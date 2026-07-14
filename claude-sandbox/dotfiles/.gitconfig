@@ -1,0 +1,7 @@
+# Identity ([user] name/email) is NOT set here — it is per-person and would make
+# the image host-specific. run-claude-sandbox.sh reads it from the host's git
+# config at launch and the entrypoint materializes it. See DESIGN.md.
+[init]
+	defaultBranch = main
+[pull]
+	rebase = true

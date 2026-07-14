@@ -1,0 +1,7 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "/etc/claude-code/statusline.sh"
+  },
+  "skipDangerousModePermissionPrompt": true
+}

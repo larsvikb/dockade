@@ -1,0 +1,16 @@
+# Case-insensitive tab completion
+set completion-ignore-case on
+
+# Show all completions on first tab if ambiguous
+set show-all-if-ambiguous on
+
+# Color completions by file type
+set colored-stats on
+
+# Arrow keys search history matching current input
+"\e[A": history-search-backward
+"\e[B": history-search-forward
+
+# Ctrl-left/right to move by word
+"\e[1;5C": forward-word
+"\e[1;5D": backward-word

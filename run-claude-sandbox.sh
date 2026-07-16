@@ -93,11 +93,13 @@ fi
 # the firewall already expects it), name resolution for the data-plane services,
 # and isolation from other default-bridge containers.
 #
-# If the network is absent, fall back to a plain bridge so the sandbox still runs
-# STANDALONE (direct egress via its firewall, no proxy audit) — this launcher is
-# useful with or without the compose infra. NOT `internal: true` yet: the end
-# state is an internal sandbox-net with no direct egress, but that needs the
-# proxy proven as the sole path first (see DESIGN.md); flip at step 3.
+# Compose creates sandbox-net as `internal: true` (no route off-box; the proxy,
+# dual-homed onto egress-net, is the sole egress). If the network is absent
+# (infra not up), fall back to a plain NON-internal bridge so the sandbox still
+# runs STANDALONE — direct egress via its firewall's ipset allowlist, no proxy
+# audit. This launcher is useful with or without the compose infra. (On an
+# internal net with no proxy running the launcher errors out below, since
+# standalone can't egress there.)
 if ! docker network inspect "$SANDBOX_NET" >/dev/null 2>&1; then
     echo "NOTE: network '$SANDBOX_NET' not found — creating a plain bridge (no egress proxy)." >&2
     echo "      For governed/audited egress, run 'docker compose up -d' first." >&2
@@ -127,6 +129,14 @@ if [[ "$EGRESS_PROXY_IP" =~ ^[0-9.]+$ ]]; then
     )
     EGRESS_DESC="governed via $EGRESS_PROXY_NAME ($EGRESS_PROXY_IP:$EGRESS_PROXY_PORT)"
 else
+    # No proxy found. If sandbox-net is internal (the compose infra defines it
+    # that way), there is NO egress route at all, so standalone/direct mode can't
+    # work — fail with guidance rather than launch a sandbox that reaches nothing.
+    if [ "$(docker network inspect "$SANDBOX_NET" -f '{{.Internal}}' 2>/dev/null)" = "true" ]; then
+        echo "ERROR: '$SANDBOX_NET' is internal but no egress proxy is running." >&2
+        echo "       Start the infrastructure first:  docker compose up -d" >&2
+        exit 1
+    fi
     EGRESS_DESC="DIRECT (no egress proxy on $SANDBOX_NET; firewall only, no audit)"
 fi
 

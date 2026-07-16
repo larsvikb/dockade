@@ -12,16 +12,23 @@ name: dockade
 # This file owns only the infrastructure they all share.
 
 networks:
+  # The agent's network. internal:true => NO route to the internet for anything
+  # on it. The sandbox lives ONLY here, so it has no possible direct egress even
+  # if its in-container firewall failed — the egress proxy (dual-homed below) is
+  # the sole way off-box. The fixed subnet gives the proxy a stable IP the
+  # sandbox firewall allowlists. (control-net arrives with the control plane.)
   sandbox-net:
     name: sandbox-net
     driver: bridge
-    # Fixed subnet so the egress proxy gets a stable IP the sandbox firewall can
-    # allowlist. NOT internal:true in step 0 — sandboxes still keep direct egress
-    # via their in-container firewall as a fallback; flip to internal at step 3,
-    # once the proxy is proven to be the sole egress path.
+    internal: true
     ipam:
       config:
         - subnet: 172.30.0.0/24
+  # Outbound-only network: the single bridge with real internet egress. ONLY the
+  # egress proxy is attached here — nothing else on sandbox-net gets a route out.
+  egress-net:
+    name: egress-net
+    driver: bridge
 
 volumes:
   egress-audit:
@@ -38,13 +45,19 @@ services:
     hostname: egress-proxy
     restart: unless-stopped
     networks:
+      # Serve the sandbox on the internal net at a stable address the sandbox
+      # firewall allowlists (matches the launcher's discovery). Keep in-subnet.
       sandbox-net:
-        # Stable address the sandbox firewall allowlists (matches the launcher's
-        # discovery). Keep in the subnet above.
         ipv4_address: 172.30.0.10
-    # The proxy resolves the (public) allowlisted targets itself. Default to
-    # public resolvers; override in a .env (EGRESS_DNS_PRIMARY/SECONDARY) for
-    # locked-down / corporate networks where those are blocked.
+        priority: 10
+      # Reach the internet on the egress net. Higher priority so THIS is the
+      # proxy's default route — sandbox-net is internal and has no gateway, so
+      # all upstream traffic (and the pinned DNS below) must leave via here.
+      egress-net:
+        priority: 100
+    # The proxy resolves the (public) allowlisted targets itself, via egress-net.
+    # Default to public resolvers; override in a .env (EGRESS_DNS_PRIMARY/
+    # SECONDARY) for locked-down / corporate networks where those are blocked.
     dns:
       - ${EGRESS_DNS_PRIMARY:-8.8.8.8}
       - ${EGRESS_DNS_SECONDARY:-8.8.4.4}

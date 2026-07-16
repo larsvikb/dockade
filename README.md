@@ -71,9 +71,11 @@ claude-yolo     # bypass-permissions mode — a conscious opt-in (see below)
 - **Builds the image** if missing (or on `--rebuild`), matching the sandbox
   user's uid/gid to the host so bind-mounted files stay writable from both
   sides (important on WSL).
-- **Creates `sandbox-net`** — a user-defined bridge network (idempotently) — and
-  attaches the container to it, instead of Docker's default bridge. This gives
-  the container Docker's embedded DNS and isolation from other containers.
+- **Attaches to `sandbox-net`** — the internal network owned by the compose
+  infra — and **discovers the egress proxy** on it, pointing the sandbox's
+  `HTTPS_PROXY` at it and allowlisting it in the firewall. If the infra isn't up
+  it falls back to creating a plain bridge for standalone use. You can run
+  **several sandboxes** against one proxy (unique names; override `SANDBOX_NAME`).
 - **Mounts your workspace** at `/workspace` (read-write) and a named config
   volume at `/config` (isolated from the host's `~/.claude`).
 - **Forwards your host git identity** into the container (it is not baked into
@@ -89,7 +91,7 @@ open egress is exactly the state this sandbox exists to prevent.
 
 | Layer | Mechanism |
 |-------|-----------|
-| **Network egress** | Default-deny `iptables` + `ipset` allowlist (`init-firewall.sh`), set up by the entrypoint as root before dropping privileges. Egress is permitted to the *IP ranges* of Anthropic API/auth, GitHub, and npm/PyPI; IPv6 is fully denied. **The firewall is IP-level, not domain-level:** several of those hosts sit behind shared CDNs (Cloudflare/Fastly), so at the IP layer alone SNI/`Host`-fronting could reach other origins on the same infrastructure. When the **egress proxy** (`docker compose up`) is running, the launcher routes the sandbox's HTTP(S) through it and it enforces a **domain**-level allowlist with per-connection audit — closing that gap for proxied traffic. Making the proxy the *sole* egress path (removing the direct firewall allowlist) is the next step (see [Roadmap](#roadmap)). |
+| **Network egress** | With the infra up, `sandbox-net` is `internal: true` — the sandbox has **no route to the internet at all**; the only path off-box is the **egress proxy**, dual-homed onto a separate `egress-net`. The proxy enforces a **domain**-level allowlist with per-connection audit (closing the shared-CDN/fronting gap that an IP-level rule can't). The in-container firewall (`init-firewall.sh`) is now **defense-in-depth**: in governed mode it permits only the proxy + embedded DNS, so even if it failed there's no route out. IPv6 fully denied. Without the infra, the launcher falls back to **standalone** mode (non-internal net, direct `ipset` IP-allowlist) for proxy-less use. |
 | **Privilege** | Non-root `sandbox` user; `--cap-drop=ALL` + minimal adds; `no-new-privileges`; no host Docker socket. |
 | **Filesystem** | Only the bind-mounted `/workspace` and the `/config` volume are writable state. |
 | **Config** | `CLAUDE_CONFIG_DIR=/config`; user settings are re-materialized from a baked template on every boot, so config always matches the repo and volume wipes lose only credentials/runtime state. |
@@ -150,11 +152,11 @@ The target architecture (see [`DESIGN.md`](DESIGN.md)) is a multi-container
 setup with the agent on an isolated network and all meaningful capability
 exposed through governed data-plane services. Next steps toward it:
 
-1. **Egress HTTP(S) proxy** — *started* (`docker-compose.yml` + `proxies/egress/`):
-   a CONNECT-level domain allowlist with per-connection audit. Next: make it the
-   **sole** egress path — flip `sandbox-net` to `internal: true`, drop the direct
-   firewall allowlist, and add `control-net` / `egress-net` — then add
-   hold-for-approval + a dynamic policy/audit store (the control plane).
+1. **Egress HTTP(S) proxy** — *done* (`docker-compose.yml` + `proxies/egress/`):
+   a CONNECT-level domain allowlist with per-connection audit, and (step 1) the
+   **sole** egress path — `sandbox-net` is `internal: true` with the proxy
+   dual-homed onto `egress-net`. Next: the **control plane** — `control-net`,
+   hold-for-approval, and a dynamic policy/audit store.
 2. **Skills + quality-gate hooks** in the image — the enablement half of the
    paved road.
 3. **Pull-through package cache** — fast, governed dependency installs.

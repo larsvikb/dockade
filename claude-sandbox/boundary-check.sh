@@ -35,6 +35,14 @@ if curl --noproxy '*' --connect-timeout 5 -s -o /dev/null https://example.com 2>
 else
     ok "direct egress to example.com blocked (firewall)"
 fi
+# Raw-IP direct egress (no DNS needed) — isolates the egress block from a mere
+# DNS failure. With sandbox-net internal there is no route off-box at all, so even
+# a literal IP must be unreachable directly (not just unresolvable names).
+if curl --noproxy '*' --connect-timeout 5 -s -o /dev/null https://1.1.1.1 2>/dev/null; then
+    bad "direct egress leak — reached 1.1.1.1 by IP (bypassing any proxy)"
+else
+    ok "direct egress to raw IP (1.1.1.1) blocked"
+fi
 # The Anthropic lifeline must be reachable via whatever path the agent actually
 # uses — through the proxy if governed, direct otherwise — so DON'T set --noproxy
 # here: use the ambient env. Any HTTP response (even 4xx) means the connection

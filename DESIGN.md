@@ -260,10 +260,10 @@ Consequences:
   **removing the capability** by replacing WebSearch with a governed `websearch`
   skill (below). A user-scope deny is still worth keeping as *accident* prevention,
   not as containment.
-- **WebFetch** is already network-governed; keep it. To also *audit* it through
-  the control-plane proxy, it needs to honor `HTTPS_PROXY` — which the official
-  docs say it does (it inherits the CLI's proxy env; see "Claude Code proxy
-  support"). Documentation-level so far, not yet re-tested in this sandbox.
+- **WebFetch** is already network-governed; keep it. It also honors `HTTPS_PROXY`
+  (inherits the CLI's proxy env), so it is audited through the egress proxy —
+  **verified**: allow/deny CONNECT entries for a fetched allowlisted vs blocked
+  host appear in the proxy audit log (see "Claude Code proxy support").
 - **Optional `websearch` skill** — *only* if a future threat model decides to turn
   WebSearch off (see decision below). Web search would then become a governed call
   to a third-party search API (Brave / SerpAPI / Google CSE) with its own read-only
@@ -346,8 +346,11 @@ the proxy, so the CLI honors `HTTPS_PROXY`. The same run confirmed the proxy
 refuses a non-allowlisted domain (`egress proxy denies non-allowlisted
 example.com`) and that direct egress, IPv6, and direct external DNS are all
 blocked. So (a) stands and the transparent-redirect fallback (b) is not needed.
-(WebFetch was not separately exercised in that run; it inherits the same proxy
-env, so it is expected — but not yet independently observed — in the audit log.)
+WebFetch was separately confirmed: fetching an allowlisted host (`pypi.org`)
+succeeded and a non-allowlisted one (`example.com`) failed with `Socket is
+closed`, and the proxy audit log shows the matching `allow`/`deny` CONNECT
+entries — so WebFetch is client-side and proxy-governed (had it run server-side
+like WebSearch, `example.com` would have succeeded and never hit the proxy).
 
 ## Server-side execution: accepted governance blind spots
 
@@ -452,6 +455,11 @@ no separate artifact-export path is needed in v1.
   Sandbox not attached.
 - `egress-net` — only outbound-capable governed proxies + internet.
 - Control-plane UI bound to host loopback for the human.
+
+**Status:** `sandbox-net` (internal) and `egress-net` are implemented, with the
+egress proxy **dual-homed** across them (step 1) — the sandbox has no direct
+route off-box; the proxy is the sole egress. `control-net` and the control-plane
+UI arrive with the control plane (step 2).
 
 ### DNS on `sandbox-net` (a non-obvious gotcha — read before touching DNS/firewall)
 
@@ -620,14 +628,23 @@ does not help and re-opens a hole). Governed mode sidesteps it entirely (no ipse
 path); standalone mode fails **closed** with a pointer to use the proxy. Do not
 "fix" ipset errors by adding capabilities — use the proxy.
 
-Still transitional in step 0: the sandbox keeps its **direct** firewall
-allowlist as a fallback in **standalone** mode. The next step makes the proxy the
-**sole** egress everywhere (`sandbox-net` → `internal: true`, add
-`control-net`/`egress-net`, route DNS through the proxy too). After that:
-hold-for-approval + a dynamic policy/audit store (the control plane).
+**Step 1 shipped — the proxy is the sole egress at the network layer.**
+`sandbox-net` is now `internal: true` (no route off-box for anything on it) and a
+separate `egress-net` carries the only internet path, with the egress proxy
+**dual-homed** across both (default route via egress-net; a stable sandbox-net IP
+the firewall allowlists). The in-container firewall is now **defense-in-depth**
+rather than the sole boundary: even if it failed, the sandbox has no route out.
+The launcher refuses to start a sandbox on an internal `sandbox-net` when no
+proxy is running. **Standalone** mode (no compose infra → non-internal net +
+direct ipset allowlist) remains for proxy-less use. DNS needs nothing extra: the
+sandbox resolves only sibling names via the embedded resolver (local, works on
+internal nets); external resolution happens at the proxy on egress-net.
 
-Not yet built: control plane, the control-net/egress-net topology, git/secrets/
-cache data-plane services, skills, quality-gate hooks.
+Deferred to step 2 (with the control plane): `control-net`, hold-for-approval,
+and a dynamic policy/audit store.
+
+Not yet built: control plane, `control-net`, git/secrets/cache data-plane
+services, skills, quality-gate hooks.
 
 **Transitional firewall entries (remove at the proxy/cache phase):** the sandbox
 firewall currently whitelists package registries (npm/PyPI) and GitHub only

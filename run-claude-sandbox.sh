@@ -157,6 +157,13 @@ echo "Git ident: ${HOST_GIT_NAME:-<none>} <${HOST_GIT_EMAIL:-none}>"
 echo "DNS upstreams: $UPSTREAM_DNS (pinned via --dns; firewall-whitelisted on :53)"
 echo ""
 
+# Capabilities: cap-drop=ALL, then add back ONLY what the root entrypoint needs
+# during setup — NET_ADMIN for the iptables/ipset firewall; CHOWN/DAC_OVERRIDE/
+# FOWNER to own /config and materialize config as the sandbox user; SETGID/SETUID
+# for the gosu privilege drop. All of these are cleared when gosu drops to the
+# non-root agent (the entrypoint asserts the agent ends up with none). NET_RAW is
+# deliberately NOT granted: the firewall needs NET_ADMIN, not raw sockets, so
+# raw-socket / packet-spoofing capability never exists in the container at all.
 docker run -it --rm \
     --name "$CONTAINER_NAME" \
     --hostname sandbox \
@@ -166,7 +173,6 @@ docker run -it --rm \
     \
     --cap-drop=ALL \
     --cap-add=NET_ADMIN \
-    --cap-add=NET_RAW \
     --cap-add=CHOWN \
     --cap-add=DAC_OVERRIDE \
     --cap-add=FOWNER \

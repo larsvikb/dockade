@@ -108,9 +108,10 @@ COPY user-settings.json /etc/claude-code/user-settings.json
 COPY statusline.sh /etc/claude-code/statusline.sh
 COPY init-firewall.sh /usr/local/bin/init-firewall.sh
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY boundary-check.sh /usr/local/bin/boundary-check.sh
 RUN chmod 0644 /etc/claude-code/user-settings.json \
     && chmod 0755 /etc/claude-code/statusline.sh \
-    && chmod 0755 /usr/local/bin/init-firewall.sh /usr/local/bin/entrypoint.sh \
+    && chmod 0755 /usr/local/bin/init-firewall.sh /usr/local/bin/entrypoint.sh /usr/local/bin/boundary-check.sh \
     && chown $USERNAME:$USERNAME /home/$USERNAME/.bashrc /home/$USERNAME/.vimrc /home/$USERNAME/.inputrc /home/$USERNAME/.gitconfig
 
 # Container starts as root so the entrypoint can set up the firewall,

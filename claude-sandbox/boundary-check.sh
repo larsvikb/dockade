@@ -1,0 +1,106 @@
+#!/bin/bash
+# Boundary smoke test for the Claude sandbox.
+#
+# Run this INSIDE the container, as the sandbox agent, to assert the v1
+# containment boundary still holds:
+#     boundary-check.sh
+#
+# It complements the boot-time checks in init-firewall.sh / entrypoint.sh, which
+# (a) run as root BEFORE the privilege drop, (b) mostly only warn, and (c) scroll
+# past at startup with no aggregate result. This runs on demand, from the agent's
+# own (capability-less) security context, and exits non-zero if any hard invariant
+# is violated — a regression baseline to run before and after the proxy work.
+#
+# Baked root-owned at /usr/local/bin so the non-root agent can run but not tamper
+# with it (same rationale as the firewall/status-line scripts; see DESIGN.md).
+#
+# NOT `set -e`: we want every check to run and the results aggregated, not an
+# abort on the first failure.
+set -uo pipefail
+
+pass=0; fail=0
+green=$'\033[32m'; red=$'\033[31m'; dim=$'\033[2m'; bold=$'\033[1m'; reset=$'\033[0m'
+ok()   { printf '  %sPASS%s %s\n' "$green" "$reset" "$1"; pass=$((pass+1)); }
+bad()  { printf '  %sFAIL%s %s\n' "$red"   "$reset" "$1"; fail=$((fail+1)); }
+info() { printf '  %s·%s    %s\n' "$dim"   "$reset" "$1"; }
+
+printf '%s== egress ==%s\n' "$bold" "$reset"
+# The core default-deny property: an arbitrary external site must be unreachable.
+# example.com presents a valid cert, so a successful fetch is a genuine leak.
+if curl --connect-timeout 5 -s -o /dev/null https://example.com 2>/dev/null; then
+    bad "example.com reachable — egress leak"
+else
+    ok "example.com blocked"
+fi
+# The Anthropic lifeline must be reachable, or the agent cannot function. Any HTTP
+# response (even 4xx) means the connection succeeded, which is all we assert here.
+if curl --connect-timeout 5 -s -o /dev/null https://api.anthropic.com 2>/dev/null; then
+    ok "api.anthropic.com reachable"
+else
+    bad "api.anthropic.com NOT reachable — lifeline down"
+fi
+
+printf '%s== ipv6 ==%s\n' "$bold" "$reset"
+if [ -e /proc/net/if_inet6 ]; then
+    # Connect to a literal v6 address (no AAAA lookup needed). We assert on the
+    # curl exit code, not overall success: 7 (connect failed) and 28 (timeout)
+    # mean the packet was blocked; a TLS-layer error (35/51/60) would mean the TCP
+    # connection actually OPENED — i.e. an ungoverned v6 path — so treat anything
+    # that isn't a clean connect-failure as reachable.
+    curl -6 --connect-timeout 5 -s -o /dev/null "https://[2606:4700:4700::1111]" 2>/dev/null
+    rc=$?
+    case "$rc" in
+        7|28) ok "IPv6 egress blocked (curl rc=$rc)" ;;
+        *)    bad "IPv6 egress reachable (curl rc=$rc)" ;;
+    esac
+else
+    ok "no IPv6 stack present (/proc/net/if_inet6 absent)"
+fi
+
+printf '%s== privilege ==%s\n' "$bold" "$reset"
+# THE load-bearing property: the agent holds no Linux capabilities, so it cannot
+# run iptables (NET_ADMIN) to tear down the firewall or otherwise re-privilege.
+# Read from this process's own status — it runs as the agent, so this is the
+# agent's real cap set (Eff/Prm/Amb are the sets that grant or preserve caps).
+caps="$(grep -E '^Cap(Eff|Prm|Amb):' /proc/self/status | awk '{print $2}')"
+caps_held=0
+for c in $caps; do [ "$c" = "0000000000000000" ] || caps_held=1; done
+if [ "$caps_held" -eq 1 ]; then
+    bad "agent holds capabilities (Eff/Prm/Amb: $(printf '%s ' $caps))"
+else
+    ok "agent holds no capabilities (Eff/Prm/Amb all zero)"
+fi
+# no-new-privileges must be in effect, so setuid binaries (sudo, etc.) can't
+# re-elevate around the missing caps.
+nnp="$(awk '/^NoNewPrivs:/ {print $2}' /proc/self/status)"
+if [ "$nnp" = "1" ]; then ok "no_new_privs set"; else bad "no_new_privs NOT set (got '${nnp:-}')"; fi
+# The Docker socket must never be present — it would be a direct path to the host
+# control plane, the one thing the sandbox must never reach.
+if [ -S /var/run/docker.sock ] || [ -S /run/docker.sock ]; then
+    bad "docker socket present — direct host control-plane path"
+else
+    ok "no docker socket"
+fi
+
+printf '%s== dns %s(informational)%s ==%s\n' "$bold" "$dim" "$reset$bold" "$reset"
+# DNS is pinned to named resolvers, but a recursive resolver still forwards
+# crafted names upstream (a documented residual exfil channel until lookups route
+# through the proxy). This probe is host-dependent, so it is reported, not
+# asserted: reaching an arbitrary public resolver would suggest port-53 is broader
+# than the pinned set.
+if command -v dig >/dev/null 2>&1; then
+    if dig +time=3 +tries=1 @1.1.1.1 example.com >/dev/null 2>&1; then
+        info "reached 1.1.1.1:53 — it is the pinned upstream, or port-53 is broad (check)"
+    else
+        info "1.1.1.1:53 unreachable (consistent with resolver pinning)"
+    fi
+else
+    info "dig not available; skipping DNS probe"
+fi
+
+echo
+if [ "$fail" -gt 0 ]; then
+    printf '%s%d passed, %d FAILED%s\n' "$red" "$pass" "$fail" "$reset"
+    exit 1
+fi
+printf '%sall %d boundary checks passed%s\n' "$green" "$pass" "$reset"

@@ -77,7 +77,7 @@ open egress is exactly the state this sandbox exists to prevent.
 
 | Layer | Mechanism |
 |-------|-----------|
-| **Network egress** | Default-deny `iptables` + `ipset` allowlist (`init-firewall.sh`), set up by the entrypoint as root before dropping privileges. Only Anthropic API/auth, GitHub, and npm/PyPI are reachable; IPv6 is fully denied. |
+| **Network egress** | Default-deny `iptables` + `ipset` allowlist (`init-firewall.sh`), set up by the entrypoint as root before dropping privileges. Egress is permitted to the *IP ranges* of Anthropic API/auth, GitHub, and npm/PyPI; IPv6 is fully denied. **This is IP-level, not domain-level:** several of those hosts sit behind shared CDNs (Cloudflare/Fastly), so SNI/`Host`-fronting can still reach other origins on the same infrastructure. True domain-level egress control arrives with the egress proxy (see [Roadmap](#roadmap)). |
 | **Privilege** | Non-root `sandbox` user; `--cap-drop=ALL` + minimal adds; `no-new-privileges`; no host Docker socket. |
 | **Filesystem** | Only the bind-mounted `/workspace` and the `/config` volume are writable state. |
 | **Config** | `CLAUDE_CONFIG_DIR=/config`; user settings are re-materialized from a baked template on every boot, so config always matches the repo and volume wipes lose only credentials/runtime state. |
@@ -92,6 +92,14 @@ mistake-prevention/steering. See [`DESIGN.md`](DESIGN.md) and
 **Known blind spot:** `WebSearch` runs server-side on Anthropic infrastructure,
 so the firewall cannot see or block it. It's read-only and consciously left
 enabled in v1; details in [`DESIGN.md`](DESIGN.md).
+
+**Verifying the boundary:** run `boundary-check.sh` inside the container (as the
+agent) for an on-demand pass/fail check of the invariants — arbitrary egress
+blocked, Anthropic reachable, IPv6 blocked, agent holds no capabilities,
+`no_new_privs` set, no Docker socket. It exits non-zero on any violation, so it
+doubles as a regression baseline to run before and after future changes (e.g. the
+egress proxy). This is separate from the boot-time checks, which run as root
+before the privilege drop and only warn.
 
 ## Yolo mode
 
@@ -112,6 +120,7 @@ dockade/
     Dockerfile
     entrypoint.sh           # root: firewall + config, then drops to non-root
     init-firewall.sh        # default-deny egress firewall
+    boundary-check.sh       # on-demand smoke test of the containment boundary
     user-settings.json      # baked template, materialized to /config each boot
     statusline.sh           # sandbox-indicator status line
     dotfiles/               # .bashrc (incl. claude-yolo), .gitconfig, ...

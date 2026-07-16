@@ -142,13 +142,32 @@ fi
 # ip6tables (default ACCEPT) would be ungoverned egress — a containment leak —
 # and hosts with AAAA records (e.g. api.anthropic.com) make curl try IPv6 first,
 # which then hangs instead of falling back to the whitelisted IPv4 path.
-if command -v ip6tables >/dev/null 2>&1; then
-    ip6tables -F 2>/dev/null || true
-    ip6tables -P INPUT DROP 2>/dev/null || true
-    ip6tables -P FORWARD DROP 2>/dev/null || true
-    ip6tables -P OUTPUT DROP 2>/dev/null || true
-    ip6tables -A INPUT  -i lo -j ACCEPT 2>/dev/null || true
-    ip6tables -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
+#
+# Fail CLOSED, not open. The three DROP policies ARE the v6 boundary, so they must
+# not be allowed to fail silently (the old `|| true` on them could leave v6 wide
+# open). But distinguish a live IPv6 stack from one that is simply absent:
+#   - No /proc/net/if_inet6  -> the kernel has no IPv6 stack at all, so there is
+#     no v6 egress to leak and ip6tables would legitimately error. Skip safely.
+#   - if_inet6 present but ip6tables missing -> we have a v6 stack we cannot
+#     filter. That is exactly the leak we refuse to accept: abort (set -e).
+#   - if_inet6 present and ip6tables present -> install the DROP policies WITHOUT
+#     `|| true`, so any failure trips set -e and the container fails closed before
+#     the agent ever runs. The loopback ACCEPTs are functionality-only (their
+#     failure would only over-restrict), so they keep the tolerant `|| true`.
+if [ -e /proc/net/if_inet6 ]; then
+    if ! command -v ip6tables >/dev/null 2>&1; then
+        echo "FATAL: IPv6 stack present but ip6tables missing — cannot close v6 egress." >&2
+        exit 1
+    fi
+    ip6tables -F || true
+    ip6tables -X || true
+    ip6tables -P INPUT DROP
+    ip6tables -P FORWARD DROP
+    ip6tables -P OUTPUT DROP
+    ip6tables -A INPUT  -i lo -j ACCEPT || true
+    ip6tables -A OUTPUT -o lo -j ACCEPT || true
+else
+    echo "  OK — no IPv6 stack (/proc/net/if_inet6 absent); nothing to lock down"
 fi
 
 # Default-deny

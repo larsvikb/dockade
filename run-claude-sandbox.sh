@@ -29,6 +29,50 @@ for arg in "$@"; do
     esac
 done
 
+# Workspace safety guard. The workspace is bind-mounted RW with the sandbox user
+# matched to the host uid, so the yolo agent gets full read/write to whatever this
+# resolves to — and anything it writes there (git hooks, build scripts, .envrc,
+# editor task files) later runs OUTSIDE the sandbox when the host next touches the
+# repo. Mounting a home directory or the filesystem root would hand the agent host
+# credentials (~/.ssh, ~/.aws, ...) plus a boundary-crossing foothold, defeating
+# the point of the sandbox. So: hard-refuse the clearly-dangerous roots, and warn
+# (non-fatal) when credential material lives inside the chosen workspace. Override
+# the hard refusal with ALLOW_UNSAFE_WORKSPACE=1 for the rare deliberate case — a
+# conscious, visible choice, in keeping with the "no silent unsafe defaults" ethos.
+REAL_WORKSPACE="$(cd "$WORKSPACE" && pwd -P)"   # canonical, symlinks resolved
+REAL_HOME="$(cd "$HOME" 2>/dev/null && pwd -P || echo "$HOME")"
+
+deny_workspace() {
+    echo "REFUSING to mount workspace: $REAL_WORKSPACE" >&2
+    echo "  $1" >&2
+    echo "  This would give the yolo agent RW access to sensitive host files, and" >&2
+    echo "  anything it writes there runs on the host later (git hooks, build scripts)." >&2
+    echo "  Re-run from a dedicated project directory, or set ALLOW_UNSAFE_WORKSPACE=1" >&2
+    echo "  to override deliberately." >&2
+    exit 1
+}
+
+if [[ "${ALLOW_UNSAFE_WORKSPACE:-}" != "1" ]]; then
+    if [[ "$REAL_WORKSPACE" == "/" ]]; then
+        deny_workspace "that is the filesystem root."
+    elif [[ "$REAL_WORKSPACE" == "$REAL_HOME" ]]; then
+        deny_workspace "that is your home directory."
+    elif [[ "$REAL_HOME" == "$REAL_WORKSPACE"/* ]]; then
+        # Workspace is an ancestor of $HOME, so mounting it exposes the whole home.
+        deny_workspace "your home directory ($REAL_HOME) is inside it."
+    fi
+fi
+
+# Non-fatal: credential material sitting inside the chosen workspace. This is
+# legal (you may genuinely want to work there), but the agent will be able to
+# read and modify it, so make that visible rather than silent.
+for sensitive in .ssh .aws .gnupg .config/gcloud .kube .docker/config.json .netrc .git-credentials; do
+    if [[ -e "$REAL_WORKSPACE/$sensitive" ]]; then
+        echo "WARNING: workspace contains '$sensitive' — the sandbox agent will have RW access to it." >&2
+    fi
+done
+WORKSPACE="$REAL_WORKSPACE"
+
 if [[ "$REBUILD" == "true" ]] || ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
     echo "Building $IMAGE_NAME (sandbox user uid/gid $(id -u)/$(id -g))..."
     # Match the sandbox user to the host uid/gid so bind-mounted workspaces are

@@ -46,5 +46,26 @@ fi
 # than launching a yolo agent with no boundary.
 /usr/local/bin/init-firewall.sh
 
+# Load-bearing invariant: the non-root agent must hold NO Linux capabilities. The
+# whole containment model assumes it cannot run iptables (NET_ADMIN) to tear down
+# the firewall, or otherwise re-privilege. By design this holds — the gosu
+# setuid->non-root transition clears the permitted/effective/ambient cap sets,
+# Docker grants no ambient caps, and no-new-privileges blocks re-elevation — but
+# this is THE property everything else rests on, so assert it here rather than
+# trust it silently. We probe a process spawned exactly the way the agent is
+# (`gosu "$USERNAME" ...`), so its /proc/self/status reflects the agent's caps.
+# CapEff/CapPrm/CapAmb are the sets that actually grant or preserve capability;
+# CapBnd (bounding) may legitimately still list the added caps and is not by
+# itself exploitable under no-new-privileges. Fail closed on any non-zero set.
+agent_caps="$(gosu "$USERNAME" grep -E '^Cap(Eff|Prm|Amb):' /proc/self/status | awk '{print $2}')"
+for cap in $agent_caps; do
+    if [ "$cap" != "0000000000000000" ]; then
+        echo "FATAL: sandbox user would start with Linux capabilities (Eff/Prm/Amb: $agent_caps)." >&2
+        echo "       The containment model requires the agent to hold none — refusing to start." >&2
+        echo "       See DESIGN.md; check --cap-add / ambient caps / no-new-privileges." >&2
+        exit 1
+    fi
+done
+
 # Drop privileges and run the requested command as the sandbox user.
 exec gosu "$USERNAME" "$@"

@@ -10,9 +10,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMAGE_NAME="claude-sandbox"
-CONTAINER_NAME="claude-sandbox"
 CONFIG_VOLUME="claude-sandbox-config"
 SANDBOX_NET="sandbox-net"
+# CONTAINER_NAME is chosen later (after proxy discovery) so multiple sandboxes
+# can share the compose infra without name collisions.
 
 REBUILD=false
 WORKSPACE="$PWD"
@@ -84,23 +85,62 @@ if [[ "$REBUILD" == "true" ]] || ! docker image inspect "$IMAGE_NAME" >/dev/null
         "$SCRIPT_DIR/claude-sandbox"
 fi
 
-# Put the sandbox on its own user-defined bridge instead of Docker's default
-# bridge. Even single-container this buys: Docker's embedded DNS (127.0.0.11,
-# used only on user-defined networks — the firewall already expects it), name
-# resolution for the data-plane services that land later, and isolation from any
-# other containers on the default bridge.
+# Infrastructure network. docker-compose.yml owns sandbox-net (with a fixed
+# subnet and the egress proxy on it) — bring the infra up first:
+#     docker compose up -d
+# The sandbox attaches to that shared network here. Even single-container this
+# buys: Docker's embedded DNS (127.0.0.11, used only on user-defined networks —
+# the firewall already expects it), name resolution for the data-plane services,
+# and isolation from other default-bridge containers.
 #
-# NOT `internal: true` yet. The design's end state is an internal sandbox-net
-# with no egress, but that requires the egress proxy to exist first — until then
-# the sandbox needs direct egress to api.anthropic.com, and the in-container
-# firewall (init-firewall.sh) remains the egress boundary. Flip to internal when
-# the proxy lands. Idempotent: create only if absent.
+# If the network is absent, fall back to a plain bridge so the sandbox still runs
+# STANDALONE (direct egress via its firewall, no proxy audit) — this launcher is
+# useful with or without the compose infra. NOT `internal: true` yet: the end
+# state is an internal sandbox-net with no direct egress, but that needs the
+# proxy proven as the sole path first (see DESIGN.md); flip at step 3.
 if ! docker network inspect "$SANDBOX_NET" >/dev/null 2>&1; then
-    echo "Creating network $SANDBOX_NET..."
+    echo "NOTE: network '$SANDBOX_NET' not found — creating a plain bridge (no egress proxy)." >&2
+    echo "      For governed/audited egress, run 'docker compose up -d' first." >&2
     docker network create "$SANDBOX_NET" >/dev/null
 fi
 
-docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+# Discover the egress proxy on sandbox-net (started by compose). Present ->
+# governed egress: route the sandbox's HTTP(S) through it (HTTPS_PROXY) and
+# allowlist it in the firewall (EGRESS_PROXY_IP). Absent -> direct egress via the
+# firewall only, with a warning. Discovering the IP (rather than hardcoding it)
+# keeps this working even if the compose subnet/address changes.
+EGRESS_PROXY_NAME="${EGRESS_PROXY_NAME:-egress-proxy}"
+EGRESS_PROXY_PORT="${EGRESS_PROXY_PORT:-8080}"
+EGRESS_PROXY_IP="$(docker inspect -f \
+    "{{with index .NetworkSettings.Networks \"$SANDBOX_NET\"}}{{.IPAddress}}{{end}}" \
+    "$EGRESS_PROXY_NAME" 2>/dev/null || true)"
+
+PROXY_ENV_ARGS=()
+if [[ "$EGRESS_PROXY_IP" =~ ^[0-9.]+$ ]]; then
+    PROXY_URL="http://${EGRESS_PROXY_NAME}:${EGRESS_PROXY_PORT}"
+    PROXY_ENV_ARGS=(
+        -e "HTTPS_PROXY=$PROXY_URL"
+        -e "HTTP_PROXY=$PROXY_URL"
+        -e "NO_PROXY=localhost,127.0.0.1,::1,${EGRESS_PROXY_NAME}"
+        -e "EGRESS_PROXY_IP=$EGRESS_PROXY_IP"
+        -e "EGRESS_PROXY_PORT=$EGRESS_PROXY_PORT"
+    )
+    EGRESS_DESC="governed via $EGRESS_PROXY_NAME ($EGRESS_PROXY_IP:$EGRESS_PROXY_PORT)"
+else
+    EGRESS_DESC="DIRECT (no egress proxy on $SANDBOX_NET; firewall only, no audit)"
+fi
+
+# One or many sandboxes share the infra, so container names must not collide.
+# Default to claude-sandbox; if taken, pick the next free suffix. Override with
+# SANDBOX_NAME. (No `docker rm -f` of siblings — other sandboxes may be running.)
+CONTAINER_NAME="${SANDBOX_NAME:-claude-sandbox}"
+if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
+    n=2
+    while docker ps -a --format '{{.Names}}' | grep -qx "${CONTAINER_NAME}-${n}"; do
+        n=$((n+1))
+    done
+    CONTAINER_NAME="${CONTAINER_NAME}-${n}"
+fi
 
 # Git identity is per-person, so it is not baked into the image. Read it from the
 # host's git config at launch and forward it; the entrypoint materializes it into
@@ -152,9 +192,11 @@ fi
 DNS_ARGS=()
 for ns in $UPSTREAM_DNS; do DNS_ARGS+=(--dns "$ns"); done
 
+echo "Sandbox:   $CONTAINER_NAME"
 echo "Workspace: $WORKSPACE -> /workspace"
 echo "Git ident: ${HOST_GIT_NAME:-<none>} <${HOST_GIT_EMAIL:-none}>"
 echo "DNS upstreams: $UPSTREAM_DNS (pinned via --dns; firewall-whitelisted on :53)"
+echo "Egress:    $EGRESS_DESC"
 echo ""
 
 # Capabilities: cap-drop=ALL, then add back ONLY what the root entrypoint needs
@@ -190,6 +232,7 @@ docker run -it --rm \
     -e "TERM=${TERM:-xterm-256color}" \
     -e "TZ=${TZ:-UTC}" \
     -e "UPSTREAM_DNS=$UPSTREAM_DNS" \
+    ${PROXY_ENV_ARGS[@]+"${PROXY_ENV_ARGS[@]}"} \
     ${GIT_ID_ARGS[@]+"${GIT_ID_ARGS[@]}"} \
     \
     "$IMAGE_NAME"

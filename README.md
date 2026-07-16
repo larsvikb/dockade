@@ -30,15 +30,27 @@ socket, and (by design) no route to a control plane.
 inside the sandbox.
 
 ```bash
-# From the directory you want the agent to work in:
+# 1. Bring up the shared infrastructure once (the governed egress proxy).
+#    Sandboxes route their traffic through it and it audits every connection.
+docker compose -f /path/to/dockade/docker-compose.yml up -d --build
+
+# 2. From the directory you want the agent to work in, launch a sandbox:
 /path/to/dockade/run-claude-sandbox.sh
 
 # Or point it at a specific workspace:
 /path/to/dockade/run-claude-sandbox.sh /path/to/project
 
-# Rebuild the image (after changing the Dockerfile, or switching hosts):
+# Rebuild the sandbox image (after changing the Dockerfile, or switching hosts):
 /path/to/dockade/run-claude-sandbox.sh --rebuild
 ```
+
+Step 1 is optional: without it, `run-claude-sandbox.sh` still runs the sandbox
+**standalone** (direct egress governed by the in-container firewall, no proxy
+audit). With the infra up, the launcher auto-detects the proxy, routes the
+sandbox's HTTP(S) through it, and allowlists it in the firewall. You can start
+**several sandboxes** against one proxy — each gets a unique name (override with
+`SANDBOX_NAME`). Audit trail: `docker compose logs -f egress-proxy` (or the
+`dockade-egress-audit` volume).
 
 On first run the image builds and you'll be dropped into a shell in the
 container. **Authenticate once** by starting Claude Code and completing the
@@ -77,7 +89,7 @@ open egress is exactly the state this sandbox exists to prevent.
 
 | Layer | Mechanism |
 |-------|-----------|
-| **Network egress** | Default-deny `iptables` + `ipset` allowlist (`init-firewall.sh`), set up by the entrypoint as root before dropping privileges. Egress is permitted to the *IP ranges* of Anthropic API/auth, GitHub, and npm/PyPI; IPv6 is fully denied. **This is IP-level, not domain-level:** several of those hosts sit behind shared CDNs (Cloudflare/Fastly), so SNI/`Host`-fronting can still reach other origins on the same infrastructure. True domain-level egress control arrives with the egress proxy (see [Roadmap](#roadmap)). |
+| **Network egress** | Default-deny `iptables` + `ipset` allowlist (`init-firewall.sh`), set up by the entrypoint as root before dropping privileges. Egress is permitted to the *IP ranges* of Anthropic API/auth, GitHub, and npm/PyPI; IPv6 is fully denied. **The firewall is IP-level, not domain-level:** several of those hosts sit behind shared CDNs (Cloudflare/Fastly), so at the IP layer alone SNI/`Host`-fronting could reach other origins on the same infrastructure. When the **egress proxy** (`docker compose up`) is running, the launcher routes the sandbox's HTTP(S) through it and it enforces a **domain**-level allowlist with per-connection audit — closing that gap for proxied traffic. Making the proxy the *sole* egress path (removing the direct firewall allowlist) is the next step (see [Roadmap](#roadmap)). |
 | **Privilege** | Non-root `sandbox` user; `--cap-drop=ALL` + minimal adds; `no-new-privileges`; no host Docker socket. |
 | **Filesystem** | Only the bind-mounted `/workspace` and the `/config` volume are writable state. |
 | **Config** | `CLAUDE_CONFIG_DIR=/config`; user settings are re-materialized from a baked template on every boot, so config always matches the repo and volume wipes lose only credentials/runtime state. |
@@ -115,7 +127,13 @@ dockade/
   README.md                 # this file
   CLAUDE.md                 # invariants + conventions for working in the repo
   DESIGN.md                 # architecture, topology, and rationale (read this)
-  run-claude-sandbox.sh     # build + launch the sandbox
+  docker-compose.yml        # shared infrastructure (data plane): the egress proxy
+  run-claude-sandbox.sh     # build + launch a sandbox (one or many) against it
+  proxies/                  # governed data-plane services (one dir per proxy)
+    egress/                 # CONNECT-level egress proxy: allowlist + audit
+      Dockerfile            #   mitmproxy + the policy/audit addon
+      addon.py              #   allowlist enforcement + structured audit log
+      allowlist.txt         #   default-deny allowlist (re-read per connection)
   claude-sandbox/           # the agent image
     Dockerfile
     entrypoint.sh           # root: firewall + config, then drops to non-root
@@ -132,14 +150,14 @@ The target architecture (see [`DESIGN.md`](DESIGN.md)) is a multi-container
 setup with the agent on an isolated network and all meaningful capability
 exposed through governed data-plane services. Next steps toward it:
 
-1. **`docker-compose.yml` + network topology** — add `control-net` / `egress-net`
-   alongside `sandbox-net`, and flip `sandbox-net` to `internal: true` once
-   there's an egress path that isn't the direct firewall.
-2. **Egress HTTP(S) proxy** — the central choke point: domain allow/block/hold +
-   audit. Lets the transitional GitHub/npm/PyPI firewall entries be removed.
-3. **Skills + quality-gate hooks** in the image — the enablement half of the
+1. **Egress HTTP(S) proxy** — *started* (`docker-compose.yml` + `proxies/egress/`):
+   a CONNECT-level domain allowlist with per-connection audit. Next: make it the
+   **sole** egress path — flip `sandbox-net` to `internal: true`, drop the direct
+   firewall allowlist, and add `control-net` / `egress-net` — then add
+   hold-for-approval + a dynamic policy/audit store (the control plane).
+2. **Skills + quality-gate hooks** in the image — the enablement half of the
    paved road.
-4. **Pull-through package cache** — fast, governed dependency installs.
+3. **Pull-through package cache** — fast, governed dependency installs.
 
 ## Documentation
 

@@ -261,8 +261,9 @@ Consequences:
   skill (below). A user-scope deny is still worth keeping as *accident* prevention,
   not as containment.
 - **WebFetch** is already network-governed; keep it. To also *audit* it through
-  the control-plane proxy, verify whether its client-side fetch honors
-  `HTTPS_PROXY` (untested).
+  the control-plane proxy, it needs to honor `HTTPS_PROXY` — which the official
+  docs say it does (it inherits the CLI's proxy env; see "Claude Code proxy
+  support"). Documentation-level so far, not yet re-tested in this sandbox.
 - **Optional `websearch` skill** — *only* if a future threat model decides to turn
   WebSearch off (see decision below). Web search would then become a governed call
   to a third-party search API (Brave / SerpAPI / Google CSE) with its own read-only
@@ -272,14 +273,81 @@ Consequences:
 The sandbox has no direct internet route (`internal: true`), so Anthropic access
 is a deliberate path, decided one of two ways:
 - **(a) Always-allow api.anthropic.com at the egress proxy** and route the CLI
-  through it — cleanest, keeps Anthropic traffic audited. Caveat: Claude Code's
-  own API calls may not honor `HTTPS_PROXY`; if not, transparent-redirect
-  outbound 443 to the proxy at the network layer.
+  through it — cleanest, keeps Anthropic traffic audited. The docs say the CLI
+  *does* honor `HTTPS_PROXY` for its own API calls (see "Claude Code proxy
+  support"), so this is the expected path; only if an in-sandbox test contradicts
+  that do we fall back to transparent-redirecting outbound 443 at the network
+  layer.
 - **(b) Narrow network-layer firewall allowlist** (iptables/ipset init
   container) permitting only api.anthropic.com directly, dropping the rest —
   forcing all other web through the proxy skill.
 
 Lean (a) so nothing escapes audit; fall back to (b) if the CLI won't proxy.
+
+### Claude Code proxy support (documented — Layer 1; CONFIRMED in-sandbox — Layer 2)
+
+The (a)-vs-(b) choice above hinges on whether the CLI honors `HTTPS_PROXY` for
+its own API calls. Per Anthropic's official
+[Enterprise network configuration](https://code.claude.com/docs/en/network-config)
+docs, **it does** — which points us at (a). This is now **verified in this
+sandbox** (see the Layer-2 result at the end of this subsection), so we are
+committed to (a). Documented points, with the design consequence of each:
+
+- **Standard proxy env vars are honored.** Claude Code reads `HTTP_PROXY`,
+  `HTTPS_PROXY`, and `NO_PROXY` (docs use **uppercase** — use uppercase),
+  Node-native, **read once at startup**. Basic auth via `user:pass@` in the URL.
+  **No SOCKS.** → *Approach (a) is viable: a plain forward proxy injected via
+  `HTTPS_PROXY`, no transparent 443-redirect needed.*
+- **WebFetch inherits the same proxy.** The docs describe no separate mechanism,
+  so the client-side WebFetch uses the same env vars (this resolves the
+  "untested" note in the Web access section — still documentation-level, not yet
+  re-tested here). One concrete wrinkle: WebFetch fires a **domain-safety
+  preflight to `api.anthropic.com` on every fetch**, disableable with
+  `skipWebFetchPreflight: true`. → *WebFetch becomes auditable at the proxy for
+  free once the CLI is proxied.*
+- **TLS interception is a first-class, documented scenario, not a hack.** Custom
+  CA via `NODE_EXTRA_CA_CERTS=/path/ca.pem`; `CLAUDE_CODE_CERT_STORE` (default
+  `bundled,system`) selects trust stores; mTLS via `CLAUDE_CODE_CLIENT_CERT` /
+  `CLAUDE_CODE_CLIENT_KEY` / `CLAUDE_CODE_CLIENT_KEY_PASSPHRASE`. → *Full MITM is
+  a supported later step (see "HTTPS inspection depth" in Open decisions); v1 of
+  the proxy can stay CONNECT/SNI-level with no CA in the sandbox.*
+- **CONNECT-level is enough to close the CDN-fronting gap.** A forward proxy that
+  gates each `CONNECT host:443` against a **domain allowlist** governs on the
+  *requested hostname*, not the shared-CDN IP — which is precisely the
+  IP-vs-domain hole called out for v1's IP-level firewall. (Verifying the
+  ClientHello SNI matches the CONNECT host defends against a client that lies
+  about the CONNECT target.)
+- **The CLI's endpoint set is wider than our current allowlist — decide each.**
+  The docs enumerate what Claude Code reaches; mapped to our posture:
+  `downloads.claude.ai` / `storage.googleapis.com` (native installer +
+  auto-updater) are **moot** — we set `DISABLE_AUTOUPDATER=1`;
+  `raw.githubusercontent.com` (`/release-notes` changelog) is cosmetic and
+  already inside the GitHub ranges; **`mcp-proxy.anthropic.com`** carries
+  claude.ai MCP connectors, which are **on by default** — either disable them
+  (`ENABLE_CLAUDEAI_MCP_SERVERS=false`) or they fail closed against our
+  default-deny. The last is the one worth an explicit decision rather than a
+  silent failure.
+- **`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` is the right lever** for the
+  statsig/feature-flag/telemetry chatter that would otherwise flood the proxy's
+  deny log — and the Dockerfile **already sets it**. Good confirmation, not new
+  work.
+- **Caveat for the proxy phase: deliver proxy vars as real process env, not a
+  shell export.** The docs warn that background-agent/supervisor processes don't
+  reliably inherit a shell's environment; the robust channel is the settings
+  `env` block or the process environment. In our container that means passing
+  them as Dockerfile `ENV` / `docker run -e` (the same pattern the hardening and
+  DNS vars already use), never a `.bashrc` export.
+
+**Layer 2 result — CONFIRMED.** With the step-0 proxy running and the sandbox in
+governed mode (`HTTPS_PROXY=http://egress-proxy:8080`, firewall allowing only the
+proxy + embedded DNS), `boundary-check.sh` reported `api.anthropic.com reachable
+(via proxy http://egress-proxy:8080)` — Claude's own API traffic flows through
+the proxy, so the CLI honors `HTTPS_PROXY`. The same run confirmed the proxy
+refuses a non-allowlisted domain (`egress proxy denies non-allowlisted
+example.com`) and that direct egress, IPv6, and direct external DNS are all
+blocked. So (a) stands and the transparent-redirect fallback (b) is not needed.
+(WebFetch was not separately exercised in that run; it inherits the same proxy
+env, so it is expected — but not yet independently observed — in the audit log.)
 
 ## Server-side execution: accepted governance blind spots
 
@@ -454,13 +522,17 @@ dockade/
   `mitmproxy` is a strong engine for the egress proxy.
 - **HTTPS inspection depth** — CONNECT/SNI (domain-level, no CA in sandbox) vs
   full MITM (URL/body-level, needs a generated CA in the sandbox). Likely start
-  CONNECT-level, allow MITM per-domain later.
+  CONNECT-level, allow MITM per-domain later. Both are documented-supported by
+  the CLI (MITM via `NODE_EXTRA_CA_CERTS` / `CLAUDE_CODE_CERT_STORE`; see "Claude
+  Code proxy support"), so the choice is ours, not gated by tool support.
 - **Policy storage** — SQLite to start.
 - **Anthropic reachability** — end state is (a) always-allow via egress proxy vs
   (b) network-layer firewall allowlist. **v1 already runs (b) transitionally** (the
   firewall directly allowlists api.anthropic.com); the open question is whether to
-  move to (a) at the proxy phase, which depends on whether the CLI honors
-  `HTTPS_PROXY` for its own API calls; verify.
+  move to (a) at the proxy phase. The blocker for (a) — does the CLI honor
+  `HTTPS_PROXY` for its own API calls — is **resolved at the documentation level**
+  (yes; see "Claude Code proxy support"), leaning us toward (a); it now needs only
+  the in-sandbox empirical confirmation described there.
 - **Web search backend** — which third-party search API for the `websearch`
   skill (Brave / SerpAPI / Google CSE).
 - **RESOLVED — the local managed file is not an enforcement lever under org auth.**
@@ -500,10 +572,62 @@ single-container image and launcher centered on this design. Notable properties:
   `init-firewall.sh` remains the egress boundary. Flip to internal (and add an
   explicit allow for the sanctioned services' subnet) when the proxy lands.
 
-Not yet built: control plane, proxies/tools, the control-net/egress-net
-topology, skills, quality-gate hooks. `docker-compose.yml` arrives with
-the multi-container phase; v1 uses `run-claude-sandbox.sh` + in-container
-firewall.
+**Egress proxy — step 0 shipped** (`docker-compose.yml` + `proxies/egress/`). The
+multi-container phase has begun, with a deliberate split the topology relies on:
+`docker-compose.yml` owns the **shared, long-lived infrastructure** (the data
+plane — currently just the egress proxy), and `run-claude-sandbox.sh` still
+launches the **ephemeral sandbox(es)** that attach to it (`docker run -it --rm`,
+one or many, each per-workspace with its own firewall/DNS/git wiring). Sandboxes
+are intentionally *not* compose services: they are interactive, disposable, and
+plural, which `compose run` models poorly.
+
+The proxy itself is `mitmproxy` in regular (forward) mode with a policy/audit
+addon (`proxies/egress/addon.py`): **CONNECT-level, default-deny domain
+allowlist, per-connection JSON audit, no TLS interception** (HTTPS is tunnelled
+via `ignore_connection`, so no CA in the sandbox). The launcher discovers the
+proxy on `sandbox-net`, points the agent's `HTTPS_PROXY` at it (the CLI honors it
+— see "Claude Code proxy support"), and allowlists it in the firewall
+(`EGRESS_PROXY_IP`). Chosen properties: it does **not** weaken the boundary while
+we validate — the allowlist is default-deny from the first commit, so arbitrary
+egress via the proxy is refused (not allow-all), and `boundary-check.sh` stays
+meaningful; and the allowlist is re-read per connection, a cheap stand-in for
+"dynamic" until the control plane exists. Governs by **name**, so it closes the
+shared-CDN/fronting gap the IP firewall can't (for proxied traffic).
+
+**Governed vs standalone egress (the firewall is mode-aware).** When the launcher
+finds the proxy it sets `EGRESS_PROXY_IP`, and `init-firewall.sh` switches to a
+minimal **governed** posture — the sandbox's only `OUTPUT` ACCEPTs become:
+loopback (incl. embedded DNS `127.0.0.11`), DNS **to `127.0.0.11` only**, the
+proxy `/32:8080`, and `ESTABLISHED,RELATED`; everything else is REJECTed. Dropped
+in governed mode vs the old posture: the direct per-domain IP allowlist (so **no
+ipset**), the **upstream DNS forward** (closing the residual DNS-exfil channel —
+a crafted name can no longer reach a recursive resolver; sibling names like
+`egress-proxy` still resolve locally), and the **gateway `/32`** (host-local
+surface). Without a proxy the firewall keeps the fuller **standalone** allowlist
+(ipset + upstreams + gateway). Net effect: with the proxy up, the sandbox's only
+paths off-box are the proxy (HTTP/S, domain-governed + audited) and — narrowly —
+the embedded resolver for sibling names. This is effectively step 1's egress
+posture, reached early. Consequence to remember: a tool that does its own
+external DNS or connects direct *without* honoring `HTTPS_PROXY` now fails closed
+(by design — proxied tools hand the hostname to the proxy, which resolves it).
+
+**WSL2 kernel gotcha (`xt_set`).** On stock WSL2 kernels `ipset create` can
+succeed while iptables `-m set --match-set` fails with `Can't open socket to
+ipset` — the kernel ships enough of `ip_set` for the userspace tool but not the
+`xt_set` match module. This is a *kernel*-capability gap, unrelated to container
+caps (`ipset`/xtables need `NET_ADMIN`, never `NET_RAW` — re-adding `NET_RAW`
+does not help and re-opens a hole). Governed mode sidesteps it entirely (no ipset
+path); standalone mode fails **closed** with a pointer to use the proxy. Do not
+"fix" ipset errors by adding capabilities — use the proxy.
+
+Still transitional in step 0: the sandbox keeps its **direct** firewall
+allowlist as a fallback in **standalone** mode. The next step makes the proxy the
+**sole** egress everywhere (`sandbox-net` → `internal: true`, add
+`control-net`/`egress-net`, route DNS through the proxy too). After that:
+hold-for-approval + a dynamic policy/audit store (the control plane).
+
+Not yet built: control plane, the control-net/egress-net topology, git/secrets/
+cache data-plane services, skills, quality-gate hooks.
 
 **Transitional firewall entries (remove at the proxy/cache phase):** the sandbox
 firewall currently whitelists package registries (npm/PyPI) and GitHub only

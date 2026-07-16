@@ -25,19 +25,35 @@ bad()  { printf '  %sFAIL%s %s\n' "$red"   "$reset" "$1"; fail=$((fail+1)); }
 info() { printf '  %s·%s    %s\n' "$dim"   "$reset" "$1"; }
 
 printf '%s== egress ==%s\n' "$bold" "$reset"
-# The core default-deny property: an arbitrary external site must be unreachable.
-# example.com presents a valid cert, so a successful fetch is a genuine leak.
-if curl --connect-timeout 5 -s -o /dev/null https://example.com 2>/dev/null; then
-    bad "example.com reachable — egress leak"
+# The core default-deny property is the DIRECT firewall boundary, so probe it with
+# --noproxy '*' — otherwise, when HTTPS_PROXY is set, curl would route through the
+# proxy and we'd be testing the proxy's policy instead of the firewall. An
+# arbitrary external site must be unreachable directly; example.com presents a
+# valid cert, so a successful direct fetch is a genuine leak.
+if curl --noproxy '*' --connect-timeout 5 -s -o /dev/null https://example.com 2>/dev/null; then
+    bad "direct egress leak — reached example.com (bypassing any proxy)"
 else
-    ok "example.com blocked"
+    ok "direct egress to example.com blocked (firewall)"
 fi
-# The Anthropic lifeline must be reachable, or the agent cannot function. Any HTTP
-# response (even 4xx) means the connection succeeded, which is all we assert here.
+# The Anthropic lifeline must be reachable via whatever path the agent actually
+# uses — through the proxy if governed, direct otherwise — so DON'T set --noproxy
+# here: use the ambient env. Any HTTP response (even 4xx) means the connection
+# succeeded, which is all we assert.
+if [ -n "${HTTPS_PROXY:-}" ]; then lifeline_path="via proxy $HTTPS_PROXY"; else lifeline_path="direct"; fi
 if curl --connect-timeout 5 -s -o /dev/null https://api.anthropic.com 2>/dev/null; then
-    ok "api.anthropic.com reachable"
+    ok "api.anthropic.com reachable ($lifeline_path)"
 else
-    bad "api.anthropic.com NOT reachable — lifeline down"
+    bad "api.anthropic.com NOT reachable ($lifeline_path) — lifeline down"
+fi
+# Governed mode: when routed through the egress proxy, a non-allowlisted domain
+# must be refused BY THE PROXY (a 403 on the CONNECT), not merely by the firewall.
+# This asserts the proxy's default-deny policy is actually enforcing.
+if [ -n "${HTTPS_PROXY:-}" ]; then
+    if curl --connect-timeout 5 -s -o /dev/null https://example.com 2>/dev/null; then
+        bad "egress proxy allowed non-allowlisted example.com — policy not enforcing"
+    else
+        ok "egress proxy denies non-allowlisted example.com"
+    fi
 fi
 
 printf '%s== ipv6 ==%s\n' "$bold" "$reset"
@@ -47,7 +63,7 @@ if [ -e /proc/net/if_inet6 ]; then
     # mean the packet was blocked; a TLS-layer error (35/51/60) would mean the TCP
     # connection actually OPENED — i.e. an ungoverned v6 path — so treat anything
     # that isn't a clean connect-failure as reachable.
-    curl -6 --connect-timeout 5 -s -o /dev/null "https://[2606:4700:4700::1111]" 2>/dev/null
+    curl --noproxy '*' -6 --connect-timeout 5 -s -o /dev/null "https://[2606:4700:4700::1111]" 2>/dev/null
     rc=$?
     case "$rc" in
         7|28) ok "IPv6 egress blocked (curl rc=$rc)" ;;
@@ -82,17 +98,25 @@ else
     ok "no docker socket"
 fi
 
-printf '%s== dns %s(informational)%s ==%s\n' "$bold" "$dim" "$reset$bold" "$reset"
-# DNS is pinned to named resolvers, but a recursive resolver still forwards
-# crafted names upstream (a documented residual exfil channel until lookups route
-# through the proxy). This probe is host-dependent, so it is reported, not
-# asserted: reaching an arbitrary public resolver would suggest port-53 is broader
-# than the pinned set.
+printf '%s== dns ==%s\n' "$bold" "$reset"
+# In GOVERNED mode the firewall allows DNS only to the embedded resolver
+# (127.0.0.11); the upstream forward is dropped, so a crafted name can't be
+# smuggled to a recursive resolver — reaching an external resolver directly would
+# be a leak, so ASSERT it's blocked. In STANDALONE mode the pinned upstreams are
+# permitted (host-dependent), so report rather than assert.
 if command -v dig >/dev/null 2>&1; then
     if dig +time=3 +tries=1 @1.1.1.1 example.com >/dev/null 2>&1; then
-        info "reached 1.1.1.1:53 — it is the pinned upstream, or port-53 is broad (check)"
+        if [ -n "${HTTPS_PROXY:-}" ]; then
+            bad "external resolver 1.1.1.1:53 reachable — governed mode should block direct DNS"
+        else
+            info "reached 1.1.1.1:53 — it is the pinned upstream, or port-53 is broad (check)"
+        fi
     else
-        info "1.1.1.1:53 unreachable (consistent with resolver pinning)"
+        if [ -n "${HTTPS_PROXY:-}" ]; then
+            ok "direct DNS to external resolvers blocked (only embedded 127.0.0.11 allowed)"
+        else
+            info "1.1.1.1:53 unreachable (consistent with resolver pinning)"
+        fi
     fi
 else
     info "dig not available; skipping DNS probe"

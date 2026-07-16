@@ -1,0 +1,57 @@
+name: dockade
+
+# Shared, long-lived INFRASTRUCTURE (data plane) for the Claude sandbox(es).
+# Bring it up once:
+#     docker compose up -d --build
+# then start one or more sandboxes against it with run-claude-sandbox.sh.
+#
+# The sandbox containers are intentionally NOT defined here. They are ephemeral,
+# per-workspace, and possibly many; run-claude-sandbox.sh launches each one
+# (`docker run -it --rm`) attached to sandbox-net below, so it keeps its
+# interactive TTY, its host-matched uid/gid, and its per-launch DNS/git wiring.
+# This file owns only the infrastructure they all share.
+
+networks:
+  sandbox-net:
+    name: sandbox-net
+    driver: bridge
+    # Fixed subnet so the egress proxy gets a stable IP the sandbox firewall can
+    # allowlist. NOT internal:true in step 0 — sandboxes still keep direct egress
+    # via their in-container firewall as a fallback; flip to internal at step 3,
+    # once the proxy is proven to be the sole egress path.
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  egress-audit:
+    name: dockade-egress-audit
+
+services:
+  # Governed egress proxy — the central choke point (step 0: CONNECT-level
+  # domain allowlist + audit, no TLS interception). See proxies/egress/.
+  egress-proxy:
+    build:
+      context: ./proxies/egress
+    image: dockade-egress-proxy
+    container_name: egress-proxy
+    hostname: egress-proxy
+    restart: unless-stopped
+    networks:
+      sandbox-net:
+        # Stable address the sandbox firewall allowlists (matches the launcher's
+        # discovery). Keep in the subnet above.
+        ipv4_address: 172.30.0.10
+    # The proxy resolves the (public) allowlisted targets itself. Default to
+    # public resolvers; override in a .env (EGRESS_DNS_PRIMARY/SECONDARY) for
+    # locked-down / corporate networks where those are blocked.
+    dns:
+      - ${EGRESS_DNS_PRIMARY:-8.8.8.8}
+      - ${EGRESS_DNS_SECONDARY:-8.8.4.4}
+    volumes:
+      - egress-audit:/var/log/egress
+    # A plain forward proxy needs no elevated privileges.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true

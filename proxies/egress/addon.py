@@ -33,6 +33,18 @@ from mitmproxy import http, tls
 ALLOWLIST_PATH = os.environ.get("EGRESS_ALLOWLIST", "/etc/egress/allowlist.txt")
 AUDIT_PATH = os.environ.get("EGRESS_AUDIT_LOG", "/var/log/egress/audit.jsonl")
 
+# This is an HTTP(S) egress proxy, so the policy has a port intent even though
+# the allowlist only names hosts: CONNECT tunnels are for HTTPS, plain forward
+# requests are for HTTP. Gate on it — otherwise an allowlisted host is reachable
+# on ANY port over a raw TCP tunnel (SSH, arbitrary TLS services, ...), widening
+# the channel well past what "allow example.com" is meant to grant. Override for
+# the rare host that legitimately serves HTTP(S) on a non-standard port.
+def _ports(env: str, default: str) -> frozenset[int]:
+    return frozenset(int(p) for p in os.environ.get(env, default).split(",") if p.strip())
+
+ALLOWED_CONNECT_PORTS = _ports("EGRESS_CONNECT_PORTS", "443")  # HTTPS tunnels
+ALLOWED_HTTP_PORTS = _ports("EGRESS_HTTP_PORTS", "80")         # plain HTTP
+
 logger = logging.getLogger("egress")
 
 
@@ -86,40 +98,76 @@ def load(loader) -> None:  # mitmproxy lifecycle hook
 
 def http_connect(flow: http.HTTPFlow) -> None:
     """All HTTPS via a forward proxy arrives as CONNECT host:port. Decide here,
-    before any TLS — rejecting with a 403 needs no CA."""
+    before any TLS — rejecting with a 403 needs no CA. Gate on BOTH host and
+    port: the tunnel is opaque TCP (``ignore_connection`` below), so an allowed
+    host on an unrestricted port would carry any protocol, not just HTTPS."""
     host = flow.request.host
+    port = flow.request.port
     client = flow.client_conn.peername[0] if flow.client_conn.peername else None
-    if _allowed(host):
-        _audit("allow", proto="connect", host=host, port=flow.request.port,
-               client=client)
+    allowed_host = _allowed(host)
+    if allowed_host and port in ALLOWED_CONNECT_PORTS:
+        _audit("allow", proto="connect", host=host, port=port, client=client)
     else:
-        _audit("deny", proto="connect", host=host, port=flow.request.port,
-               client=client)
+        reason = ("host not allowlisted" if not allowed_host
+                  else f"port {port} not permitted for CONNECT "
+                       f"({sorted(ALLOWED_CONNECT_PORTS)})")
+        _audit("deny", proto="connect", host=host, port=port, client=client,
+               reason=reason)
         flow.response = http.Response.make(
             403, b"egress denied by policy\n", {"Content-Type": "text/plain"})
 
 
 def tls_clienthello(data: tls.ClientHelloData) -> None:
-    """Pass HTTPS through without decrypting (no CA in the sandbox). We still see
-    the SNI: if it names a host the allowlist doesn't (e.g. domain-fronting
-    behind an allowed CONNECT target), flag it. Enforcing on that mismatch is a
-    step-1 refinement; step 0 observes and audits it."""
-    data.ignore_connection = True
+    """Decide whether to pass this HTTPS connection through undecrypted. The
+    CONNECT authority was already allowlisted in ``http_connect``, but the TLS
+    SNI can name a DIFFERENT host (domain-fronting behind an allowed CONNECT
+    target), so gate on it too.
+
+      - SNI absent, or SNI allowlisted -> tunnel it (``ignore_connection``); no
+        CA needed, as before.
+      - SNI present but NOT allowlisted -> refuse to tunnel. We leave
+        interception ON rather than passing the bytes through, which fails
+        CLOSED both ways: with no mitmproxy CA in the sandbox (the standing
+        invariant) the client rejects the minted cert and the handshake dies;
+        if a CA is ever added for per-domain MITM, the flow is instead decrypted
+        and re-gated at the HTTP layer by ``request`` below. Either way a
+        non-allowlisted SNI cannot pass unexamined."""
     sni = data.client_hello.sni
-    if sni and not _allowed(sni):
-        _audit("warn-sni", sni=sni,
-               note="SNI not in allowlist (possible domain-fronting)")
+    if sni is None or _allowed(sni):
+        data.ignore_connection = True
+        return
+    _audit("deny-sni", sni=sni,
+           note="SNI not allowlisted; refusing passthrough (possible domain-fronting)")
 
 
 def request(flow: http.HTTPFlow) -> None:
-    """Plain HTTP (uncommon here — most traffic is HTTPS/CONNECT). Gate on the
-    Host and log the full URL."""
-    host = flow.request.host
-    if _allowed(host):
-        _audit("allow", proto="http", method=flow.request.method,
+    """Gate a decrypted request. Today this only sees PLAIN HTTP (HTTPS is
+    tunnelled opaque via ``ignore_connection``), but a denied-SNI flow — or any
+    flow once a MITM CA is added — arrives here decrypted and MUST be re-gated.
+
+    Gate EVERY name the client asserts, not just one:
+      - ``request.host`` — the transport target we dial. For an intercepted HTTPS
+        flow this is the CONNECT authority (already allowlisted at CONNECT).
+      - ``request.pretty_host`` — the Host header / :authority, the name the
+        client actually addresses.
+    Domain-fronting hides a NON-allowlisted Host behind an allowlisted CONNECT
+    authority, so checking only ``request.host`` would wave the fronted request
+    through (it did — see the DESIGN/audit trail). Requiring BOTH closes it."""
+    https = flow.request.scheme == "https"
+    proto = "https" if https else "http"
+    allowed_ports = ALLOWED_CONNECT_PORTS if https else ALLOWED_HTTP_PORTS
+    port = flow.request.port
+    # sorted() only to make the "which name failed" report deterministic.
+    names = sorted({flow.request.host, flow.request.pretty_host})
+    bad_name = next((n for n in names if not _allowed(n)), None)
+    if bad_name is None and port in allowed_ports:
+        _audit("allow", proto=proto, method=flow.request.method,
                url=flow.request.pretty_url)
     else:
-        _audit("deny", proto="http", method=flow.request.method,
-               url=flow.request.pretty_url)
+        reason = (f"host not allowlisted ({bad_name})" if bad_name is not None
+                  else f"port {port} not permitted for {proto} "
+                       f"({sorted(allowed_ports)})")
+        _audit("deny", proto=proto, method=flow.request.method,
+               url=flow.request.pretty_url, reason=reason)
         flow.response = http.Response.make(
             403, b"egress denied by policy\n", {"Content-Type": "text/plain"})

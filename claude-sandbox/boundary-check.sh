@@ -62,6 +62,42 @@ if [ -n "${HTTPS_PROXY:-}" ]; then
     else
         ok "egress proxy denies non-allowlisted example.com"
     fi
+
+    # Port governance: the proxy is an HTTP(S) proxy, so a CONNECT to an
+    # allowlisted host on a NON-443 port must be refused with a 403 — otherwise an
+    # allowlisted host would carry arbitrary TCP (SSH, other TLS services) over a
+    # raw tunnel. We require the 403 specifically (not just any failure): if the
+    # port gate regressed, the proxy would tunnel to :8443 and curl would fail on
+    # the unreachable upstream instead — no 403 — which this correctly flags.
+    portresp="$(curl -sS --connect-timeout 5 -o /dev/null https://api.anthropic.com:8443/ 2>&1 || true)"
+    if printf '%s' "$portresp" | grep -q '403'; then
+        ok "egress proxy refuses non-443 CONNECT (api.anthropic.com:8443 -> 403)"
+    else
+        bad "egress proxy did NOT 403 a non-443 CONNECT to api.anthropic.com:8443 (got: ${portresp:-<none>})"
+    fi
+
+    # SNI / domain-fronting governance: CONNECT an allowlisted host but present a
+    # NON-allowlisted TLS SNI. --connect-to makes curl send CONNECT
+    # api.anthropic.com:443 (so http_connect passes on the authority) while the
+    # TLS SNI and Host header stay example.com (not allowlisted), which is exactly
+    # domain-fronting. The proxy must refuse the passthrough on the SNI.
+    #   -k: if the proxy wrongly tunnelled it, we'd get the real fronted response
+    #       rather than a curl cert error masking the leak.
+    # Enforced outcomes (both acceptable): the proxy declines to tunnel and MITM-
+    # re-gates at the HTTP layer -> 403 "egress denied by policy"; OR the handshake
+    # just fails closed (no trusted CA) -> curl errors. Leak: a normal passthrough
+    # response from the fronted host (curl succeeds, body is not the policy denial).
+    front="$(curl -sS -k --connect-timeout 5 \
+        --connect-to example.com:443:api.anthropic.com:443 \
+        https://example.com/ 2>&1)"
+    frc=$?
+    if [ "$frc" -ne 0 ]; then
+        ok "SNI fronting blocked (handshake failed closed; no passthrough)"
+    elif printf '%s' "$front" | grep -qi 'egress denied by policy'; then
+        ok "SNI fronting refused by proxy (deny-sni)"
+    else
+        bad "SNI fronting NOT refused — got a passthrough response (domain-fronting leak)"
+    fi
 fi
 
 printf '%s== ipv6 ==%s\n' "$bold" "$reset"

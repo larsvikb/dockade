@@ -1,0 +1,24 @@
+# Project yamllint config (gate: `make check`).
+#
+# Relaxed from yamllint's opinionated defaults so it's signal, not noise: the
+# high-value structural rules stay ON (syntax errors, duplicate keys, bad
+# indentation, trailing spaces), while purely stylistic ones we don't follow are
+# relaxed. yamllint is run without --strict, so `level: warning` rules report but
+# do not fail the build.
+extends: default
+
+rules:
+  # We don't use `---` document-start markers on these config/compose files.
+  document-start: disable
+  # Long lines are allowed (compose env-substitutions, URLs); warn past 120.
+  line-length:
+    max: 120
+    level: warning
+  # Allow a single space before an inline `# comment` (default demands two).
+  comments:
+    min-spaces-from-content: 1
+  comments-indentation: disable
+  # Don't flag mapping keys as truthy (e.g. a future GitHub Actions `on:` key);
+  # still catch yes/no/on/off used as values.
+  truthy:
+    check-keys: false

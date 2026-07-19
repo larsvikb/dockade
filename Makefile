@@ -28,6 +28,8 @@ SCRIPTS := run-claude-sandbox.sh \
            claude-sandbox/boundary-check.sh \
            claude-sandbox/statusline.sh
 DOCKERFILES := claude-sandbox/Dockerfile proxies/egress/Dockerfile
+YAMLFILES := docker-compose.yml .hadolint.yaml .yamllint
+JSONFILES := $(shell git ls-files '*.json' 2>/dev/null)
 
 # Files referenced by Dockerfile COPY / entrypoint — existence is asserted so a
 # rename can't silently break the build.
@@ -54,7 +56,7 @@ help: ## Show this help
 check: lint consistency ## Run all static checks (linters + consistency guards)
 	@echo "== all checks passed =="
 
-lint: ## Run linters (shellcheck, hadolint, ruff) — skipped if not installed
+lint: ## Run linters (shellcheck, hadolint, ruff, yamllint) — skipped if not installed
 	@fail=0
 	if command -v shellcheck >/dev/null 2>&1; then
 	  echo "== shellcheck =="; shellcheck $(SCRIPTS) || fail=1
@@ -65,6 +67,9 @@ lint: ## Run linters (shellcheck, hadolint, ruff) — skipped if not installed
 	if command -v ruff >/dev/null 2>&1; then
 	  echo "== ruff =="; ruff check proxies/egress/addon.py || fail=1
 	else echo "SKIP ruff (not installed)"; fi
+	if command -v yamllint >/dev/null 2>&1; then
+	  echo "== yamllint =="; yamllint $(YAMLFILES) || fail=1
+	else echo "SKIP yamllint (not installed)"; fi
 	exit $$fail
 
 consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
@@ -72,6 +77,11 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	for f in $(SCRIPTS); do bash -n "$$f"; echo "  ok $$f"; done
 	echo "== python compile (addon) =="
 	python3 -m py_compile proxies/egress/addon.py && echo "  ok addon.py"
+	echo "== json validity =="
+	for f in $(JSONFILES); do
+	  python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$$f" && echo "  ok $$f" \
+	    || { echo "  BAD $$f"; exit 1; }
+	done
 	echo "== domain allowlist drift (firewall ⊆ proxy allowlist) =="
 	fw=$$(awk '/ALLOWED_DOMAINS=\(/{f=1;next} f&&/^[[:space:]]*\)/{f=0} f' \
 	         claude-sandbox/init-firewall.sh | grep -oE '"[a-z0-9.]+"' | tr -d '"' | sort -u)

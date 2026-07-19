@@ -118,13 +118,15 @@ RUN curl -fsSL https://claude.ai/install.sh -o /tmp/install.sh \
        else bash /tmp/install.sh "$CLAUDE_VERSION"; fi \
     && rm /tmp/install.sh
 
-# ruff — Python linter + formatter in one fast binary (replaces flake8/black/
-# isort). pipx-isolated so it never touches the system Python; lands in
-# ~/.local/bin, already on PATH. Self-contained: no plugins to fetch at runtime,
-# so it works under the sandbox's default-deny egress. Part of the paved-road
-# toolchain; installed here as the non-root user, like Claude Code.
+# ruff (Python lint + format) and yamllint (YAML lint) — pipx-isolated so they
+# never touch the system Python; land in ~/.local/bin, already on PATH.
+# Self-contained: no plugins to fetch at runtime, so they work under the sandbox's
+# default-deny egress. Part of the paved-road toolchain; installed here as the
+# non-root user, like Claude Code.
 RUN pipx install ruff \
-    && ruff --version
+    && pipx install yamllint \
+    && ruff --version \
+    && yamllint --version
 
 # Dotfiles
 COPY dotfiles/.bashrc dotfiles/.vimrc dotfiles/.inputrc dotfiles/.gitconfig /home/$USERNAME/

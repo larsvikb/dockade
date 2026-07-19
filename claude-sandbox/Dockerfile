@@ -1,4 +1,4 @@
-FROM ubuntu:24.04
+FROM debian:13-slim
 
 ARG TZ=UTC
 ENV TZ="$TZ"
@@ -11,7 +11,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # Baseline Linux + dev stack
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl wget ca-certificates gnupg2 \
+    curl wget ca-certificates gnupg \
     git openssh-client \
     less procps sudo gosu unzip \
     fzf nano vim ripgrep jq \
@@ -54,19 +54,17 @@ RUN arch="$(dpkg --print-architecture)" \
     && chmod 0755 /usr/local/bin/hadolint \
     && hadolint --version
 
-# Non-root user. ubuntu:24.04 ships a stock `ubuntu` user at uid/gid 1000 (the
-# only thing at 1000 in the base image). Remove it so the sandbox user can own
-# 1000 — matching the host user's uid keeps bind-mounted workspaces writable from
-# both sides (WSL drvfs presents Windows-drive files as the host uid; a mismatch
-# leaves the agent read-only on its own workspace). USER_UID/USER_GID default to
-# 1000 and are set from the host by run-claude-sandbox.sh; override for a
-# different host uid.
+# Non-root user. Unlike ubuntu:24.04 (which ships a stock `ubuntu` user at uid
+# 1000 that has to be removed first), debian:13-slim has no default uid-1000 user,
+# so the sandbox user can claim it directly. Matching the host user's uid keeps
+# bind-mounted workspaces writable from both sides (WSL drvfs presents
+# Windows-drive files as the host uid; a mismatch leaves the agent read-only on
+# its own workspace). USER_UID/USER_GID default to 1000 and are set from the host
+# by run-claude-sandbox.sh; override for a different host uid.
 ARG USERNAME=sandbox
 ARG USER_UID=1000
 ARG USER_GID=1000
-RUN (userdel -r ubuntu 2>/dev/null || true) \
-    && (groupdel ubuntu 2>/dev/null || true) \
-    && groupadd --gid $USER_GID $USERNAME \
+RUN groupadd --gid $USER_GID $USERNAME \
     && useradd --uid $USER_UID --gid $USER_GID -m -s /bin/bash $USERNAME \
     && mkdir -p /home/$USERNAME/.local/bin
 

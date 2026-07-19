@@ -9,7 +9,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-IMAGE_NAME="claude-sandbox"
+# Image tag to build/run. Override with SANDBOX_IMAGE to A/B-test a variant
+# (e.g. the debian:13-slim base) without clobbering the default `claude-sandbox`.
+IMAGE_NAME="${SANDBOX_IMAGE:-claude-sandbox}"
 CONFIG_VOLUME="claude-sandbox-config"
 SANDBOX_NET="sandbox-net"
 # CONTAINER_NAME is chosen later (after proxy discovery) so multiple sandboxes

@@ -571,8 +571,17 @@ single-container image and launcher centered on this design. Notable properties:
   materialized to `/config/settings.json` authoritatively on each boot — the
   default status line ships this way; config is image-owned, the volume holds
   only credentials/runtime state.
-- Node LTS + `gh` + pipx added to the baseline stack; firewall allowlist
-  trimmed to this design (Anthropic + GitHub + npm + PyPI).
+- **Base image `debian:13-slim`** (Debian 13 "trixie") — chosen over `ubuntu:24.04`
+  for a leaner base with no default uid-1000 user to evict (dropping a `userdel`
+  step) and archive utilities as fresh or fresher; the firewall (iptables-nft on
+  both) and host-uid matching behave identically, verified by a build +
+  `boundary-check.sh` pass on the Debian base. The Ubuntu LTS+ESM support window is
+  the one trade-off, minor under rebuild-to-update.
+- Baseline stack: **Node current LTS (24.x)** + `gh` + pipx, plus baked linters
+  (shellcheck / hadolint / ruff, all self-contained so they run under default-deny
+  egress). Node tracks the latest LTS line (even majors); bump the NodeSource
+  `setup_NN.x` major to move it. Firewall allowlist trimmed to this design
+  (Anthropic + GitHub + npm + PyPI).
 - **Own user-defined bridge `sandbox-net`** (owned by `docker-compose.yml`,
   created idempotently by the launcher when the compose infra is absent), not
   Docker's default bridge — gets embedded DNS (`127.0.0.11`, which the firewall

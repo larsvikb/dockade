@@ -22,8 +22,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean && rm -rf /var/lib/apt/lists/* \
     && update-alternatives --set editor /usr/bin/vim.basic
 
-# Node.js LTS (greenfield coding baseline)
-RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+# Node.js — current LTS line (greenfield coding baseline). Even-numbered majors
+# are LTS; bump this to the next even major (24 -> 26 -> ...) to move LTS lines.
+RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 

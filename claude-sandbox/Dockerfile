@@ -4,6 +4,11 @@ ARG TZ=UTC
 ENV TZ="$TZ"
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Fail pipelines on the first error, so a piped `curl ... | bash` (Node install
+# below) aborts if the download fails instead of piping empty input onward.
+# Applies to every shell-form RUN.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
 # Baseline Linux + dev stack
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl wget ca-certificates gnupg2 \
@@ -13,6 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     iptables ipset iproute2 dnsutils aggregate \
     python3 python3-pip python3-venv pipx \
     build-essential \
+    shellcheck \
     && apt-get clean && rm -rf /var/lib/apt/lists/* \
     && update-alternatives --set editor /usr/bin/vim.basic
 
@@ -28,6 +34,25 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
       > /etc/apt/sources.list.d/github-cli.list \
     && apt-get update && apt-get install -y --no-install-recommends gh \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# hadolint — Dockerfile linter. Single static binary with no runtime deps, so it
+# works under the sandbox's default-deny egress (nothing to fetch at run time).
+# Pinned version; arch-mapped so the same build works on amd64 and arm64 hosts.
+# Fetched at BUILD time, where egress is unrestricted (the firewall only arms at
+# container start). To harden further, pin the per-arch sha256 from the release
+# page and verify it here.
+ARG HADOLINT_VERSION=v2.12.0
+RUN arch="$(dpkg --print-architecture)" \
+    && case "$arch" in \
+         amd64) hadolint_arch=x86_64 ;; \
+         arm64) hadolint_arch=arm64 ;; \
+         *) echo "unsupported arch '$arch' for hadolint" >&2; exit 1 ;; \
+       esac \
+    && curl -fsSL \
+       "https://github.com/hadolint/hadolint/releases/download/${HADOLINT_VERSION}/hadolint-Linux-${hadolint_arch}" \
+       -o /usr/local/bin/hadolint \
+    && chmod 0755 /usr/local/bin/hadolint \
+    && hadolint --version
 
 # Non-root user. ubuntu:24.04 ships a stock `ubuntu` user at uid/gid 1000 (the
 # only thing at 1000 in the base image). Remove it so the sandbox user can own
@@ -94,6 +119,14 @@ RUN curl -fsSL https://claude.ai/install.sh -o /tmp/install.sh \
        else bash /tmp/install.sh "$CLAUDE_VERSION"; fi \
     && rm /tmp/install.sh
 
+# ruff — Python linter + formatter in one fast binary (replaces flake8/black/
+# isort). pipx-isolated so it never touches the system Python; lands in
+# ~/.local/bin, already on PATH. Self-contained: no plugins to fetch at runtime,
+# so it works under the sandbox's default-deny egress. Part of the paved-road
+# toolchain; installed here as the non-root user, like Claude Code.
+RUN pipx install ruff \
+    && ruff --version
+
 # Dotfiles
 COPY dotfiles/.bashrc dotfiles/.vimrc dotfiles/.inputrc dotfiles/.gitconfig /home/$USERNAME/
 
@@ -103,6 +136,11 @@ COPY dotfiles/.bashrc dotfiles/.vimrc dotfiles/.inputrc dotfiles/.gitconfig /hom
 # file entirely, so it is not an enforcement lever here (verified; see DESIGN.md).
 # Enforcement is the firewall + capability containment; hard policy is the org
 # admin console.
+#
+# Ends as root ON PURPOSE: the entrypoint needs root to arm the firewall
+# (NET_ADMIN) before dropping to the non-root sandbox user via gosu, so the
+# running agent is never root. See entrypoint.sh.
+# hadolint ignore=DL3002
 USER root
 COPY user-settings.json /etc/claude-code/user-settings.json
 COPY statusline.sh /etc/claude-code/statusline.sh

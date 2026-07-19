@@ -1,4 +1,12 @@
-FROM mitmproxy/mitmproxy:latest
+# Pinned: the egress proxy is the security choke point, so its base is not left on
+# :latest (a rebuild could otherwise pull a mitmproxy whose addon API / TLS
+# handling differs from what addon.py is written against — risking a fail-open).
+# Upgrades are deliberate: bump this, rebuild, re-run boundary-check.sh. For full
+# supply-chain immutability, append the digest:
+#   FROM mitmproxy/mitmproxy:12.2.3@sha256:<digest>
+# (get it with: docker image inspect mitmproxy/mitmproxy:12.2.3 \
+#   --format '{{index .RepoDigests 0}}')
+FROM mitmproxy/mitmproxy:12.2.3
 
 # Policy + audit addon and the baked starter allowlist. The allowlist is re-read
 # per request, so it can be edited live (docker exec / bind mount) or, later,

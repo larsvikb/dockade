@@ -534,13 +534,15 @@ dockade/
   the CLI (MITM via `NODE_EXTRA_CA_CERTS` / `CLAUDE_CODE_CERT_STORE`; see "Claude
   Code proxy support"), so the choice is ours, not gated by tool support.
 - **Policy storage** — SQLite to start.
-- **Anthropic reachability** — end state is (a) always-allow via egress proxy vs
-  (b) network-layer firewall allowlist. **v1 already runs (b) transitionally** (the
-  firewall directly allowlists api.anthropic.com); the open question is whether to
-  move to (a) at the proxy phase. The blocker for (a) — does the CLI honor
-  `HTTPS_PROXY` for its own API calls — is **resolved at the documentation level**
-  (yes; see "Claude Code proxy support"), leaning us toward (a); it now needs only
-  the in-sandbox empirical confirmation described there.
+- **RESOLVED — Anthropic reachability is (a): always-allow via the egress proxy.**
+  The end-state choice was (a) always-allow via egress proxy vs (b) network-layer
+  firewall allowlist. The blocker for (a) — does the CLI honor `HTTPS_PROXY` for
+  its own API calls — is now **confirmed in-sandbox** (see the Layer-2 result in
+  "Claude Code proxy support": with governed mode active, `boundary-check.sh`
+  reports api.anthropic.com reachable via the proxy and direct egress blocked), so
+  (a) stands and the transparent-redirect fallback (b) is not needed. Governed mode
+  is the default and implements (a) today; (b) survives only as the **standalone**
+  (proxy-less) fallback, where the firewall directly allowlists api.anthropic.com.
 - **Web search backend** — which third-party search API for the `websearch`
   skill (Brave / SerpAPI / Google CSE).
 - **RESOLVED — the local managed file is not an enforcement lever under org auth.**
@@ -571,14 +573,14 @@ single-container image and launcher centered on this design. Notable properties:
   only credentials/runtime state.
 - Node LTS + `gh` + pipx added to the baseline stack; firewall allowlist
   trimmed to this design (Anthropic + GitHub + npm + PyPI).
-- **Own user-defined bridge `sandbox-net`** (created idempotently by the
-  launcher), not Docker's default bridge — gets embedded DNS (`127.0.0.11`, which
-  the firewall already expects), name resolution for the data-plane services that
-  land later, and isolation from other default-bridge containers. It is **not**
-  `internal: true` yet: that end state needs the egress proxy to exist first, so
-  until then the sandbox keeps direct egress to `api.anthropic.com` and
-  `init-firewall.sh` remains the egress boundary. Flip to internal (and add an
-  explicit allow for the sanctioned services' subnet) when the proxy lands.
+- **Own user-defined bridge `sandbox-net`** (owned by `docker-compose.yml`,
+  created idempotently by the launcher when the compose infra is absent), not
+  Docker's default bridge — gets embedded DNS (`127.0.0.11`, which the firewall
+  already expects), name resolution for the data-plane services, and isolation from
+  other default-bridge containers. Under the compose infra it is now `internal:
+  true` (the proxy landed — see "Step 1 shipped" below), so the sandbox has no
+  direct route off-box; the launcher's plain-bridge fallback (proxy-less standalone
+  use) is non-internal and keeps direct egress via `init-firewall.sh`.
 
 **Egress proxy — step 0 shipped** (`docker-compose.yml` + `proxies/egress/`). The
 multi-container phase has begun, with a deliberate split the topology relies on:

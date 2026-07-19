@@ -1,0 +1,8 @@
+# Project shellcheck config (gate: `make check`).
+#
+# No rules are disabled globally. The `cmd && step || true` best-effort idiom that
+# once tripped SC2015 has been rewritten as explicit `if` blocks (the `|| true`
+# stays on the action so the step is non-fatal under `set -e`), which keeps SC2015
+# ON to catch genuinely dangerous `A && B || C` chains — where C has a real effect
+# and runs when B fails — in future code. Any remaining exception is a per-line
+# `# shellcheck disable=...` with a stated reason, not a blanket rule here.

@@ -1,0 +1,13 @@
+# Project hadolint config (gate: `make check`).
+#
+# These images are rebuild-to-update (auto-update is disabled; you rebuild to get
+# new versions), so the version-pinning nags below don't buy reproducibility we
+# rely on — they'd only add churn. Everything else stays ON; DL3002 (last USER
+# root) is intentional in claude-sandbox/Dockerfile and is ignored inline THERE,
+# not globally, so the proxy image's non-root ending is still checked.
+ignored:
+  - DL3008  # pin apt-get versions — impractical for a rolling dev base image
+  - DL3013  # pin pip/pipx versions — ruff floats like Claude Code (rebuild to update)
+  # DL3007 (base image :latest) is intentionally NOT ignored: the egress proxy is
+  # now pinned to mitmproxy:12.2.3, so a regression back to :latest should trip
+  # the gate.

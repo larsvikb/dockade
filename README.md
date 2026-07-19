@@ -167,5 +167,3 @@ exposed through governed data-plane services. Next steps toward it:
   rationale behind every decision. Start here to understand *why*.
 - [`CLAUDE.md`](CLAUDE.md) — the invariants that must never be violated and the
   conventions for working in this repo.
-</content>
-</invoke>

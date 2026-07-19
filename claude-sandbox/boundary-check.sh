@@ -126,6 +126,7 @@ caps="$(grep -E '^Cap(Eff|Prm|Amb):' /proc/self/status | awk '{print $2}')"
 caps_held=0
 for c in $caps; do [ "$c" = "0000000000000000" ] || caps_held=1; done
 if [ "$caps_held" -eq 1 ]; then
+    # shellcheck disable=SC2086  # intentional word-split: flatten multiline $caps to one line
     bad "agent holds capabilities (Eff/Prm/Amb: $(printf '%s ' $caps))"
 else
     ok "agent holds no capabilities (Eff/Prm/Amb all zero)"

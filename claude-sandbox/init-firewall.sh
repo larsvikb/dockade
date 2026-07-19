@@ -76,7 +76,7 @@ iptables -A OUTPUT -o lo -j ACCEPT
 # them on the host and forwards them as UPSTREAM_DNS. Whitelisting those
 # specific IPs keeps the anti-exfiltration narrowing intact (named resolvers,
 # not "any nameserver").
-DNS_SERVERS=$(awk '/^nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null)
+mapfile -t DNS_SERVERS < <(awk '/^nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null)
 # UPSTREAM_DNS arrives space-separated from the host launcher; the script-wide
 # IFS ($'\n\t') would treat it as a single token, so split it on spaces here.
 IFS=' ' read -r -a UPSTREAM_ARR <<< "${UPSTREAM_DNS:-}"
@@ -95,7 +95,7 @@ else
     # Standalone: no proxy, so the embedded resolver MUST forward external lookups
     # upstream (for the direct allowlist to resolve, and for runtime DNS). Allow
     # the pinned upstreams too — narrowed to named resolvers, not "any nameserver".
-    DNS_ALLOW=($DNS_SERVERS "${UPSTREAM_ARR[@]}" 127.0.0.11)
+    DNS_ALLOW=("${DNS_SERVERS[@]}" "${UPSTREAM_ARR[@]}" 127.0.0.11)
 fi
 for ns in "${DNS_ALLOW[@]}"; do
     [[ "$ns" =~ ^[0-9.]+$ ]] || continue   # IPv4 only; IPv6 DNS is blocked by ip6tables below
@@ -132,7 +132,9 @@ else
     gh_ranges=$(curl -s https://api.github.com/meta || true)
     if [ -n "$gh_ranges" ] && echo "$gh_ranges" | jq -e '.web and .api and .git' >/dev/null 2>&1; then
         while read -r cidr; do
-            [[ "$cidr" =~ ^[0-9.]+/[0-9]{1,2}$ ]] && ipset add allowed-domains "$cidr" 2>/dev/null || true
+            if [[ "$cidr" =~ ^[0-9.]+/[0-9]{1,2}$ ]]; then
+                ipset add allowed-domains "$cidr" 2>/dev/null || true
+            fi
         done < <(echo "$gh_ranges" | jq -r '(.web + .api + .git)[]' | aggregate -q 2>/dev/null \
                  || echo "$gh_ranges" | jq -r '(.web + .api + .git)[]')
     else
@@ -160,7 +162,9 @@ else
         ips=$(dig +noall +answer A "$domain" 2>/dev/null | awk '$4 == "A" {print $5}')
         [ -z "$ips" ] && { echo "WARNING: failed to resolve $domain"; continue; }
         while read -r ip; do
-            [[ "$ip" =~ ^[0-9.]+$ ]] && ipset add allowed-domains "$ip" 2>/dev/null || true
+            if [[ "$ip" =~ ^[0-9.]+$ ]]; then
+                ipset add allowed-domains "$ip" 2>/dev/null || true
+            fi
         done <<< "$ips"
     done
 fi

@@ -75,7 +75,9 @@ if [ -n "$transcript" ] && [ -f "$transcript" ]; then
     mtime="$(stat -c %Y "$transcript" 2>/dev/null || echo 0)"
 
     c_mtime=""; c_used=""
-    [ -f "$cache_file" ] && read -r c_mtime c_used < "$cache_file" 2>/dev/null || true
+    if [ -f "$cache_file" ]; then
+        read -r c_mtime c_used < "$cache_file" 2>/dev/null || true
+    fi
 
     if [ "$mtime" = "$c_mtime" ] && [ -n "$c_used" ]; then
         used="$c_used"
@@ -83,7 +85,9 @@ if [ -n "$transcript" ] && [ -f "$transcript" ]; then
         # Reverse the file and take the first usage-bearing, non-sidechain line;
         # head -1 stops jq early so we don't scan the whole transcript.
         used="$(tac "$transcript" 2>/dev/null | jq -rc 'select((.isSidechain != true) and (.message.usage.input_tokens != null)) | .message.usage | (.input_tokens + (.cache_read_input_tokens // 0) + (.cache_creation_input_tokens // 0))' 2>/dev/null | head -1 || true)"
-        [ -n "$used" ] && printf '%s %s\n' "$mtime" "$used" > "$cache_file" 2>/dev/null || true
+        if [ -n "$used" ]; then
+            printf '%s %s\n' "$mtime" "$used" > "$cache_file" 2>/dev/null || true
+        fi
     fi
 fi
 
@@ -107,7 +111,7 @@ now="$(date +%s 2>/dev/null || echo 0)"
 reset_fmt() { # epoch-seconds -> compact time-until ("2h7m"/"45m"); empty if past
     local at="${1//[^0-9]/}"
     [ -n "$at" ] && [ "$at" -gt "$now" ] || return 0
-    local s=$(( at - now )) h=$(( (at - now) / 3600 )) m=$(( ((at - now) % 3600) / 60 ))
+    local h=$(( (at - now) / 3600 )) m=$(( ((at - now) % 3600) / 60 ))
     if   [ "$h" -gt 0 ] && [ "$m" -gt 0 ]; then printf '%dh%dm' "$h" "$m"
     elif [ "$h" -gt 0 ];                   then printf '%dh' "$h"
     else                                        printf '%dm' "$m"; fi

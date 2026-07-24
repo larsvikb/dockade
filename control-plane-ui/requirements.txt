@@ -1,0 +1,6 @@
+# Control-plane UI (frontend) deps. Pinned for reproducible builds. A dumb
+# reverse proxy + static server, not a security boundary, so the pinning bar
+# matches the backend (no digest required) but is still deliberate.
+fastapi==0.115.6
+uvicorn==0.34.0
+httpx==0.28.1

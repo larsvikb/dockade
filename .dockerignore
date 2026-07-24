@@ -8,6 +8,7 @@
 .git
 .github
 claude-sandbox
+control-plane-ui
 proxies
 run-claude-sandbox.sh
 Makefile

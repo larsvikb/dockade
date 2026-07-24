@@ -13,7 +13,9 @@ The authorize flow (one call from the proxy, `POST /authorize`):
     BLOCK the request until a human resolves it or CONTROL_HOLD_TIMEOUT elapses
     (-> default-deny). The proxy only ever sees allow/deny; the hold is internal.
 
-A human resolves holds via the UI (served at `/`, live over SSE):
+A human resolves holds over the approvals API (GET /approvals, the SSE stream at
+/approvals/stream, and POST /approvals/{id}/resolve), surfaced by the separate
+control-plane-ui frontend; the backend serves no HTML itself:
   - allow-once / deny-once     — decide just this request
   - allow-persist / deny-persist — also write a rule so future connections skip
     the hold (progressive trust; DESIGN.md "auto-approve progressively more").
@@ -38,13 +40,12 @@ import time
 import uuid
 
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
 DB_PATH = os.environ.get("CONTROL_DB", "/var/lib/control-plane/control.db")
 SEED_PATH = os.environ.get(
     "CONTROL_SEED", "/etc/control-plane/egress-allowlist.txt")
-UI_INDEX = os.environ.get("CONTROL_UI_INDEX", "/opt/control-plane/ui/index.html")
 # How long a held request waits for a human before defaulting to deny.
 HOLD_TIMEOUT = float(os.environ.get("CONTROL_HOLD_TIMEOUT", "120"))
 
@@ -362,8 +363,3 @@ def status() -> str:
             "SELECT COUNT(*) FROM approvals WHERE status='pending'").fetchone()[0]
     return (f"dockade control plane (2b) — {rules} rules, {audits} audit rows, "
             f"{pending} pending approvals\n")
-
-
-@app.get("/")
-def index() -> FileResponse:
-    return FileResponse(UI_INDEX, media_type="text/html")

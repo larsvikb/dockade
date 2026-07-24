@@ -458,18 +458,21 @@ no separate artifact-export path is needed in v1.
 - `control-net` (`internal: true`) — governed proxies/tools ↔ control plane.
   Sandbox not attached.
 - `egress-net` — only outbound-capable governed proxies + internet.
-- `control-ui-net` — non-internal bridge carrying ONLY the control-plane's
-  host-loopback UI publish; masquerade disabled so it is host-reachable but not
-  an egress path. Needed because Docker cannot publish a host port from a
-  container that is on an internal network alone. Sandbox not attached.
+- `control-ui-net` — non-internal bridge carrying ONLY the control-plane-ui
+  frontend's host-loopback UI publish; masquerade disabled so it is
+  host-reachable but not an egress path. Needed because Docker cannot publish a
+  host port from a container that is on an internal network alone. Sandbox not
+  attached.
 
 **Status:** all four networks are implemented. `sandbox-net` (internal) and
 `egress-net` carry the agent and the sole egress; `control-net` (internal)
 carries the control path. The egress proxy is **triple-homed** (sandbox-net
-+ egress-net + control-net). The control plane sits on `control-net` (proxy
-control path) plus `control-ui-net` (host-loopback UI only); it is on neither
-`sandbox-net` nor `egress-net`. The sandbox is on `sandbox-net` only — never
-`control-net`/`control-ui-net` (asserted by `make check` and `boundary-check.sh`).
++ egress-net + control-net). The control-plane **backend** is on `control-net`
+only and fully internal (no `sandbox-net`, no `egress-net`, no published port);
+the **control-plane-ui** frontend is on `control-net` (to reach the backend)
+plus `control-ui-net` (host-loopback UI). The sandbox is on `sandbox-net` only —
+never `control-net`/`control-ui-net` (asserted by `make check` and
+`boundary-check.sh`).
 
 ### DNS on `sandbox-net` (a non-obvious gotcha — read before touching DNS/firewall)
 
@@ -691,14 +694,15 @@ plane carries `control-ui-net`'s soft-egress surface itself), and collapsing to
 one non-internal `control-net` would be observably equivalent now — but it would
 bake in a non-internal shared control path that becomes a real hole the moment a
 must-stay-egress-free tenant (secrets broker) joins. Keeping the split is cheap
-insurance against that footgun. **Planned (with 2b):** promote the UI to a
-**distinct `control-plane-ui` frontend container** that depends on the
+insurance against that footgun. **Done in 2b-2:** the UI is now a **distinct
+`control-plane-ui` frontend container** (its own lifecycle) that depends on the
 `control-plane` backend and talks to it over `control-net`. The frontend owns the
-`control-ui-net` non-internal surface; the backend returns to `control-net`-only
-and fully `internal`, so the crown-jewel container has zero non-internal exposure.
-This is deliberately a **separate service with its own lifecycle**, not a
-co-located sidecar. That promotion pays off exactly when 2b adds approval state
-worth isolating harder.
+`control-ui-net` non-internal surface; the backend is now `control-net`-only and
+fully `internal`, so the crown-jewel container has **zero non-internal exposure**
+— the split now buys something concrete, not just future insurance. This is
+deliberately a **separate service**, not a co-located sidecar: the frontend is a
+stateless reverse proxy + static server (FastAPI + httpx), holds no state, and no
+governance decision depends on it (the egress proxy calls the backend directly).
 
 The egress proxy is now a **control-plane client** rather than a static-allowlist
 enforcer: on every connection it calls `POST /authorize {host, ...}`, which
@@ -728,13 +732,21 @@ one uvicorn worker; a held request blocks its threadpool worker on a
 `threading.Event` the resolve endpoint sets; SQLite (`approvals` table) is the
 UI's source of truth; stale `pending` rows are expired on startup.
 
-Deferred to step 2b-2: promote the UI to a distinct **`control-plane-ui`**
-frontend container so the backend returns to `control-net`-only/`internal` (see
-the step-2a design note). Step 2c: the audit-browser UI and per-proxy config
-surface (rows accumulate from 2a).
+**Frontend split — step 2b-2 shipped.** The approval UI and the API/SSE relay
+now live in a distinct **`control-plane-ui`** container (FastAPI + httpx: serves
+the static UI at `/`, reverse-proxies everything else — including the SSE stream
+— to the backend over `control-net`). The **backend is now `control-net`-only
+and fully `internal`**: no published port, no non-internal surface, nothing to
+exfiltrate even if reached. The frontend carries the sole host-facing surface
+(`control-ui-net`), holds no state, and is not on `sandbox-net`. Browsers hit
+`http://localhost:8081` → frontend → backend; the egress proxy still calls the
+backend's `/authorize` directly. See the step-2a design note for the rationale.
 
-Not yet built: `control-plane-ui` split (2b-2), audit browser (2c),
-git/secrets/cache data-plane services, skills, quality-gate hooks.
+Step 2c: the audit-browser UI and per-proxy config surface (rows accumulate
+from 2a).
+
+Not yet built: audit browser (2c), git/secrets/cache data-plane services,
+skills, quality-gate hooks.
 
 **Transitional firewall entries (remove at the proxy/cache phase):** the sandbox
 firewall currently whitelists package registries (npm/PyPI) and GitHub only

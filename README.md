@@ -17,13 +17,14 @@ the sandbox is deliberately impoverished: no direct network egress beyond a
 strict allowlist, non-root user, dropped Linux capabilities, no host Docker
 socket, and (by design) no route to a control plane.
 
-> **Status: multi-container, control plane step 2a.** The sandbox lives on an
+> **Status: multi-container, control plane step 2b.** The sandbox lives on an
 > internal network with **no direct egress**; a governed **egress proxy** is the
-> sole path off-box, and it now defers every decision to a **control plane** the
-> agent cannot reach (policy + audit in SQLite, on its own `control-net`). Still
-> to come per [`DESIGN.md`](DESIGN.md): hold-for-approval + approval UI (2b), the
-> audit browser (2c), and the git/cache data-plane services. See
-> [Roadmap](#roadmap).
+> sole path off-box, and it defers every decision to a **control plane** the
+> agent cannot reach (policy + audit in SQLite). An unknown host is **held for
+> approval** — a human approves/rejects it in a live UI (backend fully internal;
+> a separate `control-plane-ui` frontend carries the loopback UI). Still to come
+> per [`DESIGN.md`](DESIGN.md): the audit browser (2c) and the git/cache
+> data-plane services. See [Roadmap](#roadmap).
 
 ## Quickstart
 
@@ -133,10 +134,15 @@ dockade/
   DESIGN.md                 # architecture, topology, and rationale (read this)
   docker-compose.yml        # shared infrastructure: egress proxy + control plane
   run-claude-sandbox.sh     # build + launch a sandbox (one or many) against it
-  control-plane/            # governance authority (agent cannot reach it)
-    Dockerfile              #   FastAPI over SQLite; control-net + loopback-UI bridge
-    app.py                  #   POST /authorize (policy decision + audit in one call)
+  control-plane/            # governance authority BACKEND (agent cannot reach it)
+    Dockerfile              #   FastAPI over SQLite; control-net only, fully internal
+    app.py                  #   /authorize (policy + audit) + hold-for-approval API
     requirements.txt        #   pinned deps (fastapi, uvicorn)
+  control-plane-ui/         # UI FRONTEND — serves the UI + reverse-proxies the API
+    Dockerfile              #   FastAPI + httpx; control-ui-net (loopback) + control-net
+    app.py                  #   static UI at / + streaming reverse proxy to the backend
+    index.html              #   live SSE approval console
+    requirements.txt        #   pinned deps (fastapi, uvicorn, httpx)
   policies/                 # seed policy config (loaded into the control plane)
     egress-allowlist.txt    #   default-deny allow seed for the egress proxy
   proxies/                  # governed data-plane services (one dir per proxy)
@@ -171,11 +177,12 @@ exposed through governed data-plane services. Next steps toward it:
    `POST /authorize` per connection — one call that both decides policy and
    records audit — with the Anthropic lifeline allowed locally so a control-plane
    outage never bricks the agent, and everything else failing closed.
-   **Step 2b-1 done:** an unknown host is now **held for approval** — the request
-   blocks while a human approves/rejects it in a live SSE UI (allow/deny, once or
-   persist-as-rule), defaulting to deny after a timeout. Next: **2b-2** split the
-   UI into a distinct `control-plane-ui` frontend so the backend is fully
-   internal; **2c** audit browser + config.
+   **Step 2b done:** an unknown host is **held for approval** — the request blocks
+   while a human approves/rejects it in a live SSE UI (allow/deny, once or
+   persist-as-rule), defaulting to deny after a timeout (2b-1). The UI is a
+   distinct `control-plane-ui` frontend; the backend is `control-net`-only and
+   fully internal, reachable only via that frontend or the egress proxy (2b-2).
+   Next: **2c** audit browser + per-proxy config.
 3. **Skills + quality-gate hooks** in the image — the enablement half of the
    paved road.
 4. **Pull-through package cache** — fast, governed dependency installs.

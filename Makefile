@@ -28,10 +28,10 @@ SCRIPTS := run-claude-sandbox.sh \
            claude-sandbox/boundary-check.sh \
            claude-sandbox/statusline.sh
 DOCKERFILES := claude-sandbox/Dockerfile proxies/egress/Dockerfile \
-               control-plane/Dockerfile
+               control-plane/Dockerfile control-plane-ui/Dockerfile
 YAMLFILES := docker-compose.yml .hadolint.yaml .yamllint
 JSONFILES := $(shell git ls-files '*.json' 2>/dev/null)
-PYFILES := proxies/egress/addon.py control-plane/app.py
+PYFILES := proxies/egress/addon.py control-plane/app.py control-plane-ui/app.py
 
 # Files referenced by Dockerfile COPY / entrypoint — existence is asserted so a
 # rename can't silently break the build.
@@ -43,8 +43,10 @@ REFFILES := $(SCRIPTS) \
             claude-sandbox/dotfiles/.gitconfig \
             proxies/egress/addon.py \
             control-plane/app.py \
-            control-plane/ui/index.html \
             control-plane/requirements.txt \
+            control-plane-ui/app.py \
+            control-plane-ui/requirements.txt \
+            control-plane-ui/index.html \
             policies/egress-allowlist.txt
 
 .PHONY: help check lint consistency \

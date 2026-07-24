@@ -16,9 +16,9 @@ WORKDIR /opt/control-plane
 COPY control-plane/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# App, the approval UI, and the policy seed (loaded into SQLite on first boot).
+# App + the policy seed (loaded into SQLite on first boot). The approval UI is
+# served by the separate control-plane-ui frontend, not from here.
 COPY control-plane/app.py ./app.py
-COPY control-plane/ui ./ui
 COPY policies/egress-allowlist.txt /etc/control-plane/egress-allowlist.txt
 
 # The SQLite store lives here; a named volume mounts over it for persistence

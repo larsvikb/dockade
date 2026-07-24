@@ -111,12 +111,11 @@ services:
     security_opt:
       - no-new-privileges:true
 
-  # Control plane — the governance authority (policy + audit). The agent can
-  # NEVER reach it: it is NOT on sandbox-net, so the sandbox has no route to it.
-  # It sits on control-net (the proxy <-> control-plane control path, internal)
-  # and on control-ui-net (a non-internal bridge carrying ONLY the host-loopback
-  # UI publish — see that network's definition for why a host publish forces a
-  # non-internal bridge and how egress is kept off it). See control-plane/.
+  # Control plane BACKEND — the governance authority (policy + audit), the
+  # crown-jewel state. Attached to control-net ONLY and fully internal: no
+  # sandbox-net (the agent has no route to it), no egress-net, and no published
+  # port. The egress proxy reaches it here for /authorize; the human reaches it
+  # ONLY through the control-plane-ui frontend below. Zero non-internal surface.
   control-plane:
     build:
       # Repo root so the Dockerfile can COPY the top-level policies/ seed.
@@ -127,17 +126,41 @@ services:
     hostname: control-plane
     restart: unless-stopped
     networks:
-      # Control path to the governed proxies (internal, no egress).
       control-net:
         ipv4_address: 172.31.0.2
+    volumes:
+      - control-state:/var/lib/control-plane
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # Control plane UI FRONTEND — a distinct, stateless service (own lifecycle)
+  # that serves the approval UI and reverse-proxies the API/SSE to the backend.
+  # It carries the one unavoidable non-internal surface (the host-loopback UI
+  # publish on control-ui-net) so the backend does not have to. On control-net
+  # to reach the backend; NOT on sandbox-net (the agent must never reach it).
+  # Holds no state — a governance decision never depends on it.
+  control-plane-ui:
+    build:
+      context: ./control-plane-ui
+    image: dockade-control-plane-ui
+    container_name: control-plane-ui
+    hostname: control-plane-ui
+    restart: unless-stopped
+    networks:
+      # Reach the backend (internal, no egress).
+      control-net:
       # Host-UI reachability only; not an egress path (see control-ui-net).
       control-ui-net:
+    environment:
+      CONTROL_BACKEND_URL: http://control-plane:8090
     # Human-only management surface, bound to host loopback (never 0.0.0.0):
     # reachable from the host browser, not from the sandbox or other machines.
     ports:
       - "127.0.0.1:8081:8090"
-    volumes:
-      - control-state:/var/lib/control-plane
+    depends_on:
+      - control-plane
     cap_drop:
       - ALL
     security_opt:

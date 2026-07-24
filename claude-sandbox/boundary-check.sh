@@ -57,10 +57,16 @@ fi
 # must be refused BY THE PROXY (a 403 on the CONNECT), not merely by the firewall.
 # This asserts the proxy's default-deny policy is actually enforcing.
 if [ -n "${HTTPS_PROXY:-}" ]; then
-    if curl --connect-timeout 5 -s -o /dev/null https://example.com 2>/dev/null; then
+    # Since 2b an unknown host is HELD for approval — it blocks pending a human,
+    # then default-denies on timeout — rather than being refused outright. So it
+    # must NOT succeed from here. Bound the wait (--max-time) so we don't sit on
+    # the full hold window; treat held/denied/timeout as pass, and only a real
+    # success (the proxy allowing a non-allowlisted host with no rule and no
+    # approval) as a policy-enforcement leak.
+    if curl --connect-timeout 5 --max-time 8 -s -o /dev/null https://example.com 2>/dev/null; then
         bad "egress proxy allowed non-allowlisted example.com — policy not enforcing"
     else
-        ok "egress proxy denies non-allowlisted example.com"
+        ok "egress proxy does not allow non-allowlisted example.com (held or denied)"
     fi
 
     # Port governance: the proxy is an HTTP(S) proxy, so a CONNECT to an

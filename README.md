@@ -170,8 +170,12 @@ exposed through governed data-plane services. Next steps toward it:
    proxy now asks it
    `POST /authorize` per connection — one call that both decides policy and
    records audit — with the Anthropic lifeline allowed locally so a control-plane
-   outage never bricks the agent, and everything else failing closed. Next:
-   **2b** hold-for-approval + the SSE approval UI; **2c** audit browser + config.
+   outage never bricks the agent, and everything else failing closed.
+   **Step 2b-1 done:** an unknown host is now **held for approval** — the request
+   blocks while a human approves/rejects it in a live SSE UI (allow/deny, once or
+   persist-as-rule), defaulting to deny after a timeout. Next: **2b-2** split the
+   UI into a distinct `control-plane-ui` frontend so the backend is fully
+   internal; **2c** audit browser + config.
 3. **Skills + quality-gate hooks** in the image — the enablement half of the
    paved road.
 4. **Pull-through package cache** — fast, governed dependency installs.

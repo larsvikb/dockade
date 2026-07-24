@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dockade control plane</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #262b36; --fg: #e6e9ef;
+    --dim: #9aa4b2; --allow: #2ea043; --deny: #d1242f; --hold: #d29922;
+    --accent: #3b82f6;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  header { padding: 16px 20px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: baseline; gap: 12px; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .sub { color: var(--dim); font-size: 12px; }
+  #conn { margin-left: auto; font-size: 12px; color: var(--dim); }
+  #conn.up { color: var(--allow); }
+  #conn.down { color: var(--deny); }
+  main { padding: 20px; max-width: 960px; margin: 0 auto; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--dim); margin: 24px 0 10px; }
+  .empty { color: var(--dim); font-style: italic; padding: 8px 0; }
+  .card { background: var(--panel); border: 1px solid var(--line);
+    border-left: 3px solid var(--hold); border-radius: 8px;
+    padding: 12px 14px; margin-bottom: 10px; }
+  .card .host { font-weight: 600; font-size: 15px; word-break: break-all; }
+  .card .meta { color: var(--dim); font-size: 12px; margin-top: 2px; }
+  .actions { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
+  button { font: inherit; border: 1px solid var(--line); background: #202632;
+    color: var(--fg); border-radius: 6px; padding: 6px 10px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.allow { border-color: #1f4d2b; }
+  button.deny { border-color: #4d1f22; }
+  button:disabled { opacity: .5; cursor: default; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  td, th { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); }
+  th { color: var(--dim); font-weight: 500; }
+  .tag { font-size: 11px; padding: 1px 6px; border-radius: 4px; font-weight: 600; }
+  .tag.allow { color: var(--allow); } .tag.deny { color: var(--deny); }
+  .tag.hold { color: var(--hold); }
+  .ts { color: var(--dim); white-space: nowrap; }
+</style>
+</head>
+<body>
+<header>
+  <h1>dockade control plane</h1>
+  <span class="sub">hold-for-approval &middot; egress governance</span>
+  <span id="conn" class="down">connecting…</span>
+</header>
+<main>
+  <h2>Pending approvals</h2>
+  <div id="pending"><div class="empty">none</div></div>
+
+  <h2>Recent decisions</h2>
+  <table>
+    <thead><tr><th>time</th><th>decision</th><th>host</th><th>reason</th></tr></thead>
+    <tbody id="audit"></tbody>
+  </table>
+</main>
+<script>
+  const fmt = ts => new Date(ts * 1000).toLocaleTimeString();
+  const esc = s => (s ?? "").toString().replace(/[&<>"]/g,
+    c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+  async function resolve(id, action, btn) {
+    const card = btn.closest(".card");
+    card.querySelectorAll("button").forEach(b => b.disabled = true);
+    try {
+      const r = await fetch(`/approvals/${id}/resolve`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action })
+      });
+      if (!r.ok) {
+        const d = await r.json().catch(() => ({}));
+        alert("Could not resolve: " + (d.detail || r.status));
+        card.querySelectorAll("button").forEach(b => b.disabled = false);
+      }
+      // On success the SSE stream will drop this card on the next tick.
+    } catch (e) {
+      alert("Request failed: " + e);
+      card.querySelectorAll("button").forEach(b => b.disabled = false);
+    }
+    refreshAudit();
+  }
+
+  function renderPending(list) {
+    const el = document.getElementById("pending");
+    if (!list.length) { el.innerHTML = '<div class="empty">none</div>'; return; }
+    el.innerHTML = list.map(a => `
+      <div class="card" data-id="${esc(a.id)}">
+        <div class="host">${esc(a.host)}${a.port ? ":" + esc(a.port) : ""}</div>
+        <div class="meta">${esc(a.proto || "")} &middot; requested ${fmt(a.ts)}
+          ${a.client ? "&middot; from " + esc(a.client) : ""}
+          ${a.url ? "&middot; " + esc(a.url) : ""}</div>
+        <div class="actions">
+          <button class="allow" data-a="allow_once">Allow once</button>
+          <button class="allow" data-a="allow_persist">Allow + persist rule</button>
+          <button class="deny" data-a="deny_once">Deny once</button>
+          <button class="deny" data-a="deny_persist">Deny + persist rule</button>
+        </div>
+      </div>`).join("");
+    el.querySelectorAll("button").forEach(b =>
+      b.addEventListener("click", () =>
+        resolve(b.closest(".card").dataset.id, b.dataset.a, b)));
+  }
+
+  async function refreshAudit() {
+    try {
+      const rows = await (await fetch("/api/audit?limit=40")).json();
+      document.getElementById("audit").innerHTML = rows.map(r => `
+        <tr><td class="ts">${fmt(r.ts)}</td>
+          <td><span class="tag ${esc(r.decision)}">${esc(r.decision)}</span></td>
+          <td>${esc(r.host)}</td><td>${esc(r.reason)}</td></tr>`).join("");
+    } catch (e) { /* transient; next poll retries */ }
+  }
+
+  const conn = document.getElementById("conn");
+  const es = new EventSource("/approvals/stream");
+  es.onopen = () => { conn.textContent = "live"; conn.className = "up"; };
+  es.onerror = () => { conn.textContent = "reconnecting…"; conn.className = "down"; };
+  es.addEventListener("pending", e => renderPending(JSON.parse(e.data)));
+
+  refreshAudit();
+  setInterval(refreshAudit, 4000);
+</script>
+</body>
+</html>

@@ -715,12 +715,25 @@ dependency. The canonical allow policy now lives at `policies/egress-allowlist.t
 (the control plane seeds SQLite from it on first boot, idempotently); the proxy
 no longer bakes or reads an allowlist file.
 
-Deferred to step 2b: **hold-for-approval** — `/authorize` currently returns only
-allow/deny (unknown → deny); 2b adds the `hold` decision, the approval queue, and
-the SSE approval UI ("approve once" vs "approve + persist rule"). Step 2c: the
-audit-browser UI and per-proxy config surface (rows accumulate from 2a).
+**Hold-for-approval — step 2b-1 shipped.** An unmatched host is no longer denied
+outright: `_decide` returns **`hold`**, and `/authorize` records a pending
+approval and **blocks** the request until a human resolves it or
+`CONTROL_HOLD_TIMEOUT` (default 120s) elapses → default-deny. The proxy is
+unchanged except for a longer authorize timeout to cover the wait — it still
+sees only allow/deny (the hold is internal to the control plane). A human
+resolves holds in a **live SSE UI** served at `/`: **allow-once / deny-once**
+(this request only) or **allow-persist / deny-persist** (also writes a rule so
+future connections skip the hold — the progressive-trust path). Concurrency:
+one uvicorn worker; a held request blocks its threadpool worker on a
+`threading.Event` the resolve endpoint sets; SQLite (`approvals` table) is the
+UI's source of truth; stale `pending` rows are expired on startup.
 
-Not yet built: hold-for-approval + approval UI (2b), audit browser (2c),
+Deferred to step 2b-2: promote the UI to a distinct **`control-plane-ui`**
+frontend container so the backend returns to `control-net`-only/`internal` (see
+the step-2a design note). Step 2c: the audit-browser UI and per-proxy config
+surface (rows accumulate from 2a).
+
+Not yet built: `control-plane-ui` split (2b-2), audit browser (2c),
 git/secrets/cache data-plane services, skills, quality-gate hooks.
 
 **Transitional firewall entries (remove at the proxy/cache phase):** the sandbox

@@ -27,6 +27,11 @@ Fail-closed, with one deliberate exception:
     (timeout), the request is DENIED and audited locally — governed egress fails
     closed when the policy authority is down, which is the intended posture.
 
+An unknown host is HELD (2b): the control plane blocks the /authorize response
+until a human approves/rejects it or its hold window elapses. To the proxy this
+is just a slow allow/deny — the connection waits, then proceeds or gets a 403.
+That is why CONTROL_TIMEOUT is long (see below); it does not weaken fail-closed.
+
 The call runs in a worker thread (``asyncio.to_thread`` + stdlib ``urllib``), so
 it never blocks mitmproxy's event loop and the egress image needs no extra
 dependency. Port gating stays local (this is an HTTP/S proxy; a raw CONNECT to a
@@ -52,7 +57,13 @@ AUDIT_PATH = os.environ.get("EGRESS_AUDIT_LOG", "/var/log/egress/audit.jsonl")
 CONTROL_PLANE_URL = os.environ.get(
     "EGRESS_CONTROL_PLANE_URL", "http://control-plane:8090").rstrip("/")
 AUTHORIZE_URL = CONTROL_PLANE_URL + "/authorize"
-CONTROL_TIMEOUT = float(os.environ.get("EGRESS_CONTROL_TIMEOUT", "3.0"))
+# The control plane may HOLD an unknown host while a human decides (2b), so a
+# single /authorize call can legitimately block for up to the control plane's
+# hold window. This timeout must therefore EXCEED that window (default there is
+# 120s). It is a read timeout, so the fail-closed cases are unaffected: an
+# unreachable control plane fails immediately (connection refused / DNS), not by
+# waiting this out — only a genuine hold (or a hung control plane) waits long.
+CONTROL_TIMEOUT = float(os.environ.get("EGRESS_CONTROL_TIMEOUT", "130"))
 
 # Permanent lifeline — allowed locally, BEFORE the control plane is consulted,
 # so an outage of the control plane can never sever the agent's own API/auth.
@@ -78,6 +89,13 @@ ALLOWED_CONNECT_PORTS = _ports("EGRESS_CONNECT_PORTS", "443")  # HTTPS tunnels
 ALLOWED_HTTP_PORTS = _ports("EGRESS_HTTP_PORTS", "80")         # plain HTTP
 
 logger = logging.getLogger("egress")
+
+# Per-connection record of the authorized CONNECT authority, keyed by the client
+# connection id. The holding decision is made ONCE, at http_connect; the TLS SNI
+# stage then only *compares* against it (no second control-plane call), so an
+# unknown host that a human approves "once" is not re-held mid-connection. All
+# access is on mitmproxy's single event loop (the hooks), so no lock is needed.
+_conn_authority: dict[str, str] = {}
 
 
 def _setup_audit_file() -> None:
@@ -166,6 +184,9 @@ async def http_connect(flow: http.HTTPFlow) -> None:
     allowed, reason = await _authorize(
         host, stage="connect", proto="connect", port=port, client=client)
     if allowed:
+        # Remember the authorized authority for this connection so the SNI stage
+        # can verify against it without a second (possibly re-holding) decision.
+        _conn_authority[flow.client_conn.id] = host.lower()
         _audit("allow", proto="connect", host=host, port=port, client=client,
                reason=reason)
     else:
@@ -175,31 +196,29 @@ async def http_connect(flow: http.HTTPFlow) -> None:
             403, b"egress denied by policy\n", {"Content-Type": "text/plain"})
 
 
-async def tls_clienthello(data: tls.ClientHelloData) -> None:
+def tls_clienthello(data: tls.ClientHelloData) -> None:
     """Decide whether to pass this HTTPS connection through undecrypted. The
-    CONNECT authority was already authorized in ``http_connect``, but the TLS SNI
-    can name a DIFFERENT host (domain-fronting behind an allowed CONNECT target),
-    so authorize it too. ``audit=False``: the connection was already audited at
-    the CONNECT stage, so this per-connection SNI recheck is policy-only to avoid
-    doubling every HTTPS row; a fronting DENY is still recorded locally below.
+    destination decision was already made (and possibly held for approval) at
+    ``http_connect``; here we only guard against the TLS SNI naming a DIFFERENT
+    host than that authorized CONNECT authority (domain-fronting). This is a
+    local string comparison — NO second control-plane call — so a host a human
+    approved "once" (no persisted rule) is never re-held mid-connection.
 
-      - SNI absent, or SNI authorized -> tunnel it (``ignore_connection``); no
-        CA needed.
-      - SNI present but NOT authorized -> refuse to tunnel. Interception stays
-        ON, which fails CLOSED both ways: with no mitmproxy CA in the sandbox
-        (the standing invariant) the client rejects the minted cert and the
-        handshake dies; if a CA is ever added for per-domain MITM, the flow is
-        instead decrypted and re-gated at the HTTP layer by ``request`` below."""
+      - SNI absent, or SNI == the authorized authority -> tunnel it
+        (``ignore_connection``); no CA needed.
+      - SNI names a different / unrecorded host -> refuse to tunnel. Interception
+        stays ON, which fails CLOSED both ways: with no mitmproxy CA in the
+        sandbox (the standing invariant) the client rejects the minted cert and
+        the handshake dies; if a CA is ever added for per-domain MITM, the flow
+        is instead decrypted and re-gated at the HTTP layer by ``request``."""
     sni = data.client_hello.sni
-    if sni is None:
+    authority = _conn_authority.get(data.context.client.id)
+    if sni is None or (authority is not None and sni.lower() == authority):
         data.ignore_connection = True
         return
-    allowed, reason = await _authorize(sni, stage="sni", audit=False)
-    if allowed:
-        data.ignore_connection = True
-        return
-    _audit("deny-sni", sni=sni, reason=reason,
-           note="SNI not authorized; refusing passthrough (possible domain-fronting)")
+    _audit("deny-sni", sni=sni, authority=authority,
+           note="SNI does not match the authorized CONNECT authority; refusing "
+                "passthrough (possible domain-fronting)")
 
 
 async def request(flow: http.HTTPFlow) -> None:
@@ -246,3 +265,9 @@ async def request(flow: http.HTTPFlow) -> None:
                reason=f"host not authorized ({bad_name}): {bad_reason}")
         flow.response = http.Response.make(
             403, b"egress denied by policy\n", {"Content-Type": "text/plain"})
+
+
+def client_disconnected(client) -> None:  # mitmproxy lifecycle hook
+    """Drop this connection's remembered authority so ``_conn_authority`` does
+    not grow unbounded over the proxy's lifetime."""
+    _conn_authority.pop(client.id, None)

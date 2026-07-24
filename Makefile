@@ -43,6 +43,7 @@ REFFILES := $(SCRIPTS) \
             claude-sandbox/dotfiles/.gitconfig \
             proxies/egress/addon.py \
             control-plane/app.py \
+            control-plane/ui/index.html \
             control-plane/requirements.txt \
             policies/egress-allowlist.txt
 

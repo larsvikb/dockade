@@ -29,10 +29,27 @@ networks:
   egress-net:
     name: egress-net
     driver: bridge
+  # Control path. internal:true => no route off-box. Carries governed proxies
+  # <-> control plane ONLY; the sandbox is NEVER attached here (the load-bearing
+  # invariant — the agent must have no route to the control plane). Fixed subnet
+  # so boundary-check.sh can probe a literal control-net address and prove the
+  # sandbox cannot reach it.
+  control-net:
+    name: control-net
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24
 
 volumes:
   egress-audit:
     name: dockade-egress-audit
+  # The policy + audit SQLite store — the crown-jewel state (DESIGN.md). Kept in
+  # its own named volume so it survives container/image churn and is backed up
+  # independently.
+  control-state:
+    name: dockade-control-state
 
 services:
   # Governed egress proxy — the central choke point (step 0: CONNECT-level
@@ -55,6 +72,17 @@ services:
       # all upstream traffic (and the pinned DNS below) must leave via here.
       egress-net:
         priority: 100
+      # Reach the control plane on the control net (per-connection /authorize +
+      # audit). Internal, so no bearing on egress; lower priority than egress-net
+      # so it never becomes the default route.
+      control-net:
+        priority: 20
+    environment:
+      # Where the proxy asks for policy decisions and ships audit. Resolved by
+      # name via Docker's embedded DNS (127.0.0.11) on control-net.
+      EGRESS_CONTROL_PLANE_URL: http://control-plane:8090
+    depends_on:
+      - control-plane
     # The proxy resolves the (public) allowlisted targets itself, via egress-net.
     # Default to public resolvers; override in a .env (EGRESS_DNS_PRIMARY/
     # SECONDARY) for locked-down / corporate networks where those are blocked.
@@ -64,6 +92,33 @@ services:
     volumes:
       - egress-audit:/var/log/egress
     # A plain forward proxy needs no elevated privileges.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # Control plane — the governance authority (policy + audit). The agent can
+  # NEVER reach it: attached to control-net ONLY (no sandbox-net, no egress-net),
+  # so it has no route off-box and the sandbox has no route to it. The UI/API is
+  # published to HOST LOOPBACK only for the human operator. See control-plane/.
+  control-plane:
+    build:
+      # Repo root so the Dockerfile can COPY the top-level policies/ seed.
+      context: .
+      dockerfile: control-plane/Dockerfile
+    image: dockade-control-plane
+    container_name: control-plane
+    hostname: control-plane
+    restart: unless-stopped
+    networks:
+      control-net:
+        ipv4_address: 172.31.0.2
+    # Human-only management surface, bound to host loopback (never 0.0.0.0):
+    # reachable from the host browser, not from any container network.
+    ports:
+      - "127.0.0.1:8081:8090"
+    volumes:
+      - control-state:/var/lib/control-plane
     cap_drop:
       - ALL
     security_opt:

@@ -1,0 +1,32 @@
+# Egress allow policy SEED (default-deny; anything not listed is blocked and
+# audited). One host per line. A leading dot matches subdomains (".github.com"
+# => api.github.com, codeload.github.com, ...); a bare line is an exact host
+# match. Blank lines and #-comments are ignored.
+#
+# The control plane loads this file into its SQLite policy store on first boot
+# (idempotent: only when the rules table is empty). After that the store is the
+# source of truth — edit rules via the control plane, not this file; this file
+# just bootstraps a fresh store. The egress proxy no longer reads it; it asks
+# the control plane per connection (see proxies/egress/addon.py).
+#
+# Grouped by target-state disposition, mirroring init-firewall.sh.
+
+# PERMANENT — the agent's own API / auth lifeline.
+api.anthropic.com
+claude.ai
+platform.claude.com
+
+# TRANSITIONAL — package registries. These move behind the pull-through cache
+# (whose upstream flows through this proxy) when it lands; remove them then.
+registry.npmjs.org
+pypi.org
+files.pythonhosted.org
+
+# TRANSITIONAL — GitHub (git clone/pull/push, gh, API). Governed by NAME here,
+# where the v1 firewall could only allow GitHub's IP ranges. Moves behind the
+# governed git path in the target design.
+github.com
+.github.com
+codeload.github.com
+objects.githubusercontent.com
+raw.githubusercontent.com

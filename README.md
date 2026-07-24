@@ -17,11 +17,13 @@ the sandbox is deliberately impoverished: no direct network egress beyond a
 strict allowlist, non-root user, dropped Linux capabilities, no host Docker
 socket, and (by design) no route to a control plane.
 
-> **Status: v1 — single container.** The full control-plane / data-plane
-> architecture in [`DESIGN.md`](DESIGN.md) is the target, not yet the reality.
-> What's built today is the sandbox image plus a launch script; egress is
-> governed by an in-container default-deny firewall. See
-> [Roadmap](#roadmap) for what's next.
+> **Status: multi-container, control plane step 2a.** The sandbox lives on an
+> internal network with **no direct egress**; a governed **egress proxy** is the
+> sole path off-box, and it now defers every decision to a **control plane** the
+> agent cannot reach (policy + audit in SQLite, on its own `control-net`). Still
+> to come per [`DESIGN.md`](DESIGN.md): hold-for-approval + approval UI (2b), the
+> audit browser (2c), and the git/cache data-plane services. See
+> [Roadmap](#roadmap).
 
 ## Quickstart
 
@@ -129,13 +131,18 @@ dockade/
   README.md                 # this file
   CLAUDE.md                 # invariants + conventions for working in the repo
   DESIGN.md                 # architecture, topology, and rationale (read this)
-  docker-compose.yml        # shared infrastructure (data plane): the egress proxy
+  docker-compose.yml        # shared infrastructure: egress proxy + control plane
   run-claude-sandbox.sh     # build + launch a sandbox (one or many) against it
+  control-plane/            # governance authority (agent cannot reach it)
+    Dockerfile              #   FastAPI over SQLite; control-net only + loopback UI
+    app.py                  #   POST /authorize (policy decision + audit in one call)
+    requirements.txt        #   pinned deps (fastapi, uvicorn)
+  policies/                 # seed policy config (loaded into the control plane)
+    egress-allowlist.txt    #   default-deny allow seed for the egress proxy
   proxies/                  # governed data-plane services (one dir per proxy)
-    egress/                 # CONNECT-level egress proxy: allowlist + audit
+    egress/                 # CONNECT-level egress proxy: control-plane client
       Dockerfile            #   mitmproxy + the policy/audit addon
-      addon.py              #   allowlist enforcement + structured audit log
-      allowlist.txt         #   default-deny allowlist (re-read per connection)
+      addon.py              #   per-connection /authorize + local audit stream
   claude-sandbox/           # the agent image
     Dockerfile
     entrypoint.sh           # root: firewall + config, then drops to non-root
@@ -155,11 +162,17 @@ exposed through governed data-plane services. Next steps toward it:
 1. **Egress HTTP(S) proxy** — *done* (`docker-compose.yml` + `proxies/egress/`):
    a CONNECT-level domain allowlist with per-connection audit, and (step 1) the
    **sole** egress path — `sandbox-net` is `internal: true` with the proxy
-   dual-homed onto `egress-net`. Next: the **control plane** — `control-net`,
-   hold-for-approval, and a dynamic policy/audit store.
-2. **Skills + quality-gate hooks** in the image — the enablement half of the
+   dual-homed onto `egress-net`.
+2. **Control plane** — *step 2a done* (`control-plane/` + `control-net`): a
+   FastAPI + SQLite governance authority the **agent cannot reach** (on
+   `control-net` only; sandbox never attached). The egress proxy now asks it
+   `POST /authorize` per connection — one call that both decides policy and
+   records audit — with the Anthropic lifeline allowed locally so a control-plane
+   outage never bricks the agent, and everything else failing closed. Next:
+   **2b** hold-for-approval + the SSE approval UI; **2c** audit browser + config.
+3. **Skills + quality-gate hooks** in the image — the enablement half of the
    paved road.
-3. **Pull-through package cache** — fast, governed dependency installs.
+4. **Pull-through package cache** — fast, governed dependency installs.
 
 ## Documentation
 

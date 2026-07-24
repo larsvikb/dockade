@@ -1,0 +1,17 @@
+# Applies to builds whose context is the repo root — currently only the
+# control-plane service (docker-compose.yml sets context: . for it so its
+# Dockerfile can COPY the top-level policies/ seed). The egress proxy uses its
+# own context (proxies/egress) and is unaffected.
+#
+# Keep the root build context tiny: the control-plane image needs only
+# control-plane/ and policies/. Everything else is noise.
+.git
+.github
+claude-sandbox
+proxies
+run-claude-sandbox.sh
+Makefile
+*.md
+.hadolint.yaml
+.shellcheckrc
+.yamllint

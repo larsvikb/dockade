@@ -100,6 +100,19 @@ if [ -n "${HTTPS_PROXY:-}" ]; then
     fi
 fi
 
+printf '%s== control plane ==%s\n' "$bold" "$reset"
+# THE step-2 invariant: the agent must have NO route to the control plane. It
+# lives on control-net (internal), and the sandbox is deliberately not attached.
+# Probe the control-plane's fixed control-net address DIRECTLY (172.31.0.2:8090,
+# matching docker-compose.yml) — DNS-independent, like the raw-IP egress probe.
+# --noproxy '*' so we test the sandbox's OWN routing, not the egress proxy (which
+# legitimately can reach the control plane on control-net). Any reply is a leak.
+if curl --noproxy '*' --connect-timeout 5 -s -o /dev/null http://172.31.0.2:8090/healthz 2>/dev/null; then
+    bad "control plane reachable from sandbox (172.31.0.2:8090) — control-net leak"
+else
+    ok "control plane unreachable from sandbox (control-net isolated)"
+fi
+
 printf '%s== ipv6 ==%s\n' "$bold" "$reset"
 if [ -e /proc/net/if_inet6 ]; then
     # Connect to a literal v6 address (no AAAA lookup needed). We assert on the

@@ -27,9 +27,11 @@ SCRIPTS := run-claude-sandbox.sh \
            claude-sandbox/entrypoint.sh \
            claude-sandbox/boundary-check.sh \
            claude-sandbox/statusline.sh
-DOCKERFILES := claude-sandbox/Dockerfile proxies/egress/Dockerfile
+DOCKERFILES := claude-sandbox/Dockerfile proxies/egress/Dockerfile \
+               control-plane/Dockerfile
 YAMLFILES := docker-compose.yml .hadolint.yaml .yamllint
 JSONFILES := $(shell git ls-files '*.json' 2>/dev/null)
+PYFILES := proxies/egress/addon.py control-plane/app.py
 
 # Files referenced by Dockerfile COPY / entrypoint — existence is asserted so a
 # rename can't silently break the build.
@@ -40,10 +42,12 @@ REFFILES := $(SCRIPTS) \
             claude-sandbox/dotfiles/.inputrc \
             claude-sandbox/dotfiles/.gitconfig \
             proxies/egress/addon.py \
-            proxies/egress/allowlist.txt
+            control-plane/app.py \
+            control-plane/requirements.txt \
+            policies/egress-allowlist.txt
 
 .PHONY: help check lint consistency \
-        up down down-v build rebuild ps logs audit \
+        up down down-v build rebuild ps logs logs-cp audit \
         sandbox sandbox-rebuild boundary
 
 help: ## Show this help
@@ -65,7 +69,7 @@ lint: ## Run linters (shellcheck, hadolint, ruff, yamllint) — skipped if not i
 	  echo "== hadolint =="; hadolint $(DOCKERFILES) || fail=1
 	else echo "SKIP hadolint (not installed)"; fi
 	if command -v ruff >/dev/null 2>&1; then
-	  echo "== ruff =="; ruff check proxies/egress/addon.py || fail=1
+	  echo "== ruff =="; ruff check $(PYFILES) || fail=1
 	else echo "SKIP ruff (not installed)"; fi
 	if command -v yamllint >/dev/null 2>&1; then
 	  echo "== yamllint =="; yamllint $(YAMLFILES) || fail=1
@@ -75,8 +79,8 @@ lint: ## Run linters (shellcheck, hadolint, ruff, yamllint) — skipped if not i
 consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	@echo "== bash -n (shell syntax) =="
 	for f in $(SCRIPTS); do bash -n "$$f"; echo "  ok $$f"; done
-	echo "== python compile (addon) =="
-	python3 -m py_compile proxies/egress/addon.py && echo "  ok addon.py"
+	echo "== python compile =="
+	for f in $(PYFILES); do python3 -m py_compile "$$f" && echo "  ok $$f"; done
 	echo "== json validity =="
 	for f in $(JSONFILES); do
 	  python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$$f" && echo "  ok $$f" \
@@ -85,7 +89,7 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	echo "== domain allowlist drift (firewall ⊆ proxy allowlist) =="
 	fw=$$(awk '/ALLOWED_DOMAINS=\(/{f=1;next} f&&/^[[:space:]]*\)/{f=0} f' \
 	         claude-sandbox/init-firewall.sh | grep -oE '"[a-z0-9.]+"' | tr -d '"' | sort -u)
-	al=$$(grep -vE '^[[:space:]]*#|^[[:space:]]*$$' proxies/egress/allowlist.txt \
+	al=$$(grep -vE '^[[:space:]]*#|^[[:space:]]*$$' policies/egress-allowlist.txt \
 	         | sed 's/^\.//' | sort -u)
 	missing=$$(comm -23 <(printf '%s\n' "$$fw") <(printf '%s\n' "$$al"))
 	if [ -n "$$missing" ]; then
@@ -97,6 +101,20 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	for f in $(REFFILES); do
 	  if [ -f "$$f" ]; then echo "  ok $$f"; else echo "  MISSING $$f"; exit 1; fi
 	done
+	echo "== control-net isolation (sandbox must have no path to the control plane) =="
+	if grep -qE 'control-net' run-claude-sandbox.sh; then
+	  echo "  FAIL: run-claude-sandbox.sh references control-net — the sandbox must"
+	  echo "        NEVER attach to it (the agent must have no route to the control plane)"
+	  exit 1
+	fi
+	# Both agent-facing nets must stay internal: sandbox-net AND control-net. A
+	# non-internal control-net would hand the control plane a route off-box.
+	n=$$(grep -c 'internal: true' docker-compose.yml)
+	if [ "$$n" -lt 2 ]; then
+	  echo "  FAIL: expected sandbox-net and control-net both 'internal: true' in"
+	  echo "        docker-compose.yml (found $$n internal nets)"; exit 1
+	fi
+	echo "  ok — launcher never attaches the sandbox to control-net; both internal nets internal"
 
 # ── shared infrastructure (docker-compose.yml) ──────────────────────────────
 
@@ -120,6 +138,9 @@ ps: ## Show infra container status
 
 logs: ## Follow the egress-proxy log — the live per-connection audit stream
 	$(COMPOSE) logs -f egress-proxy
+
+logs-cp: ## Follow the control-plane log (policy seed + decisions)
+	$(COMPOSE) logs -f control-plane
 
 audit: logs ## Alias for `logs` (the egress audit trail)
 

@@ -456,10 +456,12 @@ no separate artifact-export path is needed in v1.
 - `egress-net` — only outbound-capable governed proxies + internet.
 - Control-plane UI bound to host loopback for the human.
 
-**Status:** `sandbox-net` (internal) and `egress-net` are implemented, with the
-egress proxy **dual-homed** across them (step 1) — the sandbox has no direct
-route off-box; the proxy is the sole egress. `control-net` and the control-plane
-UI arrive with the control plane (step 2).
+**Status:** all three networks are implemented. `sandbox-net` (internal) and
+`egress-net` carry the agent and the sole egress; `control-net` (internal)
+carries the control path. The egress proxy is now **triple-homed** (sandbox-net
++ egress-net + control-net); the control plane sits on `control-net` only (plus a
+host-loopback publish for the human UI). The sandbox is on `sandbox-net` only —
+never `control-net` (asserted by `make check` and `boundary-check.sh`).
 
 ### DNS on `sandbox-net` (a non-obvious gotcha — read before touching DNS/firewall)
 
@@ -526,14 +528,18 @@ dockade/
 
 ## Open decisions
 
-- **Control-plane stack** — leaning Python (FastAPI + SSE/websocket UI);
-  `mitmproxy` is a strong engine for the egress proxy.
+- **RESOLVED — control-plane stack is Python (FastAPI) over SQLite.** Shipped in
+  2a (`control-plane/`): FastAPI app, stdlib `sqlite3` store, plain `def`
+  endpoints (FastAPI's threadpool keeps the blocking DB off the event loop). The
+  SSE/websocket approval UI arrives with 2b on the same FastAPI app. `mitmproxy`
+  remains the egress-proxy engine.
 - **HTTPS inspection depth** — CONNECT/SNI (domain-level, no CA in sandbox) vs
   full MITM (URL/body-level, needs a generated CA in the sandbox). Likely start
   CONNECT-level, allow MITM per-domain later. Both are documented-supported by
   the CLI (MITM via `NODE_EXTRA_CA_CERTS` / `CLAUDE_CODE_CERT_STORE`; see "Claude
   Code proxy support"), so the choice is ours, not gated by tool support.
-- **Policy storage** — SQLite to start.
+- **RESOLVED — policy storage is SQLite** (2a), in its own named volume
+  (`dockade-control-state`), seeded from `policies/egress-allowlist.txt`.
 - **RESOLVED — Anthropic reachability is (a): always-allow via the egress proxy.**
   The end-state choice was (a) always-allow via egress proxy vs (b) network-layer
   firewall allowlist. The blocker for (a) — does the CLI honor `HTTPS_PROXY` for
@@ -651,11 +657,39 @@ direct ipset allowlist) remains for proxy-less use. DNS needs nothing extra: the
 sandbox resolves only sibling names via the embedded resolver (local, works on
 internal nets); external resolution happens at the proxy on egress-net.
 
-Deferred to step 2 (with the control plane): `control-net`, hold-for-approval,
-and a dynamic policy/audit store.
+**Control plane — step 2a shipped** (`control-plane/` + `control-net`). The
+governance authority now exists as a service the **agent cannot reach**: it is
+attached to `control-net` (internal) only — no `sandbox-net`, no `egress-net` —
+and the sandbox is never on `control-net`, so there is no route between them
+(`boundary-check.sh` probes the control plane's fixed control-net address and
+asserts it is unreachable from the sandbox; `make check` asserts the launcher
+never attaches the sandbox to `control-net`). The control plane is a small
+FastAPI app over a SQLite policy+audit store (its own named volume — the
+crown-jewel state), with the management surface published to **host loopback
+only** (`127.0.0.1:8081`).
 
-Not yet built: control plane, `control-net`, git/secrets/cache data-plane
-services, skills, quality-gate hooks.
+The egress proxy is now a **control-plane client** rather than a static-allowlist
+enforcer: on every connection it calls `POST /authorize {host, ...}`, which
+returns the decision **and** records the audit row in one call — so policy and
+audit share the round-trip, there is no client-side cache (an operator rule edit
+applies to the very next connection), and there is no separate audit channel.
+Two deliberate properties: (1) the **permanent lifeline** (Anthropic API/auth)
+is allowed by a *local* check in the proxy *before* the control plane is
+consulted, so a control-plane outage never bricks the agent's own API; (2)
+everything else **fails closed** — if the control plane is unreachable or times
+out, the request is denied and audited locally. The call runs in a worker thread
+so it never blocks mitmproxy's event loop, and the egress image gains no new
+dependency. The canonical allow policy now lives at `policies/egress-allowlist.txt`
+(the control plane seeds SQLite from it on first boot, idempotently); the proxy
+no longer bakes or reads an allowlist file.
+
+Deferred to step 2b: **hold-for-approval** — `/authorize` currently returns only
+allow/deny (unknown → deny); 2b adds the `hold` decision, the approval queue, and
+the SSE approval UI ("approve once" vs "approve + persist rule"). Step 2c: the
+audit-browser UI and per-proxy config surface (rows accumulate from 2a).
+
+Not yet built: hold-for-approval + approval UI (2b), audit browser (2c),
+git/secrets/cache data-plane services, skills, quality-gate hooks.
 
 **Transitional firewall entries (remove at the proxy/cache phase):** the sandbox
 firewall currently whitelists package registries (npm/PyPI) and GitHub only

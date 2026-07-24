@@ -1,0 +1,5 @@
+# Control-plane runtime deps. Pinned for reproducible builds. This is the
+# management plane, not the egress security choke point, so the pinning bar is a
+# notch below proxies/egress (no digest required) — but still deliberate.
+fastapi==0.115.6
+uvicorn==0.34.0

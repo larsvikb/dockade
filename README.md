@@ -134,7 +134,7 @@ dockade/
   docker-compose.yml        # shared infrastructure: egress proxy + control plane
   run-claude-sandbox.sh     # build + launch a sandbox (one or many) against it
   control-plane/            # governance authority (agent cannot reach it)
-    Dockerfile              #   FastAPI over SQLite; control-net only + loopback UI
+    Dockerfile              #   FastAPI over SQLite; control-net + loopback-UI bridge
     app.py                  #   POST /authorize (policy decision + audit in one call)
     requirements.txt        #   pinned deps (fastapi, uvicorn)
   policies/                 # seed policy config (loaded into the control plane)
@@ -165,7 +165,9 @@ exposed through governed data-plane services. Next steps toward it:
    dual-homed onto `egress-net`.
 2. **Control plane** — *step 2a done* (`control-plane/` + `control-net`): a
    FastAPI + SQLite governance authority the **agent cannot reach** (on
-   `control-net` only; sandbox never attached). The egress proxy now asks it
+   `control-net` plus a loopback-only UI bridge; never on the sandbox net). The
+   UI is reachable from the host browser at `http://localhost:8081`. The egress
+   proxy now asks it
    `POST /authorize` per connection — one call that both decides policy and
    records audit — with the Anthropic lifeline allowed locally so a control-plane
    outage never bricks the agent, and everything else failing closed. Next:

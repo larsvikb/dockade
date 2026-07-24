@@ -41,6 +41,20 @@ networks:
     ipam:
       config:
         - subnet: 172.31.0.0/24
+  # Host-facing UI path for the control plane ONLY. A non-internal bridge is
+  # REQUIRED here because Docker cannot publish a host port from a container that
+  # lives solely on an internal network (control-net) — the publish is silently
+  # inert. Masquerade is disabled so this bridge carries the inbound
+  # loopback-published UI but is NOT an internet egress path: inbound publishing
+  # is DNAT and needs no SNAT, while outbound has no SNAT here so it does not
+  # function as egress. (Plain Docker can't give one container BOTH a hard
+  # no-egress guarantee AND a published host port; a future reverse-proxy sidecar
+  # would let the control plane itself stay fully internal.) Sandbox never here.
+  control-ui-net:
+    name: control-ui-net
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
 
 volumes:
   egress-audit:
@@ -98,9 +112,11 @@ services:
       - no-new-privileges:true
 
   # Control plane — the governance authority (policy + audit). The agent can
-  # NEVER reach it: attached to control-net ONLY (no sandbox-net, no egress-net),
-  # so it has no route off-box and the sandbox has no route to it. The UI/API is
-  # published to HOST LOOPBACK only for the human operator. See control-plane/.
+  # NEVER reach it: it is NOT on sandbox-net, so the sandbox has no route to it.
+  # It sits on control-net (the proxy <-> control-plane control path, internal)
+  # and on control-ui-net (a non-internal bridge carrying ONLY the host-loopback
+  # UI publish — see that network's definition for why a host publish forces a
+  # non-internal bridge and how egress is kept off it). See control-plane/.
   control-plane:
     build:
       # Repo root so the Dockerfile can COPY the top-level policies/ seed.
@@ -111,10 +127,13 @@ services:
     hostname: control-plane
     restart: unless-stopped
     networks:
+      # Control path to the governed proxies (internal, no egress).
       control-net:
         ipv4_address: 172.31.0.2
+      # Host-UI reachability only; not an egress path (see control-ui-net).
+      control-ui-net:
     # Human-only management surface, bound to host loopback (never 0.0.0.0):
-    # reachable from the host browser, not from any container network.
+    # reachable from the host browser, not from the sandbox or other machines.
     ports:
       - "127.0.0.1:8081:8090"
     volumes:

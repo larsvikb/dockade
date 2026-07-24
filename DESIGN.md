@@ -446,6 +446,10 @@ no separate artifact-export path is needed in v1.
   leave the sandbox.
 - Docs mirror / offline docs tool.
 - Progressive auto-approval driven by accumulated policy + audit history.
+- Split the control-plane UI into a distinct `control-plane-ui` frontend
+  container (own the `control-ui-net` surface; backend returns to
+  `control-net`-only/internal). Planned with 2b — see "Control plane — step 2a
+  shipped" for the rationale.
 
 ## Networks
 
@@ -454,14 +458,18 @@ no separate artifact-export path is needed in v1.
 - `control-net` (`internal: true`) — governed proxies/tools ↔ control plane.
   Sandbox not attached.
 - `egress-net` — only outbound-capable governed proxies + internet.
-- Control-plane UI bound to host loopback for the human.
+- `control-ui-net` — non-internal bridge carrying ONLY the control-plane's
+  host-loopback UI publish; masquerade disabled so it is host-reachable but not
+  an egress path. Needed because Docker cannot publish a host port from a
+  container that is on an internal network alone. Sandbox not attached.
 
-**Status:** all three networks are implemented. `sandbox-net` (internal) and
+**Status:** all four networks are implemented. `sandbox-net` (internal) and
 `egress-net` carry the agent and the sole egress; `control-net` (internal)
-carries the control path. The egress proxy is now **triple-homed** (sandbox-net
-+ egress-net + control-net); the control plane sits on `control-net` only (plus a
-host-loopback publish for the human UI). The sandbox is on `sandbox-net` only —
-never `control-net` (asserted by `make check` and `boundary-check.sh`).
+carries the control path. The egress proxy is **triple-homed** (sandbox-net
++ egress-net + control-net). The control plane sits on `control-net` (proxy
+control path) plus `control-ui-net` (host-loopback UI only); it is on neither
+`sandbox-net` nor `egress-net`. The sandbox is on `sandbox-net` only — never
+`control-net`/`control-ui-net` (asserted by `make check` and `boundary-check.sh`).
 
 ### DNS on `sandbox-net` (a non-obvious gotcha — read before touching DNS/firewall)
 
@@ -659,14 +667,38 @@ internal nets); external resolution happens at the proxy on egress-net.
 
 **Control plane — step 2a shipped** (`control-plane/` + `control-net`). The
 governance authority now exists as a service the **agent cannot reach**: it is
-attached to `control-net` (internal) only — no `sandbox-net`, no `egress-net` —
-and the sandbox is never on `control-net`, so there is no route between them
-(`boundary-check.sh` probes the control plane's fixed control-net address and
-asserts it is unreachable from the sandbox; `make check` asserts the launcher
-never attaches the sandbox to `control-net`). The control plane is a small
-FastAPI app over a SQLite policy+audit store (its own named volume — the
-crown-jewel state), with the management surface published to **host loopback
-only** (`127.0.0.1:8081`).
+not on `sandbox-net`, so the sandbox has no route to it (`boundary-check.sh`
+probes the control plane's fixed control-net address and asserts it is
+unreachable from the sandbox; `make check` asserts the launcher never attaches
+the sandbox to `control-net`/`control-ui-net`). It sits on `control-net`
+(internal) for the proxy control path and on `control-ui-net` for the human UI.
+That UI bridge is non-internal **by necessity** — Docker cannot publish a host
+port from a container that is on an internal network alone — but has masquerade
+disabled, so it carries the loopback UI publish without being an egress path.
+The control plane is a small FastAPI app over a SQLite policy+audit store (its
+own named volume — the crown-jewel state), with the management surface published
+to **host loopback only** (`127.0.0.1:8081`).
+
+*Design note — why two control nets, and the planned split.* `control-net` stays
+hard-`internal` because it is the **shared** control path for the whole governed
+data plane (egress proxy today; git/secrets proxies later), and egress is granted
+**only** by `egress-net` membership — a non-internal `control-net` would silently
+hand ungoverned egress to every service on it (see "Networks"). Publishing a host
+port, though, forces *some* non-internal surface, so `control-ui-net` quarantines
+it to a single-member bridge. Honest caveat: with only the control-plane on
+`control-net` today, this split's *present* security gain is ~nil (the control-
+plane carries `control-ui-net`'s soft-egress surface itself), and collapsing to
+one non-internal `control-net` would be observably equivalent now — but it would
+bake in a non-internal shared control path that becomes a real hole the moment a
+must-stay-egress-free tenant (secrets broker) joins. Keeping the split is cheap
+insurance against that footgun. **Planned (with 2b):** promote the UI to a
+**distinct `control-plane-ui` frontend container** that depends on the
+`control-plane` backend and talks to it over `control-net`. The frontend owns the
+`control-ui-net` non-internal surface; the backend returns to `control-net`-only
+and fully `internal`, so the crown-jewel container has zero non-internal exposure.
+This is deliberately a **separate service with its own lifecycle**, not a
+co-located sidecar. That promotion pays off exactly when 2b adds approval state
+worth isolating harder.
 
 The egress proxy is now a **control-plane client** rather than a static-allowlist
 enforcer: on every connection it calls `POST /authorize {host, ...}`, which

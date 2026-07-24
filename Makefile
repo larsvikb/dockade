@@ -102,9 +102,10 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	  if [ -f "$$f" ]; then echo "  ok $$f"; else echo "  MISSING $$f"; exit 1; fi
 	done
 	echo "== control-net isolation (sandbox must have no path to the control plane) =="
-	if grep -qE 'control-net' run-claude-sandbox.sh; then
-	  echo "  FAIL: run-claude-sandbox.sh references control-net — the sandbox must"
-	  echo "        NEVER attach to it (the agent must have no route to the control plane)"
+	if grep -qE 'control-(ui-)?net' run-claude-sandbox.sh; then
+	  echo "  FAIL: run-claude-sandbox.sh references a control-plane network — the"
+	  echo "        sandbox must NEVER attach to control-net or control-ui-net (the"
+	  echo "        agent must have no route to the control plane)"
 	  exit 1
 	fi
 	# Both agent-facing nets must stay internal: sandbox-net AND control-net. A

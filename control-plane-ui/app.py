@@ -55,9 +55,18 @@ def index() -> FileResponse:
 @app.api_route("/{path:path}", methods=["GET", "POST"])
 async def proxy(path: str, request: Request) -> StreamingResponse:
     """Relay everything else to the backend, streaming the response so the SSE
-    approvals feed flows through unbuffered."""
+    approvals feed flows through unbuffered.
+
+    The upstream is PINNED to BACKEND. `{path:path}` retains a leading slash for a
+    request like `//evil.com/x` (captured as `/evil.com/x`), and the old `"/" +
+    path` turned that back into `//evil.com/x` — a network-path reference httpx
+    resolves against the base as a DIFFERENT authority (`http://evil.com/x`), i.e.
+    a caller-controlled host override / SSRF primitive. Collapsing to a single
+    leading slash keeps the request a plain absolute-path reference, so the host
+    always stays BACKEND."""
+    upstream_path = "/" + path.lstrip("/")
     req = _client.build_request(
-        request.method, "/" + path,
+        request.method, upstream_path,
         params=request.query_params,
         content=await request.body(),
         headers=[(k, v) for k, v in request.headers.items()

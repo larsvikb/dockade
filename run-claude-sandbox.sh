@@ -1,10 +1,16 @@
 #!/bin/bash
 # Launch the Claude sandbox container.
-# Usage: ./run-claude-sandbox.sh [workspace_path] [--rebuild]
+# Usage: ./run-claude-sandbox.sh [workspace_path] [--rebuild] [--build-only] [--no-cache]
 #
 # Mounts the given workspace (default: current dir) at /workspace.
 # Claude config/auth persists in the named volume `claude-sandbox-config`,
 # isolated from the host's ~/.claude. Authenticate once on first run.
+#
+# --build-only builds the image and exits WITHOUT launching (no workspace mount,
+# no network) — a headless way to assert the image still builds (used by
+# `make check`); implies a rebuild.
+# --no-cache forces a from-scratch build (bypasses the layer cache); implies a
+# rebuild. Combine with --build-only for a clean headless rebuild (`make rebuild`).
 
 set -euo pipefail
 
@@ -18,6 +24,8 @@ SANDBOX_NET="sandbox-net"
 # can share the compose infra without name collisions.
 
 REBUILD=false
+BUILD_ONLY=false
+NO_CACHE=false
 WORKSPACE="$PWD"
 
 # The firewall is the real containment boundary, so there is deliberately no
@@ -27,10 +35,36 @@ WORKSPACE="$PWD"
 for arg in "$@"; do
     case "$arg" in
         --rebuild)     REBUILD=true ;;
+        --build-only)  BUILD_ONLY=true; REBUILD=true ;;
+        --no-cache)    NO_CACHE=true; REBUILD=true ;;
         -*)            echo "Unknown flag: $arg" >&2; exit 1 ;;
         *)             WORKSPACE="$(cd "$arg" && pwd)" ;;
     esac
 done
+
+# Build the sandbox image, matching the sandbox user to the host uid/gid so
+# bind-mounted workspaces are writable from both sides (avoids the drvfs/uid
+# mismatch on WSL). Rebuild after switching hosts if the host uid differs.
+# --no-cache forces a from-scratch build (bypasses Docker's layer cache).
+build_image() {
+    local cache_args=()
+    [[ "$NO_CACHE" == "true" ]] && cache_args+=(--no-cache)
+    echo "Building $IMAGE_NAME (sandbox user uid/gid $(id -u)/$(id -g))..."
+    docker build -t "$IMAGE_NAME" \
+        ${cache_args[@]+"${cache_args[@]}"} \
+        --build-arg USER_UID="$(id -u)" \
+        --build-arg USER_GID="$(id -g)" \
+        "$SCRIPT_DIR/claude-sandbox"
+}
+
+# --build-only: assert the image builds, then stop before any launch machinery.
+# Deliberately ahead of the workspace guard below — a pure build neither mounts a
+# workspace nor needs one, so validating it (and possibly refusing) would be noise.
+if [[ "$BUILD_ONLY" == "true" ]]; then
+    build_image
+    echo "Built $IMAGE_NAME; not launching (--build-only)."
+    exit 0
+fi
 
 # Workspace safety guard. The workspace is bind-mounted RW with the sandbox user
 # matched to the host uid, so the yolo agent gets full read/write to whatever this
@@ -77,14 +111,7 @@ done
 WORKSPACE="$REAL_WORKSPACE"
 
 if [[ "$REBUILD" == "true" ]] || ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
-    echo "Building $IMAGE_NAME (sandbox user uid/gid $(id -u)/$(id -g))..."
-    # Match the sandbox user to the host uid/gid so bind-mounted workspaces are
-    # writable from both sides (avoids the drvfs/uid mismatch on WSL). Rebuild
-    # (--rebuild) after switching hosts if the host uid differs.
-    docker build -t "$IMAGE_NAME" \
-        --build-arg USER_UID="$(id -u)" \
-        --build-arg USER_GID="$(id -g)" \
-        "$SCRIPT_DIR/claude-sandbox"
+    build_image
 fi
 
 # Infrastructure network. docker-compose.yml owns sandbox-net (with a fixed

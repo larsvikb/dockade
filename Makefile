@@ -2,7 +2,9 @@
 #
 # Two jobs:
 #   - `make check`  static checks: linters (when installed) + repo consistency
-#                   guards that always run. CI-friendly: non-zero on any failure.
+#                   guards that always run + a build-verification that asserts
+#                   every image still builds (skipped when docker is unavailable).
+#                   CI-friendly: non-zero on any failure.
 #   - compose/*     thin wrappers over the shared egress-proxy infrastructure in
 #                   docker-compose.yml. Sandboxes themselves are NOT compose
 #                   services (they are ephemeral + plural); launch them with
@@ -49,9 +51,9 @@ REFFILES := $(SCRIPTS) \
             control-plane-ui/index.html \
             policies/egress-allowlist.txt
 
-.PHONY: help check lint consistency \
-        up down down-v build rebuild ps logs logs-cp audit \
-        sandbox sandbox-rebuild boundary
+.PHONY: help check lint consistency verify-build \
+        up down destroy rebuild logs-ep logs-cp \
+        sandbox boundary
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -60,7 +62,7 @@ help: ## Show this help
 
 # ── static checks ───────────────────────────────────────────────────────────
 
-check: lint consistency ## Run all static checks (linters + consistency guards)
+check: lint consistency verify-build ## Run all static checks (linters + consistency guards + build)
 	@echo "== all checks passed =="
 
 lint: ## Run linters (shellcheck, hadolint, ruff, yamllint) — skipped if not installed
@@ -120,6 +122,18 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	fi
 	echo "  ok — launcher never attaches the sandbox to control-net; both internal nets internal"
 
+verify-build: ## Assert every image still builds (skipped if docker unavailable)
+	@if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+	  echo "SKIP build verification (docker unavailable)"; exit 0
+	fi
+	# Cache-respecting builds: the first run is slow, repeats are near-instant when
+	# nothing changed. Covers all four Dockerfiles — the three compose services
+	# here, and the sandbox image (not a compose service) via the launcher.
+	echo "== docker compose build (egress proxy + control plane + UI) =="
+	$(COMPOSE) build
+	echo "== sandbox image build (run-claude-sandbox.sh --build-only) =="
+	./run-claude-sandbox.sh --build-only
+
 # ── shared infrastructure (docker-compose.yml) ──────────────────────────────
 
 up: ## Bring up the shared infra (egress proxy), building if needed
@@ -128,33 +142,24 @@ up: ## Bring up the shared infra (egress proxy), building if needed
 down: ## Stop the shared infra (keeps the egress-audit volume)
 	$(COMPOSE) down
 
-down-v: ## Stop infra AND delete the egress-audit volume (destructive)
+destroy: ## Stop infra AND delete the egress-audit volume (destructive)
 	$(COMPOSE) down -v
 
-build: ## Build the egress-proxy image
-	$(COMPOSE) build
-
-rebuild: ## Rebuild the egress-proxy image from scratch (no cache)
+rebuild: ## Tear down infra and rebuild every image from scratch — proxy + control plane + UI + sandbox (run `make up` after)
+	$(COMPOSE) down
 	$(COMPOSE) build --no-cache
+	./run-claude-sandbox.sh --build-only --no-cache
 
-ps: ## Show infra container status
-	$(COMPOSE) ps
-
-logs: ## Follow the egress-proxy log — the live per-connection audit stream
+logs-ep: ## Follow the egress-proxy log — the live per-connection audit stream
 	$(COMPOSE) logs -f egress-proxy
 
 logs-cp: ## Follow the control-plane log (policy seed + decisions)
 	$(COMPOSE) logs -f control-plane
 
-audit: logs ## Alias for `logs` (the egress audit trail)
-
 # ── sandbox lifecycle (run-claude-sandbox.sh) ───────────────────────────────
 
 sandbox: ## Launch a sandbox against the infra (WORKSPACE=/path, default $$PWD)
 	./run-claude-sandbox.sh "$(WORKSPACE)"
-
-sandbox-rebuild: ## Rebuild the sandbox image, then launch
-	./run-claude-sandbox.sh "$(WORKSPACE)" --rebuild
 
 boundary: ## Run boundary-check.sh inside a running sandbox (SANDBOX=name)
 	docker exec -it "$(SANDBOX)" boundary-check.sh

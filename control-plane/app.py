@@ -317,19 +317,29 @@ def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
            proto=req.proto, client=req.client, method=req.method, url=req.url,
            reason="held for approval")
 
-    resolved = event.wait(HOLD_TIMEOUT)
-    outcome = _release_hold(approval_id)
+    # Block until a human resolves this hold or the window elapses. The wakeup is
+    # advisory: the DURABLE approvals row is the single source of truth for the
+    # outcome. Exactly one of this timeout path and resolve() flips the row out of
+    # 'pending' — each via an atomic conditional UPDATE (…WHERE status='pending')
+    # that SQLite serializes — so a resolve landing just as the hold times out can
+    # no longer leave the row 'allowed' (and persist a rule) while the agent is
+    # told 'deny'. Whoever's UPDATE wins decides; the loser reads the winner's row.
+    event.wait(HOLD_TIMEOUT)
+    with _connect() as conn:
+        expired = conn.execute(
+            "UPDATE approvals SET status='expired', resolved_at=? "
+            "WHERE id=? AND status='pending'", (time.time(), approval_id)).rowcount
+        status_row = None if expired else conn.execute(
+            "SELECT status FROM approvals WHERE id=?", (approval_id,)).fetchone()
+        conn.commit()
+    _release_hold(approval_id)
 
-    if resolved and outcome:
-        final, why = outcome, "human approval" if outcome == "allow" else "human rejection"
-    else:
+    if expired:
         final, why = "deny", "no decision within hold timeout — default-deny"
-        # Mark expired only if still pending (resolve may have raced in).
-        with _connect() as conn:
-            conn.execute(
-                "UPDATE approvals SET status='expired', resolved_at=? "
-                "WHERE id=? AND status='pending'", (time.time(), approval_id))
-            conn.commit()
+    elif status_row and status_row["status"] == "allowed":
+        final, why = "allow", "human approval"
+    else:  # 'denied' (or any non-allowed terminal state) — default-deny
+        final, why = "deny", "human rejection"
     _audit(final, stage=req.stage, host=req.host, port=req.port, proto=req.proto,
            client=req.client, method=req.method, url=req.url, reason=why)
     return AuthorizeResponse(decision=final, reason=why)
@@ -379,9 +389,15 @@ def resolve(approval_id: str, req: ResolveRequest) -> JSONResponse:
         return JSONResponse(
             {"ok": False, "detail": "raced — no longer pending"}, status_code=409)
 
+    # We won the conditional UPDATE above, so the durable row already carries the
+    # decision the waiter will read. Wake it — but only while its slot is still
+    # registered: if its hold window elapsed and it released between our UPDATE and
+    # here, skip, so we neither leak a _PENDING_OUTCOME entry nor set a dead event.
+    # A missed wake is harmless (the waiter already read, or will read, the row).
     with _LOCK:
-        _PENDING_OUTCOME[approval_id] = outcome
-        event.set()
+        if approval_id in _PENDING_EVENTS:
+            _PENDING_OUTCOME[approval_id] = outcome
+            event.set()
     return JSONResponse({"ok": True, "outcome": outcome, "persisted": persist})
 
 

@@ -104,6 +104,28 @@ if [ -n "${HTTPS_PROXY:-}" ]; then
     else
         bad "SNI fronting NOT refused — got a passthrough response (domain-fronting leak)"
     fi
+
+    # Control-plane relay governance: the egress proxy is the ONLY component
+    # on both sandbox-net and control-net, so it — not segmentation — must refuse
+    # to relay the agent onto the control plane. Ask the proxy (via HTTPS_PROXY, so
+    # IT resolves the name/connects) to reach the control-plane host and a literal
+    # control-net IP; both must be refused with a 403 BEFORE any policy/port check.
+    # (grep the combined output for 403, like the port/SNI checks above: a refused
+    # CONNECT makes curl exit non-zero while still reporting "response 403".)
+    cphost="$(curl -sS -x "$HTTPS_PROXY" --connect-timeout 5 --max-time 8 \
+        -o /dev/null https://control-plane/ 2>&1 || true)"
+    if printf '%s' "$cphost" | grep -q '403'; then
+        ok "egress proxy refuses to relay to the control-plane host (403)"
+    else
+        bad "egress proxy did NOT 403 the control-plane host (got: ${cphost:-<none>}) — control-net relay risk"
+    fi
+    cpip="$(curl -sS -x "$HTTPS_PROXY" --connect-timeout 5 --max-time 8 \
+        -o /dev/null https://172.31.0.2/ 2>&1 || true)"
+    if printf '%s' "$cpip" | grep -q '403'; then
+        ok "egress proxy refuses to relay to a control-net IP (172.31.0.2 -> 403)"
+    else
+        bad "egress proxy did NOT 403 control-net IP 172.31.0.2 (got: ${cpip:-<none>}) — control-net relay risk"
+    fi
 fi
 
 printf '%s== control plane ==%s\n' "$bold" "$reset"

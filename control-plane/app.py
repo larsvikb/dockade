@@ -22,9 +22,12 @@ control-plane-ui frontend; the backend serves no HTML itself:
 
 Concurrency model: run under a SINGLE uvicorn worker. `/authorize` and the
 resolve endpoint are sync (FastAPI runs them in a threadpool); a held request
-blocks its worker on a threading.Event that the resolve endpoint sets. The
-SQLite store is the source of truth for the UI (the SSE stream polls it). Do NOT
-run multiple workers — the pending-event registry is in-process.
+blocks its worker on a threading.Event that the resolve endpoint sets. Concurrent
+holds are bounded (CONTROL_MAX_PENDING / CONTROL_MAX_PENDING_PER_CLIENT) so a
+sandbox cannot pin every worker and stall governance for all sandboxes — over the
+cap /authorize fails closed. The SQLite store is the source of truth for the UI
+(the SSE stream polls it). Do NOT run multiple workers — the pending-event
+registry is in-process.
 
 No egress: this service is on control-net only. It must never be given an
 internet route — it is pure management state (the crown jewel).
@@ -48,6 +51,16 @@ SEED_PATH = os.environ.get(
     "CONTROL_SEED", "/etc/control-plane/egress-allowlist.txt")
 # How long a held request waits for a human before defaulting to deny.
 HOLD_TIMEOUT = float(os.environ.get("CONTROL_HOLD_TIMEOUT", "120"))
+# Bound concurrent holds. A held request blocks a FastAPI threadpool worker
+# until it is resolved or times out, so an unbounded number of holds would pin
+# every worker and stall ALL /authorize decisions — and this control plane is
+# shared across every sandbox, so one agent could starve governance for all. Cap
+# in-flight holds globally and per client; over either cap /authorize fails CLOSED
+# immediately (deny) instead of registering another blocking hold. Keep MAX_PENDING
+# well under the threadpool size (anyio default ~40) so fast allow/deny decisions
+# always have free workers. Set MAX_PENDING_PER_CLIENT to 0 to disable that cap.
+MAX_PENDING = int(os.environ.get("CONTROL_MAX_PENDING", "16"))
+MAX_PENDING_PER_CLIENT = int(os.environ.get("CONTROL_MAX_PENDING_PER_CLIENT", "4"))
 
 app = FastAPI(title="dockade control plane", version="2b")
 
@@ -57,6 +70,8 @@ app = FastAPI(title="dockade control plane", version="2b")
 _LOCK = threading.Lock()
 _PENDING_EVENTS: dict[str, threading.Event] = {}
 _PENDING_OUTCOME: dict[str, str] = {}
+# approval_id -> client, so the per-client hold cap can be counted under _LOCK.
+_PENDING_CLIENT: dict[str, str | None] = {}
 
 
 # ── storage ─────────────────────────────────────────────────────────────────
@@ -165,6 +180,18 @@ def _audit(decision: str, **fields) -> None:
              fields.get("port"), fields.get("proto"), fields.get("client"),
              fields.get("method"), fields.get("url"), fields.get("reason")))
         conn.commit()
+    # Mirror every decision to stdout so `docker compose logs -f control-plane`
+    # (make logs-cp) is a live decision feed — the same role the egress proxy's
+    # stdout audit plays. The SQLite table above stays the durable, queryable
+    # record (served at /api/audit); this line is for live viewing only. Compact
+    # and greppable: one line, empty fields omitted, reason after a ' :: '.
+    shown = " ".join(
+        f"{k}={fields[k]}" for k in
+        ("stage", "host", "port", "proto", "client", "method", "url")
+        if fields.get(k) is not None)
+    reason = fields.get("reason")
+    print(f"AUDIT {decision} {shown}" + (f" :: {reason}" if reason else ""),
+          flush=True)
 
 
 def _list_pending() -> list[dict]:
@@ -233,8 +260,28 @@ def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
                    url=req.url, reason=reason)
         return AuthorizeResponse(decision=decision, reason=reason)
 
-    # HOLD: register a pending approval and block until resolved or timeout.
+    # HOLD (bounded): reserve a hold slot atomically with the cap check, so
+    # concurrent holds can't race past the cap. Over the global or per-client cap,
+    # fail CLOSED immediately rather than registering another worker-blocking hold.
     approval_id = uuid.uuid4().hex
+    event = threading.Event()
+    with _LOCK:
+        over_global = len(_PENDING_EVENTS) >= MAX_PENDING
+        over_client = (
+            req.client is not None and MAX_PENDING_PER_CLIENT > 0
+            and sum(1 for c in _PENDING_CLIENT.values() if c == req.client)
+            >= MAX_PENDING_PER_CLIENT)
+        if not (over_global or over_client):
+            _PENDING_EVENTS[approval_id] = event
+            _PENDING_CLIENT[approval_id] = req.client
+    if over_global or over_client:
+        scope = "global" if over_global else f"client {req.client}"
+        why = f"hold capacity exceeded ({scope}) — fail-closed"
+        _audit("deny", stage=req.stage, host=req.host, port=req.port,
+               proto=req.proto, client=req.client, method=req.method,
+               url=req.url, reason=why)
+        return AuthorizeResponse(decision="deny", reason=why)
+
     now = time.time()
     with _connect() as conn:
         conn.execute(
@@ -247,12 +294,10 @@ def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
            proto=req.proto, client=req.client, method=req.method, url=req.url,
            reason="held for approval")
 
-    event = threading.Event()
-    with _LOCK:
-        _PENDING_EVENTS[approval_id] = event
     resolved = event.wait(HOLD_TIMEOUT)
     with _LOCK:
         _PENDING_EVENTS.pop(approval_id, None)
+        _PENDING_CLIENT.pop(approval_id, None)
         outcome = _PENDING_OUTCOME.pop(approval_id, None)
 
     if resolved and outcome:

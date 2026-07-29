@@ -439,6 +439,20 @@ single project directory, read-write. Because work lands on the host FS directly
 no separate artifact-export path is needed in v1.
 
 ### Clear future improvements
+- **Python unit tests for the governance-critical logic.** Today the Python
+  (`proxies/egress/addon.py`, `control-plane/app.py`, `control-plane-ui/app.py`)
+  is checked only by `ruff` + `py_compile` in `make check` and by the runtime
+  `boundary-check.sh` smoke test — there is no behavioral test suite. The
+  security-load-bearing decision functions deserve fast, deterministic,
+  server-free unit coverage: the proxy's `_forbidden` / `_match` / port-gating and
+  the control plane's `_decide` / `_match` / hold-cap reservation. These are
+  exactly the properties `boundary-check.sh` is a poor fit for — it can only
+  observe reachability from the sandbox's vantage point, so availability/
+  concurrency properties like the hold cap (which returns the same opaque `403`
+  to the agent as any other deny) can't be asserted there. A dependency-free
+  `python -m unittest` suite wired into `make check` is the smallest first step;
+  extracting the hold-cap reservation out of the `authorize` handler into a small
+  testable function is the natural seam to start from.
 - Dedicated git proxy that speaks the git protocol (block force-push, restrict
   branches, per-repo policy) instead of HTTPS-through-egress.
 - Separate test/build runner containers for isolation + parallelism.
@@ -713,7 +727,24 @@ Two deliberate properties: (1) the **permanent lifeline** (Anthropic API/auth)
 is allowed by a *local* check in the proxy *before* the control plane is
 consulted, so a control-plane outage never bricks the agent's own API; (2)
 everything else **fails closed** — if the control plane is unreachable or times
-out, the request is denied and audited locally. The call runs in a worker thread
+out, the request is denied and audited locally.
+
+**Control-plane relay guard (the proxy is the bridge, so the proxy must refuse
+it).** The egress proxy is the *one* component attached to both `sandbox-net` and
+`control-net`, so segmentation alone does **not** isolate the agent from the
+control plane — the proxy could in principle relay a connection onto control-net
+(where the agent could, e.g., approve its own held requests). It therefore
+hard-refuses, **before** any policy / permanent-lifeline / port check, any
+destination that names a control-plane host (`control-plane`, `control-plane-ui`)
+or resolves into the control-net subnet (`172.31.0.0/24`) — see
+`_forbidden` in `proxies/egress/addon.py` (`EGRESS_FORBIDDEN_HOSTS` /
+`EGRESS_FORBIDDEN_CIDRS`). Because the guard is checked first and never weighed
+against policy, no rule, human approval, or change to the port allowlist can widen
+it, and a public name whose DNS is pointed at control-net is caught by the
+resolve step. This makes the CLAUDE.md invariant ("the agent must never reach the
+control plane") independently enforced at the one place segmentation cannot cover;
+`boundary-check.sh` asserts the proxy 403s both a control-plane host and a literal
+control-net IP. The call runs in a worker thread
 so it never blocks mitmproxy's event loop, and the egress image gains no new
 dependency. The canonical allow policy now lives at `policies/egress-allowlist.txt`
 (the control plane seeds SQLite from it on first boot, idempotently); the proxy
@@ -730,7 +761,15 @@ resolves holds in a **live SSE UI** served at `/`: **allow-once / deny-once**
 future connections skip the hold — the progressive-trust path). Concurrency:
 one uvicorn worker; a held request blocks its threadpool worker on a
 `threading.Event` the resolve endpoint sets; SQLite (`approvals` table) is the
-UI's source of truth; stale `pending` rows are expired on startup.
+UI's source of truth; stale `pending` rows are expired on startup. **Holds are
+bounded** (`CONTROL_MAX_PENDING`, `CONTROL_MAX_PENDING_PER_CLIENT`): since each
+hold pins a threadpool worker and this control plane is **shared across all
+sandboxes**, an unbounded queue would let one agent exhaust the pool and stall
+every sandbox's governed egress. Over either cap, `/authorize` fails **closed**
+(deny) immediately instead of registering another blocking hold — the cap stays
+comfortably under the worker pool so fast allow/deny decisions always have free
+workers, and the permanent lifeline is unaffected (it never reaches the control
+plane).
 
 **Frontend split — step 2b-2 shipped.** The approval UI and the API/SSE relay
 now live in a distinct **`control-plane-ui`** container (FastAPI + httpx: serves

@@ -27,6 +27,12 @@ Fail-closed, with one deliberate exception:
     (timeout), the request is DENIED and audited locally — governed egress fails
     closed when the policy authority is down, which is the intended posture.
 
+Control-plane isolation: this proxy is the only component on BOTH sandbox-net
+and control-net, so it — not network segmentation — is what keeps the agent off
+the control plane. Before any policy/permanent/port check it hard-refuses any
+destination that names a control-plane host or resolves into the control-net
+subnet (``_forbidden``), a guard that no rule, approval, or port change can widen.
+
 An unknown host is HELD (2b): the control plane blocks the /authorize response
 until a human approves/rejects it or its hold window elapses. To the proxy this
 is just a slow allow/deny — the connection waits, then proceeds or gets a 403.
@@ -43,9 +49,11 @@ Later: MITM / body-level audit is a per-domain option — enabled by NOT setting
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
+import socket
 import time
 import urllib.request
 
@@ -89,6 +97,69 @@ ALLOWED_CONNECT_PORTS = _ports("EGRESS_CONNECT_PORTS", "443")  # HTTPS tunnels
 ALLOWED_HTTP_PORTS = _ports("EGRESS_HTTP_PORTS", "80")         # plain HTTP
 
 logger = logging.getLogger("egress")
+
+# ── Forbidden destinations (control plane / control-net) ──────────────────────
+# This proxy is the ONE component attached to BOTH sandbox-net and control-net,
+# so it — not network segmentation — is what actually keeps the agent off the
+# control plane: were the proxy to relay a connection onto control-net, the agent
+# could reach the control plane (and, e.g., approve its own held requests). We
+# therefore refuse, BEFORE any policy / permanent-lifeline / port check, any
+# destination that names a control-plane host or resolves into the control-net
+# subnet. This guard is checked first and is never consulted against policy, so it
+# cannot be widened by a rule, a human approval, a change to the port allowlist,
+# or a public name whose DNS is pointed at control-net.
+def _parse_cidrs(env: str, default: str) -> tuple:
+    nets = []
+    for c in os.environ.get(env, default).split(","):
+        c = c.strip()
+        if not c:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(c, strict=False))
+        except ValueError:
+            logger.warning("ignoring invalid forbidden CIDR %r", c)
+    return tuple(nets)
+
+# Defaults mirror docker-compose.yml: control-net is 172.31.0.0/24 and the
+# control-plane services are reachable there by name.
+FORBIDDEN_CIDRS = _parse_cidrs("EGRESS_FORBIDDEN_CIDRS", "172.31.0.0/24")
+FORBIDDEN_HOSTS = _hosts("EGRESS_FORBIDDEN_HOSTS", "control-plane,control-plane-ui")
+
+
+def _ip_in_forbidden(ip_str: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    return any(ip in net for net in FORBIDDEN_CIDRS)
+
+
+def _forbidden_reason(host: str) -> str | None:
+    """Return a deny reason if this destination must never be dialed (control
+    plane / control-net), else None. Does DNS, so it runs in a worker thread
+    (see ``_forbidden``). Three checks, cheapest first: a forbidden hostname, a
+    literal forbidden IP, then a name that RESOLVES into a forbidden range."""
+    h = (host or "").lower().rstrip(".")
+    if h in FORBIDDEN_HOSTS:
+        return f"forbidden destination host {host} (control plane)"
+    if _ip_in_forbidden(h):
+        return f"forbidden destination IP {host} (control-net)"
+    if not FORBIDDEN_CIDRS:
+        return None
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return None
+    for info in infos:
+        if _ip_in_forbidden(info[4][0]):
+            return (f"destination {host} resolves to forbidden {info[4][0]} "
+                    "(control-net)")
+    return None
+
+
+async def _forbidden(host: str) -> str | None:
+    return await asyncio.to_thread(_forbidden_reason, host)
+
 
 # Per-connection record of the authorized CONNECT authority, keyed by the client
 # connection id. The holding decision is made ONCE, at http_connect; the TLS SNI
@@ -174,6 +245,16 @@ async def http_connect(flow: http.HTTPFlow) -> None:
     host = flow.request.host
     port = flow.request.port
     client = flow.client_conn.peername[0] if flow.client_conn.peername else None
+    # Refuse to relay onto the control plane / control-net BEFORE anything else
+    # — this proxy is the only bridge between the two, so this guard is what keeps
+    # the agent off the control plane, not (only) network segmentation.
+    forbidden = await _forbidden(host)
+    if forbidden:
+        _audit("deny", proto="connect", host=host, port=port, client=client,
+               reason=forbidden)
+        flow.response = http.Response.make(
+            403, b"egress denied by policy\n", {"Content-Type": "text/plain"})
+        return
     if port not in ALLOWED_CONNECT_PORTS:
         _audit("deny", proto="connect", host=host, port=port, client=client,
                reason=f"port {port} not permitted for CONNECT "
@@ -238,6 +319,16 @@ async def request(flow: http.HTTPFlow) -> None:
     proto = "https" if https else "http"
     allowed_ports = ALLOWED_CONNECT_PORTS if https else ALLOWED_HTTP_PORTS
     port = flow.request.port
+    # Forbid control-plane / control-net for EVERY name the client asserts
+    # (transport host and Host/:authority), before policy or the port gate.
+    for name in {flow.request.host, flow.request.pretty_host}:
+        forbidden = await _forbidden(name)
+        if forbidden:
+            _audit("deny", proto=proto, method=flow.request.method,
+                   url=flow.request.pretty_url, reason=forbidden)
+            flow.response = http.Response.make(
+                403, b"egress denied by policy\n", {"Content-Type": "text/plain"})
+            return
     if port not in allowed_ports:
         _audit("deny", proto=proto, method=flow.request.method,
                url=flow.request.pretty_url,

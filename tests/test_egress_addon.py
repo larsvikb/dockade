@@ -120,5 +120,20 @@ class ForbiddenGuardTests(unittest.TestCase):
         self.assertFalse(addon._ip_in_forbidden("8.8.8.8"))
 
 
+class GuardConfigTests(unittest.TestCase):
+    """The relay guard must never be silently disabled by configuration: with no
+    forbidden CIDRs the literal-IP and resolve branches vanish, leaving only exact
+    hostname matching. Startup must fail CLOSED in that case."""
+
+    def test_startup_ok_with_default_cidrs(self):
+        # Defaults include 172.31.0.0/24, so this must not raise.
+        addon._assert_guard_configured()
+
+    def test_startup_fails_closed_without_forbidden_cidrs(self):
+        with mock.patch.object(addon, "FORBIDDEN_CIDRS", ()):
+            with self.assertRaises(RuntimeError):
+                addon._assert_guard_configured()
+
+
 if __name__ == "__main__":
     unittest.main()

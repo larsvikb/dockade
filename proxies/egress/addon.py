@@ -138,7 +138,20 @@ def _forbidden_reason(host: str) -> str | None:
     """Return a deny reason if this destination must never be dialed (control
     plane / control-net), else None. Does DNS, so it runs in a worker thread
     (see ``_forbidden``). Three checks, cheapest first: a forbidden hostname, a
-    literal forbidden IP, then a name that RESOLVES into a forbidden range."""
+    literal forbidden IP, then a name that RESOLVES into a forbidden range.
+
+    Two of these are DETERMINISTIC guarantees — the exact-hostname match and the
+    literal-IP-in-CIDR match decide from the request alone. The third (resolve
+    step) is BEST-EFFORT defense-in-depth: it depends on a DNS lookup, so it is
+    subject to a TOCTOU/rebind gap (mitmproxy re-resolves when it dials) and to
+    resolution failure. That is acceptable here ONLY because it is not the
+    load-bearing control — reaching the control plane is prevented first by
+    network topology (the sandbox has no control-net route) and by the local port
+    gate (control plane listens on :8090; CONNECT/HTTP are gated to :443/:80), so
+    a rebound name is dialed on a port nothing serves. See DESIGN.md
+    "Control-plane relay guard" and the planned API-surface split (#4) that caps
+    the blast radius of any guard bypass. The startup ``_assert_guard_configured``
+    refuses to run with the CIDR check disabled, so this is never silently off."""
     h = (host or "").lower().rstrip(".")
     if h in FORBIDDEN_HOSTS:
         return f"forbidden destination host {host} (control plane)"
@@ -148,7 +161,13 @@ def _forbidden_reason(host: str) -> str | None:
         return None
     try:
         infos = socket.getaddrinfo(host, None)
-    except OSError:
+    except OSError as e:
+        # Cannot run the resolve-based check. Returning None is SAFE (not a silent
+        # fail-open): a name that will not resolve here also will not resolve when
+        # mitmproxy dials it, so no reach is granted — and the deterministic
+        # hostname/literal-IP checks above already ran. Log it so a resolver
+        # outage is observable rather than invisible.
+        logger.warning("relay-guard resolve check skipped for %r (%s)", host, e)
         return None
     for info in infos:
         if _ip_in_forbidden(info[4][0]):
@@ -159,6 +178,23 @@ def _forbidden_reason(host: str) -> str | None:
 
 async def _forbidden(host: str) -> str | None:
     return await asyncio.to_thread(_forbidden_reason, host)
+
+
+def _assert_guard_configured() -> None:
+    """Fail CLOSED at startup if the relay guard's CIDR check is disabled by
+    configuration. This proxy is the ONE bridge between sandbox-net and
+    control-net, so the control-net CIDR check is not optional: an empty
+    ``EGRESS_FORBIDDEN_CIDRS`` would silently drop BOTH the literal-IP and the
+    resolve-based branches, leaving only exact-hostname matching — bypassable by a
+    literal IP or a name that resolves into control-net. There is no legitimate
+    reason to run this proxy with that check off, so refuse to start rather than
+    serve with the hole (matches the repo's "no silent unsafe defaults"). The
+    hostname list is a cheap fast-path on top of this, not a substitute for it."""
+    if not FORBIDDEN_CIDRS:
+        raise RuntimeError(
+            "EGRESS_FORBIDDEN_CIDRS is empty — the control-plane relay guard would "
+            "not block control-net by IP. Refusing to start (fail closed). Set it "
+            "to the control-net subnet(s), e.g. 172.31.0.0/24.")
 
 
 # Per-connection record of the authorized CONNECT authority, keyed by the client
@@ -231,9 +267,14 @@ def _audit(decision: str, **fields) -> None:
 
 
 def load(loader) -> None:  # mitmproxy lifecycle hook
+    # Refuse to start with the relay guard's CIDR check disabled (fail closed)
+    # BEFORE serving any traffic or announcing readiness.
+    _assert_guard_configured()
     _setup_audit_file()
     _audit("startup", control_plane=AUTHORIZE_URL, audit=AUDIT_PATH,
-           permanent=list(PERMANENT_HOSTS))
+           permanent=list(PERMANENT_HOSTS),
+           forbidden_hosts=list(FORBIDDEN_HOSTS),
+           forbidden_cidrs=[str(n) for n in FORBIDDEN_CIDRS])
 
 
 async def http_connect(flow: http.HTTPFlow) -> None:

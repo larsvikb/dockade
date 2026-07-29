@@ -487,6 +487,28 @@ no separate artifact-export path is needed in v1.
   container (own the `control-ui-net` surface; backend returns to
   `control-net`-only/internal). Planned with 2b — see "Control plane — step 2a
   shipped" for the rationale.
+- **Split the control-plane API surface to cap the blast radius of any relay-guard
+  bypass (planned).** The egress proxy only ever needs `/authorize` (+ `/healthz`);
+  the *dangerous* surface is the management API (`/approvals`, `/approvals/{id}/
+  resolve`, `/api/audit`), because `resolve` lets a caller approve held egress —
+  i.e. self-approve. Today the agent is kept off all of it by three layers: network
+  topology (no control-net route), the egress proxy's relay guard (`_forbidden`),
+  and the local port gate (control plane on `:8090`, while CONNECT/HTTP are gated to
+  `:443`/`:80`, so even a DNS-rebound name is dialed on a port nothing serves). The
+  relay guard's resolve branch is best-effort (TOCTOU/rebind, resolution failure),
+  so the robust improvement is to make a *bypass* non-catastrophic rather than to
+  keep hardening the guard: **serve the proxy-facing `/authorize` and the
+  human-facing management API on separate ports, and give the proxy a route only to
+  the `/authorize` port** (e.g. a dedicated proxy↔backend network carrying only
+  authorize; the management port reachable solely from `control-plane-ui`). Then
+  even a total relay-guard bypass can, at worst, *query* a policy decision — it can
+  never approve a hold or read the audit store. This addresses the impact
+  (self-approval) instead of racing the mechanism (DNS), and composes with the
+  topology refinement noted under "why two control nets" (the proxy comes off the
+  broad `control-net` so it also has no route to future control-net tenants — the
+  git/secrets brokers). Pairs with a `boundary-check.sh` assertion that the proxy
+  can reach the authorize port but **not** the management port. See the
+  "Control-plane relay guard" note under Build status for the guard this backstops.
 
 ## Networks
 
@@ -767,7 +789,25 @@ it, and a public name whose DNS is pointed at control-net is caught by the
 resolve step. This makes the CLAUDE.md invariant ("the agent must never reach the
 control plane") independently enforced at the one place segmentation cannot cover;
 `boundary-check.sh` asserts the proxy 403s both a control-plane host and a literal
-control-net IP. The call runs in a worker thread
+control-net IP.
+
+*Defense-in-depth, not the sole control — and honest about the resolve branch.*
+The hostname and literal-IP checks are **deterministic** (decided from the request
+alone); the resolve branch is **best-effort** — it depends on a DNS lookup, so it
+carries a TOCTOU/rebind gap (mitmproxy re-resolves when it dials) and can be
+skipped on resolution failure (logged, returns "not forbidden" — safe, because an
+unresolvable name is also undialable, and reaching the control plane is prevented
+first by topology and by the port gate: the control plane listens on `:8090` while
+CONNECT/HTTP are gated to `:443`/`:80`, so a rebound name is dialed on a port
+nothing serves). To keep the guard from being *silently* disabled by
+misconfiguration, `load()` calls `_assert_guard_configured()`, which **fails
+closed at startup** (refuses to run) if `EGRESS_FORBIDDEN_CIDRS` is empty — an
+empty CIDR set would drop both the literal-IP and resolve branches, leaving only
+exact-hostname matching. The durable fix for the residual rebind gap is not to
+keep hardening the DNS check but to **cap the blast radius of any bypass** by
+splitting the control-plane API surface so a reached backend can only *query*
+`/authorize`, never self-approve via the management API — see the API-surface-split
+item under "Clear future improvements". The call runs in a worker thread
 so it never blocks mitmproxy's event loop, and the egress image gains no new
 dependency. The canonical allow policy now lives at `policies/egress-allowlist.txt`
 (the control plane seeds SQLite from it on first boot, idempotently); the proxy

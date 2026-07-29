@@ -243,14 +243,14 @@ def _post_authorize(payload: dict) -> dict:
         return json.loads(resp.read().decode())
 
 
-async def _authorize(host: str, *, stage: str, audit: bool = True,
-                     **fields) -> tuple[bool, str]:
+async def _authorize(host: str, *, stage: str, **fields) -> tuple[bool, str]:
     """Return (allowed, reason). Permanent lifeline hosts are allowed locally
     without consulting the control plane (outage resilience). Everything else
-    asks the control plane; any error there fails CLOSED (deny)."""
+    asks the control plane; any error there fails CLOSED (deny). The control
+    plane audits every decision it makes, so there is no per-call audit toggle."""
     if _is_permanent(host):
         return True, "permanent lifeline (local)"
-    payload = {"host": host, "stage": stage, "audit": audit, **fields}
+    payload = {"host": host, "stage": stage, **fields}
     try:
         resp = await asyncio.to_thread(_post_authorize, payload)
     except Exception as e:  # noqa: BLE001 — any failure must fail closed

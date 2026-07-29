@@ -65,11 +65,11 @@ MAX_PENDING_PER_CLIENT = int(os.environ.get("CONTROL_MAX_PENDING_PER_CLIENT", "4
 app = FastAPI(title="dockade control plane", version="2b")
 
 # In-memory registry of held requests, keyed by approval id. Single-process only
-# (see module docstring). The Event wakes the blocked /authorize worker; the
-# outcome carries the human's decision back to it. SQLite holds the durable state.
+# (see module docstring). The Event only WAKES the blocked /authorize worker; the
+# human's decision is read back from the durable approvals row (the single source
+# of truth), so no in-memory outcome is kept. SQLite holds the durable state.
 _LOCK = threading.Lock()
 _PENDING_EVENTS: dict[str, threading.Event] = {}
-_PENDING_OUTCOME: dict[str, str] = {}
 # approval_id -> client, so the per-client hold cap can be counted under _LOCK.
 _PENDING_CLIENT: dict[str, str | None] = {}
 
@@ -217,14 +217,13 @@ def _reserve_hold(approval_id: str, event: threading.Event,
         return None
 
 
-def _release_hold(approval_id: str) -> str | None:
-    """Symmetric to ``_reserve_hold``: drop this approval's slot and return the
-    human's outcome if one was recorded (else None). Under ``_LOCK`` so it is
-    consistent with reservation."""
+def _release_hold(approval_id: str) -> None:
+    """Symmetric to ``_reserve_hold``: drop this approval's slot. Under ``_LOCK``
+    so it is consistent with reservation. The human's decision is read from the
+    durable approvals row by the waiter, not carried back through here."""
     with _LOCK:
         _PENDING_EVENTS.pop(approval_id, None)
         _PENDING_CLIENT.pop(approval_id, None)
-        return _PENDING_OUTCOME.pop(approval_id, None)
 
 
 def _list_pending() -> list[dict]:
@@ -245,7 +244,6 @@ class AuthorizeRequest(BaseModel):
     method: str | None = None
     url: str | None = None
     stage: str | None = None
-    audit: bool = True
 
 
 class AuthorizeResponse(BaseModel):
@@ -287,10 +285,10 @@ def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
     decision, reason = _decide(req.host)
 
     if decision in ("allow", "deny"):
-        if req.audit:
-            _audit(decision, stage=req.stage, host=req.host, port=req.port,
-                   proto=req.proto, client=req.client, method=req.method,
-                   url=req.url, reason=reason)
+        # Every decision is audited — no governed path bypasses the log (CLAUDE.md).
+        _audit(decision, stage=req.stage, host=req.host, port=req.port,
+               proto=req.proto, client=req.client, method=req.method,
+               url=req.url, reason=reason)
         return AuthorizeResponse(decision=decision, reason=reason)
 
     # HOLD (bounded): reserve a hold slot atomically with the cap check, so
@@ -392,11 +390,10 @@ def resolve(approval_id: str, req: ResolveRequest) -> JSONResponse:
     # We won the conditional UPDATE above, so the durable row already carries the
     # decision the waiter will read. Wake it — but only while its slot is still
     # registered: if its hold window elapsed and it released between our UPDATE and
-    # here, skip, so we neither leak a _PENDING_OUTCOME entry nor set a dead event.
-    # A missed wake is harmless (the waiter already read, or will read, the row).
+    # here, skip, so we don't set a dead event. A missed wake is harmless (the
+    # waiter already read, or will read, the decision from the durable row).
     with _LOCK:
         if approval_id in _PENDING_EVENTS:
-            _PENDING_OUTCOME[approval_id] = outcome
             event.set()
     return JSONResponse({"ok": True, "outcome": outcome, "persisted": persist})
 

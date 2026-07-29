@@ -117,14 +117,25 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	  echo "        agent must have no route to the control plane)"
 	  exit 1
 	fi
-	# Both agent-facing nets must stay internal: sandbox-net AND control-net. A
-	# non-internal control-net would hand the control plane a route off-box.
-	n=$$(grep -c 'internal: true' docker-compose.yml)
-	if [ "$$n" -lt 2 ]; then
-	  echo "  FAIL: expected sandbox-net and control-net both 'internal: true' in"
-	  echo "        docker-compose.yml (found $$n internal nets)"; exit 1
-	fi
-	echo "  ok — launcher never attaches the sandbox to control-net; both internal nets internal"
+	# The two security-load-bearing nets MUST each be internal: sandbox-net (the
+	# agent's only net) and control-net (the shared control path). Check each BY
+	# NAME — a bare count of 'internal: true' can't tell that the RIGHT nets are the
+	# internal ones (a future edit could flip sandbox-net to non-internal while some
+	# other net gained 'internal: true', and a count would still pass). awk isolates
+	# each top-level network block (2-space key .. next 2-space key) and asserts
+	# 'internal: true' appears inside it.
+	for net in sandbox-net control-net; do
+	  if ! awk -v net="$$net" '
+	        $$0 ~ "^  " net ":" {inb=1; next}
+	        inb && /^  [A-Za-z]/ {inb=0}
+	        inb && /^[[:space:]]*internal:[[:space:]]*true[[:space:]]*$$/ {ok=1}
+	        END {exit(ok?0:1)}' docker-compose.yml; then
+	    echo "  FAIL: network '$$net' is not declared 'internal: true' in docker-compose.yml"
+	    echo "        — the agent would gain a route off its isolation net / to the control plane"
+	    exit 1
+	  fi
+	done
+	echo "  ok — launcher never attaches the sandbox to control-net; sandbox-net and control-net both internal"
 
 test: ## Run the governance unit tests (dependency-free; python -m unittest)
 	@echo "== unit tests (python -m unittest) =="

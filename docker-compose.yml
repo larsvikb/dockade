@@ -41,15 +41,16 @@ networks:
     ipam:
       config:
         - subnet: 172.31.0.0/24
-  # Host-facing UI path for the control plane ONLY. A non-internal bridge is
-  # REQUIRED here because Docker cannot publish a host port from a container that
-  # lives solely on an internal network (control-net) — the publish is silently
+  # Host-facing UI path for the control-plane-ui frontend ONLY. A non-internal
+  # bridge is REQUIRED here because Docker cannot publish a host port from a
+  # container that lives solely on an internal network — the publish is silently
   # inert. Masquerade is disabled so this bridge carries the inbound
   # loopback-published UI but is NOT an internet egress path: inbound publishing
   # is DNAT and needs no SNAT, while outbound has no SNAT here so it does not
-  # function as egress. (Plain Docker can't give one container BOTH a hard
-  # no-egress guarantee AND a published host port; a future reverse-proxy sidecar
-  # would let the control plane itself stay fully internal.) Sandbox never here.
+  # function as egress. This is the reverse-proxy-sidecar split in practice: the
+  # control-plane-ui frontend (below) carries this one non-internal surface so the
+  # control-plane BACKEND needs no published port and stays control-net-only /
+  # fully internal — zero non-internal exposure for the crown jewel. Sandbox never here.
   control-ui-net:
     name: control-ui-net
     driver: bridge

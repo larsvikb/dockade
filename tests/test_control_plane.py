@@ -97,13 +97,11 @@ class HoldCapTests(unittest.TestCase):
         self._saved = (cp.MAX_PENDING, cp.MAX_PENDING_PER_CLIENT)
         cp._PENDING_EVENTS.clear()
         cp._PENDING_CLIENT.clear()
-        cp._PENDING_OUTCOME.clear()
 
     def tearDown(self):
         cp.MAX_PENDING, cp.MAX_PENDING_PER_CLIENT = self._saved
         cp._PENDING_EVENTS.clear()
         cp._PENDING_CLIENT.clear()
-        cp._PENDING_OUTCOME.clear()
 
     def _reserve(self, approval_id, client):
         return cp._reserve_hold(approval_id, threading.Event(), client)
@@ -147,15 +145,15 @@ class HoldCapTests(unittest.TestCase):
         cp._release_hold("a")
         self.assertIsNone(self._reserve("b", "c2"))  # slot freed
 
-    def test_release_returns_recorded_outcome(self):
+    def test_release_forgets_the_slot(self):
         cp.MAX_PENDING, cp.MAX_PENDING_PER_CLIENT = 5, 0
         self._reserve("a", "c1")
-        cp._PENDING_OUTCOME["a"] = "allow"
-        self.assertEqual(cp._release_hold("a"), "allow")
-        # Released ids are fully forgotten.
+        cp._release_hold("a")
+        # Released ids are fully forgotten from both registries.
         self.assertNotIn("a", cp._PENDING_EVENTS)
         self.assertNotIn("a", cp._PENDING_CLIENT)
-        self.assertIsNone(cp._release_hold("a"))
+        # Releasing an already-released id is a harmless no-op.
+        cp._release_hold("a")
 
 
 if __name__ == "__main__":

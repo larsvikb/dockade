@@ -458,7 +458,7 @@ no separate artifact-export path is needed in v1.
   opaque `403` to the agent as any other deny) can't be asserted there.
 
   The suite was then extended to the **async decision flow** the pure-function
-  tests couldn't reach (61 tests total, still dependency-free): the proxy's
+  tests couldn't reach (65 tests total, still dependency-free): the proxy's
   `_authorize` (permanent-lifeline short-circuit with no control-plane call, and
   fail-closed on any control-plane error / non-`allow` decision — `_post_authorize`
   monkeypatched, no network) and the mitmproxy hooks via small `SimpleNamespace`

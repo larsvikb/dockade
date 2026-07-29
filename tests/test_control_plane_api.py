@@ -44,7 +44,6 @@ def _clear_all():
         conn.commit()
     cp._PENDING_EVENTS.clear()
     cp._PENDING_CLIENT.clear()
-    cp._PENDING_OUTCOME.clear()
 
 
 def _auth_req(host, **kw):

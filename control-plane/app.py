@@ -194,6 +194,39 @@ def _audit(decision: str, **fields) -> None:
           flush=True)
 
 
+def _reserve_hold(approval_id: str, event: threading.Event,
+                  client: str | None) -> str | None:
+    """Atomically check the hold caps and, if under them, reserve a slot for this
+    approval. Returns None on success (slot reserved), or a deny reason string if
+    over the global or per-client cap (the caller must then fail CLOSED).
+
+    Extracted from ``authorize`` so the cap logic is unit-testable without the
+    FastAPI handler (see DESIGN.md). The whole check+reserve runs under ``_LOCK``
+    so concurrent holds cannot race past the cap."""
+    with _LOCK:
+        over_global = len(_PENDING_EVENTS) >= MAX_PENDING
+        over_client = (
+            client is not None and MAX_PENDING_PER_CLIENT > 0
+            and sum(1 for c in _PENDING_CLIENT.values() if c == client)
+            >= MAX_PENDING_PER_CLIENT)
+        if over_global or over_client:
+            scope = "global" if over_global else f"client {client}"
+            return f"hold capacity exceeded ({scope}) — fail-closed"
+        _PENDING_EVENTS[approval_id] = event
+        _PENDING_CLIENT[approval_id] = client
+        return None
+
+
+def _release_hold(approval_id: str) -> str | None:
+    """Symmetric to ``_reserve_hold``: drop this approval's slot and return the
+    human's outcome if one was recorded (else None). Under ``_LOCK`` so it is
+    consistent with reservation."""
+    with _LOCK:
+        _PENDING_EVENTS.pop(approval_id, None)
+        _PENDING_CLIENT.pop(approval_id, None)
+        return _PENDING_OUTCOME.pop(approval_id, None)
+
+
 def _list_pending() -> list[dict]:
     with _connect() as conn:
         rows = conn.execute(
@@ -265,18 +298,8 @@ def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
     # fail CLOSED immediately rather than registering another worker-blocking hold.
     approval_id = uuid.uuid4().hex
     event = threading.Event()
-    with _LOCK:
-        over_global = len(_PENDING_EVENTS) >= MAX_PENDING
-        over_client = (
-            req.client is not None and MAX_PENDING_PER_CLIENT > 0
-            and sum(1 for c in _PENDING_CLIENT.values() if c == req.client)
-            >= MAX_PENDING_PER_CLIENT)
-        if not (over_global or over_client):
-            _PENDING_EVENTS[approval_id] = event
-            _PENDING_CLIENT[approval_id] = req.client
-    if over_global or over_client:
-        scope = "global" if over_global else f"client {req.client}"
-        why = f"hold capacity exceeded ({scope}) — fail-closed"
+    why = _reserve_hold(approval_id, event, req.client)
+    if why is not None:
         _audit("deny", stage=req.stage, host=req.host, port=req.port,
                proto=req.proto, client=req.client, method=req.method,
                url=req.url, reason=why)
@@ -295,10 +318,7 @@ def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
            reason="held for approval")
 
     resolved = event.wait(HOLD_TIMEOUT)
-    with _LOCK:
-        _PENDING_EVENTS.pop(approval_id, None)
-        _PENDING_CLIENT.pop(approval_id, None)
-        outcome = _PENDING_OUTCOME.pop(approval_id, None)
+    outcome = _release_hold(approval_id)
 
     if resolved and outcome:
         final, why = outcome, "human approval" if outcome == "allow" else "human rejection"

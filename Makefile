@@ -34,6 +34,10 @@ DOCKERFILES := claude-sandbox/Dockerfile proxies/egress/Dockerfile \
 YAMLFILES := docker-compose.yml .hadolint.yaml .yamllint
 JSONFILES := $(shell git ls-files '*.json' 2>/dev/null)
 PYFILES := proxies/egress/addon.py control-plane/app.py control-plane-ui/app.py
+# Dependency-free unit tests for the governance-critical decision logic. Kept
+# separate from PYFILES so they can be linted with the app code but discovered
+# and run on their own (python -m unittest, no pip installs — see tests/).
+TESTFILES := $(shell git ls-files 'tests/*.py' 2>/dev/null)
 
 # Files referenced by Dockerfile COPY / entrypoint — existence is asserted so a
 # rename can't silently break the build.
@@ -51,7 +55,7 @@ REFFILES := $(SCRIPTS) \
             control-plane-ui/index.html \
             policies/egress-allowlist.txt
 
-.PHONY: help check lint consistency verify-build \
+.PHONY: help check lint consistency test verify-build \
         up down destroy rebuild logs-ep logs-cp \
         sandbox boundary
 
@@ -62,7 +66,7 @@ help: ## Show this help
 
 # ── static checks ───────────────────────────────────────────────────────────
 
-check: lint consistency verify-build ## Run all static checks (linters + consistency guards + build)
+check: lint consistency test verify-build ## Run all static checks (linters + consistency guards + unit tests + build)
 	@echo "== all checks passed =="
 
 lint: ## Run linters (shellcheck, hadolint, ruff, yamllint) — skipped if not installed
@@ -74,7 +78,7 @@ lint: ## Run linters (shellcheck, hadolint, ruff, yamllint) — skipped if not i
 	  echo "== hadolint =="; hadolint $(DOCKERFILES) || fail=1
 	else echo "SKIP hadolint (not installed)"; fi
 	if command -v ruff >/dev/null 2>&1; then
-	  echo "== ruff =="; ruff check $(PYFILES) || fail=1
+	  echo "== ruff =="; ruff check $(PYFILES) $(TESTFILES) || fail=1
 	else echo "SKIP ruff (not installed)"; fi
 	if command -v yamllint >/dev/null 2>&1; then
 	  echo "== yamllint =="; yamllint $(YAMLFILES) || fail=1
@@ -85,7 +89,7 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	@echo "== bash -n (shell syntax) =="
 	for f in $(SCRIPTS); do bash -n "$$f"; echo "  ok $$f"; done
 	echo "== python compile =="
-	for f in $(PYFILES); do python3 -m py_compile "$$f" && echo "  ok $$f"; done
+	for f in $(PYFILES) $(TESTFILES); do python3 -m py_compile "$$f" && echo "  ok $$f"; done
 	echo "== json validity =="
 	for f in $(JSONFILES); do
 	  python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$$f" && echo "  ok $$f" \
@@ -121,6 +125,15 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	  echo "        docker-compose.yml (found $$n internal nets)"; exit 1
 	fi
 	echo "  ok — launcher never attaches the sandbox to control-net; both internal nets internal"
+
+test: ## Run the governance unit tests (dependency-free; python -m unittest)
+	@echo "== unit tests (python -m unittest) =="
+	# -W ignore::ResourceWarning: the app opens a short-lived sqlite connection
+	# per call (`with _connect() as conn:`) and relies on prompt finalization to
+	# close it — fine in production (ResourceWarning is ignored by default), but
+	# unittest un-ignores warnings, so the finalizer's "unclosed database" notice
+	# would spam the gate. Not a leak; filtered here, not worked around in the app.
+	python3 -W ignore::ResourceWarning -m unittest discover -s tests -t tests -v
 
 verify-build: ## Assert every image still builds (skipped if docker unavailable)
 	@if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then

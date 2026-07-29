@@ -439,20 +439,43 @@ single project directory, read-write. Because work lands on the host FS directly
 no separate artifact-export path is needed in v1.
 
 ### Clear future improvements
-- **Python unit tests for the governance-critical logic.** Today the Python
-  (`proxies/egress/addon.py`, `control-plane/app.py`, `control-plane-ui/app.py`)
-  is checked only by `ruff` + `py_compile` in `make check` and by the runtime
-  `boundary-check.sh` smoke test — there is no behavioral test suite. The
-  security-load-bearing decision functions deserve fast, deterministic,
-  server-free unit coverage: the proxy's `_forbidden` / `_match` / port-gating and
-  the control plane's `_decide` / `_match` / hold-cap reservation. These are
-  exactly the properties `boundary-check.sh` is a poor fit for — it can only
-  observe reachability from the sandbox's vantage point, so availability/
-  concurrency properties like the hold cap (which returns the same opaque `403`
-  to the agent as any other deny) can't be asserted there. A dependency-free
-  `python -m unittest` suite wired into `make check` is the smallest first step;
-  extracting the hold-cap reservation out of the `authorize` handler into a small
-  testable function is the natural seam to start from.
+- **DONE — Python unit tests for the governance-critical logic** (`tests/`, wired
+  into `make check` via the `test` target). A dependency-free `python -m unittest`
+  suite (`fastapi`/`pydantic`/`mitmproxy` stubbed in `tests/_loader.py`, SQLite on
+  a throwaway temp file — no pip installs, no running services) now covers the
+  security-load-bearing decision functions: the proxy's `_forbidden` relay guard
+  (name / literal-IP / resolves-into-control-net branches), `_match`, the
+  permanent-lifeline check, and env parsing; and the control plane's `_decide`
+  (block-wins-over-allow across distinct patterns, subdomain semantics,
+  default-hold, case-folding) and `_match`. Per the note below, the **hold-cap
+  reservation was extracted** out of the `authorize` handler into
+  `_reserve_hold` / `_release_hold` (behavior-preserving) so the cap logic is
+  testable directly — its global cap, per-client cap, per-client-disable (`0`),
+  `None`-client-bypasses-per-client-but-not-global, and slot-release behavior are
+  now asserted. These are exactly the properties `boundary-check.sh` is a poor fit
+  for — it can only observe reachability from the sandbox's vantage point, so
+  availability/concurrency properties like the hold cap (which returns the same
+  opaque `403` to the agent as any other deny) can't be asserted there.
+
+  The suite was then extended to the **async decision flow** the pure-function
+  tests couldn't reach (61 tests total, still dependency-free): the proxy's
+  `_authorize` (permanent-lifeline short-circuit with no control-plane call, and
+  fail-closed on any control-plane error / non-`allow` decision — `_post_authorize`
+  monkeypatched, no network) and the mitmproxy hooks via small `SimpleNamespace`
+  flow/context fakes — `http_connect` (forbidden-before-port-before-host ordering,
+  authority recorded only on allow), `tls_clienthello` (the SNI-vs-CONNECT-authority
+  anti-fronting guard, incl. no-recorded-authority fails closed), `request` (gates
+  **both** transport host and Host/`:authority`, so a fronted Host header is denied
+  even under an authorized CONNECT), and `client_disconnected` cleanup. On the
+  control-plane side the FastAPI stub leaves handlers callable, so the `authorize`
+  orchestration (allow/deny without holding, over-cap immediate fail-closed, hold
+  **timeout→deny** leaving the row `expired`) and the **resolve handshake** (a
+  backgrounded blocked `authorize` woken by `allow_persist` — which also writes the
+  operator rule so a re-decide skips the hold — vs `deny_once` which persists
+  nothing; plus bad-action `400` and unknown-id `409`) and `_seed_if_empty`
+  (lowercasing, comment/blank skipping, idempotency) are all covered. Remaining
+  untested surface is low-weight I/O: `_audit` sinks, `_post_authorize`/`_setup_
+  audit_file`, and the SSE `approvals_stream`.
 - Dedicated git proxy that speaks the git protocol (block force-push, restrict
   branches, per-repo policy) instead of HTTPS-through-egress.
 - Separate test/build runner containers for isolation + parallelism.

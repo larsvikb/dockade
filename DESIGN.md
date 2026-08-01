@@ -791,6 +791,24 @@ control plane") independently enforced at the one place segmentation cannot cove
 `boundary-check.sh` asserts the proxy 403s both a control-plane host and a literal
 control-net IP.
 
+The same guard also hard-blocks the **private / special-use ranges** —
+cloud-metadata / link-local (`169.254.0.0/16`), loopback (`127.0.0.0/8`), and
+RFC1918 (`10/8`, `172.16/12`, `192.168/16`), plus their IPv6 equivalents — via a
+separate `EGRESS_PRIVATE_CIDRS` set (`_forbidden`, checked before policy). The
+proxy's default route is egress-net, a masquerading bridge with a path to the
+cloud instance-metadata service (a credential-theft target), the Docker host, and
+the host's internal network; without a hard block, reaching those would rest
+solely on the default-deny allowlist, so a single mistaken rule or human approval
+could turn the proxy into an SSRF pivot. The proxy's only legitimate upstreams are
+public hosts (sibling data-plane services are reached by the agent *directly* on
+sandbox-net, never through the proxy), so blocking every private range costs
+nothing; RFC1918 `172.16/12` also transitively covers control-net and sandbox-net.
+Kept a *separate* env from `EGRESS_FORBIDDEN_CIDRS` so the control-net guard's
+fail-closed startup assertion stays specifically about control-net. Override
+`EGRESS_PRIVATE_CIDRS` (narrow, don't empty) only for a deployment that
+legitimately proxies to a private target such as an internal package mirror.
+`boundary-check.sh` asserts the proxy 403s `169.254.169.254`.
+
 *Defense-in-depth, not the sole control — and honest about the resolve branch.*
 The hostname and literal-IP checks are **deterministic** (decided from the request
 alone); the resolve branch is **best-effort** — it depends on a DNS lookup, so it

@@ -13,7 +13,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl wget ca-certificates gnupg \
     git openssh-client \
-    less procps sudo gosu unzip \
+    less procps gosu unzip \
     fzf nano vim ripgrep jq \
     iptables ipset iproute2 dnsutils aggregate \
     python3 python3-pip python3-venv pipx \

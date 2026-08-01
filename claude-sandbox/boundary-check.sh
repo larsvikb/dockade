@@ -126,6 +126,22 @@ if [ -n "${HTTPS_PROXY:-}" ]; then
     else
         bad "egress proxy did NOT 403 control-net IP 172.31.0.2 (got: ${cpip:-<none>}) — control-net relay risk"
     fi
+
+    # SSRF hardening: the proxy's default route is egress-net, which can reach the
+    # cloud instance-metadata service (169.254.169.254 -> cloud credentials) and
+    # the host's private network. Those are hard-blocked by the relay guard's
+    # private/special-use CIDRs (PRIVATE_CIDRS), BEFORE policy — so no allow rule
+    # or human approval can open them. Probe over https (a CONNECT) like the
+    # control-net IP check above, so a refused tunnel surfaces "response 403" in
+    # curl's output; the proxy 403s before dialing, so the (HTTP-only) metadata
+    # host never actually needs to answer.
+    imds="$(curl -sS -x "$HTTPS_PROXY" --connect-timeout 5 --max-time 8 \
+        -o /dev/null https://169.254.169.254/ 2>&1 || true)"
+    if printf '%s' "$imds" | grep -q '403'; then
+        ok "egress proxy refuses to relay to the metadata IP (169.254.169.254 -> 403)"
+    else
+        bad "egress proxy did NOT 403 metadata IP 169.254.169.254 (got: ${imds:-<none>}) — SSRF/metadata risk"
+    fi
 fi
 
 printf '%s== control plane ==%s\n' "$bold" "$reset"
@@ -172,8 +188,9 @@ if [ "$caps_held" -eq 1 ]; then
 else
     ok "agent holds no capabilities (Eff/Prm/Amb all zero)"
 fi
-# no-new-privileges must be in effect, so setuid binaries (sudo, etc.) can't
-# re-elevate around the missing caps.
+# no-new-privileges must be in effect, so any setuid-root binary can't
+# re-elevate around the missing caps. (The image also ships no sudo — see the
+# Dockerfile — so there is nothing whose sole purpose is escalation.)
 nnp="$(awk '/^NoNewPrivs:/ {print $2}' /proc/self/status)"
 if [ "$nnp" = "1" ]; then ok "no_new_privs set"; else bad "no_new_privs NOT set (got '${nnp:-}')"; fi
 # The Docker socket must never be present — it would be a direct path to the host

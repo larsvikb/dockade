@@ -32,6 +32,9 @@ and control-net, so it — not network segmentation — is what keeps the agent 
 the control plane. Before any policy/permanent/port check it hard-refuses any
 destination that names a control-plane host or resolves into the control-net
 subnet (``_forbidden``), a guard that no rule, approval, or port change can widen.
+The same guard hard-blocks the private / special-use ranges (cloud metadata /
+link-local, loopback, RFC1918 — see ``PRIVATE_CIDRS``), so the proxy can never be
+turned into an SSRF pivot to the instance-metadata service or the internal net.
 
 An unknown host is HELD (2b): the control plane blocks the /authorize response
 until a human approves/rejects it or its hold window elapses. To the proxy this
@@ -125,18 +128,57 @@ def _parse_cidrs(env: str, default: str) -> tuple:
 FORBIDDEN_CIDRS = _parse_cidrs("EGRESS_FORBIDDEN_CIDRS", "172.31.0.0/24")
 FORBIDDEN_HOSTS = _hosts("EGRESS_FORBIDDEN_HOSTS", "control-plane,control-plane-ui")
 
+# Special-use / private ranges that are NEVER a legitimate egress target for the
+# sandbox, hard-blocked exactly like control-net. This proxy's default route is
+# egress-net — a masquerading bridge with a path to the cloud instance-metadata
+# service (169.254.169.254 -> cloud credentials), the Docker host, and the host's
+# internal network — so without this an allowlist rule or a single human approval
+# could turn the proxy into an SSRF pivot to those. The proxy's only legitimate
+# upstreams are PUBLIC hosts (reached via egress-net); sibling data-plane services
+# on sandbox-net are reached by the agent DIRECTLY, never through this proxy, so
+# blocking every private range here breaks nothing. Kept SEPARATE from
+# EGRESS_FORBIDDEN_CIDRS so the control-net guard's fail-closed startup assertion
+# stays about control-net specifically. RFC1918 172.16.0.0/12 already covers both
+# control-net (172.31/24) and sandbox-net (172.30/24), but control-net is also
+# listed there so that guard is independently configurable. Override only for a
+# deployment that legitimately proxies to a private target (e.g. an internal
+# package mirror) — narrow it, don't blanket-empty it.
+PRIVATE_CIDRS = _parse_cidrs(
+    "EGRESS_PRIVATE_CIDRS",
+    "169.254.0.0/16,127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,"
+    "::1/128,fe80::/10,fc00::/7")
 
-def _ip_in_forbidden(ip_str: str) -> bool:
+# One list for the literal-IP and resolve checks, so both branches cover every
+# hard-blocked range (control-net + the private/special-use ranges).
+_BLOCKED_CIDRS = FORBIDDEN_CIDRS + PRIVATE_CIDRS
+
+
+def _blocked_cidr(ip_str: str):
+    """Return the first hard-blocked network this IP falls in, or None. A v4
+    address tested against a v6 network (or vice-versa) is simply not contained
+    (stdlib returns False across versions), so mixing families is safe."""
     try:
         ip = ipaddress.ip_address(ip_str)
     except ValueError:
-        return False
-    return any(ip in net for net in FORBIDDEN_CIDRS)
+        return None
+    for net in _BLOCKED_CIDRS:
+        if ip in net:
+            return net
+    return None
+
+
+def _cidr_label(net) -> str:
+    """Human label for a matched forbidden network, for the audit reason."""
+    return "control-net" if net in FORBIDDEN_CIDRS else "private/special-use"
 
 
 def _forbidden_reason(host: str) -> str | None:
-    """Return a deny reason if this destination must never be dialed (control
-    plane / control-net), else None. Does DNS, so it runs in a worker thread
+    """Return a deny reason if this destination must never be dialed, else None.
+    Covers the control plane / control-net AND the private/special-use ranges
+    (cloud metadata / link-local, loopback, RFC1918 — see ``PRIVATE_CIDRS``): a
+    forbidden target is never weighed against policy, so no rule or human approval
+    can turn the proxy into an SSRF pivot to the instance-metadata service, the
+    Docker host, or the internal network. Does DNS, so it runs in a worker thread
     (see ``_forbidden``). Three checks, cheapest first: a forbidden hostname, a
     literal forbidden IP, then a name that RESOLVES into a forbidden range.
 
@@ -155,9 +197,10 @@ def _forbidden_reason(host: str) -> str | None:
     h = (host or "").lower().rstrip(".")
     if h in FORBIDDEN_HOSTS:
         return f"forbidden destination host {host} (control plane)"
-    if _ip_in_forbidden(h):
-        return f"forbidden destination IP {host} (control-net)"
-    if not FORBIDDEN_CIDRS:
+    net = _blocked_cidr(h)
+    if net is not None:
+        return f"forbidden destination IP {host} ({_cidr_label(net)})"
+    if not _BLOCKED_CIDRS:
         return None
     try:
         infos = socket.getaddrinfo(host, None)
@@ -170,9 +213,10 @@ def _forbidden_reason(host: str) -> str | None:
         logger.warning("relay-guard resolve check skipped for %r (%s)", host, e)
         return None
     for info in infos:
-        if _ip_in_forbidden(info[4][0]):
+        net = _blocked_cidr(info[4][0])
+        if net is not None:
             return (f"destination {host} resolves to forbidden {info[4][0]} "
-                    "(control-net)")
+                    f"({_cidr_label(net)})")
     return None
 
 
@@ -274,7 +318,8 @@ def load(loader) -> None:  # mitmproxy lifecycle hook
     _audit("startup", control_plane=AUTHORIZE_URL, audit=AUDIT_PATH,
            permanent=list(PERMANENT_HOSTS),
            forbidden_hosts=list(FORBIDDEN_HOSTS),
-           forbidden_cidrs=[str(n) for n in FORBIDDEN_CIDRS])
+           forbidden_cidrs=[str(n) for n in FORBIDDEN_CIDRS],
+           private_cidrs=[str(n) for n in PRIVATE_CIDRS])
 
 
 async def http_connect(flow: http.HTTPFlow) -> None:

@@ -75,7 +75,9 @@ class EnvParsingTests(unittest.TestCase):
 class ForbiddenGuardTests(unittest.TestCase):
     """The relay guard — the one place segmentation can't cover, so it must be
     airtight. Defaults: FORBIDDEN_HOSTS = control-plane/-ui, FORBIDDEN_CIDRS =
-    172.31.0.0/24."""
+    172.31.0.0/24, plus PRIVATE_CIDRS (cloud metadata / link-local, loopback,
+    RFC1918) which are hard-blocked exactly like control-net so the proxy can
+    never be an SSRF pivot to the instance-metadata service or the internal net."""
 
     def test_forbidden_hostname(self):
         self.assertIsNotNone(addon._forbidden_reason("control-plane"))
@@ -86,12 +88,26 @@ class ForbiddenGuardTests(unittest.TestCase):
         self.assertIsNotNone(addon._forbidden_reason("CONTROL-PLANE."))
 
     def test_literal_ip_in_control_net_is_forbidden(self):
-        self.assertIsNotNone(addon._forbidden_reason("172.31.0.9"))
+        reason = addon._forbidden_reason("172.31.0.9")
+        self.assertIsNotNone(reason)
+        self.assertIn("control-net", reason)
 
-    def test_literal_ip_outside_control_net_needs_no_dns(self):
-        # A numeric address outside the range resolves to itself (no network),
-        # so it is allowed through the guard.
-        self.assertIsNone(addon._forbidden_reason("10.0.0.1"))
+    def test_cloud_metadata_ip_is_forbidden(self):
+        # 169.254.169.254 (the instance-metadata service) is the highest-impact
+        # SSRF target reachable via egress-net — it must be hard-blocked, not left
+        # to the default-deny policy where one human approval could open it.
+        reason = addon._forbidden_reason("169.254.169.254")
+        self.assertIsNotNone(reason)
+        self.assertIn("private/special-use", reason)
+
+    def test_rfc1918_and_loopback_ips_are_forbidden(self):
+        for ip in ("10.0.0.1", "192.168.1.1", "172.16.5.5", "127.0.0.1"):
+            self.assertIsNotNone(addon._forbidden_reason(ip), ip)
+
+    def test_public_literal_ip_is_allowed(self):
+        # A genuinely public numeric address resolves to itself (no network),
+        # so it passes the guard (policy still decides allow/hold/deny).
+        self.assertIsNone(addon._forbidden_reason("8.8.8.8"))
 
     def test_name_resolving_into_control_net_is_forbidden(self):
         # A public name whose DNS is pointed at control-net must be caught by the
@@ -101,6 +117,15 @@ class ForbiddenGuardTests(unittest.TestCase):
             reason = addon._forbidden_reason("sneaky.example.com")
         self.assertIsNotNone(reason)
         self.assertIn("172.31.0.5", reason)
+
+    def test_name_resolving_into_metadata_ip_is_forbidden(self):
+        # DNS-rebinding a name onto the metadata service must be caught by the
+        # resolve step too (best-effort, but it covers the private ranges).
+        fake = [(2, 1, 6, "", ("169.254.169.254", 0))]
+        with mock.patch.object(addon.socket, "getaddrinfo", return_value=fake):
+            reason = addon._forbidden_reason("rebind.example.com")
+        self.assertIsNotNone(reason)
+        self.assertIn("169.254.169.254", reason)
 
     def test_name_resolving_outside_control_net_is_allowed(self):
         fake = [(2, 1, 6, "", ("93.184.216.34", 0))]
@@ -114,10 +139,14 @@ class ForbiddenGuardTests(unittest.TestCase):
                                side_effect=OSError("no such host")):
             self.assertIsNone(addon._forbidden_reason("nonexistent.invalid"))
 
-    def test_ip_in_forbidden_rejects_garbage(self):
-        self.assertFalse(addon._ip_in_forbidden("not-an-ip"))
-        self.assertTrue(addon._ip_in_forbidden("172.31.0.1"))
-        self.assertFalse(addon._ip_in_forbidden("8.8.8.8"))
+    def test_blocked_cidr_classifies_ips(self):
+        self.assertIsNone(addon._blocked_cidr("not-an-ip"))
+        self.assertIsNone(addon._blocked_cidr("8.8.8.8"))
+        # control-net vs private/special-use are labelled distinctly.
+        self.assertEqual(addon._cidr_label(addon._blocked_cidr("172.31.0.1")),
+                         "control-net")
+        self.assertEqual(addon._cidr_label(addon._blocked_cidr("169.254.169.254")),
+                         "private/special-use")
 
 
 class GuardConfigTests(unittest.TestCase):

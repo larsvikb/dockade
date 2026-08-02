@@ -206,7 +206,12 @@ verify-build: ## Assert every image still builds (skipped if docker unavailable)
 # ── shared infrastructure (docker-compose.yml) ──────────────────────────────
 
 up: ## Bring up the shared infra (egress proxy + control plane + UI), building if needed
-	$(COMPOSE) up -d --build
+	# --wait: return when the services are HEALTHY, not merely created, so this
+	# target's success means the infra can actually serve. Only the three infra
+	# services are involved — the LLM is profile-gated and is started by its own
+	# `docker compose --profile ... up`, so its multi-minute model load never
+	# counts against the timeout here. A timeout is therefore a real failure.
+	$(COMPOSE) up -d --build --wait --wait-timeout 120
 
 down: ## Stop the shared infra (keeps the named volumes)
 	$(COMPOSE) down
@@ -229,7 +234,7 @@ rebuild: ## Rebuild every image from scratch — proxy + control plane + UI + bo
 	# one. Nothing to recreate.
 	$(COMPOSE) build --no-cache
 	for launcher in $(LAUNCHERS); do "./$$launcher" --build-only --no-cache; done
-	$(COMPOSE) up -d
+	$(COMPOSE) up -d --wait --wait-timeout 120
 
 logs-ep: ## Follow the egress-proxy log — the live per-connection audit stream
 	$(COMPOSE) logs -f egress-proxy

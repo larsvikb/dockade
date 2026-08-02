@@ -143,6 +143,75 @@ sc_service_ip() {
 }
 
 # ---------------------------------------------------------------------------
+# Service readiness
+# ---------------------------------------------------------------------------
+# Discovering a service's IP proves a container EXISTS, not that it can serve.
+# The gap is not cosmetic for either tier:
+#   - tier 1: the egress proxy fails CLOSED while the control plane is not yet
+#     answering /authorize, so a sandbox launched into the boot window gets real
+#     denials written to the audit log — noise that reads exactly like policy.
+#   - tier 2: llama-server binds its port immediately but returns 503 until the
+#     GGUF is loaded and offloaded, which takes minutes; opencode's first turn
+#     would simply fail.
+# Both are the same bug — acting on "container up" when we mean "service ready" —
+# so both tiers gate through the one helper below.
+
+# sc_health_status <container> — echoes healthy|unhealthy|starting, or NOTHING
+# when the container declares no healthcheck (or does not exist).
+sc_health_status() {
+    docker inspect -f \
+        '{{if .State.Health}}{{.State.Health.Status}}{{end}}' \
+        "$1" 2>/dev/null || true
+}
+
+# sc_wait_healthy <container> <why_it_matters> [timeout_seconds]
+#
+# Block until <container> reports healthy, then return. Fatal on timeout.
+#
+# An empty health status means the compose entry declares no healthcheck, or the
+# service was started by hand — proceed rather than block, because the absence of
+# a probe is not evidence of a problem (and gating on a probe that does not exist
+# would break every hand-rolled setup).
+#
+# 'unhealthy' is treated as RETRYABLE, not terminal: Docker flips a container back
+# to healthy the moment a probe succeeds, and a model whose load outruns its
+# start_period passes through unhealthy on the way up. Only the timeout is fatal.
+sc_wait_healthy() {
+    local name="$1" why="$2" timeout="${3:-180}"
+    local status waited=0 announced=false
+
+    status="$(sc_health_status "$name")"
+    if [[ -z "$status" ]]; then
+        return 0
+    fi
+
+    while [[ "$status" != "healthy" ]]; do
+        if (( waited >= timeout )); then
+            echo "ERROR: '$name' is still '$status' after ${timeout}s — not launching." >&2
+            echo "       $why" >&2
+            echo "       Check it with:  docker logs $name" >&2
+            exit 1
+        fi
+        if [[ "$announced" == "false" ]]; then
+            echo "Waiting for '$name' to become healthy (currently '$status')..." >&2
+            announced=true
+        fi
+        sleep 2
+        waited=$((waited + 2))
+        status="$(sc_health_status "$name")"
+        # It can vanish mid-wait (crash, or a `compose down` in another terminal).
+        if [[ -z "$status" ]]; then
+            echo "ERROR: '$name' disappeared while waiting for it to become healthy." >&2
+            exit 1
+        fi
+    done
+
+    if [[ "$announced" == "true" ]]; then
+        echo "  '$name' is healthy." >&2
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Container naming  ->  sets SC_CONTAINER_NAME
 # ---------------------------------------------------------------------------
 # One or many sandboxes share the infra, so names must not collide. Take the

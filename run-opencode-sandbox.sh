@@ -89,6 +89,15 @@ if [[ ! "$LLM_IP" =~ ^[0-9.]+$ ]]; then
     exit 1
 fi
 
+# Found it — but llama-server binds its port long before it can serve, returning
+# 503 while the GGUF loads and offloads to the GPU (minutes, not seconds). Since
+# inference is this tier's ONLY capability, starting opencode against a
+# still-loading server means its very first turn fails. Wait it out instead. The
+# timeout is generous for the same reason the healthcheck's start_period is.
+sc_wait_healthy "$LLM_NAME" \
+    "Inference is this tier's only capability — opencode cannot do anything without it." \
+    600
+
 sc_alloc_container_name "${SANDBOX_NAME:-opencode-sandbox}"
 sc_git_identity
 

@@ -87,6 +87,14 @@ EGRESS_PROXY_IP="$(sc_service_ip "$EGRESS_PROXY_NAME" "$SANDBOX_NET")"
 
 PROXY_ENV_ARGS=()
 if [[ "$EGRESS_PROXY_IP" =~ ^[0-9.]+$ ]]; then
+    # The proxy exists, but until the control plane answers /authorize the addon
+    # fails CLOSED — so launching now would not stall the agent's first requests,
+    # it would DENY them and write those denials to the audit log as if they were
+    # policy. Wait for the proxy's healthcheck (which compose in turn gates on the
+    # control plane being healthy) so the log stays a record of decisions.
+    sc_wait_healthy "$EGRESS_PROXY_NAME" \
+        "Governed egress is unavailable, and this tier's traffic all flows through it."
+
     PROXY_URL="http://${EGRESS_PROXY_NAME}:${EGRESS_PROXY_PORT}"
     PROXY_ENV_ARGS=(
         -e "HTTPS_PROXY=$PROXY_URL"

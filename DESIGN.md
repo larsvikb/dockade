@@ -615,6 +615,38 @@ upstream, DNS is still pinned to *named* resolvers (no "any nameserver" hole), a
 egress remains filter-table default-deny plus the mode's allowlist (ipset in
 standalone; proxy-only in governed).
 
+## Startup ordering — "running" is not "ready"
+
+Every compose service declares a `healthcheck`, and both launchers gate on it via
+`sc_wait_healthy` in `sandbox-lib.sh`. This is an **audit-integrity** measure
+before it is an ergonomic one.
+
+The egress proxy fails closed when the control plane is unreachable (`addon.py`
+`_authorize`). That is the right behaviour, but it means a proxy that accepts
+traffic *before* the backend serves `/authorize` does not stall the agent's first
+requests — it **denies them and writes those denials to the audit log**, where
+they are indistinguishable from policy decisions. The audit log is the artifact
+this whole design exists to keep trustworthy, so boot ordering must not be able to
+forge entries in it. Two gates close the window: `depends_on: condition:
+service_healthy` (proxy and UI both wait for the backend), and the tier-1 launcher
+waiting on the proxy's own health before starting a sandbox.
+
+The probes are deliberately shallow — a TCP connect for the proxy, a static
+`/healthz` for the two Python services. In particular the proxy is **not** probed
+by making a real CONNECT through itself: that would exercise the policy path end
+to end, but it would also write an audit record every interval, and a periodic
+synthetic `deny` is exactly the signal a human reviewing the log is watching for.
+A probe must not pollute the evidence it is protecting.
+
+Tier 2's gate is about capability rather than audit: `llama-server` binds its port
+immediately but returns 503 until the model is loaded and offloaded (minutes for a
+large GGUF — see "Operational constraints"), and inference is that tier's only
+capability, so `run-opencode-sandbox.sh` waits rather than letting opencode's first
+turn fail. `sc_wait_healthy` treats `unhealthy` as retryable, since a load that
+outruns its `start_period` passes through that state on the way up; only the
+timeout is fatal. A container that declares no healthcheck is not gated at all —
+absence of a probe is not evidence of a problem.
+
 ## Local inference — an ungoverned LLM tool
 
 **Status: built and verified; not reachable by tier 1 — it is tier 2's sole

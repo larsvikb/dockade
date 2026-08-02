@@ -97,7 +97,15 @@ services:
       # name via Docker's embedded DNS (127.0.0.11) on control-net.
       EGRESS_CONTROL_PLANE_URL: http://control-plane:8090
     depends_on:
-      - control-plane
+      # service_healthy, not the bare "started" form. The addon fails CLOSED when
+      # the control plane is unreachable (addon.py `_authorize`), so a proxy that
+      # accepts traffic before the backend serves /authorize does not merely stall
+      # — it DENIES real agent requests and audits them. In the log those
+      # startup-race denials are indistinguishable from policy decisions, which
+      # dilutes the record this whole design exists to keep trustworthy. Gating on
+      # health makes the audit log a record of decisions, not of boot ordering.
+      control-plane:
+        condition: service_healthy
     # The proxy resolves the (public) allowlisted targets itself, via egress-net.
     # Default to public resolvers; override in a .env (EGRESS_DNS_PRIMARY/
     # SECONDARY) for locked-down / corporate networks where those are blocked.
@@ -106,6 +114,31 @@ services:
       - ${EGRESS_DNS_SECONDARY:-8.8.4.4}
     volumes:
       - egress-audit:/var/log/egress
+    # mitmdump is a forward proxy, so there is no HTTP health endpoint to hit —
+    # the probe is a plain TCP connect to the listener, which catches the one
+    # failure the container's own exit does not: process alive, listener wedged.
+    # (Misconfiguration is already covered — the addon's _assert_guard_configured()
+    # refuses to start, so the container dies visibly.)
+    #
+    # Deliberately NOT a real CONNECT through the proxy. That would prove the whole
+    # policy path end to end, but it would also write an audit record every
+    # interval, and a periodic synthetic `deny` is exactly the signal a human
+    # reviewing the log is watching for (while a probe against an ALLOWED host
+    # would open a genuine outbound connection on a timer). A silent probe keeps
+    # the audit log a record of the agent's traffic and nothing else.
+    #
+    # python3 is the interpreter mitmproxy itself runs on, so this adds no tooling
+    # to the choke-point image.
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import socket; socket.create_connection(('127.0.0.1', 8080), 3).close()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     # A plain forward proxy needs no elevated privileges.
     cap_drop:
       - ALL
@@ -131,6 +164,31 @@ services:
         ipv4_address: 172.31.0.2
     volumes:
       - control-state:/var/lib/control-plane
+    # /healthz (control-plane/app.py). Uvicorn binds the socket before its startup
+    # handler runs, and that handler seeds the policy rules and expires stale
+    # approvals — so "answers /healthz" is strictly later, and more meaningful,
+    # than "container started". This is the health gate the other two services
+    # wait on.
+    #
+    # Deliberately SHALLOW: it returns a static 200 without touching SQLite, so
+    # healthy here means "serving", not "store verified". Deepening it to a
+    # `SELECT 1` is defensible (a healthcheck failure only marks the container
+    # unhealthy — compose does not restart on it), but it would also make the
+    # proxy's service_healthy gate depend on disk state, so it is left as an
+    # explicit choice rather than a default.
+    #
+    # urlopen raises on any non-2xx, so a bad status is a non-zero exit. python3
+    # is the runtime itself — no curl/wget assumption about the slim base.
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/healthz', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     cap_drop:
       - ALL
     security_opt:
@@ -161,7 +219,27 @@ services:
     ports:
       - "127.0.0.1:8081:8090"
     depends_on:
-      - control-plane
+      # Nothing fails closed here (the frontend is stateless and no governance
+      # decision depends on it), so this gate is purely so the first page load
+      # after `up` reaches a backend that can answer rather than a 502.
+      control-plane:
+        condition: service_healthy
+    # Same shallow probe as the backend, and shallow ON PURPOSE: it checks only
+    # that the frontend serves, NOT that the backend is reachable. Relaying that
+    # upstream state would couple two services this design keeps separate — the
+    # frontend holds no state, so a red here should mean "the UI is down", not
+    # "something behind the UI is down". This is the only host-published surface,
+    # so it is also the health a human actually reads off `docker compose ps`.
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/healthz', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     cap_drop:
       - ALL
     security_opt:
@@ -265,6 +343,31 @@ services:
         -ngl ${DOCKADE_LLM_NGL:-99} -c ${DOCKADE_LLM_CTX:-32768} --jinja --no-context-shift
         --parallel ${DOCKADE_LLM_SLOTS:-1}
         --reasoning ${DOCKADE_LLM_REASONING:-off}
+    # llama-server's own /health separates the two states that actually matter
+    # here: 503 while the GGUF is loading and offloading to the GPU, 200 once the
+    # model is resident. That load is tens of seconds to minutes, so for THIS
+    # service "container running" is badly misleading — hence the long
+    # start_period, during which a failing probe does not count toward retries.
+    # run-opencode-sandbox.sh gates on this before launching a tier-2 sandbox.
+    #
+    # Written against bash's /dev/tcp rather than curl because bash is the one
+    # tool this image is PROVEN to have (the entrypoint above invokes it), while
+    # curl's presence in the upstream llama.cpp image is not guaranteed. Note CMD
+    # rather than CMD-SHELL: /dev/tcp is a bash builtin and the default shell is
+    # not bash. HTTP/1.0 so the server closes the connection itself.
+    healthcheck:
+      test:
+        - CMD
+        - bash
+        - -c
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/8080 &&
+          printf 'GET /health HTTP/1.0\r\n\r\n' >&3 &&
+          head -n1 <&3 | grep -q '^HTTP/[0-9.]* 200'
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 300s
     cap_drop:
       - ALL
     security_opt:
@@ -300,6 +403,20 @@ services:
         -ngl ${DOCKADE_LLM_NGL:-99} -c ${DOCKADE_LLM_CTX:-32768} --jinja --no-context-shift
         --parallel ${DOCKADE_LLM_SLOTS:-1}
         --reasoning ${DOCKADE_LLM_REASONING:-off}
+    # Same probe and same rationale as the Intel variant — see there.
+    healthcheck:
+      test:
+        - CMD
+        - bash
+        - -c
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/8080 &&
+          printf 'GET /health HTTP/1.0\r\n\r\n' >&3 &&
+          head -n1 <&3 | grep -q '^HTTP/[0-9.]* 200'
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 300s
     cap_drop:
       - ALL
     security_opt:

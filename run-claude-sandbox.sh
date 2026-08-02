@@ -34,6 +34,19 @@ IMAGE_DIR="claude-sandbox"
 CONFIG_VOLUME="claude-sandbox-config"
 SANDBOX_NET="sandbox-net"
 
+# Resource ceilings, overridable per launch:
+#     SANDBOX_MEMORY=16g ./run-claude-sandbox.sh
+#
+# 4g is sized for the WORKLOAD, not the agent — a measured session (linters, a
+# 68-test suite, ~25 compiles) peaked at 353 MB, so the agent process itself is
+# not what this bounds. What can need the headroom is what the agent RUNS: tsc,
+# jest, cargo, a language server on a large tree. Raise it per-workspace when a
+# build needs it rather than carrying the worst case as the default; the failure
+# mode when it is too low is an OOM-kill of the container, which takes the whole
+# interactive session and its context with it.
+SANDBOX_MEMORY="${SANDBOX_MEMORY:-4g}"
+SANDBOX_CPUS="${SANDBOX_CPUS:-4}"
+
 REBUILD=false
 BUILD_ONLY=false
 NO_CACHE=false
@@ -134,6 +147,14 @@ echo ""
 # non-root agent (the entrypoint asserts the agent ends up with none). NET_RAW is
 # deliberately NOT granted: the firewall needs NET_ADMIN, not raw sockets, so
 # raw-socket / packet-spoofing capability never exists in the container at all.
+#
+# Resources: --memory-swap is set EQUAL to --memory, which disables swap and makes
+# the cap hard. Docker otherwise defaults swap to 2x memory, so a bare --memory=4g
+# would really mean 4g RAM + 4g swap — on a 15 GiB host that is a ceiling above
+# what exists, which is no ceiling at all. Both flags read the same variable, so
+# they cannot drift apart. (Note --cpus is a CFS quota, not a cpuset: `nproc` still
+# reports every host CPU, so build tools that size their worker pool from it will
+# oversubscribe and get throttled.)
 docker run -it --rm \
     --name "$SC_CONTAINER_NAME" \
     --hostname sandbox \
@@ -150,8 +171,9 @@ docker run -it --rm \
     --cap-add=SETUID \
     --security-opt no-new-privileges \
     \
-    --memory=8g \
-    --cpus=4 \
+    --memory="$SANDBOX_MEMORY" \
+    --memory-swap="$SANDBOX_MEMORY" \
+    --cpus="$SANDBOX_CPUS" \
     --pids-limit=512 \
     \
     -v "$WORKSPACE":/workspace \

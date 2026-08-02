@@ -139,6 +139,27 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+    # Blast-radius limits, NOT a boundary. Nothing here fails open under memory
+    # pressure — kill the proxy and sandbox-net (internal) leaves the agent with no
+    # egress at all. The point is narrower: the host OOM killer scores by footprint
+    # and kills across the whole host, so an unbounded proxy under a connection
+    # flood could get the CONTROL PLANE killed instead of itself. Capping each
+    # container turns "the kernel picks a victim" into "the container that
+    # misbehaved is the one contained". The agent cannot exhaust host RAM directly
+    # (its launcher caps it at 8g), but it CAN drive proxy memory through
+    # connection volume, which is the residual path this closes.
+    #
+    # Sized generously on purpose: these must never fire in normal operation. An
+    # OOM-killed control plane makes the addon fail closed and write denials to the
+    # audit log — the same pollution the health gating above exists to prevent.
+    # This is the one infra service with a real growth path (per-connection
+    # buffers), hence the larger share.
+    #
+    # memswap_limit == mem_limit disables swap for the container so the cap is
+    # hard; WSL2 enables swap by default, and without this the limit leaks into it.
+    mem_limit: 1g
+    memswap_limit: 1g
+    pids_limit: 256
     # A plain forward proxy needs no elevated privileges.
     cap_drop:
       - ALL
@@ -189,6 +210,13 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+    # See egress-proxy for the rationale. uvicorn + SQLite is a small, flat
+    # footprint (well under 100 MB in practice) — this is headroom, not a target.
+    # Of the three it is the one that most needs to stay clear of its cap: this is
+    # the governance authority, and an OOM here denies real agent traffic.
+    mem_limit: 512m
+    memswap_limit: 512m
+    pids_limit: 128
     cap_drop:
       - ALL
     security_opt:
@@ -240,6 +268,12 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+    # See egress-proxy for the rationale. A stateless relay — the smallest
+    # footprint of the three, and the only one whose loss costs nothing but the
+    # human's view (no governance decision depends on it).
+    mem_limit: 256m
+    memswap_limit: 256m
+    pids_limit: 128
     cap_drop:
       - ALL
     security_opt:
@@ -368,6 +402,20 @@ services:
       timeout: 5s
       retries: 3
       start_period: 300s
+    # DELIBERATELY no mem_limit, unlike the three infra services above. Two ways a
+    # naive cap misfires here:
+    #   - llama.cpp mmaps the GGUF, so the weights are reclaimable page cache
+    #     charged to this cgroup. A tight limit produces disk thrashing on every
+    #     access rather than a clean OOM — a slow, hard-to-diagnose failure instead
+    #     of a loud one.
+    #   - on the Intel iGPU, "VRAM" is host RAM allocated through /dev/dxg by the
+    #     driver, and whether those allocations are charged to this cgroup is not
+    #     something to assume. Guessing wrong means an OOM-kill mid-load and, with
+    #     restart: unless-stopped, a crash loop.
+    # What actually bounds this service is -c and -ngl against the ~16.9 GB shared
+    # pool (see DESIGN.md "Operational constraints"), which is a real budget rather
+    # than a kill threshold. If you do add a cap, derive it from `docker stats`
+    # during AND after a model load — not from arithmetic.
     cap_drop:
       - ALL
     security_opt:
@@ -417,6 +465,10 @@ services:
       timeout: 5s
       retries: 3
       start_period: 300s
+    # Also deliberately uncapped — see the Intel variant. The mmap argument applies
+    # identically; the shared-memory one does not, because on a discrete GPU the
+    # weights live in real VRAM, which a cgroup memory limit does not govern at all.
+    # A cap here would bound only the host-side buffers, which are not the pressure.
     cap_drop:
       - ALL
     security_opt:

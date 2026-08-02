@@ -647,6 +647,50 @@ outruns its `start_period` passes through that state on the way up; only the
 timeout is fatal. A container that declares no healthcheck is not gated at all —
 absence of a probe is not evidence of a problem.
 
+## Resource limits — blast radius, not boundary
+
+Both sandbox tiers are capped by their launcher — tier 1 at 4g, tier 2 at 2g, both
+`--cpus=4 --pids-limit=512` and both overridable per launch via `SANDBOX_MEMORY` /
+`SANDBOX_CPUS`. The three infra services are capped in `docker-compose.yml`
+(1g/512m/256m). Everywhere, swap is disabled by setting the swap ceiling equal to
+the memory ceiling (`--memory-swap` / `memswap_limit`): Docker otherwise defaults
+swap to 2x memory, so a bare 4g cap really means 4g RAM + 4g swap — on a 15 GiB
+host, a ceiling above what exists is no ceiling at all. These are **not** a
+containment boundary and nothing about the threat model rests on them — the
+boundary is capability (network segmentation, dropped caps, non-root, no
+control-plane route).
+
+The sandbox numbers are sized for the **workload, not the agent**: a measured
+tier-1 session (linters, a 68-test suite, ~25 compiles) peaked at 353 MB, so the
+agent process is never what needs the headroom — `tsc`, `jest`, `cargo` or a
+language server on a large tree is. Hence a modest default plus a per-workspace
+override, rather than carrying the worst case for every launch. Tier 2 is lower
+still on the merits: opencode is a thin client (inference lives in the `llm`
+service) and the tier has no egress, so `npm install` / `pip install` cannot fetch
+— its workload cannot grow the way tier 1's can.
+
+What they buy is blast radius. The host OOM killer scores by footprint and kills
+across the whole host, so an unbounded egress proxy under a connection flood could
+get the **control plane** killed instead of itself. Per-container caps turn "the
+kernel picks a victim" into "the container that misbehaved is the one contained."
+The agent cannot exhaust host RAM directly, but it can drive proxy memory through
+connection volume, and that is the residual path.
+
+Every direction of failure here is fail-safe: lose the control plane and the addon
+denies; lose the proxy and `sandbox-net` (internal) leaves no egress at all. The
+caps are therefore sized to *never fire* in normal operation, because an OOM-killed
+control plane writes denials to the audit log — the same pollution the readiness
+gating exists to prevent.
+
+**The LLM services are deliberately uncapped.** `llama.cpp` mmaps the GGUF, so the
+weights are reclaimable page cache charged to the cgroup: a tight limit thrashes
+the disk instead of OOM-ing, which is a slow failure rather than a loud one. And on
+the Intel iGPU "VRAM" is host RAM allocated through `/dev/dxg` by the driver, so
+whether it is charged to the container cgroup is not safe to assume — guessing
+wrong means an OOM-kill mid-load plus a `restart: unless-stopped` crash loop. What
+bounds that service is `-c`/`-ngl` against the ~16.9 GB shared pool, which is a
+budget rather than a kill threshold.
+
 ## Local inference — an ungoverned LLM tool
 
 **Status: built and verified; not reachable by tier 1 — it is tier 2's sole

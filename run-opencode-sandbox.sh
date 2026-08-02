@@ -29,6 +29,18 @@ IMAGE_DIR="opencode-sandbox"
 CONFIG_VOLUME="opencode-sandbox-config"
 SANDBOX_NET="sandbox-net"
 
+# Resource ceilings, overridable per launch:
+#     SANDBOX_MEMORY=8g ./run-opencode-sandbox.sh
+#
+# Deliberately HALF of tier 1's default, for two tier-specific reasons rather than
+# thrift. opencode is a thin client here — inference runs in the `llm` service, so
+# the model's memory is that container's problem, not this one's. And this tier has
+# no egress, so `npm install` / `pip install` cannot fetch: its workload physically
+# cannot grow the way tier 1's can, because it can only ever run what is already in
+# the image or the workspace.
+SANDBOX_MEMORY="${SANDBOX_MEMORY:-2g}"
+SANDBOX_CPUS="${SANDBOX_CPUS:-4}"
+
 REBUILD=false
 BUILD_ONLY=false
 NO_CACHE=false
@@ -118,6 +130,9 @@ echo ""
 # and any --dns flags. This tier resolves only sibling names, which Docker's
 # embedded resolver answers locally with no upstream forward — so there is no
 # upstream to pin and no DNS-exfiltration channel to narrow.
+#
+# Resources: --memory-swap equals --memory so the cap is hard rather than silently
+# doubled into swap (same reasoning as tier 1).
 docker run -it --rm \
     --name "$SC_CONTAINER_NAME" \
     --hostname sandbox \
@@ -133,8 +148,9 @@ docker run -it --rm \
     --cap-add=SETUID \
     --security-opt no-new-privileges \
     \
-    --memory=8g \
-    --cpus=4 \
+    --memory="$SANDBOX_MEMORY" \
+    --memory-swap="$SANDBOX_MEMORY" \
+    --cpus="$SANDBOX_CPUS" \
     --pids-limit=512 \
     \
     -v "$WORKSPACE":/workspace \

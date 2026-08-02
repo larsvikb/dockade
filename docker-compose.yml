@@ -166,3 +166,141 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+
+  # ── Local LLM inference (UNGOVERNED data-plane tool) ────────────────────────
+  # An ungoverned tool in DESIGN.md's taxonomy: exposed fully to the agent, no
+  # policy, no approval — and therefore it MUST have no independent egress. That
+  # holds by construction here: sandbox-net only (internal: true), never
+  # egress-net, and models are pre-fetched on the host into a read-only bind
+  # mount, so the service never makes an outbound request at all. Nothing to
+  # govern because nothing leaves.
+  #
+  # The GPU device is granted to THIS container, never to the sandbox. The agent
+  # reaches inference the same way it reaches every other capability: as a
+  # service on the internal network. The sandbox keeps zero direct device access,
+  # so the "never give the sandbox a direct path to anything" invariant holds.
+  #
+  # Accelerator-specific, so both variants are behind compose PROFILES and
+  # neither starts with a plain `docker compose up -d`:
+  #     docker compose --profile llm-intel  up -d    # Intel Arc / Xe (WSL2)
+  #     docker compose --profile llm-nvidia up -d    # NVIDIA (CUDA)
+  # They are MUTUALLY EXCLUSIVE: both bind the same sandbox-net address and the
+  # same `llm` alias on purpose, so the agent's endpoint (http://llm:8080) and the
+  # firewall's /32 allow are identical whichever accelerator the host has. Enabling
+  # both profiles at once is an address conflict, and is meant to be.
+  #
+  # NOT REACHABLE BY THE AGENT YET. Sibling containers on sandbox-net hit the
+  # sandbox firewall's default REJECT (see the multi-container NOTE in
+  # sandbox-common/init-firewall.sh). Wiring that up needs an explicit per-service
+  # /32 allow in the firewall plus launcher discovery, mirroring EGRESS_PROXY_IP.
+  llm-intel:
+    profiles:
+      - llm-intel
+    image: ghcr.io/ggml-org/llama.cpp:server-intel
+    container_name: llm-intel
+    hostname: llm-intel
+    restart: unless-stopped
+    networks:
+      sandbox-net:
+        # Stable address so the sandbox firewall can allow a literal /32 rather
+        # than the whole subnet (per-service /32s are tighter — see the firewall
+        # NOTE). Keep in-subnet with sandbox-net's 172.30.0.0/24.
+        ipv4_address: 172.30.0.20
+        # Accelerator-independent name for the agent: always http://llm:8080.
+        aliases:
+          - llm
+    # Intel GPU under WSL2 goes through the paravirtual D3D12 device — there is no
+    # /dev/dri render node to pass. The in-image Intel NEO/Level Zero runtime
+    # dlopen()s libdxcore.so from the host's WSL driver mount, hence both lines.
+    devices:
+      - /dev/dxg
+    volumes:
+      - /usr/lib/wsl:/usr/lib/wsl:ro
+      # Pre-fetch GGUFs here on the host. Read-only: inference never writes.
+      - ${DOCKADE_MODELS_DIR:-./models}:/models:ro
+    environment:
+      # Without this the Level Zero driver cannot query free memory and reports
+      # total instead — which matters on an iGPU, where "VRAM" is shared with the
+      # host and the honest free figure is the one that prevents over-allocation.
+      ZES_ENABLE_SYSMAN: "1"
+    # Prepend the WSL driver dir to the image's OWN LD_LIBRARY_PATH (which points
+    # at its oneAPI libs) — replacing it instead of prepending breaks the runtime
+    # the image ships. `-l` gives a login shell, whose PATH omits /app, so the
+    # binary is called by absolute path.
+    #
+    # --jinja is REQUIRED for tool calling (the template emits the tool-call
+    # format). --reasoning defaults to `off` here because llama-server's own
+    # default is `auto`, which on Qwen3.5 means thinking-on: a trivial prompt
+    # produced 6,099 reasoning tokens over 7.4 minutes. Clients that can send
+    # `chat_template_kwargs` per request can opt back in; opencode cannot, so the
+    # server default is the only place to fix it. Set DOCKADE_LLM_REASONING=on to
+    # restore thinking, and bound it with --reasoning-budget N (a hard token cap)
+    # rather than leaving it unrestricted. See DESIGN.md "Local inference".
+    #
+    # -c 32768 is sized for AGENT harnesses: opencode's base prompt (system + tool
+    # schemas) alone exceeds 8k, so a smaller window fails before the first user
+    # turn. 32k costs ~4.6 GB of KV on top of ~5.5 GB of weights — fits the ~16.9 GB
+    # shared pool with headroom; 64k does not. Do NOT use -c 0 (load from model):
+    # this model's native window would try to allocate far past the pool.
+    # --no-context-shift makes overflow a visible error instead of silently
+    # discarding the oldest tokens — for an agent that means a failed request
+    # rather than a corrupted conversation with its system prompt evicted.
+    # The client must be told the same number; see opencode-sandbox/opencode.json.
+    #
+    # --parallel 1 because the PROMPT CACHE IS PER-SLOT. llama-server defaults to 4
+    # slots and assigns requests by LRU, so a multi-turn agent conversation can land
+    # on a slot that never saw it and re-prefill the whole history — turning a
+    # once-per-session cost into a per-turn one. One slot keeps the prefix stable.
+    # Concurrent requests then queue instead of running together, which is no real
+    # loss: they contend for the same GPU anyway (measured ~331 tok/s prefill solo
+    # vs ~22 tok/s with two in flight). Raise DOCKADE_LLM_SLOTS only for a genuinely
+    # concurrent workload, accepting the cache churn.
+    entrypoint:
+      - /bin/bash
+      - -lc
+      - >
+        export LD_LIBRARY_PATH=/usr/lib/wsl/lib:/app:$$LD_LIBRARY_PATH;
+        exec /app/llama-server --host 0.0.0.0 --port 8080
+        -m /models/${DOCKADE_LLM_MODEL:?set it to a GGUF filename inside DOCKADE_MODELS_DIR, e.g. in a .env file}
+        -ngl ${DOCKADE_LLM_NGL:-99} -c ${DOCKADE_LLM_CTX:-32768} --jinja --no-context-shift
+        --parallel ${DOCKADE_LLM_SLOTS:-1}
+        --reasoning ${DOCKADE_LLM_REASONING:-off}
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # NVIDIA variant — same contract, same address, same `llm` alias. Requires
+  # nvidia-container-toolkit on the Docker host; that runtime injects the driver
+  # libraries itself, so unlike the Intel path there is no device node or driver
+  # bind mount to declare here.
+  llm-nvidia:
+    profiles:
+      - llm-nvidia
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    container_name: llm-nvidia
+    hostname: llm-nvidia
+    restart: unless-stopped
+    networks:
+      sandbox-net:
+        ipv4_address: 172.30.0.20
+        aliases:
+          - llm
+    gpus: all
+    volumes:
+      - ${DOCKADE_MODELS_DIR:-./models}:/models:ro
+    # Same flags as the Intel variant, minus the driver-path export — see there for
+    # why --jinja and --reasoning off are set.
+    entrypoint:
+      - /bin/bash
+      - -lc
+      - >
+        exec /app/llama-server --host 0.0.0.0 --port 8080
+        -m /models/${DOCKADE_LLM_MODEL:?set it to a GGUF filename inside DOCKADE_MODELS_DIR, e.g. in a .env file}
+        -ngl ${DOCKADE_LLM_NGL:-99} -c ${DOCKADE_LLM_CTX:-32768} --jinja --no-context-shift
+        --parallel ${DOCKADE_LLM_SLOTS:-1}
+        --reasoning ${DOCKADE_LLM_REASONING:-off}
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true

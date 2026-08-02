@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+# Local GGUF weights for the llm-* compose profiles (large, host-local).
+models/
+# Local compose overrides (DNS, model selection). Host-specific, never shared.
+.env

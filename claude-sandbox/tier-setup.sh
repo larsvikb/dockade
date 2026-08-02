@@ -1,0 +1,30 @@
+#!/bin/bash
+set -euo pipefail
+
+# Tier-1 (Claude) setup hook. Run as root by the shared entrypoint, before the
+# firewall is armed and before the drop to the non-root sandbox user.
+#
+# Only Claude-specific materialization belongs here. Everything tier-agnostic —
+# config ownership, git identity, the firewall, the capability assertion, the
+# gosu drop — lives in sandbox-common/entrypoint.sh and is shared with tier 2.
+
+USERNAME=sandbox
+CONFIG_DIR="${SANDBOX_CONFIG_DIR:-${CLAUDE_CONFIG_DIR:-/config}}"
+
+# User settings are declarative config owned by the image, not mutable state in
+# the volume. Overwrite them authoritatively on every boot from the baked
+# template, so: config always matches the repo, wiping the config volume for a
+# clean slate never loses it (only credentials/runtime state live in the volume),
+# and any in-session agent edits are transient by design. These are steering /
+# mistake-prevention defaults, NOT an enforcement layer — no client settings file
+# is one here (under org auth the org's remote managed source shadows any local
+# managed file; enforcement is the firewall + capability containment). statusLine
+# lives here (user scope) rather than managed settings because a managed-scope
+# command status line is gated behind an interactive approval dialog the yolo
+# launch flow suppresses. The status-line script itself stays root-owned and baked
+# at /etc/claude-code/statusline.sh — only the pointer is user-editable. No
+# chmod-to-read-only: it would be theater (owner can re-chmod, and /config is
+# agent-writable so the file can be replaced). See DESIGN.md.
+install -o "$USERNAME" -g "$USERNAME" -m 0644 \
+    /etc/claude-code/user-settings.json \
+    "$CONFIG_DIR/settings.json"

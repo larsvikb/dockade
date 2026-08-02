@@ -43,15 +43,34 @@ if curl --noproxy '*' --connect-timeout 5 -s -o /dev/null https://1.1.1.1 2>/dev
 else
     ok "direct egress to raw IP (1.1.1.1) blocked"
 fi
-# The Anthropic lifeline must be reachable via whatever path the agent actually
-# uses — through the proxy if governed, direct otherwise — so DON'T set --noproxy
-# here: use the ambient env. Any HTTP response (even 4xx) means the connection
-# succeeded, which is all we assert.
-if [ -n "${HTTPS_PROXY:-}" ]; then lifeline_path="via proxy $HTTPS_PROXY"; else lifeline_path="direct"; fi
-if curl --connect-timeout 5 -s -o /dev/null https://api.anthropic.com 2>/dev/null; then
-    ok "api.anthropic.com reachable ($lifeline_path)"
+# The Anthropic lifeline. Its expected state is INVERTED between tiers, so branch
+# on the mode rather than asserting one of them universally:
+#   tier 1 — reachable via whatever path the agent uses (proxy if governed, direct
+#            otherwise), so DON'T set --noproxy here: use the ambient env. Any HTTP
+#            response (even 4xx) means the connection succeeded, which is all we assert.
+#   tier 2 — LOCAL mode holds no Anthropic credentials and has no egress, so
+#            reachability would be a boundary FAILURE, not a healthy lifeline.
+if [ "${SANDBOX_MODE:-}" = "local" ]; then
+    if curl --connect-timeout 5 -s -o /dev/null https://api.anthropic.com 2>/dev/null; then
+        bad "api.anthropic.com reachable — LOCAL mode must have NO egress at all"
+    else
+        ok "api.anthropic.com unreachable (correct: LOCAL mode has no egress)"
+    fi
+    # The single sanctioned destination for this tier must actually work, or the
+    # sandbox is inert. Checked by IP because that is what the firewall permits.
+    if curl --connect-timeout 5 -s -o /dev/null \
+         "http://${LLM_IP:-llm}:${LLM_PORT:-8080}/health" 2>/dev/null; then
+        ok "inference service reachable (${LLM_IP:-llm}:${LLM_PORT:-8080}) — the one permitted destination"
+    else
+        bad "inference service NOT reachable (${LLM_IP:-llm}:${LLM_PORT:-8080}) — tier 2 has no other capability"
+    fi
 else
-    bad "api.anthropic.com NOT reachable ($lifeline_path) — lifeline down"
+    if [ -n "${HTTPS_PROXY:-}" ]; then lifeline_path="via proxy $HTTPS_PROXY"; else lifeline_path="direct"; fi
+    if curl --connect-timeout 5 -s -o /dev/null https://api.anthropic.com 2>/dev/null; then
+        ok "api.anthropic.com reachable ($lifeline_path)"
+    else
+        bad "api.anthropic.com NOT reachable ($lifeline_path) — lifeline down"
+    fi
 fi
 # Governed mode: when routed through the egress proxy, a non-allowlisted domain
 # must be refused BY THE PROXY (a 403 on the CONNECT), not merely by the firewall.

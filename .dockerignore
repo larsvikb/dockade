@@ -1,18 +1,26 @@
-# Applies to builds whose context is the repo root — currently only the
-# control-plane service (docker-compose.yml sets context: . for it so its
-# Dockerfile can COPY the top-level policies/ seed). The egress proxy uses its
-# own context (proxies/egress) and is unaffected.
+# Applies to every build whose context is the repo root. That is now three
+# images: the control-plane (needs control-plane/ + the top-level policies/ seed)
+# and BOTH sandbox tiers (claude-sandbox/ and opencode-sandbox/, each of which
+# also needs the shared sandbox-common/ scripts). The sandbox images use a root
+# context precisely so they can COPY sandbox-common/ — a build context cannot
+# reach outside itself, and the firewall must have ONE implementation, not a copy
+# per tier. The egress proxy uses its own context (proxies/egress), unaffected.
 #
-# Keep the root build context tiny: the control-plane image needs only
-# control-plane/ and policies/. Everything else is noise.
+# Keep the root context small: exclude anything no root-context image needs.
 .git
 .github
-claude-sandbox
 control-plane-ui
 proxies
+tests
+models
 run-claude-sandbox.sh
+run-opencode-sandbox.sh
+sandbox-lib.sh
 Makefile
 *.md
+.env
 .hadolint.yaml
 .shellcheckrc
 .yamllint
+__pycache__
+.ruff_cache

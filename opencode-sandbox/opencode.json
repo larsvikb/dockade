@@ -1,0 +1,23 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "local": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Local llama.cpp (dockade)",
+      "options": {
+        "baseURL": "http://llm:8080/v1",
+        "apiKey": "unused-no-auth-on-internal-network"
+      },
+      "models": {
+        "local": {
+          "name": "dockade local model",
+          "limit": {
+            "context": 32768,
+            "output": 4096
+          }
+        }
+      }
+    }
+  },
+  "model": "local/local"
+}

@@ -9,13 +9,40 @@ IFS=$'\n\t'
 # env and routes its runtime traffic through the proxy.
 unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY no_proxy
 
-# GOVERNED mode = an egress proxy is present (the launcher passes EGRESS_PROXY_IP).
-# Then the proxy is the sandbox's egress path for ALL external domains, so the
-# firewall drops to the bare minimum: DNS to the embedded resolver only, the
-# proxy /32, loopback, and established return traffic — no direct IP allowlist
-# (hence no ipset), no upstream DNS forward, no gateway /32. STANDALONE mode (no
-# proxy) keeps the fuller direct-egress allowlist. One flag, used throughout.
-if [[ "${EGRESS_PROXY_IP:-}" =~ ^[0-9.]+$ ]]; then GOVERNED=1; else GOVERNED=0; fi
+# Three modes, selected by what the launcher passes. Shared by every sandbox tier.
+#
+#   GOVERNED   — tier 1 with the compose infra (EGRESS_PROXY_IP set). The proxy is
+#                the sandbox's egress path for ALL external domains, so the
+#                firewall drops to the bare minimum: DNS to the embedded resolver
+#                only, the proxy /32, loopback, established. No direct IP
+#                allowlist (hence no ipset), no upstream DNS forward, no gateway.
+#   LOCAL      — tier 2, the local-LLM agent (SANDBOX_MODE=local). NO egress
+#                whatsoever and no proxy: the ONLY permitted destination is the
+#                local inference service (LLM_IP), plus loopback / embedded DNS /
+#                established. Deliberately NOT the egress proxy — a tier-2 agent
+#                must not reach it even when it is running on the same network.
+#   STANDALONE — tier 1 with no infra. Keeps the fuller direct-egress ipset
+#                allowlist; the only mode with any direct outbound allowance.
+#
+# STANDALONE is the sole mode with a direct IP allowlist, so several branches
+# below key off exactly that.
+MODE=standalone
+if [[ "${SANDBOX_MODE:-}" == "local" ]]; then
+    MODE=local
+elif [[ "${EGRESS_PROXY_IP:-}" =~ ^[0-9.]+$ ]]; then
+    MODE=governed
+fi
+if [[ "$MODE" == "standalone" ]]; then DIRECT_EGRESS=1; else DIRECT_EGRESS=0; fi
+
+# Fail closed: LOCAL mode exists to reach exactly one service. Without its address
+# the agent would boot fully mute, which is a silent misconfiguration rather than
+# a boundary — refuse instead, matching this script's other fail-closed branches.
+if [[ "$MODE" == "local" && ! "${LLM_IP:-}" =~ ^[0-9.]+$ ]]; then
+    echo "FATAL: SANDBOX_MODE=local but LLM_IP is unset or not an IPv4 address." >&2
+    echo "       The tier-2 sandbox has no egress and no proxy; the inference" >&2
+    echo "       service is its only permitted destination. Refusing to start." >&2
+    exit 1
+fi
 
 # ============================================================
 # Default-deny egress firewall for the Claude sandbox.
@@ -80,9 +107,10 @@ mapfile -t DNS_SERVERS < <(awk '/^nameserver/ {print $2}' /etc/resolv.conf 2>/de
 # UPSTREAM_DNS arrives space-separated from the host launcher; the script-wide
 # IFS ($'\n\t') would treat it as a single token, so split it on spaces here.
 IFS=' ' read -r -a UPSTREAM_ARR <<< "${UPSTREAM_DNS:-}"
-if [ "$GOVERNED" -eq 1 ]; then
-    # Governed: the only name the sandbox must resolve is sibling services (e.g.
-    # egress-proxy), which the embedded resolver at 127.0.0.11 answers LOCALLY,
+if [ "$DIRECT_EGRESS" -eq 0 ]; then
+    # Governed and local both: the only name the sandbox must resolve is sibling
+    # services (egress-proxy in governed mode, the inference service in local
+    # mode), which the embedded resolver at 127.0.0.11 answers LOCALLY,
     # with no upstream forward. External names are resolved by the PROXY, not
     # here. So allow DNS ONLY to 127.0.0.11 and let the embedded resolver's
     # upstream forward hit default-deny — which CLOSES the residual DNS-exfil
@@ -109,9 +137,12 @@ done
 # also sidesteps kernels that lack the ip_set/xt_set modules (e.g. stock WSL2,
 # where `ipset create` may work but iptables `-m set --match-set` cannot).
 USE_IPSET=0
-if [ "$GOVERNED" -eq 1 ]; then
+if [ "$MODE" = "governed" ]; then
     echo "Governed egress: proxy at $EGRESS_PROXY_IP present — external domains route"
     echo "  through it; skipping the direct IP allowlist (no ipset required)."
+elif [ "$MODE" = "local" ]; then
+    echo "LOCAL mode: no egress and no proxy — the only permitted destination is"
+    echo "  the inference service at $LLM_IP:${LLM_PORT:-8080}. No direct allowlist."
 else
     # No proxy: open direct egress to a resolved IP allowlist via ipset. Requires
     # the kernel ip_set/xt_set modules — present on most hosts, NOT on stock WSL2
@@ -177,10 +208,10 @@ fi
 # ports and every sibling container on the bridge (a lateral/pivot surface the
 # sandbox must not have). Pin to the gateway /32.
 #
-# In GOVERNED mode drop it entirely: the sandbox reaches the proxy by its own
-# /32:8080 (below) and needs nothing on the host gateway, so this host-local
-# surface is removed rather than pinned.
-if [ "$GOVERNED" -eq 0 ]; then
+# In GOVERNED and LOCAL modes drop it entirely: the sandbox reaches its one
+# sanctioned service by that service's own /32 (below) and needs nothing on the
+# host gateway, so this host-local surface is removed rather than pinned.
+if [ "$DIRECT_EGRESS" -eq 1 ]; then
     HOST_IP=$(ip route | awk '/default/ {print $3; exit}')
     if [[ "$HOST_IP" =~ ^[0-9.]+$ ]]; then
         iptables -A INPUT  -s "$HOST_IP" -j ACCEPT
@@ -194,23 +225,41 @@ fi
 # allow the NOTE below anticipates. In step 0 it runs ALONGSIDE the direct
 # allowed-domains egress (a fallback); at the proxy-only phase that direct egress
 # is removed and this becomes the sandbox's sole path off-box.
-if [[ "${EGRESS_PROXY_IP:-}" =~ ^[0-9.]+$ ]]; then
+#
+# The `$MODE` != local test is belt-and-braces: a tier-2 launcher never passes
+# EGRESS_PROXY_IP, but a tier-2 agent reaching the egress proxy would convert a
+# no-egress tier into a governed-egress one silently. Assert it here rather than
+# rely on the launcher never regressing.
+if [[ "$MODE" != "local" && "${EGRESS_PROXY_IP:-}" =~ ^[0-9.]+$ ]]; then
     iptables -A OUTPUT -p tcp -d "$EGRESS_PROXY_IP" \
         --dport "${EGRESS_PROXY_PORT:-8080}" -j ACCEPT
     echo "  egress proxy allowed -> $EGRESS_PROXY_IP:${EGRESS_PROXY_PORT:-8080}"
 fi
 
-# NOTE (multi-container phase): with the gateway pinned to /32 above, sibling
-# containers are NOT reachable by default — they hit the REJECT below. That is
-# intended. When the data plane lands, the sandbox is meant to reach its
-# sanctioned services (egress proxy, package cache, test runners) on
-# sandbox-net, so add an EXPLICIT allow for that subnet (per-service /32s are
-# tighter), e.g.:
-#     iptables -A OUTPUT -d "<sandbox-net-subnet>" -j ACCEPT
-# Scope it to sandbox-net ONLY — never control-net, or the agent regains a path
-# to the control plane. DNS for sibling names still resolves via Docker's
-# embedded 127.0.0.11 (NAT rules preserved at the top of this script); this
-# allow gates the connection, not the lookup.
+# Sanctioned data-plane service: local LLM inference, for LOCAL mode only. This is
+# the per-service /32 the multi-container NOTE below anticipates — tighter than a
+# subnet allow, so the tier-2 agent reaches the inference service and NOTHING else
+# on sandbox-net (not the egress proxy, not a sibling sandbox, not the package
+# cache). Tier 1 deliberately does not get this: a capability is granted when it
+# has a consumer, not when it becomes possible (see DESIGN.md "Local inference").
+if [ "$MODE" = "local" ]; then
+    iptables -A OUTPUT -p tcp -d "$LLM_IP" \
+        --dport "${LLM_PORT:-8080}" -j ACCEPT
+    echo "  inference service allowed -> $LLM_IP:${LLM_PORT:-8080}"
+fi
+
+# NOTE (multi-container phase): sibling containers are NOT reachable by default —
+# they hit the REJECT below. That is intended, and it is the default that every
+# new data-plane service starts from: reachability is granted per service, as an
+# explicit /32 above, never as a blanket subnet allow. The two grants that exist
+# today are the egress proxy (governed mode) and the inference service (local
+# mode); a package cache or test runner would each get their own.
+#
+# Scope every such allow to sandbox-net ONLY — never control-net, or the agent
+# regains a path to the control plane. DNS for sibling names still resolves via
+# Docker's embedded 127.0.0.11 (NAT rules preserved at the top of this script);
+# these allows gate the connection, not the lookup, which is why a blocked
+# sibling shows up as a fast connection refusal rather than a name failure.
 
 # IPv6: default-deny everything. We only govern/allow IPv4 above, so an open
 # ip6tables (default ACCEPT) would be ungoverned egress — a containment leak —
@@ -273,7 +322,23 @@ if curl --connect-timeout 5 -s https://example.com >/dev/null 2>&1; then
 else
     echo "  OK — example.com blocked (direct)"
 fi
-if [ "$USE_IPSET" -eq 1 ]; then
+if [ "$MODE" = "local" ]; then
+    # Tier 2 has no Anthropic lifeline at all — it must NOT reach api.anthropic.com
+    # by any path, and the inference service must be reachable. Both are asserted
+    # here so a misconfigured no-egress tier fails loudly at boot rather than
+    # looking healthy until the agent tries to work.
+    if curl --connect-timeout 5 -s https://api.anthropic.com >/dev/null 2>&1; then
+        echo "WARNING: firewall leak — api.anthropic.com reachable in LOCAL mode"
+    else
+        echo "  OK — api.anthropic.com unreachable (no egress in LOCAL mode)"
+    fi
+    if curl --connect-timeout 5 -s -o /dev/null "http://$LLM_IP:${LLM_PORT:-8080}/health" 2>/dev/null; then
+        echo "  OK — inference service reachable at $LLM_IP:${LLM_PORT:-8080}"
+    else
+        echo "  NOTE — inference service not answering at $LLM_IP:${LLM_PORT:-8080} yet"
+        echo "         (model may still be loading; the firewall rule is installed)"
+    fi
+elif [ "$USE_IPSET" -eq 1 ]; then
     # Standalone: api.anthropic.com is in the direct allowlist, so it should work.
     curl --connect-timeout 5 -s https://api.anthropic.com >/dev/null 2>&1 \
         && echo "  OK — api.anthropic.com reachable (direct)" \

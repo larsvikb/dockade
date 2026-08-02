@@ -22,9 +22,11 @@ socket, and (by design) no route to a control plane.
 > sole path off-box, and it defers every decision to a **control plane** the
 > agent cannot reach (policy + audit in SQLite). An unknown host is **held for
 > approval** — a human approves/rejects it in a live UI (backend fully internal;
-> a separate `control-plane-ui` frontend carries the loopback UI). Still to come
-> per [`DESIGN.md`](DESIGN.md): the audit browser (2c) and the git/cache
-> data-plane services. See [Roadmap](#roadmap).
+> a separate `control-plane-ui` frontend carries the loopback UI). There are now
+> **two sandbox tiers** sharing one boundary implementation: tier 1 (Claude,
+> governed egress) and tier 2 (opencode against a local LLM, no egress and no
+> credentials). Still to come per [`DESIGN.md`](DESIGN.md): the audit browser (2c)
+> and the git/cache data-plane services. See [Roadmap](#roadmap).
 
 ## Quickstart
 
@@ -66,6 +68,33 @@ Then, inside the container:
 claude          # normal, permission-prompting mode
 claude-yolo     # bypass-permissions mode — a conscious opt-in (see below)
 ```
+
+## Two sandbox tiers
+
+Both tiers run the **same** boundary implementation (`sandbox-common/`) and differ
+only in the capability granted:
+
+| | Brain | Egress | Credentials | Launch |
+|---|---|---|---|---|
+| **Tier 1** | Claude (API) | governed — egress proxy → allowlist | Anthropic session | `make claude` |
+| **Tier 2** | local LLM on `sandbox-net` | **none at all** | **none at all** | `make opencode` |
+
+Tier 2 is an [opencode](https://opencode.ai) agent driven by a local model served
+in-cluster by llama.cpp, and its grant is defined by *subtraction*: no proxy, no
+upstream DNS, no credentials, no route anywhere except the inference service. That
+makes it both a genuinely offline agent and the sharpest test of the boundary — its
+`boundary-check.sh` **inverts** the Anthropic check, asserting the API is
+*unreachable*. It needs a model running first:
+
+```bash
+# put a GGUF in ./models, set DOCKADE_LLM_MODEL in .env, then:
+docker compose --profile llm-intel up -d llm-intel    # Intel/WSL (SYCL)
+docker compose --profile llm-nvidia up -d llm-nvidia  # NVIDIA (CUDA)
+```
+
+See [`DESIGN.md`](DESIGN.md) → *Local inference* for the accelerator setup,
+measured throughput, and why the LLM service is ungoverned (it has no egress of
+its own to govern).
 
 ## What the launcher does
 
@@ -112,11 +141,15 @@ enabled in v1; details in [`DESIGN.md`](DESIGN.md).
 
 **Verifying the boundary:** run `boundary-check.sh` inside the container (as the
 agent) for an on-demand pass/fail check of the invariants — arbitrary egress
-blocked, Anthropic reachable, IPv6 blocked, agent holds no capabilities,
-`no_new_privs` set, no Docker socket. It exits non-zero on any violation, so it
-doubles as a regression baseline to run before and after future changes (e.g. the
-egress proxy). This is separate from the boot-time checks, which run as root
-before the privilege drop and only warn.
+blocked, IPv6 blocked, control plane unreachable, agent holds no capabilities,
+`no_new_privs` set, no Docker socket, plus nine attempts to abuse the egress proxy
+(non-443 CONNECT, SNI fronting, relaying to the control plane or the metadata IP).
+It is **tier-aware**: tier 1 asserts Anthropic is reachable *via the proxy*, tier 2
+asserts it is unreachable and that the inference service is the one destination that
+answers. It exits non-zero on any violation, so it doubles as a regression baseline
+to run before and after changes — `make boundary` runs it in a live sandbox. This is
+separate from the boot-time checks, which run as root before the privilege drop and
+only warn.
 
 ## Yolo mode
 
@@ -132,8 +165,11 @@ dockade/
   README.md                 # this file
   CLAUDE.md                 # invariants + conventions for working in the repo
   DESIGN.md                 # architecture, topology, and rationale (read this)
-  docker-compose.yml        # shared infrastructure: egress proxy + control plane
-  run-claude-sandbox.sh     # build + launch a sandbox (one or many) against it
+  Makefile                  # task entry points (make claude / make opencode / make check)
+  docker-compose.yml        # shared infra: egress proxy + control plane + local LLM
+  run-claude-sandbox.sh     # tier 1: build + launch a Claude sandbox (one or many)
+  run-opencode-sandbox.sh   # tier 2: build + launch an opencode/local-LLM sandbox
+  sandbox-lib.sh            # launcher plumbing shared by both tiers
   control-plane/            # governance authority BACKEND (agent cannot reach it)
     Dockerfile              #   FastAPI over SQLite; control-net only, fully internal
     app.py                  #   /authorize (policy + audit) + hold-for-approval API
@@ -149,14 +185,21 @@ dockade/
     egress/                 # CONNECT-level egress proxy: control-plane client
       Dockerfile            #   mitmproxy + the policy/audit addon
       addon.py              #   per-connection /authorize + local audit stream
-  claude-sandbox/           # the agent image
-    Dockerfile
+  sandbox-common/           # ONE boundary implementation, shared by every tier
     entrypoint.sh           # root: firewall + config, then drops to non-root
-    init-firewall.sh        # default-deny egress firewall
+    init-firewall.sh        # default-deny egress firewall (governed/local/standalone)
     boundary-check.sh       # on-demand smoke test of the containment boundary
+  claude-sandbox/           # TIER 1 image — Claude, governed egress
+    Dockerfile
+    tier-setup.sh           # tier hook: materialize Claude user settings
     user-settings.json      # baked template, materialized to /config each boot
     statusline.sh           # sandbox-indicator status line
     dotfiles/               # .bashrc (incl. claude-yolo), .gitconfig, ...
+  opencode-sandbox/         # TIER 2 image — opencode + local LLM, no egress
+    Dockerfile
+    tier-setup.sh           # tier hook: materialize the opencode provider config
+    opencode.json           # points opencode at the local `llm` service
+  models/                   # GGUF weights for the local LLM (gitignored)
 ```
 
 ## Roadmap

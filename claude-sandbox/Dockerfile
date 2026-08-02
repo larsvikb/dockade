@@ -128,8 +128,12 @@ RUN pipx install ruff \
     && ruff --version \
     && yamllint --version
 
-# Dotfiles
-COPY dotfiles/.bashrc dotfiles/.vimrc dotfiles/.inputrc dotfiles/.gitconfig /home/$USERNAME/
+# Dotfiles.
+# NB: the build context is the REPO ROOT (not claude-sandbox/), so that the
+# shared sandbox-common/ scripts below are reachable — a build context cannot
+# COPY from outside itself. Every COPY source is therefore repo-root-relative.
+COPY claude-sandbox/dotfiles/.bashrc claude-sandbox/dotfiles/.vimrc \
+     claude-sandbox/dotfiles/.inputrc claude-sandbox/dotfiles/.gitconfig /home/$USERNAME/
 
 # Root-owned baked config (user-settings template, status line), firewall, and
 # entrypoint. NB: no managed-settings.json — under org auth Claude Code loads the
@@ -141,16 +145,23 @@ COPY dotfiles/.bashrc dotfiles/.vimrc dotfiles/.inputrc dotfiles/.gitconfig /hom
 # Ends as root ON PURPOSE: the entrypoint needs root to arm the firewall
 # (NET_ADMIN) before dropping to the non-root sandbox user via gosu, so the
 # running agent is never root. See entrypoint.sh.
+#
+# init-firewall.sh / entrypoint.sh / boundary-check.sh come from sandbox-common/
+# and are SHARED VERBATIM with the tier-2 (opencode) image — the boundary must
+# have exactly one implementation. Anything Claude-specific goes in the
+# tier-setup.sh hook the shared entrypoint invokes, not in the shared scripts.
 # hadolint ignore=DL3002
 USER root
-COPY user-settings.json /etc/claude-code/user-settings.json
-COPY statusline.sh /etc/claude-code/statusline.sh
-COPY init-firewall.sh /usr/local/bin/init-firewall.sh
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-COPY boundary-check.sh /usr/local/bin/boundary-check.sh
+COPY claude-sandbox/user-settings.json /etc/claude-code/user-settings.json
+COPY claude-sandbox/statusline.sh /etc/claude-code/statusline.sh
+COPY claude-sandbox/tier-setup.sh /usr/local/bin/tier-setup.sh
+COPY sandbox-common/init-firewall.sh /usr/local/bin/init-firewall.sh
+COPY sandbox-common/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY sandbox-common/boundary-check.sh /usr/local/bin/boundary-check.sh
 RUN chmod 0644 /etc/claude-code/user-settings.json \
     && chmod 0755 /etc/claude-code/statusline.sh \
-    && chmod 0755 /usr/local/bin/init-firewall.sh /usr/local/bin/entrypoint.sh /usr/local/bin/boundary-check.sh \
+    && chmod 0755 /usr/local/bin/init-firewall.sh /usr/local/bin/entrypoint.sh \
+                  /usr/local/bin/boundary-check.sh /usr/local/bin/tier-setup.sh \
     && chown $USERNAME:$USERNAME /home/$USERNAME/.bashrc /home/$USERNAME/.vimrc /home/$USERNAME/.inputrc /home/$USERNAME/.gitconfig
 
 # Container starts as root so the entrypoint can set up the firewall,

@@ -8,7 +8,7 @@
 #   - compose/*     thin wrappers over the shared egress-proxy infrastructure in
 #                   docker-compose.yml. Sandboxes themselves are NOT compose
 #                   services (they are ephemeral + plural); launch them with
-#                   `make sandbox`, which calls run-claude-sandbox.sh.
+#                   `make claude` / `make opencode`, one per agent tier.
 #
 # The linters (shellcheck, hadolint, ruff) run from the HOST/CI, not the sandbox
 # image; missing ones are skipped with a note so `make check` still runs the
@@ -24,12 +24,21 @@ SANDBOX ?= claude-sandbox
 WORKSPACE ?= $(PWD)
 
 # Shell scripts (bash -n + shellcheck) and Dockerfiles (hadolint).
-SCRIPTS := run-claude-sandbox.sh \
-           claude-sandbox/init-firewall.sh \
-           claude-sandbox/entrypoint.sh \
-           claude-sandbox/boundary-check.sh \
+# Every sandbox launcher. A GLOB, not a list, so a new tier's launcher is covered
+# by the lint/syntax/control-net guards automatically — forgetting to register one
+# would leave it unchecked, and the control-net guard is security-load-bearing.
+LAUNCHERS := $(wildcard run-*-sandbox.sh)
+
+SCRIPTS := $(LAUNCHERS) \
+           sandbox-lib.sh \
+           sandbox-common/init-firewall.sh \
+           sandbox-common/entrypoint.sh \
+           sandbox-common/boundary-check.sh \
+           claude-sandbox/tier-setup.sh \
+           opencode-sandbox/tier-setup.sh \
            claude-sandbox/statusline.sh
-DOCKERFILES := claude-sandbox/Dockerfile proxies/egress/Dockerfile \
+DOCKERFILES := claude-sandbox/Dockerfile opencode-sandbox/Dockerfile \
+               proxies/egress/Dockerfile \
                control-plane/Dockerfile control-plane-ui/Dockerfile
 YAMLFILES := docker-compose.yml .hadolint.yaml .yamllint
 JSONFILES := $(shell git ls-files '*.json' 2>/dev/null)
@@ -43,6 +52,7 @@ TESTFILES := $(shell git ls-files 'tests/*.py' 2>/dev/null)
 # rename can't silently break the build.
 REFFILES := $(SCRIPTS) \
             claude-sandbox/user-settings.json \
+            opencode-sandbox/opencode.json \
             claude-sandbox/dotfiles/.bashrc \
             claude-sandbox/dotfiles/.vimrc \
             claude-sandbox/dotfiles/.inputrc \
@@ -57,7 +67,7 @@ REFFILES := $(SCRIPTS) \
 
 .PHONY: help check lint consistency test verify-build \
         up down destroy rebuild logs-ep logs-cp \
-        sandbox boundary
+        claude opencode boundary
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -97,7 +107,7 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	done
 	echo "== domain allowlist drift (firewall ⊆ proxy allowlist) =="
 	fw=$$(awk '/ALLOWED_DOMAINS=\(/{f=1;next} f&&/^[[:space:]]*\)/{f=0} f' \
-	         claude-sandbox/init-firewall.sh | grep -oE '"[a-z0-9.]+"' | tr -d '"' | sort -u)
+	         sandbox-common/init-firewall.sh | grep -oE '"[a-z0-9.]+"' | tr -d '"' | sort -u)
 	al=$$(grep -vE '^[[:space:]]*#|^[[:space:]]*$$' policies/egress-allowlist.txt \
 	         | sed 's/^\.//' | sort -u)
 	missing=$$(comm -23 <(printf '%s\n' "$$fw") <(printf '%s\n' "$$al"))
@@ -106,17 +116,47 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	  printf '%s\n' "$$missing" | sed 's/^/    /'; exit 1
 	fi
 	echo "  ok — every firewall host is covered by the proxy allowlist"
+	echo "== context-window agreement (server -c == opencode limit.context) =="
+	# Two numbers in two files that must match. If the server's window is SMALLER
+	# than what opencode believes, opencode packs a prompt the server rejects
+	# outright (and --no-context-shift means it fails loudly rather than silently
+	# evicting the system prompt). If it is LARGER, the tier just wastes memory it
+	# will never use. Neither is visible until an agent run dies mid-task.
+	srv=$$(grep -oE '\-c \$$\{DOCKADE_LLM_CTX:-[0-9]+\}' docker-compose.yml \
+	         | grep -oE '[0-9]+' | sort -u)
+	oc=$$(python3 -c "import json; print(json.load(open('opencode-sandbox/opencode.json'))['provider']['local']['models']['local']['limit']['context'])")
+	if [ "$$(printf '%s' "$$srv" | wc -l)" != "0" ]; then
+	  echo "  FAIL: accelerator variants disagree on the default context size:"
+	  printf '%s\n' "$$srv" | sed 's/^/    /'; exit 1
+	fi
+	if [ "$$srv" != "$$oc" ]; then
+	  echo "  FAIL: server default -c is $$srv but opencode.json limit.context is $$oc"
+	  echo "        — the client would size prompts against a window the server does"
+	  echo "        not have. Update both, or override DOCKADE_LLM_CTX deliberately."
+	  exit 1
+	fi
+	echo "  ok — both declare $$srv tokens"
 	echo "== referenced files exist (Dockerfile COPY / entrypoint) =="
 	for f in $(REFFILES); do
 	  if [ -f "$$f" ]; then echo "  ok $$f"; else echo "  MISSING $$f"; exit 1; fi
 	done
 	echo "== control-net isolation (sandbox must have no path to the control plane) =="
-	if grep -qE 'control-(ui-)?net' run-claude-sandbox.sh; then
-	  echo "  FAIL: run-claude-sandbox.sh references a control-plane network — the"
-	  echo "        sandbox must NEVER attach to control-net or control-ui-net (the"
-	  echo "        agent must have no route to the control plane)"
+	# Checked for EVERY launcher via the LAUNCHERS glob, not one hardcoded name: a
+	# new tier's launcher must not be able to attach to the control plane merely
+	# because nobody remembered to add it to this guard. Empty glob = fail closed.
+	if [ -z "$(LAUNCHERS)" ]; then
+	  echo "  FAIL: no run-*-sandbox.sh launcher found — the control-net guard would"
+	  echo "        silently check nothing. Did a launcher get renamed?"
 	  exit 1
 	fi
+	for launcher in $(LAUNCHERS); do
+	  if grep -qE 'control-(ui-)?net' "$$launcher"; then
+	    echo "  FAIL: $$launcher references a control-plane network — no sandbox tier"
+	    echo "        may EVER attach to control-net or control-ui-net (the agent must"
+	    echo "        have no route to the control plane)"
+	    exit 1
+	  fi
+	done
 	# The two security-load-bearing nets MUST each be internal: sandbox-net (the
 	# agent's only net) and control-net (the shared control path). Check each BY
 	# NAME — a bare count of 'internal: true' can't tell that the RIGHT nets are the
@@ -151,12 +191,14 @@ verify-build: ## Assert every image still builds (skipped if docker unavailable)
 	  echo "SKIP build verification (docker unavailable)"; exit 0
 	fi
 	# Cache-respecting builds: the first run is slow, repeats are near-instant when
-	# nothing changed. Covers all four Dockerfiles — the three compose services
-	# here, and the sandbox image (not a compose service) via the launcher.
+	# nothing changed. Covers every Dockerfile — the three compose services here,
+	# and BOTH sandbox tiers (not compose services) via their launchers.
 	echo "== docker compose build (egress proxy + control plane + UI) =="
 	$(COMPOSE) build
-	echo "== sandbox image build (run-claude-sandbox.sh --build-only) =="
-	./run-claude-sandbox.sh --build-only
+	for launcher in $(LAUNCHERS); do
+	  echo "== sandbox image build ($$launcher --build-only) =="
+	  "./$$launcher" --build-only
+	done
 
 # ── shared infrastructure (docker-compose.yml) ──────────────────────────────
 
@@ -169,10 +211,10 @@ down: ## Stop the shared infra (keeps the egress-audit volume)
 destroy: ## Stop infra AND delete the egress-audit volume (destructive)
 	$(COMPOSE) down -v
 
-rebuild: ## Tear down infra and rebuild every image from scratch — proxy + control plane + UI + sandbox (run `make up` after)
+rebuild: ## Tear down infra and rebuild every image from scratch — proxy + control plane + UI + both sandbox tiers (run `make up` after)
 	$(COMPOSE) down
 	$(COMPOSE) build --no-cache
-	./run-claude-sandbox.sh --build-only --no-cache
+	for launcher in $(LAUNCHERS); do "./$$launcher" --build-only --no-cache; done
 
 logs-ep: ## Follow the egress-proxy log — the live per-connection audit stream
 	$(COMPOSE) logs -f egress-proxy
@@ -180,10 +222,13 @@ logs-ep: ## Follow the egress-proxy log — the live per-connection audit stream
 logs-cp: ## Follow the control-plane log (policy seed + decisions)
 	$(COMPOSE) logs -f control-plane
 
-# ── sandbox lifecycle (run-claude-sandbox.sh) ───────────────────────────────
+# ── sandbox lifecycle (run-*-sandbox.sh) ────────────────────────────────────
 
-sandbox: ## Launch a sandbox against the infra (WORKSPACE=/path, default $$PWD)
+claude: ## Launch a tier-1 (Claude, governed egress) sandbox (WORKSPACE=/path, default $$PWD)
 	./run-claude-sandbox.sh "$(WORKSPACE)"
 
-boundary: ## Run boundary-check.sh inside a running sandbox (SANDBOX=name)
+opencode: ## Launch a tier-2 (opencode + local LLM, no egress) sandbox (WORKSPACE=/path)
+	./run-opencode-sandbox.sh "$(WORKSPACE)"
+
+boundary: ## Run boundary-check.sh in a running sandbox (SANDBOX=claude-sandbox|opencode-sandbox)
 	docker exec -it "$(SANDBOX)" boundary-check.sh

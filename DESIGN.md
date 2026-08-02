@@ -422,6 +422,12 @@ host-bind-mounted workspace. Dependencies: pull-through cache.
   language servers. In-image for v1 (part of the paved road), not separate
   containers yet.
 - **Local scratch DB** (optional v1) — for apps the agent builds during dev.
+- **Local LLM inference** (`llm-intel` / `llm-nvidia` compose profiles) — an
+  OpenAI-compatible `llama-server` on sandbox-net. Ungoverned because it has **no
+  egress at all**, not merely a governed one: weights are pre-fetched on the host
+  into a read-only mount, so the service never makes an outbound request. Built
+  and verified; **deliberately not yet reachable by the agent** — see "Local
+  inference".
 
 **Credentials:**
 - In the sandbox: Anthropic session credentials (must, self-use) — established by
@@ -578,6 +584,275 @@ broke the agent, and the fix spans both `run-claude-sandbox.sh` and
 the two can't drift apart. Containment is unaffected: `--dns` only sets an
 upstream, DNS is still pinned to *named* resolvers (no "any nameserver" hole), and
 egress remains filter-table default-deny + the ipset allowlist.
+
+## Local inference — an ungoverned LLM tool
+
+**Status: built and verified; not reachable by the agent.** `docker-compose.yml`
+defines `llm-intel` and `llm-nvidia`, both behind compose profiles so neither
+starts with a plain `docker compose up -d`. They serve `llama-server` (an
+OpenAI-compatible API) on sandbox-net at `172.30.0.20:8080`.
+
+### Why it is ungoverned rather than governed
+
+The taxonomy above requires an ungoverned tool to have **no independent egress**.
+This one satisfies that by construction rather than by policy, which is a stronger
+claim than the pull-through cache can make:
+
+- sandbox-net only (`internal: true`), never egress-net, no published port;
+- model weights are pre-fetched **by the human on the host** into a read-only
+  bind mount, so the service has no reason to reach the network and no way to.
+
+There is therefore nothing to audit at a choke point, because nothing crosses one.
+Verified in-container: a TCP probe to a public address returns `Network is
+unreachable` (not a timeout, not a filtered drop — no route exists), `docker
+inspect` reports an empty `Gateway`, and `docker port` is empty.
+
+The rejected alternative was to let the service fetch models itself with
+`llama-server -hf`, proxying that upstream through the egress proxy — the
+package-cache pattern. It is more convenient and would have been defensible, but
+it trades a *structural* guarantee for a *policy* one. Pre-fetching costs one
+manual download and keeps the guarantee provable by `docker inspect`.
+
+### The GPU goes to the service, not the sandbox
+
+Passing a GPU device into the *sandbox* would breach "never give the sandbox a
+direct path to anything" — it is a host device, and on the Intel/WSL path it also
+requires bind-mounting the host's driver directory. Instead the device is granted
+to the inference container, and the agent reaches inference the way it reaches
+every other capability: as a service on the internal network. The sandbox keeps
+zero direct device access.
+
+### Accelerator independence
+
+The two profiles are mutually exclusive and deliberately share both the
+sandbox-net address and the network alias `llm`. So the consumer endpoint
+(`http://llm:8080`) and any future firewall `/32` are identical whichever
+accelerator the host has, and switching hardware is a profile flag rather than a
+rewiring. Enabling both profiles at once is an address conflict, which is the
+intended failure.
+
+- **Intel (WSL2)** — `--device /dev/dxg` plus `/usr/lib/wsl:ro`. There is no
+  `/dev/dri` render node under WSL; the GPU is a paravirtual D3D12 device, and the
+  in-image Level Zero runtime reaches it via `libdxcore.so` from that mount. A
+  consequence worth recording: Intel's native Vulkan driver (ANV) **cannot** bind
+  under WSL, so Vulkan there would run through Mesa's Dozen shim over D3D12 —
+  published Arc-on-Linux Vulkan benchmarks do not transfer. SYCL is the path.
+- **NVIDIA** — `gpus: all` (Compose ≥ 2.30) and the `server-cuda` image. The
+  nvidia-container-toolkit injects driver libraries itself, so unlike the Intel
+  path there is no device node or driver mount to declare.
+
+Neither variant needs any accelerator runtime installed on the host distro: the
+llama.cpp images bundle the full Intel NEO / Level Zero stack themselves.
+
+### Measured characteristics (Intel Arc 140V iGPU, Lunar Lake)
+
+| Workload | Result |
+| --- | --- |
+| Decode, 4B Q4_K_M | ~30 tok/s |
+| Decode, 9B Q4_K_M | ~15–17 tok/s |
+| Prefill, 9B | ~164 tok/s (275-token prompt) |
+| Cold model load, 9B | ~70 s |
+| Two concurrent requests | per-request decode roughly halves |
+
+Decode is **memory-bandwidth-bound** — the iGPU shares LPDDR5X with the host at
+~135 GB/s, and measured throughput sits at ~55% of that ceiling. Prefill is
+compute-bound and benefits from Xe2's matrix engines, giving a ~10x asymmetry.
+**This machine is good at prompt-heavy, short-output work and bad at long-form
+generation**, which should drive task design more than model choice does.
+
+Verified working: OpenAI-style tool calling (correct function and arguments) and
+`response_format: json_schema` constrained decoding. `--jinja` is required for
+tool calls and is set in the compose entrypoint. Tool calling was re-verified
+**with `--reasoning off`**, i.e. in the shipped configuration — the model picks the
+function and argument in 27 tokens with no thinking step, so bounding reasoning
+costs nothing here.
+
+### Operational constraints (learned the hard way)
+
+- **One model at a time.** ~16.9 GB of shared memory will not hold two useful
+  models concurrently, and swapping costs a container recreate plus the cold load
+  above. Every consumer shares one model; "cheap classifier plus capable agent
+  simultaneously" is not available on this hardware.
+- **Reasoning models need bounding.** Qwen3.5 has thinking on by default
+  (`llama-server --reasoning` defaults to `auto`, which resolves to on). A trivial
+  self-verification prompt ("say hi in five words") produced 6,099 reasoning tokens
+  over 7.4 minutes — it found valid answers immediately, then looped re-checking.
+  Genuine tasks reason proportionally (~50 tokens for a tool-call decision), so
+  this is a tail risk, not a constant tax. **The default is therefore set
+  server-side**: `--reasoning off` in the compose entrypoint, overridable with
+  `DOCKADE_LLM_REASONING=on`. Measured on the same prompt: 6,099 tokens / 441 s
+  with reasoning on, 8 tokens / 0.5 s with it off, and no `reasoning_content` field
+  emitted at all. Server-side rather than per-request because a client
+  that *can* send `"chat_template_kwargs":{"enable_thinking":false}` merely fixes
+  itself, while one that cannot (opencode) has no recourse — so the fix belongs
+  where every consumer inherits it. Keep a hard `max_tokens` and a client timeout
+  regardless, and if reasoning is switched back on, bound it with
+  `--reasoning-budget N` instead of leaving it unrestricted (`-1`).
+- **A schema does not constrain reasoning.** With thinking on, `reasoning_content`
+  can consume the whole `max_tokens` budget and return empty `content` — the
+  grammar never applies. Unbounded reasoning defeats the reliability guarantee
+  that constrained decoding is adopted for.
+- **Constrained decoding guarantees shape, not values.** A first trial returned
+  schema-perfect JSON reading `"critical"` for a line beginning `ERROR`, and
+  expanded the component `db-pool` to `"database-connection-pooling-layer"`.
+  Explicit "verbatim, do not expand" instructions fixed both. The lesson is not
+  that the model is incapable but that its errors are *semantically* wrong while
+  *structurally* valid, so nothing throws. Prefer parsing deterministic fields
+  deterministically and giving the model only the genuinely fuzzy ones.
+- **Use `temperature: 0`** for extraction and classification. The server default
+  is non-deterministic and buys nothing on these tasks.
+- **32k context is the working ceiling, and agents need most of it.** ~4.6 GB of
+  f16 KV on top of ~5.5 GB of weights fits the ~16.9 GB shared pool with headroom;
+  64k does not. 8k is not merely tight but unusable for an agent harness —
+  opencode's base prompt (system + tool schemas) exceeds it before the first user
+  turn. Both ends must agree: `-c` on the server and `limit.context` in the client
+  config, guarded by `make consistency`. Avoid `-c 0` (load from model), which
+  would size the allocation from the model's native window.
+- **The prompt cache is per-slot, so run one slot.** llama-server defaults to 4
+  slots assigned by LRU; a multi-turn conversation can land on a slot that never
+  saw it and re-prefill the entire history. `--parallel 1` keeps the prefix stable.
+  Concurrency was never real anyway — two in-flight requests contend for the same
+  GPU (~331 tok/s prefill solo vs ~22 tok/s with two running).
+- **Prefill throughput decays with depth.** ~331 tok/s for the first 2k tokens,
+  ~236 marginal by 6k, as attention cost grows with context. Short-prompt
+  measurements (the 172 tok/s figure from a 277-token request) are dominated by
+  fixed overhead and overstate the cost of long prompts while understating deep
+  ones. Budget roughly half a minute for an 8k prompt.
+- **Overflow should fail, not silently truncate.** `--no-context-shift`: the
+  default discards the oldest tokens, which for an agent means evicting its system
+  prompt and tool definitions mid-conversation — degradation that presents as the
+  model becoming inexplicably confused rather than as an error.
+
+### Why tier-1 Claude cannot reach it — deliberately
+
+Sibling containers on sandbox-net are not reachable from the tier-1 sandbox: they
+hit the default `REJECT` in `init-firewall.sh`. Confirmed from inside a running
+sandbox — the name `llm` resolves via the embedded resolver, then the connection is
+rejected in ~1 ms.
+
+That gap is intentional. Default-deny means a capability is granted when it has a
+consumer, not when it becomes technically possible, and the case for tier-1 Claude
+using a 9B local model is weak: it is strictly less capable at everything the
+agent already does well. The arguments that survive scrutiny are narrow —
+**embeddings** (where the quality gap to a frontier model is small and the
+capability is genuinely absent today), use as a **test fixture** for the repo's own
+LLM-shaped development, and **bulk triage** where delegating keeps content out of
+the agent's context *and* out of the network. None is currently pressing.
+
+The mechanism to close it now exists — the LOCAL-mode `/32` allow described below —
+so granting it later is a launcher change, not a design change. It stays ungranted
+until a consumer justifies it.
+
+### Built — the tier-2 local-model sandbox
+
+The concrete motivation for the wiring above is not tier-1 Claude but a **second
+agent tier driven by the local model**, which is a genuinely different containment
+posture:
+
+| | Brain | Egress | Credentials | Governed by |
+| --- | --- | --- | --- | --- |
+| Tier 1 | Claude (API) | proxy → allowlist | Anthropic session | egress proxy + control plane |
+| Tier 2 | local LLM | **none** | **none** | nothing to govern — no egress exists |
+
+Tier 2 holds **no credentials at all** — the credential invariant's "only what it
+must" reduces to nothing. Built as `opencode-sandbox/` + `run-opencode-sandbox.sh`;
+launch with `make opencode`.
+
+**Its grant is defined by subtraction.** The launcher passes `SANDBOX_MODE=local`,
+`LLM_IP`, `LLM_PORT` and git identity — and deliberately *no* proxy env, *no*
+`UPSTREAM_DNS`, *no* `--dns`. Absence of capability is the mechanism; there is no
+setting to get wrong. The launcher also refuses the standalone-network fallback
+(`sc_ensure_network ... false`), because a non-internal bridge would hand a
+no-egress agent exactly the egress its design forbids, and treats a missing `llm`
+service as **fatal** rather than degraded: an opencode sandbox with no model is
+broken, not reduced. `LLM_IP` is discovered from the running container rather than
+hardcoded, so a compose subnet change cannot silently break the firewall's `/32`.
+
+**One boundary implementation, two grants.** The extraction into `sandbox-common/`
+(`init-firewall.sh`, `entrypoint.sh`, `boundary-check.sh`) plus `sandbox-lib.sh` for
+launcher plumbing means both tiers run *byte-identical* enforcement; each image
+supplies only a `tier-setup.sh` hook for its own declarative config. A firewall fix
+lands in both tiers at once, and neither tier can drift into a weaker posture
+unnoticed. `init-firewall.sh` gained a **third mode** alongside GOVERNED and
+STANDALONE:
+
+| Mode | Selected by | Permits |
+| --- | --- | --- |
+| GOVERNED | `EGRESS_PROXY_IP` set | loopback, embedded DNS, established, `/32` → egress proxy |
+| LOCAL | `SANDBOX_MODE=local` | loopback, embedded DNS, established, `/32` → `llm:8080` |
+| STANDALONE | neither | direct `ipset` IP-allowlist (proxy-less fallback, tier 1 only) |
+
+LOCAL **fails closed**: if `SANDBOX_MODE=local` and `LLM_IP` is unset or not an
+IPv4 address, the firewall aborts rather than booting an agent whose one intended
+destination is unreachable. The egress-proxy allow is explicitly gated off in this
+mode, so the proxy is not merely unused but unreachable.
+
+**Verified empirically, not asserted.** `boundary-check.sh` branches on mode and
+*inverts* the Anthropic check — in LOCAL mode, reachability is a failure. From
+inside a running tier-2 sandbox all checks pass, including the two that only this
+tier can make:
+
+- `api.anthropic.com unreachable (correct: LOCAL mode has no egress)`
+- `inference service reachable (172.30.0.20:8080) — the one permitted destination`
+
+alongside control-plane isolation, IPv6 denied, zero capabilities, `no_new_privs`,
+and no Docker socket. Tier 1 re-verified unchanged after the extraction (15/15,
+including `api.anthropic.com reachable via proxy` and all nine proxy refusals).
+This is the strongest containment evidence the repo has: an agent that can reach
+precisely one thing, holds nothing, and proves both from its own capability-less
+security context.
+
+**Runtime deps are baked at build time**, since the firewall only arms at container
+*start* — so the image installs opencode and the `@ai-sdk/openai-compatible`
+provider SDK while egress still exists. Confirmed working with no egress at
+runtime. `NPM_CONFIG_PREFIX` points at the user's `~/.local` so `-g` installs work
+as the non-root user, which also means the agent can npm-install at runtime without
+ever holding root.
+
+The provider config (`opencode.json`, `baseURL: http://llm:8080/v1`) is **not** a
+containment control and is documented as such in-place: the agent can rewrite it,
+and a rewritten `baseURL` buys nothing, because the firewall permits exactly one
+destination — pointing opencode elsewhere yields a rejected connection, not egress.
+That is the "capability, not configuration" split in miniature.
+
+**Why the server sets the reasoning default.** opencode cannot send
+`chat_template_kwargs` per request, so with llama-server's default (`--reasoning
+auto` → on) every turn paid the full thinking cost — the observed "somewhat slow"
+behaviour. Fixed at the server (`--reasoning off`, see *Operational constraints*),
+which is the right layer: a per-request workaround only helps clients able to send
+one, and this tier's whole point is hosting consumers that are not under our
+control.
+
+**Open — the unattended worker tier, deliberately undesigned:**
+
+- **Is the scheduled worker tier 2 in a different mode, or a tier 3?** What is
+  built is the *interactive* local-model sandbox. An unattended scheduled worker
+  differs in the way that matters most: with no human present, every hold degrades
+  to a deny, so a worker can only ever do what is already pre-approved and can
+  never escalate. That is a different policy posture, not a different
+  configuration — which argues for a separate tier even though the image would be
+  near-identical.
+- **Should tier 2 ever get governed egress?** Today it has none, which is what
+  makes its boundary evidence so clean. Granting it would make tier 2 a second
+  egress-proxy client and immediately forces the per-client-class question below.
+  Not needed until a worker task needs to fetch something.
+- **Per-client-class policy.** A single global allowlist becomes the union of
+  every client's needs, which erodes least privilege as soon as there is a second
+  consumer — and the approval semantics above mean the postures genuinely differ.
+  The identity primitive should be the **ingress network**, matching this design's
+  existing idiom (topology is provable; source IPs are not, since sandboxes are
+  ephemeral with dynamic addresses). Keep **one** proxy so the audit stream stays
+  single. Cheap step available now: give policy rules and audit rows a
+  client-class dimension even while only one class exists — adding a column to a
+  young schema is free, retrofitting one into accumulated crown-jewel state is not.
+- **Where does worker output go, and is it audited?** An unattended job's output
+  *is* its consequential action, but with no egress there is nothing at the
+  network choke point to log. "Everything consequential is audited" currently has
+  no answer for an agent whose only output is a file.
+- **Unattended blast radius.** Wall-clock, iteration and token budgets are
+  required, not optional — see the 7.4-minute greeting above.
+- **No concrete first task yet.** The worker tier should not be designed further
+  in the abstract.
 
 ## Layout (planned)
 

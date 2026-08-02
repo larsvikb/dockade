@@ -35,7 +35,7 @@ app = FastAPI(title="dockade control-plane UI", version="2b-2")
 
 # timeout=None: the SSE stream (/approvals/stream) is long-lived; other calls are
 # fast. Reused across requests for connection pooling to the backend.
-_client = httpx.AsyncClient(base_url=BACKEND, timeout=None)
+_client = httpx.AsyncClient(base_url=BACKEND, timeout=None)  # noqa: S113 (deliberate — see above)
 
 # Hop-by-hop / framing headers we must not copy through a streaming relay.
 _STRIP_REQ = {"host"}

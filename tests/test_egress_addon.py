@@ -159,9 +159,9 @@ class GuardConfigTests(unittest.TestCase):
         addon._assert_guard_configured()
 
     def test_startup_fails_closed_without_forbidden_cidrs(self):
-        with mock.patch.object(addon, "FORBIDDEN_CIDRS", ()):
-            with self.assertRaises(RuntimeError):
-                addon._assert_guard_configured()
+        with mock.patch.object(addon, "FORBIDDEN_CIDRS", ()), \
+                self.assertRaises(RuntimeError):
+            addon._assert_guard_configured()
 
 
 if __name__ == "__main__":

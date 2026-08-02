@@ -7,7 +7,7 @@
 # not globally, so the proxy image's non-root ending is still checked.
 ignored:
   - DL3008  # pin apt-get versions — impractical for a rolling dev base image
-  - DL3013  # pin pip/pipx versions — ruff floats like Claude Code (rebuild to update)
+  - DL3013  # pin pip/pipx versions — ruff floats like Claude Code (rebuild to update; rule set pinned in ruff.toml)
   # DL3007 (base image :latest) is intentionally NOT ignored: the egress proxy is
   # now pinned to mitmproxy:12.2.3, so a regression back to :latest should trip
   # the gate.

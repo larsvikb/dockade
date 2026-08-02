@@ -22,6 +22,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from typing import ClassVar
 from urllib.parse import urljoin, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,7 +39,7 @@ def _install_stubs() -> None:
 
         class _Resp:
             status_code = 200
-            headers: dict = {}
+            headers: ClassVar[dict] = {}
 
             def aiter_raw(self):
                 async def _gen():
@@ -130,7 +131,7 @@ class _FakeRequest:
     def __init__(self, path_captured: str):
         self.method = "GET"
         self.query_params = {}
-        self.headers = types.SimpleNamespace(items=lambda: [])
+        self.headers = types.SimpleNamespace(items=list)
         self._captured = path_captured
 
     async def body(self) -> bytes:

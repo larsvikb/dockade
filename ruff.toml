@@ -1,0 +1,22 @@
+# Pinned lint rule set (gate: `make lint`, part of `make check`).
+#
+# Ruff's built-in default selection is a moving target — 0.9 enabled ~30 rules,
+# 0.16 enables 400+ — and the binary floats by design (rebuild-to-update, like
+# every pipx tool here; see .hadolint.yaml). Unpinned, the gate's verdict — and
+# even which `noqa` suppressions count as "used" — depends on whichever ruff
+# happens to run it. Pinning the selection makes the verdict a property of the
+# code. Residual drift (rules newly added to these families by a future ruff)
+# is accepted rebuild-to-update churn, same as any other baked tool.
+[lint]
+select = [
+    "E4",   # pycodestyle: import placement (E402 needs a reasoned noqa)
+    "E7",   # pycodestyle: statement pitfalls
+    "E9",   # pycodestyle: syntax/runtime errors
+    "F",    # pyflakes: undefined names, unused imports/vars
+    "I",    # import sorting
+    "S",    # bandit security checks; suppressions must state their reason
+    "BLE",  # no undocumented blind `except Exception` (fail-closed sites get a reasoned noqa)
+    "PIE",  # misc correctness/cleanliness
+    "SIM",  # simplifiable constructs
+    "RUF",  # ruff-native, incl. RUF100: stale suppressions are themselves errors
+]

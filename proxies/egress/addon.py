@@ -280,7 +280,7 @@ def _post_authorize(payload: dict) -> dict:
     ``_authorize``), so blocking here is fine — it never touches the event
     loop."""
     data = json.dumps(payload).encode()
-    req = urllib.request.Request(
+    req = urllib.request.Request(  # noqa: S310 (fixed internal URL)
         AUTHORIZE_URL, data=data,
         headers={"Content-Type": "application/json"}, method="POST")
     with urllib.request.urlopen(req, timeout=CONTROL_TIMEOUT) as resp:  # noqa: S310 (fixed internal URL)

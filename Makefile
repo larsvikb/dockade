@@ -245,4 +245,4 @@ opencode: ## Launch a tier-2 (opencode + local LLM, no egress) sandbox (WORKSPAC
 	./run-opencode-sandbox.sh "$(WORKSPACE)"
 
 boundary: ## Run boundary-check.sh in a running sandbox (SANDBOX=claude-sandbox|opencode-sandbox)
-	docker exec -it "$(SANDBOX)" boundary-check.sh
+	docker exec -it --user sandbox "$(SANDBOX)" boundary-check.sh

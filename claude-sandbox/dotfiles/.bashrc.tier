@@ -1,0 +1,5 @@
+# Tier-1 (Claude) shell additions. Sourced from the shared
+# sandbox-common/dotfiles/.bashrc — keep tier-agnostic settings there.
+
+# Claude — yolo is an explicit, conscious opt-in (not forced by settings)
+alias claude-yolo='claude --dangerously-skip-permissions'

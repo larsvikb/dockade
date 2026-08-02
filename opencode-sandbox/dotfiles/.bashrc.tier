@@ -1,0 +1,11 @@
+# Tier-2 (opencode) shell additions. Sourced from the shared
+# sandbox-common/dotfiles/.bashrc — keep tier-agnostic settings there.
+
+alias oc='opencode'
+
+# Distinguish the tiers at a glance. Both containers use the hostname `sandbox`
+# and the same workspace mount, so without this the two shells are visually
+# identical — and the tiers differ in exactly the way you do not want to be
+# confused about (tier 1 has credentials and governed egress; tier 2 has
+# neither). Overrides the shared prompt, hence sourcing this file last.
+PS1='\[\e[1;36m\][sandbox:oc]\[\e[0m\] \[\e[1;34m\]\w\[\e[0m\]\$ '

@@ -53,10 +53,12 @@ TESTFILES := $(shell git ls-files 'tests/*.py' 2>/dev/null)
 REFFILES := $(SCRIPTS) \
             claude-sandbox/user-settings.json \
             opencode-sandbox/opencode.json \
-            claude-sandbox/dotfiles/.bashrc \
-            claude-sandbox/dotfiles/.vimrc \
-            claude-sandbox/dotfiles/.inputrc \
-            claude-sandbox/dotfiles/.gitconfig \
+            sandbox-common/dotfiles/.bashrc \
+            sandbox-common/dotfiles/.vimrc \
+            sandbox-common/dotfiles/.inputrc \
+            sandbox-common/dotfiles/.gitconfig \
+            claude-sandbox/dotfiles/.bashrc.tier \
+            opencode-sandbox/dotfiles/.bashrc.tier \
             proxies/egress/addon.py \
             control-plane/app.py \
             control-plane/requirements.txt \

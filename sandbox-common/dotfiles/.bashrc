@@ -1,4 +1,7 @@
-# Sandbox .bashrc
+# Sandbox .bashrc — SHARED BY EVERY TIER (sandbox-common/dotfiles/).
+# Anything tier-specific belongs in that tier's .bashrc.tier, sourced at the end
+# of this file, not here. Same rule as the boundary scripts: one shared
+# implementation, per-tier hooks.
 
 # History
 HISTSIZE=10000
@@ -44,10 +47,11 @@ alias rm='rm -i'
 alias mv='mv -i'
 alias cp='cp -i'
 
-# Claude — yolo is an explicit, conscious opt-in (not forced by settings)
-alias claude-yolo='claude --dangerously-skip-permissions'
-
 # Misc
 alias ..='cd ..'
 alias ...='cd ../..'
 alias cls='clear'
+
+# Tier-specific additions (agent aliases, prompt tweaks). Last so a tier can
+# override anything above it.
+[ -f ~/.bashrc.tier ] && . ~/.bashrc.tier

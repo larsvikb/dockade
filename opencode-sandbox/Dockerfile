@@ -24,15 +24,28 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # Everything opencode needs at runtime is therefore baked at BUILD time, where
 # egress is unrestricted (the firewall only arms at container start).
 
-# Baseline. Deliberately leaner than tier 1: no gh (no git remote access without
-# egress), no build-essential (this tier is for evaluating the local model, not
-# compiling). iptables/ipset/dnsutils are required by the shared firewall script.
+# Baseline. Leaner than tier 1 where the omission is principled: no gh and no
+# openssh-client (with no egress there is no git remote to reach), no
+# build-essential, no hadolint/shellcheck (this tier evaluates the local model,
+# it does not lint this repo). iptables/ipset/dnsutils are required by the shared
+# firewall script.
+#
+# python3 IS included, despite the lean intent, because of an asymmetry specific
+# to this tier: with no egress, `pip install` and `npm install` cannot fetch
+# anything at runtime. In tier 1 a missing tool is an inconvenience the agent
+# installs its way out of; here it is a permanent wall, hit mid-task — possibly
+# on an unattended scheduled run with nobody watching. Scripting glue around a
+# local model call is the archetypal job for this tier, and python3 is also what
+# this repo's own `make consistency` shells out to. python3-venv comes along so
+# a vendored wheel can still be installed into an isolated env offline; pip
+# itself is near-inert here and only useful for local wheels.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates \
     git \
     less procps gosu \
     nano vim ripgrep jq \
     iptables ipset iproute2 dnsutils aggregate \
+    python3 python3-venv python3-pip \
     && apt-get clean && rm -rf /var/lib/apt/lists/* \
     && update-alternatives --set editor /usr/bin/vim.basic
 
@@ -105,9 +118,16 @@ COPY opencode-sandbox/opencode.json /etc/opencode/opencode.json
 COPY sandbox-common/init-firewall.sh /usr/local/bin/init-firewall.sh
 COPY sandbox-common/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY sandbox-common/boundary-check.sh /usr/local/bin/boundary-check.sh
+# Dotfiles: the tier-agnostic ones shared with tier 1, plus this tier's hook
+# (the `oc` alias and a prompt that distinguishes the two sandboxes).
+COPY sandbox-common/dotfiles/.bashrc sandbox-common/dotfiles/.vimrc \
+     sandbox-common/dotfiles/.inputrc sandbox-common/dotfiles/.gitconfig /home/$USERNAME/
+COPY opencode-sandbox/dotfiles/.bashrc.tier /home/$USERNAME/.bashrc.tier
 RUN chmod 0644 /etc/opencode/opencode.json \
     && chmod 0755 /usr/local/bin/init-firewall.sh /usr/local/bin/entrypoint.sh \
-                  /usr/local/bin/boundary-check.sh /usr/local/bin/tier-setup.sh
+                  /usr/local/bin/boundary-check.sh /usr/local/bin/tier-setup.sh \
+    && chown $USERNAME:$USERNAME /home/$USERNAME/.bashrc /home/$USERNAME/.bashrc.tier \
+                                 /home/$USERNAME/.vimrc /home/$USERNAME/.inputrc /home/$USERNAME/.gitconfig
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["bash"]

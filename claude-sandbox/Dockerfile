@@ -128,12 +128,15 @@ RUN pipx install ruff \
     && ruff --version \
     && yamllint --version
 
-# Dotfiles.
+# Dotfiles. The tier-agnostic ones are SHARED with tier 2 from sandbox-common/,
+# for the same reason the boundary scripts are: one implementation, no drift.
+# .bashrc.tier is this tier's own hook, sourced at the end of the shared .bashrc.
 # NB: the build context is the REPO ROOT (not claude-sandbox/), so that the
-# shared sandbox-common/ scripts below are reachable — a build context cannot
-# COPY from outside itself. Every COPY source is therefore repo-root-relative.
-COPY claude-sandbox/dotfiles/.bashrc claude-sandbox/dotfiles/.vimrc \
-     claude-sandbox/dotfiles/.inputrc claude-sandbox/dotfiles/.gitconfig /home/$USERNAME/
+# shared sandbox-common/ files are reachable — a build context cannot COPY from
+# outside itself. Every COPY source is therefore repo-root-relative.
+COPY sandbox-common/dotfiles/.bashrc sandbox-common/dotfiles/.vimrc \
+     sandbox-common/dotfiles/.inputrc sandbox-common/dotfiles/.gitconfig /home/$USERNAME/
+COPY claude-sandbox/dotfiles/.bashrc.tier /home/$USERNAME/.bashrc.tier
 
 # Root-owned baked config (user-settings template, status line), firewall, and
 # entrypoint. NB: no managed-settings.json — under org auth Claude Code loads the
@@ -162,7 +165,8 @@ RUN chmod 0644 /etc/claude-code/user-settings.json \
     && chmod 0755 /etc/claude-code/statusline.sh \
     && chmod 0755 /usr/local/bin/init-firewall.sh /usr/local/bin/entrypoint.sh \
                   /usr/local/bin/boundary-check.sh /usr/local/bin/tier-setup.sh \
-    && chown $USERNAME:$USERNAME /home/$USERNAME/.bashrc /home/$USERNAME/.vimrc /home/$USERNAME/.inputrc /home/$USERNAME/.gitconfig
+    && chown $USERNAME:$USERNAME /home/$USERNAME/.bashrc /home/$USERNAME/.bashrc.tier \
+                                 /home/$USERNAME/.vimrc /home/$USERNAME/.inputrc /home/$USERNAME/.gitconfig
 
 # Container starts as root so the entrypoint can set up the firewall,
 # then drops to the non-root user via gosu.

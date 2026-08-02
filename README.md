@@ -25,8 +25,9 @@ socket, and (by design) no route to a control plane.
 > a separate `control-plane-ui` frontend carries the loopback UI). There are now
 > **two sandbox tiers** sharing one boundary implementation: tier 1 (Claude,
 > governed egress) and tier 2 (opencode against a local LLM, no egress and no
-> credentials). Still to come per [`DESIGN.md`](DESIGN.md): the audit browser (2c)
-> and the git/cache data-plane services. See [Roadmap](#roadmap).
+> credentials). Still to come per [`DESIGN.md`](DESIGN.md): audit browsing beyond
+> the UI's recent-decisions table (2c) and the git/cache data-plane services. See
+> [Roadmap](#roadmap).
 
 ## Quickstart
 
@@ -51,7 +52,8 @@ docker compose -f /path/to/dockade/docker-compose.yml up -d --build
 
 Step 1 is optional: without it, `run-claude-sandbox.sh` still runs the sandbox
 **standalone** (direct egress governed by the in-container firewall, no proxy
-audit). With the infra up, the launcher auto-detects the proxy, routes the
+audit). Standalone needs kernel ipset support, which stock WSL2 kernels lack —
+there, bring the infra up and use the proxy path. With the infra up, the launcher auto-detects the proxy, routes the
 sandbox's HTTP(S) through it, and allowlists it in the firewall. You can start
 **several sandboxes** against one proxy — each gets a unique name (override with
 `SANDBOX_NAME`). Audit trail: `docker compose logs -f egress-proxy` (or the
@@ -112,9 +114,10 @@ its own to govern).
   volume at `/config` (isolated from the host's `~/.claude`).
 - **Forwards your host git identity** into the container (it is not baked into
   the image).
-- **Runs the container** as non-root, with `--cap-drop=ALL` plus only the few
-  capabilities the firewall setup needs, `--security-opt no-new-privileges`, and
-  memory/CPU/pids limits.
+- **Runs the agent** as non-root — the container starts as root only to arm the
+  firewall and materialize config, then drops to the `sandbox` user via gosu —
+  with `--cap-drop=ALL` plus only the capabilities that root setup needs,
+  `--security-opt no-new-privileges`, and memory/CPU/pids limits.
 
 There is deliberately **no flag to disable the firewall** — a yolo agent with
 open egress is exactly the state this sandbox exists to prevent.
@@ -125,7 +128,7 @@ open egress is exactly the state this sandbox exists to prevent.
 |-------|-----------|
 | **Network egress** | With the infra up, `sandbox-net` is `internal: true` — the sandbox has **no route to the internet at all**; the only path off-box is the **egress proxy**, dual-homed onto a separate `egress-net`. The proxy enforces a **domain**-level allowlist with per-connection audit (closing the shared-CDN/fronting gap that an IP-level rule can't). The in-container firewall (`init-firewall.sh`) is now **defense-in-depth**: in governed mode it permits only the proxy + embedded DNS, so even if it failed there's no route out. IPv6 fully denied. Without the infra, the launcher falls back to **standalone** mode (non-internal net, direct `ipset` IP-allowlist) for proxy-less use. |
 | **Privilege** | Non-root `sandbox` user; `--cap-drop=ALL` + minimal adds; `no-new-privileges`; no host Docker socket. |
-| **Filesystem** | Only the bind-mounted `/workspace` and the `/config` volume are writable state. |
+| **Filesystem** | Only the bind-mounted `/workspace` and the `/config` volume are *persistent* writable state (the rest of the container filesystem is writable but ephemeral). |
 | **Config** | `CLAUDE_CONFIG_DIR=/config`; user settings are re-materialized from a baked template on every boot, so config always matches the repo and volume wipes lose only credentials/runtime state. |
 
 **Not a containment boundary:** no Claude Code settings file. Under
@@ -142,8 +145,9 @@ enabled in v1; details in [`DESIGN.md`](DESIGN.md).
 **Verifying the boundary:** run `boundary-check.sh` inside the container (as the
 agent) for an on-demand pass/fail check of the invariants — arbitrary egress
 blocked, IPv6 blocked, control plane unreachable, agent holds no capabilities,
-`no_new_privs` set, no Docker socket, plus nine attempts to abuse the egress proxy
-(non-443 CONNECT, SNI fronting, relaying to the control plane or the metadata IP).
+`no_new_privs` set, no Docker socket, plus six attempts to abuse the egress proxy
+(non-443 CONNECT, SNI fronting, relaying to the control plane by name or by IP,
+or to the metadata IP).
 It is **tier-aware**: tier 1 asserts Anthropic is reachable *via the proxy*, tier 2
 asserts it is unreachable and that the inference service is the one destination that
 answers. It exits non-zero on any violation, so it doubles as a regression baseline
@@ -166,7 +170,8 @@ dockade/
   CLAUDE.md                 # invariants + conventions for working in the repo
   DESIGN.md                 # architecture, topology, and rationale (read this)
   Makefile                  # task entry points (make claude / make opencode / make check)
-  docker-compose.yml        # shared infra: egress proxy + control plane + local LLM
+  ruff.toml, .yamllint, .hadolint.yaml, .shellcheckrc   # pinned linter configs (make check)
+  docker-compose.yml        # shared infra: egress proxy + control plane + UI + local LLM
   run-claude-sandbox.sh     # tier 1: build + launch a Claude sandbox (one or many)
   run-opencode-sandbox.sh   # tier 2: build + launch an opencode/local-LLM sandbox
   sandbox-lib.sh            # launcher plumbing shared by both tiers
@@ -180,7 +185,7 @@ dockade/
     index.html              #   live SSE approval console
     requirements.txt        #   pinned deps (fastapi, uvicorn, httpx)
   policies/                 # seed policy config (loaded into the control plane)
-    egress-allowlist.txt    #   default-deny allow seed for the egress proxy
+    egress-allowlist.txt    #   default-deny seed for the control plane's egress policy store
   proxies/                  # governed data-plane services (one dir per proxy)
     egress/                 # CONNECT-level egress proxy: control-plane client
       Dockerfile            #   mitmproxy + the policy/audit addon
@@ -189,16 +194,19 @@ dockade/
     entrypoint.sh           # root: firewall + config, then drops to non-root
     init-firewall.sh        # default-deny egress firewall (governed/local/standalone)
     boundary-check.sh       # on-demand smoke test of the containment boundary
+    dotfiles/               # shared .bashrc / .gitconfig / .inputrc / .vimrc, baked into both tiers
   claude-sandbox/           # TIER 1 image — Claude, governed egress
     Dockerfile
     tier-setup.sh           # tier hook: materialize Claude user settings
     user-settings.json      # baked template, materialized to /config each boot
     statusline.sh           # sandbox-indicator status line
-    dotfiles/               # .bashrc (incl. claude-yolo), .gitconfig, ...
+    dotfiles/               # .bashrc.tier — tier-1 shell hook (claude-yolo alias)
   opencode-sandbox/         # TIER 2 image — opencode + local LLM, no egress
     Dockerfile
     tier-setup.sh           # tier hook: materialize the opencode provider config
     opencode.json           # points opencode at the local `llm` service
+    dotfiles/               # .bashrc.tier — tier-2 shell hook (oc alias, distinct prompt)
+  tests/                    # dependency-free unit tests for the governance logic (make check)
   models/                   # GGUF weights for the local LLM (gitignored)
 ```
 
@@ -225,7 +233,8 @@ exposed through governed data-plane services. Next steps toward it:
    persist-as-rule), defaulting to deny after a timeout (2b-1). The UI is a
    distinct `control-plane-ui` frontend; the backend is `control-net`-only and
    fully internal, reachable only via that frontend or the egress proxy (2b-2).
-   Next: **2c** audit browser + per-proxy config.
+   Next: **2c** audit browsing (filter/search/history beyond the recent-decisions
+   table already in the UI) + per-proxy config.
 3. **Skills + quality-gate hooks** in the image — the enablement half of the
    paved road.
 4. **Pull-through package cache** — fast, governed dependency installs.

@@ -45,7 +45,7 @@ if [[ "$MODE" == "local" && ! "${LLM_IP:-}" =~ ^[0-9.]+$ ]]; then
 fi
 
 # ============================================================
-# Default-deny egress firewall for the Claude sandbox.
+# Default-deny egress firewall, shared by every sandbox tier.
 # Whitelist only. This is the real network boundary; client-side
 # settings (permissions.deny etc.) are steering, not containment.
 # Adapted from Anthropic's Claude Code devcontainer firewall.
@@ -99,8 +99,8 @@ iptables -A OUTPUT -o lo -j ACCEPT
 # moment default-deny arms — every runtime lookup dies. (Init-time resolution in
 # the domain loop below still works: the policy is not ACCEPT->DROP until the
 # end of this script.) The container can't discover those upstreams
-# (resolv.conf hides them behind 127.0.0.11), so run-claude-sandbox.sh computes
-# them on the host and forwards them as UPSTREAM_DNS. Whitelisting those
+# (resolv.conf hides them behind 127.0.0.11), so the launcher (sandbox-lib.sh)
+# computes them on the host and forwards them as UPSTREAM_DNS. Whitelisting those
 # specific IPs keeps the anti-exfiltration narrowing intact (named resolvers,
 # not "any nameserver").
 mapfile -t DNS_SERVERS < <(awk '/^nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null)
@@ -340,14 +340,18 @@ if [ "$MODE" = "local" ]; then
     fi
 elif [ "$USE_IPSET" -eq 1 ]; then
     # Standalone: api.anthropic.com is in the direct allowlist, so it should work.
-    curl --connect-timeout 5 -s https://api.anthropic.com >/dev/null 2>&1 \
-        && echo "  OK — api.anthropic.com reachable (direct)" \
-        || echo "  NOTE — api.anthropic.com not reachable yet (direct)"
+    if curl --connect-timeout 5 -s https://api.anthropic.com >/dev/null 2>&1; then
+        echo "  OK — api.anthropic.com reachable (direct)"
+    else
+        echo "  NOTE — api.anthropic.com not reachable yet (direct)"
+    fi
 else
     # Governed: no direct allowlist — the agent reaches api.anthropic.com through
     # the proxy (it keeps HTTPS_PROXY set), so a DIRECT probe here is EXPECTED to
     # fail. Confirm that; the real lifeline check is boundary-check.sh via the proxy.
-    curl --connect-timeout 5 -s https://api.anthropic.com >/dev/null 2>&1 \
-        && echo "  WARNING: api.anthropic.com reachable DIRECTLY (expected proxy-only)" \
-        || echo "  OK — no direct api.anthropic.com (agent reaches it via the proxy)"
+    if curl --connect-timeout 5 -s https://api.anthropic.com >/dev/null 2>&1; then
+        echo "  WARNING: api.anthropic.com reachable DIRECTLY (expected proxy-only)"
+    else
+        echo "  OK — no direct api.anthropic.com (agent reaches it via the proxy)"
+    fi
 fi

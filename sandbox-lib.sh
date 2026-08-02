@@ -190,9 +190,12 @@ sc_git_identity() {
 #     broken on WSL2 / Docker Desktop (external lookups SERVFAIL even with no
 #     firewall), so pin it explicitly via --dns. That keeps resolv.conf as
 #     127.0.0.11 (sibling-service discovery preserved) while setting ExtServers.
-#   - That forward egresses the in-container firewall's OUTPUT chain, so
-#     init-firewall.sh must whitelist the same IPs on port 53 (passed as
-#     UPSTREAM_DNS) or runtime DNS dies the moment default-deny arms.
+#   - That forward egresses the in-container firewall's OUTPUT chain, so in
+#     STANDALONE mode init-firewall.sh must whitelist the same IPs on port 53
+#     (passed as UPSTREAM_DNS) or runtime DNS dies the moment default-deny arms.
+#     (Governed mode blocks that forward on purpose — proxied tools hand the
+#     hostname to the proxy — and allows only the embedded resolver, which still
+#     answers sibling-container names like the proxy's.)
 # One list for both means the resolver's upstream and the firewall's DNS allowlist
 # can never drift apart. Selection order:
 #   1. An explicit SANDBOX_DNS override, for locked-down / corporate / VPN networks

@@ -21,7 +21,8 @@ opt-in via the `claude-yolo` alias — not forced) with no per-action prompting.
 This is safe **not** because we trust the agent, but because the sandbox is
 deliberately impoverished — and the safety holds regardless of mode:
 
-- no direct network egress
+- no direct network egress (governed mode — the default; the proxy-less
+  standalone fallback keeps a narrow, allowlisted, unaudited direct path)
 - restricted, minimal filesystem
 - non-root user, dropped capabilities, no host Docker socket
 - no route to the control plane (see Networks)
@@ -39,20 +40,24 @@ MCP is out of scope. Capabilities are exposed as skills, not MCP servers.
 ## Architecture
 
 ```
- host browser ──loopback──► CONTROL PLANE ─┐
-                                           │ control-net (internal)
-                        policy / approval  │
-                        / audit / config   │
-        ┌──────────────────────────────────┘
+ host browser ──loopback──► control-plane-ui ──► CONTROL PLANE ─┐
+                            (stateless frontend)                │ control-net
+                                            policy / approval   │ (internal)
+                                            / audit / config    │
+        ┌───────────────────────────────────────────────────────┘
         │
    GOVERNED proxies/tools   (dual-homed: sandbox-net + control-net;
         │   egress ones also on egress-net) ─────────────► internet
         │
 ════════╪═══ sandbox-net (internal) ═══════════════════════════════
         │
-     SANDBOX (Claude, yolo) ──────► UNGOVERNED tools (sandbox-net only, NO egress)
+     SANDBOXES ─────► UNGOVERNED tools (sandbox-net only, NO egress;
+                      e.g. the local-LLM inference service)
 
-     The sandbox has NO route to control-net / the control plane.
+     tier 1: Claude (yolo) — governed egress through the proxy
+     tier 2: opencode + local LLM — NO egress, NO credentials
+
+     No sandbox tier has a route to control-net / the control plane.
 ```
 
 ### Control plane (control path only — agent cannot reach it)
@@ -98,10 +103,12 @@ Claude Code, with yolo available as a conscious opt-in (`claude-yolo`). This
 image is where **enablement** lives:
 - curated toolchain + pre-wired linters / formatters / test runners
 - baseline Claude Code settings and **hooks as quality gates**
-  (e.g. format/test on write, block known-bad patterns)
+  (e.g. format/test on write, block known-bad patterns) — *hooks: planned, not
+  yet in the image (see Build status)*
 - a default **status line** (`claude-sandbox/statusline.sh`, seeded into user
-  settings by the entrypoint — see below)
-- the **skills** that are the sanctioned interface to every capability
+  settings by the tier-1 setup hook the entrypoint runs — see below)
+- the **skills** that are the sanctioned interface to every capability —
+  *planned, not yet in the image*
 - non-root `sandbox` user, resource limits
 
 #### User settings — image-owned config, materialized each boot
@@ -121,8 +128,10 @@ a read-only `chmod` is theater — the owner can re-`chmod` it, or replace it vi
 writable directory. There is no client-side immutability against the agent;
 containment is capability + egress, not file bits or any settings scope.
 
-The default **status line** ships this way. It shows a sandbox indicator, model,
-directory, git branch, and **used context window** (tokens + %). The **script
+The default **status line** ships this way. It shows a sandbox indicator,
+directory, git branch, **used context window** (tokens + %), and 5h/7d
+subscription rate-limit usage with reset countdowns (the model id is read only
+to size the context window, not displayed). The **script
 itself stays root-owned and baked** at `/etc/claude-code/statusline.sh`, so the
 non-root agent can toggle the pointer but not tamper with the code it runs — an
 acceptable trade-off for a cosmetic feature. User-scope delivery (not managed
@@ -160,8 +169,9 @@ latency, not a (nonexistent) network round-trip.
 Git **conventions** are shared and safe to ship, so the baked `~/.gitconfig`
 carries only non-personal defaults (`init.defaultBranch = main`, `pull.rebase =
 true`). Git **identity** is per-person and would make the image host-specific, so
-it is *not* committed. `run-claude-sandbox.sh` reads `user.name`/`user.email` from
-the **host's** git config at launch and forwards them as `GIT_USER_NAME` /
+it is *not* committed. The launcher (`sandbox-lib.sh`, shared by both tiers) reads
+`user.name`/`user.email` from the **host's** git config at launch and forwards
+them as `GIT_USER_NAME` /
 `GIT_USER_EMAIL`; the entrypoint materializes them into the sandbox user's global
 config each boot (same materialize-each-boot pattern as `settings.json`). Keeping
 this at **runtime** rather than build time sidesteps the build-context limit
@@ -171,13 +181,16 @@ changing identity needs no rebuild. If the host has no identity, the launcher
 **warns but does not fail**: the container still starts and git errors only at
 commit time (`Author identity unknown`), which is legible and recoverable.
 
+#### Managed settings are NOT an enforcement lever here
+
 Claude Code's managed-settings tier is **single-source**: when more than one
 managed source exists, one wins and the others are ignored — they do **not**
 merge. Under **organization authentication** (an org-governed Claude account), the
 winning source is Anthropic's **remote** server-managed settings, cached locally
 at `/config/remote-settings.json` and `/config/policy-limits.json` (un-editable by
-the sandbox). The Dockerfile-delivered `/etc/claude-code/managed-settings.json` is
-therefore **not loaded at all** in this configuration.
+the sandbox). The `/etc/claude-code/managed-settings.json` the Dockerfile used to
+deliver was therefore **not loaded at all** in this configuration — and has since
+been removed from the build (see below).
 
 **Verified in the running container:**
 - `/status` reports setting sources as *"User settings, Enterprise managed
@@ -201,9 +214,11 @@ Consequences, now settled:
   `permissions.deny` there stops *accidents* and steers the agent onto the paved
   road, but the yolo agent can edit it or relaunch around it, so it never counts
   against *malicious* intent. Use it freely for ergonomics; never for containment.
+  (No deny ships in the baked template today — it carries only the status line
+  and the disclaimer flag.)
 - **A settings opt-out is not a containment control.** Hardening env flags
-  (`DISABLE_TELEMETRY`, `DO_NOT_TRACK`, and content-export-off
-  `OTEL_LOG_TOOL_CONTENT=0` / `OTEL_LOG_USER_PROMPTS=0`) are set as real process
+  (`DISABLE_TELEMETRY`, `DO_NOT_TRACK`,
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`) are set as real process
   `ENV` — the robust, unshadowable place for them — but they are defense-in-depth,
   not the boundary. Whatever the sandbox didn't configure and can't see coming (a
   telemetry exporter enabled upstream, any other unexpected egress) is stopped by
@@ -214,9 +229,11 @@ Consequences, now settled:
 Skills do double duty: they are the capability interface **and** they encode the
 right *way* to do a task, steering the agent onto the paved road.
 
-## Web access (verified empirically in the current sandbox)
+## Web access (verified empirically in-sandbox)
 
-Tested inside this sandbox's default-deny firewall (iptables + ipset allowlist):
+Tested in the pre-proxy **standalone** posture (default-deny iptables + ipset
+allowlist); the conclusions were re-confirmed under governed mode in the Layer-2
+result below:
 
 | Tool | Executes | Governed by network layer? | Evidence |
 |------|----------|----------------------------|----------|
@@ -258,8 +275,8 @@ Consequences:
   org auth (see "Managed settings are NOT an enforcement lever here", verified). So
   the only real controls are the **org admin console** (server-managed) or
   **removing the capability** by replacing WebSearch with a governed `websearch`
-  skill (below). A user-scope deny is still worth keeping as *accident* prevention,
-  not as containment.
+  skill (below). A user-scope deny remains available as *accident* prevention
+  (none ships in the baked template today), never as containment.
 - **WebFetch** is already network-governed; keep it. It also honors `HTTPS_PROXY`
   (inherits the CLI's proxy env), so it is audited through the egress proxy —
   **verified**: allow/deny CONNECT entries for a fetched allowlisted vs blocked
@@ -270,8 +287,11 @@ Consequences:
   key, routed through the egress proxy. Not planned while WebSearch stays enabled.
 
 ### Reaching the Anthropic API while governing everything else
-The sandbox has no direct internet route (`internal: true`), so Anthropic access
-is a deliberate path, decided one of two ways:
+
+**RESOLVED — (a).** Kept here for the rationale; the confirmation is the Layer-2
+result below. The sandbox has no direct internet route (`internal: true`; the
+proxy-less standalone fallback is the exception), so Anthropic access is a
+deliberate path, decided one of two ways:
 - **(a) Always-allow api.anthropic.com at the egress proxy** and route the CLI
   through it — cleanest, keeps Anthropic traffic audited. The docs say the CLI
   *does* honor `HTTPS_PROXY` for its own API calls (see "Claude Code proxy
@@ -282,7 +302,8 @@ is a deliberate path, decided one of two ways:
   container) permitting only api.anthropic.com directly, dropping the rest —
   forcing all other web through the proxy skill.
 
-Lean (a) so nothing escapes audit; fall back to (b) if the CLI won't proxy.
+The lean was (a) so nothing escapes audit — since confirmed; (b) survives only
+as the standalone (proxy-less) fallback.
 
 ### Claude Code proxy support (documented — Layer 1; CONFIRMED in-sandbox — Layer 2)
 
@@ -299,9 +320,9 @@ committed to (a). Documented points, with the design consequence of each:
   **No SOCKS.** → *Approach (a) is viable: a plain forward proxy injected via
   `HTTPS_PROXY`, no transparent 443-redirect needed.*
 - **WebFetch inherits the same proxy.** The docs describe no separate mechanism,
-  so the client-side WebFetch uses the same env vars (this resolves the
-  "untested" note in the Web access section — still documentation-level, not yet
-  re-tested here). One concrete wrinkle: WebFetch fires a **domain-safety
+  so the client-side WebFetch uses the same env vars — since **confirmed
+  in-sandbox**: the Layer-2 result below shows WebFetch's allow/deny CONNECT
+  entries in the proxy audit log. One concrete wrinkle: WebFetch fires a **domain-safety
   preflight to `api.anthropic.com` on every fetch**, disableable with
   `skipWebFetchPreflight: true`. → *WebFetch becomes auditable at the proxy for
   free once the CLI is proxied.*
@@ -325,8 +346,10 @@ committed to (a). Documented points, with the design consequence of each:
   already inside the GitHub ranges; **`mcp-proxy.anthropic.com`** carries
   claude.ai MCP connectors, which are **on by default** — either disable them
   (`ENABLE_CLAUDEAI_MCP_SERVERS=false`) or they fail closed against our
-  default-deny. The last is the one worth an explicit decision rather than a
-  silent failure.
+  default-deny. **Decision: left to fail closed.** The connectors are unused here
+  (MCP is out of scope — see Core idea), so failing closed costs nothing; set the
+  env only if deny-log noise from `mcp-proxy.anthropic.com` ever becomes a
+  nuisance.
 - **`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` is the right lever** for the
   statsig/feature-flag/telemetry chatter that would otherwise flood the proxy's
   deny log — and the Dockerfile **already sets it**. Good confirmation, not new
@@ -343,9 +366,9 @@ governed mode (`HTTPS_PROXY=http://egress-proxy:8080`, firewall allowing only th
 proxy + embedded DNS), `boundary-check.sh` reported `api.anthropic.com reachable
 (via proxy http://egress-proxy:8080)` — Claude's own API traffic flows through
 the proxy, so the CLI honors `HTTPS_PROXY`. The same run confirmed the proxy
-refuses a non-allowlisted domain (`egress proxy denies non-allowlisted
-example.com`) and that direct egress, IPv6, and direct external DNS are all
-blocked. So (a) stands and the transparent-redirect fallback (b) is not needed.
+refuses a non-allowlisted domain (`egress proxy does not allow non-allowlisted
+example.com (held or denied)` — the wording covers 2b's hold-then-deny path) and
+that direct egress, IPv6, and direct external DNS are all blocked. So (a) stands and the transparent-redirect fallback (b) is not needed.
 WebFetch was separately confirmed: fetching an allowlisted host (`pypi.org`)
 succeeded and a non-allowlisted one (`example.com`) failed with `Socket is
 closed`, and the proxy audit log shows the matching `allow`/`deny` CONNECT
@@ -415,19 +438,21 @@ host-bind-mounted workspace. Dependencies: pull-through cache.
   credential and stays governed (not in the sandbox).
 
 **Ungoverned (sandbox-net only, no independent egress):**
-- **Pull-through package cache** (npm/PyPI/apt). Ungoverned to the agent (fast,
-  free installs); its upstream fetch is governed via the egress proxy. The one
-  tool with upstream reach, and that reach is itself governed.
+- **Pull-through package cache** (npm/PyPI/apt) *(not built yet — see Build
+  status)*. Ungoverned to the agent (fast, free installs); its upstream fetch is
+  governed via the egress proxy. The one tool with upstream reach, and that
+  reach is itself governed.
 - **Toolchain in the sandbox image** — test runner, build, linters, formatters,
   language servers. In-image for v1 (part of the paved road), not separate
   containers yet.
-- **Local scratch DB** (optional v1) — for apps the agent builds during dev.
+- **Local scratch DB** (optional v1, not built) — for apps the agent builds
+  during dev.
 - **Local LLM inference** (`llm-intel` / `llm-nvidia` compose profiles) — an
   OpenAI-compatible `llama-server` on sandbox-net. Ungoverned because it has **no
   egress at all**, not merely a governed one: weights are pre-fetched on the host
   into a read-only mount, so the service never makes an outbound request. Built
-  and verified; **deliberately not yet reachable by the agent** — see "Local
-  inference".
+  and verified; **deliberately not reachable by tier 1** — it is tier 2's one
+  permitted destination. See "Local inference".
 
 **Credentials:**
 - In the sandbox: Anthropic session credentials (must, self-use) — established by
@@ -444,7 +469,7 @@ host-bind-mounted workspace. Dependencies: pull-through cache.
 single project directory, read-write. Because work lands on the host FS directly,
 no separate artifact-export path is needed in v1.
 
-### Clear future improvements
+### Recently completed
 - **DONE — Python unit tests for the governance-critical logic** (`tests/`, wired
   into `make check` via the `test` target). A dependency-free `python -m unittest`
   suite (`fastapi`/`pydantic`/`mitmproxy` stubbed in `tests/_loader.py`, SQLite on
@@ -464,7 +489,9 @@ no separate artifact-export path is needed in v1.
   opaque `403` to the agent as any other deny) can't be asserted there.
 
   The suite was then extended to the **async decision flow** the pure-function
-  tests couldn't reach (65 tests total, still dependency-free): the proxy's
+  tests couldn't reach (68 tests total, still dependency-free — the count
+  includes the two `control-plane-ui` relay host-pinning regression tests that
+  came with the 2b-2 split): the proxy's
   `_authorize` (permanent-lifeline short-circuit with no control-plane call, and
   fail-closed on any control-plane error / non-`allow` decision — `_post_authorize`
   monkeypatched, no network) and the mitmproxy hooks via small `SimpleNamespace`
@@ -482,6 +509,9 @@ no separate artifact-export path is needed in v1.
   (lowercasing, comment/blank skipping, idempotency) are all covered. Remaining
   untested surface is low-weight I/O: `_audit` sinks, `_post_authorize`/`_setup_
   audit_file`, and the SSE `approvals_stream`.
+- **DONE — `control-plane-ui` frontend split** (step 2b-2; see Build status).
+
+### Clear future improvements
 - Dedicated git proxy that speaks the git protocol (block force-push, restrict
   branches, per-repo policy) instead of HTTPS-through-egress.
 - Separate test/build runner containers for isolation + parallelism.
@@ -489,10 +519,6 @@ no separate artifact-export path is needed in v1.
   leave the sandbox.
 - Docs mirror / offline docs tool.
 - Progressive auto-approval driven by accumulated policy + audit history.
-- Split the control-plane UI into a distinct `control-plane-ui` frontend
-  container (own the `control-ui-net` surface; backend returns to
-  `control-net`-only/internal). Planned with 2b — see "Control plane — step 2a
-  shipped" for the rationale.
 - **Split the control-plane API surface to cap the blast radius of any relay-guard
   bypass (planned).** The egress proxy only ever needs `/authorize` (+ `/healthz`);
   the *dangerous* surface is the management API (`/approvals`, `/approvals/{id}/
@@ -543,8 +569,8 @@ never `control-net`/`control-ui-net` (asserted by `make check` and
 
 Putting the sandbox on a *user-defined* network (which we do, and must — it's how
 data-plane services get name resolution) changes DNS in two ways that together
-broke the agent, and the fix spans both `run-claude-sandbox.sh` and
-`init-firewall.sh`. The chain, so nobody has to rediscover it:
+broke the agent, and the fix spans both the launcher plumbing (`sandbox-lib.sh`)
+and `init-firewall.sh`. The chain, so nobody has to rediscover it:
 
 1. **Embedded resolver.** On a user-defined network the container's `resolv.conf`
    is always `127.0.0.11` — Docker's embedded DNS. It answers sibling-container
@@ -561,7 +587,7 @@ broke the agent, and the fix spans both `run-claude-sandbox.sh` and
    stub `127.0.0.53`, which is meaningless inside the container. Result: **every
    external lookup `SERVFAIL`s, with or without the firewall.** This is generic
    Docker behavior, not a broken host (host DNS and the default bridge both work).
-   Fix: `run-claude-sandbox.sh` pins the upstream explicitly with `--dns`, sourced
+   Fix: the launcher (`sandbox-lib.sh`) pins the upstream explicitly with `--dns`, sourced
    from the host's real uplink resolvers (`/run/systemd/resolve/resolv.conf`),
    falling back to public `8.8.8.8/8.8.4.4`, overridable via `SANDBOX_DNS` for
    locked-down networks. `resolv.conf` stays `127.0.0.11`, so service discovery is
@@ -576,18 +602,23 @@ broke the agent, and the fix spans both `run-claude-sandbox.sh` and
      not a containment boundary — egress is governed entirely in the `filter`
      table.)
    - The embedded resolver's upstream forward **egresses the `filter` OUTPUT
-     chain**, so those same upstream IPs must be whitelisted on port 53 (passed in
-     as `UPSTREAM_DNS`) or runtime DNS dies the instant default-deny arms.
+     chain**, so in STANDALONE mode those same upstream IPs must be whitelisted on
+     port 53 (passed in as `UPSTREAM_DNS`) or runtime DNS dies the instant
+     default-deny arms. (Governed mode blocks that forward on purpose — proxied
+     tools hand the hostname to the proxy — and allows only the embedded resolver
+     itself, which still answers sibling names.)
 
-`run-claude-sandbox.sh` computes the resolver list **once** and uses it for both
+`sandbox-lib.sh` computes the resolver list **once** and uses it for both
 `--dns` (the resolver's upstream) and `UPSTREAM_DNS` (the firewall allow-list), so
 the two can't drift apart. Containment is unaffected: `--dns` only sets an
 upstream, DNS is still pinned to *named* resolvers (no "any nameserver" hole), and
-egress remains filter-table default-deny + the ipset allowlist.
+egress remains filter-table default-deny plus the mode's allowlist (ipset in
+standalone; proxy-only in governed).
 
 ## Local inference — an ungoverned LLM tool
 
-**Status: built and verified; not reachable by the agent.** `docker-compose.yml`
+**Status: built and verified; not reachable by tier 1 — it is tier 2's sole
+destination (see "Built — the tier-2 local-model sandbox").** `docker-compose.yml`
 defines `llm-intel` and `llm-nvidia`, both behind compose profiles so neither
 starts with a plain `docker compose up -d`. They serve `llama-server` (an
 OpenAI-compatible API) on sandbox-net at `172.30.0.20:8080`.
@@ -715,7 +746,8 @@ costs nothing here.
   GPU (~331 tok/s prefill solo vs ~22 tok/s with two running).
 - **Prefill throughput decays with depth.** ~331 tok/s for the first 2k tokens,
   ~236 marginal by 6k, as attention cost grows with context. Short-prompt
-  measurements (the 172 tok/s figure from a 277-token request) are dominated by
+  measurements (the ~164 tok/s figure from the 275-token request in the table
+  above) are dominated by
   fixed overhead and overstate the cost of long prompts while understating deep
   ones. Budget roughly half a minute for an 8k prompt.
 - **Overflow should fail, not silently truncate.** `--no-context-shift`: the
@@ -797,7 +829,7 @@ tier can make:
 
 alongside control-plane isolation, IPv6 denied, zero capabilities, `no_new_privs`,
 and no Docker socket. Tier 1 re-verified unchanged after the extraction (15/15,
-including `api.anthropic.com reachable via proxy` and all nine proxy refusals).
+including `api.anthropic.com reachable via proxy` and all six proxy refusals).
 This is the strongest containment evidence the repo has: an agent that can reach
 precisely one thing, holds nothing, and proves both from its own capability-less
 security context.
@@ -854,21 +886,16 @@ control.
 - **No concrete first task yet.** The worker tier should not be designed further
   in the abstract.
 
-## Layout (planned)
+## Layout
+
+See `README.md` → Layout for the current tree. Still-planned additions to it:
 
 ```
 dockade/
-  docker-compose.yml
-  control-plane/      # management app: policy, approval UI, audit, config
-  proxies/            # governed data-plane services (one dir per proxy/tool)
-    egress/
-  tools/              # ungoverned data-plane services
-  claude-sandbox/     # Claude agent image
-    Dockerfile
+  tools/              # ungoverned data-plane services (cache, scratch DB, ...)
+  claude-sandbox/
     skills/           # sanctioned capability + workflow interface
     hooks/            # quality-gate hooks
-    settings/         # baseline Claude Code config
-  policies/           # seed allow/block config
 ```
 
 ## Open decisions
@@ -876,8 +903,8 @@ dockade/
 - **RESOLVED — control-plane stack is Python (FastAPI) over SQLite.** Shipped in
   2a (`control-plane/`): FastAPI app, stdlib `sqlite3` store, plain `def`
   endpoints (FastAPI's threadpool keeps the blocking DB off the event loop). The
-  SSE/websocket approval UI arrives with 2b on the same FastAPI app. `mitmproxy`
-  remains the egress-proxy engine.
+  SSE approval UI shipped with 2b-1 and moved to the separate `control-plane-ui`
+  app in 2b-2. `mitmproxy` remains the egress-proxy engine.
 - **HTTPS inspection depth** — CONNECT/SNI (domain-level, no CA in sandbox) vs
   full MITM (URL/body-level, needs a generated CA in the sandbox). Likely start
   CONNECT-level, allow MITM per-domain later. Both are documented-supported by
@@ -945,8 +972,10 @@ single-container image and launcher centered on this design. Notable properties:
 **Egress proxy — step 0 shipped** (`docker-compose.yml` + `proxies/egress/`). The
 multi-container phase has begun, with a deliberate split the topology relies on:
 `docker-compose.yml` owns the **shared, long-lived infrastructure** (the data
-plane — currently just the egress proxy), and `run-claude-sandbox.sh` still
-launches the **ephemeral sandbox(es)** that attach to it (`docker run -it --rm`,
+plane — the egress proxy at this step; the control plane + UI frontend and the
+profile-gated inference service joined as later steps landed), and the
+`run-*-sandbox.sh` launchers still
+launch the **ephemeral sandbox(es)** that attach to it (`docker run -it --rm`,
 one or many, each per-workspace with its own firewall/DNS/git wiring). Sandboxes
 are intentionally *not* compose services: they are interactive, disposable, and
 plural, which `compose run` models poorly.
@@ -960,9 +989,11 @@ proxy on `sandbox-net`, points the agent's `HTTPS_PROXY` at it (the CLI honors i
 (`EGRESS_PROXY_IP`). Chosen properties: it does **not** weaken the boundary while
 we validate — the allowlist is default-deny from the first commit, so arbitrary
 egress via the proxy is refused (not allow-all), and `boundary-check.sh` stays
-meaningful; and the allowlist is re-read per connection, a cheap stand-in for
-"dynamic" until the control plane exists. Governs by **name**, so it closes the
-shared-CDN/fronting gap the IP firewall can't (for proxied traffic).
+meaningful; and the allowlist was re-read per connection, a cheap stand-in for
+"dynamic" until the control plane existed (2a replaced the baked allowlist
+entirely — the proxy is a control-plane client now, see below). Governs by
+**name**, so it closes the shared-CDN/fronting gap the IP firewall can't (for
+proxied traffic).
 
 **Governed vs standalone egress (the firewall is mode-aware).** When the launcher
 finds the proxy it sets `EGRESS_PROXY_IP`, and `init-firewall.sh` switches to a
@@ -1007,28 +1038,31 @@ governance authority now exists as a service the **agent cannot reach**: it is
 not on `sandbox-net`, so the sandbox has no route to it (`boundary-check.sh`
 probes the control plane's fixed control-net address and asserts it is
 unreachable from the sandbox; `make check` asserts the launcher never attaches
-the sandbox to `control-net`/`control-ui-net`). It sits on `control-net`
-(internal) for the proxy control path and on `control-ui-net` for the human UI.
+the sandbox to `control-net`/`control-ui-net`). In 2a it sat on `control-net`
+(internal) for the proxy control path and on `control-ui-net` for the human UI;
+since 2b-2 the backend is `control-net`-only and the UI frontend carries
+`control-ui-net` (see below).
 That UI bridge is non-internal **by necessity** — Docker cannot publish a host
 port from a container that is on an internal network alone — but has masquerade
 disabled, so it carries the loopback UI publish without being an egress path.
 The control plane is a small FastAPI app over a SQLite policy+audit store (its
-own named volume — the crown-jewel state), with the management surface published
-to **host loopback only** (`127.0.0.1:8081`).
+own named volume — the crown-jewel state); the management surface reaches the
+host as **loopback only** (`127.0.0.1:8081`), published since 2b-2 by the UI
+frontend rather than the backend.
 
-*Design note — why two control nets, and the planned split.* `control-net` stays
+*Design note — why two control nets, and the frontend split.* `control-net` stays
 hard-`internal` because it is the **shared** control path for the whole governed
 data plane (egress proxy today; git/secrets proxies later), and egress is granted
 **only** by `egress-net` membership — a non-internal `control-net` would silently
 hand ungoverned egress to every service on it (see "Networks"). Publishing a host
 port, though, forces *some* non-internal surface, so `control-ui-net` quarantines
-it to a single-member bridge. Honest caveat: with only the control-plane on
-`control-net` today, this split's *present* security gain is ~nil (the control-
-plane carries `control-ui-net`'s soft-egress surface itself), and collapsing to
-one non-internal `control-net` would be observably equivalent now — but it would
-bake in a non-internal shared control path that becomes a real hole the moment a
-must-stay-egress-free tenant (secrets broker) joins. Keeping the split is cheap
-insurance against that footgun. **Done in 2b-2:** the UI is now a **distinct
+it to a single-member bridge. Honest caveat: before 2b-2 — when the backend
+itself carried `control-ui-net`'s soft-egress surface — the split's security
+gain was ~nil, and collapsing to one non-internal `control-net` would have been
+observably equivalent; but that would have baked in a non-internal shared
+control path that becomes a real hole the moment a must-stay-egress-free tenant
+(secrets broker) joins. Keeping the split was cheap insurance against that
+footgun. **Done in 2b-2:** the UI is now a **distinct
 `control-plane-ui` frontend container** (its own lifecycle) that depends on the
 `control-plane` backend and talks to it over `control-net`. The frontend owns the
 `control-ui-net` non-internal surface; the backend is now `control-net`-only and
@@ -1137,17 +1171,20 @@ exfiltrate even if reached. The frontend carries the sole host-facing surface
 `http://localhost:8081` → frontend → backend; the egress proxy still calls the
 backend's `/authorize` directly. See the step-2a design note for the rationale.
 
-Step 2c: the audit-browser UI and per-proxy config surface (rows accumulate
-from 2a).
+Step 2c: audit *browsing* — filter/search/history beyond the live
+recent-decisions table the UI already renders — and the per-proxy config
+surface (rows accumulate from 2a).
 
-Not yet built: audit browser (2c), git/secrets/cache data-plane services,
-skills, quality-gate hooks.
+Not yet built: audit browsing beyond the recent-decisions table (2c),
+git/secrets/cache data-plane services, skills, quality-gate hooks.
 
-**Transitional firewall entries (remove at the proxy/cache phase):** the sandbox
-firewall currently whitelists package registries (npm/PyPI) and GitHub only
-because the data plane that should mediate them doesn't exist yet. In the target
-design the sandbox has *no direct egress* — packages come from the pull-through
-cache (upstream via the egress proxy) and git via the governed git path. Only
-the Anthropic API/auth lifeline is permanent (and even that routes through the
-proxy as an always-allow in the end state). The allowlist is grouped PERMANENT
-vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
+**Transitional allowlist entries (remove at the cache/git phase):** the
+**standalone-mode** firewall allowlist and the control-plane policy seed still
+whitelist package registries (npm/PyPI) and GitHub only because the data plane
+that should mediate them doesn't exist yet. (Governed mode — the default —
+already gives the sandbox no direct egress at all; there the entries live on as
+proxy policy, not firewall rules.) In the target design packages come from the
+pull-through cache (upstream via the egress proxy) and git via the governed git
+path. Only the Anthropic API/auth lifeline is permanent, and it already routes
+through the proxy as an always-allow in governed mode. The allowlist is grouped
+PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.

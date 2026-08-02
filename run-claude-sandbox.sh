@@ -16,9 +16,10 @@
 # in sandbox-lib.sh and is identical for every tier. THIS file owns only tier 1's
 # capability profile — which is deliberately the whole point of the split:
 #
-#   TIER 1 GRANT: Anthropic session credentials (in the config volume),
-#   governed egress through the egress proxy, upstream DNS. No route to the
-#   control plane — sandbox-net only, asserted by `make consistency`.
+#   TIER 1 GRANT: Anthropic session credentials (in the config volume) and
+#   governed egress through the egress proxy (standalone fallback: direct
+#   firewall allowlist + upstream DNS). No route to the control plane —
+#   sandbox-net only, asserted by `make consistency`.
 
 set -euo pipefail
 
@@ -27,7 +28,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/sandbox-lib.sh"
 
 # Image tag to build/run. Override with SANDBOX_IMAGE to A/B-test a variant
-# (e.g. the debian:13-slim base) without clobbering the default `claude-sandbox`.
+# (e.g. an alternate base image) without clobbering the default `claude-sandbox`.
 IMAGE_NAME="${SANDBOX_IMAGE:-claude-sandbox}"
 IMAGE_DIR="claude-sandbox"
 CONFIG_VOLUME="claude-sandbox-config"
@@ -114,7 +115,7 @@ sc_upstream_dns
 echo "Sandbox:   $SC_CONTAINER_NAME (tier 1 — Claude)"
 echo "Workspace: $WORKSPACE -> /workspace"
 echo "Git ident: ${SC_GIT_NAME:-<none>} <${SC_GIT_EMAIL:-none}>"
-echo "DNS upstreams: $SC_UPSTREAM_DNS (pinned via --dns; firewall-whitelisted on :53)"
+echo "DNS upstreams: $SC_UPSTREAM_DNS (pinned via --dns; whitelisted on :53 in standalone mode only)"
 echo "Egress:    $EGRESS_DESC"
 echo ""
 

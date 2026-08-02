@@ -1,5 +1,5 @@
 #!/bin/bash
-# Boundary smoke test for the Claude sandbox.
+# Boundary smoke test, shared by every sandbox tier.
 #
 # Run this INSIDE the container, as the sandbox agent, to assert the v1
 # containment boundary still holds:

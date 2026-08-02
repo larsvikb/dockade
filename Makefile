@@ -5,14 +5,15 @@
 #                   guards that always run + a build-verification that asserts
 #                   every image still builds (skipped when docker is unavailable).
 #                   CI-friendly: non-zero on any failure.
-#   - compose/*     thin wrappers over the shared egress-proxy infrastructure in
+#   - compose/*     thin wrappers over the shared infrastructure (egress proxy +
+#                   control plane + UI, plus the optional llm-* profiles) in
 #                   docker-compose.yml. Sandboxes themselves are NOT compose
 #                   services (they are ephemeral + plural); launch them with
 #                   `make claude` / `make opencode`, one per agent tier.
 #
-# The linters (shellcheck, hadolint, ruff) run from the HOST/CI, not the sandbox
-# image; missing ones are skipped with a note so `make check` still runs the
-# intrinsic consistency guards locally.
+# The linters (shellcheck, hadolint, ruff, yamllint) run wherever `make check`
+# runs — host, CI, or inside the sandbox image, which bakes them; missing ones
+# are skipped with a note so the intrinsic consistency guards still run.
 
 SHELL := bash
 .SHELLFLAGS := -eu -o pipefail -c
@@ -107,17 +108,17 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	  python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$$f" && echo "  ok $$f" \
 	    || { echo "  BAD $$f"; exit 1; }
 	done
-	echo "== domain allowlist drift (firewall ⊆ proxy allowlist) =="
+	echo "== domain allowlist drift (firewall ⊆ control-plane policy seed) =="
 	fw=$$(awk '/ALLOWED_DOMAINS=\(/{f=1;next} f&&/^[[:space:]]*\)/{f=0} f' \
 	         sandbox-common/init-firewall.sh | grep -oE '"[a-z0-9.]+"' | tr -d '"' | sort -u)
 	al=$$(grep -vE '^[[:space:]]*#|^[[:space:]]*$$' policies/egress-allowlist.txt \
 	         | sed 's/^\.//' | sort -u)
 	missing=$$(comm -23 <(printf '%s\n' "$$fw") <(printf '%s\n' "$$al"))
 	if [ -n "$$missing" ]; then
-	  echo "  FAIL: firewall allows hosts the proxy allowlist does not:"
+	  echo "  FAIL: firewall allows hosts the control-plane policy seed does not:"
 	  printf '%s\n' "$$missing" | sed 's/^/    /'; exit 1
 	fi
-	echo "  ok — every firewall host is covered by the proxy allowlist"
+	echo "  ok — every firewall host is covered by the control-plane policy seed"
 	echo "== context-window agreement (server -c == opencode limit.context) =="
 	# Two numbers in two files that must match. If the server's window is SMALLER
 	# than what opencode believes, opencode packs a prompt the server rejects
@@ -204,13 +205,13 @@ verify-build: ## Assert every image still builds (skipped if docker unavailable)
 
 # ── shared infrastructure (docker-compose.yml) ──────────────────────────────
 
-up: ## Bring up the shared infra (egress proxy), building if needed
+up: ## Bring up the shared infra (egress proxy + control plane + UI), building if needed
 	$(COMPOSE) up -d --build
 
-down: ## Stop the shared infra (keeps the egress-audit volume)
+down: ## Stop the shared infra (keeps the named volumes)
 	$(COMPOSE) down
 
-destroy: ## Stop infra AND delete the egress-audit volume (destructive)
+destroy: ## Stop infra AND delete BOTH volumes: egress audit log + control-plane policy/audit store (destructive)
 	$(COMPOSE) down -v
 
 rebuild: ## Rebuild every image from scratch — proxy + control plane + UI + both sandbox tiers — then recreate the infra

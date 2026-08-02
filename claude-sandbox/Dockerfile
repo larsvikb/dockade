@@ -61,7 +61,7 @@ RUN arch="$(dpkg --print-architecture)" \
 # bind-mounted workspaces writable from both sides (WSL drvfs presents
 # Windows-drive files as the host uid; a mismatch leaves the agent read-only on
 # its own workspace). USER_UID/USER_GID default to 1000 and are set from the host
-# by run-claude-sandbox.sh; override for a different host uid.
+# by the launcher (sandbox-lib.sh); override for a different host uid.
 ARG USERNAME=sandbox
 ARG USER_UID=1000
 ARG USER_GID=1000

@@ -87,7 +87,7 @@ def _install_fastapi_stub() -> None:
     class BaseModel:
         """Enough of pydantic for the control plane's request/response models to
         be constructed directly in tests: apply class-declared field defaults
-        (annotations that have a value, e.g. ``audit: bool = True``) first, then
+        (annotations that have a value, e.g. ``port: int | None = None``) first, then
         override with kwargs. Fields without a default that aren't passed stay
         unset (accessing one raises, mirroring a required field)."""
 

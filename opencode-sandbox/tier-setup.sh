@@ -23,9 +23,9 @@ install -o "$USERNAME" -g "$USERNAME" -m 0644 \
     /etc/opencode/opencode.json \
     "$CONFIG_DIR/opencode/opencode.json"
 
-# opencode reads its user-scope config from XDG_CONFIG_HOME. Point that at the
-# persistent volume so session state survives container churn, and so the config
-# above is the one it actually loads.
+# opencode reads its user-scope config from ~/.config/opencode (the XDG default;
+# nothing here overrides it). Symlink that at the persistent volume so session
+# state survives container churn, and so the config above is the one it loads.
 install -d -o "$USERNAME" -g "$USERNAME" -m 0755 "/home/$USERNAME/.config"
 ln -sfn "$CONFIG_DIR/opencode" "/home/$USERNAME/.config/opencode"
 chown -h "$USERNAME:$USERNAME" "/home/$USERNAME/.config/opencode"

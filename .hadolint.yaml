@@ -3,7 +3,7 @@
 # These images are rebuild-to-update (auto-update is disabled; you rebuild to get
 # new versions), so the version-pinning nags below don't buy reproducibility we
 # rely on — they'd only add churn. Everything else stays ON; DL3002 (last USER
-# root) is intentional in claude-sandbox/Dockerfile and is ignored inline THERE,
+# root) is intentional in both sandbox Dockerfiles and is ignored inline THERE,
 # not globally, so the proxy image's non-root ending is still checked.
 ignored:
   - DL3008  # pin apt-get versions — impractical for a rolling dev base image

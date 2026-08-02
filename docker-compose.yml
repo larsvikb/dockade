@@ -1,12 +1,12 @@
 name: dockade
 
-# Shared, long-lived INFRASTRUCTURE (data plane) for the Claude sandbox(es).
+# Shared, long-lived INFRASTRUCTURE (data plane) for the sandbox tiers.
 # Bring it up once:
 #     docker compose up -d --build
-# then start one or more sandboxes against it with run-claude-sandbox.sh.
+# then start one or more sandboxes against it with run-*-sandbox.sh.
 #
 # The sandbox containers are intentionally NOT defined here. They are ephemeral,
-# per-workspace, and possibly many; run-claude-sandbox.sh launches each one
+# per-workspace, and possibly many; the run-*-sandbox.sh launchers start each one
 # (`docker run -it --rm`) attached to sandbox-net below, so it keeps its
 # interactive TTY, its host-matched uid/gid, and its per-launch DNS/git wiring.
 # This file owns only the infrastructure they all share.
@@ -16,7 +16,7 @@ networks:
   # on it. The sandbox lives ONLY here, so it has no possible direct egress even
   # if its in-container firewall failed — the egress proxy (dual-homed below) is
   # the sole way off-box. The fixed subnet gives the proxy a stable IP the
-  # sandbox firewall allowlists. (control-net arrives with the control plane.)
+  # sandbox firewall allowlists.
   sandbox-net:
     name: sandbox-net
     driver: bridge
@@ -189,10 +189,10 @@ services:
   # firewall's /32 allow are identical whichever accelerator the host has. Enabling
   # both profiles at once is an address conflict, and is meant to be.
   #
-  # NOT REACHABLE BY THE AGENT YET. Sibling containers on sandbox-net hit the
-  # sandbox firewall's default REJECT (see the multi-container NOTE in
-  # sandbox-common/init-firewall.sh). Wiring that up needs an explicit per-service
-  # /32 allow in the firewall plus launcher discovery, mirroring EGRESS_PROXY_IP.
+  # Reachable ONLY by tier 2 (run-opencode-sandbox.sh): its launcher discovers
+  # this service's IP and the firewall's LOCAL mode grants that single /32 — it is
+  # tier 2's one permitted destination (see sandbox-common/init-firewall.sh).
+  # Tier 1 sandboxes hit the firewall's default REJECT for it, on purpose.
   llm-intel:
     profiles:
       - llm-intel

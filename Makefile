@@ -213,10 +213,22 @@ down: ## Stop the shared infra (keeps the egress-audit volume)
 destroy: ## Stop infra AND delete the egress-audit volume (destructive)
 	$(COMPOSE) down -v
 
-rebuild: ## Tear down infra and rebuild every image from scratch — proxy + control plane + UI + both sandbox tiers (run `make up` after)
-	$(COMPOSE) down
+rebuild: ## Rebuild every image from scratch — proxy + control plane + UI + both sandbox tiers — then recreate the infra
+	# Deliberately does NOT `down` first. A build touches no running container, so
+	# taking the governance plane offline for the whole --no-cache build bought
+	# nothing and cost real downtime; the only unavoidable interruption is the
+	# container recreate at the end, which `up -d` does in seconds. It also avoids
+	# a trap: `compose down` acts on the whole project and can stop profile-gated
+	# services (the local LLM), which the following `up -d` would NOT restart,
+	# because their profile is not active.
+	#
+	# Sandbox images are rebuilt but not relaunched — they are ephemeral
+	# (`docker run --rm`) and per-workspace, so a running session keeps the image
+	# it started with and the next `make claude` / `make opencode` picks up the new
+	# one. Nothing to recreate.
 	$(COMPOSE) build --no-cache
 	for launcher in $(LAUNCHERS); do "./$$launcher" --build-only --no-cache; done
+	$(COMPOSE) up -d
 
 logs-ep: ## Follow the egress-proxy log — the live per-connection audit stream
 	$(COMPOSE) logs -f egress-proxy

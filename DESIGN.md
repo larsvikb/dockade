@@ -490,11 +490,11 @@ no separate artifact-export path is needed in v1.
   opaque `403` to the agent as any other deny) can't be asserted there.
 
   The suite was then extended to the **async decision flow** the pure-function
-  tests couldn't reach (**100 tests total**, still dependency-free — the count
+  tests couldn't reach (**105 tests total**, still dependency-free — the count
   includes the `control-plane-ui` relay host-pinning regression tests that came
   with the 2b-2 split, the mapped-IPv6 relay-guard regression suite, and the
-  frontend's Host / cross-origin / relay-allowlist / provenance guards plus the
-  fresh-schema guard on the provenance column): the proxy's
+  frontend's Host / cross-origin / relay-allowlist / provenance guards, the
+  standing-policy rules view, and the fresh-schema guard on the provenance column): the proxy's
   `_authorize` (permanent-lifeline short-circuit with no control-plane call, and
   fail-closed on any control-plane error / non-`allow` decision — `_post_authorize`
   monkeypatched, no network) and the mitmproxy hooks via small `SimpleNamespace`
@@ -522,18 +522,20 @@ no separate artifact-export path is needed in v1.
   leave the sandbox.
 - Docs mirror / offline docs tool.
 - Progressive auto-approval driven by accumulated policy + audit history.
-- **Rule management / revocation on the control plane.** Today rules can be GRANTED
-  (a `*_persist` resolution writes one) but never listed, edited or removed: there is
-  no rule endpoint, and the seed file is re-read only when the table is empty, so a
-  mistaken persist is permanent short of hand-editing SQLite in the volume. Two
-  sharp edges come with it — `resolve` persists the **agent-controlled** host string
-  verbatim as a pattern, so a request for `.evil.com` turns one approval into a
-  *subdomain wildcard* (`_match` treats a leading dot that way); and the
-  `INSERT OR IGNORE` means `deny_persist` silently writes nothing when a pattern
-  already exists while still reporting `persisted: true`. A governance plane that
-  can grant but not revoke is incomplete; pair the CRUD with validating that a
-  persisted pattern is a bare hostname and making wildcard-vs-exact an explicit
-  operator choice in the UI.
+- **Rule MUTATION / revocation on the control plane** (listing is now done — see
+  "Standing policy" below). Rules can be GRANTED — a `*_persist` resolution writes
+  one — but still never edited or removed: there is no mutating rule endpoint, and
+  the seed file is re-read only when the table is empty, so a mistaken persist is
+  permanent short of hand-editing SQLite in the volume. Two sharp edges come with it
+  — `resolve` persists the **agent-controlled** host string verbatim as a pattern, so
+  a request for `.evil.com` turns one approval into a *subdomain wildcard* (`_match`
+  treats a leading dot that way; the rules view now at least NAMES that scope, but
+  does not prevent it); and the `INSERT OR IGNORE` means `deny_persist` silently
+  writes nothing when a pattern already exists while still reporting
+  `persisted: true` — reachable because retrying clients routinely produce two holds
+  for one host. A governance plane that can grant but not revoke is incomplete; pair
+  the mutation API with validating that a persisted pattern is a bare hostname and
+  making wildcard-vs-exact an explicit operator choice at approval time.
 - **Human-presence on approval (WebAuthn user-presence, or an out-of-band confirm).**
   The *only* thing that closes host-local forgery of an approval — see the
   browser-facing-guards note under "Frontend split". Worth building for that
@@ -1387,6 +1389,22 @@ deliberate *later* decision, and it should be taken for this specific threat rat
 than for "the UI has no auth" in general. Ceiling worth stating plainly: while the
 bind mount exists and the approval surface must be reachable by a human who is on
 the host, no purely host-side control survives host code execution.
+
+**Standing policy is now visible in the UI (`GET /api/rules`).** The UI showed
+pending approvals and recent decisions but never the **rules** — the thing that
+actually decides every request. So answering "what have I permanently allowed?" meant
+`docker compose exec` plus SQL against the volume, and in practice rules accumulated
+across weeks unseen. Policy that is invisible drifts, and every `*_persist` approval
+writes to it, so the read-only view is the small half of the rule-management item and
+removes most of its risk. Three deliberate choices: **unpaginated**, because a
+silently truncated view of policy is worse than none (the opposite of `/api/audit`,
+which is capped precisely because it grows without bound); **blocks listed first**, so
+the listing reads in the same precedence order `_decide` applies rather than
+alphabetically; and the **match scope named in words** (`host + subdomains` vs
+`exact host`, derived by `_pattern_scope` beside the `_match` that implements it, so
+the frontend cannot drift from the real semantics) — because a leading-dot wildcard
+otherwise looks exactly like an ordinary hostname in a list. Read-only on purpose:
+this makes policy reviewable, it does not add mutation.
 
 **Approval provenance — detection where prevention is not available.** Given that
 ceiling, the frontend and backend at least make a forged approval *visible*. The

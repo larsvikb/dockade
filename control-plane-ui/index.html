@@ -41,8 +41,14 @@
   th { color: var(--dim); font-weight: 500; }
   .tag { font-size: 11px; padding: 1px 6px; border-radius: 4px; font-weight: 600; }
   .tag.allow { color: var(--allow); } .tag.deny { color: var(--deny); }
+  .tag.block { color: var(--deny); }
   .tag.hold { color: var(--hold); }
   .ts { color: var(--dim); white-space: nowrap; }
+  h2 .note { text-transform: none; letter-spacing: 0; font-weight: 400; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  /* A leading-dot pattern is a SUBDOMAIN WILDCARD that looks like a hostname, so
+     the scope is spelled out rather than left to the reader to spot. */
+  .wild { color: var(--hold); }
 </style>
 </head>
 <body>
@@ -60,9 +66,24 @@
     <thead><tr><th>time</th><th>decision</th><th>host</th><th>reason</th></tr></thead>
     <tbody id="audit"></tbody>
   </table>
+
+  <h2>Standing policy <span class="note" id="rulecount"></span></h2>
+  <div class="empty" id="rulesnote">
+    Every request is decided by these rules before anything is held. Read-only here —
+    rules are written by &ldquo;+ persist&rdquo; approvals and by the seed file, and
+    removing one currently needs direct access to the store.
+  </div>
+  <table>
+    <thead><tr><th>action</th><th>pattern</th><th>matches</th><th>source</th>
+      <th>added</th></tr></thead>
+    <tbody id="rules"></tbody>
+  </table>
 </main>
 <script>
   const fmt = ts => new Date(ts * 1000).toLocaleTimeString();
+  // Rules persist for weeks, so this one keeps the DATE. (A time-only stamp on
+  // long-lived rows reads as out-of-order the moment they span midnight.)
+  const fmtDay = ts => new Date(ts * 1000).toLocaleString();
   const esc = s => (s ?? "").toString().replace(/[&<>"]/g,
     c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
@@ -85,6 +106,9 @@
       card.querySelectorAll("button").forEach(b => b.disabled = false);
     }
     refreshAudit();
+    // A "+ persist" action just changed standing policy, so show that immediately
+    // rather than up to a poll interval later.
+    refreshRules();
   }
 
   function renderPending(list) {
@@ -118,6 +142,23 @@
     } catch (e) { /* transient; next poll retries */ }
   }
 
+  async function refreshRules() {
+    try {
+      const rows = await (await fetch("/api/rules")).json();
+      document.getElementById("rulecount").textContent =
+        rows.length ? `· ${rows.length} rule${rows.length === 1 ? "" : "s"}` : "· none";
+      document.getElementById("rules").innerHTML = rows.map(r => {
+        const wild = (r.pattern || "").startsWith(".");
+        return `<tr>
+          <td><span class="tag ${esc(r.action)}">${esc(r.action)}</span></td>
+          <td><code>${esc(r.pattern)}</code></td>
+          <td class="${wild ? "wild" : "ts"}">${esc(r.scope)}</td>
+          <td class="ts">${esc(r.source)}</td>
+          <td class="ts">${r.created_at ? fmtDay(r.created_at) : ""}</td></tr>`;
+      }).join("");
+    } catch (e) { /* transient; next poll retries */ }
+  }
+
   const conn = document.getElementById("conn");
   const es = new EventSource("/approvals/stream");
   es.onopen = () => { conn.textContent = "live"; conn.className = "up"; };
@@ -125,7 +166,12 @@
   es.addEventListener("pending", e => renderPending(JSON.parse(e.data)));
 
   refreshAudit();
+  refreshRules();
   setInterval(refreshAudit, 4000);
+  // Rules change rarely, but polling them keeps a "+ persist" visible immediately
+  // after the click that wrote it — the whole point being that standing policy is
+  // never something you have to go looking for.
+  setInterval(refreshRules, 4000);
 </script>
 </body>
 </html>

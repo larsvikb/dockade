@@ -15,7 +15,9 @@ The authorize flow (one call from the proxy, `POST /authorize`):
 
 A human resolves holds over the approvals API (GET /approvals, the SSE stream at
 /approvals/stream, and POST /approvals/{id}/resolve), surfaced by the separate
-control-plane-ui frontend; the backend serves no HTML itself:
+control-plane-ui frontend; the backend serves no HTML itself. Two read-only views
+back the rest of that UI: GET /api/audit (recent decisions) and GET /api/rules (the
+standing policy — see ``api_rules`` for why that one has to be visible):
   - allow-once / deny-once     — decide just this request
   - allow-persist / deny-persist — also write a rule so future connections skip
     the hold (progressive trust; DESIGN.md "auto-approve progressively more").
@@ -177,6 +179,18 @@ def _match(host: str, pattern: str) -> bool:
     if pattern.startswith("."):
         return host == pattern[1:] or host.endswith(pattern)
     return host == pattern
+
+
+def _pattern_scope(pattern: str) -> str:
+    """How broadly a stored pattern matches, in words, for the rules view.
+
+    Derived HERE, beside the ``_match`` that implements it, so the UI cannot drift
+    from the real semantics. It matters because a leading dot is a SUBDOMAIN WILDCARD
+    while looking like an ordinary hostname: a rule persisted for ``.example.com``
+    also grants every subdomain, and nothing in the approval flow says so (the
+    pattern comes verbatim from the requested host — see the rule-management item in
+    DESIGN.md). Naming the scope is the cheap half of that fix."""
+    return "host + subdomains" if pattern.startswith(".") else "exact host"
 
 
 def _decide(host: str) -> tuple[str, str]:
@@ -504,6 +518,33 @@ def api_audit(limit: int = 50) -> list[dict]:
             "SELECT ts, decision, stage, host, reason FROM audit "
             "ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
     return [dict(r) for r in rows]
+
+
+@app.get("/api/rules")
+def api_rules() -> list[dict]:
+    """Read-only view of the policy store — the rules that decide every request.
+
+    Exists because standing policy was INVISIBLE from the interface built to govern
+    it: the UI showed pending approvals and recent decisions, but never the rules, so
+    answering "what have I permanently allowed?" meant `docker compose exec` and SQL
+    against the volume. Policy that accumulates unseen drifts, and a `*_persist`
+    approval writes to it with no way to review the result.
+
+    Deliberately UNPAGINATED: this is the complete policy, and a silently truncated
+    view of it would be worse than none — the whole point is that nothing standing is
+    hidden. Rules are operator/seed-created and bounded in practice, unlike the audit
+    table (which is capped for exactly the opposite reason: it grows without bound and
+    nobody needs all of it at once).
+
+    Ordered blocks first, because block wins over allow in ``_decide`` — the listing
+    reads in precedence order rather than alphabetically. Read-only on purpose: this
+    change makes policy visible, it does not add mutation (see the rule-management
+    item in DESIGN.md for what revocation still needs)."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT pattern, action, source, created_at FROM rules "
+            "ORDER BY action DESC, pattern").fetchall()
+    return [dict(r, scope=_pattern_scope(r["pattern"])) for r in rows]
 
 
 @app.get("/status", response_class=PlainTextResponse)

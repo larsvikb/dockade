@@ -265,6 +265,50 @@ class ProvenanceTests(_CPTestCase):
         self.assertNotIn("peer=", resp.reason)
 
 
+class RulesViewTests(_CPTestCase):
+    """``/api/rules`` exists so standing policy is not invisible from the UI that
+    governs it. It is the complete policy, in precedence order, with the wildcard
+    semantics spelled out."""
+
+    def test_lists_every_rule_with_source_and_scope(self):
+        _set_rules([("example.com", "allow"), ("bad.com", "block"),
+                    (".github.com", "allow")])
+        rows = cp.api_rules()
+        self.assertEqual(len(rows), 3)
+        by_pattern = {r["pattern"]: r for r in rows}
+        self.assertEqual(by_pattern["example.com"]["action"], "allow")
+        self.assertEqual(by_pattern["bad.com"]["action"], "block")
+        # Every row carries where it came from, so seed and operator rules are
+        # distinguishable in the listing.
+        self.assertEqual(by_pattern["example.com"]["source"], "test")
+
+    def test_blocks_are_listed_first_because_block_wins(self):
+        _set_rules([("aaa-allow.com", "allow"), ("zzz-block.com", "block")])
+        actions = [r["action"] for r in cp.api_rules()]
+        # Alphabetically 'allow' < 'block' and aaa- < zzz-, so a naive ordering would
+        # invert this. The listing must read in DECISION precedence order.
+        self.assertEqual(actions, ["block", "allow"])
+
+    def test_wildcard_scope_is_named_not_left_to_the_reader(self):
+        # A leading dot is a subdomain wildcard that LOOKS like a hostname — the
+        # thing that makes an over-broad persisted rule easy to miss.
+        _set_rules([(".example.com", "allow"), ("example.com", "allow")])
+        scope = {r["pattern"]: r["scope"] for r in cp.api_rules()}
+        self.assertEqual(scope[".example.com"], "host + subdomains")
+        self.assertEqual(scope["example.com"], "exact host")
+
+    def test_scope_agrees_with_the_matcher_that_implements_it(self):
+        # Guard against the label drifting from _match's real behaviour.
+        self.assertTrue(cp._match("sub.example.com", ".example.com"))
+        self.assertFalse(cp._match("sub.example.com", "example.com"))
+        self.assertEqual(cp._pattern_scope(".example.com"), "host + subdomains")
+        self.assertEqual(cp._pattern_scope("example.com"), "exact host")
+
+    def test_empty_policy_is_an_empty_list_not_an_error(self):
+        _set_rules([])
+        self.assertEqual(cp.api_rules(), [])
+
+
 class FreshSchemaTests(unittest.TestCase):
     """A brand-new store must carry ``resolved_by`` from the DDL itself.
 

@@ -99,6 +99,7 @@ _RELAY_ROUTES = (
     ("GET", re.compile(r"^/approvals/stream$")),
     ("POST", re.compile(r"^/approvals/[A-Za-z0-9._-]{1,128}/resolve$")),
     ("GET", re.compile(r"^/api/audit$")),
+    ("GET", re.compile(r"^/api/rules$")),
     ("GET", re.compile(r"^/status$")),
 )
 

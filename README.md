@@ -92,7 +92,13 @@ makes it both a genuinely offline agent and the sharpest test of the boundary �
 # put a GGUF in ./models, set DOCKADE_LLM_MODEL in .env, then:
 docker compose --profile llm-intel up -d llm-intel    # Intel/WSL (SYCL)
 docker compose --profile llm-nvidia up -d llm-nvidia  # NVIDIA (CUDA)
+docker compose --profile llm-vulkan up -d llm-vulkan  # AMD or Intel, native Linux
 ```
+
+The three are mutually exclusive — they share one address and one `llm` alias, so
+the agent's endpoint is `http://llm:8080` whatever the host has. `llm-vulkan` also
+needs `DOCKADE_RENDER_GID` (the host gid owning `/dev/dri/renderD128`) and is the
+one variant not yet verified on hardware.
 
 See [`DESIGN.md`](DESIGN.md) → *Local inference* for the accelerator setup,
 measured throughput, and why the LLM service is ungoverned (it has no egress of

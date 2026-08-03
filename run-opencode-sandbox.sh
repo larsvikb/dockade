@@ -85,9 +85,9 @@ LLM_NAME="${LLM_NAME:-llm}"
 LLM_PORT="${LLM_PORT:-8080}"
 LLM_IP="$(sc_service_ip "$LLM_NAME" "$SANDBOX_NET")"
 if [[ ! "$LLM_IP" =~ ^[0-9.]+$ ]]; then
-    # The alias `llm` is shared by both accelerator profiles, so resolve the
+    # The alias `llm` is shared by every accelerator profile, so resolve the
     # concrete container behind it for the address lookup.
-    for candidate in llm-intel llm-nvidia; do
+    for candidate in llm-intel llm-nvidia llm-vulkan; do
         LLM_IP="$(sc_service_ip "$candidate" "$SANDBOX_NET")"
         [[ "$LLM_IP" =~ ^[0-9.]+$ ]] && { LLM_NAME="$candidate"; break; }
     done
@@ -96,8 +96,9 @@ if [[ ! "$LLM_IP" =~ ^[0-9.]+$ ]]; then
     echo "ERROR: no local inference service found on $SANDBOX_NET." >&2
     echo "       Tier 2 has no egress and no other capability — it cannot run" >&2
     echo "       without a model. Start one first:" >&2
-    echo "         docker compose --profile llm-intel  up -d llm-intel" >&2
-    echo "         docker compose --profile llm-nvidia up -d llm-nvidia" >&2
+    echo "         docker compose --profile llm-intel  up -d llm-intel   # Intel/WSL" >&2
+    echo "         docker compose --profile llm-nvidia up -d llm-nvidia  # NVIDIA" >&2
+    echo "         docker compose --profile llm-vulkan up -d llm-vulkan  # AMD/Intel, native Linux" >&2
     exit 1
 fi
 

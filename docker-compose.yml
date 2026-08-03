@@ -292,14 +292,15 @@ services:
   # service on the internal network. The sandbox keeps zero direct device access,
   # so the "never give the sandbox a direct path to anything" invariant holds.
   #
-  # Accelerator-specific, so both variants are behind compose PROFILES and
-  # neither starts with a plain `docker compose up -d`:
-  #     docker compose --profile llm-intel  up -d    # Intel Arc / Xe (WSL2)
+  # Accelerator-specific, so every variant is behind a compose PROFILE and none
+  # starts with a plain `docker compose up -d`:
+  #     docker compose --profile llm-intel  up -d    # Intel Arc / Xe (WSL2, SYCL)
   #     docker compose --profile llm-nvidia up -d    # NVIDIA (CUDA)
-  # They are MUTUALLY EXCLUSIVE: both bind the same sandbox-net address and the
-  # same `llm` alias on purpose, so the agent's endpoint (http://llm:8080) and the
-  # firewall's /32 allow are identical whichever accelerator the host has. Enabling
-  # both profiles at once is an address conflict, and is meant to be.
+  #     docker compose --profile llm-vulkan up -d    # AMD or Intel (native Linux)
+  # They are MUTUALLY EXCLUSIVE: all three bind the same sandbox-net address and
+  # the same `llm` alias on purpose, so the agent's endpoint (http://llm:8080) and
+  # the firewall's /32 allow are identical whichever accelerator the host has.
+  # Enabling two profiles at once is an address conflict, and is meant to be.
   #
   # Reachable ONLY by tier 2 (run-opencode-sandbox.sh): its launcher discovers
   # this service's IP and the firewall's LOCAL mode grants that single /32 — it is
@@ -340,6 +341,17 @@ services:
     # the image ships. `-l` gives a login shell, whose PATH omits /app, so the
     # binary is called by absolute path.
     #
+    # DOCKADE_LLM_MODEL takes an obviously-bogus DEFAULT rather than compose's `:?`
+    # required form, because compose interpolates the WHOLE FILE BEFORE profiles
+    # select services — verified: with the variable empty, `docker compose up -d`
+    # (no profile) failed on `services.llm-intel.entrypoint` and refused to start the
+    # three infra services. A `:?` in a profile-gated service is therefore a
+    # whole-project requirement, which is exactly what profiles are supposed to
+    # prevent. The default keeps the failure where it belongs — llama-server exits
+    # naming the variable, and only if you actually start an llm-* profile. Cost of
+    # this shape: `restart: unless-stopped` will crash-loop that container instead of
+    # failing once, so read the log rather than assuming the image is broken.
+    #
     # --jinja is REQUIRED for tool calling (the template emits the tool-call
     # format). --reasoning defaults to `off` here because llama-server's own
     # default is `auto`, which on Qwen3.5 means thinking-on: a trivial prompt
@@ -373,7 +385,7 @@ services:
       - >
         export LD_LIBRARY_PATH=/usr/lib/wsl/lib:/app:$$LD_LIBRARY_PATH;
         exec /app/llama-server --host 0.0.0.0 --port 8080
-        -m /models/${DOCKADE_LLM_MODEL:?set it to a GGUF filename inside DOCKADE_MODELS_DIR, e.g. in a .env file}
+        -m /models/${DOCKADE_LLM_MODEL:-DOCKADE_LLM_MODEL-is-unset.gguf}
         -ngl ${DOCKADE_LLM_NGL:-99} -c ${DOCKADE_LLM_CTX:-32768} --jinja --no-context-shift
         --parallel ${DOCKADE_LLM_SLOTS:-1}
         --reasoning ${DOCKADE_LLM_REASONING:-off}
@@ -447,7 +459,7 @@ services:
       - -lc
       - >
         exec /app/llama-server --host 0.0.0.0 --port 8080
-        -m /models/${DOCKADE_LLM_MODEL:?set it to a GGUF filename inside DOCKADE_MODELS_DIR, e.g. in a .env file}
+        -m /models/${DOCKADE_LLM_MODEL:-DOCKADE_LLM_MODEL-is-unset.gguf}
         -ngl ${DOCKADE_LLM_NGL:-99} -c ${DOCKADE_LLM_CTX:-32768} --jinja --no-context-shift
         --parallel ${DOCKADE_LLM_SLOTS:-1}
         --reasoning ${DOCKADE_LLM_REASONING:-off}
@@ -469,6 +481,114 @@ services:
     # identically; the shared-memory one does not, because on a discrete GPU the
     # weights live in real VRAM, which a cgroup memory limit does not govern at all.
     # A cap here would bound only the host-side buffers, which are not the pressure.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # Vulkan variant — the NATIVE-LINUX fallback, and the only AMD path here. Same
+  # contract, same address, same `llm` alias as the other two.
+  #
+  # STATUS: designed, NOT VERIFIED ON HARDWARE. Written on a WSL2/Intel host where
+  # Vulkan cannot bind (see DESIGN.md "Accelerator independence"), so the compose
+  # wiring, flags and health probe are reasoned rather than measured. The two things
+  # to expect trouble from on first real use are DOCKADE_RENDER_GID below and
+  # whether the driver enumerates at all — check with:
+  #     docker run --rm --device /dev/dri ghcr.io/ggml-org/llama.cpp:server-vulkan \
+  #       /app/llama-server --list-devices
+  #
+  # Vendor-neutral on purpose: RADV (AMD) and ANV (Intel) are both userspace Mesa
+  # drivers over the same DRM render node, so ONE profile covers AMD and
+  # native-Linux Intel. It is NOT for WSL2 — there is no /dev/dri there and Vulkan
+  # could only run through Mesa's Dozen shim over D3D12, which is why the Intel
+  # variant above uses SYCL instead.
+  #
+  #     docker compose --profile llm-vulkan up -d llm-vulkan
+  #
+  # For an AMD DATACENTER card (MI2xx/MI3xx), ROCm/HIP is meaningfully faster than
+  # Vulkan on long context, MoE, and multi-GPU. That is a manual swap, not a fourth
+  # profile: upstream ggml-org publishes no ROCm tag, so it means AMD's own image
+  # (rocm/llama.cpp:...-server) plus /dev/kfd in addition to /dev/dri. Not carried
+  # here because it would be a second unverifiable path, and the ROCm images are
+  # validated only for MI-series hardware anyway.
+  llm-vulkan:
+    profiles:
+      - llm-vulkan
+    image: ghcr.io/ggml-org/llama.cpp:server-vulkan
+    container_name: llm-vulkan
+    hostname: llm-vulkan
+    restart: unless-stopped
+    networks:
+      sandbox-net:
+        ipv4_address: 172.30.0.20
+        aliases:
+          - llm
+    # The DRM render node is all a Vulkan driver needs — /dev/kfd is the ROCm/HIP
+    # compute node and is deliberately NOT granted, since nothing here uses HIP.
+    # Keeping the grant to the render node (no /dev/dri/card*, no modesetting) is
+    # the smallest device capability that can serve inference.
+    devices:
+      - /dev/dri/renderD128
+    volumes:
+      - ${DOCKADE_MODELS_DIR:-./models}:/models:ro
+    # renderD128 is typically root:render 0660, so the container process must hold
+    # that group. group_add accepts a NAME or a NUMBER, and only the NUMBER crosses
+    # the container boundary usefully: a name is resolved in the CONTAINER's
+    # /etc/group (userspace), while the kernel checks the numeric gid against the
+    # device node's owner. So a name either fails to resolve in the image, or
+    # resolves to a DIFFERENT number than the host's (container `video`=44 vs host
+    # `render`=104) and silently fails the permission check. Pass the HOST's gid;
+    # it varies by distro (often 104 on Debian/Ubuntu, 105/109 elsewhere):
+    #     getent group render | cut -d: -f3      # or `video` on older setups
+    # and set DOCKADE_RENDER_GID in .env. Assumes rootful Docker — under
+    # userns-remap or rootless, gids are remapped and this needs rethinking.
+    #
+    # No numeric default is guessed, because a WRONG gid degrades silently to CPU
+    # rather than erroring. But this deliberately does NOT use the `:?` required-
+    # variable form either: compose interpolates the WHOLE file before profiles
+    # select services, so a `:?` here can make a plain `docker compose up -d` fail
+    # for the infra services on any host that never intends to run this profile.
+    # The default is instead an unresolvable group NAME, which scopes the failure to
+    # this container's creation — docker resolves supplementary group names against
+    # the container's /etc/group and rejects one it cannot find, naming the variable
+    # back to you. If a docker version ignores it instead of erroring, the symptom is
+    # the CPU-fallback trap described above, which the --list-devices check catches.
+    group_add:
+      - "${DOCKADE_RENDER_GID:-DOCKADE_RENDER_GID-is-unset}"
+    # Same flags as the Intel variant, minus the WSL driver-path export — see there
+    # for why --jinja, --no-context-shift, --parallel 1 and --reasoning off are set.
+    # -ngl 99 assumes the weights fit; on a discrete card check against real VRAM
+    # rather than the shared-pool arithmetic in DESIGN.md, which is iGPU-specific.
+    entrypoint:
+      - /bin/bash
+      - -lc
+      - >
+        exec /app/llama-server --host 0.0.0.0 --port 8080
+        -m /models/${DOCKADE_LLM_MODEL:-DOCKADE_LLM_MODEL-is-unset.gguf}
+        -ngl ${DOCKADE_LLM_NGL:-99} -c ${DOCKADE_LLM_CTX:-32768} --jinja --no-context-shift
+        --parallel ${DOCKADE_LLM_SLOTS:-1}
+        --reasoning ${DOCKADE_LLM_REASONING:-off}
+    # Same probe and same rationale as the Intel variant — see there. Note this one
+    # can go 200 with NO GPU at all: if the driver fails to enumerate, llama.cpp
+    # falls back to CPU and serves happily at a fraction of the speed. So a healthy
+    # container is not evidence of acceleration — read the startup log for the
+    # Vulkan device line, or run --list-devices as shown above.
+    healthcheck:
+      test:
+        - CMD
+        - bash
+        - -c
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/8080 &&
+          printf 'GET /health HTTP/1.0\r\n\r\n' >&3 &&
+          head -n1 <&3 | grep -q '^HTTP/[0-9.]* 200'
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 300s
+    # Uncapped for the same reasons as the other two — the mmap'd-weights argument
+    # is backend-independent, and on an APU/iGPU the shared-memory argument applies
+    # as written for Intel.
     cap_drop:
       - ALL
     security_opt:

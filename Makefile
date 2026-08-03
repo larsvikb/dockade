@@ -208,9 +208,15 @@ verify-build: ## Assert every image still builds (skipped if docker unavailable)
 up: ## Bring up the shared infra (egress proxy + control plane + UI), building if needed
 	# --wait: return when the services are HEALTHY, not merely created, so this
 	# target's success means the infra can actually serve. Only the three infra
-	# services are involved — the LLM is profile-gated and is started by its own
+	# services are STARTED — the LLM is profile-gated and is brought up by its own
 	# `docker compose --profile ... up`, so its multi-minute model load never
 	# counts against the timeout here. A timeout is therefore a real failure.
+	#
+	# Profile-gating keeps the llm-* services from RUNNING, but NOT from being
+	# interpolated: compose expands variables across the whole file before it selects
+	# services, so a required-variable (`:?`) reference inside a profile-gated
+	# service aborts this target too. Verified the hard way. Hence the llm-*
+	# services use bogus defaults instead — see docker-compose.yml.
 	$(COMPOSE) up -d --build --wait --wait-timeout 120
 
 down: ## Stop the shared infra (keeps the named volumes)

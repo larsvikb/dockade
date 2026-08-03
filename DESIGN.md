@@ -447,7 +447,8 @@ host-bind-mounted workspace. Dependencies: pull-through cache.
   containers yet.
 - **Local scratch DB** (optional v1, not built) — for apps the agent builds
   during dev.
-- **Local LLM inference** (`llm-intel` / `llm-nvidia` compose profiles) — an
+- **Local LLM inference** (`llm-intel` / `llm-nvidia` / `llm-vulkan` compose
+  profiles) — an
   OpenAI-compatible `llama-server` on sandbox-net. Ungoverned because it has **no
   egress at all**, not merely a governed one: weights are pre-fetched on the host
   into a read-only mount, so the service never makes an outbound request. Built
@@ -693,11 +694,13 @@ budget rather than a kill threshold.
 
 ## Local inference — an ungoverned LLM tool
 
-**Status: built and verified; not reachable by tier 1 — it is tier 2's sole
-destination (see "Built — the tier-2 local-model sandbox").** `docker-compose.yml`
-defines `llm-intel` and `llm-nvidia`, both behind compose profiles so neither
-starts with a plain `docker compose up -d`. They serve `llama-server` (an
-OpenAI-compatible API) on sandbox-net at `172.30.0.20:8080`.
+**Status: built and verified on the Intel/WSL path; not reachable by tier 1 — it is
+tier 2's sole destination (see "Built — the tier-2 local-model sandbox").**
+`docker-compose.yml` defines `llm-intel`, `llm-nvidia` and `llm-vulkan`, each behind
+a compose profile so none starts with a plain `docker compose up -d`. They serve
+`llama-server` (an OpenAI-compatible API) on sandbox-net at `172.30.0.20:8080`.
+Only `llm-intel` has been exercised on real hardware; `llm-vulkan` is designed but
+unverified (see "Accelerator independence").
 
 ### Why it is ungoverned rather than governed
 
@@ -731,11 +734,11 @@ zero direct device access.
 
 ### Accelerator independence
 
-The two profiles are mutually exclusive and deliberately share both the
+The three profiles are mutually exclusive and deliberately share both the
 sandbox-net address and the network alias `llm`. So the consumer endpoint
 (`http://llm:8080`) and any future firewall `/32` are identical whichever
 accelerator the host has, and switching hardware is a profile flag rather than a
-rewiring. Enabling both profiles at once is an address conflict, which is the
+rewiring. Enabling two profiles at once is an address conflict, which is the
 intended failure.
 
 - **Intel (WSL2)** — `--device /dev/dxg` plus `/usr/lib/wsl:ro`. There is no
@@ -747,9 +750,55 @@ intended failure.
 - **NVIDIA** — `gpus: all` (Compose ≥ 2.30) and the `server-cuda` image. The
   nvidia-container-toolkit injects driver libraries itself, so unlike the Intel
   path there is no device node or driver mount to declare.
+- **Vulkan, native Linux only** (`llm-vulkan`) — **designed, not yet verified on
+  hardware.** `--device /dev/dri/renderD128` and the `server-vulkan` image. One
+  profile covers both AMD and native-Linux Intel because RADV and ANV are userspace
+  Mesa drivers over the same DRM render node. `/dev/kfd` is deliberately *not*
+  granted: that is the ROCm/HIP compute node and nothing here uses HIP, so the
+  render node is the smaller capability that suffices. The render node is normally
+  `root:render 0660`, so the container process must hold that group. `group_add`
+  takes either a name or a numeric gid, and the difference matters: **only the
+  number crosses the boundary.** Group *names* are a userspace lookup in the
+  *container's* `/etc/group`, while the *gid* is what the kernel actually checks
+  against the device node's owner. A name is therefore wrong twice over — it may
+  not exist in the image at all (error), or it may exist and resolve to a
+  different number than the host's (container `video` = 44 vs host `render` = 104),
+  which silently fails the permission check. Hence the host's numeric gid supplied
+  as `DOCKADE_RENDER_GID`; it varies by distro. This assumes ordinary rootful
+  Docker: under `userns-remap` or rootless Docker, gids are remapped and the device
+  grant needs rethinking rather than a different number.
 
-Neither variant needs any accelerator runtime installed on the host distro: the
-llama.cpp images bundle the full Intel NEO / Level Zero stack themselves.
+  That variable is given an unresolvable-name default rather than compose's `:?`
+  required form on purpose, and so is `DOCKADE_LLM_MODEL` in all three profiles.
+  **Compose interpolates the entire file before profiles select which services
+  run** — verified: with `DOCKADE_LLM_MODEL` empty, a plain `docker compose up -d`
+  failed on `services.llm-intel.entrypoint` and refused to start the three infra
+  services, even though no llm profile was active. So a `:?` inside a profile-gated
+  service is silently a whole-project requirement, defeating the point of gating it.
+  Requiredness has to be enforced where the container is *created*, not where the
+  file is *parsed*; the trade is that `restart: unless-stopped` turns the misconfig
+  into a crash-loop on that one service rather than a single clean error.
+  A wrong gid does not fail loudly —
+  llama.cpp falls back to CPU and the health check still returns 200, so **a healthy
+  container is not evidence of acceleration.** Confirm with
+  `/app/llama-server --list-devices` or the Vulkan device line in the startup log.
+
+No variant needs an accelerator runtime installed on the host distro: the
+llama.cpp images bundle the full Intel NEO / Level Zero and Mesa stacks themselves.
+
+**Why AMD is Vulkan here rather than ROCm.** On supported hardware ROCm/HIP beats
+Vulkan by roughly 10–20%, and by much more on long context, MoE, and multi-GPU
+(Vulkan lacks row split); Vulkan tends to win short-context dense prefill and is
+far less fussy about hardware. Two things settle it for this repo: upstream
+ggml-org publishes no ROCm tag (only `cuda`, `vulkan`, `musa`, `intel`), so ROCm
+means AMD's own `rocm/llama.cpp` images, and those are validated for MI-series
+datacenter cards rather than consumer Radeon. Vulkan is therefore the default AMD
+path, with ROCm left as a documented manual image swap (`+ /dev/kfd`) for anyone
+running MI hardware. Note also that **AMD under WSL2 is not a viable target at
+all** — the amdgpu module lives on the Windows side, `rocm-smi`/`amd-smi` are
+unsupported there, ROCm-in-Docker-under-WSL is community-workaround territory, and
+Vulkan hits the same Dozen problem as Intel. An AMD laptop on Windows means CPU
+inference.
 
 ### Measured characteristics (Intel Arc 140V iGPU, Lunar Lake)
 

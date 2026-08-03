@@ -1390,7 +1390,47 @@ than for "the UI has no auth" in general. Ceiling worth stating plainly: while t
 bind mount exists and the approval surface must be reachable by a human who is on
 the host, no purely host-side control survives host code execution.
 
-**Standing policy is now visible in the UI (`GET /api/rules`).** The UI showed
+**Three tabbed views, with badges carrying the hidden state.** Approvals /
+Decisions / Policy, selected by `location.hash` so a reload, a bookmark and the back
+button agree, with `role="tablist"` and arrow-key navigation. Tabs were a deliberate
+choice over one long page, and they come with a specific hazard that the badges exist
+to answer: two views are hidden at any moment, and one of them (standing policy) has
+**silent drift** as its failure mode — it accumulated unnoticed for weeks before it
+was surfaced at all, so putting it one click away could have re-hidden it. Therefore
+the Approvals tab carries a live pending count (amber when non-zero) and the Policy
+tab carries a rule count plus an **unseen marker** that appears when the rule set
+changes while another view is showing and clears only when the policy view is actually
+opened. Both feeds keep polling regardless of the active tab — otherwise a badge could
+not report a hidden view's state, which is the entire reason it is there. The change
+signature is over pattern+action rather than the row count, because a rule whose
+*action flipped* is the change most worth noticing and it leaves the count unchanged.
+A real view split for audit browsing (filter/search/history) is step 2c; this is the
+navigation it will extend.
+
+**Traffic-light favicon + title count.** An inline SVG data URI — never a file or a
+CDN reference, since a governance UI issuing an external request per page load would
+be both ironic and a needless third-party signal, and this way there is no extra route
+for the relay to allow. Three lamps map onto the three states that matter: **red** the
+SSE stream is down (we are not seeing pending approvals), **amber** something is
+waiting on a human, **green** connected and clear. All three lamps keep their **own
+colour at every state** and only the brightness moves (active at full opacity, the
+others at ~0.26): with the inactive lamps greyed out the icon is a dark rectangle
+carrying one small coloured dot and stops reading as a traffic light at 16px, which is
+the size that actually matters. The honest cost is that dim-to-bright is a weaker
+peripheral signal than grey-to-colour, so the title prefix carries most of the
+eye-catching load. `href` is only reassigned when the state genuinely changes —
+`updateIndicators` runs on every poll, and browsers treat each assignment as a fresh
+favicon load, so rewriting it ~15×/minute would be wasted work at best and a
+flickering tab icon at worst. Red for "blind" rather than for
+"denied" is the deliberate part: an unseen hold default-denies after
+`CONTROL_HOLD_TIMEOUT` (~120s), so not-receiving-updates deserves more alarm than
+being busy, and a stale green would be a lie. The pre-JS fallback in `<head>` is amber
+for the same reason — before the stream connects, "unknown" is the honest state, not
+"all clear". The tab title gains a `(n)` prefix so a **background** tab shows the
+count, which is the case that actually matters: `mcp-proxy.anthropic.com` expired
+unnoticed five times because nobody was watching the page.
+
+**Standing policy is visible in the UI (`GET /api/rules`).** The UI showed
 pending approvals and recent decisions but never the **rules** — the thing that
 actually decides every request. So answering "what have I permanently allowed?" meant
 `docker compose exec` plus SQL against the volume, and in practice rules accumulated

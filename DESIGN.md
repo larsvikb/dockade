@@ -490,9 +490,11 @@ no separate artifact-export path is needed in v1.
   opaque `403` to the agent as any other deny) can't be asserted there.
 
   The suite was then extended to the **async decision flow** the pure-function
-  tests couldn't reach (68 tests total, still dependency-free — the count
-  includes the two `control-plane-ui` relay host-pinning regression tests that
-  came with the 2b-2 split): the proxy's
+  tests couldn't reach (**100 tests total**, still dependency-free — the count
+  includes the `control-plane-ui` relay host-pinning regression tests that came
+  with the 2b-2 split, the mapped-IPv6 relay-guard regression suite, and the
+  frontend's Host / cross-origin / relay-allowlist / provenance guards plus the
+  fresh-schema guard on the provenance column): the proxy's
   `_authorize` (permanent-lifeline short-circuit with no control-plane call, and
   fail-closed on any control-plane error / non-`allow` decision — `_post_authorize`
   monkeypatched, no network) and the mitmproxy hooks via small `SimpleNamespace`
@@ -520,6 +522,28 @@ no separate artifact-export path is needed in v1.
   leave the sandbox.
 - Docs mirror / offline docs tool.
 - Progressive auto-approval driven by accumulated policy + audit history.
+- **Rule management / revocation on the control plane.** Today rules can be GRANTED
+  (a `*_persist` resolution writes one) but never listed, edited or removed: there is
+  no rule endpoint, and the seed file is re-read only when the table is empty, so a
+  mistaken persist is permanent short of hand-editing SQLite in the volume. Two
+  sharp edges come with it — `resolve` persists the **agent-controlled** host string
+  verbatim as a pattern, so a request for `.evil.com` turns one approval into a
+  *subdomain wildcard* (`_match` treats a leading dot that way); and the
+  `INSERT OR IGNORE` means `deny_persist` silently writes nothing when a pattern
+  already exists while still reporting `persisted: true`. A governance plane that
+  can grant but not revoke is incomplete; pair the CRUD with validating that a
+  persisted pattern is a bare hostname and making wildcard-vs-exact an explicit
+  operator choice in the UI.
+- **Human-presence on approval (WebAuthn user-presence, or an out-of-band confirm).**
+  The *only* thing that closes host-local forgery of an approval — see the
+  browser-facing-guards note under "Frontend split". Worth building for that
+  specific threat (the agent reaching host execution via the workspace mount), not
+  because "the UI has no auth"; naive auth does not help, since any credential at
+  rest on the host is readable by the same process.
+- Normalize hosts consistently across the control plane. The proxy's relay guard
+  strips a trailing FQDN dot but `_decide` / `_match` only lowercase, so `evil.com.`
+  misses a persisted **block** rule and lands in a hold instead — fail-safe, but it
+  lets an explicit operator denial be re-prompted indefinitely.
 - **Split the control-plane API surface to cap the blast radius of any relay-guard
   bypass (planned).** The egress proxy only ever needs `/authorize` (+ `/healthz`);
   the *dangerous* surface is the management API (`/approvals`, `/approvals/{id}/
@@ -1322,6 +1346,71 @@ exfiltrate even if reached. The frontend carries the sole host-facing surface
 (`control-ui-net`), holds no state, and is not on `sandbox-net`. Browsers hit
 `http://localhost:8081` → frontend → backend; the egress proxy still calls the
 backend's `/authorize` directly. See the step-2a design note for the rationale.
+
+**Browser-facing guards on the frontend (and their honest limit).** The frontend
+publishes the only API that can GRANT egress — `POST /approvals/{id}/resolve` is
+self-approval if reached — on host loopback, with no auth. Loopback binding is not a
+defense against **DNS rebinding**: a page the operator visits can point its own name
+at `127.0.0.1`, at which point it is *same-origin* with the frontend, so there is no
+preflight and responses are readable — it can list the pending approvals (obtaining
+the `uuid4` ids a blind attacker cannot guess) and resolve them. That, not CSRF, is
+the vector that matters here; plain CSRF is largely self-blocking, because a JSON
+body forces a preflight that fails for want of CORS headers and `resolve` needs an
+unguessable id. Three structural guards now sit in front (`control-plane-ui/app.py`):
+
+- **Host allowlist** (`CONTROL_UI_ALLOWED_HOSTS`, default `127.0.0.1,localhost,::1`)
+  — closes rebinding. Rebinding *requires* the attacker's own name in `Host`, and
+  `Host` is a forbidden header JS cannot set, so this removes the attack class
+  rather than raising its cost. Compared without the port on purpose: the port is
+  irrelevant to the guard, and ignoring it keeps one list valid for both the
+  published `:8081` and the in-container healthcheck's `:8090`. Import fails closed
+  on an empty list (`_assert_host_guard_configured`, mirroring the egress addon).
+- **Cross-origin state changes refused** — `Sec-Fetch-Site` when present, else
+  `Origin`; both absent means no browser is calling, so there is no CSRF to stop and
+  refusing would only break scripting. Belt-and-braces for a future endpoint that is
+  less lucky than the current ones.
+- **Relay path allowlist** — only the paths the UI actually uses are proxied. The
+  backend surface is not uniformly browser-appropriate: reaching `POST /authorize`
+  from a page means forged audit rows and consumed hold slots on the governance
+  authority. The old catch-all `/{path:path}` relayed it.
+
+*What these cannot do.* They are **browser-enforced**. A process running on the host
+sets any header it likes and can still reach the API — and that is not hypothetical
+here, because the agent's RW workspace bind mount is an acknowledged (delayed) path
+to host execution (see the workspace guard in `sandbox-lib.sh`). **Authentication
+would not close it either**, which is the non-obvious part: any credential at rest
+on the host — token file, env var, browser cookie — is readable by that same
+process, so it adds friction and a secret to manage without changing the outcome.
+Closing host-local forgery requires a human-presence gesture the host cannot replay
+(WebAuthn user-presence on `resolve`, or an out-of-band confirm). That is a
+deliberate *later* decision, and it should be taken for this specific threat rather
+than for "the UI has no auth" in general. Ceiling worth stating plainly: while the
+bind mount exists and the approval surface must be reachable by a human who is on
+the host, no purely host-side control survives host code execution.
+
+**Approval provenance — detection where prevention is not available.** Given that
+ceiling, the frontend and backend at least make a forged approval *visible*. The
+relay strips client-supplied provenance headers (`X-Dockade-Actor`,
+`X-Forwarded-*`, `Forwarded`, `X-Real-IP`) and re-adds `X-Dockade-Actor` with the
+peer address it actually observed; the backend's `_actor` records that on the
+approvals row (`resolved_by`) and carries it into the audit reason, so the log
+answers "who granted this egress" rather than merely "a human did". The labels keep
+trust levels apart: `peer=` is observed by the backend (but is the *relay* for
+anything via the UI), `via-ui=` is asserted by the relay, and `origin=` / `ua=` are
+self-reported and forgeable — recorded anyway because they are usually what betrays
+a non-browser caller. None of this was recorded before: an operator's click and a
+scripted POST were indistinguishable after the fact.
+
+*Schema note (read before adding a column).* `resolved_by` ships with **no migration
+step**, which is safe only because of a one-time circumstance: the single store that
+predated the column was migrated in place with `ALTER TABLE ADD COLUMN` before the
+migration code was removed, and every store created since gets the column from the
+`CREATE TABLE`. That is not a general pattern — `CREATE TABLE IF NOT EXISTS` is a
+no-op on an existing table and this store is a long-lived named volume that
+deliberately outlives container and image churn, so **the next additive column will
+need its own explicit `ALTER` for existing volumes**, or every statement naming it
+fails at runtime. The only alternative is `make destroy`, which discards the policy
+rules and the audit history — i.e. the crown jewels. See the NOTE in `_init_db`.
 
 Step 2c: audit *browsing* — filter/search/history beyond the live
 recent-decisions table the UI already renders — and the per-proxy config

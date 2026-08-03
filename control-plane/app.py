@@ -20,6 +20,14 @@ control-plane-ui frontend; the backend serves no HTML itself:
   - allow-persist / deny-persist — also write a rule so future connections skip
     the hold (progressive trust; DESIGN.md "auto-approve progressively more").
 
+Resolving a hold is the one privileged action in this system — it is what grants
+egress — so every resolution records the PROVENANCE of whoever performed it
+(``_actor``), both on the durable approvals row (``resolved_by``) and in the audit
+reason. That is detection, not prevention: the self-reported fields are forgeable
+by a host-local caller. It exists so a forged approval is at least visible in the
+record afterwards, which it previously was not — an operator's click and a
+scripted POST were indistinguishable once written.
+
 Concurrency model: run under a SINGLE uvicorn worker. `/authorize` and the
 resolve endpoint are sync (FastAPI runs them in a threadpool); a held request
 blocks its worker on a threading.Event that the resolve endpoint sets. Concurrent
@@ -121,11 +129,26 @@ def _init_db() -> None:
                 url         TEXT,
                 status      TEXT NOT NULL,    -- pending | allowed | denied | expired
                 mode        TEXT,             -- once | persist
-                resolved_at REAL
+                resolved_at REAL,
+                resolved_by TEXT              -- provenance of the resolver (_actor)
             )""")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS approvals_status ON approvals(status)")
         conn.commit()
+
+
+# NOTE for whoever adds the next column: there is NO migration step here, and that
+# is only safe because of a one-time circumstance. `CREATE TABLE IF NOT EXISTS` is a
+# NO-OP on an existing table — it silently does not add columns — and this store is a
+# long-lived named volume that deliberately outlives container and image churn, so a
+# new column is MISSING on any store created before it and every statement naming it
+# then fails at runtime. `resolved_by` got away without one because the single store
+# that predated it was migrated in place (ALTER TABLE ADD COLUMN) before this was
+# removed, and every store created since gets the column from the DDL above. So a
+# future additive column needs its own explicit ALTER for existing volumes; the only
+# alternative is `make destroy`, which discards the policy rules and the audit
+# history. (Restoring a pre-`resolved_by` backup of the volume would likewise need
+# that ALTER run by hand.)
 
 
 def _seed_if_empty() -> int:
@@ -224,6 +247,49 @@ def _release_hold(approval_id: str) -> None:
     with _LOCK:
         _PENDING_EVENTS.pop(approval_id, None)
         _PENDING_CLIENT.pop(approval_id, None)
+
+
+# Header the control-plane-ui relay uses to assert the BROWSER's address. The relay
+# strips any client-supplied copy before setting it (see control-plane-ui/app.py),
+# so a caller cannot self-report this value — but it is only as trustworthy as the
+# relay, which is why _actor labels it as asserted rather than observed.
+ACTOR_HEADER = "x-dockade-actor"
+# Bound the recorded User-Agent so a hostile one cannot bloat the store.
+_ACTOR_UA_MAX = 120
+
+
+def _actor(request) -> str:
+    """Compact provenance for whoever resolved an approval, for the durable record.
+
+    The trust level differs per field, so the labels distinguish them:
+      - ``peer``   — the socket address this process itself observed. Unforgeable by
+        the caller, but for anything arriving through the UI it is the
+        control-plane-ui container, so it identifies the RELAY, not the human.
+      - ``via-ui`` — the browser address the relay asserts (``ACTOR_HEADER``).
+      - ``origin`` / ``ua`` — self-reported by the client, therefore forgeable.
+        Recorded anyway because they are usually what betrays a non-browser caller.
+
+    DETECTION, not prevention. A process running on the host can forge every
+    self-reported field, and origin/Host checks in the relay are browser-enforced so
+    they do not constrain it either. Preventing host-local forgery needs a human
+    presence gesture the host cannot replay (WebAuthn user-presence or an
+    out-of-band confirm) — see DESIGN.md. Until then the goal is that a forged
+    approval leaves a trace that reads differently from an operator's click."""
+    if request is None:                      # hand-invoked / non-HTTP caller
+        return "unrecorded (no request context)"
+    client = getattr(request, "client", None)
+    parts = [f"peer={getattr(client, 'host', None) or '?'}"]
+    headers = getattr(request, "headers", None) or {}
+    asserted = headers.get(ACTOR_HEADER)
+    if asserted:
+        parts.append(f"via-ui={asserted}")
+    origin = headers.get("origin")
+    if origin:
+        parts.append(f"origin={origin}")
+    ua = headers.get("user-agent")
+    if ua:
+        parts.append(f'ua="{ua[:_ACTOR_UA_MAX]}"')
+    return " ".join(parts)
 
 
 def _list_pending() -> list[dict]:
@@ -328,16 +394,20 @@ def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
             "UPDATE approvals SET status='expired', resolved_at=? "
             "WHERE id=? AND status='pending'", (time.time(), approval_id)).rowcount
         status_row = None if expired else conn.execute(
-            "SELECT status FROM approvals WHERE id=?", (approval_id,)).fetchone()
+            "SELECT status, resolved_by FROM approvals WHERE id=?",
+            (approval_id,)).fetchone()
         conn.commit()
     _release_hold(approval_id)
 
+    # Carry the resolver's provenance (recorded by resolve()) into the audit reason,
+    # so the log answers "who granted this egress" and not merely "a human did".
+    actor = (status_row["resolved_by"] if status_row else None) or "actor unrecorded"
     if expired:
         final, why = "deny", "no decision within hold timeout — default-deny"
     elif status_row and status_row["status"] == "allowed":
-        final, why = "allow", "human approval"
+        final, why = "allow", f"human approval [{actor}]"
     else:  # 'denied' (or any non-allowed terminal state) — default-deny
-        final, why = "deny", "human rejection"
+        final, why = "deny", f"human rejection [{actor}]"
     _audit(final, stage=req.stage, host=req.host, port=req.port, proto=req.proto,
            client=req.client, method=req.method, url=req.url, reason=why)
     return AuthorizeResponse(decision=final, reason=why)
@@ -351,11 +421,14 @@ def approvals() -> list[dict]:
 
 
 @app.post("/approvals/{approval_id}/resolve")
-def resolve(approval_id: str, req: ResolveRequest) -> JSONResponse:
+def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResponse:
     if req.action not in ("allow_once", "allow_persist", "deny_once", "deny_persist"):
         return JSONResponse({"ok": False, "detail": "bad action"}, status_code=400)
     outcome = "allow" if req.action.startswith("allow") else "deny"
     persist = req.action.endswith("persist")
+    # Captured BEFORE the update so the same value lands on the durable row and, via
+    # that row, in the audit reason the blocked authorize() waiter writes.
+    actor = _actor(request)
 
     with _LOCK:
         event = _PENDING_EVENTS.get(approval_id)
@@ -371,10 +444,11 @@ def resolve(approval_id: str, req: ResolveRequest) -> JSONResponse:
         if row is None:
             return JSONResponse({"ok": False, "detail": "unknown"}, status_code=404)
         updated = conn.execute(
-            "UPDATE approvals SET status=?, mode=?, resolved_at=? "
+            "UPDATE approvals SET status=?, mode=?, resolved_at=?, resolved_by=? "
             "WHERE id=? AND status='pending'",
             ("allowed" if outcome == "allow" else "denied",
-             "persist" if persist else "once", time.time(), approval_id)).rowcount
+             "persist" if persist else "once", time.time(), actor,
+             approval_id)).rowcount
         if updated and persist:
             conn.execute(
                 "INSERT OR IGNORE INTO rules(pattern, action, source, created_at) "

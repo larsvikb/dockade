@@ -74,8 +74,15 @@ def _install_fastapi_stub() -> None:
     responses = types.ModuleType("fastapi.responses")
 
     class _Resp:
+        """Enough of a Starlette response to assert on: the handlers return these,
+        and tests check the status. ``status_code`` mirrors the real attribute so a
+        test never has to reach into ``kwargs`` (and so this stub stays usable by the
+        control-plane-ui tests, which share whichever fastapi stub loads first)."""
+
         def __init__(self, *args, **kwargs):
             self.args, self.kwargs = args, kwargs
+            self.status_code = kwargs.get("status_code", 200)
+            self.body = args[0] if args else None
 
     responses.JSONResponse = _Resp
     responses.PlainTextResponse = _Resp

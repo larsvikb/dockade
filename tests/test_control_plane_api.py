@@ -15,6 +15,7 @@ import os
 import tempfile
 import threading
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -48,6 +49,23 @@ def _clear_all():
 
 def _auth_req(host, **kw):
     return cp.AuthorizeRequest(host=host, **kw)
+
+
+class _FakeRequest:
+    """Stand-in for the Starlette Request that ``resolve`` reads provenance from
+    (``_actor``). Headers are lowercased like Starlette's case-insensitive mapping."""
+
+    def __init__(self, peer="172.31.0.3", headers=None):
+        self._headers = {k.lower(): v for k, v in (headers or {}).items()}
+        self.headers = types.SimpleNamespace(get=self._headers.get)
+        self.client = types.SimpleNamespace(host=peer) if peer else None
+
+
+def _resolve(approval_id, action, request=None):
+    """resolve() with a default request, so tests that don't care about provenance
+    stay readable."""
+    return cp.resolve(approval_id, cp.ResolveRequest(action=action),
+                      request if request is not None else _FakeRequest())
 
 
 class _CPTestCase(unittest.TestCase):
@@ -133,8 +151,7 @@ class HoldHandshakeTests(_CPTestCase):
         cp.HOLD_TIMEOUT = 5
         try:
             t, result, approval_id = self._authorize_in_thread("newsite.com")
-            resolve_resp = cp.resolve(
-                approval_id, cp.ResolveRequest(action="allow_persist"))
+            resolve_resp = _resolve(approval_id, "allow_persist")
             t.join(2)
         finally:
             cp.HOLD_TIMEOUT = saved
@@ -149,7 +166,7 @@ class HoldHandshakeTests(_CPTestCase):
         cp.HOLD_TIMEOUT = 5
         try:
             t, result, approval_id = self._authorize_in_thread("nope.com")
-            cp.resolve(approval_id, cp.ResolveRequest(action="deny_once"))
+            _resolve(approval_id, "deny_once")
             t.join(2)
         finally:
             cp.HOLD_TIMEOUT = saved
@@ -161,13 +178,114 @@ class HoldHandshakeTests(_CPTestCase):
 
 class ResolveTests(_CPTestCase):
     def test_bad_action_is_rejected(self):
-        resp = cp.resolve("whatever", cp.ResolveRequest(action="nonsense"))
+        resp = _resolve("whatever", "nonsense")
         self.assertEqual(resp.kwargs.get("status_code"), 400)
 
     def test_unknown_or_expired_id_is_conflict(self):
         # No pending event registered for this id -> 409.
-        resp = cp.resolve("missing-id", cp.ResolveRequest(action="allow_once"))
+        resp = _resolve("missing-id", "allow_once")
         self.assertEqual(resp.kwargs.get("status_code"), 409)
+
+
+class ProvenanceTests(_CPTestCase):
+    """Resolving a hold is the one privileged action here — it grants egress — so
+    "who approved this" must reach the durable record and the audit trail. It reached
+    NEITHER before: an operator's click and a scripted POST were indistinguishable
+    once written. Detection, not prevention (the self-reported fields are forgeable
+    by a host-local caller), so what is asserted is that the trace exists and keeps
+    observed and asserted values apart."""
+
+    def test_actor_separates_observed_peer_from_self_reported_fields(self):
+        actor = cp._actor(_FakeRequest(peer="172.31.0.3", headers={
+            cp.ACTOR_HEADER: "127.0.0.1",
+            "origin": "http://127.0.0.1:8081",
+            "user-agent": "Mozilla/5.0 (X11)"}))
+        self.assertIn("peer=172.31.0.3", actor)      # observed by us
+        self.assertIn("via-ui=127.0.0.1", actor)     # asserted by the relay
+        self.assertIn("origin=http://127.0.0.1:8081", actor)
+        self.assertIn('ua="Mozilla/5.0 (X11)"', actor)
+
+    def test_actor_tolerates_a_bare_request(self):
+        self.assertIn("peer=?", cp._actor(_FakeRequest(peer=None)))
+        self.assertIn("unrecorded", cp._actor(None))
+
+    def test_actor_bounds_a_hostile_user_agent(self):
+        actor = cp._actor(_FakeRequest(headers={"user-agent": "A" * 5000}))
+        self.assertLess(len(actor), 400)
+
+    def test_resolution_records_provenance_on_the_approval_row(self):
+        saved = cp.HOLD_TIMEOUT
+        cp.HOLD_TIMEOUT = 5
+        try:
+            t, _result, approval_id = HoldHandshakeTests._authorize_in_thread(
+                self, "provenance.com")
+            _resolve(approval_id, "allow_once",
+                     _FakeRequest(peer="172.31.0.3",
+                                  headers={cp.ACTOR_HEADER: "10.1.2.3",
+                                           "user-agent": "curl/8.5.0"}))
+            t.join(2)
+        finally:
+            cp.HOLD_TIMEOUT = saved
+        with cp._connect() as conn:
+            row = conn.execute(
+                "SELECT status, resolved_by FROM approvals WHERE host=?",
+                ("provenance.com",)).fetchone()
+        self.assertEqual(row["status"], "allowed")
+        self.assertIn("via-ui=10.1.2.3", row["resolved_by"])
+        # A non-browser caller is exactly what the UA field is for.
+        self.assertIn("curl/8.5.0", row["resolved_by"])
+
+    def test_audit_reason_carries_the_actor(self):
+        # _audit is mocked by _CPTestCase, so assert on what the waiter passed it —
+        # that is the record an operator actually reads back.
+        saved = cp.HOLD_TIMEOUT
+        cp.HOLD_TIMEOUT = 5
+        try:
+            t, result, approval_id = HoldHandshakeTests._authorize_in_thread(
+                self, "audited.com")
+            _resolve(approval_id, "allow_once", _FakeRequest(peer="172.31.0.9"))
+            t.join(2)
+        finally:
+            cp.HOLD_TIMEOUT = saved
+        self.assertEqual(result["resp"].decision, "allow")
+        reasons = [c.kwargs.get("reason", "") for c in cp._audit.call_args_list]
+        self.assertTrue(any("human approval" in r and "peer=172.31.0.9" in r
+                            for r in reasons),
+                        f"actor missing from audit reasons: {reasons}")
+
+    def test_timeout_path_reports_no_actor_rather_than_a_wrong_one(self):
+        saved = cp.HOLD_TIMEOUT
+        cp.HOLD_TIMEOUT = 0.05
+        try:
+            resp = cp.authorize(_auth_req("nobody.com", client="a"))
+        finally:
+            cp.HOLD_TIMEOUT = saved
+        self.assertEqual(resp.decision, "deny")
+        self.assertIn("timeout", resp.reason)
+        self.assertNotIn("peer=", resp.reason)
+
+
+class FreshSchemaTests(unittest.TestCase):
+    """A brand-new store must carry ``resolved_by`` from the DDL itself.
+
+    This is what carries the provenance column now that there is no migration step
+    (see the NOTE in ``_init_db``): the one store that predated the column was
+    migrated in place, so every store from here on is created with it. If it ever
+    fell out of the ``CREATE TABLE``, every resolve would fail at runtime, so assert
+    it against a genuinely empty database rather than the shared test one."""
+
+    def test_new_store_has_the_provenance_column(self):
+        saved = cp.DB_PATH
+        cp.DB_PATH = os.path.join(_TMP, "fresh-schema.db")
+        try:
+            cp._init_db()
+            with cp._connect() as conn:
+                cols = {r["name"] for r in
+                        conn.execute("PRAGMA table_info(approvals)")}
+            self.assertIn("resolved_by", cols)
+            cp._init_db()          # idempotent: a second run must not fail
+        finally:
+            cp.DB_PATH = saved
 
 
 class SeedTests(_CPTestCase):

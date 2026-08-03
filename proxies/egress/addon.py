@@ -33,8 +33,13 @@ the control plane. Before any policy/permanent/port check it hard-refuses any
 destination that names a control-plane host or resolves into the control-net
 subnet (``_forbidden``), a guard that no rule, approval, or port change can widen.
 The same guard hard-blocks the private / special-use ranges (cloud metadata /
-link-local, loopback, RFC1918 — see ``PRIVATE_CIDRS``), so the proxy can never be
-turned into an SSRF pivot to the instance-metadata service or the internal net.
+link-local, loopback, RFC1918 and friends — see ``PRIVATE_CIDRS``), so the proxy
+can never be turned into an SSRF pivot to the instance-metadata service or the
+internal net. Because that promise is about a DESTINATION and not about a string,
+the guard normalizes before matching (case, trailing FQDN dot, IPv6 brackets) and
+folds the IPv6 forms that carry an embedded IPv4 address down to the address they
+actually dial — otherwise ``[::ffff:169.254.169.254]`` is the same destination
+under a spelling no v4 blocklist recognizes (see ``_embedded_ipv4``).
 
 An unknown host is HELD (2b): the control plane blocks the /authorize response
 until a human approves/rejects it or its hold window elapses. To the proxy this
@@ -143,27 +148,101 @@ FORBIDDEN_HOSTS = _hosts("EGRESS_FORBIDDEN_HOSTS", "control-plane,control-plane-
 # listed there so that guard is independently configurable. Override only for a
 # deployment that legitimately proxies to a private target (e.g. an internal
 # package mirror) — narrow it, don't blanket-empty it.
+#
+# Beyond the obvious RFC1918/loopback/link-local set, this covers the special-use
+# v4 ranges that are ALSO local-or-undialable and so have no business being an
+# egress target: 0.0.0.0/8 (connect(0.0.0.0) reaches localhost on Linux — the same
+# loopback pivot as 127/8, by another spelling), 100.64.0.0/10 (CGNAT, which is
+# where a host's VPN/overlay peers live), 192.0.0.0/24 and 198.18.0.0/15 (IETF
+# protocol assignments / benchmarking), and 224.0.0.0/4 + 240.0.0.0/4 (multicast,
+# reserved, and the 255.255.255.255 broadcast address).
 PRIVATE_CIDRS = _parse_cidrs(
     "EGRESS_PRIVATE_CIDRS",
-    "169.254.0.0/16,127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,"
-    "::1/128,fe80::/10,fc00::/7")
+    "0.0.0.0/8,10.0.0.0/8,100.64.0.0/10,127.0.0.0/8,169.254.0.0/16,"
+    "172.16.0.0/12,192.0.0.0/24,192.168.0.0/16,198.18.0.0/15,"
+    "224.0.0.0/4,240.0.0.0/4,"
+    "::/128,::1/128,fe80::/10,fc00::/7")
 
 # One list for the literal-IP and resolve checks, so both branches cover every
 # hard-blocked range (control-net + the private/special-use ranges).
 _BLOCKED_CIDRS = FORBIDDEN_CIDRS + PRIVATE_CIDRS
 
+# IPv6 forms that CARRY an embedded IPv4 address, and are therefore a way to write
+# a blocked v4 destination that a v4-only blocklist does not recognize.
+#
+# This is the classic SSRF-filter bypass, and it defeated BOTH checks that
+# ``_forbidden_reason`` documents as deterministic: stdlib containment never
+# crosses address families, so ``::ffff:169.254.169.254`` is in none of the v4
+# networks above, and ``getaddrinfo`` hands the same mapped form straight back, so
+# the resolve branch re-tests the identical unrecognized address. Meanwhile
+# ``connect()`` on a v4-mapped address delivers to the v4 host. So fold every such
+# form down to the v4 address it actually dials and test THAT as well.
+#
+# NAT64 has no stdlib accessor (unlike ``ipv4_mapped`` / ``sixtofour``), so its
+# well-known prefixes are matched explicitly and the address read out of the low
+# 32 bits — the same read that handles the deprecated IPv4-compatible ``::a.b.c.d``.
+#
+# Teredo (2001::/32) is deliberately NOT folded: its embedded v4 is the client's
+# own NAT address, not a destination anything delivers to, so folding it would
+# block on an address the packet never reaches. It is also not a plausible egress
+# target, so nothing is lost by leaving it to host policy.
+_NAT64_PREFIXES = (ipaddress.ip_network("64:ff9b::/96"),
+                   ipaddress.ip_network("64:ff9b:1::/48"))
+_V4_COMPAT_PREFIX = ipaddress.ip_network("::/96")
+
+
+def _unbracket(host: str) -> str:
+    """Strip the brackets an IPv6 literal wears inside an authority or Host header
+    (``[::1]``). mitmproxy splits the port off but leaves the brackets on, and a
+    bracketed address defeats EVERY check here: ``ip_address()`` rejects the form,
+    and ``getaddrinfo()`` cannot resolve it either (verified) — so without this a
+    bracketed control-net address passes the guard entirely."""
+    host = host.strip()
+    if host.startswith("[") and host.endswith("]"):
+        return host[1:-1]
+    return host
+
+
+def _embedded_ipv4(ip):
+    """Return the IPv4 address an IPv6 literal would actually dial, or None.
+
+    Covers v4-mapped (``::ffff:a.b.c.d``), 6to4 (``2002::/16``), NAT64
+    (``64:ff9b::/96``) and the deprecated v4-compatible (``::a.b.c.d``) forms.
+    Returns None for a plain v6 address, for a v4 address, and for the
+    unspecified address (whose low 32 bits are zero and mean no v4 host)."""
+    if not isinstance(ip, ipaddress.IPv6Address):
+        return None
+    for embedded in (ip.ipv4_mapped, ip.sixtofour):
+        if embedded is not None:
+            return embedded
+    if ip in _V4_COMPAT_PREFIX or any(ip in n for n in _NAT64_PREFIXES):
+        low = int(ip) & 0xFFFFFFFF
+        if low:
+            return ipaddress.IPv4Address(low)
+    return None
+
 
 def _blocked_cidr(ip_str: str):
-    """Return the first hard-blocked network this IP falls in, or None. A v4
-    address tested against a v6 network (or vice-versa) is simply not contained
-    (stdlib returns False across versions), so mixing families is safe."""
+    """Return the first hard-blocked network this IP falls in, or None.
+
+    Tests the address AS WRITTEN and, for the IPv6 forms that carry an embedded
+    IPv4 address, the v4 address it actually dials (see ``_embedded_ipv4``) —
+    without which ``::ffff:172.31.0.2`` reaches control-net past a v4-only
+    blocklist. A v4 address tested against a v6 network (or vice-versa) is simply
+    not contained (stdlib returns False across versions), so mixing families in
+    ``_BLOCKED_CIDRS`` is safe."""
     try:
-        ip = ipaddress.ip_address(ip_str)
+        ip = ipaddress.ip_address(_unbracket(ip_str))
     except ValueError:
         return None
-    for net in _BLOCKED_CIDRS:
-        if ip in net:
-            return net
+    candidates = [ip]
+    embedded = _embedded_ipv4(ip)
+    if embedded is not None:
+        candidates.append(embedded)
+    for candidate in candidates:
+        for net in _BLOCKED_CIDRS:
+            if candidate in net:
+                return net
     return None
 
 
@@ -182,6 +261,11 @@ def _forbidden_reason(host: str) -> str | None:
     (see ``_forbidden``). Three checks, cheapest first: a forbidden hostname, a
     literal forbidden IP, then a name that RESOLVES into a forbidden range.
 
+    Every check runs against the NORMALIZED destination (lowercased, trailing FQDN
+    dot and IPv6 brackets stripped) and, in ``_blocked_cidr``, against the v4
+    address that an IPv4-embedding IPv6 literal actually dials — so the guard is
+    not spellable-around with ``[::ffff:172.31.0.2]``.
+
     Two of these are DETERMINISTIC guarantees — the exact-hostname match and the
     literal-IP-in-CIDR match decide from the request alone. The third (resolve
     step) is BEST-EFFORT defense-in-depth: it depends on a DNS lookup, so it is
@@ -194,7 +278,7 @@ def _forbidden_reason(host: str) -> str | None:
     "Control-plane relay guard" and the planned API-surface split (#4) that caps
     the blast radius of any guard bypass. The startup ``_assert_guard_configured``
     refuses to run with the CIDR check disabled, so this is never silently off."""
-    h = (host or "").lower().rstrip(".")
+    h = _unbracket((host or "").lower()).rstrip(".")
     if h in FORBIDDEN_HOSTS:
         return f"forbidden destination host {host} (control plane)"
     net = _blocked_cidr(h)
@@ -203,7 +287,9 @@ def _forbidden_reason(host: str) -> str | None:
     if not _BLOCKED_CIDRS:
         return None
     try:
-        infos = socket.getaddrinfo(host, None)
+        # Resolve the NORMALIZED name: a bracketed or trailing-dot form that the
+        # raw `host` cannot resolve would otherwise skip this branch entirely.
+        infos = socket.getaddrinfo(h, None)
     except OSError as e:
         # Cannot run the resolve-based check. Returning None is SAFE (not a silent
         # fail-open): a name that will not resolve here also will not resolve when

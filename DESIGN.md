@@ -1226,8 +1226,12 @@ control plane") independently enforced at the one place segmentation cannot cove
 control-net IP.
 
 The same guard also hard-blocks the **private / special-use ranges** —
-cloud-metadata / link-local (`169.254.0.0/16`), loopback (`127.0.0.0/8`), and
-RFC1918 (`10/8`, `172.16/12`, `192.168/16`), plus their IPv6 equivalents — via a
+cloud-metadata / link-local (`169.254.0.0/16`), loopback (`127.0.0.0/8`), RFC1918
+(`10/8`, `172.16/12`, `192.168/16`), `0.0.0.0/8` (`connect(0.0.0.0)` reaches
+localhost on Linux — loopback under another spelling), CGNAT/overlay
+(`100.64.0.0/10`), protocol-assignment and benchmarking (`192.0.0.0/24`,
+`198.18.0.0/15`), and multicast/reserved/broadcast (`224.0.0.0/4`, `240.0.0.0/4`),
+plus their IPv6 equivalents — via a
 separate `EGRESS_PRIVATE_CIDRS` set (`_forbidden`, checked before policy). The
 proxy's default route is egress-net, a masquerading bridge with a path to the
 cloud instance-metadata service (a credential-theft target), the Docker host, and
@@ -1242,6 +1246,29 @@ fail-closed startup assertion stays specifically about control-net. Override
 `EGRESS_PRIVATE_CIDRS` (narrow, don't empty) only for a deployment that
 legitimately proxies to a private target such as an internal package mirror.
 `boundary-check.sh` asserts the proxy 403s `169.254.169.254`.
+
+*A destination, not a string — spelling normalization (fixed bug, keep the
+regression tests).* Both hard-blocked sets are lists of **IP ranges**, but what
+arrives is a **hostname field**, and the two are only equivalent after
+normalization. The guard therefore lowercases, strips a trailing FQDN dot, strips
+the brackets an IPv6 literal wears in an authority (`[::1]`), and — the part that
+was missing — folds the IPv6 forms that carry an **embedded IPv4 address** down to
+the v4 address they actually dial: v4-mapped (`::ffff:a.b.c.d`), the deprecated
+v4-compatible (`::a.b.c.d`), NAT64 (`64:ff9b::/96`) and 6to4 (`2002::/16`); see
+`_embedded_ipv4` / `_blocked_cidr`. Without that fold, `::ffff:169.254.169.254` was
+**the metadata service under a spelling neither deterministic branch recognized**
+— `ipaddress` containment never crosses address families, so it matched none of
+the v4 ranges, and the resolve branch was no help because `getaddrinfo` returns the
+same mapped form straight back, while `connect()` on a v4-mapped address delivers
+to the v4 host. It was reachable in practice because metadata serves on `:80`,
+already a permitted HTTP port; only the host policy's default-deny stood behind
+it, which is exactly the "one mistaken rule or approval" case this guard exists to
+remove. Teredo (`2001::/32`) is deliberately *not* folded — its embedded v4 is the
+client's own NAT, not a destination anything delivers to. The fold is precise
+rather than a blanket v6 ban: `::ffff:8.8.8.8` still goes to policy like any other
+host. `boundary-check.sh` now probes the **mapped** spelling of both control-net
+and metadata alongside the dotted-quad ones — the dotted-quad probes passed
+throughout this bug, so they cannot catch its return.
 
 *Defense-in-depth, not the sole control — and honest about the resolve branch.*
 The hostname and literal-IP checks are **deterministic** (decided from the request

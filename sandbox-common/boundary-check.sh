@@ -161,6 +161,23 @@ if [ -n "${HTTPS_PROXY:-}" ]; then
     else
         bad "egress proxy did NOT 403 metadata IP 169.254.169.254 (got: ${imds:-<none>}) — SSRF/metadata risk"
     fi
+
+    # Same two destinations, written as IPv4-MAPPED IPv6. This is the spelling that
+    # used to defeat the relay guard entirely: address-family containment meant a
+    # mapped address matched none of the v4 blocked ranges, and the resolve branch
+    # re-tested the same unrecognized form, while connect() on a v4-mapped address
+    # still reaches the v4 host. The dotted-quad probes above passed throughout, so
+    # only an explicitly mapped probe can catch a regression here. Both must 403 for
+    # the same reason as their dotted-quad twins — BEFORE any policy or port check.
+    for mapped in "[::ffff:172.31.0.2]" "[::ffff:169.254.169.254]"; do
+        resp="$(curl -sS -x "$HTTPS_PROXY" --connect-timeout 5 --max-time 8 \
+            -o /dev/null "https://${mapped}/" 2>&1 || true)"
+        if printf '%s' "$resp" | grep -q '403'; then
+            ok "egress proxy refuses IPv4-mapped IPv6 destination ($mapped -> 403)"
+        else
+            bad "egress proxy did NOT 403 $mapped (got: ${resp:-<none>}) — mapped-IPv6 guard bypass"
+        fi
+    done
 fi
 
 printf '%s== control plane ==%s\n' "$bold" "$reset"

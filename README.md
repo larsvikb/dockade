@@ -251,6 +251,8 @@ exposed through governed data-plane services. Next steps toward it:
   rationale behind every decision. Start here to understand *why*.
 - [`CLAUDE.md`](CLAUDE.md) — the invariants that must never be violated and the
   conventions for working in this repo.
+- [`SECURITY.md`](SECURITY.md) — how to report a boundary bypass, and — worth
+  reading first — which weaknesses are already known and consciously accepted.
 
 ## License
 

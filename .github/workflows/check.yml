@@ -58,10 +58,26 @@ jobs:
           pipx install yamllint
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Install hadolint
+      # hadolint is the one linter this repo PINS (ruff and yamllint float via pipx,
+      # here and in the image alike), so the version is read out of the Dockerfile
+      # that pins it rather than restated — CI and the sandbox image cannot drift
+      # apart, and bumping HADOLINT_VERSION moves both at once. An earlier version
+      # of this step fetched releases/latest and failed the gate on two rules that
+      # v2.12.0 does not have (DL3064 matching "USER" in `ARG USERNAME=sandbox` as
+      # sensitive; DL3066 wanting numeric UIDs, including for `USER root`), while
+      # `make check` stayed green locally. A linter version is part of the verdict.
+      - name: Install hadolint (version pinned by claude-sandbox/Dockerfile)
         run: |
+          version=$(sed -n 's/^ARG HADOLINT_VERSION=//p' claude-sandbox/Dockerfile)
+          if [ -z "$version" ]; then
+            echo "could not read ARG HADOLINT_VERSION from claude-sandbox/Dockerfile —" >&2
+            echo "refusing to silently fall back to 'latest', which is what broke this" >&2
+            echo "step before. Did the ARG get renamed or moved?" >&2
+            exit 1
+          fi
+          echo "pinned hadolint: $version"
           sudo curl -fsSL -o /usr/local/bin/hadolint \
-            https://github.com/hadolint/hadolint/releases/latest/download/hadolint-Linux-x86_64
+            "https://github.com/hadolint/hadolint/releases/download/$version/hadolint-Linux-x86_64"
           sudo chmod +x /usr/local/bin/hadolint
 
       # Recorded in the log so a run's verdict can be traced to the exact tool

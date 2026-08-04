@@ -169,6 +169,32 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	  exit 1
 	fi
 	echo "  ok — both declare $$srv tokens"
+	echo "== launchers are executable IN THE GIT INDEX =="
+	# `make claude` / `make opencode` / verify-build all invoke these as
+	# ./run-*-sandbox.sh, so the exec bit is load-bearing for anyone who CLONES.
+	#
+	# It must be read from the INDEX, not from disk, and that is the whole point of
+	# this guard: this repo is routinely worked on through a bind mount where git
+	# sets core.fileMode=false, so the on-disk bit is ignored and a 100644 in the
+	# index goes unnoticed indefinitely. That is exactly how run-opencode-sandbox.sh
+	# shipped non-executable — 755 on disk, 644 in the index, working perfectly on
+	# the machine that wrote it and dying with exit 126 on the first fresh clone
+	# (CI). Only the launchers need this: sandbox-lib.sh is sourced, and the scripts
+	# copied into images are chmod'ed by their Dockerfile.
+	if git rev-parse --git-dir >/dev/null 2>&1; then
+	  for launcher in $(LAUNCHERS); do
+	    mode=$$(git ls-files -s -- "$$launcher" | awk '{print $$1}')
+	    if [ "$$mode" != "100755" ]; then
+	      echo "  FAIL: $$launcher is $${mode:-untracked} in the git index, not 100755"
+	      echo "        — a fresh clone could not execute it. Fix with:"
+	      echo "          git update-index --chmod=+x $$launcher"
+	      exit 1
+	    fi
+	    echo "  ok $$launcher (100755)"
+	  done
+	else
+	  echo "  SKIP (not a git checkout — nothing to read the index from)"
+	fi
 	echo "== referenced files exist (Dockerfile COPY / entrypoint) =="
 	for f in $(REFFILES); do
 	  if [ -f "$$f" ]; then echo "  ok $$f"; else echo "  MISSING $$f"; exit 1; fi

@@ -544,6 +544,45 @@ no separate artifact-export path is needed in v1.
   ambushing whoever opens the next pull request. For the same reason the workflow
   prints every tool's version, so a verdict can be traced to what produced it.
 
+  **The CI toolchain is NOT the sandbox image's toolchain, and only one of the
+  differences mattered.** The first CI run failed on hadolint, because the workflow
+  fetched `releases/latest` (2.15.1) while the repo *pins* hadolint at
+  `claude-sandbox/Dockerfile`'s `ARG HADOLINT_VERSION=v2.12.0` — so CI enforced two
+  rules v2.12.0 does not have (DL3064, which reads the "USER" in `ARG
+  USERNAME=sandbox` as sensitive data, and DL3066, which wants numeric UIDs
+  including for `USER root`; both noise here) while `make check` stayed green
+  locally. The workflow now *derives* the version from that ARG rather than
+  restating it, and fails loudly if it cannot be read instead of falling back to
+  `latest` — one source of truth, and a deliberate pin bump moves CI and the image
+  together. A side effect worth knowing: hadolint drift no longer surfaces in the
+  weekly run, it surfaces when someone bumps the pin, which is the better moment.
+
+  The other five differ too (CI vs image: shellcheck 0.9.0 vs 0.10.0, python 3.12.3
+  vs 3.13.5, node 22 vs 24; ruff and yamllint happen to match, and float via pipx in
+  both places). Those are accepted, on a principle worth stating because it is not
+  "CI should be stricter": **a divergence is harmful when it produces surprise AFTER
+  a push.** hadolint was harmful because CI was the stricter side, so the failure
+  could only appear post-push. shellcheck is the reverse — the local gate is the
+  newer one, so anything it can catch it catches first, and no new pin is needed for
+  a tool that has no repo-side pin to derive from. The interpreter difference is a
+  positive: the services run on `python:3.12-slim`, so CI tests closer to production
+  than a dev machine on 3.13 does, and the dependency-free suite gets exercised on
+  both.
+
+  **The build job's first run found a bug that was unobservable locally**, which is
+  the clearest possible argument for having insisted on it. `run-opencode-sandbox.sh`
+  was recorded in the git index as `100644` while being `755` on disk, so `make
+  opencode` worked perfectly on the machine that wrote it and *any fresh clone* got a
+  non-executable launcher — `./run-opencode-sandbox.sh: Permission denied`, exit 126.
+  The reason it could hide is `core.fileMode=false`, which git sets automatically when
+  the working tree lives on a filesystem whose exec bit it cannot trust (this repo is
+  routinely worked on through exactly such a bind mount): git then ignores the on-disk
+  bit entirely, so nothing ever flagged the mismatch. `make consistency` now asserts
+  every launcher is `100755` **in the index** (`git ls-files -s`, not `test -x`, since
+  the on-disk bit is the thing that lies here). Only the launchers need it —
+  `sandbox-lib.sh` is sourced, and scripts copied into images are chmod'ed by their
+  Dockerfile.
+
   **No Docker layer cache**, deliberately for now. Caching across GitHub-hosted
   runners needs `--cache-to/--cache-from type=gha` on the build itself, which
   `docker compose build` does not accept and the launchers do not pass — so it would

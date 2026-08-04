@@ -38,8 +38,21 @@
     border-left: 3px solid var(--hold); border-radius: 8px;
     padding: 12px 14px; margin-bottom: 10px; }
   .card .host { font-weight: 600; font-size: 15px; word-break: break-all; }
-  .card .meta { color: var(--dim); font-size: 12px; margin-top: 2px; }
+  .card .meta { color: var(--dim); font-size: 12px; margin-top: 2px; word-break: break-all; }
   .actions { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
+  /* Card outcome states. A resolve reports itself HERE rather than by the card
+     disappearing on the next SSE tick — that was the only feedback before, so with
+     the feed down a successful approval looked like a hung click. A card that left
+     the queue without us deciding it (hold expired, or resolved elsewhere) goes
+     `stale` in place and is swept only when removing it cannot move a button under
+     the pointer. */
+  .card.busy { opacity: .8; }
+  .card.done-allow { border-left-color: var(--allow); }
+  .card.done-deny { border-left-color: var(--deny); }
+  .card.stale { opacity: .55; border-left-color: var(--line); }
+  .cardmsg { margin-top: 8px; font-size: 12px; color: var(--dim); }
+  .cardmsg.ok { color: var(--allow); }
+  .cardmsg.bad { color: var(--deny); }
   button { font: inherit; border: 1px solid var(--line); background: #202632;
     color: var(--fg); border-radius: 6px; padding: 6px 10px; cursor: pointer; }
   button:hover { border-color: var(--accent); }
@@ -112,7 +125,11 @@
 <main>
   <section id="view-approvals" role="tabpanel" aria-labelledby="tab-approvals">
     <h2>Pending approvals</h2>
-    <div id="pending"><div class="empty">none</div></div>
+    <!-- Cards are keyed by approval id and updated in place (see app.js
+         diffPending), so the empty notice is a sibling that hides rather than
+         markup the render replaces. -->
+    <div id="pending"></div>
+    <div class="empty" id="pending-empty">none</div>
   </section>
 
   <section id="view-decisions" role="tabpanel" aria-labelledby="tab-decisions" hidden>
@@ -137,228 +154,11 @@
     </table>
   </section>
 </main>
-<script>
-  const fmt = ts => new Date(ts * 1000).toLocaleTimeString();
-  // Rules persist for weeks, so this one keeps the DATE. (A time-only stamp on
-  // long-lived rows reads as out-of-order the moment they span midnight.)
-  const fmtDay = ts => new Date(ts * 1000).toLocaleString();
-  const esc = s => (s ?? "").toString().replace(/[&<>"]/g,
-    c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-
-  // ── state the indicators read ───────────────────────────────────────────────
-  let pendingCount = 0;      // approvals waiting on a human
-  let streamUp = false;      // is the SSE feed actually delivering?
-  let policySig = null;      // signature of the rules, to detect change
-  let policyUnseen = false;  // policy changed while another view was showing
-
-  // ── views ───────────────────────────────────────────────────────────────────
-  const VIEWS = ["approvals", "decisions", "policy"];
-  const viewFromHash = () =>
-    VIEWS.includes(location.hash.slice(1)) ? location.hash.slice(1) : "approvals";
-  let current = viewFromHash();
-
-  function showView(name) {
-    current = VIEWS.includes(name) ? name : "approvals";
-    for (const v of VIEWS) {
-      document.getElementById("view-" + v).hidden = v !== current;
-      const tab = document.getElementById("tab-" + v);
-      tab.setAttribute("aria-selected", String(v === current));
-      tab.tabIndex = v === current ? 0 : -1;
-    }
-    // Opening the policy view IS the acknowledgement that its change was seen.
-    if (current === "policy") { policyUnseen = false; }
-    updateIndicators();
-  }
-
-  for (const v of VIEWS) {
-    document.getElementById("tab-" + v).addEventListener("click", () => {
-      // Drive through the hash so a reload, a bookmark and the back button all
-      // land on the same view; hashchange calls showView.
-      if (viewFromHash() === v) showView(v); else location.hash = v;
-    });
-  }
-  window.addEventListener("hashchange", () => showView(viewFromHash()));
-
-  // Arrow-key navigation between tabs, as the tablist role implies.
-  document.querySelector("nav.tabs").addEventListener("keydown", e => {
-    const i = VIEWS.indexOf(current);
-    let next = null;
-    if (e.key === "ArrowRight") next = VIEWS[(i + 1) % VIEWS.length];
-    if (e.key === "ArrowLeft") next = VIEWS[(i - 1 + VIEWS.length) % VIEWS.length];
-    if (e.key === "Home") next = VIEWS[0];
-    if (e.key === "End") next = VIEWS[VIEWS.length - 1];
-    if (!next) return;
-    e.preventDefault();
-    location.hash = next;
-    document.getElementById("tab-" + next).focus();
-  });
-
-  // ── indicators (favicon + title + badges) ───────────────────────────────────
-  // A traffic light, whose three lamps map onto the three states that matter:
-  //   red    — the stream is down, so we are NOT seeing pending approvals. Being
-  //            blind is worth more alarm than being busy: a hold you never see
-  //            default-denies after ~120s.
-  //   amber  — something is waiting on you.
-  //   green  — connected and nothing pending.
-  // All three lamps keep their OWN colour at every state; only the brightness moves.
-  // Rationale is legibility at 16px: with the inactive lamps greyed out, the icon is
-  // a dark rectangle carrying one small coloured dot and stops reading as a traffic
-  // light at all. Three coloured lamps is what makes the shape recognisable, so the
-  // state is carried by opacity instead. The cost is an honest one — dim-to-bright is
-  // a weaker peripheral signal than grey-to-colour, so the `(n)` title prefix does
-  // most of the work of catching the eye in a background tab.
-  const LAMP_DIM = 0.26;
-  const LAMPS = [["red", 9, "#d1242f"], ["amber", 16, "#d29922"],
-                 ["green", 23, "#2ea043"]];
-  const favicon = document.getElementById("favicon");
-
-  function faviconURI(state) {
-    const svg =
-      `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">` +
-      `<rect x="8" y="1" width="16" height="30" rx="5" fill="#0f1115"` +
-      ` stroke="#39404e" stroke-width="1.5"/>` +
-      LAMPS.map(([name, cy, colour]) =>
-        `<circle cx="16" cy="${cy}" r="4" fill="${colour}"` +
-        ` fill-opacity="${state === name ? 1 : LAMP_DIM}"/>`).join("") +
-      `</svg>`;
-    // encodeURIComponent, not raw: '#' in the colours would otherwise start a
-    // fragment and truncate the SVG.
-    return "data:image/svg+xml," + encodeURIComponent(svg);
-  }
-
-  let faviconState = null;
-
-  function updateIndicators() {
-    const state = !streamUp ? "red" : pendingCount ? "amber" : "green";
-    // Only touch the <link> when the state actually CHANGES. This runs on every
-    // poll (~15x a minute, forever), and browsers treat each href assignment as a
-    // fresh favicon load — which is wasted work at best and a visibly flickering
-    // tab icon at worst.
-    if (state !== faviconState) {
-      faviconState = state;
-      favicon.href = faviconURI(state);
-    }
-    // Title prefix so a BACKGROUND tab shows the count in the tab strip — the
-    // case that matters, since nobody watches this page while working.
-    document.title = (pendingCount ? `(${pendingCount}) ` : "") +
-      "dockade control plane";
-
-    const pa = document.getElementById("badge-approvals");
-    pa.textContent = String(pendingCount);
-    pa.classList.toggle("hot", pendingCount > 0);
-
-    const pb = document.getElementById("badge-policy");
-    pb.classList.toggle("unseen", policyUnseen && current !== "policy");
-  }
-
-  // ── data ────────────────────────────────────────────────────────────────────
-  async function resolve(id, action, btn) {
-    const card = btn.closest(".card");
-    card.querySelectorAll("button").forEach(b => b.disabled = true);
-    try {
-      const r = await fetch(`/approvals/${id}/resolve`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action })
-      });
-      if (!r.ok) {
-        const d = await r.json().catch(() => ({}));
-        alert("Could not resolve: " + (d.detail || r.status));
-        card.querySelectorAll("button").forEach(b => b.disabled = false);
-      }
-      // On success the SSE stream will drop this card on the next tick.
-    } catch (e) {
-      alert("Request failed: " + e);
-      card.querySelectorAll("button").forEach(b => b.disabled = false);
-    }
-    refreshAudit();
-    // A "+ persist" action just changed standing policy. Refresh it at once so the
-    // Policy badge marks the change while you are still on the approvals view.
-    refreshRules();
-  }
-
-  function renderPending(list) {
-    pendingCount = list.length;
-    updateIndicators();
-    const el = document.getElementById("pending");
-    if (!list.length) { el.innerHTML = '<div class="empty">none</div>'; return; }
-    el.innerHTML = list.map(a => `
-      <div class="card" data-id="${esc(a.id)}">
-        <div class="host">${esc(a.host)}${a.port ? ":" + esc(a.port) : ""}</div>
-        <div class="meta">${esc(a.proto || "")} &middot; requested ${fmt(a.ts)}
-          ${a.client ? "&middot; from " + esc(a.client) : ""}
-          ${a.url ? "&middot; " + esc(a.url) : ""}</div>
-        <div class="actions">
-          <button class="allow" data-a="allow_once">Allow once</button>
-          <button class="allow" data-a="allow_persist">Allow + persist rule</button>
-          <button class="deny" data-a="deny_once">Deny once</button>
-          <button class="deny" data-a="deny_persist">Deny + persist rule</button>
-        </div>
-      </div>`).join("");
-    el.querySelectorAll("button").forEach(b =>
-      b.addEventListener("click", () =>
-        resolve(b.closest(".card").dataset.id, b.dataset.a, b)));
-  }
-
-  async function refreshAudit() {
-    try {
-      const rows = await (await fetch("/api/audit?limit=40")).json();
-      document.getElementById("audit").innerHTML = rows.map(r => `
-        <tr><td class="ts">${fmt(r.ts)}</td>
-          <td><span class="tag ${esc(r.decision)}">${esc(r.decision)}</span></td>
-          <td>${esc(r.host)}</td><td>${esc(r.reason)}</td></tr>`).join("");
-    } catch (e) { /* transient; next poll retries */ }
-  }
-
-  async function refreshRules() {
-    try {
-      const rows = await (await fetch("/api/rules")).json();
-      // Signature over pattern+action, not just the COUNT: a rule whose action
-      // flipped is the change most worth noticing, and it leaves the count alone.
-      const sig = JSON.stringify(rows.map(r => r.action + " " + r.pattern));
-      if (policySig !== null && sig !== policySig && current !== "policy") {
-        policyUnseen = true;
-      }
-      policySig = sig;
-
-      document.getElementById("badge-policy").textContent = String(rows.length);
-      document.getElementById("rulecount").textContent =
-        rows.length ? `· ${rows.length} rule${rows.length === 1 ? "" : "s"}` : "· none";
-      document.getElementById("rules").innerHTML = rows.map(r => {
-        const wild = (r.pattern || "").startsWith(".");
-        return `<tr>
-          <td><span class="tag ${esc(r.action)}">${esc(r.action)}</span></td>
-          <td><code>${esc(r.pattern)}</code></td>
-          <td class="${wild ? "wild" : "ts"}">${esc(r.scope)}</td>
-          <td class="ts">${esc(r.source)}</td>
-          <td class="ts">${r.created_at ? fmtDay(r.created_at) : ""}</td></tr>`;
-      }).join("");
-      updateIndicators();
-    } catch (e) { /* transient; next poll retries */ }
-  }
-
-  // ── wiring ──────────────────────────────────────────────────────────────────
-  const conn = document.getElementById("conn");
-  const es = new EventSource("/approvals/stream");
-  es.onopen = () => {
-    streamUp = true; conn.textContent = "live"; conn.className = "up";
-    updateIndicators();
-  };
-  es.onerror = () => {
-    // The feed is the only thing that tells us about pending approvals, so losing
-    // it means we are blind, not idle — say so in the light rather than sitting on
-    // a stale green.
-    streamUp = false; conn.textContent = "reconnecting…"; conn.className = "down";
-    updateIndicators();
-  };
-  es.addEventListener("pending", e => renderPending(JSON.parse(e.data)));
-
-  showView(current);
-  refreshAudit();
-  refreshRules();
-  // Both keep polling regardless of which view is showing — otherwise the badges
-  // could not report a hidden view's state, which is the whole reason they exist.
-  setInterval(refreshAudit, 4000);
-  setInterval(refreshRules, 4000);
-</script>
+<!-- Behaviour lives in app.js, NOT inline: an external script is what lets the
+     Content-Security-Policy this app sends say `script-src 'self'` instead of
+     `'unsafe-inline'`, and it is what makes the decision logic unit-testable
+     (tests/test_control_plane_ui_js.py). Same origin, served by this container —
+     never a CDN. -->
+<script src="/app.js" defer></script>
 </body>
 </html>

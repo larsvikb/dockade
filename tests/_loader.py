@@ -77,12 +77,18 @@ def _install_fastapi_stub() -> None:
         """Enough of a Starlette response to assert on: the handlers return these,
         and tests check the status. ``status_code`` mirrors the real attribute so a
         test never has to reach into ``kwargs`` (and so this stub stays usable by the
-        control-plane-ui tests, which share whichever fastapi stub loads first)."""
+        control-plane-ui tests, which share whichever fastapi stub loads first).
+
+        ``headers`` is a plain dict standing in for Starlette's ``MutableHeaders``:
+        the UI's ``_security_headers`` middleware writes the CSP onto whatever
+        response it wraps, refusals included, so a response object without it is not
+        enough of a response to test that path."""
 
         def __init__(self, *args, **kwargs):
             self.args, self.kwargs = args, kwargs
             self.status_code = kwargs.get("status_code", 200)
             self.body = args[0] if args else None
+            self.headers = dict(kwargs.get("headers") or {})
 
     responses.JSONResponse = _Resp
     responses.PlainTextResponse = _Resp

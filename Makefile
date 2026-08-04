@@ -66,6 +66,7 @@ REFFILES := $(SCRIPTS) \
             control-plane-ui/app.py \
             control-plane-ui/requirements.txt \
             control-plane-ui/index.html \
+            control-plane-ui/app.js \
             policies/egress-allowlist.txt
 
 .PHONY: help check lint consistency test verify-build \

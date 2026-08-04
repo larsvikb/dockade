@@ -37,6 +37,13 @@ allowlist):
      a browser. `POST /authorize` is the proxy's decision endpoint; reaching it from
      a page means forged audit rows and consumed hold slots. Only the paths this UI
      actually uses are relayed.
+  4. **Refusal to be EMBEDDED** (`frame-ancestors 'none'` in the CSP, plus a
+     `Sec-Fetch-Dest` check) — closes CLICKJACKING, which guards 1 and 2 cannot see.
+     An attacker page that frames this UI sends a perfectly legitimate
+     `Host: 127.0.0.1`, and the framed document's own `resolve` POST is *same-origin
+     from inside the frame*, so both guards pass; cross-origin reads stay blocked, but
+     a UI-redress click needs no read — it lands on the real "Allow + persist rule"
+     button. See `_CSP` / `_FRAMED_DESTS`.
 
 What these guards CANNOT do, stated plainly so the boundary is not overclaimed:
 they are BROWSER-ENFORCED. A process running on the host sets any header it likes,
@@ -67,6 +74,12 @@ from starlette.background import BackgroundTask
 BACKEND = os.environ.get(
     "CONTROL_BACKEND_URL", "http://control-plane:8090").rstrip("/")
 UI_INDEX = os.environ.get("CONTROL_UI_INDEX", "/opt/control-plane-ui/index.html")
+# The page's behaviour, served as a separate file rather than inline in the HTML.
+# That is what lets the CSP below say `script-src 'self'` instead of
+# `'unsafe-inline'` — an inline-script allowance makes the whole policy decorative
+# against injection — and it is what makes the frontend's decision logic testable
+# (tests/test_control_plane_ui_js.py).
+UI_SCRIPT = os.environ.get("CONTROL_UI_SCRIPT", "/opt/control-plane-ui/app.js")
 
 
 def _hostnames(env: str, default: str) -> frozenset[str]:
@@ -115,6 +128,49 @@ _STRIP_REQ = {"host", ACTOR_HEADER, "x-forwarded-for", "x-forwarded-host",
 
 # Hop-by-hop / framing headers we must not copy through a streaming relay.
 _STRIP_RESP = {"content-length", "transfer-encoding", "connection"}
+
+# Fetch destinations that mean "this response is being EMBEDDED in another page".
+# Refused because neither guard above can see the difference: an attacker page that
+# frames http://127.0.0.1:8081 causes a request with a legitimate `Host: 127.0.0.1`
+# (guard 1 passes) using GET, which is deliberately allowed cross-origin (guard 2
+# does not apply) — and the framed page's own resolve POST then reads as
+# `Sec-Fetch-Site: same-origin`, because from inside the frame it is. The attacker
+# cannot READ the framed UI, but clickjacking does not need a read: overlay a decoy,
+# and the operator's click lands on the real "Allow + persist rule" button.
+#
+# `frame-ancestors 'none'` in _CSP is the primary control; this check is not
+# redundant with it. Both are browser-enforced, but refusing the embedded document
+# HERE means the attempt appears as a 403 in this app's log rather than only in the
+# operator's console — visibility being what this repo falls back on wherever
+# prevention is browser-dependent (see the provenance note above).
+_FRAMED_DESTS = frozenset({"iframe", "frame", "embed", "object"})
+
+# Sent on EVERY response, refusals included (see `_security_headers`).
+#
+# `default-src 'none'` then names only what the page genuinely uses: its own script
+# (`'self'` — hence app.js being a file), the inline <style> block, the data-URI
+# favicon under img-src, and same-origin fetch/EventSource under connect-src. The
+# effect worth having is that the pending list renders AGENT-CONTROLLED strings
+# (host, url, client), so if an escaping mistake ever became script, that script
+# could still reach no external origin, load nothing, and submit nowhere.
+_CSP = ("default-src 'none'; "
+        "script-src 'self'; "
+        "style-src 'unsafe-inline'; "
+        "img-src data:; "
+        "connect-src 'self'; "
+        "base-uri 'none'; "
+        "form-action 'none'; "
+        "frame-ancestors 'none'")
+
+_SECURITY_HEADERS = {
+    "content-security-policy": _CSP,
+    # Redundant with frame-ancestors on any current browser; kept because it costs a
+    # header and covers an old one that honours neither Sec-Fetch-Dest nor CSP 2.
+    "x-frame-options": "DENY",
+    "x-content-type-options": "nosniff",
+    # This origin's URLs name approval ids; nothing should carry them outward.
+    "referrer-policy": "no-referrer",
+}
 
 app = FastAPI(title="dockade control-plane UI", version="2b-2")
 
@@ -174,6 +230,10 @@ async def _guard(request: Request, call_next):
         # Also catches a missing Host, which HTTP/1.1 forbids anyway.
         return _refuse(f"unexpected Host {hostname or '<absent>'!r} "
                        f"(allowed: {sorted(ALLOWED_HOSTNAMES)}) — possible DNS rebinding")
+    dest = (request.headers.get("sec-fetch-dest") or "").lower()
+    if dest in _FRAMED_DESTS:
+        return _refuse(f"refusing to be embedded (Sec-Fetch-Dest: {dest}) — "
+                       f"clickjacking of the approval buttons")
     if request.method.upper() in _UNSAFE_METHODS:
         # Prefer Sec-Fetch-Site when the browser sends it: it states the relationship
         # directly and, like Host and Origin, JS cannot forge it. Absent (older
@@ -191,6 +251,25 @@ async def _guard(request: Request, call_next):
     return await call_next(request)
 
 
+# Declared AFTER `_guard` on purpose: with Starlette's `@app.middleware("http")` the
+# last-registered middleware is the OUTERMOST, so this one wraps the guard and
+# therefore also hardens its 403 refusals — including the refused framing attempt,
+# whose response a browser would otherwise render with no policy at all.
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    """Set the browser-facing security headers on every response.
+
+    Kept separate from `_guard` rather than folded into it because the two do
+    different jobs: `_guard` decides whether to serve at all, this decides what the
+    browser is permitted to do with what was served. Plain assignment, not
+    `setdefault`: these responses include RELAYED backend ones, and a header from
+    upstream must not be able to weaken the frontend's policy."""
+    response = await call_next(request)
+    for name, value in _SECURITY_HEADERS.items():
+        response.headers[name] = value
+    return response
+
+
 @app.get("/healthz")
 def healthz() -> dict:
     return {"status": "ok"}
@@ -199,6 +278,14 @@ def healthz() -> dict:
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(UI_INDEX, media_type="text/html")
+
+
+@app.get("/app.js")
+def script() -> FileResponse:
+    """The page's behaviour. A local static file — never a CDN reference, for the same
+    reason the favicon is an inline data URI: a governance UI must not fetch its own
+    control logic from a third party."""
+    return FileResponse(UI_SCRIPT, media_type="text/javascript")
 
 
 def _relay_allowed(method: str, path: str) -> bool:
@@ -236,7 +323,20 @@ async def proxy(path: str, request: Request) -> Response:
         headers=[(k, v) for k, v in request.headers.items()
                  if k.lower() not in _STRIP_REQ] + [(ACTOR_HEADER, peer)],
     )
-    resp = await _client.send(req, stream=True)
+    try:
+        resp = await _client.send(req, stream=True)
+    except httpx.RequestError as exc:
+        # The backend is down, restarting, or unresolvable. Answer a clean 502 rather
+        # than letting the exception surface as a 500 with a traceback.
+        #
+        # This is load-bearing for the SSE feed, not just tidiness. An EventSource
+        # treats ANY non-200 as a PERMANENT close (readyState CLOSED, no built-in
+        # retry), so a backend restart used to leave the page silently blind while its
+        # status line still read "reconnecting…". app.js now reconnects by hand from
+        # CLOSED with backoff; a legible 502 is what it reconnects from.
+        return PlainTextResponse(
+            f"control-plane backend unreachable: {type(exc).__name__}\n",
+            status_code=502)
     return StreamingResponse(
         resp.aiter_raw(),
         status_code=resp.status_code,

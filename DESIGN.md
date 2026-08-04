@@ -490,10 +490,12 @@ no separate artifact-export path is needed in v1.
   opaque `403` to the agent as any other deny) can't be asserted there.
 
   The suite was then extended to the **async decision flow** the pure-function
-  tests couldn't reach (**105 tests total**, still dependency-free — the count
+  tests couldn't reach (**132 tests total**, still dependency-free — the count
   includes the `control-plane-ui` relay host-pinning regression tests that came
   with the 2b-2 split, the mapped-IPv6 relay-guard regression suite, and the
   frontend's Host / cross-origin / relay-allowlist / provenance guards, the
+  embedding refusal and security-header policy, the backend-unreachable 502, the
+  page script's own decision helpers (see "The frontend's own tests" below), the
   standing-policy rules view, and the fresh-schema guard on the provenance column): the proxy's
   `_authorize` (permanent-lifeline short-circuit with no control-plane call, and
   fail-closed on any control-plane error / non-`allow` decision — `_post_authorize`
@@ -542,6 +544,43 @@ no separate artifact-export path is needed in v1.
   specific threat (the agent reaching host execution via the workspace mount), not
   because "the UI has no auth"; naive auth does not help, since any credential at
   rest on the host is readable by the same process.
+- **Approval-UI follow-ups (reviewed and specified, not built).** From the same review
+  that produced the reconnect / CSP / keyed-rendering work above, in value order:
+  - **A hold countdown.** A held request *blocks the agent* and default-denies after
+    `CONTROL_HOLD_TIMEOUT`, yet the card shows only a static "requested 14:32:05" and
+    then disappears. The operator cannot tell whether they have 100 seconds or 4. Needs
+    the timeout exposed (a small `GET /api/config`, added to the relay allowlist), an
+    `expires in 43s` countdown with a depleting bar, and an explicit
+    `expired — default-denied` marker rather than a silent removal (the keyed rendering
+    already parks such a card in place, so this is now a small addition). This is the
+    difference between hold-for-approval and a slow deny.
+  - **Say what a persist will write, and confirm it.** `resolve` stores the requested
+    host verbatim, a leading dot is a subdomain wildcard, and nothing revokes — a
+    mis-click is permanent short of hand-editing SQLite. The card should preview
+    `persists: example.com · exact host` (flagging a wildcard loudly) and require a
+    second click for the two `*_persist` actions specifically, justified by
+    irreversibility rather than by risk. The better fix is a `pattern` field on
+    `ResolveRequest` so exact-vs-wildcard is an operator choice, not an agent-controlled
+    string — see the rule-mutation item above.
+  - **The decisions table drops data the backend already sends** (`stage` is selected
+    and never rendered; `client` is not selected at all, though this control plane is
+    shared across sandboxes), stamps rows time-only so 40 rows read out of order across
+    midnight, has no empty state, and encodes the decision by colour alone.
+  - **Saturation is invisible.** Over `CONTROL_MAX_PENDING(_PER_CLIENT)` `/authorize`
+    fails closed and the agent just gets denies — governance degraded, visible only as a
+    reason string. Wants a banner plus an `n/16 holds` counter.
+  - **Collapse duplicate holds by host.** Retrying clients routinely produce several
+    holds for one host, so one decision costs four clicks and can fill the per-client
+    cap; grouping also sidesteps the `INSERT OR IGNORE` wart where a second
+    `deny_persist` writes nothing while reporting `persisted: true`.
+  - **Opt-in desktop notification.** `http://localhost` is a secure context, so the
+    Notification API is available; with a ~120s fuse and a page nobody watches, this is
+    the honest fix for the problem the `(n)` title prefix only mitigates.
+  - Smaller: `/status` is on the relay allowlist but unused (allowlists rot — use it or
+    drop it); `_STRIP_REQ` should also strip `content-length` / `transfer-encoding` /
+    `connection` / `expect`; audit and rules poll failures are swallowed, so those views
+    can show stale data while `conn` still reads "live"; no `aria-live` on the pending
+    list; both pollers run at 4s even in a hidden tab.
 - Normalize hosts consistently across the control plane. The proxy's relay guard
   strips a trailing FQDN dot but `_decide` / `_match` only lowercase, so `evil.com.`
   misses a persisted **block** rule and lands in a hold instead — fail-safe, but it
@@ -1375,6 +1414,89 @@ unguessable id. Three structural guards now sit in front (`control-plane-ui/app.
   backend surface is not uniformly browser-appropriate: reaching `POST /authorize`
   from a page means forged audit rows and consumed hold slots on the governance
   authority. The old catch-all `/{path:path}` relayed it.
+- **Refusal to be embedded** — closes **clickjacking**, which is the gap the first
+  three guards structurally cannot see, and it was open until now. An attacker page
+  that frames `http://127.0.0.1:8081` produces a request with a perfectly legitimate
+  `Host: 127.0.0.1` (guard 1 satisfied) by GET, which is deliberately allowed
+  cross-origin (guard 2 does not apply) — and the framed document's own `resolve`
+  POST then reads as `Sec-Fetch-Site: same-origin`, because from inside the frame it
+  genuinely is. Cross-origin *reads* stay blocked throughout, but a UI-redress attack
+  needs no read: overlay a decoy on the invisible frame and the operator's click
+  lands on the real "Allow + persist rule" button, granting standing egress. The
+  unguessable `uuid4` id that defeats a blind CSRF is no help either — a click does
+  not need to know it. Closed by `frame-ancestors 'none'` in the CSP below, plus a
+  `Sec-Fetch-Dest: iframe|frame|embed|object` refusal in `_guard`; the second is not
+  redundant, it makes the attempt a 403 in *this app's* log rather than a message in
+  the operator's browser console, which is the visibility this repo falls back on
+  wherever prevention is browser-dependent.
+
+**Security headers on every response, and why the script became a file.** A
+`_security_headers` middleware sets a Content-Security-Policy (plus `X-Frame-Options`,
+`nosniff`, `no-referrer`) on everything this app serves, refusals included — it is
+registered *after* `_guard`, which under Starlette makes it the **outer** middleware,
+so a refused framing attempt is itself delivered under the policy. The policy is
+`default-src 'none'` naming only what the page uses, and it is applied by assignment
+rather than `setdefault` because relayed backend responses pass through it and an
+upstream header must not be able to weaken the frontend's policy.
+
+The directive that shaped a file move is `script-src 'self'`. The page's behaviour used
+to be inline in `index.html`, which would have forced `'unsafe-inline'` and reduced the
+whole policy to decoration — on the one page that renders **agent-controlled** strings
+(the requested host, url and client on each approval card). So the script now lives in
+`control-plane-ui/app.js`, served from this origin (never a CDN, for the same reason the
+favicon is an inline data URI: a governance UI must not fetch its own control logic from
+a third party). The payoff is doubled: it also made the frontend testable for the first
+time. Because that invariant spans two files and re-inlining would break nothing
+*visible*, a test asserts the page carries no inline script or event handlers, and
+another asserts every `getElementById` in `app.js` matches an id that exists in
+`index.html` — the split's new failure mode is a renamed id, which is a `null`
+dereference that would otherwise appear only in a browser.
+
+**The stream had no reconnect, and said otherwise.** The page treated every
+`EventSource` error as transient. It is not: an `EventSource` retries *by itself* only
+from `CONNECTING`, and a non-200 response or wrong MIME type puts it in `CLOSED`
+**permanently**. That state was reachable in ordinary operation — the relay had no
+exception handling, so a backend restart made `httpx.ConnectError` a 500, the browser
+gave up for good, and the status line went on reading "reconnecting…" while the page was
+blind until someone reloaded it. Being blind is the exact failure the traffic light was
+built around (an unseen hold default-denies after `CONTROL_HOLD_TIMEOUT`), so this was
+the most consequential defect in the UI. Fixed at both ends: the relay answers a clean
+**502** on any `httpx.RequestError`, and `app.js` reconnects by hand from `CLOSED` with
+doubling backoff (1s → 30s cap, no jitter — jitter de-synchronises a fleet, and this
+page has one operator, so determinism is worth more and makes the delay assertable),
+reporting `retrying in Ns` instead of a comforting lie.
+
+**The approvals list is keyed, and does not move under the cursor.** Rendering was an
+`innerHTML` assignment of the whole list on every push, up to once a second. A hold
+expires on its own after ~120s, so a card leaving the *middle* of the queue shifted
+every card below it upward — between the operator's eye and their click, on a row of
+buttons that **grant egress**. It also discarded the `disabled` state a resolve in
+flight had just set. Cards are now created once, keyed by approval id, and updated in
+place (`diffPending`); an unchanged push is a no-op. A card that leaves the queue
+without the operator deciding it is marked **stale in place** with the reason rather
+than yanked out, and swept only when removal cannot move a button under the pointer —
+nothing in the list hovered or focused — with a 15s cap so a parked cursor cannot freeze
+the list. Cards are built with `createElement`/`textContent` rather than an HTML string,
+so for the one list that renders agent-controlled values the question of whether `esc()`
+covers every context does not arise.
+
+**A resolve now reports itself.** Previously the only feedback was the card vanishing on
+the next SSE tick, so with the feed down — precisely the state above — a successful
+approval was indistinguishable from a hung click, and errors arrived as a blocking
+`alert()`. The card now shows `✓ allowed · standing rule for example.com` (or
+`· this request only`) inline the moment the POST returns, keeps its buttons disabled,
+and on a `409` says so specifically — "no longer pending" is a different fact from a
+failure, and re-enabling the buttons would only invite a second failing click.
+
+**The frontend's own tests.** `tests/test_control_plane_ui_js.py` runs the pure helpers
+under `node` (skipped when node is absent, the way `make lint` skips a missing linter)
+and asserts in Python, so failures read like the rest of `tests/`. It covers the lamp
+precedence (blind outranks busy), the backoff bounds and monotonicity, the keyed-diff
+properties, and the sweep gating. Everything that touches the DOM lives inside
+`start()`, which runs only in a browser — so requiring the module under node must be
+side-effect free, and the test asserts that too: if DOM work migrates to the top level,
+`require` throws and the file cannot quietly become untestable again. Still no
+browser-level test; `start()`'s DOM path is covered only by the id-agreement guard.
 
 *What these cannot do.* They are **browser-enforced**. A process running on the host
 sets any header it likes and can still reach the API — and that is not hypothetical

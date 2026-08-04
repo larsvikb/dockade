@@ -77,8 +77,18 @@ def _install_stubs() -> None:
             async def send(self, req, stream=False):
                 return _Resp()
 
+        class RequestError(Exception):
+            """Stand-in for the base of httpx's transport errors — what the relay
+            catches to answer 502 when the backend is unreachable."""
+
         httpx.AsyncClient = AsyncClient
+        httpx.RequestError = RequestError
         sys.modules["httpx"] = httpx
+
+    # Augment rather than assume ownership: discovery order is arbitrary, so another
+    # module may have installed an httpx stub of its own first.
+    if not hasattr(sys.modules["httpx"], "RequestError"):
+        sys.modules["httpx"].RequestError = type("RequestError", (Exception,), {})
 
     # Another test module may have installed the shared fastapi stub first (test
     # discovery order is arbitrary), so augment whatever exists rather than assume
@@ -92,6 +102,9 @@ def _install_stubs() -> None:
             self.args, self.kwargs = a, k
             self.status_code = k.get("status_code", 200)
             self.body = a[0] if a else None
+            # A dict stands in for Starlette's MutableHeaders — `_security_headers`
+            # writes onto every response it wraps, refusals included.
+            self.headers = dict(k.get("headers") or {})
 
     if "fastapi" not in sys.modules:
         fa = types.ModuleType("fastapi")
@@ -335,6 +348,150 @@ class ProvenanceHeaderTests(unittest.TestCase):
         # httpx must set Host for the backend, or the upstream sees the UI's.
         names = [k.lower() for k, _ in self._relay_headers(_ok_host())]
         self.assertNotIn("host", names)
+
+
+class FramingGuardTests(unittest.TestCase):
+    """Clickjacking is the one browser-side vector the Host and cross-origin guards
+    cannot see: framing this UI produces a legitimate `Host: 127.0.0.1` on a GET
+    (allowed cross-origin by design), and the framed page's own resolve POST really is
+    same-origin. Reads stay blocked, but a UI-redress click needs no read — it lands
+    on the real "Allow + persist rule" button."""
+
+    def _guard(self, request):
+        return asyncio.run(ui._guard(request, _passthrough))
+
+    def test_embedded_destinations_are_refused(self):
+        for dest in ("iframe", "frame", "embed", "object"):
+            resp = self._guard(_ok_host(headers={"sec-fetch-dest": dest}))
+            self.assertEqual(getattr(resp, "status_code", None), 403, dest)
+
+    def test_normal_destinations_are_served(self):
+        # The top-level page, the script, and the fetch/EventSource calls.
+        for dest in ("document", "script", "empty", ""):
+            self.assertEqual(
+                self._guard(_ok_host(headers={"sec-fetch-dest": dest})),
+                "REACHED-THE-APP", dest or "<absent>")
+
+    def test_embedded_post_is_refused_even_when_same_origin(self):
+        # The POST from inside a frame is genuinely same-origin, so guard 2 passes it;
+        # this must not be the only thing standing between a frame and `resolve`.
+        resp = self._guard(_ok_host(method="POST", headers={
+            "sec-fetch-site": "same-origin", "sec-fetch-dest": "iframe"}))
+        self.assertEqual(resp.status_code, 403)
+
+
+def _directives(csp: str) -> dict[str, list[str]]:
+    """Parse a CSP into {directive: [sources]} so tests assert on the POLICY rather
+    than on a substring of a header value."""
+    out = {}
+    for part in csp.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        name, _, rest = part.partition(" ")
+        out[name.lower()] = rest.split()
+    return out
+
+
+class _FakeResponse:
+    def __init__(self, status_code=200, headers=None):
+        self.status_code = status_code
+        self.headers = dict(headers or {})
+
+
+class SecurityHeaderTests(unittest.TestCase):
+    """Every response carries the browser-facing policy — refusals included, since a
+    refusal is still a document a browser may have framed."""
+
+    def _headers(self, upstream=None, status_code=200):
+        async def _next(_request):
+            return _FakeResponse(status_code=status_code, headers=upstream or {})
+        resp = asyncio.run(ui._security_headers(_ok_host(), _next))
+        return resp.headers
+
+    def test_frame_ancestors_none_is_present(self):
+        # The load-bearing directive: this is what actually closes clickjacking in a
+        # browser (the Sec-Fetch-Dest refusal above is for the log trail).
+        csp = _directives(self._headers()["content-security-policy"])
+        self.assertEqual(csp.get("frame-ancestors"), ["'none'"])
+
+    def test_script_src_is_self_and_never_unsafe_inline(self):
+        # The whole reason app.js is a file. An 'unsafe-inline' script-src would make
+        # the rest of this policy decorative against an injection in the pending list,
+        # which renders agent-controlled host/url/client strings.
+        csp = _directives(self._headers()["content-security-policy"])
+        self.assertEqual(csp.get("script-src"), ["'self'"])
+
+    def test_policy_denies_by_default_and_allows_only_what_the_page_uses(self):
+        csp = _directives(self._headers()["content-security-policy"])
+        self.assertEqual(csp.get("default-src"), ["'none'"])
+        self.assertEqual(csp.get("connect-src"), ["'self'"])   # fetch + EventSource
+        self.assertEqual(csp.get("img-src"), ["data:"])        # the inline favicon
+        self.assertEqual(csp.get("base-uri"), ["'none'"])
+        self.assertEqual(csp.get("form-action"), ["'none'"])
+        # No external origin is permitted anywhere in the policy — a governance UI
+        # must not be able to load or reach a third party even under an injection.
+        for sources in csp.values():
+            for src in sources:
+                self.assertNotIn("//", src)
+                self.assertNotIn("*", src)
+
+    def test_supporting_headers_are_set(self):
+        headers = self._headers()
+        self.assertEqual(headers["x-frame-options"], "DENY")
+        self.assertEqual(headers["x-content-type-options"], "nosniff")
+        self.assertEqual(headers["referrer-policy"], "no-referrer")
+
+    def test_a_relayed_backend_header_cannot_weaken_the_policy(self):
+        # These responses include relayed ones, so upstream headers pass through this
+        # middleware. Assignment (not setdefault) is what makes the frontend's policy
+        # authoritative over anything the backend might send.
+        headers = self._headers(upstream={"content-security-policy": "default-src *"})
+        self.assertEqual(headers["content-security-policy"], ui._CSP)
+
+    def test_guard_refusals_are_hardened_too(self):
+        # `_security_headers` is registered AFTER `_guard`, which under Starlette makes
+        # it the OUTER middleware — so it wraps the guard's 403s. If that ordering is
+        # ever inverted, a refused framing attempt would render with no policy at all.
+        async def _refusing(_request):
+            return ui._refuse("nope")
+
+        resp = asyncio.run(ui._security_headers(_ok_host(), _refusing))
+        self.assertEqual(resp.status_code, 403)
+        self.assertIn("frame-ancestors 'none'", resp.headers["content-security-policy"])
+
+
+class BackendUnreachableTests(unittest.TestCase):
+    """A backend that is down/restarting must produce a legible 502, not a 500.
+
+    Load-bearing for the SSE feed specifically: an EventSource treats ANY non-200 as a
+    PERMANENT close (readyState CLOSED, no built-in retry), so this path is what the
+    page's hand-rolled reconnect reconnects from. Before it existed the exception
+    became a 500 and the page sat blind on "reconnecting…" until a manual reload."""
+
+    def _proxy_with_dead_backend(self, path="approvals", method="GET"):
+        async def _boom(_req, stream=False):
+            raise sys.modules["httpx"].RequestError("connection refused")
+
+        _sent.clear()
+        with mock.patch.object(ui._client, "send", _boom):
+            return asyncio.run(ui.proxy(path, _ok_host(method=method)))
+
+    def test_transport_error_becomes_502(self):
+        resp = self._proxy_with_dead_backend()
+        self.assertEqual(resp.status_code, 502)
+
+    def test_stream_path_also_becomes_502(self):
+        # The case that matters: this is the endpoint EventSource is attached to.
+        resp = self._proxy_with_dead_backend("approvals/stream")
+        self.assertEqual(resp.status_code, 502)
+
+    def test_the_guards_still_run_first(self):
+        # A dead backend must not turn a refusal into a 502 — the refusal happens
+        # before any upstream call is attempted.
+        resp = self._proxy_with_dead_backend("authorize", "POST")
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(_sent, {}, "must not reach the backend at all")
 
 
 class RelayHostPinningTests(unittest.TestCase):

@@ -16,6 +16,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py ./app.py
 COPY index.html ./index.html
+# The page script, served as a file rather than inlined into index.html — that is
+# what lets the CSP say `script-src 'self'` (see _CSP in app.py).
+COPY app.js ./app.js
 
 USER cpui
 EXPOSE 8090

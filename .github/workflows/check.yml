@@ -47,15 +47,27 @@ jobs:
     env:
       DOCKADE_REQUIRE_TOOLS: 1
     steps:
-      - uses: actions/checkout@v4
+      # v5 targets Node 24. v4 targets Node 20, which GitHub has deprecated and is
+      # already force-running on 24 — a warning on every run and a future failure.
+      # Credentials are NOT persisted: nothing after checkout needs git auth (the
+      # consistency guards use `git ls-files`/`rev-parse`, both local; verify-build
+      # touches git not at all), so leaving the token in .git/config for the job's
+      # duration buys nothing and widens the window in which a later step could read it.
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       # ruff and yamllint via pipx, which is how claude-sandbox/Dockerfile installs
       # them too — CI and the agent image get the linters the same way. Unpinned, per
       # the ruff.toml rationale; the scheduled run above is what catches drift.
+      # --force because the runner image ALREADY ships yamllint via pipx, so a plain
+      # `pipx install` is a silent no-op ("already seems to be installed") and the
+      # version would be pinned by the runner image rather than floating from PyPI as
+      # the ruff.toml rationale intends. The step should do what it says.
       - name: Install ruff + yamllint
         run: |
-          pipx install ruff
-          pipx install yamllint
+          pipx install --force ruff
+          pipx install --force yamllint
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       # hadolint is the one linter this repo PINS (ruff and yamllint float via pipx,
@@ -104,7 +116,15 @@ jobs:
     env:
       DOCKADE_REQUIRE_TOOLS: 1
     steps:
-      - uses: actions/checkout@v4
+      # v5 targets Node 24. v4 targets Node 20, which GitHub has deprecated and is
+      # already force-running on 24 — a warning on every run and a future failure.
+      # Credentials are NOT persisted: nothing after checkout needs git auth (the
+      # consistency guards use `git ls-files`/`rev-parse`, both local; verify-build
+      # touches git not at all), so leaving the token in .git/config for the job's
+      # duration buys nothing and widens the window in which a later step could read it.
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       # Covers all five Dockerfiles: the three compose services, plus BOTH sandbox
       # tiers via each launcher's --build-only (which builds and exits — no workspace
@@ -113,6 +133,11 @@ jobs:
       - name: make verify-build
         run: make verify-build
 
+      # Filtered to OUR images: the runner image ships a pile of its own (dependabot,
+      # gh-aw-firewall, github-mcp-server) which are noise here and read as if this
+      # build produced them.
       - name: Image sizes
         if: success()
-        run: docker images --format '{{.Repository}}:{{.Tag}}\t{{.Size}}' | sort
+        run: |
+          docker images --format '{{.Repository}}:{{.Tag}}\t{{.Size}}' \
+            | grep -E '^(dockade-|claude-sandbox|opencode-sandbox)' | sort

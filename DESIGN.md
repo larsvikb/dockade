@@ -583,15 +583,23 @@ no separate artifact-export path is needed in v1.
   `sandbox-lib.sh` is sourced, and scripts copied into images are chmod'ed by their
   Dockerfile.
 
-  **No Docker layer cache**, deliberately for now. Caching across GitHub-hosted
-  runners needs `--cache-to/--cache-from type=gha` on the build itself, which
-  `docker compose build` does not accept and the launchers do not pass — so it would
-  mean either `buildx bake --set` for the compose half (diverging CI from
-  `make verify-build`, which is the property that makes CI reproducible locally) or a
-  new flag hook through `sandbox-lib.sh`. Since Actions minutes are free for public
-  repositories, the only cost of a cold build is latency, and a faithful slow build
-  beats a fast one that runs something other than the gate. Revisit if the measured
-  time actually hurts.
+  **No Docker layer cache — and the first green run settled that it should stay that
+  way.** Caching across GitHub-hosted runners needs `--cache-to/--cache-from
+  type=gha` on the build itself, which `docker compose build` does not accept and the
+  launchers do not pass, so it would mean either `buildx bake --set` for the compose
+  half (diverging CI from `make verify-build`, which is the property that makes CI
+  reproducible locally) or a new flag hook through `sandbox-lib.sh`. That was deferred
+  pending a measured number. The number is **~2m 22s cold, uncached**: 19s for the
+  three compose services, 68s for `claude-sandbox`, 54s for `opencode-sandbox`. Far
+  below the 5–15 minutes estimated, so the divergence buys nothing and the question is
+  closed rather than merely deferred. (Some of the speed is intra-run reuse — the
+  second sandbox build reports `CACHED` on the shared `debian:13-slim` layer.)
+
+  Image sizes from the same run: `claude-sandbox` 1.2GB, `opencode-sandbox` 1.23GB,
+  `dockade-egress-proxy` 255MB, `dockade-control-plane` 142MB, `dockade-control-plane-ui`
+  143MB. Worth knowing that tier 2 is **not** the smaller image despite being the
+  thinner *tier* — "thin client" describes where inference runs and what capability it
+  holds, not the size of the toolchain both tiers inherit from `sandbox-common`.
 - **DONE — `control-plane-ui` frontend split** (step 2b-2; see Build status).
 
 ### Clear future improvements

@@ -1,5 +1,7 @@
 # dockade
 
+[![check](https://github.com/larsvikb/dockade/actions/workflows/check.yml/badge.svg?branch=main)](https://github.com/larsvikb/dockade/actions/workflows/check.yml)
+
 Run an AI coding agent (Claude Code) in a **capability-limited Docker sandbox**
 so it can do strong work in a controlled, auditable way.
 

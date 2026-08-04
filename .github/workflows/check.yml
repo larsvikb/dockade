@@ -1,0 +1,102 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# CI gate. Runs the SAME targets as `make check` rather than reimplementing them, so
+# there is one definition of "does this repo pass" and a contributor can reproduce a
+# CI failure locally with `make check-strict`.
+#
+# The one thing this file adds is STRICTNESS. Every stage of the gate degrades to a
+# SKIP when its tool is missing, which is correct on a dev machine and a trap in CI:
+# a runner without hadolint would print `SKIP hadolint` and pass green. So
+# DOCKADE_REQUIRE_TOOLS=1 is set for every job, turning a missing tool into a
+# failure. See the REQUIRE_TOOLS comment in the Makefile.
+#
+# Split into two jobs on purpose. `checks` finishes in about a minute; `build`
+# compiles five images, two of which are Debian-based sandbox tiers that apt-install
+# a whole toolchain. Running them in parallel means a shellcheck typo is not queued
+# behind a ten-minute image build.
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Weekly, because this repo floats its tooling ON PURPOSE: ruff.toml pins the rule
+  # SELECTION and lets the binary drift ("rebuild-to-update"), and base images are
+  # pinned by tag, not digest. The consequence is that a green commit can go red with
+  # no code change — a new ruff rule family, a rebuilt python:3.12-slim. A scheduled
+  # run is how that surfaces on its own schedule instead of ambushing whoever happens
+  # to open the next pull request.
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+# Least privilege: every job here only reads the tree. Nothing publishes, comments,
+# or pushes, so no write scope is granted.
+permissions:
+  contents: read
+
+# A second push to the same ref makes the first run's answer irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: lint + consistency + tests
+    runs-on: ubuntu-latest
+    env:
+      DOCKADE_REQUIRE_TOOLS: 1
+    steps:
+      - uses: actions/checkout@v4
+
+      # ruff and yamllint via pipx, which is how claude-sandbox/Dockerfile installs
+      # them too — CI and the agent image get the linters the same way. Unpinned, per
+      # the ruff.toml rationale; the scheduled run above is what catches drift.
+      - name: Install ruff + yamllint
+        run: |
+          pipx install ruff
+          pipx install yamllint
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install hadolint
+        run: |
+          sudo curl -fsSL -o /usr/local/bin/hadolint \
+            https://github.com/hadolint/hadolint/releases/latest/download/hadolint-Linux-x86_64
+          sudo chmod +x /usr/local/bin/hadolint
+
+      # Recorded in the log so a run's verdict can be traced to the exact tool
+      # versions that produced it — the necessary counterpart to floating them.
+      # shellcheck, python3 and node come with the runner image; strict mode fails
+      # loudly rather than skipping if a future image drops one.
+      - name: Toolchain versions
+        run: |
+          shellcheck --version | sed -n 2p
+          hadolint --version
+          ruff --version
+          yamllint --version
+          python3 --version
+          node --version
+
+      # Not `make check-strict`: verify-build is the `build` job's work, and running
+      # it here would serialise the slow half behind the fast half.
+      - name: make lint consistency test
+        run: make lint consistency test
+
+  build:
+    name: every image still builds
+    runs-on: ubuntu-latest
+    env:
+      DOCKADE_REQUIRE_TOOLS: 1
+    steps:
+      - uses: actions/checkout@v4
+
+      # Covers all five Dockerfiles: the three compose services, plus BOTH sandbox
+      # tiers via each launcher's --build-only (which builds and exits — no workspace
+      # mount, no network, no credentials, so it needs nothing from the runner).
+      # No layer cache: see the note in the pull request that added this file.
+      - name: make verify-build
+        run: make verify-build
+
+      - name: Image sizes
+        if: success()
+        run: docker images --format '{{.Repository}}:{{.Tag}}\t{{.Size}}' | sort

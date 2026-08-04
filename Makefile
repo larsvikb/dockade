@@ -25,6 +25,18 @@ COMPOSE := docker compose
 SANDBOX ?= claude-sandbox
 WORKSPACE ?= $(PWD)
 
+# Strict mode. Every stage of `check` degrades to a SKIP when its tool is absent —
+# right on a dev machine, where running the checks you CAN run beats running none.
+# In CI it is a trap: a runner image without hadolint would print `SKIP hadolint`
+# and pass GREEN, verifying less than the badge claims, and nothing would ever say
+# so. Set DOCKADE_REQUIRE_TOOLS=1 (as `check-strict` and the CI workflow do) to turn
+# every such skip into a failure. Same fail-closed reasoning as the LAUNCHERS glob
+# guard below: silently checking nothing is the outcome worth refusing.
+#
+# Read from the environment too (make imports env vars as variables), so both
+# `DOCKADE_REQUIRE_TOOLS=1 make check` and `make check DOCKADE_REQUIRE_TOOLS=1` work.
+REQUIRE_TOOLS ?= $(DOCKADE_REQUIRE_TOOLS)
+
 # Shell scripts (bash -n + shellcheck) and Dockerfiles (hadolint).
 # Every sandbox launcher. A GLOB, not a list, so a new tier's launcher is covered
 # by the lint/syntax/control-net guards automatically — forgetting to register one
@@ -42,7 +54,10 @@ SCRIPTS := $(LAUNCHERS) \
 DOCKERFILES := claude-sandbox/Dockerfile opencode-sandbox/Dockerfile \
                proxies/egress/Dockerfile \
                control-plane/Dockerfile control-plane-ui/Dockerfile
-YAMLFILES := docker-compose.yml .hadolint.yaml .yamllint
+# A GLOB for the workflows, not a list, so a second workflow is linted without
+# anyone remembering to register it — same reasoning as LAUNCHERS above.
+YAMLFILES := docker-compose.yml .hadolint.yaml .yamllint \
+             $(wildcard .github/workflows/*.yml)
 JSONFILES := $(shell git ls-files '*.json' 2>/dev/null)
 PYFILES := proxies/egress/addon.py control-plane/app.py control-plane-ui/app.py
 # Dependency-free unit tests for the governance-critical decision logic. Kept
@@ -70,7 +85,7 @@ REFFILES := $(SCRIPTS) \
             control-plane-ui/app.js \
             policies/egress-allowlist.txt
 
-.PHONY: help check lint consistency test verify-build \
+.PHONY: help check check-strict lint consistency test verify-build \
         up down destroy rebuild logs-ep logs-cp \
         claude opencode boundary
 
@@ -84,20 +99,33 @@ help: ## Show this help
 check: lint consistency test verify-build ## Run all static checks (linters + consistency guards + unit tests + build)
 	@echo "== all checks passed =="
 
+check-strict: ## Like check, but a MISSING TOOL is a failure, not a skip — what CI runs
+	@$(MAKE) --no-print-directory check DOCKADE_REQUIRE_TOOLS=1
+
 lint: ## Run linters (shellcheck, hadolint, ruff, yamllint) — skipped if not installed
 	@fail=0
+	# A missing tool SKIPS by default and FAILS under DOCKADE_REQUIRE_TOOLS (see
+	# REQUIRE_TOOLS above for why the two behaviours differ).
+	miss() {
+	  if [ -n "$(REQUIRE_TOOLS)" ]; then
+	    echo "  FAIL: $$1 is not installed and DOCKADE_REQUIRE_TOOLS is set —"
+	    echo "        refusing to report success for a check that never ran."
+	    return 1
+	  fi
+	  echo "SKIP $$1 (not installed)"
+	}
 	if command -v shellcheck >/dev/null 2>&1; then
 	  echo "== shellcheck =="; shellcheck $(SCRIPTS) || fail=1
-	else echo "SKIP shellcheck (not installed)"; fi
+	else miss shellcheck || fail=1; fi
 	if command -v hadolint >/dev/null 2>&1; then
 	  echo "== hadolint =="; hadolint $(DOCKERFILES) || fail=1
-	else echo "SKIP hadolint (not installed)"; fi
+	else miss hadolint || fail=1; fi
 	if command -v ruff >/dev/null 2>&1; then
 	  echo "== ruff =="; ruff check $(PYFILES) $(TESTFILES) || fail=1
-	else echo "SKIP ruff (not installed)"; fi
+	else miss ruff || fail=1; fi
 	if command -v yamllint >/dev/null 2>&1; then
 	  echo "== yamllint =="; yamllint $(YAMLFILES) || fail=1
-	else echo "SKIP yamllint (not installed)"; fi
+	else miss yamllint || fail=1; fi
 	exit $$fail
 
 consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
@@ -189,10 +217,23 @@ test: ## Run the governance unit tests (dependency-free; python -m unittest)
 	# close it — fine in production (ResourceWarning is ignored by default), but
 	# unittest un-ignores warnings, so the finalizer's "unclosed database" notice
 	# would spam the gate. Not a leak; filtered here, not worked around in the app.
-	python3 -W ignore::ResourceWarning -m unittest discover -s tests -t tests -v
+	#
+	# DOCKADE_REQUIRE_TOOLS is passed through EXPLICITLY rather than exported: the
+	# app.js tests need `node` and skip without it, which strict mode must turn into
+	# a failure (see tests/test_control_plane_ui_js.py). An empty value is falsy on
+	# the Python side, so the default stays "skip".
+	DOCKADE_REQUIRE_TOOLS=$(REQUIRE_TOOLS) \
+	  python3 -W ignore::ResourceWarning -m unittest discover -s tests -t tests -v
 
 verify-build: ## Assert every image still builds (skipped if docker unavailable)
 	@if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+	  if [ -n "$(REQUIRE_TOOLS)" ]; then
+	    echo "  FAIL: docker is unavailable and DOCKADE_REQUIRE_TOOLS is set —"
+	    echo "        the build verification is the ONLY check that a Dockerfile edit"
+	    echo "        (or a COPY of a file that does not exist) still builds, so"
+	    echo "        skipping it silently is exactly what strict mode exists to stop."
+	    exit 1
+	  fi
 	  echo "SKIP build verification (docker unavailable)"; exit 0
 	fi
 	# Cache-respecting builds: the first run is slow, repeats are near-instant when

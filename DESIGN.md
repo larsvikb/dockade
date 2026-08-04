@@ -514,6 +514,45 @@ no separate artifact-export path is needed in v1.
   (lowercasing, comment/blank skipping, idempotency) are all covered. Remaining
   untested surface is low-weight I/O: `_audit` sinks, `_post_authorize`/`_setup_
   audit_file`, and the SSE `approvals_stream`.
+- **DONE — CI gate (`.github/workflows/check.yml`), and the strict mode it needed.**
+  The workflow runs the existing `make` targets rather than reimplementing them, so
+  there is one definition of "does this repo pass" and a contributor can reproduce a
+  CI failure with `make check-strict`. Two parallel jobs: lint + consistency + tests
+  (about a minute) and the five-image build verification (minutes, because both
+  sandbox tiers apt-install a toolchain), so a shellcheck typo is not queued behind an
+  image build.
+
+  The part worth recording is why a plain `make check` in CI would have been
+  **worse than no CI**. Every stage of the gate degrades to a SKIP when its tool is
+  absent — `SKIP hadolint (not installed)`, the ten `app.js` tests skipping without
+  node, `SKIP build verification (docker unavailable)`. That is right on a dev
+  machine, where running the checks you *can* run beats running none. In CI it
+  produces a green check that verified less than the badge claims, with nothing
+  anywhere saying so — the same "silently checks nothing" failure the `LAUNCHERS`
+  glob guard already fails closed against. Hence `DOCKADE_REQUIRE_TOOLS=1`, which
+  turns every such skip into a failure, set for both CI jobs and available locally as
+  `make check-strict`. It lives in the Makefile rather than the workflow YAML because
+  the Makefile already owns what-must-be-true, and because a requirement encoded only
+  in CI is invisible to whoever runs the checks by hand. Verified in all four
+  directions (docker, hadolint, node, and the all-present case): each skips in the
+  default mode and fails under strict.
+
+  The schedule (weekly) exists because this repo **floats its tooling on purpose** —
+  `ruff.toml` pins the rule *selection* and lets the binary drift, and base images are
+  pinned by tag, not digest. The accepted cost is that a green commit can go red with
+  no code change; a scheduled run is how that surfaces on its own rather than
+  ambushing whoever opens the next pull request. For the same reason the workflow
+  prints every tool's version, so a verdict can be traced to what produced it.
+
+  **No Docker layer cache**, deliberately for now. Caching across GitHub-hosted
+  runners needs `--cache-to/--cache-from type=gha` on the build itself, which
+  `docker compose build` does not accept and the launchers do not pass — so it would
+  mean either `buildx bake --set` for the compose half (diverging CI from
+  `make verify-build`, which is the property that makes CI reproducible locally) or a
+  new flag hook through `sandbox-lib.sh`. Since Actions minutes are free for public
+  repositories, the only cost of a cold build is latency, and a faithful slow build
+  beats a fast one that runs something other than the gate. Revisit if the measured
+  time actually hurts.
 - **DONE — `control-plane-ui` frontend split** (step 2b-2; see Build status).
 
 ### Clear future improvements

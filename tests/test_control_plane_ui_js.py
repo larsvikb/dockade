@@ -46,6 +46,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_control_plane_ui import _directives, ui  # noqa: E402 (path set above)
 
 _NODE = shutil.which("node")
+# Missing node SKIPS on a dev machine — running the checks you can run beats running
+# none — but FAILS under DOCKADE_REQUIRE_TOOLS, which CI sets. A silently skipped
+# test that still reports success is how coverage shrinks without anyone noticing;
+# these ten tests are the only coverage app.js has. Mirrors the Makefile's strict mode.
+_STRICT = bool(os.environ.get("DOCKADE_REQUIRE_TOOLS"))
 
 # Evaluate the module and report a fixed set of calls. Deliberately data-only: no
 # assertions live here, so a failure is reported by Python with a normal diff.
@@ -88,7 +93,8 @@ console.log(JSON.stringify({
 """
 
 
-@unittest.skipUnless(_NODE, "node is not installed — skipping app.js unit tests")
+@unittest.skipIf(not _NODE and not _STRICT,
+                 "node is not installed — skipping app.js unit tests")
 class PageScriptTests(unittest.TestCase):
     """The pure decision helpers in app.js."""
 
@@ -96,6 +102,11 @@ class PageScriptTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
+        if not _NODE:
+            raise AssertionError(
+                "node is not installed and DOCKADE_REQUIRE_TOOLS is set — refusing to "
+                "report success for the app.js tests, which are the only coverage that "
+                "file has. Install node, or drop strict mode to skip them knowingly.")
         # _NODE comes from shutil.which (absolute path, no shell), and both arguments
         # are repo paths — no untrusted input reaches the command line.
         proc = subprocess.run(  # noqa: S603 (absolute path, fixed args — see above)

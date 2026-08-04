@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """
 Control-plane UI — the human-facing frontend (step 2b-2).
 

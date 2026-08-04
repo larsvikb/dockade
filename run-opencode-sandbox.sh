@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # Launch the TIER-2 sandbox: opencode driven by the local LLM. No egress.
 # Usage: ./run-opencode-sandbox.sh [workspace_path] [--rebuild] [--build-only] [--no-cache]
 #

@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 set -euo pipefail
 
 # Runs as root. Sets up the network boundary, then drops to the non-root

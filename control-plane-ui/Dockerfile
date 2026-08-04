@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # Control-plane UI (frontend). A stateless reverse proxy + static server, on
 # control-ui-net (host-loopback publish) and control-net (to reach the backend).
 # NOT the egress choke point; base pinned by tag (deliberate upgrades), like the

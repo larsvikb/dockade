@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 set -euo pipefail
 
 # Tier-2 (opencode) setup hook. Run as root by the shared entrypoint, before the

@@ -1,0 +1,10 @@
+dockade
+Copyright 2026 Lars Vikberg
+
+Licensed under the Apache License, Version 2.0 (the "License"); see the LICENSE
+file at the root of this repository, or http://www.apache.org/licenses/LICENSE-2.0
+
+Kept deliberately minimal. Every downstream redistribution has to carry this file
+along, so it holds only the attribution the License requires — not a changelog, not
+a credits list, and not the third-party notices of the base images the Dockerfiles
+pull at build time (no third-party source is vendored into this repository).

@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # Launch the TIER-1 sandbox: Claude Code, governed egress via the proxy.
 # Usage: ./run-claude-sandbox.sh [workspace_path] [--rebuild] [--build-only] [--no-cache]
 #

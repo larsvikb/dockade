@@ -251,3 +251,17 @@ exposed through governed data-plane services. Next steps toward it:
   rationale behind every decision. Start here to understand *why*.
 - [`CLAUDE.md`](CLAUDE.md) — the invariants that must never be violated and the
   conventions for working in this repo.
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE) — use, modify and redistribute
+freely, including commercially, keeping the copyright and license notices. Source
+files carry `SPDX-License-Identifier: Apache-2.0` so automated license scanners can
+read them without parsing this file.
+
+**Read the warranty disclaimer as meaning it.** This is a security boundary with a
+documented ceiling, not a guarantee: [`DESIGN.md`](DESIGN.md) is explicit about what
+containment here does *not* cover — notably that the read-write workspace bind mount
+is a delayed path to host execution, that `WebSearch` runs server-side and cannot be
+seen by the proxy, and that no Claude Code settings file is an enforcement boundary.
+Understand those before trusting it with anything that matters.

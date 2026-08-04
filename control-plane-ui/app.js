@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /* dockade control-plane UI — page behaviour.
  *
  * Split out of index.html rather than left inline for two substantive reasons:

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # dockade — dev/ops entrypoints. Run `make` (or `make help`) to list targets.
 #
 # Two jobs:

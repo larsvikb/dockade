@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # Shared launcher plumbing for every sandbox tier.
 #
 # Sourced by run-claude-sandbox.sh (tier 1, Claude + governed egress) and

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # Pinned: the egress proxy is the security choke point, so its base is not left on
 # :latest (a rebuild could otherwise pull a mitmproxy whose addon API / TLS
 # handling differs from what addon.py is written against — risking a fail-open).

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Unit tests for the egress proxy's async decision flow — the parts of
 ``proxies/egress/addon.py`` that ``boundary-check.sh`` cannot reach: the
 control-plane call ``_authorize`` (permanent-lifeline short-circuit + fail-closed)

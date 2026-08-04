@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # Control plane — the governance authority. NOT an internet-facing service and
 # NOT the egress choke point (that is proxies/egress), so this base is pinned by
 # tag rather than digest; upgrades are still deliberate (bump, rebuild).

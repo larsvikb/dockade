@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Dependency-free import helpers for the governance modules under test.
 
 The two governance modules import third-party packages at module scope that we

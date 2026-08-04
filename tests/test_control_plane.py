@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Unit tests for the control plane's security-load-bearing logic
 (``control-plane/app.py``): the policy decision ``_decide`` (block-wins-over-allow,
 subdomain semantics, default-hold) and the hold-cap reservation

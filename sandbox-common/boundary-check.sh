@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # Boundary smoke test, shared by every sandbox tier.
 #
 # Run this INSIDE the container, as the sandbox agent, to assert the v1

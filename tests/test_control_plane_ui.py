@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Unit tests for the control-plane-ui frontend (``control-plane-ui/app.py``).
 
 Two groups, both regression suites for real defects:

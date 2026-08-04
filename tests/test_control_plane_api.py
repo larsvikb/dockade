@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Unit tests for the control plane's request-handling flow
 (``control-plane/app.py``): the ``authorize`` handler's allow/deny/hold
 orchestration (including the timeout-defaults-to-deny path and the

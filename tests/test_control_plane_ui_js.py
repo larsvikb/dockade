@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Unit tests for the control-plane-ui PAGE SCRIPT (``control-plane-ui/app.js``).
 
 The frontend had no tests at all while it grew the two behaviours that most decide

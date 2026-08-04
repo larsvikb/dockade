@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # Claude Code status line for the sandbox image.
 #
 # Wired via the baked user-settings.json template (user scope — a managed-scope

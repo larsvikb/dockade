@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """
 Control plane — governance authority for the governed data-plane proxies.
 

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Unit tests for the egress proxy's security-load-bearing decision helpers
 (``proxies/egress/addon.py``): host matching, the permanent lifeline, env
 parsing, and — most importantly — the ``_forbidden`` control-plane relay guard

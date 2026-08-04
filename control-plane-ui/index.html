@@ -51,9 +51,43 @@
   .card.done-allow { border-left-color: var(--allow); }
   .card.done-deny { border-left-color: var(--deny); }
   .card.stale { opacity: .55; border-left-color: var(--line); }
+  .card.confirming { border-left-color: var(--accent); }
   .cardmsg { margin-top: 8px; font-size: 12px; color: var(--dim); }
   .cardmsg.ok { color: var(--allow); }
   .cardmsg.bad { color: var(--deny); }
+
+  /* ── the hold countdown ───────────────────────────────────────────────────
+     A held request BLOCKS the agent and default-denies when CONTROL_HOLD_TIMEOUT
+     elapses, so the card says how long is left; the bar is the same fact for a glance
+     rather than a read. Tabular numerals so a shrinking count doesn't jitter. */
+  .countdown { display: flex; align-items: center; gap: 8px; margin-top: 8px;
+    font-size: 12px; color: var(--dim); }
+  .countdown .cdtext { white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .countdown .bar { flex: 1; max-width: 240px; height: 4px; border-radius: 2px;
+    background: #202632; overflow: hidden; }
+  .countdown .bar i { display: block; height: 100%; background: var(--hold); }
+  .countdown.urgent { color: var(--deny); }
+  .countdown.urgent .bar i { background: var(--deny); }
+
+  /* ── the confirm step on a "+ persist" ────────────────────────────────────
+     Both persist actions write standing policy that nothing in this UI removes, so
+     they take a second click that names the pattern and lets the operator narrow or
+     widen it. Sits BELOW the action row, which stays put: the confirm button must not
+     appear under a pointer still resting on the button that opened it. */
+  .confirm { margin-top: 10px; padding: 10px 12px; background: #12151c;
+    border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    border-radius: 6px; }
+  .confirm .cwhat { font-size: 13px; }
+  .confirm .cwhat code { color: var(--fg); font-weight: 600; }
+  .confirm .cscope { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    margin-top: 8px; font-size: 12px; color: var(--dim); }
+  .confirm select { font: inherit; font-size: 12px; background: #202632;
+    color: var(--fg); border: 1px solid var(--line); border-radius: 6px;
+    padding: 4px 6px; max-width: 100%; }
+  /* A wildcard grants hosts that have never been requested. Said loudly, in the one
+     place where it is still reversible. */
+  .confirm .cwarn { margin-top: 8px; font-size: 12px; color: var(--hold); }
+  .confirm .cactions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
   button { font: inherit; border: 1px solid var(--line); background: #202632;
     color: var(--fg); border-radius: 6px; padding: 6px 10px; cursor: pointer; }
   button:hover { border-color: var(--accent); }

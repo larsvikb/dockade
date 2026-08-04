@@ -62,6 +62,67 @@ function shouldSweep(busy, ageMs) {
   return !busy || ageMs >= STALE_MAX_MS;
 }
 
+// How long this hold has left, in seconds. A held request BLOCKS the agent and is
+// default-denied when CONTROL_HOLD_TIMEOUT elapses, and that deadline was the one
+// thing a card could not tell you: it showed `requested 14:32:05` and then vanished,
+// so 100 seconds left and 4 seconds left looked identical.
+//
+// Clamped at BOTH ends, because these are two different clocks — `requestedTs` is the
+// backend's time.time(), `nowMs` the browser's. They agree in the intended deployment
+// (both are the operator's host), and where they don't, a skewed clock should make the
+// countdown wrong rather than absurd: never more than the whole window, never negative.
+function holdRemaining(requestedTs, holdTimeout, nowMs) {
+  return Math.max(0, Math.min(holdTimeout, requestedTs + holdTimeout - nowMs / 1000));
+}
+
+// Below this many seconds left the countdown is called out, because by then the
+// decision is being made for the operator rather than by them.
+const COUNTDOWN_URGENT_S = 20;
+function countdownState(remainingS, holdTimeout) {
+  return {
+    // At zero this says "expiring", not "expired": the BACKEND's clock decides, so a
+    // click may still land. If it doesn't, the 409 path reports that honestly.
+    text: remainingS < 1 ? "expiring now" : `expires in ${Math.ceil(remainingS)}s`,
+    frac: holdTimeout > 0
+      ? Math.max(0, Math.min(1, remainingS / holdTimeout)) : 0,
+    urgent: remainingS <= COUNTDOWN_URGENT_S,
+  };
+}
+
+// Why a card left the pending queue. Worth distinguishing rather than covering both
+// with one hedge: an EXPIRY is a governance outcome — the agent was denied because
+// nobody looked in time — whereas a card vanishing with time still on the clock means
+// something else resolved it. Falls back to the hedge when the window is unknown
+// (/api/config unreachable), because then we genuinely cannot tell.
+function goneReason(remainingS, holdTimeout) {
+  if (holdTimeout === null || holdTimeout === undefined) {
+    return "no longer pending — the hold expired (default-denied) or was resolved elsewhere";
+  }
+  if (remainingS <= 0) {
+    return `expired — no decision within ${Math.round(holdTimeout)}s, ` +
+      "so the request was default-denied";
+  }
+  return "no longer pending — resolved elsewhere, or the control plane restarted";
+}
+
+// What a `+ persist` click is about to write, for the confirm step. The pattern is
+// reported VERBATIM next to its scope rather than described, because exact-host and
+// whole-subtree differ by one leading dot and that dot is the entire grant.
+function persistPreview(action, option) {
+  const pattern = (option && option.pattern) || "";
+  return {
+    // Defaults to the SAFER reading if the action is somehow absent: a preview that
+    // says "block" where an allow was meant is caught by the operator; the reverse
+    // is the mistake this whole step exists to prevent.
+    verb: (action || "").startsWith("allow") ? "allow" : "block",
+    pattern,
+    scope: (option && option.scope) || "",
+    // Flagged separately so the UI can shout about it: a wildcard covers hosts that
+    // have never been requested, and nothing in this UI removes a rule once written.
+    wild: pattern.startsWith("."),
+  };
+}
+
 // ── the page ────────────────────────────────────────────────────────────────
 
 function start() {
@@ -77,6 +138,10 @@ function start() {
   let streamUp = false;      // is the SSE feed actually delivering?
   let policySig = null;      // signature of the rules, to detect change
   let policyUnseen = false;  // policy changed while another view was showing
+  // Seconds a hold waits before it default-denies, from GET /api/config. Stays null
+  // until the backend says, and the page works without it — one fewer thing that can
+  // stop an approval from reaching a human.
+  let holdTimeout = null;
 
   // ── views ─────────────────────────────────────────────────────────────────
   const VIEWS = ["approvals", "decisions", "policy"];
@@ -175,8 +240,10 @@ function start() {
   // ── pending approvals, keyed by approval id ───────────────────────────────
   const pendingEl = document.getElementById("pending");
   const emptyEl = document.getElementById("pending-empty");
-  // id -> { el, actions, msg, state, staleAt }
-  //   state: pending → resolving → resolved,  or  pending → stale
+  // id -> entry (see buildCard for the shape)
+  //   state: pending → resolving → resolved
+  //          pending → confirming → resolving → resolved   (the *_persist actions)
+  //          any of the above → stale
   const cards = new Map();
 
   const ACTIONS = [
@@ -189,7 +256,8 @@ function start() {
   // Built with createElement/textContent rather than an HTML string: the host, url
   // and client on an approval are AGENT-CONTROLLED, and a text node needs no
   // escaping to be safe, so the question of whether esc() covers every context
-  // does not arise for this list at all.
+  // does not arise for this list at all. The persist patterns are derived from that
+  // same host by the backend, so they get the same treatment.
   function buildCard(a) {
     const el = document.createElement("div");
     el.className = "card";
@@ -205,22 +273,156 @@ function start() {
                         a.client ? `from ${a.client}` : null, a.url || null]
       .filter(Boolean).join(" · ");
 
+    // The hold countdown, hidden until /api/config has told us the window — the page
+    // does not invent a deadline it cannot know.
+    const cd = document.createElement("div");
+    cd.className = "countdown";
+    cd.hidden = true;
+    const cdText = document.createElement("span");
+    cdText.className = "cdtext";
+    const bar = document.createElement("span");
+    bar.className = "bar";
+    const fill = document.createElement("i");
+    bar.append(fill);
+    cd.append(cdText, bar);
+
     const actions = document.createElement("div");
     actions.className = "actions";
-    for (const [action, label, kind] of ACTIONS) {
-      const b = document.createElement("button");
-      b.className = kind;
-      b.textContent = label;
-      b.addEventListener("click", () => resolve(a, action));
-      actions.append(b);
-    }
 
     const msg = document.createElement("div");
     msg.className = "cardmsg";
     msg.hidden = true;
 
-    el.append(host, meta, actions, msg);
-    return { el, actions, msg, state: "pending", staleAt: null };
+    const entry = {
+      el, actions, msg, cd, cdText, fill,
+      state: "pending", staleAt: null,
+      ts: a.ts,
+      // What a persist may write, as the BACKEND will accept it. A backend that has
+      // not been restarted into this change sends no options; fall back to the exact
+      // host, which is also what resolve() defaults to when no pattern is sent.
+      options: (a.persist_options && a.persist_options.length)
+        ? a.persist_options
+        : [{ pattern: (a.host || "").toLowerCase(), scope: "exact host" }],
+      action: null,            // which *_persist action the confirm panel is for
+    };
+
+    for (const [action, label, kind] of ACTIONS) {
+      const b = document.createElement("button");
+      b.className = kind;
+      b.textContent = label;
+      // The two `*_persist` actions write standing policy, so they open the confirm
+      // panel; the `*_once` actions decide this request only and stay a single click.
+      b.addEventListener("click", () => action.endsWith("persist")
+        ? askPersist(a, action)
+        : resolve(a, action));
+      actions.append(b);
+    }
+
+    buildConfirm(entry, a);
+    el.append(host, meta, cd, actions, entry.confirm, msg);
+    return entry;
+  }
+
+  // ── the confirm step for a `+ persist` ────────────────────────────────────
+  // Justified by IRREVERSIBILITY rather than by risk. A persisted rule outlives the
+  // session, is what makes every future request to that host skip the hold entirely,
+  // and nothing in this UI removes it — undoing a mis-click means hand-editing SQLite
+  // in a named volume. So the click that writes policy is now two clicks, and the
+  // second one names the pattern and lets the operator narrow or widen it.
+  //
+  // Laid out BELOW the action row, which stays exactly where it was. That is
+  // deliberate, and the same concern that drove keyed rendering: if the confirm button
+  // appeared where the pointer already is, a double-click on "Allow + persist rule"
+  // would sail straight through the confirmation it had just opened.
+  function buildConfirm(entry, a) {
+    const box = document.createElement("div");
+    box.className = "confirm";
+    box.hidden = true;
+
+    const what = document.createElement("div");
+    what.className = "cwhat";
+
+    const label = document.createElement("label");
+    label.className = "cscope";
+    label.append(document.createTextNode("rule "));
+    const select = document.createElement("select");
+    for (const opt of entry.options) {
+      const o = document.createElement("option");
+      o.value = opt.pattern;
+      o.textContent = `${opt.pattern} — ${opt.scope}`;
+      select.append(o);
+    }
+    // Narrowest first from the backend, so the default selection is the safest one.
+    select.selectedIndex = 0;
+    select.addEventListener("change", () => renderPreview(entry));
+    label.append(select);
+
+    const warn = document.createElement("div");
+    warn.className = "cwarn";
+    warn.hidden = true;
+
+    const cactions = document.createElement("div");
+    cactions.className = "cactions";
+    const go = document.createElement("button");
+    go.className = "confirmgo";
+    const cancel = document.createElement("button");
+    cancel.textContent = "Cancel";
+    cancel.addEventListener("click", () => cancelPersist(entry));
+    go.addEventListener("click", () => resolve(a, entry.action, select.value));
+    cactions.append(go, cancel);
+
+    // Escape backs out, as a dialog-shaped thing should.
+    box.addEventListener("keydown", e => {
+      if (e.key === "Escape") { e.preventDefault(); cancelPersist(entry); }
+    });
+
+    box.append(what, label, warn, cactions);
+    Object.assign(entry, { confirm: box, cwhat: what, cwarn: warn,
+                           select, confirmBtn: go });
+  }
+
+  function renderPreview(entry) {
+    const opt = entry.options.find(o => o.pattern === entry.select.value)
+      || entry.options[0];
+    const p = persistPreview(entry.action, opt);
+    // Rebuilt as nodes so the pattern (derived from an agent-chosen host) is text,
+    // never markup — same reason as the card body above.
+    entry.cwhat.replaceChildren();
+    entry.cwhat.append(document.createTextNode(`Writes a standing rule to ${p.verb} `));
+    const code = document.createElement("code");
+    code.textContent = p.pattern;
+    entry.cwhat.append(code, document.createTextNode(` — ${p.scope}.`));
+    entry.cwarn.hidden = !p.wild;
+    entry.cwarn.textContent = p.wild
+      ? `⚠ Wildcard: this covers ${p.pattern.slice(1)} and every subdomain of it, ` +
+        "including hosts nothing has requested yet."
+      : "";
+    entry.confirmBtn.textContent =
+      `Confirm — ${p.verb} ${p.pattern} from now on`;
+    entry.confirmBtn.className = "confirmgo " + (p.verb === "allow" ? "allow" : "deny");
+  }
+
+  function askPersist(a, action) {
+    const entry = cards.get(a.id);
+    if (!entry || entry.state !== "pending") return;
+    entry.state = "confirming";
+    entry.action = action;
+    entry.el.classList.add("confirming");
+    // The action row is disabled while the panel is open, so the only live buttons are
+    // Confirm and Cancel — a stray second click cannot fire a different action.
+    disableActions(entry, true);
+    renderPreview(entry);
+    entry.confirm.hidden = false;
+    entry.confirmBtn.focus();
+  }
+
+  function cancelPersist(entry) {
+    if (entry.state !== "confirming") return;
+    entry.state = "pending";
+    entry.action = null;
+    entry.confirm.hidden = true;
+    entry.el.classList.remove("confirming");
+    disableActions(entry, false);
   }
 
   function setMessage(entry, text, kind) {
@@ -236,23 +438,32 @@ function start() {
   function markStale(entry, text) {
     entry.state = "stale";
     entry.staleAt = Date.now();
-    entry.el.classList.remove("busy");
+    entry.el.classList.remove("busy", "confirming");
     entry.el.classList.add("stale");
+    // A card nobody can act on any more shows neither a deadline nor a half-finished
+    // confirmation — the message below replaces both.
+    entry.confirm.hidden = true;
+    entry.cd.hidden = true;
     disableActions(entry, true);
     setMessage(entry, text, "bad");
   }
 
-  async function resolve(a, action) {
+  // `pattern` is sent only for the `*_persist` actions, and only ever a value the
+  // backend itself offered on this approval (it re-derives and re-validates the set,
+  // so the choice is bounded there too, not merely here).
+  async function resolve(a, action, pattern) {
     const entry = cards.get(a.id);
-    if (!entry || entry.state !== "pending") return;
+    if (!entry || (entry.state !== "pending" && entry.state !== "confirming")) return;
     entry.state = "resolving";
+    entry.confirm.hidden = true;
+    entry.el.classList.remove("confirming");
     entry.el.classList.add("busy");
     disableActions(entry, true);
     setMessage(entry, "resolving…");
     try {
       const r = await fetch(`/approvals/${encodeURIComponent(a.id)}/resolve`, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action }),
+        body: JSON.stringify(pattern ? { action, pattern } : { action }),
       });
       const d = await r.json().catch(() => ({}));
       if (r.ok) {
@@ -264,14 +475,18 @@ function start() {
         entry.state = "resolved";
         entry.staleAt = Date.now();
         entry.el.classList.remove("busy");
+        entry.cd.hidden = true;
         entry.el.classList.add(d.outcome === "allow" ? "done-allow" : "done-deny");
-        // "standing rule for <host>" is true either way: a persist that hit the
-        // backend's INSERT OR IGNORE wrote nothing only because a rule for that
-        // host already existed.
+        // The pattern comes back from the BACKEND, so this reports what was stored
+        // rather than what was clicked — and it is the exact string an operator would
+        // have to go and delete. Saying "standing rule" is true even when the
+        // backend's INSERT OR IGNORE wrote nothing, because that only happens when
+        // the identical rule was already there.
         setMessage(entry,
           (d.outcome === "allow" ? "✓ allowed" : "✕ denied") +
-          (d.persisted ? ` · standing rule for ${a.host.toLowerCase()}`
-                       : " · this request only"),
+          (d.persisted
+            ? ` · standing rule: ${d.pattern || a.host.toLowerCase()}`
+            : " · this request only"),
           d.outcome === "allow" ? "ok" : "bad");
       } else if (r.status === 409) {
         // Backend says it is no longer pending (expired, or resolved elsewhere).
@@ -323,20 +538,55 @@ function start() {
     }
     for (const id of gone) {
       const entry = cards.get(id);
-      if (entry.state === "pending" || entry.state === "resolving") {
-        markStale(entry,
-          "no longer pending — the hold expired (default-denied) or was resolved elsewhere");
+      if (entry.state === "pending" || entry.state === "confirming"
+          || entry.state === "resolving") {
+        // Say WHICH way it went. An expiry is a decision the operator failed to make
+        // in time and the agent was denied for it; a card leaving with time left is
+        // somebody or something else resolving it. Both used to read the same.
+        markStale(entry, goneReason(
+          holdTimeout === null ? null
+            : holdRemaining(entry.ts, holdTimeout, Date.now()),
+          holdTimeout));
       }
     }
     sweep();
     updateIndicators();
   }
 
+  // Redrawn once a second for every live card. Cheap, and the only thing that makes a
+  // deadline legible: the text for a reading, the bar for a glance.
+  function updateCountdowns() {
+    if (holdTimeout === null) return;
+    const now = Date.now();
+    for (const entry of cards.values()) {
+      if (entry.state === "resolved" || entry.state === "stale") continue;
+      const cs = countdownState(
+        holdRemaining(entry.ts, holdTimeout, now), holdTimeout);
+      entry.cd.hidden = false;
+      entry.cdText.textContent = cs.text;
+      entry.fill.style.width = `${(cs.frac * 100).toFixed(1)}%`;
+      entry.cd.classList.toggle("urgent", cs.urgent);
+    }
+  }
+
   // Sweeping is also driven by the operator leaving the list, so a stale card goes
   // as soon as removing it is safe rather than on the next tick.
   pendingEl.addEventListener("mouseleave", sweep);
   pendingEl.addEventListener("focusout", () => setTimeout(sweep, 0));
-  setInterval(sweep, 1000);
+  setInterval(() => { updateCountdowns(); sweep(); }, 1000);
+
+  // ── config (the hold window behind the countdown) ─────────────────────────
+  async function refreshConfig() {
+    try {
+      const c = await (await fetch("/api/config")).json();
+      const t = Number(c.hold_timeout);
+      // Validated rather than trusted: a zero or absent window would divide the
+      // progress bar by zero and, worse, imply a deadline that isn't there. Anything
+      // unusable leaves holdTimeout null, which just means no countdown.
+      holdTimeout = Number.isFinite(t) && t > 0 ? t : null;
+      updateCountdowns();
+    } catch (e) { /* no countdown; the cards are otherwise unaffected */ }
+  }
 
   // ── audit + rules ─────────────────────────────────────────────────────────
   async function refreshAudit() {
@@ -392,6 +642,10 @@ function start() {
       streamUp = true;
       setConn("live", "up");
       updateIndicators();
+      // Re-read the config on every (re)connect rather than once at load: a card can
+      // only exist because this stream delivered it, so this is the earliest useful
+      // moment — and a reconnect may be a restarted backend with a different window.
+      refreshConfig();
     };
     es.addEventListener("pending", e => renderPending(JSON.parse(e.data)));
     es.onerror = () => {
@@ -433,6 +687,7 @@ if (typeof document !== "undefined") { start(); }
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     lampState, backoffDelay, diffPending, shouldSweep,
-    RECONNECT_MIN_MS, RECONNECT_MAX_MS, STALE_MAX_MS,
+    holdRemaining, countdownState, goneReason, persistPreview,
+    RECONNECT_MIN_MS, RECONNECT_MAX_MS, STALE_MAX_MS, COUNTDOWN_URGENT_S,
   };
 }

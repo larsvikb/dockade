@@ -58,7 +58,8 @@ _STRICT = bool(os.environ.get("DOCKADE_REQUIRE_TOOLS"))
 # vector (there is no script filename), so an index would be quietly wrong.
 _PROBE = r"""
 const m = require(process.env.DOCKADE_APP_JS);
-const missing = ["lampState", "backoffDelay", "diffPending", "shouldSweep"]
+const missing = ["lampState", "backoffDelay", "diffPending", "shouldSweep",
+                 "holdRemaining", "countdownState", "goneReason", "persistPreview"]
   .filter(n => typeof m[n] !== "function");
 console.log(JSON.stringify({
   missing,
@@ -88,6 +89,39 @@ console.log(JSON.stringify({
     busy_fresh: m.shouldSweep(true, 0),
     busy_just_under: m.shouldSweep(true, m.STALE_MAX_MS - 1),
     busy_at_cap: m.shouldSweep(true, m.STALE_MAX_MS),
+  },
+  // The hold countdown. Fixed clocks, not Date.now(), so the arithmetic is asserted
+  // rather than the machine's mood: a hold requested at t=1000 with a 120s window.
+  remaining: {
+    at_start: m.holdRemaining(1000, 120, 1000 * 1000),
+    halfway: m.holdRemaining(1000, 120, 1060 * 1000),
+    at_deadline: m.holdRemaining(1000, 120, 1120 * 1000),
+    past_deadline: m.holdRemaining(1000, 120, 5000 * 1000),
+    browser_clock_behind: m.holdRemaining(1000, 120, 0),
+  },
+  countdown: {
+    fresh: m.countdownState(120, 120),
+    fractional: m.countdownState(43.2, 120),
+    at_urgent_boundary: m.countdownState(m.COUNTDOWN_URGENT_S, 120),
+    just_outside_urgent: m.countdownState(m.COUNTDOWN_URGENT_S + 1, 120),
+    zero: m.countdownState(0, 120),
+    unknown_window: m.countdownState(0, 0),
+  },
+  urgent_at: m.COUNTDOWN_URGENT_S,
+  gone: {
+    expired: m.goneReason(0, 120),
+    time_left: m.goneReason(55, 120),
+    window_unknown: m.goneReason(null, null),
+  },
+  preview: {
+    exact: m.persistPreview("allow_persist",
+                            { pattern: "example.com", scope: "exact host" }),
+    wildcard: m.persistPreview("allow_persist",
+                               { pattern: ".example.com",
+                                 scope: "host + subdomains" }),
+    blocking: m.persistPreview("deny_persist",
+                               { pattern: "example.com", scope: "exact host" }),
+    nothing: m.persistPreview(null, null),
   },
 }));
 """
@@ -192,6 +226,75 @@ class PageScriptTests(unittest.TestCase):
         self.assertTrue(sweep["busy_at_cap"])
 
 
+    def test_the_countdown_measures_the_hold_window(self):
+        rem = self.probe["remaining"]
+        self.assertEqual(rem["at_start"], 120)
+        self.assertEqual(rem["halfway"], 60)
+        self.assertEqual(rem["at_deadline"], 0)
+
+    def test_a_skewed_browser_clock_cannot_produce_an_absurd_deadline(self):
+        # `ts` is the BACKEND's clock and `now` the browser's. They agree in the
+        # intended deployment, and where they don't the countdown should be wrong
+        # rather than nonsense — never negative, never longer than the whole window.
+        rem = self.probe["remaining"]
+        self.assertEqual(rem["past_deadline"], 0)
+        self.assertEqual(rem["browser_clock_behind"], 120)
+
+    def test_the_countdown_reads_as_a_deadline_and_a_bar(self):
+        cd = self.probe["countdown"]
+        self.assertEqual(cd["fresh"]["text"], "expires in 120s")
+        self.assertEqual(cd["fresh"]["frac"], 1)
+        # Rounded UP, so the text never claims less time than there is.
+        self.assertEqual(cd["fractional"]["text"], "expires in 44s")
+        self.assertAlmostEqual(cd["fractional"]["frac"], 43.2 / 120)
+
+    def test_the_last_seconds_are_called_out(self):
+        cd = self.probe["countdown"]
+        self.assertTrue(cd["at_urgent_boundary"]["urgent"])
+        self.assertFalse(cd["just_outside_urgent"]["urgent"])
+        self.assertTrue(cd["zero"]["urgent"])
+
+    def test_zero_says_expiring_not_expired_because_the_backend_decides(self):
+        # The browser's clock is not authoritative: a click at 0 may still land, and if
+        # it doesn't the 409 path reports that. Claiming "expired" here would be the UI
+        # asserting an outcome it doesn't know.
+        self.assertEqual(self.probe["countdown"]["zero"]["text"], "expiring now")
+
+    def test_an_unusable_window_cannot_divide_by_zero(self):
+        self.assertEqual(self.probe["countdown"]["unknown_window"]["frac"], 0)
+
+    def test_a_departed_card_says_which_way_it_went(self):
+        gone = self.probe["gone"]
+        # An expiry is a governance outcome — the agent was denied because nobody
+        # looked in time — and it used to be indistinguishable from someone else
+        # resolving the hold.
+        self.assertIn("default-denied", gone["expired"])
+        self.assertIn("120s", gone["expired"])
+        self.assertNotIn("default-denied", gone["time_left"])
+        self.assertIn("resolved elsewhere", gone["time_left"])
+        # With the window unknown we genuinely cannot tell, and say so.
+        self.assertIn("or was resolved elsewhere", gone["window_unknown"])
+
+    def test_the_persist_preview_names_the_pattern_and_flags_a_wildcard(self):
+        prev = self.probe["preview"]
+        self.assertEqual(prev["exact"]["pattern"], "example.com")
+        self.assertEqual(prev["exact"]["scope"], "exact host")
+        self.assertFalse(prev["exact"]["wild"])
+        # A leading dot is the whole grant, so the wildcard flag is what the confirm
+        # step shouts about — the rule covers hosts nothing has requested yet.
+        self.assertTrue(prev["wildcard"]["wild"])
+        self.assertEqual(prev["wildcard"]["pattern"], ".example.com")
+
+    def test_the_preview_verb_follows_the_action(self):
+        prev = self.probe["preview"]
+        self.assertEqual(prev["exact"]["verb"], "allow")
+        self.assertEqual(prev["blocking"]["verb"], "block")
+        # Missing input defaults to the safer reading: previewing "block" where an
+        # allow was meant gets caught by the operator; the reverse is the mistake the
+        # confirm step exists to prevent.
+        self.assertEqual(prev["nothing"]["verb"], "block")
+
+
 class InlineScriptTests(unittest.TestCase):
     """``script-src 'self'`` is only worth sending while the page has no inline
     script, and that invariant spans two files — so it is checked, not trusted.
@@ -244,6 +347,34 @@ class InlineScriptTests(unittest.TestCase):
             self.assertRegex(html, rf'id="{re.escape(element_id)}"',
                              f'app.js reaches for #{element_id}, which index.html '
                              f'does not define')
+
+    def test_every_endpoint_the_page_calls_is_served_or_relayed(self):
+        """The relay allowlist is deliberately narrow — only the backend paths this UI
+        needs cross it, so that `POST /authorize` and anything else never can. The cost
+        is a coupling with no compiler between the two ends: adding a `fetch()` to
+        app.js without adding its path to `_RELAY_ROUTES` yields a 403 that appears only
+        when a real operator loads the page against a real backend. That is exactly how
+        `/api/config` (the countdown's window) would have failed.
+
+        Paths only, not methods: the shapes here are simple and the method-level
+        allowlist has its own tests in test_control_plane_ui.py. The converse direction
+        — a relayed route the page no longer calls — is deliberately not asserted; the
+        allowlist still carries `/status` unused, and pruning it is a separate change."""
+        js = APP_JS.read_text()
+        # Served by this container rather than relayed (see control-plane-ui/app.py).
+        local = {"/", "/app.js", "/healthz"}
+        calls = re.findall(r"""(?:fetch|EventSource)\(\s*["'`]([^"'`]+)["'`]""", js)
+        self.assertGreater(len(calls), 3, "no fetch/EventSource calls found — did the "
+                                          "page's I/O move somewhere this cannot see?")
+        for raw in calls:
+            # `${...}` is an interpolated approval id; the route patterns bound it to a
+            # slash-free segment, so any placeholder text stands in for it.
+            path = re.sub(r"\$\{[^}]*\}", "ID", raw).split("?")[0]
+            self.assertTrue(
+                path in local or ui._relay_allowed("GET", path)
+                or ui._relay_allowed("POST", path),
+                f"app.js calls {path}, which control-plane-ui neither serves nor "
+                f"relays — add it to _RELAY_ROUTES or it will 403 in the browser")
 
     def test_the_script_file_is_the_one_the_app_serves(self):
         # UI_SCRIPT points into the image; assert the repo file the Dockerfile copies

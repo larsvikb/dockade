@@ -16,12 +16,15 @@ The authorize flow (one call from the proxy, `POST /authorize`):
 
 A human resolves holds over the approvals API (GET /approvals, the SSE stream at
 /approvals/stream, and POST /approvals/{id}/resolve), surfaced by the separate
-control-plane-ui frontend; the backend serves no HTML itself. Two read-only views
-back the rest of that UI: GET /api/audit (recent decisions) and GET /api/rules (the
-standing policy — see ``api_rules`` for why that one has to be visible):
+control-plane-ui frontend; the backend serves no HTML itself. Three read-only views
+back the rest of that UI: GET /api/audit (recent decisions), GET /api/rules (the
+standing policy — see ``api_rules`` for why that one has to be visible) and
+GET /api/config (the hold window, so a card can show its countdown):
   - allow-once / deny-once     — decide just this request
   - allow-persist / deny-persist — also write a rule so future connections skip
-    the hold (progressive trust; DESIGN.md "auto-approve progressively more").
+    the hold (progressive trust; DESIGN.md "auto-approve progressively more"). WHICH
+    rule is the operator's choice from a bounded set derived from the requested host
+    (``_persist_candidates``), not a string the agent's request can supply.
 
 Resolving a hold is the one privileged action in this system — it is what grants
 egress — so every resolution records the PROVENANCE of whoever performed it
@@ -46,6 +49,7 @@ internet route — it is pure management state (the crown jewel).
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import os
 import sqlite3
@@ -194,6 +198,63 @@ def _pattern_scope(pattern: str) -> str:
     return "host + subdomains" if pattern.startswith(".") else "exact host"
 
 
+# A wildcard must keep at least this many labels. One label is either a public suffix
+# or a bare name, and a standing allow rule for `.com` would end governance for that
+# entire TLD in a single click.
+_WILDCARD_MIN_LABELS = 2
+
+
+def _persist_candidates(host: str) -> list[str]:
+    """The patterns an operator may persist for a held host, NARROWEST FIRST.
+
+    Exists because ``resolve`` used to store the requested host verbatim. Two facts
+    made that sharper than it looks: a leading dot is a subdomain wildcard (``_match``),
+    and the host on an approval is chosen by the AGENT — so a request for
+    ``.example.com`` persisted a rule covering every subdomain of example.com, and
+    nothing in this system revokes a rule. Deriving the candidate set here, in the
+    module that defines matching, makes exact-vs-wildcard an *operator choice from a
+    bounded set* instead of a string the requester supplies.
+
+    Three at most, in increasing order of breadth — so the first is both the safest and
+    the default:
+
+      - the exact host;
+      - ``.host`` — that host and its subdomains;
+      - ``.<last two labels>`` — the registrable domain, which is what an operator
+        usually wants when one service spreads over many hostnames.
+
+    Anything broader is deliberately NOT offered: it needs direct policy editing, which
+    is a decision rather than a click.
+
+    Known limitation, stated rather than hidden: with no public-suffix list the
+    two-label suffix of ``example.co.uk`` is ``.co.uk``, which grants far more than it
+    appears to. That is why the UI shows the chosen pattern VERBATIM in a confirm step
+    instead of describing it, and why a human picks."""
+    exact = (host or "").strip().lower().strip(".")
+    if not exact:
+        return []
+    out = [exact]
+    try:
+        ipaddress.ip_address(exact.strip("[]"))
+    except ValueError:
+        pass
+    else:
+        return out          # an IP literal has no subdomains to wildcard over
+    labels = exact.split(".")
+    if not all(labels):
+        return out          # malformed (`a..b`): offer the exact string, invent nothing
+    for depth in (len(labels), _WILDCARD_MIN_LABELS):
+        # `depth > len(labels)` is the single-label case (`localhost`), where the
+        # two-label suffix does not exist and taking it anyway would manufacture
+        # `.localhost` — precisely the one-label wildcard the floor exists to forbid.
+        if depth < _WILDCARD_MIN_LABELS or depth > len(labels):
+            continue
+        pattern = "." + ".".join(labels[len(labels) - depth:])
+        if pattern not in out:
+            out.append(pattern)
+    return out
+
+
 def _decide(host: str) -> tuple[str, str]:
     """(decision, reason). Block wins over allow; an unmatched host is HELD for
     human approval (2b) rather than denied outright."""
@@ -312,7 +373,13 @@ def _list_pending() -> list[dict]:
         rows = conn.execute(
             "SELECT id, ts, host, port, proto, client, method, url FROM approvals "
             "WHERE status='pending' ORDER BY ts").fetchall()
-    return [dict(r) for r in rows]
+    # ``persist_options`` travels WITH the approval so the UI offers exactly the
+    # patterns ``resolve`` will accept. One definition of the candidate set, beside the
+    # matcher it derives from — rather than a second implementation in JavaScript that
+    # could drift into offering a pattern the backend then rejects.
+    return [dict(r, persist_options=[{"pattern": p, "scope": _pattern_scope(p)}
+                                     for p in _persist_candidates(r["host"])])
+            for r in rows]
 
 
 # ── API models ──────────────────────────────────────────────────────────────
@@ -334,6 +401,10 @@ class AuthorizeResponse(BaseModel):
 
 class ResolveRequest(BaseModel):
     action: str                    # allow_once | allow_persist | deny_once | deny_persist
+    # Which pattern a `*_persist` action writes. Must be one of the approval's
+    # ``_persist_candidates``; omitted means the narrowest of them (the exact host).
+    # Ignored by the two `*_once` actions, which write no rule at all.
+    pattern: str | None = None
 
 
 # ── lifecycle ───────────────────────────────────────────────────────────────
@@ -409,7 +480,7 @@ def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
             "UPDATE approvals SET status='expired', resolved_at=? "
             "WHERE id=? AND status='pending'", (time.time(), approval_id)).rowcount
         status_row = None if expired else conn.execute(
-            "SELECT status, resolved_by FROM approvals WHERE id=?",
+            "SELECT status, mode, resolved_by FROM approvals WHERE id=?",
             (approval_id,)).fetchone()
         conn.commit()
     _release_hold(approval_id)
@@ -417,12 +488,22 @@ def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
     # Carry the resolver's provenance (recorded by resolve()) into the audit reason,
     # so the log answers "who granted this egress" and not merely "a human did".
     actor = (status_row["resolved_by"] if status_row else None) or "actor unrecorded"
+    # Whether the decision also wrote STANDING POLICY belongs in the audit line: a
+    # one-off and a persist are the same allow for this request and very different
+    # afterwards, and the log said nothing about which had happened. From the durable
+    # ``mode`` column, so it reports what was recorded rather than what was asked for.
+    # (Naming the pattern too would need a column on ``approvals``, which has no
+    # migration step — see the NOTE above ``_seed_if_empty``. The rule itself is
+    # recorded, with its pattern and ``source='operator'``, in the rules table.)
+    scope = ("this request only" if not status_row
+             else "standing rule written" if status_row["mode"] == "persist"
+             else "this request only")
     if expired:
         final, why = "deny", "no decision within hold timeout — default-deny"
     elif status_row and status_row["status"] == "allowed":
-        final, why = "allow", f"human approval [{actor}]"
+        final, why = "allow", f"human approval ({scope}) [{actor}]"
     else:  # 'denied' (or any non-allowed terminal state) — default-deny
-        final, why = "deny", f"human rejection [{actor}]"
+        final, why = "deny", f"human rejection ({scope}) [{actor}]"
     _audit(final, stage=req.stage, host=req.host, port=req.port, proto=req.proto,
            client=req.client, method=req.method, url=req.url, reason=why)
     return AuthorizeResponse(decision=final, reason=why)
@@ -458,6 +539,28 @@ def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResp
             "SELECT host FROM approvals WHERE id=?", (approval_id,)).fetchone()
         if row is None:
             return JSONResponse({"ok": False, "detail": "unknown"}, status_code=404)
+        # Settle WHAT a persist writes before anything is written, and settle it from
+        # the host on the durable row rather than from the request body — the caller
+        # chooses among candidates, it does not supply them (see _persist_candidates).
+        pattern = None
+        if persist:
+            allowed = _persist_candidates(row["host"])
+            if not allowed:
+                return JSONResponse(
+                    {"ok": False,
+                     "detail": f"no rule pattern can be derived from host "
+                               f"{row['host']!r}"}, status_code=400)
+            pattern = (req.pattern or "").strip().lower() or allowed[0]
+            if pattern not in allowed:
+                # Refused BEFORE the UPDATE, so a rejected pattern neither resolves the
+                # hold nor consumes it: the approval stays pending and the operator can
+                # choose again. (A `*_persist` that half-applied — decision recorded,
+                # rule not — would be the worst of both.)
+                return JSONResponse(
+                    {"ok": False,
+                     "detail": f"pattern {pattern!r} is not one this approval may "
+                               f"persist (allowed: {', '.join(allowed)})"},
+                    status_code=400)
         updated = conn.execute(
             "UPDATE approvals SET status=?, mode=?, resolved_at=?, resolved_by=? "
             "WHERE id=? AND status='pending'",
@@ -468,8 +571,7 @@ def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResp
             conn.execute(
                 "INSERT OR IGNORE INTO rules(pattern, action, source, created_at) "
                 "VALUES (?,?, 'operator', ?)",
-                (row["host"].lower(), "allow" if outcome == "allow" else "block",
-                 time.time()))
+                (pattern, "allow" if outcome == "allow" else "block", time.time()))
         conn.commit()
 
     if not updated:
@@ -484,7 +586,12 @@ def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResp
     with _LOCK:
         if approval_id in _PENDING_EVENTS:
             event.set()
-    return JSONResponse({"ok": True, "outcome": outcome, "persisted": persist})
+    # ``pattern`` is echoed so the UI reports what was actually STORED rather than what
+    # was clicked — the two differ when the request omitted a pattern (defaulting to the
+    # exact host) and, more usefully, it is the string an operator would have to go and
+    # delete by hand.
+    return JSONResponse({"ok": True, "outcome": outcome, "persisted": persist,
+                         "pattern": pattern})
 
 
 @app.get("/approvals/stream")
@@ -546,6 +653,18 @@ def api_rules() -> list[dict]:
             "SELECT pattern, action, source, created_at FROM rules "
             "ORDER BY action DESC, pattern").fetchall()
     return [dict(r, scope=_pattern_scope(r["pattern"])) for r in rows]
+
+
+@app.get("/api/config")
+def api_config() -> dict:
+    """The settings the UI cannot behave correctly without knowing. Read-only, and
+    non-secret by construction — nothing here decides anything.
+
+    Just the hold window today, and that one is load-bearing: a held request BLOCKS the
+    agent and default-denies after ``HOLD_TIMEOUT``, so a card that cannot say how long
+    is left cannot distinguish hold-for-approval from a slow deny. Sent rather than
+    hardcoded in the page, so the number the operator sets is the number they see."""
+    return {"hold_timeout": HOLD_TIMEOUT}
 
 
 @app.get("/status", response_class=PlainTextResponse)

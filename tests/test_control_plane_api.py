@@ -62,11 +62,31 @@ class _FakeRequest:
         self.client = types.SimpleNamespace(host=peer) if peer else None
 
 
-def _resolve(approval_id, action, request=None):
+def _resolve(approval_id, action, request=None, **fields):
     """resolve() with a default request, so tests that don't care about provenance
-    stay readable."""
-    return cp.resolve(approval_id, cp.ResolveRequest(action=action),
+    stay readable. Extra kwargs go on the ResolveRequest (e.g. ``pattern=``)."""
+    return cp.resolve(approval_id, cp.ResolveRequest(action=action, **fields),
                       request if request is not None else _FakeRequest())
+
+
+def _hold(host, approval_id="hold-1"):
+    """Register a pending approval with NO blocked authorize() behind it: the durable
+    row plus the in-process slot ``resolve`` looks for. Enough for every resolve-side
+    assertion, and no thread to wait on — the wake path has its own tests."""
+    with cp._connect() as conn:
+        conn.execute(
+            "INSERT INTO approvals(id, ts, host, status) VALUES (?,?,?, 'pending')",
+            (approval_id, time.time(), host))
+        conn.commit()
+    cp._PENDING_EVENTS[approval_id] = threading.Event()
+    cp._PENDING_CLIENT[approval_id] = None
+    return approval_id
+
+
+def _rules():
+    with cp._connect() as conn:
+        return {(r["pattern"], r["action"]) for r in
+                conn.execute("SELECT pattern, action FROM rules")}
 
 
 class _CPTestCase(unittest.TestCase):
@@ -188,6 +208,154 @@ class ResolveTests(_CPTestCase):
         self.assertEqual(resp.kwargs.get("status_code"), 409)
 
 
+class PersistCandidateTests(unittest.TestCase):
+    """``_persist_candidates`` is what turns the persisted pattern from an
+    AGENT-CONTROLLED STRING into an operator choice from a bounded set.
+
+    The old ``resolve`` stored the requested host verbatim, and a leading dot is a
+    subdomain wildcard — so a host spelled ``.example.com`` persisted a rule covering
+    every subdomain of example.com, permanently (nothing revokes a rule)."""
+
+    def test_the_narrowest_choice_is_first_because_it_is_the_default(self):
+        self.assertEqual(
+            cp._persist_candidates("a.b.example.com"),
+            ["a.b.example.com", ".a.b.example.com", ".example.com"])
+
+    def test_a_two_label_host_offers_only_itself_and_its_subtree(self):
+        self.assertEqual(cp._persist_candidates("example.com"),
+                         ["example.com", ".example.com"])
+
+    def test_no_candidate_is_ever_a_single_label_wildcard(self):
+        # `.com` as a standing allow rule would end governance for the whole TLD, and
+        # `.localhost` is the same mistake one label down.
+        for host in ("example.com", "a.b.example.com", "localhost", "example.co.uk"):
+            for pattern in cp._persist_candidates(host):
+                labels = pattern.lstrip(".").split(".")
+                if pattern.startswith("."):
+                    self.assertGreaterEqual(
+                        len(labels), 2, f"{host} offers one-label wildcard {pattern}")
+        # A bare name has no subtree to offer at all.
+        self.assertEqual(cp._persist_candidates("localhost"), ["localhost"])
+
+    def test_an_ip_literal_gets_no_wildcard(self):
+        for host in ("1.2.3.4", "::1", "[::1]"):
+            self.assertEqual(
+                len(cp._persist_candidates(host)), 1,
+                f"{host} has no subdomains — `.1.2.3.4` would be a nonsense rule")
+
+    def test_a_host_the_agent_spelled_as_a_wildcard_cannot_stay_one(self):
+        # THE case this function exists for: the leading dot is normalized away, so the
+        # exact-host default is an exact host and the wildcard is only ever reachable by
+        # an operator picking it.
+        self.assertEqual(cp._persist_candidates(".example.com")[0], "example.com")
+        self.assertEqual(cp._persist_candidates(".example.com"),
+                         cp._persist_candidates("example.com"))
+
+    def test_case_and_a_trailing_fqdn_dot_are_normalized(self):
+        self.assertEqual(cp._persist_candidates("EXAMPLE.com."),
+                         ["example.com", ".example.com"])
+
+    def test_a_malformed_host_gets_no_invented_wildcards(self):
+        self.assertEqual(cp._persist_candidates("a..b"), ["a..b"])
+        self.assertEqual(cp._persist_candidates(""), [])
+        self.assertEqual(cp._persist_candidates("."), [])
+
+    def test_every_candidate_actually_matches_the_host_it_came_from(self):
+        # The property that makes the set safe to offer: picking any of them grants at
+        # least this request. Asserted against `_match`, the matcher they are derived
+        # from, so a change to either side has to keep them consistent.
+        for host in ("example.com", "a.b.example.com", "raw.githubusercontent.com",
+                     "localhost", "1.2.3.4"):
+            for pattern in cp._persist_candidates(host):
+                self.assertTrue(cp._match(host, pattern),
+                                f"{pattern} would not even match {host}")
+
+    def test_pending_approvals_carry_the_patterns_resolve_will_accept(self):
+        # Sent WITH the approval so the UI cannot offer a pattern the backend rejects.
+        # One definition of the set, next to the matcher — not a second one in JS.
+        cp._init_db()
+        _clear_all()
+        _hold("api.example.com", "opts-1")
+        (row,) = cp._list_pending()
+        self.assertEqual([o["pattern"] for o in row["persist_options"]],
+                         cp._persist_candidates("api.example.com"))
+        # Each carries the scope in words, since the dot is easy to miss.
+        self.assertEqual(row["persist_options"][0]["scope"], "exact host")
+        self.assertEqual(row["persist_options"][1]["scope"], "host + subdomains")
+
+
+class PersistPatternTests(_CPTestCase):
+    """The resolve side of the same thing: which pattern actually gets written."""
+
+    def test_persist_without_a_pattern_writes_the_exact_host(self):
+        _resolve(_hold("plain.example.com"), "allow_persist")
+        self.assertEqual(_rules(), {("plain.example.com", "allow")})
+
+    def test_an_operator_chosen_wildcard_is_written_as_chosen(self):
+        resp = _resolve(_hold("api.example.com"), "allow_persist",
+                        pattern=".example.com")
+        self.assertTrue(resp.args[0]["ok"])
+        self.assertEqual(_rules(), {(".example.com", "allow")})
+        # And it does what the scope label says: subdomains skip the hold now.
+        self.assertEqual(cp._decide("other.example.com")[0], "allow")
+
+    def test_deny_persist_writes_a_block_rule_for_the_chosen_pattern(self):
+        _resolve(_hold("bad.example.com"), "deny_persist", pattern=".example.com")
+        self.assertEqual(_rules(), {(".example.com", "block")})
+        self.assertEqual(cp._decide("anything.example.com")[0], "deny")
+
+    def test_the_response_names_the_pattern_that_was_stored(self):
+        # So the UI reports what was WRITTEN, not what was clicked — and names the
+        # string an operator would have to go and delete by hand.
+        resp = _resolve(_hold("named.example.com"), "allow_persist")
+        self.assertEqual(resp.args[0]["pattern"], "named.example.com")
+        resp = _resolve(_hold("named2.example.com", "hold-2"), "allow_persist",
+                        pattern=".example.com")
+        self.assertEqual(resp.args[0]["pattern"], ".example.com")
+
+    def test_a_once_action_reports_no_pattern_and_writes_none(self):
+        resp = _resolve(_hold("once.example.com"), "allow_once")
+        self.assertIsNone(resp.args[0]["pattern"])
+        self.assertEqual(_rules(), set())
+
+    def test_a_pattern_outside_the_candidate_set_is_refused(self):
+        # The whole point of validating server-side: the caller picks FROM the set, it
+        # does not supply it. A relay or a scripted POST gets the same answer the UI
+        # would.
+        for bogus in (".com", "evil.com", ".evil.com", "example.co",
+                      ".b.example.com"):
+            approval = _hold("a.example.com", f"bogus-{bogus}")
+            resp = _resolve(approval, "allow_persist", pattern=bogus)
+            self.assertEqual(resp.kwargs.get("status_code"), 400,
+                             f"{bogus} must not be persistable")
+            self.assertEqual(_rules(), set(), f"{bogus} wrote a rule anyway")
+
+    def test_a_refused_pattern_leaves_the_hold_pending_and_decidable(self):
+        # Refused BEFORE the UPDATE, so a rejected pattern must not half-apply: the
+        # operator gets to choose again rather than losing the approval to a 409.
+        approval = _hold("retry.example.com")
+        resp = _resolve(approval, "allow_persist", pattern=".com")
+        self.assertEqual(resp.kwargs.get("status_code"), 400)
+        self.assertEqual([r["id"] for r in cp._list_pending()], [approval])
+        # And the retry works.
+        resp = _resolve(approval, "allow_persist")
+        self.assertTrue(resp.args[0]["ok"])
+        self.assertEqual(_rules(), {("retry.example.com", "allow")})
+
+    def test_a_host_that_yields_no_pattern_refuses_rather_than_guessing(self):
+        approval = _hold(".", "dotty")
+        resp = _resolve(approval, "allow_persist")
+        self.assertEqual(resp.kwargs.get("status_code"), 400)
+        self.assertEqual(_rules(), set())
+
+    def test_the_stored_pattern_is_normalized_not_taken_verbatim(self):
+        # A host the agent spelled with a leading dot must not become a wildcard rule.
+        _resolve(_hold(".sneaky.example.com"), "allow_persist")
+        self.assertEqual(_rules(), {("sneaky.example.com", "allow")})
+        # Which is a strictly narrower grant: the subtree still holds.
+        self.assertEqual(cp._decide("x.sneaky.example.com")[0], "hold")
+
+
 class ProvenanceTests(_CPTestCase):
     """Resolving a hold is the one privileged action here — it grants egress — so
     "who approved this" must reach the durable record and the audit trail. It reached
@@ -254,6 +422,39 @@ class ProvenanceTests(_CPTestCase):
                             for r in reasons),
                         f"actor missing from audit reasons: {reasons}")
 
+    def test_audit_reason_says_whether_standing_policy_was_written(self):
+        # A one-off and a persist are the same allow for THIS request and very
+        # different afterwards, and the audit line used to say nothing about which had
+        # happened — so reading the log could not tell you that a click had changed
+        # policy. Read from the durable `mode` column, i.e. what was recorded.
+        saved = cp.HOLD_TIMEOUT
+        cp.HOLD_TIMEOUT = 5
+        try:
+            t, result, approval_id = HoldHandshakeTests._authorize_in_thread(
+                self, "persisted.example.com")
+            _resolve(approval_id, "allow_persist")
+            t.join(2)
+        finally:
+            cp.HOLD_TIMEOUT = saved
+        self.assertEqual(result["resp"].decision, "allow")
+        reasons = [c.kwargs.get("reason", "") for c in cp._audit.call_args_list]
+        self.assertTrue(any("standing rule written" in r for r in reasons),
+                        f"persist not distinguishable in audit reasons: {reasons}")
+
+    def test_audit_reason_marks_a_one_off_as_one_off(self):
+        saved = cp.HOLD_TIMEOUT
+        cp.HOLD_TIMEOUT = 5
+        try:
+            t, _result, approval_id = HoldHandshakeTests._authorize_in_thread(
+                self, "oneoff.example.com")
+            _resolve(approval_id, "deny_once")
+            t.join(2)
+        finally:
+            cp.HOLD_TIMEOUT = saved
+        reasons = [c.kwargs.get("reason", "") for c in cp._audit.call_args_list]
+        self.assertTrue(any("this request only" in r for r in reasons), reasons)
+        self.assertFalse(any("standing rule" in r for r in reasons), reasons)
+
     def test_timeout_path_reports_no_actor_rather_than_a_wrong_one(self):
         saved = cp.HOLD_TIMEOUT
         cp.HOLD_TIMEOUT = 0.05
@@ -308,6 +509,28 @@ class RulesViewTests(_CPTestCase):
     def test_empty_policy_is_an_empty_list_not_an_error(self):
         _set_rules([])
         self.assertEqual(cp.api_rules(), [])
+
+
+class ConfigViewTests(_CPTestCase):
+    """``/api/config`` exists so a pending card can show a COUNTDOWN. Without it the
+    UI would have to hardcode the hold window, and a card that cannot say how long is
+    left cannot distinguish hold-for-approval from a slow deny."""
+
+    def test_config_reports_the_hold_window(self):
+        self.assertEqual(cp.api_config()["hold_timeout"], cp.HOLD_TIMEOUT)
+
+    def test_config_follows_the_operator_setting_rather_than_a_constant(self):
+        saved = cp.HOLD_TIMEOUT
+        cp.HOLD_TIMEOUT = 45.0
+        try:
+            self.assertEqual(cp.api_config()["hold_timeout"], 45.0)
+        finally:
+            cp.HOLD_TIMEOUT = saved
+
+    def test_config_exposes_nothing_but_that(self):
+        # A read-only view of NON-SECRET config on the one interface that can grant
+        # egress: whatever gets added here has to stay harmless to publish.
+        self.assertEqual(set(cp.api_config()), {"hold_timeout"})
 
 
 class FreshSchemaTests(unittest.TestCase):

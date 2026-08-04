@@ -292,7 +292,7 @@ class RelayAllowlistTests(unittest.TestCase):
     def test_ui_paths_are_relayed(self):
         for path, method in (("approvals", "GET"), ("approvals/stream", "GET"),
                              ("api/audit", "GET"), ("api/rules", "GET"),
-                             ("status", "GET"),
+                             ("api/config", "GET"), ("status", "GET"),
                              ("approvals/0123abcd/resolve", "POST")):
             self._proxy(path, method)
             self.assertEqual(urlsplit(_sent["url"]).netloc, "control-plane:8090",
@@ -310,8 +310,9 @@ class RelayAllowlistTests(unittest.TestCase):
                              ("approvals/x/resolve", "GET"),
                              ("approvals/a/b/resolve", "POST"),
                              # The rules view is READ-only: no mutation path exists
-                             # on the backend, and none is relayed either.
-                             ("api/rules", "POST")):
+                             # on the backend, and none is relayed either. Same for
+                             # config — the UI reads settings, it does not set them.
+                             ("api/rules", "POST"), ("api/config", "POST")):
             resp = self._proxy(path, method)
             self.assertEqual(getattr(resp, "status_code", None), 403,
                              f"{method} {path} must be refused")

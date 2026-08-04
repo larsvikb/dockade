@@ -238,7 +238,10 @@ exposed through governed data-plane services. Next steps toward it:
    outage never bricks the agent, and everything else failing closed.
    **Step 2b done:** an unknown host is **held for approval** — the request blocks
    while a human approves/rejects it in a live SSE UI (allow/deny, once or
-   persist-as-rule), defaulting to deny after a timeout (2b-1). The UI is a
+   persist-as-rule), defaulting to deny after a timeout (2b-1). The card counts
+   down to that default-deny, and a persist names the rule it will write and asks
+   twice, with exact-host-vs-subdomain-wildcard chosen by the operator from a set
+   the backend derives and validates. The UI is a
    distinct `control-plane-ui` frontend; the backend is `control-net`-only and
    fully internal, reachable only via that frontend or the egress proxy (2b-2).
    Next: **2c** audit browsing (filter/search/history beyond the recent-decisions

@@ -490,13 +490,15 @@ no separate artifact-export path is needed in v1.
   opaque `403` to the agent as any other deny) can't be asserted there.
 
   The suite was then extended to the **async decision flow** the pure-function
-  tests couldn't reach (**132 tests total**, still dependency-free — the count
+  tests couldn't reach (**165 tests total**, still dependency-free — the count
   includes the `control-plane-ui` relay host-pinning regression tests that came
   with the 2b-2 split, the mapped-IPv6 relay-guard regression suite, and the
   frontend's Host / cross-origin / relay-allowlist / provenance guards, the
   embedding refusal and security-header policy, the backend-unreachable 502, the
   page script's own decision helpers (see "The frontend's own tests" below), the
-  standing-policy rules view, and the fresh-schema guard on the provenance column): the proxy's
+  standing-policy rules view, the persist-pattern candidate derivation and its
+  server-side validation, the hold-window config view, and the fresh-schema guard on
+  the provenance column): the proxy's
   `_authorize` (permanent-lifeline short-circuit with no control-plane call, and
   fail-closed on any control-plane error / non-`allow` decision — `_post_authorize`
   monkeypatched, no network) and the mitmproxy hooks via small `SimpleNamespace`
@@ -610,20 +612,19 @@ no separate artifact-export path is needed in v1.
   leave the sandbox.
 - Docs mirror / offline docs tool.
 - Progressive auto-approval driven by accumulated policy + audit history.
-- **Rule MUTATION / revocation on the control plane** (listing is now done — see
-  "Standing policy" below). Rules can be GRANTED — a `*_persist` resolution writes
-  one — but still never edited or removed: there is no mutating rule endpoint, and
-  the seed file is re-read only when the table is empty, so a mistaken persist is
-  permanent short of hand-editing SQLite in the volume. Two sharp edges come with it
-  — `resolve` persists the **agent-controlled** host string verbatim as a pattern, so
-  a request for `.evil.com` turns one approval into a *subdomain wildcard* (`_match`
-  treats a leading dot that way; the rules view now at least NAMES that scope, but
-  does not prevent it); and the `INSERT OR IGNORE` means `deny_persist` silently
-  writes nothing when a pattern already exists while still reporting
-  `persisted: true` — reachable because retrying clients routinely produce two holds
-  for one host. A governance plane that can grant but not revoke is incomplete; pair
-  the mutation API with validating that a persisted pattern is a bare hostname and
-  making wildcard-vs-exact an explicit operator choice at approval time.
+- **Rule MUTATION / revocation on the control plane** (listing is done — see "Standing
+  policy" below — and so, now, is choosing what a persist writes). Rules can be
+  GRANTED — a `*_persist` resolution writes one — but still never edited or removed:
+  there is no mutating rule endpoint, and the seed file is re-read only when the table
+  is empty, so a mistaken persist is permanent short of hand-editing SQLite in the
+  volume. **This is now the whole of the item.** The two sharp edges it used to carry
+  have moved: the agent-controlled-pattern one is closed (`_persist_candidates` derives
+  a bounded set and `resolve` validates against it — see "A `+ persist` says what it
+  will write"), and the `INSERT OR IGNORE` wart, where `deny_persist` silently writes
+  nothing for an existing pattern while still reporting `persisted: true`, is now
+  reachable only when the *same* pattern was chosen twice and is covered honestly by
+  the card's wording. A governance plane that can grant but not revoke is still
+  incomplete, and revocation is the remaining half.
 - **Human-presence on approval (WebAuthn user-presence, or an out-of-band confirm).**
   The *only* thing that closes host-local forgery of an approval — see the
   browser-facing-guards note under "Frontend split". Worth building for that
@@ -631,23 +632,10 @@ no separate artifact-export path is needed in v1.
   because "the UI has no auth"; naive auth does not help, since any credential at
   rest on the host is readable by the same process.
 - **Approval-UI follow-ups (reviewed and specified, not built).** From the same review
-  that produced the reconnect / CSP / keyed-rendering work above, in value order:
-  - **A hold countdown.** A held request *blocks the agent* and default-denies after
-    `CONTROL_HOLD_TIMEOUT`, yet the card shows only a static "requested 14:32:05" and
-    then disappears. The operator cannot tell whether they have 100 seconds or 4. Needs
-    the timeout exposed (a small `GET /api/config`, added to the relay allowlist), an
-    `expires in 43s` countdown with a depleting bar, and an explicit
-    `expired — default-denied` marker rather than a silent removal (the keyed rendering
-    already parks such a card in place, so this is now a small addition). This is the
-    difference between hold-for-approval and a slow deny.
-  - **Say what a persist will write, and confirm it.** `resolve` stores the requested
-    host verbatim, a leading dot is a subdomain wildcard, and nothing revokes — a
-    mis-click is permanent short of hand-editing SQLite. The card should preview
-    `persists: example.com · exact host` (flagging a wildcard loudly) and require a
-    second click for the two `*_persist` actions specifically, justified by
-    irreversibility rather than by risk. The better fix is a `pattern` field on
-    `ResolveRequest` so exact-vs-wildcard is an operator choice, not an agent-controlled
-    string — see the rule-mutation item above.
+  that produced the reconnect / CSP / keyed-rendering work above, in value order. The
+  top two — the hold countdown and the persist preview/confirm with an operator-chosen
+  pattern — are **now built**; see "The card shows its deadline" and "A `+ persist` says
+  what it will write" under the frontend section. What remains:
   - **The decisions table drops data the backend already sends** (`stage` is selected
     and never rendered; `client` is not selected at all, though this control plane is
     shared across sandboxes), stamps rows time-only so 40 rows read out of order across
@@ -1569,20 +1557,112 @@ covers every context does not arise.
 **A resolve now reports itself.** Previously the only feedback was the card vanishing on
 the next SSE tick, so with the feed down — precisely the state above — a successful
 approval was indistinguishable from a hung click, and errors arrived as a blocking
-`alert()`. The card now shows `✓ allowed · standing rule for example.com` (or
+`alert()`. The card now shows `✓ allowed · standing rule: .example.com` (or
 `· this request only`) inline the moment the POST returns, keeps its buttons disabled,
 and on a `409` says so specifically — "no longer pending" is a different fact from a
-failure, and re-enabling the buttons would only invite a second failing click.
+failure, and re-enabling the buttons would only invite a second failing click. The
+pattern in that line comes back from the *backend* rather than being reconstructed from
+the click, so it reports what was **stored** — which is also the exact string an
+operator would have to go and delete by hand.
+
+**The card shows its deadline (`GET /api/config`).** A held request *blocks the agent*
+and is **default-denied** when `CONTROL_HOLD_TIMEOUT` elapses, and that deadline was
+the one thing the card could not say: it showed a static `requested 14:32:05` and then
+disappeared, so 100 seconds left and 4 seconds left looked identical. Without it the
+difference between hold-for-approval and a slow deny is invisible from the interface
+built to govern it. The backend now exposes the window (a deliberately narrow
+read-only view of non-secret config — `{"hold_timeout": 120.0}`, on the relay
+allowlist), and each card carries `expires in 43s` plus a depleting bar, called out in
+red under 20s. Three details are load-bearing rather than cosmetic:
+
+- **Two clocks, so both ends are clamped.** `ts` is the backend's `time.time()` and
+  `now` is the browser's. They agree in the intended deployment — both are the
+  operator's host — and where they don't, `holdRemaining` clamps to `[0, holdTimeout]`
+  so a skewed clock makes the countdown *wrong* rather than absurd (never negative,
+  never longer than the whole window, and the bar can never exceed 100%).
+- **Zero says `expiring now`, not `expired`.** The backend's clock decides, so a click
+  at zero may still land; if it doesn't, the existing `409` path reports that honestly.
+  Claiming expiry here would be the UI asserting an outcome it cannot know.
+- **A departing card now says which way it went.** Expiry is a governance outcome — the
+  agent was denied because nobody looked in time — while a card leaving with time on
+  the clock means something else resolved it or the control plane restarted. Both used
+  to read as the same hedged sentence; `goneReason` distinguishes them, and falls back
+  to the hedge when `/api/config` is unreachable, because then we genuinely cannot
+  tell. The whole feature fails soft: no config, no countdown, page otherwise
+  unaffected.
+
+**A `+ persist` says what it will write, lets you choose it, and asks twice.** This one
+closes a sharp edge, not just a UX gap. `resolve` used to store the **requested host
+verbatim** as the rule pattern, and two facts made that worse than it looks: a leading
+dot is a *subdomain wildcard* in `_match`, and the host on an approval is chosen by the
+**agent** — so a request for `.example.com` turned one click into a standing rule over
+every subdomain, permanently, since nothing in this system revokes a rule.
+
+The fix puts the pattern under the operator's control and out of the requester's.
+`_persist_candidates(host)` derives a **bounded set** in the backend, beside the
+`_match` it must agree with: the exact host, `.host`, and `.<last two labels>` (the
+registrable domain, which is what one usually wants when a service spreads over many
+hostnames) — narrowest first, so the default is the safest. Leading dots, trailing FQDN
+dots and case are normalized away, IP literals get no wildcard at all (`.1.2.3.4` is
+nonsense), and a one-label wildcard is never offered because `.com` as a standing allow
+rule would end governance for an entire TLD in one click. `ResolveRequest` gained an
+optional `pattern`, **validated against that set server-side** and refused with a `400`
+*before* the conditional UPDATE — so a rejected pattern neither resolves the hold nor
+consumes it, and the operator can choose again rather than losing the approval to a
+race they didn't cause. The candidate list travels with each pending approval, so the
+UI offers exactly what the backend will accept instead of reimplementing the derivation
+in JavaScript and drifting into offering a pattern that then 400s.
+
+On the card, both `*_persist` buttons now open a confirm panel — justified by
+**irreversibility rather than risk**: undoing a mis-click means hand-editing SQLite in
+a named volume. It names the pattern verbatim in a `<code>` (not described — exact-host
+and whole-subtree differ by one dot, and that dot *is* the grant), offers the
+candidates in a select, shouts specifically about a wildcard ("covers … and every
+subdomain of it, including hosts nothing has requested yet"), and labels its own button
+`Confirm — allow .example.com from now on`. It sits **below** the action row, which
+stays exactly where it was: if the confirm button appeared where the pointer already
+is, a double-click on "Allow + persist rule" would sail straight through the
+confirmation it had just opened — the same concern that drove keyed rendering. The
+action row is disabled while the panel is open, so the only live buttons are Confirm
+and Cancel, and Escape backs out.
+
+Known limitation, stated rather than hidden: with no public-suffix list the two-label
+suffix of `example.co.uk` is `.co.uk`, which grants far more than it appears to. That
+is exactly why the operator picks and why the pattern is shown verbatim in a step where
+it is still reversible. The audit trail also learned to say whether policy changed at
+all — the reason now reads `human approval (standing rule written) [peer=…]` vs
+`(this request only)`, from the durable `mode` column. Naming the *pattern* there would
+need a new column on `approvals`, which has no migration step (see the NOTE above
+`_seed_if_empty`); the rule itself is recorded with its pattern and `source='operator'`
+in the rules table, and every later use of it is audited as `allowed by rule (…)`.
 
 **The frontend's own tests.** `tests/test_control_plane_ui_js.py` runs the pure helpers
 under `node` (skipped when node is absent, the way `make lint` skips a missing linter)
 and asserts in Python, so failures read like the rest of `tests/`. It covers the lamp
 precedence (blind outranks busy), the backoff bounds and monotonicity, the keyed-diff
-properties, and the sweep gating. Everything that touches the DOM lives inside
-`start()`, which runs only in a browser — so requiring the module under node must be
-side-effect free, and the test asserts that too: if DOM work migrates to the top level,
-`require` throws and the file cannot quietly become untestable again. Still no
-browser-level test; `start()`'s DOM path is covered only by the id-agreement guard.
+properties, the sweep gating, the countdown arithmetic (including the clock-skew clamps
+and the `expiring now`-not-`expired` wording), the expiry-vs-resolved-elsewhere
+distinction, and the persist preview's wildcard flag. Everything that touches the DOM
+lives inside `start()`, which runs only in a browser — so requiring the module under
+node must be side-effect free, and the test asserts that too: if DOM work migrates to
+the top level, `require` throws and the file cannot quietly become untestable again.
+
+Two cross-file guards cover couplings that have no compiler between their ends. The
+first asserts every `getElementById` in `app.js` matches an id in `index.html`. The
+second asserts **every path the page `fetch`es is either served here or on the relay
+allowlist** — the deliberately narrow allowlist is what keeps `POST /authorize`
+unreachable from a browser, and the cost of that narrowness is that adding a call
+without adding its route yields a 403 visible only to an operator loading the real page
+against a real backend. That is precisely how `/api/config` would have failed; the
+guard was verified by removing the route and watching it fail. The converse direction is
+deliberately not asserted — `/status` is still on the allowlist unused, and pruning it
+is a separate change.
+
+Still no browser-level test: `start()`'s DOM path is covered only by those two guards.
+The new card wiring (countdown, confirm panel, pattern select) was verified once against
+a throwaway stub DOM under node — enough to catch a typo in the plumbing, not kept,
+because a hand-rolled DOM stub is a maintenance liability that would mostly assert its
+own shape.
 
 *What these cannot do.* They are **browser-enforced**. A process running on the host
 sets any header it likes and can still reach the API — and that is not hypothetical
@@ -1652,7 +1732,10 @@ alphabetically; and the **match scope named in words** (`host + subdomains` vs
 `exact host`, derived by `_pattern_scope` beside the `_match` that implements it, so
 the frontend cannot drift from the real semantics) — because a leading-dot wildcard
 otherwise looks exactly like an ordinary hostname in a list. Read-only on purpose:
-this makes policy reviewable, it does not add mutation.
+this makes policy reviewable, it does not add mutation. `_pattern_scope` earns its
+keep twice over now — the same words label the candidates in the persist confirm step,
+so what an approval promises to write and what the policy view later shows it wrote are
+described identically.
 
 **Approval provenance — detection where prevention is not available.** Given that
 ceiling, the frontend and backend at least make a forged approval *visible*. The

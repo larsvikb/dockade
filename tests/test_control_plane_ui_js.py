@@ -510,6 +510,38 @@ class InlineScriptTests(unittest.TestCase):
         self.assertIn("<style>", html)
         self.assertEqual(csp["style-src"], ["'unsafe-inline'"])
 
+    def test_the_hidden_attribute_survives_this_stylesheet(self):
+        """The script hides things by setting `.hidden`, which relies on the UA rule
+        `[hidden] { display: none }` — and that rule loses to ANY author rule setting
+        `display` on the same element, because author beats user-agent at equal
+        specificity. `.saturation` and `.countdown` both set `display: flex`, so both
+        were visible while the script believed otherwise; the saturation banner shipped
+        as a permanently open empty panel offering a Dismiss button.
+
+        Guarding the global override rather than enumerating the elements is the point:
+        one rule makes the whole class impossible, whereas a per-element list is a list
+        someone has to remember to extend. The page had a narrow
+        `[role="tabpanel"][hidden]` patch — the same bug, fixed once, for one element.
+        """
+        html = INDEX_HTML.read_text()
+        self.assertRegex(
+            html, r"\[hidden\]\s*\{[^}]*display:\s*none\s*!important",
+            "index.html must carry a global `[hidden] { display: none !important; }`. "
+            "Without it, any rule that sets `display` on an element the script hides "
+            "leaves it on screen — see this test's docstring.")
+        # Every element the script toggles `hidden` on, and every one the markup ships
+        # hidden, is covered by that one rule — so a NARROWER re-patch is a signal the
+        # global rule was lost or misunderstood.
+        # Comments stripped first: the rationale above this rule quotes `[hidden] {`
+        # in prose, and a scan that reads its own explanation as a violation is worse
+        # than no scan.
+        rules = re.sub(r"/\*.*?\*/", "", html, flags=re.S)
+        narrower = [s for s in re.findall(r"^\s*([^{\n]*\[hidden\][^{\n]*)\{", rules, re.M)
+                    if s.strip() != "[hidden]"]
+        self.assertEqual(narrower, [],
+                         "a scoped [hidden] rule is redundant with the global one; if "
+                         "it is there because the global rule stopped working, fix that")
+
     def test_every_element_the_script_reaches_for_exists_in_the_page(self):
         """Splitting the script out of the markup created a way for the two to drift:
         a `getElementById` that matches nothing returns null, and the very next line

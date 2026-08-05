@@ -1060,6 +1060,24 @@ heartbeat, and make an idle page a 1 Hz firehose — hence absolute timestamps o
 the client doing the arithmetic exactly as the countdown already does. A test pins the
 field set for that reason rather than for tidiness.
 
+**`hidden` did not hide, and it was never only the banner.** The banner shipped
+permanently visible and empty — a Dismiss button with nothing to dismiss. The script
+hides things by setting `.hidden`, which relies on the user-agent rule
+`[hidden] { display: none }`, and that rule loses to *any* author rule setting `display`
+on the same element, because author beats user-agent at equal specificity.
+`.saturation` sets `display: flex`. So does `.countdown` — meaning empty countdown rows
+had been rendering on every card before `/api/config` answered, and stale ones staying
+put after a resolve, unnoticed for as long as the countdown has existed.
+
+The page was already carrying a `[role="tabpanel"][hidden] { display: none }` rule: the
+same bug, met once, patched for the one element that had it, class left open for the
+next occurrence to be found from the running UI. It is now a global
+`[hidden] { display: none !important; }` — the one context where `!important` is the
+right tool rather than a smell, since outranking author `display` declarations on hidden
+elements is the rule's entire job. The test guards **the global rule**, not a list of
+elements, and fails on a narrower re-patch: one rule makes the class impossible, whereas
+an enumeration is something someone has to remember to extend.
+
 **The frontend's own tests.** `tests/test_control_plane_ui_js.py` runs the pure helpers
 under `node` (skipped when node is absent, the way `make lint` skips a missing linter)
 and asserts in Python, so failures read like the rest of `tests/`. It covers the lamp

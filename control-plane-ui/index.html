@@ -34,6 +34,19 @@
   h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
     color: var(--dim); margin: 4px 0 10px; }
   h2 .note { text-transform: none; letter-spacing: 0; font-weight: 400; }
+  /* `hidden` must actually hide, and by default it does not survive this stylesheet.
+     The UA rule is `[hidden] { display: none }`, and ANY author rule that sets
+     `display` on the same element beats it — author beats user-agent at equal
+     specificity — so the element stays on screen while the script believes it hid it.
+     Both `.saturation` and `.countdown` set `display: flex`, and the saturation banner
+     duly shipped as a permanently visible empty panel with a Dismiss button.
+
+     `!important` is correct here rather than a smell: this rule's entire job is to
+     outrank whatever `display` an author rule gives an element that is currently
+     hidden. It replaces a narrower `[role="tabpanel"][hidden]` patch, which fixed the
+     first instance of this and left the class open for the next one to rediscover
+     from the running UI. */
+  [hidden] { display: none !important; }
   .empty { color: var(--dim); font-style: italic; padding: 8px 0; }
   /* Saturation banner. Three levels, and the difference between them is EMPHASIS
      rather than presence: a rejection notice never disappears on a timer (see
@@ -155,7 +168,6 @@
      approvals tab cannot land silently. */
   .badge.unseen { border-color: var(--hold); color: var(--hold); }
   .badge.unseen::after { content: " •"; }
-  [role="tabpanel"][hidden] { display: none; }
 </style>
 </head>
 <body>

@@ -1184,7 +1184,7 @@ A probe must not pollute the evidence it is protecting.
 
 Tier 2's gate is about capability rather than audit: `llama-server` binds its port
 immediately but returns 503 until the model is loaded and offloaded (minutes for a
-large GGUF — see "Operational constraints"), and inference is that tier's only
+large GGUF — `NOTES.md` has the measured load times), and inference is that tier's only
 capability, so `run-opencode-sandbox.sh` waits rather than letting opencode's first
 turn fail. `sc_wait_healthy` treats `unhealthy` as retryable, since a load that
 outruns its `start_period` passes through that state on the way up; only the
@@ -1284,12 +1284,10 @@ accelerator the host has, and switching hardware is a profile flag rather than a
 rewiring. Enabling two profiles at once is an address conflict, which is the
 intended failure.
 
-- **Intel (WSL2)** — `--device /dev/dxg` plus `/usr/lib/wsl:ro`. There is no
-  `/dev/dri` render node under WSL; the GPU is a paravirtual D3D12 device, and the
-  in-image Level Zero runtime reaches it via `libdxcore.so` from that mount. A
-  consequence worth recording: Intel's native Vulkan driver (ANV) **cannot** bind
-  under WSL, so Vulkan there would run through Mesa's Dozen shim over D3D12 —
-  published Arc-on-Linux Vulkan benchmarks do not transfer. SYCL is the path.
+- **Intel (WSL2)** — `--device /dev/dxg` plus `/usr/lib/wsl:ro`, because there is no
+  `/dev/dri` render node under WSL and the in-image Level Zero runtime reaches the
+  paravirtual D3D12 device via `libdxcore.so` from that mount. SYCL is the path, not
+  Vulkan (`NOTES.md` explains why Vulkan cannot work there).
 - **NVIDIA** — `gpus: all` (Compose ≥ 2.30) and the `server-cuda` image. The
   nvidia-container-toolkit injects driver libraries itself, so unlike the Intel
   path there is no device node or driver mount to declare.
@@ -1329,99 +1327,41 @@ intended failure.
 No variant needs an accelerator runtime installed on the host distro: the
 llama.cpp images bundle the full Intel NEO / Level Zero and Mesa stacks themselves.
 
-**Why AMD is Vulkan here rather than ROCm.** On supported hardware ROCm/HIP beats
-Vulkan by roughly 10–20%, and by much more on long context, MoE, and multi-GPU
-(Vulkan lacks row split); Vulkan tends to win short-context dense prefill and is
-far less fussy about hardware. Two things settle it for this repo: upstream
-ggml-org publishes no ROCm tag (only `cuda`, `vulkan`, `musa`, `intel`), so ROCm
-means AMD's own `rocm/llama.cpp` images, and those are validated for MI-series
-datacenter cards rather than consumer Radeon. Vulkan is therefore the default AMD
-path, with ROCm left as a documented manual image swap (`+ /dev/kfd`) for anyone
-running MI hardware. Note also that **AMD under WSL2 is not a viable target at
-all** — the amdgpu module lives on the Windows side, `rocm-smi`/`amd-smi` are
-unsupported there, ROCm-in-Docker-under-WSL is community-workaround territory, and
-Vulkan hits the same Dozen problem as Intel. An AMD laptop on Windows means CPU
-inference.
+**AMD is Vulkan here, not ROCm**, and **AMD under WSL2 is not a viable target at all**
+(CPU inference only there). Both conclusions rest on an ecosystem survey rather than on
+anything in this repo — see `NOTES.md` → "Accelerator ecosystem survey". ROCm stays a
+documented manual image swap for anyone on MI-series hardware.
 
-### Measured characteristics (Intel Arc 140V iGPU, Lunar Lake)
+### Tuning decisions (the evidence is in `NOTES.md`)
 
-| Workload | Result |
-| --- | --- |
-| Decode, 4B Q4_K_M | ~30 tok/s |
-| Decode, 9B Q4_K_M | ~15–17 tok/s |
-| Prefill, 9B | ~164 tok/s (275-token prompt) |
-| Cold model load, 9B | ~70 s |
-| Two concurrent requests | per-request decode roughly halves |
+The compose entrypoint carries a handful of `llama-server` flags that all exist for the
+same reason: on this hardware the *silent* failure modes are the dangerous ones, so each
+flag converts one into either a loud failure or a bounded cost. Measurements and the full
+"learned the hard way" list are in `NOTES.md` → "Local inference".
 
-Decode is **memory-bandwidth-bound** — the iGPU shares LPDDR5X with the host at
-~135 GB/s, and measured throughput sits at ~55% of that ceiling. Prefill is
-compute-bound and benefits from Xe2's matrix engines, giving a ~10x asymmetry.
-**This machine is good at prompt-heavy, short-output work and bad at long-form
-generation**, which should drive task design more than model choice does.
+- **`--reasoning off`** — thinking defaults to on, and a trivial prompt once produced
+  6,099 reasoning tokens over 7.4 minutes. Set **server-side**, not per-request, because
+  a client that can disable it merely fixes itself while one that cannot (opencode) has
+  no recourse. Overridable with `DOCKADE_LLM_REASONING=on`; if switched on, bound it with
+  `--reasoning-budget N` rather than leaving it at `-1`.
+- **`--parallel 1`** — the prompt cache is per-slot and slots are assigned LRU, so a
+  multi-turn conversation could land on a slot that never saw it and re-prefill the whole
+  history. Concurrency was never real anyway: two in-flight requests contend for the same
+  GPU.
+- **`--no-context-shift`** — the default silently discards the oldest tokens, which for
+  an agent means evicting its system prompt and tool definitions mid-conversation.
+  Presents as the model becoming inexplicably confused rather than as an error.
+- **`-c 32768`, matched by `limit.context` in the client config** and guarded by `make
+  consistency`. 8k is not merely tight but unusable — opencode's base prompt exceeds it
+  before the first user turn — and 64k does not fit the shared memory pool. Avoid `-c 0`,
+  which would size the allocation from the model's native window.
+- **One model at a time**, and `temperature: 0` for extraction/classification.
 
-Verified working: OpenAI-style tool calling (correct function and arguments) and
-`response_format: json_schema` constrained decoding. `--jinja` is required for
-tool calls and is set in the compose entrypoint. Tool calling was re-verified
-**with `--reasoning off`**, i.e. in the shipped configuration — the model picks the
-function and argument in 27 tokens with no thinking step, so bounding reasoning
-costs nothing here.
-
-### Operational constraints (learned the hard way)
-
-- **One model at a time.** ~16.9 GB of shared memory will not hold two useful
-  models concurrently, and swapping costs a container recreate plus the cold load
-  above. Every consumer shares one model; "cheap classifier plus capable agent
-  simultaneously" is not available on this hardware.
-- **Reasoning models need bounding.** Qwen3.5 has thinking on by default
-  (`llama-server --reasoning` defaults to `auto`, which resolves to on). A trivial
-  self-verification prompt ("say hi in five words") produced 6,099 reasoning tokens
-  over 7.4 minutes — it found valid answers immediately, then looped re-checking.
-  Genuine tasks reason proportionally (~50 tokens for a tool-call decision), so
-  this is a tail risk, not a constant tax. **The default is therefore set
-  server-side**: `--reasoning off` in the compose entrypoint, overridable with
-  `DOCKADE_LLM_REASONING=on`. Measured on the same prompt: 6,099 tokens / 441 s
-  with reasoning on, 8 tokens / 0.5 s with it off, and no `reasoning_content` field
-  emitted at all. Server-side rather than per-request because a client
-  that *can* send `"chat_template_kwargs":{"enable_thinking":false}` merely fixes
-  itself, while one that cannot (opencode) has no recourse — so the fix belongs
-  where every consumer inherits it. Keep a hard `max_tokens` and a client timeout
-  regardless, and if reasoning is switched back on, bound it with
-  `--reasoning-budget N` instead of leaving it unrestricted (`-1`).
-- **A schema does not constrain reasoning.** With thinking on, `reasoning_content`
-  can consume the whole `max_tokens` budget and return empty `content` — the
-  grammar never applies. Unbounded reasoning defeats the reliability guarantee
-  that constrained decoding is adopted for.
-- **Constrained decoding guarantees shape, not values.** A first trial returned
-  schema-perfect JSON reading `"critical"` for a line beginning `ERROR`, and
-  expanded the component `db-pool` to `"database-connection-pooling-layer"`.
-  Explicit "verbatim, do not expand" instructions fixed both. The lesson is not
-  that the model is incapable but that its errors are *semantically* wrong while
-  *structurally* valid, so nothing throws. Prefer parsing deterministic fields
-  deterministically and giving the model only the genuinely fuzzy ones.
-- **Use `temperature: 0`** for extraction and classification. The server default
-  is non-deterministic and buys nothing on these tasks.
-- **32k context is the working ceiling, and agents need most of it.** ~4.6 GB of
-  f16 KV on top of ~5.5 GB of weights fits the ~16.9 GB shared pool with headroom;
-  64k does not. 8k is not merely tight but unusable for an agent harness —
-  opencode's base prompt (system + tool schemas) exceeds it before the first user
-  turn. Both ends must agree: `-c` on the server and `limit.context` in the client
-  config, guarded by `make consistency`. Avoid `-c 0` (load from model), which
-  would size the allocation from the model's native window.
-- **The prompt cache is per-slot, so run one slot.** llama-server defaults to 4
-  slots assigned by LRU; a multi-turn conversation can land on a slot that never
-  saw it and re-prefill the entire history. `--parallel 1` keeps the prefix stable.
-  Concurrency was never real anyway — two in-flight requests contend for the same
-  GPU (~331 tok/s prefill solo vs ~22 tok/s with two running).
-- **Prefill throughput decays with depth.** ~331 tok/s for the first 2k tokens,
-  ~236 marginal by 6k, as attention cost grows with context. Short-prompt
-  measurements (the ~164 tok/s figure from the 275-token request in the table
-  above) are dominated by
-  fixed overhead and overstate the cost of long prompts while understating deep
-  ones. Budget roughly half a minute for an 8k prompt.
-- **Overflow should fail, not silently truncate.** `--no-context-shift`: the
-  default discards the oldest tokens, which for an agent means evicting its system
-  prompt and tool definitions mid-conversation — degradation that presents as the
-  model becoming inexplicably confused rather than as an error.
+Two properties worth carrying in the reader's head, because they shape task design more
+than model choice does: decode is memory-bandwidth-bound while prefill is compute-bound
+(a ~10x asymmetry, so this machine is good at prompt-heavy short-output work and bad at
+long-form generation), and **a healthy container is not evidence of acceleration** —
+llama.cpp falls back to CPU silently and the health check still returns 200.
 
 ### Why tier-1 Claude cannot reach it — deliberately
 
@@ -1518,7 +1458,7 @@ That is the "capability, not configuration" split in miniature.
 **Why the server sets the reasoning default.** opencode cannot send
 `chat_template_kwargs` per request, so with llama-server's default (`--reasoning
 auto` → on) every turn paid the full thinking cost — the observed "somewhat slow"
-behaviour. Fixed at the server (`--reasoning off`, see *Operational constraints*),
+behaviour. Fixed at the server (`--reasoning off`, see *Tuning decisions*),
 which is the right layer: a per-request workaround only helps clients able to send
 one, and this tier's whole point is hosting consumers that are not under our
 control.
@@ -1798,7 +1738,9 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
 
 ## Layout
 
-See `README.md` → Layout for the current tree. Still-planned additions to it:
+See `README.md` → Layout for the current tree. Companion documents: `NOTES.md` holds
+the evidence behind decisions recorded here (see CLAUDE.md → "Where writing goes" for
+which file takes what). Still-planned additions to it:
 
 ```
 dockade/

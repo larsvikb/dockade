@@ -49,6 +49,36 @@ only the invariants and conventions for working in the repo.
   clarity over cleverness.
 - New recurring workflow → make it a skill. Skills encode good practice, not
   just access.
-- Keep CLAUDE.md lean; put architecture and rationale in `DESIGN.md` and
-  reference it rather than restating it.
 - Don't commit or push unless asked.
+
+### Where writing goes
+
+Five places, and the test is **what would have to change for this to become
+wrong.** Getting this wrong is how `DESIGN.md` grew a 616-line section called
+"Build status" that was really the architecture rationale.
+
+| Write it in | When | Rot risk |
+|---|---|---|
+| **code comment** | it explains the code it sits next to | none — moves with the code |
+| **commit message** | how a specific bug was found and fixed | none — dated, immutable |
+| **`DESIGN.md`** | a decision or invariant that constrains *this* repo | rots if it restates the other four |
+| **`NOTES.md`** | evidence: measurements, environment behaviour, dead ends | low — facts about the world |
+| **`CLAUDE.md`** | an invariant or convention to follow *while working* | rots fastest — keep it lean |
+
+Consequences worth stating, because each was learned by violating it:
+
+- **A decision goes in `DESIGN.md`; the evidence for it goes in `NOTES.md`.** If a
+  paragraph would still be true in someone else's repo on the same hardware, it is
+  evidence. If changing it means changing code here, it is a decision.
+- **Never narrate an incident in `DESIGN.md`.** The commit that fixed it already
+  says it, in more detail, with a date. `DESIGN.md` keeps the resulting invariant
+  and nothing else — one or two sentences.
+- **Don't restate a code comment.** Reference the file. The comment is closer to
+  the code and cannot drift from it; a copy in a document silently can.
+- **`DESIGN.md` earns its length only on reasoning that spans files** — "these
+  four guards together close clickjacking, none alone does" has no home in any
+  single file, which is exactly why it belongs there.
+- **No status logs, no DONE lists, anywhere but `## Status`.** They only grow. One
+  table that tracks sequence, so nothing else needs editing when a step lands.
+- **Numbers in prose rot.** Don't restate a test count or a version a command
+  reports; name the command.

@@ -102,9 +102,9 @@ the agent's endpoint is `http://llm:8080` whatever the host has. `llm-vulkan` al
 needs `DOCKADE_RENDER_GID` (the host gid owning `/dev/dri/renderD128`) and is the
 one variant not yet verified on hardware.
 
-See [`DESIGN.md`](DESIGN.md) → *Local inference* for the accelerator setup,
-measured throughput, and why the LLM service is ungoverned (it has no egress of
-its own to govern).
+See [`DESIGN.md`](DESIGN.md) → *Local inference* for the accelerator setup, the
+tuning decisions, and why the LLM service is ungoverned (it has no egress of its own
+to govern); [`NOTES.md`](NOTES.md) has the measured throughput behind those decisions.
 
 ## What the launcher does
 
@@ -254,6 +254,8 @@ exposed through governed data-plane services. Next steps toward it:
 
 - [`DESIGN.md`](DESIGN.md) — architecture, topology, threat model, and the
   rationale behind every decision. Start here to understand *why*.
+- [`NOTES.md`](NOTES.md) — the lab notebook: measurements, hardware behaviour,
+  and dead ends. Evidence for what `DESIGN.md` decides.
 - [`CLAUDE.md`](CLAUDE.md) — the invariants that must never be violated and the
   conventions for working in this repo.
 - [`SECURITY.md`](SECURITY.md) — how to report a boundary bypass, and — worth

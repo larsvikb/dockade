@@ -60,8 +60,9 @@
   .saturation .sat-detail { color: var(--dim); font-size: 12px; margin-top: 2px;
     word-break: break-all; }
   .saturation.recent { border-left-color: var(--deny); }
-  /* Not colour alone: the marker carries the level for anyone who cannot use hue,
-     which is the same gap still open in the decisions table. */
+  /* Not colour alone: the marker carries the level for anyone who cannot use hue.
+     Same reason the decisions table puts the word "allow"/"deny" in the tag rather
+     than relying on its colour. */
   .saturation.recent .sat-body::before { content: "⚠ "; color: var(--deny); }
   .saturation.past { border-left-color: var(--hold); }
   .saturation.past .sat-body::before { content: "⚑ "; color: var(--hold); }

@@ -1818,10 +1818,17 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
     is treated as a convenience layer over a backend that validates every input, with its
     mistakes made detectable rather than prevented. The reasoning, and the condition that
     would reopen it, are under "`start()` is deliberately unverified" above.)*
-  - **The decisions table drops data the backend already sends** (`stage` is selected
-    and never rendered; `client` is not selected at all, though this control plane is
-    shared across sandboxes), stamps rows time-only so 40 rows read out of order across
-    midnight, has no empty state, and encodes the decision by colour alone.
+  - **The decisions table drops data the backend already sends** — `stage` is selected
+    and never rendered, and `client` is not selected at all, though it is populated
+    (the proxy sends the sandbox peer address) and this control plane is shared across
+    sandboxes, so a row cannot say *whose* request was decided. It also stamps rows
+    time-only, so 40 rows read out of order across midnight, and has no empty state,
+    which makes "nothing has happened yet" and "the poll failed" identical.
+    *(This bullet also claimed the decision was encoded by colour alone. That was
+    wrong and is struck: the tag's text content is the decision word, with colour as
+    redundant reinforcement. Checked only when the item came up for work — a filed
+    defect is a claim like any other, and this one had been repeated into a CSS
+    comment before anyone read the template.)*
   - **Collapse duplicate holds by host.** Retrying clients routinely produce several
     holds for one host, so one decision costs four clicks and can fill the per-client
     cap; grouping also sidesteps the `INSERT OR IGNORE` wart where a second

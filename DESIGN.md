@@ -1044,16 +1044,41 @@ alternative — making omission impossible — is what was done for `markStale` 
 `shouldSweep` keeps its primitive signature because that is what makes it cheap to
 assert at the boundaries.
 
-Still no browser-level test: `start()`'s DOM path is covered only by those guards. The
-card wiring (countdown, confirm panel, pattern select, dwell) was verified against a
-throwaway stub DOM under node — enough to catch a typo in the plumbing — and not kept,
-because a hand-rolled DOM stub is a maintenance liability that would mostly assert its
-own shape. **The cost of that choice is now measurable and worth stating**: mutation
-testing was run twice over this work, and every mutation inside a pure helper was caught
-while every mutation inside `start()` survived. The structural fixes above (pass the
-whole object, guard the call site) reduce what a mutation there can silently break, but
-they are mitigations for missing coverage rather than coverage. See the DOM-test item
-under "Future improvements".
+**`start()` is deliberately unverified, and that is a decision rather than a gap.** Its
+DOM path is covered only by the guards above; the card wiring (countdown, confirm panel,
+pattern select, dwell) was checked once against a throwaway stub DOM under node and not
+kept. The cost is real and measurable: mutation testing was run twice across this work,
+and every mutation inside a pure helper was caught while every mutation inside `start()`
+survived. So the position needs an argument, not a shrug.
+
+The argument is what a frontend bug can and cannot do here. It **cannot** produce an
+out-of-policy rule: `resolve` validates the action against a fixed set and the pattern
+against `_persist_candidates` re-derived from the *durable approval row*, never from
+anything the page sends, so no breakage in the UI reaches an outcome a hand-crafted curl
+could not have asked for. What it **can** do is cause an operator to approve one of the
+*legitimate* options they did not intend — sharpest case, a preview reading
+`example.com` while the select's value is `.example.com`. That display-versus-value
+divergence is the entire residual risk.
+
+Three things already act on exactly that risk, and the load-bearing one is tested. The
+card's outcome message reports `d.pattern` **from the backend response**, not from the
+click, so a wrong send announces itself in words at the moment of the mistake, while the
+operator is still looking (`test_the_response_names_the_pattern_that_was_stored` asserts
+the backend echoes what it stored). The audit reason then says whether standing policy
+was written, and the Policy view shows the rule with its scope named. That is the same
+**detection-where-prevention-is-not-available** pattern this repo already applies to
+host-local approval forgery — see the provenance note below.
+
+The alternatives were weighed and declined. A hand-rolled stub DOM would catch the
+value-flow class but largely asserts its own shape and needs editing on every markup
+change. A headless browser is the only thing that catches *layout-level* deception (a
+warning that renders invisible, a confirm button that lands under the pointer), but it
+does not merely add a dependency — it breaks the property that this suite runs
+identically on a host, in CI, **and inside the sandbox image**, where it would skip for
+want of egress to install a browser. That is precisely the "silently checks nothing where
+the agent actually runs" failure `DOCKADE_REQUIRE_TOOLS` exists to prevent. Revisit if
+the UI ever gains a control whose mistake the backend cannot refuse and the response
+cannot report.
 
 *What these cannot do.* They are **browser-enforced**. A process running on the host
 sets any header it likes and can still reach the API — and that is not hypothetical
@@ -1678,18 +1703,10 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
   top two — the hold countdown and the persist preview/confirm with an operator-chosen
   pattern — are **now built**; see "The card shows its deadline" and "A `+ persist` says
   what it will write" under the frontend section. What remains:
-  - **A DOM-level test for `start()`, and a decision about how.** The frontend's testing
-    strategy — pure decision helpers under node, DOM work left to cross-file guards — was
-    right when `start()` only rendered a list. It now holds a confirm-panel state machine,
-    a countdown, and per-card sweep timing, and the evidence that the strategy has been
-    outgrown is concrete: mutation testing over the last two changes caught every mutation
-    inside a pure helper and **none** inside `start()`. Two honest options, and the choice
-    matters more than the work: a hand-rolled stub DOM (what was used throwaway here —
-    cheap, no dependencies, but largely asserts its own shape), or a real headless browser
-    (truthful, but a Node dependency and a CI browser install, against a repo that keeps
-    its test suite dependency-free on purpose). A third possibility is to keep shrinking
-    `start()` by extracting more decisions into pure functions, which is what has happened
-    organically so far and has a ceiling.
+  - *(A DOM-level test for `start()` was considered here and **declined** — the frontend
+    is treated as a convenience layer over a backend that validates every input, with its
+    mistakes made detectable rather than prevented. The reasoning, and the condition that
+    would reopen it, are under "`start()` is deliberately unverified" above.)*
   - **The decisions table drops data the backend already sends** (`stage` is selected
     and never rendered; `client` is not selected at all, though this control plane is
     shared across sandboxes), stamps rows time-only so 40 rows read out of order across

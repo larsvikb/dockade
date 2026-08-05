@@ -152,6 +152,76 @@ function persistPreview(action, option) {
   };
 }
 
+// Hold-cap pressure, as a banner state. Over CONTROL_MAX_PENDING(_PER_CLIENT) the
+// control plane fails closed WITHOUT creating an approval, so the agent is denied and
+// no card is ever raised — governance degrading to blanket-deny, and from this page
+// indistinguishable from a quiet afternoon.
+//
+// The rejection RECORD is what this reports, not the live level. Saturation is a
+// burst: holds drain in seconds, so a gauge alone shows a healthy number to anyone who
+// looks a moment later. The gauge is here too, but only as the secondary reading.
+//
+// Deliberately says nothing about WHICH cap fired in its headline. The operator's
+// response is identical either way — a request was refused unheard — and per-client
+// detail would be the first thing in this UI to expose client identity. It is carried
+// in `detail` for when the distinction between "one agent hammering" and "the whole
+// control plane loaded" is the question being asked.
+const SATURATION_RECENT_MS = 60000;
+const SATURATION_WARN_FRAC = 0.75;
+
+// `dismissedCount` is the rejection total the operator has already acknowledged, so a
+// dismissed banner RETURNS on the next rejection rather than staying shut. There is no
+// time-based auto-clear on purpose: the failure being reported is precisely "nobody was
+// looking", so expiring the notice after a minute would re-create the bug for the one
+// population it exists to serve. Emphasis decays; the notice does not.
+function saturationState(sat, nowMs, dismissedCount = 0) {
+  const hidden = { show: false, level: "none", count: 0, text: "", detail: "", lastTs: null };
+  if (!sat) return hidden;
+  const cap = Number(sat.max_pending) || 0;
+  const inFlight = Number(sat.in_flight) || 0;
+  const rejections = Number(sat.rejections) || 0;
+
+  if (rejections > dismissedCount) {
+    const lastTs = Number(sat.last_ts);
+    const known = Number.isFinite(lastTs) && lastTs > 0;
+    // Age from an ABSOLUTE stamp, computed here — the payload never carries an
+    // elapsed value (see _saturation in the control plane).
+    const recent = known && (nowMs - lastTs * 1000) < SATURATION_RECENT_MS;
+    const plural = rejections === 1 ? "" : "s";
+    return {
+      show: true,
+      level: recent ? "recent" : "past",
+      count: rejections,
+      text: `${rejections} request${plural} denied unheard — over the hold cap, ` +
+            "so no approval card was raised",
+      // Never renders a bare zero anywhere (the banner is hidden at zero), and says
+      // SINCE WHEN, because this counter is in-memory and a restart silently resets
+      // it. "3 since 14:02" cannot be misread as "3 ever".
+      detail: (sat.last_host ? `last: ${sat.last_host}` : "last: unknown host") +
+              (sat.last_scope
+                ? " — hit " + (sat.last_scope === "global"
+                    ? "the global cap"
+                    : `the per-client cap for ${String(sat.last_scope).replace(/^client /, "")}`)
+                : ""),
+      lastTs: known ? lastTs : null,
+    };
+  }
+
+  // No rejections yet: warn only once the cap is close enough that the next burst
+  // would hit it. Below that this is noise on a page whose job is the queue.
+  if (cap > 0 && inFlight >= cap * SATURATION_WARN_FRAC) {
+    return {
+      show: true, level: "load", count: 0,
+      text: `${inFlight}/${cap} holds in flight`,
+      detail: inFlight >= cap
+        ? "at the cap — further requests are denied without raising a card"
+        : "near the cap — further requests would be denied without raising a card",
+      lastTs: null,
+    };
+  }
+  return hidden;
+}
+
 // ── the page ────────────────────────────────────────────────────────────────
 
 function start() {
@@ -568,6 +638,38 @@ function start() {
     emptyEl.hidden = cards.size > 0;
   }
 
+  // ── saturation banner ─────────────────────────────────────────────────────
+  const satEl = document.getElementById("saturation");
+  const satText = document.getElementById("sat-text");
+  const satDetail = document.getElementById("sat-detail");
+  const satDismiss = document.getElementById("sat-dismiss");
+  let lastSaturation = null;
+  let dismissedRejections = 0;
+
+  satDismiss.addEventListener("click", () => {
+    // Acknowledge exactly what has happened so far. Anything after this re-raises the
+    // banner, because `saturationState` compares against this number rather than
+    // clearing a flag.
+    dismissedRejections = lastSaturation ? Number(lastSaturation.rejections) || 0 : 0;
+    renderSaturation();
+  });
+
+  function renderSaturation() {
+    const s = saturationState(lastSaturation, Date.now(), dismissedRejections);
+    satEl.hidden = !s.show;
+    if (!s.show) return;
+    satEl.className = "saturation " + s.level;
+    satText.textContent = s.text;
+    // The time is formatted HERE rather than in the pure helper, which returns the raw
+    // stamp: locale formatting is not something a unit test should have to pin down.
+    satDetail.textContent = s.lastTs
+      ? `${s.detail} at ${fmt(s.lastTs)} · counted since ${fmt(lastSaturation.since)}`
+      : s.detail;
+    // Only the acknowledgeable state offers the button; a load warning clears itself
+    // when the holds drain, so dismissing it would mean nothing.
+    satDismiss.hidden = s.level === "load";
+  }
+
   function renderPending(list) {
     pendingCount = list.length;
     const { add, gone } = diffPending([...cards.keys()], list);
@@ -615,7 +717,10 @@ function start() {
   // as soon as removing it is safe rather than on the next tick.
   pendingEl.addEventListener("mouseleave", sweep);
   pendingEl.addEventListener("focusout", () => setTimeout(sweep, 0));
-  setInterval(() => { updateCountdowns(); sweep(); }, 1000);
+  // renderSaturation rides this tick too, because its emphasis decays with time
+  // rather than with events: a rejection that stops being "recent" must fade on its
+  // own, and the stream is silent precisely when nothing is arriving.
+  setInterval(() => { updateCountdowns(); sweep(); renderSaturation(); }, 1000);
 
   // ── config (the hold window behind the countdown) ─────────────────────────
   async function refreshConfig() {
@@ -689,7 +794,12 @@ function start() {
       // moment — and a reconnect may be a restarted backend with a different window.
       refreshConfig();
     };
-    es.addEventListener("pending", e => renderPending(JSON.parse(e.data)));
+    es.addEventListener("pending", e => {
+      const d = JSON.parse(e.data);
+      lastSaturation = d.saturation || null;
+      renderSaturation();
+      renderPending(d.holds || []);
+    });
     es.onerror = () => {
       // The feed is the only thing that tells us about pending approvals, so losing
       // it means we are blind, not idle — say so in the light rather than sitting on
@@ -729,8 +839,8 @@ if (typeof document !== "undefined") { start(); }
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     lampState, backoffDelay, diffPending, shouldSweep,
-    holdRemaining, countdownState, departure, persistPreview,
+    holdRemaining, countdownState, departure, persistPreview, saturationState,
     RECONNECT_MIN_MS, RECONNECT_MAX_MS, STALE_MAX_MS, COUNTDOWN_URGENT_S,
-    DWELL_MS,
+    DWELL_MS, SATURATION_RECENT_MS, SATURATION_WARN_FRAC,
   };
 }

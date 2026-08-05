@@ -1014,13 +1014,60 @@ need a new column on `approvals`, which has no migration step (see the NOTE abov
 `_seed_if_empty`); the rule itself is recorded with its pattern and `source='operator'`
 in the rules table, and every later use of it is audited as `allowed by rule (…)`.
 
+**The banner for requests that never became cards.** Over `CONTROL_MAX_PENDING` (16) or
+`CONTROL_MAX_PENDING_PER_CLIENT` (4), `/authorize` fails closed **without creating an
+approval row** — correct, since default-deny is the right failure and a held request
+pins a threadpool worker this control plane shares across every sandbox. But it meant
+the agent was being refused while the operator's queue looked exactly like a quiet
+afternoon. The refusal existed only as a reason string in the audit table.
+
+Two things about the shape of that problem drove the design, and the second overturned
+the obvious fix:
+
+- **The count cannot be taken from the visible cards.** The cap is measured against the
+  in-memory hold set; the card list comes from `status='pending'` rows. They normally
+  agree and diverge exactly when it matters — after a restart the table can carry
+  pending rows with no live hold behind them — so a card-derived gauge would be
+  confidently wrong in the one situation it exists to report. `_saturation()` counts
+  `_PENDING_EVENTS`.
+- **Saturation is a burst, so a gauge is nearly useless.** Holds drain in seconds; by
+  the time anyone looks, the level is healthy again. What was filed here was an
+  `n/16 holds` counter, and that would have reported almost nothing. The **rejection
+  record** is the load-bearing part — a count plus the last one's time, scope and host,
+  kept in memory — and the gauge is context beside it, shown only from 75% of the cap.
+
+In-memory is not a weakening: the deny is already audited with its reason, so this is a
+display index over a durable record. It does mean a restart resets the count, which is
+why the payload carries `since` and the banner says *3 since 14:02* rather than a bare
+3 — and why it renders nothing at all at zero, since an in-memory counter must never be
+able to present itself as a positive all-clear.
+
+Two decisions worth keeping. The banner **does not auto-clear**: the failure it reports
+is precisely that nobody was looking, so expiring the notice after a minute would
+re-create the bug for the only population it serves. Emphasis decays (`recent` → `past`
+at 60s) and dismissal is explicit — and dismissal acknowledges a *count*, not a flag, so
+the next rejection raises it again. And it says nothing in its headline about *which*
+cap fired: the operator's response is the same either way, and per-client detail would
+be the first thing in this UI to expose client identity, so it sits in the detail line.
+
+It rides the existing SSE payload rather than a new endpoint — `/approvals` and the
+stream now return `{holds, saturation}` — so a rejection reaches the banner within a
+second through the push the page already listens to, with no new relay-allowlist entry
+and no poll to lag behind the burst. That carries one constraint into the backend: the
+stream emits on *serialized payload change*, so every field must be stable while nothing
+happens. An `elapsed_seconds` convenience would defeat the change detection, silence the
+heartbeat, and make an idle page a 1 Hz firehose — hence absolute timestamps only, with
+the client doing the arithmetic exactly as the countdown already does. A test pins the
+field set for that reason rather than for tidiness.
+
 **The frontend's own tests.** `tests/test_control_plane_ui_js.py` runs the pure helpers
 under `node` (skipped when node is absent, the way `make lint` skips a missing linter)
 and asserts in Python, so failures read like the rest of `tests/`. It covers the lamp
 precedence (blind outranks busy), the backoff bounds and monotonicity, the keyed-diff
 properties, the sweep gating, the countdown arithmetic (including the clock-skew clamps
 and the `expiring now`-not-`expired` wording), the expiry-vs-resolved-elsewhere
-distinction, and the persist preview's wildcard flag. Everything that touches the DOM
+distinction, the persist preview's wildcard flag, and the saturation banner's levels,
+recency boundary and count-based dismissal. Everything that touches the DOM
 lives inside `start()`, which runs only in a browser — so requiring the module under
 node must be side-effect free, and the test asserts that too: if DOM work migrates to
 the top level, `require` throws and the file cannot quietly become untestable again.
@@ -1727,9 +1774,6 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
     and never rendered; `client` is not selected at all, though this control plane is
     shared across sandboxes), stamps rows time-only so 40 rows read out of order across
     midnight, has no empty state, and encodes the decision by colour alone.
-  - **Saturation is invisible.** Over `CONTROL_MAX_PENDING(_PER_CLIENT)` `/authorize`
-    fails closed and the agent just gets denies — governance degraded, visible only as a
-    reason string. Wants a banner plus an `n/16 holds` counter.
   - **Collapse duplicate holds by host.** Retrying clients routinely produce several
     holds for one host, so one decision costs four clicks and can fill the per-client
     cap; grouping also sidesteps the `INSERT OR IGNORE` wart where a second

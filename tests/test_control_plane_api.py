@@ -12,6 +12,7 @@ thread; ``HOLD_TIMEOUT`` is shortened per-test so a bug fails fast instead of
 blocking the default 120s."""
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import threading
@@ -46,6 +47,9 @@ def _clear_all():
         conn.commit()
     cp._PENDING_EVENTS.clear()
     cp._PENDING_CLIENT.clear()
+    # Module state like the two above, and reset for the same reason: it is
+    # process-lifetime by design, which across tests means it leaks.
+    cp._SATURATION.update(count=0, last_ts=None, last_scope=None, last_host=None)
 
 
 def _auth_req(host, **kw):
@@ -531,6 +535,102 @@ class ConfigViewTests(_CPTestCase):
         # A read-only view of NON-SECRET config on the one interface that can grant
         # egress: whatever gets added here has to stay harmless to publish.
         self.assertEqual(set(cp.api_config()), {"hold_timeout"})
+
+
+class SaturationTests(_CPTestCase):
+    """Over the hold cap ``/authorize`` fails closed WITHOUT creating an approval, so
+    the refusal never becomes a card and the approvals page shows the same empty list
+    as a quiet afternoon. These assert the record that makes it visible."""
+
+    def _over_cap(self, host="pypi.org", client=None):
+        saved = cp.MAX_PENDING
+        cp.MAX_PENDING = 0
+        try:
+            return cp.authorize(_auth_req(host, client=client))
+        finally:
+            cp.MAX_PENDING = saved
+
+    def test_a_rejection_is_recorded_with_what_was_refused(self):
+        self._over_cap(host="pypi.org")
+        sat = cp._saturation()
+        self.assertEqual(sat["rejections"], 1)
+        self.assertEqual(sat["last_host"], "pypi.org")
+        self.assertEqual(sat["last_scope"], "global")
+        self.assertIsNotNone(sat["last_ts"])
+
+    def test_rejections_accumulate_rather_than_overwrite(self):
+        # The count is the point: a burst of twenty is a different event from one,
+        # and only the count survives the holds draining.
+        for _ in range(3):
+            self._over_cap()
+        self.assertEqual(cp._saturation()["rejections"], 3)
+
+    def test_the_per_client_cap_is_recorded_as_its_own_scope(self):
+        saved = cp.MAX_PENDING_PER_CLIENT
+        cp.MAX_PENDING_PER_CLIENT = 1
+        try:
+            _hold("a.example", "held-1")
+            cp._PENDING_CLIENT["held-1"] = "172.30.0.9"
+            cp.authorize(_auth_req("b.example", client="172.30.0.9"))
+        finally:
+            cp.MAX_PENDING_PER_CLIENT = saved
+        # Distinguishable from a global exhaustion: "one agent is hammering" and
+        # "the whole control plane is loaded" want different responses.
+        self.assertEqual(cp._saturation()["last_scope"], "client 172.30.0.9")
+
+    def test_nothing_is_recorded_when_the_hold_is_accepted(self):
+        _hold("quiet.example", "held-1")
+        self.assertEqual(cp._saturation()["rejections"], 0)
+        self.assertIsNone(cp._saturation()["last_ts"])
+
+    def test_in_flight_counts_live_holds_not_pending_rows(self):
+        # The divergence this exists for: after a restart the table can carry
+        # `pending` rows with no live hold behind them. The cap is measured against
+        # the in-memory set, so a count taken from the visible cards would be
+        # confidently wrong in exactly the situation the banner reports.
+        with cp._connect() as conn:
+            conn.execute(
+                "INSERT INTO approvals(id, ts, host, status) "
+                "VALUES ('orphan', 0, 'stale.example', 'pending')")
+            conn.commit()
+        self.assertEqual(len(cp._list_pending()), 1)
+        self.assertEqual(cp._saturation()["in_flight"], 0)
+
+    def test_the_payload_carries_the_holds_and_the_pressure_together(self):
+        _hold("a.example", "held-1")
+        payload = cp.approvals()
+        self.assertEqual(set(payload), {"holds", "saturation"})
+        self.assertEqual([h["id"] for h in payload["holds"]], ["held-1"])
+        self.assertEqual(payload["saturation"]["in_flight"], 1)
+        self.assertEqual(payload["saturation"]["max_pending"], cp.MAX_PENDING)
+
+    def test_every_time_in_the_payload_is_absolute(self):
+        # Load-bearing for the SSE stream, which emits on payload CHANGE: an
+        # elapsed-seconds field would differ on every 1s tick, so the change
+        # detection would fire forever, the heartbeat would never be sent, and an
+        # idle page would receive a 1 Hz firehose. Named fields, so adding a
+        # "seconds_ago" convenience trips this rather than the stream.
+        self._over_cap()
+        sat = cp._saturation()
+        self.assertEqual(
+            set(sat),
+            {"in_flight", "max_pending", "rejections", "last_ts", "last_scope",
+             "last_host", "since"})
+        # Both stamps are epoch seconds — comfortably past 2001 — not durations.
+        self.assertGreater(sat["last_ts"], 1_000_000_000)
+        self.assertGreater(sat["since"], 1_000_000_000)
+
+    def test_an_idle_payload_is_byte_identical_across_ticks(self):
+        # The property the test above protects, asserted directly against the
+        # comparison the stream actually makes.
+        _hold("a.example", "held-1")
+        self.assertEqual(json.dumps(cp._pending_payload()),
+                         json.dumps(cp._pending_payload()))
+
+    def test_the_counter_says_since_when(self):
+        # In-memory, so a restart resets it. The UI can only be honest about that if
+        # the payload says which window the count covers.
+        self.assertEqual(cp._saturation()["since"], cp._STARTED_TS)
 
 
 class FreshSchemaTests(unittest.TestCase):

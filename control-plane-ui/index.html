@@ -35,6 +35,29 @@
     color: var(--dim); margin: 4px 0 10px; }
   h2 .note { text-transform: none; letter-spacing: 0; font-weight: 400; }
   .empty { color: var(--dim); font-style: italic; padding: 8px 0; }
+  /* Saturation banner. Three levels, and the difference between them is EMPHASIS
+     rather than presence: a rejection notice never disappears on a timer (see
+     saturationState), it just stops shouting. `recent` borrows the deny colour
+     because that is literally what happened to the request. */
+  .saturation { display: flex; gap: 12px; align-items: flex-start;
+    border: 1px solid var(--line); border-left: 3px solid var(--dim);
+    border-radius: 8px; padding: 10px 12px; margin-bottom: 12px;
+    background: var(--panel); font-size: 13px; }
+  .saturation .sat-body { flex: 1; }
+  .saturation .sat-detail { color: var(--dim); font-size: 12px; margin-top: 2px;
+    word-break: break-all; }
+  .saturation.recent { border-left-color: var(--deny); }
+  /* Not colour alone: the marker carries the level for anyone who cannot use hue,
+     which is the same gap still open in the decisions table. */
+  .saturation.recent .sat-body::before { content: "⚠ "; color: var(--deny); }
+  .saturation.past { border-left-color: var(--hold); }
+  .saturation.past .sat-body::before { content: "⚑ "; color: var(--hold); }
+  .saturation.load { border-left-color: var(--hold); color: var(--dim); }
+  .saturation.load .sat-body::before { content: "◔ "; }
+  .sat-dismiss { background: transparent; color: var(--dim);
+    border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px;
+    font-size: 12px; cursor: pointer; }
+  .sat-dismiss:hover { color: var(--fg); border-color: var(--dim); }
   .card { background: var(--panel); border: 1px solid var(--line);
     border-left: 3px solid var(--hold); border-radius: 8px;
     padding: 12px 14px; margin-bottom: 10px; }
@@ -163,6 +186,18 @@
     <!-- Cards are keyed by approval id and updated in place (see app.js
          diffPending), so the empty notice is a sibling that hides rather than
          markup the render replaces. -->
+    <!-- Hold-cap saturation. Above the queue rather than in it, because what it
+         reports is requests that never BECAME cards — an over-cap /authorize fails
+         closed without creating an approval, so this is the only place that refusal
+         is visible. role=status (a polite live region) so it is announced without
+         interrupting; assertive would fight the operator mid-click. -->
+    <div id="saturation" class="saturation" role="status" hidden>
+      <div class="sat-body">
+        <div id="sat-text"></div>
+        <div id="sat-detail" class="sat-detail"></div>
+      </div>
+      <button type="button" id="sat-dismiss" class="sat-dismiss">Dismiss</button>
+    </div>
     <div id="pending"></div>
     <div class="empty" id="pending-empty">none</div>
   </section>

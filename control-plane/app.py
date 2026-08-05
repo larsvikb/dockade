@@ -88,6 +88,25 @@ _PENDING_EVENTS: dict[str, threading.Event] = {}
 # approval_id -> client, so the per-client hold cap can be counted under _LOCK.
 _PENDING_CLIENT: dict[str, str | None] = {}
 
+# Over-cap rejections, for the UI's saturation banner. Kept IN MEMORY, which is a
+# deliberate weakening of nothing: the deny itself is written to the audit table
+# with its reason (see ``authorize``), so this is a display index over a durable
+# record, not the record. Losing it on restart costs a banner, not evidence.
+#
+# What it exists to fix is that saturation is INVISIBLE and TRANSIENT. Over the cap
+# /authorize fails closed without creating an approval row, so no card is ever
+# raised: the agent is refused, and an operator watching the queue sees the same
+# empty list as when nothing is happening. A live gauge would not help either —
+# holds drain in seconds, so by the time anyone looks the count is healthy again.
+# The lasting record of the EVENT is what makes it noticeable, and the gauge is
+# context beside it.
+#
+# ``since`` is the process start, and it is load-bearing for honesty: "3 denied
+# unheard" means three since this timestamp, never three ever.
+_STARTED_TS = time.time()
+_SATURATION: dict[str, object] = {
+    "count": 0, "last_ts": None, "last_scope": None, "last_host": None}
+
 
 # ── storage ─────────────────────────────────────────────────────────────────
 
@@ -294,14 +313,18 @@ def _audit(decision: str, **fields) -> None:
 
 
 def _reserve_hold(approval_id: str, event: threading.Event,
-                  client: str | None) -> str | None:
+                  client: str | None, host: str | None = None) -> str | None:
     """Atomically check the hold caps and, if under them, reserve a slot for this
     approval. Returns None on success (slot reserved), or a deny reason string if
     over the global or per-client cap (the caller must then fail CLOSED).
 
     Extracted from ``authorize`` so the cap logic is unit-testable without the
     FastAPI handler (see DESIGN.md). The whole check+reserve runs under ``_LOCK``
-    so concurrent holds cannot race past the cap."""
+    so concurrent holds cannot race past the cap.
+
+    A rejection is also recorded in ``_SATURATION`` here rather than by the caller,
+    so the one place that decides "over the cap" is the one place that reports it —
+    the alternative leaves a second call site free to fail closed silently."""
     with _LOCK:
         over_global = len(_PENDING_EVENTS) >= MAX_PENDING
         over_client = (
@@ -310,10 +333,40 @@ def _reserve_hold(approval_id: str, event: threading.Event,
             >= MAX_PENDING_PER_CLIENT)
         if over_global or over_client:
             scope = "global" if over_global else f"client {client}"
+            _SATURATION["count"] = int(_SATURATION["count"]) + 1  # type: ignore[arg-type]
+            _SATURATION["last_ts"] = time.time()
+            _SATURATION["last_scope"] = scope
+            _SATURATION["last_host"] = host
             return f"hold capacity exceeded ({scope}) — fail-closed"
         _PENDING_EVENTS[approval_id] = event
         _PENDING_CLIENT[approval_id] = client
         return None
+
+
+def _saturation() -> dict:
+    """Hold-cap pressure, for the UI banner.
+
+    ``in_flight`` is counted from ``_PENDING_EVENTS`` — the set the cap is actually
+    measured against — and NOT from the pending approvals list, which is a different
+    set. They normally agree, and diverge exactly when it matters: after a restart
+    the table can carry ``pending`` rows with no live hold behind them, so a count
+    derived from the visible cards would be confidently wrong in the one situation
+    this exists to report.
+
+    Every timestamp here is ABSOLUTE. An elapsed-seconds field would change on every
+    tick, and the SSE stream emits on payload change — so it would defeat the
+    change-detection, silence the heartbeat, and turn an idle stream into a 1 Hz
+    firehose. The client does the arithmetic, as it already does for the countdown."""
+    with _LOCK:
+        return {
+            "in_flight": len(_PENDING_EVENTS),
+            "max_pending": MAX_PENDING,
+            "rejections": _SATURATION["count"],
+            "last_ts": _SATURATION["last_ts"],
+            "last_scope": _SATURATION["last_scope"],
+            "last_host": _SATURATION["last_host"],
+            "since": _STARTED_TS,
+        }
 
 
 def _release_hold(approval_id: str) -> None:
@@ -382,6 +435,18 @@ def _list_pending() -> list[dict]:
             for r in rows]
 
 
+def _pending_payload() -> dict:
+    """What the approvals view needs, in one object: the holds AND the hold-cap
+    pressure beside them.
+
+    Deliberately not a second endpoint. The SSE stream already re-serializes this on
+    a 1 s tick and emits on change, so folding saturation in means a rejection reaches
+    the banner within a second through the push the page is already listening to —
+    no new route, no relay-allowlist entry, and no polling interval to lag behind the
+    burst it is meant to report."""
+    return {"holds": _list_pending(), "saturation": _saturation()}
+
+
 # ── API models ──────────────────────────────────────────────────────────────
 
 class AuthorizeRequest(BaseModel):
@@ -448,7 +513,7 @@ def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
     # fail CLOSED immediately rather than registering another worker-blocking hold.
     approval_id = uuid.uuid4().hex
     event = threading.Event()
-    why = _reserve_hold(approval_id, event, req.client)
+    why = _reserve_hold(approval_id, event, req.client, req.host)
     if why is not None:
         _audit("deny", stage=req.stage, host=req.host, port=req.port,
                proto=req.proto, client=req.client, method=req.method,
@@ -512,8 +577,8 @@ def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
 # ── approvals (human-facing) ────────────────────────────────────────────────
 
 @app.get("/approvals")
-def approvals() -> list[dict]:
-    return _list_pending()
+def approvals() -> dict:
+    return _pending_payload()
 
 
 @app.post("/approvals/{approval_id}/resolve")
@@ -596,17 +661,20 @@ def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResp
 
 @app.get("/approvals/stream")
 async def approvals_stream(request: Request) -> StreamingResponse:
-    """Server-sent events: push the pending-approval list whenever it changes.
+    """Server-sent events: push the pending-approval payload whenever it changes.
     Polls SQLite once a second (a fast indexed query; the brief sync read is
     negligible on the event loop) and emits on change, plus a periodic heartbeat
-    so proxies/clients can detect a dead stream."""
+    so proxies/clients can detect a dead stream.
+
+    Change-detection is on the SERIALIZED payload, which is why every field in it
+    must be stable while nothing happens — see the note in ``_saturation`` about
+    absolute timestamps. A field that ticks turns this into a 1 Hz emitter."""
     async def gen():
         last = None
         while True:
             if await request.is_disconnected():
                 break
-            pending = _list_pending()
-            payload = json.dumps(pending)
+            payload = json.dumps(_pending_payload())
             if payload != last:
                 last = payload
                 yield f"event: pending\ndata: {payload}\n\n"

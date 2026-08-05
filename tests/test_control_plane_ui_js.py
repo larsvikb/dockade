@@ -59,7 +59,8 @@ _STRICT = bool(os.environ.get("DOCKADE_REQUIRE_TOOLS"))
 _PROBE = r"""
 const m = require(process.env.DOCKADE_APP_JS);
 const missing = ["lampState", "backoffDelay", "diffPending", "shouldSweep",
-                 "holdRemaining", "countdownState", "departure", "persistPreview"]
+                 "holdRemaining", "countdownState", "departure", "persistPreview",
+                 "saturationState"]
   .filter(n => typeof m[n] !== "function");
 console.log(JSON.stringify({
   missing,
@@ -146,6 +147,39 @@ console.log(JSON.stringify({
                                { pattern: "example.com", scope: "exact host" }),
     nothing: m.persistPreview(null, null),
   },
+  // Saturation. NOW is fixed at 1_000_000_000_000 ms (= 1e9 s) so every "how long
+  // ago" below is arithmetic on constants rather than on the wall clock.
+  saturation: (() => {
+    const NOW = 1e12;
+    const base = { in_flight: 0, max_pending: 16, rejections: 0,
+                   last_ts: null, last_scope: null, last_host: null, since: 1e9 };
+    const rej = (over) => ({ ...base, rejections: 3, last_host: "pypi.org",
+                             last_scope: "client 172.30.0.9",
+                             last_ts: (NOW - over) / 1000 });
+    return {
+      quiet: m.saturationState(base, NOW, 0),
+      absent: m.saturationState(null, NOW, 0),
+      // Two holds against a cap of 16 is not news; 12 is 75% of it.
+      light_load: m.saturationState({ ...base, in_flight: 2 }, NOW, 0),
+      near_cap: m.saturationState({ ...base, in_flight: 12 }, NOW, 0),
+      at_cap: m.saturationState({ ...base, in_flight: 16 }, NOW, 0),
+      recent: m.saturationState(rej(5000), NOW, 0),
+      just_inside: m.saturationState(rej(m.SATURATION_RECENT_MS - 1), NOW, 0),
+      just_outside: m.saturationState(rej(m.SATURATION_RECENT_MS + 1), NOW, 0),
+      // A rejection with no usable stamp must not be silently downgraded to "past".
+      no_stamp: m.saturationState({ ...base, rejections: 1 }, NOW, 0),
+      global_scope: m.saturationState(
+        { ...rej(5000), last_scope: "global" }, NOW, 0).detail,
+      no_scope: m.saturationState(
+        { ...rej(5000), last_scope: null, last_host: null }, NOW, 0).detail,
+      dismissed: m.saturationState(rej(5000), NOW, 3),
+      dismissed_then_more: m.saturationState({ ...rej(5000), rejections: 4 }, NOW, 3),
+      // A rejection outranks the gauge: the event matters more than the level.
+      rejection_beats_load: m.saturationState(
+        { ...rej(5000), in_flight: 16 }, NOW, 0).level,
+      one: m.saturationState({ ...rej(5000), rejections: 1 }, NOW, 0).text,
+    };
+  })(),
 }));
 """
 
@@ -368,6 +402,80 @@ class PageScriptTests(unittest.TestCase):
         # allow was meant gets caught by the operator; the reverse is the mistake the
         # confirm step exists to prevent.
         self.assertEqual(prev["nothing"]["verb"], "block")
+
+    # ── saturation banner ────────────────────────────────────────────────────
+
+    def test_nothing_is_shown_while_nothing_has_gone_wrong(self):
+        sat = self.probe["saturation"]
+        # The banner is HIDDEN at zero rather than reporting "0 rejections". An
+        # in-memory counter resets on restart, so a rendered zero would be a positive
+        # all-clear the page is not entitled to give.
+        self.assertFalse(sat["quiet"]["show"])
+        self.assertFalse(sat["light_load"]["show"])
+        # An absent payload (older backend, or a parse that yielded nothing) must not
+        # throw and must not claim health either.
+        self.assertFalse(sat["absent"]["show"])
+
+    def test_the_gauge_appears_only_once_the_cap_is_within_reach(self):
+        sat = self.probe["saturation"]
+        self.assertTrue(sat["near_cap"]["show"])
+        self.assertEqual(sat["near_cap"]["level"], "load")
+        self.assertIn("12/16", sat["near_cap"]["text"])
+        # At the cap the wording moves from conditional to actual, because it is no
+        # longer a warning about what would happen.
+        self.assertIn("would be denied", sat["near_cap"]["detail"])
+        self.assertIn("at the cap", sat["at_cap"]["detail"])
+
+    def test_a_rejection_is_reported_as_an_event_not_a_level(self):
+        sat = self.probe["saturation"]
+        r = sat["recent"]
+        self.assertTrue(r["show"])
+        self.assertEqual(r["level"], "recent")
+        # The wording has to name the thing that is invisible everywhere else: the
+        # request was refused and NO CARD was ever raised for it.
+        self.assertIn("denied unheard", r["text"])
+        self.assertIn("no approval card", r["text"])
+        self.assertIn("pypi.org", r["detail"])
+        # Saturation outranks the gauge — the burst is the news, not the level it
+        # left behind.
+        self.assertEqual(sat["rejection_beats_load"], "recent")
+
+    def test_the_detail_line_says_which_cap_was_hit(self):
+        sat = self.probe["saturation"]
+        # Not in the headline (the operator's response is the same either way), but
+        # carried here, because "one agent hammering" and "the whole control plane
+        # loaded" are different situations.
+        self.assertIn("per-client cap for 172.30.0.9", sat["recent"]["detail"])
+        self.assertIn("the global cap", sat["global_scope"])
+        # A rejection with neither host nor scope must still render a sentence.
+        self.assertEqual(sat["no_scope"], "last: unknown host")
+
+    def test_the_notice_persists_after_it_stops_being_recent(self):
+        sat = self.probe["saturation"]
+        # Emphasis decays; the notice does not. Auto-clearing would re-create the
+        # exact failure being reported — that nobody was looking at the time.
+        self.assertEqual(sat["just_inside"]["level"], "recent")
+        self.assertEqual(sat["just_outside"]["level"], "past")
+        self.assertTrue(sat["just_outside"]["show"])
+        self.assertEqual(sat["just_outside"]["text"], sat["just_inside"]["text"])
+
+    def test_an_unusable_timestamp_does_not_downgrade_the_alert(self):
+        sat = self.probe["saturation"]
+        # No stamp means we cannot say it was long ago, so it must not be styled as
+        # though it were — but it still shows.
+        self.assertTrue(sat["no_stamp"]["show"])
+        self.assertIsNone(sat["no_stamp"]["lastTs"])
+
+    def test_dismissing_acknowledges_a_count_not_a_flag(self):
+        sat = self.probe["saturation"]
+        # Dismissed at 3 of 3: gone. One more arrives: back. A boolean flag here
+        # would swallow every rejection after the first dismissal.
+        self.assertFalse(sat["dismissed"]["show"])
+        self.assertTrue(sat["dismissed_then_more"]["show"])
+        self.assertEqual(sat["dismissed_then_more"]["count"], 4)
+
+    def test_the_count_reads_as_english_for_one(self):
+        self.assertIn("1 request denied", self.probe["saturation"]["one"])
 
 
 class InlineScriptTests(unittest.TestCase):

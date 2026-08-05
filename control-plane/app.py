@@ -13,6 +13,9 @@ The authorize flow (one call from the proxy, `POST /authorize`):
   - no matching rule                     -> HOLD: record a pending approval and
     BLOCK the request until a human resolves it or CONTROL_HOLD_TIMEOUT elapses
     (-> default-deny). The proxy only ever sees allow/deny; the hold is internal.
+    A request identical to one already held JOINS it rather than raising a second
+    approval, so a retrying agent produces one card and one decision — which is
+    also why one click can release several blocked requests (see _group_key).
 
 A human resolves holds over the approvals API (GET /approvals, the SSE stream at
 /approvals/stream, and POST /approvals/{id}/resolve), surfaced by the separate
@@ -56,6 +59,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from typing import NamedTuple
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
@@ -66,14 +70,24 @@ SEED_PATH = os.environ.get(
     "CONTROL_SEED", "/etc/control-plane/egress-allowlist.txt")
 # How long a held request waits for a human before defaulting to deny.
 HOLD_TIMEOUT = float(os.environ.get("CONTROL_HOLD_TIMEOUT", "120"))
-# Bound concurrent holds. A held request blocks a FastAPI threadpool worker
-# until it is resolved or times out, so an unbounded number of holds would pin
-# every worker and stall ALL /authorize decisions — and this control plane is
-# shared across every sandbox, so one agent could starve governance for all. Cap
-# in-flight holds globally and per client; over either cap /authorize fails CLOSED
-# immediately (deny) instead of registering another blocking hold. Keep MAX_PENDING
-# well under the threadpool size (anyio default ~40) so fast allow/deny decisions
-# always have free workers. Set MAX_PENDING_PER_CLIENT to 0 to disable that cap.
+# Bound concurrent holds. The two caps look alike and protect DIFFERENT things, which
+# is why they count different sets — before duplicate grouping they counted the same
+# one, and the distinction was invisible:
+#
+#   MAX_PENDING counts WAITERS — blocked FastAPI threadpool workers. A held request
+#   pins a worker until it is resolved or times out, so an unbounded number would
+#   stall ALL /authorize decisions, and this control plane is shared across every
+#   sandbox: one agent could starve governance for all. Keep it well under the
+#   threadpool size (anyio default ~40) so fast allow/deny decisions always have
+#   free workers.
+#
+#   MAX_PENDING_PER_CLIENT counts CARDS — pending approvals on the operator's screen,
+#   for one client. It protects attention, not workers. Duplicate requests join an
+#   existing card (see _reserve_hold) and so cost this cap nothing; they still cost a
+#   worker, and are still bounded by MAX_PENDING. Set to 0 to disable.
+#
+# Over either cap /authorize fails CLOSED immediately (deny) instead of registering
+# another blocking hold.
 MAX_PENDING = int(os.environ.get("CONTROL_MAX_PENDING", "16"))
 MAX_PENDING_PER_CLIENT = int(os.environ.get("CONTROL_MAX_PENDING_PER_CLIENT", "4"))
 
@@ -85,8 +99,25 @@ app = FastAPI(title="dockade control plane", version="2b")
 # of truth), so no in-memory outcome is kept. SQLite holds the durable state.
 _LOCK = threading.Lock()
 _PENDING_EVENTS: dict[str, threading.Event] = {}
-# approval_id -> client, so the per-client hold cap can be counted under _LOCK.
+# approval_id -> client, so the per-client CARD cap can be counted under _LOCK.
+# One entry per card, so counting entries for a client counts that client's cards.
 _PENDING_CLIENT: dict[str, str | None] = {}
+# approval_id -> how many /authorize workers are blocked on that card. Duplicates
+# share a card, so this is 1 for a lone request and N for a retry storm; the global
+# cap sums it, because a joined waiter still pins a worker.
+_PENDING_WAITERS: dict[str, int] = {}
+# Duplicate grouping: group key (see _group_key) -> the approval id blocked requests
+# with that key attach to. Present only while that card can still be JOINED — resolve
+# and expiry remove it, so a request arriving after a decision opens a fresh card
+# instead of silently inheriting an outcome nobody was shown it alongside.
+_GROUPS: dict[tuple, str] = {}
+# approval_id -> the wall-clock instant this card default-denies. Set ONCE, when the
+# card is created, and inherited by every request that joins it: a joiner waits out the
+# REMAINDER of the original window rather than starting a fresh one. Otherwise an agent
+# retrying on a short loop would push the deadline out forever and the card's countdown
+# would be a lie. A request that joins with seconds left gets a fast default-deny, and
+# its next retry — arriving after _close_group — opens a new card with a full window.
+_PENDING_DEADLINE: dict[str, float] = {}
 
 # Over-cap rejections, for the UI's saturation banner. Kept IN MEMORY, which is a
 # deliberate weakening of nothing: the deny itself is written to the audit table
@@ -318,46 +349,119 @@ def _audit(decision: str, **fields) -> None:
           flush=True)
 
 
+def _group_key(client: str | None, host: str | None,
+               port: int | None, proto: str | None) -> tuple:
+    """What makes two held requests THE SAME REQUEST for grouping purposes.
+
+    ``client`` is in the key even though the decision is not a function of it
+    (``_decide`` reads the host alone): a card names one client, and approving one
+    sandbox's request must not silently release another's.
+
+    ``method`` and ``url`` are deliberately OUT. They are precisely what varies across
+    the retries this exists to collapse — a different query string or cache-buster
+    each time — so keying on them would defeat grouping in the one case that motivates
+    it. Nothing is lost from the record: every joined request writes its own audit
+    line carrying its own method and url (see ``authorize``); only the CARD shows one
+    representative."""
+    return ((client or None), (host or "").lower(),
+            port, (proto or "").lower() or None)
+
+
+class HoldSlot(NamedTuple):
+    """Outcome of asking for a hold slot. Exactly one of ``refused`` / ``approval_id``
+    is set: refused means nothing was reserved and the caller must fail closed."""
+    approval_id: str | None
+    event: threading.Event | None
+    joined: bool          # True -> attached to an existing card; write no new row
+    refused: str | None   # deny reason, over one of the caps
+    deadline: float       # when to stop waiting; the CARD's, not this request's
+
+
 def _reserve_hold(approval_id: str, event: threading.Event,
-                  client: str | None, host: str | None = None) -> str | None:
-    """Atomically check the hold caps and, if under them, reserve a slot for this
-    approval. Returns None on success (slot reserved), or a deny reason string if
-    over the global or per-client cap (the caller must then fail CLOSED).
+                  client: str | None, host: str | None = None,
+                  port: int | None = None, proto: str | None = None) -> HoldSlot:
+    """Atomically check the hold caps and either reserve a slot for a NEW card, attach
+    this request to an existing card for the same key, or refuse.
 
     Extracted from ``authorize`` so the cap logic is unit-testable without the
     FastAPI handler (see DESIGN.md). The whole check+reserve runs under ``_LOCK``
-    so concurrent holds cannot race past the cap.
+    so concurrent holds cannot race past the cap — nor race into creating two cards
+    for one key, which is the same problem wearing a different hat.
+
+    Order matters. The global waiter cap is checked FIRST, before the join, because a
+    joined request still blocks a worker: grouping must never be a way around the cap
+    that protects governance for every other sandbox. The per-client cap is checked
+    only on the new-card path, because that cap counts cards.
 
     A rejection is also recorded in ``_SATURATION`` here rather than by the caller,
     so the one place that decides "over the cap" is the one place that reports it —
     the alternative leaves a second call site free to fail closed silently."""
+    key = _group_key(client, host, port, proto)
     with _LOCK:
-        over_global = len(_PENDING_EVENTS) >= MAX_PENDING
-        over_client = (
-            client is not None and MAX_PENDING_PER_CLIENT > 0
-            and sum(1 for c in _PENDING_CLIENT.values() if c == client)
-            >= MAX_PENDING_PER_CLIENT)
-        if over_global or over_client:
-            scope = "global" if over_global else f"client {client}"
+        def refuse(scope: str) -> HoldSlot:
             _SATURATION["count"] = int(_SATURATION["count"]) + 1  # type: ignore[arg-type]
             _SATURATION["last_ts"] = time.time()
             _SATURATION["last_scope"] = scope
             _SATURATION["last_host"] = host
-            return f"hold capacity exceeded ({scope}) — fail-closed"
+            return HoldSlot(None, None, False,
+                            f"hold capacity exceeded ({scope}) — fail-closed", 0.0)
+
+        if sum(_PENDING_WAITERS.values()) >= MAX_PENDING:
+            return refuse("global")
+
+        joined_id = _GROUPS.get(key)
+        joined_event = _PENDING_EVENTS.get(joined_id) if joined_id else None
+        if joined_id and joined_event is not None:
+            _PENDING_WAITERS[joined_id] = _PENDING_WAITERS.get(joined_id, 0) + 1
+            return HoldSlot(joined_id, joined_event, True, None,
+                            _PENDING_DEADLINE.get(joined_id, 0.0))
+
+        if (client is not None and MAX_PENDING_PER_CLIENT > 0
+                and sum(1 for c in _PENDING_CLIENT.values() if c == client)
+                >= MAX_PENDING_PER_CLIENT):
+            return refuse(f"client {client}")
+
+        deadline = time.time() + HOLD_TIMEOUT
         _PENDING_EVENTS[approval_id] = event
         _PENDING_CLIENT[approval_id] = client
-        return None
+        _PENDING_WAITERS[approval_id] = 1
+        _PENDING_DEADLINE[approval_id] = deadline
+        _GROUPS[key] = approval_id
+        return HoldSlot(approval_id, event, False, None, deadline)
+
+
+def _close_group_locked(approval_id: str) -> None:
+    """Stop new requests JOINING this card, without disturbing the waiters already on
+    it. Caller must hold ``_LOCK`` — ``resolve`` calls this inside the same critical
+    section that wakes the waiters, so there is no instant in which the card is decided
+    and still joinable.
+
+    Separate from ``_release_hold`` because the two happen at different times: the card
+    stops being joinable when it is DECIDED, and its slots free as each blocked worker
+    wakes and returns. Collapsing them would leave a decided card joinable for as long
+    as the slowest waiter took to notice."""
+    for key, held in list(_GROUPS.items()):
+        if held == approval_id:
+            del _GROUPS[key]
+
+
+def _close_group(approval_id: str) -> None:
+    """``_close_group_locked`` for callers that do not already hold ``_LOCK``."""
+    with _LOCK:
+        _close_group_locked(approval_id)
 
 
 def _saturation() -> dict:
     """Hold-cap pressure, for the UI banner.
 
-    ``in_flight`` is counted from ``_PENDING_EVENTS`` — the set the cap is actually
-    measured against — and NOT from the pending approvals list, which is a different
-    set. They normally agree, and diverge exactly when it matters: after a restart
-    the table can carry ``pending`` rows with no live hold behind them, so a count
-    derived from the visible cards would be confidently wrong in the one situation
-    this exists to report.
+    ``in_flight`` is BLOCKED WAITERS — the set the global cap is actually measured
+    against — and NOT the pending approvals list, which is a different set twice over.
+    It diverges after a restart, when the table can carry ``pending`` rows with no live
+    hold behind them; and it diverges whenever duplicates are grouped, since one card
+    can hold several waiters. A count derived from the visible cards would therefore be
+    confidently wrong in the one situation this exists to report. ``cards`` is that
+    other number, reported beside it rather than instead of it — "12/16 in flight"
+    reads as an emergency next to three cards until you can see both.
 
     Every timestamp here is ABSOLUTE. An elapsed-seconds field would change on every
     tick, and the SSE stream emits on payload change — so it would defeat the
@@ -365,7 +469,8 @@ def _saturation() -> dict:
     firehose. The client does the arithmetic, as it already does for the countdown."""
     with _LOCK:
         return {
-            "in_flight": len(_PENDING_EVENTS),
+            "in_flight": sum(_PENDING_WAITERS.values()),
+            "cards": len(_PENDING_EVENTS),
             "max_pending": MAX_PENDING,
             "rejections": _SATURATION["count"],
             "acknowledged": _SATURATION["acked"],
@@ -380,12 +485,25 @@ def _saturation() -> dict:
 
 
 def _release_hold(approval_id: str) -> None:
-    """Symmetric to ``_reserve_hold``: drop this approval's slot. Under ``_LOCK``
-    so it is consistent with reservation. The human's decision is read from the
-    durable approvals row by the waiter, not carried back through here."""
+    """Symmetric to ``_reserve_hold``: drop ONE waiter's slot. Under ``_LOCK`` so it is
+    consistent with reservation. The human's decision is read from the durable
+    approvals row by the waiter, not carried back through here.
+
+    Per-waiter, not per-card: with duplicates grouped, N workers are blocked on one
+    approval id and each releases its own slot as it wakes. The card itself is
+    unregistered only when the last of them has gone — until then ``resolve`` must
+    still find its event, and the global cap must still count the workers it is
+    holding."""
     with _LOCK:
+        remaining = _PENDING_WAITERS.get(approval_id, 0) - 1
+        if remaining > 0:
+            _PENDING_WAITERS[approval_id] = remaining
+            return
+        _PENDING_WAITERS.pop(approval_id, None)
         _PENDING_EVENTS.pop(approval_id, None)
         _PENDING_CLIENT.pop(approval_id, None)
+        _PENDING_DEADLINE.pop(approval_id, None)
+        _close_group_locked(approval_id)
 
 
 # Header the control-plane-ui relay uses to assert the BROWSER's address. The relay
@@ -436,12 +554,22 @@ def _list_pending() -> list[dict]:
         rows = conn.execute(
             "SELECT id, ts, host, port, proto, client, method, url FROM approvals "
             "WHERE status='pending' ORDER BY ts").fetchall()
+    with _LOCK:
+        waiters = dict(_PENDING_WAITERS)
     # ``persist_options`` travels WITH the approval so the UI offers exactly the
     # patterns ``resolve`` will accept. One definition of the candidate set, beside the
     # matcher it derives from — rather than a second implementation in JavaScript that
     # could drift into offering a pattern the backend then rejects.
-    return [dict(r, persist_options=[{"pattern": p, "scope": _pattern_scope(p)}
-                                     for p in _persist_candidates(r["host"])])
+    #
+    # ``requests`` is how many blocked requests one click decides. It is on the card
+    # because grouping changed what "allow once" MEANS — once per card is now several
+    # requests — and an operator granting egress to three requests while believing it
+    # is one is the exact class of surprise this system exists to prevent. Defaults to
+    # 1, not 0: a row with no live waiter is a stale pending row from before a restart
+    # (see ``_startup``), and "0 requests" would read as a card that decides nothing.
+    return [dict(r, requests=max(1, waiters.get(r["id"], 1)),
+                 persist_options=[{"pattern": p, "scope": _pattern_scope(p)}
+                                  for p in _persist_candidates(r["host"])])
             for r in rows]
 
 
@@ -528,26 +656,35 @@ def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
     # HOLD (bounded): reserve a hold slot atomically with the cap check, so
     # concurrent holds can't race past the cap. Over the global or per-client cap,
     # fail CLOSED immediately rather than registering another worker-blocking hold.
-    approval_id = uuid.uuid4().hex
-    event = threading.Event()
-    why = _reserve_hold(approval_id, event, req.client, req.host)
-    if why is not None:
+    # A request identical to one already held JOINS it instead of raising a second
+    # card (_group_key) — a retrying agent used to fill its whole card budget with
+    # copies of one question.
+    slot = _reserve_hold(uuid.uuid4().hex, threading.Event(), req.client,
+                         req.host, req.port, req.proto)
+    if slot.refused is not None:
         _audit("deny", stage=req.stage, host=req.host, port=req.port,
                proto=req.proto, client=req.client, method=req.method,
-               url=req.url, reason=why)
-        return AuthorizeResponse(decision="deny", reason=why)
+               url=req.url, reason=slot.refused)
+        return AuthorizeResponse(decision="deny", reason=slot.refused)
+    approval_id, event = slot.approval_id, slot.event
 
-    now = time.time()
-    with _connect() as conn:
-        conn.execute(
-            "INSERT INTO approvals(id, ts, host, port, proto, client, method, "
-            "url, status) VALUES (?,?,?,?,?,?,?,?, 'pending')",
-            (approval_id, now, req.host, req.port, req.proto, req.client,
-             req.method, req.url))
-        conn.commit()
+    if not slot.joined:
+        now = time.time()
+        with _connect() as conn:
+            conn.execute(
+                "INSERT INTO approvals(id, ts, host, port, proto, client, method, "
+                "url, status) VALUES (?,?,?,?,?,?,?,?, 'pending')",
+                (approval_id, now, req.host, req.port, req.proto, req.client,
+                 req.method, req.url))
+            conn.commit()
+    # Audited PER REQUEST either way, with this request's own method and url, because
+    # grouping is a concept of the screen and the worker pool — never of the record.
+    # The joiner's reason names the card it attached to, so the log explains on its own
+    # terms why four requests produced one approval and one decision.
     _audit("hold", stage=req.stage, host=req.host, port=req.port,
            proto=req.proto, client=req.client, method=req.method, url=req.url,
-           reason="held for approval")
+           reason=(f"joined hold {approval_id} — duplicate of a request already "
+                   "awaiting approval" if slot.joined else "held for approval"))
 
     # Block until a human resolves this hold or the window elapses. The wakeup is
     # advisory: the DURABLE approvals row is the single source of truth for the
@@ -556,7 +693,10 @@ def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
     # that SQLite serializes — so a resolve landing just as the hold times out can
     # no longer leave the row 'allowed' (and persist a rule) while the agent is
     # told 'deny'. Whoever's UPDATE wins decides; the loser reads the winner's row.
-    event.wait(HOLD_TIMEOUT)
+    # The card's remaining window, not a fresh one — see _PENDING_DEADLINE. Every
+    # waiter on a card therefore wakes at the same instant, which is what lets them
+    # race harmlessly for the expiry UPDATE below.
+    event.wait(max(0.0, slot.deadline - time.time()))
     with _connect() as conn:
         expired = conn.execute(
             "UPDATE approvals SET status='expired', resolved_at=? "
@@ -565,6 +705,10 @@ def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
             "SELECT status, mode, resolved_by FROM approvals WHERE id=?",
             (approval_id,)).fetchone()
         conn.commit()
+    if expired:
+        # Only the waiter that WON the expiry closes the group, and it does so before
+        # releasing its slot: the card is now decided, so nothing may still join it.
+        _close_group(approval_id)
     _release_hold(approval_id)
 
     # Carry the resolver's provenance (recorded by resolve()) into the audit reason,
@@ -580,9 +724,14 @@ def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
     scope = ("this request only" if not status_row
              else "standing rule written" if status_row["mode"] == "persist"
              else "this request only")
-    if expired:
+    # Read the STATUS rather than "did I win the expiry UPDATE": with duplicates
+    # grouped, several waiters wake together and only one of them wins it. The losers
+    # read status='expired' and must report the timeout too — testing `expired` alone
+    # would have told every one of them a human had rejected their request.
+    status = "expired" if expired or status_row is None else status_row["status"]
+    if status == "expired":
         final, why = "deny", "no decision within hold timeout — default-deny"
-    elif status_row and status_row["status"] == "allowed":
+    elif status == "allowed":
         final, why = "allow", f"human approval ({scope}) [{actor}]"
     else:  # 'denied' (or any non-allowed terminal state) — default-deny
         final, why = "deny", f"human rejection ({scope}) [{actor}]"
@@ -661,11 +810,18 @@ def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResp
             {"ok": False, "detail": "raced — no longer pending"}, status_code=409)
 
     # We won the conditional UPDATE above, so the durable row already carries the
-    # decision the waiter will read. Wake it — but only while its slot is still
-    # registered: if its hold window elapsed and it released between our UPDATE and
+    # decision the waiters will read. Wake them — but only while the slot is still
+    # registered: if the hold window elapsed and it released between our UPDATE and
     # here, skip, so we don't set a dead event. A missed wake is harmless (the
     # waiter already read, or will read, the decision from the durable row).
+    #
+    # ``event.set()`` releases EVERY waiter on this card, which is the whole of what
+    # grouping does to this endpoint: one click, one durable row, one audit line per
+    # released request. Closing the group in the SAME critical section is what makes
+    # decision and joinability change together — a duplicate arriving a moment later
+    # opens its own card rather than inheriting an outcome it was never shown beside.
     with _LOCK:
+        _close_group_locked(approval_id)
         if approval_id in _PENDING_EVENTS:
             event.set()
     # ``pattern`` is echoed so the UI reports what was actually STORED rather than what

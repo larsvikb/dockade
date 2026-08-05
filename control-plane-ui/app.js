@@ -182,6 +182,7 @@ function saturationState(sat, nowMs, dismissedCount = 0) {
   if (!sat) return hidden;
   const cap = Number(sat.max_pending) || 0;
   const inFlight = Number(sat.in_flight) || 0;
+  const cards = Number(sat.cards) || 0;
   const rejections = Number(sat.rejections) || 0;
 
   // The UNREAD count, not the lifetime total: after dismissing at 2, a third rejection
@@ -219,7 +220,13 @@ function saturationState(sat, nowMs, dismissedCount = 0) {
   if (cap > 0 && inFlight >= cap * SATURATION_WARN_FRAC) {
     return {
       show: true, level: "load", count: 0,
-      text: `${inFlight}/${cap} holds in flight`,
+      // The cap counts BLOCKED REQUESTS, and duplicates share a card — so this number
+      // can be far above the number of cards on screen. Said out loud when they
+      // differ, because "14/16 holds in flight" beside two cards otherwise reads as a
+      // queue that has stopped draining.
+      text: cards > 0 && cards !== inFlight
+        ? `${inFlight}/${cap} requests held on ${cards} card${cards === 1 ? "" : "s"}`
+        : `${inFlight}/${cap} holds in flight`,
       detail: inFlight >= cap
         ? "at the cap — further requests are denied without raising a card"
         : "near the cap — further requests would be denied without raising a card",
@@ -227,6 +234,25 @@ function saturationState(sat, nowMs, dismissedCount = 0) {
     };
   }
   return hidden;
+}
+
+// How a card announces that one click decides more than one blocked request.
+//
+// This exists because grouping changed what the buttons MEAN. Duplicate requests share
+// a card (see _group_key in the control plane), so "Allow once" can release four
+// blocked requests — and an operator granting egress to four while believing it is one
+// is exactly the surprise this system is built to prevent. Empty string for the
+// ordinary single-request card, so the badge is ABSENT rather than reading "1 request"
+// on every row: a marker that appears on every card is one nobody sees on the card
+// where it matters.
+// No default for a missing or junk count: NaN > 1 is false, so anything we were not
+// told renders nothing, which is the same outcome as being told "1". A `|| 1` fallback
+// here looked more careful and was unobservable — the two differ in no case this
+// function can return.
+function requestsLabel(n) {
+  return Number(n) > 1
+    ? `${Number(n)} identical requests — one decision releases all of them`
+    : "";
 }
 
 // What a Dismiss click acknowledges. A one-line function only because it must be the
@@ -402,6 +428,12 @@ function start() {
     bar.append(fill);
     cd.append(cdText, bar);
 
+    // Immediately above the buttons, not up with the host line: it qualifies what the
+    // click does, so it belongs where the eye already is at the moment of clicking.
+    const dup = document.createElement("div");
+    dup.className = "dup";
+    dup.hidden = true;
+
     const actions = document.createElement("div");
     actions.className = "actions";
 
@@ -410,7 +442,7 @@ function start() {
     msg.hidden = true;
 
     const entry = {
-      el, actions, msg, cd, cdText, fill,
+      el, actions, msg, cd, cdText, fill, dup,
       state: "pending", staleAt: null, dwell: 0,
       ts: a.ts,
       // What a persist may write, as the BACKEND will accept it. A backend that has
@@ -435,8 +467,15 @@ function start() {
     }
 
     buildConfirm(entry, a);
-    el.append(host, meta, cd, actions, entry.confirm, msg);
+    setRequests(entry, a.requests);
+    el.append(host, meta, cd, dup, actions, entry.confirm, msg);
     return entry;
+  }
+
+  function setRequests(entry, n) {
+    const text = requestsLabel(n);
+    entry.dup.textContent = text;
+    entry.dup.hidden = !text;
   }
 
   // ── the confirm step for a `+ persist` ────────────────────────────────────
@@ -722,6 +761,18 @@ function start() {
       cards.set(a.id, entry);
       pendingEl.append(entry.el);
     }
+    // The one field on a SURVIVING card that changes while it waits: how many blocked
+    // requests it now speaks for. Updated in place on every push, because a retry can
+    // join between the render and the click — a count frozen at first paint would
+    // understate what the button does at the moment it is pressed. Left alone once the
+    // card is resolving or stale: by then the number is history, and rewriting it
+    // under a click that has already been sent would be a lie in the other direction.
+    for (const a of list) {
+      const entry = cards.get(a.id);
+      if (entry && (entry.state === "pending" || entry.state === "confirming")) {
+        setRequests(entry, a.requests);
+      }
+    }
     for (const id of gone) {
       const entry = cards.get(id);
       if (entry.state === "pending" || entry.state === "confirming"
@@ -884,7 +935,7 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     lampState, backoffDelay, diffPending, shouldSweep,
     holdRemaining, countdownState, departure, persistPreview, saturationState,
-    ackCount,
+    ackCount, requestsLabel,
     RECONNECT_MIN_MS, RECONNECT_MAX_MS, STALE_MAX_MS, COUNTDOWN_URGENT_S,
     DWELL_MS, SATURATION_RECENT_MS, SATURATION_WARN_FRAC,
   };

@@ -804,7 +804,8 @@ every sandbox's governed egress. Over either cap, `/authorize` fails **closed**
 (deny) immediately instead of registering another blocking hold — the cap stays
 comfortably under the worker pool so fast allow/deny decisions always have free
 workers, and the permanent lifeline is unaffected (it never reaches the control
-plane).
+plane). The two caps count **different sets** — waiters and cards respectively — since
+duplicate holds share a card; see "Duplicate holds share one card" below.
 
 ### Approval UI — the one surface that can grant egress
 
@@ -1029,7 +1030,8 @@ the obvious fix:
   agree and diverge exactly when it matters — after a restart the table can carry
   pending rows with no live hold behind them — so a card-derived gauge would be
   confidently wrong in the one situation it exists to report. `_saturation()` counts
-  `_PENDING_EVENTS`.
+  the in-memory waiter set, and reports the card count beside it (see duplicate
+  grouping below, which gave the two numbers a second way to diverge).
 - **Saturation is a burst, so a gauge is nearly useless.** Holds drain in seconds; by
   the time anyone looks, the level is healthy again. What was filed here was an
   `n/16 holds` counter, and that would have reported almost nothing. The **rejection
@@ -1106,14 +1108,57 @@ elements is the rule's entire job. The test guards **the global rule**, not a li
 elements, and fails on a narrower re-patch: one rule makes the class impossible, whereas
 an enumeration is something someone has to remember to extend.
 
+**Duplicate holds share one card — and that changes what a click grants.** A retrying
+agent asks the same question repeatedly, and each attempt used to become its own card
+and its own slot. With `CONTROL_MAX_PENDING_PER_CLIENT` at 4, four retries filled the
+client's whole budget with copies of one question and the fifth was refused with no card
+at all — the failure the banner above exists to report, reached by the most ordinary
+behaviour an agent has. Identical holds now attach to the existing card, keyed on
+`(client, host, port, proto)`: `client` is in the key because approving one sandbox's
+request must not release another's, and `method`/`url` are out because they are exactly
+what varies between retries, so keying on them would defeat grouping in the case that
+motivates it.
+
+What made this more than a UI tidy-up is that **the two caps were counting the same set
+while protecting different things**, and nothing made that visible until duplicates
+stopped being distinct. The global cap bounds *blocked workers* — the availability of
+governance for every other sandbox. The per-client cap bounds *cards on the operator's
+screen* — attention. Grouping forced them apart: the global cap now counts waiters and a
+joined request costs one, while the per-client cap counts cards and a joined request
+costs nothing. Skip that split and the feature is cosmetic; the fifth retry is still
+refused at four, just after showing one card instead of four.
+
+The governance cost is real and is paid explicitly. **"Allow once" now releases every
+request on the card**, which widens what a single click grants — the precise class of
+surprise the hold mechanism exists to prevent. What keeps it honest is a count on the
+card, and the count is *live*: a retry can join between the render and the click, so a
+number frozen at first paint would understate what the button is about to do. Two
+invariants sitting in different files back that up. The joining window closes inside the
+**same critical section** that records the decision, so nothing can attach to a card
+that has already been decided and inherit an outcome it was never displayed beside; and
+a joiner inherits the card's **existing deadline** rather than starting a fresh window,
+or an agent retrying on a loop would push the deadline out indefinitely and the
+countdown on the card would be a lie.
+
+Grouping is a concept of the screen and the worker pool, and deliberately **not** of the
+record: every joined request still writes its own audit lines with its own `method` and
+`url`, and the joiner's hold reason names the card it attached to — so the log explains
+why four requests produced one approval without the reader needing to know grouping
+exists. One consequence worth stating, because several waiters now wake together on one
+row: only one of them wins the conditional expiry `UPDATE`, so the outcome each reports
+is read from the row's *status* rather than from "did I win". Branching on the latter —
+which is what the single-waiter code did — told every loser that a human had rejected
+their request.
+
 **The frontend's own tests.** `tests/test_control_plane_ui_js.py` runs the pure helpers
 under `node` (skipped when node is absent, the way `make lint` skips a missing linter)
 and asserts in Python, so failures read like the rest of `tests/`. It covers the lamp
 precedence (blind outranks busy), the backoff bounds and monotonicity, the keyed-diff
 properties, the sweep gating, the countdown arithmetic (including the clock-skew clamps
 and the `expiring now`-not-`expired` wording), the expiry-vs-resolved-elsewhere
-distinction, the persist preview's wildcard flag, and the saturation banner's levels,
-recency boundary and count-based dismissal. Everything that touches the DOM
+distinction, the persist preview's wildcard flag, the saturation banner's levels,
+recency boundary and count-based dismissal, and the duplicate-count badge.
+Everything that touches the DOM
 lives inside `start()`, which runs only in a browser — so requiring the module under
 node must be side-effect free, and the test asserts that too: if DOM work migrates to
 the top level, `require` throws and the file cannot quietly become untestable again.
@@ -1829,10 +1874,10 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
     redundant reinforcement. Checked only when the item came up for work — a filed
     defect is a claim like any other, and this one had been repeated into a CSS
     comment before anyone read the template.)*
-  - **Collapse duplicate holds by host.** Retrying clients routinely produce several
-    holds for one host, so one decision costs four clicks and can fill the per-client
-    cap; grouping also sidesteps the `INSERT OR IGNORE` wart where a second
-    `deny_persist` writes nothing while reporting `persisted: true`.
+  - **`resolve` reports `persisted: true` for a rule it did not write.** The insert is
+    `INSERT OR IGNORE`, so re-persisting an existing pattern is a no-op the response
+    still claims as a write. Duplicate grouping made this rarer — the usual way to hit
+    it was two cards for one host — but not impossible, and the UI echoes the claim.
   - **Opt-in desktop notification.** `http://localhost` is a secure context, so the
     Notification API is available; with a ~120s fuse and a page nobody watches, this is
     the honest fix for the problem the `(n)` title prefix only mitigates.

@@ -60,7 +60,7 @@ _PROBE = r"""
 const m = require(process.env.DOCKADE_APP_JS);
 const missing = ["lampState", "backoffDelay", "diffPending", "shouldSweep",
                  "holdRemaining", "countdownState", "departure", "persistPreview",
-                 "saturationState", "ackCount"]
+                 "saturationState", "ackCount", "requestsLabel"]
   .filter(n => typeof m[n] !== "function");
 console.log(JSON.stringify({
   missing,
@@ -163,6 +163,16 @@ console.log(JSON.stringify({
       light_load: m.saturationState({ ...base, in_flight: 2 }, NOW, 0),
       near_cap: m.saturationState({ ...base, in_flight: 12 }, NOW, 0),
       at_cap: m.saturationState({ ...base, in_flight: 16 }, NOW, 0),
+      // Duplicates grouped: 12 blocked requests on 2 cards. The gauge counts the
+      // requests (that is what the cap bounds) and must say so, or it reads as a
+      // queue of 12 that has stopped draining.
+      grouped_load: m.saturationState(
+        { ...base, in_flight: 12, cards: 2 }, NOW, 0).text,
+      // Ungrouped, the two numbers agree and the extra clause is noise.
+      ungrouped_load: m.saturationState(
+        { ...base, in_flight: 12, cards: 12 }, NOW, 0).text,
+      // An older backend sends no `cards` at all.
+      no_cards_field: m.saturationState({ ...base, in_flight: 12 }, NOW, 0).text,
       recent: m.saturationState(rej(5000), NOW, 0),
       just_inside: m.saturationState(rej(m.SATURATION_RECENT_MS - 1), NOW, 0),
       just_outside: m.saturationState(rej(m.SATURATION_RECENT_MS + 1), NOW, 0),
@@ -182,6 +192,14 @@ console.log(JSON.stringify({
       rejection_beats_load: m.saturationState(
         { ...rej(5000), in_flight: 16 }, NOW, 0).level,
       one: m.saturationState({ ...rej(5000), rejections: 1 }, NOW, 0).text,
+      requests: {
+        one: m.requestsLabel(1),
+        four: m.requestsLabel(4),
+        two: m.requestsLabel(2),
+        missing: m.requestsLabel(undefined),
+        zero: m.requestsLabel(0),
+        junk: m.requestsLabel("lots"),
+      },
       ack: {
         counts_what_happened: m.ackCount({ rejections: 7 }),
         nothing_to_ack: m.ackCount(null),
@@ -437,6 +455,17 @@ class PageScriptTests(unittest.TestCase):
         self.assertIn("would be denied", sat["near_cap"]["detail"])
         self.assertIn("at the cap", sat["at_cap"]["detail"])
 
+    def test_the_gauge_distinguishes_held_requests_from_cards_on_screen(self):
+        sat = self.probe["saturation"]
+        # The two diverge as soon as duplicates group, and the divergence is the
+        # confusing part: 12 requests on 2 cards looks like a stuck queue unless the
+        # banner says which number is which.
+        self.assertIn("12/16 requests held on 2 cards", sat["grouped_load"])
+        # When they agree, the extra clause would be noise — and an older backend
+        # sending no `cards` field must not render "on 0 cards".
+        self.assertEqual(sat["ungrouped_load"], "12/16 holds in flight")
+        self.assertEqual(sat["no_cards_field"], "12/16 holds in flight")
+
     def test_a_rejection_is_reported_as_an_event_not_a_level(self):
         sat = self.probe["saturation"]
         r = sat["recent"]
@@ -511,6 +540,71 @@ class PageScriptTests(unittest.TestCase):
         self.assertEqual(ack["absent_field"], 0)
         self.assertEqual(ack["never_negative"], 0)
         self.assertEqual(ack["junk"], 0)
+
+    # ── duplicate holds on one card ──────────────────────────────────────────
+
+    def test_a_card_says_when_one_click_decides_several_requests(self):
+        """Grouping changed what the buttons mean: "Allow once" can release four
+        blocked requests. An operator granting egress to four believing it is one is
+        the surprise this whole system exists to prevent, so the count is on the card
+        — and only when it is news."""
+        r = self.probe["saturation"]["requests"]
+        self.assertIn("4 identical requests", r["four"])
+        self.assertIn("one decision releases all of them", r["four"])
+        self.assertIn("2 identical requests", r["two"])
+        # Empty on the ordinary card. A badge on every row is one nobody reads on the
+        # row where it matters — and "1 identical request" is not even English.
+        self.assertEqual(r["one"], "")
+        # Absent, zero or junk render nothing rather than a number: a card claiming
+        # to decide "0 requests" would be worse than a card that says nothing.
+        self.assertEqual(r["missing"], "")
+        self.assertEqual(r["zero"], "")
+        self.assertEqual(r["junk"], "")
+
+
+class DuplicateBadgeSourceTests(unittest.TestCase):
+    """The badge is only honest if it is LIVE, and the liveness lives in `start()`
+    where no unit test can reach it — so it is asserted against the source, the same
+    way the dismiss handler is.
+
+    What could silently break: `renderPending` updates cards that are added or gone
+    and left surviving cards untouched, which is correct for every other field on a
+    card and wrong for this one. A retry joining between the render and the click
+    would leave the operator clicking a button labelled with a stale number."""
+
+    def setUp(self):
+        self.src = APP_JS.read_text()
+
+    def test_the_count_is_refreshed_on_surviving_cards_not_only_new_ones(self):
+        body = re.search(r"function renderPending\(list\)\s*\{(.*?)\n  \}",
+                         self.src, re.S)
+        self.assertIsNotNone(body, "renderPending not found — did it get renamed?")
+        # Iterating the incoming list (not just `add`) is the whole point: `add` holds
+        # only ids that were not already on screen.
+        self.assertRegex(body.group(1), r"for \(const a of list\)")
+        self.assertIn("setRequests(entry, a.requests)", body.group(1))
+
+    def test_the_badge_is_placed_in_the_card_between_the_clock_and_the_buttons(self):
+        # Building an element and never appending it is invisible to every test that
+        # does not render a DOM, and this page has shipped that exact shape of bug
+        # before — a banner that existed in the markup and could not be seen (see the
+        # `[hidden]` guard below). Order is part of the claim, not decoration: the
+        # badge qualifies what the buttons are about to do, so it has to be adjacent
+        # to them rather than up with the metadata.
+        parts = [p.strip() for p in
+                 re.search(r"^    el\.append\((.*)\);", self.src, re.M)
+                 .group(1).split(",")]
+        self.assertIn("dup", parts, "the badge is built but never attached")
+        self.assertEqual(parts.index("dup"), parts.index("actions") - 1)
+        self.assertLess(parts.index("cd"), parts.index("dup"))
+
+    def test_the_count_stops_moving_once_the_card_is_being_decided(self):
+        # Rewriting the number under a click already in flight is the same lie in the
+        # other direction: by then it is history, not what the button will do.
+        body = re.search(r"for \(const a of list\)\s*\{(.*?)\n    \}",
+                         self.src, re.S).group(1)
+        self.assertIn('entry.state === "pending"', body)
+        self.assertIn('entry.state === "confirming"', body)
 
 
 class InlineScriptTests(unittest.TestCase):

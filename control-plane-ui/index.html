@@ -77,6 +77,12 @@
     padding: 12px 14px; margin-bottom: 10px; }
   .card .host { font-weight: 600; font-size: 15px; word-break: break-all; }
   .card .meta { color: var(--dim); font-size: 12px; margin-top: 2px; word-break: break-all; }
+  /* One click can decide several blocked requests: duplicates of a held request join
+     its card instead of raising their own. This badge is the only thing on the page
+     that says so, so it is styled like a caution and not like the dim `.meta` line —
+     it qualifies what the buttons below it are about to do. */
+  .dup { margin-top: 8px; font-size: 12px; color: var(--hold);
+    border-left: 2px solid var(--hold); padding-left: 8px; }
   .actions { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
   /* Card outcome states. A resolve reports itself HERE rather than by the card
      disappearing on the next SSE tick — that was the only feedback before, so with

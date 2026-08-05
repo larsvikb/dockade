@@ -47,7 +47,10 @@ def _clear_all():
         conn.commit()
     cp._PENDING_EVENTS.clear()
     cp._PENDING_CLIENT.clear()
-    # Module state like the two above, and reset for the same reason: it is
+    cp._PENDING_WAITERS.clear()
+    cp._PENDING_DEADLINE.clear()
+    cp._GROUPS.clear()
+    # Module state like those above, and reset for the same reason: it is
     # process-lifetime by design, which across tests means it leaks.
     cp._SATURATION.update(count=0, last_ts=None, last_scope=None, last_host=None,
                           acked=0, acked_ts=None)
@@ -74,17 +77,27 @@ def _resolve(approval_id, action, request=None, **fields):
                       request if request is not None else _FakeRequest())
 
 
-def _hold(host, approval_id="hold-1"):
-    """Register a pending approval with NO blocked authorize() behind it: the durable
-    row plus the in-process slot ``resolve`` looks for. Enough for every resolve-side
-    assertion, and no thread to wait on — the wake path has its own tests."""
+def _hold(host, approval_id="hold-1", client=None):
+    """Register an INDEPENDENT pending approval with no blocked authorize() behind it:
+    the durable row plus the in-process slot ``resolve`` looks for. Enough for every
+    resolve-side assertion, and no thread to wait on — the wake path has its own tests.
+
+    The in-process half goes through the REAL ``_reserve_hold`` rather than assigning
+    to the registries by hand. It used to do the latter, and when the registry grew a
+    waiter count and a group key the fixture kept building a half-registered hold that
+    the production code would never produce — tests passing against a state that cannot
+    occur.
+
+    ``client`` defaults to the approval id — unique, therefore a distinct group key —
+    so two ``_hold``s on the same host are two cards. Callers that want them GROUPED
+    (which is what a real duplicate does) pass the same client explicitly."""
     with cp._connect() as conn:
         conn.execute(
             "INSERT INTO approvals(id, ts, host, status) VALUES (?,?,?, 'pending')",
             (approval_id, time.time(), host))
         conn.commit()
-    cp._PENDING_EVENTS[approval_id] = threading.Event()
-    cp._PENDING_CLIENT[approval_id] = None
+    cp._reserve_hold(approval_id, threading.Event(),
+                     approval_id if client is None else client, host)
     return approval_id
 
 
@@ -200,6 +213,170 @@ class HoldHandshakeTests(_CPTestCase):
         self.assertEqual(result["resp"].decision, "deny")
         # deny_once must NOT persist a rule — the host stays held next time.
         self.assertEqual(cp._decide("nope.com")[0], "hold")
+
+
+class DuplicateHoldTests(_CPTestCase):
+    """Grouping through the real ``authorize`` path, which is the only place its
+    concurrency shows: N blocked workers, one card, one decision, N audit lines."""
+
+    def _authorize_many(self, n, host, client="agent-1", urls=None):
+        """Start n concurrent authorize() calls for the same request. Returns the
+        threads and a results list that fills in as each returns."""
+        results = [None] * n
+
+        def worker(i):
+            results[i] = cp.authorize(_auth_req(
+                host, client=client, url=(urls[i] if urls else None)))
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        return threads, results
+
+    def _await_card(self, requests):
+        """Wait for exactly one pending card carrying ``requests`` blocked waiters."""
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            pending = cp._list_pending()
+            if len(pending) == 1 and pending[0]["requests"] == requests:
+                return pending[0]
+            time.sleep(0.01)
+        raise AssertionError(
+            f"never saw one card with {requests} waiters; saw {cp._list_pending()}")
+
+    def test_four_retries_raise_one_card_that_says_it_is_four_requests(self):
+        # The motivating case. Before grouping this was four cards, and with the
+        # per-client cap at 4 the fifth retry was refused with no card at all.
+        saved = cp.HOLD_TIMEOUT
+        cp.HOLD_TIMEOUT = 10
+        try:
+            threads, results = self._authorize_many(4, "dup.example")
+            card = self._await_card(4)
+            # The count is ON THE CARD because grouping changed what one click means.
+            self.assertEqual(card["requests"], 4)
+            _resolve(card["id"], "allow_once")
+            for t in threads:
+                t.join(5)
+        finally:
+            cp.HOLD_TIMEOUT = saved
+        self.assertEqual([r.decision for r in results], ["allow"] * 4)
+        with cp._connect() as conn:
+            rows = conn.execute("SELECT id FROM approvals").fetchall()
+        self.assertEqual(len(rows), 1, "duplicates must not each get a durable row")
+        # "once" still means no standing rule — it now means four requests, not one.
+        self.assertEqual(_rules(), set())
+        self.assertEqual(cp._decide("dup.example")[0], "hold")
+
+    def test_a_timeout_tells_every_waiter_it_was_a_timeout(self):
+        # Only ONE waiter wins the expiry UPDATE; the rest read the row. Reporting
+        # from `did I win the UPDATE` told the losers a human had rejected them —
+        # an audit trail inventing a human decision for a timeout is worse than none.
+        saved = cp.HOLD_TIMEOUT
+        cp.HOLD_TIMEOUT = 0.3
+        try:
+            threads, results = self._authorize_many(3, "slow.example")
+            for t in threads:
+                t.join(5)
+        finally:
+            cp.HOLD_TIMEOUT = saved
+        self.assertEqual([r.decision for r in results], ["deny"] * 3)
+        for r in results:
+            self.assertIn("timeout", r.reason)
+            self.assertNotIn("rejection", r.reason)
+        with cp._connect() as conn:
+            statuses = [r[0] for r in conn.execute(
+                "SELECT status FROM approvals").fetchall()]
+        self.assertEqual(statuses, ["expired"])
+
+    def test_every_joined_request_is_audited_on_its_own_terms(self):
+        # Grouping is a concept of the screen and the worker pool, never of the
+        # record: each request keeps its own audit line and its own url, and the
+        # joiners' reason names the card, so the log explains why four requests
+        # produced one approval without anyone having to know about grouping.
+        saved = cp.HOLD_TIMEOUT
+        cp.HOLD_TIMEOUT = 10
+        urls = ["https://dup.example/a", "https://dup.example/b",
+                "https://dup.example/c"]
+        try:
+            threads, results = self._authorize_many(3, "dup.example", urls=urls)
+            card = self._await_card(3)
+            _resolve(card["id"], "deny_once")
+            for t in threads:
+                t.join(5)
+        finally:
+            cp.HOLD_TIMEOUT = saved
+        calls = [c for c in cp._audit.call_args_list if c.args[0] == "hold"]
+        self.assertEqual(sorted(c.kwargs["url"] for c in calls), sorted(urls))
+        reasons = [c.kwargs["reason"] for c in calls]
+        self.assertEqual(sum(r == "held for approval" for r in reasons), 1)
+        joined = [r for r in reasons if r.startswith("joined hold ")]
+        self.assertEqual(len(joined), 2)
+        for r in joined:
+            self.assertIn(card["id"], r)
+        # And a terminal line per request, not per card.
+        self.assertEqual(
+            sum(1 for c in cp._audit.call_args_list if c.args[0] == "deny"), 3)
+        self.assertEqual([r.decision for r in results], ["deny"] * 3)
+
+    def test_a_decided_card_stops_accepting_joiners_at_the_click(self):
+        # The window closes with the DECISION, not when the last woken worker happens
+        # to return. Asserted while the waiters are still registered, because that gap
+        # is the whole risk: a retry landing in it would attach to an already-resolved
+        # card and inherit an outcome nobody was shown it beside.
+        approval = _hold("clicked.example", "held-1", client="agent-1")
+        before = cp._reserve_hold("dup", threading.Event(), "agent-1",
+                                  "clicked.example")
+        self.assertTrue(before.joined, "joinable while pending")
+        _resolve(approval, "deny_once")
+        self.assertIn(approval, cp._PENDING_EVENTS, "waiters not drained yet")
+        after = cp._reserve_hold("late", threading.Event(), "agent-1",
+                                 "clicked.example")
+        self.assertFalse(after.joined)
+        self.assertEqual(after.approval_id, "late")
+
+    def test_an_expired_card_stops_accepting_joiners_before_its_waiters_drain(self):
+        # Same invariant on the other terminal path. A phantom waiter (registered, with
+        # no thread that will ever release it) keeps the card in the registry after the
+        # real waiter returns, so the group can only have been closed by the EXPIRY
+        # path — not incidentally by the last release.
+        saved = cp.HOLD_TIMEOUT
+        cp.HOLD_TIMEOUT = 0.3
+        try:
+            threads, _ = self._authorize_many(1, "drain.example")
+            card = self._await_card(1)
+            phantom = cp._reserve_hold("phantom", threading.Event(), "agent-1",
+                                       "drain.example")
+            self.assertTrue(phantom.joined)
+            for t in threads:
+                t.join(5)
+            self.assertIn(card["id"], cp._PENDING_EVENTS)
+            late = cp._reserve_hold("late", threading.Event(), "agent-1",
+                                    "drain.example")
+        finally:
+            cp.HOLD_TIMEOUT = saved
+        self.assertFalse(late.joined)
+
+    def test_a_duplicate_arriving_after_the_decision_opens_a_new_card(self):
+        # The joining window closes with the decision, so a retry that lands after
+        # the click is held again rather than inheriting an outcome nobody was shown
+        # it beside.
+        saved = cp.HOLD_TIMEOUT
+        cp.HOLD_TIMEOUT = 10
+        try:
+            threads, _ = self._authorize_many(2, "again.example")
+            card = self._await_card(2)
+            _resolve(card["id"], "deny_once")
+            for t in threads:
+                t.join(5)
+            cp.HOLD_TIMEOUT = 0.2
+            late = cp.authorize(_auth_req("again.example", client="agent-1"))
+        finally:
+            cp.HOLD_TIMEOUT = saved
+        self.assertEqual(late.decision, "deny")
+        self.assertIn("timeout", late.reason)   # held afresh, then defaulted
+        with cp._connect() as conn:
+            rows = conn.execute("SELECT status FROM approvals ORDER BY ts").fetchall()
+        self.assertEqual([r[0] for r in rows], ["denied", "expired"])
 
 
 class ResolveTests(_CPTestCase):
@@ -596,6 +773,20 @@ class SaturationTests(_CPTestCase):
             conn.commit()
         self.assertEqual(len(cp._list_pending()), 1)
         self.assertEqual(cp._saturation()["in_flight"], 0)
+        self.assertEqual(cp._saturation()["cards"], 0)
+
+    def test_in_flight_counts_waiters_and_cards_counts_cards(self):
+        # The second divergence, and the reason both numbers are in the payload:
+        # duplicates share a card, so "12/16 in flight" beside three cards is not a
+        # contradiction. The global cap is measured against the FIRST number.
+        _hold("a.example", "held-1", client="172.30.0.2")
+        for _ in range(4):
+            slot = cp._reserve_hold("ignored", threading.Event(), "172.30.0.2",
+                                    "a.example")
+            self.assertTrue(slot.joined)
+        sat = cp._saturation()
+        self.assertEqual(sat["in_flight"], 5)
+        self.assertEqual(sat["cards"], 1)
 
     def test_the_payload_carries_the_holds_and_the_pressure_together(self):
         _hold("a.example", "held-1")
@@ -615,8 +806,8 @@ class SaturationTests(_CPTestCase):
         sat = cp._saturation()
         self.assertEqual(
             set(sat),
-            {"in_flight", "max_pending", "rejections", "acknowledged", "last_ts",
-             "last_scope", "last_host", "since"})
+            {"in_flight", "cards", "max_pending", "rejections", "acknowledged",
+             "last_ts", "last_scope", "last_host", "since"})
         # Both stamps are epoch seconds — comfortably past 2001 — not durations.
         self.assertGreater(sat["last_ts"], 1_000_000_000)
         self.assertGreater(sat["since"], 1_000_000_000)

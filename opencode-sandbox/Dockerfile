@@ -98,12 +98,17 @@ RUN npm install -g "opencode-ai@${OPENCODE_VERSION}" \
     && npm install -g "@ai-sdk/openai-compatible@${AI_SDK_OPENAI_COMPAT_VERSION}" \
     && opencode --version
 
-# NOTE if offline provider resolution turns out to fail at runtime: opencode may
-# populate its own cache on first use rather than reading the SDK from
-# node_modules. The fix is a build-time warm — place the config, invoke opencode
-# once here where egress exists, and tolerate the connection failure (the `llm`
-# service does not exist at build time). Not done pre-emptively because the npm
-# install above may already suffice; verify empirically before adding it.
+# The two installs above are SUFFICIENT — verified by running a full agentic turn
+# in a live tier-2 sandbox (model round-trip + write tool + bash tool, all with no
+# egress). So opencode reads the provider SDK from node_modules rather than
+# populating a cache of its own on first use, and nothing it needs is fetched
+# lazily at runtime. An earlier NOTE here proposed a build-time warm (invoke
+# opencode once during the build and tolerate the connection failure) as a
+# contingency; that contingency is not needed and is not implemented.
+#
+# Note what `opencode --version` alone would NOT have proven: only that the bin
+# shim resolves. Lazy runtime fetching fails at first TOOL USE, not at startup,
+# so the version print was never the check that settled this.
 
 # Shared boundary + entrypoint, byte-identical to tier 1. The build context is the
 # REPO ROOT so these are reachable; a context cannot COPY from outside itself.

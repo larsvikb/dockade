@@ -4,3 +4,6 @@ __pycache__/
 models/
 # Local compose overrides (DNS, model selection). Host-specific, never shared.
 .env
+# Container logs pulled into the tree for analysis (`docker logs llm-intel &>...`).
+# Useful to read, never to commit: host-specific, large, and stale within minutes.
+*.log

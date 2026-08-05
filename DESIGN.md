@@ -1469,8 +1469,13 @@ security context.
 
 **Runtime deps are baked at build time**, since the firewall only arms at container
 *start* — so the image installs opencode and the `@ai-sdk/openai-compatible`
-provider SDK while egress still exists. Confirmed working with no egress at
-runtime. `NPM_CONFIG_PREFIX` points at the user's `~/.local` so `-g` installs work
+provider SDK while egress still exists. Confirmed by running a full agentic turn in
+a live sandbox — model round-trip, write tool, bash tool, nothing reachable but the
+`llm` service. Worth stating what that test is *for*, because a weaker one looked
+sufficient: `opencode --version` passing proves only that the bin shim resolves, and
+anything fetched lazily fails at first **tool use**, not at startup. A no-egress tier
+has to be verified by doing work in it.
+`NPM_CONFIG_PREFIX` points at the user's `~/.local` so `-g` installs work
 as the non-root user, which also means the agent can npm-install at runtime without
 ever holding root.
 

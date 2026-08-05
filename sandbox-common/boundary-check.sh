@@ -59,9 +59,40 @@ if [ "${SANDBOX_MODE:-}" = "local" ]; then
     fi
     # The single sanctioned destination for this tier must actually work, or the
     # sandbox is inert. Checked by IP because that is what the firewall permits.
-    if curl --connect-timeout 5 -s -o /dev/null \
-         "http://${LLM_IP:-llm}:${LLM_PORT:-8080}/health" 2>/dev/null; then
+    llm_url="http://${LLM_IP:-llm}:${LLM_PORT:-8080}"
+    if curl --connect-timeout 5 -s -o /dev/null "$llm_url/health" 2>/dev/null; then
         ok "inference service reachable (${LLM_IP:-llm}:${LLM_PORT:-8080}) — the one permitted destination"
+        # Reachability is not usability. /health returns 200 once the GGUF is
+        # resident, which a wedged or misconfigured server also does — so assert a
+        # real COMPLETION round-trip. max_tokens 1 keeps it to a single decode
+        # (~0.1 s) while still exercising the whole path the agent uses: chat
+        # template, tool-call-capable --jinja parsing, sampler, detokenizer.
+        #
+        # Asserted on the SHAPE, never the content: the response must carry
+        # `choices` and must not carry `error`. A local model's words are not a
+        # test fixture — they change with the weights, the sampler and the quant,
+        # and a check that asserts them is a check that gets disabled.
+        #
+        # 60 s because a cold prefill on an iGPU is slow and this check must not
+        # fail for being impatient; it is diagnosing "does the model generate at
+        # all", not latency.
+        #
+        # KNOWN COST, and it follows from `--parallel 1` in docker-compose.yml: the
+        # prompt cache is per-slot and there is one slot, so this request EVICTS a
+        # running agent's cached prefix. Running `make boundary` mid-session makes
+        # the agent's next turn re-prefill its whole base prompt — tens of seconds
+        # on this hardware, once. Acceptable for an on-demand diagnostic, and the
+        # reason this is not on a timer.
+        llm_reply=$(curl --connect-timeout 5 --max-time 60 -s \
+                      -H 'Content-Type: application/json' \
+                      -d '{"messages":[{"role":"user","content":"ping"}],"max_tokens":1}' \
+                      "$llm_url/v1/chat/completions" 2>/dev/null)
+        case "$llm_reply" in
+            *'"choices"'*) ok "inference service completes a request (generation works, not just listening)" ;;
+            *'"error"'*)   bad "inference service returned an error to a minimal completion: $(printf '%s' "$llm_reply" | tr -d '\n' | cut -c1-160)" ;;
+            "")            bad "inference service accepted the connection but returned nothing to /v1/chat/completions (loading, wedged, or OOM?)" ;;
+            *)             bad "inference service gave an unrecognised reply to /v1/chat/completions: $(printf '%s' "$llm_reply" | tr -d '\n' | cut -c1-160)" ;;
+        esac
     else
         bad "inference service NOT reachable (${LLM_IP:-llm}:${LLM_PORT:-8080}) — tier 2 has no other capability"
     fi

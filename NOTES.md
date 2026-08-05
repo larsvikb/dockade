@@ -96,6 +96,31 @@ costs nothing here.
   prompt and tool definitions mid-conversation — degradation that presents as the
   model becoming inexplicably confused rather than as an error.
 
+### Tier 2 end to end, measured
+
+One `opencode run` turn in a live tier-2 sandbox — write a file, read it back, run
+`wc -c` on it — with no egress. It completed, and the file was correct on disk.
+
+| Phase | Tokens | Time |
+| --- | --- | --- |
+| Session/title request | 574 prompt | 4.9 s prefill |
+| First turn (base prompt + task) | 8635 prompt, 44 out | 36 s prefill (~240 tok/s), 13 tok/s decode |
+| After the write-tool result | 23 new | 3.7 s |
+| After the bash-tool result | 27 new | 2.5 s |
+
+Two things worth keeping. **The first turn is ~40 s and almost all of it is
+prefilling opencode's own base prompt**, not doing the work — so on this hardware
+the fixed cost of the harness dominates any short task, and a long session
+amortises far better than several short ones. **`--parallel 1` demonstrably paid
+off**: the tool-result turns reported `f_sim_best = 0.997` prefix-cache reuse and
+came back in seconds instead of re-prefilling 8.6k tokens.
+
+And a caution about the output rather than the plumbing: the model reported "2 bytes
+(the word OK plus the newline character)" for a file that is `OK` with **no**
+newline. The tool calls were right and the arithmetic narrating them was wrong,
+which is the same lesson as constrained decoding above — verify the artifact, not
+the prose about it.
+
 ## Accelerator ecosystem survey
 
 Why the compose profiles are shaped the way they are — the design is in DESIGN.md →

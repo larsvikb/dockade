@@ -60,15 +60,29 @@ jobs:
       # ruff and yamllint via pipx, which is how claude-sandbox/Dockerfile installs
       # them too — CI and the agent image get the linters the same way. Unpinned, per
       # the ruff.toml rationale; the scheduled run above is what catches drift.
-      # --force because the runner image ALREADY ships yamllint via pipx, so a plain
-      # `pipx install` is a silent no-op ("already seems to be installed") and the
-      # version would be pinned by the runner image rather than floating from PyPI as
-      # the ruff.toml rationale intends. The step should do what it says.
+      #
+      # Into a pipx home of OUR OWN, which is the part worth knowing. The runner image
+      # ships its own pipx tools in a shared, ROOT-OWNED PIPX_HOME (/opt/pipx), and
+      # yamllint is one of them — so both obvious spellings are wrong there. A plain
+      # `pipx install` is a silent no-op ("already seems to be installed"), leaving the
+      # version pinned by the runner image rather than floating from PyPI as intended.
+      # `pipx install --force` is worse: it tries to recreate a venv it has no
+      # permission to remove, declines ("not removing existing venv ... because it was
+      # not created in this session"), and fails the job — `Operation not permitted:
+      # /opt/pipx/venvs/yamllint/bin/Activate.ps1`. That regressed a green gate.
+      #
+      # A private PIPX_HOME has neither problem: nothing to collide with, so no --force
+      # is needed, and the binaries land where this step says they do rather than
+      # wherever the image decided. RUNNER_TEMP is per-job and disposable, so nothing
+      # leaks between runs either.
       - name: Install ruff + yamllint
+        env:
+          PIPX_HOME: ${{ runner.temp }}/pipx
+          PIPX_BIN_DIR: ${{ runner.temp }}/pipx/bin
         run: |
-          pipx install --force ruff
-          pipx install --force yamllint
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          pipx install ruff
+          pipx install yamllint
+          echo "${{ runner.temp }}/pipx/bin" >> "$GITHUB_PATH"
 
       # hadolint is the one linter this repo PINS (ruff and yamllint float via pipx,
       # here and in the image alike), so the version is read out of the Dockerfile
@@ -96,6 +110,11 @@ jobs:
       # versions that produced it — the necessary counterpart to floating them.
       # shellcheck, python3 and node come with the runner image; strict mode fails
       # loudly rather than skipping if a future image drops one.
+      #
+      # The PATHS are printed for the two we install ourselves, because "which yamllint
+      # is this?" is precisely the question the pipx-home failure above raised, and the
+      # version alone cannot answer it: the image's copy and ours can report the same
+      # number while only one of them is floating.
       - name: Toolchain versions
         run: |
           shellcheck --version | sed -n 2p
@@ -104,6 +123,7 @@ jobs:
           yamllint --version
           python3 --version
           node --version
+          echo "installed by this job: $(command -v ruff), $(command -v yamllint)"
 
       # Not `make check-strict`: verify-build is the `build` job's work, and running
       # it here would serialise the slow half behind the fast half.

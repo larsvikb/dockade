@@ -571,6 +571,25 @@ no separate artifact-export path is needed in v1.
   than a dev machine on 3.13 does, and the dependency-free suite gets exercised on
   both.
 
+  **The linters get a pipx home of their own, and the attempt to fix that naively
+  broke the gate.** The runner image ships its own pipx tools in a shared,
+  root-owned `PIPX_HOME` (`/opt/pipx`), and `yamllint` is one of them — so both
+  obvious spellings are wrong. A plain `pipx install yamllint` is a silent **no-op**
+  ("already seems to be installed"), which quietly pins the version to the runner
+  image instead of floating it from PyPI as the `ruff.toml` rationale intends. Adding
+  `--force` to fix that made it **worse**: pipx tries to recreate a venv it has no
+  permission to remove, declines because it "was not created in this session", and
+  fails the job outright (`Operation not permitted:
+  /opt/pipx/venvs/yamllint/bin/Activate.ps1`). `ruff` survived only because it is not
+  preinstalled there — which is exactly why the failure looked unrelated to the change
+  that caused it. Both symptoms are one root cause, the image's pipx layout leaking
+  into our step, so the step now sets its own `PIPX_HOME`/`PIPX_BIN_DIR` under
+  `RUNNER_TEMP`: nothing to collide with, no `--force` needed, and the binaries land
+  where the step says. The versions step also prints `command -v` for those two now,
+  because "which yamllint is this?" is the question this raised and a version number
+  cannot answer it — the image's copy and ours can report the same number while only
+  one of them floats.
+
   **The build job's first run found a bug that was unobservable locally**, which is
   the clearest possible argument for having insisted on it. `run-opencode-sandbox.sh`
   was recorded in the git index as `100644` while being `755` on disk, so `make

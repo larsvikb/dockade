@@ -98,20 +98,94 @@ egress** — sandbox-net only. These make good practices cheap and fast. Example
 - headless browser **only if** its egress is forced through the governed proxy
   (otherwise it is an ungoverned egress hole — treat as governed)
 
-### Sandbox (the agent image — the "paved road")
+## Networks
+
+- `sandbox-net` (`internal: true`) — sandbox ↔ all data-plane services (governed
+  + ungoverned). The agent lives only here.
+- `control-net` (`internal: true`) — governed proxies/tools ↔ control plane.
+  Sandbox not attached.
+- `egress-net` — only outbound-capable governed proxies + internet.
+- `control-ui-net` — non-internal bridge carrying ONLY the control-plane-ui
+  frontend's host-loopback UI publish; masquerade disabled so it is
+  host-reachable but not an egress path. Needed because Docker cannot publish a
+  host port from a container that is on an internal network alone. Sandbox not
+  attached.
+
+**Status:** all four networks are implemented. `sandbox-net` (internal) and
+`egress-net` carry the agent and the sole egress; `control-net` (internal)
+carries the control path. The egress proxy is **triple-homed** (sandbox-net
++ egress-net + control-net). The control-plane **backend** is on `control-net`
+only and fully internal (no `sandbox-net`, no `egress-net`, no published port);
+the **control-plane-ui** frontend is on `control-net` (to reach the backend)
+plus `control-ui-net` (host-loopback UI). The sandbox is on `sandbox-net` only —
+never `control-net`/`control-ui-net` (asserted by `make check` and
+`boundary-check.sh`).
+
+### DNS on `sandbox-net` (a non-obvious gotcha — read before touching DNS/firewall)
+
+Putting the sandbox on a *user-defined* network (which we do, and must — it's how
+data-plane services get name resolution) changes DNS in two ways that together
+broke the agent, and the fix spans both the launcher plumbing (`sandbox-lib.sh`)
+and `init-firewall.sh`. The chain, so nobody has to rediscover it:
+
+1. **Embedded resolver.** On a user-defined network the container's `resolv.conf`
+   is always `127.0.0.11` — Docker's embedded DNS. It answers sibling-container
+   names itself and **forwards** everything else to an upstream. (On the *default*
+   bridge there is no embedded resolver; `resolv.conf` holds real IPs directly.
+   That's why "drop `--network` and it works" appears to fix things — it sidesteps
+   all of this, at the cost of the isolation `sandbox-net` exists to provide. Not
+   an acceptable fix.)
+
+2. **The upstream it auto-selects is often unreachable from the container.** The
+   embedded resolver derives its upstream (`ExtServers`) from the *host's*
+   `/etc/resolv.conf`. On any systemd-resolved host — most WSL2/Docker Desktop
+   setups, much stock Linux, anything on a split-DNS VPN — that file is just the
+   stub `127.0.0.53`, which is meaningless inside the container. Result: **every
+   external lookup `SERVFAIL`s, with or without the firewall.** This is generic
+   Docker behavior, not a broken host (host DNS and the default bridge both work).
+   Fix: the launcher (`sandbox-lib.sh`) pins the upstream explicitly with `--dns`, sourced
+   from the host's real uplink resolvers (`/run/systemd/resolve/resolv.conf`),
+   falling back to public `8.8.8.8/8.8.4.4`, overridable via `SANDBOX_DNS` for
+   locked-down networks. `resolv.conf` stays `127.0.0.11`, so service discovery is
+   preserved.
+
+3. **The firewall must not break the resolver, and must permit its forward.** Two
+   traps in `init-firewall.sh`:
+   - It must **not flush the `nat` table** — Docker's embedded-DNS `DNAT` lives
+     there, and flushing it kills all resolution *before* default-deny even arms.
+     (An earlier save/restore dance tried to undo this; it's unreliable under the
+     nf_tables iptables backend. Simpler and correct: leave `nat` alone. `nat` is
+     not a containment boundary — egress is governed entirely in the `filter`
+     table.)
+   - The embedded resolver's upstream forward **egresses the `filter` OUTPUT
+     chain**, so in STANDALONE mode those same upstream IPs must be whitelisted on
+     port 53 (passed in as `UPSTREAM_DNS`) or runtime DNS dies the instant
+     default-deny arms. (Governed mode blocks that forward on purpose — proxied
+     tools hand the hostname to the proxy — and allows only the embedded resolver
+     itself, which still answers sibling names.)
+
+`sandbox-lib.sh` computes the resolver list **once** and uses it for both
+`--dns` (the resolver's upstream) and `UPSTREAM_DNS` (the firewall allow-list), so
+the two can't drift apart. Containment is unaffected: `--dns` only sets an
+upstream, DNS is still pinned to *named* resolvers (no "any nameserver" hole), and
+egress remains filter-table default-deny plus the mode's allowlist (ipset in
+standalone; proxy-only in governed).
+
+## The sandbox image (the agent's "paved road")
+
 Claude Code, with yolo available as a conscious opt-in (`claude-yolo`). This
 image is where **enablement** lives:
 - curated toolchain + pre-wired linters / formatters / test runners
 - baseline Claude Code settings and **hooks as quality gates**
   (e.g. format/test on write, block known-bad patterns) — *hooks: planned, not
-  yet in the image (see Build status)*
+  yet in the image (see Status)*
 - a default **status line** (`claude-sandbox/statusline.sh`, seeded into user
   settings by the tier-1 setup hook the entrypoint runs — see below)
 - the **skills** that are the sanctioned interface to every capability —
   *planned, not yet in the image*
 - non-root `sandbox` user, resource limits
 
-#### User settings — image-owned config, materialized each boot
+### User settings — image-owned config, materialized each boot
 
 `/config/settings.json` is **declarative configuration owned by the image**, not
 mutable state in the volume. The entrypoint **overwrites it authoritatively on
@@ -164,7 +238,7 @@ figure is already local and free. The parse is cached on the transcript's mtime
 so a large JSONL is only re-read when it changes; the win is avoiding re-parse
 latency, not a (nonexistent) network round-trip.
 
-#### Git identity — from the host at launch, not the tree
+### Git identity — from the host at launch, not the tree
 
 Git **conventions** are shared and safe to ship, so the baked `~/.gitconfig`
 carries only non-personal defaults (`init.defaultBranch = main`, `pull.rebase =
@@ -181,7 +255,7 @@ changing identity needs no rebuild. If the host has no identity, the launcher
 **warns but does not fail**: the container still starts and git errors only at
 commit time (`Author identity unknown`), which is legible and recoverable.
 
-#### Managed settings are NOT an enforcement lever here
+### Managed settings are NOT an enforcement lever here
 
 Claude Code's managed-settings tier is **single-source**: when more than one
 managed source exists, one wins and the others are ignored — they do **not**
@@ -229,6 +303,43 @@ Consequences, now settled:
 Skills do double duty: they are the capability interface **and** they encode the
 right *way* to do a task, steering the agent onto the paved road.
 
+### What the image ships today
+
+**v1 sandbox scaffolded** (`claude-sandbox/` + `run-claude-sandbox.sh`) — a
+single-container image and launcher centered on this design. Notable properties:
+- **Isolated persistent config** via `CLAUDE_CONFIG_DIR=/config` backed by its
+  own named volume — no host `~/.claude` sharing.
+- **No local managed-settings enforcement layer** — removed after verifying it is
+  shadowed by the org's remote managed source under org auth (see "Managed settings
+  are NOT an enforcement lever here"). Hardening opt-outs live as real Dockerfile
+  `ENV`; any `permissions.deny` would go in user-scope `settings.json` as
+  mistake-prevention only. Enforcement is the firewall + capability containment;
+  hard policy is the org admin console. Does **not** force yolo — starting in yolo
+  is a conscious opt-in via the `claude-yolo` alias.
+- **Baseline user settings** (`claude-sandbox/user-settings.json`) baked in and
+  materialized to `/config/settings.json` authoritatively on each boot — the
+  default status line ships this way; config is image-owned, the volume holds
+  only credentials/runtime state.
+- **Base image `debian:13-slim`** (Debian 13 "trixie") — chosen over `ubuntu:24.04`
+  for a leaner base with no default uid-1000 user to evict (dropping a `userdel`
+  step) and archive utilities as fresh or fresher; the firewall (iptables-nft on
+  both) and host-uid matching behave identically, verified by a build +
+  `boundary-check.sh` pass on the Debian base. The Ubuntu LTS+ESM support window is
+  the one trade-off, minor under rebuild-to-update.
+- Baseline stack: **Node current LTS (24.x)** + `gh` + pipx, plus baked linters
+  (shellcheck / hadolint / ruff, all self-contained so they run under default-deny
+  egress). Node tracks the latest LTS line (even majors); bump the NodeSource
+  `setup_NN.x` major to move it. Firewall allowlist trimmed to this design
+  (Anthropic + GitHub + npm + PyPI).
+- **Own user-defined bridge `sandbox-net`** (owned by `docker-compose.yml`,
+  created idempotently by the launcher when the compose infra is absent), not
+  Docker's default bridge — gets embedded DNS (`127.0.0.11`, which the firewall
+  already expects), name resolution for the data-plane services, and isolation from
+  other default-bridge containers. Under the compose infra it is now `internal:
+  true` (the proxy landed — see "Governance surfaces"), so the sandbox has no
+  direct route off-box; the launcher's plain-bridge fallback (proxy-less standalone
+  use) is non-internal and keeps direct egress via `init-firewall.sh`.
+
 ## Web access (verified empirically in-sandbox)
 
 Tested in the pre-proxy **standalone** posture (default-deny iptables + ipset
@@ -257,26 +368,21 @@ our own control/data plane for governed remote execution.
 
 Consequences:
 
-- **WebSearch cannot be blocked at the network layer** (that would require
-  blocking api.anthropic.com, which the agent needs). The remaining levers are
-  server-managed policy (the **org admin console**) or removing the capability
-  entirely (replace with a governed skill). A user-scope
-  `permissions.deny: ["WebSearch"]` only discourages *accidental* use — the local
-  managed file that could have enforced it is not loaded under org auth (verified).
+- **WebSearch cannot be blocked at the network layer** — that would mean blocking
+  api.anthropic.com, which the agent needs. Nor is there any *client-side* lever: a
+  yolo agent edits or relaunches around a user-scope `permissions.deny`, and the one
+  mechanism that could have outranked it — a root-owned local managed file — is **not
+  loaded** under org auth (verified; see "Managed settings are NOT an enforcement lever
+  here"). So the only real controls are the **org admin console** (server-managed) or
+  **removing the capability**, replacing WebSearch with a governed `websearch` skill
+  (below). A user-scope deny stays available as *accident* prevention — none ships in
+  the baked template today — never as containment.
 - **Disabling it is a threat-model choice, not automatic.** WebSearch is
   read-only: the agent cannot POST/upload through it. Realistic risks are narrow
   — low-bandwidth exfil via crafted query strings (to Anthropic's search, not an
   attacker endpoint) and unaudited information *intake*. If neither is in scope,
   leaving WebSearch on keeps its perf/capability benefit. Disable only if
   unaudited intake or query-string leakage matters for your threat model.
-- **No client-side lever enforces a WebSearch block here.** A yolo agent can edit
-  or relaunch around a user-scope deny, and the one mechanism that could have
-  outranked the agent — a root-owned local managed file — is **not loaded** under
-  org auth (see "Managed settings are NOT an enforcement lever here", verified). So
-  the only real controls are the **org admin console** (server-managed) or
-  **removing the capability** by replacing WebSearch with a governed `websearch`
-  skill (below). A user-scope deny remains available as *accident* prevention
-  (none ships in the baked template today), never as containment.
 - **WebFetch** is already network-governed; keep it. It also honors `HTTPS_PROXY`
   (inherits the CLI's proxy env), so it is audited through the egress proxy —
   **verified**: allow/deny CONNECT entries for a fetched allowlisted vs blocked
@@ -470,321 +576,588 @@ host-bind-mounted workspace. Dependencies: pull-through cache.
 single project directory, read-write. Because work lands on the host FS directly,
 no separate artifact-export path is needed in v1.
 
-### Recently completed
-- **DONE — Python unit tests for the governance-critical logic** (`tests/`, wired
-  into `make check` via the `test` target). A dependency-free `python -m unittest`
-  suite (`fastapi`/`pydantic`/`mitmproxy` stubbed in `tests/_loader.py`, SQLite on
-  a throwaway temp file — no pip installs, no running services) now covers the
-  security-load-bearing decision functions: the proxy's `_forbidden` relay guard
-  (name / literal-IP / resolves-into-control-net branches), `_match`, the
-  permanent-lifeline check, and env parsing; and the control plane's `_decide`
-  (block-wins-over-allow across distinct patterns, subdomain semantics,
-  default-hold, case-folding) and `_match`. Per the note below, the **hold-cap
-  reservation was extracted** out of the `authorize` handler into
-  `_reserve_hold` / `_release_hold` (behavior-preserving) so the cap logic is
-  testable directly — its global cap, per-client cap, per-client-disable (`0`),
-  `None`-client-bypasses-per-client-but-not-global, and slot-release behavior are
-  now asserted. These are exactly the properties `boundary-check.sh` is a poor fit
-  for — it can only observe reachability from the sandbox's vantage point, so
-  availability/concurrency properties like the hold cap (which returns the same
-  opaque `403` to the agent as any other deny) can't be asserted there.
+## Governance surfaces
 
-  The suite was then extended to the **async decision flow** the pure-function
-  tests couldn't reach (**172 tests total**, still dependency-free — the count
-  includes the `control-plane-ui` relay host-pinning regression tests that came
-  with the 2b-2 split, the mapped-IPv6 relay-guard regression suite, and the
-  frontend's Host / cross-origin / relay-allowlist / provenance guards, the
-  embedding refusal and security-header policy, the backend-unreachable 502, the
-  page script's own decision helpers (see "The frontend's own tests" below), the
-  standing-policy rules view, the persist-pattern candidate derivation and its
-  server-side validation, the hold-window config view, and the fresh-schema guard on
-  the provenance column): the proxy's
-  `_authorize` (permanent-lifeline short-circuit with no control-plane call, and
-  fail-closed on any control-plane error / non-`allow` decision — `_post_authorize`
-  monkeypatched, no network) and the mitmproxy hooks via small `SimpleNamespace`
-  flow/context fakes — `http_connect` (forbidden-before-port-before-host ordering,
-  authority recorded only on allow), `tls_clienthello` (the SNI-vs-CONNECT-authority
-  anti-fronting guard, incl. no-recorded-authority fails closed), `request` (gates
-  **both** transport host and Host/`:authority`, so a fronted Host header is denied
-  even under an authorized CONNECT), and `client_disconnected` cleanup. On the
-  control-plane side the FastAPI stub leaves handlers callable, so the `authorize`
-  orchestration (allow/deny without holding, over-cap immediate fail-closed, hold
-  **timeout→deny** leaving the row `expired`) and the **resolve handshake** (a
-  backgrounded blocked `authorize` woken by `allow_persist` — which also writes the
-  operator rule so a re-decide skips the hold — vs `deny_once` which persists
-  nothing; plus bad-action `400` and unknown-id `409`) and `_seed_if_empty`
-  (lowercasing, comment/blank skipping, idempotency) are all covered. Remaining
-  untested surface is low-weight I/O: `_audit` sinks, `_post_authorize`/`_setup_
-  audit_file`, and the SSE `approvals_stream`.
-- **DONE — CI gate (`.github/workflows/check.yml`), and the strict mode it needed.**
-  The workflow runs the existing `make` targets rather than reimplementing them, so
-  there is one definition of "does this repo pass" and a contributor can reproduce a
-  CI failure with `make check-strict`. Two parallel jobs: lint + consistency + tests
-  (about a minute) and the five-image build verification (minutes, because both
-  sandbox tiers apt-install a toolchain), so a shellcheck typo is not queued behind an
-  image build.
+The three services that actually implement governance, and the reasoning each one
+rests on. This is the "why it is this way" that a change has to keep true — it was
+previously filed under a heading called *Build status*, which is why it kept
+growing without anyone noticing.
 
-  The part worth recording is why a plain `make check` in CI would have been
-  **worse than no CI**. Every stage of the gate degrades to a SKIP when its tool is
-  absent — `SKIP hadolint (not installed)`, the ten `app.js` tests skipping without
-  node, `SKIP build verification (docker unavailable)`. That is right on a dev
-  machine, where running the checks you *can* run beats running none. In CI it
-  produces a green check that verified less than the badge claims, with nothing
-  anywhere saying so — the same "silently checks nothing" failure the `LAUNCHERS`
-  glob guard already fails closed against. Hence `DOCKADE_REQUIRE_TOOLS=1`, which
-  turns every such skip into a failure, set for both CI jobs and available locally as
-  `make check-strict`. It lives in the Makefile rather than the workflow YAML because
-  the Makefile already owns what-must-be-true, and because a requirement encoded only
-  in CI is invisible to whoever runs the checks by hand. Verified in all four
-  directions (docker, hadolint, node, and the all-present case): each skips in the
-  default mode and fails under strict.
+### Egress proxy — the sole path off-box
 
-  The schedule (weekly) exists because this repo **floats its tooling on purpose** —
-  `ruff.toml` pins the rule *selection* and lets the binary drift, and base images are
-  pinned by tag, not digest. The accepted cost is that a green commit can go red with
-  no code change; a scheduled run is how that surfaces on its own rather than
-  ambushing whoever opens the next pull request. For the same reason the workflow
-  prints every tool's version, so a verdict can be traced to what produced it.
+**The proxy and the compose split** (`docker-compose.yml` + `proxies/egress/`). The
+multi-container phase has begun, with a deliberate split the topology relies on:
+`docker-compose.yml` owns the **shared, long-lived infrastructure** (the data
+plane — the egress proxy at this step; the control plane + UI frontend and the
+profile-gated inference service joined as later steps landed), and the
+`run-*-sandbox.sh` launchers still
+launch the **ephemeral sandbox(es)** that attach to it (`docker run -it --rm`,
+one or many, each per-workspace with its own firewall/DNS/git wiring). Sandboxes
+are intentionally *not* compose services: they are interactive, disposable, and
+plural, which `compose run` models poorly.
 
-  **The CI toolchain is NOT the sandbox image's toolchain, and only one of the
-  differences mattered.** The first CI run failed on hadolint, because the workflow
-  fetched `releases/latest` (2.15.1) while the repo *pins* hadolint at
-  `claude-sandbox/Dockerfile`'s `ARG HADOLINT_VERSION=v2.12.0` — so CI enforced two
-  rules v2.12.0 does not have (DL3064, which reads the "USER" in `ARG
-  USERNAME=sandbox` as sensitive data, and DL3066, which wants numeric UIDs
-  including for `USER root`; both noise here) while `make check` stayed green
-  locally. The workflow now *derives* the version from that ARG rather than
-  restating it, and fails loudly if it cannot be read instead of falling back to
-  `latest` — one source of truth, and a deliberate pin bump moves CI and the image
-  together. A side effect worth knowing: hadolint drift no longer surfaces in the
-  weekly run, it surfaces when someone bumps the pin, which is the better moment.
+The proxy itself is `mitmproxy` in regular (forward) mode with a policy/audit
+addon (`proxies/egress/addon.py`): **CONNECT-level, default-deny domain
+allowlist, per-connection JSON audit, no TLS interception** (HTTPS is tunnelled
+via `ignore_connection`, so no CA in the sandbox). The launcher discovers the
+proxy on `sandbox-net`, points the agent's `HTTPS_PROXY` at it (the CLI honors it
+— see "Claude Code proxy support"), and allowlists it in the firewall
+(`EGRESS_PROXY_IP`). Chosen properties: it does **not** weaken the boundary while
+we validate — the allowlist is default-deny from the first commit, so arbitrary
+egress via the proxy is refused (not allow-all), and `boundary-check.sh` stays
+meaningful; and the allowlist was re-read per connection, a cheap stand-in for
+"dynamic" until the control plane existed (2a replaced the baked allowlist
+entirely — the proxy is a control-plane client now, see below). Governs by
+**name**, so it closes the shared-CDN/fronting gap the IP firewall can't (for
+proxied traffic).
 
-  The other five differ too (CI vs image: shellcheck 0.9.0 vs 0.10.0, python 3.12.3
-  vs 3.13.5, node 22 vs 24; ruff and yamllint happen to match, and float via pipx in
-  both places). Those are accepted, on a principle worth stating because it is not
-  "CI should be stricter": **a divergence is harmful when it produces surprise AFTER
-  a push.** hadolint was harmful because CI was the stricter side, so the failure
-  could only appear post-push. shellcheck is the reverse — the local gate is the
-  newer one, so anything it can catch it catches first, and no new pin is needed for
-  a tool that has no repo-side pin to derive from. The interpreter difference is a
-  positive: the services run on `python:3.12-slim`, so CI tests closer to production
-  than a dev machine on 3.13 does, and the dependency-free suite gets exercised on
-  both.
+**Governed vs standalone egress (the firewall is mode-aware).** When the launcher
+finds the proxy it sets `EGRESS_PROXY_IP`, and `init-firewall.sh` switches to a
+minimal **governed** posture — the sandbox's only `OUTPUT` ACCEPTs become:
+loopback (incl. embedded DNS `127.0.0.11`), DNS **to `127.0.0.11` only**, the
+proxy `/32:8080`, and `ESTABLISHED,RELATED`; everything else is REJECTed. Dropped
+in governed mode vs the old posture: the direct per-domain IP allowlist (so **no
+ipset**), the **upstream DNS forward** (closing the residual DNS-exfil channel —
+a crafted name can no longer reach a recursive resolver; sibling names like
+`egress-proxy` still resolve locally), and the **gateway `/32`** (host-local
+surface). Without a proxy the firewall keeps the fuller **standalone** allowlist
+(ipset + upstreams + gateway). Net effect: with the proxy up, the sandbox's only
+paths off-box are the proxy (HTTP/S, domain-governed + audited) and — narrowly —
+the embedded resolver for sibling names. This is effectively step 1's egress
+posture, reached early. Consequence to remember: a tool that does its own
+external DNS or connects direct *without* honoring `HTTPS_PROXY` now fails closed
+(by design — proxied tools hand the hostname to the proxy, which resolves it).
 
-  **The linters get a pipx home of their own, and the attempt to fix that naively
-  broke the gate.** The runner image ships its own pipx tools in a shared,
-  root-owned `PIPX_HOME` (`/opt/pipx`), and `yamllint` is one of them — so both
-  obvious spellings are wrong. A plain `pipx install yamllint` is a silent **no-op**
-  ("already seems to be installed"), which quietly pins the version to the runner
-  image instead of floating it from PyPI as the `ruff.toml` rationale intends. Adding
-  `--force` to fix that made it **worse**: pipx tries to recreate a venv it has no
-  permission to remove, declines because it "was not created in this session", and
-  fails the job outright (`Operation not permitted:
-  /opt/pipx/venvs/yamllint/bin/Activate.ps1`). `ruff` survived only because it is not
-  preinstalled there — which is exactly why the failure looked unrelated to the change
-  that caused it. Both symptoms are one root cause, the image's pipx layout leaking
-  into our step, so the step now sets its own `PIPX_HOME`/`PIPX_BIN_DIR` under
-  `RUNNER_TEMP`: nothing to collide with, no `--force` needed, and the binaries land
-  where the step says. The versions step also prints `command -v` for those two now,
-  because "which yamllint is this?" is the question this raised and a version number
-  cannot answer it — the image's copy and ours can report the same number while only
-  one of them floats.
+**WSL2 kernel gotcha (`xt_set`).** On stock WSL2 kernels `ipset create` can
+succeed while iptables `-m set --match-set` fails with `Can't open socket to
+ipset` — the kernel ships enough of `ip_set` for the userspace tool but not the
+`xt_set` match module. This is a *kernel*-capability gap, unrelated to container
+caps (`ipset`/xtables need `NET_ADMIN`, never `NET_RAW` — re-adding `NET_RAW`
+does not help and re-opens a hole). Governed mode sidesteps it entirely (no ipset
+path); standalone mode fails **closed** with a pointer to use the proxy. Do not
+"fix" ipset errors by adding capabilities — use the proxy.
 
-  **The build job's first run found a bug that was unobservable locally**, which is
-  the clearest possible argument for having insisted on it. `run-opencode-sandbox.sh`
-  was recorded in the git index as `100644` while being `755` on disk, so `make
-  opencode` worked perfectly on the machine that wrote it and *any fresh clone* got a
-  non-executable launcher — `./run-opencode-sandbox.sh: Permission denied`, exit 126.
-  The reason it could hide is `core.fileMode=false`, which git sets automatically when
-  the working tree lives on a filesystem whose exec bit it cannot trust (this repo is
-  routinely worked on through exactly such a bind mount): git then ignores the on-disk
-  bit entirely, so nothing ever flagged the mismatch. `make consistency` now asserts
-  every launcher is `100755` **in the index** (`git ls-files -s`, not `test -x`, since
-  the on-disk bit is the thing that lies here). Only the launchers need it —
-  `sandbox-lib.sh` is sourced, and scripts copied into images are chmod'ed by their
-  Dockerfile.
+**The proxy is the sole egress at the network layer.**
+`sandbox-net` is now `internal: true` (no route off-box for anything on it) and a
+separate `egress-net` carries the only internet path, with the egress proxy
+**dual-homed** across both (default route via egress-net; a stable sandbox-net IP
+the firewall allowlists). The in-container firewall is now **defense-in-depth**
+rather than the sole boundary: even if it failed, the sandbox has no route out.
+The launcher refuses to start a sandbox on an internal `sandbox-net` when no
+proxy is running. **Standalone** mode (no compose infra → non-internal net +
+direct ipset allowlist) remains for proxy-less use. DNS needs nothing extra: the
+sandbox resolves only sibling names via the embedded resolver (local, works on
+internal nets); external resolution happens at the proxy on egress-net.
 
-  **No Docker layer cache — and the first green run settled that it should stay that
-  way.** Caching across GitHub-hosted runners needs `--cache-to/--cache-from
-  type=gha` on the build itself, which `docker compose build` does not accept and the
-  launchers do not pass, so it would mean either `buildx bake --set` for the compose
-  half (diverging CI from `make verify-build`, which is the property that makes CI
-  reproducible locally) or a new flag hook through `sandbox-lib.sh`. That was deferred
-  pending a measured number. The number is **~2m 22s cold, uncached**: 19s for the
-  three compose services, 68s for `claude-sandbox`, 54s for `opencode-sandbox`. Far
-  below the 5–15 minutes estimated, so the divergence buys nothing and the question is
-  closed rather than merely deferred. (Some of the speed is intra-run reuse — the
-  second sandbox build reports `CACHED` on the shared `debian:13-slim` layer.)
+**Control-plane relay guard (the proxy is the bridge, so the proxy must refuse
+it).** The egress proxy is the *one* component attached to both `sandbox-net` and
+`control-net`, so segmentation alone does **not** isolate the agent from the
+control plane — the proxy could in principle relay a connection onto control-net
+(where the agent could, e.g., approve its own held requests). It therefore
+hard-refuses, **before** any policy / permanent-lifeline / port check, any
+destination that names a control-plane host (`control-plane`, `control-plane-ui`)
+or resolves into the control-net subnet (`172.31.0.0/24`) — see
+`_forbidden` in `proxies/egress/addon.py` (`EGRESS_FORBIDDEN_HOSTS` /
+`EGRESS_FORBIDDEN_CIDRS`). Because the guard is checked first and never weighed
+against policy, no rule, human approval, or change to the port allowlist can widen
+it, and a public name whose DNS is pointed at control-net is caught by the
+resolve step. This makes the CLAUDE.md invariant ("the agent must never reach the
+control plane") independently enforced at the one place segmentation cannot cover;
+`boundary-check.sh` asserts the proxy 403s both a control-plane host and a literal
+control-net IP.
 
-  Image sizes from the same run: `claude-sandbox` 1.2GB, `opencode-sandbox` 1.23GB,
-  `dockade-egress-proxy` 255MB, `dockade-control-plane` 142MB, `dockade-control-plane-ui`
-  143MB. Worth knowing that tier 2 is **not** the smaller image despite being the
-  thinner *tier* — "thin client" describes where inference runs and what capability it
-  holds, not the size of the toolchain both tiers inherit from `sandbox-common`.
-- **DONE — `control-plane-ui` frontend split** (step 2b-2; see Build status).
+The same guard also hard-blocks the **private / special-use ranges** —
+cloud-metadata / link-local (`169.254.0.0/16`), loopback (`127.0.0.0/8`), RFC1918
+(`10/8`, `172.16/12`, `192.168/16`), `0.0.0.0/8` (`connect(0.0.0.0)` reaches
+localhost on Linux — loopback under another spelling), CGNAT/overlay
+(`100.64.0.0/10`), protocol-assignment and benchmarking (`192.0.0.0/24`,
+`198.18.0.0/15`), and multicast/reserved/broadcast (`224.0.0.0/4`, `240.0.0.0/4`),
+plus their IPv6 equivalents — via a
+separate `EGRESS_PRIVATE_CIDRS` set (`_forbidden`, checked before policy). The
+proxy's default route is egress-net, a masquerading bridge with a path to the
+cloud instance-metadata service (a credential-theft target), the Docker host, and
+the host's internal network; without a hard block, reaching those would rest
+solely on the default-deny allowlist, so a single mistaken rule or human approval
+could turn the proxy into an SSRF pivot. The proxy's only legitimate upstreams are
+public hosts (sibling data-plane services are reached by the agent *directly* on
+sandbox-net, never through the proxy), so blocking every private range costs
+nothing; RFC1918 `172.16/12` also transitively covers control-net and sandbox-net.
+Kept a *separate* env from `EGRESS_FORBIDDEN_CIDRS` so the control-net guard's
+fail-closed startup assertion stays specifically about control-net. Override
+`EGRESS_PRIVATE_CIDRS` (narrow, don't empty) only for a deployment that
+legitimately proxies to a private target such as an internal package mirror.
+`boundary-check.sh` asserts the proxy 403s `169.254.169.254`.
 
-### Clear future improvements
-- Dedicated git proxy that speaks the git protocol (block force-push, restrict
-  branches, per-repo policy) instead of HTTPS-through-egress.
-- Separate test/build runner containers for isolation + parallelism.
-- Selective MITM on credentialed hosts → true brokering so even self-use keys
-  leave the sandbox.
-- Docs mirror / offline docs tool.
-- Progressive auto-approval driven by accumulated policy + audit history.
-- **Rule MUTATION / revocation on the control plane** (listing is done — see "Standing
-  policy" below — and so, now, is choosing what a persist writes). Rules can be
-  GRANTED — a `*_persist` resolution writes one — but still never edited or removed:
-  there is no mutating rule endpoint, and the seed file is re-read only when the table
-  is empty, so a mistaken persist is permanent short of hand-editing SQLite in the
-  volume. **This is now the whole of the item.** The two sharp edges it used to carry
-  have moved: the agent-controlled-pattern one is closed (`_persist_candidates` derives
-  a bounded set and `resolve` validates against it — see "A `+ persist` says what it
-  will write"), and the `INSERT OR IGNORE` wart, where `deny_persist` silently writes
-  nothing for an existing pattern while still reporting `persisted: true`, is now
-  reachable only when the *same* pattern was chosen twice and is covered honestly by
-  the card's wording. A governance plane that can grant but not revoke is still
-  incomplete, and revocation is the remaining half.
-- **Human-presence on approval (WebAuthn user-presence, or an out-of-band confirm).**
-  The *only* thing that closes host-local forgery of an approval — see the
-  browser-facing-guards note under "Frontend split". Worth building for that
-  specific threat (the agent reaching host execution via the workspace mount), not
-  because "the UI has no auth"; naive auth does not help, since any credential at
-  rest on the host is readable by the same process.
-- **Approval-UI follow-ups (reviewed and specified, not built).** From the same review
-  that produced the reconnect / CSP / keyed-rendering work above, in value order. The
-  top two — the hold countdown and the persist preview/confirm with an operator-chosen
-  pattern — are **now built**; see "The card shows its deadline" and "A `+ persist` says
-  what it will write" under the frontend section. What remains:
-  - **A DOM-level test for `start()`, and a decision about how.** The frontend's testing
-    strategy — pure decision helpers under node, DOM work left to cross-file guards — was
-    right when `start()` only rendered a list. It now holds a confirm-panel state machine,
-    a countdown, and per-card sweep timing, and the evidence that the strategy has been
-    outgrown is concrete: mutation testing over the last two changes caught every mutation
-    inside a pure helper and **none** inside `start()`. Two honest options, and the choice
-    matters more than the work: a hand-rolled stub DOM (what was used throwaway here —
-    cheap, no dependencies, but largely asserts its own shape), or a real headless browser
-    (truthful, but a Node dependency and a CI browser install, against a repo that keeps
-    its test suite dependency-free on purpose). A third possibility is to keep shrinking
-    `start()` by extracting more decisions into pure functions, which is what has happened
-    organically so far and has a ceiling.
-  - **The decisions table drops data the backend already sends** (`stage` is selected
-    and never rendered; `client` is not selected at all, though this control plane is
-    shared across sandboxes), stamps rows time-only so 40 rows read out of order across
-    midnight, has no empty state, and encodes the decision by colour alone.
-  - **Saturation is invisible.** Over `CONTROL_MAX_PENDING(_PER_CLIENT)` `/authorize`
-    fails closed and the agent just gets denies — governance degraded, visible only as a
-    reason string. Wants a banner plus an `n/16 holds` counter.
-  - **Collapse duplicate holds by host.** Retrying clients routinely produce several
-    holds for one host, so one decision costs four clicks and can fill the per-client
-    cap; grouping also sidesteps the `INSERT OR IGNORE` wart where a second
-    `deny_persist` writes nothing while reporting `persisted: true`.
-  - **Opt-in desktop notification.** `http://localhost` is a secure context, so the
-    Notification API is available; with a ~120s fuse and a page nobody watches, this is
-    the honest fix for the problem the `(n)` title prefix only mitigates.
-  - Smaller: `/status` is on the relay allowlist but unused (allowlists rot — use it or
-    drop it); `_STRIP_REQ` should also strip `content-length` / `transfer-encoding` /
-    `connection` / `expect`; audit and rules poll failures are swallowed, so those views
-    can show stale data while `conn` still reads "live"; no `aria-live` on the pending
-    list; both pollers run at 4s even in a hidden tab.
-- Normalize hosts consistently across the control plane. The proxy's relay guard
-  strips a trailing FQDN dot but `_decide` / `_match` only lowercase, so `evil.com.`
-  misses a persisted **block** rule and lands in a hold instead — fail-safe, but it
-  lets an explicit operator denial be re-prompted indefinitely.
-- **Split the control-plane API surface to cap the blast radius of any relay-guard
-  bypass (planned).** The egress proxy only ever needs `/authorize` (+ `/healthz`);
-  the *dangerous* surface is the management API (`/approvals`, `/approvals/{id}/
-  resolve`, `/api/audit`), because `resolve` lets a caller approve held egress —
-  i.e. self-approve. Today the agent is kept off all of it by three layers: network
-  topology (no control-net route), the egress proxy's relay guard (`_forbidden`),
-  and the local port gate (control plane on `:8090`, while CONNECT/HTTP are gated to
-  `:443`/`:80`, so even a DNS-rebound name is dialed on a port nothing serves). The
-  relay guard's resolve branch is best-effort (TOCTOU/rebind, resolution failure),
-  so the robust improvement is to make a *bypass* non-catastrophic rather than to
-  keep hardening the guard: **serve the proxy-facing `/authorize` and the
-  human-facing management API on separate ports, and give the proxy a route only to
-  the `/authorize` port** (e.g. a dedicated proxy↔backend network carrying only
-  authorize; the management port reachable solely from `control-plane-ui`). Then
-  even a total relay-guard bypass can, at worst, *query* a policy decision — it can
-  never approve a hold or read the audit store. This addresses the impact
-  (self-approval) instead of racing the mechanism (DNS), and composes with the
-  topology refinement noted under "why two control nets" (the proxy comes off the
-  broad `control-net` so it also has no route to future control-net tenants — the
-  git/secrets brokers). Pairs with a `boundary-check.sh` assertion that the proxy
-  can reach the authorize port but **not** the management port. See the
-  "Control-plane relay guard" note under Build status for the guard this backstops.
+*A destination, not a string — spelling normalization (fixed bug, keep the
+regression tests).* Both hard-blocked sets are lists of **IP ranges**, but what
+arrives is a **hostname field**, and the two are only equivalent after
+normalization. The guard therefore lowercases, strips a trailing FQDN dot, strips
+the brackets an IPv6 literal wears in an authority (`[::1]`), and — the part that
+was missing — folds the IPv6 forms that carry an **embedded IPv4 address** down to
+the v4 address they actually dial: v4-mapped (`::ffff:a.b.c.d`), the deprecated
+v4-compatible (`::a.b.c.d`), NAT64 (`64:ff9b::/96`) and 6to4 (`2002::/16`); see
+`_embedded_ipv4` / `_blocked_cidr`. Without that fold, `::ffff:169.254.169.254` was
+**the metadata service under a spelling neither deterministic branch recognized**
+— `ipaddress` containment never crosses address families, so it matched none of
+the v4 ranges, and the resolve branch was no help because `getaddrinfo` returns the
+same mapped form straight back, while `connect()` on a v4-mapped address delivers
+to the v4 host. It was reachable in practice because metadata serves on `:80`,
+already a permitted HTTP port; only the host policy's default-deny stood behind
+it, which is exactly the "one mistaken rule or approval" case this guard exists to
+remove. Teredo (`2001::/32`) is deliberately *not* folded — its embedded v4 is the
+client's own NAT, not a destination anything delivers to. The fold is precise
+rather than a blanket v6 ban: `::ffff:8.8.8.8` still goes to policy like any other
+host. `boundary-check.sh` now probes the **mapped** spelling of both control-net
+and metadata alongside the dotted-quad ones — the dotted-quad probes passed
+throughout this bug, so they cannot catch its return.
 
-## Networks
+*Defense-in-depth, not the sole control — and honest about the resolve branch.*
+The hostname and literal-IP checks are **deterministic** (decided from the request
+alone); the resolve branch is **best-effort** — it depends on a DNS lookup, so it
+carries a TOCTOU/rebind gap (mitmproxy re-resolves when it dials) and can be
+skipped on resolution failure (logged, returns "not forbidden" — safe, because an
+unresolvable name is also undialable, and reaching the control plane is prevented
+first by topology and by the port gate: the control plane listens on `:8090` while
+CONNECT/HTTP are gated to `:443`/`:80`, so a rebound name is dialed on a port
+nothing serves). To keep the guard from being *silently* disabled by
+misconfiguration, `load()` calls `_assert_guard_configured()`, which **fails
+closed at startup** (refuses to run) if `EGRESS_FORBIDDEN_CIDRS` is empty — an
+empty CIDR set would drop both the literal-IP and resolve branches, leaving only
+exact-hostname matching. The durable fix for the residual rebind gap is not to
+keep hardening the DNS check but to **cap the blast radius of any bypass** by
+splitting the control-plane API surface so a reached backend can only *query*
+`/authorize`, never self-approve via the management API — see the API-surface-split
+item under "Future improvements". The call runs in a worker thread
+so it never blocks mitmproxy's event loop, and the egress image gains no new
+dependency. The canonical allow policy now lives at `policies/egress-allowlist.txt`
+(the control plane seeds SQLite from it on first boot, idempotently); the proxy
+no longer bakes or reads an allowlist file.
 
-- `sandbox-net` (`internal: true`) — sandbox ↔ all data-plane services (governed
-  + ungoverned). The agent lives only here.
-- `control-net` (`internal: true`) — governed proxies/tools ↔ control plane.
-  Sandbox not attached.
-- `egress-net` — only outbound-capable governed proxies + internet.
-- `control-ui-net` — non-internal bridge carrying ONLY the control-plane-ui
-  frontend's host-loopback UI publish; masquerade disabled so it is
-  host-reachable but not an egress path. Needed because Docker cannot publish a
-  host port from a container that is on an internal network alone. Sandbox not
-  attached.
+### Control plane — policy, audit, hold-for-approval
 
-**Status:** all four networks are implemented. `sandbox-net` (internal) and
-`egress-net` carry the agent and the sole egress; `control-net` (internal)
-carries the control path. The egress proxy is **triple-homed** (sandbox-net
-+ egress-net + control-net). The control-plane **backend** is on `control-net`
-only and fully internal (no `sandbox-net`, no `egress-net`, no published port);
-the **control-plane-ui** frontend is on `control-net` (to reach the backend)
-plus `control-ui-net` (host-loopback UI). The sandbox is on `sandbox-net` only —
-never `control-net`/`control-ui-net` (asserted by `make check` and
-`boundary-check.sh`).
+**The backend and its isolation** (`control-plane/` + `control-net`). The
+governance authority now exists as a service the **agent cannot reach**: it is
+not on `sandbox-net`, so the sandbox has no route to it (`boundary-check.sh`
+probes the control plane's fixed control-net address and asserts it is
+unreachable from the sandbox; `make check` asserts the launcher never attaches
+the sandbox to `control-net`/`control-ui-net`). In 2a it sat on `control-net`
+(internal) for the proxy control path and on `control-ui-net` for the human UI;
+since 2b-2 the backend is `control-net`-only and the UI frontend carries
+`control-ui-net` (see below).
+That UI bridge is non-internal **by necessity** — Docker cannot publish a host
+port from a container that is on an internal network alone — but has masquerade
+disabled, so it carries the loopback UI publish without being an egress path.
+The control plane is a small FastAPI app over a SQLite policy+audit store (its
+own named volume — the crown-jewel state); the management surface reaches the
+host as **loopback only** (`127.0.0.1:8081`), published since 2b-2 by the UI
+frontend rather than the backend.
 
-### DNS on `sandbox-net` (a non-obvious gotcha — read before touching DNS/firewall)
+*Design note — why two control nets, and the frontend split.* `control-net` stays
+hard-`internal` because it is the **shared** control path for the whole governed
+data plane (egress proxy today; git/secrets proxies later), and egress is granted
+**only** by `egress-net` membership — a non-internal `control-net` would silently
+hand ungoverned egress to every service on it (see "Networks"). Publishing a host
+port, though, forces *some* non-internal surface, so `control-ui-net` quarantines
+it to a single-member bridge. Honest caveat: before 2b-2 — when the backend
+itself carried `control-ui-net`'s soft-egress surface — the split's security
+gain was ~nil, and collapsing to one non-internal `control-net` would have been
+observably equivalent; but that would have baked in a non-internal shared
+control path that becomes a real hole the moment a must-stay-egress-free tenant
+(secrets broker) joins. Keeping the split was cheap insurance against that
+footgun. **Done in 2b-2:** the UI is now a **distinct
+`control-plane-ui` frontend container** (its own lifecycle) that depends on the
+`control-plane` backend and talks to it over `control-net`. The frontend owns the
+`control-ui-net` non-internal surface; the backend is now `control-net`-only and
+fully `internal`, so the crown-jewel container has **zero non-internal exposure**
+— the split now buys something concrete, not just future insurance. This is
+deliberately a **separate service**, not a co-located sidecar: the frontend is a
+stateless reverse proxy + static server (FastAPI + httpx), holds no state, and no
+governance decision depends on it (the egress proxy calls the backend directly).
 
-Putting the sandbox on a *user-defined* network (which we do, and must — it's how
-data-plane services get name resolution) changes DNS in two ways that together
-broke the agent, and the fix spans both the launcher plumbing (`sandbox-lib.sh`)
-and `init-firewall.sh`. The chain, so nobody has to rediscover it:
+The egress proxy is now a **control-plane client** rather than a static-allowlist
+enforcer: on every connection it calls `POST /authorize {host, ...}`, which
+returns the decision **and** records the audit row in one call — so policy and
+audit share the round-trip, there is no client-side cache (an operator rule edit
+applies to the very next connection), and there is no separate audit channel.
+Two deliberate properties: (1) the **permanent lifeline** (Anthropic API/auth)
+is allowed by a *local* check in the proxy *before* the control plane is
+consulted, so a control-plane outage never bricks the agent's own API; (2)
+everything else **fails closed** — if the control plane is unreachable or times
+out, the request is denied and audited locally.
 
-1. **Embedded resolver.** On a user-defined network the container's `resolv.conf`
-   is always `127.0.0.11` — Docker's embedded DNS. It answers sibling-container
-   names itself and **forwards** everything else to an upstream. (On the *default*
-   bridge there is no embedded resolver; `resolv.conf` holds real IPs directly.
-   That's why "drop `--network` and it works" appears to fix things — it sidesteps
-   all of this, at the cost of the isolation `sandbox-net` exists to provide. Not
-   an acceptable fix.)
+**Hold-for-approval.** An unmatched host is no longer denied
+outright: `_decide` returns **`hold`**, and `/authorize` records a pending
+approval and **blocks** the request until a human resolves it or
+`CONTROL_HOLD_TIMEOUT` (default 120s) elapses → default-deny. The proxy is
+unchanged except for a longer authorize timeout to cover the wait — it still
+sees only allow/deny (the hold is internal to the control plane). A human
+resolves holds in a **live SSE UI** served at `/`: **allow-once / deny-once**
+(this request only) or **allow-persist / deny-persist** (also writes a rule so
+future connections skip the hold — the progressive-trust path). Concurrency:
+one uvicorn worker; a held request blocks its threadpool worker on a
+`threading.Event` the resolve endpoint sets; SQLite (`approvals` table) is the
+UI's source of truth; stale `pending` rows are expired on startup. **Holds are
+bounded** (`CONTROL_MAX_PENDING`, `CONTROL_MAX_PENDING_PER_CLIENT`): since each
+hold pins a threadpool worker and this control plane is **shared across all
+sandboxes**, an unbounded queue would let one agent exhaust the pool and stall
+every sandbox's governed egress. Over either cap, `/authorize` fails **closed**
+(deny) immediately instead of registering another blocking hold — the cap stays
+comfortably under the worker pool so fast allow/deny decisions always have free
+workers, and the permanent lifeline is unaffected (it never reaches the control
+plane).
 
-2. **The upstream it auto-selects is often unreachable from the container.** The
-   embedded resolver derives its upstream (`ExtServers`) from the *host's*
-   `/etc/resolv.conf`. On any systemd-resolved host — most WSL2/Docker Desktop
-   setups, much stock Linux, anything on a split-DNS VPN — that file is just the
-   stub `127.0.0.53`, which is meaningless inside the container. Result: **every
-   external lookup `SERVFAIL`s, with or without the firewall.** This is generic
-   Docker behavior, not a broken host (host DNS and the default bridge both work).
-   Fix: the launcher (`sandbox-lib.sh`) pins the upstream explicitly with `--dns`, sourced
-   from the host's real uplink resolvers (`/run/systemd/resolve/resolv.conf`),
-   falling back to public `8.8.8.8/8.8.4.4`, overridable via `SANDBOX_DNS` for
-   locked-down networks. `resolv.conf` stays `127.0.0.11`, so service discovery is
-   preserved.
+### Approval UI — the one surface that can grant egress
 
-3. **The firewall must not break the resolver, and must permit its forward.** Two
-   traps in `init-firewall.sh`:
-   - It must **not flush the `nat` table** — Docker's embedded-DNS `DNAT` lives
-     there, and flushing it kills all resolution *before* default-deny even arms.
-     (An earlier save/restore dance tried to undo this; it's unreliable under the
-     nf_tables iptables backend. Simpler and correct: leave `nat` alone. `nat` is
-     not a containment boundary — egress is governed entirely in the `filter`
-     table.)
-   - The embedded resolver's upstream forward **egresses the `filter` OUTPUT
-     chain**, so in STANDALONE mode those same upstream IPs must be whitelisted on
-     port 53 (passed in as `UPSTREAM_DNS`) or runtime DNS dies the instant
-     default-deny arms. (Governed mode blocks that forward on purpose — proxied
-     tools hand the hostname to the proxy — and allows only the embedded resolver
-     itself, which still answers sibling names.)
+**Why the frontend is a separate container.** The approval UI and the API/SSE relay
+now live in a distinct **`control-plane-ui`** container (FastAPI + httpx: serves
+the static UI at `/`, reverse-proxies everything else — including the SSE stream
+— to the backend over `control-net`). The **backend is now `control-net`-only
+and fully `internal`**: no published port, no non-internal surface, nothing to
+exfiltrate even if reached. The frontend carries the sole host-facing surface
+(`control-ui-net`), holds no state, and is not on `sandbox-net`. Browsers hit
+`http://localhost:8081` → frontend → backend; the egress proxy still calls the
+backend's `/authorize` directly. See the step-2a design note for the rationale.
 
-`sandbox-lib.sh` computes the resolver list **once** and uses it for both
-`--dns` (the resolver's upstream) and `UPSTREAM_DNS` (the firewall allow-list), so
-the two can't drift apart. Containment is unaffected: `--dns` only sets an
-upstream, DNS is still pinned to *named* resolvers (no "any nameserver" hole), and
-egress remains filter-table default-deny plus the mode's allowlist (ipset in
-standalone; proxy-only in governed).
+**Browser-facing guards on the frontend (and their honest limit).** The frontend
+publishes the only API that can GRANT egress — `POST /approvals/{id}/resolve` is
+self-approval if reached — on host loopback, with no auth. Loopback binding is not a
+defense against **DNS rebinding**: a page the operator visits can point its own name
+at `127.0.0.1`, at which point it is *same-origin* with the frontend, so there is no
+preflight and responses are readable — it can list the pending approvals (obtaining
+the `uuid4` ids a blind attacker cannot guess) and resolve them. That, not CSRF, is
+the vector that matters here; plain CSRF is largely self-blocking, because a JSON
+body forces a preflight that fails for want of CORS headers and `resolve` needs an
+unguessable id. Three structural guards now sit in front (`control-plane-ui/app.py`):
+
+- **Host allowlist** (`CONTROL_UI_ALLOWED_HOSTS`, default `127.0.0.1,localhost,::1`)
+  — closes rebinding. Rebinding *requires* the attacker's own name in `Host`, and
+  `Host` is a forbidden header JS cannot set, so this removes the attack class
+  rather than raising its cost. Compared without the port on purpose: the port is
+  irrelevant to the guard, and ignoring it keeps one list valid for both the
+  published `:8081` and the in-container healthcheck's `:8090`. Import fails closed
+  on an empty list (`_assert_host_guard_configured`, mirroring the egress addon).
+- **Cross-origin state changes refused** — `Sec-Fetch-Site` when present, else
+  `Origin`; both absent means no browser is calling, so there is no CSRF to stop and
+  refusing would only break scripting. Belt-and-braces for a future endpoint that is
+  less lucky than the current ones.
+- **Relay path allowlist** — only the paths the UI actually uses are proxied. The
+  backend surface is not uniformly browser-appropriate: reaching `POST /authorize`
+  from a page means forged audit rows and consumed hold slots on the governance
+  authority. The old catch-all `/{path:path}` relayed it.
+- **Refusal to be embedded** — closes **clickjacking**, which is the gap the first
+  three guards structurally cannot see, and it was open until now. An attacker page
+  that frames `http://127.0.0.1:8081` produces a request with a perfectly legitimate
+  `Host: 127.0.0.1` (guard 1 satisfied) by GET, which is deliberately allowed
+  cross-origin (guard 2 does not apply) — and the framed document's own `resolve`
+  POST then reads as `Sec-Fetch-Site: same-origin`, because from inside the frame it
+  genuinely is. Cross-origin *reads* stay blocked throughout, but a UI-redress attack
+  needs no read: overlay a decoy on the invisible frame and the operator's click
+  lands on the real "Allow + persist rule" button, granting standing egress. The
+  unguessable `uuid4` id that defeats a blind CSRF is no help either — a click does
+  not need to know it. Closed by `frame-ancestors 'none'` in the CSP below, plus a
+  `Sec-Fetch-Dest: iframe|frame|embed|object` refusal in `_guard`; the second is not
+  redundant, it makes the attempt a 403 in *this app's* log rather than a message in
+  the operator's browser console, which is the visibility this repo falls back on
+  wherever prevention is browser-dependent.
+
+**Security headers on every response, and why the script became a file.** A
+`_security_headers` middleware sets a Content-Security-Policy (plus `X-Frame-Options`,
+`nosniff`, `no-referrer`) on everything this app serves, refusals included — it is
+registered *after* `_guard`, which under Starlette makes it the **outer** middleware,
+so a refused framing attempt is itself delivered under the policy. The policy is
+`default-src 'none'` naming only what the page uses, and it is applied by assignment
+rather than `setdefault` because relayed backend responses pass through it and an
+upstream header must not be able to weaken the frontend's policy.
+
+The directive that shaped a file move is `script-src 'self'`. The page's behaviour used
+to be inline in `index.html`, which would have forced `'unsafe-inline'` and reduced the
+whole policy to decoration — on the one page that renders **agent-controlled** strings
+(the requested host, url and client on each approval card). So the script now lives in
+`control-plane-ui/app.js`, served from this origin (never a CDN, for the same reason the
+favicon is an inline data URI: a governance UI must not fetch its own control logic from
+a third party). The payoff is doubled: it also made the frontend testable for the first
+time. Because that invariant spans two files and re-inlining would break nothing
+*visible*, a test asserts the page carries no inline script or event handlers, and
+another asserts every `getElementById` in `app.js` matches an id that exists in
+`index.html` — the split's new failure mode is a renamed id, which is a `null`
+dereference that would otherwise appear only in a browser.
+
+**The stream had no reconnect, and said otherwise.** The page treated every
+`EventSource` error as transient. It is not: an `EventSource` retries *by itself* only
+from `CONNECTING`, and a non-200 response or wrong MIME type puts it in `CLOSED`
+**permanently**. That state was reachable in ordinary operation — the relay had no
+exception handling, so a backend restart made `httpx.ConnectError` a 500, the browser
+gave up for good, and the status line went on reading "reconnecting…" while the page was
+blind until someone reloaded it. Being blind is the exact failure the traffic light was
+built around (an unseen hold default-denies after `CONTROL_HOLD_TIMEOUT`), so this was
+the most consequential defect in the UI. Fixed at both ends: the relay answers a clean
+**502** on any `httpx.RequestError`, and `app.js` reconnects by hand from `CLOSED` with
+doubling backoff (1s → 30s cap, no jitter — jitter de-synchronises a fleet, and this
+page has one operator, so determinism is worth more and makes the delay assertable),
+reporting `retrying in Ns` instead of a comforting lie.
+
+**The approvals list is keyed, and does not move under the cursor.** Rendering was an
+`innerHTML` assignment of the whole list on every push, up to once a second. A hold
+expires on its own after ~120s, so a card leaving the *middle* of the queue shifted
+every card below it upward — between the operator's eye and their click, on a row of
+buttons that **grant egress**. It also discarded the `disabled` state a resolve in
+flight had just set. Cards are now created once, keyed by approval id, and updated in
+place (`diffPending`); an unchanged push is a no-op. A card that leaves the queue
+without the operator deciding it is marked **stale in place** with the reason rather
+than yanked out, and swept only when removal cannot move a button under the pointer —
+nothing in the list hovered or focused — with a 15s cap so a parked cursor cannot freeze
+the list.
+
+That gating turned out to have a hole, found by asking how to *test* the expiry marker
+rather than by reading the code: "removal cannot move a button under the pointer" is
+true immediately whenever the cursor is **outside** the list, so a stale card was swept
+on the next 1s tick. The `expired — default-denied` message — the one departure that
+reports a governance failure — was therefore on screen for about a second, readable only
+by an operator who happened to be hovering. So `shouldSweep` gained a **minimum dwell**
+that hover cannot shorten (`DWELL_MS`: 60s expired, 8s resolved, 5s resolved-elsewhere),
+ordered by how much each matters. An expiry gets long enough to read; a resolve less,
+because the operator performed it but may move the mouse away before reading the
+confirmation (the same bug, and the only reason the outcome message *appeared* to work
+is that clicking leaves the pointer inside the list); a card resolved elsewhere least.
+Not longer, because stale cards would then compete with real pending holds on what is
+fundamentally a work queue — the Decisions tab is the durable record.
+
+Two smaller corrections came out of mutation-testing that fix: a `Math.max(STALE_MAX_MS,
+dwellMs)` on the cap line was **dead logic** (the floor check above already guarantees
+`ageMs >= dwellMs`) with a comment claiming it was load-bearing, which is worse than not
+having it; and `markStale` now takes the whole `{text, dwellMs}` that `departure()`
+returns rather than the two as separate arguments, so the message and how long it stays
+readable cannot be passed apart — omitting the dwell would have silently given an expiry
+the 5s treatment with nothing failing. Cards are built with `createElement`/`textContent` rather than an HTML string,
+so for the one list that renders agent-controlled values the question of whether `esc()`
+covers every context does not arise.
+
+**A resolve now reports itself.** Previously the only feedback was the card vanishing on
+the next SSE tick, so with the feed down — precisely the state above — a successful
+approval was indistinguishable from a hung click, and errors arrived as a blocking
+`alert()`. The card now shows `✓ allowed · standing rule: .example.com` (or
+`· this request only`) inline the moment the POST returns, keeps its buttons disabled,
+and on a `409` says so specifically — "no longer pending" is a different fact from a
+failure, and re-enabling the buttons would only invite a second failing click. The
+pattern in that line comes back from the *backend* rather than being reconstructed from
+the click, so it reports what was **stored** — which is also the exact string an
+operator would have to go and delete by hand.
+
+**The card shows its deadline (`GET /api/config`).** A held request *blocks the agent*
+and is **default-denied** when `CONTROL_HOLD_TIMEOUT` elapses, and that deadline was
+the one thing the card could not say: it showed a static `requested 14:32:05` and then
+disappeared, so 100 seconds left and 4 seconds left looked identical. Without it the
+difference between hold-for-approval and a slow deny is invisible from the interface
+built to govern it. The backend now exposes the window (a deliberately narrow
+read-only view of non-secret config — `{"hold_timeout": 120.0}`, on the relay
+allowlist), and each card carries `expires in 43s` plus a depleting bar, called out in
+red under 20s. Three details are load-bearing rather than cosmetic:
+
+- **Two clocks, so both ends are clamped.** `ts` is the backend's `time.time()` and
+  `now` is the browser's. They agree in the intended deployment — both are the
+  operator's host — and where they don't, `holdRemaining` clamps to `[0, holdTimeout]`
+  so a skewed clock makes the countdown *wrong* rather than absurd (never negative,
+  never longer than the whole window, and the bar can never exceed 100%).
+- **Zero says `expiring now`, not `expired`.** The backend's clock decides, so a click
+  at zero may still land; if it doesn't, the existing `409` path reports that honestly.
+  Claiming expiry here would be the UI asserting an outcome it cannot know.
+- **A departing card now says which way it went.** Expiry is a governance outcome — the
+  agent was denied because nobody looked in time — while a card leaving with time on
+  the clock means something else resolved it or the control plane restarted. Both used
+  to read as the same hedged sentence; `goneReason` distinguishes them, and falls back
+  to the hedge when `/api/config` is unreachable, because then we genuinely cannot
+  tell. The whole feature fails soft: no config, no countdown, page otherwise
+  unaffected.
+
+**A `+ persist` says what it will write, lets you choose it, and asks twice.** This one
+closes a sharp edge, not just a UX gap. `resolve` used to store the **requested host
+verbatim** as the rule pattern, and two facts made that worse than it looks: a leading
+dot is a *subdomain wildcard* in `_match`, and the host on an approval is chosen by the
+**agent** — so a request for `.example.com` turned one click into a standing rule over
+every subdomain, permanently, since nothing in this system revokes a rule.
+
+The fix puts the pattern under the operator's control and out of the requester's.
+`_persist_candidates(host)` derives a **bounded set** in the backend, beside the
+`_match` it must agree with: the exact host, `.host`, and `.<last two labels>` (the
+registrable domain, which is what one usually wants when a service spreads over many
+hostnames) — narrowest first, so the default is the safest. Leading dots, trailing FQDN
+dots and case are normalized away, IP literals get no wildcard at all (`.1.2.3.4` is
+nonsense), and a one-label wildcard is never offered because `.com` as a standing allow
+rule would end governance for an entire TLD in one click. `ResolveRequest` gained an
+optional `pattern`, **validated against that set server-side** and refused with a `400`
+*before* the conditional UPDATE — so a rejected pattern neither resolves the hold nor
+consumes it, and the operator can choose again rather than losing the approval to a
+race they didn't cause. The candidate list travels with each pending approval, so the
+UI offers exactly what the backend will accept instead of reimplementing the derivation
+in JavaScript and drifting into offering a pattern that then 400s.
+
+On the card, both `*_persist` buttons now open a confirm panel — justified by
+**irreversibility rather than risk**: undoing a mis-click means hand-editing SQLite in
+a named volume. It names the pattern verbatim in a `<code>` (not described — exact-host
+and whole-subtree differ by one dot, and that dot *is* the grant), offers the
+candidates in a select, shouts specifically about a wildcard ("covers … and every
+subdomain of it, including hosts nothing has requested yet"), and labels its own button
+`Confirm — allow .example.com from now on`. It sits **below** the action row, which
+stays exactly where it was: if the confirm button appeared where the pointer already
+is, a double-click on "Allow + persist rule" would sail straight through the
+confirmation it had just opened — the same concern that drove keyed rendering. The
+action row is disabled while the panel is open, so the only live buttons are Confirm
+and Cancel, and Escape backs out.
+
+Known limitation, stated rather than hidden: with no public-suffix list the two-label
+suffix of `example.co.uk` is `.co.uk`, which grants far more than it appears to. That
+is exactly why the operator picks and why the pattern is shown verbatim in a step where
+it is still reversible. The audit trail also learned to say whether policy changed at
+all — the reason now reads `human approval (standing rule written) [peer=…]` vs
+`(this request only)`, from the durable `mode` column. Naming the *pattern* there would
+need a new column on `approvals`, which has no migration step (see the NOTE above
+`_seed_if_empty`); the rule itself is recorded with its pattern and `source='operator'`
+in the rules table, and every later use of it is audited as `allowed by rule (…)`.
+
+**The frontend's own tests.** `tests/test_control_plane_ui_js.py` runs the pure helpers
+under `node` (skipped when node is absent, the way `make lint` skips a missing linter)
+and asserts in Python, so failures read like the rest of `tests/`. It covers the lamp
+precedence (blind outranks busy), the backoff bounds and monotonicity, the keyed-diff
+properties, the sweep gating, the countdown arithmetic (including the clock-skew clamps
+and the `expiring now`-not-`expired` wording), the expiry-vs-resolved-elsewhere
+distinction, and the persist preview's wildcard flag. Everything that touches the DOM
+lives inside `start()`, which runs only in a browser — so requiring the module under
+node must be side-effect free, and the test asserts that too: if DOM work migrates to
+the top level, `require` throws and the file cannot quietly become untestable again.
+
+Two cross-file guards cover couplings that have no compiler between their ends. The
+first asserts every `getElementById` in `app.js` matches an id in `index.html`. The
+second asserts **every path the page `fetch`es is either served here or on the relay
+allowlist** — the deliberately narrow allowlist is what keeps `POST /authorize`
+unreachable from a browser, and the cost of that narrowness is that adding a call
+without adding its route yields a 403 visible only to an operator loading the real page
+against a real backend. That is precisely how `/api/config` would have failed; the
+guard was verified by removing the route and watching it fail. The converse direction is
+deliberately not asserted — `/status` is still on the allowlist unused, and pruning it
+is a separate change.
+
+A third guard is source-level rather than behavioural: `shouldSweep`'s dwell floor
+defaults to `0`, so **dropping the argument at the call site** would restore the
+swept-in-a-second bug with every unit test still green, since they exercise the function
+directly. The call site is therefore asserted to pass a dwell. Ugly, and the honest
+alternative — making omission impossible — is what was done for `markStale` instead;
+`shouldSweep` keeps its primitive signature because that is what makes it cheap to
+assert at the boundaries.
+
+Still no browser-level test: `start()`'s DOM path is covered only by those guards. The
+card wiring (countdown, confirm panel, pattern select, dwell) was verified against a
+throwaway stub DOM under node — enough to catch a typo in the plumbing — and not kept,
+because a hand-rolled DOM stub is a maintenance liability that would mostly assert its
+own shape. **The cost of that choice is now measurable and worth stating**: mutation
+testing was run twice over this work, and every mutation inside a pure helper was caught
+while every mutation inside `start()` survived. The structural fixes above (pass the
+whole object, guard the call site) reduce what a mutation there can silently break, but
+they are mitigations for missing coverage rather than coverage. See the DOM-test item
+under "Future improvements".
+
+*What these cannot do.* They are **browser-enforced**. A process running on the host
+sets any header it likes and can still reach the API — and that is not hypothetical
+here, because the agent's RW workspace bind mount is an acknowledged (delayed) path
+to host execution (see the workspace guard in `sandbox-lib.sh`). **Authentication
+would not close it either**, which is the non-obvious part: any credential at rest
+on the host — token file, env var, browser cookie — is readable by that same
+process, so it adds friction and a secret to manage without changing the outcome.
+Closing host-local forgery requires a human-presence gesture the host cannot replay
+(WebAuthn user-presence on `resolve`, or an out-of-band confirm). That is a
+deliberate *later* decision, and it should be taken for this specific threat rather
+than for "the UI has no auth" in general. Ceiling worth stating plainly: while the
+bind mount exists and the approval surface must be reachable by a human who is on
+the host, no purely host-side control survives host code execution.
+
+**Three tabbed views, with badges carrying the hidden state.** Approvals /
+Decisions / Policy, selected by `location.hash` so a reload, a bookmark and the back
+button agree, with `role="tablist"` and arrow-key navigation. Tabs were a deliberate
+choice over one long page, and they come with a specific hazard that the badges exist
+to answer: two views are hidden at any moment, and one of them (standing policy) has
+**silent drift** as its failure mode — it accumulated unnoticed for weeks before it
+was surfaced at all, so putting it one click away could have re-hidden it. Therefore
+the Approvals tab carries a live pending count (amber when non-zero) and the Policy
+tab carries a rule count plus an **unseen marker** that appears when the rule set
+changes while another view is showing and clears only when the policy view is actually
+opened. Both feeds keep polling regardless of the active tab — otherwise a badge could
+not report a hidden view's state, which is the entire reason it is there. The change
+signature is over pattern+action rather than the row count, because a rule whose
+*action flipped* is the change most worth noticing and it leaves the count unchanged.
+A real view split for audit browsing (filter/search/history) is step 2c; this is the
+navigation it will extend.
+
+**Traffic-light favicon + title count.** An inline SVG data URI — never a file or a
+CDN reference, since a governance UI issuing an external request per page load would
+be both ironic and a needless third-party signal, and this way there is no extra route
+for the relay to allow. Three lamps map onto the three states that matter: **red** the
+SSE stream is down (we are not seeing pending approvals), **amber** something is
+waiting on a human, **green** connected and clear. All three lamps keep their **own
+colour at every state** and only the brightness moves (active at full opacity, the
+others at ~0.26): with the inactive lamps greyed out the icon is a dark rectangle
+carrying one small coloured dot and stops reading as a traffic light at 16px, which is
+the size that actually matters. The honest cost is that dim-to-bright is a weaker
+peripheral signal than grey-to-colour, so the title prefix carries most of the
+eye-catching load. `href` is only reassigned when the state genuinely changes —
+`updateIndicators` runs on every poll, and browsers treat each assignment as a fresh
+favicon load, so rewriting it ~15×/minute would be wasted work at best and a
+flickering tab icon at worst. Red for "blind" rather than for
+"denied" is the deliberate part: an unseen hold default-denies after
+`CONTROL_HOLD_TIMEOUT` (~120s), so not-receiving-updates deserves more alarm than
+being busy, and a stale green would be a lie. The pre-JS fallback in `<head>` is amber
+for the same reason — before the stream connects, "unknown" is the honest state, not
+"all clear". The tab title gains a `(n)` prefix so a **background** tab shows the
+count, which is the case that actually matters: `mcp-proxy.anthropic.com` expired
+unnoticed five times because nobody was watching the page.
+
+**Standing policy is visible in the UI (`GET /api/rules`).** The UI showed
+pending approvals and recent decisions but never the **rules** — the thing that
+actually decides every request. So answering "what have I permanently allowed?" meant
+`docker compose exec` plus SQL against the volume, and in practice rules accumulated
+across weeks unseen. Policy that is invisible drifts, and every `*_persist` approval
+writes to it, so the read-only view is the small half of the rule-management item and
+removes most of its risk. Three deliberate choices: **unpaginated**, because a
+silently truncated view of policy is worse than none (the opposite of `/api/audit`,
+which is capped precisely because it grows without bound); **blocks listed first**, so
+the listing reads in the same precedence order `_decide` applies rather than
+alphabetically; and the **match scope named in words** (`host + subdomains` vs
+`exact host`, derived by `_pattern_scope` beside the `_match` that implements it, so
+the frontend cannot drift from the real semantics) — because a leading-dot wildcard
+otherwise looks exactly like an ordinary hostname in a list. Read-only on purpose:
+this makes policy reviewable, it does not add mutation. `_pattern_scope` earns its
+keep twice over now — the same words label the candidates in the persist confirm step,
+so what an approval promises to write and what the policy view later shows it wrote are
+described identically.
+
+**Approval provenance — detection where prevention is not available.** Given that
+ceiling, the frontend and backend at least make a forged approval *visible*. The
+relay strips client-supplied provenance headers (`X-Dockade-Actor`,
+`X-Forwarded-*`, `Forwarded`, `X-Real-IP`) and re-adds `X-Dockade-Actor` with the
+peer address it actually observed; the backend's `_actor` records that on the
+approvals row (`resolved_by`) and carries it into the audit reason, so the log
+answers "who granted this egress" rather than merely "a human did". The labels keep
+trust levels apart: `peer=` is observed by the backend (but is the *relay* for
+anything via the UI), `via-ui=` is asserted by the relay, and `origin=` / `ua=` are
+self-reported and forgeable — recorded anyway because they are usually what betrays
+a non-browser caller. None of this was recorded before: an operator's click and a
+scripted POST were indistinguishable after the fact.
+
+*Schema note (read before adding a column).* `resolved_by` ships with **no migration
+step**, which is safe only because of a one-time circumstance: the single store that
+predated the column was migrated in place with `ALTER TABLE ADD COLUMN` before the
+migration code was removed, and every store created since gets the column from the
+`CREATE TABLE`. That is not a general pattern — `CREATE TABLE IF NOT EXISTS` is a
+no-op on an existing table and this store is a long-lived named volume that
+deliberately outlives container and image churn, so **the next additive column will
+need its own explicit `ALTER` for existing volumes**, or every statement naming it
+fails at runtime. The only alternative is `make destroy`, which discards the policy
+rules and the audit history — i.e. the crown jewels. See the NOTE in `_init_db`.
+
+Step 2c: audit *browsing* — filter/search/history beyond the live
+recent-decisions table the UI already renders — and the per-proxy config
+surface (rows accumulate from 2a).
+
+Not yet built: audit browsing beyond the recent-decisions table (2c),
+git/secrets/cache data-plane services, skills, quality-gate hooks.
 
 ## Startup ordering — "running" is not "ready"
 
@@ -1181,17 +1554,123 @@ control.
 - **No concrete first task yet.** The worker tier should not be designed further
   in the abstract.
 
-## Layout
+## Testing and CI
 
-See `README.md` → Layout for the current tree. Still-planned additions to it:
+**The unit suite is dependency-free on purpose** (`tests/`, run by `make test`).
+`fastapi` / `pydantic` / `mitmproxy` are stubbed in `tests/_loader.py` and SQLite runs
+on a throwaway temp file, so `python -m unittest` needs no pip installs and no running
+services — which is what lets the same gate run on a dev machine, in CI, and inside the
+sandbox image that bakes the linters. `make test` reports the current count; it is
+deliberately not restated here, because a number in prose only ever rots.
 
-```
-dockade/
-  tools/              # ungoverned data-plane services (cache, scratch DB, ...)
-  claude-sandbox/
-    skills/           # sanctioned capability + workflow interface
-    hooks/            # quality-gate hooks
-```
+What it covers is the **security-load-bearing decision logic**: the proxy's `_forbidden`
+relay guard, `_match`, the permanent-lifeline short-circuit, the mitmproxy hooks via
+`SimpleNamespace` fakes (CONNECT ordering, the SNI-vs-authority anti-fronting guard, the
+Host/`:authority` gate that catches a fronted header under an authorized CONNECT); and
+on the control plane `_decide`, the `authorize` orchestration including
+hold-timeout→deny, the resolve handshake, the persist-pattern candidate set and its
+server-side validation. Per-function detail belongs in the test names, which read as
+sentences for exactly that reason — `tests/` is the inventory, not this file.
+
+Two things are worth stating because the code shape depends on them. The **hold-cap
+reservation was extracted** out of the `authorize` handler into `_reserve_hold` /
+`_release_hold` (behaviour-preserving) purely so the cap logic could be asserted without
+the FastAPI machinery. And these are properties `boundary-check.sh` structurally cannot
+reach: it observes reachability from the sandbox's vantage point, so a hold-cap rejection
+— which returns the agent the same opaque `403` as any other deny — is invisible there.
+Deliberately untested surface is low-weight I/O: `_audit` sinks,
+`_post_authorize` / `_setup_audit_file`, and the SSE `approvals_stream`.
+
+**The CI gate runs the same `make` targets rather than reimplementing them**
+(`.github/workflows/check.yml`), so there is one definition of "does this repo pass" and
+a CI failure reproduces locally with `make check-strict`. Two parallel jobs — lint +
+consistency + tests (about a minute) and the five-image build verification — so a
+shellcheck typo is not queued behind an image build.
+
+**Strict mode is the part that makes the gate mean anything.** Every stage degrades to a
+SKIP when its tool is absent, which is right on a dev machine (running the checks you
+*can* run beats running none) and a trap in CI: a runner without hadolint prints `SKIP
+hadolint` and passes green, verifying less than the badge claims with nothing anywhere
+saying so — the same "silently checks nothing" failure the `LAUNCHERS` glob guard fails
+closed against. `DOCKADE_REQUIRE_TOOLS=1` turns every such skip into a failure. It lives
+in the **Makefile, not the workflow YAML**, because the Makefile already owns
+what-must-be-true and a requirement encoded only in CI is invisible to whoever runs the
+checks by hand. Verified in all four directions (docker, hadolint, node, all-present).
+
+**The tooling floats on purpose, so the workflow is built around that.** `ruff.toml`
+pins the rule *selection* and lets the binary drift; base images are pinned by tag, not
+digest. The accepted cost is that a green commit can go red with no code change, so a
+weekly schedule surfaces it on its own rather than ambushing the next pull request, and
+every tool's version is printed so a verdict traces to what produced it. Three
+consequences that are load-bearing rather than incidental:
+
+- **hadolint's version is *derived* from `claude-sandbox/Dockerfile`'s
+  `ARG HADOLINT_VERSION`**, not restated, and the step fails loudly rather than falling
+  back to `latest`. It is the one linter this repo pins, so CI and the image cannot
+  drift apart and a deliberate bump moves both.
+- **The linters install into a private `PIPX_HOME` under `RUNNER_TEMP`.** The runner
+  image ships its own pipx tools in a shared, root-owned `/opt/pipx`, where a plain
+  install silently no-ops (pinning the version to the image) and `--force` fails
+  outright. Ours cannot collide with either.
+- **A divergence is harmful when it produces surprise *after* a push** — not "CI should
+  be stricter". hadolint was harmful because CI was the stricter side, so the failure
+  could only appear post-push. shellcheck is the reverse (the local gate is newer, so it
+  catches first) and needs no pin. The interpreter gap is a positive: the services run
+  on `python:3.12-slim`, so CI tests closer to production than a dev machine on 3.13.
+
+**The build job earns its minutes.** Its first run found a bug unobservable locally:
+`run-opencode-sandbox.sh` was `100644` in the git index while `755` on disk, so it
+worked on the machine that wrote it and *any fresh clone* got exit 126. `core.fileMode=false`
+— which git sets automatically on a filesystem whose exec bit it cannot trust, i.e. the
+bind mount this repo is worked on through — is why nothing flagged it. `make consistency`
+now asserts every launcher is `100755` **in the index**; the full reasoning is in that
+guard's comment in the `Makefile`, next to the code it constrains.
+
+**No Docker layer cache, and that is settled rather than deferred.** Caching on hosted
+runners needs `--cache-to/--cache-from type=gha` on the build, which `docker compose
+build` does not accept — so it would mean diverging CI from `make verify-build`, the
+property that makes CI reproducible locally. The measured cold build is **~2m 22s** (19s
+compose, 68s `claude-sandbox`, 54s `opencode-sandbox`), far below the 5–15 minutes
+estimated, so the divergence buys nothing. Image sizes from the same run: both sandbox
+tiers ~1.2GB, the three services 142–255MB. Worth knowing that **tier 2 is not the
+smaller image** despite being the thinner *tier* — "thin client" describes where
+inference runs and what capability it holds, not the toolchain both tiers inherit from
+`sandbox-common`.
+
+*Each of the incidents above is recorded blow-by-blow in the commit that fixed it, which
+is the copy that is dated and cannot drift. What is kept here is the resulting invariant.*
+
+## Status
+
+| Step | What | State |
+|------|------|-------|
+| — | sandbox image + launcher, both tiers | **done** |
+| 0 | egress proxy, compose infra | **done** |
+| 1 | proxy is the sole egress (`sandbox-net` internal) | **done** |
+| 2a | control plane: policy store + audit | **done** |
+| 2b-1 | hold-for-approval, blocking with default-deny | **done** |
+| 2b-2 | `control-plane-ui` split out as its own container | **done** |
+| — | unit suite + CI gate | **done** |
+| 2c | audit browsing (filter/search/history), per-proxy config | next |
+| 3 | skills + quality-gate hooks in the image | planned |
+| 4 | pull-through package cache | planned |
+| — | governed git push path | planned |
+
+The rationale for each shipped item lives under **Governance surfaces** above, not here
+— a status line goes stale, the reasoning does not. This section is deliberately the
+only place that tracks *sequence*; nothing else in this document should need updating
+when a step lands.
+
+**Transitional allowlist entries (remove at the cache/git phase):** the
+**standalone-mode** firewall allowlist and the control-plane policy seed still
+whitelist package registries (npm/PyPI) and GitHub only because the data plane
+that should mediate them doesn't exist yet. (Governed mode — the default —
+already gives the sandbox no direct egress at all; there the entries live on as
+proxy policy, not firewall rules.) In the target design packages come from the
+pull-through cache (upstream via the egress proxy) and git via the governed git
+path. Only the Anthropic API/auth lifeline is permanent, and it already routes
+through the proxy as an always-allow in governed mode. The allowlist is grouped
+PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
 
 ## Open decisions
 
@@ -1227,620 +1706,104 @@ dockade/
   local managed file has been removed from the build. See "Managed settings are NOT
   an enforcement lever here".
 
-## Build status
+## Future improvements
+- Dedicated git proxy that speaks the git protocol (block force-push, restrict
+  branches, per-repo policy) instead of HTTPS-through-egress.
+- Separate test/build runner containers for isolation + parallelism.
+- Selective MITM on credentialed hosts → true brokering so even self-use keys
+  leave the sandbox.
+- Docs mirror / offline docs tool.
+- Progressive auto-approval driven by accumulated policy + audit history.
+- **Rule MUTATION / revocation on the control plane** (listing is done — see "Standing
+  policy" below — and so, now, is choosing what a persist writes). Rules can be
+  GRANTED — a `*_persist` resolution writes one — but still never edited or removed:
+  there is no mutating rule endpoint, and the seed file is re-read only when the table
+  is empty, so a mistaken persist is permanent short of hand-editing SQLite in the
+  volume. **This is now the whole of the item.** The two sharp edges it used to carry
+  have moved: the agent-controlled-pattern one is closed (`_persist_candidates` derives
+  a bounded set and `resolve` validates against it — see "A `+ persist` says what it
+  will write"), and the `INSERT OR IGNORE` wart, where `deny_persist` silently writes
+  nothing for an existing pattern while still reporting `persisted: true`, is now
+  reachable only when the *same* pattern was chosen twice and is covered honestly by
+  the card's wording. A governance plane that can grant but not revoke is still
+  incomplete, and revocation is the remaining half.
+- **Human-presence on approval (WebAuthn user-presence, or an out-of-band confirm).**
+  The *only* thing that closes host-local forgery of an approval — see the
+  browser-facing-guards note under "Approval UI". Worth building for that
+  specific threat (the agent reaching host execution via the workspace mount), not
+  because "the UI has no auth"; naive auth does not help, since any credential at
+  rest on the host is readable by the same process.
+- **Approval-UI follow-ups (reviewed and specified, not built).** From the same review
+  that produced the reconnect / CSP / keyed-rendering work above, in value order. The
+  top two — the hold countdown and the persist preview/confirm with an operator-chosen
+  pattern — are **now built**; see "The card shows its deadline" and "A `+ persist` says
+  what it will write" under the frontend section. What remains:
+  - **A DOM-level test for `start()`, and a decision about how.** The frontend's testing
+    strategy — pure decision helpers under node, DOM work left to cross-file guards — was
+    right when `start()` only rendered a list. It now holds a confirm-panel state machine,
+    a countdown, and per-card sweep timing, and the evidence that the strategy has been
+    outgrown is concrete: mutation testing over the last two changes caught every mutation
+    inside a pure helper and **none** inside `start()`. Two honest options, and the choice
+    matters more than the work: a hand-rolled stub DOM (what was used throwaway here —
+    cheap, no dependencies, but largely asserts its own shape), or a real headless browser
+    (truthful, but a Node dependency and a CI browser install, against a repo that keeps
+    its test suite dependency-free on purpose). A third possibility is to keep shrinking
+    `start()` by extracting more decisions into pure functions, which is what has happened
+    organically so far and has a ceiling.
+  - **The decisions table drops data the backend already sends** (`stage` is selected
+    and never rendered; `client` is not selected at all, though this control plane is
+    shared across sandboxes), stamps rows time-only so 40 rows read out of order across
+    midnight, has no empty state, and encodes the decision by colour alone.
+  - **Saturation is invisible.** Over `CONTROL_MAX_PENDING(_PER_CLIENT)` `/authorize`
+    fails closed and the agent just gets denies — governance degraded, visible only as a
+    reason string. Wants a banner plus an `n/16 holds` counter.
+  - **Collapse duplicate holds by host.** Retrying clients routinely produce several
+    holds for one host, so one decision costs four clicks and can fill the per-client
+    cap; grouping also sidesteps the `INSERT OR IGNORE` wart where a second
+    `deny_persist` writes nothing while reporting `persisted: true`.
+  - **Opt-in desktop notification.** `http://localhost` is a secure context, so the
+    Notification API is available; with a ~120s fuse and a page nobody watches, this is
+    the honest fix for the problem the `(n)` title prefix only mitigates.
+  - Smaller: `/status` is on the relay allowlist but unused (allowlists rot — use it or
+    drop it); `_STRIP_REQ` should also strip `content-length` / `transfer-encoding` /
+    `connection` / `expect`; audit and rules poll failures are swallowed, so those views
+    can show stale data while `conn` still reads "live"; no `aria-live` on the pending
+    list; both pollers run at 4s even in a hidden tab.
+- Normalize hosts consistently across the control plane. The proxy's relay guard
+  strips a trailing FQDN dot but `_decide` / `_match` only lowercase, so `evil.com.`
+  misses a persisted **block** rule and lands in a hold instead — fail-safe, but it
+  lets an explicit operator denial be re-prompted indefinitely.
+- **Split the control-plane API surface to cap the blast radius of any relay-guard
+  bypass (planned).** The egress proxy only ever needs `/authorize` (+ `/healthz`);
+  the *dangerous* surface is the management API (`/approvals`, `/approvals/{id}/
+  resolve`, `/api/audit`), because `resolve` lets a caller approve held egress —
+  i.e. self-approve. Today the agent is kept off all of it by three layers: network
+  topology (no control-net route), the egress proxy's relay guard (`_forbidden`),
+  and the local port gate (control plane on `:8090`, while CONNECT/HTTP are gated to
+  `:443`/`:80`, so even a DNS-rebound name is dialed on a port nothing serves). The
+  relay guard's resolve branch is best-effort (TOCTOU/rebind, resolution failure),
+  so the robust improvement is to make a *bypass* non-catastrophic rather than to
+  keep hardening the guard: **serve the proxy-facing `/authorize` and the
+  human-facing management API on separate ports, and give the proxy a route only to
+  the `/authorize` port** (e.g. a dedicated proxy↔backend network carrying only
+  authorize; the management port reachable solely from `control-plane-ui`). Then
+  even a total relay-guard bypass can, at worst, *query* a policy decision — it can
+  never approve a hold or read the audit store. This addresses the impact
+  (self-approval) instead of racing the mechanism (DNS), and composes with the
+  topology refinement noted under "why two control nets" (the proxy comes off the
+  broad `control-net` so it also has no route to future control-net tenants — the
+  git/secrets brokers). Pairs with a `boundary-check.sh` assertion that the proxy
+  can reach the authorize port but **not** the management port. See the
+  "Control-plane relay guard" note under "Egress proxy" for the guard this backstops.
 
-**v1 sandbox scaffolded** (`claude-sandbox/` + `run-claude-sandbox.sh`) — a
-single-container image and launcher centered on this design. Notable properties:
-- **Isolated persistent config** via `CLAUDE_CONFIG_DIR=/config` backed by its
-  own named volume — no host `~/.claude` sharing.
-- **No local managed-settings enforcement layer** — removed after verifying it is
-  shadowed by the org's remote managed source under org auth (see "Managed settings
-  are NOT an enforcement lever here"). Hardening opt-outs live as real Dockerfile
-  `ENV`; any `permissions.deny` would go in user-scope `settings.json` as
-  mistake-prevention only. Enforcement is the firewall + capability containment;
-  hard policy is the org admin console. Does **not** force yolo — starting in yolo
-  is a conscious opt-in via the `claude-yolo` alias.
-- **Baseline user settings** (`claude-sandbox/user-settings.json`) baked in and
-  materialized to `/config/settings.json` authoritatively on each boot — the
-  default status line ships this way; config is image-owned, the volume holds
-  only credentials/runtime state.
-- **Base image `debian:13-slim`** (Debian 13 "trixie") — chosen over `ubuntu:24.04`
-  for a leaner base with no default uid-1000 user to evict (dropping a `userdel`
-  step) and archive utilities as fresh or fresher; the firewall (iptables-nft on
-  both) and host-uid matching behave identically, verified by a build +
-  `boundary-check.sh` pass on the Debian base. The Ubuntu LTS+ESM support window is
-  the one trade-off, minor under rebuild-to-update.
-- Baseline stack: **Node current LTS (24.x)** + `gh` + pipx, plus baked linters
-  (shellcheck / hadolint / ruff, all self-contained so they run under default-deny
-  egress). Node tracks the latest LTS line (even majors); bump the NodeSource
-  `setup_NN.x` major to move it. Firewall allowlist trimmed to this design
-  (Anthropic + GitHub + npm + PyPI).
-- **Own user-defined bridge `sandbox-net`** (owned by `docker-compose.yml`,
-  created idempotently by the launcher when the compose infra is absent), not
-  Docker's default bridge — gets embedded DNS (`127.0.0.11`, which the firewall
-  already expects), name resolution for the data-plane services, and isolation from
-  other default-bridge containers. Under the compose infra it is now `internal:
-  true` (the proxy landed — see "Step 1 shipped" below), so the sandbox has no
-  direct route off-box; the launcher's plain-bridge fallback (proxy-less standalone
-  use) is non-internal and keeps direct egress via `init-firewall.sh`.
+## Layout
 
-**Egress proxy — step 0 shipped** (`docker-compose.yml` + `proxies/egress/`). The
-multi-container phase has begun, with a deliberate split the topology relies on:
-`docker-compose.yml` owns the **shared, long-lived infrastructure** (the data
-plane — the egress proxy at this step; the control plane + UI frontend and the
-profile-gated inference service joined as later steps landed), and the
-`run-*-sandbox.sh` launchers still
-launch the **ephemeral sandbox(es)** that attach to it (`docker run -it --rm`,
-one or many, each per-workspace with its own firewall/DNS/git wiring). Sandboxes
-are intentionally *not* compose services: they are interactive, disposable, and
-plural, which `compose run` models poorly.
+See `README.md` → Layout for the current tree. Still-planned additions to it:
 
-The proxy itself is `mitmproxy` in regular (forward) mode with a policy/audit
-addon (`proxies/egress/addon.py`): **CONNECT-level, default-deny domain
-allowlist, per-connection JSON audit, no TLS interception** (HTTPS is tunnelled
-via `ignore_connection`, so no CA in the sandbox). The launcher discovers the
-proxy on `sandbox-net`, points the agent's `HTTPS_PROXY` at it (the CLI honors it
-— see "Claude Code proxy support"), and allowlists it in the firewall
-(`EGRESS_PROXY_IP`). Chosen properties: it does **not** weaken the boundary while
-we validate — the allowlist is default-deny from the first commit, so arbitrary
-egress via the proxy is refused (not allow-all), and `boundary-check.sh` stays
-meaningful; and the allowlist was re-read per connection, a cheap stand-in for
-"dynamic" until the control plane existed (2a replaced the baked allowlist
-entirely — the proxy is a control-plane client now, see below). Governs by
-**name**, so it closes the shared-CDN/fronting gap the IP firewall can't (for
-proxied traffic).
-
-**Governed vs standalone egress (the firewall is mode-aware).** When the launcher
-finds the proxy it sets `EGRESS_PROXY_IP`, and `init-firewall.sh` switches to a
-minimal **governed** posture — the sandbox's only `OUTPUT` ACCEPTs become:
-loopback (incl. embedded DNS `127.0.0.11`), DNS **to `127.0.0.11` only**, the
-proxy `/32:8080`, and `ESTABLISHED,RELATED`; everything else is REJECTed. Dropped
-in governed mode vs the old posture: the direct per-domain IP allowlist (so **no
-ipset**), the **upstream DNS forward** (closing the residual DNS-exfil channel —
-a crafted name can no longer reach a recursive resolver; sibling names like
-`egress-proxy` still resolve locally), and the **gateway `/32`** (host-local
-surface). Without a proxy the firewall keeps the fuller **standalone** allowlist
-(ipset + upstreams + gateway). Net effect: with the proxy up, the sandbox's only
-paths off-box are the proxy (HTTP/S, domain-governed + audited) and — narrowly —
-the embedded resolver for sibling names. This is effectively step 1's egress
-posture, reached early. Consequence to remember: a tool that does its own
-external DNS or connects direct *without* honoring `HTTPS_PROXY` now fails closed
-(by design — proxied tools hand the hostname to the proxy, which resolves it).
-
-**WSL2 kernel gotcha (`xt_set`).** On stock WSL2 kernels `ipset create` can
-succeed while iptables `-m set --match-set` fails with `Can't open socket to
-ipset` — the kernel ships enough of `ip_set` for the userspace tool but not the
-`xt_set` match module. This is a *kernel*-capability gap, unrelated to container
-caps (`ipset`/xtables need `NET_ADMIN`, never `NET_RAW` — re-adding `NET_RAW`
-does not help and re-opens a hole). Governed mode sidesteps it entirely (no ipset
-path); standalone mode fails **closed** with a pointer to use the proxy. Do not
-"fix" ipset errors by adding capabilities — use the proxy.
-
-**Step 1 shipped — the proxy is the sole egress at the network layer.**
-`sandbox-net` is now `internal: true` (no route off-box for anything on it) and a
-separate `egress-net` carries the only internet path, with the egress proxy
-**dual-homed** across both (default route via egress-net; a stable sandbox-net IP
-the firewall allowlists). The in-container firewall is now **defense-in-depth**
-rather than the sole boundary: even if it failed, the sandbox has no route out.
-The launcher refuses to start a sandbox on an internal `sandbox-net` when no
-proxy is running. **Standalone** mode (no compose infra → non-internal net +
-direct ipset allowlist) remains for proxy-less use. DNS needs nothing extra: the
-sandbox resolves only sibling names via the embedded resolver (local, works on
-internal nets); external resolution happens at the proxy on egress-net.
-
-**Control plane — step 2a shipped** (`control-plane/` + `control-net`). The
-governance authority now exists as a service the **agent cannot reach**: it is
-not on `sandbox-net`, so the sandbox has no route to it (`boundary-check.sh`
-probes the control plane's fixed control-net address and asserts it is
-unreachable from the sandbox; `make check` asserts the launcher never attaches
-the sandbox to `control-net`/`control-ui-net`). In 2a it sat on `control-net`
-(internal) for the proxy control path and on `control-ui-net` for the human UI;
-since 2b-2 the backend is `control-net`-only and the UI frontend carries
-`control-ui-net` (see below).
-That UI bridge is non-internal **by necessity** — Docker cannot publish a host
-port from a container that is on an internal network alone — but has masquerade
-disabled, so it carries the loopback UI publish without being an egress path.
-The control plane is a small FastAPI app over a SQLite policy+audit store (its
-own named volume — the crown-jewel state); the management surface reaches the
-host as **loopback only** (`127.0.0.1:8081`), published since 2b-2 by the UI
-frontend rather than the backend.
-
-*Design note — why two control nets, and the frontend split.* `control-net` stays
-hard-`internal` because it is the **shared** control path for the whole governed
-data plane (egress proxy today; git/secrets proxies later), and egress is granted
-**only** by `egress-net` membership — a non-internal `control-net` would silently
-hand ungoverned egress to every service on it (see "Networks"). Publishing a host
-port, though, forces *some* non-internal surface, so `control-ui-net` quarantines
-it to a single-member bridge. Honest caveat: before 2b-2 — when the backend
-itself carried `control-ui-net`'s soft-egress surface — the split's security
-gain was ~nil, and collapsing to one non-internal `control-net` would have been
-observably equivalent; but that would have baked in a non-internal shared
-control path that becomes a real hole the moment a must-stay-egress-free tenant
-(secrets broker) joins. Keeping the split was cheap insurance against that
-footgun. **Done in 2b-2:** the UI is now a **distinct
-`control-plane-ui` frontend container** (its own lifecycle) that depends on the
-`control-plane` backend and talks to it over `control-net`. The frontend owns the
-`control-ui-net` non-internal surface; the backend is now `control-net`-only and
-fully `internal`, so the crown-jewel container has **zero non-internal exposure**
-— the split now buys something concrete, not just future insurance. This is
-deliberately a **separate service**, not a co-located sidecar: the frontend is a
-stateless reverse proxy + static server (FastAPI + httpx), holds no state, and no
-governance decision depends on it (the egress proxy calls the backend directly).
-
-The egress proxy is now a **control-plane client** rather than a static-allowlist
-enforcer: on every connection it calls `POST /authorize {host, ...}`, which
-returns the decision **and** records the audit row in one call — so policy and
-audit share the round-trip, there is no client-side cache (an operator rule edit
-applies to the very next connection), and there is no separate audit channel.
-Two deliberate properties: (1) the **permanent lifeline** (Anthropic API/auth)
-is allowed by a *local* check in the proxy *before* the control plane is
-consulted, so a control-plane outage never bricks the agent's own API; (2)
-everything else **fails closed** — if the control plane is unreachable or times
-out, the request is denied and audited locally.
-
-**Control-plane relay guard (the proxy is the bridge, so the proxy must refuse
-it).** The egress proxy is the *one* component attached to both `sandbox-net` and
-`control-net`, so segmentation alone does **not** isolate the agent from the
-control plane — the proxy could in principle relay a connection onto control-net
-(where the agent could, e.g., approve its own held requests). It therefore
-hard-refuses, **before** any policy / permanent-lifeline / port check, any
-destination that names a control-plane host (`control-plane`, `control-plane-ui`)
-or resolves into the control-net subnet (`172.31.0.0/24`) — see
-`_forbidden` in `proxies/egress/addon.py` (`EGRESS_FORBIDDEN_HOSTS` /
-`EGRESS_FORBIDDEN_CIDRS`). Because the guard is checked first and never weighed
-against policy, no rule, human approval, or change to the port allowlist can widen
-it, and a public name whose DNS is pointed at control-net is caught by the
-resolve step. This makes the CLAUDE.md invariant ("the agent must never reach the
-control plane") independently enforced at the one place segmentation cannot cover;
-`boundary-check.sh` asserts the proxy 403s both a control-plane host and a literal
-control-net IP.
-
-The same guard also hard-blocks the **private / special-use ranges** —
-cloud-metadata / link-local (`169.254.0.0/16`), loopback (`127.0.0.0/8`), RFC1918
-(`10/8`, `172.16/12`, `192.168/16`), `0.0.0.0/8` (`connect(0.0.0.0)` reaches
-localhost on Linux — loopback under another spelling), CGNAT/overlay
-(`100.64.0.0/10`), protocol-assignment and benchmarking (`192.0.0.0/24`,
-`198.18.0.0/15`), and multicast/reserved/broadcast (`224.0.0.0/4`, `240.0.0.0/4`),
-plus their IPv6 equivalents — via a
-separate `EGRESS_PRIVATE_CIDRS` set (`_forbidden`, checked before policy). The
-proxy's default route is egress-net, a masquerading bridge with a path to the
-cloud instance-metadata service (a credential-theft target), the Docker host, and
-the host's internal network; without a hard block, reaching those would rest
-solely on the default-deny allowlist, so a single mistaken rule or human approval
-could turn the proxy into an SSRF pivot. The proxy's only legitimate upstreams are
-public hosts (sibling data-plane services are reached by the agent *directly* on
-sandbox-net, never through the proxy), so blocking every private range costs
-nothing; RFC1918 `172.16/12` also transitively covers control-net and sandbox-net.
-Kept a *separate* env from `EGRESS_FORBIDDEN_CIDRS` so the control-net guard's
-fail-closed startup assertion stays specifically about control-net. Override
-`EGRESS_PRIVATE_CIDRS` (narrow, don't empty) only for a deployment that
-legitimately proxies to a private target such as an internal package mirror.
-`boundary-check.sh` asserts the proxy 403s `169.254.169.254`.
-
-*A destination, not a string — spelling normalization (fixed bug, keep the
-regression tests).* Both hard-blocked sets are lists of **IP ranges**, but what
-arrives is a **hostname field**, and the two are only equivalent after
-normalization. The guard therefore lowercases, strips a trailing FQDN dot, strips
-the brackets an IPv6 literal wears in an authority (`[::1]`), and — the part that
-was missing — folds the IPv6 forms that carry an **embedded IPv4 address** down to
-the v4 address they actually dial: v4-mapped (`::ffff:a.b.c.d`), the deprecated
-v4-compatible (`::a.b.c.d`), NAT64 (`64:ff9b::/96`) and 6to4 (`2002::/16`); see
-`_embedded_ipv4` / `_blocked_cidr`. Without that fold, `::ffff:169.254.169.254` was
-**the metadata service under a spelling neither deterministic branch recognized**
-— `ipaddress` containment never crosses address families, so it matched none of
-the v4 ranges, and the resolve branch was no help because `getaddrinfo` returns the
-same mapped form straight back, while `connect()` on a v4-mapped address delivers
-to the v4 host. It was reachable in practice because metadata serves on `:80`,
-already a permitted HTTP port; only the host policy's default-deny stood behind
-it, which is exactly the "one mistaken rule or approval" case this guard exists to
-remove. Teredo (`2001::/32`) is deliberately *not* folded — its embedded v4 is the
-client's own NAT, not a destination anything delivers to. The fold is precise
-rather than a blanket v6 ban: `::ffff:8.8.8.8` still goes to policy like any other
-host. `boundary-check.sh` now probes the **mapped** spelling of both control-net
-and metadata alongside the dotted-quad ones — the dotted-quad probes passed
-throughout this bug, so they cannot catch its return.
-
-*Defense-in-depth, not the sole control — and honest about the resolve branch.*
-The hostname and literal-IP checks are **deterministic** (decided from the request
-alone); the resolve branch is **best-effort** — it depends on a DNS lookup, so it
-carries a TOCTOU/rebind gap (mitmproxy re-resolves when it dials) and can be
-skipped on resolution failure (logged, returns "not forbidden" — safe, because an
-unresolvable name is also undialable, and reaching the control plane is prevented
-first by topology and by the port gate: the control plane listens on `:8090` while
-CONNECT/HTTP are gated to `:443`/`:80`, so a rebound name is dialed on a port
-nothing serves). To keep the guard from being *silently* disabled by
-misconfiguration, `load()` calls `_assert_guard_configured()`, which **fails
-closed at startup** (refuses to run) if `EGRESS_FORBIDDEN_CIDRS` is empty — an
-empty CIDR set would drop both the literal-IP and resolve branches, leaving only
-exact-hostname matching. The durable fix for the residual rebind gap is not to
-keep hardening the DNS check but to **cap the blast radius of any bypass** by
-splitting the control-plane API surface so a reached backend can only *query*
-`/authorize`, never self-approve via the management API — see the API-surface-split
-item under "Clear future improvements". The call runs in a worker thread
-so it never blocks mitmproxy's event loop, and the egress image gains no new
-dependency. The canonical allow policy now lives at `policies/egress-allowlist.txt`
-(the control plane seeds SQLite from it on first boot, idempotently); the proxy
-no longer bakes or reads an allowlist file.
-
-**Hold-for-approval — step 2b-1 shipped.** An unmatched host is no longer denied
-outright: `_decide` returns **`hold`**, and `/authorize` records a pending
-approval and **blocks** the request until a human resolves it or
-`CONTROL_HOLD_TIMEOUT` (default 120s) elapses → default-deny. The proxy is
-unchanged except for a longer authorize timeout to cover the wait — it still
-sees only allow/deny (the hold is internal to the control plane). A human
-resolves holds in a **live SSE UI** served at `/`: **allow-once / deny-once**
-(this request only) or **allow-persist / deny-persist** (also writes a rule so
-future connections skip the hold — the progressive-trust path). Concurrency:
-one uvicorn worker; a held request blocks its threadpool worker on a
-`threading.Event` the resolve endpoint sets; SQLite (`approvals` table) is the
-UI's source of truth; stale `pending` rows are expired on startup. **Holds are
-bounded** (`CONTROL_MAX_PENDING`, `CONTROL_MAX_PENDING_PER_CLIENT`): since each
-hold pins a threadpool worker and this control plane is **shared across all
-sandboxes**, an unbounded queue would let one agent exhaust the pool and stall
-every sandbox's governed egress. Over either cap, `/authorize` fails **closed**
-(deny) immediately instead of registering another blocking hold — the cap stays
-comfortably under the worker pool so fast allow/deny decisions always have free
-workers, and the permanent lifeline is unaffected (it never reaches the control
-plane).
-
-**Frontend split — step 2b-2 shipped.** The approval UI and the API/SSE relay
-now live in a distinct **`control-plane-ui`** container (FastAPI + httpx: serves
-the static UI at `/`, reverse-proxies everything else — including the SSE stream
-— to the backend over `control-net`). The **backend is now `control-net`-only
-and fully `internal`**: no published port, no non-internal surface, nothing to
-exfiltrate even if reached. The frontend carries the sole host-facing surface
-(`control-ui-net`), holds no state, and is not on `sandbox-net`. Browsers hit
-`http://localhost:8081` → frontend → backend; the egress proxy still calls the
-backend's `/authorize` directly. See the step-2a design note for the rationale.
-
-**Browser-facing guards on the frontend (and their honest limit).** The frontend
-publishes the only API that can GRANT egress — `POST /approvals/{id}/resolve` is
-self-approval if reached — on host loopback, with no auth. Loopback binding is not a
-defense against **DNS rebinding**: a page the operator visits can point its own name
-at `127.0.0.1`, at which point it is *same-origin* with the frontend, so there is no
-preflight and responses are readable — it can list the pending approvals (obtaining
-the `uuid4` ids a blind attacker cannot guess) and resolve them. That, not CSRF, is
-the vector that matters here; plain CSRF is largely self-blocking, because a JSON
-body forces a preflight that fails for want of CORS headers and `resolve` needs an
-unguessable id. Three structural guards now sit in front (`control-plane-ui/app.py`):
-
-- **Host allowlist** (`CONTROL_UI_ALLOWED_HOSTS`, default `127.0.0.1,localhost,::1`)
-  — closes rebinding. Rebinding *requires* the attacker's own name in `Host`, and
-  `Host` is a forbidden header JS cannot set, so this removes the attack class
-  rather than raising its cost. Compared without the port on purpose: the port is
-  irrelevant to the guard, and ignoring it keeps one list valid for both the
-  published `:8081` and the in-container healthcheck's `:8090`. Import fails closed
-  on an empty list (`_assert_host_guard_configured`, mirroring the egress addon).
-- **Cross-origin state changes refused** — `Sec-Fetch-Site` when present, else
-  `Origin`; both absent means no browser is calling, so there is no CSRF to stop and
-  refusing would only break scripting. Belt-and-braces for a future endpoint that is
-  less lucky than the current ones.
-- **Relay path allowlist** — only the paths the UI actually uses are proxied. The
-  backend surface is not uniformly browser-appropriate: reaching `POST /authorize`
-  from a page means forged audit rows and consumed hold slots on the governance
-  authority. The old catch-all `/{path:path}` relayed it.
-- **Refusal to be embedded** — closes **clickjacking**, which is the gap the first
-  three guards structurally cannot see, and it was open until now. An attacker page
-  that frames `http://127.0.0.1:8081` produces a request with a perfectly legitimate
-  `Host: 127.0.0.1` (guard 1 satisfied) by GET, which is deliberately allowed
-  cross-origin (guard 2 does not apply) — and the framed document's own `resolve`
-  POST then reads as `Sec-Fetch-Site: same-origin`, because from inside the frame it
-  genuinely is. Cross-origin *reads* stay blocked throughout, but a UI-redress attack
-  needs no read: overlay a decoy on the invisible frame and the operator's click
-  lands on the real "Allow + persist rule" button, granting standing egress. The
-  unguessable `uuid4` id that defeats a blind CSRF is no help either — a click does
-  not need to know it. Closed by `frame-ancestors 'none'` in the CSP below, plus a
-  `Sec-Fetch-Dest: iframe|frame|embed|object` refusal in `_guard`; the second is not
-  redundant, it makes the attempt a 403 in *this app's* log rather than a message in
-  the operator's browser console, which is the visibility this repo falls back on
-  wherever prevention is browser-dependent.
-
-**Security headers on every response, and why the script became a file.** A
-`_security_headers` middleware sets a Content-Security-Policy (plus `X-Frame-Options`,
-`nosniff`, `no-referrer`) on everything this app serves, refusals included — it is
-registered *after* `_guard`, which under Starlette makes it the **outer** middleware,
-so a refused framing attempt is itself delivered under the policy. The policy is
-`default-src 'none'` naming only what the page uses, and it is applied by assignment
-rather than `setdefault` because relayed backend responses pass through it and an
-upstream header must not be able to weaken the frontend's policy.
-
-The directive that shaped a file move is `script-src 'self'`. The page's behaviour used
-to be inline in `index.html`, which would have forced `'unsafe-inline'` and reduced the
-whole policy to decoration — on the one page that renders **agent-controlled** strings
-(the requested host, url and client on each approval card). So the script now lives in
-`control-plane-ui/app.js`, served from this origin (never a CDN, for the same reason the
-favicon is an inline data URI: a governance UI must not fetch its own control logic from
-a third party). The payoff is doubled: it also made the frontend testable for the first
-time. Because that invariant spans two files and re-inlining would break nothing
-*visible*, a test asserts the page carries no inline script or event handlers, and
-another asserts every `getElementById` in `app.js` matches an id that exists in
-`index.html` — the split's new failure mode is a renamed id, which is a `null`
-dereference that would otherwise appear only in a browser.
-
-**The stream had no reconnect, and said otherwise.** The page treated every
-`EventSource` error as transient. It is not: an `EventSource` retries *by itself* only
-from `CONNECTING`, and a non-200 response or wrong MIME type puts it in `CLOSED`
-**permanently**. That state was reachable in ordinary operation — the relay had no
-exception handling, so a backend restart made `httpx.ConnectError` a 500, the browser
-gave up for good, and the status line went on reading "reconnecting…" while the page was
-blind until someone reloaded it. Being blind is the exact failure the traffic light was
-built around (an unseen hold default-denies after `CONTROL_HOLD_TIMEOUT`), so this was
-the most consequential defect in the UI. Fixed at both ends: the relay answers a clean
-**502** on any `httpx.RequestError`, and `app.js` reconnects by hand from `CLOSED` with
-doubling backoff (1s → 30s cap, no jitter — jitter de-synchronises a fleet, and this
-page has one operator, so determinism is worth more and makes the delay assertable),
-reporting `retrying in Ns` instead of a comforting lie.
-
-**The approvals list is keyed, and does not move under the cursor.** Rendering was an
-`innerHTML` assignment of the whole list on every push, up to once a second. A hold
-expires on its own after ~120s, so a card leaving the *middle* of the queue shifted
-every card below it upward — between the operator's eye and their click, on a row of
-buttons that **grant egress**. It also discarded the `disabled` state a resolve in
-flight had just set. Cards are now created once, keyed by approval id, and updated in
-place (`diffPending`); an unchanged push is a no-op. A card that leaves the queue
-without the operator deciding it is marked **stale in place** with the reason rather
-than yanked out, and swept only when removal cannot move a button under the pointer —
-nothing in the list hovered or focused — with a 15s cap so a parked cursor cannot freeze
-the list.
-
-That gating turned out to have a hole, found by asking how to *test* the expiry marker
-rather than by reading the code: "removal cannot move a button under the pointer" is
-true immediately whenever the cursor is **outside** the list, so a stale card was swept
-on the next 1s tick. The `expired — default-denied` message — the one departure that
-reports a governance failure — was therefore on screen for about a second, readable only
-by an operator who happened to be hovering. So `shouldSweep` gained a **minimum dwell**
-that hover cannot shorten (`DWELL_MS`: 60s expired, 8s resolved, 5s resolved-elsewhere),
-ordered by how much each matters. An expiry gets long enough to read; a resolve less,
-because the operator performed it but may move the mouse away before reading the
-confirmation (the same bug, and the only reason the outcome message *appeared* to work
-is that clicking leaves the pointer inside the list); a card resolved elsewhere least.
-Not longer, because stale cards would then compete with real pending holds on what is
-fundamentally a work queue — the Decisions tab is the durable record.
-
-Two smaller corrections came out of mutation-testing that fix: a `Math.max(STALE_MAX_MS,
-dwellMs)` on the cap line was **dead logic** (the floor check above already guarantees
-`ageMs >= dwellMs`) with a comment claiming it was load-bearing, which is worse than not
-having it; and `markStale` now takes the whole `{text, dwellMs}` that `departure()`
-returns rather than the two as separate arguments, so the message and how long it stays
-readable cannot be passed apart — omitting the dwell would have silently given an expiry
-the 5s treatment with nothing failing. Cards are built with `createElement`/`textContent` rather than an HTML string,
-so for the one list that renders agent-controlled values the question of whether `esc()`
-covers every context does not arise.
-
-**A resolve now reports itself.** Previously the only feedback was the card vanishing on
-the next SSE tick, so with the feed down — precisely the state above — a successful
-approval was indistinguishable from a hung click, and errors arrived as a blocking
-`alert()`. The card now shows `✓ allowed · standing rule: .example.com` (or
-`· this request only`) inline the moment the POST returns, keeps its buttons disabled,
-and on a `409` says so specifically — "no longer pending" is a different fact from a
-failure, and re-enabling the buttons would only invite a second failing click. The
-pattern in that line comes back from the *backend* rather than being reconstructed from
-the click, so it reports what was **stored** — which is also the exact string an
-operator would have to go and delete by hand.
-
-**The card shows its deadline (`GET /api/config`).** A held request *blocks the agent*
-and is **default-denied** when `CONTROL_HOLD_TIMEOUT` elapses, and that deadline was
-the one thing the card could not say: it showed a static `requested 14:32:05` and then
-disappeared, so 100 seconds left and 4 seconds left looked identical. Without it the
-difference between hold-for-approval and a slow deny is invisible from the interface
-built to govern it. The backend now exposes the window (a deliberately narrow
-read-only view of non-secret config — `{"hold_timeout": 120.0}`, on the relay
-allowlist), and each card carries `expires in 43s` plus a depleting bar, called out in
-red under 20s. Three details are load-bearing rather than cosmetic:
-
-- **Two clocks, so both ends are clamped.** `ts` is the backend's `time.time()` and
-  `now` is the browser's. They agree in the intended deployment — both are the
-  operator's host — and where they don't, `holdRemaining` clamps to `[0, holdTimeout]`
-  so a skewed clock makes the countdown *wrong* rather than absurd (never negative,
-  never longer than the whole window, and the bar can never exceed 100%).
-- **Zero says `expiring now`, not `expired`.** The backend's clock decides, so a click
-  at zero may still land; if it doesn't, the existing `409` path reports that honestly.
-  Claiming expiry here would be the UI asserting an outcome it cannot know.
-- **A departing card now says which way it went.** Expiry is a governance outcome — the
-  agent was denied because nobody looked in time — while a card leaving with time on
-  the clock means something else resolved it or the control plane restarted. Both used
-  to read as the same hedged sentence; `goneReason` distinguishes them, and falls back
-  to the hedge when `/api/config` is unreachable, because then we genuinely cannot
-  tell. The whole feature fails soft: no config, no countdown, page otherwise
-  unaffected.
-
-**A `+ persist` says what it will write, lets you choose it, and asks twice.** This one
-closes a sharp edge, not just a UX gap. `resolve` used to store the **requested host
-verbatim** as the rule pattern, and two facts made that worse than it looks: a leading
-dot is a *subdomain wildcard* in `_match`, and the host on an approval is chosen by the
-**agent** — so a request for `.example.com` turned one click into a standing rule over
-every subdomain, permanently, since nothing in this system revokes a rule.
-
-The fix puts the pattern under the operator's control and out of the requester's.
-`_persist_candidates(host)` derives a **bounded set** in the backend, beside the
-`_match` it must agree with: the exact host, `.host`, and `.<last two labels>` (the
-registrable domain, which is what one usually wants when a service spreads over many
-hostnames) — narrowest first, so the default is the safest. Leading dots, trailing FQDN
-dots and case are normalized away, IP literals get no wildcard at all (`.1.2.3.4` is
-nonsense), and a one-label wildcard is never offered because `.com` as a standing allow
-rule would end governance for an entire TLD in one click. `ResolveRequest` gained an
-optional `pattern`, **validated against that set server-side** and refused with a `400`
-*before* the conditional UPDATE — so a rejected pattern neither resolves the hold nor
-consumes it, and the operator can choose again rather than losing the approval to a
-race they didn't cause. The candidate list travels with each pending approval, so the
-UI offers exactly what the backend will accept instead of reimplementing the derivation
-in JavaScript and drifting into offering a pattern that then 400s.
-
-On the card, both `*_persist` buttons now open a confirm panel — justified by
-**irreversibility rather than risk**: undoing a mis-click means hand-editing SQLite in
-a named volume. It names the pattern verbatim in a `<code>` (not described — exact-host
-and whole-subtree differ by one dot, and that dot *is* the grant), offers the
-candidates in a select, shouts specifically about a wildcard ("covers … and every
-subdomain of it, including hosts nothing has requested yet"), and labels its own button
-`Confirm — allow .example.com from now on`. It sits **below** the action row, which
-stays exactly where it was: if the confirm button appeared where the pointer already
-is, a double-click on "Allow + persist rule" would sail straight through the
-confirmation it had just opened — the same concern that drove keyed rendering. The
-action row is disabled while the panel is open, so the only live buttons are Confirm
-and Cancel, and Escape backs out.
-
-Known limitation, stated rather than hidden: with no public-suffix list the two-label
-suffix of `example.co.uk` is `.co.uk`, which grants far more than it appears to. That
-is exactly why the operator picks and why the pattern is shown verbatim in a step where
-it is still reversible. The audit trail also learned to say whether policy changed at
-all — the reason now reads `human approval (standing rule written) [peer=…]` vs
-`(this request only)`, from the durable `mode` column. Naming the *pattern* there would
-need a new column on `approvals`, which has no migration step (see the NOTE above
-`_seed_if_empty`); the rule itself is recorded with its pattern and `source='operator'`
-in the rules table, and every later use of it is audited as `allowed by rule (…)`.
-
-**The frontend's own tests.** `tests/test_control_plane_ui_js.py` runs the pure helpers
-under `node` (skipped when node is absent, the way `make lint` skips a missing linter)
-and asserts in Python, so failures read like the rest of `tests/`. It covers the lamp
-precedence (blind outranks busy), the backoff bounds and monotonicity, the keyed-diff
-properties, the sweep gating, the countdown arithmetic (including the clock-skew clamps
-and the `expiring now`-not-`expired` wording), the expiry-vs-resolved-elsewhere
-distinction, and the persist preview's wildcard flag. Everything that touches the DOM
-lives inside `start()`, which runs only in a browser — so requiring the module under
-node must be side-effect free, and the test asserts that too: if DOM work migrates to
-the top level, `require` throws and the file cannot quietly become untestable again.
-
-Two cross-file guards cover couplings that have no compiler between their ends. The
-first asserts every `getElementById` in `app.js` matches an id in `index.html`. The
-second asserts **every path the page `fetch`es is either served here or on the relay
-allowlist** — the deliberately narrow allowlist is what keeps `POST /authorize`
-unreachable from a browser, and the cost of that narrowness is that adding a call
-without adding its route yields a 403 visible only to an operator loading the real page
-against a real backend. That is precisely how `/api/config` would have failed; the
-guard was verified by removing the route and watching it fail. The converse direction is
-deliberately not asserted — `/status` is still on the allowlist unused, and pruning it
-is a separate change.
-
-A third guard is source-level rather than behavioural: `shouldSweep`'s dwell floor
-defaults to `0`, so **dropping the argument at the call site** would restore the
-swept-in-a-second bug with every unit test still green, since they exercise the function
-directly. The call site is therefore asserted to pass a dwell. Ugly, and the honest
-alternative — making omission impossible — is what was done for `markStale` instead;
-`shouldSweep` keeps its primitive signature because that is what makes it cheap to
-assert at the boundaries.
-
-Still no browser-level test: `start()`'s DOM path is covered only by those guards. The
-card wiring (countdown, confirm panel, pattern select, dwell) was verified against a
-throwaway stub DOM under node — enough to catch a typo in the plumbing — and not kept,
-because a hand-rolled DOM stub is a maintenance liability that would mostly assert its
-own shape. **The cost of that choice is now measurable and worth stating**: mutation
-testing was run twice over this work, and every mutation inside a pure helper was caught
-while every mutation inside `start()` survived. The structural fixes above (pass the
-whole object, guard the call site) reduce what a mutation there can silently break, but
-they are mitigations for missing coverage rather than coverage. See the DOM-test item
-under "Clear future improvements".
-
-*What these cannot do.* They are **browser-enforced**. A process running on the host
-sets any header it likes and can still reach the API — and that is not hypothetical
-here, because the agent's RW workspace bind mount is an acknowledged (delayed) path
-to host execution (see the workspace guard in `sandbox-lib.sh`). **Authentication
-would not close it either**, which is the non-obvious part: any credential at rest
-on the host — token file, env var, browser cookie — is readable by that same
-process, so it adds friction and a secret to manage without changing the outcome.
-Closing host-local forgery requires a human-presence gesture the host cannot replay
-(WebAuthn user-presence on `resolve`, or an out-of-band confirm). That is a
-deliberate *later* decision, and it should be taken for this specific threat rather
-than for "the UI has no auth" in general. Ceiling worth stating plainly: while the
-bind mount exists and the approval surface must be reachable by a human who is on
-the host, no purely host-side control survives host code execution.
-
-**Three tabbed views, with badges carrying the hidden state.** Approvals /
-Decisions / Policy, selected by `location.hash` so a reload, a bookmark and the back
-button agree, with `role="tablist"` and arrow-key navigation. Tabs were a deliberate
-choice over one long page, and they come with a specific hazard that the badges exist
-to answer: two views are hidden at any moment, and one of them (standing policy) has
-**silent drift** as its failure mode — it accumulated unnoticed for weeks before it
-was surfaced at all, so putting it one click away could have re-hidden it. Therefore
-the Approvals tab carries a live pending count (amber when non-zero) and the Policy
-tab carries a rule count plus an **unseen marker** that appears when the rule set
-changes while another view is showing and clears only when the policy view is actually
-opened. Both feeds keep polling regardless of the active tab — otherwise a badge could
-not report a hidden view's state, which is the entire reason it is there. The change
-signature is over pattern+action rather than the row count, because a rule whose
-*action flipped* is the change most worth noticing and it leaves the count unchanged.
-A real view split for audit browsing (filter/search/history) is step 2c; this is the
-navigation it will extend.
-
-**Traffic-light favicon + title count.** An inline SVG data URI — never a file or a
-CDN reference, since a governance UI issuing an external request per page load would
-be both ironic and a needless third-party signal, and this way there is no extra route
-for the relay to allow. Three lamps map onto the three states that matter: **red** the
-SSE stream is down (we are not seeing pending approvals), **amber** something is
-waiting on a human, **green** connected and clear. All three lamps keep their **own
-colour at every state** and only the brightness moves (active at full opacity, the
-others at ~0.26): with the inactive lamps greyed out the icon is a dark rectangle
-carrying one small coloured dot and stops reading as a traffic light at 16px, which is
-the size that actually matters. The honest cost is that dim-to-bright is a weaker
-peripheral signal than grey-to-colour, so the title prefix carries most of the
-eye-catching load. `href` is only reassigned when the state genuinely changes —
-`updateIndicators` runs on every poll, and browsers treat each assignment as a fresh
-favicon load, so rewriting it ~15×/minute would be wasted work at best and a
-flickering tab icon at worst. Red for "blind" rather than for
-"denied" is the deliberate part: an unseen hold default-denies after
-`CONTROL_HOLD_TIMEOUT` (~120s), so not-receiving-updates deserves more alarm than
-being busy, and a stale green would be a lie. The pre-JS fallback in `<head>` is amber
-for the same reason — before the stream connects, "unknown" is the honest state, not
-"all clear". The tab title gains a `(n)` prefix so a **background** tab shows the
-count, which is the case that actually matters: `mcp-proxy.anthropic.com` expired
-unnoticed five times because nobody was watching the page.
-
-**Standing policy is visible in the UI (`GET /api/rules`).** The UI showed
-pending approvals and recent decisions but never the **rules** — the thing that
-actually decides every request. So answering "what have I permanently allowed?" meant
-`docker compose exec` plus SQL against the volume, and in practice rules accumulated
-across weeks unseen. Policy that is invisible drifts, and every `*_persist` approval
-writes to it, so the read-only view is the small half of the rule-management item and
-removes most of its risk. Three deliberate choices: **unpaginated**, because a
-silently truncated view of policy is worse than none (the opposite of `/api/audit`,
-which is capped precisely because it grows without bound); **blocks listed first**, so
-the listing reads in the same precedence order `_decide` applies rather than
-alphabetically; and the **match scope named in words** (`host + subdomains` vs
-`exact host`, derived by `_pattern_scope` beside the `_match` that implements it, so
-the frontend cannot drift from the real semantics) — because a leading-dot wildcard
-otherwise looks exactly like an ordinary hostname in a list. Read-only on purpose:
-this makes policy reviewable, it does not add mutation. `_pattern_scope` earns its
-keep twice over now — the same words label the candidates in the persist confirm step,
-so what an approval promises to write and what the policy view later shows it wrote are
-described identically.
-
-**Approval provenance — detection where prevention is not available.** Given that
-ceiling, the frontend and backend at least make a forged approval *visible*. The
-relay strips client-supplied provenance headers (`X-Dockade-Actor`,
-`X-Forwarded-*`, `Forwarded`, `X-Real-IP`) and re-adds `X-Dockade-Actor` with the
-peer address it actually observed; the backend's `_actor` records that on the
-approvals row (`resolved_by`) and carries it into the audit reason, so the log
-answers "who granted this egress" rather than merely "a human did". The labels keep
-trust levels apart: `peer=` is observed by the backend (but is the *relay* for
-anything via the UI), `via-ui=` is asserted by the relay, and `origin=` / `ua=` are
-self-reported and forgeable — recorded anyway because they are usually what betrays
-a non-browser caller. None of this was recorded before: an operator's click and a
-scripted POST were indistinguishable after the fact.
-
-*Schema note (read before adding a column).* `resolved_by` ships with **no migration
-step**, which is safe only because of a one-time circumstance: the single store that
-predated the column was migrated in place with `ALTER TABLE ADD COLUMN` before the
-migration code was removed, and every store created since gets the column from the
-`CREATE TABLE`. That is not a general pattern — `CREATE TABLE IF NOT EXISTS` is a
-no-op on an existing table and this store is a long-lived named volume that
-deliberately outlives container and image churn, so **the next additive column will
-need its own explicit `ALTER` for existing volumes**, or every statement naming it
-fails at runtime. The only alternative is `make destroy`, which discards the policy
-rules and the audit history — i.e. the crown jewels. See the NOTE in `_init_db`.
-
-Step 2c: audit *browsing* — filter/search/history beyond the live
-recent-decisions table the UI already renders — and the per-proxy config
-surface (rows accumulate from 2a).
-
-Not yet built: audit browsing beyond the recent-decisions table (2c),
-git/secrets/cache data-plane services, skills, quality-gate hooks.
-
-**Transitional allowlist entries (remove at the cache/git phase):** the
-**standalone-mode** firewall allowlist and the control-plane policy seed still
-whitelist package registries (npm/PyPI) and GitHub only because the data plane
-that should mediate them doesn't exist yet. (Governed mode — the default —
-already gives the sandbox no direct egress at all; there the entries live on as
-proxy policy, not firewall rules.) In the target design packages come from the
-pull-through cache (upstream via the egress proxy) and git via the governed git
-path. Only the Anthropic API/auth lifeline is permanent, and it already routes
-through the proxy as an always-allow in governed mode. The allowlist is grouped
-PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
+```
+dockade/
+  tools/              # ungoverned data-plane services (cache, scratch DB, ...)
+  claude-sandbox/
+    skills/           # sanctioned capability + workflow interface
+    hooks/            # quality-gate hooks
+```

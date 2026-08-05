@@ -59,7 +59,7 @@ _STRICT = bool(os.environ.get("DOCKADE_REQUIRE_TOOLS"))
 _PROBE = r"""
 const m = require(process.env.DOCKADE_APP_JS);
 const missing = ["lampState", "backoffDelay", "diffPending", "shouldSweep",
-                 "holdRemaining", "countdownState", "goneReason", "persistPreview"]
+                 "holdRemaining", "countdownState", "departure", "persistPreview"]
   .filter(n => typeof m[n] !== "function");
 console.log(JSON.stringify({
   missing,
@@ -90,6 +90,29 @@ console.log(JSON.stringify({
     busy_just_under: m.shouldSweep(true, m.STALE_MAX_MS - 1),
     busy_at_cap: m.shouldSweep(true, m.STALE_MAX_MS),
   },
+  // The minimum dwell: an idle list must NOT sweep a card that has not been readable
+  // for its kind's floor yet, which is the whole point of the parameter.
+  dwell: {
+    values: m.DWELL_MS,
+    expired_idle_immediately: m.shouldSweep(false, 0, m.DWELL_MS.expired),
+    expired_idle_just_under: m.shouldSweep(false, m.DWELL_MS.expired - 1,
+                                           m.DWELL_MS.expired),
+    expired_idle_at_floor: m.shouldSweep(false, m.DWELL_MS.expired,
+                                         m.DWELL_MS.expired),
+    // A dwell longer than STALE_MAX_MS is a floor, so a hovered list cannot shorten it
+    // and the cap cannot either.
+    expired_busy_at_stale_cap: m.shouldSweep(true, m.STALE_MAX_MS,
+                                             m.DWELL_MS.expired),
+    expired_busy_at_floor: m.shouldSweep(true, m.DWELL_MS.expired,
+                                         m.DWELL_MS.expired),
+    resolved_idle_just_under: m.shouldSweep(false, m.DWELL_MS.resolved - 1,
+                                            m.DWELL_MS.resolved),
+    resolved_idle_at_floor: m.shouldSweep(false, m.DWELL_MS.resolved,
+                                          m.DWELL_MS.resolved),
+    // No dwell (the old two-argument behaviour) must be unchanged.
+    no_dwell_idle: m.shouldSweep(false, 0, 0),
+    no_dwell_busy: m.shouldSweep(true, 0, 0),
+  },
   // The hold countdown. Fixed clocks, not Date.now(), so the arithmetic is asserted
   // rather than the machine's mood: a hold requested at t=1000 with a 120s window.
   remaining: {
@@ -109,9 +132,9 @@ console.log(JSON.stringify({
   },
   urgent_at: m.COUNTDOWN_URGENT_S,
   gone: {
-    expired: m.goneReason(0, 120),
-    time_left: m.goneReason(55, 120),
-    window_unknown: m.goneReason(null, null),
+    expired: m.departure(0, 120),
+    time_left: m.departure(55, 120),
+    window_unknown: m.departure(null, null),
   },
   preview: {
     exact: m.persistPreview("allow_persist",
@@ -268,12 +291,64 @@ class PageScriptTests(unittest.TestCase):
         # An expiry is a governance outcome — the agent was denied because nobody
         # looked in time — and it used to be indistinguishable from someone else
         # resolving the hold.
-        self.assertIn("default-denied", gone["expired"])
-        self.assertIn("120s", gone["expired"])
-        self.assertNotIn("default-denied", gone["time_left"])
-        self.assertIn("resolved elsewhere", gone["time_left"])
+        self.assertIn("default-denied", gone["expired"]["text"])
+        self.assertIn("120s", gone["expired"]["text"])
+        self.assertNotIn("default-denied", gone["time_left"]["text"])
+        self.assertIn("resolved elsewhere", gone["time_left"]["text"])
         # With the window unknown we genuinely cannot tell, and say so.
-        self.assertIn("or was resolved elsewhere", gone["window_unknown"])
+        self.assertIn("or was resolved elsewhere", gone["window_unknown"]["text"])
+
+    def test_the_wording_and_the_dwell_come_from_one_decision(self):
+        # The dwell is returned WITH the text it belongs to, so there is no second
+        # kind→duration lookup that could disagree with the message on screen.
+        gone = self.probe["gone"]
+        dwell = self.probe["dwell"]["values"]
+        self.assertEqual(gone["expired"]["kind"], "expired")
+        self.assertEqual(gone["expired"]["dwellMs"], dwell["expired"])
+        self.assertEqual(gone["time_left"]["kind"], "gone")
+        self.assertEqual(gone["time_left"]["dwellMs"], dwell["gone"])
+        # A card we cannot classify must not claim the expiry wording OR its long dwell.
+        self.assertEqual(gone["window_unknown"]["kind"], "gone")
+        self.assertEqual(gone["window_unknown"]["dwellMs"], dwell["gone"])
+
+    def test_an_expired_card_cannot_be_swept_before_it_can_be_read(self):
+        # THE defect this fixes: the sweep fires as soon as removal cannot move a
+        # button under the pointer, so with the cursor anywhere else the
+        # `expired — default-denied` marker — the one departure that reports a
+        # governance failure — was on screen for about a second.
+        dwell = self.probe["dwell"]
+        self.assertFalse(dwell["expired_idle_immediately"])
+        self.assertFalse(dwell["expired_idle_just_under"])
+        self.assertTrue(dwell["expired_idle_at_floor"])
+
+    def test_the_dwell_floor_outlasts_the_parked_cursor_cap(self):
+        # STALE_MAX_MS exists so a hovered list cannot freeze the queue forever. A dwell
+        # LONGER than it is a deliberate floor, so the cap must not cut it short.
+        dwell = self.probe["dwell"]
+        self.assertGreater(dwell["values"]["expired"], self.probe["limits"]["stale"])
+        self.assertFalse(dwell["expired_busy_at_stale_cap"])
+        self.assertTrue(dwell["expired_busy_at_floor"])
+
+    def test_a_resolve_stays_readable_after_the_mouse_leaves(self):
+        # Same bug, milder: clicking leaves the pointer inside the list, which is the
+        # only reason the outcome message appeared to work — move the mouse away and it
+        # went with the card.
+        dwell = self.probe["dwell"]
+        self.assertFalse(dwell["resolved_idle_just_under"])
+        self.assertTrue(dwell["resolved_idle_at_floor"])
+
+    def test_the_dwells_are_ordered_by_how_much_they_matter(self):
+        # An expiry is a governance failure; a resolve the operator's own action; a
+        # card resolved elsewhere purely informational.
+        v = self.probe["dwell"]["values"]
+        self.assertGreater(v["expired"], v["resolved"])
+        self.assertGreater(v["resolved"], v["gone"])
+
+    def test_no_dwell_behaves_exactly_as_before(self):
+        # The gating properties the sweep already had must survive the new parameter.
+        dwell = self.probe["dwell"]
+        self.assertTrue(dwell["no_dwell_idle"])
+        self.assertFalse(dwell["no_dwell_busy"])
 
     def test_the_persist_preview_names_the_pattern_and_flags_a_wildcard(self):
         prev = self.probe["preview"]
@@ -375,6 +450,25 @@ class InlineScriptTests(unittest.TestCase):
                 or ui._relay_allowed("POST", path),
                 f"app.js calls {path}, which control-plane-ui neither serves nor "
                 f"relays — add it to _RELAY_ROUTES or it will 403 in the browser")
+
+    def test_the_sweep_call_site_passes_a_per_card_dwell(self):
+        """`shouldSweep` grew a minimum dwell because the `expired — default-denied`
+        marker was swept within about a second whenever the cursor was outside the
+        pending list. That floor defaults to `0`, which keeps the two-argument
+        behaviour intact — and means **dropping the argument at the call site silently
+        restores the bug** with every unit test still passing, because they call the
+        function directly. So the call site itself is asserted."""
+        js = APP_JS.read_text()
+        calls = re.findall(r"shouldSweep\(([^)]*)\)", js)
+        # The definition is the one mentioning its own parameter names; the rest are
+        # real call sites.
+        sites = [c for c in calls if "ageMs" not in c]
+        self.assertEqual(len(sites), 1, f"unexpected shouldSweep call sites: {calls}")
+        self.assertEqual(
+            len(sites[0].split(",")), 3,
+            "sweep() must pass the departed card's dwell as the third argument, or an "
+            "expired hold is swept before it can be read")
+        self.assertIn("dwell", sites[0])
 
     def test_the_script_file_is_the_one_the_app_serves(self):
         # UI_SCRIPT points into the image; assert the repo file the Dockerfile copies

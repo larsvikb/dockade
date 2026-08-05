@@ -490,7 +490,7 @@ no separate artifact-export path is needed in v1.
   opaque `403` to the agent as any other deny) can't be asserted there.
 
   The suite was then extended to the **async decision flow** the pure-function
-  tests couldn't reach (**165 tests total**, still dependency-free — the count
+  tests couldn't reach (**172 tests total**, still dependency-free — the count
   includes the `control-plane-ui` relay host-pinning regression tests that came
   with the 2b-2 split, the mapped-IPv6 relay-guard regression suite, and the
   frontend's Host / cross-origin / relay-allowlist / provenance guards, the
@@ -655,6 +655,18 @@ no separate artifact-export path is needed in v1.
   top two — the hold countdown and the persist preview/confirm with an operator-chosen
   pattern — are **now built**; see "The card shows its deadline" and "A `+ persist` says
   what it will write" under the frontend section. What remains:
+  - **A DOM-level test for `start()`, and a decision about how.** The frontend's testing
+    strategy — pure decision helpers under node, DOM work left to cross-file guards — was
+    right when `start()` only rendered a list. It now holds a confirm-panel state machine,
+    a countdown, and per-card sweep timing, and the evidence that the strategy has been
+    outgrown is concrete: mutation testing over the last two changes caught every mutation
+    inside a pure helper and **none** inside `start()`. Two honest options, and the choice
+    matters more than the work: a hand-rolled stub DOM (what was used throwaway here —
+    cheap, no dependencies, but largely asserts its own shape), or a real headless browser
+    (truthful, but a Node dependency and a CI browser install, against a repo that keeps
+    its test suite dependency-free on purpose). A third possibility is to keep shrinking
+    `start()` by extracting more decisions into pure functions, which is what has happened
+    organically so far and has a ceiling.
   - **The decisions table drops data the backend already sends** (`stage` is selected
     and never rendered; `client` is not selected at all, though this control plane is
     shared across sandboxes), stamps rows time-only so 40 rows read out of order across
@@ -1569,7 +1581,29 @@ place (`diffPending`); an unchanged push is a no-op. A card that leaves the queu
 without the operator deciding it is marked **stale in place** with the reason rather
 than yanked out, and swept only when removal cannot move a button under the pointer —
 nothing in the list hovered or focused — with a 15s cap so a parked cursor cannot freeze
-the list. Cards are built with `createElement`/`textContent` rather than an HTML string,
+the list.
+
+That gating turned out to have a hole, found by asking how to *test* the expiry marker
+rather than by reading the code: "removal cannot move a button under the pointer" is
+true immediately whenever the cursor is **outside** the list, so a stale card was swept
+on the next 1s tick. The `expired — default-denied` message — the one departure that
+reports a governance failure — was therefore on screen for about a second, readable only
+by an operator who happened to be hovering. So `shouldSweep` gained a **minimum dwell**
+that hover cannot shorten (`DWELL_MS`: 60s expired, 8s resolved, 5s resolved-elsewhere),
+ordered by how much each matters. An expiry gets long enough to read; a resolve less,
+because the operator performed it but may move the mouse away before reading the
+confirmation (the same bug, and the only reason the outcome message *appeared* to work
+is that clicking leaves the pointer inside the list); a card resolved elsewhere least.
+Not longer, because stale cards would then compete with real pending holds on what is
+fundamentally a work queue — the Decisions tab is the durable record.
+
+Two smaller corrections came out of mutation-testing that fix: a `Math.max(STALE_MAX_MS,
+dwellMs)` on the cap line was **dead logic** (the floor check above already guarantees
+`ageMs >= dwellMs`) with a comment claiming it was load-bearing, which is worse than not
+having it; and `markStale` now takes the whole `{text, dwellMs}` that `departure()`
+returns rather than the two as separate arguments, so the message and how long it stays
+readable cannot be passed apart — omitting the dwell would have silently given an expiry
+the 5s treatment with nothing failing. Cards are built with `createElement`/`textContent` rather than an HTML string,
 so for the one list that renders agent-controlled values the question of whether `esc()`
 covers every context does not arise.
 
@@ -1677,11 +1711,24 @@ guard was verified by removing the route and watching it fail. The converse dire
 deliberately not asserted — `/status` is still on the allowlist unused, and pruning it
 is a separate change.
 
-Still no browser-level test: `start()`'s DOM path is covered only by those two guards.
-The new card wiring (countdown, confirm panel, pattern select) was verified once against
-a throwaway stub DOM under node — enough to catch a typo in the plumbing, not kept,
+A third guard is source-level rather than behavioural: `shouldSweep`'s dwell floor
+defaults to `0`, so **dropping the argument at the call site** would restore the
+swept-in-a-second bug with every unit test still green, since they exercise the function
+directly. The call site is therefore asserted to pass a dwell. Ugly, and the honest
+alternative — making omission impossible — is what was done for `markStale` instead;
+`shouldSweep` keeps its primitive signature because that is what makes it cheap to
+assert at the boundaries.
+
+Still no browser-level test: `start()`'s DOM path is covered only by those guards. The
+card wiring (countdown, confirm panel, pattern select, dwell) was verified against a
+throwaway stub DOM under node — enough to catch a typo in the plumbing — and not kept,
 because a hand-rolled DOM stub is a maintenance liability that would mostly assert its
-own shape.
+own shape. **The cost of that choice is now measurable and worth stating**: mutation
+testing was run twice over this work, and every mutation inside a pure helper was caught
+while every mutation inside `start()` survived. The structural fixes above (pass the
+whole object, guard the call site) reduce what a mutation there can silently break, but
+they are mitigations for missing coverage rather than coverage. See the DOM-test item
+under "Clear future improvements".
 
 *What these cannot do.* They are **browser-enforced**. A process running on the host
 sets any header it likes and can still reach the API — and that is not hypothetical

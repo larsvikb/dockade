@@ -58,8 +58,30 @@ function diffPending(shownIds, list) {
 // hovered or focused. The age cap keeps a cursor parked over the list from freezing
 // it permanently.
 const STALE_MAX_MS = 15000;
-function shouldSweep(busy, ageMs) {
-  return !busy || ageMs >= STALE_MAX_MS;
+
+// How long a departed card stays on screen REGARDLESS of where the pointer is, by why
+// it left. This is not cosmetic: the sweep above triggers as soon as removal cannot
+// move a button under the pointer, which for anyone whose cursor is not inside the list
+// means the very next 1s tick — so the `expired — default-denied` marker, the one
+// departure that reports a GOVERNANCE FAILURE, was on screen for about a second and
+// only readable by an operator who happened to be hovering. The audit row survives
+// either way, but the card is where it would be noticed.
+//
+// An expiry therefore gets long enough to actually be read. A resolve gets less (the
+// operator performed it and knows the outcome, but may move the mouse away before
+// reading the confirmation), and a card resolved elsewhere least — it is purely
+// informational. Longer than these and stale cards would compete with real pending
+// holds for attention on what is fundamentally a work queue; the Decisions tab is the
+// durable record.
+const DWELL_MS = { expired: 60000, resolved: 8000, gone: 5000 };
+
+function shouldSweep(busy, ageMs, dwellMs = 0) {
+  if (ageMs < dwellMs) return false;   // must have been readable this long
+  if (!busy) return true;              // nothing can shift under anyone
+  // A parked cursor must not freeze the list forever. No need to also max() this
+  // against dwellMs: the check above already returned for everything younger than the
+  // floor, so by here ageMs >= dwellMs and a longer floor has already had its say.
+  return ageMs >= STALE_MAX_MS;
 }
 
 // How long this hold has left, in seconds. A held request BLOCKS the agent and is
@@ -89,20 +111,27 @@ function countdownState(remainingS, holdTimeout) {
   };
 }
 
-// Why a card left the pending queue. Worth distinguishing rather than covering both
-// with one hedge: an EXPIRY is a governance outcome — the agent was denied because
-// nobody looked in time — whereas a card vanishing with time still on the clock means
-// something else resolved it. Falls back to the hedge when the window is unknown
-// (/api/config unreachable), because then we genuinely cannot tell.
-function goneReason(remainingS, holdTimeout) {
+// Why a card left the pending queue — the wording AND the kind, from one decision, so
+// the message and how long it dwells (DWELL_MS above) cannot disagree about what
+// happened. Worth distinguishing rather than covering both cases with one hedge: an
+// EXPIRY is a governance outcome — the agent was denied because nobody looked in time —
+// whereas a card vanishing with time still on the clock means something else resolved
+// it. Falls back to the hedge when the window is unknown (/api/config unreachable),
+// because then we genuinely cannot tell, and a card we cannot classify must not claim
+// the expiry wording.
+function departure(remainingS, holdTimeout) {
   if (holdTimeout === null || holdTimeout === undefined) {
-    return "no longer pending — the hold expired (default-denied) or was resolved elsewhere";
+    return { kind: "gone", dwellMs: DWELL_MS.gone,
+             text: "no longer pending — the hold expired (default-denied) or was " +
+                   "resolved elsewhere" };
   }
   if (remainingS <= 0) {
-    return `expired — no decision within ${Math.round(holdTimeout)}s, ` +
-      "so the request was default-denied";
+    return { kind: "expired", dwellMs: DWELL_MS.expired,
+             text: `expired — no decision within ${Math.round(holdTimeout)}s, ` +
+                   "so the request was default-denied" };
   }
-  return "no longer pending — resolved elsewhere, or the control plane restarted";
+  return { kind: "gone", dwellMs: DWELL_MS.gone,
+           text: "no longer pending — resolved elsewhere, or the control plane restarted" };
 }
 
 // What a `+ persist` click is about to write, for the confirm step. The pattern is
@@ -295,7 +324,7 @@ function start() {
 
     const entry = {
       el, actions, msg, cd, cdText, fill,
-      state: "pending", staleAt: null,
+      state: "pending", staleAt: null, dwell: 0,
       ts: a.ts,
       // What a persist may write, as the BACKEND will accept it. A backend that has
       // not been restarted into this change sends no options; fall back to the exact
@@ -435,9 +464,14 @@ function start() {
     entry.actions.querySelectorAll("button").forEach(b => { b.disabled = off; });
   }
 
-  function markStale(entry, text) {
+  // Takes the whole `{text, dwellMs}` from `departure()` rather than the two
+  // separately, so the message and how long it stays readable cannot be passed apart —
+  // omitting the dwell would silently give an expiry the 5s treatment and undo the fix
+  // above, with nothing failing. The 409 caller below builds the same shape by hand.
+  function markStale(entry, d) {
     entry.state = "stale";
     entry.staleAt = Date.now();
+    entry.dwell = d.dwellMs;
     entry.el.classList.remove("busy", "confirming");
     entry.el.classList.add("stale");
     // A card nobody can act on any more shows neither a deadline nor a half-finished
@@ -445,7 +479,7 @@ function start() {
     entry.confirm.hidden = true;
     entry.cd.hidden = true;
     disableActions(entry, true);
-    setMessage(entry, text, "bad");
+    setMessage(entry, d.text, "bad");
   }
 
   // `pattern` is sent only for the `*_persist` actions, and only ever a value the
@@ -474,6 +508,10 @@ function start() {
         // hung click.
         entry.state = "resolved";
         entry.staleAt = Date.now();
+        // Long enough to read the outcome after moving the mouse off the list, which is
+        // the natural thing to do right after clicking — before this, the card could go
+        // in about a second and take the confirmation with it.
+        entry.dwell = DWELL_MS.resolved;
         entry.el.classList.remove("busy");
         entry.cd.hidden = true;
         entry.el.classList.add(d.outcome === "allow" ? "done-allow" : "done-deny");
@@ -491,7 +529,9 @@ function start() {
       } else if (r.status === 409) {
         // Backend says it is no longer pending (expired, or resolved elsewhere).
         // Re-enabling the buttons would only invite a second failing click.
-        markStale(entry, "no longer pending — the hold expired or was already resolved");
+        markStale(entry, {
+          dwellMs: DWELL_MS.gone,
+          text: "no longer pending — the hold expired or was already resolved" });
       } else {
         entry.state = "pending";
         entry.el.classList.remove("busy");
@@ -520,7 +560,7 @@ function start() {
     const now = Date.now();
     for (const [id, entry] of cards) {
       if (entry.staleAt === null) continue;
-      if (shouldSweep(busy, now - entry.staleAt)) {
+      if (shouldSweep(busy, now - entry.staleAt, entry.dwell)) {
         entry.el.remove();
         cards.delete(id);
       }
@@ -542,11 +582,13 @@ function start() {
           || entry.state === "resolving") {
         // Say WHICH way it went. An expiry is a decision the operator failed to make
         // in time and the agent was denied for it; a card leaving with time left is
-        // somebody or something else resolving it. Both used to read the same.
-        markStale(entry, goneReason(
+        // somebody or something else resolving it. Both used to read the same — and
+        // the expiry now also stays put long enough to be read (see DWELL_MS).
+        const d = departure(
           holdTimeout === null ? null
             : holdRemaining(entry.ts, holdTimeout, Date.now()),
-          holdTimeout));
+          holdTimeout);
+        markStale(entry, d);
       }
     }
     sweep();
@@ -687,7 +729,8 @@ if (typeof document !== "undefined") { start(); }
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     lampState, backoffDelay, diffPending, shouldSweep,
-    holdRemaining, countdownState, goneReason, persistPreview,
+    holdRemaining, countdownState, departure, persistPreview,
     RECONNECT_MIN_MS, RECONNECT_MAX_MS, STALE_MAX_MS, COUNTDOWN_URGENT_S,
+    DWELL_MS,
   };
 }

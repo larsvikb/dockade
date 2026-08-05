@@ -333,9 +333,21 @@ services:
       # Pre-fetch GGUFs here on the host. Read-only: inference never writes.
       - ${DOCKADE_MODELS_DIR:-./models}:/models:ro
     environment:
-      # Without this the Level Zero driver cannot query free memory and reports
-      # total instead — which matters on an iGPU, where "VRAM" is shared with the
-      # host and the honest free figure is the one that prevents over-allocation.
+      # Asks the Level Zero driver to report FREE device memory rather than total —
+      # which matters on an iGPU, where "VRAM" is shared with the host and the
+      # honest free figure is the one that prevents over-allocation.
+      #
+      # It does NOT work on this path, and the container log says so on every boot:
+      # `ext_intel_free_memory is not supported (export/set ZES_ENABLE_SYSMAN=1 to
+      # support), use total memory as free memory` — printed WITH the variable
+      # already set, because the WSL2 paravirtual D3D12 device exposes no sysman
+      # interface to enable. Kept anyway: harmless here, and correct on the native
+      # Linux paths where the query does exist.
+      #
+      # The consequence is the reason `-c` is hand-sized below rather than trusted
+      # to fit: llama.cpp is planning allocations against TOTAL shared memory as
+      # though all of it were free, so it cannot warn about an overshoot. On this
+      # host, 32768 fits and 64k does not, and only measurement establishes that.
       ZES_ENABLE_SYSMAN: "1"
     # Prepend the WSL driver dir to the image's OWN LD_LIBRARY_PATH (which points
     # at its oneAPI libs) — replacing it instead of prepending breaks the runtime
@@ -369,8 +381,11 @@ services:
     # this model's native window would try to allocate far past the pool.
     # --no-context-shift makes overflow a visible error instead of silently
     # discarding the oldest tokens — for an agent that means a failed request
-    # rather than a corrupted conversation with its system prompt evicted.
-    # The client must be told the same number; see opencode-sandbox/opencode.json.
+    # rather than a corrupted conversation with its system prompt evicted. Earned
+    # its place: the log shows it rejecting three oversized requests outright, and
+    # opencode compacting and continuing after each. Loud and recoverable.
+    # The client must be told a SMALLER number, not this one — it overshoots
+    # whatever window it is given. See the headroom check in the Makefile.
     #
     # --parallel 1 because the PROMPT CACHE IS PER-SLOT. llama-server defaults to 4
     # slots and assigns requests by LRU, so a multi-turn agent conversation can land

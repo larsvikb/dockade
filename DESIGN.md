@@ -1376,10 +1376,21 @@ flag converts one into either a loud failure or a bounded cost. Measurements and
 - **`--no-context-shift`** — the default silently discards the oldest tokens, which for
   an agent means evicting its system prompt and tool definitions mid-conversation.
   Presents as the model becoming inexplicably confused rather than as an error.
-- **`-c 32768`, matched by `limit.context` in the client config** and guarded by `make
-  consistency`. 8k is not merely tight but unusable — opencode's base prompt exceeds it
-  before the first user turn — and 64k does not fit the shared memory pool. Avoid `-c 0`,
-  which would size the allocation from the model's native window.
+- **`-c 32768`, and the client's `limit.context` must be materially SMALLER** — a ratio
+  guarded by `make consistency` (`CTX_HEADROOM`). 8k is not merely tight but unusable —
+  opencode's base prompt exceeds it before the first user turn — and 64k does not fit the
+  shared memory pool. Avoid `-c 0`, which would size the allocation from the model's
+  native window.
+
+  The headroom is the part that is not obvious, and the repo learned it by getting it
+  wrong: the guard originally required the two numbers to be **equal**, on the reasoning
+  that a client told the true window would respect it. A client told the true window
+  overshoots it anyway (measurements in `NOTES.md`), because its token accounting is its
+  own and tool output arrives after the turn is budgeted. So the invariant that survives
+  contact is *the server's window exceeds what the client believes*, by enough to absorb
+  the client's undercount — and it is free, because `-c` sets the KV allocation and does
+  not move. **A cross-component agreement check is only as good as its direction**; two
+  numbers matching is not the same as two components agreeing.
 - **One model at a time**, and `temperature: 0` for extraction/classification.
 
 Two properties worth carrying in the reader's head, because they shape task design more

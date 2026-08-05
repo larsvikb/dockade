@@ -12,7 +12,7 @@
         "local": {
           "name": "dockade local model",
           "limit": {
-            "context": 32768,
+            "context": 24576,
             "output": 4096
           }
         }

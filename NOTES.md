@@ -77,9 +77,20 @@ costs nothing here.
   f16 KV on top of ~5.5 GB of weights fits the ~16.9 GB shared pool with headroom;
   64k does not. 8k is not merely tight but unusable for an agent harness —
   opencode's base prompt (system + tool schemas) exceeds it before the first user
-  turn. Both ends must agree: `-c` on the server and `limit.context` in the client
-  config, guarded by `make consistency`. Avoid `-c 0` (load from model), which
-  would size the allocation from the model's native window.
+  turn — measured at **~8.6k tokens**, so 26% of a 32k window is gone before the
+  agent does anything. Avoid `-c 0` (load from model), which would size the
+  allocation from the model's native window.
+- **A client told the true window still overshoots it.** This is the one that cost
+  real agent runs. `-c 32768` on the server and `limit.context: 32768` in
+  opencode.json agreed exactly, and the server still rejected three requests across
+  a day's sessions: **40840, 37943 and 35980 tokens** against the 32768 window —
+  up to 1.25x over. So the client's context accounting is approximate; plausibly it
+  does not tokenize with the server's tokenizer, and tool output enters the
+  conversation after the turn has been budgeted. **Equality is the wrong
+  invariant** — it leaves the client no room to be wrong in the direction it is
+  actually wrong in. Give the server headroom over what the client believes
+  (`CTX_HEADROOM` in the Makefile) and the client compacts before the server has to
+  refuse. Free, too: the server's KV allocation follows `-c`, which does not move.
 - **The prompt cache is per-slot, so run one slot.** llama-server defaults to 4
   slots assigned by LRU; a multi-turn conversation can land on a slot that never
   saw it and re-prefill the entire history. `--parallel 1` keeps the prefix stable.
@@ -94,7 +105,25 @@ costs nothing here.
 - **Overflow should fail, not silently truncate.** `--no-context-shift`: the
   default discards the oldest tokens, which for an agent means evicting its system
   prompt and tool definitions mid-conversation — degradation that presents as the
-  model becoming inexplicably confused rather than as an error.
+  model becoming inexplicably confused rather than as an error. **Vindicated by the
+  three overflows above**: each produced `send_error ... exceeds the available
+  context size`, a cancelled task, and then a *smaller* follow-up request from
+  opencode (40840 rejected, next request 4549) — it compacted and carried on. Loud
+  and recoverable, which is the whole argument for the flag.
+- **`ZES_ENABLE_SYSMAN=1` does nothing under WSL2.** The var is set in the compose
+  service, and the log still prints `ext_intel_free_memory is not supported
+  (export/set ZES_ENABLE_SYSMAN=1 to support), use total memory as free memory` on
+  every boot — there is no sysman interface on the paravirtual D3D12 device to
+  enable. Consequence: llama.cpp plans allocations against **total** shared memory
+  as though all of it were free, so it cannot warn about an overshoot. That is why
+  `-c` is hand-sized from measurement rather than trusted to fit. The var is kept
+  because it is correct on the native-Linux paths.
+- **The CORS / no-API-key warning in the log is not a finding here.** llama-server
+  warns that it allows all origins with no key. There is no browser origin and no
+  authenticated surface: sandbox-net is `internal: true`, the service publishes no
+  port, and its only client is tier 2, whose firewall permits exactly this one
+  destination. Adding a key would protect nothing that reachability does not
+  already protect.
 
 ### Tier 2 end to end, measured
 

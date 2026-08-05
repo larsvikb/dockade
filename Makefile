@@ -25,6 +25,11 @@ COMPOSE := docker compose
 SANDBOX ?= claude-sandbox
 WORKSPACE ?= $(PWD)
 
+# How far the inference server's context window must exceed the window the CLIENT
+# believes it has. Not a safety margin picked by taste — it is sized to a measured
+# overshoot; see the context-window headroom check in `consistency`.
+CTX_HEADROOM := 1.33
+
 # Strict mode. Every stage of `check` degrades to a SKIP when its tool is absent —
 # right on a dev machine, where running the checks you CAN run beats running none.
 # In CI it is a trap: a runner image without hadolint would print `SKIP hadolint`
@@ -149,12 +154,28 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	  printf '%s\n' "$$missing" | sed 's/^/    /'; exit 1
 	fi
 	echo "  ok — every firewall host is covered by the control-plane policy seed"
-	echo "== context-window agreement (server -c == opencode limit.context) =="
-	# Two numbers in two files that must match. If the server's window is SMALLER
-	# than what opencode believes, opencode packs a prompt the server rejects
-	# outright (and --no-context-shift means it fails loudly rather than silently
-	# evicting the system prompt). If it is LARGER, the tier just wastes memory it
-	# will never use. Neither is visible until an agent run dies mid-task.
+	echo "== context-window headroom (server -c >= opencode limit.context x $(CTX_HEADROOM)) =="
+	# Two numbers in two files, and the relationship between them is NOT equality.
+	#
+	# It used to be. That check passed while three agent runs died anyway: the
+	# server refused requests of 40840, 37943 and 35980 tokens against a 32768
+	# window, with both files declaring 32768 and agreeing perfectly. So a client
+	# told the true window still overshoots it — opencode's own accounting is
+	# approximate (it does not tokenize with the server's tokenizer, and tool
+	# output lands in the conversation after it has budgeted for the turn). Making
+	# the numbers equal leaves the client no room to be wrong in the one direction
+	# it is actually wrong in.
+	#
+	# So the invariant is HEADROOM, not agreement: the server's window must exceed
+	# what the client believes by enough to absorb the client's undercount. The
+	# worst overshoot observed was 1.25x, hence the 1.33x floor. Costs nothing in
+	# memory — the server's KV allocation is set by -c, which does not move; the
+	# client simply compacts earlier and the overflow never reaches the server.
+	#
+	# Still a real check in the other direction: too MUCH headroom means the tier
+	# pays KV for a window the client will never fill, so this fails on a client
+	# limit under half the server's. Both failure modes stay invisible until an
+	# agent run dies mid-task, which is why they are worth a build-time guard.
 	srv=$$(grep -oE '\-c \$$\{DOCKADE_LLM_CTX:-[0-9]+\}' docker-compose.yml \
 	         | grep -oE '[0-9]+' | sort -u)
 	oc=$$(python3 -c "import json; print(json.load(open('opencode-sandbox/opencode.json'))['provider']['local']['models']['local']['limit']['context'])")
@@ -162,13 +183,15 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	  echo "  FAIL: accelerator variants disagree on the default context size:"
 	  printf '%s\n' "$$srv" | sed 's/^/    /'; exit 1
 	fi
-	if [ "$$srv" != "$$oc" ]; then
-	  echo "  FAIL: server default -c is $$srv but opencode.json limit.context is $$oc"
-	  echo "        — the client would size prompts against a window the server does"
-	  echo "        not have. Update both, or override DOCKADE_LLM_CTX deliberately."
-	  exit 1
-	fi
-	echo "  ok — both declare $$srv tokens"
+	python3 -c "import sys; srv, oc, h = $$srv, $$oc, $(CTX_HEADROOM); \
+	  sys.exit(0) if srv >= oc * h else (print(f'  FAIL: server -c is {srv} but opencode.json limit.context is {oc} —'), \
+	  print(f'        only {srv/oc:.2f}x headroom, and {h}x is required. A client told the'), \
+	  print('        exact window still overshoots it; see the comment above. Lower'), \
+	  print('        limit.context, or raise -c and pay the KV for it.'), sys.exit(1))"
+	python3 -c "import sys; srv, oc = $$srv, $$oc; \
+	  sys.exit(0) if oc * 2 >= srv else (print(f'  FAIL: server -c is {srv} but opencode.json limit.context is only {oc} —'), \
+	  print('        the tier pays KV cache for a window the client will never fill.'), sys.exit(1))"
+	echo "  ok — server $$srv, client $$oc ($$(python3 -c "print(f'{$$srv/$$oc:.2f}')")x headroom)"
 	echo "== launchers are executable IN THE GIT INDEX =="
 	# `make claude` / `make opencode` / verify-build all invoke these as
 	# ./run-*-sandbox.sh, so the exec bit is load-bearing for anyone who CLONES.

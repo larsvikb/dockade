@@ -49,7 +49,8 @@ def _clear_all():
     cp._PENDING_CLIENT.clear()
     # Module state like the two above, and reset for the same reason: it is
     # process-lifetime by design, which across tests means it leaks.
-    cp._SATURATION.update(count=0, last_ts=None, last_scope=None, last_host=None)
+    cp._SATURATION.update(count=0, last_ts=None, last_scope=None, last_host=None,
+                          acked=0, acked_ts=None)
 
 
 def _auth_req(host, **kw):
@@ -614,8 +615,8 @@ class SaturationTests(_CPTestCase):
         sat = cp._saturation()
         self.assertEqual(
             set(sat),
-            {"in_flight", "max_pending", "rejections", "last_ts", "last_scope",
-             "last_host", "since"})
+            {"in_flight", "max_pending", "rejections", "acknowledged", "last_ts",
+             "last_scope", "last_host", "since"})
         # Both stamps are epoch seconds — comfortably past 2001 — not durations.
         self.assertGreater(sat["last_ts"], 1_000_000_000)
         self.assertGreater(sat["since"], 1_000_000_000)
@@ -631,6 +632,71 @@ class SaturationTests(_CPTestCase):
         # In-memory, so a restart resets it. The UI can only be honest about that if
         # the payload says which window the count covers.
         self.assertEqual(cp._saturation()["since"], cp._STARTED_TS)
+
+    # ── acknowledgement ──────────────────────────────────────────────────────
+
+    def test_acknowledgement_lives_in_the_control_plane_not_the_page(self):
+        # The bug this fixes: dismissal was page state, so a reload brought the
+        # banner back. An operator who believes they cleared something and a page
+        # that disagrees on refresh is worse than offering no button.
+        self._over_cap()
+        self._over_cap()
+        cp.api_saturation_ack(cp.AckRequest(count=2))
+        sat = cp._saturation()
+        self.assertEqual(sat["rejections"], 2)
+        self.assertEqual(sat["acknowledged"], 2)
+
+    def test_a_rejection_racing_the_click_is_not_swallowed(self):
+        # The reason this is a high-water mark rather than a reset. The operator read
+        # 2 and clicked; a third landed in the gap. Zeroing the counter would lose it,
+        # and rejections come in bursts — exactly when the gap is open.
+        self._over_cap()
+        self._over_cap()
+        self._over_cap()                       # arrives while the click is in flight
+        cp.api_saturation_ack(cp.AckRequest(count=2))
+        sat = cp._saturation()
+        self.assertEqual(sat["rejections"] - sat["acknowledged"], 1)
+
+    def test_acknowledgement_never_goes_backwards(self):
+        for _ in range(3):
+            self._over_cap()
+        cp.api_saturation_ack(cp.AckRequest(count=3))
+        cp.api_saturation_ack(cp.AckRequest(count=1))   # a stale tab, or a replay
+        self.assertEqual(cp._saturation()["acknowledged"], 3)
+
+    def test_acknowledging_more_than_happened_is_clamped(self):
+        # Otherwise a client number silences FUTURE rejections until they catch up —
+        # a governance signal suppressed by an unvalidated input. Same reasoning as
+        # validating `pattern` in resolve, and the same answer.
+        self._over_cap()
+        cp.api_saturation_ack(cp.AckRequest(count=10_000))
+        self.assertEqual(cp._saturation()["acknowledged"], 1)
+        self._over_cap()
+        sat = cp._saturation()
+        self.assertEqual(sat["rejections"] - sat["acknowledged"], 1)
+
+    def test_negative_acknowledgements_are_floored(self):
+        self._over_cap()
+        cp.api_saturation_ack(cp.AckRequest(count=-5))
+        self.assertEqual(cp._saturation()["acknowledged"], 0)
+
+    def test_the_window_moves_to_the_dismissal(self):
+        # The count and the stamp beside it must describe the SAME span, or the
+        # banner reads "1 request since 14:02" for something that happened at 15:30.
+        self._over_cap()
+        before = cp._saturation()["since"]
+        self.assertEqual(before, cp._STARTED_TS)
+        cp.api_saturation_ack(cp.AckRequest(count=1))
+        after = cp._saturation()["since"]
+        self.assertNotEqual(after, cp._STARTED_TS)
+        self.assertGreaterEqual(after, before)
+
+    def test_an_acknowledgement_that_changes_nothing_leaves_the_window_alone(self):
+        self._over_cap()
+        cp.api_saturation_ack(cp.AckRequest(count=1))
+        stamped = cp._saturation()["since"]
+        cp.api_saturation_ack(cp.AckRequest(count=1))   # idempotent replay
+        self.assertEqual(cp._saturation()["since"], stamped)
 
 
 class FreshSchemaTests(unittest.TestCase):

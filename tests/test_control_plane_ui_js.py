@@ -60,7 +60,7 @@ _PROBE = r"""
 const m = require(process.env.DOCKADE_APP_JS);
 const missing = ["lampState", "backoffDelay", "diffPending", "shouldSweep",
                  "holdRemaining", "countdownState", "departure", "persistPreview",
-                 "saturationState"]
+                 "saturationState", "ackCount"]
   .filter(n => typeof m[n] !== "function");
 console.log(JSON.stringify({
   missing,
@@ -174,10 +174,21 @@ console.log(JSON.stringify({
         { ...rej(5000), last_scope: null, last_host: null }, NOW, 0).detail,
       dismissed: m.saturationState(rej(5000), NOW, 3),
       dismissed_then_more: m.saturationState({ ...rej(5000), rejections: 4 }, NOW, 3),
+      // Two more after acknowledging three: the banner counts the UNREAD, not the
+      // lifetime total, so it must say 2.
+      unread_not_total: m.saturationState(
+        { ...rej(5000), rejections: 5 }, NOW, 3).text,
       // A rejection outranks the gauge: the event matters more than the level.
       rejection_beats_load: m.saturationState(
         { ...rej(5000), in_flight: 16 }, NOW, 0).level,
       one: m.saturationState({ ...rej(5000), rejections: 1 }, NOW, 0).text,
+      ack: {
+        counts_what_happened: m.ackCount({ rejections: 7 }),
+        nothing_to_ack: m.ackCount(null),
+        absent_field: m.ackCount({}),
+        never_negative: m.ackCount({ rejections: -2 }),
+        junk: m.ackCount({ rejections: "three" }),
+      },
     };
   })(),
 }));
@@ -472,10 +483,34 @@ class PageScriptTests(unittest.TestCase):
         # would swallow every rejection after the first dismissal.
         self.assertFalse(sat["dismissed"]["show"])
         self.assertTrue(sat["dismissed_then_more"]["show"])
-        self.assertEqual(sat["dismissed_then_more"]["count"], 4)
+
+    def test_the_banner_counts_what_is_unread_not_what_has_ever_happened(self):
+        sat = self.probe["saturation"]
+        # After acknowledging 3, a 4th reads "1" — and the backend moves `since` to
+        # the dismissal, so the number and the window beside it agree. Reporting the
+        # lifetime total here would answer a question the operator did not ask.
+        self.assertEqual(sat["dismissed_then_more"]["count"], 1)
+        self.assertIn("1 request denied", sat["dismissed_then_more"]["text"])
+        self.assertIn("2 requests denied", sat["unread_not_total"])
 
     def test_the_count_reads_as_english_for_one(self):
         self.assertIn("1 request denied", self.probe["saturation"]["one"])
+
+    def test_a_dismissal_acknowledges_everything_currently_reported(self):
+        """`ackCount` exists to be the ONE expression behind both the optimistic hide
+        and the POST body. Written twice, the two could disagree and the failure would
+        be silent: the banner hides, the POST returns 200, and the dismissal simply
+        does not persist — which is the bug server-side acknowledgement was added to
+        fix. It is also the only part of the dismiss path a unit test can reach, since
+        the click handler lives in `start()`."""
+        ack = self.probe["saturation"]["ack"]
+        self.assertEqual(ack["counts_what_happened"], 7)
+        # Nothing on screen, nothing to acknowledge — and never a number the backend
+        # would have to clamp.
+        self.assertEqual(ack["nothing_to_ack"], 0)
+        self.assertEqual(ack["absent_field"], 0)
+        self.assertEqual(ack["never_negative"], 0)
+        self.assertEqual(ack["junk"], 0)
 
 
 class InlineScriptTests(unittest.TestCase):
@@ -609,6 +644,31 @@ class InlineScriptTests(unittest.TestCase):
             "sweep() must pass the departed card's dwell as the third argument, or an "
             "expired hold is swept before it can be read")
         self.assertIn("dwell", sites[0])
+
+    def test_the_dismiss_handler_acknowledges_and_then_believes_the_backend(self):
+        """Two lines in `start()` that unit tests cannot reach, and they are each
+        other's safety net — which is exactly why both are asserted here.
+
+        The click must acknowledge via `ackCount`. A hardcoded number there hides the
+        banner, returns 200, and silently fails to persist — the very bug server-side
+        acknowledgement was added to fix. That mistake IS detectable at runtime,
+        because the endpoint echoes what it recorded and the banner reappears at once
+        if it disagrees. But only while the handler reads that echo rather than
+        assuming its own number stuck. Drop the echo and the detector goes with it.
+
+        Source-level and ugly, for the reason the sweep guard above is: the honest
+        alternative is making omission impossible, and a call site passing the wrong
+        literal cannot be designed away."""
+        js = APP_JS.read_text()
+        handler = re.search(r"satDismiss\.addEventListener\(.*?\n  \}\);", js, re.S)
+        self.assertIsNotNone(handler, "dismiss handler not found — did the wiring move?")
+        body = handler.group(0)
+        self.assertIn("ackCount(", body,
+                      "the dismiss click must acknowledge ackCount(...), not a literal")
+        self.assertRegex(
+            body, r"localAck\s*=\s*Number\([^;]*\.acknowledged\)",
+            "the handler must adopt the acknowledgement the BACKEND recorded; without "
+            "that echo a wrong count fails silently instead of re-raising the banner")
 
     def test_the_script_file_is_the_one_the_app_serves(self):
         # UI_SCRIPT points into the image; assert the repo file the Dockerfile copies

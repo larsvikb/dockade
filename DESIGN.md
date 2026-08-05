@@ -1045,10 +1045,38 @@ able to present itself as a positive all-clear.
 Two decisions worth keeping. The banner **does not auto-clear**: the failure it reports
 is precisely that nobody was looking, so expiring the notice after a minute would
 re-create the bug for the only population it serves. Emphasis decays (`recent` → `past`
-at 60s) and dismissal is explicit — and dismissal acknowledges a *count*, not a flag, so
-the next rejection raises it again. And it says nothing in its headline about *which*
+at 60s) and dismissal is explicit. And it says nothing in its headline about *which*
 cap fired: the operator's response is the same either way, and per-client detail would
 be the first thing in this UI to expose client identity, so it sits in the detail line.
+
+**Dismissal is server-side, and it is a high-water mark.** It began as page state,
+which meant a reload restored the banner — worse than offering no button, because the
+operator believes they cleared something and the page disagrees on refresh. It now
+POSTs to `/api/saturation/ack`, and three properties of that endpoint are load-bearing:
+
+- **A count, not a "dismiss".** Acknowledging *the two I have read* leaves a third that
+  landed while the click was in flight still unread. Zeroing a counter would swallow
+  it, and rejections arrive in bursts — exactly when that window is open.
+- **Monotonic and clamped to what actually happened.** A lower count never
+  un-acknowledges (a stale tab, a replay), and a count above the current total is
+  clamped, because otherwise an unvalidated client number silences *future* rejections
+  until they catch up. Same reasoning as validating `pattern` in `resolve`.
+- **The window moves with it.** `since` becomes the acknowledgement time, so the banner
+  reports what has happened *since you dismissed* and the number always describes the
+  span the stamp names. The count shown is therefore the **unread** delta, not the
+  lifetime total — which the audit table holds durably anyway.
+
+Not audited, deliberately: the rejections are already in the audit table with their
+reasons, and acknowledging one changes what the banner displays while touching no
+evidence. A row here would put a non-decision in the decisions log.
+
+The dismiss path also reaches into `start()`, which is unverified by choice — so it is
+built to make its own mistakes loud. `ackCount()` is a pure function purely so the
+optimistic hide and the POST body are *one expression* and cannot disagree, and the
+handler adopts the acknowledgement the backend **echoes back** rather than assuming its
+own number stuck, so a wrong count re-raises the banner immediately instead of failing
+silently. Those two lines are each other's safety net — drop the echo and the detector
+for the first mistake goes with it — which is why a source-level guard asserts both.
 
 It rides the existing SSE payload rather than a new endpoint — `/approvals` and the
 stream now return `{holds, saturation}` — so a rejection reaches the banner within a
@@ -1099,7 +1127,9 @@ without adding its route yields a 403 visible only to an operator loading the re
 against a real backend. That is precisely how `/api/config` would have failed; the
 guard was verified by removing the route and watching it fail. The converse direction is
 deliberately not asserted — `/status` is still on the allowlist unused, and pruning it
-is a separate change.
+is a separate change. The guard earned its keep a second time on
+`POST /api/saturation/ack`: removing the route from the allowlist fails the suite
+rather than the browser.
 
 A third guard is source-level rather than behavioural: `shouldSweep`'s dwell floor
 defaults to `0`, so **dropping the argument at the call site** would restore the

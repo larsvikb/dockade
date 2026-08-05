@@ -169,11 +169,14 @@ function persistPreview(action, option) {
 const SATURATION_RECENT_MS = 60000;
 const SATURATION_WARN_FRAC = 0.75;
 
-// `dismissedCount` is the rejection total the operator has already acknowledged, so a
-// dismissed banner RETURNS on the next rejection rather than staying shut. There is no
-// time-based auto-clear on purpose: the failure being reported is precisely "nobody was
-// looking", so expiring the notice after a minute would re-create the bug for the one
-// population it exists to serve. Emphasis decays; the notice does not.
+// `dismissedCount` is the rejection total already acknowledged — held in the CONTROL
+// PLANE, not here, because a dismissal that a reload undoes is worse than no button at
+// all: the operator believes they cleared something and the page disagrees the moment
+// they refresh. The banner therefore reports what has happened SINCE the dismissal, and
+// returns on the next rejection rather than staying shut. There is no time-based
+// auto-clear on purpose: the failure being reported is precisely "nobody was looking",
+// so expiring the notice after a minute would re-create the bug for the one population
+// it exists to serve. Emphasis decays; the notice does not.
 function saturationState(sat, nowMs, dismissedCount = 0) {
   const hidden = { show: false, level: "none", count: 0, text: "", detail: "", lastTs: null };
   if (!sat) return hidden;
@@ -181,18 +184,22 @@ function saturationState(sat, nowMs, dismissedCount = 0) {
   const inFlight = Number(sat.in_flight) || 0;
   const rejections = Number(sat.rejections) || 0;
 
-  if (rejections > dismissedCount) {
+  // The UNREAD count, not the lifetime total: after dismissing at 2, a third rejection
+  // reads "1 request denied unheard", and the `since` stamp beside it has moved to the
+  // dismissal — so the number and the window it covers always describe the same span.
+  const unread = rejections - dismissedCount;
+  if (unread > 0) {
     const lastTs = Number(sat.last_ts);
     const known = Number.isFinite(lastTs) && lastTs > 0;
     // Age from an ABSOLUTE stamp, computed here — the payload never carries an
     // elapsed value (see _saturation in the control plane).
     const recent = known && (nowMs - lastTs * 1000) < SATURATION_RECENT_MS;
-    const plural = rejections === 1 ? "" : "s";
+    const plural = unread === 1 ? "" : "s";
     return {
       show: true,
       level: recent ? "recent" : "past",
-      count: rejections,
-      text: `${rejections} request${plural} denied unheard — over the hold cap, ` +
+      count: unread,
+      text: `${unread} request${plural} denied unheard — over the hold cap, ` +
             "so no approval card was raised",
       // Never renders a bare zero anywhere (the banner is hidden at zero), and says
       // SINCE WHEN, because this counter is in-memory and a restart silently resets
@@ -220,6 +227,16 @@ function saturationState(sat, nowMs, dismissedCount = 0) {
     };
   }
   return hidden;
+}
+
+// What a Dismiss click acknowledges. A one-line function only because it must be the
+// SAME expression the optimistic local hide uses and the one the POST body carries:
+// with the number written twice, the two can disagree, and the failure is silent —
+// the banner hides, the POST returns 200, and the dismissal simply does not persist.
+// As a pure function it is also the only part of the dismiss path a unit test can
+// reach, `start()` being deliberately unverified.
+function ackCount(sat) {
+  return sat ? Math.max(0, Number(sat.rejections) || 0) : 0;
 }
 
 // ── the page ────────────────────────────────────────────────────────────────
@@ -644,18 +661,45 @@ function start() {
   const satDetail = document.getElementById("sat-detail");
   const satDismiss = document.getElementById("sat-dismiss");
   let lastSaturation = null;
-  let dismissedRejections = 0;
+  // Optimistic acknowledgement, held only until the stream echoes the backend's own.
+  // The POST plus the next push is up to a second, and a banner that lingers after the
+  // click reads as a button that did not work.
+  let localAck = 0;
 
-  satDismiss.addEventListener("click", () => {
-    // Acknowledge exactly what has happened so far. Anything after this re-raises the
-    // banner, because `saturationState` compares against this number rather than
-    // clearing a flag.
-    dismissedRejections = lastSaturation ? Number(lastSaturation.rejections) || 0 : 0;
+  satDismiss.addEventListener("click", async () => {
+    // One expression for both the optimistic hide and the POST body, so they cannot
+    // disagree. Acknowledging a COUNT rather than sending a "dismiss" is what lets a
+    // rejection that landed between the render and the click survive as unread.
+    const n = ackCount(lastSaturation);
+    localAck = n;
     renderSaturation();
+    try {
+      const r = await fetch("/api/saturation/ack", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ count: n }),
+      });
+      if (!r.ok) throw new Error(String(r.status));
+      // Take the acknowledgement the backend actually RECORDED, not the one we hoped
+      // to send — the same reason a resolved card reports `d.pattern` from the
+      // response. If this page ever sends the wrong count, the banner reappears
+      // immediately instead of the dismissal quietly failing to persist.
+      localAck = Number((await r.json()).acknowledged) || 0;
+      renderSaturation();
+    } catch (e) {
+      // The POST is the whole point — it is what survives a reload. If it failed, put
+      // the banner back rather than leaving the operator believing it stuck.
+      localAck = 0;
+      renderSaturation();
+    }
   });
 
   function renderSaturation() {
-    const s = saturationState(lastSaturation, Date.now(), dismissedRejections);
+    // Whichever acknowledgement is further along: the backend's, or the click we have
+    // not had confirmed yet.
+    const acked = Math.max(
+      localAck, lastSaturation ? Number(lastSaturation.acknowledged) || 0 : 0);
+    const s = saturationState(lastSaturation, Date.now(), acked);
     satEl.hidden = !s.show;
     if (!s.show) return;
     satEl.className = "saturation " + s.level;
@@ -840,6 +884,7 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     lampState, backoffDelay, diffPending, shouldSweep,
     holdRemaining, countdownState, departure, persistPreview, saturationState,
+    ackCount,
     RECONNECT_MIN_MS, RECONNECT_MAX_MS, STALE_MAX_MS, COUNTDOWN_URGENT_S,
     DWELL_MS, SATURATION_RECENT_MS, SATURATION_WARN_FRAC,
   };

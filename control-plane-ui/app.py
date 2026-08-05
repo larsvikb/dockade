@@ -115,6 +115,7 @@ _RELAY_ROUTES = (
     ("GET", re.compile(r"^/api/audit$")),
     ("GET", re.compile(r"^/api/rules$")),
     ("GET", re.compile(r"^/api/config$")),
+    ("POST", re.compile(r"^/api/saturation/ack$")),
     ("GET", re.compile(r"^/status$")),
 )
 

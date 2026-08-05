@@ -103,9 +103,15 @@ _PENDING_CLIENT: dict[str, str | None] = {}
 #
 # ``since`` is the process start, and it is load-bearing for honesty: "3 denied
 # unheard" means three since this timestamp, never three ever.
+#
+# ``acked`` is a HIGH-WATER MARK rather than a reset-to-zero, and that choice is what
+# makes dismissal race-free: acknowledging "the 2 I have read" leaves a third that
+# arrived while the click was in flight still unread, whereas zeroing the counter would
+# swallow it. Rejections arrive in bursts, which is precisely when that gap is open.
 _STARTED_TS = time.time()
 _SATURATION: dict[str, object] = {
-    "count": 0, "last_ts": None, "last_scope": None, "last_host": None}
+    "count": 0, "last_ts": None, "last_scope": None, "last_host": None,
+    "acked": 0, "acked_ts": None}
 
 
 # ── storage ─────────────────────────────────────────────────────────────────
@@ -362,10 +368,14 @@ def _saturation() -> dict:
             "in_flight": len(_PENDING_EVENTS),
             "max_pending": MAX_PENDING,
             "rejections": _SATURATION["count"],
+            "acknowledged": _SATURATION["acked"],
             "last_ts": _SATURATION["last_ts"],
             "last_scope": _SATURATION["last_scope"],
             "last_host": _SATURATION["last_host"],
-            "since": _STARTED_TS,
+            # The window the count covers, and it MOVES to the dismissal: after an
+            # acknowledgement the banner reports what has happened since then, so the
+            # number and the stamp beside it always describe the same span.
+            "since": _SATURATION["acked_ts"] or _STARTED_TS,
         }
 
 
@@ -470,6 +480,13 @@ class ResolveRequest(BaseModel):
     # ``_persist_candidates``; omitted means the narrowest of them (the exact host).
     # Ignored by the two `*_once` actions, which write no rule at all.
     pattern: str | None = None
+
+
+class AckRequest(BaseModel):
+    # How many over-cap rejections the operator has read. A count rather than a
+    # "dismiss" flag, so a rejection arriving between the render and the click is
+    # still unread afterwards. Clamped server-side — see ``api_saturation_ack``.
+    count: int
 
 
 # ── lifecycle ───────────────────────────────────────────────────────────────
@@ -733,6 +750,37 @@ def api_config() -> dict:
     is left cannot distinguish hold-for-approval from a slow deny. Sent rather than
     hardcoded in the page, so the number the operator sets is the number they see."""
     return {"hold_timeout": HOLD_TIMEOUT}
+
+
+@app.post("/api/saturation/ack")
+def api_saturation_ack(req: AckRequest) -> dict:
+    """Acknowledge over-cap rejections the operator has read.
+
+    Server-side because a dismissal held in the page is not a dismissal: reloading
+    restored the banner, which is worse than not offering the button — the operator
+    believes they have cleared something and the state disagrees.
+
+    A HIGH-WATER MARK, not a reset. Acknowledging "the 2 I read" leaves a third that
+    arrived while the click was in flight still unread; zeroing the counter would
+    swallow it, and rejections arrive in bursts, which is exactly when that window is
+    open. Monotonic for the same reason — a lower count never un-acknowledges.
+
+    Clamped to what has actually happened. An acknowledgement above the current total
+    would suppress FUTURE rejections until they caught up, which is a governance signal
+    silenced by an unvalidated client number — the same reasoning that validates
+    ``pattern`` in ``resolve``, and the same answer.
+
+    Deliberately NOT audited. The rejections themselves are already in the audit table
+    with their reasons; this changes what the banner displays and touches no evidence,
+    so a row here would put a non-decision in the decisions log for no gain."""
+    with _LOCK:
+        total = int(_SATURATION["count"])  # type: ignore[arg-type]
+        acked = max(0, min(int(req.count), total))
+        if acked > int(_SATURATION["acked"]):  # type: ignore[arg-type]
+            _SATURATION["acked"] = acked
+            _SATURATION["acked_ts"] = time.time()
+        return {"ok": True, "acknowledged": _SATURATION["acked"],
+                "rejections": total}
 
 
 @app.get("/status", response_class=PlainTextResponse)

@@ -1341,20 +1341,29 @@ lives inside `start()`, which runs only in a browser — so requiring the module
 node must be side-effect free, and the test asserts that too: if DOM work migrates to
 the top level, `require` throws and the file cannot quietly become untestable again.
 
-Two cross-file guards cover couplings that have no compiler between their ends. The
-first asserts every `getElementById` in `app.js` matches an id in `index.html`. The
+Two cross-file couplings have no compiler between their ends, and a test stands in at
+each. The first asserts every `getElementById` in `app.js` matches an id in `index.html`. The
 second asserts **every path the page `fetch`es is either served here or on the relay
 allowlist** — the deliberately narrow allowlist is what keeps `POST /authorize`
 unreachable from a browser, and the cost of that narrowness is that adding a call
 without adding its route yields a 403 visible only to an operator loading the real page
 against a real backend. That is precisely how `/api/config` would have failed; the
-guard was verified by removing the route and watching it fail. The converse direction is
-deliberately not asserted — `/status` is still on the allowlist unused, and pruning it
-is a separate change. The guard earned its keep a second time on
-`POST /api/saturation/ack`: removing the route from the allowlist fails the suite
-rather than the browser.
+guard was verified by removing the route and watching it fail. The guard earned its keep
+a second time on `POST /api/saturation/ack`: removing the route from the allowlist fails
+the suite rather than the browser.
 
-A third guard is source-level rather than behavioural: `shouldSweep`'s dwell floor
+The **converse** is now asserted too — every relayed route must be called by the page —
+and that direction is about a different failure. A route with no caller does not break
+anything, which is exactly the problem: nothing would reveal it if it were wrong. Two
+had accumulated. `/status` was harmless (a plain-text count summary, mostly duplicating
+what the page already shows). `GET /approvals` was not: the non-streaming form of the
+pending list, superseded by the SSE stream, still relaying the pending hosts, clients and
+URLs to any caller that got past the Host and `Sec-Fetch` guards. Both still serve on
+control-net; only the browser's path to them is gone. The test carries no exception list
+on purpose — a route that must stay uncalled should arrive with its reason attached, as
+an edit someone has to justify.
+
+A further guard is source-level rather than behavioural: `shouldSweep`'s dwell floor
 defaults to `0`, so **dropping the argument at the call site** would restore the
 swept-in-a-second bug with every unit test still green, since they exercise the function
 directly. The call site is therefore asserted to pass a dwell. Ugly, and the honest
@@ -2049,10 +2058,11 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
   - **Opt-in desktop notification.** `http://localhost` is a secure context, so the
     Notification API is available; with a ~120s fuse and a page nobody watches, this is
     the honest fix for the problem the `(n)` title prefix only mitigates.
-  - Smaller: `/status` is on the relay allowlist but unused (allowlists rot — use it or
-    drop it); `_STRIP_REQ` should also strip `content-length` / `transfer-encoding` /
+  - Smaller: `_STRIP_REQ` should also strip `content-length` / `transfer-encoding` /
     `connection` / `expect`; no `aria-live` on the pending list; both pollers run at 4s
-    even in a hidden tab.
+    even in a hidden tab — and gating them on tab visibility is where the decisions
+    view should also gain "showing N of M recorded decisions", since the total needs
+    the same gating to avoid a `COUNT(*)` every four seconds forever.
 - Normalize hosts consistently across the control plane. The proxy's relay guard
   strips a trailing FQDN dot but `_decide` / `_match` only lowercase, so `evil.com.`
   misses a persisted **block** rule and lands in a hold instead — fail-safe, but it

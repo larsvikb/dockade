@@ -17,9 +17,11 @@ The authorize flow (one call from the proxy, `POST /authorize`):
     approval, so a retrying agent produces one card and one decision — which is
     also why one click can release several blocked requests (see _group_key).
 
-A human resolves holds over the approvals API (GET /approvals, the SSE stream at
-/approvals/stream, and POST /approvals/{id}/resolve), surfaced by the separate
-control-plane-ui frontend; the backend serves no HTML itself. Three read-only views
+A human resolves holds over the approvals API (the SSE stream at /approvals/stream
+and POST /approvals/{id}/resolve), surfaced by the separate control-plane-ui
+frontend; the backend serves no HTML itself. GET /approvals is the non-streaming
+form of the same list and is still served here, but the UI does not use it and the
+frontend no longer relays it — see _RELAY_ROUTES in control-plane-ui/app.py. Three read-only views
 back the rest of that UI: GET /api/audit (recent decisions), GET /api/rules (the
 standing policy — see ``api_rules`` for why that one has to be visible) and
 GET /api/config (the hold window, so a card can show its countdown):

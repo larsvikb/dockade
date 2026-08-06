@@ -108,15 +108,27 @@ _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 # Exactly the backend paths this UI needs, as (method, pattern). Everything else —
 # above all `POST /authorize` — is refused rather than relayed. The approval id is
 # bounded and slash-free so nothing path-shaped can be smuggled through it.
+#
+# EXACTLY the paths it needs, and that word is the maintenance rule rather than a
+# description: a default-deny allowlist is only worth what its entries are worth, and
+# an entry with no caller cannot be reasoned about, because nothing would break if it
+# were wrong. Two sat here unused. `/status` was a harmless plain-text summary whose
+# three counts are either already on the page or prose the frontend would have had to
+# parse. `GET /approvals` is the non-streaming form of the pending list, superseded by
+# the SSE stream the page actually opens — and unlike /status it carries the pending
+# hosts, clients and URLs, so an uncalled route was relaying real data.
+#
+# Both remain reachable on control-net for `docker exec` debugging, which is what they
+# are for; only the BROWSER's path to them is gone. Add a route here when a fetch needs
+# it, never in anticipation of one — a test asserts this list and app.js agree in both
+# directions.
 _RELAY_ROUTES = (
-    ("GET", re.compile(r"^/approvals$")),
     ("GET", re.compile(r"^/approvals/stream$")),
     ("POST", re.compile(r"^/approvals/[A-Za-z0-9._-]{1,128}/resolve$")),
     ("GET", re.compile(r"^/api/audit$")),
     ("GET", re.compile(r"^/api/rules$")),
     ("GET", re.compile(r"^/api/config$")),
     ("POST", re.compile(r"^/api/saturation/ack$")),
-    ("GET", re.compile(r"^/status$")),
 )
 
 # Provenance headers a CLIENT must never be able to set, because the backend reads

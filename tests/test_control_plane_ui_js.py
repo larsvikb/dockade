@@ -1276,8 +1276,7 @@ class InlineScriptTests(unittest.TestCase):
 
         Paths only, not methods: the shapes here are simple and the method-level
         allowlist has its own tests in test_control_plane_ui.py. The converse direction
-        — a relayed route the page no longer calls — is deliberately not asserted; the
-        allowlist still carries `/status` unused, and pruning it is a separate change."""
+        has its own test below."""
         js = APP_JS.read_text()
         # Served by this container rather than relayed (see control-plane-ui/app.py).
         local = {"/", "/app.js", "/healthz"}
@@ -1293,6 +1292,30 @@ class InlineScriptTests(unittest.TestCase):
                 or ui._relay_allowed("POST", path),
                 f"app.js calls {path}, which control-plane-ui neither serves nor "
                 f"relays — add it to _RELAY_ROUTES or it will 403 in the browser")
+
+    def test_every_relayed_route_is_actually_called(self):
+        """The converse, and the one that keeps a default-deny allowlist worth reading.
+        An entry with no caller cannot be reasoned about: nothing breaks if it is wrong,
+        so nobody finds out that it is. Two had already accumulated — `/status`, and
+        `GET /approvals`, which carries the pending hosts, clients and URLs and had been
+        superseded by the SSE stream.
+
+        Deliberately has NO exception list. A route that must stay without a caller is a
+        real possibility, but it should arrive with its reason attached, as a change to
+        this test that someone has to justify — not as an entry that quietly stops
+        matching anything."""
+        js = APP_JS.read_text()
+        calls = [re.sub(r"\$\{[^}]*\}", "ID", raw).split("?")[0] for raw in
+                 re.findall(r"""(?:fetch|EventSource)\(\s*["'`]([^"'`]+)["'`]""", js)]
+        self.assertTrue(calls, "no fetch/EventSource calls found")
+        unused = [f"{method} {pattern.pattern}"
+                  for method, pattern in ui._RELAY_ROUTES
+                  if not any(pattern.match(c) for c in calls)]
+        self.assertEqual(
+            unused, [],
+            "these routes cross the relay but nothing on the page calls them — drop "
+            "them, or wire them up; the backend keeps serving them on control-net "
+            "either way")
 
     def test_the_sweep_call_site_passes_a_per_card_dwell(self):
         """`shouldSweep` grew a minimum dwell because the `expired — default-denied`

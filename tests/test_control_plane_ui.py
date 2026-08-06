@@ -290,9 +290,9 @@ class RelayAllowlistTests(unittest.TestCase):
         return asyncio.run(ui.proxy(captured_path, _ok_host(method=method)))
 
     def test_ui_paths_are_relayed(self):
-        for path, method in (("approvals", "GET"), ("approvals/stream", "GET"),
+        for path, method in (("approvals/stream", "GET"),
                              ("api/audit", "GET"), ("api/rules", "GET"),
-                             ("api/config", "GET"), ("status", "GET"),
+                             ("api/config", "GET"),
                              ("approvals/0123abcd/resolve", "POST")):
             self._proxy(path, method)
             self.assertEqual(urlsplit(_sent["url"]).netloc, "control-plane:8090",
@@ -307,6 +307,11 @@ class RelayAllowlistTests(unittest.TestCase):
     def test_unknown_and_wrong_method_paths_are_not_relayed(self):
         for path, method in (("healthz", "GET"), ("api/secrets", "GET"),
                              ("approvals", "POST"), ("status", "POST"),
+                             # Dropped from the allowlist once nothing called them.
+                             # `GET /approvals` matters most: it carries the pending
+                             # hosts, clients and URLs, so an uncalled route was
+                             # relaying real data. Both still serve on control-net.
+                             ("approvals", "GET"), ("status", "GET"),
                              ("approvals/x/resolve", "GET"),
                              ("approvals/a/b/resolve", "POST"),
                              # The rules view is READ-only: no mutation path exists
@@ -325,7 +330,7 @@ class ProvenanceHeaderTests(unittest.TestCase):
 
     def _relay_headers(self, request):
         _sent.clear()
-        asyncio.run(ui.proxy("approvals", request))
+        asyncio.run(ui.proxy("api/rules", request))
         return _sent["headers"]
 
     def test_actor_header_is_set_from_the_observed_peer(self):
@@ -471,7 +476,7 @@ class BackendUnreachableTests(unittest.TestCase):
     page's hand-rolled reconnect reconnects from. Before it existed the exception
     became a 500 and the page sat blind on "reconnecting…" until a manual reload."""
 
-    def _proxy_with_dead_backend(self, path="approvals", method="GET"):
+    def _proxy_with_dead_backend(self, path="api/rules", method="GET"):
         async def _boom(_req, stream=False):
             raise sys.modules["httpx"].RequestError("connection refused")
 
@@ -510,7 +515,7 @@ class RelayHostPinningTests(unittest.TestCase):
 
     def test_normal_paths_reach_the_backend(self):
         # {path:path} captures these WITHOUT a leading slash.
-        for p in ("approvals", "approvals/stream", "api/audit"):
+        for p in ("api/rules", "approvals/stream", "api/audit"):
             self.assertEqual(self._upstream_host(p), "control-plane:8090",
                              f"normal path {p!r} must relay to the backend")
 

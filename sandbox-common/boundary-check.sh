@@ -210,6 +210,30 @@ if [ -n "${HTTPS_PROXY:-}" ]; then
             bad "egress proxy did NOT 403 $mapped (got: ${resp:-<none>}) — mapped-IPv6 guard bypass"
         fi
     done
+
+    # Plaintext HTTP must reach the proxy too, and nothing above can tell us that:
+    # every governed probe here is https, and curl honours HTTPS_PROXY in EITHER
+    # case, so all of them pass while `curl http://...` bypasses the proxy entirely
+    # and dies at DNS. That was this sandbox's real state until the launcher began
+    # setting the lowercase variable — curl reads `http_proxy` LOWER CASE ONLY, a
+    # fact about curl recorded in NOTES.md. `make consistency` guards the pairing,
+    # but it reads the launcher SOURCE; only a probe from inside sees the
+    # environment a running container actually ended up with.
+    #
+    # control-plane over http:// is the discriminator. Unproxied, the name resolves
+    # only on control-net, so curl fails DNS instantly with no timeout to sit
+    # through. Proxied, the relay guard refuses it BEFORE any policy lookup — a
+    # deterministic 403 that needs no seeded rule and raises no hold, so this check
+    # does not depend on the state of the policy store. Distinguish all three
+    # outcomes: "never reached the proxy" and "reached it and was not refused" are
+    # opposite defects that would otherwise share one non-403 symptom.
+    plain="$(curl -sS --connect-timeout 5 --max-time 8 \
+        -o /dev/null -w '%{http_code}' http://control-plane/ 2>/dev/null || true)"
+    case "$plain" in
+        403)    ok "plaintext HTTP is proxied and governed (http://control-plane -> 403)" ;;
+        000|"") bad "plaintext HTTP never reached the egress proxy — curl resolved the host itself (is LOWERCASE http_proxy set? see NOTES.md)" ;;
+        *)      bad "plaintext HTTP reached the proxy but was NOT refused (got: $plain) — control-net relay risk on the http path" ;;
+    esac
 fi
 
 printf '%s== control plane ==%s\n' "$bold" "$reset"

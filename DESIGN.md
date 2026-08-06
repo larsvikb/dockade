@@ -428,8 +428,13 @@ committed to (a). Documented points, with the design consequence of each:
   agent is not the only thing in the image making requests: `curl` reads `http_proxy`
   in **lower case only** — a deliberate httpoxy mitigation, not an oversight — so with
   uppercase alone, plaintext HTTP bypassed the governed proxy entirely and died at
-  DNS, unheld and unaudited. `make consistency` asserts the pairing; `NOTES.md` has
-  the measurement.
+  DNS, unheld and unaudited. Two guards, because neither covers the other: `make
+  consistency` asserts the pairing in the launcher *source*, and `boundary-check.sh`
+  probes `http://` from *inside a running container*, which is the only place an
+  environment that drifted — or a sandbox started before the fix — becomes visible.
+  Every other governed probe in that script is `https://`, and curl honours
+  `HTTPS_PROXY` in either case, so they all passed throughout. `NOTES.md` has the
+  measurement.
 - **WebFetch inherits the same proxy.** The docs describe no separate mechanism,
   so the client-side WebFetch uses the same env vars — since **confirmed
   in-sandbox**: the Layer-2 result below shows WebFetch's allow/deny CONNECT

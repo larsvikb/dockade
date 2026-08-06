@@ -265,6 +265,13 @@
         <th>added</th></tr></thead>
       <tbody id="rules"></tbody>
     </table>
+    <!-- Same job as `audit-empty`, and needed more here. This poll failing used to be
+         swallowed outright, so the table went on showing rules that might no longer be
+         in force — and an operator reads it to see what already stands before deciding
+         a hold. BELOW the table, unlike the static blurb above it, so a warning appears
+         next to the rows it is casting doubt on rather than above the explanation of
+         what the view is. -->
+    <div class="empty" id="rules-empty" hidden></div>
   </section>
 </main>
 <!-- Behaviour lives in app.js, NOT inline: an external script is what lets the

@@ -351,25 +351,51 @@ function repeatCount(r) {
 // A failed refresh does NOT clear the rows. Stale decisions with a warning above them
 // are more useful than an empty table, provided the staleness is stated — which is the
 // entire difference between this and what it replaces.
-function auditStatus(rowCount, failed, loaded) {
+// The three states are the same for EVERY polled list, so the logic lives once and
+// each view supplies only its sentences. Both views are filled by their own poll and
+// both can therefore be stale while the header reads `live`; sharing this is what
+// stops one of them growing the honesty the other has (the decisions table got it
+// first, and the policy table then sat silently swallowing failures for as long).
+function pollStatus(texts, rowCount, failed, loaded) {
   if (failed) {
-    return loaded
-      ? { show: true, level: "warn",
-          text: "Could not refresh — these are the last decisions loaded successfully " +
-                "and may be out of date." }
-      : { show: true, level: "warn",
-          text: "Could not load recent decisions — the control plane may be " +
-                "unreachable." };
+    return { show: true, level: "warn",
+             text: loaded ? texts.stale : texts.cold };
   }
   // Before the first response there is nothing to claim in either direction; saying
   // "none yet" here would be a positive all-clear the page has not earned.
   if (!loaded) return { show: false, level: "none", text: "" };
-  if (rowCount === 0) {
-    return { show: true, level: "none",
-             text: "No decisions recorded yet. Every allow, deny and hold appears " +
-                   "here as it happens." };
-  }
+  if (rowCount === 0) return { show: true, level: "none", text: texts.empty };
   return { show: false, level: "none", text: "" };
+}
+
+const AUDIT_STATUS_TEXT = {
+  stale: "Could not refresh — these are the last decisions loaded successfully " +
+         "and may be out of date.",
+  cold: "Could not load recent decisions — the control plane may be unreachable.",
+  empty: "No decisions recorded yet. Every allow, deny and hold appears here " +
+         "as it happens.",
+};
+function auditStatus(rowCount, failed, loaded) {
+  return pollStatus(AUDIT_STATUS_TEXT, rowCount, failed, loaded);
+}
+
+// The policy view's wording is NOT the decisions view's with a noun swapped, because
+// the consequence of staleness differs. A stale decisions table is old history, which
+// is merely unhelpful. A stale policy table misstates WHAT IS CURRENTLY ALLOWED — an
+// operator deciding a hold reads this to see what already stands, so it has to say
+// plainly that it may no longer be in force.
+const RULES_STATUS_TEXT = {
+  stale: "Could not refresh — this is the last policy loaded successfully and may " +
+         "no longer be what is in force.",
+  cold: "Could not load the standing policy — the control plane may be unreachable.",
+  // Not a neutral "no rules": with an empty table nothing matches, so `_decide`
+  // returns hold for every host. That is a fact about what happens next, which is
+  // what an operator needs, rather than an observation about a table being short.
+  empty: "No standing rules, so every request is unknown and will be held for " +
+         "approval.",
+};
+function rulesStatus(rowCount, failed, loaded) {
+  return pollStatus(RULES_STATUS_TEXT, rowCount, failed, loaded);
 }
 
 // What a Dismiss click acknowledges. A one-line function only because it must be the
@@ -1049,13 +1075,26 @@ function start() {
   // failing" want different sentences — see auditStatus.
   let auditLoaded = false;
   let auditFailed = false;
+  let rulesLoaded = false;
+  let rulesFailed = false;
+
+  // One renderer for both, because the element contract is identical and the two
+  // states drifting apart is precisely what happened last time.
+  function renderListStatus(el, s) {
+    el.hidden = !s.show;
+    el.textContent = s.text;
+    el.className = "empty" + (s.level === "warn" ? " warn" : "");
+  }
+
   const auditEmpty = document.getElementById("audit-empty");
+  const rulesEmpty = document.getElementById("rules-empty");
 
   function renderAuditStatus(rowCount) {
-    const s = auditStatus(rowCount, auditFailed, auditLoaded);
-    auditEmpty.hidden = !s.show;
-    auditEmpty.textContent = s.text;
-    auditEmpty.className = "empty" + (s.level === "warn" ? " warn" : "");
+    renderListStatus(auditEmpty, auditStatus(rowCount, auditFailed, auditLoaded));
+  }
+
+  function renderRulesStatus(rowCount) {
+    renderListStatus(rulesEmpty, rulesStatus(rowCount, rulesFailed, rulesLoaded));
   }
 
   async function refreshAudit() {
@@ -1094,30 +1133,50 @@ function start() {
   }
 
   async function refreshRules() {
+    let rows;
     try {
-      const rows = await (await fetch("/api/rules")).json();
-      // Signature over pattern+action, not just the COUNT: a rule whose action
-      // flipped is the change most worth noticing, and it leaves the count alone.
-      const sig = JSON.stringify(rows.map(r => r.action + " " + r.pattern));
-      if (policySig !== null && sig !== policySig && current !== "policy") {
-        policyUnseen = true;
-      }
-      policySig = sig;
+      const res = await fetch("/api/rules");
+      // `res.ok` checked, not just the parse: a 4xx/5xx body would otherwise flow
+      // into .json() and either throw somewhere less obvious or — worse — parse
+      // into something that renders as an empty but SUCCESSFUL policy.
+      if (!res.ok) throw new Error(String(res.status));
+      rows = await res.json();
+    } catch (e) {
+      // A failed refresh keeps the rows and SAYS SO, rather than swallowing it as
+      // "transient; next poll retries" — which it is, right up until it is not.
+      // Three things stop here and none of them looked stopped: the table kept
+      // showing rules that might no longer be in force, the count froze, and
+      // `policySig` stopped advancing, so the change badge silently stopped firing.
+      // Leaving `policySig` alone IS correct — we cannot claim a change we did not
+      // see — but the operator has to be told the view is not moving.
+      rulesFailed = true;
+      renderRulesStatus(document.getElementById("rules").rows.length);
+      return;
+    }
+    rulesFailed = false;
+    rulesLoaded = true;
+    // Signature over pattern+action, not just the COUNT: a rule whose action
+    // flipped is the change most worth noticing, and it leaves the count alone.
+    const sig = JSON.stringify(rows.map(r => r.action + " " + r.pattern));
+    if (policySig !== null && sig !== policySig && current !== "policy") {
+      policyUnseen = true;
+    }
+    policySig = sig;
 
-      document.getElementById("badge-policy").textContent = String(rows.length);
-      document.getElementById("rulecount").textContent =
-        rows.length ? `· ${rows.length} rule${rows.length === 1 ? "" : "s"}` : "· none";
-      document.getElementById("rules").innerHTML = rows.map(r => {
-        const wild = (r.pattern || "").startsWith(".");
-        return `<tr>
-          <td><span class="tag ${esc(r.action)}">${esc(r.action)}</span></td>
-          <td><code>${esc(r.pattern)}</code></td>
-          <td class="${wild ? "wild" : "ts"}">${esc(r.scope)}</td>
-          <td class="ts">${esc(r.source)}</td>
-          <td class="ts">${r.created_at ? fmtStamp(r.created_at) : ""}</td></tr>`;
-      }).join("");
-      updateIndicators();
-    } catch (e) { /* transient; next poll retries */ }
+    document.getElementById("badge-policy").textContent = String(rows.length);
+    document.getElementById("rulecount").textContent =
+      rows.length ? `· ${rows.length} rule${rows.length === 1 ? "" : "s"}` : "· none";
+    document.getElementById("rules").innerHTML = rows.map(r => {
+      const wild = (r.pattern || "").startsWith(".");
+      return `<tr>
+        <td><span class="tag ${esc(r.action)}">${esc(r.action)}</span></td>
+        <td><code>${esc(r.pattern)}</code></td>
+        <td class="${wild ? "wild" : "ts"}">${esc(r.scope)}</td>
+        <td class="ts">${esc(r.source)}</td>
+        <td class="ts">${r.created_at ? fmtStamp(r.created_at) : ""}</td></tr>`;
+    }).join("");
+    renderRulesStatus(rows.length);
+    updateIndicators();
   }
 
   // ── the approvals feed, and the reconnect it used to lack ─────────────────
@@ -1187,7 +1246,7 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     lampState, backoffDelay, diffPending, shouldSweep,
     holdRemaining, countdownState, departure, persistPreview, saturationState,
-    ackCount, requestsLabel, auditRow, auditStatus, repeatCount,
+    ackCount, requestsLabel, auditRow, auditStatus, rulesStatus, repeatCount,
     fmtTime, fmtStamp, fmtInstant,
     AUDIT_ORDINARY_STAGE,
     RECONNECT_MIN_MS, RECONNECT_MAX_MS, STALE_MAX_MS, COUNTDOWN_URGENT_S,

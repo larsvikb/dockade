@@ -1311,6 +1311,20 @@ failed request. Three states, three sentences, and the third — before the firs
 lands — deliberately says nothing at all, for the same reason the saturation banner
 renders nothing at zero.
 
+**Both polled lists, not just the decisions one.** Fixing this for the decisions table
+and leaving the policy table's `catch` swallowing was the shape of the original bug
+repeated one tab over — and worse there, because the consequence of staleness differs.
+A stale decisions table is old history. A stale **policy** table misstates what is
+currently allowed, which is what an operator reads before deciding a hold. Three things
+stopped silently: the rules kept rendering, the count froze, and `policySig` stopped
+advancing, so the "policy changed" badge quietly stopped firing.
+
+The three-state logic is therefore shared (`pollStatus`) and only the sentences differ
+per view — the wording has to stay separate, and a test asserts the two views cannot
+collapse onto one text. Leaving `policySig` untouched on failure is correct, since a
+change nobody observed must not be claimed; what was missing was telling the operator
+the view had stopped moving.
+
 **The frontend's own tests.** `tests/test_control_plane_ui_js.py` runs the pure helpers
 under `node` (skipped when node is absent, the way `make lint` skips a missing linter)
 and asserts in Python, so failures read like the rest of `tests/`. It covers the lamp
@@ -1319,7 +1333,9 @@ properties, the sweep gating, the countdown arithmetic (including the clock-skew
 and the `expiring now`-not-`expired` wording), the expiry-vs-resolved-elsewhere
 distinction, the persist preview's wildcard flag, the saturation banner's levels,
 recency boundary and count-based dismissal, the duplicate-count badge, and the
-decisions table's row shaping, repeat-count annotation and empty-versus-stale states.
+decisions table's row shaping, repeat-count annotation and empty-versus-stale states —
+the last of these for the policy table too, including that the two views' wordings stay
+distinct.
 Everything that touches the DOM
 lives inside `start()`, which runs only in a browser — so requiring the module under
 node must be side-effect free, and the test asserts that too: if DOM work migrates to
@@ -2035,9 +2051,8 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
     the honest fix for the problem the `(n)` title prefix only mitigates.
   - Smaller: `/status` is on the relay allowlist but unused (allowlists rot — use it or
     drop it); `_STRIP_REQ` should also strip `content-length` / `transfer-encoding` /
-    `connection` / `expect`; **rules** poll failures are still swallowed (the audit view
-    now reports its own staleness — the rules view does not); no `aria-live` on the
-    pending list; both pollers run at 4s even in a hidden tab.
+    `connection` / `expect`; no `aria-live` on the pending list; both pollers run at 4s
+    even in a hidden tab.
 - Normalize hosts consistently across the control plane. The proxy's relay guard
   strips a trailing FQDN dot but `_decide` / `_match` only lowercase, so `evil.com.`
   misses a persisted **block** rule and lands in a hold instead — fail-safe, but it

@@ -61,7 +61,7 @@ const m = require(process.env.DOCKADE_APP_JS);
 const missing = ["lampState", "backoffDelay", "diffPending", "shouldSweep",
                  "holdRemaining", "countdownState", "departure", "persistPreview",
                  "saturationState", "ackCount", "requestsLabel",
-                 "auditRow", "auditStatus", "repeatCount",
+                 "auditRow", "auditStatus", "rulesStatus", "repeatCount",
                  "fmtTime", "fmtStamp", "fmtInstant"]
   .filter(n => typeof m[n] !== "function");
 console.log(JSON.stringify({
@@ -295,6 +295,16 @@ console.log(JSON.stringify({
         has_rows: m.auditStatus(12, false, true),
         failed_with_rows: m.auditStatus(12, true, true),
         failed_from_cold: m.auditStatus(0, true, false),
+      },
+      rules_status: {
+        // Same three states, same argument order — the policy view is filled by its
+        // own poll and can be stale while the header reads `live`, exactly like the
+        // decisions view.
+        first_load_in_flight: m.rulesStatus(0, false, false),
+        genuinely_empty: m.rulesStatus(0, false, true),
+        has_rows: m.rulesStatus(12, false, true),
+        failed_with_rows: m.rulesStatus(12, true, true),
+        failed_from_cold: m.rulesStatus(0, true, false),
       },
       requests: {
         one: m.requestsLabel(1),
@@ -872,6 +882,39 @@ class PageScriptTests(unittest.TestCase):
         # saturation banner hidden at zero rather than rendering one.
         self.assertFalse(s["first_load_in_flight"]["show"])
 
+    def test_the_policy_view_reports_its_own_staleness(self):
+        """The decisions view got this first and the policy view then sat swallowing
+        its poll failures for as long — while showing rules that might no longer be in
+        force, which is what an operator reads before deciding a hold."""
+        s = self.probe["saturation"]["rules_status"]
+        self.assertEqual(s["failed_with_rows"]["level"], "warn")
+        self.assertEqual(s["failed_from_cold"]["level"], "warn")
+        self.assertIn("unreachable", s["failed_from_cold"]["text"])
+        self.assertFalse(s["has_rows"]["show"])
+        self.assertFalse(s["first_load_in_flight"]["show"])
+
+    def test_an_empty_policy_says_what_happens_next(self):
+        # With no rules nothing matches, so `_decide` holds every host. That is a fact
+        # about the next request, which is the useful thing to say — not an observation
+        # that a table is short.
+        s = self.probe["saturation"]["rules_status"]
+        self.assertTrue(s["genuinely_empty"]["show"])
+        self.assertEqual(s["genuinely_empty"]["level"], "none")
+        self.assertIn("held for approval", s["genuinely_empty"]["text"])
+
+    def test_the_two_views_do_not_share_a_sentence(self):
+        """The logic is shared on purpose; the WORDING must not be. A stale decisions
+        table is old history. A stale policy table misstates what is currently allowed.
+        Pointing `rulesStatus` at the decisions text would pass every assertion above
+        except this one."""
+        a = self.probe["saturation"]["audit_status"]
+        r = self.probe["saturation"]["rules_status"]
+        for state in ("genuinely_empty", "failed_with_rows", "failed_from_cold"):
+            with self.subTest(state=state):
+                self.assertNotEqual(a[state]["text"], r[state]["text"])
+        # And the policy view's stale wording makes the claim that matters.
+        self.assertIn("no longer be what is in force", r["failed_with_rows"]["text"])
+
 
 class DecisionsTableSourceTests(unittest.TestCase):
     """`refreshAudit` lives in `start()` and cannot be unit-tested, so the parts of
@@ -908,11 +951,24 @@ class DecisionsTableSourceTests(unittest.TestCase):
             r'catch[^}]*innerHTML\s*=\s*""',
             "a failed poll must not blank the table")
 
+    def test_a_recovered_poll_clears_the_warning_and_re_renders(self):
+        # The recovery half, which was asserted for neither table until a mutation of
+        # the policy one survived. Both strings appear in the failure path too, so the
+        # split at the catch's `return` is what makes this about the SUCCESS path.
+        _, sep, success = self.body.group(1).partition("return;\n    }")
+        self.assertTrue(sep, "the failure path no longer returns early")
+        self.assertIn("auditFailed = false", success)
+        self.assertIn("renderAuditStatus(", success)
+
     def test_a_non_ok_response_is_a_failure_not_a_row_of_json(self):
         # `fetch` does not reject on 4xx/5xx. Without this check a 502 from the relay
         # would flow into .json(), throw somewhere less obvious, or worse parse into
         # something that renders as an empty but SUCCESSFUL list.
-        self.assertIn("res.ok", self.body.group(1))
+        #
+        # Matches the STATEMENT, not the substring "res.ok": the policy table's version
+        # of this test was satisfied by a comment mentioning the check, and survived a
+        # mutation that deleted the check itself.
+        self.assertRegex(self.body.group(1), r"if\s*\(!res\.ok\)\s*throw")
 
     def test_each_cell_renders_the_field_its_header_promises(self):
         """A structural guard over the row template, because the render lives in
@@ -969,6 +1025,62 @@ class DecisionsTableSourceTests(unittest.TestCase):
         self.assertIsNotNone(section, "the decisions section was renamed")
         self.assertIn("<th>client</th>", section.group(0),
                       "the column exists in the body but has no header")
+
+
+class PolicyTableSourceTests(unittest.TestCase):
+    """`refreshRules` lives in `start()` too, and its failure path was a bare
+    `catch (e) { /* transient */ }` — the same swallow the decisions table had, left
+    in place after that one was fixed. Guarded at the source for the same reason."""
+
+    def setUp(self):
+        self.src = APP_JS.read_text()
+        self.body = re.search(r"async function refreshRules\(\)\s*\{(.*?)\n  \}",
+                              self.src, re.S)
+        self.assertIsNotNone(self.body, "refreshRules not found — renamed?")
+
+    def test_a_failed_refresh_keeps_the_rules_and_reports_the_staleness(self):
+        body = self.body.group(1)
+        self.assertIn("rulesFailed = true", body)
+        self.assertIn("renderRulesStatus(", body)
+        self.assertNotRegex(body, r'catch[^}]*innerHTML\s*=\s*""',
+                            "a failed poll must not blank the policy table")
+        # The specific regression: a catch that discards the error and says nothing.
+        self.assertNotRegex(
+            body, r"catch\s*\([^)]*\)\s*\{\s*/\*[^*]*\*/\s*\}",
+            "the failure path is a comment again, not a reported state")
+
+    def test_a_non_ok_response_is_a_failure_not_a_row_of_json(self):
+        # `fetch` does not reject on 4xx/5xx, and this one used to call .json()
+        # straight off the response — so a 502 from the relay could parse into
+        # something that rendered as an empty but SUCCESSFUL policy. On this table
+        # that reads as "no standing rules", which is the opposite of the truth.
+        #
+        # The STATEMENT, not the substring — see the decisions-table twin.
+        self.assertRegex(self.body.group(1), r"if\s*\(!res\.ok\)\s*throw")
+
+    def test_a_recovered_poll_clears_the_warning_and_re_renders(self):
+        """Setting the failed flag is only half a fix, and both halves were mutants
+        that survived the first run. Without the reset the table warns forever after
+        one blip; without a render on the success path the warning stays on screen
+        until the next failure, and the empty state never appears at all.
+
+        Split at the catch's `return`, so these are asserted on the SUCCESS path
+        specifically — both strings also occur in the failure path, where they prove
+        nothing."""
+        _, sep, success = self.body.group(1).partition("return;\n    }")
+        self.assertTrue(sep, "the failure path no longer returns early")
+        self.assertIn("rulesFailed = false", success)
+        self.assertIn("renderRulesStatus(", success)
+
+    def test_a_failed_poll_does_not_advance_the_change_signature(self):
+        """`policySig` drives the "policy changed" badge. It must be assigned only on
+        the success path: advancing it after a failure would silently swallow the next
+        real change, because the comparison would be against a signature nobody saw."""
+        body = self.body.group(1)
+        before, _, after = body.partition("rulesLoaded = true")
+        self.assertNotIn("policySig =", before,
+                         "the signature is updated before the poll is known to work")
+        self.assertIn("policySig = sig", after)
 
 
 class PersistConflictSourceTests(unittest.TestCase):

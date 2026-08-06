@@ -782,13 +782,47 @@ governance decision depends on it (the egress proxy calls the backend directly).
 The egress proxy is now a **control-plane client** rather than a static-allowlist
 enforcer: on every connection it calls `POST /authorize {host, ...}`, which
 returns the decision **and** records the audit row in one call — so policy and
-audit share the round-trip, there is no client-side cache (an operator rule edit
-applies to the very next connection), and there is no separate audit channel.
-Two deliberate properties: (1) the **permanent lifeline** (Anthropic API/auth)
-is allowed by a *local* check in the proxy *before* the control plane is
-consulted, so a control-plane outage never bricks the agent's own API; (2)
-everything else **fails closed** — if the control plane is unreachable or times
-out, the request is denied and audited locally.
+audit share the round-trip, and there is no client-side cache (an operator rule
+edit applies to the very next connection). Two deliberate properties: (1) the
+**permanent lifeline** (Anthropic API/auth) is allowed by a *local* check in the
+proxy *before* the control plane is consulted, so a control-plane outage never
+bricks the agent's own API; (2) everything else **fails closed** — if the control
+plane is unreachable or times out, the request is denied and audited locally.
+
+**Ingesting the decisions the proxy makes alone.** Those two properties, plus the
+relay guard, the port gate and the SNI anti-fronting check, mean a real share of
+egress decisions are made *in the proxy* and never travel the authorize path. They
+were always audited — the invariant held — but only to the proxy's own stream, so
+the UI's "Recent decisions" was a record of round-trips, and a **domain-fronting
+refusal**, the most alarming line the proxy can emit, appeared nowhere a human was
+looking. The control plane now mounts the proxy's audit volume **read-only** and
+tails it, ingesting the lines the proxy marks `central: false`.
+
+The reasoning is why this is a *pull* and not a push, which is not obvious and
+spans all three components:
+
+- **The file already was the durable queue.** `audit.jsonl` sits on a named volume,
+  append-only and ordered, and it cannot be removed regardless — it is the record of
+  record during a control-plane outage. Any broker or POST would have been a *second*
+  durable store of the same events.
+- **Pulling makes the ingest exactly-once for free.** The cursor lives in the same
+  SQLite as the audit table, so rows and cursor advance in one transaction. Every
+  push design delivers at-least-once, which imports an idempotency key, a unique
+  index and a dedup pass — the entire complexity budget, spent on a problem the pull
+  simply does not have.
+- **It leaves the security-critical image alone.** The egress proxy is `mitmproxy` +
+  one stdlib-only file with a pinned base; a push would have put the first pip
+  dependency, and a fire-and-forget task, in the component whose compromise is total.
+- **The `central` flag is load-bearing, and fails safe.** Every governed request
+  writes a proxy line *too*, so without a marker the ingest would duplicate the whole
+  log. It is tested for the literal `false`, so a line that predates the field, or
+  carries a garbled one, under-reports rather than double-counts.
+
+What this deliberately does **not** buy: decisions made while the control plane is
+down still arrive late (on the next drain), and one made while it is down *and* the
+volume is lost is gone. That was judged acceptable — the alternative is durability
+machinery for rows that are almost all `deny — control-plane unreachable`, recorded
+during a window in which nobody could load the UI either.
 
 **Hold-for-approval.** An unmatched host is no longer denied
 outright: `_decide` returns **`hold`**, and `/authorize` records a pending
@@ -1965,14 +1999,6 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
   - **Opt-in desktop notification.** `http://localhost` is a secure context, so the
     Notification API is available; with a ~120s fuse and a page nobody watches, this is
     the honest fix for the problem the `(n)` title prefix only mitigates.
-  - **A domain-fronting refusal never reaches the decisions table.** `tls_clienthello`
-    compares the SNI against the authorized CONNECT authority locally — deliberately
-    **no** second control-plane call, so an "allow once" is not re-held mid-connection
-    — and audits the refusal to the *proxy's* stream. It is audited, so the invariant
-    holds; but the UI view titled "Recent decisions" shows control-plane decisions
-    only, and a fronting attempt is exactly what an operator watching it would want to
-    see. Needs either a decision on merging the two audit streams or an honest
-    narrowing of that heading.
   - Smaller: `/status` is on the relay allowlist but unused (allowlists rot — use it or
     drop it); `_STRIP_REQ` should also strip `content-length` / `transfer-encoding` /
     `connection` / `expect`; **rules** poll failures are still swallowed (the audit view

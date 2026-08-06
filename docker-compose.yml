@@ -186,6 +186,13 @@ services:
         ipv4_address: 172.31.0.2
     volumes:
       - control-state:/var/lib/control-plane
+      # The egress proxy's own audit file, READ-ONLY. Not all egress decisions are
+      # made by /authorize — the relay guard, port gate, SNI anti-fronting check and
+      # permanent-lifeline allow are decided locally in the proxy — so the control
+      # plane tails this file and ingests those (see _drain_egress_audit). `:ro` is
+      # the point: the proxy owns the record, and the reader must not be able to
+      # rewrite the evidence it is reading.
+      - egress-audit:/var/log/egress:ro
     # /healthz (control-plane/app.py). Uvicorn binds the socket before its startup
     # handler runs, and that handler seeds the policy rules and expires stale
     # approvals — so "answers /healthz" is strictly later, and more meaningful,

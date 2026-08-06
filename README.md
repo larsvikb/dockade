@@ -187,6 +187,7 @@ dockade/
   control-plane/            # governance authority BACKEND (agent cannot reach it)
     Dockerfile              #   FastAPI over SQLite; control-net only, fully internal
     app.py                  #   /authorize (policy + audit) + hold-for-approval API
+                            #   + ingest of the proxy's locally-decided audit lines
     requirements.txt        #   pinned deps (fastapi, uvicorn)
   control-plane-ui/         # UI FRONTEND — serves the UI + reverse-proxies the API
     Dockerfile              #   FastAPI + httpx; control-ui-net (loopback) + control-net

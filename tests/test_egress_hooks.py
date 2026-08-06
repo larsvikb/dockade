@@ -52,43 +52,56 @@ def _http_flow(host, pretty_host, *, scheme="https", port=443, method="GET",
 
 class AuthorizeTests(unittest.TestCase):
     """_authorize: lifeline is decided locally; everything else asks the control
-    plane and any failure fails CLOSED."""
+    plane and any failure fails CLOSED.
+
+    ``Verdict.central`` reports whether the CONTROL PLANE recorded the decision, and
+    it is checked on every path here because it is the control plane's ingest filter:
+    a false positive double-counts a governed request in the audit table, a false
+    negative loses a decision from it entirely."""
 
     def test_permanent_lifeline_never_calls_control_plane(self):
         with mock.patch.object(addon, "_post_authorize",
                                side_effect=AssertionError("must not be called")):
-            allowed, reason = run(addon._authorize("api.anthropic.com",
-                                                   stage="connect"))
-        self.assertTrue(allowed)
-        self.assertIn("permanent lifeline", reason)
+            v = run(addon._authorize("api.anthropic.com", stage="connect"))
+        self.assertTrue(v.allowed)
+        self.assertIn("permanent lifeline", v.reason)
+        # Decided here, so nothing wrote it centrally — this line must be ingested.
+        self.assertFalse(v.central)
 
     def test_control_plane_allow(self):
         with mock.patch.object(addon, "_post_authorize",
                                return_value={"decision": "allow", "reason": "ok"}):
-            allowed, reason = run(addon._authorize("example.com", stage="connect"))
-        self.assertTrue(allowed)
-        self.assertEqual(reason, "ok")
+            v = run(addon._authorize("example.com", stage="connect"))
+        self.assertTrue(v.allowed)
+        self.assertEqual(v.reason, "ok")
+        self.assertTrue(v.central)
 
     def test_control_plane_deny(self):
         with mock.patch.object(addon, "_post_authorize",
                                return_value={"decision": "deny", "reason": "nope"}):
-            allowed, reason = run(addon._authorize("example.com", stage="connect"))
-        self.assertFalse(allowed)
-        self.assertEqual(reason, "nope")
+            v = run(addon._authorize("example.com", stage="connect"))
+        self.assertFalse(v.allowed)
+        self.assertEqual(v.reason, "nope")
+        self.assertTrue(v.central)
 
     def test_control_plane_unreachable_fails_closed(self):
         with mock.patch.object(addon, "_post_authorize",
                                side_effect=OSError("connection refused")):
-            allowed, reason = run(addon._authorize("example.com", stage="connect"))
-        self.assertFalse(allowed)
-        self.assertIn("fail-closed", reason)
+            v = run(addon._authorize("example.com", stage="connect"))
+        self.assertFalse(v.allowed)
+        self.assertIn("fail-closed", v.reason)
+        # The outage case: the control plane wrote nothing, so this local line is
+        # the only record and must be ingested once the control plane returns.
+        self.assertFalse(v.central)
 
     def test_unexpected_decision_value_is_not_allow(self):
         # Any decision that isn't exactly "allow" must be treated as deny.
         with mock.patch.object(addon, "_post_authorize",
                                return_value={"decision": "hold", "reason": "?"}):
-            allowed, _ = run(addon._authorize("example.com", stage="connect"))
-        self.assertFalse(allowed)
+            v = run(addon._authorize("example.com", stage="connect"))
+        self.assertFalse(v.allowed)
+        # The call still REACHED the control plane, which audits what it returned.
+        self.assertTrue(v.central)
 
 
 class HttpConnectTests(unittest.TestCase):
@@ -139,10 +152,13 @@ class TlsClientHelloTests(unittest.TestCase):
     (``ignore_connection``) is granted ONLY when the SNI is absent or matches the
     authority recorded at CONNECT."""
 
-    def _data(self, sni, cid="c1"):
+    def _data(self, sni, cid="c1", peer="172.30.0.2"):
+        # `peername` mirrors _connect_flow / _http_flow. Its absence here is why the
+        # fronting refusal could be recorded with no client for as long as it was.
         return SimpleNamespace(
             client_hello=SimpleNamespace(sni=sni),
-            context=SimpleNamespace(client=SimpleNamespace(id=cid)),
+            context=SimpleNamespace(
+                client=SimpleNamespace(id=cid, peername=(peer, 5000))),
             ignore_connection=False)
 
     def setUp(self):
@@ -171,6 +187,43 @@ class TlsClientHelloTests(unittest.TestCase):
         addon.tls_clienthello(data)
         self.assertFalse(data.ignore_connection)
 
+    def test_refusal_is_audited_in_the_shape_the_control_plane_ingests(self):
+        """The fronting refusal is the whole reason the ingest exists, so its line
+        has to land in the audit table's own vocabulary — not as a `deny-sni` verb
+        the schema and the frontend's tag styling have no rule for."""
+        addon._conn_authority["c1"] = "example.com"
+        with mock.patch.object(addon, "_audit") as audited:
+            addon.tls_clienthello(self._data("evil.com"))
+        audited.assert_called_once()
+        decision, fields = audited.call_args[0][0], audited.call_args[1]
+        self.assertEqual(decision, "deny")
+        self.assertEqual(fields["stage"], "sni")
+        # `host` is the name the CLIENT asserted; the authority it contradicts is
+        # named in the reason, so one row carries both sides of the mismatch.
+        self.assertEqual(fields["host"], "evil.com")
+        self.assertIn("example.com", fields["reason"])
+        self.assertEqual(fields["client"], "172.30.0.2")
+        # No /authorize call happens on this path at all, by design.
+        self.assertFalse(fields["central"])
+
+    def test_refusal_with_no_authority_still_names_a_client_and_reason(self):
+        with mock.patch.object(addon, "_audit") as audited:
+            addon.tls_clienthello(self._data("evil.com", peer="172.30.0.9"))
+        fields = audited.call_args[1]
+        self.assertEqual(fields["client"], "172.30.0.9")
+        self.assertEqual(fields["host"], "evil.com")
+        # Must not render as the string "None" where an authority would be.
+        self.assertNotIn("None", fields["reason"])
+
+    def test_tunnelled_connections_are_not_audited(self):
+        """Passthrough is the non-event. Auditing it would put a line per TLS
+        connection into a file the control plane now reads every 2 seconds."""
+        addon._conn_authority["c1"] = "example.com"
+        with mock.patch.object(addon, "_audit") as audited:
+            addon.tls_clienthello(self._data("example.com"))
+            addon.tls_clienthello(self._data(None))
+        audited.assert_not_called()
+
 
 class RequestTests(unittest.TestCase):
     """``request`` gates BOTH the transport host and the Host/:authority — this
@@ -193,6 +246,51 @@ class RequestTests(unittest.TestCase):
                                side_effect=self._authorize_by_host({"allowed.com"})):
             run(addon.request(flow))
         self.assertIsNone(flow.response)
+
+    def test_a_partly_local_decision_is_marked_uncentralised(self):
+        """Two names are gated, and they can be decided by different authorities: a
+        lifeline host short-circuits locally while the other goes to the control
+        plane. The flow is centrally recorded only if EVERY consulted name was, so
+        the flag is folded with `and` — taking the last name's answer would mark this
+        row as already-audited and drop it from the ingest, losing the decision."""
+        flow = _http_flow("api.anthropic.com", "other.example",
+                          scheme="http", port=80)
+        with mock.patch.object(addon.socket, "getaddrinfo",
+                               return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]), \
+             mock.patch.object(addon, "_post_authorize",
+                               side_effect=self._authorize_by_host({"other.example"})), \
+             mock.patch.object(addon, "_audit") as audited:
+            run(addon.request(flow))
+        self.assertIsNone(flow.response)                    # both names cleared
+        self.assertFalse(audited.call_args[1]["central"])
+
+    def test_a_fully_central_decision_is_not_ingested_twice(self):
+        # The other side of the fold: nothing local, so /authorize already wrote it.
+        flow = _http_flow("allowed.com", "allowed.com", scheme="http", port=80)
+        with mock.patch.object(addon.socket, "getaddrinfo",
+                               return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]), \
+             mock.patch.object(addon, "_post_authorize",
+                               side_effect=self._authorize_by_host({"allowed.com"})), \
+             mock.patch.object(addon, "_audit") as audited:
+            run(addon.request(flow))
+        self.assertTrue(audited.call_args[1]["central"])
+
+    def test_locally_denied_requests_still_name_their_client(self):
+        """The guard and port-gate denials are audited BEFORE /authorize is reached,
+        so they are ingested rows — and an ingested row that cannot say who asked is
+        half a record. They read the peer only after the guards until this ingest
+        made them visible, which is where the omission would have shown up."""
+        flow = _http_flow("allowed.com", "allowed.com", scheme="http", port=8080,
+                          peer="172.30.0.7")
+        with mock.patch.object(addon.socket, "getaddrinfo",
+                               return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]), \
+             mock.patch.object(addon, "_audit") as audited:
+            run(addon.request(flow))
+        self.assertIsNotNone(flow.response)                 # port-gated
+        fields = audited.call_args[1]
+        self.assertEqual(fields["client"], "172.30.0.7")
+        self.assertEqual(fields["host"], "allowed.com")
+        self.assertFalse(fields["central"])
 
     def test_the_authorize_call_says_which_sandbox_asked(self):
         """The control plane is SHARED across sandboxes, so an audit row that cannot

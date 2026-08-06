@@ -54,6 +54,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
+import math
 import os
 import sqlite3
 import threading
@@ -90,6 +91,40 @@ HOLD_TIMEOUT = float(os.environ.get("CONTROL_HOLD_TIMEOUT", "120"))
 # another blocking hold.
 MAX_PENDING = int(os.environ.get("CONTROL_MAX_PENDING", "16"))
 MAX_PENDING_PER_CLIENT = int(os.environ.get("CONTROL_MAX_PENDING_PER_CLIENT", "4"))
+
+# ── Egress audit ingest ─────────────────────────────────────────────────────
+# The proxy's audit file, mounted READ-ONLY from the shared named volume. Not every
+# egress decision is made by /authorize — the relay guard, the port gate, the SNI
+# anti-fronting check and the permanent-lifeline allow are all decided locally in the
+# proxy, on purpose, and a control-plane outage produces local fail-closed denials by
+# definition. Those never reached this store, so the UI's "recent decisions" was a
+# record of round-trips rather than of decisions, and a domain-fronting refusal — the
+# single most alarming thing the proxy can emit — was visible only in `make logs-proxy`.
+#
+# We PULL rather than have the proxy push, and that choice buys the property that
+# matters: the cursor lives in this same SQLite, so ingesting rows and advancing the
+# cursor are ONE transaction. A crash mid-drain rolls back both, which makes the
+# ingest exactly-once with no idempotency key, no UNIQUE index and no dedup pass —
+# the tax any at-least-once push (broker or POST) would have imposed. It also
+# self-heals across an outage of THIS service, since the file is durable and the
+# cursor simply resumes, and it leaves the security-critical proxy image untouched:
+# no new dependency, no fire-and-forget task in a hot path.
+EGRESS_AUDIT_LOG = os.environ.get("EGRESS_AUDIT_LOG", "/var/log/egress/audit.jsonl")
+# Seconds between drains; 0 disables ingest entirely. An idle pass is one stat() and
+# a comparison, so frequency is nearly free — what bounds it from ABOVE is that the
+# UI polls /api/audit every 4s, so anything under that keeps the drain out of the
+# critical path and total event-to-screen lag stays dominated by a poll the operator
+# already lives with. Above it, this interval becomes the lag.
+DRAIN_INTERVAL = float(os.environ.get("CONTROL_AUDIT_DRAIN_INTERVAL", "2"))
+# Bytes per drain pass. Bounds both memory and how long one transaction holds the
+# write lock, so a large backlog (first run against an existing volume) drains over
+# several passes instead of stalling startup in a single giant commit.
+DRAIN_BLOCK = int(os.environ.get("CONTROL_AUDIT_DRAIN_BLOCK", str(1 << 20)))
+# Cap on any single ingested string. These fields are agent-INFLUENCED (a host or URL
+# the sandbox asked for), and this is a trust boundary: the proxy writes them faithfully,
+# including a megabyte-long URL if the agent sent one. Truncating here keeps one request
+# from bloating the store or the glanceable UI list.
+DRAIN_MAX_FIELD = 2048
 
 app = FastAPI(title="dockade control plane", version="2b")
 
@@ -197,6 +232,18 @@ def _init_db() -> None:
             )""")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS approvals_status ON approvals(status)")
+        # Ingest cursor for the egress proxy's audit file (see _drain_egress_audit).
+        # A NEW TABLE, deliberately — not a column on an existing one — so it needs
+        # no migration on the long-lived store (read the note below this function).
+        # `inode` is what distinguishes a rotated/replaced file from an appended one;
+        # without it a fresh file inherits the old offset and its first N bytes are
+        # never ingested.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS audit_cursor (
+                path   TEXT PRIMARY KEY,
+                inode  INTEGER NOT NULL,
+                offset INTEGER NOT NULL
+            )""")
         conn.commit()
 
 
@@ -347,6 +394,157 @@ def _audit(decision: str, **fields) -> None:
     reason = fields.get("reason")
     print(f"AUDIT {decision} {shown}" + (f" :: {reason}" if reason else ""),
           flush=True)
+
+
+# ── egress audit ingest ─────────────────────────────────────────────────────
+
+def _ingest_field(value: object) -> str | None:
+    if value is None:
+        return None
+    return str(value)[:DRAIN_MAX_FIELD]
+
+
+def _ingest_row(line: bytes) -> tuple | None:
+    """Map one line of the proxy's audit file to an ``audit`` row, or None to skip.
+
+    Skipping is the default for anything unrecognized. This parses a file written by
+    the component that faces the sandbox, so it is deliberately incurious: a line it
+    does not fully understand is dropped, never guessed at.
+
+    The filter that matters is ``central is False`` — the proxy's marker for "no
+    /authorize call recorded this, so my line is the only record". Testing for the
+    literal False (not falsiness, not absence) is what makes a line the proxy wrote
+    before this field existed, or one with a garbled flag, under-report rather than
+    double-count every already-audited request."""
+    try:
+        rec = json.loads(line)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(rec, dict) or rec.get("central") is not False:
+        return None
+    if rec.get("decision") not in ("allow", "deny", "hold"):
+        return None
+    ts = rec.get("ts")
+    # The proxy's own timestamp, not our receipt time: these are historical rows, and
+    # stamping them on arrival would sort a backlog as if it had all just happened.
+    if (not isinstance(ts, (int, float)) or isinstance(ts, bool)
+            or not math.isfinite(ts)):
+        return None
+    port = rec.get("port")
+    if not isinstance(port, int) or isinstance(port, bool):
+        port = None
+    return (float(ts), _ingest_field(rec.get("decision")),
+            _ingest_field(rec.get("stage")), _ingest_field(rec.get("host")),
+            port, _ingest_field(rec.get("proto")), _ingest_field(rec.get("client")),
+            _ingest_field(rec.get("method")), _ingest_field(rec.get("url")),
+            _ingest_field(rec.get("reason")))
+
+
+def _drain_egress_audit() -> int:
+    """Ingest one bounded block of the proxy's audit file. Returns bytes consumed.
+
+    Reads only up to the LAST NEWLINE in the block, so a line the proxy is midway
+    through appending is left for the next pass rather than parsed in half.
+
+    Rows and the cursor advance in a single transaction — that is the whole design
+    (see EGRESS_AUDIT_LOG). Do not split them."""
+    # Raises if there is no file yet (the proxy may not have started, or the volume
+    # is absent). Deliberately not swallowed here: _audit_drain_loop reports it once
+    # on the transition, so "no ingest at all" can never be a silent steady state.
+    st = os.stat(EGRESS_AUDIT_LOG)
+    with _connect() as conn:
+        row = conn.execute("SELECT inode, offset FROM audit_cursor WHERE path=?",
+                           (EGRESS_AUDIT_LOG,)).fetchone()
+        inode, offset = (row["inode"], row["offset"]) if row else (st.st_ino, 0)
+        if inode != st.st_ino:
+            # Rotated or replaced: a different file, so the old offset means nothing.
+            inode, offset = st.st_ino, 0
+        elif st.st_size < offset:
+            # Truncated in place. Same file, fewer bytes — start over rather than
+            # read from a position past the end (which yields nothing, forever).
+            offset = 0
+        if st.st_size == offset:
+            return 0
+        with open(EGRESS_AUDIT_LOG, "rb") as f:
+            f.seek(offset)
+            block = f.read(DRAIN_BLOCK)
+        cut = block.rfind(b"\n")
+        if cut < 0 and len(block) < DRAIN_BLOCK:
+            # No newline yet and the file ends here: the proxy is midway through
+            # appending this line. Consume nothing and pick it up next pass — the
+            # alternative is parsing half a record, or worse, skipping it as
+            # "oversized" purely because we looked while it was being written.
+            return 0
+        if cut < 0:
+            # A full block with no newline: a line longer than the block. Skip past
+            # it — its fragments fail to parse and are dropped, which self-limits
+            # rather than wedging the cursor here and stalling every later line
+            # behind one oversized record.
+            print(f"control-plane: audit ingest skipping an oversized line at "
+                  f"offset {offset} (>{DRAIN_BLOCK} bytes)", flush=True)
+            consumed = len(block)
+        else:
+            consumed = cut + 1
+            rows = [r for r in (_ingest_row(ln)
+                                for ln in block[:consumed].split(b"\n") if ln.strip())
+                    if r is not None]
+            if rows:
+                conn.executemany(
+                    "INSERT INTO audit(ts, decision, stage, host, port, proto, "
+                    "client, method, url, reason) VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
+                # Mirror to stdout like _audit does, so `make logs-cp` stays a live
+                # feed of DECISIONS and not merely of this service's own round-trips.
+                # Marked `ingested` because it is: a decision the proxy made, arriving
+                # late and out of order relative to the lines around it.
+                for r in rows:
+                    print(f"AUDIT {r[1]} (ingested) stage={r[2]} host={r[3]} "
+                          f"client={r[6]} :: {r[9]}", flush=True)
+        conn.execute(
+            "INSERT INTO audit_cursor(path, inode, offset) VALUES (?,?,?) "
+            "ON CONFLICT(path) DO UPDATE SET inode=excluded.inode, "
+            "offset=excluded.offset",
+            (EGRESS_AUDIT_LOG, inode, offset + consumed))
+        conn.commit()
+    return consumed
+
+
+# Whether the last drain attempt failed, so the loop can report a transition instead
+# of the same line every DRAIN_INTERVAL. A missing file is the NORMAL state before the
+# proxy first writes, and a permanently silent ingest is exactly the failure this
+# whole change exists to remove — so it is reported once on the way in and once on
+# the way out, and never in between.
+_drain_failing = False
+
+
+async def _audit_drain_loop() -> None:
+    global _drain_failing
+    while True:
+        try:
+            # Drain until a pass consumes nothing, so a backlog clears in one wake-up
+            # rather than one block per interval. "Consumed nothing" — not "consumed
+            # less than a block" — is the right stop: a pass almost always stops short
+            # of DRAIN_BLOCK because it cuts at the last newline inside it, so the
+            # short-read test would sleep with the file still hours behind.
+            #
+            # Bounded anyway. Each pass strictly advances the cursor so this cannot
+            # spin on a fixed file, but a proxy appending faster than we drain would
+            # otherwise keep the loop from ever yielding to its own sleep.
+            for _ in range(64):
+                if await asyncio.to_thread(_drain_egress_audit) == 0:
+                    break
+            if _drain_failing:
+                print(f"control-plane: audit ingest recovered ({EGRESS_AUDIT_LOG})",
+                      flush=True)
+                _drain_failing = False
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — a dead loop must never be silent
+            if not _drain_failing:
+                print(f"control-plane: audit ingest FAILING ({EGRESS_AUDIT_LOG}): "
+                      f"{e!r} — locally-decided egress will not appear in "
+                      f"/api/audit until this clears", flush=True)
+                _drain_failing = True
+        await asyncio.sleep(DRAIN_INTERVAL)
 
 
 def _group_key(client: str | None, host: str | None,
@@ -645,6 +843,34 @@ def _startup() -> None:
     if seeded:
         print(f"control-plane: seeded {seeded} allow rules from {SEED_PATH}",
               flush=True)
+
+
+# Module-level reference, because asyncio keeps only a WEAK one: a bare create_task
+# whose result nobody holds can be garbage-collected mid-flight, and the ingest would
+# stop with no error anywhere.
+_drain_task: asyncio.Task | None = None
+
+
+@app.on_event("startup")
+async def _start_audit_drain() -> None:
+    """Start the egress-audit ingest. Registered AFTER _startup so _init_db has
+    created audit_cursor before the loop's first pass — Starlette runs startup
+    handlers in registration order, and this one does no work before its first
+    await anyway. The loop drains immediately on entry, which is what backfills
+    everything the proxy wrote while this service was down."""
+    global _drain_task
+    if DRAIN_INTERVAL <= 0:
+        print("control-plane: audit ingest DISABLED "
+              "(CONTROL_AUDIT_DRAIN_INTERVAL=0); locally-decided egress will "
+              "appear only in the proxy's own log", flush=True)
+        return
+    _drain_task = asyncio.create_task(_audit_drain_loop())
+
+
+@app.on_event("shutdown")
+async def _stop_audit_drain() -> None:
+    if _drain_task is not None:
+        _drain_task.cancel()
 
 
 @app.get("/healthz")

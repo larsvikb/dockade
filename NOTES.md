@@ -13,6 +13,35 @@ dated and cannot drift.
 Nothing here is load-bearing for a change to this repo. It is here so a number never has
 to be re-measured and a dead end never has to be re-explored.
 
+## SQLite: `INSERT OR IGNORE … ON CONFLICT DO UPDATE` still updates
+
+The `OR IGNORE` is inert when an `ON CONFLICT` clause names the same constraint — the
+upsert wins:
+
+```python
+c.execute("CREATE TABLE t(path TEXT PRIMARY KEY, v INT)")
+c.execute("INSERT INTO t VALUES ('a', 1)")
+c.execute("INSERT OR IGNORE INTO t(path, v) VALUES ('a', 2) "
+          "ON CONFLICT(path) DO UPDATE SET v=excluded.v")
+c.execute("SELECT v FROM t").fetchone()      # -> (2,)   not (1,)
+```
+
+Documented behaviour ("the upsert … takes precedence"), but it reads like belt-and-
+braces and is not. Worth knowing in both directions: a stray `OR IGNORE` in front of an
+upsert is harmless rather than a silent no-write bug — and, in the other direction, an
+`OR IGNORE` added *as* a mutation to test whether something advances is not a mutation
+at all. One of these was written as a mutation-testing case and reported SURVIVED before
+it turned out to be a no-op.
+
+## A deleted-and-recreated file usually gets the same inode back
+
+On ext4/overlayfs, `os.remove(p)` followed immediately by recreating `p` typically
+reuses the just-freed inode number, so `st_ino` is unchanged. Any rotation detection
+keyed on the inode therefore cannot be tested by delete-then-recreate — the test passes
+or fails on allocator luck. Write to a sibling path and `os.replace()` it over the
+target instead: the new file's inode is allocated while the old one is still linked, so
+it is guaranteed to differ.
+
 ## `curl` reads `http_proxy` in lower case only
 
 Same host, same shell, curl 8.14.1. `example.com` carries a **block** rule, so reaching

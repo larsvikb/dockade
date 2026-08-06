@@ -17,8 +17,20 @@ allowlist file, it asks the control plane per connection:
 
 That one call is both the policy decision AND the audit record (the control
 plane writes the row as it decides), so policy and audit share the round-trip
-the proxy already makes — no client-side cache (an operator edit applies to the
-very next connection) and no separate audit channel.
+the proxy already makes — and no client-side cache, so an operator edit applies
+to the very next connection.
+
+But NOT every decision is made by that call. The relay guard, the port gate, the
+SNI anti-fronting check and the permanent-lifeline allow are all decided HERE,
+locally, precisely so they cannot be widened (or stalled) by the control plane —
+and a control-plane outage produces local fail-closed denials by definition. Those
+never reach the central store on the authorize path, so each audit line carries
+``central``: true when the control plane already wrote the row itself, false when
+this local stream is the only record of it. The control plane tails this file
+(read-only) and ingests the ``central: false`` lines, which is what keeps its
+"recent decisions" view a record of *decisions* rather than of round-trips. The
+flag is the join key for that: it is what stops the ingest double-counting every
+governed request. See ``_drain_egress_audit`` in control-plane/app.py.
 
 Fail-closed, with one deliberate exception:
   - The **permanent lifeline** hosts (``EGRESS_PERMANENT_HOSTS`` — the Anthropic
@@ -65,6 +77,7 @@ import os
 import socket
 import time
 import urllib.request
+from typing import NamedTuple
 
 from mitmproxy import http, tls
 
@@ -374,25 +387,46 @@ def _post_authorize(payload: dict) -> dict:
         return json.loads(resp.read().decode())
 
 
-async def _authorize(host: str, *, stage: str, **fields) -> tuple[bool, str]:
-    """Return (allowed, reason). Permanent lifeline hosts are allowed locally
-    without consulting the control plane (outage resilience). Everything else
-    asks the control plane; any error there fails CLOSED (deny). The control
-    plane audits every decision it makes, so there is no per-call audit toggle."""
+class Verdict(NamedTuple):
+    allowed: bool
+    reason: str
+    # Did the CONTROL PLANE write this decision to the central audit store? True
+    # only when the /authorize call actually returned a decision — the two local
+    # paths below are false, and their audit lines are the sole record until the
+    # control plane ingests this file. Never inferred at the call site: whether a
+    # given host short-circuits as a lifeline is knowable only here.
+    central: bool
+
+
+async def _authorize(host: str, *, stage: str, **fields) -> Verdict:
+    """Permanent lifeline hosts are allowed locally without consulting the control
+    plane (outage resilience). Everything else asks the control plane; any error
+    there fails CLOSED (deny). The control plane audits every decision it makes
+    itself, which is what ``Verdict.central`` reports."""
     if _is_permanent(host):
-        return True, "permanent lifeline (local)"
+        return Verdict(True, "permanent lifeline (local)", False)
     payload = {"host": host, "stage": stage, **fields}
     try:
         resp = await asyncio.to_thread(_post_authorize, payload)
     except Exception as e:  # noqa: BLE001 — any failure must fail closed
-        return False, f"control-plane unreachable, fail-closed ({e})"
-    return resp.get("decision") == "allow", resp.get("reason", "")
+        return Verdict(False, f"control-plane unreachable, fail-closed ({e})", False)
+    return Verdict(resp.get("decision") == "allow", resp.get("reason", ""), True)
 
 
 def _audit(decision: str, **fields) -> None:
-    """Local audit stream (stdout + optional file). The control plane holds the
-    authoritative central record; this mirrors it for live `logs` viewing and is
-    the sole record when the control plane is unreachable."""
+    """Local audit stream (stdout + the file at AUDIT_PATH). The control plane holds
+    the authoritative central record; this mirrors it for live `logs` viewing and is
+    the sole record of the locally-made decisions (and of everything, while the
+    control plane is unreachable).
+
+    Every DECISION line carries ``central`` — see the module docstring. It is the
+    control plane's ingest filter, so a decision line without it is invisible to the
+    ingest by default, which is the fail-safe direction: a missing flag under-reports
+    rather than double-counts. Non-decision lines (``startup``) deliberately omit it.
+
+    Field names on decision lines mirror the /authorize payload (stage/host/port/
+    proto/client/method/url/reason) so the ingest is a straight column mapping with
+    no per-decision translation; extra fields are for the local stream only."""
     logger.info(json.dumps({"ts": round(time.time(), 3),
                             "decision": decision, **fields}))
 
@@ -423,29 +457,30 @@ async def http_connect(flow: http.HTTPFlow) -> None:
     # the agent off the control plane, not (only) network segmentation.
     forbidden = await _forbidden(host)
     if forbidden:
-        _audit("deny", proto="connect", host=host, port=port, client=client,
-               reason=forbidden)
+        _audit("deny", stage="connect", proto="connect", host=host, port=port,
+               client=client, reason=forbidden, central=False)
         flow.response = http.Response.make(
             403, b"egress denied by policy\n", {"Content-Type": "text/plain"})
         return
     if port not in ALLOWED_CONNECT_PORTS:
-        _audit("deny", proto="connect", host=host, port=port, client=client,
+        _audit("deny", stage="connect", proto="connect", host=host, port=port,
+               client=client, central=False,
                reason=f"port {port} not permitted for CONNECT "
                       f"({sorted(ALLOWED_CONNECT_PORTS)})")
         flow.response = http.Response.make(
             403, b"egress denied by policy\n", {"Content-Type": "text/plain"})
         return
-    allowed, reason = await _authorize(
+    v = await _authorize(
         host, stage="connect", proto="connect", port=port, client=client)
-    if allowed:
+    if v.allowed:
         # Remember the authorized authority for this connection so the SNI stage
         # can verify against it without a second (possibly re-holding) decision.
         _conn_authority[flow.client_conn.id] = host.lower()
-        _audit("allow", proto="connect", host=host, port=port, client=client,
-               reason=reason)
+        _audit("allow", stage="connect", proto="connect", host=host, port=port,
+               client=client, reason=v.reason, central=v.central)
     else:
-        _audit("deny", proto="connect", host=host, port=port, client=client,
-               reason=reason)
+        _audit("deny", stage="connect", proto="connect", host=host, port=port,
+               client=client, reason=v.reason, central=v.central)
         flow.response = http.Response.make(
             403, b"egress denied by policy\n", {"Content-Type": "text/plain"})
 
@@ -470,9 +505,19 @@ def tls_clienthello(data: tls.ClientHelloData) -> None:
     if sni is None or (authority is not None and sni.lower() == authority):
         data.ignore_connection = True
         return
-    _audit("deny-sni", sni=sni, authority=authority,
-           note="SNI does not match the authorized CONNECT authority; refusing "
-                "passthrough (possible domain-fronting)")
+    # Recorded as a plain `deny` at stage `sni`, NOT as its own `deny-sni` decision
+    # verb, so it maps onto the audit table's decision vocabulary (allow|deny|hold)
+    # and renders in the UI with the stage as a qualifier — `deny  sni · fronted.host`
+    # — instead of arriving as an unstyled tag the frontend has no rule for. `host` is
+    # the SNI because that is the name the client actually asserted; the authority it
+    # contradicts is in the reason. `sni`/`authority` stay as separate fields for the
+    # local stream, where they are still worth grepping on their own.
+    peer = data.context.client.peername
+    _audit("deny", stage="sni", host=sni, client=peer[0] if peer else None,
+           sni=sni, authority=authority, central=False,
+           reason=f"SNI does not match the authorized CONNECT authority "
+                  f"({authority or 'none recorded'}); refusing passthrough "
+                  f"(possible domain-fronting)")
 
 
 async def request(flow: http.HTTPFlow) -> None:
@@ -492,19 +537,30 @@ async def request(flow: http.HTTPFlow) -> None:
     proto = "https" if https else "http"
     allowed_ports = ALLOWED_CONNECT_PORTS if https else ALLOWED_HTTP_PORTS
     port = flow.request.port
+    # The same peer address ``http_connect`` reports. Omitting it left every plaintext
+    # -HTTP decision recorded with no client at all — and this control plane is shared
+    # across sandboxes, so those audit rows could not say whose request they were. It
+    # went unnoticed while the decisions view had no client column to be blank; it
+    # showed up in the first live test after the column was added. Read BEFORE the two
+    # guards below, not just before /authorize: those denials are audited too, and are
+    # now ingested centrally, so leaving them clientless reopened the same hole on the
+    # paths that need attribution most.
+    client = flow.client_conn.peername[0] if flow.client_conn.peername else None
     # Forbid control-plane / control-net for EVERY name the client asserts
     # (transport host and Host/:authority), before policy or the port gate.
     for name in {flow.request.host, flow.request.pretty_host}:
         forbidden = await _forbidden(name)
         if forbidden:
-            _audit("deny", proto=proto, method=flow.request.method,
-                   url=flow.request.pretty_url, reason=forbidden)
+            _audit("deny", stage="http", proto=proto, host=name, port=port,
+                   client=client, method=flow.request.method,
+                   url=flow.request.pretty_url, reason=forbidden, central=False)
             flow.response = http.Response.make(
                 403, b"egress denied by policy\n", {"Content-Type": "text/plain"})
             return
     if port not in allowed_ports:
-        _audit("deny", proto=proto, method=flow.request.method,
-               url=flow.request.pretty_url,
+        _audit("deny", stage="http", proto=proto, host=flow.request.pretty_host,
+               port=port, client=client, method=flow.request.method,
+               url=flow.request.pretty_url, central=False,
                reason=f"port {port} not permitted for {proto} "
                       f"({sorted(allowed_ports)})")
         flow.response = http.Response.make(
@@ -512,26 +568,27 @@ async def request(flow: http.HTTPFlow) -> None:
         return
     # sorted() only to make the "which name failed" report deterministic.
     names = sorted({flow.request.host, flow.request.pretty_host})
-    # The same peer address ``http_connect`` reports. Omitting it here left every
-    # plaintext-HTTP decision recorded with no client at all — and this control plane
-    # is shared across sandboxes, so those audit rows could not say whose request they
-    # were. It went unnoticed while the decisions view had no client column to be
-    # blank; it showed up in the first live test after the column was added.
-    client = flow.client_conn.peername[0] if flow.client_conn.peername else None
-    bad_name, bad_reason = None, ""
+    bad_name, bad_reason, central = None, "", True
     for name in names:
-        allowed, reason = await _authorize(
+        v = await _authorize(
             name, stage="http", proto=proto, port=port, client=client,
             method=flow.request.method, url=flow.request.pretty_url)
-        if not allowed:
-            bad_name, bad_reason = name, reason
+        # Every name must clear the control plane, so the flow is centrally recorded
+        # only if EVERY consulted name was — one lifeline name short-circuiting
+        # locally leaves this decision partly unrecorded there, and `and` is the
+        # fail-safe fold: it ingests a possible duplicate rather than dropping a row.
+        central = central and v.central
+        if not v.allowed:
+            bad_name, bad_reason = name, v.reason
             break
     if bad_name is None:
-        _audit("allow", proto=proto, method=flow.request.method,
-               client=client, url=flow.request.pretty_url)
+        _audit("allow", stage="http", proto=proto, host=flow.request.pretty_host,
+               port=port, method=flow.request.method, client=client,
+               url=flow.request.pretty_url, central=central)
     else:
-        _audit("deny", proto=proto, method=flow.request.method,
-               client=client, url=flow.request.pretty_url,
+        _audit("deny", stage="http", proto=proto, host=bad_name, port=port,
+               method=flow.request.method, client=client,
+               url=flow.request.pretty_url, central=central,
                reason=f"host not authorized ({bad_name}): {bad_reason}")
         flow.response = http.Response.make(
             403, b"egress denied by policy\n", {"Content-Type": "text/plain"})

@@ -1150,6 +1150,55 @@ is read from the row's *status* rather than from "did I win". Branching on the l
 which is what the single-waiter code did — told every loser that a human had rejected
 their request.
 
+**A decision row now says whose request it was.** `/api/audit` selected `stage` — which
+nothing rendered — while omitting `client`, which the proxy has always populated with
+the sandbox peer address. On a control plane **shared across every sandbox** that is
+the difference between a record and half a record: "egress to pypi.org was allowed" does
+not answer the question an audit trail exists for once two agents are running.
+
+This is not a reversal of keeping client identity out of the saturation banner's
+headline. That banner is a glanceable alert where a bare IP is noise; this table is the
+forensic view where *who* is the entire question. The two decisions point the same way —
+put the address where someone is reading carefully, not where they are only glancing.
+
+What stays out of the response matters as much: `url` is agent-controlled and unbounded,
+and `method`/`port`/`proto` are noise in a forty-row glance. All four remain in the
+table and in `make logs-cp`. This endpoint is a legible summary, not the record — and
+the record is what the invariant is about.
+
+**Timestamps are formatted here, not deferred to the viewer's locale** — a correctness
+decision rather than a preference, and the one place in this UI where following the
+platform default was actively wrong. `toLocaleString()` with no locale argument takes
+its format from the *browser's* language preference, so the same audit row read
+`8/7/2026` for one operator and `07/08/2026` for another. Those are different dates, in
+a table whose whole purpose is to say when something happened. Deferring to the viewer
+is right for a consumer app and wrong for a record: an audit trail needs one rendering
+that every reader parses identically. Fixed ISO-8601 ordering, local time, 24-hour, with
+the UTC instant on the row's `title` because the visible stamp states no offset —
+`NOTES.md` has what six locales actually produce.
+
+Two consequences beyond the reading. The format became **assertable**: while it was
+locale-driven the tests could only check its shape, and the suite now pins the exact
+string with `TZ` deliberately set to a non-zero offset, since a UTC runner cannot
+distinguish local from UTC. And writing that test immediately found a real defect — a
+null timestamp rendered as `1970-01-01`, because `Number(null)` is `0` rather than
+`NaN` and cleared every plausible numeric guard.
+
+**An empty state alone would not have fixed the empty state.** The filed defect was that
+"nothing has happened yet" and "the poll failed" rendered identically. The sharp part is
+that the page's own connection indicator cannot settle it either: `conn` reports the
+**SSE stream**, while this table is filled by a **separate poll**, so the header can read
+`live` while the decisions view sits indefinitely stale. Adding "none yet" under an empty
+table would have made that worse, not better — a positive all-clear on evidence the page
+does not have.
+
+So the two facts are tracked separately (has a load *ever* succeeded; did the *last* one
+fail) and a failed refresh keeps the rows it already has while saying they may be stale.
+Discarding them would throw away the only data the operator has, on the strength of one
+failed request. Three states, three sentences, and the third — before the first response
+lands — deliberately says nothing at all, for the same reason the saturation banner
+renders nothing at zero.
+
 **The frontend's own tests.** `tests/test_control_plane_ui_js.py` runs the pure helpers
 under `node` (skipped when node is absent, the way `make lint` skips a missing linter)
 and asserts in Python, so failures read like the rest of `tests/`. It covers the lamp
@@ -1157,7 +1206,8 @@ precedence (blind outranks busy), the backoff bounds and monotonicity, the keyed
 properties, the sweep gating, the countdown arithmetic (including the clock-skew clamps
 and the `expiring now`-not-`expired` wording), the expiry-vs-resolved-elsewhere
 distinction, the persist preview's wildcard flag, the saturation banner's levels,
-recency boundary and count-based dismissal, and the duplicate-count badge.
+recency boundary and count-based dismissal, the duplicate-count badge, and the
+decisions table's row shaping and empty-versus-stale states.
 Everything that touches the DOM
 lives inside `start()`, which runs only in a browser — so requiring the module under
 node must be side-effect free, and the test asserts that too: if DOM work migrates to
@@ -1863,17 +1913,6 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
     is treated as a convenience layer over a backend that validates every input, with its
     mistakes made detectable rather than prevented. The reasoning, and the condition that
     would reopen it, are under "`start()` is deliberately unverified" above.)*
-  - **The decisions table drops data the backend already sends** — `stage` is selected
-    and never rendered, and `client` is not selected at all, though it is populated
-    (the proxy sends the sandbox peer address) and this control plane is shared across
-    sandboxes, so a row cannot say *whose* request was decided. It also stamps rows
-    time-only, so 40 rows read out of order across midnight, and has no empty state,
-    which makes "nothing has happened yet" and "the poll failed" identical.
-    *(This bullet also claimed the decision was encoded by colour alone. That was
-    wrong and is struck: the tag's text content is the decision word, with colour as
-    redundant reinforcement. Checked only when the item came up for work — a filed
-    defect is a claim like any other, and this one had been repeated into a CSS
-    comment before anyone read the template.)*
   - **`resolve` reports `persisted: true` for a rule it did not write.** The insert is
     `INSERT OR IGNORE`, so re-persisting an existing pattern is a no-op the response
     still claims as a write. Duplicate grouping made this rarer — the usual way to hit
@@ -1881,11 +1920,19 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
   - **Opt-in desktop notification.** `http://localhost` is a secure context, so the
     Notification API is available; with a ~120s fuse and a page nobody watches, this is
     the honest fix for the problem the `(n)` title prefix only mitigates.
+  - **A domain-fronting refusal never reaches the decisions table.** `tls_clienthello`
+    compares the SNI against the authorized CONNECT authority locally — deliberately
+    **no** second control-plane call, so an "allow once" is not re-held mid-connection
+    — and audits the refusal to the *proxy's* stream. It is audited, so the invariant
+    holds; but the UI view titled "Recent decisions" shows control-plane decisions
+    only, and a fronting attempt is exactly what an operator watching it would want to
+    see. Needs either a decision on merging the two audit streams or an honest
+    narrowing of that heading.
   - Smaller: `/status` is on the relay allowlist but unused (allowlists rot — use it or
     drop it); `_STRIP_REQ` should also strip `content-length` / `transfer-encoding` /
-    `connection` / `expect`; audit and rules poll failures are swallowed, so those views
-    can show stale data while `conn` still reads "live"; no `aria-live` on the pending
-    list; both pollers run at 4s even in a hidden tab.
+    `connection` / `expect`; **rules** poll failures are still swallowed (the audit view
+    now reports its own staleness — the rules view does not); no `aria-live` on the
+    pending list; both pollers run at 4s even in a hidden tab.
 - Normalize hosts consistently across the control plane. The proxy's relay guard
   strips a trailing FQDN dot but `_decide` / `_match` only lowercase, so `evil.com.`
   misses a persisted **block** rule and lands in a hold instead — fail-safe, but it

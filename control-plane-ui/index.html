@@ -48,6 +48,13 @@
      from the running UI. */
   [hidden] { display: none !important; }
   .empty { color: var(--dim); font-style: italic; padding: 8px 0; }
+  /* A stale list and an empty one are different claims, so they do not look alike.
+     `warn` is the one that says the data on screen may no longer be true. */
+  .empty.warn { color: var(--hold); font-style: normal; }
+  .empty.warn::before { content: "⚠ "; }
+  /* The audit `stage`, beside the decision it qualifies. Rendered only when it is not
+     the ordinary CONNECT tunnel — see AUDIT_ORDINARY_STAGE in app.js. */
+  .qual { color: var(--dim); font-size: 11px; margin-left: 6px; }
   /* Saturation banner. Three levels, and the difference between them is EMPHASIS
      rather than presence: a rejection notice never disappears on a timer (see
      saturationState), it just stops shouting. `recent` borrows the deny colour
@@ -224,9 +231,15 @@
   <section id="view-decisions" role="tabpanel" aria-labelledby="tab-decisions" hidden>
     <h2>Recent decisions</h2>
     <table>
-      <thead><tr><th>time</th><th>decision</th><th>host</th><th>reason</th></tr></thead>
+      <thead><tr><th>time</th><th>decision</th><th>host</th><th>client</th>
+        <th>reason</th></tr></thead>
       <tbody id="audit"></tbody>
     </table>
+    <!-- Says whether an empty list means "nothing has happened" or "the poll failed".
+         Those rendered identically before, and the header cannot settle it either:
+         `conn` reports the SSE stream, while this table is filled by a separate poll
+         that can be failing while the stream is perfectly healthy. -->
+    <div class="empty" id="audit-empty" hidden></div>
   </section>
 
   <section id="view-policy" role="tabpanel" aria-labelledby="tab-policy" hidden>

@@ -390,6 +390,72 @@ class ResolveTests(_CPTestCase):
         self.assertEqual(resp.kwargs.get("status_code"), 409)
 
 
+class AuditViewTests(_CPTestCase):
+    """``/api/audit`` backs the decisions table, and had no tests at all — which is
+    how it went this long selecting ``stage`` that nothing rendered while omitting
+    ``client``, the one column a shared control plane most needs."""
+
+    def _rows(self, *rows):
+        """Insert audit rows directly. Not via ``_audit`` — that is mocked by
+        _CPTestCase, and these tests are about what the ENDPOINT serves, not about
+        what the writer records."""
+        with cp._connect() as conn:
+            for r in rows:
+                conn.execute(
+                    "INSERT INTO audit(ts, decision, stage, host, port, proto, "
+                    "client, method, url, reason) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (r.get("ts", 0.0), r.get("decision", "allow"), r.get("stage"),
+                     r.get("host"), r.get("port"), r.get("proto"), r.get("client"),
+                     r.get("method"), r.get("url"), r.get("reason")))
+            conn.commit()
+
+    def test_a_row_says_whose_request_it_was(self):
+        # The gap this closes. One control plane serves every sandbox, so a row that
+        # records "egress to pypi.org was allowed" without saying which agent asked
+        # is not answering the question an audit trail exists for.
+        self._rows({"host": "pypi.org", "client": "172.30.0.7", "decision": "allow"})
+        self.assertEqual(cp.api_audit()[0]["client"], "172.30.0.7")
+
+    def test_the_served_columns_are_pinned(self):
+        # Named, so adding or dropping one is a deliberate act with a failing test
+        # attached rather than a silent change of what the operator can see. `stage`
+        # was served and rendered by nothing for as long as this endpoint existed.
+        self._rows({"host": "a.example"})
+        self.assertEqual(
+            set(cp.api_audit()[0]),
+            {"ts", "decision", "stage", "host", "client", "reason"})
+
+    def test_the_unbounded_fields_stay_out_of_the_list_view(self):
+        # url is AGENT-CONTROLLED and unbounded; method/port/proto are recorded and
+        # queryable but noise in a forty-row glance. They are in the table on purpose
+        # and out of this response on purpose.
+        self._rows({"host": "a.example", "url": "https://a.example/" + "x" * 4000,
+                    "method": "GET", "port": 443, "proto": "connect"})
+        served = cp.api_audit()[0]
+        for field in ("url", "method", "port", "proto"):
+            self.assertNotIn(field, served)
+
+    def test_newest_first(self):
+        self._rows({"host": "old.example", "ts": 100.0},
+                   {"host": "new.example", "ts": 200.0})
+        self.assertEqual([r["host"] for r in cp.api_audit()],
+                         ["new.example", "old.example"])
+
+    def test_the_limit_is_clamped_at_both_ends(self):
+        self._rows(*[{"host": f"h{i}.example", "ts": float(i)} for i in range(12)])
+        self.assertEqual(len(cp.api_audit(limit=5)), 5)
+        # Zero or negative would serve nothing and read as "no decisions"; the
+        # ceiling stops one request dragging the whole unbounded table across.
+        self.assertEqual(len(cp.api_audit(limit=0)), 1)
+        self.assertEqual(len(cp.api_audit(limit=-3)), 1)
+        self.assertEqual(len(cp.api_audit(limit=100_000)), 12)
+
+    def test_an_empty_table_is_an_empty_list_not_an_error(self):
+        # The frontend distinguishes "nothing yet" from "the poll failed", which only
+        # works if this reports the first as success.
+        self.assertEqual(cp.api_audit(), [])
+
+
 class PersistCandidateTests(unittest.TestCase):
     """``_persist_candidates`` is what turns the persisted pattern from an
     AGENT-CONTROLLED STRING into an operator choice from a bounded set.

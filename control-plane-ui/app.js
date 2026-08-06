@@ -255,6 +255,61 @@ function requestsLabel(n) {
     : "";
 }
 
+// Nearly every governed request is a CONNECT tunnel, so `stage` is "connect" on almost
+// every row and a column of it would be forty repetitions of one word. It is shown only
+// when it is something else — which is exactly when it is worth seeing, because a
+// plaintext HTTP decision reaching the proxy at all is unusual.
+const AUDIT_ORDINARY_STAGE = "connect";
+
+// One audit row, shaped for display. Pure, and deliberately does NOT format the
+// timestamp: that is locale-dependent, and a unit test should not have to pin down a
+// locale to assert the parts that carry meaning.
+function auditRow(r) {
+  const stage = (r && r.stage) || "";
+  return {
+    ts: tsSeconds(r && r.ts),
+    decision: (r && r.decision) || "?",
+    // An ABSENT qualifier means "connect, or not recorded" — the two are not
+    // distinguished here on purpose. This is a hint that something is unusual, not
+    // evidence; the audit table holds the exact value and `make logs-cp` prints it.
+    qualifier: stage && stage !== AUDIT_ORDINARY_STAGE ? stage : "",
+    host: (r && r.host) || "",
+    // An em dash rather than an empty cell: blank reads as "this column is broken",
+    // whereas the honest statement is that no client was recorded for this row.
+    client: (r && r.client) || "—",
+    reason: (r && r.reason) || "",
+  };
+}
+
+// What the decisions list should say ABOUT ITSELF. It exists because an empty table
+// and a failed poll rendered identically — and the header cannot disambiguate them
+// either, since `conn` reports the SSE stream while this list is filled by a separate
+// poll that can be failing while the stream is healthy.
+//
+// A failed refresh does NOT clear the rows. Stale decisions with a warning above them
+// are more useful than an empty table, provided the staleness is stated — which is the
+// entire difference between this and what it replaces.
+function auditStatus(rowCount, failed, loaded) {
+  if (failed) {
+    return loaded
+      ? { show: true, level: "warn",
+          text: "Could not refresh — these are the last decisions loaded successfully " +
+                "and may be out of date." }
+      : { show: true, level: "warn",
+          text: "Could not load recent decisions — the control plane may be " +
+                "unreachable." };
+  }
+  // Before the first response there is nothing to claim in either direction; saying
+  // "none yet" here would be a positive all-clear the page has not earned.
+  if (!loaded) return { show: false, level: "none", text: "" };
+  if (rowCount === 0) {
+    return { show: true, level: "none",
+             text: "No decisions recorded yet. Every allow, deny and hold appears " +
+                   "here as it happens." };
+  }
+  return { show: false, level: "none", text: "" };
+}
+
 // What a Dismiss click acknowledges. A one-line function only because it must be the
 // SAME expression the optimistic local hide uses and the one the POST body carries:
 // with the number written twice, the two can disagree, and the failure is silent —
@@ -265,13 +320,73 @@ function ackCount(sat) {
   return sat ? Math.max(0, Number(sat.rejections) || 0) : 0;
 }
 
+// ── timestamps ──────────────────────────────────────────────────────────────
+// Formatted HERE rather than deferred to the viewer's locale, and that is a
+// correctness choice rather than a preference. `toLocaleString()` with no locale
+// argument takes its format from the BROWSER's language preference — not the OS
+// regional setting and not the page's `lang` — so one operator read an audit row as
+// `8/6/2026` while another read the same row as `06/08/2026`. Those are different
+// dates. A record whose whole purpose is to say WHEN something happened cannot mean
+// two things depending on who opened the page.
+//
+// So: fixed ISO-8601 ordering, local time, 24-hour. Unambiguous, sortable, identical
+// on every machine — and pinnable by a test, which a locale-driven format deliberately
+// was not.
+const pad2 = n => String(n).padStart(2, "0");
+
+// Epoch seconds, or null if there is no usable value.
+//
+// The explicit null/undefined/"" rejection is the whole reason this is a function.
+// `Number(null)` and `Number("")` are 0, NOT NaN — so a missing timestamp sails
+// through every plausible numeric guard and renders as `1970-01-01`, which in an audit
+// row reads as a real (if absurd) decision time rather than as missing data. A test
+// caught exactly that.
+function tsSeconds(ts) {
+  if (ts === null || ts === undefined || ts === "") return null;
+  const n = Number(ts);
+  return Number.isFinite(n) ? n : null;
+}
+
+// A Date, or null if the input cannot make one. Every formatter below returns "" for
+// that case rather than the string "Invalid Date", which is what `new Date(NaN)`
+// renders and reads like a decision the system made.
+function tsDate(ts) {
+  const n = tsSeconds(ts);
+  if (n === null) return null;
+  const d = new Date(n * 1000);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+// HH:MM:SS — for things happening NOW, where the date is today by construction: a
+// card's hold countdown, the saturation banner's "last rejection at".
+function fmtTime(ts) {
+  const d = tsDate(ts);
+  return d ? `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`
+           : "";
+}
+
+// YYYY-MM-DD HH:MM:SS — for rows that persist and are read in order. Rules live for
+// weeks and forty audit rows routinely span midnight, where a time-only stamp reads
+// as out of order at exactly the moment ordering matters.
+function fmtStamp(ts) {
+  const d = tsDate(ts);
+  return d ? `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} `
+             + fmtTime(ts)
+           : "";
+}
+
+// The unambiguous instant, for a `title` on audit rows. The displayed stamp is LOCAL
+// and carries no offset, which is fine while an operator is reading their own screen
+// and stops being fine the moment a row is correlated against `make logs-cp` or pasted
+// into a security advisory.
+function fmtInstant(ts) {
+  const d = tsDate(ts);
+  return d ? d.toISOString() : "";
+}
+
 // ── the page ────────────────────────────────────────────────────────────────
 
 function start() {
-  const fmt = ts => new Date(ts * 1000).toLocaleTimeString();
-  // Rules persist for weeks, so this one keeps the DATE. (A time-only stamp on
-  // long-lived rows reads as out-of-order the moment they span midnight.)
-  const fmtDay = ts => new Date(ts * 1000).toLocaleString();
   const esc = s => (s ?? "").toString().replace(/[&<>"]/g,
     c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
@@ -411,7 +526,7 @@ function start() {
 
     const meta = document.createElement("div");
     meta.className = "meta";
-    meta.textContent = [a.proto || null, `requested ${fmt(a.ts)}`,
+    meta.textContent = [a.proto || null, `requested ${fmtTime(a.ts)}`,
                         a.client ? `from ${a.client}` : null, a.url || null]
       .filter(Boolean).join(" · ");
 
@@ -746,7 +861,7 @@ function start() {
     // The time is formatted HERE rather than in the pure helper, which returns the raw
     // stamp: locale formatting is not something a unit test should have to pin down.
     satDetail.textContent = s.lastTs
-      ? `${s.detail} at ${fmt(s.lastTs)} · counted since ${fmt(lastSaturation.since)}`
+      ? `${s.detail} at ${fmtTime(s.lastTs)} · counted since ${fmtTime(lastSaturation.since)}`
       : s.detail;
     // Only the acknowledgeable state offers the button; a load warning clears itself
     // when the holds drain, so dismissing it would mean nothing.
@@ -831,14 +946,51 @@ function start() {
   }
 
   // ── audit + rules ─────────────────────────────────────────────────────────
+  // Whether a successful load has EVER completed, and whether the most recent one
+  // failed. Two facts rather than one, because "never loaded" and "loaded once, now
+  // failing" want different sentences — see auditStatus.
+  let auditLoaded = false;
+  let auditFailed = false;
+  const auditEmpty = document.getElementById("audit-empty");
+
+  function renderAuditStatus(rowCount) {
+    const s = auditStatus(rowCount, auditFailed, auditLoaded);
+    auditEmpty.hidden = !s.show;
+    auditEmpty.textContent = s.text;
+    auditEmpty.className = "empty" + (s.level === "warn" ? " warn" : "");
+  }
+
   async function refreshAudit() {
+    let rows;
     try {
-      const rows = await (await fetch("/api/audit?limit=40")).json();
-      document.getElementById("audit").innerHTML = rows.map(r => `
-        <tr><td class="ts">${fmt(r.ts)}</td>
-          <td><span class="tag ${esc(r.decision)}">${esc(r.decision)}</span></td>
-          <td>${esc(r.host)}</td><td>${esc(r.reason)}</td></tr>`).join("");
-    } catch (e) { /* transient; next poll retries */ }
+      const res = await fetch("/api/audit?limit=40");
+      if (!res.ok) throw new Error(String(res.status));
+      rows = await res.json();
+    } catch (e) {
+      // A failed refresh leaves the previous rows in place and SAYS SO. Silently
+      // swallowing this is what let the list sit indefinitely stale while the header
+      // read "live" — the stream and this poll are different transports.
+      auditFailed = true;
+      renderAuditStatus(document.getElementById("audit").rows.length);
+      return;
+    }
+    auditFailed = false;
+    auditLoaded = true;
+    // Dates, not times: forty rows routinely span midnight, and a time-only stamp makes
+    // them read as out of order at exactly the moment ordering matters. The `title`
+    // carries the UTC instant, because the visible stamp is local and states no offset
+    // — see fmtInstant.
+    document.getElementById("audit").innerHTML = rows.map(r => {
+      const a = auditRow(r);
+      return `
+        <tr><td class="ts" title="${esc(fmtInstant(a.ts))}">${esc(fmtStamp(a.ts))}</td>
+          <td><span class="tag ${esc(a.decision)}">${esc(a.decision)}</span>${
+            a.qualifier ? `<span class="qual">${esc(a.qualifier)}</span>` : ""}</td>
+          <td>${esc(a.host)}</td>
+          <td class="ts">${esc(a.client)}</td>
+          <td>${esc(a.reason)}</td></tr>`;
+    }).join("");
+    renderAuditStatus(rows.length);
   }
 
   async function refreshRules() {
@@ -862,7 +1014,7 @@ function start() {
           <td><code>${esc(r.pattern)}</code></td>
           <td class="${wild ? "wild" : "ts"}">${esc(r.scope)}</td>
           <td class="ts">${esc(r.source)}</td>
-          <td class="ts">${r.created_at ? fmtDay(r.created_at) : ""}</td></tr>`;
+          <td class="ts">${r.created_at ? fmtStamp(r.created_at) : ""}</td></tr>`;
       }).join("");
       updateIndicators();
     } catch (e) { /* transient; next poll retries */ }
@@ -935,7 +1087,9 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     lampState, backoffDelay, diffPending, shouldSweep,
     holdRemaining, countdownState, departure, persistPreview, saturationState,
-    ackCount, requestsLabel,
+    ackCount, requestsLabel, auditRow, auditStatus,
+    fmtTime, fmtStamp, fmtInstant,
+    AUDIT_ORDINARY_STAGE,
     RECONNECT_MIN_MS, RECONNECT_MAX_MS, STALE_MAX_MS, COUNTDOWN_URGENT_S,
     DWELL_MS, SATURATION_RECENT_MS, SATURATION_WARN_FRAC,
   };

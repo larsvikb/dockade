@@ -861,10 +861,24 @@ async def approvals_stream(request: Request) -> StreamingResponse:
 
 @app.get("/api/audit")
 def api_audit(limit: int = 50) -> list[dict]:
+    """Recent decisions, newest first, for the UI's decisions table.
+
+    ``client`` is here because this control plane is SHARED ACROSS SANDBOXES. Without
+    it a row records that egress to a host was allowed but not whose request it was,
+    which is the question an audit trail exists to answer the moment more than one
+    agent is running. It is the peer address the proxy observed — there is no sandbox
+    name to map it to, and the raw address is what the saturation banner's detail line
+    reports too.
+
+    The column list is deliberately narrower than the table. ``port``/``proto``/
+    ``method``/``url`` are recorded and queryable but not served here: the URL in
+    particular is agent-controlled and unbounded, and this is a glanceable list of
+    forty rows rather than the forensic interface. ``make logs-cp`` and the store
+    itself remain the complete record."""
     limit = max(1, min(limit, 500))
     with _connect() as conn:
         rows = conn.execute(
-            "SELECT ts, decision, stage, host, reason FROM audit "
+            "SELECT ts, decision, stage, host, client, reason FROM audit "
             "ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
     return [dict(r) for r in rows]
 

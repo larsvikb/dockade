@@ -13,6 +13,41 @@ dated and cannot drift.
 Nothing here is load-bearing for a change to this repo. It is here so a number never has
 to be re-measured and a dead end never has to be re-explored.
 
+## `toLocaleString()` renders one instant six ways
+
+One instant — `2026-08-06T22:30:05Z`, rendered in `Europe/Stockholm`:
+
+| locale | `toLocaleString()` | `toLocaleTimeString()` |
+|---|---|---|
+| `en-US` | `8/7/2026, 12:30:05 AM` | `12:30:05 AM` |
+| `en-GB` | `07/08/2026, 00:30:05` | `00:30:05` |
+| `sv-SE` | `2026-08-07 00:30:05` | `00:30:05` |
+| `de-DE` | `7.8.2026, 00:30:05` | `00:30:05` |
+| `fr-FR` | `07/08/2026 00:30:05` | `00:30:05` |
+| `ja-JP` | `2026/8/7 0:30:05` | `0:30:05` |
+
+`8/7/2026` and `07/08/2026` are the same moment written by two readers who would each
+report a different date if asked.
+
+Three things worth knowing, none of them obvious from the API:
+
+- **With no locale argument the runtime picks**, and in a browser that comes from the
+  **browser's language preference** (`navigator.languages`), *not* the operating
+  system's regional format setting. A browser installed in English renders US dates on
+  a machine configured entirely otherwise — which is how this was noticed.
+- **The page's `<html lang>` has no effect on it.** Setting `lang="en"` documents the
+  content language for assistive technology and does not reach `Intl`.
+- **`Number(null)` and `Number("")` are `0`, not `NaN`.** So a missing timestamp
+  survives an `isFinite` guard and formats as `1970-01-01` — a plausible-looking date
+  where the honest output is nothing at all. Only `undefined` and non-numeric strings
+  produce `NaN`.
+
+Node behaves the same way and defaults to `en-US` on a stock runner
+(`Intl.DateTimeFormat().resolvedOptions().locale`), which matters for tests: a
+locale-driven format cannot be asserted, only shape-checked, and a UTC-defaulted CI
+runner will not catch a UTC-for-local mix-up. Pinning `TZ` to a zone with a non-zero
+offset is what makes that assertable.
+
 ## Local inference on an Intel Arc 140V iGPU (Lunar Lake, WSL2)
 
 Decisions these numbers produced are in DESIGN.md → "Local inference"; this is the

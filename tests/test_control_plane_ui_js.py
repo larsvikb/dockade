@@ -60,7 +60,8 @@ _PROBE = r"""
 const m = require(process.env.DOCKADE_APP_JS);
 const missing = ["lampState", "backoffDelay", "diffPending", "shouldSweep",
                  "holdRemaining", "countdownState", "departure", "persistPreview",
-                 "saturationState", "ackCount", "requestsLabel"]
+                 "saturationState", "ackCount", "requestsLabel",
+                 "auditRow", "auditStatus", "fmtTime", "fmtStamp", "fmtInstant"]
   .filter(n => typeof m[n] !== "function");
 console.log(JSON.stringify({
   missing,
@@ -192,6 +193,51 @@ console.log(JSON.stringify({
       rejection_beats_load: m.saturationState(
         { ...rej(5000), in_flight: 16 }, NOW, 0).level,
       one: m.saturationState({ ...rej(5000), rejections: 1 }, NOW, 0).text,
+      // Timestamps. TZ is pinned by the runner (see setUpClass), so these are exact
+      // strings rather than "something date-shaped" — which is the whole point of
+      // formatting here instead of deferring to the viewer's locale.
+      stamps: {
+        // 2026-08-06T22:30:05Z, which is 2026-08-07 00:30:05 in Stockholm. The UTC
+        // and local DATES differ on purpose: a midday sample would let a UTC-vs-local
+        // mix-up pass, and this is the row where getting it wrong misfiles a decision
+        // by a day.
+        time: m.fmtTime(1786055405),
+        stamp: m.fmtStamp(1786055405),
+        instant: m.fmtInstant(1786055405),
+        // Single-digit month, day, hour, minute and second at once — the case
+        // zero-padding exists for, which an unpadded format renders "2026-1-2 3:4:5".
+        padded: m.fmtStamp(1767319445),
+        bad_time: m.fmtTime("whenever"),
+        bad_stamp: m.fmtStamp(undefined),
+        // null and "" are the dangerous ones: Number() turns both into 0, so they
+        // pass any isFinite check and render as the Unix epoch.
+        bad_instant: m.fmtInstant(null),
+        null_stamp: m.fmtStamp(null),
+        empty_stamp: m.fmtStamp(""),
+        null_row_ts: m.auditRow({ ts: null, host: "a.example" }).ts,
+      },
+      audit: {
+        ordinary_stage: m.AUDIT_ORDINARY_STAGE,
+        tunnelled: m.auditRow({ ts: 1e9, decision: "allow", stage: "connect",
+                                host: "pypi.org", client: "172.30.0.7",
+                                reason: "allowed by rule (pypi.org)" }),
+        plaintext: m.auditRow({ ts: 1e9, decision: "deny", stage: "http",
+                                host: "a.example", client: "172.30.0.2",
+                                reason: "no matching rule" }),
+        no_stage: m.auditRow({ ts: 1e9, decision: "hold", host: "a.example" }),
+        no_client: m.auditRow({ ts: 1e9, decision: "allow", host: "a.example" }),
+        junk_ts: m.auditRow({ ts: "soon", decision: "allow", host: "a.example" }).ts,
+        empty: m.auditRow({}),
+        nothing: m.auditRow(null),
+      },
+      audit_status: {
+        // rowCount, failed, loaded
+        first_load_in_flight: m.auditStatus(0, false, false),
+        genuinely_empty: m.auditStatus(0, false, true),
+        has_rows: m.auditStatus(12, false, true),
+        failed_with_rows: m.auditStatus(12, true, true),
+        failed_from_cold: m.auditStatus(0, true, false),
+      },
       requests: {
         one: m.requestsLabel(1),
         four: m.requestsLabel(4),
@@ -229,9 +275,14 @@ class PageScriptTests(unittest.TestCase):
                 "file has. Install node, or drop strict mode to skip them knowingly.")
         # _NODE comes from shutil.which (absolute path, no shell), and both arguments
         # are repo paths — no untrusted input reaches the command line.
+        # TZ is PINNED, and not to UTC. The formatters render LOCAL time, so a UTC
+        # runner would let a UTC-vs-local mix-up pass unnoticed; a zone two hours off
+        # makes that mistake a failing assertion. The offset also has to be one whose
+        # local date differs from the UTC date for the sample instants below.
         proc = subprocess.run(  # noqa: S603 (absolute path, fixed args — see above)
             [_NODE, "-e", _PROBE],
-            env={**os.environ, "DOCKADE_APP_JS": str(APP_JS)},
+            env={**os.environ, "DOCKADE_APP_JS": str(APP_JS),
+                 "TZ": "Europe/Stockholm"},
             capture_output=True, text=True, timeout=60, check=False)
         if proc.returncode != 0:
             raise AssertionError(
@@ -560,6 +611,162 @@ class PageScriptTests(unittest.TestCase):
         self.assertEqual(r["missing"], "")
         self.assertEqual(r["zero"], "")
         self.assertEqual(r["junk"], "")
+
+
+    # ── timestamps ───────────────────────────────────────────────────────────
+
+    def test_a_stamp_reads_the_same_for_every_operator(self):
+        """The format is fixed rather than taken from the viewer's locale, and that is
+        a correctness property, not a preference. `toLocaleString()` with no argument
+        follows the BROWSER's language — so the same audit row read `8/6/2026` for one
+        operator and `06/08/2026` for another. Those are different dates, in a table
+        whose entire job is to say when something happened.
+
+        Being able to write this assertion at all is the second half of the change: a
+        locale-driven format could only ever be tested for shape."""
+        s = self.probe["saturation"]["stamps"]
+        self.assertEqual(s["stamp"], "2026-08-07 00:30:05")
+        self.assertEqual(s["time"], "00:30:05")
+        # ISO-8601 ordering, 24-hour, no AM/PM, no ambiguity about which number is
+        # the month.
+        self.assertRegex(s["stamp"], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+        self.assertNotIn("PM", s["stamp"])
+
+    def test_the_displayed_stamp_is_local_and_the_title_is_absolute(self):
+        s = self.probe["saturation"]["stamps"]
+        # Same instant, two renderings: local for reading, UTC for correlating. The
+        # dates differ here, which is exactly why the tooltip is worth carrying.
+        self.assertTrue(s["stamp"].startswith("2026-08-07"), s["stamp"])
+        self.assertEqual(s["instant"], "2026-08-06T22:30:05.000Z")
+
+    def test_every_field_is_zero_padded(self):
+        # Otherwise columns fail to align and, worse, sort wrong as text — the
+        # property ISO ordering was chosen for in the first place.
+        self.assertEqual(self.probe["saturation"]["stamps"]["padded"],
+                         "2026-01-02 03:04:05")
+
+    def test_an_unusable_timestamp_renders_empty_not_invalid_date(self):
+        s = self.probe["saturation"]["stamps"]
+        # `new Date(NaN)` stringifies to "Invalid Date", which in an audit cell reads
+        # like a finding the system is reporting rather than a missing value.
+        #
+        # null and "" are the ones that actually bit: Number() maps both to 0, not
+        # NaN, so they cleared every plausible numeric guard and rendered
+        # "1970-01-01 01:00:00" — a real-looking decision time for a row that has none.
+        for key in ("bad_time", "bad_stamp", "bad_instant",
+                    "null_stamp", "empty_stamp"):
+            self.assertEqual(s[key], "", key)
+        self.assertIsNone(s["null_row_ts"],
+                          "auditRow had the same hole and must not reintroduce it")
+
+    # ── the decisions table ──────────────────────────────────────────────────
+
+    def test_a_decision_row_carries_who_asked(self):
+        a = self.probe["saturation"]["audit"]
+        # The whole point of the change: one control plane serves every sandbox, so
+        # "allowed egress to pypi.org" is only half a record.
+        self.assertEqual(a["tunnelled"]["client"], "172.30.0.7")
+        # An em dash, not a blank cell — blank reads as a broken column, whereas the
+        # honest statement is that no client was recorded on this row.
+        self.assertEqual(a["no_client"]["client"], "—")
+
+    def test_the_stage_shows_only_when_it_is_not_the_ordinary_tunnel(self):
+        a = self.probe["saturation"]["audit"]
+        # Nearly every governed request is a CONNECT tunnel, so a column of `stage`
+        # would be forty repetitions of one word and the one row worth noticing —
+        # a plaintext HTTP decision — would not stand out at all.
+        self.assertEqual(a["ordinary_stage"], "connect")
+        self.assertEqual(a["tunnelled"]["qualifier"], "")
+        self.assertEqual(a["plaintext"]["qualifier"], "http")
+        # Absent stage renders nothing rather than inventing "connect".
+        self.assertEqual(a["no_stage"]["qualifier"], "")
+
+    def test_a_malformed_row_still_renders(self):
+        a = self.probe["saturation"]["audit"]
+        # This list is fed from a table the agent influences the contents of, so a
+        # missing field must degrade to a readable cell, never to a thrown render
+        # that leaves the operator with a blank decisions view.
+        self.assertEqual(a["empty"]["decision"], "?")
+        self.assertEqual(a["nothing"]["decision"], "?")
+        self.assertEqual(a["nothing"]["host"], "")
+        self.assertIsNone(a["junk_ts"], "a non-numeric ts must not reach Date()")
+
+    def test_an_empty_list_and_a_failed_poll_no_longer_look_alike(self):
+        """The filed defect, and the reason a bare empty state would not have fixed
+        it. The header cannot disambiguate these either: `conn` reports the SSE
+        stream, while this table is filled by a poll that can fail independently."""
+        s = self.probe["saturation"]["audit_status"]
+        # Genuinely empty: say so plainly, no warning styling.
+        self.assertTrue(s["genuinely_empty"]["show"])
+        self.assertEqual(s["genuinely_empty"]["level"], "none")
+        self.assertIn("No decisions recorded yet", s["genuinely_empty"]["text"])
+        # Failed: warn, and distinguish "these rows are stale" from "there are none".
+        self.assertEqual(s["failed_with_rows"]["level"], "warn")
+        self.assertIn("may be out of date", s["failed_with_rows"]["text"])
+        self.assertEqual(s["failed_from_cold"]["level"], "warn")
+        self.assertIn("unreachable", s["failed_from_cold"]["text"])
+        # Healthy with rows: the table speaks for itself.
+        self.assertFalse(s["has_rows"]["show"])
+
+    def test_nothing_is_claimed_before_the_first_response(self):
+        s = self.probe["saturation"]["audit_status"]
+        # "No decisions recorded yet" during the first fetch would be a positive
+        # all-clear the page has not earned — the same reasoning that keeps the
+        # saturation banner hidden at zero rather than rendering one.
+        self.assertFalse(s["first_load_in_flight"]["show"])
+
+
+class DecisionsTableSourceTests(unittest.TestCase):
+    """`refreshAudit` lives in `start()` and cannot be unit-tested, so the parts of
+    it that would fail SILENTLY are asserted against the source — the same approach
+    the dismiss handler and the duplicate badge use."""
+
+    def setUp(self):
+        self.src = APP_JS.read_text()
+        self.body = re.search(r"async function refreshAudit\(\)\s*\{(.*?)\n  \}",
+                              self.src, re.S)
+        self.assertIsNotNone(self.body, "refreshAudit not found — renamed?")
+
+    def test_the_decisions_table_stamps_the_date_not_only_the_time(self):
+        # Forty rows routinely span midnight, and a time-only stamp makes them read
+        # as out of order at exactly the moment ordering matters. WHICH formatter this
+        # render calls is not reachable from a unit test; the formatters themselves are
+        # (see the FormatterTests above), so only the call site needs guarding.
+        self.assertIn("fmtStamp(", self.body.group(1))
+        self.assertNotIn("fmtTime(", self.body.group(1))
+
+    def test_the_row_carries_the_unambiguous_instant_as_well(self):
+        # The visible stamp is LOCAL and states no offset, which is fine on the
+        # operator's own screen and not fine once a row is correlated against
+        # `make logs-cp` or pasted into an advisory.
+        self.assertRegex(self.body.group(1), r'title="\$\{esc\(fmtInstant\(')
+
+    def test_a_failed_refresh_keeps_the_rows_and_reports_the_staleness(self):
+        # Both halves matter. Clearing on failure would throw away the only data the
+        # operator has; not reporting it is the bug being fixed.
+        self.assertIn("auditFailed = true", self.body.group(1))
+        self.assertIn("renderAuditStatus(", self.body.group(1))
+        self.assertNotRegex(
+            self.body.group(1),
+            r'catch[^}]*innerHTML\s*=\s*""',
+            "a failed poll must not blank the table")
+
+    def test_a_non_ok_response_is_a_failure_not_a_row_of_json(self):
+        # `fetch` does not reject on 4xx/5xx. Without this check a 502 from the relay
+        # would flow into .json(), throw somewhere less obvious, or worse parse into
+        # something that renders as an empty but SUCCESSFUL list.
+        self.assertIn("res.ok", self.body.group(1))
+
+    def test_the_client_column_is_rendered_and_escaped(self):
+        self.assertIn("esc(a.client)", self.body.group(1))
+        # Scoped to the decisions SECTION, not the first <thead> in the file — the
+        # policy table also has one, and a reordering of the two sections would
+        # otherwise silently point this assertion at the wrong table.
+        section = re.search(r'<section id="view-decisions".*?</section>',
+                            INDEX_HTML.read_text(), re.S)
+        self.assertIsNotNone(section, "the decisions section was renamed")
+        self.assertIn("<th>client</th>", section.group(0),
+                      "the column exists in the body but has no header")
 
 
 class DuplicateBadgeSourceTests(unittest.TestCase):

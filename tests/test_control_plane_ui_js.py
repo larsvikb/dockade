@@ -61,7 +61,8 @@ const m = require(process.env.DOCKADE_APP_JS);
 const missing = ["lampState", "backoffDelay", "diffPending", "shouldSweep",
                  "holdRemaining", "countdownState", "departure", "persistPreview",
                  "saturationState", "ackCount", "requestsLabel",
-                 "auditRow", "auditStatus", "fmtTime", "fmtStamp", "fmtInstant"]
+                 "auditRow", "auditStatus", "repeatCount",
+                 "fmtTime", "fmtStamp", "fmtInstant"]
   .filter(n => typeof m[n] !== "function");
 console.log(JSON.stringify({
   missing,
@@ -274,6 +275,18 @@ console.log(JSON.stringify({
         junk_ts: m.auditRow({ ts: "soon", decision: "allow", host: "a.example" }).ts,
         empty: m.auditRow({}),
         nothing: m.auditRow(null),
+      },
+      repeats: {
+        // n, and what the row should say about it.
+        grouped: m.auditRow({ ts: 1e9, n: 47, first_ts: 1e9 - 2800,
+                              host: "chatty.example" }),
+        single: m.auditRow({ ts: 1e9, n: 1, first_ts: 1e9, host: "a.example" }),
+        absent: m.auditRow({ ts: 1e9, host: "a.example" }),
+        // n>1 but no span recorded — the count still stands on its own.
+        no_first_ts: m.auditRow({ ts: 1e9, n: 3, host: "a.example" }),
+        counts: [47, 1, 0, -5, null, undefined, "many", 2.7, 1e9, true]
+          .map(n => [String(n), m.repeatCount({ n })]),
+        no_row: m.repeatCount(null),
       },
       audit_status: {
         // rowCount, failed, loaded
@@ -798,6 +811,43 @@ class PageScriptTests(unittest.TestCase):
         self.assertEqual(a["nothing"]["host"], "")
         self.assertIsNone(a["junk_ts"], "a non-numeric ts must not reach Date()")
 
+    def test_a_repeated_decision_says_how_many_and_over_what_span(self):
+        """`/api/audit` groups identical decisions, so a row can stand for many. The
+        count without the span is not enough: 47x cannot distinguish a burst from a
+        client retrying once a minute all afternoon, and those want different
+        responses from whoever reads the row."""
+        r = self.probe["saturation"]["repeats"]
+        self.assertEqual(r["grouped"]["repeat"], "47x")
+        self.assertEqual(r["grouped"]["firstTs"], 1e9 - 2800)
+
+    def test_an_ordinary_row_is_untouched_by_grouping(self):
+        """n==1 is the majority case and must render exactly as it did before grouping
+        existed. A literal "1x" on every row would be noise on all of them to annotate
+        a few — and `absent` covers a payload with no `n` at all, so the frontend
+        degrades to the old behaviour rather than to a broken group."""
+        r = self.probe["saturation"]["repeats"]
+        for case in ("single", "absent"):
+            with self.subTest(case=case):
+                self.assertEqual(r[case]["repeat"], "")
+                self.assertIsNone(r[case]["firstTs"])
+
+    def test_a_count_with_no_span_still_reports_the_count(self):
+        r = self.probe["saturation"]["repeats"]
+        self.assertEqual(r["no_first_ts"]["repeat"], "3x")
+        self.assertIsNone(r["no_first_ts"]["firstTs"])
+
+    def test_only_a_real_count_above_one_groups(self):
+        # Same trust posture as the rest of this row: the value comes from a table the
+        # agent influences, so anything unusable reads as the ordinary single row.
+        r = dict(self.probe["saturation"]["repeats"]["counts"])
+        self.assertEqual(r["47"], 47)
+        self.assertEqual(r["2.7"], 2, "a fractional count must not reach the cell")
+        self.assertEqual(r["1000000000"], 1000000000)
+        for junk in ("1", "0", "-5", "null", "undefined", "many", "true"):
+            with self.subTest(n=junk):
+                self.assertEqual(r[junk], 1)
+        self.assertEqual(self.probe["saturation"]["repeats"]["no_row"], 1)
+
     def test_an_empty_list_and_a_failed_poll_no_longer_look_alike(self):
         """The filed defect, and the reason a bare empty state would not have fixed
         it. The header cannot disambiguate these either: `conn` reports the SSE
@@ -890,6 +940,24 @@ class DecisionsTableSourceTests(unittest.TestCase):
         self.assertIn("esc(a.host)", host)
         self.assertIn("esc(a.client)", client)
         self.assertIn("esc(a.reason)", reason)
+        # Grouping annotates two cells and must not add a sixth (asserted above): the
+        # repeat count sits beside the host it repeats, the span beside the reason,
+        # which is the column that already carries explanatory text.
+        self.assertIn("a.repeat", host)
+        self.assertIn("a.firstTs", reason)
+        self.assertNotIn("a.repeat", decision, "the decision column stays uniform")
+
+    def test_the_grouping_annotations_carry_their_own_separators(self):
+        """The `denyhttp` lesson, which cost a live debug: a CSS margin produced the
+        right pixels and the wrong `textContent`, so a row copied into a ticket read as
+        one word. A decisions table exists to be quotable evidence, so the space and
+        the separator are part of the escaped VALUE, never styling."""
+        body = self.body.group(1)
+        self.assertIn('esc(" " + a.repeat)', body)
+        self.assertIn("esc(` · first seen ${fmtStamp(a.firstTs)}`)", body)
+        # fmtStamp, not fmtTime: a group's span can cover days (the scan behind it is
+        # bounded by event count, not by a window), so a bare time reads as today.
+        self.assertNotIn("fmtTime(a.firstTs)", body)
 
     def test_the_client_column_is_rendered_and_escaped(self):
         self.assertIn("esc(a.client)", self.body.group(1))

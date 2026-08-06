@@ -476,10 +476,15 @@ class AuditViewTests(_CPTestCase):
     ``client``, the one column a shared control plane most needs."""
 
     def _rows(self, *rows):
-        """Insert audit rows directly. Not via ``_audit`` — that is mocked by
-        _CPTestCase, and these tests are about what the ENDPOINT serves, not about
-        what the writer records."""
+        """REPLACE the audit table with these rows. Not via ``_audit`` — that is mocked
+        by _CPTestCase, and these tests are about what the ENDPOINT serves, not about
+        what the writer records.
+
+        Replacing rather than appending, so a test can call this more than once in a
+        loop. Appending made the grouping subtests count leftovers from the previous
+        iteration and read 6 where they meant 2."""
         with cp._connect() as conn:
+            conn.execute("DELETE FROM audit")
             for r in rows:
                 conn.execute(
                     "INSERT INTO audit(ts, decision, stage, host, port, proto, "
@@ -503,7 +508,8 @@ class AuditViewTests(_CPTestCase):
         self._rows({"host": "a.example"})
         self.assertEqual(
             set(cp.api_audit()[0]),
-            {"ts", "decision", "stage", "host", "client", "reason"})
+            {"ts", "decision", "stage", "host", "client", "reason",
+             "n", "first_ts"})
 
     def test_the_unbounded_fields_stay_out_of_the_list_view(self):
         # url is AGENT-CONTROLLED and unbounded; method/port/proto are recorded and
@@ -534,6 +540,116 @@ class AuditViewTests(_CPTestCase):
         # The frontend distinguishes "nothing yet" from "the poll failed", which only
         # works if this reports the first as success.
         self.assertEqual(cp.api_audit(), [])
+
+    def test_identical_decisions_collapse_to_one_row(self):
+        """The case that forced this: a client retrying a host that a standing rule
+        refuses, once a minute, forever. Ungrouped it writes 1440 rows a day and the
+        forty-row list covers under an hour — so a fronting refusal from this morning
+        is already off the bottom."""
+        self._rows(*[{"host": "chatty.example", "decision": "deny", "stage": "connect",
+                      "client": "172.30.0.2", "reason": "blocked by rule",
+                      "ts": 1000.0 + 60 * i} for i in range(30)])
+        served = cp.api_audit()
+        self.assertEqual(len(served), 1)
+        self.assertEqual(served[0]["n"], 30)
+        # The LATEST occurrence is the row's instant; the span's start is separate,
+        # because a bare count cannot tell a burst from a day-long retry loop.
+        self.assertEqual(served[0]["ts"], 1000.0 + 60 * 29)
+        self.assertEqual(served[0]["first_ts"], 1000.0)
+
+    def test_interleaved_repeats_still_collapse(self):
+        """Two periodic sources chop each other's runs apart, which is why this groups
+        by key over a window rather than collapsing consecutive rows: run-detection
+        would have folded almost nothing on the very log that motivated it."""
+        rows = []
+        for i in range(10):
+            rows.append({"host": "chatty.example", "decision": "deny", "ts": 100.0 + 2 * i})
+            rows.append({"host": "api.example", "decision": "allow", "ts": 101.0 + 2 * i})
+        self._rows(*rows)
+        served = cp.api_audit()
+        self.assertEqual({r["host"]: r["n"] for r in served},
+                         {"chatty.example": 10, "api.example": 10})
+
+    def test_a_single_decision_reports_itself_as_one(self):
+        # The ordinary row. n==1 is what the frontend keys "render exactly as before".
+        self._rows({"host": "a.example", "ts": 5.0})
+        self.assertEqual(cp.api_audit()[0]["n"], 1)
+        self.assertEqual(cp.api_audit()[0]["first_ts"], 5.0)
+
+    def test_the_group_key_is_exactly_what_is_displayed(self):
+        """Rows that differ ONLY in a served field must stay apart, and rows that
+        differ only in an unserved one must merge — otherwise the list shows entries
+        a reader cannot tell apart, which is the failure being fixed."""
+        base = {"host": "a.example", "decision": "deny", "stage": "connect",
+                "client": "172.30.0.2", "reason": "blocked by rule"}
+        for field, other in (("decision", "allow"), ("stage", "sni"),
+                             ("host", "b.example"), ("client", "172.30.0.9"),
+                             ("reason", "no matching rule")):
+            with self.subTest(field=field):
+                self._rows(base, {**base, field: other})
+                self.assertEqual(len(cp.api_audit()), 2)
+        # port/proto/method/url are recorded but never shown, so keying on them would
+        # split one group into rows that render identically.
+        self._rows({**base, "port": 443, "proto": "connect", "method": "GET"},
+                   {**base, "port": 8443, "proto": "https", "method": "POST"})
+        self.assertEqual(len(cp.api_audit()), 1)
+
+    def test_one_sandbox_never_absorbs_another(self):
+        # Attribution is the whole reason the client column exists; folding two
+        # sandboxes into one row would quietly undo it.
+        self._rows({"host": "a.example", "client": "172.30.0.2"},
+                   {"host": "a.example", "client": "172.30.0.3"})
+        self.assertEqual({r["client"] for r in cp.api_audit()},
+                         {"172.30.0.2", "172.30.0.3"})
+
+    def test_groups_are_ordered_by_their_latest_occurrence(self):
+        self._rows({"host": "chatty.example", "ts": 10.0},
+                   {"host": "chatty.example", "ts": 20.0},
+                   {"host": "quiet.example", "ts": 15.0})
+        self.assertEqual([r["host"] for r in cp.api_audit()],
+                         ["chatty.example", "quiet.example"])
+
+    def test_the_scan_bounds_the_rows_read_and_the_limit_bounds_the_groups_served(self):
+        """Two different bounds doing two different jobs, and swapping them is a real
+        mistake with no symptom at the default settings — the scan would collapse to
+        forty rows while the response grew to five thousand groups.
+
+        Distinguishing them needs a fixture where the two answers differ: the newest
+        ten events are all ONE host, behind thirty distinct older ones. Reading the
+        scan window and grouping it gives ONE row; reading everything and truncating
+        the groups gives ten. A first version of this test used forty distinct hosts,
+        where both orderings happen to return the same ten rows, and the swap survived
+        it."""
+        cp.AUDIT_GROUP_SCAN = 10
+        try:
+            self._rows(*([{"host": f"old{i}.example", "ts": float(i)}
+                          for i in range(30)]
+                         + [{"host": "chatty.example", "ts": 30.0 + i}
+                            for i in range(10)]))
+            served = cp.api_audit(limit=50)
+            self.assertEqual(len(served), 1)
+            self.assertEqual(served[0]["host"], "chatty.example")
+            # The count is over the SCAN WINDOW, which is the honest claim: this view
+            # summarises recent events, not the whole table.
+            self.assertEqual(served[0]["n"], 10)
+        finally:
+            cp.AUDIT_GROUP_SCAN = 5000
+
+    def test_rows_older_than_the_scan_are_kept_but_not_shown(self):
+        # Cost has to be fixed as the table grows, since this is polled every few
+        # seconds against a table that only ever gets longer. The trade is stated
+        # rather than hidden: the record keeps everything, this view does not.
+        cp.AUDIT_GROUP_SCAN = 5
+        try:
+            self._rows(*[{"host": f"h{i}.example", "ts": float(i)}
+                         for i in range(20)])
+            self.assertEqual([r["host"] for r in cp.api_audit()],
+                             [f"h{i}.example" for i in range(19, 14, -1)])
+            with cp._connect() as conn:
+                self.assertEqual(
+                    conn.execute("SELECT COUNT(*) FROM audit").fetchone()[0], 20)
+        finally:
+            cp.AUDIT_GROUP_SCAN = 5000
 
 
 class PersistCandidateTests(unittest.TestCase):

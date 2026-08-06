@@ -319,7 +319,28 @@ function auditRow(r) {
     // whereas the honest statement is that no client was recorded for this row.
     client: (r && r.client) || "—",
     reason: (r && r.reason) || "",
+    // /api/audit groups rows by exactly the fields rendered here, so `n` is how many
+    // identical decisions this line stands for. Empty at n<=1, which is the ordinary
+    // case and must look exactly as it did before grouping existed — a bare "1x" on
+    // every row would be noise on the majority to annotate the minority.
+    //
+    // Not a bare count: `firstTs` is what turns it into information. "47x" alone
+    // cannot distinguish a burst from a client retrying once a minute for a day, and
+    // those call for different responses from whoever is reading.
+    repeat: repeatCount(r) > 1 ? `${repeatCount(r)}x` : "",
+    // The span's start, unformatted — auditRow stays out of formatting (see above),
+    // and the renderer uses fmtStamp rather than a time: the scan behind a group can
+    // cover days, so a time-only start reads as minutes ago when it is not.
+    firstTs: repeatCount(r) > 1 ? tsSeconds(r && r.first_ts) : null,
   };
+}
+
+// How many raw decisions a grouped row folds. Absent (an ungrouped payload, or a
+// backend older than grouping) reads as 1, so the row renders exactly as it always
+// did rather than as a broken group.
+function repeatCount(r) {
+  const n = Number(r && r.n);
+  return Number.isFinite(n) && n > 1 ? Math.floor(n) : 1;
 }
 
 // What the decisions list should say ABOUT ITSELF. It exists because an empty table
@@ -1063,9 +1084,11 @@ function start() {
         <tr><td class="ts" title="${esc(fmtInstant(a.ts))}">${esc(fmtStamp(a.ts))}</td>
           <td><span class="tag ${esc(a.decision)}">${esc(a.decision)}</span></td>
           <td>${a.stagePrefix ? `<span class="qual">${esc(a.stagePrefix)}</span>` : ""
-            }${esc(a.host)}</td>
+            }${esc(a.host)}${a.repeat
+              ? `<span class="rep">${esc(" " + a.repeat)}</span>` : ""}</td>
           <td class="ts">${esc(a.client)}</td>
-          <td>${esc(a.reason)}</td></tr>`;
+          <td>${esc(a.reason)}${a.firstTs
+            ? esc(` · first seen ${fmtStamp(a.firstTs)}`) : ""}</td></tr>`;
     }).join("");
     renderAuditStatus(rows.length);
   }
@@ -1164,7 +1187,7 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     lampState, backoffDelay, diffPending, shouldSweep,
     holdRemaining, countdownState, departure, persistPreview, saturationState,
-    ackCount, requestsLabel, auditRow, auditStatus,
+    ackCount, requestsLabel, auditRow, auditStatus, repeatCount,
     fmtTime, fmtStamp, fmtInstant,
     AUDIT_ORDINARY_STAGE,
     RECONNECT_MIN_MS, RECONNECT_MAX_MS, STALE_MAX_MS, COUNTDOWN_URGENT_S,

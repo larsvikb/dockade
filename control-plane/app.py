@@ -126,6 +126,10 @@ DRAIN_BLOCK = int(os.environ.get("CONTROL_AUDIT_DRAIN_BLOCK", str(1 << 20)))
 # from bloating the store or the glanceable UI list.
 DRAIN_MAX_FIELD = 2048
 
+# How many recent audit rows /api/audit folds into its grouped view (see api_audit).
+# Bounds the aggregation regardless of table size; the slice itself rides audit_ts.
+AUDIT_GROUP_SCAN = int(os.environ.get("CONTROL_AUDIT_GROUP_SCAN", "5000"))
+
 app = FastAPI(title="dockade control plane", version="2b")
 
 # In-memory registry of held requests, keyed by approval id. Single-process only
@@ -1160,12 +1164,49 @@ def api_audit(limit: int = 50) -> list[dict]:
     ``method``/``url`` are recorded and queryable but not served here: the URL in
     particular is agent-controlled and unbounded, and this is a glanceable list of
     forty rows rather than the forensic interface. ``make logs-cp`` and the store
-    itself remain the complete record."""
+    itself remain the complete record.
+
+    **Rows are grouped, and the group key is exactly what the UI renders.** A client
+    that retries a permanently-refused host on a timer — a background exporter or
+    updater refused by a standing rule, once a minute, forever — otherwise fills this
+    list with 1440 identical rows a day and pushes everything else off the bottom
+    within the hour. Two properties follow from keying on the DISPLAYED fields:
+
+      - No two rows here can look identical, because rows that would look the same
+        ARE the same group. That is the property that makes the list scannable,
+        stated directly rather than approximated.
+      - ``client`` is in the key. One host refused for two sandboxes is two facts,
+        and attribution is the entire reason that column exists.
+
+    Read a grouped ``client`` as an ADDRESS, not as a sandbox. Docker hands ``.2`` to
+    whichever container starts first, so a group spanning days covers however many
+    sandboxes held that address over the span — a live sighting of ``.2`` and ``.3``
+    really is two concurrent sandboxes, but "400x from 172.30.0.2 since last week" is
+    an address's history, not an agent's. Grouping is what introduced this: an
+    ungrouped row was one instant, where the peer address is unambiguous. ``first_ts``
+    is the visible cue that a long span is in play. Fixing it properly needs a stable
+    per-sandbox identity, and the only ways to get one are the Docker socket (which
+    this proxy must never hold) or a launcher-to-control-plane path that does not
+    exist — neither is worth inventing for a label.
+
+    ``port``/``proto`` are deliberately NOT in the key: they are not displayed, so
+    keying on them would split one group into rows a reader cannot tell apart.
+
+    Grouping is a property of this VIEW and never of the record — the ``audit`` table
+    keeps every row, and ``n``/``first_ts`` are how the view stays honest about what
+    it folded. Note the inner slice: it bounds the work by EVENT COUNT rather than by
+    time, so the cost is fixed as the table grows (it rides ``audit_ts``), and the
+    span covered adapts on its own — about a day when something is retrying every
+    minute, months when nothing is. A time bound would go empty on a quiet system,
+    which is the one thing a decisions list must not do."""
     limit = max(1, min(limit, 500))
     with _connect() as conn:
         rows = conn.execute(
-            "SELECT ts, decision, stage, host, client, reason FROM audit "
-            "ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
+            "SELECT decision, stage, host, client, reason, "
+            "       COUNT(*) AS n, MAX(ts) AS ts, MIN(ts) AS first_ts "
+            "FROM (SELECT * FROM audit ORDER BY ts DESC LIMIT ?) "
+            "GROUP BY decision, stage, host, client, reason "
+            "ORDER BY ts DESC LIMIT ?", (AUDIT_GROUP_SCAN, limit)).fetchall()
     return [dict(r) for r in rows]
 
 

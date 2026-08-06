@@ -1262,6 +1262,40 @@ distinguish local from UTC. And writing that test immediately found a real defec
 null timestamp rendered as `1970-01-01`, because `Number(null)` is `0` rather than
 `NaN` and cleared every plausible numeric guard.
 
+**The list groups; the record does not.** `/api/audit` folds rows whose *displayed*
+fields are identical into one, with a count and the span's start. It exists because a
+client retrying a permanently-refused host on a timer — a background exporter or
+updater denied by a standing rule, once a minute — writes 1440 identical rows a day,
+and a forty-row list of them covers under an hour. Everything else, including the
+fronting refusal the ingest above was built to surface, falls off the bottom before
+anyone looks.
+
+Three choices in it are less obvious than the feature:
+
+- **Group by key over a window, not by consecutive runs.** Runs were the first idea and
+  the live log disproved it: two periodic sources (the refused retry loop, the lifeline
+  allows) interleave and chop each other's runs into singletons, so run-collapsing folds
+  almost nothing on exactly the data that motivated it.
+- **The key is precisely the set of displayed fields.** That is what guarantees no two
+  rows in the list can look identical — rows that would look the same *are* the same
+  group — and it settles the edge cases by itself: `client` is in the key because one host
+  refused for two sandboxes is two facts, while `port`/`proto` are out because keying on
+  what is not shown splits a group into rows a reader cannot tell apart.
+- **The scan is bounded by event count, not by a time window.** Cost then stays fixed as
+  the table grows, and coverage adapts on its own — about a day when something is
+  retrying every minute, months when nothing is. A time bound would go empty on a quiet
+  system, which is the one thing a decisions list must not do.
+
+It also introduced one honest limitation, which is filed here rather than fixed: a
+grouped `client` is an **address**, not a sandbox. Docker reassigns `172.30.0.2` to
+whichever container starts first, so a group spanning days covers every sandbox that
+held that address. Concurrently the column still does its job — two live sandboxes are
+two rows — but folding a fortnight into one line makes an address look like an identity,
+which an ungrouped row (one instant) never did. A real fix needs stable per-sandbox
+identity, and the only sources are the Docker socket (which the egress proxy must never
+hold) or a launcher-to-control-plane path that does not exist; neither is worth
+inventing for a label, so `first_ts` stands as the cue that a long span is involved.
+
 **An empty state alone would not have fixed the empty state.** The filed defect was that
 "nothing has happened yet" and "the poll failed" rendered identically. The sharp part is
 that the page's own connection indicator cannot settle it either: `conn` reports the
@@ -1285,7 +1319,7 @@ properties, the sweep gating, the countdown arithmetic (including the clock-skew
 and the `expiring now`-not-`expired` wording), the expiry-vs-resolved-elsewhere
 distinction, the persist preview's wildcard flag, the saturation banner's levels,
 recency boundary and count-based dismissal, the duplicate-count badge, and the
-decisions table's row shaping and empty-versus-stale states.
+decisions table's row shaping, repeat-count annotation and empty-versus-stale states.
 Everything that touches the DOM
 lives inside `start()`, which runs only in a browser — so requiring the module under
 node must be side-effect free, and the test asserts that too: if DOM work migrates to

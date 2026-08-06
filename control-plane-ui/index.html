@@ -58,6 +58,10 @@
      part of the TEXT, so copying a row yields "http · example.com" rather than the
      "httpexample.com" a margin-only gap would produce. */
   .qual { color: var(--dim); font-size: 11px; white-space: pre; }
+  /* Repeat count on a grouped decision row ("47x"). Same rule as .qual: the leading
+     space is part of the TEXT, not a margin, so a copied row reads
+     "chatty.example 47x" and not "chatty.example47x". */
+  .rep { color: var(--dim); font-size: 11px; white-space: pre; }
   /* Saturation banner. Three levels, and the difference between them is EMPHASIS
      rather than presence: a rejection notice never disappears on a timer (see
      saturationState), it just stops shouting. `recent` borrows the deny colour

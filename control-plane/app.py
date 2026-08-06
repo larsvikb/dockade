@@ -554,6 +554,11 @@ def _list_pending() -> list[dict]:
         rows = conn.execute(
             "SELECT id, ts, host, port, proto, client, method, url FROM approvals "
             "WHERE status='pending' ORDER BY ts").fetchall()
+        # Every standing rule, so each offered pattern can say whether one already
+        # exists for it. Read once for the whole list rather than per candidate — the
+        # table is the complete policy and bounded in practice (see ``api_rules``).
+        rules = {r["pattern"]: r["action"]
+                 for r in conn.execute("SELECT pattern, action FROM rules")}
     with _LOCK:
         waiters = dict(_PENDING_WAITERS)
     # ``persist_options`` travels WITH the approval so the UI offers exactly the
@@ -567,8 +572,15 @@ def _list_pending() -> list[dict]:
     # is one is the exact class of surprise this system exists to prevent. Defaults to
     # 1, not 0: a row with no live waiter is a stale pending row from before a restart
     # (see ``_startup``), and "0 requests" would read as a card that decides nothing.
+    # ``existing`` is the action of a standing rule already holding this pattern, or
+    # None. Nothing can REPLACE a rule here, so persisting over one with the opposite
+    # action is refused by ``resolve`` — this is what lets the confirm panel say so
+    # before the click rather than after it. Both halves are needed: the rule can
+    # appear between this render and the click, which is the only way the conflict
+    # arises at all (see the conflict branch in ``resolve``).
     return [dict(r, requests=max(1, waiters.get(r["id"], 1)),
-                 persist_options=[{"pattern": p, "scope": _pattern_scope(p)}
+                 persist_options=[{"pattern": p, "scope": _pattern_scope(p),
+                                   "existing": rules.get(p)}
                                   for p in _persist_candidates(r["host"])])
             for r in rows]
 
@@ -792,6 +804,40 @@ def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResp
                      "detail": f"pattern {pattern!r} is not one this approval may "
                                f"persist (allowed: {', '.join(allowed)})"},
                     status_code=400)
+            # A rule for this pattern may ALREADY EXIST with the opposite action, and
+            # the insert below is INSERT OR IGNORE against a UNIQUE(pattern) — so it
+            # would silently write nothing while this endpoint reported persisted:true
+            # and the card confirmed a standing rule. Deny-over-allow is the dangerous
+            # direction: the operator believes they have permanently blocked a subtree,
+            # and every later request to it is allowed without even raising a hold.
+            #
+            # Refused BEFORE the UPDATE for the same reason as the branch above — the
+            # approval stays pending and decidable, rather than half-applying with the
+            # decision recorded and the rule not.
+            #
+            # Reachable only through a rule created WHILE this hold was pending: every
+            # candidate is derived from the held host and matches it, so a pre-existing
+            # rule would have decided the request instead of holding it. Two concurrent
+            # holds for sibling hosts, resolved with the same broadened pattern in
+            # opposite directions, is the shape — which is what a burst of holds across
+            # one domain looks like.
+            existing = conn.execute(
+                "SELECT action FROM rules WHERE pattern=?", (pattern,)).fetchone()
+            wanted = "allow" if outcome == "allow" else "block"
+            if existing is not None and existing["action"] != wanted:
+                return JSONResponse(
+                    {"ok": False,
+                     "detail": f"a standing rule for {pattern!r} already exists and "
+                               f"{existing['action']}s it; this would write "
+                               f"{wanted!r} and cannot, because nothing here replaces "
+                               f"a rule. Decide this request with a *_once action, or "
+                               f"persist a different pattern.",
+                     "conflict": {"pattern": pattern, "action": existing["action"]}},
+                    status_code=409)
+            # Same action already present is NOT a conflict — the policy the operator
+            # is asking for is already in force. Proceed, and report below that this
+            # call wrote nothing, so the card stops claiming a write it did not make.
+        wrote_rule = False
         updated = conn.execute(
             "UPDATE approvals SET status=?, mode=?, resolved_at=?, resolved_by=? "
             "WHERE id=? AND status='pending'",
@@ -799,10 +845,16 @@ def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResp
              "persist" if persist else "once", time.time(), actor,
              approval_id)).rowcount
         if updated and persist:
-            conn.execute(
+            # OR IGNORE stays, even though the conflicting case is now refused above:
+            # the check and this insert are not one atomic statement, so a rule could
+            # still appear between them. What changes is that the outcome is READ from
+            # rowcount instead of assumed — the response reports whether a row was
+            # actually written, not whether one was asked for.
+            wrote_rule = conn.execute(
                 "INSERT OR IGNORE INTO rules(pattern, action, source, created_at) "
                 "VALUES (?,?, 'operator', ?)",
-                (pattern, "allow" if outcome == "allow" else "block", time.time()))
+                (pattern, "allow" if outcome == "allow" else "block",
+                 time.time())).rowcount > 0
         conn.commit()
 
     if not updated:
@@ -828,7 +880,15 @@ def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResp
     # was clicked — the two differ when the request omitted a pattern (defaulting to the
     # exact host) and, more usefully, it is the string an operator would have to go and
     # delete by hand.
-    return JSONResponse({"ok": True, "outcome": outcome, "persisted": persist,
+    # ``persisted`` is whether THIS call wrote a rule, read from the insert's rowcount
+    # rather than from what was asked for. The two differ when the same rule was
+    # already in place, and that difference is precisely what used to be reported as a
+    # successful write. ``already_present`` carries the other half, so the UI can say
+    # "already in place" instead of either claiming a write or going silent about
+    # policy the operator just asked for.
+    return JSONResponse({"ok": True, "outcome": outcome,
+                         "persisted": wrote_rule,
+                         "already_present": persist and not wrote_rule,
                          "pattern": pattern})
 
 

@@ -98,9 +98,17 @@ report.
 - **Resource limits not containing anything.** They bound blast radius so the wrong
   container is not OOM-killed; nothing in the threat model rests on them. See
   *Resource limits — blast radius, not boundary*.
-- **The policy store granting but never revoking**, and a persisted rule's scope
-  coming from the requested hostname (a leading dot is a subdomain wildcard). Known
-  and on the roadmap. See the rule-mutation item under *Clear future improvements*.
+- **The policy store granting but never revoking.** Nothing in the UI removes or
+  replaces a rule, and a persist that would contradict an existing one is refused
+  rather than applied. Known and on the roadmap — see the rule-mutation item under
+  *Clear future improvements*.
+  *(This bullet also said a persisted rule's scope came from the requested hostname,
+  a leading dot being a subdomain wildcard. That is no longer true and is corrected:
+  the requester cannot choose the scope. A leading dot is normalised away, and the
+  operator picks from a bounded candidate set the backend derives and re-validates on
+  resolve, with the exact host as the default. Reported scope escalation is still very
+  much in scope — a way to make a persist store something outside that set is a real
+  finding.)*
 - **Base images pinned by tag rather than digest.** A deliberate
   rebuild-to-update choice, consistent across every image here.
 - **The standalone (proxy-less) fallback being weaker than governed mode.** It

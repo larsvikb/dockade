@@ -149,6 +149,18 @@ function persistPreview(action, option) {
     // Flagged separately so the UI can shout about it: a wildcard covers hosts that
     // have never been requested, and nothing in this UI removes a rule once written.
     wild: pattern.startsWith("."),
+    // A standing rule already holding this pattern. `conflict` is the case the backend
+    // REFUSES: nothing here replaces a rule, so persisting the opposite action would
+    // have written nothing while reporting success. `redundant` is harmless — the
+    // policy asked for is already in force — but worth saying so the operator is not
+    // told a rule was written when none was.
+    existing: (option && option.existing) || null,
+    conflict: !!(option && option.existing
+                 && option.existing !== ((action || "").startsWith("allow")
+                                         ? "allow" : "block")),
+    redundant: !!(option && option.existing
+                  && option.existing === ((action || "").startsWith("allow")
+                                          ? "allow" : "block")),
   };
 }
 
@@ -662,13 +674,30 @@ function start() {
     const code = document.createElement("code");
     code.textContent = p.pattern;
     entry.cwhat.append(code, document.createTextNode(` — ${p.scope}.`));
-    entry.cwarn.hidden = !p.wild;
-    entry.cwarn.textContent = p.wild
-      ? `⚠ Wildcard: this covers ${p.pattern.slice(1)} and every subdomain of it, ` +
-        "including hosts nothing has requested yet."
-      : "";
-    entry.confirmBtn.textContent =
-      `Confirm — ${p.verb} ${p.pattern} from now on`;
+    // A conflict outranks the wildcard warning: the wildcard caution is about a rule
+    // that would be too broad, while a conflict means the click cannot write a rule at
+    // all. Saying the second is more urgent than saying the first.
+    const warn = p.conflict
+      ? `⚠ ${p.pattern} is already a standing ${p.existing.toUpperCase()} rule, and ` +
+        "nothing here replaces one. This will be refused — decide the request with " +
+        "a one-off action, or pick a different pattern."
+      : p.redundant
+        ? `Already a standing ${p.existing.toUpperCase()} rule — confirming decides ` +
+          "this request and leaves policy unchanged."
+        : p.wild
+          ? `⚠ Wildcard: this covers ${p.pattern.slice(1)} and every subdomain of ` +
+            "it, including hosts nothing has requested yet."
+          : "";
+    entry.cwarn.hidden = !warn;
+    entry.cwarn.textContent = warn;
+    entry.cwarn.className = "cwarn" + (p.conflict ? " bad" : "");
+    // Disabled rather than merely warned about, because the backend will refuse it:
+    // letting the click through would spend a round trip to arrive at the same place.
+    // The panel still opens, so the operator can read WHY and pick another pattern.
+    entry.confirmBtn.disabled = p.conflict;
+    entry.confirmBtn.textContent = p.conflict
+      ? `Cannot ${p.verb} ${p.pattern} — already a ${p.existing} rule`
+      : `Confirm — ${p.verb} ${p.pattern} from now on`;
     entry.confirmBtn.className = "confirmgo " + (p.verb === "allow" ? "allow" : "deny");
   }
 
@@ -683,7 +712,11 @@ function start() {
     disableActions(entry, true);
     renderPreview(entry);
     entry.confirm.hidden = false;
-    entry.confirmBtn.focus();
+    // Focus lands on the pattern select when Confirm is disabled by a conflict —
+    // focusing a disabled button drops focus to the body, which would strand a
+    // keyboard operator outside the panel that just opened, with Escape (bound on the
+    // panel) no longer reaching anything.
+    (entry.confirmBtn.disabled ? entry.select : entry.confirmBtn).focus();
   }
 
   function cancelPersist(entry) {
@@ -758,15 +791,30 @@ function start() {
         entry.el.classList.add(d.outcome === "allow" ? "done-allow" : "done-deny");
         // The pattern comes back from the BACKEND, so this reports what was stored
         // rather than what was clicked — and it is the exact string an operator would
-        // have to go and delete. Saying "standing rule" is true even when the
-        // backend's INSERT OR IGNORE wrote nothing, because that only happens when
-        // the identical rule was already there.
+        // have to go and delete.
+        //
+        // `persisted` now means A ROW WAS WRITTEN, read from the insert's rowcount.
+        // The comment that used to sit here reasoned that "standing rule" was true
+        // even when nothing was written, "because that only happens when the identical
+        // rule was already there". That was the bug: it also happened when the
+        // OPPOSITE rule was there, and the card cheerfully confirmed a block that
+        // policy had discarded. The conflicting case is refused outright now, and the
+        // already-in-place case says so in its own words.
         setMessage(entry,
           (d.outcome === "allow" ? "✓ allowed" : "✕ denied") +
-          (d.persisted
-            ? ` · standing rule: ${d.pattern || a.host.toLowerCase()}`
-            : " · this request only"),
+          (d.persisted ? ` · standing rule written: ${d.pattern || a.host.toLowerCase()}`
+            : d.already_present
+              ? ` · standing rule already in place: ${d.pattern || a.host.toLowerCase()}`
+              : " · this request only"),
           d.outcome === "allow" ? "ok" : "bad");
+      } else if (r.status === 409 && d.conflict) {
+        // A persist that would contradict an existing rule. NOT a stale card: the
+        // approval is deliberately left pending so the operator can choose again, so
+        // the buttons come back — the same treatment as a rejected pattern.
+        entry.state = "pending";
+        entry.el.classList.remove("busy");
+        disableActions(entry, false);
+        setMessage(entry, d.detail || "that rule already exists", "bad");
       } else if (r.status === 409) {
         // Backend says it is no longer pending (expired, or resolved elsewhere).
         // Re-enabling the buttons would only invite a second failing click.

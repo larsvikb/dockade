@@ -147,6 +147,22 @@ console.log(JSON.stringify({
     blocking: m.persistPreview("deny_persist",
                                { pattern: "example.com", scope: "exact host" }),
     nothing: m.persistPreview(null, null),
+    // A rule already holding the pattern. The opposite action is the case the backend
+    // REFUSES; the same action is merely redundant.
+    conflicting: m.persistPreview("deny_persist",
+                                  { pattern: ".example.com",
+                                    scope: "host + subdomains",
+                                    existing: "allow" }),
+    conflicting_allow: m.persistPreview("allow_persist",
+                                        { pattern: "a.example",
+                                          scope: "exact host",
+                                          existing: "block" }),
+    redundant: m.persistPreview("allow_persist",
+                                { pattern: "a.example", scope: "exact host",
+                                  existing: "allow" }),
+    // A backend that has not been restarted into this change sends no `existing`.
+    unannotated: m.persistPreview("deny_persist",
+                                  { pattern: "a.example", scope: "exact host" }),
   },
   // Saturation. NOW is fixed at 1_000_000_000_000 ms (= 1e9 s) so every "how long
   // ago" below is arithmetic on constants rather than on the wall clock.
@@ -483,6 +499,41 @@ class PageScriptTests(unittest.TestCase):
         # confirm step exists to prevent.
         self.assertEqual(prev["nothing"]["verb"], "block")
 
+    def test_the_preview_knows_a_rule_already_holds_the_pattern(self):
+        """Nothing in this system replaces a rule, so persisting the opposite action
+        writes nothing. That used to be reported as success — the card confirmed a
+        standing block while policy still said allow. The backend refuses it now; this
+        is what lets the panel say so before the click rather than after it."""
+        prev = self.probe["preview"]
+        # Opposite action: refused by the backend, so the panel must not present it as
+        # an available choice.
+        self.assertTrue(prev["conflicting"]["conflict"])
+        self.assertFalse(prev["conflicting"]["redundant"])
+        self.assertEqual(prev["conflicting"]["existing"], "allow")
+        # Both directions, because a response claiming a write that did not happen is
+        # the defect regardless of which way it fails.
+        self.assertTrue(prev["conflicting_allow"]["conflict"])
+
+    def test_a_rule_already_present_in_the_same_direction_is_only_redundant(self):
+        prev = self.probe["preview"]
+        # Not a conflict: the policy asked for is already in force. Worth saying, so
+        # the operator is not told a rule was written when none was — but nothing to
+        # refuse.
+        self.assertFalse(prev["redundant"]["conflict"])
+        self.assertTrue(prev["redundant"]["redundant"])
+
+    def test_an_unannotated_option_claims_no_conflict(self):
+        # A backend that predates this sends no `existing`. Failing open here is right:
+        # the backend check is the enforcement, and inventing a conflict would block a
+        # legitimate persist against a control plane that simply has not restarted.
+        prev = self.probe["preview"]
+        self.assertFalse(prev["unannotated"]["conflict"])
+        self.assertFalse(prev["unannotated"]["redundant"])
+        self.assertIsNone(prev["unannotated"]["existing"])
+        # And the pre-existing wildcard caution is untouched by any of this.
+        self.assertTrue(prev["wildcard"]["wild"])
+        self.assertFalse(prev["wildcard"]["conflict"])
+
     # ── saturation banner ────────────────────────────────────────────────────
 
     def test_nothing_is_shown_while_nothing_has_gone_wrong(self):
@@ -767,6 +818,59 @@ class DecisionsTableSourceTests(unittest.TestCase):
         self.assertIsNotNone(section, "the decisions section was renamed")
         self.assertIn("<th>client</th>", section.group(0),
                       "the column exists in the body but has no header")
+
+
+class PersistConflictSourceTests(unittest.TestCase):
+    """The confirm panel and the resolve handler live in `start()`. Both would fail
+    silently here — a disabled button that is never disabled, and a 409 handled as the
+    wrong kind of 409 — so both are asserted against the source."""
+
+    def setUp(self):
+        self.src = APP_JS.read_text()
+
+    def test_a_conflicting_pattern_cannot_be_confirmed(self):
+        body = re.search(r"function renderPreview\(entry\)\s*\{(.*?)\n  \}",
+                         self.src, re.S).group(1)
+        # Warned about AND disabled. The backend refuses it, so letting the click
+        # through spends a round trip to arrive at the same place.
+        self.assertIn("entry.confirmBtn.disabled = p.conflict", body)
+        self.assertIn("p.conflict", body)
+
+    def test_focus_does_not_fall_off_a_disabled_confirm_button(self):
+        # Focusing a disabled button drops focus to the body, stranding a keyboard
+        # operator outside the panel that just opened — with Escape bound on the panel
+        # and therefore no longer reaching anything.
+        body = re.search(r"function askPersist\(a, action\)\s*\{(.*?)\n  \}",
+                         self.src, re.S).group(1)
+        self.assertRegex(body, r"entry\.confirmBtn\.disabled \?\s*entry\.select")
+
+    def test_a_conflict_409_does_not_mark_the_card_stale(self):
+        # Two different 409s reach this handler. "No longer pending" means the card is
+        # dead; a persist conflict means the approval is deliberately still pending so
+        # the operator can choose again. Treating the second as the first would retire
+        # a live card and strand the request until it default-denies.
+        conflict = re.search(r"r\.status === 409 && d\.conflict\)\s*\{(.*?)\n      \}",
+                             self.src, re.S)
+        self.assertIsNotNone(conflict, "the conflict 409 is not distinguished")
+        self.assertIn("disableActions(entry, false)", conflict.group(1))
+        self.assertNotIn("markStale", conflict.group(1))
+        # And the narrower branch must come FIRST, or the general one swallows it.
+        self.assertLess(self.src.index("r.status === 409 && d.conflict"),
+                        self.src.index("} else if (r.status === 409) {"))
+
+    def test_the_card_distinguishes_a_written_rule_from_one_already_there(self):
+        # The old message said "standing rule" for both, on the reasoning that a
+        # no-op insert only happened when the identical rule existed. It also happened
+        # when the OPPOSITE rule existed, which is the bug this closes.
+        #
+        # Asserting each branch's CONDITION, not merely that both strings appear: a
+        # first version of this checked only that the two phrases were present, and
+        # survived a mutation routing `already_present` into the "written" branch —
+        # which is the original defect, with the second string left unreachable.
+        self.assertRegex(self.src, r"d\.persisted \? ` · standing rule written")
+        self.assertRegex(
+            self.src,
+            r"d\.already_present\s*\?\s*` · standing rule already in place")
 
 
 class DuplicateBadgeSourceTests(unittest.TestCase):

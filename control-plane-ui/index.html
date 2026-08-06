@@ -137,6 +137,10 @@
   /* A wildcard grants hosts that have never been requested. Said loudly, in the one
      place where it is still reversible. */
   .confirm .cwarn { margin-top: 8px; font-size: 12px; color: var(--hold); }
+  /* A conflicting pattern is not a caution about breadth — the click cannot write a
+     rule at all, and the backend refuses it. Coloured as a refusal, not a warning. */
+  .confirm .cwarn.bad { color: var(--deny); }
+  .confirm .confirmgo:disabled { opacity: .5; cursor: not-allowed; }
   .confirm .cactions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
   button { font: inherit; border: 1px solid var(--line); background: #202632;
     color: var(--fg); border-radius: 6px; padding: 6px 10px; cursor: pointer; }

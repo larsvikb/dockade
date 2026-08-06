@@ -1150,6 +1150,37 @@ is read from the row's *status* rather than from "did I win". Branching on the l
 which is what the single-waiter code did — told every loser that a human had rejected
 their request.
 
+**A persist cannot overwrite, so one that would is refused.** `rules.pattern` is
+`UNIQUE`, and the insert was `INSERT OR IGNORE` — so persisting a pattern that already
+carried the **opposite** action wrote nothing, while the endpoint returned
+`persisted: true` and the card confirmed a standing rule. Deny-over-allow was the
+dangerous direction: the operator believed a subtree was permanently blocked, and every
+later request to it was allowed without so much as raising a hold.
+
+Reachability is the part worth recording, because it looks unreachable at first. A
+conflicting rule cannot already exist when the hold is raised — every persist candidate
+is derived from the held host and matches it, so a pre-existing rule would have *decided*
+the request instead of holding it. The conflict can therefore only be created **while the
+hold is pending**, which gives one shape: two concurrent holds for sibling hosts, resolved
+with the same broadened pattern in opposite directions. That is what a burst of holds
+across one domain looks like, and it reproduces in a few lines.
+
+Refused before the `UPDATE`, matching the rejected-pattern branch beside it, so the
+approval stays pending and decidable rather than half-applying with the decision recorded
+and the rule not — which is exactly the state that branch's comment already called "the
+worst of both". Overwriting was the alternative and was declined: nothing in this system
+revokes a rule, so `ON CONFLICT DO UPDATE` would make a click the operator was never
+shown silently flip standing policy, and it would pre-empt the rule-mutation design
+rather than settle it.
+
+Two supporting changes make the refusal legible rather than surprising. `persisted` now
+reports **whether a row was written**, read from the insert's `rowcount` instead of from
+what was asked for, with `already_present` carrying the harmless same-action case — so a
+card stops claiming a write it did not make. And each offered pattern travels with any
+rule already holding it, so the confirm panel says so *before* the click. Both halves are
+required: the panel is prevention, and the backend check covers the race that is the only
+way the conflict arises at all.
+
 **A decision row now says whose request it was.** `/api/audit` selected `stage` — which
 nothing rendered — while omitting `client`, which the proxy has always populated with
 the sandbox peer address. On a control plane **shared across every sandbox** that is
@@ -1913,10 +1944,11 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
     is treated as a convenience layer over a backend that validates every input, with its
     mistakes made detectable rather than prevented. The reasoning, and the condition that
     would reopen it, are under "`start()` is deliberately unverified" above.)*
-  - **`resolve` reports `persisted: true` for a rule it did not write.** The insert is
-    `INSERT OR IGNORE`, so re-persisting an existing pattern is a no-op the response
-    still claims as a write. Duplicate grouping made this rarer — the usual way to hit
-    it was two cards for one host — but not impossible, and the UI echoes the claim.
+  - **Rule mutation** — nothing here replaces or removes a rule, which is why a persist
+    that contradicts an existing one is refused rather than applied (see *A persist
+    cannot overwrite* above). The refusal is the honest behaviour given the constraint;
+    lifting the constraint is the open item, and it needs a way to review and revoke
+    policy, not just a different `INSERT`.
   - **Opt-in desktop notification.** `http://localhost` is a secure context, so the
     Notification API is available; with a ~120s fuse and a page nobody watches, this is
     the honest fix for the problem the `(n)` title prefix only mitigates.

@@ -390,6 +390,86 @@ class ResolveTests(_CPTestCase):
         self.assertEqual(resp.kwargs.get("status_code"), 409)
 
 
+class PersistConflictTests(_CPTestCase):
+    """A `*_persist` cannot write over a rule that already holds its pattern.
+
+    The insert is `INSERT OR IGNORE` against `UNIQUE(pattern)`, so before this it
+    silently wrote NOTHING while the endpoint reported `persisted: true` and the card
+    confirmed a standing rule. Deny-over-allow was the dangerous direction: the
+    operator believed a subtree was permanently blocked and every later request to it
+    was allowed without even raising a hold."""
+
+    def test_a_persist_that_contradicts_an_existing_rule_is_refused(self):
+        _set_rules([(".example.com", "allow")])
+        resp = _resolve(_hold("b.example.com"), "deny_persist", pattern=".example.com")
+        self.assertEqual(resp.kwargs.get("status_code"), 409)
+        body = resp.args[0]
+        self.assertFalse(body["ok"])
+        # Names the rule standing in the way, so the operator can act on it rather
+        # than guess.
+        self.assertEqual(body["conflict"],
+                         {"pattern": ".example.com", "action": "allow"})
+        # And policy is untouched — no half-application.
+        self.assertEqual(_rules(), {(".example.com", "allow")})
+
+    def test_the_refused_approval_stays_pending_and_decidable(self):
+        # Same reasoning as a rejected pattern: a persist that consumed the approval
+        # without writing the rule would be the worst of both. The operator must get
+        # to choose again.
+        _set_rules([(".example.com", "allow")])
+        approval = _hold("b.example.com")
+        _resolve(approval, "deny_persist", pattern=".example.com")
+        self.assertEqual([p["id"] for p in cp._list_pending()], [approval])
+        # A one-off decides the request without touching policy, and now succeeds.
+        ok = _resolve(approval, "deny_once")
+        self.assertTrue(ok.args[0]["ok"])
+        self.assertEqual(_rules(), {(".example.com", "allow")})
+
+    def test_the_conflict_is_refused_in_both_directions(self):
+        # allow-over-block fails safe and is merely a lie; it is still refused, because
+        # a response claiming a write that did not happen is the defect either way.
+        _set_rules([("blocked.example", "block")])
+        resp = _resolve(_hold("blocked.example"), "allow_persist",
+                        pattern="blocked.example")
+        self.assertEqual(resp.kwargs.get("status_code"), 409)
+        self.assertEqual(_rules(), {("blocked.example", "block")})
+
+    def test_the_same_rule_already_present_is_not_a_conflict(self):
+        # The policy being asked for is already in force, so refusing would be noise.
+        # It succeeds — and reports that it wrote nothing.
+        _set_rules([(".example.com", "allow")])
+        resp = _resolve(_hold("b.example.com"), "allow_persist", pattern=".example.com")
+        body = resp.args[0]
+        self.assertTrue(body["ok"])
+        self.assertFalse(body["persisted"], "no row was written; do not claim one")
+        self.assertTrue(body["already_present"])
+
+    def test_persisted_reports_a_write_not_an_intention(self):
+        resp = _resolve(_hold("fresh.example"), "allow_persist",
+                        pattern="fresh.example")
+        body = resp.args[0]
+        self.assertTrue(body["persisted"])
+        self.assertFalse(body["already_present"])
+        self.assertEqual(_rules(), {("fresh.example", "allow")})
+
+    def test_a_once_action_reports_neither(self):
+        body = _resolve(_hold("once.example"), "deny_once").args[0]
+        self.assertFalse(body["persisted"])
+        self.assertFalse(body["already_present"])
+
+    def test_the_offered_patterns_say_which_already_exist(self):
+        # The prevention half: the confirm panel can warn BEFORE the click, because
+        # each candidate carries any rule already holding it. The backend check still
+        # has to exist — the rule can appear between this render and the click, which
+        # is the only way the conflict arises at all.
+        _set_rules([(".example.com", "allow")])
+        _hold("a.b.example.com")
+        options = {o["pattern"]: o["existing"]
+                   for o in cp._list_pending()[0]["persist_options"]}
+        self.assertEqual(options["a.b.example.com"], None)
+        self.assertEqual(options[".example.com"], "allow")
+
+
 class AuditViewTests(_CPTestCase):
     """``/api/audit`` backs the decisions table, and had no tests at all — which is
     how it went this long selecting ``stage`` that nothing rendered while omitting

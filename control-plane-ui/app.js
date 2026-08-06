@@ -273,6 +273,22 @@ function requestsLabel(n) {
 // plaintext HTTP decision reaching the proxy at all is unusual.
 const AUDIT_ORDINARY_STAGE = "connect";
 
+// What may be rendered AS a stage prefix. The proxy sends one of two literals
+// (`connect`, `http`) and the field is unvalidated free text all the way to the
+// column, so this bounds the shape rather than the vocabulary — a stage a future
+// hook adds still shows, which is the point of displaying the unusual ones at all.
+//
+// A SHAPE bound, not a security control: `/authorize` is reachable only from
+// control-net, so the agent cannot reach it, and a compromised proxy could do far
+// worse than mislabel a row. The reason is that the prefix sits immediately before
+// the host and `.qual` does not wrap, so an unbounded value would run into the host
+// it precedes, or push it out of view. This makes "the host cell shows the host" a
+// structural property instead of an argued one.
+// Case is deliberately NOT constrained. Both current stages are lowercase, but
+// silently suppressing a future `TLS` would be a confusing debug for no benefit —
+// case does nothing to make a value blend into the host beside it.
+const AUDIT_STAGE_SHAPE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,11}$/;
+
 // One audit row, shaped for display. Pure, and deliberately does NOT format the
 // timestamp: that is locale-dependent, and a unit test should not have to pin down a
 // locale to assert the parts that carry meaning.
@@ -281,10 +297,23 @@ function auditRow(r) {
   return {
     ts: tsSeconds(r && r.ts),
     decision: (r && r.decision) || "?",
-    // An ABSENT qualifier means "connect, or not recorded" — the two are not
-    // distinguished here on purpose. This is a hint that something is unusual, not
-    // evidence; the audit table holds the exact value and `make logs-cp` prints it.
-    qualifier: stage && stage !== AUDIT_ORDINARY_STAGE ? stage : "",
+    // Prefixes the HOST, not the decision — `http · example.com`, which reads as the
+    // scheme it effectively is. The stage does not qualify the decision at all (a deny
+    // at the http stage is the same deny as at connect); it describes how the request
+    // was MADE, and the host cell is where the request is identified. It also keeps
+    // the decision column uniform, which matters because that is the column an
+    // operator scans vertically.
+    //
+    // Carries its own SEPARATOR rather than relying on a CSS margin. The margin spaced
+    // it on screen while `textContent` read "denyhttp" — which is what an operator
+    // gets copying a row into a ticket, and what a screen reader says. In a table
+    // whose purpose is to be quotable evidence, the copied text is the artefact.
+    //
+    // ABSENT means "connect, or not recorded" — the two are not distinguished here on
+    // purpose. This is a hint that something is unusual, not evidence; the audit table
+    // holds the exact value and `make logs-cp` prints it.
+    stagePrefix: stage && stage !== AUDIT_ORDINARY_STAGE
+                 && AUDIT_STAGE_SHAPE.test(stage) ? `${stage} · ` : "",
     host: (r && r.host) || "",
     // An em dash rather than an empty cell: blank reads as "this column is broken",
     // whereas the honest statement is that no client was recorded for this row.
@@ -1032,9 +1061,9 @@ function start() {
       const a = auditRow(r);
       return `
         <tr><td class="ts" title="${esc(fmtInstant(a.ts))}">${esc(fmtStamp(a.ts))}</td>
-          <td><span class="tag ${esc(a.decision)}">${esc(a.decision)}</span>${
-            a.qualifier ? `<span class="qual">${esc(a.qualifier)}</span>` : ""}</td>
-          <td>${esc(a.host)}</td>
+          <td><span class="tag ${esc(a.decision)}">${esc(a.decision)}</span></td>
+          <td>${a.stagePrefix ? `<span class="qual">${esc(a.stagePrefix)}</span>` : ""
+            }${esc(a.host)}</td>
           <td class="ts">${esc(a.client)}</td>
           <td>${esc(a.reason)}</td></tr>`;
     }).join("");

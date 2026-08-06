@@ -52,9 +52,12 @@
      `warn` is the one that says the data on screen may no longer be true. */
   .empty.warn { color: var(--hold); font-style: normal; }
   .empty.warn::before { content: "⚠ "; }
-  /* The audit `stage`, beside the decision it qualifies. Rendered only when it is not
-     the ordinary CONNECT tunnel — see AUDIT_ORDINARY_STAGE in app.js. */
-  .qual { color: var(--dim); font-size: 11px; margin-left: 6px; }
+  /* The audit `stage`, prefixed to the HOST it describes — `http · example.com`, which
+     reads as the scheme it effectively is. Rendered only when it is not the ordinary
+     CONNECT tunnel; see AUDIT_ORDINARY_STAGE in app.js. No margin: the separator is
+     part of the TEXT, so copying a row yields "http · example.com" rather than the
+     "httpexample.com" a margin-only gap would produce. */
+  .qual { color: var(--dim); font-size: 11px; white-space: pre; }
   /* Saturation banner. Three levels, and the difference between them is EMPHASIS
      rather than presence: a rejection notice never disappears on a timer (see
      saturationState), it just stops shouting. `recent` borrows the deny colour

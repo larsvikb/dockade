@@ -512,20 +512,26 @@ async def request(flow: http.HTTPFlow) -> None:
         return
     # sorted() only to make the "which name failed" report deterministic.
     names = sorted({flow.request.host, flow.request.pretty_host})
+    # The same peer address ``http_connect`` reports. Omitting it here left every
+    # plaintext-HTTP decision recorded with no client at all — and this control plane
+    # is shared across sandboxes, so those audit rows could not say whose request they
+    # were. It went unnoticed while the decisions view had no client column to be
+    # blank; it showed up in the first live test after the column was added.
+    client = flow.client_conn.peername[0] if flow.client_conn.peername else None
     bad_name, bad_reason = None, ""
     for name in names:
         allowed, reason = await _authorize(
-            name, stage="http", proto=proto, port=port,
+            name, stage="http", proto=proto, port=port, client=client,
             method=flow.request.method, url=flow.request.pretty_url)
         if not allowed:
             bad_name, bad_reason = name, reason
             break
     if bad_name is None:
         _audit("allow", proto=proto, method=flow.request.method,
-               url=flow.request.pretty_url)
+               client=client, url=flow.request.pretty_url)
     else:
         _audit("deny", proto=proto, method=flow.request.method,
-               url=flow.request.pretty_url,
+               client=client, url=flow.request.pretty_url,
                reason=f"host not authorized ({bad_name}): {bad_reason}")
         flow.response = http.Response.make(
             403, b"egress denied by policy\n", {"Content-Type": "text/plain"})

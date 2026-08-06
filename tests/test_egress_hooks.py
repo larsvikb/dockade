@@ -36,11 +36,17 @@ def _connect_flow(host, port=443, cid="conn-1", peer="1.2.3.4"):
         response=None)
 
 
-def _http_flow(host, pretty_host, *, scheme="https", port=443, method="GET"):
+def _http_flow(host, pretty_host, *, scheme="https", port=443, method="GET",
+               cid="req-1", peer="1.2.3.4"):
+    # ``client_conn`` mirrors _connect_flow. Its ABSENCE here is why nothing noticed
+    # that the request hook never sent a client to the control plane: the stub could
+    # not have exercised the field, so every plaintext-HTTP decision was recorded
+    # against no client at all and the tests were satisfied.
     return SimpleNamespace(
         request=SimpleNamespace(
             host=host, pretty_host=pretty_host, scheme=scheme, port=port,
             method=method, pretty_url=f"{scheme}://{pretty_host}/"),
+        client_conn=SimpleNamespace(peername=(peer, 5000), id=cid),
         response=None)
 
 
@@ -187,6 +193,49 @@ class RequestTests(unittest.TestCase):
                                side_effect=self._authorize_by_host({"allowed.com"})):
             run(addon.request(flow))
         self.assertIsNone(flow.response)
+
+    def test_the_authorize_call_says_which_sandbox_asked(self):
+        """The control plane is SHARED across sandboxes, so an audit row that cannot
+        name the client is half a record. ``http_connect`` has always sent it; this
+        path never did, so every plaintext-HTTP decision was stored against no client.
+
+        It survived this long because nothing rendered the column — and because the
+        flow stub had no ``client_conn`` for a test to have caught it with. Found in
+        the first live run after the decisions table grew a client column and showed
+        an em dash where the address belonged."""
+        seen = []
+
+        def capture(payload):
+            seen.append(payload)
+            return {"decision": "allow", "reason": "ok"}
+
+        flow = _http_flow("allowed.com", "allowed.com", peer="172.30.0.2")
+        with mock.patch.object(addon.socket, "getaddrinfo",
+                               return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]), \
+             mock.patch.object(addon, "_post_authorize", side_effect=capture):
+            run(addon.request(flow))
+        self.assertTrue(seen, "no authorize call was made")
+        self.assertEqual(seen[0]["client"], "172.30.0.2")
+        # The stage travels too — it is what the decisions table renders as the
+        # qualifier distinguishing a plaintext decision from a tunnelled one.
+        self.assertEqual(seen[0]["stage"], "http")
+
+    def test_a_connect_and_a_request_report_the_client_the_same_way(self):
+        # One derivation, two hooks. They disagreed silently for as long as only one
+        # of them was checked.
+        calls = []
+
+        def capture(payload):
+            calls.append(payload)
+            return {"decision": "allow", "reason": "ok"}
+
+        with mock.patch.object(addon.socket, "getaddrinfo",
+                               return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]), \
+             mock.patch.object(addon, "_post_authorize", side_effect=capture):
+            run(addon.http_connect(_connect_flow("allowed.com", peer="172.30.0.9")))
+            run(addon.request(_http_flow("allowed.com", "allowed.com",
+                                         peer="172.30.0.9")))
+        self.assertEqual([c["client"] for c in calls], ["172.30.0.9", "172.30.0.9"])
 
     def test_fronted_host_header_is_denied(self):
         # Transport host is authorized, but the Host header names a different,

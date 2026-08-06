@@ -241,6 +241,35 @@ console.log(JSON.stringify({
                                 host: "a.example", client: "172.30.0.2",
                                 reason: "no matching rule" }),
         no_stage: m.auditRow({ ts: 1e9, decision: "hold", host: "a.example" }),
+        // A stage a future hook might add still shows: the bound is on SHAPE, not on
+        // a fixed vocabulary.
+        future_stage: m.auditRow({ ts: 1e9, decision: "deny", stage: "tls",
+                                   host: "a.example" }).stagePrefix,
+        // Case is not part of the bound: it does nothing to make a value blend into
+        // the host, and suppressing a future `TLS` would be a silent surprise.
+        uppercase_stage: m.auditRow({ ts: 1e9, stage: "TLS",
+                                      host: "a.example" }).stagePrefix,
+        // Values that must NOT reach the cell, one per excluded character class and
+        // each rejected for ONE reason only. Named cases were tried first and were the
+        // wrong SHAPE of test: every value failed for several reasons at once, so
+        // mutations admitting whitespace, then dots, then colons each survived in turn
+        // — the assertions could not say which rule was doing the work.
+        rejected: [
+          "x".repeat(13),      // too long
+          "http ",             // trailing space
+          "ht tp",             // inner space
+          "evil.example",      // a dot: reads as a hostname beside the real one
+          "http:8080",         // a colon
+          "a/b",               // a slash
+          "<b>http</b>",       // markup
+          "http%20x",          // percent-encoding
+          "http\\x",           // backslash
+          "-http",             // leading punctuation
+          "",                  // empty
+        ].map(s => [s, m.auditRow({ ts: 1e9, stage: s,
+                                    host: "a.example" }).stagePrefix]),
+        at_the_length_limit: m.auditRow({ ts: 1e9, stage: "x".repeat(12),
+                                          host: "a.example" }).stagePrefix,
         no_client: m.auditRow({ ts: 1e9, decision: "allow", host: "a.example" }),
         junk_ts: m.auditRow({ ts: "soon", decision: "allow", host: "a.example" }).ts,
         empty: m.auditRow({}),
@@ -727,10 +756,37 @@ class PageScriptTests(unittest.TestCase):
         # would be forty repetitions of one word and the one row worth noticing —
         # a plaintext HTTP decision — would not stand out at all.
         self.assertEqual(a["ordinary_stage"], "connect")
-        self.assertEqual(a["tunnelled"]["qualifier"], "")
-        self.assertEqual(a["plaintext"]["qualifier"], "http")
+        self.assertEqual(a["tunnelled"]["stagePrefix"], "")
+        # A PREFIX ON THE HOST — `http · example.com`, reading as the scheme it
+        # effectively is. It does not qualify the decision (a deny at the http stage is
+        # the same deny as at connect); it describes how the request was made. Keeping
+        # it out of the decision cell also leaves that column uniform, which is the one
+        # an operator scans vertically.
+        #
+        # The SEPARATOR is part of the value, not a CSS margin. A margin spaced it on
+        # screen while textContent read "denyhttp" — which is what an operator gets
+        # copying the row into a ticket, and what a screen reader says out loud. Live
+        # testing surfaced it in the first pasted row.
+        self.assertEqual(a["plaintext"]["stagePrefix"], "http · ")
         # Absent stage renders nothing rather than inventing "connect".
-        self.assertEqual(a["no_stage"]["qualifier"], "")
+        self.assertEqual(a["no_stage"]["stagePrefix"], "")
+
+    def test_only_a_short_plain_word_can_prefix_the_host(self):
+        """`stage` is unvalidated free text from the API model all the way to this
+        cell, and the prefix now sits immediately before the host without wrapping —
+        so an unbounded value would run into the host it precedes or push it out of
+        view.
+
+        A SHAPE bound, deliberately not a vocabulary one: a stage a future hook adds
+        still shows, which is the entire point of displaying the unusual ones. And not
+        a security control either — `/authorize` is reachable only from control-net,
+        and a compromised proxy could do far worse than mislabel a row."""
+        a = self.probe["saturation"]["audit"]
+        self.assertEqual(a["future_stage"], "tls · ")
+        self.assertEqual(a["uppercase_stage"], "TLS · ")
+        self.assertEqual(a["at_the_length_limit"], "x" * 12 + " · ")
+        for value, prefix in a["rejected"]:
+            self.assertEqual(prefix, "", f"stage {value!r} must not reach the cell")
 
     def test_a_malformed_row_still_renders(self):
         a = self.probe["saturation"]["audit"]
@@ -807,6 +863,33 @@ class DecisionsTableSourceTests(unittest.TestCase):
         # would flow into .json(), throw somewhere less obvious, or worse parse into
         # something that renders as an empty but SUCCESSFUL list.
         self.assertIn("res.ok", self.body.group(1))
+
+    def test_each_cell_renders_the_field_its_header_promises(self):
+        """A structural guard over the row template, because the render lives in
+        `start()` where no unit test reaches — and two mutations proved value tests
+        alone are not enough: moving the stage prefix back onto the decision cell, and
+        dropping the host entirely, both left every assertion passing.
+
+        Cell ORDER is the claim: the header row promises time, decision, host, client,
+        reason, and nothing else checks that the body agrees."""
+        row = re.search(r"return `\s*<tr>(.*?)</tr>`", self.body.group(1), re.S)
+        self.assertIsNotNone(row, "the row template was restructured")
+        cells = row.group(1).split("<td")[1:]
+        self.assertEqual(len(cells), 5, "expected five cells, one per header")
+        time_, decision, host, client, reason = cells
+
+        self.assertIn("fmtStamp(a.ts)", time_)
+        self.assertIn("fmtInstant(a.ts)", time_)
+        # The decision cell holds the decision and NOTHING else. It is the column an
+        # operator scans vertically, so a variable-width extra makes it ragged — and
+        # the stage does not qualify the decision anyway.
+        self.assertIn("a.decision", decision)
+        self.assertNotIn("stagePrefix", decision)
+        # The stage prefixes the HOST, reading as the scheme it effectively is.
+        self.assertIn("a.stagePrefix", host)
+        self.assertIn("esc(a.host)", host)
+        self.assertIn("esc(a.client)", client)
+        self.assertIn("esc(a.reason)", reason)
 
     def test_the_client_column_is_rendered_and_escaped(self):
         self.assertIn("esc(a.client)", self.body.group(1))

@@ -1192,6 +1192,14 @@ headline. That banner is a glanceable alert where a bare IP is noise; this table
 forensic view where *who* is the entire question. The two decisions point the same way —
 put the address where someone is reading carefully, not where they are only glancing.
 
+Adding the column immediately showed that the **proxy was not sending the value on one
+of its two paths**: `http_connect` had always passed the peer address, and the plaintext
+`request` hook never did, so every HTTP decision was stored against no client at all.
+Invisible for as long as nothing rendered it, and invisible to the tests too — the
+request-flow stub had no `client_conn` for a test to have caught it with. Both hooks
+derive it identically now, and a test asserts they agree, because one derivation in two
+places is exactly the shape that drifts silently.
+
 What stays out of the response matters as much: `url` is agent-controlled and unbounded,
 and `method`/`port`/`proto` are noise in a forty-row glance. All four remain in the
 table and in `make logs-cp`. This endpoint is a legible summary, not the record — and

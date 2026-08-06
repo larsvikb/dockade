@@ -2,10 +2,10 @@
 """
 Control plane — governance authority for the governed data-plane proxies.
 
-Step 2b: policy + audit + **hold-for-approval**. The management app the agent
-can never reach (control-net only; the sandbox has no route there). Governed
-proxies call it on the control path to authorize connections; unknown requests
-are held for a human, who approves/rejects them in a live UI.
+Step 2b: policy + audit + **hold-for-approval**. The management app the agent can
+never reach — it lives on internal networks the sandbox is not attached to.
+Governed proxies call it on the control path to authorize connections; unknown
+requests are held for a human, who approves/rejects them in a live UI.
 
 The authorize flow (one call from the proxy, `POST /authorize`):
   - host matches a BLOCK rule            -> deny   (audited)
@@ -39,6 +39,23 @@ by a host-local caller. It exists so a forged approval is at least visible in th
 record afterwards, which it previously was not — an operator's click and a
 scripted POST were indistinguishable once written.
 
+TWO LISTENERS, on two networks, because the dangerous surface is the management
+API and not `/authorize`. Resolving a hold GRANTS egress, so anything that reaches
+`resolve` can self-approve, while `/authorize` can only ever answer a policy
+question. They are therefore served separately (``main``):
+
+  - the AUTHORIZE listener (CONTROL_AUTHORIZE_PORT, on authorize-net) serves
+    exactly POST /authorize and GET /healthz — ``authorize_app`` below. It is the
+    only surface the egress proxy has a route to.
+  - the MANAGEMENT listener (CONTROL_MANAGE_PORT, bound to the control-net address
+    ALONE — a wildcard bind is refused at startup) serves everything else, and is
+    reachable only from control-plane-ui.
+
+This is blast-radius containment, not the primary control: the agent is kept off
+this service by network topology, by the proxy's relay guard and by the proxy's
+port gate. What the split adds is that all three failing at once yields a policy
+QUERY rather than a self-approval. See DESIGN.md.
+
 Concurrency model: run under a SINGLE uvicorn worker. `/authorize` and the
 resolve endpoint are sync (FastAPI runs them in a threadpool); a held request
 blocks its worker on a threading.Event that the resolve endpoint sets. Concurrent
@@ -46,10 +63,14 @@ holds are bounded (CONTROL_MAX_PENDING / CONTROL_MAX_PENDING_PER_CLIENT) so a
 sandbox cannot pin every worker and stall governance for all sandboxes — over the
 cap /authorize fails closed. The SQLite store is the source of truth for the UI
 (the SSE stream polls it). Do NOT run multiple workers — the pending-event
-registry is in-process.
+registry is in-process. That constraint is also why the two listeners above are
+two sockets in ONE process rather than two services: a held /authorize and the
+`resolve` that releases it must share memory, precisely because they must not
+share a socket.
 
-No egress: this service is on control-net only. It must never be given an
-internet route — it is pure management state (the crown jewel).
+No egress: this service sits on control-net and authorize-net, both internal. It
+must never be given an internet route — it is pure management state (the crown
+jewel).
 """
 from __future__ import annotations
 
@@ -132,7 +153,24 @@ DRAIN_MAX_FIELD = 2048
 # Bounds the aggregation regardless of table size; the slice itself rides audit_ts.
 AUDIT_GROUP_SCAN = int(os.environ.get("CONTROL_AUDIT_GROUP_SCAN", "5000"))
 
+# ── the two listeners (see the module docstring) ────────────────────────────
+# The proxy-facing surface binds a WILDCARD on purpose: it is the safe one, it
+# only answers policy questions, and the container's healthcheck reaches it over
+# loopback. The management surface binds ONE address, and the default is loopback
+# so that a deployment which forgets to set it fails VISIBLY (the UI cannot reach
+# the backend) instead of silently re-exposing `resolve` to the proxy's network.
+AUTHORIZE_BIND = os.environ.get("CONTROL_AUTHORIZE_BIND", "0.0.0.0")  # noqa: S104
+AUTHORIZE_PORT = int(os.environ.get("CONTROL_AUTHORIZE_PORT", "8091"))
+MANAGE_BIND = os.environ.get("CONTROL_MANAGE_BIND", "127.0.0.1")
+MANAGE_PORT = int(os.environ.get("CONTROL_MANAGE_PORT", "8090"))
+
+# Everything except /authorize: the approvals API, the read-only views, /status.
 app = FastAPI(title="dockade control plane", version="2b")
+# POST /authorize and GET /healthz, and nothing else, ever. Adding a route here
+# hands it to the egress proxy — the one component whose compromise this split
+# exists to survive — so the question to ask of any new endpoint is not "is it
+# read-only" but "would I let a bypassed relay guard call it".
+authorize_app = FastAPI(title="dockade control plane (authorize)", version="2b")
 
 # In-memory registry of held requests, keyed by approval id. Single-process only
 # (see module docstring). The Event only WAKES the blocked /authorize worker; the
@@ -835,8 +873,12 @@ class AckRequest(BaseModel):
 
 # ── lifecycle ───────────────────────────────────────────────────────────────
 
-@app.on_event("startup")
-def _startup() -> None:
+def _bootstrap() -> None:
+    """Prepare the store. Called by ``main`` BEFORE either listener binds, so no
+    request — from the proxy or the UI — can observe an unseeded database. This
+    used to be a Starlette startup handler, which worked only because there was a
+    single app: with two, each has its own lifespan and the authorize listener
+    would race the management one's seed."""
     _init_db()
     # A held request cannot survive a restart (its blocked connection is gone),
     # so any 'pending' rows from a previous process are stale — expire them.
@@ -851,42 +893,37 @@ def _startup() -> None:
               flush=True)
 
 
-# Module-level reference, because asyncio keeps only a WEAK one: a bare create_task
-# whose result nobody holds can be garbage-collected mid-flight, and the ingest would
-# stop with no error anywhere.
-_drain_task: asyncio.Task | None = None
+def _assert_listeners_separated() -> None:
+    """Fail closed on a configuration that undoes the split.
 
-
-@app.on_event("startup")
-async def _start_audit_drain() -> None:
-    """Start the egress-audit ingest. Registered AFTER _startup so _init_db has
-    created audit_cursor before the loop's first pass — Starlette runs startup
-    handlers in registration order, and this one does no work before its first
-    await anyway. The loop drains immediately on entry, which is what backfills
-    everything the proxy wrote while this service was down."""
-    global _drain_task
-    if DRAIN_INTERVAL <= 0:
-        print("control-plane: audit ingest DISABLED "
-              "(CONTROL_AUDIT_DRAIN_INTERVAL=0); locally-decided egress will "
-              "appear only in the proxy's own log", flush=True)
-        return
-    _drain_task = asyncio.create_task(_audit_drain_loop())
-
-
-@app.on_event("shutdown")
-async def _stop_audit_drain() -> None:
-    if _drain_task is not None:
-        _drain_task.cancel()
+    The management API is only out of the proxy's reach because it binds ONE
+    address, on a network the proxy is not attached to. A wildcard bind serves it
+    on every interface — including authorize-net — which silently restores exactly
+    the self-approval path the split removes, while every healthcheck and every
+    page in the UI keeps working. Nothing downstream can detect that, so it is
+    refused here (the same shape as the proxy's ``_assert_guard_configured``)."""
+    if MANAGE_BIND in ("", "0.0.0.0", "::", "*"):  # noqa: S104
+        raise SystemExit(
+            f"control-plane: CONTROL_MANAGE_BIND={MANAGE_BIND!r} is a wildcard, "
+            f"which would serve the management API (including "
+            f"/approvals/{{id}}/resolve) on authorize-net, where the egress proxy "
+            f"can reach it. Bind the control-net address instead. Refusing to "
+            f"start (fail closed).")
+    if MANAGE_BIND == AUTHORIZE_BIND and MANAGE_PORT == AUTHORIZE_PORT:
+        raise SystemExit(
+            "control-plane: the management and authorize listeners resolve to the "
+            f"same socket ({MANAGE_BIND}:{MANAGE_PORT}). Refusing to start.")
 
 
 @app.get("/healthz")
+@authorize_app.get("/healthz")
 def healthz() -> dict:
     return {"status": "ok"}
 
 
 # ── authorize (proxy-facing) ────────────────────────────────────────────────
 
-@app.post("/authorize", response_model=AuthorizeResponse)
+@authorize_app.post("/authorize", response_model=AuthorizeResponse)
 def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
     decision, reason = _decide(req.host)
 
@@ -1291,3 +1328,62 @@ def status() -> str:
             "SELECT COUNT(*) FROM approvals WHERE status='pending'").fetchone()[0]
     return (f"dockade control plane (2b) — {rules} rules, {audits} audit rows, "
             f"{pending} pending approvals\n")
+
+
+# ── entry point ─────────────────────────────────────────────────────────────
+
+async def main() -> None:
+    """Serve both listeners from one process and one event loop.
+
+    ``uvicorn`` is imported HERE rather than at module scope so the module stays
+    importable with only the stdlib — the unit suite loads this file directly with
+    stub fastapi/pydantic and installs no packages (see tests/_loader.py)."""
+    import uvicorn
+
+    _assert_listeners_separated()
+    _bootstrap()
+    print(f"control-plane: authorize on {AUTHORIZE_BIND}:{AUTHORIZE_PORT}, "
+          f"management on {MANAGE_BIND}:{MANAGE_PORT}", flush=True)
+
+    # The ingest is a plain task on this loop rather than a lifespan hook, for the
+    # same reason _bootstrap is not one: it belongs to the PROCESS, not to either
+    # app. Holding the reference matters — asyncio keeps only a weak one, so a
+    # create_task whose result nobody holds can be collected mid-flight and the
+    # ingest would stop with no error anywhere.
+    drain = None
+    if DRAIN_INTERVAL > 0:
+        drain = asyncio.create_task(_audit_drain_loop())
+    else:
+        print("control-plane: audit ingest DISABLED "
+              "(CONTROL_AUDIT_DRAIN_INTERVAL=0); locally-decided egress will "
+              "appear only in the proxy's own log", flush=True)
+
+    # Two servers sharing one process means sharing one set of signal handlers,
+    # and SIGTERM has to stop BOTH or `docker compose down` waits out the grace
+    # period and SIGKILLs the governance authority with holds in flight.
+    #
+    # uvicorn already handles this, and the mechanism is worth naming because it is
+    # not obvious: each ``serve()`` wraps itself in ``capture_signals()``, so the
+    # second server's handler replaces the first's — but on exit it restores what
+    # it replaced and re-raises the signal it caught, which then reaches the first.
+    # Measured on the pinned 0.34.0 (NOTES.md): SIGTERM logs two clean shutdowns
+    # and the process is gone inside a second. An earlier version of this function
+    # added handlers of its own to "fix" the overwrite; they were inert — uvicorn
+    # installs via ``signal.signal``, which displaces asyncio's — and removing them
+    # changed nothing, so they are gone rather than kept as insurance.
+    servers = [
+        uvicorn.Server(uvicorn.Config(
+            authorize_app, host=AUTHORIZE_BIND, port=AUTHORIZE_PORT,
+            log_level="info")),
+        uvicorn.Server(uvicorn.Config(
+            app, host=MANAGE_BIND, port=MANAGE_PORT, log_level="info")),
+    ]
+    try:
+        await asyncio.gather(*(s.serve() for s in servers))
+    finally:
+        if drain is not None:
+            drain.cancel()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

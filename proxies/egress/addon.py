@@ -40,11 +40,21 @@ Fail-closed, with one deliberate exception:
     (timeout), the request is DENIED and audited locally — governed egress fails
     closed when the policy authority is down, which is the intended posture.
 
-Control-plane isolation: this proxy is the only component on BOTH sandbox-net
-and control-net, so it — not network segmentation — is what keeps the agent off
+Control-plane isolation: this proxy is the only component on BOTH sandbox-net and
+a control network, so it — not network segmentation — is what keeps the agent off
 the control plane. Before any policy/permanent/port check it hard-refuses any
-destination that names a control-plane host or resolves into the control-net
-subnet (``_forbidden``), a guard that no rule, approval, or port change can widen.
+destination that names a control-plane host or resolves into either control subnet
+(``_forbidden``), a guard that no rule, approval, or port change can widen.
+
+The control network this proxy joins is authorize-net, which carries ONLY
+``/authorize``. That is deliberate and it is what bounds the damage here: this
+guard is best-effort against DNS rebinding (the resolve branch re-resolves, so a
+name can change answers between the check and the dial), so the design assumes it
+can be beaten and arranges for the far side to be worth little. Even a total
+bypass reaches a listener that can answer a policy question and nothing else — it
+cannot approve a held request, read the audit store, or see a pending approval,
+because the management API is served on a different port bound to a different
+address on a network this container is not attached to. See DESIGN.md.
 The same guard hard-blocks the private / special-use ranges (cloud metadata /
 link-local, loopback, RFC1918 and friends — see ``PRIVATE_CIDRS``), so the proxy
 can never be turned into an SSRF pivot to the instance-metadata service or the
@@ -120,16 +130,22 @@ ALLOWED_HTTP_PORTS = _ports("EGRESS_HTTP_PORTS", "80")         # plain HTTP
 
 logger = logging.getLogger("egress")
 
-# ── Forbidden destinations (control plane / control-net) ──────────────────────
-# This proxy is the ONE component attached to BOTH sandbox-net and control-net,
-# so it — not network segmentation — is what actually keeps the agent off the
-# control plane: were the proxy to relay a connection onto control-net, the agent
-# could reach the control plane (and, e.g., approve its own held requests). We
-# therefore refuse, BEFORE any policy / permanent-lifeline / port check, any
-# destination that names a control-plane host or resolves into the control-net
-# subnet. This guard is checked first and is never consulted against policy, so it
-# cannot be widened by a rule, a human approval, a change to the port allowlist,
-# or a public name whose DNS is pointed at control-net.
+# ── Forbidden destinations (control plane / control networks) ─────────────────
+# This proxy is the ONE component attached to BOTH sandbox-net and a control
+# network, so it — not network segmentation — is what actually keeps the agent off
+# the control plane: were the proxy to relay a connection onto authorize-net, the
+# agent would be talking to the control plane directly. We therefore refuse,
+# BEFORE any policy / permanent-lifeline / port check, any destination that names
+# a control-plane host or resolves into either control subnet. This guard is
+# checked first and is never consulted against policy, so it cannot be widened by
+# a rule, a human approval, a change to the port allowlist, or a public name whose
+# DNS is pointed at a control subnet.
+#
+# What a bypass here now costs is bounded by the API-surface split (see the module
+# docstring): the reachable listener serves /authorize alone, so the worst outcome
+# is an unauthorized policy QUERY rather than an approval of the agent's own held
+# request. That is the point of the split — this guard is racy by nature, so the
+# far side is arranged to be worth little rather than the guard being trusted.
 def _parse_cidrs(env: str, default: str) -> tuple:
     nets = []
     for c in os.environ.get(env, default).split(","):
@@ -142,9 +158,16 @@ def _parse_cidrs(env: str, default: str) -> tuple:
             logger.warning("ignoring invalid forbidden CIDR %r", c)
     return tuple(nets)
 
-# Defaults mirror docker-compose.yml: control-net is 172.31.0.0/24 and the
-# control-plane services are reachable there by name.
-FORBIDDEN_CIDRS = _parse_cidrs("EGRESS_FORBIDDEN_CIDRS", "172.31.0.0/24")
+# Defaults mirror docker-compose.yml. BOTH control networks are listed, and the
+# second one is the one that matters operationally: this proxy is attached to
+# authorize-net (172.29.0.0/24) and NOT to control-net (172.31.0.0/24), so
+# authorize-net is where a relayed connection could actually land. control-net
+# stays listed because a guard that only blocks what is currently routable would
+# quietly stop covering the control plane the moment the topology changes, and
+# because being unroutable is a property of the compose file rather than of this
+# process — this file cannot verify it and should not assume it.
+FORBIDDEN_CIDRS = _parse_cidrs(
+    "EGRESS_FORBIDDEN_CIDRS", "172.31.0.0/24,172.29.0.0/24")
 FORBIDDEN_HOSTS = _hosts("EGRESS_FORBIDDEN_HOSTS", "control-plane,control-plane-ui")
 
 # Special-use / private ranges that are NEVER a legitimate egress target for the
@@ -261,13 +284,15 @@ def _blocked_cidr(ip_str: str):
 
 
 def _cidr_label(net) -> str:
-    """Human label for a matched forbidden network, for the audit reason."""
-    return "control-net" if net in FORBIDDEN_CIDRS else "private/special-use"
+    """Human label for a matched forbidden network, for the audit reason. Both
+    control subnets share one label — the reason quotes the address anyway, so
+    naming the specific network would add nothing a reader cannot already see."""
+    return "control network" if net in FORBIDDEN_CIDRS else "private/special-use"
 
 
 def _forbidden_reason(host: str) -> str | None:
     """Return a deny reason if this destination must never be dialed, else None.
-    Covers the control plane / control-net AND the private/special-use ranges
+    Covers the control plane's networks AND the private/special-use ranges
     (cloud metadata / link-local, loopback, RFC1918 — see ``PRIVATE_CIDRS``): a
     forbidden target is never weighed against policy, so no rule or human approval
     can turn the proxy into an SSRF pivot to the instance-metadata service, the
@@ -285,13 +310,14 @@ def _forbidden_reason(host: str) -> str | None:
     step) is BEST-EFFORT defense-in-depth: it depends on a DNS lookup, so it is
     subject to a TOCTOU/rebind gap (mitmproxy re-resolves when it dials) and to
     resolution failure. That is acceptable here ONLY because it is not the
-    load-bearing control — reaching the control plane is prevented first by
-    network topology (the sandbox has no control-net route) and by the local port
-    gate (control plane listens on :8090; CONNECT/HTTP are gated to :443/:80), so
-    a rebound name is dialed on a port nothing serves. See DESIGN.md
-    "Control-plane relay guard" and the planned API-surface split (#4) that caps
-    the blast radius of any guard bypass. The startup ``_assert_guard_configured``
-    refuses to run with the CIDR check disabled, so this is never silently off."""
+    load-bearing control. Reaching the control plane is prevented first by network
+    topology (the sandbox has no route to either control network) and by the local
+    port gate (the control plane listens on :8090 and :8091; CONNECT/HTTP are
+    gated to :443/:80), so a rebound name is dialed on a port nothing serves — and
+    if all of that failed, the API-surface split leaves this container able to
+    reach an /authorize listener and nothing else. See DESIGN.md "Control-plane
+    relay guard". The startup ``_assert_guard_configured`` refuses to run with the
+    CIDR check disabled, so this is never silently off."""
     h = _unbracket((host or "").lower()).rstrip(".")
     if h in FORBIDDEN_HOSTS:
         return f"forbidden destination host {host} (control plane)"
@@ -326,19 +352,20 @@ async def _forbidden(host: str) -> str | None:
 
 def _assert_guard_configured() -> None:
     """Fail CLOSED at startup if the relay guard's CIDR check is disabled by
-    configuration. This proxy is the ONE bridge between sandbox-net and
-    control-net, so the control-net CIDR check is not optional: an empty
-    ``EGRESS_FORBIDDEN_CIDRS`` would silently drop BOTH the literal-IP and the
-    resolve-based branches, leaving only exact-hostname matching — bypassable by a
-    literal IP or a name that resolves into control-net. There is no legitimate
-    reason to run this proxy with that check off, so refuse to start rather than
-    serve with the hole (matches the repo's "no silent unsafe defaults"). The
-    hostname list is a cheap fast-path on top of this, not a substitute for it."""
+    configuration. This proxy is the ONE bridge between sandbox-net and a control
+    network, so the CIDR check is not optional: an empty ``EGRESS_FORBIDDEN_CIDRS``
+    would silently drop BOTH the literal-IP and the resolve-based branches, leaving
+    only exact-hostname matching — bypassable by a literal IP or a name that
+    resolves into a control subnet. There is no legitimate reason to run this proxy
+    with that check off, so refuse to start rather than serve with the hole
+    (matches the repo's "no silent unsafe defaults"). The hostname list is a cheap
+    fast-path on top of this, not a substitute for it."""
     if not FORBIDDEN_CIDRS:
         raise RuntimeError(
             "EGRESS_FORBIDDEN_CIDRS is empty — the control-plane relay guard would "
-            "not block control-net by IP. Refusing to start (fail closed). Set it "
-            "to the control-net subnet(s), e.g. 172.31.0.0/24.")
+            "not block the control networks by IP. Refusing to start (fail "
+            "closed). Set it to the control subnet(s), e.g. "
+            "172.31.0.0/24,172.29.0.0/24.")
 
 
 # Per-connection record of the authorized CONNECT authority, keyed by the client

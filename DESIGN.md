@@ -102,8 +102,13 @@ egress** — sandbox-net only. These make good practices cheap and fast. Example
 
 - `sandbox-net` (`internal: true`) — sandbox ↔ all data-plane services (governed
   + ungoverned). The agent lives only here.
-- `control-net` (`internal: true`) — governed proxies/tools ↔ control plane.
-  Sandbox not attached.
+- `control-net` (`internal: true`) — the MANAGEMENT path: control plane ↔
+  control-plane-ui, and later the git/secrets brokers. Sandbox not attached, and
+  neither is the egress proxy.
+- `authorize-net` (`internal: true`) — the AUTHORIZE path, one conversation only:
+  egress proxy → the control plane's `/authorize` listener. Exists so the proxy
+  can ask policy questions without gaining a route to the management API; see
+  "why three control nets" under Governance surfaces. Sandbox not attached.
 - `egress-net` — only outbound-capable governed proxies + internet.
 - `control-ui-net` — non-internal bridge carrying ONLY the control-plane-ui
   frontend's host-loopback UI publish; masquerade disabled so it is
@@ -111,15 +116,16 @@ egress** — sandbox-net only. These make good practices cheap and fast. Example
   host port from a container that is on an internal network alone. Sandbox not
   attached.
 
-**Status:** all four networks are implemented. `sandbox-net` (internal) and
-`egress-net` carry the agent and the sole egress; `control-net` (internal)
-carries the control path. The egress proxy is **triple-homed** (sandbox-net
-+ egress-net + control-net). The control-plane **backend** is on `control-net`
-only and fully internal (no `sandbox-net`, no `egress-net`, no published port);
-the **control-plane-ui** frontend is on `control-net` (to reach the backend)
-plus `control-ui-net` (host-loopback UI). The sandbox is on `sandbox-net` only —
-never `control-net`/`control-ui-net` (asserted by `make check` and
-`boundary-check.sh`).
+**Status:** all five networks are implemented. `sandbox-net` (internal) and
+`egress-net` carry the agent and the sole egress; the two internal control nets
+carry the control path, split by surface. The egress proxy is **triple-homed**
+(sandbox-net + egress-net + authorize-net) — note `authorize-net`, not
+`control-net`. The control-plane **backend** is on both control nets and fully
+internal (no `sandbox-net`, no `egress-net`, no published port), serving a
+different surface on each; the **control-plane-ui** frontend is on `control-net`
+(to reach the backend) plus `control-ui-net` (host-loopback UI). The sandbox is on
+`sandbox-net` only — never any control network (asserted by `make check`,
+`tests/test_topology.py` and `boundary-check.sh`).
 
 ### DNS on `sandbox-net` (a non-obvious gotcha — read before touching DNS/firewall)
 
@@ -727,17 +733,17 @@ alone); the resolve branch is **best-effort** — it depends on a DNS lookup, so
 carries a TOCTOU/rebind gap (mitmproxy re-resolves when it dials) and can be
 skipped on resolution failure (logged, returns "not forbidden" — safe, because an
 unresolvable name is also undialable, and reaching the control plane is prevented
-first by topology and by the port gate: the control plane listens on `:8090` while
-CONNECT/HTTP are gated to `:443`/`:80`, so a rebound name is dialed on a port
-nothing serves). To keep the guard from being *silently* disabled by
+first by topology and by the port gate: the control plane listens on `:8090` and
+`:8091` while CONNECT/HTTP are gated to `:443`/`:80`, so a rebound name is dialed
+on a port nothing serves). To keep the guard from being *silently* disabled by
 misconfiguration, `load()` calls `_assert_guard_configured()`, which **fails
 closed at startup** (refuses to run) if `EGRESS_FORBIDDEN_CIDRS` is empty — an
 empty CIDR set would drop both the literal-IP and resolve branches, leaving only
-exact-hostname matching. The durable fix for the residual rebind gap is not to
-keep hardening the DNS check but to **cap the blast radius of any bypass** by
-splitting the control-plane API surface so a reached backend can only *query*
-`/authorize`, never self-approve via the management API — see the API-surface-split
-item under "Future improvements". The call runs in a worker thread
+exact-hostname matching. The durable fix for the residual rebind gap was never to
+keep hardening the DNS check but to **cap the blast radius of any bypass**, and
+that is now built: the API surface is split, so a bypass reaches a listener that
+can only *query* `/authorize` and can never self-approve through the management
+API — see "the third net, `authorize-net`" below. The call runs in a worker thread
 so it never blocks mitmproxy's event loop, and the egress image gains no new
 dependency. The canonical allow policy now lives at `policies/egress-allowlist.txt`
 (the control plane seeds SQLite from it on first boot, idempotently); the proxy
@@ -750,10 +756,12 @@ governance authority now exists as a service the **agent cannot reach**: it is
 not on `sandbox-net`, so the sandbox has no route to it (`boundary-check.sh`
 probes the control plane's fixed control-net address and asserts it is
 unreachable from the sandbox; `make check` asserts the launcher never attaches
-the sandbox to `control-net`/`control-ui-net`). In 2a it sat on `control-net`
+the sandbox to any control network). In 2a it sat on `control-net`
 (internal) for the proxy control path and on `control-ui-net` for the human UI;
-since 2b-2 the backend is `control-net`-only and the UI frontend carries
-`control-ui-net` (see below).
+2b-2 moved `control-ui-net` to the UI frontend, and the API-surface split moved
+the proxy's control path off `control-net` onto `authorize-net`, so the backend
+now spans the two internal control nets and serves a different surface on each
+(see below).
 That UI bridge is non-internal **by necessity** — Docker cannot publish a host
 port from a container that is on an internal network alone — but has masquerade
 disabled, so it carries the loopback UI publish without being an egress path.
@@ -762,9 +770,9 @@ own named volume — the crown-jewel state); the management surface reaches the
 host as **loopback only** (`127.0.0.1:8081`), published since 2b-2 by the UI
 frontend rather than the backend.
 
-*Design note — why two control nets, and the frontend split.* `control-net` stays
+*Design note — why three control nets, and the frontend split.* `control-net` stays
 hard-`internal` because it is the **shared** control path for the whole governed
-data plane (egress proxy today; git/secrets proxies later), and egress is granted
+data plane (the UI today; git/secrets proxies later), and egress is granted
 **only** by `egress-net` membership — a non-internal `control-net` would silently
 hand ungoverned egress to every service on it (see "Networks"). Publishing a host
 port, though, forces *some* non-internal surface, so `control-ui-net` quarantines
@@ -783,6 +791,46 @@ fully `internal`, so the crown-jewel container has **zero non-internal exposure*
 deliberately a **separate service**, not a co-located sidecar: the frontend is a
 stateless reverse proxy + static server (FastAPI + httpx), holds no state, and no
 governance decision depends on it (the egress proxy calls the backend directly).
+
+**The third net, `authorize-net`, and why the API surface is split.** The egress
+proxy is no longer on `control-net` at all. It sits on a single-conversation
+bridge to the control plane, and the control plane answers a *different surface*
+on each of its two networks: the management API (approvals, `resolve`, the
+read-only views) on `control-net`, and `POST /authorize` alone on `authorize-net`.
+
+The reasoning is about which failure is worth designing around. The dangerous
+endpoint is `resolve`, because it is what grants egress — a caller that reaches it
+approves the agent's own held requests, and the governance plane becomes a
+formality. Three layers keep the agent off it: no control-net route from the
+sandbox, the proxy's relay guard, and the proxy's port gate. But the relay guard's
+resolve branch is *best-effort by construction* — it re-resolves, so a name can
+change answers between the check and the dial — and hardening it further is racing
+DNS rather than addressing the consequence. So the consequence is addressed
+instead: after the split, a total relay-guard bypass reaches a listener that can
+answer a policy question and nothing else.
+
+**Both halves are load-bearing, and neither is sufficient.** The network split
+alone would still put one all-routes listener on the network the proxy can reach.
+The port split alone would sit on a network the proxy is already attached to. What
+makes them compose is the *bind address*: the management listener binds the
+control-net address only, so it is absent from `authorize-net` even on its own
+port. A wildcard bind would quietly undo the whole thing while every health check
+stayed green and every page in the UI kept working — which is why `app.py` refuses
+to start on one rather than trusting compose to be right.
+
+**One process, two sockets**, and that is forced rather than chosen: a held
+`/authorize` blocks on a `threading.Event` that `resolve` sets, so the two surfaces
+must share memory precisely because they must not share a socket. Splitting them
+into two containers would mean externalising the hold registry, which trades a
+narrow, checkable property for a distributed-state problem.
+
+Three guards stand where no compiler can: `tests/test_topology.py` reads
+`docker-compose.yml` and asserts who is attached to what (the app cannot see its
+own topology, and compose cannot see which routes an app serves);
+`tests/test_control_plane_api.py` asserts the route partition itself; and
+`make split-check` probes both ports *from inside the running proxy*, which is the
+only place the claim actually applies — `boundary-check.sh` runs in the sandbox and
+gets a relay-guard 403 long before reachability is in question.
 
 The egress proxy is now a **control-plane client** rather than a static-allowlist
 enforcer: on every connection it calls `POST /authorize {host, ...}`, which
@@ -2072,28 +2120,6 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
   strips a trailing FQDN dot but `_decide` / `_match` only lowercase, so `evil.com.`
   misses a persisted **block** rule and lands in a hold instead — fail-safe, but it
   lets an explicit operator denial be re-prompted indefinitely.
-- **Split the control-plane API surface to cap the blast radius of any relay-guard
-  bypass (planned).** The egress proxy only ever needs `/authorize` (+ `/healthz`);
-  the *dangerous* surface is the management API (`/approvals`, `/approvals/{id}/
-  resolve`, `/api/audit`), because `resolve` lets a caller approve held egress —
-  i.e. self-approve. Today the agent is kept off all of it by three layers: network
-  topology (no control-net route), the egress proxy's relay guard (`_forbidden`),
-  and the local port gate (control plane on `:8090`, while CONNECT/HTTP are gated to
-  `:443`/`:80`, so even a DNS-rebound name is dialed on a port nothing serves). The
-  relay guard's resolve branch is best-effort (TOCTOU/rebind, resolution failure),
-  so the robust improvement is to make a *bypass* non-catastrophic rather than to
-  keep hardening the guard: **serve the proxy-facing `/authorize` and the
-  human-facing management API on separate ports, and give the proxy a route only to
-  the `/authorize` port** (e.g. a dedicated proxy↔backend network carrying only
-  authorize; the management port reachable solely from `control-plane-ui`). Then
-  even a total relay-guard bypass can, at worst, *query* a policy decision — it can
-  never approve a hold or read the audit store. This addresses the impact
-  (self-approval) instead of racing the mechanism (DNS), and composes with the
-  topology refinement noted under "why two control nets" (the proxy comes off the
-  broad `control-net` so it also has no route to future control-net tenants — the
-  git/secrets brokers). Pairs with a `boundary-check.sh` assertion that the proxy
-  can reach the authorize port but **not** the management port. See the
-  "Control-plane relay guard" note under "Egress proxy" for the guard this backstops.
 
 ## Layout
 

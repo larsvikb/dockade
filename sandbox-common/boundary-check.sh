@@ -170,13 +170,28 @@ if [ -n "${HTTPS_PROXY:-}" ]; then
     else
         bad "egress proxy did NOT 403 the control-plane host (got: ${cphost:-<none>}) — control-net relay risk"
     fi
-    cpip="$(curl -sS -x "$HTTPS_PROXY" --connect-timeout 5 --max-time 8 \
-        -o /dev/null https://172.31.0.2/ 2>&1 || true)"
-    if printf '%s' "$cpip" | grep -q '403'; then
-        ok "egress proxy refuses to relay to a control-net IP (172.31.0.2 -> 403)"
-    else
-        bad "egress proxy did NOT 403 control-net IP 172.31.0.2 (got: ${cpip:-<none>}) — control-net relay risk"
-    fi
+    # Both control subnets, and the SECOND one is the one that matters. The proxy
+    # is attached to authorize-net (172.29.0.0/24) and NOT to control-net, so
+    # 172.29.0.2 is the address a relayed connection could actually land on —
+    # 172.31.0.2 is unroutable from the proxy and would fail even with the guard
+    # off, which makes it the weaker of the two probes despite being the older one.
+    # Keep both: the guard must not start depending on the topology for its effect.
+    #
+    # NEITHER probe can tell you WHICH list refused it. Both addresses also fall
+    # inside PRIVATE_CIDRS (RFC1918 172.16.0.0/12), so a 403 here survives dropping
+    # them from EGRESS_FORBIDDEN_CIDRS entirely — which is precisely the state the
+    # startup assertion exists to prevent and cannot be observed from out here.
+    # tests/test_topology.py asserts the CIDR list itself against the compose
+    # subnets; this asserts the refusal a sandbox actually experiences.
+    for cpip_addr in 172.31.0.2 172.29.0.2; do
+        cpip="$(curl -sS -x "$HTTPS_PROXY" --connect-timeout 5 --max-time 8 \
+            -o /dev/null "https://${cpip_addr}/" 2>&1 || true)"
+        if printf '%s' "$cpip" | grep -q '403'; then
+            ok "egress proxy refuses to relay to a control-net IP ($cpip_addr -> 403)"
+        else
+            bad "egress proxy did NOT 403 control IP $cpip_addr (got: ${cpip:-<none>}) — control-plane relay risk"
+        fi
+    done
 
     # SSRF hardening: the proxy's default route is egress-net, which can reach the
     # cloud instance-metadata service (169.254.169.254 -> cloud credentials) and
@@ -201,7 +216,7 @@ if [ -n "${HTTPS_PROXY:-}" ]; then
     # still reaches the v4 host. The dotted-quad probes above passed throughout, so
     # only an explicitly mapped probe can catch a regression here. Both must 403 for
     # the same reason as their dotted-quad twins — BEFORE any policy or port check.
-    for mapped in "[::ffff:172.31.0.2]" "[::ffff:169.254.169.254]"; do
+    for mapped in "[::ffff:172.31.0.2]" "[::ffff:172.29.0.2]" "[::ffff:169.254.169.254]"; do
         resp="$(curl -sS -x "$HTTPS_PROXY" --connect-timeout 5 --max-time 8 \
             -o /dev/null "https://${mapped}/" 2>&1 || true)"
         if printf '%s' "$resp" | grep -q '403'; then
@@ -243,10 +258,20 @@ printf '%s== control plane ==%s\n' "$bold" "$reset"
 # matching docker-compose.yml) — DNS-independent, like the raw-IP egress probe.
 # --noproxy '*' so we test the sandbox's OWN routing, not the egress proxy (which
 # legitimately can reach the control plane on control-net). Any reply is a leak.
-if curl --noproxy '*' --connect-timeout 5 -s -o /dev/null http://172.31.0.2:8090/healthz 2>/dev/null; then
-    bad "control plane reachable from sandbox (172.31.0.2:8090) — control-net leak"
-else
-    ok "control plane unreachable from sandbox (control-net isolated)"
+# BOTH of its addresses, because it now answers a different surface on each and
+# the agent must reach neither: 172.31.0.2:8090 is the management API (approvals,
+# resolve, the audit store) and 172.29.0.2:8091 is /authorize on authorize-net.
+# Probing only the first would leave the newer network unasserted precisely
+# because it is newer.
+cp_leak=0
+for target in 172.31.0.2:8090 172.29.0.2:8091; do
+    if curl --noproxy '*' --connect-timeout 5 -s -o /dev/null "http://${target}/healthz" 2>/dev/null; then
+        bad "control plane reachable from sandbox ($target) — control-network leak"
+        cp_leak=1
+    fi
+done
+if [ "$cp_leak" -eq 0 ]; then
+    ok "control plane unreachable from sandbox on both control networks"
 fi
 
 printf '%s== ipv6 ==%s\n' "$bold" "$reset"

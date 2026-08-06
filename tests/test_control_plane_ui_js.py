@@ -802,7 +802,7 @@ class PageScriptTests(unittest.TestCase):
 
         A SHAPE bound, deliberately not a vocabulary one: a stage a future hook adds
         still shows, which is the entire point of displaying the unusual ones. And not
-        a security control either — `/authorize` is reachable only from control-net,
+        a security control either — `/authorize` is reachable only from authorize-net,
         and a compromised proxy could do far worse than mislabel a row."""
         a = self.probe["saturation"]["audit"]
         self.assertEqual(a["future_stage"], "tls · ")
@@ -1314,8 +1314,8 @@ class InlineScriptTests(unittest.TestCase):
         self.assertEqual(
             unused, [],
             "these routes cross the relay but nothing on the page calls them — drop "
-            "them, or wire them up; the backend keeps serving them on control-net "
-            "either way")
+            "them, or wire them up; the backend keeps serving them on the "
+            "management listener either way")
 
     def test_the_sweep_call_site_passes_a_per_card_dwell(self):
         """`shouldSweep` grew a minimum dwell because the `expired — default-denied`

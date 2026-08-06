@@ -30,10 +30,13 @@ networks:
   egress-net:
     name: egress-net
     driver: bridge
-  # Control path. internal:true => no route off-box. Carries governed proxies
-  # <-> control plane ONLY; the sandbox is NEVER attached here (the load-bearing
-  # invariant — the agent must have no route to the control plane). Fixed subnet
-  # so boundary-check.sh can probe a literal control-net address and prove the
+  # MANAGEMENT path. internal:true => no route off-box. Carries the human-facing
+  # control-plane API — approvals, resolve, the read-only views — between the
+  # control plane and control-plane-ui, and NOTHING ELSE. The sandbox is never
+  # attached (the load-bearing invariant), and neither is the egress proxy: it has
+  # its own authorize-net below, so a future control-net tenant (the git or
+  # secrets broker) is out of the proxy's reach before it exists. Fixed subnet so
+  # boundary-check.sh can probe a literal control-net address and prove the
   # sandbox cannot reach it.
   control-net:
     name: control-net
@@ -42,6 +45,23 @@ networks:
     ipam:
       config:
         - subnet: 172.31.0.0/24
+  # AUTHORIZE path. internal:true. Carries exactly one conversation: the egress
+  # proxy asking the control plane to authorize a connection. It exists so that
+  # the proxy — the component whose relay guard is best-effort against DNS
+  # rebinding, and therefore the one whose bypass this design plans for — has a
+  # route to /authorize and no route at all to the management API. The control
+  # plane serves the two on separate ports AND separate bind addresses, so
+  # membership of this network cannot reach the management listener even by
+  # dialing the right port. Both halves are needed: the network split alone would
+  # still expose a single all-routes listener here, and the port split alone would
+  # sit on a network the proxy can already reach.
+  authorize-net:
+    name: authorize-net
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.29.0.0/24
   # Host-facing UI path for the control-plane-ui frontend ONLY. A non-internal
   # bridge is REQUIRED here because Docker cannot publish a host port from a
   # container that lives solely on an internal network — the publish is silently
@@ -88,15 +108,21 @@ services:
       # all upstream traffic (and the pinned DNS below) must leave via here.
       egress-net:
         priority: 100
-      # Reach the control plane on the control net (per-connection /authorize +
-      # audit). Internal, so no bearing on egress; lower priority than egress-net
-      # so it never becomes the default route.
-      control-net:
+      # Reach the control plane's /authorize listener — and ONLY that listener.
+      # Deliberately NOT control-net: this proxy asks policy questions, it never
+      # needs the management API, and the whole point of the split is that a
+      # bypassed relay guard cannot reach `resolve` and self-approve. Internal, so
+      # no bearing on egress; lower priority than egress-net so it never becomes
+      # the default route.
+      authorize-net:
         priority: 20
     environment:
-      # Where the proxy asks for policy decisions and ships audit. Resolved by
-      # name via Docker's embedded DNS (127.0.0.11) on control-net.
-      EGRESS_CONTROL_PLANE_URL: http://control-plane:8090
+      # Where the proxy asks for policy decisions. Resolved by name via Docker's
+      # embedded DNS (127.0.0.11): `control-plane` gives this container the
+      # authorize-net address, because that is the only network the two share.
+      # Port 8091 is the authorize listener; 8090 (management) is not served on
+      # this network at all.
+      EGRESS_CONTROL_PLANE_URL: http://control-plane:8091
     depends_on:
       # service_healthy, not the bare "started" form. The addon fails CLOSED when
       # the control plane is unreachable (addon.py `_authorize`), so a proxy that
@@ -168,10 +194,15 @@ services:
       - no-new-privileges:true
 
   # Control plane BACKEND — the governance authority (policy + audit), the
-  # crown-jewel state. Attached to control-net ONLY and fully internal: no
-  # sandbox-net (the agent has no route to it), no egress-net, and no published
-  # port. The egress proxy reaches it here for /authorize; the human reaches it
-  # ONLY through the control-plane-ui frontend below. Zero non-internal surface.
+  # crown-jewel state. Fully internal: no sandbox-net (the agent has no route to
+  # it), no egress-net, no published port. Zero non-internal surface.
+  #
+  # It is the ONE service on both internal networks, and it serves a DIFFERENT
+  # surface on each: the human reaches the management API over control-net (via
+  # the control-plane-ui frontend below, the only other member), and the egress
+  # proxy reaches /authorize over authorize-net and can reach nothing else. Two
+  # ports, two bind addresses, one process — see app.py's module docstring for
+  # why the process cannot be split even though the sockets must be.
   control-plane:
     build:
       # Repo root so the Dockerfile can COPY the top-level policies/ seed.
@@ -184,6 +215,15 @@ services:
     networks:
       control-net:
         ipv4_address: 172.31.0.2
+      authorize-net:
+        ipv4_address: 172.29.0.2
+    environment:
+      # The management listener binds THIS ADDRESS ALONE, which is the mechanism
+      # that keeps it off authorize-net — a wildcard bind would serve `resolve` to
+      # the egress proxy, so app.py refuses to start on one. The authorize
+      # listener binds the wildcard on purpose: it is the safe surface, and the
+      # healthcheck below reaches it over loopback.
+      CONTROL_MANAGE_BIND: 172.31.0.2
     volumes:
       - control-state:/var/lib/control-plane
       # The egress proxy's own audit file, READ-ONLY. Not all egress decisions are
@@ -193,9 +233,13 @@ services:
       # the point: the proxy owns the record, and the reader must not be able to
       # rewrite the evidence it is reading.
       - egress-audit:/var/log/egress:ro
-    # /healthz (control-plane/app.py). Uvicorn binds the socket before its startup
-    # handler runs, and that handler seeds the policy rules and expires stale
-    # approvals — so "answers /healthz" is strictly later, and more meaningful,
+    # /healthz on the AUTHORIZE listener (8091), which is the one the proxy's
+    # service_healthy gate is actually about. Probed over loopback, which reaches
+    # it because that listener binds the wildcard; the management listener binds
+    # 172.31.0.2 alone and is deliberately not probeable from here.
+    #
+    # `main` seeds the policy rules and expires stale approvals BEFORE either
+    # socket binds, so "answers /healthz" is strictly later, and more meaningful,
     # than "container started". This is the health gate the other two services
     # wait on.
     #
@@ -213,7 +257,7 @@ services:
         - CMD
         - python3
         - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/healthz', timeout=3)"
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8091/healthz', timeout=3)"
       interval: 30s
       timeout: 5s
       retries: 3

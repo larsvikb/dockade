@@ -75,10 +75,28 @@ class EnvParsingTests(unittest.TestCase):
 
 class ForbiddenGuardTests(unittest.TestCase):
     """The relay guard — the one place segmentation can't cover, so it must be
-    airtight. Defaults: FORBIDDEN_HOSTS = control-plane/-ui, FORBIDDEN_CIDRS =
-    172.31.0.0/24, plus PRIVATE_CIDRS (cloud metadata / link-local, loopback,
-    RFC1918) which are hard-blocked exactly like control-net so the proxy can
-    never be an SSRF pivot to the instance-metadata service or the internal net."""
+    airtight. Defaults: FORBIDDEN_HOSTS = control-plane/-ui, FORBIDDEN_CIDRS = the
+    two control subnets (control-net 172.31.0.0/24 and authorize-net
+    172.29.0.0/24), plus PRIVATE_CIDRS (cloud metadata / link-local, loopback,
+    RFC1918) which are hard-blocked just the same so the proxy can never be an
+    SSRF pivot to the instance-metadata service or the internal net."""
+
+    def test_both_control_subnets_are_forbidden(self):
+        # authorize-net is the one the proxy is actually ATTACHED to, so it is the
+        # subnet a relayed connection could really land on; control-net is listed
+        # even though the proxy has no route there, because unroutability is a
+        # property of docker-compose.yml that this guard cannot verify.
+        for ip in ("172.31.0.9", "172.29.0.2"):
+            reason = addon._forbidden_reason(ip)
+            self.assertIsNotNone(reason, ip)
+            self.assertIn("control network", reason, ip)
+
+    def test_the_authorize_listener_is_not_reachable_by_dialing_its_port(self):
+        # The split puts /authorize on a port the proxy legitimately talks to, so
+        # the guard must refuse the control plane by DESTINATION regardless of
+        # port — it never sees one, and must not be understood to allow 8091.
+        self.assertIsNotNone(addon._forbidden_reason("172.29.0.2"))
+        self.assertIsNotNone(addon._forbidden_reason("control-plane"))
 
     def test_forbidden_hostname(self):
         self.assertIsNotNone(addon._forbidden_reason("control-plane"))
@@ -91,7 +109,7 @@ class ForbiddenGuardTests(unittest.TestCase):
     def test_literal_ip_in_control_net_is_forbidden(self):
         reason = addon._forbidden_reason("172.31.0.9")
         self.assertIsNotNone(reason)
-        self.assertIn("control-net", reason)
+        self.assertIn("control network", reason)
 
     def test_cloud_metadata_ip_is_forbidden(self):
         # 169.254.169.254 (the instance-metadata service) is the highest-impact
@@ -145,7 +163,7 @@ class ForbiddenGuardTests(unittest.TestCase):
         self.assertIsNone(addon._blocked_cidr("8.8.8.8"))
         # control-net vs private/special-use are labelled distinctly.
         self.assertEqual(addon._cidr_label(addon._blocked_cidr("172.31.0.1")),
-                         "control-net")
+                         "control network")
         self.assertEqual(addon._cidr_label(addon._blocked_cidr("169.254.169.254")),
                          "private/special-use")
 
@@ -179,7 +197,7 @@ class EmbeddedIPv4GuardTests(unittest.TestCase):
                          "2002:ac1f:2::1"):        # 6to4
             reason = self._reason_without_dns(spelling)
             self.assertIsNotNone(reason, spelling)
-            self.assertIn("control-net", reason, spelling)
+            self.assertIn("control network", reason, spelling)
 
     def test_v4_mapped_metadata_and_loopback_are_forbidden(self):
         for spelling in ("::ffff:169.254.169.254", "::ffff:127.0.0.1",
@@ -211,7 +229,7 @@ class EmbeddedIPv4GuardTests(unittest.TestCase):
         with mock.patch.object(addon.socket, "getaddrinfo", return_value=fake):
             reason = addon._forbidden_reason("rebind6.example.com")
         self.assertIsNotNone(reason)
-        self.assertIn("control-net", reason)
+        self.assertIn("control network", reason)
 
     def test_embedded_ipv4_returns_none_for_plain_addresses(self):
         import ipaddress

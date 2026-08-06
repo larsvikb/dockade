@@ -50,29 +50,78 @@ def _install_mitmproxy_stub() -> None:
     sys.modules["mitmproxy.tls"] = tls
 
 
-def _install_fastapi_stub() -> None:
-    if "fastapi" in sys.modules:
-        return
-    fa = types.ModuleType("fastapi")
+def _route_recorder(method: str):
+    """A stub route decorator that REMEMBERS what it registered.
 
+    The control plane serves two apps — the management API and a proxy-facing
+    ``/authorize`` — and which app a handler lands on is a security property (see
+    the module docstring in control-plane/app.py). Identity decorators would make
+    that partition invisible to the suite, so the stub records ``(method, path)``
+    per app instance and a test asserts the split directly, instead of asserting a
+    constant that merely claims to describe the decorators."""
+    def route(self, path, *_args, **_kwargs):
+        def register(fn):
+            self.__dict__.setdefault("routes", []).append((method, path))
+            return fn
+        return register
+    return route
+
+
+def _install_recording_routes(klass) -> None:
+    """Force the recording decorators onto whichever FastAPI stub exists.
+
+    Deliberately overwrites rather than filling gaps: test discovery order is
+    arbitrary, and ``tests/test_control_plane_ui.py`` installs its own stub with
+    plain identity decorators. If that one loaded first, the route partition would
+    silently stop being asserted — a guard that quietly does nothing is the exact
+    failure this repo keeps rejecting elsewhere."""
+    klass.get = _route_recorder("GET")
+    klass.post = _route_recorder("POST")
+    # `middleware` and `on_event` take a kind ("http" / "startup"), not a path, so
+    # they stay identity — recording them as routes would be a lie.
+    for name in ("middleware", "on_event", "api_route"):
+        if not hasattr(klass, name):
+            setattr(klass, name, staticmethod(lambda *_a, **_k: (lambda fn: fn)))
+
+
+def _install_fastapi_stub() -> None:
+    """Install — or COMPLETE — the shared fastapi/pydantic stubs.
+
+    Additive, not all-or-nothing. ``tests/test_control_plane_ui.py`` installs a
+    fastapi stub of its own (it needs ``api_route`` and ``middleware``, which the
+    control plane does not), and whichever test module imports first owns
+    ``sys.modules``. This used to return early on finding one, which left the
+    control plane unimportable in that order because ``pydantic`` was never
+    installed — invisible only because ``test_control_plane_api`` sorts before
+    ``test_control_plane_ui``. Filling gaps instead means neither module cares who
+    got there first."""
     def _decorator(*_args, **_kwargs):
         return lambda fn: fn
 
     class FastAPI:
         def __init__(self, *args, **kwargs):
-            pass
+            self.routes: list[tuple[str, str]] = []
 
         on_event = staticmethod(_decorator)
-        get = staticmethod(_decorator)
-        post = staticmethod(_decorator)
+        get = _route_recorder("GET")
+        post = _route_recorder("POST")
 
     class Request:  # only referenced in a handler signature
         pass
 
-    fa.FastAPI = FastAPI
-    fa.Request = Request
+    fa = sys.modules.get("fastapi")
+    if fa is None:
+        fa = types.ModuleType("fastapi")
+        sys.modules["fastapi"] = fa
+    if not hasattr(fa, "FastAPI"):
+        fa.FastAPI = FastAPI
+    if not hasattr(fa, "Request"):
+        fa.Request = Request
+    _install_recording_routes(fa.FastAPI)
 
-    responses = types.ModuleType("fastapi.responses")
+    responses = sys.modules.get("fastapi.responses")
+    if responses is None:
+        responses = types.ModuleType("fastapi.responses")
 
     class _Resp:
         """Enough of a Starlette response to assert on: the handlers return these,
@@ -91,12 +140,12 @@ def _install_fastapi_stub() -> None:
             self.body = args[0] if args else None
             self.headers = dict(kwargs.get("headers") or {})
 
-    responses.JSONResponse = _Resp
-    responses.PlainTextResponse = _Resp
-    responses.StreamingResponse = _Resp
+    for name in ("JSONResponse", "PlainTextResponse", "StreamingResponse",
+                 "FileResponse", "Response"):
+        if not hasattr(responses, name):
+            setattr(responses, name, _Resp)
     fa.responses = responses
-
-    pydantic = types.ModuleType("pydantic")
+    sys.modules["fastapi.responses"] = responses
 
     class BaseModel:
         """Enough of pydantic for the control plane's request/response models to
@@ -113,11 +162,12 @@ def _install_fastapi_stub() -> None:
             for k, v in kwargs.items():
                 setattr(self, k, v)
 
-    pydantic.BaseModel = BaseModel
-
-    sys.modules["fastapi"] = fa
-    sys.modules["fastapi.responses"] = responses
-    sys.modules["pydantic"] = pydantic
+    pydantic = sys.modules.get("pydantic")
+    if pydantic is None:
+        pydantic = types.ModuleType("pydantic")
+        sys.modules["pydantic"] = pydantic
+    if not hasattr(pydantic, "BaseModel"):
+        pydantic.BaseModel = BaseModel
 
 
 def _load(name: str, relpath: str) -> types.ModuleType:

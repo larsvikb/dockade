@@ -19,6 +19,7 @@ import threading
 import time
 import types
 import unittest
+from typing import ClassVar
 from unittest import mock
 
 _TMP = tempfile.mkdtemp(prefix="dockade-cp-api-test-")
@@ -1194,6 +1195,107 @@ class SeedTests(_CPTestCase):
             self.assertEqual(cp._seed_if_empty(), 0)
         finally:
             cp.SEED_PATH = saved
+
+
+def _routes(fastapi_app) -> set:
+    """(method, path) pairs the stub recorded for one app — see tests/_loader.py.
+    Defaulting to empty rather than raising would let a stub regression read as
+    'no dangerous routes', so an app that recorded nothing is an error here."""
+    recorded = getattr(fastapi_app, "routes", None)
+    if not recorded:
+        raise AssertionError(
+            "the FastAPI stub recorded no routes — route recording is broken, so "
+            "the API-surface split below is not actually being asserted")
+    return set(recorded)
+
+
+class ApiSurfaceSplitTests(unittest.TestCase):
+    """The control plane serves two listeners, and WHICH one a handler lands on is
+    a security property rather than a layout choice.
+
+    The egress proxy has a network route to the authorize listener and none to the
+    management one. That topology is in docker-compose.yml, but it is only worth
+    anything if the listener the proxy CAN reach stays harmless — so the roster
+    below is asserted exactly, and adding to it has to be a deliberate act rather
+    than the side effect of putting a new endpoint next to an existing one.
+
+    The stakes are asymmetric: a management route missing from its app is a broken
+    UI, noticed in seconds. A management route that also appears on the authorize
+    app is a self-approval path for the agent, noticed never."""
+
+    #: Everything the proxy-facing listener may serve. /authorize answers a policy
+    #: question; /healthz is what the container's health gate probes.
+    AUTHORIZE_ROUTES: ClassVar[set] = {("POST", "/authorize"),
+                                       ("GET", "/healthz")}
+
+    def test_the_authorize_listener_serves_exactly_two_routes(self):
+        self.assertEqual(_routes(cp.authorize_app), self.AUTHORIZE_ROUTES)
+
+    def test_nothing_but_healthz_is_served_on_both(self):
+        shared = _routes(cp.app) & _routes(cp.authorize_app)
+        self.assertEqual(shared, {("GET", "/healthz")})
+
+    def test_the_endpoint_that_grants_egress_is_management_only(self):
+        # resolve is THE privileged action — it is what turns a held request into
+        # allowed egress. If the agent can reach this, the governance plane is a
+        # formality, so it gets its own assertion rather than relying on the
+        # roster test above to catch it by arithmetic.
+        resolve = [r for r in _routes(cp.app) if r[1].endswith("/resolve")]
+        self.assertEqual(len(resolve), 1, "resolve is not on the management app")
+        self.assertNotIn(resolve[0], _routes(cp.authorize_app))
+
+    def test_the_views_that_read_the_store_are_management_only(self):
+        # Not privileged, but they carry the record: pending hosts and clients,
+        # the audit history, the standing policy. A bypassed relay guard must not
+        # be able to read them either.
+        for path in ("/approvals", "/approvals/stream", "/api/audit",
+                     "/api/rules", "/api/config", "/status"):
+            self.assertIn(("GET", path), _routes(cp.app), path)
+            self.assertNotIn(("GET", path), _routes(cp.authorize_app), path)
+
+
+class ListenerSeparationTests(unittest.TestCase):
+    """``_assert_listeners_separated`` — the startup fail-closed for a config that
+    silently undoes the split. A wildcard management bind serves `resolve` on
+    authorize-net while every healthcheck and every page in the UI keeps working,
+    so nothing downstream can detect it."""
+
+    # S104 (bind-all-interfaces) is suppressed throughout this class rather than
+    # avoided: the wildcard IS the subject here. The default below mirrors the real
+    # authorize listener, which binds the wildcard on purpose, and the literals in
+    # the test are the spellings the guard has to reject.
+    def _check(self, *, manage_bind, manage_port=8090,
+               authorize_bind="0.0.0.0", authorize_port=8091):  # noqa: S104
+        with mock.patch.multiple(cp, MANAGE_BIND=manage_bind,
+                                 MANAGE_PORT=manage_port,
+                                 AUTHORIZE_BIND=authorize_bind,
+                                 AUTHORIZE_PORT=authorize_port):
+            cp._assert_listeners_separated()
+
+    def test_a_pinned_management_address_is_accepted(self):
+        self._check(manage_bind="172.31.0.2")
+
+    def test_every_wildcard_spelling_is_refused(self):
+        # All four reach every interface, authorize-net included. Listing them
+        # explicitly beats a substring test, which would also reject a legitimate
+        # address that merely contains one of these.
+        for spelling in ("0.0.0.0", "::", "*", ""):  # noqa: S104
+            with self.assertRaises(SystemExit, msg=spelling) as caught:
+                self._check(manage_bind=spelling)
+            self.assertIn("CONTROL_MANAGE_BIND", str(caught.exception), spelling)
+
+    def test_the_two_listeners_may_not_be_the_same_socket(self):
+        # Same address AND same port means one listener serving both apps' worth
+        # of surface to whoever can reach it.
+        with self.assertRaises(SystemExit):
+            self._check(manage_bind="172.31.0.2", manage_port=9000,
+                        authorize_bind="172.31.0.2", authorize_port=9000)
+
+    def test_the_same_address_on_different_ports_is_fine(self):
+        # This is a single-network deployment, not a wildcard: the split still
+        # holds because the ports differ and only one is routed to the proxy.
+        self._check(manage_bind="172.31.0.2", manage_port=8090,
+                    authorize_bind="172.31.0.2", authorize_port=8091)
 
 
 if __name__ == "__main__":

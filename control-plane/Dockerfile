@@ -28,5 +28,12 @@ COPY policies/egress-allowlist.txt /etc/control-plane/egress-allowlist.txt
 RUN mkdir -p /var/lib/control-plane && chown -R cp:cp /var/lib/control-plane
 
 USER cp
-EXPOSE 8090
-ENTRYPOINT ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8090"]
+# Two listeners, deliberately: 8090 is the management API (approvals, resolve,
+# the read-only views) and 8091 is the proxy-facing /authorize. They are split so
+# the egress proxy has a route to the second and none to the first — see the
+# module docstring in app.py and DESIGN.md.
+EXPOSE 8090 8091
+# `python app.py`, not `uvicorn app:app`: the process owns two uvicorn servers on
+# one event loop (app.main), because a held /authorize and the resolve that
+# releases it share in-process state and cannot be split across containers.
+ENTRYPOINT ["python", "app.py"]

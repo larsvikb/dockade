@@ -69,6 +69,29 @@ both cases is the conventional pairing, since other tools split the other way.
 No man page ships in the sandbox image, so the above is the measurement rather than a
 quote from the documentation.
 
+## Two `uvicorn.Server`s in one event loop still both stop on SIGTERM
+
+Running two servers from one `asyncio.gather` looks like it should break signal
+handling, and the reasoning is sound as far as it goes: `serve()` wraps itself in
+`capture_signals()`, which calls `signal.signal(sig, self.handle_exit)`, so the
+second server installs over the first and only the second's `handle_exit` runs.
+
+It works anyway, because `capture_signals()` is a context manager that cleans up
+after itself in two steps. On exit it restores the handler it displaced — the
+first server's — and then re-raises the signals it captured
+(`signal.raise_signal`, LIFO). The re-raised SIGTERM lands on the restored
+handler, so the first server shuts down too.
+
+Measured on uvicorn **0.34.0** (the pin in `control-plane/requirements.txt`), two
+servers on one loop, `kill -TERM` on the process: two `Finished server process`
+lines and the process gone in about 500 ms.
+
+The corollary is the part worth writing down: hand-rolled handlers added "to be
+safe" do nothing here. `loop.add_signal_handler` installs through asyncio's own
+`signal.signal` hook, which `capture_signals` then displaces, so a handler
+registered before `serve()` never fires. Removing one changed neither the timing
+nor the log — it was inert code that read as load-bearing.
+
 ## `toLocaleString()` renders one instant six ways
 
 One instant — `2026-08-06T22:30:05Z`, rendered in `Europe/Stockholm`:

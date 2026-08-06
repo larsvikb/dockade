@@ -313,21 +313,26 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	  exit 1
 	fi
 	for launcher in $(LAUNCHERS); do
-	  if grep -qE 'control-(ui-)?net' "$$launcher"; then
+	  if grep -qE 'control-(ui-)?net|authorize-net' "$$launcher"; then
 	    echo "  FAIL: $$launcher references a control-plane network — no sandbox tier"
-	    echo "        may EVER attach to control-net or control-ui-net (the agent must"
-	    echo "        have no route to the control plane)"
+	    echo "        may EVER attach to control-net, control-ui-net or authorize-net"
+	    echo "        (the agent must have no route to the control plane, and"
+	    echo "        authorize-net reaches it just as directly as the others)"
 	    exit 1
 	  fi
 	done
-	# The two security-load-bearing nets MUST each be internal: sandbox-net (the
-	# agent's only net) and control-net (the shared control path). Check each BY
-	# NAME — a bare count of 'internal: true' can't tell that the RIGHT nets are the
-	# internal ones (a future edit could flip sandbox-net to non-internal while some
-	# other net gained 'internal: true', and a count would still pass). awk isolates
-	# each top-level network block (2-space key .. next 2-space key) and asserts
-	# 'internal: true' appears inside it.
-	for net in sandbox-net control-net; do
+	# The security-load-bearing nets MUST each be internal: sandbox-net (the
+	# agent's only net) and the two control paths — control-net (management) and
+	# authorize-net (the proxy's route to /authorize, which reaches the control
+	# plane just as directly). Check each BY NAME — a bare count of 'internal:
+	# true' can't tell that the RIGHT nets are the internal ones (a future edit
+	# could flip sandbox-net to non-internal while some other net gained
+	# 'internal: true', and a count would still pass). awk isolates each top-level
+	# network block (2-space key .. next 2-space key) and asserts 'internal: true'
+	# appears inside it. tests/test_topology.py asserts the same property from the
+	# other side, along with who is attached to what; this stays because it is the
+	# one that runs in `make consistency` alongside the launcher check above.
+	for net in sandbox-net control-net authorize-net; do
 	  if ! awk -v net="$$net" '
 	        $$0 ~ "^  " net ":" {inb=1; next}
 	        inb && /^  [A-Za-z]/ {inb=0}
@@ -338,7 +343,7 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	    exit 1
 	  fi
 	done
-	echo "  ok — launcher never attaches the sandbox to control-net; sandbox-net and control-net both internal"
+	echo "  ok — no launcher attaches the sandbox to a control network; sandbox-net, control-net and authorize-net all internal"
 
 test: ## Run the governance unit tests (dependency-free; python -m unittest)
 	@echo "== unit tests (python -m unittest) =="
@@ -431,3 +436,41 @@ opencode: ## Launch a tier-2 (opencode + local LLM, no egress) sandbox (WORKSPAC
 
 boundary: ## Run boundary-check.sh in a running sandbox (SANDBOX=claude-sandbox|opencode-sandbox)
 	docker exec -it --user sandbox "$(SANDBOX)" boundary-check.sh
+
+split-check: ## Assert the running proxy reaches /authorize and NOT the management API
+	# The API-surface split, checked where it actually applies. boundary-check.sh
+	# cannot do this: it runs in the SANDBOX, which has no route to either listener
+	# and gets a relay-guard 403 long before reachability is in question. The claim
+	# here is about the PROXY's own routes, so it has to run in the proxy.
+	#
+	# Both directions, because either alone is satisfiable by a broken deployment:
+	# a proxy that reaches nothing passes the negative check while governance is
+	# down, and a proxy that reaches everything passes the positive one.
+	#
+	# python3 rather than curl — it is mitmproxy's own interpreter, so this adds no
+	# tooling to the choke-point image (same reasoning as that container's
+	# healthcheck in docker-compose.yml).
+	docker exec egress-proxy python3 -c "$$SPLIT_CHECK_PY"
+
+# Kept as a variable so the Python above stays readable and quoting stays sane.
+define SPLIT_CHECK_PY
+import socket, sys
+ok = True
+def probe(port, want, label):
+    global ok
+    s = socket.socket(); s.settimeout(3)
+    try:
+        s.connect(("control-plane", port)); reached = True
+    except OSError:
+        reached = False
+    finally:
+        s.close()
+    good = reached is want
+    ok = ok and good
+    print(("  PASS " if good else "  FAIL ") +
+          f"{label} (port {port}): reachable={reached}, expected={want}")
+probe(8091, True,  "authorize listener — the proxy must be able to ask")
+probe(8090, False, "management API — a route here is a self-approval path")
+sys.exit(0 if ok else 1)
+endef
+export SPLIT_CHECK_PY

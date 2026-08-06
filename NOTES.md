@@ -13,6 +13,33 @@ dated and cannot drift.
 Nothing here is load-bearing for a change to this repo. It is here so a number never has
 to be re-measured and a dead end never has to be re-explored.
 
+## `curl` reads `http_proxy` in lower case only
+
+Same host, same shell, curl 8.14.1. `example.com` carries a **block** rule, so reaching
+the proxy yields a fast 403 and not reaching it yields a DNS failure — which
+discriminates cleanly without raising a hold:
+
+| proxy specified via | reached the proxy? | result |
+|---|---|---|
+| `HTTP_PROXY` (upper) | **no** — resolved the target itself | `Could not resolve host`, ~1 ms |
+| `http_proxy` (lower) | yes — `GET http://example.com/` | `403` from the block rule |
+| `HTTPS_PROXY` (upper) | yes — `CONNECT example.com:443` | `403` from the block rule |
+| `--proxy` (explicit) | yes | `403` from the block rule |
+
+The giveaway is that curl **was** doing proxy-environment resolution in the first row —
+it printed `Uses proxy env variable NO_PROXY == '…'` — and then resolved the target
+anyway. So it consults the proxy env vars and declines to use the uppercase
+`HTTP_PROXY` specifically. `HTTPS_PROXY` and `NO_PROXY` are honoured in either case.
+
+**It is a security mitigation, so it will not change.** Under CGI a client-supplied
+`Proxy:` request header arrives in the environment as `HTTP_PROXY`; honouring it would
+let a remote caller redirect a server's outbound HTTP through a proxy of their choosing
+(httpoxy, CVE-2016-5385). Setting the lowercase variable is the only fix — and setting
+both cases is the conventional pairing, since other tools split the other way.
+
+No man page ships in the sandbox image, so the above is the measurement rather than a
+quote from the documentation.
+
 ## `toLocaleString()` renders one instant six ways
 
 One instant — `2026-08-06T22:30:05Z`, rendered in `Europe/Stockholm`:

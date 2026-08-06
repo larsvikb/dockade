@@ -421,10 +421,15 @@ sandbox** (see the Layer-2 result at the end of this subsection), so we are
 committed to (a). Documented points, with the design consequence of each:
 
 - **Standard proxy env vars are honored.** Claude Code reads `HTTP_PROXY`,
-  `HTTPS_PROXY`, and `NO_PROXY` (docs use **uppercase** — use uppercase),
-  Node-native, **read once at startup**. Basic auth via `user:pass@` in the URL.
-  **No SOCKS.** → *Approach (a) is viable: a plain forward proxy injected via
-  `HTTPS_PROXY`, no transparent 443-redirect needed.*
+  `HTTPS_PROXY`, and `NO_PROXY` (docs use **uppercase**), Node-native, **read once at
+  startup**. Basic auth via `user:pass@` in the URL. **No SOCKS.** → *Approach (a) is
+  viable: a plain forward proxy injected via `HTTPS_PROXY`, no transparent
+  443-redirect needed.* The launcher nevertheless sets **both cases**, because the
+  agent is not the only thing in the image making requests: `curl` reads `http_proxy`
+  in **lower case only** — a deliberate httpoxy mitigation, not an oversight — so with
+  uppercase alone, plaintext HTTP bypassed the governed proxy entirely and died at
+  DNS, unheld and unaudited. `make consistency` asserts the pairing; `NOTES.md` has
+  the measurement.
 - **WebFetch inherits the same proxy.** The docs describe no separate mechanism,
   so the client-side WebFetch uses the same env vars — since **confirmed
   in-sandbox**: the Layer-2 result below shows WebFetch's allow/deny CONNECT

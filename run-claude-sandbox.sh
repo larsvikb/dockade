@@ -110,10 +110,32 @@ if [[ "$EGRESS_PROXY_IP" =~ ^[0-9.]+$ ]]; then
         "Governed egress is unavailable, and this tier's traffic all flows through it."
 
     PROXY_URL="http://${EGRESS_PROXY_NAME}:${EGRESS_PROXY_PORT}"
+    NO_PROXY_LIST="localhost,127.0.0.1,::1,${EGRESS_PROXY_NAME}"
+    # BOTH CASES of each, and the lowercase ones are not redundant styling.
+    #
+    # curl reads `http_proxy` in LOWER CASE ONLY, while honouring HTTPS_PROXY and
+    # NO_PROXY in either case. That is deliberate, not an oversight: under CGI a
+    # client-supplied `Proxy:` request header arrives in the environment as
+    # HTTP_PROXY, so honouring it would let a remote caller redirect a server's
+    # outbound HTTP through a proxy of their choosing (httpoxy, CVE-2016-5385).
+    #
+    # With only the uppercase set, `curl http://...` in the sandbox did not reach the
+    # governed proxy at all: it resolved the target itself and died at DNS in about a
+    # millisecond. Containment held — sandbox-net is internal, so there was nowhere
+    # to go — but the agent got "Could not resolve host" instead of a hold it could
+    # have had approved, and the attempt reached no audit log, because it never
+    # reached the control plane. HTTPS was unaffected, which is why it went unnoticed
+    # until a decisions-table row showed a plaintext request that had never arrived.
+    #
+    # Setting both cases is the conventional pairing and covers other tools with the
+    # same rule. `make consistency` asserts the pairing so it cannot drift back.
     PROXY_ENV_ARGS=(
         -e "HTTPS_PROXY=$PROXY_URL"
         -e "HTTP_PROXY=$PROXY_URL"
-        -e "NO_PROXY=localhost,127.0.0.1,::1,${EGRESS_PROXY_NAME}"
+        -e "NO_PROXY=$NO_PROXY_LIST"
+        -e "https_proxy=$PROXY_URL"
+        -e "http_proxy=$PROXY_URL"
+        -e "no_proxy=$NO_PROXY_LIST"
         -e "EGRESS_PROXY_IP=$EGRESS_PROXY_IP"
         -e "EGRESS_PROXY_PORT=$EGRESS_PROXY_PORT"
     )

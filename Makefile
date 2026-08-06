@@ -218,6 +218,44 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	else
 	  echo "  SKIP (not a git checkout — nothing to read the index from)"
 	fi
+	echo "== every tracked source file carries an SPDX header =="
+	# CONTRIBUTING.md tells contributors to add one, and a documented convention with
+	# nothing enforcing it is the kind that holds at 100% until it quietly does not.
+	# The reason is concrete: `SPDX-License-Identifier` in the file is what lets a
+	# licence scanner answer correctly without parsing LICENSE.
+	#
+	# SOURCE only, and the boundary is not fussiness — it is what can carry a comment
+	# and what a scanner cares about. JSON has no comment syntax at all, so
+	# user-settings.json and opencode.json could not comply if asked. Markdown, the
+	# linter configs, requirements.txt, the policy allowlist and the baked dotfiles are
+	# settings and data rather than works, and none of them carries a header today; a
+	# guard demanding one would be inventing a convention rather than holding an
+	# existing one. The glob below is exactly the set where it IS held.
+	#
+	# Read from the INDEX (git ls-files) rather than a find, so a new file is covered
+	# the moment it is staged and untracked scratch files never fail the gate. The
+	# header must be in the FIRST THREE lines: below that it is prose, not a header,
+	# and tools that look for it stop reading.
+	if git rev-parse --git-dir >/dev/null 2>&1; then
+	  spdx_files=$$(git ls-files '*.py' '*.sh' '*.js' '*.html' \
+	                             'Makefile' 'docker-compose.yml' \
+	                             '*Dockerfile' '.github/workflows/*.yml')
+	  if [ -z "$$spdx_files" ]; then
+	    echo "  FAIL: the SPDX glob matched nothing — it would check silently. Renamed?"
+	    exit 1
+	  fi
+	  missing=0
+	  for f in $$spdx_files; do
+	    if ! head -3 "$$f" | grep -q 'SPDX-License-Identifier'; then
+	      echo "  FAIL: $$f has no SPDX-License-Identifier in its first 3 lines"
+	      missing=1
+	    fi
+	  done
+	  [ "$$missing" = 0 ] || { echo "        add: SPDX-License-Identifier: Apache-2.0"; exit 1; }
+	  echo "  ok — $$(echo "$$spdx_files" | wc -w) source files"
+	else
+	  echo "  SKIP (not a git checkout — nothing to read the index from)"
+	fi
 	echo "== referenced files exist (Dockerfile COPY / entrypoint) =="
 	for f in $(REFFILES); do
 	  if [ -f "$$f" ]; then echo "  ok $$f"; else echo "  MISSING $$f"; exit 1; fi

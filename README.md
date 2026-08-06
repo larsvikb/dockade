@@ -175,6 +175,7 @@ restarts and volume wipes; it does not start Claude in yolo automatically.
 ```
 dockade/
   README.md                 # this file
+  CONTRIBUTING.md           # how to build, test and submit a change
   CLAUDE.md                 # invariants + conventions for working in the repo
   DESIGN.md                 # architecture, topology, and rationale (read this)
   Makefile                  # task entry points (make claude / make opencode / make check)
@@ -260,6 +261,8 @@ exposed through governed data-plane services. Next steps toward it:
   conventions for working in this repo.
 - [`SECURITY.md`](SECURITY.md) — how to report a boundary bypass, and — worth
   reading first — which weaknesses are already known and consciously accepted.
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — how to run the gate, what the tests and
+  commit messages are expected to look like, and the licensing position (no CLA).
 
 ## License
 

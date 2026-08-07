@@ -307,6 +307,26 @@ console.log(JSON.stringify({
         row_marked: m.auditRow({ ts: 1e9, host: "a", fail_closed: true }).failClosed,
         row_plain: m.auditRow({ ts: 1e9, host: "a" }).failClosed,
       },
+      coverage: {
+        // rows (with grouped counts), and the total the backend reports.
+        truncated: m.coverageSummary([{ n: 12 }, { n: 3 }], 1200),
+        complete: m.coverageSummary([{ n: 12 }, { n: 3 }], 15),
+        // A total BELOW what is shown is nonsense; say nothing rather than a
+        // negative remainder.
+        impossible: m.coverageSummary([{ n: 12 }], 3),
+        no_total: m.coverageSummary([{ n: 12 }], undefined),
+        junk_total: m.coverageSummary([{ n: 5 }], "lots"),
+        empty: m.coverageSummary([], 0),
+        counts_decisions: m.coverageSummary([{ n: 40 }], 900).shown,
+      },
+      announce: {
+        nothing: m.pendingAnnouncement([], 0),
+        no_list: m.pendingAnnouncement(null, 0),
+        one: m.pendingAnnouncement([{ host: "github.com" }], 1),
+        one_of_many: m.pendingAnnouncement([{ host: "github.com" }], 3),
+        several: m.pendingAnnouncement([{ host: "a" }, { host: "b" }], 5),
+        nameless: m.pendingAnnouncement([{}], 1),
+      },
       audit_status: {
         // rowCount, failed, loaded
         first_load_in_flight: m.auditStatus(0, false, false),
@@ -892,6 +912,63 @@ class PageScriptTests(unittest.TestCase):
         self.assertIs(self.probe["saturation"]["outage"]["row_marked"], True)
         self.assertIs(self.probe["saturation"]["outage"]["row_plain"], False)
 
+    def test_the_list_says_when_it_is_a_window(self):
+        """Forty rows silently stood for the whole record. Grouping made that worse,
+        not better: counts on the rows read as an explanation of the volume, so the
+        list looks complete precisely when it is least so."""
+        c = self.probe["saturation"]["coverage"]["truncated"]
+        self.assertTrue(c["show"])
+        self.assertIn("15", c["text"])
+        self.assertIn("1,200", c["text"])
+
+    def test_coverage_compares_decisions_with_decisions(self):
+        """Both numbers are RAW decisions. Comparing rows against decisions would be
+        a ratio of unlike quantities — "2 of 1,200" for a list accounting for fifteen
+        of them — and would read as truncation even where there was none."""
+        self.assertEqual(
+            self.probe["saturation"]["coverage"]["counts_decisions"], 40)
+
+    def test_the_list_stays_quiet_when_it_shows_everything(self):
+        """The ordinary state on a quiet system. A permanent "showing 15 of 15" is
+        furniture, and furniture is what stops a real message being read."""
+        c = self.probe["saturation"]["coverage"]
+        for case in ("complete", "impossible", "empty"):
+            with self.subTest(case=case):
+                self.assertFalse(c[case]["show"])
+                self.assertEqual(c[case]["text"], "")
+
+    def test_a_missing_total_makes_no_claim(self):
+        """A backend that does not send the field must not produce "0 of 0". The
+        frontend also accepts a bare array from such a backend, so this is the state
+        that pairs with it."""
+        c = self.probe["saturation"]["coverage"]
+        for case in ("no_total", "junk_total"):
+            with self.subTest(case=case):
+                self.assertFalse(c[case]["show"])
+                self.assertIsNone(c[case]["total"])
+
+    def test_an_arriving_approval_is_announced_with_its_host(self):
+        """The host IS the decision. "One approval pending" says something is
+        waiting; it does not say whether the agent wants the package registry or an
+        address nobody recognises, which is the question being asked."""
+        a = self.probe["saturation"]["announce"]
+        self.assertIn("github.com", a["one"])
+        self.assertIn("github.com", a["one_of_many"])
+        self.assertIn("3 pending", a["one_of_many"])
+        self.assertIn("2 new approvals", a["several"])
+
+    def test_nothing_is_announced_when_nothing_arrived(self):
+        """ARRIVALS only. A live region that spoke on every push would read the
+        countdown aloud once a second for the life of every hold — which is why this
+        is a separate element from the card list rather than an attribute on it."""
+        a = self.probe["saturation"]["announce"]
+        self.assertEqual(a["nothing"], "")
+        self.assertEqual(a["no_list"], "")
+
+    def test_an_unnamed_host_still_announces(self):
+        # Degrades to a sentence rather than to "Approval needed for undefined."
+        self.assertIn("unnamed host", self.probe["saturation"]["announce"]["nameless"])
+
     def test_a_repeated_decision_says_how_many_and_over_what_span(self):
         """`/api/audit` groups identical decisions, so a row can stand for many. The
         count without the span is not enough: 47x cannot distinguish a burst from a
@@ -1103,6 +1180,54 @@ class DecisionsTableSourceTests(unittest.TestCase):
         self.assertIsNotNone(section, "the decisions section was renamed")
         self.assertIn("<th>client</th>", section.group(0),
                       "the column exists in the body but has no header")
+
+
+class PollGatingSourceTests(unittest.TestCase):
+    """The poll wiring lives at the bottom of `start()` and cannot be unit-tested, so
+    the properties that would fail silently are asserted against the source.
+
+    Silently is the operative word for all three: a poller that stops in a hidden tab
+    and never resumes looks exactly like a quiet system; an ungated poller costs a
+    COUNT(*) every four seconds forever and shows no symptom at all; and a gated SSE
+    stream would drop approval arrivals while a hold burns its ~120s fuse, surfacing
+    only as a request the operator never saw and the agent was denied for."""
+
+    def setUp(self):
+        self.src = APP_JS.read_text()
+
+    def test_both_polls_are_gated_on_tab_visibility(self):
+        for poll in ("refreshAudit", "refreshRules"):
+            with self.subTest(poll=poll):
+                self.assertRegex(
+                    self.src,
+                    r"setInterval\(\(\) => \{ if \(visible\(\)\) " + poll + r"\(\); \}",
+                    f"{poll} must not poll a tab nobody is looking at")
+
+    def test_the_approvals_stream_is_not_gated(self):
+        """Deliberately the exception. A hold blocks the agent and default-denies when
+        its window elapses, so arrivals must keep landing whether or not the tab is in
+        front — the title prefix is how they get noticed. Asserted because "gate the
+        pollers" reads like advice that ought to apply to everything."""
+        self.assertRegex(self.src, r"\n  connect\(\);",
+                         "the stream is no longer started unconditionally")
+        self.assertNotRegex(self.src, r"if \(visible\(\)\) connect\(\)")
+
+    def test_returning_to_the_tab_refreshes_immediately(self):
+        """Without this the operator faces up to four seconds of stale data at exactly
+        the moment their attention returns — and unlabelled stale, because the
+        staleness wording is for a FAILED poll, not a skipped one."""
+        self.assertRegex(
+            self.src,
+            # [\s\S] not . — the handler spans lines and assertRegex does not
+            # pass re.DOTALL.
+            r'addEventListener\("visibilitychange"[\s\S]*?'
+            r"if \(visible\(\)\) \{ refreshAudit\(\); refreshRules\(\); \}")
+
+    def test_an_unknown_visibility_state_keeps_polling(self):
+        # Fail toward the OLD behaviour: a host without the API must not silently stop
+        # updating the page.
+        self.assertRegex(
+            self.src, r'visible = \(\) => document\.visibilityState !== "hidden"')
 
 
 class PolicyTableSourceTests(unittest.TestCase):

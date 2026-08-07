@@ -48,6 +48,11 @@
      from the running UI. */
   [hidden] { display: none !important; }
   .empty { color: var(--dim); font-style: italic; padding: 8px 0; }
+  /* Available to assistive technology, absent from the visual layout. NOT `hidden`
+     and not `display: none` — either removes it from the accessibility tree too,
+     which would make a live region that announces nothing. */
+  .sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+    overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
   /* A stale list and an empty one are different claims, so they do not look alike.
      `warn` is the one that says the data on screen may no longer be true. */
   .empty.warn { color: var(--hold); font-style: normal; }
@@ -244,6 +249,14 @@
       </div>
       <button type="button" id="sat-dismiss" class="sat-dismiss">Dismiss</button>
     </div>
+    <!-- Arrivals, for a screen reader. A live region on `#pending` itself is the
+         obvious placement and the wrong one: every card carries a countdown that
+         rewrites once a second, so the region would read a timer aloud continuously
+         for the life of the hold instead of announcing the request. This element
+         holds one sentence, written only when a card ARRIVES — see
+         pendingAnnouncement in app.js. `role=status` is implicitly polite, so it
+         waits for a pause rather than interrupting an operator mid-click. -->
+    <div id="pending-live" class="sr-only" role="status"></div>
     <div id="pending"></div>
     <div class="empty" id="pending-empty">none</div>
   </section>
@@ -265,6 +278,12 @@
          `conn` reports the SSE stream, while this table is filled by a separate poll
          that can be failing while the stream is perfectly healthy. -->
     <div class="empty" id="audit-empty" hidden></div>
+    <!-- What the list is a window onto. BELOW the table, unlike the outage banner
+         above it: that one changes how the rows should be read and must arrive
+         first, whereas this one answers "was there more?", which is a question you
+         only have once you have reached the bottom. Silent when the window covers
+         everything — see coverageSummary. -->
+    <div class="empty" id="audit-coverage" hidden></div>
   </section>
 
   <section id="view-policy" role="tabpanel" aria-labelledby="tab-policy" hidden>

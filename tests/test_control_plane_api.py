@@ -475,6 +475,15 @@ class PersistConflictTests(_CPTestCase):
         self.assertEqual(options[".example.com"], "allow")
 
 
+def _served(**kw):
+    """The grouped rows ``/api/audit`` serves.
+
+    The endpoint returns ``{"rows": [...], "total": n}`` — the total being what the
+    view is a window onto. These tests are about the rows unless they say otherwise,
+    so the unwrapping lives here rather than in forty assertions."""
+    return cp.api_audit(**kw)["rows"]
+
+
 class AuditViewTests(_CPTestCase):
     """``/api/audit`` backs the decisions table, and had no tests at all — which is
     how it went this long selecting ``stage`` that nothing rendered while omitting
@@ -509,7 +518,7 @@ class AuditViewTests(_CPTestCase):
              "reason": "blocked by rule (a.example)"},
             {"host": "b.example", "decision": "deny", "ts": 1.0,
              "reason": "control-plane unreachable, fail-closed (timed out)"})
-        got = {r["host"]: r["fail_closed"] for r in cp.api_audit()}
+        got = {r["host"]: r["fail_closed"] for r in _served()}
         self.assertEqual(got, {"a.example": False, "b.example": True})
 
     def test_the_marker_matches_what_the_proxy_actually_writes(self):
@@ -534,7 +543,7 @@ class AuditViewTests(_CPTestCase):
         # too — a host can legitimately be named after the control plane.
         self._rows({"host": "c.example", "decision": "deny",
                     "reason": "blocked by rule (control-plane-mirror.example)"})
-        self.assertFalse(cp.api_audit()[0]["fail_closed"])
+        self.assertFalse(_served()[0]["fail_closed"])
 
     def test_the_marker_must_anchor_at_the_start_of_the_reason(self):
         # A substring search would also match a reason that merely MENTIONS the
@@ -548,14 +557,14 @@ class AuditViewTests(_CPTestCase):
         self._rows({"host": "d.example", "decision": "deny",
                     "reason": "blocked by rule, recorded while "
                               "control-plane unreachable"})
-        self.assertFalse(cp.api_audit()[0]["fail_closed"])
+        self.assertFalse(_served()[0]["fail_closed"])
 
     def test_a_row_says_whose_request_it_was(self):
         # The gap this closes. One control plane serves every sandbox, so a row that
         # records "egress to pypi.org was allowed" without saying which agent asked
         # is not answering the question an audit trail exists for.
         self._rows({"host": "pypi.org", "client": "172.30.0.7", "decision": "allow"})
-        self.assertEqual(cp.api_audit()[0]["client"], "172.30.0.7")
+        self.assertEqual(_served()[0]["client"], "172.30.0.7")
 
     def test_the_served_columns_are_pinned(self):
         # Named, so adding or dropping one is a deliberate act with a failing test
@@ -567,7 +576,7 @@ class AuditViewTests(_CPTestCase):
         # difference and this set is the contract.
         self._rows({"host": "a.example"})
         self.assertEqual(
-            set(cp.api_audit()[0]),
+            set(_served()[0]),
             {"ts", "decision", "stage", "host", "client", "reason",
              "n", "first_ts", "fail_closed"})
 
@@ -577,29 +586,53 @@ class AuditViewTests(_CPTestCase):
         # and out of this response on purpose.
         self._rows({"host": "a.example", "url": "https://a.example/" + "x" * 4000,
                     "method": "GET", "port": 443, "proto": "connect"})
-        served = cp.api_audit()[0]
+        served = _served()[0]
         for field in ("url", "method", "port", "proto"):
             self.assertNotIn(field, served)
 
     def test_newest_first(self):
         self._rows({"host": "old.example", "ts": 100.0},
                    {"host": "new.example", "ts": 200.0})
-        self.assertEqual([r["host"] for r in cp.api_audit()],
+        self.assertEqual([r["host"] for r in _served()],
                          ["new.example", "old.example"])
 
     def test_the_limit_is_clamped_at_both_ends(self):
         self._rows(*[{"host": f"h{i}.example", "ts": float(i)} for i in range(12)])
-        self.assertEqual(len(cp.api_audit(limit=5)), 5)
+        self.assertEqual(len(_served(limit=5)), 5)
         # Zero or negative would serve nothing and read as "no decisions"; the
         # ceiling stops one request dragging the whole unbounded table across.
-        self.assertEqual(len(cp.api_audit(limit=0)), 1)
-        self.assertEqual(len(cp.api_audit(limit=-3)), 1)
-        self.assertEqual(len(cp.api_audit(limit=100_000)), 12)
+        self.assertEqual(len(_served(limit=0)), 1)
+        self.assertEqual(len(_served(limit=-3)), 1)
+        self.assertEqual(len(_served(limit=100_000)), 12)
 
     def test_an_empty_table_is_an_empty_list_not_an_error(self):
         # The frontend distinguishes "nothing yet" from "the poll failed", which only
         # works if this reports the first as success.
-        self.assertEqual(cp.api_audit(), [])
+        self.assertEqual(_served(), [])
+        self.assertEqual(cp.api_audit()["total"], 0)
+
+    def test_the_total_counts_decisions_not_rows(self):
+        """The list is a window and used to say so nowhere. Grouping made that worse
+        rather than better: forty rows carrying counts read like a complete picture,
+        because the counts appear to explain the volume away.
+
+        The total is RAW decisions, so it can be compared against the sum of the
+        counts on screen — a total of groups would be a second number that agrees
+        with the first and tells the reader nothing."""
+        self._rows(*[{"host": "chatty.example", "decision": "deny",
+                      "ts": 1000.0 + i} for i in range(30)])
+        served = cp.api_audit()
+        self.assertEqual(len(served["rows"]), 1)     # one group
+        self.assertEqual(served["rows"][0]["n"], 30)
+        self.assertEqual(served["total"], 30)        # thirty decisions
+
+    def test_the_total_is_not_bounded_by_the_display_limit(self):
+        # The limit shapes what is SHOWN; the total exists precisely to say how much
+        # was not. A total that moved with the limit would always equal the rows and
+        # could never report truncation.
+        self._rows(*[{"host": f"h{i}.example", "ts": float(i)} for i in range(12)])
+        self.assertEqual(len(_served(limit=3)), 3)
+        self.assertEqual(cp.api_audit(limit=3)["total"], 12)
 
     def test_identical_decisions_collapse_to_one_row(self):
         """The case that forced this: a client retrying a host that a standing rule
@@ -609,7 +642,7 @@ class AuditViewTests(_CPTestCase):
         self._rows(*[{"host": "chatty.example", "decision": "deny", "stage": "connect",
                       "client": "172.30.0.2", "reason": "blocked by rule",
                       "ts": 1000.0 + 60 * i} for i in range(30)])
-        served = cp.api_audit()
+        served = _served()
         self.assertEqual(len(served), 1)
         self.assertEqual(served[0]["n"], 30)
         # The LATEST occurrence is the row's instant; the span's start is separate,
@@ -626,15 +659,15 @@ class AuditViewTests(_CPTestCase):
             rows.append({"host": "chatty.example", "decision": "deny", "ts": 100.0 + 2 * i})
             rows.append({"host": "api.example", "decision": "allow", "ts": 101.0 + 2 * i})
         self._rows(*rows)
-        served = cp.api_audit()
+        served = _served()
         self.assertEqual({r["host"]: r["n"] for r in served},
                          {"chatty.example": 10, "api.example": 10})
 
     def test_a_single_decision_reports_itself_as_one(self):
         # The ordinary row. n==1 is what the frontend keys "render exactly as before".
         self._rows({"host": "a.example", "ts": 5.0})
-        self.assertEqual(cp.api_audit()[0]["n"], 1)
-        self.assertEqual(cp.api_audit()[0]["first_ts"], 5.0)
+        self.assertEqual(_served()[0]["n"], 1)
+        self.assertEqual(_served()[0]["first_ts"], 5.0)
 
     def test_the_group_key_is_exactly_what_is_displayed(self):
         """Rows that differ ONLY in a served field must stay apart, and rows that
@@ -647,26 +680,26 @@ class AuditViewTests(_CPTestCase):
                              ("reason", "no matching rule")):
             with self.subTest(field=field):
                 self._rows(base, {**base, field: other})
-                self.assertEqual(len(cp.api_audit()), 2)
+                self.assertEqual(len(_served()), 2)
         # port/proto/method/url are recorded but never shown, so keying on them would
         # split one group into rows that render identically.
         self._rows({**base, "port": 443, "proto": "connect", "method": "GET"},
                    {**base, "port": 8443, "proto": "https", "method": "POST"})
-        self.assertEqual(len(cp.api_audit()), 1)
+        self.assertEqual(len(_served()), 1)
 
     def test_one_sandbox_never_absorbs_another(self):
         # Attribution is the whole reason the client column exists; folding two
         # sandboxes into one row would quietly undo it.
         self._rows({"host": "a.example", "client": "172.30.0.2"},
                    {"host": "a.example", "client": "172.30.0.3"})
-        self.assertEqual({r["client"] for r in cp.api_audit()},
+        self.assertEqual({r["client"] for r in _served()},
                          {"172.30.0.2", "172.30.0.3"})
 
     def test_groups_are_ordered_by_their_latest_occurrence(self):
         self._rows({"host": "chatty.example", "ts": 10.0},
                    {"host": "chatty.example", "ts": 20.0},
                    {"host": "quiet.example", "ts": 15.0})
-        self.assertEqual([r["host"] for r in cp.api_audit()],
+        self.assertEqual([r["host"] for r in _served()],
                          ["chatty.example", "quiet.example"])
 
     def test_the_scan_bounds_the_rows_read_and_the_limit_bounds_the_groups_served(self):
@@ -686,7 +719,7 @@ class AuditViewTests(_CPTestCase):
                           for i in range(30)]
                          + [{"host": "chatty.example", "ts": 30.0 + i}
                             for i in range(10)]))
-            served = cp.api_audit(limit=50)
+            served = _served(limit=50)
             self.assertEqual(len(served), 1)
             self.assertEqual(served[0]["host"], "chatty.example")
             # The count is over the SCAN WINDOW, which is the honest claim: this view
@@ -703,7 +736,7 @@ class AuditViewTests(_CPTestCase):
         try:
             self._rows(*[{"host": f"h{i}.example", "ts": float(i)}
                          for i in range(20)])
-            self.assertEqual([r["host"] for r in cp.api_audit()],
+            self.assertEqual([r["host"] for r in _served()],
                              [f"h{i}.example" for i in range(19, 14, -1)])
             with cp._connect() as conn:
                 self.assertEqual(

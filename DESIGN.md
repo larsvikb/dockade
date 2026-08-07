@@ -2154,11 +2154,13 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
   - **Opt-in desktop notification.** `http://localhost` is a secure context, so the
     Notification API is available; with a ~120s fuse and a page nobody watches, this is
     the honest fix for the problem the `(n)` title prefix only mitigates.
-  - Smaller: `_STRIP_REQ` should also strip `content-length` / `transfer-encoding` /
-    `connection` / `expect`; no `aria-live` on the pending list; both pollers run at 4s
-    even in a hidden tab — and gating them on tab visibility is where the decisions
-    view should also gain "showing N of M recorded decisions", since the total needs
-    the same gating to avoid a `COUNT(*)` every four seconds forever.
+  - *(The smaller items filed here — hop-by-hop header stripping on the request side,
+    an announcement for arriving approvals, visibility-gated pollers, and "showing N
+    of M recorded decisions" — are **now built**. Two of them changed shape on
+    contact: a live region belongs on a separate element rather than on the card list,
+    whose countdowns rewrite once a second; and the coverage line compares decisions
+    with decisions, since the view is grouped and a rows-versus-decisions ratio reads
+    as truncation even when nothing was truncated.)*
 - Normalize hosts consistently across the control plane. The proxy's relay guard
   strips a trailing FQDN dot but `_decide` / `_match` only lowercase, so `evil.com.`
   misses a persisted **block** rule and lands in a hold instead — fail-safe, but it

@@ -1260,7 +1260,15 @@ def api_audit(limit: int = 50) -> list[dict]:
             "FROM (SELECT * FROM audit ORDER BY ts DESC LIMIT ?) "
             "GROUP BY decision, stage, host, client, reason "
             "ORDER BY ts DESC LIMIT ?", (AUDIT_GROUP_SCAN, limit)).fetchall()
-    return [_audit_view(r) for r in rows]
+        # What the list is a WINDOW ONTO. Without it the view silently truncates:
+        # forty rows look like the whole record, and grouping made that worse rather
+        # than better, because the counts on each row appear to explain the volume
+        # away. The cost is a COUNT(*) per poll, which is why the frontend stops
+        # polling in a hidden tab — that gating is what makes this affordable instead
+        # of a scan every four seconds for as long as the page is open. Rides the
+        # audit_ts index, so it is a small scan rather than a table read.
+        total = conn.execute("SELECT COUNT(*) FROM audit").fetchone()[0]
+    return {"rows": [_audit_view(r) for r in rows], "total": total}
 
 
 def _audit_view(row) -> dict:

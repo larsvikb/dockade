@@ -350,6 +350,69 @@ function repeatCount(r) {
   return Number.isFinite(n) && n > 1 ? Math.floor(n) : 1;
 }
 
+// What a screen reader should hear when the pending queue changes.
+//
+// Announced from a SEPARATE element rather than by making the card list a live
+// region, which is the obvious move and would be actively hostile: every card holds
+// a countdown that rewrites once a second, so the region would read a timer aloud
+// instead of the arrival, continuously, for the life of the hold. `aria-relevant`
+// could suppress some of that, but only by relying on how each screen reader
+// classifies a text replacement inside an existing node.
+//
+// ARRIVALS only. A departure is either the operator's own click, or an expiry the
+// card already announces in place and keeps on screen long enough to read (DWELL_MS).
+//
+// The host is in the message because the host IS the decision. "One approval
+// pending" says something is waiting; it does not say whether the agent is asking
+// for the package registry or for an address nobody recognises, which is the whole
+// question the operator is being woken up to answer.
+//
+// KNOWN LIMIT: identical consecutive text is not re-announced by a live region, so
+// two arrivals for the same host with the same total would speak once. The total
+// differs in almost every real case, and the alternative — salting the string to
+// force a change — makes the region announce noise on purpose.
+function pendingAnnouncement(added, total) {
+  if (!added || !added.length) return "";
+  if (added.length === 1) {
+    const host = (added[0] && added[0].host) || "an unnamed host";
+    return total > 1
+      ? `Approval needed for ${host}. ${total} pending.`
+      : `Approval needed for ${host}.`;
+  }
+  return `${added.length} new approvals needed. ${total} pending.`;
+}
+
+// What the decisions list is a WINDOW ONTO, in words.
+//
+// The list shows the most recent groups and has always silently truncated. Grouping
+// made that harder to notice rather than easier: forty rows carrying "47x" read like
+// a complete account, because the counts appear to explain the volume away.
+//
+// Compares raw decisions with raw decisions — the folded count on screen against the
+// total recorded — so the two numbers are the same kind of thing. Rows-versus-
+// decisions would be a ratio of unlike quantities and would read as truncation even
+// when nothing was truncated.
+//
+// Silent when the window covers everything, which is the ordinary state on a quiet
+// system and the state where a permanent "showing 12 of 12" is pure furniture.
+function coverageSummary(rows, total) {
+  const shown = (rows || []).reduce((n, r) => n + repeatCount(r), 0);
+  const t = Number(total);
+  // An absent or nonsensical total says nothing rather than guessing. A backend
+  // without the field must not make this claim "0 of 0".
+  if (!Number.isFinite(t) || t <= shown) {
+    return { show: false, level: "none", text: "", shown, total: Number.isFinite(t) ? t : null };
+  }
+  return {
+    show: true,
+    level: "none",
+    shown,
+    total: t,
+    text: `Showing the ${shown.toLocaleString()} most recent of `
+        + `${t.toLocaleString()} recorded decisions.`,
+  };
+}
+
 // What the decisions list should say about a run of FAIL-CLOSED denials, over and
 // above marking the rows themselves.
 //
@@ -629,6 +692,7 @@ function start() {
   // ── pending approvals, keyed by approval id ───────────────────────────────
   const pendingEl = document.getElementById("pending");
   const emptyEl = document.getElementById("pending-empty");
+  const pendingLive = document.getElementById("pending-live");
   // id -> entry (see buildCard for the shape)
   //   state: pending → resolving → resolved
   //          pending → confirming → resolving → resolved   (the *_persist actions)
@@ -1039,6 +1103,10 @@ function start() {
   function renderPending(list) {
     pendingCount = list.length;
     const { add, gone } = diffPending([...cards.keys()], list);
+    // Before the DOM work, so the announcement reflects what is arriving rather than
+    // racing the cards that carry it.
+    const say = pendingAnnouncement(add, list.length);
+    if (say) pendingLive.textContent = say;
     for (const a of add) {
       const entry = buildCard(a);
       cards.set(a.id, entry);
@@ -1140,6 +1208,12 @@ function start() {
     renderListStatus(auditOutage, s);
   }
 
+  const auditCoverage = document.getElementById("audit-coverage");
+
+  function renderCoverage(s) {
+    renderListStatus(auditCoverage, s);
+  }
+
   function renderAuditStatus(rowCount) {
     renderListStatus(auditEmpty, auditStatus(rowCount, auditFailed, auditLoaded));
   }
@@ -1149,11 +1223,15 @@ function start() {
   }
 
   async function refreshAudit() {
-    let rows;
+    let rows, total;
     try {
       const res = await fetch("/api/audit?limit=40");
       if (!res.ok) throw new Error(String(res.status));
-      rows = await res.json();
+      // {rows, total}. Tolerates a bare array from an older backend, in which case
+      // `total` is undefined and coverageSummary stays silent rather than guessing.
+      const body = await res.json();
+      rows = Array.isArray(body) ? body : (body && body.rows) || [];
+      total = Array.isArray(body) ? undefined : body && body.total;
     } catch (e) {
       // A failed refresh leaves the previous rows in place and SAYS SO. Silently
       // swallowing this is what let the list sit indefinitely stale while the header
@@ -1182,6 +1260,7 @@ function start() {
             ? esc(` · first seen ${fmtStamp(a.firstTs)}`) : ""}</td></tr>`;
     }).join("");
     renderOutage(outageSummary(rows));
+    renderCoverage(coverageSummary(rows, total));
     renderAuditStatus(rows.length);
   }
 
@@ -1282,14 +1361,32 @@ function start() {
   }
 
   // ── wiring ────────────────────────────────────────────────────────────────
+  // `visibilityState` is absent in some non-browser hosts; treat unknown as
+  // visible so a missing API degrades to the old always-poll behaviour rather
+  // than to a page that silently stops updating.
+  const visible = () => document.visibilityState !== "hidden";
+
   showView(current);
   connect();
   refreshAudit();
   refreshRules();
-  // Both keep polling regardless of which view is showing — otherwise the badges
+  // Both keep polling regardless of which VIEW is showing — otherwise the badges
   // could not report a hidden view's state, which is the whole reason they exist.
-  setInterval(refreshAudit, 4000);
-  setInterval(refreshRules, 4000);
+  //
+  // A hidden TAB is a different matter. Nobody is reading either list, the badges
+  // are not on screen either, and the cost is real now that /api/audit counts the
+  // table on every call: left ungated this is a COUNT(*) every four seconds for as
+  // long as the page is open on a machine that never closes it. The SSE stream is
+  // deliberately NOT gated — a hold has a ~120s fuse and default-denies, so arrivals
+  // must keep landing whether or not the tab is in front, and the title prefix is
+  // how they get noticed.
+  setInterval(() => { if (visible()) refreshAudit(); }, 4000);
+  setInterval(() => { if (visible()) refreshRules(); }, 4000);
+  // Refresh IMMEDIATELY on return, rather than leaving up to four seconds of
+  // stale-but-unlabelled data on screen at the moment attention comes back to it.
+  document.addEventListener("visibilitychange", () => {
+    if (visible()) { refreshAudit(); refreshRules(); }
+  });
 }
 
 // Browser: run the page. Node (the unit tests): export the pure helpers and touch
@@ -1300,7 +1397,7 @@ if (typeof module !== "undefined" && module.exports) {
     lampState, backoffDelay, diffPending, shouldSweep,
     holdRemaining, countdownState, departure, persistPreview, saturationState,
     ackCount, requestsLabel, auditRow, auditStatus, rulesStatus, repeatCount,
-    outageSummary,
+    outageSummary, pendingAnnouncement, coverageSummary,
     fmtTime, fmtStamp, fmtInstant,
     AUDIT_ORDINARY_STAGE,
     RECONNECT_MIN_MS, RECONNECT_MAX_MS, STALE_MAX_MS, COUNTDOWN_URGENT_S,

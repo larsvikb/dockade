@@ -487,8 +487,19 @@ def check(host, port, want, label, *, routable_is_failure=False):
     print(f"  {'PASS' if good else 'FAIL'} {label}\n"
           f"       {host}:{port} -> {how}")
 
-print(f"  control-plane resolves to {socket.gethostbyname('control-plane')} "
-      f"from inside the proxy")
+# Best-effort, and it must stay that way. This line once raised gaierror and took
+# the whole check down with a traceback, at the exact moment the check had
+# something useful to say: the control plane was stopped, so its name no longer
+# resolved (Docker's embedded DNS answers for running containers only). A
+# diagnostic that aborts the diagnosis is worse than no diagnostic — the probes
+# below already report an unreachable authorize listener as a FAIL, which is the
+# right message for that situation.
+try:
+    addrs = sorted({a[4][0] for a in socket.getaddrinfo("control-plane", None)})
+    print(f"  control-plane resolves to {', '.join(addrs)} from inside the proxy")
+except OSError as e:
+    print(f"  control-plane does NOT resolve from inside the proxy ({e}) — it is "
+          f"probably not running; `docker compose ps -a`")
 # By NAME: what the proxy actually talks to. Resolves to the authorize-net
 # address, because that is the only network the two containers share.
 check("control-plane", 8091, True,

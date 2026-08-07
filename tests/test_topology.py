@@ -177,6 +177,36 @@ def _raw_networks(service: str) -> set[str]:
         return set()
 
 
+class RestartPolicyTests(unittest.TestCase):
+    """`always` on the substrate, `unless-stopped` on the optional tier-2 model
+    server. The line is not stylistic: the two policies differ in exactly one case
+    — whether a container that was down when the daemon stopped comes back when it
+    starts — and that case cost this stack its governance authority across one
+    ordinary power cycle, silently, with the proxy still up and reporting healthy.
+
+    Asserted rather than left to review because the failure is invisible: a service
+    demoted to `unless-stopped` behaves identically until the one reboot where it
+    does not come back."""
+
+    def _restart_of(self, service: str) -> str:
+        for line in _service(service):
+            m = re.match(r"\s*restart:\s*(\S+)", line)
+            if m:
+                return m.group(1)
+        raise AssertionError(f"{service} declares no restart policy at all")
+
+    def test_the_infra_services_always_come_back(self):
+        for service in ("egress-proxy", "control-plane", "control-plane-ui"):
+            self.assertEqual(self._restart_of(service), "always", service)
+
+    def test_the_model_server_honours_a_deliberate_stop(self):
+        # Stopping llm-intel to reclaim the shared memory pool is an ordinary
+        # operator action, so it must NOT be resurrected by a reboot. This is the
+        # other half of the line above — without it, "always everywhere" would
+        # satisfy the test above and quietly break a real workflow.
+        self.assertEqual(self._restart_of("llm-intel"), "unless-stopped")
+
+
 class RelayGuardAgreesWithComposeTests(unittest.TestCase):
     """The proxy's relay guard hard-blocks the control subnets by CIDR, and those
     CIDRs are written twice — once as a compose subnet, once as a default in

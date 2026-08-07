@@ -96,7 +96,26 @@ services:
     image: dockade-egress-proxy
     container_name: egress-proxy
     hostname: egress-proxy
-    restart: unless-stopped
+    # `always`, not `unless-stopped`, and only on the three infra services. The two
+    # differ in exactly one case: whether a container that was down when the daemon
+    # stopped comes back when it starts. That case is not hypothetical here — a
+    # normal Windows power cycle left this stack with the control plane exited
+    # (containerd recorded exit 128, its "could not determine the status" code, which
+    # is what a teardown alongside the VM looks like) while the other services
+    # returned. `unless-stopped` will not restart a container it did not observe
+    # running at shutdown, so the governance authority stayed down and the proxy
+    # came back without it.
+    #
+    # That specific combination is the worst one available: egress fails closed, so
+    # nothing unsafe happens, but every request returns a 403 indistinguishable from
+    # a policy denial while `docker compose ps` shows green. See the audit view's
+    # handling of `control-plane unreachable, fail-closed`, which is the detection
+    # half — this is only the recovery half.
+    #
+    # The llm-* variants below deliberately keep `unless-stopped`: stopping the model
+    # server to reclaim the shared memory pool is an ordinary operator action and it
+    # should survive a reboot. These three are substrate and have no such use.
+    restart: always
     networks:
       # Serve the sandbox on the internal net at a stable address the sandbox
       # firewall allowlists (matches the launcher's discovery). Keep in-subnet.
@@ -131,6 +150,17 @@ services:
       # startup-race denials are indistinguishable from policy decisions, which
       # dilutes the record this whole design exists to keep trustworthy. Gating on
       # health makes the audit log a record of decisions, not of boot ordering.
+      #
+      # KNOWN LIMIT, and `restart: always` above makes it matter more: depends_on
+      # governs `docker compose up` ONLY. Restart-policy restarts are per-container
+      # and the daemon honours no ordering between them, so after a host reboot
+      # these three come back in whatever order they come back in, and this proxy
+      # can be serving before the control plane is healthy. The gate is real for the
+      # path a human drives and absent for the path a power cycle drives — which is
+      # now the more common one. The resulting denials are correct (fail-closed) and
+      # carry `control-plane unreachable, fail-closed` as their reason, so they are
+      # at least distinguishable from policy decisions in the audit view; that
+      # distinguishability is what stands in for ordering here.
       control-plane:
         condition: service_healthy
     # The proxy resolves the (public) allowlisted targets itself, via egress-net.
@@ -211,7 +241,8 @@ services:
     image: dockade-control-plane
     container_name: control-plane
     hostname: control-plane
-    restart: unless-stopped
+    # See egress-proxy for why these three are `always`.
+    restart: always
     networks:
       control-net:
         ipv4_address: 172.31.0.2
@@ -286,7 +317,8 @@ services:
     image: dockade-control-plane-ui
     container_name: control-plane-ui
     hostname: control-plane-ui
-    restart: unless-stopped
+    # See egress-proxy for why these three are `always`.
+    restart: always
     networks:
       # Reach the backend (internal, no egress).
       control-net:

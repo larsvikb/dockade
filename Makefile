@@ -458,34 +458,48 @@ import socket, sys
 ok = True
 
 def connect(host, port):
-    """Reachability AND why not, because the two failure modes differ in what
-    they prove. A dropped packet (timeout / EHOSTUNREACH) means no path. A
-    REFUSED means the packet arrived and something sent back an RST — the
-    subnet is routable and the only thing saving us is that nothing happens to
-    be listening on that port, which is not a boundary."""
+    """Four outcomes, not two, because they prove different things.
+
+    reached   — connected.
+    refused   — the packet ARRIVED and something answered with an RST. The subnet
+                is routable and the port is shut by luck, which is not a boundary.
+    dropped   — no path (timeout / EHOSTUNREACH / ENETUNREACH).
+    unresolved— the name did not resolve, so NOTHING WAS TESTED. Distinguished
+                because a negative probe that never left the host would otherwise
+                report PASS: with the control plane stopped, Docker's embedded DNS
+                stops answering for it, and 'the management API is not served
+                here' became true for the wrong reason.
+    """
     s = socket.socket(); s.settimeout(3)
     try:
         s.connect((host, port))
-        return True, "connected"
+        return "reached", "connected"
+    except socket.gaierror as e:
+        return "unresolved", f"name does not resolve ({e})"
     except ConnectionRefusedError:
-        return False, "REFUSED — host is reachable, nothing listening"
+        return "refused", "REFUSED - host is reachable, nothing listening"
     except (socket.timeout, TimeoutError):
-        return False, "no answer (packets dropped)"
+        return "dropped", "no answer (packets dropped)"
     except OSError as e:
-        return False, f"{type(e).__name__}: {e}"
+        return "dropped", f"{type(e).__name__}: {e}"
     finally:
         s.close()
 
 def check(host, port, want, label, *, routable_is_failure=False):
     global ok
-    reached, how = connect(host, port)
-    good = reached is want
-    if good and routable_is_failure and "REFUSED" in how:
-        good = False
-        how += " — the isolation is not holding; this port is closed by luck"
-    ok = ok and good
-    print(f"  {'PASS' if good else 'FAIL'} {label}\n"
-          f"       {host}:{port} -> {how}")
+    state, how = connect(host, port)
+    if state == "unresolved":
+        # Never a pass, whichever way `want` points. An untested assertion that
+        # reports success is the failure mode this whole check exists to catch.
+        verdict, ok = "SKIP", False
+        how += " - nothing was tested, so this proves nothing"
+    else:
+        good = (state == "reached") is want
+        if good and routable_is_failure and state == "refused":
+            good = False
+            how += " - the isolation is not holding; this port is closed by luck"
+        verdict, ok = ("PASS" if good else "FAIL"), ok and good
+    print(f"  {verdict} {label}\n       {host}:{port} -> {how}")
 
 # Best-effort, and it must stay that way. This line once raised gaierror and took
 # the whole check down with a traceback, at the exact moment the check had

@@ -841,9 +841,18 @@ true`, not code in this repo, which is exactly why it is measured rather than
 assumed. The literal probe hits port **8091 as a positive control**: the authorize
 listener binds the wildcard, so it genuinely is listening on `172.31.0.2:8091`, and
 only if *that* is unreachable does the `:8090` result mean the subnet is closed
-rather than one port being shut. The check also distinguishes a dropped packet from
-a `REFUSED`: a refusal proves the packet arrived and the subnet is routable, so it
-is reported as a failure even though the connection did not succeed.
+rather than one port being shut.
+
+The probe classifies four outcomes rather than two, because "did not connect" hides
+three different meanings. A **dropped** packet is the one that proves a boundary. A
+**refused** proves the opposite — the packet arrived and something answered with an
+RST, so the subnet is routable and the port is shut by luck — and is reported as a
+failure even though the connection did not succeed. **Unresolved** proves nothing at
+all, and is never a pass in either direction: Docker's embedded DNS answers only for
+running containers, so with the control plane stopped every by-name negative probe
+becomes trivially true. That last case was found by reading real output rather than
+by design — the check reported `PASS management API is not served on the
+authorize-net address` about a name that had not resolved.
 
 The egress proxy is now a **control-plane client** rather than a static-allowlist
 enforcer: on every connection it calls `POST /authorize {host, ...}`, which

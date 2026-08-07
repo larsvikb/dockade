@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 import types
+import typing
 import unittest
 from pathlib import Path
 from typing import ClassVar
@@ -473,6 +474,41 @@ class PersistConflictTests(_CPTestCase):
                    for o in cp._list_pending()[0]["persist_options"]}
         self.assertEqual(options["a.b.example.com"], None)
         self.assertEqual(options[".example.com"], "allow")
+
+
+class ResponseShapeTests(_CPTestCase):
+    """FastAPI derives each endpoint's response_model from its RETURN ANNOTATION and
+    validates the handler's output against it. An annotation that disagrees with what
+    the function actually returns is therefore not a type-checker nag — it is a 500
+    in the browser, at runtime, on a path every other test says is fine.
+
+    Nothing else in this suite can see that. The fastapi stub these tests run against
+    is an identity decorator with no validation, which is precisely what keeps them
+    dependency-free; the cost is that annotations are invisible. Not hypothetical:
+    ``/api/audit`` kept ``-> list[dict]`` after it began returning ``{rows, total}``,
+    every test passed, and the decisions view read "the control plane may be
+    unreachable" until someone loaded the page.
+
+    The roster is explicit rather than discovered, because the endpoints that cannot
+    simply be called — ``authorize`` blocks on a hold, ``resolve`` and ``revoke_rule``
+    return a Response directly — need judgement rather than reflection."""
+
+    def test_each_json_endpoint_returns_what_it_declares(self):
+        for name, call in (("healthz", cp.healthz),
+                           ("approvals", cp.approvals),
+                           ("api_rules", cp.api_rules),
+                           ("api_audit", cp.api_audit),
+                           ("api_config", cp.api_config)):
+            with self.subTest(endpoint=name):
+                # get_type_hints, not __annotations__: the module carries
+                # `from __future__ import annotations`, so the raw values are
+                # STRINGS. FastAPI resolves them the same way, which is why a
+                # mismatch reaches runtime rather than import.
+                declared = typing.get_type_hints(call).get("return")
+                self.assertIsNotNone(declared, f"{name} declares no return type, so "
+                                               f"FastAPI will not validate it")
+                # `list[dict]` -> `list`; a bare `dict` has no origin and is its own.
+                self.assertIsInstance(call(), typing.get_origin(declared) or declared)
 
 
 class RevokeRuleTests(_CPTestCase):

@@ -1203,7 +1203,7 @@ async def approvals_stream(request: Request) -> StreamingResponse:
 # ── UI + status ─────────────────────────────────────────────────────────────
 
 @app.get("/api/audit")
-def api_audit(limit: int = 50) -> list[dict]:
+def api_audit(limit: int = 50) -> dict:
     """Recent decisions, newest first, for the UI's decisions table.
 
     ``client`` is here because this control plane is SHARED ACROSS SANDBOXES. Without

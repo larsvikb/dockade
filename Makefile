@@ -488,9 +488,16 @@ def connect(host, port):
 def check(host, port, want, label, *, routable_is_failure=False):
     global ok
     state, how = connect(host, port)
-    if state == "unresolved":
-        # Never a pass, whichever way `want` points. An untested assertion that
-        # reports success is the failure mode this whole check exists to catch.
+    if state == "unresolved" and want:
+        # A POSITIVE assertion is not inconclusive here, it is falsified: the claim
+        # is that the proxy can reach this listener, and it demonstrably cannot.
+        # Saying "untested" would bury the most actionable line in the output.
+        verdict, ok = "FAIL", False
+        how += " - the proxy cannot ask, so egress is failing closed"
+    elif state == "unresolved":
+        # A NEGATIVE assertion is a different matter: it would be satisfied by the
+        # probe never leaving the host, which proves nothing about where the
+        # management API is served. Never a pass, and never counted as one.
         verdict, ok = "SKIP", False
         how += " - nothing was tested, so this proves nothing"
     else:

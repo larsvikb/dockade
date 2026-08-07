@@ -456,21 +456,58 @@ split-check: ## Assert the running proxy reaches /authorize and NOT the manageme
 define SPLIT_CHECK_PY
 import socket, sys
 ok = True
-def probe(port, want, label):
-    global ok
+
+def connect(host, port):
+    """Reachability AND why not, because the two failure modes differ in what
+    they prove. A dropped packet (timeout / EHOSTUNREACH) means no path. A
+    REFUSED means the packet arrived and something sent back an RST — the
+    subnet is routable and the only thing saving us is that nothing happens to
+    be listening on that port, which is not a boundary."""
     s = socket.socket(); s.settimeout(3)
     try:
-        s.connect(("control-plane", port)); reached = True
-    except OSError:
-        reached = False
+        s.connect((host, port))
+        return True, "connected"
+    except ConnectionRefusedError:
+        return False, "REFUSED — host is reachable, nothing listening"
+    except (socket.timeout, TimeoutError):
+        return False, "no answer (packets dropped)"
+    except OSError as e:
+        return False, f"{type(e).__name__}: {e}"
     finally:
         s.close()
+
+def check(host, port, want, label, *, routable_is_failure=False):
+    global ok
+    reached, how = connect(host, port)
     good = reached is want
+    if good and routable_is_failure and "REFUSED" in how:
+        good = False
+        how += " — the isolation is not holding; this port is closed by luck"
     ok = ok and good
-    print(("  PASS " if good else "  FAIL ") +
-          f"{label} (port {port}): reachable={reached}, expected={want}")
-probe(8091, True,  "authorize listener — the proxy must be able to ask")
-probe(8090, False, "management API — a route here is a self-approval path")
+    print(f"  {'PASS' if good else 'FAIL'} {label}\n"
+          f"       {host}:{port} -> {how}")
+
+print(f"  control-plane resolves to {socket.gethostbyname('control-plane')} "
+      f"from inside the proxy")
+# By NAME: what the proxy actually talks to. Resolves to the authorize-net
+# address, because that is the only network the two containers share.
+check("control-plane", 8091, True,
+      "authorize listener - the proxy must be able to ask")
+check("control-plane", 8090, False,
+      "management API is not served on the authorize-net address")
+# By LITERAL control-net address: the other half of the argument, and the half
+# that is Docker's behaviour rather than ours (inter-bridge forwarding dropped,
+# both nets internal). Port 8091 first, and it is the POSITIVE CONTROL: the
+# authorize listener binds the wildcard, so it IS listening on 172.31.0.2:8091.
+# If that is unreachable, the subnet is genuinely unroutable from here — which
+# is what makes the 8090 result below mean something rather than being a
+# statement about one closed port.
+check("172.31.0.2", 8091, False,
+      "control-net subnet is unroutable (probing a port that IS listening)",
+      routable_is_failure=True)
+check("172.31.0.2", 8090, False,
+      "management API unreachable at its own address - no self-approval path",
+      routable_is_failure=True)
 sys.exit(0 if ok else 1)
 endef
 export SPLIT_CHECK_PY

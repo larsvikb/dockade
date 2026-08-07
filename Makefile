@@ -485,61 +485,73 @@ def connect(host, port):
     finally:
         s.close()
 
-def check(host, port, want, label, *, routable_is_failure=False):
+def check(host, port, expect, label):
+    """One expected outcome per probe, named. This replaced a pair of booleans
+    (`want` plus a `routable_is_failure` override) that between them encoded three
+    real answers and one meaningless combination — accidental complexity from
+    patching this twice. Naming the outcome is also STRICTER: the authorize-net
+    management probe below asserts `refused` specifically, so it now proves the
+    packet arrived and found no listener, where before it passed on any failure
+    to connect at all."""
     global ok
     state, how = connect(host, port)
-    if state == "unresolved" and want:
-        # A POSITIVE assertion is not inconclusive here, it is falsified: the claim
-        # is that the proxy can reach this listener, and it demonstrably cannot.
-        # Saying "untested" would bury the most actionable line in the output.
-        verdict, ok = "FAIL", False
-        how += " - the proxy cannot ask, so egress is failing closed"
-    elif state == "unresolved":
-        # A NEGATIVE assertion is a different matter: it would be satisfied by the
-        # probe never leaving the host, which proves nothing about where the
-        # management API is served. Never a pass, and never counted as one.
-        verdict, ok = "SKIP", False
-        how += " - nothing was tested, so this proves nothing"
-    else:
-        good = (state == "reached") is want
-        if good and routable_is_failure and state == "refused":
-            good = False
-            how += " - the isolation is not holding; this port is closed by luck"
-        verdict, ok = ("PASS" if good else "FAIL"), ok and good
-    print(f"  {verdict} {label}\n       {host}:{port} -> {how}")
+    if state == "unresolved":
+        # Never the expected outcome, so always a failure. The wording splits
+        # because the two cases need different words: a probe that should have
+        # CONNECTED is a live outage, and that line must not be buried; one that
+        # should have been refused or dropped is simply untested, and would have
+        # been satisfied for the wrong reason.
+        ok = False
+        if expect == "reached":
+            print(f"  FAIL {label}\n       {host}:{port} -> {how}"
+                  f" - the proxy cannot ask, so egress is failing closed")
+        else:
+            print(f"  SKIP {label}\n       {host}:{port} -> {how}"
+                  f" - nothing was tested, so this proves nothing")
+        return
+    good = state == expect
+    ok = ok and good
+    note = ""
+    if not good and state == "refused":
+        note = " - the packet ARRIVED; this subnet is routable and the port is " \
+               "closed by luck, which is not a boundary"
+    print(f"  {'PASS' if good else 'FAIL'} {label}\n"
+          f"       {host}:{port} -> {how} (expected: {expect}){note}")
 
 # Best-effort, and it must stay that way. This line once raised gaierror and took
 # the whole check down with a traceback, at the exact moment the check had
 # something useful to say: the control plane was stopped, so its name no longer
 # resolved (Docker's embedded DNS answers for running containers only). A
-# diagnostic that aborts the diagnosis is worse than no diagnostic — the probes
-# below already report an unreachable authorize listener as a FAIL, which is the
-# right message for that situation.
+# diagnostic that aborts the diagnosis is worse than no diagnostic.
 try:
     addrs = sorted({a[4][0] for a in socket.getaddrinfo("control-plane", None)})
     print(f"  control-plane resolves to {', '.join(addrs)} from inside the proxy")
 except OSError as e:
-    print(f"  control-plane does NOT resolve from inside the proxy ({e}) — it is "
+    print(f"  control-plane does NOT resolve from inside the proxy ({e}) - it is "
           f"probably not running; `docker compose ps -a`")
+
 # By NAME: what the proxy actually talks to. Resolves to the authorize-net
-# address, because that is the only network the two containers share.
-check("control-plane", 8091, True,
+# address, because that is the only network the two containers share. The second
+# probe expects REFUSED rather than merely "not connected", and that is the whole
+# evidence for the bind split: the packet reaches the control plane and finds no
+# listener on that address, because management binds 172.31.0.2 alone.
+check("control-plane", 8091, "reached",
       "authorize listener - the proxy must be able to ask")
-check("control-plane", 8090, False,
+check("control-plane", 8090, "refused",
       "management API is not served on the authorize-net address")
+
 # By LITERAL control-net address: the other half of the argument, and the half
 # that is Docker's behaviour rather than ours (inter-bridge forwarding dropped,
-# both nets internal). Port 8091 first, and it is the POSITIVE CONTROL: the
+# both nets internal). Both expect DROPPED - no path at all, as against the
+# refusal above, which is what distinguishes "unroutable subnet" from "reachable
+# host, no listener". Port 8091 first, and it is the POSITIVE CONTROL: the
 # authorize listener binds the wildcard, so it IS listening on 172.31.0.2:8091.
-# If that is unreachable, the subnet is genuinely unroutable from here — which
-# is what makes the 8090 result below mean something rather than being a
-# statement about one closed port.
-check("172.31.0.2", 8091, False,
-      "control-net subnet is unroutable (probing a port that IS listening)",
-      routable_is_failure=True)
-check("172.31.0.2", 8090, False,
-      "management API unreachable at its own address - no self-approval path",
-      routable_is_failure=True)
+# If that is unreachable the subnet is genuinely closed, which is what makes the
+# 8090 result below mean something beyond one shut port.
+check("172.31.0.2", 8091, "dropped",
+      "control-net subnet is unroutable (probing a port that IS listening)")
+check("172.31.0.2", 8090, "dropped",
+      "management API unreachable at its own address - no self-approval path")
 sys.exit(0 if ok else 1)
 endef
 export SPLIT_CHECK_PY

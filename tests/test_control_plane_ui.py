@@ -356,6 +356,54 @@ class ProvenanceHeaderTests(unittest.TestCase):
         names = [k.lower() for k, _ in self._relay_headers(_ok_host())]
         self.assertNotIn("host", names)
 
+    def test_framing_headers_are_not_forwarded(self):
+        """This relay READS the body and re-sends it, so it owns the framing: httpx
+        sets `content-length` from the content it is handed. Forwarding the caller's
+        value, or a `transfer-encoding: chunked` alongside a fixed-length re-send,
+        is how a request desyncs from its length — request smuggling rather than an
+        untidy header.
+
+        `expect: 100-continue` is stripped for a different reason: the backend would
+        wait for an interim response this relay never sends."""
+        headers = self._relay_headers(_ok_host(headers={
+            "content-length": "9999",
+            "transfer-encoding": "chunked",
+            "expect": "100-continue",
+        }))
+        names = [k.lower() for k, _ in headers]
+        for framing in ("content-length", "transfer-encoding", "expect"):
+            self.assertNotIn(framing, names, framing)
+
+    def test_hop_by_hop_headers_are_not_forwarded(self):
+        # They describe the connection they arrived on, not the message, so copying
+        # them onto a different connection is a protocol error. Applied to requests
+        # as well as responses — it used to be responses only.
+        headers = self._relay_headers(_ok_host(headers={
+            "connection": "keep-alive", "keep-alive": "timeout=5",
+            "upgrade": "websocket", "te": "trailers",
+            "proxy-authorization": "Basic Zm9v",
+        }))
+        names = [k.lower() for k, _ in headers]
+        for hop in ("connection", "keep-alive", "upgrade", "te",
+                    "proxy-authorization"):
+            self.assertNotIn(hop, names, hop)
+
+    def test_the_two_directions_strip_the_same_hop_by_hop_set(self):
+        # One list, applied both ways. They were separate literals, and the request
+        # side simply did not have this class of header in it at all.
+        self.assertLessEqual(ui._HOP_BY_HOP, ui._STRIP_REQ)
+        self.assertLessEqual(ui._HOP_BY_HOP, ui._STRIP_RESP)
+
+    def test_ordinary_headers_still_reach_the_backend(self):
+        # The stripping must be a list, not a filter that eats everything: a relay
+        # that forwarded no headers would pass every test above.
+        headers = self._relay_headers(_ok_host(headers={
+            "accept": "application/json", "if-none-match": '"abc"',
+        }))
+        names = [k.lower() for k, _ in headers]
+        self.assertIn("accept", names)
+        self.assertIn("if-none-match", names)
+
 
 class FramingGuardTests(unittest.TestCase):
     """Clickjacking is the one browser-side vector the Host and cross-origin guards

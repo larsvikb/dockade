@@ -138,11 +138,34 @@ _RELAY_ROUTES = (
 # faithfully repeat the lie. `host` is stripped for a different reason: httpx must
 # set it for the backend.
 ACTOR_HEADER = "x-dockade-actor"
-_STRIP_REQ = {"host", ACTOR_HEADER, "x-forwarded-for", "x-forwarded-host",
+_SPOOFABLE = {"host", ACTOR_HEADER, "x-forwarded-for", "x-forwarded-host",
               "x-forwarded-proto", "x-real-ip", "forwarded"}
 
-# Hop-by-hop / framing headers we must not copy through a streaming relay.
-_STRIP_RESP = {"content-length", "transfer-encoding", "connection"}
+# Hop-by-hop headers (RFC 9110 §7.6.1). They describe the CONNECTION they arrived on
+# rather than the message, so a relay must not copy them onto its own connection —
+# in EITHER direction. This used to be applied to responses only, which left the
+# request side forwarding whatever the browser sent.
+_HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate",
+               "proxy-authorization", "te", "trailer", "transfer-encoding",
+               "upgrade"}
+
+# Framing this relay owns and must therefore not inherit from its caller.
+#
+# `content-length` is not hop-by-hop, and that is exactly why it needs saying: this
+# relay reads the body and re-sends it, so httpx sets the length from the content it
+# is given. A copied value that disagrees with that body is the classic
+# request-smuggling primitive, not a cosmetic mismatch — and `transfer-encoding:
+# chunked` arriving alongside a fixed-length re-send is the same hazard by the other
+# spelling, which is why the hop-by-hop set above is applied to requests now too.
+#
+# `expect` is here for an unrelated reason: `expect: 100-continue` makes the backend
+# wait for an interim response this relay never produces.
+_STRIP_FRAMING = {"content-length", "expect"}
+
+_STRIP_REQ = _SPOOFABLE | _HOP_BY_HOP | _STRIP_FRAMING
+# Responses need the framing stripped (the body is re-streamed) but not `expect`,
+# which is a request header and would be meaningless here.
+_STRIP_RESP = _HOP_BY_HOP | {"content-length"}
 
 # Fetch destinations that mean "this response is being EMBEDDED in another page".
 # Refused because neither guard above can see the difference: an attacker page that

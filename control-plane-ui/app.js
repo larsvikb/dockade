@@ -332,6 +332,13 @@ function auditRow(r) {
     // and the renderer uses fmtStamp rather than a time: the scan behind a group can
     // cover days, so a time-only start reads as minutes ago when it is not.
     firstTs: repeatCount(r) > 1 ? tsSeconds(r && r.first_ts) : null,
+    // Denied because the proxy could not REACH the control plane, rather than
+    // because policy said no. Same red `deny` tag, entirely different meaning: one
+    // is governance working, the other is governance absent and everything being
+    // refused. Classified by the backend (see `_audit_view`), never matched on the
+    // reason text here — and defaulting to false means a backend that does not send
+    // the field renders exactly as it did before this existed.
+    failClosed: !!(r && r.fail_closed),
   };
 }
 
@@ -341,6 +348,43 @@ function auditRow(r) {
 function repeatCount(r) {
   const n = Number(r && r.n);
   return Number.isFinite(n) && n > 1 ? Math.floor(n) : 1;
+}
+
+// What the decisions list should say about a run of FAIL-CLOSED denials, over and
+// above marking the rows themselves.
+//
+// The rows alone are not enough. They are red `deny` lines among other red `deny`
+// lines, and the situation this exists for is precisely the one where nobody is
+// suspicious yet — governed egress refusing everything while the page, the rules and
+// the health checks all look normal. A count stated in words is what the per-row
+// edge can only imply, and it is also what keeps colour from being the sole cue.
+//
+// SCOPED TO WHAT WAS SERVED, deliberately. It counts the rows on screen rather than
+// querying the store, so it can never claim more than the reader can scroll to, and
+// it says "in the decisions below" rather than "now" — these rows may be an outage
+// that has already ended, and a banner asserting a live failure that has since
+// recovered would be its own kind of lie.
+//
+// `repeatCount` and not the row count: the grouped view folds identical denials, so
+// one line can stand for hundreds of refused requests, which is exactly the number
+// that conveys the scale of an outage.
+function outageSummary(rows) {
+  const hit = (rows || []).filter(r => r && r.fail_closed);
+  if (!hit.length) return { show: false, level: "none", text: "", decisions: 0, hosts: 0 };
+  const decisions = hit.reduce((n, r) => n + repeatCount(r), 0);
+  const hosts = new Set(hit.map(r => (r && r.host) || "")).size;
+  return {
+    show: true,
+    level: "warn",
+    decisions,
+    hosts,
+    text: `${decisions} request${decisions === 1 ? "" : "s"} to `
+        + `${hosts} host${hosts === 1 ? "" : "s"} below `
+        + `${decisions === 1 ? "was" : "were"} denied because the proxy could not `
+        + `reach the control plane. That is an outage, not policy — governed egress `
+        + `fails closed, so ${decisions === 1 ? "it was" : "they were"} refused `
+        + `without any rule being consulted.`,
+  };
 }
 
 // What the decisions list should say ABOUT ITSELF. It exists because an empty table
@@ -1088,6 +1132,13 @@ function start() {
 
   const auditEmpty = document.getElementById("audit-empty");
   const rulesEmpty = document.getElementById("rules-empty");
+  const auditOutage = document.getElementById("audit-outage");
+
+  // Same element contract as the two status lines, so it goes through the same
+  // renderer — a third hand-rolled show/hide is how the first two drifted apart.
+  function renderOutage(s) {
+    renderListStatus(auditOutage, s);
+  }
 
   function renderAuditStatus(rowCount) {
     renderListStatus(auditEmpty, auditStatus(rowCount, auditFailed, auditLoaded));
@@ -1120,7 +1171,8 @@ function start() {
     document.getElementById("audit").innerHTML = rows.map(r => {
       const a = auditRow(r);
       return `
-        <tr><td class="ts" title="${esc(fmtInstant(a.ts))}">${esc(fmtStamp(a.ts))}</td>
+        <tr${a.failClosed ? ' class="outage"' : ""}>
+          <td class="ts" title="${esc(fmtInstant(a.ts))}">${esc(fmtStamp(a.ts))}</td>
           <td><span class="tag ${esc(a.decision)}">${esc(a.decision)}</span></td>
           <td>${a.stagePrefix ? `<span class="qual">${esc(a.stagePrefix)}</span>` : ""
             }${esc(a.host)}${a.repeat
@@ -1129,6 +1181,7 @@ function start() {
           <td>${esc(a.reason)}${a.firstTs
             ? esc(` · first seen ${fmtStamp(a.firstTs)}`) : ""}</td></tr>`;
     }).join("");
+    renderOutage(outageSummary(rows));
     renderAuditStatus(rows.length);
   }
 
@@ -1247,6 +1300,7 @@ if (typeof module !== "undefined" && module.exports) {
     lampState, backoffDelay, diffPending, shouldSweep,
     holdRemaining, countdownState, departure, persistPreview, saturationState,
     ackCount, requestsLabel, auditRow, auditStatus, rulesStatus, repeatCount,
+    outageSummary,
     fmtTime, fmtStamp, fmtInstant,
     AUDIT_ORDINARY_STAGE,
     RECONNECT_MIN_MS, RECONNECT_MAX_MS, STALE_MAX_MS, COUNTDOWN_URGENT_S,

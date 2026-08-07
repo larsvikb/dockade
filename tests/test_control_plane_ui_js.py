@@ -288,6 +288,25 @@ console.log(JSON.stringify({
           .map(n => [String(n), m.repeatCount({ n })]),
         no_row: m.repeatCount(null),
       },
+      outage: {
+        // Rows as /api/audit serves them; `fail_closed` is set by the backend.
+        none: m.outageSummary([]),
+        only_policy: m.outageSummary([{ fail_closed: false, host: "a", n: 9 }]),
+        one: m.outageSummary([{ fail_closed: true, host: "a", n: 1 }]),
+        // Counts REQUESTS not rows: the view is grouped, so one line can stand for
+        // hundreds of refusals, and that is the number conveying the scale.
+        grouped: m.outageSummary([{ fail_closed: true, host: "a", n: 12 },
+                                  { fail_closed: true, host: "b", n: 3 },
+                                  { fail_closed: false, host: "c", n: 900 }]),
+        // Same host twice is one host, and a missing flag is not an outage.
+        same_host: m.outageSummary([{ fail_closed: true, host: "a", n: 2 },
+                                    { fail_closed: true, host: "a", n: 5 }]),
+        no_flag: m.outageSummary([{ host: "a", n: 4 }]),
+        nothing: m.outageSummary(null),
+        // The row marker, from the same payload the renderer reads.
+        row_marked: m.auditRow({ ts: 1e9, host: "a", fail_closed: true }).failClosed,
+        row_plain: m.auditRow({ ts: 1e9, host: "a" }).failClosed,
+      },
       audit_status: {
         // rowCount, failed, loaded
         first_load_in_flight: m.auditStatus(0, false, false),
@@ -821,6 +840,58 @@ class PageScriptTests(unittest.TestCase):
         self.assertEqual(a["nothing"]["host"], "")
         self.assertIsNone(a["junk_ts"], "a non-numeric ts must not reach Date()")
 
+    def test_an_outage_is_not_reported_when_every_denial_was_policy(self):
+        """The banner must stay silent in the ordinary case. A warning that is present
+        during normal operation is one nobody reads during an abnormal one, and this
+        list is mostly denials by design — default-deny means refusals are the
+        expected content, not the alarming content."""
+        o = self.probe["saturation"]["outage"]
+        for case in ("none", "only_policy", "no_flag", "nothing"):
+            with self.subTest(case=case):
+                self.assertFalse(o[case]["show"])
+                self.assertEqual(o[case]["text"], "")
+
+    def test_an_outage_counts_requests_rather_than_rows(self):
+        """The decisions view is GROUPED, so one line can stand for hundreds of refused
+        requests. Counting lines would report `2` for an outage that denied fifteen
+        things, and the scale is the whole point of saying anything."""
+        o = self.probe["saturation"]["outage"]["grouped"]
+        self.assertTrue(o["show"])
+        self.assertEqual(o["level"], "warn")
+        self.assertEqual(o["decisions"], 15)   # 12 + 3, not 2 rows
+        self.assertEqual(o["hosts"], 2)        # the policy-denied host is not counted
+
+    def test_the_outage_wording_agrees_with_itself_at_one(self):
+        # A banner that says "1 requests were denied" reads as broken, and a reader who
+        # doubts the sentence doubts the number in it.
+        o = self.probe["saturation"]["outage"]["one"]
+        self.assertIn("1 request to 1 host", o["text"])
+        self.assertIn("was denied", o["text"])
+        self.assertNotIn("requests", o["text"])
+        self.assertNotIn("they were", o["text"])
+
+    def test_the_outage_banner_says_it_is_not_policy(self):
+        """The distinction IS the message. Without those words the banner is just a
+        second count of denials, and the reader is left where they started: unable to
+        tell a rule refusing traffic from governance being unreachable."""
+        text = self.probe["saturation"]["outage"]["grouped"]["text"]
+        self.assertIn("not policy", text)
+        self.assertIn("could not reach the control plane", text)
+        # Scoped to what was served — never a claim about the store, or about now.
+        self.assertIn("below", text)
+
+    def test_repeated_hosts_count_once(self):
+        o = self.probe["saturation"]["outage"]["same_host"]
+        self.assertEqual(o["hosts"], 1)
+        self.assertEqual(o["decisions"], 7)
+
+    def test_a_row_carries_the_marker_only_when_the_backend_sets_it(self):
+        """Colour is not the only cue (the banner carries words), but the row edge is
+        what ties the sentence to the specific lines — and it must default OFF so a
+        backend that does not send the field renders exactly as it did before."""
+        self.assertIs(self.probe["saturation"]["outage"]["row_marked"], True)
+        self.assertIs(self.probe["saturation"]["outage"]["row_plain"], False)
+
     def test_a_repeated_decision_says_how_many_and_over_what_span(self):
         """`/api/audit` groups identical decisions, so a row can stand for many. The
         count without the span is not enough: 47x cannot distinguish a burst from a
@@ -978,9 +1049,16 @@ class DecisionsTableSourceTests(unittest.TestCase):
 
         Cell ORDER is the claim: the header row promises time, decision, host, client,
         reason, and nothing else checks that the body agrees."""
-        row = re.search(r"return `\s*<tr>(.*?)</tr>`", self.body.group(1), re.S)
+        # `<tr[^>]*>` rather than `<tr>`: the row carries a conditional `outage`
+        # class now. The attribute region is asserted separately just below, so
+        # loosening this does not let arbitrary markup onto the row unnoticed.
+        row = re.search(r"return `\s*<tr([^>]*)>(.*?)</tr>`", self.body.group(1), re.S)
         self.assertIsNotNone(row, "the row template was restructured")
-        cells = row.group(1).split("<td")[1:]
+        self.assertRegex(
+            row.group(1),
+            r"""^\$\{a\.failClosed \? ' class="outage"' : ""\}$""",
+            "the only thing on the row element itself is the outage marker")
+        cells = row.group(2).split("<td")[1:]
         self.assertEqual(len(cells), 5, "expected five cells, one per header")
         time_, decision, host, client, reason = cells
 

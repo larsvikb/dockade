@@ -52,6 +52,15 @@
      `warn` is the one that says the data on screen may no longer be true. */
   .empty.warn { color: var(--hold); font-style: normal; }
   .empty.warn::before { content: "⚠ "; }
+  /* A denial the proxy made because it could not REACH the control plane. It carries
+     the same red `deny` tag as a policy denial and means something entirely
+     different: not "your rules refused this" but "governance is unreachable and
+     everything is being refused". The marker is a rule edge rather than a background
+     tint, so it survives the row striping and stays legible to anyone who cannot
+     separate these particular hues. The banner above the table carries the words —
+     colour alone must not be the only cue (WCAG 1.4.1). */
+  tr.outage > td { border-top: 1px solid var(--hold); }
+  tr.outage > td:first-child { border-left: 3px solid var(--hold); }
   /* The audit `stage`, prefixed to the HOST it describes — `http · example.com`, which
      reads as the scheme it effectively is. Rendered only when it is not the ordinary
      CONNECT tunnel; see AUDIT_ORDINARY_STAGE in app.js. No margin: the separator is
@@ -241,6 +250,11 @@
 
   <section id="view-decisions" role="tabpanel" aria-labelledby="tab-decisions" hidden>
     <h2>Recent decisions</h2>
+    <!-- ABOVE the table, because it changes how everything below it should be read.
+         A run of fail-closed denials looks exactly like a run of policy denials, and
+         the case that matters is the one where nobody suspects anything — so the
+         distinction has to arrive before the rows, not be discovered among them. -->
+    <div class="empty" id="audit-outage" hidden></div>
     <table>
       <thead><tr><th>time</th><th>decision</th><th>host</th><th>client</th>
         <th>reason</th></tr></thead>

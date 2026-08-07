@@ -153,6 +153,20 @@ DRAIN_MAX_FIELD = 2048
 # Bounds the aggregation regardless of table size; the slice itself rides audit_ts.
 AUDIT_GROUP_SCAN = int(os.environ.get("CONTROL_AUDIT_GROUP_SCAN", "5000"))
 
+# The reason the egress proxy writes when it denies because it could not reach THIS
+# service (proxies/egress/addon.py, ``_authorize``). Those denials are correct — that
+# is fail-closed working — but they are not policy, and until they were told apart an
+# operator could not distinguish "your rules refused this" from "governance is down
+# and everything is being refused". Both render as a red `deny` row against a host.
+#
+# Matched as a PREFIX because the proxy appends the underlying exception. Matched at
+# all, rather than shared as a constant, because these are separate services in
+# separate images with no common module — so a test asserts the two strings still
+# agree (tests/test_control_plane_api.py). If they ever drift, the classification
+# silently returns to what it was before this existed: an ordinary deny. That is the
+# safe direction, and it is why matching is acceptable here at all.
+FAIL_CLOSED_REASON = "control-plane unreachable"
+
 # ── the two listeners (see the module docstring) ────────────────────────────
 # The proxy-facing surface binds a WILDCARD on purpose: it is the safe one, it
 # only answers policy questions, and the container's healthcheck reaches it over
@@ -1246,7 +1260,21 @@ def api_audit(limit: int = 50) -> list[dict]:
             "FROM (SELECT * FROM audit ORDER BY ts DESC LIMIT ?) "
             "GROUP BY decision, stage, host, client, reason "
             "ORDER BY ts DESC LIMIT ?", (AUDIT_GROUP_SCAN, limit)).fetchall()
-    return [dict(r) for r in rows]
+    return [_audit_view(r) for r in rows]
+
+
+def _audit_view(row) -> dict:
+    """One grouped row as the UI receives it, plus the one thing it cannot work out
+    for itself: whether this denial was policy or an outage.
+
+    Classified HERE rather than in the frontend so the marker string lives next to
+    the guard test that pins it, and so the browser is not matching on prose. The
+    field is additive — a client that ignores it renders exactly what it rendered
+    before."""
+    out = dict(row)
+    reason = out.get("reason") or ""
+    out["fail_closed"] = reason.startswith(FAIL_CLOSED_REASON)
+    return out
 
 
 @app.get("/api/rules")

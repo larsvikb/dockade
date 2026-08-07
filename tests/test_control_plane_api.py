@@ -14,13 +14,17 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import threading
 import time
 import types
 import unittest
+from pathlib import Path
 from typing import ClassVar
 from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[1]
 
 _TMP = tempfile.mkdtemp(prefix="dockade-cp-api-test-")
 os.environ["CONTROL_DB"] = os.path.join(_TMP, "control.db")
@@ -495,6 +499,57 @@ class AuditViewTests(_CPTestCase):
                      r.get("method"), r.get("url"), r.get("reason")))
             conn.commit()
 
+    def test_a_denial_says_whether_it_was_policy_or_an_outage(self):
+        # The two are visually identical in the UI — same red `deny` tag, same host —
+        # and mean opposite things: one is governance working, the other governance
+        # absent with everything being refused. An evening was spent on that
+        # ambiguity, hence the flag.
+        self._rows(
+            {"host": "a.example", "decision": "deny",
+             "reason": "blocked by rule (a.example)"},
+            {"host": "b.example", "decision": "deny", "ts": 1.0,
+             "reason": "control-plane unreachable, fail-closed (timed out)"})
+        got = {r["host"]: r["fail_closed"] for r in cp.api_audit()}
+        self.assertEqual(got, {"a.example": False, "b.example": True})
+
+    def test_the_marker_matches_what_the_proxy_actually_writes(self):
+        """The reason text is produced in proxies/egress/addon.py and classified in
+        control-plane/app.py — two services, two images, no shared module. Nothing but
+        this test connects them, and the drift is silent: a renamed reason simply stops
+        being recognised and the row reverts to looking like a policy denial.
+
+        Reads the addon's SOURCE rather than importing it, because the point is to pin
+        the literal that ships in the other image."""
+        addon = (ROOT / "proxies" / "egress" / "addon.py").read_text()
+        produced = re.findall(r'Verdict\(False,\s*f?"([^"{]*)', addon)
+        self.assertTrue(
+            any(p.startswith(cp.FAIL_CLOSED_REASON) for p in produced),
+            f"no fail-closed Verdict reason in addon.py starts with "
+            f"{cp.FAIL_CLOSED_REASON!r}; found {produced!r}. If the wording moved, "
+            f"move FAIL_CLOSED_REASON with it — otherwise outage denials go back to "
+            f"being indistinguishable from policy denials in the UI.")
+
+    def test_an_unrecognised_reason_is_not_marked_as_an_outage(self):
+        # The classification must not fire on a word that appears in ordinary reasons
+        # too — a host can legitimately be named after the control plane.
+        self._rows({"host": "c.example", "decision": "deny",
+                    "reason": "blocked by rule (control-plane-mirror.example)"})
+        self.assertFalse(cp.api_audit()[0]["fail_closed"])
+
+    def test_the_marker_must_anchor_at_the_start_of_the_reason(self):
+        # A substring search would also match a reason that merely MENTIONS the
+        # condition rather than being one. The proxy writes the phrase as a PREFIX and
+        # appends the exception, so the anchor is what distinguishes "this request was
+        # refused because governance was unreachable" from any future reason that
+        # refers to that state while describing something else.
+        #
+        # Without this the guard is decorative: `startswith` loosened to `in` passed
+        # every other test in this class.
+        self._rows({"host": "d.example", "decision": "deny",
+                    "reason": "blocked by rule, recorded while "
+                              "control-plane unreachable"})
+        self.assertFalse(cp.api_audit()[0]["fail_closed"])
+
     def test_a_row_says_whose_request_it_was(self):
         # The gap this closes. One control plane serves every sandbox, so a row that
         # records "egress to pypi.org was allowed" without saying which agent asked
@@ -506,11 +561,15 @@ class AuditViewTests(_CPTestCase):
         # Named, so adding or dropping one is a deliberate act with a failing test
         # attached rather than a silent change of what the operator can see. `stage`
         # was served and rendered by nothing for as long as this endpoint existed.
+        # `fail_closed` is DERIVED rather than stored — it is the one field here the
+        # audit table does not hold, computed in _audit_view from the reason. Listed
+        # alongside the columns anyway, because from the UI's side there is no
+        # difference and this set is the contract.
         self._rows({"host": "a.example"})
         self.assertEqual(
             set(cp.api_audit()[0]),
             {"ts", "decision", "stage", "host", "client", "reason",
-             "n", "first_ts"})
+             "n", "first_ts", "fail_closed"})
 
     def test_the_unbounded_fields_stay_out_of_the_list_view(self):
         # url is AGENT-CONTROLLED and unbounded; method/port/proto are recorded and

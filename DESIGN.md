@@ -899,6 +899,27 @@ volume is lost is gone. That was judged acceptable — the alternative is durabi
 machinery for rows that are almost all `deny — control-plane unreachable`, recorded
 during a window in which nobody could load the UI either.
 
+**Telling an outage denial from a policy denial.** Those `control-plane unreachable`
+rows carry the same red `deny` tag as a rule refusing a host, against the same host
+column, and they mean the opposite thing: not "your policy refused this" but "no
+policy was consulted, because governance was unreachable". `/api/audit` therefore
+classifies them (`_audit_view` → `fail_closed`), the row is marked, and a line above
+the table states the count in words — colour alone must not be the only cue, and the
+words are what the row edge can only imply.
+
+**Which failure each mechanism actually covers** is worth stating, because they look
+like one feature and are two. When the control-plane *container* is down the UI
+cannot reach its backend either, so both polled views report their own staleness and
+the operator is told directly — that is what the stale/cold wording exists for, and
+no audit row is even ingested until the service returns. The `fail_closed` marker
+covers the *other* shape: the control plane is up, the UI is healthy, the rules look
+right, and the **proxy** cannot reach `/authorize` — a partition, a wedged listener,
+DNS. Nothing else on the page changes in that state. Classification lives in the
+backend rather than the browser so the marker string sits beside the test that pins
+it against `addon.py`, which produces it in a different image with no shared module;
+if they ever drift the row simply reverts to looking like a policy denial, which is
+the safe direction.
+
 **Hold-for-approval.** An unmatched host is no longer denied
 outright: `_decide` returns **`hold`**, and `/authorize` records a pending
 approval and **blocks** the request until a human resolves it or
@@ -2142,6 +2163,16 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
   strips a trailing FQDN dot but `_decide` / `_match` only lowercase, so `evil.com.`
   misses a persisted **block** rule and lands in a hold instead — fail-safe, but it
   lets an explicit operator denial be re-prompted indefinitely.
+- **`boundary-check.sh` manufactures the most alarming rows the audit log can
+  hold** — control-plane relay attempts, SNI fronting, metadata-IP SSRF — and they
+  are indistinguishable from an agent genuinely attempting them. That is arguably
+  correct: the sandbox really did make those requests, and a probe that produced no
+  audit row would not be testing the real path. It also sits deliberately opposite
+  the decision recorded for the egress proxy's healthcheck in `docker-compose.yml`,
+  which is *not* a real CONNECT precisely so a periodic synthetic deny never
+  pollutes the record. The distinction that justifies both: that one fires on a
+  timer forever, this one only when a human asks. Left as-is, filed because
+  "remember what you ran" is not a property of a log.
 
 ## Layout
 

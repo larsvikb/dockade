@@ -24,7 +24,9 @@ socket, and (by design) no route to a control plane.
 > sole path off-box, and it defers every decision to a **control plane** the
 > agent cannot reach (policy + audit in SQLite). An unknown host is **held for
 > approval** — a human approves/rejects it in a live UI (backend fully internal;
-> a separate `control-plane-ui` frontend carries the loopback UI). There are now
+> a separate `control-plane-ui` frontend carries the loopback UI). The backend's
+> API surface is **split across two internal networks**, so the egress proxy can
+> ask `/authorize` and cannot reach the approvals API at all. There are now
 > **two sandbox tiers** sharing one boundary implementation: tier 1 (Claude,
 > governed egress) and tier 2 (opencode against a local LLM, no egress and no
 > credentials). Still to come per [`DESIGN.md`](DESIGN.md): audit browsing beyond
@@ -152,10 +154,13 @@ enabled in v1; details in [`DESIGN.md`](DESIGN.md).
 
 **Verifying the boundary:** run `boundary-check.sh` inside the container (as the
 agent) for an on-demand pass/fail check of the invariants — arbitrary egress
-blocked, IPv6 blocked, control plane unreachable, agent holds no capabilities,
-`no_new_privs` set, no Docker socket, plus six attempts to abuse the egress proxy
-(non-443 CONNECT, SNI fronting, relaying to the control plane by name or by IP,
-or to the metadata IP).
+blocked, IPv6 blocked, the control plane unreachable on either of its internal
+networks, agent holds no capabilities, `no_new_privs` set, no Docker socket, plus a
+set of attempts to abuse the egress proxy (non-443 CONNECT, SNI fronting, relaying
+to a control network by name, by IP and by IPv4-mapped IPv6, relaying to the
+metadata IP, and plaintext HTTP going through the proxy rather than around it). It
+prints a pass/fail line each and an aggregate; run it rather than counting them
+here.
 It is **tier-aware**: tier 1 asserts Anthropic is reachable *via the proxy*, tier 2
 asserts it is unreachable and that the inference service is the one destination that
 answers. It exits non-zero on any violation, so it doubles as a regression baseline
@@ -185,8 +190,9 @@ dockade/
   run-opencode-sandbox.sh   # tier 2: build + launch an opencode/local-LLM sandbox
   sandbox-lib.sh            # launcher plumbing shared by both tiers
   control-plane/            # governance authority BACKEND (agent cannot reach it)
-    Dockerfile              #   FastAPI over SQLite; control-net only, fully internal
-    app.py                  #   /authorize (policy + audit) + hold-for-approval API
+    Dockerfile              #   FastAPI over SQLite; two internal nets, fully internal
+    app.py                  #   /authorize on authorize-net; the management API
+                            #   (approvals, resolve, the read-only views) on control-net
                             #   + ingest of the proxy's locally-decided audit lines
     requirements.txt        #   pinned deps (fastapi, uvicorn)
   control-plane-ui/         # UI FRONTEND — serves the UI + reverse-proxies the API
@@ -230,11 +236,10 @@ exposed through governed data-plane services. Next steps toward it:
    a CONNECT-level domain allowlist with per-connection audit, and (step 1) the
    **sole** egress path — `sandbox-net` is `internal: true` with the proxy
    dual-homed onto `egress-net`.
-2. **Control plane** — *step 2a done* (`control-plane/` + `control-net`): a
-   FastAPI + SQLite governance authority the **agent cannot reach** (on
-   `control-net` plus a loopback-only UI bridge; never on the sandbox net). The
-   UI is reachable from the host browser at `http://localhost:8081`. The egress
-   proxy now asks it
+2. **Control plane** — *step 2a done* (`control-plane/`): a FastAPI + SQLite
+   governance authority the **agent cannot reach** — it lives only on internal
+   networks the sandbox is not attached to. The UI is reachable from the host
+   browser at `http://localhost:8081`. The egress proxy asks it
    `POST /authorize` per connection — one call that both decides policy and
    records audit — with the Anthropic lifeline allowed locally so a control-plane
    outage never bricks the agent, and everything else failing closed.
@@ -243,9 +248,15 @@ exposed through governed data-plane services. Next steps toward it:
    persist-as-rule), defaulting to deny after a timeout (2b-1). The card counts
    down to that default-deny, and a persist names the rule it will write and asks
    twice, with exact-host-vs-subdomain-wildcard chosen by the operator from a set
-   the backend derives and validates. The UI is a
-   distinct `control-plane-ui` frontend; the backend is `control-net`-only and
-   fully internal, reachable only via that frontend or the egress proxy (2b-2).
+   the backend derives and validates. The UI is a distinct `control-plane-ui`
+   frontend on `control-net`; the backend is fully internal and reachable only
+   through it (2b-2). **2b-3:** the backend's API surface is split across two
+   internal networks — the egress proxy is on `authorize-net` and can reach
+   `POST /authorize` and nothing else, while the management API (approvals,
+   `resolve`, the read-only views) is served on a separate port bound to the
+   `control-net` address alone. The proxy's relay guard is best-effort against DNS
+   rebinding, so the design assumes it can be beaten and makes the far side worth
+   little: even a total bypass yields a policy *query*, never a self-approval.
    Next: **2c** audit browsing (filter/search/history beyond the recent-decisions
    table already in the UI) + per-proxy config.
 3. **Skills + quality-gate hooks** in the image — the enablement half of the

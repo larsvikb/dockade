@@ -2092,6 +2092,7 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | 2a | control plane: policy store + audit | **done** |
 | 2b-1 | hold-for-approval, blocking with default-deny | **done** |
 | 2b-2 | `control-plane-ui` split out as its own container | **done** |
+| 2b-3 | control-plane API surface split across two internal nets | **done** |
 | — | unit suite + CI gate | **done** |
 | 2c | audit browsing (filter/search/history), per-proxy config | next |
 | 3 | skills + quality-gate hooks in the image | planned |

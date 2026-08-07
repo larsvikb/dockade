@@ -475,6 +475,104 @@ class PersistConflictTests(_CPTestCase):
         self.assertEqual(options[".example.com"], "allow")
 
 
+class RevokeRuleTests(_CPTestCase):
+    """The other half of a governance plane that could grant but never take back.
+
+    The asymmetry is the point: revoking an ALLOW tightens (the host reverts to
+    unknown and is held), revoking a BLOCK loosens — an explicit operator denial
+    becomes a request that can be approved by someone who never knew it had been
+    refused. The backend treats both as the same operation and the UI carries the
+    distinction in its confirm; what the backend owes is that the operation is
+    recorded, attributed, and refused for seed rules."""
+
+    def _rule(self, pattern, action="allow", source="operator"):
+        with cp._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO rules(pattern, action, source, created_at) "
+                "VALUES (?,?,?,0)", (pattern, action, source))
+            conn.commit()
+            return cur.lastrowid
+
+    def _patterns(self):
+        with cp._connect() as conn:
+            return {r["pattern"] for r in conn.execute("SELECT pattern FROM rules")}
+
+    def test_an_operator_rule_is_removed(self):
+        rid = self._rule("evil.example", "block")
+        resp = cp.revoke_rule(rid, _FakeRequest())
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotIn("evil.example", self._patterns())
+
+    def test_a_seed_rule_is_refused_by_the_backend(self):
+        """Refused HERE, not merely hidden in the UI. The UI is a convenience layer
+        over a backend that validates every input — and this particular refusal also
+        guards a trap: `_seed_if_empty` re-reads the seed file whenever the rules
+        table is empty, so a store whose every rule could be revoked would resurrect
+        the entire seed allowlist on the next restart."""
+        rid = self._rule("pypi.org", "allow", source="seed")
+        resp = cp.revoke_rule(rid, _FakeRequest())
+        self.assertEqual(resp.status_code, 403)
+        self.assertIn("pypi.org", self._patterns())
+
+    def test_the_refusal_says_where_to_change_it_instead(self):
+        # A refusal with no next step is a dead end; the seed file IS the next step.
+        rid = self._rule("pypi.org", "allow", source="seed")
+        body = cp.revoke_rule(rid, _FakeRequest()).body
+        self.assertIn("egress-allowlist.txt", json.dumps(body))
+
+    def test_the_rules_table_can_never_be_emptied_by_revocation(self):
+        """The property that makes the seed refusal load-bearing rather than
+        decorative. Stated as behaviour rather than trusted as a consequence."""
+        self._rule("seeded.example", "allow", source="seed")
+        ids = [self._rule(f"op{i}.example") for i in range(3)]
+        for rid in ids:
+            cp.revoke_rule(rid, _FakeRequest())
+        self.assertEqual(self._patterns(), {"seeded.example"})
+        # And therefore a restart does not re-seed.
+        self.assertEqual(cp._seed_if_empty(), 0)
+
+    def test_an_unknown_id_is_a_404_not_a_silent_success(self):
+        self.assertEqual(cp.revoke_rule(999999, _FakeRequest()).status_code, 404)
+
+    def test_revocation_is_audited_with_provenance(self):
+        """Editing standing policy is more consequential than any single egress
+        decision, and nothing recorded that it had happened at all. Attribution is
+        detection rather than prevention — the fields are forgeable by a host-local
+        caller — but a forged revocation is at least visible afterwards."""
+        rid = self._rule(".github.com", "allow")
+        with mock.patch.object(cp, "_audit") as audit:
+            cp.revoke_rule(rid, _FakeRequest(peer="172.31.0.9"))
+        self.assertEqual(audit.call_args.args[0], "revoke")
+        kwargs = audit.call_args.kwargs
+        self.assertEqual(kwargs["host"], ".github.com")
+        self.assertIn("peer=172.31.0.9", kwargs["reason"])
+        self.assertIn("allow rule revoked", kwargs["reason"])
+
+    def test_the_audit_reason_says_what_the_host_reverts_to(self):
+        # Both directions land on `hold`; the reason is the only thing that says the
+        # rule is gone rather than replaced.
+        rid = self._rule("evil.example", "block")
+        with mock.patch.object(cp, "_audit") as audit:
+            cp.revoke_rule(rid, _FakeRequest())
+        self.assertIn("held for approval", audit.call_args.kwargs["reason"])
+
+    def test_a_revoked_allow_stops_deciding_requests(self):
+        # The whole point, asserted end to end through _decide rather than by
+        # inspecting the table: policy actually changes.
+        rid = self._rule("gone.example", "allow")
+        self.assertEqual(cp._decide("gone.example")[0], "allow")
+        cp.revoke_rule(rid, _FakeRequest())
+        self.assertEqual(cp._decide("gone.example")[0], "hold")
+
+    def test_a_revoked_block_reverts_to_hold_not_allow(self):
+        # The loosening direction, and the reason the UI warns differently about it:
+        # it does NOT become allowed, it becomes decidable.
+        rid = self._rule("bad.example", "block")
+        self.assertEqual(cp._decide("bad.example")[0], "deny")
+        cp.revoke_rule(rid, _FakeRequest())
+        self.assertEqual(cp._decide("bad.example")[0], "hold")
+
+
 def _served(**kw):
     """The grouped rows ``/api/audit`` serves.
 

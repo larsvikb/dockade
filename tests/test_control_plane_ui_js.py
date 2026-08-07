@@ -319,6 +319,18 @@ console.log(JSON.stringify({
         empty: m.coverageSummary([], 0),
         counts_decisions: m.coverageSummary([{ n: 40 }], 900).shown,
       },
+      revoke: {
+        allow_rule: m.revokePreview({ pattern: ".github.com", action: "allow",
+                                      source: "operator" }),
+        block_rule: m.revokePreview({ pattern: "evil.example", action: "block",
+                                      source: "operator" }),
+        seed_rule: m.revokePreview({ pattern: "pypi.org", action: "allow",
+                                     source: "seed" }),
+        // An action the frontend does not recognise must warn as the DANGEROUS
+        // direction, not the safe one.
+        unknown_action: m.revokePreview({ pattern: "x", action: "", source: "op" }),
+        nothing: m.revokePreview(null),
+      },
       announce: {
         nothing: m.pendingAnnouncement([], 0),
         no_list: m.pendingAnnouncement(null, 0),
@@ -912,6 +924,48 @@ class PageScriptTests(unittest.TestCase):
         self.assertIs(self.probe["saturation"]["outage"]["row_marked"], True)
         self.assertIs(self.probe["saturation"]["outage"]["row_plain"], False)
 
+    def test_revoking_an_allow_and_a_block_do_not_read_alike(self):
+        """They are opposites. Revoking an allow TIGHTENS — the host reverts to
+        unknown and the next request is held. Revoking a block LOOSENS: an explicit
+        operator denial becomes a request that can then be approved, possibly by
+        someone who never knew it had been deliberately refused. A single "delete
+        this?" hides exactly that."""
+        r = self.probe["saturation"]["revoke"]
+        self.assertIn("no longer be allowed", r["allow_rule"]["text"])
+        self.assertIn("no longer be blocked", r["block_rule"]["text"])
+        self.assertFalse(r["allow_rule"]["danger"])
+        self.assertTrue(r["block_rule"]["danger"])
+
+    def test_the_dangerous_direction_says_it_can_then_be_allowed(self):
+        # The consequence an operator is least likely to have in mind: removing a
+        # block does not merely stop denying, it opens the host to approval.
+        self.assertIn("can then be allowed",
+                      self.probe["saturation"]["revoke"]["block_rule"]["text"])
+
+    def test_both_say_the_consequence_rather_than_the_row(self):
+        """`Delete .github.com?` asks about a table row. `Requests to .github.com
+        will no longer be allowed` asks about the world, which is what the operator
+        is actually deciding — the same discipline persistPreview follows."""
+        r = self.probe["saturation"]["revoke"]
+        for case in ("allow_rule", "block_rule"):
+            with self.subTest(case=case):
+                self.assertIn("held for approval", r[case]["text"])
+
+    def test_a_seed_rule_is_not_revocable_and_says_where_to_change_it(self):
+        """Shown WITH the reason rather than as a missing control, so nobody wonders
+        whether the button failed to render. The backend refuses it too — this is the
+        explanation, not the enforcement."""
+        seed = self.probe["saturation"]["revoke"]["seed_rule"]
+        self.assertFalse(seed["allowed"])
+        self.assertIn("egress-allowlist.txt", seed["text"])
+
+    def test_an_unrecognised_action_warns_as_the_dangerous_one(self):
+        # Under-warning is the failure worth avoiding; an over-warned allow costs the
+        # operator one extra sentence.
+        r = self.probe["saturation"]["revoke"]
+        self.assertTrue(r["unknown_action"]["danger"])
+        self.assertTrue(r["nothing"]["danger"])
+
     def test_the_list_says_when_it_is_a_window(self):
         """Forty rows silently stood for the whole record. Grouping made that worse,
         not better: counts on the rows read as an explanation of the volume, so the
@@ -1384,6 +1438,22 @@ class DuplicateBadgeSourceTests(unittest.TestCase):
         self.assertIn('entry.state === "confirming"', body)
 
 
+# Paths app.js actually requests, with each `${...}` interpolation replaced by a
+# stand-in — and by MORE THAN ONE, because the ids in this app are not all the same
+# shape. An approval id is a uuid4 and its route accepts `[A-Za-z0-9._-]`; a rule id
+# is an integer and its route is bounded to digits, deliberately, since that segment
+# lands in a URL path and a looser class would be a traversal primitive. One
+# alphabetic placeholder would therefore report the tighter route as uncallable.
+# A call is relayable if ANY stand-in matches.
+_ID_STANDINS = ("ID", "1")
+
+
+def _requested_paths(js: str) -> list[list[str]]:
+    raw = re.findall(r"""(?:fetch|EventSource)\(\s*["'`]([^"'`]+)["'`]""", js)
+    return [[re.sub(r"\$\{[^}]*\}", stand, r).split("?")[0]
+             for stand in _ID_STANDINS] for r in raw]
+
+
 class InlineScriptTests(unittest.TestCase):
     """``script-src 'self'`` is only worth sending while the page has no inline
     script, and that invariant spans two files — so it is checked, not trusted.
@@ -1483,18 +1553,15 @@ class InlineScriptTests(unittest.TestCase):
         js = APP_JS.read_text()
         # Served by this container rather than relayed (see control-plane-ui/app.py).
         local = {"/", "/app.js", "/healthz"}
-        calls = re.findall(r"""(?:fetch|EventSource)\(\s*["'`]([^"'`]+)["'`]""", js)
+        calls = _requested_paths(js)
         self.assertGreater(len(calls), 3, "no fetch/EventSource calls found — did the "
                                           "page's I/O move somewhere this cannot see?")
-        for raw in calls:
-            # `${...}` is an interpolated approval id; the route patterns bound it to a
-            # slash-free segment, so any placeholder text stands in for it.
-            path = re.sub(r"\$\{[^}]*\}", "ID", raw).split("?")[0]
+        for variants in calls:
             self.assertTrue(
-                path in local or ui._relay_allowed("GET", path)
-                or ui._relay_allowed("POST", path),
-                f"app.js calls {path}, which control-plane-ui neither serves nor "
-                f"relays — add it to _RELAY_ROUTES or it will 403 in the browser")
+                any(p in local or ui._relay_allowed("GET", p)
+                    or ui._relay_allowed("POST", p) for p in variants),
+                f"app.js calls {variants[0]}, which control-plane-ui neither serves "
+                f"nor relays — add it to _RELAY_ROUTES or it will 403 in the browser")
 
     def test_every_relayed_route_is_actually_called(self):
         """The converse, and the one that keeps a default-deny allowlist worth reading.
@@ -1508,8 +1575,7 @@ class InlineScriptTests(unittest.TestCase):
         this test that someone has to justify — not as an entry that quietly stops
         matching anything."""
         js = APP_JS.read_text()
-        calls = [re.sub(r"\$\{[^}]*\}", "ID", raw).split("?")[0] for raw in
-                 re.findall(r"""(?:fetch|EventSource)\(\s*["'`]([^"'`]+)["'`]""", js)]
+        calls = [p for variants in _requested_paths(js) for p in variants]
         self.assertTrue(calls, "no fetch/EventSource calls found")
         unused = [f"{method} {pattern.pattern}"
                   for method, pattern in ui._RELAY_ROUTES

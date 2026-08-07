@@ -64,6 +64,18 @@
      tint, so it survives the row striping and stays legible to anyone who cannot
      separate these particular hues. The banner above the table carries the words —
      colour alone must not be the only cue (WCAG 1.4.1). */
+  /* Revocation. Deliberately quiet: it sits in a table an operator scans, and the
+     weight belongs on the confirm — which states the CONSEQUENCE and differs for a
+     block rule, whose removal loosens policy rather than tightening it. */
+  button.revoke { background: transparent; color: var(--dim);
+    border: 1px solid var(--line); border-radius: 6px; padding: 2px 8px;
+    font-size: 12px; cursor: pointer; }
+  button.revoke:hover { color: var(--deny); border-color: var(--deny); }
+  button.revoke[disabled] { opacity: .5; cursor: default; }
+  /* A policy change in the decisions list. Not an egress decision, so it does not
+     borrow allow/deny/hold colour — it is the operator acting on the rules those
+     decisions are made from. */
+  .tag.revoke { background: #3a2f18; color: var(--hold); }
   tr.outage > td { border-top: 1px solid var(--hold); }
   tr.outage > td:first-child { border-left: 3px solid var(--hold); }
   /* The audit `stage`, prefixed to the HOST it describes — `http · example.com`, which
@@ -289,13 +301,14 @@
   <section id="view-policy" role="tabpanel" aria-labelledby="tab-policy" hidden>
     <h2>Standing policy <span class="note" id="rulecount"></span></h2>
     <div class="empty">
-      Every request is decided by these rules before anything is held. Read-only here —
-      rules are written by &ldquo;+ persist&rdquo; approvals and by the seed file, and
-      removing one currently needs direct access to the store.
+      Every request is decided by these rules before anything is held. Rules are
+      written by &ldquo;+ persist&rdquo; approvals and by the seed file; operator
+      rules can be revoked here, seed rules only by editing
+      <code>policies/egress-allowlist.txt</code>.
     </div>
     <table>
       <thead><tr><th>action</th><th>pattern</th><th>matches</th><th>source</th>
-        <th>added</th></tr></thead>
+        <th>added</th><th></th></tr></thead>
       <tbody id="rules"></tbody>
     </table>
     <!-- Same job as `audit-empty`, and needed more here. This poll failing used to be

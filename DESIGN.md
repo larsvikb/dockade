@@ -1576,6 +1576,44 @@ keep twice over now — the same words label the candidates in the persist confi
 so what an approval promises to write and what the policy view later shows it wrote are
 described identically.
 
+**Taking a rule back (`POST /api/rules/{id}/revoke`).** A governance plane that can
+grant but never revoke is half a plane, and until this landed a mistaken `+ persist`
+was permanent short of hand-editing SQLite in the volume. Four decisions worth
+recording, because none of them is the obvious one:
+
+- **The two directions are opposites, and the confirm carries the difference.**
+  Revoking an *allow* tightens: the host reverts to unknown and the next request is
+  held. Revoking a *block* loosens — an explicit operator denial becomes a request
+  that can then be approved, quite possibly by someone who never knew it had been
+  deliberately refused. Both land on `hold`, so nothing structural distinguishes
+  them; only wording can. `revokePreview` states the consequence rather than the row
+  ("requests to X will no longer be blocked… and can then be allowed"), the same
+  discipline the persist confirm uses, and an unrecognised action warns as the
+  dangerous direction rather than the safe one.
+- **Seed rules cannot be revoked, and the refusal is in the BACKEND.** Their source
+  of truth is `policies/egress-allowlist.txt`, a reviewed file under version control,
+  and a click that left the file disagreeing with the store would make the file a
+  lie. It also closes a trap for free: `_seed_if_empty` re-reads that file whenever
+  the rules table is empty, so a store whose every rule could be revoked would
+  resurrect the entire seed allowlist on the next restart. With seed rules
+  undeletable that state is unreachable — which is why the property is asserted as
+  behaviour rather than left as a consequence. The cost is that retiring a
+  *transitional* seed entry (npm, PyPI, GitHub) is a migration shipped beside the
+  code that replaces it, not an operator action. That is the right shape for a
+  versioned change to a declared policy.
+- **Keyed on `id`, not pattern.** Patterns carry the live normalization gap noted
+  under Open decisions (`_match` lowercases but does not strip a trailing FQDN dot),
+  so a pattern-keyed delete inherits every such mismatch and can miss the row the
+  operator is looking at. The relay bounds that segment to digits, and the bound is
+  load-bearing rather than tidy: it lands in a URL path, so a looser class admits
+  dot-segments that httpx resolves upstream into a different path than the allowlist
+  approved.
+- **Deletion, not a tombstone, with the audit row as the history.** Dead rows in the
+  rules table would have to be filtered by every reader of it — including `_decide`,
+  the one place a mistake is unrecoverable. Provenance is recorded exactly as
+  `resolve` records it: editing standing policy is more consequential than any single
+  egress decision, and nothing recorded that it had happened at all.
+
 **Approval provenance — detection where prevention is not available.** Given that
 ceiling, the frontend and backend at least make a forged approval *visible*. The
 relay strips client-supplied provenance headers (`X-Dockade-Actor`,
@@ -2118,12 +2156,12 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
   leave the sandbox.
 - Docs mirror / offline docs tool.
 - Progressive auto-approval driven by accumulated policy + audit history.
-- **Rule MUTATION / revocation on the control plane** (listing is done — see "Standing
-  policy" below — and so, now, is choosing what a persist writes). Rules can be
-  GRANTED — a `*_persist` resolution writes one — but still never edited or removed:
-  there is no mutating rule endpoint, and the seed file is re-read only when the table
-  is empty, so a mistaken persist is permanent short of hand-editing SQLite in the
-  volume. **This is now the whole of the item.** The two sharp edges it used to carry
+- **Rule MUTATION on the control plane.** Revocation is **now built** — see "Taking a
+  rule back" under the control-plane section. What remains is EDITING: changing a
+  rule's pattern or flipping its action is still revoke-then-persist rather than one
+  operation, which is two audit rows for one intent and leaves a window in which the
+  host is neither allowed nor blocked. Acceptable, because that window fails to
+  `hold` rather than to allow, but it is not the same thing as an edit. The two sharp edges it used to carry
   have moved: the agent-controlled-pattern one is closed (`_persist_candidates` derives
   a bounded set and `resolve` validates against it — see "A `+ persist` says what it
   will write"), and the `INSERT OR IGNORE` wart, where `deny_persist` silently writes

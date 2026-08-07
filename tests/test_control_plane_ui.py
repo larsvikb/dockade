@@ -293,7 +293,8 @@ class RelayAllowlistTests(unittest.TestCase):
         for path, method in (("approvals/stream", "GET"),
                              ("api/audit", "GET"), ("api/rules", "GET"),
                              ("api/config", "GET"),
-                             ("approvals/0123abcd/resolve", "POST")):
+                             ("approvals/0123abcd/resolve", "POST"),
+                             ("api/rules/12/revoke", "POST")):
             self._proxy(path, method)
             self.assertEqual(urlsplit(_sent["url"]).netloc, "control-plane:8090",
                              f"{method} {path} must relay")
@@ -314,10 +315,21 @@ class RelayAllowlistTests(unittest.TestCase):
                              ("approvals", "GET"), ("status", "GET"),
                              ("approvals/x/resolve", "GET"),
                              ("approvals/a/b/resolve", "POST"),
-                             # The rules view is READ-only: no mutation path exists
-                             # on the backend, and none is relayed either. Same for
-                             # config — the UI reads settings, it does not set them.
-                             ("api/rules", "POST"), ("api/config", "POST")):
+                             # The rules VIEW is read-only; revocation has its own
+                             # path. Config is read-only outright — the UI reads
+                             # settings, it does not set them.
+                             ("api/rules", "POST"), ("api/config", "POST"),
+                             # The revoke route's id segment is bounded to DIGITS,
+                             # and that bound is load-bearing rather than tidy: the
+                             # segment lands in a URL path, so a looser class admits
+                             # dot-segments, which httpx resolves upstream into a
+                             # different path than the one the allowlist approved.
+                             # Widening it to `[^/]+` passes every other test here.
+                             ("api/rules/../revoke", "POST"),
+                             ("api/rules/1.2/revoke", "POST"),
+                             ("api/rules/abc/revoke", "POST"),
+                             ("api/rules//revoke", "POST"),
+                             ("api/rules/12/revoke", "GET")):
             resp = self._proxy(path, method)
             self.assertEqual(getattr(resp, "status_code", None), 403,
                              f"{method} {path} must be refused")

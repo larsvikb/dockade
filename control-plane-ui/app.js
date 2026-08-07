@@ -350,6 +350,49 @@ function repeatCount(r) {
   return Number.isFinite(n) && n > 1 ? Math.floor(n) : 1;
 }
 
+// What revoking a rule is about to do, for the confirm step — and whether it is the
+// safe direction or the dangerous one.
+//
+// The two are opposites and a single "delete this?" hides that. Revoking an ALLOW
+// tightens: the host reverts to unknown and the next request is held for a human.
+// Revoking a BLOCK loosens — an explicit operator denial becomes "unknown", which
+// can then be approved by someone who never knew it had been deliberately refused.
+// Both land on `hold`; only the direction differs, so only wording can carry it.
+//
+// Says the CONSEQUENCE rather than the pattern alone, the same discipline
+// persistPreview uses. "Delete .github.com?" asks about a row. "Requests to
+// .github.com will no longer be allowed" asks about the world.
+//
+// Seed rules are reported as not revocable at all, with the reason. The backend
+// refuses them too — this is the explanation, not the control.
+function revokePreview(rule) {
+  const pattern = (rule && rule.pattern) || "";
+  const action = (rule && rule.action) || "";
+  if (rule && rule.source === "seed") {
+    return {
+      allowed: false,
+      pattern,
+      danger: false,
+      text: `${pattern} comes from the policy seed and cannot be revoked here. `
+          + `Edit policies/egress-allowlist.txt and rebuild.`,
+    };
+  }
+  // Unknown action is treated as the dangerous direction: a confirm that
+  // under-warns is the failure worth avoiding, and an over-warned allow costs the
+  // operator one extra sentence.
+  const loosening = action !== "allow";
+  return {
+    allowed: true,
+    pattern,
+    danger: loosening,
+    text: loosening
+      ? `Requests to ${pattern} will no longer be blocked. They will be held for `
+        + `approval instead — and can then be allowed.`
+      : `Requests to ${pattern} will no longer be allowed. They will be held for `
+        + `approval instead.`,
+  };
+}
+
 // What a screen reader should hear when the pending queue changes.
 //
 // Announced from a SEPARATE element rather than by making the card list a live
@@ -1189,6 +1232,7 @@ function start() {
   let auditFailed = false;
   let rulesLoaded = false;
   let rulesFailed = false;
+  let rulesById = new Map();
 
   // One renderer for both, because the element contract is identical and the two
   // states drifting apart is precisely what happened last time.
@@ -1289,6 +1333,9 @@ function start() {
     rulesLoaded = true;
     // Signature over pattern+action, not just the COUNT: a rule whose action
     // flipped is the change most worth noticing, and it leaves the count alone.
+    // Keyed by id so the click handler works from the ROW rather than from
+    // markup it would otherwise have to parse back out of the DOM.
+    rulesById = new Map(rows.map(r => [String(r.id), r]));
     const sig = JSON.stringify(rows.map(r => r.action + " " + r.pattern));
     if (policySig !== null && sig !== policySig && current !== "policy") {
       policyUnseen = true;
@@ -1300,16 +1347,62 @@ function start() {
       rows.length ? `· ${rows.length} rule${rows.length === 1 ? "" : "s"}` : "· none";
     document.getElementById("rules").innerHTML = rows.map(r => {
       const wild = (r.pattern || "").startsWith(".");
+      const p = revokePreview(r);
+      // A seed rule shows WHY it has no control rather than an empty cell, so
+      // nobody has to wonder whether the button failed to render. The id is on the
+      // button because revocation keys on it, never on the pattern.
+      const control = p.allowed
+        ? `<button type="button" class="revoke" data-rule="${esc(String(r.id))}"
+             >revoke</button>`
+        : `<span class="ts" title="${esc(p.text)}">from seed</span>`;
       return `<tr>
         <td><span class="tag ${esc(r.action)}">${esc(r.action)}</span></td>
         <td><code>${esc(r.pattern)}</code></td>
         <td class="${wild ? "wild" : "ts"}">${esc(r.scope)}</td>
         <td class="ts">${esc(r.source)}</td>
-        <td class="ts">${r.created_at ? fmtStamp(r.created_at) : ""}</td></tr>`;
+        <td class="ts">${r.created_at ? fmtStamp(r.created_at) : ""}</td>
+        <td>${control}</td></tr>`;
     }).join("");
     renderRulesStatus(rows.length);
     updateIndicators();
   }
+
+  // Delegated, because the table is replaced wholesale on every poll — a handler
+  // bound per button would be re-bound every four seconds and lost in between.
+  //
+  // `confirm()` rather than the inline two-step the approval cards use. The cards
+  // needed inline confirmation because the button row moves under the pointer as
+  // holds expire; this table only changes when policy does, and a modal that steals
+  // focus is the right amount of friction for an action with no undo.
+  document.getElementById("rules").addEventListener("click", async (ev) => {
+    const btn = ev.target.closest("button.revoke");
+    if (!btn) return;
+    const row = rulesById.get(btn.dataset.rule);
+    if (!row) return;
+    const p = revokePreview(row);
+    if (!p.allowed) return;
+    if (!window.confirm(`${p.text}\n\nRevoke ${p.pattern}?`)) return;
+    btn.disabled = true;
+    try {
+      const res = await fetch(`/api/rules/${encodeURIComponent(btn.dataset.rule)}/revoke`,
+                              { method: "POST" });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok || !body.ok) {
+        // Says what the backend said. The refusals that matter here are 403 (a seed
+        // rule, which the UI should not have offered) and 404 (already revoked, or
+        // the table on screen is stale) — both are worth reading rather than
+        // collapsing into "failed".
+        window.alert(`Could not revoke: ${body.detail || res.status}`);
+        btn.disabled = false;
+        return;
+      }
+    } catch (e) {
+      window.alert("Could not revoke: the control plane is unreachable.");
+      btn.disabled = false;
+      return;
+    }
+    refreshRules();
+  });
 
   // ── the approvals feed, and the reconnect it used to lack ─────────────────
   const conn = document.getElementById("conn");
@@ -1397,7 +1490,7 @@ if (typeof module !== "undefined" && module.exports) {
     lampState, backoffDelay, diffPending, shouldSweep,
     holdRemaining, countdownState, departure, persistPreview, saturationState,
     ackCount, requestsLabel, auditRow, auditStatus, rulesStatus, repeatCount,
-    outageSummary, pendingAnnouncement, coverageSummary,
+    outageSummary, pendingAnnouncement, coverageSummary, revokePreview,
     fmtTime, fmtStamp, fmtInstant,
     AUDIT_ORDINARY_STAGE,
     RECONNECT_MIN_MS, RECONNECT_MAX_MS, STALE_MAX_MS, COUNTDOWN_URGENT_S,

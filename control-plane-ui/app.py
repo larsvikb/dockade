@@ -127,6 +127,10 @@ _RELAY_ROUTES = (
     ("POST", re.compile(r"^/approvals/[A-Za-z0-9._-]{1,128}/resolve$")),
     ("GET", re.compile(r"^/api/audit$")),
     ("GET", re.compile(r"^/api/rules$")),
+    # Digits only, and bounded: the id goes straight into a path segment, and a
+    # pattern that could match a slash or a dot-segment would be a path-traversal
+    # primitive rather than an id.
+    ("POST", re.compile(r"^/api/rules/[0-9]{1,19}/revoke$")),
     ("GET", re.compile(r"^/api/config$")),
     ("POST", re.compile(r"^/api/saturation/ack$")),
 )

@@ -1307,8 +1307,13 @@ def api_rules() -> list[dict]:
     item in DESIGN.md for what revocation still needs)."""
     with _connect() as conn:
         rows = conn.execute(
-            "SELECT pattern, action, source, created_at FROM rules "
+            "SELECT id, pattern, action, source, created_at FROM rules "
             "ORDER BY action DESC, pattern").fetchall()
+    # `id` is served so revocation can key on it. Not cosmetic: patterns are the one
+    # field a revoke could plausibly key on instead, and they carry a live
+    # normalization gap (``_match`` lowercases but does not strip a trailing FQDN dot
+    # — see DESIGN.md), so a pattern-keyed delete inherits every such mismatch and can
+    # miss the row the operator is looking at. An id cannot.
     return [dict(r, scope=_pattern_scope(r["pattern"])) for r in rows]
 
 
@@ -1353,6 +1358,59 @@ def api_saturation_ack(req: AckRequest) -> dict:
             _SATURATION["acked_ts"] = time.time()
         return {"ok": True, "acknowledged": _SATURATION["acked"],
                 "rejections": total}
+
+
+@app.post("/api/rules/{rule_id}/revoke")
+def revoke_rule(rule_id: int, request: Request) -> JSONResponse:
+    """Remove one operator-created rule. The other half of a governance plane that
+    could grant but never take back.
+
+    **Seed rules are refused, and refused HERE rather than merely hidden in the UI.**
+    Their source of truth is ``policies/egress-allowlist.txt``, a reviewed file under
+    version control, and a click that left the file disagreeing with the store would
+    make the file a lie. It also removes a trap for free: ``_seed_if_empty`` re-reads
+    that file whenever the rules table is empty, so a store whose every rule could be
+    revoked would silently resurrect the whole seed allowlist on the next restart.
+    With seed rules undeletable the table cannot reach that state.
+
+    The consequence of retiring a TRANSITIONAL seed entry (npm, PyPI, GitHub — see
+    DESIGN.md) is therefore that it happens as a migration shipped beside the code
+    that replaces it, not as an operator action. That is the right shape for it: it is
+    a versioned, reviewed change to a declared policy.
+
+    Deletion rather than a tombstone. The audit row below IS the history — a rules
+    table carrying dead rows would have to be filtered by every reader of it,
+    including ``_decide``, which is the one place a mistake is unrecoverable.
+
+    Provenance is recorded exactly as ``resolve`` records it, and for the same reason:
+    editing standing policy is more consequential than any single egress decision, and
+    until now nothing recorded that it had happened at all. Detection, not prevention
+    — the fields are forgeable by a host-local caller (see ``_actor``)."""
+    actor = _actor(request)
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT pattern, action, source FROM rules WHERE id=?",
+            (rule_id,)).fetchone()
+        if row is None:
+            return JSONResponse({"ok": False, "detail": "unknown rule"},
+                                status_code=404)
+        if row["source"] == "seed":
+            return JSONResponse(
+                {"ok": False,
+                 "detail": f"{row['pattern']} came from the policy seed and cannot "
+                           f"be revoked here — edit policies/egress-allowlist.txt"},
+                status_code=403)
+        conn.execute("DELETE FROM rules WHERE id=?", (rule_id,))
+        conn.commit()
+
+    # What the host reverts TO is the useful half of this record. Both actions land on
+    # `hold` — an unmatched host is held for approval — but from opposite directions,
+    # and only the reason line says which.
+    _audit("revoke", stage="policy", host=row["pattern"],
+           reason=f"{row['action']} rule revoked by {actor}; {row['pattern']} is now "
+                  f"unknown and will be held for approval")
+    return JSONResponse({"ok": True, "pattern": row["pattern"],
+                         "action": row["action"]})
 
 
 @app.get("/status", response_class=PlainTextResponse)

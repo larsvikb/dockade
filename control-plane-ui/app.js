@@ -625,8 +625,8 @@ function fmtInstant(ts) {
 // ── the page ────────────────────────────────────────────────────────────────
 
 function start() {
-  const esc = s => (s ?? "").toString().replace(/[&<>"]/g,
-    c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const esc = s => (s ?? "").toString().replace(/[&<>"']/g,
+    c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
   // ── state the indicators read ─────────────────────────────────────────────
   let pendingCount = 0;      // approvals waiting on a human

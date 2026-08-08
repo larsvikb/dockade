@@ -419,7 +419,11 @@ def _persist_candidates(host: str) -> list[str]:
 def _decide(host: str) -> tuple[str, str]:
     """(decision, reason). Block wins over allow; an unmatched host is HELD for
     human approval (2b) rather than denied outright."""
-    host = (host or "").lower()
+    # Strip a trailing FQDN dot, matching the proxy's relay guard: `evil.com.` and
+    # `evil.com` are the same destination, so without this an explicit operator BLOCK
+    # of `evil.com` misses `evil.com.` — it lands in a hold and can be re-prompted
+    # indefinitely. (Stored patterns are already dot-normalized on the persist path.)
+    host = (host or "").lower().rstrip(".")
     with _connect() as conn:
         rows = conn.execute("SELECT pattern, action FROM rules").fetchall()
     for r in rows:
@@ -432,13 +436,21 @@ def _decide(host: str) -> tuple[str, str]:
 
 
 def _audit(decision: str, **fields) -> None:
+    # Agent-INFLUENCED fields (host/url/... arrive on /authorize from the proxy, which
+    # relays whatever the sandbox asked for) are truncated on write — the same
+    # trust-boundary cap the ingest path applies (DRAIN_MAX_FIELD). Without it a
+    # megabyte-long URL on a single request would bloat the crown-jewel store and the
+    # glanceable /api/audit list. Non-string fields (port) and the server-set decision
+    # pass through untouched.
+    def cap(v):
+        return v[:DRAIN_MAX_FIELD] if isinstance(v, str) else v
     with _connect() as conn:
         conn.execute(
             "INSERT INTO audit(ts, decision, stage, host, port, proto, client, "
             "method, url, reason) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (time.time(), decision, fields.get("stage"), fields.get("host"),
-             fields.get("port"), fields.get("proto"), fields.get("client"),
-             fields.get("method"), fields.get("url"), fields.get("reason")))
+            (time.time(), decision, cap(fields.get("stage")), cap(fields.get("host")),
+             fields.get("port"), cap(fields.get("proto")), cap(fields.get("client")),
+             cap(fields.get("method")), cap(fields.get("url")), cap(fields.get("reason"))))
         conn.commit()
     # Mirror every decision to stdout so `docker compose logs -f control-plane`
     # (make logs-cp) is a live decision feed — the same role the egress proxy's
@@ -767,7 +779,8 @@ def _release_hold(approval_id: str) -> None:
 # so a caller cannot self-report this value — but it is only as trustworthy as the
 # relay, which is why _actor labels it as asserted rather than observed.
 ACTOR_HEADER = "x-dockade-actor"
-# Bound the recorded User-Agent so a hostile one cannot bloat the store.
+# Bound each recorded self-reported header (User-Agent, Origin) so a hostile one
+# cannot bloat the store.
 _ACTOR_UA_MAX = 120
 
 
@@ -798,7 +811,7 @@ def _actor(request) -> str:
         parts.append(f"via-ui={asserted}")
     origin = headers.get("origin")
     if origin:
-        parts.append(f"origin={origin}")
+        parts.append(f"origin={origin[:_ACTOR_UA_MAX]}")
     ua = headers.get("user-agent")
     if ua:
         parts.append(f'ua="{ua[:_ACTOR_UA_MAX]}"')
@@ -1152,9 +1165,12 @@ def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResp
     #
     # ``event.set()`` releases EVERY waiter on this card, which is the whole of what
     # grouping does to this endpoint: one click, one durable row, one audit line per
-    # released request. Closing the group in the SAME critical section is what makes
-    # decision and joinability change together — a duplicate arriving a moment later
-    # opens its own card rather than inheriting an outcome it was never shown beside.
+    # released request. Closing the group here stops further joins. The decision
+    # committed just above (outside _LOCK), so a duplicate can still slip into the
+    # narrow gap before this line and inherit this outcome — but it is identical by
+    # group key (client/host/port/proto), so it rides the same grant just made, and a
+    # deny is fail-safe. (Fully closing the gap would mean holding _LOCK across the DB
+    # commit above.)
     with _LOCK:
         _close_group_locked(approval_id)
         if approval_id in _PENDING_EVENTS:

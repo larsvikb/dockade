@@ -92,7 +92,7 @@ REFFILES := $(SCRIPTS) \
 
 .PHONY: help check check-strict lint consistency test verify-build \
         up down destroy rebuild logs-ep logs-cp \
-        claude opencode boundary
+        claude opencode boundary split-check
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \

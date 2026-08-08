@@ -1524,5 +1524,20 @@ class ListenerSeparationTests(unittest.TestCase):
                     authorize_bind="172.31.0.2", authorize_port=8091)
 
 
+class ActorHeaderAgreementTests(unittest.TestCase):
+    def test_actor_header_agrees_with_the_relay(self):
+        """The backend reads ``ACTOR_HEADER`` as the relay's assertion about the
+        browser; the relay (``control-plane-ui/app.py`` — a different image, no shared
+        module) strips any client-supplied copy and re-adds it with the peer address. If
+        the two names drift, provenance silently loses ``via-ui=`` AND the relay's
+        spoof-strip stops covering the header the backend trusts, so a caller could
+        self-report an actor the audit records as relay-asserted. Read the relay's
+        SOURCE, the same arrangement as the fail-closed-marker test above."""
+        ui_src = (ROOT / "control-plane-ui" / "app.py").read_text()
+        m = re.search(r'^ACTOR_HEADER\s*=\s*"([^"]+)"', ui_src, re.MULTILINE)
+        self.assertIsNotNone(m, "ACTOR_HEADER not found in control-plane-ui/app.py")
+        self.assertEqual(m.group(1), cp.ACTOR_HEADER)
+
+
 if __name__ == "__main__":
     unittest.main()

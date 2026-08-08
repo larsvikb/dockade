@@ -115,7 +115,7 @@ failure it warns about.
 - **New source file?** Add an `SPDX-License-Identifier: Apache-2.0` header in the
   first three lines, so licence scanners never have to parse `LICENSE`.
   `make consistency` enforces this for the file types where it applies — scripts,
-  Python, JS, HTML, Dockerfiles, the compose file and the workflow. Not for JSON,
+  Python, JS, HTML, Dockerfiles, the compose file, the Makefile and the workflow. Not for JSON,
   which has no comment syntax, nor for markdown, linter configs or the baked
   dotfiles, which are settings and data rather than works.
 - **Adding a recurring workflow?** Make it a skill or a `make` target rather than a

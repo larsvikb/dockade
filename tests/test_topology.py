@@ -27,6 +27,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = (ROOT / "docker-compose.yml").read_text().splitlines()
 ADDON = (ROOT / "proxies" / "egress" / "addon.py").read_text()
+APP = (ROOT / "control-plane" / "app.py").read_text()
 
 #: The control plane's two listeners. Duplicated from app.py's defaults rather
 #: than imported, deliberately: this file is asserting that compose and the app
@@ -232,6 +233,27 @@ class RelayGuardAgreesWithComposeTests(unittest.TestCase):
             self.assertTrue(
                 any(re.match(r"\s*internal:\s*true\s*$", line) for line in body),
                 f"network {network} is not internal: true")
+
+
+class AppPortDefaultsAgreeTests(unittest.TestCase):
+    """Close the third edge of the port triangle. The constants above are checked
+    against compose, and compose sets NEITHER ``CONTROL_AUTHORIZE_PORT`` nor
+    ``CONTROL_MANAGE_PORT`` — so the APP's own defaults are the deployed ports, yet
+    nothing asserted they still match. A drift there would pass every
+    compose-vs-literal check here while the healthcheck (which hardcodes 8091) and the
+    proxy failed at deploy. Text-parsed, to keep this file free of the app import (see
+    the module docstring)."""
+
+    def _default(self, name: str) -> int:
+        m = re.search(rf'{name}",\s*"(\d+)"', APP)
+        self.assertIsNotNone(m, f"no default for {name} in control-plane/app.py")
+        return int(m.group(1))
+
+    def test_authorize_port_default_matches_compose(self):
+        self.assertEqual(self._default("CONTROL_AUTHORIZE_PORT"), AUTHORIZE_PORT)
+
+    def test_manage_port_default_matches_compose(self):
+        self.assertEqual(self._default("CONTROL_MANAGE_PORT"), MANAGE_PORT)
 
 
 if __name__ == "__main__":

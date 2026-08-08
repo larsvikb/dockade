@@ -595,5 +595,36 @@ class RelayHostPinningTests(unittest.TestCase):
         self.assertEqual(_sent, {})
 
 
+class GuardMiddlewareWiringTests(unittest.TestCase):
+    """The tests above exercise ``_guard`` / ``_security_headers`` as plain functions,
+    but the stub's ``@app.middleware`` decorator is identity — so whether the app
+    actually REGISTERS them, and in the right order, is invisible to them. Removing the
+    decorator off ``_guard`` (disabling the Host/CSRF/framing guards) or swapping the
+    two would pass the whole behavioural suite. Assert the wiring from the source.
+
+    Order matters: under Starlette the LAST-registered ``@app.middleware('http')`` is
+    the OUTERMOST, so ``_security_headers`` must be declared AFTER ``_guard`` for a
+    refused (403) framing/rebinding attempt to still carry the CSP."""
+
+    SRC: ClassVar[str] = (ROOT / "control-plane-ui" / "app.py").read_text()
+
+    def _mw(self, fn: str):
+        return re.search(rf'@app\.middleware\("http"\)\s*\nasync def {fn}\b', self.SRC)
+
+    def test_guard_is_registered_as_middleware(self):
+        self.assertIsNotNone(
+            self._mw("_guard"),
+            "_guard must be an @app.middleware('http') — it is the Host/CSRF/framing guard")
+
+    def test_security_headers_is_registered_after_guard(self):
+        guard, headers = self._mw("_guard"), self._mw("_security_headers")
+        self.assertIsNotNone(
+            headers, "_security_headers must be an @app.middleware('http')")
+        self.assertLess(
+            guard.start(), headers.start(),
+            "_security_headers must be declared AFTER _guard so it wraps it and hardens "
+            "the 403 refusals with the CSP")
+
+
 if __name__ == "__main__":
     unittest.main()

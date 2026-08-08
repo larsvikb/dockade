@@ -40,7 +40,7 @@ socket, and (by design) no route to a control plane.
 inside the sandbox.
 
 ```bash
-# 1. Bring up the shared infrastructure once (the governed egress proxy).
+# 1. Bring up the shared infrastructure once (egress proxy + control plane + UI).
 #    Sandboxes route their traffic through it and it audits every connection.
 docker compose -f /path/to/dockade/docker-compose.yml up -d --build
 
@@ -136,7 +136,7 @@ open egress is exactly the state this sandbox exists to prevent.
 
 | Layer | Mechanism |
 |-------|-----------|
-| **Network egress** | With the infra up, `sandbox-net` is `internal: true` — the sandbox has **no route to the internet at all**; the only path off-box is the **egress proxy**, dual-homed onto a separate `egress-net`. The proxy enforces a **domain**-level allowlist with per-connection audit (closing the shared-CDN/fronting gap that an IP-level rule can't). The in-container firewall (`init-firewall.sh`) is now **defense-in-depth**: in governed mode it permits only the proxy + embedded DNS, so even if it failed there's no route out. IPv6 fully denied. Without the infra, the launcher falls back to **standalone** mode (non-internal net, direct `ipset` IP-allowlist) for proxy-less use. |
+| **Network egress** | With the infra up, `sandbox-net` is `internal: true` — the sandbox has **no route to the internet at all**; the only path off-box is the **egress proxy**, which reaches the internet on a separate `egress-net`. The proxy enforces a **domain**-level allowlist with per-connection audit (closing the shared-CDN/fronting gap that an IP-level rule can't). The in-container firewall (`init-firewall.sh`) is now **defense-in-depth**: in governed mode it permits only the proxy + embedded DNS, so even if it failed there's no route out. IPv6 fully denied. Without the infra, the launcher falls back to **standalone** mode (non-internal net, direct `ipset` IP-allowlist) for proxy-less use. |
 | **Privilege** | Non-root `sandbox` user; `--cap-drop=ALL` + minimal adds; `no-new-privileges`; no host Docker socket. |
 | **Filesystem** | Only the bind-mounted `/workspace` and the `/config` volume are *persistent* writable state (the rest of the container filesystem is writable but ephemeral). |
 | **Config** | `CLAUDE_CONFIG_DIR=/config`; user settings are re-materialized from a baked template on every boot, so config always matches the repo and volume wipes lose only credentials/runtime state. |
@@ -183,8 +183,12 @@ dockade/
   CONTRIBUTING.md           # how to build, test and submit a change
   CLAUDE.md                 # invariants + conventions for working in the repo
   DESIGN.md                 # architecture, topology, and rationale (read this)
+  NOTES.md                  # lab notebook: measurements, hardware behaviour, dead ends
+  SECURITY.md               # how to report a boundary bypass; the accepted-risk ceiling
+  LICENSE, NOTICE           # Apache-2.0
   Makefile                  # task entry points (make claude / make opencode / make check)
   ruff.toml, .yamllint, .hadolint.yaml, .shellcheckrc   # pinned linter configs (make check)
+  .github/workflows/        # CI: lint + consistency + tests + image builds (make check)
   docker-compose.yml        # shared infra: egress proxy + control plane + UI + local LLM
   run-claude-sandbox.sh     # tier 1: build + launch a Claude sandbox (one or many)
   run-opencode-sandbox.sh   # tier 2: build + launch an opencode/local-LLM sandbox
@@ -198,7 +202,9 @@ dockade/
   control-plane-ui/         # UI FRONTEND — serves the UI + reverse-proxies the API
     Dockerfile              #   FastAPI + httpx; control-ui-net (loopback) + control-net
     app.py                  #   static UI at / + streaming reverse proxy to the backend
-    index.html              #   live SSE approval console
+    app.js                  #   the approval console's behaviour — a file so the CSP can
+                            #   say script-src 'self'; pure helpers unit-tested under node
+    index.html              #   static shell + styles for the SSE approval console
     requirements.txt        #   pinned deps (fastapi, uvicorn, httpx)
   policies/                 # seed policy config (loaded into the control plane)
     egress-allowlist.txt    #   default-deny seed for the control plane's egress policy store
@@ -234,8 +240,8 @@ exposed through governed data-plane services. Next steps toward it:
 
 1. **Egress HTTP(S) proxy** — *done* (`docker-compose.yml` + `proxies/egress/`):
    a CONNECT-level domain allowlist with per-connection audit, and (step 1) the
-   **sole** egress path — `sandbox-net` is `internal: true` with the proxy
-   dual-homed onto `egress-net`.
+   **sole** egress path — `sandbox-net` is `internal: true` with the proxy's
+   internet leg on `egress-net`.
 2. **Control plane** — *step 2a done* (`control-plane/`): a FastAPI + SQLite
    governance authority the **agent cannot reach** — it lives only on internal
    networks the sandbox is not attached to. The UI is reachable from the host

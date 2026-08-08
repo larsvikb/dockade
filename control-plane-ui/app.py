@@ -107,7 +107,9 @@ _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 # Exactly the backend paths this UI needs, as (method, pattern). Everything else —
 # above all `POST /authorize` — is refused rather than relayed. The approval id is
-# bounded and slash-free so nothing path-shaped can be smuggled through it.
+# bounded, slash-free AND dot-free (`uuid4().hex` needs none of `./`), so nothing
+# path-shaped — no traversal, no dot-segment httpx would resolve upstream — can be
+# smuggled through it.
 #
 # EXACTLY the paths it needs, and that word is the maintenance rule rather than a
 # description: a default-deny allowlist is only worth what its entries are worth, and
@@ -124,7 +126,7 @@ _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 # directions.
 _RELAY_ROUTES = (
     ("GET", re.compile(r"^/approvals/stream$")),
-    ("POST", re.compile(r"^/approvals/[A-Za-z0-9._-]{1,128}/resolve$")),
+    ("POST", re.compile(r"^/approvals/[A-Za-z0-9_-]{1,128}/resolve$")),
     ("GET", re.compile(r"^/api/audit$")),
     ("GET", re.compile(r"^/api/rules$")),
     # Digits only, and bounded: the id goes straight into a path segment, and a

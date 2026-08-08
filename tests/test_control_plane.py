@@ -81,6 +81,16 @@ class DecideTests(unittest.TestCase):
         _set_rules([("example.com", "allow")])
         self.assertEqual(cp._decide("EXAMPLE.COM")[0], "allow")
 
+    def test_trailing_fqdn_dot_is_normalized(self):
+        # `evil.com.` and `evil.com` are the same destination, so an operator BLOCK of
+        # `evil.com` must not be evadable with the trailing-dot spelling — which would
+        # otherwise miss the rule, land in a hold and be re-promptable indefinitely.
+        _set_rules([("evil.com", "block")])
+        self.assertEqual(cp._decide("evil.com.")[0], "deny")
+        # A trailing dot on an allowed host still resolves to allow, not hold.
+        _set_rules([("example.com", "allow")])
+        self.assertEqual(cp._decide("example.com.")[0], "allow")
+
 
 class MatchTests(unittest.TestCase):
     def test_match_semantics(self):

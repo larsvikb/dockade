@@ -334,8 +334,8 @@ single-container image and launcher centered on this design. Notable properties:
   `boundary-check.sh` pass on the Debian base. The Ubuntu LTS+ESM support window is
   the one trade-off, minor under rebuild-to-update.
 - Baseline stack: **Node current LTS (24.x)** + `gh` + pipx, plus baked linters
-  (shellcheck / hadolint / ruff, all self-contained so they run under default-deny
-  egress). Node tracks the latest LTS line (even majors); bump the NodeSource
+  (shellcheck / hadolint / ruff / yamllint, all self-contained so they run under
+  default-deny egress). Node tracks the latest LTS line (even majors); bump the NodeSource
   `setup_NN.x` major to move it. Firewall allowlist trimmed to this design
   (Anthropic + GitHub + npm + PyPI).
 - **Own user-defined bridge `sandbox-net`** (owned by `docker-compose.yml`,
@@ -1273,9 +1273,11 @@ request on the card**, which widens what a single click grants — the precise c
 surprise the hold mechanism exists to prevent. What keeps it honest is a count on the
 card, and the count is *live*: a retry can join between the render and the click, so a
 number frozen at first paint would understate what the button is about to do. Two
-invariants sitting in different files back that up. The joining window closes inside the
-**same critical section** that records the decision, so nothing can attach to a card
-that has already been decided and inherit an outcome it was never displayed beside; and
+invariants sitting in different files back that up. The joining window is closed in the
+critical section right after the decision commits — a duplicate can still slip into the
+narrow gap between the commit and that close, but it is identical by group key
+(client/host/port/proto), so it rides the same grant just made for that key and a deny
+is fail-safe regardless; and
 a joiner inherits the card's **existing deadline** rather than starting a fresh window,
 or an agent retrying on a loop would push the deadline out indefinitely and the
 countdown on the card would be a lie.
@@ -1606,10 +1608,10 @@ recording, because none of them is the obvious one:
   *transitional* seed entry (npm, PyPI, GitHub) is a migration shipped beside the
   code that replaces it, not an operator action. That is the right shape for a
   versioned change to a declared policy.
-- **Keyed on `id`, not pattern.** Patterns carry the live normalization gap noted
-  under Open decisions (`_match` lowercases but does not strip a trailing FQDN dot),
-  so a pattern-keyed delete inherits every such mismatch and can miss the row the
-  operator is looking at. The relay bounds that segment to digits, and the bound is
+- **Keyed on `id`, not pattern.** A pattern-keyed delete would have to exact-match the
+  stored `rules.pattern` string, inheriting every normalization subtlety (case, a
+  leading wildcard dot) and possibly missing the row the operator is looking at; an
+  integer `id` is unambiguous. The relay bounds that segment to digits, and the bound is
   load-bearing rather than tidy: it lands in a URL path, so a looser class admits
   dot-segments that httpx resolves upstream into a different path than the allowlist
   approved.
@@ -2205,10 +2207,6 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
     whose countdowns rewrite once a second; and the coverage line compares decisions
     with decisions, since the view is grouped and a rows-versus-decisions ratio reads
     as truncation even when nothing was truncated.)*
-- Normalize hosts consistently across the control plane. The proxy's relay guard
-  strips a trailing FQDN dot but `_decide` / `_match` only lowercase, so `evil.com.`
-  misses a persisted **block** rule and lands in a hold instead — fail-safe, but it
-  lets an explicit operator denial be re-prompted indefinitely.
 - **`boundary-check.sh` manufactures the most alarming rows the audit log can
   hold** — control-plane relay attempts, SNI fronting, metadata-IP SSRF — and they
   are indistinguishable from an agent genuinely attempting them. That is arguably

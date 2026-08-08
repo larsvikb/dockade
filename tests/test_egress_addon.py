@@ -283,5 +283,35 @@ class MetadataProbeTests(unittest.TestCase):
         self.assertTrue(log.info.called)
 
 
+class AuditFileRotationTests(unittest.TestCase):
+    """The local audit file is size-rotated so it cannot grow without bound on a
+    long-lived volume. Pin that _setup_audit_file installs a RotatingFileHandler with
+    the configured cap and backup count — a plain FileHandler here would silently
+    reintroduce the unbounded growth this closes. (What makes the rename LOSSLESS is
+    the control plane's ingest, tested in test_control_plane_ingest.py.)"""
+
+    def test_installs_a_rotating_handler_with_the_configured_caps(self):
+        with mock.patch.object(addon.os, "makedirs"), \
+                mock.patch.object(addon.logger, "addHandler"), \
+                mock.patch.multiple(addon, AUDIT_MAX_BYTES=4096, AUDIT_BACKUPS=3), \
+                mock.patch.object(addon.logging.handlers,
+                                  "RotatingFileHandler") as rfh:
+            addon._setup_audit_file()
+        self.assertTrue(rfh.called)
+        _, kwargs = rfh.call_args
+        self.assertEqual(kwargs["maxBytes"], 4096)
+        self.assertEqual(kwargs["backupCount"], 3)
+
+    def test_audit_file_failure_is_not_fatal(self):
+        # Best-effort sink: a filesystem error warns and falls back to stdout, never
+        # raises — a proxy that cannot open its convenience log must still run.
+        log = mock.Mock()
+        with mock.patch.object(addon.os, "makedirs",
+                               side_effect=OSError("read-only fs")), \
+                mock.patch.object(addon, "logger", log):
+            addon._setup_audit_file()
+        self.assertTrue(log.warning.called)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -107,6 +107,19 @@ class IngestTestCase(unittest.TestCase):
             f.write(text)
         os.replace(tmp, self.path)
 
+    def rotate(self):
+        """Mimic RotatingFileHandler.doRollover: shift the numbered backups up (oldest
+        first), move the active file to `.1`, and leave the active path free — the next
+        write recreates it with a NEW inode, exactly as the handler does. Renames (not
+        copies) so each file keeps its inode across the shuffle, which is what the drain
+        follows it by."""
+        n = 1
+        while os.path.exists(f"{self.path}.{n}"):
+            n += 1
+        for i in range(n - 1, 0, -1):
+            os.replace(f"{self.path}.{i}", f"{self.path}.{i + 1}")
+        os.replace(self.path, f"{self.path}.1")
+
     def rows(self):
         with cp._connect() as conn:
             return conn.execute(
@@ -274,16 +287,75 @@ class DrainTests(IngestTestCase):
         self.assertEqual(self.cursor()["offset"], os.path.getsize(self.path))
 
     def test_replaced_file_restarts_from_zero(self):
-        """Rotation. Without the inode check a fresh file inherits the old offset
-        and its first N bytes — the oldest decisions on it — are never read."""
+        """A file swapped out for a genuinely different inode with the old one gone
+        (no sibling to follow) is the aged-out case: resume on the new file from zero.
+        Without the inode check a fresh file would inherit the old offset and its first
+        N bytes — the oldest decisions on it — would never be read."""
         self.write(_line(host="old.example") * 5)
         cp._drain_egress_audit()
         old_inode = self.cursor()["inode"]
         self.replace_file(_line(host="rotated.example") * 5)  # new inode, same size
         cp._drain_egress_audit()
         self.assertNotEqual(self.cursor()["inode"], old_inode)
-        self.assertEqual({r["host"] for r in self.rows()},
-                         {"old.example", "rotated.example"})
+        self.assertIn("rotated.example", [r["host"] for r in self.rows()])
+
+    def test_rotation_drains_the_rolled_files_tail_losslessly(self):
+        """The property the rotation-aware drain exists for. A file rolled aside while
+        it still holds un-ingested lines must have that tail read from the sibling —
+        NOT skipped the instant the fresh active file's new inode is noticed. Losing
+        those lines would drop decisions from the record silently, which is the one
+        thing an audit trail must never do."""
+        cp.DRAIN_BLOCK = 512
+        try:
+            self.write(_line(host="early.example") * 40)
+            self.assertGreater(cp._drain_egress_audit(), 0)
+            self.assertLess(len(self.rows()), 40)          # one pass: a real tail left
+            self.rotate()                                  # roll the partly-read file
+            self.write(_line(host="fresh.example") * 3)    # fresh active, new inode
+            for _ in range(60):
+                if cp._drain_egress_audit() == 0:
+                    break
+            hosts = [r["host"] for r in self.rows()]
+            self.assertEqual(hosts.count("early.example"), 40)   # tail not lost
+            self.assertEqual(hosts.count("fresh.example"), 3)
+            self.assertEqual(hosts[-3:], ["fresh.example"] * 3)  # oldest-first order
+        finally:
+            cp.DRAIN_BLOCK = 1 << 20
+
+    def test_multiple_backlogged_siblings_drain_oldest_first(self):
+        """Two rollovers before the reader catches up: both siblings and the active
+        file must ingest, in content order, exactly once each."""
+        self.write(_line(host="gen1.example"))
+        self.rotate()
+        self.write(_line(host="gen2.example"))
+        self.rotate()
+        self.write(_line(host="gen3.example"))
+        for _ in range(10):
+            if cp._drain_egress_audit() == 0:
+                break
+        self.assertEqual([r["host"] for r in self.rows()],
+                         ["gen1.example", "gen2.example", "gen3.example"])
+
+    def test_cursor_whose_file_aged_out_warns_and_resumes(self):
+        """If a backup is deleted (rotated past the backup count) before the reader
+        finishes it, that is a genuine unread gap. It must be reported — not passed
+        over in silence — and the reader must resume on the next file, not wedge.
+
+        The aged-out file is simulated by pointing the cursor at an inode no current
+        file has. Deleting and recreating the file cannot do this reliably — the
+        filesystem may hand the just-freed inode straight back (the allocator luck
+        replace_file() exists to sidestep), and then the cursor would 'find' it."""
+        self.write(_line(host="ingested.example"))
+        cp._drain_egress_audit()
+        self.assertEqual([r["host"] for r in self.rows()], ["ingested.example"])
+        with cp._connect() as conn:
+            conn.execute("UPDATE audit_cursor SET inode = inode + ? WHERE path = ?",
+                         (10 ** 9, self.path))             # an inode nothing owns
+            conn.commit()
+        self.replace_file(_line(host="afterward.example"))  # the file that took over
+        cp._drain_egress_audit()
+        self.assertIn("cursor lost its file", self.out.getvalue())
+        self.assertIn("afterward.example", [r["host"] for r in self.rows()])
 
     def test_malformed_line_does_not_wedge_the_cursor(self):
         self.write("{not json\n" + _line(host="after.example"))

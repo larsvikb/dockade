@@ -925,9 +925,13 @@ The reasoning is why this is a *pull* and not a push, which is not obvious and
 spans all three components:
 
 - **The file already was the durable queue.** `audit.jsonl` sits on a named volume,
-  append-only and ordered, and it cannot be removed regardless — it is the record of
-  record during a control-plane outage. Any broker or POST would have been a *second*
-  durable store of the same events.
+  append-only and ordered, and survives a control-plane outage — it is the record of
+  record while governance is down. Any broker or POST would have been a *second*
+  durable store of the same events. It is size-rotated so a long-lived volume cannot
+  fill (the proxy's `RotatingFileHandler`); the ingest follows a file across the
+  rename by inode and drains rotated siblings oldest-first, so rotation does not
+  strand the un-ingested tail — and warns loudly in the one case it could, a backup
+  deleted before it was read (`_drain_egress_audit`).
 - **Pulling makes the ingest exactly-once for free.** The cursor lives in the same
   SQLite as the audit table, so rows and cursor advance in one transaction. Every
   push design delivers at-least-once, which imports an idempotency key, a unique

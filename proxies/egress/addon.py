@@ -83,6 +83,7 @@ import asyncio
 import ipaddress
 import json
 import logging
+import logging.handlers
 import os
 import socket
 import threading
@@ -93,6 +94,15 @@ from typing import NamedTuple
 from mitmproxy import http, tls
 
 AUDIT_PATH = os.environ.get("EGRESS_AUDIT_LOG", "/var/log/egress/audit.jsonl")
+# The local audit file is otherwise unbounded on a long-lived volume. Rotate it by
+# SIZE (rename-aside at the cap, keep a few backups, drop the oldest), which caps
+# on-disk use at roughly (backups + 1) x cap. The control plane's ingest is built
+# for exactly this rename model — it follows a file by inode across the .N shuffle
+# and drains rotated siblings oldest-first, so nothing is lost when we roll over
+# (see ``_drain_egress_audit`` in control-plane/app.py). Set the cap to 0 to disable
+# rotation. Keep it comfortably above one drain block so the reader always keeps up.
+AUDIT_MAX_BYTES = int(os.environ.get("EGRESS_AUDIT_MAX_BYTES", str(8 * 1024 * 1024)))
+AUDIT_BACKUPS = int(os.environ.get("EGRESS_AUDIT_BACKUPS", "5"))
 
 # Control plane: where policy decisions + audit go. One call per connection.
 # Default port is 8091 — the AUTHORIZE listener on authorize-net (compose sets this
@@ -387,7 +397,11 @@ def _setup_audit_file() -> None:
     convenience for persistence and grep on the mounted volume."""
     try:
         os.makedirs(os.path.dirname(AUDIT_PATH), exist_ok=True)
-        handler = logging.FileHandler(AUDIT_PATH)
+        # Size-rotating so the file cannot grow without bound (see AUDIT_MAX_BYTES).
+        # maxBytes=0 keeps the old single-file behaviour (RotatingFileHandler never
+        # rolls over then), which is the documented off switch.
+        handler = logging.handlers.RotatingFileHandler(
+            AUDIT_PATH, maxBytes=AUDIT_MAX_BYTES, backupCount=AUDIT_BACKUPS)
         handler.setFormatter(logging.Formatter("%(message)s"))
         logger.addHandler(handler)
     except OSError as e:

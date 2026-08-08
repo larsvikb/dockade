@@ -91,7 +91,7 @@ REFFILES := $(SCRIPTS) \
             policies/egress-allowlist.txt
 
 .PHONY: help check check-strict lint consistency test verify-build \
-        up down destroy rebuild logs-ep logs-cp \
+        up down destroy audit-prune rebuild logs-ep logs-cp \
         claude opencode boundary split-check
 
 help: ## Show this help
@@ -403,6 +403,28 @@ down: ## Stop the shared infra (keeps the named volumes)
 destroy: ## Stop infra AND delete BOTH volumes: egress audit log + control-plane policy/audit store (destructive)
 	$(COMPOSE) down -v
 
+# Retention window for `audit-prune`, in days. A variable, not a literal in the
+# script, so operators tune it without editing the recipe: `make audit-prune
+# AUDIT_RETENTION_DAYS=90`. Kept out of prose elsewhere on purpose — this is the
+# one place the number lives (numbers in prose rot; CLAUDE.md).
+AUDIT_RETENTION_DAYS ?= 30
+
+audit-prune: ## Trim audit rows older than AUDIT_RETENTION_DAYS (default 30) and reclaim disk; leaves policy + approvals intact (operator-run)
+	# Retention for the audit table, and ONLY the audit table. This is NOT `make
+	# destroy`: that deletes the whole volume — policy rules, approvals and the
+	# ingest cursor with it — and is the fresh-start. This trims old DECISIONS to a
+	# window and hands the freed disk back, leaving everything standing (rules,
+	# pending/resolved approvals, the ingest offset) untouched. Deliberately manual:
+	# the audit trail is what this design exists to keep trustworthy, so thinning it
+	# is an operator's decision, never a timer's.
+	#
+	# Runs against the LIVE control plane over docker exec, using its own python3 +
+	# stdlib sqlite3 — no tooling added to the choke-point-adjacent image, same
+	# reasoning as split-check. VACUUM is why disk is actually returned: a bare
+	# DELETE frees pages inside the file without shrinking it.
+	docker exec -e AUDIT_RETENTION_DAYS=$(AUDIT_RETENTION_DAYS) control-plane \
+	  python3 -c "$$AUDIT_PRUNE_PY"
+
 rebuild: ## Rebuild every image from scratch — proxy + control plane + UI + both sandbox tiers — then recreate the infra
 	# Deliberately does NOT `down` first. A build touches no running container, so
 	# taking the governance plane offline for the whole --no-cache build bought
@@ -555,3 +577,30 @@ check("172.31.0.2", 8090, "dropped",
 sys.exit(0 if ok else 1)
 endef
 export SPLIT_CHECK_PY
+
+# Body of `audit-prune` (see the target above). Runs inside the control-plane
+# container so it shares the app's view of the store (CONTROL_DB, WAL mode).
+define AUDIT_PRUNE_PY
+import os, sqlite3, time
+
+# Only the audit table is touched. Reads the same defaults app.py does, so an
+# operator override of CONTROL_DB is honoured; AUDIT_RETENTION_DAYS is passed in
+# by the Makefile (docker exec -e).
+days = int(os.environ.get("AUDIT_RETENTION_DAYS", "30"))
+db = os.environ.get("CONTROL_DB", "/var/lib/control-plane/control.db")
+cutoff = time.time() - days * 86400
+
+conn = sqlite3.connect(db, timeout=10.0)
+# The app runs in WAL and the drain loop writes in short bursts; wait rather than
+# fail on a momentary lock. VACUUM below needs the write lock to itself.
+conn.execute("PRAGMA busy_timeout=10000")
+deleted = conn.execute("DELETE FROM audit WHERE ts < ?", (cutoff,)).rowcount
+conn.commit()
+# DELETE frees pages inside the file but does not shrink it; VACUUM rebuilds the
+# file compactly and returns the space to the OS. Must run outside a transaction,
+# hence the commit above.
+conn.execute("VACUUM")
+conn.close()
+print(f"audit-prune: deleted {deleted} audit row(s) older than {days}d, then VACUUM")
+endef
+export AUDIT_PRUNE_PY

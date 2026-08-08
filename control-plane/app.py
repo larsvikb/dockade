@@ -75,6 +75,7 @@ jewel).
 from __future__ import annotations
 
 import asyncio
+import glob
 import ipaddress
 import json
 import math
@@ -133,8 +134,9 @@ MAX_PENDING_PER_CLIENT = int(os.environ.get("CONTROL_MAX_PENDING_PER_CLIENT", "4
 # cursor simply resumes, and it leaves the security-critical proxy image untouched:
 # no new dependency, no fire-and-forget task in a hot path.
 EGRESS_AUDIT_LOG = os.environ.get("EGRESS_AUDIT_LOG", "/var/log/egress/audit.jsonl")
-# Seconds between drains; 0 disables ingest entirely. An idle pass is one stat() and
-# a comparison, so frequency is nearly free — what bounds it from ABOVE is that the
+# Seconds between drains; 0 disables ingest entirely. An idle pass is a short scan of
+# the audit dir and a stat per file (rotation, below), so frequency is nearly free —
+# what bounds it from ABOVE is that the
 # UI polls /api/audit every 4s, so anything under that keeps the drain out of the
 # critical path and total event-to-screen lag stays dominated by a poll the operator
 # already lives with. Above it, this interval becomes the lag.
@@ -273,6 +275,13 @@ def _init_db() -> None:
                 reason   TEXT
             )""")
         conn.execute("CREATE INDEX IF NOT EXISTS audit_ts ON audit(ts)")
+        # This table grows without bound — every decision is kept, and only
+        # /api/audit's VIEW is windowed (see api_audit), never the record itself.
+        # That is deliberate: the trail is the artifact. There is no automatic
+        # rotation; an operator thins it on their own schedule with `make
+        # audit-prune`, which deletes rows past a retention window and VACUUMs to
+        # return the disk. The `audit_ts` index above is what keeps that DELETE cheap
+        # (and `make destroy` remains the separate, whole-store reset).
         conn.execute("""
             CREATE TABLE IF NOT EXISTS approvals (
                 id          TEXT PRIMARY KEY,
@@ -510,48 +519,109 @@ def _ingest_row(line: bytes) -> tuple | None:
             _ingest_field(rec.get("reason")))
 
 
+def _audit_log_files() -> list[tuple[str, os.stat_result]]:
+    """The proxy's audit files, OLDEST CONTENT FIRST: the size-rotated siblings
+    (``audit.jsonl.N``; higher N is older) followed by the active file last.
+
+    RotatingFileHandler renames on rollover, so a given file's SUFFIX changes over
+    time but its inode does not — callers follow a file by inode, never by name, and
+    this only fixes the order to drain in. A sibling missing because a rotation raced
+    this scan is skipped and reappears next pass."""
+    base = EGRESS_AUDIT_LOG
+    rotated = []
+    for path in glob.glob(glob.escape(base) + ".*"):
+        suffix = path[len(base) + 1:]
+        if suffix.isdigit():                         # .1/.2/... only, not .new etc.
+            rotated.append((int(suffix), path))
+    rotated.sort(reverse=True)                        # oldest (highest N) first
+    out = []
+    for path in [p for _, p in rotated] + [base]:
+        try:
+            out.append((path, os.stat(path)))
+        except OSError:
+            continue
+    return out
+
+
 def _drain_egress_audit() -> int:
-    """Ingest one bounded block of the proxy's audit file. Returns bytes consumed.
+    """Ingest one bounded block of the proxy's audit log. Returns bytes consumed.
 
-    Reads only up to the LAST NEWLINE in the block, so a line the proxy is midway
-    through appending is left for the next pass rather than parsed in half.
+    The log is ROTATED by size (RotatingFileHandler in proxies/egress/addon.py): at a
+    cap the active file is renamed aside, a fresh one takes its place, and the oldest
+    backup is dropped. So "the log" is the active file plus a few rotated siblings, and
+    ingest must drain them OLDEST-FIRST — otherwise the rename would strand the
+    un-ingested tail of a file in a sibling this loop never reads, silently dropping
+    decisions, which an audit trail must never do.
 
-    Rows and the cursor advance in a single transaction — that is the whole design
-    (see EGRESS_AUDIT_LOG). Do not split them."""
-    # Raises if there is no file yet (the proxy may not have started, or the volume
-    # is absent). Deliberately not swallowed here: _audit_drain_loop reports it once
-    # on the transition, so "no ingest at all" can never be a silent steady state.
-    st = os.stat(EGRESS_AUDIT_LOG)
+    Position is tracked by INODE, not name: a rotation shuffles the .N suffixes but
+    never a file's inode. A rotated file never grows again, so once its end is reached
+    we step to the next-oldest at offset 0; only the active file is ever appended to.
+    Reads only up to the LAST NEWLINE, so a line the proxy is mid-append on is left for
+    the next pass. Rows and the cursor advance in ONE transaction (see EGRESS_AUDIT_LOG)
+    — do not split them."""
+    files = _audit_log_files()
+    if not files:
+        # No file at all — the proxy may not have started, or the volume is absent.
+        # Raise (not swallow): _audit_drain_loop reports it once on the transition, so
+        # "no ingest at all" can never become a silent steady state.
+        os.stat(EGRESS_AUDIT_LOG)
+        return 0
+
     with _connect() as conn:
         row = conn.execute("SELECT inode, offset FROM audit_cursor WHERE path=?",
                            (EGRESS_AUDIT_LOG,)).fetchone()
-        inode, offset = (row["inode"], row["offset"]) if row else (st.st_ino, 0)
-        if inode != st.st_ino:
-            # Rotated or replaced: a different file, so the old offset means nothing.
-            inode, offset = st.st_ino, 0
-        elif st.st_size < offset:
-            # Truncated in place. Same file, fewer bytes — start over rather than
-            # read from a position past the end (which yields nothing, forever).
+        # Find the file we were reading by its inode. First run (no row) or a cursor
+        # whose file has aged out (deleted before we finished it) both start at the
+        # oldest file still present; the latter is a genuine unread gap, so it is
+        # reported LOUDLY rather than passed over in silence.
+        idx, offset = 0, 0
+        if row is not None:
+            found = next((i for i, (_, st) in enumerate(files)
+                          if st.st_ino == row["inode"]), None)
+            if found is None:
+                print("control-plane: audit ingest cursor lost its file (inode "
+                      f"{row['inode']} gone — a backup rotated out before it drained); "
+                      "resuming at the oldest file present, some decisions may be "
+                      "un-ingested", flush=True)
+            else:
+                idx, offset = found, row["offset"]
+
+        path, st = files[idx]
+        if st.st_size < offset:
+            # Truncated in place (same inode, fewer bytes) — start this file over.
             offset = 0
+        # Caught up on a ROTATED file (one with newer files after it): it never grows
+        # again, so advance to the next-oldest at 0. Skips fully-drained/empty backups
+        # in one pass; lands on the active file, or a backup with bytes still to read.
+        while st.st_size == offset and idx < len(files) - 1:
+            idx += 1
+            path, st, offset = files[idx][0], files[idx][1], 0
         if st.st_size == offset:
-            return 0
-        with open(EGRESS_AUDIT_LOG, "rb") as f:
+            return 0                                  # active file, nothing new
+
+        is_active = path == EGRESS_AUDIT_LOG
+        with open(path, "rb") as f:
+            # Between the scan and this open the file could have been rotated out from
+            # under the path. fstat the OPEN handle: if the inode moved, bail and let
+            # the next pass re-resolve, rather than read one file and credit another.
+            if os.fstat(f.fileno()).st_ino != st.st_ino:
+                return 0
             f.seek(offset)
             block = f.read(DRAIN_BLOCK)
         cut = block.rfind(b"\n")
-        if cut < 0 and len(block) < DRAIN_BLOCK:
-            # No newline yet and the file ends here: the proxy is midway through
-            # appending this line. Consume nothing and pick it up next pass — the
-            # alternative is parsing half a record, or worse, skipping it as
-            # "oversized" purely because we looked while it was being written.
+        if cut < 0 and len(block) < DRAIN_BLOCK and is_active:
+            # No newline yet and the ACTIVE file ends here: the proxy is mid-append.
+            # Consume nothing and pick it up next pass — parsing half a record, or
+            # dropping it as "oversized", would both be wrong. (A rotated file never
+            # grows, so an unterminated tail there is genuine and falls through below.)
             return 0
         if cut < 0:
             # A full block with no newline: a line longer than the block. Skip past
             # it — its fragments fail to parse and are dropped, which self-limits
             # rather than wedging the cursor here and stalling every later line
             # behind one oversized record.
-            print(f"control-plane: audit ingest skipping an oversized line at "
-                  f"offset {offset} (>{DRAIN_BLOCK} bytes)", flush=True)
+            print(f"control-plane: audit ingest skipping an oversized line at offset "
+                  f"{offset} in {path} (>{DRAIN_BLOCK} bytes)", flush=True)
             consumed = len(block)
         else:
             consumed = cut + 1
@@ -573,7 +643,7 @@ def _drain_egress_audit() -> int:
             "INSERT INTO audit_cursor(path, inode, offset) VALUES (?,?,?) "
             "ON CONFLICT(path) DO UPDATE SET inode=excluded.inode, "
             "offset=excluded.offset",
-            (EGRESS_AUDIT_LOG, inode, offset + consumed))
+            (EGRESS_AUDIT_LOG, st.st_ino, offset + consumed))
         conn.commit()
     return consumed
 

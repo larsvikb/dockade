@@ -319,7 +319,12 @@ echo "=== Firewall configured (default-deny, whitelist only) ==="
 # Sanity checks. NB: proxy vars are unset in this script, so these curls test
 # DIRECT egress. example.com must always be blocked directly.
 if curl --connect-timeout 5 -s https://example.com >/dev/null 2>&1; then
-    echo "WARNING: firewall leak — reached example.com directly"
+    # A reachable arbitrary site is a real containment failure, not a warning:
+    # example.com is never allowlisted in any mode, so a direct hit means egress
+    # is open. Fail CLOSED — abort before the gosu drop rather than launch a yolo
+    # agent with an open boundary, matching every other fatal check in this script.
+    echo "FATAL: firewall leak — reached example.com directly. Egress is open." >&2
+    exit 1
 else
     echo "  OK — example.com blocked (direct)"
 fi
@@ -329,7 +334,11 @@ if [ "$MODE" = "local" ]; then
     # here so a misconfigured no-egress tier fails loudly at boot rather than
     # looking healthy until the agent tries to work.
     if curl --connect-timeout 5 -s https://api.anthropic.com >/dev/null 2>&1; then
-        echo "WARNING: firewall leak — api.anthropic.com reachable in LOCAL mode"
+        # Tier 2's entire premise is zero egress; reaching Anthropic means the
+        # boundary failed. Fail CLOSED rather than warn — a no-egress tier that can
+        # egress is broken, not degraded.
+        echo "FATAL: firewall leak — api.anthropic.com reachable in LOCAL mode." >&2
+        exit 1
     else
         echo "  OK — api.anthropic.com unreachable (no egress in LOCAL mode)"
     fi

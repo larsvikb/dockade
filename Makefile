@@ -145,7 +145,7 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	done
 	echo "== domain allowlist drift (firewall ⊆ control-plane policy seed) =="
 	fw=$$(awk '/ALLOWED_DOMAINS=\(/{f=1;next} f&&/^[[:space:]]*\)/{f=0} f' \
-	         sandbox-common/init-firewall.sh | grep -oE '"[a-z0-9.]+"' | tr -d '"' | sort -u)
+	         sandbox-common/init-firewall.sh | grep -oE '"[a-z0-9.-]+"' | tr -d '"' | sort -u)
 	al=$$(grep -vE '^[[:space:]]*#|^[[:space:]]*$$' policies/egress-allowlist.txt \
 	         | sed 's/^\.//' | sort -u)
 	missing=$$(comm -23 <(printf '%s\n' "$$fw") <(printf '%s\n' "$$al"))
@@ -435,7 +435,7 @@ opencode: ## Launch a tier-2 (opencode + local LLM, no egress) sandbox (WORKSPAC
 	./run-opencode-sandbox.sh "$(WORKSPACE)"
 
 boundary: ## Run boundary-check.sh in a running sandbox (SANDBOX=claude-sandbox|opencode-sandbox)
-	docker exec -it --user sandbox "$(SANDBOX)" boundary-check.sh
+	docker exec -it --user sandbox "$(SANDBOX)" /usr/local/bin/boundary-check.sh
 
 split-check: ## Assert the running proxy reaches /authorize and NOT the management API
 	# The API-surface split, checked where it actually applies. boundary-check.sh

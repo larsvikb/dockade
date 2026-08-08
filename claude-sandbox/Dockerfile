@@ -96,7 +96,13 @@ RUN mkdir -p /workspace /config \
     && chown -R $USERNAME:$USERNAME /workspace /config /home/$USERNAME
 
 WORKDIR /workspace
-ENV PATH="/home/$USERNAME/.local/bin:$PATH"
+# Agent-writable dir goes LAST on PATH, not first: /home/$USERNAME is chown'd to
+# the sandbox user, so a prepended entry would let the agent shadow baked/system
+# binaries — including /usr/local/bin/boundary-check.sh, the containment self-check.
+# Appended, the agent's own tools (claude, ruff, yamllint) still resolve because
+# nothing earlier on PATH shares their names. (The Makefile also invokes
+# boundary-check.sh by absolute path — belt-and-braces for a live docker exec.)
+ENV PATH="$PATH:/home/$USERNAME/.local/bin"
 # Standardize on bash. The login shell is already /bin/bash (useradd -s above);
 # pinning SHELL makes tools that auto-detect a shell (e.g. Claude Code's
 # shell-snapshot) deterministically pick bash rather than any other installed shell.

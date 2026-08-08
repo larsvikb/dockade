@@ -69,7 +69,7 @@ and that property is worth more than the convenience of any given library.
 **A new test should fail if you break the thing it names.** Obvious, and easy to get
 wrong: the habit here is to check it rather than assume it — break the behaviour
 deliberately, watch the suite go red, restore. Several tests exist *because* that
-found a gap, including a payload that changed shape while all 172 tests kept passing
+found a gap, including a payload that changed shape while the whole suite stayed green
 and a dismiss button that could silently send the wrong number.
 
 Two things learned the hard way if you script it. Restore from a **copy of the working

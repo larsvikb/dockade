@@ -98,10 +98,13 @@ report.
 - **Resource limits not containing anything.** They bound blast radius so the wrong
   container is not OOM-killed; nothing in the threat model rests on them. See
   *Resource limits — blast radius, not boundary*.
-- **The policy store granting but never revoking.** Nothing in the UI removes or
-  replaces a rule, and a persist that would contradict an existing one is refused
-  rather than applied. Known and on the roadmap — see the rule-mutation item under
-  *Clear future improvements*.
+- **The policy store having no atomic *edit*.** Revoking an operator-created rule is
+  built (`POST /api/rules/{id}/revoke`, in the Policy view); what is not is changing a
+  rule's pattern or flipping its action in one step — that stays revoke-then-persist,
+  two audit rows for one intent, with a window in which the host is held rather than
+  allowed or blocked. A persist that would contradict an existing rule is refused
+  rather than applied (nothing here overwrites a rule). Known and on the roadmap — see
+  the rule-mutation item under *Future improvements*.
   *(This bullet also said a persisted rule's scope came from the requested hostname,
   a leading dot being a subdomain wildcard. That is no longer true and is corrected:
   the requester cannot choose the scope. A leading dot is normalised away, and the

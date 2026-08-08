@@ -203,8 +203,8 @@ services:
     # flood could get the CONTROL PLANE killed instead of itself. Capping each
     # container turns "the kernel picks a victim" into "the container that
     # misbehaved is the one contained". The agent cannot exhaust host RAM directly
-    # (its launcher caps it at 8g), but it CAN drive proxy memory through
-    # connection volume, which is the residual path this closes.
+    # (its launcher caps it — tier 1 at 4g, tier 2 at 2g), but it CAN drive proxy
+    # memory through connection volume, which is the residual path this closes.
     #
     # Sized generously on purpose: these must never fire in normal operation. An
     # OOM-killed control plane makes the addon fail closed and write denials to the

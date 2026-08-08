@@ -94,8 +94,11 @@ from mitmproxy import http, tls
 AUDIT_PATH = os.environ.get("EGRESS_AUDIT_LOG", "/var/log/egress/audit.jsonl")
 
 # Control plane: where policy decisions + audit go. One call per connection.
+# Default port is 8091 — the AUTHORIZE listener on authorize-net (compose sets this
+# explicitly). 8090 is the management surface, on a network this proxy has no route
+# to; pointing here would fail closed, but the default should name the right port.
 CONTROL_PLANE_URL = os.environ.get(
-    "EGRESS_CONTROL_PLANE_URL", "http://control-plane:8090").rstrip("/")
+    "EGRESS_CONTROL_PLANE_URL", "http://control-plane:8091").rstrip("/")
 AUTHORIZE_URL = CONTROL_PLANE_URL + "/authorize"
 # The control plane may HOLD an unknown host while a human decides (2b), so a
 # single /authorize call can legitimately block for up to the control plane's

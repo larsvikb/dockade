@@ -46,7 +46,7 @@ MCP is out of scope. Capabilities are exposed as skills, not MCP servers.
                                             / audit / config    │
         ┌───────────────────────────────────────────────────────┘
         │
-   GOVERNED proxies/tools   (dual-homed: sandbox-net + control-net;
+   GOVERNED proxies/tools   (dual-homed: sandbox-net + a control net;
         │   egress ones also on egress-net) ─────────────► internet
         │
 ════════╪═══ sandbox-net (internal) ═══════════════════════════════
@@ -82,8 +82,9 @@ backed up independently of any container.
 
 ### Data plane — governed proxies/tools
 Single-purpose services that **enforce** policy pulled from the control plane
-and **escalate unknowns** to it. Dual-homed on sandbox-net (serve agent) and
-control-net (talk to control plane); outbound ones also on egress-net. Examples:
+and **escalate unknowns** to it. Dual-homed on sandbox-net (serve agent) and a
+control net (talk to control plane — the egress proxy uses `authorize-net`, a
+narrowed one; see Governance surfaces); outbound ones also on egress-net. Examples:
 - HTTP egress proxy (domain/URL allow-block, hold-for-approval, logging)
 - git / repo access
 - secrets broker (scoped credentials never exposed to the sandbox)
@@ -667,20 +668,23 @@ internal nets); external resolution happens at the proxy on egress-net.
 
 **Control-plane relay guard (the proxy is the bridge, so the proxy must refuse
 it).** The egress proxy is the *one* component attached to both `sandbox-net` and
-`control-net`, so segmentation alone does **not** isolate the agent from the
-control plane — the proxy could in principle relay a connection onto control-net
-(where the agent could, e.g., approve its own held requests). It therefore
-hard-refuses, **before** any policy / permanent-lifeline / port check, any
-destination that names a control-plane host (`control-plane`, `control-plane-ui`)
-or resolves into the control-net subnet (`172.31.0.0/24`) — see
-`_forbidden` in `proxies/egress/addon.py` (`EGRESS_FORBIDDEN_HOSTS` /
-`EGRESS_FORBIDDEN_CIDRS`). Because the guard is checked first and never weighed
-against policy, no rule, human approval, or change to the port allowlist can widen
-it, and a public name whose DNS is pointed at control-net is caught by the
-resolve step. This makes the CLAUDE.md invariant ("the agent must never reach the
-control plane") independently enforced at the one place segmentation cannot cover;
-`boundary-check.sh` asserts the proxy 403s both a control-plane host and a literal
-control-net IP.
+a control network (`authorize-net` — see "The third net" below; it is deliberately
+**not** on `control-net`), so segmentation alone does **not** isolate the agent from
+the control plane — the proxy could in principle relay a connection onto that
+network. It therefore hard-refuses, **before** any policy / permanent-lifeline /
+port check, any destination that names a control-plane host (`control-plane`,
+`control-plane-ui`) or resolves into either control subnet (`172.31.0.0/24`
+control-net, `172.29.0.0/24` authorize-net) — see `_forbidden` in
+`proxies/egress/addon.py` (`EGRESS_FORBIDDEN_HOSTS` / `EGRESS_FORBIDDEN_CIDRS`).
+Because the guard is checked first and never weighed against policy, no rule, human
+approval, or change to the port allowlist can widen it, and a public name whose DNS
+is pointed at a control subnet is caught by the resolve step. This makes the
+CLAUDE.md invariant ("the agent must never reach the control plane") independently
+enforced at the one place segmentation cannot cover; `boundary-check.sh` asserts the
+proxy 403s a control-plane host and literal IPs in both control subnets. And the
+damage a bypass could do is bounded by the API-surface split (below): the network
+the proxy can reach carries only `/authorize`, so even a total bypass reaches a
+listener that cannot approve a held request.
 
 The same guard also hard-blocks the **private / special-use ranges** —
 cloud-metadata / link-local (`169.254.0.0/16`), loopback (`127.0.0.0/8`), RFC1918
@@ -1110,7 +1114,8 @@ closes a sharp edge, not just a UX gap. `resolve` used to store the **requested 
 verbatim** as the rule pattern, and two facts made that worse than it looks: a leading
 dot is a *subdomain wildcard* in `_match`, and the host on an approval is chosen by the
 **agent** — so a request for `.example.com` turned one click into a standing rule over
-every subdomain, permanently, since nothing in this system revokes a rule.
+every subdomain, chosen by the agent rather than the operator and outliving the session
+(revoking it is a separate, deliberate step — see "Taking a rule back").
 
 The fix puts the pattern under the operator's control and out of the requester's.
 `_persist_candidates(host)` derives a **bounded set** in the backend, beside the
@@ -2168,8 +2173,8 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
   will write"), and the `INSERT OR IGNORE` wart, where `deny_persist` silently writes
   nothing for an existing pattern while still reporting `persisted: true`, is now
   reachable only when the *same* pattern was chosen twice and is covered honestly by
-  the card's wording. A governance plane that can grant but not revoke is still
-  incomplete, and revocation is the remaining half.
+  the card's wording. A governance plane that can grant and revoke but not *edit* a
+  rule in one step is still incomplete, and atomic editing is the remaining half.
 - **Human-presence on approval (WebAuthn user-presence, or an out-of-band confirm).**
   The *only* thing that closes host-local forgery of an approval — see the
   browser-facing-guards note under "Approval UI". Worth building for that
@@ -2185,11 +2190,11 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
     is treated as a convenience layer over a backend that validates every input, with its
     mistakes made detectable rather than prevented. The reasoning, and the condition that
     would reopen it, are under "`start()` is deliberately unverified" above.)*
-  - **Rule mutation** — nothing here replaces or removes a rule, which is why a persist
-    that contradicts an existing one is refused rather than applied (see *A persist
-    cannot overwrite* above). The refusal is the honest behaviour given the constraint;
-    lifting the constraint is the open item, and it needs a way to review and revoke
-    policy, not just a different `INSERT`.
+  - **Rule mutation** — nothing here *replaces* a rule (revoking one is built — see
+    "Taking a rule back"), which is why a persist that contradicts an existing one is
+    refused rather than applied (see *A persist cannot overwrite* above). The refusal
+    is the honest behaviour given the constraint; lifting it — editing a rule's pattern
+    or action in one operation rather than revoke-then-persist — is the open item.
   - **Opt-in desktop notification.** `http://localhost` is a secure context, so the
     Notification API is available; with a ~120s fuse and a page nobody watches, this is
     the honest fix for the problem the `(n)` title prefix only mitigates.

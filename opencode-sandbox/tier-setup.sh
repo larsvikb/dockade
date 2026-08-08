@@ -19,6 +19,17 @@ set -euo pipefail
 USERNAME=sandbox
 CONFIG_DIR="${SANDBOX_CONFIG_DIR:-/config}"
 
+# $CONFIG_DIR is a persistent volume the agent OWNS, so it can plant a symlink at
+# this path between boots. `install -d` — run here as root, before the firewall and
+# the privilege drop — FOLLOWS a symlink and chowns/chmods its target, turning an
+# agent-controlled config path into a privileged write/chown outside the volume.
+# Refuse a symlink (or any non-directory) first; a real directory from a previous
+# boot is kept. (The file `install` below replaces a symlink destination rather than
+# writing through it, so only the directory create needs this guard.)
+if [ -L "$CONFIG_DIR/opencode" ] || \
+   { [ -e "$CONFIG_DIR/opencode" ] && [ ! -d "$CONFIG_DIR/opencode" ]; }; then
+    rm -f "$CONFIG_DIR/opencode"
+fi
 install -d -o "$USERNAME" -g "$USERNAME" -m 0755 "$CONFIG_DIR/opencode"
 install -o "$USERNAME" -g "$USERNAME" -m 0644 \
     /etc/opencode/opencode.json \

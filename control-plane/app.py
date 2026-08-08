@@ -122,7 +122,7 @@ MAX_PENDING_PER_CLIENT = int(os.environ.get("CONTROL_MAX_PENDING_PER_CLIENT", "4
 # proxy, on purpose, and a control-plane outage produces local fail-closed denials by
 # definition. Those never reached this store, so the UI's "recent decisions" was a
 # record of round-trips rather than of decisions, and a domain-fronting refusal — the
-# single most alarming thing the proxy can emit — was visible only in `make logs-proxy`.
+# single most alarming thing the proxy can emit — was visible only in `make logs-ep`.
 #
 # We PULL rather than have the proxy push, and that choice buys the property that
 # matters: the cursor lives in this same SQLite, so ingesting rows and advancing the

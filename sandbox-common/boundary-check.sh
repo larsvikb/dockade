@@ -156,9 +156,10 @@ if [ -n "${HTTPS_PROXY:-}" ]; then
         bad "SNI fronting NOT refused — got a passthrough response (domain-fronting leak)"
     fi
 
-    # Control-plane relay governance: the egress proxy is the ONLY component
-    # on both sandbox-net and control-net, so it — not segmentation — must refuse
-    # to relay the agent onto the control plane. Ask the proxy (via HTTPS_PROXY, so
+    # Control-plane relay governance: the egress proxy is the ONLY component on both
+    # sandbox-net and a control network (authorize-net — see below), so it — not
+    # segmentation — must refuse to relay the agent onto the control plane. Ask the
+    # proxy (via HTTPS_PROXY, so
     # IT resolves the name/connects) to reach the control-plane host and a literal
     # control-net IP; both must be refused with a 403 BEFORE any policy/port check.
     # (grep the combined output for 403, like the port/SNI checks above: a refused

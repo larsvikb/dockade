@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-# Pinned: the egress proxy is the security choke point, so its base is not left on
-# :latest (a rebuild could otherwise pull a mitmproxy whose addon API / TLS
-# handling differs from what addon.py is written against — risking a fail-open).
-# Upgrades are deliberate: bump this, rebuild, re-run boundary-check.sh. For full
-# supply-chain immutability, append the digest:
-#   FROM mitmproxy/mitmproxy:12.2.3@sha256:<digest>
-# (get it with: docker image inspect mitmproxy/mitmproxy:12.2.3 \
-#   --format '{{index .RepoDigests 0}}')
-FROM mitmproxy/mitmproxy:12.2.3
+# Digest-pinned: the egress proxy is the security choke point, so its base is not
+# left on :latest or even a bare tag (a rebuild could otherwise pull a mitmproxy
+# whose addon API / TLS handling differs from what addon.py is written against —
+# risking a fail-open, and a tag can be repointed at a new image under the same
+# name). The tag is kept for human readability; the @sha256 is what's enforced.
+# Upgrades are deliberate: bump the tag AND the digest together, rebuild, re-run
+# boundary-check.sh. Get the digest for a new tag with:
+#   docker image inspect mitmproxy/mitmproxy:<tag> --format '{{index .RepoDigests 0}}'
+FROM mitmproxy/mitmproxy:12.2.3@sha256:00b77b5d8804c8ad18cb6caefbf9d5849e895e8986c5ce011f4ae30f4385962f
 
 # Policy + audit addon. Policy is no longer a baked file: the addon asks the
 # control plane per connection (EGRESS_CONTROL_PLANE_URL). The canonical seed

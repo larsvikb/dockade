@@ -85,6 +85,7 @@ import json
 import logging
 import os
 import socket
+import threading
 import time
 import urllib.request
 from typing import NamedTuple
@@ -461,6 +462,36 @@ def _audit(decision: str, **fields) -> None:
                             "decision": decision, **fields}))
 
 
+# ── Cloud sanity check (this project targets dev machines; cloud is defense-in-depth) ──
+# The relay guard hard-blocks the instance-metadata IP for literal/known targets, but its
+# resolve branch is best-effort against DNS rebinding (see ``_forbidden_reason``). Whether
+# that residual gap reaches real cloud credentials or nothing depends on whether THIS
+# proxy's egress-net has a route to the metadata service at all — a property of the host,
+# not of the guard. Probe it once at startup and warn if reachable, so the operator knows
+# the rebind gap is live here. A heads-up, NEVER a control (the block is the control);
+# disable with EGRESS_METADATA_CHECK=0. Runs in a daemon thread so it never delays startup
+# or touches mitmproxy's event loop.
+METADATA_IP = os.environ.get("EGRESS_METADATA_IP", "169.254.169.254")
+METADATA_CHECK = os.environ.get("EGRESS_METADATA_CHECK", "1") != "0"
+
+
+def _probe_metadata_reachable() -> None:
+    for port in (80, 443):
+        try:
+            socket.create_connection((METADATA_IP, port), timeout=1).close()
+        except OSError:
+            continue
+        logger.warning(
+            "cloud sanity check: instance-metadata service is REACHABLE from the egress "
+            "proxy (%s:%d). The relay guard blocks it for literal/known targets, but the "
+            "DNS-rebind gap is best-effort — on a cloud host, pin the resolved IP (see "
+            "DESIGN.md). Heads-up, not a boundary.", METADATA_IP, port)
+        return
+    logger.info(
+        "cloud sanity check: instance-metadata service not reachable (%s) — the "
+        "DNS-rebind gap reaches no metadata endpoint on this host", METADATA_IP)
+
+
 def load(loader) -> None:  # mitmproxy lifecycle hook
     # Refuse to start with the relay guard's CIDR check disabled (fail closed)
     # BEFORE serving any traffic or announcing readiness.
@@ -471,6 +502,10 @@ def load(loader) -> None:  # mitmproxy lifecycle hook
            forbidden_hosts=list(FORBIDDEN_HOSTS),
            forbidden_cidrs=[str(n) for n in FORBIDDEN_CIDRS],
            private_cidrs=[str(n) for n in PRIVATE_CIDRS])
+    # Cloud sanity check, off the startup path (see _probe_metadata_reachable).
+    if METADATA_CHECK:
+        threading.Thread(target=_probe_metadata_reachable, name="metadata-probe",
+                         daemon=True).start()
 
 
 async def http_connect(flow: http.HTTPFlow) -> None:

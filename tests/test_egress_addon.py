@@ -260,5 +260,28 @@ class GuardConfigTests(unittest.TestCase):
             addon._assert_guard_configured()
 
 
+class MetadataProbeTests(unittest.TestCase):
+    """The cloud sanity check warns IFF the metadata service is actually reachable from
+    the proxy. It is a heads-up, not a control (the relay guard blocks metadata
+    regardless); this pins the warn/quiet branch so the signal cannot silently invert."""
+
+    def _run(self, connect):
+        log = mock.Mock()
+        with mock.patch.object(addon.socket, "create_connection", connect), \
+                mock.patch.object(addon, "logger", log):
+            addon._probe_metadata_reachable()
+        return log
+
+    def test_warns_when_metadata_is_reachable(self):
+        log = self._run(mock.Mock(return_value=mock.Mock()))  # connect succeeds
+        self.assertTrue(log.warning.called)
+        self.assertFalse(log.info.called)
+
+    def test_quiet_when_metadata_is_unreachable(self):
+        log = self._run(mock.Mock(side_effect=OSError("no route")))  # both ports fail
+        self.assertFalse(log.warning.called)
+        self.assertTrue(log.info.called)
+
+
 if __name__ == "__main__":
     unittest.main()

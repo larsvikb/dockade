@@ -3,6 +3,50 @@
 Architecture and rationale for dockade. See `CLAUDE.md` for working
 conventions and invariants.
 
+## Mental model (read this first)
+
+The whole system is one sentence: **an AI agent can reach nothing directly, so every
+consequential action has to travel a governed path that can be policed, approved, and
+audited.**
+
+- An **agent** runs in a disposable **sandbox** on `sandbox-net`, an *internal* Docker
+  network with no route off-box. It holds near-zero capability by construction (non-root,
+  dropped caps, no docker socket), so "yolo mode" is safe not because the agent is trusted
+  but because it can't reach anything.
+- The one way off-box is the **egress proxy** — a CONNECT-level, default-deny, domain
+  allowlist that audits every connection. It's the sole bridge between the sandbox and the
+  outside.
+- The proxy asks the **control plane** (policy + audit store — the "crown jewels") to
+  authorize each connection. An unknown host is **held** for a human, who approves or
+  rejects it in a small loopback **UI**; no decision → default-deny after a timeout.
+- The agent **cannot reach the control plane**: it's on separate internal networks the
+  sandbox isn't attached to, and the proxy — the only component that touches both sides —
+  hard-refuses to relay onto them.
+
+Two agent **tiers**: **tier 1** is Claude with governed egress through the proxy; **tier
+2** is a local-LLM agent (opencode) with *no egress and no credentials at all*. Three
+egress **modes** in the firewall: **governed** (via the proxy), **local** (tier 2, only
+the inference service), **standalone** (proxy-less fallback with a direct allowlist).
+
+The rest of this document is the *why* behind each of those pieces. Everything else in
+the repo follows from "containment is by **capability**, not configuration."
+
+## Contents
+
+- [Purpose](#purpose) · [Core idea](#core-idea) · [Architecture](#architecture) ·
+  [Networks](#networks)
+- [The sandbox image](#the-sandbox-image-the-agents-paved-road) ·
+  [Web access](#web-access-verified-empirically-in-sandbox) ·
+  [Server-side execution blind spots](#server-side-execution-accepted-governance-blind-spots)
+- [Capability inventory](#capability-inventory-v1) ·
+  [Governance surfaces](#governance-surfaces) (egress proxy · control plane · approval UI)
+- [Startup ordering](#startup-ordering--running-is-not-ready) ·
+  [Resource limits](#resource-limits--blast-radius-not-boundary) ·
+  [Local inference](#local-inference--an-ungoverned-llm-tool)
+- [Testing and CI](#testing-and-ci) · [Status](#status) ·
+  [Open decisions](#open-decisions) · [Future improvements](#future-improvements) ·
+  [Layout](#layout)
+
 ## Purpose
 
 Run an AI coding agent (Claude Code) in a **capability-limited sandbox** that
@@ -1022,92 +1066,26 @@ another asserts every `getElementById` in `app.js` matches an id that exists in
 `index.html` — the split's new failure mode is a renamed id, which is a `null`
 dereference that would otherwise appear only in a browser.
 
-**The stream had no reconnect, and said otherwise.** The page treated every
-`EventSource` error as transient. It is not: an `EventSource` retries *by itself* only
-from `CONNECTING`, and a non-200 response or wrong MIME type puts it in `CLOSED`
-**permanently**. That state was reachable in ordinary operation — the relay had no
-exception handling, so a backend restart made `httpx.ConnectError` a 500, the browser
-gave up for good, and the status line went on reading "reconnecting…" while the page was
-blind until someone reloaded it. Being blind is the exact failure the traffic light was
-built around (an unseen hold default-denies after `CONTROL_HOLD_TIMEOUT`), so this was
-the most consequential defect in the UI. Fixed at both ends: the relay answers a clean
-**502** on any `httpx.RequestError`, and `app.js` reconnects by hand from `CLOSED` with
-doubling backoff (1s → 30s cap, no jitter — jitter de-synchronises a fleet, and this
-page has one operator, so determinism is worth more and makes the delay assertable),
-reporting `retrying in Ns` instead of a comforting lie.
+**Frontend mechanics — the rationale lives in `control-plane-ui/app.js`.** A cluster of
+UI behaviours exists for one reason: the operator must never be *silently* blind, because
+an unseen hold default-denies after `CONTROL_HOLD_TIMEOUT`. Each is documented at its
+point of use in `app.js`; only the cross-cutting points are kept here.
 
-**The approvals list is keyed, and does not move under the cursor.** Rendering was an
-`innerHTML` assignment of the whole list on every push, up to once a second. A hold
-expires on its own after ~120s, so a card leaving the *middle* of the queue shifted
-every card below it upward — between the operator's eye and their click, on a row of
-buttons that **grant egress**. It also discarded the `disabled` state a resolve in
-flight had just set. Cards are now created once, keyed by approval id, and updated in
-place (`diffPending`); an unchanged push is a no-op. A card that leaves the queue
-without the operator deciding it is marked **stale in place** with the reason rather
-than yanked out, and swept only when removal cannot move a button under the pointer —
-nothing in the list hovered or focused — with a 15s cap so a parked cursor cannot freeze
-the list.
-
-That gating turned out to have a hole, found by asking how to *test* the expiry marker
-rather than by reading the code: "removal cannot move a button under the pointer" is
-true immediately whenever the cursor is **outside** the list, so a stale card was swept
-on the next 1s tick. The `expired — default-denied` message — the one departure that
-reports a governance failure — was therefore on screen for about a second, readable only
-by an operator who happened to be hovering. So `shouldSweep` gained a **minimum dwell**
-that hover cannot shorten (`DWELL_MS`: 60s expired, 8s resolved, 5s resolved-elsewhere),
-ordered by how much each matters. An expiry gets long enough to read; a resolve less,
-because the operator performed it but may move the mouse away before reading the
-confirmation (the same bug, and the only reason the outcome message *appeared* to work
-is that clicking leaves the pointer inside the list); a card resolved elsewhere least.
-Not longer, because stale cards would then compete with real pending holds on what is
-fundamentally a work queue — the Decisions tab is the durable record.
-
-Two smaller corrections came out of mutation-testing that fix: a `Math.max(STALE_MAX_MS,
-dwellMs)` on the cap line was **dead logic** (the floor check above already guarantees
-`ageMs >= dwellMs`) with a comment claiming it was load-bearing, which is worse than not
-having it; and `markStale` now takes the whole `{text, dwellMs}` that `departure()`
-returns rather than the two as separate arguments, so the message and how long it stays
-readable cannot be passed apart — omitting the dwell would have silently given an expiry
-the 5s treatment with nothing failing. Cards are built with `createElement`/`textContent` rather than an HTML string,
-so for the one list that renders agent-controlled values the question of whether `esc()`
-covers every context does not arise.
-
-**A resolve now reports itself.** Previously the only feedback was the card vanishing on
-the next SSE tick, so with the feed down — precisely the state above — a successful
-approval was indistinguishable from a hung click, and errors arrived as a blocking
-`alert()`. The card now shows `✓ allowed · standing rule: .example.com` (or
-`· this request only`) inline the moment the POST returns, keeps its buttons disabled,
-and on a `409` says so specifically — "no longer pending" is a different fact from a
-failure, and re-enabling the buttons would only invite a second failing click. The
-pattern in that line comes back from the *backend* rather than being reconstructed from
-the click, so it reports what was **stored** — which is also the exact string an
-operator would have to go and delete by hand.
-
-**The card shows its deadline (`GET /api/config`).** A held request *blocks the agent*
-and is **default-denied** when `CONTROL_HOLD_TIMEOUT` elapses, and that deadline was
-the one thing the card could not say: it showed a static `requested 14:32:05` and then
-disappeared, so 100 seconds left and 4 seconds left looked identical. Without it the
-difference between hold-for-approval and a slow deny is invisible from the interface
-built to govern it. The backend now exposes the window (a deliberately narrow
-read-only view of non-secret config — `{"hold_timeout": 120.0}`, on the relay
-allowlist), and each card carries `expires in 43s` plus a depleting bar, called out in
-red under 20s. Three details are load-bearing rather than cosmetic:
-
-- **Two clocks, so both ends are clamped.** `ts` is the backend's `time.time()` and
-  `now` is the browser's. They agree in the intended deployment — both are the
-  operator's host — and where they don't, `holdRemaining` clamps to `[0, holdTimeout]`
-  so a skewed clock makes the countdown *wrong* rather than absurd (never negative,
-  never longer than the whole window, and the bar can never exceed 100%).
-- **Zero says `expiring now`, not `expired`.** The backend's clock decides, so a click
-  at zero may still land; if it doesn't, the existing `409` path reports that honestly.
-  Claiming expiry here would be the UI asserting an outcome it cannot know.
-- **A departing card now says which way it went.** Expiry is a governance outcome — the
-  agent was denied because nobody looked in time — while a card leaving with time on
-  the clock means something else resolved it or the control plane restarted. Both used
-  to read as the same hedged sentence; `goneReason` distinguishes them, and falls back
-  to the hedge when `/api/config` is unreachable, because then we genuinely cannot
-  tell. The whole feature fails soft: no config, no countdown, page otherwise
-  unaffected.
+- **Reconnect.** An `EventSource` retries itself only from `CONNECTING`; a non-200 (the
+  relay's 502 during a backend restart) puts it in `CLOSED` for good. So the relay
+  returns a clean 502 and `app.js` reconnects by hand with bounded backoff, instead of
+  sitting on "reconnecting…" while blind — the exact failure the traffic light exists for.
+- **Keyed, non-jumping list + minimum dwell.** Cards are keyed by id and updated in place
+  (`diffPending`) so a row of egress-granting buttons never shifts under the pointer; a
+  departed card is marked stale in place and swept only after a per-reason dwell
+  (`DWELL_MS`), so an expiry — the one departure that reports a governance failure —
+  stays on screen long enough to read. Cards are built with `createElement`/`textContent`,
+  so the agent-controlled host/url/client render as text with no escaping question.
+- **The card reports its own outcome and deadline.** A resolve shows its result inline,
+  the pattern echoed from the *backend* so it names what was stored; the hold countdown
+  comes from `GET /api/config` (`{"hold_timeout"}`, on the relay allowlist — the one
+  cross-component piece) with a two-clock clamp so skew makes it wrong, not absurd. Fails
+  soft: no config, no countdown, page otherwise unaffected.
 
 **A `+ persist` says what it will write, lets you choose it, and asks twice.** This one
 closes a sharp edge, not just a UX gap. `resolve` used to store the **requested host
@@ -1347,23 +1325,12 @@ and `method`/`port`/`proto` are noise in a forty-row glance. All four remain in 
 table and in `make logs-cp`. This endpoint is a legible summary, not the record — and
 the record is what the invariant is about.
 
-**Timestamps are formatted here, not deferred to the viewer's locale** — a correctness
-decision rather than a preference, and the one place in this UI where following the
-platform default was actively wrong. `toLocaleString()` with no locale argument takes
-its format from the *browser's* language preference, so the same audit row read
-`8/7/2026` for one operator and `07/08/2026` for another. Those are different dates, in
-a table whose whole purpose is to say when something happened. Deferring to the viewer
-is right for a consumer app and wrong for a record: an audit trail needs one rendering
-that every reader parses identically. Fixed ISO-8601 ordering, local time, 24-hour, with
-the UTC instant on the row's `title` because the visible stamp states no offset —
-`NOTES.md` has what six locales actually produce.
-
-Two consequences beyond the reading. The format became **assertable**: while it was
-locale-driven the tests could only check its shape, and the suite now pins the exact
-string with `TZ` deliberately set to a non-zero offset, since a UTC runner cannot
-distinguish local from UTC. And writing that test immediately found a real defect — a
-null timestamp rendered as `1970-01-01`, because `Number(null)` is `0` rather than
-`NaN` and cleared every plausible numeric guard.
+**Timestamps are formatted, not deferred to the viewer's locale.** A correctness call,
+not a preference: `toLocaleString()` renders the same audit row as different dates for
+different browsers, and a record of *when* something happened cannot mean two things. So
+the UI fixes ISO-8601 ordering, local time, 24-hour, with the UTC instant on the row's
+`title`, and pins the format in a test. The shaping and the `Number(null)`→`1970-01-01`
+guard live in `app.js`; `NOTES.md` has what six locales produce.
 
 **The list groups; the record does not.** `/api/audit` folds rows whose *displayed*
 fields are identical into one, with a count and the span's start. It exists because a
@@ -1399,34 +1366,15 @@ identity, and the only sources are the Docker socket (which the egress proxy mus
 hold) or a launcher-to-control-plane path that does not exist; neither is worth
 inventing for a label, so `first_ts` stands as the cue that a long span is involved.
 
-**An empty state alone would not have fixed the empty state.** The filed defect was that
-"nothing has happened yet" and "the poll failed" rendered identically. The sharp part is
-that the page's own connection indicator cannot settle it either: `conn` reports the
-**SSE stream**, while this table is filled by a **separate poll**, so the header can read
-`live` while the decisions view sits indefinitely stale. Adding "none yet" under an empty
-table would have made that worse, not better — a positive all-clear on evidence the page
-does not have.
-
-So the two facts are tracked separately (has a load *ever* succeeded; did the *last* one
-fail) and a failed refresh keeps the rows it already has while saying they may be stale.
-Discarding them would throw away the only data the operator has, on the strength of one
-failed request. Three states, three sentences, and the third — before the first response
-lands — deliberately says nothing at all, for the same reason the saturation banner
-renders nothing at zero.
-
-**Both polled lists, not just the decisions one.** Fixing this for the decisions table
-and leaving the policy table's `catch` swallowing was the shape of the original bug
-repeated one tab over — and worse there, because the consequence of staleness differs.
-A stale decisions table is old history. A stale **policy** table misstates what is
-currently allowed, which is what an operator reads before deciding a hold. Three things
-stopped silently: the rules kept rendering, the count froze, and `policySig` stopped
-advancing, so the "policy changed" badge quietly stopped firing.
-
-The three-state logic is therefore shared (`pollStatus`) and only the sentences differ
-per view — the wording has to stay separate, and a test asserts the two views cannot
-collapse onto one text. Leaving `policySig` untouched on failure is correct, since a
-change nobody observed must not be claimed; what was missing was telling the operator
-the view had stopped moving.
+**Empty vs. stale, on both polled lists.** "Nothing has happened yet" and "the poll
+failed" must not render identically — and the header cannot disambiguate them, because
+`conn` reports the SSE *stream* while the decisions and policy tables are filled by a
+*separate poll* that can be failing while the stream is healthy. So each list tracks two
+facts (has a load ever succeeded; did the last one fail), keeps its rows on a failed
+refresh while saying they may be stale, and stays silent before the first response. The
+three-state logic is shared (`pollStatus`) with per-view wording a test keeps distinct —
+a stale **policy** table is worse than a stale decisions one, since it misstates what is
+currently allowed before an operator decides a hold. Details in `app.js`.
 
 **The frontend's own tests.** `tests/test_control_plane_ui_js.py` runs the pure helpers
 under `node` (skipped when node is absent, the way `make lint` skips a missing linter)
@@ -1524,45 +1472,18 @@ than for "the UI has no auth" in general. Ceiling worth stating plainly: while t
 bind mount exists and the approval surface must be reachable by a human who is on
 the host, no purely host-side control survives host code execution.
 
-**Three tabbed views, with badges carrying the hidden state.** Approvals /
-Decisions / Policy, selected by `location.hash` so a reload, a bookmark and the back
-button agree, with `role="tablist"` and arrow-key navigation. Tabs were a deliberate
-choice over one long page, and they come with a specific hazard that the badges exist
-to answer: two views are hidden at any moment, and one of them (standing policy) has
-**silent drift** as its failure mode — it accumulated unnoticed for weeks before it
-was surfaced at all, so putting it one click away could have re-hidden it. Therefore
-the Approvals tab carries a live pending count (amber when non-zero) and the Policy
-tab carries a rule count plus an **unseen marker** that appears when the rule set
-changes while another view is showing and clears only when the policy view is actually
-opened. Both feeds keep polling regardless of the active tab — otherwise a badge could
-not report a hidden view's state, which is the entire reason it is there. The change
-signature is over pattern+action rather than the row count, because a rule whose
-*action flipped* is the change most worth noticing and it leaves the count unchanged.
-A real view split for audit browsing (filter/search/history) is step 2c; this is the
-navigation it will extend.
-
-**Traffic-light favicon + title count.** An inline SVG data URI — never a file or a
-CDN reference, since a governance UI issuing an external request per page load would
-be both ironic and a needless third-party signal, and this way there is no extra route
-for the relay to allow. Three lamps map onto the three states that matter: **red** the
-SSE stream is down (we are not seeing pending approvals), **amber** something is
-waiting on a human, **green** connected and clear. All three lamps keep their **own
-colour at every state** and only the brightness moves (active at full opacity, the
-others at ~0.26): with the inactive lamps greyed out the icon is a dark rectangle
-carrying one small coloured dot and stops reading as a traffic light at 16px, which is
-the size that actually matters. The honest cost is that dim-to-bright is a weaker
-peripheral signal than grey-to-colour, so the title prefix carries most of the
-eye-catching load. `href` is only reassigned when the state genuinely changes —
-`updateIndicators` runs on every poll, and browsers treat each assignment as a fresh
-favicon load, so rewriting it ~15×/minute would be wasted work at best and a
-flickering tab icon at worst. Red for "blind" rather than for
-"denied" is the deliberate part: an unseen hold default-denies after
-`CONTROL_HOLD_TIMEOUT` (~120s), so not-receiving-updates deserves more alarm than
-being busy, and a stale green would be a lie. The pre-JS fallback in `<head>` is amber
-for the same reason — before the stream connects, "unknown" is the honest state, not
-"all clear". The tab title gains a `(n)` prefix so a **background** tab shows the
-count, which is the case that actually matters: `mcp-proxy.anthropic.com` expired
-unnoticed five times because nobody was watching the page.
+**Tabbed views + traffic-light favicon, both driven by "don't hide a failing state."**
+Approvals / Decisions / Policy are tabs (via `location.hash`, with arrow-key nav), and
+the hazard tabs introduce — a hidden view drifting unnoticed, which standing policy did
+for weeks — is answered by badges that keep polling even the hidden views: a live pending
+count, and a policy **unseen** marker keyed on pattern+action (a flipped rule leaves the
+count unchanged). The favicon is an inline SVG data URI (never a CDN — a governance UI
+must not fetch its own control logic or icons per page load) whose lit lamp means
+**red = blind** (SSE down; an unseen hold default-denies after `CONTROL_HOLD_TIMEOUT`)
+rather than red = denied, with the pre-JS fallback amber ("unknown", not "all clear") and
+a `(n)` title prefix so the background tab nobody watches still shows the count. Rendering
+specifics (lamp opacity, `href`-reassignment throttling) are in `app.js`. A real audit
+browser (filter/search/history) is step 2c; this is the navigation it will extend.
 
 **Standing policy is visible in the UI (`GET /api/rules`).** The UI showed
 pending approvals and recent decisions but never the **rules** — the thing that
@@ -2186,8 +2107,8 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
 - **Approval-UI follow-ups (reviewed and specified, not built).** From the same review
   that produced the reconnect / CSP / keyed-rendering work above, in value order. The
   top two — the hold countdown and the persist preview/confirm with an operator-chosen
-  pattern — are **now built**; see "The card shows its deadline" and "A `+ persist` says
-  what it will write" under the frontend section. What remains:
+  pattern — are **now built**; see "Frontend mechanics" (the hold countdown) and "A
+  `+ persist` says what it will write" under the frontend section. What remains:
   - *(A DOM-level test for `start()` was considered here and **declined** — the frontend
     is treated as a convenience layer over a backend that validates every input, with its
     mistakes made detectable rather than prevented. The reasoning, and the condition that

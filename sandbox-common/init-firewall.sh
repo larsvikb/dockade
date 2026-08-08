@@ -157,6 +157,20 @@ else
     fi
     USE_IPSET=1
 
+    # Reject a CIDR that is absurdly broad (prefix < /8) or private/loopback/
+    # link-local — a hostile or MITM'd api.github.com/meta response could send
+    # 0.0.0.0/0, which a shape-only check would add, turning "whitelist only" into
+    # allow-all while still printing the reassuring banner below. GitHub never
+    # publishes such ranges. Fail-safe: over-rejecting only drops direct git egress
+    # (recoverable), it can never open a hole.
+    _sane_cidr() {
+        local c="$1" prefix="${1##*/}"
+        [[ "$c" =~ ^[0-9.]+/[0-9]{1,2}$ ]] || return 1
+        [[ "$prefix" =~ ^[0-9]+$ && "$prefix" -ge 8 ]] || return 1
+        [[ "$c" =~ ^(0|10|127|169\.254|192\.168|172\.(1[6-9]|2[0-9]|3[01]))\. ]] && return 1
+        return 0
+    }
+
     # GitHub IP ranges (dynamic) — git clone/pull/push, gh, API.
     # TRANSITIONAL: belongs behind the governed git path in the target design;
     # whitelisted here only until that data plane exists.
@@ -164,8 +178,10 @@ else
     gh_ranges=$(curl -s https://api.github.com/meta || true)
     if [ -n "$gh_ranges" ] && echo "$gh_ranges" | jq -e '.web and .api and .git' >/dev/null 2>&1; then
         while read -r cidr; do
-            if [[ "$cidr" =~ ^[0-9.]+/[0-9]{1,2}$ ]]; then
+            if _sane_cidr "$cidr"; then
                 ipset add allowed-domains "$cidr" 2>/dev/null || true
+            else
+                echo "  skipping suspicious GitHub CIDR: $cidr"
             fi
         done < <(echo "$gh_ranges" | jq -r '(.web + .api + .git)[]' | aggregate -q 2>/dev/null \
                  || echo "$gh_ranges" | jq -r '(.web + .api + .git)[]')
@@ -305,12 +321,18 @@ if [ "$USE_IPSET" -eq 1 ]; then
     # Direct IP allowlist (standalone mode only). This match needs the kernel
     # xt_set module; on kernels without it (stock WSL2) `ipset create` above can
     # still succeed while THIS fails, so fail closed with guidance.
-    if ! iptables -A OUTPUT -m set --match-set allowed-domains dst -j ACCEPT 2>/tmp/xtset.err; then
+    # Restrict the direct allowlist to HTTP(S) ports. Matching only the destination IP
+    # let an allowlisted host be reached on ANY port (SSH, arbitrary TLS) over raw TCP,
+    # widening the channel well past what "allow <host>" grants; DNS is already handled
+    # by the port-53 rules above. The first rule doubles as the xt_set capability probe
+    # (ipset create can succeed while the match module is absent — stock WSL2).
+    if ! iptables -A OUTPUT -p tcp --dport 443 -m set --match-set allowed-domains dst -j ACCEPT 2>/tmp/xtset.err; then
         echo "FATAL: iptables cannot use ipset matches ($(tr -d '\n' </tmp/xtset.err))." >&2
         echo "       The kernel lacks the xt_set module (common on stock WSL2)." >&2
         echo "       Use the egress proxy (governed mode) instead. See DESIGN.md." >&2
         exit 1
     fi
+    iptables -A OUTPUT -p tcp --dport 80 -m set --match-set allowed-domains dst -j ACCEPT
 fi
 iptables -A OUTPUT -j REJECT --reject-with icmp-admin-prohibited
 

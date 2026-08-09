@@ -108,6 +108,17 @@ ENV PATH="$PATH:/home/$USERNAME/.local/bin"
 # shell-snapshot) deterministically pick bash rather than any other installed shell.
 ENV SHELL=/bin/bash
 
+# UTF-8 by default. Costs nothing to add: `C.utf8` is built into glibc (>= 2.35), so
+# this needs no `locales` package and no locale-gen — the image already carried the
+# locale and only the variable was missing. Unset, everything runs in the C locale,
+# where any tool that converts from the locale charset treats non-ASCII input as
+# invalid: `curl https://bücher.de` will not even build a URL despite libidn2 being
+# linked, and it fails in a way that reads exactly like a proxy denial (see NOTES.md).
+# `C.UTF-8` and not a national locale on purpose — it is UTF-8 encoding with C
+# semantics, so byte-order sorting and ASCII case rules are unchanged and nothing that
+# depends on them shifts underneath.
+ENV LANG=C.UTF-8
+
 # Default editor. Real process env so it reaches every process (git, Claude Code,
 # non-interactive shells), not just interactive bash. git honors these directly
 # (GIT_EDITOR > core.editor > VISUAL > EDITOR); the update-alternatives above

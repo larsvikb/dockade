@@ -254,6 +254,42 @@ def _unbracket(host: str) -> str:
     return host
 
 
+def _a_label(host: str) -> str:
+    """Return the ASCII (A-label) spelling of a possibly-internationalized host.
+
+    mitmproxy hands us the UNICODE form: ``parse_authority`` IDNA-*decodes* when it
+    parses the authority off the wire as bytes, so a ``CONNECT xn--bcher-kva.de:443``
+    arrives at ``request.host`` as ``bücher.de`` (verified against the pinned 12.2.3
+    — ``request.pretty_host``, which re-parses the already-decoded Host header
+    string, does not decode and keeps the ASCII form). Nothing else in this system
+    speaks that dialect, so the decoded form has to be folded back here, at the one
+    place it enters:
+
+      - the approval card and the policy/audit tables render it verbatim, so a
+        homoglyph — ``apple.com`` with its leading letter swapped for U+0430
+        CYRILLIC SMALL LETTER A — reaches the operator looking exactly like the
+        host it imitates, and a persisted rule then keeps the disguise;
+      - the TLS SNI is ASCII by RFC 6066 and mitmproxy decodes it ``ascii`` only,
+        so an authority remembered in Unicode can never equal the SNI it should
+        match — every legitimate IDN would die at ``tls_clienthello`` accused of
+        domain-fronting.
+
+    Both are the same bug: a name spelled two ways. Canonicalizing to the A-label
+    is what makes the comparison, the display and the stored rule agree.
+
+    Falls back to the input on UnicodeError. The ``idna`` codec is stricter than
+    the hosts we must keep working — it rejects empty, over-long and underscored
+    labels (``_dmarc.example.com``) that DNS and the rest of this proxy handle
+    fine — and this function's job is spelling, not validation. Failing closed
+    here would trade a display bug for an outage on hosts that were never
+    internationalized in the first place; the guards downstream still run either
+    way."""
+    try:
+        return host.encode("idna").decode("ascii")
+    except (UnicodeError, ValueError):
+        return host
+
+
 def _embedded_ipv4(ip):
     """Return the IPv4 address an IPv6 literal would actually dial, or None.
 
@@ -528,7 +564,10 @@ async def http_connect(flow: http.HTTPFlow) -> None:
     (the tunnel is opaque TCP via ``ignore_connection`` below, so an allowed host
     on an unrestricted port would carry any protocol), then ask the control plane
     about the host."""
-    host = flow.request.host
+    # A-label BEFORE anything reads it: this one name becomes the audit line, the
+    # /authorize question, the operator's card, any rule persisted from it, and the
+    # authority the SNI stage compares against. See ``_a_label``.
+    host = _a_label(flow.request.host)
     port = flow.request.port
     client = flow.client_conn.peername[0] if flow.client_conn.peername else None
     # Refuse to relay onto the control plane / control-net BEFORE anything else
@@ -625,9 +664,17 @@ async def request(flow: http.HTTPFlow) -> None:
     # now ingested centrally, so leaving them clientless reopened the same hole on the
     # paths that need attribution most.
     client = flow.client_conn.peername[0] if flow.client_conn.peername else None
+    # A-label both names before comparing or gating them (see ``_a_label``). The two
+    # properties disagree on spelling for an IDN — ``host`` is IDNA-decoded, but
+    # ``pretty_host`` is not — so without this the set below holds two spellings of
+    # ONE destination and gates (and can separately hold) the same host twice.
+    # Folding first keeps the set a set of destinations, which is what it is for:
+    # a genuinely fronted request still yields two entries.
+    transport_host = _a_label(flow.request.host)
+    asserted_host = _a_label(flow.request.pretty_host)
     # Forbid control-plane / control-net for EVERY name the client asserts
     # (transport host and Host/:authority), before policy or the port gate.
-    for name in {flow.request.host, flow.request.pretty_host}:
+    for name in {transport_host, asserted_host}:
         forbidden = await _forbidden(name)
         if forbidden:
             _audit("deny", stage="http", proto=proto, host=name, port=port,
@@ -637,7 +684,7 @@ async def request(flow: http.HTTPFlow) -> None:
                 403, b"egress denied by policy\n", {"Content-Type": "text/plain"})
             return
     if port not in allowed_ports:
-        _audit("deny", stage="http", proto=proto, host=flow.request.pretty_host,
+        _audit("deny", stage="http", proto=proto, host=asserted_host,
                port=port, client=client, method=flow.request.method,
                url=flow.request.pretty_url, central=False,
                reason=f"port {port} not permitted for {proto} "
@@ -646,7 +693,7 @@ async def request(flow: http.HTTPFlow) -> None:
             403, b"egress denied by policy\n", {"Content-Type": "text/plain"})
         return
     # sorted() only to make the "which name failed" report deterministic.
-    names = sorted({flow.request.host, flow.request.pretty_host})
+    names = sorted({transport_host, asserted_host})
     bad_name, bad_reason, central = None, "", True
     for name in names:
         v = await _authorize(
@@ -661,7 +708,7 @@ async def request(flow: http.HTTPFlow) -> None:
             bad_name, bad_reason = name, v.reason
             break
     if bad_name is None:
-        _audit("allow", stage="http", proto=proto, host=flow.request.pretty_host,
+        _audit("allow", stage="http", proto=proto, host=asserted_host,
                port=port, method=flow.request.method, client=client,
                url=flow.request.pretty_url, central=central)
     else:

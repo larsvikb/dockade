@@ -110,14 +110,6 @@ than restated.
   drain. Refusals fail closed, so this costs availability, not containment. The fix
   needs a per-client *waiter* bound — a semantics decision rather than a patch.
 
-- **The approval card may render a decoded Unicode hostname.** *(unconfirmed against
-  the pinned mitmproxy version)* Nothing between `flow.request.host` and the card's
-  `textContent` converts back to ASCII, so **if** mitmproxy decodes IDNA, a punycode
-  homoglyph reaches the operator with no ASCII form shown beside it. The conditional
-  is honest — this was found by reading, not by observing — and confirming it is the
-  first step. The fix is to show the punycode form on the card and in the policy and
-  audit tables.
-
 - **A duplicate can join a card in the instant after it is decided.** `resolve`
   commits the decision outside `_LOCK` and closes the group inside it, so a request
   can arrive between the two and inherit an outcome it did not wait for. Bounded: a

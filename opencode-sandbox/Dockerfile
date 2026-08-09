@@ -79,6 +79,10 @@ WORKDIR /workspace
 # boundary-check.sh by absolute path — belt-and-braces for a live docker exec.)
 ENV PATH="$PATH:/home/$USERNAME/.local/bin"
 ENV SHELL=/bin/bash
+# UTF-8 by default — see the matching note in claude-sandbox/Dockerfile. `C.utf8` is
+# built into glibc (>= 2.35), so this adds no package and no bytes; unset, the C locale
+# makes tools reject non-ASCII input they can otherwise handle (NOTES.md).
+ENV LANG=C.UTF-8
 ENV EDITOR=vim \
     VISUAL=vim
 

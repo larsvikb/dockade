@@ -88,6 +88,58 @@ both cases is the conventional pairing, since other tools split the other way.
 No man page ships in the sandbox image, so the above is the measurement rather than a
 quote from the documentation.
 
+## mitmproxy decodes IDNA on the authority it parses, but not on the Host header or SNI
+
+Measured against `mitmproxy 12.2.3` — the version pinned by digest in
+`proxies/egress/Dockerfile`. A client sending `CONNECT xn--bcher-kva.de:443` (the
+A-label of `bücher.de`, which is what curl and browsers put on the wire) produces:
+
+| property | value | why |
+|---|---|---|
+| `request.host` | `bücher.de` | **decoded** |
+| `request.pretty_host` | `xn--bcher-kva.de` | not decoded |
+| `request.authority` | `bücher.de:443` | decoded |
+| `ClientHello.sni` | `xn--bcher-kva.de` | ASCII only |
+
+The asymmetry is one function taking two types. `url.parse_authority` decodes when
+handed **bytes** and does not when handed **str**: the HTTP/1 reader passes the raw
+wire bytes (`net/http/http1/read.py`, both the authority-form and absolute-form
+branches), whereas `pretty_host` re-parses the Host header, which `Headers` has
+already turned into a `str`. `ClientHello.sni` is `.decode("ascii")` with no IDNA
+path at all (`mitmproxy/tls.py`). Under HTTP/2 the split moves: `host_header` returns
+`authority`, which *is* decoded, so `pretty_host` is Unicode there too.
+
+Sending raw UTF-8 on the wire instead of the A-label is **not** an alternative route
+to the same state — the request line fails to parse (`ValueError: Bad HTTP request
+line`) before any of this.
+
+Measured by installing the same version and parsing synthetic request heads through
+`mitmproxy.net.http.http1.read_request_head`, not by reading the changelog.
+
+## In the C locale, `curl` rejects a literal IDN even with `libidn2` linked in
+
+`curl https://bücher.de` fails with `(3) URL using bad/illegal format` in ~6 ms —
+before any request leaves, so in a terminal it reads exactly like a proxy denial and
+is not one. curl has `libidn2`; what it lacked was a UTF-8 locale to convert *from*.
+Bypassing the proxy separates parsing from egress, since error 3 means curl never
+built a URL and error 6 means it did:
+
+| `LC_ALL` | result |
+|---|---|
+| unset (C locale) | `(3)` — not parsed |
+| `C.UTF-8` | `(6) Could not resolve host: bücher.de` — parsed fine |
+| `en_US.UTF-8` | `(3)` — not installed in the image, so it falls back to C |
+
+Debian 13's glibc carries `C.utf8` built in, so the fix was one `ENV LANG=C.UTF-8`
+(now in both sandbox Dockerfiles) and not a `locales` package — the locale was always
+there, only the variable was missing. Worth knowing anyway when reaching for a
+national locale in a slim image: `en_US.UTF-8` is *not* present and silently degrades
+to C rather than erroring.
+
+Probing an internationalized host with its **A-label** (`xn--bcher-kva.de`) sidesteps
+the question entirely, and is the more faithful test regardless — the A-label is what
+any client puts on the wire.
+
 ## Two `uvicorn.Server`s in one event loop still both stop on SIGTERM
 
 Running two servers from one `asyncio.gather` looks like it should break signal

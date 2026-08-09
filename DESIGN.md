@@ -775,6 +775,24 @@ host. `boundary-check.sh` now probes the **mapped** spelling of both control-net
 and metadata alongside the dotted-quad ones — the dotted-quad probes passed
 throughout this bug, so they cannot catch its return.
 
+*One destination, one spelling — the IDNA fold.* The same "a destination, not a
+string" problem recurs one layer up, where the consumers are not CIDR sets but
+people and stored rules. mitmproxy IDNA-**decodes** the authority it parses off the
+wire while leaving the Host header and the TLS SNI in ASCII (measured in `NOTES.md`),
+so the raw properties hand three consumers three spellings of one host — and each
+fails differently. The approval card and any rule persisted from it render what they
+are given, so a homoglyph reaches the operator wearing the imitated host's face and
+the rule keeps the disguise; `tls_clienthello` compares the remembered CONNECT
+authority against an SNI that is ASCII by RFC 6066, so a *legitimate* IDN is approved
+by a human and then refused as domain-fronting, with an audit line accusing it. No
+single file owns that reasoning, which is why it is here: the fix is one fold to the
+A-label at the point each name enters `addon.py` (`_a_label`), chosen over normalizing
+at display time because only the entry point is upstream of all three consumers.
+Folding spelling must not fold destinations — a Host header naming a genuinely
+different site still gates separately — and the fold falls back to the input rather
+than raising, since the `idna` codec rejects underscored and over-long labels that
+DNS and the rest of this proxy accept.
+
 *Defense-in-depth, not the sole control — and honest about the resolve branch.*
 The hostname and literal-IP checks are **deterministic** (decided from the request
 alone); the resolve branch is **best-effort** — it depends on a DNS lookup, so it

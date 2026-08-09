@@ -225,6 +225,130 @@ class TlsClientHelloTests(unittest.TestCase):
         audited.assert_not_called()
 
 
+class InternationalizedHostTests(unittest.TestCase):
+    """One destination must have ONE spelling everywhere.
+
+    mitmproxy IDNA-*decodes* the authority it parses off the wire, so
+    ``request.host`` arrives as Unicode (``bücher.de``) while ``request.pretty_host``
+    and the TLS SNI stay ASCII. Nothing downstream reconciles those: the approval
+    card renders what it is given, a persisted rule keeps that spelling, and the SNI
+    check is a plain string compare. ``_a_label`` folds them at the entry points —
+    these tests hold that fold in place, because every symptom below is invisible
+    until an internationalized host actually appears."""
+
+    # bücher.de — a real IDN. Its A-label is what any client puts on the wire.
+    UNICODE = "bücher.de"
+    ASCII = "xn--bcher-kva.de"
+    # apple.com with its leading letter swapped for U+0430 CYRILLIC SMALL LETTER A.
+    # Written as an escape deliberately: spelled literally it is indistinguishable
+    # from the real host HERE too, which is the whole complaint about the card.
+    HOMOGLYPH = "\u0430pple.com"
+    HOMOGLYPH_ASCII = "xn--pple-43d.com"
+
+    def setUp(self):
+        addon._conn_authority.clear()
+
+    def test_a_label_folds_unicode_and_leaves_ascii_alone(self):
+        self.assertEqual(addon._a_label(self.UNICODE), self.ASCII)
+        self.assertEqual(addon._a_label(self.HOMOGLYPH), self.HOMOGLYPH_ASCII)
+        # Already-ASCII names, including an A-label, must survive untouched.
+        self.assertEqual(addon._a_label("example.com"), "example.com")
+        self.assertEqual(addon._a_label(self.ASCII), self.ASCII)
+
+    def test_a_label_falls_back_rather_than_rejecting_a_dns_valid_host(self):
+        """The ``idna`` codec is stricter than DNS and than the rest of this proxy.
+        Underscored and over-long labels resolve fine in practice, so raising here
+        would turn a spelling helper into an outage for hosts that were never
+        internationalized. Spelling is this function's job; gating is not."""
+        for host in ("_dmarc.example.com", "a" * 64 + ".example.com", ""):
+            self.assertEqual(addon._a_label(host), host)
+
+    def test_connect_asks_the_control_plane_in_ascii(self):
+        """The /authorize host is what the operator's card shows and what a persisted
+        rule stores. Sent as Unicode, a homoglyph reaches the human looking exactly
+        like the host it imitates — and the rule keeps the disguise."""
+        flow = _connect_flow(self.HOMOGLYPH, cid="idn1")
+        with mock.patch.object(addon.socket, "getaddrinfo",
+                               return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]), \
+             mock.patch.object(
+                 addon, "_post_authorize",
+                 return_value={"decision": "allow", "reason": "ok"}) as authorized:
+            run(addon.http_connect(flow))
+        self.assertEqual(authorized.call_args[0][0]["host"], self.HOMOGLYPH_ASCII)
+
+    def test_connect_audits_in_ascii(self):
+        flow = _connect_flow(self.HOMOGLYPH, cid="idn2")
+        with mock.patch.object(addon.socket, "getaddrinfo",
+                               return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]), \
+             mock.patch.object(addon, "_post_authorize",
+                               return_value={"decision": "allow", "reason": "ok"}), \
+             mock.patch.object(addon, "_audit") as audited:
+            run(addon.http_connect(flow))
+        self.assertEqual(audited.call_args[1]["host"], self.HOMOGLYPH_ASCII)
+
+    def test_an_approved_idn_is_not_then_refused_as_domain_fronting(self):
+        """The regression this fold exists for. The SNI is ASCII by RFC 6066 and
+        mitmproxy decodes it ``ascii`` only, so an authority remembered in Unicode
+        could never equal it: every legitimate IDN was approved at CONNECT and then
+        killed at the TLS stage, audited as a fronting attempt it never was."""
+        flow = _connect_flow(self.UNICODE, cid="idn3")
+        with mock.patch.object(addon.socket, "getaddrinfo",
+                               return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]), \
+             mock.patch.object(addon, "_post_authorize",
+                               return_value={"decision": "allow", "reason": "ok"}):
+            run(addon.http_connect(flow))
+        self.assertEqual(addon._conn_authority.get("idn3"), self.ASCII)
+
+        data = SimpleNamespace(
+            client_hello=SimpleNamespace(sni=self.ASCII),   # what TLS carries
+            context=SimpleNamespace(
+                client=SimpleNamespace(id="idn3", peername=("172.30.0.2", 5000))),
+            ignore_connection=False)
+        addon.tls_clienthello(data)
+        self.assertTrue(data.ignore_connection)
+
+    def test_fronting_an_idn_authority_is_still_refused(self):
+        """The fold must not become a way through: matching is still exact, it just
+        happens in one alphabet."""
+        addon._conn_authority["idn4"] = self.ASCII
+        data = SimpleNamespace(
+            client_hello=SimpleNamespace(sni="evil.com"),
+            context=SimpleNamespace(
+                client=SimpleNamespace(id="idn4", peername=("172.30.0.2", 5000))),
+            ignore_connection=False)
+        addon.tls_clienthello(data)
+        self.assertFalse(data.ignore_connection)
+
+    def test_http_gates_one_destination_once(self):
+        """``host`` and ``pretty_host`` disagree on spelling for an IDN, so ungated
+        they are two set members — two /authorize calls, and two approval cards, for
+        a single request to a single host."""
+        flow = _http_flow(self.UNICODE, self.ASCII, scheme="http", port=80)
+        with mock.patch.object(addon.socket, "getaddrinfo",
+                               return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]), \
+             mock.patch.object(
+                 addon, "_post_authorize",
+                 return_value={"decision": "allow", "reason": "ok"}) as authorized:
+            run(addon.request(flow))
+        self.assertIsNone(flow.response)
+        authorized.assert_called_once()
+        self.assertEqual(authorized.call_args[0][0]["host"], self.ASCII)
+
+    def test_http_still_gates_two_genuinely_different_names(self):
+        """Folding spellings must not fold DESTINATIONS: a Host header naming a
+        different site than the transport target is the fronting case, and it still
+        has to clear the control plane on both names."""
+        flow = _http_flow(self.UNICODE, "other.example", scheme="http", port=80)
+        with mock.patch.object(addon.socket, "getaddrinfo",
+                               return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]), \
+             mock.patch.object(
+                 addon, "_post_authorize",
+                 return_value={"decision": "allow", "reason": "ok"}) as authorized:
+            run(addon.request(flow))
+        asked = {c[0][0]["host"] for c in authorized.call_args_list}
+        self.assertEqual(asked, {self.ASCII, "other.example"})
+
+
 class RequestTests(unittest.TestCase):
     """``request`` gates BOTH the transport host and the Host/:authority — this
     is what closes domain-fronting on the decrypted/plain-HTTP path."""

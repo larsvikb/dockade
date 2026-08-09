@@ -771,13 +771,19 @@ def _reserve_hold(approval_id: str, event: threading.Event,
 def _close_group_locked(approval_id: str) -> None:
     """Stop new requests JOINING this card, without disturbing the waiters already on
     it. Caller must hold ``_LOCK`` — ``resolve`` calls this inside the same critical
-    section that wakes the waiters, so there is no instant in which the card is decided
-    and still joinable.
+    section that wakes the waiters, so no waiter is ever released while the card is
+    still joinable.
+
+    That is NOT the same as the card becoming unjoinable the moment it is decided. The
+    decision commits OUTSIDE ``_LOCK``, so there is a narrow gap in which a duplicate
+    can still join and inherit an outcome it did not wait for. The gap, its bound and
+    why it is tolerated are at the call site in ``resolve``; it is also disclosed in
+    SECURITY.md.
 
     Separate from ``_release_hold`` because the two happen at different times: the card
-    stops being joinable when it is DECIDED, and its slots free as each blocked worker
-    wakes and returns. Collapsing them would leave a decided card joinable for as long
-    as the slowest waiter took to notice."""
+    stops being joinable at the decision (bar that gap), and its slots free as each
+    blocked worker wakes and returns. Collapsing them would leave a decided card
+    joinable for as long as the slowest waiter took to notice."""
     for key, held in list(_GROUPS.items()):
         if held == approval_id:
             del _GROUPS[key]

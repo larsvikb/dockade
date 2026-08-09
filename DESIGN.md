@@ -1961,6 +1961,18 @@ a CI failure reproduces locally with `make check-strict`. Two parallel jobs — 
 consistency + tests (about a minute) and the five-image build verification — so a
 shellcheck typo is not queued behind an image build.
 
+**The build job then runs `make check-boundary`, which is the only automated evidence
+that containment still holds.** Everything else in the gate reads the boundary rather
+than crossing it: shellcheck reads `init-firewall.sh` as text, `tests/test_topology.py`
+reads `docker-compose.yml` as YAML. Between them they assert what the boundary is
+*declared* to be, which leaves a firewall regression invisible to every other check here
+— the strongest containment evidence the repo has was a manual `make boundary`. So the
+job stands the stack up and runs `boundary-check.sh` inside a real tier-1 sandbox, from
+the agent's own security context. It rides on the build job because that job has already
+compiled the images; a third job shares no layer cache and would rebuild all five to run
+a two-minute check. What CI cannot cover stays manual and is named in the workflow: tier
+2 needs a GPU, standalone mode needs a host with no compose infra.
+
 **Strict mode is the part that makes the gate mean anything.** Every stage degrades to a
 SKIP when its tool is absent, which is right on a dev machine (running the checks you
 *can* run beats running none) and a trap in CI: a runner without hadolint prints `SKIP

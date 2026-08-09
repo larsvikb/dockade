@@ -25,6 +25,12 @@ COMPOSE := docker compose
 SANDBOX ?= claude-sandbox
 WORKSPACE ?= $(PWD)
 
+# The throwaway container `check-boundary` runs the check in. Named apart from
+# the default so it is self-evident in `docker ps` while it runs, and so it never
+# takes the numbered suffix the launcher would otherwise allocate next to a live
+# agent session.
+BOUNDARY_SANDBOX ?= boundary-check-sandbox
+
 # How far the inference server's context window must exceed the window the CLIENT
 # believes it has. Not a safety margin picked by taste — it is sized to a measured
 # overshoot; see the context-window headroom check in `consistency`.
@@ -92,7 +98,7 @@ REFFILES := $(SCRIPTS) \
 
 .PHONY: help check check-strict lint consistency test verify-build \
         up down destroy audit-prune rebuild logs-ep logs-cp \
-        claude opencode boundary split-check
+        claude opencode boundary check-boundary split-check
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -458,6 +464,35 @@ opencode: ## Launch a tier-2 (opencode + local LLM, no egress) sandbox (WORKSPAC
 
 boundary: ## Run boundary-check.sh in a running sandbox (SANDBOX=claude-sandbox|opencode-sandbox)
 	docker exec -it --user sandbox "$(SANDBOX)" /usr/local/bin/boundary-check.sh
+
+check-boundary: ## Stand the infra up and assert containment from inside a throwaway tier-1 sandbox (what CI runs)
+	# The repo's only AUTOMATED evidence that the containment boundary holds.
+	# `make check` structurally cannot reach it: shellcheck reads init-firewall.sh
+	# as text and tests/test_topology.py reads docker-compose.yml as YAML, so
+	# between them they assert what the boundary is DECLARED to be. Nothing there
+	# arms a firewall or tries to leave a container. This does, as the agent.
+	#
+	# Deliberately NOT part of `make check`, which is a static gate that must stay
+	# fast and runnable anywhere: this one needs a live docker daemon, builds an
+	# image if it is missing, and takes minutes.
+	#
+	# Deliberately NON-DESTRUCTIVE, because an operator may well run it against
+	# live infrastructure: `up` keeps the volumes and leaves any running agent
+	# session alone. It never calls `destroy` — the audit store is the crown
+	# jewel, and no test target gets to delete it.
+	#
+	# `boundary` is the sibling for the case where you already HAVE a sandbox
+	# running (and is the only way to check tier 2, whose own probes need the local
+	# model server up). This one owns the whole lifecycle instead, which is what
+	# makes it usable from a runner with no TTY and nothing running.
+	#
+	# Two lines because the launcher does the work: --boundary-check runs the check
+	# as the container's command, so the container's exit status IS the verdict and
+	# there is no container left to clean up, inspect or name-manage. See the
+	# launch-mode comment in run-claude-sandbox.sh for why that beats exec'ing into
+	# a long-running one.
+	$(MAKE) --no-print-directory up
+	SANDBOX_NAME="$(BOUNDARY_SANDBOX)" ./run-claude-sandbox.sh "$(WORKSPACE)" --boundary-check
 
 split-check: ## Assert the running proxy reaches /authorize and NOT the management API
 	# The API-surface split, checked where it actually applies. boundary-check.sh

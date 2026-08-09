@@ -109,9 +109,12 @@ failure it warns about.
   commit message, because it becomes one.
 - **`make check` green.** If a check is wrong rather than your change, say so in the
   description and fix the check in the same PR.
-- **Touching the boundary?** Run `boundary-check.sh` inside a live sandbox before and
-  after (`make boundary`). It exits non-zero on any violation, which makes it usable
-  as a regression baseline and not just a demo.
+- **Touching the boundary?** Run `make check-boundary` before and after. It stands the
+  infra up, launches a throwaway tier-1 sandbox and runs `boundary-check.sh` inside it,
+  exiting non-zero on any violation — a regression baseline, not a demo. It leaves your
+  volumes and any running agent session alone. CI runs the same target, so a boundary
+  regression fails the PR. Use `make boundary` instead when you already have a sandbox
+  running, or to check tier 2 (whose probes need the local model server up).
 - **New source file?** Add an `SPDX-License-Identifier: Apache-2.0` header in the
   first three lines, so licence scanners never have to parse `LICENSE`.
   `make consistency` enforces this for the file types where it applies — scripts,

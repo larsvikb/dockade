@@ -1,7 +1,8 @@
 #!/bin/bash
 # SPDX-License-Identifier: Apache-2.0
 # Launch the TIER-1 sandbox: Claude Code, governed egress via the proxy.
-# Usage: ./run-claude-sandbox.sh [workspace_path] [--rebuild] [--build-only] [--no-cache]
+# Usage: ./run-claude-sandbox.sh [workspace_path] [--rebuild] [--build-only]
+#                                [--no-cache] [--boundary-check]
 #
 # Mounts the given workspace (default: current dir) at /workspace.
 # Claude config/auth persists in the named volume `claude-sandbox-config`,
@@ -12,6 +13,10 @@
 # `make check`); implies a rebuild.
 # --no-cache forces a from-scratch build (bypasses the layer cache); implies a
 # rebuild. Combine with --build-only for a clean headless rebuild (`make rebuild`).
+# --boundary-check launches the container exactly as normal — same network, caps,
+# mounts, firewall, privilege drop — but runs boundary-check.sh instead of a shell
+# and exits with its verdict. Needs no TTY, so it is how `make check-boundary` (and
+# therefore CI) asserts containment; see .github/workflows/check.yml.
 #
 # Shared plumbing (workspace guard, image build, naming, git identity, DNS) lives
 # in sandbox-lib.sh and is identical for every tier. THIS file owns only tier 1's
@@ -51,6 +56,7 @@ SANDBOX_CPUS="${SANDBOX_CPUS:-4}"
 REBUILD=false
 BUILD_ONLY=false
 NO_CACHE=false
+BOUNDARY_CHECK=false
 WORKSPACE="$PWD"
 
 # The firewall is the real containment boundary, so there is deliberately no
@@ -62,6 +68,7 @@ for arg in "$@"; do
         --rebuild)     REBUILD=true ;;
         --build-only)  BUILD_ONLY=true; REBUILD=true ;;
         --no-cache)    NO_CACHE=true; REBUILD=true ;;
+        --boundary-check) BOUNDARY_CHECK=true ;;
         -*)            echo "Unknown flag: $arg" >&2; exit 1 ;;
         *)             WORKSPACE="$(cd "$arg" && pwd)" ;;
     esac
@@ -163,6 +170,44 @@ echo "DNS upstreams: $SC_UPSTREAM_DNS (pinned via --dns; whitelisted on :53 in s
 echo "Egress:    $EGRESS_DESC"
 echo ""
 
+# Launch mode. Everything below this — network, capabilities, mounts, firewall,
+# privilege drop — is IDENTICAL in both modes on purpose: a boundary check is
+# worth something only if it runs against the real boundary, so the modes may
+# differ ONLY in whether a TTY is attached and in what runs after the
+# entrypoint's gosu drop.
+#
+#   default          -it, image CMD (`bash`) -> the interactive shell the
+#                    operator starts the agent from.
+#   --boundary-check no TTY, command overridden to boundary-check.sh. One-shot:
+#                    the container exits with the check's verdict, and `docker
+#                    run` hands that back as this script's exit status.
+#
+# ONE-SHOT, rather than "start an idle container and `docker exec` the check into
+# it" — which is the obvious shape and the worse one, for two reasons.
+#
+# The overridden command replaces only CMD (the Dockerfile sets ENTRYPOINT
+# separately), so the entrypoint still arms the firewall, asserts the agent holds
+# no capabilities, and drops privileges. boundary-check.sh therefore runs as the
+# gosu-dropped CHILD of that entrypoint: the same process lineage, and the same
+# environment, an agent gets. A `docker exec` is instead a sibling Docker builds
+# from the container's stored config — it inherits the `-e` variables but NOT
+# anything the entrypoint exported at runtime (SANDBOX_CONFIG_DIR, HOME, USER),
+# so a probe that branched on one of those would quietly take the wrong branch
+# and still report PASS. Nothing in boundary-check.sh reads them today; the point
+# is that this mode cannot grow that bug, and the exec shape can.
+#
+# Second, the entrypoint's output and the probe results arrive in ONE ordered
+# stream on success and failure alike. That matters most in the case that matters
+# most: the entrypoint is designed to abort when the firewall cannot be armed, and
+# here that abort IS the output, rather than something left behind in `docker logs`
+# for someone to know to go and find. It also makes --rm safe to keep.
+RUN_MODE_ARGS=(-it --rm)
+RUN_CMD_ARGS=()
+if [[ "$BOUNDARY_CHECK" == "true" ]]; then
+    RUN_MODE_ARGS=(--rm)
+    RUN_CMD_ARGS=(/usr/local/bin/boundary-check.sh)
+fi
+
 # Capabilities: cap-drop=ALL, then add back ONLY what the root entrypoint needs
 # during setup — NET_ADMIN for the iptables/ipset firewall; CHOWN/DAC_OVERRIDE/
 # FOWNER to own /config and materialize config as the sandbox user; SETGID/SETUID
@@ -178,7 +223,7 @@ echo ""
 # they cannot drift apart. (Note --cpus is a CFS quota, not a cpuset: `nproc` still
 # reports every host CPU, so build tools that size their worker pool from it will
 # oversubscribe and get throttled.)
-docker run -it --rm \
+docker run "${RUN_MODE_ARGS[@]}" \
     --name "$SC_CONTAINER_NAME" \
     --hostname sandbox \
     --network "$SANDBOX_NET" \
@@ -208,4 +253,4 @@ docker run -it --rm \
     ${PROXY_ENV_ARGS[@]+"${PROXY_ENV_ARGS[@]}"} \
     ${SC_GIT_ID_ARGS[@]+"${SC_GIT_ID_ARGS[@]}"} \
     \
-    "$IMAGE_NAME"
+    "$IMAGE_NAME" ${RUN_CMD_ARGS[@]+"${RUN_CMD_ARGS[@]}"}

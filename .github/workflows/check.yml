@@ -14,6 +14,14 @@
 # compiles five images, two of which are Debian-based sandbox tiers that apt-install
 # a whole toolchain. Running them in parallel means a shellcheck typo is not queued
 # behind a ten-minute image build.
+#
+# The `build` job then STANDS THE STACK UP and runs boundary-check.sh in a real
+# sandbox, which is the only automated evidence this repo has that the containment
+# boundary still holds — init-firewall.sh is otherwise covered by shellcheck and a
+# manual `make boundary`, i.e. a firewall regression is invisible to every other
+# check here. It rides on `build` rather than a third job because that job has
+# already compiled the images into this runner's daemon; a separate job shares no
+# layer cache and would rebuild all five from scratch to run a two-minute check.
 name: check
 
 on:
@@ -131,8 +139,13 @@ jobs:
         run: make lint consistency test
 
   build:
-    name: every image still builds
+    name: every image builds + the boundary holds
     runs-on: ubuntu-latest
+    # The default job timeout is SIX HOURS. Builds fail fast, but the boundary
+    # step stands a stack up and waits on healthchecks and network probes, which
+    # is the kind of work that hangs rather than fails. A cold build measures
+    # around three minutes, so this is a runaway guard with room to spare.
+    timeout-minutes: 30
     env:
       DOCKADE_REQUIRE_TOOLS: 1
     steps:
@@ -161,3 +174,38 @@ jobs:
         run: |
           docker images --format '{{.Repository}}:{{.Tag}}\t{{.Size}}' \
             | grep -E '^(dockade-|claude-sandbox|opencode-sandbox)' | sort
+
+      # `make check-boundary` owns the whole lifecycle (compose up, launch a
+      # throwaway tier-1 sandbox, run boundary-check.sh inside it as the agent),
+      # so this stays a make target for the same reason every other stage does:
+      # one definition of the check, reproducible locally with the same command.
+      # The images it needs were just built into this runner's daemon above.
+      #
+      # Known limits of this run, so a green tick is not read as more than it is:
+      #   - tier 1 in GOVERNED mode only. Tier 2 needs an iGPU the runner does not
+      #     have; standalone mode needs a host with no compose infra, which is
+      #     also why the standalone firewall rules stay validated by hand.
+      #   - the IPv6 probe self-skips when the runner's container has no v6 stack.
+      #   - the lifeline probe needs api.anthropic.com to answer (no credentials —
+      #     any HTTP response counts), so a network blip there reads as a failure.
+      #     That is the one flake vector: every containment probe needs nothing
+      #     external, because the proxy refuses them before it dials.
+      #
+      # One thing this may cover BETTER than a laptop does: GitHub's runners are
+      # Azure VMs, where 169.254.169.254 is a live instance-metadata endpoint and
+      # not the dead address it is on a dev machine — so the SSRF/metadata
+      # hard-block gets exercised against something that would actually answer. If
+      # the proxy logs its metadata-reachability warning at startup here, that is
+      # the warning doing its job, not a fault to fix.
+      - name: Boundary check (tier 1, governed)
+        run: make check-boundary
+
+      # The sandbox side needs no diagnostics step: the check runs as the
+      # container's command in the foreground, so the firewall's boot output and
+      # every probe result are already in the step above, in order, pass or fail.
+      # What is NOT there is the other end of each refusal — the proxy's own view
+      # of the policy decision — so pull the infra logs when something failed. The
+      # runner is disposable; nothing needs tearing down after.
+      - name: Governance-plane logs on failure
+        if: failure()
+        run: docker compose logs --no-color --tail=200 || true

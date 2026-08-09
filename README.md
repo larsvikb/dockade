@@ -278,7 +278,8 @@ exposed through governed data-plane services. Next steps toward it:
 - [`CLAUDE.md`](CLAUDE.md) — the invariants that must never be violated and the
   conventions for working in this repo.
 - [`SECURITY.md`](SECURITY.md) — how to report a boundary bypass, and — worth
-  reading first — which weaknesses are already known and consciously accepted.
+  reading first — which weaknesses are already known, both the ones consciously
+  accepted and the ones still open.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — how to run the gate, what the tests and
   commit messages are expected to look like, and the licensing position (no CLA).
 

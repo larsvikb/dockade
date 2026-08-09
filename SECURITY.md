@@ -6,10 +6,11 @@ is genuinely valuable and welcome.
 
 It is also a boundary with a **documented ceiling**, and that shapes this policy
 more than anything else here. [`DESIGN.md`](DESIGN.md) states plainly where
-containment stops — several weaknesses are known, reasoned about, and consciously
-accepted rather than overlooked. Those are listed under
-[Out of scope](#out-of-scope) below, with pointers to the reasoning. Reading that
-list first will save you time.
+containment stops, and this file carries two lists that follow from it:
+[Known open findings](#known-open-findings) — real defects, already found, not yet
+fixed — and [Out of scope](#out-of-scope) — weaknesses reasoned about and
+consciously accepted rather than overlooked. Reading both first will save you time,
+because between them they cover most of what a first look at this repo turns up.
 
 ## Reporting a vulnerability
 
@@ -67,6 +68,62 @@ Anything that **crosses a boundary the design claims to hold**:
   CSRF or clickjacking path that still works against the Host allowlist, the
   cross-origin refusal, the embedding refusal and the CSP.
 
+## Known open findings
+
+Distinct from [Out of scope](#out-of-scope): those are accepted and will not change.
+These are **known, not accepted, and not yet fixed** — each is waiting on a design
+decision, a test environment, or a change riskier than the defect itself. They are
+published so a reporter does not spend a weekend rediscovering one, and because they
+are all readable from the source anyway; listing them costs nothing that is not
+already given away by the code.
+
+A report that **deepens** one of these is welcome and useful — a working exploit, a
+consequence wider than described here, or a case the note misses. A report that
+restates one is duplicate work, which is what this section exists to prevent. The
+reasoning for each lives in `DESIGN.md` or beside the code and is referenced rather
+than restated.
+
+- **The relay guard's resolve branch is beatable by DNS rebinding.**
+  `proxies/egress/addon.py` `_forbidden_reason` re-resolves instead of pinning the
+  resolved address, so a name can change answers between the check and the dial. The
+  *consequence* is capped rather than the gap closed — see the API-surface split in
+  `DESIGN.md`, which is why even a total bypass reaches a listener that can only ask
+  a policy question. What that cap does **not** cover is the metadata IP, the Docker
+  host and the LAN: they answer on the same `:80`/`:443` the port gate permits. On
+  the developer-machine target this is a pivot onto the operator's own network rather
+  than cloud-credential theft, which is why it is ranked here and not higher. The fix
+  is to dial the address that was checked, or re-check the peer after connect.
+
+- **Standalone mode can reach every port on the Docker host.**
+  `sandbox-common/init-firewall.sh` pins the host-gateway rule to a `/32`, which
+  removes the sibling-container surface, but the rule still allows *all ports* on the
+  host itself. Governed mode — the default — drops the rule entirely, so this is
+  standalone-only and compounds the accepted "standalone is weaker" position below.
+  Scoping it needs a proxy-less host to validate, because it can break DNS and egress
+  in ways a governed host cannot exercise.
+
+- **One sandbox can exhaust the hold queue for every other sandbox.** In
+  `control-plane/app.py` `_reserve_hold`, the global cap counts *waiters* while the
+  per-client cap counts *cards*, and the join path returns before the per-client check
+  is reached. Grouped duplicates from a single client can therefore fill the global
+  cap (`CONTROL_MAX_PENDING`) and every other sandbox is refused until those holds
+  drain. Refusals fail closed, so this costs availability, not containment. The fix
+  needs a per-client *waiter* bound — a semantics decision rather than a patch.
+
+- **The approval card may render a decoded Unicode hostname.** *(unconfirmed against
+  the pinned mitmproxy version)* Nothing between `flow.request.host` and the card's
+  `textContent` converts back to ASCII, so **if** mitmproxy decodes IDNA, a punycode
+  homoglyph reaches the operator with no ASCII form shown beside it. The conditional
+  is honest — this was found by reading, not by observing — and confirming it is the
+  first step. The fix is to show the punycode form on the card and in the policy and
+  audit tables.
+
+- **A duplicate can join a card in the instant after it is decided.** `resolve`
+  commits the decision outside `_LOCK` and closes the group inside it, so a request
+  can arrive between the two and inherit an outcome it did not wait for. Bounded: a
+  joiner is identical by group key, and a deny is fail-safe. The gap and the reason it
+  is tolerated are at the `_close_group_locked` call site in `control-plane/app.py`.
+
 ## Out of scope
 
 These are **known and accepted**, each with its reasoning in `DESIGN.md`. They are
@@ -112,6 +169,14 @@ report.
   resolve, with the exact host as the default. Reported scope escalation is still very
   much in scope — a way to make a persist store something outside that set is a real
   finding.)*
+- **Resource exhaustion and availability, except where pressure becomes permission.**
+  There is no service here and no other tenant to deny — the agent making its own
+  sandbox slow, filling its own workspace or burning its own CPU is a local nuisance,
+  not a finding. What *is* in scope is anything that converts load into a decision
+  going the wrong way: a cap that fails open under pressure, a saturated queue that
+  lets a request through undecided, or an audit line dropped because the system was
+  busy. The known availability defect that stays on the fail-closed side of that line
+  is listed under [Known open findings](#known-open-findings).
 - **Base images pinned by tag rather than digest.** A deliberate
   rebuild-to-update choice, consistent across every image here.
 - **The standalone (proxy-less) fallback being weaker than governed mode.** It

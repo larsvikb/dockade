@@ -783,7 +783,12 @@ skipped on resolution failure (logged, returns "not forbidden" — safe, because
 unresolvable name is also undialable, and reaching the control plane is prevented
 first by topology and by the port gate: the control plane listens on `:8090` and
 `:8091` while CONNECT/HTTP are gated to `:443`/`:80`, so a rebound name is dialed
-on a port nothing serves). To keep the guard from being *silently* disabled by
+on a port nothing serves). **That last bound covers the control plane and nothing
+else** — the other destinations this guard exists to refuse (the metadata IP, the
+Docker host, the LAN) answer on the very `:80`/`:443` the port gate permits, so for
+those the rebind gap is bounded by none of the above. It is carried as a known open
+finding in `SECURITY.md` rather than claimed as closed here.
+To keep the guard from being *silently* disabled by
 misconfiguration, `load()` calls `_assert_guard_configured()`, which **fails
 closed at startup** (refuses to run) if `EGRESS_FORBIDDEN_CIDRS` is empty — an
 empty CIDR set would drop both the literal-IP and resolve branches, leaving only

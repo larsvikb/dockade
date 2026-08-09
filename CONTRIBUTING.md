@@ -8,7 +8,7 @@ Two things to read first, because they will save you the most time:
 
 - **[`SECURITY.md`](SECURITY.md) if you found a way across the boundary.** That is a
   private report, not a pull request. It also lists the weaknesses that are already
-  known and consciously accepted, which is worth a look before you spend time on one.
+  known — accepted or still open — which is worth a look before you spend time on one.
 - **[`CLAUDE.md`](CLAUDE.md) → *Invariants — never violate*.** This is a security
   boundary, so a handful of properties are not up for trade against convenience. A
   change that crosses one gets declined however good the rest of it is, and the list

@@ -286,8 +286,18 @@ sc_upstream_dns() {
         SC_UPSTREAM_DNS="$SANDBOX_DNS"
     else
         SC_UPSTREAM_DNS=""
+        # `|| true` is load-bearing, not defensive habit. The launchers run under
+        # `set -euo pipefail`, and awk exits 2 when a file does not exist — which
+        # pipefail then propagates out of the pipeline, out of the command
+        # substitution, and into the assignment, where set -e kills the launcher
+        # outright. The very first candidate is absent on any host without
+        # systemd-resolved, so `./run-claude-sandbox.sh` died there with a bare
+        # rc=2 and no message, BEFORE the /etc/resolv.conf fallback it was about
+        # to try — making both remaining fallbacks unreachable on exactly the
+        # hosts they exist for. Silence is the reason this went unnoticed: on a
+        # host that HAS the file, nothing is wrong.
         for resolv in /run/systemd/resolve/resolv.conf /etc/resolv.conf; do
-            SC_UPSTREAM_DNS="$(awk '/^nameserver/ && $2 !~ /^127\./ {print $2}' "$resolv" 2>/dev/null | tr '\n' ' ')"
+            SC_UPSTREAM_DNS="$(awk '/^nameserver/ && $2 !~ /^127\./ {print $2}' "$resolv" 2>/dev/null | tr '\n' ' ' || true)"
             [[ -n "${SC_UPSTREAM_DNS// }" ]] && break
         done
         [[ -z "${SC_UPSTREAM_DNS// }" ]] && SC_UPSTREAM_DNS="8.8.8.8 8.8.4.4"

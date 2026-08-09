@@ -175,7 +175,7 @@ _STRIP_RESP = _HOP_BY_HOP | {"content-length"}
 
 # Fetch destinations that mean "this response is being EMBEDDED in another page".
 # Refused because neither guard above can see the difference: an attacker page that
-# frames http://127.0.0.1:8081 causes a request with a legitimate `Host: 127.0.0.1`
+# frames the UI's loopback origin causes a request with a legitimate `Host: 127.0.0.1`
 # (guard 1 passes) using GET, which is deliberately allowed cross-origin (guard 2
 # does not apply) — and the framed page's own resolve POST then reads as
 # `Sec-Fetch-Site: same-origin`, because from inside the frame it is. The attacker

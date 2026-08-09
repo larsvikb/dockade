@@ -815,8 +815,8 @@ port from a container that is on an internal network alone — but has masquerad
 disabled, so it carries the loopback UI publish without being an egress path.
 The control plane is a small FastAPI app over a SQLite policy+audit store (its
 own named volume — the crown-jewel state); the management surface reaches the
-host as **loopback only** (`127.0.0.1:8081`), published since 2b-2 by the UI
-frontend rather than the backend.
+host as **loopback only** (`127.0.0.1`, on the port `docker-compose.yml` publishes),
+published since 2b-2 by the UI frontend rather than the backend.
 
 *Design note — why three control nets, and the frontend split.* `control-net` stays
 hard-`internal` because it is the **shared** control path for the whole governed
@@ -1002,8 +1002,8 @@ the static UI at `/`, reverse-proxies everything else — including the SSE stre
 — to the backend over `control-net`). The **backend is now `control-net`-only
 and fully `internal`**: no published port, no non-internal surface, nothing to
 exfiltrate even if reached. The frontend carries the sole host-facing surface
-(`control-ui-net`), holds no state, and is not on `sandbox-net`. Browsers hit
-`http://localhost:8081` → frontend → backend; the egress proxy still calls the
+(`control-ui-net`), holds no state, and is not on `sandbox-net`. Browsers hit the
+published loopback port → frontend → backend; the egress proxy still calls the
 backend's `/authorize` directly. See the step-2a design note for the rationale.
 
 **Browser-facing guards on the frontend (and their honest limit).** The frontend
@@ -1022,7 +1022,8 @@ unguessable id. Three structural guards now sit in front (`control-plane-ui/app.
   `Host` is a forbidden header JS cannot set, so this removes the attack class
   rather than raising its cost. Compared without the port on purpose: the port is
   irrelevant to the guard, and ignoring it keeps one list valid for both the
-  published `:8081` and the in-container healthcheck's `:8090`. Import fails closed
+  published port (configurable, so pinning it would be wrong twice over) and the
+  in-container healthcheck's `:8090`. Import fails closed
   on an empty list (`_assert_host_guard_configured`, mirroring the egress addon).
 - **Cross-origin state changes refused** — `Sec-Fetch-Site` when present, else
   `Origin`; both absent means no browser is calling, so there is no CSRF to stop and
@@ -1034,7 +1035,7 @@ unguessable id. Three structural guards now sit in front (`control-plane-ui/app.
   authority. The old catch-all `/{path:path}` relayed it.
 - **Refusal to be embedded** — closes **clickjacking**, which is the gap the first
   three guards structurally cannot see, and it was open until now. An attacker page
-  that frames `http://127.0.0.1:8081` produces a request with a perfectly legitimate
+  that frames the UI's loopback origin produces a request with a perfectly legitimate
   `Host: 127.0.0.1` (guard 1 satisfied) by GET, which is deliberately allowed
   cross-origin (guard 2 does not apply) — and the framed document's own `resolve`
   POST then reads as `Sec-Fetch-Site: same-origin`, because from inside the frame it

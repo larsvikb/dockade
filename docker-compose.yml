@@ -328,8 +328,22 @@ services:
       CONTROL_BACKEND_URL: http://control-plane:8090
     # Human-only management surface, bound to host loopback (never 0.0.0.0):
     # reachable from the host browser, not from the sandbox or other machines.
+    #
+    # This is the ONLY port the whole stack publishes — everything else (the
+    # proxy's 8080, the control plane's 8090/8091, the model server's 8080) is
+    # container-internal on a network the host does not join. So it is also the
+    # only thing here that can collide with whatever else the operator is running,
+    # which is why it is a variable: a collision should cost an env var, not an
+    # edit. DOCKADE_UI_PORT overrides it.
+    #
+    # The default avoids the crowded 8000-9000 block, where 8081 in particular is
+    # the reflexive "8080 was already taken" port, AND stays below the ephemeral
+    # range, because the private-range answer that sounds principled is the wrong
+    # instinct on this platform — NOTES.md has the two reasons and the commands
+    # that show them. Host and container are the same service number on purpose
+    # (28090 -> 8090); 8081 -> 8090 read like a mismatch you had to go look up.
     ports:
-      - "127.0.0.1:8081:8090"
+      - "127.0.0.1:${DOCKADE_UI_PORT:-28090}:8090"
     depends_on:
       # Nothing fails closed here (the frontend is stateless and no governance
       # decision depends on it), so this gate is purely so the first page load

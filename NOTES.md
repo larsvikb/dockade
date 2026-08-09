@@ -42,6 +42,25 @@ or fails on allocator luck. Write to a sibling path and `os.replace()` it over t
 target instead: the new file's inode is allocated while the old one is still linked, so
 it is guaranteed to differ.
 
+## Publishing a host port: the private range is the wrong instinct on WSL2
+
+Choosing a port for Docker to publish on the host, the principled-looking answer is
+IANA's dynamic/private range (49152–65535) — no registered service claims it. On a
+Windows host running WSL2 it is the worst band available, for two independent reasons:
+
+- **It overlaps the Linux ephemeral range.** `cat /proc/sys/net/ipv4/ip_local_port_range`
+  reports `32768 60999` here, so anything from 32768 up can already be held by some
+  outbound connection's source port at the moment the daemon tries to bind. The failure
+  is intermittent and load-dependent, which is the expensive kind.
+- **Windows reserves blocks inside it.** Hyper-V / WinNAT take ranges out of 49152–65535
+  for their own use; `netsh interface ipv4 show excludedportrange protocol=tcp` lists
+  them. A publish that lands in one fails with "An attempt was made to access a socket
+  in a way forbidden by its access permissions" — which reads like a permissions problem
+  and is nothing of the kind.
+
+So the usable band is *above* the crowded 8000–9000 development block and *below* the
+ephemeral floor: roughly 20000–32767.
+
 ## `curl` reads `http_proxy` in lower case only
 
 Same host, same shell, curl 8.14.1. `example.com` carries a **block** rule, so reaching

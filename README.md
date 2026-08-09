@@ -245,7 +245,7 @@ exposed through governed data-plane services. Next steps toward it:
 2. **Control plane** — *step 2a done* (`control-plane/`): a FastAPI + SQLite
    governance authority the **agent cannot reach** — it lives only on internal
    networks the sandbox is not attached to. The UI is reachable from the host
-   browser at `http://localhost:8081`. The egress proxy asks it
+   browser at `http://localhost:28090` (the default `DOCKADE_UI_PORT`). The egress proxy asks it
    `POST /authorize` per connection — one call that both decides policy and
    records audit — with the Anthropic lifeline allowed locally so a control-plane
    outage never bricks the agent, and everything else failing closed.

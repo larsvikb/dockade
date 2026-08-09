@@ -188,7 +188,7 @@ class _FakeRequest:
 
 def _ok_host(**kw):
     """A request that already satisfies the Host guard, for tests about other guards."""
-    headers = {"host": "127.0.0.1:8081", **kw.pop("headers", {})}
+    headers = {"host": "127.0.0.1:28090", **kw.pop("headers", {})}
     return _FakeRequest(headers=headers, **kw)
 
 
@@ -205,16 +205,18 @@ class HostGuardTests(unittest.TestCase):
         return asyncio.run(ui._guard(request, _passthrough))
 
     def test_loopback_hosts_are_accepted_regardless_of_port(self):
-        # The published port (8081) and the in-container healthcheck port (8090)
-        # must both work off ONE list — hence port-insensitive comparison.
-        for host in ("127.0.0.1:8081", "localhost:8081", "127.0.0.1:8090",
-                     "localhost", "[::1]:8081"):
+        # The published port and the in-container healthcheck port (8090) differ
+        # and must both work off ONE list — hence port-insensitive comparison.
+        # The published number is deliberately arbitrary here: it is configurable
+        # (DOCKADE_UI_PORT), and pinning it would make this a test of the default.
+        for host in ("127.0.0.1:28090", "localhost:28090", "127.0.0.1:8090",
+                     "localhost", "[::1]:28090"):
             self.assertEqual(self._guard(_FakeRequest(headers={"host": host})),
                              "REACHED-THE-APP", host)
 
     def test_rebinding_host_is_refused(self):
-        for host in ("evil.com", "evil.com:8081", "attacker.test:8081",
-                     "127.0.0.1.evil.com:8081"):
+        for host in ("evil.com", "evil.com:28090", "attacker.test:28090",
+                     "127.0.0.1.evil.com:28090"):
             resp = self._guard(_FakeRequest(headers={"host": host}))
             self.assertEqual(getattr(resp, "status_code", None), 403, host)
 
@@ -226,7 +228,7 @@ class HostGuardTests(unittest.TestCase):
         # Not a supported configuration (import asserts against it) — this pins the
         # direction of failure if it is somehow reached: refuse, never wave through.
         with mock.patch.object(ui, "ALLOWED_HOSTNAMES", frozenset()):
-            resp = self._guard(_FakeRequest(headers={"host": "127.0.0.1:8081"}))
+            resp = self._guard(_FakeRequest(headers={"host": "127.0.0.1:28090"}))
         self.assertEqual(resp.status_code, 403)
 
     def test_import_refuses_an_empty_allowlist(self):
@@ -261,7 +263,7 @@ class CrossOriginGuardTests(unittest.TestCase):
     def test_same_origin_post_via_origin_header_is_accepted(self):
         self.assertEqual(
             self._guard(_ok_host(method="POST",
-                                 headers={"origin": "http://127.0.0.1:8081"})),
+                                 headers={"origin": "http://127.0.0.1:28090"})),
             "REACHED-THE-APP")
 
     def test_post_with_no_browser_headers_is_accepted(self):

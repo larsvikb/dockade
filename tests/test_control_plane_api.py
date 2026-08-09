@@ -1038,11 +1038,11 @@ class ProvenanceTests(_CPTestCase):
     def test_actor_separates_observed_peer_from_self_reported_fields(self):
         actor = cp._actor(_FakeRequest(peer="172.31.0.3", headers={
             cp.ACTOR_HEADER: "127.0.0.1",
-            "origin": "http://127.0.0.1:8081",
+            "origin": "http://127.0.0.1:28090",
             "user-agent": "Mozilla/5.0 (X11)"}))
         self.assertIn("peer=172.31.0.3", actor)      # observed by us
         self.assertIn("via-ui=127.0.0.1", actor)     # asserted by the relay
-        self.assertIn("origin=http://127.0.0.1:8081", actor)
+        self.assertIn("origin=http://127.0.0.1:28090", actor)
         self.assertIn('ua="Mozilla/5.0 (X11)"', actor)
 
     def test_actor_tolerates_a_bare_request(self):

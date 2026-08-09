@@ -140,16 +140,36 @@ if [ -n "${HTTPS_PROXY:-}" ]; then
     # domain-fronting. The proxy must refuse the passthrough on the SNI.
     #   -k: if the proxy wrongly tunnelled it, we'd get the real fronted response
     #       rather than a curl cert error masking the leak.
-    # Enforced outcomes (both acceptable): the proxy declines to tunnel and MITM-
+    # Enforced outcomes (all acceptable): the proxy declines to tunnel and MITM-
     # re-gates at the HTTP layer -> 403 "egress denied by policy"; OR the handshake
-    # just fails closed (no trusted CA) -> curl errors. Leak: a normal passthrough
+    # fails closed (no trusted CA) -> curl errors; OR the re-gate holds and we stop
+    # waiting (see --max-time below) -> curl errors. Leak: a normal passthrough
     # response from the fronted host (curl succeeds, body is not the policy denial).
-    front="$(curl -sS -k --connect-timeout 5 \
+    #
+    # --max-time for the same reason as the example.com probe above, and it is the
+    # dominant cost of this whole script without it. After the SNI refusal the proxy
+    # MITM-re-gates at the HTTP layer, where BOTH names are authorized (transport
+    # host and Host header — see the request hook in addon.py). The Host header is
+    # still the non-allowlisted example.com, so that gate HOLDS, and with no human
+    # to answer it the probe sat for the full CONTROL_HOLD_TIMEOUT: a measured 120s
+    # of a 5m04s run, in one probe.
+    #
+    # Bounding it cannot mask the failure this exists to catch, because A LEAK IS
+    # FAST: a wrongly-tunnelled request returns the fronted host's own response
+    # promptly (-k means no cert error to stall on). Only the hold path is slow, and
+    # the hold path is a refusal. So a timeout here is one more way of being denied.
+    #
+    # Which is why the non-zero branch no longer NAMES a mechanism. It used to say
+    # "handshake failed closed", true when the only way to get here was a cert error;
+    # a timeout would now print it while something else entirely had happened. The
+    # branch asserts what it can actually distinguish — no passthrough — and leaves
+    # the how to the two reasons above it.
+    front="$(curl -sS -k --connect-timeout 5 --max-time 8 \
         --connect-to example.com:443:api.anthropic.com:443 \
         https://example.com/ 2>&1)"
     frc=$?
     if [ "$frc" -ne 0 ]; then
-        ok "SNI fronting blocked (handshake failed closed; no passthrough)"
+        ok "SNI fronting blocked (no passthrough)"
     elif printf '%s' "$front" | grep -qi 'egress denied by policy'; then
         ok "SNI fronting refused by proxy (deny-sni)"
     else

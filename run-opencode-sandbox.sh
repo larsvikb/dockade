@@ -40,7 +40,11 @@ SANDBOX_NET="sandbox-net"
 # cannot grow the way tier 1's can, because it can only ever run what is already in
 # the image or the workspace.
 SANDBOX_MEMORY="${SANDBOX_MEMORY:-2g}"
+#
+# 4 is a REQUEST, not the final figure: sc_clamp_cpus lowers it to the host's
+# CPU count, because docker rejects a --cpus above that rather than saturating.
 SANDBOX_CPUS="${SANDBOX_CPUS:-4}"
+sc_clamp_cpus "$SANDBOX_CPUS"
 
 REBUILD=false
 BUILD_ONLY=false
@@ -152,7 +156,7 @@ docker run -it --rm \
     \
     --memory="$SANDBOX_MEMORY" \
     --memory-swap="$SANDBOX_MEMORY" \
-    --cpus="$SANDBOX_CPUS" \
+    --cpus="$SC_CPUS" \
     --pids-limit=512 \
     \
     -v "$WORKSPACE":/workspace \

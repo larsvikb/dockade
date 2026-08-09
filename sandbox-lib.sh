@@ -305,3 +305,41 @@ sc_upstream_dns() {
     SC_DNS_ARGS=()
     for ns in $SC_UPSTREAM_DNS; do SC_DNS_ARGS+=(--dns "$ns"); done
 }
+
+# ---------------------------------------------------------------------------
+# Resource ceilings
+# ---------------------------------------------------------------------------
+# sc_clamp_cpus <requested>   -> sets SC_CPUS
+#
+# Docker REFUSES a --cpus larger than the host CPU count rather than saturating
+# at it ("range of CPUs is from 0.01 to 2.00, as there are only 2 CPUs
+# available", exit 125). So an over-large default is not a soft ceiling that
+# quietly does nothing on a small host — it is a hard launch failure there, and
+# only there. The default of 4 ran green on every dev machine and took CI down
+# the first time it met a 2-core runner.
+#
+# Clamp rather than fail, because this ceiling is BLAST RADIUS, NOT A BOUNDARY
+# (see DESIGN.md, "Resource limits"): nothing in the threat model rests on the
+# number, so the useful behaviour on a small host is to run with what it has.
+# The note goes to stderr because a ceiling silently different from the one you
+# asked for is worth seeing once.
+#
+# Fractional values are legal (SANDBOX_CPUS=1.5), so the comparison runs through
+# awk — bash arithmetic is integer-only and would read 1.5 as a syntax error.
+# A host without nproc, or one that answers with something other than a number,
+# leaves the request untouched and lets docker be the judge.
+sc_clamp_cpus() {
+    local requested="$1"
+    SC_CPUS="$requested"
+
+    local available
+    available="$(nproc 2>/dev/null)" || return 0
+    [[ "$available" =~ ^[0-9]+$ ]] || return 0
+
+    if awk -v r="$requested" -v a="$available" 'BEGIN { exit !(r > a) }'; then
+        echo "NOTE: SANDBOX_CPUS=$requested exceeds the $available CPU(s) on this host;" >&2
+        echo "      using $available — docker rejects a --cpus above the host count." >&2
+        # shellcheck disable=SC2034  # consumed by the sourcing launcher, not here
+        SC_CPUS="$available"
+    fi
+}

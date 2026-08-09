@@ -51,7 +51,11 @@ SANDBOX_NET="sandbox-net"
 # mode when it is too low is an OOM-kill of the container, which takes the whole
 # interactive session and its context with it.
 SANDBOX_MEMORY="${SANDBOX_MEMORY:-4g}"
+#
+# 4 is a REQUEST, not the final figure: sc_clamp_cpus lowers it to the host's
+# CPU count, because docker rejects a --cpus above that rather than saturating.
 SANDBOX_CPUS="${SANDBOX_CPUS:-4}"
+sc_clamp_cpus "$SANDBOX_CPUS"
 
 REBUILD=false
 BUILD_ONLY=false
@@ -241,7 +245,7 @@ docker run "${RUN_MODE_ARGS[@]}" \
     \
     --memory="$SANDBOX_MEMORY" \
     --memory-swap="$SANDBOX_MEMORY" \
-    --cpus="$SANDBOX_CPUS" \
+    --cpus="$SC_CPUS" \
     --pids-limit=512 \
     \
     -v "$WORKSPACE":/workspace \

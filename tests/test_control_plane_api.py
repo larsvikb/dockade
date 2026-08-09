@@ -37,7 +37,7 @@ cp = load_control_plane()
 
 
 def _set_rules(rules):
-    with cp._connect() as conn:
+    with cp.store._connect() as conn:
         conn.execute("DELETE FROM rules")
         conn.executemany(
             "INSERT INTO rules(pattern, action, source, created_at) "
@@ -46,19 +46,19 @@ def _set_rules(rules):
 
 
 def _clear_all():
-    with cp._connect() as conn:
+    with cp.store._connect() as conn:
         conn.execute("DELETE FROM rules")
         conn.execute("DELETE FROM approvals")
         conn.execute("DELETE FROM audit")
         conn.commit()
-    cp._PENDING_EVENTS.clear()
-    cp._PENDING_CLIENT.clear()
-    cp._PENDING_WAITERS.clear()
-    cp._PENDING_DEADLINE.clear()
-    cp._GROUPS.clear()
+    cp.holds._PENDING_EVENTS.clear()
+    cp.holds._PENDING_CLIENT.clear()
+    cp.holds._PENDING_WAITERS.clear()
+    cp.holds._PENDING_DEADLINE.clear()
+    cp.holds._GROUPS.clear()
     # Module state like those above, and reset for the same reason: it is
     # process-lifetime by design, which across tests means it leaks.
-    cp._SATURATION.update(count=0, last_ts=None, last_scope=None, last_host=None,
+    cp.holds._SATURATION.update(count=0, last_ts=None, last_scope=None, last_host=None,
                           acked=0, acked_ts=None)
 
 
@@ -97,18 +97,18 @@ def _hold(host, approval_id="hold-1", client=None):
     ``client`` defaults to the approval id — unique, therefore a distinct group key —
     so two ``_hold``s on the same host are two cards. Callers that want them GROUPED
     (which is what a real duplicate does) pass the same client explicitly."""
-    with cp._connect() as conn:
+    with cp.store._connect() as conn:
         conn.execute(
             "INSERT INTO approvals(id, ts, host, status) VALUES (?,?,?, 'pending')",
             (approval_id, time.time(), host))
         conn.commit()
-    cp._reserve_hold(approval_id, threading.Event(),
+    cp.holds._reserve_hold(approval_id, threading.Event(),
                      approval_id if client is None else client, host)
     return approval_id
 
 
 def _rules():
-    with cp._connect() as conn:
+    with cp.store._connect() as conn:
         return {(r["pattern"], r["action"]) for r in
                 conn.execute("SELECT pattern, action FROM rules")}
 
@@ -120,9 +120,9 @@ class _CPTestCase(unittest.TestCase):
     orthogonal to the decision logic under test."""
 
     def setUp(self):
-        cp._init_db()
+        cp.store._init_db()
         _clear_all()
-        patch = mock.patch.object(cp, "_audit")
+        patch = mock.patch.object(cp.store, "_audit")
         patch.start()
         self.addCleanup(patch.stop)
 
@@ -133,7 +133,7 @@ class AuthorizeDecisionTests(_CPTestCase):
         resp = cp.authorize(_auth_req("example.com"))
         self.assertEqual(resp.decision, "allow")
         # An allow decision must not create an approval row.
-        self.assertEqual(cp._list_pending(), [])
+        self.assertEqual(cp.holds._list_pending(), [])
 
     def test_block_rule_returns_deny(self):
         _set_rules([("blocked.com", "block")])
@@ -142,29 +142,29 @@ class AuthorizeDecisionTests(_CPTestCase):
 
     def test_over_cap_hold_fails_closed_immediately(self):
         # With no hold slots, an unmatched host must deny at once (not block).
-        saved = cp.MAX_PENDING
-        cp.MAX_PENDING = 0
+        saved = cp.holds.MAX_PENDING
+        cp.holds.MAX_PENDING = 0
         try:
             start = time.monotonic()
             resp = cp.authorize(_auth_req("unknown.com", client="a"))
             elapsed = time.monotonic() - start
         finally:
-            cp.MAX_PENDING = saved
+            cp.holds.MAX_PENDING = saved
         self.assertEqual(resp.decision, "deny")
         self.assertIn("hold capacity exceeded", resp.reason)
         self.assertLess(elapsed, 1.0)                      # did not block
 
     def test_hold_times_out_to_deny(self):
-        saved = cp.HOLD_TIMEOUT
-        cp.HOLD_TIMEOUT = 0.05
+        saved = cp.holds.HOLD_TIMEOUT
+        cp.holds.HOLD_TIMEOUT = 0.05
         try:
             resp = cp.authorize(_auth_req("slow.com", client="a"))
         finally:
-            cp.HOLD_TIMEOUT = saved
+            cp.holds.HOLD_TIMEOUT = saved
         self.assertEqual(resp.decision, "deny")
         self.assertIn("timeout", resp.reason)
         # The approval row is left as 'expired', not stuck 'pending'.
-        with cp._connect() as conn:
+        with cp.store._connect() as conn:
             statuses = [r[0] for r in conn.execute(
                 "SELECT status FROM approvals WHERE host='slow.com'").fetchall()]
         self.assertEqual(statuses, ["expired"])
@@ -184,7 +184,7 @@ class HoldHandshakeTests(_CPTestCase):
         # Wait for the pending approval to register.
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
-            pending = cp._list_pending()
+            pending = cp.holds._list_pending()
             if pending:
                 return t, result, pending[0]["id"]
             time.sleep(0.01)
@@ -192,33 +192,33 @@ class HoldHandshakeTests(_CPTestCase):
         raise AssertionError("approval never became pending")
 
     def test_allow_persist_wakes_waiter_and_writes_rule(self):
-        saved = cp.HOLD_TIMEOUT
-        cp.HOLD_TIMEOUT = 5
+        saved = cp.holds.HOLD_TIMEOUT
+        cp.holds.HOLD_TIMEOUT = 5
         try:
             t, result, approval_id = self._authorize_in_thread("newsite.com")
             resolve_resp = _resolve(approval_id, "allow_persist")
             t.join(2)
         finally:
-            cp.HOLD_TIMEOUT = saved
+            cp.holds.HOLD_TIMEOUT = saved
         self.assertFalse(t.is_alive())
         self.assertEqual(result["resp"].decision, "allow")
         self.assertTrue(resolve_resp.args[0]["ok"])
         # persist wrote an operator allow rule, so a re-decide skips the hold.
-        self.assertEqual(cp._decide("newsite.com")[0], "allow")
+        self.assertEqual(cp.policy._decide("newsite.com")[0], "allow")
 
     def test_deny_once_wakes_waiter_without_writing_rule(self):
-        saved = cp.HOLD_TIMEOUT
-        cp.HOLD_TIMEOUT = 5
+        saved = cp.holds.HOLD_TIMEOUT
+        cp.holds.HOLD_TIMEOUT = 5
         try:
             t, result, approval_id = self._authorize_in_thread("nope.com")
             _resolve(approval_id, "deny_once")
             t.join(2)
         finally:
-            cp.HOLD_TIMEOUT = saved
+            cp.holds.HOLD_TIMEOUT = saved
         self.assertFalse(t.is_alive())
         self.assertEqual(result["resp"].decision, "deny")
         # deny_once must NOT persist a rule — the host stays held next time.
-        self.assertEqual(cp._decide("nope.com")[0], "hold")
+        self.assertEqual(cp.policy._decide("nope.com")[0], "hold")
 
 
 class DuplicateHoldTests(_CPTestCase):
@@ -243,18 +243,18 @@ class DuplicateHoldTests(_CPTestCase):
         """Wait for exactly one pending card carrying ``requests`` blocked waiters."""
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
-            pending = cp._list_pending()
+            pending = cp.holds._list_pending()
             if len(pending) == 1 and pending[0]["requests"] == requests:
                 return pending[0]
             time.sleep(0.01)
         raise AssertionError(
-            f"never saw one card with {requests} waiters; saw {cp._list_pending()}")
+            f"never saw one card with {requests} waiters; saw {cp.holds._list_pending()}")
 
     def test_four_retries_raise_one_card_that_says_it_is_four_requests(self):
         # The motivating case. Before grouping this was four cards, and with the
         # per-client cap at 4 the fifth retry was refused with no card at all.
-        saved = cp.HOLD_TIMEOUT
-        cp.HOLD_TIMEOUT = 10
+        saved = cp.holds.HOLD_TIMEOUT
+        cp.holds.HOLD_TIMEOUT = 10
         try:
             threads, results = self._authorize_many(4, "dup.example")
             card = self._await_card(4)
@@ -264,32 +264,32 @@ class DuplicateHoldTests(_CPTestCase):
             for t in threads:
                 t.join(5)
         finally:
-            cp.HOLD_TIMEOUT = saved
+            cp.holds.HOLD_TIMEOUT = saved
         self.assertEqual([r.decision for r in results], ["allow"] * 4)
-        with cp._connect() as conn:
+        with cp.store._connect() as conn:
             rows = conn.execute("SELECT id FROM approvals").fetchall()
         self.assertEqual(len(rows), 1, "duplicates must not each get a durable row")
         # "once" still means no standing rule — it now means four requests, not one.
         self.assertEqual(_rules(), set())
-        self.assertEqual(cp._decide("dup.example")[0], "hold")
+        self.assertEqual(cp.policy._decide("dup.example")[0], "hold")
 
     def test_a_timeout_tells_every_waiter_it_was_a_timeout(self):
         # Only ONE waiter wins the expiry UPDATE; the rest read the row. Reporting
         # from `did I win the UPDATE` told the losers a human had rejected them —
         # an audit trail inventing a human decision for a timeout is worse than none.
-        saved = cp.HOLD_TIMEOUT
-        cp.HOLD_TIMEOUT = 0.3
+        saved = cp.holds.HOLD_TIMEOUT
+        cp.holds.HOLD_TIMEOUT = 0.3
         try:
             threads, results = self._authorize_many(3, "slow.example")
             for t in threads:
                 t.join(5)
         finally:
-            cp.HOLD_TIMEOUT = saved
+            cp.holds.HOLD_TIMEOUT = saved
         self.assertEqual([r.decision for r in results], ["deny"] * 3)
         for r in results:
             self.assertIn("timeout", r.reason)
             self.assertNotIn("rejection", r.reason)
-        with cp._connect() as conn:
+        with cp.store._connect() as conn:
             statuses = [r[0] for r in conn.execute(
                 "SELECT status FROM approvals").fetchall()]
         self.assertEqual(statuses, ["expired"])
@@ -299,8 +299,8 @@ class DuplicateHoldTests(_CPTestCase):
         # record: each request keeps its own audit line and its own url, and the
         # joiners' reason names the card, so the log explains why four requests
         # produced one approval without anyone having to know about grouping.
-        saved = cp.HOLD_TIMEOUT
-        cp.HOLD_TIMEOUT = 10
+        saved = cp.holds.HOLD_TIMEOUT
+        cp.holds.HOLD_TIMEOUT = 10
         urls = ["https://dup.example/a", "https://dup.example/b",
                 "https://dup.example/c"]
         try:
@@ -310,8 +310,8 @@ class DuplicateHoldTests(_CPTestCase):
             for t in threads:
                 t.join(5)
         finally:
-            cp.HOLD_TIMEOUT = saved
-        calls = [c for c in cp._audit.call_args_list if c.args[0] == "hold"]
+            cp.holds.HOLD_TIMEOUT = saved
+        calls = [c for c in cp.store._audit.call_args_list if c.args[0] == "hold"]
         self.assertEqual(sorted(c.kwargs["url"] for c in calls), sorted(urls))
         reasons = [c.kwargs["reason"] for c in calls]
         self.assertEqual(sum(r == "held for approval" for r in reasons), 1)
@@ -321,7 +321,7 @@ class DuplicateHoldTests(_CPTestCase):
             self.assertIn(card["id"], r)
         # And a terminal line per request, not per card.
         self.assertEqual(
-            sum(1 for c in cp._audit.call_args_list if c.args[0] == "deny"), 3)
+            sum(1 for c in cp.store._audit.call_args_list if c.args[0] == "deny"), 3)
         self.assertEqual([r.decision for r in results], ["deny"] * 3)
 
     def test_a_decided_card_stops_accepting_joiners_at_the_click(self):
@@ -330,12 +330,12 @@ class DuplicateHoldTests(_CPTestCase):
         # is the whole risk: a retry landing in it would attach to an already-resolved
         # card and inherit an outcome nobody was shown it beside.
         approval = _hold("clicked.example", "held-1", client="agent-1")
-        before = cp._reserve_hold("dup", threading.Event(), "agent-1",
+        before = cp.holds._reserve_hold("dup", threading.Event(), "agent-1",
                                   "clicked.example")
         self.assertTrue(before.joined, "joinable while pending")
         _resolve(approval, "deny_once")
-        self.assertIn(approval, cp._PENDING_EVENTS, "waiters not drained yet")
-        after = cp._reserve_hold("late", threading.Event(), "agent-1",
+        self.assertIn(approval, cp.holds._PENDING_EVENTS, "waiters not drained yet")
+        after = cp.holds._reserve_hold("late", threading.Event(), "agent-1",
                                  "clicked.example")
         self.assertFalse(after.joined)
         self.assertEqual(after.approval_id, "late")
@@ -345,42 +345,42 @@ class DuplicateHoldTests(_CPTestCase):
         # no thread that will ever release it) keeps the card in the registry after the
         # real waiter returns, so the group can only have been closed by the EXPIRY
         # path — not incidentally by the last release.
-        saved = cp.HOLD_TIMEOUT
-        cp.HOLD_TIMEOUT = 0.3
+        saved = cp.holds.HOLD_TIMEOUT
+        cp.holds.HOLD_TIMEOUT = 0.3
         try:
             threads, _ = self._authorize_many(1, "drain.example")
             card = self._await_card(1)
-            phantom = cp._reserve_hold("phantom", threading.Event(), "agent-1",
+            phantom = cp.holds._reserve_hold("phantom", threading.Event(), "agent-1",
                                        "drain.example")
             self.assertTrue(phantom.joined)
             for t in threads:
                 t.join(5)
-            self.assertIn(card["id"], cp._PENDING_EVENTS)
-            late = cp._reserve_hold("late", threading.Event(), "agent-1",
+            self.assertIn(card["id"], cp.holds._PENDING_EVENTS)
+            late = cp.holds._reserve_hold("late", threading.Event(), "agent-1",
                                     "drain.example")
         finally:
-            cp.HOLD_TIMEOUT = saved
+            cp.holds.HOLD_TIMEOUT = saved
         self.assertFalse(late.joined)
 
     def test_a_duplicate_arriving_after_the_decision_opens_a_new_card(self):
         # The joining window closes with the decision, so a retry that lands after
         # the click is held again rather than inheriting an outcome nobody was shown
         # it beside.
-        saved = cp.HOLD_TIMEOUT
-        cp.HOLD_TIMEOUT = 10
+        saved = cp.holds.HOLD_TIMEOUT
+        cp.holds.HOLD_TIMEOUT = 10
         try:
             threads, _ = self._authorize_many(2, "again.example")
             card = self._await_card(2)
             _resolve(card["id"], "deny_once")
             for t in threads:
                 t.join(5)
-            cp.HOLD_TIMEOUT = 0.2
+            cp.holds.HOLD_TIMEOUT = 0.2
             late = cp.authorize(_auth_req("again.example", client="agent-1"))
         finally:
-            cp.HOLD_TIMEOUT = saved
+            cp.holds.HOLD_TIMEOUT = saved
         self.assertEqual(late.decision, "deny")
         self.assertIn("timeout", late.reason)   # held afresh, then defaulted
-        with cp._connect() as conn:
+        with cp.store._connect() as conn:
             rows = conn.execute("SELECT status FROM approvals ORDER BY ts").fetchall()
         self.assertEqual([r[0] for r in rows], ["denied", "expired"])
 
@@ -425,7 +425,7 @@ class PersistConflictTests(_CPTestCase):
         _set_rules([(".example.com", "allow")])
         approval = _hold("b.example.com")
         _resolve(approval, "deny_persist", pattern=".example.com")
-        self.assertEqual([p["id"] for p in cp._list_pending()], [approval])
+        self.assertEqual([p["id"] for p in cp.holds._list_pending()], [approval])
         # A one-off decides the request without touching policy, and now succeeds.
         ok = _resolve(approval, "deny_once")
         self.assertTrue(ok.args[0]["ok"])
@@ -471,7 +471,7 @@ class PersistConflictTests(_CPTestCase):
         _set_rules([(".example.com", "allow")])
         _hold("a.b.example.com")
         options = {o["pattern"]: o["existing"]
-                   for o in cp._list_pending()[0]["persist_options"]}
+                   for o in cp.holds._list_pending()[0]["persist_options"]}
         self.assertEqual(options["a.b.example.com"], None)
         self.assertEqual(options[".example.com"], "allow")
 
@@ -522,7 +522,7 @@ class RevokeRuleTests(_CPTestCase):
     recorded, attributed, and refused for seed rules."""
 
     def _rule(self, pattern, action="allow", source="operator"):
-        with cp._connect() as conn:
+        with cp.store._connect() as conn:
             cur = conn.execute(
                 "INSERT INTO rules(pattern, action, source, created_at) "
                 "VALUES (?,?,?,0)", (pattern, action, source))
@@ -530,7 +530,7 @@ class RevokeRuleTests(_CPTestCase):
             return cur.lastrowid
 
     def _patterns(self):
-        with cp._connect() as conn:
+        with cp.store._connect() as conn:
             return {r["pattern"] for r in conn.execute("SELECT pattern FROM rules")}
 
     def test_an_operator_rule_is_removed(self):
@@ -565,7 +565,7 @@ class RevokeRuleTests(_CPTestCase):
             cp.revoke_rule(rid, _FakeRequest())
         self.assertEqual(self._patterns(), {"seeded.example"})
         # And therefore a restart does not re-seed.
-        self.assertEqual(cp._seed_if_empty(), 0)
+        self.assertEqual(cp.store._seed_if_empty(), 0)
 
     def test_an_unknown_id_is_a_404_not_a_silent_success(self):
         self.assertEqual(cp.revoke_rule(999999, _FakeRequest()).status_code, 404)
@@ -576,7 +576,7 @@ class RevokeRuleTests(_CPTestCase):
         detection rather than prevention — the fields are forgeable by a host-local
         caller — but a forged revocation is at least visible afterwards."""
         rid = self._rule(".github.com", "allow")
-        with mock.patch.object(cp, "_audit") as audit:
+        with mock.patch.object(cp.store, "_audit") as audit:
             cp.revoke_rule(rid, _FakeRequest(peer="172.31.0.9"))
         self.assertEqual(audit.call_args.args[0], "revoke")
         kwargs = audit.call_args.kwargs
@@ -588,7 +588,7 @@ class RevokeRuleTests(_CPTestCase):
         # Both directions land on `hold`; the reason is the only thing that says the
         # rule is gone rather than replaced.
         rid = self._rule("evil.example", "block")
-        with mock.patch.object(cp, "_audit") as audit:
+        with mock.patch.object(cp.store, "_audit") as audit:
             cp.revoke_rule(rid, _FakeRequest())
         self.assertIn("held for approval", audit.call_args.kwargs["reason"])
 
@@ -596,17 +596,17 @@ class RevokeRuleTests(_CPTestCase):
         # The whole point, asserted end to end through _decide rather than by
         # inspecting the table: policy actually changes.
         rid = self._rule("gone.example", "allow")
-        self.assertEqual(cp._decide("gone.example")[0], "allow")
+        self.assertEqual(cp.policy._decide("gone.example")[0], "allow")
         cp.revoke_rule(rid, _FakeRequest())
-        self.assertEqual(cp._decide("gone.example")[0], "hold")
+        self.assertEqual(cp.policy._decide("gone.example")[0], "hold")
 
     def test_a_revoked_block_reverts_to_hold_not_allow(self):
         # The loosening direction, and the reason the UI warns differently about it:
         # it does NOT become allowed, it becomes decidable.
         rid = self._rule("bad.example", "block")
-        self.assertEqual(cp._decide("bad.example")[0], "deny")
+        self.assertEqual(cp.policy._decide("bad.example")[0], "deny")
         cp.revoke_rule(rid, _FakeRequest())
-        self.assertEqual(cp._decide("bad.example")[0], "hold")
+        self.assertEqual(cp.policy._decide("bad.example")[0], "hold")
 
 
 def _served(**kw):
@@ -631,7 +631,7 @@ class AuditViewTests(_CPTestCase):
         Replacing rather than appending, so a test can call this more than once in a
         loop. Appending made the grouping subtests count leftovers from the previous
         iteration and read 6 where they meant 2."""
-        with cp._connect() as conn:
+        with cp.store._connect() as conn:
             conn.execute("DELETE FROM audit")
             for r in rows:
                 conn.execute(
@@ -872,7 +872,7 @@ class AuditViewTests(_CPTestCase):
                          for i in range(20)])
             self.assertEqual([r["host"] for r in _served()],
                              [f"h{i}.example" for i in range(19, 14, -1)])
-            with cp._connect() as conn:
+            with cp.store._connect() as conn:
                 self.assertEqual(
                     conn.execute("SELECT COUNT(*) FROM audit").fetchone()[0], 20)
         finally:
@@ -889,47 +889,47 @@ class PersistCandidateTests(unittest.TestCase):
 
     def test_the_narrowest_choice_is_first_because_it_is_the_default(self):
         self.assertEqual(
-            cp._persist_candidates("a.b.example.com"),
+            cp.policy._persist_candidates("a.b.example.com"),
             ["a.b.example.com", ".a.b.example.com", ".example.com"])
 
     def test_a_two_label_host_offers_only_itself_and_its_subtree(self):
-        self.assertEqual(cp._persist_candidates("example.com"),
+        self.assertEqual(cp.policy._persist_candidates("example.com"),
                          ["example.com", ".example.com"])
 
     def test_no_candidate_is_ever_a_single_label_wildcard(self):
         # `.com` as a standing allow rule would end governance for the whole TLD, and
         # `.localhost` is the same mistake one label down.
         for host in ("example.com", "a.b.example.com", "localhost", "example.co.uk"):
-            for pattern in cp._persist_candidates(host):
+            for pattern in cp.policy._persist_candidates(host):
                 labels = pattern.lstrip(".").split(".")
                 if pattern.startswith("."):
                     self.assertGreaterEqual(
                         len(labels), 2, f"{host} offers one-label wildcard {pattern}")
         # A bare name has no subtree to offer at all.
-        self.assertEqual(cp._persist_candidates("localhost"), ["localhost"])
+        self.assertEqual(cp.policy._persist_candidates("localhost"), ["localhost"])
 
     def test_an_ip_literal_gets_no_wildcard(self):
         for host in ("1.2.3.4", "::1", "[::1]"):
             self.assertEqual(
-                len(cp._persist_candidates(host)), 1,
+                len(cp.policy._persist_candidates(host)), 1,
                 f"{host} has no subdomains — `.1.2.3.4` would be a nonsense rule")
 
     def test_a_host_the_agent_spelled_as_a_wildcard_cannot_stay_one(self):
         # THE case this function exists for: the leading dot is normalized away, so the
         # exact-host default is an exact host and the wildcard is only ever reachable by
         # an operator picking it.
-        self.assertEqual(cp._persist_candidates(".example.com")[0], "example.com")
-        self.assertEqual(cp._persist_candidates(".example.com"),
-                         cp._persist_candidates("example.com"))
+        self.assertEqual(cp.policy._persist_candidates(".example.com")[0], "example.com")
+        self.assertEqual(cp.policy._persist_candidates(".example.com"),
+                         cp.policy._persist_candidates("example.com"))
 
     def test_case_and_a_trailing_fqdn_dot_are_normalized(self):
-        self.assertEqual(cp._persist_candidates("EXAMPLE.com."),
+        self.assertEqual(cp.policy._persist_candidates("EXAMPLE.com."),
                          ["example.com", ".example.com"])
 
     def test_a_malformed_host_gets_no_invented_wildcards(self):
-        self.assertEqual(cp._persist_candidates("a..b"), ["a..b"])
-        self.assertEqual(cp._persist_candidates(""), [])
-        self.assertEqual(cp._persist_candidates("."), [])
+        self.assertEqual(cp.policy._persist_candidates("a..b"), ["a..b"])
+        self.assertEqual(cp.policy._persist_candidates(""), [])
+        self.assertEqual(cp.policy._persist_candidates("."), [])
 
     def test_every_candidate_actually_matches_the_host_it_came_from(self):
         # The property that makes the set safe to offer: picking any of them grants at
@@ -937,19 +937,19 @@ class PersistCandidateTests(unittest.TestCase):
         # from, so a change to either side has to keep them consistent.
         for host in ("example.com", "a.b.example.com", "raw.githubusercontent.com",
                      "localhost", "1.2.3.4"):
-            for pattern in cp._persist_candidates(host):
-                self.assertTrue(cp._match(host, pattern),
+            for pattern in cp.policy._persist_candidates(host):
+                self.assertTrue(cp.policy._match(host, pattern),
                                 f"{pattern} would not even match {host}")
 
     def test_pending_approvals_carry_the_patterns_resolve_will_accept(self):
         # Sent WITH the approval so the UI cannot offer a pattern the backend rejects.
         # One definition of the set, next to the matcher — not a second one in JS.
-        cp._init_db()
+        cp.store._init_db()
         _clear_all()
         _hold("api.example.com", "opts-1")
-        (row,) = cp._list_pending()
+        (row,) = cp.holds._list_pending()
         self.assertEqual([o["pattern"] for o in row["persist_options"]],
-                         cp._persist_candidates("api.example.com"))
+                         cp.policy._persist_candidates("api.example.com"))
         # Each carries the scope in words, since the dot is easy to miss.
         self.assertEqual(row["persist_options"][0]["scope"], "exact host")
         self.assertEqual(row["persist_options"][1]["scope"], "host + subdomains")
@@ -968,12 +968,12 @@ class PersistPatternTests(_CPTestCase):
         self.assertTrue(resp.args[0]["ok"])
         self.assertEqual(_rules(), {(".example.com", "allow")})
         # And it does what the scope label says: subdomains skip the hold now.
-        self.assertEqual(cp._decide("other.example.com")[0], "allow")
+        self.assertEqual(cp.policy._decide("other.example.com")[0], "allow")
 
     def test_deny_persist_writes_a_block_rule_for_the_chosen_pattern(self):
         _resolve(_hold("bad.example.com"), "deny_persist", pattern=".example.com")
         self.assertEqual(_rules(), {(".example.com", "block")})
-        self.assertEqual(cp._decide("anything.example.com")[0], "deny")
+        self.assertEqual(cp.policy._decide("anything.example.com")[0], "deny")
 
     def test_the_response_names_the_pattern_that_was_stored(self):
         # So the UI reports what was WRITTEN, not what was clicked — and names the
@@ -1007,7 +1007,7 @@ class PersistPatternTests(_CPTestCase):
         approval = _hold("retry.example.com")
         resp = _resolve(approval, "allow_persist", pattern=".com")
         self.assertEqual(resp.kwargs.get("status_code"), 400)
-        self.assertEqual([r["id"] for r in cp._list_pending()], [approval])
+        self.assertEqual([r["id"] for r in cp.holds._list_pending()], [approval])
         # And the retry works.
         resp = _resolve(approval, "allow_persist")
         self.assertTrue(resp.args[0]["ok"])
@@ -1024,7 +1024,7 @@ class PersistPatternTests(_CPTestCase):
         _resolve(_hold(".sneaky.example.com"), "allow_persist")
         self.assertEqual(_rules(), {("sneaky.example.com", "allow")})
         # Which is a strictly narrower grant: the subtree still holds.
-        self.assertEqual(cp._decide("x.sneaky.example.com")[0], "hold")
+        self.assertEqual(cp.policy._decide("x.sneaky.example.com")[0], "hold")
 
 
 class ProvenanceTests(_CPTestCase):
@@ -1054,8 +1054,8 @@ class ProvenanceTests(_CPTestCase):
         self.assertLess(len(actor), 400)
 
     def test_resolution_records_provenance_on_the_approval_row(self):
-        saved = cp.HOLD_TIMEOUT
-        cp.HOLD_TIMEOUT = 5
+        saved = cp.holds.HOLD_TIMEOUT
+        cp.holds.HOLD_TIMEOUT = 5
         try:
             t, _result, approval_id = HoldHandshakeTests._authorize_in_thread(
                 self, "provenance.com")
@@ -1065,8 +1065,8 @@ class ProvenanceTests(_CPTestCase):
                                            "user-agent": "curl/8.5.0"}))
             t.join(2)
         finally:
-            cp.HOLD_TIMEOUT = saved
-        with cp._connect() as conn:
+            cp.holds.HOLD_TIMEOUT = saved
+        with cp.store._connect() as conn:
             row = conn.execute(
                 "SELECT status, resolved_by FROM approvals WHERE host=?",
                 ("provenance.com",)).fetchone()
@@ -1078,17 +1078,17 @@ class ProvenanceTests(_CPTestCase):
     def test_audit_reason_carries_the_actor(self):
         # _audit is mocked by _CPTestCase, so assert on what the waiter passed it —
         # that is the record an operator actually reads back.
-        saved = cp.HOLD_TIMEOUT
-        cp.HOLD_TIMEOUT = 5
+        saved = cp.holds.HOLD_TIMEOUT
+        cp.holds.HOLD_TIMEOUT = 5
         try:
             t, result, approval_id = HoldHandshakeTests._authorize_in_thread(
                 self, "audited.com")
             _resolve(approval_id, "allow_once", _FakeRequest(peer="172.31.0.9"))
             t.join(2)
         finally:
-            cp.HOLD_TIMEOUT = saved
+            cp.holds.HOLD_TIMEOUT = saved
         self.assertEqual(result["resp"].decision, "allow")
-        reasons = [c.kwargs.get("reason", "") for c in cp._audit.call_args_list]
+        reasons = [c.kwargs.get("reason", "") for c in cp.store._audit.call_args_list]
         self.assertTrue(any("human approval" in r and "peer=172.31.0.9" in r
                             for r in reasons),
                         f"actor missing from audit reasons: {reasons}")
@@ -1098,41 +1098,41 @@ class ProvenanceTests(_CPTestCase):
         # different afterwards, and the audit line used to say nothing about which had
         # happened — so reading the log could not tell you that a click had changed
         # policy. Read from the durable `mode` column, i.e. what was recorded.
-        saved = cp.HOLD_TIMEOUT
-        cp.HOLD_TIMEOUT = 5
+        saved = cp.holds.HOLD_TIMEOUT
+        cp.holds.HOLD_TIMEOUT = 5
         try:
             t, result, approval_id = HoldHandshakeTests._authorize_in_thread(
                 self, "persisted.example.com")
             _resolve(approval_id, "allow_persist")
             t.join(2)
         finally:
-            cp.HOLD_TIMEOUT = saved
+            cp.holds.HOLD_TIMEOUT = saved
         self.assertEqual(result["resp"].decision, "allow")
-        reasons = [c.kwargs.get("reason", "") for c in cp._audit.call_args_list]
+        reasons = [c.kwargs.get("reason", "") for c in cp.store._audit.call_args_list]
         self.assertTrue(any("standing rule written" in r for r in reasons),
                         f"persist not distinguishable in audit reasons: {reasons}")
 
     def test_audit_reason_marks_a_one_off_as_one_off(self):
-        saved = cp.HOLD_TIMEOUT
-        cp.HOLD_TIMEOUT = 5
+        saved = cp.holds.HOLD_TIMEOUT
+        cp.holds.HOLD_TIMEOUT = 5
         try:
             t, _result, approval_id = HoldHandshakeTests._authorize_in_thread(
                 self, "oneoff.example.com")
             _resolve(approval_id, "deny_once")
             t.join(2)
         finally:
-            cp.HOLD_TIMEOUT = saved
-        reasons = [c.kwargs.get("reason", "") for c in cp._audit.call_args_list]
+            cp.holds.HOLD_TIMEOUT = saved
+        reasons = [c.kwargs.get("reason", "") for c in cp.store._audit.call_args_list]
         self.assertTrue(any("this request only" in r for r in reasons), reasons)
         self.assertFalse(any("standing rule" in r for r in reasons), reasons)
 
     def test_timeout_path_reports_no_actor_rather_than_a_wrong_one(self):
-        saved = cp.HOLD_TIMEOUT
-        cp.HOLD_TIMEOUT = 0.05
+        saved = cp.holds.HOLD_TIMEOUT
+        cp.holds.HOLD_TIMEOUT = 0.05
         try:
             resp = cp.authorize(_auth_req("nobody.com", client="a"))
         finally:
-            cp.HOLD_TIMEOUT = saved
+            cp.holds.HOLD_TIMEOUT = saved
         self.assertEqual(resp.decision, "deny")
         self.assertIn("timeout", resp.reason)
         self.assertNotIn("peer=", resp.reason)
@@ -1172,10 +1172,10 @@ class RulesViewTests(_CPTestCase):
 
     def test_scope_agrees_with_the_matcher_that_implements_it(self):
         # Guard against the label drifting from _match's real behaviour.
-        self.assertTrue(cp._match("sub.example.com", ".example.com"))
-        self.assertFalse(cp._match("sub.example.com", "example.com"))
-        self.assertEqual(cp._pattern_scope(".example.com"), "host + subdomains")
-        self.assertEqual(cp._pattern_scope("example.com"), "exact host")
+        self.assertTrue(cp.policy._match("sub.example.com", ".example.com"))
+        self.assertFalse(cp.policy._match("sub.example.com", "example.com"))
+        self.assertEqual(cp.policy._pattern_scope(".example.com"), "host + subdomains")
+        self.assertEqual(cp.policy._pattern_scope("example.com"), "exact host")
 
     def test_empty_policy_is_an_empty_list_not_an_error(self):
         _set_rules([])
@@ -1188,15 +1188,15 @@ class ConfigViewTests(_CPTestCase):
     left cannot distinguish hold-for-approval from a slow deny."""
 
     def test_config_reports_the_hold_window(self):
-        self.assertEqual(cp.api_config()["hold_timeout"], cp.HOLD_TIMEOUT)
+        self.assertEqual(cp.api_config()["hold_timeout"], cp.holds.HOLD_TIMEOUT)
 
     def test_config_follows_the_operator_setting_rather_than_a_constant(self):
-        saved = cp.HOLD_TIMEOUT
-        cp.HOLD_TIMEOUT = 45.0
+        saved = cp.holds.HOLD_TIMEOUT
+        cp.holds.HOLD_TIMEOUT = 45.0
         try:
             self.assertEqual(cp.api_config()["hold_timeout"], 45.0)
         finally:
-            cp.HOLD_TIMEOUT = saved
+            cp.holds.HOLD_TIMEOUT = saved
 
     def test_config_exposes_nothing_but_that(self):
         # A read-only view of NON-SECRET config on the one interface that can grant
@@ -1210,16 +1210,16 @@ class SaturationTests(_CPTestCase):
     as a quiet afternoon. These assert the record that makes it visible."""
 
     def _over_cap(self, host="pypi.org", client=None):
-        saved = cp.MAX_PENDING
-        cp.MAX_PENDING = 0
+        saved = cp.holds.MAX_PENDING
+        cp.holds.MAX_PENDING = 0
         try:
             return cp.authorize(_auth_req(host, client=client))
         finally:
-            cp.MAX_PENDING = saved
+            cp.holds.MAX_PENDING = saved
 
     def test_a_rejection_is_recorded_with_what_was_refused(self):
         self._over_cap(host="pypi.org")
-        sat = cp._saturation()
+        sat = cp.holds._saturation()
         self.assertEqual(sat["rejections"], 1)
         self.assertEqual(sat["last_host"], "pypi.org")
         self.assertEqual(sat["last_scope"], "global")
@@ -1230,39 +1230,39 @@ class SaturationTests(_CPTestCase):
         # and only the count survives the holds draining.
         for _ in range(3):
             self._over_cap()
-        self.assertEqual(cp._saturation()["rejections"], 3)
+        self.assertEqual(cp.holds._saturation()["rejections"], 3)
 
     def test_the_per_client_cap_is_recorded_as_its_own_scope(self):
-        saved = cp.MAX_PENDING_PER_CLIENT
-        cp.MAX_PENDING_PER_CLIENT = 1
+        saved = cp.holds.MAX_PENDING_PER_CLIENT
+        cp.holds.MAX_PENDING_PER_CLIENT = 1
         try:
             _hold("a.example", "held-1")
-            cp._PENDING_CLIENT["held-1"] = "172.30.0.9"
+            cp.holds._PENDING_CLIENT["held-1"] = "172.30.0.9"
             cp.authorize(_auth_req("b.example", client="172.30.0.9"))
         finally:
-            cp.MAX_PENDING_PER_CLIENT = saved
+            cp.holds.MAX_PENDING_PER_CLIENT = saved
         # Distinguishable from a global exhaustion: "one agent is hammering" and
         # "the whole control plane is loaded" want different responses.
-        self.assertEqual(cp._saturation()["last_scope"], "client 172.30.0.9")
+        self.assertEqual(cp.holds._saturation()["last_scope"], "client 172.30.0.9")
 
     def test_nothing_is_recorded_when_the_hold_is_accepted(self):
         _hold("quiet.example", "held-1")
-        self.assertEqual(cp._saturation()["rejections"], 0)
-        self.assertIsNone(cp._saturation()["last_ts"])
+        self.assertEqual(cp.holds._saturation()["rejections"], 0)
+        self.assertIsNone(cp.holds._saturation()["last_ts"])
 
     def test_in_flight_counts_live_holds_not_pending_rows(self):
         # The divergence this exists for: after a restart the table can carry
         # `pending` rows with no live hold behind them. The cap is measured against
         # the in-memory set, so a count taken from the visible cards would be
         # confidently wrong in exactly the situation the banner reports.
-        with cp._connect() as conn:
+        with cp.store._connect() as conn:
             conn.execute(
                 "INSERT INTO approvals(id, ts, host, status) "
                 "VALUES ('orphan', 0, 'stale.example', 'pending')")
             conn.commit()
-        self.assertEqual(len(cp._list_pending()), 1)
-        self.assertEqual(cp._saturation()["in_flight"], 0)
-        self.assertEqual(cp._saturation()["cards"], 0)
+        self.assertEqual(len(cp.holds._list_pending()), 1)
+        self.assertEqual(cp.holds._saturation()["in_flight"], 0)
+        self.assertEqual(cp.holds._saturation()["cards"], 0)
 
     def test_in_flight_counts_waiters_and_cards_counts_cards(self):
         # The second divergence, and the reason both numbers are in the payload:
@@ -1270,10 +1270,10 @@ class SaturationTests(_CPTestCase):
         # contradiction. The global cap is measured against the FIRST number.
         _hold("a.example", "held-1", client="172.30.0.2")
         for _ in range(4):
-            slot = cp._reserve_hold("ignored", threading.Event(), "172.30.0.2",
+            slot = cp.holds._reserve_hold("ignored", threading.Event(), "172.30.0.2",
                                     "a.example")
             self.assertTrue(slot.joined)
-        sat = cp._saturation()
+        sat = cp.holds._saturation()
         self.assertEqual(sat["in_flight"], 5)
         self.assertEqual(sat["cards"], 1)
 
@@ -1283,7 +1283,7 @@ class SaturationTests(_CPTestCase):
         self.assertEqual(set(payload), {"holds", "saturation"})
         self.assertEqual([h["id"] for h in payload["holds"]], ["held-1"])
         self.assertEqual(payload["saturation"]["in_flight"], 1)
-        self.assertEqual(payload["saturation"]["max_pending"], cp.MAX_PENDING)
+        self.assertEqual(payload["saturation"]["max_pending"], cp.holds.MAX_PENDING)
 
     def test_every_time_in_the_payload_is_absolute(self):
         # Load-bearing for the SSE stream, which emits on payload CHANGE: an
@@ -1292,7 +1292,7 @@ class SaturationTests(_CPTestCase):
         # idle page would receive a 1 Hz firehose. Named fields, so adding a
         # "seconds_ago" convenience trips this rather than the stream.
         self._over_cap()
-        sat = cp._saturation()
+        sat = cp.holds._saturation()
         self.assertEqual(
             set(sat),
             {"in_flight", "cards", "max_pending", "rejections", "acknowledged",
@@ -1305,13 +1305,13 @@ class SaturationTests(_CPTestCase):
         # The property the test above protects, asserted directly against the
         # comparison the stream actually makes.
         _hold("a.example", "held-1")
-        self.assertEqual(json.dumps(cp._pending_payload()),
-                         json.dumps(cp._pending_payload()))
+        self.assertEqual(json.dumps(cp.holds._pending_payload()),
+                         json.dumps(cp.holds._pending_payload()))
 
     def test_the_counter_says_since_when(self):
         # In-memory, so a restart resets it. The UI can only be honest about that if
         # the payload says which window the count covers.
-        self.assertEqual(cp._saturation()["since"], cp._STARTED_TS)
+        self.assertEqual(cp.holds._saturation()["since"], cp.holds._STARTED_TS)
 
     # ── acknowledgement ──────────────────────────────────────────────────────
 
@@ -1322,7 +1322,7 @@ class SaturationTests(_CPTestCase):
         self._over_cap()
         self._over_cap()
         cp.api_saturation_ack(cp.AckRequest(count=2))
-        sat = cp._saturation()
+        sat = cp.holds._saturation()
         self.assertEqual(sat["rejections"], 2)
         self.assertEqual(sat["acknowledged"], 2)
 
@@ -1334,7 +1334,7 @@ class SaturationTests(_CPTestCase):
         self._over_cap()
         self._over_cap()                       # arrives while the click is in flight
         cp.api_saturation_ack(cp.AckRequest(count=2))
-        sat = cp._saturation()
+        sat = cp.holds._saturation()
         self.assertEqual(sat["rejections"] - sat["acknowledged"], 1)
 
     def test_acknowledgement_never_goes_backwards(self):
@@ -1342,7 +1342,7 @@ class SaturationTests(_CPTestCase):
             self._over_cap()
         cp.api_saturation_ack(cp.AckRequest(count=3))
         cp.api_saturation_ack(cp.AckRequest(count=1))   # a stale tab, or a replay
-        self.assertEqual(cp._saturation()["acknowledged"], 3)
+        self.assertEqual(cp.holds._saturation()["acknowledged"], 3)
 
     def test_acknowledging_more_than_happened_is_clamped(self):
         # Otherwise a client number silences FUTURE rejections until they catch up —
@@ -1350,33 +1350,33 @@ class SaturationTests(_CPTestCase):
         # validating `pattern` in resolve, and the same answer.
         self._over_cap()
         cp.api_saturation_ack(cp.AckRequest(count=10_000))
-        self.assertEqual(cp._saturation()["acknowledged"], 1)
+        self.assertEqual(cp.holds._saturation()["acknowledged"], 1)
         self._over_cap()
-        sat = cp._saturation()
+        sat = cp.holds._saturation()
         self.assertEqual(sat["rejections"] - sat["acknowledged"], 1)
 
     def test_negative_acknowledgements_are_floored(self):
         self._over_cap()
         cp.api_saturation_ack(cp.AckRequest(count=-5))
-        self.assertEqual(cp._saturation()["acknowledged"], 0)
+        self.assertEqual(cp.holds._saturation()["acknowledged"], 0)
 
     def test_the_window_moves_to_the_dismissal(self):
         # The count and the stamp beside it must describe the SAME span, or the
         # banner reads "1 request since 14:02" for something that happened at 15:30.
         self._over_cap()
-        before = cp._saturation()["since"]
-        self.assertEqual(before, cp._STARTED_TS)
+        before = cp.holds._saturation()["since"]
+        self.assertEqual(before, cp.holds._STARTED_TS)
         cp.api_saturation_ack(cp.AckRequest(count=1))
-        after = cp._saturation()["since"]
-        self.assertNotEqual(after, cp._STARTED_TS)
+        after = cp.holds._saturation()["since"]
+        self.assertNotEqual(after, cp.holds._STARTED_TS)
         self.assertGreaterEqual(after, before)
 
     def test_an_acknowledgement_that_changes_nothing_leaves_the_window_alone(self):
         self._over_cap()
         cp.api_saturation_ack(cp.AckRequest(count=1))
-        stamped = cp._saturation()["since"]
+        stamped = cp.holds._saturation()["since"]
         cp.api_saturation_ack(cp.AckRequest(count=1))   # idempotent replay
-        self.assertEqual(cp._saturation()["since"], stamped)
+        self.assertEqual(cp.holds._saturation()["since"], stamped)
 
 
 class FreshSchemaTests(unittest.TestCase):
@@ -1389,17 +1389,17 @@ class FreshSchemaTests(unittest.TestCase):
     it against a genuinely empty database rather than the shared test one."""
 
     def test_new_store_has_the_provenance_column(self):
-        saved = cp.DB_PATH
-        cp.DB_PATH = os.path.join(_TMP, "fresh-schema.db")
+        saved = cp.store.DB_PATH
+        cp.store.DB_PATH = os.path.join(_TMP, "fresh-schema.db")
         try:
-            cp._init_db()
-            with cp._connect() as conn:
+            cp.store._init_db()
+            with cp.store._connect() as conn:
                 cols = {r["name"] for r in
                         conn.execute("PRAGMA table_info(approvals)")}
             self.assertIn("resolved_by", cols)
-            cp._init_db()          # idempotent: a second run must not fail
+            cp.store._init_db()          # idempotent: a second run must not fail
         finally:
-            cp.DB_PATH = saved
+            cp.store.DB_PATH = saved
 
 
 class SeedTests(_CPTestCase):
@@ -1407,20 +1407,20 @@ class SeedTests(_CPTestCase):
         seed = os.path.join(_TMP, "seed.txt")
         with open(seed, "w") as f:
             f.write("# a comment\n\n Example.COM \n.pypi.org\n")
-        saved = cp.SEED_PATH
-        cp.SEED_PATH = seed
+        saved = cp.store.SEED_PATH
+        cp.store.SEED_PATH = seed
         try:
-            n = cp._seed_if_empty()
+            n = cp.store._seed_if_empty()
             self.assertEqual(n, 2)
-            with cp._connect() as conn:
+            with cp.store._connect() as conn:
                 rows = {(r["pattern"], r["action"], r["source"]) for r in
                         conn.execute("SELECT pattern, action, source FROM rules")}
             self.assertEqual(rows, {("example.com", "allow", "seed"),
                                     (".pypi.org", "allow", "seed")})
             # Idempotent: a second call is a no-op once rules exist.
-            self.assertEqual(cp._seed_if_empty(), 0)
+            self.assertEqual(cp.store._seed_if_empty(), 0)
         finally:
-            cp.SEED_PATH = saved
+            cp.store.SEED_PATH = saved
 
 
 def _routes(fastapi_app) -> set:

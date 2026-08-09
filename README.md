@@ -195,9 +195,13 @@ dockade/
   sandbox-lib.sh            # launcher plumbing shared by both tiers
   control-plane/            # governance authority BACKEND (agent cannot reach it)
     Dockerfile              #   FastAPI over SQLite; two internal nets, fully internal
-    app.py                  #   /authorize on authorize-net; the management API
-                            #   (approvals, resolve, the read-only views) on control-net
-                            #   + ingest of the proxy's locally-decided audit lines
+    app.py                  #   the HTTP surface: /authorize on authorize-net; the
+                            #   management API (approvals, resolve, the read-only
+                            #   views) on control-net; both listeners' entry point
+    store.py                #   SQLite — schema, the audit write, the policy seed
+    policy.py               #   what a rule pattern matches; host -> allow/deny/hold
+    holds.py                #   the in-process registry a held request blocks on
+    ingest.py               #   drains the proxy's locally-decided audit lines in
     requirements.txt        #   pinned deps (fastapi, uvicorn)
   control-plane-ui/         # UI FRONTEND — serves the UI + reverse-proxies the API
     Dockerfile              #   FastAPI + httpx; control-ui-net (loopback) + control-net

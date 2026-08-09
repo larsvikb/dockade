@@ -1592,7 +1592,8 @@ no-op on an existing table and this store is a long-lived named volume that
 deliberately outlives container and image churn, so **the next additive column will
 need its own explicit `ALTER` for existing volumes**, or every statement naming it
 fails at runtime. The only alternative is `make destroy`, which discards the policy
-rules and the audit history — i.e. the crown jewels. See the NOTE in `_init_db`.
+rules and the audit history — i.e. the crown jewels. See the NOTE below `_init_db`
+in `control-plane/store.py`.
 
 Step 2c: audit *browsing* — filter/search/history beyond the live
 recent-decisions table the UI already renders — and the per-proxy config

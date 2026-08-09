@@ -103,7 +103,7 @@ than restated.
   in ways a governed host cannot exercise.
 
 - **One sandbox can exhaust the hold queue for every other sandbox.** In
-  `control-plane/app.py` `_reserve_hold`, the global cap counts *waiters* while the
+  `control-plane/holds.py` `_reserve_hold`, the global cap counts *waiters* while the
   per-client cap counts *cards*, and the join path returns before the per-client check
   is reached. Grouped duplicates from a single client can therefore fill the global
   cap (`CONTROL_MAX_PENDING`) and every other sandbox is refused until those holds

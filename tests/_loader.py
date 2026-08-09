@@ -17,6 +17,15 @@ keeps ``python -m unittest`` runnable with no pip installs (see DESIGN.md).
 
 Both modules are loaded by absolute path (``control-plane`` has a hyphen, so it
 is not importable as a package name) under a private module name.
+
+``control-plane/app.py`` is itself the top of a small set of sibling modules
+(``store``, ``policy``, ``holds``, ``ingest``) that it imports by plain name — the
+way any script does from its own directory. So the loader puts that directory on
+``sys.path`` before executing it, which is exactly what ``python app.py`` does for
+the container. Tests reach a sibling through the app module (``cp.holds``), and
+that indirection is load-bearing: rebinding a tunable has to happen on the module
+whose functions READ it, so ``cp.holds.MAX_PENDING = 2`` works where a re-exported
+``cp.MAX_PENDING = 2`` would silently not.
 """
 from __future__ import annotations
 
@@ -186,4 +195,9 @@ def load_egress_addon() -> types.ModuleType:
 
 def load_control_plane() -> types.ModuleType:
     _install_fastapi_stub()
+    # app.py imports its siblings by plain name, so its own directory has to be
+    # importable — the position `python app.py` gives it in the container.
+    pkg_dir = str(ROOT / "control-plane")
+    if pkg_dir not in sys.path:
+        sys.path.insert(0, pkg_dir)
     return _load("dockade_control_plane", "control-plane/app.py")

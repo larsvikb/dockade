@@ -23,6 +23,7 @@ from __future__ import annotations
 import re
 import unittest
 from pathlib import Path
+from typing import ClassVar
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = (ROOT / "docker-compose.yml").read_text().splitlines()
@@ -233,6 +234,32 @@ class RelayGuardAgreesWithComposeTests(unittest.TestCase):
             self.assertTrue(
                 any(re.match(r"\s*internal:\s*true\s*$", line) for line in body),
                 f"network {network} is not internal: true")
+
+
+class ControlPlaneModulesAreShippedTests(unittest.TestCase):
+    """Every module ``app.py`` sits beside is COPYed into the image.
+
+    Same shape as the rest of this file — two ends with no compiler between them.
+    ``app.py`` imports its siblings by plain name, which the unit suite satisfies
+    from the source tree, so a module that no ``COPY`` line mentions passes every
+    test here and then raises ``ImportError`` the moment the container starts. The
+    build cannot catch it either: a missing COPY is a file that is simply absent,
+    not an error.
+
+    Asserted over the DIRECTORY rather than a list, so adding the sixth module is
+    what trips it — a list would have to be remembered in the same breath as the
+    COPY line it exists to compensate for."""
+
+    CP_DIR: ClassVar[Path] = ROOT / "control-plane"
+    DOCKERFILE: ClassVar[str] = (ROOT / "control-plane" / "Dockerfile").read_text()
+
+    def test_every_sibling_module_has_a_copy_line(self):
+        for path in sorted(self.CP_DIR.glob("*.py")):
+            with self.subTest(module=path.name):
+                self.assertIn(f"COPY control-plane/{path.name} ", self.DOCKERFILE,
+                              f"{path.name} sits next to app.py but no COPY line "
+                              f"puts it in the image — it would ImportError at "
+                              f"container start")
 
 
 class AppPortDefaultsAgreeTests(unittest.TestCase):

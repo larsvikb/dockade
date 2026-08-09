@@ -80,13 +80,13 @@ class _FailsOn:
 
 class IngestTestCase(unittest.TestCase):
     def setUp(self):
-        cp._init_db()
-        with cp._connect() as conn:
+        cp.store._init_db()
+        with cp.store._connect() as conn:
             conn.execute("DELETE FROM audit")
             conn.execute("DELETE FROM audit_cursor")
             conn.commit()
         self.path = os.path.join(_TMP, f"audit-{self.id()}.jsonl")
-        cp.EGRESS_AUDIT_LOG = self.path
+        cp.ingest.EGRESS_AUDIT_LOG = self.path
         # The drain mirrors ingested rows to stdout (make logs-cp). Capture it so a
         # test run stays readable, and so the mirror itself can be asserted on.
         self.out = io.StringIO()
@@ -121,13 +121,13 @@ class IngestTestCase(unittest.TestCase):
         os.replace(self.path, f"{self.path}.1")
 
     def rows(self):
-        with cp._connect() as conn:
+        with cp.store._connect() as conn:
             return conn.execute(
                 "SELECT ts, decision, stage, host, port, proto, client, method, "
                 "url, reason FROM audit ORDER BY id").fetchall()
 
     def cursor(self):
-        with cp._connect() as conn:
+        with cp.store._connect() as conn:
             return conn.execute("SELECT inode, offset FROM audit_cursor "
                                 "WHERE path=?", (self.path,)).fetchone()
 
@@ -136,7 +136,7 @@ class RowMappingTests(IngestTestCase):
     """``_ingest_row``: what becomes a row, and what is dropped."""
 
     def test_local_decision_becomes_a_row(self):
-        row = cp._ingest_row(_line().encode())
+        row = cp.ingest._ingest_row(_line().encode())
         self.assertEqual(row, (1000.0, "deny", "sni", "evil.com", None, None,
                                "172.30.0.2", None, None,
                                "possible domain-fronting"))
@@ -144,7 +144,7 @@ class RowMappingTests(IngestTestCase):
     def test_central_true_is_never_ingested(self):
         """Every governed request writes a proxy line too. Ingesting those would
         duplicate the whole log against the rows /authorize already wrote."""
-        self.assertIsNone(cp._ingest_row(_line(central=True).encode()))
+        self.assertIsNone(cp.ingest._ingest_row(_line(central=True).encode()))
 
     def test_missing_flag_is_not_ingested(self):
         """Absence must read as 'unknown', not as 'local'. A line written by a proxy
@@ -152,23 +152,23 @@ class RowMappingTests(IngestTestCase):
         is the direction that degrades a view instead of corrupting a record."""
         rec = json.loads(_line())
         del rec["central"]
-        self.assertIsNone(cp._ingest_row((json.dumps(rec) + "\n").encode()))
+        self.assertIsNone(cp.ingest._ingest_row((json.dumps(rec) + "\n").encode()))
 
     def test_truthy_non_false_flag_is_not_ingested(self):
         # `is not False`, not `not falsy`: 0 and "" must not read as local either.
         for garbled in (0, "", "false", None, [], "no"):
             with self.subTest(central=garbled):
-                self.assertIsNone(cp._ingest_row(_line(central=garbled).encode()))
+                self.assertIsNone(cp.ingest._ingest_row(_line(central=garbled).encode()))
 
     def test_unknown_decision_verbs_are_dropped(self):
         """The audit table's vocabulary is allow|deny|hold. The proxy's `startup`
         line lives in the same file and is not a decision."""
         for verb in ("startup", "deny-sni", "", "DENY", "allowish"):
             with self.subTest(decision=verb):
-                self.assertIsNone(cp._ingest_row(_line(decision=verb).encode()))
+                self.assertIsNone(cp.ingest._ingest_row(_line(decision=verb).encode()))
         for verb in ("allow", "deny", "hold"):
             with self.subTest(decision=verb):
-                self.assertIsNotNone(cp._ingest_row(_line(decision=verb).encode()))
+                self.assertIsNotNone(cp.ingest._ingest_row(_line(decision=verb).encode()))
 
     def test_unusable_timestamps_are_dropped(self):
         # A row with no usable instant cannot be placed in a time-ordered view.
@@ -176,26 +176,26 @@ class RowMappingTests(IngestTestCase):
         # check would silently file a decision at 1970-01-01T00:00:01.
         for ts in (None, "1000", float("nan"), float("inf"), True, [1000]):
             with self.subTest(ts=ts):
-                self.assertIsNone(cp._ingest_row(_line(ts=ts).encode()))
+                self.assertIsNone(cp.ingest._ingest_row(_line(ts=ts).encode()))
 
     def test_non_integer_port_becomes_null(self):
         for port in ("443", None, 4.5, True):
             with self.subTest(port=port):
-                self.assertIsNone(cp._ingest_row(_line(port=port).encode())[4])
-        self.assertEqual(cp._ingest_row(_line(port=443).encode())[4], 443)
+                self.assertIsNone(cp.ingest._ingest_row(_line(port=port).encode())[4])
+        self.assertEqual(cp.ingest._ingest_row(_line(port=443).encode())[4], 443)
 
     def test_agent_influenced_fields_are_truncated(self):
         """host/url come from what the sandbox asked for. The proxy records them
         faithfully; this reader is where an unbounded one stops being our problem."""
-        row = cp._ingest_row(_line(host="h" * 9000, url="u" * 9000).encode())
-        self.assertEqual(len(row[3]), cp.DRAIN_MAX_FIELD)
-        self.assertEqual(len(row[8]), cp.DRAIN_MAX_FIELD)
+        row = cp.ingest._ingest_row(_line(host="h" * 9000, url="u" * 9000).encode())
+        self.assertEqual(len(row[3]), cp.store.DRAIN_MAX_FIELD)
+        self.assertEqual(len(row[8]), cp.store.DRAIN_MAX_FIELD)
 
     def test_malformed_lines_are_dropped_not_guessed_at(self):
         for raw in (b"{not json", b"[]", b'"a string"', b"null", b"42",
                     b"\xff\xfe\x00binary"):
             with self.subTest(raw=raw):
-                self.assertIsNone(cp._ingest_row(raw))
+                self.assertIsNone(cp.ingest._ingest_row(raw))
 
 
 class DrainTests(IngestTestCase):
@@ -203,7 +203,7 @@ class DrainTests(IngestTestCase):
 
     def test_drains_and_records_a_cursor(self):
         self.write(_line(host="a.example") + _line(host="b.example"))
-        consumed = cp._drain_egress_audit()
+        consumed = cp.ingest._drain_egress_audit()
         self.assertEqual(consumed, os.path.getsize(self.path))
         self.assertEqual([r["host"] for r in self.rows()],
                          ["a.example", "b.example"])
@@ -211,15 +211,15 @@ class DrainTests(IngestTestCase):
 
     def test_second_pass_over_unchanged_file_ingests_nothing(self):
         self.write(_line())
-        cp._drain_egress_audit()
-        self.assertEqual(cp._drain_egress_audit(), 0)
+        cp.ingest._drain_egress_audit()
+        self.assertEqual(cp.ingest._drain_egress_audit(), 0)
         self.assertEqual(len(self.rows()), 1)
 
     def test_only_appended_bytes_are_ingested(self):
         self.write(_line(host="first.example"))
-        cp._drain_egress_audit()
+        cp.ingest._drain_egress_audit()
         self.write(_line(host="second.example"))
-        cp._drain_egress_audit()
+        cp.ingest._drain_egress_audit()
         self.assertEqual([r["host"] for r in self.rows()],
                          ["first.example", "second.example"])
 
@@ -230,17 +230,17 @@ class DrainTests(IngestTestCase):
         and the next pass ingests them AGAIN — silently, since nothing here carries
         an idempotency key."""
         self.write(_line())
-        real_connect = cp._connect
-        cp._connect = lambda: _FailsOn(real_connect(), "INSERT INTO audit_cursor")
+        real_connect = cp.store._connect
+        cp.store._connect = lambda: _FailsOn(real_connect(), "INSERT INTO audit_cursor")
         try:
             with self.assertRaises(OSError):
-                cp._drain_egress_audit()
+                cp.ingest._drain_egress_audit()
         finally:
-            cp._connect = real_connect
+            cp.store._connect = real_connect
         self.assertEqual(self.rows(), [])
         self.assertIsNone(self.cursor())
         # ...and the retry after recovery ingests it exactly once, not twice.
-        cp._drain_egress_audit()
+        cp.ingest._drain_egress_audit()
         self.assertEqual(len(self.rows()), 1)
 
     def test_partial_trailing_line_waits_for_its_newline(self):
@@ -254,35 +254,35 @@ class DrainTests(IngestTestCase):
         left alone for free. A first version of this test drained both at once and
         so proved nothing."""
         self.write(_line(host="complete.example"))
-        cp._drain_egress_audit()
+        cp.ingest._drain_egress_audit()
         self.assertEqual([r["host"] for r in self.rows()], ["complete.example"])
 
         self.write('{"ts": 1001.0, "dec')                   # mid-append
-        self.assertEqual(cp._drain_egress_audit(), 0)       # consumed nothing
+        self.assertEqual(cp.ingest._drain_egress_audit(), 0)       # consumed nothing
         self.assertEqual(len(self.rows()), 1)
 
         self.write('ision": "deny", "host": "late.example", "central": false}\n')
-        cp._drain_egress_audit()
+        cp.ingest._drain_egress_audit()
         self.assertEqual([r["host"] for r in self.rows()],
                          ["complete.example", "late.example"])
         self.assertEqual(self.cursor()["offset"], os.path.getsize(self.path))
 
     def test_empty_file_is_not_an_error(self):
         self.write("", mode="w")
-        self.assertEqual(cp._drain_egress_audit(), 0)
+        self.assertEqual(cp.ingest._drain_egress_audit(), 0)
 
     def test_missing_file_raises_so_the_loop_can_report_it(self):
         """Swallowed here it would be a permanently silent ingest — the exact
         failure shape this change exists to remove. _audit_drain_loop owns the
         once-per-transition reporting."""
         with self.assertRaises(OSError):
-            cp._drain_egress_audit()
+            cp.ingest._drain_egress_audit()
 
     def test_truncation_in_place_restarts_from_zero(self):
         self.write(_line(host="old.example") * 5)
-        cp._drain_egress_audit()
+        cp.ingest._drain_egress_audit()
         self.write(_line(host="new.example"), mode="w")     # same inode, smaller
-        cp._drain_egress_audit()
+        cp.ingest._drain_egress_audit()
         self.assertEqual([r["host"] for r in self.rows()][-1], "new.example")
         self.assertEqual(self.cursor()["offset"], os.path.getsize(self.path))
 
@@ -292,10 +292,10 @@ class DrainTests(IngestTestCase):
         Without the inode check a fresh file would inherit the old offset and its first
         N bytes — the oldest decisions on it — would never be read."""
         self.write(_line(host="old.example") * 5)
-        cp._drain_egress_audit()
+        cp.ingest._drain_egress_audit()
         old_inode = self.cursor()["inode"]
         self.replace_file(_line(host="rotated.example") * 5)  # new inode, same size
-        cp._drain_egress_audit()
+        cp.ingest._drain_egress_audit()
         self.assertNotEqual(self.cursor()["inode"], old_inode)
         self.assertIn("rotated.example", [r["host"] for r in self.rows()])
 
@@ -305,22 +305,22 @@ class DrainTests(IngestTestCase):
         NOT skipped the instant the fresh active file's new inode is noticed. Losing
         those lines would drop decisions from the record silently, which is the one
         thing an audit trail must never do."""
-        cp.DRAIN_BLOCK = 512
+        cp.ingest.DRAIN_BLOCK = 512
         try:
             self.write(_line(host="early.example") * 40)
-            self.assertGreater(cp._drain_egress_audit(), 0)
+            self.assertGreater(cp.ingest._drain_egress_audit(), 0)
             self.assertLess(len(self.rows()), 40)          # one pass: a real tail left
             self.rotate()                                  # roll the partly-read file
             self.write(_line(host="fresh.example") * 3)    # fresh active, new inode
             for _ in range(60):
-                if cp._drain_egress_audit() == 0:
+                if cp.ingest._drain_egress_audit() == 0:
                     break
             hosts = [r["host"] for r in self.rows()]
             self.assertEqual(hosts.count("early.example"), 40)   # tail not lost
             self.assertEqual(hosts.count("fresh.example"), 3)
             self.assertEqual(hosts[-3:], ["fresh.example"] * 3)  # oldest-first order
         finally:
-            cp.DRAIN_BLOCK = 1 << 20
+            cp.ingest.DRAIN_BLOCK = 1 << 20
 
     def test_multiple_backlogged_siblings_drain_oldest_first(self):
         """Two rollovers before the reader catches up: both siblings and the active
@@ -331,7 +331,7 @@ class DrainTests(IngestTestCase):
         self.rotate()
         self.write(_line(host="gen3.example"))
         for _ in range(10):
-            if cp._drain_egress_audit() == 0:
+            if cp.ingest._drain_egress_audit() == 0:
                 break
         self.assertEqual([r["host"] for r in self.rows()],
                          ["gen1.example", "gen2.example", "gen3.example"])
@@ -346,59 +346,59 @@ class DrainTests(IngestTestCase):
         filesystem may hand the just-freed inode straight back (the allocator luck
         replace_file() exists to sidestep), and then the cursor would 'find' it."""
         self.write(_line(host="ingested.example"))
-        cp._drain_egress_audit()
+        cp.ingest._drain_egress_audit()
         self.assertEqual([r["host"] for r in self.rows()], ["ingested.example"])
-        with cp._connect() as conn:
+        with cp.store._connect() as conn:
             conn.execute("UPDATE audit_cursor SET inode = inode + ? WHERE path = ?",
                          (10 ** 9, self.path))             # an inode nothing owns
             conn.commit()
         self.replace_file(_line(host="afterward.example"))  # the file that took over
-        cp._drain_egress_audit()
+        cp.ingest._drain_egress_audit()
         self.assertIn("cursor lost its file", self.out.getvalue())
         self.assertIn("afterward.example", [r["host"] for r in self.rows()])
 
     def test_malformed_line_does_not_wedge_the_cursor(self):
         self.write("{not json\n" + _line(host="after.example"))
-        cp._drain_egress_audit()
+        cp.ingest._drain_egress_audit()
         self.assertEqual([r["host"] for r in self.rows()], ["after.example"])
         self.assertEqual(self.cursor()["offset"], os.path.getsize(self.path))
 
     def test_oversized_line_is_skipped_rather_than_stalling_the_tail(self):
         """One unbounded record must not stop every later decision from arriving."""
-        cp.DRAIN_BLOCK = 512
+        cp.ingest.DRAIN_BLOCK = 512
         try:
             self.write(json.dumps({"ts": 1.0, "decision": "deny",
                                    "host": "x" * 4000, "central": False}) + "\n")
             self.write(_line(host="after.example"))
             for _ in range(20):
-                if cp._drain_egress_audit() == 0:
+                if cp.ingest._drain_egress_audit() == 0:
                     break
             self.assertEqual([r["host"] for r in self.rows()], ["after.example"])
         finally:
-            cp.DRAIN_BLOCK = 1 << 20
+            cp.ingest.DRAIN_BLOCK = 1 << 20
 
     def test_ingested_rows_are_mirrored_to_the_live_log(self):
         """`make logs-cp` is described as a live feed of decisions. An ingested row
         IS a decision, so it belongs there — marked, because it arrives late and out
         of order relative to the lines around it."""
         self.write(_line(host="fronted.example"))
-        cp._drain_egress_audit()
+        cp.ingest._drain_egress_audit()
         mirrored = self.out.getvalue()
         self.assertIn("fronted.example", mirrored)
         self.assertIn("(ingested)", mirrored)
 
     def test_backlog_larger_than_one_block_drains_over_passes(self):
-        cp.DRAIN_BLOCK = 512
+        cp.ingest.DRAIN_BLOCK = 512
         try:
             self.write(_line(host="a.example") * 40)
             passes = 0
-            while cp._drain_egress_audit() > 0:
+            while cp.ingest._drain_egress_audit() > 0:
                 passes += 1
             self.assertGreater(passes, 1)          # genuinely multi-block
             self.assertEqual(len(self.rows()), 40)
             self.assertEqual(self.cursor()["offset"], os.path.getsize(self.path))
         finally:
-            cp.DRAIN_BLOCK = 1 << 20
+            cp.ingest.DRAIN_BLOCK = 1 << 20
 
 
 if __name__ == "__main__":

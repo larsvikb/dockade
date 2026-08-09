@@ -19,7 +19,16 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # App + the policy seed (loaded into SQLite on first boot). The approval UI is
 # served by the separate control-plane-ui frontend, not from here.
+#
+# app.py imports its siblings by plain name, which resolves because WORKDIR is
+# their directory and `python app.py` puts it first on sys.path. Copied one by
+# one rather than as a directory so an added module is a deliberate line here
+# (and so the build context can never smuggle in a stray file next to them).
 COPY control-plane/app.py ./app.py
+COPY control-plane/store.py ./store.py
+COPY control-plane/policy.py ./policy.py
+COPY control-plane/holds.py ./holds.py
+COPY control-plane/ingest.py ./ingest.py
 COPY policies/egress-allowlist.txt /etc/control-plane/egress-allowlist.txt
 
 # The SQLite store lives here; a named volume mounts over it for persistence

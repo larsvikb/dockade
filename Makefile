@@ -70,7 +70,9 @@ DOCKERFILES := claude-sandbox/Dockerfile opencode-sandbox/Dockerfile \
 YAMLFILES := docker-compose.yml .hadolint.yaml .yamllint \
              $(wildcard .github/workflows/*.yml)
 JSONFILES := $(shell git ls-files '*.json' 2>/dev/null)
-PYFILES := proxies/egress/addon.py control-plane/app.py control-plane-ui/app.py
+PYFILES := proxies/egress/addon.py control-plane-ui/app.py \
+           control-plane/app.py control-plane/store.py control-plane/policy.py \
+           control-plane/holds.py control-plane/ingest.py
 # Dependency-free unit tests for the governance-critical decision logic. Kept
 # separate from PYFILES so they can be linted with the app code but discovered
 # and run on their own (python -m unittest, no pip installs — see tests/).
@@ -89,6 +91,10 @@ REFFILES := $(SCRIPTS) \
             opencode-sandbox/dotfiles/.bashrc.tier \
             proxies/egress/addon.py \
             control-plane/app.py \
+            control-plane/store.py \
+            control-plane/policy.py \
+            control-plane/holds.py \
+            control-plane/ingest.py \
             control-plane/requirements.txt \
             control-plane-ui/app.py \
             control-plane-ui/requirements.txt \

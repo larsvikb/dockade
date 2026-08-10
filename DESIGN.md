@@ -1796,9 +1796,13 @@ flag converts one into either a loud failure or a bounded cost. Measurements and
   Presents as the model becoming inexplicably confused rather than as an error.
 - **`-c 32768`, and the client's `limit.context` must be materially SMALLER** — a ratio
   guarded by `make consistency` (`CTX_HEADROOM`). 8k is not merely tight but unusable —
-  opencode's base prompt exceeds it before the first user turn — and 64k does not fit the
-  shared memory pool. Avoid `-c 0`, which would size the allocation from the model's
-  native window.
+  opencode's base prompt exceeds it before the first user turn. The upper bound is **not**
+  the memory pool, which has room to spare; it is that cold-load time grows with `-c`
+  until the load outruns the healthcheck's `start_period`, at which point the service
+  works and reports unhealthy and the tier-2 launcher refuses to run in front of it. So
+  the two knobs move together, and the constraint is a *liveness* one rather than a
+  capacity one (figures in `NOTES.md`). Avoid `-c 0`, which would size the allocation
+  from the model's native window.
 
   The headroom is the part that is not obvious, and the repo learned it by getting it
   wrong: the guard originally required the two numbers to be **equal**, on the reasoning
@@ -1816,6 +1820,32 @@ than model choice does: decode is memory-bandwidth-bound while prefill is comput
 (a ~10x asymmetry, so this machine is good at prompt-heavy short-output work and bad at
 long-form generation), and **a healthy container is not evidence of acceleration** —
 llama.cpp falls back to CPU silently and the health check still returns 200.
+
+### What the local model is for
+
+The asymmetry above is a role constraint rather than a tuning detail: this model is fast
+at reading and slow at writing, so its work is **large input, small output, with a human
+or a deterministic gate on the far side.** Two shapes qualify. Offline questions, asked
+in a session where every answer is read before it is acted on — which needs no governance
+because nothing is produced and nothing leaves. And narrow reduction over local data:
+select, classify, rank, deduplicate, or check a supplied claim against a supplied file,
+where the output is a pointer or a label rather than prose.
+
+What it is not for is agent work, or anything that becomes an artifact of record. Its
+failure mode compounds the hardware's: it is reliable about text it was given and
+fabricates about text it was not (`NOTES.md`), so any output asserting that something is
+*absent* — a prose summary included, since "here is what mattered" implies nothing else
+did — cannot be trusted without reading the input it was supposed to replace. The test a
+candidate task must pass is whether its output can be spot-checked more cheaply than it
+can be produced.
+
+Two things follow. Tier 2 is sized for a long conversation rather than an agent run,
+because the harness fixed cost is paid once per session and the prompt cache carries the
+rest. And the local model's real advantage is not that it is cheap — a frontier model
+through the governed proxy is better and faster at nearly everything — but that it is
+**confined**: it is the only inference here that can read data which must not leave the
+host, and the only one that works with no egress at all. Candidate tasks should be chosen
+for that property, not for token cost.
 
 ### Why tier-1 Claude cannot reach it — deliberately
 

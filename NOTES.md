@@ -203,6 +203,12 @@ offset is what makes that assertable.
 Decisions these numbers produced are in DESIGN.md → "Local inference"; this is the
 evidence.
 
+**Every figure below comes from one host** — an Intel Arc 140V (Lunar Lake, Xe2) iGPU
+with ~16.9 GB of shared memory, under WSL2 on Windows, with Docker installed natively in
+WSL rather than Docker Desktop. That is n=1, so treat these as calibration for this class
+of hardware rather than as benchmarks, and add a second host as further rows rather than
+as a correction to these.
+
 | Workload | Result |
 | --- | --- |
 | Decode, 4B Q4_K_M | ~30 tok/s |
@@ -258,13 +264,12 @@ costs nothing here.
   deterministically and giving the model only the genuinely fuzzy ones.
 - **Use `temperature: 0`** for extraction and classification. The server default
   is non-deterministic and buys nothing on these tasks.
-- **32k context is the working ceiling, and agents need most of it.** ~4.6 GB of
-  f16 KV on top of ~5.5 GB of weights fits the ~16.9 GB shared pool with headroom;
-  64k does not. 8k is not merely tight but unusable for an agent harness —
-  opencode's base prompt (system + tool schemas) exceeds it before the first user
-  turn — measured at **~8.6k tokens**, so 26% of a 32k window is gone before the
-  agent does anything. Avoid `-c 0` (load from model), which would size the
-  allocation from the model's native window.
+- **The context floor is the consumer, not the hardware.** 8k is not merely tight but
+  unusable for an agent harness — opencode's base prompt (system + tool schemas)
+  exceeds it before the first user turn, measured at **~8.6k tokens**, so 26% of a
+  32k window is gone before the agent does anything. The *upper* bound is not memory —
+  see "Measuring shared-memory use" below. Avoid `-c 0` (load from model), which would
+  size the allocation from the model's native window.
 - **A client told the true window still overshoots it.** This is the one that cost
   real agent runs. `-c 32768` on the server and `limit.context: 32768` in
   opencode.json agreed exactly, and the server still rejected three requests across
@@ -310,6 +315,52 @@ costs nothing here.
   destination. Adding a key would protect nothing that reachability does not
   already protect.
 
+### Measuring shared-memory use
+
+There is no instrument on the Linux side. `xpu-smi` and `intel_gpu_top` want a
+`/dev/dri` node and i915 debugfs, neither of which exists under WSL2; sysman is absent
+(above), so llama.cpp cannot report free memory; and this build prints **no buffer-size
+lines at all** — between `load_model: loading model` and `model loaded` the log carries
+nothing but the sysman warning repeated eleven times, at every `-c` tried. What works is
+a host-side Windows counter, read on the Arc's own adapter instance (the other instances
+are the Basic Render Driver and never move):
+
+    Get-Counter '\GPU Adapter Memory(*)\Shared Usage'
+
+Qwen3.5-9B-Q4_K_M, 5.29 GiB on disk, `--parallel 1`, sampled *after* `/health` returns
+200:
+
+| `-c` | shared usage | above idle | cold load |
+| --- | --- | --- | --- |
+| — (idle) | 1.27 GiB | — | — |
+| 32768 | 7.51 GiB | 6.24 GiB | 87.9 s |
+| 49152 | 8.70 GiB | 7.43 GiB | 162.9 s |
+
+**Sample only after the health check passes**, or the number is meaningless: mid-load
+readings sit ~90–110 MiB above idle, because the weights reach the device late.
+
+**Marginal KV cost is 78 KB/token** (1.19 GiB for 16,384 tokens), which differences out
+the weights, the compute buffers and the driver's baseline, and is the figure to use for
+"can I afford more window". Treat the per-token total as bracketed rather than pinned:
+at 78 KB/token the KV for 32768 tokens would already exceed the whole 6.24 GiB measured
+at that setting, so the two rows do not reconcile under a single linear model and the
+32k row is the suspect one. Somewhere between 50 and 78 KB/token, and a third data point
+would settle it.
+
+**Cold-load time grows with `-c`** — 75 s for 1.19 GiB, so roughly **63 s per GiB**
+allocated, presumably the driver committing and zeroing shared memory through the
+paravirtual D3D12 path. This is what makes the ceiling a liveness problem:
+
+- **Memory** would allow ~125k tokens (pool, less idle, less weights, at 78 KB/token).
+- **The healthcheck's 300 s `start_period`** is exceeded around ~78k, and past that the
+  server works while reporting unhealthy — which `run-opencode-sandbox.sh` treats as
+  fatal. So `start_period` and `-c` have to move together.
+
+The binding constraint is therefore the health gate, at roughly 60% of the memory
+ceiling. The earlier reading here — that 32768 fits and 64k does not — was two health
+checks taken about two minutes into what is a nearly four-minute load; 49152 loads and
+serves, and nothing was ever short of memory.
+
 ### Tier 2 end to end, measured
 
 One `opencode run` turn in a live tier-2 sandbox — write a file, read it back, run
@@ -334,6 +385,36 @@ And a caution about the output rather than the plumbing: the model reported "2 b
 newline. The tool calls were right and the arithmetic narrating them was wrong,
 which is the same lesson as constrained decoding above — verify the artifact, not
 the prose about it.
+
+### It is reliable on presence and fabricates absence
+
+Asked to review this repository and propose improvements, the local model produced a
+document whose errors all pointed the same way. Everything it got right was a
+*presence* claim about text it had actually read — its three "critical" security
+findings were transcriptions of `SECURITY.md` → "Known open findings", down to the
+remediation wording, including the one that section says restating is duplicate work.
+Everything it got wrong was an *absence* claim about the parts it had not read: no type
+hints (the modules are annotated), no contribution guidelines (`CONTRIBUTING.md`), no
+logging config (the egress addon configures a rotating JSON logger), no health
+endpoints, no compose profiles, no security headers (the UI already sends CSP,
+`x-frame-options`, `nosniff` and `referrer-policy`). Every code snippet it offered
+called an API that does not exist — three invented functions on `store.py`, which
+defines five. Its own summary table miscounted three of four rows while the total came
+out right, the same signature as the 2-byte file above.
+
+The asymmetry is structural, not a prompting defect: asserting absence requires
+exhaustive search, and a model that read part of a repo will generalise to the whole.
+Three consequences for task design, the last of which decides what is worth offloading:
+
+- **Never ask it what is missing.** Supply the evidence in the prompt and ask for a
+  judgement about that evidence only.
+- **A prose summary is an absence claim in disguise** — "here is what mattered" implies
+  nothing else did, and the errors are omissions, which are invisible without reading
+  the source. Reduce large input to a *pointer or a label* (line numbers, IDs, one of k
+  classes) so the output can be checked against ground truth in seconds. Summaries are
+  fine when their job is to send a human to the source, and unsafe when they replace it.
+- **Acceptance test before offloading anything:** can the output be spot-checked more
+  cheaply than producing it? Reviewing that document took longer than generating it did.
 
 ## Accelerator ecosystem survey
 

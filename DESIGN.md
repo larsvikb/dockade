@@ -377,7 +377,7 @@ single-container image and launcher centered on this design. Notable properties:
   both) and host-uid matching behave identically, verified by a build +
   `boundary-check.sh` pass on the Debian base. The Ubuntu LTS+ESM support window is
   the one trade-off, minor under rebuild-to-update.
-- Baseline stack: **Node current LTS (24.x)** + `gh` + pipx, plus baked linters
+- Baseline stack: **Node current LTS (24.x)** + pipx, plus baked linters
   (shellcheck / hadolint / ruff / yamllint, all self-contained so they run under
   default-deny egress). Node tracks the latest LTS line (even majors); bump the NodeSource
   `setup_NN.x` major to move it. Firewall allowlist trimmed to this design

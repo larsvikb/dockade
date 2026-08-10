@@ -42,6 +42,35 @@ or fails on allocator luck. Write to a sibling path and `os.replace()` it over t
 target instead: the new file's inode is allocated while the old one is still linked, so
 it is guaranteed to differ.
 
+## Claude Code reads a managed `CLAUDE.md` even where it ignores managed settings
+
+The two managed tiers do not behave alike, and the asymmetry is easy to walk into.
+
+Under org auth, a local `managed-settings.json` is ignored entirely — the org's
+remote managed source is the sole managed *settings* tier (verified separately; the
+consequence for this repo is in DESIGN.md). A local managed **`CLAUDE.md`** is not
+ignored. Dropping one in `/etc/claude-code` and running `/context` lists it:
+
+| Type | Path |
+| --- | --- |
+| Managed | `/etc/claude-code/CLAUDE.md` |
+| User | `$CLAUDE_CONFIG_DIR/CLAUDE.md` |
+| Project | `<repo>/CLAUDE.md` |
+
+So `/etc/claude-code` being the natural place to bake a *template* collides with it
+also being a place Claude Code *looks*: the baked copy and the installed copy both
+load, and identical text enters context twice. `user-settings.json` never had this
+problem only because settings are not discovered by that filename.
+
+Two things follow. Any file baked into a managed directory as a source-of-truth
+copy needs a name Claude Code does not look for — `.template` is enough. And
+"managed settings are inert here" must not be generalised to "managed anything is
+inert here"; the memory tier is live.
+
+Also confirmed while establishing this: with `CLAUDE_CONFIG_DIR` set, user-scope
+memory follows it (`/config/CLAUDE.md`, not `~/.claude/CLAUDE.md`), and `~/.claude`
+holds only a downloads cache.
+
 ## Publishing a host port: the private range is the wrong instinct on WSL2
 
 Choosing a port for Docker to publish on the host, the principled-looking answer is

@@ -29,13 +29,15 @@ RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# GitHub CLI (git push / PR workflows)
-RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-      -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
-    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-      > /etc/apt/sources.list.d/github-cli.list \
-    && apt-get update && apt-get install -y --no-install-recommends gh \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
+# NB: no GitHub CLI. `gh` refuses to run at all without a token — not merely
+# degraded but "please run gh auth login" on every invocation, including read-only
+# public API calls — and a write-capable token is precisely what the credential
+# invariant keeps out of this container. So it was capability theatre: an apt
+# repo, a keyring and a build-time dependency on cli.github.com, in exchange for
+# a binary that cannot do anything. Public GitHub reads go through WebFetch
+# (governed and audited); anything authenticated belongs on the host until the
+# governed git path exists. Reinstate it WITH a scoped token behind the proxy at
+# that point, not before.
 
 # hadolint — Dockerfile linter. Single static binary with no runtime deps, so it
 # works under the sandbox's default-deny egress (nothing to fetch at run time).
@@ -174,12 +176,20 @@ COPY claude-sandbox/dotfiles/.bashrc.tier /home/$USERNAME/.bashrc.tier
 # hadolint ignore=DL3002
 USER root
 COPY claude-sandbox/user-settings.json /etc/claude-code/user-settings.json
+# NOT named CLAUDE.md at this path. /etc/claude-code is a MANAGED source, and
+# Claude Code discovers a CLAUDE.md there and loads it as managed memory — so the
+# baked template got read in its own right, alongside the copy tier-setup.sh
+# installs, and the same text entered context twice. Note the asymmetry with the
+# managed-settings note above: a local managed *settings* file is ignored under
+# org auth, a local managed *CLAUDE.md* is not. `.template` keeps this file inert
+# until tier-setup.sh puts it where it belongs (user scope). See NOTES.md.
+COPY claude-sandbox/CLAUDE.md /etc/claude-code/CLAUDE.md.template
 COPY claude-sandbox/statusline.sh /etc/claude-code/statusline.sh
 COPY claude-sandbox/tier-setup.sh /usr/local/bin/tier-setup.sh
 COPY sandbox-common/init-firewall.sh /usr/local/bin/init-firewall.sh
 COPY sandbox-common/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY sandbox-common/boundary-check.sh /usr/local/bin/boundary-check.sh
-RUN chmod 0644 /etc/claude-code/user-settings.json \
+RUN chmod 0644 /etc/claude-code/user-settings.json /etc/claude-code/CLAUDE.md.template \
     && chmod 0755 /etc/claude-code/statusline.sh \
     && chmod 0755 /usr/local/bin/init-firewall.sh /usr/local/bin/entrypoint.sh \
                   /usr/local/bin/boundary-check.sh /usr/local/bin/tier-setup.sh \

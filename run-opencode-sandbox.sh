@@ -118,6 +118,7 @@ sc_wait_healthy "$LLM_NAME" \
 
 sc_alloc_container_name "${SANDBOX_NAME:-opencode-sandbox}"
 sc_git_identity
+sc_host_timezone
 
 echo "Sandbox:   $SC_CONTAINER_NAME (tier 2 — opencode, local model)"
 echo "Workspace: $WORKSPACE -> /workspace"
@@ -163,7 +164,7 @@ docker run -it --rm \
     -v "$CONFIG_VOLUME":/config \
     \
     -e "TERM=${TERM:-xterm-256color}" \
-    -e "TZ=${TZ:-UTC}" \
+    -e "TZ=$SC_TZ" \
     -e "SANDBOX_MODE=local" \
     -e "LLM_IP=$LLM_IP" \
     -e "LLM_PORT=$LLM_PORT" \

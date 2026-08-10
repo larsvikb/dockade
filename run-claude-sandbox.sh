@@ -166,6 +166,7 @@ fi
 sc_alloc_container_name "${SANDBOX_NAME:-claude-sandbox}"
 sc_git_identity
 sc_upstream_dns
+sc_host_timezone
 
 echo "Sandbox:   $SC_CONTAINER_NAME (tier 1 — Claude)"
 echo "Workspace: $WORKSPACE -> /workspace"
@@ -252,7 +253,7 @@ docker run "${RUN_MODE_ARGS[@]}" \
     -v "$CONFIG_VOLUME":/config \
     \
     -e "TERM=${TERM:-xterm-256color}" \
-    -e "TZ=${TZ:-UTC}" \
+    -e "TZ=$SC_TZ" \
     -e "UPSTREAM_DNS=$SC_UPSTREAM_DNS" \
     ${PROXY_ENV_ARGS[@]+"${PROXY_ENV_ARGS[@]}"} \
     ${SC_GIT_ID_ARGS[@]+"${SC_GIT_ID_ARGS[@]}"} \

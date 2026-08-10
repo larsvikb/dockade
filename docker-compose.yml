@@ -441,10 +441,11 @@ services:
       # interface to enable. Kept anyway: harmless here, and correct on the native
       # Linux paths where the query does exist.
       #
-      # The consequence is the reason `-c` is hand-sized below rather than trusted
-      # to fit: llama.cpp is planning allocations against TOTAL shared memory as
-      # though all of it were free, so it cannot warn about an overshoot. On this
-      # host, 32768 fits and 64k does not, and only measurement establishes that.
+      # The consequence is that llama.cpp plans allocations against TOTAL shared
+      # memory as though all of it were free, so it cannot warn about an overshoot
+      # and the log reports no buffer sizes to check it against. Shared-memory use
+      # therefore has to be measured from the HOST side; see NOTES.md → "Measuring
+      # shared-memory use" for the counter and the figures it gives.
       ZES_ENABLE_SYSMAN: "1"
     # Prepend the WSL driver dir to the image's OWN LD_LIBRARY_PATH (which points
     # at its oneAPI libs) — replacing it instead of prepending breaks the runtime
@@ -471,11 +472,16 @@ services:
     # restore thinking, and bound it with --reasoning-budget N (a hard token cap)
     # rather than leaving it unrestricted. See DESIGN.md "Local inference".
     #
-    # -c 32768 is sized for AGENT harnesses: opencode's base prompt (system + tool
-    # schemas) alone exceeds 8k, so a smaller window fails before the first user
-    # turn. 32k costs ~4.6 GB of KV on top of ~5.5 GB of weights — fits the ~16.9 GB
-    # shared pool with headroom; 64k does not. Do NOT use -c 0 (load from model):
-    # this model's native window would try to allocate far past the pool.
+    # -c 32768 has a floor and a ceiling, and neither is where it looks. The floor is
+    # the consumer: opencode's base prompt (system + tool schemas) alone exceeds 8k,
+    # so a smaller window fails before the first user turn. The ceiling is NOT the
+    # memory pool — measured, 32768 costs well under half of it and larger windows fit
+    # (NOTES.md → "Measuring shared-memory use"). What binds is that cold-load time
+    # grows with -c, and past roughly 78k the load outruns the healthcheck's
+    # start_period below, so the container serves fine while reporting unhealthy and
+    # run-opencode-sandbox.sh refuses to launch in front of it. Raising -c therefore
+    # means raising start_period too. Do NOT use -c 0 (load from model): this model's
+    # native window would size the allocation far past the pool.
     # --no-context-shift makes overflow a visible error instead of silently
     # discarding the oldest tokens — for an agent that means a failed request
     # rather than a corrupted conversation with its system prompt evicted. Earned

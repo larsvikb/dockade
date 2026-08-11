@@ -84,6 +84,7 @@ REFFILES := $(SCRIPTS) \
             claude-sandbox/user-settings.json \
             claude-sandbox/CLAUDE.md \
             opencode-sandbox/opencode.json \
+            opencode-sandbox/AGENTS.md \
             sandbox-common/dotfiles/.bashrc \
             sandbox-common/dotfiles/.vimrc \
             sandbox-common/dotfiles/.inputrc \

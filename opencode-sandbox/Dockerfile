@@ -20,12 +20,12 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 #   - no egress at runtime, governed or otherwise. Its only permitted
 #     destination is the inference service (enforced by init-firewall.sh's
 #     LOCAL mode, not by config);
-#   - correspondingly no gh/GitHub CLI and no upstream DNS.
+#   - correspondingly no upstream DNS.
 #
 # Everything opencode needs at runtime is therefore baked at BUILD time, where
 # egress is unrestricted (the firewall only arms at container start).
 
-# Baseline. Leaner than tier 1 where the omission is principled: no gh and no
+# Baseline. Leaner than tier 1 where the omission is principled: no
 # openssh-client (with no egress there is no git remote to reach), no
 # build-essential, no hadolint/shellcheck (this tier evaluates the local model,
 # it does not lint this repo). iptables/ipset/dnsutils are required by the shared

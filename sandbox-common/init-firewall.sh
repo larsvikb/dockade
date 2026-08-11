@@ -171,7 +171,7 @@ else
         return 0
     }
 
-    # GitHub IP ranges (dynamic) — git clone/pull/push, gh, API.
+    # GitHub IP ranges (dynamic) — git clone/pull and the API.
     # TRANSITIONAL: belongs behind the governed git path in the target design;
     # whitelisted here only until that data plane exists.
     echo "Fetching GitHub IP ranges..."

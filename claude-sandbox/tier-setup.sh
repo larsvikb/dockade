@@ -29,3 +29,20 @@ CONFIG_DIR="${SANDBOX_CONFIG_DIR:-${CLAUDE_CONFIG_DIR:-/config}}"
 install -o "$USERNAME" -g "$USERNAME" -m 0644 \
     /etc/claude-code/user-settings.json \
     "$CONFIG_DIR/settings.json"
+
+# User-scope CLAUDE.md, on the same terms and for the same reasons as the
+# settings above: baked in the image, overwritten every boot, transient if the
+# agent edits it. Its content is the container's CAPABILITY facts — no egress but
+# the proxy, no push, no docker, /workspace shared with the host — which the agent
+# otherwise rediscovers one failed command at a time. Enablement, not enforcement:
+# an agent that ignores the file is stopped by the firewall exactly as before.
+# Deliberately says nothing about how to work in the repo; that is the repo's own
+# CLAUDE.md, which travels with the checkout and is loaded alongside this.
+#
+# The source is `.template` on purpose — /etc/claude-code is a managed source and
+# a CLAUDE.md sitting there is loaded as managed memory in its own right, which
+# put the same text in context twice. The extension is what keeps the baked copy
+# inert. See the Dockerfile comment and NOTES.md.
+install -o "$USERNAME" -g "$USERNAME" -m 0644 \
+    /etc/claude-code/CLAUDE.md.template \
+    "$CONFIG_DIR/CLAUDE.md"

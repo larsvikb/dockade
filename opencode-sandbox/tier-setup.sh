@@ -35,6 +35,21 @@ install -o "$USERNAME" -g "$USERNAME" -m 0644 \
     /etc/opencode/opencode.json \
     "$CONFIG_DIR/opencode/opencode.json"
 
+# AGENTS.md beside it, on the same terms. This is opencode's instruction file:
+# core/src/instruction-context.ts reads `join(global.config, "AGENTS.md")` and then
+# walks the project tree, so the global config dir — symlinked below — is where a
+# container-wide one belongs. There is no `instructions` key in opencode.json to
+# point at instead; the file IS the mechanism.
+#
+# Content is this tier's CAPABILITY facts, and deliberately NOT a copy of tier 1's
+# CLAUDE.md: that file's longest bullet describes the governed proxy, and this tier
+# has neither a proxy nor egress. Shorter, too, and for a reason beyond taste — the
+# window here is 32k with a base prompt already taking a quarter of it, so
+# instructions cost roughly thirty times what they cost in tier 1.
+install -o "$USERNAME" -g "$USERNAME" -m 0644 \
+    /etc/opencode/AGENTS.md.template \
+    "$CONFIG_DIR/opencode/AGENTS.md"
+
 # opencode reads its user-scope config from ~/.config/opencode (the XDG default;
 # nothing here overrides it). Symlink that at the persistent volume so session
 # state survives container churn, and so the config above is the one it loads.

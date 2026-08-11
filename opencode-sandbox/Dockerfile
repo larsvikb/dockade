@@ -131,6 +131,14 @@ RUN npm install -g "opencode-ai@${OPENCODE_VERSION}" \
 USER root
 COPY opencode-sandbox/tier-setup.sh /usr/local/bin/tier-setup.sh
 COPY opencode-sandbox/opencode.json /etc/opencode/opencode.json
+# `.template`, though /etc/opencode is verifiably NOT one of opencode's search
+# paths: instruction-context.ts looks in the global config dir and walks the
+# project tree, nothing else. The extension is here because tier 1 learned that
+# baking a file under the name a tool globs for is a class of error (a CLAUDE.md
+# parked in a managed dir got loaded in its own right — see NOTES.md), and this
+# costs nothing while making the baked copy inert whatever search paths appear
+# later. tier-setup.sh installs it where opencode does look.
+COPY opencode-sandbox/AGENTS.md /etc/opencode/AGENTS.md.template
 COPY sandbox-common/init-firewall.sh /usr/local/bin/init-firewall.sh
 COPY sandbox-common/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY sandbox-common/boundary-check.sh /usr/local/bin/boundary-check.sh
@@ -139,7 +147,7 @@ COPY sandbox-common/boundary-check.sh /usr/local/bin/boundary-check.sh
 COPY sandbox-common/dotfiles/.bashrc sandbox-common/dotfiles/.vimrc \
      sandbox-common/dotfiles/.inputrc sandbox-common/dotfiles/.gitconfig /home/$USERNAME/
 COPY opencode-sandbox/dotfiles/.bashrc.tier /home/$USERNAME/.bashrc.tier
-RUN chmod 0644 /etc/opencode/opencode.json \
+RUN chmod 0644 /etc/opencode/opencode.json /etc/opencode/AGENTS.md.template \
     && chmod 0755 /usr/local/bin/init-firewall.sh /usr/local/bin/entrypoint.sh \
                   /usr/local/bin/boundary-check.sh /usr/local/bin/tier-setup.sh \
     && chown $USERNAME:$USERNAME /home/$USERNAME/.bashrc /home/$USERNAME/.bashrc.tier \

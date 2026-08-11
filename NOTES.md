@@ -399,6 +399,7 @@ One `opencode run` turn in a live tier-2 sandbox — write a file, read it back,
 | --- | --- | --- |
 | Session/title request | 574 prompt | 4.9 s prefill |
 | First turn (base prompt + task) | 8635 prompt, 44 out | 36 s prefill (~240 tok/s), 13 tok/s decode |
+| First turn, after the tool prune | 7138 prompt, 10 out | 30.9 s prefill (231 tok/s), 13.7 tok/s decode |
 | After the write-tool result | 23 new | 3.7 s |
 | After the bash-tool result | 27 new | 2.5 s |
 
@@ -414,6 +415,56 @@ And a caution about the output rather than the plumbing: the model reported "2 b
 newline. The tool calls were right and the arithmetic narrating them was wrong,
 which is the same lesson as constrained decoding above — verify the artifact, not
 the prose about it.
+
+### What opencode's 8.6k base prompt is made of, and which parts are configurable
+
+Read from opencode's source at the version the image installs. Sizes below are
+**characters** of the prompt text on disk — `chars/4` is the rough bridge to tokens, and
+the measured result is at the end of this section.
+
+- **The system prompt is a quarter of it, not half.** `SystemPrompt.provider()` picks a
+  prompt file by substring-matching the model id — `gpt`, `gemini-`, `claude`, `kimi`,
+  `trinity`, `muse`. The id here is `local`, which matches nothing, so tier 2 gets
+  `prompt/default.txt`: **8,528 chars**, call it ~2.1k tokens.
+- **Tool descriptions are the largest part.** `tool/*.txt` plus `shell.txt` total
+  **16,342 chars**, ~4.1k tokens, before the JSON parameter schemas that accompany them.
+  The five with no capability behind them in a no-egress tier — webfetch, websearch,
+  task, lsp, todowrite — are 7,403 of those characters.
+- **An agent's `prompt` REPLACES the built-in rather than appending to it.**
+  `session/llm/request.ts`: `input.agent.prompt ? [input.agent.prompt] :
+  SystemPrompt.provider(input.model)`. Worth knowing before writing one.
+- **A `false` in the top-level `tools` map removes the schema from the request**, via a
+  deny rule that `Permission.visibleTools` applies while assembling it. But `write` and
+  `patch` normalize to the `edit` permission, shared by `edit`, `write` and
+  `apply_patch`, so those three can only be disabled together.
+- **The config format is mid-migration and the two halves disagree on names.** What
+  `opencode.json` validates against — the published schema its `$schema` pins — uses
+  `agent`, `prompt`, `permission`, `disable`, `tools`. The internal v2 shape
+  (`ConfigV2.Agent`) uses `agents`, `system`, `permissions`, `disabled`. A v2 key written
+  into today's config is silently inert, which is the failure mode to expect from
+  reading the TypeScript instead of the schema.
+- **Instruction files: first match wins at each level, and they do not stack.** Global is
+  `$XDG_CONFIG/opencode/AGENTS.md`, else `~/.claude/CLAUDE.md`. Project is `AGENTS.md`,
+  else `CLAUDE.md`, else `CONTEXT.md`, walking up from the working directory. A global
+  file and a project file both load; two candidates at the same level do not. The
+  top-level `instructions` array adds more, resolving absolute paths, `~/`, globs, and
+  http(s) URLs — the last fetched with a 5s timeout, so a URL entry in a no-egress tier
+  is a guaranteed 5s stall.
+- **opencode parses the file as JSONC**, so comments would load fine — but this repo's
+  `make consistency` reads it with Python's `json.load`, which would not.
+
+**Measured, after disabling the five and adding a global AGENTS.md.** First-turn prompt
+fell from **8,635 to 7,138 tokens**, prefill from 36 s to 30.9 s. Same instrument
+(llama-server's `prompt eval time` line), same hardware: 230.8 tok/s prefill against
+~240, and decode 13.7 against 13, so the whole gain is tokens rather than speed. The
+session/title request was unchanged at 553.
+
+Two things that reading does *not* establish. The two changes were made in one step, so
+the tool saving and the AGENTS.md cost are not separated — the prediction was ~1.85k out
+and ~420 back in, which brackets the observed −1,497 but does not confirm either term.
+And the image installs `opencode-ai@latest`, so the two readings are not guaranteed to be
+the same opencode version; the base prompt can move upstream between them without
+anything failing. A pinned version is what would make this a controlled comparison.
 
 ### It is reliable on presence and fabricates absence
 

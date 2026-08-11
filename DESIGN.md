@@ -1944,6 +1944,17 @@ and a rewritten `baseURL` buys nothing, because the firewall permits exactly one
 destination — pointing opencode elsewhere yields a rejected connection, not egress.
 That is the "capability, not configuration" split in miniature.
 
+**The harness's prompt budget is trimmed by capability, not by taste.** On a 24k
+window the base prompt is a quarter of it and tool descriptions are its largest
+part (decomposition in `NOTES.md`), so `opencode.json` disables the tools this
+tier has no capability behind — the rationale is in `tier-setup.sh`, beside the
+list. The system prompt is deliberately left as upstream ships it. Replacing it
+is supported and would save more, but this tier earns its keep partly as a
+harness we do **not** control, and that property is protocol-level — a client
+that cannot send `chat_template_kwargs`, per the paragraph below. Withholding
+tools that do not exist here does not touch it; authoring the agent's own system
+prompt starts to.
+
 **Why the server sets the reasoning default.** opencode cannot send
 `chat_template_kwargs` per request, so with llama-server's default (`--reasoning
 auto` → on) every turn paid the full thinking cost — the observed "somewhat slow"

@@ -343,3 +343,57 @@ sc_clamp_cpus() {
         SC_CPUS="$available"
     fi
 }
+
+# ---------------------------------------------------------------------------
+# Host time zone
+# ---------------------------------------------------------------------------
+# sc_host_timezone   -> sets SC_TZ
+#
+# Both launchers pass -e TZ so a timestamp inside the container means what the
+# human reading it expects. They used to pass `${TZ:-UTC}`, which is correct on a
+# host that exports TZ and wrong on the one this repo is developed on: WSL2 never
+# exports it. It carries the zone in /etc/localtime instead — a symlink into
+# zoneinfo that WSL keeps in step with Windows — so the fallback fired on every
+# launch and the container ran UTC while the host read CEST. Nothing broke; every
+# container timestamp simply had to be offset by hand before it could be compared
+# with anything from the host, which is a tax paid silently and forever.
+#
+# Detection order is most-explicit-first. An exported TZ still wins, so an
+# operator keeps the override. Then /etc/timezone, which is a bare zone name on
+# Debian and Ubuntu. Then the /etc/localtime symlink, the WSL case and the only
+# one needing the zoneinfo prefix stripped. UTC last, the honest answer when the
+# host says nothing.
+#
+# Deliberately NOT `timedatectl`: it is the tidy answer and it needs systemd,
+# which this launcher has already been bitten by once on hosts without
+# systemd-resolved. A file read and a readlink work everywhere.
+#
+# Only ever a zone NAME, passed as an env var — no host path is mounted to
+# achieve it, so "never give the sandbox a direct path to anything" is untouched.
+# And a name the image's tzdata does not carry degrades to UTC inside glibc, which
+# is where this started, so a bad guess costs nothing.
+# shellcheck disable=SC2034  # SC_TZ is consumed by the sourcing launcher, not here
+sc_host_timezone() {
+    SC_TZ="UTC"
+
+    if [ -n "${TZ:-}" ]; then
+        SC_TZ="$TZ"
+        return 0
+    fi
+
+    local zone
+    if [ -r /etc/timezone ]; then
+        zone="$(tr -d '[:space:]' < /etc/timezone)"
+        if [ -n "$zone" ]; then
+            SC_TZ="$zone"
+            return 0
+        fi
+    fi
+
+    if [ -L /etc/localtime ]; then
+        zone="$(readlink -f /etc/localtime 2>/dev/null)"
+        case "$zone" in
+            /usr/share/zoneinfo/?*) SC_TZ="${zone#/usr/share/zoneinfo/}" ;;
+        esac
+    fi
+}

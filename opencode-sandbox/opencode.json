@@ -19,5 +19,12 @@
       }
     }
   },
-  "model": "local/local"
+  "model": "local/local",
+  "tools": {
+    "webfetch": false,
+    "websearch": false,
+    "task": false,
+    "lsp": false,
+    "todowrite": false
+  }
 }

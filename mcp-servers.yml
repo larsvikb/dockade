@@ -1,0 +1,113 @@
+# MCP servers — the catalogue. One container per server, one profile per server.
+#
+# WHY THIS IS A SEPARATE FILE. `docker-compose.yml` owns the topology: the five
+# networks, who is attached to what, and the three infra services whose placement
+# IS the security boundary. This file owns a growing list of optional third-party
+# containers. Keeping them apart means adding a server never requires editing the
+# file that owns the boundary — the catalogue is expected to grow, the topology is
+# not.
+#
+# It is NOT a separate compose project. The Makefile's `COMPOSE` merges the two
+# with `-f`, so this is one project with one lifecycle: `depends_on` can name
+# `egress-proxy` and gate on its healthcheck (impossible across projects), and
+# `mcp-net` resolves to the definition in `docker-compose.yml` rather than needing
+# an `external: true` network that must exist first.
+#
+#     make up                       # infra only; no server starts
+#     make mcp-up SERVER=github     # add one
+#     make mcp-ps                   # who is on mcp-net right now
+#
+# Use the targets rather than a hand-written `docker compose`: without BOTH `-f`
+# flags compose never reads this file and `--profile mcp-github` fails with "no
+# such service". The Makefile's COMPOSE is the one place that pair is defined.
+#
+# THREE PROPERTIES MAKE A SERVER SAFE HERE, and every one is a placement rather
+# than a setting. `tests/test_topology.py` reads this file and asserts them, so a
+# new server cannot escape them by being added quietly:
+#   - `mcp-net` only. No `sandbox-net` leg, so the agent has no route to the
+#     container and no route to the credential it holds. This is the whole boundary
+#     — nothing inside the container enforces it.
+#   - No `egress-net` leg. The network is internal, so the only reachable thing is
+#     the egress proxy: a server that ignores the proxy env fails loudly instead of
+#     quietly going direct. Capability, not configuration.
+#   - No published ports. Nothing on the host reaches these either.
+#
+# Governance happens at two altitudes and neither substitutes for the other: the
+# MCP gateway (not built yet — see DESIGN.md) decides per tool call; the egress
+# proxy decides where the server's own process may connect.
+#
+# Adding a server = copy the block below, change image/env/profile, keep the three
+# properties. That is what this file is for.
+services:
+  mcp-github:
+    profiles:
+      - mcp-github
+    # Pinned deliberately: this container holds a write-capable credential, so an
+    # unreviewed `latest` would be an auto-updating supply chain into it.
+    image: ghcr.io/github/github-mcp-server:v1.9.0
+    container_name: mcp-github
+    hostname: mcp-github
+    # `http` is the streamable-HTTP transport. stdio is the image's default and is
+    # useless here — a pipe does not cross a container boundary, and spawning the
+    # server from the gateway would need the docker socket, which nothing in this
+    # design may have. 8082 is the image's own default port.
+    command: ["http", "--listen-host", "0.0.0.0", "--port", "8082"]
+    networks:
+      mcp-net:
+    environment:
+      # NO CREDENTIAL HERE, and that is the finding rather than an omission. In `http`
+      # mode this server is an OAuth-protected resource: it refuses an unauthenticated
+      # MCP request outright, and when a bearer IS supplied it uses that and ignores
+      # `GITHUB_PERSONAL_ACCESS_TOKEN` completely — both measured, see NOTES.md. The
+      # documented env fallback (github/github-mcp-server#1216) does not apply here.
+      #
+      # So for THIS server the token is a client credential the gateway injects per
+      # call, and the var was removed rather than relabelled: a credential slot that
+      # has no effect while still appearing in `docker inspect` is pure downside.
+      #
+      # Do NOT read that as "credentials belong in the gateway". The opposite is the
+      # default — a server container has no route from the sandbox, the gateway is
+      # agent-facing, so an env credential here is FARTHER from the agent than one
+      # held there. Injection is what this server forces, not what the design
+      # prefers; see DESIGN.md, "Credentials". Where the token itself lives: outside
+      # this repo.
+      # Narrow the surface at the source as well as at the gateway. This is defence
+      # in depth and NOT the boundary: read-only was silently inert in http mode
+      # until v0.31.0 (github/github-mcp-server#2156, fixed by #2208), which is
+      # precisely why the gateway's deny state — not a server's own flag — is what
+      # the design relies on. Verify `tools/list` rather than trusting either.
+      GITHUB_TOOLSETS: ${GITHUB_MCP_TOOLSETS:-context,repos,issues,pull_requests}
+      GITHUB_READ_ONLY: ${GITHUB_MCP_READ_ONLY:-1}
+      # Limits what content from PUBLIC repos is surfaced, by checking whether the
+      # author has push access. Directly aimed at the response-side risk: issue and
+      # PR bodies are attacker-authored text that lands in the agent's context.
+      GITHUB_LOCKDOWN_MODE: "1"
+      # Real process env, not a shell export (same rule as the sandbox's proxy
+      # vars). Go's net/http honours these; a Node-based server would not without
+      # an explicit dispatcher — verify by looking for the connection in the
+      # proxy's audit log, since the failure mode is a timeout, not an error.
+      HTTP_PROXY: http://egress-proxy:8080
+      HTTPS_PROXY: http://egress-proxy:8080
+      NO_PROXY: localhost,127.0.0.1
+    depends_on:
+      egress-proxy:
+        condition: service_healthy
+    restart: unless-stopped
+    read_only: true
+    # Lowest tier of the capped services, alongside control-plane-ui: a Go binary
+    # that marshals JSON between two HTTP endpoints holds no state and has no
+    # workload that grows. Peak is driven by response SIZE — a big file fetch or a
+    # large diff — not by concurrency, so the headroom here is for one outlier
+    # response, not for many. Reasoned rather than measured; check with
+    # `docker stats` against real traffic before trusting it, and remember the caps
+    # are sized never to fire (an OOM kill here is a crash loop under
+    # `unless-stopped`, i.e. tools that fail intermittently for no visible reason).
+    mem_limit: 256m
+    # Swap ceiling == memory ceiling, or the cap is really 2x (see DESIGN.md,
+    # "Resource limits"). Every other capped service does the same.
+    memswap_limit: 256m
+    pids_limit: 128
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true

@@ -20,14 +20,23 @@ elsewhere in the file cannot confuse it.
 """
 from __future__ import annotations
 
+import ipaddress
 import re
 import unittest
 from pathlib import Path
 from typing import ClassVar
 
 ROOT = Path(__file__).resolve().parents[1]
-COMPOSE = (ROOT / "docker-compose.yml").read_text().splitlines()
+# BOTH compose files, concatenated, because the Makefile's COMPOSE merges them with
+# -f and the merged model is what actually runs. docker-compose.yml owns the
+# topology; mcp-servers.yml owns the MCP server catalogue. Reading only the first
+# would leave every placement rule below asserted against the file where servers are
+# NOT declared — blind in exactly the place new services get added.
+COMPOSE = [line
+           for name in ("docker-compose.yml", "mcp-servers.yml")
+           for line in (ROOT / name).read_text().splitlines()]
 ADDON = (ROOT / "proxies" / "egress" / "addon.py").read_text()
+BOUNDARY = (ROOT / "sandbox-common" / "boundary-check.sh").read_text()
 APP = (ROOT / "control-plane" / "app.py").read_text()
 
 #: The control plane's two listeners. Duplicated from app.py's defaults rather
@@ -64,8 +73,40 @@ def _block(lines: list[str], key: str, indent: int) -> list[str]:
     return out
 
 
+def _all_services() -> list[str]:
+    """Every service declaration across BOTH compose files, as one body.
+
+    Needed because COMPOSE is a concatenation and each file has its own top-level
+    ``services:`` key — ``_block`` would stop at the second one and silently return
+    only the first file's services. That failure mode is the dangerous direction:
+    the rules below would pass by not seeing the services they exist to constrain.
+    """
+    bodies = [_block(COMPOSE[i:], "services", 0)
+              for i, line in enumerate(COMPOSE) if line.rstrip() == "services:"]
+    if not bodies:
+        raise AssertionError("no services: block in either compose file")
+    return [line for body in bodies for line in body]
+
+
 def _service(name: str) -> list[str]:
-    return _block(_block(COMPOSE, "services", 0), name, 2)
+    return _block(_all_services(), name, 2)
+
+
+def _service_names() -> list[str]:
+    """Every service key, so a rule can be asserted across the whole file rather
+    than against a list that a new service silently escapes."""
+    return [m.group(1)
+            for line in _all_services()
+            if (m := re.match(r"  ([A-Za-z0-9._-]+):\s*$", line))]
+
+
+def _scalar(body: list[str], key: str) -> str | None:
+    """A scalar key directly under a service block, or None if absent."""
+    for line in body:
+        m = re.match(rf"\s*{re.escape(key)}:\s*(\S+)", line)
+        if m:
+            return m.group(1)
+    return None
 
 
 def _networks_of(service: str) -> set[str]:
@@ -129,6 +170,95 @@ class ProxyReachabilityTests(unittest.TestCase):
         # the job they assume, so assert the premise rather than imply it.
         self.assertLessEqual({"sandbox-net", "egress-net"},
                              _networks_of("egress-proxy"))
+
+
+class McpServerPlacementTests(unittest.TestCase):
+    """Where MCP server containers sit, which is their entire boundary.
+
+    Each one holds a write-capable credential the sandbox is not allowed to have.
+    Nothing in the container stops the agent using it — only the fact that the
+    agent has no route to the container does. A stray `sandbox-net:` here would
+    hand the agent the credential directly and make the gateway's per-tool policy
+    decorative, and every health check would stay green while it did."""
+
+    #: Services that run a third-party MCP server. Extend as servers are added.
+    MCP_SERVERS = ("mcp-github",)
+
+    def test_mcp_servers_never_join_the_agent_network(self):
+        for svc in self.MCP_SERVERS:
+            with self.subTest(service=svc):
+                self.assertEqual(_networks_of(svc), {"mcp-net"})
+
+    def test_mcp_servers_have_no_egress_of_their_own(self):
+        # They reach the internet only by asking the proxy. Attaching egress-net
+        # here would be a second way off-box, held by the one process in this
+        # design carrying a credential worth stealing.
+        for svc in self.MCP_SERVERS:
+            with self.subTest(service=svc):
+                self.assertNotIn("egress-net", _networks_of(svc))
+
+    def test_mcp_servers_are_told_to_use_the_proxy(self):
+        # The placement above makes the proxy the only reachable destination; this
+        # is what makes the server actually use it rather than merely fail.
+        for svc in self.MCP_SERVERS:
+            with self.subTest(service=svc):
+                env = _environment_of(svc)
+                for var in ("HTTP_PROXY", "HTTPS_PROXY"):
+                    self.assertIn("egress-proxy", env.get(var, ""))
+
+    def test_the_proxy_can_be_reached_from_the_mcp_network(self):
+        # The premise the three assertions above depend on: if the proxy ever
+        # leaves mcp-net, the servers do not fall back to direct egress — they
+        # stop working — but the tests would still pass while claiming otherwise.
+        self.assertIn("mcp-net", _networks_of("egress-proxy"))
+
+    def test_no_variable_is_required_at_interpolation_time(self):
+        # Not an MCP-specific rule, and not a new one: the compose file has said so
+        # in prose since the llm-* profiles landed (see the DOCKADE_LLM_MODEL and
+        # DOCKADE_RENDER_GID notes), because interpolation runs over the whole file
+        # before profiles select services. A `:?` in a profile nobody enabled takes
+        # `build` and `up` down for the infra services. Prose did not stop it being
+        # reintroduced, so this is the guard.
+        offenders = [ln.strip() for ln in COMPOSE if re.search(r"\$\{[^}]+:\?", ln)]
+        self.assertEqual(offenders, [], "use ${VAR:-}, not ${VAR:?}")
+
+    def test_a_memory_cap_always_disables_swap(self):
+        # Also not MCP-specific, and also learned by breaking it. Docker defaults
+        # the swap ceiling to 2x memory, so `mem_limit` ALONE is half a cap — the
+        # container gets its RAM again in swap, on a host where a ceiling above
+        # what exists is no ceiling at all. Uncapped is a legitimate choice here
+        # (the llm-* services argue for it); capped-but-swappable is the shape that
+        # is never intended, and it is invisible in review because the line that
+        # would say so is the one that is missing.
+        for svc in _service_names():
+            body = _service(svc)
+            mem = _scalar(body, "mem_limit")
+            if mem is None:
+                continue            # uncapped on purpose — see the llm-* services
+            with self.subTest(service=svc):
+                self.assertEqual(_scalar(body, "memswap_limit"), mem,
+                                 f"{svc}: mem_limit {mem} without a matching "
+                                 "memswap_limit is really a 2x cap")
+
+    def test_the_probed_mcp_address_is_the_one_compose_pins(self):
+        # boundary-check.sh proves the sandbox has no route to mcp-net by dialing a
+        # LITERAL address, and that probe means something only because the proxy is
+        # really listening on it. If compose stops pinning the address, or pins a
+        # different one, the probe keeps passing — against nothing. The two files
+        # cannot see each other, so this is where they are held together.
+        pinned = _scalar(_block(_service("egress-proxy"), "mcp-net", 6),
+                         "ipv4_address")
+        self.assertIsNotNone(pinned, "the proxy's mcp-net leg has no fixed address")
+        self.assertIn(f"http://{pinned}:8080", BOUNDARY,
+                      "boundary-check.sh probes an address compose does not pin")
+
+    def test_the_mcp_network_is_inside_the_range_the_relay_guard_blocks(self):
+        # Why the proxy's leg is inbound-only in effect: mcp-net sits in the
+        # private range the guard hard-blocks, so the proxy refuses it as a
+        # CONNECT target and cannot be asked to relay the agent into the servers.
+        self.assertTrue(
+            ipaddress.ip_network(_subnet_of("mcp-net")).subnet_of(
+                ipaddress.ip_network("172.16.0.0/12")))
 
 
 class ControlPlaneBindTests(unittest.TestCase):

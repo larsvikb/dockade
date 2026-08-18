@@ -42,7 +42,8 @@ inside the sandbox.
 ```bash
 # 1. Bring up the shared infrastructure once (egress proxy + control plane + UI).
 #    Sandboxes route their traffic through it and it audits every connection.
-docker compose -f /path/to/dockade/docker-compose.yml up -d --build
+cd /path/to/dockade && make up   # or: docker compose -f docker-compose.yml \
+                                 #       -f mcp-servers.yml up -d --build
 
 # 2. From the directory you want the agent to work in, launch a sandbox:
 /path/to/dockade/run-claude-sandbox.sh
@@ -190,6 +191,7 @@ dockade/
   ruff.toml, .yamllint, .hadolint.yaml, .shellcheckrc   # pinned linter configs (make check)
   .github/workflows/        # CI: lint + consistency + tests + image builds (make check)
   docker-compose.yml        # shared infra: egress proxy + control plane + UI + local LLM
+  mcp-servers.yml           # MCP server catalogue (one container + profile per server)
   run-claude-sandbox.sh     # tier 1: build + launch a Claude sandbox (one or many)
   run-opencode-sandbox.sh   # tier 2: build + launch an opencode/local-LLM sandbox
   sandbox-lib.sh            # launcher plumbing shared by both tiers

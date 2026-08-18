@@ -295,6 +295,25 @@ if [ "$cp_leak" -eq 0 ]; then
     ok "control plane unreachable from sandbox on both control networks"
 fi
 
+printf '%s== mcp ==%s\n' "$bold" "$reset"
+# MCP servers hold the credentials the sandbox must not have (a GitHub PAT today),
+# and nothing INSIDE those containers keeps the agent out — only the absence of a
+# route does. They live on mcp-net, which the sandbox is not attached to.
+#
+# Probing a server directly would be a vacuous test: none runs unless its profile
+# is enabled, so "connection failed" would pass for the wrong reason. Probe the
+# EGRESS PROXY's mcp-net address instead — it is on that network permanently and
+# genuinely listening there, so this measures routing and nothing else. The
+# positive control is already in this run: the same service, same port, answered on
+# 172.30.0.10 in the egress section above. Reaching it here and not there is the
+# difference between "no listener" and "no route", which is the distinction that
+# makes the result mean anything.
+if curl --noproxy '*' --connect-timeout 5 -s -o /dev/null http://172.28.0.10:8080 2>/dev/null; then
+    bad "mcp-net reachable from sandbox (172.28.0.10:8080) — the MCP servers' credentials are exposed"
+else
+    ok "mcp-net unreachable from sandbox (MCP server containers are out of reach)"
+fi
+
 printf '%s== ipv6 ==%s\n' "$bold" "$reset"
 if [ -e /proc/net/if_inet6 ]; then
     # Connect to a literal v6 address (no AAAA lookup needed). We assert on the

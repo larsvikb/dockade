@@ -36,8 +36,25 @@
 # MCP gateway (not built yet — see DESIGN.md) decides per tool call; the egress
 # proxy decides where the server's own process may connect.
 #
-# Adding a server = copy the block below, change image/env/profile, keep the three
-# properties. That is what this file is for.
+# A FOURTH property, load-bearing for the second altitude: every server pins its
+# ipv4_address. The egress proxy identifies its callers by peer ADDRESS — that is
+# all a TCP connection carries — so an address is the only handle per-server egress
+# policy can ever have. Dynamic addresses make it a useless one: Docker hands out
+# whatever is free in start order, so a restart can move a server and hand its old
+# address to a different one, which would decide the new server's egress under the
+# old server's rules. Pinning removes that race rather than narrowing it. Addresses
+# are allocated here, in the file that adds the server, so it stays one edit.
+#
+#     172.28.0.10   egress-proxy's leg   (pinned in docker-compose.yml)
+#     172.28.0.11+  MCP servers          (pinned below, one each)
+#
+# Note this is about the SERVER's own outbound calls, not about tool calls. Tool
+# calls reach the gateway, which dialled the server BY NAME and can say which it is
+# without resolving anything — see the per-server identity discussion under
+# DESIGN.md, "MCP gateway".
+#
+# Adding a server = copy the block below, change image/env/profile, take the next
+# free address, keep the four properties. That is what this file is for.
 services:
   mcp-github:
     profiles:
@@ -54,6 +71,9 @@ services:
     command: ["http", "--listen-host", "0.0.0.0", "--port", "8082"]
     networks:
       mcp-net:
+        # First server address. See the allocation note in the file header for why
+        # this is pinned rather than left to Docker.
+        ipv4_address: 172.28.0.11
     environment:
       # NO CREDENTIAL HERE, and that is the finding rather than an omission. In `http`
       # mode this server is an OAuth-protected resource: it refuses an unauthenticated

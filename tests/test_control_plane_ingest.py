@@ -123,8 +123,8 @@ class IngestTestCase(unittest.TestCase):
     def rows(self):
         with cp.store._connect() as conn:
             return conn.execute(
-                "SELECT ts, decision, stage, host, port, proto, client, method, "
-                "url, reason FROM audit ORDER BY id").fetchall()
+                "SELECT ts, decision, stage, host, port, proto, client, "
+                "client_class, method, url, reason FROM audit ORDER BY id").fetchall()
 
     def cursor(self):
         with cp.store._connect() as conn:
@@ -138,8 +138,37 @@ class RowMappingTests(IngestTestCase):
     def test_local_decision_becomes_a_row(self):
         row = cp.ingest._ingest_row(_line().encode())
         self.assertEqual(row, (1000.0, "deny", "sni", "evil.com", None, None,
-                               "172.30.0.2", None, None,
+                               "172.30.0.2", "sandbox", None, None,
                                "possible domain-fronting"))
+
+    def test_the_row_matches_the_column_order_it_is_inserted_under(self):
+        """The two used to agree only by hand-counted index, and adding a column in
+        the middle moved `reason` under the stdout mirror's `r[9]` — which would have
+        printed the agent-supplied URL as the decision's reason. One tuple, one column
+        list, asserted the same length so a field added to only one of them fails
+        here rather than in a log line nobody diffs."""
+        row = cp.ingest._ingest_row(_line().encode())
+        self.assertEqual(len(row), len(cp.ingest._AUDIT_COLUMNS))
+        fields = dict(zip(cp.ingest._AUDIT_COLUMNS, row))
+        self.assertEqual(fields["reason"], "possible domain-fronting")
+        self.assertEqual(fields["client"], "172.30.0.2")
+        self.assertEqual(fields["client_class"], "sandbox")
+
+    def test_the_class_is_derived_from_the_client_the_proxy_reported(self):
+        """The proxy sends no class and should not start: it is deliberately
+        client-agnostic about everything except the lifeline. These are its LOCAL
+        decisions — the fronting refusal above among them — so deriving the class here
+        is what keeps the column populated across the whole audit view, rather than
+        empty on exactly the most alarming rows."""
+        mcp = cp.ingest._ingest_row(_line(client="172.28.0.5").encode())
+        self.assertEqual(dict(zip(cp.ingest._AUDIT_COLUMNS, mcp))["client_class"],
+                         "mcp")
+        # A client in no configured range is recorded as unclassified, not as NULL:
+        # the row is still evidence, and "we could not place this caller" is a fact
+        # worth keeping.
+        odd = cp.ingest._ingest_row(_line(client="203.0.113.9").encode())
+        self.assertEqual(dict(zip(cp.ingest._AUDIT_COLUMNS, odd))["client_class"],
+                         cp.policy.UNCLASSIFIED)
 
     def test_central_true_is_never_ingested(self):
         """Every governed request writes a proxy line too. Ingesting those would
@@ -178,18 +207,25 @@ class RowMappingTests(IngestTestCase):
             with self.subTest(ts=ts):
                 self.assertIsNone(cp.ingest._ingest_row(_line(ts=ts).encode()))
 
+    @staticmethod
+    def _fields(line):
+        """The mapped row BY NAME. Positional indexing here is what broke when
+        `client_class` landed in the middle of the tuple — an assertion about `url`
+        silently became one about `reason`."""
+        return dict(zip(cp.ingest._AUDIT_COLUMNS, cp.ingest._ingest_row(line)))
+
     def test_non_integer_port_becomes_null(self):
         for port in ("443", None, 4.5, True):
             with self.subTest(port=port):
-                self.assertIsNone(cp.ingest._ingest_row(_line(port=port).encode())[4])
-        self.assertEqual(cp.ingest._ingest_row(_line(port=443).encode())[4], 443)
+                self.assertIsNone(self._fields(_line(port=port).encode())["port"])
+        self.assertEqual(self._fields(_line(port=443).encode())["port"], 443)
 
     def test_agent_influenced_fields_are_truncated(self):
         """host/url come from what the sandbox asked for. The proxy records them
         faithfully; this reader is where an unbounded one stops being our problem."""
-        row = cp.ingest._ingest_row(_line(host="h" * 9000, url="u" * 9000).encode())
-        self.assertEqual(len(row[3]), cp.store.DRAIN_MAX_FIELD)
-        self.assertEqual(len(row[8]), cp.store.DRAIN_MAX_FIELD)
+        f = self._fields(_line(host="h" * 9000, url="u" * 9000).encode())
+        self.assertEqual(len(f["host"]), cp.store.DRAIN_MAX_FIELD)
+        self.assertEqual(len(f["url"]), cp.store.DRAIN_MAX_FIELD)
 
     def test_malformed_lines_are_dropped_not_guessed_at(self):
         for raw in (b"{not json", b"[]", b'"a string"', b"null", b"42",

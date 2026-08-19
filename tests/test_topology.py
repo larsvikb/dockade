@@ -38,6 +38,7 @@ COMPOSE = [line
 ADDON = (ROOT / "proxies" / "egress" / "addon.py").read_text()
 BOUNDARY = (ROOT / "sandbox-common" / "boundary-check.sh").read_text()
 APP = (ROOT / "control-plane" / "app.py").read_text()
+POLICY = (ROOT / "control-plane" / "policy.py").read_text()
 
 #: The control plane's two listeners. Duplicated from app.py's defaults rather
 #: than imported, deliberately: this file is asserting that compose and the app
@@ -252,6 +253,32 @@ class McpServerPlacementTests(unittest.TestCase):
         self.assertIn(f"http://{pinned}:8080", BOUNDARY,
                       "boundary-check.sh probes an address compose does not pin")
 
+    def test_every_mcp_server_pins_its_address(self):
+        # The egress proxy identifies a caller by peer address, because that is all
+        # a TCP connection carries. A dynamic address is therefore not an identity:
+        # Docker reassigns in start order, so a restarted server can inherit another
+        # server's address and have its egress decided under that server's rules.
+        # An unpinned server does not fail — it just quietly stops being separable,
+        # which is why the guard is here rather than left to review.
+        for svc in self.MCP_SERVERS:
+            with self.subTest(service=svc):
+                pinned = _scalar(_block(_service(svc), "mcp-net", 6), "ipv4_address")
+                self.assertIsNotNone(pinned, f"{svc} does not pin an mcp-net address")
+                self.assertIn(
+                    ipaddress.ip_address(pinned),
+                    ipaddress.ip_network(_subnet_of("mcp-net")),
+                    f"{svc} pins {pinned}, which is outside mcp-net")
+
+    def test_no_two_mcp_containers_claim_the_same_address(self):
+        # Including the proxy's own leg. Two containers pinned to one address is a
+        # startup failure for the second — loud, and therefore not the danger. The
+        # danger is a server pinned to the PROXY's address, which would collide with
+        # the one endpoint every server depends on, and boundary-check.sh probes.
+        claimed = [_scalar(_block(_service(svc), "mcp-net", 6), "ipv4_address")
+                   for svc in (*self.MCP_SERVERS, "egress-proxy")]
+        self.assertEqual(len(claimed), len(set(claimed)),
+                         f"two containers pin the same mcp-net address: {claimed}")
+
     def test_the_mcp_network_is_inside_the_range_the_relay_guard_blocks(self):
         # Why the proxy's leg is inbound-only in effect: mcp-net sits in the
         # private range the guard hard-blocks, so the proxy refuses it as a
@@ -382,6 +409,54 @@ class RelayGuardAgreesWithComposeTests(unittest.TestCase):
                 self.assertFalse(
                     subnet.subnet_of(granted),
                     f"{network} sits inside the permanent lifeline's client range")
+
+    def test_every_client_class_range_is_a_real_compose_subnet(self):
+        # Third instance of the same two-ends-no-compiler problem, and the one with
+        # the quietest failure. A class range that matches no network places nobody:
+        # its clients fall through to UNCLASSIFIED, match no rule, and are HELD — so
+        # a renumbered subnet does not break governance, it makes every request from
+        # that population wait for a human who has no idea why they are being asked.
+        default = re.search(
+            r'CLIENT_CLASSES_DEFAULT = "([^"]+)"', POLICY)
+        self.assertIsNotNone(default, "could not find the CLIENT_CLASSES default")
+        subnets = {_subnet_of(n) for n in ("sandbox-net", "mcp-net", "control-net",
+                                           "authorize-net")}
+        mapped = {}
+        for entry in default.group(1).split(","):
+            name, _, cidr = entry.partition("=")
+            self.assertIn(cidr.strip(), subnets,
+                          f"client class {name!r} maps to {cidr!r}, which is not a "
+                          f"subnet any network in compose declares")
+            mapped[name.strip()] = cidr.strip()
+        # The two populations the egress proxy actually serves, each named. The proxy
+        # has a leg on both, so both reach /authorize and both must be placeable —
+        # an unmapped one is the union-of-needs problem returning by omission.
+        self.assertEqual(mapped, {"sandbox": _subnet_of("sandbox-net"),
+                                  "mcp": _subnet_of("mcp-net")})
+
+    def test_the_class_ranges_do_not_overlap(self):
+        # First match wins, so an overlap would silently place one network's clients
+        # in another's class and decide their requests under rules written for
+        # somebody else — least privilege inverted rather than merely weakened.
+        default = re.search(r'CLIENT_CLASSES_DEFAULT = "([^"]+)"', POLICY)
+        nets = [(e.split("=")[0], ipaddress.ip_network(e.split("=")[1]))
+                for e in default.group(1).split(",")]
+        for i, (name_a, a) in enumerate(nets):
+            for name_b, b in nets[i + 1:]:
+                self.assertFalse(a.overlaps(b),
+                                 f"client classes {name_a} and {name_b} overlap")
+
+    def test_the_agents_class_is_the_one_the_lifeline_is_scoped_to(self):
+        # Two independent client checks — the proxy's local lifeline allow and the
+        # control plane's rule scoping — and they have to be about the same network,
+        # because both derive from the same sentence: only sandbox-net runs the agent.
+        # Drifting apart would mean the population that keeps the Anthropic lifeline
+        # is not the population the agent's own rules were written for.
+        classes = re.search(r'CLIENT_CLASSES_DEFAULT = "([^"]+)"', POLICY).group(1)
+        lifeline = re.search(
+            r'"EGRESS_LIFELINE_CIDRS",\s*\n?\s*"([^"]+)"', ADDON).group(1)
+        agent_range = dict(e.split("=") for e in classes.split(","))["sandbox"]
+        self.assertEqual({agent_range}, {c.strip() for c in lifeline.split(",")})
 
     def test_the_networks_the_guard_blocks_are_internal(self):
         # An internal bridge has no route off-box. Both control networks must be

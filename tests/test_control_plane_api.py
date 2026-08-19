@@ -36,12 +36,23 @@ from _loader import load_control_plane  # noqa: E402 (must set env first)
 cp = load_control_plane()
 
 
+# The client class these tests decide as, and an address that maps to it under the
+# default CIDR map. Rules are scoped to a class, so a test that writes one and a
+# request that must match it have to agree — naming both here keeps that agreement in
+# one place rather than in every fixture.
+CLASS = cp.store.LEGACY_CLIENT_CLASS
+CLASS_IP = "172.30.0.2"
+
+
 def _set_rules(rules):
+    """(pattern, action) tuples, or (pattern, action, client_class) where the class
+    is what a test is actually about."""
     with cp.store._connect() as conn:
         conn.execute("DELETE FROM rules")
         conn.executemany(
-            "INSERT INTO rules(pattern, action, source, created_at) "
-            "VALUES (?,?, 'test', 0)", rules)
+            "INSERT INTO rules(pattern, action, source, created_at, client_class) "
+            "VALUES (?,?, 'test', 0, ?)",
+            [r if len(r) == 3 else (*r, CLASS) for r in rules])
         conn.commit()
 
 
@@ -63,6 +74,13 @@ def _clear_all():
 
 
 def _auth_req(host, **kw):
+    """An /authorize request that classifies as ``CLASS`` unless a test says otherwise.
+
+    The client defaults to a real sandbox-net address rather than being left unset,
+    because the class is derived from it: an absent client is UNCLASSIFIED, matches no
+    rule and is held, so every decision test would otherwise be testing the
+    unclassified path by accident."""
+    kw.setdefault("client", CLASS_IP)
     return cp.AuthorizeRequest(host=host, **kw)
 
 
@@ -83,7 +101,7 @@ def _resolve(approval_id, action, request=None, **fields):
                       request if request is not None else _FakeRequest())
 
 
-def _hold(host, approval_id="hold-1", client=None):
+def _hold(host, approval_id="hold-1", client=None, client_class=CLASS):
     """Register an INDEPENDENT pending approval with no blocked authorize() behind it:
     the durable row plus the in-process slot ``resolve`` looks for. Enough for every
     resolve-side assertion, and no thread to wait on — the wake path has its own tests.
@@ -96,11 +114,18 @@ def _hold(host, approval_id="hold-1", client=None):
 
     ``client`` defaults to the approval id — unique, therefore a distinct group key —
     so two ``_hold``s on the same host are two cards. Callers that want them GROUPED
-    (which is what a real duplicate does) pass the same client explicitly."""
+    (which is what a real duplicate does) pass the same client explicitly.
+
+    ``client_class`` is stored EXPLICITLY rather than derived from that client, and
+    defaults to a real one: a persist needs a class to scope the rule to, so leaving it
+    NULL would make every ``*_persist`` test exercise the unclassified refusal instead
+    of the write it means to assert. Tests about that refusal pass None."""
     with cp.store._connect() as conn:
         conn.execute(
-            "INSERT INTO approvals(id, ts, host, status) VALUES (?,?,?, 'pending')",
-            (approval_id, time.time(), host))
+            "INSERT INTO approvals(id, ts, host, client, client_class, status) "
+            "VALUES (?,?,?,?,?, 'pending')",
+            (approval_id, time.time(), host,
+             approval_id if client is None else client, client_class))
         conn.commit()
     cp.holds._reserve_hold(approval_id, threading.Event(),
                      approval_id if client is None else client, host)
@@ -173,7 +198,7 @@ class AuthorizeDecisionTests(_CPTestCase):
 class HoldHandshakeTests(_CPTestCase):
     """The full hold path: a blocked authorize is woken by a human resolve."""
 
-    def _authorize_in_thread(self, host, client="agent-1"):
+    def _authorize_in_thread(self, host, client=CLASS_IP):
         result = {}
 
         def worker():
@@ -204,7 +229,7 @@ class HoldHandshakeTests(_CPTestCase):
         self.assertEqual(result["resp"].decision, "allow")
         self.assertTrue(resolve_resp.args[0]["ok"])
         # persist wrote an operator allow rule, so a re-decide skips the hold.
-        self.assertEqual(cp.policy._decide("newsite.com")[0], "allow")
+        self.assertEqual(cp.policy._decide("newsite.com", CLASS)[0], "allow")
 
     def test_deny_once_wakes_waiter_without_writing_rule(self):
         saved = cp.holds.HOLD_TIMEOUT
@@ -218,14 +243,14 @@ class HoldHandshakeTests(_CPTestCase):
         self.assertFalse(t.is_alive())
         self.assertEqual(result["resp"].decision, "deny")
         # deny_once must NOT persist a rule — the host stays held next time.
-        self.assertEqual(cp.policy._decide("nope.com")[0], "hold")
+        self.assertEqual(cp.policy._decide("nope.com", CLASS)[0], "hold")
 
 
 class DuplicateHoldTests(_CPTestCase):
     """Grouping through the real ``authorize`` path, which is the only place its
     concurrency shows: N blocked workers, one card, one decision, N audit lines."""
 
-    def _authorize_many(self, n, host, client="agent-1", urls=None):
+    def _authorize_many(self, n, host, client=CLASS_IP, urls=None):
         """Start n concurrent authorize() calls for the same request. Returns the
         threads and a results list that fills in as each returns."""
         results = [None] * n
@@ -271,7 +296,7 @@ class DuplicateHoldTests(_CPTestCase):
         self.assertEqual(len(rows), 1, "duplicates must not each get a durable row")
         # "once" still means no standing rule — it now means four requests, not one.
         self.assertEqual(_rules(), set())
-        self.assertEqual(cp.policy._decide("dup.example")[0], "hold")
+        self.assertEqual(cp.policy._decide("dup.example", CLASS)[0], "hold")
 
     def test_a_timeout_tells_every_waiter_it_was_a_timeout(self):
         # Only ONE waiter wins the expiry UPDATE; the rest read the row. Reporting
@@ -329,13 +354,13 @@ class DuplicateHoldTests(_CPTestCase):
         # to return. Asserted while the waiters are still registered, because that gap
         # is the whole risk: a retry landing in it would attach to an already-resolved
         # card and inherit an outcome nobody was shown it beside.
-        approval = _hold("clicked.example", "held-1", client="agent-1")
-        before = cp.holds._reserve_hold("dup", threading.Event(), "agent-1",
+        approval = _hold("clicked.example", "held-1", client=CLASS_IP)
+        before = cp.holds._reserve_hold("dup", threading.Event(), CLASS_IP,
                                   "clicked.example")
         self.assertTrue(before.joined, "joinable while pending")
         _resolve(approval, "deny_once")
         self.assertIn(approval, cp.holds._PENDING_EVENTS, "waiters not drained yet")
-        after = cp.holds._reserve_hold("late", threading.Event(), "agent-1",
+        after = cp.holds._reserve_hold("late", threading.Event(), CLASS_IP,
                                  "clicked.example")
         self.assertFalse(after.joined)
         self.assertEqual(after.approval_id, "late")
@@ -350,13 +375,13 @@ class DuplicateHoldTests(_CPTestCase):
         try:
             threads, _ = self._authorize_many(1, "drain.example")
             card = self._await_card(1)
-            phantom = cp.holds._reserve_hold("phantom", threading.Event(), "agent-1",
+            phantom = cp.holds._reserve_hold("phantom", threading.Event(), CLASS_IP,
                                        "drain.example")
             self.assertTrue(phantom.joined)
             for t in threads:
                 t.join(5)
             self.assertIn(card["id"], cp.holds._PENDING_EVENTS)
-            late = cp.holds._reserve_hold("late", threading.Event(), "agent-1",
+            late = cp.holds._reserve_hold("late", threading.Event(), CLASS_IP,
                                     "drain.example")
         finally:
             cp.holds.HOLD_TIMEOUT = saved
@@ -375,7 +400,7 @@ class DuplicateHoldTests(_CPTestCase):
             for t in threads:
                 t.join(5)
             cp.holds.HOLD_TIMEOUT = 0.2
-            late = cp.authorize(_auth_req("again.example", client="agent-1"))
+            late = cp.authorize(_auth_req("again.example", client=CLASS_IP))
         finally:
             cp.holds.HOLD_TIMEOUT = saved
         self.assertEqual(late.decision, "deny")
@@ -412,9 +437,11 @@ class PersistConflictTests(_CPTestCase):
         body = resp.args[0]
         self.assertFalse(body["ok"])
         # Names the rule standing in the way, so the operator can act on it rather
-        # than guess.
+        # than guess — including WHICH class it is in, since the same pattern can
+        # stand in two and only one of them is the obstacle.
         self.assertEqual(body["conflict"],
-                         {"pattern": ".example.com", "action": "allow"})
+                         {"pattern": ".example.com", "action": "allow",
+                          "client_class": CLASS})
         # And policy is untouched — no half-application.
         self.assertEqual(_rules(), {(".example.com", "allow")})
 
@@ -596,17 +623,17 @@ class RevokeRuleTests(_CPTestCase):
         # The whole point, asserted end to end through _decide rather than by
         # inspecting the table: policy actually changes.
         rid = self._rule("gone.example", "allow")
-        self.assertEqual(cp.policy._decide("gone.example")[0], "allow")
+        self.assertEqual(cp.policy._decide("gone.example", CLASS)[0], "allow")
         cp.revoke_rule(rid, _FakeRequest())
-        self.assertEqual(cp.policy._decide("gone.example")[0], "hold")
+        self.assertEqual(cp.policy._decide("gone.example", CLASS)[0], "hold")
 
     def test_a_revoked_block_reverts_to_hold_not_allow(self):
         # The loosening direction, and the reason the UI warns differently about it:
         # it does NOT become allowed, it becomes decidable.
         rid = self._rule("bad.example", "block")
-        self.assertEqual(cp.policy._decide("bad.example")[0], "deny")
+        self.assertEqual(cp.policy._decide("bad.example", CLASS)[0], "deny")
         cp.revoke_rule(rid, _FakeRequest())
-        self.assertEqual(cp.policy._decide("bad.example")[0], "hold")
+        self.assertEqual(cp.policy._decide("bad.example", CLASS)[0], "hold")
 
 
 def _served(**kw):
@@ -711,7 +738,7 @@ class AuditViewTests(_CPTestCase):
         self._rows({"host": "a.example"})
         self.assertEqual(
             set(_served()[0]),
-            {"ts", "decision", "stage", "host", "client", "reason",
+            {"ts", "decision", "stage", "host", "client", "client_class", "reason",
              "n", "first_ts", "fail_closed"})
 
     def test_the_unbounded_fields_stay_out_of_the_list_view(self):
@@ -968,12 +995,12 @@ class PersistPatternTests(_CPTestCase):
         self.assertTrue(resp.args[0]["ok"])
         self.assertEqual(_rules(), {(".example.com", "allow")})
         # And it does what the scope label says: subdomains skip the hold now.
-        self.assertEqual(cp.policy._decide("other.example.com")[0], "allow")
+        self.assertEqual(cp.policy._decide("other.example.com", CLASS)[0], "allow")
 
     def test_deny_persist_writes_a_block_rule_for_the_chosen_pattern(self):
         _resolve(_hold("bad.example.com"), "deny_persist", pattern=".example.com")
         self.assertEqual(_rules(), {(".example.com", "block")})
-        self.assertEqual(cp.policy._decide("anything.example.com")[0], "deny")
+        self.assertEqual(cp.policy._decide("anything.example.com", CLASS)[0], "deny")
 
     def test_the_response_names_the_pattern_that_was_stored(self):
         # So the UI reports what was WRITTEN, not what was clicked — and names the
@@ -1024,7 +1051,7 @@ class PersistPatternTests(_CPTestCase):
         _resolve(_hold(".sneaky.example.com"), "allow_persist")
         self.assertEqual(_rules(), {("sneaky.example.com", "allow")})
         # Which is a strictly narrower grant: the subtree still holds.
-        self.assertEqual(cp.policy._decide("x.sneaky.example.com")[0], "hold")
+        self.assertEqual(cp.policy._decide("x.sneaky.example.com", CLASS)[0], "hold")
 
 
 class ProvenanceTests(_CPTestCase):
@@ -1138,10 +1165,145 @@ class ProvenanceTests(_CPTestCase):
         self.assertNotIn("peer=", resp.reason)
 
 
+class PersistClassScopeTests(_CPTestCase):
+    """What a `*_persist` writes, now that a rule is scoped.
+
+    The persist path is where the class dimension stops being descriptive: the rule an
+    approval writes decides for one client population and no other, so it has to be
+    the population the card was raised for, and not "everyone"."""
+
+    def _stored(self):
+        with cp.store._connect() as conn:
+            return {(r["pattern"], r["action"], r["client_class"]) for r in
+                    conn.execute("SELECT pattern, action, client_class FROM rules")}
+
+    def test_a_persist_writes_the_rule_for_the_approvals_class(self):
+        _resolve(_hold("api.github.com", client_class="mcp"), "allow_persist")
+        self.assertEqual(self._stored(), {("api.github.com", "allow", "mcp")})
+        # ...and it decides for that class alone.
+        self.assertEqual(cp.policy._decide("api.github.com", "mcp")[0], "allow")
+        self.assertEqual(cp.policy._decide("api.github.com", CLASS)[0], "hold")
+
+    def test_the_class_comes_from_the_durable_row_not_from_the_address(self):
+        # `resolve` must not re-derive the class from the client address: the durable
+        # row is the only thing that knows which population the card was raised for,
+        # and a second implementation of the classification — for the one caller whose
+        # answer becomes standing policy — is exactly the drift worth refusing. The
+        # address here maps to `sandbox`; the rule must still be written for `mcp`.
+        approval = _hold("x.example", client="172.30.0.9", client_class="mcp")
+        _resolve(approval, "allow_persist")
+        self.assertEqual(self._stored(), {("x.example", "allow", "mcp")})
+
+    def test_an_unclassified_client_cannot_write_a_standing_rule(self):
+        # "Whoever we could not identify" is not a client population: a rule scoped to
+        # it would grant to every future unidentified caller, which is exactly the
+        # union-of-needs erosion the class dimension exists to stop.
+        for value in (None, cp.policy.UNCLASSIFIED):
+            with self.subTest(client_class=value):
+                _clear_all()
+                resp = _resolve(_hold("x.example", client_class=value),
+                                "allow_persist")
+                self.assertEqual(resp.kwargs.get("status_code"), 400)
+                self.assertFalse(resp.args[0]["ok"])
+                self.assertIn("unclassified", resp.args[0]["detail"])
+                self.assertEqual(self._stored(), set())
+
+    def test_the_refused_persist_leaves_the_approval_decidable(self):
+        # Refused BEFORE the UPDATE, like every other persist refusal here: the
+        # operator is never stuck, because `*_once` still decides the request.
+        approval = _hold("x.example", client_class=None)
+        _resolve(approval, "allow_persist")
+        with cp.store._connect() as conn:
+            self.assertEqual(
+                conn.execute("SELECT status FROM approvals WHERE id=?",
+                             (approval,)).fetchone()[0], "pending")
+        self.assertTrue(_resolve(approval, "allow_once").args[0]["ok"])
+
+    def test_the_same_pattern_in_another_class_is_not_a_conflict(self):
+        # Under the old UNIQUE(pattern) this could not be stored at all, and the
+        # conflict check would have refused it. One host the agent may reach and an
+        # MCP server may not is ordinary policy, not a contradiction.
+        _set_rules([("pypi.org", "allow", CLASS)])
+        resp = _resolve(_hold("pypi.org", client_class="mcp"), "deny_persist")
+        self.assertTrue(resp.args[0]["ok"])
+        self.assertTrue(resp.args[0]["persisted"])
+        self.assertEqual(self._stored(),
+                         {("pypi.org", "allow", CLASS), ("pypi.org", "block", "mcp")})
+
+    def test_the_conflict_check_still_fires_within_one_class(self):
+        _set_rules([("pypi.org", "allow", "mcp")])
+        resp = _resolve(_hold("pypi.org", client_class="mcp"), "deny_persist")
+        self.assertEqual(resp.kwargs.get("status_code"), 409)
+        self.assertEqual(resp.args[0]["conflict"]["client_class"], "mcp")
+
+    def test_the_response_names_the_class_the_rule_was_written_for(self):
+        # The pattern alone does not identify the rule any more: the same pattern
+        # persisted from two cards is two rules, and a confirmation naming only the
+        # pattern reads identically for both.
+        resp = _resolve(_hold("x.example", client_class="mcp"), "allow_persist")
+        self.assertEqual(resp.args[0]["client_class"], "mcp")
+        # A `*_once` writes no rule, so it names no class.
+        _clear_all()
+        resp = _resolve(_hold("y.example", client_class="mcp"), "allow_once")
+        self.assertIsNone(resp.args[0]["client_class"])
+
+
+class PendingCardClassTests(_CPTestCase):
+    """What the operator's card says about the class, from ``holds._list_pending``."""
+
+    def test_the_card_carries_the_class_the_request_was_decided_under(self):
+        _hold("x.example", client="172.28.0.4", client_class="mcp")
+        self.assertEqual(cp.holds._list_pending()[0]["client_class"], "mcp")
+
+    def test_existing_is_reported_per_class_not_per_pattern(self):
+        # Keyed by pattern alone, a rule in ANOTHER class would be reported as already
+        # present — so the card would describe a rule as existing while the request
+        # that raised it stayed held, which is the most confusing thing it could say.
+        _set_rules([("x.example", "allow", CLASS)])
+        _hold("x.example", client_class="mcp")
+        options = {o["pattern"]: o["existing"]
+                   for o in cp.holds._list_pending()[0]["persist_options"]}
+        self.assertIsNone(options["x.example"])
+        # The same card for the class that DOES hold the rule reports it.
+        _clear_all()
+        _set_rules([("x.example", "allow", CLASS)])
+        _hold("x.example", client_class=CLASS)
+        options = {o["pattern"]: o["existing"]
+                   for o in cp.holds._list_pending()[0]["persist_options"]}
+        self.assertEqual(options["x.example"], "allow")
+
+    def test_a_card_says_whether_a_rule_can_be_written_at_all(self):
+        # So the UI can disable the persist buttons rather than walk the operator
+        # through a confirm panel to reach a 400.
+        _hold("x.example", "classified", client_class="mcp")
+        _hold("y.example", "unplaceable", client_class=cp.policy.UNCLASSIFIED)
+        persistable = {h["host"]: h["persistable"] for h in cp.holds._list_pending()}
+        self.assertEqual(persistable, {"x.example": True, "y.example": False})
+
+
 class RulesViewTests(_CPTestCase):
     """``/api/rules`` exists so standing policy is not invisible from the UI that
     governs it. It is the complete policy, in precedence order, with the wildcard
     semantics spelled out."""
+
+    def test_every_rule_says_which_client_class_it_decides_for(self):
+        # Without it the listing can show two rows with the same pattern and opposite
+        # actions, which reads as a contradiction rather than as two scoped rules.
+        _set_rules([("pypi.org", "allow", CLASS), ("pypi.org", "block", "mcp")])
+        classes = {(r["pattern"], r["action"]): r["client_class"]
+                   for r in cp.api_rules()}
+        self.assertEqual(classes, {("pypi.org", "allow"): CLASS,
+                                   ("pypi.org", "block"): "mcp"})
+
+    def test_rules_are_grouped_by_class_before_precedence(self):
+        # `_decide` filters to the asking class FIRST and only then lets a block win,
+        # so the listing reads in that order: one class's rules together, blocks first
+        # within each.
+        _set_rules([("a.example", "allow", "mcp"), ("b.example", "block", "mcp"),
+                    ("c.example", "allow", CLASS), ("d.example", "block", CLASS)])
+        listed = [(r["client_class"], r["action"]) for r in cp.api_rules()]
+        self.assertEqual(listed, [("mcp", "block"), ("mcp", "allow"),
+                                  (CLASS, "block"), (CLASS, "allow")])
 
     def test_lists_every_rule_with_source_and_scope(self):
         _set_rules([("example.com", "allow"), ("bad.com", "block"),
@@ -1379,27 +1541,320 @@ class SaturationTests(_CPTestCase):
         self.assertEqual(cp.holds._saturation()["since"], stamped)
 
 
-class FreshSchemaTests(unittest.TestCase):
-    """A brand-new store must carry ``resolved_by`` from the DDL itself.
+class _FreshStoreTestCase(unittest.TestCase):
+    """Base for tests that need a genuinely empty database rather than the shared one:
+    schema questions cannot be asked of a store the rest of the suite has been
+    writing to. ``name`` is per-test so a leftover file never decides the answer."""
 
-    This is what carries the provenance column now that there is no migration step
-    (see the NOTE in ``_init_db``): the one store that predated the column was
-    migrated in place, so every store from here on is created with it. If it ever
-    fell out of the ``CREATE TABLE``, every resolve would fail at runtime, so assert
-    it against a genuinely empty database rather than the shared test one."""
+    def _use_store(self, name):
+        saved = cp.store.DB_PATH
+        path = os.path.join(_TMP, name)
+        if os.path.exists(path):
+            os.unlink(path)
+        cp.store.DB_PATH = path
+        self.addCleanup(setattr, cp.store, "DB_PATH", saved)
+        return path
+
+
+class FreshSchemaTests(_FreshStoreTestCase):
+    """A brand-new store must carry every column the code names, from the DDL itself.
+
+    ``_migrate`` covers the stores that already exist; this covers the ones created
+    from here on, and the two have to agree. If a column fell out of the
+    ``CREATE TABLE``, every statement naming it would fail at runtime on a fresh
+    deployment while every migrated one kept working — the worst shape of bug this
+    schema can have."""
 
     def test_new_store_has_the_provenance_column(self):
-        saved = cp.store.DB_PATH
-        cp.store.DB_PATH = os.path.join(_TMP, "fresh-schema.db")
-        try:
-            cp.store._init_db()
-            with cp.store._connect() as conn:
+        self._use_store("fresh-schema.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(approvals)")}
+        self.assertIn("resolved_by", cols)
+        cp.store._init_db()          # idempotent: a second run must not fail
+
+    def test_new_store_carries_client_class_on_every_table_that_records_one(self):
+        self._use_store("fresh-class-schema.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            for table in ("rules", "audit", "approvals"):
                 cols = {r["name"] for r in
-                        conn.execute("PRAGMA table_info(approvals)")}
-            self.assertIn("resolved_by", cols)
-            cp.store._init_db()          # idempotent: a second run must not fail
-        finally:
-            cp.store.DB_PATH = saved
+                        conn.execute(f"PRAGMA table_info({table})")}
+                self.assertIn("client_class", cols, table)
+
+    def test_a_fresh_stores_rules_default_matches_the_migrations(self):
+        # The DDL default is mirrored from the migration deliberately, so a fresh
+        # store and a migrated one behave identically on an insert that omits the
+        # column. Divergence there would be invisible until a deployment that had
+        # never migrated hit an insert path the migrated ones had exercised for
+        # months.
+        self._use_store("fresh-default.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            conn.execute("INSERT INTO rules(pattern, action, source, created_at) "
+                         "VALUES ('x.example', 'allow', 'test', 0)")
+            conn.commit()
+            self.assertEqual(
+                conn.execute("SELECT client_class FROM rules").fetchone()[0],
+                cp.store.LEGACY_CLIENT_CLASS)
+
+    def test_a_fresh_store_keys_uniqueness_on_the_pattern_and_the_class(self):
+        self._use_store("fresh-unique.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            conn.execute("INSERT INTO rules(pattern, action, source, created_at, "
+                         "client_class) VALUES ('x.example','allow','test',0,'a')")
+            # Same pattern, different class: a different rule, and storable.
+            conn.execute("INSERT INTO rules(pattern, action, source, created_at, "
+                         "client_class) VALUES ('x.example','block','test',0,'b')")
+            conn.commit()
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM rules").fetchone()[0], 2)
+            # Same pattern AND class is still one rule — the constraint `resolve`
+            # relies on for INSERT OR IGNORE to mean "already in force".
+            with self.assertRaises(Exception):
+                conn.execute("INSERT INTO rules(pattern, action, source, "
+                             "created_at, client_class) "
+                             "VALUES ('x.example','allow','test',0,'a')")
+
+
+class MigrationTests(_FreshStoreTestCase):
+    """Upgrading a store that already exists.
+
+    This is the case with the most to lose and the least test coverage available by
+    accident: the store is a long-lived named volume holding the policy rules and the
+    audit history — the crown jewels — and the alternative to migrating it is `make
+    destroy`. So the pre-change schema is built here BY HAND, exactly as the shipped
+    code wrote it, and ``_init_db`` is asked to bring it forward."""
+
+    # The rules/audit/approvals DDL as it stood before client_class, reproduced
+    # rather than referenced: the point is to start from what is actually on disk in
+    # an existing deployment, which no current code path can produce any more.
+    _OLD_SCHEMA = (
+        """CREATE TABLE rules (
+               id INTEGER PRIMARY KEY, pattern TEXT NOT NULL UNIQUE,
+               action TEXT NOT NULL, source TEXT NOT NULL, created_at REAL NOT NULL)""",
+        """CREATE TABLE audit (
+               id INTEGER PRIMARY KEY, ts REAL NOT NULL, decision TEXT NOT NULL,
+               stage TEXT, host TEXT, port INTEGER, proto TEXT, client TEXT,
+               method TEXT, url TEXT, reason TEXT)""",
+        """CREATE TABLE approvals (
+               id TEXT PRIMARY KEY, ts REAL NOT NULL, host TEXT NOT NULL,
+               port INTEGER, proto TEXT, client TEXT, method TEXT, url TEXT,
+               status TEXT NOT NULL, mode TEXT, resolved_at REAL, resolved_by TEXT)""",
+    )
+
+    def _old_store(self, name, rules=(("example.com", "allow", "operator"),)):
+        self._use_store(name)
+        with cp.store._connect() as conn:
+            for ddl in self._OLD_SCHEMA:
+                conn.execute(ddl)
+            conn.executemany(
+                "INSERT INTO rules(pattern, action, source, created_at) "
+                "VALUES (?,?,?, 0)", rules)
+            conn.execute(
+                "INSERT INTO audit(ts, decision, host, client) "
+                "VALUES (1.0, 'allow', 'old.example', '172.30.0.2')")
+            conn.commit()
+
+    def test_existing_rules_survive_and_are_scoped_to_the_agent(self):
+        # The whole risk of this migration in one assertion. Every rule in an existing
+        # store was approved while the proxy had ONE client population, so scoping
+        # them to the agent is what they already meant; losing them, or widening them
+        # to every client, are the two ways to get this wrong.
+        self._old_store("migrate-rules.db",
+                        rules=(("example.com", "allow", "operator"),
+                               ("evil.com", "block", "operator"),
+                               ("pypi.org", "allow", "seed")))
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            rows = {r["pattern"]: (r["action"], r["source"], r["client_class"])
+                    for r in conn.execute(
+                        "SELECT pattern, action, source, client_class FROM rules")}
+        self.assertEqual(rows, {
+            "example.com": ("allow", "operator", cp.store.LEGACY_CLIENT_CLASS),
+            "evil.com": ("block", "operator", cp.store.LEGACY_CLIENT_CLASS),
+            "pypi.org": ("allow", "seed", cp.store.LEGACY_CLIENT_CLASS)})
+
+    def test_rule_ids_are_carried_over_not_regenerated(self):
+        # The UI's revoke button keys on the id, so renumbering during a migration
+        # would aim a click the operator has already made at a different rule.
+        self._old_store("migrate-ids.db",
+                        rules=(("a.example", "allow", "operator"),
+                               ("b.example", "allow", "operator")))
+        with cp.store._connect() as conn:
+            before = {r["id"]: r["pattern"]
+                      for r in conn.execute("SELECT id, pattern FROM rules")}
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            after = {r["id"]: r["pattern"]
+                     for r in conn.execute("SELECT id, pattern FROM rules")}
+        self.assertEqual(before, after)
+
+    def test_the_old_unique_pattern_constraint_is_gone(self):
+        # The reason this is a REBUILD and not an ADD COLUMN. Under the old
+        # constraint a second class could never have a rule for a host the first
+        # already covered: `resolve`'s INSERT OR IGNORE would write nothing and report
+        # the rule already present, leaving that client held forever on a host the
+        # operator believed they had just approved.
+        self._old_store("migrate-unique.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            conn.execute("INSERT INTO rules(pattern, action, source, created_at, "
+                         "client_class) VALUES ('example.com','allow','operator',0,"
+                         "'mcp')")
+            conn.commit()
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM rules WHERE pattern='example.com'")
+                .fetchone()[0], 2)
+
+    def test_audit_and_approvals_gain_a_nullable_column(self):
+        # Records, not constraints: a row written before classes existed genuinely has
+        # no class, and NULL says so where a backfilled name would put a claim in the
+        # audit trail that nothing ever observed.
+        self._old_store("migrate-audit.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            self.assertIsNone(
+                conn.execute("SELECT client_class FROM audit").fetchone()[0])
+            # And the column is writable on new rows, which is the point of adding it.
+            conn.execute("INSERT INTO audit(ts, decision, host, client_class) "
+                         "VALUES (2.0, 'allow', 'new.example', 'mcp')")
+            conn.commit()
+
+    def test_a_migrated_store_decides_exactly_as_it_did_for_the_agent(self):
+        # Behavioural, not structural: after the migration the agent's own traffic
+        # must be decided by the same rules as before. A migration that preserved the
+        # rows but changed what they matched would be worse than one that failed.
+        self._old_store("migrate-decide.db",
+                        rules=(("example.com", "allow", "operator"),
+                               ("evil.com", "block", "operator")))
+        cp.store._init_db()
+        self.assertEqual(cp.policy._decide("example.com", CLASS)[0], "allow")
+        self.assertEqual(cp.policy._decide("evil.com", CLASS)[0], "deny")
+        # ...and decides nothing for the population that did not exist before it.
+        self.assertEqual(cp.policy._decide("example.com", "mcp")[0], "hold")
+
+    def test_a_migrated_rules_table_has_the_same_schema_as_a_fresh_one(self):
+        # The DDL is written twice — once in `_init_db`, once in the rebuild — and
+        # divergence between them is the failure mode with no symptom: both stores
+        # work, differently, until one hits an insert path the other has not. Compared
+        # as SQL text, normalized for whitespace and for the temporary table name the
+        # rebuild renames away.
+        self._old_store("migrate-schema.db")
+        cp.store._init_db()
+        migrated = self._rules_sql()
+        self._use_store("fresh-for-compare.db")
+        cp.store._init_db()
+        self.assertEqual(migrated, self._rules_sql())
+
+    @staticmethod
+    def _rules_sql():
+        with cp.store._connect() as conn:
+            sql = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='rules'"
+            ).fetchone()[0]
+        # Comments and indentation differ between the two definitions on purpose —
+        # one explains itself in place, the other explains itself in `_migrate`. What
+        # must match is the columns, their types, their defaults and the constraint.
+        sql = re.sub(r"--[^\n]*", " ", sql)
+        # `ALTER TABLE ... RENAME TO` rewrites the stored DDL with the new name
+        # QUOTED, so a migrated table reads `CREATE TABLE "rules"` where a fresh one
+        # reads `CREATE TABLE rules`. Same table, SQLite's own spelling.
+        sql = sql.replace('"rules"', "rules").replace("rules_migrating", "rules")
+        return " ".join(sql.split())
+
+    def test_migration_is_idempotent(self):
+        self._old_store("migrate-twice.db")
+        cp.store._init_db()
+        cp.store._init_db()
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM rules").fetchone()[0], 1)
+            # And it leaves no scaffolding behind for the next one to trip over.
+            names = {r["name"] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            self.assertNotIn("rules_migrating", names)
+
+    def test_a_fresh_store_needs_no_migration_at_all(self):
+        # `_migrate` runs on every start, including the first. On an empty file there
+        # is nothing to inspect and it must be a clean no-op rather than an error.
+        self._use_store("migrate-fresh.db")
+        cp.store._migrate()
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM rules").fetchone()[0], 0)
+
+    def test_a_failed_migration_leaves_the_rules_intact(self):
+        # The crash window the explicit BEGIN/COMMIT exists to close: without a
+        # transaction around the copy and the DROP, a failure between them loses every
+        # policy rule in the store. Injected at the rename, which is after the DROP.
+        self._old_store("migrate-crash.db",
+                        rules=(("keep.example", "allow", "operator"),))
+        real_connect = cp.store._connect
+
+        class _FailsOnRename:
+            """Wraps the connection rather than patching it: sqlite3.Connection.execute
+            is read-only, so the fault has to be injected from outside the object."""
+
+            def __init__(self, conn):
+                object.__setattr__(self, "_conn", conn)
+
+            def execute(self, sql, *a):
+                if "RENAME TO rules" in sql:
+                    raise RuntimeError("injected failure mid-migration")
+                return self._conn.execute(sql, *a)
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+            def __setattr__(self, name, value):
+                setattr(self._conn, name, value)
+
+            def __enter__(self):
+                self._conn.__enter__()
+                return self
+
+            def __exit__(self, *exc):
+                return self._conn.__exit__(*exc)
+
+        with mock.patch.object(cp.store, "_connect",
+                               lambda: _FailsOnRename(real_connect())), \
+                self.assertRaises(RuntimeError):
+            cp.store._migrate()
+        # The rules table is still there, still holding the rule, still on the old
+        # schema — a failed migration that can be retried, not a destroyed store.
+        with cp.store._connect() as conn:
+            rows = [r["pattern"] for r in conn.execute("SELECT pattern FROM rules")]
+        self.assertEqual(rows, ["keep.example"])
+        # And a retry after the fault clears completes it.
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            self.assertEqual(
+                conn.execute("SELECT client_class FROM rules").fetchone()[0],
+                cp.store.LEGACY_CLIENT_CLASS)
+
+
+class LegacyClassNameTests(unittest.TestCase):
+    """``store.LEGACY_CLIENT_CLASS`` and the class names in ``policy`` are two
+    spellings of one thing, and nothing in the code ties them: ``store`` is the bottom
+    of the dependency order and must not import ``policy``. If they drift, every rule
+    a migration wrote becomes dead — matching a class no client is ever placed in —
+    and the symptom is that the agent is suddenly held for hosts it has always
+    reached. So the suite is the tie."""
+
+    def test_the_backfill_class_is_one_the_default_map_can_produce(self):
+        names = {name for name, _ in
+                 cp.policy._parse_client_classes(cp.policy.CLIENT_CLASSES_DEFAULT)}
+        self.assertIn(cp.store.LEGACY_CLIENT_CLASS, names)
+
+    def test_the_backfill_class_is_the_one_the_sandbox_lands_in(self):
+        # Stronger than membership: it must be the class the AGENT is placed in,
+        # since that is whose approvals the backfilled rules were.
+        self.assertEqual(cp.policy._client_class(CLASS_IP),
+                         cp.store.LEGACY_CLIENT_CLASS)
 
 
 class SeedTests(_CPTestCase):

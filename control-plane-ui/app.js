@@ -318,6 +318,15 @@ function auditRow(r) {
     // An em dash rather than an empty cell: blank reads as "this column is broken",
     // whereas the honest statement is that no client was recorded for this row.
     client: (r && r.client) || "—",
+    // The client CLASS, prefixed to the address the same way `stagePrefix` qualifies
+    // the host — because it is what the decision was actually taken against, while
+    // the address is only how the class was worked out. An operator scanning this
+    // column wants "was this the agent or an MCP server", not a fourth octet.
+    //
+    // ABSENT for a row written before client classes existed, and for one the
+    // backend could not place. Rendering nothing in that case is deliberate: an
+    // invented label would be a claim, and these rows are evidence.
+    clientClassPrefix: r && r.client_class ? `${r.client_class} · ` : "",
     reason: (r && r.reason) || "",
     // /api/audit groups rows by exactly the fields rendered here, so `n` is how many
     // identical decisions this line stands for. Empty at n<=1, which is the ordinary
@@ -765,8 +774,16 @@ function start() {
 
     const meta = document.createElement("div");
     meta.className = "meta";
+    // The client class rides WITH the address rather than replacing it: the address
+    // is what was observed and the class is what a persisted rule would be scoped to,
+    // and an operator deciding a card needs both — "from 172.28.0.3 (mcp)" answers
+    // both "who asked" and "who would this grant cover".
     meta.textContent = [a.proto || null, `requested ${fmtTime(a.ts)}`,
-                        a.client ? `from ${a.client}` : null, a.url || null]
+                        a.client
+                          ? `from ${a.client}`
+                            + (a.client_class ? ` (${a.client_class})` : "")
+                          : null,
+                        a.url || null]
       .filter(Boolean).join(" · ");
 
     // The hold countdown, hidden until /api/config has told us the window — the page
@@ -808,10 +825,26 @@ function start() {
       action: null,            // which *_persist action the confirm panel is for
     };
 
+    // Whether a standing rule can be written for this request at all. A rule is
+    // scoped to a client class, and a client the backend could not place has none —
+    // `resolve` refuses the persist with a 400. Offering the button anyway would put
+    // the operator through the confirm panel to reach a refusal, so it is disabled
+    // here with the reason on it, the same "say it before the click" the conflict
+    // preview does. `!== false` so a backend that predates the field behaves exactly
+    // as it did: absent means allowed.
+    const persistable = a.persistable !== false;
     for (const [action, label, kind] of ACTIONS) {
       const b = document.createElement("button");
       b.className = kind;
       b.textContent = label;
+      if (action.endsWith("persist") && !persistable) {
+        b.disabled = true;
+        b.title = "No standing rule can be written for an unclassified client — "
+                + "decide this request with a once action, or map its network in "
+                + "CONTROL_CLIENT_CLASSES.";
+        actions.append(b);
+        continue;
+      }
       // The two `*_persist` actions write standing policy, so they open the confirm
       // panel; the `*_once` actions decide this request only and stay a single click.
       b.addEventListener("click", () => action.endsWith("persist")
@@ -1299,7 +1332,9 @@ function start() {
           <td>${a.stagePrefix ? `<span class="qual">${esc(a.stagePrefix)}</span>` : ""
             }${esc(a.host)}${a.repeat
               ? `<span class="rep">${esc(" " + a.repeat)}</span>` : ""}</td>
-          <td class="ts">${esc(a.client)}</td>
+          <td class="ts">${a.clientClassPrefix
+            ? `<span class="qual">${esc(a.clientClassPrefix)}</span>` : ""
+            }${esc(a.client)}</td>
           <td>${esc(a.reason)}${a.firstTs
             ? esc(` · first seen ${fmtStamp(a.firstTs)}`) : ""}</td></tr>`;
     }).join("");
@@ -1331,12 +1366,15 @@ function start() {
     }
     rulesFailed = false;
     rulesLoaded = true;
-    // Signature over pattern+action, not just the COUNT: a rule whose action
-    // flipped is the change most worth noticing, and it leaves the count alone.
+    // Signature over pattern+action+class, not just the COUNT: a rule whose action
+    // flipped is the change most worth noticing, and it leaves the count alone. The
+    // class is in it for the same reason — the same pattern and action in a second
+    // class is a real policy change, and without it two such rules sign identically.
     // Keyed by id so the click handler works from the ROW rather than from
     // markup it would otherwise have to parse back out of the DOM.
     rulesById = new Map(rows.map(r => [String(r.id), r]));
-    const sig = JSON.stringify(rows.map(r => r.action + " " + r.pattern));
+    const sig = JSON.stringify(
+      rows.map(r => r.action + " " + r.pattern + " " + (r.client_class || "")));
     if (policySig !== null && sig !== policySig && current !== "policy") {
       policyUnseen = true;
     }
@@ -1359,6 +1397,11 @@ function start() {
         <td><span class="tag ${esc(r.action)}">${esc(r.action)}</span></td>
         <td><code>${esc(r.pattern)}</code></td>
         <td class="${wild ? "wild" : "ts"}">${esc(r.scope)}</td>
+        <!-- WHICH client population this rule decides for. Load-bearing rather than
+             informational: the same pattern can appear twice with different actions,
+             one row per class, and without this column those two rows look like a
+             contradiction instead of two scoped rules. -->
+        <td class="ts">${esc(r.client_class || "")}</td>
         <td class="ts">${esc(r.source)}</td>
         <td class="ts">${r.created_at ? fmtStamp(r.created_at) : ""}</td>
         <td>${control}</td></tr>`;

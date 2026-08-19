@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for the control plane's security-load-bearing logic
 (``control-plane/app.py``): the policy decision ``_decide`` (block-wins-over-allow,
-subdomain semantics, default-hold) and the hold registry
-(``_reserve_hold`` / ``_release_hold``: the two caps, and duplicate grouping).
+subdomain semantics, default-hold, and per-client-class scoping), the address ->
+class mapping that feeds it, and the hold registry (``_reserve_hold`` /
+``_release_hold``: the two caps, and duplicate grouping).
 
 The hold cap is exactly what ``boundary-check.sh`` cannot assert: an over-cap
 request returns the same opaque 403 to the agent as any other deny, so the cap's
@@ -30,13 +31,19 @@ from _loader import load_control_plane  # noqa: E402 (must set env first)
 cp = load_control_plane()
 
 
+CLASS = cp.store.LEGACY_CLIENT_CLASS          # the class these tests decide as
+
+
 def _set_rules(rules):
-    """Replace the rules table with (pattern, action) tuples."""
+    """Replace the rules table with (pattern, action) or (pattern, action, class)
+    tuples. The two-element form is the common case — a rule for ``CLASS`` — so the
+    class-scoping tests are the ones that have to say so, not every other test."""
     with cp.store._connect() as conn:
         conn.execute("DELETE FROM rules")
         conn.executemany(
-            "INSERT INTO rules(pattern, action, source, created_at) "
-            "VALUES (?,?, 'test', 0)", rules)
+            "INSERT INTO rules(pattern, action, source, created_at, client_class) "
+            "VALUES (?,?, 'test', 0, ?)",
+            [r if len(r) == 3 else (*r, CLASS) for r in rules])
         conn.commit()
 
 
@@ -46,50 +53,170 @@ class DecideTests(unittest.TestCase):
         _set_rules([])
 
     def test_unmatched_host_is_held(self):
-        decision, reason = cp.policy._decide("unknown.example.com")
+        decision, reason = cp.policy._decide("unknown.example.com", CLASS)
         self.assertEqual(decision, "hold")
         self.assertIn("held for approval", reason)
 
     def test_exact_allow_rule(self):
         _set_rules([("example.com", "allow")])
-        self.assertEqual(cp.policy._decide("example.com")[0], "allow")
+        self.assertEqual(cp.policy._decide("example.com", CLASS)[0], "allow")
         # A bare rule must not authorize a subdomain.
-        self.assertEqual(cp.policy._decide("a.example.com")[0], "hold")
+        self.assertEqual(cp.policy._decide("a.example.com", CLASS)[0], "hold")
 
     def test_block_rule_denies(self):
         _set_rules([("blocked.com", "block")])
-        self.assertEqual(cp.policy._decide("blocked.com")[0], "deny")
+        self.assertEqual(cp.policy._decide("blocked.com", CLASS)[0], "deny")
 
     def test_block_wins_over_allow(self):
-        # A host can't be both allowed and blocked by one pattern (rules.pattern
-        # is UNIQUE), but two DISTINCT patterns can both match a host — e.g. a
-        # wildcard allow with a specific-subdomain block. Block must win.
+        # A host can't be both allowed and blocked by one pattern in one class
+        # (UNIQUE(pattern, client_class)), but two DISTINCT patterns can both match a
+        # host — e.g. a wildcard allow with a specific-subdomain block. Block wins.
         _set_rules([(".example.com", "allow"), ("evil.example.com", "block")])
-        decision, reason = cp.policy._decide("evil.example.com")
+        decision, reason = cp.policy._decide("evil.example.com", CLASS)
         self.assertEqual(decision, "deny")
         self.assertIn("blocked", reason)
         # A sibling under the same wildcard is still allowed.
-        self.assertEqual(cp.policy._decide("safe.example.com")[0], "allow")
+        self.assertEqual(cp.policy._decide("safe.example.com", CLASS)[0], "allow")
 
     def test_subdomain_allow_matches_apex_and_children(self):
         _set_rules([(".example.com", "allow")])
-        self.assertEqual(cp.policy._decide("example.com")[0], "allow")
-        self.assertEqual(cp.policy._decide("a.b.example.com")[0], "allow")
-        self.assertEqual(cp.policy._decide("notexample.com")[0], "hold")
+        self.assertEqual(cp.policy._decide("example.com", CLASS)[0], "allow")
+        self.assertEqual(cp.policy._decide("a.b.example.com", CLASS)[0], "allow")
+        self.assertEqual(cp.policy._decide("notexample.com", CLASS)[0], "hold")
 
     def test_decision_is_case_insensitive(self):
         _set_rules([("example.com", "allow")])
-        self.assertEqual(cp.policy._decide("EXAMPLE.COM")[0], "allow")
+        self.assertEqual(cp.policy._decide("EXAMPLE.COM", CLASS)[0], "allow")
 
     def test_trailing_fqdn_dot_is_normalized(self):
         # `evil.com.` and `evil.com` are the same destination, so an operator BLOCK of
         # `evil.com` must not be evadable with the trailing-dot spelling — which would
         # otherwise miss the rule, land in a hold and be re-promptable indefinitely.
         _set_rules([("evil.com", "block")])
-        self.assertEqual(cp.policy._decide("evil.com.")[0], "deny")
+        self.assertEqual(cp.policy._decide("evil.com.", CLASS)[0], "deny")
         # A trailing dot on an allowed host still resolves to allow, not hold.
         _set_rules([("example.com", "allow")])
-        self.assertEqual(cp.policy._decide("example.com.")[0], "allow")
+        self.assertEqual(cp.policy._decide("example.com.", CLASS)[0], "allow")
+
+
+class ClientClassDecisionTests(unittest.TestCase):
+    """A rule decides for ONE client population. This is the least-privilege property
+    the whole column exists for: before it, every host an operator ever approved for
+    the agent was reachable by every container the egress proxy served — and since
+    mcp-net that includes third-party server images holding a credential the sandbox
+    must not have."""
+
+    def setUp(self):
+        cp.store._init_db()
+        _set_rules([])
+
+    def test_an_allow_for_one_class_does_not_decide_for_another(self):
+        _set_rules([("api.github.com", "allow", "sandbox")])
+        self.assertEqual(cp.policy._decide("api.github.com", "sandbox")[0], "allow")
+        self.assertEqual(cp.policy._decide("api.github.com", "mcp")[0], "hold")
+
+    def test_a_block_for_one_class_does_not_deny_another(self):
+        # The same isolation in the other direction. Stated separately because a
+        # matcher that filtered only the allow pass would still pass the test above
+        # while letting one class's block silently deny every other client.
+        _set_rules([("evil.com", "block", "sandbox")])
+        self.assertEqual(cp.policy._decide("evil.com", "sandbox")[0], "deny")
+        self.assertEqual(cp.policy._decide("evil.com", "mcp")[0], "hold")
+
+    def test_block_wins_over_allow_only_within_a_class(self):
+        # A block written for `mcp` must not reach into the agent's decision, even
+        # though block-wins-over-allow is the strongest precedence rule here. Filtering
+        # AFTER the block pass instead of before would fail exactly this.
+        _set_rules([(".example.com", "allow", "sandbox"),
+                    ("evil.example.com", "block", "mcp")])
+        self.assertEqual(cp.policy._decide("evil.example.com", "sandbox")[0], "allow")
+        self.assertEqual(cp.policy._decide("evil.example.com", "mcp")[0], "deny")
+
+    def test_the_same_pattern_can_be_allowed_and_blocked_in_different_classes(self):
+        # The case UNIQUE(pattern) made unstorable, which is why the migration rebuilds
+        # the table rather than adding a column: one host the agent may reach and an
+        # MCP server may not is an ordinary policy, not a contradiction.
+        _set_rules([("pypi.org", "allow", "sandbox"), ("pypi.org", "block", "mcp")])
+        self.assertEqual(cp.policy._decide("pypi.org", "sandbox")[0], "allow")
+        self.assertEqual(cp.policy._decide("pypi.org", "mcp")[0], "deny")
+
+    def test_an_unclassified_client_matches_nothing_and_is_held(self):
+        _set_rules([("example.com", "allow", "sandbox")])
+        decision, _ = cp.policy._decide("example.com", cp.policy.UNCLASSIFIED)
+        self.assertEqual(decision, "hold")
+
+    def test_the_hold_reason_names_the_classes_that_do_match(self):
+        # "I already approved this host, why am I being asked again?" — the answer is
+        # that the rule belongs to another client population, and only the reason line
+        # can carry it. Without this the two failure modes (host unknown vs host known
+        # to someone else) are one indistinguishable hold.
+        _set_rules([("api.github.com", "allow", "sandbox")])
+        _, reason = cp.policy._decide("api.github.com", "mcp")
+        self.assertIn("mcp", reason)
+        self.assertIn("matched only for: sandbox", reason)
+        # A genuinely unknown host says no such thing — there is nothing to name.
+        _, reason = cp.policy._decide("unheard-of.example", "mcp")
+        self.assertNotIn("matched only for", reason)
+
+    def test_the_deciding_rules_class_is_named_in_the_reason(self):
+        _set_rules([("example.com", "allow", "sandbox")])
+        self.assertIn("for sandbox", cp.policy._decide("example.com", "sandbox")[1])
+
+
+class ClientClassMappingTests(unittest.TestCase):
+    """Peer address -> class. Everything unplaceable lands on UNCLASSIFIED, which
+    matches no rule and is therefore held: a caller that cannot be identified gets
+    governed, not exempted."""
+
+    def _classify(self, client, spec="sandbox=172.30.0.0/24,mcp=172.28.0.0/24"):
+        saved = cp.policy.CLIENT_CLASSES
+        cp.policy.CLIENT_CLASSES = cp.policy._parse_client_classes(spec)
+        try:
+            return cp.policy._client_class(client)
+        finally:
+            cp.policy.CLIENT_CLASSES = saved
+
+    def test_an_address_maps_to_its_networks_class(self):
+        self.assertEqual(self._classify("172.30.0.2"), "sandbox")
+        self.assertEqual(self._classify("172.28.0.3"), "mcp")
+
+    def test_an_address_outside_every_range_is_unclassified(self):
+        self.assertEqual(self._classify("10.1.2.3"), cp.policy.UNCLASSIFIED)
+
+    def test_a_missing_or_malformed_address_is_unclassified(self):
+        for value in (None, "", "not-an-ip", "agent-1", "172.30.0.999"):
+            self.assertEqual(self._classify(value), cp.policy.UNCLASSIFIED, value)
+
+    def test_a_bracketed_v6_literal_is_unwrapped_like_the_proxy_does(self):
+        self.assertEqual(self._classify("[fd00::2]", "mcp=fd00::/8"), "mcp")
+
+    def test_containment_does_not_cross_address_families(self):
+        # A v4 client must not fall into a v6 range or the reverse — which would be a
+        # silent mis-scoping rather than an error.
+        self.assertEqual(self._classify("172.30.0.2", "mcp=fd00::/8"),
+                         cp.policy.UNCLASSIFIED)
+
+    def test_one_class_may_span_several_ranges(self):
+        spec = "sandbox=172.30.0.0/24,sandbox=10.9.0.0/16"
+        self.assertEqual(self._classify("10.9.4.5", spec), "sandbox")
+
+    def test_the_first_listed_match_wins(self):
+        spec = "first=10.0.0.0/8,second=10.0.0.0/8"
+        self.assertEqual(self._classify("10.1.1.1", spec), "first")
+
+    def test_an_unparseable_entry_is_dropped_not_fatal(self):
+        # Its clients fall through to UNCLASSIFIED and are HELD, so a typo in the
+        # config costs approvals rather than granting any.
+        spec = "sandbox=not-a-cidr,mcp=172.28.0.0/24"
+        self.assertEqual(self._classify("172.30.0.2", spec), cp.policy.UNCLASSIFIED)
+        self.assertEqual(self._classify("172.28.0.2", spec), "mcp")
+
+    def test_unclassified_cannot_be_claimed_as_a_class_name(self):
+        # Otherwise a config could name a real network `unclassified` and rules
+        # written for genuinely-unplaceable clients would start deciding for it.
+        spec = f"{cp.policy.UNCLASSIFIED}=10.0.0.0/8"
+        self.assertEqual(self._classify("10.1.1.1", spec), cp.policy.UNCLASSIFIED)
+        self.assertEqual(cp.policy._parse_client_classes(spec), ())
 
 
 class MatchTests(unittest.TestCase):

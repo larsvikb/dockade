@@ -984,10 +984,51 @@ nothing holds and the control plane never records. Enforced by `_is_lifeline` in
 safe way — no client qualifies and every host becomes the control plane's call —
 which is why, unlike `EGRESS_FORBIDDEN_CIDRS`, it carries no startup assertion.
 
-A consequence worth stating because the topology now invites the mistake: adding a
-network to this proxy adds a **client population**, not just a route. Egress policy
-is still per-host, so every rule the operator ever approved for the agent is
-reachable by every container on every network the proxy serves.
+A consequence worth stating because the topology invites the mistake: adding a
+network to this proxy adds a **client population**, not just a route. That is what
+per-client-class policy below answers.
+
+### Policy is scoped to a client class
+
+**A rule decides for one client population and no other.** `_decide` takes the host
+*and* the class of client asking, and a rule carries the class it was written for, so
+a host the operator approved for the agent is still unknown to an MCP server and is
+held the first time one asks. Without this a single allowlist becomes the union of
+every client's needs — least privilege eroding by construction the moment there is a
+second consumer, and the second consumer here is the one process holding a
+write-capable credential.
+
+**The identity primitive is the ingress network**, not the source address. Topology
+is provable; addresses are not, since sandboxes are ephemeral and Docker hands `.2`
+to whichever container starts first — a rule keyed to an address would silently
+transfer to the next tenant of it. Named ranges live in `policy.CLIENT_CLASSES`, and
+`tests/test_topology.py` holds them equal to the compose subnets, non-overlapping,
+and equal to the lifeline's range for the agent's class.
+
+**The classification is the control plane's, not the proxy's**, which is the one
+placement decision here worth arguing. The proxy observes the peer address and
+already CIDR-matches one — but only for the lifeline, and only because the lifeline
+is the allow it makes *without* asking. Every other decision belongs to the policy
+authority, so the class is derived where the decision is taken. One mapping then
+serves however many governed proxies call `/authorize`, rather than each carrying a
+copy to drift; the MCP gateway will be the second.
+
+**Unplaceable fails safe, and cannot become a scope.** A client in no configured
+range is `unclassified`: it matches no rule and is held, the same default-deny an
+unknown host gets. `resolve` refuses to *persist* for one, because a rule scoped to
+"whoever we could not identify" would grant to every future unidentified client —
+the erosion this dimension exists to stop, reintroduced through the approval flow.
+`allow_once` still works, so an operator is never stuck; the card says so before the
+click rather than after.
+
+**Existing rules were backfilled to the agent's class, and that is what they meant.**
+They were approved while the proxy had one client population. Widening them to every
+client would have granted the whole accumulated allowlist to `mcp-net`; narrowing
+them differently would have revoked policy a human decided. Uniqueness became the
+*pair* — the same pattern can be allowed for one class and blocked for another — so
+this needed a table rebuild rather than an added column, and the store now has a real
+`_migrate` (see the NOTE under `store._init_db`, and the SQLite DDL note in
+`NOTES.md`).
 
 **Ingesting the decisions the proxy makes alone.** Those two properties, plus the
 relay guard, the port gate and the SNI anti-fronting check, mean a real share of
@@ -1731,6 +1772,50 @@ brings the container up; the control plane owns which of the running servers are
 enabled and what each of their tools may do. The policy store holds nothing that
 grants — it never sees a credential.
 
+**Per-server identity has two different answers, because it is asked on two paths
+that do not meet.** Conflating them is the easy mistake here.
+
+- **Tool calls** run sandbox → gateway → server. The gateway *dialled* the server,
+  by name, so the identity is the name it used. It needs no address, no resolution
+  and no registry lookup to say which server a call is for. This is the identity
+  per-tool policy is keyed on.
+- **A server's own egress** runs server → egress proxy → internet, and the gateway
+  is not in it: `HTTPS_PROXY` on each server container points at the egress proxy
+  directly. The proxy has a TCP connection and nothing else, so the peer **address**
+  is the only handle that exists. This is the identity `rules.client_class` is keyed
+  on (see "Policy is scoped to a client class").
+
+The consequence is that the gateway cannot supply the client class. It is absent
+from the conversation that needs it, and a server makes egress calls with no tool
+call in flight at all — at startup, on a token refresh, on a background poll.
+
+**So the addresses are pinned, in `mcp-servers.yml` beside the server they belong
+to.** A dynamic address is not an identity: Docker allocates in start order, so a
+restarted server can inherit the address a different server just vacated and have
+its egress decided under that server's rules — an ordinary operational race needing
+no attacker. Pinning removes it rather than narrowing it, and it costs one line in
+the file that is being edited anyway. `tests/test_topology.py` holds every server to
+it, since an unpinned server does not fail loudly — it quietly stops being separable.
+
+**Egress classes stay per-network until a second server exists.** With addresses
+pinned, splitting `mcp` into one class per server is a one-line change to
+`policy.CLIENT_CLASSES` and an `UPDATE` on the rules table — the column is free-form
+text, so no schema change and no migration. That cheapness is the argument for
+waiting: today one server shares a class with nobody, and what a second server's host
+needs look like is not yet known. What is *not* deferrable is the pin, because it has
+to be true before any of it is sound.
+
+The bound while it waits, stated so it is known rather than rediscovered: containers
+on `mcp-net` share one egress class, so a second MCP server inherits the first's
+approved hosts. It reaches nothing approved only for the agent.
+
+**The alternative that would remove the pins is worth naming, and rejecting.** Point
+each server's `HTTPS_PROXY` at the *gateway*, have it forward upstream, and it can
+annotate every request with the server it came from — per-server identity, no
+addresses. It also makes the gateway a forward proxy as well as an MCP gateway, puts
+it in the path of every server's TLS, and turns a gateway outage into an egress
+outage. Against one line of YAML per server, the trade is not close.
+
 **A credential should live as far from the agent as its server allows — which is
 usually the server container, not the gateway.** The rule follows from what each
 component is: MCP server containers sit on `mcp-net` with **no route from the
@@ -2375,17 +2460,14 @@ control.
   near-identical.
 - **Should tier 2 ever get governed egress?** Today it has none, which is what
   makes its boundary evidence so clean. Granting it would make tier 2 a second
-  egress-proxy client and immediately forces the per-client-class question below.
-  Not needed until a worker task needs to fetch something.
-- **Per-client-class policy.** A single global allowlist becomes the union of
-  every client's needs, which erodes least privilege as soon as there is a second
-  consumer — and the approval semantics above mean the postures genuinely differ.
-  The identity primitive should be the **ingress network**, matching this design's
-  existing idiom (topology is provable; source IPs are not, since sandboxes are
-  ephemeral with dynamic addresses). Keep **one** proxy so the audit stream stays
-  single. Cheap step available now: give policy rules and audit rows a
-  client-class dimension even while only one class exists — adding a column to a
-  young schema is free, retrofitting one into accumulated crown-jewel state is not.
+  egress-proxy client — which is now a solved shape rather than an open question:
+  give its network a class in `policy.CLIENT_CLASSES` and its rules are its own
+  (see "Policy is scoped to a client class"). Still not needed until a worker task
+  needs to fetch something.
+- **RESOLVED — per-client-class policy.** Shipped: rules, audit rows and approvals
+  carry a client class, keyed on the ingress network. What remains open from this
+  item is only the *worker* half above — an unattended tier's posture differs in
+  its approval semantics, not in how its rules are scoped.
 - **Where does worker output go, and is it audited?** An unattended job's output
   *is* its consequential action, but with no egress there is nothing at the
   network choke point to log. "Everything consequential is audited" currently has
@@ -2510,6 +2592,7 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | 4 | pull-through package cache | planned |
 | — | governed git push path | planned |
 | — | `mcp-net` + MCP server catalogue (`mcp-servers.yml`) | **done** — inert until the gateway exists |
+| — | per-client-class egress policy | **done** |
 | — | MCP gateway — per-tool allow/deny/ask | planned (needs 2c's per-proxy config + rule editing) |
 
 The rationale for each shipped item lives under **Governance surfaces** above, not here

@@ -21,7 +21,10 @@ module per concern, and every call below is written qualified (``policy._decide`
 They import in that order and never back: nothing under this file imports this
 file.
 
-The authorize flow (one call from the proxy, `POST /authorize`):
+The authorize flow (one call from the proxy, `POST /authorize`). Every rule is scoped
+to a CLIENT CLASS — the ingress network the caller reached the proxy on, named by
+``policy._client_class`` — so "matches" below means matches for the class asking, and
+a rule written for one client population decides nothing for another:
   - host matches a BLOCK rule            -> deny   (audited)
   - host matches an ALLOW rule           -> allow  (audited)
   - no matching rule                     -> HOLD: record a pending approval and
@@ -273,13 +276,18 @@ def healthz() -> dict:
 
 @authorize_app.post("/authorize", response_model=AuthorizeResponse)
 def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
-    decision, reason = policy._decide(req.host)
+    # Derived HERE, once, and carried through every write this request makes — the
+    # audit rows, the approvals row, and via that row the rule a persist writes. One
+    # derivation rather than several means the value that DECIDED the request is the
+    # same one that gets recorded, by construction instead of by two lookups agreeing.
+    client_class = policy._client_class(req.client)
+    decision, reason = policy._decide(req.host, client_class)
 
     if decision in ("allow", "deny"):
         # Every decision is audited — no governed path bypasses the log (CLAUDE.md).
         store._audit(decision, stage=req.stage, host=req.host, port=req.port,
-                     proto=req.proto, client=req.client, method=req.method,
-                     url=req.url, reason=reason)
+                     proto=req.proto, client=req.client, client_class=client_class,
+                     method=req.method, url=req.url, reason=reason)
         return AuthorizeResponse(decision=decision, reason=reason)
 
     # HOLD (bounded): reserve a hold slot atomically with the cap check, so
@@ -292,8 +300,8 @@ def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
                                req.host, req.port, req.proto)
     if slot.refused is not None:
         store._audit("deny", stage=req.stage, host=req.host, port=req.port,
-                     proto=req.proto, client=req.client, method=req.method,
-                     url=req.url, reason=slot.refused)
+                     proto=req.proto, client=req.client, client_class=client_class,
+                     method=req.method, url=req.url, reason=slot.refused)
         return AuthorizeResponse(decision="deny", reason=slot.refused)
     approval_id, event = slot.approval_id, slot.event
 
@@ -301,17 +309,19 @@ def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
         now = time.time()
         with store._connect() as conn:
             conn.execute(
-                "INSERT INTO approvals(id, ts, host, port, proto, client, method, "
-                "url, status) VALUES (?,?,?,?,?,?,?,?, 'pending')",
+                "INSERT INTO approvals(id, ts, host, port, proto, client, "
+                "client_class, method, url, status) "
+                "VALUES (?,?,?,?,?,?,?,?,?, 'pending')",
                 (approval_id, now, req.host, req.port, req.proto, req.client,
-                 req.method, req.url))
+                 client_class, req.method, req.url))
             conn.commit()
     # Audited PER REQUEST either way, with this request's own method and url, because
     # grouping is a concept of the screen and the worker pool — never of the record.
     # The joiner's reason names the card it attached to, so the log explains on its own
     # terms why four requests produced one approval and one decision.
     store._audit("hold", stage=req.stage, host=req.host, port=req.port,
-                 proto=req.proto, client=req.client, method=req.method, url=req.url,
+                 proto=req.proto, client=req.client, client_class=client_class,
+                 method=req.method, url=req.url,
                  reason=(f"joined hold {approval_id} — duplicate of a request already "
                          "awaiting approval" if slot.joined else "held for approval"))
 
@@ -365,8 +375,8 @@ def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
     else:  # 'denied' (or any non-allowed terminal state) — default-deny
         final, why = "deny", f"human rejection ({scope}) [{actor}]"
     store._audit(final, stage=req.stage, host=req.host, port=req.port,
-                 proto=req.proto, client=req.client, method=req.method, url=req.url,
-                 reason=why)
+                 proto=req.proto, client=req.client, client_class=client_class,
+                 method=req.method, url=req.url, reason=why)
     return AuthorizeResponse(decision=final, reason=why)
 
 
@@ -397,15 +407,37 @@ def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResp
 
     with store._connect() as conn:
         row = conn.execute(
-            "SELECT host FROM approvals WHERE id=?", (approval_id,)).fetchone()
+            "SELECT host, client_class FROM approvals WHERE id=?",
+            (approval_id,)).fetchone()
         if row is None:
             return JSONResponse({"ok": False, "detail": "unknown"}, status_code=404)
+        # The class the request was DECIDED under, read from the durable row — the
+        # same discipline ``host`` follows just below, and for the same reason. The
+        # rule this writes must be scoped to the population the card was raised for,
+        # and the durable row is the only thing that knows that; re-deriving it from
+        # the address here would be a second implementation of the classification for
+        # the one caller whose answer becomes standing policy.
+        client_class = row["client_class"]
         # Settle WHAT a persist writes before anything is written, and settle it from
         # the host on the durable row rather than from the request body — the caller
         # chooses among candidates, it does not supply them (see
         # policy._persist_candidates).
         pattern = None
         if persist:
+            if not client_class or client_class == policy.UNCLASSIFIED:
+                # A rule needs a class to be scoped to, and "whoever we could not
+                # identify" is not one: it would grant to every future unidentified
+                # client, which is precisely the union-of-needs erosion the class
+                # dimension exists to stop. Refused before the UPDATE like the two
+                # branches below, so the approval stays pending — the operator can
+                # still decide this request with a `*_once` action, and is never stuck.
+                return JSONResponse(
+                    {"ok": False,
+                     "detail": f"this request came from an unclassified client "
+                               f"({row['client_class'] or 'none recorded'}), so no "
+                               f"standing rule can be scoped to it. Decide it with a "
+                               f"*_once action, or map its network in "
+                               f"CONTROL_CLIENT_CLASSES."}, status_code=400)
             allowed = policy._persist_candidates(row["host"])
             if not allowed:
                 return JSONResponse(
@@ -440,18 +472,27 @@ def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResp
             # holds for sibling hosts, resolved with the same broadened pattern in
             # opposite directions, is the shape — which is what a burst of holds across
             # one domain looks like.
+            #
+            # Scoped to THIS client class, matching the UNIQUE(pattern, client_class)
+            # the insert below collides on. A rule for the same pattern in another
+            # class is not a conflict — it is a different rule that decides for a
+            # different client population, and refusing on it would make one class's
+            # policy unwritable because another's already covered the host.
             existing = conn.execute(
-                "SELECT action FROM rules WHERE pattern=?", (pattern,)).fetchone()
+                "SELECT action FROM rules WHERE pattern=? AND client_class=?",
+                (pattern, client_class)).fetchone()
             wanted = "allow" if outcome == "allow" else "block"
             if existing is not None and existing["action"] != wanted:
                 return JSONResponse(
                     {"ok": False,
-                     "detail": f"a standing rule for {pattern!r} already exists and "
+                     "detail": f"a standing rule for {pattern!r} already exists for "
+                               f"client class {client_class!r} and "
                                f"{existing['action']}s it; this would write "
                                f"{wanted!r} and cannot, because nothing here replaces "
                                f"a rule. Decide this request with a *_once action, or "
                                f"persist a different pattern.",
-                     "conflict": {"pattern": pattern, "action": existing["action"]}},
+                     "conflict": {"pattern": pattern, "action": existing["action"],
+                                  "client_class": client_class}},
                     status_code=409)
             # Same action already present is NOT a conflict — the policy the operator
             # is asking for is already in force. Proceed, and report below that this
@@ -470,10 +511,10 @@ def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResp
             # rowcount instead of assumed — the response reports whether a row was
             # actually written, not whether one was asked for.
             wrote_rule = conn.execute(
-                "INSERT OR IGNORE INTO rules(pattern, action, source, created_at) "
-                "VALUES (?,?, 'operator', ?)",
+                "INSERT OR IGNORE INTO rules(pattern, action, source, created_at, "
+                "client_class) VALUES (?,?, 'operator', ?, ?)",
                 (pattern, "allow" if outcome == "allow" else "block",
-                 time.time())).rowcount > 0
+                 time.time(), client_class)).rowcount > 0
         conn.commit()
 
     if not updated:
@@ -508,10 +549,14 @@ def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResp
     # successful write. ``already_present`` carries the other half, so the UI can say
     # "already in place" instead of either claiming a write or going silent about
     # policy the operator just asked for.
+    # ``client_class`` is echoed beside ``pattern`` because the two together are the
+    # rule: the same pattern persisted from two cards is two different rules, and a
+    # confirmation naming only the pattern would read identically for both.
     return JSONResponse({"ok": True, "outcome": outcome,
                          "persisted": wrote_rule,
                          "already_present": persist and not wrote_rule,
-                         "pattern": pattern})
+                         "pattern": pattern,
+                         "client_class": client_class if persist else None})
 
 
 @app.get("/approvals/stream")
@@ -551,6 +596,13 @@ def api_audit(limit: int = 50) -> dict:
     agent is running. It is the peer address the proxy observed — there is no sandbox
     name to map it to, and the raw address is what the saturation banner's detail line
     reports too.
+
+    ``client_class`` is the address made meaningful: it is what the decision was
+    actually taken against (``policy._decide``), so without it a reader can see that a
+    host was allowed for `172.28.0.3` but not that this was the MCP population rather
+    than the agent — the difference the rule was written to make. Served from the
+    stored column rather than re-derived, so a row keeps the class it was decided
+    under even after the CIDR map changes; NULL on rows that predate the column.
 
     The column list is deliberately narrower than the table. ``port``/``proto``/
     ``method``/``url`` are recorded and queryable but not served here: the URL in
@@ -594,10 +646,10 @@ def api_audit(limit: int = 50) -> dict:
     limit = max(1, min(limit, 500))
     with store._connect() as conn:
         rows = conn.execute(
-            "SELECT decision, stage, host, client, reason, "
+            "SELECT decision, stage, host, client, client_class, reason, "
             "       COUNT(*) AS n, MAX(ts) AS ts, MIN(ts) AS first_ts "
             "FROM (SELECT * FROM audit ORDER BY ts DESC LIMIT ?) "
-            "GROUP BY decision, stage, host, client, reason "
+            "GROUP BY decision, stage, host, client, client_class, reason "
             "ORDER BY ts DESC LIMIT ?", (AUDIT_GROUP_SCAN, limit)).fetchall()
         # What the list is a WINDOW ONTO. Without it the view silently truncates:
         # forty rows look like the whole record, and grouping made that worse rather
@@ -640,14 +692,17 @@ def api_rules() -> list[dict]:
     table (which is capped for exactly the opposite reason: it grows without bound and
     nobody needs all of it at once).
 
-    Ordered blocks first, because block wins over allow in ``policy._decide`` — the
-    listing reads in precedence order rather than alphabetically. Read-only on purpose:
+    Grouped by CLIENT CLASS first, then blocks before allows, because that is the
+    order ``policy._decide`` applies: it filters to the asking client's class and only
+    then lets a block win over an allow. A flat alphabetical listing would put two
+    rules for the same pattern in different classes side by side and imply they
+    interact, which is the one thing they do not do.  Read-only on purpose:
     this change makes policy visible, it does not add mutation (see the rule-management
     item in DESIGN.md for what revocation still needs)."""
     with store._connect() as conn:
         rows = conn.execute(
-            "SELECT id, pattern, action, source, created_at FROM rules "
-            "ORDER BY action DESC, pattern").fetchall()
+            "SELECT id, pattern, action, source, created_at, client_class FROM rules "
+            "ORDER BY client_class, action DESC, pattern").fetchall()
     # `id` is served so revocation can key on it. Not cosmetic: patterns are the one
     # field a revoke could plausibly key on instead, and they carry a live
     # normalization gap (``policy._match`` lowercases but does not strip a trailing
@@ -729,7 +784,7 @@ def revoke_rule(rule_id: int, request: Request) -> JSONResponse:
     actor = _actor(request)
     with store._connect() as conn:
         row = conn.execute(
-            "SELECT pattern, action, source FROM rules WHERE id=?",
+            "SELECT pattern, action, source, client_class FROM rules WHERE id=?",
             (rule_id,)).fetchone()
         if row is None:
             return JSONResponse({"ok": False, "detail": "unknown rule"},
@@ -746,11 +801,17 @@ def revoke_rule(rule_id: int, request: Request) -> JSONResponse:
     # What the host reverts TO is the useful half of this record. Both actions land on
     # `hold` — an unmatched host is held for approval — but from opposite directions,
     # and only the reason line says which.
+    # The class is named in both the column and the reason: a revoke touches ONE
+    # client population, and a record saying only "the .github.com allow was revoked"
+    # cannot answer which of two such rules went.
     store._audit("revoke", stage="policy", host=row["pattern"],
+                 client_class=row["client_class"],
                  reason=f"{row['action']} rule revoked by {actor}; {row['pattern']} is "
-                        f"now unknown and will be held for approval")
+                        f"now unknown for client class {row['client_class']} and will "
+                        f"be held for approval")
     return JSONResponse({"ok": True, "pattern": row["pattern"],
-                         "action": row["action"]})
+                         "action": row["action"],
+                         "client_class": row["client_class"]})
 
 
 @app.get("/status", response_class=PlainTextResponse)

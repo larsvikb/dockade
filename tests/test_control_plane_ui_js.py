@@ -242,6 +242,13 @@ console.log(JSON.stringify({
                                 host: "a.example", client: "172.30.0.2",
                                 reason: "no matching rule" }),
         no_stage: m.auditRow({ ts: 1e9, decision: "hold", host: "a.example" }),
+        // The client class, which is what the decision was actually taken against.
+        classed: m.auditRow({ ts: 1e9, decision: "allow", host: "api.github.com",
+                              client: "172.28.0.3", client_class: "mcp" }),
+        // A row from before the column existed, and one the backend could not place.
+        // Both render nothing rather than an invented label — these rows are evidence.
+        unclassed: m.auditRow({ ts: 1e9, decision: "allow", host: "a.example",
+                                client: "172.30.0.2" }),
         // A stage a future hook might add still shows: the bound is on SHAPE, not on
         // a fixed vocabulary.
         future_stage: m.auditRow({ ts: 1e9, decision: "deny", stage: "tls",
@@ -824,6 +831,27 @@ class PageScriptTests(unittest.TestCase):
         # honest statement is that no client was recorded on this row.
         self.assertEqual(a["no_client"]["client"], "—")
 
+    def test_a_decision_row_carries_which_client_population_asked(self):
+        a = self.probe["saturation"]["audit"]
+        # The address says which container; the class says which POPULATION, and the
+        # class is what the rule was written for. An operator scanning this column
+        # wants "agent or MCP server", not a fourth octet.
+        self.assertEqual(a["classed"]["clientClassPrefix"], "mcp · ")
+        self.assertEqual(a["classed"]["client"], "172.28.0.3")
+        # Absent for a row that predates the column, or one the backend could not
+        # place. Nothing is rendered rather than a guess: an invented label would be
+        # a claim, and these rows are evidence.
+        self.assertEqual(a["unclassed"]["clientClassPrefix"], "")
+        # The address is still there — losing the class must not lose the row.
+        self.assertEqual(a["unclassed"]["client"], "172.30.0.2")
+
+    def test_the_class_prefix_carries_its_own_separator(self):
+        # The `denyhttp` lesson again: a CSS margin gives the right pixels and the
+        # wrong `textContent`, so a row copied into a ticket reads as one word. This
+        # table exists to be quotable evidence.
+        a = self.probe["saturation"]["audit"]
+        self.assertTrue(a["classed"]["clientClassPrefix"].endswith(" · "))
+
     def test_the_stage_shows_only_when_it_is_not_the_ordinary_tunnel(self):
         a = self.probe["saturation"]["audit"]
         # Nearly every governed request is a CONNECT tunnel, so a column of `stage`
@@ -1204,6 +1232,11 @@ class DecisionsTableSourceTests(unittest.TestCase):
         self.assertIn("a.stagePrefix", host)
         self.assertIn("esc(a.host)", host)
         self.assertIn("esc(a.client)", client)
+        # The class qualifies the CLIENT, the same way the stage qualifies the host —
+        # it is not a sixth column (asserted above) and it must not drift onto the
+        # decision cell, which stays uniform for vertical scanning.
+        self.assertIn("a.clientClassPrefix", client)
+        self.assertNotIn("clientClassPrefix", decision)
         self.assertIn("esc(a.reason)", reason)
         # Grouping annotates two cells and must not add a sixth (asserted above): the
         # repeat count sits beside the host it repeats, the span beside the reason,
@@ -1234,6 +1267,31 @@ class DecisionsTableSourceTests(unittest.TestCase):
         self.assertIsNotNone(section, "the decisions section was renamed")
         self.assertIn("<th>client</th>", section.group(0),
                       "the column exists in the body but has no header")
+
+    def test_the_policy_table_body_agrees_with_its_header(self):
+        """Same guard as the decisions table above, for the table that shows STANDING
+        policy. It matters more here since the class column landed: without it two
+        rules for one pattern with opposite actions read as a contradiction rather
+        than as two scoped rules, and a header/body mismatch would shift every cell
+        one place left — putting the class under `source` and reading as ordinary
+        data rather than as a broken table."""
+        html = INDEX_HTML.read_text()
+        section = re.search(r'<section id="view-policy".*?</section>', html, re.S)
+        self.assertIsNotNone(section, "the policy section was renamed")
+        headers = re.findall(r"<th>(.*?)</th>", section.group(0), re.S)
+        self.assertEqual([h.strip() for h in headers],
+                         ["action", "pattern", "matches", "for", "source", "added",
+                          ""])
+        # The row template is built in `refreshRules`, and the `for` cell has to be
+        # the fourth — between the wildcard scope and the source.
+        body = re.search(r"document\.getElementById\(\"rules\"\)\.innerHTML"
+                         r".*?return `<tr>(.*?)</tr>`", APP_JS.read_text(), re.S)
+        self.assertIsNotNone(body, "the policy row template was restructured")
+        cells = body.group(1).split("<td")[1:]
+        self.assertEqual(len(cells), len(headers),
+                         "the policy table body and header disagree on cell count")
+        self.assertIn("r.client_class", cells[3])
+        self.assertIn("esc(r.source)", cells[4])
 
 
 class PollGatingSourceTests(unittest.TestCase):

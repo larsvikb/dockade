@@ -104,9 +104,14 @@ def _group_key(client: str | None, host: str | None,
                port: int | None, proto: str | None) -> tuple:
     """What makes two held requests THE SAME REQUEST for grouping purposes.
 
-    ``client`` is in the key even though the decision is not a function of it
-    (``_decide`` reads the host alone): a card names one client, and approving one
+    ``client`` is in the key because a card names one client, and approving one
     sandbox's request must not silently release another's.
+
+    The client CLASS is deliberately not a second key field: it is a pure function of
+    the address (``policy._client_class``), so two requests with the same ``client``
+    always have the same class and adding it could only ever split a group that the
+    address had already joined. That equivalence is what lets a joiner skip writing
+    its own approvals row — the card it attaches to was raised under its class.
 
     ``method`` and ``url`` are deliberately OUT. They are precisely what varies across
     the retries this exists to collapse — a different query string or cache-buster
@@ -266,13 +271,19 @@ def _release_hold(approval_id: str) -> None:
 def _list_pending() -> list[dict]:
     with store._connect() as conn:
         rows = conn.execute(
-            "SELECT id, ts, host, port, proto, client, method, url FROM approvals "
-            "WHERE status='pending' ORDER BY ts").fetchall()
+            "SELECT id, ts, host, port, proto, client, client_class, method, url "
+            "FROM approvals WHERE status='pending' ORDER BY ts").fetchall()
         # Every standing rule, so each offered pattern can say whether one already
         # exists for it. Read once for the whole list rather than per candidate — the
         # table is the complete policy and bounded in practice (see ``api_rules``).
-        rules = {r["pattern"]: r["action"]
-                 for r in conn.execute("SELECT pattern, action FROM rules")}
+        #
+        # Keyed by (pattern, class), matching the uniqueness ``resolve`` collides on:
+        # keyed by pattern alone, a rule in ANOTHER class would be reported as already
+        # present, and the card would offer to persist something it described as
+        # existing while the request that raised it stayed held.
+        rules = {(r["pattern"], r["client_class"]): r["action"]
+                 for r in conn.execute(
+                     "SELECT pattern, action, client_class FROM rules")}
     with _LOCK:
         waiters = dict(_PENDING_WAITERS)
     # ``persist_options`` travels WITH the approval so the UI offers exactly the
@@ -292,9 +303,16 @@ def _list_pending() -> list[dict]:
     # before the click rather than after it. Both halves are needed: the rule can
     # appear between this render and the click, which is the only way the conflict
     # arises at all (see the conflict branch in ``resolve``).
+    # ``persistable`` is whether a `*_persist` can be offered at all. It is false for an
+    # unclassified client, because a standing rule has to be scoped to a class and
+    # "whoever we could not identify" is not one — ``resolve`` refuses it, and the card
+    # should say so before the click rather than after (the same discipline
+    # ``existing`` follows for the conflict case).
     return [dict(r, requests=max(1, waiters.get(r["id"], 1)),
+                 persistable=bool(r["client_class"])
+                 and r["client_class"] != policy.UNCLASSIFIED,
                  persist_options=[{"pattern": p, "scope": policy._pattern_scope(p),
-                                   "existing": rules.get(p)}
+                                   "existing": rules.get((p, r["client_class"]))}
                                   for p in policy._persist_candidates(r["host"])])
             for r in rows]
 

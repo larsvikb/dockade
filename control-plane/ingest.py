@@ -26,6 +26,7 @@ import json
 import math
 import os
 
+import policy
 import store
 
 EGRESS_AUDIT_LOG = os.environ.get("EGRESS_AUDIT_LOG", "/var/log/egress/audit.jsonl")
@@ -40,6 +41,20 @@ DRAIN_INTERVAL = float(os.environ.get("CONTROL_AUDIT_DRAIN_INTERVAL", "2"))
 # write lock, so a large backlog (first run against an existing volume) drains over
 # several passes instead of stalling startup in a single giant commit.
 DRAIN_BLOCK = int(os.environ.get("CONTROL_AUDIT_DRAIN_BLOCK", str(1 << 20)))
+
+
+# The audit columns an ingested row fills, in the order ``_ingest_row`` returns them.
+# ONE definition, used to build the INSERT and to read fields back for the stdout
+# mirror, because the two used to agree only by hand-counted index — and adding
+# `client_class` in the middle silently moved `reason` under the mirror's `r[9]`,
+# which would have printed the agent-supplied URL as the decision's reason.
+_AUDIT_COLUMNS = ("ts", "decision", "stage", "host", "port", "proto", "client",
+                  "client_class", "method", "url", "reason")
+# Built once, from that tuple, so the statement cannot disagree with the rows fed to
+# it. The interpolated values are the column names above — a module constant, never a
+# request field — so this is not a query built from input.
+_AUDIT_INSERT = (f"INSERT INTO audit({', '.join(_AUDIT_COLUMNS)}) "  # noqa: S608
+                 f"VALUES ({', '.join('?' * len(_AUDIT_COLUMNS))})")
 
 
 def _ingest_field(value: object) -> str | None:
@@ -77,9 +92,20 @@ def _ingest_row(line: bytes) -> tuple | None:
     port = rec.get("port")
     if not isinstance(port, int) or isinstance(port, bool):
         port = None
+    client = _ingest_field(rec.get("client"))
+    # Classified HERE rather than read off the line: the proxy does not send a class
+    # and should not start, because it is deliberately client-agnostic about
+    # everything except the lifeline (see policy.CLIENT_CLASSES). These rows are the
+    # proxy's LOCAL decisions — the relay guard, the port gate, the anti-fronting
+    # check, the lifeline allow, the fail-closed denials — so no rule was consulted
+    # for them and the class is descriptive rather than load-bearing. Deriving it
+    # anyway is what keeps the column populated across the whole audit view, so an
+    # operator filtering by client class does not silently lose exactly the alarming
+    # rows. It is derived at INGEST, seconds behind the event, not at read time.
     return (float(ts), _ingest_field(rec.get("decision")),
             _ingest_field(rec.get("stage")), _ingest_field(rec.get("host")),
-            port, _ingest_field(rec.get("proto")), _ingest_field(rec.get("client")),
+            port, _ingest_field(rec.get("proto")), client,
+            policy._client_class(client),
             _ingest_field(rec.get("method")), _ingest_field(rec.get("url")),
             _ingest_field(rec.get("reason")))
 
@@ -194,16 +220,17 @@ def _drain_egress_audit() -> int:
                                 for ln in block[:consumed].split(b"\n") if ln.strip())
                     if r is not None]
             if rows:
-                conn.executemany(
-                    "INSERT INTO audit(ts, decision, stage, host, port, proto, "
-                    "client, method, url, reason) VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
+                conn.executemany(_AUDIT_INSERT, rows)
                 # Mirror to stdout like _audit does, so `make logs-cp` stays a live
                 # feed of DECISIONS and not merely of this service's own round-trips.
                 # Marked `ingested` because it is: a decision the proxy made, arriving
                 # late and out of order relative to the lines around it.
                 for r in rows:
-                    print(f"AUDIT {r[1]} (ingested) stage={r[2]} host={r[3]} "
-                          f"client={r[6]} :: {r[9]}", flush=True)
+                    f = dict(zip(_AUDIT_COLUMNS, r))
+                    print(f"AUDIT {f['decision']} (ingested) stage={f['stage']} "
+                          f"host={f['host']} client={f['client']} "
+                          f"client_class={f['client_class']} :: {f['reason']}",
+                          flush=True)
         conn.execute(
             "INSERT INTO audit_cursor(path, inode, offset) VALUES (?,?,?) "
             "ON CONFLICT(path) DO UPDATE SET inode=excluded.inode, "

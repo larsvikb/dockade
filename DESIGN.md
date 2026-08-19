@@ -984,10 +984,51 @@ nothing holds and the control plane never records. Enforced by `_is_lifeline` in
 safe way — no client qualifies and every host becomes the control plane's call —
 which is why, unlike `EGRESS_FORBIDDEN_CIDRS`, it carries no startup assertion.
 
-A consequence worth stating because the topology now invites the mistake: adding a
-network to this proxy adds a **client population**, not just a route. Egress policy
-is still per-host, so every rule the operator ever approved for the agent is
-reachable by every container on every network the proxy serves.
+A consequence worth stating because the topology invites the mistake: adding a
+network to this proxy adds a **client population**, not just a route. That is what
+per-client-class policy below answers.
+
+### Policy is scoped to a client class
+
+**A rule decides for one client population and no other.** `_decide` takes the host
+*and* the class of client asking, and a rule carries the class it was written for, so
+a host the operator approved for the agent is still unknown to an MCP server and is
+held the first time one asks. Without this a single allowlist becomes the union of
+every client's needs — least privilege eroding by construction the moment there is a
+second consumer, and the second consumer here is the one process holding a
+write-capable credential.
+
+**The identity primitive is the ingress network**, not the source address. Topology
+is provable; addresses are not, since sandboxes are ephemeral and Docker hands `.2`
+to whichever container starts first — a rule keyed to an address would silently
+transfer to the next tenant of it. Named ranges live in `policy.CLIENT_CLASSES`, and
+`tests/test_topology.py` holds them equal to the compose subnets, non-overlapping,
+and equal to the lifeline's range for the agent's class.
+
+**The classification is the control plane's, not the proxy's**, which is the one
+placement decision here worth arguing. The proxy observes the peer address and
+already CIDR-matches one — but only for the lifeline, and only because the lifeline
+is the allow it makes *without* asking. Every other decision belongs to the policy
+authority, so the class is derived where the decision is taken. One mapping then
+serves however many governed proxies call `/authorize`, rather than each carrying a
+copy to drift; the MCP gateway will be the second.
+
+**Unplaceable fails safe, and cannot become a scope.** A client in no configured
+range is `unclassified`: it matches no rule and is held, the same default-deny an
+unknown host gets. `resolve` refuses to *persist* for one, because a rule scoped to
+"whoever we could not identify" would grant to every future unidentified client —
+the erosion this dimension exists to stop, reintroduced through the approval flow.
+`allow_once` still works, so an operator is never stuck; the card says so before the
+click rather than after.
+
+**Existing rules were backfilled to the agent's class, and that is what they meant.**
+They were approved while the proxy had one client population. Widening them to every
+client would have granted the whole accumulated allowlist to `mcp-net`; narrowing
+them differently would have revoked policy a human decided. Uniqueness became the
+*pair* — the same pattern can be allowed for one class and blocked for another — so
+this needed a table rebuild rather than an added column, and the store now has a real
+`_migrate` (see the NOTE under `store._init_db`, and the SQLite DDL note in
+`NOTES.md`).
 
 **Ingesting the decisions the proxy makes alone.** Those two properties, plus the
 relay guard, the port gate and the SNI anti-fronting check, mean a real share of
@@ -2375,17 +2416,14 @@ control.
   near-identical.
 - **Should tier 2 ever get governed egress?** Today it has none, which is what
   makes its boundary evidence so clean. Granting it would make tier 2 a second
-  egress-proxy client and immediately forces the per-client-class question below.
-  Not needed until a worker task needs to fetch something.
-- **Per-client-class policy.** A single global allowlist becomes the union of
-  every client's needs, which erodes least privilege as soon as there is a second
-  consumer — and the approval semantics above mean the postures genuinely differ.
-  The identity primitive should be the **ingress network**, matching this design's
-  existing idiom (topology is provable; source IPs are not, since sandboxes are
-  ephemeral with dynamic addresses). Keep **one** proxy so the audit stream stays
-  single. Cheap step available now: give policy rules and audit rows a
-  client-class dimension even while only one class exists — adding a column to a
-  young schema is free, retrofitting one into accumulated crown-jewel state is not.
+  egress-proxy client — which is now a solved shape rather than an open question:
+  give its network a class in `policy.CLIENT_CLASSES` and its rules are its own
+  (see "Policy is scoped to a client class"). Still not needed until a worker task
+  needs to fetch something.
+- **RESOLVED — per-client-class policy.** Shipped: rules, audit rows and approvals
+  carry a client class, keyed on the ingress network. What remains open from this
+  item is only the *worker* half above — an unattended tier's posture differs in
+  its approval semantics, not in how its rules are scoped.
 - **Where does worker output go, and is it audited?** An unattended job's output
   *is* its consequential action, but with no egress there is nothing at the
   network choke point to log. "Everything consequential is audited" currently has
@@ -2510,6 +2548,7 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | 4 | pull-through package cache | planned |
 | — | governed git push path | planned |
 | — | `mcp-net` + MCP server catalogue (`mcp-servers.yml`) | **done** — inert until the gateway exists |
+| — | per-client-class egress policy | **done** |
 | — | MCP gateway — per-tool allow/deny/ask | planned (needs 2c's per-proxy config + rule editing) |
 
 The rationale for each shipped item lives under **Governance surfaces** above, not here

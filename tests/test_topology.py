@@ -38,6 +38,7 @@ COMPOSE = [line
 ADDON = (ROOT / "proxies" / "egress" / "addon.py").read_text()
 BOUNDARY = (ROOT / "sandbox-common" / "boundary-check.sh").read_text()
 APP = (ROOT / "control-plane" / "app.py").read_text()
+POLICY = (ROOT / "control-plane" / "policy.py").read_text()
 
 #: The control plane's two listeners. Duplicated from app.py's defaults rather
 #: than imported, deliberately: this file is asserting that compose and the app
@@ -382,6 +383,54 @@ class RelayGuardAgreesWithComposeTests(unittest.TestCase):
                 self.assertFalse(
                     subnet.subnet_of(granted),
                     f"{network} sits inside the permanent lifeline's client range")
+
+    def test_every_client_class_range_is_a_real_compose_subnet(self):
+        # Third instance of the same two-ends-no-compiler problem, and the one with
+        # the quietest failure. A class range that matches no network places nobody:
+        # its clients fall through to UNCLASSIFIED, match no rule, and are HELD — so
+        # a renumbered subnet does not break governance, it makes every request from
+        # that population wait for a human who has no idea why they are being asked.
+        default = re.search(
+            r'CLIENT_CLASSES_DEFAULT = "([^"]+)"', POLICY)
+        self.assertIsNotNone(default, "could not find the CLIENT_CLASSES default")
+        subnets = {_subnet_of(n) for n in ("sandbox-net", "mcp-net", "control-net",
+                                           "authorize-net")}
+        mapped = {}
+        for entry in default.group(1).split(","):
+            name, _, cidr = entry.partition("=")
+            self.assertIn(cidr.strip(), subnets,
+                          f"client class {name!r} maps to {cidr!r}, which is not a "
+                          f"subnet any network in compose declares")
+            mapped[name.strip()] = cidr.strip()
+        # The two populations the egress proxy actually serves, each named. The proxy
+        # has a leg on both, so both reach /authorize and both must be placeable —
+        # an unmapped one is the union-of-needs problem returning by omission.
+        self.assertEqual(mapped, {"sandbox": _subnet_of("sandbox-net"),
+                                  "mcp": _subnet_of("mcp-net")})
+
+    def test_the_class_ranges_do_not_overlap(self):
+        # First match wins, so an overlap would silently place one network's clients
+        # in another's class and decide their requests under rules written for
+        # somebody else — least privilege inverted rather than merely weakened.
+        default = re.search(r'CLIENT_CLASSES_DEFAULT = "([^"]+)"', POLICY)
+        nets = [(e.split("=")[0], ipaddress.ip_network(e.split("=")[1]))
+                for e in default.group(1).split(",")]
+        for i, (name_a, a) in enumerate(nets):
+            for name_b, b in nets[i + 1:]:
+                self.assertFalse(a.overlaps(b),
+                                 f"client classes {name_a} and {name_b} overlap")
+
+    def test_the_agents_class_is_the_one_the_lifeline_is_scoped_to(self):
+        # Two independent client checks — the proxy's local lifeline allow and the
+        # control plane's rule scoping — and they have to be about the same network,
+        # because both derive from the same sentence: only sandbox-net runs the agent.
+        # Drifting apart would mean the population that keeps the Anthropic lifeline
+        # is not the population the agent's own rules were written for.
+        classes = re.search(r'CLIENT_CLASSES_DEFAULT = "([^"]+)"', POLICY).group(1)
+        lifeline = re.search(
+            r'"EGRESS_LIFELINE_CIDRS",\s*\n?\s*"([^"]+)"', ADDON).group(1)
+        agent_range = dict(e.split("=") for e in classes.split(","))["sandbox"]
+        self.assertEqual({agent_range}, {c.strip() for c in lifeline.split(",")})
 
     def test_the_networks_the_guard_blocks_are_internal(self):
         # An internal bridge has no route off-box. Both control networks must be

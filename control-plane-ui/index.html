@@ -301,14 +301,16 @@
   <section id="view-policy" role="tabpanel" aria-labelledby="tab-policy" hidden>
     <h2>Standing policy <span class="note" id="rulecount"></span></h2>
     <div class="empty">
-      Every request is decided by these rules before anything is held. Rules are
-      written by &ldquo;+ persist&rdquo; approvals and by the seed file; operator
-      rules can be revoked here, seed rules only by editing
-      <code>policies/egress-allowlist.txt</code>.
+      Every request is decided by these rules before anything is held. Each rule
+      decides for ONE client class &mdash; the &ldquo;for&rdquo; column &mdash; so a
+      host allowed for the agent is still unknown to an MCP server, and is held the
+      first time one asks. Rules are written by &ldquo;+ persist&rdquo; approvals and
+      by the seed file; operator rules can be revoked here, seed rules only by
+      editing <code>policies/egress-allowlist.txt</code>.
     </div>
     <table>
-      <thead><tr><th>action</th><th>pattern</th><th>matches</th><th>source</th>
-        <th>added</th><th></th></tr></thead>
+      <thead><tr><th>action</th><th>pattern</th><th>matches</th><th>for</th>
+        <th>source</th><th>added</th><th></th></tr></thead>
       <tbody id="rules"></tbody>
     </table>
     <!-- Same job as `audit-empty`, and needed more here. This poll failing used to be

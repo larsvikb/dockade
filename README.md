@@ -201,7 +201,8 @@ dockade/
                             #   management API (approvals, resolve, the read-only
                             #   views) on control-net; both listeners' entry point
     store.py                #   SQLite — schema, the audit write, the policy seed
-    policy.py               #   what a rule pattern matches; host -> allow/deny/hold
+    policy.py               #   what a rule pattern matches; peer address -> client
+                            #   class; (host, class) -> allow/deny/hold
     holds.py                #   the in-process registry a held request blocks on
     ingest.py               #   drains the proxy's locally-decided audit lines in
     requirements.txt        #   pinned deps (fastapi, uvicorn)
@@ -269,6 +270,10 @@ exposed through governed data-plane services. Next steps toward it:
    `control-net` address alone. The proxy's relay guard is best-effort against DNS
    rebinding, so the design assumes it can be beaten and makes the far side worth
    little: even a total bypass yields a policy *query*, never a self-approval.
+   Every rule is scoped to a **client class** — the ingress network the caller
+   reached the proxy on — so a host approved for the agent is still unknown to an
+   MCP server container and is held the first time one asks; a single allowlist
+   would otherwise become the union of every client's needs.
    Next: **2c** audit browsing (filter/search/history beyond the recent-decisions
    table already in the UI) + per-proxy config.
 3. **Skills + quality-gate hooks** in the image — the enablement half of the

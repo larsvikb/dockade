@@ -33,7 +33,48 @@ upsert is harmless rather than a silent no-write bug — and, in the other direc
 at all. One of these was written as a mutation-testing case and reported SURVIVED before
 it turned out to be a no-op.
 
-## A deleted-and-recreated file usually gets the same inode back
+## Python's `sqlite3` leaves DDL outside its implicit transaction
+
+SQLite itself has transactional DDL — a `DROP TABLE` inside a transaction is undone by
+a rollback. Python's driver in legacy mode does not put it in one: it opens an implicit
+transaction before `INSERT`/`UPDATE`/`DELETE`/`REPLACE` and nothing else, so a `DROP`
+issued on a default connection runs in autocommit and is already permanent by the time
+anything can roll it back.
+
+```python
+c = sqlite3.connect(":memory:")
+c.execute("CREATE TABLE t(x)"); c.execute("INSERT INTO t VALUES (1)"); c.commit()
+c.execute("DROP TABLE t")
+c.in_transaction        # -> False        (no transaction was ever opened)
+c.rollback()
+c.execute("SELECT * FROM t")               # -> OperationalError: no such table: t
+```
+
+Take control explicitly and the engine behaves as advertised:
+
+```python
+c.isolation_level = None                   # autocommit; we issue the statements
+c.execute("BEGIN IMMEDIATE")
+c.execute("DROP TABLE t")
+c.in_transaction        # -> True
+c.execute("ROLLBACK")
+c.execute("SELECT * FROM t").fetchall()     # -> [(1,)]   the table is back
+```
+
+Measured on CPython 3.13.5 / SQLite 3.46.1. This is the documented legacy
+`isolation_level` behaviour rather than a version quirk, so it applies to the
+`python:3.12-slim` the control-plane image is built on — but only the 3.13 figure above
+was actually run.
+
+The consequence is entirely about **table-rebuild migrations**, which are the only
+shape here that mixes DML and DDL in one operation: copy the rows aside, drop the
+original, rename. On a default connection those three are three separate autocommits,
+so a failure between the copy and the drop is not undone — on a long-lived store that
+is the policy rules gone. Nothing warns; the code reads as if it were atomic.
+
+An additive `ALTER TABLE ADD COLUMN` needs none of this, which is why the distinction
+is worth writing down rather than "always wrap migrations": the cheap shape is safe on
+its own and the expensive shape silently is not.
 
 On ext4/overlayfs, `os.remove(p)` followed immediately by recreating `p` typically
 reuses the just-freed inode number, so `st_ino` is unchanged. Any rotation detection

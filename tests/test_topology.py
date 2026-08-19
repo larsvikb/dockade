@@ -253,6 +253,32 @@ class McpServerPlacementTests(unittest.TestCase):
         self.assertIn(f"http://{pinned}:8080", BOUNDARY,
                       "boundary-check.sh probes an address compose does not pin")
 
+    def test_every_mcp_server_pins_its_address(self):
+        # The egress proxy identifies a caller by peer address, because that is all
+        # a TCP connection carries. A dynamic address is therefore not an identity:
+        # Docker reassigns in start order, so a restarted server can inherit another
+        # server's address and have its egress decided under that server's rules.
+        # An unpinned server does not fail — it just quietly stops being separable,
+        # which is why the guard is here rather than left to review.
+        for svc in self.MCP_SERVERS:
+            with self.subTest(service=svc):
+                pinned = _scalar(_block(_service(svc), "mcp-net", 6), "ipv4_address")
+                self.assertIsNotNone(pinned, f"{svc} does not pin an mcp-net address")
+                self.assertIn(
+                    ipaddress.ip_address(pinned),
+                    ipaddress.ip_network(_subnet_of("mcp-net")),
+                    f"{svc} pins {pinned}, which is outside mcp-net")
+
+    def test_no_two_mcp_containers_claim_the_same_address(self):
+        # Including the proxy's own leg. Two containers pinned to one address is a
+        # startup failure for the second — loud, and therefore not the danger. The
+        # danger is a server pinned to the PROXY's address, which would collide with
+        # the one endpoint every server depends on, and boundary-check.sh probes.
+        claimed = [_scalar(_block(_service(svc), "mcp-net", 6), "ipv4_address")
+                   for svc in (*self.MCP_SERVERS, "egress-proxy")]
+        self.assertEqual(len(claimed), len(set(claimed)),
+                         f"two containers pin the same mcp-net address: {claimed}")
+
     def test_the_mcp_network_is_inside_the_range_the_relay_guard_blocks(self):
         # Why the proxy's leg is inbound-only in effect: mcp-net sits in the
         # private range the guard hard-blocks, so the proxy refuses it as a

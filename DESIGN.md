@@ -1772,6 +1772,50 @@ brings the container up; the control plane owns which of the running servers are
 enabled and what each of their tools may do. The policy store holds nothing that
 grants — it never sees a credential.
 
+**Per-server identity has two different answers, because it is asked on two paths
+that do not meet.** Conflating them is the easy mistake here.
+
+- **Tool calls** run sandbox → gateway → server. The gateway *dialled* the server,
+  by name, so the identity is the name it used. It needs no address, no resolution
+  and no registry lookup to say which server a call is for. This is the identity
+  per-tool policy is keyed on.
+- **A server's own egress** runs server → egress proxy → internet, and the gateway
+  is not in it: `HTTPS_PROXY` on each server container points at the egress proxy
+  directly. The proxy has a TCP connection and nothing else, so the peer **address**
+  is the only handle that exists. This is the identity `rules.client_class` is keyed
+  on (see "Policy is scoped to a client class").
+
+The consequence is that the gateway cannot supply the client class. It is absent
+from the conversation that needs it, and a server makes egress calls with no tool
+call in flight at all — at startup, on a token refresh, on a background poll.
+
+**So the addresses are pinned, in `mcp-servers.yml` beside the server they belong
+to.** A dynamic address is not an identity: Docker allocates in start order, so a
+restarted server can inherit the address a different server just vacated and have
+its egress decided under that server's rules — an ordinary operational race needing
+no attacker. Pinning removes it rather than narrowing it, and it costs one line in
+the file that is being edited anyway. `tests/test_topology.py` holds every server to
+it, since an unpinned server does not fail loudly — it quietly stops being separable.
+
+**Egress classes stay per-network until a second server exists.** With addresses
+pinned, splitting `mcp` into one class per server is a one-line change to
+`policy.CLIENT_CLASSES` and an `UPDATE` on the rules table — the column is free-form
+text, so no schema change and no migration. That cheapness is the argument for
+waiting: today one server shares a class with nobody, and what a second server's host
+needs look like is not yet known. What is *not* deferrable is the pin, because it has
+to be true before any of it is sound.
+
+The bound while it waits, stated so it is known rather than rediscovered: containers
+on `mcp-net` share one egress class, so a second MCP server inherits the first's
+approved hosts. It reaches nothing approved only for the agent.
+
+**The alternative that would remove the pins is worth naming, and rejecting.** Point
+each server's `HTTPS_PROXY` at the *gateway*, have it forward upstream, and it can
+annotate every request with the server it came from — per-server identity, no
+addresses. It also makes the gateway a forward proxy as well as an MCP gateway, puts
+it in the path of every server's TLS, and turns a gateway outage into an egress
+outage. Against one line of YAML per server, the trade is not close.
+
 **A credential should live as far from the agent as its server allows — which is
 usually the server container, not the gateway.** The rule follows from what each
 component is: MCP server containers sit on `mcp-net` with **no route from the

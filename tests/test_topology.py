@@ -356,6 +356,33 @@ class RelayGuardAgreesWithComposeTests(unittest.TestCase):
             self.assertIn(_subnet_of(network), listed,
                           f"{network}'s subnet is not in the relay guard's default")
 
+    def test_the_lifeline_range_is_the_sandbox_network(self):
+        # Same two-ends-no-compiler problem as the guard above, opposite sign: this
+        # CIDR decides who KEEPS a grant rather than who is refused one. Pointed at
+        # a subnet nothing uses it fails safe but silently — the lifeline stops
+        # working for the agent and every Anthropic call starts depending on the
+        # control plane being up, which looks like an outage, not a config error.
+        # Pointed at too WIDE a range it hands the local allow to mcp-net, which is
+        # the thing _is_lifeline exists to prevent.
+        default = re.search(r'"EGRESS_LIFELINE_CIDRS",\s*\n?\s*"([^"]+)"', ADDON)
+        self.assertIsNotNone(default, "could not find the LIFELINE_CIDRS default")
+        listed = {c.strip() for c in default.group(1).split(",")}
+        self.assertEqual(listed, {_subnet_of("sandbox-net")})
+
+    def test_no_other_network_is_inside_the_lifeline_range(self):
+        # The assertion the one above cannot make on its own: equality with
+        # sandbox-net's subnet is only meaningful while no other network is a
+        # subnet of it. mcp-net is the one this matters for today.
+        default = re.search(r'"EGRESS_LIFELINE_CIDRS",\s*\n?\s*"([^"]+)"', ADDON)
+        lifeline = [ipaddress.ip_network(c.strip())
+                    for c in default.group(1).split(",")]
+        for network in ("mcp-net", "control-net", "authorize-net"):
+            subnet = ipaddress.ip_network(_subnet_of(network))
+            for granted in lifeline:
+                self.assertFalse(
+                    subnet.subnet_of(granted),
+                    f"{network} sits inside the permanent lifeline's client range")
+
     def test_the_networks_the_guard_blocks_are_internal(self):
         # An internal bridge has no route off-box. Both control networks must be
         # one, or the control plane itself would gain egress.

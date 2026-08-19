@@ -29,7 +29,18 @@ def run(coro):
     return asyncio.run(coro)
 
 
-def _connect_flow(host, port=443, cid="conn-1", peer="1.2.3.4"):
+# The default peer is a SANDBOX-NET address, not an arbitrary one, because the
+# permanent lifeline is now scoped by client (addon._is_lifeline): a flow claiming
+# to come from 1.2.3.4 is not the client these hooks exist to serve, and using one
+# as the default would silently turn every lifeline assertion below into an
+# assertion about the fallthrough path instead. MCP_PEER is the other side of that
+# — an address on mcp-net, which this proxy also serves and which must NOT inherit
+# the agent's local allow.
+SANDBOX_PEER = "172.30.0.2"
+MCP_PEER = "172.28.0.2"
+
+
+def _connect_flow(host, port=443, cid="conn-1", peer=SANDBOX_PEER):
     return SimpleNamespace(
         request=SimpleNamespace(host=host, port=port),
         client_conn=SimpleNamespace(peername=(peer, 5000), id=cid),
@@ -37,7 +48,7 @@ def _connect_flow(host, port=443, cid="conn-1", peer="1.2.3.4"):
 
 
 def _http_flow(host, pretty_host, *, scheme="https", port=443, method="GET",
-               cid="req-1", peer="1.2.3.4"):
+               cid="req-1", peer=SANDBOX_PEER):
     # ``client_conn`` mirrors _connect_flow. Its ABSENCE here is why nothing noticed
     # that the request hook never sent a client to the control plane: the stub could
     # not have exercised the field, so every plaintext-HTTP decision was recorded
@@ -62,11 +73,70 @@ class AuthorizeTests(unittest.TestCase):
     def test_permanent_lifeline_never_calls_control_plane(self):
         with mock.patch.object(addon, "_post_authorize",
                                side_effect=AssertionError("must not be called")):
-            v = run(addon._authorize("api.anthropic.com", stage="connect"))
+            v = run(addon._authorize("api.anthropic.com", stage="connect",
+                                     client=SANDBOX_PEER))
         self.assertTrue(v.allowed)
         self.assertIn("permanent lifeline", v.reason)
         # Decided here, so nothing wrote it centrally — this line must be ingested.
         self.assertFalse(v.central)
+
+    def test_the_lifeline_is_the_sandbox_s_and_not_the_mcp_servers(self):
+        """THE assertion behind ``_is_lifeline``. The lifeline is the one allow this
+        proxy makes without asking the policy authority, and its whole justification
+        is that a control-plane outage must not sever *the agent's* API. An MCP
+        server container is on the other side of this proxy for a different reason
+        entirely — it is a third-party image holding a credential — and it never
+        talks to Anthropic, so inheriting the short-circuit would hand exactly the
+        component this topology plans for the one egress path nothing holds or
+        centrally records."""
+        with mock.patch.object(addon, "_post_authorize",
+                               return_value={"decision": "deny", "reason": "nope"}):
+            v = run(addon._authorize("api.anthropic.com", stage="connect",
+                                     client=MCP_PEER))
+        # Not short-circuited: the control plane was asked and its answer stands.
+        self.assertFalse(v.allowed)
+        self.assertTrue(v.central)
+
+    def test_an_unrecognised_client_is_governed_not_exempted(self):
+        # peername can be absent (both hooks already guard for it). Falling through
+        # to /authorize is the fail-safe direction — an unidentifiable client gets
+        # governed rather than handed the local allow.
+        for client in (None, "", "not-an-address"):
+            with self.subTest(client=client):
+                with mock.patch.object(
+                        addon, "_post_authorize",
+                        return_value={"decision": "allow", "reason": "ok"}) as posted:
+                    v = run(addon._authorize("api.anthropic.com", stage="connect",
+                                             client=client))
+                self.assertTrue(posted.called)
+                self.assertTrue(v.central)
+                self.assertEqual(v.reason, "ok")
+
+    def test_a_v4_mapped_sandbox_peer_keeps_its_lifeline(self):
+        # A dual-stack listener can report the sandbox as ::ffff:172.30.0.2. Same
+        # client; losing the lifeline over a spelling would break the outage
+        # resilience this exists for. (_in_cidrs folds it, as _blocked_cidr does.)
+        with mock.patch.object(addon, "_post_authorize",
+                               side_effect=AssertionError("must not be called")):
+            v = run(addon._authorize("api.anthropic.com", stage="connect",
+                                     client=f"::ffff:{SANDBOX_PEER}"))
+        self.assertTrue(v.allowed)
+        self.assertIn("permanent lifeline", v.reason)
+
+    def test_the_client_still_reaches_the_control_plane(self):
+        # ``client`` became a named parameter when _authorize started READING it.
+        # It must still travel in the payload: the control plane is shared across
+        # sandboxes and audits by client, so promoting it out of **fields without
+        # putting it back would blank the column on every governed decision.
+        seen = []
+
+        def capture(payload):
+            seen.append(payload)
+            return {"decision": "allow", "reason": "ok"}
+
+        with mock.patch.object(addon, "_post_authorize", side_effect=capture):
+            run(addon._authorize("example.com", stage="connect", client=MCP_PEER))
+        self.assertEqual(seen[0]["client"], MCP_PEER)
 
     def test_control_plane_allow(self):
         with mock.patch.object(addon, "_post_authorize",
@@ -145,6 +215,39 @@ class HttpConnectTests(unittest.TestCase):
             run(addon.http_connect(flow))
         self.assertIsNotNone(flow.response)
         self.assertNotIn("c4", addon._conn_authority)
+
+    def test_an_mcp_client_connecting_to_a_lifeline_host_is_governed(self):
+        """The scoping asserted through the hook rather than through ``_authorize``,
+        because the part that can silently break is the PLUMBING: the peer address is
+        read at the top of this hook and has to reach the decision. A regression that
+        stopped passing it would leave ``_is_lifeline`` correct and useless, and the
+        unit tests above would all still pass.
+
+        Exploit shape this closes: a compromised MCP server container opening
+        CONNECT api.anthropic.com:443 and posting a stolen credential to an
+        attacker's own API key — allowed locally, never held, never centrally
+        audited."""
+        flow = _connect_flow("api.anthropic.com", cid="c5", peer=MCP_PEER)
+        with mock.patch.object(addon.socket, "getaddrinfo",
+                               return_value=[(2, 1, 6, "", ("160.79.104.10", 0))]), \
+             mock.patch.object(addon, "_post_authorize",
+                               return_value={"decision": "deny", "reason": "no"}) as posted:
+            run(addon.http_connect(flow))
+        self.assertTrue(posted.called, "mcp-net client took the local lifeline")
+        self.assertIsNotNone(flow.response)                  # the deny stands
+        self.assertNotIn("c5", addon._conn_authority)
+
+    def test_the_sandbox_keeps_its_lifeline_through_the_hook(self):
+        # The other half: the same host from sandbox-net is still decided locally,
+        # so a control-plane outage cannot sever the agent's own API.
+        flow = _connect_flow("api.anthropic.com", cid="c6")
+        with mock.patch.object(addon.socket, "getaddrinfo",
+                               return_value=[(2, 1, 6, "", ("160.79.104.10", 0))]), \
+             mock.patch.object(addon, "_post_authorize",
+                               side_effect=OSError("control plane is down")):
+            run(addon.http_connect(flow))
+        self.assertIsNone(flow.response)                     # allowed anyway
+        self.assertEqual(addon._conn_authority.get("c6"), "api.anthropic.com")
 
 
 class TlsClientHelloTests(unittest.TestCase):

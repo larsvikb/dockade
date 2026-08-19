@@ -971,6 +971,24 @@ proxy *before* the control plane is consulted, so a control-plane outage never
 bricks the agent's own API; (2) everything else **fails closed** — if the control
 plane is unreachable or times out, the request is denied and audited locally.
 
+**The lifeline is scoped by client, and it is the only decision here that is.**
+Everywhere else this proxy is deliberately client-agnostic: it asks the policy
+authority and the authority decides on the host. The lifeline is the one allow that
+skips that call, so who is asking has to be part of it — its justification names its
+own scope, *the agent's* own API, and only sandbox-net runs the agent. Since
+`mcp-net`, this proxy also serves MCP server containers, which hold credentials and
+never talk to Anthropic; a host-only check would hand them the sole egress path
+nothing holds and the control plane never records. Enforced by `_is_lifeline` in
+`proxies/egress/addon.py` against `EGRESS_LIFELINE_CIDRS`, whose default
+`tests/test_topology.py` holds equal to sandbox-net's subnet. Emptying it fails the
+safe way — no client qualifies and every host becomes the control plane's call —
+which is why, unlike `EGRESS_FORBIDDEN_CIDRS`, it carries no startup assertion.
+
+A consequence worth stating because the topology now invites the mistake: adding a
+network to this proxy adds a **client population**, not just a route. Egress policy
+is still per-host, so every rule the operator ever approved for the agent is
+reachable by every container on every network the proxy serves.
+
 **Ingesting the decisions the proxy makes alone.** Those two properties, plus the
 relay guard, the port gate and the SNI anti-fronting check, mean a real share of
 egress decisions are made *in the proxy* and never travel the authorize path. They

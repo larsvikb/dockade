@@ -71,6 +71,151 @@ Also confirmed while establishing this: with `CLAUDE_CONFIG_DIR` set, user-scope
 memory follows it (`/config/CLAUDE.md`, not `~/.claude/CLAUDE.md`), and `~/.claude`
 holds only a downloads cache.
 
+## An MCP server can be declared four ways, and `settings.json` is not one of them
+
+Measured in-container on Claude Code 2.1.234, because the channel that looks most
+natural for this repo — an `mcpServers` block in the baked `user-settings.json` —
+turns out not to exist.
+
+The probe is the useful part: give the server a command that leaves a trace and see
+whether it was ever launched, rather than trusting a listing.
+
+```
+--mcp-config '{"mcpServers":{"p":{"command":"/bin/sh",
+    "args":["-c","touch /tmp/probe; exec /bin/false"]}}}' -p 'reply with: ok'
+```
+
+| Channel | Server launched? |
+| --- | --- |
+| `--mcp-config` (inline JSON string *or* file path) | yes |
+| `--settings '{"mcpServers":…}'` | **no** — silently ignored, no error |
+| `claude mcp add -s user` → `$CLAUDE_CONFIG_DIR/.claude.json` | yes |
+| `claude mcp add -s user` + `--strict-mcp-config` on the same run | **no** — suppressed |
+
+The two flags are not alternatives — one supplies servers, the other changes how the
+sources are resolved. With a user-scope server registered throughout:
+
+| Invocation | user-scope server | `--mcp-config` server |
+| --- | --- | --- |
+| neither flag | runs | — |
+| `--mcp-config X` | runs (**additive**) | runs |
+| `--mcp-config X --strict-mcp-config` | suppressed | runs |
+| `--strict-mcp-config` alone | suppressed | — none supplied |
+
+The last row is the non-obvious one: strict with nothing to be strict about yields
+**zero** MCP servers rather than erroring or falling back.
+
+Four facts worth not re-deriving:
+
+- **`mcpServers` in a settings file does nothing.** No warning, no error — the run
+  succeeds and the server simply never starts. `mcpServers` and `strictMcpConfig` do
+  both appear as strings in the binary, so grepping the bundle does *not* settle it;
+  only the launch probe does.
+- **`--mcp-config` accepts an inline JSON string**, so no file has to exist anywhere.
+- **`--strict-mcp-config` really is exclusive** — the user-scope server registered a
+  moment earlier did not launch under it, and `--mcp-config` on its own does *not*
+  suppress it. That is the property that makes a launcher-supplied set authoritative
+  for a session, and it belongs to the strict flag alone.
+- **`--mcp-config` is variadic and greedy.** `claude --mcp-config '<json>' mcp list`
+  consumes `mcp` and `list` as further config paths and fails with "MCP config file
+  not found: mcp". It is also a main-command option only: `claude mcp list
+  --mcp-config …` errors with `unknown option`. Put it before an option-shaped
+  argument (`-p`), not before a subcommand.
+
+Separately, `claude mcp get`/`list --help` state that servers from a project
+`.mcp.json` show as `⏸ Pending approval` and are *not connected to* until approved —
+and `enableAllProjectMcpServers` / `enabledMcpjsonServers` in settings pre-approve
+it. **That gate does not hold in `-p` mode.** Same launch probe, `.mcp.json` dropped
+in a fresh directory: the server started, with and without
+`--dangerously-skip-permissions`, on a run that had no approval state to inherit —
+no `enableAllProjectMcpServers` anywhere, empty `enabledMcpjsonServers`, no managed
+settings file, and no `projects` entry for that path in `.claude.json`. So in
+headless runs a directory can start a process merely by containing a file. The
+interactive path was **not** tested and may well prompt; the point is that the
+prompt is not what makes it safe.
+
+## An MCP server container really does honour `HTTPS_PROXY` — and how to tell
+
+Measured against `ghcr.io/github/github-mcp-server:v1.9.0` in `http` mode on an
+internal network whose only reachable peer is the egress proxy. The interesting part
+is the probe order, because most of the obvious checks prove less than they appear to.
+
+**What the proxy log shows when it works.** A tool call that reaches GitHub leaves a
+row naming the *server's* address, which is the only observation that distinguishes
+"this server used the proxy" from "something on that network can":
+
+```
+{"decision": "allow", "host": "api.github.com", "port": 443,
+ "client": "172.28.0.2", "reason": "allowed by rule (.github.com)", "central": true}
+```
+
+…and the tool returns `GET https://api.github.com/user: 401 Bad credentials`. **A 401
+from GitHub is the success case**: it proves a full TLS round trip completed, so the
+egress path can be verified with a deliberately bogus token and no real credential.
+
+**Four probes, in increasing strength.** Each of the first three fails to answer the
+question, which is why the order matters:
+
+| Probe | Outcome | What it actually proves |
+| --- | --- | --- |
+| audit log, before any tool call | no rows | *nothing* — an idle MCP server makes no API calls |
+| `curl https://api.github.com` from the network | could not resolve host | weak — only that the resolver has no upstream |
+| `curl http://1.1.1.1` (literal, port 80) | `rc=7` at **0 ms** | strong — no route at all; DNS-independent |
+| a real `tools/call`, then the log | row with the server's IP | the actual claim |
+
+The 0 ms matters: an internal network has no gateway, so the kernel fails locally
+rather than timing out. Same reasoning as `boundary-check.sh` probing a raw IP.
+
+**"OAuth" means two unrelated things in this server, which is why the docs read as
+contradictory.** `docs/oauth-login.md`: *"OAuth login applies to the **stdio** server
+only. The remote server and the `http` command have their own authentication."* That
+one is the server acting as an OAuth **client** to obtain a token for itself —
+interactive, browser or device code, callback port, in-memory only. Separately, the
+`http` server acts as an OAuth **resource** server: it advertises
+`/.well-known/oauth-protected-resource/mcp` and verifies a bearer, which is what the
+`WWW-Authenticate` below is doing and what `OAuth protected resource endpoints
+registered` in its startup log means. `docs/host-integration.md` documents that
+discovery dance only for GitHub's *hosted* remote server, so the self-hosted `http`
+mode implementing it is undocumented rather than absent. Net effect: in `http` mode
+the server never acquires a credential, only verifies one.
+
+**Driving the server by hand needs three surprises handled.** In `http` mode it is an
+**OAuth-protected resource**: an unauthenticated `initialize` gets `401` plus
+`Www-Authenticate: Bearer resource_metadata=…/.well-known/oauth-protected-resource/mcp`.
+Any bearer value is accepted at `initialize` (it is not validated there), so
+`-H 'Authorization: Bearer ghp_0000…'` is enough to proceed. It runs **stateless** —
+no `Mcp-Session-Id` is issued, so `tools/call` needs no session header. And replies
+arrive as **SSE** (`text/event-stream`), so the result is a `data:` line, not a JSON body.
+
+**`GITHUB_PERSONAL_ACCESS_TOKEN` is unused in `http` mode.** Settled with one valid
+read-only PAT in the container's environment, varying only where the credential came
+from — the audit log is what makes the first row unambiguous, since a local refusal
+and a GitHub rejection both surface as "401":
+
+| env token | `Authorization` header | Result | New audit row |
+| --- | --- | --- | --- |
+| valid | omitted | `Unauthorized` (HTTP 401) | **no** — never called GitHub |
+| valid | bogus | `401 Bad credentials` *from GitHub* | yes |
+
+So there is no env fallback, and when a bearer is present it **takes precedence** —
+the valid env token was ignored in favour of a deliberately broken header.
+
+**The upstream documentation says otherwise, and the code agrees with the
+measurement.** PR github/github-mcp-server#1216 and the changelog both describe HTTP
+mode as falling back to `GITHUB_PERSONAL_ACCESS_TOKEN` when no header is present.
+`pkg/http/middleware/token.go` on `main` contains no such fallback: it parses the
+`Authorization` header and returns 401 with `WWW-Authenticate` exactly when the header
+is missing, and offers no static-token flag. The fallback was the original intent and
+the docs were not updated — worth knowing before believing any account of this
+server's auth that is not the middleware itself.
+
+Two things follow, and both are favourable. A gateway fronting this server **must**
+inject `Authorization`, because without it the server never reaches GitHub at all.
+And the precedence runs the safe way round: a stale env credential cannot shadow the
+token the gateway supplies. The container therefore needs no credential of its own,
+which is why the env var was removed from `mcp-servers.yml` rather than kept as a
+fallback — an ineffective credential slot still shows up in `docker inspect`.
+
 ## Publishing a host port: the private range is the wrong instinct on WSL2
 
 Choosing a port for Docker to publish on the host, the principled-looking answer is

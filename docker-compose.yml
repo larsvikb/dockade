@@ -62,6 +62,30 @@ networks:
     ipam:
       config:
         - subnet: 172.29.0.0/24
+  # MCP data path. internal:true. Carries two conversations and no others: the MCP
+  # gateway dialing the MCP server containers, and those containers reaching the
+  # egress proxy for their own upstream calls.
+  #
+  # The servers live HERE and never on sandbox-net, and that placement is the whole
+  # boundary: each one holds a credential the sandbox must not have, so a server the
+  # agent could dial directly would make the gateway's per-tool policy decorative.
+  # The agent has no route to this network at all.
+  #
+  # The proxy is attached only to be DIALED. This subnet is inside the private range
+  # the relay guard already hard-blocks (172.16.0.0/12 in PRIVATE_CIDRS), so the
+  # proxy refuses it as a CONNECT target and cannot be turned into the agent's way in.
+  #
+  # Its tenants live in `mcp-servers.yml`, merged in by the Makefile's COMPOSE with
+  # `-f`: this file owns the topology, that one owns a catalogue that grows. Both
+  # are read by tests/test_topology.py, so a server added there still cannot join
+  # sandbox-net or take an egress leg.
+  mcp-net:
+    name: mcp-net
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
   # Host-facing UI path for the control-plane-ui frontend ONLY. A non-internal
   # bridge is REQUIRED here because Docker cannot publish a host port from a
   # container that lives solely on an internal network — the publish is silently
@@ -135,6 +159,21 @@ services:
       # the default route.
       authorize-net:
         priority: 20
+      # Be reachable BY the MCP server containers, so their upstream calls are
+      # governed by the same choke point as everything else — an MCP server with
+      # its own egress would be a second hole, and it is the one process here
+      # holding a write-capable credential. Internal and lowest priority, so it
+      # never becomes the default route. Attachment is inbound-only in effect:
+      # mcp-net is inside PRIVATE_CIDRS, so the guard still refuses it as a
+      # CONNECT target and this leg opens no path INTO the servers.
+      mcp-net:
+        # Fixed, for the same reason sandbox-net's is: it gives boundary-check.sh a
+        # literal address to probe. This one is the sandbox's NEGATIVE control — the
+        # proxy really is listening on it, so a sandbox that cannot reach
+        # 172.28.0.10:8080 while reaching 172.30.0.10:8080 has proved the absence of
+        # a route rather than the absence of a listener.
+        ipv4_address: 172.28.0.10
+        priority: 5
     environment:
       # Where the proxy asks for policy decisions. Resolved by name via Docker's
       # embedded DNS (127.0.0.11): `control-plane` gives this container the

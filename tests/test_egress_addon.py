@@ -57,6 +57,67 @@ class PermanentLifelineTests(unittest.TestCase):
         self.assertFalse(addon._is_permanent(""))
 
 
+class LifelineScopeTests(unittest.TestCase):
+    """``_is_lifeline`` = the host half AND the client half.
+
+    ``_is_permanent`` above says what the lifeline is for; this says who. The two
+    were one check until mcp-net gave this proxy a second, differently-trusted
+    client population — MCP server containers, which hold credentials and never
+    talk to Anthropic. A host-only check hands them the sole allow that skips the
+    policy authority."""
+
+    SANDBOX = "172.30.0.2"
+    MCP = "172.28.0.2"
+
+    def test_the_sandbox_gets_the_lifeline(self):
+        self.assertTrue(addon._is_lifeline("api.anthropic.com", self.SANDBOX))
+
+    def test_an_mcp_server_does_not(self):
+        self.assertFalse(addon._is_lifeline("api.anthropic.com", self.MCP))
+
+    def test_the_host_half_still_binds(self):
+        # Being on sandbox-net grants the lifeline for lifeline hosts only —
+        # everything else the agent asks for is still the control plane's call.
+        self.assertFalse(addon._is_lifeline("example.com", self.SANDBOX))
+
+    def test_an_unknown_client_does_not_qualify(self):
+        # Falls through to /authorize, which is the fail-safe direction.
+        for client in (None, "", "not-an-address", "[::1]"):
+            with self.subTest(client=client):
+                self.assertFalse(addon._is_lifeline("api.anthropic.com", client))
+
+    def test_a_v4_mapped_sandbox_address_is_the_same_client(self):
+        # A dual-stack listener can report the peer this way; the fold in
+        # _in_cidrs keeps the grant from turning on a spelling.
+        self.assertTrue(addon._is_lifeline("api.anthropic.com",
+                                           f"::ffff:{self.SANDBOX}"))
+
+    def test_emptying_the_range_disables_the_lifeline_rather_than_widening_it(self):
+        # Deliberately NOT guarded by _assert_guard_configured, unlike
+        # EGRESS_FORBIDDEN_CIDRS, because this is the direction it fails in: no
+        # client qualifies, so every host goes to the control plane. Losing outage
+        # resilience is a cost; it is not a hole, and the difference is why one of
+        # these lists is asserted at startup and the other is a knob.
+        with mock.patch.object(addon, "LIFELINE_CIDRS", ()):
+            self.assertFalse(addon._is_lifeline("api.anthropic.com", self.SANDBOX))
+
+
+class InCidrsTests(unittest.TestCase):
+    NETS = addon._parse_cidrs("DOCKADE_UNSET_LIFELINE", "172.30.0.0/24")
+
+    def test_inside_and_outside(self):
+        self.assertTrue(addon._in_cidrs("172.30.0.99", self.NETS))
+        self.assertFalse(addon._in_cidrs("172.31.0.2", self.NETS))
+
+    def test_unparseable_or_absent_is_false(self):
+        for value in (None, "", "  ", "example.com", "172.30.0.999"):
+            with self.subTest(value=value):
+                self.assertFalse(addon._in_cidrs(value, self.NETS))
+
+    def test_no_networks_matches_nothing(self):
+        self.assertFalse(addon._in_cidrs("172.30.0.2", ()))
+
+
 class EnvParsingTests(unittest.TestCase):
     def test_hosts_strips_lowercases_and_drops_empties(self):
         got = addon._hosts("DOCKADE_UNSET_HOSTS", "A.com, .B.com , ,c.COM")

@@ -21,7 +21,21 @@ SHELL := bash
 .ONESHELL:
 .DEFAULT_GOAL := help
 
-COMPOSE := docker compose
+# Both files, always. docker-compose.yml owns the topology; mcp-servers.yml owns
+# the MCP server catalogue (see its header). Merged with -f rather than run as a
+# second project so `depends_on: egress-proxy / condition: service_healthy` still
+# works and `mcp-net` needs no `external: true`. Every target inherits this, so a
+# bare `docker compose ...` typed by hand is the only way to get a partial view.
+COMPOSE := docker compose -f docker-compose.yml -f mcp-servers.yml
+# Where MCP client credentials live: one JSON file per server, OUTSIDE this repo,
+# because a sandbox launched with dockade as its workspace bind-mounts this tree
+# read-write (DESIGN.md, "Credentials" — which also fixes the schema and the
+# derive-the-path-from-the-server-name rule). Mounted read-only into the gateway once
+# it exists; until then, read by hand when probing a server:
+#   tok=$$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["token"])' \
+#            $(MCP_SECRETS)/mcp-github.json)
+# No container is given a credential today: see mcp-servers.yml.
+MCP_SECRETS ?= $(HOME)/.config/dockade/secrets
 SANDBOX ?= claude-sandbox
 WORKSPACE ?= $(PWD)
 
@@ -67,7 +81,7 @@ DOCKERFILES := claude-sandbox/Dockerfile opencode-sandbox/Dockerfile \
                control-plane/Dockerfile control-plane-ui/Dockerfile
 # A GLOB for the workflows, not a list, so a second workflow is linted without
 # anyone remembering to register it — same reasoning as LAUNCHERS above.
-YAMLFILES := docker-compose.yml .hadolint.yaml .yamllint \
+YAMLFILES := docker-compose.yml mcp-servers.yml .hadolint.yaml .yamllint \
              $(wildcard .github/workflows/*.yml)
 JSONFILES := $(shell git ls-files '*.json' 2>/dev/null)
 PYFILES := proxies/egress/addon.py control-plane-ui/app.py \
@@ -413,6 +427,48 @@ up: ## Bring up the shared infra (egress proxy + control plane + UI), building i
 
 down: ## Stop the shared infra (keeps the named volumes)
 	$(COMPOSE) down
+
+# The catalogue servers are profile-gated AND live in a second compose file, so
+# starting one by hand means both -f flags and the profile name — easy to get
+# subtly wrong, and a bare `docker compose --profile mcp-github up -d` fails with
+# "no such service" because it never reads mcp-servers.yml. These targets exist so
+# the -f pair has exactly one definition (COMPOSE, above) rather than living in
+# anyone's shell history.
+mcp-up: ## Start one catalogue MCP server: make mcp-up SERVER=github
+	@if [ -z "$(SERVER)" ]; then
+	  echo "usage: make mcp-up SERVER=github   (profiles: $$(grep -oP '^\s+- \Kmcp-\S+' mcp-servers.yml | tr '\n' ' '))"
+	  exit 2
+	fi
+	# No credential is passed in: measured, github-mcp-server ignores its env token in
+	# http mode and takes a per-request bearer, so the container holds nothing and this
+	# target has nothing secret to plumb. See mcp-servers.yml. A server that DOES take
+	# an env credential reads it from $(MCP_SECRETS) — never from a repo `.env`.
+	#
+	# Checked rather than fixed: a mode this loose is a decision someone made, and
+	# silently chmod-ing another person's files from a build target is worse than
+	# saying so.
+	@if [ -d "$(MCP_SECRETS)" ]; then
+	  for f in "$(MCP_SECRETS)" "$(MCP_SECRETS)"/*.json; do
+	    [ -e "$$f" ] || continue
+	    if [ -n "$$(find "$$f" -maxdepth 0 -perm /077 2>/dev/null)" ]; then
+	      echo "WARNING: $$f is group/world-readable — chmod 600 (700 for the dir)."
+	    fi
+	  done
+	fi
+	# --wait returns when the container is running and its dependencies are
+	# healthy, so a failure here is real rather than a race. The server holds a
+	# credential: if it exits immediately, read its log before re-running.
+	$(COMPOSE) --profile mcp-$(SERVER) up -d --wait --wait-timeout 60 mcp-$(SERVER)
+
+mcp-down: ## Stop one catalogue MCP server: make mcp-down SERVER=github
+	@if [ -z "$(SERVER)" ]; then echo "usage: make mcp-down SERVER=github"; exit 2; fi
+	# stop+rm rather than `down`, which would take the shared infra with it.
+	$(COMPOSE) stop mcp-$(SERVER)
+	$(COMPOSE) rm -f mcp-$(SERVER)
+
+mcp-ps: ## Who is on mcp-net right now (should be the proxy plus enabled servers)
+	docker network inspect mcp-net \
+	  -f '{{range .Containers}}{{printf "%-16s %s\n" .Name .IPv4Address}}{{end}}'
 
 destroy: ## Stop infra AND delete BOTH volumes: egress audit log + control-plane policy/audit store (destructive)
 	$(COMPOSE) down -v

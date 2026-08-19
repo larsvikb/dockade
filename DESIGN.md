@@ -39,7 +39,8 @@ the repo follows from "containment is by **capability**, not configuration."
   [Web access](#web-access-verified-empirically-in-sandbox) ·
   [Server-side execution blind spots](#server-side-execution-accepted-governance-blind-spots)
 - [Capability inventory](#capability-inventory-v1) ·
-  [Governance surfaces](#governance-surfaces) (egress proxy · control plane · approval UI)
+  [Governance surfaces](#governance-surfaces)
+  (egress proxy · control plane · approval UI · [MCP gateway](#mcp-gateway--governed-tool-capability-planned-not-built))
 - [Startup ordering](#startup-ordering--running-is-not-ready) ·
   [Resource limits](#resource-limits--blast-radius-not-boundary) ·
   [Local inference](#local-inference--an-ungoverned-llm-tool)
@@ -79,7 +80,13 @@ the internal sandbox network. Meaningful/risky capabilities are exposed as
 **governed proxies/tools**; safe high-value capabilities are exposed as
 **ungoverned tools**. Capabilities are surfaced to the agent as **skills**.
 
-MCP is out of scope. Capabilities are exposed as skills, not MCP servers.
+**MCP reaches the sandbox only through the governed MCP gateway** (planned — see
+"MCP gateway" under Governance surfaces). Skills stay the interface for capabilities
+we design; the gateway is for third-party tool surfaces we did not. Nothing is lost
+by the agent adding an MCP server of its own: one it spawns in its own container
+inherits the sandbox's capability, which is no egress and no credentials. The
+gateway is therefore not merely the *sanctioned* MCP path — it is the only one with
+anything behind it.
 
 ## Architecture
 
@@ -513,10 +520,13 @@ committed to (a). Documented points, with the design consequence of each:
   already inside the GitHub ranges; **`mcp-proxy.anthropic.com`** carries
   claude.ai MCP connectors, which are **on by default** — either disable them
   (`ENABLE_CLAUDEAI_MCP_SERVERS=false`) or they fail closed against our
-  default-deny. **Decision: left to fail closed.** The connectors are unused here
-  (MCP is out of scope — see Core idea), so failing closed costs nothing; set the
-  env only if deny-log noise from `mcp-proxy.anthropic.com` ever becomes a
-  nuisance.
+  default-deny. **Decision: left to fail closed** — but no longer merely because
+  the connectors are unused here. A connector's tool call executes
+  **server-side**, so it never crosses this container's network boundary and the
+  MCP gateway can neither see, audit nor hold it. Blocking the transport is what
+  keeps the gateway the only MCP path with capability behind it; see the
+  blind-spot registry below. Set the env only if deny-log noise from
+  `mcp-proxy.anthropic.com` ever becomes a nuisance.
 - **`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` is the right lever** for the
   statsig/feature-flag/telemetry chatter that would otherwise flood the proxy's
   deny log — and the Dockerfile **already sets it**. Good confirmation, not new
@@ -553,8 +563,10 @@ it explicitly so it is a conscious tradeoff, revisited as the setup matures.
 **Why the list is complete, not a sample:** a tool can only escape governance if
 it causes effects *outside* the container. File/process tools (Bash, Read, Edit,
 Write, Glob, Grep, Task, NotebookEdit) are inherently local — the firewall
-already governs anything they spawn. The only tools that reach external networks
-are the two web tools, both tested in this sandbox.
+already governs anything they spawn. The tools that reach external networks are
+the two web tools, both tested in this sandbox — plus **hosted MCP connectors**,
+whose calls originate on Anthropic infra rather than here, which is why the
+transport carrying them is blocked rather than accepted.
 
 Registry (re-test when Claude Code adds/changes tools):
 
@@ -563,6 +575,8 @@ Registry (re-test when Claude Code adds/changes tools):
 | WebSearch | server-side | **No** | what the agent searches for; unaudited web *intake*; low-bandwidth exfil via query strings (read-only — no upload/POST) |
 | WebFetch | client-side | Yes | — (network-governed) |
 | Bash / file / Task / Notebook tools | client-side | Yes | — (local, firewall-governed) |
+| MCP tools via the gateway *(planned)* | client-side | Yes | — (the gateway is the choke point; see "MCP gateway") |
+| claude.ai MCP connectors (hosted) | server-side | **No** | everything a connector does — which is why this one is **closed at the transport** rather than accepted as WebSearch is |
 
 Scope: this concerns governing *actions on external systems*. The conversation
 itself always goes to Anthropic (that is the model, not a tool action) and is
@@ -603,6 +617,11 @@ host-bind-mounted workspace. Dependencies: pull-through cache.
   direction**. v1: git over HTTPS through the egress proxy, push allowed to
   allowlisted repos/orgs, unknown → hold. The push token is a write-capable
   credential and stays governed (not in the sandbox).
+- **MCP gateway** *(planned — see "MCP gateway")* — the sole MCP surface offered to
+  the sandbox, exposing a curated tool set from configured MCP servers under
+  per-tool allow/deny/ask policy. It holds those servers' credentials so the
+  sandbox never does, which makes it the first concrete instance of the
+  write-capable-credentials invariant rather than a second exception to it.
 
 **Ungoverned (sandbox-net only, no independent egress):**
 - **Pull-through package cache** (npm/PyPI/apt) *(not built yet — see Build
@@ -631,7 +650,24 @@ host-bind-mounted workspace. Dependencies: pull-through cache.
   a personal-subscription login would not carry those (see "Managed settings are
   NOT an enforcement lever here"). Low-risk
   read-only tokens (e.g. a search API key) are also acceptable here.
-- Governed / not in sandbox: git push token, any write-capable / high-impact key.
+- Governed / not in sandbox: git push token, MCP server credentials (held by the
+  gateway), any write-capable / high-impact key.
+
+**No secret belongs in the repo's `.env`.** It is the natural place to reach for —
+gitignored, read automatically, already holding host-specific overrides — and the
+reason to refuse is not that it is plaintext. The workspace bind-mount is whatever
+directory a sandbox was launched from, so this repo's root is inside it exactly when
+an agent is working **on dockade** — which is how dockade gets developed. A secret
+there is therefore readable by the agent some of the time, decided by a launch
+directory nobody is thinking about at the time. Contingent exposure is worse than
+constant exposure, because it tests clean. Gitignoring keeps a value out of the
+history, not out of a sandbox.
+
+So anything that grants lives **outside the tree** — `~/.config/dockade/mcp.env`,
+mode 0600 — and is sourced by the `make mcp-up` recipe rather than by compose, so no
+version-dependent `env_file` behaviour decides whether a missing file is fatal.
+`.env` keeps the non-secret overrides it was meant for: DNS, model selection, the
+render gid, a port.
 
 **Workspace bind-mount:** the one deliberate direct host coupling. Scope it to a
 single project directory, read-write. Because work lands on the host FS directly,
@@ -639,8 +675,8 @@ no separate artifact-export path is needed in v1.
 
 ## Governance surfaces
 
-The three services that actually implement governance, and the reasoning each one
-rests on. This is the "why it is this way" that a change has to keep true — it was
+The services that actually implement governance, and the reasoning each one
+rests on (three built, plus the MCP gateway's design). This is the "why it is this way" that a change has to keep true — it was
 previously filed under a heading called *Build status*, which is why it kept
 growing without anyone noticing.
 
@@ -934,6 +970,24 @@ edit applies to the very next connection). Two deliberate properties: (1) the
 proxy *before* the control plane is consulted, so a control-plane outage never
 bricks the agent's own API; (2) everything else **fails closed** — if the control
 plane is unreachable or times out, the request is denied and audited locally.
+
+**The lifeline is scoped by client, and it is the only decision here that is.**
+Everywhere else this proxy is deliberately client-agnostic: it asks the policy
+authority and the authority decides on the host. The lifeline is the one allow that
+skips that call, so who is asking has to be part of it — its justification names its
+own scope, *the agent's* own API, and only sandbox-net runs the agent. Since
+`mcp-net`, this proxy also serves MCP server containers, which hold credentials and
+never talk to Anthropic; a host-only check would hand them the sole egress path
+nothing holds and the control plane never records. Enforced by `_is_lifeline` in
+`proxies/egress/addon.py` against `EGRESS_LIFELINE_CIDRS`, whose default
+`tests/test_topology.py` holds equal to sandbox-net's subnet. Emptying it fails the
+safe way — no client qualifies and every host becomes the control plane's call —
+which is why, unlike `EGRESS_FORBIDDEN_CIDRS`, it carries no startup assertion.
+
+A consequence worth stating because the topology now invites the mistake: adding a
+network to this proxy adds a **client population**, not just a route. Egress policy
+is still per-host, so every rule the operator ever approved for the agent is
+reachable by every container on every network the proxy serves.
 
 **Ingesting the decisions the proxy makes alone.** Those two properties, plus the
 relay guard, the port gate and the SNI anti-fronting check, mean a real share of
@@ -1600,7 +1654,365 @@ recent-decisions table the UI already renders — and the per-proxy config
 surface (rows accumulate from 2a).
 
 Not yet built: audit browsing beyond the recent-decisions table (2c),
-git/secrets/cache data-plane services, skills, quality-gate hooks.
+git/secrets/cache data-plane services, the MCP gateway, skills, quality-gate hooks.
+
+### MCP gateway — governed tool capability (planned, not built)
+
+A data-plane service that speaks MCP to the sandbox on one side and to configured
+MCP servers on the other, exposing a **curated** tool set under per-tool
+**allow / deny / ask** policy held in the control plane. It is to tool capability
+what the egress proxy is to network capability, and it is deliberately built on the
+same parts: policy in the crown-jewel store, unknown held for a human, every
+decision audited.
+
+**Why it is governed rather than ungoverned, and the reason is not policy.** An
+ungoverned tool must have *no independent egress*; an MCP gateway has egress and
+credentials by definition, so the classification is forced. The prize is custody:
+a GitHub PAT, a Slack token, a Jira key lives in the gateway and never in the
+sandbox. Per-tool policy is the visible feature, but credential brokering is what
+makes this the first concrete instance of "write-capable credentials stay governed"
+rather than a second exception to it.
+
+**What makes the boundary hold, given that no settings file is a boundary here.**
+The yolo agent can add an MCP server of its own and it does not matter: a server it
+spawns in its own container inherits the sandbox's capability, which is no egress
+and no credentials, so it can do nothing `Bash` could not already do. The invariant
+therefore needs no client-side enforcement — it rests on the same impoverishment
+everything else here rests on. This is why the Core-idea line says the gateway is
+the only MCP path *with anything behind it*, rather than the only one permitted.
+
+**One server, one container, and `mcp-net` is the boundary.** Each MCP server runs
+as its own container on `mcp-net` (internal), never inside the gateway and never on
+`sandbox-net`. That placement *is* the security property, because nothing inside
+those containers keeps the agent out: each holds a credential the sandbox must not
+have, so a server the agent could dial directly would make per-tool policy
+decorative. Running them inside the gateway would be worse still — a third-party
+image would inherit the gateway's route to the control plane, a better position
+than the agent has. `mcp-servers.yml` is the built catalogue; `docker-compose.yml`
+keeps the networks.
+
+Four constraints follow, each closing a different hole:
+
+- **The servers' egress goes through the egress proxy** — set by env, *enforced* by
+  placement: `mcp-net` is internal, so the proxy is the only thing reachable and a
+  server that ignores `HTTPS_PROXY` fails loudly instead of going direct. This is
+  the point the containers-per-server model does not remove but relocates: the
+  gateway itself needs no egress, since it only ever dials siblings, while the
+  servers need real internet — from a container holding a write-capable credential,
+  which is exactly what must not have an unaudited path out.
+- **The proxy's leg on `mcp-net` is inbound-only in effect.** It is attached to be
+  *dialed*, and the subnet sits inside the private range the relay guard already
+  hard-blocks, so the proxy refuses `mcp-net` as a CONNECT target and cannot be
+  turned into the agent's way in.
+- **The gateway keeps its own single-conversation bridge to the control plane**, on
+  the `authorize-net` pattern but *not* `authorize-net` itself — sharing that bridge
+  would create a lateral edge between two enforcers, which is what the original
+  split bought its way out of (see "why three control nets"). Its agent-facing
+  listener binds the `sandbox-net` address only, so it is absent from `mcp-net`:
+  otherwise a compromised server container could call the gateway's own tool
+  endpoint and drive approved tools laterally.
+- **Tier 2 stays out by the mechanism that already keeps tier 1 off the inference
+  service** — firewall grants are mode-gated, so the gateway's /32 is issued in
+  governed mode only.
+
+None of this is self-enforcing, so it is asserted rather than described:
+`tests/test_topology.py` reads both compose files and holds the placement rules
+(no `sandbox-net` leg, no egress leg, proxy env present, the probed address pinned),
+and `boundary-check.sh` proves from *inside the sandbox* that `mcp-net` is
+unreachable — probing the proxy's address there rather than a server's, because no
+server runs unless its profile is enabled and "nothing listening" would pass for the
+wrong reason.
+
+**The control plane configures servers; it never starts them.** Adding a server
+means starting a container, and that would mean a docker socket on the
+crown-jewel container — the one component whose compromise is total. So the split
+is: **compose declares, the UI configures.** A human edits `mcp-servers.yml` and
+brings the container up; the control plane owns which of the running servers are
+enabled and what each of their tools may do. The policy store holds nothing that
+grants — it never sees a credential.
+
+**A credential should live as far from the agent as its server allows — which is
+usually the server container, not the gateway.** The rule follows from what each
+component is: MCP server containers sit on `mcp-net` with **no route from the
+sandbox**, while the gateway is agent-facing *by definition*. Making the gateway hold
+every server's token would put the whole credential set on the one surface the agent
+can talk to, and concentrate it: one compromise yields every token instead of one.
+Per-container credentials keep them off the reachable surface and spread the blast
+radius.
+
+*The tempting counter-argument does not survive contact.* "A third-party image with
+no standing credential has nothing to steal" is only true while the server is idle —
+an injected bearer arrives on **every call**, so a compromised image gets the token
+the moment it is used. What per-request injection actually removes is the idle window,
+which is worth little against the threat it appears to address.
+
+**GitHub's server leaves no choice, and that is a per-server fact rather than the
+rule.** In `http` mode its token middleware requires an `Authorization` header per
+request and 401s without one; the env credential is stdio-only, and when a header is
+present it wins outright (both measured — see NOTES.md, which also records that the
+upstream fallback documentation no longer matches the code). So the gateway must hold
+and inject *this* token. The precedence at least runs the safe way round: a stale
+environment token cannot shadow what the gateway supplies.
+
+**The injected bearer is a scoped PAT, not an OAuth token.** GitHub's server in
+`http` mode is an OAuth *resource* server — it advertises protected-resource metadata
+and verifies a bearer, but never acquires one (its interactive OAuth *login* is
+stdio-only, by its own documentation). Acquisition is therefore the gateway's job, and
+OAuth's advantages here are the enterprise ones: per-user identity, short-lived
+tokens, incremental scope. With one operator they pay nothing, while the costs are an
+app registration, a browser-reachable redirect bolted onto the control-plane UI, and
+storage of a refresh token — a *longer*-lived secret than the PAT it replaced. A
+fine-grained PAT scoped to one repo is also tighter than an OAuth token carrying an
+account's scopes. Revisit only if dockade ever serves more than one human.
+
+*The option that would beat it, and why it is unavailable.* The server's stdio OAuth
+login keeps its token **in memory only** — no env var, nothing in `docker inspect`,
+nothing in the gateway — which is better custody than any PAT arrangement, and its
+documentation covers running that way in Docker (a published callback port so a host
+browser can reach the redirect). Two structural facts rule it out here, neither of
+them about security: a client in one container **cannot speak stdio to a server in
+another** without the docker socket, which nothing in this design may hold; and a
+memory-only token acquired interactively means a human at a browser after every
+restart, which an unattended gateway cannot rely on. So the PAT wins on availability
+rather than on custody — worth stating in that order, because the reverse claim is
+tempting and wrong.
+
+The consequence for the catalogue: the gateway needs the injection capability
+regardless, but "the gateway is the vault" is **not** an architectural rule. Prefer an
+env credential in the container wherever a server accepts one. If concentration ever
+starts to matter with several forced-injection servers, the shape that resolves it is
+a per-server header-injecting sidecar on `mcp-net` — more moving parts than one server
+justifies, recorded so it does not have to be re-derived.
+
+**How a credential is configured: the control plane stores the descriptor, the
+gateway resolves the secret.** These are separable and must stay separate. The store
+gets an **auth descriptor** per server — enough to build a request, useless to steal:
+
+```json
+{ "auth": { "type": "header", "header": "Authorization",
+            "template": "Bearer {secret}" } }
+```
+
+`type: none` is the default and covers the preferred case where the server holds its
+own credential and the gateway injects nothing. One `{secret}` placeholder covers the
+variations that actually occur (`Bearer …`, `token …`, `X-Api-Key: …`) without a
+per-server special case anywhere in the code — there is no GitHub-specific branch.
+
+**The secret's path is derived from the server name, never stored as a reference.**
+The gateway reads exactly `/run/dockade/secrets/mcp-<server>.json` and nothing else. A
+free-text `secret_ref` in the store would let a forged config write point one server
+at another's credential; deriving the path makes that cross-wiring **impossible**
+rather than validated-against. Same move `_persist_candidates` already makes for
+egress rules: the backend derives a bounded set instead of trusting a string the
+requester supplied. The cost is that two servers cannot share one token, which is
+closer to a feature.
+
+**The file is JSON, holding secret material and nothing else:**
+
+```json
+{ "token": "github_pat_...",
+  "note": "read-only on dockade, expires 2026-08-26" }
+```
+
+Structured rather than a bare token for two reasons beyond the extension being honest
+about its contents. It removes a whole class of fragility — a bare-token file is
+sensitive to trailing newlines and CRLF, which cost a `tr -d` in the manual probe
+before this was settled — and multi-field secrets are coming: a self-hosted GitLab or
+Jira needs a token *plus* an instance URL, and a bare string would force a second
+mechanism the first time that happens. `note` exists so a token's expiry has a home,
+and is never read by anything; it is worth having because an expired credential
+returns the same 401 that otherwise signals a working path.
+
+The boundary that keeps this from drifting: **secret fields only.** Another secret
+(`client_id`, `client_secret`) belongs here; a non-secret like an endpoint or a header
+name does not — that is the descriptor's job, and config split across two stores means
+neither is the source of truth.
+
+**Where the material lives:** one file per server on the host, outside this repo,
+`~/.config/dockade/secrets/` at 0700 with files at 0600 — not in a Docker volume, not
+in the policy store, not in the image, not in git. Hence a property worth having
+explicitly: **a crown-jewel backup never contains a credential.**
+
+**Delivered as a read-only bind mount of the directory, deliberately not compose
+`secrets:`.** A `secrets:` entry whose `file:` source is absent fails at `up` time for
+the whole project — the same eager-validation trap as `${VAR:?}`, and this repo has
+paid for that lesson twice. A directory bind degrades instead: a missing file means
+*that* server fails closed while every other service is unaffected. `make up` ensures
+the directory exists first, as it already checks the mode of `MCP_ENV`.
+
+**What the UI can say without ever seeing a value:** whether the secret *resolves*,
+per server. That is what makes a forced-injection server fail legibly — "configured,
+secret missing" — instead of surfacing an upstream 401 that reads like a policy
+problem. Rotation is replacing the file; the gateway re-reads on mtime change, so
+there is nothing to restart and nothing to edit in the UI.
+
+**The gateway pulls, and what it may cache is not uniform.** Same shape as the
+proxy's `/authorize`, for the same reason: no client-side cache means an operator
+edit applies to the very next call. But two questions travel this path, and only one
+is per-call. **Execution policy must never be cached** — a `deny` set in the UI that
+waits for a TTL is not a deny. The **roster and tool list** are needed at session
+start and on change, so they may be polled, with `notifications/tools/list_changed`
+pushing the update into a live session. Serving the roster read on the narrow
+authorize bridge is a deliberate widening of a surface that answers one endpoint
+today; the criterion that keeps it honest is that a caller reaching that bridge
+still cannot *grant* anything, which is why `resolve` stays off it.
+
+**Three states, two axes.** `allow` / `deny` / `ask` map onto the existing rules
+table almost unchanged (`allow` / `block` / `hold`). What does not carry over is that
+a rule here governs two separable things: whether a tool's schema is **presented**,
+and whether a call is **executed**. Withholding a schema is ergonomics — it keeps
+the agent from planning around a capability it cannot have. Execution is the
+boundary, and `deny` must be enforced there *regardless of presentation*, because a
+tool name can arrive from anywhere: a transcript, a `CLAUDE.md`, text injected into
+the agent's context by an earlier tool result. Same shape as settings-versus-
+capability everywhere else in this design.
+
+**An unconfigured tool is denied and reported, not held — a deliberate divergence
+from the egress proxy.** There, an unmatched host is held because the set of hosts
+is unbounded and discovered at runtime; default-deny without a human would make the
+proxy useless. A server's tool set is **finite and enumerable at connect time**, so
+it can be configured in advance and refusing the unknown costs nothing. The gain is
+that the exposed tool list becomes a *configuration artifact* rather than a mirror
+of upstream: a server upgrade that adds tools raises a notice in the control plane
+instead of silently widening what the agent can reach.
+
+**`ask` does not decay, and that is the problem this design has to answer.** Egress
+holds collapse duplicates onto one card and persist into rules, so the human's
+decision count trends toward zero as trust accrues — the progressive-trust path this
+system is built around. Tool payloads are per-call and never repeat exactly, so a
+naive `ask` is a permanent tax with no such path. What is needed is an
+argument-shaped analogue of `_persist_candidates`: *this call* → *this tool with
+these arguments* → *this tool with one field pinned* → *this tool always*. Copy its
+shape exactly, because the property that matters is the same one — the backend
+derives a **bounded** candidate set, the operator picks from it, and the chosen
+value is shown verbatim; nothing is persisted from a string the requester supplied.
+Deriving that ladder is server-specific, and it — not rendering — is where "any kind
+of MCP server" actually bites. MCP's own `readOnlyHint` / `destructiveHint`
+annotations are **server-supplied and therefore untrusted**: they may sort and label
+the configuration surface ("this server claims these are read-only"), and they must
+never decide.
+
+**Presenting a payload for approval.** A schema-driven view gets most of the way —
+the tool's JSON Schema gives a field tree with each field's description beside it —
+but the rule the approval UI already established governs: the **raw payload is
+authoritative and always one click away**, exactly as the persist-confirm shows a
+chosen pattern verbatim rather than describing it. A prettifier that truncates,
+unescapes or reorders is a place to hide something from the person deciding. The
+limit worth stating rather than engineering around: an operator cannot judge an
+opaque identifier, and resolving one would mean the control plane making its own MCP
+calls — new capability on the crown-jewel container and a fine SSRF surface. The
+card names the gap instead.
+
+**Two failure modes the egress proxy does not have.**
+- **Executing after the caller is gone.** If the hold outlives the client's MCP tool
+  timeout, a human approves, the gateway executes, and the agent has already
+  recorded a failure — a message sent that nobody wanted, invisible to both sides.
+  So: cancel on client disconnect, keep the hold window strictly under the client
+  timeout, and audit the case where it fires anyway. The proxy has no side effects to
+  strand, which is why this appears for the first time here.
+- **The response is the channel.** The gateway governs the *request*, but what steers
+  an agent is the third-party text arriving in its context — an `allow`-ed,
+  read-only tool is unaudited intake of the same shape as WebSearch, and content in
+  it can name tools (see the presentation/execution split above). The audit must
+  therefore record the response side, at minimum size and hash, because the forensic
+  question is *what entered the agent's context*.
+
+**Which servers may be admitted: narrow, named tools.** The three states only have
+purchase when a tool is narrow and named. A tool whose payload is a **program** —
+SQL, PromQL, a shell string, a generic `http_request` — collapses
+allow/deny/ask into allow-everything-or-nothing: per-tool policy governs nothing,
+every call is an `ask` a human must read a query to judge, and the credential is the
+only real boundary left. Such a capability is admitted only when the **credential
+itself** is the boundary (read-only against a replica, where `allow` is safe by
+construction), or as a handful of named parameterized operations — and that is a
+skill, not MCP. This sharpens the skills-versus-MCP line rather than reversing it:
+skills for capabilities we can name, the gateway for third-party tool surfaces we
+did not design.
+
+**First server: GitHub — shipped as `mcp-github` in `mcp-servers.yml`, ahead of the
+gateway that will front it.** It is the capability actually missing rather than a
+demonstration — `gh` is deliberately absent, no write-capable credential lives in
+the sandbox, and pushing is the human's step, so a fine-grained PAT held beside the
+server is what lets the agent finish a unit of work. It is also kind to the parts that are
+hard, in ways the alternatives are not: payloads are human-legible (a PR body, a
+branch name) rather than opaque IDs, authentication is a static token rather than an
+OAuth flow the gateway would have to own, and reads/comments/merges land cleanly on
+the three states. And it is unkind in the one place that argues *for* it: issue and
+PR bodies are attacker-authored text read by an agent with write access to the same
+repo, so the response-side channel above is confronted on server one rather than
+discovered on server four — which is also where a per-tool **repo allowlist** earns
+itself. Likely order after that: observability (near-all read, so it proves the
+topology cheaply), then Slack (opaque channel IDs, and `ask` at its least
+decaying), then Atlassian (OAuth plus ADF payloads — the renderer's stress test, not
+what should drive its design). Corporate servers also raise a custody question that
+GitHub-on-your-own-repos does not; one gateway instance per credential domain is
+cheap to decide early and awkward late.
+
+Two consequences of the container-per-server rule, worth stating because they are
+choices and not oversights. **Hosted servers are excluded** — Sentry, Atlassian and
+Linear all offer one, and none can be a container on `mcp-net`; if one is wanted
+later, wrap it in a local container so "the gateway only dials siblings" survives
+and the remote hop sits behind the egress proxy where it belongs. And **stdio
+servers need an HTTP transport**, because a pipe does not cross a container boundary
+and spawning one from the gateway would need the docker socket, which nothing here
+may hold. GitHub's server has an `http` subcommand; a stdio-only server needs a shim
+in its image, which is a real cost when choosing the next one.
+
+**A server's own restriction flags are defence in depth, never the boundary.** The
+GitHub server's `--read-only` was silently inert in `http` mode through v0.31.0 —
+write tools stayed in `tools/list` and executed. Set them anyway; rely on the
+gateway's deny state, and verify `tools/list` rather than the flag.
+
+**Telling the sandbox it exists: `--mcp-config` + `--strict-mcp-config`, from the
+launcher.** Four channels can declare an MCP server, and the choice is not a matter
+of taste — a settings block, which would have been the obvious fit for this repo's
+materialize-each-boot config, **does not work at all**: `mcpServers` in a settings
+file is silently ignored (measured; see NOTES.md). What remains is a project
+`.mcp.json`, the per-project `local` scope, the `user` scope in
+`$CLAUDE_CONFIG_DIR/.claude.json`, and the `--mcp-config` flag.
+
+`--mcp-config` wins on three counts, and only the first is ergonomic. It takes an
+inline JSON string or a file path, so the gateway entry can be a **baked,
+root-owned file** the agent cannot edit — the same shape as `statusline.sh`, and one
+step past materialize-each-boot, since nothing is written into the config volume to
+drift in the first place. And `--strict-mcp-config` makes the launcher's set
+**exclusive for the session** — a `claude mcp add` by the agent does not join it,
+where `--mcp-config` alone is merely additive (both measured).
+
+`.mcp.json` is disqualified twice over, and the second reason is what makes strict
+mode load-bearing rather than tidy. Writing one would put config into the human's
+live checkout — but the sharper problem is *reading* one: `/workspace` is a checkout
+the agent clones into, so a repo can ship an MCP server with itself, and in `-p` mode
+that server starts with no approval gate at all (measured — see NOTES.md). What
+arrives is not capability, since a repo-supplied server inherits the same nothing
+every agent-added server does; what arrives is **steering** — tool names,
+descriptions and outputs entering the agent's context from an untrusted repository,
+the same channel as the response-side risk above. Strict mode makes a `.mcp.json`
+in the workspace inert, which is the honest fix; the trust prompt is not.
+
+That exclusivity is **mistake-prevention, not containment**, and the distinction is
+the same one this design draws everywhere: the agent could relaunch `claude` without
+the flags. What makes that harmless is not the flag but the capability argument
+above — a server it adds has nothing behind it. The flag's real value is that the
+sandbox's tool surface is *reviewable in the repo* rather than accumulated in a
+volume.
+
+**The flags belong in a root-owned wrapper on `PATH`, not in the `.bashrc.tier`
+alias.** An alias is only expanded by an interactive shell, so `claude -p` from a
+script or a hook would silently run without them — and `-p` is precisely where a
+workspace `.mcp.json` was measured starting a server unprompted. The wrapper also
+keeps `claude-yolo` correct for free, since that alias resolves through it.
+
+Whether the entry is passed at all belongs to the **launcher's mode decision**,
+alongside governed-versus-standalone — not a runtime probe, because "running is not
+ready" (see Startup ordering) and a dead entry costs a startup error and misleads
+the agent about its own capability. The two flags are separable, and that decides
+the gateway-absent case cleanly: pass `--strict-mcp-config` **unconditionally** and
+add `--mcp-config` only when the gateway is up. Strict with nothing supplied yields
+zero MCP servers (measured), so "no gateway" means a provably empty tool surface
+rather than whatever the config volume happens to have accumulated. The baked `CLAUDE.md` must also say that a
+gateway tool call can block on a human, or an `ask` is indistinguishable from a
+hang.
 
 ## Startup ordering — "running" is not "ready"
 
@@ -2097,6 +2509,8 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | 3 | skills + quality-gate hooks in the image | planned |
 | 4 | pull-through package cache | planned |
 | — | governed git push path | planned |
+| — | `mcp-net` + MCP server catalogue (`mcp-servers.yml`) | **done** — inert until the gateway exists |
+| — | MCP gateway — per-tool allow/deny/ask | planned (needs 2c's per-proxy config + rule editing) |
 
 The rationale for each shipped item lives under **Governance surfaces** above, not here
 — a status line goes stale, the reasoning does not. This section is deliberately the
@@ -2139,6 +2553,16 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
   (proxy-less) fallback, where the firewall directly allowlists api.anthropic.com.
 - **Web search backend** — which third-party search API for the `websearch`
   skill (Brave / SerpAPI / Google CSE).
+- **Which governed path owns repo writes.** The planned git proxy speaks the git
+  protocol; a GitHub MCP server behind the gateway reaches the same capability
+  through the REST API (create-or-update-file style tools commit without ever
+  touching the wire protocol). Two governed roads to "write to a repo" under
+  different policy models is a hole, because an actor — or a confused agent —
+  takes the weaker one, so this has to be decided once rather than discovered
+  after both exist. Either the gateway denies the API-commit tools and
+  git-over-the-wire owns writes (the inclination: a branch and force-push policy
+  wants to see refs, not JSON), or the gateway owns them and the git proxy is
+  scoped to clone/fetch.
 - **RESOLVED — the local managed file is not an enforcement lever under org auth.**
   Verified in-container: `/status` shows the managed source as *remote* (org
   server-managed); the local `/etc/claude-code/managed-settings.json` is not loaded,
@@ -2174,7 +2598,9 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
   browser-facing-guards note under "Approval UI". Worth building for that
   specific threat (the agent reaching host execution via the workspace mount), not
   because "the UI has no auth"; naive auth does not help, since any credential at
-  rest on the host is readable by the same process.
+  rest on the host is readable by the same process. The MCP gateway raises the
+  stakes of this item without changing its reasoning: a forged egress approval lets
+  a socket out, a forged `ask` sends the mail.
 - **Approval-UI follow-ups (reviewed and specified, not built).** From the same review
   that produced the reconnect / CSP / keyed-rendering work above, in value order. The
   top two — the hold countdown and the persist preview/confirm with an operator-chosen

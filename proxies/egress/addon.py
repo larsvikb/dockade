@@ -36,6 +36,8 @@ Fail-closed, with one deliberate exception:
   - The **permanent lifeline** hosts (``EGRESS_PERMANENT_HOSTS`` — the Anthropic
     API/auth endpoints) are allowed by a LOCAL check *before* the control plane
     is consulted, so a control-plane outage never bricks the agent's own API.
+    Scoped to clients on ``EGRESS_LIFELINE_CIDRS`` (sandbox-net), because that
+    sentence names the only client it is for — see ``_is_lifeline``.
   - Every other host depends on the control plane. If it is unreachable or slow
     (timeout), the request is DENIED and audited locally — governed egress fails
     closed when the policy authority is down, which is the intended posture.
@@ -123,6 +125,9 @@ CONTROL_TIMEOUT = float(os.environ.get("EGRESS_CONTROL_TIMEOUT", "130"))
 # so an outage of the control plane can never sever the agent's own API/auth.
 # Mirrors the PERMANENT block of policies/egress-allowlist.txt. Same match
 # semantics as the control plane: a leading dot matches subdomains.
+#
+# WHICH clients get it is a separate question, answered by LIFELINE_CIDRS below.
+# This list is only the host half.
 def _hosts(env: str, default: str) -> tuple[str, ...]:
     return tuple(h.strip().lower() for h in os.environ.get(env, default).split(",")
                  if h.strip())
@@ -217,6 +222,27 @@ PRIVATE_CIDRS = _parse_cidrs(
 # One list for the literal-IP and resolve checks, so both branches cover every
 # hard-blocked range (control-net + the private/special-use ranges).
 _BLOCKED_CIDRS = FORBIDDEN_CIDRS + PRIVATE_CIDRS
+
+# WHO may take the permanent lifeline. The lifeline is the one path here that
+# allows a host WITHOUT asking the control plane, so it is the one place where
+# "which client is asking" has to be part of the decision — everywhere else this
+# proxy is deliberately client-agnostic and lets the policy authority decide.
+#
+# It exists for exactly one reason, and the reason names its own scope: a
+# control-plane outage must never sever THE AGENT's own API/auth. Only sandbox-net
+# runs the agent. Since mcp-net was added, this proxy also serves MCP server
+# containers — third-party images that hold or are handed a credential and never
+# talk to Anthropic at all. Granting them an unheld, centrally-unaudited tunnel to
+# api.anthropic.com would hand the one component whose compromise this topology
+# plans for the one egress path the policy authority never sees.
+#
+# Default mirrors sandbox-net in docker-compose.yml (tests/test_topology.py holds
+# the two together). Unlike EGRESS_FORBIDDEN_CIDRS there is no startup assertion,
+# because emptying this one fails the SAFE way: no client qualifies, the lifeline
+# is off, and every host — Anthropic's included — goes to the control plane and is
+# centrally audited. The cost of that is outage resilience, not containment, which
+# is why it is a knob rather than a guard.
+LIFELINE_CIDRS = _parse_cidrs("EGRESS_LIFELINE_CIDRS", "172.30.0.0/24")
 
 # IPv6 forms that CARRY an embedded IPv4 address, and are therefore a way to write
 # a blocked v4 destination that a v4-only blocklist does not recognize.
@@ -331,6 +357,33 @@ def _blocked_cidr(ip_str: str):
             if candidate in net:
                 return net
     return None
+
+
+def _in_cidrs(ip_str: str | None, nets: tuple) -> bool:
+    """True if this address parses and falls inside one of ``nets``.
+
+    Folds the IPv4-embedding IPv6 forms down the same way ``_blocked_cidr`` does,
+    for the opposite reason: there the fold stops a blocked destination hiding
+    behind a spelling, here it stops a legitimate client LOSING a grant because of
+    one. A v4 sandbox peer can be reported as ``::ffff:172.30.0.2`` on a dual-stack
+    listener, and that is the same client by any measure that matters.
+
+    Unparseable or absent -> False, which for the only caller means the request
+    goes to the control plane instead of short-circuiting. That is the fail-safe
+    direction: an unidentifiable client gets governed, not exempted. Note this can
+    never be widened by a spoofed value — the address comes from the accepted
+    socket's peername, not from anything on the wire."""
+    if not ip_str:
+        return False
+    try:
+        ip = ipaddress.ip_address(_unbracket(ip_str))
+    except ValueError:
+        return False
+    candidates = [ip]
+    embedded = _embedded_ipv4(ip)
+    if embedded is not None:
+        candidates.append(embedded)
+    return any(c in n for c in candidates for n in nets)
 
 
 def _cidr_label(net) -> str:
@@ -456,6 +509,18 @@ def _is_permanent(host: str) -> bool:
     return any(_match(host, p) for p in PERMANENT_HOSTS)
 
 
+def _is_lifeline(host: str, client: str | None) -> bool:
+    """Whether THIS client may take the local lifeline allow for THIS host.
+
+    Both halves are required. The host half (``PERMANENT_HOSTS``) says what the
+    lifeline is for; the client half (``LIFELINE_CIDRS``) says who it is for, and
+    without it every container this proxy serves inherits an allow the control
+    plane never sees. A client outside the range is not denied — it simply falls
+    through to ``/authorize`` like any other request, so an Anthropic host reached
+    from mcp-net is governed and centrally audited rather than short-circuited."""
+    return _is_permanent(host) and _in_cidrs(client, LIFELINE_CIDRS)
+
+
 def _post_authorize(payload: dict) -> dict:
     """Blocking POST to the control plane. Runs in a worker thread (see
     ``_authorize``), so blocking here is fine — it never touches the event
@@ -479,14 +544,21 @@ class Verdict(NamedTuple):
     central: bool
 
 
-async def _authorize(host: str, *, stage: str, **fields) -> Verdict:
-    """Permanent lifeline hosts are allowed locally without consulting the control
-    plane (outage resilience). Everything else asks the control plane; any error
-    there fails CLOSED (deny). The control plane audits every decision it makes
-    itself, which is what ``Verdict.central`` reports."""
-    if _is_permanent(host):
+async def _authorize(host: str, *, stage: str, client: str | None = None,
+                     **fields) -> Verdict:
+    """Permanent lifeline hosts are allowed locally, FOR SANDBOX CLIENTS, without
+    consulting the control plane (outage resilience — see ``_is_lifeline`` for why
+    the client is part of that decision and nothing else's). Everything else asks
+    the control plane; any error there fails CLOSED (deny). The control plane
+    audits every decision it makes itself, which is what ``Verdict.central``
+    reports.
+
+    ``client`` is named explicitly rather than left to ``**fields`` because it is
+    now read here and not merely forwarded. It still travels to the control plane
+    in the payload below, which both hooks depend on for audit attribution."""
+    if _is_lifeline(host, client):
         return Verdict(True, "permanent lifeline (local)", False)
-    payload = {"host": host, "stage": stage, **fields}
+    payload = {"host": host, "stage": stage, "client": client, **fields}
     try:
         resp = await asyncio.to_thread(_post_authorize, payload)
     except Exception as e:  # noqa: BLE001 — any failure must fail closed
@@ -549,6 +621,7 @@ def load(loader) -> None:  # mitmproxy lifecycle hook
     _setup_audit_file()
     _audit("startup", control_plane=AUTHORIZE_URL, audit=AUDIT_PATH,
            permanent=list(PERMANENT_HOSTS),
+           lifeline_cidrs=[str(n) for n in LIFELINE_CIDRS],
            forbidden_hosts=list(FORBIDDEN_HOSTS),
            forbidden_cidrs=[str(n) for n in FORBIDDEN_CIDRS],
            private_cidrs=[str(n) for n in PRIVATE_CIDRS])

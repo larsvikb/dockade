@@ -242,6 +242,8 @@ dockade/
                             #   management API (approvals, resolve, the read-only
                             #   views) on control-net; both listeners' entry point
     store.py                #   SQLite — schema, the audit write, the policy seed
+    audit.py                #   the read side: the folded glance, the paged record,
+                            #   and the filters both share
     policy.py               #   what a rule pattern matches; peer address -> client
                             #   class; (host, class) -> allow/deny/hold
     holds.py                #   the in-process registry a held request blocks on
@@ -315,8 +317,13 @@ exposed through governed data-plane services. Next steps toward it:
    reached the proxy on — so a host approved for the agent is still unknown to an
    MCP server container and is held the first time one asks; a single allowlist
    would otherwise become the union of every client's needs.
-   Next: **2c** audit browsing (filter/search/history beyond the recent-decisions
-   table already in the UI) + per-proxy config.
+   **2c-1 done:** the audit trail is **browsable**. The decisions view takes filters
+   (free-text search, a decision facet, a relative time window) and offers a second
+   view of the same table — one row per decision instead of the folded glance, with
+   the request itself and cursor paging back through the whole record. Reading the
+   log no longer means `docker compose exec` and SQL against the crown-jewel volume.
+   Next: **2c-2** per-proxy config (which also unblocks the MCP gateway's per-tool
+   rules).
 3. **Skills + quality-gate hooks** in the image — the enablement half of the
    paved road.
 4. **Pull-through package cache** — fast, governed dependency installs.

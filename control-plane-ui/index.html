@@ -194,6 +194,31 @@
      the scope is spelled out rather than left to the reader to spot. */
   .wild { color: var(--hold); }
 
+  /* ── browsing the record: the filter bar, and the record view's pager ──────
+     Deliberately plain controls. This bar sits above a table of evidence, and the
+     one thing it must not do is look like it is doing more than narrowing what is
+     shown — nothing here changes policy, and nothing here is a button an operator
+     could mistake for the ones on an approval card. */
+  .filters { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+    margin-bottom: 10px; }
+  .filters input[type="search"] { font: inherit; font-size: 13px; flex: 1;
+    min-width: 200px; background: #202632; color: var(--fg);
+    border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+  .filters select { font: inherit; font-size: 13px; background: #202632;
+    color: var(--fg); border: 1px solid var(--line); border-radius: 6px;
+    padding: 5px 6px; }
+  .filters .switch { display: flex; align-items: center; gap: 5px;
+    color: var(--dim); font-size: 12px; white-space: nowrap; }
+  .filters button { font-size: 12px; padding: 5px 10px; }
+  .pager { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+  .pager button { font-size: 12px; padding: 4px 10px; }
+  /* The request cell. This is the one agent-controlled UNBOUNDED string rendered on
+     the page (capped on write, escaped on render), so it wraps anywhere and is
+     width-limited — otherwise a 2 kB URL pushes the reason column off screen and the
+     row stops being readable as a row. */
+  td.req { color: var(--dim); font-size: 12px; word-break: break-all;
+    max-width: 380px; }
+
   /* ── tabs ────────────────────────────────────────────────────────────────
      Tabs hide two of the three views at any moment, and one of those (standing
      policy) has SILENT DRIFT as its failure mode — it accumulated unnoticed for
@@ -274,17 +299,69 @@
   </section>
 
   <section id="view-decisions" role="tabpanel" aria-labelledby="tab-decisions" hidden>
-    <h2>Recent decisions</h2>
+    <!-- The note says WHICH of the two views is on screen. Without it the heading
+         claims "recent" while the table may be showing a filtered window from last
+         week, which is the sort of quiet mislabelling this page exists not to do. -->
+    <h2>Decisions <span class="note" id="audit-mode"></span></h2>
+    <!-- Filters, shared by both views below. The search box matches the columns the
+         view DISPLAYS (host, client, class, reason — plus the request itself in the
+         record view), so a row can never match on something the reader cannot see;
+         the backend enforces that split, this is only the control. -->
+    <div class="filters" role="search">
+      <input type="search" id="audit-q" autocomplete="off" spellcheck="false"
+             placeholder="search host, client, class, reason"
+             aria-label="Search decisions">
+      <!-- These option values are the `decision` column's vocabulary, and a test
+           holds them equal to the backend's (audit.DECISIONS) — a value this page
+           offers that the backend does not know is a 400 on click. -->
+      <select id="audit-decision" aria-label="Filter by decision">
+        <option value="">any decision</option>
+        <option value="allow">allow</option>
+        <option value="deny">deny</option>
+        <option value="hold">hold</option>
+        <option value="revoke">revoke</option>
+      </select>
+      <!-- Relative windows, not date pickers: the question is "since when". Values
+           are the keys of AUDIT_WINDOWS in app.js, held equal by a test. -->
+      <select id="audit-window" aria-label="Filter by time">
+        <option value="">any time</option>
+        <option value="1h">last hour</option>
+        <option value="24h">last 24 hours</option>
+        <option value="7d">last 7 days</option>
+      </select>
+      <!-- The glance/record switch. Unchecked folds identical decisions and shows the
+           most recent window; checked is one row per decision, with the request and a
+           pager that reaches the whole record. NOT a filter — "clear" leaves it
+           alone, because it chooses which record the filters apply to. -->
+      <label class="switch"><input type="checkbox" id="audit-every">
+        every event</label>
+      <button type="button" id="audit-clear">clear filters</button>
+    </div>
     <!-- ABOVE the table, because it changes how everything below it should be read.
          A run of fail-closed denials looks exactly like a run of policy denials, and
          the case that matters is the one where nobody suspects anything — so the
          distinction has to arrive before the rows, not be discovered among them. -->
     <div class="empty" id="audit-outage" hidden></div>
-    <table>
+    <table id="audit-grouped-table">
       <thead><tr><th>time</th><th>decision</th><th>host</th><th>client</th>
         <th>reason</th></tr></thead>
       <tbody id="audit"></tbody>
     </table>
+    <!-- The record: one row per decision. Carries `request` — the method and URL, or
+         the port for a CONNECT tunnel — which is the whole reason to leave the folded
+         view, and the field the glance deliberately drops as unbounded. -->
+    <table id="audit-events-table" hidden>
+      <thead><tr><th>time</th><th>decision</th><th>host</th><th>client</th>
+        <th>request</th><th>reason</th></tr></thead>
+      <tbody id="audit-events"></tbody>
+    </table>
+    <!-- Paging, for the record view only. The glance cannot page (a fold is defined
+         relative to its window) and says so with the coverage line instead. -->
+    <div class="pager" id="audit-pager" hidden>
+      <button type="button" id="audit-newer">&larr; newer</button>
+      <button type="button" id="audit-older">older &rarr;</button>
+      <span class="ts" id="audit-page"></span>
+    </div>
     <!-- Says whether an empty list means "nothing has happened" or "the poll failed".
          Those rendered identically before, and the header cannot settle it either:
          `conn` reports the SSE stream, while this table is filled by a separate poll

@@ -62,6 +62,8 @@ const missing = ["lampState", "backoffDelay", "diffPending", "shouldSweep",
                  "holdRemaining", "countdownState", "departure", "persistPreview",
                  "saturationState", "ackCount", "requestsLabel",
                  "auditRow", "auditStatus", "rulesStatus", "repeatCount",
+                 "timeWindow", "filterActive", "auditQuery", "eventRow",
+                 "historyPager",
                  "fmtTime", "fmtStamp", "fmtInstant"]
   .filter(n => typeof m[n] !== "function");
 console.log(JSON.stringify({
@@ -325,6 +327,93 @@ console.log(JSON.stringify({
         junk_total: m.coverageSummary([{ n: 5 }], "lots"),
         empty: m.coverageSummary([], 0),
         counts_decisions: m.coverageSummary([{ n: 40 }], 900).shown,
+        // With a filter applied the total is the MATCHING set, not the store.
+        filtered_truncated: m.coverageSummary([{ n: 12 }], 1200, true),
+        filtered_complete: m.coverageSummary([{ n: 12 }], 12, true),
+        filtered_empty: m.coverageSummary([], 0, true),
+      },
+      // ── browsing the record ──────────────────────────────────────────────
+      // A fixed clock: 2024-01-01T00:00:00Z is 1704067200s, so a 1h window starts
+      // at 1704063600. Asserted arithmetic rather than the machine's mood.
+      window: {
+        any: m.timeWindow("", 1704067200000),
+        hour: m.timeWindow("1h", 1704067200000),
+        day: m.timeWindow("24h", 1704067200000),
+        week: m.timeWindow("7d", 1704067200000),
+        unknown_preset: m.timeWindow("all-of-it", 1704067200000),
+        no_clock: m.timeWindow("1h", undefined),
+        junk_clock: m.timeWindow("1h", "now"),
+        // Sub-second clocks must not leak into the bound (see timeWindow).
+        whole_seconds: m.timeWindow("1h", 1704067200999),
+        presets: Object.keys(m.AUDIT_WINDOWS),
+      },
+      filter_active: {
+        nothing: m.filterActive({ q: "", decision: "", preset: "" }),
+        no_filter_object: m.filterActive(null),
+        text: m.filterActive({ q: "evil" }),
+        // Whitespace is not a filter: an accidental space must not relabel the view.
+        whitespace: m.filterActive({ q: "   " }),
+        decision: m.filterActive({ decision: "deny" }),
+        window: m.filterActive({ preset: "24h" }),
+        unknown_window: m.filterActive({ preset: "forever" }),
+      },
+      query: {
+        bare: m.auditQuery({}, { limit: 40 }),
+        everything: m.auditQuery(
+          { q: "evil", decision: "deny", preset: "1h" },
+          { limit: 100, nowMs: 1704067200000, before: "1704067200.5:42" }),
+        // Free text is percent-encoded, or an `&` pasted from a URL splits the
+        // query string into parameters the backend would misread or refuse.
+        hostile_text: m.auditQuery({ q: "a&b=c #x/y" }, { limit: 40 }),
+        trims: m.auditQuery({ q: "  evil  " }, { limit: 40 }),
+        no_limit: m.auditQuery({ q: "x" }, {}),
+        junk_limit: m.auditQuery({}, { limit: "lots" }),
+        // A cursor must survive encoding intact: it is the position in the record,
+        // and a mangled one either 400s or silently serves the newest page.
+        cursor: m.auditQuery({}, { limit: 5, before: "1704067200.5:42" }),
+      },
+      event_row: {
+        // A plaintext request: method and URL are what identify it.
+        http: m.eventRow({ ts: 1e9, id: 7, decision: "deny", host: "a.example",
+                           stage: "http", method: "GET", url: "https://a.example/x",
+                           port: 80, proto: "http", client: "172.30.0.2",
+                           client_class: "sandbox", reason: "blocked by rule" }),
+        // A CONNECT tunnel has neither, and is identified by its port.
+        tunnel: m.eventRow({ ts: 1e9, id: 8, decision: "allow", host: "b.example",
+                             stage: "connect", port: 443, proto: "connect" }),
+        // Neither recorded — an empty cell rather than an invented one.
+        bare: m.eventRow({ ts: 1e9, id: 9, host: "c.example" }),
+        nothing: m.eventRow(null),
+        // The shared columns must be IDENTICAL to the folded view's, which is the
+        // whole reason eventRow builds on auditRow.
+        shares_shaping: (() => {
+          const r = { ts: 1e9, decision: "deny", host: "a.example", stage: "http",
+                      client_class: "mcp", fail_closed: true };
+          const folded = m.auditRow(r), raw = m.eventRow(r);
+          return ["ts", "decision", "host", "client", "stagePrefix",
+                  "clientClassPrefix", "reason", "failClosed"]
+            .every(k => JSON.stringify(folded[k]) === JSON.stringify(raw[k]));
+        })(),
+      },
+      pager: {
+        // page, pageSize, shown, total, hasNext, filtered
+        first_of_many: m.historyPager(0, 100, 100, 4301, true, false),
+        second_of_many: m.historyPager(1, 100, 100, 4301, true, false),
+        last: m.historyPager(2, 100, 40, 240, false, false),
+        only_page: m.historyPager(0, 100, 12, 12, false, false),
+        empty: m.historyPager(0, 100, 0, 0, false, false),
+        filtered: m.historyPager(1, 100, 100, 900, true, true),
+        no_total: m.historyPager(0, 100, 5, undefined, false, false),
+        junk: m.historyPager("x", "y", "z", "t", false, false),
+      },
+      audit_filtered_status: {
+        // The empty sentence must not claim an empty RECORD when a filter is what
+        // emptied the list.
+        filtered_empty: m.auditStatus(0, false, true, true),
+        unfiltered_empty: m.auditStatus(0, false, true, false),
+        // A failed poll stays a failed poll — the more urgent fact either way.
+        filtered_failed: m.auditStatus(0, true, true, true),
+        filtered_has_rows: m.auditStatus(12, false, true, true),
       },
       revoke: {
         allow_rule: m.revokePreview({ pattern: ".github.com", action: "allow",
@@ -1029,6 +1118,169 @@ class PageScriptTests(unittest.TestCase):
                 self.assertFalse(c[case]["show"])
                 self.assertIsNone(c[case]["total"])
 
+    def test_a_filtered_view_measures_itself_against_the_matching_set(self):
+        """"of 1,200 recorded decisions" under an active filter reads as the size of
+        the store, which makes a narrowed view look like a shrunken record. The noun is
+        the whole fix, and it comes from the BACKEND's answer rather than from the
+        controls on screen — an older backend that ignored the parameters served an
+        unfiltered list."""
+        c = self.probe["saturation"]["coverage"]
+        self.assertIn("matching", c["filtered_truncated"]["text"])
+        self.assertNotIn("recorded", c["filtered_truncated"]["text"])
+        self.assertIn("recorded", c["truncated"]["text"])
+
+    def test_a_complete_filtered_view_says_so_instead_of_going_quiet(self):
+        """The exception to "silent when it shows everything". Unfiltered, that silence
+        is right — a permanent "12 of 12" is furniture. Under a filter the reader is
+        looking at a short list they just narrowed, where silence is indistinguishable
+        from truncation, so the completeness is worth one sentence."""
+        c = self.probe["saturation"]["coverage"]
+        self.assertTrue(c["filtered_complete"]["show"])
+        self.assertIn("All 12 matching", c["filtered_complete"]["text"])
+        # Nothing on screen means the status line owns the message (see auditStatus);
+        # two sentences arguing about an empty list is noise.
+        self.assertFalse(c["filtered_empty"]["show"])
+
+    def test_an_empty_filtered_list_does_not_claim_an_empty_record(self):
+        """The same empty-versus-stale discipline, one level in. "No decisions recorded
+        yet" in front of a full store — because the operator searched a host that never
+        asked for anything — reads as governance not running at all."""
+        s = self.probe["saturation"]["audit_filtered_status"]
+        self.assertIn("No decisions match", s["filtered_empty"]["text"])
+        self.assertIn("record itself is not empty", s["filtered_empty"]["text"])
+        self.assertIn("No decisions recorded yet", s["unfiltered_empty"]["text"])
+        # A failed poll outranks the filter: it is the more urgent fact either way.
+        self.assertIn("Could not refresh", s["filtered_failed"]["text"])
+        self.assertFalse(s["filtered_has_rows"]["show"])
+
+    def test_the_time_window_is_arithmetic_on_a_clock_it_is_given(self):
+        """A relative window, computed from a clock passed IN — which is what makes it
+        assertable at all, and the same choice the hold countdown made."""
+        w = self.probe["saturation"]["window"]
+        self.assertIsNone(w["any"])
+        self.assertEqual(w["hour"], 1704063600)
+        self.assertEqual(w["day"], 1704067200 - 86400)
+        self.assertEqual(w["week"], 1704067200 - 604800)
+        # Whole seconds: a sub-second clock must not produce a different query string
+        # for two identical clicks.
+        self.assertEqual(w["whole_seconds"], w["hour"])
+
+    def test_an_unusable_window_becomes_no_window_rather_than_a_wrong_one(self):
+        # A bound derived from a junk clock would silently hide the record. "Any time"
+        # is the safe direction: it shows more, not less.
+        w = self.probe["saturation"]["window"]
+        for case in ("unknown_preset", "no_clock", "junk_clock"):
+            with self.subTest(case=case):
+                self.assertIsNone(w[case])
+
+    def test_the_window_presets_are_the_ones_the_page_offers(self):
+        """Two ends, no compiler: an <option> value app.js does not know is a control
+        that silently does nothing — the query goes out unfiltered and the table looks
+        like an answer."""
+        section = re.search(r'<select id="audit-window".*?</select>',
+                            INDEX_HTML.read_text(), re.S)
+        self.assertIsNotNone(section, "the time facet moved in index.html")
+        offered = [v for v in re.findall(r'value="([^"]*)"', section.group(0)) if v]
+        self.assertEqual(sorted(offered),
+                         sorted(self.probe["saturation"]["window"]["presets"]))
+
+    def test_a_filter_is_only_active_when_it_narrows_something(self):
+        f = self.probe["saturation"]["filter_active"]
+        self.assertFalse(f["nothing"])
+        self.assertFalse(f["no_filter_object"])
+        self.assertTrue(f["text"])
+        self.assertTrue(f["decision"])
+        self.assertTrue(f["window"])
+        # Whitespace is not a filter, and an unknown preset narrows nothing — treating
+        # either as active would relabel the whole view for no change in its contents.
+        self.assertFalse(f["whitespace"])
+        self.assertFalse(f["unknown_window"])
+
+    def test_the_query_string_carries_exactly_what_was_asked_for(self):
+        q = self.probe["saturation"]["query"]
+        self.assertEqual(q["bare"], "limit=40")
+        self.assertEqual(
+            q["everything"],
+            "limit=100&q=evil&decision=deny&since=1704063600"
+            "&before=1704067200.5%3A42")
+        self.assertEqual(q["trims"], "limit=40&q=evil")
+        # An absent or unusable limit is omitted rather than sent as junk — the
+        # backend's own default is the better answer than a guess.
+        self.assertEqual(q["no_limit"], "q=x")
+        self.assertEqual(q["junk_limit"], "")
+
+    def test_free_text_is_encoded_before_it_reaches_the_query_string(self):
+        """The search box takes anything, including strings pasted out of a URL. An
+        unencoded `&` splits the query into parameters the backend never received as
+        typed — so the operator's search silently means something else."""
+        q = self.probe["saturation"]["query"]["hostile_text"]
+        self.assertEqual(q, "limit=40&q=a%26b%3Dc%20%23x%2Fy")
+
+    def test_the_page_cursor_survives_the_round_trip(self):
+        """It is the position in the record. Mangled, the backend either refuses it or
+        serves the newest page while the pager claims to be twelve pages back."""
+        self.assertEqual(self.probe["saturation"]["query"]["cursor"],
+                         "limit=5&before=1704067200.5%3A42")
+
+    def test_an_event_row_identifies_the_request_two_ways(self):
+        """The two shapes are alternatives, not columns: a plaintext request has a
+        method and a URL, a CONNECT tunnel has neither and is identified by its port.
+        Rendering both as columns would give every row two empty cells."""
+        e = self.probe["saturation"]["event_row"]
+        self.assertEqual(e["http"]["request"], "GET https://a.example/x")
+        self.assertEqual(e["tunnel"]["request"], ":443 connect")
+        # Neither recorded: an empty cell, not an invented one.
+        self.assertEqual(e["bare"]["request"], "")
+        self.assertEqual(e["nothing"]["request"], "")
+
+    def test_both_views_shape_their_shared_columns_identically(self):
+        """The reason `eventRow` is built ON `auditRow` rather than beside it. The two
+        tables show the same five columns, and a second implementation of the stage
+        prefix, the class prefix, the em-dash for a missing client or the fail-closed
+        marker is one that can drift in a view nobody is currently looking at."""
+        self.assertIs(self.probe["saturation"]["event_row"]["shares_shaping"], True)
+
+    def test_the_pager_reports_row_numbers_not_a_page_count(self):
+        """"decisions 101 to 200 of 4,301" says where the reader is in the record;
+        "page 2" needs the page size before it means anything. Exact, because every
+        page but the last is full by construction."""
+        p = self.probe["saturation"]["pager"]
+        self.assertEqual((p["first_of_many"]["from"], p["first_of_many"]["to"]), (1, 100))
+        self.assertEqual((p["second_of_many"]["from"], p["second_of_many"]["to"]),
+                         (101, 200))
+        # The range separator is an EN DASH, written as an escape here because ruff
+        # rejects the raw character in a string as confusable with a hyphen.
+        self.assertIn("101\u2013200", p["second_of_many"]["text"])
+        self.assertIn("4,301", p["second_of_many"]["text"])
+        # A partial last page reports what it actually holds.
+        self.assertEqual((p["last"]["from"], p["last"]["to"]), (201, 240))
+
+    def test_the_pager_offers_only_the_directions_that_exist(self):
+        """`older` follows the CURSOR, not arithmetic on the total: the record takes an
+        insert on every governed request, so a page derived from the two would disagree
+        with the record while it was being read."""
+        p = self.probe["saturation"]["pager"]
+        self.assertTrue(p["first_of_many"]["older"])
+        self.assertFalse(p["first_of_many"]["newer"])
+        self.assertTrue(p["second_of_many"]["newer"])
+        self.assertFalse(p["last"]["older"])
+        for k in ("older", "newer"):
+            self.assertFalse(p["only_page"][k])
+            self.assertFalse(p["junk"][k])
+
+    def test_the_pager_says_nothing_about_an_empty_page(self):
+        # The list's own status line already says whether that is an empty record or an
+        # unmatched filter; a "0 to 0" beside it would be a second sentence arguing
+        # with the first.
+        p = self.probe["saturation"]["pager"]
+        self.assertEqual(p["empty"]["text"], "")
+        self.assertEqual(p["junk"]["text"], "")
+        # And it says "matching" for the same reason the coverage line does.
+        self.assertIn("matching", p["filtered"]["text"])
+        # A backend without the total still gets a usable label.
+        self.assertIn("Decisions 1\u20135", p["no_total"]["text"])
+        self.assertNotIn(" of ", p["no_total"]["text"])
+
     def test_an_arriving_approval_is_announced_with_its_host(self):
         """The host IS the decision. "One approval pending" says something is
         waiting; it does not say whether the agent wants the package registry or an
@@ -1146,30 +1398,56 @@ class PageScriptTests(unittest.TestCase):
         self.assertIn("no longer be what is in force", r["failed_with_rows"]["text"])
 
 
+def _fn_body(src: str, signature: str) -> str:
+    """The body of a two-space-indented function inside `start()`.
+
+    The row templates moved out of `refreshAudit` when the decisions view grew a
+    second table, so the source guards below name the RENDERER they are about — which
+    also means each of them can be asserted for both tables rather than for whichever
+    one the poll happened to inline."""
+    m = re.search(rf"function {re.escape(signature)}\s*\{{(.*?)\n  \}}", src, re.S)
+    if m is None:
+        raise AssertionError(f"{signature} not found in app.js — renamed? The source "
+                             f"guards below cannot assert a renderer they cannot find, "
+                             f"and would otherwise pass by looking at nothing.")
+    return m.group(1)
+
+
 class DecisionsTableSourceTests(unittest.TestCase):
-    """`refreshAudit` lives in `start()` and cannot be unit-tested, so the parts of
-    it that would fail SILENTLY are asserted against the source — the same approach
-    the dismiss handler and the duplicate badge use."""
+    """`refreshAudit` and the two row renderers live in `start()` and cannot be
+    unit-tested, so the parts of them that would fail SILENTLY are asserted against
+    the source — the same approach the dismiss handler and the duplicate badge use.
+
+    `self.body` is the poll; `self.rows` and `self.events` are the folded and the raw
+    row templates. The shared claims are asserted for BOTH, because the two views
+    render the same five columns and the whole reason `eventRow` builds on `auditRow`
+    is that they must not be able to disagree."""
 
     def setUp(self):
         self.src = APP_JS.read_text()
         self.body = re.search(r"async function refreshAudit\(\)\s*\{(.*?)\n  \}",
                               self.src, re.S)
         self.assertIsNotNone(self.body, "refreshAudit not found — renamed?")
+        self.rows = _fn_body(self.src, "renderGrouped(rows)")
+        self.events = _fn_body(self.src, "renderEvents(rows)")
 
     def test_the_decisions_table_stamps_the_date_not_only_the_time(self):
         # Forty rows routinely span midnight, and a time-only stamp makes them read
         # as out of order at exactly the moment ordering matters. WHICH formatter this
         # render calls is not reachable from a unit test; the formatters themselves are
         # (see the FormatterTests above), so only the call site needs guarding.
-        self.assertIn("fmtStamp(", self.body.group(1))
-        self.assertNotIn("fmtTime(", self.body.group(1))
+        for view, body in (("folded", self.rows), ("record", self.events)):
+            with self.subTest(view=view):
+                self.assertIn("fmtStamp(", body)
+                self.assertNotIn("fmtTime(", body)
 
     def test_the_row_carries_the_unambiguous_instant_as_well(self):
         # The visible stamp is LOCAL and states no offset, which is fine on the
         # operator's own screen and not fine once a row is correlated against
         # `make logs-cp` or pasted into an advisory.
-        self.assertRegex(self.body.group(1), r'title="\$\{esc\(fmtInstant\(')
+        for view, body in (("folded", self.rows), ("record", self.events)):
+            with self.subTest(view=view):
+                self.assertRegex(body, r'title="\$\{esc\(fmtInstant\(')
 
     def test_a_failed_refresh_keeps_the_rows_and_reports_the_staleness(self):
         # Both halves matter. Clearing on failure would throw away the only data the
@@ -1211,7 +1489,7 @@ class DecisionsTableSourceTests(unittest.TestCase):
         # `<tr[^>]*>` rather than `<tr>`: the row carries a conditional `outage`
         # class now. The attribute region is asserted separately just below, so
         # loosening this does not let arbitrary markup onto the row unnoticed.
-        row = re.search(r"return `\s*<tr([^>]*)>(.*?)</tr>`", self.body.group(1), re.S)
+        row = re.search(r"return `\s*<tr([^>]*)>(.*?)</tr>`", self.rows, re.S)
         self.assertIsNotNone(row, "the row template was restructured")
         self.assertRegex(
             row.group(1),
@@ -1250,15 +1528,19 @@ class DecisionsTableSourceTests(unittest.TestCase):
         right pixels and the wrong `textContent`, so a row copied into a ticket read as
         one word. A decisions table exists to be quotable evidence, so the space and
         the separator are part of the escaped VALUE, never styling."""
-        body = self.body.group(1)
-        self.assertIn('esc(" " + a.repeat)', body)
-        self.assertIn("esc(` · first seen ${fmtStamp(a.firstTs)}`)", body)
+        self.assertIn('esc(" " + a.repeat)', self.rows)
+        self.assertIn("esc(` · first seen ${fmtStamp(a.firstTs)}`)", self.rows)
         # fmtStamp, not fmtTime: a group's span can cover days (the scan behind it is
         # bounded by event count, not by a window), so a bare time reads as today.
-        self.assertNotIn("fmtTime(a.firstTs)", body)
+        self.assertNotIn("fmtTime(a.firstTs)", self.rows)
+        # The record view folds nothing, so a repeat count there would be a "1x" on
+        # every row — the annotation exists to mark the exception, not the rule.
+        self.assertNotIn("a.repeat", self.events)
 
     def test_the_client_column_is_rendered_and_escaped(self):
-        self.assertIn("esc(a.client)", self.body.group(1))
+        for view, body in (("folded", self.rows), ("record", self.events)):
+            with self.subTest(view=view):
+                self.assertIn("esc(a.client)", body)
         # Scoped to the decisions SECTION, not the first <thead> in the file — the
         # policy table also has one, and a reordering of the two sections would
         # otherwise silently point this assertion at the wrong table.
@@ -1267,6 +1549,28 @@ class DecisionsTableSourceTests(unittest.TestCase):
         self.assertIsNotNone(section, "the decisions section was renamed")
         self.assertIn("<th>client</th>", section.group(0),
                       "the column exists in the body but has no header")
+
+    def test_the_record_table_body_agrees_with_its_header(self):
+        """Same guard as the folded table above, for the view that carries the request.
+        A header/body mismatch here shifts every cell one place left, which puts the
+        URL under `client` — and an audit row that misattributes a request is worse
+        than one that fails to render."""
+        section = re.search(r'<table id="audit-events-table".*?</table>',
+                            INDEX_HTML.read_text(), re.S)
+        self.assertIsNotNone(section, "the record table was renamed")
+        headers = [h.strip() for h in re.findall(r"<th>(.*?)</th>", section.group(0))]
+        self.assertEqual(headers, ["time", "decision", "host", "client", "request",
+                                   "reason"])
+        row = re.search(r"return `\s*<tr([^>]*)>(.*?)</tr>`", self.events, re.S)
+        self.assertIsNotNone(row, "the record row template was restructured")
+        cells = row.group(2).split("<td")[1:]
+        self.assertEqual(len(cells), len(headers),
+                         "the record table body and header disagree on cell count")
+        # The request cell is the fifth, and it is escaped — this is the one
+        # agent-controlled unbounded string the page renders outside an approval card.
+        self.assertIn("esc(a.request)", cells[4])
+        self.assertIn("a.stagePrefix", cells[2])
+        self.assertIn("a.clientClassPrefix", cells[3])
 
     def test_the_policy_table_body_agrees_with_its_header(self):
         """Same guard as the decisions table above, for the table that shows STANDING
@@ -1292,6 +1596,76 @@ class DecisionsTableSourceTests(unittest.TestCase):
                          "the policy table body and header disagree on cell count")
         self.assertIn("r.client_class", cells[3])
         self.assertIn("esc(r.source)", cells[4])
+
+
+class RecordViewWiringSourceTests(unittest.TestCase):
+    """The filter and paging wiring lives in `start()`, and each property below fails
+    SILENTLY if it is dropped — the page keeps rendering a table of real decisions,
+    which is exactly what makes a wrong one hard to notice."""
+
+    def setUp(self):
+        self.src = APP_JS.read_text()
+        self.refresh = re.search(r"async function refreshAudit\(\)\s*\{(.*?)\n  \}",
+                                 self.src, re.S)
+        self.assertIsNotNone(self.refresh, "refreshAudit not found — renamed?")
+
+    def test_a_filter_change_resets_the_page_position(self):
+        """A cursor is a position in ONE result set. Kept across a filter change it
+        points into a list that no longer exists, so the operator lands on an arbitrary
+        page of the thing they just narrowed — with rows on screen, which reads as an
+        answer rather than as a bug."""
+        changed = re.search(r"function filtersChanged\(immediate\)\s*\{(.*?)\n  \}",
+                            self.src, re.S)
+        self.assertIsNotNone(changed, "filtersChanged not found — renamed?")
+        self.assertIn("resetPaging()", changed.group(1))
+        # Every control goes through it, including the mode switch: the two views page
+        # differently, so carrying a cursor across the switch is the same mistake.
+        for control in ("auditQEl", "auditDecisionEl", "auditWindowEl", "auditEveryEl"):
+            with self.subTest(control=control):
+                self.assertRegex(self.src, rf"{control}[^;]*?filtersChanged\(",
+                                 f"{control} must go through filtersChanged, or its "
+                                 f"change leaves the page position stale")
+
+    def test_the_record_view_sends_the_cursor_it_is_paging_with(self):
+        # Without `before`, "older" re-fetches page 1: the buttons work, the table
+        # changes nothing, and the pager's label says the reader has moved.
+        self.assertRegex(self.refresh.group(1),
+                         r"before:\s*events\s*\?\s*auditCursors\[auditPage - 1\]")
+
+    def test_a_page_past_the_end_of_the_record_snaps_back(self):
+        """`make audit-prune` deletes rows a cursor still points at, so an empty page is
+        reachable with nobody doing anything wrong — and it renders as "nothing here"
+        for a record that is not empty, which is the one claim this view must never
+        make."""
+        self.assertRegex(
+            self.refresh.group(1),
+            r"if \(events && !rows\.length && auditPage > 0\) \{\s*\n\s*resetPaging\(\);")
+
+    def test_clearing_the_filters_leaves_the_view_switch_alone(self):
+        """"Clear filters" clears filters. The glance/record switch selects WHICH record
+        the filters narrow, so resetting it would answer a question nobody asked — and
+        would silently drop an operator out of the history they were reading."""
+        handler = re.search(r"auditClearEl\.addEventListener\(.*?\n  \}\);",
+                            self.src, re.S)
+        self.assertIsNotNone(handler, "the clear handler moved")
+        self.assertNotIn("auditEveryEl", handler.group(0))
+
+    def test_the_two_views_are_fetched_from_two_literal_paths(self):
+        """The relay allowlist is matched against the literal each `fetch` begins with,
+        so a path assembled from a ternary is one the cross-file guard cannot see — and
+        that guard is the only thing between a new route and a 403 an operator finds by
+        loading the page."""
+        for path in ("/api/audit?", "/api/audit/events?"):
+            with self.subTest(path=path):
+                self.assertIn(f"fetch(`{path}", self.refresh.group(1))
+
+    def test_only_one_of_the_two_truncation_stories_is_told_at_a_time(self):
+        # The glance truncates and says so with the coverage line; the record pages and
+        # says so with the pager. Showing both would have them contradict each other,
+        # since they measure different things.
+        body = self.refresh.group(1)
+        self.assertRegex(body, r"renderCoverage\(events \?")
+        self.assertRegex(body, r"auditPagerEl\.hidden = !events")
 
 
 class PollGatingSourceTests(unittest.TestCase):

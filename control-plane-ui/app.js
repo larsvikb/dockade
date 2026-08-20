@@ -447,12 +447,25 @@ function pendingAnnouncement(added, total) {
 //
 // Silent when the window covers everything, which is the ordinary state on a quiet
 // system and the state where a permanent "showing 12 of 12" is pure furniture.
-function coverageSummary(rows, total) {
+// `filtered` is the backend's own answer (`/api/audit`'s `filtered` field), not what
+// the page asked for: an older backend ignores the parameters, and then the rows are
+// unfiltered whatever the controls say. It changes the NOUN, and that is the whole of
+// its job — "of 4,301 recorded decisions" under an active filter reads as the size of
+// the store, which would make a narrowed view look like a shrunken record.
+function coverageSummary(rows, total, filtered) {
   const shown = (rows || []).reduce((n, r) => n + repeatCount(r), 0);
   const t = Number(total);
   // An absent or nonsensical total says nothing rather than guessing. A backend
   // without the field must not make this claim "0 of 0".
   if (!Number.isFinite(t) || t <= shown) {
+    // With a filter on, "everything that matches is on screen" is worth stating
+    // rather than leaving to inference: the reader is looking at a short list they
+    // just narrowed, and silence there is indistinguishable from truncation. Without
+    // a filter it stays silent, because a permanent "showing 12 of 12" is furniture.
+    if (filtered && shown > 0) {
+      return { show: true, level: "none", shown, total: Number.isFinite(t) ? t : null,
+               text: `All ${shown.toLocaleString()} matching decisions are shown.` };
+    }
     return { show: false, level: "none", text: "", shown, total: Number.isFinite(t) ? t : null };
   }
   return {
@@ -461,7 +474,124 @@ function coverageSummary(rows, total) {
     shown,
     total: t,
     text: `Showing the ${shown.toLocaleString()} most recent of `
-        + `${t.toLocaleString()} recorded decisions.`,
+        + `${t.toLocaleString()} ${filtered ? "matching" : "recorded"} decisions.`,
+  };
+}
+
+// ── browsing the record: filters, and the view that pages ────────────────────
+//
+// The backend serves two views of the audit table and this is the page's half of that
+// split (see `audit.py`): the GLANCE is folded, bounded and unpaged; the RECORD is one
+// row per decision and pages backwards without bound. The filters are shared, so
+// narrowing the glance and then walking the history of what it turned up does not mean
+// re-typing anything — the controls do not move, only the table under them does.
+
+// Relative windows in seconds, not a pair of date pickers. The question an operator
+// has is "since when", and any absolute range they might type is one they would first
+// have to work out from a clock. The keys are the <option> values in index.html.
+const AUDIT_WINDOWS = { "1h": 3600, "24h": 86400, "7d": 604800 };
+
+// The `since` bound a preset means, in epoch SECONDS, or null for "any time".
+//
+// Takes the clock as an argument rather than reading it, so the arithmetic is
+// assertable — the same reason the countdown helpers do. Whole seconds because the
+// bound is a filter, not a measurement: a float here would make two identical clicks
+// produce two different cache-missing query strings for no gain.
+function timeWindow(preset, nowMs) {
+  const span = AUDIT_WINDOWS[preset];
+  const now = Number(nowMs);
+  if (!span || !Number.isFinite(now)) return null;
+  return Math.floor(now / 1000) - span;
+}
+
+// Is anything narrowing the view? Used only to decide whether to ASK for a filtered
+// query; whether one was actually applied is the backend's to report (see
+// coverageSummary).
+function filterActive(f) {
+  return !!(f && (((f.q || "").trim()) || f.decision || AUDIT_WINDOWS[f.preset]));
+}
+
+// The query string both views are fetched with. Pure, so the one place that decides
+// what the backend is asked is testable — and so `before` cannot silently go missing,
+// which would serve page 1 while the pager said page 12.
+//
+// Every value is percent-encoded: the search box takes free text, and `&` or `#`
+// pasted out of a URL would otherwise split the query string into parameters the
+// backend would then refuse (or worse, misread).
+function auditQuery(f, opts) {
+  const o = opts || {};
+  const parts = [];
+  const limit = Number(o.limit);
+  if (Number.isFinite(limit) && limit > 0) parts.push(`limit=${Math.floor(limit)}`);
+  const q = ((f && f.q) || "").trim();
+  if (q) parts.push(`q=${encodeURIComponent(q)}`);
+  if (f && f.decision) parts.push(`decision=${encodeURIComponent(f.decision)}`);
+  const since = timeWindow(f && f.preset, o.nowMs);
+  if (since !== null) parts.push(`since=${since}`);
+  if (o.before) parts.push(`before=${encodeURIComponent(o.before)}`);
+  return parts.join("&");
+}
+
+// One raw event, shaped for the record view.
+//
+// Built ON TOP of auditRow rather than beside it, so the five columns the two views
+// share cannot render differently in one of them — the stage prefix, the client class
+// prefix, the em-dash for a missing client and the fail-closed marker are one
+// implementation, and this adds only what the glance drops.
+function eventRow(r) {
+  const method = ((r && r.method) || "").trim();
+  const url = ((r && r.url) || "").trim();
+  const port = Number(r && r.port);
+  const proto = ((r && r.proto) || "").trim();
+  return {
+    ...auditRow(r),
+    id: r && r.id !== undefined && r.id !== null ? String(r.id) : "",
+    // WHAT was asked for, in one cell, because the two shapes are alternatives rather
+    // than columns: a plaintext request has a method and a URL, a CONNECT tunnel has
+    // neither and is identified by its port. Rendering both as columns would give
+    // every row two empty cells, which is how a table stops being scannable.
+    //
+    // The URL is the reason this view exists — it is the field that says WHICH request
+    // — and it is also the only agent-controlled unbounded string on the page. Capped
+    // on write (store.DRAIN_MAX_FIELD) and escaped by the renderer; the CSP is what
+    // makes an escaping mistake inert rather than fatal.
+    request: [method, url].filter(Boolean).join(" ")
+             || [Number.isFinite(port) && port > 0 ? `:${port}` : "", proto]
+                .filter(Boolean).join(" "),
+  };
+}
+
+// What the record's pager says and which of its buttons work.
+//
+// `page` is a zero-based index and `pageSize` the rows asked for, which together give
+// the row NUMBERS — exact, because every page but the last is full by construction
+// (the backend serves `limit` rows and reports a cursor only when more remain). Row
+// numbers rather than a page count: "decisions 101–200 of 4,301" tells the reader
+// where they are in the record, whereas "page 2" needs the page size to mean anything.
+//
+// `older` follows the cursor rather than the total. The total is the size of the
+// matching set and the page is a keyset window into it, so arithmetic on the two would
+// disagree with the record the moment a decision is written mid-read — which, on a
+// table that takes an insert per governed request, is the ordinary case.
+function historyPager(page, pageSize, shown, total, hasNext, filtered) {
+  const p = Math.max(0, Math.floor(Number(page)) || 0);
+  const size = Math.max(1, Math.floor(Number(pageSize)) || 1);
+  const n = Math.max(0, Math.floor(Number(shown)) || 0);
+  const t = Number(total);
+  const from = n ? p * size + 1 : 0;
+  const to = n ? p * size + n : 0;
+  const of = Number.isFinite(t)
+    ? ` of ${t.toLocaleString()}${filtered ? " matching" : ""}`
+    : "";
+  return {
+    older: !!hasNext,
+    newer: p > 0,
+    from,
+    to,
+    // Empty when there is nothing on screen: the list's own status line already says
+    // whether that is an empty record or an unmatched filter, and a second sentence
+    // saying "0–0" next to it would be noise arguing with prose.
+    text: n ? `Decisions ${from.toLocaleString()}–${to.toLocaleString()}${of}` : "",
   };
 }
 
@@ -534,8 +664,22 @@ const AUDIT_STATUS_TEXT = {
   empty: "No decisions recorded yet. Every allow, deny and hold appears here " +
          "as it happens.",
 };
-function auditStatus(rowCount, failed, loaded) {
-  return pollStatus(AUDIT_STATUS_TEXT, rowCount, failed, loaded);
+// An empty list under a FILTER is not an empty record, and the difference is the same
+// kind of difference as empty-versus-stale: one says the system is quiet, the other
+// says the question found nothing. Getting this wrong is worse than the stale case it
+// borrows from — "no decisions recorded yet" in front of a full store, because the
+// operator typed a host that never asked for anything, reads as governance not running.
+const AUDIT_FILTERED_EMPTY_TEXT =
+  "No decisions match these filters. The record itself is not empty — clear them, " +
+  "or widen the time window, to see it.";
+function auditStatus(rowCount, failed, loaded, filtered) {
+  const s = pollStatus(AUDIT_STATUS_TEXT, rowCount, failed, loaded);
+  // Only the EMPTY sentence changes. A failed poll is a failed poll whether or not a
+  // filter is set, and saying so remains the more urgent fact.
+  if (filtered && !failed && loaded && rowCount === 0) {
+    return { ...s, text: AUDIT_FILTERED_EMPTY_TEXT };
+  }
+  return s;
 }
 
 // The policy view's wording is NOT the decisions view's with a noun swapped, because
@@ -1291,34 +1435,60 @@ function start() {
     renderListStatus(auditCoverage, s);
   }
 
-  function renderAuditStatus(rowCount) {
-    renderListStatus(auditEmpty, auditStatus(rowCount, auditFailed, auditLoaded));
+  function renderAuditStatus(rowCount, filtered) {
+    renderListStatus(auditEmpty,
+                     auditStatus(rowCount, auditFailed, auditLoaded, filtered));
   }
 
   function renderRulesStatus(rowCount) {
     renderListStatus(rulesEmpty, rulesStatus(rowCount, rulesFailed, rulesLoaded));
   }
 
-  async function refreshAudit() {
-    let rows, total;
-    try {
-      const res = await fetch("/api/audit?limit=40");
-      if (!res.ok) throw new Error(String(res.status));
-      // {rows, total}. Tolerates a bare array from an older backend, in which case
-      // `total` is undefined and coverageSummary stays silent rather than guessing.
-      const body = await res.json();
-      rows = Array.isArray(body) ? body : (body && body.rows) || [];
-      total = Array.isArray(body) ? undefined : body && body.total;
-    } catch (e) {
-      // A failed refresh leaves the previous rows in place and SAYS SO. Silently
-      // swallowing this is what let the list sit indefinitely stale while the header
-      // read "live" — the stream and this poll are different transports.
-      auditFailed = true;
-      renderAuditStatus(document.getElementById("audit").rows.length);
-      return;
-    }
-    auditFailed = false;
-    auditLoaded = true;
+  // ── the decisions view's controls ─────────────────────────────────────────
+  // Rows the two views ask for. The glance stays at forty — it is read at a glance
+  // and the number is what the coverage line is honest about. The record's page is
+  // larger because it is read deliberately and paged, and it is bounded by the
+  // backend's own ceiling regardless of what is asked for here (audit.EVENTS_LIMIT_MAX).
+  const AUDIT_LIMIT = 40;
+  const EVENTS_LIMIT = 100;
+  // A keystroke is a query against the crown-jewel store, so the text box waits for a
+  // pause. The selects do not: a click is already a deliberate act, and delaying it
+  // reads as the page ignoring the click.
+  const AUDIT_FILTER_DEBOUNCE_MS = 250;
+
+  const auditQEl = document.getElementById("audit-q");
+  const auditDecisionEl = document.getElementById("audit-decision");
+  const auditWindowEl = document.getElementById("audit-window");
+  const auditEveryEl = document.getElementById("audit-every");
+  const auditClearEl = document.getElementById("audit-clear");
+  const auditModeNote = document.getElementById("audit-mode");
+  const auditGroupedTable = document.getElementById("audit-grouped-table");
+  const auditEventsTable = document.getElementById("audit-events-table");
+  const auditPagerEl = document.getElementById("audit-pager");
+  const auditOlderEl = document.getElementById("audit-older");
+  const auditNewerEl = document.getElementById("audit-newer");
+  const auditPageEl = document.getElementById("audit-page");
+
+  // Paging state for the record view. `auditCursors[i]` is the cursor that OPENS page
+  // i+1 — i.e. what the backend returned as `next` while serving page i — so walking
+  // back is popping an index rather than re-deriving anything. Kept as a list rather
+  // than a single cursor because keyset paging is one-directional: there is no
+  // "previous" cursor to compute, only one already seen.
+  let auditCursors = [];
+  let auditPage = 0;
+
+  const readFilter = () => ({ q: auditQEl.value, decision: auditDecisionEl.value,
+                              preset: auditWindowEl.value });
+  const everyEvent = () => auditEveryEl.checked;
+  const auditRowCount = () =>
+    document.getElementById(everyEvent() ? "audit-events" : "audit").rows.length;
+
+  function resetPaging() {
+    auditCursors = [];
+    auditPage = 0;
+  }
+
+  function renderGrouped(rows) {
     // Dates, not times: forty rows routinely span midnight, and a time-only stamp makes
     // them read as out of order at exactly the moment ordering matters. The `title`
     // carries the UTC instant, because the visible stamp is local and states no offset
@@ -1338,10 +1508,140 @@ function start() {
           <td>${esc(a.reason)}${a.firstTs
             ? esc(` · first seen ${fmtStamp(a.firstTs)}`) : ""}</td></tr>`;
     }).join("");
-    renderOutage(outageSummary(rows));
-    renderCoverage(coverageSummary(rows, total));
-    renderAuditStatus(rows.length);
   }
+
+  // The record view. Same five columns as the glance, rendered from the same shaping
+  // (see eventRow), plus the request itself — which is the column this view exists for
+  // and the one the glance cannot carry.
+  function renderEvents(rows) {
+    document.getElementById("audit-events").innerHTML = rows.map(r => {
+      const a = eventRow(r);
+      return `
+        <tr${a.failClosed ? ' class="outage"' : ""}>
+          <td class="ts" title="${esc(fmtInstant(a.ts))}">${esc(fmtStamp(a.ts))}</td>
+          <td><span class="tag ${esc(a.decision)}">${esc(a.decision)}</span></td>
+          <td>${a.stagePrefix ? `<span class="qual">${esc(a.stagePrefix)}</span>` : ""
+            }${esc(a.host)}</td>
+          <td class="ts">${a.clientClassPrefix
+            ? `<span class="qual">${esc(a.clientClassPrefix)}</span>` : ""
+            }${esc(a.client)}</td>
+          <td class="req"><code>${esc(a.request)}</code></td>
+          <td>${esc(a.reason)}</td></tr>`;
+    }).join("");
+  }
+
+  async function refreshAudit() {
+    const f = readFilter();
+    const events = everyEvent();
+    const qs = auditQuery(f, {
+      limit: events ? EVENTS_LIMIT : AUDIT_LIMIT,
+      nowMs: Date.now(),
+      // The cursor for the page being shown. Absent on page 0, which is what makes a
+      // filter change (which resets paging) return to the newest rows.
+      before: events ? auditCursors[auditPage - 1] : "",
+    });
+    let body;
+    try {
+      // Two calls rather than one with a computed path: the relay allowlist is
+      // matched against the literal each `fetch` starts with (see the guard in
+      // tests/test_control_plane_ui_js.py), and a path built by a ternary is a path
+      // that test cannot see — which would take the 403-in-the-browser guard off
+      // exactly the route being added.
+      const res = events ? await fetch(`/api/audit/events?${qs}`)
+                         : await fetch(`/api/audit?${qs}`);
+      if (!res.ok) throw new Error(String(res.status));
+      body = await res.json();
+    } catch (e) {
+      // A failed refresh leaves the previous rows in place and SAYS SO. Silently
+      // swallowing this is what let the list sit indefinitely stale while the header
+      // read "live" — the stream and this poll are different transports.
+      auditFailed = true;
+      renderAuditStatus(auditRowCount(), filterActive(f));
+      return;
+    }
+    auditFailed = false;
+    auditLoaded = true;
+    // {rows, total, filtered, next}. Tolerates a bare array from an older backend, in
+    // which case `total` is undefined and coverageSummary stays silent rather than
+    // guessing — and `filtered` is false, because a backend that ignored the
+    // parameters served an unfiltered list whatever the controls on screen say.
+    const rows = Array.isArray(body) ? body : (body && body.rows) || [];
+    const total = Array.isArray(body) ? undefined : body && body.total;
+    const filtered = !Array.isArray(body) && !!(body && body.filtered);
+    const next = Array.isArray(body) ? null : (body && body.next) || null;
+
+    // A page that fell off the end of the record. Reachable without anyone doing
+    // anything wrong: `make audit-prune` deletes rows a cursor still points at. Snap
+    // back to the newest page rather than render an empty table, which would read as
+    // "nothing here" for a record that is not empty. Cannot loop — the retry is at
+    // page 0, where an empty result is the honest answer.
+    if (events && !rows.length && auditPage > 0) {
+      resetPaging();
+      return refreshAudit();
+    }
+
+    auditGroupedTable.hidden = events;
+    auditEventsTable.hidden = !events;
+    auditModeNote.textContent = events
+      ? "· every event, newest first" : "· identical decisions folded";
+    if (events) renderEvents(rows); else renderGrouped(rows);
+
+    renderOutage(outageSummary(rows));
+    // The two views answer "was there more?" differently, so only one of them speaks:
+    // the glance has a coverage line because it silently truncates, the record has a
+    // pager because it does not.
+    renderCoverage(events ? { show: false, level: "none", text: "" }
+                          : coverageSummary(rows, total, filtered));
+    if (events) {
+      // Remember the cursor that opens the NEXT page, and forget any beyond it — the
+      // record can shrink under `make audit-prune`, and stale cursors would offer an
+      // "older" that lands nowhere.
+      if (next) auditCursors[auditPage] = next;
+      else auditCursors.length = auditPage;
+      const pager = historyPager(auditPage, EVENTS_LIMIT, rows.length, total,
+                                 !!next, filtered);
+      auditPageEl.textContent = pager.text;
+      auditOlderEl.disabled = !pager.older;
+      auditNewerEl.disabled = !pager.newer;
+    }
+    auditPagerEl.hidden = !events;
+    renderAuditStatus(rows.length, filtered);
+  }
+
+  // A filter change RESETS paging, always. Keeping the cursor would apply a position
+  // derived from one query to the results of another — the rows at that cursor may not
+  // match the new filter at all, so the operator would land on an arbitrary page of a
+  // list they just narrowed.
+  let auditFilterTimer = null;
+  function filtersChanged(immediate) {
+    clearTimeout(auditFilterTimer);
+    resetPaging();
+    auditFilterTimer = setTimeout(refreshAudit,
+                                  immediate ? 0 : AUDIT_FILTER_DEBOUNCE_MS);
+  }
+
+  auditQEl.addEventListener("input", () => filtersChanged(false));
+  for (const el of [auditDecisionEl, auditWindowEl, auditEveryEl]) {
+    el.addEventListener("change", () => filtersChanged(true));
+  }
+  auditClearEl.addEventListener("click", () => {
+    auditQEl.value = "";
+    auditDecisionEl.value = "";
+    auditWindowEl.value = "";
+    // The view switch is deliberately NOT cleared: it selects which record the
+    // filters apply to, so resetting it would answer a question nobody asked.
+    filtersChanged(true);
+  });
+  auditOlderEl.addEventListener("click", () => {
+    if (auditCursors[auditPage] === undefined) return;   // no next page to open
+    auditPage += 1;
+    refreshAudit();
+  });
+  auditNewerEl.addEventListener("click", () => {
+    if (auditPage === 0) return;
+    auditPage -= 1;
+    refreshAudit();
+  });
 
   async function refreshRules() {
     let rows;
@@ -1534,8 +1834,9 @@ if (typeof module !== "undefined" && module.exports) {
     holdRemaining, countdownState, departure, persistPreview, saturationState,
     ackCount, requestsLabel, auditRow, auditStatus, rulesStatus, repeatCount,
     outageSummary, pendingAnnouncement, coverageSummary, revokePreview,
+    timeWindow, filterActive, auditQuery, eventRow, historyPager,
     fmtTime, fmtStamp, fmtInstant,
-    AUDIT_ORDINARY_STAGE,
+    AUDIT_ORDINARY_STAGE, AUDIT_WINDOWS,
     RECONNECT_MIN_MS, RECONNECT_MAX_MS, STALE_MAX_MS, COUNTDOWN_URGENT_S,
     DWELL_MS, SATURATION_RECENT_MS, SATURATION_WARN_FRAC,
   };

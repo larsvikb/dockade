@@ -175,6 +175,52 @@ headless runs a directory can start a process merely by containing a file. The
 interactive path was **not** tested and may well prompt; the point is that the
 prompt is not what makes it safe.
 
+## A directory marketplace is used in place, and `settings.json` is the whole declaration
+
+Measured in-container on Claude Code 2.1.236, with a fixture marketplace
+(`.claude-plugin/marketplace.json` plus one plugin holding one skill) and a
+throwaway `CLAUDE_CONFIG_DIR`. Four facts, each of which changed a design choice.
+
+**A local path becomes a `directory` source, referenced in place.** `claude plugin
+marketplace add /tmp/mkt/local-demo` recorded
+`{"source":{"source":"directory","path":"/tmp/mkt/local-demo"}}` with
+`installLocation` equal to that same path, and copied nothing into
+`plugins/marketplaces/` (a *github* source clones there — the shipped
+`claude-plugins-official` entry does). No network, no credential: the add succeeded
+in a config dir holding no `.credentials.json`. `installLocation` being the path as
+given is why the container path has to be the in-container one.
+
+**Installing from a read-only tree works.** With the fixture `chmod -R a-w`,
+`claude plugin install hello@local-demo` still succeeded — the tree is read, never
+written. So `:ro` costs nothing.
+
+**The CLI's only effect is two keys in user `settings.json`.** `marketplace add`
+wrote `extraKnownMarketplaces`, `install` wrote `enabledPlugins`, both merged into
+an existing file (a copy of this repo's baked template kept its `statusLine` and
+`skipDangerousModePermissionPrompt`). `plugins/known_marketplaces.json` is derived
+cache, not the declaration: hand-writing both keys and running a *session*
+materialized it, after which `claude plugin details hello@local-demo` printed the
+plugin and its skill inventory with no install ever run. The reconciliation happens
+at **session** start — the `plugin` subcommands read the cache, so immediately
+after hand-writing settings, `plugin list` and `plugin details` still say "not
+found" while a session would load it fine. Both halves matter: settings alone are
+sufficient, and the CLI is not a way to check that they are.
+
+**The marketplace key is the manifest's `name`, not the directory name.** A
+checkout at `dir-name-differs/` whose manifest said `manifest-name` was keyed
+`manifest-name`. Plugin ids are `plugin@<manifest name>`, so deriving the key from
+the directory yields an allowlist that silently matches nothing.
+
+Failure modes, for a boot script that must not abort on one bad checkout: a missing
+path and a directory without `.claude-plugin/marketplace.json` both exit 1;
+re-adding an existing marketplace is idempotent and exits 0. And an `enabledPlugins`
+id naming a marketplace that does not exist is **inert, not fatal** — a session with
+`nope@unknown-marketplace` declared started and answered in 11s against 7s for the
+same session without it, and triggered no fetch (nothing appeared in
+`known_marketplaces.json`). Worth knowing because the opposite would have been
+worse than an error: an unresolvable id that made Claude Code try to clone would
+hang on the proxy's hold-for-approval path at every boot.
+
 ## An MCP server container really does honour `HTTPS_PROXY` — and how to tell
 
 Measured against `ghcr.io/github/github-mcp-server:v1.9.0` in `http` mode on an

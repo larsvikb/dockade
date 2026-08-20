@@ -331,6 +331,24 @@ else
     ok "no IPv6 stack present (/proc/net/if_inet6 absent)"
 fi
 
+printf '%s== mounts ==%s\n' "$bold" "$reset"
+# /marketplaces, when the launcher mounted it, carries plugin code this agent
+# LOADS — skills, hooks, agents. Writable, it would be a cross-session channel:
+# edit a hook now, have it run at the next boot, outside the review that
+# /workspace commits get. `make consistency` asserts the `:ro` in the source; this
+# asserts it in the container that is actually running, which is the only place a
+# mount option is real. Absent is not a failure — the mount is optional.
+if [ -d /marketplaces ]; then
+    if touch /marketplaces/.boundary-check-probe 2>/dev/null; then
+        rm -f /marketplaces/.boundary-check-probe
+        bad "/marketplaces is WRITABLE — plugin code the agent loads must be read-only"
+    else
+        ok "/marketplaces is read-only"
+    fi
+else
+    info "/marketplaces not mounted (no host marketplaces configured)"
+fi
+
 printf '%s== privilege ==%s\n' "$bold" "$reset"
 # THE load-bearing property: the agent holds no Linux capabilities, so it cannot
 # run iptables (NET_ADMIN) to tear down the firewall or otherwise re-privilege.

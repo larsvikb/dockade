@@ -8,6 +8,12 @@
 # Claude config/auth persists in the named volume `claude-sandbox-config`,
 # isolated from the host's ~/.claude. Authenticate once on first run.
 #
+# ~/.config/dockade/marketplaces, when it exists, is mounted READ-ONLY at
+# /marketplaces and every marketplace in it is registered at boot;
+# ~/.config/dockade/plugins lists the `plugin@marketplace` ids to enable. Both
+# are optional and neither needs network. See sandbox-lib.sh (sc_marketplaces,
+# sc_plugin_allowlist) and claude-sandbox/tier-setup.sh.
+#
 # --build-only builds the image and exits WITHOUT launching (no workspace mount,
 # no network) — a headless way to assert the image still builds (used by
 # `make check`); implies a rebuild.
@@ -168,8 +174,18 @@ sc_git_identity
 sc_upstream_dns
 sc_host_timezone
 
+# Plugin marketplaces and the enabled-plugin allowlist: tier 1 only, because
+# Claude Code plugins are Claude Code's mechanism — tier 2 runs opencode and has
+# nothing to do with them. Both are host-side reads with no egress involved; see
+# sandbox-lib.sh for why the mount is read-only and why the allowlist travels as
+# an env var rather than a second mount.
+sc_marketplaces
+sc_plugin_allowlist
+
 echo "Sandbox:   $SC_CONTAINER_NAME (tier 1 — Claude)"
 echo "Workspace: $WORKSPACE -> /workspace"
+echo "Markets:   $SC_MARKETPLACE_DESC"
+echo "Plugins:   $SC_PLUGINS_DESC"
 echo "Git ident: ${SC_GIT_NAME:-<none>} <${SC_GIT_EMAIL:-none}>"
 echo "DNS upstreams: $SC_UPSTREAM_DNS (pinned via --dns; whitelisted on :53 in standalone mode only)"
 echo "Egress:    $EGRESS_DESC"
@@ -251,10 +267,12 @@ docker run "${RUN_MODE_ARGS[@]}" \
     \
     -v "$WORKSPACE":/workspace \
     -v "$CONFIG_VOLUME":/config \
+    ${SC_MARKETPLACE_ARGS[@]+"${SC_MARKETPLACE_ARGS[@]}"} \
     \
     -e "TERM=${TERM:-xterm-256color}" \
     -e "TZ=$SC_TZ" \
     -e "UPSTREAM_DNS=$SC_UPSTREAM_DNS" \
+    ${SC_PLUGIN_ARGS[@]+"${SC_PLUGIN_ARGS[@]}"} \
     ${PROXY_ENV_ARGS[@]+"${PROXY_ENV_ARGS[@]}"} \
     ${SC_GIT_ID_ARGS[@]+"${SC_GIT_ID_ARGS[@]}"} \
     \

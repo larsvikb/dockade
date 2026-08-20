@@ -104,6 +104,186 @@ sc_guard_workspace() {
 }
 
 # ---------------------------------------------------------------------------
+# Host config home  ->  echoes the dockade config directory
+# ---------------------------------------------------------------------------
+# Durable per-machine settings live OUTSIDE this repo. Not tidiness: a sandbox
+# launched with dockade as its workspace bind-mounts this tree READ-WRITE, so
+# anything configured from inside the repo is agent-writable — and a knob that
+# decides which code loads into the agent must not be. That is the same reason
+# MCP_SECRETS sits here (Makefile), which is why both derive from this one path;
+# `make consistency` asserts the two spellings agree.
+#
+# Precedence: DOCKADE_CONFIG_HOME (explicit) > $XDG_CONFIG_HOME/dockade (the
+# spec) > ~/.config/dockade (the fallback the spec itself prescribes).
+#
+# Echoes rather than setting a global: it is a plain string, needed in string
+# contexts, and every caller wants it interpolated.
+sc_config_home() {
+    if [[ -n "${DOCKADE_CONFIG_HOME:-}" ]]; then
+        printf '%s\n' "$DOCKADE_CONFIG_HOME"
+    else
+        printf '%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}/dockade"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Plugin marketplaces  ->  sets SC_MARKETPLACE_ARGS (array), SC_MARKETPLACE_DESC
+# ---------------------------------------------------------------------------
+# Claude Code can take a marketplace from a local DIRECTORY, and a directory
+# source is referenced in place — no clone, no copy, no egress, no credential
+# (measured; see NOTES.md). That is what makes this the right shape for a
+# container with no governed git path: the human clones marketplace repos on the
+# host, and the sandbox reads them.
+#
+# Mounted READ-ONLY, and that is the load-bearing part. A writable plugin tree is
+# a cross-session channel: the agent edits a skill or a hook now, and it lands in
+# its own context — or executes — on the next boot, outside the diff review that
+# /workspace commits get. Read-only costs nothing, because a directory-source
+# marketplace is never written to in normal use (installing from a chmod-a-w tree
+# works).
+#
+# Auto-mounted when the default path EXISTS, so the common case needs no
+# configuration at all. SANDBOX_MARKETPLACES_DIR overrides the host path — and
+# when it is set explicitly, a missing directory is FATAL rather than skipped:
+# the operator named something specific, and silently launching without it is how
+# you spend a session wondering where your plugins went.
+#
+# The container path is fixed at /marketplaces and is NOT the host path, because
+# Claude Code records the path it was given verbatim as the marketplace's
+# installLocation — it has to be the path as seen from inside.
+sc_marketplaces() {
+    SC_MARKETPLACE_ARGS=()
+    SC_MARKETPLACE_DESC="none"
+
+    local dir explicit=false
+    if [[ -n "${SANDBOX_MARKETPLACES_DIR:-}" ]]; then
+        dir="$SANDBOX_MARKETPLACES_DIR"
+        explicit=true
+    else
+        dir="$(sc_config_home)/marketplaces"
+    fi
+
+    if [[ ! -d "$dir" ]]; then
+        if [[ "$explicit" == "true" ]]; then
+            echo "ERROR: SANDBOX_MARKETPLACES_DIR is set to '$dir', which is not a" >&2
+            echo "       directory. Refusing to launch without it — unset the variable" >&2
+            echo "       to run with no marketplaces." >&2
+            exit 1
+        fi
+        SC_MARKETPLACE_DESC="none ($dir does not exist)"
+        return 0
+    fi
+
+    local real real_home secrets
+    real="$(cd "$dir" && pwd -P)"        # canonical, symlinks resolved
+    real_home="$(cd "$HOME" 2>/dev/null && pwd -P || echo "$HOME")"
+    secrets="$(sc_config_home)/secrets"
+    [[ -d "$secrets" ]] && secrets="$(cd "$secrets" && pwd -P)"
+
+    _sc_deny_marketplaces() {
+        echo "REFUSING to mount marketplaces: $real" >&2
+        echo "  $1" >&2
+        echo "  Point SANDBOX_MARKETPLACES_DIR at a directory that holds ONLY" >&2
+        echo "  marketplace checkouts (default: $(sc_config_home)/marketplaces)." >&2
+        exit 1
+    }
+
+    # Read-only keeps the agent from WRITING what it reads; it does nothing about
+    # what it can read. So the same over-broad paths sc_guard_workspace refuses
+    # are refused here too, for the narrower reason that they would hand the agent
+    # the contents of a home directory.
+    if [[ "$real" == "/" ]]; then
+        _sc_deny_marketplaces "that is the filesystem root."
+    elif [[ "$real" == "$real_home" ]]; then
+        _sc_deny_marketplaces "that is your home directory."
+    elif [[ "$real_home" == "$real"/* ]]; then
+        _sc_deny_marketplaces "your home directory ($real_home) is inside it."
+    fi
+
+    # A footgun this layout creates rather than one it inherits: the MCP client
+    # credentials live next door, under the same config home, so the obvious
+    # near-miss (SANDBOX_MARKETPLACES_DIR=~/.config/dockade) would mount the
+    # secrets tree into the sandbox. Read-only, which is no comfort at all for a
+    # credential — readable IS the compromise.
+    if [[ "$secrets" == "$real" || "$secrets" == "$real"/* ]]; then
+        _sc_deny_marketplaces "the MCP secrets directory ($secrets) is inside it."
+    fi
+
+    # Count what is actually there, so the launch line distinguishes "mounted, 3
+    # marketplaces" from "mounted, and empty" — the second looks identical to a
+    # working setup from the agent's side until a plugin is missing.
+    #
+    # Manifests PRESENT, not manifests valid: validating one means parsing JSON,
+    # and this runs on the HOST, where jq is not a dependency this repo gets to
+    # assume. The boot-side registration does parse them (the image has jq) and
+    # warns per unusable file, so the exact figure surfaces there.
+    local found=0 d
+    if [[ -f "$real/.claude-plugin/marketplace.json" ]]; then
+        found=1
+    else
+        for d in "$real"/*; do
+            [[ -f "$d/.claude-plugin/marketplace.json" ]] && found=$((found + 1))
+        done
+    fi
+
+    # shellcheck disable=SC2034  # both are consumed by the sourcing launcher, not here
+    SC_MARKETPLACE_ARGS=(-v "$real":/marketplaces:ro)
+    # shellcheck disable=SC2034
+    SC_MARKETPLACE_DESC="$real -> /marketplaces:ro ($found marketplace(s))"
+    if (( found == 0 )); then
+        echo "NOTE: $real holds no .claude-plugin/marketplace.json — mounting it" >&2
+        echo "      anyway, but no marketplace will be registered." >&2
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Plugin allowlist  ->  sets SC_PLUGIN_ARGS (array), SC_PLUGINS_DESC
+# ---------------------------------------------------------------------------
+# WHICH plugins are enabled is a separate decision from which marketplaces are
+# available, and deliberately so: registering a marketplace only makes plugins
+# installable, while a plugin loads only if it appears in `enabledPlugins`. It is
+# also independent of the mount — an id may name a marketplace the config volume
+# already knows, with nothing mounted at all.
+#
+# It has to be declared host-side because the sandbox's settings.json is
+# rewritten from the image on every boot (see claude-sandbox/tier-setup.sh), so a
+# plugin enabled in-session does not survive a restart. Without this file the
+# feature would ship as "your marketplaces are mounted, now re-enable your
+# plugins every session".
+#
+# Carried as an ENV VAR rather than a second mount, on the invariant that the
+# sandbox gets no host path it does not need: the list is a handful of ids, and
+# the file is read here, on the host. SANDBOX_PLUGINS overrides the file, which
+# keeps the env > file > default precedence the launchers use everywhere else.
+#
+# Format: one `plugin@marketplace` per line, `#` comments and blank lines
+# ignored. Commas are accepted too, because a one-line SANDBOX_PLUGINS is the
+# natural way to write it on a command line.
+sc_plugin_allowlist() {
+    SC_PLUGIN_ARGS=()
+    SC_PLUGINS_DESC="none"
+
+    local raw="" file
+    file="$(sc_config_home)/plugins"
+    if [[ -n "${SANDBOX_PLUGINS:-}" ]]; then
+        raw="$SANDBOX_PLUGINS"
+    elif [[ -f "$file" ]]; then
+        raw="$(sed 's/#.*//' "$file")"
+    fi
+
+    # Normalize to a single space-separated line: strip comments (above), split on
+    # commas and newlines, collapse whitespace.
+    local list
+    list="$(printf '%s' "$raw" | tr ',\n\t' '   ' | tr -s ' ' | sed 's/^ *//; s/ *$//')"
+    [[ -z "$list" ]] && return 0
+
+    # shellcheck disable=SC2034  # both are consumed by the sourcing launcher, not here
+    SC_PLUGIN_ARGS=(-e "SANDBOX_PLUGINS=$list")
+    # shellcheck disable=SC2034
+    SC_PLUGINS_DESC="$list"
+}
+
+# ---------------------------------------------------------------------------
 # Network
 # ---------------------------------------------------------------------------
 # sc_ensure_network <net> <allow_fallback>

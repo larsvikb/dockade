@@ -906,6 +906,365 @@ class AuditViewTests(_CPTestCase):
             cp.AUDIT_GROUP_SCAN = 5000
 
 
+def _write_audit(*rows):
+    """REPLACE the audit table with these rows, every column writable.
+
+    A second fixture beside ``AuditViewTests._rows`` rather than a widening of it: the
+    filter and record tests are about `client_class` and `url`, which that one does not
+    write, and the grouping tests depend on their rows being exactly what they say."""
+    with cp.store._connect() as conn:
+        conn.execute("DELETE FROM audit")
+        for r in rows:
+            conn.execute(
+                "INSERT INTO audit(ts, decision, stage, host, port, proto, client, "
+                "client_class, method, url, reason) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (r.get("ts", 0.0), r.get("decision", "allow"), r.get("stage"),
+                 r.get("host"), r.get("port"), r.get("proto"), r.get("client"),
+                 r.get("client_class"), r.get("method"), r.get("url"), r.get("reason")))
+        conn.commit()
+
+
+class AuditFilterTests(_CPTestCase):
+    """Filters on the folded view. What they are FOR is that the audit trail became
+    unreadable long before it became large: a chatty client's retries push everything
+    else off a forty-row list, and until now the only way past that was `sqlite3`
+    against the crown-jewel volume.
+
+    Every refusal here matters more than the matches. A filter that is silently ignored
+    answers a different question than the one asked — widened, it reports decisions the
+    reader excluded; narrowed, it reports an empty record as a quiet system — and
+    neither is visible on screen."""
+
+    def _hosts(self, **kw):
+        return [r["host"] for r in cp.api_audit(**kw)["rows"]]
+
+    def setUp(self):
+        super().setUp()
+        _write_audit(
+            {"host": "pypi.org", "decision": "allow", "client": "172.30.0.2",
+             "client_class": "sandbox", "reason": "allowed by rule (pypi.org)",
+             "url": "https://pypi.org/simple/", "method": "GET", "ts": 100.0},
+            {"host": "evil.example", "decision": "deny", "client": "172.30.0.2",
+             "client_class": "sandbox", "reason": "blocked by rule", "ts": 200.0},
+            {"host": "slack.com", "decision": "hold", "client": "172.28.0.5",
+             "client_class": "mcp", "reason": "held for approval", "ts": 300.0})
+
+    def test_search_matches_the_host(self):
+        self.assertEqual(self._hosts(q="evil"), ["evil.example"])
+
+    def test_search_matches_the_client_and_its_class(self):
+        # The class is the useful one: "what has the MCP population been doing" is a
+        # question about a population, and the address is only how it was worked out.
+        self.assertEqual(self._hosts(q="mcp"), ["slack.com"])
+        self.assertEqual(self._hosts(q="172.28"), ["slack.com"])
+
+    def test_search_matches_the_reason(self):
+        self.assertEqual(self._hosts(q="blocked by rule"), ["evil.example"])
+
+    def test_search_is_case_insensitive(self):
+        self.assertEqual(self._hosts(q="EVIL"), ["evil.example"])
+
+    def test_search_does_not_read_the_column_the_view_does_not_show(self):
+        """The rule is that a view searches exactly what it DISPLAYS. `url` is not in
+        the folded row, so a match on it would put a row on screen whose visible
+        content does not contain what was typed, with nothing to explain why — the
+        same failure the group key avoids by keying on the displayed fields."""
+        self.assertEqual(self._hosts(q="simple"), [])
+        # And it IS searchable where it is shown.
+        self.assertEqual([r["host"] for r in cp.api_audit_events(q="simple")["rows"]],
+                         ["pypi.org"])
+
+    def test_search_is_a_literal_substring_not_a_like_pattern(self):
+        # Unescaped, `%` matches every row and `_` matches any character — so the
+        # search box would stop meaning "contains this text" for exactly the inputs an
+        # operator pastes out of a URL or a rule pattern.
+        self.assertEqual(self._hosts(q="%"), [])
+        self.assertEqual(self._hosts(q="_"), [])
+        _write_audit({"host": "100%.example", "ts": 1.0},
+                     {"host": "plain.example", "ts": 2.0})
+        self.assertEqual(self._hosts(q="100%"), ["100%.example"])
+
+    def test_search_finds_a_row_with_no_client_recorded(self):
+        # `NULL LIKE x` is NULL, not false, so an un-COALESCEd OR drops rows that
+        # match on another column. A row with no client must still be findable by host.
+        _write_audit({"host": "lonely.example", "ts": 1.0})
+        self.assertEqual(self._hosts(q="lonely"), ["lonely.example"])
+
+    def test_the_decision_facet_narrows_to_one_kind(self):
+        self.assertEqual(self._hosts(decision="deny"), ["evil.example"])
+
+    def test_the_decision_facet_takes_a_set(self):
+        # "everything that was refused or is waiting" is one question, and a
+        # single-valued facet would make the UI merge two responses to answer it.
+        self.assertEqual(self._hosts(decision="deny,hold"),
+                         ["slack.com", "evil.example"])
+
+    def test_an_unknown_decision_is_refused_rather_than_matching_nothing(self):
+        resp = cp.api_audit(decision="allowed")
+        self.assertEqual(resp.status_code, 400)
+        # And it says what the words are, so the refusal has a next step.
+        self.assertIn("allow", json.dumps(resp.body))
+
+    def test_every_word_the_control_plane_writes_is_filterable(self):
+        """The vocabulary and the writers are in different files with no compiler
+        between them: a new decision word would be recorded, rendered, and quietly
+        unfilterable — its facet a 400. Read from the SOURCE rather than exercised,
+        because the point is the set of literals that ship."""
+        written = set(re.findall(r'store\._audit\(\s*"([a-z]+)"',
+                                 (ROOT / "control-plane" / "app.py").read_text()))
+        self.assertTrue(written, "no literal audit decisions found in app.py")
+        self.assertLessEqual(written, set(cp.audit.DECISIONS))
+        # The ingest is the other writer, and it validates against its own tuple —
+        # so that tuple is the second half of the vocabulary.
+        ingested = re.search(r'rec\.get\("decision"\) not in \(([^)]*)\)',
+                             (ROOT / "control-plane" / "ingest.py").read_text())
+        self.assertIsNotNone(ingested, "the ingest's decision guard moved")
+        self.assertLessEqual(set(re.findall(r'"([a-z]+)"', ingested.group(1))),
+                             set(cp.audit.DECISIONS))
+
+    def test_the_page_offers_exactly_the_words_the_backend_knows(self):
+        # The third end of the same coupling: an <option> the backend does not know is
+        # a 400 on click, and a word missing from the page is a filter no operator can
+        # reach. Same shape as the fail-closed marker test above — read the file that
+        # ships, do not restate its contents.
+        section = re.search(r'<select id="audit-decision".*?</select>',
+                            (ROOT / "control-plane-ui" / "index.html").read_text(),
+                            re.S)
+        self.assertIsNotNone(section, "the decision facet moved in index.html")
+        offered = [v for v in re.findall(r'value="([^"]*)"', section.group(0)) if v]
+        self.assertEqual(sorted(offered), sorted(cp.audit.DECISIONS))
+
+    def test_the_time_window_is_half_open(self):
+        # `since` inclusive, `until` exclusive, which is what makes two adjacent
+        # windows partition the record instead of both claiming the instant between.
+        self.assertEqual(self._hosts(since=200.0), ["slack.com", "evil.example"])
+        self.assertEqual(self._hosts(until=200.0), ["pypi.org"])
+
+    def test_an_inverted_window_is_refused_not_answered_with_nothing(self):
+        self.assertEqual(cp.api_audit(since=300.0, until=100.0).status_code, 400)
+
+    def test_an_unusable_time_bound_is_refused(self):
+        # NaN is the one worth naming: every comparison against it is false, so it
+        # would answer "nothing happened" for a store full of decisions.
+        for bad in (float("nan"), float("inf"), "yesterday"):
+            with self.subTest(since=bad):
+                self.assertEqual(cp.api_audit(since=bad).status_code, 400)
+
+    def test_the_total_follows_the_filter(self):
+        # The total exists to say how much was NOT shown. Measured against the whole
+        # table, a complete filtered view would report itself as truncated — on every
+        # filtered query.
+        self.assertEqual(cp.api_audit()["total"], 3)
+        self.assertEqual(cp.api_audit(decision="deny")["total"], 1)
+
+    def test_the_response_says_whether_it_filtered(self):
+        # The one thing the browser cannot work out for itself: it knows what it sent,
+        # not whether this backend understood it. Without it the coverage line would
+        # say "matching" against an older backend that ignored the parameters.
+        self.assertFalse(cp.api_audit()["filtered"])
+        self.assertTrue(cp.api_audit(q="evil")["filtered"])
+        # Whitespace is not a filter, and treating it as one would make an accidental
+        # space in the box relabel the whole view.
+        self.assertFalse(cp.api_audit(q="   ")["filtered"])
+
+    def test_no_filter_value_ever_reaches_the_sql_text(self):
+        """The property the whole filter design rests on, asserted DIRECTLY rather than
+        argued from the code: the SQL text a filter becomes is independent of the
+        values in it. Every value is a bound parameter, every clause is a literal
+        assembled here, and the only interpolation is column names from module
+        constants.
+
+        Worth a test of its own because the three query builders carry `noqa: S608`
+        suppressions — ruff will not warn again on those lines, so what stops an
+        injected string reaching the text has to be something that fails loudly."""
+        hostile = "x' OR 1=1 --"
+        loud = cp.audit.parse(q=hostile, decision="deny,hold", since=1, until=2)
+        plain = cp.audit.parse(q="ordinary", decision="deny,hold", since=3, until=4)
+        self.assertEqual(loud.where, plain.where,
+                         "the WHERE text changed with the VALUES — something is being "
+                         "interpolated that must be bound")
+        self.assertNotIn("1=1", loud.where)
+        self.assertIn(f"%{hostile}%", loud.params)
+        # And the same for the paging cursor, which joins its own clause on.
+        self.assertEqual(loud.and_("(id < ?)", 5).where, plain.and_("(id < ?)", 9).where)
+
+    def test_a_classic_payload_is_a_search_term_and_nothing_else(self):
+        # End to end through the endpoint, because the unit above proves the text is
+        # value-independent and this proves the request path actually goes through it:
+        # the payload matches no host, and the table is still there afterwards.
+        _write_audit({"host": "a.example", "ts": 1.0}, {"host": "b.example", "ts": 2.0})
+        for payload in ("x' OR '1'='1", "'; DROP TABLE audit; --",
+                        "1); DELETE FROM rules; --", "\\", "%' --"):
+            with self.subTest(payload=payload):
+                body = cp.api_audit(q=payload)
+                self.assertEqual(body["rows"], [])
+                self.assertEqual(cp.api_audit_events(q=payload)["rows"], [])
+        with cp.store._connect() as conn:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM audit").fetchone()[0], 2)
+
+    def test_the_escape_character_is_itself_escaped_first(self):
+        # Order matters: escaping `%` before `\` would leave the escape marker the
+        # first pass introduced looking like an operator's own backslash, and the
+        # needle would stop matching the text they typed.
+        _write_audit({"host": "back\\slash.example", "ts": 1.0},
+                     {"host": "plain.example", "ts": 2.0})
+        self.assertEqual(self._hosts(q="back\\slash"), ["back\\slash.example"])
+
+    def test_an_overlong_search_is_refused(self):
+        self.assertEqual(cp.api_audit(q="x" * (cp.audit.Q_MAX + 1)).status_code, 400)
+
+    def test_filtering_happens_before_the_fold_so_the_scan_reaches_back(self):
+        """The property that makes filtering worth having on a bounded window: the scan
+        counts MATCHING events, not events. Unfiltered, a chatty host fills the window
+        and everything older is invisible — which is the exact complaint that motivated
+        grouping, one level up."""
+        cp.AUDIT_GROUP_SCAN = 10
+        try:
+            _write_audit(*([{"host": "quiet.example", "decision": "deny", "ts": 1.0}]
+                           + [{"host": "chatty.example", "ts": 10.0 + i}
+                              for i in range(50)]))
+            # Unfiltered, the window is all chatter.
+            self.assertEqual(self._hosts(), ["chatty.example"])
+            # Filtered, it reaches the one row that matters.
+            self.assertEqual(self._hosts(q="quiet"), ["quiet.example"])
+        finally:
+            cp.AUDIT_GROUP_SCAN = 5000
+
+
+class AuditRecordTests(_CPTestCase):
+    """``/api/audit/events`` — the record itself, one row per decision, paged.
+
+    The glance answers *what is happening*; this answers *what happened*. It is the
+    half that makes "the audit log is the artifact this design exists to keep
+    trustworthy" a claim an operator can check from the interface rather than from
+    `docker compose exec` and SQL against the volume."""
+
+    def _rows(self, **kw):
+        return cp.api_audit_events(**kw)["rows"]
+
+    def test_the_dropped_columns_are_here(self):
+        # The glance omits these on purpose (a forty-row list must stay legible, and
+        # `url` is agent-controlled and unbounded); this view cannot answer the
+        # question it is for without them.
+        _write_audit({"host": "a.example", "method": "GET", "port": 443,
+                      "proto": "connect", "url": "https://a.example/x", "ts": 1.0})
+        row = self._rows()[0]
+        self.assertEqual(
+            set(row),
+            {"id", "ts", "decision", "stage", "host", "port", "proto", "client",
+             "client_class", "method", "url", "reason", "fail_closed"})
+        self.assertEqual(row["url"], "https://a.example/x")
+
+    def test_nothing_is_folded(self):
+        # The whole difference from the glance: identical decisions are separate
+        # facts here, because this is the record and folding is a property of a view.
+        _write_audit(*[{"host": "chatty.example", "decision": "deny", "ts": 1.0 + i}
+                       for i in range(5)])
+        self.assertEqual(len(self._rows()), 5)
+        self.assertNotIn("n", self._rows()[0])
+
+    def test_newest_first_with_the_id_breaking_ties(self):
+        # Two rows can share a timestamp — one request writes a `hold` and then its
+        # outcome, and time.time() need not advance between them — so the order has to
+        # be total or a page boundary drops or repeats a row.
+        _write_audit({"host": "first.example", "ts": 5.0},
+                     {"host": "second.example", "ts": 5.0},
+                     {"host": "older.example", "ts": 4.0})
+        self.assertEqual([r["host"] for r in self._rows()],
+                         ["second.example", "first.example", "older.example"])
+
+    def test_a_denial_still_says_whether_it_was_policy_or_an_outage(self):
+        # Same classification as the glance, from the same helper — an outage denial
+        # must not read as policy in the view an incident is reconstructed from.
+        _write_audit({"host": "b.example", "decision": "deny", "ts": 1.0,
+                      "reason": "control-plane unreachable, fail-closed (timed out)"})
+        self.assertTrue(self._rows()[0]["fail_closed"])
+
+    def test_paging_walks_the_whole_record_exactly_once(self):
+        """The property worth asserting, rather than the mechanics: page through to the
+        end and the pages concatenated must equal the ordered record — no gap, no
+        repeat. That is what an offset would break under a concurrent insert, and what
+        a ts-only cursor would break on a tie."""
+        _write_audit(*[{"host": f"h{i}.example", "ts": float(i // 2)}
+                       for i in range(20)])          # deliberate ts ties, pairwise
+        walked, cursor, pages = [], None, 0
+        while True:
+            body = cp.api_audit_events(limit=3, before=cursor)
+            walked.extend(r["host"] for r in body["rows"])
+            pages += 1
+            cursor = body["next"]
+            if not cursor:
+                break
+            self.assertLess(pages, 20, "paging did not terminate")
+        self.assertEqual(walked, [r["host"] for r in self._rows(limit=100)])
+        self.assertEqual(len(walked), 20)
+        self.assertEqual(len(set(walked)), 20)
+
+    def test_the_last_page_reports_no_next(self):
+        # How the pager knows to stop. A cursor that always came back would offer an
+        # "older" that lands on an empty page.
+        _write_audit(*[{"host": f"h{i}.example", "ts": float(i)} for i in range(3)])
+        self.assertIsNone(cp.api_audit_events(limit=3)["next"])
+        self.assertIsNotNone(cp.api_audit_events(limit=2)["next"])
+
+    def test_the_total_does_not_move_while_paging(self):
+        # The cursor narrows the query but never the total: a page counter that walked
+        # down to zero would read as the record shrinking as it was examined.
+        _write_audit(*[{"host": f"h{i}.example", "ts": float(i)} for i in range(10)])
+        first = cp.api_audit_events(limit=4)
+        second = cp.api_audit_events(limit=4, before=first["next"])
+        self.assertEqual(first["total"], 10)
+        self.assertEqual(second["total"], 10)
+
+    def test_the_filter_survives_paging_and_bounds_the_total(self):
+        _write_audit(*[{"host": f"h{i}.example", "ts": float(i),
+                        "decision": "deny" if i % 2 else "allow"} for i in range(10)])
+        first = cp.api_audit_events(limit=2, decision="deny")
+        second = cp.api_audit_events(limit=2, decision="deny", before=first["next"])
+        self.assertEqual(first["total"], 5)
+        self.assertEqual(second["total"], 5)
+        self.assertTrue(all(r["decision"] == "deny"
+                            for r in first["rows"] + second["rows"]))
+
+    def test_a_malformed_cursor_is_refused_not_treated_as_the_first_page(self):
+        # Serving page 1 while the pager says page 12 is the worst available answer:
+        # it looks like data, not like an error.
+        for bad in ("nonsense", "", ":", "abc:def", "1.0:x"):
+            with self.subTest(cursor=bad):
+                resp = cp.api_audit_events(before=bad)
+                if bad == "":                      # absent, not malformed
+                    self.assertIn("rows", resp)
+                else:
+                    self.assertEqual(resp.status_code, 400)
+
+    def test_the_page_size_is_clamped_at_both_ends(self):
+        _write_audit(*[{"host": f"h{i}.example", "ts": float(i)} for i in range(5)])
+        self.assertEqual(len(self._rows(limit=0)), 1)
+        self.assertEqual(len(self._rows(limit=-9)), 1)
+        # The ceiling bounds the response, which carries `url` on every row.
+        self.assertLessEqual(len(self._rows(limit=100_000)),
+                             cp.audit.EVENTS_LIMIT_MAX)
+
+    def test_the_page_never_asks_for_more_rows_than_this_view_serves(self):
+        """The pager's row numbers are arithmetic on the page size the FRONTEND asked
+        for ("decisions 101 to 200"), so a ceiling below that request makes every label
+        wrong by the difference — silently, because the rows themselves are correct.
+        Two ends, one file each, no compiler between them."""
+        js = (ROOT / "control-plane-ui" / "app.js").read_text()
+        asked = re.search(r"const EVENTS_LIMIT = (\d+);", js)
+        self.assertIsNotNone(asked, "EVENTS_LIMIT moved in app.js")
+        self.assertLessEqual(int(asked.group(1)), cp.audit.EVENTS_LIMIT_MAX,
+                             "the page asks for more rows than the backend will serve, "
+                             "so the pager's row numbers overstate every page")
+
+    def test_an_empty_record_is_an_empty_page_not_an_error(self):
+        body = cp.api_audit_events()
+        self.assertEqual(body["rows"], [])
+        self.assertEqual(body["total"], 0)
+        self.assertIsNone(body["next"])
+
+
 class PersistCandidateTests(unittest.TestCase):
     """``_persist_candidates`` is what turns the persisted pattern from an
     AGENT-CONTROLLED STRING into an operator choice from a bounded set.
@@ -1930,7 +2289,7 @@ class ApiSurfaceSplitTests(unittest.TestCase):
         # the audit history, the standing policy. A bypassed relay guard must not
         # be able to read them either.
         for path in ("/approvals", "/approvals/stream", "/api/audit",
-                     "/api/rules", "/api/config", "/status"):
+                     "/api/audit/events", "/api/rules", "/api/config", "/status"):
             self.assertIn(("GET", path), _routes(cp.app), path)
             self.assertNotIn(("GET", path), _routes(cp.authorize_app), path)
 

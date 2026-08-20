@@ -1521,7 +1521,9 @@ places is exactly the shape that drifts silently.
 What stays out of the response matters as much: `url` is agent-controlled and unbounded,
 and `method`/`port`/`proto` are noise in a forty-row glance. All four remain in the
 table and in `make logs-cp`. This endpoint is a legible summary, not the record — and
-the record is what the invariant is about.
+the record is what the invariant is about. (2c-1 gave the record its own endpoint,
+which does serve those four; see "Browsing it" below for why that is a scoped
+reversal rather than a change of mind.)
 
 **Timestamps are formatted, not deferred to the viewer's locale.** A correctness call,
 not a preference: `toLocaleString()` renders the same audit row as different dates for
@@ -1564,6 +1566,38 @@ identity, and the only sources are the Docker socket (which the egress proxy mus
 hold) or a launcher-to-control-plane path that does not exist; neither is worth
 inventing for a label, so `first_ts` stands as the cue that a long span is involved.
 
+**Browsing it: two views, not one view with a page parameter (2c-1).** The trail was
+the artifact the whole design exists to keep trustworthy and the only way to read it
+was a forty-row live summary — so the interface could not answer a question about a
+*specific* request, and "browse the audit log" meant `docker compose exec` and SQL
+against the crown-jewel volume. It is now two endpoints over one table
+(`control-plane/audit.py`), and the split is the design decision rather than an
+implementation detail:
+
+- The **glance** (`/api/audit`) folds, bounds its scan by event count, and cannot
+  page — a group is defined *relative to its window*, so paging it would either split
+  one group across two pages with partial counts on each, or need a second definition
+  of what a group is. Filtering it has no such problem.
+- The **record** (`/api/audit/events`) is one row per decision, keyset-paged on
+  `(ts, id)`, and serves the columns the glance drops. An offset would have been
+  simpler and wrong: this table takes an insert per governed request, so
+  `LIMIT/OFFSET` drops rows between pages exactly while something interesting is
+  happening, and a `ts`-only cursor mis-pages on the tie a single held request
+  produces (a `hold` row and its outcome, with no guarantee the clock advanced).
+
+Three consequences worth stating because each was a choice against the obvious one.
+**A view searches exactly what it displays** — the same discipline the group key
+follows, which is why `url` is searchable in the record and not in the glance rather
+than being either everywhere or nowhere; a result whose visible content does not
+contain what was typed is the worst kind of list. **`total` follows the filter**, or a
+complete filtered view reports itself as truncated on every query, and the response
+says whether it filtered at all so the frontend can say "matching" rather than implying
+the store is that size. And **the record serving `url`/`method`/`port` is a scoped
+reversal** of what the glance deliberately omits: unboundedness is handled where it
+belongs — capped on write, page-bounded on read, escaped under a CSP that gives an
+injected string nowhere to go — and a forensic view without the field that identifies
+the request cannot do its job.
+
 **Empty vs. stale, on both polled lists.** "Nothing has happened yet" and "the poll
 failed" must not render identically — and the header cannot disambiguate them, because
 `conn` reports the SSE *stream* while the decisions and policy tables are filled by a
@@ -1584,7 +1618,9 @@ distinction, the persist preview's wildcard flag, the saturation banner's levels
 recency boundary and count-based dismissal, the duplicate-count badge, and the
 decisions table's row shaping, repeat-count annotation and empty-versus-stale states —
 the last of these for the policy table too, including that the two views' wordings stay
-distinct.
+distinct. The 2c-1 helpers are covered the same way: the window arithmetic, the query
+string the backend is actually asked for (encoding included), the record row's two ways
+of identifying a request, and the pager's row numbers.
 Everything that touches the DOM
 lives inside `start()`, which runs only in a browser — so requiring the module under
 node must be side-effect free, and the test asserts that too: if DOM work migrates to
@@ -1765,12 +1801,11 @@ fails at runtime. The only alternative is `make destroy`, which discards the pol
 rules and the audit history — i.e. the crown jewels. See the NOTE below `_init_db`
 in `control-plane/store.py`.
 
-Step 2c: audit *browsing* — filter/search/history beyond the live
-recent-decisions table the UI already renders — and the per-proxy config
-surface (rows accumulate from 2a).
+Step 2c-2: the per-proxy config surface (rows accumulate from 2a), and the rule
+editing the MCP gateway's per-tool policy needs.
 
-Not yet built: audit browsing beyond the recent-decisions table (2c),
-git/secrets/cache data-plane services, the MCP gateway, skills, quality-gate hooks.
+Not yet built: per-proxy config (2c-2), git/secrets/cache data-plane services, the
+MCP gateway, skills, quality-gate hooks.
 
 ### MCP gateway — governed tool capability (planned, not built)
 
@@ -2662,7 +2697,8 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | 2b-2 | `control-plane-ui` split out as its own container | **done** |
 | 2b-3 | control-plane API surface split across two internal nets | **done** |
 | — | unit suite + CI gate | **done** |
-| 2c | audit browsing (filter/search/history), per-proxy config | next |
+| 2c-1 | audit browsing — filters + the paged record view | **done** |
+| 2c-2 | per-proxy config (+ rule editing) | next |
 | 3 | skills + quality-gate hooks in the image | planned |
 | 4 | pull-through package cache | planned |
 | — | governed git push path | planned |

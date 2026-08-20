@@ -293,7 +293,8 @@ class RelayAllowlistTests(unittest.TestCase):
 
     def test_ui_paths_are_relayed(self):
         for path, method in (("approvals/stream", "GET"),
-                             ("api/audit", "GET"), ("api/rules", "GET"),
+                             ("api/audit", "GET"), ("api/audit/events", "GET"),
+                             ("api/rules", "GET"),
                              ("api/config", "GET"),
                              ("approvals/0123abcd/resolve", "POST"),
                              ("api/rules/12/revoke", "POST")):
@@ -321,6 +322,13 @@ class RelayAllowlistTests(unittest.TestCase):
                              # path. Config is read-only outright — the UI reads
                              # settings, it does not set them.
                              ("api/rules", "POST"), ("api/config", "POST"),
+                             # The audit views are reads, and each is its OWN entry:
+                             # anchoring `^/api/audit` without the `$` would relay
+                             # every future path under that prefix sight unseen,
+                             # which is how a default-deny allowlist stops being one.
+                             ("api/audit", "POST"), ("api/audit/events", "POST"),
+                             ("api/audit/events/x", "GET"),
+                             ("api/audit/anything", "GET"),
                              # The revoke route's id segment is bounded to DIGITS,
                              # and that bound is load-bearing rather than tidy: the
                              # segment lands in a URL path, so a looser class admits

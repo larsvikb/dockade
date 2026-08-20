@@ -296,6 +296,81 @@ figure is already local and free. The parse is cached on the transcript's mtime
 so a large JSONL is only re-read when it changes; the win is avoiding re-parse
 latency, not a (nonexistent) network round-trip.
 
+### Durable host config lives outside the repo (`~/.config/dockade`)
+
+Per-machine settings that outlive a launch — MCP client credentials
+(`MCP_SECRETS`), plugin marketplace checkouts, the enabled-plugin allowlist — live
+under `$XDG_CONFIG_HOME/dockade` (default `~/.config/dockade`), **never in this
+tree**. The reason is specific to this repo rather than convention: a sandbox
+launched with dockade as its workspace bind-mounts the tree **read-write**, so
+anything configured from inside it is agent-writable. For a credential that is
+obvious; it applies just as much to a knob that decides *which code loads into the
+agent*, which is why the marketplace configuration sits here and not in a repo
+file or a committed `.env`.
+
+The rule, in precedence order: **env var > host config file > baked default.**
+Per-launch knobs (`SANDBOX_MEMORY`, `SANDBOX_NAME`, …) stay env vars, because they
+are per-invocation by nature. `~/.config/dockade` holds what should persist
+without being retyped. Compose service tuning keeps using `.env` (compose reads it
+natively, and those knobs configure services, not the agent's capability). A
+fourth channel — a config file *inside* the repo — is the one shape to refuse, for
+the paragraph above.
+
+The path is necessarily spelled twice, in `sc_config_home` (`sandbox-lib.sh`) and
+`DOCKADE_CONFIG_HOME` (`Makefile`), because make cannot source bash and a launcher
+cannot read a Makefile. `make consistency` invokes both and compares, including
+under a set `XDG_CONFIG_HOME` — the same two-spellings-plus-a-drift-guard shape as
+the firewall/policy allowlist check.
+
+### Plugin marketplaces — host-curated, read-only, re-derived each boot
+
+`~/.config/dockade/marketplaces` is auto-mounted at `/marketplaces` **read-only**
+when it exists, and every marketplace in it is registered into `settings.json` at
+boot (`sc_marketplaces` in `sandbox-lib.sh`; `claude-sandbox/tier-setup.sh`).
+
+This works at all because a Claude Code marketplace can be a local **directory**,
+and a directory source is used in place — no clone, no copy, no egress, no
+credential (measured; `NOTES.md`). That makes it the right shape for a container
+with no governed git path: the human clones on the host, the sandbox reads. It
+needs no new capability, so it is enablement, not a widening of the boundary.
+
+Three decisions worth keeping:
+
+- **Read-only, and outside `/workspace`.** A writable plugin tree is a
+  cross-session channel rather than a convenience: the agent edits a skill or a
+  hook now, and it lands in its own context — or executes — on the next boot,
+  outside the diff review that `/workspace` commits get. `:ro` costs nothing (a
+  directory marketplace is never written to in normal use) and `make consistency`
+  asserts it, because the mitigation is one character wide.
+- **Generated, not `claude plugin marketplace add`.** The CLI's only effect is
+  writing the same two settings keys, so shelling out to it would make it a second
+  writer to the file the boot owns authoritatively — and it would need a `gosu` hop
+  to avoid leaving root-owned files in `/config`. Deriving the whole set from what
+  is mounted, every boot, also means removing a checkout on the host removes it
+  here, with no stale state to clean up.
+- **Not a general host-supplied settings overlay**, tempting though one is (a
+  single channel, a schema we do not own, room for every future user-scope knob).
+  It would reopen precisely what "user settings are image-owned" closes: the
+  effective configuration would become a two-file question, and a host file could
+  quietly undo a paved-road default. Two narrow keys instead —
+  `extraKnownMarketplaces` and `enabledPlugins`.
+
+Enabling is a **separate** decision from availability: a registered marketplace
+only makes plugins installable, and a plugin loads only if it is in
+`enabledPlugins`. It has to be declared host-side (`~/.config/dockade/plugins`)
+for the same reason the yolo disclaimer is baked into the template — settings are
+re-materialized every boot, so an in-session `/plugin install` does not survive a
+restart. The list travels as an env var rather than a second mount, keeping the
+sandbox free of host paths it does not need.
+
+**The trust framing:** a mounted marketplace is code the agent runs — skills,
+agents, hooks, MCP declarations. Mounting one is a trust decision on par with what
+is in `/workspace`: inside the boundary, not a new hole in it. It does not widen
+egress (the firewall is untouched, and a plugin-declared stdio MCP server still
+has no route but the proxy), but it does sidestep the curated catalogue in
+`mcp-servers.yml`, and plugin hooks execute commands. Host-curated, read-only and
+boot-derived is the whole mitigation; the trust decision itself stays the human's.
+
 ### Git identity — from the host at launch, not the tree
 
 Git **conventions** are shared and safe to ship, so the baked `~/.gitconfig`

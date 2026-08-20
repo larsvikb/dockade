@@ -123,6 +123,9 @@ to govern); [`NOTES.md`](NOTES.md) has the measured throughput behind those deci
   **several sandboxes** against one proxy (unique names; override `SANDBOX_NAME`).
 - **Mounts your workspace** at `/workspace` (read-write) and a named config
   volume at `/config` (isolated from the host's `~/.claude`).
+- **Mounts your plugin marketplaces** at `/marketplaces` (**read-only**) when
+  `~/.config/dockade/marketplaces` exists, and registers every one of them at
+  boot — see *Plugins and marketplaces* below.
 - **Forwards your host git identity** into the container (it is not baked into
   the image).
 - **Runs the agent** as non-root — the container starts as root only to arm the
@@ -175,6 +178,44 @@ Bypass-permissions mode is available via the `claude-yolo` alias but is **never
 forced** — starting in it is a conscious opt-in. The image pre-accepts the
 bypass-mode disclaimer (in the baked user settings) so the acceptance survives
 restarts and volume wipes; it does not start Claude in yolo automatically.
+
+## Plugins and marketplaces
+
+The sandbox has no governed git path, so it cannot clone a marketplace itself.
+Instead **you** clone marketplace repos on the host and the sandbox reads them:
+
+```bash
+mkdir -p ~/.config/dockade/marketplaces
+git clone https://github.com/some/marketplace ~/.config/dockade/marketplaces/some-marketplace
+printf 'a-plugin@some-marketplace\n' >> ~/.config/dockade/plugins
+./run-claude-sandbox.sh          # mounts and registers them; no flag needed
+```
+
+Claude Code takes a marketplace from a local **directory** and uses it in place —
+no clone, no copy, no egress, no credential — so the mount is **read-only**, and
+that is deliberate: a writable plugin tree is a channel for the agent to edit a
+skill or hook that lands in its own context, or executes, on the next boot.
+Updating a marketplace is a `git pull` on the host.
+
+Registration is **re-derived on every boot** from what is mounted, so deleting a
+checkout removes it with no stale state. Enabling is separate — a marketplace
+only makes plugins *installable* — and must be declared host-side too, because
+the sandbox's `settings.json` is re-materialized from the image on every boot: a
+`/plugin install` inside a session does not survive a restart.
+
+| Path | Holds |
+|---|---|
+| `~/.config/dockade/marketplaces/` | marketplace checkouts (or one checkout directly) |
+| `~/.config/dockade/plugins` | `plugin@marketplace` ids to enable, one per line, `#` comments ok |
+| `~/.config/dockade/secrets/` | MCP client credentials (`MCP_SECRETS`) |
+
+Durable per-machine config lives **outside this repo** on purpose: a sandbox
+pointed at dockade as its workspace bind-mounts this tree read-write, so anything
+configured from inside it is agent-writable — and what decides which code loads
+into the agent must not be. `XDG_CONFIG_HOME` is honoured; `DOCKADE_CONFIG_HOME`
+overrides the lot. Per-launch overrides: `SANDBOX_MARKETPLACES_DIR` (host path;
+when set explicitly, a missing directory is a launch failure rather than a shrug)
+and `SANDBOX_PLUGINS` (the id list, comma- or space-separated).
 
 ## Layout
 

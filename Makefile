@@ -35,7 +35,18 @@ COMPOSE := docker compose -f docker-compose.yml -f mcp-servers.yml
 #   tok=$$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["token"])' \
 #            $(MCP_SECRETS)/mcp-github.json)
 # No container is given a credential today: see mcp-servers.yml.
-MCP_SECRETS ?= $(HOME)/.config/dockade/secrets
+MCP_SECRETS ?= $(DOCKADE_CONFIG_HOME)/secrets
+# Durable per-machine config lives here, OUTSIDE the repo, for the reason above:
+# this tree is bind-mounted read-write into a sandbox, so anything configured
+# from inside it is agent-writable. Holds `secrets/` (MCP credentials),
+# `marketplaces/` (plugin marketplace checkouts, mounted read-only) and `plugins`
+# (which plugin@marketplace ids to enable).
+#
+# Spelled here AND in sandbox-lib.sh's sc_config_home, because make cannot source
+# bash and the launchers cannot read a Makefile; `make consistency` asserts the
+# two agree, which is the same two-spellings-plus-a-drift-guard shape as the
+# firewall/policy allowlist check.
+DOCKADE_CONFIG_HOME ?= $(if $(XDG_CONFIG_HOME),$(XDG_CONFIG_HOME),$(HOME)/.config)/dockade
 SANDBOX ?= claude-sandbox
 WORKSPACE ?= $(PWD)
 
@@ -289,6 +300,59 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	  echo "        nothing. Tier 1 has governed egress — did the -e lines change shape?"
 	  exit 1
 	fi
+	echo "== host config home: Makefile and sandbox-lib.sh agree =="
+	# Two spellings of one path, in two languages that cannot read each other:
+	# make has no way to source bash, and the launchers have no way to read a
+	# Makefile. Drift here is silent and expensive — `make mcp-up` would warn about
+	# permissions on a directory nobody uses while the launcher mounted
+	# marketplaces from somewhere else. Invoke BOTH and compare, rather than
+	# grepping for a literal, so the check tests the resolved value including the
+	# XDG_CONFIG_HOME branch.
+	lib=$$(bash -c '. ./sandbox-lib.sh && sc_config_home')
+	mk="$(DOCKADE_CONFIG_HOME)"
+	if [ "$$lib" != "$$mk" ]; then
+	  echo "  FAIL: sandbox-lib.sh says '$$lib' but the Makefile says '$$mk'."
+	  echo "        sc_config_home and DOCKADE_CONFIG_HOME must resolve identically."
+	  exit 1
+	fi
+	# And again with XDG_CONFIG_HOME set, which is the branch a dev machine with a
+	# default $$HOME never exercises — the two implementations could agree on the
+	# fallback and disagree on the spec-mandated override.
+	lib=$$(XDG_CONFIG_HOME=/tmp/xdg-probe bash -c '. ./sandbox-lib.sh && sc_config_home')
+	mk=$$(XDG_CONFIG_HOME=/tmp/xdg-probe $(MAKE) --no-print-directory print-config-home)
+	if [ "$$lib" != "$$mk" ]; then
+	  echo "  FAIL: with XDG_CONFIG_HOME set, sandbox-lib.sh says '$$lib' but the"
+	  echo "        Makefile says '$$mk'. One of them ignores XDG_CONFIG_HOME."
+	  exit 1
+	fi
+	echo "  ok — both resolve to $(DOCKADE_CONFIG_HOME) (and honour XDG_CONFIG_HOME)"
+	echo "== marketplace mounts are READ-ONLY =="
+	# A writable plugin tree is a cross-session channel, not a convenience: the
+	# agent edits a skill or a hook, and it lands in its own context — or executes —
+	# on the next boot, outside the review that /workspace commits get. `:ro` is the
+	# whole mitigation, and it is one character from being absent, so assert it
+	# rather than trusting the comment next to it.
+	# sandbox-lib.sh is in the file set, not just the launchers: tier 1 builds the
+	# mount in sc_marketplaces, and a future tier might inline one instead. Both
+	# places must obey the rule, so both are searched.
+	mounted=0
+	for f in $(LAUNCHERS) sandbox-lib.sh; do
+	  tot=$$(grep -cE -- '-v "[^"]*":/marketplaces' "$$f" || true)
+	  [ "$$tot" -gt 0 ] || continue
+	  ro=$$(grep -cE -- '-v "[^"]*":/marketplaces:ro' "$$f" || true)
+	  if [ "$$tot" != "$$ro" ]; then
+	    echo "  FAIL: $$f constructs $$tot /marketplaces mount(s) but only $$ro carry :ro."
+	    exit 1
+	  fi
+	  mounted=$$((mounted + tot))
+	  echo "  ok $$f ($$tot mount(s), all :ro)"
+	done
+	if [ "$$mounted" -eq 0 ]; then
+	  echo "  FAIL: nothing constructs a /marketplaces mount, so this guard checked"
+	  echo "        nothing. Tier 1 does (sc_marketplaces) — did the mount change shape?"
+	  echo "        If the feature was removed deliberately, remove this guard too."
+	  exit 1
+	fi
 	echo "== every tracked source file carries an SPDX header =="
 	# CONTRIBUTING.md tells contributors to add one, and a documented convention with
 	# nothing enforcing it is the kind that holds at 100% until it quietly does not.
@@ -372,6 +436,11 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	  fi
 	done
 	echo "  ok — no launcher attaches the sandbox to a control network; sandbox-net, control-net and authorize-net all internal"
+
+# No `##` description, so it stays out of `make help`: it exists for the config-home
+# drift guard above, which needs make's own answer under a modified environment.
+print-config-home:
+	@printf '%s\n' "$(DOCKADE_CONFIG_HOME)"
 
 test: ## Run the governance unit tests (dependency-free; python -m unittest)
 	@echo "== unit tests (python -m unittest) =="

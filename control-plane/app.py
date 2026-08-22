@@ -13,6 +13,8 @@ module per concern, and every call below is written qualified (``policy._decide`
 ``holds._reserve_hold``) so a reader can see which one is being asked:
 
   - ``store``   — SQLite: the schema, the audit write, the seed. The crown jewel.
+  - ``audit``   — the READ side of that store: the two decision views, their shared
+    filters and the record view's paging.
   - ``policy``  — what a rule pattern matches, and what a host decides to.
   - ``holds``   — the in-process registry a blocked request waits on, its caps
     and its duplicate grouping.
@@ -38,10 +40,12 @@ A human resolves holds over the approvals API (the SSE stream at /approvals/stre
 and POST /approvals/{id}/resolve), surfaced by the separate control-plane-ui
 frontend; the backend serves no HTML itself. GET /approvals is the non-streaming
 form of the same list and is still served here, but the UI does not use it and the
-frontend no longer relays it — see _RELAY_ROUTES in control-plane-ui/app.py. Three read-only views
-back the rest of that UI: GET /api/audit (recent decisions), GET /api/rules (the
-standing policy — see ``api_rules`` for why that one has to be visible) and
-GET /api/config (the hold window, so a card can show its countdown):
+frontend no longer relays it — see _RELAY_ROUTES in control-plane-ui/app.py. Four
+read-only views back the rest of that UI: GET /api/audit (recent decisions, folded),
+GET /api/audit/events (the same record unfolded, filtered and paged — the two are one
+per ``audit.py``'s glance/record split), GET /api/rules (the standing policy — see
+``api_rules`` for why that one has to be visible) and GET /api/config (the hold
+window, so a card can show its countdown):
   - allow-once / deny-once     — decide just this request
   - allow-persist / deny-persist — also write a rule so future connections skip
     the hold (progressive trust; DESIGN.md "auto-approve progressively more"). WHICH
@@ -98,6 +102,7 @@ import threading
 import time
 import uuid
 
+import audit
 import holds
 import ingest
 import policy
@@ -586,8 +591,20 @@ async def approvals_stream(request: Request) -> StreamingResponse:
 
 # ── UI + status ─────────────────────────────────────────────────────────────
 
+def _bad_filter(exc: audit.FilterError) -> JSONResponse:
+    """A refused filter, in the shape every other refusal here takes.
+
+    400 and a sentence, rather than ignoring the parameter and serving a list. Both
+    directions of a silently-dropped filter mislead: a widened one reports decisions
+    the reader excluded, a narrowed one reports an empty record as a quiet system.
+    Neither is visible on screen, which is why the answer is an error and not a
+    best-effort list."""
+    return JSONResponse({"ok": False, "detail": str(exc)}, status_code=400)
+
+
 @app.get("/api/audit")
-def api_audit(limit: int = 50) -> dict:
+def api_audit(limit: int = 50, q: str | None = None, decision: str | None = None,
+              since: float | None = None, until: float | None = None) -> dict:
     """Recent decisions, newest first, for the UI's decisions table.
 
     ``client`` is here because this control plane is SHARED ACROSS SANDBOXES. Without
@@ -642,29 +659,89 @@ def api_audit(limit: int = 50) -> dict:
     time, so the cost is fixed as the table grows (it rides ``audit_ts``), and the
     span covered adapts on its own — about a day when something is retrying every
     minute, months when nothing is. A time bound would go empty on a quiet system,
-    which is the one thing a decisions list must not do."""
-    limit = max(1, min(limit, 500))
+    which is the one thing a decisions list must not do.
+
+    **Filters narrow the raw rows, before the fold** (``audit.grouped``), so ``scan``
+    bounds the matching events read rather than the events read — a search for a quiet
+    host therefore reaches back past however many thousand rows a chatty one just
+    wrote. ``q`` matches the DISPLAYED columns only, which is the same principle the
+    group key follows; the record view searches its own wider set. ``total`` follows
+    the filter for the reason the field exists at all: compared against the whole
+    table, a complete filtered view would report itself as truncated.
+
+    ``filtered`` is served so the frontend's coverage line can say "matching" rather
+    than implying the store itself is that size. It is the one thing the browser cannot
+    work out from the response — it has the parameters it sent, but not whether this
+    backend understood them as a filter."""
+    try:
+        filt = audit.parse(q=q, decision=decision, since=since, until=until,
+                           search=audit.GROUPED_SEARCH)
+    except audit.FilterError as exc:
+        return _bad_filter(exc)
+    limit = audit.clamp(limit, 50, 500)
     with store._connect() as conn:
-        rows = conn.execute(
-            "SELECT decision, stage, host, client, client_class, reason, "
-            "       COUNT(*) AS n, MAX(ts) AS ts, MIN(ts) AS first_ts "
-            "FROM (SELECT * FROM audit ORDER BY ts DESC LIMIT ?) "
-            "GROUP BY decision, stage, host, client, client_class, reason "
-            "ORDER BY ts DESC LIMIT ?", (AUDIT_GROUP_SCAN, limit)).fetchall()
+        rows = audit.grouped(conn, limit, filt, AUDIT_GROUP_SCAN)
         # What the list is a WINDOW ONTO. Without it the view silently truncates:
         # forty rows look like the whole record, and grouping made that worse rather
         # than better, because the counts on each row appear to explain the volume
         # away. The cost is a COUNT(*) per poll, which is why the frontend stops
         # polling in a hidden tab — that gating is what makes this affordable instead
-        # of a scan every four seconds for as long as the page is open. Rides the
-        # audit_ts index, so it is a small scan rather than a table read.
-        total = conn.execute("SELECT COUNT(*) FROM audit").fetchone()[0]
-    return {"rows": [_audit_view(r) for r in rows], "total": total}
+        # of a scan every four seconds for as long as the page is open.
+        total = audit.total(conn, filt)
+    return {"rows": [_audit_view(r) for r in rows], "total": total,
+            "filtered": filt.active}
+
+
+@app.get("/api/audit/events")
+def api_audit_events(limit: int = audit.EVENTS_LIMIT_DEFAULT, q: str | None = None,
+                     decision: str | None = None, since: float | None = None,
+                     until: float | None = None, before: str | None = None) -> dict:
+    """The record itself: one row per decision, newest first, paged backwards without
+    bound. The forensic interface ``api_audit``'s docstring keeps deferring to.
+
+    It exists because "browse the audit log" was, until now, `docker compose exec` and
+    SQL against the crown-jewel volume. The glance above answers *what is happening*;
+    this answers *what happened* — which request, from which client, with which URL,
+    and everything before it. An audit trail nobody can page through is a file, not a
+    trail.
+
+    Serves the columns the glance drops (``port``/``proto``/``method``/``url``), and
+    that is a deliberate reversal rather than an oversight there or here. The glance
+    omits them because a forty-row list scanned at a glance must stay legible and
+    ``url`` is agent-controlled and unbounded; this view is read deliberately, one
+    request at a time, and without those fields it cannot answer the question it is
+    for. The unboundedness is handled where it belongs — capped on WRITE
+    (``store.DRAIN_MAX_FIELD``), page-bounded here (``audit.EVENTS_LIMIT_MAX``), and
+    escaped in the page under a CSP that gives an injected string nowhere to go.
+
+    Paged by CURSOR, not by offset, and the cursor is ``(ts, id)`` — see
+    ``audit.encode_cursor`` for why both halves are needed and why an offset would
+    drop rows between pages exactly while something interesting was happening.
+    ``next`` is null at the end of the record, which is how the pager knows to stop.
+
+    ``total`` is the size of the MATCHING set and does not move as pages advance: the
+    cursor narrows the query but never the total, or paging back through history would
+    look like the record shrinking."""
+    try:
+        filt = audit.parse(q=q, decision=decision, since=since, until=until,
+                           search=audit.EVENT_SEARCH)
+        limit = audit.clamp(limit, audit.EVENTS_LIMIT_DEFAULT, audit.EVENTS_LIMIT_MAX)
+        with store._connect() as conn:
+            rows, nxt = audit.events(conn, limit, filt, before)
+            total = audit.total(conn, filt)
+    except audit.FilterError as exc:
+        # Covers the cursor as well as the filters — a malformed `before` is refused
+        # rather than treated as "start from the beginning", which would silently
+        # serve page 1 while the operator believed they were reading page 12.
+        return _bad_filter(exc)
+    return {"rows": [_audit_view(r) for r in rows], "total": total,
+            "filtered": filt.active, "next": nxt}
 
 
 def _audit_view(row) -> dict:
-    """One grouped row as the UI receives it, plus the one thing it cannot work out
-    for itself: whether this denial was policy or an outage.
+    """One audit row as the UI receives it — grouped or raw, this shaping is the same
+    for both — plus the one thing it cannot work out for itself: whether this denial
+    was policy or an outage.
 
     Classified HERE rather than in the frontend so the marker string lives next to
     the guard test that pins it, and so the browser is not matching on prose. The

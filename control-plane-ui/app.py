@@ -128,6 +128,10 @@ _RELAY_ROUTES = (
     ("GET", re.compile(r"^/approvals/stream$")),
     ("POST", re.compile(r"^/approvals/[A-Za-z0-9_-]{1,128}/resolve$")),
     ("GET", re.compile(r"^/api/audit$")),
+    # The record view behind the same path prefix, and a SEPARATE entry rather than a
+    # loosened one: `^/api/audit` without the anchor would relay every future path
+    # under it, which is how a default-deny allowlist stops being one.
+    ("GET", re.compile(r"^/api/audit/events$")),
     ("GET", re.compile(r"^/api/rules$")),
     # Digits only, and bounded: the id goes straight into a path segment, and a
     # pattern that could match a slash or a dot-segment would be a path-traversal

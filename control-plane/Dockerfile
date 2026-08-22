@@ -26,6 +26,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # (and so the build context can never smuggle in a stray file next to them).
 COPY control-plane/app.py ./app.py
 COPY control-plane/store.py ./store.py
+COPY control-plane/audit.py ./audit.py
 COPY control-plane/policy.py ./policy.py
 COPY control-plane/holds.py ./holds.py
 COPY control-plane/ingest.py ./ingest.py

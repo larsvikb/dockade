@@ -672,7 +672,21 @@ const AUDIT_STATUS_TEXT = {
 const AUDIT_FILTERED_EMPTY_TEXT =
   "No decisions match these filters. The record itself is not empty — clear them, " +
   "or widen the time window, to see it.";
-function auditStatus(rowCount, failed, loaded, filtered) {
+// When the backend refuses the filters but says nothing usable about why. Only reachable
+// if the 400 body is missing or unparseable, which is why it is vague where the
+// backend's own sentence is specific — but it still has to name the filter bar as the
+// place to look, because the one thing we do know is that the control plane answered.
+const AUDIT_REFUSED_FALLBACK =
+  "These filters were refused, so the decisions below still answer the previous " +
+  "question. Adjust them and try again.";
+function auditStatus(rowCount, failed, loaded, filtered, refused) {
+  // A REFUSED filter outranks every sentence below it. The query never ran, so the
+  // rows on screen are the PREVIOUS question's answer — and unlike a failed poll this
+  // is something the operator can act on, in the filter bar, right now. Leaving it to
+  // the stale wording would blame the control plane for a parameter the page sent.
+  // The backend's sentence is used verbatim (`_bad_filter` in control-plane/app.py)
+  // because it names which filter and why, which nothing written here could.
+  if (refused) return { show: true, level: "warn", text: refused };
   const s = pollStatus(AUDIT_STATUS_TEXT, rowCount, failed, loaded);
   // Only the EMPTY sentence changes. A failed poll is a failed poll whether or not a
   // filter is set, and saying so remains the more urgent fact.
@@ -1407,6 +1421,11 @@ function start() {
   // failing" want different sentences — see auditStatus.
   let auditLoaded = false;
   let auditFailed = false;
+  // The refusal sentence from the last 400, or null. A third fact rather than a flavour
+  // of `auditFailed`, because the transport SUCCEEDED — the control plane answered, and
+  // answered with the reason. Collapsing the two would report a bad filter as an
+  // unreachable control plane, which sends the operator to the wrong place entirely.
+  let auditRefused = null;
   let rulesLoaded = false;
   let rulesFailed = false;
   let rulesById = new Map();
@@ -1437,7 +1456,8 @@ function start() {
 
   function renderAuditStatus(rowCount, filtered) {
     renderListStatus(auditEmpty,
-                     auditStatus(rowCount, auditFailed, auditLoaded, filtered));
+                     auditStatus(rowCount, auditFailed, auditLoaded, filtered,
+                                 auditRefused));
   }
 
   function renderRulesStatus(rowCount) {
@@ -1549,6 +1569,19 @@ function start() {
       // exactly the route being added.
       const res = events ? await fetch(`/api/audit/events?${qs}`)
                          : await fetch(`/api/audit?${qs}`);
+      // 400 is the backend REFUSING these parameters and saying which one and why —
+      // the sentence is the entire reason that response is a 400 rather than a
+      // best-effort list (see `_bad_filter`). Throwing it into the catch below would
+      // discard the sentence and render "could not refresh", which is both wrong about
+      // the cause and unactionable. `.catch` on the parse because a refusal that
+      // arrives without a readable body must still surface AS a refusal.
+      if (res.status === 400) {
+        const refusal = await res.json().catch(() => null);
+        auditFailed = false;
+        auditRefused = (refusal && refusal.detail) || AUDIT_REFUSED_FALLBACK;
+        renderAuditStatus(auditRowCount(), filterActive(f));
+        return;
+      }
       if (!res.ok) throw new Error(String(res.status));
       body = await res.json();
     } catch (e) {
@@ -1556,10 +1589,12 @@ function start() {
       // swallowing this is what let the list sit indefinitely stale while the header
       // read "live" — the stream and this poll are different transports.
       auditFailed = true;
+      auditRefused = null;
       renderAuditStatus(auditRowCount(), filterActive(f));
       return;
     }
     auditFailed = false;
+    auditRefused = null;
     auditLoaded = true;
     // {rows, total, filtered, next}. Tolerates a bare array from an older backend, in
     // which case `total` is undefined and coverageSummary stays silent rather than

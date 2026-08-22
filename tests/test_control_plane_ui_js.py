@@ -414,6 +414,11 @@ console.log(JSON.stringify({
         // A failed poll stays a failed poll — the more urgent fact either way.
         filtered_failed: m.auditStatus(0, true, true, true),
         filtered_has_rows: m.auditStatus(12, false, true, true),
+        // A REFUSED filter: the backend's own sentence, and it outranks everything.
+        refused: m.auditStatus(12, false, true, true,
+                              "since (5) must be before until (2)"),
+        refused_over_failed: m.auditStatus(0, true, true, true, "bad cursor"),
+        refused_no_body: m.auditStatus(12, false, true, true, null),
       },
       revoke: {
         allow_rule: m.revokePreview({ pattern: ".github.com", action: "allow",
@@ -1152,6 +1157,23 @@ class PageScriptTests(unittest.TestCase):
         # A failed poll outranks the filter: it is the more urgent fact either way.
         self.assertIn("Could not refresh", s["filtered_failed"]["text"])
         self.assertFalse(s["filtered_has_rows"]["show"])
+
+    def test_a_refused_filter_says_which_one_rather_than_blaming_the_transport(self):
+        """The backend spends a 400 and a sentence saying which filter it refused and
+        why (`_bad_filter`); this is the only place that sentence can reach the person
+        who typed it. Reporting it as "could not refresh" sends them to look at the
+        control plane for something the filter bar did — and the rows below are the
+        PREVIOUS question's answer, which is the part silence gets wrong."""
+        s = self.probe["saturation"]["audit_filtered_status"]
+        # Verbatim, not paraphrased: the parameter and the value are the useful part.
+        self.assertIn("since (5) must be before until (2)", s["refused"]["text"])
+        self.assertTrue(s["refused"]["show"])
+        self.assertEqual(s["refused"]["level"], "warn")
+        # Outranks a stale poll, unlike the filtered-empty sentence above: a refusal is
+        # the one state here the operator can fix from the controls on screen.
+        self.assertIn("bad cursor", s["refused_over_failed"]["text"])
+        # And absent, it changes nothing — every other state keeps its own wording.
+        self.assertFalse(s["refused_no_body"]["show"])
 
     def test_the_time_window_is_arithmetic_on_a_clock_it_is_given(self):
         """A relative window, computed from a clock passed IN — which is what makes it

@@ -82,7 +82,15 @@ class FilterError(ValueError):
     Every raise here is a case where silently dropping the filter would answer a
     different question than the one asked — an unparseable time range widens the
     result set, an unknown decision word narrows it to nothing — and both look like
-    an answer. ``app.py`` turns this into a 400 carrying the message."""
+    an answer. ``app.py`` turns this into a 400 carrying the message.
+
+    **The message is served VERBATIM to the caller** (``_bad_filter``), so interpolate
+    only what the caller already has: their own parameters, and this module's constants.
+    Nothing read from the store, the filesystem, or an underlying exception belongs in
+    one — that is what keeps the 400 a validation sentence rather than a disclosure. A
+    code scanning rule flags the ``str(exc)`` on the other end from the shape alone;
+    this contract is why that is a false positive, and it holds only as long as every
+    raise site below honours it."""
 
 
 class Filter:
@@ -122,6 +130,16 @@ def _needle(q: str) -> str:
     return f"%{escaped}%"
 
 
+def _finite(ts: float) -> bool:
+    """Whether a parsed float is usable as a bound.
+
+    The case both callers need: ``float()`` PARSES ``'nan'`` and ``'inf'`` rather than
+    rejecting them, so a value that looks valid reaches the SQL and then compares
+    wrongly instead of failing. What that costs differs per caller — see the two call
+    sites — but the check does not, which is why it is here and not written twice."""
+    return ts == ts and ts not in (float("inf"), float("-inf"))
+
+
 def _time(name: str, value) -> float:
     """One epoch-seconds bound, validated. ``float('nan')`` is the case worth naming:
     every comparison against NaN is false, so it would silently return an empty list
@@ -131,7 +149,7 @@ def _time(name: str, value) -> float:
     except (TypeError, ValueError):
         raise FilterError(f"{name} must be a number of seconds since the epoch, "
                           f"not {value!r}") from None
-    if ts != ts or ts in (float("inf"), float("-inf")):
+    if not _finite(ts):
         raise FilterError(f"{name} must be a finite number of seconds since the "
                           f"epoch, not {value!r}")
     return ts
@@ -249,14 +267,30 @@ def encode_cursor(row) -> str:
 
 
 def decode_cursor(cursor: str) -> tuple[float, int]:
+    """The ``(ts, id)`` pair ``encode_cursor`` wrote, or a refusal.
+
+    Unparseable and non-finite are ONE error here, deliberately. ``since``/``until``
+    name their specific problem because a human types them; a cursor is machine-
+    generated, so the only useful thing to say about a bad one is that it did not come
+    from a previous page."""
     raw = str(cursor)
     ts, _, rid = raw.rpartition(":")
     try:
-        return float(ts), int(rid)
+        at, row_id = float(ts), int(rid)
+        # Refused HERE and not left to the SQL, because a non-finite cursor does not
+        # fail — it answers. NaN compares false against every row, so the page comes
+        # back empty with `next: None`, which is the wire signal for end-of-record, over
+        # a store that is full. An infinity compares true against every row, so it
+        # serves page 1 while the pager believes it is deeper. Both are the "looks like
+        # data, not like an error" outcome this refusal exists to prevent.
+        ok = _finite(at)
     except ValueError:
+        ok = False
+    if not ok:
         raise FilterError(
             f"malformed page cursor {raw!r} — it must be the value a previous page "
-            f"returned as `next`") from None
+            f"returned as `next`")
+    return at, row_id
 
 
 def events(conn, limit: int, filt: Filter, before: str | None = None) -> tuple[list, str | None]:

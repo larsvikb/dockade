@@ -1230,7 +1230,12 @@ class AuditRecordTests(_CPTestCase):
     def test_a_malformed_cursor_is_refused_not_treated_as_the_first_page(self):
         # Serving page 1 while the pager says page 12 is the worst available answer:
         # it looks like data, not like an error.
-        for bad in ("nonsense", "", ":", "abc:def", "1.0:x"):
+        # `nan` and `inf` are here because they PARSE: every other string on this list
+        # fails float() and would be refused by any implementation, while these two
+        # reach the SQL and compare wrongly instead — NaN as an empty page reporting
+        # itself as the end of the record, inf as page 1. See audit._finite.
+        for bad in ("nonsense", "", ":", "abc:def", "1.0:x",
+                    "nan:1", "inf:1", "-inf:1", "1e400:1"):
             with self.subTest(cursor=bad):
                 resp = cp.api_audit_events(before=bad)
                 if bad == "":                      # absent, not malformed

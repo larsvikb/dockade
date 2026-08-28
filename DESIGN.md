@@ -179,6 +179,13 @@ different surface on each; the **control-plane-ui** frontend is on `control-net`
 `sandbox-net` only — never any control network (asserted by `make check`,
 `tests/test_topology.py` and `boundary-check.sh`).
 
+**On any one network, pin every member's address or pin none.** A mixed network is a
+start-order race for a single address rather than a style inconsistency, and it stays
+invisible until a host reboot puts the members up in an order `depends_on` has no say
+over (`NOTES.md` has the allocator behaviour and the misleading error). Asserted by
+`AddressAllocationTests` in `tests/test_topology.py`, which is also why the sandboxes
+may stay dynamic: they are launched after the substrate already holds its pins.
+
 ### DNS on `sandbox-net` (a non-obvious gotcha — read before touching DNS/firewall)
 
 Putting the sandbox on a *user-defined* network (which we do, and must — it's how

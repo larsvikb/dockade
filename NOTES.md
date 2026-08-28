@@ -322,6 +322,34 @@ Windows host running WSL2 it is the worst band available, for two independent re
 So the usable band is *above* the crowded 8000–9000 development block and *below* the
 ephemeral floor: roughly 20000–32767.
 
+## Docker's dynamic IP is the lowest free one, so it collides with `.2`
+
+A container attached to a user-defined bridge without an `ipv4_address` is not given
+an arbitrary address: the allocator walks the subnet and hands out the lowest free
+one. On a `/24` the gateway takes `.1`, so the first dynamic member gets `.2` — the
+same address a hand-pinned member is most likely to have been given, because `.2` is
+also the obvious thing to write down. A network that mixes a pinned member with a
+dynamic one is therefore not "mostly fine": the two want the identical address.
+
+Which one gets it is start order, and `depends_on` does not decide that after a host
+reboot. It orders `compose up`; a reboot has the daemon bring `restart: always`
+containers back on its own, in an order that need not match. So the collision is
+invisible in every tested path and appears only on a reboot, as:
+
+    "Error": "failed to set up container networking: Address already in use"
+
+That message reads like a published *host port* conflict, which is the expensive part
+— the stack it appeared in published exactly one port, from a container that started
+fine. It is container-side IPAM, and the container it collides with is whoever is
+holding the address:
+
+    docker network inspect <net> \
+      --format '{{range .Containers}}{{printf "  %-18s %s\n" .Name .IPv4Address}}{{end}}'
+
+That view is the allocator's own record, so it also shows an address held by a stale
+endpoint with no live container — the other way this fails after an unclean shutdown,
+cured with `docker network disconnect -f` or by recreating the network.
+
 ## `curl` reads `http_proxy` in lower case only
 
 Same host, same shell, curl 8.14.1. `example.com` carries a **block** rule, so reaching

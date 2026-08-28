@@ -158,6 +158,14 @@ services:
       # no bearing on egress; lower priority than egress-net so it never becomes
       # the default route.
       authorize-net:
+        # Fixed for two reasons. The load-bearing one: control-plane pins .2 on this
+        # network, and a dynamically-assigned member gets handed the LOWEST free
+        # address — so on a host reboot, where the daemon starts `restart: always`
+        # containers in an order `depends_on` has no say over, whoever loses the race
+        # takes the other's address and dies with "Address already in use". Static on
+        # both ends removes the race. Secondary: app.py logs the authorize caller by
+        # peer address, so pinning it keeps that audit field stable across boots.
+        ipv4_address: 172.29.0.10
         priority: 20
       # Be reachable BY the MCP server containers, so their upstream calls are
       # governed by the same choke point as everything else — an MCP server with
@@ -359,8 +367,12 @@ services:
     # See egress-proxy for why these three are `always`.
     restart: always
     networks:
-      # Reach the backend (internal, no egress).
+      # Reach the backend (internal, no egress). Fixed only to stay out of
+      # control-plane's way: it pins .2 here, and a dynamic member is handed the
+      # lowest free address — which is .2. See egress-proxy's authorize-net leg for
+      # why that is a reboot-order race and not a theoretical one.
       control-net:
+        ipv4_address: 172.31.0.10
       # Host-UI reachability only; not an egress path (see control-ui-net).
       control-ui-net:
     environment:

@@ -288,6 +288,57 @@ class McpServerPlacementTests(unittest.TestCase):
                 ipaddress.ip_network("172.16.0.0/12")))
 
 
+class AddressAllocationTests(unittest.TestCase):
+    """Per network: pin every member's address, or pin none of them.
+
+    Mixing the two is a reboot-order race, and it does not look like one in review.
+    Docker hands a dynamic member the LOWEST free address in the subnet, which is
+    the same ``.2`` a pinned member is most likely to have asked for; whoever the
+    daemon starts first takes it and the other dies with "Address already in use".
+    `depends_on` does not help — it orders `compose up`, not the daemon bringing
+    `restart: always` containers back after a host reboot, which is the only time
+    the order differs from the one that was tested.
+
+    Scoped to attachments DECLARED IN COMPOSE. The sandboxes are dynamic on
+    sandbox-net by design: the launchers start them long after the substrate holds
+    its pinned addresses, so they can only ever be handed what is left."""
+
+    @staticmethod
+    def _legs() -> dict[str, dict[str, str | None]]:
+        """network -> {service: pinned address or None} over both compose files."""
+        legs: dict[str, dict[str, str | None]] = {}
+        for svc in _service_names():
+            for net in _raw_networks(svc):
+                legs.setdefault(net, {})[svc] = _scalar(
+                    _block(_service(svc), net, 6), "ipv4_address")
+        return legs
+
+    def test_a_network_with_any_fixed_address_fixes_them_all(self):
+        for net, members in self._legs().items():
+            if not any(members.values()):
+                continue        # all-dynamic is fine — nobody has a claim to lose
+            with self.subTest(network=net):
+                floating = sorted(s for s, addr in members.items() if addr is None)
+                self.assertEqual(
+                    floating, [],
+                    f"{net} mixes fixed and dynamic addresses: {floating} float "
+                    f"while {sorted(s for s, a in members.items() if a)} are pinned")
+
+    def test_every_fixed_address_is_inside_its_network(self):
+        # A pin outside the subnet is refused at start; a pin inside the WRONG
+        # network's subnet is the typo this catches, and it fails the same way the
+        # race above does — at boot, on the host, not here.
+        for net, members in self._legs().items():
+            subnet = ipaddress.ip_network(_subnet_of(net)) if any(
+                members.values()) else None
+            for svc, addr in members.items():
+                if addr is None:
+                    continue
+                with self.subTest(network=net, service=svc):
+                    self.assertIn(ipaddress.ip_address(addr), subnet,
+                                  f"{svc} pins {addr}, outside {net} ({subnet})")
+
+
 class ControlPlaneBindTests(unittest.TestCase):
     """The management listener is out of the proxy's reach because of WHERE it
     binds, not merely which port it uses. Both halves are asserted here because

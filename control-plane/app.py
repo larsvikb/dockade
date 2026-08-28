@@ -281,6 +281,40 @@ def _bootstrap() -> None:
           f"{holds.MAX_PENDING_PER_CLIENT} per client, blocked requests "
           f"{holds.MAX_WAITERS} global / {holds.MAX_WAITERS_PER_CLIENT} per client "
           f"(0 = refuse all on a global cap, disabled on a per-client one)", flush=True)
+    _warn_on_dead_caps()
+
+
+def _warn_on_dead_caps() -> None:
+    """Name a cap that cannot fire, at the boot that configured it.
+
+    A card holds at least one blocked request, so cards are always <= waiters and a card
+    cap set at or above its waiter cap can never be the one to refuse — the waiter cap
+    gets there first, and the card number is a limit the operator believes in and does
+    not have. ``test_a_card_cap_at_or_above_its_waiter_cap_is_dead`` pins the shipped
+    defaults against that, which covers every case except the one the caps exist for:
+    being set by hand.
+
+    A WARNING rather than the ``SystemExit`` that ``_assert_listeners_separated`` uses,
+    and the asymmetry is the point. A wildcard management bind restores a self-approval
+    path, so refusing to start is strictly safer than starting. A dead cap is not a
+    containment failure at all — waiters still bound cards, so the hold queue stays
+    bounded and only the operator's model of WHICH limit binds is wrong. Refusing to boot
+    would answer that by taking the governance authority down, which denies every
+    sandbox's egress: a worse outcome than the misconfiguration, and caused by us.
+
+    Zero is exempt at both scopes because zero is meaningful at both — a global zero
+    refuses everything, a per-client zero disables that cap (see ``holds.py``). Warning
+    on either would be warning that a documented setting works.
+    """
+    for cards, waiters, scope in (
+            (holds.MAX_PENDING, holds.MAX_WAITERS, "global"),
+            (holds.MAX_PENDING_PER_CLIENT, holds.MAX_WAITERS_PER_CLIENT, "per-client")):
+        if cards > 0 and waiters > 0 and cards >= waiters:
+            print(f"control-plane: WARNING — the {scope} card cap ({cards}) is at or "
+                  f"above the {scope} blocked-request cap ({waiters}), so it can never "
+                  f"refuse: every card holds at least one blocked request, so the "
+                  f"request cap always fires first. Lower the card cap to make it bind.",
+                  flush=True)
 
 
 def _assert_listeners_separated() -> None:

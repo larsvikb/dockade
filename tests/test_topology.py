@@ -36,6 +36,7 @@ COMPOSE = [line
            for name in ("docker-compose.yml", "mcp-servers.yml")
            for line in (ROOT / name).read_text().splitlines()]
 ADDON = (ROOT / "proxies" / "egress" / "addon.py").read_text()
+HOLDS = (ROOT / "control-plane" / "holds.py").read_text()
 BOUNDARY = (ROOT / "sandbox-common" / "boundary-check.sh").read_text()
 APP = (ROOT / "control-plane" / "app.py").read_text()
 POLICY = (ROOT / "control-plane" / "policy.py").read_text()
@@ -564,6 +565,56 @@ class AppPortDefaultsAgreeTests(unittest.TestCase):
 
     def test_manage_port_default_matches_compose(self):
         self.assertEqual(self._default("CONTROL_MANAGE_PORT"), MANAGE_PORT)
+
+
+class ProxyOutlastsTheHoldWindowTests(unittest.TestCase):
+    """The proxy must still be waiting when the hold window closes.
+
+    ``/authorize`` blocks for up to ``CONTROL_HOLD_TIMEOUT`` while a human decides, and
+    the proxy abandons that call after ``EGRESS_CONTROL_TIMEOUT``. Order them the wrong
+    way and the proxy gives up on a request whose card is still on the operator's screen:
+    the agent is denied by a race rather than by a decision, and the click that follows
+    resolves an approval with nobody left to serve. The gap between the two covers the
+    round trip.
+
+    The constants live in DIFFERENT IMAGES and neither process can read the other's — the
+    same no-compiler-between-the-ends situation as the rest of this file. Compose
+    overrides neither today, so the source defaults are what deploys (the reasoning for
+    leaving them in the environment at all is under "Hold bounds are fail-closed, so
+    their values stay env vars" in DESIGN.md). The override is read anyway, so setting
+    one later does not silently retire this guard.
+    """
+
+    @staticmethod
+    def _default(text: str, name: str, where: str) -> float:
+        m = re.search(rf'{re.escape(name)}",\s*"([0-9.]+)"', text)
+        if m is None:
+            raise AssertionError(f"no default for {name} in {where}")
+        return float(m.group(1))
+
+    def _effective(self, service: str, name: str, text: str, where: str) -> float:
+        override = _environment_of(service).get(name)
+        if override is None:
+            return self._default(text, name, where)
+        try:
+            return float(override)
+        except ValueError:
+            self.fail(f"{service} sets {name}={override!r} in compose, which this guard "
+                      f"cannot compare as a number — so it can no longer tell whether "
+                      f"the proxy outlasts the hold window. Inline the value or teach "
+                      f"this test the form.")
+
+    def test_the_proxy_waits_longer_than_the_hold_window(self):
+        proxy = self._effective("egress-proxy", "EGRESS_CONTROL_TIMEOUT",
+                                ADDON, "proxies/egress/addon.py")
+        hold = self._effective("control-plane", "CONTROL_HOLD_TIMEOUT",
+                               HOLDS, "control-plane/holds.py")
+        self.assertGreater(
+            proxy, hold,
+            f"the proxy gives up on /authorize after {proxy}s but a hold can run "
+            f"{hold}s, so a held request dies on the proxy side while its card is "
+            f"still pending — raise EGRESS_CONTROL_TIMEOUT or lower "
+            f"CONTROL_HOLD_TIMEOUT")
 
 
 if __name__ == "__main__":

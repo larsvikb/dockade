@@ -2230,6 +2230,57 @@ human, which is the attention-DoS `MAX_PENDING_PER_CLIENT` exists for on the egr
 side. The tool surface needs that cap most, and its own, since the two surfaces no
 longer share a pool.
 
+**Resumption is a tool, keyed on the approval id.** The agent needs a way back to a
+pending ask, and the obvious one — retry the original call — is safe but fragile. Safe
+because the gateway re-checks policy before executing, so a still-pending ask returns
+pending again rather than running. Fragile because joining by payload hash requires the
+agent to reproduce the arguments *byte-identically*, and a model asked to retry
+commonly reformulates: a reformulated retry hashes differently and opens a **second**
+ask, so the flood the caps exist to bound arrives from ordinary model behaviour rather
+than from an adversary. An opaque id is a short token copied verbatim, which is the one
+thing a model will not quietly rewrite. Hash-joining stays as the backstop for an agent
+that retries the original call anyway; the id is the path the pending result names.
+
+**The gateway executes on resumption, not on approval.** Lazily, when the agent comes
+back for the result — never at the instant the human clicks. This makes the
+stranded-caller property structural rather than detected: an approved call nobody
+returns for simply never runs, so a side effect cannot happen with no one to receive
+it. Eager execution is the obvious implementation and it quietly reintroduces the exact
+failure that answering immediately was chosen to remove. It also means the agent never
+re-sends the payload, so the arguments that execute are necessarily the ones the human
+read.
+
+**One id at a time, and no roster of pending work.** A lookup scoped to a single
+approval is all resumption needs. Listing what is pending is a different capability and
+is deliberately not offered: the gateway's agent-facing listener binds `sandbox-net`,
+which both tiers share, so a roster would leak approvals the caller never raised — and
+past the leak it hands the agent a read on the operator's queue, a nudge surface kept
+away from it everywhere else here.
+
+**Gateway-native tools are a category, and need their own rule.** Resume is proxied
+from no MCP server; it is the gateway's own, permanently `allow`, and therefore outside
+the per-tool policy governing everything else on the surface. The rule that keeps the
+category honest: **a native tool must not cause an ungoverned side effect.** Resume
+sits precisely on that line, because it does cause one — admissible only because the
+effect is bound to an id a human explicitly approved, with arguments they read. The
+next native tool will not inherit that property, which is why the criterion is written
+here rather than left to be inferred from this one being safe.
+
+**Elicitation routes to the wrong human.** Worth naming because it is the protocol's
+own answer to everything above: MCP lets a server ask the *client* to prompt its user
+(`elicitation/create`), which is the human-in-the-loop primitive this section otherwise
+builds by hand. It is unusable for approvals here. The approving human sits at the
+control-plane UI, in a different trust domain from the agent's session, so routing the
+decision through the agent's own client would put it inside the boundary being governed
+— where "no Claude Code settings file is a containment boundary" already applies.
+Whether the client implements it is therefore not worth establishing for this purpose.
+What MCP does supply is the brokering half: a curated `tools/list` plus
+`notifications/tools/list_changed` is exactly the configuration-artifact roster above.
+What it supplies nothing of is the deferred half — no accepted-come-back-later, no
+resumption primitive, no timeout extension (see NOTES.md). That absence argues *for*
+answering immediately rather than against it: fail-fast asks the protocol only for what
+it natively has, a result now and another tool call later.
+
 **Presenting a payload for approval.** A schema-driven view gets most of the way —
 the tool's JSON Schema gives a field tree with each field's description beside it —
 but the rule the approval UI already established governs: the **raw payload is

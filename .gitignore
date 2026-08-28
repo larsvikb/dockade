@@ -9,3 +9,10 @@ models/
 *.log
 # Local review scratch pad (findings / todo). Working notes, not a repo artifact.
 local-todo.md
+# Claude Code's per-checkout working state: agent worktrees (each one a second copy
+# of this repo) and local settings. Ignored WHOLESALE rather than per-entry, which is
+# a decision and not laziness — /workspace is bind-mounted read-write, so a committed
+# `.claude/` deciding which hooks, agents or skills load would be exactly the
+# agent-writable config knob DESIGN.md refuses. The paved road ships in the image
+# (claude-sandbox/), and durable per-machine settings live in ~/.config/dockade.
+.claude/

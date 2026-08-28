@@ -30,7 +30,7 @@ this local stream is the only record of it. The control plane tails this file
 (read-only) and ingests the ``central: false`` lines, which is what keeps its
 "recent decisions" view a record of *decisions* rather than of round-trips. The
 flag is the join key for that: it is what stops the ingest double-counting every
-governed request. See ``_drain_egress_audit`` in control-plane/app.py.
+governed request. See ``_drain_egress_audit`` in control-plane/ingest.py.
 
 Fail-closed, with one deliberate exception:
   - The **permanent lifeline** hosts (``EGRESS_PERMANENT_HOSTS`` — the Anthropic
@@ -101,7 +101,7 @@ AUDIT_PATH = os.environ.get("EGRESS_AUDIT_LOG", "/var/log/egress/audit.jsonl")
 # on-disk use at roughly (backups + 1) x cap. The control plane's ingest is built
 # for exactly this rename model — it follows a file by inode across the .N shuffle
 # and drains rotated siblings oldest-first, so nothing is lost when we roll over
-# (see ``_drain_egress_audit`` in control-plane/app.py). Set the cap to 0 to disable
+# (see ``_drain_egress_audit`` in control-plane/ingest.py). Set the cap to 0 to disable
 # rotation. Keep it comfortably above one drain block so the reader always keeps up.
 AUDIT_MAX_BYTES = int(os.environ.get("EGRESS_AUDIT_MAX_BYTES", str(8 * 1024 * 1024)))
 AUDIT_BACKUPS = int(os.environ.get("EGRESS_AUDIT_BACKUPS", "5"))

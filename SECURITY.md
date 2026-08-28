@@ -158,8 +158,13 @@ report.
   hold pool for every other — was listed here and is now fixed; the caps that bound it
   are described in `DESIGN.md` under *Four hold caps: two nouns, two scopes*. Another
   of that shape would be worth reporting.
-- **Base images pinned by tag rather than digest.** A deliberate
-  rebuild-to-update choice, consistent across every image here.
+- **Base images pinned by tag rather than digest**, everywhere except the one place
+  it would matter: the egress proxy is the security choke point and its base *is*
+  digest-pinned, so a repointed tag cannot change the component that enforces egress.
+  Elsewhere this is a deliberate rebuild-to-update choice. Python dependencies are
+  pinned by version in each `requirements.txt` but not by hash, and their transitive
+  dependencies are not pinned at all — the same choice one layer down, and a real
+  supply-chain path into the control plane if you disagree with it.
 - **The standalone (proxy-less) fallback being weaker than governed mode.** It
   keeps a narrow, allowlisted, *unaudited* direct path by design, for hosts that
   cannot run the infrastructure. Governed mode is the default and the one the

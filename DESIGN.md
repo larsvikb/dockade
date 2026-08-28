@@ -182,8 +182,10 @@ control-plane **backend** is on both control nets and fully
 internal (no `sandbox-net`, no `egress-net`, no published port), serving a
 different surface on each; the **control-plane-ui** frontend is on `control-net`
 (to reach the backend) plus `control-ui-net` (host-loopback UI). The sandbox is on
-`sandbox-net` only — never any control network (asserted by `make check`,
-`tests/test_topology.py` and `boundary-check.sh`).
+`sandbox-net` only — never any control network (asserted by the launcher guard in
+`make consistency` and by `boundary-check.sh`, which probes it from inside a running
+sandbox; a sandbox is not a compose service, so `tests/test_topology.py` cannot see
+this one).
 
 **On any one network, pin every member's address or pin none.** A mixed network is a
 start-order race for a single address rather than a style inconsistency, and it stays
@@ -751,11 +753,13 @@ directory nobody is thinking about at the time. Contingent exposure is worse tha
 constant exposure, because it tests clean. Gitignoring keeps a value out of the
 history, not out of a sandbox.
 
-So anything that grants lives **outside the tree** — `~/.config/dockade/mcp.env`,
-mode 0600 — and is sourced by the `make mcp-up` recipe rather than by compose, so no
-version-dependent `env_file` behaviour decides whether a missing file is fatal.
-`.env` keeps the non-secret overrides it was meant for: DNS, model selection, the
-render gid, a port.
+So anything that grants lives **outside the tree**, under `MCP_SECRETS`
+(`~/.config/dockade/secrets/`, 0700 with files at 0600) — one file per server, read by
+the gateway rather than handed to compose, so no version-dependent `env_file`
+behaviour decides whether a missing file is fatal. See "Where the material lives"
+under the MCP gateway for the file's shape and why a directory bind beats a compose
+`secrets:` entry. `.env` keeps the non-secret overrides it was meant for: DNS, model
+selection, the render gid, a port.
 
 **Workspace bind-mount:** the one deliberate direct host coupling. Scope it to a
 single project directory, read-write. Because work lands on the host FS directly,
@@ -2241,8 +2245,10 @@ explicitly: **a crown-jewel backup never contains a credential.**
 `secrets:`.** A `secrets:` entry whose `file:` source is absent fails at `up` time for
 the whole project — the same eager-validation trap as `${VAR:?}`, and this repo has
 paid for that lesson twice. A directory bind degrades instead: a missing file means
-*that* server fails closed while every other service is unaffected. `make up` ensures
-the directory exists first, as it already checks the mode of `MCP_ENV`.
+*that* server fails closed while every other service is unaffected. `make mcp-up` is
+where that lands — it already warns on the mode of anything under `MCP_SECRETS`, and
+ensuring the directory exists belongs beside that check rather than in `make up`,
+which starts the infra and has no MCP server in it to serve.
 
 **What the UI can say without ever seeing a value:** whether the secret *resolves*,
 per server. That is what makes a forced-injection server fail legibly — "configured,
@@ -2381,8 +2387,12 @@ rather than its size: it is a hard wall-clock bound with no extension path (prog
 notifications do not lift it), and it defaults to roughly a day. Blocking would mean
 a design whose failure mode is a stranded call, tuned by a number whose default is
 useless. Answering immediately makes the hold window a **human** parameter, free to
-be minutes or hours because nothing is waiting on it. The measurements are in
-NOTES.md; the numbers are deliberately not repeated here.
+be minutes or hours because nothing is waiting on it. The timers are in NOTES.md and
+the numbers are deliberately not repeated here — read them as **documented, not
+measured**: NOTES.md says so, and the ~28-hour default in particular is worth probing
+in-container before anything depends on its exact value. The decision does not: it
+rests on the SHAPE of the limit (a hard wall-clock bound with no extension path),
+which the documentation is authority enough for.
 
 Three properties make the pending answer safe rather than merely non-blocking:
 
@@ -2484,7 +2494,8 @@ card names the gap instead.
   immediately"): nothing is held open, so there is no caller to lose and no
   disconnect to cancel on. The earlier plan — cancel on disconnect and keep the hold
   window under the client timeout — was written for a blocking gateway and does not
-  apply; the timer facts that killed it are in NOTES.md.
+  apply; the timers that killed it are in NOTES.md (documented, not measured — see
+  "An `ask` answers immediately").
 - **The response is the channel.** The gateway governs the *request*, but what steers
   an agent is the third-party text arriving in its context — an `allow`-ed,
   read-only tool is unaudited intake of the same shape as WebSearch, and content in

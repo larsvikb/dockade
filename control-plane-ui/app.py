@@ -132,11 +132,14 @@ _RELAY_ROUTES = (
     # loosened one: `^/api/audit` without the anchor would relay every future path
     # under it, which is how a default-deny allowlist stops being one.
     ("GET", re.compile(r"^/api/audit/events$")),
-    ("GET", re.compile(r"^/api/rules$")),
+    # Surface-prefixed: policy paths name the governed surface they decide for, so the
+    # gateway's `/api/mcp/rules` lands as its own entry rather than widening this one
+    # (see "URLs carry the surface" in DESIGN.md).
+    ("GET", re.compile(r"^/api/egress/rules$")),
     # Digits only, and bounded: the id goes straight into a path segment, and a
     # pattern that could match a slash or a dot-segment would be a path-traversal
     # primitive rather than an id.
-    ("POST", re.compile(r"^/api/rules/[0-9]{1,19}/revoke$")),
+    ("POST", re.compile(r"^/api/egress/rules/[0-9]{1,19}/revoke$")),
     ("GET", re.compile(r"^/api/config$")),
     ("POST", re.compile(r"^/api/saturation/ack$")),
 )

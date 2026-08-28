@@ -43,7 +43,7 @@ form of the same list and is still served here, but the UI does not use it and t
 frontend no longer relays it — see _RELAY_ROUTES in control-plane-ui/app.py. Four
 read-only views back the rest of that UI: GET /api/audit (recent decisions, folded),
 GET /api/audit/events (the same record unfolded, filtered and paged — the two are one
-per ``audit.py``'s glance/record split), GET /api/rules (the standing policy — see
+per ``audit.py``'s glance/record split), GET /api/egress/rules (the standing policy — see
 ``api_rules`` for why that one has to be visible) and GET /api/config (the hold
 window, so a card can show its countdown):
   - allow-once / deny-once     — decide just this request
@@ -753,7 +753,7 @@ def _audit_view(row) -> dict:
     return out
 
 
-@app.get("/api/rules")
+@app.get("/api/egress/rules")
 def api_rules() -> list[dict]:
     """Read-only view of the policy store — the rules that decide every request.
 
@@ -832,7 +832,7 @@ def api_saturation_ack(req: AckRequest) -> dict:
                 "rejections": total}
 
 
-@app.post("/api/rules/{rule_id}/revoke")
+@app.post("/api/egress/rules/{rule_id}/revoke")
 def revoke_rule(rule_id: int, request: Request) -> JSONResponse:
     """Remove one operator-created rule. The other half of a governance plane that
     could grant but never take back.

@@ -1732,7 +1732,7 @@ a `(n)` title prefix so the background tab nobody watches still shows the count.
 specifics (lamp opacity, `href`-reassignment throttling) are in `app.js`. A real audit
 browser (filter/search/history) is step 2c; this is the navigation it will extend.
 
-**Standing policy is visible in the UI (`GET /api/rules`).** The UI showed
+**Standing policy is visible in the UI (`GET /api/egress/rules`).** The UI showed
 pending approvals and recent decisions but never the **rules** — the thing that
 actually decides every request. So answering "what have I permanently allowed?" meant
 `docker compose exec` plus SQL against the volume, and in practice rules accumulated
@@ -1751,7 +1751,7 @@ keep twice over now — the same words label the candidates in the persist confi
 so what an approval promises to write and what the policy view later shows it wrote are
 described identically.
 
-**Taking a rule back (`POST /api/rules/{id}/revoke`).** A governance plane that can
+**Taking a rule back (`POST /api/egress/rules/{id}/revoke`).** A governance plane that can
 grant but never revoke is half a plane, and until this landed a mistaken `+ persist`
 was permanent short of hand-editing SQLite in the volume. Four decisions worth
 recording, because none of them is the obvious one:
@@ -1820,10 +1820,11 @@ lands in its own, with the gateway (see "Tool policy gets its own table"), so th
 config surface treats a second governed service as a surface with its own policy and
 not as a filter over this one.
 
-**URLs carry the surface: `/api/egress/rules` now, `/api/mcp/rules` with the
-gateway.** `/api/rules` is a generic name on a specific thing, and the rename is
-cheapest before 2c-2 hangs a POST and a config surface off it — today the only
-consumers are the UI and the relay's path allowlist. The lifecycle endpoints keep
+**URLs carry the surface.** `/api/egress/rules` is the standing-policy view and
+`/api/egress/rules/{id}/revoke` takes a rule back; the gateway later adds
+`/api/mcp/rules`. The `/api/rules` it replaced was a generic name on a specific thing,
+and the rename landed before 2c-2 hung a POST and a config surface off it, while the
+only consumers were the UI and the relay's path allowlist. The lifecycle endpoints keep
 unprefixed names (`/approvals`, `/approvals/stream`, `/approvals/{id}/resolve`), so
 the URL shape states the split itself: prefixed is per-surface policy, unprefixed is
 the one queue every surface feeds (see "`approvals` splits the same way"). The shape

@@ -294,10 +294,10 @@ class RelayAllowlistTests(unittest.TestCase):
     def test_ui_paths_are_relayed(self):
         for path, method in (("approvals/stream", "GET"),
                              ("api/audit", "GET"), ("api/audit/events", "GET"),
-                             ("api/rules", "GET"),
+                             ("api/egress/rules", "GET"),
                              ("api/config", "GET"),
                              ("approvals/0123abcd/resolve", "POST"),
-                             ("api/rules/12/revoke", "POST")):
+                             ("api/egress/rules/12/revoke", "POST")):
             self._proxy(path, method)
             self.assertEqual(urlsplit(_sent["url"]).netloc, "control-plane:8090",
                              f"{method} {path} must relay")
@@ -321,7 +321,7 @@ class RelayAllowlistTests(unittest.TestCase):
                              # The rules VIEW is read-only; revocation has its own
                              # path. Config is read-only outright — the UI reads
                              # settings, it does not set them.
-                             ("api/rules", "POST"), ("api/config", "POST"),
+                             ("api/egress/rules", "POST"), ("api/config", "POST"),
                              # The audit views are reads, and each is its OWN entry:
                              # anchoring `^/api/audit` without the `$` would relay
                              # every future path under that prefix sight unseen,
@@ -335,11 +335,19 @@ class RelayAllowlistTests(unittest.TestCase):
                              # dot-segments, which httpx resolves upstream into a
                              # different path than the one the allowlist approved.
                              # Widening it to `[^/]+` passes every other test here.
-                             ("api/rules/../revoke", "POST"),
-                             ("api/rules/1.2/revoke", "POST"),
-                             ("api/rules/abc/revoke", "POST"),
-                             ("api/rules//revoke", "POST"),
-                             ("api/rules/12/revoke", "GET")):
+                             ("api/egress/rules/../revoke", "POST"),
+                             ("api/egress/rules/1.2/revoke", "POST"),
+                             ("api/egress/rules/abc/revoke", "POST"),
+                             ("api/egress/rules//revoke", "POST"),
+                             ("api/egress/rules/12/revoke", "GET"),
+                             # The PRE-RENAME paths, asserted gone rather than left
+                             # to rot. A rename that adds the new entry and forgets
+                             # to drop the old one relays both, and every other test
+                             # here passes: the UI calls the new path and never
+                             # notices the old one still works. See "URLs carry the
+                             # surface" in DESIGN.md.
+                             ("api/rules", "GET"),
+                             ("api/rules/12/revoke", "POST")):
             resp = self._proxy(path, method)
             self.assertEqual(getattr(resp, "status_code", None), 403,
                              f"{method} {path} must be refused")
@@ -352,7 +360,7 @@ class ProvenanceHeaderTests(unittest.TestCase):
 
     def _relay_headers(self, request):
         _sent.clear()
-        asyncio.run(ui.proxy("api/rules", request))
+        asyncio.run(ui.proxy("api/egress/rules", request))
         return _sent["headers"]
 
     def test_actor_header_is_set_from_the_observed_peer(self):
@@ -546,7 +554,7 @@ class BackendUnreachableTests(unittest.TestCase):
     page's hand-rolled reconnect reconnects from. Before it existed the exception
     became a 500 and the page sat blind on "reconnecting…" until a manual reload."""
 
-    def _proxy_with_dead_backend(self, path="api/rules", method="GET"):
+    def _proxy_with_dead_backend(self, path="api/egress/rules", method="GET"):
         async def _boom(_req, stream=False):
             raise sys.modules["httpx"].RequestError("connection refused")
 
@@ -585,7 +593,7 @@ class RelayHostPinningTests(unittest.TestCase):
 
     def test_normal_paths_reach_the_backend(self):
         # {path:path} captures these WITHOUT a leading slash.
-        for p in ("api/rules", "approvals/stream", "api/audit"):
+        for p in ("api/egress/rules", "approvals/stream", "api/audit"):
             self.assertEqual(self._upstream_host(p), "control-plane:8090",
                              f"normal path {p!r} must relay to the backend")
 

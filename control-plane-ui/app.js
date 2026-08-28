@@ -1681,7 +1681,7 @@ function start() {
   async function refreshRules() {
     let rows;
     try {
-      const res = await fetch("/api/rules");
+      const res = await fetch("/api/egress/rules");
       // `res.ok` checked, not just the parse: a 4xx/5xx body would otherwise flow
       // into .json() and either throw somewhere less obvious or — worse — parse
       // into something that renders as an empty but SUCCESSFUL policy.
@@ -1762,7 +1762,7 @@ function start() {
     if (!window.confirm(`${p.text}\n\nRevoke ${p.pattern}?`)) return;
     btn.disabled = true;
     try {
-      const res = await fetch(`/api/rules/${encodeURIComponent(btn.dataset.rule)}/revoke`,
+      const res = await fetch(`/api/egress/rules/${encodeURIComponent(btn.dataset.rule)}/revoke`,
                               { method: "POST" });
       const body = await res.json().catch(() => ({}));
       if (!res.ok || !body.ok) {

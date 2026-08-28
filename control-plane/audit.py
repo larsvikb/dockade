@@ -44,7 +44,7 @@ from __future__ import annotations
 # as a constant with the call sites — the writer takes ``decision`` as a plain string
 # from four different places, and a new word appearing there without appearing here
 # would make its rows unfilterable while every other test passed.
-DECISIONS = ("allow", "deny", "hold", "revoke")
+DECISIONS = ("allow", "deny", "hold", "revoke", "create")
 
 # Columns ``q`` searches, PER VIEW, and the rule is that a view searches exactly what
 # it DISPLAYS. Anything else produces the worst kind of result list: rows whose visible

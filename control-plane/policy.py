@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import re
 
 import store
 
@@ -83,6 +84,20 @@ def _parse_client_classes(spec: str) -> tuple[tuple[str, object], ...]:
 
 CLIENT_CLASSES = _parse_client_classes(
     os.environ.get("CONTROL_CLIENT_CLASSES", CLIENT_CLASSES_DEFAULT))
+
+
+def _class_names() -> tuple[str, ...]:
+    """Every configured class name, in listed order, deduplicated.
+
+    A class may span several CIDRs, so the parsed pairs repeat names; this is the set
+    a rule may legitimately be scoped TO. UNCLASSIFIED is absent by construction —
+    ``_parse_client_classes`` refuses it as a name — which is what makes this usable
+    as the validation list for an operator-supplied class without a second exclusion."""
+    seen: list[str] = []
+    for name, _ in CLIENT_CLASSES:
+        if name not in seen:
+            seen.append(name)
+    return tuple(seen)
 
 
 def _client_class(client: str | None) -> str:
@@ -179,6 +194,83 @@ def _persist_candidates(host: str) -> list[str]:
         if pattern not in out:
             out.append(pattern)
     return out
+
+
+# What a stored pattern may contain, per label. Deliberately narrower than DNS
+# permits: this is the charset of a hostname an agent could actually ask for, and a
+# pattern outside it can only ever be a typo or an injection attempt, never a rule
+# that decides anything. Underscore is in because service names (`_dns.example.com`)
+# use it and a resolver will happily be asked for one.
+_LABEL_RE = re.compile(r"^[a-z0-9_-]+$")
+# The DNS name ceiling. A bound rather than a semantic check: patterns are stored,
+# listed in full by the rules view and compared on every decision, so an unbounded
+# one is a way to bloat the crown-jewel store through a governance endpoint.
+_PATTERN_MAX_LEN = 253
+
+
+def _normalize_pattern(pattern: str) -> str:
+    """A pattern as the store holds it: trimmed, lowercased, trailing FQDN dot removed.
+
+    The single definition of that shape, because two paths now write rules — a
+    ``*_persist`` approval (whose candidates ``_persist_candidates`` already produces
+    in this form) and direct operator creation — and a pattern normalized differently
+    by one of them is a rule that silently never matches. ``_decide`` lowercases the
+    host and strips its trailing dot before comparing, so anything this does not
+    remove here is a mismatch that reads, in the rules view, as policy in force.
+
+    A LEADING dot survives: it is the subdomain-wildcard marker (``_match``), which is
+    why this cannot be the ``.strip('.')`` used for a host."""
+    p = (pattern or "").strip().lower()
+    return "." + p[1:].rstrip(".") if p.startswith(".") else p.rstrip(".")
+
+
+def _rule_error(pattern: str, action: str) -> str | None:
+    """Why ``pattern`` cannot be stored as an ``action`` rule, or None if it can.
+    Expects an already-``_normalize_pattern``'d pattern.
+
+    The validation an operator-supplied pattern needs and a persisted one does not:
+    ``_persist_candidates`` derives its patterns from a host the proxy observed, so
+    they are well-formed and bounded by construction. Here the string comes from a
+    caller, and a rule is standing policy — a malformed one is refused outright rather
+    than stored inert, because an inert rule reads as policy in force in the rules view
+    and the operator stops asking why the host is still being held.
+
+    **The wildcard floor applies to ALLOW only, and the asymmetry is the point.** A
+    one-label wildcard is ``.com``: as an allow it ends governance for an entire TLD in
+    one call, silently — nothing afterwards raises a hold to notice it by. As a block
+    it only ever tightens, it announces itself the first time anything is denied, and
+    it is revocable. Refusing both would mean the broadest blocks — the ones most worth
+    writing — are the ones this endpoint cannot express."""
+    if action not in ("allow", "block"):
+        return f"action must be 'allow' or 'block', not {action!r}"
+    if not pattern:
+        return "pattern is empty"
+    if len(pattern) > _PATTERN_MAX_LEN:
+        return (f"pattern is {len(pattern)} characters; the DNS ceiling is "
+                f"{_PATTERN_MAX_LEN}")
+    wildcard = pattern.startswith(".")
+    body = pattern[1:] if wildcard else pattern
+    try:
+        ipaddress.ip_address(body.strip("[]"))
+    except ValueError:
+        pass
+    else:
+        # An address literal has no subdomains, so a leading dot on one cannot mean
+        # what it means everywhere else. Refused rather than silently accepted as an
+        # exact match: `._match` would compare it as a suffix and it would match
+        # nothing, which is the inert-rule failure this function exists to prevent.
+        return ("an IP address has no subdomains, so a leading dot cannot be a "
+                "wildcard over one") if wildcard else None
+    labels = body.split(".")
+    if not all(_LABEL_RE.match(label) for label in labels):
+        return (f"{pattern!r} is not a hostname pattern — expected labels of letters, "
+                f"digits, '-' or '_' separated by dots, optionally led by one dot for "
+                f"a subdomain wildcard")
+    if wildcard and action == "allow" and len(labels) < _WILDCARD_MIN_LABELS:
+        return (f"{pattern!r} is a wildcard over a single label, which as an allow "
+                f"grants everything under it — that needs at least "
+                f"{_WILDCARD_MIN_LABELS} labels (a block may be this broad)")
+    return None
 
 
 def _decide(host: str, client_class: str) -> tuple[str, str]:

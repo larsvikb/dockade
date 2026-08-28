@@ -74,8 +74,11 @@
   button.revoke[disabled] { opacity: .5; cursor: default; }
   /* A policy change in the decisions list. Not an egress decision, so it does not
      borrow allow/deny/hold colour — it is the operator acting on the rules those
-     decisions are made from. */
-  .tag.revoke { background: #3a2f18; color: var(--hold); }
+     decisions are made from. Both directions share the styling because they are the
+     same category of event: `create` writes a standing rule, `revoke` takes one back.
+     They are told apart by the WORD in the tag, which is the cue that survives for a
+     reader who cannot use hue. */
+  .tag.revoke, .tag.create { background: #3a2f18; color: var(--hold); }
   tr.outage > td { border-top: 1px solid var(--hold); }
   tr.outage > td:first-child { border-left: 3px solid var(--hold); }
   /* The audit `stage`, prefixed to the HOST it describes — `http · example.com`, which
@@ -210,6 +213,20 @@
   .filters .switch { display: flex; align-items: center; gap: 5px;
     color: var(--dim); font-size: 12px; white-space: nowrap; }
   .filters button { font-size: 12px; padding: 5px 10px; }
+  /* The add-rule form. Shaped like the filter bar above deliberately NOT: that bar is
+     plain because nothing in it changes anything, and this one writes standing policy.
+     The submit therefore carries the same weight as an approval button, and the live
+     preview below it says what the click will do before it is clicked. */
+  .ruleform { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+    margin-bottom: 8px; }
+  .ruleform input[type="text"] { font: inherit; font-size: 13px; flex: 1;
+    min-width: 220px; background: #202632; color: var(--fg);
+    border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+  .ruleform select { font: inherit; font-size: 13px; background: #202632;
+    color: var(--fg); border: 1px solid var(--line); border-radius: 6px;
+    padding: 5px 6px; }
+  .ruleform button { font-size: 12px; padding: 5px 10px; }
+  .ruleform :disabled { opacity: .5; cursor: default; }
   .pager { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
   .pager button { font-size: 12px; padding: 4px 10px; }
   /* The request cell. This is the one agent-controlled UNBOUNDED string rendered on
@@ -320,6 +337,7 @@
         <option value="deny">deny</option>
         <option value="hold">hold</option>
         <option value="revoke">revoke</option>
+        <option value="create">create</option>
       </select>
       <!-- Relative windows, not date pickers: the question is "since when". Values
            are the keys of AUDIT_WINDOWS in app.js, held equal by a test. -->
@@ -381,10 +399,41 @@
       Every request is decided by these rules before anything is held. Each rule
       decides for ONE client class &mdash; the &ldquo;for&rdquo; column &mdash; so a
       host allowed for the agent is still unknown to an MCP server, and is held the
-      first time one asks. Rules are written by &ldquo;+ persist&rdquo; approvals and
-      by the seed file; operator rules can be revoked here, seed rules only by
-      editing <code>policies/egress-allowlist.txt</code>.
+      first time one asks. Rules are written by &ldquo;+ persist&rdquo; approvals, by
+      the seed file, and by the form below; operator rules can be revoked here, seed
+      rules only by editing <code>policies/egress-allowlist.txt</code>.
     </div>
+    <!-- Config-first policy: state a position about a host BEFORE anything asks for
+         it. Everything else that writes a rule is downstream of a request the agent
+         already made, which made pre-authorizing a registry cost one blocked build and
+         made a pre-emptive block inexpressible.
+
+         A real <form>, so Enter submits and the controls are grouped for a screen
+         reader — and safe as one because the page's CSP sends `form-action 'none'`:
+         the submit handler always preventDefaults, and if the script ever failed to
+         load, the browser refuses the native POST rather than sending it somewhere. -->
+    <form class="ruleform" id="rule-form" autocomplete="off">
+      <input type="text" id="rule-pattern" spellcheck="false" autocapitalize="off"
+             placeholder="example.com, or .example.com for subdomains"
+             aria-label="Rule pattern">
+      <select id="rule-action" aria-label="Rule action">
+        <option value="allow">allow</option>
+        <option value="block">block</option>
+      </select>
+      <!-- Filled from /api/config, never guessed: the backend refuses a class it does
+           not know, so a hardcoded list would offer rules that cannot be written. -->
+      <select id="rule-class" aria-label="Client class this rule decides for"></select>
+      <button type="submit" id="rule-add">add rule</button>
+    </form>
+    <!-- What the button will do, in the world rather than in the table — the same
+         discipline the revoke confirm and the persist preview follow. Also where the
+         backend's refusal lands, because the checks this page mirrors are deliberately
+         only a subset (see createPreview in app.js).
+
+         `aria-live`, because the text changes as a consequence of typing elsewhere: a
+         sighted operator sees it appear, and without this nobody else would. Polite,
+         not assertive — it must not interrupt the field being typed into. -->
+    <div class="empty" id="rule-preview" aria-live="polite" hidden></div>
     <table>
       <thead><tr><th>action</th><th>pattern</th><th>matches</th><th>for</th>
         <th>source</th><th>added</th><th></th></tr></thead>

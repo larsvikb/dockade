@@ -136,6 +136,11 @@ _RELAY_ROUTES = (
     # gateway's `/api/mcp/rules` lands as its own entry rather than widening this one
     # (see "URLs carry the surface" in DESIGN.md).
     ("GET", re.compile(r"^/api/egress/rules$")),
+    # The write half of that view. A SEPARATE entry from the GET above rather than a
+    # method list on one, because the two differ in consequence and not only in verb:
+    # this one grants egress (a standing allow decides future requests with no hold and
+    # no click), which puts it in the same class as the resolve entry.
+    ("POST", re.compile(r"^/api/egress/rules$")),
     # Digits only, and bounded: the id goes straight into a path segment, and a
     # pattern that could match a slash or a dot-segment would be a path-traversal
     # primitive rather than an id.

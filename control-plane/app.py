@@ -52,18 +52,26 @@ window, so a card can show its countdown):
     rule is the operator's choice from a bounded set derived from the requested host
     (``policy._persist_candidates``), not a string the agent's request can supply.
 
-Resolving a hold is the one privileged action in this system — it is what grants
-egress — so every resolution records the PROVENANCE of whoever performed it
-(``_actor``), both on the durable approvals row (``resolved_by``) and in the audit
-reason. That is detection, not prevention: the self-reported fields are forgeable
-by a host-local caller. It exists so a forged approval is at least visible in the
+Standing policy is also editable directly, which is the half that does not begin with
+a request: POST /api/egress/rules writes a rule (``create_rule``) and POST
+/api/egress/rules/{id}/revoke takes one back (``revoke_rule``). The pattern there IS
+caller-supplied — there is no held host to derive candidates from — so that path
+validates it (``policy._rule_error``) where the persist path constrains it.
+
+Granting egress is the privileged act here, and there are two ways to perform it:
+resolving a hold, and writing a standing rule outright (``create_rule``, the config-
+first half of policy — the other three rule paths are all downstream of a request the
+agent already made). Both record the PROVENANCE of whoever did it (``_actor``) — on
+the durable approvals row (``resolved_by``) and in the audit reason for a resolution,
+in the audit reason for a rule written or revoked. That is detection, not prevention:
+the self-reported fields are forgeable by a host-local caller. It exists so a forged approval is at least visible in the
 record afterwards, which it previously was not — an operator's click and a
 scripted POST were indistinguishable once written.
 
 TWO LISTENERS, on two networks, because the dangerous surface is the management
-API and not `/authorize`. Resolving a hold GRANTS egress, so anything that reaches
-`resolve` can self-approve, while `/authorize` can only ever answer a policy
-question. They are therefore served separately (``main``):
+API and not `/authorize`. Both ways of granting egress live on the management one —
+`resolve` and `create_rule` — so anything that reaches it can self-approve, while
+`/authorize` can only ever answer a policy question. They are therefore served separately (``main``):
 
   - the AUTHORIZE listener (CONTROL_AUTHORIZE_PORT, on authorize-net) serves
     exactly POST /authorize and GET /healthz — ``authorize_app`` below. It is the
@@ -218,6 +226,22 @@ class ResolveRequest(BaseModel):
     # ``policy._persist_candidates``; omitted means the narrowest of them (the exact
     # host). Ignored by the two `*_once` actions, which write no rule at all.
     pattern: str | None = None
+
+
+class RuleCreateRequest(BaseModel):
+    # Validated and normalized server-side (policy._normalize_pattern / _rule_error).
+    # Unlike a `*_persist` pattern, this one is not chosen from a derived candidate set
+    # — there is no held request to derive one from — so this model is the widest input
+    # in the service, and ``create_rule`` is where that is answered for.
+    pattern: str
+    action: str                    # allow | block
+    # Required, with no default. A default would be a class the caller did not name,
+    # and every wrong guess is a rule that decides for a population the operator did
+    # not mean — silently, since a mis-scoped rule looks correct in the rules view.
+    client_class: str
+    # NOTE the field that is absent: ``source``. It is server-set to 'operator' and
+    # must never be caller-supplied, because 'seed' is the value ``revoke_rule``
+    # refuses to delete — a caller that could set it could write an UNREVOCABLE rule.
 
 
 class AckRequest(BaseModel):
@@ -773,9 +797,11 @@ def api_rules() -> list[dict]:
     order ``policy._decide`` applies: it filters to the asking client's class and only
     then lets a block win over an allow. A flat alphabetical listing would put two
     rules for the same pattern in different classes side by side and imply they
-    interact, which is the one thing they do not do.  Read-only on purpose:
-    this change makes policy visible, it does not add mutation (see the rule-management
-    item in DESIGN.md for what revocation still needs)."""
+    interact, which is the one thing they do not do.
+
+    Read-only itself: the writes on this path are ``create_rule`` (POST here) and
+    ``revoke_rule``, and what neither of them offers is an atomic EDIT — see the
+    rule-mutation item in DESIGN.md."""
     with store._connect() as conn:
         rows = conn.execute(
             "SELECT id, pattern, action, source, created_at, client_class FROM rules "
@@ -793,12 +819,18 @@ def api_config() -> dict:
     """The settings the UI cannot behave correctly without knowing. Read-only, and
     non-secret by construction — nothing here decides anything.
 
-    Just the hold window today, and that one is load-bearing: a held request BLOCKS the
-    agent and default-denies after ``holds.HOLD_TIMEOUT``, so a card that cannot say
-    how long is left cannot distinguish hold-for-approval from a slow deny. Sent rather
-    than hardcoded in the page, so the number the operator sets is the number they
-    see."""
-    return {"hold_timeout": holds.HOLD_TIMEOUT}
+    The hold window is load-bearing: a held request BLOCKS the agent and default-denies
+    after ``holds.HOLD_TIMEOUT``, so a card that cannot say how long is left cannot
+    distinguish hold-for-approval from a slow deny. Sent rather than hardcoded in the
+    page, so the number the operator sets is the number they see.
+
+    The client classes are here for the same reason and a sharper one: ``create_rule``
+    refuses a class it does not know, so a page that guesses the list offers rules that
+    cannot be written. Deriving it from the RULES instead would be worse than guessing —
+    a class with no rules yet would be missing from the form, which is exactly the case
+    where an operator most needs to write the first one (a fresh MCP server, say)."""
+    return {"hold_timeout": holds.HOLD_TIMEOUT,
+            "client_classes": list(policy._class_names())}
 
 
 @app.post("/api/saturation/ack")
@@ -830,6 +862,107 @@ def api_saturation_ack(req: AckRequest) -> dict:
             holds._SATURATION["acked_ts"] = time.time()
         return {"ok": True, "acknowledged": holds._SATURATION["acked"],
                 "rejections": total}
+
+
+@app.post("/api/egress/rules")
+def create_rule(req: RuleCreateRequest, request: Request) -> JSONResponse:
+    """Write a standing rule directly, without a held request to hang it on.
+
+    The missing verb. Until this existed, every rule in the store arrived one of two
+    ways: seeded from ``policies/egress-allowlist.txt`` at first boot, or persisted as
+    a side effect of resolving a hold. Both are REACTIVE — policy could only be stated
+    about a host the agent had already reached for, which meant pre-authorizing a known
+    registry required first letting a build block for the whole hold window, and
+    writing a BLOCK before anything asked for it was not expressible at all (the
+    resolve path only persists what a card was raised for).
+
+    Two properties of the resolve path do NOT carry over, and both are why this
+    endpoint is the one place in the service that validates a pattern properly:
+
+      - the pattern is not chosen from ``policy._persist_candidates``, because there
+        is no held host to derive candidates from. The bounded-choice guarantee that
+        makes a persist safe is unavailable here, so its job is done instead by
+        ``policy._rule_error`` — which is also why the wildcard floor lives there and
+        not in a check written inline here.
+      - the client class is not read off a durable approvals row, because there is no
+        request whose class was already settled. It is caller-supplied and therefore
+        checked against ``policy._class_names``: an unlisted class writes a rule that
+        matches nothing, and an inert rule is worse than a refused one — it reads as
+        policy in force in the rules view while every request it was meant to decide
+        keeps being held.
+
+    Off the authorize listener, like everything else that GRANTS (see the module
+    docstring). A rule written here decides egress with no hold and no click, which
+    makes this a stronger capability than ``resolve``: that one can only answer a
+    question something already asked.
+
+    Not idempotent-by-overwrite: an existing rule for the same (pattern, class) with
+    the OPPOSITE action is a 409, never a silent replace — the same refusal, for the
+    same reason, that ``resolve`` makes on its persist path. Nothing in this service
+    replaces a rule; revoke-then-create is the two-step, and it is deliberately
+    visible as two audit rows."""
+    actor = _actor(request)
+    pattern = policy._normalize_pattern(getattr(req, "pattern", "") or "")
+    action = (getattr(req, "action", "") or "").strip().lower()
+    client_class = (getattr(req, "client_class", "") or "").strip().lower()
+
+    error = policy._rule_error(pattern, action)
+    if error is not None:
+        return JSONResponse({"ok": False, "detail": error}, status_code=400)
+    classes = policy._class_names()
+    if client_class not in classes:
+        # A typo here is the quiet failure: `sandox` inserts cleanly, lists cleanly,
+        # and decides nothing. Named against the configured set so the refusal carries
+        # its own fix.
+        return JSONResponse(
+            {"ok": False,
+             "detail": f"client class {client_class!r} is not configured; rules can "
+                       f"be scoped to: {', '.join(classes) or '(none configured)'}",
+             "client_classes": list(classes)}, status_code=400)
+
+    with store._connect() as conn:
+        existing = conn.execute(
+            "SELECT id, action, source FROM rules WHERE pattern=? AND client_class=?",
+            (pattern, client_class)).fetchone()
+        if existing is not None and existing["action"] != action:
+            return JSONResponse(
+                {"ok": False,
+                 "detail": f"a standing rule for {pattern!r} already exists for client "
+                           f"class {client_class!r} and {existing['action']}s it; "
+                           f"nothing here replaces a rule. Revoke it first, or write a "
+                           f"different pattern.",
+                 "conflict": {"id": existing["id"], "pattern": pattern,
+                              "action": existing["action"], "source": existing["source"],
+                              "client_class": client_class}},
+                status_code=409)
+        if existing is not None:
+            # Same action already in force. Not an error — the policy asked for IS the
+            # policy — but reported as a non-write, so the caller can say "already in
+            # place" rather than confirming a rule it did not create. ``source`` rides
+            # along because it decides whether the rule can be taken back again.
+            return JSONResponse({"ok": True, "created": False, "already_present": True,
+                                 "id": existing["id"], "pattern": pattern,
+                                 "action": action, "source": existing["source"],
+                                 "client_class": client_class})
+        rule_id = conn.execute(
+            "INSERT INTO rules(pattern, action, source, created_at, client_class) "
+            "VALUES (?,?, 'operator', ?, ?)",
+            (pattern, action, time.time(), client_class)).lastrowid
+        conn.commit()
+
+    # Audited like a revocation, and for the stronger version of the same reason: this
+    # writes standing policy from nothing, so the record is the only thing that can
+    # answer where a rule came from once it is sitting in the table looking exactly
+    # like one a human approved at a card. The NORMALIZED pattern is what is recorded,
+    # because it is what was stored and therefore what decides.
+    store._audit("create", stage="policy", host=pattern, client_class=client_class,
+                 reason=f"{action} rule created by {actor}; {pattern} "
+                        f"({policy._pattern_scope(pattern)}) now {action}s for client "
+                        f"class {client_class} without being held for approval")
+    return JSONResponse({"ok": True, "created": True, "already_present": False,
+                         "id": rule_id, "pattern": pattern, "action": action,
+                         "source": "operator", "client_class": client_class},
+                        status_code=201)
 
 
 @app.post("/api/egress/rules/{rule_id}/revoke")

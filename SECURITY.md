@@ -147,20 +147,23 @@ report.
 - **Resource limits not containing anything.** They bound blast radius so the wrong
   container is not OOM-killed; nothing in the threat model rests on them. See
   *Resource limits — blast radius, not boundary*.
-- **The policy store having no atomic *edit*.** Revoking an operator-created rule is
-  built (`POST /api/egress/rules/{id}/revoke`, in the Policy view); what is not is changing a
-  rule's pattern or flipping its action in one step — that stays revoke-then-persist,
-  two audit rows for one intent, with a window in which the host is held rather than
-  allowed or blocked. A persist that would contradict an existing rule is refused
-  rather than applied (nothing here overwrites a rule). Known and on the roadmap — see
-  the rule-mutation item under *Future improvements*.
+- **The policy store having no atomic *edit*.** Writing a rule and revoking one are
+  both built (`POST /api/egress/rules` and `POST /api/egress/rules/{id}/revoke`, in the
+  Policy view); what is not is changing a rule's pattern or flipping its action in one
+  step — that stays revoke-then-create, two audit rows for one intent, with a window in
+  which the host is held rather than allowed or blocked. Neither path overwrites a rule:
+  a write that would contradict an existing one is refused. Known and on the roadmap —
+  see the rule-mutation item under *Future improvements*.
   *(This bullet also said a persisted rule's scope came from the requested hostname,
   a leading dot being a subdomain wildcard. That is no longer true and is corrected:
   the requester cannot choose the scope. A leading dot is normalised away, and the
   operator picks from a bounded candidate set the backend derives and re-validates on
   resolve, with the exact host as the default. Reported scope escalation is still very
   much in scope — a way to make a persist store something outside that set is a real
-  finding.)*
+  finding. The direct write is the one path where an operator DOES supply a pattern; it
+  is validated rather than bounded, and a way past that validation — a stored pattern
+  broader than what was asked for, or one that decides for a class the caller did not
+  name — is equally a finding.)*
 - **Resource exhaustion and availability, except where pressure becomes permission.**
   There is no service here and no other tenant to deny — the agent making its own
   sandbox slow, filling its own workspace or burning its own CPU is a local nuisance,

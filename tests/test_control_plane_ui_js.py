@@ -65,7 +65,7 @@ _PROBE = r"""
 const m = require(process.env.DOCKADE_APP_JS);
 const missing = ["lampState", "backoffDelay", "diffPending", "shouldSweep",
                  "holdRemaining", "countdownState", "departure", "persistPreview",
-                 "normalizePattern", "createPreview",
+                 "normalizePattern", "createPreview", "editPreview",
                  "saturationState", "ackCount", "capScope", "requestsLabel",
                  "auditRow", "auditStatus", "rulesStatus", "repeatCount",
                  "timeWindow", "filterActive", "auditQuery", "eventRow",
@@ -488,6 +488,44 @@ console.log(JSON.stringify({
         // An unrecognised action must preview as the SAFER reading.
         unknown_action: m.createPreview("example.com", "", "sandbox", []),
       },
+      edit: (() => {
+        const rule = { id: 7, pattern: ".example.com", action: "allow",
+                       client_class: "sandbox", source: "operator" };
+        const blockRule = { id: 7, pattern: "evil.example", action: "block",
+                            client_class: "sandbox", source: "operator" };
+        return {
+          // Narrowing an allow: the subtree stops being allowed and one host starts.
+          // Both halves have to be in the text or the confirm describes half an edit.
+          narrowed: m.editPreview(rule, "api.example.com", "allow", [rule]),
+          // Flipping an action on the same pattern. The rule holds its OWN pattern, so
+          // this is the case a naive conflict check would refuse (the backend's `id<>?`).
+          flipped: m.editPreview(blockRule, "evil.example", "allow", [blockRule]),
+          tightened: m.editPreview(rule, ".example.com", "block", [rule]),
+          // Narrowing a BLOCK loosens: the hosts falling out from under it stop being
+          // denied. Flagged, which is why the old action matters and not only the new.
+          narrowed_block: m.editPreview(blockRule, "one.evil.example", "block",
+                                        [blockRule]),
+          unchanged: m.editPreview(rule, ".example.com", "allow", [rule]),
+          normalized: m.editPreview(rule, "  API.Example.COM.  ", "allow", [rule]),
+          tld_allow: m.editPreview(rule, ".com", "allow", [rule]),
+          tld_block: m.editPreview(rule, ".com", "block", [rule]),
+          // Another rule already holding the target, versus the same pattern in another
+          // class — which is not a collision, because uniqueness is the pair.
+          conflict: m.editPreview(rule, "evil.example", "allow",
+            [rule, { id: 9, pattern: "evil.example", action: "block",
+                     client_class: "sandbox" }]),
+          other_class: m.editPreview(rule, "evil.example", "allow",
+            [rule, { id: 9, pattern: "evil.example", action: "block",
+                     client_class: "mcp" }]),
+          seed: m.editPreview({ id: 7, pattern: "pypi.org", action: "allow",
+                                client_class: "sandbox", source: "seed" },
+                              "evil.example", "allow", []),
+          // The row went away under the form.
+          gone: m.editPreview(undefined, "example.com", "allow", []),
+          empty: m.editPreview(rule, "", "allow", [rule]),
+          unknown_action: m.editPreview(rule, "api.example.com", "", [rule]),
+        };
+      })(),
       announce: {
         nothing: m.pendingAnnouncement([], 0),
         no_list: m.pendingAnnouncement(null, 0),
@@ -1232,8 +1270,8 @@ class PageScriptTests(unittest.TestCase):
         self.assertTrue(create["tld_block"]["ok"])
 
     def test_a_conflicting_rule_is_reported_with_its_fix(self):
-        # Nothing in this system replaces a rule, so the next step is "revoke that one
-        # first" — and the rule in question is on screen already.
+        # Nothing ADDED here replaces a rule, so the next step is to revoke or edit the
+        # one in the way — and it is on screen already.
         c = self.probe["saturation"]["create"]["conflict"]
         self.assertFalse(c["ok"])
         self.assertTrue(c["conflict"])
@@ -1267,6 +1305,83 @@ class PageScriptTests(unittest.TestCase):
         c = self.probe["saturation"]["create"]["unknown_action"]
         self.assertEqual(c["verb"], "block")
         self.assertFalse(c["danger"])
+
+    def test_an_edit_preview_states_both_halves_of_the_transition(self):
+        """The only operation on this page that takes something away and gives something
+        back in one click, so a preview naming just the end state describes half of what
+        the operator is agreeing to."""
+        e = self.probe["saturation"]["edit"]["narrowed"]
+        self.assertTrue(e["ok"])
+        self.assertIn(".example.com", e["text"])            # what it was
+        self.assertIn("no longer be allowed", e["text"])
+        self.assertIn("api.example.com", e["text"])         # what it becomes
+        self.assertIn("without being held for approval", e["text"])
+
+    def test_an_action_flip_is_previewed_not_refused_as_a_conflict(self):
+        """A rule always holds its own pattern, so the conflict check has to exclude the
+        row being edited — the frontend half of the backend's ``id<>?`` clause. Without
+        it every action flip previews as a collision with itself."""
+        e = self.probe["saturation"]["edit"]["flipped"]
+        self.assertTrue(e["ok"])
+        self.assertFalse(e["conflict"])
+        self.assertIn("currently block", e["text"])
+
+    def test_both_loosening_directions_are_flagged_not_only_the_new_action(self):
+        """What makes this different from createPreview, which only has a new action to
+        judge. Narrowing a BLOCK loosens — the hosts falling out from under it stop being
+        denied — so the old action decides the warning as much as the new one."""
+        edit = self.probe["saturation"]["edit"]
+        self.assertTrue(edit["narrowed"]["danger"])         # ends as an allow
+        self.assertTrue(edit["narrowed_block"]["danger"])   # stops blocking some hosts
+        self.assertFalse(edit["tightened"]["danger"])       # allow -> block, strictly
+
+    def test_an_edit_that_changes_nothing_is_reported_rather_than_sent(self):
+        e = self.probe["saturation"]["edit"]["unchanged"]
+        self.assertFalse(e["ok"])
+        self.assertTrue(e["unchanged"])
+        self.assertIn("Nothing to change", e["text"])
+
+    def test_the_edit_preview_quotes_the_pattern_that_will_be_stored(self):
+        e = self.probe["saturation"]["edit"]["normalized"]
+        self.assertEqual(e["pattern"], "api.example.com")
+        self.assertIn("api.example.com", e["text"])
+
+    def test_the_wildcard_floor_applies_to_an_edit_too(self):
+        # The same asymmetry, on the operation that can walk a narrow allow outward one
+        # save at a time — which is the shape this floor exists to stop.
+        edit = self.probe["saturation"]["edit"]
+        self.assertFalse(edit["tld_allow"]["ok"])
+        self.assertTrue(edit["tld_block"]["ok"])
+
+    def test_an_edit_onto_another_rule_is_a_conflict_and_not_a_merge(self):
+        edit = self.probe["saturation"]["edit"]
+        self.assertFalse(edit["conflict"]["ok"])
+        self.assertTrue(edit["conflict"]["conflict"])
+        self.assertIn("Revoke", edit["conflict"]["text"])
+        # And the same pattern in ANOTHER class is not one — uniqueness is the pair.
+        self.assertTrue(edit["other_class"]["ok"])
+        self.assertFalse(edit["other_class"]["conflict"])
+
+    def test_a_seed_rule_previews_as_uneditable_with_the_reason(self):
+        # The backend refuses it too; this is the explanation, not the control — the
+        # same division revokePreview draws.
+        e = self.probe["saturation"]["edit"]["seed"]
+        self.assertFalse(e["ok"])
+        self.assertIn("egress-allowlist.txt", e["text"])
+
+    def test_a_rule_that_vanished_under_the_form_says_so(self):
+        """Revoked in another tab while the form was open. The alternative is a disabled
+        button with an empty preview, which reads as the page being broken."""
+        e = self.probe["saturation"]["edit"]["gone"]
+        self.assertFalse(e["ok"])
+        self.assertIn("no longer in the table", e["text"])
+
+    def test_an_incomplete_or_unrecognised_edit_previews_safely(self):
+        edit = self.probe["saturation"]["edit"]
+        self.assertFalse(edit["empty"]["ok"])
+        self.assertEqual(edit["empty"]["text"], "")
+        # Same rule the create form follows: an unknown action reads as the block.
+        self.assertEqual(edit["unknown_action"]["verb"], "block")
 
     def test_the_list_says_when_it_is_a_window(self):
         """Forty rows silently stood for the whole record. Grouping made that worse,
@@ -2021,6 +2136,62 @@ class CreateRuleSourceTests(unittest.TestCase):
         self.assertIsNotNone(options, "renderClassOptions not found — renamed?")
         self.assertIn("clientClasses.map", options.group(1))
         self.assertNotIn("rulesById", options.group(1))
+
+
+class EditRuleSourceTests(unittest.TestCase):
+    """The edit path lives in `start()` too, and it has three failure modes the pure
+    ``editPreview`` tests cannot reach — all of them the kind that leaves the page
+    looking like it worked."""
+
+    def setUp(self):
+        self.src = APP_JS.read_text()
+        self.body = re.search(r"async function submitEdit\(p\)\s*\{.*?\n  \}",
+                              self.src, re.S)
+        self.assertIsNotNone(self.body, "the edit submit handler moved — renamed?")
+
+    def test_the_body_carries_the_pattern_that_was_confirmed(self):
+        # The create path's twin, and the same failure: `p.pattern` is normalized and
+        # the input box is not, so sending the raw value stores a rule the confirm never
+        # described.
+        body = self.body.group(0)
+        self.assertRegex(body, r"pattern:\s*p\.pattern")
+        self.assertNotRegex(body, r"pattern:\s*rulePatternEl\.value")
+
+    def test_the_client_class_is_never_sent(self):
+        """The backend has no such field, so sending one would be silently ignored —
+        which is worse than an error, because the UI would appear to offer a re-scope
+        that never happens.
+
+        Scoped to the REQUEST body: the success notice reads `body.client_class` back
+        off the response to say who the rule decides for, which is the opposite of
+        sending one."""
+        sent = re.search(r"body:\s*JSON\.stringify\(\{(.*?)\}\)",
+                         self.body.group(0), re.S)
+        self.assertIsNotNone(sent, "the edit request body moved — restructured?")
+        self.assertNotIn("client_class", sent.group(1))
+
+    def test_an_edit_that_wrote_nothing_is_not_reported_as_a_write(self):
+        self.assertIn("body.changed === false", self.body.group(0))
+
+    def test_a_config_poll_cannot_unlock_the_class_picker_mid_edit(self):
+        """`renderClassOptions` re-enables every control from the config poll, which runs
+        on a timer. Without the guard it re-enables the picker under an open edit, and
+        the operator can select a class the edit will not apply — the form saying one
+        thing while the request says another."""
+        options = re.search(r"function renderClassOptions\(\)\s*\{(.*?)\n  \}",
+                            self.src, re.S)
+        self.assertIsNotNone(options, "renderClassOptions not found — renamed?")
+        self.assertRegex(options.group(1),
+                         r"editingRuleId !== null\)\s*ruleClassEl\.disabled = true")
+
+    def test_the_row_is_re_read_on_every_preview_rather_than_captured(self):
+        """The form holds an id, not a row. Capturing the row at entry would preview
+        against a rule that may have been revoked or changed by a poll since — and then
+        write over whatever replaced it."""
+        current = re.search(r"function currentPreview\(\)\s*\{(.*?)\n  \}",
+                            self.src, re.S)
+        self.assertIsNotNone(current, "currentPreview not found — renamed?")
+        self.assertIn("rulesById.get(editingRuleId)", current.group(1))
 
 
 class PersistConflictSourceTests(unittest.TestCase):

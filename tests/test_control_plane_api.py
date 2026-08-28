@@ -872,6 +872,174 @@ def _served(**kw):
     return cp.api_audit(**kw)["rows"]
 
 
+class EditRuleTests(_CPTestCase):
+    """``edit_rule`` — the third verb, and the one that makes the other two a plane
+    rather than a pair.
+
+    Create and revoke could express every END STATE already; what they could not
+    express is a TRANSITION. Narrowing `.example.com` to `api.example.com` meant
+    revoking and re-creating, which is two audit rows that each describe half of an
+    intent, and a window in between where the whole subtree was unknown and every
+    request under it was held one card at a time. The window failed closed, so this is
+    not a hole being closed — it is an operation that was being simulated by two."""
+
+    def _rule(self, pattern, action="allow", source="operator", client_class=CLASS):
+        with cp.store._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO rules(pattern, action, source, created_at, client_class) "
+                "VALUES (?,?,?,?,?)", (pattern, action, source, 1234.0, client_class))
+            conn.commit()
+            return cur.lastrowid
+
+    def _edit(self, rule_id, pattern, action, request=None):
+        return cp.edit_rule(rule_id, cp.RuleEditRequest(pattern=pattern, action=action),
+                            request if request is not None else _FakeRequest())
+
+    def test_an_action_flips_in_one_operation(self):
+        # Through `_decide`, like the create tests: the assertion is that policy moved,
+        # not that a column did.
+        rid = self._rule("evil.example", "block")
+        self.assertEqual(cp.policy._decide("evil.example", CLASS)[0], "deny")
+        resp = self._edit(rid, "evil.example", "allow")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(cp.policy._decide("evil.example", CLASS)[0], "allow")
+
+    def test_a_pattern_narrows_in_one_operation(self):
+        """The motivating case. Afterwards the subtree is unknown again and the one
+        host is allowed — and at no point was the rule absent."""
+        rid = self._rule(".example.com", "allow")
+        self._edit(rid, "api.example.com", "allow")
+        self.assertEqual(cp.policy._decide("api.example.com", CLASS)[0], "allow")
+        self.assertEqual(cp.policy._decide("other.example.com", CLASS)[0], "hold")
+
+    def test_the_rule_keeps_its_id_and_its_age(self):
+        """The same rule with different terms, not a new one. ``created_at`` says when
+        the policy came into force and the rules view sorts on it; the audit row is
+        where the change is dated."""
+        rid = self._rule("example.com", "allow")
+        self._edit(rid, "api.example.com", "block")
+        with cp.store._connect() as conn:
+            row = conn.execute("SELECT * FROM rules WHERE id=?", (rid,)).fetchone()
+        self.assertEqual(row["pattern"], "api.example.com")
+        self.assertEqual(row["action"], "block")
+        self.assertEqual(row["created_at"], 1234.0)
+        self.assertEqual(row["source"], "operator")
+
+    def test_the_stored_pattern_is_normalized(self):
+        rid = self._rule("example.com", "allow")
+        self._edit(rid, " .Example.NET. ", "allow")
+        with cp.store._connect() as conn:
+            self.assertEqual(
+                conn.execute("SELECT pattern FROM rules WHERE id=?",
+                             (rid,)).fetchone()["pattern"], ".example.net")
+
+    def test_a_seed_rule_is_refused_by_the_backend(self):
+        """Refused for a STRONGER reason than the revoke case. A revoked seed rule at
+        least leaves, and `_seed_if_empty` re-reads the file on the next empty-table
+        start; an edited one stays, deciding, while the reviewed file under version
+        control says something else about the same host."""
+        rid = self._rule("pypi.org", "allow", source="seed")
+        resp = self._edit(rid, "evil.example", "allow")
+        self.assertEqual(resp.status_code, 403)
+        self.assertIn("egress-allowlist.txt", json.dumps(resp.body))
+        with cp.store._connect() as conn:
+            self.assertEqual(
+                conn.execute("SELECT pattern FROM rules WHERE id=?",
+                             (rid,)).fetchone()["pattern"], "pypi.org")
+
+    def test_an_unknown_id_is_a_404_not_a_silent_success(self):
+        self.assertEqual(self._edit(999999, "example.com", "allow").status_code, 404)
+
+    def test_a_malformed_pattern_is_refused_and_changes_nothing(self):
+        rid = self._rule("example.com", "allow")
+        resp = self._edit(rid, "http://evil.example", "allow")
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(_rules(), {("example.com", "allow")})
+
+    def test_the_wildcard_floor_applies_here_too(self):
+        """``policy._rule_error`` is the whole of the validation, exactly as it is for
+        ``create_rule`` — there is no ``_persist_candidates`` bounded set behind an
+        edit either, so an unvalidated one would be the widest input in the service."""
+        rid = self._rule("example.com", "allow")
+        self.assertEqual(self._edit(rid, ".com", "allow").status_code, 400)
+        # Still permitted as a BLOCK, which is the asymmetry that floor encodes.
+        self.assertEqual(self._edit(rid, ".com", "block").status_code, 200)
+
+    def test_colliding_with_another_rule_is_a_conflict_not_a_merge(self):
+        """``UNIQUE(pattern, client_class)`` would otherwise surface as an opaque 500,
+        and silently merging two rules into one would lose whichever action lost."""
+        keep = self._rule("evil.example", "block")
+        rid = self._rule("other.example", "allow")
+        resp = self._edit(rid, "evil.example", "allow")
+        self.assertEqual(resp.status_code, 409)
+        # Both rules survive the refusal, unchanged.
+        self.assertEqual(_rules(), {("evil.example", "block"),
+                                    ("other.example", "allow")})
+        self.assertIn(str(keep), json.dumps(resp.body))
+
+    def test_changing_only_the_action_does_not_collide_with_itself(self):
+        """The bug the ``id<>?`` clause exists for: the row being edited already holds
+        the target pattern, so a naive uniqueness check refuses every action flip."""
+        rid = self._rule("evil.example", "block")
+        self.assertEqual(self._edit(rid, "evil.example", "allow").status_code, 200)
+
+    def test_a_rule_in_another_class_is_not_a_collision(self):
+        # Uniqueness is (pattern, class), and the edit stays inside its own class.
+        self._rule("evil.example", "block", client_class="mcp")
+        rid = self._rule("other.example", "allow")
+        self.assertEqual(self._edit(rid, "evil.example", "allow").status_code, 200)
+
+    def test_an_edit_that_changes_nothing_reports_a_non_write(self):
+        """The policy asked for IS the policy — not an error. Reported as a non-write
+        so nothing confirms a change, and so the log does not gain a row saying
+        standing policy moved on a request that moved nothing."""
+        rid = self._rule("example.com", "allow")
+        with mock.patch.object(cp.store, "_audit") as audit:
+            resp = self._edit(rid, "example.com", "allow")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIs(resp.body["changed"], False)
+        audit.assert_not_called()
+
+    def test_the_edit_is_audited_once_with_both_states(self):
+        """ONE row carrying the before AND the after. That is the whole difference from
+        revoke-then-create, which wrote two rows that each described half of an intent
+        with nothing tying them together."""
+        rid = self._rule(".example.com", "allow")
+        with mock.patch.object(cp.store, "_audit") as audit:
+            self._edit(rid, "api.example.com", "block",
+                       request=_FakeRequest(peer="172.31.0.9"))
+        self.assertEqual(audit.call_count, 1)
+        self.assertEqual(audit.call_args.args[0], "edit")
+        reason = audit.call_args.kwargs["reason"]
+        self.assertIn(".example.com", reason)          # what it was
+        self.assertIn("api.example.com", reason)       # what it is
+        self.assertIn("allow", reason)
+        self.assertIn("block", reason)
+        self.assertIn("peer=172.31.0.9", reason)
+        # `host` is the NEW pattern: it is what decides from now on.
+        self.assertEqual(audit.call_args.kwargs["host"], "api.example.com")
+
+    def test_a_refused_edit_is_not_audited(self):
+        rid = self._rule("example.com", "allow")
+        with mock.patch.object(cp.store, "_audit") as audit:
+            self._edit(rid, ".com", "allow")
+        audit.assert_not_called()
+
+    def test_the_client_class_is_not_editable(self):
+        """Not an omission. Moving a rule between classes takes policy from one
+        population and gives it to another, which is two changes wearing one audit row;
+        revoke-then-create says that honestly. This asserts the model stays shut, the
+        same way the create tests assert ``source`` does."""
+        rid = self._rule("example.com", "allow")
+        req = cp.RuleEditRequest(pattern="example.com", action="allow",
+                                 client_class="mcp")
+        cp.edit_rule(rid, req, _FakeRequest())
+        with cp.store._connect() as conn:
+            self.assertEqual(
+                conn.execute("SELECT client_class FROM rules WHERE id=?",
+                             (rid,)).fetchone()["client_class"], CLASS)
+
+
 class AuditViewTests(_CPTestCase):
     """``/api/audit`` backs the decisions table, and had no tests at all — which is
     how it went this long selecting ``stage`` that nothing rendered while omitting
@@ -2568,7 +2736,8 @@ class ApiSurfaceSplitTests(unittest.TestCase):
         writes = {r for r in _routes(cp.app)
                   if r[0] == "POST" and "/api/egress/rules" in r[1]}
         self.assertEqual(writes, {("POST", "/api/egress/rules"),
-                                  ("POST", "/api/egress/rules/{rule_id}/revoke")})
+                                  ("POST", "/api/egress/rules/{rule_id}/revoke"),
+                                  ("POST", "/api/egress/rules/{rule_id}/edit")})
         self.assertEqual(writes & _routes(cp.authorize_app), set())
 
     def test_the_views_that_read_the_store_are_management_only(self):

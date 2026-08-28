@@ -1578,10 +1578,12 @@ across one domain looks like, and it reproduces in a few lines.
 Refused before the `UPDATE`, matching the rejected-pattern branch beside it, so the
 approval stays pending and decidable rather than half-applying with the decision recorded
 and the rule not — which is exactly the state that branch's comment already called "the
-worst of both". Overwriting was the alternative and was declined: nothing in this system
-revokes a rule, so `ON CONFLICT DO UPDATE` would make a click the operator was never
-shown silently flip standing policy, and it would pre-empt the rule-mutation design
-rather than settle it.
+worst of both". Overwriting was the alternative and was declined: `ON CONFLICT DO UPDATE`
+would make a click the operator was never shown silently flip standing policy, and it
+would pre-empt the rule-mutation design rather than settle it. That design is now built
+and named (see "Changing a rule is one operation, not two"), which is what keeps this
+refusal honest rather than merely restrictive — replacing a rule is available, as an act
+the operator asks for by name and that records what it displaced.
 
 Two supporting changes make the refusal legible rather than surprising. `persisted` now
 reports **whether a row was written**, read from the insert's `rowcount` instead of from
@@ -1904,11 +1906,13 @@ files is what does *not* carry over from the persist path:
   guessing, because a class with no rules yet is exactly the one an operator needs to
   write the first rule for. `UNCLASSIFIED` is absent by construction rather than by
   exclusion — `_parse_client_classes` refuses it as a name.
-- **Nothing replaces a rule, here either.** An existing rule with the opposite action is
+- **A create still never replaces a rule.** An existing rule with the opposite action is
   a 409 with the conflict described; the same action is a 200 that reports it wrote
   nothing. Same refusal and same reasoning as the persist path (see "A persist cannot
-  overwrite, so one that would is refused") — revoke-then-create stays two operations,
-  deliberately visible as two audit rows.
+  overwrite, so one that would is refused"). Replacing one is a named operation of its
+  own (see "Changing a rule is one operation, not two") — the distinction being that an
+  edit records what it displaced, where a create that silently overwrote would be the
+  same act with nothing in the record saying so.
 - **The page mirrors three refusals and no more.** `createPreview` in `app.js` checks
   the wildcard floor, a conflicting rule and an identical one — the floor because it is
   the refusal that would otherwise arrive only *after* clicking a button labelled with a
@@ -1923,6 +1927,46 @@ request. It sits on the management listener with `resolve` for that reason, and 
 audit vocabulary (`audit.DECISIONS`) gains `create` beside `revoke` so a rule that
 appeared without a card is distinguishable in the record from one a human approved at
 one — which, once it is sitting in the table, it otherwise is not.
+
+**Changing a rule is one operation, not two (`POST /api/egress/rules/{id}/edit`).**
+Create and revoke could already express every end state; what they could not express is
+a *transition*. Narrowing `.example.com` to `api.example.com` meant revoking and
+re-creating, which cost two things. One is the record: two rows that each describe half
+of an intent, with nothing tying them together and no order guaranteed between them in a
+busy log. The other is a window in which the subtree was unknown and every request under
+it was held, one card at a time, for as long as the second step took. That window failed
+to `hold` rather than to allow, which is why this was tolerable rather than a hole — but
+tolerable is not atomic, and the operator paying for it was the one tightening policy
+under load. A single `UPDATE` in one transaction closes it.
+
+Four things follow, and each is a consequence of *which* endpoint this resembles:
+
+- **It carries create's exposure, so it gets create's validation.** There is no
+  `_persist_candidates` bounded set behind an edit any more than behind a create, so
+  `policy._rule_error` is the whole of what stands between this and a rule matching more
+  than the operator meant. The wildcard floor matters more here than anywhere: an edit is
+  the one operation that can walk a narrow allow outward a label at a time.
+- **The seed refusal is the same one `revoke_rule` makes, for a stronger reason.** A
+  revoked seed rule at least *leaves*, and `store._seed_if_empty` re-reads the file on the
+  next empty-table start. An edited one stays, indexed and deciding, while
+  `policies/egress-allowlist.txt` says something else about the same host.
+- **The class is not editable.** Moving a rule between client classes takes policy from
+  one population and gives it to another, which is two changes wearing one audit row —
+  the exact defect this endpoint exists to remove, reintroduced from the other side. The
+  request model has no such field and the UI locks the picker; revoke-then-create stays
+  the honest shape for a re-scope.
+- **The conflict check must exclude the rule being edited.** A rule always holds its own
+  pattern, so a naive uniqueness check refuses every action flip. The backend answers it
+  with an `id<>?` clause and `editPreview` in `app.js` mirrors it; both are tested,
+  because a page that previews a collision with itself makes the operation look broken
+  rather than refused.
+
+`audit.DECISIONS` gains `edit`, and the row carries **both** states. That is the whole
+difference from what it replaces: the record now says what a rule was, not only what it
+became. The UI's confirm says the same thing in the same shape, which is why
+`editPreview` flags *both* loosening directions where `createPreview` only has a new
+action to judge — narrowing a block loosens too, since the hosts falling out from under
+it stop being denied.
 
 **Approval provenance — detection where prevention is not available.** Given that
 ceiling, the frontend and backend at least make a forged approval *visible*. The
@@ -1949,9 +1993,10 @@ fails at runtime. The only alternative is `make destroy`, which discards the pol
 rules and the audit history — i.e. the crown jewels. See the NOTE below `_init_db`
 in `control-plane/store.py`.
 
-Step 2c-2 is egress rule **editing**: creating and revoking are built (see "Writing a
-rule with no request behind it") and atomic *mutation* is the remaining half. The
-per-proxy config surface this step also used to mean is **not** being built — those
+Step 2c-2 is egress rule **editing**, and it is built: all three verbs now exist, with
+changing a rule an atomic operation rather than revoke-then-create (see "Changing a rule
+is one operation, not two"). The per-proxy config surface this step also used to mean is
+**not** being built — those
 values are fail-closed bounds rather than policy, so they stay env vars and a second
 governed service names its own (see "Hold bounds are fail-closed, so their values stay
 env vars"). Tool policy still lands in its own table, with the gateway (see "Tool policy
@@ -1968,8 +2013,8 @@ the one queue every surface feeds (see "`approvals` splits the same way"). The s
 rejected on the way is `/api/rules?surface=…`, a discriminator over a single path —
 the storage mistake above wearing an API hat.
 
-Not yet built: rule editing (2c-2), git/secrets/cache data-plane services, the
-MCP gateway, skills, quality-gate hooks.
+Not yet built: git/secrets/cache data-plane services, the MCP gateway, skills,
+quality-gate hooks.
 
 ### MCP gateway — governed tool capability (planned, not built)
 
@@ -3033,7 +3078,7 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | 2b-3 | control-plane API surface split across two internal nets | **done** |
 | — | unit suite + CI gate | **done** |
 | 2c-1 | audit browsing — filters + the paged record view | **done** |
-| 2c-2 | egress rule editing (atomic mutation) | next |
+| 2c-2 | egress rule editing (atomic mutation) | **done** |
 | 3 | skills + quality-gate hooks in the image | planned |
 | 4 | pull-through package cache | planned |
 | — | governed git push path | planned |
@@ -3128,20 +3173,6 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
   leave the sandbox.
 - Docs mirror / offline docs tool.
 - Progressive auto-approval driven by accumulated policy + audit history.
-- **Rule MUTATION on the control plane.** Revocation is **now built** — see "Taking a
-  rule back" under the control-plane section — and so is creation, from nothing rather
-  than off a card ("Writing a rule with no request behind it"). What remains is EDITING:
-  changing a rule's pattern or flipping its action is still revoke-then-create rather
-  than one operation, which is two audit rows for one intent and leaves a window in which the
-  host is neither allowed nor blocked. Acceptable, because that window fails to
-  `hold` rather than to allow, but it is not the same thing as an edit. The two sharp edges it used to carry
-  have moved: the agent-controlled-pattern one is closed (`_persist_candidates` derives
-  a bounded set and `resolve` validates against it — see "A `+ persist` says what it
-  will write"), and the `INSERT OR IGNORE` wart, where `deny_persist` silently writes
-  nothing for an existing pattern while still reporting `persisted: true`, is now
-  reachable only when the *same* pattern was chosen twice and is covered honestly by
-  the card's wording. A governance plane that can grant and revoke but not *edit* a
-  rule in one step is still incomplete, and atomic editing is the remaining half.
 - **Human-presence on approval (WebAuthn user-presence, or an out-of-band confirm).**
   The *only* thing that closes host-local forgery of an approval — see the
   browser-facing-guards note under "Approval UI". Worth building for that
@@ -3159,12 +3190,6 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
     is treated as a convenience layer over a backend that validates every input, with its
     mistakes made detectable rather than prevented. The reasoning, and the condition that
     would reopen it, are under "`start()` is deliberately unverified" above.)*
-  - **Rule mutation** — nothing here *replaces* a rule (revoking one is built — see
-    "Taking a rule back", and writing one outright since — see "Writing a rule with no
-    request behind it"), which is why a persist that contradicts an existing one is
-    refused rather than applied (see *A persist cannot overwrite* above). The refusal
-    is the honest behaviour given the constraint; lifting it — editing a rule's pattern
-    or action in one operation rather than revoke-then-create — is the open item.
   - **Opt-in desktop notification.** `http://localhost` is a secure context, so the
     Notification API is available; with a ~120s fuse and a page nobody watches, this is
     the honest fix for the problem the `(n)` title prefix only mitigates.

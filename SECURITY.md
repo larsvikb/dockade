@@ -148,7 +148,7 @@ report.
   container is not OOM-killed; nothing in the threat model rests on them. See
   *Resource limits — blast radius, not boundary*.
 - **The policy store having no atomic *edit*.** Revoking an operator-created rule is
-  built (`POST /api/rules/{id}/revoke`, in the Policy view); what is not is changing a
+  built (`POST /api/egress/rules/{id}/revoke`, in the Policy view); what is not is changing a
   rule's pattern or flipping its action in one step — that stays revoke-then-persist,
   two audit rows for one intent, with a window in which the host is held rather than
   allowed or blocked. A persist that would contradict an existing rule is refused

@@ -1646,7 +1646,7 @@ class PendingCardClassTests(_CPTestCase):
 
 
 class RulesViewTests(_CPTestCase):
-    """``/api/rules`` exists so standing policy is not invisible from the UI that
+    """``/api/egress/rules`` exists so standing policy is not invisible from the UI that
     governs it. It is the complete policy, in precedence order, with the wildcard
     semantics spelled out."""
 
@@ -2294,7 +2294,7 @@ class ApiSurfaceSplitTests(unittest.TestCase):
         # the audit history, the standing policy. A bypassed relay guard must not
         # be able to read them either.
         for path in ("/approvals", "/approvals/stream", "/api/audit",
-                     "/api/audit/events", "/api/rules", "/api/config", "/status"):
+                     "/api/audit/events", "/api/egress/rules", "/api/config", "/status"):
             self.assertIn(("GET", path), _routes(cp.app), path)
             self.assertNotIn(("GET", path), _routes(cp.authorize_app), path)
 

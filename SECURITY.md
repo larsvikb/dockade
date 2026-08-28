@@ -102,14 +102,6 @@ than restated.
   Scoping it needs a proxy-less host to validate, because it can break DNS and egress
   in ways a governed host cannot exercise.
 
-- **One sandbox can exhaust the hold queue for every other sandbox.** In
-  `control-plane/holds.py` `_reserve_hold`, the global cap counts *waiters* while the
-  per-client cap counts *cards*, and the join path returns before the per-client check
-  is reached. Grouped duplicates from a single client can therefore fill the global
-  cap (`CONTROL_MAX_PENDING`) and every other sandbox is refused until those holds
-  drain. Refusals fail closed, so this costs availability, not containment. The fix
-  needs a per-client *waiter* bound — a semantics decision rather than a patch.
-
 - **A duplicate can join a card in the instant after it is decided.** `resolve`
   commits the decision outside `_LOCK` and closes the group inside it, so a request
   can arrive between the two and inherit an outcome it did not wait for. Bounded: a
@@ -170,8 +162,10 @@ report.
   not a finding. What *is* in scope is anything that converts load into a decision
   going the wrong way: a cap that fails open under pressure, a saturated queue that
   lets a request through undecided, or an audit line dropped because the system was
-  busy. The known availability defect that stays on the fail-closed side of that line
-  is listed under [Known open findings](#known-open-findings).
+  busy. One cross-sandbox availability defect of that kind — one client filling the
+  hold pool for every other — was listed here and is now fixed; the caps that bound it
+  are described in `DESIGN.md` under *Four hold caps: two nouns, two scopes*. Another
+  of that shape would be worth reporting.
 - **Base images pinned by tag rather than digest.** A deliberate
   rebuild-to-update choice, consistent across every image here.
 - **The standalone (proxy-less) fallback being weaker than governed mode.** It

@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 import unittest
+from typing import ClassVar
 
 # The module reads CONTROL_DB at import time — point it at a throwaway file and
 # suppress seeding (we drive the rules table directly) before loading.
@@ -234,13 +235,31 @@ class _HoldRegistryTestCase(unittest.TestCase):
     so a NEW registry that this fixture forgets to clear shows up as a test that
     leaks state rather than as a name in a list nobody reads."""
 
+    #: The four cap names, so save/restore cannot drift from the module as it grows.
+    CAPS: ClassVar[tuple] = ("MAX_PENDING", "MAX_PENDING_PER_CLIENT",
+                             "MAX_WAITERS", "MAX_WAITERS_PER_CLIENT")
+
     def setUp(self):
-        self._saved = (cp.holds.MAX_PENDING, cp.holds.MAX_PENDING_PER_CLIENT)
+        self._saved = {name: getattr(cp.holds, name) for name in self.CAPS}
         self._wipe()
 
     def tearDown(self):
-        cp.holds.MAX_PENDING, cp.holds.MAX_PENDING_PER_CLIENT = self._saved
+        for name, value in self._saved.items():
+            setattr(cp.holds, name, value)
         self._wipe()
+
+    def _caps(self, *, cards=100, cards_per_client=0,
+              waiters=100, waiters_per_client=0):
+        """Set ALL FOUR caps, so a test states the ones it is about and neutralizes the
+        rest. Keyword-only and fully specified rather than a two-tuple assignment,
+        because the failure it prevents actually happened: adding the waiter caps made
+        several tests that read as being about the CARD cap start failing on a waiter
+        cap they never mentioned. A test refused by a limit it does not name is a test
+        whose subject has silently changed."""
+        cp.holds.MAX_PENDING = cards
+        cp.holds.MAX_PENDING_PER_CLIENT = cards_per_client
+        cp.holds.MAX_WAITERS = waiters
+        cp.holds.MAX_WAITERS_PER_CLIENT = waiters_per_client
 
     def _wipe(self):
         cp.holds._PENDING_EVENTS.clear()
@@ -251,8 +270,14 @@ class _HoldRegistryTestCase(unittest.TestCase):
 
 
 class HoldCapTests(_HoldRegistryTestCase):
-    """The hold cap protects a shared threadpool: over cap, /authorize must fail
-    CLOSED instead of registering another worker-blocking hold."""
+    """Four caps, two nouns times two scopes: CARDS protect the operator's attention,
+    WAITERS protect the threadpool. Over any of them /authorize must fail CLOSED
+    instead of registering another worker-blocking hold.
+
+    These tests reserve a DISTINCT host per approval, so each one is a new card and
+    nothing here is grouped. The waiter caps' interesting case is the opposite — a
+    joined duplicate, which costs a waiter and no card — and it lives with the rest of
+    grouping in ``DuplicateGroupingTests``."""
 
     def _reserve(self, approval_id, client, host=None):
         # A DISTINCT host per approval unless a test asks otherwise, so these tests
@@ -262,16 +287,47 @@ class HoldCapTests(_HoldRegistryTestCase):
         return cp.holds._reserve_hold(approval_id, threading.Event(), client,
                                 host or f"{approval_id}.example.com")
 
-    def test_global_cap_fails_closed_over_limit(self):
-        cp.holds.MAX_PENDING, cp.holds.MAX_PENDING_PER_CLIENT = 2, 0
+    def test_the_global_card_cap_fails_closed_over_limit(self):
+        self._caps(cards=2)
         self.assertIsNone(self._reserve("a", "c1").refused)
         self.assertIsNone(self._reserve("b", "c2").refused)
         reason = self._reserve("c", "c3").refused
         self.assertIsNotNone(reason)
-        self.assertIn("global", reason)
+        # The scope names the NOUN as well as the scope, because four caps can refuse
+        # and the operator's response differs: too many questions on screen is an
+        # attention problem, too many blocked workers is a capacity one. Asserted both
+        # ways, so the right cap firing is distinguished from any cap firing.
+        self.assertIn("global cards", reason)
+        self.assertNotIn("waiters", reason)
+
+    def test_the_global_waiter_cap_fails_closed_over_limit(self):
+        # Distinct hosts, so every one of these is also a card — the point being that
+        # with the card cap out of the way it is the waiter cap that refuses.
+        self._caps(waiters=2)
+        self.assertIsNone(self._reserve("a", "c1").refused)
+        self.assertIsNone(self._reserve("b", "c2").refused)
+        reason = self._reserve("c", "c3").refused
+        self.assertIsNotNone(reason)
+        self.assertIn("global waiters", reason)
+
+    def test_a_card_cap_at_or_above_its_waiter_cap_is_dead(self):
+        """Not a rule the code enforces — a property of the two counts that the shipped
+        DEFAULTS are chosen to avoid. Cards are always <= waiters, so a card cap set
+        equal to its waiter cap can never be the first to refuse. Asserted so that
+        raising `CONTROL_MAX_WAITERS` alone, and thereby silencing the card cap without
+        meaning to, is a visible fact rather than a discovery."""
+        self._caps(cards=3, waiters=3)
+        for i in range(3):
+            self.assertIsNone(self._reserve(f"d{i}", f"c{i}").refused)
+        self.assertIn("global waiters", self._reserve("d3", "c3").refused)
+        # And the SHIPPED defaults (saved by the fixture before `_caps` overwrote them)
+        # keep both alive, on each axis.
+        self.assertLess(self._saved["MAX_PENDING"], self._saved["MAX_WAITERS"])
+        self.assertLess(self._saved["MAX_PENDING_PER_CLIENT"],
+                        self._saved["MAX_WAITERS_PER_CLIENT"])
 
     def test_per_client_cap_isolates_clients(self):
-        cp.holds.MAX_PENDING, cp.holds.MAX_PENDING_PER_CLIENT = 100, 2
+        self._caps(cards_per_client=2)
         self.assertIsNone(self._reserve("a1", "A").refused)
         self.assertIsNone(self._reserve("a2", "A").refused)
         over = self._reserve("a3", "A").refused
@@ -281,12 +337,12 @@ class HoldCapTests(_HoldRegistryTestCase):
         self.assertIsNone(self._reserve("b1", "B").refused)
 
     def test_per_client_cap_disabled_with_zero(self):
-        cp.holds.MAX_PENDING, cp.holds.MAX_PENDING_PER_CLIENT = 100, 0
+        self._caps()
         for i in range(10):
             self.assertIsNone(self._reserve(f"x{i}", "same-client").refused)
 
     def test_none_client_bypasses_per_client_cap_but_not_global(self):
-        cp.holds.MAX_PENDING, cp.holds.MAX_PENDING_PER_CLIENT = 3, 1
+        self._caps(cards=3, cards_per_client=1)
         # client=None never counts against the per-client cap...
         self.assertIsNone(self._reserve("n1", None).refused)
         self.assertIsNone(self._reserve("n2", None).refused)
@@ -295,14 +351,14 @@ class HoldCapTests(_HoldRegistryTestCase):
         self.assertIsNotNone(self._reserve("n4", None).refused)
 
     def test_release_frees_a_global_slot(self):
-        cp.holds.MAX_PENDING, cp.holds.MAX_PENDING_PER_CLIENT = 1, 0
+        self._caps(cards=1)
         self.assertIsNone(self._reserve("a", "c1").refused)
         self.assertIsNotNone(self._reserve("b", "c2").refused)  # full
         cp.holds._release_hold("a")
         self.assertIsNone(self._reserve("b", "c2").refused)  # slot freed
 
     def test_release_forgets_the_slot(self):
-        cp.holds.MAX_PENDING, cp.holds.MAX_PENDING_PER_CLIENT = 5, 0
+        self._caps(cards=5)
         self._reserve("a", "c1")
         cp.holds._release_hold("a")
         # Released ids are fully forgotten from every registry.
@@ -326,7 +382,7 @@ class DuplicateGroupingTests(_HoldRegistryTestCase):
                                 host, port, proto)
 
     def test_an_identical_request_joins_the_existing_card(self):
-        cp.holds.MAX_PENDING, cp.holds.MAX_PENDING_PER_CLIENT = 100, 4
+        self._caps(cards_per_client=4)
         first = self._reserve("a")
         self.assertFalse(first.joined)
         second = self._reserve("b")
@@ -340,7 +396,7 @@ class DuplicateGroupingTests(_HoldRegistryTestCase):
     def test_grouping_is_what_keeps_a_retry_storm_under_the_card_cap(self):
         # The motivating case, as a whole: with a per-client cap of 4, a fifth retry
         # used to be refused outright. It now joins, and the operator sees one card.
-        cp.holds.MAX_PENDING, cp.holds.MAX_PENDING_PER_CLIENT = 100, 4
+        self._caps(cards_per_client=4)
         for i in range(20):
             self.assertIsNone(self._reserve(f"r{i}").refused)
         self.assertEqual(len(cp.holds._PENDING_EVENTS), 1)
@@ -350,23 +406,62 @@ class DuplicateGroupingTests(_HoldRegistryTestCase):
         # The global cap bounds BLOCKED WORKERS, and a joiner blocks one. If grouping
         # were free here it would be a route around the cap that protects governance
         # for every other sandbox — the one thing it must not become.
-        cp.holds.MAX_PENDING, cp.holds.MAX_PENDING_PER_CLIENT = 3, 0
+        self._caps(waiters=3)
         for i in range(3):
             self.assertIsNone(self._reserve(f"j{i}").refused)
         over = self._reserve("j3")
         self.assertIsNotNone(over.refused)
-        self.assertIn("global", over.refused)
+        self.assertIn("global waiters", over.refused)
+
+    def test_a_joined_waiter_also_costs_a_PER_CLIENT_slot(self):
+        """The defect this cap was added for, stated as behaviour.
+
+        Grouping is what decoupled cards from waiters, and the per-client cap kept
+        counting cards — so a joiner met no per-client bound at all. The whole of the
+        bug is that this test used to be impossible to write: every one of these
+        twenty reservations is the SAME request, so it costs one card and twenty
+        workers, and only a per-client WAITER cap can see it."""
+        self._caps(waiters_per_client=3)
+        for i in range(3):
+            self.assertIsNone(self._reserve(f"j{i}").refused)
+        over = self._reserve("j3")
+        self.assertIn("client c1 waiters", over.refused)
+        # One card the whole time — which is why the card caps could never have caught
+        # this, at any setting.
+        self.assertEqual(len(cp.holds._PENDING_EVENTS), 1)
+
+    def test_one_client_storming_cannot_starve_another(self):
+        """The consequence, and the reason this was a finding rather than a nuisance:
+        the control plane is shared across every sandbox, so one agent retrying one
+        host used to fill the global pool from a single card and every other sandbox
+        was refused until those holds drained."""
+        self._caps(waiters=4, waiters_per_client=2)
+        self.assertIsNone(self._reserve("s0", client="storm").refused)
+        self.assertIsNone(self._reserve("s1", client="storm").refused)
+        self.assertIsNotNone(self._reserve("s2", client="storm").refused)
+        # The victim still gets in, which is the entire point.
+        self.assertIsNone(self._reserve("v0", client="victim").refused)
+
+    def test_releasing_a_joined_waiter_frees_its_per_client_slot(self):
+        # The cap counts live waiters, so it has to fall as they wake — otherwise a
+        # client is locked out for the process lifetime by a storm that has drained.
+        self._caps(waiters_per_client=2)
+        self._reserve("k0")
+        self._reserve("k1")
+        self.assertIsNotNone(self._reserve("k2").refused)
+        cp.holds._release_hold("k0")            # one waiter wakes; the card survives
+        self.assertIsNone(self._reserve("k3").refused)
 
     def test_a_different_client_gets_its_own_card(self):
         # The decision is a function of the host alone, but approving one sandbox's
         # request must never release another's.
-        cp.holds.MAX_PENDING, cp.holds.MAX_PENDING_PER_CLIENT = 100, 4
+        self._caps(cards_per_client=4)
         self.assertFalse(self._reserve("a", client="A").joined)
         self.assertFalse(self._reserve("b", client="B").joined)
         self.assertEqual(len(cp.holds._PENDING_EVENTS), 2)
 
     def test_port_and_proto_split_a_card_but_method_and_url_do_not(self):
-        cp.holds.MAX_PENDING, cp.holds.MAX_PENDING_PER_CLIENT = 100, 0
+        self._caps()
         self.assertFalse(self._reserve("a", port=443).joined)
         self.assertFalse(self._reserve("b", port=80).joined)
         self.assertFalse(self._reserve("c", proto="http", port=443).joined)
@@ -377,7 +472,7 @@ class DuplicateGroupingTests(_HoldRegistryTestCase):
         self.assertEqual(len(cp.holds._PENDING_EVENTS), 3)
 
     def test_the_host_key_is_case_insensitive_like_the_matcher(self):
-        cp.holds.MAX_PENDING, cp.holds.MAX_PENDING_PER_CLIENT = 100, 0
+        self._caps()
         self.assertFalse(self._reserve("a", host="Example.COM").joined)
         self.assertTrue(self._reserve("b", host="example.com").joined)
 
@@ -385,7 +480,7 @@ class DuplicateGroupingTests(_HoldRegistryTestCase):
         # What makes "one click decides what it showed": the moment a card is decided
         # it stops accepting joiners, while the workers already on it stay registered
         # so resolve() can still find the event and the global cap still counts them.
-        cp.holds.MAX_PENDING, cp.holds.MAX_PENDING_PER_CLIENT = 100, 0
+        self._caps()
         self._reserve("a")
         self._reserve("b")
         cp.holds._close_group("a")
@@ -396,7 +491,7 @@ class DuplicateGroupingTests(_HoldRegistryTestCase):
         self.assertEqual(after.approval_id, "c")
 
     def test_the_card_frees_only_when_the_last_waiter_leaves(self):
-        cp.holds.MAX_PENDING, cp.holds.MAX_PENDING_PER_CLIENT = 100, 0
+        self._caps()
         self._reserve("a")
         self._reserve("b")
         self._reserve("c")
@@ -412,13 +507,13 @@ class DuplicateGroupingTests(_HoldRegistryTestCase):
     def test_a_joiner_inherits_the_cards_deadline_rather_than_extending_it(self):
         # Otherwise an agent retrying on a loop pushes the deadline out forever and the
         # countdown on the card is a lie.
-        cp.holds.MAX_PENDING, cp.holds.MAX_PENDING_PER_CLIENT = 100, 0
+        self._caps()
         first = self._reserve("a")
         self.assertEqual(self._reserve("b").deadline, first.deadline)
         self.assertAlmostEqual(first.deadline - time.time(), cp.holds.HOLD_TIMEOUT, delta=5)
 
     def test_a_refusal_reserves_nothing(self):
-        cp.holds.MAX_PENDING, cp.holds.MAX_PENDING_PER_CLIENT = 1, 0
+        self._caps(cards=1)
         self._reserve("a", host="one.example")
         over = self._reserve("b", host="two.example")
         self.assertIsNotNone(over.refused)

@@ -271,6 +271,16 @@ def _bootstrap() -> None:
     if seeded:
         print(f"control-plane: seeded {seeded} allow rules from {store.SEED_PATH}",
               flush=True)
+    # The hold caps, with their UNITS, once per boot. Not decoration: `CONTROL_MAX_
+    # PENDING` used to count blocked requests and now counts cards, so an operator who
+    # set it under the old meaning has a different limit than they think. A line that
+    # says which noun each number counts is what makes that discoverable without
+    # reading holds.py, and it costs one line in a log an operator already tails for
+    # the live decision feed.
+    print(f"control-plane: hold caps — cards {holds.MAX_PENDING} global / "
+          f"{holds.MAX_PENDING_PER_CLIENT} per client, blocked requests "
+          f"{holds.MAX_WAITERS} global / {holds.MAX_WAITERS_PER_CLIENT} per client "
+          f"(0 = refuse all on a global cap, disabled on a per-client one)", flush=True)
 
 
 def _assert_listeners_separated() -> None:

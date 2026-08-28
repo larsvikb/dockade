@@ -478,7 +478,13 @@ function createPreview(pattern, action, clientClass, rules) {
   const verb = action === "allow" ? "allow" : "block";
   const wild = p.startsWith(".");
   const scope = wild ? "host + subdomains" : "exact host";
-  const base = { ok: false, pattern: p, verb, wild, scope, danger: false,
+  // `clientClass` rides on the result so the submit posts the class this preview was
+  // BUILT from, rather than reading the select a second time. The two reads cannot
+  // disagree while `confirm()` blocks the event loop between them — but that is a
+  // property of the dialog, not of the code, and it would fall away the moment the
+  // confirm became a custom one or anything before the fetch awaited. Preview and
+  // request come from one object here, as they already do for `pattern` and `verb`.
+  const base = { ok: false, pattern: p, verb, clientClass, wild, scope, danger: false,
                  existing: null, conflict: false, redundant: false, text: "" };
   if (!p) {
     return { ...base, text: "" };
@@ -2158,9 +2164,11 @@ function start() {
         headers: { "content-type": "application/json" },
         // What was PREVIEWED and confirmed, not what is in the box: the two differ
         // whenever normalization did anything, and the confirm has to be about the
-        // rule that lands.
+        // rule that lands. All three fields come from the one preview object for that
+        // reason — `client_class` used to re-read its select here, which was a second
+        // derivation of a value the operator had already been shown.
         body: JSON.stringify({ pattern: p.pattern, action: p.verb,
-                               client_class: ruleClassEl.value }),
+                               client_class: p.clientClass }),
       });
       const body = await res.json().catch(() => ({}));
       if (!res.ok || !body.ok) {

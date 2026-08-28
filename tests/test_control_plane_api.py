@@ -1976,21 +1976,33 @@ class SaturationTests(_CPTestCase):
     the refusal never becomes a card and the approvals page shows the same empty list
     as a quiet afternoon. These assert the record that makes it visible."""
 
-    def _over_cap(self, host="pypi.org", client=None):
-        saved = cp.holds.MAX_PENDING
-        cp.holds.MAX_PENDING = 0
+    def _over_cap(self, host="pypi.org", client=None, cap="MAX_WAITERS"):
+        """Drive one rejection by zeroing ``cap``. Zero on a GLOBAL cap refuses
+        everything (see the cap block in holds.py), which is what makes it the cheap
+        way to exercise the refusal path — and the cap is named rather than assumed,
+        because with four of them "over cap" no longer identifies one."""
+        saved = getattr(cp.holds, cap)
+        setattr(cp.holds, cap, 0)
         try:
             return cp.authorize(_auth_req(host, client=client))
         finally:
-            cp.holds.MAX_PENDING = saved
+            setattr(cp.holds, cap, saved)
 
     def test_a_rejection_is_recorded_with_what_was_refused(self):
         self._over_cap(host="pypi.org")
         sat = cp.holds._saturation()
         self.assertEqual(sat["rejections"], 1)
         self.assertEqual(sat["last_host"], "pypi.org")
-        self.assertEqual(sat["last_scope"], "global")
+        self.assertEqual(sat["last_scope"], "global waiters")
         self.assertIsNotNone(sat["last_ts"])
+
+    def test_the_scope_names_which_of_the_four_caps_refused(self):
+        """Four caps can refuse, and they suggest different responses: cards versus
+        blocked workers is attention versus capacity, global versus per-client is "the
+        whole plane is loaded" versus "one agent is hammering". A scope that named only
+        one axis would collapse two of those four into each other."""
+        self._over_cap(cap="MAX_PENDING")
+        self.assertEqual(cp.holds._saturation()["last_scope"], "global cards")
 
     def test_rejections_accumulate_rather_than_overwrite(self):
         # The count is the point: a burst of twenty is a different event from one,
@@ -2010,7 +2022,21 @@ class SaturationTests(_CPTestCase):
             cp.holds.MAX_PENDING_PER_CLIENT = saved
         # Distinguishable from a global exhaustion: "one agent is hammering" and
         # "the whole control plane is loaded" want different responses.
-        self.assertEqual(cp.holds._saturation()["last_scope"], "client 172.30.0.9")
+        self.assertEqual(cp.holds._saturation()["last_scope"],
+                         "client 172.30.0.9 cards")
+
+    def test_the_per_client_waiter_cap_is_recorded_as_its_own_scope(self):
+        """The fourth scope, and the one whose absence was the finding. A client that
+        fills the pool through ONE card hits nothing the other three caps can see."""
+        saved = cp.holds.MAX_WAITERS_PER_CLIENT
+        cp.holds.MAX_WAITERS_PER_CLIENT = 1
+        try:
+            _hold("a.example", "held-1", client="172.30.0.9")
+            cp.authorize(_auth_req("a.example", client="172.30.0.9"))
+        finally:
+            cp.holds.MAX_WAITERS_PER_CLIENT = saved
+        self.assertEqual(cp.holds._saturation()["last_scope"],
+                         "client 172.30.0.9 waiters")
 
     def test_nothing_is_recorded_when_the_hold_is_accepted(self):
         _hold("quiet.example", "held-1")
@@ -2034,7 +2060,7 @@ class SaturationTests(_CPTestCase):
     def test_in_flight_counts_waiters_and_cards_counts_cards(self):
         # The second divergence, and the reason both numbers are in the payload:
         # duplicates share a card, so "12/16 in flight" beside three cards is not a
-        # contradiction. The global cap is measured against the FIRST number.
+        # contradiction. Each number is measured against its OWN cap.
         _hold("a.example", "held-1", client="172.30.0.2")
         for _ in range(4):
             slot = cp.holds._reserve_hold("ignored", threading.Event(), "172.30.0.2",
@@ -2050,7 +2076,10 @@ class SaturationTests(_CPTestCase):
         self.assertEqual(set(payload), {"holds", "saturation"})
         self.assertEqual([h["id"] for h in payload["holds"]], ["held-1"])
         self.assertEqual(payload["saturation"]["in_flight"], 1)
+        # Both global caps travel, because either can be the one about to fire and the
+        # banner shows whichever gauge is fuller. Sending one would hide the other.
         self.assertEqual(payload["saturation"]["max_pending"], cp.holds.MAX_PENDING)
+        self.assertEqual(payload["saturation"]["max_waiters"], cp.holds.MAX_WAITERS)
 
     def test_every_time_in_the_payload_is_absolute(self):
         # Load-bearing for the SSE stream, which emits on payload CHANGE: an
@@ -2062,8 +2091,8 @@ class SaturationTests(_CPTestCase):
         sat = cp.holds._saturation()
         self.assertEqual(
             set(sat),
-            {"in_flight", "cards", "max_pending", "rejections", "acknowledged",
-             "last_ts", "last_scope", "last_host", "since"})
+            {"in_flight", "cards", "max_waiters", "max_pending", "rejections",
+             "acknowledged", "last_ts", "last_scope", "last_host", "since"})
         # Both stamps are epoch seconds — comfortably past 2001 — not durations.
         self.assertGreater(sat["last_ts"], 1_000_000_000)
         self.assertGreater(sat["since"], 1_000_000_000)

@@ -27,26 +27,55 @@ import store
 
 # How long a held request waits for a human before defaulting to deny.
 HOLD_TIMEOUT = float(os.environ.get("CONTROL_HOLD_TIMEOUT", "120"))
-# Bound concurrent holds. The two caps look alike and protect DIFFERENT things, which
-# is why they count different sets — before duplicate grouping they counted the same
-# one, and the distinction was invisible:
+# Bound concurrent holds. FOUR caps, and they are two nouns times two scopes — which
+# is the whole of the scheme, and the reason the names are what they are:
 #
-#   MAX_PENDING counts WAITERS — blocked FastAPI threadpool workers. A held request
-#   pins a worker until it is resolved or times out, so an unbounded number would
-#   stall ALL /authorize decisions, and this control plane is shared across every
-#   sandbox: one agent could starve governance for all. Keep it well under the
-#   threadpool size (anyio default ~40) so fast allow/deny decisions always have
-#   free workers.
+#             |  global            |  per client
+#   ----------|--------------------|-----------------------------
+#   CARDS     |  MAX_PENDING       |  MAX_PENDING_PER_CLIENT
+#   WAITERS   |  MAX_WAITERS       |  MAX_WAITERS_PER_CLIENT
 #
-#   MAX_PENDING_PER_CLIENT counts CARDS — pending approvals on the operator's screen,
-#   for one client. It protects attention, not workers. Duplicate requests join an
-#   existing card (see _reserve_hold) and so cost this cap nothing; they still cost a
-#   worker, and are still bounded by MAX_PENDING. Set to 0 to disable.
+# A CARD is a pending approval on the operator's screen. A WAITER is a blocked FastAPI
+# threadpool worker. They were the same number until duplicate grouping, which made one
+# card able to hold N waiters — and it is that decoupling, not the caps themselves,
+# that this shape exists to survive.
 #
-# Over either cap /authorize fails CLOSED immediately (deny) instead of registering
-# another blocking hold.
-MAX_PENDING = int(os.environ.get("CONTROL_MAX_PENDING", "16"))
+#   The CARD caps protect ATTENTION. Nobody triages twelve simultaneous questions, and
+#   an agent that can put four on the screen can already drown out another's one.
+#
+#   The WAITER caps protect WORKERS. A held request pins a worker until it is resolved
+#   or times out, so an unbounded number stalls ALL /authorize decisions — and this
+#   control plane is shared across every sandbox, so one agent could starve governance
+#   for all. Keep MAX_WAITERS well under the threadpool size (anyio default ~40) so
+#   fast allow/deny decisions always have free workers.
+#
+# The per-client waiter cap is the one that was MISSING, and its absence was a real
+# defect rather than an omission: duplicates join an existing card, so they cost the
+# card caps nothing, and the only bound they met was the global waiter cap. One agent
+# retrying one host filled the whole pool from a single card and every other sandbox
+# was refused. See _reserve_hold for the ordering that fixes it.
+#
+# The four defaults are chosen so EACH CAP CAN BE THE FIRST TO FIRE — a cap that can
+# never bind is one nobody can reason about, and cards are always <= waiters, so a card
+# cap set equal to its waiter cap is dead:
+#
+#   one agent, 4 distinct hosts        -> per-client cards (4)
+#   three clients at 4 cards each      -> global cards (12)
+#   one agent, 4 cards, retrying       -> per-client waiters (8)
+#   two agents at 8 waiters each       -> global waiters (16)
+#
+# ZERO means different things by scope, and the asymmetry is deliberate. On a GLOBAL
+# cap it refuses everything, which is fail-closed and a plausible way to say "stop
+# holding anything at all". On a PER-CLIENT cap it DISABLES the cap, because the
+# fail-closed reading would make every client's first hold impossible, which cannot be
+# what anyone meant by setting it.
+#
+# Over any of the four, /authorize fails CLOSED immediately (deny) instead of
+# registering another blocking hold.
+MAX_PENDING = int(os.environ.get("CONTROL_MAX_PENDING", "12"))
 MAX_PENDING_PER_CLIENT = int(os.environ.get("CONTROL_MAX_PENDING_PER_CLIENT", "4"))
+MAX_WAITERS = int(os.environ.get("CONTROL_MAX_WAITERS", "16"))
+MAX_WAITERS_PER_CLIENT = int(os.environ.get("CONTROL_MAX_WAITERS_PER_CLIENT", "8"))
 
 # In-memory registry of held requests, keyed by approval id. Single-process only
 # (see module docstring). The Event only WAKES the blocked /authorize worker; the
@@ -123,6 +152,18 @@ def _group_key(client: str | None, host: str | None,
             port, (proto or "").lower() or None)
 
 
+def _client_waiters_locked(client: str | None) -> int:
+    """How many blocked workers one client is holding, across all of its cards.
+    Caller must hold ``_LOCK``.
+
+    Summed over the two registries rather than kept as a third counter, because a
+    counter would be a second source of truth for a number that is already implied —
+    and the one it could disagree with is the one a cap is checked against. Both dicts
+    are keyed by approval id, so this is a join, not a scan of anything new."""
+    return sum(n for approval_id, n in _PENDING_WAITERS.items()
+               if _PENDING_CLIENT.get(approval_id) == client)
+
+
 class HoldSlot(NamedTuple):
     """Outcome of asking for a hold slot. Exactly one of ``refused`` / ``approval_id``
     is set: refused means nothing was reserved and the caller must fail closed."""
@@ -144,14 +185,24 @@ def _reserve_hold(approval_id: str, event: threading.Event,
     so concurrent holds cannot race past the cap — nor race into creating two cards
     for one key, which is the same problem wearing a different hat.
 
-    Order matters. The global waiter cap is checked FIRST, before the join, because a
-    joined request still blocks a worker: grouping must never be a way around the cap
-    that protects governance for every other sandbox. The per-client cap is checked
-    only on the new-card path, because that cap counts cards.
+    **Every cap this request will draw on is checked BEFORE the early return that
+    consumes it.** That rule is the fix for a real defect rather than a tidiness
+    preference: the join used to return above the per-client check, so a joined waiter
+    — which costs a worker exactly like any other — met no per-client bound at all, and
+    one agent retrying one host could fill the global pool from a single card and get
+    every other sandbox refused. So the order is waiters, then join, then cards:
+
+      1. global waiters   — every request costs one, joined or not
+      2. per-client waiters
+      3. JOIN and return  — costs no card, so nothing below applies
+      4. global cards     — only a new card reaches here
+      5. per-client cards
 
     A rejection is also recorded in ``_SATURATION`` here rather than by the caller,
     so the one place that decides "over the cap" is the one place that reports it —
-    the alternative leaves a second call site free to fail closed silently."""
+    the alternative leaves a second call site free to fail closed silently. The scope
+    string names WHICH of the four fired, because "one agent is hammering" and "the
+    whole control plane is loaded" want different responses from the operator."""
     key = _group_key(client, host, port, proto)
     with _LOCK:
         def refuse(scope: str) -> HoldSlot:
@@ -162,8 +213,12 @@ def _reserve_hold(approval_id: str, event: threading.Event,
             return HoldSlot(None, None, False,
                             f"hold capacity exceeded ({scope}) — fail-closed", 0.0)
 
-        if sum(_PENDING_WAITERS.values()) >= MAX_PENDING:
-            return refuse("global")
+        if sum(_PENDING_WAITERS.values()) >= MAX_WAITERS:
+            return refuse("global waiters")
+
+        if (client is not None and MAX_WAITERS_PER_CLIENT > 0
+                and _client_waiters_locked(client) >= MAX_WAITERS_PER_CLIENT):
+            return refuse(f"client {client} waiters")
 
         joined_id = _GROUPS.get(key)
         joined_event = _PENDING_EVENTS.get(joined_id) if joined_id else None
@@ -172,10 +227,13 @@ def _reserve_hold(approval_id: str, event: threading.Event,
             return HoldSlot(joined_id, joined_event, True, None,
                             _PENDING_DEADLINE.get(joined_id, 0.0))
 
+        if len(_PENDING_EVENTS) >= MAX_PENDING:
+            return refuse("global cards")
+
         if (client is not None and MAX_PENDING_PER_CLIENT > 0
                 and sum(1 for c in _PENDING_CLIENT.values() if c == client)
                 >= MAX_PENDING_PER_CLIENT):
-            return refuse(f"client {client}")
+            return refuse(f"client {client} cards")
 
         deadline = time.time() + HOLD_TIMEOUT
         _PENDING_EVENTS[approval_id] = event
@@ -216,14 +274,19 @@ def _close_group(approval_id: str) -> None:
 def _saturation() -> dict:
     """Hold-cap pressure, for the UI banner.
 
-    ``in_flight`` is BLOCKED WAITERS — the set the global cap is actually measured
-    against — and NOT the pending approvals list, which is a different set twice over.
-    It diverges after a restart, when the table can carry ``pending`` rows with no live
-    hold behind them; and it diverges whenever duplicates are grouped, since one card
-    can hold several waiters. A count derived from the visible cards would therefore be
-    confidently wrong in the one situation this exists to report. ``cards`` is that
-    other number, reported beside it rather than instead of it — "12/16 in flight"
-    reads as an emergency next to three cards until you can see both.
+    Two gauges, because there are two global caps and either can be the one about to
+    fire. ``in_flight``/``max_waiters`` is blocked workers; ``cards``/``max_pending`` is
+    questions on the operator's screen. The banner shows whichever is nearer its limit
+    (see ``saturationState`` in app.js) — sending only one would hide the cap that is
+    actually about to deny.
+
+    ``in_flight`` is BLOCKED WAITERS and NOT the pending approvals list, which is a
+    different set twice over. It diverges after a restart, when the table can carry
+    ``pending`` rows with no live hold behind them; and it diverges whenever duplicates
+    are grouped, since one card can hold several waiters. A count derived from the
+    visible cards would therefore be confidently wrong in the one situation this exists
+    to report — "12/16 in flight" reads as an emergency next to three cards until you
+    can see both.
 
     Every timestamp here is ABSOLUTE. An elapsed-seconds field would change on every
     tick, and the SSE stream emits on payload change — so it would defeat the
@@ -233,6 +296,7 @@ def _saturation() -> dict:
         return {
             "in_flight": sum(_PENDING_WAITERS.values()),
             "cards": len(_PENDING_EVENTS),
+            "max_waiters": MAX_WAITERS,
             "max_pending": MAX_PENDING,
             "rejections": _SATURATION["count"],
             "acknowledged": _SATURATION["acked"],

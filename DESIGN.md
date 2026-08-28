@@ -1190,15 +1190,14 @@ future connections skip the hold — the progressive-trust path). Concurrency:
 one uvicorn worker; a held request blocks its threadpool worker on a
 `threading.Event` the resolve endpoint sets; SQLite (`approvals` table) is the
 UI's source of truth; stale `pending` rows are expired on startup. **Holds are
-bounded** (`CONTROL_MAX_PENDING`, `CONTROL_MAX_PENDING_PER_CLIENT`): since each
-hold pins a threadpool worker and this control plane is **shared across all
-sandboxes**, an unbounded queue would let one agent exhaust the pool and stall
-every sandbox's governed egress. Over either cap, `/authorize` fails **closed**
-(deny) immediately instead of registering another blocking hold — the cap stays
-comfortably under the worker pool so fast allow/deny decisions always have free
-workers, and the permanent lifeline is unaffected (it never reaches the control
-plane). The two caps count **different sets** — waiters and cards respectively — since
-duplicate holds share a card; see "Duplicate holds share one card" below.
+bounded**: since each hold pins a threadpool worker and this control plane is
+**shared across all sandboxes**, an unbounded queue would let one agent exhaust the
+pool and stall every sandbox's governed egress. Over any cap, `/authorize` fails
+**closed** (deny) immediately instead of registering another blocking hold — the
+worker caps stay comfortably under the pool so fast allow/deny decisions always have
+free workers, and the permanent lifeline is unaffected (it never reaches the control
+plane). There are **four** caps, because there are two things to protect and two
+scopes to protect them at; see "Four hold caps: two nouns, two scopes" below.
 
 ### Approval UI — the one surface that can grant egress
 
@@ -1344,8 +1343,8 @@ need a new column on `approvals`, which has no migration step (see the NOTE abov
 `_seed_if_empty`); the rule itself is recorded with its pattern and `source='operator'`
 in the rules table, and every later use of it is audited as `allowed by rule (…)`.
 
-**The banner for requests that never became cards.** Over `CONTROL_MAX_PENDING` (16) or
-`CONTROL_MAX_PENDING_PER_CLIENT` (4), `/authorize` fails closed **without creating an
+**The banner for requests that never became cards.** Over any of the four hold caps
+(see "Four hold caps: two nouns, two scopes"), `/authorize` fails closed **without creating an
 approval row** — correct, since default-deny is the right failure and a held request
 pins a threadpool worker this control plane shares across every sandbox. But it meant
 the agent was being refused while the operator's queue looked exactly like a quiet
@@ -1452,10 +1451,10 @@ What made this more than a UI tidy-up is that **the two caps were counting the s
 while protecting different things**, and nothing made that visible until duplicates
 stopped being distinct. The global cap bounds *blocked workers* — the availability of
 governance for every other sandbox. The per-client cap bounds *cards on the operator's
-screen* — attention. Grouping forced them apart: the global cap now counts waiters and a
-joined request costs one, while the per-client cap counts cards and a joined request
-costs nothing. Skip that split and the feature is cosmetic; the fifth retry is still
-refused at four, just after showing one card instead of four.
+screen* — attention. Grouping forced them apart. Skip that split and the feature is
+cosmetic; the fifth retry is still refused at four, just after showing one card instead
+of four. Forcing them apart is also what left a gap on the other diagonal — see "Four
+hold caps: two nouns, two scopes" below.
 
 The governance cost is real and is paid explicitly. **"Allow once" now releases every
 request on the card**, which widens what a single click grants — the precise class of
@@ -1480,6 +1479,39 @@ row: only one of them wins the conditional expiry `UPDATE`, so the outcome each 
 is read from the row's *status* rather than from "did I win". Branching on the latter —
 which is what the single-waiter code did — told every loser that a human had rejected
 their request.
+
+**Four hold caps: two nouns, two scopes.** Grouping split *cards* from *waiters*, and
+the caps were left describing three of the four cells: global waiters, per-client cards,
+and nothing bounding one client's share of the workers. That missing cell was a real
+defect rather than a tidiness gap. Duplicates cost the card caps nothing by design, so
+one agent retrying one host filled the entire global pool **from a single card**, and
+every other sandbox was refused until those holds drained. The per-client cap could not
+see it at any setting, because it was counting the wrong noun.
+
+So the grid is completed and the names say which cell they are:
+`CONTROL_MAX_PENDING` / `CONTROL_MAX_PENDING_PER_CLIENT` count **cards** and protect
+attention; `CONTROL_MAX_WAITERS` / `CONTROL_MAX_WAITERS_PER_CLIENT` count **waiters**
+and protect the threadpool. Three consequences worth recording, because none is
+recoverable from the constants:
+
+- **`CONTROL_MAX_PENDING` changed meaning**, from waiters to cards. It is the same name
+  for a different noun, which is the one kind of change a config file cannot announce,
+  so `_bootstrap` logs all four with their units at every boot.
+- **The ordering rule is the actual fix**: every cap a request will draw on is checked
+  *before* the early return that consumes it. The bug was positional — the join
+  returned above the per-client check — and `_reserve_hold` now runs global waiters,
+  per-client waiters, join-and-return, global cards, per-client cards. A cap check
+  after an early return is the shape to look for; the MCP gateway adds a fifth cap of
+  its own and should copy this order, not the old one.
+- **The defaults are chosen so every cap can fire first.** Cards are always ≤ waiters,
+  so a card cap set equal to its waiter cap is dead code that no test would notice.
+  12/4 cards against 16/8 waiters keeps all four live, and a test asserts the
+  relationship rather than the numbers.
+
+Zero means different things by scope, deliberately: on a global cap it refuses
+everything (fail-closed, and a plausible way to say "stop holding anything"), on a
+per-client cap it disables the cap — the fail-closed reading would make every client's
+first hold impossible, which cannot be what setting it meant.
 
 **A persist cannot overwrite, so one that would is refused.** `rules.pattern` is
 `UNIQUE`, and the insert was `INSERT OR IGNORE` — so persisting a pattern that already
@@ -2200,7 +2232,7 @@ learn that governance is refusing things.
 
 An earlier draft of this section rested the argument on a shared worker pool as well.
 That leg is gone: a tool ask no longer pins a control-plane worker and no longer draws
-on `MAX_PENDING` (see "An `ask` answers immediately"), so the two surfaces have
+on `MAX_WAITERS` (see "An `ask` answers immediately"), so the two surfaces have
 separate capacity and the "one queue empties while another consumes the pool" case
 cannot arise. The decision stands on the stream.
 
@@ -2246,7 +2278,7 @@ never decide.
 a control-plane worker either — two independent choices, both away from the egress
 shape. It *registers* the ask with the control plane and takes an id back at
 once, rather than having its call held open and woken by a `threading.Event` — so a
-tool ask pins no threadpool worker and does not draw on `MAX_PENDING`, whose whole
+tool ask pins no threadpool worker and does not draw on `MAX_WAITERS`, whose whole
 purpose is that a slow decision must never starve the `/authorize` path the agent
 depends on to work at all. And the gateway answers the *agent* immediately too, with
 a **pending result** naming the approval, rather than holding the MCP call open.
@@ -3008,7 +3040,7 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
   a `threading.Event`, pinning a threadpool worker. A tool ask does neither — the
   gateway registers it and answers the agent with a pending result. See "An `ask`
   answers immediately" for the reasoning and for what makes the pending answer safe.
-  Three consequences settled with it: a tool ask does **not** draw on `MAX_PENDING`
+  Three consequences settled with it: a tool ask does **not** draw on `MAX_WAITERS`
   and gets its own cap, the tool hold window is a second number free of any client
   timeout (per-surface config, which is the shape 2c-2 is being built for), and
   **withdrawal is moot** — nothing is held open, so there is no stranded caller to

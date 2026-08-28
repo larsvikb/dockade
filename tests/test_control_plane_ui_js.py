@@ -66,7 +66,7 @@ const m = require(process.env.DOCKADE_APP_JS);
 const missing = ["lampState", "backoffDelay", "diffPending", "shouldSweep",
                  "holdRemaining", "countdownState", "departure", "persistPreview",
                  "normalizePattern", "createPreview",
-                 "saturationState", "ackCount", "requestsLabel",
+                 "saturationState", "ackCount", "capScope", "requestsLabel",
                  "auditRow", "auditStatus", "rulesStatus", "repeatCount",
                  "timeWindow", "filterActive", "auditQuery", "eventRow",
                  "historyPager",
@@ -177,10 +177,14 @@ console.log(JSON.stringify({
   // ago" below is arithmetic on constants rather than on the wall clock.
   saturation: (() => {
     const NOW = 1e12;
-    const base = { in_flight: 0, max_pending: 16, rejections: 0,
+    // TWO global caps, so two gauges. `max_pending` counts cards and `max_waiters`
+    // counts blocked requests; the cards cap is the lower of the two, exactly as the
+    // shipped defaults are, so a case has to say which one it is driving.
+    const base = { in_flight: 0, cards: 0, max_pending: 12, max_waiters: 16,
+                   rejections: 0,
                    last_ts: null, last_scope: null, last_host: null, since: 1e9 };
     const rej = (over) => ({ ...base, rejections: 3, last_host: "pypi.org",
-                             last_scope: "client 172.30.0.9",
+                             last_scope: "client 172.30.0.9 cards",
                              last_ts: (NOW - over) / 1000 });
     return {
       quiet: m.saturationState(base, NOW, 0),
@@ -194,18 +198,33 @@ console.log(JSON.stringify({
       // queue of 12 that has stopped draining.
       grouped_load: m.saturationState(
         { ...base, in_flight: 12, cards: 2 }, NOW, 0).text,
-      // Ungrouped, the two numbers agree and the extra clause is noise.
+      // Ungrouped, the two numbers agree and the extra clause is noise. `cards: 12`
+      // against a card cap of 12 would otherwise be the fuller gauge, so this case
+      // raises that cap to keep the WAITER gauge the one being asserted.
       ungrouped_load: m.saturationState(
-        { ...base, in_flight: 12, cards: 12 }, NOW, 0).text,
+        { ...base, in_flight: 12, cards: 12, max_pending: 100 }, NOW, 0).text,
       // An older backend sends no `cards` at all.
-      no_cards_field: m.saturationState({ ...base, in_flight: 12 }, NOW, 0).text,
+      no_cards_field: m.saturationState(
+        { ...base, in_flight: 12, cards: undefined }, NOW, 0).text,
+      // The CARD gauge as the fuller one: 11 cards against 12 is 92%, while 11
+      // waiters against 16 is under the warn fraction. Reporting the waiter gauge
+      // here would hide the cap that is actually about to deny.
+      cards_are_the_fuller_gauge: m.saturationState(
+        { ...base, in_flight: 11, cards: 11 }, NOW, 0).text,
+      // A cap of 0 refuses everything, and a `0/0` gauge would divide by zero. The
+      // rejection notice reports that situation far better, so the gauge drops it.
+      zero_cap: m.saturationState(
+        { ...base, in_flight: 5, max_pending: 0, max_waiters: 0 }, NOW, 0),
+      scopes: ["global cards", "global waiters",
+               "client 172.30.0.9 cards", "client 172.30.0.9 waiters",
+               "", "nonsense"].map(s => [s, m.capScope(s)]),
       recent: m.saturationState(rej(5000), NOW, 0),
       just_inside: m.saturationState(rej(m.SATURATION_RECENT_MS - 1), NOW, 0),
       just_outside: m.saturationState(rej(m.SATURATION_RECENT_MS + 1), NOW, 0),
       // A rejection with no usable stamp must not be silently downgraded to "past".
       no_stamp: m.saturationState({ ...base, rejections: 1 }, NOW, 0),
       global_scope: m.saturationState(
-        { ...rej(5000), last_scope: "global" }, NOW, 0).detail,
+        { ...rej(5000), last_scope: "global waiters" }, NOW, 0).detail,
       no_scope: m.saturationState(
         { ...rej(5000), last_scope: null, last_host: null }, NOW, 0).detail,
       dismissed: m.saturationState(rej(5000), NOW, 3),
@@ -806,8 +825,37 @@ class PageScriptTests(unittest.TestCase):
         self.assertIn("12/16 requests held on 2 cards", sat["grouped_load"])
         # When they agree, the extra clause would be noise — and an older backend
         # sending no `cards` field must not render "on 0 cards".
-        self.assertEqual(sat["ungrouped_load"], "12/16 holds in flight")
-        self.assertEqual(sat["no_cards_field"], "12/16 holds in flight")
+        self.assertEqual(sat["ungrouped_load"], "12/16 requests held")
+        self.assertEqual(sat["no_cards_field"], "12/16 requests held")
+
+    def test_the_gauge_reports_whichever_cap_is_nearer_its_limit(self):
+        """Two global caps, and cards are always <= waiters — so the fuller gauge is
+        not always the same one. A fixed choice would hide the cap that is about to
+        deny, which is the only thing this banner exists to say early."""
+        sat = self.probe["saturation"]
+        self.assertEqual(sat["cards_are_the_fuller_gauge"], "11/12 cards")
+
+    def test_a_cap_of_zero_is_dropped_rather_than_divided_by(self):
+        # Zero on a global cap means "refuse everything", which the rejection notice
+        # reports properly. A gauge would render `5/0` or NaN.
+        self.assertFalse(self.probe["saturation"]["zero_cap"]["show"])
+
+    def test_the_scope_phrase_names_both_axes(self):
+        """`last_scope` carries which cap fired as "<who> <what>", and both halves
+        change what the operator should do: cards versus blocked workers is attention
+        versus capacity, global versus per-client is "the plane is loaded" versus "one
+        agent is hammering"."""
+        phrases = dict((k, v) for k, v in self.probe["saturation"]["scopes"])
+        self.assertEqual(phrases["global cards"], "the global card cap")
+        self.assertEqual(phrases["global waiters"], "the global blocked-request cap")
+        self.assertEqual(phrases["client 172.30.0.9 cards"],
+                         "the per-client card cap for 172.30.0.9")
+        self.assertEqual(phrases["client 172.30.0.9 waiters"],
+                         "the per-client blocked-request cap for 172.30.0.9")
+        # An absent or unrecognised scope shortens the sentence rather than inventing
+        # a phrase around a word this does not know.
+        self.assertEqual(phrases[""], "")
+        self.assertEqual(phrases["nonsense"], "")
 
     def test_a_rejection_is_reported_as_an_event_not_a_level(self):
         sat = self.probe["saturation"]
@@ -828,8 +876,8 @@ class PageScriptTests(unittest.TestCase):
         # Not in the headline (the operator's response is the same either way), but
         # carried here, because "one agent hammering" and "the whole control plane
         # loaded" are different situations.
-        self.assertIn("per-client cap for 172.30.0.9", sat["recent"]["detail"])
-        self.assertIn("the global cap", sat["global_scope"])
+        self.assertIn("per-client card cap for 172.30.0.9", sat["recent"]["detail"])
+        self.assertIn("the global blocked-request cap", sat["global_scope"])
         # A rejection with neither host nor scope must still render a sentence.
         self.assertEqual(sat["no_scope"], "last: unknown host")
 

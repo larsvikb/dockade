@@ -164,10 +164,11 @@ function persistPreview(action, option) {
   };
 }
 
-// Hold-cap pressure, as a banner state. Over CONTROL_MAX_PENDING(_PER_CLIENT) the
-// control plane fails closed WITHOUT creating an approval, so the agent is denied and
-// no card is ever raised — governance degrading to blanket-deny, and from this page
-// indistinguishable from a quiet afternoon.
+// Hold-cap pressure, as a banner state. Over any of the four hold caps (cards and
+// blocked requests, each global and per client — see holds.py) the control plane fails
+// closed WITHOUT creating an approval, so the agent is denied and no card is ever
+// raised — governance degrading to blanket-deny, and from this page indistinguishable
+// from a quiet afternoon.
 //
 // The rejection RECORD is what this reports, not the live level. Saturation is a
 // burst: holds drain in seconds, so a gauge alone shows a healthy number to anyone who
@@ -181,6 +182,28 @@ function persistPreview(action, option) {
 const SATURATION_RECENT_MS = 60000;
 const SATURATION_WARN_FRAC = 0.75;
 
+// Which of the four hold caps a rejection hit, as a phrase for the banner's detail.
+//
+// The control plane records the cap it actually checked, as "<who> <what>": who is
+// `global` or `client <address>`, what is `cards` or `waiters` (see _reserve_hold).
+// Both halves matter to the operator and they suggest different responses — "one agent
+// is hammering" versus "the whole control plane is loaded", and "too many questions on
+// screen" versus "too many blocked workers", which is a capacity problem rather than an
+// attention one.
+//
+// "waiters" is rendered as "blocked-request" rather than repeated: it is the control
+// plane's word for a pinned threadpool worker, which is an implementation fact the
+// operator has no reason to hold. An unrecognised scope yields "" so the sentence is
+// simply shorter, never a phrase invented around a word this does not know.
+function capScope(scope) {
+  const m = /^(global|client .+) (cards|waiters)$/.exec(String(scope || ""));
+  if (!m) return "";
+  const what = m[2] === "waiters" ? "blocked-request" : "card";
+  return m[1] === "global"
+    ? `the global ${what} cap`
+    : `the per-client ${what} cap for ${m[1].replace(/^client /, "")}`;
+}
+
 // `dismissedCount` is the rejection total already acknowledged — held in the CONTROL
 // PLANE, not here, because a dismissal that a reload undoes is worse than no button at
 // all: the operator believes they cleared something and the page disagrees the moment
@@ -192,10 +215,20 @@ const SATURATION_WARN_FRAC = 0.75;
 function saturationState(sat, nowMs, dismissedCount = 0) {
   const hidden = { show: false, level: "none", count: 0, text: "", detail: "", lastTs: null };
   if (!sat) return hidden;
-  const cap = Number(sat.max_pending) || 0;
   const inFlight = Number(sat.in_flight) || 0;
   const cards = Number(sat.cards) || 0;
   const rejections = Number(sat.rejections) || 0;
+  // TWO global caps, so two gauges. Cards are always <= waiters, so the fuller one is
+  // not always the same one, and reporting a fixed choice would hide the cap that is
+  // actually about to deny. A cap of 0 is dropped rather than divided by: on a global
+  // cap zero means "refuse everything", which the rejection notice above already
+  // reports far better than a `0/0` gauge could.
+  const gauges = [
+    { n: inFlight, cap: Number(sat.max_waiters) || 0, unit: "requests held" },
+    { n: cards, cap: Number(sat.max_pending) || 0, unit: "cards" },
+  ].filter(g => g.cap > 0);
+  const fullest = gauges.reduce(
+    (a, b) => (b.n / b.cap > a.n / a.cap ? b : a), gauges[0] || null);
 
   // The UNREAD count, not the lifetime total: after dismissing at 2, a third rejection
   // reads "1 request denied unheard", and the `since` stamp beside it has moved to the
@@ -218,28 +251,25 @@ function saturationState(sat, nowMs, dismissedCount = 0) {
       // SINCE WHEN, because this counter is in-memory and a restart silently resets
       // it. "3 since 14:02" cannot be misread as "3 ever".
       detail: (sat.last_host ? `last: ${sat.last_host}` : "last: unknown host") +
-              (sat.last_scope
-                ? " — hit " + (sat.last_scope === "global"
-                    ? "the global cap"
-                    : `the per-client cap for ${String(sat.last_scope).replace(/^client /, "")}`)
-                : ""),
+              (capScope(sat.last_scope) ? ` — hit ${capScope(sat.last_scope)}` : ""),
       lastTs: known ? lastTs : null,
     };
   }
 
   // No rejections yet: warn only once the cap is close enough that the next burst
   // would hit it. Below that this is noise on a page whose job is the queue.
-  if (cap > 0 && inFlight >= cap * SATURATION_WARN_FRAC) {
+  if (fullest && fullest.n >= fullest.cap * SATURATION_WARN_FRAC) {
     return {
       show: true, level: "load", count: 0,
-      // The cap counts BLOCKED REQUESTS, and duplicates share a card — so this number
-      // can be far above the number of cards on screen. Said out loud when they
-      // differ, because "14/16 holds in flight" beside two cards otherwise reads as a
-      // queue that has stopped draining.
-      text: cards > 0 && cards !== inFlight
-        ? `${inFlight}/${cap} requests held on ${cards} card${cards === 1 ? "" : "s"}`
-        : `${inFlight}/${cap} holds in flight`,
-      detail: inFlight >= cap
+      // Duplicates share a card, so the blocked-request count can be far above the
+      // number of cards on screen. Said out loud when they differ, because "14/16
+      // requests held" beside two cards otherwise reads as a queue that has stopped
+      // draining.
+      text: fullest.unit === "requests held" && cards > 0 && cards !== inFlight
+        ? `${inFlight}/${fullest.cap} requests held on ${cards} card` +
+          `${cards === 1 ? "" : "s"}`
+        : `${fullest.n}/${fullest.cap} ${fullest.unit}`,
+      detail: fullest.n >= fullest.cap
         ? "at the cap — further requests are denied without raising a card"
         : "near the cap — further requests would be denied without raising a card",
       lastTs: null,
@@ -2106,7 +2136,7 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     lampState, backoffDelay, diffPending, shouldSweep,
     holdRemaining, countdownState, departure, persistPreview, saturationState,
-    ackCount, requestsLabel, auditRow, auditStatus, rulesStatus, repeatCount,
+    ackCount, capScope, requestsLabel, auditRow, auditStatus, rulesStatus, repeatCount,
     outageSummary, pendingAnnouncement, coverageSummary, revokePreview,
     normalizePattern, createPreview,
     timeWindow, filterActive, auditQuery, eventRow, historyPager,

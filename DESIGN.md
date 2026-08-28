@@ -1820,6 +1820,16 @@ lands in its own, with the gateway (see "Tool policy gets its own table"), so th
 config surface treats a second governed service as a surface with its own policy and
 not as a filter over this one.
 
+**URLs carry the surface: `/api/egress/rules` now, `/api/mcp/rules` with the
+gateway.** `/api/rules` is a generic name on a specific thing, and the rename is
+cheapest before 2c-2 hangs a POST and a config surface off it — today the only
+consumers are the UI and the relay's path allowlist. The lifecycle endpoints keep
+unprefixed names (`/approvals`, `/approvals/stream`, `/approvals/{id}/resolve`), so
+the URL shape states the split itself: prefixed is per-surface policy, unprefixed is
+the one queue every surface feeds (see "`approvals` splits the same way"). The shape
+rejected on the way is `/api/rules?surface=…`, a discriminator over a single path —
+the storage mistake above wearing an API hat.
+
 Not yet built: per-proxy config (2c-2), git/secrets/cache data-plane services, the
 MCP gateway, skills, quality-gate hooks.
 
@@ -2104,6 +2114,42 @@ set, the operator picks from it, the chosen value is shown verbatim — and the 
 themselves have no common implementation: one is host-breadth, the other
 argument-shaped and server-specific.
 
+**`approvals` splits the same way; the operator's queue does not.** The approvals
+table is egress-shaped exactly as `rules` is — `host`, `port`, `proto`, `client`,
+`client_class`, `method`, `url`, against a tool ask's server, tool and arguments — so
+it splits for the same reasons, and `control-plane/holds.py` splits with it along a
+seam it already has. The in-memory registry (events, deadlines, waiter counts, the
+caps) is keyed by approval id and is entirely payload-agnostic; `_group_key` and
+`_list_pending`'s SELECT and `persist_options` are not. The gateway brings its own
+rim and reuses the core.
+
+What must **not** split is the pending queue: one list, one SSE stream, one saturation
+accounting. The principle is not that reads merge — it is that a union is worth
+serving only when the union is itself the object. Nobody asks for every rule across
+every subsystem, which is why the rules views stay per-surface. "How many decisions
+are waiting, how long have I got, and is the queue at capacity" is asked constantly
+and cannot be answered one surface at a time.
+
+What forces it is that **a partly connected merged view is indistinguishable from an
+empty one.** A pending decision is time-bounded and blocks work; with one stream,
+"disconnected" is a single honest boolean the UI can show, whereas two streams merged
+in the browser render a silent subset when one drops — and a subset of a queue looks
+exactly like an empty queue. Saturation reporting pulls the same way, though less
+hard: over a cap a request fails closed *without raising a card* (the invisibility
+`_SATURATION` exists to fix), and an operator should not have to check two banners to
+learn that governance is refusing things.
+
+An earlier draft of this section rested the argument on a shared worker pool as well.
+That leg is gone: a tool ask no longer pins a control-plane worker and no longer draws
+on `MAX_PENDING` (see "An `ask` answers immediately"), so the two surfaces have
+separate capacity and the "one queue empties while another consumes the pool" case
+cannot arise. The decision stands on the stream.
+
+Merging the queue merges little else. The tables are separate, `resolve` keeps
+per-surface action sets (dispatched on the card's kind, since the approval id already
+determines its table), each surface renders its own card, and the merged payload is a
+union of two per-surface builders rather than one query over a discriminator column.
+
 **Two axes, not one.** A rule here governs two separable things: whether a tool's
 schema is **presented**, and whether a call is **executed**. Withholding a schema is
 ergonomics — it keeps the agent from planning around a capability it cannot have.
@@ -2137,6 +2183,53 @@ annotations are **server-supplied and therefore untrusted**: they may sort and l
 the configuration surface ("this server claims these are read-only"), and they must
 never decide.
 
+**An `ask` answers immediately.** The gateway never blocks the agent, and never blocks
+a control-plane worker either — two independent choices, both away from the egress
+shape. It *registers* the ask with the control plane and takes an id back at
+once, rather than having its call held open and woken by a `threading.Event` — so a
+tool ask pins no threadpool worker and does not draw on `MAX_PENDING`, whose whole
+purpose is that a slow decision must never starve the `/authorize` path the agent
+depends on to work at all. And the gateway answers the *agent* immediately too, with
+a **pending result** naming the approval, rather than holding the MCP call open.
+
+Blocking the agent was available — a per-server `timeout` raises the first-byte timer
+to match, so a long wait is configurable — and is rejected on the shape of the limit
+rather than its size: it is a hard wall-clock bound with no extension path (progress
+notifications do not lift it), and it defaults to roughly a day. Blocking would mean
+a design whose failure mode is a stranded call, tuned by a number whose default is
+useless. Answering immediately makes the hold window a **human** parameter, free to
+be minutes or hours because nothing is waiting on it. The measurements are in
+NOTES.md; the numbers are deliberately not repeated here.
+
+Three properties make the pending answer safe rather than merely non-blocking:
+
+- **It is a result, not an error.** "Held for approval, id X, retry later" is
+  something an agent can act on — do other work, come back. A failure is not, and an
+  agent that records the call as failed is the stranded-caller problem arriving by a
+  different route.
+- **A grant is bound to the payload, not to the tool.** The approval is keyed by a
+  hash of the arguments the human actually read, so a retry with *different*
+  arguments cannot ride an approval given for different ones. The same hash is the
+  join key: an identical retry attaches to the pending ask instead of raising a
+  second card, which is what `_GROUPS` does for egress duplicates.
+- **A decided ask is terminal and says so.** `denied` and `expired` must be
+  unmistakably distinct from `pending`, and unmistakably final, or an agent retries a
+  refusal forever.
+
+**Retry pressure is contained by the caps, not by instructions.** The instruction to
+retry travels *in the pending result*, where it cannot be forgotten mid-session and
+cannot drift from the gateway that emits it — deliberately not a rule in a
+`CLAUDE.md`, which would be a copy of a behaviour, read every session for something
+that happens rarely, and stale the moment the gateway changed. Nothing enforces an
+instruction anyway, so the containment is structural and mirrors the two caps
+`control-plane/holds.py` already distinguishes. A repeated *identical* ask is O(1) —
+it joins by hash, raises no card, and costs the agent its own context rather than
+costing governance anything. What actually needs bounding is the other loop: an agent
+opening *fresh* asks with slightly varied payloads defeats hash-joining and floods the
+human, which is the attention-DoS `MAX_PENDING_PER_CLIENT` exists for on the egress
+side. The tool surface needs that cap most, and its own, since the two surfaces no
+longer share a pool.
+
 **Presenting a payload for approval.** A schema-driven view gets most of the way —
 the tool's JSON Schema gives a field tree with each field's description beside it —
 but the rule the approval UI already established governs: the **raw payload is
@@ -2149,12 +2242,15 @@ calls — new capability on the crown-jewel container and a fine SSRF surface. T
 card names the gap instead.
 
 **Two failure modes the egress proxy does not have.**
-- **Executing after the caller is gone.** If the hold outlives the client's MCP tool
-  timeout, a human approves, the gateway executes, and the agent has already
+- **Executing after the caller is gone.** If a held call outlives the client's MCP
+  tool timeout, a human approves, the gateway executes, and the agent has already
   recorded a failure — a message sent that nobody wanted, invisible to both sides.
-  So: cancel on client disconnect, keep the hold window strictly under the client
-  timeout, and audit the case where it fires anyway. The proxy has no side effects to
-  strand, which is why this appears for the first time here.
+  The proxy has no side effects to strand, which is why this appears for the first
+  time here. **Answering an `ask` immediately removes it** (see "An `ask` answers
+  immediately"): nothing is held open, so there is no caller to lose and no
+  disconnect to cancel on. The earlier plan — cancel on disconnect and keep the hold
+  window under the client timeout — was written for a blocking gateway and does not
+  apply; the timer facts that killed it are in NOTES.md.
 - **The response is the channel.** The gateway governs the *request*, but what steers
   an agent is the third-party text arriving in its context — an `allow`-ed,
   read-only tool is unaudited intake of the same shape as WebSearch, and content in
@@ -2797,6 +2893,17 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
   (proxy-less) fallback, where the firewall directly allowlists api.anthropic.com.
 - **Web search backend** — which third-party search API for the `websearch`
   skill (Brave / SerpAPI / Google CSE).
+- **RESOLVED — a tool `ask` is registered and answered immediately, not held.** The
+  egress shape blocks: `/authorize` is held open inside the control plane and woken by
+  a `threading.Event`, pinning a threadpool worker. A tool ask does neither — the
+  gateway registers it and answers the agent with a pending result. See "An `ask`
+  answers immediately" for the reasoning and for what makes the pending answer safe.
+  Three consequences settled with it: a tool ask does **not** draw on `MAX_PENDING`
+  and gets its own cap, the tool hold window is a second number free of any client
+  timeout (per-surface config, which is the shape 2c-2 is being built for), and
+  **withdrawal is moot** — nothing is held open, so there is no stranded caller to
+  cancel. It also means the single-queue decision now rests on the SSE argument
+  alone: the worker pool is no longer shared.
 - **Which governed path owns repo writes.** The planned git proxy speaks the git
   protocol; a GitHub MCP server behind the gateway reaches the same capability
   through the REST API (create-or-update-file style tools commit without ever

@@ -175,6 +175,34 @@ headless runs a directory can start a process merely by containing a file. The
 interactive path was **not** tested and may well prompt; the point is that the
 prompt is not what makes it safe.
 
+## An MCP tool call has three timers, and the one that bites defaults to ~28 hours
+
+From the Claude Code MCP documentation (`https://code.claude.com/docs/en/mcp`), read
+while deciding whether a gateway `ask` may block the agent. **Documented, not
+measured** — the defaults below have not been probed in-container, and the 28-hour
+figure especially is worth pinning before anything depends on it.
+
+| Timer | Scope | Default |
+| --- | --- | --- |
+| `MCP_TIMEOUT` | server **startup** | not stated in the docs |
+| `MCP_TOOL_TIMEOUT` | per tool call, when no per-server `timeout` is set | ~28 hours |
+| per-server `timeout` (ms, in the server's config entry) | per tool call | unset |
+| first-response-byte, HTTP/SSE/WS servers only | per request | 60 s, raised to match `timeout` / `MCP_TOOL_TIMEOUT` when either is ≥ 60 s |
+
+Three consequences, in the order they surprised:
+
+- The per-server `timeout` is a **hard wall-clock limit**, and **progress
+  notifications do not extend it**. MCP's own keepalive mechanism is therefore
+  unavailable as a way to hold a call open past the limit — the option that looks
+  obvious from the protocol does not exist in this client.
+- The first-byte timer is the one an HTTP server hits first, and it is only 60 s
+  *until* a longer `timeout` is configured, at which point it rises to match. So a
+  server that intends to answer slowly must set `timeout`; there is nothing to set on
+  the first-byte timer directly.
+- Unset means ~28 hours, not "a sensible minute or two". Any design that blocks the
+  caller and relies on the default to bound it hangs the agent for a day rather than
+  failing — the failure mode arrives in someone else's config, not the author's.
+
 ## A directory marketplace is used in place, and `settings.json` is the whole declaration
 
 Measured in-container on Claude Code 2.1.236, with a fixture marketplace

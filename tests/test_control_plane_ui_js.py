@@ -43,6 +43,11 @@ INDEX_HTML = ROOT / "control-plane-ui" / "index.html"
 # this keeps the file runnable on its own too. Imported for `_CSP` / `_directives` —
 # the policy and its parser live with the app, so this module does not restate them.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# ``cp`` is the loaded control plane, for the two places this page duplicates a backend
+# rule and has to be held equal to it: `normalizePattern` and the wildcard floor.
+# Imported from the sibling test module rather than loaded again — that module already
+# owns the temp-store setup, and loading twice would give two modules with two databases.
+from test_control_plane_api import cp  # noqa: E402 (path set above)
 from test_control_plane_ui import _directives, ui  # noqa: E402 (path set above)
 
 _NODE = shutil.which("node")
@@ -60,6 +65,7 @@ _PROBE = r"""
 const m = require(process.env.DOCKADE_APP_JS);
 const missing = ["lampState", "backoffDelay", "diffPending", "shouldSweep",
                  "holdRemaining", "countdownState", "departure", "persistPreview",
+                 "normalizePattern", "createPreview",
                  "saturationState", "ackCount", "requestsLabel",
                  "auditRow", "auditStatus", "rulesStatus", "repeatCount",
                  "timeWindow", "filterActive", "auditQuery", "eventRow",
@@ -431,6 +437,37 @@ console.log(JSON.stringify({
         // direction, not the safe one.
         unknown_action: m.revokePreview({ pattern: "x", action: "", source: "op" }),
         nothing: m.revokePreview(null),
+      },
+      // The pattern as the STORE will hold it. Compared against the backend's own
+      // normalizer by a test below, which is the whole reason these are echoed as
+      // pairs rather than asserted here.
+      normalize: ["Example.COM.", "  .Example.com  ", "example.com..", ".", "",
+                  "EXAMPLE.com", "10.0.0.7.", ".co.uk"]
+        .map(s => [s, m.normalizePattern(s)]),
+      wildcard_min_labels: m.WILDCARD_MIN_LABELS,
+      create: {
+        nothing: m.createPreview("", "allow", "sandbox", []),
+        no_class: m.createPreview("example.com", "allow", "", []),
+        exact_allow: m.createPreview("pypi.example", "allow", "sandbox", []),
+        // Normalization is visible in the preview, because the confirm has to be
+        // about the rule that will actually land.
+        normalized: m.createPreview(" PyPI.Example. ", "allow", "sandbox", []),
+        wildcard_allow: m.createPreview(".example.com", "allow", "sandbox", []),
+        exact_block: m.createPreview("evil.example", "block", "sandbox", []),
+        // The floor: `.com` as an allow ends governance for a TLD, and as a block
+        // only tightens.
+        tld_allow: m.createPreview(".com", "allow", "sandbox", []),
+        tld_block: m.createPreview(".com", "block", "sandbox", []),
+        conflict: m.createPreview("evil.example", "allow", "sandbox",
+          [{ pattern: "evil.example", action: "block", client_class: "sandbox" }]),
+        redundant: m.createPreview("evil.example", "block", "sandbox",
+          [{ pattern: "evil.example", action: "block", client_class: "sandbox" }]),
+        // The same pattern in ANOTHER class is not a conflict — uniqueness is the
+        // pair, and refusing here would make one class's policy unwritable.
+        other_class: m.createPreview("evil.example", "allow", "sandbox",
+          [{ pattern: "evil.example", action: "block", client_class: "mcp" }]),
+        // An unrecognised action must preview as the SAFER reading.
+        unknown_action: m.createPreview("example.com", "", "sandbox", []),
       },
       announce: {
         nothing: m.pendingAnnouncement([], 0),
@@ -1087,6 +1124,101 @@ class PageScriptTests(unittest.TestCase):
         r = self.probe["saturation"]["revoke"]
         self.assertTrue(r["unknown_action"]["danger"])
         self.assertTrue(r["nothing"]["danger"])
+
+    # ── writing a rule with no held request behind it ────────────────────────
+
+    def test_the_page_normalizes_a_pattern_exactly_as_the_backend_does(self):
+        """Two implementations of one rule, in two languages, with nothing between
+        them. They have to agree or the confirm step lies: it quotes what the page
+        thinks will be stored, and the backend stores something else. `Example.COM.`
+        and `example.com` are the same rule; `.example.com` and `example.com` are not,
+        and the difference is one character of punctuation."""
+        for typed, in_page in self.probe["saturation"]["normalize"]:
+            with self.subTest(pattern=typed):
+                self.assertEqual(in_page, cp.policy._normalize_pattern(typed))
+
+    def test_the_wildcard_floor_is_the_same_number_on_both_sides(self):
+        # The one piece of the grammar the page duplicates (see createPreview). A page
+        # with a lower floor offers a grant the backend refuses; a higher one hides a
+        # rule the operator is entitled to write.
+        self.assertEqual(self.probe["saturation"]["wildcard_min_labels"],
+                         cp.policy._WILDCARD_MIN_LABELS)
+
+    def test_the_preview_says_the_consequence_and_names_the_class(self):
+        """Same discipline as revokePreview: the world, not the row. And the class is
+        in the sentence because a rule is the pattern AND the class — the same pattern
+        written for two classes is two different rules with two different effects."""
+        c = self.probe["saturation"]["create"]["exact_allow"]
+        self.assertTrue(c["ok"])
+        self.assertIn("sandbox", c["text"])
+        self.assertIn("pypi.example", c["text"])
+        self.assertIn("without being held for approval", c["text"])
+
+    def test_the_preview_quotes_the_pattern_that_will_actually_be_stored(self):
+        # The typed string and the stored one differ whenever normalization does
+        # anything, and it is the stored one the confirm has to be about.
+        c = self.probe["saturation"]["create"]["normalized"]
+        self.assertEqual(c["pattern"], "pypi.example")
+        self.assertIn("pypi.example", c["text"])
+
+    def test_an_allow_is_the_flagged_direction_and_a_block_is_not(self):
+        # An allow grants egress with no hold and no click; a block only tightens, and
+        # is revocable. The asymmetry the whole endpoint is shaped around.
+        create = self.probe["saturation"]["create"]
+        self.assertTrue(create["exact_allow"]["danger"])
+        self.assertFalse(create["exact_block"]["danger"])
+
+    def test_a_wildcard_spells_out_the_subtree_rather_than_naming_it(self):
+        """A leading dot is the entire grant and it looks like punctuation. `.example
+        .com` covers hosts nobody has ever requested, which is precisely what an
+        operator typing a domain into a box is least likely to be picturing."""
+        c = self.probe["saturation"]["create"]["wildcard_allow"]
+        self.assertTrue(c["wild"])
+        self.assertIn("every subdomain", c["text"])
+        self.assertIn("never been requested", c["text"])
+
+    def test_a_single_label_wildcard_can_be_blocked_but_not_allowed(self):
+        create = self.probe["saturation"]["create"]
+        self.assertFalse(create["tld_allow"]["ok"])
+        self.assertIn(".com", create["tld_allow"]["text"])
+        self.assertTrue(create["tld_block"]["ok"])
+
+    def test_a_conflicting_rule_is_reported_with_its_fix(self):
+        # Nothing in this system replaces a rule, so the next step is "revoke that one
+        # first" — and the rule in question is on screen already.
+        c = self.probe["saturation"]["create"]["conflict"]
+        self.assertFalse(c["ok"])
+        self.assertTrue(c["conflict"])
+        self.assertIn("Revoke", c["text"])
+
+    def test_an_identical_rule_is_a_no_op_rather_than_an_error(self):
+        # The backend answers 200 with created:false, which is easy to misread as a
+        # write. Better not to make the call.
+        c = self.probe["saturation"]["create"]["redundant"]
+        self.assertFalse(c["ok"])
+        self.assertTrue(c["redundant"])
+        self.assertFalse(c["conflict"])
+
+    def test_the_same_pattern_in_another_class_is_not_a_conflict(self):
+        # Uniqueness is the PAIR. Treating this as a conflict would make one class's
+        # policy unwritable because another's already covered the host.
+        c = self.probe["saturation"]["create"]["other_class"]
+        self.assertTrue(c["ok"])
+        self.assertFalse(c["conflict"])
+
+    def test_an_incomplete_form_previews_nothing_it_could_be_read_as_agreeing_to(self):
+        create = self.probe["saturation"]["create"]
+        self.assertFalse(create["nothing"]["ok"])
+        self.assertEqual(create["nothing"]["text"], "")
+        self.assertFalse(create["no_class"]["ok"])
+        self.assertIn("client class", create["no_class"]["text"])
+
+    def test_an_unrecognised_action_previews_as_the_safer_reading(self):
+        # An over-warned block costs a sentence; an under-warned allow is the mistake
+        # the confirm exists to prevent. Same rule persistPreview follows.
+        c = self.probe["saturation"]["create"]["unknown_action"]
+        self.assertEqual(c["verb"], "block")
+        self.assertFalse(c["danger"])
 
     def test_the_list_says_when_it_is_a_window(self):
         """Forty rows silently stood for the whole record. Grouping made that worse,
@@ -1792,6 +1924,55 @@ class PolicyTableSourceTests(unittest.TestCase):
         self.assertNotIn("policySig =", before,
                          "the signature is updated before the poll is known to work")
         self.assertIn("policySig = sig", after)
+
+
+class CreateRuleSourceTests(unittest.TestCase):
+    """The add-rule submit handler lives in `start()`, and three of its lines fail in
+    ways nothing else here would catch: a form that appears broken, a rule that is not
+    the one confirmed, and a picker offering classes that cannot be written to."""
+
+    def setUp(self):
+        self.src = APP_JS.read_text()
+        self.body = re.search(
+            r"ruleFormEl\.addEventListener\(\"submit\".*?\n  \}\);", self.src, re.S)
+        self.assertIsNotNone(self.body, "the add-rule submit handler moved — renamed?")
+
+    def test_the_submit_is_always_intercepted(self):
+        """The page's CSP sends `form-action 'none'`, so a native submit is refused by
+        the browser. That makes the missing `preventDefault` invisible in every other
+        test and total in a real one: the click does nothing, silently, and the form
+        reads as broken rather than as blocked."""
+        self.assertIn("ev.preventDefault()", self.body.group(0))
+        self.assertIn("form-action 'none'",
+                      (ROOT / "control-plane-ui" / "app.py").read_text())
+
+    def test_the_body_carries_the_pattern_that_was_confirmed(self):
+        # `p.pattern` is normalized; the input box is not. Sending the raw value would
+        # store a rule the confirm never described — which is the whole failure the
+        # preview exists to prevent, reintroduced one line later.
+        body = self.body.group(0)
+        self.assertRegex(body, r"pattern:\s*p\.pattern")
+        self.assertNotRegex(body, r"pattern:\s*rulePatternEl\.value")
+
+    def test_a_write_that_wrote_nothing_is_not_reported_as_a_write(self):
+        # The backend answers 200 with created:false when the same rule is already in
+        # force. Collapsing that into success is the same mistake the approval cards
+        # made before they learned to say "already in place".
+        self.assertIn("body.created === false", self.body.group(0))
+
+    def test_the_class_picker_is_filled_from_the_backend(self):
+        """Not from the rules table, which is the tempting source because it is already
+        loaded: a class with no rules yet would be missing from the picker, and that is
+        exactly the class an operator needs to write the FIRST rule for."""
+        config = re.search(r"async function refreshConfig\(\)\s*\{(.*?)\n  \}",
+                           self.src, re.S)
+        self.assertIsNotNone(config, "refreshConfig not found — renamed?")
+        self.assertIn("c.client_classes", config.group(1))
+        options = re.search(r"function renderClassOptions\(\)\s*\{(.*?)\n  \}",
+                            self.src, re.S)
+        self.assertIsNotNone(options, "renderClassOptions not found — renamed?")
+        self.assertIn("clientClasses.map", options.group(1))
+        self.assertNotIn("rulesById", options.group(1))
 
 
 class PersistConflictSourceTests(unittest.TestCase):

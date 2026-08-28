@@ -402,6 +402,95 @@ function revokePreview(rule) {
   };
 }
 
+// A pattern as the control plane will STORE it (policy._normalize_pattern), mirrored
+// here and held equal to it by a test.
+//
+// Mirrored rather than deferred to the backend because the confirm step has to show
+// what will actually be written, not what was typed: `Example.COM.` is stored as
+// `example.com`, and a confirm quoting the typed string is confirming a different
+// rule from the one that lands. A leading dot survives — it is the wildcard marker.
+function normalizePattern(pattern) {
+  const p = String(pattern === null || pattern === undefined ? "" : pattern)
+    .trim().toLowerCase();
+  return p.startsWith(".")
+    ? "." + p.slice(1).replace(/\.+$/, "")
+    : p.replace(/\.+$/, "");
+}
+
+// A wildcard must keep at least this many labels to be an ALLOW (policy._rule_error,
+// held equal by a test). `.com` allowed would end governance for a TLD in one click.
+const WILDCARD_MIN_LABELS = 2;
+
+// What "+ add rule" is about to write, for the live preview and the confirm.
+//
+// The backend validates; this EXPLAINS. Only three refusals are mirrored here, and the
+// choice of which is deliberate rather than laziness:
+//
+//   - the wildcard floor, because it is the one refusal that would otherwise arrive
+//     only after clicking a button labelled with a grant the operator wanted;
+//   - a conflicting rule, because the fix is "revoke that one first" and it is on the
+//     screen already;
+//   - an identical rule, because the call would change nothing and the backend says so
+//     with a 200 that is easy to misread as a write.
+//
+// Everything else a pattern can be wrong about — charset, length, a wildcard over an
+// IP — is left to the backend and rendered from its `detail`. That keeps the duplicated
+// policy down to one constant instead of a second copy of the grammar, which is the
+// copy that would drift.
+//
+// `rules` is the standing policy already on screen, so the conflict check reads the
+// same rows the operator is looking at.
+function createPreview(pattern, action, clientClass, rules) {
+  const p = normalizePattern(pattern);
+  // Defaults to the SAFER reading when the action is somehow absent, the same way
+  // persistPreview does: previewing a block where an allow was meant is caught by the
+  // operator, and the reverse is the mistake this step exists to prevent.
+  const verb = action === "allow" ? "allow" : "block";
+  const wild = p.startsWith(".");
+  const scope = wild ? "host + subdomains" : "exact host";
+  const base = { ok: false, pattern: p, verb, wild, scope, danger: false,
+                 existing: null, conflict: false, redundant: false, text: "" };
+  if (!p) {
+    return { ...base, text: "" };
+  }
+  if (!clientClass) {
+    return { ...base, text: "Pick the client class this rule decides for." };
+  }
+  if (wild && verb === "allow" && p.slice(1).split(".").length < WILDCARD_MIN_LABELS) {
+    return { ...base,
+             text: `${p} is a wildcard over a single label — as an allow that grants `
+                 + `everything under it. A block may be this broad; an allow may not.` };
+  }
+  const existing = (rules || []).find(
+    r => r && r.pattern === p && (r.client_class || "") === clientClass) || null;
+  if (existing) {
+    const same = existing.action === verb;
+    return { ...base, existing: existing.action, conflict: !same, redundant: same,
+             text: same
+               ? `${p} is already a standing ${verb.toUpperCase()} rule for `
+                 + `${clientClass}. Nothing to add.`
+               : `${p} is already a standing ${existing.action.toUpperCase()} rule for `
+                 + `${clientClass}, and nothing here replaces a rule. Revoke that one `
+                 + `first, or write a different pattern.` };
+  }
+  // The subtree is spelled out rather than named, because a leading dot is the entire
+  // grant and it looks like punctuation — the same reason persistPreview quotes the
+  // pattern verbatim beside its scope.
+  const subject = wild
+    ? `${p} — that host and every subdomain of it, including ones that have never `
+      + `been requested —`
+    : p;
+  return { ...base, ok: true,
+           // An allow LOOSENS: it grants egress with no hold and no click, which is the
+           // direction worth flagging. A block only ever tightens, and is revocable.
+           danger: verb === "allow",
+           text: verb === "allow"
+             ? `Requests from ${clientClass} to ${subject} will be allowed `
+               + `immediately, without being held for approval.`
+             : `Requests from ${clientClass} to ${subject} will be denied `
+               + `immediately, without being held for approval.` };
+}
+
 // What a screen reader should hear when the pending queue changes.
 //
 // Announced from a SEPARATE element rather than by making the card list a live
@@ -1412,7 +1501,19 @@ function start() {
       // unusable leaves holdTimeout null, which just means no countdown.
       holdTimeout = Number.isFinite(t) && t > 0 ? t : null;
       updateCountdowns();
-    } catch (e) { /* no countdown; the cards are otherwise unaffected */ }
+      // The classes a rule may be scoped to, from the backend rather than guessed:
+      // `create_rule` refuses one it does not know, so a guessed list offers rules that
+      // cannot be written. Filtered to strings for the same reason the window above is
+      // validated — this feeds a <select> whose value goes straight into a POST.
+      clientClasses = (Array.isArray(c.client_classes) ? c.client_classes : [])
+        .filter(x => typeof x === "string" && x);
+      configState = "ok";
+      renderClassOptions();
+    } catch (e) {
+      // No countdown, and no rule form; the cards are otherwise unaffected.
+      configState = "failed";
+      renderClassOptions();
+    }
   }
 
   // ── audit + rules ─────────────────────────────────────────────────────────
@@ -1429,6 +1530,13 @@ function start() {
   let rulesLoaded = false;
   let rulesFailed = false;
   let rulesById = new Map();
+  // Populated by refreshConfig, not by the rules table: a class with no rules yet is
+  // exactly the one an operator most needs to write the first rule for.
+  let clientClasses = [];
+  // "pending" until the first /api/config answers. Three states rather than an empty
+  // list, because an empty list means two different things — not asked yet, and asked
+  // and there are none — and only one of them is worth a sentence on screen.
+  let configState = "pending";
 
   // One renderer for both, because the element contract is identical and the two
   // states drifting apart is precisely what happened last time.
@@ -1742,6 +1850,9 @@ function start() {
         <td>${control}</td></tr>`;
     }).join("");
     renderRulesStatus(rows.length);
+    // The preview's conflict check reads these rows, so a rule that appeared elsewhere
+    // shows up in the form rather than waiting to surface as a 409 on click.
+    renderRulePreview();
     updateIndicators();
   }
 
@@ -1779,6 +1890,130 @@ function start() {
       btn.disabled = false;
       return;
     }
+    refreshRules();
+  });
+
+  // ── writing a rule with no held request behind it ─────────────────────────
+  // The config-first half of policy. Every other rule in the store is downstream of
+  // something the agent already did — a seed entry, or a `+ persist` on a card — so
+  // until this form existed, pre-authorizing a registry meant letting a build block
+  // for the whole hold window first, and writing a block before anything asked for it
+  // could not be expressed at all.
+  const ruleFormEl = document.getElementById("rule-form");
+  const rulePatternEl = document.getElementById("rule-pattern");
+  const ruleActionEl = document.getElementById("rule-action");
+  const ruleClassEl = document.getElementById("rule-class");
+  const ruleAddEl = document.getElementById("rule-add");
+  const rulePreviewEl = document.getElementById("rule-preview");
+  // What the last submit came back with. A separate fact from the preview, and it
+  // OUTRANKS it: the preview describes what a click would do, and this describes what
+  // the last one actually did — including the refusals this page deliberately does not
+  // mirror (see createPreview).
+  let ruleNotice = null;
+
+  function renderClassOptions() {
+    const chosen = ruleClassEl.value;
+    ruleClassEl.innerHTML = clientClasses.map(
+      c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
+    // Keep the operator's choice across a refresh; otherwise a poll landing mid-type
+    // silently re-scopes the rule they are composing.
+    if (chosen && clientClasses.includes(chosen)) ruleClassEl.value = chosen;
+    // With no classes the form cannot produce a rule the backend would accept, so it
+    // is disabled and SAYS why, rather than offering an empty picker that 400s.
+    const usable = clientClasses.length > 0;
+    for (const el of [rulePatternEl, ruleActionEl, ruleClassEl, ruleAddEl]) {
+      el.disabled = !usable;
+    }
+    renderRulePreview();
+  }
+
+  function currentPreview() {
+    return createPreview(rulePatternEl.value, ruleActionEl.value, ruleClassEl.value,
+                         [...rulesById.values()]);
+  }
+
+  function renderRulePreview() {
+    if (!clientClasses.length) {
+      // Silent while the first /api/config is still in flight — a form that is briefly
+      // disabled explains itself a moment later, whereas an error shown before anything
+      // has failed is simply wrong.
+      rulePreviewEl.hidden = configState === "pending";
+      rulePreviewEl.className = "empty";
+      rulePreviewEl.textContent = configState === "failed"
+        ? "Could not reach the control plane, so no rule can be scoped to a client "
+          + "class yet."
+        : "No client classes are configured (CONTROL_CLIENT_CLASSES), so a rule "
+          + "written here could not decide for anyone.";
+      return;
+    }
+    const p = currentPreview();
+    ruleAddEl.disabled = !p.ok;
+    const text = ruleNotice ? ruleNotice.text : p.text;
+    rulePreviewEl.hidden = !text;
+    // The loosening direction is called out the same way the revoke confirm calls out
+    // its own: colour is never the only cue, so the wording carries it too.
+    rulePreviewEl.className =
+      "empty" + ((ruleNotice ? ruleNotice.bad : p.danger) ? " wild" : "");
+    rulePreviewEl.textContent = text;
+  }
+
+  for (const el of [rulePatternEl, ruleActionEl, ruleClassEl]) {
+    // Any edit invalidates the last submit's verdict — leaving it up would attach a
+    // refusal to a rule that is no longer the one on screen.
+    el.addEventListener("input", () => { ruleNotice = null; renderRulePreview(); });
+    el.addEventListener("change", () => { ruleNotice = null; renderRulePreview(); });
+  }
+
+  ruleFormEl.addEventListener("submit", async (ev) => {
+    // Always: the page's own CSP sends `form-action 'none'`, so a native submit is
+    // refused by the browser anyway — this is what makes that a fail-closed backstop
+    // rather than a broken form.
+    ev.preventDefault();
+    const p = currentPreview();
+    if (!p.ok) return;
+    // `confirm()` for the same reason the revoke path uses one: this table only changes
+    // when policy does, so a modal is the right amount of friction for a write that
+    // takes effect on the agent's very next request. The pattern quoted is the
+    // NORMALIZED one, which is what will actually be stored.
+    if (!window.confirm(`${p.text}\n\nAdd this ${p.verb} rule for ${p.pattern}?`)) return;
+    ruleAddEl.disabled = true;
+    try {
+      const res = await fetch("/api/egress/rules", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        // What was PREVIEWED and confirmed, not what is in the box: the two differ
+        // whenever normalization did anything, and the confirm has to be about the
+        // rule that lands.
+        body: JSON.stringify({ pattern: p.pattern, action: p.verb,
+                               client_class: ruleClassEl.value }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok || !body.ok) {
+        // The backend's own sentence. The refusals worth reading rather than
+        // collapsing into "failed" are 400 (a pattern this page did not mirror a check
+        // for) and 409 (a rule appeared under us — the table on screen was stale).
+        ruleNotice = { bad: true,
+                       text: `Not added: ${body.detail || `the control plane answered `
+                                                        + `${res.status}`}` };
+      } else if (body.created === false) {
+        // A 200 that wrote nothing, because the same rule arrived between the preview
+        // and the click. Reported rather than treated as success — the same distinction
+        // the approval cards draw between "rule written" and "already in place".
+        ruleNotice = { bad: false,
+                       text: `${body.pattern} was already a standing ${body.action} `
+                           + `rule for ${body.client_class}; nothing was written.` };
+      } else {
+        ruleNotice = { bad: false,
+                       text: `Added: ${body.pattern} now ${body.action}s for `
+                           + `${body.client_class}.` };
+        rulePatternEl.value = "";
+      }
+    } catch (e) {
+      ruleNotice = { bad: true,
+                     text: "Not added: the control plane is unreachable." };
+    }
+    ruleAddEl.disabled = false;
+    renderRulePreview();
     refreshRules();
   });
 
@@ -1841,6 +2076,10 @@ function start() {
   connect();
   refreshAudit();
   refreshRules();
+  // Also here, not only on stream open: the rule form needs the client classes, and it
+  // has to work while the SSE feed is down — which is exactly when an operator is most
+  // likely to be writing policy by hand rather than clicking cards.
+  refreshConfig();
   // Both keep polling regardless of which VIEW is showing — otherwise the badges
   // could not report a hidden view's state, which is the whole reason they exist.
   //
@@ -1869,9 +2108,10 @@ if (typeof module !== "undefined" && module.exports) {
     holdRemaining, countdownState, departure, persistPreview, saturationState,
     ackCount, requestsLabel, auditRow, auditStatus, rulesStatus, repeatCount,
     outageSummary, pendingAnnouncement, coverageSummary, revokePreview,
+    normalizePattern, createPreview,
     timeWindow, filterActive, auditQuery, eventRow, historyPager,
     fmtTime, fmtStamp, fmtInstant,
-    AUDIT_ORDINARY_STAGE, AUDIT_WINDOWS,
+    AUDIT_ORDINARY_STAGE, AUDIT_WINDOWS, WILDCARD_MIN_LABELS,
     RECONNECT_MIN_MS, RECONNECT_MAX_MS, STALE_MAX_MS, COUNTDOWN_URGENT_S,
     DWELL_MS, SATURATION_RECENT_MS, SATURATION_WARN_FRAC,
   };

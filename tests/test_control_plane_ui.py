@@ -297,6 +297,11 @@ class RelayAllowlistTests(unittest.TestCase):
                              ("api/egress/rules", "GET"),
                              ("api/config", "GET"),
                              ("approvals/0123abcd/resolve", "POST"),
+                             # The two writes to standing policy. Both grant-adjacent:
+                             # this one GRANTS outright (a standing allow decides future
+                             # requests with no hold and no click) and the other takes a
+                             # grant back.
+                             ("api/egress/rules", "POST"),
                              ("api/egress/rules/12/revoke", "POST")):
             self._proxy(path, method)
             self.assertEqual(urlsplit(_sent["url"]).netloc, "control-plane:8090",
@@ -318,10 +323,15 @@ class RelayAllowlistTests(unittest.TestCase):
                              ("approvals", "GET"), ("status", "GET"),
                              ("approvals/x/resolve", "GET"),
                              ("approvals/a/b/resolve", "POST"),
-                             # The rules VIEW is read-only; revocation has its own
-                             # path. Config is read-only outright — the UI reads
-                             # settings, it does not set them.
-                             ("api/egress/rules", "POST"), ("api/config", "POST"),
+                             # Config is read-only — the UI reads settings, it does
+                             # not set them.
+                             ("api/config", "POST"),
+                             # The rules COLLECTION now takes a POST, and these are the
+                             # neighbouring shapes that must not have come with it: the
+                             # entry is anchored, so nothing under the collection is
+                             # relayed except the one revoke path spelled out below.
+                             ("api/egress/rules/", "POST"),
+                             ("api/egress/rules/12", "POST"),
                              # The audit views are reads, and each is its OWN entry:
                              # anchoring `^/api/audit` without the `$` would relay
                              # every future path under that prefix sight unseen,

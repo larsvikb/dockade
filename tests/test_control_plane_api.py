@@ -636,6 +636,233 @@ class RevokeRuleTests(_CPTestCase):
         self.assertEqual(cp.policy._decide("bad.example", CLASS)[0], "hold")
 
 
+class PatternValidationTests(unittest.TestCase):
+    """``policy._normalize_pattern`` and ``policy._rule_error`` — the validation that
+    only exists because ``create_rule`` takes a pattern from a caller.
+
+    Every other write path derives its pattern from a host the proxy observed, so
+    well-formedness is a property of where the string came from. Here it has to be
+    checked, and the failure being guarded against is not a crash: SQLite stores any
+    text, ``_match`` compares it to nothing, and the result is a rule that appears in
+    the standing-policy view while deciding no request that will ever be made."""
+
+    def test_a_trailing_fqdn_dot_is_removed(self):
+        # `_decide` strips it from the HOST before comparing, so a pattern that keeps
+        # one can never match — the inert-rule case, which reads as policy in force.
+        self.assertEqual(cp.policy._normalize_pattern("Example.COM."), "example.com")
+
+    def test_a_leading_dot_survives_normalization(self):
+        # It is the wildcard marker, not punctuation — which is why this cannot be the
+        # `.strip('.')` a host goes through.
+        self.assertEqual(cp.policy._normalize_pattern("  .Example.com  "),
+                         ".example.com")
+
+    def test_a_normalized_pattern_still_matches_the_host_it_names(self):
+        # The property the two functions exist for, asserted through the matcher rather
+        # than by string comparison.
+        p = cp.policy._normalize_pattern(".EXAMPLE.com.")
+        self.assertTrue(cp.policy._match("api.example.com", p))
+
+    def test_every_persist_candidate_is_already_a_valid_rule(self):
+        """The two write paths tied together. ``_persist_candidates`` produces patterns
+        that bypass this validation entirely (a persist never calls it), so if the two
+        ever disagree, one path would be storing what the other refuses — and the
+        wildcard floor would be enforceable at one entrance only."""
+        for host in ("example.com", "api.example.com", "a.b.c.example.com",
+                     "localhost", "10.0.0.7"):
+            for candidate in cp.policy._persist_candidates(host):
+                with self.subTest(host=host, pattern=candidate):
+                    self.assertEqual(cp.policy._normalize_pattern(candidate), candidate)
+                    self.assertIsNone(cp.policy._rule_error(candidate, "allow"))
+
+    def test_a_single_label_wildcard_is_refused_as_an_allow(self):
+        # `.com` as an allow ends governance for a TLD in one call, and nothing
+        # afterwards raises a hold to notice it by.
+        self.assertIsNotNone(cp.policy._rule_error(".com", "allow"))
+
+    def test_the_same_wildcard_is_permitted_as_a_block(self):
+        # The asymmetry is deliberate: a block only tightens, it announces itself the
+        # first time anything is denied, and it is revocable. Refusing it would make
+        # the broadest blocks the ones this endpoint cannot express.
+        self.assertIsNone(cp.policy._rule_error(".com", "block"))
+
+    def test_a_two_label_wildcard_is_permitted_either_way(self):
+        for action in ("allow", "block"):
+            with self.subTest(action=action):
+                self.assertIsNone(cp.policy._rule_error(".example.com", action))
+
+    def test_a_malformed_pattern_is_refused(self):
+        for pattern in ("", "a..b", "exa mple.com", "http://example.com",
+                        "example.com/path", "*.example.com", "ex@mple.com",
+                        "a" * 300):
+            with self.subTest(pattern=pattern):
+                self.assertIsNotNone(
+                    cp.policy._rule_error(cp.policy._normalize_pattern(pattern),
+                                          "allow"))
+
+    def test_an_ip_literal_is_a_valid_exact_pattern(self):
+        self.assertIsNone(cp.policy._rule_error("10.0.0.7", "allow"))
+
+    def test_a_wildcard_over_an_ip_literal_is_refused(self):
+        # `.10.0.0.7` would be compared as a suffix and match nothing — inert again,
+        # and it passes the label check, so it needs its own refusal.
+        self.assertIsNotNone(cp.policy._rule_error(".10.0.0.7", "allow"))
+
+    def test_an_unknown_action_is_refused(self):
+        self.assertIsNotNone(cp.policy._rule_error("example.com", "hold"))
+
+    def test_the_configured_class_names_exclude_the_unclassified_one(self):
+        # A rule scoped to "whoever we could not identify" would grant to every future
+        # unidentified client. `resolve` refuses it explicitly; here it is excluded by
+        # construction, and this asserts that construction rather than trusting it.
+        self.assertNotIn(cp.policy.UNCLASSIFIED, cp.policy._class_names())
+        self.assertIn(CLASS, cp.policy._class_names())
+
+
+def _create(pattern, action="allow", client_class=CLASS, request=None):
+    return cp.create_rule(
+        cp.RuleCreateRequest(pattern=pattern, action=action,
+                             client_class=client_class),
+        request if request is not None else _FakeRequest())
+
+
+class CreateRuleTests(_CPTestCase):
+    """``create_rule`` — the config-first half of policy.
+
+    Every other rule in the store is downstream of something the agent already did:
+    the seed file is a declared allowlist, and a `*_persist` approval can only write
+    about a host that was requested. So an operator could answer questions and never
+    state a position — pre-authorizing a registry meant letting a build block for the
+    hold window first, and writing a BLOCK before anything asked for it was not
+    expressible at all."""
+
+    def _row(self, pattern, client_class=CLASS):
+        with cp.store._connect() as conn:
+            return conn.execute(
+                "SELECT * FROM rules WHERE pattern=? AND client_class=?",
+                (pattern, client_class)).fetchone()
+
+    def test_a_rule_is_written_and_decides_immediately(self):
+        # End to end through `_decide` rather than by inspecting the table: the point
+        # is that policy changes, not that a row exists.
+        self.assertEqual(cp.policy._decide("pypi.example", CLASS)[0], "hold")
+        resp = _create("pypi.example", "allow")
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(cp.policy._decide("pypi.example", CLASS)[0], "allow")
+
+    def test_a_block_can_be_written_before_anything_asks_for_it(self):
+        # The case the resolve path cannot express at all: there is no card to click,
+        # because nothing has been requested.
+        _create("evil.example", "block")
+        self.assertEqual(cp.policy._decide("evil.example", CLASS)[0], "deny")
+
+    def test_the_stored_rule_is_the_normalized_pattern(self):
+        _create(" .Example.COM. ", "allow")
+        self.assertIsNotNone(self._row(".example.com"))
+
+    def test_the_source_is_server_set_and_not_caller_supplied(self):
+        """'seed' is the value ``revoke_rule`` refuses to delete, so a caller that
+        could set it could write an UNREVOCABLE rule — and one that would also stop
+        ``_seed_if_empty`` from ever re-reading the file, since the table is no longer
+        empty. The model has no such field; this asserts the model stays that way."""
+        req = cp.RuleCreateRequest(pattern="sneaky.example", action="allow",
+                                   client_class=CLASS, source="seed")
+        cp.create_rule(req, _FakeRequest())
+        self.assertEqual(self._row("sneaky.example")["source"], "operator")
+
+    def test_an_unconfigured_client_class_is_refused(self):
+        """The quiet failure this endpoint is most exposed to: a typo inserts cleanly,
+        lists cleanly, and decides nothing — while the operator reads the rules view
+        and believes the host is covered."""
+        resp = _create("example.com", "allow", client_class="sandox")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIsNone(self._row("example.com", "sandox"))
+        # And the refusal names the classes that would work, so it has a next step.
+        self.assertIn(CLASS, json.dumps(resp.body))
+
+    def test_the_unclassified_pseudo_class_is_refused(self):
+        # Same refusal `resolve` makes on its persist path, and for the same reason: a
+        # rule keyed to "whoever we could not identify" grants to every future one.
+        resp = _create("example.com", "allow",
+                       client_class=cp.policy.UNCLASSIFIED)
+        self.assertEqual(resp.status_code, 400)
+
+    def test_a_single_label_wildcard_allow_is_refused(self):
+        resp = _create(".com", "allow")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIsNone(self._row(".com"))
+
+    def test_a_malformed_pattern_is_refused_rather_than_stored_inert(self):
+        resp = _create("http://example.com", "allow")
+        self.assertEqual(resp.status_code, 400)
+        with cp.store._connect() as conn:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM rules").fetchone()[0], 0)
+
+    def test_the_opposite_action_is_a_conflict_not_a_replacement(self):
+        """Nothing in this service replaces a rule. The dangerous direction is
+        allow-over-block: the operator believes a subtree is permanently blocked, and
+        every later request to it is allowed without even raising a hold."""
+        _create("evil.example", "block")
+        resp = _create("evil.example", "allow")
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(self._row("evil.example")["action"], "block")
+        # And the conflict is described, so the UI can say which rule is in the way.
+        self.assertEqual(resp.body["conflict"]["action"], "block")
+
+    def test_the_same_rule_twice_reports_a_non_write_rather_than_an_error(self):
+        # The policy asked for IS the policy — but the response must not claim a write
+        # it did not make, which is the distinction `resolve` already draws.
+        first = _create("example.com", "allow")
+        second = _create("example.com", "allow")
+        self.assertEqual(second.status_code, 200)
+        body = second.body
+        self.assertFalse(body["created"])
+        self.assertTrue(body["already_present"])
+        self.assertEqual(body["id"], first.body["id"])
+
+    def test_the_same_pattern_in_another_class_is_a_separate_rule(self):
+        # Not a conflict: uniqueness is the PAIR, and refusing here would make one
+        # class's policy unwritable because another's already covered the host.
+        other = next(c for c in cp.policy._class_names() if c != CLASS)
+        self.assertEqual(_create("example.com", "allow").status_code, 201)
+        self.assertEqual(_create("example.com", "block", client_class=other)
+                         .status_code, 201)
+        self.assertEqual(cp.policy._decide("example.com", CLASS)[0], "allow")
+        self.assertEqual(cp.policy._decide("example.com", other)[0], "deny")
+
+    def test_creation_is_audited_with_provenance(self):
+        """Stronger version of the reason revocation is audited: this writes standing
+        policy from nothing, so once the rule is in the table it looks exactly like one
+        a human approved at a card. The record is the only thing that can tell them
+        apart."""
+        with mock.patch.object(cp.store, "_audit") as audit:
+            _create(".github.example", "allow",
+                    request=_FakeRequest(peer="172.31.0.9"))
+        self.assertEqual(audit.call_args.args[0], "create")
+        kwargs = audit.call_args.kwargs
+        self.assertEqual(kwargs["host"], ".github.example")
+        self.assertEqual(kwargs["client_class"], CLASS)
+        self.assertIn("peer=172.31.0.9", kwargs["reason"])
+        # The scope, in words, because a leading dot is a wildcard that looks like a
+        # hostname — the same thing the rules view spells out.
+        self.assertIn("host + subdomains", kwargs["reason"])
+
+    def test_a_refused_creation_is_not_audited(self):
+        # A refusal changed nothing, and a `create` row for a rule that does not exist
+        # would be a decision log describing policy that was never in force.
+        with mock.patch.object(cp.store, "_audit") as audit:
+            _create(".com", "allow")
+        audit.assert_not_called()
+
+    def test_a_created_rule_can_be_revoked(self):
+        # The round trip: what this writes is an operator rule, so the other half of
+        # the governance plane can take it back.
+        rid = _create("example.com", "allow").body["id"]
+        self.assertEqual(cp.revoke_rule(rid, _FakeRequest()).status_code, 200)
+        self.assertEqual(cp.policy._decide("example.com", CLASS)[0], "hold")
+
+
 def _served(**kw):
     """The grouped rows ``/api/audit`` serves.
 
@@ -1711,7 +1938,9 @@ class RulesViewTests(_CPTestCase):
 class ConfigViewTests(_CPTestCase):
     """``/api/config`` exists so a pending card can show a COUNTDOWN. Without it the
     UI would have to hardcode the hold window, and a card that cannot say how long is
-    left cannot distinguish hold-for-approval from a slow deny."""
+    left cannot distinguish hold-for-approval from a slow deny. It carries the client
+    classes for the same shape of reason: ``create_rule`` refuses a class it does not
+    know, so a page that guessed the list would offer rules that cannot be written."""
 
     def test_config_reports_the_hold_window(self):
         self.assertEqual(cp.api_config()["hold_timeout"], cp.holds.HOLD_TIMEOUT)
@@ -1724,10 +1953,22 @@ class ConfigViewTests(_CPTestCase):
         finally:
             cp.holds.HOLD_TIMEOUT = saved
 
+    def test_config_reports_the_classes_a_rule_can_be_scoped_to(self):
+        self.assertEqual(cp.api_config()["client_classes"],
+                         list(cp.policy._class_names()))
+        self.assertIn(CLASS, cp.api_config()["client_classes"])
+
+    def test_config_never_offers_the_unclassified_pseudo_class(self):
+        # It is not a rule scope — `create_rule` and `resolve` both refuse it — so a
+        # page that offered it would present a choice that can only ever 400.
+        self.assertNotIn(cp.policy.UNCLASSIFIED, cp.api_config()["client_classes"])
+
     def test_config_exposes_nothing_but_that(self):
         # A read-only view of NON-SECRET config on the one interface that can grant
-        # egress: whatever gets added here has to stay harmless to publish.
-        self.assertEqual(set(cp.api_config()), {"hold_timeout"})
+        # egress: whatever gets added here has to stay harmless to publish. The class
+        # names pass that test — they are network LABELS, and the CIDRs behind them
+        # stay here.
+        self.assertEqual(set(cp.api_config()), {"hold_timeout", "client_classes"})
 
 
 class SaturationTests(_CPTestCase):
@@ -2288,6 +2529,18 @@ class ApiSurfaceSplitTests(unittest.TestCase):
         resolve = [r for r in _routes(cp.app) if r[1].endswith("/resolve")]
         self.assertEqual(len(resolve), 1, "resolve is not on the management app")
         self.assertNotIn(resolve[0], _routes(cp.authorize_app))
+
+    def test_the_endpoints_that_write_standing_policy_are_management_only(self):
+        # The other way to grant egress, and the stronger one: a rule written here
+        # decides future requests with no hold and no click, where `resolve` can only
+        # answer a question something already asked. Asserted as its own roster rather
+        # than by arithmetic, for the same reason as the test above — and by SUFFIX, so
+        # a third mutation added later has to be named here or fail this.
+        writes = {r for r in _routes(cp.app)
+                  if r[0] == "POST" and "/api/egress/rules" in r[1]}
+        self.assertEqual(writes, {("POST", "/api/egress/rules"),
+                                  ("POST", "/api/egress/rules/{rule_id}/revoke")})
+        self.assertEqual(writes & _routes(cp.authorize_app), set())
 
     def test_the_views_that_read_the_store_are_management_only(self):
         # Not privileged, but they carry the record: pending hosts and clients,

@@ -1789,6 +1789,62 @@ recording, because none of them is the obvious one:
   `resolve` records it: editing standing policy is more consequential than any single
   egress decision, and nothing recorded that it had happened at all.
 
+**Writing a rule with no request behind it (`POST /api/egress/rules`).** Every other
+rule in the store is *downstream of something the agent already did*: a seed entry is a
+declared allowlist, and a `*_persist` approval can only write about a host that was
+requested. So the operator could answer questions and never state a position —
+pre-authorizing a registry meant letting a build block for the whole hold window first,
+and writing a **block** before anything asked for it was not expressible at all, because
+there was no card to click. This is the config-first half, and the reasoning that spans
+files is what does *not* carry over from the persist path:
+
+- **The pattern is caller-supplied, so it must be validated rather than constrained.**
+  A persist is safe because `_persist_candidates` derives a bounded ladder from an
+  observed host and `resolve` re-checks the choice against it. Here there is no observed
+  host, so that guarantee is unavailable and `policy._rule_error` replaces it. Both live
+  in `policy.py`, beside the `_match` that defines what a pattern means, so the grammar
+  has one home rather than a copy per entrance — and `_normalize_pattern` is shared for
+  the sharper reason that `_decide` strips a trailing FQDN dot from the *host*: a
+  pattern that keeps one matches nothing while reading, in the rules view, as policy in
+  force. An **inert rule is worse than a refused one**, which is why malformed input is
+  a 400 and not a stored row.
+- **The wildcard floor applies to `allow` only.** `.com` as an allow ends governance for
+  a TLD in one call and nothing afterwards raises a hold to notice it by; as a block it
+  only tightens, announces itself the first time anything is denied, and is revocable.
+  Refusing both would make the broadest blocks — the ones most worth writing — the ones
+  this endpoint cannot express.
+- **`source` is server-set to `operator` and is not a field on the request model.**
+  `seed` is the value `revoke_rule` refuses to delete, so a caller that could set it
+  could write an *unrevocable* rule — and one that would also stop `_seed_if_empty` from
+  ever re-reading the file. The two guards are in different modules and only compose
+  because neither trusts the caller for this one string.
+- **The class is checked against `CLIENT_CLASSES`, and the UI is told the list.** An
+  unlisted class inserts cleanly, lists cleanly and decides nothing, so a typo is the
+  quiet failure this endpoint is most exposed to. `GET /api/config` carries the names
+  for the form to offer; deriving them from the *rules* instead would be worse than
+  guessing, because a class with no rules yet is exactly the one an operator needs to
+  write the first rule for. `UNCLASSIFIED` is absent by construction rather than by
+  exclusion — `_parse_client_classes` refuses it as a name.
+- **Nothing replaces a rule, here either.** An existing rule with the opposite action is
+  a 409 with the conflict described; the same action is a 200 that reports it wrote
+  nothing. Same refusal and same reasoning as the persist path (see "A persist cannot
+  overwrite, so one that would is refused") — revoke-then-create stays two operations,
+  deliberately visible as two audit rows.
+- **The page mirrors three refusals and no more.** `createPreview` in `app.js` checks
+  the wildcard floor, a conflicting rule and an identical one — the floor because it is
+  the refusal that would otherwise arrive only *after* clicking a button labelled with a
+  grant the operator wanted, the other two because their fix is on screen already.
+  Everything else a pattern can be wrong about is left to the backend and rendered from
+  its `detail`. That keeps the duplicated policy down to one constant instead of a
+  second copy of the grammar, and the constant plus the normalizer are held equal across
+  the two languages by tests rather than by intent.
+
+This is also a **third way to grant egress**, and the first that does not begin with a
+request. It sits on the management listener with `resolve` for that reason, and the
+audit vocabulary (`audit.DECISIONS`) gains `create` beside `revoke` so a rule that
+appeared without a card is distinguishable in the record from one a human approved at
+one — which, once it is sitting in the table, it otherwise is not.
+
 **Approval provenance — detection where prevention is not available.** Given that
 ceiling, the frontend and backend at least make a forged approval *visible*. The
 relay strips client-supplied provenance headers (`X-Dockade-Actor`,
@@ -1815,7 +1871,9 @@ rules and the audit history — i.e. the crown jewels. See the NOTE below `_init
 in `control-plane/store.py`.
 
 Step 2c-2: the per-proxy config surface (rows accumulate from 2a), and egress rule
-editing. The gateway needs that surface's *shape* rather than its table — tool policy
+editing — of which creating and revoking are built (see "Writing a rule with no request
+behind it") and atomic *mutation* is the remaining half. The gateway needs that
+surface's *shape* rather than its table — tool policy
 lands in its own, with the gateway (see "Tool policy gets its own table"), so the
 config surface treats a second governed service as a surface with its own policy and
 not as a filter over this one.
@@ -2984,9 +3042,10 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
 - Docs mirror / offline docs tool.
 - Progressive auto-approval driven by accumulated policy + audit history.
 - **Rule MUTATION on the control plane.** Revocation is **now built** — see "Taking a
-  rule back" under the control-plane section. What remains is EDITING: changing a
-  rule's pattern or flipping its action is still revoke-then-persist rather than one
-  operation, which is two audit rows for one intent and leaves a window in which the
+  rule back" under the control-plane section — and so is creation, from nothing rather
+  than off a card ("Writing a rule with no request behind it"). What remains is EDITING:
+  changing a rule's pattern or flipping its action is still revoke-then-create rather
+  than one operation, which is two audit rows for one intent and leaves a window in which the
   host is neither allowed nor blocked. Acceptable, because that window fails to
   `hold` rather than to allow, but it is not the same thing as an edit. The two sharp edges it used to carry
   have moved: the agent-controlled-pattern one is closed (`_persist_candidates` derives
@@ -3014,10 +3073,11 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
     mistakes made detectable rather than prevented. The reasoning, and the condition that
     would reopen it, are under "`start()` is deliberately unverified" above.)*
   - **Rule mutation** — nothing here *replaces* a rule (revoking one is built — see
-    "Taking a rule back"), which is why a persist that contradicts an existing one is
+    "Taking a rule back", and writing one outright since — see "Writing a rule with no
+    request behind it"), which is why a persist that contradicts an existing one is
     refused rather than applied (see *A persist cannot overwrite* above). The refusal
     is the honest behaviour given the constraint; lifting it — editing a rule's pattern
-    or action in one operation rather than revoke-then-persist — is the open item.
+    or action in one operation rather than revoke-then-create — is the open item.
   - **Opt-in desktop notification.** `http://localhost` is a secure context, so the
     Notification API is available; with a ~120s fuse and a page nobody watches, this is
     the honest fix for the problem the `(n)` title prefix only mitigates.

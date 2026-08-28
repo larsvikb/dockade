@@ -1,7 +1,7 @@
 # MCP servers — the catalogue. One container per server, one profile per server.
 #
-# WHY THIS IS A SEPARATE FILE. `docker-compose.yml` owns the topology: the five
-# networks, who is attached to what, and the three infra services whose placement
+# WHY THIS IS A SEPARATE FILE. `docker-compose.yml` owns the topology: every
+# network, who is attached to what, and the three infra services whose placement
 # IS the security boundary. This file owns a growing list of optional third-party
 # containers. Keeping them apart means adding a server never requires editing the
 # file that owns the boundary — the catalogue is expected to grow, the topology is

@@ -87,10 +87,12 @@ QUERY rather than a self-approval. See DESIGN.md.
 
 Concurrency model: run under a SINGLE uvicorn worker. `/authorize` and the
 resolve endpoint are sync (FastAPI runs them in a threadpool); a held request
-blocks its worker on a threading.Event that the resolve endpoint sets. Concurrent
-holds are bounded (CONTROL_MAX_PENDING / CONTROL_MAX_PENDING_PER_CLIENT) so a
-sandbox cannot pin every worker and stall governance for all sandboxes — over the
-cap /authorize fails closed. The SQLite store is the source of truth for the UI
+blocks its worker on a threading.Event that the resolve endpoint sets. Blocked
+workers are bounded (CONTROL_MAX_WAITERS / CONTROL_MAX_WAITERS_PER_CLIENT) so a
+sandbox cannot pin every worker and stall governance for all sandboxes; CARDS are
+bounded separately (CONTROL_MAX_PENDING / CONTROL_MAX_PENDING_PER_CLIENT), which
+protects the operator's attention rather than the pool — see holds.py for why the
+two nouns need four caps. Over any of them /authorize fails closed. The SQLite store is the source of truth for the UI
 (the SSE stream polls it). Do NOT run multiple workers — the pending-event
 registry is in-process (holds.py). That constraint is also why the two listeners
 above are two sockets in ONE process rather than two services: a held /authorize

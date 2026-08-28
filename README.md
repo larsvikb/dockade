@@ -19,7 +19,7 @@ the sandbox is deliberately impoverished: no direct network egress beyond a
 strict allowlist, non-root user, dropped Linux capabilities, no host Docker
 socket, and (by design) no route to a control plane.
 
-> **Status: multi-container, control plane step 2b.** The sandbox lives on an
+> **Status: multi-container, control plane step 2c.** The sandbox lives on an
 > internal network with **no direct egress**; a governed **egress proxy** is the
 > sole path off-box, and it defers every decision to a **control plane** the
 > agent cannot reach (policy + audit in SQLite). An unknown host is **held for
@@ -29,9 +29,10 @@ socket, and (by design) no route to a control plane.
 > ask `/authorize` and cannot reach the approvals API at all. There are now
 > **two sandbox tiers** sharing one boundary implementation: tier 1 (Claude,
 > governed egress) and tier 2 (opencode against a local LLM, no egress and no
-> credentials). Still to come per [`DESIGN.md`](DESIGN.md): audit browsing beyond
-> the UI's recent-decisions table (2c) and the git/cache data-plane services. See
-> [Roadmap](#roadmap).
+> credentials). The audit trail is **browsable** — filters over the folded glance,
+> and a paged record view of every decision. Still to come per
+> [`DESIGN.md`](DESIGN.md): atomic egress rule editing (2c-2) and the git/cache
+> data-plane services. See [Roadmap](#roadmap).
 
 ## Quickstart
 

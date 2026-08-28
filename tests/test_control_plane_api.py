@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import tempfile
 import threading
 import time
@@ -132,6 +133,36 @@ def _hold(host, approval_id="hold-1", client=None, client_class=CLASS):
     return approval_id
 
 
+class _FailsTheApprovalsInsert:
+    """A real connection that refuses one statement: the approvals INSERT.
+
+    Wrapped rather than counted. Failing the Nth ``_connect`` would pass vacuously the
+    day ``policy._decide`` opens a second one — the reservation would never be reached,
+    the registries would be empty for the wrong reason, and the test would still be
+    green. Naming the statement pins the failure to the window the guard is about.
+
+    ``__enter__`` returns SELF, not the wrapped connection: ``sqlite3``'s own returns
+    the connection, and delegating to it would hand the caller an unguarded handle."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def __enter__(self):
+        self._conn.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self._conn.__exit__(*exc)
+
+    def execute(self, sql, *args, **kwargs):
+        if "INSERT INTO approvals" in sql:
+            raise sqlite3.OperationalError("disk I/O error")
+        return self._conn.execute(sql, *args, **kwargs)
+
+
 def _rules():
     with cp.store._connect() as conn:
         return {(r["pattern"], r["action"]) for r in
@@ -178,6 +209,56 @@ class AuthorizeDecisionTests(_CPTestCase):
         self.assertEqual(resp.decision, "deny")
         self.assertIn("hold capacity exceeded", resp.reason)
         self.assertLess(elapsed, 1.0)                      # did not block
+
+    def test_a_failed_store_write_does_not_leak_the_hold_slot(self):
+        # The slot is reserved BEFORE the approvals row is written, so a store failure
+        # in between used to leave it registered for the life of the process — and the
+        # leaked _GROUPS entry was the sharp end: every later request for the same
+        # (client, host, port, proto) joined a card with no row and no waiter behind
+        # it, blocked out the original window, default-denied with a reason that reads
+        # as operator inaction, and never appeared on anyone's screen. That destination
+        # became permanently un-decidable, and MAX_WAITERS of them fail every sandbox's
+        # holds closed until a restart.
+        real = cp.store._connect
+        with mock.patch.object(cp.store, "_connect",
+                               lambda: _FailsTheApprovalsInsert(real())), \
+                self.assertRaises(sqlite3.OperationalError):
+            cp.authorize(_auth_req("unknown.com", client=CLASS_IP))
+
+        # Every registry, because a partial release is the same defect wearing fewer
+        # entries — and _GROUPS is the one that decides whether the next request for
+        # this host gets a card or inherits a phantom.
+        self.assertEqual(cp.holds._PENDING_EVENTS, {})
+        self.assertEqual(cp.holds._PENDING_WAITERS, {})
+        self.assertEqual(cp.holds._PENDING_CLIENT, {})
+        self.assertEqual(cp.holds._PENDING_DEADLINE, {})
+        self.assertEqual(cp.holds._GROUPS, {})
+
+    def test_a_hold_after_a_failed_store_write_still_gets_its_own_card(self):
+        # The consequence, asserted from the outside: with the slot released the next
+        # request raises a REAL card rather than joining the leaked one. Without the
+        # release this call blocks for the full window and returns a timeout deny, so
+        # the short timeout here is what keeps the failure fast instead of a hang.
+        real = cp.store._connect
+        with mock.patch.object(cp.store, "_connect",
+                               lambda: _FailsTheApprovalsInsert(real())), \
+                self.assertRaises(sqlite3.OperationalError):
+            cp.authorize(_auth_req("unknown.com", client=CLASS_IP))
+
+        saved = cp.holds.HOLD_TIMEOUT
+        cp.holds.HOLD_TIMEOUT = 0.05
+        try:
+            resp = cp.authorize(_auth_req("unknown.com", client=CLASS_IP))
+        finally:
+            cp.holds.HOLD_TIMEOUT = saved
+        self.assertEqual(resp.decision, "deny")
+        self.assertIn("timeout", resp.reason)
+        # A row exists at all, which is what says a card was raised for the second
+        # request rather than it silently inheriting the first one's slot.
+        with cp.store._connect() as conn:
+            statuses = [r[0] for r in conn.execute(
+                "SELECT status FROM approvals WHERE host='unknown.com'").fetchall()]
+        self.assertEqual(statuses, ["expired"])
 
     def test_hold_times_out_to_deny(self):
         saved = cp.holds.HOLD_TIMEOUT

@@ -392,50 +392,70 @@ def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
         return AuthorizeResponse(decision="deny", reason=slot.refused)
     approval_id, event = slot.approval_id, slot.event
 
-    if not slot.joined:
-        now = time.time()
-        with store._connect() as conn:
-            conn.execute(
-                "INSERT INTO approvals(id, ts, host, port, proto, client, "
-                "client_class, method, url, status) "
-                "VALUES (?,?,?,?,?,?,?,?,?, 'pending')",
-                (approval_id, now, req.host, req.port, req.proto, req.client,
-                 client_class, req.method, req.url))
-            conn.commit()
-    # Audited PER REQUEST either way, with this request's own method and url, because
-    # grouping is a concept of the screen and the worker pool — never of the record.
-    # The joiner's reason names the card it attached to, so the log explains on its own
-    # terms why four requests produced one approval and one decision.
-    store._audit("hold", stage=req.stage, host=req.host, port=req.port,
-                 proto=req.proto, client=req.client, client_class=client_class,
-                 method=req.method, url=req.url,
-                 reason=(f"joined hold {approval_id} — duplicate of a request already "
-                         "awaiting approval" if slot.joined else "held for approval"))
+    # From here the slot is RESERVED, so every exit has to give it back — which is what
+    # the `finally` is for, and it is not defensive habit. A reservation that leaks is
+    # not merely a lost slot: `_GROUPS` still names this approval id, so every later
+    # request with the same (client, host, port, proto) JOINS a card that has no
+    # approvals row and no waiter coming for it. Those requests block out the original
+    # window, default-deny with a reason that reads as operator inaction, and never
+    # raise a card anyone can approve — so one failed write makes that destination
+    # permanently un-decidable, and enough of them exhaust MAX_WAITERS and fail every
+    # sandbox's holds closed until a restart. The store write below is the reachable
+    # trigger (a full disk, a lock held past the busy timeout).
+    #
+    # Nothing is audited on that path and nothing needs to be: the exception becomes a
+    # 500, the proxy's `_authorize` fails closed on it, and the proxy writes the denial
+    # to its own stream, which the ingest picks up. The decision is recorded by the
+    # component that made it.
+    try:
+        if not slot.joined:
+            now = time.time()
+            with store._connect() as conn:
+                conn.execute(
+                    "INSERT INTO approvals(id, ts, host, port, proto, client, "
+                    "client_class, method, url, status) "
+                    "VALUES (?,?,?,?,?,?,?,?,?, 'pending')",
+                    (approval_id, now, req.host, req.port, req.proto, req.client,
+                     client_class, req.method, req.url))
+                conn.commit()
+        # Audited PER REQUEST either way, with this request's own method and url,
+        # because grouping is a concept of the screen and the worker pool — never of
+        # the record. The joiner's reason names the card it attached to, so the log
+        # explains on its own terms why four requests produced one approval and one
+        # decision.
+        store._audit("hold", stage=req.stage, host=req.host, port=req.port,
+                     proto=req.proto, client=req.client, client_class=client_class,
+                     method=req.method, url=req.url,
+                     reason=(f"joined hold {approval_id} — duplicate of a request "
+                             "already awaiting approval"
+                             if slot.joined else "held for approval"))
 
-    # Block until a human resolves this hold or the window elapses. The wakeup is
-    # advisory: the DURABLE approvals row is the single source of truth for the
-    # outcome. Exactly one of this timeout path and resolve() flips the row out of
-    # 'pending' — each via an atomic conditional UPDATE (…WHERE status='pending')
-    # that SQLite serializes — so a resolve landing just as the hold times out can
-    # no longer leave the row 'allowed' (and persist a rule) while the agent is
-    # told 'deny'. Whoever's UPDATE wins decides; the loser reads the winner's row.
-    # The card's remaining window, not a fresh one — see holds._PENDING_DEADLINE.
-    # Every waiter on a card therefore wakes at the same instant, which is what lets
-    # them race harmlessly for the expiry UPDATE below.
-    event.wait(max(0.0, slot.deadline - time.time()))
-    with store._connect() as conn:
-        expired = conn.execute(
-            "UPDATE approvals SET status='expired', resolved_at=? "
-            "WHERE id=? AND status='pending'", (time.time(), approval_id)).rowcount
-        status_row = None if expired else conn.execute(
-            "SELECT status, mode, resolved_by FROM approvals WHERE id=?",
-            (approval_id,)).fetchone()
-        conn.commit()
-    if expired:
-        # Only the waiter that WON the expiry closes the group, and it does so before
-        # releasing its slot: the card is now decided, so nothing may still join it.
-        holds._close_group(approval_id)
-    holds._release_hold(approval_id)
+        # Block until a human resolves this hold or the window elapses. The wakeup is
+        # advisory: the DURABLE approvals row is the single source of truth for the
+        # outcome. Exactly one of this timeout path and resolve() flips the row out of
+        # 'pending' — each via an atomic conditional UPDATE (…WHERE status='pending')
+        # that SQLite serializes — so a resolve landing just as the hold times out can
+        # no longer leave the row 'allowed' (and persist a rule) while the agent is
+        # told 'deny'. Whoever's UPDATE wins decides; the loser reads the winner's row.
+        # The card's remaining window, not a fresh one — see holds._PENDING_DEADLINE.
+        # Every waiter on a card therefore wakes at the same instant, which is what
+        # lets them race harmlessly for the expiry UPDATE below.
+        event.wait(max(0.0, slot.deadline - time.time()))
+        with store._connect() as conn:
+            expired = conn.execute(
+                "UPDATE approvals SET status='expired', resolved_at=? "
+                "WHERE id=? AND status='pending'", (time.time(), approval_id)).rowcount
+            status_row = None if expired else conn.execute(
+                "SELECT status, mode, resolved_by FROM approvals WHERE id=?",
+                (approval_id,)).fetchone()
+            conn.commit()
+        if expired:
+            # Only the waiter that WON the expiry closes the group, and it does so
+            # before releasing its slot: the card is now decided, so nothing may still
+            # join it.
+            holds._close_group(approval_id)
+    finally:
+        holds._release_hold(approval_id)
 
     # Carry the resolver's provenance (recorded by resolve()) into the audit reason,
     # so the log answers "who granted this egress" and not merely "a human did".

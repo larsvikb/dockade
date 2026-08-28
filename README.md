@@ -30,8 +30,9 @@ socket, and (by design) no route to a control plane.
 > **two sandbox tiers** sharing one boundary implementation: tier 1 (Claude,
 > governed egress) and tier 2 (opencode against a local LLM, no egress and no
 > credentials). The audit trail is **browsable** — filters over the folded glance,
-> and a paged record view of every decision. Still to come per
-> [`DESIGN.md`](DESIGN.md): atomic egress rule editing (2c-2) and the git/cache
+> and a paged record view of every decision — and standing policy is **fully
+> mutable**, a rule's pattern or action changeable in one audited operation. Still
+> to come per [`DESIGN.md`](DESIGN.md): the MCP gateway, and the git/cache
 > data-plane services. See [Roadmap](#roadmap).
 
 ## Quickstart

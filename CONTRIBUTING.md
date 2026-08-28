@@ -57,6 +57,11 @@ not about your code being wrong:
   sandbox must have no path to the control plane.
 - **`verify-build`** — builds all five images. Skipped automatically when Docker is
   unavailable, so a green local run does not always mean CI will agree.
+- **`lint` reads the git index too, so stage a new file before you trust it.** Ruff's
+  file list is `git ls-files 'tests/*.py'`, which means a new test you have not
+  staged yet is invisible to it: `make lint` reports green having never opened the
+  file, and CI — which sees it committed — does not. Same index-vs-disk trap as the
+  launcher exec bit above, arriving from the other direction.
 
 ## Tests
 

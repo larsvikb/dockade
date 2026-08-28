@@ -82,3 +82,8 @@ Consequences worth stating, because each was learned by violating it:
   table that tracks sequence, so nothing else needs editing when a step lands.
 - **Numbers in prose rot.** Don't restate a test count or a version a command
   reports; name the command.
+- **A doc claim with a machine-checkable counterpart gets a guard.**
+  `tests/test_docs.py` holds the derivable ones — the `DESIGN.md` network roster
+  against compose, `**N-homed**` claims against a service's real legs, backticked
+  repo paths, and in-document anchors. Prose only a human can judge stays out of
+  it: a guard that needs appeasing gets deleted, and takes the useful ones along.

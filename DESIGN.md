@@ -1814,8 +1814,11 @@ fails at runtime. The only alternative is `make destroy`, which discards the pol
 rules and the audit history — i.e. the crown jewels. See the NOTE below `_init_db`
 in `control-plane/store.py`.
 
-Step 2c-2: the per-proxy config surface (rows accumulate from 2a), and the rule
-editing the MCP gateway's per-tool policy needs.
+Step 2c-2: the per-proxy config surface (rows accumulate from 2a), and egress rule
+editing. The gateway needs that surface's *shape* rather than its table — tool policy
+lands in its own, with the gateway (see "Tool policy gets its own table"), so the
+config surface treats a second governed service as a surface with its own policy and
+not as a filter over this one.
 
 Not yet built: per-proxy config (2c-2), git/secrets/cache data-plane services, the
 MCP gateway, skills, quality-gate hooks.
@@ -2065,15 +2068,49 @@ authorize bridge is a deliberate widening of a surface that answers one endpoint
 today; the criterion that keeps it honest is that a caller reaching that bridge
 still cannot *grant* anything, which is why `resolve` stays off it.
 
-**Three states, two axes.** `allow` / `deny` / `ask` map onto the existing rules
-table almost unchanged (`allow` / `block` / `hold`). What does not carry over is that
-a rule here governs two separable things: whether a tool's schema is **presented**,
-and whether a call is **executed**. Withholding a schema is ergonomics — it keeps
-the agent from planning around a capability it cannot have. Execution is the
-boundary, and `deny` must be enforced there *regardless of presentation*, because a
-tool name can arrive from anywhere: a transcript, a `CLAUDE.md`, text injected into
-the agent's context by an earlier tool result. Same shape as settings-versus-
-capability everywhere else in this design.
+**Tool policy gets its own table, not a new scope on `rules`.** The three states are
+the same three (`allow` / `deny` / `ask` against `allow` / `block` / `hold`), and the
+two-column key looks like a near-fit — a tool rule wants `(tool, server)` where an
+egress rule has `(pattern, client_class)`. Both are false friends. `action` is the
+only column that carries over.
+
+`client_class` is not a label anyone writes: `policy._client_class` derives it from
+the peer address, and it names a *network*. The server on a tool call is the name the
+gateway dialled — the other of the two identities "Per-server identity has two
+different answers" above keeps apart. Sharing the column puts both meanings in one
+table, sorting `mcp` (a network whose egress is being decided) beside `mcp-github` (a
+server whose tools are) in a view that groups by that column precisely so unrelated
+rules are never adjacent (`api_rules` in `control-plane/app.py`). `pattern` fares no
+better: its leading-dot wildcard and the breadth ladder built over it
+(`policy._match`, `policy._persist_candidates`) describe a host namespace, and a tool
+name has no hierarchy to widen along.
+
+Deeper than the key, and the reason this is a different *kind* of row rather than a
+differently keyed one: an egress rule decides a whole request, because the host is
+the unit of decision, while a tool name is only a prefix of one — the payload carries
+the rest. `ask` not decaying (below) is a consequence of that same fact, and it makes
+pinning an argument a predicate over a payload rather than a string in a column. The
+write paths also run opposite ways: egress policy accumulates from approvals, with
+editing retrofitted onto it; tool policy is configuration first, with growth-by-use
+the thing to prevent.
+
+Cost breaks the same direction, which settles the choice rather than makes the case
+for it. A new table is a `CREATE TABLE IF NOT EXISTS` over no existing rows; a shared
+one needs a discriminator inside `UNIQUE(pattern, client_class)`, and SQLite cannot
+add a uniqueness constraint by `ALTER`, so that is the drop-copy-rename rebuild
+`_migrate` in `control-plane/store.py` already had to write once. What the two
+surfaces share is a *pattern* and not code — the backend derives a bounded candidate
+set, the operator picks from it, the chosen value is shown verbatim — and the ladders
+themselves have no common implementation: one is host-breadth, the other
+argument-shaped and server-specific.
+
+**Two axes, not one.** A rule here governs two separable things: whether a tool's
+schema is **presented**, and whether a call is **executed**. Withholding a schema is
+ergonomics — it keeps the agent from planning around a capability it cannot have.
+Execution is the boundary, and `deny` must be enforced there *regardless of
+presentation*, because a tool name can arrive from anywhere: a transcript, a
+`CLAUDE.md`, text injected into the agent's context by an earlier tool result. Same
+shape as settings-versus-capability everywhere else in this design.
 
 **An unconfigured tool is denied and reported, not held — a deliberate divergence
 from the egress proxy.** There, an unmatched host is held because the set of hosts

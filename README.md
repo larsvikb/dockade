@@ -322,8 +322,10 @@ exposed through governed data-plane services. Next steps toward it:
    view of the same table — one row per decision instead of the folded glance, with
    the request itself and cursor paging back through the whole record. Reading the
    log no longer means `docker compose exec` and SQL against the crown-jewel volume.
-   Next: **2c-2** egress rule editing — changing a rule's pattern or action in one
-   audited operation, rather than revoke-then-create.
+   **2c-2 done:** standing policy is fully mutable — a rule's pattern or action can be
+   changed in one audited operation carrying both states, rather than a revoke and a
+   create that leave two half-rows and a window where the host is neither allowed nor
+   blocked. Next: the **MCP gateway**, per-tool allow/deny/ask.
 3. **Skills + quality-gate hooks** in the image — the enablement half of the
    paved road.
 4. **Pull-through package cache** — fast, governed dependency installs.

@@ -145,6 +145,10 @@ _RELAY_ROUTES = (
     # pattern that could match a slash or a dot-segment would be a path-traversal
     # primitive rather than an id.
     ("POST", re.compile(r"^/api/egress/rules/[0-9]{1,19}/revoke$")),
+    # Its own entry, not a widened one, for the reason the GET/POST split above gives:
+    # an edit can flip a block into an allow, so it grants exactly as the collection
+    # POST does and belongs in that class rather than beside the revoke it sits next to.
+    ("POST", re.compile(r"^/api/egress/rules/[0-9]{1,19}/edit$")),
     ("GET", re.compile(r"^/api/config$")),
     ("POST", re.compile(r"^/api/saturation/ack$")),
 )

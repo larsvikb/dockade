@@ -500,8 +500,8 @@ function createPreview(pattern, action, clientClass, rules) {
                ? `${p} is already a standing ${verb.toUpperCase()} rule for `
                  + `${clientClass}. Nothing to add.`
                : `${p} is already a standing ${existing.action.toUpperCase()} rule for `
-                 + `${clientClass}, and nothing here replaces a rule. Revoke that one `
-                 + `first, or write a different pattern.` };
+                 + `${clientClass}, and nothing ADDED here replaces a rule. Revoke that `
+                 + `one first, edit it in place, or write a different pattern.` };
   }
   // The subtree is spelled out rather than named, because a leading dot is the entire
   // grant and it looks like punctuation — the same reason persistPreview quotes the
@@ -519,6 +519,84 @@ function createPreview(pattern, action, clientClass, rules) {
                + `immediately, without being held for approval.`
              : `Requests from ${clientClass} to ${subject} will be denied `
                + `immediately, without being held for approval.` };
+}
+
+// What "save changes" is about to do to an existing rule.
+//
+// The counterpart to createPreview, mirroring the same three refusals — the wildcard
+// floor, a conflicting rule, and a no-op — for the same reasons, and leaving everything
+// else to the backend's `detail`.
+//
+// It describes the TRANSITION, not the end state. "api.example.com will be allowed"
+// describes a row; "requests to .example.com will no longer be allowed, and requests to
+// api.example.com will be" describes what changes about the world. That is the
+// distinction revokePreview draws too, and an edit needs it more than either neighbour:
+// it is the only operation here that takes something away and gives something back in
+// the same click.
+//
+// `rule` is the row being edited, so the conflict check can EXCLUDE it. A rule always
+// holds its own pattern, and counting that as a collision would refuse every action flip
+// — the same off-by-one the backend answers with its `id<>?` clause.
+function editPreview(rule, pattern, action, rules) {
+  const p = normalizePattern(pattern);
+  const verb = action === "allow" ? "allow" : "block";
+  const wild = p.startsWith(".");
+  const was = (rule && rule.pattern) || "";
+  const wasVerb = (rule && rule.action) || "";
+  const clientClass = (rule && rule.client_class) || "";
+  const base = { ok: false, pattern: p, verb, wild, was, wasVerb, clientClass,
+                 danger: false, conflict: false, unchanged: false, text: "" };
+  if (!rule) {
+    // The row went away under the form — revoked in another tab, or edited to something
+    // else. Said out loud rather than left as a silently dead button.
+    return { ...base,
+             text: "That rule is no longer in the table. It may have been revoked "
+                 + "elsewhere; cancel and start again." };
+  }
+  if (rule.source === "seed") {
+    return { ...base,
+             text: `${was} comes from the policy seed and cannot be edited here. `
+                 + `Edit policies/egress-allowlist.txt and rebuild.` };
+  }
+  if (!p) return { ...base, text: "" };
+  if (wild && verb === "allow" && p.slice(1).split(".").length < WILDCARD_MIN_LABELS) {
+    return { ...base,
+             text: `${p} is a wildcard over a single label — as an allow that grants `
+                 + `everything under it. A block may be this broad; an allow may not.` };
+  }
+  if (p === was && verb === wasVerb) {
+    return { ...base, unchanged: true,
+             text: `${p} already ${verb}s for ${clientClass}. Nothing to change.` };
+  }
+  const clash = (rules || []).find(
+    r => r && String(r.id) !== String(rule.id) && r.pattern === p
+      && (r.client_class || "") === clientClass) || null;
+  if (clash) {
+    return { ...base, conflict: true,
+             text: `${p} is already a standing ${String(clash.action).toUpperCase()} `
+                 + `rule for ${clientClass}, and nothing here merges two rules. Revoke `
+                 + `one of them first, or write a different pattern.` };
+  }
+  const subject = wild
+    ? `${p} — that host and every subdomain of it, including ones that have never `
+      + `been requested —`
+    : p;
+  // Loosening in either of two ways, and both are flagged. The rule ENDS as an allow;
+  // or it stops being a block, which includes narrowing one — the hosts that fall out
+  // from under a shrinking block are no longer denied. So the old action decides this
+  // as much as the new one, which is what makes it different from createPreview.
+  const danger = verb === "allow" || wasVerb === "block";
+  const leaving = p === was
+    ? `${was} currently ${wasVerb}s. `
+    : (wasVerb === "allow"
+        ? `Requests to ${was} will no longer be allowed. `
+        : `Requests to ${was} will no longer be blocked. `);
+  return { ...base, ok: true, danger,
+           text: leaving + (verb === "allow"
+             ? `Requests from ${clientClass} to ${subject} will be allowed `
+               + `immediately, without being held for approval.`
+             : `Requests from ${clientClass} to ${subject} will be denied `
+               + `immediately, without being held for approval.`) };
 }
 
 // What a screen reader should hear when the pending queue changes.
@@ -1862,8 +1940,13 @@ function start() {
       // A seed rule shows WHY it has no control rather than an empty cell, so
       // nobody has to wonder whether the button failed to render. The id is on the
       // button because revocation keys on it, never on the pattern.
+      // Edit before revoke, in the order the operator should reach for them: changing a
+      // rule is the recoverable action and taking it away is not, so the destructive one
+      // is not the first button under the pointer.
       const control = p.allowed
-        ? `<button type="button" class="revoke" data-rule="${esc(String(r.id))}"
+        ? `<button type="button" class="edit" data-rule="${esc(String(r.id))}"
+             >edit</button>
+           <button type="button" class="revoke" data-rule="${esc(String(r.id))}"
              >revoke</button>`
         : `<span class="ts" title="${esc(p.text)}">from seed</span>`;
       return `<tr>
@@ -1894,6 +1977,15 @@ function start() {
   // holds expire; this table only changes when policy does, and a modal that steals
   // focus is the right amount of friction for an action with no undo.
   document.getElementById("rules").addEventListener("click", async (ev) => {
+    // Editing loads the row into the form above rather than acting here. No confirm on
+    // THIS click: it changes nothing yet, and the form's own confirm is the one that
+    // guards the write.
+    const editBtn = ev.target.closest("button.edit");
+    if (editBtn) {
+      const editRow = rulesById.get(editBtn.dataset.rule);
+      if (editRow) enterEditMode(editRow);
+      return;
+    }
     const btn = ev.target.closest("button.revoke");
     if (!btn) return;
     const row = rulesById.get(btn.dataset.rule);
@@ -1934,7 +2026,14 @@ function start() {
   const ruleActionEl = document.getElementById("rule-action");
   const ruleClassEl = document.getElementById("rule-class");
   const ruleAddEl = document.getElementById("rule-add");
+  const ruleCancelEl = document.getElementById("rule-cancel");
   const rulePreviewEl = document.getElementById("rule-preview");
+  // The id being edited, or null for the create form. Editing REUSES this form rather
+  // than adding a second one: the fields are the same fields and the validation is the
+  // same validation, so a separate editor would be a second place for the wildcard floor
+  // and the conflict check to drift out of. It also means an operator cannot be halfway
+  // through both at once.
+  let editingRuleId = null;
   // What the last submit came back with. A separate fact from the preview, and it
   // OUTRANKS it: the preview describes what a click would do, and this describes what
   // the last one actually did — including the refusals this page deliberately does not
@@ -1954,12 +2053,50 @@ function start() {
     for (const el of [rulePatternEl, ruleActionEl, ruleClassEl, ruleAddEl]) {
       el.disabled = !usable;
     }
+    // A config poll must not hand back a control this form deliberately locked. Without
+    // this, re-rendering the class list mid-edit re-enables the picker and the operator
+    // can re-scope a rule the backend will not re-scope.
+    if (editingRuleId !== null) ruleClassEl.disabled = true;
+    renderRulePreview();
+  }
+
+  function enterEditMode(row) {
+    editingRuleId = String(row.id);
+    rulePatternEl.value = row.pattern || "";
+    ruleActionEl.value = row.action === "block" ? "block" : "allow";
+    // The class is shown but LOCKED. Moving a rule between client classes takes policy
+    // from one population and gives it to another, which the backend refuses to call an
+    // edit (see RuleEditRequest) — disabled rather than hidden, so the form still says
+    // who the rule decides for.
+    if (row.client_class) ruleClassEl.value = row.client_class;
+    ruleClassEl.disabled = true;
+    ruleCancelEl.hidden = false;
+    ruleAddEl.textContent = "save changes";
+    // Any verdict from a previous submit is about a different rule now.
+    ruleNotice = null;
+    renderRulePreview();
+    rulePatternEl.focus();
+  }
+
+  function leaveEditMode() {
+    editingRuleId = null;
+    rulePatternEl.value = "";
+    ruleClassEl.disabled = !clientClasses.length;
+    ruleCancelEl.hidden = true;
+    ruleAddEl.textContent = "add rule";
     renderRulePreview();
   }
 
   function currentPreview() {
+    const rules = [...rulesById.values()];
+    if (editingRuleId !== null) {
+      // Looked up on every render rather than captured at entry, so a rule revoked or
+      // changed under the form is noticed by the preview instead of being written over.
+      return editPreview(rulesById.get(editingRuleId), rulePatternEl.value,
+                         ruleActionEl.value, rules);
+    }
     return createPreview(rulePatternEl.value, ruleActionEl.value, ruleClassEl.value,
-                         [...rulesById.values()]);
+                         rules);
   }
 
   function renderRulePreview() {
@@ -1994,6 +2131,10 @@ function start() {
     el.addEventListener("change", () => { ruleNotice = null; renderRulePreview(); });
   }
 
+  // Leaves the rule exactly as it was: nothing has been sent at this point, so there is
+  // nothing to undo and no confirm to ask for.
+  ruleCancelEl.addEventListener("click", () => { ruleNotice = null; leaveEditMode(); });
+
   ruleFormEl.addEventListener("submit", async (ev) => {
     // Always: the page's own CSP sends `form-action 'none'`, so a native submit is
     // refused by the browser anyway — this is what makes that a fail-closed backstop
@@ -2001,6 +2142,10 @@ function start() {
     ev.preventDefault();
     const p = currentPreview();
     if (!p.ok) return;
+    if (editingRuleId !== null) {
+      await submitEdit(p);
+      return;
+    }
     // `confirm()` for the same reason the revoke path uses one: this table only changes
     // when policy does, so a modal is the right amount of friction for a write that
     // takes effect on the agent's very next request. The pattern quoted is the
@@ -2046,6 +2191,57 @@ function start() {
     renderRulePreview();
     refreshRules();
   });
+
+  // The edit half of that submit. Split out rather than branched inline because the two
+  // differ in more than a URL — the confirm names a transition, the success case leaves
+  // edit mode, and `changed: false` is a different sentence from `created: false`.
+  async function submitEdit(p) {
+    // The same friction the create path applies, for a stronger reason: this write both
+    // grants and takes away, and the confirm is the only place the operator sees both
+    // halves stated together.
+    if (!window.confirm(`${p.text}\n\nSave this change to ${p.pattern}?`)) return;
+    ruleAddEl.disabled = true;
+    try {
+      const res = await fetch(
+        `/api/egress/rules/${encodeURIComponent(editingRuleId)}/edit`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          // The PREVIEWED pattern, not the typed one, for the reason the create path
+          // gives: normalization can change what lands, and the confirm has to have been
+          // about the rule that does.
+          body: JSON.stringify({ pattern: p.pattern, action: p.verb }),
+        });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok || !body.ok) {
+        // 404 is the one worth reading here and it has no analogue on the create path:
+        // the rule was revoked while the form was open, so there is nothing to edit and
+        // retrying cannot help.
+        ruleNotice = { bad: true,
+                       text: `Not saved: ${body.detail || `the control plane answered `
+                                                        + `${res.status}`}` };
+      } else if (body.changed === false) {
+        ruleNotice = { bad: false,
+                       text: `${body.pattern} already ${body.action}s for `
+                           + `${body.client_class}; nothing was written.` };
+        leaveEditMode();
+      } else {
+        // Names both states, as the audit row does — "saved" alone would not say which
+        // of the two things an edit can change actually moved.
+        const prev = body.previous || {};
+        ruleNotice = { bad: false,
+                       text: `Saved: ${prev.pattern} (${prev.action}) is now `
+                           + `${body.pattern} (${body.action}) for `
+                           + `${body.client_class}.` };
+        leaveEditMode();
+      }
+    } catch (e) {
+      ruleNotice = { bad: true,
+                     text: "Not saved: the control plane is unreachable." };
+    }
+    ruleAddEl.disabled = false;
+    renderRulePreview();
+    refreshRules();
+  }
 
   // ── the approvals feed, and the reconnect it used to lack ─────────────────
   const conn = document.getElementById("conn");
@@ -2138,7 +2334,7 @@ if (typeof module !== "undefined" && module.exports) {
     holdRemaining, countdownState, departure, persistPreview, saturationState,
     ackCount, capScope, requestsLabel, auditRow, auditStatus, rulesStatus, repeatCount,
     outageSummary, pendingAnnouncement, coverageSummary, revokePreview,
-    normalizePattern, createPreview,
+    normalizePattern, createPreview, editPreview,
     timeWindow, filterActive, auditQuery, eventRow, historyPager,
     fmtTime, fmtStamp, fmtInstant,
     AUDIT_ORDINARY_STAGE, AUDIT_WINDOWS, WILDCARD_MIN_LABELS,

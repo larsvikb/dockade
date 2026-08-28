@@ -244,6 +244,20 @@ class RuleCreateRequest(BaseModel):
     # refuses to delete — a caller that could set it could write an UNREVOCABLE rule.
 
 
+class RuleEditRequest(BaseModel):
+    # The TARGET state, not a delta: both fields are required even when one of them is
+    # unchanged. An absent field would have to mean "leave this alone", which is
+    # indistinguishable from a caller that meant to send it and did not — and ``action``
+    # is the field where that ambiguity decides egress. Stating both is also what lets
+    # the audit row report a before and an after that the caller actually asked for.
+    pattern: str
+    action: str                    # allow | block
+    # NOTE the two fields that are absent. ``source``, for the reason
+    # ``RuleCreateRequest`` gives. And ``client_class``, because a rule's class is not
+    # editable: moving one between classes takes policy away from one population and
+    # gives it to another, which is two changes wearing one audit row. See ``edit_rule``.
+
+
 class AckRequest(BaseModel):
     # How many over-cap rejections the operator has read. A count rather than a
     # "dismiss" flag, so a rejection arriving between the render and the click is
@@ -942,9 +956,9 @@ def create_rule(req: RuleCreateRequest, request: Request) -> JSONResponse:
 
     Not idempotent-by-overwrite: an existing rule for the same (pattern, class) with
     the OPPOSITE action is a 409, never a silent replace — the same refusal, for the
-    same reason, that ``resolve`` makes on its persist path. Nothing in this service
-    replaces a rule; revoke-then-create is the two-step, and it is deliberately
-    visible as two audit rows."""
+    same reason, that ``resolve`` makes on its persist path. Replacing one is
+    ``edit_rule``'s job, where it is a named operation with a before and an after in
+    the record; a create that silently overwrote would be the same act with neither."""
     actor = _actor(request)
     pattern = policy._normalize_pattern(getattr(req, "pattern", "") or "")
     action = (getattr(req, "action", "") or "").strip().lower()
@@ -1007,6 +1021,106 @@ def create_rule(req: RuleCreateRequest, request: Request) -> JSONResponse:
                          "id": rule_id, "pattern": pattern, "action": action,
                          "source": "operator", "client_class": client_class},
                         status_code=201)
+
+
+@app.post("/api/egress/rules/{rule_id}/edit")
+def edit_rule(rule_id: int, req: RuleEditRequest, request: Request) -> JSONResponse:
+    """Change a standing rule's pattern or action in ONE operation.
+
+    The remaining half of rule mutation. Creating and revoking were built; CHANGING one
+    meant revoke-then-create, which is two audit rows for one intent and — the part that
+    actually bites — a window in which the rule is gone and its host decides as unknown.
+    That window failed to ``hold`` rather than to allow, which is why it was tolerable,
+    but tolerable is not atomic: an operator narrowing a wildcard under load left every
+    host under it held, one card at a time, for as long as the second step took.
+
+    One UPDATE in one transaction closes it. There is no instant at which the old rule
+    is gone and the new one is not yet written.
+
+    Otherwise this carries create's exposure and therefore create's validation: the
+    pattern is caller-supplied rather than drawn from ``policy._persist_candidates``, so
+    ``policy._rule_error`` is the whole of what stands between this and a rule matching
+    more than the operator meant.
+
+    **Seed rules are refused**, as ``revoke_rule`` refuses them, and the reasoning is
+    stronger here. A revoked seed rule at least LEAVES, and ``store._seed_if_empty``
+    re-reads the file on the next empty-table start. An edited one stays, indexed and
+    deciding, while ``policies/egress-allowlist.txt`` — a reviewed file under version
+    control — says something else about the same host.
+
+    ``created_at`` is deliberately not touched: this is the same rule with different
+    terms, and the audit row below is where the change is dated. Rewriting it would
+    erase when the policy first came into force in favour of when someone last adjusted
+    it, and the rules view sorts on it.
+
+    The class is deliberately not editable — see ``RuleEditRequest``."""
+    actor = _actor(request)
+    pattern = policy._normalize_pattern(getattr(req, "pattern", "") or "")
+    action = (getattr(req, "action", "") or "").strip().lower()
+
+    error = policy._rule_error(pattern, action)
+    if error is not None:
+        return JSONResponse({"ok": False, "detail": error}, status_code=400)
+
+    with store._connect() as conn:
+        row = conn.execute(
+            "SELECT pattern, action, source, client_class FROM rules WHERE id=?",
+            (rule_id,)).fetchone()
+        if row is None:
+            return JSONResponse({"ok": False, "detail": "unknown rule"},
+                                status_code=404)
+        if row["source"] == "seed":
+            return JSONResponse(
+                {"ok": False,
+                 "detail": f"{row['pattern']} came from the policy seed and cannot be "
+                           f"edited here — edit policies/egress-allowlist.txt"},
+                status_code=403)
+        if row["pattern"] == pattern and row["action"] == action:
+            # Asked for what is already in force. A non-write rather than an error, for
+            # the reason ``create_rule`` reports ``already_present``: the policy asked
+            # for IS the policy. Reported as such because the alternative is an audit
+            # row saying standing policy moved on a request that moved nothing.
+            return JSONResponse({"ok": True, "changed": False, "id": rule_id,
+                                 "pattern": pattern, "action": action,
+                                 "client_class": row["client_class"]})
+        # A DIFFERENT rule already holding the target (pattern, class) is the 409 that
+        # ``UNIQUE(pattern, client_class)`` would otherwise raise at the driver, where it
+        # is an opaque 500. Excluding this rule's own id matters: without it, changing
+        # only the ACTION would collide with the row being edited.
+        clash = conn.execute(
+            "SELECT id, action, source FROM rules "
+            "WHERE pattern=? AND client_class=? AND id<>?",
+            (pattern, row["client_class"], rule_id)).fetchone()
+        if clash is not None:
+            return JSONResponse(
+                {"ok": False,
+                 "detail": f"another standing rule already covers {pattern!r} for "
+                           f"client class {row['client_class']!r} and "
+                           f"{clash['action']}s it; nothing here merges two rules. "
+                           f"Revoke one of them first.",
+                 "conflict": {"id": clash["id"], "pattern": pattern,
+                              "action": clash["action"], "source": clash["source"],
+                              "client_class": row["client_class"]}},
+                status_code=409)
+        conn.execute("UPDATE rules SET pattern=?, action=? WHERE id=?",
+                     (pattern, action, rule_id))
+        conn.commit()
+
+    # ONE row carrying BOTH states, which is the entire difference from
+    # revoke-then-create: those were two rows that each described half of an intent,
+    # with nothing tying them together and no order guaranteed between them in a busy
+    # log. ``host`` is the NEW pattern, because that is what decides from now on, and
+    # the reason says what it replaced.
+    store._audit("edit", stage="policy", host=pattern,
+                 client_class=row["client_class"],
+                 reason=f"rule edited by {actor}; {row['pattern']} ({row['action']}) is "
+                        f"now {pattern} ({action}, {policy._pattern_scope(pattern)}) "
+                        f"for client class {row['client_class']}")
+    return JSONResponse({"ok": True, "changed": True, "id": rule_id,
+                         "pattern": pattern, "action": action,
+                         "client_class": row["client_class"],
+                         "previous": {"pattern": row["pattern"],
+                                      "action": row["action"]}})
 
 
 @app.post("/api/egress/rules/{rule_id}/revoke")

@@ -338,6 +338,7 @@
         <option value="hold">hold</option>
         <option value="revoke">revoke</option>
         <option value="create">create</option>
+        <option value="edit">edit</option>
       </select>
       <!-- Relative windows, not date pickers: the question is "since when". Values
            are the keys of AUDIT_WINDOWS in app.js, held equal by a test. -->
@@ -424,6 +425,10 @@
            not know, so a hardcoded list would offer rules that cannot be written. -->
       <select id="rule-class" aria-label="Client class this rule decides for"></select>
       <button type="submit" id="rule-add">add rule</button>
+      <!-- Only in edit mode, where the form is standing in for an existing rule and
+           there has to be a way out that is not "submit something". Hidden rather than
+           absent so the button row does not reflow when a rule is picked. -->
+      <button type="button" id="rule-cancel" hidden>cancel</button>
     </form>
     <!-- What the button will do, in the world rather than in the table — the same
          discipline the revoke confirm and the persist preview follow. Also where the

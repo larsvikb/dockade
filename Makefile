@@ -414,9 +414,11 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	  fi
 	done
 	# The security-load-bearing nets MUST each be internal: sandbox-net (the
-	# agent's only net) and the two control paths — control-net (management) and
+	# agent's only net), the two control paths — control-net (management) and
 	# authorize-net (the proxy's route to /authorize, which reaches the control
-	# plane just as directly). Check each BY NAME — a bare count of 'internal:
+	# plane just as directly) — and mcp-net, whose internal-ness is what leaves the
+	# egress proxy as the only thing an MCP server container can reach, from a
+	# container holding a write-capable credential. Check each BY NAME — a bare count of 'internal:
 	# true' can't tell that the RIGHT nets are the internal ones (a future edit
 	# could flip sandbox-net to non-internal while some other net gained
 	# 'internal: true', and a count would still pass). awk isolates each top-level
@@ -424,7 +426,7 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	# appears inside it. tests/test_topology.py asserts the same property from the
 	# other side, along with who is attached to what; this stays because it is the
 	# one that runs in `make consistency` alongside the launcher check above.
-	for net in sandbox-net control-net authorize-net; do
+	for net in sandbox-net control-net authorize-net mcp-net; do
 	  if ! awk -v net="$$net" '
 	        $$0 ~ "^  " net ":" {inb=1; next}
 	        inb && /^  [A-Za-z]/ {inb=0}
@@ -435,7 +437,7 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	    exit 1
 	  fi
 	done
-	echo "  ok — no launcher attaches the sandbox to a control network; sandbox-net, control-net and authorize-net all internal"
+	echo "  ok — no launcher attaches the sandbox to a control network; sandbox-net, control-net, authorize-net and mcp-net all internal"
 
 # No `##` description, so it stays out of `make help`: it exists for the config-home
 # drift guard above, which needs make's own answer under a modified environment.

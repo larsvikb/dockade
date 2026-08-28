@@ -35,6 +35,9 @@ ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = [line
            for name in ("docker-compose.yml", "mcp-servers.yml")
            for line in (ROOT / name).read_text().splitlines()]
+#: The catalogue alone, so the MCP placement rules below can be asserted over every
+#: server it declares rather than over a list someone has to remember to extend.
+MCP_COMPOSE = (ROOT / "mcp-servers.yml").read_text().splitlines()
 ADDON = (ROOT / "proxies" / "egress" / "addon.py").read_text()
 HOLDS = (ROOT / "control-plane" / "holds.py").read_text()
 BOUNDARY = (ROOT / "sandbox-common" / "boundary-check.sh").read_text()
@@ -100,6 +103,30 @@ def _service_names() -> list[str]:
     return [m.group(1)
             for line in _all_services()
             if (m := re.match(r"  ([A-Za-z0-9._-]+):\s*$", line))]
+
+
+def _mcp_service_names() -> list[str]:
+    """Every service the MCP catalogue declares.
+
+    Derived, for the reason ``_service_names`` gives and one sharper: the placement
+    rules below are the ENTIRE boundary around a container holding a credential the
+    sandbox must not have, and mcp-servers.yml tells its reader that a new server
+    "cannot escape them by being added quietly". A hardcoded tuple made that false —
+    a second server added to the catalogue and not to the tuple was asserted about by
+    nothing at all, and nothing would have said so.
+
+    Raises on an empty result rather than returning one, the same fail-closed shape as
+    the LAUNCHERS and SPDX globs in the Makefile: a catalogue that stops parsing must
+    not turn every test below into a silent pass.
+    """
+    names = [m.group(1)
+             for line in _block(MCP_COMPOSE, "services", 0)
+             if (m := re.match(r"  ([A-Za-z0-9._-]+):\s*$", line))]
+    if not names:
+        raise AssertionError(
+            "no services parsed out of mcp-servers.yml — the MCP placement rules "
+            "would check nothing. Did the file move, or its indentation change?")
+    return names
 
 
 def _scalar(body: list[str], key: str) -> str | None:
@@ -183,8 +210,9 @@ class McpServerPlacementTests(unittest.TestCase):
     hand the agent the credential directly and make the gateway's per-tool policy
     decorative, and every health check would stay green while it did."""
 
-    #: Services that run a third-party MCP server. Extend as servers are added.
-    MCP_SERVERS = ("mcp-github",)
+    #: Every server the catalogue declares — derived, never listed, so adding one to
+    #: mcp-servers.yml is what subjects it to the rules below. See _mcp_service_names.
+    MCP_SERVERS: ClassVar[tuple[str, ...]] = tuple(_mcp_service_names())
 
     def test_mcp_servers_never_join_the_agent_network(self):
         for svc in self.MCP_SERVERS:
@@ -511,9 +539,14 @@ class RelayGuardAgreesWithComposeTests(unittest.TestCase):
         self.assertEqual({agent_range}, {c.strip() for c in lifeline.split(",")})
 
     def test_the_networks_the_guard_blocks_are_internal(self):
-        # An internal bridge has no route off-box. Both control networks must be
-        # one, or the control plane itself would gain egress.
-        for network in ("control-net", "authorize-net", "sandbox-net"):
+        # An internal bridge has no route off-box. Both control networks must be one,
+        # or the control plane itself would gain egress. mcp-net is here for the same
+        # reason wearing a different hat: its internal-ness is what makes the egress
+        # proxy the only thing an MCP server container can reach, so a server that
+        # ignores HTTPS_PROXY fails loudly instead of quietly going direct — from a
+        # container holding a write-capable credential. Placement is that boundary;
+        # nothing inside those containers enforces it.
+        for network in ("control-net", "authorize-net", "sandbox-net", "mcp-net"):
             body = _block(_block(COMPOSE, "networks", 0), network, 2)
             self.assertTrue(
                 any(re.match(r"\s*internal:\s*true\s*$", line) for line in body),

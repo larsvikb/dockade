@@ -176,8 +176,11 @@ report.
   cannot run the infrastructure. Governed mode is the default and the one the
   invariants describe.
 - **Components that do not exist yet** — the git proxy, secrets broker, package
-  cache, skills and quality-gate hooks are described in `DESIGN.md` as planned. They
-  cannot have vulnerabilities until they are built.
+  cache, MCP gateway, skills and quality-gate hooks are described in `DESIGN.md` as
+  planned. They cannot have vulnerabilities until they are built. The MCP *server
+  catalogue* (`mcp-servers.yml`) does ship and its containers do run, but no
+  sandbox has a route to them until the gateway exists — so what is testable today
+  is that absence of a route, not the gateway's per-tool policy.
 - **"The control-plane UI has no authentication."** Correct, and deliberate: it is
   bound to host loopback behind structural browser-facing guards, and see the first
   item for why adding auth would not address the threat that actually matters. A

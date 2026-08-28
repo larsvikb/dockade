@@ -161,6 +161,11 @@ egress** — sandbox-net only. These make good practices cheap and fast. Example
   egress proxy → the control plane's `/authorize` listener. Exists so the proxy
   can ask policy questions without gaining a route to the management API; see
   "why three control nets" under Governance surfaces. Sandbox not attached.
+- `mcp-net` (`internal: true`) — the MCP data path, two conversations only: the
+  MCP gateway dialing the server containers, and those containers reaching the
+  egress proxy for their own upstream calls. The servers live here and never on
+  `sandbox-net`, which is their whole boundary — each holds a credential the agent
+  must not have. Sandbox not attached. Its tenants are in `mcp-servers.yml`.
 - `egress-net` — only outbound-capable governed proxies + internet.
 - `control-ui-net` — non-internal bridge carrying ONLY the control-plane-ui
   frontend's host-loopback UI publish; masquerade disabled so it is
@@ -168,11 +173,12 @@ egress** — sandbox-net only. These make good practices cheap and fast. Example
   host port from a container that is on an internal network alone. Sandbox not
   attached.
 
-**Status:** all five networks are implemented. `sandbox-net` (internal) and
+**Status:** every network above is implemented. `sandbox-net` (internal) and
 `egress-net` carry the agent and the sole egress; the two internal control nets
-carry the control path, split by surface. The egress proxy is **triple-homed**
-(sandbox-net + egress-net + authorize-net) — note `authorize-net`, not
-`control-net`. The control-plane **backend** is on both control nets and fully
+carry the control path, split by surface. The egress proxy is **quadruple-homed**
+(sandbox-net + egress-net + authorize-net + mcp-net) — note `authorize-net`, not
+`control-net`, and note that the `mcp-net` leg exists only to be DIALED. The
+control-plane **backend** is on both control nets and fully
 internal (no `sandbox-net`, no `egress-net`, no published port), serving a
 different surface on each; the **control-plane-ui** frontend is on `control-net`
 (to reach the backend) plus `control-ui-net` (host-loopback UI). The sandbox is on
@@ -706,8 +712,8 @@ host-bind-mounted workspace. Dependencies: pull-through cache.
   write-capable-credentials invariant rather than a second exception to it.
 
 **Ungoverned (sandbox-net only, no independent egress):**
-- **Pull-through package cache** (npm/PyPI/apt) *(not built yet — see Build
-  status)*. Ungoverned to the agent (fast, free installs); its upstream fetch is
+- **Pull-through package cache** (npm/PyPI/apt) *(not built yet — see
+  "Status")*. Ungoverned to the agent (fast, free installs); its upstream fetch is
   governed via the egress proxy. The one tool with upstream reach, and that
   reach is itself governed.
 - **Toolchain in the sandbox image** — test runner, build, linters, formatters,

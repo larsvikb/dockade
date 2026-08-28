@@ -1513,6 +1513,53 @@ everything (fail-closed, and a plausible way to say "stop holding anything"), on
 per-client cap it disables the cap — the fail-closed reading would make every client's
 first hold impossible, which cannot be what setting it meant.
 
+**Hold bounds are fail-closed, so their values stay env vars.** Step 2c-2 was going to
+move the four caps and `CONTROL_HOLD_TIMEOUT` into the store, on the reasoning that
+governs everything else here: policy belongs in the crown-jewel volume, and every change
+to it is audited. That reasoning does not reach these values, and the distinction decides
+where the next governed service's numbers live too.
+
+Every one of these knobs can only produce a **deny**. Over a cap, `/authorize` refuses
+fail-closed; with no decision inside the window, the hold default-denies; an allow
+requires a human resolution, recorded with its actor. A wrong value therefore makes the
+system more restrictive, never more permissive — which is what separates these from
+rules. "Everything consequential is audited" exists to record capability *granted*, and a
+number that cannot grant capability is not what it governs. The record already carries
+the part an investigation needs, too: every deny names **which** bound fired, in its
+reason string. The magnitude of that bound is readable off the running config, which
+`_bootstrap` prints with its units at every boot.
+
+For values changed this rarely — compose sets none of the five — a compose diff is also
+the better trail than a row in a named volume, carrying a message, an author, a date and
+a review. It is the argument `CLAUDE.md` already makes for commit messages, applied to
+configuration.
+
+So per-surface hold config is a **naming** problem rather than a storage one, and the MCP
+gateway's hold window is a second constant with its own name, beside the tool policy that
+does get its own table (see "Tool policy gets its own table"). What survives of 2c-2 is
+rule **editing**, where the audit argument does apply, because a rule grants.
+
+What none of this excuses is that both cross-value invariants here went unenforced at
+runtime. The four caps must each be able to fire, and the test asserting it covers only
+the defaults — an override could silence a cap with nothing to notice. And the egress
+proxy's authorize timeout must outlast the hold window, or the proxy abandons a request
+whose card is still on the operator's screen and the click decides nothing; those two
+live in different images and neither can see the other. Both are now guarded — see
+"A dead cap warns, it does not refuse to boot" for why the first warns rather than
+exiting, and `ProxyOutlastsTheHoldWindowTests` in `tests/test_topology.py` for the
+second, which compares the two images' defaults because compose overrides neither.
+
+**A dead cap warns, it does not refuse to boot.** `_assert_listeners_separated` exits on
+a wildcard management bind, and copying that shape here would be wrong. A cap that cannot
+fire is not a containment failure: cards are bounded by waiters regardless, so the system
+stays bounded and only the operator's belief about *which* limit binds is wrong. Refusing
+to start would trade that for an outage of the governance authority, which denies every
+sandbox's egress — a strictly worse failure than the one being prevented. The zero cases
+settle it: a global cap of zero legitimately means "refuse everything" and a per-client
+zero legitimately disables that cap, so a naive ordering assertion would refuse to boot
+on two documented settings. `_warn_on_dead_caps` therefore exempts zeros and prints
+beside the caps line that `_bootstrap` already emits.
+
 **A persist cannot overwrite, so one that would is refused.** `rules.pattern` is
 `UNIQUE`, and the insert was `INSERT OR IGNORE` — so persisting a pattern that already
 carried the **opposite** action wrote nothing, while the endpoint returned
@@ -1902,13 +1949,13 @@ fails at runtime. The only alternative is `make destroy`, which discards the pol
 rules and the audit history — i.e. the crown jewels. See the NOTE below `_init_db`
 in `control-plane/store.py`.
 
-Step 2c-2: the per-proxy config surface (rows accumulate from 2a), and egress rule
-editing — of which creating and revoking are built (see "Writing a rule with no request
-behind it") and atomic *mutation* is the remaining half. The gateway needs that
-surface's *shape* rather than its table — tool policy
-lands in its own, with the gateway (see "Tool policy gets its own table"), so the
-config surface treats a second governed service as a surface with its own policy and
-not as a filter over this one.
+Step 2c-2 is egress rule **editing**: creating and revoking are built (see "Writing a
+rule with no request behind it") and atomic *mutation* is the remaining half. The
+per-proxy config surface this step also used to mean is **not** being built — those
+values are fail-closed bounds rather than policy, so they stay env vars and a second
+governed service names its own (see "Hold bounds are fail-closed, so their values stay
+env vars"). Tool policy still lands in its own table, with the gateway (see "Tool policy
+gets its own table"), so the gateway is not waiting on a config surface for it.
 
 **URLs carry the surface.** `/api/egress/rules` is the standing-policy view and
 `/api/egress/rules/{id}/revoke` takes a rule back; the gateway later adds
@@ -1921,7 +1968,7 @@ the one queue every surface feeds (see "`approvals` splits the same way"). The s
 rejected on the way is `/api/rules?surface=…`, a discriminator over a single path —
 the storage mistake above wearing an API hat.
 
-Not yet built: per-proxy config (2c-2), git/secrets/cache data-plane services, the
+Not yet built: rule editing (2c-2), git/secrets/cache data-plane services, the
 MCP gateway, skills, quality-gate hooks.
 
 ### MCP gateway — governed tool capability (planned, not built)
@@ -2986,13 +3033,13 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | 2b-3 | control-plane API surface split across two internal nets | **done** |
 | — | unit suite + CI gate | **done** |
 | 2c-1 | audit browsing — filters + the paged record view | **done** |
-| 2c-2 | per-proxy config (+ rule editing) | next |
+| 2c-2 | egress rule editing (atomic mutation) | next |
 | 3 | skills + quality-gate hooks in the image | planned |
 | 4 | pull-through package cache | planned |
 | — | governed git push path | planned |
 | — | `mcp-net` + MCP server catalogue (`mcp-servers.yml`) | **done** — inert until the gateway exists |
 | — | per-client-class egress policy | **done** |
-| — | MCP gateway — per-tool allow/deny/ask | planned (needs 2c's per-proxy config + rule editing) |
+| — | MCP gateway — per-tool allow/deny/ask | planned (unblocked — names its own bounds) |
 
 The rationale for each shipped item lives under **Governance surfaces** above, not here
 — a status line goes stale, the reasoning does not. This section is deliberately the
@@ -3042,10 +3089,18 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
   answers immediately" for the reasoning and for what makes the pending answer safe.
   Three consequences settled with it: a tool ask does **not** draw on `MAX_WAITERS`
   and gets its own cap, the tool hold window is a second number free of any client
-  timeout (per-surface config, which is the shape 2c-2 is being built for), and
+  timeout (a constant of its own, not a config surface — see "Hold bounds are
+  fail-closed, so their values stay env vars"), and
   **withdrawal is moot** — nothing is held open, so there is no stranded caller to
   cancel. It also means the single-queue decision now rests on the SSE argument
   alone: the worker pool is no longer shared.
+- **RESOLVED — the hold bounds stay env vars, and 2c-2 is rule editing alone.** The
+  per-proxy config surface is not being built. The four caps and the two timeouts can
+  only ever produce a deny, so the audit invariant — which exists to record capability
+  *granted* — does not reach them, and for values changed this rarely a compose diff is
+  a better trail than a store row. See "Hold bounds are fail-closed, so their values
+  stay env vars". The two cross-value invariants such a surface would have validated on
+  write are guarded at boot and in `tests/test_topology.py` instead.
 - **Which governed path owns repo writes.** The planned git proxy speaks the git
   protocol; a GitHub MCP server behind the gateway reaches the same capability
   through the REST API (create-or-update-file style tools commit without ever

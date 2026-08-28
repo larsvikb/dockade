@@ -14,6 +14,8 @@ Dependency-free: ``fastapi``/``pydantic`` are stubbed (see ``tests/_loader.py``)
 and the store is a throwaway SQLite file in a temp dir set before import."""
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import tempfile
 import threading
@@ -312,8 +314,9 @@ class HoldCapTests(_HoldRegistryTestCase):
 
     def test_a_card_cap_at_or_above_its_waiter_cap_is_dead(self):
         """Not a rule the code enforces — a property of the two counts that the shipped
-        DEFAULTS are chosen to avoid. Cards are always <= waiters, so a card cap set
-        equal to its waiter cap can never be the first to refuse. Asserted so that
+        DEFAULTS are chosen to avoid, and that ``_warn_on_dead_caps`` reports at boot for
+        the hand-set values this test cannot see. Cards are always <= waiters, so a card
+        cap set equal to its waiter cap can never be the first to refuse. Asserted so that
         raising `CONTROL_MAX_WAITERS` alone, and thereby silencing the card cap without
         meaning to, is a visible fact rather than a discovery."""
         self._caps(cards=3, waiters=3)
@@ -369,6 +372,57 @@ class HoldCapTests(_HoldRegistryTestCase):
         self.assertNotIn("a", cp.holds._GROUPS.values())
         # Releasing an already-released id is a harmless no-op.
         cp.holds._release_hold("a")
+
+
+class DeadCapWarningTests(_HoldRegistryTestCase):
+    """``_warn_on_dead_caps`` reports a card cap that can never be the one to refuse.
+
+    The cap ordering was asserted only for the SHIPPED defaults, so an operator raising
+    a waiter cap on its own silenced the matching card cap with nothing anywhere saying
+    so. The boot line is where that becomes visible, because it is the moment the values
+    are read (see "Hold bounds are fail-closed, so their values stay env vars" in
+    DESIGN.md for why they are read from the environment at all).
+
+    Asserted on the WARNING's presence and on which scope it names, never on its
+    wording."""
+
+    def _warnings(self) -> list[str]:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cp._warn_on_dead_caps()
+        return [ln for ln in buf.getvalue().splitlines() if "WARNING" in ln]
+
+    def test_a_global_card_cap_at_its_waiter_cap_warns(self):
+        self._caps(cards=8, waiters=8)
+        warnings = self._warnings()
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("global", warnings[0])
+
+    def test_a_per_client_card_cap_above_its_waiter_cap_warns(self):
+        self._caps(cards=4, waiters=16, cards_per_client=9, waiters_per_client=8)
+        warnings = self._warnings()
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("per-client", warnings[0])
+
+    def test_the_shipped_defaults_are_silent(self):
+        """The fixture saved them before any test overwrote them, so this asserts the
+        real deployed configuration and not a value this file chose."""
+        for name, value in self._saved.items():
+            setattr(cp.holds, name, value)
+        self.assertEqual(self._warnings(), [])
+
+    def test_a_zero_waiter_cap_is_not_a_dead_card_cap(self):
+        """Zero DISABLES the per-client waiter cap, which leaves the per-client card cap
+        as the only bound of its scope — the most alive it ever is. Warning here would
+        report a documented setting as a mistake."""
+        self._caps(cards=4, waiters=16, cards_per_client=4, waiters_per_client=0)
+        self.assertEqual(self._warnings(), [])
+
+    def test_a_zero_card_cap_is_not_warned_about(self):
+        """A global zero refuses every hold outright — fail-closed, and a documented way
+        to say "stop holding anything". It is not a cap that failed to bind."""
+        self._caps(cards=0, waiters=16, cards_per_client=0, waiters_per_client=8)
+        self.assertEqual(self._warnings(), [])
 
 
 class DuplicateGroupingTests(_HoldRegistryTestCase):

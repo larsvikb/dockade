@@ -42,10 +42,16 @@ alias gf='git fetch --prune'
 alias gst='git stash'
 alias grs='git restore'
 
-# Safety
-alias rm='rm -i'
-alias mv='mv -i'
-alias cp='cp -i'
+# Safety. `-I` and not `-i`, because the primary user of this shell is an AGENT, and
+# Claude Code's shell snapshot picks these aliases up — so a per-file prompt reaches a
+# caller that cannot answer it, the command does nothing, and it still exits 0
+# (`rm f && echo done` printed `done` with f untouched). A footgun documented in the
+# baked CLAUDE.md rather than removed is the weaker half of this repo's own instinct.
+# `-I` keeps the intent — one prompt for a recursive delete or three-plus files, where
+# a mistake is expensive — and asks nothing for the ordinary single-file case.
+# `mv`/`cp` have no `-I`, so they lose the prompt entirely: their overwrite is a
+# narrower hazard than an unanswerable prompt on every remove.
+alias rm='rm -I'
 
 # Misc
 alias ..='cd ..'

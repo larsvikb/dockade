@@ -13,8 +13,9 @@ from in here.
 - **No git remote.** Commit locally; pushing is the human's step.
 - **`/workspace` is the human's checkout, live.** Your edits and branch switches
   appear outside this container immediately. Say so when you switch branches.
-- **`rm`, `mv` and `cp` are aliased to `-i`.** A non-interactive caller cannot
-  answer the prompt, so the command does nothing and still exits 0. Use `rm -f`,
-  and confirm a destructive step by its result rather than its exit status.
+- **`rm` is aliased to `-I`.** One prompt for a recursive delete or three or more
+  files, none for a single file. A non-interactive caller cannot answer that prompt,
+  so a bulk remove does nothing and still exits 0. Use `rm -f` when deleting many at
+  once, and confirm a destructive step by its result rather than its exit status.
 - **You are not root and cannot become root.** No sudo. A permission error here is
   the design working, not a problem to route around.

@@ -130,7 +130,8 @@ REFFILES := $(SCRIPTS) \
             policies/egress-allowlist.txt
 
 .PHONY: help check check-strict lint consistency test verify-build \
-        up down destroy audit-prune rebuild logs-ep logs-cp \
+        up down destroy audit-prune control-tool-preflight backup restore \
+        rebuild logs-ep logs-cp \
         claude opencode boundary check-boundary split-check
 
 help: ## Show this help
@@ -566,6 +567,111 @@ audit-prune: ## Trim audit rows older than AUDIT_RETENTION_DAYS (default 30) and
 	docker exec -e AUDIT_RETENTION_DAYS=$(AUDIT_RETENTION_DAYS) control-plane \
 	  python3 -c "$$AUDIT_PRUNE_PY"
 
+# Where `make backup` writes. Gitignored: a backup is the crown-jewel state — every
+# host the agent has ever asked for, and the operator's whole policy — so it is
+# host-local by default and never a repo artifact.
+BACKUP_DIR ?= backups
+
+# The image and volume `backup`/`restore` hand to `docker run`. Both are fixed in
+# docker-compose.yml (the service's `image:` and the volume's `name:`) and restated
+# here because `docker run` takes them as arguments rather than reading the file;
+# tests/test_topology.py holds the two spellings together.
+CONTROL_IMAGE := dockade-control-plane
+CONTROL_VOLUME := dockade-control-state
+
+# `docker run`, and neither of the two obvious alternatives:
+#
+#   - NOT `docker compose run`. It attaches the service's networks, and control-plane
+#     PINS its address on both of them (see docker-compose.yml, and the reasoning in
+#     "Pin every address on a network, or none"). A second container asking for an
+#     address the running one holds fails at start with "Address already in use", and
+#     `compose run` has no --network to override with. Measured, not predicted: this
+#     is what the first cut of these targets did, and it failed the moment it met a
+#     live stack.
+#   - NOT `docker exec`. That needs a RUNNING container, and the moment you most want
+#     a backup is the moment the stack is down (before a risky migration, after a bad
+#     one).
+#
+# So the state is reached through the volume rather than through the service, and
+# `--network none` follows honestly rather than as a workaround: this touches a file
+# and needs a route nowhere — least of all the process holding the crown jewels open.
+# `-i` is for `restore`, which feeds the backup on stdin; `backup` reads none.
+CONTROL_TOOL = docker run --rm -i --network none \
+  -v $(CONTROL_VOLUME):/var/lib/control-plane \
+  --entrypoint python3 $(CONTROL_IMAGE)
+
+# Prerequisite of both targets. Without it a missing image sends `docker run` to a
+# registry for a name that was never pushed, and a missing volume is worse: docker
+# CREATES an empty one, so `restore` would quietly populate a volume compose has
+# never adopted and the store would look empty after a restore that reported success.
+control-tool-preflight:
+	@if ! docker image inspect $(CONTROL_IMAGE) >/dev/null 2>&1; then
+	  echo "no $(CONTROL_IMAGE) image — build it first (make up, or make rebuild)"
+	  exit 1
+	fi
+	@if ! docker volume inspect $(CONTROL_VOLUME) >/dev/null 2>&1; then
+	  echo "no $(CONTROL_VOLUME) volume — there is no store yet (make up)"
+	  exit 1
+	fi
+
+backup: control-tool-preflight ## Snapshot the control-plane store (policy + approvals + audit) into BACKUP_DIR (default ./backups)
+	@# The crown-jewel state, which DESIGN.md says must be backed up independently of
+	@# any container — this is that path. Non-destructive and safe to run against a
+	@# LIVE stack: `VACUUM INTO` (in BACKUP_PY) takes a read lock and writes a
+	@# consistent, compacted copy, so nothing has to be stopped and no decision is
+	@# denied while it runs.
+	@mkdir -p "$(BACKUP_DIR)"
+	@out="$(BACKUP_DIR)/dockade-control-$$(date -u +%Y%m%dT%H%M%SZ).db"
+	# Written to `.partial` and renamed only after the check below, so an interrupted
+	# transfer never leaves something that looks like a usable backup.
+	$(CONTROL_TOOL) -c "$$BACKUP_PY" > "$$out.partial"
+	if [ "$$(head -c 15 "$$out.partial" 2>/dev/null)" != "SQLite format 3" ]; then
+	  echo "backup: FAILED — the stream is not a SQLite database. Left at $$out.partial"
+	  exit 1
+	fi
+	mv "$$out.partial" "$$out"
+	echo "backup: wrote $$out ($$(du -h "$$out" | cut -f1))"
+
+restore: control-tool-preflight ## Replace the control-plane store from a backup: make restore FILE=backups/… (destructive)
+	@# The other half of `backup`, and the destructive one: it discards the CURRENT
+	@# rules, approvals and audit history. Deliberately manual, deliberately loud,
+	@# and it validates the incoming file in two passes — a cheap one before the
+	@# stack is touched at all, then the full one in RESTORE_PY before the replace,
+	@# which is the last moment a half-checked file can still be refused.
+	@if [ -z "$(FILE)" ]; then
+	  echo "usage: make restore FILE=$(BACKUP_DIR)/dockade-control-<stamp>.db"
+	  exit 2
+	fi
+	@if [ ! -f "$(FILE)" ]; then echo "restore: no such file: $(FILE)"; exit 2; fi
+	@# The cheap half of the validation, hoisted to BEFORE the stack is touched. The
+	# full check (integrity, the four tables, the schema version) needs the container
+	# and therefore the maintenance window, but the mistake people actually make is
+	# naming the wrong FILE — and that one is decidable from the first 15 bytes, at no
+	# downtime and before the operator is even asked to confirm.
+	@if [ "$$(head -c 15 "$(FILE)" 2>/dev/null)" != "SQLite format 3" ]; then
+	  echo "restore: $(FILE) is not a SQLite database — nothing was touched"
+	  exit 2
+	fi
+	@if [ -z "$(FORCE)" ]; then
+	  printf 'Replace the control-plane store (policy rules, approvals, audit history) with %s? [y/N] ' "$(FILE)"
+	  read -r reply
+	  case "$$reply" in y|Y|yes) ;; *) echo "restore: aborted"; exit 1;; esac
+	fi
+	@# The proxy goes down FIRST and comes back last. It fails closed when the
+	@# control plane is unreachable, so leaving it up would spend the restore
+	@# window denying and auditing real agent requests — filling the very log
+	@# being restored with records of the restore. A maintenance window where the
+	@# sandbox sees a refused connection is the honest shape of this.
+	$(COMPOSE) stop egress-proxy control-plane-ui control-plane
+	@# The stack comes back WHATEVER happens next, which is why this is a trap and
+	# not a line at the end. RESTORE_PY refuses on a file that fails validation —
+	# that is it working — and the first cut let the refusal abort the recipe, so the
+	# SAFE path was the one that left the governance plane and the proxy down until
+	# someone noticed. A restore that declines to run must cost nothing but the
+	# window. Observed, not theorised: `make restore FILE=README.md`.
+	trap '$(COMPOSE) up -d --wait --wait-timeout 120' EXIT
+	$(CONTROL_TOOL) -c "$$RESTORE_PY" < "$(FILE)"
+
 rebuild: ## Rebuild every image from scratch — proxy + control plane + UI + both sandbox tiers — then recreate the infra
 	# Deliberately does NOT `down` first. A build touches no running container, so
 	# taking the governance plane offline for the whole --no-cache build bought
@@ -774,3 +880,122 @@ conn.close()
 print(f"audit-prune: deleted {deleted} audit row(s) older than {days}d, then VACUUM")
 endef
 export AUDIT_PRUNE_PY
+
+# Body of `backup` (see the target above). Runs in a throwaway container built from
+# the control-plane image, with the state volume mounted where the app expects it.
+#
+# STDOUT IS THE TRANSPORT — the snapshot's bytes and nothing else. Every human-
+# readable line goes to stderr, or it would end up inside the .db file. That is why
+# the alternative (write into the container, `docker cp` it out) was not taken: it
+# needs a RUNNING container to copy from, and the moment you most want a backup is
+# the moment the stack is down.
+define BACKUP_PY
+import os, sqlite3, shutil, sys
+
+# The app's own module, imported rather than restated: DB_PATH is defined once and
+# an operator's CONTROL_DB override is honoured for free. WORKDIR is its directory.
+import store
+
+src = store.DB_PATH
+if not os.path.exists(src):
+    sys.exit(f"backup: no store at {src} — nothing to back up (has it ever run?)")
+
+# A sibling of the store, so it is on the same filesystem as the file being copied
+# and inside the volume the container can write.
+snap = src + ".backup-snapshot"
+if os.path.exists(snap):
+    os.unlink(snap)
+
+conn = sqlite3.connect(src, timeout=10.0)
+# The app is (or may be) live and writing in short bursts; wait rather than fail.
+conn.execute("PRAGMA busy_timeout=10000")
+# VACUUM INTO, not a file copy: it takes a read lock and writes a standalone,
+# compacted database that already includes everything in the WAL. So it is
+# consistent against a live store, and the result has NO -wal/-shm sidecar — which
+# is what lets `restore` be a single file move rather than a three-file dance.
+conn.execute("VACUUM INTO ?", (snap,))
+conn.close()
+
+snapconn = sqlite3.connect(snap)
+counts = {t: snapconn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+          for t in ("rules", "approvals", "audit")}
+version = snapconn.execute("PRAGMA user_version").fetchone()[0]
+snapconn.close()
+
+with open(snap, "rb") as f:
+    shutil.copyfileobj(f, sys.stdout.buffer)
+sys.stdout.buffer.flush()
+os.unlink(snap)
+
+print(f"backup: schema v{version}, " +
+      ", ".join(f"{n} {t}" for t, n in counts.items()), file=sys.stderr)
+endef
+export BACKUP_PY
+
+# Body of `restore` (see the target above). Reads the backup on STDIN — the mirror
+# of BACKUP_PY writing it to stdout — so the file never has to be copied into a
+# container that may not be running.
+define RESTORE_PY
+import os, sqlite3, sys
+
+import store
+
+dst = store.DB_PATH
+tmp = dst + ".restore-incoming"
+
+os.makedirs(os.path.dirname(dst), exist_ok=True)
+with open(tmp, "wb") as f:
+    f.write(sys.stdin.buffer.read())
+
+
+def reject(why):
+    """Refuse BEFORE the replace, and take the half-written file with us. Every
+    check below is here because passing it is what makes the destructive step
+    safe — after os.replace there is nothing left to compare against."""
+    os.unlink(tmp)
+    sys.exit(f"restore: REFUSED, store untouched — {why}")
+
+
+try:
+    conn = sqlite3.connect(tmp)
+    integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    counts = {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+              for t in ("rules", "approvals", "audit") if t in tables}
+    conn.close()
+except sqlite3.DatabaseError as e:
+    reject(f"not a readable SQLite database ({e})")
+
+if integrity != "ok":
+    reject(f"integrity_check says {integrity!r}")
+missing = {"rules", "audit", "approvals", "audit_cursor"} - tables
+if missing:
+    reject(f"not a control-plane store — missing table(s): {', '.join(sorted(missing))}")
+# A backup from a NEWER build carries a schema this code has no steps for, and
+# migration only runs forwards: restoring it would leave the app reading columns it
+# does not understand, or writing rows the newer build would misread. The fix is to
+# update the image, not to force it, so this refuses rather than warns.
+if version > store.SCHEMA_VERSION:
+    reject(f"backup is schema v{version}, this control plane understands "
+           f"v{store.SCHEMA_VERSION} — update the image first")
+
+os.replace(tmp, dst)
+# Stale sidecars from the store just replaced. A -wal left behind belongs to a
+# DIFFERENT database file and applying it over the restored one is how a good backup
+# becomes a corrupt store, so failing to remove it is fatal, not a warning. Safe
+# here because `restore` stops the stack first: nothing has the file open.
+for side in ("-wal", "-shm"):
+    try:
+        os.unlink(dst + side)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        sys.exit(f"restore: RESTORED but could not remove {dst + side} ({e}) — "
+                 f"remove it before starting the control plane")
+
+print(f"restore: store replaced from a schema-v{version} backup (" +
+      ", ".join(f"{n} {t}" for t, n in counts.items()) + ")")
+endef
+export RESTORE_PY

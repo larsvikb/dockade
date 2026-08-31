@@ -1985,17 +1985,14 @@ self-reported and forgeable — recorded anyway because they are usually what be
 a non-browser caller. None of this was recorded before: an operator's click and a
 scripted POST were indistinguishable after the fact.
 
-*Schema note (read before adding a column).* `resolved_by` ships with **no migration
-step**, which is safe only because of a one-time circumstance: the single store that
-predated the column was migrated in place with `ALTER TABLE ADD COLUMN` before the
-migration code was removed, and every store created since gets the column from the
-`CREATE TABLE`. That is not a general pattern — `CREATE TABLE IF NOT EXISTS` is a
-no-op on an existing table and this store is a long-lived named volume that
-deliberately outlives container and image churn, so **the next additive column will
-need its own explicit `ALTER` for existing volumes**, or every statement naming it
-fails at runtime. The only alternative is `make destroy`, which discards the policy
-rules and the audit history — i.e. the crown jewels. See the NOTE below `_init_db`
-in `control-plane/store.py`.
+*Schema note (read before adding a column).* The store is a long-lived named volume
+that deliberately outlives container and image churn, and `CREATE TABLE IF NOT
+EXISTS` is a no-op on an existing table, so a column added to the DDL alone is
+missing on every store already in the field. **Migration is therefore not optional
+here, and the alternative to it is `make destroy`** — which discards the policy rules
+and the audit history, i.e. the crown jewels. The mechanism (a stamped schema
+version, append-only ordered steps, and the three edits a new column needs) lives in
+`control-plane/store.py`: read the NOTE below `_init_db` before touching the schema.
 
 Step 2c-2 is egress rule **editing**, and it is built: all three verbs now exist, with
 changing a rule an atomic operation rather than revoke-then-create (see "Changing a rule

@@ -2720,6 +2720,99 @@ class MigrationTests(_FreshStoreTestCase):
                 cp.store.LEGACY_CLIENT_CLASS)
 
 
+class SchemaVersionTests(_FreshStoreTestCase):
+    """What decides that a migration step runs, now that the schema is not the thing
+    being interrogated.
+
+    ``MigrationTests`` above covers what step 1 DOES; this covers the loop that picks
+    steps. The failure it exists to catch has no symptom at start-up: a step that runs
+    a second time on a store already past it completes without error and silently
+    rewrites data — for step 1, every per-class rule an operator made would be dragged
+    back to the legacy class."""
+
+    def _old_store(self, name):
+        """A store on the pre-client_class schema — the same hand-built shape
+        ``MigrationTests`` starts from, which is where its DDL is explained."""
+        self._use_store(name)
+        with cp.store._connect() as conn:
+            for ddl in MigrationTests._OLD_SCHEMA:
+                conn.execute(ddl)
+            conn.execute("INSERT INTO rules(pattern, action, source, created_at) "
+                         "VALUES ('example.com','allow','operator',0)")
+            conn.commit()
+
+    @staticmethod
+    def _version():
+        with cp.store._connect() as conn:
+            return conn.execute("PRAGMA user_version").fetchone()[0]
+
+    def test_a_fresh_store_is_stamped_at_the_current_version(self):
+        # A fresh store gets today's schema from the DDL, so it must come out stamped
+        # as current — not 0. Stamped 0, the next release would run every step in
+        # ``_STEPS`` over a store that already has their result.
+        self._use_store("version-fresh.db")
+        cp.store._init_db()
+        self.assertEqual(self._version(), cp.store.SCHEMA_VERSION)
+
+    def test_a_migrated_store_is_stamped_at_the_current_version(self):
+        self._old_store("version-migrated.db")
+        self.assertEqual(self._version(), 0)
+        cp.store._init_db()
+        self.assertEqual(self._version(), cp.store.SCHEMA_VERSION)
+
+    def test_an_unstamped_store_past_a_step_is_placed_not_re_run(self):
+        # The store the PREVIOUS release left behind: migrated by the old
+        # shape-keyed code, so it has client_class and no stamp. `_detect_version`
+        # has to place it at 1 from its schema. If it placed it at 0, step 1 would
+        # re-run and re-scope every rule to the legacy class — including the
+        # per-class rules that are the whole reason the column exists.
+        self._old_store("version-unstamped.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            conn.execute("INSERT INTO rules(pattern, action, source, created_at, "
+                         "client_class) VALUES ('tools.example','allow','operator',"
+                         "0,'mcp')")
+            conn.execute("PRAGMA user_version = 0")     # back to unstamped
+            conn.commit()
+
+        cp.store._init_db()
+
+        self.assertEqual(self._version(), cp.store.SCHEMA_VERSION)
+        with cp.store._connect() as conn:
+            rows = {r["pattern"]: r["client_class"]
+                    for r in conn.execute("SELECT pattern, client_class FROM rules")}
+        self.assertEqual(rows, {"example.com": cp.store.LEGACY_CLIENT_CLASS,
+                                "tools.example": "mcp"})
+
+    def test_a_failed_step_leaves_the_version_where_it_was(self):
+        # The stamp is written inside the step's transaction, so a failure must roll
+        # it back with the schema change. A stamp that survived a failed step would
+        # be the worst outcome available: the store would be recorded as migrated,
+        # the next start would skip the step, and nothing would ever complete it.
+        self._old_store("version-failed-step.db")
+
+        def boom(conn):
+            conn.execute("ALTER TABLE rules ADD COLUMN half_applied TEXT")
+            raise RuntimeError("injected failure mid-step")
+
+        with mock.patch.object(cp.store, "_STEPS", ((1, "boom", boom),)), \
+                self.assertRaises(RuntimeError):
+            cp.store._migrate()
+
+        self.assertEqual(self._version(), 0)
+        with cp.store._connect() as conn:
+            self.assertNotIn("half_applied", cp.store._columns(conn, "rules"))
+
+    def test_the_steps_are_contiguous_and_end_at_the_declared_version(self):
+        # ``SCHEMA_VERSION`` and ``_STEPS`` are two halves of one fact, and only this
+        # holds them together. A step appended without the bump would never run (its
+        # version is reachable, but nothing stamps past it on a fresh store); a bump
+        # without the step would stamp stores as having applied one that does not
+        # exist, so it could never be added later.
+        versions = [v for v, _, _ in cp.store._STEPS]
+        self.assertEqual(versions, list(range(1, cp.store.SCHEMA_VERSION + 1)))
+
+
 class LegacyClassNameTests(unittest.TestCase):
     """``store.LEGACY_CLIENT_CLASS`` and the class names in ``policy`` are two
     spellings of one thing, and nothing in the code ties them: ``store`` is the bottom

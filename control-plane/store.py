@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import time
+from collections.abc import Callable
 
 DB_PATH = os.environ.get("CONTROL_DB", "/var/lib/control-plane/control.db")
 SEED_PATH = os.environ.get(
@@ -42,6 +43,11 @@ DRAIN_MAX_FIELD = 2048
 # two spellings are tied by the suite rather than by a shared constant.
 LEGACY_CLIENT_CLASS = "sandbox"
 
+# The schema this code expects. Every entry in ``_STEPS`` below adds exactly one,
+# and a store records the version it is at (see ``_migrate``), so "what has already
+# run here" is a number to compare rather than a schema to interrogate.
+SCHEMA_VERSION = 1
+
 
 def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=5.0)
@@ -51,84 +57,131 @@ def _connect() -> sqlite3.Connection:
 
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     """Column names of ``table``, or an empty set if it does not exist. The empty
-    case is what tells a migration "fresh store" from "old store"."""
+    case is what tells ``_detect_version`` "fresh store" from "old store"."""
     return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
 
 
-def _migrate() -> None:
-    """Bring an EXISTING store up to the current schema. Runs before the
-    ``CREATE TABLE IF NOT EXISTS`` block, so on a fresh store it is a no-op and the
-    DDL below is the whole definition.
+def _detect_version(conn: sqlite3.Connection) -> int:
+    """The version of a store written BEFORE this code stamped one — the only case
+    where the schema itself has to be interrogated.
 
-    This is the migration step the NOTE under ``_init_db`` said the next column would
-    need. It exists because the store is a long-lived named volume that outlives
-    container and image churn, and ``CREATE TABLE IF NOT EXISTS`` is a NO-OP on an
-    existing table — so without this, ``client_class`` would be missing on every store
-    created before it and every statement naming it would fail at runtime.
+    A one-time bridge, and it stays fixed-size: every store this code touches leaves
+    with a stamp, so nothing beyond the two shapes below can ever arrive unstamped
+    again. A new step extends ``_STEPS``, never this function.
 
-    The rebuilt ``rules`` DDL below is a near-copy of the one in ``_init_db``, and the
+    ``rules`` absent means no DDL has run at all — a fresh file. It is reported as
+    CURRENT rather than 0 because ``_init_db``'s ``CREATE TABLE`` block writes today's
+    schema directly; running the steps over it would be re-doing work the DDL already
+    did."""
+    rules = _columns(conn, "rules")
+    if not rules:
+        return SCHEMA_VERSION
+    return 1 if "client_class" in rules else 0
+
+
+def _step_1_client_class(conn: sqlite3.Connection) -> None:
+    """v1 — policy becomes per-client-class: ``rules`` is scoped and constrained by
+    (pattern, client_class), ``audit`` and ``approvals`` record the class a decision
+    was made under.
+
+    The rebuilt ``rules`` DDL here is a near-copy of the one in ``_init_db``, and the
     two have to stay identical or a migrated store and a fresh one diverge in ways
     nothing would notice until one of them hit an insert path the other had not. They
     are compared, statement to statement, by a test rather than shared as a constant —
     a shared one would have to be parameterized by table name, which is how the
     migration's temporary table would end up in the fresh store's schema.
 
-    Its own connection in AUTOCOMMIT mode with an explicit ``BEGIN``/``COMMIT``,
-    which is load-bearing rather than stylistic: Python's sqlite3 opens an implicit
-    transaction for DML only, so DDL issued on a default connection runs outside one.
-    The rules rebuild below drops a table, and a crash between the copy and the drop
-    with no transaction around them loses the crown-jewel policy rules. SQLite itself
-    has transactional DDL; this is what lets us use it.
-
     ``audit`` and ``approvals`` take the column NULLABLE and with no default. Those
     are records, not constraints, and a row written before classes existed genuinely
     has no class — NULL says that, where backfilling a name would put a claim in the
     audit trail that nothing observed."""
+    # A REBUILD rather than an ADD COLUMN, because the constraint changes too:
+    # uniqueness becomes (pattern, client_class). The old column-level
+    # UNIQUE(pattern) would let one class's rule for a host block another's —
+    # `INSERT OR IGNORE` in ``resolve`` would silently write nothing, report the
+    # rule already present, and leave the second client held forever on a host the
+    # operator believes they approved. SQLite cannot drop a column-level constraint
+    # in place, so the table is rebuilt: the twelve-step procedure, minus the steps
+    # that only apply to foreign keys, triggers and views (this schema has none).
+    conn.execute("DROP TABLE IF EXISTS rules_migrating")
+    conn.execute("""
+        CREATE TABLE rules_migrating (
+            id           INTEGER PRIMARY KEY,
+            pattern      TEXT NOT NULL,
+            action       TEXT NOT NULL,
+            source       TEXT NOT NULL,
+            created_at   REAL NOT NULL,
+            client_class TEXT NOT NULL DEFAULT '%s',
+            UNIQUE(pattern, client_class)
+        )""" % LEGACY_CLIENT_CLASS)
+    # `id` is carried over, not regenerated: the UI's revoke button keys on it, so
+    # renumbering would aim a pending click at another rule.
+    conn.execute(
+        "INSERT INTO rules_migrating(id, pattern, action, source, "
+        "created_at, client_class) SELECT id, pattern, action, source, "
+        "created_at, ? FROM rules", (LEGACY_CLIENT_CLASS,))
+    conn.execute("DROP TABLE rules")
+    conn.execute("ALTER TABLE rules_migrating RENAME TO rules")
+    print(f"control-plane: migrated the rules table to per-client-class policy; "
+          f"existing rules are scoped to {LEGACY_CLIENT_CLASS!r}", flush=True)
+    for table in ("audit", "approvals"):
+        cols = _columns(conn, table)
+        if cols and "client_class" not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN client_class TEXT")
+            print(f"control-plane: added client_class to {table} (existing rows "
+                  f"keep NULL — they predate client classes)", flush=True)
+
+
+# Ordered, and the order is the only thing that decides what runs: a step is applied
+# when its version exceeds the store's, so steps must be APPEND-ONLY and never
+# renumbered, reordered or edited once shipped — a store in the field has already run
+# the old body and will never run it again. Each entry is (version, label, function),
+# the label being what the operator sees in the log.
+_STEPS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = (
+    (1, "per-client-class policy", _step_1_client_class),
+)
+
+
+def _migrate() -> None:
+    """Bring an EXISTING store up to ``SCHEMA_VERSION``. Runs before the
+    ``CREATE TABLE IF NOT EXISTS`` block, so on a fresh store it applies nothing and
+    the DDL below is the whole definition.
+
+    It exists because the store is a long-lived named volume that outlives container
+    and image churn, and ``CREATE TABLE IF NOT EXISTS`` is a NO-OP on an existing
+    table — so without this, a column added to the DDL would be missing on every
+    store created before it and every statement naming it would fail at runtime.
+
+    The version lives in SQLite's own ``user_version`` header field rather than in a
+    table of ours. It needs no DDL to exist (so there is no bootstrap step that
+    itself needs migrating), it is written inside the same transaction as the step it
+    records, and it costs no query on the hot path — nothing reads it but this
+    function. Stores that predate the stamp are placed once by ``_detect_version``.
+
+    Its own connection in AUTOCOMMIT mode with an explicit ``BEGIN``/``COMMIT``,
+    which is load-bearing rather than stylistic: Python's sqlite3 opens an implicit
+    transaction for DML only, so DDL issued on a default connection runs outside one.
+    The v1 rules rebuild drops a table, and a crash between the copy and the drop
+    with no transaction around them loses the crown-jewel policy rules. SQLite itself
+    has transactional DDL; this is what lets us use it — and it covers the stamp too,
+    so a failed step leaves the version where it was and the retry is the same run."""
     with _connect() as conn:
         conn.isolation_level = None                   # explicit transaction control
         conn.execute("BEGIN IMMEDIATE")
         try:
-            rules = _columns(conn, "rules")
-            if rules and "client_class" not in rules:
-                # A REBUILD rather than an ADD COLUMN, because the constraint changes
-                # too: uniqueness becomes (pattern, client_class). The old
-                # column-level UNIQUE(pattern) would let one class's rule for a host
-                # block another's — `INSERT OR IGNORE` in ``resolve`` would silently
-                # write nothing, report the rule already present, and leave the second
-                # client held forever on a host the operator believes they approved.
-                # SQLite cannot drop a column-level constraint in place, so the table
-                # is rebuilt: the twelve-step procedure, minus the steps that only
-                # apply to foreign keys, triggers and views (this schema has none).
-                conn.execute("DROP TABLE IF EXISTS rules_migrating")
-                conn.execute("""
-                    CREATE TABLE rules_migrating (
-                        id           INTEGER PRIMARY KEY,
-                        pattern      TEXT NOT NULL,
-                        action       TEXT NOT NULL,
-                        source       TEXT NOT NULL,
-                        created_at   REAL NOT NULL,
-                        client_class TEXT NOT NULL DEFAULT '%s',
-                        UNIQUE(pattern, client_class)
-                    )""" % LEGACY_CLIENT_CLASS)
-                # `id` is carried over, not regenerated: the UI's revoke button keys
-                # on it, so renumbering would aim a pending click at another rule.
-                conn.execute(
-                    "INSERT INTO rules_migrating(id, pattern, action, source, "
-                    "created_at, client_class) SELECT id, pattern, action, source, "
-                    "created_at, ? FROM rules", (LEGACY_CLIENT_CLASS,))
-                conn.execute("DROP TABLE rules")
-                conn.execute("ALTER TABLE rules_migrating RENAME TO rules")
-                print(f"control-plane: migrated the rules table to per-client-class "
-                      f"policy; existing rules are scoped to "
-                      f"{LEGACY_CLIENT_CLASS!r}", flush=True)
-            for table in ("audit", "approvals"):
-                cols = _columns(conn, table)
-                if cols and "client_class" not in cols:
-                    conn.execute(
-                        f"ALTER TABLE {table} ADD COLUMN client_class TEXT")
-                    print(f"control-plane: added client_class to {table} (existing "
-                          f"rows keep NULL — they predate client classes)",
-                          flush=True)
+            at = conn.execute("PRAGMA user_version").fetchone()[0]
+            if at == 0:                  # unstamped: placed by shape, exactly once
+                at = _detect_version(conn)
+            for version, label, step in _STEPS:
+                if version <= at:
+                    continue
+                step(conn)
+                print(f"control-plane: schema v{version} applied ({label})",
+                      flush=True)
+                at = version
+            # Not parameterizable — PRAGMA takes no placeholders — so the value is
+            # forced to int rather than interpolated as it arrives.
+            conn.execute(f"PRAGMA user_version = {int(at)}")
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
@@ -224,19 +277,23 @@ def _init_db() -> None:
         conn.commit()
 
 
-# NOTE for whoever adds the next column: add it to the DDL above AND to ``_migrate``.
+# NOTE for whoever adds the next column — THREE edits, and all three are required:
+#   1. the DDL above, which is what a fresh store gets;
+#   2. a new `_step_N` above, which is what every store already in the field gets;
+#   3. `SCHEMA_VERSION` and `_STEPS`, bumped and appended by one.
 # `CREATE TABLE IF NOT EXISTS` is a NO-OP on an existing table — it silently does not
 # add columns — and this store is a long-lived named volume that deliberately outlives
-# container and image churn, so a new column is MISSING on any store created before it
-# and every statement naming it then fails at runtime. The only alternative is `make
-# destroy`, which discards the policy rules and the audit history.
+# container and image churn, so a column added at (1) alone is MISSING on any store
+# created before it and every statement naming it then fails at runtime. The only
+# alternative is `make destroy`, which discards the policy rules and the audit history.
 #
-# `resolved_by` got away without a migration step because of a one-time circumstance:
-# the single store that predated it was migrated in place by hand. `client_class` is
-# the column that ended that, and ``_migrate`` is what it left behind — so the step
-# now exists and the question for the next column is only which of its two shapes it
-# needs. An additive nullable column is an `ALTER TABLE ADD COLUMN`; anything that
-# changes a CONSTRAINT is a table rebuild, because SQLite cannot alter one in place.
+# The step's shape is the only real question: an additive nullable column is an
+# `ALTER TABLE ADD COLUMN`; anything that changes a CONSTRAINT is a table rebuild,
+# because SQLite cannot alter one in place (see `_step_1_client_class`).
+#
+# Take a `make backup` before deploying a step that rebuilds a table. The transaction
+# makes a FAILED migration safe; it does nothing about one that succeeds and turns out
+# to be wrong.
 
 
 def _seed_if_empty() -> int:

@@ -579,6 +579,61 @@ class ControlPlaneModulesAreShippedTests(unittest.TestCase):
                               f"container start")
 
 
+class BackupToolTargetsAgreeTests(unittest.TestCase):
+    """`make backup` / `make restore` reach the store through `docker run`, so the
+    image, the volume and the mount path are ARGUMENTS rather than things compose
+    hands them — three names restated in the Makefile that compose owns.
+
+    They are the only place in the repo where compose's own identifiers are spelled
+    out somewhere compose never reads, which is what makes this the file's usual
+    shape: two ends, no compiler between them. Renaming the volume in compose leaves
+    both targets pointed at a name docker will happily CREATE as an empty volume, so
+    the drift does not fail loudly — `backup` reports there is nothing to back up,
+    and a `restore` into it succeeds against a store nothing serves."""
+
+    MAKEFILE: ClassVar[str] = (ROOT / "Makefile").read_text()
+
+    def _make_var(self, name: str) -> str:
+        m = re.search(rf"^{name}\s*:?=\s*(\S+)", self.MAKEFILE, re.M)
+        self.assertIsNotNone(m, f"no {name} in the Makefile — renamed or removed")
+        return m.group(1)
+
+    def test_the_image_is_the_one_compose_builds(self):
+        declared = [line.split(":", 1)[1].strip()
+                    for line in _service("control-plane")
+                    if line.strip().startswith("image:")]
+        self.assertEqual(declared, [self._make_var("CONTROL_IMAGE")])
+
+    def test_the_volume_is_the_one_compose_names(self):
+        # The top-level volume's `name:`, not its key: `name:` is what docker sees,
+        # and it is what `docker run -v` has to be given.
+        names = [line.split(":", 1)[1].strip()
+                 for line in _block(_block(COMPOSE, "volumes", 0), "control-state", 2)
+                 if line.strip().startswith("name:")]
+        self.assertEqual(names, [self._make_var("CONTROL_VOLUME")])
+
+    def test_the_mount_path_is_where_the_service_mounts_it(self):
+        # Where the app looks for the store (store.DB_PATH's default is under it), so
+        # a `docker run` that mounts the volume anywhere else backs up an empty
+        # directory and reports success.
+        mounts = [line.strip().lstrip("- ") for line in _service("control-plane")
+                  if line.strip().startswith("- control-state:")]
+        self.assertEqual(len(mounts), 1, "control-plane's control-state mount moved")
+        path = mounts[0].split(":", 1)[1]
+        self.assertIn(f"-v $(CONTROL_VOLUME):{path}", self.MAKEFILE,
+                      f"compose mounts the store at {path}; the Makefile's "
+                      f"`docker run` mounts it somewhere else")
+
+    def test_the_run_container_joins_no_network(self):
+        # Not a preference. control-plane pins its addresses on both its networks, so
+        # a second container that joins them collides with the running one — which is
+        # the bug these targets shipped with. The store is reached through the volume;
+        # nothing about that needs a route.
+        m = re.search(r"^CONTROL_TOOL\s*=\s*(.*(?:\\\n.*)*)", self.MAKEFILE, re.M)
+        self.assertIsNotNone(m, "no CONTROL_TOOL in the Makefile — renamed or removed")
+        self.assertIn("--network none", m.group(1))
+
+
 class AppPortDefaultsAgreeTests(unittest.TestCase):
     """Close the third edge of the port triangle. The constants above are checked
     against compose, and compose sets NEITHER ``CONTROL_AUTHORIZE_PORT`` nor

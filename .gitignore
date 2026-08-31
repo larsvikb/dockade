@@ -9,6 +9,9 @@ models/
 *.log
 # Local review scratch pad (findings / todo). Working notes, not a repo artifact.
 local-todo.md
+# `make backup` output. The crown-jewel store: every host the agent has asked for and
+# the operator's whole policy — host-local state, never a repo artifact.
+backups/
 # Claude Code's per-checkout working state: agent worktrees (each one a second copy
 # of this repo) and local settings. Ignored WHOLESALE rather than per-entry, which is
 # a decision and not laziness — /workspace is bind-mounted read-write, so a committed

@@ -295,12 +295,17 @@ mode implementing it is undocumented rather than absent. Net effect: in `http` m
 the server never acquires a credential, only verifies one.
 
 **Driving the server by hand needs three surprises handled.** In `http` mode it is an
-**OAuth-protected resource**: an unauthenticated `initialize` gets `401` plus
+**OAuth-protected resource**: an unauthenticated request gets `401` plus
 `Www-Authenticate: Bearer resource_metadata=…/.well-known/oauth-protected-resource/mcp`.
-Any bearer value is accepted at `initialize` (it is not validated there), so
-`-H 'Authorization: Bearer ghp_0000…'` is enough to proceed. It runs **stateless** —
-no `Mcp-Session-Id` is issued, so `tools/call` needs no session header. And replies
-arrive as **SSE** (`text/event-stream`), so the result is a `data:` line, not a JSON body.
+The bearer is not *validated* locally, but it is **format-checked**, which is a third
+refusal distinct from the two in the table below: a token that does not look like a
+GitHub one is rejected with `bad request: Authorization header is badly formatted`
+without anything reaching GitHub. So a dummy has to be well-formed —
+`-H 'Authorization: Bearer ghp_0000…'` (36 characters after the prefix) proceeds where
+`Bearer not-a-real-token` does not. It runs **stateless** — no `Mcp-Session-Id` is
+issued, so no session header is needed and `tools/list` answers with no `initialize`
+handshake at all. And replies arrive as **SSE** (`text/event-stream`), so the result is
+a `data:` line, not a JSON body.
 
 **`GITHUB_PERSONAL_ACCESS_TOKEN` is unused in `http` mode.** Settled with one valid
 read-only PAT in the container's environment, varying only where the credential came
@@ -330,6 +335,68 @@ And the precedence runs the safe way round: a stale env credential cannot shadow
 token the gateway supplies. The container therefore needs no credential of its own,
 which is why the env var was removed from `mcp-servers.yml` rather than kept as a
 fallback — an ineffective credential slot still shows up in `docker inspect`.
+
+## What `mcp-github` v1.9.0 actually exposes
+
+Reproduce with `make mcp-tools SERVER=github`. Captured against
+`ghcr.io/github/github-mcp-server:v1.9.0` with the catalogue's defaults
+(`GITHUB_TOOLSETS=context,repos,issues,pull_requests`, `GITHUB_READ_ONLY=1`) and a
+**dummy** `ghp_` token — enumeration never calls GitHub, so the whole tool surface is
+readable before any credential is configured. A gateway can therefore build its roster
+at startup without holding one.
+
+**25 tools, every one `readOnlyHint: true` — and the flag is what does it.** Re-running
+the same probe with `GITHUB_MCP_READ_ONLY=0` and nothing else changed returns **41
+tools, 16 of them not read-only**, so `GITHUB_READ_ONLY` really filters in v1.9.0 rather
+than being the silently inert flag it was through v0.31.0
+(github/github-mcp-server#2156). The toolset selection is not what produced the
+read-only list. This is defence in depth and still not the boundary — the flag was
+believed to work before, too.
+
+**The 16 it removes are the ones that make "which governed path owns repo writes" a real
+question**, because several reach ref-changing capability without ever speaking the git
+wire protocol: `create_or_update_file`, `push_files`, `delete_file`, `create_branch`,
+`update_pull_request_branch`, `merge_pull_request`, `fork_repository`,
+`create_repository`. `merge_pull_request` is the awkward one — the ref moves
+server-side, so a git proxy watching the wire never sees it. The rest are
+`create_pull_request`, `update_pull_request`, `issue_write`, `sub_issue_write`,
+`add_issue_comment`, `add_comment_to_pending_review`,
+`add_reply_to_pull_request_comment`, `pull_request_review_write`.
+
+**Four tools are dispatchers rather than operations**, two on each side of the flag:
+`pull_request_read` takes a required `method` enum of nine values (`get`, `get_diff`,
+`get_status`, `get_files`, `get_commits`, `get_review_comments`, `get_reviews`,
+`get_comments`, `get_check_runs`), `issue_read` five (`get`, `get_comments`,
+`get_sub_issues`, `get_parent`, `get_labels`), `pull_request_review_write` five
+(`create`, `submit_pending`, `delete_pending`, `resolve_thread`, `unresolve_thread`)
+and `issue_write` two (`create`, `update`). Anything keyed on the tool name alone
+decides all nine together.
+
+`make mcp-tools` surfaces these by printing any **required enum**, which is a broader
+net than "dispatcher" and deliberately so — but the two are not the same thing, and
+`add_comment_to_pending_review`'s `subjectType: FILE, LINE` is the case that shows it:
+a parameter with two legal values, not one name standing for two operations.
+
+**`owner` and `repo` are annotated `x-mcp-header` on 19 of the 25**, i.e. the server
+accepts them as HTTP headers and not only as body fields. With the write tools exposed
+it is **34 of 41** — so 15 of the 16 writes carry it too, and the annotation is not a
+read-path convenience. The sole write-side exception is `create_repository`, which has
+no `owner` to pin because it makes a repository rather than acting on one; nothing is
+lost by it.
+
+Whether a header *overrides* a conflicting body field is **not measured**, and that is
+the whole question: 34 tools accepting a header means nothing if the body wins.
+Overriding would let repo scope be pinned in the transport, for writes included, rather
+than by validating arguments.
+
+The six read tools with neither field — `get_me`, `get_teams`, `get_team_members`,
+`search_code`, `search_commits`, `search_repositories` — are the ones no repo scoping
+reaches at all, by either route.
+
+**55% of the reply is icons**: 36.7 KB of a 67 KB payload, base64 PNG, two per tool
+(light and dark). The share is per-tool rather than fixed overhead — the 41-tool reply is
+113,844 bytes and still 55%. The result also declares `ttlMs: 0` and
+`cacheScope: "public"` — the server's own answer to whether its list may be cached is no.
 
 ## Publishing a host port: the private range is the wrong instinct on WSL2
 

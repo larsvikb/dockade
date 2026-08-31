@@ -132,6 +132,7 @@ REFFILES := $(SCRIPTS) \
 .PHONY: help check check-strict lint consistency test verify-build \
         up down destroy audit-prune control-tool-preflight backup restore \
         rebuild logs-ep logs-cp \
+        mcp-up mcp-down mcp-ps mcp-tools \
         claude opencode boundary check-boundary split-check
 
 help: ## Show this help
@@ -541,6 +542,89 @@ mcp-down: ## Stop one catalogue MCP server: make mcp-down SERVER=github
 mcp-ps: ## Who is on mcp-net right now (should be the proxy plus enabled servers)
 	docker network inspect mcp-net \
 	  -f '{{range .Containers}}{{printf "%-16s %s\n" .Name .IPv4Address}}{{end}}'
+
+# A well-formed DUMMY, and both halves matter. Enumeration never calls GitHub, so no
+# real credential is needed to read a server's tool surface — but the bearer is
+# format-checked before that is discovered, and `Bearer not-a-real-token` is refused
+# outright (NOTES.md, "Driving the server by hand"). Override to compare against what a
+# real token returns: `make mcp-tools SERVER=github MCP_PROBE_TOKEN=$$tok`.
+MCP_PROBE_TOKEN ?= ghp_000000000000000000000000000000000000
+# The first catalogue server's transport, which is the image's own default rather than
+# anything this repo chose. A second server that listens elsewhere makes these
+# per-server; until one exists, two variables beat a lookup.
+MCP_PORT ?= 8082
+MCP_PATH ?= /mcp
+# Unpinned on purpose, and the contrast with mcp-servers.yml is the reason: that file
+# pins because the container holds a write-capable credential and `latest` would be an
+# auto-updating supply chain into it. This one is thrown away after a single request
+# and is handed a dummy token, so a floating tag costs nothing it could spend.
+CURL_IMAGE ?= curlimages/curl:latest
+
+# Reads the SSE reply on stdin. Exists mostly to make the failure modes legible: the
+# server answers a bad bearer with a bare line of prose and no JSON at all, which
+# `jq` reports as a parse error rather than as what happened.
+define MCP_TOOLS_PY
+import json, os, sys
+
+raw = sys.stdin.read()
+payloads = [line[6:] for line in raw.splitlines() if line.startswith("data: ")]
+if not payloads:
+    sys.exit(f"mcp-tools: not an MCP reply — the server said: {raw.strip()[:200]!r}")
+if os.environ.get("MCP_RAW"):
+    print(payloads[0])
+    sys.exit(0)
+
+message = json.loads(payloads[0])
+if "error" in message:
+    sys.exit(f"mcp-tools: the server returned an error — {message['error']}")
+result = message["result"]
+tools = sorted(result["tools"], key=lambda t: t["name"])
+
+for tool in tools:
+    notes = tool.get("annotations", {})
+    kind = "RO" if notes.get("readOnlyHint") else "RW"
+    print(f"{kind}  {tool['name']:<32} {notes.get('title', '')}")
+    # A REQUIRED enum is a dispatcher: one tool name standing for several operations,
+    # so a rule keyed on the name alone decides all of them together. Shown at the
+    # point of listing because it is invisible in a bare list of names.
+    schema = tool.get("inputSchema", {})
+    properties = schema.get("properties", {})
+    for field in schema.get("required", []):
+        choices = properties.get(field, {}).get("enum")
+        if choices:
+            print(f"      {field}: {', '.join(choices)}")
+
+writes = sum(1 for t in tools if not t.get("annotations", {}).get("readOnlyHint"))
+total = len(json.dumps(result))
+icons = sum(len(json.dumps(t.get("icons", []))) for t in tools)
+print(f"\n{len(tools)} tools, {writes} not read-only; "
+      f"{total} bytes of which {round(100 * icons / total)}% is icons")
+endef
+export MCP_TOOLS_PY
+
+mcp-tools: ## List one server's tools and read-only hints: make mcp-tools SERVER=github [RAW=1]
+	@if [ -z "$(SERVER)" ]; then echo "usage: make mcp-tools SERVER=github   [RAW=1 for the raw JSON]"; exit 2; fi
+	@if ! docker ps --format '{{.Names}}' | grep -qx 'mcp-$(SERVER)'; then
+	  echo "mcp-tools: mcp-$(SERVER) is not running — make mcp-up SERVER=$(SERVER)"
+	  exit 2
+	fi
+	# A throwaway container ON mcp-net, because the network is internal with no
+	# published ports: nothing on the host has a path in, which is the property
+	# boundary-check.sh proves from the other side. It also takes the same route the
+	# gateway will — dialling a sibling by name. The image pull happens before the
+	# network is attached, so `internal:` does not block it, and the container takes a
+	# dynamic address out of the subnet, which is why the real servers pin theirs.
+	#
+	# Three details are measured rather than guessed (NOTES.md): the Authorization
+	# header is mandatory and format-checked, the server is stateless so `tools/list`
+	# needs no `initialize` handshake and no session header, and the reply is SSE.
+	docker run --rm --network mcp-net $(CURL_IMAGE) \
+	  -sS -X POST 'http://mcp-$(SERVER):$(MCP_PORT)$(MCP_PATH)' \
+	  -H 'Authorization: Bearer $(MCP_PROBE_TOKEN)' \
+	  -H 'Content-Type: application/json' \
+	  -H 'Accept: application/json, text/event-stream' \
+	  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
+	  | MCP_RAW='$(RAW)' python3 -c "$$MCP_TOOLS_PY"
 
 destroy: ## Stop infra AND delete BOTH volumes: egress audit log + control-plane policy/audit store (destructive)
 	$(COMPOSE) down -v

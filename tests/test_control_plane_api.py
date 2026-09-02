@@ -2427,6 +2427,134 @@ class SaturationTests(_CPTestCase):
         self.assertEqual(cp.holds._saturation()["since"], stamped)
 
 
+class MergedQueueTests(_CPTestCase):
+    """One queue over two builders. Everything else about the tool surface splits —
+    its own tables, caps and endpoints — and this is the deliberate exception, because
+    a partly connected merged view is indistinguishable from an empty one: two streams
+    merged in the browser render a silent subset when one drops, and a subset of a
+    queue looks exactly like a queue with nothing in it."""
+
+    def test_both_kinds_arrive_in_one_list(self):
+        _hold("example.com", "hold-1")
+        ask = cp.holds._register_tool_ask("mcp-github", "issue_write", {"n": 1})
+        cards = cp.holds._pending_payload()["holds"]
+        self.assertEqual({c["kind"] for c in cards}, {"egress", "tool"})
+        self.assertIn(ask.approval_id, [c["id"] for c in cards])
+
+    def test_every_card_states_its_kind(self):
+        # Stated on both builders rather than defaulted on one, so neither surface is
+        # the implicit case a reader has to infer from the absence of the other.
+        _hold("example.com", "hold-1")
+        cp.holds._register_tool_ask("mcp-github", "issue_write", {"n": 1})
+        self.assertTrue(all(c.get("kind") for c in
+                            cp.holds._pending_payload()["holds"]))
+
+    def test_the_queue_is_ordered_by_age_across_both_surfaces(self):
+        # The operator's question is which decision has waited longest, and that does
+        # not respect which subsystem raised it. Sorting per surface and concatenating
+        # would float a seconds-old ask above a minutes-old hold.
+        ask = cp.holds._register_tool_ask("mcp-github", "issue_write", {"n": 1})
+        with cp.store._connect() as conn:
+            conn.execute("UPDATE tool_approvals SET ts=? WHERE id=?",
+                         (time.time() - 300, ask.approval_id))
+            conn.commit()
+        _hold("example.com", "hold-1")
+        cards = cp.holds._pending_payload()["holds"]
+        self.assertEqual([c["id"] for c in cards], [ask.approval_id, "hold-1"])
+
+    def test_a_tool_card_carries_what_a_human_needs_and_no_egress_rim(self):
+        # No `requests` count — nothing is blocked, so a joiner adds no waiter to
+        # report. No `persist_options` — the argument-shaped ladder that would derive
+        # them does not exist, so there is nothing an ask could be persisted AS.
+        cp.holds._register_tool_ask("mcp-github", "issue_write", {"n": 1})
+        card = cp.holds._pending_payload()["holds"][0]
+        for field in ("server", "tool", "args_json", "deadline"):
+            self.assertIn(field, card)
+        for field in ("requests", "persist_options", "persistable"):
+            self.assertNotIn(field, card)
+
+    def test_saturation_is_reported_once_for_both(self):
+        # Unsplit: over a cap nothing raises a card on either surface, so a refusal is
+        # invisible in the queue, and an operator should not have to read two banners.
+        self.assertIn("saturation", cp.holds._pending_payload())
+
+
+class ResolveToolAskTests(_CPTestCase):
+    """``resolve``, tool side. Dispatched on which table holds the id — the queue is
+    merged, so the client sends back only that, and an approval id belongs to exactly
+    one table."""
+
+    def _ask(self, **kw):
+        return cp.holds._register_tool_ask("mcp-github", "issue_write", {"n": 1},
+                                           **kw).approval_id
+
+    def test_an_ask_is_decided_by_its_own_action_set(self):
+        ask = self._ask()
+        resp = _resolve(ask, "allow")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.body["kind"], "tool")
+        self.assertEqual(cp.holds._get_tool_ask(ask)["status"], "allowed")
+
+    def test_the_egress_vocabulary_is_refused_on_a_tool_card(self):
+        # Per-surface action sets, not a union. `allow_persist` on a tool ask would
+        # have to mean "allow this tool forever" — the one rung of a ladder that does
+        # not exist that nobody should reach by clicking the same button twice.
+        ask = self._ask()
+        for action in ("allow_once", "allow_persist", "deny_once", "deny_persist"):
+            resp = _resolve(ask, action)
+            self.assertEqual(resp.status_code, 400, action)
+        self.assertEqual(cp.holds._get_tool_ask(ask)["status"], "pending")
+
+    def test_the_tool_vocabulary_is_refused_on_an_egress_card(self):
+        _hold("example.com", "hold-1")
+        for action in ("allow", "deny"):
+            self.assertEqual(_resolve("hold-1", action).status_code, 400, action)
+
+    def test_a_pattern_on_a_tool_ask_is_refused_not_ignored(self):
+        # Nothing on this surface persists, so a pattern is a caller that thinks it is
+        # writing standing policy — better told than quietly humoured.
+        ask = self._ask()
+        resp = _resolve(ask, "allow", pattern="example.com")
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(cp.holds._get_tool_ask(ask)["status"], "pending")
+
+    def test_deciding_twice_reports_the_current_status(self):
+        # Expired and already-decided call for different things from an operator, so
+        # the conflict names which it was rather than saying only "not pending".
+        ask = self._ask()
+        _resolve(ask, "allow")
+        resp = _resolve(ask, "deny")
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.body["status"], "allowed")
+
+    def test_resolving_an_ask_wakes_nothing_and_touches_no_egress_state(self):
+        # There is no event to set, no group to close and no waiter to release,
+        # because nothing is blocked: the agent already holds a pending result and an
+        # id to come back with.
+        ask = self._ask()
+        _resolve(ask, "allow")
+        self.assertEqual(cp.holds._PENDING_EVENTS, {})
+        self.assertEqual(cp.holds._GROUPS, {})
+
+    def test_a_decision_writes_its_own_audit_row(self):
+        # The asymmetry worth asserting: on the egress path the released waiter writes
+        # the audit line as it returns, so `resolve` records nothing itself. Here there
+        # is no waiter, so without this a human would grant capability with nothing in
+        # the trail.
+        with mock.patch.object(cp.store, "_audit") as audited:
+            _resolve(self._ask(), "allow")
+        self.assertEqual(audited.call_args[0][0], "allow")
+        self.assertEqual(audited.call_args[1]["stage"], "tool-ask")
+
+    def test_an_approval_is_not_executed_by_the_click(self):
+        # The gateway runs the call when the agent RESUMES and claims it, which is what
+        # keeps an approved side effect from happening with nobody left to receive it.
+        ask = self._ask()
+        _resolve(ask, "allow")
+        self.assertIsNone(cp.holds._get_tool_ask(ask)["claimed_at"])
+        self.assertIsNotNone(cp.holds._claim_tool_ask(ask))
+
+
 def _register(server="mcp-github", request=None, **kw):
     return cp.create_mcp_server(cp.ServerCreateRequest(server=server, **kw),
                                 request if request is not None else _FakeRequest())

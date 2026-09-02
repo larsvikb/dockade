@@ -69,7 +69,7 @@ const missing = ["lampState", "backoffDelay", "diffPending", "shouldSweep",
                  "saturationState", "ackCount", "capScope", "requestsLabel",
                  "auditRow", "auditStatus", "rulesStatus", "repeatCount",
                  "timeWindow", "filterActive", "auditQuery", "eventRow",
-                 "historyPager",
+                 "historyPager", "renderableHolds",
                  "fmtTime", "fmtStamp", "fmtInstant"]
   .filter(n => typeof m[n] !== "function");
 console.log(JSON.stringify({
@@ -94,6 +94,19 @@ console.log(JSON.stringify({
     // A card kept on screen after leaving the queue (resolved/stale) must not be
     // re-added when the next push still omits it.
     lingering: m.diffPending(["a"], []),
+  },
+  kinds: {
+    known: m.RENDERABLE_KINDS,
+    // The queue is one list over two builders, so a payload can carry a kind this
+    // script has never seen — a backend one step ahead of a tab left open.
+    both: m.renderableHolds([{ id: "a", kind: "egress" },
+                             { id: "b", kind: "tool" }]).map(a => a.id),
+    unknown_dropped: m.renderableHolds([{ id: "a", kind: "egress" },
+                                        { id: "b", kind: "seance" }]).map(a => a.id),
+    // No kind at all is the shape every payload had before the tool surface existed.
+    legacy_kept: m.renderableHolds([{ id: "a" }]).map(a => a.id),
+    empty: m.renderableHolds([]),
+    absent: m.renderableHolds(undefined),
   },
   sweep: {
     idle_fresh: m.shouldSweep(false, 0),
@@ -658,6 +671,29 @@ class PageScriptTests(unittest.TestCase):
         diff = self.probe["diff"]["added_and_gone"]
         self.assertEqual([a["id"] for a in diff["add"]], ["c"])
         self.assertEqual(diff["gone"], ["a"])
+
+    def test_both_card_kinds_are_rendered(self):
+        # The queue is ONE list over two builders, and the page draws both. If this
+        # ever drops a kind the backend can raise, that surface's decisions are held
+        # by governance and invisible to the human — which is the failure the single
+        # merged stream exists to prevent, arriving by the other door.
+        self.assertEqual(self.probe["kinds"]["both"], ["a", "b"])
+        self.assertEqual(sorted(self.probe["kinds"]["known"]), ["egress", "tool"])
+
+    def test_an_unknown_card_kind_is_dropped_rather_than_drawn(self):
+        # A backend one step ahead of the page — in this repo, a container rebuilt
+        # while a tab stayed open. Filtered once at the payload, so the count, the
+        # announcement and the cards all read the same list: showing fewer cards than
+        # exist is survivable, while claiming a number the list does not match is what
+        # makes an operator believe they have cleared a queue they have not.
+        self.assertEqual(self.probe["kinds"]["unknown_dropped"], ["a"])
+
+    def test_a_card_with_no_kind_is_still_drawn(self):
+        # The shape every payload had before the tool surface existed. Dropping it
+        # would blank the queue of a page cached across that upgrade.
+        self.assertEqual(self.probe["kinds"]["legacy_kept"], ["a"])
+        self.assertEqual(self.probe["kinds"]["empty"], [])
+        self.assertEqual(self.probe["kinds"]["absent"], [])
 
     def test_an_emptied_queue_reports_every_card_gone(self):
         # What a backend restart looks like: startup expires every stale 'pending' row.

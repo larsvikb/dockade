@@ -44,6 +44,25 @@ function backoffDelay(attempt) {
 // ~120s — shifted every card below it upwards between the operator's eye and their
 // click, on a row of buttons that GRANT EGRESS. It also discarded the `disabled`
 // state a resolve in flight had just set.
+// Card kinds this page knows how to draw. The queue is ONE list over two builders
+// (holds.py, `_pending_payload`), so the payload can carry a kind this version of the
+// script has never seen — a backend one step ahead of the page, which in this repo
+// means a container rebuilt while the browser tab stayed open.
+//
+// Filtered ONCE, where the payload arrives, rather than defensively at each consumer.
+// That is the whole point: the count, the announcement and the rendered cards all read
+// the same list, so the page can never say "3 waiting" over two visible cards. Showing
+// fewer than exist is a compromise either way — but a wrong NUMBER is the one that
+// makes an operator think they have finished a queue they have not.
+const RENDERABLE_KINDS = ["egress", "tool"];
+
+// A card with no `kind` at all is treated as egress, and that is not leniency for its
+// own sake: it is the shape every payload had before the tool surface existed, so a
+// page held in cache across that upgrade keeps working instead of blanking its queue.
+function renderableHolds(list) {
+  return (list || []).filter(a => !a.kind || RENDERABLE_KINDS.includes(a.kind));
+}
+
 function diffPending(shownIds, list) {
   const incoming = new Set(list.map(a => a.id));
   return {
@@ -2276,7 +2295,7 @@ function start() {
       const d = JSON.parse(e.data);
       lastSaturation = d.saturation || null;
       renderSaturation();
-      renderPending(d.holds || []);
+      renderPending(renderableHolds(d.holds));
     });
     es.onerror = () => {
       // The feed is the only thing that tells us about pending approvals, so losing
@@ -2338,7 +2357,7 @@ function start() {
 if (typeof document !== "undefined") { start(); }
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
-    lampState, backoffDelay, diffPending, shouldSweep,
+    lampState, backoffDelay, diffPending, renderableHolds, shouldSweep,
     holdRemaining, countdownState, departure, persistPreview, saturationState,
     ackCount, capScope, requestsLabel, auditRow, auditStatus, rulesStatus, repeatCount,
     outageSummary, pendingAnnouncement, coverageSummary, revokePreview,
@@ -2348,5 +2367,6 @@ if (typeof module !== "undefined" && module.exports) {
     AUDIT_ORDINARY_STAGE, AUDIT_WINDOWS, WILDCARD_MIN_LABELS,
     RECONNECT_MIN_MS, RECONNECT_MAX_MS, STALE_MAX_MS, COUNTDOWN_URGENT_S,
     DWELL_MS, SATURATION_RECENT_MS, SATURATION_WARN_FRAC,
+    RENDERABLE_KINDS,
   };
 }

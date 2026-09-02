@@ -553,9 +553,35 @@ def approvals() -> dict:
     return holds._pending_payload()
 
 
+#: What each surface's cards may be resolved WITH. Per-surface rather than a union,
+#: because the two vocabularies mean different things and an action from the wrong one
+#: is a caller that has misread which card it is looking at. The tool set has no
+#: `*_persist` member at all: persisting an egress decision writes a host pattern from
+#: a bounded candidate set, and the argument-shaped analogue for a payload — this call,
+#: then this tool with these arguments, then this tool always — is not built. Offering
+#: `allow_persist` here would have to mean "allow this tool forever", which is the one
+#: rung of that ladder nobody should reach by clicking the same button twice.
+EGRESS_ACTIONS = ("allow_once", "allow_persist", "deny_once", "deny_persist")
+TOOL_ACTIONS = ("allow", "deny")
+
+
 @app.post("/approvals/{approval_id}/resolve")
 def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResponse:
-    if req.action not in ("allow_once", "allow_persist", "deny_once", "deny_persist"):
+    """One endpoint, two surfaces, dispatched on which table holds the id.
+
+    The queue is deliberately merged (``holds._pending_payload``), so the operator
+    clicks cards of both kinds from one list and the id is all the client sends back.
+    That is enough: an approval id belongs to exactly one table, so the card's kind is
+    already determined by the time this is called and nothing has to be trusted from
+    the request body to find it.
+
+    The egress path below is untouched by the split. Everything tool-shaped lives in
+    ``_resolve_tool_ask_request`` rather than as branches threaded through it, because
+    this is the endpoint that turns a held request into allowed egress — the one whose
+    reasoning is worth being able to read straight through."""
+    if holds._get_tool_ask(approval_id) is not None:
+        return _resolve_tool_ask_request(approval_id, req, request)
+    if req.action not in EGRESS_ACTIONS:
         return JSONResponse({"ok": False, "detail": "bad action"}, status_code=400)
     outcome = "allow" if req.action.startswith("allow") else "deny"
     persist = req.action.endswith("persist")
@@ -723,6 +749,66 @@ def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResp
                          "already_present": persist and not wrote_rule,
                          "pattern": pattern,
                          "client_class": client_class if persist else None})
+
+
+def _resolve_tool_ask_request(approval_id: str, req: ResolveRequest,
+                              request: Request) -> JSONResponse:
+    """Answer a tool ask. The tool-shaped half of ``resolve``, and shorter than the
+    egress half by everything that exists to release a blocked worker.
+
+    There is no event to set, no group to close and no waiter to wake, because nothing
+    is blocked: the agent already has a pending result and an id to come back with, so
+    the decision simply lands on the row and waits to be collected. What this does NOT
+    do is execute anything — the gateway runs the call when the agent resumes and
+    claims the approval, which is what keeps an approved side effect from happening
+    with nobody left to receive it.
+
+    It DOES write its own audit row, and that is the asymmetry worth naming: on the
+    egress path the released waiter writes the audit line as it returns, so ``resolve``
+    itself records nothing. Here there is no waiter, so a decision that wrote no audit
+    row would be a human granting capability with nothing in the trail — the one thing
+    no governed path may do."""
+    action = (getattr(req, "action", "") or "").strip().lower()
+    if action not in TOOL_ACTIONS:
+        return JSONResponse(
+            {"ok": False,
+             "detail": f"action must be one of {', '.join(TOOL_ACTIONS)} for a tool "
+                       f"ask, not {action!r}",
+             "actions": list(TOOL_ACTIONS)}, status_code=400)
+    if (getattr(req, "pattern", "") or "").strip():
+        # Refused rather than ignored, unlike a `*_once` egress action which shares a
+        # vocabulary with the persisting ones. Nothing on this surface persists at all,
+        # so a pattern here is a caller that thinks it is writing standing policy —
+        # better told than quietly humoured.
+        return JSONResponse(
+            {"ok": False,
+             "detail": "a tool ask persists nothing, so it takes no pattern"},
+            status_code=400)
+
+    actor = _actor(request)
+    ask = holds._get_tool_ask(approval_id)
+    status = holds._resolve_tool_ask(
+        approval_id, "allowed" if action == "allow" else "denied", actor)
+    if status is None:
+        # Lost a race, or the window elapsed between the render and the click. The
+        # ask's own status says which, and saying so beats a bare conflict: expired
+        # and already-decided call for different things from the operator.
+        current = holds._get_tool_ask(approval_id)
+        return JSONResponse(
+            {"ok": False,
+             "detail": f"not pending ({current['status'] if current else 'unknown'})",
+             "status": current["status"] if current else None}, status_code=409)
+
+    store._audit("allow" if action == "allow" else "deny", stage="tool-ask",
+                 client=ask["client"],
+                 reason=f"tool ask {action}ed by {actor}; {ask['tool']} on "
+                        f"{ask['server']} — the call runs only if the agent returns "
+                        f"for it" if action == "allow" else
+                        f"tool ask denied by {actor}; {ask['tool']} on "
+                        f"{ask['server']} will not run")
+    return JSONResponse({"ok": True, "kind": "tool", "outcome": action,
+                         "status": status, "server": ask["server"],
+                         "tool": ask["tool"]})
 
 
 @app.get("/approvals/stream")

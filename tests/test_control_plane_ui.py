@@ -556,6 +556,53 @@ class SecurityHeaderTests(unittest.TestCase):
         self.assertIn("frame-ancestors 'none'", resp.headers["content-security-policy"])
 
 
+class StaticRevalidationTests(unittest.TestCase):
+    """The page must not run a version of its own control logic older than the one
+    the container is serving.
+
+    `FileResponse` sends validators and no `Cache-Control`, which lets a browser apply
+    HEURISTIC freshness and skip the revalidation entirely. The failure that follows is
+    not an error but a MISRENDER, and it was observed rather than imagined: a page
+    cached from before the tool surface drew every tool ask through the egress card
+    builder — a literal "undefined" where the host would be, under the four egress
+    action buttons, which the backend refuses with a 400 because the action sets are
+    per-surface. A real pending decision, on screen, that cannot be actioned."""
+
+    def test_the_page_script_is_revalidated_on_every_load(self):
+        self.assertEqual(ui.script().headers["cache-control"], "no-cache")
+
+    def test_the_document_is_revalidated_too(self):
+        # The markup carries the stylesheet and the element ids the script binds to,
+        # so a stale document against a fresh script is the same failure mirrored.
+        self.assertEqual(ui.index().headers["cache-control"], "no-cache")
+
+    def test_it_revalidates_rather_than_refusing_to_store(self):
+        # `no-store` would refetch both files in full on every load and every
+        # reconnect. The validators are already being sent, so `no-cache` gets the same
+        # guarantee for one conditional request and a 304.
+        for headers in (ui.script().headers, ui.index().headers):
+            self.assertNotIn("no-store", headers["cache-control"])
+
+    def test_the_security_middleware_does_not_drop_it(self):
+        # `_security_headers` wraps every response and assigns its own names onto it.
+        # If it ever assigned a whole header mapping instead, this would go silently —
+        # and silence is exactly the failure mode being closed here.
+        async def _next(_request):
+            return ui.script()
+
+        resp = asyncio.run(ui._security_headers(_ok_host(), _next))
+        self.assertEqual(resp.headers["cache-control"], "no-cache")
+        self.assertIn("content-security-policy", resp.headers)
+
+    def test_relayed_responses_are_left_alone(self):
+        # Not a security header and deliberately not in `_SECURITY_HEADERS`: it answers
+        # a staleness problem the two STATIC files have, because they are the only
+        # responses here carrying validators with no policy beside them. Putting it on
+        # every relayed response would change caching for the API and the SSE stream to
+        # fix something neither of them has.
+        self.assertNotIn("cache-control", ui._SECURITY_HEADERS)
+
+
 class BackendUnreachableTests(unittest.TestCase):
     """A backend that is down/restarting must produce a legible 502, not a 500.
 

@@ -3089,7 +3089,7 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | 2c-2 | egress rule editing (atomic mutation) | **done** |
 | 3 | skills + quality-gate hooks in the image | planned |
 | 4 | pull-through package cache | planned |
-| — | governed git push path | planned |
+| — | governed git path — clone/fetch (writes are the gateway's) | planned |
 | — | `mcp-net` + MCP server catalogue (`mcp-servers.yml`) | **done** — inert until the gateway exists |
 | — | per-client-class egress policy | **done** |
 | — | tool policy table (`tool_rules` + `policy._decide_tool`) | **done** — inert until the gateway exists |
@@ -3155,16 +3155,36 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
   a better trail than a store row. See "Hold bounds are fail-closed, so their values
   stay env vars". The two cross-value invariants such a surface would have validated on
   write are guarded at boot and in `tests/test_topology.py` instead.
-- **Which governed path owns repo writes.** The planned git proxy speaks the git
-  protocol; a GitHub MCP server behind the gateway reaches the same capability
-  through the REST API (create-or-update-file style tools commit without ever
-  touching the wire protocol). Two governed roads to "write to a repo" under
-  different policy models is a hole, because an actor — or a confused agent —
-  takes the weaker one, so this has to be decided once rather than discovered
-  after both exist. Either the gateway denies the API-commit tools and
-  git-over-the-wire owns writes (the inclination: a branch and force-push policy
-  wants to see refs, not JSON), or the gateway owns them and the git proxy is
-  scoped to clone/fetch.
+- **RESOLVED — the MCP gateway owns repo writes.** The governed git path is scoped to
+  clone/fetch. Two governed roads to "write to a repo" under different policy
+  models is a hole, because an actor — or a confused agent — takes the weaker one,
+  which is why this was decided before either path existed rather than after both
+  did. The earlier inclination was the opposite one — a branch and force-push policy
+  wants to see refs, not JSON — and what overturns it is that **the REST write set
+  cannot express the destructive operations that policy exists to catch**: a
+  create-or-update-file style tool appends a commit and fails on a stale blob sha,
+  and nothing in the set rewrites history or deletes a ref. A wire proxy would be
+  enforcing against operations the surviving path cannot perform. Nor could it have
+  owned writes alone whatever else was decided, because `merge_pull_request` moves
+  the ref **server-side** where nothing watching the wire sees it. The cost, because
+  it is real: the API path writes **new** commits from file contents rather than
+  pushing ones already made locally, so a branch must never be written both ways.
+  Three consequences, in the order they bite. `GITHUB_READ_ONLY` flips off **with the
+  gateway and not before** — until something fronts the server that flag is the only
+  thing narrowing it — after which the gateway's `deny` is the whole boundary, which
+  is what "a server's own restriction flags are defence in depth" has to survive.
+  Per-tool repo scoping stops being optional, putting the unmeasured `x-mcp-header`
+  override question (NOTES.md) on the gateway's critical path. And a dispatcher tool
+  means one name decides several operations, so the argument-shaped `ask` ladder is
+  needed for the write set rather than deferrable past it. `merge_pull_request` is
+  denied outright: merging stays the human's step, as pushing is today.
+
+  *Reasoned from the REST surface, not measured.* The write tools are enumerable —
+  `make mcp-tools SERVER=github` with `GITHUB_MCP_READ_ONLY=0` prints their schemas —
+  and confirming this before allowing any of them is cheap. `push_files` is the one
+  to look at first and the reason this is flagged rather than asserted: it builds a
+  commit through the Git Database API, where a ref update *can* carry `force`, so it
+  is the single tool in the set that could falsify the paragraph above.
 - **RESOLVED — the local managed file is not an enforcement lever under org auth.**
   Verified in-container: `/status` shows the managed source as *remote* (org
   server-managed); the local `/etc/claude-code/managed-settings.json` is not loaded,
@@ -3175,8 +3195,9 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
   an enforcement lever here".
 
 ## Future improvements
-- Dedicated git proxy that speaks the git protocol (block force-push, restrict
-  branches, per-repo policy) instead of HTTPS-through-egress.
+- Dedicated git proxy that speaks the git protocol, per-repo, instead of
+  HTTPS-through-egress — scoped to clone/fetch, since writes are the gateway's (see
+  "the MCP gateway owns repo writes").
 - Separate test/build runner containers for isolation + parallelism.
 - Selective MITM on credentialed hosts → true brokering so even self-use keys
   leave the sandbox.

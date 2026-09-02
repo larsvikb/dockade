@@ -214,6 +214,38 @@ def _init_db() -> None:
                 client_class TEXT NOT NULL DEFAULT '%s',
                 UNIQUE(pattern, client_class)
             )""" % LEGACY_CLIENT_CLASS)
+        # The servers whose tools `tool_rules` decides for. Compose DECLARES a server
+        # and a human brings the container up; this table is the other half of that
+        # split — which of the running servers is enabled, and how the gateway
+        # authenticates to it (DESIGN.md, "The control plane configures servers; it
+        # never starts them"). Nothing here starts anything, and nothing here grants:
+        # the row is configuration, and the credential it describes lives outside this
+        # store entirely.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS mcp_servers (
+                -- The name the gateway dials, which is also the container's name. The
+                -- natural key: the gateway has no address for a server and needs none,
+                -- so there is no id for this to be looked up by instead.
+                server        TEXT PRIMARY KEY,
+                -- 0 until an operator says otherwise. Registering a server is not
+                -- enabling it, for the reason every default here points the same way.
+                enabled       INTEGER NOT NULL DEFAULT 0,
+                -- The AUTH DESCRIPTOR: enough to build a request, useless to steal.
+                -- 'none' is the default and the preferred case — a server holding its
+                -- own env credential, which is FARTHER from the agent than one the
+                -- agent-facing gateway holds. 'header' is for a server that forces
+                -- per-request injection, as GitHub's does in http mode.
+                auth_type     TEXT NOT NULL DEFAULT 'none',   -- 'none' | 'header'
+                auth_header   TEXT,             -- e.g. 'Authorization'
+                auth_template TEXT,             -- e.g. 'Bearer {secret}'
+                created_at    REAL NOT NULL
+                -- NOTE what is absent: any reference to the secret. The gateway reads
+                -- exactly `/run/dockade/secrets/mcp-<server>.json`, DERIVED from the
+                -- name above, because a stored free-text path would let a forged
+                -- config write point one server at another server's credential. Making
+                -- that impossible beats validating against it — the move
+                -- `_persist_candidates` already makes for egress patterns.
+            )""")
         # The OTHER policy table, for the MCP gateway's surface. It is a separate
         # table rather than a scope on `rules` because the rows are a different kind,
         # not a differently keyed one — the reasoning is in DESIGN.md, "Tool policy

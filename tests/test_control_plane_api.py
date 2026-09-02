@@ -60,6 +60,8 @@ def _set_rules(rules):
 def _clear_all():
     with cp.store._connect() as conn:
         conn.execute("DELETE FROM rules")
+        conn.execute("DELETE FROM tool_rules")
+        conn.execute("DELETE FROM mcp_servers")
         conn.execute("DELETE FROM approvals")
         conn.execute("DELETE FROM audit")
         conn.commit()
@@ -2424,6 +2426,309 @@ class SaturationTests(_CPTestCase):
         self.assertEqual(cp.holds._saturation()["since"], stamped)
 
 
+def _register(server="mcp-github", request=None, **kw):
+    return cp.create_mcp_server(cp.ServerCreateRequest(server=server, **kw),
+                                request if request is not None else _FakeRequest())
+
+
+def _tool_rule(tool, action="allow", server="mcp-github", request=None):
+    return cp.create_mcp_rule(
+        cp.ToolRuleCreateRequest(server=server, tool=tool, action=action),
+        request if request is not None else _FakeRequest())
+
+
+class McpServerRegistrationTests(_CPTestCase):
+    """``/api/mcp/servers`` — the half of server configuration the control plane owns.
+
+    The other half is compose, and the split is not negotiable: enumerating or
+    starting containers would mean a docker socket on the crown-jewel container. So a
+    registration here is a NAME the operator asserts, and everything downstream keys
+    on it — the gateway dials it, the secret path is derived from it, and a tool rule
+    points at it."""
+
+    def _row(self, server="mcp-github"):
+        with cp.store._connect() as conn:
+            return conn.execute("SELECT * FROM mcp_servers WHERE server=?",
+                                (server,)).fetchone()
+
+    def test_a_registration_is_disabled_and_grants_nothing(self):
+        # Both defaults point the same way, and neither is covering for the other: the
+        # server is not dialled, and every tool it might expose is denied for want of
+        # a rule. A registration that arrived enabled would be one call that both
+        # introduces a server and opens it.
+        self.assertEqual(_register().status_code, 201)
+        row = self._row()
+        self.assertEqual(row["enabled"], 0)
+        self.assertEqual(row["auth_type"], "none")
+        self.assertEqual(cp.policy._decide_tool("mcp-github", "get_me")[0], "deny")
+
+    def test_enabled_cannot_be_set_at_registration(self):
+        # Asserts the MODEL stays without the field, the way the egress suite asserts
+        # `source` cannot be caller-supplied.
+        cp.create_mcp_server(
+            cp.ServerCreateRequest(server="mcp-sneaky", enabled=True), _FakeRequest())
+        self.assertEqual(self._row("mcp-sneaky")["enabled"], 0)
+
+    def test_a_name_that_is_not_dialable_is_refused(self):
+        # The name IS the address here — there is no second field to fall back on — so
+        # a name no resolver could answer for is a tool surface that never replies.
+        for bad in ("mcp github", "-mcp", "mcp-", "mcp/github", "", "x" * 64):
+            resp = _register(server=bad)
+            self.assertEqual(resp.status_code, 400, bad)
+
+    def test_a_name_is_normalized_rather_than_refused_for_its_case(self):
+        # Lowercased on the way in, like an egress pattern, because DNS does not
+        # distinguish the two spellings and the charset above only admits one of them.
+        # Refusing instead would reject a name that is genuinely dialable.
+        self.assertEqual(_register(server=" MCP-GitHub ").status_code, 201)
+        self.assertIsNotNone(self._row("mcp-github"))
+
+    def test_a_duplicate_registration_is_a_conflict_not_a_replace(self):
+        # A silent replace would overwrite an auth descriptor — a credential swap
+        # reported as a registration, with no before in the record.
+        _register(auth_type="header", auth_header="Authorization",
+                  auth_template="Bearer {secret}")
+        resp = _register(auth_type="none")
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(self._row()["auth_type"], "header")
+
+    def test_a_header_descriptor_needs_exactly_one_secret_placeholder(self):
+        # None of them is a stored credential; all of them are a request the gateway
+        # cannot build. The zero case is the dangerous one, because the upstream
+        # answer is a 401 that reads exactly like a policy refusal or a dead token.
+        for template in ("Bearer ", "Bearer {secret} {secret}", ""):
+            resp = _register(server="mcp-x", auth_type="header",
+                             auth_header="Authorization", auth_template=template)
+            self.assertEqual(resp.status_code, 400, template)
+            self.assertIn("{secret}", json.dumps(resp.body))
+
+    def test_a_header_descriptor_needs_a_header_name(self):
+        resp = _register(auth_type="header", auth_template="Bearer {secret}")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_an_injectionless_descriptor_takes_no_header_fields(self):
+        # Config that says two things at once, so neither is the source of truth: the
+        # gateway injects nothing under 'none', and a header sitting in the row would
+        # describe behaviour that does not happen.
+        resp = _register(auth_type="none", auth_header="Authorization",
+                         auth_template="Bearer {secret}")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_an_unknown_auth_type_is_refused(self):
+        self.assertEqual(_register(auth_type="oauth").status_code, 400)
+
+
+class McpServerEditTests(_CPTestCase):
+    def setUp(self):
+        super().setUp()
+        _register()
+
+    def test_enabling_and_disabling_reports_both_states(self):
+        resp = cp.edit_mcp_server("mcp-github", cp.ServerEditRequest(enabled=True),
+                                  _FakeRequest())
+        self.assertTrue(resp.body["changed"])
+        self.assertTrue(resp.body["enabled"])
+        self.assertFalse(resp.body["previous"]["enabled"])
+
+    def test_asking_for_what_is_already_configured_writes_nothing(self):
+        resp = cp.edit_mcp_server("mcp-github", cp.ServerEditRequest(enabled=False),
+                                  _FakeRequest())
+        self.assertFalse(resp.body["changed"])
+
+    def test_the_descriptor_travels_with_the_switch(self):
+        # One operation for both, because they are one configuration: a server enabled
+        # with a descriptor that cannot build a request fails as though policy refused
+        # it, and splitting them puts a window either side of the ordering.
+        resp = cp.edit_mcp_server(
+            "mcp-github",
+            cp.ServerEditRequest(enabled=True, auth_type="header",
+                                 auth_header="Authorization",
+                                 auth_template="Bearer {secret}"), _FakeRequest())
+        self.assertEqual(resp.body["auth"]["type"], "header")
+        self.assertTrue(resp.body["enabled"])
+
+    def test_a_bad_descriptor_is_refused_before_anything_is_enabled(self):
+        resp = cp.edit_mcp_server(
+            "mcp-github",
+            cp.ServerEditRequest(enabled=True, auth_type="header",
+                                 auth_header="Authorization",
+                                 auth_template="Bearer nothing"), _FakeRequest())
+        self.assertEqual(resp.status_code, 400)
+        with cp.store._connect() as conn:
+            self.assertEqual(
+                conn.execute("SELECT enabled FROM mcp_servers WHERE server=?",
+                             ("mcp-github",)).fetchone()[0], 0)
+
+    def test_an_unknown_server_is_a_404(self):
+        resp = cp.edit_mcp_server("mcp-nope", cp.ServerEditRequest(enabled=True),
+                                  _FakeRequest())
+        self.assertEqual(resp.status_code, 404)
+
+
+class McpServerRevokeTests(_CPTestCase):
+    def setUp(self):
+        super().setUp()
+        _register()
+
+    def test_a_registration_with_no_rules_is_removed(self):
+        self.assertEqual(cp.revoke_mcp_server("mcp-github",
+                                              _FakeRequest()).status_code, 200)
+        with cp.store._connect() as conn:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM mcp_servers").fetchone()[0], 0)
+
+    def test_standing_policy_is_never_deleted_as_a_side_effect(self):
+        # A cascade behind one POST would remove decisions the operator cannot see
+        # from the button they pressed, and nothing here has an undo. Removal is the
+        # safe DIRECTION — an unconfigured tool is denied — but safe is not visible,
+        # and visibility is this surface's entire job.
+        _tool_rule("get_me")
+        resp = cp.revoke_mcp_server("mcp-github", _FakeRequest())
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.body["tool_rules"], 1)
+        with cp.store._connect() as conn:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM tool_rules").fetchone()[0], 1)
+
+    def test_an_unknown_server_is_a_404(self):
+        self.assertEqual(cp.revoke_mcp_server("mcp-nope",
+                                              _FakeRequest()).status_code, 404)
+
+
+class McpToolRuleTests(_CPTestCase):
+    """``/api/mcp/rules`` — stating what a server's tools may do, before anything asks.
+
+    Configuration first, which is the mirror image of the egress surface: there, rules
+    accumulate from approvals and direct creation was the retrofit. Here there is
+    nothing to accumulate from — an unconfigured tool is denied outright — so this
+    endpoint is the primary path rather than the missing verb."""
+
+    def setUp(self):
+        super().setUp()
+        _register()
+
+    def test_a_rule_decides_immediately(self):
+        self.assertEqual(cp.policy._decide_tool("mcp-github", "get_me")[0], "deny")
+        self.assertEqual(_tool_rule("get_me", "allow").status_code, 201)
+        self.assertEqual(cp.policy._decide_tool("mcp-github", "get_me")[0], "allow")
+
+    def test_a_rule_for_an_unregistered_server_is_refused(self):
+        # The tool-surface twin of the unknown-client-class refusal: the row would
+        # insert cleanly, list cleanly and decide nothing, while reading as policy in
+        # force in the one view built to show what is in force.
+        resp = _tool_rule("get_me", server="mcp-nobody")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("register it", json.dumps(resp.body))
+
+    def test_an_explicit_deny_is_worth_writing(self):
+        # It changes nothing for the gateway and everything for the operator: this is
+        # what distinguishes "reviewed and refused" from "never looked at", which is
+        # the distinction that makes materialising discovered rows unnecessary.
+        _tool_rule("delete_file", "deny")
+        with cp.store._connect() as conn:
+            self.assertEqual(
+                conn.execute("SELECT action FROM tool_rules WHERE tool=?",
+                             ("delete_file",)).fetchone()[0], "deny")
+
+    def test_an_ask_rule_is_storable_before_any_registry_exists(self):
+        # `ask` has no approvals table behind it yet. Storing one is still correct —
+        # policy is configuration — and the gateway is what will act on it.
+        self.assertEqual(_tool_rule("create_pull_request", "ask").status_code, 201)
+        self.assertEqual(
+            cp.policy._decide_tool("mcp-github", "create_pull_request")[0], "ask")
+
+    def test_the_action_vocabulary_is_the_tool_one(self):
+        # 'block' and 'hold' are the EGRESS words. Accepting one here would store an
+        # action `_decide_tool` does not recognize, which it fails closed on — a rule
+        # that reads as policy and denies whatever it says.
+        for bad in ("block", "hold", "", "permit"):
+            self.assertEqual(_tool_rule("get_me", bad).status_code, 400, bad)
+
+    def test_the_action_is_normalized_but_the_tool_name_is_not(self):
+        # Two different answers in one request, and both are deliberate. An action is
+        # a fixed vocabulary, so case and padding are noise. A tool name is the
+        # server's own identifier, compared byte-for-byte by ``_decide_tool``, so
+        # folding its case here would store a rule for a tool that does not exist.
+        self.assertEqual(_tool_rule("getMe", " ALLOW ").status_code, 201)
+        self.assertEqual(cp.policy._decide_tool("mcp-github", "getMe")[0], "allow")
+        self.assertEqual(cp.policy._decide_tool("mcp-github", "getme")[0], "deny")
+
+    def test_a_tool_name_outside_the_charset_is_refused(self):
+        for bad in ("get me", "get\nme", "x" * 129, "", "tool$"):
+            self.assertEqual(_tool_rule(bad).status_code, 400, bad)
+
+    def test_a_conflicting_action_is_a_conflict_and_the_same_one_is_a_non_write(self):
+        _tool_rule("get_me", "allow")
+        clash = _tool_rule("get_me", "deny")
+        self.assertEqual(clash.status_code, 409)
+        self.assertEqual(clash.body["conflict"]["action"], "allow")
+        again = _tool_rule("get_me", "allow")
+        self.assertTrue(again.body["already_present"])
+        self.assertFalse(again.body["created"])
+
+    def test_the_source_is_server_set(self):
+        cp.create_mcp_rule(
+            cp.ToolRuleCreateRequest(server="mcp-github", tool="get_me",
+                                     action="allow", source="seed"), _FakeRequest())
+        with cp.store._connect() as conn:
+            self.assertEqual(
+                conn.execute("SELECT source FROM tool_rules").fetchone()[0],
+                "operator")
+
+    def test_promoting_a_tool_is_one_operation(self):
+        # deny -> ask -> allow is the workflow this endpoint exists for, and each step
+        # keeps the rule's identity, so there is no window where the tool is
+        # unconfigured and no second row in the record.
+        rule_id = _tool_rule("issue_write", "deny").body["id"]
+        for action in ("ask", "allow"):
+            resp = cp.edit_mcp_rule(rule_id, cp.ToolRuleEditRequest(action=action),
+                                    _FakeRequest())
+            self.assertTrue(resp.body["changed"])
+            self.assertEqual(
+                cp.policy._decide_tool("mcp-github", "issue_write")[0], action)
+
+    def test_an_edit_to_the_same_action_writes_nothing(self):
+        rule_id = _tool_rule("get_me", "allow").body["id"]
+        resp = cp.edit_mcp_rule(rule_id, cp.ToolRuleEditRequest(action="allow"),
+                                _FakeRequest())
+        self.assertFalse(resp.body["changed"])
+
+    def test_an_edit_validates_the_action_and_the_rule_id(self):
+        rule_id = _tool_rule("get_me", "allow").body["id"]
+        self.assertEqual(
+            cp.edit_mcp_rule(rule_id, cp.ToolRuleEditRequest(action="block"),
+                             _FakeRequest()).status_code, 400)
+        self.assertEqual(
+            cp.edit_mcp_rule(9999, cp.ToolRuleEditRequest(action="allow"),
+                             _FakeRequest()).status_code, 404)
+
+    def test_revoking_returns_the_tool_to_denied_not_to_held(self):
+        # The one place this differs from revoking an egress rule, where the host
+        # reverts to being HELD for approval. Here it reverts to the default deny, so
+        # a revoke can only ever narrow.
+        rule_id = _tool_rule("get_me", "allow").body["id"]
+        self.assertEqual(cp.revoke_mcp_rule(rule_id, _FakeRequest()).status_code, 200)
+        self.assertEqual(cp.policy._decide_tool("mcp-github", "get_me")[0], "deny")
+
+    def test_the_view_groups_by_server_then_widest_first(self):
+        _register(server="mcp-other")
+        _tool_rule("b_deny", "deny", server="mcp-other")
+        _tool_rule("a_ask", "ask", server="mcp-other")
+        _tool_rule("z_allow", "allow")
+        _tool_rule("a_deny", "deny")
+        served = [(r["server"], r["action"]) for r in cp.api_mcp_rules()]
+        self.assertEqual(served, [("mcp-github", "allow"), ("mcp-github", "deny"),
+                                  ("mcp-other", "ask"), ("mcp-other", "deny")])
+
+    def test_the_server_view_counts_the_rules(self):
+        # What makes the list actionable: a server with no rules has a fully denied
+        # surface rather than a broken one, and only the count says which.
+        _tool_rule("get_me", "allow")
+        _tool_rule("get_teams", "ask")
+        served = {s["server"]: s["tool_rules"] for s in cp.api_mcp_servers()}
+        self.assertEqual(served, {"mcp-github": 2})
+
+
 class _FreshStoreTestCase(unittest.TestCase):
     """Base for tests that need a genuinely empty database rather than the shared one:
     schema questions cannot be asked of a store the rest of the suite has been
@@ -2464,6 +2769,20 @@ class FreshSchemaTests(_FreshStoreTestCase):
                     conn.execute("PRAGMA table_info(tool_rules)")}
         self.assertEqual(cols, {"id", "server", "tool", "action", "source",
                                 "created_at"})
+
+    def test_new_store_has_the_mcp_server_table_and_no_secret_reference(self):
+        # Asserted as an EXACT set, and the exactness is the assertion: a column
+        # holding a path or a handle to the credential is what must never appear here,
+        # because a stored free-text reference is what would let a forged config write
+        # point one server at another's secret. It is also what keeps the property
+        # that a crown-jewel backup contains no credential.
+        self._use_store("fresh-mcp-servers.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            cols = {r["name"] for r in
+                    conn.execute("PRAGMA table_info(mcp_servers)")}
+        self.assertEqual(cols, {"server", "enabled", "auth_type", "auth_header",
+                                "auth_template", "created_at"})
 
     def test_the_tool_policy_key_is_the_server_tool_pair(self):
         # Tool names are not namespaced across servers, so uniqueness has to be the
@@ -2962,12 +3281,28 @@ class ApiSurfaceSplitTests(unittest.TestCase):
                                   ("POST", "/api/egress/rules/{rule_id}/edit")})
         self.assertEqual(writes & _routes(cp.authorize_app), set())
 
+    def test_the_endpoints_that_write_tool_policy_are_management_only(self):
+        # The gateway's surface, held to the same roster as the egress one. The
+        # gateway will eventually READ policy over a bridge of its own — a narrow one
+        # that cannot grant — and these are the writes that must never appear on it,
+        # nor on the authorize listener the egress proxy can already reach.
+        writes = {r for r in _routes(cp.app)
+                  if r[0] == "POST" and "/api/mcp/" in r[1]}
+        self.assertEqual(writes, {("POST", "/api/mcp/servers"),
+                                  ("POST", "/api/mcp/servers/{server}/edit"),
+                                  ("POST", "/api/mcp/servers/{server}/revoke"),
+                                  ("POST", "/api/mcp/rules"),
+                                  ("POST", "/api/mcp/rules/{rule_id}/edit"),
+                                  ("POST", "/api/mcp/rules/{rule_id}/revoke")})
+        self.assertEqual(writes & _routes(cp.authorize_app), set())
+
     def test_the_views_that_read_the_store_are_management_only(self):
         # Not privileged, but they carry the record: pending hosts and clients,
         # the audit history, the standing policy. A bypassed relay guard must not
         # be able to read them either.
         for path in ("/approvals", "/approvals/stream", "/api/audit",
-                     "/api/audit/events", "/api/egress/rules", "/api/config", "/status"):
+                     "/api/audit/events", "/api/egress/rules", "/api/mcp/servers",
+                     "/api/mcp/rules", "/api/config", "/status"):
             self.assertIn(("GET", path), _routes(cp.app), path)
             self.assertNotIn(("GET", path), _routes(cp.authorize_app), path)
 

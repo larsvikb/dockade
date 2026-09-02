@@ -329,6 +329,100 @@ def _decide(host: str, client_class: str) -> tuple[str, str]:
 #     whatever the upstream image last added.
 _TOOL_ACTIONS = ("allow", "deny", "ask")
 
+# What a server's auth descriptor may say. 'none' is the default and the preferred
+# case; 'header' is what a server forces when it will not read an env credential.
+AUTH_TYPES = ("none", "header")
+# The placeholder the gateway substitutes the secret into. Required in a header
+# template and required to appear EXACTLY once — see ``_auth_descriptor_error``.
+SECRET_PLACEHOLDER = "{secret}"  # noqa: S105 (the hole a secret goes in, not one)
+
+# A server name is a hostname the gateway dials, so it is held to a DNS label rather
+# than to anything looser: whatever is stored here must be dialable, and the failure
+# mode of a name that is not is a tool surface that never answers.
+_SERVER_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+# A tool name is compared byte-for-byte by ``_decide_tool``, so its charset is a
+# STORAGE bound rather than a semantic one: the characters MCP servers use in
+# practice, plus the ':' that namespaced names carry. The consequence is worth
+# stating because it is a real limit — a server exposing a tool outside this charset
+# cannot have a rule written for it, and an unconfigured tool is denied, so that tool
+# is unreachable rather than ungoverned. Widen this if such a server ever appears.
+_TOOL_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+# An HTTP field name, narrower than the RFC's token: the characters a header an
+# operator would actually configure is spelled with.
+_HEADER_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+_TEMPLATE_MAX_LEN = 200
+
+
+def _server_name_error(server: str) -> str | None:
+    """Why ``server`` cannot be a server name, or None if it can.
+
+    One place, because the name is load-bearing three times over: the gateway dials
+    it, the secret path is derived from it, and ``tool_rules.server`` points at it.
+    Validating it once at registration is what lets the rule endpoints check only
+    that the server EXISTS."""
+    if not server:
+        return "server name is empty"
+    if not _SERVER_RE.match(server):
+        return (f"{server!r} is not a server name — expected a DNS label: lowercase "
+                f"letters, digits and '-', not starting or ending with '-', at most "
+                f"63 characters")
+    return None
+
+
+def _auth_descriptor_error(auth_type: str, header: str, template: str) -> str | None:
+    """Why an auth descriptor cannot be stored, or None if it can.
+
+    Two refusals carry real weight. A ``header`` descriptor with no
+    ``{secret}`` placeholder builds a header with no credential in it, and the
+    upstream answer to that is a 401 — indistinguishable, from the UI, from a policy
+    problem or an expired token. And a ``none`` descriptor carrying header fields is
+    configuration that says two things at once, so neither is the source of truth."""
+    if auth_type not in AUTH_TYPES:
+        return (f"auth type must be one of {', '.join(AUTH_TYPES)}, "
+                f"not {auth_type!r}")
+    if auth_type == "none":
+        if header or template:
+            return ("an auth type of 'none' takes no header and no template — the "
+                    "server holds its own credential and the gateway injects nothing")
+        return None
+    if not header:
+        return "a 'header' auth type needs the header name to set"
+    if not _HEADER_RE.match(header):
+        return (f"{header!r} is not a header name — expected letters, digits and '-', "
+                f"at most 64 characters")
+    if not template:
+        return (f"a 'header' auth type needs a template containing "
+                f"{SECRET_PLACEHOLDER}")
+    if len(template) > _TEMPLATE_MAX_LEN:
+        return (f"the template is {len(template)} characters; the ceiling is "
+                f"{_TEMPLATE_MAX_LEN}")
+    if template.count(SECRET_PLACEHOLDER) != 1:
+        return (f"the template must contain {SECRET_PLACEHOLDER} exactly once, so the "
+                f"gateway has one place to put the secret — {template!r} has "
+                f"{template.count(SECRET_PLACEHOLDER)}")
+    return None
+
+
+def _tool_rule_error(tool: str, action: str) -> str | None:
+    """Why ``tool`` cannot be stored as an ``action`` rule, or None if it can.
+
+    The server half is deliberately not checked here: it is validated once at
+    registration by ``_server_name_error``, and the rule endpoints check that the
+    named server exists rather than re-deriving whether it could.
+
+    There is no wildcard floor to enforce, which is the whole difference from
+    ``_rule_error``. A host pattern can be broadened until it grants a TLD; a tool
+    name names one tool, so breadth is not expressible and an ``allow`` here is
+    exactly as wide as it reads."""
+    if action not in _TOOL_ACTIONS:
+        return (f"action must be one of {', '.join(_TOOL_ACTIONS)}, not {action!r}")
+    if not tool:
+        return "tool name is empty"
+    if not _TOOL_RE.match(tool):
+        return (f"{tool!r} is not a tool name — expected letters, digits, '_', '-', "
+                f"'.' or ':', at most 128 characters")
+    return None
+
 
 def _decide_tool(server: str, tool: str) -> tuple[str, str]:
     """(decision, reason) for calling ``tool`` on ``server``: allow, deny or ask.

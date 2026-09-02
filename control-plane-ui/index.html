@@ -126,6 +126,22 @@
      it qualifies what the buttons below it are about to do. */
   .dup { margin-top: 8px; font-size: 12px; color: var(--hold);
     border-left: 2px solid var(--hold); padding-left: 8px; }
+  /* A tool ask. Same shell as a held request, and a different left edge because it is
+     a different KIND of decision: an egress hold blocks an agent that is waiting,
+     while an ask has already been answered with "come back for this" — the agent is
+     working on something else and nothing is stalled behind the click. */
+  .card.tool { border-left-color: var(--accent); }
+  /* THE payload, and the reason this card exists at all: the tool name says what kind
+     of act is being asked for, and only the arguments say what it does to which
+     repository. Never truncated and never reformatted — collapsed at most, with the
+     byte count on the summary so a folded card still says how much has not been read.
+     Monospace and pre-wrap because whitespace inside a payload is content. */
+  .payload { margin-top: 8px; font-size: 12px; }
+  .payload summary { color: var(--dim); cursor: pointer; }
+  .payload pre { margin: 6px 0 0; padding: 8px; background: var(--bg);
+    border: 1px solid var(--line); border-radius: 6px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+    white-space: pre-wrap; word-break: break-all; max-height: 40vh; overflow: auto; }
   .actions { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
   /* Card outcome states. A resolve reports itself HERE rather than by the card
      disappearing on the next SSE tick — that was the only feedback before, so with

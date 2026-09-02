@@ -70,6 +70,8 @@ const missing = ["lampState", "backoffDelay", "diffPending", "shouldSweep",
                  "auditRow", "auditStatus", "rulesStatus", "repeatCount",
                  "timeWindow", "filterActive", "auditQuery", "eventRow",
                  "historyPager", "renderableHolds",
+                 "toolRemaining", "payloadDisclosure", "toolOutcomeMessage",
+                 "cardSubject",
                  "fmtTime", "fmtStamp", "fmtInstant"]
   .filter(n => typeof m[n] !== "function");
 console.log(JSON.stringify({
@@ -107,6 +109,29 @@ console.log(JSON.stringify({
     legacy_kept: m.renderableHolds([{ id: "a" }]).map(a => a.id),
     empty: m.renderableHolds([]),
     absent: m.renderableHolds(undefined),
+  },
+  tool: {
+    fold: m.PAYLOAD_FOLD_BYTES,
+    // Short payloads are readable without a click; long ones fold so one card cannot
+    // push every other pending decision off the screen. Neither truncates.
+    short: m.payloadDisclosure('{"a":1}'),
+    long: m.payloadDisclosure("x".repeat(m.PAYLOAD_FOLD_BYTES + 1)),
+    at_fold: m.payloadDisclosure("x".repeat(m.PAYLOAD_FOLD_BYTES)).open,
+    missing: m.payloadDisclosure(undefined),
+    // Read off the card's own absolute deadline, so it works before /api/config has
+    // answered and needs no knowledge of the backend's tool window.
+    remaining_mid: m.toolRemaining(1000, 400 * 1000),
+    remaining_past: m.toolRemaining(1000, 5000 * 1000),
+    remaining_unknown: m.toolRemaining(undefined, 0),
+    allowed: m.toolOutcomeMessage({ outcome: "allow" }),
+    denied: m.toolOutcomeMessage({ outcome: "deny" }),
+    nothing: m.toolOutcomeMessage(undefined),
+    // The announcement is the only place a screen-reader user learns WHICH decision
+    // arrived, so a tool ask read out as a host describes the wrong sort of thing.
+    say_tool: m.pendingAnnouncement(
+      [{ kind: "tool", tool: "issue_write", server: "mcp-github" }], 1),
+    say_tool_nameless: m.cardSubject({ kind: "tool" }),
+    say_egress: m.pendingAnnouncement([{ host: "example.com" }], 1),
   },
   sweep: {
     idle_fresh: m.shouldSweep(false, 0),
@@ -694,6 +719,55 @@ class PageScriptTests(unittest.TestCase):
         self.assertEqual(self.probe["kinds"]["legacy_kept"], ["a"])
         self.assertEqual(self.probe["kinds"]["empty"], [])
         self.assertEqual(self.probe["kinds"]["absent"], [])
+
+    def test_a_payload_is_folded_but_never_shortened(self):
+        # The fold is about the QUEUE, not about the payload: a card whose arguments
+        # run to pages pushes every other pending decision off the screen, and a
+        # decision nobody scrolls to is one nobody makes. The whole string is in the
+        # DOM either way — only the disclosure state changes — and the byte count is
+        # on the summary so a folded card still says how much has not been read.
+        tool = self.probe["tool"]
+        self.assertTrue(tool["short"]["open"])
+        self.assertFalse(tool["long"]["open"])
+        self.assertTrue(tool["at_fold"])          # the fold is a ceiling, not a floor
+        self.assertEqual(tool["long"]["bytes"], tool["fold"] + 1)
+        self.assertIn(str(tool["fold"] + 1), tool["long"]["summary"])
+
+    def test_a_missing_payload_is_zero_bytes_rather_than_a_crash(self):
+        # A card that threw while building would take the whole queue's render with
+        # it, which is a governance outage caused by one malformed row.
+        self.assertEqual(self.probe["tool"]["missing"]["bytes"], 0)
+
+    def test_a_tool_countdown_reads_its_own_deadline(self):
+        # Absolute and per-card, so it counts down before /api/config has answered and
+        # does not need the page to know what CONTROL_TOOL_HOLD_TIMEOUT is set to.
+        tool = self.probe["tool"]
+        self.assertEqual(tool["remaining_mid"], 600)
+        self.assertEqual(tool["remaining_past"], 0)     # clamped, never negative
+        self.assertIsNone(tool["remaining_unknown"])
+
+    def test_an_allowed_tool_ask_does_not_claim_the_call_ran(self):
+        # The gateway executes on RESUMPTION, when the agent comes back and claims the
+        # approval. A message reading like a completed action would misreport the one
+        # property that keeps an approved side effect from happening with nobody left
+        # to receive it.
+        tool = self.probe["tool"]
+        self.assertIn("returns", tool["allowed"]["text"])
+        self.assertEqual(tool["allowed"]["tone"], "ok")
+        self.assertIn("not run", tool["denied"]["text"])
+        self.assertEqual(tool["nothing"]["tone"], "bad")   # unknown fails to denied
+
+    def test_a_new_tool_ask_is_announced_as_a_tool_and_not_as_a_host(self):
+        # The live region is the only place a screen-reader user learns which decision
+        # arrived. Before this, a tool ask read out as "an unnamed host": not merely
+        # vague but a description of the wrong sort of thing, on the one surface where
+        # the subject is what decides whether it needs attention now.
+        tool = self.probe["tool"]
+        self.assertIn("issue_write on mcp-github", tool["say_tool"])
+        self.assertNotIn("host", tool["say_tool"])
+        self.assertIn("example.com", tool["say_egress"])
+        # A server-less ask still names the tool rather than falling back to a host.
+        self.assertEqual(tool["say_tool_nameless"], "an unnamed tool")
 
     def test_an_emptied_queue_reports_every_card_gone(self):
         # What a backend restart looks like: startup expires every stale 'pending' row.
@@ -2305,6 +2379,20 @@ class DuplicateBadgeSourceTests(unittest.TestCase):
         self.assertRegex(body.group(1), r"for \(const a of list\)")
         self.assertIn("setRequests(entry, a.requests)", body.group(1))
 
+    def _appended(self, fn):
+        """The identifiers one card builder appends, in order.
+
+        Scoped to a NAMED function rather than to the first `el.append` in the file,
+        which is what this used to do — and what broke the moment a second card
+        builder existed. The looser version did not report the tool card; it reported
+        the egress card's badge as missing, which is the failure mode a source-text
+        guard is worst at explaining."""
+        body = re.search(rf"function {fn}\(a\) \{{(.*?)\n  \}}", self.src, re.S)
+        self.assertIsNotNone(body, f"{fn} not found — did it get renamed?")
+        appended = re.search(r"el\.append\((.*?)\);", body.group(1), re.S)
+        self.assertIsNotNone(appended, f"{fn} never appends its parts")
+        return [p.strip() for p in appended.group(1).split(",")]
+
     def test_the_badge_is_placed_in_the_card_between_the_clock_and_the_buttons(self):
         # Building an element and never appending it is invisible to every test that
         # does not render a DOM, and this page has shipped that exact shape of bug
@@ -2312,12 +2400,21 @@ class DuplicateBadgeSourceTests(unittest.TestCase):
         # `[hidden]` guard below). Order is part of the claim, not decoration: the
         # badge qualifies what the buttons are about to do, so it has to be adjacent
         # to them rather than up with the metadata.
-        parts = [p.strip() for p in
-                 re.search(r"^    el\.append\((.*)\);", self.src, re.M)
-                 .group(1).split(",")]
+        parts = self._appended("buildCard")
         self.assertIn("dup", parts, "the badge is built but never attached")
         self.assertEqual(parts.index("dup"), parts.index("actions") - 1)
         self.assertLess(parts.index("cd"), parts.index("dup"))
+
+    def test_a_tool_card_attaches_its_payload_above_the_buttons(self):
+        # Same class of bug on the other builder, and it matters more here: the
+        # payload is the thing being approved. A card that rendered the tool name and
+        # silently dropped the arguments would put an operator one click from allowing
+        # a write whose target they never saw.
+        parts = self._appended("buildToolCard")
+        self.assertIn("details", parts, "the payload is built but never attached")
+        self.assertLess(parts.index("details"), parts.index("actions"))
+        # And no duplicate badge, because nothing joins a tool card by waiting on it.
+        self.assertNotIn("dup", parts)
 
     def test_the_count_stops_moving_once_the_card_is_being_decided(self):
         # Rewriting the number under a click already in flight is the same lie in the

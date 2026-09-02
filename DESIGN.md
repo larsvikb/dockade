@@ -3099,7 +3099,8 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | `mcp-net` + MCP server catalogue (`mcp-servers.yml`) | **done** — inert until the gateway exists |
 | — | per-client-class egress policy | **done** |
 | — | tool policy: store (`tool_rules`, `mcp_servers`) + config API (`/api/mcp/…`) | **done** — headless; inert until the gateway exists |
-| — | tool asks: `tool_approvals`, the ask registry, one merged queue, `resolve` split | **done** — backend; cards not yet drawn |
+| — | tool asks: `tool_approvals`, the ask registry, one merged queue, `resolve` split | **done** |
+| — | the tool card — raw payload, per-surface actions | **done** — no schema-driven view; the raw payload is the whole of it |
 | — | MCP gateway — per-tool allow/deny/ask | planned (unblocked — names its own bounds) |
 
 The rationale for each shipped item lives under **Governance surfaces** above, not here

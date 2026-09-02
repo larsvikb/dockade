@@ -1505,8 +1505,11 @@ recoverable from the constants:
   *before* the early return that consumes it. The bug was positional — the join
   returned above the per-client check — and `_reserve_hold` now runs global waiters,
   per-client waiters, join-and-return, global cards, per-client cards. A cap check
-  after an early return is the shape to look for; the MCP gateway adds a fifth cap of
-  its own and should copy this order, not the old one.
+  after an early return is the shape to look for. The tool surface follows the RULE and
+  lands on the opposite ORDER: its join sits below both caps, because a tool joiner
+  costs no row, no card and no attention, where an egress joiner still pins a worker.
+  Copying the sequence rather than the reasoning would have denied a call whose question
+  is already on the operator's screen.
 - **The defaults are chosen so every cap can fire first.** Cards are always ≤ waiters,
   so a card cap set equal to its waiter cap is dead code that no test would notice.
   12/4 cards against 16/8 waiters keeps all four live, and a test asserts the
@@ -1533,7 +1536,7 @@ the part an investigation needs, too: every deny names **which** bound fired, in
 reason string. The magnitude of that bound is readable off the running config, which
 `_bootstrap` prints with its units at every boot.
 
-For values changed this rarely — compose sets none of the five — a compose diff is also
+For values changed this rarely — compose sets none of them — a compose diff is also
 the better trail than a row in a named volume, carrying a message, an author, a date and
 a review. It is the argument `CLAUDE.md` already makes for commit messages, applied to
 configuration.
@@ -3096,6 +3099,7 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | `mcp-net` + MCP server catalogue (`mcp-servers.yml`) | **done** — inert until the gateway exists |
 | — | per-client-class egress policy | **done** |
 | — | tool policy: store (`tool_rules`, `mcp_servers`) + config API (`/api/mcp/…`) | **done** — headless; inert until the gateway exists |
+| — | tool asks: `tool_approvals` + the ask registry (register/join/expire/claim) | **done** — not yet in the operator's queue |
 | — | MCP gateway — per-tool allow/deny/ask | planned (unblocked — names its own bounds) |
 
 The rationale for each shipped item lives under **Governance surfaces** above, not here

@@ -14,12 +14,22 @@ the two listeners two sockets in one process rather than two services (see the
 ``app.py`` module docstring). The Event only WAKES the blocked worker — the
 human's decision is read back from the durable approvals row, which is the single
 source of truth.
+
+The TOOL ASKS at the bottom are the exception that shows what that constraint is
+for. Nothing blocks on one, so they keep no in-process state at all and the row is
+the whole ask — which means they alone would survive being served from a second
+process. They are here rather than in a module of their own because they share the
+saturation account and the queue, and because the ways they differ from a hold are
+only legible next to one.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import threading
 import time
+import uuid
 from typing import NamedTuple
 
 import policy
@@ -379,6 +389,253 @@ def _list_pending() -> list[dict]:
                                    "existing": rules.get((p, r["client_class"]))}
                                   for p in policy._persist_candidates(r["host"])])
             for r in rows]
+
+
+# ── tool asks — the same three states, and almost none of the same machinery ──
+#
+# A tool ask is registered and answered IMMEDIATELY. Nothing above this line applies
+# to it, and the reason is one fact: an egress hold blocks a FastAPI worker on an
+# Event until a human answers, while the gateway takes an id back at once and hands
+# the agent a pending result to come back with (DESIGN.md, "An ``ask`` answers
+# immediately").
+#
+# Everything the registry above exists for follows from that blocked worker — the
+# Event that wakes it, the waiter counts, the two WAITER caps that keep a slow
+# decision from starving the /authorize path every sandbox depends on. With nothing
+# blocked there is no worker to protect, no event to fire and no in-process state to
+# keep, so the tool side is DURABLE STATE ONLY: the row is the ask. That is why the
+# split here is so lopsided — the "core" the gateway was expected to reuse turns out
+# to be mostly machinery for a problem it does not have.
+#
+# Two things do carry over, and they are the two that were never about workers. The
+# CARD caps, because attention is the scarce thing on both surfaces and an agent
+# opening asks with slightly varied payloads floods a human exactly as a retry storm
+# does. And the saturation accounting, unsplit, because an operator should not have
+# to read two banners to learn that governance is refusing things.
+
+# The window a tool ask waits for a human. A second number, and deliberately not
+# ``HOLD_TIMEOUT``: that one is bounded by what a blocked agent and a proxy will sit
+# through, and this one is bounded by nothing at all, because nothing is waiting on
+# it. So it is free to be a human interval — an hour, rather than two minutes.
+# Fail-closed like the rest of the bounds, so it stays an env var (DESIGN.md, "Hold
+# bounds are fail-closed").
+TOOL_HOLD_TIMEOUT = float(os.environ.get("CONTROL_TOOL_HOLD_TIMEOUT", "3600"))
+# The card caps, tool-side. Their own numbers rather than the egress ones, because
+# the two surfaces no longer share a pool and a queue of asks costs no workers.
+MAX_TOOL_PENDING = int(os.environ.get("CONTROL_MAX_TOOL_PENDING", "12"))
+MAX_TOOL_PENDING_PER_CLIENT = int(
+    os.environ.get("CONTROL_MAX_TOOL_PENDING_PER_CLIENT", "4"))
+# Ceiling on a payload this will store. REFUSED over it rather than truncated, which
+# is the opposite of what ``store.DRAIN_MAX_FIELD`` does to an agent-supplied URL —
+# and the asymmetry is the point. A truncated audit field costs evidence detail; a
+# truncated payload is shown to a human as the thing they are approving, so the
+# hidden tail would be exactly where anything worth hiding went.
+TOOL_ARGS_MAX = 8192
+
+
+def _canonical_args(args: object) -> str:
+    """The one serialization of a payload: what gets stored, what gets hashed, and
+    what the human is shown.
+
+    ONE form for all three, which is what makes "the payload is authoritative" mean
+    something — the string in the record is byte-for-byte the string the digest
+    covers, so an approval cannot be bound to something other than what was read.
+    Producing it here rather than accepting a caller's rendering also removes the
+    question of whose spelling wins.
+
+    Key order is normalized. That is not the reordering DESIGN warns about, which is
+    a UI prettifier rearranging what a human sees while the real payload differs;
+    here the normalized form IS the payload of record. Nothing is dropped, summarized
+    or truncated — an oversized payload is refused instead."""
+    return json.dumps(args, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False)
+
+
+def _args_digest(server: str, tool: str, args_json: str) -> str:
+    """What binds a grant to a payload, and what an identical retry joins on.
+
+    Over the canonical form, so key order cannot make one ask look like two: a model
+    that reformulates ``{"a":1,"b":2}`` as ``{"b":2,"a":1}`` is asking the same
+    question and should attach to the pending card rather than raise a second one.
+    Any difference in a VALUE lands on a different digest, which is the half that
+    matters — an approval a human gave for one set of arguments must never execute
+    another.
+
+    The server and tool are inside the hash rather than beside it, so a payload
+    approved for one tool cannot be replayed against another."""
+    return hashlib.sha256(
+        f"{server}\x00{tool}\x00{args_json}".encode()).hexdigest()
+
+
+class ToolAsk(NamedTuple):
+    """Outcome of registering an ask. Exactly one of ``refused`` / ``approval_id`` is
+    set; ``joined`` means an identical ask was already pending and this attached to
+    it rather than raising a second card."""
+    approval_id: str | None
+    joined: bool
+    refused: str | None
+    deadline: float
+
+
+def _expire_tool_asks() -> int:
+    """Retire every pending ask past its deadline. Returns how many.
+
+    LAZY, and it has to be: nothing is blocked on a tool ask, so there is no waiter
+    whose timeout would enforce the window and no reason to run a timer thread for a
+    row that can simply be read as expired. Called wherever an ask is read, which is
+    what makes the state honest at every point anyone can observe it.
+
+    An expired ask is TERMINAL and distinct from a denied one. Both refuse the call;
+    only one of them means a human decided, and an agent — or an operator reading the
+    record later — must be able to tell those apart."""
+    with store._connect() as conn:
+        cur = conn.execute(
+            "UPDATE tool_approvals SET status='expired', resolved_at=? "
+            "WHERE status='pending' AND deadline <= ?", (time.time(), time.time()))
+        conn.commit()
+        return cur.rowcount
+
+
+def _register_tool_ask(server: str, tool: str, args: object,
+                       client: str | None = None) -> ToolAsk:
+    """Raise a card for a tool call, or attach to the identical one already pending.
+
+    Under ``_LOCK`` for the same reason ``_reserve_hold`` is: the check and the write
+    have to be one step, or two concurrent asks both pass a cap with one slot left,
+    or both open a card for one payload. The lock is enough here where it is not for
+    a general database — this is a single process by construction (see the module
+    docstring), and the row is the only state involved.
+
+    Order of refusal is size, then caps, then join, and the join sits BELOW the caps
+    on purpose — the mirror image of ``_reserve_hold``, where joining comes first
+    because a joiner still costs a worker. Here a joiner costs nothing: no card, no
+    row, no attention. So it must not be refused for capacity it does not consume."""
+    args_json = _canonical_args(args)
+    if len(args_json) > TOOL_ARGS_MAX:
+        # Not a cap rejection: nothing was contended for, and reporting it in the
+        # saturation banner would tell an operator that governance is under pressure
+        # when one caller sent something oversized.
+        return ToolAsk(None, False,
+                       f"tool arguments are {len(args_json)} bytes; the ceiling is "
+                       f"{TOOL_ARGS_MAX} — an ask a human cannot be shown in full is "
+                       f"refused rather than shown in part", 0.0)
+    _expire_tool_asks()
+    digest = _args_digest(server, tool, args_json)
+    now = time.time()
+    with _LOCK, store._connect() as conn:
+        pending = conn.execute(
+            "SELECT id, client, deadline, args_digest FROM tool_approvals "
+            "WHERE status='pending' ORDER BY ts").fetchall()
+        # The client is in the join key for the reason it is in ``_group_key``: a card
+        # names one caller, and answering one sandbox's question must not silently
+        # answer another's.
+        for row in pending:
+            if row["client"] == client and row["args_digest"] == digest:
+                return ToolAsk(row["id"], True, None, row["deadline"])
+
+        if len(pending) >= MAX_TOOL_PENDING:
+            return _refuse_tool("global tool asks")
+        if (client is not None and MAX_TOOL_PENDING_PER_CLIENT > 0
+                and sum(1 for r in pending if r["client"] == client)
+                >= MAX_TOOL_PENDING_PER_CLIENT):
+            return _refuse_tool(f"client {client} tool asks")
+
+        approval_id = uuid.uuid4().hex
+        deadline = now + TOOL_HOLD_TIMEOUT
+        conn.execute(
+            "INSERT INTO tool_approvals(id, ts, server, tool, args_json, "
+            "args_digest, client, status, deadline) "
+            "VALUES (?,?,?,?,?,?,?, 'pending', ?)",
+            (approval_id, now, server, tool, args_json, digest, client, deadline))
+        conn.commit()
+        return ToolAsk(approval_id, False, None, deadline)
+
+
+def _refuse_tool(scope: str) -> ToolAsk:
+    """Record an over-cap tool ask in the ONE saturation account and refuse it.
+    Caller holds ``_LOCK``.
+
+    Unsplit deliberately: over a cap nothing raises a card, so the refusal is
+    invisible in the queue on this surface exactly as it is on the other, and an
+    operator should not have to check two banners to learn that governance is
+    refusing things. ``last_host`` is left alone rather than filled with a
+    tool-shaped value — the banner's subject field is host-shaped, and the scope
+    string is where this surface says what it was."""
+    _SATURATION["count"] = int(_SATURATION["count"]) + 1  # type: ignore[arg-type]
+    _SATURATION["last_ts"] = time.time()
+    _SATURATION["last_scope"] = scope
+    return ToolAsk(None, False,
+                   f"tool ask capacity exceeded ({scope}) — fail-closed", 0.0)
+
+
+def _get_tool_ask(approval_id: str) -> dict | None:
+    """One ask by id, expiry applied first. None if there is no such ask.
+
+    ONE at a time, and there is deliberately no listing counterpart for the agent:
+    the gateway's agent-facing listener is on a network both tiers share, so a roster
+    would leak approvals the caller never raised — and past the leak it hands the
+    agent a read on the operator's queue (DESIGN.md, "One id at a time")."""
+    _expire_tool_asks()
+    with store._connect() as conn:
+        row = conn.execute(
+            "SELECT id, ts, server, tool, args_json, client, status, deadline, "
+            "resolved_at, claimed_at FROM tool_approvals WHERE id=?",
+            (approval_id,)).fetchone()
+    return dict(row) if row is not None else None
+
+
+def _resolve_tool_ask(approval_id: str, decision: str, actor: str) -> str | None:
+    """Record the human's answer. Returns the new status, or None if the ask was not
+    pending — already decided, expired, or never existed.
+
+    Conditional on ``status='pending'`` inside the UPDATE rather than checked first,
+    so two clicks on one card cannot both land: the second changes no row and reads
+    back as the non-transition it was."""
+    if decision not in ("allowed", "denied"):
+        return None
+    with store._connect() as conn:
+        changed = conn.execute(
+            "UPDATE tool_approvals SET status=?, resolved_at=?, resolved_by=? "
+            "WHERE id=? AND status='pending'",
+            (decision, time.time(), actor, approval_id)).rowcount
+        conn.commit()
+    return decision if changed else None
+
+
+def _claim_tool_ask(approval_id: str) -> dict | None:
+    """Take single-use ownership of an APPROVED ask, for the gateway about to run it.
+    Returns the ask if this caller now owns it, None if it is not claimable.
+
+    The gateway executes on RESUMPTION rather than at the human's click, which is what
+    keeps an approved call from running with nobody left to receive it. That choice
+    needs this one: resumption is a request the agent makes, and an agent can make it
+    twice. The claim is the conditional UPDATE below, so exactly one resumption of one
+    approval ever performs the side effect — a second gets None and can be told the
+    ask is spent, which is a different answer from denied and from unknown."""
+    _expire_tool_asks()
+    with store._connect() as conn:
+        changed = conn.execute(
+            "UPDATE tool_approvals SET claimed_at=? "
+            "WHERE id=? AND status='allowed' AND claimed_at IS NULL",
+            (time.time(), approval_id)).rowcount
+        conn.commit()
+    return _get_tool_ask(approval_id) if changed else None
+
+
+def _list_tool_asks() -> list[dict]:
+    """Pending asks, oldest first — the tool half of the operator's queue.
+
+    Not folded into ``_list_pending`` yet, and that is a sequencing choice rather
+    than a design one: the queue is meant to be ONE list over two builders, and
+    merging the payload before the page can render a tool card would put rows in
+    front of a renderer that expects a host. Nothing raises these rows until the
+    gateway exists, so nothing is hidden in the meantime."""
+    _expire_tool_asks()
+    with store._connect() as conn:
+        rows = conn.execute(
+            "SELECT id, ts, server, tool, args_json, client, deadline "
+            "FROM tool_approvals WHERE status='pending' ORDER BY ts").fetchall()
+    return [dict(r, kind="tool") for r in rows]
 
 
 def _pending_payload() -> dict:

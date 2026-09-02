@@ -367,6 +367,299 @@ class _HoldRegistryTestCase(unittest.TestCase):
         cp.holds._GROUPS.clear()
 
 
+class _ToolAskTestCase(unittest.TestCase):
+    """Fixture for tool asks. Deliberately NOT ``_HoldRegistryTestCase``: there is no
+    in-memory registry to wipe, because nothing blocks on a tool ask and the row is
+    the whole of it. What does need resetting is the table, the two caps, the window,
+    and the saturation account the two surfaces share."""
+
+    CAPS: ClassVar[tuple] = ("MAX_TOOL_PENDING", "MAX_TOOL_PENDING_PER_CLIENT",
+                             "TOOL_HOLD_TIMEOUT", "TOOL_ARGS_MAX")
+
+    def setUp(self):
+        cp.store._init_db()
+        self._saved = {name: getattr(cp.holds, name) for name in self.CAPS}
+        self._wipe()
+
+    def tearDown(self):
+        for name, value in self._saved.items():
+            setattr(cp.holds, name, value)
+        self._wipe()
+
+    def _wipe(self):
+        with cp.store._connect() as conn:
+            conn.execute("DELETE FROM tool_approvals")
+            conn.commit()
+        cp.holds._SATURATION.update(count=0, last_ts=None, last_scope=None,
+                                    last_host=None, acked=0, acked_ts=None)
+
+    @staticmethod
+    def _rows(status="pending"):
+        with cp.store._connect() as conn:
+            return conn.execute("SELECT * FROM tool_approvals WHERE status=?",
+                                (status,)).fetchall()
+
+
+class ToolAskRegistrationTests(_ToolAskTestCase):
+    """Registering an ask, and the joining that keeps a retry from raising a second
+    card. The egress analogue is ``_reserve_hold``; almost nothing is shared, because
+    a tool ask blocks no worker."""
+
+    def test_an_ask_is_a_row_and_nothing_in_memory(self):
+        # The structural claim of the whole split: an ask pins no worker, holds no
+        # Event and occupies no slot in the registries that exist to protect the
+        # /authorize path. If any of these grew an entry, a queue of asks could starve
+        # egress decisions — the exact coupling answering immediately removed.
+        ask = cp.holds._register_tool_ask("mcp-github", "create_pull_request",
+                                          {"title": "x"}, client="172.30.0.2")
+        self.assertIsNotNone(ask.approval_id)
+        self.assertFalse(ask.joined)
+        self.assertEqual(len(self._rows()), 1)
+        self.assertEqual(cp.holds._PENDING_EVENTS, {})
+        self.assertEqual(cp.holds._PENDING_WAITERS, {})
+        self.assertEqual(cp.holds._GROUPS, {})
+
+    def test_an_identical_retry_joins_instead_of_raising_a_second_card(self):
+        first = cp.holds._register_tool_ask("mcp-github", "issue_write", {"n": 1},
+                                            client="172.30.0.2")
+        again = cp.holds._register_tool_ask("mcp-github", "issue_write", {"n": 1},
+                                            client="172.30.0.2")
+        self.assertTrue(again.joined)
+        self.assertEqual(again.approval_id, first.approval_id)
+        self.assertEqual(len(self._rows()), 1)
+
+    def test_key_order_is_the_same_ask(self):
+        # A model asked to retry commonly reformulates, and a reordered object is the
+        # same question. Joining it is what keeps ordinary model behaviour from
+        # flooding the human.
+        first = cp.holds._register_tool_ask("mcp-github", "issue_write",
+                                            {"a": 1, "b": 2})
+        again = cp.holds._register_tool_ask("mcp-github", "issue_write",
+                                            {"b": 2, "a": 1})
+        self.assertTrue(again.joined)
+        self.assertEqual(again.approval_id, first.approval_id)
+
+    def test_a_changed_value_is_a_different_ask(self):
+        # The half that carries the security weight: an approval given for one set of
+        # arguments must never be inherited by another.
+        first = cp.holds._register_tool_ask("mcp-github", "issue_write", {"n": 1})
+        other = cp.holds._register_tool_ask("mcp-github", "issue_write", {"n": 2})
+        self.assertFalse(other.joined)
+        self.assertNotEqual(other.approval_id, first.approval_id)
+        self.assertEqual(len(self._rows()), 2)
+
+    def test_the_same_payload_on_another_tool_or_server_does_not_join(self):
+        # Server and tool are inside the digest, so a payload approved for one cannot
+        # be replayed against another.
+        first = cp.holds._register_tool_ask("mcp-github", "issue_write", {"n": 1})
+        for server, tool in (("mcp-github", "sub_issue_write"),
+                             ("mcp-other", "issue_write")):
+            ask = cp.holds._register_tool_ask(server, tool, {"n": 1})
+            self.assertFalse(ask.joined, (server, tool))
+            self.assertNotEqual(ask.approval_id, first.approval_id)
+
+    def test_another_client_does_not_join(self):
+        # A card names one caller. Answering one sandbox's question must not silently
+        # answer another's — the reason ``client`` is in ``_group_key`` too.
+        first = cp.holds._register_tool_ask("mcp-github", "issue_write", {"n": 1},
+                                            client="172.30.0.2")
+        other = cp.holds._register_tool_ask("mcp-github", "issue_write", {"n": 1},
+                                            client="172.30.0.9")
+        self.assertFalse(other.joined)
+        self.assertNotEqual(other.approval_id, first.approval_id)
+
+    def test_a_decided_ask_is_not_joinable(self):
+        # The tool-side equivalent of closing a group at the decision: a retry
+        # arriving after a human answered opens a fresh card rather than inheriting an
+        # outcome it was never shown alongside.
+        first = cp.holds._register_tool_ask("mcp-github", "issue_write", {"n": 1})
+        cp.holds._resolve_tool_ask(first.approval_id, "allowed", "test")
+        again = cp.holds._register_tool_ask("mcp-github", "issue_write", {"n": 1})
+        self.assertFalse(again.joined)
+        self.assertNotEqual(again.approval_id, first.approval_id)
+
+
+class ToolAskCapTests(_ToolAskTestCase):
+    """Two caps, both about ATTENTION — there is no worker to protect here. What they
+    bound is the loop hash-joining cannot: an agent opening FRESH asks with slightly
+    varied payloads, which floods a human without ever repeating itself."""
+
+    def _ask(self, n, client="172.30.0.2"):
+        return cp.holds._register_tool_ask("mcp-github", "issue_write", {"n": n},
+                                           client=client)
+
+    def test_over_the_global_cap_fails_closed(self):
+        cp.holds.MAX_TOOL_PENDING = 2
+        cp.holds.MAX_TOOL_PENDING_PER_CLIENT = 0
+        self._ask(1), self._ask(2)
+        refused = self._ask(3)
+        self.assertIsNone(refused.approval_id)
+        self.assertIn("global tool asks", refused.refused)
+        self.assertEqual(len(self._rows()), 2)
+
+    def test_over_the_per_client_cap_fails_closed_for_that_client_alone(self):
+        cp.holds.MAX_TOOL_PENDING = 100
+        cp.holds.MAX_TOOL_PENDING_PER_CLIENT = 2
+        self._ask(1), self._ask(2)
+        self.assertIsNone(self._ask(3).approval_id)
+        # Another sandbox is unaffected, which is the whole point of the scope.
+        self.assertIsNotNone(self._ask(3, client="172.30.0.9").approval_id)
+
+    def test_a_zero_per_client_cap_disables_it(self):
+        # Same asymmetry the egress caps have: fail-closed on a global cap, disabled
+        # on a per-client one, because the fail-closed reading would make every
+        # client's first ask impossible.
+        cp.holds.MAX_TOOL_PENDING = 100
+        cp.holds.MAX_TOOL_PENDING_PER_CLIENT = 0
+        for n in range(6):
+            self.assertIsNotNone(self._ask(n).approval_id)
+
+    def test_a_refusal_reaches_the_one_saturation_account(self):
+        # Unsplit deliberately: over the cap nothing raises a card, so the refusal is
+        # invisible in the queue — and an operator should not have to read two banners
+        # to learn that governance is refusing things.
+        cp.holds.MAX_TOOL_PENDING = 1
+        self._ask(1)
+        self._ask(2)
+        self.assertEqual(cp.holds._saturation()["rejections"], 1)
+        self.assertIn("tool asks", cp.holds._saturation()["last_scope"])
+
+    def test_a_joiner_is_never_refused_for_capacity_it_does_not_use(self):
+        # The join sits BELOW the caps here and above them in ``_reserve_hold``, and
+        # the inversion is deliberate: an egress joiner still pins a worker, while a
+        # tool joiner costs no row, no card and no attention. Refusing it would deny a
+        # call whose question is already on the screen.
+        cp.holds.MAX_TOOL_PENDING = 1
+        first = self._ask(1)
+        joined = self._ask(1)
+        self.assertTrue(joined.joined)
+        self.assertEqual(joined.approval_id, first.approval_id)
+
+    def test_an_oversized_payload_is_refused_but_is_not_saturation(self):
+        # Refused rather than truncated, because the payload is what a human reads to
+        # decide. And NOT counted as pressure: nothing was contended for, so a banner
+        # saying governance is loaded would be reporting the wrong event.
+        cp.holds.TOOL_ARGS_MAX = 64
+        refused = cp.holds._register_tool_ask("mcp-github", "issue_write",
+                                              {"body": "x" * 200})
+        self.assertIsNone(refused.approval_id)
+        self.assertIn("ceiling", refused.refused)
+        self.assertEqual(self._rows(), [])
+        self.assertEqual(cp.holds._saturation()["rejections"], 0)
+
+
+class ToolAskLifecycleTests(_ToolAskTestCase):
+    """Decide, expire, claim. Four terminal states that must stay distinguishable:
+    an agent that cannot tell a denial from an expiry retries a refusal forever, and
+    one that cannot tell either from a spent approval re-runs a side effect."""
+
+    def _ask(self, **kw):
+        return cp.holds._register_tool_ask("mcp-github", "issue_write", {"n": 1},
+                                           **kw)
+
+    def test_a_decision_is_recorded_once(self):
+        ask = self._ask()
+        self.assertEqual(
+            cp.holds._resolve_tool_ask(ask.approval_id, "allowed", "operator"),
+            "allowed")
+        # A second click changes no row and reads back as the non-transition it was,
+        # rather than overwriting a decision already made.
+        self.assertIsNone(
+            cp.holds._resolve_tool_ask(ask.approval_id, "denied", "operator"))
+        self.assertEqual(cp.holds._get_tool_ask(ask.approval_id)["status"], "allowed")
+
+    def test_an_unknown_or_invalid_decision_changes_nothing(self):
+        ask = self._ask()
+        self.assertIsNone(
+            cp.holds._resolve_tool_ask(ask.approval_id, "maybe", "operator"))
+        self.assertIsNone(cp.holds._resolve_tool_ask("no-such-id", "allowed", "op"))
+        self.assertEqual(cp.holds._get_tool_ask(ask.approval_id)["status"], "pending")
+
+    def test_an_ask_past_its_deadline_expires_on_the_next_read(self):
+        # Lazy rather than swept by a timer: nothing is blocked, so there is no waiter
+        # whose timeout would enforce the window, and a row can simply be read as
+        # expired. It also means a restart cannot leave an ask pending forever.
+        cp.holds.TOOL_HOLD_TIMEOUT = -1
+        ask = self._ask()
+        self.assertEqual(cp.holds._get_tool_ask(ask.approval_id)["status"], "expired")
+
+    def test_expired_is_distinct_from_denied(self):
+        # Both refuse the call; only one of them means a human decided. An agent — or
+        # someone reading the record a month later — has to be able to tell.
+        cp.holds.TOOL_HOLD_TIMEOUT = -1
+        expired = self._ask()
+        cp.holds.TOOL_HOLD_TIMEOUT = 3600
+        denied = cp.holds._register_tool_ask("mcp-github", "issue_write", {"n": 2})
+        cp.holds._resolve_tool_ask(denied.approval_id, "denied", "operator")
+        self.assertEqual(cp.holds._get_tool_ask(expired.approval_id)["status"],
+                         "expired")
+        self.assertEqual(cp.holds._get_tool_ask(denied.approval_id)["status"],
+                         "denied")
+
+    def test_an_expired_ask_cannot_be_decided_afterwards(self):
+        cp.holds.TOOL_HOLD_TIMEOUT = -1
+        ask = self._ask()
+        cp.holds._expire_tool_asks()
+        self.assertIsNone(
+            cp.holds._resolve_tool_ask(ask.approval_id, "allowed", "operator"))
+
+    def test_an_approval_is_claimable_exactly_once(self):
+        # The property that makes lazy execution safe. The gateway runs the call on
+        # RESUMPTION, and an agent can resume twice — so without a single-use claim
+        # one approval could send the mail twice.
+        ask = self._ask()
+        cp.holds._resolve_tool_ask(ask.approval_id, "allowed", "operator")
+        claimed = cp.holds._claim_tool_ask(ask.approval_id)
+        self.assertIsNotNone(claimed)
+        self.assertIsNotNone(claimed["claimed_at"])
+        self.assertIsNone(cp.holds._claim_tool_ask(ask.approval_id))
+
+    def test_nothing_undecided_or_refused_is_claimable(self):
+        pending = self._ask()
+        self.assertIsNone(cp.holds._claim_tool_ask(pending.approval_id))
+        denied = cp.holds._register_tool_ask("mcp-github", "issue_write", {"n": 2})
+        cp.holds._resolve_tool_ask(denied.approval_id, "denied", "operator")
+        self.assertIsNone(cp.holds._claim_tool_ask(denied.approval_id))
+        self.assertIsNone(cp.holds._claim_tool_ask("no-such-id"))
+
+    def test_an_approval_that_expired_before_resumption_is_not_claimable(self):
+        # Allowed and never collected, past its window: the human's answer does not
+        # keep a side effect live indefinitely.
+        ask = self._ask()
+        cp.holds._resolve_tool_ask(ask.approval_id, "allowed", "operator")
+        with cp.store._connect() as conn:
+            conn.execute("UPDATE tool_approvals SET status='expired' WHERE id=?",
+                         (ask.approval_id,))
+            conn.commit()
+        self.assertIsNone(cp.holds._claim_tool_ask(ask.approval_id))
+
+    def test_an_unknown_id_is_none_rather_than_an_error(self):
+        self.assertIsNone(cp.holds._get_tool_ask("no-such-id"))
+
+    def test_the_queue_lists_only_what_is_still_pending(self):
+        pending = self._ask()
+        decided = cp.holds._register_tool_ask("mcp-github", "issue_write", {"n": 2})
+        cp.holds._resolve_tool_ask(decided.approval_id, "denied", "operator")
+        listed = cp.holds._list_tool_asks()
+        self.assertEqual([a["id"] for a in listed], [pending.approval_id])
+        self.assertEqual(listed[0]["kind"], "tool")
+
+    def test_the_stored_payload_is_what_the_digest_covers(self):
+        # One serialization for storage, hashing and display, so "the payload is
+        # authoritative" means something: what a human reads is byte-for-byte what the
+        # grant is bound to.
+        ask = cp.holds._register_tool_ask("mcp-github", "issue_write",
+                                          {"b": 2, "a": 1})
+        stored = cp.holds._get_tool_ask(ask.approval_id)["args_json"]
+        with cp.store._connect() as conn:
+            digest = conn.execute(
+                "SELECT args_digest FROM tool_approvals WHERE id=?",
+                (ask.approval_id,)).fetchone()[0]
+        self.assertEqual(stored, '{"a":1,"b":2}')
+        self.assertEqual(
+            digest, cp.holds._args_digest("mcp-github", "issue_write", stored))
+
+
 class HoldCapTests(_HoldRegistryTestCase):
     """Four caps, two nouns times two scopes: CARDS protect the operator's attention,
     WAITERS protect the threadpool. Over any of them /authorize must fail CLOSED

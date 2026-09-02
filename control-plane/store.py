@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Control-plane storage — the SQLite store, and the writes every path shares.
 
-This is the crown-jewel state: the policy rules that decide egress, the audit
-trail those decisions are written to, the durable approvals rows that are the
-single source of truth for a hold's outcome, and the ingest cursor. Everything
-else in this service reads and writes through here.
+This is the crown-jewel state: the policy rules that decide egress, the per-tool
+rules that decide the MCP gateway's surface, the audit trail those decisions are
+written to, the durable approvals rows that are the single source of truth for a
+hold's outcome, and the ingest cursor. Everything else in this service reads and
+writes through here.
 
 Bottom of the dependency order: this module imports no other module of the
 control plane, so the schema and its migration constraint (the NOTE below
@@ -213,6 +214,36 @@ def _init_db() -> None:
                 client_class TEXT NOT NULL DEFAULT '%s',
                 UNIQUE(pattern, client_class)
             )""" % LEGACY_CLIENT_CLASS)
+        # The OTHER policy table, for the MCP gateway's surface. It is a separate
+        # table rather than a scope on `rules` because the rows are a different kind,
+        # not a differently keyed one — the reasoning is in DESIGN.md, "Tool policy
+        # gets its own table". `action` is the only column the two share.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS tool_rules (
+                id         INTEGER PRIMARY KEY,
+                -- The server the gateway DIALLED, by name. Not an address and not a
+                -- client_class: those name a network and are derived from a peer
+                -- address, which is the OTHER of the two identities (DESIGN.md,
+                -- "Per-server identity has two different answers"). Nothing here is
+                -- derived — the gateway knows the name because it used it.
+                server     TEXT NOT NULL,
+                -- One exact tool name. There is no wildcard and no breadth ladder:
+                -- `policy._match`'s leading dot describes a host namespace, and a
+                -- tool name has no hierarchy to widen along.
+                tool       TEXT NOT NULL,
+                action     TEXT NOT NULL,          -- 'allow' | 'deny' | 'ask'
+                -- 'operator' is the only value today, and the column is here anyway:
+                -- provenance on a policy row is what the rules view labels, and a
+                -- COLUMN is the expensive kind to add to a long-lived store (the NOTE
+                -- below `_init_db`) where this whole table was free.
+                source     TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                -- Uniqueness is the PAIR, because tool names are not namespaced
+                -- across servers: two servers can each expose an `issue_read`, and
+                -- the server half is what stops one server's policy deciding for
+                -- the other's identically named tool.
+                UNIQUE(server, tool)
+            )""")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS audit (
                 id       INTEGER PRIMARY KEY,

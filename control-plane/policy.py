@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Policy matching — what a stored rule means, and what a host decides to.
+"""Policy matching — what a stored rule means, and what a request decides to.
 
-Every function here is a pure reading of the rules table: ``_decide`` answers
+Every function here is a pure reading of a policy table: ``_decide`` answers
 allow/deny/hold for a host AND the class of client asking, and the rest exist so
 that nothing else has to re-derive what a pattern matches. That is the point of
 the module — a leading dot is a subdomain wildcard, and the two places that must
 agree about it (the matcher and the patterns an operator may persist) are written
 side by side so they cannot drift.
+
+``_decide_tool`` at the bottom does the same job for the MCP gateway's own table,
+and shares no code with the host matcher on purpose: it is here to be read next to
+``_decide``, because the ways the two differ are each a decision.
 
 ``_client_class`` is the second half of that: a rule is scoped to a client class,
 so the mapping from an observed peer address to a class name lives here, beside
@@ -306,3 +310,50 @@ def _decide(host: str, client_class: str) -> tuple[str, str]:
     scope = (f" (matched only for: {', '.join(elsewhere)})" if elsewhere else "")
     return "hold", (f"no matching rule for client class {client_class}{scope} "
                     f"— held for approval")
+
+
+# ── tool policy: what a `tool_rules` row means ───────────────────────────────
+# The gateway's surface, keyed on (server, tool). Written beside ``_decide`` and
+# not merged into it: the two decide different KINDS of row (DESIGN.md, "Tool
+# policy gets its own table"), and reading them together is what shows the three
+# divergences below are deliberate rather than an omission.
+#
+#   - No wildcards. An exact (server, tool) match or no match at all.
+#   - CASE-SENSITIVE, where ``_decide`` lowercases the host. A hostname is
+#     case-insensitive by DNS; a tool name is an identifier its server chose, so
+#     folding case here would make two distinct tools one rule.
+#   - An unmatched tool is DENIED, where an unmatched host is held. A server's
+#     tool set is finite and enumerable at connect time, so refusing the unknown
+#     costs a configuration step rather than making the surface unusable — and it
+#     makes the exposed tool list a configuration artifact rather than a mirror of
+#     whatever the upstream image last added.
+_TOOL_ACTIONS = ("allow", "deny", "ask")
+
+
+def _decide_tool(server: str, tool: str) -> tuple[str, str]:
+    """(decision, reason) for calling ``tool`` on ``server``: allow, deny or ask.
+
+    ``ask`` is not this path's ``hold``. An egress hold blocks the request inside the
+    control plane until a human answers; a tool ask is registered and answered
+    immediately, with the agent given a way back to it (DESIGN.md, "An ``ask``
+    answers immediately"). This function only says which of the three a call is.
+
+    Every failure direction is a deny, including a stored action this code does not
+    recognize. That last case is not reachable through the API — it validates on
+    write — which is exactly why it is handled here: the store is a file on a volume,
+    and the one thing a hand-edited or corrupted row must never do is grant."""
+    server, tool = (server or "").strip(), (tool or "").strip()
+    if not server or not tool:
+        return "deny", "a tool call needs both a server and a tool name"
+    with store._connect() as conn:
+        row = conn.execute(
+            "SELECT action FROM tool_rules WHERE server = ? AND tool = ?",
+            (server, tool)).fetchone()
+    if row is None:
+        return "deny", (f"no rule for {tool!r} on {server!r} — an unconfigured tool "
+                        f"is denied, not held")
+    action = row["action"]
+    if action not in _TOOL_ACTIONS:
+        return "deny", (f"the rule for {tool!r} on {server!r} carries an unknown "
+                        f"action {action!r}")
+    return action, f"{action!r} by rule ({tool} on {server})"

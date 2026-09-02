@@ -2000,8 +2000,8 @@ is one operation, not two"). The per-proxy config surface this step also used to
 **not** being built — those
 values are fail-closed bounds rather than policy, so they stay env vars and a second
 governed service names its own (see "Hold bounds are fail-closed, so their values stay
-env vars"). Tool policy still lands in its own table, with the gateway (see "Tool policy
-gets its own table"), so the gateway is not waiting on a config surface for it.
+env vars"). Tool policy lands in its own table (see "Tool policy gets its own table"),
+so the gateway is not waiting on a config surface for it.
 
 **URLs carry the surface.** `/api/egress/rules` is the standing-policy view and
 `/api/egress/rules/{id}/revoke` takes a rule back; the gateway later adds
@@ -3092,6 +3092,7 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | governed git push path | planned |
 | — | `mcp-net` + MCP server catalogue (`mcp-servers.yml`) | **done** — inert until the gateway exists |
 | — | per-client-class egress policy | **done** |
+| — | tool policy table (`tool_rules` + `policy._decide_tool`) | **done** — inert until the gateway exists |
 | — | MCP gateway — per-tool allow/deny/ask | planned (unblocked — names its own bounds) |
 
 The rationale for each shipped item lives under **Governance surfaces** above, not here

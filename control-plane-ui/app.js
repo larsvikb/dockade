@@ -63,6 +63,44 @@ function renderableHolds(list) {
   return (list || []).filter(a => !a.kind || RENDERABLE_KINDS.includes(a.kind));
 }
 
+// How much of a tool ask's window is left. Read off the card's OWN `deadline`, which
+// is absolute and durable, rather than derived from `ts` plus a configured window the
+// way an egress hold's countdown is. Two consequences, both wanted: a tool card can
+// count down before `/api/config` has answered, and its window can differ per card
+// without the page knowing anything about `CONTROL_TOOL_HOLD_TIMEOUT`.
+function toolRemaining(deadline, nowMs) {
+  if (!Number.isFinite(deadline)) return null;
+  return Math.max(0, deadline - nowMs / 1000);
+}
+
+// Payload above this many bytes starts collapsed. Not a truncation — the whole string
+// is in the DOM either way and one click reveals it. What it protects is the QUEUE: a
+// card whose arguments run to pages pushes every other pending decision off the
+// screen, and a decision nobody scrolls to is one nobody makes.
+const PAYLOAD_FOLD_BYTES = 400;
+
+// The disclosure around a tool ask's arguments. The raw payload is authoritative and
+// always reachable — DESIGN is explicit that a view which truncates, unescapes or
+// reorders is a place to hide something from the person deciding — so this decides
+// only whether it starts OPEN, and says how many bytes are there either way. The size
+// is on the summary so a collapsed card still tells you how much you have not read.
+function payloadDisclosure(argsJson) {
+  const text = typeof argsJson === "string" ? argsJson : "";
+  const bytes = text.length;
+  return { bytes, open: bytes <= PAYLOAD_FOLD_BYTES,
+           summary: `arguments · ${bytes} bytes` };
+}
+
+// What a decided tool ask says on the card. "Allowed" is NOT "ran": the gateway
+// executes on resumption, when the agent comes back and claims the approval, so a
+// message reading like a completed action would misreport the one property that keeps
+// an approved side effect from happening with nobody to receive it.
+function toolOutcomeMessage(d) {
+  return d && d.outcome === "allow"
+    ? { text: "✓ allowed · runs when the agent returns for it", tone: "ok" }
+    : { text: "✕ denied · the call will not run", tone: "bad" };
+}
+
 function diffPending(shownIds, list) {
   const incoming = new Set(list.map(a => a.id));
   return {
@@ -645,13 +683,27 @@ function editPreview(rule, pattern, action, rules) {
 // two arrivals for the same host with the same total would speak once. The total
 // differs in almost every real case, and the alternative — salting the string to
 // force a change — makes the region announce noise on purpose.
+// What a card is ABOUT, in words, for anyone reading the queue rather than looking at
+// it. Per kind, because the two surfaces name their subject differently and the
+// announcement is the only place a screen-reader user learns which decision arrived:
+// a tool ask read out as "an unnamed host" is worse than no announcement, since it
+// describes the wrong sort of thing entirely.
+function cardSubject(a) {
+  if (!a) return "an unnamed host";
+  if (a.kind === "tool") {
+    const tool = a.tool || "an unnamed tool";
+    return a.server ? `${tool} on ${a.server}` : tool;
+  }
+  return a.host || "an unnamed host";
+}
+
 function pendingAnnouncement(added, total) {
   if (!added || !added.length) return "";
   if (added.length === 1) {
-    const host = (added[0] && added[0].host) || "an unnamed host";
+    const subject = cardSubject(added[0]);
     return total > 1
-      ? `Approval needed for ${host}. ${total} pending.`
-      : `Approval needed for ${host}.`;
+      ? `Approval needed for ${subject}. ${total} pending.`
+      : `Approval needed for ${subject}.`;
   }
   return `${added.length} new approvals needed. ${total} pending.`;
 }
@@ -1143,7 +1195,93 @@ function start() {
   // escaping to be safe, so the question of whether esc() covers every context
   // does not arise for this list at all. The persist patterns are derived from that
   // same host by the backend, so they get the same treatment.
+  //: A tool ask's two answers. Deliberately not ACTIONS above: the backend keeps
+  //: per-surface action sets and refuses the egress vocabulary here, so a shared list
+  //: would render buttons that 400. There is no `+ persist` counterpart because the
+  //: argument-shaped ladder that would derive one does not exist — and "allow this
+  //: tool forever" is not a rung anyone should reach by clicking twice.
+  const TOOL_CARD_ACTIONS = [["allow", "Allow", "allow"], ["deny", "Deny", "deny"]];
+
+  // A tool ask, which shares the card's shell and almost none of its body. No persist
+  // confirm panel, no duplicate badge (nothing joins a card by waiting on it), and a
+  // payload where an egress card has a URL.
+  //
+  // Built with createElement/textContent throughout, and here that matters more than
+  // it does for a host: the arguments are AGENT-AUTHORED and may contain anything a
+  // model can emit. A text node needs no escaping to be safe, so the question of
+  // whether an escaper covers every context does not arise.
+  function buildToolCard(a) {
+    const el = document.createElement("div");
+    el.className = "card tool";
+    el.dataset.id = a.id;
+
+    const title = document.createElement("div");
+    title.className = "host";
+    title.textContent = a.tool || "(unnamed tool)";
+
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    meta.textContent = [a.server ? `on ${a.server}` : null,
+                        `asked ${fmtTime(a.ts)}`,
+                        a.client ? `from ${a.client}` : null]
+      .filter(Boolean).join(" · ");
+
+    // The payload, verbatim, one click away at worst. This is the thing being
+    // approved: the tool name says what KIND of act it is and only the arguments say
+    // what it does to which repository.
+    const disclosure = payloadDisclosure(a.args_json);
+    const details = document.createElement("details");
+    details.className = "payload";
+    details.open = disclosure.open;
+    const summary = document.createElement("summary");
+    summary.textContent = disclosure.summary;
+    const pre = document.createElement("pre");
+    pre.textContent = typeof a.args_json === "string" ? a.args_json : "";
+    details.append(summary, pre);
+
+    const cd = document.createElement("div");
+    cd.className = "countdown";
+    cd.hidden = true;
+    const cdText = document.createElement("span");
+    cdText.className = "cdtext";
+    const bar = document.createElement("span");
+    bar.className = "bar";
+    const fill = document.createElement("i");
+    bar.append(fill);
+    cd.append(cdText, bar);
+
+    const actions = document.createElement("div");
+    actions.className = "actions";
+
+    const msg = document.createElement("div");
+    msg.className = "cardmsg";
+    msg.hidden = true;
+
+    const entry = {
+      el, actions, msg, cd, cdText, fill,
+      kind: "tool",
+      state: "pending", staleAt: null, dwell: 0,
+      ts: a.ts,
+      deadline: Number(a.deadline),
+      // The card's own window, so `countdownState` gets a total to take a fraction of
+      // without the page knowing what the backend's tool timeout is set to.
+      window: Number(a.deadline) - Number(a.ts),
+    };
+
+    for (const [action, label, kind] of TOOL_CARD_ACTIONS) {
+      const b = document.createElement("button");
+      b.className = kind;
+      b.textContent = label;
+      b.addEventListener("click", () => resolve(a, action));
+      actions.append(b);
+    }
+
+    el.append(title, meta, details, cd, actions, msg);
+    return entry;
+  }
+
   function buildCard(a) {
+    if (a.kind === "tool") return buildToolCard(a);
     const el = document.createElement("div");
     el.className = "card";
     el.dataset.id = a.id;
@@ -1403,7 +1541,9 @@ function start() {
     const entry = cards.get(a.id);
     if (!entry || (entry.state !== "pending" && entry.state !== "confirming")) return;
     entry.state = "resolving";
-    entry.confirm.hidden = true;
+    // A tool card has no confirm panel to close: nothing it can do writes standing
+    // policy, so there is no irreversible step to put a step in front of.
+    if (entry.confirm) entry.confirm.hidden = true;
     entry.el.classList.remove("confirming");
     entry.el.classList.add("busy");
     disableActions(entry, true);
@@ -1429,6 +1569,16 @@ function start() {
         entry.el.classList.remove("busy");
         entry.cd.hidden = true;
         entry.el.classList.add(d.outcome === "allow" ? "done-allow" : "done-deny");
+        if (entry.kind === "tool") {
+          // Its own sentence, because the egress one below reports what was PERSISTED
+          // and a tool ask persists nothing — the fields it reads are all absent here,
+          // so it would settle on "this request only", which is both wrong and
+          // reassuring about the wrong thing.
+          const m = toolOutcomeMessage(d);
+          setMessage(entry, m.text, m.tone);
+          refreshAudit();
+          return;
+        }
         // The pattern comes back from the BACKEND, so this reports what was stored
         // rather than what was clicked — and it is the exact string an operator would
         // have to go and delete.
@@ -1576,7 +1726,11 @@ function start() {
     // under a click that has already been sent would be a lie in the other direction.
     for (const a of list) {
       const entry = cards.get(a.id);
-      if (entry && (entry.state === "pending" || entry.state === "confirming")) {
+      // Tool cards are skipped rather than defaulted to 1: nothing blocks on an ask,
+      // so a joiner adds no waiter and there is no count to keep current. A badge
+      // saying "1 request" would be inventing a number the backend never sends.
+      if (entry && entry.kind !== "tool"
+          && (entry.state === "pending" || entry.state === "confirming")) {
         setRequests(entry, a.requests);
       }
     }
@@ -1588,10 +1742,15 @@ function start() {
         // in time and the agent was denied for it; a card leaving with time left is
         // somebody or something else resolving it. Both used to read the same — and
         // the expiry now also stays put long enough to be read (see DWELL_MS).
-        const d = departure(
-          holdTimeout === null ? null
-            : holdRemaining(entry.ts, holdTimeout, Date.now()),
-          holdTimeout);
+        // A tool card knows its own window, so it can tell an expiry from a
+        // resolved-elsewhere even when `/api/config` never answered — the egress card
+        // cannot, and passes null to say so.
+        const d = entry.kind === "tool"
+          ? departure(toolRemaining(entry.deadline, Date.now()), entry.window)
+          : departure(
+            holdTimeout === null ? null
+              : holdRemaining(entry.ts, holdTimeout, Date.now()),
+            holdTimeout);
         markStale(entry, d);
       }
     }
@@ -1602,12 +1761,22 @@ function start() {
   // Redrawn once a second for every live card. Cheap, and the only thing that makes a
   // deadline legible: the text for a reading, the bar for a glance.
   function updateCountdowns() {
-    if (holdTimeout === null) return;
     const now = Date.now();
     for (const entry of cards.values()) {
       if (entry.state === "resolved" || entry.state === "stale") continue;
-      const cs = countdownState(
-        holdRemaining(entry.ts, holdTimeout, now), holdTimeout);
+      // A tool card carries its own absolute deadline, so it counts down whether or
+      // not the config fetch ever succeeded. An egress card cannot — its window is
+      // configuration — so it stays hidden rather than inventing a deadline.
+      const tool = entry.kind === "tool";
+      const remaining = tool ? toolRemaining(entry.deadline, now) : null;
+      // Same rule on both surfaces: no countdown is shown for a deadline the page
+      // cannot know. `countdownState` reads a null remaining as "expiring now" and
+      // flags it urgent, so a card with a malformed deadline would sit there crying
+      // wolf — the one thing an urgency signal must never do.
+      if (tool ? remaining === null : holdTimeout === null) continue;
+      const cs = tool
+        ? countdownState(remaining, entry.window)
+        : countdownState(holdRemaining(entry.ts, holdTimeout, now), holdTimeout);
       entry.cd.hidden = false;
       entry.cdText.textContent = cs.text;
       entry.fill.style.width = `${(cs.frac * 100).toFixed(1)}%`;
@@ -2358,6 +2527,7 @@ if (typeof document !== "undefined") { start(); }
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     lampState, backoffDelay, diffPending, renderableHolds, shouldSweep,
+    toolRemaining, payloadDisclosure, toolOutcomeMessage, cardSubject,
     holdRemaining, countdownState, departure, persistPreview, saturationState,
     ackCount, capScope, requestsLabel, auditRow, auditStatus, rulesStatus, repeatCount,
     outageSummary, pendingAnnouncement, coverageSummary, revokePreview,
@@ -2367,6 +2537,6 @@ if (typeof module !== "undefined" && module.exports) {
     AUDIT_ORDINARY_STAGE, AUDIT_WINDOWS, WILDCARD_MIN_LABELS,
     RECONNECT_MIN_MS, RECONNECT_MAX_MS, STALE_MAX_MS, COUNTDOWN_URGENT_S,
     DWELL_MS, SATURATION_RECENT_MS, SATURATION_WARN_FRAC,
-    RENDERABLE_KINDS,
+    RENDERABLE_KINDS, PAYLOAD_FOLD_BYTES,
   };
 }

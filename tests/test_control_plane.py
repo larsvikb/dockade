@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for the control plane's security-load-bearing logic
 (``control-plane/app.py``): the policy decision ``_decide`` (block-wins-over-allow,
-subdomain semantics, default-hold, and per-client-class scoping), the address ->
-class mapping that feeds it, and the hold registry (``_reserve_hold`` /
-``_release_hold``: the two caps, and duplicate grouping).
+subdomain semantics, default-hold, and per-client-class scoping), the per-tool
+decision ``_decide_tool`` that answers the same question for the MCP gateway's
+surface, the address -> class mapping that feeds the first, and the hold registry
+(``_reserve_hold`` / ``_release_hold``: the two caps, and duplicate grouping).
 
 The hold cap is exactly what ``boundary-check.sh`` cannot assert: an over-cap
 request returns the same opaque 403 to the agent as any other deny, so the cap's
@@ -100,6 +101,101 @@ class DecideTests(unittest.TestCase):
         # A trailing dot on an allowed host still resolves to allow, not hold.
         _set_rules([("example.com", "allow")])
         self.assertEqual(cp.policy._decide("example.com.", CLASS)[0], "allow")
+
+
+def _set_tool_rules(rules):
+    """Replace the tool_rules table with (server, tool, action) tuples."""
+    with cp.store._connect() as conn:
+        conn.execute("DELETE FROM tool_rules")
+        conn.executemany(
+            "INSERT INTO tool_rules(server, tool, action, source, created_at) "
+            "VALUES (?,?,?, 'test', 0)", rules)
+        conn.commit()
+
+
+class DecideToolTests(unittest.TestCase):
+    """``_decide_tool`` — the gateway's surface. Every test here is a place the tool
+    path deliberately does NOT behave like the egress path above, which is the only
+    reason this needs its own class: the shared vocabulary (three actions, a
+    (thing, scope) key) makes the two look interchangeable, and the whole risk is
+    someone later "fixing" one of these divergences into consistency."""
+
+    def setUp(self):
+        cp.store._init_db()
+        _set_tool_rules([])
+
+    def test_an_unconfigured_tool_is_denied_not_held(self):
+        # The divergence that matters most. An unmatched HOST is held, because the
+        # set of hosts is unbounded and discovered at runtime; a server's tool set is
+        # finite and enumerable, so the unknown can be refused for the price of a
+        # configuration step. If this ever returns 'hold', the exposed tool list has
+        # stopped being a configuration artifact.
+        decision, reason = cp.policy._decide_tool("mcp-github", "merge_pull_request")
+        self.assertEqual(decision, "deny")
+        self.assertIn("denied, not held", reason)
+
+    def test_each_action_is_returned_as_itself(self):
+        _set_tool_rules([("mcp-github", "get_me", "allow"),
+                         ("mcp-github", "create_branch", "deny"),
+                         ("mcp-github", "create_pull_request", "ask")])
+        self.assertEqual(cp.policy._decide_tool("mcp-github", "get_me")[0], "allow")
+        self.assertEqual(
+            cp.policy._decide_tool("mcp-github", "create_branch")[0], "deny")
+        self.assertEqual(
+            cp.policy._decide_tool("mcp-github", "create_pull_request")[0], "ask")
+
+    def test_a_rule_decides_only_for_its_own_server(self):
+        # Tool names are not namespaced across servers, so the server half of the key
+        # is load-bearing: an `issue_read` allowed on one server must not answer for a
+        # different server's identically named tool.
+        _set_tool_rules([("mcp-github", "issue_read", "allow")])
+        self.assertEqual(cp.policy._decide_tool("mcp-github", "issue_read")[0],
+                         "allow")
+        self.assertEqual(cp.policy._decide_tool("mcp-other", "issue_read")[0], "deny")
+
+    def test_tool_names_are_case_sensitive(self):
+        # The opposite of `_decide`, which lowercases the host. A hostname is
+        # case-insensitive by DNS; a tool name is an identifier the server chose, so
+        # folding case would let one rule decide two distinct tools.
+        _set_tool_rules([("mcp-github", "get_me", "allow")])
+        self.assertEqual(cp.policy._decide_tool("mcp-github", "GET_ME")[0], "deny")
+
+    def test_there_is_no_wildcard(self):
+        # `.example.com` is a subdomain wildcard on the host path. A tool name has no
+        # hierarchy, so nothing here may read a leading dot — or any other character —
+        # as breadth. Both spellings are just names that do not match.
+        _set_tool_rules([(".mcp-github", ".issue", "allow"),
+                         ("mcp-github", "issue_", "allow")])
+        self.assertEqual(cp.policy._decide_tool("mcp-github", "issue_read")[0], "deny")
+
+    def test_an_unknown_stored_action_fails_closed(self):
+        # Unreachable through the API, which validates on write — and handled anyway,
+        # because the store is a file on a volume. A hand-edited or corrupted row must
+        # never be the thing that grants.
+        _set_tool_rules([("mcp-github", "get_me", "allowed"),      # not 'allow'
+                         ("mcp-github", "get_teams", "")])
+        for tool in ("get_me", "get_teams"):
+            decision, reason = cp.policy._decide_tool("mcp-github", tool)
+            self.assertEqual(decision, "deny", tool)
+            self.assertIn("unknown action", reason)
+
+    def test_a_missing_server_or_tool_is_denied(self):
+        for server, tool in (("", "get_me"), ("mcp-github", ""), ("", ""),
+                             (None, None)):
+            self.assertEqual(cp.policy._decide_tool(server, tool)[0], "deny",
+                             (server, tool))
+
+    def test_surrounding_whitespace_does_not_defeat_a_deny(self):
+        # A deny that a trailing space could slip past would be the worst possible
+        # shape of this bug: the rule reads as policy in force in the UI while the
+        # call it names goes through.
+        _set_tool_rules([("mcp-github", "delete_file", "deny")])
+        self.assertEqual(
+            cp.policy._decide_tool(" mcp-github ", " delete_file ")[0], "deny")
+        # ...and the same normalization on the allow side, so a stray space is a
+        # consistent no-op rather than a silent downgrade to deny.
+        _set_tool_rules([("mcp-github", "get_me", "allow")])
+        self.assertEqual(cp.policy._decide_tool("mcp-github ", " get_me")[0], "allow")
 
 
 class ClientClassDecisionTests(unittest.TestCase):

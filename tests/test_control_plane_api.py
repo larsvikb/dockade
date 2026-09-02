@@ -2456,6 +2456,37 @@ class FreshSchemaTests(_FreshStoreTestCase):
         self.assertIn("resolved_by", cols)
         cp.store._init_db()          # idempotent: a second run must not fail
 
+    def test_new_store_has_the_tool_policy_table(self):
+        self._use_store("fresh-tool-rules.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            cols = {r["name"] for r in
+                    conn.execute("PRAGMA table_info(tool_rules)")}
+        self.assertEqual(cols, {"id", "server", "tool", "action", "source",
+                                "created_at"})
+
+    def test_the_tool_policy_key_is_the_server_tool_pair(self):
+        # Tool names are not namespaced across servers, so uniqueness has to be the
+        # pair. If it were `tool` alone, a second server exposing an identically named
+        # tool could not be given its own rule: the INSERT would be ignored and the
+        # first server's action would silently decide for both.
+        self._use_store("fresh-tool-rules-key.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            conn.executemany(
+                "INSERT INTO tool_rules(server, tool, action, source, created_at) "
+                "VALUES (?,?,?, 'operator', 0)",
+                [("mcp-github", "issue_read", "allow"),
+                 ("mcp-other", "issue_read", "deny")])
+            conn.commit()
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM tool_rules").fetchone()[0], 2)
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    "INSERT INTO tool_rules(server, tool, action, source, "
+                    "created_at) VALUES ('mcp-github','issue_read','deny',"
+                    "'operator',0)")
+
     def test_new_store_carries_client_class_on_every_table_that_records_one(self):
         self._use_store("fresh-class-schema.db")
         cp.store._init_db()
@@ -2646,6 +2677,23 @@ class MigrationTests(_FreshStoreTestCase):
         # reads `CREATE TABLE rules`. Same table, SQLite's own spelling.
         sql = sql.replace('"rules"', "rules").replace("rules_migrating", "rules")
         return " ".join(sql.split())
+
+    def test_a_new_table_reaches_an_existing_store_without_a_step(self):
+        # Why `tool_rules` appends no `_STEPS` entry, asserted rather than argued:
+        # `CREATE TABLE IF NOT EXISTS` is a no-op only on a table that already
+        # exists, so it CREATES a wholly new one on a long-lived store just as it
+        # does on a fresh one. That is the difference between adding a table and
+        # adding a column — the latter is silently skipped, which is what the NOTE
+        # under `_init_db` is about. If this ever fails, the gateway's policy table
+        # is missing on exactly the stores that have real history in them.
+        self._old_store("migrate-new-table.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            conn.execute("INSERT INTO tool_rules(server, tool, action, source, "
+                         "created_at) VALUES ('mcp-github','get_me','allow',"
+                         "'operator',0)")
+            conn.commit()
+        self.assertEqual(cp.policy._decide_tool("mcp-github", "get_me")[0], "allow")
 
     def test_migration_is_idempotent(self):
         self._old_store("migrate-twice.db")

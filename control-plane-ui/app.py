@@ -335,17 +335,42 @@ def healthz() -> dict:
     return {"status": "ok"}
 
 
+# The two static files must be REVALIDATED on every load, and this is a correctness
+# header rather than a performance one — which is why it is not in
+# `_SECURITY_HEADERS` and not applied to relayed responses.
+#
+# `FileResponse` sends `Last-Modified` and `ETag` but no `Cache-Control`, and that
+# combination is the trap: with no explicit policy a browser is free to apply
+# HEURISTIC freshness — commonly a fraction of the file's age — and serve the script
+# from cache without asking. So the page's own control logic silently runs a version
+# behind, and the symptom is not an error but a MISRENDER. Observed: a page cached
+# from before the tool surface drew every tool ask through the egress card builder,
+# printing a literal "undefined" for the host it does not have, and offering the four
+# egress actions — buttons the backend now refuses with a 400, because the action sets
+# are per-surface. That is an operator looking at a real pending decision they cannot
+# action, with nothing on screen to explain why.
+#
+# `no-cache`, NOT `no-store`: store it, but revalidate before use. The validators
+# above are already there, so the ordinary case stays a 304 and costs one conditional
+# request rather than a refetch of the whole file.
+_REVALIDATE = {"cache-control": "no-cache"}
+
+
 @app.get("/")
 def index() -> FileResponse:
-    return FileResponse(UI_INDEX, media_type="text/html")
+    return FileResponse(UI_INDEX, media_type="text/html", headers=_REVALIDATE)
 
 
 @app.get("/app.js")
 def script() -> FileResponse:
     """The page's behaviour. A local static file — never a CDN reference, for the same
     reason the favicon is an inline data URI: a governance UI must not fetch its own
-    control logic from a third party."""
-    return FileResponse(UI_SCRIPT, media_type="text/javascript")
+    control logic from a third party.
+
+    Which makes staleness this file's failure mode rather than a third party's, and
+    `_REVALIDATE` above is the answer to it."""
+    return FileResponse(UI_SCRIPT, media_type="text/javascript",
+                        headers=_REVALIDATE)
 
 
 def _relay_allowed(method: str, path: str) -> bool:

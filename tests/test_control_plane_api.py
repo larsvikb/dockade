@@ -63,6 +63,7 @@ def _clear_all():
         conn.execute("DELETE FROM tool_rules")
         conn.execute("DELETE FROM mcp_servers")
         conn.execute("DELETE FROM approvals")
+        conn.execute("DELETE FROM tool_approvals")
         conn.execute("DELETE FROM audit")
         conn.commit()
     cp.holds._PENDING_EVENTS.clear()
@@ -2769,6 +2770,20 @@ class FreshSchemaTests(_FreshStoreTestCase):
                     conn.execute("PRAGMA table_info(tool_rules)")}
         self.assertEqual(cols, {"id", "server", "tool", "action", "source",
                                 "created_at"})
+
+    def test_new_store_has_the_tool_approvals_table(self):
+        self._use_store("fresh-tool-approvals.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            cols = {r["name"] for r in
+                    conn.execute("PRAGMA table_info(tool_approvals)")}
+        # ``deadline`` is the one with no counterpart on ``approvals``, where the
+        # window lives in memory because a blocked worker enforces it. Nothing is
+        # blocked here, so the window has to be durable or a restart would leave asks
+        # pending forever.
+        self.assertEqual(cols, {"id", "ts", "server", "tool", "args_json",
+                                "args_digest", "client", "status", "deadline",
+                                "resolved_at", "resolved_by", "claimed_at"})
 
     def test_new_store_has_the_mcp_server_table_and_no_secret_reference(self):
         # Asserted as an EXACT set, and the exactness is the assertion: a column

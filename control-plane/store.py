@@ -325,6 +325,50 @@ def _init_db() -> None:
             )""")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS approvals_status ON approvals(status)")
+        # The tool surface's approvals, which split from the table above for the
+        # reason the rules did: the rows are egress-shaped there — host, port, proto,
+        # method, url — against a server, a tool and a payload here (DESIGN.md,
+        # "``approvals`` splits the same way").
+        #
+        # What does NOT split is the operator's pending queue; these rows and those
+        # are two builders behind one list.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS tool_approvals (
+                id          TEXT PRIMARY KEY,
+                ts          REAL NOT NULL,
+                server      TEXT NOT NULL,
+                tool        TEXT NOT NULL,
+                -- The complete arguments, in the ONE canonical form that is also what
+                -- `args_digest` covers and what the human is shown
+                -- (holds._canonical_args). Nothing is dropped, summarized or
+                -- truncated: this is what someone reads to decide, so a payload
+                -- trimmed on the way in would hide exactly the part worth hiding. An
+                -- oversized one is refused instead (holds.TOOL_ARGS_MAX).
+                args_json   TEXT NOT NULL,
+                -- What the grant is BOUND to, and the key an identical retry joins on.
+                -- Over the canonical form of the arguments, so a payload that differs
+                -- only in key order is the same ask, while one that differs in any
+                -- VALUE is a different ask and cannot ride this approval.
+                args_digest TEXT NOT NULL,
+                client      TEXT,
+                status      TEXT NOT NULL,   -- pending | allowed | denied | expired
+                -- Durable, where the egress deadline lives only in `holds._PENDING_
+                -- DEADLINE`. Nothing is blocked on a tool ask, so there is no worker
+                -- whose timeout would enforce a window and no in-process state to
+                -- lose: expiry is decided by reading this column (holds.
+                -- ``_expire_tool_asks``), which also means a restart cannot resurrect
+                -- an ask as pending forever.
+                deadline    REAL NOT NULL,
+                resolved_at REAL,
+                resolved_by TEXT,            -- provenance of the resolver (_actor)
+                -- Set when the gateway EXECUTES this ask, which happens on resumption
+                -- rather than at the human's click. It is what makes an approval
+                -- single-use: the claim is a conditional UPDATE, so two resumptions
+                -- of one approved ask cannot both run the side effect.
+                claimed_at  REAL
+            )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS tool_approvals_status "
+                     "ON tool_approvals(status)")
         # Ingest cursor for the egress proxy's audit file (see _drain_egress_audit).
         # A NEW TABLE, deliberately — not a column on an existing one — so it needs
         # no migration on the long-lived store (read the note below this function).

@@ -320,6 +320,14 @@ def _bootstrap() -> None:
     store._init_db()
     # A held request cannot survive a restart (its blocked connection is gone),
     # so any 'pending' rows from a previous process are stale — expire them.
+    #
+    # ``tool_approvals`` is deliberately NOT swept here, and the difference is the
+    # whole point of that table: nothing is blocked on a tool ask, so a pending one
+    # is not stale after a restart — it is a question still waiting for a human, with
+    # an agent that can still come back for the answer. Its window is enforced by its
+    # own ``deadline`` column instead (``holds._expire_tool_asks``). Sweeping it here
+    # would throw away exactly the state that answering immediately was chosen to make
+    # durable.
     with store._connect() as conn:
         conn.execute(
             "UPDATE approvals SET status='expired', resolved_at=? "
@@ -339,6 +347,13 @@ def _bootstrap() -> None:
           f"{holds.MAX_PENDING_PER_CLIENT} per client, blocked requests "
           f"{holds.MAX_WAITERS} global / {holds.MAX_WAITERS_PER_CLIENT} per client "
           f"(0 = refuse all on a global cap, disabled on a per-client one)", flush=True)
+    # The tool surface's bounds, on their own line because they count a different
+    # thing: cards only, since nothing blocks on an ask, and a window measured against
+    # a human's attention rather than against a proxy's patience.
+    print(f"control-plane: tool asks — cards {holds.MAX_TOOL_PENDING} global / "
+          f"{holds.MAX_TOOL_PENDING_PER_CLIENT} per client, window "
+          f"{holds.TOOL_HOLD_TIMEOUT:g}s, payload ceiling {holds.TOOL_ARGS_MAX}B",
+          flush=True)
     _warn_on_dead_caps()
 
 

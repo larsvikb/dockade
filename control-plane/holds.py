@@ -382,7 +382,10 @@ def _list_pending() -> list[dict]:
     # "whoever we could not identify" is not one — ``resolve`` refuses it, and the card
     # should say so before the click rather than after (the same discipline
     # ``existing`` follows for the conflict case).
-    return [dict(r, requests=max(1, waiters.get(r["id"], 1)),
+    # ``kind`` is what the merged queue dispatches on — see ``_pending_payload``. It
+    # is stated on both builders rather than defaulted on one, so neither surface is
+    # the implicit case that a reader has to infer from the absence of the other.
+    return [dict(r, kind="egress", requests=max(1, waiters.get(r["id"], 1)),
                  persistable=bool(r["client_class"])
                  and r["client_class"] != policy.UNCLASSIFIED,
                  persist_options=[{"pattern": p, "scope": policy._pattern_scope(p),
@@ -487,11 +490,25 @@ def _expire_tool_asks() -> int:
 
     An expired ask is TERMINAL and distinct from a denied one. Both refuse the call;
     only one of them means a human decided, and an agent — or an operator reading the
-    record later — must be able to tell those apart."""
+    record later — must be able to tell those apart.
+
+    Reads before it writes, and that is not premature: the merged queue is re-read by
+    the SSE tick once a SECOND, so this runs 86,400 times a day with nothing to do on
+    almost all of them. An unconditional UPDATE would take a write lock on the
+    crown-jewel store every time — the file the governance path is reading, where a
+    lock contended at the wrong moment becomes a fail-closed deny. The check makes the
+    common case a WAL read. It is racy in the harmless direction: a row falling due
+    between the two statements is expired on the next read instead of this one."""
+    now = time.time()
     with store._connect() as conn:
+        due = conn.execute(
+            "SELECT 1 FROM tool_approvals WHERE status='pending' AND deadline <= ? "
+            "LIMIT 1", (now,)).fetchone()
+        if due is None:
+            return 0
         cur = conn.execute(
             "UPDATE tool_approvals SET status='expired', resolved_at=? "
-            "WHERE status='pending' AND deadline <= ?", (time.time(), time.time()))
+            "WHERE status='pending' AND deadline <= ?", (now, now))
         conn.commit()
         return cur.rowcount
 
@@ -625,11 +642,12 @@ def _claim_tool_ask(approval_id: str) -> dict | None:
 def _list_tool_asks() -> list[dict]:
     """Pending asks, oldest first — the tool half of the operator's queue.
 
-    Not folded into ``_list_pending`` yet, and that is a sequencing choice rather
-    than a design one: the queue is meant to be ONE list over two builders, and
-    merging the payload before the page can render a tool card would put rows in
-    front of a renderer that expects a host. Nothing raises these rows until the
-    gateway exists, so nothing is hidden in the meantime."""
+    A separate BUILDER feeding one list (see ``_pending_payload``), not a separate
+    view. It carries none of ``_list_pending``'s rim: no ``requests`` count, because
+    nothing is blocked and a joiner adds no waiter to report; and no
+    ``persist_options``, because the argument-shaped ladder that would derive them
+    does not exist yet, so there is nothing an ask can be persisted AS. Both absences
+    are the reason this is its own function rather than a branch inside that one."""
     _expire_tool_asks()
     with store._connect() as conn:
         rows = conn.execute(
@@ -646,5 +664,23 @@ def _pending_payload() -> dict:
     a 1 s tick and emits on change, so folding saturation in means a rejection reaches
     the banner within a second through the push the page is already listening to —
     no new route, no relay-allowlist entry, and no polling interval to lag behind the
-    burst it is meant to report."""
-    return {"holds": _list_pending(), "saturation": _saturation()}
+    burst it is meant to report.
+
+    **ONE list over two builders**, and this is the merge the tool surface does not
+    get to skip. Everything else about tool policy splits — its own table, its own
+    caps, its own endpoints — because two surfaces answering different questions
+    should not share a row shape. The queue is the exception, and the reason is a
+    failure mode rather than a preference: a partly connected merged view is
+    indistinguishable from an empty one. With one stream, "disconnected" is a single
+    honest boolean the page can show; with two merged in the browser, one dropping
+    renders a silent subset — and a subset of a queue looks exactly like a queue with
+    nothing in it. "How many decisions are waiting, how long have I got, is the queue
+    at capacity" is asked constantly and cannot be answered one surface at a time.
+
+    Ordered by ``ts`` ACROSS the two, because the operator's question is which
+    decision has been waiting longest, and that does not respect which subsystem
+    raised it. Sorting per surface and concatenating would put a five-second-old tool
+    ask above a two-minute-old hold whenever the tool list came first."""
+    holds_and_asks = _list_pending() + _list_tool_asks()
+    holds_and_asks.sort(key=lambda card: card["ts"])
+    return {"holds": holds_and_asks, "saturation": _saturation()}

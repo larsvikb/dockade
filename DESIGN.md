@@ -2004,8 +2004,11 @@ env vars"). Tool policy lands in its own table (see "Tool policy gets its own ta
 so the gateway is not waiting on a config surface for it.
 
 **URLs carry the surface.** `/api/egress/rules` is the standing-policy view and
-`/api/egress/rules/{id}/revoke` takes a rule back; the gateway later adds
-`/api/mcp/rules`. The `/api/rules` it replaced was a generic name on a specific thing,
+`/api/egress/rules/{id}/revoke` takes a rule back; `/api/mcp/rules` and
+`/api/mcp/servers` are the gateway surface's, and they precede the gateway rather
+than arriving with it — tool policy is configuration first, so the surface that
+states it is usable before anything consumes it. The `/api/rules` the egress
+prefix replaced was a generic name on a specific thing,
 and the rename landed before 2c-2 hung a POST and a config surface off it, while the
 only consumers were the UI and the relay's path allowlist. The lifecycle endpoints keep
 unprefixed names (`/approvals`, `/approvals/stream`, `/approvals/{id}/resolve`), so
@@ -3092,7 +3095,7 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | governed git path — clone/fetch (writes are the gateway's) | planned |
 | — | `mcp-net` + MCP server catalogue (`mcp-servers.yml`) | **done** — inert until the gateway exists |
 | — | per-client-class egress policy | **done** |
-| — | tool policy table (`tool_rules` + `policy._decide_tool`) | **done** — inert until the gateway exists |
+| — | tool policy: store (`tool_rules`, `mcp_servers`) + config API (`/api/mcp/…`) | **done** — headless; inert until the gateway exists |
 | — | MCP gateway — per-tool allow/deny/ask | planned (unblocked — names its own bounds) |
 
 The rationale for each shipped item lives under **Governance surfaces** above, not here

@@ -355,14 +355,19 @@ services:
       # rewrite the evidence it is reading.
       - egress-audit:/var/log/egress:ro
     # /healthz on the AUTHORIZE listener (8091), which is the one the proxy's
-    # service_healthy gate is actually about. Probed over loopback, which reaches
-    # it because that listener binds the wildcard; the management listener binds
-    # 172.31.0.2 alone and is deliberately not probeable from here.
+    # service_healthy gate is actually about. Probed over loopback, which reaches it
+    # because that listener binds the wildcard. It is the ONLY one of the three that
+    # is probeable from here, and by construction: the management listener binds
+    # 172.31.0.2 alone and the gateway's bridge binds 172.27.0.2 alone, which is the
+    # same single-address rule that keeps each off the others' networks. The tool
+    # bridge therefore has no health probe at all — worth stating, because that is a
+    # consequence of the bind rule rather than an omission, and the probe that would
+    # fix it would have to come from the gateway's side of the bridge.
     #
-    # `main` seeds the policy rules and expires stale approvals BEFORE either
-    # socket binds, so "answers /healthz" is strictly later, and more meaningful,
-    # than "container started". This is the health gate the other two services
-    # wait on.
+    # `main` seeds the policy rules and expires stale approvals BEFORE any of the
+    # three sockets bind, so "answers /healthz" is strictly later, and more
+    # meaningful, than "container started". This is the health gate the other two
+    # services wait on.
     #
     # Deliberately SHALLOW: it returns a static 200 without touching SQLite, so
     # healthy here means "serving", not "store verified". Deepening it to a

@@ -4379,6 +4379,33 @@ class ListenerSeparationTests(unittest.TestCase):
                 self._check(manage_bind="172.31.0.2", tool_bind=spelling)
             self.assertIn("CONTROL_TOOL_BIND", str(caught.exception), spelling)
 
+    def test_a_tool_bind_on_another_enforcers_network_is_refused(self):
+        # The spelling a wildcard check misses, and the whole reason the assertion
+        # lives in the app: naming authorize-net's address outright puts the claim
+        # endpoint within the egress proxy's reach with every healthcheck green.
+        # control-net is refused for the neighbouring reason — one bridge per
+        # enforcer, and neither belongs on the other's leg.
+        for address in ("172.29.0.2", "172.31.0.2"):
+            with self.assertRaises(SystemExit, msg=address) as caught:
+                self._check(manage_bind="172.31.0.2", tool_bind=address)
+            self.assertIn("CONTROL_TOOL_BIND", str(caught.exception), address)
+
+    def test_the_forbidden_list_is_a_typo_away_from_nothing_and_says_so(self):
+        # Fatal rather than tolerant, unlike the addon's CIDR parsing: that list is
+        # long and mostly redundant, this one has two members and dropping either
+        # silently removes the guard.
+        with mock.patch.object(cp, "_TOOL_BIND_FORBIDDEN",
+                               "172.29.0.0/24,not-a-cidr"), \
+                self.assertRaises(SystemExit) as caught:
+            self._check(manage_bind="172.31.0.2")
+        self.assertIn("CONTROL_TOOL_BIND_FORBIDDEN", str(caught.exception))
+
+    def test_a_hostname_bind_is_not_read_as_inside_a_forbidden_net(self):
+        # Resolving a name here would make the guard depend on DNS — the class of
+        # check the relay guard exists because it cannot trust. A name is simply not
+        # an address, so it falls through to the other two refusals.
+        self._check(manage_bind="172.31.0.2", tool_bind="control-plane")
+
     def test_the_tool_listener_may_not_share_a_port_with_either_other(self):
         # Same port on different addresses is refused as well as the same socket:
         # with a wildcard in the mix — and the authorize listener is one — which app

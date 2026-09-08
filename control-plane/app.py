@@ -127,6 +127,7 @@ state (the crown jewel).
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import os
 import threading
@@ -188,6 +189,23 @@ TOOL_PORT = int(os.environ.get("CONTROL_TOOL_PORT", "8092"))
 #: uvicorn treats as one. Listed rather than substring-matched: a substring test
 #: would also reject a legitimate address that happens to contain one of these.
 _WILDCARDS = ("", "0.0.0.0", "::", "*")  # noqa: S104
+#: Where the tool bridge must NOT be served, as CIDRs rather than as a wildcard test.
+#: A wildcard is one way to put the claim endpoint on authorize-net; naming that
+#: network's address outright is the other, and it passes a wildcard check while
+#: producing exactly the outcome the check exists to refuse — the claim endpoint
+#: within the egress proxy's reach, with every healthcheck green. This is the whole
+#: reason the assertion is in the app and not only in tests/test_topology.py: it is
+#: here so as not to trust the compose file, so it cannot be satisfied by a test that
+#: reads the compose file.
+#:
+#: Defaults mirror docker-compose.yml, the same arrangement ``FORBIDDEN_CIDRS`` in
+#: proxies/egress/addon.py uses, and tests/test_topology.py holds them equal to the
+#: real subnets. control-net is listed alongside authorize-net because the rule is one
+#: bridge per enforcer: sharing the management network would not reach the proxy, but
+#: it would put the gateway on the operator's path, and neither enforcer belongs on
+#: the other's leg.
+_TOOL_BIND_FORBIDDEN = os.environ.get(
+    "CONTROL_TOOL_BIND_FORBIDDEN", "172.29.0.0/24,172.31.0.0/24")
 
 # Everything except /authorize: the approvals API, the read-only views, /status.
 app = FastAPI(title="dockade control plane", version="2b")
@@ -468,6 +486,40 @@ def _warn_on_dead_caps() -> None:
                   flush=True)
 
 
+def _forbidden_tool_nets() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    """The networks the tool bridge must not be served on, parsed.
+
+    An unparseable entry is FATAL here, unlike the addon's tolerant CIDR parsing: that
+    one drops a bad entry because its list is long and mostly redundant, while this one
+    has two members and dropping either silently removes the guard. A typo in a
+    hand-set override must not read as "nothing is forbidden"."""
+    nets = []
+    for raw in (part.strip() for part in _TOOL_BIND_FORBIDDEN.split(",")):
+        if not raw:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(raw, strict=False))
+        except ValueError as exc:
+            raise SystemExit(
+                f"control-plane: CONTROL_TOOL_BIND_FORBIDDEN entry {raw!r} is not a "
+                f"CIDR ({exc}), so the bind guard cannot be evaluated. Refusing to "
+                f"start (fail closed).") from exc
+    return tuple(nets)
+
+
+def _bind_within(bind: str, net: ipaddress.IPv4Network | ipaddress.IPv6Network) -> bool:
+    """Whether ``bind`` names an address inside ``net``.
+
+    A bind that is not an address at all — a hostname, or a wildcard the caller has
+    already rejected — is not "inside" anything and answers False. Resolving a name
+    here would make the guard depend on DNS, which is the class of check the relay
+    guard exists because it cannot trust."""
+    try:
+        return ipaddress.ip_address(bind) in net
+    except ValueError:
+        return False
+
+
 def _assert_listeners_separated() -> None:
     """Fail closed on a configuration that undoes the split.
 
@@ -476,7 +528,12 @@ def _assert_listeners_separated() -> None:
     on every interface — including authorize-net — which silently restores exactly
     the self-approval path the split removes, while every healthcheck and every
     page in the UI keeps working. Nothing downstream can detect that, so it is
-    refused here (the same shape as the proxy's ``_assert_guard_configured``)."""
+    refused here (the same shape as the proxy's ``_assert_guard_configured``).
+
+    Three refusals, because a bind can undo the split three ways: a wildcard, a
+    concrete address on another enforcer's network, and a shared port. The first two
+    are the same mistake spelled differently and one check does not imply the
+    other."""
     if MANAGE_BIND in _WILDCARDS:
         raise SystemExit(
             f"control-plane: CONTROL_MANAGE_BIND={MANAGE_BIND!r} is a wildcard, "
@@ -491,6 +548,17 @@ def _assert_listeners_separated() -> None:
             f"releases an approved call) on authorize-net, where the egress proxy "
             f"can reach it — a lateral edge between two enforcers. Bind the "
             f"tool-authorize-net address instead. Refusing to start (fail closed).")
+    # The other spelling of the same mistake, and the one a wildcard test misses: an
+    # address on another enforcer's network. Refused for the reason the wildcard is,
+    # because the outcome is the same one.
+    for net in _forbidden_tool_nets():
+        if _bind_within(TOOL_BIND, net):
+            raise SystemExit(
+                f"control-plane: CONTROL_TOOL_BIND={TOOL_BIND!r} is inside {net}, "
+                f"which is another enforcer's network — serving the claim endpoint "
+                f"there is the lateral edge the separate bridge exists to remove, and "
+                f"nothing downstream can detect it. Bind the tool-authorize-net "
+                f"address instead. Refusing to start (fail closed).")
     # Every listener gets its OWN PORT, checked across all three pairs and without
     # regard to the addresses. Same address and same port is one socket serving two
     # apps' worth of surface, which is the obvious case; same port on different
@@ -2261,12 +2329,15 @@ async def main() -> None:
     # not obvious: each ``serve()`` wraps itself in ``capture_signals()``, so the
     # second server's handler replaces the first's — but on exit it restores what
     # it replaced and re-raises the signal it caught, which then reaches the first.
-    # Measured on the pinned 0.34.0 (NOTES.md): SIGTERM logs two clean shutdowns
-    # and the process is gone inside a second. An earlier version of this function
-    # added handlers of its own to "fix" the overwrite; they were inert — uvicorn
-    # installs via ``signal.signal``, which displaces asyncio's — and removing them
-    # changed nothing, so they are gone rather than kept as insurance. The chain is
-    # per-server rather than pairwise, so a third listener needs nothing new here.
+    # Measured on the pinned 0.34.0 with TWO listeners (NOTES.md): SIGTERM logged a
+    # clean shutdown for each and the process was gone inside a second. The count is
+    # the measurement's, not this file's — three listeners ship now, and the chain is
+    # per-server rather than pairwise (each ``capture_signals`` restores and re-raises
+    # for exactly one ``serve()``), so it extends by construction rather than by
+    # having been re-measured. An earlier version of this function added handlers of
+    # its own to "fix" the overwrite; they were inert — uvicorn installs via
+    # ``signal.signal``, which displaces asyncio's — and removing them changed
+    # nothing, so they are gone rather than kept as insurance.
     servers = [
         uvicorn.Server(uvicorn.Config(
             authorize_app, host=AUTHORIZE_BIND, port=AUTHORIZE_PORT,

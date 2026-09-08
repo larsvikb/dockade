@@ -854,15 +854,21 @@ a control network (`authorize-net` — see "The third net" below; it is delibera
 the control plane — the proxy could in principle relay a connection onto that
 network. It therefore hard-refuses, **before** any policy / permanent-lifeline /
 port check, any destination that names a control-plane host (`control-plane`,
-`control-plane-ui`) or resolves into either control subnet (`172.31.0.0/24`
-control-net, `172.29.0.0/24` authorize-net) — see `_forbidden` in
-`proxies/egress/addon.py` (`EGRESS_FORBIDDEN_HOSTS` / `EGRESS_FORBIDDEN_CIDRS`).
+`control-plane-ui`) or resolves into **any** control subnet — every network the
+control plane is homed on, not only the one this proxy can route to, because
+unroutability is a property of the compose file that the addon cannot verify. The
+list is `FORBIDDEN_CIDRS_DEFAULT` in `proxies/egress/addon.py` and is deliberately
+not restated here; `tests/test_topology.py` holds it equal to the real subnets, and
+`_forbidden` is the check (`EGRESS_FORBIDDEN_HOSTS` / `EGRESS_FORBIDDEN_CIDRS`).
 Because the guard is checked first and never weighed against policy, no rule, human
 approval, or change to the port allowlist can widen it, and a public name whose DNS
 is pointed at a control subnet is caught by the resolve step. This makes the
 CLAUDE.md invariant ("the agent must never reach the control plane") independently
 enforced at the one place segmentation cannot cover; `boundary-check.sh` asserts the
-proxy 403s a control-plane host and literal IPs in both control subnets. And the
+proxy 403s a control-plane host and a literal IP in every control subnet, each in
+its dotted-quad and its IPv4-mapped-IPv6 spelling — the second list has to gain
+whatever the first gains, since only the mapped probe can catch a regression of the
+address-family bypass. And the
 damage a bypass could do is bounded by the API-surface split (below): the network
 the proxy can reach carries only `/authorize`, so even a total bypass reaches a
 listener that cannot approve a held request.

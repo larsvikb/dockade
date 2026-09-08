@@ -541,6 +541,11 @@ Measured on uvicorn **0.34.0** (the pin in `control-plane/requirements.txt`), tw
 servers on one loop, `kill -TERM` on the process: two `Finished server process`
 lines and the process gone in about 500 ms.
 
+Not re-measured since the control plane grew a third listener. The mechanism is
+per-server — each `capture_signals` restores and re-raises for exactly one
+`serve()`, so the restorations nest — which is why the code did not change; but
+the timing above is a two-server number and should be read as one.
+
 The corollary is the part worth writing down: hand-rolled handlers added "to be
 safe" do nothing here. `loop.add_signal_handler` installs through asyncio's own
 `signal.signal` hook, which `capture_signals` then displaces, so a handler

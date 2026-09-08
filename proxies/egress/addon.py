@@ -187,8 +187,12 @@ def _parse_cidrs(env: str, default: str) -> tuple:
 # compose file rather than of this process — this file cannot verify it and should
 # not assume it. The gateway's bridge is the one where a relay would be worth most
 # to an attacker: its claim endpoint releases an approved tool call.
-FORBIDDEN_CIDRS = _parse_cidrs(
-    "EGRESS_FORBIDDEN_CIDRS", "172.31.0.0/24,172.29.0.0/24,172.27.0.0/24")
+#: Named rather than inlined so the fail-closed refusal below can SUGGEST it instead
+#: of carrying its own copy. The copy is what rots: it went one control network stale
+#: the moment a third was added, and pasting a stale suggestion is how an operator
+#: recovering from that refusal silently un-guards a subnet.
+FORBIDDEN_CIDRS_DEFAULT = "172.31.0.0/24,172.29.0.0/24,172.27.0.0/24"
+FORBIDDEN_CIDRS = _parse_cidrs("EGRESS_FORBIDDEN_CIDRS", FORBIDDEN_CIDRS_DEFAULT)
 FORBIDDEN_HOSTS = _hosts("EGRESS_FORBIDDEN_HOSTS", "control-plane,control-plane-ui")
 
 # Special-use / private ranges that are NEVER a legitimate egress target for the
@@ -469,8 +473,8 @@ def _assert_guard_configured() -> None:
         raise RuntimeError(
             "EGRESS_FORBIDDEN_CIDRS is empty — the control-plane relay guard would "
             "not block the control networks by IP. Refusing to start (fail "
-            "closed). Set it to the control subnet(s), e.g. "
-            "172.31.0.0/24,172.29.0.0/24.")
+            "closed). Set it to the control subnets, e.g. "
+            f"{FORBIDDEN_CIDRS_DEFAULT}.")
 
 
 # Per-connection record of the authorized CONNECT authority, keyed by the client

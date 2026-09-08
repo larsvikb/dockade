@@ -201,10 +201,10 @@ if [ -n "${HTTPS_PROXY:-}" ]; then
     # effect, and the gateway's bridge is the destination a relay would be worth
     # most — its claim endpoint releases an approved tool call.
     #
-    # NEITHER probe can tell you WHICH list refused it. Both addresses also fall
-    # inside PRIVATE_CIDRS (RFC1918 172.16.0.0/12), so a 403 here survives dropping
-    # them from EGRESS_FORBIDDEN_CIDRS entirely — which is precisely the state the
-    # startup assertion exists to prevent and cannot be observed from out here.
+    # NO probe here can tell you WHICH list refused it. Every one of these addresses
+    # also falls inside PRIVATE_CIDRS (RFC1918 172.16.0.0/12), so a 403 here survives
+    # dropping them from EGRESS_FORBIDDEN_CIDRS entirely — which is precisely the
+    # state the startup assertion exists to prevent and cannot be observed from here.
     # tests/test_topology.py asserts the CIDR list itself against the compose
     # subnets; this asserts the refusal a sandbox actually experiences.
     for cpip_addr in 172.31.0.2 172.29.0.2 172.27.0.2; do
@@ -233,14 +233,19 @@ if [ -n "${HTTPS_PROXY:-}" ]; then
         bad "egress proxy did NOT 403 metadata IP 169.254.169.254 (got: ${imds:-<none>}) — SSRF/metadata risk"
     fi
 
-    # Same two destinations, written as IPv4-MAPPED IPv6. This is the spelling that
-    # used to defeat the relay guard entirely: address-family containment meant a
-    # mapped address matched none of the v4 blocked ranges, and the resolve branch
-    # re-tested the same unrecognized form, while connect() on a v4-mapped address
-    # still reaches the v4 host. The dotted-quad probes above passed throughout, so
-    # only an explicitly mapped probe can catch a regression here. Both must 403 for
-    # the same reason as their dotted-quad twins — BEFORE any policy or port check.
-    for mapped in "[::ffff:172.31.0.2]" "[::ffff:172.29.0.2]" "[::ffff:169.254.169.254]"; do
+    # THE SAME destinations, written as IPv4-MAPPED IPv6 — every one of them, which is
+    # the point: this is the spelling that used to defeat the relay guard entirely.
+    # Address-family containment meant a mapped address matched none of the v4 blocked
+    # ranges, and the resolve branch re-tested the same unrecognized form, while
+    # connect() on a v4-mapped address still reaches the v4 host. The dotted-quad
+    # probes above passed throughout, so only an explicitly mapped probe can catch a
+    # regression here — which is exactly why this list must gain every address that
+    # one gains. tests/test_topology.py holds the two in step, since a subnet added
+    # to the dotted list alone leaves the bypass unprobed for precisely that subnet.
+    # All must 403 for the same reason as their dotted twins — BEFORE any policy or
+    # port check.
+    for mapped in "[::ffff:172.31.0.2]" "[::ffff:172.29.0.2]" "[::ffff:172.27.0.2]" \
+        "[::ffff:169.254.169.254]"; do
         resp="$(curl -sS -x "$HTTPS_PROXY" --connect-timeout 5 --max-time 8 \
             -o /dev/null "https://${mapped}/" 2>&1 || true)"
         if printf '%s' "$resp" | grep -q '403'; then

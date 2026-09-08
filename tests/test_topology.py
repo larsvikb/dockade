@@ -429,6 +429,21 @@ class ControlPlaneBindTests(unittest.TestCase):
                               f"boundary-check.sh does not probe {net} at the "
                               f"address and port compose deploys")
 
+    def test_every_relay_probe_has_an_ipv4_mapped_twin(self):
+        # The relay guard is probed twice per address, and the mapped spelling is not
+        # decoration: address-family containment once defeated the guard entirely,
+        # and the dotted-quad probes passed throughout. So the mapped list is the only
+        # one that can catch a regression of it, and a new control subnet added to
+        # the dotted list alone leaves the bypass unprobed for exactly that subnet.
+        for net in ("control-net", "authorize-net", "tool-authorize-net"):
+            with self.subTest(network=net):
+                pinned = _scalar(_block(_service("control-plane"), net, 6),
+                                 "ipv4_address")
+                self.assertIn(f"[::ffff:{pinned}]", BOUNDARY,
+                              f"boundary-check.sh probes {pinned} as a dotted quad "
+                              f"but not as IPv4-mapped IPv6, which is the only "
+                              f"spelling that catches an address-family bypass")
+
     def test_nothing_else_joins_the_tool_bridge(self):
         # One member today and exactly two ever: the control plane and the MCP
         # gateway. The roster is asserted rather than the absence of a particular
@@ -511,12 +526,29 @@ class RelayGuardAgreesWithComposeTests(unittest.TestCase):
 
     def test_the_guard_default_covers_every_control_subnet(self):
         default = re.search(
-            r'"EGRESS_FORBIDDEN_CIDRS",\s*\n?\s*"([^"]+)"', ADDON)
+            r'FORBIDDEN_CIDRS_DEFAULT = "([^"]+)"', ADDON)
         self.assertIsNotNone(default, "could not find the FORBIDDEN_CIDRS default")
         listed = {c.strip() for c in default.group(1).split(",")}
         for network in ("control-net", "authorize-net", "tool-authorize-net"):
             self.assertIn(_subnet_of(network), listed,
                           f"{network}'s subnet is not in the relay guard's default")
+
+    def test_the_tool_bind_guard_names_every_other_enforcers_network(self):
+        # The app-side half of the same two-ends problem, and it has to be checked
+        # from compose for the same reason: a default pointed at a range nothing
+        # uses passes every wildcard test while leaving the claim endpoint bindable
+        # on authorize-net. The tool bridge's OWN subnet must not be listed — that
+        # is the address the listener is required to bind.
+        default = re.search(
+            r'"CONTROL_TOOL_BIND_FORBIDDEN", "([^"]+)"', APP)
+        self.assertIsNotNone(default, "could not find the tool bind guard's default")
+        listed = {c.strip() for c in default.group(1).split(",")}
+        for network in ("control-net", "authorize-net"):
+            self.assertIn(_subnet_of(network), listed,
+                          f"{network}'s subnet is not in the tool bind guard")
+        self.assertNotIn(_subnet_of("tool-authorize-net"), listed,
+                         "the tool bridge's own subnet is forbidden to the listener "
+                         "that is required to bind it")
 
     def test_the_lifeline_range_is_the_sandbox_network(self):
         # Same two-ends-no-compiler problem as the guard above, opposite sign: this

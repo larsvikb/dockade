@@ -69,7 +69,7 @@ const missing = ["lampState", "backoffDelay", "diffPending", "shouldSweep",
                  "saturationState", "ackCount", "capScope", "requestsLabel",
                  "auditRow", "auditStatus", "rulesStatus", "repeatCount",
                  "leaseLabel", "leaseRemaining", "leaseCountdown", "leasesStatus",
-                 "leaseDomain", "groupLeases",
+                 "leaseDomain", "groupLeases", "shortActor",
                  "timeWindow", "filterActive", "auditQuery", "eventRow",
                  "historyPager", "renderableHolds",
                  "toolRemaining", "payloadDisclosure", "toolOutcomeMessage",
@@ -698,6 +698,22 @@ console.log(JSON.stringify({
     empty: m.groupLeases([]),
     absent: m.groupLeases(undefined),
   },
+  // Provenance in a table cell. The long input is a REAL `_actor` string, copied from
+  // a live lease — which is how the width problem was found.
+  actor: {
+    full: m.shortActor(
+      'peer=172.31.0.10 via-ui=172.18.0.1 origin=http://localhost:28090 ' +
+      'ua="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+      '(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"'),
+    // A direct host-local caller: peer only, nothing asserted.
+    peer_only: m.shortActor("peer=172.31.0.9"),
+    // No headers at all, so `_actor` cannot even name the socket.
+    unknown_peer: m.shortActor("peer=?"),
+    // An unrecognized shape falls back whole rather than emptying the cell.
+    unrecognized: m.shortActor("actor unrecorded"),
+    absent: m.shortActor(undefined),
+    blank: m.shortActor("   "),
+  },
 }));
 """
 
@@ -983,6 +999,39 @@ class PageScriptTests(unittest.TestCase):
         # And before the first response there is nothing to claim in either direction:
         # "none in force" here would be an all-clear the page has not earned.
         self.assertFalse(lease["status_before_first_load"]["show"])
+
+    def test_a_provenance_cell_drops_the_forgeable_fields_and_keeps_the_addresses(self):
+        """Found by using it: a live lease's `granted_by` ran to ~180 characters of
+        Chrome version string in a middle column, pushing the revoke button off the
+        table. `origin` and `ua` go — the two longest fields, and the two the client
+        self-reports, so they are evidence to read in the trail rather than an answer
+        to "who granted this"."""
+        a = self.probe["actor"]
+        self.assertEqual(a["full"], "peer=172.31.0.10 via-ui=172.18.0.1")
+        self.assertNotIn("Chrome", a["full"])
+        self.assertNotIn("origin", a["full"])
+
+    def test_a_provenance_cell_keeps_the_labels_that_carry_the_trust_level(self):
+        """Showing a bare address would be shorter and would misrepresent it. `peer` is
+        the socket address this process observed and the caller cannot forge it;
+        `via-ui` is the relay's ASSERTION about the browser behind it. That difference
+        is why `_actor` labels its fields at all, so a cell reading `172.18.0.1` would
+        present an assertion as a fact."""
+        a = self.probe["actor"]
+        self.assertTrue(a["full"].startswith("peer="))
+        self.assertIn("via-ui=", a["full"])
+        # Nothing asserted: peer alone, still labelled.
+        self.assertEqual(a["peer_only"], "peer=172.31.0.9")
+        self.assertEqual(a["unknown_peer"], "peer=?")
+
+    def test_an_unrecognized_provenance_string_is_shown_whole(self):
+        # A provenance cell that silently emptied itself would be worse than a wide
+        # one; the CSS width cap catches whatever length arrives.
+        a = self.probe["actor"]
+        self.assertEqual(a["unrecognized"], "actor unrecorded")
+        # And nothing at all reads as nothing recorded, not as a broken column.
+        self.assertEqual(a["absent"], "—")
+        self.assertEqual(a["blank"], "—")
 
     def test_sibling_hosts_fold_under_their_registrable_domain(self):
         g = self.probe["group"]["siblings"]
@@ -2466,6 +2515,20 @@ class LeaseTableSourceTests(unittest.TestCase):
         # Folding four hosts into one line must not make the number shrink: the header
         # answers "how much is granted right now", not "how tall is this table".
         self.assertIn("leasesCountEl.textContent = rows.length", self.body.group(1))
+
+    def test_the_full_provenance_survives_in_the_cell_title(self):
+        """The shortener is a RENDERING. The stored `granted_by` is evidence and stays
+        whole in the store, in the audit reason, and in this cell's tooltip — so
+        nothing an operator might need to quote is only in the abbreviated form."""
+        row = re.search(r"function leaseRow\(([^)]*)\)\s*\{(.*?)\n  \}",
+                        self.src, re.S)
+        self.assertIsNotNone(row, "leaseRow not found — renamed?")
+        body = row.group(2)
+        self.assertRegex(body, r'title="\$\{esc\(r\.granted_by')
+        self.assertIn("shortActor(r.granted_by)", body)
+        # And it is NOT in a `.ts` cell — that class is `white-space: nowrap` with no
+        # width cap, which is what let the string widen the whole table.
+        self.assertNotRegex(body, r'<td class="ts">\$\{esc\(r\.granted_by')
 
     def test_a_group_summary_offers_no_bulk_revoke(self):
         """Ending four grants with one click is a sharper action than the per-lease

@@ -610,7 +610,8 @@ class ResponseShapeTests(_CPTestCase):
                            ("approvals", cp.approvals),
                            ("api_rules", cp.api_rules),
                            ("api_audit", cp.api_audit),
-                           ("api_config", cp.api_config)):
+                           ("api_config", cp.api_config),
+                           ("tool_roster", cp.tool_roster)):
             with self.subTest(endpoint=name):
                 # get_type_hints, not __annotations__: the module carries
                 # `from __future__ import annotations`, so the raw values are
@@ -2897,6 +2898,16 @@ def _register(server="mcp-github", request=None, **kw):
                                 request if request is not None else _FakeRequest())
 
 
+def _enable(server="mcp-github", request=None, **kw):
+    """Flip a registered server on, through the endpoint that owns the switch.
+
+    Separate from ``_register`` because a registration cannot arrive pre-enabled, and
+    needed by every test whose subject is what a rule DECIDES: a rule on a disabled
+    server decides nothing (``policy._decide_tool``), which is the switch working."""
+    return cp.edit_mcp_server(server, cp.ServerEditRequest(enabled=True, **kw),
+                              request if request is not None else _FakeRequest())
+
+
 def _tool_rule(tool, action="allow", server="mcp-github", request=None):
     return cp.create_mcp_rule(
         cp.ToolRuleCreateRequest(server=server, tool=tool, action=action),
@@ -3072,11 +3083,26 @@ class McpToolRuleTests(_CPTestCase):
     def setUp(self):
         super().setUp()
         _register()
+        # Enabled, because what a rule DECIDES is what most of these tests assert and
+        # a disabled server's rules decide nothing. Registration is the other half and
+        # is deliberately not enough on its own.
+        _enable()
 
     def test_a_rule_decides_immediately(self):
         self.assertEqual(cp.policy._decide_tool("mcp-github", "get_me")[0], "deny")
         self.assertEqual(_tool_rule("get_me", "allow").status_code, 201)
         self.assertEqual(cp.policy._decide_tool("mcp-github", "get_me")[0], "allow")
+
+    def test_a_rule_on_a_disabled_server_decides_nothing(self):
+        # Standing policy survives the switch — the rule is still there, still listed,
+        # still what the server's tools may do WHEN it is on — and it grants nothing
+        # while it is off. That is the difference between disabling a server and
+        # revoking its rules, and both verbs exist because both are wanted.
+        _tool_rule("get_me", "allow")
+        cp.edit_mcp_server("mcp-github", cp.ServerEditRequest(enabled=False),
+                           _FakeRequest())
+        self.assertEqual(cp.policy._decide_tool("mcp-github", "get_me")[0], "deny")
+        self.assertEqual([r["tool"] for r in cp.api_mcp_rules()], ["get_me"])
 
     def test_a_rule_for_an_unregistered_server_is_refused(self):
         # The tool-surface twin of the unknown-client-class refusal: the row would
@@ -3193,6 +3219,371 @@ class McpToolRuleTests(_CPTestCase):
         _tool_rule("get_teams", "ask")
         served = {s["server"]: s["tool_rules"] for s in cp.api_mcp_servers()}
         self.assertEqual(served, {"mcp-github": 2})
+
+
+def _tool_call(server="mcp-github", tool="get_me", args=None, client=CLASS_IP):
+    """One tool call put to the bridge. ``client`` defaults to a real sandbox-net
+    address for the reason ``_auth_req`` does: it is what the per-client cap counts
+    and what an identical retry joins on."""
+    return cp.tool_authorize(cp.ToolCallRequest(server=server, tool=tool, args=args,
+                                                client=client))
+
+
+def _claim(approval_id, client=CLASS_IP):
+    return cp.tool_claim(approval_id, cp.ToolResumeRequest(client=client))
+
+
+class _ToolBridgeTestCase(_CPTestCase):
+    """A registered, enabled server, which is the state every question on this bridge
+    is asked in. The two server-state refusals get their own tests."""
+
+    def setUp(self):
+        super().setUp()
+        _register()
+        _enable()
+
+
+class ToolAuthorizeDecisionTests(_ToolBridgeTestCase):
+    """``POST /tool/authorize`` — the gateway's per-call question, and the tool
+    surface's counterpart to ``/authorize``.
+
+    Its whole shape is the divergence: an egress hold is resolved INSIDE the control
+    plane by blocking a worker until a human answers, while an `ask` here is
+    registered and answered immediately with an id to come back with. Nothing waits,
+    so nothing can be stranded."""
+
+    def test_an_allowed_tool_is_allowed_without_registering_anything(self):
+        _tool_rule("get_me", "allow")
+        self.assertEqual(_tool_call()["decision"], "allow")
+        self.assertEqual(cp.holds._list_tool_asks(), [])
+
+    def test_an_unconfigured_tool_is_denied_and_raises_no_card(self):
+        # The divergence from the egress surface, asserted at the endpoint and not
+        # only in ``policy._decide_tool``: an unmatched HOST is held because the set
+        # of hosts is unbounded, while a server's tool set is finite and enumerable,
+        # so refusing the unknown costs a configuration step and keeps the exposed
+        # tool list a configuration artifact.
+        self.assertEqual(_tool_call(tool="merge_pull_request")["decision"], "deny")
+        self.assertEqual(cp.holds._list_tool_asks(), [])
+
+    def test_a_denied_tool_is_denied_whether_or_not_it_was_ever_presented(self):
+        # Presentation and execution are two axes. Withholding a schema is
+        # ergonomics; this is the boundary, and it has to hold for a tool name that
+        # arrived from anywhere — a transcript, a CLAUDE.md, an earlier tool result.
+        _tool_rule("delete_file", "deny")
+        self.assertEqual(_tool_call(tool="delete_file")["decision"], "deny")
+
+    def test_an_unregistered_or_disabled_server_is_denied_by_the_authority(self):
+        _tool_rule("get_me", "allow")
+        self.assertEqual(_tool_call(server="mcp-nobody")["decision"], "deny")
+        cp.edit_mcp_server("mcp-github", cp.ServerEditRequest(enabled=False),
+                           _FakeRequest())
+        self.assertEqual(_tool_call()["decision"], "deny")
+
+    def test_every_outcome_is_an_answer_rather_than_an_error(self):
+        # A gateway must never have to read an HTTP status to learn what governance
+        # said, so a refused name, an unknown server and a granted call all come back
+        # the same way: a dict with a decision in it.
+        _tool_rule("get_me", "allow")
+        for kw in ({}, {"server": "mcp-nobody"}, {"tool": "nope"},
+                   {"server": "", "tool": ""}):
+            answer = _tool_call(**kw)
+            with self.subTest(**kw):
+                self.assertIn(answer["decision"], ("allow", "deny", "ask"))
+                self.assertTrue(answer["reason"])
+
+    def test_an_ask_comes_back_with_an_id_and_a_deadline_and_blocks_nothing(self):
+        _tool_rule("create_pull_request", "ask")
+        answer = _tool_call(tool="create_pull_request", args={"title": "x"})
+        self.assertEqual(answer["decision"], "ask")
+        self.assertFalse(answer["joined"])
+        ask = cp.holds._get_tool_ask(answer["approval_id"])
+        self.assertEqual(ask["status"], "pending")
+        # Absolute, not a remaining-seconds count: a ticking field is stale on
+        # arrival and would turn the SSE change-detector into a 1 Hz emitter.
+        self.assertGreater(answer["deadline"], time.time())
+        # Nothing blocked, so none of the egress registry exists for this.
+        self.assertEqual(cp.holds._PENDING_EVENTS, {})
+
+    def test_the_payload_reaches_the_card_that_a_human_will_read(self):
+        _tool_rule("create_pull_request", "ask")
+        _tool_call(tool="create_pull_request", args={"b": 2, "a": 1})
+        card = cp.holds._pending_payload()["holds"][0]
+        # The canonical form: key order normalized, nothing dropped or truncated.
+        self.assertEqual(card["args_json"], '{"a":1,"b":2}')
+
+    def test_an_identical_retry_joins_instead_of_raising_a_second_card(self):
+        # What keeps a retrying agent from filling the operator's queue with copies
+        # of one question. Reformulated key order is the same question.
+        _tool_rule("create_pull_request", "ask")
+        first = _tool_call(tool="create_pull_request", args={"a": 1, "b": 2})
+        again = _tool_call(tool="create_pull_request", args={"b": 2, "a": 1})
+        self.assertEqual(again["approval_id"], first["approval_id"])
+        self.assertTrue(again["joined"])
+        self.assertEqual(len(cp.holds._list_tool_asks()), 1)
+
+    def test_a_different_argument_is_a_different_ask(self):
+        # The half that matters: an approval a human gave for one payload must never
+        # execute another, so any difference in a VALUE has to open its own card.
+        _tool_rule("create_pull_request", "ask")
+        first = _tool_call(tool="create_pull_request", args={"title": "one"})
+        other = _tool_call(tool="create_pull_request", args={"title": "two"})
+        self.assertNotEqual(other["approval_id"], first["approval_id"])
+
+    def test_one_sandbox_never_joins_another_sandboxs_ask(self):
+        _tool_rule("create_pull_request", "ask")
+        mine = _tool_call(tool="create_pull_request", args={"a": 1})
+        theirs = _tool_call(tool="create_pull_request", args={"a": 1},
+                            client="172.30.0.9")
+        self.assertNotEqual(theirs["approval_id"], mine["approval_id"])
+
+    def test_an_oversized_payload_is_denied_rather_than_shown_in_part(self):
+        # Refused, not truncated: this payload is what a human is shown as the thing
+        # they are approving, so the hidden tail would be exactly where anything
+        # worth hiding went.
+        _tool_rule("create_pull_request", "ask")
+        answer = _tool_call(tool="create_pull_request",
+                            args={"body": "x" * (cp.holds.TOOL_ARGS_MAX + 1)})
+        self.assertEqual(answer["decision"], "deny")
+        self.assertIn("ceiling", answer["reason"])
+        self.assertEqual(cp.holds._list_tool_asks(), [])
+
+    def test_a_saturated_queue_denies_and_is_reported_in_the_one_banner(self):
+        # Over a cap nothing raises a card, so the refusal is invisible in the queue
+        # — which is what the saturation account exists to fix, unsplit across both
+        # surfaces so an operator reads one banner rather than two.
+        _tool_rule("create_pull_request", "ask")
+        with mock.patch.object(cp.holds, "MAX_TOOL_PENDING", 1):
+            self.assertEqual(
+                _tool_call(tool="create_pull_request", args={"n": 1})["decision"],
+                "ask")
+            answer = _tool_call(tool="create_pull_request", args={"n": 2})
+        self.assertEqual(answer["decision"], "deny")
+        self.assertIn("fail-closed", answer["reason"])
+        saturation = cp.holds._saturation()
+        self.assertEqual(saturation["rejections"], 1)
+        self.assertIn("tool asks", saturation["last_scope"])
+
+    def test_a_per_client_flood_cannot_starve_the_other_sandbox(self):
+        _tool_rule("create_pull_request", "ask")
+        with mock.patch.object(cp.holds, "MAX_TOOL_PENDING_PER_CLIENT", 1):
+            _tool_call(tool="create_pull_request", args={"n": 1})
+            mine = _tool_call(tool="create_pull_request", args={"n": 2})
+            theirs = _tool_call(tool="create_pull_request", args={"n": 3},
+                                client="172.30.0.9")
+        self.assertEqual(mine["decision"], "deny")
+        self.assertEqual(theirs["decision"], "ask")
+
+    def test_every_decision_is_audited_with_the_caller_and_its_class(self):
+        # No governed path bypasses the log, and the record has to say WHICH
+        # population called: this control plane is shared across sandboxes.
+        _tool_rule("get_me", "allow")
+        _tool_rule("create_pull_request", "ask")
+        for kw, decision in (({}, "allow"),
+                             ({"tool": "nope"}, "deny"),
+                             ({"tool": "create_pull_request"}, "hold")):
+            with mock.patch.object(cp.store, "_audit") as audited:
+                _tool_call(**kw)
+            with self.subTest(**kw):
+                self.assertEqual(audited.call_args[0][0], decision)
+                self.assertEqual(audited.call_args[1]["stage"], "tool-call")
+                self.assertEqual(audited.call_args[1]["client"], CLASS_IP)
+                self.assertEqual(audited.call_args[1]["client_class"], CLASS)
+
+    def test_a_registered_ask_is_audited_as_a_hold_naming_its_id(self):
+        # 'hold' rather than a new decision word: the vocabulary is shared with the
+        # audit views, the filter facet and the page's <option> list, and "deferred to
+        # a human" is what `hold` already means. The reason carries the difference.
+        _tool_rule("create_pull_request", "ask")
+        with mock.patch.object(cp.store, "_audit") as audited:
+            answer = _tool_call(tool="create_pull_request", args={"n": 1})
+        reason = audited.call_args[1]["reason"]
+        self.assertIn(answer["approval_id"], reason)
+        self.assertIn("nothing is blocked", reason)
+
+    def test_the_audit_words_this_endpoint_writes_are_all_filterable(self):
+        # The same coupling ``test_every_word_the_control_plane_writes_is_filterable``
+        # asserts for the file as a whole, narrowed to the words added here — a new
+        # decision word would be recorded, rendered, and quietly unfilterable.
+        self.assertLessEqual({"allow", "deny", "hold"}, set(cp.audit.DECISIONS))
+
+
+class ToolRosterTests(_ToolBridgeTestCase):
+    """``GET /tool/roster`` — what the gateway may dial and what it may present.
+
+    The pollable half of the bridge, and the split from the decision endpoint is the
+    point: this answers "what is configured", which is needed at session start and on
+    change, while execution policy is per-call and must never be cached."""
+
+    def test_an_enabled_server_arrives_with_its_rules(self):
+        _tool_rule("get_me", "allow")
+        _tool_rule("create_pull_request", "ask")
+        roster = cp.tool_roster()
+        self.assertEqual([s["server"] for s in roster], ["mcp-github"])
+        self.assertEqual(roster[0]["tools"],
+                         [{"tool": "create_pull_request", "action": "ask"},
+                          {"tool": "get_me", "action": "allow"}])
+
+    def test_a_disabled_server_is_absent_rather_than_reported_as_disabled(self):
+        # The whole meaning of the switch: the gateway dials what the roster names,
+        # and has nothing different to do with the fact that a server exists but is
+        # off. The operator's view of that is /api/mcp/servers.
+        _tool_rule("get_me", "allow")
+        cp.edit_mcp_server("mcp-github", cp.ServerEditRequest(enabled=False),
+                           _FakeRequest())
+        self.assertEqual(cp.tool_roster(), [])
+        self.assertEqual([s["server"] for s in cp.api_mcp_servers()], ["mcp-github"])
+
+    def test_an_enabled_server_with_no_rules_is_still_named(self):
+        # A fully denied surface rather than a broken one — and the gateway still has
+        # to dial it, because enumerating its tools is what turns "never looked at"
+        # into a decision an operator can make.
+        self.assertEqual(cp.tool_roster()[0]["tools"], [])
+
+    def test_deny_rules_ship_too(self):
+        # Presentation is the gateway's filter; enforcement is the decision
+        # endpoint's. Serving the deny rows is what lets the gateway tell "reviewed
+        # and refused" from "never configured" without asking again.
+        _tool_rule("delete_file", "deny")
+        self.assertEqual(cp.tool_roster()[0]["tools"],
+                         [{"tool": "delete_file", "action": "deny"}])
+
+    def test_the_descriptor_travels_and_the_secret_does_not(self):
+        # Enough to build a request, useless to steal. The material lives in a file
+        # at a path DERIVED from the server name, so nothing here — and nothing in
+        # the store behind it — can point one server at another's credential.
+        cp.edit_mcp_server(
+            "mcp-github",
+            cp.ServerEditRequest(enabled=True, auth_type="header",
+                                 auth_header="Authorization",
+                                 auth_template="Bearer {secret}"),
+            _FakeRequest())
+        auth = cp.tool_roster()[0]["auth"]
+        self.assertEqual(auth, {"type": "header", "header": "Authorization",
+                                "template": "Bearer {secret}"})
+        self.assertNotIn("secret", json.dumps(cp.tool_roster()).replace(
+            "{secret}", ""))
+
+    def test_no_server_is_an_empty_list_not_an_error(self):
+        cp.revoke_mcp_server("mcp-github", _FakeRequest())
+        self.assertEqual(cp.tool_roster(), [])
+
+    def test_the_roster_carries_no_constant_enabled_field(self):
+        # Every server here is enabled by definition, and a field that never varies
+        # invites a reader to believe it does.
+        self.assertNotIn("enabled", cp.tool_roster()[0])
+
+
+class ToolClaimTests(_ToolBridgeTestCase):
+    """``POST /tool/asks/{id}/claim`` — resumption, and the only place this bridge
+    releases anything.
+
+    The gateway executes HERE rather than at the human's click, which is what makes
+    the stranded-caller property structural: an approved call nobody comes back for
+    simply never runs."""
+
+    def _ask(self, args=None, client=CLASS_IP):
+        _tool_rule("create_pull_request", "ask")
+        return _tool_call(tool="create_pull_request",
+                          args={"title": "x"} if args is None else args,
+                          client=client)["approval_id"]
+
+    def test_an_approved_ask_hands_back_exactly_what_the_human_read(self):
+        ask = self._ask(args={"b": 2, "a": 1})
+        _resolve(ask, "allow")
+        resp = _claim(ask)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.body["server"], "mcp-github")
+        self.assertEqual(resp.body["tool"], "create_pull_request")
+        # The canonical string rather than re-parsed JSON: it is what the digest
+        # covers and what was shown, so the arguments that execute are necessarily
+        # the approved ones.
+        self.assertEqual(resp.body["args_json"], '{"a":1,"b":2}')
+
+    def test_a_pending_ask_is_refused_as_a_delay_not_as_a_refusal(self):
+        # An agent that cannot tell "come back later" from "no" retries a refusal
+        # forever, or abandons a call a human is about to approve.
+        resp = _claim(self._ask())
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.body["status"], "pending")
+        self.assertFalse(resp.body["terminal"])
+
+    def test_a_denied_or_expired_ask_is_terminal_and_says_so(self):
+        denied = self._ask(args={"n": 1})
+        _resolve(denied, "deny")
+        resp = _claim(denied)
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.body["status"], "denied")
+        self.assertTrue(resp.body["terminal"])
+
+        expiring = self._ask(args={"n": 2})
+        with cp.store._connect() as conn:
+            conn.execute("UPDATE tool_approvals SET deadline=? WHERE id=?",
+                         (time.time() - 1, expiring))
+            conn.commit()
+        resp = _claim(expiring)
+        self.assertEqual(resp.body["status"], "expired")
+        self.assertTrue(resp.body["terminal"])
+
+    def test_a_grant_is_single_use(self):
+        # The gateway can be asked to resume twice — by a retrying agent, or by one
+        # that reformulated and fell back to the id. Exactly one claim may run the
+        # side effect, and the second answer has to be "spent", which is a different
+        # fact from "denied".
+        ask = self._ask()
+        _resolve(ask, "allow")
+        self.assertEqual(_claim(ask).status_code, 200)
+        resp = _claim(ask)
+        self.assertEqual(resp.status_code, 409)
+        self.assertTrue(resp.body["spent"])
+        self.assertTrue(resp.body["terminal"])
+
+    def test_another_sandboxs_id_is_unknown_rather_than_forbidden(self):
+        # Both tiers share sandbox-net, so an id that leaked between them must not
+        # confirm that it exists: a guessed id and a real one answer identically.
+        ask = self._ask()
+        _resolve(ask, "allow")
+        resp = _claim(ask, client="172.30.0.9")
+        self.assertEqual(resp.status_code, 404)
+        self.assertIsNone(resp.body["status"])
+        # ...and the approval is still there, unclaimed, for the client that raised it.
+        self.assertEqual(_claim(ask).status_code, 200)
+
+    def test_an_unknown_id_is_a_terminal_404(self):
+        # Terminal like the refusals above, so the gateway reads one field for every
+        # answer: an id unknown to this caller does not become known by asking again.
+        resp = _claim("no-such-approval")
+        self.assertEqual(resp.status_code, 404)
+        self.assertTrue(resp.body["terminal"])
+
+    def test_the_claim_is_audited_as_the_moment_capability_is_released(self):
+        # Two rows for one grant, deliberately: `resolve` records what a human
+        # decided, this records that it is being acted on. The gap between them is
+        # exactly the window in which an approved call was never run.
+        ask = self._ask()
+        _resolve(ask, "allow")
+        with mock.patch.object(cp.store, "_audit") as audited:
+            _claim(ask)
+        self.assertEqual(audited.call_args[0][0], "allow")
+        self.assertEqual(audited.call_args[1]["stage"], "tool-resume")
+        self.assertIn(ask, audited.call_args[1]["reason"])
+
+    def test_a_refused_claim_is_not_audited_as_a_release(self):
+        # The ask is raised OUTSIDE the patch: registering it audits a hold of its
+        # own, and counting that here would report the release this asserts is absent.
+        ask = self._ask()
+        with mock.patch.object(cp.store, "_audit") as audited:
+            _claim(ask)
+        self.assertEqual(audited.call_count, 0)
+
+    def test_nothing_here_can_decide_an_ask(self):
+        # The criterion for this whole bridge: a caller reaching it cannot GRANT.
+        # A claim releases only what a human already approved, so a pending ask
+        # stays pending no matter how often it is claimed.
+        ask = self._ask()
+        for _ in range(3):
+            _claim(ask)
+        self.assertEqual(cp.holds._get_tool_ask(ask)["status"], "pending")
 
 
 class _FreshStoreTestCase(unittest.TestCase):
@@ -3516,6 +3907,10 @@ class MigrationTests(_FreshStoreTestCase):
         self._old_store("migrate-new-table.db")
         cp.store._init_db()
         with cp.store._connect() as conn:
+            # BOTH new tables, because the decision below reads both: a rule grants
+            # nothing for a server that is not registered and enabled.
+            conn.execute("INSERT INTO mcp_servers(server, enabled, auth_type, "
+                         "created_at) VALUES ('mcp-github', 1, 'none', 0)")
             conn.execute("INSERT INTO tool_rules(server, tool, action, source, "
                          "created_at) VALUES ('mcp-github','get_me','allow',"
                          "'operator',0)")
@@ -3775,39 +4170,63 @@ def _routes(fastapi_app) -> set:
 
 
 class ApiSurfaceSplitTests(unittest.TestCase):
-    """The control plane serves two listeners, and WHICH one a handler lands on is
+    """The control plane serves three listeners, and WHICH one a handler lands on is
     a security property rather than a layout choice.
 
-    The egress proxy has a network route to the authorize listener and none to the
-    management one. That topology is in docker-compose.yml, but it is only worth
-    anything if the listener the proxy CAN reach stays harmless — so the roster
-    below is asserted exactly, and adding to it has to be a deliberate act rather
-    than the side effect of putting a new endpoint next to an existing one.
+    Each enforcer has a network route to its own bridge and none to the management
+    listener or to the other enforcer's. That topology is in docker-compose.yml, but
+    it is only worth anything if the listeners an enforcer CAN reach stay harmless —
+    so each roster below is asserted exactly, and adding to one has to be a deliberate
+    act rather than the side effect of putting a new endpoint next to an existing one.
 
     The stakes are asymmetric: a management route missing from its app is a broken
-    UI, noticed in seconds. A management route that also appears on the authorize
-    app is a self-approval path for the agent, noticed never."""
+    UI, noticed in seconds. A management route that also appears on an enforcer's
+    app is a self-approval path, noticed never."""
 
     #: Everything the proxy-facing listener may serve. /authorize answers a policy
     #: question; /healthz is what the container's health gate probes.
     AUTHORIZE_ROUTES: ClassVar[set] = {("POST", "/authorize"),
                                        ("GET", "/healthz")}
+    #: Everything the gateway-facing listener may serve: decide a call, read the
+    #: roster, claim an ask a human approved. Three rather than one, and the
+    #: criterion that keeps that width honest is that none of them GRANTS — the
+    #: claim releases only what was already decided elsewhere.
+    TOOL_ROUTES: ClassVar[set] = {("POST", "/tool/authorize"),
+                                  ("GET", "/tool/roster"),
+                                  ("POST", "/tool/asks/{approval_id}/claim"),
+                                  ("GET", "/healthz")}
 
     def test_the_authorize_listener_serves_exactly_two_routes(self):
         self.assertEqual(_routes(cp.authorize_app), self.AUTHORIZE_ROUTES)
+
+    def test_the_tool_listener_serves_exactly_its_three_routes(self):
+        self.assertEqual(_routes(cp.tool_app), self.TOOL_ROUTES)
+
+    def test_the_two_enforcer_bridges_share_nothing_but_healthz(self):
+        # Separate nets AND separate sockets: a bypassed egress proxy must not reach
+        # the gateway's claim endpoint, which is the one place this bridge releases a
+        # side effect.
+        shared = _routes(cp.authorize_app) & _routes(cp.tool_app)
+        self.assertEqual(shared, {("GET", "/healthz")})
 
     def test_nothing_but_healthz_is_served_on_both(self):
         shared = _routes(cp.app) & _routes(cp.authorize_app)
         self.assertEqual(shared, {("GET", "/healthz")})
 
+    def test_the_management_app_shares_nothing_with_the_tool_bridge(self):
+        shared = _routes(cp.app) & _routes(cp.tool_app)
+        self.assertEqual(shared, {("GET", "/healthz")})
+
     def test_the_endpoint_that_grants_egress_is_management_only(self):
         # resolve is THE privileged action — it is what turns a held request into
-        # allowed egress. If the agent can reach this, the governance plane is a
-        # formality, so it gets its own assertion rather than relying on the
-        # roster test above to catch it by arithmetic.
+        # allowed egress, and a tool ask into an approved call. If either enforcer
+        # can reach this, the governance plane is a formality, so it gets its own
+        # assertion rather than relying on the roster tests above to catch it by
+        # arithmetic.
         resolve = [r for r in _routes(cp.app) if r[1].endswith("/resolve")]
         self.assertEqual(len(resolve), 1, "resolve is not on the management app")
         self.assertNotIn(resolve[0], _routes(cp.authorize_app))
+        self.assertNotIn(resolve[0], _routes(cp.tool_app))
 
     def test_the_endpoints_that_write_standing_policy_are_management_only(self):
         # The other way to grant egress, and the stronger one: a rule written here
@@ -3821,12 +4240,13 @@ class ApiSurfaceSplitTests(unittest.TestCase):
                                   ("POST", "/api/egress/rules/{rule_id}/revoke"),
                                   ("POST", "/api/egress/rules/{rule_id}/edit")})
         self.assertEqual(writes & _routes(cp.authorize_app), set())
+        self.assertEqual(writes & _routes(cp.tool_app), set())
 
     def test_the_endpoints_that_write_tool_policy_are_management_only(self):
         # The gateway's surface, held to the same roster as the egress one. The
-        # gateway will eventually READ policy over a bridge of its own — a narrow one
-        # that cannot grant — and these are the writes that must never appear on it,
-        # nor on the authorize listener the egress proxy can already reach.
+        # gateway READS policy over a bridge of its own — a narrow one that cannot
+        # grant — and these are the writes that must never appear on it, nor on the
+        # authorize listener the egress proxy can already reach.
         writes = {r for r in _routes(cp.app)
                   if r[0] == "POST" and "/api/mcp/" in r[1]}
         self.assertEqual(writes, {("POST", "/api/mcp/servers"),
@@ -3836,6 +4256,7 @@ class ApiSurfaceSplitTests(unittest.TestCase):
                                   ("POST", "/api/mcp/rules/{rule_id}/edit"),
                                   ("POST", "/api/mcp/rules/{rule_id}/revoke")})
         self.assertEqual(writes & _routes(cp.authorize_app), set())
+        self.assertEqual(writes & _routes(cp.tool_app), set())
 
     def test_the_views_that_read_the_store_are_management_only(self):
         # Not privileged, but they carry the record: pending hosts and clients,
@@ -3846,6 +4267,11 @@ class ApiSurfaceSplitTests(unittest.TestCase):
                      "/api/mcp/rules", "/api/config", "/status"):
             self.assertIn(("GET", path), _routes(cp.app), path)
             self.assertNotIn(("GET", path), _routes(cp.authorize_app), path)
+            # Nor on the gateway's bridge. It reads policy — that is what the roster
+            # is — but the queue, the audit record and the standing rules are the
+            # operator's view, and one of them is a read on the operator's own
+            # pending decisions.
+            self.assertNotIn(("GET", path), _routes(cp.tool_app), path)
 
 
 class ListenerSeparationTests(unittest.TestCase):
@@ -3859,15 +4285,37 @@ class ListenerSeparationTests(unittest.TestCase):
     # authorize listener, which binds the wildcard on purpose, and the literals in
     # the test are the spellings the guard has to reject.
     def _check(self, *, manage_bind, manage_port=8090,
-               authorize_bind="0.0.0.0", authorize_port=8091):  # noqa: S104
+               authorize_bind="0.0.0.0", authorize_port=8091,  # noqa: S104
+               tool_bind="172.27.0.2", tool_port=8092):
         with mock.patch.multiple(cp, MANAGE_BIND=manage_bind,
                                  MANAGE_PORT=manage_port,
                                  AUTHORIZE_BIND=authorize_bind,
-                                 AUTHORIZE_PORT=authorize_port):
+                                 AUTHORIZE_PORT=authorize_port,
+                                 TOOL_BIND=tool_bind,
+                                 TOOL_PORT=tool_port):
             cp._assert_listeners_separated()
 
     def test_a_pinned_management_address_is_accepted(self):
         self._check(manage_bind="172.31.0.2")
+
+    def test_a_wildcard_tool_bind_is_refused(self):
+        # The gateway's bridge carries the claim endpoint, which releases an approved
+        # call. On the wildcard it would answer on authorize-net too, where the
+        # egress proxy could spend an approval the agent is coming back for — the
+        # lateral edge between two enforcers that the second bridge exists to prevent.
+        for spelling in ("0.0.0.0", "::", "*", ""):  # noqa: S104
+            with self.assertRaises(SystemExit, msg=spelling) as caught:
+                self._check(manage_bind="172.31.0.2", tool_bind=spelling)
+            self.assertIn("CONTROL_TOOL_BIND", str(caught.exception), spelling)
+
+    def test_the_tool_listener_may_not_share_a_port_with_either_other(self):
+        # Same port on different addresses is refused as well as the same socket:
+        # with a wildcard in the mix — and the authorize listener is one — which app
+        # answers depends on which bind is more specific for the address dialled,
+        # which is not a property an operator reading a firewall rule can see.
+        for port in (8090, 8091):
+            with self.assertRaises(SystemExit, msg=str(port)):
+                self._check(manage_bind="172.31.0.2", tool_port=port)
 
     def test_every_wildcard_spelling_is_refused(self):
         # All four reach every interface, authorize-net included. Listing them

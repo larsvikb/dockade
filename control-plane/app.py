@@ -77,17 +77,29 @@ the self-reported fields are forgeable by a host-local caller. It exists so a fo
 record afterwards, which it previously was not — an operator's click and a
 scripted POST were indistinguishable once written.
 
-TWO LISTENERS, on two networks, because the dangerous surface is the management
-API and not `/authorize`. Both ways of granting egress live on the management one —
-`resolve` and `create_rule` — so anything that reaches it can self-approve, while
-`/authorize` can only ever answer a policy question. They are therefore served separately (``main``):
+THREE LISTENERS, on three networks, because the dangerous surface is the management
+API and not the questions the enforcers ask it. Both ways of granting egress live on
+the management one — `resolve` and `create_rule` — so anything that reaches it can
+self-approve, while an enforcer's bridge can only ever answer a policy question.
+They are therefore served separately (``main``):
 
   - the AUTHORIZE listener (CONTROL_AUTHORIZE_PORT, on authorize-net) serves
     exactly POST /authorize and GET /healthz — ``authorize_app`` below. It is the
     only surface the egress proxy has a route to.
+  - the TOOL listener (CONTROL_TOOL_PORT, on tool-authorize-net) serves the MCP
+    gateway's three questions and nothing else — ``tool_app`` below.
   - the MANAGEMENT listener (CONTROL_MANAGE_PORT, bound to the control-net address
     ALONE — a wildcard bind is refused at startup) serves everything else, and is
     reachable only from control-plane-ui.
+
+The two enforcer bridges are separate networks and separate sockets rather than one
+shared "ask policy" surface, because a lateral edge between two enforcers is what
+splitting them bought its way out of: the proxy's relay guard is best-effort by
+construction, and a bypassed proxy must not gain a route to the gateway's claim
+endpoint, which is the one place a side effect gets released. That is also why the
+TOOL listener binds ONE address where the authorize listener binds the wildcard —
+the asymmetry is not an oversight, it is the whole point (see
+``_assert_listeners_separated``).
 
 This is blast-radius containment, not the primary control: the agent is kept off
 this service by network topology, by the proxy's relay guard and by the proxy's
@@ -103,14 +115,14 @@ bounded separately (CONTROL_MAX_PENDING / CONTROL_MAX_PENDING_PER_CLIENT), which
 protects the operator's attention rather than the pool — see holds.py for why the
 two nouns need four caps. Over any of them /authorize fails closed. The SQLite store is the source of truth for the UI
 (the SSE stream polls it). Do NOT run multiple workers — the pending-event
-registry is in-process (holds.py). That constraint is also why the two listeners
-above are two sockets in ONE process rather than two services: a held /authorize
-and the `resolve` that releases it must share memory, precisely because they must
-not share a socket.
+registry is in-process (holds.py). That constraint is also why the listeners
+above are separate sockets in ONE process rather than separate services: a held
+/authorize and the `resolve` that releases it must share memory, precisely because
+they must not share a socket.
 
-No egress: this service sits on control-net and authorize-net, both internal. It
-must never be given an internet route — it is pure management state (the crown
-jewel).
+No egress: this service sits on control-net, authorize-net and tool-authorize-net,
+all internal. It must never be given an internet route — it is pure management
+state (the crown jewel).
 """
 from __future__ import annotations
 
@@ -120,6 +132,7 @@ import os
 import threading
 import time
 import uuid
+from typing import Any
 
 import audit
 import holds
@@ -148,7 +161,7 @@ AUDIT_GROUP_SCAN = int(os.environ.get("CONTROL_AUDIT_GROUP_SCAN", "5000"))
 # safe direction, and it is why matching is acceptable here at all.
 FAIL_CLOSED_REASON = "control-plane unreachable"
 
-# ── the two listeners (see the module docstring) ────────────────────────────
+# ── the three listeners (see the module docstring) ──────────────────────────
 # The proxy-facing surface binds a WILDCARD on purpose: it is the safe one, it
 # only answers policy questions, and the container's healthcheck reaches it over
 # loopback. The management surface binds ONE address, and the default is loopback
@@ -158,6 +171,23 @@ AUTHORIZE_BIND = os.environ.get("CONTROL_AUTHORIZE_BIND", "0.0.0.0")  # noqa: S1
 AUTHORIZE_PORT = int(os.environ.get("CONTROL_AUTHORIZE_PORT", "8091"))
 MANAGE_BIND = os.environ.get("CONTROL_MANAGE_BIND", "127.0.0.1")
 MANAGE_PORT = int(os.environ.get("CONTROL_MANAGE_PORT", "8090"))
+# The MCP gateway's bridge. Binds ONE address like the management surface, not the
+# wildcard the authorize surface uses, and the default is loopback for the same
+# reason: a deployment that forgets to set it fails VISIBLY (the gateway cannot
+# reach it) rather than silently serving the claim endpoint on authorize-net, where
+# the egress proxy could burn an approved ask the agent is coming back for.
+#
+# The consequence of the authorize listener's wildcard, stated rather than left to be
+# discovered: the gateway CAN reach /authorize, since that socket answers on every
+# interface. Accepted, because that surface only ever answers a policy question — the
+# same property that makes it safe for the proxy. The reverse direction is the one
+# that had to be closed, and this bind is what closes it.
+TOOL_BIND = os.environ.get("CONTROL_TOOL_BIND", "127.0.0.1")
+TOOL_PORT = int(os.environ.get("CONTROL_TOOL_PORT", "8092"))
+#: Every spelling of "listen on every interface", including the empty string, which
+#: uvicorn treats as one. Listed rather than substring-matched: a substring test
+#: would also reject a legitimate address that happens to contain one of these.
+_WILDCARDS = ("", "0.0.0.0", "::", "*")  # noqa: S104
 
 # Everything except /authorize: the approvals API, the read-only views, /status.
 app = FastAPI(title="dockade control plane", version="2b")
@@ -166,6 +196,13 @@ app = FastAPI(title="dockade control plane", version="2b")
 # exists to survive — so the question to ask of any new endpoint is not "is it
 # read-only" but "would I let a bypassed relay guard call it".
 authorize_app = FastAPI(title="dockade control plane (authorize)", version="2b")
+# The MCP gateway's three questions, and nothing else, ever: what may this call do,
+# which servers and tools are configured, and may I now run the ask a human approved.
+# The question to ask of any new route here is the one above with a different
+# enforcer: "would I let a compromised MCP gateway call it". Nothing on this app may
+# GRANT — no rule is written here and no approval is decided here (`resolve` stays on
+# the management app, asserted by tests/test_control_plane_api.py).
+tool_app = FastAPI(title="dockade control plane (tool)", version="2b")
 
 
 # ── provenance ──────────────────────────────────────────────────────────────
@@ -311,6 +348,37 @@ class ToolRuleEditRequest(BaseModel):
     action: str
 
 
+class ToolCallRequest(BaseModel):
+    """A tool call the gateway is about to make, as a question rather than a report:
+    nothing has run when this arrives, which is what makes a `deny` worth anything."""
+    server: str
+    tool: str
+    # The COMPLETE arguments, as the gateway received them. Not a summary and not a
+    # subset: on the `ask` path this becomes what a human reads and what the grant is
+    # bound to (``holds._canonical_args`` re-serializes it into the one canonical
+    # form), so a payload trimmed here would bind an approval to something other than
+    # the call. ``Any`` because it is a tool's own JSON — whatever shape that server's
+    # schema allows, and this is not the place that judges it. Oversize is refused,
+    # not truncated (``holds.TOOL_ARGS_MAX``).
+    args: Any = None
+    # The SANDBOX's address, relayed by the gateway — the same arrangement as
+    # ``AuthorizeRequest.client``, where the proxy reports the peer it observed. It is
+    # what the per-client ask cap counts and part of what an identical retry joins on,
+    # so the gateway reporting its OWN address instead would make one shared bucket of
+    # every sandbox and let one agent's asks answer another's.
+    client: str | None = None
+
+
+class ToolResumeRequest(BaseModel):
+    """Resumption: the agent has come back for an ask a human approved.
+
+    ``client`` is checked against the ask's own, so an id that leaked or was guessed
+    from another sandbox is answered as unknown rather than claimed — both tiers share
+    `sandbox-net`, and the gateway is the only thing that knows which of them is
+    calling."""
+    client: str | None = None
+
+
 class AckRequest(BaseModel):
     # How many over-cap rejections the operator has read. A count rather than a
     # "dismiss" flag, so a rejection arriving between the render and the click is
@@ -408,21 +476,46 @@ def _assert_listeners_separated() -> None:
     the self-approval path the split removes, while every healthcheck and every
     page in the UI keeps working. Nothing downstream can detect that, so it is
     refused here (the same shape as the proxy's ``_assert_guard_configured``)."""
-    if MANAGE_BIND in ("", "0.0.0.0", "::", "*"):  # noqa: S104
+    if MANAGE_BIND in _WILDCARDS:
         raise SystemExit(
             f"control-plane: CONTROL_MANAGE_BIND={MANAGE_BIND!r} is a wildcard, "
             f"which would serve the management API (including "
             f"/approvals/{{id}}/resolve) on authorize-net, where the egress proxy "
             f"can reach it. Bind the control-net address instead. Refusing to "
             f"start (fail closed).")
-    if MANAGE_BIND == AUTHORIZE_BIND and MANAGE_PORT == AUTHORIZE_PORT:
+    if TOOL_BIND in _WILDCARDS:
         raise SystemExit(
-            "control-plane: the management and authorize listeners resolve to the "
-            f"same socket ({MANAGE_BIND}:{MANAGE_PORT}). Refusing to start.")
+            f"control-plane: CONTROL_TOOL_BIND={TOOL_BIND!r} is a wildcard, which "
+            f"would serve the gateway's bridge (including the claim endpoint that "
+            f"releases an approved call) on authorize-net, where the egress proxy "
+            f"can reach it — a lateral edge between two enforcers. Bind the "
+            f"tool-authorize-net address instead. Refusing to start (fail closed).")
+    # Every listener gets its OWN PORT, checked across all three pairs and without
+    # regard to the addresses. Same address and same port is one socket serving two
+    # apps' worth of surface, which is the obvious case; same port on different
+    # addresses is the subtle one and is refused too, because with a wildcard in the
+    # mix — and the authorize listener is one — which app answers depends on which
+    # bind is more specific for the address dialled. That is not a property an
+    # operator reading a healthcheck or a firewall rule can see, and nothing here
+    # needs it.
+    for (a_name, a_bind, a_port), (b_name, b_bind, b_port) in (
+            (("management", MANAGE_BIND, MANAGE_PORT),
+             ("authorize", AUTHORIZE_BIND, AUTHORIZE_PORT)),
+            (("management", MANAGE_BIND, MANAGE_PORT),
+             ("tool", TOOL_BIND, TOOL_PORT)),
+            (("authorize", AUTHORIZE_BIND, AUTHORIZE_PORT),
+             ("tool", TOOL_BIND, TOOL_PORT))):
+        if a_port == b_port:
+            raise SystemExit(
+                f"control-plane: the {a_name} listener ({a_bind}:{a_port}) and the "
+                f"{b_name} listener ({b_bind}:{b_port}) share a port, so which "
+                f"surface answers depends on which bind is more specific. Give each "
+                f"listener its own port. Refusing to start.")
 
 
 @app.get("/healthz")
 @authorize_app.get("/healthz")
+@tool_app.get("/healthz")
 def healthz() -> dict:
     return {"status": "ok"}
 
@@ -570,6 +663,223 @@ def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
                  proto=req.proto, client=req.client, client_class=client_class,
                  method=req.method, url=req.url, reason=why)
     return AuthorizeResponse(decision=final, reason=why)
+
+
+# ── the tool bridge (gateway-facing) ────────────────────────────────────────
+#
+# The MCP gateway's entire conversation with the control plane, and it is three
+# questions rather than one: what may this call do, what is configured, and may I now
+# run the ask a human approved. All three are served on ``tool_app`` — its own socket
+# on its own network — and none of them grants anything (see the app's comment).
+#
+# It is the tool surface's counterpart to ``/authorize`` and deliberately not that
+# endpoint. The shapes diverge where the surfaces do: `/authorize` answers allow or
+# deny and resolves a hold INTERNALLY by blocking a worker, while this one answers
+# allow, deny or `ask` and hands the id back at once, because nothing waits (DESIGN.md,
+# "An ``ask`` answers immediately"). Sharing the endpoint would mean one handler whose
+# every branch forked on which surface asked.
+#
+# What the gateway is TRUSTED with here, stated because it is the trust model rather
+# than an oversight: it reports the sandbox address it observed, exactly as the egress
+# proxy does on `/authorize`. A gateway that lied would misattribute an ask's client
+# and spend another sandbox's per-client budget. It cannot forge a DECISION, which is
+# the part that matters — policy is read here, and the human's answer lands on a row
+# the gateway never writes.
+
+@tool_app.post("/tool/authorize")
+def tool_authorize(req: ToolCallRequest) -> dict:
+    """Decide one tool call: allow, deny, or ask (registered, with an id to return
+    with).
+
+    Always a 200 and always an answer, like ``authorize``: a policy question has a
+    policy answer, and a gateway should never have to read an HTTP status to learn
+    what governance said. That includes the refusals — a malformed name, a server
+    nobody registered, a disabled one, an oversized payload and a saturated queue all
+    come back as `deny` with a reason, because every one of them is a decision the
+    gateway has to act on identically.
+
+    NOTHING IS CACHEABLE IN THIS ANSWER, and the gateway must not try: an operator's
+    `deny` that waits for a TTL is not a deny (DESIGN.md, "The gateway pulls"). The
+    roster below is the half that may be polled; this is the half that may not.
+
+    What is NOT recorded here is the payload of an allowed call. The audit row carries
+    the server, the tool and the decision; the arguments reach the store only when a
+    human has to read them (an ``ask``, where they are the thing being approved). The
+    other half of that record — what a call sent and what came back, at minimum size
+    and hash, because the response is the channel that steers an agent — belongs to
+    the gateway's own audit stream, ingested the way the proxy's is. Naming the gap is
+    the point: it is not covered yet, and this endpoint is not where it lands."""
+    # Derived here and carried into the audit row, the same discipline ``authorize``
+    # follows: the class that named this caller is the one the record shows. It scopes
+    # nothing — a tool rule is keyed on (server, tool), never on a client class, which
+    # is exactly the conflation "Per-server identity has two different answers" keeps
+    # apart. It is here because the record has to say WHICH population called, and a
+    # tool ask's own row cannot: `tool_approvals` has no class column, so `resolve`
+    # would have to re-derive it from an address recorded earlier — the reverse of the
+    # rule that a decision is recorded under the class it was decided with.
+    client_class = policy._client_class(req.client)
+    server = (getattr(req, "server", "") or "").strip().lower()
+    tool = (getattr(req, "tool", "") or "").strip()
+    decision, reason = policy._decide_tool(server, tool)
+
+    if decision in ("allow", "deny"):
+        store._audit(decision, stage="tool-call", client=req.client,
+                     client_class=client_class,
+                     reason=f"{tool or '(no tool)'} on {server or '(no server)'}: "
+                            f"{reason}")
+        return {"decision": decision, "reason": reason}
+
+    # ASK. Registered, not held: the row is the ask, the gateway takes the id back
+    # immediately and the agent gets a pending result it can come back with. An
+    # identical ask from the same client JOINS the pending one instead of raising a
+    # second card, which is what keeps a retrying agent from filling the operator's
+    # queue with copies of one question.
+    ask = holds._register_tool_ask(server, tool, req.args, req.client)
+    if ask.refused is not None:
+        # Over a cap, or a payload too large to show a human in full. A deny, and
+        # audited as one — the refusal is real and the gateway acts on it exactly as
+        # it would on a policy deny. `holds._refuse_tool` has already recorded the
+        # cap case in the saturation account, which is what makes a refusal that
+        # raises no card visible to an operator at all.
+        store._audit("deny", stage="tool-call", client=req.client,
+                     client_class=client_class,
+                     reason=f"{tool} on {server}: {ask.refused}")
+        return {"decision": "deny", "reason": ask.refused}
+
+    # 'hold' rather than a new word, and the vocabulary is the reason: `decision` is
+    # shared with the audit views, the filter facet and the page's <option> list
+    # (audit.DECISIONS), which have no compiler between them, and "deferred to a
+    # human" is what `hold` already means. The reason line carries the difference that
+    # matters — nothing is blocked, and the id is how the answer gets collected.
+    why = (f"{tool} on {server}: registered as tool ask {ask.approval_id}"
+           + (" (joined an identical ask already pending)" if ask.joined else "")
+           + " — nothing is blocked; the agent resumes with the id")
+    store._audit("hold", stage="tool-call", client=req.client,
+                 client_class=client_class, reason=why)
+    return {"decision": "ask", "reason": reason, "approval_id": ask.approval_id,
+            # ABSOLUTE, like every other time in a payload here: a remaining-seconds
+            # field would tick, which turns the SSE change-detector into a 1 Hz
+            # emitter and gives the gateway a number that is stale on arrival.
+            "deadline": ask.deadline, "joined": ask.joined}
+
+
+@tool_app.get("/tool/roster")
+def tool_roster() -> list[dict]:
+    """The enabled servers, their auth descriptors, and the standing policy for each
+    one's tools — everything the gateway needs to know what to dial and what to
+    present.
+
+    POLLABLE, unlike the decision above, and that split is deliberate: this answers
+    "what is configured", which the gateway needs at session start and on change, while
+    execution policy is per-call and must never be cached. A `list_changed`
+    notification is what pushes an update into a live session.
+
+    A DISABLED server is simply absent, which is the whole meaning of the switch — the
+    gateway dials what the roster names. It is not reported as disabled, because the
+    gateway has nothing different to do with that fact; the operator's view of it is
+    ``/api/mcp/servers``, on the management listener where configuration belongs.
+
+    Every rule ships, `deny` rows included. Presentation is the gateway's filter
+    (withholding a schema keeps an agent from planning around a capability it cannot
+    have), but the two axes are separate: a `deny` is enforced at EXECUTION by the
+    decision endpoint above regardless of whether the tool was ever presented, because
+    a tool name can arrive from anywhere — a transcript, a `CLAUDE.md`, text injected
+    by an earlier tool result.
+
+    The auth descriptor is here and the secret is not. The descriptor is enough to
+    build a request and useless to steal; the material lives in a file the gateway
+    reads at a path DERIVED from the server name, so nothing in this response — or in
+    the store behind it — can point one server at another's credential."""
+    with store._connect() as conn:
+        servers = conn.execute(
+            "SELECT server, enabled, auth_type, auth_header, auth_template, "
+            "created_at FROM mcp_servers WHERE enabled=1 ORDER BY server").fetchall()
+        rules: dict[str, list[dict]] = {}
+        for row in conn.execute(
+                "SELECT server, tool, action FROM tool_rules ORDER BY server, tool"):
+            rules.setdefault(row["server"], []).append(
+                {"tool": row["tool"], "action": row["action"]})
+    # ``_server_view`` minus ``enabled``: every server here is enabled by definition,
+    # and a constant field invites a reader to believe it varies.
+    return [{"server": r["server"],
+             "auth": {"type": r["auth_type"], "header": r["auth_header"],
+                      "template": r["auth_template"]},
+             "tools": rules.get(r["server"], [])}
+            for r in servers]
+
+
+@tool_app.post("/tool/asks/{approval_id}/claim")
+def tool_claim(approval_id: str, req: ToolResumeRequest) -> JSONResponse:
+    """Take single-use ownership of an approved ask, and hand back what to run.
+
+    This is the resumption path: the agent returns with the id from its pending
+    result, and the gateway executes only after this call succeeds. Executing HERE
+    rather than at the human's click is what makes the stranded-caller property
+    structural — an approved call nobody comes back for simply never runs, so a side
+    effect cannot happen with nobody left to receive it.
+
+    ONE ID, and no listing counterpart. A roster of pending asks would leak approvals
+    the caller never raised — the gateway's agent-facing listener is on a network both
+    sandbox tiers share — and past the leak it hands the agent a read on the
+    operator's queue (DESIGN.md, "One id at a time").
+
+    The response carries the ARGUMENTS, in the canonical form the human read and the
+    digest covers. That is the point of returning them rather than having the gateway
+    replay its own copy: the arguments that execute are necessarily the approved ones,
+    with no second chance for a reformulated payload to ride an old grant.
+
+    An id belonging to a DIFFERENT client is answered as unknown, not as forbidden.
+    Both tiers share `sandbox-net`, so an id that leaked between them must not confirm
+    it exists — and a 404 makes a guessed id and a real one indistinguishable."""
+    ask = holds._get_tool_ask(approval_id)
+    if ask is None or (ask["client"] or None) != (req.client or None):
+        # ``terminal`` is set here too, so the gateway branches on one field for
+        # every refusal below: an id that is unknown to this caller does not become
+        # known by asking again, whatever the reason it is unknown.
+        return JSONResponse(
+            {"ok": False, "detail": "unknown approval", "status": None,
+             "spent": False, "terminal": True},
+            status_code=404)
+    # The claim itself is the atomic conditional UPDATE (`status='allowed' AND
+    # claimed_at IS NULL`), so exactly one resumption of one approval ever performs
+    # the side effect. Attempted BEFORE reporting a status, for the reason
+    # ``_resolve_tool_ask`` orders itself the same way: reading first and then writing
+    # would let two concurrent resumptions both read 'allowed' and both proceed.
+    claimed = holds._claim_tool_ask(approval_id)
+    if claimed is None:
+        current = holds._get_tool_ask(approval_id) or ask
+        # Four different refusals, and the gateway needs them apart: `pending` means
+        # come back later, `denied` and `expired` are terminal and must be
+        # unmistakably so — an agent that cannot tell a refusal from a delay retries
+        # one forever — and an already-claimed approval is spent rather than refused,
+        # which is the answer to a duplicate resumption of a call that already ran.
+        spent = current["status"] == "allowed" and current["claimed_at"] is not None
+        return JSONResponse(
+            {"ok": False,
+             "detail": ("this approval has already been claimed and its call has run"
+                        if spent else
+                        f"not claimable ({current['status']})"),
+             "status": current["status"], "spent": spent,
+             "terminal": spent or current["status"] in ("denied", "expired")},
+            status_code=409)
+
+    # Audited as an ALLOW at the moment capability is actually released, which is here
+    # and not at the click: the resolve row records what a human decided, this one
+    # records that it is being acted on. Two rows for one grant, deliberately — the
+    # gap between them is exactly the window in which an approved call was never run,
+    # and a record with only the first could not show it.
+    store._audit("allow", stage="tool-resume", client=claimed["client"],
+                 reason=f"approved tool ask {approval_id} claimed for execution; "
+                        f"{claimed['tool']} on {claimed['server']} — single-use, this "
+                        f"claim is the only one that can run it")
+    return JSONResponse({"ok": True, "status": claimed["status"],
+                         "server": claimed["server"], "tool": claimed["tool"],
+                         # The canonical string, not re-parsed JSON: it is what the
+                         # digest covers and what was shown, so anything that
+                         # re-serializes it on the way out could hand the gateway a
+                         # payload that differs from the approved one.
+                         "args_json": claimed["args_json"],
+                         "claimed_at": claimed["claimed_at"]})
 
 
 # ── approvals (human-facing) ────────────────────────────────────────────────
@@ -1889,6 +2199,7 @@ async def main() -> None:
     _assert_listeners_separated()
     _bootstrap()
     print(f"control-plane: authorize on {AUTHORIZE_BIND}:{AUTHORIZE_PORT}, "
+          f"tool on {TOOL_BIND}:{TOOL_PORT}, "
           f"management on {MANAGE_BIND}:{MANAGE_PORT}", flush=True)
 
     # The ingest is a plain task on this loop rather than a lifespan hook, for the
@@ -1904,8 +2215,8 @@ async def main() -> None:
               "(CONTROL_AUDIT_DRAIN_INTERVAL=0); locally-decided egress will "
               "appear only in the proxy's own log", flush=True)
 
-    # Two servers sharing one process means sharing one set of signal handlers,
-    # and SIGTERM has to stop BOTH or `docker compose down` waits out the grace
+    # Servers sharing one process means sharing one set of signal handlers,
+    # and SIGTERM has to stop ALL of them or `docker compose down` waits out the grace
     # period and SIGKILLs the governance authority with holds in flight.
     #
     # uvicorn already handles this, and the mechanism is worth naming because it is
@@ -1916,11 +2227,14 @@ async def main() -> None:
     # and the process is gone inside a second. An earlier version of this function
     # added handlers of its own to "fix" the overwrite; they were inert — uvicorn
     # installs via ``signal.signal``, which displaces asyncio's — and removing them
-    # changed nothing, so they are gone rather than kept as insurance.
+    # changed nothing, so they are gone rather than kept as insurance. The chain is
+    # per-server rather than pairwise, so a third listener needs nothing new here.
     servers = [
         uvicorn.Server(uvicorn.Config(
             authorize_app, host=AUTHORIZE_BIND, port=AUTHORIZE_PORT,
             log_level="info")),
+        uvicorn.Server(uvicorn.Config(
+            tool_app, host=TOOL_BIND, port=TOOL_PORT, log_level="info")),
         uvicorn.Server(uvicorn.Config(
             app, host=MANAGE_BIND, port=MANAGE_PORT, log_level="info")),
     ]

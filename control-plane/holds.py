@@ -10,8 +10,8 @@ which are in ``app.py``.
 
 SINGLE PROCESS ONLY. Every dict below is in-memory, so a held ``/authorize`` and
 the ``resolve`` that releases it must share memory; that constraint is what makes
-the two listeners two sockets in one process rather than two services (see the
-``app.py`` module docstring). The Event only WAKES the blocked worker — the
+the listeners separate sockets in one process rather than separate services (see
+the ``app.py`` module docstring). The Event only WAKES the blocked worker — the
 human's decision is read back from the durable approvals row, which is the single
 source of truth.
 

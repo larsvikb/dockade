@@ -123,10 +123,23 @@ class DecideTests(unittest.TestCase):
         self.assertEqual(cp.policy._decide("example.com.", CLASS)[0], "allow")
 
 
-def _set_tool_rules(rules):
-    """Replace the tool_rules table with (server, tool, action) tuples."""
+def _set_tool_rules(rules, servers=()):
+    """Replace the tool_rules table with (server, tool, action) tuples, and register
+    every server they name — plus any in ``servers`` — as ENABLED.
+
+    The registration is part of the fixture rather than a separate call because a rule
+    on an unregistered or disabled server decides nothing (``_decide_tool``), so
+    without it every test below would pass for that reason instead of the one it is
+    about — the vacuous pass this suite exists to avoid. ``servers`` is for the tests
+    whose subject is a server with NO rule on it; the two server-state refusals have
+    their own tests."""
+    named = dict.fromkeys([*(r[0] for r in rules), *servers])
     with cp.store._connect() as conn:
         conn.execute("DELETE FROM tool_rules")
+        conn.execute("DELETE FROM mcp_servers")
+        conn.executemany(
+            "INSERT INTO mcp_servers(server, enabled, auth_type, created_at) "
+            "VALUES (?, 1, 'none', 0)", [(server,) for server in named])
         conn.executemany(
             "INSERT INTO tool_rules(server, tool, action, source, created_at) "
             "VALUES (?,?,?, 'test', 0)", rules)
@@ -142,7 +155,7 @@ class DecideToolTests(unittest.TestCase):
 
     def setUp(self):
         cp.store._init_db()
-        _set_tool_rules([])
+        _set_tool_rules([], servers=["mcp-github"])
 
     def test_an_unconfigured_tool_is_denied_not_held(self):
         # The divergence that matters most. An unmatched HOST is held, because the
@@ -153,6 +166,27 @@ class DecideToolTests(unittest.TestCase):
         decision, reason = cp.policy._decide_tool("mcp-github", "merge_pull_request")
         self.assertEqual(decision, "deny")
         self.assertIn("denied, not held", reason)
+
+    def test_an_unregistered_server_denies_before_any_rule_is_consulted(self):
+        # And says so in its own words rather than borrowing the unconfigured-tool
+        # reason: the operator action is registering a server, not writing a rule.
+        _set_tool_rules([("mcp-github", "get_me", "allow")])
+        decision, reason = cp.policy._decide_tool("mcp-nobody", "get_me")
+        self.assertEqual(decision, "deny")
+        self.assertIn("is registered", reason)
+
+    def test_a_disabled_server_grants_nothing_its_rules_say(self):
+        # The switch means "the gateway will no longer dial this server", and the
+        # authority has to answer accordingly: a gateway that asks anyway — buggy,
+        # racing a just-flipped switch, or compromised — must get a refusal rather
+        # than a grant it is trusted not to act on.
+        _set_tool_rules([("mcp-github", "get_me", "allow")])
+        with cp.store._connect() as conn:
+            conn.execute("UPDATE mcp_servers SET enabled=0 WHERE server='mcp-github'")
+            conn.commit()
+        decision, reason = cp.policy._decide_tool("mcp-github", "get_me")
+        self.assertEqual(decision, "deny")
+        self.assertIn("disabled", reason)
 
     def test_each_action_is_returned_as_itself(self):
         _set_tool_rules([("mcp-github", "get_me", "allow"),

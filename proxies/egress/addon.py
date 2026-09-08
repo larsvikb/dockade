@@ -177,16 +177,18 @@ def _parse_cidrs(env: str, default: str) -> tuple:
             logger.warning("ignoring invalid forbidden CIDR %r", c)
     return tuple(nets)
 
-# Defaults mirror docker-compose.yml. BOTH control networks are listed, and the
-# second one is the one that matters operationally: this proxy is attached to
-# authorize-net (172.29.0.0/24) and NOT to control-net (172.31.0.0/24), so
-# authorize-net is where a relayed connection could actually land. control-net
-# stays listed because a guard that only blocks what is currently routable would
-# quietly stop covering the control plane the moment the topology changes, and
-# because being unroutable is a property of the compose file rather than of this
-# process — this file cannot verify it and should not assume it.
+# Defaults mirror docker-compose.yml. EVERY control network is listed, and
+# authorize-net (172.29.0.0/24) is the one that matters operationally: it is the
+# only one this proxy is attached to, so it is where a relayed connection could
+# actually land. control-net (172.31.0.0/24) and the MCP gateway's bridge
+# (tool-authorize-net, 172.27.0.0/24) stay listed because a guard that only blocks
+# what is currently routable would quietly stop covering the control plane the
+# moment the topology changes, and because being unroutable is a property of the
+# compose file rather than of this process — this file cannot verify it and should
+# not assume it. The gateway's bridge is the one where a relay would be worth most
+# to an attacker: its claim endpoint releases an approved tool call.
 FORBIDDEN_CIDRS = _parse_cidrs(
-    "EGRESS_FORBIDDEN_CIDRS", "172.31.0.0/24,172.29.0.0/24")
+    "EGRESS_FORBIDDEN_CIDRS", "172.31.0.0/24,172.29.0.0/24,172.27.0.0/24")
 FORBIDDEN_HOSTS = _hosts("EGRESS_FORBIDDEN_HOSTS", "control-plane,control-plane-ui")
 
 # Special-use / private ranges that are NEVER a legitimate egress target for the

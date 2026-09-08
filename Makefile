@@ -407,18 +407,20 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	  exit 1
 	fi
 	for launcher in $(LAUNCHERS); do
-	  if grep -qE 'control-(ui-)?net|authorize-net' "$$launcher"; then
+	  if grep -qE 'control-(ui-)?net|(tool-)?authorize-net' "$$launcher"; then
 	    echo "  FAIL: $$launcher references a control-plane network — no sandbox tier"
-	    echo "        may EVER attach to control-net, control-ui-net or authorize-net"
-	    echo "        (the agent must have no route to the control plane, and"
-	    echo "        authorize-net reaches it just as directly as the others)"
+	    echo "        may EVER attach to control-net, control-ui-net, authorize-net"
+	    echo "        or tool-authorize-net (the agent must have no route to the"
+	    echo "        control plane, and both authorize nets reach it just as"
+	    echo "        directly as the others)"
 	    exit 1
 	  fi
 	done
 	# The security-load-bearing nets MUST each be internal: sandbox-net (the
-	# agent's only net), the two control paths — control-net (management) and
-	# authorize-net (the proxy's route to /authorize, which reaches the control
-	# plane just as directly) — and mcp-net, whose internal-ness is what leaves the
+	# agent's only net), the control paths — control-net (management) and the two
+	# enforcer bridges, authorize-net (the proxy's route to /authorize) and
+	# tool-authorize-net (the MCP gateway's), each of which reaches the control
+	# plane just as directly — and mcp-net, whose internal-ness is what leaves the
 	# egress proxy as the only thing an MCP server container can reach, from a
 	# container holding a write-capable credential. Check each BY NAME — a bare count of 'internal:
 	# true' can't tell that the RIGHT nets are the internal ones (a future edit
@@ -428,7 +430,7 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	# appears inside it. tests/test_topology.py asserts the same property from the
 	# other side, along with who is attached to what; this stays because it is the
 	# one that runs in `make consistency` alongside the launcher check above.
-	for net in sandbox-net control-net authorize-net mcp-net; do
+	for net in sandbox-net control-net authorize-net tool-authorize-net mcp-net; do
 	  if ! awk -v net="$$net" '
 	        $$0 ~ "^  " net ":" {inb=1; next}
 	        inb && /^  [A-Za-z]/ {inb=0}
@@ -439,7 +441,7 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	    exit 1
 	  fi
 	done
-	echo "  ok — no launcher attaches the sandbox to a control network; sandbox-net, control-net, authorize-net and mcp-net all internal"
+	echo "  ok — no launcher attaches the sandbox to a control network; sandbox-net, control-net, authorize-net, tool-authorize-net and mcp-net all internal"
 
 # No `##` description, so it stays out of `make help`: it exists for the config-home
 # drift guard above, which needs make's own answer under a modified environment.
@@ -819,7 +821,7 @@ check-boundary: ## Stand the infra up and assert containment from inside a throw
 	$(MAKE) --no-print-directory up
 	SANDBOX_NAME="$(BOUNDARY_SANDBOX)" ./run-claude-sandbox.sh "$(WORKSPACE)" --boundary-check
 
-split-check: ## Assert the running proxy reaches /authorize and NOT the management API
+split-check: ## Assert the running proxy reaches /authorize and NOT the management API or the gateway's bridge
 	# The API-surface split, checked where it actually applies. boundary-check.sh
 	# cannot do this: it runs in the SANDBOX, which has no route to either listener
 	# and gets a relay-guard 403 long before reachability is in question. The claim
@@ -934,6 +936,19 @@ check("172.31.0.2", 8091, "dropped",
       "control-net subnet is unroutable (probing a port that IS listening)")
 check("172.31.0.2", 8090, "dropped",
       "management API unreachable at its own address - no self-approval path")
+
+# The MCP gateway's bridge, probed the same two ways and for a sharper reason: a
+# bypassed relay guard must not reach the CLAIM endpoint, which is the one place
+# the control plane releases an approved tool call. Two enforcers sharing a route
+# is the lateral edge the second bridge exists to prevent, so this is where that
+# claim is measured rather than asserted.
+check("control-plane", 8092, "refused",
+      "tool bridge is not served on the authorize-net address")
+check("172.27.0.2", 8091, "dropped",
+      "tool-authorize-net subnet is unroutable (probing a port that IS listening)")
+check("172.27.0.2", 8092, "dropped",
+      "tool bridge unreachable at its own address - the proxy cannot spend an "
+      "approved ask")
 sys.exit(0 if ok else 1)
 endef
 export SPLIT_CHECK_PY

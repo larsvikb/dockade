@@ -160,7 +160,14 @@ egress** — sandbox-net only. These make good practices cheap and fast. Example
 - `authorize-net` (`internal: true`) — the AUTHORIZE path, one conversation only:
   egress proxy → the control plane's `/authorize` listener. Exists so the proxy
   can ask policy questions without gaining a route to the management API; see
-  "why three control nets" under Governance surfaces. Sandbox not attached.
+  "why the control path is more than one net" under Governance surfaces. Sandbox
+  not attached.
+- `tool-authorize-net` (`internal: true`) — the MCP gateway's authorize path, one
+  conversation only: gateway → the control plane's tool listener (decide a call,
+  read the roster, claim an approved ask). A second bridge rather than a share of
+  `authorize-net`, so a bypassed egress proxy gains no route to the gateway's claim
+  endpoint — the one place an approved side effect is released. Sandbox not
+  attached.
 - `mcp-net` (`internal: true`) — the MCP data path, two conversations only: the
   MCP gateway dialing the server containers, and those containers reaching the
   egress proxy for their own upstream calls. The servers live here and never on
@@ -174,11 +181,13 @@ egress** — sandbox-net only. These make good practices cheap and fast. Example
   attached.
 
 **Status:** every network above is implemented. `sandbox-net` (internal) and
-`egress-net` carry the agent and the sole egress; the two internal control nets
-carry the control path, split by surface. The egress proxy is **quadruple-homed**
+`egress-net` carry the agent and the sole egress; the internal control nets carry
+the control path, split by surface — one shared management path and one
+single-conversation bridge per enforcer. The egress proxy is **quadruple-homed**
 (sandbox-net + egress-net + authorize-net + mcp-net) — note `authorize-net`, not
 `control-net`, and note that the `mcp-net` leg exists only to be DIALED. The
-control-plane **backend** is on both control nets and fully
+control-plane **backend** is **triple-homed**
+(control-net + authorize-net + tool-authorize-net) and fully
 internal (no `sandbox-net`, no `egress-net`, no published port), serving a
 different surface on each; the **control-plane-ui** frontend is on `control-net`
 (to reach the backend) plus `control-ui-net` (host-loopback UI). The sandbox is on
@@ -959,8 +968,8 @@ the sandbox to any control network). In 2a it sat on `control-net`
 (internal) for the proxy control path and on `control-ui-net` for the human UI;
 2b-2 moved `control-ui-net` to the UI frontend, and the API-surface split moved
 the proxy's control path off `control-net` onto `authorize-net`, so the backend
-now spans the two internal control nets and serves a different surface on each
-(see below).
+now spans the internal control nets and serves a different surface on each — one
+more of them since the MCP gateway got a bridge of its own (see below).
 That UI bridge is non-internal **by necessity** — Docker cannot publish a host
 port from a container that is on an internal network alone — but has masquerade
 disabled, so it carries the loopback UI publish without being an egress path.
@@ -969,7 +978,16 @@ own named volume — the crown-jewel state); the management surface reaches the
 host as **loopback only** (`127.0.0.1`, on the port `docker-compose.yml` publishes),
 published since 2b-2 by the UI frontend rather than the backend.
 
-*Design note — why three control nets, and the frontend split.* `control-net` stays
+*Design note — why the control path is more than one net, and the frontend split.*
+There are two kinds of net here and the distinction is what keeps the count from
+being arbitrary: **one shared management path**, plus **one single-conversation
+bridge per enforcer** (`authorize-net` for the egress proxy, `tool-authorize-net`
+for the MCP gateway). An enforcer never joins the shared path, and no two enforcers
+share a bridge — that second rule is the one that costs a net each time, and it buys
+the property that a bypass of one enforcer reaches a policy query and not another
+enforcer's surface.
+
+`control-net` stays
 hard-`internal` because it is the **shared** control path for the whole governed
 data plane (the UI today; git/secrets proxies later), and egress is granted
 **only** by `egress-net` membership — a non-internal `control-net` would silently
@@ -1017,11 +1035,31 @@ port. A wildcard bind would quietly undo the whole thing while every health chec
 stayed green and every page in the UI kept working — which is why `app.py` refuses
 to start on one rather than trusting compose to be right.
 
-**One process, two sockets**, and that is forced rather than chosen: a held
-`/authorize` blocks on a `threading.Event` that `resolve` sets, so the two surfaces
+**One process, several sockets**, and that is forced rather than chosen: a held
+`/authorize` blocks on a `threading.Event` that `resolve` sets, so those two surfaces
 must share memory precisely because they must not share a socket. Splitting them
 into two containers would mean externalising the hold registry, which trades a
 narrow, checkable property for a distributed-state problem.
+
+**The MCP gateway's bridge, `tool-authorize-net`, repeats the shape and does not
+share the net.** It is a third listener in the same process, serving the gateway's
+three questions — decide a tool call, read the roster, claim an approved ask — and
+nothing that grants. `authorize-net` would have done the job for one line of YAML,
+and the reason it is not reused is the design assumption above: the relay guard is
+best-effort, so a bypassed proxy is planned for, and it must not land on the
+gateway's claim endpoint, which is where an approved side effect is released. Two
+enforcers sharing a bridge is the lateral edge the original split bought its way out
+of.
+
+The bind asymmetry between the two bridges is deliberate and worth reading once. The
+authorize listener binds the **wildcard** — it is the safe surface, it answers a
+policy question and nothing more, and the container's healthcheck reaches it over
+loopback. The tool listener binds **one address**, like the management one, because
+its claim endpoint has a side effect to release; `app.py` refuses to start on a
+wildcard there for the same reason it does for management. The consequence of the
+wildcard, stated rather than left to be found: the gateway *can* reach `/authorize`.
+That is accepted on the same grounds that make it safe for the proxy, and the
+direction that mattered — proxy to claim — is the one the bind closes.
 
 Three guards stand where no compiler can: `tests/test_topology.py` reads
 `docker-compose.yml` and asserts who is attached to what (the app cannot see its
@@ -1041,6 +1079,12 @@ assumed. The literal probe hits port **8091 as a positive control**: the authori
 listener binds the wildcard, so it genuinely is listening on `172.31.0.2:8091`, and
 only if *that* is unreachable does the `:8090` result mean the subnet is closed
 rather than one port being shut.
+
+The same pair now runs against the gateway's bridge, and the wildcard that supplies
+the positive control there is the same one: `172.27.0.2:8091` is genuinely listening,
+so a drop on it is what makes the drop on `:8092` mean an unroutable subnet. What is
+being measured is sharper than for the management API — not "no self-approval path"
+but "the proxy cannot spend an approved tool ask".
 
 The probe classifies four outcomes rather than two, because "did not connect" hides
 three different meanings. A **dropped** packet is the one that proves a boundary. A
@@ -2161,10 +2205,12 @@ Four constraints follow, each closing a different hole:
   *dialed*, and the subnet sits inside the private range the relay guard already
   hard-blocks, so the proxy refuses `mcp-net` as a CONNECT target and cannot be
   turned into the agent's way in.
-- **The gateway keeps its own single-conversation bridge to the control plane**, on
-  the `authorize-net` pattern but *not* `authorize-net` itself — sharing that bridge
+- **The gateway keeps its own single-conversation bridge to the control plane** —
+  `tool-authorize-net`, built: on the `authorize-net` pattern but *not*
+  `authorize-net` itself, since sharing that bridge
   would create a lateral edge between two enforcers, which is what the original
-  split bought its way out of (see "why three control nets"). Its agent-facing
+  split bought its way out of (see "why the control path is more than one net", which
+  also has the bind asymmetry between the two bridges). Its agent-facing
   listener binds the `sandbox-net` address only, so it is absent from `mcp-net`:
   otherwise a compromised server container could call the gateway's own tool
   endpoint and drive approved tools laterally.
@@ -2355,10 +2401,11 @@ edit applies to the very next call. But two questions travel this path, and only
 is per-call. **Execution policy must never be cached** — a `deny` set in the UI that
 waits for a TTL is not a deny. The **roster and tool list** are needed at session
 start and on change, so they may be polled, with `notifications/tools/list_changed`
-pushing the update into a live session. Serving the roster read on the narrow
-authorize bridge is a deliberate widening of a surface that answers one endpoint
-today; the criterion that keeps it honest is that a caller reaching that bridge
-still cannot *grant* anything, which is why `resolve` stays off it.
+pushing the update into a live session. The gateway's bridge therefore answers three
+endpoints where the proxy's answers one — decide, roster, claim — and the criterion
+that keeps that width honest is that none of them *grants*: no rule is written there
+and no approval is decided there, which is why `resolve` stays off it and why the
+claim can only release what a human already approved.
 
 **Tool policy gets its own table, not a new scope on `rules`.** The three states are
 the same three (`allow` / `deny` / `ask` against `allow` / `block` / `hold`), and the
@@ -3192,7 +3239,8 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | tool asks: `tool_approvals`, the ask registry, one merged queue, `resolve` split | **done** |
 | — | the tool card — raw payload, per-surface actions | **done** — no schema-driven view; the raw payload is the whole of it |
 | — | timed grants (`leases`) — `allow_lease`, the live-lease strip, revoke | **done** — exact host only; no breadth ladder |
-| — | MCP gateway — per-tool allow/deny/ask | planned (unblocked — names its own bounds) |
+| — | the gateway's bridge — `tool-authorize-net`, third listener, decide/roster/claim | **done** — inert until the gateway exists |
+| — | MCP gateway — per-tool allow/deny/ask | planned (unblocked — its whole control-plane surface is built) |
 
 The rationale for each shipped item lives under **Governance surfaces** above, not here
 — a status line goes stale, the reasoning does not. This section is deliberately the

@@ -530,6 +530,15 @@ def _decide_tool(server: str, tool: str) -> tuple[str, str]:
     immediately, with the agent given a way back to it (DESIGN.md, "An ``ask``
     answers immediately"). This function only says which of the three a call is.
 
+    The SERVER's state is part of the decision, not a separate gate the caller
+    applies afterwards. A rule on a server nobody registered, or on one an operator
+    switched off, decides nothing here — it denies. The disable switch means "the
+    gateway will no longer dial this server" (``edit_mcp_server``), and a gateway that
+    asks anyway must get a refusal from the authority rather than a grant it is
+    trusted not to act on. Two lookups rather than one JOIN, because the REASONS
+    differ and each names a different operator action: an unregistered server needs
+    registering, a disabled one enabling, an unconfigured tool a rule.
+
     Every failure direction is a deny, including a stored action this code does not
     recognize. That last case is not reachable through the API — it validates on
     write — which is exactly why it is handled here: the store is a file on a volume,
@@ -538,6 +547,14 @@ def _decide_tool(server: str, tool: str) -> tuple[str, str]:
     if not server or not tool:
         return "deny", "a tool call needs both a server and a tool name"
     with store._connect() as conn:
+        registered = conn.execute(
+            "SELECT enabled FROM mcp_servers WHERE server = ?", (server,)).fetchone()
+        if registered is None:
+            return "deny", (f"no MCP server named {server!r} is registered, so nothing "
+                            f"about its tools has been decided")
+        if not registered["enabled"]:
+            return "deny", (f"MCP server {server!r} is registered but disabled — its "
+                            f"tool rules do not decide while it is switched off")
         row = conn.execute(
             "SELECT action FROM tool_rules WHERE server = ? AND tool = ?",
             (server, tool)).fetchone()

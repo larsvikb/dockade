@@ -428,8 +428,9 @@ def _bootstrap() -> None:
     # thing: cards only, since nothing blocks on an ask, and a window measured against
     # a human's attention rather than against a proxy's patience.
     print(f"control-plane: tool asks — cards {holds.MAX_TOOL_PENDING} global / "
-          f"{holds.MAX_TOOL_PENDING_PER_CLIENT} per client, window "
-          f"{holds.TOOL_HOLD_TIMEOUT:g}s, payload ceiling {holds.TOOL_ARGS_MAX}B",
+          f"{holds.MAX_TOOL_PENDING_PER_CLIENT} per client, ask window "
+          f"{holds.TOOL_HOLD_TIMEOUT:g}s, grant window "
+          f"{holds.TOOL_GRANT_TIMEOUT:g}s, payload ceiling {holds.TOOL_ARGS_MAX}B",
           flush=True)
     _warn_on_dead_caps()
 
@@ -830,7 +831,17 @@ def tool_claim(approval_id: str, req: ToolResumeRequest) -> JSONResponse:
 
     An id belonging to a DIFFERENT client is answered as unknown, not as forbidden.
     Both tiers share `sandbox-net`, so an id that leaked between them must not confirm
-    it exists — and a 404 makes a guessed id and a real one indistinguishable."""
+    it exists — and a 404 makes a guessed id and a real one indistinguishable.
+
+    POLICY IS RE-READ HERE, and the approval alone is not enough to release the call.
+    An ask is decided at one moment and redeemed at another, and everything the
+    decision rested on can change in between: the server can be disabled — the
+    one-click way to stop it without touching its rules (``revoke_mcp_server``) — or
+    the rule can be revoked or flipped to `deny`. None of those touch `tool_approvals`,
+    so without this check the switch an operator reaches for does not reach the one
+    surface that releases a side effect. Same rule as ``_decide_tool``'s own: a gateway
+    that asks anyway must get a refusal from the authority rather than a grant it is
+    trusted not to act on."""
     ask = holds._get_tool_ask(approval_id)
     if ask is None or (ask["client"] or None) != (req.client or None):
         # ``terminal`` is set here too, so the gateway branches on one field for
@@ -840,6 +851,32 @@ def tool_claim(approval_id: str, req: ToolResumeRequest) -> JSONResponse:
             {"ok": False, "detail": "unknown approval", "status": None,
              "spent": False, "terminal": True},
             status_code=404)
+    # Derived once and used by every row below, for the reason ``tool_authorize``
+    # states: the record has to say which population called. ``ask["client"]`` rather
+    # than ``req.client`` only to read as what it is — the check above holds them
+    # equal, and the stored one is the value the card was raised under.
+    client_class = policy._client_class(ask["client"])
+
+    # Policy BEFORE the claim, so a refusal does not consume the grant: the server may
+    # be switched back on, and the approval is then still there to be redeemed. The
+    # narrow window this leaves — a disable landing between this read and the UPDATE
+    # below — is the same in-flight race a disable always has against a call already
+    # on the wire, and closing it here would only move it.
+    decision, why = policy._decide_tool(ask["server"], ask["tool"])
+    if decision == "deny":
+        store._audit("deny", stage="tool-resume", client=ask["client"],
+                     client_class=client_class,
+                     reason=f"approved tool ask {approval_id} not released: {why} — "
+                            f"the approval stands, the server's state does not")
+        # TERMINAL, though the underlying state is reversible. An agent should not sit
+        # in a retry loop on a policy refusal, and if the operator does switch the
+        # server back on the right move is a fresh ``/tool/authorize`` — a new decision
+        # made in the new circumstances — rather than a grant resurrected under them.
+        return JSONResponse(
+            {"ok": False, "detail": f"not releasable ({why})",
+             "status": ask["status"], "spent": False, "terminal": True},
+            status_code=409)
+
     # The claim itself is the atomic conditional UPDATE (`status='allowed' AND
     # claimed_at IS NULL`), so exactly one resumption of one approval ever performs
     # the side effect. Attempted BEFORE reporting a status, for the reason
@@ -869,6 +906,7 @@ def tool_claim(approval_id: str, req: ToolResumeRequest) -> JSONResponse:
     # gap between them is exactly the window in which an approved call was never run,
     # and a record with only the first could not show it.
     store._audit("allow", stage="tool-resume", client=claimed["client"],
+                 client_class=client_class,
                  reason=f"approved tool ask {approval_id} claimed for execution; "
                         f"{claimed['tool']} on {claimed['server']} — single-use, this "
                         f"claim is the only one that can run it")

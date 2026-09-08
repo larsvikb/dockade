@@ -2583,6 +2583,19 @@ failure that answering immediately was chosen to remove. It also means the agent
 re-sends the payload, so the arguments that execute are necessarily the ones the human
 read.
 
+**An approval is not a standing authorization.** Deferring execution to resumption
+opens a gap between the decision and the side effect, and two things close it, neither
+sufficient alone. The grant gets its **own window** — a second timeout, running from
+the human's answer rather than from the ask, so an approval nobody redeems expires
+instead of staying live for whenever a forgotten session comes back. And the claim
+**re-reads policy** before it releases anything: a server can be disabled or a rule
+revoked in that gap, and none of those touch the approvals table, so without the
+re-read the operator's stop button would reach the decision endpoint and not the one
+surface that releases a side effect. This is why the two bounds in
+`control-plane/holds.py` are separate numbers and why the claim endpoint depends on
+`policy._decide_tool` at all — a claim that trusted its own row would be the
+default-allow this whole path is built to avoid.
+
 **One id at a time, and no roster of pending work.** A lookup scoped to a single
 approval is all resumption needs. Listing what is pending is a different capability and
 is deliberately not offered: the gateway's agent-facing listener binds `sandbox-net`,

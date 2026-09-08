@@ -3585,6 +3585,77 @@ class ToolClaimTests(_ToolBridgeTestCase):
             _claim(ask)
         self.assertEqual(cp.holds._get_tool_ask(ask)["status"], "pending")
 
+    def test_disabling_the_server_stops_a_call_a_human_already_approved(self):
+        # The switch has to reach THIS surface, not only the decision endpoint. It is
+        # the one-click way to stop a server without touching its rules, and it does
+        # not write to `tool_approvals` — so without a policy read here the operator's
+        # stop button leaves every outstanding grant redeemable.
+        ask = self._ask()
+        _resolve(ask, "allow")
+        cp.edit_mcp_server("mcp-github", cp.ServerEditRequest(enabled=False),
+                           _FakeRequest())
+        resp = _claim(ask)
+        self.assertEqual(resp.status_code, 409)
+        self.assertTrue(resp.body["terminal"])
+        self.assertFalse(resp.body["spent"])
+        self.assertIn("disabled", resp.body["detail"])
+
+    def test_revoking_or_denying_the_rule_stops_an_approved_call(self):
+        # The same reasoning one level down: the approval was for a call the policy
+        # then stopped permitting, and an id is not a grant that outlives its rule.
+        # Two shapes of the same operator move. Nothing REPLACES a rule, so flipping
+        # one to `deny` is a revoke followed by a write — both halves land here.
+        def _flip_to_deny(rule_id):
+            cp.revoke_mcp_rule(rule_id, _FakeRequest())
+            _tool_rule("create_pull_request", "deny")
+
+        for undo in (lambda rid: cp.revoke_mcp_rule(rid, _FakeRequest()),
+                     _flip_to_deny):
+            with self.subTest(undo=undo):
+                rule_id = _tool_rule("create_pull_request", "ask").body["id"]
+                ask = _tool_call(tool="create_pull_request",
+                                 args={"title": "x"})["approval_id"]
+                _resolve(ask, "allow")
+                undo(rule_id)
+                self.assertEqual(_claim(ask).status_code, 409)
+
+    def test_a_policy_refusal_leaves_the_grant_to_be_redeemed_later(self):
+        # Checked BEFORE the claim, so a refusal does not consume the approval: the
+        # server can be switched back on, and the human's answer is still there.
+        ask = self._ask()
+        _resolve(ask, "allow")
+        cp.edit_mcp_server("mcp-github", cp.ServerEditRequest(enabled=False),
+                           _FakeRequest())
+        self.assertEqual(_claim(ask).status_code, 409)
+        self.assertIsNone(cp.holds._get_tool_ask(ask)["claimed_at"])
+        _enable()
+        self.assertEqual(_claim(ask).status_code, 200)
+
+    def test_a_call_stopped_by_policy_is_audited_as_a_deny_not_a_release(self):
+        # The record has to distinguish "approved and run" from "approved and
+        # refused at the door" — the second is the interesting one, because it is the
+        # only evidence the operator's switch did anything.
+        ask = self._ask()
+        _resolve(ask, "allow")
+        cp.edit_mcp_server("mcp-github", cp.ServerEditRequest(enabled=False),
+                           _FakeRequest())
+        with mock.patch.object(cp.store, "_audit") as audited:
+            _claim(ask)
+        self.assertEqual(audited.call_args[0][0], "deny")
+        self.assertEqual(audited.call_args[1]["stage"], "tool-resume")
+        self.assertIn(ask, audited.call_args[1]["reason"])
+
+    def test_every_release_row_records_which_population_called(self):
+        # `client_class` is a searchable and grouped audit field, so an operator
+        # filtering by class must not lose the row where capability was actually
+        # released — a tool ask's own row cannot carry the class.
+        ask = self._ask()
+        _resolve(ask, "allow")
+        with mock.patch.object(cp.store, "_audit") as audited:
+            _claim(ask)
+        self.assertEqual(audited.call_args[1]["client_class"],
+                         cp.policy._client_class(CLASS_IP))
+
 
 class _FreshStoreTestCase(unittest.TestCase):
     """Base for tests that need a genuinely empty database rather than the shared one:

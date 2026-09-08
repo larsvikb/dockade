@@ -23,6 +23,7 @@ import threading
 import time
 import unittest
 from typing import ClassVar
+from unittest import mock
 
 # The module reads CONTROL_DB at import time — point it at a throwaway file and
 # suppress seeding (we drive the rules table directly) before loading.
@@ -563,7 +564,8 @@ class _ToolAskTestCase(unittest.TestCase):
     and the saturation account the two surfaces share."""
 
     CAPS: ClassVar[tuple] = ("MAX_TOOL_PENDING", "MAX_TOOL_PENDING_PER_CLIENT",
-                             "TOOL_HOLD_TIMEOUT", "TOOL_ARGS_MAX")
+                             "TOOL_HOLD_TIMEOUT", "TOOL_GRANT_TIMEOUT",
+                             "TOOL_ARGS_MAX")
 
     def setUp(self):
         cp.store._init_db()
@@ -821,6 +823,64 @@ class ToolAskLifecycleTests(_ToolAskTestCase):
                          (ask.approval_id,))
             conn.commit()
         self.assertIsNone(cp.holds._claim_tool_ask(ask.approval_id))
+
+    def test_an_unclaimed_grant_expires_on_its_own_window(self):
+        # The half the ask window does not cover: a click nobody redeemed. Without
+        # this an approval is a STANDING authorization — redeemable by a session the
+        # operator has forgotten, against conditions they would no longer approve.
+        cp.holds.TOOL_GRANT_TIMEOUT = -1
+        ask = self._ask()
+        cp.holds._resolve_tool_ask(ask.approval_id, "allowed", "operator")
+        self.assertEqual(cp.holds._get_tool_ask(ask.approval_id)["status"], "expired")
+        self.assertIsNone(cp.holds._claim_tool_ask(ask.approval_id))
+
+    def test_the_grant_window_runs_from_the_decision_not_from_the_ask(self):
+        # Why it is a second number rather than a reuse of the ask window: an ask
+        # answered a moment before ITS deadline still gets a full window to be
+        # collected in. Sharing the field would give it none.
+        cp.holds.TOOL_HOLD_TIMEOUT = 0.05
+        ask = self._ask()
+        cp.holds._resolve_tool_ask(ask.approval_id, "allowed", "operator")
+        time.sleep(0.1)
+        self.assertIsNotNone(cp.holds._claim_tool_ask(ask.approval_id))
+
+    def test_a_stale_grant_is_refused_by_the_write_not_only_by_the_sweep(self):
+        # Expiry is lazy, so the claim carries the window in its own UPDATE. Asserted
+        # against a row the sweep has deliberately not seen: the predicate is what
+        # makes "a stale grant cannot be redeemed" a property of the write.
+        ask = self._ask()
+        cp.holds._resolve_tool_ask(ask.approval_id, "allowed", "operator")
+        with mock.patch.object(cp.holds, "_expire_tool_asks", return_value=0):
+            cp.holds.TOOL_GRANT_TIMEOUT = -1
+            self.assertIsNone(cp.holds._claim_tool_ask(ask.approval_id))
+        self.assertIsNone(
+            cp.holds._get_tool_ask(ask.approval_id)["claimed_at"])
+
+    def test_a_spent_approval_is_never_relabelled_expired(self):
+        # The distinction a duplicate resumption depends on: `spent` says the call
+        # happened, `expired` says it never will. An aged claimed row must keep saying
+        # the first, however long it sits there.
+        ask = self._ask()
+        cp.holds._resolve_tool_ask(ask.approval_id, "allowed", "operator")
+        self.assertIsNotNone(cp.holds._claim_tool_ask(ask.approval_id))
+        cp.holds.TOOL_GRANT_TIMEOUT = -1
+        cp.holds._expire_tool_asks()
+        row = cp.holds._get_tool_ask(ask.approval_id)
+        self.assertEqual(row["status"], "allowed")
+        self.assertIsNotNone(row["claimed_at"])
+
+    def test_expiring_a_grant_keeps_the_time_the_human_decided(self):
+        # ``resolved_at`` is what the grant cutoff is measured FROM, so the pending
+        # branch's habit of stamping it must not follow the row into this one:
+        # overwriting it would destroy the record and move the deadline it defines.
+        ask = self._ask()
+        cp.holds._resolve_tool_ask(ask.approval_id, "allowed", "operator")
+        decided_at = cp.holds._get_tool_ask(ask.approval_id)["resolved_at"]
+        cp.holds.TOOL_GRANT_TIMEOUT = -1
+        cp.holds._expire_tool_asks()
+        row = cp.holds._get_tool_ask(ask.approval_id)
+        self.assertEqual(row["status"], "expired")
+        self.assertEqual(row["resolved_at"], decided_at)
 
     def test_an_unknown_id_is_none_rather_than_an_error(self):
         self.assertIsNone(cp.holds._get_tool_ask("no-such-id"))

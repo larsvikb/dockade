@@ -60,6 +60,7 @@ def _set_rules(rules):
 def _clear_all():
     with cp.store._connect() as conn:
         conn.execute("DELETE FROM rules")
+        conn.execute("DELETE FROM leases")
         conn.execute("DELETE FROM tool_rules")
         conn.execute("DELETE FROM mcp_servers")
         conn.execute("DELETE FROM approvals")
@@ -2187,6 +2188,327 @@ class RulesViewTests(_CPTestCase):
         self.assertEqual(cp.api_rules(), [])
 
 
+class LeaseGrantTests(_CPTestCase):
+    """``allow_lease`` — the middle rung of the resolve ladder, from the click side.
+
+    ``LeaseDecisionTests`` in ``test_control_plane.py`` covers what a lease MEANS once
+    it is in the table; these cover the write that puts one there, and the two ways it
+    must refuse."""
+
+    @staticmethod
+    def _leases():
+        with cp.store._connect() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT host, client_class, approval_id, expires_at, granted_by "
+                "FROM leases ORDER BY id")]
+
+    def test_a_lease_is_written_and_decides_the_next_request(self):
+        _hold("api.example.com")
+        resp = _resolve("hold-1", "allow_lease")
+        self.assertTrue(resp.args[0]["ok"])
+        self.assertTrue(resp.args[0]["leased"])
+        self.assertEqual(cp.policy._decide("api.example.com", CLASS)[0], "allow")
+
+    def test_a_lease_writes_no_standing_rule(self):
+        # The distinction the whole feature rests on. A lease that quietly wrote a rule
+        # would be `allow_persist` with a confusing name and no expiry anyone could see.
+        _hold("api.example.com")
+        resp = _resolve("hold-1", "allow_lease")
+        self.assertFalse(resp.args[0]["persisted"])
+        self.assertFalse(resp.args[0]["already_present"])
+        self.assertIsNone(resp.args[0]["pattern"])
+        with cp.store._connect() as conn:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM rules").fetchone()[0], 0)
+
+    def test_the_lease_row_carries_the_card_it_was_granted_from(self):
+        # Provenance a rule has no equivalent of, and what makes the trail joinable:
+        # the approvals row says what was asked, this says what the answer granted.
+        _hold("api.example.com", approval_id="card-7")
+        _resolve("card-7", "allow_lease")
+        row = self._leases()[0]
+        self.assertEqual(row["approval_id"], "card-7")
+        self.assertEqual(row["host"], "api.example.com")
+        self.assertEqual(row["client_class"], CLASS)
+
+    def test_the_lease_expires_after_the_configured_duration(self):
+        saved = cp.policy.LEASE_SECONDS
+        cp.policy.LEASE_SECONDS = 300.0
+        try:
+            before = time.time()
+            _hold("api.example.com")
+            resp = _resolve("hold-1", "allow_lease")
+        finally:
+            cp.policy.LEASE_SECONDS = saved
+        expires = resp.args[0]["lease_expires_at"]
+        self.assertGreaterEqual(expires, before + 300.0)
+        self.assertLess(expires, before + 310.0)
+        # The returned deadline IS the stored one — the card reports what was written
+        # rather than adding the duration to its own clock.
+        self.assertEqual(self._leases()[0]["expires_at"], expires)
+
+    def test_the_stored_host_is_normalized_so_it_can_ever_match(self):
+        # A lease is matched by EQUALITY, so this is the difference between a grant and
+        # a row that decides nothing: `_decide` normalizes the requested host, and a
+        # lease stored in any other shape could never equal it.
+        _hold("API.Example.COM.")
+        _resolve("hold-1", "allow_lease")
+        self.assertEqual(self._leases()[0]["host"], "api.example.com")
+        self.assertEqual(cp.policy._decide("api.example.com", CLASS)[0], "allow")
+
+    def test_a_lease_records_who_granted_it(self):
+        # Same provenance discipline as the approvals row and a persisted rule: a grant
+        # that decides future requests has to say who made it.
+        _hold("api.example.com")
+        _resolve("hold-1", "allow_lease", request=_FakeRequest(peer="172.31.0.9"))
+        self.assertIn("peer=172.31.0.9", self._leases()[0]["granted_by"])
+
+    def test_the_durable_row_records_the_lease_mode(self):
+        # Read by the released waiter to write its audit line (`_decision_scope`), so a
+        # mode of 'once' here would report a lease as a one-off in the trail.
+        _hold("api.example.com")
+        _resolve("hold-1", "allow_lease")
+        with cp.store._connect() as conn:
+            row = conn.execute(
+                "SELECT status, mode FROM approvals WHERE id='hold-1'").fetchone()
+        self.assertEqual((row["status"], row["mode"]), ("allowed", "lease"))
+
+    def test_an_unclassified_client_cannot_be_leased_to(self):
+        # Expiry bounds how LONG a grant lasts; it does nothing about WHO it covers, so
+        # a lease needs a class to be scoped to exactly as a rule does.
+        _hold("api.example.com", client_class=None)
+        resp = _resolve("hold-1", "allow_lease")
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(resp.args[0]["ok"])
+        self.assertIn("lease", resp.args[0]["detail"])
+        self.assertEqual(self._leases(), [])
+
+    def test_the_refused_lease_leaves_the_card_decidable(self):
+        # Refused BEFORE the UPDATE, so the operator can still answer with
+        # `allow_once` rather than being stuck with a card that consumed itself.
+        _hold("api.example.com", client_class=None)
+        _resolve("hold-1", "allow_lease")
+        self.assertEqual([a["id"] for a in cp.holds._list_pending()], ["hold-1"])
+        self.assertTrue(_resolve("hold-1", "allow_once").args[0]["ok"])
+
+    def test_there_is_no_deny_lease(self):
+        # An unmatched host is HELD, not denied, so a timed deny would mean "suppress
+        # the card for a while" — a different feature wearing this one's name.
+        self.assertNotIn("deny_lease", cp.EGRESS_ACTIONS)
+        _hold("api.example.com")
+        self.assertEqual(_resolve("hold-1", "deny_lease").status_code, 400)
+
+    def test_a_lease_takes_no_pattern(self):
+        # A lease answers the breadth question by expiring, so there is no candidate
+        # ladder on this path — a pattern in the body is simply not read, and the host
+        # is the exact one from the durable row.
+        _hold("api.example.com")
+        _resolve("hold-1", "allow_lease", pattern=".example.com")
+        self.assertEqual(self._leases()[0]["host"], "api.example.com")
+        self.assertEqual(cp.policy._decide("other.example.com", CLASS)[0], "hold")
+
+    def test_granting_a_lease_sweeps_the_expired_ones(self):
+        # The only place the table grows, so the only place it needs to shrink. Not
+        # what ENDS a lease — `_live_lease` filters on the deadline — just what keeps
+        # the table from accumulating a row per grant forever.
+        now = time.time()
+        with cp.store._connect() as conn:
+            conn.execute(
+                "INSERT INTO leases(host, client_class, approval_id, created_at, "
+                "expires_at, granted_by) VALUES ('old.example.com', ?, 'x', ?, ?, 'y')",
+                (CLASS, now - 100, now - 1))
+            conn.commit()
+        _hold("api.example.com")
+        _resolve("hold-1", "allow_lease")
+        self.assertEqual([r["host"] for r in self._leases()], ["api.example.com"])
+
+    def test_an_expired_card_does_not_leave_a_live_lease_behind(self):
+        # The race the `updated` guard closes. The waiter's timeout and this call race
+        # for one conditional UPDATE; if the lease were written outside that guard —
+        # where the persist path does its VALIDATION — a card that expired and
+        # default-denied would still have granted half an hour of egress.
+        _hold("api.example.com")
+        with cp.store._connect() as conn:
+            conn.execute(
+                "UPDATE approvals SET status='expired' WHERE id='hold-1'")
+            conn.commit()
+        resp = _resolve("hold-1", "allow_lease")
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(self._leases(), [])
+        self.assertEqual(cp.policy._decide("api.example.com", CLASS)[0], "hold")
+
+    def test_a_lease_wakes_the_blocked_waiter(self):
+        saved = cp.holds.HOLD_TIMEOUT
+        cp.holds.HOLD_TIMEOUT = 5
+        try:
+            result = {}
+
+            def worker():
+                result["resp"] = cp.authorize(_auth_req("leased.com",
+                                                        client=CLASS_IP))
+
+            t = threading.Thread(target=worker)
+            t.start()
+            deadline = time.monotonic() + 5
+            approval_id = None
+            while time.monotonic() < deadline and approval_id is None:
+                pending = cp.holds._list_pending()
+                approval_id = pending[0]["id"] if pending else None
+                time.sleep(0.01)
+            self.assertIsNotNone(approval_id, "approval never became pending")
+            _resolve(approval_id, "allow_lease")
+            t.join(2)
+        finally:
+            cp.holds.HOLD_TIMEOUT = saved
+        self.assertFalse(t.is_alive())
+        self.assertEqual(result["resp"].decision, "allow")
+        # And the NEXT request needs no card at all, which is the point of the rung.
+        self.assertEqual(cp.authorize(_auth_req("leased.com")).decision, "allow")
+
+
+class LeaseCardTests(_CPTestCase):
+    """What a pending card says about the lease button before it is clicked."""
+
+    def test_a_classified_card_offers_both_grants(self):
+        _hold("api.example.com")
+        card = cp.holds._list_pending()[0]
+        self.assertTrue(card["leasable"])
+        self.assertTrue(card["persistable"])
+
+    def test_an_unclassified_card_offers_neither(self):
+        # One condition, two fields (`holds._classified`): the card must not end up
+        # offering one button the backend will refuse while disabling the other.
+        _hold("api.example.com", client_class=None)
+        card = cp.holds._list_pending()[0]
+        self.assertFalse(card["leasable"])
+        self.assertFalse(card["persistable"])
+
+    def test_a_card_carries_no_lease_options(self):
+        # Nothing per-approval for the operator to choose — the host is the requested
+        # one and the duration is the same for every card — which is why the lease
+        # button is one click where a persist is two.
+        _hold("api.example.com")
+        card = cp.holds._list_pending()[0]
+        self.assertNotIn("lease_options", card)
+        self.assertIn("persist_options", card)
+
+
+class LeaseViewTests(_CPTestCase):
+    """``/api/egress/leases`` — "what am I allowing right now", which is a different
+    question from the one the rules view answers and is why it is a different endpoint.
+    """
+
+    def _insert(self, host, offset, client_class=CLASS):
+        now = time.time()
+        with cp.store._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO leases(host, client_class, approval_id, created_at, "
+                "expires_at, granted_by) VALUES (?,?, 'card', ?, ?, 'someone')",
+                (host, client_class, now, now + offset))
+            conn.commit()
+            return cur.lastrowid
+
+    def test_a_live_lease_is_listed(self):
+        self._insert("api.example.com", 300)
+        rows = cp.api_leases()
+        self.assertEqual([r["host"] for r in rows], ["api.example.com"])
+        self.assertEqual(rows[0]["client_class"], CLASS)
+        self.assertEqual(rows[0]["granted_by"], "someone")
+
+    def test_an_expired_lease_is_not_listed(self):
+        # An expired lease is not policy, so listing it would put something in the
+        # operator's "what is granted" view that grants nothing.
+        self._insert("gone.example.com", -1)
+        self.assertEqual(cp.api_leases(), [])
+
+    def test_the_deadline_is_absolute_not_a_remaining_count(self):
+        # A remaining-seconds field would change on every tick, which is what makes the
+        # page's four-second poll a firehose and its countdown unable to run between
+        # polls. The client does the arithmetic.
+        self._insert("api.example.com", 300)
+        row = cp.api_leases()[0]
+        self.assertIn("expires_at", row)
+        self.assertNotIn("remaining", row)
+        self.assertGreater(row["expires_at"], time.time())
+
+    def test_the_soonest_to_expire_comes_first(self):
+        self._insert("later.example.com", 900)
+        self._insert("sooner.example.com", 60)
+        self.assertEqual([r["host"] for r in cp.api_leases()],
+                         ["sooner.example.com", "later.example.com"])
+
+
+class LeaseRevokeTests(_CPTestCase):
+    """Revocation is what makes the configured duration an ergonomics number rather
+    than a safety floor — without it a lease can only be waited out, and the default
+    could not have been half an hour."""
+
+    def _insert(self, host, offset, client_class=CLASS):
+        now = time.time()
+        with cp.store._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO leases(host, client_class, approval_id, created_at, "
+                "expires_at, granted_by) VALUES (?,?, 'card', ?, ?, 'someone')",
+                (host, client_class, now, now + offset))
+            conn.commit()
+            return cur.lastrowid
+
+    def test_revoking_stops_the_lease_deciding_requests(self):
+        lease_id = self._insert("api.example.com", 900)
+        self.assertEqual(cp.policy._decide("api.example.com", CLASS)[0], "allow")
+        resp = cp.revoke_lease(lease_id, _FakeRequest())
+        self.assertTrue(resp.args[0]["ok"])
+        self.assertTrue(resp.args[0]["was_live"])
+        self.assertEqual(cp.policy._decide("api.example.com", CLASS)[0], "hold")
+
+    def test_the_row_is_deleted_rather_than_tombstoned(self):
+        # This table is transient by construction, so a dead row would be the only
+        # long-lived thing in it and every reader would have to filter for it.
+        lease_id = self._insert("api.example.com", 900)
+        cp.revoke_lease(lease_id, _FakeRequest())
+        with cp.store._connect() as conn:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM leases").fetchone()[0], 0)
+
+    def test_revocation_is_audited_with_provenance_and_what_it_reverts_to(self):
+        lease_id = self._insert("api.example.com", 900)
+        with mock.patch.object(cp.store, "_audit") as audit:
+            cp.revoke_lease(lease_id, _FakeRequest(peer="172.31.0.9"))
+        self.assertEqual(audit.call_args.args[0], "revoke")
+        kwargs = audit.call_args.kwargs
+        self.assertEqual(kwargs["host"], "api.example.com")
+        self.assertEqual(kwargs["client_class"], CLASS)
+        self.assertIn("peer=172.31.0.9", kwargs["reason"])
+        # Held, not denied — the same distinction a rule revocation records, and only
+        # the reason line carries it. And how much time was cut short, which is the
+        # part a rule revocation has no equivalent of.
+        self.assertIn("held for approval", kwargs["reason"])
+        self.assertRegex(kwargs["reason"], r"\d+m\d\ds left")
+
+    def test_revoking_an_already_expired_lease_says_so_rather_than_refusing(self):
+        # A refusal would look like a bug. The honest answer — it had already ended,
+        # and now the row is gone too — is both true and what was being asked for.
+        lease_id = self._insert("gone.example.com", -5)
+        with mock.patch.object(cp.store, "_audit") as audit:
+            resp = cp.revoke_lease(lease_id, _FakeRequest())
+        self.assertTrue(resp.args[0]["ok"])
+        self.assertFalse(resp.args[0]["was_live"])
+        self.assertIn("already stopped deciding",
+                      audit.call_args.kwargs["reason"])
+
+    def test_an_unknown_id_is_a_404_not_a_silent_success(self):
+        resp = cp.revoke_lease(999999, _FakeRequest())
+        self.assertEqual(resp.status_code, 404)
+        self.assertFalse(resp.args[0]["ok"])
+
+    def test_revoking_one_lease_leaves_the_others(self):
+        keep = self._insert("keep.example.com", 900)
+        drop = self._insert("drop.example.com", 900)
+        cp.revoke_lease(drop, _FakeRequest())
+        self.assertEqual([r["host"] for r in cp.api_leases()], ["keep.example.com"])
+        self.assertTrue(keep)
+
+
 class ConfigViewTests(_CPTestCase):
     """``/api/config`` exists so a pending card can show a COUNTDOWN. Without it the
     UI would have to hardcode the hold window, and a card that cannot say how long is
@@ -2205,6 +2527,20 @@ class ConfigViewTests(_CPTestCase):
         finally:
             cp.holds.HOLD_TIMEOUT = saved
 
+    def test_config_reports_the_lease_duration(self):
+        # Served so the lease BUTTON can label itself. A page that spelled the number
+        # into its own markup would keep saying it on a store configured differently,
+        # which is why the action is `allow_lease` and not `allow_30m`.
+        self.assertEqual(cp.api_config()["lease_seconds"], cp.policy.LEASE_SECONDS)
+
+    def test_config_follows_the_operator_lease_setting_too(self):
+        saved = cp.policy.LEASE_SECONDS
+        cp.policy.LEASE_SECONDS = 300.0
+        try:
+            self.assertEqual(cp.api_config()["lease_seconds"], 300.0)
+        finally:
+            cp.policy.LEASE_SECONDS = saved
+
     def test_config_reports_the_classes_a_rule_can_be_scoped_to(self):
         self.assertEqual(cp.api_config()["client_classes"],
                          list(cp.policy._class_names()))
@@ -2220,7 +2556,8 @@ class ConfigViewTests(_CPTestCase):
         # egress: whatever gets added here has to stay harmless to publish. The class
         # names pass that test — they are network LABELS, and the CIDRs behind them
         # stay here.
-        self.assertEqual(set(cp.api_config()), {"hold_timeout", "client_classes"})
+        self.assertEqual(set(cp.api_config()),
+                         {"hold_timeout", "lease_seconds", "client_classes"})
 
 
 class SaturationTests(_CPTestCase):
@@ -2899,6 +3236,34 @@ class FreshSchemaTests(_FreshStoreTestCase):
         self.assertEqual(cols, {"id", "server", "tool", "action", "source",
                                 "created_at"})
 
+    def test_new_store_has_the_leases_table(self):
+        # An EXACT set, like the two below it. What the exactness asserts here is that
+        # no `pattern` or `action` column has crept in: a lease matches one host by
+        # equality and only ever allows, and either column would be an invitation to
+        # give the timed path a breadth ladder or a timed deny.
+        self._use_store("fresh-leases.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(leases)")}
+        self.assertEqual(cols, {"id", "host", "client_class", "approval_id",
+                                "created_at", "expires_at", "granted_by"})
+
+    def test_a_fresh_store_lets_two_leases_hold_the_same_host(self):
+        # The absent UNIQUE, asserted rather than assumed. Unreachable through the API
+        # — a live lease decides the request, so no card is raised to grant a second
+        # from — and the schema says so by not constraining it, which is what keeps a
+        # future insert path from having to choose between ignoring and extending.
+        self._use_store("fresh-leases-unique.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            for _ in range(2):
+                conn.execute(
+                    "INSERT INTO leases(host, client_class, approval_id, created_at, "
+                    "expires_at, granted_by) VALUES ('x.example','a','c',0,1,'t')")
+            conn.commit()
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM leases").fetchone()[0], 2)
+
     def test_new_store_has_the_tool_approvals_table(self):
         self._use_store("fresh-tool-approvals.db")
         cp.store._init_db()
@@ -3312,6 +3677,39 @@ class SchemaVersionTests(_FreshStoreTestCase):
         self.assertEqual(self._version(), 0)
         with cp.store._connect() as conn:
             self.assertNotIn("half_applied", cp.store._columns(conn, "rules"))
+
+    def test_an_old_store_gains_the_leases_table(self):
+        # Step 2 is the cheapest shape a step has — a new table — but it still has to
+        # RUN on the stores already in the field. Without it, `resolve` would 500 on
+        # every lease and `_decide` on every request, on exactly the deployments that
+        # have been governing egress the longest.
+        self._old_store("version-leases.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(leases)")}
+        self.assertEqual(cols, {"id", "host", "client_class", "approval_id",
+                                "created_at", "expires_at", "granted_by"})
+        # And the rules the earlier step migrated are untouched by it.
+        with cp.store._connect() as conn:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM rules").fetchone()[0], 1)
+
+    def test_a_migrated_and_a_fresh_store_agree_on_the_leases_table(self):
+        # The v1 rules rebuild kept two near-copies of its DDL and needed a test to
+        # hold them equal; this table shares ONE string (`store._LEASES_DDL`), so what
+        # is asserted is that both paths really use it rather than that two copies
+        # match.
+        self._old_store("agree-migrated.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            migrated = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name='leases'").fetchone()[0]
+        self._use_store("agree-fresh.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            fresh = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name='leases'").fetchone()[0]
+        self.assertEqual(migrated, fresh)
 
     def test_the_steps_are_contiguous_and_end_at_the_declared_version(self):
         # ``SCHEMA_VERSION`` and ``_STEPS`` are two halves of one fact, and only this

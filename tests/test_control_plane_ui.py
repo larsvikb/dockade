@@ -302,7 +302,11 @@ class RelayAllowlistTests(unittest.TestCase):
                              # requests with no hold and no click) and the other takes a
                              # grant back.
                              ("api/egress/rules", "POST"),
-                             ("api/egress/rules/12/revoke", "POST")):
+                             ("api/egress/rules/12/revoke", "POST"),
+                             # The timed grants. Read, and taken back — see below for
+                             # the collection POST that is deliberately absent.
+                             ("api/egress/leases", "GET"),
+                             ("api/egress/leases/12/revoke", "POST")):
             self._proxy(path, method)
             self.assertEqual(urlsplit(_sent["url"]).netloc, "control-plane:8090",
                              f"{method} {path} must relay")
@@ -332,6 +336,20 @@ class RelayAllowlistTests(unittest.TestCase):
                              # relayed except the one revoke path spelled out below.
                              ("api/egress/rules/", "POST"),
                              ("api/egress/rules/12", "POST"),
+                             # The leases COLLECTION takes no POST, and that absence is
+                             # a decision rather than an oversight: a lease is only ever
+                             # created by resolving a card, because a timed grant with no
+                             # request behind it is just a standing rule somebody will
+                             # forget they wrote. The same anchoring and the same
+                             # id bound as the rules paths, asserted the same way.
+                             ("api/egress/leases", "POST"),
+                             ("api/egress/leases/", "POST"),
+                             ("api/egress/leases/12", "POST"),
+                             ("api/egress/leases/../revoke", "POST"),
+                             ("api/egress/leases/1.2/revoke", "POST"),
+                             ("api/egress/leases/abc/revoke", "POST"),
+                             ("api/egress/leases//revoke", "POST"),
+                             ("api/egress/leases/12/revoke", "GET"),
                              # The audit views are reads, and each is its OWN entry:
                              # anchoring `^/api/audit` without the `$` would relay
                              # every future path under that prefix sight unseen,

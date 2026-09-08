@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Control-plane storage — the SQLite store, and the writes every path shares.
 
-This is the crown-jewel state: the policy rules that decide egress, the per-tool
-rules that decide the MCP gateway's surface, the audit trail those decisions are
-written to, the durable approvals rows that are the single source of truth for a
-hold's outcome, and the ingest cursor. Everything else in this service reads and
-writes through here.
+This is the crown-jewel state: the policy rules that decide egress, the timed
+leases that decide it for a while, the per-tool rules that decide the MCP
+gateway's surface, the audit trail those decisions are written to, the durable
+approvals rows that are the single source of truth for a hold's outcome, and the
+ingest cursor. Everything else in this service reads and writes through here.
 
 Bottom of the dependency order: this module imports no other module of the
 control plane, so the schema and its migration constraint (the NOTE below
@@ -47,7 +47,7 @@ LEGACY_CLIENT_CLASS = "sandbox"
 # The schema this code expects. Every entry in ``_STEPS`` below adds exactly one,
 # and a store records the version it is at (see ``_migrate``), so "what has already
 # run here" is a number to compare rather than a schema to interrogate.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _connect() -> sqlite3.Connection:
@@ -133,6 +133,65 @@ def _step_1_client_class(conn: sqlite3.Connection) -> None:
                   f"keep NULL — they predate client classes)", flush=True)
 
 
+# The TIMED GRANTS: an `allow_lease` decision, which allows one host for one client
+# class until it expires. A third grant duration between `*_once` (this request) and
+# `*_persist` (standing policy) — see DESIGN.md, "A lease is the third grant duration".
+#
+# ONE definition, shared by the v2 step and the fresh-store DDL, where the v1 rules
+# rebuild deliberately kept two near-copies. The difference is that this is a NEW
+# table: there is no constraint to change, so the step has no temporary table to
+# parameterize a shared string by, which was the whole reason `_step_1_client_class`
+# could not share one. Sharing here makes the divergence a test had to catch there
+# impossible instead.
+_LEASES_DDL = """
+    CREATE TABLE IF NOT EXISTS leases (
+        id           INTEGER PRIMARY KEY,
+        -- ONE exact host, in `policy._normalize_host` form, matched by EQUALITY.
+        -- Deliberately not a `pattern`: the breadth ladder on `rules` exists because
+        -- a standing rule needs an operator choice about how wide it is, and a lease
+        -- answers that question by expiring instead. So there is no leading-dot
+        -- wildcard here and `policy._match` is not used on this column.
+        host         TEXT NOT NULL,
+        -- WHICH client population this grant covers, exactly as on `rules` and for
+        -- the same reason. NOT NULL with no default: `resolve` refuses to lease for an
+        -- unclassified client, so a row with no class cannot be written, and the
+        -- constraint says so rather than leaving a fallback nobody meant.
+        client_class TEXT NOT NULL,
+        -- The card this was granted from. Provenance a rule has no equivalent of, and
+        -- it is what makes the trail joinable end to end: the approvals row says what
+        -- was asked and who answered, this says what the answer granted, and the audit
+        -- rows say what rode it.
+        approval_id  TEXT NOT NULL,
+        created_at   REAL NOT NULL,
+        expires_at   REAL NOT NULL,
+        granted_by   TEXT NOT NULL   -- provenance of the resolver (app._actor)
+        -- NO UNIQUE constraint, and that is a consequence rather than an omission. A
+        -- second lease for a host already covered by a live one is UNREACHABLE: the
+        -- live lease would have decided the request in `policy._decide`, so no card
+        -- would have been raised to grant from. Every row that can be written is
+        -- therefore a genuinely new grant, and a constraint would only force a choice
+        -- between ignoring and extending that nothing can ever make.
+    )"""
+
+
+def _step_2_leases(conn: sqlite3.Connection) -> None:
+    """v2 — timed grants get their own table (``_LEASES_DDL``).
+
+    The cheapest shape a step can have: a new table, so nothing existing is read,
+    rewritten or constrained differently, and a store that has never leased anything
+    is fully migrated by creating it empty. Contrast ``_step_1_client_class``, which
+    had to rebuild the crown-jewel rules table to change a constraint.
+
+    A separate table rather than an ``expires_at`` column on ``rules``, because the
+    rows are a different KIND — the same test that gave tool policy its own table
+    (DESIGN.md). The consequence that decided it: every existing reader of ``rules``
+    is a reader of standing policy, and a nullable expiry on it would mean the rules
+    view, the conflict check in ``resolve``, ``revoke_rule``, the edit path and
+    ``policy._decide`` each had to learn "except the expired ones" — five places to
+    drift instead of one new pass."""
+    conn.execute(_LEASES_DDL)
+
+
 # Ordered, and the order is the only thing that decides what runs: a step is applied
 # when its version exceeds the store's, so steps must be APPEND-ONLY and never
 # renumbered, reordered or edited once shipped — a store in the field has already run
@@ -140,6 +199,7 @@ def _step_1_client_class(conn: sqlite3.Connection) -> None:
 # the label being what the operator sees in the log.
 _STEPS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = (
     (1, "per-client-class policy", _step_1_client_class),
+    (2, "timed grants (leases)", _step_2_leases),
 )
 
 
@@ -319,12 +379,21 @@ def _init_db() -> None:
                 method      TEXT,
                 url         TEXT,
                 status      TEXT NOT NULL,    -- pending | allowed | denied | expired
-                mode        TEXT,             -- once | persist
+                -- How far the decision REACHED: this request, a timed lease, or
+                -- standing policy. A plain TEXT column, which is why the lease needed
+                -- no step of its own here — a third value costs nothing where a third
+                -- column would have cost a migration.
+                mode        TEXT,             -- once | lease | persist
                 resolved_at REAL,
                 resolved_by TEXT              -- provenance of the resolver (_actor)
             )""")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS approvals_status ON approvals(status)")
+        # Timed grants. No index: `policy._decide` reads this table only when no rule
+        # decided the request, and it holds at most a handful of rows — one per live
+        # lease, swept on the grant path (see the lease branch in `resolve`). An index
+        # on a table that small buys nothing and would be one more thing to keep true.
+        conn.execute(_LEASES_DDL)
         # The tool surface's approvals, which split from the table above for the
         # reason the rules did: the rows are egress-shaped there — host, port, proto,
         # method, url — against a server, a tool and a payload here (DESIGN.md,

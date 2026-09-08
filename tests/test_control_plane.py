@@ -51,6 +51,26 @@ def _set_rules(rules):
         conn.commit()
 
 
+def _set_leases(leases):
+    """Replace the leases table with (host, seconds_from_now) or
+    (host, seconds_from_now, class) tuples.
+
+    The offset is RELATIVE and applied here, so a test says "expired 5 seconds ago"
+    (-5) or "half an hour left" (1800) rather than computing an absolute instant — the
+    thing under test is the boundary, and an absolute timestamp in the fixture puts
+    arithmetic on both sides of it."""
+    now = time.time()
+    with cp.store._connect() as conn:
+        conn.execute("DELETE FROM leases")
+        conn.executemany(
+            "INSERT INTO leases(host, client_class, approval_id, created_at, "
+            "expires_at, granted_by) VALUES (?,?, 'test-approval', ?, ?, 'test')",
+            [(host, cls, now, now + offset)
+             for host, offset, cls in
+             [(le if len(le) == 3 else (*le, CLASS)) for le in leases]])
+        conn.commit()
+
+
 class DecideTests(unittest.TestCase):
     def setUp(self):
         cp.store._init_db()
@@ -196,6 +216,141 @@ class DecideToolTests(unittest.TestCase):
         # consistent no-op rather than a silent downgrade to deny.
         _set_tool_rules([("mcp-github", "get_me", "allow")])
         self.assertEqual(cp.policy._decide_tool("mcp-github ", " get_me")[0], "allow")
+
+
+class LeaseDecisionTests(unittest.TestCase):
+    """``_decide``'s third pass: a lease is an allow that expires.
+
+    Every test here is a property the ORDER of the three passes is responsible for, or
+    a way the equality match on ``host`` can be got wrong. The expiry boundary and the
+    block-beats-lease case are the two that matter most — the first is the whole
+    feature, and the second is the invariant that keeps a timed grant from being a way
+    around policy an operator wrote down."""
+
+    def setUp(self):
+        cp.store._init_db()
+        _set_rules([])
+        _set_leases([])
+
+    def test_a_live_lease_allows_a_host_no_rule_matches(self):
+        _set_leases([("api.example.com", 300)])
+        self.assertEqual(cp.policy._decide("api.example.com", CLASS)[0], "allow")
+
+    def test_an_expired_lease_holds_rather_than_allowing(self):
+        # The boundary in the direction that matters. A lease one second past its
+        # deadline must decide NOTHING — if this passes only because the row was
+        # deleted, the sweep has become load-bearing, which is exactly what
+        # `_live_lease` filtering on the deadline exists to prevent.
+        _set_leases([("api.example.com", -1)])
+        self.assertEqual(cp.policy._decide("api.example.com", CLASS)[0], "hold")
+
+    def test_an_expired_lease_is_still_in_the_table(self):
+        # States the above properly: the row is present and inert, not absent. Written
+        # as its own test because a future sweeper that deleted eagerly would make the
+        # previous test pass for the wrong reason and nothing would say so.
+        _set_leases([("api.example.com", -1)])
+        cp.policy._decide("api.example.com", CLASS)
+        with cp.store._connect() as conn:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM leases").fetchone()[0], 1)
+
+    def test_a_block_beats_a_live_lease(self):
+        # THE invariant. The block pass runs first, so a lease cannot reach a host an
+        # operator has blocked — reachable in practice only by blocking a host while a
+        # lease for it is already live.
+        _set_rules([("api.example.com", "block")])
+        _set_leases([("api.example.com", 300)])
+        decision, reason = cp.policy._decide("api.example.com", CLASS)
+        self.assertEqual(decision, "deny")
+        self.assertIn("blocked by rule", reason)
+
+    def test_a_wildcard_block_beats_a_lease_under_it(self):
+        # The same property where the block does not name the leased host, which is the
+        # shape a lease could plausibly slip past: the block matches by pattern and the
+        # lease by equality, so nothing about the two strings is comparable.
+        _set_rules([(".example.com", "block")])
+        _set_leases([("api.example.com", 300)])
+        self.assertEqual(cp.policy._decide("api.example.com", CLASS)[0], "deny")
+
+    def test_a_standing_allow_is_the_reason_when_both_match(self):
+        # Both grant, so the DECISION cannot differ; what the ordering settles is which
+        # one the audit trail records, and the standing rule is the more useful answer
+        # to "why was this allowed".
+        _set_rules([("api.example.com", "allow")])
+        _set_leases([("api.example.com", 300)])
+        decision, reason = cp.policy._decide("api.example.com", CLASS)
+        self.assertEqual(decision, "allow")
+        self.assertIn("allowed by rule", reason)
+
+    def test_the_reason_names_the_remaining_time(self):
+        # In the reason because the alternative is a trail showing one human approval
+        # followed by traffic with no recorded cause.
+        _set_leases([("api.example.com", 125)])
+        reason = cp.policy._decide("api.example.com", CLASS)[1]
+        self.assertIn("allowed by lease", reason)
+        self.assertIn("api.example.com", reason)
+        self.assertIn(CLASS, reason)
+        # 2m04s or 2m05s depending on where the clock fell between the two calls.
+        self.assertRegex(reason, r"2m0[45]s left")
+
+    def test_a_lease_decides_only_for_its_own_class(self):
+        _set_leases([("api.example.com", 300, "sandbox")])
+        self.assertEqual(cp.policy._decide("api.example.com", "sandbox")[0], "allow")
+        self.assertEqual(cp.policy._decide("api.example.com", "mcp")[0], "hold")
+
+    def test_a_lease_does_not_cover_a_subdomain(self):
+        # The exact-host property, and the reason there is no breadth ladder on the
+        # lease path: `_match`'s leading-dot wildcard is never applied to this column,
+        # so a lease for a host grants that host and nothing under or over it.
+        _set_leases([("example.com", 300)])
+        self.assertEqual(cp.policy._decide("example.com", CLASS)[0], "allow")
+        self.assertEqual(cp.policy._decide("api.example.com", CLASS)[0], "hold")
+
+    def test_a_leading_dot_lease_is_not_read_as_a_wildcard(self):
+        # A host is agent-chosen, so `.example.com` can arrive as one. It is stored and
+        # matched verbatim: it grants the odd literal name it is and NOT the subtree a
+        # rule with the same spelling would.
+        _set_leases([(".example.com", 300)])
+        self.assertEqual(cp.policy._decide("api.example.com", CLASS)[0], "hold")
+        self.assertEqual(cp.policy._decide("example.com", CLASS)[0], "hold")
+
+    def test_the_host_match_is_case_and_fqdn_dot_insensitive(self):
+        # `_normalize_host` is what makes this true on both sides. Without it a lease
+        # stored from `API.Example.com.` would be a grant no request could ever equal.
+        _set_leases([(cp.policy._normalize_host("API.Example.com."), 300)])
+        self.assertEqual(cp.policy._decide("api.example.com", CLASS)[0], "allow")
+        self.assertEqual(cp.policy._decide("API.EXAMPLE.COM.", CLASS)[0], "allow")
+
+    def test_extracting_the_normalizer_did_not_loosen_the_matcher(self):
+        # `_decide` used to inline `(host or "").lower().rstrip(".")`; the lease path
+        # needs the identical shape, so it became `_normalize_host`. This asserts the
+        # extraction changed NOTHING — in particular that no `strip()` came along,
+        # which would make a padded host match an allow rule it currently misses.
+        _set_rules([("example.com", "allow"), ("evil.com", "block")])
+        for host in (" example.com", "example.com ", "\texample.com"):
+            self.assertEqual(cp.policy._decide(host, CLASS)[0], "hold", host)
+        # And the fail-safe direction on a block: still held, never allowed.
+        self.assertEqual(cp.policy._decide(" evil.com", CLASS)[0], "hold")
+        # What it DOES normalize, unchanged: case and the trailing FQDN dot.
+        self.assertEqual(cp.policy._decide("EXAMPLE.com.", CLASS)[0], "allow")
+
+    def test_a_padded_lease_host_still_matches_itself(self):
+        # The consequence of leaving whitespace alone, stated rather than left to be
+        # discovered: a lease is stored in the same shape `_decide` computes, so even
+        # the odd padded host equals itself. Unreachable in practice — mitmproxy will
+        # not hand over a CONNECT authority with a space in it — and defined anyway,
+        # because "matched by equality" is only safe if both sides agree exactly.
+        _set_leases([(" api.example.com", 300)])
+        self.assertEqual(cp.policy._decide(" api.example.com", CLASS)[0], "allow")
+        self.assertEqual(cp.policy._decide("api.example.com", CLASS)[0], "hold")
+
+    def test_the_longest_lived_lease_is_the_one_reported(self):
+        # Unreachable through the API (a live lease decides the request, so no card is
+        # raised to grant a second from), which is why the answer is DEFINED here rather
+        # than left to whichever row SQLite returned first.
+        _set_leases([("api.example.com", 60), ("api.example.com", 900)])
+        reason = cp.policy._decide("api.example.com", CLASS)[1]
+        self.assertRegex(reason, r"1[45]m\d\ds left")
 
 
 class ClientClassDecisionTests(unittest.TestCase):

@@ -68,6 +68,8 @@ const missing = ["lampState", "backoffDelay", "diffPending", "shouldSweep",
                  "normalizePattern", "createPreview", "editPreview",
                  "saturationState", "ackCount", "capScope", "requestsLabel",
                  "auditRow", "auditStatus", "rulesStatus", "repeatCount",
+                 "leaseLabel", "leaseRemaining", "leaseCountdown", "leasesStatus",
+                 "leaseDomain", "groupLeases",
                  "timeWindow", "filterActive", "auditQuery", "eventRow",
                  "historyPager", "renderableHolds",
                  "toolRemaining", "payloadDisclosure", "toolOutcomeMessage",
@@ -607,6 +609,95 @@ console.log(JSON.stringify({
       },
     };
   })(),
+  // The lease helpers. Fixed clocks throughout, like the hold countdown above: a
+  // deadline at t=2000 read from a browser clock at t=1000s.
+  lease: {
+    label_default: m.leaseLabel(1800),
+    label_five: m.leaseLabel(300),
+    label_hour: m.leaseLabel(3600),
+    label_odd: m.leaseLabel(90),
+    // Before /api/config answers, and for anything unusable. The button still works —
+    // the backend owns the duration — so what is unknown is only what to call it.
+    label_unknown: m.leaseLabel(null),
+    label_zero: m.leaseLabel(0),
+    label_junk: m.leaseLabel("soon"),
+    remaining_mid: m.leaseRemaining(2000, 1000 * 1000),
+    // The backend serves only live leases, so a past deadline means the two clocks
+    // disagree — and "0" is the reading that cannot mislead.
+    remaining_past: m.leaseRemaining(1000, 5000 * 1000),
+    remaining_unknown: m.leaseRemaining(undefined, 0),
+    cell_minutes: m.leaseCountdown(1805),
+    cell_seconds: m.leaseCountdown(9),
+    cell_at_urgent: m.leaseCountdown(m.COUNTDOWN_URGENT_S),
+    cell_outside_urgent: m.leaseCountdown(m.COUNTDOWN_URGENT_S + 1),
+    cell_unknown: m.leaseCountdown(null),
+    status_empty: m.leasesStatus(0, false, true),
+    status_stale: m.leasesStatus(2, true, true),
+    status_cold: m.leasesStatus(0, true, false),
+    status_quiet: m.leasesStatus(2, false, true),
+    status_before_first_load: m.leasesStatus(0, false, false),
+  },
+  // Folding sibling hosts. The rows are the shape `/api/egress/leases` serves, trimmed
+  // to the fields the grouping reads.
+  group: {
+    threshold: m.LEASE_GROUP_MIN,
+    domain_plain: m.leaseDomain("cdn.example.com"),
+    domain_deep: m.leaseDomain("a.b.c.example.com"),
+    domain_apex: m.leaseDomain("example.com"),
+    domain_single_label: m.leaseDomain("localhost"),
+    domain_case: m.leaseDomain("CDN.Example.COM"),
+    // An address has no domain to group under.
+    domain_ipv4: m.leaseDomain("10.1.2.3"),
+    domain_ipv6: m.leaseDomain("2001:db8::1"),
+    // The public-suffix limitation, asserted so it is a KNOWN answer rather than a
+    // surprise. Harmless here — it can only put two rows under one heading.
+    domain_public_suffix: m.leaseDomain("shop.example.co.uk"),
+    // Four siblings on one class fold into one group.
+    siblings: (() => {
+      const g = m.groupLeases([
+        { id: 1, host: "cdn.example.com", client_class: "sandbox", expires_at: 300 },
+        { id: 2, host: "api.example.com", client_class: "sandbox", expires_at: 200 },
+        { id: 3, host: "www.example.com", client_class: "sandbox", expires_at: 400 },
+      ]);
+      return { count: g.length, grouped: g[0].grouped, members: g[0].count,
+               domain: g[0].domain, soonest: g[0].soonest,
+               order: g[0].leases.map(r => r.id), key: g[0].key };
+    })(),
+    // One lease is NOT a group of one — that would make every single lease cost a
+    // click to read, which is worse than the clutter grouping exists to fix.
+    lone: (() => {
+      const g = m.groupLeases(
+        [{ id: 1, host: "solo.example.com", client_class: "sandbox",
+           expires_at: 100 }]);
+      return { count: g.length, grouped: g[0].grouped, members: g[0].count };
+    })(),
+    // Two client populations under one domain are TWO groups. Folding them together
+    // would read as one grant covering both tenants.
+    split_by_class: (() => {
+      const g = m.groupLeases([
+        { id: 1, host: "api.example.com", client_class: "sandbox", expires_at: 300 },
+        { id: 2, host: "cdn.example.com", client_class: "sandbox", expires_at: 300 },
+        { id: 3, host: "api.example.com", client_class: "mcp", expires_at: 200 },
+        { id: 4, host: "cdn.example.com", client_class: "mcp", expires_at: 250 },
+      ]);
+      return { count: g.length,
+               keys: g.map(x => x.key),
+               classes: g.map(x => x.clientClass) };
+    })(),
+    // Groups sort by the SOONEST expiry in each, which is the next thing about a group
+    // that will actually change.
+    order: (() => {
+      const g = m.groupLeases([
+        { id: 1, host: "a.later.com", client_class: "s", expires_at: 900 },
+        { id: 2, host: "b.later.com", client_class: "s", expires_at: 950 },
+        { id: 3, host: "a.sooner.com", client_class: "s", expires_at: 60 },
+        { id: 4, host: "b.sooner.com", client_class: "s", expires_at: 70 },
+      ]);
+      return g.map(x => x.domain);
+    })(),
+    empty: m.groupLeases([]),
+    absent: m.groupLeases(undefined),
+  },
 }));
 """
 
@@ -823,6 +914,144 @@ class PageScriptTests(unittest.TestCase):
 
     def test_an_unusable_window_cannot_divide_by_zero(self):
         self.assertEqual(self.probe["countdown"]["unknown_window"]["frac"], 0)
+
+    def test_the_lease_button_says_how_long_it_grants_for(self):
+        lease = self.probe["lease"]
+        # Derived from `/api/config`, never written into the markup: a button reading
+        # "Allow for 30 min" on a store configured for five is the same class of lie
+        # as a countdown that invents its own window.
+        self.assertEqual(lease["label_default"], "Allow for 30 min")
+        self.assertEqual(lease["label_five"], "Allow for 5 min")
+        self.assertEqual(lease["label_hour"], "Allow for 1 h")
+        self.assertEqual(lease["label_odd"], "Allow for 90 s")
+
+    def test_the_lease_button_promises_no_number_it_does_not_know(self):
+        lease = self.probe["lease"]
+        # Before the first /api/config, and for anything unusable. It must not fall
+        # back to a DEFAULT number — a wrong duration on a button that grants egress
+        # is worse than a vague one, because the operator would have no reason to
+        # doubt it.
+        for case in ("label_unknown", "label_zero", "label_junk"):
+            self.assertEqual(lease[case], "Allow for a while", case)
+
+    def test_a_lease_counts_down_from_its_own_deadline(self):
+        lease = self.probe["lease"]
+        # The absolute instant comes from the backend, so this works with a stale
+        # /api/config and needs no knowledge of the configured duration.
+        self.assertEqual(lease["remaining_mid"], 1000)
+        # Never negative: the backend serves only live leases, so a past deadline means
+        # the clocks disagree rather than that the grant ran over.
+        self.assertEqual(lease["remaining_past"], 0)
+        self.assertIsNone(lease["remaining_unknown"])
+
+    def test_a_lease_cell_reads_as_a_clock(self):
+        lease = self.probe["lease"]
+        self.assertEqual(lease["cell_minutes"]["text"], "30m 05s")
+        self.assertEqual(lease["cell_seconds"]["text"], "9s")
+        # A deadline the page cannot compute says so rather than showing "0s", which
+        # would read as a grant about to lapse — the one thing an urgency signal must
+        # never say when it does not know.
+        self.assertEqual(lease["cell_unknown"]["text"], "unknown")
+        self.assertFalse(lease["cell_unknown"]["urgent"])
+
+    def test_a_lease_about_to_lapse_is_flagged_at_the_same_threshold_as_a_hold(self):
+        # One threshold, so the same colour means one thing across the page.
+        lease = self.probe["lease"]
+        self.assertTrue(lease["cell_at_urgent"]["urgent"])
+        self.assertFalse(lease["cell_outside_urgent"]["urgent"])
+
+    def test_an_empty_lease_table_is_not_reported_as_a_fault(self):
+        lease = self.probe["lease"]
+        # No leases is the normal resting state of this table, so the sentence says
+        # what that MEANS for the next request rather than that a table is short.
+        self.assertTrue(lease["status_empty"]["show"])
+        self.assertEqual(lease["status_empty"]["level"], "none")
+        self.assertIn("held for approval", lease["status_empty"]["text"])
+
+    def test_a_failed_lease_poll_says_the_table_may_be_wrong(self):
+        lease = self.probe["lease"]
+        # The rows stay — blanking a table whose subject is what is in force RIGHT NOW
+        # would read as "nothing is granted", which is the reassuring reading and the
+        # wrong one — so the staleness has to be stated instead.
+        self.assertEqual(lease["status_stale"]["level"], "warn")
+        self.assertIn("lapsed or been revoked", lease["status_stale"]["text"])
+        self.assertIn("unreachable", lease["status_cold"]["text"])
+
+    def test_a_healthy_lease_table_says_nothing(self):
+        lease = self.probe["lease"]
+        self.assertFalse(lease["status_quiet"]["show"])
+        # And before the first response there is nothing to claim in either direction:
+        # "none in force" here would be an all-clear the page has not earned.
+        self.assertFalse(lease["status_before_first_load"]["show"])
+
+    def test_sibling_hosts_fold_under_their_registrable_domain(self):
+        g = self.probe["group"]["siblings"]
+        self.assertEqual(g["count"], 1)
+        self.assertTrue(g["grouped"])
+        self.assertEqual(g["members"], 3)
+        self.assertEqual(g["domain"], "example.com")
+        # The group counts down by its soonest member, not by whichever row the backend
+        # happened to return first.
+        self.assertEqual(g["soonest"], 200)
+        # And within the group, soonest first — so the row about to vanish is the one
+        # nearest the summary line that says it is about to vanish.
+        self.assertEqual(g["order"], [2, 1, 3])
+
+    def test_a_lone_lease_is_not_a_group_of_one(self):
+        # Grouping a single lease would make every one of them cost a click to read,
+        # which is worse than the clutter the folding exists to fix.
+        g = self.probe["group"]["lone"]
+        self.assertEqual(g["count"], 1)
+        self.assertFalse(g["grouped"])
+        self.assertEqual(g["members"], 1)
+        self.assertEqual(self.probe["group"]["threshold"], 2)
+
+    def test_two_client_classes_are_never_folded_together(self):
+        """The key is (class, domain), not domain. Two populations under one heading
+        would imply they interact — the same mistake `api_rules` avoids by grouping the
+        standing rules by class first. A lease for `sandbox` and one for `mcp` are two
+        grants to two tenants, and one line for both would read as a single grant
+        covering the pair."""
+        g = self.probe["group"]["split_by_class"]
+        self.assertEqual(g["count"], 2)
+        self.assertEqual(sorted(g["classes"]), ["mcp", "sandbox"])
+        # The class is IN the key, which is what makes the two groups distinct rather
+        # than one group that happens to be rendered twice.
+        for key, cls in zip(g["keys"], g["classes"]):
+            self.assertTrue(key.startswith(f"{cls}|"), key)
+
+    def test_groups_are_ordered_by_the_one_expiring_soonest(self):
+        self.assertEqual(self.probe["group"]["order"],
+                         ["sooner.com", "later.com"])
+
+    def test_a_domain_is_the_two_label_suffix_and_carries_no_dot(self):
+        g = self.probe["group"]
+        self.assertEqual(g["domain_plain"], "example.com")
+        self.assertEqual(g["domain_deep"], "example.com")
+        self.assertEqual(g["domain_apex"], "example.com")
+        self.assertEqual(g["domain_case"], "example.com")
+        # No leading dot: nothing here is a pattern and nothing here grants, so the
+        # wildcard marker `policy._persist_candidates` adds would be a lie.
+        for key in ("domain_plain", "domain_deep", "domain_apex"):
+            self.assertFalse(g[key].startswith("."), key)
+
+    def test_a_host_with_no_domain_to_group_under_is_its_own_group(self):
+        g = self.probe["group"]
+        self.assertEqual(g["domain_single_label"], "localhost")
+        self.assertEqual(g["domain_ipv4"], "10.1.2.3")
+        self.assertEqual(g["domain_ipv6"], "2001:db8::1")
+
+    def test_the_public_suffix_limitation_is_a_known_answer_here(self):
+        """With no public-suffix list the two-label suffix of `example.co.uk` is
+        `co.uk`. On the persist path that would be a grant far wider than it looks,
+        which is why an operator picks the pattern and sees it verbatim. Here it can
+        only put two rows under one heading, so the wrong answer costs an odd grouping
+        and nothing else — asserted so that stays a decision rather than a discovery."""
+        self.assertEqual(self.probe["group"]["domain_public_suffix"], "co.uk")
+
+    def test_an_empty_or_absent_lease_list_groups_into_nothing(self):
+        self.assertEqual(self.probe["group"]["empty"], [])
+        self.assertEqual(self.probe["group"]["absent"], [])
 
     def test_a_departed_card_says_which_way_it_went(self):
         gone = self.probe["gone"]
@@ -2128,19 +2357,137 @@ class PollGatingSourceTests(unittest.TestCase):
     def test_returning_to_the_tab_refreshes_immediately(self):
         """Without this the operator faces up to four seconds of stale data at exactly
         the moment their attention returns — and unlabelled stale, because the
-        staleness wording is for a FAILED poll, not a skipped one."""
-        self.assertRegex(
-            self.src,
-            # [\s\S] not . — the handler spans lines and assertRegex does not
-            # pass re.DOTALL.
-            r'addEventListener\("visibilitychange"[\s\S]*?'
-            r"if \(visible\(\)\) \{ refreshAudit\(\); refreshRules\(\); \}")
+        staleness wording is for a FAILED poll, not a skipped one.
+
+        Asserted as "every gated poll appears in the handler" rather than as the
+        handler's exact text. The literal form was the previous shape and it made
+        adding a third polled list look like a regression in this test rather than the
+        omission it would actually be — which is backwards for a guard whose job is to
+        notice a poll that was left out."""
+        handler = re.search(r'addEventListener\("visibilitychange"[\s\S]*?\}\);',
+                            self.src)
+        self.assertIsNotNone(handler, "the visibilitychange handler is gone")
+        # The polls that are SKIPPED while hidden, so returning has to catch each of
+        # them up. Derived from the source rather than listed, so a fourth one cannot
+        # be added to the intervals and forgotten here.
+        gated = set(re.findall(r"if \(visible\(\)\) (\w+)\(\); \}, \d+\);", self.src))
+        self.assertTrue(gated, "no visibility-gated polls found — did they change?")
+        for fn in sorted(gated):
+            self.assertIn(f"{fn}()", handler.group(0),
+                          f"{fn} is skipped while the tab is hidden but not caught up "
+                          f"when it comes back")
 
     def test_an_unknown_visibility_state_keeps_polling(self):
         # Fail toward the OLD behaviour: a host without the API must not silently stop
         # updating the page.
         self.assertRegex(
             self.src, r'visible = \(\) => document\.visibilityState !== "hidden"')
+
+
+class LeaseTableSourceTests(unittest.TestCase):
+    """`refreshLeases` is the third polled list, and it inherits the trap the other two
+    each fell into once: a failure path that blanks the table or says nothing.
+
+    It matters more here than on either of them. This table's subject is what is being
+    allowed AT THIS MOMENT, so an empty one reads as "nothing is granted" — the
+    reassuring answer, and the wrong one when what actually happened is that the page
+    stopped being able to tell."""
+
+    def setUp(self):
+        self.src = APP_JS.read_text()
+        self.body = re.search(r"async function refreshLeases\(\)\s*\{(.*?)\n  \}",
+                              self.src, re.S)
+        self.assertIsNotNone(self.body, "refreshLeases not found — renamed?")
+
+    def test_a_failed_refresh_keeps_the_rows_and_reports_the_staleness(self):
+        body = self.body.group(1)
+        self.assertIn("leasesFailed = true", body)
+        self.assertIn("renderLeasesStatus(", body)
+        self.assertNotRegex(body, r'catch[^}]*innerHTML\s*=\s*""',
+                            "a failed poll must not blank the leases table")
+        self.assertNotRegex(
+            body, r"catch\s*\([^)]*\)\s*\{\s*/\*[^*]*\*/\s*\}",
+            "the failure path is a comment, not a reported state")
+
+    def test_a_non_ok_response_is_a_failure_not_a_row_of_json(self):
+        self.assertRegex(self.body.group(1), r"if\s*\(!res\.ok\)\s*throw")
+
+    def test_a_recovered_poll_clears_the_warning_and_re_renders(self):
+        _, sep, success = self.body.group(1).partition("return;\n    }")
+        self.assertTrue(sep, "the failure path no longer returns early")
+        self.assertIn("leasesFailed = false", success)
+        self.assertIn("renderLeasesStatus(", success)
+
+    def test_the_countdowns_do_not_depend_on_the_poll(self):
+        """The rows carry their own absolute deadline so the one-second tick can rewrite
+        just the countdown cells. Rebuilding the table on that tick instead would drop a
+        click landing on a revoke button at the moment it fired — which is exactly when
+        an operator is most likely to be pressing one."""
+        tick = re.search(r"function updateLeaseCountdowns\(\)\s*\{(.*?)\n  \}",
+                         self.src, re.S)
+        self.assertIsNotNone(tick, "updateLeaseCountdowns not found — renamed?")
+        body = tick.group(1)
+        self.assertIn("dataset.expires", body)
+        self.assertNotIn("innerHTML", body)
+        self.assertNotIn("fetch(", body)
+
+    def test_a_folded_group_hides_its_rows_rather_than_omitting_them(self):
+        """Expanding has to be a flip on rows already in the DOM. Rendering members only
+        when open would make the toggle depend on the next four-second poll to produce
+        them, so a click could be undone by a fetch already in flight — the same class
+        of bug as rebuilding the table on the one-second tick."""
+        # Every member is emitted; `open` only decides the `hidden` attribute on it.
+        body = self.body.group(1)
+        self.assertRegex(body, r"g\.leases\.map\(r => leaseRow\(")
+        self.assertNotRegex(body, r"open\s*\?\s*g\.leases\.map",
+                            "members must be rendered and hidden, not conditionally "
+                            "rendered")
+        row = re.search(r"function leaseRow\(([^)]*)\)\s*\{(.*?)\n  \}",
+                        self.src, re.S)
+        self.assertIsNotNone(row, "leaseRow not found — renamed?")
+        self.assertIn("lease-member", row.group(2))
+        self.assertRegex(row.group(2), r'!open\s*\?\s*"hidden"')
+
+    def test_expansion_survives_the_poll(self):
+        """The table is replaced wholesale every four seconds, so expansion state held
+        in the DOM alone would collapse itself on the next tick. It lives in a Set
+        outside the render, and the render reads it back."""
+        self.assertIn("const expandedLeaseGroups = new Set()", self.src)
+        self.assertIn("expandedLeaseGroups.has(g.key)", self.body.group(1))
+
+    def test_a_lapsed_group_does_not_keep_its_expansion(self):
+        # The key is (class, domain), which outlives the leases under it: without the
+        # prune, a domain leased again half an hour later would silently come back
+        # expanded because a previous group with the same key had been opened.
+        body = self.body.group(1)
+        self.assertIn("expandedLeaseGroups.delete(key)", body)
+
+    def test_the_count_in_the_header_counts_grants_not_rows(self):
+        # Folding four hosts into one line must not make the number shrink: the header
+        # answers "how much is granted right now", not "how tall is this table".
+        self.assertIn("leasesCountEl.textContent = rows.length", self.body.group(1))
+
+    def test_a_group_summary_offers_no_bulk_revoke(self):
+        """Ending four grants with one click is a sharper action than the per-lease
+        revoke and would need the confirm step this table deliberately does not have.
+        Revocation stays on the row that names the thing being revoked."""
+        summary = re.search(r'const summary = `<tr class="lease-group">(.*?)`;',
+                            self.src, re.S)
+        self.assertIsNotNone(summary, "the group summary row is gone — renamed?")
+        self.assertNotIn("class=\"revoke\"", summary.group(1))
+        self.assertNotIn("data-lease", summary.group(1))
+
+    def test_the_lease_button_is_one_click_and_not_a_confirm_step(self):
+        """A persist opens the confirm panel because it names a PATTERN and nothing in
+        this UI removes a rule. A lease chooses nothing, expires on its own, and is
+        revocable from the table below — so the second click would be friction with no
+        question behind it. Asserted because the obvious "safer" edit is to route it
+        through `askPersist` like its neighbours, which would then 400: the confirm
+        panel sends a `pattern` the lease path does not accept."""
+        self.assertRegex(
+            self.src,
+            r"action\.endsWith\(\"persist\"\)\s*\n\s*\?\s*askPersist\(a, action\)")
+        self.assertNotRegex(self.src, r"askPersist\(a, \"allow_lease\"\)")
 
 
 class PolicyTableSourceTests(unittest.TestCase):

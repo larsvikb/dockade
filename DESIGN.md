@@ -1188,9 +1188,12 @@ approval and **blocks** the request until a human resolves it or
 `CONTROL_HOLD_TIMEOUT` (default 120s) elapses → default-deny. The proxy is
 unchanged except for a longer authorize timeout to cover the wait — it still
 sees only allow/deny (the hold is internal to the control plane). A human
-resolves holds in a **live SSE UI** served at `/`: **allow-once / deny-once**
-(this request only) or **allow-persist / deny-persist** (also writes a rule so
-future connections skip the hold — the progressive-trust path). Concurrency:
+resolves holds in a **live SSE UI** served at `/`, and the vocabulary is a ladder
+of how far the click reaches: **allow-once / deny-once** (this request only),
+**allow-lease** (that host, that client class, until `CONTROL_LEASE_SECONDS`
+elapses — see "A lease is the third grant duration") or **allow-persist /
+deny-persist** (also writes a rule so future connections skip the hold — the
+progressive-trust path). Concurrency:
 one uvicorn worker; a held request blocks its threadpool worker on a
 `threading.Event` the resolve endpoint sets; SQLite (`approvals` table) is the
 UI's source of truth; stale `pending` rows are expired on startup. **Holds are
@@ -1346,6 +1349,93 @@ all — the reason now reads `human approval (standing rule written) [peer=…]`
 need a new column on `approvals`, which has no migration step (see the NOTE above
 `_seed_if_empty`); the rule itself is recorded with its pattern and `source='operator'`
 in the rules table, and every later use of it is audited as `allowed by rule (…)`.
+
+**A lease is the third grant duration.** The resolve vocabulary had two rungs — this
+request, or a standing rule forever — and nothing between them, so the answer for a
+host an agent is about to hit twenty times was either twenty clicks or permanent
+policy. `allow_lease` is the middle rung: it allows one exact host, for one client
+class, until `CONTROL_LEASE_SECONDS` elapses.
+
+It gets its **own table** rather than an `expires_at` column on `rules`, by the same
+test that gave tool policy its own (see "Tool policy gets its own table"): the rows are
+a different *kind*, not a differently keyed one. A lease belongs to the card it was
+granted from, self-destructs, and must not appear in the answer to "what have I
+permanently allowed?". The consequence that settled it is that every existing reader of
+`rules` is a reader of standing policy — the rules view, the conflict check in
+`resolve`, `revoke_rule`, the edit path and `_decide` — so a nullable expiry would have
+taught each of them "except the expired ones", which is five places to drift instead of
+one new pass.
+
+Four properties are decisions rather than defaults, and each is one someone would
+otherwise add later as an obvious improvement:
+
+- **A lease loses to a block.** `_decide` runs blocks, then standing allows, then live
+  leases, and the ordering is what guarantees it: a timed grant must never be a way
+  around policy an operator wrote down. Leases come *last* among the two allows because
+  when both cover a host the standing rule is the more informative audit reason —
+  which of two allows answers a request cannot change the answer, only the record.
+- **No breadth choice.** `_persist_candidates` exists because a permanent rule needs an
+  operator decision about how wide it is; a lease answers that question by expiring
+  instead, so it is always the exact host and the card stays one click. The visible
+  cost is real and accepted: one page load often touches several hosts, so a lease for
+  `example.com` can be followed immediately by a card for `cdn.example.com` — and the
+  live-lease table then carries a row for each. It **folds** those under their
+  registrable domain rather than truncating to a `+N more`, because a live grant hidden
+  behind a click is a grant nobody revokes, which was the whole reason for showing them.
+  The fold is keyed `(client class, domain)` and not domain alone, the same way
+  `api_rules` groups standing policy by class first: two populations under one heading
+  would read as one grant covering both tenants. Folding is a display fix for a cost the
+  exact-host decision creates; offering `.example.com` as a lease pattern would remove
+  it at the source, and the expiry makes that far safer than it is for persist — which
+  is the shape of the next decision here if the folding stops being enough.
+- **No `deny_lease`.** An unmatched host is *held*, not denied, so a timed deny would
+  mean "stop raising this card for a while" — silencing a looping agent, which is a
+  different feature wearing this one's name.
+- **An unclassified client cannot be leased to**, exactly as it cannot be persisted for.
+  Expiry bounds how *long* a grant lasts and says nothing about *who* it covers, and a
+  grant scoped to "whoever we could not identify" covers a population rather than a
+  client.
+
+Revocation is why the default is half an hour rather than the five minutes the feature
+was first sketched with. `POST /api/egress/leases/{id}/revoke` closes a grant early, so
+the duration stopped being a safety floor and became an ergonomics number — long enough
+that an agent finishes what it was doing without a second card. The action is named
+`allow_lease` and not `allow_30m` for the same reason: the number is configuration, and
+a button that spelled it into the page would keep saying it on a store set to something
+else. `/api/config` serves it so the button labels itself.
+
+**A lease bounds authorization, not connection lifetime.** The egress proxy authorizes
+**once per CONNECT tunnel** (`http_connect` in `proxies/egress/addon.py`), and the SNI
+stage afterwards only *compares* against the authority it already recorded — no second
+call to the control plane. So a tunnel opened while a lease is live keeps carrying
+requests after the lease ends, for as long as the client holds it open, and revoking
+early stops the *next* connection rather than this one.
+
+This is not new — revoking a standing rule has always had the same property — but it is
+worth stating for a feature whose entire value is the time bound, and it is reasoning
+that lives in no single file: the deadline is in `policy.py`, the once-per-tunnel
+decision is in the proxy, and neither one can see the other. Closing it would mean
+re-authorizing mid-tunnel, which the proxy deliberately does not do (the SNI stage's
+whole design is a local comparison, so a fronted request cannot buy a second decision).
+
+**A lease does not release a card already raised for a sibling request.** A lease is
+keyed `(host, client_class)`; a hold's group key is `(client, host, port, proto)`
+(`holds._group_key`). Those do not line up, so granting a lease from one card leaves
+another card for the *same host on a different port*, or from a different client in the
+same class, still pending — its waiter blocking until `CONTROL_HOLD_TIMEOUT` elapses
+and it default-denies, even though leased policy now allows it. The agent's retry then
+sails through on the live lease.
+
+Accepted rather than fixed, and the alternative is why. Re-deciding every pending card
+when a lease is granted would make a card resolvable by something other than a human
+clicking it, which means a third writer to the `approvals` row — and "exactly one of
+the resolve and the timeout flips it out of `pending`, via a conditional UPDATE SQLite
+serializes" is the invariant that keeps a resolve landing as a hold expires from
+telling the agent *deny* while recording *allowed* and writing a grant. Trading that
+for one avoided card is the wrong trade. The common case is collapsed anyway: one agent
+retrying one host is already one card (see "Duplicate holds share one card — and that
+changes what a click grants"), so the uncollapsed shapes are the rarer two-port and
+two-client-one-class ones.
 
 **The banner for requests that never became cards.** Over any of the four hold caps
 (see "Four hold caps: two nouns, two scopes"), `/authorize` fails closed **without creating an
@@ -3101,6 +3191,7 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | tool policy: store (`tool_rules`, `mcp_servers`) + config API (`/api/mcp/…`) | **done** — headless; inert until the gateway exists |
 | — | tool asks: `tool_approvals`, the ask registry, one merged queue, `resolve` split | **done** |
 | — | the tool card — raw payload, per-surface actions | **done** — no schema-driven view; the raw payload is the whole of it |
+| — | timed grants (`leases`) — `allow_lease`, the live-lease strip, revoke | **done** — exact host only; no breadth ladder |
 | — | MCP gateway — per-tool allow/deny/ask | planned (unblocked — names its own bounds) |
 
 The rationale for each shipped item lives under **Governance surfaces** above, not here

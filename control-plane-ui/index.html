@@ -212,6 +212,23 @@
   /* A leading-dot pattern is a SUBDOMAIN WILDCARD that looks like a hostname, so
      the scope is spelled out rather than left to the reader to spot. */
   .wild { color: var(--hold); }
+  /* A lease's remaining time. Tabular figures for the same reason the hold countdown
+     uses them — a number that reflows as it counts down is read as a flicker rather
+     than as a clock. `.urgent` borrows the countdown's colour so "about to lapse"
+     looks the same wherever it appears. */
+  .lease-left { white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .lease-left.urgent { color: var(--deny); }
+  /* Sibling hosts folded under their registrable domain. The summary row is the one
+     that reads as a heading; members are indented so an expanded group cannot be
+     mistaken for four unrelated grants that happen to sort together. */
+  tr.lease-group > td:first-child { display: flex; align-items: center; gap: 6px; }
+  tr.lease-member > td:first-child { padding-left: 26px; }
+  /* Quiet, like button.revoke: this one reveals rows and decides nothing, so it must
+     not compete with the button beside it that ends a grant. */
+  button.group-toggle { background: transparent; color: var(--dim);
+    border: 1px solid var(--line); border-radius: 4px; padding: 0 5px;
+    font-size: 11px; line-height: 1.6; cursor: pointer; }
+  button.group-toggle:hover { color: var(--fg); border-color: var(--dim); }
 
   /* ── browsing the record: the filter bar, and the record view's pager ──────
      Deliberately plain controls. This bar sits above a table of evidence, and the
@@ -329,6 +346,25 @@
     <div id="pending-live" class="sr-only" role="status"></div>
     <div id="pending"></div>
     <div class="empty" id="pending-empty">none</div>
+
+    <!-- The live leases: timed grants that are deciding requests RIGHT NOW. In this
+         view rather than under Policy because that is the distinction between the two
+         — Policy answers "what have I permanently allowed", this answers "what am I
+         allowing at this moment" — and because a grant nobody can see is a grant
+         nobody will revoke, which would make the revoke button pointless.
+
+         BELOW the queue, not above it: the queue is what asks for a decision and must
+         stay at the top of the view, while this is context for the decisions already
+         made. No live region either — the rows rewrite every second as the countdowns
+         tick, which is exactly the continuous-timer reading `#pending-live` exists to
+         avoid. -->
+    <h2>Live leases <span class="note" id="leasecount"></span></h2>
+    <table id="leases-table" hidden>
+      <thead><tr><th>host</th><th>client class</th><th>expires in</th>
+        <th>granted by</th><th></th></tr></thead>
+      <tbody id="leases"></tbody>
+    </table>
+    <div class="empty" id="leases-empty" hidden></div>
   </section>
 
   <section id="view-decisions" role="tabpanel" aria-labelledby="tab-decisions" hidden>

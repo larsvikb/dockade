@@ -989,6 +989,142 @@ function rulesStatus(rowCount, failed, loaded) {
   return pollStatus(RULES_STATUS_TEXT, rowCount, failed, loaded);
 }
 
+// ── leases: the grants that expire ──────────────────────────────────────────
+// A lease is the middle rung of the resolve ladder — this request, this host for a
+// while, this pattern forever — so the button granting one has to say WHICH of the
+// three it is. The duration is configuration (`policy.LEASE_SECONDS`, served by
+// `/api/config`), so the label is DERIVED: a button reading "Allow for 30 min" on a
+// store configured for five would be the same class of lie as a countdown inventing
+// its own window, and it is why the backend action is named `allow_lease` rather than
+// after any number.
+//
+// A non-finite or non-positive duration — including the `null` that stands for "the
+// first /api/config has not answered yet" — gets a label that promises no particular
+// length. The button still WORKS in that state, because the backend owns the duration
+// and does not need the page to tell it: what is unknown here is only what to call it.
+function leaseLabel(seconds) {
+  const s = Number(seconds);
+  if (!Number.isFinite(s) || s <= 0) return "Allow for a while";
+  if (s % 3600 === 0) return `Allow for ${s / 3600} h`;
+  if (s % 60 === 0) return `Allow for ${s / 60} min`;
+  return `Allow for ${Math.round(s)} s`;
+}
+
+// How long a live lease has left, from its own ABSOLUTE deadline. The same discipline
+// `toolRemaining` follows, for the same reason: the backend sends the instant rather
+// than a remaining-seconds field, so this needs no knowledge of the configured
+// duration and a stale `/api/config` cannot make it wrong.
+//
+// Clamped at zero instead of going negative. The backend serves only live leases, so a
+// negative value here means the browser's clock and the control plane's disagree — and
+// of the two readings available then, "0s" is the one that cannot mislead.
+function leaseRemaining(expiresAt, nowMs) {
+  const at = Number(expiresAt);
+  if (!Number.isFinite(at)) return null;
+  return Math.max(0, at - nowMs / 1000);
+}
+
+// A lease's remaining time as a cell: the text, and whether it is about to lapse.
+// `urgent` reuses COUNTDOWN_URGENT_S so "nearly out of time" looks the same here as on
+// a hold card — two thresholds would make the same colour mean two things.
+function leaseCountdown(remainingS) {
+  if (remainingS === null) return { text: "unknown", urgent: false };
+  const whole = Math.max(0, Math.floor(remainingS));
+  const mins = Math.floor(whole / 60);
+  return {
+    text: mins >= 1 ? `${mins}m ${String(whole % 60).padStart(2, "0")}s` : `${whole}s`,
+    urgent: whole <= COUNTDOWN_URGENT_S,
+  };
+}
+
+const LEASES_STATUS_TEXT = {
+  stale: "Could not refresh — these are the last live leases loaded successfully, " +
+         "and one may have lapsed or been revoked since.",
+  cold: "Could not load the live leases — the control plane may be unreachable.",
+  // Phrased so it does not read as a fault: no leases is the normal resting state of
+  // this table, so the sentence says what that MEANS for the next request rather than
+  // observing that a table is short.
+  empty: "No timed grants in force, so every unknown host is still held for approval.",
+};
+function leasesStatus(rowCount, failed, loaded) {
+  return pollStatus(LEASES_STATUS_TEXT, rowCount, failed, loaded);
+}
+
+// ── folding sibling hosts into one line ─────────────────────────────────────
+// A lease is always the exact host (there is no breadth ladder — it answers the
+// breadth question by expiring), so one site spread over `cdn.`, `static.`, `api.`
+// and `assets.` is four rows for what the operator thinks of as one grant. That is
+// clutter carrying no information, and it is produced by the exact-host decision
+// rather than by this table.
+//
+// GROUPED, never truncated, and that is the load-bearing choice. A `+N more` fold
+// would be less code and it is the wrong answer: a live grant hidden behind a click
+// is a grant nobody revokes, which was the whole argument for showing them at all.
+// Every lease stays reachable here — the summary line only defers the detail.
+
+// The registrable domain, for display. The two-label suffix, the same shape
+// `policy._persist_candidates` derives — but WITHOUT the leading dot, because nothing
+// here is a pattern and nothing here grants.
+//
+// That difference matters for the known limitation the backend has to warn about: with
+// no public-suffix list the two-label suffix of `example.co.uk` is `co.uk`. On the
+// persist path that would be a grant far wider than it looks, which is why an operator
+// picks it and sees it verbatim. HERE it can only put two rows under one heading, so
+// the wrong answer costs a slightly odd grouping and nothing else — and the same
+// applies to the loose IP check below, where the backend uses a real parser.
+function leaseDomain(host) {
+  const h = (host || "").toLowerCase();
+  // An address has no domain to group under. Deliberately looser than the backend's
+  // `ipaddress` parse: a missed literal is grouped by its last two dotted parts, which
+  // is untidy rather than wrong.
+  if (h.includes(":") || /^[0-9.]+$/.test(h)) return h;
+  const labels = h.split(".").filter(Boolean);
+  if (labels.length < 2) return h;
+  return labels.slice(-2).join(".");
+}
+
+// Below this, a group renders as plain rows. A "group" of one would make every single
+// lease cost a click to read, which is worse than the clutter it is meant to fix.
+const LEASE_GROUP_MIN = 2;
+
+// Live leases into display groups, soonest to expire first.
+//
+// The key is (client class, registrable domain) and NOT the domain alone. Two client
+// populations under one heading would imply they interact, which is the exact mistake
+// `api_rules` avoids by grouping the standing rules by class first: a lease for
+// `api.example.com` on `sandbox` and one for `cdn.example.com` on `mcp` are two
+// separate grants to two separate tenants, and folding them together would read as one.
+//
+// `soonest` is what a group sorts and counts down by, because it is the next thing
+// about the group that will actually change.
+function groupLeases(rows) {
+  const byKey = new Map();
+  for (const r of Array.isArray(rows) ? rows : []) {
+    const domain = leaseDomain(r.host);
+    const cls = r.client_class || "";
+    const key = `${cls}|${domain}`;
+    if (!byKey.has(key)) {
+      byKey.set(key, { key, domain, clientClass: cls, leases: [] });
+    }
+    byKey.get(key).leases.push(r);
+  }
+  const groups = [];
+  for (const g of byKey.values()) {
+    const leases = [...g.leases].sort(
+      (a, b) => Number(a.expires_at) - Number(b.expires_at));
+    groups.push({
+      ...g, leases,
+      count: leases.length,
+      soonest: Number(leases[0].expires_at),
+      // Whether it is DRAWN as a group. Carried on the group rather than recomputed at
+      // render time, so the threshold is applied in one place and the renderer cannot
+      // disagree with the tests about where it falls.
+      grouped: leases.length >= LEASE_GROUP_MIN,
+    });
+  }
+  return groups.sort((a, b) => a.soonest - b.soonest);
+}
+
 // What a Dismiss click acknowledges. A one-line function only because it must be the
 // SAME expression the optimistic local hide uses and the one the POST body carries:
 // with the number written twice, the two can disagree, and the failure is silent —
@@ -1078,6 +1214,12 @@ function start() {
   // until the backend says, and the page works without it — one fewer thing that can
   // stop an approval from reaching a human.
   let holdTimeout = null;
+  // Seconds a lease lasts, also from GET /api/config, and null until it answers. Used
+  // for the BUTTON LABEL only — never to compute a deadline, which every lease carries
+  // as an absolute instant of its own. That split is deliberate: a wrong label is
+  // cosmetic, while a locally-computed expiry could show a grant ending at a time it
+  // does not, and the second failure is the one that matters.
+  let leaseSeconds = null;
 
   // ── views ─────────────────────────────────────────────────────────────────
   const VIEWS = ["approvals", "decisions", "policy"];
@@ -1183,8 +1325,13 @@ function start() {
   //          any of the above → stale
   const cards = new Map();
 
+  // The resolve ladder, in increasing order of how far the click reaches. `allow_lease`
+  // carries a `null` label because its wording depends on the configured duration —
+  // `leaseLabel` derives it, and `relabelLeaseButtons` fills it in again when
+  // /api/config answers after a card was already drawn.
   const ACTIONS = [
     ["allow_once", "Allow once", "allow"],
+    ["allow_lease", null, "allow"],
     ["allow_persist", "Allow + persist rule", "allow"],
     ["deny_once", "Deny once", "deny"],
     ["deny_persist", "Deny + persist rule", "deny"],
@@ -1351,20 +1498,39 @@ function start() {
     // preview does. `!== false` so a backend that predates the field behaves exactly
     // as it did: absent means allowed.
     const persistable = a.persistable !== false;
+    // Whether a LEASE can be granted for this request, which fails in exactly the same
+    // case and for the same reason (`holds._classified`): a grant outliving the request
+    // is scoped to a client class, and an unplaceable client has none. Read from its own
+    // field rather than reusing `persistable`, so the page is not quietly relying on the
+    // two preconditions staying identical. `!== false` so a backend that predates the
+    // field behaves as it did: absent means allowed.
+    const leasable = a.leasable !== false;
     for (const [action, label, kind] of ACTIONS) {
       const b = document.createElement("button");
       b.className = kind;
-      b.textContent = label;
-      if (action.endsWith("persist") && !persistable) {
+      // On the button so `relabelLeaseButtons` can find it later. Every action carries
+      // one rather than only the lease, because a marker present on one button and
+      // absent on its neighbours is the kind of asymmetry a future reader has to test
+      // for to trust.
+      b.dataset.action = action;
+      b.textContent = label === null ? leaseLabel(leaseSeconds) : label;
+      const grants = action.endsWith("persist") || action.endsWith("lease");
+      if (grants && !(action.endsWith("lease") ? leasable : persistable)) {
         b.disabled = true;
-        b.title = "No standing rule can be written for an unclassified client — "
-                + "decide this request with a once action, or map its network in "
-                + "CONTROL_CLIENT_CLASSES.";
+        b.title = `No ${action.endsWith("lease") ? "lease" : "standing rule"} can be `
+                + "written for an unclassified client — decide this request with a "
+                + "once action, or map its network in CONTROL_CLIENT_CLASSES.";
         actions.append(b);
         continue;
       }
       // The two `*_persist` actions write standing policy, so they open the confirm
       // panel; the `*_once` actions decide this request only and stay a single click.
+      //
+      // `allow_lease` is a single click too, and that is a judgement rather than an
+      // oversight. The confirm panel exists to name the PATTERN a persist would write,
+      // because the choice is irreversible and nothing in this UI removes a rule; a
+      // lease chooses nothing, expires on its own, and can be revoked from the table
+      // below — so a second click would be friction with no question behind it.
       b.addEventListener("click", () => action.endsWith("persist")
         ? askPersist(a, action)
         : resolve(a, action));
@@ -1375,6 +1541,24 @@ function start() {
     setRequests(entry, a.requests);
     el.append(host, meta, cd, dup, actions, entry.confirm, msg);
     return entry;
+  }
+
+  // The lease button's wording depends on a number that arrives after the first cards
+  // do, so it is written twice: once at build time (with whatever is known then) and
+  // again here when /api/config answers. Cheaper and less surprising than deferring the
+  // whole card — the button is live and correct from the first paint either way, and
+  // only its wording sharpens.
+  //
+  // Skips a card that is no longer pending: a resolved or stale card's buttons are
+  // disabled and its message reports what already happened, so relabelling one would
+  // rewrite a record of a click that has been made.
+  function relabelLeaseButtons() {
+    const text = leaseLabel(leaseSeconds);
+    for (const entry of cards.values()) {
+      if (entry.state !== "pending" && entry.state !== "confirming") continue;
+      const b = entry.actions.querySelector('button[data-action="allow_lease"]');
+      if (b) b.textContent = text;
+    }
   }
 
   function setRequests(entry, n) {
@@ -1590,12 +1774,19 @@ function start() {
         // OPPOSITE rule was there, and the card cheerfully confirmed a block that
         // policy had discarded. The conflicting case is refused outright now, and the
         // already-in-place case says so in its own words.
+        // The lease clause reads the deadline the BACKEND returned rather than adding
+        // the configured duration to this machine's clock, so the time shown is the
+        // time the grant actually ends. `fmtTime` for the instant and not a duration:
+        // the countdown in the table below is where "how long left" belongs, and this
+        // sentence is a record of what was granted.
         setMessage(entry,
           (d.outcome === "allow" ? "✓ allowed" : "✕ denied") +
           (d.persisted ? ` · standing rule written: ${d.pattern || a.host.toLowerCase()}`
             : d.already_present
               ? ` · standing rule already in place: ${d.pattern || a.host.toLowerCase()}`
-              : " · this request only"),
+              : d.leased
+                ? ` · leased until ${fmtTime(d.lease_expires_at)}`
+                : " · this request only"),
           d.outcome === "allow" ? "ok" : "bad");
       } else if (r.status === 409 && d.conflict) {
         // A persist that would contradict an existing rule. NOT a stale card: the
@@ -1627,6 +1818,11 @@ function start() {
     // A "+ persist" action just changed standing policy. Refresh it at once so the
     // Policy badge marks the change while you are still on the approvals view.
     refreshRules();
+    // And a lease just changed what is in force RIGHT NOW, in a table on the view the
+    // operator is looking at — so it appears with the click rather than up to a poll
+    // interval later, which for a grant with a countdown on it would read as the table
+    // having missed it.
+    refreshLeases();
   }
 
   function listBusy() {
@@ -1791,7 +1987,12 @@ function start() {
   // renderSaturation rides this tick too, because its emphasis decays with time
   // rather than with events: a rejection that stops being "recent" must fade on its
   // own, and the stream is silent precisely when nothing is arriving.
-  setInterval(() => { updateCountdowns(); sweep(); renderSaturation(); }, 1000);
+  // The lease countdowns ride this tick for the same reason the saturation banner
+  // does: what changes is the passage of time, not an event, so nothing is going to
+  // push a redraw at the moment one is needed.
+  setInterval(() => {
+    updateCountdowns(); sweep(); renderSaturation(); updateLeaseCountdowns();
+  }, 1000);
 
   // ── config (the hold window behind the countdown) ─────────────────────────
   async function refreshConfig() {
@@ -1803,6 +2004,12 @@ function start() {
       // unusable leaves holdTimeout null, which just means no countdown.
       holdTimeout = Number.isFinite(t) && t > 0 ? t : null;
       updateCountdowns();
+      // Validated the same way and left null when unusable, which `leaseLabel` reads as
+      // "say no number". Relabelled rather than only stored, because cards drawn before
+      // this first answer are already on screen with the placeholder wording on them.
+      const ls = Number(c.lease_seconds);
+      leaseSeconds = Number.isFinite(ls) && ls > 0 ? ls : null;
+      relabelLeaseButtons();
       // The classes a rule may be scoped to, from the backend rather than guessed:
       // `create_rule` refuses one it does not know, so a guessed list offers rules that
       // cannot be written. Filtered to strings for the same reason the window above is
@@ -1832,6 +2039,16 @@ function start() {
   let rulesLoaded = false;
   let rulesFailed = false;
   let rulesById = new Map();
+  // The same two facts for the leases poll, kept separately rather than folded into the
+  // rules ones: the two views are filled by two fetches, and one of them failing while
+  // the other succeeds is a state the page has to be able to describe.
+  let leasesLoaded = false;
+  let leasesFailed = false;
+  let leasesById = new Map();
+  // Which lease groups the operator has opened, by (class, domain) key. Outside the
+  // render deliberately — see the toggle handler — and pruned to the live groups on
+  // every refresh so a lapsed domain does not keep an expansion nobody asked for.
+  const expandedLeaseGroups = new Set();
   // Populated by refreshConfig, not by the rules table: a class with no rules yet is
   // exactly the one an operator most needs to write the first rule for.
   let clientClasses = [];
@@ -1872,6 +2089,15 @@ function start() {
 
   function renderRulesStatus(rowCount) {
     renderListStatus(rulesEmpty, rulesStatus(rowCount, rulesFailed, rulesLoaded));
+  }
+
+  const leasesEl = document.getElementById("leases");
+  const leasesTableEl = document.getElementById("leases-table");
+  const leasesEmptyEl = document.getElementById("leases-empty");
+  const leasesCountEl = document.getElementById("leasecount");
+
+  function renderLeasesStatus(rowCount) {
+    renderListStatus(leasesEmptyEl, leasesStatus(rowCount, leasesFailed, leasesLoaded));
   }
 
   // ── the decisions view's controls ─────────────────────────────────────────
@@ -2209,6 +2435,180 @@ function start() {
     refreshRules();
   });
 
+  // ── the live leases ───────────────────────────────────────────────────────
+  // What is being allowed RIGHT NOW on a timer, which until this table existed was
+  // the one kind of granted egress with nowhere to see it: a lease writes no rule, so
+  // the standing-policy view is silent about it, and by the time an operator went
+  // looking in the decisions log the grant might already have lapsed.
+  //
+  // It also makes the revoke button worth having. A grant nobody can see is a grant
+  // nobody closes early, which would leave the configured duration doing the whole job
+  // — and it is exactly that revocability that let the default be half an hour rather
+  // than a few minutes.
+  async function refreshLeases() {
+    let rows;
+    try {
+      const res = await fetch("/api/egress/leases");
+      // Checked like the rules poll: a 4xx body reaching .json() either throws
+      // somewhere less obvious or parses into something that renders as "nothing is
+      // leased", which is the reassuring reading and the wrong one.
+      if (!res.ok) throw new Error(String(res.status));
+      rows = await res.json();
+    } catch (e) {
+      // Keeps the rows and says so, rather than blanking a table whose whole subject
+      // is what is in force at this moment — an empty one would read as "nothing is
+      // granted" when what happened is that we stopped being able to tell.
+      leasesFailed = true;
+      renderLeasesStatus(document.getElementById("leases").rows.length);
+      return;
+    }
+    leasesFailed = false;
+    leasesLoaded = true;
+    leasesById = new Map(rows.map(r => [String(r.id), r]));
+    // The count is of LEASES, not of rendered rows: it answers "how much is granted
+    // right now", and a number that shrank because four hosts folded into one line
+    // would be answering a question about the table instead.
+    leasesCountEl.textContent = rows.length ? `· ${rows.length} live` : "";
+    leasesTableEl.hidden = rows.length === 0;
+    const groups = groupLeases(rows);
+    // Groups that no longer exist are dropped from the expanded set here rather than
+    // left to accumulate: the key is (class, domain), so a group whose last lease
+    // lapsed would otherwise keep its expansion and silently re-expand if the same
+    // domain were leased again half an hour later.
+    const live = new Set(groups.map(g => g.key));
+    for (const key of [...expandedLeaseGroups]) {
+      if (!live.has(key)) expandedLeaseGroups.delete(key);
+    }
+    leasesEl.innerHTML = groups.map(g => {
+      if (!g.grouped) return leaseRow(g.leases[0], false);
+      const open = expandedLeaseGroups.has(g.key);
+      const cd = leaseCountdown(leaseRemaining(g.soonest, Date.now()));
+      // The summary counts down by the group's SOONEST expiry, which is the next thing
+      // about it that will change — and it carries `data-expires` like any other
+      // countdown cell, so the one-second tick moves it with no special case.
+      //
+      // No revoke on this row. A button that ended four grants at once is a different
+      // and much sharper action than the per-lease one, and it would need the confirm
+      // step this table deliberately does not have; revocation stays where the thing
+      // being revoked is named.
+      const summary = `<tr class="lease-group">
+        <td><button type="button" class="group-toggle"
+              data-group="${esc(g.key)}" aria-expanded="${open}"
+            >${open ? "▾" : "▸"}</button>
+          <code>${esc(g.domain)}</code>
+          <span class="ts">${g.count} hosts</span></td>
+        <td class="ts">${esc(g.clientClass)}</td>
+        <td class="lease-left${cd.urgent ? " urgent" : ""}"
+            data-expires="${esc(String(g.soonest))}">${esc(cd.text)}</td>
+        <td class="ts">first to lapse</td>
+        <td></td></tr>`;
+      return summary + g.leases.map(r => leaseRow(r, true, g.key, open)).join("");
+    }).join("");
+    renderLeasesStatus(rows.length);
+  }
+
+  // One lease as a row. `member` rows belong to a drawn group: indented, and hidden
+  // while it is collapsed — HIDDEN rather than omitted, so expanding is a class flip on
+  // rows already in the DOM and cannot race the four-second poll that would otherwise
+  // have to re-render to produce them.
+  //
+  // `data-expires` carries the absolute deadline so the one-second tick can rewrite the
+  // countdown without another fetch. The row is otherwise static, and re-polling once a
+  // second to move a clock would be the firehose `/api/egress/leases` avoids by not
+  // sending a remaining-seconds field at all.
+  function leaseRow(r, member, groupKey, open) {
+    const cd = leaseCountdown(leaseRemaining(r.expires_at, Date.now()));
+    return `<tr${member ? ` class="lease-member" data-group="${esc(groupKey)}"` : ""}
+        ${member && !open ? "hidden" : ""}>
+      <td><code>${esc(r.host)}</code></td>
+      <td class="ts">${esc(r.client_class || "")}</td>
+      <td class="lease-left${cd.urgent ? " urgent" : ""}"
+          data-expires="${esc(String(r.expires_at))}">${esc(cd.text)}</td>
+      <td class="ts">${esc(r.granted_by || "")}</td>
+      <td><button type="button" class="revoke"
+            data-lease="${esc(String(r.id))}">revoke</button></td></tr>`;
+  }
+
+  // Only the countdown cells, and only their text and urgency — never the row. Rebuilding
+  // the table every second would drop a click landing on a revoke button at the moment
+  // the tick fired, which is precisely when an operator is most likely to be pressing one.
+  function updateLeaseCountdowns() {
+    const now = Date.now();
+    for (const cell of leasesEl.querySelectorAll("td.lease-left")) {
+      const cd = leaseCountdown(leaseRemaining(cell.dataset.expires, now));
+      cell.textContent = cd.text;
+      cell.classList.toggle("urgent", cd.urgent);
+    }
+  }
+
+  // Delegated for the reason the rules table's handler is: the tbody is replaced
+  // wholesale on every poll, so a per-button listener would be re-bound every four
+  // seconds and lost in between.
+  //
+  // No `confirm()`, where revoking a RULE has one. The asymmetry is the point: that
+  // dialog guards an action with no undo, and this one has an obvious undo — the host
+  // goes back to being held, so the next request raises a card and the operator can
+  // grant it again. Making the reversible action as heavy as the irreversible one is
+  // how a confirmation stops being read.
+  document.getElementById("leases").addEventListener("click", async (ev) => {
+    // Expanding a group changes nothing and reaches nothing, so it is handled before
+    // the revoke path and takes none of its ceremony. The state lives OUTSIDE the
+    // render (`expandedLeaseGroups`) because the table is replaced wholesale every four
+    // seconds: held in the DOM alone, an expanded group would collapse itself on the
+    // next poll, which is the same class of bug as re-rendering on the one-second tick.
+    const toggle = ev.target.closest("button.group-toggle");
+    if (toggle) {
+      const key = toggle.dataset.group;
+      if (expandedLeaseGroups.has(key)) expandedLeaseGroups.delete(key);
+      else expandedLeaseGroups.add(key);
+      const open = expandedLeaseGroups.has(key);
+      // Applied to the rows already on screen rather than by re-rendering, so the click
+      // does not depend on a fetch and cannot be undone by one in flight.
+      toggle.textContent = open ? "▾" : "▸";
+      toggle.setAttribute("aria-expanded", String(open));
+      // Matched by comparing `dataset.group` rather than by an attribute SELECTOR built
+      // from the key. Half the key is a host the agent chose, so a selector would need
+      // escaping to be correct inside a quoted attribute value — `CSS.escape` does in
+      // fact produce a string that matches there, but reasoning about why is work this
+      // does not need to cost. A comparison has no escaping question to get wrong.
+      for (const row of leasesEl.querySelectorAll("tr.lease-member")) {
+        if (row.dataset.group === key) row.hidden = !open;
+      }
+      return;
+    }
+    const btn = ev.target.closest("button.revoke");
+    if (!btn) return;
+    const row = leasesById.get(btn.dataset.lease);
+    if (!row) return;
+    btn.disabled = true;
+    try {
+      const res = await fetch(
+        `/api/egress/leases/${encodeURIComponent(btn.dataset.lease)}/revoke`,
+        { method: "POST" });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok || !body.ok) {
+        // A 404 here is the ordinary race, not a fault: the lease expired, or another
+        // tab revoked it, between this table being drawn and the click. Said plainly
+        // rather than as a failure, because the operator's intent — that host is no
+        // longer leased — is now satisfied either way.
+        window.alert(res.status === 404
+          ? "That lease is already gone — it expired or was revoked elsewhere."
+          : `Could not revoke: ${body.detail || res.status}`);
+        btn.disabled = false;
+        refreshLeases();
+        return;
+      }
+    } catch (e) {
+      window.alert("Could not revoke: the control plane is unreachable.");
+      btn.disabled = false;
+      return;
+    }
+    refreshLeases();
+    // The revocation is an audited decision, so it belongs in the decisions view as
+    // soon as it happened rather than on that view's own next poll.
+    refreshAudit();
+  });
+
   // ── writing a rule with no held request behind it ─────────────────────────
   // The config-first half of policy. Every other rule in the store is downstream of
   // something the agent already did — a seed entry, or a `+ persist` on a card — so
@@ -2498,6 +2898,7 @@ function start() {
   connect();
   refreshAudit();
   refreshRules();
+  refreshLeases();
   // Also here, not only on stream open: the rule form needs the client classes, and it
   // has to work while the SSE feed is down — which is exactly when an operator is most
   // likely to be writing policy by hand rather than clicking cards.
@@ -2514,10 +2915,15 @@ function start() {
   // how they get noticed.
   setInterval(() => { if (visible()) refreshAudit(); }, 4000);
   setInterval(() => { if (visible()) refreshRules(); }, 4000);
+  // Gated and paced like the other two. The COUNTDOWNS do not depend on this poll —
+  // they tick from each row's own deadline on the one-second interval — so what four
+  // seconds bounds is only how long a lease that was revoked elsewhere, or that has
+  // just lapsed, stays listed.
+  setInterval(() => { if (visible()) refreshLeases(); }, 4000);
   // Refresh IMMEDIATELY on return, rather than leaving up to four seconds of
   // stale-but-unlabelled data on screen at the moment attention comes back to it.
   document.addEventListener("visibilitychange", () => {
-    if (visible()) { refreshAudit(); refreshRules(); }
+    if (visible()) { refreshAudit(); refreshRules(); refreshLeases(); }
   });
 }
 
@@ -2530,6 +2936,8 @@ if (typeof module !== "undefined" && module.exports) {
     toolRemaining, payloadDisclosure, toolOutcomeMessage, cardSubject,
     holdRemaining, countdownState, departure, persistPreview, saturationState,
     ackCount, capScope, requestsLabel, auditRow, auditStatus, rulesStatus, repeatCount,
+    leaseLabel, leaseRemaining, leaseCountdown, leasesStatus,
+    leaseDomain, groupLeases, LEASE_GROUP_MIN,
     outageSummary, pendingAnnouncement, coverageSummary, revokePreview,
     normalizePattern, createPreview, editPreview,
     timeWindow, filterActive, auditQuery, eventRow, historyPager,

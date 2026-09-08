@@ -149,6 +149,15 @@ _RELAY_ROUTES = (
     # an edit can flip a block into an allow, so it grants exactly as the collection
     # POST does and belongs in that class rather than beside the revoke it sits next to.
     ("POST", re.compile(r"^/api/egress/rules/[0-9]{1,19}/edit$")),
+    # The TIMED grants, under the same surface prefix. Two entries and not three: a
+    # lease is only ever created by resolving a card, so there is no collection POST
+    # here to allow — the relay surface says that as plainly as the backend does.
+    ("GET", re.compile(r"^/api/egress/leases$")),
+    # Revoking TIGHTENS — it can only take a grant away — so unlike the rule paths
+    # above this one is not in the granting class. It is here on its own terms anyway:
+    # the id-bounded shape is what keeps a path segment from becoming a traversal
+    # primitive, and that reasoning does not depend on which direction the call moves.
+    ("POST", re.compile(r"^/api/egress/leases/[0-9]{1,19}/revoke$")),
     ("GET", re.compile(r"^/api/config$")),
     ("POST", re.compile(r"^/api/saturation/ack$")),
 )

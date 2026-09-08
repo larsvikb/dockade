@@ -342,6 +342,16 @@ def _release_hold(approval_id: str) -> None:
         _close_group_locked(approval_id)
 
 
+def _classified(client_class: str | None) -> bool:
+    """Whether a grant that OUTLIVES the request can be scoped to this card's client.
+
+    Both `*_persist` and `allow_lease` need this, and need it for the same reason: such
+    a grant is scoped to a client class, and "whoever we could not identify" is not one
+    — ``resolve`` refuses both. One definition rather than the expression twice, so the
+    card cannot end up offering one of the two buttons while disabling the other."""
+    return bool(client_class) and client_class != policy.UNCLASSIFIED
+
+
 def _list_pending() -> list[dict]:
     with store._connect() as conn:
         rows = conn.execute(
@@ -377,17 +387,25 @@ def _list_pending() -> list[dict]:
     # before the click rather than after it. Both halves are needed: the rule can
     # appear between this render and the click, which is the only way the conflict
     # arises at all (see the conflict branch in ``resolve``).
-    # ``persistable`` is whether a `*_persist` can be offered at all. It is false for an
-    # unclassified client, because a standing rule has to be scoped to a class and
-    # "whoever we could not identify" is not one — ``resolve`` refuses it, and the card
-    # should say so before the click rather than after (the same discipline
-    # ``existing`` follows for the conflict case).
+    # ``persistable`` and ``leasable`` are whether each grant action can be offered at
+    # all — false for an unclassified client, because a grant that outlives the request
+    # has to be scoped to a class and "whoever we could not identify" is not one
+    # (``_classified``). ``resolve`` refuses both, and the card should say so before the
+    # click rather than after (the same discipline ``existing`` follows for the conflict
+    # case). TWO fields for one condition, deliberately: the payload then states what
+    # each button needs, rather than making the page know that persist and lease happen
+    # to share a precondition.
     # ``kind`` is what the merged queue dispatches on — see ``_pending_payload``. It
     # is stated on both builders rather than defaulted on one, so neither surface is
     # the implicit case that a reader has to infer from the absence of the other.
+    #
+    # A lease needs NO options field beside these. Its host is the requested one and
+    # its duration is the same for every card (``policy.LEASE_SECONDS``, served by
+    # ``/api/config``), so there is nothing per-approval for the operator to choose —
+    # which is exactly why the lease button is one click where a persist is two.
     return [dict(r, kind="egress", requests=max(1, waiters.get(r["id"], 1)),
-                 persistable=bool(r["client_class"])
-                 and r["client_class"] != policy.UNCLASSIFIED,
+                 persistable=_classified(r["client_class"]),
+                 leasable=_classified(r["client_class"]),
                  persist_options=[{"pattern": p, "scope": policy._pattern_scope(p),
                                    "existing": rules.get((p, r["client_class"]))}
                                   for p in policy._persist_candidates(r["host"])])

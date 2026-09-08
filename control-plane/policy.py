@@ -8,6 +8,10 @@ the module — a leading dot is a subdomain wildcard, and the two places that mu
 agree about it (the matcher and the patterns an operator may persist) are written
 side by side so they cannot drift.
 
+``_decide`` reads TWO tables, and the second is the one that expires: a lease is an
+allow scoped to one host, one client class and a deadline (``_live_lease``). It is
+consulted last, so it loses to a block like any other allow — see ``_decide``.
+
 ``_decide_tool`` at the bottom does the same job for the MCP gateway's own table,
 and shares no code with the host matcher on purpose: it is here to be read next to
 ``_decide``, because the ways the two differ are each a decision.
@@ -22,6 +26,7 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
+import time
 
 import store
 
@@ -122,6 +127,39 @@ def _client_class(client: str | None) -> str:
         if addr.version == net.version and addr in net:
             return name
     return UNCLASSIFIED
+
+
+def _normalize_host(host: str) -> str:
+    """A hostname in the ONE form ``_decide`` compares and the lease table stores.
+
+    The trailing FQDN dot goes for the reason ``_decide`` always removed it: `evil.com.`
+    and `evil.com` are the same destination, so an operator's block of one must not miss
+    the other. What is new is that a second consumer now needs the identical shape — a
+    lease is matched by EQUALITY against this (``_live_lease``), so a host normalized
+    differently on the two paths is a grant no request can ever equal.
+
+    A LEADING dot survives, unlike in ``_persist_candidates``. That asymmetry is the
+    point: a pattern is a namespace an operator picked from a bounded set, while this is
+    whatever the agent asked for, and folding `.example.com` down to `example.com` here
+    would silently widen a grant to the parent name.
+
+    Surrounding whitespace also survives, where ``_persist_candidates`` strips it, and
+    that is deliberately NOT tidied. This is the matcher's own normalization, unchanged
+    from before leases existed and doing the same two things to a name that the proxy's
+    relay guard does (``_forbidden_reason`` lowercases and drops the trailing dot too;
+    it additionally unbrackets IPv6, which nothing here needs). Adding a ``strip()``
+    would make a padded host match a rule it currently misses, and on an ALLOW rule
+    that is a loosening. As-is, a padded host stays unknown and gets a card — the
+    fail-safe direction — and a lease stored for one is padded identically, so it still
+    matches itself."""
+    return (host or "").lower().rstrip(".")
+
+
+def _short_duration(seconds: float) -> str:
+    """A duration for a human to read in an audit reason. Minutes and seconds only —
+    nothing here is ever longer than a lease, and an hours field would be dead code."""
+    whole = max(0, int(seconds))
+    return f"{whole // 60}m{whole % 60:02d}s" if whole >= 60 else f"{whole}s"
 
 
 def _match(host: str, pattern: str) -> bool:
@@ -277,6 +315,46 @@ def _rule_error(pattern: str, action: str) -> str | None:
     return None
 
 
+# ── leases: an allow that expires ────────────────────────────────────────────
+# How long an `allow_lease` grant decides for, and it lives HERE — beside the pass
+# that enforces the expiry — rather than with ``holds.HOLD_TIMEOUT``. The two are
+# unrelated timers that a reader will otherwise conflate: HOLD_TIMEOUT bounds how
+# long a human has to ANSWER, this bounds how long the answer LASTS. (Which is also
+# why nothing in this feature is called a "window": that word is already taken.)
+#
+# 30 minutes rather than the 5 the feature was first sketched with, and revocation is
+# what made that safe: `/api/egress/leases/{id}/revoke` closes a grant early, so the
+# duration stopped being a safety floor and became an ergonomics number — long enough
+# that an agent finishes what it was doing without a second card.
+#
+# Configurable, and the ACTION NAME deliberately does not encode the number for that
+# reason: an `allow_5m` button on a store configured for 30 minutes would be a lie
+# nothing could catch.
+LEASE_SECONDS = float(os.environ.get("CONTROL_LEASE_SECONDS", "1800"))
+
+
+def _live_lease(conn, host: str, client_class: str, now: float):
+    """The live lease covering ``host`` for ``client_class``, or None.
+
+    Expiry is enforced HERE, in the read, rather than by a sweeper — so a row that
+    outlives its deadline cannot grant no matter what did or did not delete it. The
+    sweep on the grant path (see the lease branch in ``resolve``) only bounds the
+    table's size; it is not what makes a lease end.
+
+    ``host`` is matched by equality on the ``_normalize_host`` form, never by
+    ``_match``: a lease names one destination and has no wildcard to widen along.
+
+    Longest-lived first, because that is the one whose remaining time the reason should
+    name. Two live rows for one host is unreachable today (see the absent UNIQUE in
+    ``store._LEASES_DDL``), so this is a defined answer to an undefined-by-construction
+    case rather than a case being handled."""
+    return conn.execute(
+        "SELECT id, expires_at FROM leases "
+        "WHERE host=? AND client_class=? AND expires_at > ? "
+        "ORDER BY expires_at DESC LIMIT 1",
+        (host, client_class, now)).fetchone()
+
+
 def _decide(host: str, client_class: str) -> tuple[str, str]:
     """(decision, reason). Block wins over allow; an unmatched host is HELD for
     human approval (2b) rather than denied outright.
@@ -286,24 +364,44 @@ def _decide(host: str, client_class: str) -> tuple[str, str]:
     host allowed for ANOTHER class is a least-privilege boundary doing its job — and
     those are indistinguishable to an operator who is looking at a rule they are sure
     they already approved. So the hold reason names the classes that DO match, which
-    is the whole of what "why am I being asked this again" needs answering."""
-    # Strip a trailing FQDN dot, matching the proxy's relay guard: `evil.com.` and
-    # `evil.com` are the same destination, so without this an explicit operator BLOCK
-    # of `evil.com` misses `evil.com.` — it lands in a hold and can be re-prompted
-    # indefinitely. (Stored patterns are already dot-normalized on the persist path.)
-    host = (host or "").lower().rstrip(".")
+    is the whole of what "why am I being asked this again" needs answering.
+
+    THREE passes now, and their order is the decision. Blocks first, then standing
+    allows, then live leases:
+
+      - A lease is an allow that expires, so it LOSES TO A BLOCK exactly as any allow
+        does. That falls out of the block pass running first, and it is the invariant
+        the ordering exists to guarantee: a timed grant must never become a way around
+        policy an operator wrote down.
+      - Leases come last because when both a rule and a lease cover a host, the
+        STANDING rule is the more informative thing to record. Which of two allows
+        answers a request cannot change the answer — only the audit line."""
+    host = _normalize_host(host)
     with store._connect() as conn:
         rows = conn.execute(
             "SELECT pattern, action, client_class FROM rules").fetchall()
-    # Filtered ONCE, before either pass, so block-wins-over-allow is decided within
-    # the class and cannot be influenced by a rule written for a different one.
-    mine = [r for r in rows if r["client_class"] == client_class]
-    for r in mine:
-        if r["action"] == "block" and _match(host, r["pattern"]):
-            return "deny", f"blocked by rule ({r['pattern']} for {client_class})"
-    for r in mine:
-        if r["action"] == "allow" and _match(host, r["pattern"]):
-            return "allow", f"allowed by rule ({r['pattern']} for {client_class})"
+        # Filtered ONCE, before either pass, so block-wins-over-allow is decided
+        # within the class and cannot be influenced by a rule written for a
+        # different one.
+        mine = [r for r in rows if r["client_class"] == client_class]
+        for r in mine:
+            if r["action"] == "block" and _match(host, r["pattern"]):
+                return "deny", f"blocked by rule ({r['pattern']} for {client_class})"
+        for r in mine:
+            if r["action"] == "allow" and _match(host, r["pattern"]):
+                return "allow", f"allowed by rule ({r['pattern']} for {client_class})"
+        # Same connection as the rules read, so one decision is one open of the store
+        # rather than two — and the lease is only consulted when no rule decided, which
+        # is what keeps this off the path of every already-allowed request.
+        now = time.time()
+        lease = _live_lease(conn, host, client_class, now)
+    if lease is not None:
+        # The remaining time goes IN THE REASON, so the trail explains a burst of
+        # allows on its own terms. Without it the log shows one human approval followed
+        # by traffic with no recorded cause: the record would exist and still not
+        # answer why any individual request was allowed.
+        return "allow", (f"allowed by lease ({host} for {client_class}, "
+                         f"{_short_duration(lease['expires_at'] - now)} left)")
     elsewhere = sorted({r["client_class"] for r in rows
                         if r["client_class"] != client_class
                         and _match(host, r["pattern"])})

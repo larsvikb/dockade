@@ -40,13 +40,19 @@ A human resolves holds over the approvals API (the SSE stream at /approvals/stre
 and POST /approvals/{id}/resolve), surfaced by the separate control-plane-ui
 frontend; the backend serves no HTML itself. GET /approvals is the non-streaming
 form of the same list and is still served here, but the UI does not use it and the
-frontend no longer relays it — see _RELAY_ROUTES in control-plane-ui/app.py. Four
+frontend no longer relays it — see _RELAY_ROUTES in control-plane-ui/app.py. Five
 read-only views back the rest of that UI: GET /api/audit (recent decisions, folded),
 GET /api/audit/events (the same record unfolded, filtered and paged — the two are one
 per ``audit.py``'s glance/record split), GET /api/egress/rules (the standing policy — see
-``api_rules`` for why that one has to be visible) and GET /api/config (the hold
-window, so a card can show its countdown):
+``api_rules`` for why that one has to be visible), GET /api/egress/leases (the timed
+grants deciding right now) and GET /api/config (the hold window, so a card can show
+its countdown, and the lease duration, so the button that grants one can label
+itself). The resolve vocabulary is a DURATION LADDER (``EGRESS_ACTIONS``):
   - allow-once / deny-once     — decide just this request
+  - allow-lease                — also allow that exact host, for that client class,
+    until ``policy.LEASE_SECONDS`` elapses. The rung between one request and standing
+    policy, for a host an agent is about to hit repeatedly; it takes no pattern choice
+    because it answers the breadth question by expiring.
   - allow-persist / deny-persist — also write a rule so future connections skip
     the hold (progressive trust; DESIGN.md "auto-approve progressively more"). WHICH
     rule is the operator's choice from a bounded set derived from the requested host
@@ -56,7 +62,10 @@ Standing policy is also editable directly, which is the half that does not begin
 a request: POST /api/egress/rules writes a rule (``create_rule``) and POST
 /api/egress/rules/{id}/revoke takes one back (``revoke_rule``). The pattern there IS
 caller-supplied — there is no held host to derive candidates from — so that path
-validates it (``policy._rule_error``) where the persist path constrains it.
+validates it (``policy._rule_error``) where the persist path constrains it. A lease has
+only the taking-back half, POST /api/egress/leases/{id}/revoke (``revoke_lease``):
+nothing creates one without a card to grant it from, because a timed grant with no
+request behind it is just a standing rule somebody will forget they wrote.
 
 Granting egress is the privileged act here, and there are two ways to perform it:
 resolving a hold, and writing a standing rule outright (``create_rule``, the config-
@@ -420,6 +429,29 @@ def healthz() -> dict:
 
 # ── authorize (proxy-facing) ────────────────────────────────────────────────
 
+def _decision_scope(status_row) -> str:
+    """How far a human's decision reached, for the audit reason a released waiter
+    writes. Read from the durable ``mode`` column, so it reports what was RECORDED
+    rather than what was asked for.
+
+    A function rather than the inline conditional it replaced, because there are three
+    modes now and the middle one is the reason: a lease is neither "this request only"
+    nor standing policy, and a log that collapsed it into either would misreport the one
+    thing an operator comes to this line to find out. `None` — no resolver row at all —
+    is the expiry path, which reached nothing.
+
+    Naming the lease's own deadline here would mean a second read of the ``leases``
+    table per released request; the configured duration is the same for every lease and
+    the row itself carries the exact instant (``/api/egress/leases``), so this states
+    the duration and lets that be the record."""
+    mode = status_row["mode"] if status_row else None
+    if mode == "persist":
+        return "standing rule written"
+    if mode == "lease":
+        return f"lease written, {policy._short_duration(policy.LEASE_SECONDS)}"
+    return "this request only"
+
+
 @authorize_app.post("/authorize", response_model=AuthorizeResponse)
 def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
     # Derived HERE, once, and carried through every write this request makes — the
@@ -519,16 +551,10 @@ def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
     # Carry the resolver's provenance (recorded by resolve()) into the audit reason,
     # so the log answers "who granted this egress" and not merely "a human did".
     actor = (status_row["resolved_by"] if status_row else None) or "actor unrecorded"
-    # Whether the decision also wrote STANDING POLICY belongs in the audit line: a
-    # one-off and a persist are the same allow for this request and very different
-    # afterwards, and the log said nothing about which had happened. From the durable
-    # ``mode`` column, so it reports what was recorded rather than what was asked for.
-    # (Naming the pattern too would need a column on ``approvals``, which has no
-    # migration step — see the NOTE below ``store._init_db``. The rule itself is
-    # recorded, with its pattern and ``source='operator'``, in the rules table.)
-    scope = ("this request only" if not status_row
-             else "standing rule written" if status_row["mode"] == "persist"
-             else "this request only")
+    # How far the decision REACHED belongs in the audit line: three modes that are the
+    # same allow for this request and very different afterwards, and the log said
+    # nothing about which had happened. See ``_decision_scope``.
+    scope = _decision_scope(status_row)
     # Read the STATUS rather than "did I win the expiry UPDATE": with duplicates
     # grouped, several waiters wake together and only one of them wins it. The losers
     # read status='expired' and must report the timeout too — testing `expired` alone
@@ -561,7 +587,19 @@ def approvals() -> dict:
 #: then this tool with these arguments, then this tool always — is not built. Offering
 #: `allow_persist` here would have to mean "allow this tool forever", which is the one
 #: rung of that ladder nobody should reach by clicking the same button twice.
-EGRESS_ACTIONS = ("allow_once", "allow_persist", "deny_once", "deny_persist")
+#:
+#: The egress set is a DURATION LADDER — this request, this host for a while, this
+#: pattern forever — and two absences on it are decisions:
+#:
+#:   - There is no `deny_lease`. An unmatched host is HELD, not denied, so a timed deny
+#:     would mean "suppress the card for a while", which is a different feature
+#:     (silencing a looping agent) wearing this one's name.
+#:   - There is no breadth choice on `allow_lease`. The `_persist_candidates` ladder
+#:     exists because a permanent rule needs an operator decision about how wide it is;
+#:     a lease answers that by expiring instead, and buying breadth would double the
+#:     card's decision surface for it. So a lease is always the exact host.
+EGRESS_ACTIONS = ("allow_once", "allow_lease", "allow_persist",
+                  "deny_once", "deny_persist")
 TOOL_ACTIONS = ("allow", "deny")
 
 
@@ -585,6 +623,7 @@ def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResp
         return JSONResponse({"ok": False, "detail": "bad action"}, status_code=400)
     outcome = "allow" if req.action.startswith("allow") else "deny"
     persist = req.action.endswith("persist")
+    lease = req.action.endswith("lease")
     # Captured BEFORE the update so the same value lands on the durable row and, via
     # that row, in the audit reason the blocked authorize() waiter writes.
     actor = _actor(request)
@@ -615,21 +654,28 @@ def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResp
         # chooses among candidates, it does not supply them (see
         # policy._persist_candidates).
         pattern = None
+        # Any grant that OUTLIVES this request — a standing rule or a timed lease —
+        # has to be scoped to a client class, and "whoever we could not identify" is
+        # not one: it would grant to every future unidentified client, which is
+        # precisely the union-of-needs erosion the class dimension exists to stop.
+        #
+        # The lease is refused for that reason too, even though it expires. Expiry
+        # bounds HOW LONG a grant lasts; it does nothing about WHO it covers, and a
+        # lease with no class to scope to covers a population rather than a client.
+        #
+        # Refused before the UPDATE like the two branches below, so the approval stays
+        # pending — the operator can still decide this request with `allow_once`, and
+        # is never stuck.
+        if (persist or lease) and (
+                not client_class or client_class == policy.UNCLASSIFIED):
+            return JSONResponse(
+                {"ok": False,
+                 "detail": f"this request came from an unclassified client "
+                           f"({row['client_class'] or 'none recorded'}), so no "
+                           f"{'standing rule' if persist else 'lease'} can be scoped "
+                           f"to it. Decide it with a *_once action, or map its network "
+                           f"in CONTROL_CLIENT_CLASSES."}, status_code=400)
         if persist:
-            if not client_class or client_class == policy.UNCLASSIFIED:
-                # A rule needs a class to be scoped to, and "whoever we could not
-                # identify" is not one: it would grant to every future unidentified
-                # client, which is precisely the union-of-needs erosion the class
-                # dimension exists to stop. Refused before the UPDATE like the two
-                # branches below, so the approval stays pending — the operator can
-                # still decide this request with a `*_once` action, and is never stuck.
-                return JSONResponse(
-                    {"ok": False,
-                     "detail": f"this request came from an unclassified client "
-                               f"({row['client_class'] or 'none recorded'}), so no "
-                               f"standing rule can be scoped to it. Decide it with a "
-                               f"*_once action, or map its network in "
-                               f"CONTROL_CLIENT_CLASSES."}, status_code=400)
             allowed = policy._persist_candidates(row["host"])
             if not allowed:
                 return JSONResponse(
@@ -690,12 +736,37 @@ def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResp
             # is asking for is already in force. Proceed, and report below that this
             # call wrote nothing, so the card stops claiming a write it did not make.
         wrote_rule = False
+        lease_expires_at = None
+        now = time.time()
         updated = conn.execute(
             "UPDATE approvals SET status=?, mode=?, resolved_at=?, resolved_by=? "
             "WHERE id=? AND status='pending'",
             ("allowed" if outcome == "allow" else "denied",
-             "persist" if persist else "once", time.time(), actor,
+             "persist" if persist else "lease" if lease else "once", now, actor,
              approval_id)).rowcount
+        if updated and lease:
+            # INSIDE the `updated` guard, which is the whole of what keeps a lease
+            # honest. The conditional UPDATE above is what makes exactly one of this
+            # call and the waiter's timeout the decider; writing the lease before it —
+            # where the persist path does its VALIDATION — would leave a live grant
+            # behind a card that expired and default-denied the request that raised it.
+            #
+            # Expired rows are swept here rather than by a background timer: this is
+            # the only place the table grows, so sweeping on it bounds the size without
+            # a second mechanism to reason about. It is not what ends a lease —
+            # ``policy._live_lease`` filters on the deadline, so a row that survives
+            # the sweep still cannot grant.
+            conn.execute("DELETE FROM leases WHERE expires_at <= ?", (now,))
+            lease_expires_at = now + policy.LEASE_SECONDS
+            # The host from the DURABLE row, normalized the one way `_decide` compares
+            # hosts — the same discipline the pattern follows, and here it is
+            # load-bearing rather than tidy: a lease is matched by equality, so a host
+            # stored in any other shape is a grant no request can ever equal.
+            conn.execute(
+                "INSERT INTO leases(host, client_class, approval_id, created_at, "
+                "expires_at, granted_by) VALUES (?,?,?,?,?,?)",
+                (policy._normalize_host(row["host"]), client_class, approval_id,
+                 now, lease_expires_at, actor))
         if updated and persist:
             # OR IGNORE stays, even though the conflicting case is now refused above:
             # the check and this insert are not one atomic statement, so a rule could
@@ -744,11 +815,17 @@ def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResp
     # ``client_class`` is echoed beside ``pattern`` because the two together are the
     # rule: the same pattern persisted from two cards is two different rules, and a
     # confirmation naming only the pattern would read identically for both.
+    # ``leased`` and ``lease_expires_at`` are the lease's half of the same honesty:
+    # the card reports the DEADLINE it was given rather than adding a configured
+    # duration to its own clock, so a page whose `/api/config` is stale — or whose
+    # machine's clock is off — cannot show a grant ending at a time it does not.
     return JSONResponse({"ok": True, "outcome": outcome,
                          "persisted": wrote_rule,
                          "already_present": persist and not wrote_rule,
                          "pattern": pattern,
-                         "client_class": client_class if persist else None})
+                         "leased": lease_expires_at is not None,
+                         "lease_expires_at": lease_expires_at,
+                         "client_class": client_class if persist or lease else None})
 
 
 def _resolve_tool_ask_request(approval_id: str, req: ResolveRequest,
@@ -1051,8 +1128,15 @@ def api_config() -> dict:
     refuses a class it does not know, so a page that guesses the list offers rules that
     cannot be written. Deriving it from the RULES instead would be worse than guessing —
     a class with no rules yet would be missing from the form, which is exactly the case
-    where an operator most needs to write the first one (a fresh MCP server, say)."""
+    where an operator most needs to write the first one (a fresh MCP server, say).
+
+    The lease duration is here so the button that grants one can LABEL ITSELF from the
+    server. A page that spelled "30 min" into its own markup would keep saying it on a
+    store configured for five, which is the same class of lie as a countdown that
+    invents a window — and it is why the action is named ``allow_lease`` rather than
+    after any number."""
     return {"hold_timeout": holds.HOLD_TIMEOUT,
+            "lease_seconds": policy.LEASE_SECONDS,
             "client_classes": list(policy._class_names())}
 
 
@@ -1345,6 +1429,95 @@ def revoke_rule(rule_id: int, request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "pattern": row["pattern"],
                          "action": row["action"],
                          "client_class": row["client_class"]})
+
+
+# ── leases (human-facing) ───────────────────────────────────────────────────
+# The timed half of egress policy, and its own pair of endpoints rather than a filter
+# on the rules ones — the rows are a different kind (``store._LEASES_DDL``) and they
+# answer a different question. ``/api/egress/rules`` is "what have I permanently
+# allowed"; this is "what am I allowing right now".
+
+@app.get("/api/egress/leases")
+def api_leases() -> list[dict]:
+    """The LIVE leases — every timed grant currently deciding requests.
+
+    Expired rows are filtered out rather than listed greyed-out: an expired lease is
+    not policy, and showing it would put something in the operator's "what is granted"
+    view that grants nothing. Rows are swept on the grant path (see the lease branch in
+    ``resolve``), so what this filters is only what has lapsed since the last grant.
+
+    Absolute ``expires_at``, never a remaining-seconds field, for the reason the
+    saturation payload states (``holds._saturation_payload``): a value that changes on
+    every tick defeats change-detection and turns a poll into a firehose. The client
+    does the arithmetic, as it already does for the hold countdown.
+
+    Unpaginated, as ``api_rules`` is and for the same reason — this is the complete set
+    of live timed grants, bounded by how many cards a human can click, and a silently
+    truncated view of what is currently allowed would be worse than none."""
+    with store._connect() as conn:
+        rows = conn.execute(
+            "SELECT id, host, client_class, approval_id, created_at, expires_at, "
+            "granted_by FROM leases WHERE expires_at > ? ORDER BY expires_at",
+            (time.time(),)).fetchall()
+    # Soonest to expire first: the one about to lapse is the one an operator might
+    # still want to act on, and the one whose disappearance from this list next is
+    # least surprising if it is at the top.
+    return [dict(r) for r in rows]
+
+
+@app.post("/api/egress/leases/{lease_id}/revoke")
+def revoke_lease(lease_id: int, request: Request) -> JSONResponse:
+    """End one timed grant early.
+
+    Without this a lease is a grant that can only be waited out, and it is what makes
+    the configured duration an ergonomics number rather than a safety floor
+    (``policy.LEASE_SECONDS``). No seed exemption of the kind ``revoke_rule`` carries:
+    every lease was written by a click on a card, so there is no reviewed file under
+    version control for a revocation here to leave disagreeing with the store.
+
+    Deletion rather than a tombstone — the same choice ``revoke_rule`` makes, for a
+    sharper reason. This table is transient by construction, so a dead row would be the
+    only long-lived thing in it and every reader, ``policy._live_lease`` included, would
+    have to filter for it. The audit rows are the history: ``resolve`` records the
+    grant, this records the end of it.
+
+    An ALREADY-EXPIRED row is deleted too and reported as such rather than refused. A
+    refusal would leave the operator looking at a button that failed for a reason
+    indistinguishable from a bug, where the honest answer — the grant had already ended,
+    and now the row is gone as well — is both true and what they were asking for.
+
+    **What this does not do is tear down an established connection.** The proxy
+    authorizes once per CONNECT tunnel, so a tunnel opened while the lease was live
+    keeps carrying requests after it ends (DESIGN.md, "A lease bounds authorization,
+    not connection lifetime"). Revoking stops the next connection, not this one."""
+    actor = _actor(request)
+    now = time.time()
+    with store._connect() as conn:
+        row = conn.execute(
+            "SELECT host, client_class, expires_at FROM leases WHERE id=?",
+            (lease_id,)).fetchone()
+        if row is None:
+            return JSONResponse({"ok": False, "detail": "unknown lease"},
+                                status_code=404)
+        conn.execute("DELETE FROM leases WHERE id=?", (lease_id,))
+        conn.commit()
+    was_live = row["expires_at"] > now
+    # What the host reverts TO is the useful half of the record, exactly as it is for a
+    # rule revocation: a lease ending sends the host back to being held for approval,
+    # not to being denied, and only the reason line says so.
+    store._audit(
+        "revoke", stage="policy", host=row["host"],
+        client_class=row["client_class"],
+        reason=(f"lease revoked by {actor} with "
+                f"{policy._short_duration(row['expires_at'] - now)} left; "
+                f"{row['host']} is now unknown for client class "
+                f"{row['client_class']} and will be held for approval"
+                if was_live else
+                f"expired lease removed by {actor}; it had already stopped deciding "
+                f"requests for {row['host']}"))
+    return JSONResponse({"ok": True, "host": row["host"],
+                         "client_class": row["client_class"],
+                         "was_live": was_live})
 
 
 # ── MCP gateway policy (human-facing) ───────────────────────────────────────

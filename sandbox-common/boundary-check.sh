@@ -328,6 +328,43 @@ else
     ok "mcp-net unreachable from sandbox (MCP server containers are out of reach)"
 fi
 
+printf '%s== tool gateway ==%s\n' "$bold" "$reset"
+# The gateway is the one governed service the agent is SUPPOSED to reach, so this
+# section is shaped the other way round from every other one here: the first probe
+# must succeed, and it is what makes the two that follow mean anything.
+#
+# Without it, "gateway unreachable on mcp-net" would pass on a host where the
+# gateway is simply not running — which is the failure mode the mcp section above
+# had to design around by probing the proxy instead. Here the positive control is
+# the same process on its agent-facing leg, so a pass on 172.30.0.11 and a failure
+# on 172.28.0.2 is a statement about ROUTING and binding, not about liveness.
+if curl --noproxy '*' --connect-timeout 5 -sf -o /dev/null http://172.30.0.11:8100/healthz 2>/dev/null; then
+    ok "tool gateway reachable on sandbox-net (172.30.0.11:8100) — the governed tool path is up"
+    gw_up=1
+else
+    # NOT a failure. The gateway is a normal compose service and an operator may be
+    # running this against infra brought up before it existed, or with it stopped.
+    # Saying so plainly beats a pass that silently covers nothing.
+    printf '  SKIP tool gateway not running — the two bind probes below are vacuous without it\n'
+    gw_up=0
+fi
+if [ "$gw_up" -eq 1 ]; then
+    # The agent surface must NOT be served on the gateway's other two legs. Both are
+    # addresses the sandbox has no route to, so a reply here would mean two failures
+    # at once — a wildcard bind AND a route that should not exist — and either alone
+    # is enough to make per-tool policy decorative. app.py refuses to start on a
+    # wildcard, so this is the check that the refusal is actually in force rather
+    # than merely written.
+    gw_leak=0
+    for gwaddr in 172.28.0.2:8100 172.27.0.3:8100; do
+        if curl --noproxy '*' --connect-timeout 5 -s -o /dev/null "http://${gwaddr}/healthz" 2>/dev/null; then
+            bad "tool gateway answers on $gwaddr — its agent surface is served off sandbox-net"
+            gw_leak=1
+        fi
+    done
+    [ "$gw_leak" -eq 0 ] && ok "tool gateway serves the agent leg only (silent on mcp-net and its control bridge)"
+fi
+
 printf '%s== ipv6 ==%s\n' "$bold" "$reset"
 if [ -e /proc/net/if_inet6 ]; then
     # Connect to a literal v6 address (no AAAA lookup needed). We assert on the

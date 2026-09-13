@@ -1,0 +1,11 @@
+# MCP gateway runtime deps. Pinned for reproducible builds, at the same bar as
+# control-plane/requirements.txt: this is a data-plane service that brokers
+# credentials, but it is not the egress security choke point (proxies/egress is),
+# so a tag pin rather than a digest.
+#
+# Held equal to the control plane's versions by tests/test_topology.py. The two
+# run the same stack for the same reason CI runs `make check` rather than
+# reimplementing it — one definition of "the Python service shape we ship", so a
+# FastAPI upgrade is one decision instead of a drift between two services.
+fastapi==0.115.6
+uvicorn==0.34.0

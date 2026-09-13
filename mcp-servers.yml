@@ -45,8 +45,13 @@
 # old server's rules. Pinning removes that race rather than narrowing it. Addresses
 # are allocated here, in the file that adds the server, so it stays one edit.
 #
+#     172.28.0.2    tool-gateway's leg   (pinned in docker-compose.yml)
 #     172.28.0.10   egress-proxy's leg   (pinned in docker-compose.yml)
 #     172.28.0.11+  MCP servers          (pinned below, one each)
+#
+# The gateway sits BELOW the server range on purpose: it is not a tenant of this
+# catalogue, so it should not consume an address from the block that grows. It
+# dials this network and serves nothing on it — see docker-compose.yml.
 #
 # Note this is about the SERVER's own outbound calls, not about tool calls. Tool
 # calls reach the gateway, which dialled the server BY NAME and can say which it is

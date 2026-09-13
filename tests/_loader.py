@@ -30,6 +30,7 @@ whose functions READ it, so ``cp.holds.MAX_PENDING = 2`` works where a re-export
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 import types
 from pathlib import Path
@@ -201,3 +202,29 @@ def load_control_plane() -> types.ModuleType:
     if pkg_dir not in sys.path:
         sys.path.insert(0, pkg_dir)
     return _load("dockade_control_plane", "control-plane/app.py")
+
+
+def load_tool_gateway(env: dict[str, str] | None = None) -> types.ModuleType:
+    """The MCP gateway, with its bind-guard environment applied at import.
+
+    Takes an ``env`` because the thing worth testing here resolves at MODULE
+    SCOPE: ``GATEWAY_AGENT_BIND`` and ``GATEWAY_BIND_FORBIDDEN`` are read into
+    constants when the module executes, exactly as they are in the container,
+    where the process is started once with a fixed environment. Rebinding them
+    afterwards would test a configuration the gateway can never actually be in.
+
+    Reloaded under a fresh module name per call for the same reason — a cached
+    module would carry the previous call's constants and quietly answer for the
+    wrong configuration."""
+    _install_fastapi_stub()
+    previous = {k: os.environ.get(k) for k in (env or {})}
+    os.environ.update(env or {})
+    try:
+        name = f"dockade_tool_gateway_{len(sys.modules)}"
+        return _load(name, "tool-gateway/app.py")
+    finally:
+        for key, was in previous.items():
+            if was is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = was

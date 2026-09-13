@@ -476,6 +476,88 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  # ── MCP gateway (GOVERNED data-plane tool) ──────────────────────────────────
+  # Speaks MCP to the sandbox and to the server containers, under per-tool policy
+  # held in the control plane. Governed rather than ungoverned by force, not by
+  # preference: an ungoverned tool must have no independent egress, and a gateway
+  # has egress and credentials by definition. See DESIGN.md, "MCP gateway".
+  #
+  # TRIPLE-HOMED, and the asymmetry between the three legs is the design. One is
+  # served on; two are only ever dialled out of.
+  tool-gateway:
+    build:
+      # This directory, not the repo root: there is no top-level seed to COPY, so
+      # the narrower context is both sufficient and the smaller thing to get wrong.
+      context: ./tool-gateway
+      dockerfile: Dockerfile
+    image: dockade-tool-gateway
+    container_name: tool-gateway
+    hostname: tool-gateway
+    # See egress-proxy for why the infra services are `always`.
+    restart: always
+    # Not `service_healthy` on the control plane: the gateway must come up and stay
+    # up whether or not the authority is reachable, because a gateway that is absent
+    # looks to the agent like a tool set that does not exist, while a gateway that is
+    # present and cannot reach policy fails each call closed — which is the behaviour
+    # default-deny asks for. Ordering here would trade the second for the first.
+    networks:
+      # The AGENT's network, and the only leg anything is served on. Pinned because
+      # GATEWAY_AGENT_BIND below names this exact address: a dynamic leg would be a
+      # listener that refuses to bind after a reallocation. .10 is the egress proxy.
+      sandbox-net:
+        ipv4_address: 172.30.0.11
+      # Dialled OUT to reach the server containers. Nothing is served here — that is
+      # what the single-address bind below enforces, and it is the point: a server
+      # container holds a write-capable credential, so one that could call the
+      # gateway's agent-facing endpoint would drive approved tool calls laterally.
+      #
+      # .2 rather than the .11+ range, which mcp-servers.yml allocates to servers:
+      # the gateway is not a tenant of the catalogue and should not consume an
+      # address from the block that grows.
+      mcp-net:
+        ipv4_address: 172.28.0.2
+      # Dialled OUT to reach the control plane's /tool/* bridge — the one built in
+      # #37. The control plane is .2 here; nothing else is on this network.
+      tool-authorize-net:
+        ipv4_address: 172.27.0.3
+      # NO egress-net leg, and that is not an omission. The gateway only ever dials
+      # siblings. The SERVERS need real internet, from containers holding
+      # credentials, which is exactly why that hop goes through the egress proxy
+      # instead. A route out here would sit next to the credentials being brokered.
+    environment:
+      # The agent-facing listener binds THIS ADDRESS ALONE. A wildcard would serve
+      # the MCP endpoint on mcp-net as well, so app.py refuses to start on one — the
+      # same mechanism, and the same reasoning, as CONTROL_MANAGE_BIND above.
+      GATEWAY_AGENT_BIND: 172.30.0.11
+      GATEWAY_AGENT_PORT: "8100"
+    healthcheck:
+      # Dials the PINNED ADDRESS, not loopback, because the listener binds one
+      # address and loopback is not it. Read out of the environment rather than
+      # written twice, so the healthcheck cannot drift from the bind it probes.
+      test:
+        - CMD
+        - python3
+        - -c
+        # Folded so the line stays inside yamllint's limit. Folding joins these
+        # with single spaces, which Python reads as one statement.
+        - >-
+          import os, urllib.request as u;
+          u.urlopen('http://%s:%s/healthz' % (os.environ['GATEWAY_AGENT_BIND'],
+          os.environ['GATEWAY_AGENT_PORT']), timeout=3)
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    # See egress-proxy for the rationale. A FastAPI process that brokers calls and
+    # holds no store: the footprint is small and this is headroom, not a target.
+    mem_limit: 256m
+    memswap_limit: 256m
+    pids_limit: 128
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
   # ── Local LLM inference (UNGOVERNED data-plane tool) ────────────────────────
   # An ungoverned tool in DESIGN.md's taxonomy: exposed fully to the agent, no
   # policy, no approval — and therefore it MUST have no independent egress. That

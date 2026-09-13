@@ -40,7 +40,7 @@ the repo follows from "containment is by **capability**, not configuration."
   [Server-side execution blind spots](#server-side-execution-accepted-governance-blind-spots)
 - [Capability inventory](#capability-inventory-v1) ·
   [Governance surfaces](#governance-surfaces)
-  (egress proxy · control plane · approval UI · [MCP gateway](#mcp-gateway--governed-tool-capability-planned-not-built))
+  (egress proxy · control plane · approval UI · [MCP gateway](#mcp-gateway--governed-tool-capability-placement-built-protocol-not-yet))
 - [Startup ordering](#startup-ordering--running-is-not-ready) ·
   [Resource limits](#resource-limits--blast-radius-not-boundary) ·
   [Local inference](#local-inference--an-ungoverned-llm-tool)
@@ -2163,7 +2163,7 @@ the storage mistake above wearing an API hat.
 Not yet built: git/secrets/cache data-plane services, the MCP gateway, skills,
 quality-gate hooks.
 
-### MCP gateway — governed tool capability (planned, not built)
+### MCP gateway — governed tool capability (placement built, protocol not yet)
 
 A data-plane service that speaks MCP to the sandbox on one side and to configured
 MCP servers on the other, exposing a **curated** tool set under per-tool
@@ -2231,6 +2231,29 @@ and `boundary-check.sh` proves from *inside the sandbox* that `mcp-net` is
 unreachable — probing the proxy's address there rather than a server's, because no
 server runs unless its profile is enabled and "nothing listening" would pass for the
 wrong reason.
+
+**The gateway is `tool-gateway`, and it is placed before it speaks.** The service
+is **triple-homed** — `sandbox-net`, `mcp-net`, `tool-authorize-net` — and the
+asymmetry between the three legs is the design rather than an implementation
+detail: one is *served on* and two are only ever *dialled out of*. The rule that
+generates it is the same one that decided the control plane's binds, applied from
+the other side: a surface lives on the network of whoever is meant to call it, and
+nowhere else. `tool-gateway/app.py` carries the refusals and the reasoning beside
+the code they constrain.
+
+Stated here because it is the part no single file can check. The gateway's bind
+guard can see the address it was given but not the networks it was attached to;
+compose declares the legs but cannot see which of them a listener opened. Neither
+end can catch a disagreement, so `tests/test_topology.py` holds the two equal —
+the bind against the pinned `sandbox-net` leg, the forbidden-CIDR default against
+the real subnets — and `boundary-check.sh` probes all three legs from inside a
+running sandbox, the agent-facing one as a **positive control** so that a silent
+`mcp-net` is a statement about binding rather than about nothing listening.
+
+The protocol half is not built: the service stands up, refuses a bad placement and
+answers a liveness probe. It serves no tools, dials no server and asks the control
+plane nothing. The `/tool/*` bridge it will consume has been live since the
+gateway's bridge shipped.
 
 **The control plane configures servers; it never starts them.** Adding a server
 means starting a container, and that would mean a docker socket on the
@@ -3269,8 +3292,9 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | tool asks: `tool_approvals`, the ask registry, one merged queue, `resolve` split | **done** |
 | — | the tool card — raw payload, per-surface actions | **done** — no schema-driven view; the raw payload is the whole of it |
 | — | timed grants (`leases`) — `allow_lease`, the live-lease strip, revoke | **done** — exact host only; no breadth ladder |
-| — | the gateway's bridge — `tool-authorize-net`, third listener, decide/roster/claim | **done** — inert until the gateway exists |
-| — | MCP gateway — per-tool allow/deny/ask | planned (unblocked — its whole control-plane surface is built) |
+| — | the gateway's bridge — `tool-authorize-net`, third listener, decide/roster/claim | **done** — inert until the gateway speaks |
+| — | `tool-gateway` placement — triple-homed, agent leg only, bind guard | **done** — serves no tools yet |
+| — | MCP gateway — per-tool allow/deny/ask | planned (next: roster + curated tool list) |
 
 The rationale for each shipped item lives under **Governance surfaces** above, not here
 — a status line goes stale, the reasoning does not. This section is deliberately the

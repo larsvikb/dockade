@@ -97,7 +97,8 @@ YAMLFILES := docker-compose.yml mcp-servers.yml .hadolint.yaml .yamllint \
 JSONFILES := $(shell git ls-files '*.json' 2>/dev/null)
 PYFILES := proxies/egress/addon.py control-plane-ui/app.py \
            control-plane/app.py control-plane/store.py control-plane/policy.py \
-           control-plane/holds.py control-plane/ingest.py control-plane/audit.py
+           control-plane/holds.py control-plane/ingest.py control-plane/audit.py \
+           tool-gateway/app.py
 # Dependency-free unit tests for the governance-critical decision logic. Kept
 # separate from PYFILES so they can be linted with the app code but discovered
 # and run on their own (python -m unittest, no pip installs — see tests/).
@@ -123,6 +124,8 @@ REFFILES := $(SCRIPTS) \
             control-plane/holds.py \
             control-plane/ingest.py \
             control-plane/requirements.txt \
+            tool-gateway/app.py \
+            tool-gateway/requirements.txt \
             control-plane-ui/app.py \
             control-plane-ui/requirements.txt \
             control-plane-ui/index.html \

@@ -189,7 +189,12 @@ class HomingClaimTests(_NeedsGit):
             text = (ROOT / doc).read_text()
             for m in re.finditer(r"\*\*(\w+)-homed\*\*\s*\(([^)]*)\)", text):
                 word, listed = m.group(1).lower(), m.group(2)
-                nets = {n.strip(" `") for n in listed.split("+")}
+                # ``strip()`` and not ``strip(" `")``: these docs are hard-wrapped, so
+                # a list of four networks WRAPS, and a member that carried a leading
+                # newline used to match no service's attachment set — the guard
+                # failing on correct prose, which is how a guard becomes something to
+                # appease rather than read.
+                nets = {n.strip().strip("`") for n in listed.split("+")}
                 line = text[:m.start()].count("\n") + 1
                 with self.subTest(doc=doc, line=line, claim=m.group(0)[:60]):
                     self.assertIn(word, COUNT_WORDS,

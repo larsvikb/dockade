@@ -25,8 +25,9 @@ socket, and (by design) no route to a control plane.
 > agent cannot reach (policy + audit in SQLite). An unknown host is **held for
 > approval** — a human approves/rejects it in a live UI (backend fully internal;
 > a separate `control-plane-ui` frontend carries the loopback UI). The backend's
-> API surface is **split across two internal networks**, so the egress proxy can
-> ask `/authorize` and cannot reach the approvals API at all. There are now
+> API surface is **split across internal networks**, one bridge per enforcer, so
+> each can ask its own policy question and none of them can reach the approvals
+> API at all. There are now
 > **two sandbox tiers** sharing one boundary implementation: tier 1 (Claude,
 > governed egress) and tier 2 (opencode against a local LLM, no egress and no
 > credentials). The audit trail is **browsable** — filters over the folded glance,
@@ -239,10 +240,11 @@ dockade/
   run-opencode-sandbox.sh   # tier 2: build + launch an opencode/local-LLM sandbox
   sandbox-lib.sh            # launcher plumbing shared by both tiers
   control-plane/            # governance authority BACKEND (agent cannot reach it)
-    Dockerfile              #   FastAPI over SQLite; two internal nets, fully internal
+    Dockerfile              #   FastAPI over SQLite; internal nets only, fully internal
     app.py                  #   the HTTP surface: /authorize on authorize-net; the
+                            #   gateway's bridge on tool-authorize-net; the
                             #   management API (approvals, resolve, the read-only
-                            #   views) on control-net; both listeners' entry point
+                            #   views) on control-net; every listener's entry point
     store.py                #   SQLite — schema, the audit write, the policy seed
     audit.py                #   the read side: the folded glance, the paged record,
                             #   and the filters both share

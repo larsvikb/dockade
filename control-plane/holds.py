@@ -10,8 +10,8 @@ which are in ``app.py``.
 
 SINGLE PROCESS ONLY. Every dict below is in-memory, so a held ``/authorize`` and
 the ``resolve`` that releases it must share memory; that constraint is what makes
-the two listeners two sockets in one process rather than two services (see the
-``app.py`` module docstring). The Event only WAKES the blocked worker — the
+the listeners separate sockets in one process rather than separate services (see
+the ``app.py`` module docstring). The Event only WAKES the blocked worker — the
 human's decision is read back from the durable approvals row, which is the single
 source of truth.
 
@@ -441,6 +441,20 @@ def _list_pending() -> list[dict]:
 # Fail-closed like the rest of the bounds, so it stays an env var (DESIGN.md, "Hold
 # bounds are fail-closed").
 TOOL_HOLD_TIMEOUT = float(os.environ.get("CONTROL_TOOL_HOLD_TIMEOUT", "3600"))
+# The window an APPROVED ask waits for the gateway to come back and claim it. A third
+# number rather than a reuse of the one above, because the two bound different waits:
+# ``TOOL_HOLD_TIMEOUT`` runs from the ask and bounds a human's attention, and this one
+# runs from ``resolved_at`` and bounds a GRANT. Sharing them would give an ask answered
+# one second before its deadline a one-second claim window, which is the bug that
+# reusing the field looks like it fixes.
+#
+# It exists because an unbounded grant is a standing authorization. Nothing is blocked
+# on an approved ask either, so without this a click could be redeemed a week later, by
+# a session the operator has forgotten, against conditions they would no longer approve
+# — the same "a decision is only good for the circumstances it was made in" that keeps
+# the decision endpoint uncacheable. Shorter than the ask window on purpose: a human
+# deciding is slow, and a gateway that already has its answer is not.
+TOOL_GRANT_TIMEOUT = float(os.environ.get("CONTROL_TOOL_GRANT_TIMEOUT", "900"))
 # The card caps, tool-side. Their own numbers rather than the egress ones, because
 # the two surfaces no longer share a pool and a queue of asks costs no workers.
 MAX_TOOL_PENDING = int(os.environ.get("CONTROL_MAX_TOOL_PENDING", "12"))
@@ -499,7 +513,22 @@ class ToolAsk(NamedTuple):
 
 
 def _expire_tool_asks() -> int:
-    """Retire every pending ask past its deadline. Returns how many.
+    """Retire every ask whose window has run out. Returns how many.
+
+    TWO windows, because an ask waits twice. A `pending` row is waiting for a human
+    and falls due at its stored ``deadline``; an `allowed` row nobody has claimed is
+    waiting for a GATEWAY, and falls due ``TOOL_GRANT_TIMEOUT`` after the human
+    answered. Both are retired here so that "the state is honest at every point anyone
+    can observe it" means the same thing for a grant as for a question — otherwise a
+    click stays redeemable forever and an approval becomes a standing authorization.
+
+    A CLAIMED row is never touched, whatever its age. It already ran, and relabelling
+    it `expired` would cost the one distinction a duplicate resumption depends on:
+    `spent` says the call happened, `expired` says it never will.
+
+    ``resolved_at`` is written only by the pending branch. On a grant it is the
+    human's decision time, which is what the cutoff is measured FROM, so overwriting
+    it would both destroy the record and move the deadline it defines.
 
     LAZY, and it has to be: nothing is blocked on a tool ask, so there is no waiter
     whose timeout would enforce the window and no reason to run a timer thread for a
@@ -518,17 +547,28 @@ def _expire_tool_asks() -> int:
     common case a WAL read. It is racy in the harmless direction: a row falling due
     between the two statements is expired on the next read instead of this one."""
     now = time.time()
+    grant_cutoff = now - TOOL_GRANT_TIMEOUT
     with store._connect() as conn:
+        # One probe for both windows, so the nothing-to-do case stays a single read.
         due = conn.execute(
-            "SELECT 1 FROM tool_approvals WHERE status='pending' AND deadline <= ? "
-            "LIMIT 1", (now,)).fetchone()
+            "SELECT 1 FROM tool_approvals WHERE (status='pending' AND deadline <= ?) "
+            "OR (status='allowed' AND claimed_at IS NULL "
+            "    AND resolved_at IS NOT NULL AND resolved_at <= ?) LIMIT 1",
+            (now, grant_cutoff)).fetchone()
         if due is None:
             return 0
-        cur = conn.execute(
+        retired = conn.execute(
             "UPDATE tool_approvals SET status='expired', resolved_at=? "
-            "WHERE status='pending' AND deadline <= ?", (now, now))
+            "WHERE status='pending' AND deadline <= ?", (now, now)).rowcount
+        # Separate statement rather than one OR'd UPDATE, because the SET clauses
+        # differ: see the ``resolved_at`` paragraph above.
+        retired += conn.execute(
+            "UPDATE tool_approvals SET status='expired' "
+            "WHERE status='allowed' AND claimed_at IS NULL "
+            "AND resolved_at IS NOT NULL AND resolved_at <= ?",
+            (grant_cutoff,)).rowcount
         conn.commit()
-        return cur.rowcount
+        return retired
 
 
 def _register_tool_ask(server: str, tool: str, args: object,
@@ -646,13 +686,21 @@ def _claim_tool_ask(approval_id: str) -> dict | None:
     needs this one: resumption is a request the agent makes, and an agent can make it
     twice. The claim is the conditional UPDATE below, so exactly one resumption of one
     approval ever performs the side effect — a second gets None and can be told the
-    ask is spent, which is a different answer from denied and from unknown."""
+    ask is spent, which is a different answer from denied and from unknown.
+
+    The grant window is in the UPDATE as well as in ``_expire_tool_asks`` above, and
+    the duplication is deliberate: expiry is lazy, so the predicate here is what makes
+    "a stale grant cannot be redeemed" a property of the write rather than of having
+    been read recently enough. The pass above is what turns the resulting None into an
+    `expired` status rather than a bare "not claimable"."""
     _expire_tool_asks()
+    now = time.time()
     with store._connect() as conn:
         changed = conn.execute(
             "UPDATE tool_approvals SET claimed_at=? "
-            "WHERE id=? AND status='allowed' AND claimed_at IS NULL",
-            (time.time(), approval_id)).rowcount
+            "WHERE id=? AND status='allowed' AND claimed_at IS NULL "
+            "AND resolved_at IS NOT NULL AND resolved_at > ?",
+            (now, approval_id, now - TOOL_GRANT_TIMEOUT)).rowcount
         conn.commit()
     return _get_tool_ask(approval_id) if changed else None
 

@@ -191,20 +191,23 @@ if [ -n "${HTTPS_PROXY:-}" ]; then
     else
         bad "egress proxy did NOT 403 the control-plane host (got: ${cphost:-<none>}) — control-net relay risk"
     fi
-    # Both control subnets, and the SECOND one is the one that matters. The proxy
-    # is attached to authorize-net (172.29.0.0/24) and NOT to control-net, so
+    # Every control subnet, and authorize-net is the one that matters. The proxy is
+    # attached to authorize-net (172.29.0.0/24) and to neither of the others, so
     # 172.29.0.2 is the address a relayed connection could actually land on —
-    # 172.31.0.2 is unroutable from the proxy and would fail even with the guard
-    # off, which makes it the weaker of the two probes despite being the older one.
-    # Keep both: the guard must not start depending on the topology for its effect.
+    # 172.31.0.2 (management) and 172.27.0.2 (the MCP gateway's bridge) are
+    # unroutable from the proxy and would fail even with the guard off, which makes
+    # them the weaker probes despite one being the oldest one here.
+    # Keep them all: the guard must not start depending on the topology for its
+    # effect, and the gateway's bridge is the destination a relay would be worth
+    # most — its claim endpoint releases an approved tool call.
     #
-    # NEITHER probe can tell you WHICH list refused it. Both addresses also fall
-    # inside PRIVATE_CIDRS (RFC1918 172.16.0.0/12), so a 403 here survives dropping
-    # them from EGRESS_FORBIDDEN_CIDRS entirely — which is precisely the state the
-    # startup assertion exists to prevent and cannot be observed from out here.
+    # NO probe here can tell you WHICH list refused it. Every one of these addresses
+    # also falls inside PRIVATE_CIDRS (RFC1918 172.16.0.0/12), so a 403 here survives
+    # dropping them from EGRESS_FORBIDDEN_CIDRS entirely — which is precisely the
+    # state the startup assertion exists to prevent and cannot be observed from here.
     # tests/test_topology.py asserts the CIDR list itself against the compose
     # subnets; this asserts the refusal a sandbox actually experiences.
-    for cpip_addr in 172.31.0.2 172.29.0.2; do
+    for cpip_addr in 172.31.0.2 172.29.0.2 172.27.0.2; do
         cpip="$(curl -sS -x "$HTTPS_PROXY" --connect-timeout 5 --max-time 8 \
             -o /dev/null "https://${cpip_addr}/" 2>&1 || true)"
         if printf '%s' "$cpip" | grep -q '403'; then
@@ -230,14 +233,19 @@ if [ -n "${HTTPS_PROXY:-}" ]; then
         bad "egress proxy did NOT 403 metadata IP 169.254.169.254 (got: ${imds:-<none>}) — SSRF/metadata risk"
     fi
 
-    # Same two destinations, written as IPv4-MAPPED IPv6. This is the spelling that
-    # used to defeat the relay guard entirely: address-family containment meant a
-    # mapped address matched none of the v4 blocked ranges, and the resolve branch
-    # re-tested the same unrecognized form, while connect() on a v4-mapped address
-    # still reaches the v4 host. The dotted-quad probes above passed throughout, so
-    # only an explicitly mapped probe can catch a regression here. Both must 403 for
-    # the same reason as their dotted-quad twins — BEFORE any policy or port check.
-    for mapped in "[::ffff:172.31.0.2]" "[::ffff:172.29.0.2]" "[::ffff:169.254.169.254]"; do
+    # THE SAME destinations, written as IPv4-MAPPED IPv6 — every one of them, which is
+    # the point: this is the spelling that used to defeat the relay guard entirely.
+    # Address-family containment meant a mapped address matched none of the v4 blocked
+    # ranges, and the resolve branch re-tested the same unrecognized form, while
+    # connect() on a v4-mapped address still reaches the v4 host. The dotted-quad
+    # probes above passed throughout, so only an explicitly mapped probe can catch a
+    # regression here — which is exactly why this list must gain every address that
+    # one gains. tests/test_topology.py holds the two in step, since a subnet added
+    # to the dotted list alone leaves the bypass unprobed for precisely that subnet.
+    # All must 403 for the same reason as their dotted twins — BEFORE any policy or
+    # port check.
+    for mapped in "[::ffff:172.31.0.2]" "[::ffff:172.29.0.2]" "[::ffff:172.27.0.2]" \
+        "[::ffff:169.254.169.254]"; do
         resp="$(curl -sS -x "$HTTPS_PROXY" --connect-timeout 5 --max-time 8 \
             -o /dev/null "https://${mapped}/" 2>&1 || true)"
         if printf '%s' "$resp" | grep -q '403'; then
@@ -279,20 +287,26 @@ printf '%s== control plane ==%s\n' "$bold" "$reset"
 # matching docker-compose.yml) — DNS-independent, like the raw-IP egress probe.
 # --noproxy '*' so we test the sandbox's OWN routing, not the egress proxy (which
 # legitimately can reach the control plane on control-net). Any reply is a leak.
-# BOTH of its addresses, because it now answers a different surface on each and
-# the agent must reach neither: 172.31.0.2:8090 is the management API (approvals,
-# resolve, the audit store) and 172.29.0.2:8091 is /authorize on authorize-net.
-# Probing only the first would leave the newer network unasserted precisely
-# because it is newer.
+# ALL THREE of its addresses, because it answers a different surface on each and
+# the agent must reach none of them: 172.31.0.2:8090 is the management API
+# (approvals, resolve, the audit store), 172.29.0.2:8091 is /authorize on
+# authorize-net, and 172.27.0.2:8092 is the MCP gateway's bridge on
+# tool-authorize-net — the one that can release an approved tool call. Probing only
+# the older ones would leave each new network unasserted precisely because it is new.
+#
+# Every one of these is a genuine negative control rather than an absent listener:
+# all three sockets are bound by the same running process, and the positive control
+# is the UI's own use of the management port. A reply here is a route the sandbox
+# must not have.
 cp_leak=0
-for target in 172.31.0.2:8090 172.29.0.2:8091; do
+for target in 172.31.0.2:8090 172.29.0.2:8091 172.27.0.2:8092; do
     if curl --noproxy '*' --connect-timeout 5 -s -o /dev/null "http://${target}/healthz" 2>/dev/null; then
         bad "control plane reachable from sandbox ($target) — control-network leak"
         cp_leak=1
     fi
 done
 if [ "$cp_leak" -eq 0 ]; then
-    ok "control plane unreachable from sandbox on both control networks"
+    ok "control plane unreachable from sandbox on all three control networks"
 fi
 
 printf '%s== mcp ==%s\n' "$bold" "$reset"

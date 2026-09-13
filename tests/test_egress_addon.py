@@ -136,18 +136,21 @@ class EnvParsingTests(unittest.TestCase):
 
 class ForbiddenGuardTests(unittest.TestCase):
     """The relay guard — the one place segmentation can't cover, so it must be
-    airtight. Defaults: FORBIDDEN_HOSTS = control-plane/-ui, FORBIDDEN_CIDRS = the
-    two control subnets (control-net 172.31.0.0/24 and authorize-net
-    172.29.0.0/24), plus PRIVATE_CIDRS (cloud metadata / link-local, loopback,
+    airtight. Defaults: FORBIDDEN_HOSTS = control-plane/-ui, FORBIDDEN_CIDRS = every
+    control subnet (control-net 172.31.0.0/24, authorize-net 172.29.0.0/24 and the
+    MCP gateway's bridge, tool-authorize-net 172.27.0.0/24), plus PRIVATE_CIDRS
+    (cloud metadata / link-local, loopback,
     RFC1918) which are hard-blocked just the same so the proxy can never be an
     SSRF pivot to the instance-metadata service or the internal net."""
 
-    def test_both_control_subnets_are_forbidden(self):
+    def test_every_control_subnet_is_forbidden(self):
         # authorize-net is the one the proxy is actually ATTACHED to, so it is the
-        # subnet a relayed connection could really land on; control-net is listed
+        # subnet a relayed connection could really land on; the other two are listed
         # even though the proxy has no route there, because unroutability is a
-        # property of docker-compose.yml that this guard cannot verify.
-        for ip in ("172.31.0.9", "172.29.0.2"):
+        # property of docker-compose.yml that this guard cannot verify. The
+        # gateway's bridge is where a relay would be worth most — its claim
+        # endpoint releases an approved tool call.
+        for ip in ("172.31.0.9", "172.29.0.2", "172.27.0.2"):
             reason = addon._forbidden_reason(ip)
             self.assertIsNotNone(reason, ip)
             self.assertIn("control network", reason, ip)

@@ -2,10 +2,10 @@
 """Guards over the network topology in ``docker-compose.yml``.
 
 The API-surface split is only half code. ``control-plane/app.py`` serves
-``/authorize`` and the management API on two sockets, and
-``tests/test_control_plane_api.py`` asserts which handler lands on which — but
-what makes that worth anything is that the egress proxy has a route to one and
-not the other, and that lives here, in compose.
+``/authorize``, the MCP gateway's bridge and the management API on separate
+sockets, and ``tests/test_control_plane_api.py`` asserts which handler lands on
+which — but what makes that worth anything is that each enforcer has a route to its
+own bridge and to nothing else, and that lives here, in compose.
 
 Neither half is checkable from the other. The app cannot see the topology it runs
 under, and compose cannot see which routes an app serves. So the coupling has no
@@ -44,12 +44,13 @@ BOUNDARY = (ROOT / "sandbox-common" / "boundary-check.sh").read_text()
 APP = (ROOT / "control-plane" / "app.py").read_text()
 POLICY = (ROOT / "control-plane" / "policy.py").read_text()
 
-#: The control plane's two listeners. Duplicated from app.py's defaults rather
+#: The control plane's three listeners. Duplicated from app.py's defaults rather
 #: than imported, deliberately: this file is asserting that compose and the app
 #: AGREE, and importing the value from one side would make half the comparison
 #: vacuous.
 AUTHORIZE_PORT = 8091
 MANAGE_PORT = 8090
+TOOL_PORT = 8092
 
 
 def _block(lines: list[str], key: str, indent: int) -> list[str]:
@@ -382,11 +383,80 @@ class ControlPlaneBindTests(unittest.TestCase):
         self.assertTrue(bind.startswith(net + "."),
                         f"CONTROL_MANAGE_BIND {bind} is not on control-net")
 
-    def test_the_control_plane_spans_both_control_networks(self):
+    def test_the_control_plane_spans_every_control_network(self):
         # It is the one service that does, and that is the whole design: one
-        # process, one surface per network.
+        # process, one surface per network — the shared management path plus one
+        # single-conversation bridge per enforcer.
         self.assertEqual(_networks_of("control-plane"),
-                         {"control-net", "authorize-net"})
+                         {"control-net", "authorize-net", "tool-authorize-net"})
+
+    def test_the_tool_listener_binds_its_own_bridge_address(self):
+        # The narrower of the two bind rules, and the reason it is not the authorize
+        # listener's wildcard: this surface can release an approved tool call, so
+        # serving it on every interface would put it within the egress proxy's reach.
+        bind = _environment_of("control-plane")["CONTROL_TOOL_BIND"]
+        self.assertNotIn(bind, ("0.0.0.0", "::", "*", ""))  # noqa: S104
+        net = _subnet_of("tool-authorize-net").split("/")[0].rsplit(".", 1)[0]
+        self.assertTrue(bind.startswith(net + "."),
+                        f"CONTROL_TOOL_BIND {bind} is not on tool-authorize-net")
+
+    def test_the_bound_tool_address_is_the_leg_compose_pins(self):
+        # A bind that names an address this container does not hold is a listener
+        # that refuses to start — the fail-closed direction, but at boot on the host
+        # rather than here. The two are set in different blocks of the same file,
+        # which is exactly the pair nothing else compares.
+        leg = _scalar(_block(_service("control-plane"), "tool-authorize-net", 6),
+                      "ipv4_address")
+        self.assertEqual(_environment_of("control-plane")["CONTROL_TOOL_BIND"], leg)
+
+    def test_every_probed_control_plane_address_is_one_compose_pins(self):
+        # boundary-check.sh proves the sandbox has no route to the control plane by
+        # dialing LITERAL addresses, one per surface. Each probe means something only
+        # because a listener is really there: a pin that moves, or a port that
+        # changes, leaves the probe passing against nothing — the same drift
+        # ``test_the_probed_mcp_address_is_the_one_compose_pins`` exists for, and the
+        # two files still cannot see each other. All three surfaces, because the
+        # newest is the one a reader is most likely to leave unasserted.
+        for net, port in (("control-net", MANAGE_PORT),
+                          ("authorize-net", AUTHORIZE_PORT),
+                          ("tool-authorize-net", TOOL_PORT)):
+            with self.subTest(network=net):
+                pinned = _scalar(_block(_service("control-plane"), net, 6),
+                                 "ipv4_address")
+                self.assertIsNotNone(
+                    pinned, f"the control plane's {net} leg has no fixed address")
+                self.assertIn(f"{pinned}:{port}", BOUNDARY,
+                              f"boundary-check.sh does not probe {net} at the "
+                              f"address and port compose deploys")
+
+    def test_every_relay_probe_has_an_ipv4_mapped_twin(self):
+        # The relay guard is probed twice per address, and the mapped spelling is not
+        # decoration: address-family containment once defeated the guard entirely,
+        # and the dotted-quad probes passed throughout. So the mapped list is the only
+        # one that can catch a regression of it, and a new control subnet added to
+        # the dotted list alone leaves the bypass unprobed for exactly that subnet.
+        for net in ("control-net", "authorize-net", "tool-authorize-net"):
+            with self.subTest(network=net):
+                pinned = _scalar(_block(_service("control-plane"), net, 6),
+                                 "ipv4_address")
+                self.assertIn(f"[::ffff:{pinned}]", BOUNDARY,
+                              f"boundary-check.sh probes {pinned} as a dotted quad "
+                              f"but not as IPv4-mapped IPv6, which is the only "
+                              f"spelling that catches an address-family bypass")
+
+    def test_nothing_else_joins_the_tool_bridge(self):
+        # One member today and exactly two ever: the control plane and the MCP
+        # gateway. The roster is asserted rather than the absence of a particular
+        # service, because the point of a SECOND bridge is that no third component —
+        # least of all the egress proxy — reaches the claim endpoint on it.
+        members = {name.strip().rstrip(":")
+                   for name in _block(COMPOSE, "services", 0)
+                   if len(name) - len(name.lstrip(" ")) == 2
+                   and name.strip().endswith(":")
+                   and "tool-authorize-net" in _raw_networks(
+                       name.strip().rstrip(":"))}
+        self.assertEqual(members, {"control-plane"})
+        self.assertNotIn("tool-authorize-net", _networks_of("egress-proxy"))
 
     def test_the_ui_talks_to_the_management_port_over_control_net(self):
         self.assertEqual(_networks_of("control-plane-ui"),
@@ -456,12 +526,29 @@ class RelayGuardAgreesWithComposeTests(unittest.TestCase):
 
     def test_the_guard_default_covers_every_control_subnet(self):
         default = re.search(
-            r'"EGRESS_FORBIDDEN_CIDRS",\s*\n?\s*"([^"]+)"', ADDON)
+            r'FORBIDDEN_CIDRS_DEFAULT = "([^"]+)"', ADDON)
         self.assertIsNotNone(default, "could not find the FORBIDDEN_CIDRS default")
+        listed = {c.strip() for c in default.group(1).split(",")}
+        for network in ("control-net", "authorize-net", "tool-authorize-net"):
+            self.assertIn(_subnet_of(network), listed,
+                          f"{network}'s subnet is not in the relay guard's default")
+
+    def test_the_tool_bind_guard_names_every_other_enforcers_network(self):
+        # The app-side half of the same two-ends problem, and it has to be checked
+        # from compose for the same reason: a default pointed at a range nothing
+        # uses passes every wildcard test while leaving the claim endpoint bindable
+        # on authorize-net. The tool bridge's OWN subnet must not be listed — that
+        # is the address the listener is required to bind.
+        default = re.search(
+            r'"CONTROL_TOOL_BIND_FORBIDDEN", "([^"]+)"', APP)
+        self.assertIsNotNone(default, "could not find the tool bind guard's default")
         listed = {c.strip() for c in default.group(1).split(",")}
         for network in ("control-net", "authorize-net"):
             self.assertIn(_subnet_of(network), listed,
-                          f"{network}'s subnet is not in the relay guard's default")
+                          f"{network}'s subnet is not in the tool bind guard")
+        self.assertNotIn(_subnet_of("tool-authorize-net"), listed,
+                         "the tool bridge's own subnet is forbidden to the listener "
+                         "that is required to bind it")
 
     def test_the_lifeline_range_is_the_sandbox_network(self):
         # Same two-ends-no-compiler problem as the guard above, opposite sign: this
@@ -483,7 +570,8 @@ class RelayGuardAgreesWithComposeTests(unittest.TestCase):
         default = re.search(r'"EGRESS_LIFELINE_CIDRS",\s*\n?\s*"([^"]+)"', ADDON)
         lifeline = [ipaddress.ip_network(c.strip())
                     for c in default.group(1).split(",")]
-        for network in ("mcp-net", "control-net", "authorize-net"):
+        for network in ("mcp-net", "control-net", "authorize-net",
+                        "tool-authorize-net"):
             subnet = ipaddress.ip_network(_subnet_of(network))
             for granted in lifeline:
                 self.assertFalse(
@@ -500,7 +588,7 @@ class RelayGuardAgreesWithComposeTests(unittest.TestCase):
             r'CLIENT_CLASSES_DEFAULT = "([^"]+)"', POLICY)
         self.assertIsNotNone(default, "could not find the CLIENT_CLASSES default")
         subnets = {_subnet_of(n) for n in ("sandbox-net", "mcp-net", "control-net",
-                                           "authorize-net")}
+                                           "authorize-net", "tool-authorize-net")}
         mapped = {}
         for entry in default.group(1).split(","):
             name, _, cidr = entry.partition("=")
@@ -546,7 +634,8 @@ class RelayGuardAgreesWithComposeTests(unittest.TestCase):
         # ignores HTTPS_PROXY fails loudly instead of quietly going direct — from a
         # container holding a write-capable credential. Placement is that boundary;
         # nothing inside those containers enforces it.
-        for network in ("control-net", "authorize-net", "sandbox-net", "mcp-net"):
+        for network in ("control-net", "authorize-net", "tool-authorize-net",
+                        "sandbox-net", "mcp-net"):
             body = _block(_block(COMPOSE, "networks", 0), network, 2)
             self.assertTrue(
                 any(re.match(r"\s*internal:\s*true\s*$", line) for line in body),
@@ -653,6 +742,19 @@ class AppPortDefaultsAgreeTests(unittest.TestCase):
 
     def test_manage_port_default_matches_compose(self):
         self.assertEqual(self._default("CONTROL_MANAGE_PORT"), MANAGE_PORT)
+
+    def test_tool_port_default_matches_compose(self):
+        # Compose sets no port for this listener either, so the app's default is the
+        # deployed one — and it is what boundary-check.sh probes by literal.
+        self.assertEqual(self._default("CONTROL_TOOL_PORT"), TOOL_PORT)
+
+    def test_the_three_listeners_have_three_distinct_ports(self):
+        # ``_assert_listeners_separated`` refuses a shared port at startup; this is
+        # the same property read off the shipped defaults, so a collision is a failed
+        # test rather than a container that will not boot.
+        ports = {self._default(f"CONTROL_{name}_PORT")
+                 for name in ("AUTHORIZE", "MANAGE", "TOOL")}
+        self.assertEqual(len(ports), 3, ports)
 
 
 class ProxyOutlastsTheHoldWindowTests(unittest.TestCase):

@@ -62,6 +62,38 @@ networks:
     ipam:
       config:
         - subnet: 172.29.0.0/24
+  # The MCP gateway's AUTHORIZE path. internal:true. Carries exactly one
+  # conversation: the gateway asking the control plane what a tool call may do, which
+  # servers are configured, and whether it may run an ask a human approved.
+  #
+  # A SECOND bridge rather than a shared one, and that is the whole reason it exists.
+  # `authorize-net` would have been one line of YAML, and it would have created a
+  # lateral edge between two enforcers: the egress proxy's relay guard is best-effort
+  # by construction (it re-resolves, so a name can change answers between the check
+  # and the dial), so the design assumes a bypassed proxy — and a bypassed proxy must
+  # not reach the gateway's claim endpoint, which is the one place an approved side
+  # effect gets released. Splitting the nets means the blast radius of that bypass is
+  # still one policy query and nothing else.
+  #
+  # The control plane serves a THIRD surface here, on its own port and bound to this
+  # network's address ALONE — app.py refuses to start on a wildcard, exactly as it
+  # does for the management listener. Both halves are needed, for the reason spelled
+  # out under `authorize-net`: the network split alone would still expose a
+  # single all-routes listener, and the port split alone would sit on a network the
+  # proxy can already reach.
+  #
+  # ONE MEMBER TODAY, which is the same order the MCP catalogue shipped in: the
+  # surface the gateway will speak to is built and asserted before the gateway that
+  # consumes it. The sandbox is never attached — `make consistency` fails on a
+  # launcher that names any control network, and boundary-check.sh probes this
+  # network's address from inside a running sandbox.
+  tool-authorize-net:
+    name: tool-authorize-net
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.27.0.0/24
   # MCP data path. internal:true. Carries two conversations and no others: the MCP
   # gateway dialing the MCP server containers, and those containers reaching the
   # egress proxy for their own upstream calls.
@@ -295,6 +327,11 @@ services:
         ipv4_address: 172.31.0.2
       authorize-net:
         ipv4_address: 172.29.0.2
+      # The MCP gateway's bridge. Pinned like the others on this service, and
+      # required to be: CONTROL_TOOL_BIND below names this exact address, so a
+      # dynamic leg would be a listener that refuses to bind after a reallocation.
+      tool-authorize-net:
+        ipv4_address: 172.27.0.2
     environment:
       # The management listener binds THIS ADDRESS ALONE, which is the mechanism
       # that keeps it off authorize-net — a wildcard bind would serve `resolve` to
@@ -302,6 +339,12 @@ services:
       # listener binds the wildcard on purpose: it is the safe surface, and the
       # healthcheck below reaches it over loopback.
       CONTROL_MANAGE_BIND: 172.31.0.2
+      # The gateway's bridge binds ONE address for the same reason the management
+      # listener does, and it is the narrower case of the two: this surface can
+      # release an approved call (the claim endpoint), so serving it on the
+      # wildcard would put it within the egress proxy's reach. app.py refuses to
+      # start on a wildcard here too.
+      CONTROL_TOOL_BIND: 172.27.0.2
     volumes:
       - control-state:/var/lib/control-plane
       # The egress proxy's own audit file, READ-ONLY. Not all egress decisions are
@@ -312,14 +355,19 @@ services:
       # rewrite the evidence it is reading.
       - egress-audit:/var/log/egress:ro
     # /healthz on the AUTHORIZE listener (8091), which is the one the proxy's
-    # service_healthy gate is actually about. Probed over loopback, which reaches
-    # it because that listener binds the wildcard; the management listener binds
-    # 172.31.0.2 alone and is deliberately not probeable from here.
+    # service_healthy gate is actually about. Probed over loopback, which reaches it
+    # because that listener binds the wildcard. It is the ONLY one of the three that
+    # is probeable from here, and by construction: the management listener binds
+    # 172.31.0.2 alone and the gateway's bridge binds 172.27.0.2 alone, which is the
+    # same single-address rule that keeps each off the others' networks. The tool
+    # bridge therefore has no health probe at all — worth stating, because that is a
+    # consequence of the bind rule rather than an omission, and the probe that would
+    # fix it would have to come from the gateway's side of the bridge.
     #
-    # `main` seeds the policy rules and expires stale approvals BEFORE either
-    # socket binds, so "answers /healthz" is strictly later, and more meaningful,
-    # than "container started". This is the health gate the other two services
-    # wait on.
+    # `main` seeds the policy rules and expires stale approvals BEFORE any of the
+    # three sockets bind, so "answers /healthz" is strictly later, and more
+    # meaningful, than "container started". This is the health gate the other two
+    # services wait on.
     #
     # Deliberately SHALLOW: it returns a static 200 without touching SQLite, so
     # healthy here means "serving", not "store verified". Deepening it to a

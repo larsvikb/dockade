@@ -59,9 +59,8 @@ class BindGuardTests(unittest.TestCase):
         # and a guard that depended on today's topology would need revisiting every
         # time the topology changed — which is when it is least likely to happen.
         for addr in ("172.27.0.3", "172.29.0.2", "172.31.0.2"):
-            with self.subTest(bind=addr):
-                with self.assertRaises(SystemExit):
-                    self._guard({"GATEWAY_AGENT_BIND": addr})
+            with self.subTest(bind=addr), self.assertRaises(SystemExit):
+                self._guard({"GATEWAY_AGENT_BIND": addr})
 
     def test_a_hostname_is_not_inside_anything_and_is_not_resolved(self):
         # A guard that resolved names would depend on DNS, which is the class of

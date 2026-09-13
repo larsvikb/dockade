@@ -260,6 +260,10 @@ dockade/
                             #   say script-src 'self'; pure helpers unit-tested under node
     index.html              #   static shell + styles for the SSE approval console
     requirements.txt        #   pinned deps (fastapi, uvicorn, httpx)
+  tool-gateway/             # MCP GATEWAY — governed tool capability (placement only)
+    Dockerfile              #   FastAPI + uvicorn; triple-homed, no egress leg
+    app.py                  #   the bind guard + liveness; serves no tools yet
+    requirements.txt        #   pinned deps, held equal to the control plane's
   policies/                 # seed policy config (loaded into the control plane)
     egress-allowlist.txt    #   default-deny seed for the control plane's egress policy store
   proxies/                  # governed data-plane services (one dir per proxy)

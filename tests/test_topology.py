@@ -445,17 +445,21 @@ class ControlPlaneBindTests(unittest.TestCase):
                               f"spelling that catches an address-family bypass")
 
     def test_nothing_else_joins_the_tool_bridge(self):
-        # One member today and exactly two ever: the control plane and the MCP
+        # Both members now, and exactly these two ever: the control plane and the MCP
         # gateway. The roster is asserted rather than the absence of a particular
         # service, because the point of a SECOND bridge is that no third component —
         # least of all the egress proxy — reaches the claim endpoint on it.
+        #
+        # The set is now CLOSED rather than pending, which is the state that makes
+        # this guard bite: with one member it could only catch an arrival, and the
+        # arrival it was waiting for was legitimate. From here every addition is one.
         members = {name.strip().rstrip(":")
                    for name in _block(COMPOSE, "services", 0)
                    if len(name) - len(name.lstrip(" ")) == 2
                    and name.strip().endswith(":")
                    and "tool-authorize-net" in _raw_networks(
                        name.strip().rstrip(":"))}
-        self.assertEqual(members, {"control-plane"})
+        self.assertEqual(members, {"control-plane", "tool-gateway"})
         self.assertNotIn("tool-authorize-net", _networks_of("egress-proxy"))
 
     def test_the_ui_talks_to_the_management_port_over_control_net(self):
@@ -484,6 +488,139 @@ def _raw_networks(service: str) -> set[str]:
         return _networks_of(service)
     except AssertionError:
         return set()
+
+
+GATEWAY_SRC = (ROOT / "tool-gateway" / "app.py").read_text()
+
+
+def _gateway_port() -> str:
+    """The agent-facing port as compose sets it, unquoted.
+
+    Compose quotes it — a bare 8100 would be a YAML int, and compose rejects a
+    non-string environment value — so the quotes are part of the scalar this file's
+    reader returns. Stripped here rather than at each use, because a probe compared
+    against `172.30.0.11:"8100"` fails for a reason that has nothing to do with the
+    property under test."""
+    return _environment_of("tool-gateway")["GATEWAY_AGENT_PORT"].strip('"\'')
+
+
+def _gateway_forbidden_default() -> set[str]:
+    """The CIDRs tool-gateway/app.py refuses to serve the agent surface on.
+
+    Read out of the source rather than imported, for the reason the relay-guard
+    tests read the addon that way: importing would run the module's env-var
+    resolution under the TEST's environment, which is not the one the container
+    starts with."""
+    match = re.search(r'"GATEWAY_BIND_FORBIDDEN",\s*\n?\s*"([^"]+)"', GATEWAY_SRC)
+    if not match:
+        raise AssertionError(
+            "tool-gateway/app.py no longer has a GATEWAY_BIND_FORBIDDEN default this "
+            "can read, so the guard is no longer held equal to the compose subnets")
+    return {part.strip() for part in match.group(1).split(",") if part.strip()}
+
+
+class GatewayPlacementTests(unittest.TestCase):
+    """The gateway is triple-homed, and only ONE of the three legs is served on.
+
+    Everything here is a placement rather than a setting, which is why it is
+    asserted here rather than described in DESIGN.md: nothing inside the gateway
+    process can observe which networks it was attached to, so compose is the only
+    place these properties exist and this is the only place they are checked."""
+
+    def test_the_gateway_is_on_exactly_its_three_legs(self):
+        # Named exhaustively rather than checked one at a time. A fourth leg is the
+        # failure this catches, and it would not announce itself: an added network
+        # breaks nothing at runtime and every probe below would keep passing.
+        self.assertEqual(_networks_of("tool-gateway"),
+                         {"sandbox-net", "mcp-net", "tool-authorize-net"})
+
+    def test_the_gateway_has_no_egress_of_its_own(self):
+        # The whole point of the servers' egress going through the proxy is that a
+        # container holding a write-capable credential has no unaudited path out. A
+        # leg here would put exactly that next to the credentials being brokered.
+        self.assertNotIn("egress-net", _networks_of("tool-gateway"))
+
+    def test_the_agent_listener_binds_the_sandbox_net_address_and_only_that(self):
+        # The bind and the leg are written in two places and must agree: a bind that
+        # names an address compose does not deploy is a listener that refuses to
+        # start, and one that names a DIFFERENT deployed address is the lateral edge
+        # the guard in app.py exists to refuse.
+        env = _environment_of("tool-gateway")
+        pinned = _scalar(_block(_service("tool-gateway"), "sandbox-net", 6),
+                         "ipv4_address")
+        self.assertIsNotNone(pinned, "the gateway's sandbox-net leg has no fixed "
+                                     "address, so GATEWAY_AGENT_BIND cannot name it")
+        self.assertEqual(env["GATEWAY_AGENT_BIND"], pinned)
+
+    def test_the_bind_guard_names_every_network_the_agent_surface_must_not_reach(self):
+        # Same arrangement as the relay guard's FORBIDDEN_CIDRS: the default in the
+        # source is held equal to the real subnets here, so the two cannot drift. The
+        # entry that matters is mcp-net — a server container reaching the agent-facing
+        # endpoint is the lateral move this whole placement exists to prevent.
+        forbidden = _gateway_forbidden_default()
+        for net in ("mcp-net", "tool-authorize-net", "authorize-net", "control-net"):
+            with self.subTest(network=net):
+                self.assertIn(_subnet_of(net), forbidden,
+                              f"{net} is absent from GATEWAY_BIND_FORBIDDEN, so a "
+                              f"bind on it would be accepted")
+
+    def test_the_guard_does_not_forbid_the_network_it_must_bind(self):
+        # The other direction, and a real way to write this wrong: listing sandbox-net
+        # would make the gateway refuse its own correct configuration, and it would
+        # fail closed at boot rather than here — a restart loop on the host, which is
+        # a slower and less legible way to learn it.
+        self.assertNotIn(_subnet_of("sandbox-net"), _gateway_forbidden_default())
+
+    def test_the_gateway_does_not_take_an_address_from_the_catalogue_range(self):
+        # mcp-servers.yml allocates .11+ to servers and grows; the gateway is not a
+        # tenant of that catalogue. Overlap would not fail at boot — it would fail the
+        # NEXT time a server was added and took an address already held.
+        addr = ipaddress.ip_address(
+            _scalar(_block(_service("tool-gateway"), "mcp-net", 6), "ipv4_address"))
+        for svc in _mcp_service_names():
+            with self.subTest(server=svc):
+                self.assertNotEqual(
+                    addr,
+                    ipaddress.ip_address(
+                        _scalar(_block(_service(svc), "mcp-net", 6), "ipv4_address")),
+                    f"{svc} and tool-gateway both claim {addr} on mcp-net")
+
+    def test_boundary_check_probes_the_gateway_where_compose_deploys_it(self):
+        # The positive control. If this address drifts from compose, the probe fails
+        # on a correct deployment and the two bind probes below it go vacuous — they
+        # are gated on it, so a stale address here silently disables them rather than
+        # failing loudly, which is the shape of bug this whole file exists to catch.
+        pinned = _scalar(_block(_service("tool-gateway"), "sandbox-net", 6),
+                         "ipv4_address")
+        self.assertIn(f"{pinned}:{_gateway_port()}", BOUNDARY,
+                      "boundary-check.sh does not probe the gateway at the address "
+                      "and port compose deploys")
+
+    def test_boundary_check_probes_every_leg_the_agent_surface_must_not_be_on(self):
+        # The other two legs, by the same argument the mapped-IPv6 twins are held in
+        # step with their dotted quads: a leg added to compose and not to the probe
+        # list leaves exactly that leg unasserted, and it is the newest leg — the one
+        # least likely to have been thought about — that goes unchecked.
+        port = _gateway_port()
+        for net in ("mcp-net", "tool-authorize-net"):
+            with self.subTest(network=net):
+                pinned = _scalar(_block(_service("tool-gateway"), net, 6),
+                                 "ipv4_address")
+                self.assertIn(f"{pinned}:{port}", BOUNDARY,
+                              f"boundary-check.sh does not probe the gateway's {net} "
+                              f"leg, so a wildcard bind there would go undetected")
+
+    def test_the_gateway_runs_the_same_stack_as_the_control_plane(self):
+        # One definition of "the Python service shape we ship". Two services on two
+        # FastAPI versions is a drift nobody decides — it happens when one gets bumped
+        # and the other is forgotten, and the symptom surfaces in whichever is touched
+        # next rather than at the bump.
+        gw = (ROOT / "tool-gateway" / "requirements.txt").read_text()
+        cp = (ROOT / "control-plane" / "requirements.txt").read_text()
+        pins = lambda text: {  # noqa: E731
+            line.strip() for line in text.splitlines()
+            if line.strip() and not line.startswith("#")}
+        self.assertEqual(pins(gw), pins(cp))
 
 
 class RestartPolicyTests(unittest.TestCase):

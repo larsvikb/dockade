@@ -45,7 +45,9 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import threading
 
+import discovery
 from fastapi import FastAPI
 
 #: The agent-facing MCP listener. Bound to ONE address — see the module docstring
@@ -148,6 +150,49 @@ def healthz() -> dict:
     return {"ok": True}
 
 
+#: How often the gateway re-reads the servers and compares them with policy. Long,
+#: because this is a diagnostic rather than a control: an operator who has just
+#: written a rule is reading the UI, not this log, and a short interval would only
+#: put steady traffic on containers holding credentials for no one's benefit.
+DISCOVERY_INTERVAL = float(os.environ.get("GATEWAY_DISCOVERY_INTERVAL", "300"))
+
+#: The COLD-START interval, used only until the control plane first answers. This
+#: gateway has no `depends_on` — deliberately, so it serves whether or not the
+#: authority is up — and the control plane's healthcheck probes its authorize
+#: listener, not the tool bridge, so nothing in compose orders these two. The first
+#: pass therefore races a cold start and loses. At the steady interval that would
+#: leave a five-minute window where the only line in the log says the roster is
+#: unreachable, which reads as broken rather than as starting.
+STARTUP_RETRY = float(os.environ.get("GATEWAY_DISCOVERY_STARTUP_RETRY", "5"))
+
+
+def _reconcile_forever(stop: threading.Event) -> None:
+    """Report the gap between what the servers expose and what policy decides.
+
+    A DAEMON loop that cannot fail the process: ``discovery.run`` swallows its own
+    errors and returns them as lines, and the sleep is on an Event so a shutdown is
+    not held for the interval. It runs immediately and then on the interval, because
+    the pass an operator most wants is the one right after a restart.
+
+    Two paces, and only the first is quiet. Before the control plane has ever
+    answered, the loop retries fast and says so ONCE — the repeats are a startup race
+    resolving itself, and printing each would bury the line that matters. After it has
+    answered, every pass prints, failures included: at that point an unreachable
+    authority is news rather than noise, and a diagnostic that goes silent on trouble
+    is the failure mode this whole module exists to avoid."""
+    reached = False    # the control plane has answered at least once
+    announced = False  # the cold-start failure has been reported once
+    while True:
+        answered, lines = discovery.run()
+        if answered or reached or not announced:
+            for line in lines:
+                print(line, flush=True)
+            announced = True
+        reached = reached or answered
+        if stop.wait(DISCOVERY_INTERVAL if reached else STARTUP_RETRY):
+            return
+
+
 def main() -> None:
     """Assert placement, then serve.
 
@@ -165,7 +210,17 @@ def main() -> None:
 
     print(f"tool-gateway: serving the agent-facing MCP endpoint on "
           f"{AGENT_BIND}:{AGENT_PORT} (this address only)", flush=True)
-    uvicorn.run(app, host=AGENT_BIND, port=AGENT_PORT, log_level="info")
+
+    # Started AFTER the guard and before the listener. A daemon thread rather than a
+    # FastAPI startup hook: the work is blocking stdlib HTTP, so on the event loop it
+    # would stall the listener for as long as a server takes to answer.
+    stop = threading.Event()
+    threading.Thread(target=_reconcile_forever, args=(stop,),
+                     name="reconcile", daemon=True).start()
+    try:
+        uvicorn.run(app, host=AGENT_BIND, port=AGENT_PORT, log_level="info")
+    finally:
+        stop.set()
 
 
 if __name__ == "__main__":

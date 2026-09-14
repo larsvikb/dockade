@@ -610,6 +610,58 @@ class GatewayPlacementTests(unittest.TestCase):
                               f"boundary-check.sh does not probe the gateway's {net} "
                               f"leg, so a wildcard bind there would go undetected")
 
+    def test_the_gateway_dials_the_control_planes_tool_leg_and_not_another(self):
+        # The gateway reaches the control plane by ADDRESS while it reaches servers by
+        # NAME, and the asymmetry is the property under test. A server is single-homed,
+        # so its name resolves to its one leg; the control plane has four, and three of
+        # them are networks this container must never speak to. `control-plane` would
+        # resolve to whichever Docker's DNS returned, so only an address names a leg.
+        #
+        # Held against CONTROL_TOOL_BIND rather than against a literal: that variable
+        # is what the control plane actually binds, so this fails if either side moves
+        # instead of only when both are edited to disagree with this file.
+        url = _environment_of("tool-gateway")["GATEWAY_CONTROL_URL"]
+        bind = _environment_of("control-plane")["CONTROL_TOOL_BIND"]
+        self.assertIn(f"//{bind}:", url,
+                      f"GATEWAY_CONTROL_URL {url} does not dial the address the "
+                      f"control plane binds its tool listener to ({bind})")
+        leg = _scalar(_block(_service("tool-gateway"), "tool-authorize-net", 6),
+                      "ipv4_address")
+        self.assertNotIn(f"//{leg}:", url,
+                         "GATEWAY_CONTROL_URL points at the gateway's own leg")
+
+    def test_the_gateway_reaches_the_control_plane_over_no_other_network(self):
+        # The reason the address above is safe to hardcode: it is on the one network
+        # the two share. If the gateway ever gained a leg on authorize-net or
+        # control-net, dialling "the control plane" would stop being unambiguous and
+        # this file's whole single-leg argument would need revisiting.
+        legs = _networks_of("tool-gateway")
+        self.assertEqual(legs & {"authorize-net", "control-net", "control-ui-net"},
+                         set(),
+                         "the gateway has a leg on a control network, so it no longer "
+                         "reaches the control plane over tool-authorize-net alone")
+
+    def test_the_secrets_mount_is_read_only(self):
+        # The gateway only ever READS a token. Write access would let a compromised
+        # gateway rewrite the credential every future call is made with, and would put
+        # the agent one process-compromise away from editing what the broker spends —
+        # which is the whole thing this container is between the agent and.
+        mount = [ln for ln in _service("tool-gateway")
+                 if "/run/dockade/secrets" in ln]
+        self.assertTrue(mount, "the gateway has no secrets mount")
+        self.assertTrue(mount[0].rstrip().endswith(":ro"),
+                        f"the gateway's secrets mount is not read-only: {mount[0]!r}")
+
+    def test_no_other_service_is_given_the_secrets(self):
+        # One holder, deliberately. Every additional container with the directory is
+        # another process whose compromise spends the same token, and the servers in
+        # particular must NOT have it — in http mode they ignore an env credential
+        # anyway (NOTES.md), so a copy there would be exposure buying nothing.
+        holders = {svc for svc in _service_names()
+                   if any("/run/dockade/secrets" in ln for ln in _service(svc))}
+        self.assertEqual(holders, {"tool-gateway"},
+                         f"more than the gateway is given the MCP credentials: {holders}")
+
     def test_the_gateway_runs_the_same_stack_as_the_control_plane(self):
         # One definition of "the Python service shape we ship". Two services on two
         # FastAPI versions is a drift nobody decides — it happens when one gets bumped

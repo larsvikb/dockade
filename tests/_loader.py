@@ -204,6 +204,26 @@ def load_control_plane() -> types.ModuleType:
     return _load("dockade_control_plane", "control-plane/app.py")
 
 
+def load_discovery(env: dict[str, str] | None = None) -> types.ModuleType:
+    """The gateway's discovery module alone, without importing the app.
+
+    Separate from ``load_tool_gateway`` because the two read different environments
+    and a test that varies one must not have to satisfy the other's bind guard. Same
+    fresh-name-per-call rule, and for the same reason: these constants resolve at
+    module scope."""
+    previous = {k: os.environ.get(k) for k in (env or {})}
+    os.environ.update(env or {})
+    try:
+        name = f"dockade_discovery_{len(sys.modules)}"
+        return _load(name, "tool-gateway/discovery.py")
+    finally:
+        for key, was in previous.items():
+            if was is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = was
+
+
 def load_tool_gateway(env: dict[str, str] | None = None) -> types.ModuleType:
     """The MCP gateway, with its bind-guard environment applied at import.
 
@@ -217,6 +237,11 @@ def load_tool_gateway(env: dict[str, str] | None = None) -> types.ModuleType:
     module would carry the previous call's constants and quietly answer for the
     wrong configuration."""
     _install_fastapi_stub()
+    # app.py imports `discovery` by plain name, the way any script does from its own
+    # directory — the same arrangement load_control_plane makes for its siblings.
+    pkg_dir = str(ROOT / "tool-gateway")
+    if pkg_dir not in sys.path:
+        sys.path.insert(0, pkg_dir)
     previous = {k: os.environ.get(k) for k in (env or {})}
     os.environ.update(env or {})
     try:

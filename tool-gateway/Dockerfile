@@ -24,6 +24,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # an added module becomes a deliberate line here, and the build context cannot
 # smuggle in a stray file beside them.
 COPY app.py ./app.py
+COPY discovery.py ./discovery.py
 
 USER gw
 # One listener: the agent-facing MCP endpoint. EXPOSE is documentation — the

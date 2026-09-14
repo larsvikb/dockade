@@ -2,6 +2,11 @@ __pycache__/
 *.pyc
 # Local GGUF weights for the llm-* compose profiles (large, host-local).
 models/
+# Fallback location for MCP client credentials when MCP_SECRETS is unset — only a
+# hand-run `docker compose` lands here, since the Makefile exports the real path under
+# ~/.config/dockade. Ignored because the real ones must NEVER be in this tree: it is
+# bind-mounted read-write into the sandbox, so a token here is a token the agent holds.
+secrets/
 # Local compose overrides (DNS, model selection). Host-specific, never shared.
 .env
 # Container logs pulled into the tree for analysis (`docker logs llm-intel &>...`).

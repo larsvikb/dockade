@@ -42,6 +42,16 @@ MCP_SECRETS ?= $(DOCKADE_CONFIG_HOME)/secrets
 # variable is not in it — without this the mount would silently fall back to the
 # in-repo default and every token would read as missing.
 export MCP_SECRETS
+# The gateway bind-mounts that directory read-only, and the files in it are the host
+# user's, mode 0600 — which `secrets-perm-check` above exists to keep that way. A
+# container running as its image's own system uid simply cannot read them, so it runs
+# as the INVOKING USER instead. Same move sandbox-lib.sh makes with
+# `--build-arg USER_UID`, and for the same reason: a container that reads host-owned
+# bind mounts has to share the owner.
+DOCKADE_UID ?= $(shell id -u)
+DOCKADE_GID ?= $(shell id -g)
+export DOCKADE_UID
+export DOCKADE_GID
 # Durable per-machine config lives here, OUTSIDE the repo, for the reason above:
 # this tree is bind-mounted read-write into a sandbox, so anything configured
 # from inside it is agent-writable. Holds `secrets/` (MCP credentials),

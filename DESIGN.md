@@ -3299,6 +3299,7 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | `tool-gateway` placement — triple-homed, agent leg only, bind guard | **done** — serves no tools yet |
 | — | gateway discovery — roster pull, `tools/list`, policy-vs-server report | **done** — reports to the log; writes nothing back |
 | — | MCP client credentials — read-only mount, path derived from the server name | **done** — the gateway is the only holder |
+| — | MCP server registration — UI tab: register, enable/disable, revoke | **done** — servers only; tool rules not yet |
 | — | MCP gateway — per-tool allow/deny/ask | planned (next: curated tool list on the agent leg) |
 
 The rationale for each shipped item lives under **Governance surfaces** above, not here
@@ -3431,6 +3432,21 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
   way `policies/egress-allowlist.txt` already is (`control-plane/Dockerfile`). That
   half needs no network access and no trust in anything running; it is only the tool
   half that requires the gateway.
+- **RESOLVED — a server enters the store because an operator registered it, not
+  because a file declared it.** The seeding alternative above was considered and set
+  aside rather than rejected. Reading `mcp-servers.yml` directly means a YAML parser
+  in the component whose compromise is total, parsing a document almost none of which
+  concerns it, and coupling the control plane to a compose file's format; a small
+  purpose-built seed file avoids all three and is this repo's existing idiom, but
+  costs two files per server plus a drift guard to remove one typing step. What
+  decides it for now is that seeding removes only the *register* call: `enabled`
+  stays an operator decision under every option, so the UI surface is the same either
+  way, and building the registration path answers the question while leaving it open.
+  The accepted cost is that the name is typed against nothing — this container cannot
+  enumerate what is running — so a typo registers a server the gateway finds nothing
+  behind. That is tolerable **because** the gateway's discovery report names it as
+  `NOT ENUMERATED` within one interval; without that report this decision would be
+  the wrong one.
 
 ## Future improvements
 - Dedicated git proxy that speaks the git protocol, per-repo, instead of

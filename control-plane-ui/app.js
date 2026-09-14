@@ -662,6 +662,72 @@ function editPreview(rule, pattern, action, rules) {
                + `immediately, without being held for approval.`) };
 }
 
+// The DNS label a server name has to be. Three spellings of one rule — here, in the
+// relay's path pattern, and in `policy._server_name_error` — each load-bearing in a
+// different process. The backend stays the one that DECIDES; this copy only shapes
+// the preview, so a drift makes the preview wrong rather than the policy wrong.
+const SERVER_NAME_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
+
+// A UI preset expanded into the three fields the store actually holds.
+//
+// This is the ONLY place a concrete header scheme is spelled anywhere in the system.
+// The gateway builds its request from whatever descriptor the roster carries and has
+// no idea which server it belongs to, which is how "no per-server branch in the code"
+// stays true while this form still offers a one-click answer for the common case.
+function serverDescriptor(kind, header, template) {
+  if (kind === "header") {
+    return { auth_type: "header", auth_header: "Authorization",
+             auth_template: "Bearer {secret}" };
+  }
+  if (kind === "custom") {
+    return { auth_type: "header", auth_header: (header || "").trim(),
+             auth_template: (template || "").trim() };
+  }
+  return { auth_type: "none", auth_header: null, auth_template: null };
+}
+
+// What registering will do, in the world. A DELIBERATELY partial mirror of the
+// backend's validation, like createPreview: it describes, and the backend refuses.
+function serverPreview(name, desc) {
+  const n = (name || "").trim();
+  if (!n) return { ok: false, text: "" };
+  if (!SERVER_NAME_RE.test(n)) {
+    return { ok: false,
+             text: `${n} is not a DNS label — lowercase letters, digits and '-', not `
+                 + `starting or ending with '-'. It is the container name, so it has `
+                 + `to match what mcp-servers.yml declares.` };
+  }
+  if (desc.auth_type === "none") {
+    return { ok: true,
+             text: `Register ${n}, disabled, with the gateway injecting nothing — the `
+                 + `server holds its own credential. Nothing runs until you enable it `
+                 + `and write tool rules.` };
+  }
+  // Named rather than implied: the token's path is DERIVED from the server name, so
+  // the operator can see which file they are about to make load-bearing.
+  return { ok: Boolean(desc.auth_header && desc.auth_template),
+           text: `Register ${n}, disabled. The gateway will send `
+               + `${desc.auth_header || "(no header)"}: `
+               + `${desc.auth_template || "(no template)"}, reading the token from `
+               + `${n}.json in the secrets directory.` };
+}
+
+// The body of an enable/disable edit.
+//
+// The descriptor is ECHOED BACK and that is the whole reason this is a function.
+// `ServerEditRequest` takes the TARGET state with `auth_type` defaulting to "none",
+// so a body carrying only `enabled` does not mean "leave auth alone" — it means "set
+// auth to none". A server toggled off and on again would come back stripped of its
+// credential descriptor, the next enumeration would send no header, and the 401 that
+// followed would read like an expired token rather than like this.
+function serverEditBody(row, enabled) {
+  const auth = row.auth || {};
+  return { enabled: enabled,
+           auth_type: auth.type || "none",
+           auth_header: auth.header || null,
+           auth_template: auth.template || null };
+}
+
 // What a screen reader should hear when the pending queue changes.
 //
 // Announced from a SEPARATE element rather than by making the card list a live
@@ -1251,7 +1317,7 @@ function start() {
   let leaseSeconds = null;
 
   // ── views ─────────────────────────────────────────────────────────────────
-  const VIEWS = ["approvals", "decisions", "policy"];
+  const VIEWS = ["approvals", "decisions", "policy", "tools"];
   const viewFromHash = () =>
     VIEWS.includes(location.hash.slice(1)) ? location.hash.slice(1) : "approvals";
   let current = viewFromHash();
@@ -2889,6 +2955,10 @@ function start() {
       // only exist because this stream delivered it, so this is the earliest useful
       // moment — and a reconnect may be a restarted backend with a different window.
       refreshConfig();
+  // Once, not polled. Server registration changes when an operator changes it,
+  // and this view is the thing doing the changing — each action refreshes after
+  // itself. A four-second poll here would be watching for edits nobody else makes.
+  refreshServers();
     };
     es.addEventListener("pending", e => {
       const d = JSON.parse(e.data);
@@ -2917,6 +2987,161 @@ function start() {
       retryTimer = setTimeout(connect, delay);
     };
   }
+
+  // ── MCP servers ───────────────────────────────────────────────────────────
+  // Which of the running servers the gateway may dial. Nothing here starts a
+  // container and nothing here grants: a registration lands disabled, and an enabled
+  // server with no tool rules still denies every call.
+  const serversBody = document.getElementById("servers");
+  const serversEmpty = document.getElementById("servers-empty");
+  const serverForm = document.getElementById("server-form");
+  const serverName = document.getElementById("server-name");
+  const serverAuth = document.getElementById("server-auth");
+  const serverHeader = document.getElementById("server-header");
+  const serverTemplate = document.getElementById("server-template");
+  const serverPreviewEl = document.getElementById("server-preview");
+  let serversFailed = false;
+  const serversByName = new Map();
+
+  // No PORT anywhere in this form, and that is the convention rather than an omission:
+  // every catalogue server listens on the one the gateway dials (tool-gateway's
+  // MCP_PORT), so a port here would be a field that must always hold the same value.
+
+  const authFields = () =>
+    serverDescriptor(serverAuth.value, serverHeader.value, serverTemplate.value);
+
+  function renderServerPreview() {
+    const custom = serverAuth.value === "custom";
+    serverHeader.hidden = !custom;
+    serverTemplate.hidden = !custom;
+    serverPreviewEl.textContent = serverPreview(serverName.value, authFields()).text;
+  }
+
+  function renderServers(rows) {
+    serversByName.clear();
+    serversBody.replaceChildren();
+    for (const row of rows) {
+      serversByName.set(row.server, row);
+      const tr = document.createElement("tr");
+      const cell = text => {
+        const td = document.createElement("td");
+        td.textContent = text;
+        tr.appendChild(td);
+        return td;
+      };
+      cell(row.server);
+      cell(row.enabled ? "enabled" : "disabled");
+      cell(row.auth && row.auth.type === "header"
+             ? `${row.auth.header}: ${row.auth.template}` : "none");
+      cell(String(row.tool_rules));
+      const actions = document.createElement("td");
+      for (const [cls, label] of [["toggle", row.enabled ? "disable" : "enable"],
+                                  ["revoke", "revoke"]]) {
+        const b = document.createElement("button");
+        b.className = cls;
+        b.dataset.server = row.server;
+        b.textContent = label;
+        actions.appendChild(b);
+      }
+      tr.appendChild(actions);
+      serversBody.appendChild(tr);
+    }
+    document.getElementById("servercount").textContent =
+      rows.length ? `${rows.length} registered` : "";
+    serversEmpty.hidden = !(serversFailed || rows.length === 0);
+    serversEmpty.textContent = serversFailed
+      ? "This list did not refresh — the control plane did not answer. What is shown " +
+        "may no longer be what the gateway is dialling."
+      : (rows.length ? "" :
+         "No servers registered, so the gateway dials nothing. Register the container " +
+         "name declared in mcp-servers.yml.");
+  }
+
+  async function refreshServers() {
+    try {
+      const res = await fetch("/api/mcp/servers");
+      // `res.ok` first, for the reason refreshRules checks it: a 4xx body that parses
+      // would render as an empty but SUCCESSFUL list — "no servers registered" is a
+      // sentence this page must not say when it simply failed to ask.
+      if (!res.ok) throw new Error(String(res.status));
+      serversFailed = false;
+      renderServers(await res.json());
+    } catch (e) {
+      serversFailed = true;
+      renderServers([...serversByName.values()]);
+    }
+  }
+
+  serverAuth.addEventListener("change", renderServerPreview);
+  serverName.addEventListener("input", renderServerPreview);
+  serverHeader.addEventListener("input", renderServerPreview);
+  serverTemplate.addEventListener("input", renderServerPreview);
+
+  serverForm.addEventListener("submit", async ev => {
+    ev.preventDefault();
+    const name = serverName.value.trim();
+    if (!SERVER_NAME_RE.test(name)) return;
+    const body = JSON.stringify(Object.assign({ server: name }, authFields()));
+    try {
+      const res = await fetch("/api/mcp/servers", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body });
+      const answer = await res.json().catch(() => ({}));
+      if (!res.ok || !answer.ok) {
+        // Verbatim. The refusals here are worth reading rather than collapsing: 409
+        // says it is already registered and points at edit, and 400 says exactly which
+        // half of the descriptor is malformed.
+        window.alert(`Could not register: ${answer.detail || res.status}`);
+        return;
+      }
+    } catch (e) {
+      window.alert("Could not register: the control plane is unreachable.");
+      return;
+    }
+    serverName.value = "";
+    renderServerPreview();
+    refreshServers();
+  });
+
+  serversBody.addEventListener("click", async ev => {
+    const btn = ev.target.closest("button.toggle, button.revoke");
+    if (!btn) return;
+    const row = serversByName.get(btn.dataset.server);
+    if (!row) return;
+    const name = encodeURIComponent(row.server);
+    const revoking = btn.classList.contains("revoke");
+    if (revoking &&
+        !window.confirm(
+          `Revoke ${row.server}? The gateway stops dialling it. Its tool rules are ` +
+          `not deleted — the backend refuses this while any still name it.`)) {
+      return;
+    }
+    btn.disabled = true;
+    try {
+      const res = revoking
+        ? await fetch(`/api/mcp/servers/${name}/revoke`, { method: "POST" })
+        // The descriptor is ECHOED BACK, and it has to be. `ServerEditRequest` takes
+        // the TARGET state with `auth_type` defaulting to "none", so an edit carrying
+        // only `enabled` would silently strip a server's auth — the next enumeration
+        // would send no credential and the 401 would read like a policy problem.
+        : await fetch(`/api/mcp/servers/${name}/edit`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(serverEditBody(row, !row.enabled)) });
+      const answer = await res.json().catch(() => ({}));
+      if (!res.ok || !answer.ok) {
+        // 409 on revoke is the one an operator most needs to read: it names how many
+        // rules still point at the server and tells them to disable instead.
+        window.alert(`Could not ${revoking ? "revoke" : "update"}: ` +
+                     `${answer.detail || res.status}`);
+        btn.disabled = false;
+        return;
+      }
+    } catch (e) {
+      window.alert("Could not reach the control plane.");
+      btn.disabled = false;
+      return;
+    }
+    refreshServers();
+  });
 
   // ── wiring ────────────────────────────────────────────────────────────────
   // `visibilityState` is absent in some non-browser hosts; treat unknown as
@@ -2970,6 +3195,7 @@ if (typeof module !== "undefined" && module.exports) {
     leaseDomain, groupLeases, LEASE_GROUP_MIN, shortActor,
     outageSummary, pendingAnnouncement, coverageSummary, revokePreview,
     normalizePattern, createPreview, editPreview,
+    serverDescriptor, serverPreview, serverEditBody, SERVER_NAME_RE,
     timeWindow, filterActive, auditQuery, eventRow, historyPager,
     fmtTime, fmtStamp, fmtInstant,
     AUDIT_ORDINARY_STAGE, AUDIT_WINDOWS, WILDCARD_MIN_LABELS,

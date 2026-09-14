@@ -74,10 +74,32 @@ const missing = ["lampState", "backoffDelay", "diffPending", "shouldSweep",
                  "historyPager", "renderableHolds",
                  "toolRemaining", "payloadDisclosure", "toolOutcomeMessage",
                  "cardSubject",
-                 "fmtTime", "fmtStamp", "fmtInstant"]
+                 "fmtTime", "fmtStamp", "fmtInstant",
+                 "serverDescriptor", "serverPreview", "serverEditBody"]
   .filter(n => typeof m[n] !== "function");
+const _row = {server: "mcp-github", enabled: false,
+              auth: {type: "header", header: "Authorization",
+                     template: "Bearer {secret}"}};
 console.log(JSON.stringify({
   missing,
+  server: {
+    none: m.serverDescriptor("none"),
+    bearer: m.serverDescriptor("header"),
+    custom: m.serverDescriptor("custom", "  X-Api-Key  ", "  {secret}  "),
+    // The preset must ignore whatever sits in the custom fields, or a half-filled
+    // form would smuggle values into a descriptor the operator did not pick.
+    bearer_with_stale_custom: m.serverDescriptor("header", "X-Evil", "{secret}-nope"),
+    preview_none: m.serverPreview("mcp-github", m.serverDescriptor("none")).text,
+    preview_bearer: m.serverPreview("mcp-github", m.serverDescriptor("header")).text,
+    preview_blank: m.serverPreview("   ", m.serverDescriptor("none")),
+    preview_upper: m.serverPreview("Mcp-GitHub", m.serverDescriptor("none")),
+    preview_traversal: m.serverPreview("../etc/passwd", m.serverDescriptor("none")),
+    preview_single: m.serverPreview("a", m.serverDescriptor("none")).ok,
+    preview_half_custom: m.serverPreview("mcp-x", m.serverDescriptor("custom", "H", "")),
+    edit_enable: m.serverEditBody(_row, true),
+    edit_disable: m.serverEditBody(_row, false),
+    edit_no_auth: m.serverEditBody({server: "s", enabled: true}, false),
+  },
   lamp: {
     down_idle: m.lampState(false, 0),
     down_busy: m.lampState(false, 3),
@@ -754,6 +776,79 @@ class PageScriptTests(unittest.TestCase):
     def test_every_helper_is_exported(self):
         # Guards the export block: dropping a name there silently disables its tests.
         self.assertEqual(self.probe["missing"], [])
+
+    def test_the_bearer_preset_ignores_stale_custom_fields(self):
+        # The custom inputs stay in the DOM when the preset changes back, so a form
+        # that read them regardless would register a descriptor the operator did not
+        # choose — and a descriptor decides which header a credential is sent in.
+        srv = self.probe["server"]
+        self.assertEqual(srv["bearer"], srv["bearer_with_stale_custom"])
+        self.assertEqual(srv["bearer"]["auth_header"], "Authorization")
+
+    def test_a_none_descriptor_carries_no_header_fields(self):
+        # `policy._auth_descriptor_error` refuses a 'none' descriptor carrying header
+        # fields — "configuration that says two things at once" — so the form must not
+        # build one. Asserted here because the backend's refusal would surface as a 400
+        # the operator has to decode.
+        self.assertEqual(self.probe["server"]["none"],
+                         {"auth_type": "none", "auth_header": None,
+                          "auth_template": None})
+
+    def test_a_custom_descriptor_is_trimmed(self):
+        # A trailing space in a header NAME is not a header the server will match, and
+        # it is invisible in the field it was typed into.
+        self.assertEqual(self.probe["server"]["custom"],
+                         {"auth_type": "header", "auth_header": "X-Api-Key",
+                          "auth_template": "{secret}"})
+
+    def test_an_edit_echoes_the_descriptor_back(self):
+        # THE trap in this endpoint. `ServerEditRequest` takes the TARGET state and
+        # defaults `auth_type` to "none", so a body carrying only `enabled` does not
+        # mean "leave auth alone" — it means "set it to none". Toggling a server off
+        # and on would strip its credential descriptor, and the resulting 401 reads
+        # like an expired token rather than like a UI bug.
+        srv = self.probe["server"]
+        for key, enabled in (("edit_enable", True), ("edit_disable", False)):
+            with self.subTest(body=key):
+                self.assertEqual(srv[key], {"enabled": enabled,
+                                            "auth_type": "header",
+                                            "auth_header": "Authorization",
+                                            "auth_template": "Bearer {secret}"})
+
+    def test_an_edit_on_a_server_with_no_descriptor_sends_none(self):
+        # The other direction: absent auth must produce a well-formed 'none', not
+        # undefined fields that serialize out of the body entirely.
+        self.assertEqual(self.probe["server"]["edit_no_auth"],
+                         {"enabled": False, "auth_type": "none",
+                          "auth_header": None, "auth_template": None})
+
+    def test_the_preview_refuses_a_name_that_is_not_a_dns_label(self):
+        # The name becomes a path segment at the relay and a hostname at the gateway.
+        # The backend validates too — this only keeps the form from offering a
+        # registration that cannot succeed.
+        srv = self.probe["server"]
+        self.assertFalse(srv["preview_upper"]["ok"])
+        self.assertFalse(srv["preview_traversal"]["ok"])
+        self.assertTrue(srv["preview_single"], "a one-character label is legal")
+        # Empty is not an error, it is nothing typed yet: no text at all.
+        self.assertEqual(srv["preview_blank"], {"ok": False, "text": ""})
+
+    def test_the_preview_names_the_secret_file_it_will_make_load_bearing(self):
+        # Derived from the server name with no prefix added (#40). Showing the actual
+        # filename is what lets an operator put the token in the right place first
+        # time; describing it in prose is what got the path wrong for three files.
+        self.assertIn("mcp-github.json", self.probe["server"]["preview_bearer"])
+        self.assertNotIn("mcp-mcp-github.json", self.probe["server"]["preview_bearer"])
+
+    def test_the_preview_says_registering_does_not_run_anything(self):
+        # Registering is not enabling and enabling is not permitting. The page has to
+        # say so, because "register" reads like "turn on" everywhere else.
+        self.assertIn("disabled", self.probe["server"]["preview_none"])
+
+    def test_a_half_filled_custom_descriptor_is_not_ok(self):
+        # A `header` descriptor with no template builds a header with no credential,
+        # and the upstream answer is a 401 — indistinguishable from an expired token.
+        self.assertFalse(self.probe["server"]["preview_half_custom"]["ok"])
 
     def test_the_lamp_treats_being_blind_as_worse_than_being_busy(self):
         lamp = self.probe["lamp"]

@@ -324,6 +324,13 @@
           aria-selected="false" tabindex="-1" data-view="policy">
     Policy <span class="badge" id="badge-policy">–</span>
   </button>
+  <!-- No badge, as Decisions has none: a badge here would count servers, and a server
+       count is not a thing anyone needs to notice from another tab. The two that carry
+       badges both mean "something is waiting for you". -->
+  <button role="tab" id="tab-tools" aria-controls="view-tools"
+          aria-selected="false" tabindex="-1" data-view="tools">
+    Tools
+  </button>
 </nav>
 
 <main>
@@ -511,6 +518,62 @@
          next to the rows it is casting doubt on rather than above the explanation of
          what the view is. -->
     <div class="empty" id="rules-empty" hidden></div>
+  </section>
+
+  <section id="view-tools" role="tabpanel" aria-labelledby="tab-tools" hidden>
+    <h2>MCP servers <span class="note" id="servercount"></span></h2>
+    <div class="empty">
+      Which of the running MCP servers the gateway may dial, and how it authenticates
+      to each. Nothing here starts a container &mdash; a server is declared in
+      <code>mcp-servers.yml</code> and brought up with <code>make mcp-up</code>; this
+      decides whether policy may be written about it. Registering does not enable, and
+      enabling does not permit: a server with no tool rules denies every call, because
+      an unconfigured tool is denied rather than held.
+    </div>
+    <!-- The name is typed, and is NOT checked against anything: this container cannot
+         enumerate what is running (that would mean a docker socket on the crown jewel),
+         so a typo registers a server the gateway finds nothing behind. That is the
+         intended failure — visible and granting nothing — and the gateway's discovery
+         report is where it becomes visible, not here.
+
+         A real <form> for the reason the rule form above is one, and safe for the same
+         reason: `form-action 'none'` in the CSP means a browser refuses the native POST
+         if the script ever fails to load. -->
+    <form class="ruleform" id="server-form" autocomplete="off">
+      <input type="text" id="server-name" spellcheck="false" autocapitalize="off"
+             placeholder="mcp-github &mdash; the container name, exactly"
+             aria-label="Server name">
+      <!-- The descriptor, as presets. The two real cases are "the server holds its own
+           credential" and "the gateway injects a bearer"; custom exists so this form
+           can express everything the store can, rather than quietly being narrower
+           than the API behind it. No server is named in any of it — the gateway builds
+           the header from these fields and has no per-server branch. -->
+      <select id="server-auth" aria-label="How the gateway authenticates">
+        <option value="none">no auth &mdash; the server holds its own credential</option>
+        <option value="header">bearer in Authorization</option>
+        <option value="custom">custom header&hellip;</option>
+      </select>
+      <input type="text" id="server-header" hidden spellcheck="false"
+             autocapitalize="off" placeholder="X-Api-Key" aria-label="Header name">
+      <input type="text" id="server-template" hidden spellcheck="false"
+             autocapitalize="off" placeholder="{secret}"
+             aria-label="Header value template">
+      <button type="submit" id="server-add">register</button>
+    </form>
+    <!-- What registering will do, in the world rather than in the table — the same
+         discipline the rule form's preview follows, and the place the backend's own
+         refusal lands. Polite, because it changes as a consequence of typing. -->
+    <div class="note" id="server-preview" aria-live="polite"></div>
+    <table>
+      <thead>
+        <tr><th>server</th><th>state</th><th>auth</th><th>rules</th><th></th></tr>
+      </thead>
+      <tbody id="servers"></tbody>
+    </table>
+    <!-- Below the table, next to the rows it qualifies. Says nothing about whether a
+         server's SECRET resolves: only the gateway can know that, and it has no way to
+         tell this page yet. -->
+    <div class="empty" id="servers-empty" hidden></div>
   </section>
 </main>
 <!-- Behaviour lives in app.js, NOT inline: an external script is what lets the

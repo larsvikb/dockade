@@ -537,6 +537,17 @@ services:
       # single-homed, so there is no leg to pick. Held equal to CONTROL_TOOL_BIND
       # and CONTROL_TOOL_PORT by tests/test_topology.py.
       GATEWAY_CONTROL_URL: http://172.27.0.2:8092
+    # Runs as the INVOKING USER, overriding the image's own `gw`. The secrets below
+    # are host-owned and mode 0600, so a container with a different uid reads nothing —
+    # and fails at enumeration time with a permission error rather than at start, which
+    # is a long way from the cause. `:-` and never `:?` (tests/test_topology.py); the
+    # Makefile exports the real values, and 1000:1000 is the common case for a
+    # single-user machine running compose by hand.
+    #
+    # NOT a privilege change: this container's only host path is the read-only mount
+    # below, so running as uid 1000 lets it read exactly what it already had to read
+    # and write nothing.
+    user: "${DOCKADE_UID:-1000}:${DOCKADE_GID:-1000}"
     volumes:
       # The MCP client credentials, READ-ONLY, one JSON file per server named for the
       # server itself. This is the credential the gateway injects per request, and it

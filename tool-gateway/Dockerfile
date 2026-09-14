@@ -12,7 +12,12 @@ FROM python:3.12-slim
 # Non-root runtime user. The gateway needs no privileges — it serves HTTP on one
 # sandbox-net address and dials siblings. It holds credentials in memory, which is
 # an argument for fewer privileges rather than more.
-RUN useradd --system --create-home --home-dir /home/gw --uid 10002 gw
+# 10003, not 10002: control-plane-ui already holds that one. Two infra images sharing
+# a uid is harmless until they share a mount, and then it is invisible.
+#
+# Mostly a FALLBACK — compose runs this service as the invoking user so it can read the
+# host-owned secrets mount. This uid is what a hand-run `docker run` gets.
+RUN useradd --system --create-home --home-dir /home/gw --uid 10003 gw
 
 WORKDIR /opt/tool-gateway
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import unittest
 
 from _loader import load_tool_gateway
@@ -24,6 +25,11 @@ from _loader import load_tool_gateway
 #: compose: test_topology.py already holds those two equal, and re-deriving it here
 #: would make this file pass for whatever compose happens to say.
 GOOD = {"GATEWAY_AGENT_BIND": "172.30.0.11"}
+
+#: Two rosters that differ, for the pacing tests. Content is irrelevant —
+#: what is under test is whether the loop notices they are not the same.
+ROSTER_A = [{"server": "a"}]
+ROSTER_B = [{"server": "b"}]
 
 
 class BindGuardTests(unittest.TestCase):
@@ -92,26 +98,38 @@ class BindGuardTests(unittest.TestCase):
 
 
 class ReconcilePacingTests(unittest.TestCase):
-    """Two paces, because the gateway deliberately starts before its authority.
+    """Polling and SPEAKING happen at different rates, and the gap is the design.
 
-    There is no `depends_on` on tool-gateway and the control plane's healthcheck
-    probes a different listener than the tool bridge, so nothing in compose orders
-    these two. The first pass losing that race is EXPECTED; waiting the steady
-    interval afterwards is what made a normal cold start read as broken."""
+    The roster is cheap — one request to a sibling — so it is re-read often enough
+    that a registration shows up while the operator is still looking. Dialling the
+    servers is not cheap: every one is a container holding a write-capable credential.
+    So a report follows a CHANGE, with a slow tick as the backstop for what changes
+    without an operator."""
 
-    def _loop(self, answers):
-        """Drive the loop once per answer, capturing what it printed and how it slept.
+    def _loop(self, polls, interval=None):
+        """Drive the loop once per poll result, capturing what it printed.
 
-        The stop Event is faked rather than timed: asserting on the delay the loop
-        ASKS for is the property, and a test that actually slept would be pacing
-        itself on the thing under test."""
-        gateway = load_tool_gateway(GOOD)
-        replies = iter(answers)
+        ``polls`` are ``(roster_or_None, failure_text)`` pairs, exactly what
+        ``discovery.poll`` returns. The stop Event is faked rather than timed: a test
+        that slept would be pacing itself on the thing under test."""
+        env = dict(GOOD)
+        if interval is not None:
+            env["GATEWAY_DISCOVERY_INTERVAL"] = interval
+        gateway = load_tool_gateway(env)
+        replies = iter(polls)
 
         class FakeDiscovery:
             @staticmethod
-            def run():
+            def poll():
                 return next(replies)
+
+            @staticmethod
+            def roster_digest(roster):
+                return json.dumps(roster, sort_keys=True)
+
+            @staticmethod
+            def report(roster):
+                return [f"report:{len(roster)}"]
 
         class FakeStop:
             def __init__(self):
@@ -119,7 +137,7 @@ class ReconcilePacingTests(unittest.TestCase):
 
             def wait(self, delay):
                 self.waits.append(delay)
-                return len(self.waits) >= len(answers)
+                return len(self.waits) >= len(polls)
 
         gateway.discovery = FakeDiscovery
         stop, out = FakeStop(), io.StringIO()
@@ -127,37 +145,58 @@ class ReconcilePacingTests(unittest.TestCase):
             gateway._reconcile_forever(stop)
         return stop.waits, out.getvalue()
 
-    def test_a_cold_start_retries_fast_rather_than_waiting_the_full_interval(self):
-        # The bug this fixes: one refused connection at boot, then five minutes of a
-        # log whose only line says the roster is unreachable.
-        waits, _ = self._loop([(False, ["down"]), (False, ["down"])])
+    def test_the_loop_waits_the_roster_interval_not_the_report_interval(self):
+        waits, _ = self._loop([(ROSTER_A, "")] * 3)
         gateway = load_tool_gateway(GOOD)
-        self.assertEqual(waits, [gateway.STARTUP_RETRY] * 2)
-        self.assertLess(gateway.STARTUP_RETRY, gateway.DISCOVERY_INTERVAL)
+        self.assertEqual(waits, [gateway.ROSTER_INTERVAL] * 3)
+        self.assertLess(gateway.ROSTER_INTERVAL, gateway.DISCOVERY_INTERVAL)
 
-    def test_the_slow_interval_takes_over_once_the_authority_answers(self):
-        # And STAYS taken over. Pacing on the latest result instead would drop back to
-        # the fast retry whenever the control plane restarted, turning a brief outage
-        # into a hot loop against the crown jewel.
-        waits, _ = self._loop([(False, ["down"]), (True, ["ok"]), (False, ["down"])])
-        gateway = load_tool_gateway(GOOD)
-        self.assertEqual(waits, [gateway.STARTUP_RETRY,
-                                 gateway.DISCOVERY_INTERVAL,
-                                 gateway.DISCOVERY_INTERVAL])
+    def test_an_unchanged_roster_is_polled_but_not_re_reported(self):
+        # The whole point of the split. Three polls, one report — otherwise a ten
+        # second cadence would dial every credential-holding container six times a
+        # minute to say nothing new.
+        _, printed = self._loop([(ROSTER_A, "")] * 3)
+        self.assertEqual(printed.count("report:"), 1)
 
-    def test_the_cold_start_failure_is_said_once_not_every_retry(self):
-        # At a 5s retry a slow control plane would otherwise print the same line
-        # dozens of times and bury the success when it finally arrives.
-        _, printed = self._loop([(False, ["down"])] * 4 + [(True, ["ok"])])
+    def test_a_changed_roster_reports_again(self):
+        # Registering or enabling a server has to show up at the poll cadence, not at
+        # the backstop — which is the papercut that prompted the split.
+        _, printed = self._loop([(ROSTER_A, ""), (ROSTER_A, ""), (ROSTER_B, "")])
+        self.assertEqual(printed.count("report:"), 2)
+
+    def test_the_cold_start_race_is_reported_once_and_then_recovers(self):
+        # No `depends_on`, and the control plane's healthcheck probes a different
+        # listener than the tool bridge, so losing the first poll is expected. The
+        # retry is the poll interval, so there is no third number for it.
+        _, printed = self._loop([(None, "down")] * 3 + [(ROSTER_A, "")])
         self.assertEqual(printed.count("down"), 1)
-        self.assertIn("ok", printed)
+        self.assertEqual(printed.count("report:"), 1)
 
-    def test_a_failure_after_the_authority_has_answered_is_always_printed(self):
-        # The other direction, and the one that must not be optimised away: once the
-        # control plane has worked, losing it is news. A diagnostic that goes quiet
-        # exactly when something breaks is the failure this module exists to avoid.
-        _, printed = self._loop([(True, ["ok"]), (False, ["down"]), (False, ["down"])])
-        self.assertEqual(printed.count("down"), 2)
+    def test_losing_the_control_plane_is_announced_when_it_happens(self):
+        # Flipping INTO failure is news. Reporting it only at the backstop would leave
+        # up to five minutes in which the last thing said was a healthy report.
+        _, printed = self._loop([(ROSTER_A, ""), (None, "down"), (None, "down")])
+        self.assertEqual(printed.count("down"), 1)
+
+    def test_a_persistent_outage_is_repeated_on_the_backstop_tick(self):
+        # The quiet has to be BOUNDED. `GATEWAY_DISCOVERY_INTERVAL=0` makes every pass
+        # due, standing in for a tick that has elapsed — a diagnostic that goes silent
+        # exactly while something is broken is the failure this module exists to avoid.
+        _, printed = self._loop([(None, "down")] * 3, interval="0")
+        self.assertEqual(printed.count("down"), 3)
+
+    def test_an_unchanged_roster_is_still_re_reported_on_the_backstop_tick(self):
+        # What changes without an operator — a server restarting, an image bump adding
+        # tools — moves nothing in the roster, so the digest alone would never notice.
+        _, printed = self._loop([(ROSTER_A, "")] * 3, interval="0")
+        self.assertEqual(printed.count("report:"), 3)
+
+    def test_recovery_reports_even_when_the_roster_never_changed(self):
+        # `reachable` flipping back has to trigger a report on its own: the digest is
+        # unchanged across the outage, so without that check the first thing said after
+        # a recovery would wait for the backstop.
+        _, printed = self._loop([(ROSTER_A, ""), (None, "down"), (ROSTER_A, "")])
+        self.assertEqual(printed.count("report:"), 2)
 
 
 if __name__ == "__main__":

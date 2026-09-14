@@ -300,7 +300,7 @@ def _init_db() -> None:
                 auth_template TEXT,             -- e.g. 'Bearer {secret}'
                 created_at    REAL NOT NULL
                 -- NOTE what is absent: any reference to the secret. The gateway reads
-                -- exactly `/run/dockade/secrets/mcp-<server>.json`, DERIVED from the
+                -- exactly `/run/dockade/secrets/<server>.json`, DERIVED from the
                 -- name above, because a stored free-text path would let a forged
                 -- config write point one server at another server's credential. Making
                 -- that impossible beats validating against it — the move

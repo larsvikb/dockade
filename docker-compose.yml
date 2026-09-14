@@ -530,6 +530,31 @@ services:
       # same mechanism, and the same reasoning, as CONTROL_MANAGE_BIND above.
       GATEWAY_AGENT_BIND: 172.30.0.11
       GATEWAY_AGENT_PORT: "8100"
+      # The control plane's TOOL bridge, by ADDRESS and not by name. The control
+      # plane is multi-homed and only this leg may be spoken to; `control-plane`
+      # resolves to whichever of its legs Docker's DNS returns, and most of them
+      # would be the wrong one. Servers are dialled by NAME instead — they are
+      # single-homed, so there is no leg to pick. Held equal to CONTROL_TOOL_BIND
+      # and CONTROL_TOOL_PORT by tests/test_topology.py.
+      GATEWAY_CONTROL_URL: http://172.27.0.2:8092
+    volumes:
+      # The MCP client credentials, READ-ONLY, one JSON file per server named for the
+      # server itself. This is the credential the gateway injects per request, and it
+      # is here rather than in the server containers because github-mcp-server in
+      # `http` mode has no env fallback at all — measured, see NOTES.md: a bearer is
+      # mandatory and takes precedence over the container's own token.
+      #
+      # This is the one place a write-capable credential sits in a container the agent
+      # can reach, and it is a cost rather than a preference (mcp-servers.yml: a
+      # credential held by the SERVER is farther from the agent). What keeps it bounded
+      # is `:ro` plus the derived path — the gateway opens `<server>.json` and can name
+      # no other file, so a forged roster cannot point one server at another's token.
+      #
+      # `:-` and never `:?`: interpolation runs over the whole file before profiles
+      # select services, so a required variable here would take the infra down with it
+      # (tests/test_topology.py). The Makefile exports the real, XDG-aware path; the
+      # in-repo default is the fallback for a hand-run compose and is gitignored.
+      - ${MCP_SECRETS:-./secrets}:/run/dockade/secrets:ro
     healthcheck:
       # Dials the PINNED ADDRESS, not loopback, because the listener binds one
       # address and loopback is not it. Read out of the environment rather than

@@ -2375,7 +2375,10 @@ variations that actually occur (`Bearer …`, `token …`, `X-Api-Key: …`) wit
 per-server special case anywhere in the code — there is no GitHub-specific branch.
 
 **The secret's path is derived from the server name, never stored as a reference.**
-The gateway reads exactly `/run/dockade/secrets/mcp-<server>.json` and nothing else. A
+The gateway reads exactly `/run/dockade/secrets/<server>.json` and nothing else. No
+prefix is added, because the name already carries one — the server IS `mcp-github`,
+so the file is `mcp-github.json`; one string is the container dialled, the policy key
+and the filename, and that is what leaves nothing for a reference to disagree with. A
 free-text `secret_ref` in the store would let a forged config write point one server
 at another's credential; deriving the path makes that cross-wiring **impossible**
 rather than validated-against. Same move `_persist_candidates` already makes for
@@ -3294,7 +3297,9 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | timed grants (`leases`) — `allow_lease`, the live-lease strip, revoke | **done** — exact host only; no breadth ladder |
 | — | the gateway's bridge — `tool-authorize-net`, third listener, decide/roster/claim | **done** — inert until the gateway speaks |
 | — | `tool-gateway` placement — triple-homed, agent leg only, bind guard | **done** — serves no tools yet |
-| — | MCP gateway — per-tool allow/deny/ask | planned (next: roster + curated tool list) |
+| — | gateway discovery — roster pull, `tools/list`, policy-vs-server report | **done** — reports to the log; writes nothing back |
+| — | MCP client credentials — read-only mount, path derived from the server name | **done** — the gateway is the only holder |
+| — | MCP gateway — per-tool allow/deny/ask | planned (next: curated tool list on the agent leg) |
 
 The rationale for each shipped item lives under **Governance surfaces** above, not here
 — a status line goes stale, the reasoning does not. This section is deliberately the
@@ -3394,6 +3399,38 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
   relies on managed settings; hard policy goes to the org admin console, and the
   local managed file has been removed from the build. See "Managed settings are NOT
   an enforcement lever here".
+- **RESOLVED — the control plane learns a server's tools from the gateway, never by
+  scanning `mcp-net`.** Today it knows no tools at all: a `tool_rules` row is a name
+  an operator typed, and nothing checks it against anything. That is safe — a missing
+  rule denies, so a misspelled rule and an unwritten one fail the same closed way —
+  but it is blind in both directions. There is no list to pick a tool name from, and a
+  typo is indistinguishable from a deny. The gateway is the only component that can
+  close this, because it is the only one that ever talks to a server; it already
+  dials each enabled server by name on its roster poll, and `tools/list` is the same
+  trip. What comes back is operator-facing metadata and **never an input to
+  `policy._decide_tool`** — the names and descriptions are server-authored, they would
+  render in the control plane's own UI, and a discovered tool that could write its own
+  rule is a server granting itself capability. Reporting is a **pull**, like everything
+  else on that bridge: the control plane has no leg on the gateway's networks, and
+  giving it one to push is the lateral edge the bind guard exists to prevent.
+  Discovery therefore runs only on *enabled* servers, since disabling means the gateway
+  stops dialling — so an operator enables before seeing the tool list, which is safe
+  only because the deny default makes an enabled server with no rules able to do
+  nothing. The rejected alternative is a subnet sweep. Its fatal form is taking the
+  name from the server's own answer, which under name-keyed policy lets a server
+  choose its rules; Docker's reverse DNS may well supply an honest name instead, and
+  it is still the wrong shape, because no MCP port convention exists (8082 is GitHub's
+  image default) so a sweep means probing guessed ports across containers holding
+  write-capable credentials, and registering by existence would put anything that
+  reaches `mcp-net` in front of an operator as a candidate. **Interim, shipping
+  first:** the gateway audits the mismatch — a rule naming a tool the server does not
+  expose, and a tool no rule decides — which needs no store, no new endpoint, and no
+  server-authored text in the crown jewel.
+  **Open companion:** whether the control plane should learn that a server *exists*
+  from `mcp-servers.yml` rather than from an operator retyping its name, seeded the
+  way `policies/egress-allowlist.txt` already is (`control-plane/Dockerfile`). That
+  half needs no network access and no trust in anything running; it is only the tool
+  half that requires the gateway.
 
 ## Future improvements
 - Dedicated git proxy that speaks the git protocol, per-repo, instead of

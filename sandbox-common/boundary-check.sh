@@ -342,10 +342,19 @@ if curl --noproxy '*' --connect-timeout 5 -sf -o /dev/null http://172.30.0.11:81
     ok "tool gateway reachable on sandbox-net (172.30.0.11:8100) — the governed tool path is up"
     gw_up=1
 else
-    # NOT a failure. The gateway is a normal compose service and an operator may be
-    # running this against infra brought up before it existed, or with it stopped.
-    # Saying so plainly beats a pass that silently covers nothing.
-    printf '  SKIP tool gateway not running — the two bind probes below are vacuous without it\n'
+    # NOT a failure, and NOT evidence about the gateway's state. Two causes produce an
+    # identical failed connect from in here and this probe cannot tell them apart: the
+    # gateway may be stopped, or the sandbox may have no firewall grant for it — and
+    # today the second is the normal case, since init-firewall.sh whitelists the egress
+    # proxy and the LLM and nothing else. The grant is mode-gated and arrives with the
+    # sandbox wiring (DESIGN.md, "Telling the sandbox it exists").
+    #
+    # The firewall DROPs rather than rejects, so a blocked probe times out exactly as a
+    # dead one does; the earlier wording here named a cause it had not established.
+    # Until the grant exists this section always skips, which means the two bind probes
+    # below have never run — the refusal they would confirm is covered by
+    # tests/test_tool_gateway.py and by compose, and by nothing at runtime.
+    printf '  SKIP tool gateway unreachable (stopped, or no firewall grant yet) — the two bind probes below are vacuous without it\n'
     gw_up=0
 fi
 if [ "$gw_up" -eq 1 ]; then

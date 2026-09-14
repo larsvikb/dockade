@@ -158,6 +158,30 @@ _RELAY_ROUTES = (
     # the id-bounded shape is what keeps a path segment from becoming a traversal
     # primitive, and that reasoning does not depend on which direction the call moves.
     ("POST", re.compile(r"^/api/egress/leases/[0-9]{1,19}/revoke$")),
+    # ── MCP servers: which of the running servers policy may be written about ──
+    # The SERVERS half only. `/api/mcp/rules*` is deliberately absent: writing a rule
+    # means naming a tool, and naming one blind is what the gateway's discovery report
+    # exists to catch. That surface arrives with the picker, not before it.
+    #
+    # None of these four grants, which is worth saying because they are writes on the
+    # crown jewel's relay and a reader will ask. Registering leaves `enabled=0` with no
+    # rules; enabling a server with no rules still denies every call, since an
+    # unconfigured tool is denied rather than held. Compare `POST /api/egress/rules`
+    # above, which decides future requests outright.
+    ("GET", re.compile(r"^/api/mcp/servers$")),
+    ("POST", re.compile(r"^/api/mcp/servers$")),
+    # A NAME in the path segment, where the egress entries carry an id — so the bound
+    # is a charset rather than a digit count, and it is the same DNS label
+    # `policy._server_name_error` holds a registration to. Spelled out rather than
+    # `[^/]+` for the reason the digit bound is spelled out: a segment that can match a
+    # slash or a dot-segment is a path-traversal primitive, and this one reaches an
+    # endpoint that deletes.
+    ("POST", re.compile(r"^/api/mcp/servers/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?/edit$")),
+    # Revoking TIGHTENS — the gateway stops dialling — and the backend refuses it with
+    # a 409 while any tool rule still names the server, so nothing here deletes standing
+    # policy as a side effect.
+    ("POST",
+     re.compile(r"^/api/mcp/servers/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?/revoke$")),
     ("GET", re.compile(r"^/api/config$")),
     ("POST", re.compile(r"^/api/saturation/ack$")),
 )

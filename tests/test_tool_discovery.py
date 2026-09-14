@@ -102,7 +102,11 @@ class AuthHeaderTests(unittest.TestCase):
         # different operator action and has to stay a different message.
         with self.assertRaises(self.discovery.DiscoveryError) as caught:
             self.discovery.auth_header(ENTRY["auth"], None)
-        self.assertIn("no secret", str(caught.exception))
+        said = str(caught.exception)
+        self.assertIn("no file", said)
+        # Names the header it wanted, so the message distinguishes "this server needs a
+        # credential" from "this server's credential is wrong".
+        self.assertIn("Authorization", said)
 
 
 class SecretPathTests(unittest.TestCase):
@@ -138,6 +142,38 @@ class SecretPathTests(unittest.TestCase):
         # the path the module builds, and no other input may.
         discovery = load_discovery({"GATEWAY_SECRETS_DIR": "/nonexistent-for-tests"})
         self.assertIsNone(discovery.read_secret("mcp-github"))
+
+    def test_a_file_with_no_token_key_is_not_reported_as_a_missing_file(self):
+        # The real one, found by shipping it. A secrets file written to the OLD shape —
+        # a descriptor with the token inlined into the template — parses fine and has
+        # no `token`, and reporting that as "no secret is present" sends its reader
+        # looking for a file that is sitting right there.
+        import json as _json
+        import tempfile
+        stale = {"auth": {"type": "header", "header": "Authorization",
+                          "template": "Bearer github_pat_redacted"}}
+        with tempfile.TemporaryDirectory() as secrets:
+            with open(f"{secrets}/mcp-github.json", "w", encoding="utf-8") as handle:
+                _json.dump(stale, handle)
+            discovery = load_discovery({"GATEWAY_SECRETS_DIR": secrets})
+            with self.assertRaises(discovery.DiscoveryError) as caught:
+                discovery.read_secret("mcp-github")
+        said = str(caught.exception)
+        self.assertIn("has no 'token'", said)
+        # Names the file, so the fix is obvious from the line alone.
+        self.assertIn("mcp-github.json", said)
+
+    def test_a_missing_file_still_names_the_path_it_looked_at(self):
+        # The placeholder this printed before — a literal "<server>.json" — was
+        # unresolvable by the person reading it, which is the one thing an error must
+        # not be.
+        discovery = load_discovery({"GATEWAY_SECRETS_DIR": "/nonexistent-for-tests"})
+        with self.assertRaises(discovery.DiscoveryError) as caught:
+            discovery.auth_header({"type": "header", "header": "Authorization"}, None,
+                                  discovery.secret_path("mcp-github"))
+        said = str(caught.exception)
+        self.assertIn("/nonexistent-for-tests/mcp-github.json", said)
+        self.assertNotIn("<server>", said)
 
     def test_a_missing_secret_is_none_rather_than_an_exception(self):
         # "Configured, secret missing" is a state to REPORT, not a crash: it is the
@@ -196,7 +232,40 @@ class ReconcileTests(unittest.TestCase):
                       "\n".join(self.discovery.format_report([])))
 
 
-class RunTests(unittest.TestCase):
+class DigestTests(unittest.TestCase):
+    """What counts as "the roster changed", which is what paces the whole loop."""
+
+    def setUp(self):
+        self.discovery = load_discovery()
+
+    def test_a_flipped_rule_action_changes_the_digest(self):
+        # The case a server-name digest would miss. `ask` becoming `deny` changes the
+        # report without changing which servers are dialled — and if it did not
+        # re-trigger, the operator's edit would appear to have done nothing until the
+        # backstop tick.
+        other = {**ENTRY, "tools": [{"tool": "get_issue", "action": "allow"},
+                                    {"tool": "create_pr", "action": "deny"}]}
+        self.assertNotEqual(self.discovery.roster_digest([ENTRY]),
+                            self.discovery.roster_digest([other]))
+
+    def test_an_auth_descriptor_edit_changes_the_digest(self):
+        # It changes HOW a server is dialled, so the next report may differ even though
+        # nothing about the tool rules moved.
+        other = {**ENTRY, "auth": {"type": "none", "header": None, "template": None}}
+        self.assertNotEqual(self.discovery.roster_digest([ENTRY]),
+                            self.discovery.roster_digest([other]))
+
+    def test_key_order_is_not_a_change(self):
+        # JSON object order is not meaningful and the control plane is free to change
+        # it. Without sorting, an unrelated backend edit would look like a roster
+        # change forever and the loop would re-dial every server on every poll.
+        reordered = {"tools": ENTRY["tools"], "auth": ENTRY["auth"],
+                     "server": ENTRY["server"]}
+        self.assertEqual(self.discovery.roster_digest([ENTRY]),
+                         self.discovery.roster_digest([reordered]))
+
+
+class PollTests(unittest.TestCase):
 
     def test_an_unreachable_control_plane_is_reported_and_not_raised(self):
         # The gateway must come up and stay up whether or not the authority answers —
@@ -206,23 +275,22 @@ class RunTests(unittest.TestCase):
         discovery = load_discovery(
             {"GATEWAY_CONTROL_URL": "http://127.0.0.1:1",
              "GATEWAY_DISCOVERY_TIMEOUT": "0.2"})
-        answered, lines = discovery.run()
-        self.assertFalse(answered)
-        self.assertIn("roster unavailable", "\n".join(lines))
+        roster, failure = discovery.poll()
+        self.assertIsNone(roster)
+        self.assertIn("roster unavailable", failure)
 
-    def test_an_unreachable_server_still_counts_as_the_authority_answering(self):
-        # The flag tracks the CONTROL PLANE, not the servers. A pass where the roster
-        # arrived and a server was down is a COMPLETE report, so pacing on it would
-        # keep the loop in its cold-start retry forever while everything it needs is
-        # working — a hot loop caused by a finding rather than by a fault.
+    def test_polling_the_roster_dials_no_server(self):
+        # The split only pays if the cheap call stays cheap. If poll() ever enumerated,
+        # the ten-second cadence would land on every container holding a credential,
+        # which is the cost the two rates exist to avoid.
         discovery = load_discovery()
-        discovery.fetch_roster = lambda: [dict(ENTRY)]
         def boom(*_a, **_k):
-            raise discovery.DiscoveryError("unreachable: connection refused")
+            raise AssertionError("poll() dialled a server")
         discovery.list_tools = boom
-        answered, lines = discovery.run()
-        self.assertTrue(answered)
-        self.assertIn("NOT ENUMERATED", "\n".join(lines))
+        discovery.fetch_roster = lambda: [dict(ENTRY)]
+        roster, failure = discovery.poll()
+        self.assertEqual(failure, "")
+        self.assertEqual(len(roster), 1)
 
 
 if __name__ == "__main__":

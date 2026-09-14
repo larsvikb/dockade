@@ -306,7 +306,15 @@ class RelayAllowlistTests(unittest.TestCase):
                              # The timed grants. Read, and taken back — see below for
                              # the collection POST that is deliberately absent.
                              ("api/egress/leases", "GET"),
-                             ("api/egress/leases/12/revoke", "POST")):
+                             ("api/egress/leases/12/revoke", "POST"),
+                             # MCP servers. None of these grants — a registration lands
+                             # disabled and an enabled server with no rules denies every
+                             # call — which is what separates them from the egress
+                             # writes above.
+                             ("api/mcp/servers", "GET"),
+                             ("api/mcp/servers", "POST"),
+                             ("api/mcp/servers/mcp-github/edit", "POST"),
+                             ("api/mcp/servers/mcp-github/revoke", "POST")):
             self._proxy(path, method)
             self.assertEqual(urlsplit(_sent["url"]).netloc, "control-plane:8090",
                              f"{method} {path} must relay")

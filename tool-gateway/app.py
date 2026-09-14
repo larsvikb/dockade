@@ -46,6 +46,7 @@ from __future__ import annotations
 import ipaddress
 import os
 import threading
+import time
 
 import discovery
 from fastapi import FastAPI
@@ -150,46 +151,66 @@ def healthz() -> dict:
     return {"ok": True}
 
 
-#: How often the gateway re-reads the servers and compares them with policy. Long,
-#: because this is a diagnostic rather than a control: an operator who has just
-#: written a rule is reading the UI, not this log, and a short interval would only
-#: put steady traffic on containers holding credentials for no one's benefit.
+#: The BACKSTOP, not the cadence. A report is normally triggered by the roster
+#: changing; this is the longest the gateway will stay silent regardless, so that what
+#: changes without an operator — a server restarting, an image bump adding tools, an
+#: outage that has not lifted — still surfaces. Long because dialling every container
+#: holding a credential is the expensive half, and nothing here is a control: an
+#: unconfigured tool is denied whether or not this report has run.
 DISCOVERY_INTERVAL = float(os.environ.get("GATEWAY_DISCOVERY_INTERVAL", "300"))
 
-#: The COLD-START interval, used only until the control plane first answers. This
-#: gateway has no `depends_on` — deliberately, so it serves whether or not the
-#: authority is up — and the control plane's healthcheck probes its authorize
-#: listener, not the tool bridge, so nothing in compose orders these two. The first
-#: pass therefore races a cold start and loses. At the steady interval that would
-#: leave a five-minute window where the only line in the log says the roster is
-#: unreachable, which reads as broken rather than as starting.
-STARTUP_RETRY = float(os.environ.get("GATEWAY_DISCOVERY_STARTUP_RETRY", "5"))
+#: How often the ROSTER is re-read. Short, because it is one request to a sibling
+#: answering two indexed selects — cheaper than the three four-second polls this
+#: control plane already serves the UI — and because an operator who has just
+#: registered a server is watching for the result.
+#:
+#: It doubles as the cold-start retry, which is why there is no third number. The
+#: gateway has no `depends_on` (deliberately, so it serves whether or not the
+#: authority is up) and the control plane's healthcheck probes its authorize listener
+#: rather than the tool bridge, so nothing in compose orders the two: the first poll
+#: races a cold start and loses. At this cadence it simply wins the next one.
+ROSTER_INTERVAL = float(os.environ.get("GATEWAY_ROSTER_INTERVAL", "10"))
 
 
 def _reconcile_forever(stop: threading.Event) -> None:
     """Report the gap between what the servers expose and what policy decides.
 
-    A DAEMON loop that cannot fail the process: ``discovery.run`` swallows its own
-    errors and returns them as lines, and the sleep is on an Event so a shutdown is
-    not held for the interval. It runs immediately and then on the interval, because
-    the pass an operator most wants is the one right after a restart.
+    A DAEMON loop that cannot fail the process: ``discovery.poll`` swallows its own
+    errors and returns them as text, and the sleep is on an Event so a shutdown is not
+    held for the interval.
 
-    Two paces, and only the first is quiet. Before the control plane has ever
-    answered, the loop retries fast and says so ONCE — the repeats are a startup race
-    resolving itself, and printing each would bury the line that matters. After it has
-    answered, every pass prints, failures included: at that point an unreachable
-    authority is news rather than noise, and a diagnostic that goes silent on trouble
-    is the failure mode this whole module exists to avoid."""
-    reached = False    # the control plane has answered at least once
-    announced = False  # the cold-start failure has been reported once
+    POLLING AND SPEAKING ARE DIFFERENT RATES, and the split is the design. The roster
+    is re-read every ROSTER_INTERVAL; the servers are dialled — and a report printed —
+    only when the roster CHANGED, when reachability flipped, or when DISCOVERY_INTERVAL
+    has passed since the last thing said. Enumeration is a request to every container
+    holding a credential, so it follows an operator action rather than a short timer,
+    while the slow tick still catches what changes without one: a server restarting, or
+    an image bump adding tools.
+
+    The quiet is bounded on purpose. A persistent outage is not announced every ten
+    seconds, but it IS announced every slow tick, because a diagnostic that goes silent
+    exactly when something is broken is the failure this module exists to avoid."""
+    enumerated = None   # digest of the roster the last report was built from
+    reachable = None    # None until the control plane has ever answered
+    deadline = 0.0      # monotonic time the slow tick next falls due
     while True:
-        answered, lines = discovery.run()
-        if answered or reached or not announced:
-            for line in lines:
-                print(line, flush=True)
-            announced = True
-        reached = reached or answered
-        if stop.wait(DISCOVERY_INTERVAL if reached else STARTUP_RETRY):
+        roster, failure = discovery.poll()
+        due = time.monotonic() >= deadline
+        if roster is None:
+            # Flipping into failure is news; staying there is not, until the tick.
+            if reachable is not False or due:
+                print(failure, flush=True)
+                deadline = time.monotonic() + DISCOVERY_INTERVAL
+            reachable = False
+        else:
+            digest = discovery.roster_digest(roster)
+            if reachable is not True or digest != enumerated or due:
+                for line in discovery.report(roster):
+                    print(line, flush=True)
+                enumerated = digest
+                deadline = time.monotonic() + DISCOVERY_INTERVAL
+            reachable = True
+        if stop.wait(ROSTER_INTERVAL):
             return
 
 

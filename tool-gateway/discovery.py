@@ -120,6 +120,12 @@ def check_name(server: str) -> str:
     return server
 
 
+def secret_path(server: str) -> str:
+    """Where a server's token lives. One definition, because it is quoted in errors as
+    well as opened, and an error naming a path nobody reads is worse than none."""
+    return os.path.join(SECRETS_DIR, f"{check_name(server)}.json")
+
+
 def read_secret(server: str) -> str | None:
     """A server's token, or None if no file is there.
 
@@ -133,21 +139,34 @@ def read_secret(server: str) -> str | None:
     ``mcp-mcp-github.json`` — which is the file the Makefile's probe helper does NOT
     write. DESIGN.md said otherwise until this was implemented against it.
 
-    A missing file is not an error, because "configured, secret missing" is a state an
-    operator needs REPORTED — it is the one that otherwise surfaces as an upstream 401
-    and reads like a policy problem (DESIGN.md, "What the UI can say without ever
-    seeing a value")."""
-    path = os.path.join(SECRETS_DIR, f"{check_name(server)}.json")
+    THREE outcomes, not two, and keeping them apart is the whole point. A missing file
+    is None — "configured, secret missing" is a state an operator needs reported, since
+    it otherwise surfaces as an upstream 401 that reads like a policy problem
+    (DESIGN.md, "What the UI can say without ever seeing a value"). An unreadable one
+    and a file of the wrong SHAPE are both errors, and they name different fixes:
+    permissions on the one hand, file contents on the other.
+
+    Collapsing the third into the second is what this function did first, and it sent
+    its reader looking for a file that was sitting right there."""
+    path = secret_path(server)
     try:
         with open(path, encoding="utf-8") as handle:
-            return json.load(handle).get("token") or None
+            data = json.load(handle)
     except FileNotFoundError:
         return None
     except (OSError, ValueError) as exc:
-        raise DiscoveryError(f"secret file for {server!r} is unreadable: {exc}") from exc
+        raise DiscoveryError(f"secret file {path} is unreadable: {exc}") from exc
+    token = isinstance(data, dict) and data.get("token")
+    if not token:
+        raise DiscoveryError(
+            f"{path} has no 'token'. The file holds secret material and nothing else — "
+            f'{{"token": "...", "note": "..."}} — because the header name and template '
+            f"are the DESCRIPTOR, and that is registered in the control plane rather "
+            f"than kept beside the credential")
+    return token
 
 
-def auth_header(auth: dict, secret: str | None) -> dict[str, str]:
+def auth_header(auth: dict, secret: str | None, where: str = "") -> dict[str, str]:
     """The Authorization-style header a descriptor asks for, with the secret applied.
 
     The descriptor is the whole per-server difference — header NAME and TEMPLATE come
@@ -156,9 +175,11 @@ def auth_header(auth: dict, secret: str | None) -> dict[str, str]:
     if auth.get("type") != "header":
         return {}
     if secret is None:
+        # Names the actual path. The placeholder this used to print was unresolvable by
+        # the person reading it, which is the one thing an error message must not be.
         raise DiscoveryError(
-            f"auth descriptor wants {auth.get('header')!r} but no secret is present "
-            f"at {SECRETS_DIR}/<server>.json")
+            f"auth descriptor wants {auth.get('header')!r} but there is no file at "
+            f"{where or SECRETS_DIR}")
     name = auth.get("header") or "Authorization"
     template = auth.get("template") or "{secret}"
     return {name: template.replace("{secret}", secret)}
@@ -194,7 +215,7 @@ def list_tools(server: str, auth: dict) -> list[str]:
     where it was measured."""
     headers = {"Content-Type": "application/json",
                "Accept": "application/json, text/event-stream"}
-    headers.update(auth_header(auth, read_secret(server)))
+    headers.update(auth_header(auth, read_secret(server), secret_path(server)))
     payload = json.dumps(
         {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}).encode()
     # The scheme is a literal here, so there is no S310 to suppress: the only variable
@@ -269,20 +290,45 @@ def format_report(results: list[dict]) -> list[str]:
     return lines
 
 
-def run() -> tuple[bool, list[str]]:
-    """One reconciliation pass: whether the AUTHORITY answered, and the report lines.
+def poll() -> tuple[list[dict] | None, str]:
+    """The roster, or None and a reason. Never raises.
 
-    Never raises — a diagnostic that can take the gateway down is worse than no
-    diagnostic, and the control plane being unreachable is itself reportable.
+    Split from ``report`` because the two have different costs and therefore
+    different cadences. This is one HTTP call to a sibling answering two indexed
+    selects, cheap enough to run every few seconds; ``report`` dials every enabled
+    server, which are the containers holding credentials. Polling the authority often
+    and the servers rarely is what lets a registration show up in seconds without
+    putting steady traffic on the servers.
 
-    The flag is separate from the lines because the caller paces itself on it. It
-    reports reaching the CONTROL PLANE and nothing else: an unreachable server is a
-    finding inside a successful pass, not a failed pass, since the roster answered and
-    the report is complete. Returned rather than inferred from the text, because a
-    caller matching on a substring would silently stop working the day a message is
-    reworded."""
+    None means the CONTROL PLANE did not answer — not that a server is down. An
+    unreachable server is a finding inside a successful report, because the roster
+    arrived and the report is complete. Returned as a value rather than left for the
+    caller to infer from the text: matching on a substring would stop working the day
+    a message is reworded."""
     try:
-        roster = fetch_roster()
+        return fetch_roster(), ""
     except (urllib.error.URLError, OSError, ValueError) as exc:
-        return False, [f"tool-gateway: roster unavailable from {CONTROL_URL} — {exc}"]
-    return True, format_report([reconcile(entry) for entry in roster])
+        return None, f"tool-gateway: roster unavailable from {CONTROL_URL} — {exc}"
+
+
+def roster_digest(roster: list[dict]) -> str:
+    """What the caller compares to decide whether anything it acts on has changed.
+
+    The WHOLE roster, not just the server names: a rule flipped from `ask` to `deny`
+    changes the report without changing which servers are dialled, and an auth
+    descriptor edit changes how they are dialled. Anything that can alter the report
+    has to be able to trigger one.
+
+    The serialization IS the digest rather than a hash of it. A roster is a handful of
+    servers and their rules, so there is nothing to save by hashing, and no collision
+    question to reason about in exchange."""
+    return json.dumps(roster, sort_keys=True, separators=(",", ":"))
+
+
+def report(roster: list[dict]) -> list[str]:
+    """Dial every server on the roster and say where policy and reality disagree.
+
+    The expensive half. Each entry is one request to a container holding a
+    write-capable credential, which is why the caller runs this on change rather than
+    on a short timer."""
+    return format_report([reconcile(entry) for entry in roster])

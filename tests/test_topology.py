@@ -652,6 +652,34 @@ class GatewayPlacementTests(unittest.TestCase):
         self.assertTrue(mount[0].rstrip().endswith(":ro"),
                         f"the gateway's secrets mount is not read-only: {mount[0]!r}")
 
+    def test_the_gateway_runs_as_a_user_that_can_read_the_secrets_mount(self):
+        # These two lines are one fact split across a file boundary, and getting it
+        # wrong is SILENT until enumeration: the container starts, the healthcheck
+        # passes, and the only symptom is a permission error inside a report an
+        # operator may not be reading. The host files are mode 0600 (secrets-perm-check
+        # keeps them that way), so the mount is useless to any uid but the owner's.
+        user = [ln.strip() for ln in _service("tool-gateway")
+                if ln.strip().startswith("user:")]
+        self.assertTrue(user, "the gateway has a secrets mount but no user override, "
+                              "so it runs as the image uid and can read none of it")
+        self.assertIn("DOCKADE_UID", user[0],
+                      f"{user[0]} does not take the invoking user's id")
+        # Not root, which would read the mount by ignoring its mode — the one way to
+        # make this test pass while throwing away the reason it exists.
+        self.assertNotIn('"0:', user[0])
+        self.assertNotIn("root", user[0])
+
+    def test_the_gateway_image_uid_collides_with_no_other_infra_image(self):
+        # It is only a fallback for a hand-run `docker run`, and it still has to be its
+        # own: two images sharing a uid is harmless right up until they share a mount,
+        # and then each can read what the other was given.
+        uids = {}
+        for path in sorted(ROOT.glob("*/Dockerfile")):
+            for match in re.finditer(r"--uid (\d+)", path.read_text()):
+                uids.setdefault(match.group(1), []).append(path.parent.name)
+        shared = {uid: who for uid, who in uids.items() if len(set(who)) > 1}
+        self.assertEqual(shared, {}, f"uid claimed by more than one image: {shared}")
+
     def test_no_other_service_is_given_the_secrets(self):
         # One holder, deliberately. Every additional container with the directory is
         # another process whose compromise spends the same token, and the servers in

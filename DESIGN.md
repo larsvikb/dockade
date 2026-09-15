@@ -40,7 +40,7 @@ the repo follows from "containment is by **capability**, not configuration."
   [Server-side execution blind spots](#server-side-execution-accepted-governance-blind-spots)
 - [Capability inventory](#capability-inventory-v1) ·
   [Governance surfaces](#governance-surfaces)
-  (egress proxy · control plane · approval UI · [MCP gateway](#mcp-gateway--governed-tool-capability-presenting-not-yet-executing))
+  (egress proxy · control plane · approval UI · [MCP gateway](#mcp-gateway--governed-tool-capability-built-not-yet-offered-to-the-sandbox))
 - [Startup ordering](#startup-ordering--running-is-not-ready) ·
   [Resource limits](#resource-limits--blast-radius-not-boundary) ·
   [Local inference](#local-inference--an-ungoverned-llm-tool)
@@ -2163,7 +2163,7 @@ the storage mistake above wearing an API hat.
 Not yet built: git/secrets/cache data-plane services, the MCP gateway, skills,
 quality-gate hooks.
 
-### MCP gateway — governed tool capability (presenting, not yet executing)
+### MCP gateway — governed tool capability (built; not yet offered to the sandbox)
 
 A data-plane service that speaks MCP to the sandbox on one side and to configured
 MCP servers on the other, exposing a **curated** tool set under per-tool
@@ -2250,14 +2250,36 @@ the real subnets — and `boundary-check.sh` probes all three legs from inside a
 running sandbox, the agent-facing one as a **positive control** so that a silent
 `mcp-net` is a statement about binding rather than about nothing listening.
 
-**The two axes landed one at a time, presentation first.** The gateway now speaks MCP
-on the agent leg and serves a curated `tools/list`; `tools/call` is refused, so the
-surface is fail-closed rather than half-open while its executing half is built. That
-order follows from the axes themselves: presentation is ergonomics and can be wrong
-without granting anything, while execution is the boundary — so the half that cannot
-grant is also the half that can ship first and be probed by hand (`make gateway-tools`,
-which dials the listener from a throwaway container on `sandbox-net`, the agent's own
-position).
+**The two axes landed one at a time, presentation first.** The order followed from the
+axes themselves: presentation is ergonomics and can be wrong without granting anything,
+while execution is the boundary — so the half that cannot grant shipped first and was
+probed by hand (`make gateway-tools`, which dials the listener from a throwaway
+container on `sandbox-net`, the agent's own position). Both are now built:
+`tool-gateway/surface.py` decides what is shown and `tool-gateway/execute.py` decides
+what runs, with `tool-gateway/protocol.py` holding the wire and no I/O at all.
+
+What remains before an agent can use any of it is the launcher's `--mcp-config` entry
+(below), which is deliberately last: a tool surface that is offered before it works
+misleads the agent about its own capability, which is the same objection that rules out
+a runtime probe there.
+
+**Nothing runs before the control plane has answered, and that is structural rather
+than asserted.** There is exactly one function in the gateway that dials a server, it
+takes no policy argument, and it is reached from exactly two places — an `allow` from
+`/tool/authorize`, and a successful claim on an ask a human approved. A function that
+both decided and ran would have two reasons to be called and one of them would
+eventually be wrong. The failure direction is the one that matters: an unreachable
+control plane refuses the call rather than running it, so an outage cannot become a
+default-allow wearing a disguise.
+
+**Every refusal reaches the agent as a RESULT, not a protocol error**, generalising
+what DESIGN already required of the pending answer. An agent can act on a result — read
+the reason, do something else, come back — where an error is something it records as a
+failed call, carrying nothing it can use. The corollary is that the text has to carry
+the distinction the agent needs: a `deny` says retrying will not help, a pending ask
+says come back with the same id, and a `denied`/`expired`/`spent` approval says the
+matter is final. An agent that cannot tell a refusal from a delay retries one forever,
+and that is a property of the wording rather than of the protocol.
 
 **Flattening several servers into one namespace, reversibly.** The agent talks to one
 MCP server, so tools arrive from several backing servers into a single list and a name
@@ -3312,19 +3334,20 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | governed git path — clone/fetch (writes are the gateway's) | planned |
 | — | `mcp-net` + MCP server catalogue (`mcp-servers.yml`) | **done** |
 | — | per-client-class egress policy | **done** |
-| — | tool policy: store (`tool_rules`, `mcp_servers`) + config API (`/api/mcp/…`) | **done** — decides what is presented; not yet what runs |
+| — | tool policy: store (`tool_rules`, `mcp_servers`) + config API (`/api/mcp/…`) | **done** |
 | — | tool asks: `tool_approvals`, the ask registry, one merged queue, `resolve` split | **done** |
 | — | the tool card — raw payload, per-surface actions | **done** — no schema-driven view; the raw payload is the whole of it |
 | — | timed grants (`leases`) — `allow_lease`, the live-lease strip, revoke | **done** — exact host only; no breadth ladder |
-| — | the gateway's bridge — `tool-authorize-net`, third listener, decide/roster/claim | **done** — roster and inventory in use; decide and claim await execution |
+| — | the gateway's bridge — `tool-authorize-net`, third listener, decide/roster/claim | **done** — all four endpoints in use |
 | — | `tool-gateway` placement — triple-homed, agent leg only, bind guard | **done** |
 | — | gateway discovery — roster pull, `tools/list`, policy-vs-server report | **done** — reports to the log; writes nothing back |
 | — | MCP client credentials — read-only mount, path derived from the server name | **done** — the gateway is the only holder |
 | — | MCP server registration — UI tab: register, enable/disable, revoke | **done** — servers only; tool rules not yet |
 | — | tool inventory — gateway pushes, control plane holds it in memory | **done** — audited on change; no UI yet |
 | — | tool policy UI — pick from the inventory, write allow/ask/deny, promote | **done** — every row in `tool_rules` now has an operator surface |
-| — | curated tool list on the agent leg — MCP listener, `tools/list` | **done** — presents; `tools/call` is refused |
-| — | MCP gateway — per-tool allow/deny/ask | planned (next: execution — authorize, proxy, the pending ask, resume) |
+| — | curated tool list on the agent leg — MCP listener, `tools/list` | **done** |
+| — | MCP gateway — per-tool allow/deny/ask on `tools/call`, the pending ask, `resume_tool_call` | **done** — no agent is pointed at it yet |
+| — | tell the sandbox it exists — `--mcp-config` + `--strict-mcp-config` from the launcher | planned (next) |
 
 The rationale for each shipped item lives under **Governance surfaces** above, not here
 — a status line goes stale, the reasoning does not. This section is deliberately the

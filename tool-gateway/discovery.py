@@ -208,6 +208,36 @@ def parse_tools(raw: str) -> list[dict]:
     return message.get("result", {}).get("tools", [])
 
 
+def post(server: str, message: dict, auth: dict, timeout: float | None = None) -> str:
+    """One MCP request to a server, returning its raw reply body.
+
+    THE ONLY PLACE ANYTHING DIALS A SERVER, which is what makes the properties below
+    hold for enumeration and execution alike rather than for whichever one was written
+    first. Both send the same headers, resolve the same derived secret path and get the
+    same errors turned into `DiscoveryError`; the difference between them is the
+    message and the timeout, which is exactly what the two arguments are.
+
+    The URL is assembled here and nowhere else. ``check_name`` runs on every call, so a
+    server name that is not a DNS label cannot become a host, a path or a filename —
+    checked at this choke point rather than trusted from the roster that supplied it."""
+    headers = {"Content-Type": "application/json",
+               "Accept": "application/json, text/event-stream"}
+    headers.update(auth_header(auth, read_secret(server), secret_path(server)))
+    # The scheme is a literal here, so there is no S310 to suppress: the only variable
+    # part is a server NAME off the roster, which is what this is supposed to dial.
+    request = urllib.request.Request(
+        f"http://{check_name(server)}:{MCP_PORT}{MCP_PATH}",
+        data=json.dumps(message).encode(), headers=headers)
+    try:
+        with urllib.request.urlopen(  # noqa: S310
+                request, timeout=TIMEOUT if timeout is None else timeout) as response:
+            return response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        raise DiscoveryError(f"HTTP {exc.code} from {server} — {exc.reason}") from exc
+    except (urllib.error.URLError, OSError) as exc:
+        raise DiscoveryError(f"unreachable: {exc}") from exc
+
+
 def list_tools(server: str, auth: dict) -> list[dict]:
     """The tools a server exposes, TRIMMED, by asking it.
 
@@ -220,24 +250,8 @@ def list_tools(server: str, auth: dict) -> list[dict]:
     description and the schema, because an agent cannot call a tool whose arguments it
     cannot see. Trimming to only the first pair is what this did first, and it made the
     served tool list uncallable."""
-    headers = {"Content-Type": "application/json",
-               "Accept": "application/json, text/event-stream"}
-    headers.update(auth_header(auth, read_secret(server), secret_path(server)))
-    payload = json.dumps(
-        {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}).encode()
-    # The scheme is a literal here, so there is no S310 to suppress: the only variable
-    # part is a server NAME off the roster, which is what this is supposed to dial.
-    request = urllib.request.Request(
-        f"http://{check_name(server)}:{MCP_PORT}{MCP_PATH}",
-        data=payload, headers=headers)
-    try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:  # noqa: S310
-            raw = response.read().decode("utf-8", "replace")
-    except urllib.error.HTTPError as exc:
-        raise DiscoveryError(
-            f"HTTP {exc.code} from {server} — {exc.reason}") from exc
-    except (urllib.error.URLError, OSError) as exc:
-        raise DiscoveryError(f"unreachable: {exc}") from exc
+    raw = post(server, {"jsonrpc": "2.0", "id": 1, "method": "tools/list",
+                        "params": {}}, auth)
     # Trimmed HERE, at the point of reading, rather than downstream. A real reply
     # carries inline base64 `icons` as well — measured, see the byte split
     # `make mcp-tools` prints — and nothing reads them. The narrowing that crosses to

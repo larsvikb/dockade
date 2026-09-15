@@ -145,6 +145,7 @@ REFFILES := $(SCRIPTS) \
             control-plane/requirements.txt \
             tool-gateway/app.py \
             tool-gateway/discovery.py \
+            tool-gateway/execute.py \
             tool-gateway/protocol.py \
             tool-gateway/surface.py \
             tool-gateway/requirements.txt \
@@ -692,32 +693,41 @@ if os.environ.get("MCP_RAW"):
 if "error" in message:
     sys.exit(f"gateway-tools: the gateway returned an error — {message['error']}")
 
-tools = message["result"]["tools"]
-if not tools:
-    # The empty surface is a real steady state — a fresh install, or every rule denied —
-    # so it gets a sentence of its own rather than the summary below with zeroes in it.
-    # The probe cannot tell the two causes apart from `tools/list`, and says so instead
-    # of picking one.
-    #
-    # Printed and exited ZERO, unlike every other exit in here: those are failures to
-    # get an answer, and this IS the answer.
-    print("no tools. Either no server is enabled, or nothing on one is ruled allow "
-          "or ask — both are the same empty surface from the agent's side.")
-    sys.exit(0)
+def count(n, noun):
+    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
 
-servers = {}
-for tool in tools:
-    server, _, name = tool["name"].partition("__")
-    servers.setdefault(server, []).append(name)
+# Split on the SEPARATOR being there at all, which is how the gateway itself tells its
+# own tools from proxied ones: every proxied name carries `<server>__`, and a native one
+# cannot, so a missing separator is the whole discriminator (tool-gateway/surface.py).
+servers, native = {}, []
+for tool in message["result"]["tools"]:
+    server, sep, name = tool["name"].partition("__")
+    if sep:
+        servers.setdefault(server, []).append(name)
+    else:
+        native.append(tool["name"])
+
 for server in sorted(servers):
     print(server)
     for name in sorted(servers[server]):
         print(f"  {name}")
+if native:
+    print("the gateway's own")
+    for name in sorted(native):
+        print(f"  {name}")
 
-def count(n, noun):
-    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
+proxied = sum(len(names) for names in servers.values())
+if not proxied:
+    # The empty surface is a real steady state — a fresh install, or every rule denied —
+    # so it gets a sentence of its own rather than the summary below with zeroes in it.
+    # The probe cannot tell the two causes apart from `tools/list`, and says so instead
+    # of picking one. Printed and exited ZERO, unlike every other exit in here: those
+    # are failures to get an answer, and this IS the answer.
+    print("\nno tools from any server. Either none is enabled, or nothing on one is "
+          "ruled allow or ask — both are the same empty surface from the agent's side.")
+    sys.exit(0)
 
-print(f"\n{count(len(tools), 'tool')} from {count(len(servers), 'server')} — each is "
+print(f"\n{count(proxied, 'tool')} from {count(len(servers), 'server')} — each is "
       f"ruled allow or ask. A tool with no rule, a denied one, and a tool no server "
       f"exposes are all absent, and absent means the same thing for all three.")
 endef

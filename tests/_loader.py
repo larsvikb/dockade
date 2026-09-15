@@ -157,6 +157,20 @@ def _install_fastapi_stub() -> None:
     fa.responses = responses
     sys.modules["fastapi.responses"] = responses
 
+    # The gateway hands its blocking handler to starlette's threadpool so one slow tool
+    # call cannot stall the event loop. Only the import needs satisfying here: the
+    # handler that uses it is the thin adapter, and everything it calls is tested
+    # directly.
+    concurrency = sys.modules.get("fastapi.concurrency")
+    if concurrency is None:
+        concurrency = types.ModuleType("fastapi.concurrency")
+    if not hasattr(concurrency, "run_in_threadpool"):
+        async def run_in_threadpool(fn, *args, **kwargs):
+            return fn(*args, **kwargs)
+        concurrency.run_in_threadpool = run_in_threadpool
+    fa.concurrency = concurrency
+    sys.modules["fastapi.concurrency"] = concurrency
+
     class BaseModel:
         """Enough of pydantic for the control plane's request/response models to
         be constructed directly in tests: apply class-declared field defaults
@@ -243,6 +257,28 @@ def load_surface() -> types.ModuleType:
     state because one thread writes it and another serves from it, so a shared instance
     would let one test's roster answer another's ``listing()``."""
     return _load(f"dockade_surface_{len(sys.modules)}", "tool-gateway/surface.py")
+
+
+def load_execute(env: dict[str, str] | None = None) -> types.ModuleType:
+    """The gateway's executing half, fresh per call.
+
+    Fresh because it imports ``surface``, whose published listing is module state — a
+    cached instance would share one roster across tests. ``env`` is applied at import
+    for the reason ``load_discovery`` takes one: the timeouts resolve at module scope,
+    exactly as they do in the container."""
+    pkg_dir = str(ROOT / "tool-gateway")
+    if pkg_dir not in sys.path:
+        sys.path.insert(0, pkg_dir)
+    previous = {k: os.environ.get(k) for k in (env or {})}
+    os.environ.update(env or {})
+    try:
+        return _load(f"dockade_execute_{len(sys.modules)}", "tool-gateway/execute.py")
+    finally:
+        for key, was in previous.items():
+            if was is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = was
 
 
 def load_protocol() -> types.ModuleType:

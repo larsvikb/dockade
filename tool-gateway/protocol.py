@@ -49,6 +49,7 @@ SERVER_VERSION = "0.1.0"
 PARSE_ERROR = -32700
 INVALID_REQUEST = -32600
 METHOD_NOT_FOUND = -32601
+INVALID_PARAMS = -32602
 INTERNAL_ERROR = -32603
 
 
@@ -74,8 +75,17 @@ def negotiate(requested: object) -> str:
     return requested if requested in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[0]
 
 
-def handle(message: object, listing: list[dict]) -> dict | None:
+def handle(message: object, listing: list[dict], execute=None) -> dict | None:
     """One message in, one message out — or None when there is nothing to say.
+
+    ``execute`` is what runs a tool call — ``(name, arguments) -> CallToolResult`` —
+    and it is INJECTED rather than imported so this module keeps no I/O in it: every
+    branch below is reachable from a test with no control plane, no server and no
+    socket. It also carries the caller's identity, bound by whoever supplies it, so
+    nothing here has to be trusted to pass a client address along correctly.
+
+    Absent, `tools/call` is refused. That is the honest answer for a gateway whose
+    executing half is not wired up, and it is the same answer an unruled tool gets.
 
     None means the message was a NOTIFICATION, and the caller answers with an empty
     202. Replying to a notification is a protocol violation, so this returns None for
@@ -124,12 +134,21 @@ def handle(message: object, listing: list[dict]) -> dict | None:
         return _result(message_id, {"tools": listing})
 
     if method == "tools/call":
-        # The half that is not built. Answered as an error rather than as a tool result
-        # with `isError`, because the two mean different things to an agent: a tool
-        # result says the call ran and failed, and nothing ran here. Fail-closed is the
-        # ordinary state of this surface, so an unbuilt executor refusing every call is
-        # the same answer an unruled tool would get.
-        return _error(message_id, INTERNAL_ERROR,
-                      "this gateway presents tools but does not execute them yet")
+        if execute is None:
+            # Answered as an error rather than as a result with `isError`, because the
+            # two mean different things to an agent: a result says the call ran and
+            # failed, and with no executor nothing ran and nothing could.
+            return _error(message_id, INTERNAL_ERROR,
+                          "this gateway presents tools but does not execute them yet")
+        name = params.get("name")
+        if not isinstance(name, str) or not name:
+            return _error(message_id, INVALID_PARAMS,
+                          "tools/call needs a tool name")
+        arguments = params.get("arguments")
+        # A JSON-RPC error is reserved for a malformed REQUEST. Everything the executor
+        # decides — a deny, an unknown tool, an unreachable server — comes back as a
+        # result, because each carries a reason the agent can act on and an error
+        # carries none it can use.
+        return _result(message_id, execute(name, arguments))
 
     return _error(message_id, METHOD_NOT_FOUND, f"{method!r} is not served here")

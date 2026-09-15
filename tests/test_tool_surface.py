@@ -148,6 +148,25 @@ class CurationTests(unittest.TestCase):
         self.assertEqual(shown["description"], "Read an issue.")
         self.assertIn("properties", shown["inputSchema"])
 
+    def test_an_ask_tool_says_so_in_its_description(self):
+        # Otherwise an `ask` tool is indistinguishable from an `allow` one until it is
+        # called, so the agent cannot do the gated work first and the unblocked work
+        # while it waits, and cannot warn a human that a task will need them.
+        shown = next(t for t in self.listing if t["name"] == "mcp-github__create_pr")
+        self.assertTrue(shown["description"].startswith(self.surface.ASK_NOTICE))
+        self.assertIn("Open a pull request.", shown["description"])
+
+    def test_an_allow_tool_carries_no_notice(self):
+        # The notice has to MEAN something. Put on everything, it stops being a signal
+        # and becomes noise the agent learns to skip.
+        shown = next(t for t in self.listing if t["name"] == "mcp-github__get_issue")
+        self.assertEqual(shown["description"], "Read an issue.")
+
+    def test_the_notice_names_the_tool_that_finishes_the_call(self):
+        # A notice that said "this may need approval" and stopped would leave the agent
+        # knowing it is stuck and not how to get unstuck.
+        self.assertIn(self.surface.RESUME_TOOL, self.surface.ASK_NOTICE)
+
     def test_the_servers_annotations_do_not_reach_the_agent(self):
         # `readOnlyHint` is server-supplied and therefore untrusted. Forwarding it hands
         # a third party a lever on the client's own permission behaviour; its legitimate
@@ -175,14 +194,30 @@ class PublicationTests(unittest.TestCase):
     def setUp(self):
         self.surface = load_surface()
 
-    def test_nothing_is_listed_before_the_first_reconcile(self):
+    def proxied(self) -> list[str]:
+        """The listed names that came from a server.
+
+        The gateway's own tools are filtered out HERE rather than asserted around,
+        because every case in this class is about the policy join and a native tool is
+        not in it — it is proxied from no server and governed by no rule."""
+        native = {tool["name"] for tool in self.surface.NATIVE_TOOLS}
+        return [tool["name"] for tool in self.surface.listing()
+                if tool["name"] not in native]
+
+    def test_nothing_is_proxied_before_the_first_reconcile(self):
         # The correct cold answer, and a harmless one: an empty list is not a grant.
-        self.assertEqual(self.surface.listing(), [])
+        self.assertEqual(self.proxied(), [])
+
+    def test_the_gateways_own_tools_are_listed_without_any_server(self):
+        # Resumption has to be reachable before anything has been enumerated, because
+        # an agent can hold an approval id across a gateway restart — and it depends on
+        # no server, so there is nothing for a reconcile to contribute to it.
+        self.assertIn(self.surface.RESUME_TOOL,
+                      [tool["name"] for tool in self.surface.listing()])
 
     def test_publishing_makes_the_listing_readable(self):
         self.surface.publish(ROSTER, [result()])
-        self.assertIn("mcp-github__get_issue",
-                      [t["name"] for t in self.surface.listing()])
+        self.assertIn("mcp-github__get_issue", self.proxied())
 
     def test_a_server_that_could_not_be_dialled_keeps_its_tools(self):
         # A restarting container or a briefly missing credential must not read to the
@@ -190,15 +225,14 @@ class PublicationTests(unittest.TestCase):
         # risk, because execution is decided per call against the control plane.
         self.surface.publish(ROSTER, [result()])
         self.surface.publish(ROSTER, [unreachable()])
-        self.assertIn("mcp-github__get_issue",
-                      [t["name"] for t in self.surface.listing()])
+        self.assertIn("mcp-github__get_issue", self.proxied())
 
     def test_a_server_removed_from_the_roster_loses_its_tools(self):
         # A different event from a failed dial: this one is an operator's answer
         # (disabled or revoked), not a failure to ask.
         self.surface.publish(ROSTER, [result()])
         self.surface.publish([], [])
-        self.assertEqual(self.surface.listing(), [])
+        self.assertEqual(self.proxied(), [])
 
     def test_a_rule_flipped_to_deny_leaves_the_listing_on_the_next_reconcile(self):
         # The operator-visible loop this whole step exists to close. A rule edit changes
@@ -207,15 +241,58 @@ class PublicationTests(unittest.TestCase):
         denied = [{**ROSTER[0],
                    "tools": [{"tool": "get_issue", "action": "deny"}]}]
         self.surface.publish(denied, [result()])
-        self.assertEqual(self.surface.listing(), [])
+        self.assertEqual(self.proxied(), [])
 
     def test_a_server_that_stops_exposing_a_tool_stops_listing_it(self):
         # The supply-chain direction: an image bump that REMOVES a tool. The rule
         # survives and decides nothing, which is `ruled_but_absent` in the report.
         self.surface.publish(ROSTER, [result()])
         self.surface.publish(ROSTER, [result(tools=[EXPOSED[1]])])
-        self.assertEqual([t["name"] for t in self.surface.listing()],
-                         ["mcp-github__create_pr"])
+        self.assertEqual(self.proxied(), ["mcp-github__create_pr"])
+
+
+class NativeToolTests(unittest.TestCase):
+    """The gateway's own tools — a category with its own rule.
+
+    A native tool is outside the per-tool policy governing everything else on the
+    surface, which is exactly why it needs one: a native tool must not cause an
+    ungoverned side effect. Resumption sits on that line and is admissible only because
+    its effect is bound to an id a human approved, with arguments they read."""
+
+    def setUp(self):
+        self.surface = load_surface()
+
+    def test_a_native_name_cannot_be_confused_with_a_proxied_one(self):
+        # Structural rather than a convention that has to be remembered: every proxied
+        # name is built by ``exposed_name``, which always inserts the separator, so the
+        # decode built for safety is also what tells the two apart.
+        for tool in self.surface.NATIVE_TOOLS:
+            with self.subTest(tool=tool["name"]):
+                self.assertIsNone(self.surface.split_exposed(tool["name"]))
+                self.assertNotIn(self.surface.SEP, tool["name"])
+
+    def test_the_resume_tool_is_shaped_like_an_mcp_tool(self):
+        resume = next(t for t in self.surface.NATIVE_TOOLS
+                      if t["name"] == self.surface.RESUME_TOOL)
+        self.assertEqual(resume["inputSchema"]["required"], ["approval_id"])
+        self.assertIn("approval_id", resume["inputSchema"]["properties"])
+
+    def test_the_description_says_it_runs_the_call_and_runs_it_once(self):
+        # The two things a model would otherwise get wrong, and the reason the tool is
+        # not called `get_result`: this is the trigger for the side effect, not a
+        # collection of one that already happened.
+        resume = next(t for t in self.surface.NATIVE_TOOLS
+                      if t["name"] == self.surface.RESUME_TOOL)
+        self.assertIn("RUNS the call", resume["description"])
+        self.assertIn("once", resume["description"])
+
+    def test_a_native_tool_is_not_produced_by_the_policy_join(self):
+        # It is proxied from no server, so no roster and no enumeration can contribute
+        # it — and no rule can withdraw it either.
+        listed = {tool["name"] for tool in self.surface.curate(ROSTER,
+                                                              {"mcp-github": EXPOSED})}
+        for tool in self.surface.NATIVE_TOOLS:
+            self.assertNotIn(tool["name"], listed)
 
 
 class ProtocolTests(unittest.TestCase):
@@ -261,12 +338,52 @@ class ProtocolTests(unittest.TestCase):
         # that saw one would page forever against a list held in memory.
         self.assertNotIn("nextCursor", self.ask("tools/list")["result"])
 
-    def test_a_call_is_refused_while_the_executing_half_is_unbuilt(self):
-        # Fail-closed is the ordinary state of this surface, so an unbuilt executor
-        # refusing every call is the same answer an unruled tool would get.
+    def test_a_call_is_refused_when_no_executor_is_wired_in(self):
+        # Fail-closed is the ordinary state of this surface, so a gateway with no
+        # executing half refuses every call rather than half-answering them.
         answer = self.ask("tools/call", {"name": "mcp-github__get_issue"})
         self.assertIn("error", answer)
         self.assertNotIn("result", answer)
+
+    def test_a_call_is_handed_to_the_executor_verbatim(self):
+        # The name is not decoded here and the arguments are not inspected. This module
+        # has no policy in it, and a protocol layer that pre-judged either would be a
+        # second place where a call could be decided.
+        seen = []
+
+        def execute(name, arguments):
+            seen.append((name, arguments))
+            return {"content": [{"type": "text", "text": "ran"}], "isError": False}
+
+        answer = self.protocol.handle(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": "mcp-github__get_issue", "arguments": {"id": 7}}},
+            [], execute)
+        self.assertEqual(seen, [("mcp-github__get_issue", {"id": 7})])
+        self.assertEqual(answer["result"]["content"][0]["text"], "ran")
+
+    def test_an_executor_result_is_a_result_rather_than_an_error(self):
+        # Including a refusal. Everything the executor decides carries a reason the
+        # agent can act on; a JSON-RPC error carries none it can use.
+        answer = self.protocol.handle(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": "x__y"}}, [],
+            lambda name, arguments: {"content": [], "isError": True})
+        self.assertNotIn("error", answer)
+        self.assertTrue(answer["result"]["isError"])
+
+    def test_a_call_with_no_tool_name_never_reaches_the_executor(self):
+        # A malformed REQUEST is the one thing on this path that is a protocol error
+        # rather than a decision, so it is refused before anything can decide it.
+        for params in ({}, {"name": ""}, {"name": 7}, {"name": None}):
+            with self.subTest(params=params):
+                def execute(name, arguments):  # pragma: no cover - must not run
+                    raise AssertionError("the executor was reached")
+
+                answer = self.protocol.handle(
+                    {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                     "params": params}, [], execute)
+                self.assertEqual(answer["error"]["code"], self.protocol.INVALID_PARAMS)
 
     def test_a_notification_is_never_answered(self):
         # Including one we do not recognize: replying to a notification is a protocol

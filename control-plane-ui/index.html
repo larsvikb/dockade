@@ -207,6 +207,11 @@
   .tag.allow { color: var(--allow); } .tag.deny { color: var(--deny); }
   .tag.block { color: var(--deny); }
   .tag.hold { color: var(--hold); }
+  /* A tool `ask` and an egress `hold` are the same colour because they are the same
+     thing to the person reading the table: nothing has run, and it is waiting on them.
+     They differ in how the agent experiences the wait (DESIGN.md, "An `ask` answers
+     immediately"), which is not a distinction a colour can carry. */
+  .tag.ask { color: var(--hold); }
   /* Deliberately not one of the decision colours: an observation is a thing a server
      claimed, not a thing this system decided, and it should not read as a fourth
      verdict sitting beside allow/deny/hold. */
@@ -579,6 +584,67 @@
          server's SECRET resolves: only the gateway can know that, and it has no way to
          tell this page yet. -->
     <div class="empty" id="servers-empty" hidden></div>
+
+    <h2>Tool policy <span class="note" id="toolrulecount"></span></h2>
+    <div class="empty">
+      What each registered server&rsquo;s tools may do. A tool with no rule is
+      <strong>denied</strong> &mdash; not held, not asked about &mdash; so this table is
+      the whole of what the gateway will let through. An explicit <code>deny</code> is
+      still worth writing: it decides the same thing and records that a human looked.
+    </div>
+    <!-- The picker lists what each server told the gateway it exposes. That is the
+         SERVER'S OWN CLAIM and permits nothing: it is here so a rule is written
+         against a real name instead of a remembered one, which is what the gateway's
+         `ruled_but_absent` report otherwise spends its time pointing out.
+
+         THERE IS NO WAY TO TYPE A NAME, and that is the design rather than a missing
+         feature: it means no rule can name a tool no server has ever claimed, so no
+         GRANT can precede an observation. A free-text field would be the one path by
+         which an `allow` could stand waiting for a tool to appear and permit it the
+         moment it did, with no human in the loop at that point. When a server has
+         reported nothing the note below says which of the reasons it is; the answer
+         is to fix that, not to guess a name.
+
+         A real <form> for the reason the two above are, and safe for the same one:
+         `form-action 'none'` in the CSP means the browser refuses the native POST if
+         the script ever fails to load. -->
+    <form class="ruleform" id="toolrule-form" autocomplete="off">
+      <select id="toolrule-server" aria-label="Server this rule decides for"></select>
+      <select id="toolrule-tool" aria-label="Tool this rule decides for"></select>
+      <!-- Deny first, so the default selection is the one that grants nothing. -->
+      <select id="toolrule-action" aria-label="What this tool may do">
+        <option value="deny">deny</option>
+        <option value="ask">ask</option>
+        <option value="allow">allow</option>
+      </select>
+      <button type="submit" id="toolrule-add">add rule</button>
+    </form>
+    <!-- What the SELECTED SERVER exposes and how much of it is undecided &mdash; the
+         join this view exists for. Distinct from the preview below, which is about the
+         button rather than the server: one says how much is left to decide, the other
+         says what this click decides. Polite, because both change as a consequence of
+         using a control elsewhere. -->
+    <div class="note" id="toolrule-note" aria-live="polite"></div>
+    <div class="empty" id="toolrule-preview" aria-live="polite" hidden></div>
+    <table>
+      <thead>
+        <!-- `exposed` is the rule read back against the server's current surface:
+             yes, no, or unknown when nobody has been able to ask. A rule for a tool
+             that is not there decides nothing while reading exactly like one that
+             does, which is the whole reason the column is here.
+
+             No `source` column, unlike the egress table: no file seeds `tool_rules`,
+             so every row in it is an operator's and the column would hold one value. -->
+
+        <tr><th>server</th><th>tool</th><th>action</th><th>exposed</th>
+          <th>added</th><th></th></tr>
+      </thead>
+      <tbody id="toolrules"></tbody>
+    </table>
+    <!-- Same job as `rules-empty`, and the empty case says more here: an empty egress
+         policy holds everything for a human, an empty tool policy refuses everything
+         outright. -->
+    <div class="empty" id="toolrules-empty" hidden></div>
   </section>
 </main>
 <!-- Behaviour lives in app.js, NOT inline: an external script is what lets the

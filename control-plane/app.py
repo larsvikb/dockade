@@ -2209,9 +2209,11 @@ def api_mcp_rules() -> list[dict]:
     since a tool matches at most one rule, so the order can serve the reader instead.
 
     What this view CANNOT show is the tools a server exposes that have no rule — they
-    are denied, and they are also the ones most needing a decision. That list comes
-    from the gateway's roster, joined against these rows, and there is no gateway
-    yet."""
+    are denied, and they are also the ones most needing a decision. That join is the
+    caller's to make, against ``/api/mcp/inventory``: the two are served separately
+    because one is what an operator decided and the other is what a server claimed,
+    and merging them here would produce a single list in which those are
+    indistinguishable."""
     with store._connect() as conn:
         rows = conn.execute(
             "SELECT id, server, tool, action, source, created_at FROM tool_rules "

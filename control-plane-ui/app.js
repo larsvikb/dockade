@@ -728,6 +728,210 @@ function serverEditBody(row, enabled) {
            auth_template: auth.template || null };
 }
 
+// ── tool policy: what a server CLAIMS, joined against what a human DECIDED ───
+//
+// Two sources that must never be confused, which is why they are two endpoints and two
+// arguments here rather than one merged payload. `/api/mcp/inventory` is a third
+// party's claim about itself, held in memory, authoritative about nothing.
+// `/api/mcp/rules` is the operator's standing policy, and it is the only one of the two
+// that decides anything.
+//
+// The JOIN is what this half of the page is for. A tool a server exposes with no rule
+// is DENIED, and it is also the one most needing a human — so the picker leads with
+// those. Nothing about appearing in the list grants: a server that invents a tool name
+// gets it listed, not permitted, and the rule still has to be written.
+
+// The three actions in order of how much they PERMIT. Ranked rather than compared
+// against "allow" alone, because deny → ask is a loosening too, and a confirm that
+// flagged only `allow` would wave it through.
+const TOOL_ACTION_RANK = { deny: 0, ask: 1, allow: 2 };
+const toolRank = a => (a in TOOL_ACTION_RANK ? TOOL_ACTION_RANK[a] : -1);
+
+// "denies", not "denys". Spelled once rather than as `${action}s` at each call site,
+// which is right for two of the three actions and wrong for the one an operator reads
+// most often. Falls back to the naive form so an action this page has not heard of
+// still produces a sentence.
+const TOOL_VERB = { allow: "allows", ask: "asks", deny: "denies" };
+const toolVerb = a => TOOL_VERB[a] || `${a}s`;
+// And the passive form, for saying what a rule will STOP doing. "will no longer ask"
+// reads as the tool losing the ability to ask, which is the wrong actor: it is the
+// operator who stops being asked.
+const TOOL_UNDO = { allow: "be allowed", ask: "be asked about", deny: "be denied" };
+const toolUndo = a => TOOL_UNDO[a] || a;
+
+// What a server exposes, split by whether policy has anything to say about it — plus
+// one sentence explaining the state the picker is in.
+//
+// The sentence carries the cases that otherwise render identically as an empty list,
+// and they mean opposite things: a server nobody has enumerated (nobody could ask) vs
+// one that answered with nothing (it offers nothing). `inventory.py` takes the same
+// trouble to keep those apart, and dropping the distinction here would throw away the
+// half of it the operator actually reads.
+function toolChoices(server, inventory, rules) {
+  const name = (server || "").trim();
+  const entry = (inventory || {})[name] || null;
+  const mine = (rules || []).filter(r => r && r.server === name);
+  const action = new Map(mine.map(r => [r.tool, r.action]));
+  const exposed = (entry && entry.tools) || [];
+  const readOnly = new Set((entry && entry.read_only) || []);
+  const enumerated = Boolean(entry && entry.enumerated);
+  const unnameable = Number((entry && entry.unnameable) || 0);
+  const status = String((entry && entry.status) || "");
+
+  const unruled = [];
+  const ruled = [];
+  for (const tool of exposed) {
+    const row = { tool, readOnly: readOnly.has(tool), action: action.get(tool) || null };
+    (row.action ? ruled : unruled).push(row);
+  }
+  // Ruled but NOT exposed — the gateway's `ruled_but_absent`, seen from the other end.
+  // Claimed only when the server was actually enumerated: before that every rule would
+  // look absent, for the sole reason that nobody has been able to ask the server
+  // anything yet.
+  const absent = enumerated
+    ? mine.map(r => r.tool).filter(t => !exposed.includes(t)).sort() : [];
+
+  const parts = [];
+  if (!name) {
+    parts.push("Pick a server to see what it exposes.");
+  } else if (!entry) {
+    parts.push(`The gateway has not reported on ${name} yet, so there is nothing to `
+             + `pick from. It reports within seconds of a server being enabled.`);
+  } else if (!enumerated) {
+    parts.push(`${name} is on the gateway's roster but has never been enumerated. This `
+             + `is not a claim that it exposes nothing — nobody has been able to ask.`);
+  } else if (!exposed.length) {
+    parts.push(`${name} answered, and offers no tools.`);
+  } else if (unruled.length) {
+    parts.push(`${unruled.length} of the ${exposed.length} tools ${name} exposes `
+             + `${unruled.length === 1 ? "has" : "have"} no rule, so `
+             + `${unruled.length === 1 ? "it is" : "they are"} denied.`);
+  } else if (exposed.length === 1) {
+    parts.push(`The one tool ${name} exposes has a rule.`);
+  } else {
+    parts.push(`Every one of the ${exposed.length} tools ${name} exposes has a rule.`);
+  }
+  // Verbatim from the gateway. "secret missing" and "unreachable" are what an operator
+  // most needs here, and they are exactly the states that otherwise arrive as an empty
+  // picker with no explanation.
+  if (status) parts.push(`The gateway says: ${status}`);
+  if (unnameable) {
+    // Dropped by `inventory._clean_tools` because no rule could name them — so they
+    // are unreachable rather than ungoverned. Counted rather than passed over, so the
+    // list can say it is showing fewer tools than the server has.
+    parts.push(`${unnameable} name${unnameable === 1 ? "" : "s"} could not be written `
+             + `as a rule and ${unnameable === 1 ? "is" : "are"} not listed.`);
+  }
+  if (absent.length) {
+    parts.push(`${absent.length} rule${absent.length === 1 ? "" : "s"} below `
+             + `name${absent.length === 1 ? "s" : ""} a tool ${name} did not offer: `
+             + `${absent.join(", ")}.`);
+  }
+  return { server: name, known: Boolean(entry), enumerated, names: exposed.slice(),
+           unruled, ruled, absent, unnameable, status,
+           seenAt: entry ? Number(entry.seen_at) || null : null,
+           note: parts.join(" ") };
+}
+
+// What "add rule" is about to write. A deliberately partial mirror of the backend's
+// validation, the same division of labour createPreview follows: this EXPLAINS, the
+// backend REFUSES. Only the conflict and the no-op are mirrored — both because the fix
+// is on screen already — and the tool-name charset is left to the backend's `detail`
+// rather than copied into a second grammar that could drift.
+//
+// It takes no inventory, because the name can only have come FROM the inventory: the
+// form offers a picker and nothing else. There is deliberately no check for "a tool
+// the server never claimed", since the UI cannot produce one — see the note on the
+// form in index.html for why that path was closed rather than warned about.
+function toolRulePreview(server, tool, action, rules) {
+  const s = (server || "").trim();
+  const t = (tool || "").trim();
+  // Defaults to the SAFEST of the three when the action is somehow absent, the same
+  // way createPreview defaults to `block`: previewing a deny where an allow was meant
+  // is caught by the operator, and the reverse is what this step exists to prevent.
+  const verb = toolRank(action) < 0 ? "deny" : action;
+  const base = { ok: false, server: s, tool: t, action: verb, danger: false,
+                 existing: null, conflict: false, redundant: false, text: "" };
+  if (!s) return { ...base, text: "Pick the server whose tool this rule decides for." };
+  if (!t) return { ...base, text: "" };
+  const existing = (rules || []).find(r => r && r.server === s && r.tool === t) || null;
+  if (existing) {
+    const same = existing.action === verb;
+    return { ...base, existing: existing.action, conflict: !same, redundant: same,
+             text: same
+               ? `${t} on ${s} already ${toolVerb(verb)}. Nothing to add.`
+               : `${t} on ${s} already ${toolVerb(existing.action)}, and nothing ADDED `
+                 + `here replaces a rule. Move it in the table below, or revoke it `
+                 + `first.` };
+  }
+  const consequence = verb === "allow"
+    ? `The agent may call ${t} on ${s}, and the call runs with no hold and no click.`
+    : verb === "ask"
+      ? `A call to ${t} on ${s} is put to you before it runs; until you answer, it has `
+        + `not run.`
+      : `Calls to ${t} on ${s} are refused. An unconfigured tool is refused too — what `
+        + `this adds is the record that a human looked and said no.`;
+  return { ...base, ok: true,
+           // Only `allow` loosens from the default here. `ask` and `deny` both leave a
+           // call unable to proceed on its own, so neither grants anything a missing
+           // rule did not already withhold.
+           danger: verb === "allow",
+           text: consequence };
+}
+
+// What moving a rule between deny, ask and allow is about to do.
+//
+// The TRANSITION, not the end state — the same distinction editPreview draws for
+// egress, and for the same reason: "allow" describes a row, "denies now, will allow"
+// describes what changes about the world.
+function toolEditPreview(rule, action) {
+  const verb = toolRank(action) < 0 ? "deny" : action;
+  const was = (rule && rule.action) || "";
+  const base = { ok: false, action: verb, was, danger: false, unchanged: false,
+                 server: (rule && rule.server) || "", tool: (rule && rule.tool) || "",
+                 text: "" };
+  if (!rule) {
+    // The row went away under the button — revoked in another tab. Said out loud
+    // rather than left as a click that silently does nothing.
+    return { ...base,
+             text: "That rule is no longer in the table; it may have been revoked "
+                 + "elsewhere." };
+  }
+  if (was === verb) {
+    return { ...base, unchanged: true,
+             text: `${base.tool} on ${base.server} already ${toolVerb(verb)}.` };
+  }
+  return { ...base, ok: true, danger: toolRank(verb) > toolRank(was),
+           text: `${base.tool} on ${base.server} ${toolVerb(was)} now; it will `
+               + `${verb} instead.` };
+}
+
+// What revoking a tool rule does — which is narrow, always, whatever the rule said.
+//
+// That is the one place this differs from revoking an egress rule, and the difference
+// is worth its own function rather than a reworded copy: removing an egress BLOCK
+// returns a host to being held, and therefore to being approvable by someone who never
+// knew it had been refused. Removing a tool rule returns the tool to unconfigured,
+// which DENIES. So the dangerous direction that revokePreview has to warn about does
+// not exist here.
+function toolRevokePreview(rule) {
+  const tool = (rule && rule.tool) || "";
+  const server = (rule && rule.server) || "";
+  const was = (rule && rule.action) || "";
+  if (was === "deny") {
+    // The one case where revoking changes nothing the gateway will do, so the sentence
+    // has to be about the RECORD instead — "reviewed and refused" becoming "never
+    // looked at" is the whole difference an explicit deny row exists to carry.
+    return { danger: false, tool, server, was,
+             text: `${tool} on ${server} is denied either way. Removing the rule only `
+                 + `removes the record that a human decided it, and it will read as `
+                 + `never looked at.` };
+  }
+  return { danger: false, tool, server, was,
+           text: `${tool} on ${server} will no longer ${toolUndo(was)}. With no rule it `
+               + `is denied, so this can only take capability away.` };
+}
+
 // What a screen reader should hear when the pending queue changes.
 //
 // Announced from a SEPARATE element rather than by making the card list a live
@@ -1055,6 +1259,22 @@ function rulesStatus(rowCount, failed, loaded) {
   return pollStatus(RULES_STATUS_TEXT, rowCount, failed, loaded);
 }
 
+// Its own wording rather than the block above with a noun swapped, for the same reason
+// that one is not the decisions view's: what an EMPTY table means differs, and it is
+// the opposite kind of fact. An empty egress policy holds every request for a human;
+// an empty tool policy refuses every call outright, so nothing reaches anyone to
+// approve and the quiet is not a queue.
+const TOOL_RULES_STATUS_TEXT = {
+  stale: "Could not refresh — this is the last tool policy loaded successfully and " +
+         "may no longer be what the gateway is enforcing.",
+  cold: "Could not load the tool policy — the control plane may be unreachable.",
+  empty: "No tool rules, so every tool call is denied. An unconfigured tool is " +
+         "refused rather than held, so nothing here reaches you to approve.",
+};
+function toolRulesStatus(rowCount, failed, loaded) {
+  return pollStatus(TOOL_RULES_STATUS_TEXT, rowCount, failed, loaded);
+}
+
 // ── leases: the grants that expire ──────────────────────────────────────────
 // A lease is the middle rung of the resolve ladder — this request, this host for a
 // while, this pattern forever — so the button granting one has to say WHICH of the
@@ -1332,6 +1552,12 @@ function start() {
     }
     // Opening the policy view IS the acknowledgement that its change was seen.
     if (current === "policy") { policyUnseen = false; }
+    // The inventory poll only runs while this view is up, so arriving here would
+    // otherwise show whatever was last fetched — up to a poll interval old, and after
+    // a long absence arbitrarily so. Asking on arrival is the same reasoning as the
+    // refresh on `visibilitychange`: the stale moment to avoid is the one where
+    // attention has just landed on the data.
+    if (current === "tools") { refreshInventory(); }
     updateIndicators();
   }
 
@@ -2958,7 +3184,13 @@ function start() {
   // Once, not polled. Server registration changes when an operator changes it,
   // and this view is the thing doing the changing — each action refreshes after
   // itself. A four-second poll here would be watching for edits nobody else makes.
+  //
+  // Tool rules are the same kind of state and get the same treatment. The INVENTORY
+  // is not: it changes because the gateway pushed, which happens without anyone
+  // touching this page, so it is the one thing in this view that is polled.
   refreshServers();
+  refreshToolRules();
+  refreshInventory();
     };
     es.addEventListener("pending", e => {
       const d = JSON.parse(e.data);
@@ -3055,6 +3287,11 @@ function start() {
       : (rows.length ? "" :
          "No servers registered, so the gateway dials nothing. Register the container " +
          "name declared in mcp-servers.yml.");
+    // The tool-policy picker below reads THIS map for its server list, and the two
+    // refreshes race on load — so the picker is rebuilt here rather than left to wait
+    // for whichever poll happens to run next. Without it, arriving before the servers
+    // did leaves a form that says nothing is registered after everything is.
+    renderToolPicker();
   }
 
   async function refreshServers() {
@@ -3143,6 +3380,314 @@ function start() {
     refreshServers();
   });
 
+  // ── tool policy ───────────────────────────────────────────────────────────
+  // The half of this view that actually decides. The servers table above says which
+  // servers the gateway may dial; this says what may be called on them, and until a
+  // row exists here an enabled server with a working credential still answers nothing.
+  const toolRulesBody = document.getElementById("toolrules");
+  const toolRulesEmpty = document.getElementById("toolrules-empty");
+  const toolRuleForm = document.getElementById("toolrule-form");
+  const toolRuleServer = document.getElementById("toolrule-server");
+  const toolRuleTool = document.getElementById("toolrule-tool");
+  const toolRuleAction = document.getElementById("toolrule-action");
+  const toolRuleAdd = document.getElementById("toolrule-add");
+  const toolRuleNote = document.getElementById("toolrule-note");
+  const toolRulePreviewEl = document.getElementById("toolrule-preview");
+  const toolRuleCountEl = document.getElementById("toolrulecount");
+
+  let toolRules = [];
+  let toolRulesById = new Map();
+  let toolRulesFailed = false;
+  let toolRulesLoaded = false;
+  let inventory = {};
+  let inventoryFailed = false;
+  // What the last submit came back with, outranking the preview while it stands — the
+  // same split the egress form draws between "what this click would do" and "what the
+  // last one did", including the refusals this page deliberately does not mirror.
+  let toolNotice = null;
+
+  function renderToolServerOptions() {
+    const chosen = toolRuleServer.value;
+    const rows = [...serversByName.values()];
+    toolRuleServer.replaceChildren();
+    for (const row of rows) {
+      const opt = document.createElement("option");
+      opt.value = row.server;
+      // The disabled state rides on the option rather than being left to be read off
+      // the table above: a rule written for a server the gateway has stopped dialling
+      // decides nothing, and this form is where that is about to happen.
+      opt.textContent = row.enabled ? row.server : `${row.server} (disabled)`;
+      toolRuleServer.appendChild(opt);
+    }
+    // Keep the operator's choice across a refresh; otherwise a poll landing mid-edit
+    // silently re-points the rule they are composing at another server.
+    if (chosen && rows.some(r => r.server === chosen)) toolRuleServer.value = chosen;
+  }
+
+  function renderToolPicker() {
+    renderToolServerOptions();
+    const choices = toolChoices(toolRuleServer.value, inventory, toolRules);
+    const chosen = toolRuleTool.value;
+    toolRuleTool.replaceChildren();
+    const group = (label, items) => {
+      if (!items.length) return;
+      const optgroup = document.createElement("optgroup");
+      optgroup.label = label;
+      for (const item of items) {
+        const opt = document.createElement("option");
+        opt.value = item.tool;
+        // `textContent`, and the whole table below is built the same way: every string
+        // here is SERVER-AUTHORED. An escaped template would be correct too, right up
+        // until someone edits it — this cannot be got wrong later.
+        opt.textContent = item.action
+          ? `${item.tool} — ${item.action}${item.readOnly ? ", read-only" : ""}`
+          : `${item.tool}${item.readOnly ? " — read-only" : ""}`;
+        optgroup.appendChild(opt);
+      }
+      toolRuleTool.appendChild(optgroup);
+    };
+    // Unruled FIRST, which is the point of the join rather than a sorting preference:
+    // those are the tools denied today, and the only ones a new rule can be written
+    // for at all.
+    group("no rule yet — denied", choices.unruled);
+    group("already ruled", choices.ruled);
+    // Keep the operator's choice across a refresh; otherwise an inventory push landing
+    // mid-edit silently re-points the rule they are composing at a different tool.
+    if (choices.names.includes(chosen)) toolRuleTool.value = chosen;
+    // Empty because nothing has been reported, which is a state this form cannot write
+    // its way out of — there is no free-text path, deliberately (see index.html). The
+    // control is disabled rather than left as an empty box that looks clickable.
+    toolRuleTool.disabled = choices.names.length === 0;
+    // Both of these are facts about this PAGE rather than about a server, which is why
+    // they are appended here instead of inside the pure helper — it would have to be
+    // told about registration and about polling to say either.
+    //
+    // With nothing registered, "pick a server" is advice that cannot be taken, and the
+    // backend would refuse the rule anyway: it will not write policy about a server
+    // nobody registered. Say what to do instead.
+    toolRuleNote.textContent = serversByName.size === 0
+      ? "No servers are registered, so there is no tool to write a rule about. "
+        + "Register one above first."
+      : inventoryFailed
+        ? `${choices.note} This list did not refresh — the control plane did not `
+          + `answer, so what a server exposes may have changed.`
+        : choices.note;
+    renderToolRulePreview();
+  }
+
+  function renderToolRulePreview() {
+    const p = toolRulePreview(toolRuleServer.value, toolRuleTool.value,
+                              toolRuleAction.value, toolRules);
+    // With no servers registered the backend refuses every rule this form could
+    // produce — it will not write policy about a server nobody registered — so the
+    // button is off and the note above says why. The same goes for a server that has
+    // reported no tools: there is nothing the picker could have selected.
+    toolRuleAdd.disabled = !p.ok || serversByName.size === 0 || toolRuleTool.disabled;
+    const text = toolNotice ? toolNotice.text : p.text;
+    toolRulePreviewEl.hidden = !text;
+    // Colour is never the only cue here either; the wording carries the direction.
+    toolRulePreviewEl.className =
+      "empty" + ((toolNotice ? toolNotice.bad : p.danger) ? " wild" : "");
+    toolRulePreviewEl.textContent = text;
+  }
+
+  function renderToolRules(rows) {
+    // Keyed by id so the click handler works from the ROW rather than parsing it back
+    // out of the DOM — the same reason the egress table keeps `rulesById`.
+    toolRulesById = new Map(rows.map(r => [String(r.id), r]));
+    toolRulesBody.replaceChildren();
+    for (const row of rows) {
+      const tr = document.createElement("tr");
+      const cell = (value, cls) => {
+        const td = document.createElement("td");
+        td.textContent = value;
+        if (cls) td.className = cls;
+        tr.appendChild(td);
+      };
+      cell(row.server);
+      cell(row.tool);
+      const actionCell = document.createElement("td");
+      const tag = document.createElement("span");
+      tag.className = `tag ${row.action}`;
+      tag.textContent = row.action;
+      actionCell.appendChild(tag);
+      tr.appendChild(actionCell);
+      // Whether the server still OFFERS this tool. A rule naming one it does not is
+      // inert while reading here exactly like policy in force — the confusion the
+      // gateway's `ruled_but_absent` report names, said next to the rule itself.
+      // "unknown" and "no" are different facts: the first means nobody has asked.
+      const entry = inventory[row.server];
+      cell(!entry || !entry.enumerated
+             ? "unknown"
+             : (entry.tools || []).includes(row.tool) ? "yes" : "no", "ts");
+      cell(row.created_at ? fmtStamp(row.created_at) : "", "ts");
+      const actions = document.createElement("td");
+      // The two actions this rule is NOT, rather than an edit mode: a tool rule's
+      // identity is (server, tool) and only the action can change, so promoting one
+      // between deny, ask and allow IS the whole edit. A form standing in for the row
+      // would be a second place for that to be got wrong.
+      for (const target of ["deny", "ask", "allow"]) {
+        if (target === row.action) continue;
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "edit";
+        button.dataset.rule = String(row.id);
+        button.dataset.action = target;
+        button.textContent = `→ ${target}`;
+        actions.appendChild(button);
+      }
+      const revoke = document.createElement("button");
+      revoke.type = "button";
+      revoke.className = "revoke";
+      revoke.dataset.rule = String(row.id);
+      revoke.textContent = "revoke";
+      actions.appendChild(revoke);
+      tr.appendChild(actions);
+      toolRulesBody.appendChild(tr);
+    }
+    toolRuleCountEl.textContent =
+      rows.length ? `· ${rows.length} rule${rows.length === 1 ? "" : "s"}` : "· none";
+    renderListStatus(toolRulesEmpty,
+                     toolRulesStatus(rows.length, toolRulesFailed, toolRulesLoaded));
+    // The picker reads these rows for its join and its conflict check, so a rule that
+    // appeared elsewhere shows up there rather than waiting to surface as a 409.
+    renderToolPicker();
+  }
+
+  async function refreshToolRules() {
+    try {
+      const res = await fetch("/api/mcp/rules");
+      // `res.ok` first, for the reason refreshRules checks it: a 4xx body that parsed
+      // would render as an empty but SUCCESSFUL policy — and an empty tool policy is a
+      // sentence meaning "everything is denied", which must not be said on a failure.
+      if (!res.ok) throw new Error(String(res.status));
+      toolRules = await res.json();
+      toolRulesFailed = false;
+      toolRulesLoaded = true;
+    } catch (e) {
+      // Keeps the rows and SAYS SO. A tool-policy table that quietly stops refreshing
+      // misstates what the gateway is letting through, which is the one question this
+      // view exists to answer.
+      toolRulesFailed = true;
+    }
+    renderToolRules(toolRules);
+  }
+
+  async function refreshInventory() {
+    try {
+      const res = await fetch("/api/mcp/inventory");
+      if (!res.ok) throw new Error(String(res.status));
+      inventory = await res.json();
+      inventoryFailed = false;
+    } catch (e) {
+      // The last picture stands. Unlike the rules above, nothing here decides
+      // anything — the inventory only adds context — so a failed poll costs accuracy
+      // in the picker and in the "exposed" column. The NOTE is where that is said;
+      // the column cannot carry it without a fourth value meaning "stale", which
+      // would be a distinction nobody could act on differently from "unknown".
+      inventoryFailed = true;
+    }
+    renderToolRules(toolRules);
+  }
+
+  for (const el of [toolRuleServer, toolRuleTool, toolRuleAction]) {
+    // Any edit invalidates the last submit's verdict — leaving it up would attach a
+    // refusal to a rule that is no longer the one on screen.
+    el.addEventListener("change", () => { toolNotice = null; renderToolPicker(); });
+  }
+
+  toolRuleForm.addEventListener("submit", async ev => {
+    // Always, for the reason the egress form gives: `form-action 'none'` in the CSP
+    // makes the native submit a fail-closed backstop rather than a broken form.
+    ev.preventDefault();
+    const p = toolRulePreview(toolRuleServer.value, toolRuleTool.value,
+                              toolRuleAction.value, toolRules);
+    if (!p.ok) return;
+    // The same friction the egress form applies, and for a reason that does not weaken
+    // for the two non-granting actions: all three take effect on the agent's very next
+    // call, and `allow` is a standing grant with nothing held behind it.
+    if (!window.confirm(`${p.text}\n\nWrite this ${p.action} rule for ${p.tool}?`)) {
+      return;
+    }
+    toolRuleAdd.disabled = true;
+    try {
+      const res = await fetch("/api/mcp/rules", {
+        method: "POST", headers: { "content-type": "application/json" },
+        // Straight off the PREVIEW, never re-read from the controls: what was
+        // confirmed has to be what is sent, which is the same single-derivation
+        // discipline the egress form follows for its pattern and class.
+        body: JSON.stringify({ server: p.server, tool: p.tool, action: p.action }) });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok || !body.ok) {
+        // Verbatim. The refusals worth reading rather than collapsing into "failed"
+        // are 400 (a tool name this page did not mirror a check for), and 409 — a rule
+        // appeared under us, so the table on screen was stale.
+        toolNotice = { bad: true,
+                       text: `Not added: ${body.detail
+                                           || `the control plane answered ${res.status}`}` };
+      } else if (body.created === false) {
+        // A 200 that wrote nothing, because the same rule arrived between the preview
+        // and the click. Reported rather than read as a write.
+        toolNotice = { bad: false,
+                       text: `${body.tool} on ${body.server} was already a standing `
+                           + `${body.action} rule; nothing was written.` };
+      } else {
+        toolNotice = { bad: false,
+                       text: `Added: ${body.tool} on ${body.server} now `
+                           + `${body.action}s.` };
+      }
+    } catch (e) {
+      toolNotice = { bad: true, text: "Not added: the control plane is unreachable." };
+    }
+    toolRuleAdd.disabled = false;
+    await refreshToolRules();
+    // The servers table counts rules per server, so it is stale the moment this lands.
+    refreshServers();
+  });
+
+  // Delegated, because the table is replaced wholesale on every refresh — a handler
+  // bound per button would be lost with the row it was bound to.
+  toolRulesBody.addEventListener("click", async ev => {
+    const btn = ev.target.closest("button.edit, button.revoke");
+    if (!btn) return;
+    const row = toolRulesById.get(btn.dataset.rule);
+    if (!row) return;
+    const revoking = btn.classList.contains("revoke");
+    const p = revoking ? toolRevokePreview(row) : toolEditPreview(row, btn.dataset.action);
+    if (!revoking && !p.ok) return;
+    if (!window.confirm(`${p.text}\n\n${revoking ? "Revoke" : "Save"} this rule?`)) {
+      return;
+    }
+    btn.disabled = true;
+    const id = encodeURIComponent(String(row.id));
+    try {
+      // Two whole literal paths rather than one built from a ternary, which is the
+      // shape the servers handler above uses and not an accident: the relay allowlist
+      // is matched against the literal each `fetch` begins with, and a path assembled
+      // by concatenation is invisible to the test that holds the two ends together.
+      const res = revoking
+        ? await fetch(`/api/mcp/rules/${id}/revoke`, { method: "POST" })
+        : await fetch(`/api/mcp/rules/${id}/edit`, {
+            method: "POST", headers: { "content-type": "application/json" },
+            body: JSON.stringify({ action: btn.dataset.action }) });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok || !body.ok) {
+        // 404 is the one worth reading: the rule was revoked in another tab, so the
+        // table on screen is stale and retrying cannot help.
+        window.alert(`Could not ${revoking ? "revoke" : "update"}: ` +
+                     `${body.detail || res.status}`);
+        btn.disabled = false;
+        return;
+      }
+    } catch (e) {
+      window.alert("Could not reach the control plane.");
+      btn.disabled = false;
+      return;
+    }
+    await refreshToolRules();
+    refreshServers();
+  });
+
   // ── wiring ────────────────────────────────────────────────────────────────
   // `visibilityState` is absent in some non-browser hosts; treat unknown as
   // visible so a missing API degrades to the old always-poll behaviour rather
@@ -3175,10 +3720,24 @@ function start() {
   // seconds bounds is only how long a lease that was revoked elsewhere, or that has
   // just lapsed, stays listed.
   setInterval(() => { if (visible()) refreshLeases(); }, 4000);
+  // Gated on the VIEW as well, which the three above deliberately are not. They feed
+  // badges that have to report a hidden view's state; this feeds a picker and a column
+  // nobody can see from anywhere else, so polling it while another view is up would be
+  // work with no reader. Paced to the gateway's own roster tick (GATEWAY_ROSTER_INTERVAL,
+  // 10s) rather than to the four seconds the others use: pushes cannot arrive faster
+  // than that, so a shorter poll could only re-fetch what it already has.
+  setInterval(() => {
+    if (visible() && current === "tools") refreshInventory();
+  }, 10000);
   // Refresh IMMEDIATELY on return, rather than leaving up to four seconds of
   // stale-but-unlabelled data on screen at the moment attention comes back to it.
   document.addEventListener("visibilitychange", () => {
-    if (visible()) { refreshAudit(); refreshRules(); refreshLeases(); }
+    if (visible()) {
+      refreshAudit();
+      refreshRules();
+      refreshLeases();
+      if (current === "tools") refreshInventory();
+    }
   });
 }
 
@@ -3196,6 +3755,8 @@ if (typeof module !== "undefined" && module.exports) {
     outageSummary, pendingAnnouncement, coverageSummary, revokePreview,
     normalizePattern, createPreview, editPreview,
     serverDescriptor, serverPreview, serverEditBody, SERVER_NAME_RE,
+    toolChoices, toolRulePreview, toolEditPreview, toolRevokePreview, toolRulesStatus,
+    TOOL_ACTION_RANK,
     timeWindow, filterActive, auditQuery, eventRow, historyPager,
     fmtTime, fmtStamp, fmtInstant,
     AUDIT_ORDINARY_STAGE, AUDIT_WINDOWS, WILDCARD_MIN_LABELS,

@@ -3301,6 +3301,7 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | MCP client credentials — read-only mount, path derived from the server name | **done** — the gateway is the only holder |
 | — | MCP server registration — UI tab: register, enable/disable, revoke | **done** — servers only; tool rules not yet |
 | — | tool inventory — gateway pushes, control plane holds it in memory | **done** — audited on change; no UI yet |
+| — | tool policy UI — pick from the inventory, write allow/ask/deny, promote | **done** — every row in `tool_rules` now has an operator surface |
 | — | MCP gateway — per-tool allow/deny/ask | planned (next: curated tool list on the agent leg) |
 
 The rationale for each shipped item lives under **Governance surfaces** above, not here
@@ -3402,20 +3403,19 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
   local managed file has been removed from the build. See "Managed settings are NOT
   an enforcement lever here".
 - **RESOLVED — the control plane learns a server's tools from the gateway, never by
-  scanning `mcp-net`.** Today it knows no tools at all: a `tool_rules` row is a name
-  an operator typed, and nothing checks it against anything. That is safe — a missing
-  rule denies, so a misspelled rule and an unwritten one fail the same closed way —
-  but it is blind in both directions. There is no list to pick a tool name from, and a
-  typo is indistinguishable from a deny. The gateway is the only component that can
+  scanning `mcp-net`.** Before it did, a `tool_rules` row was a name an operator typed
+  and nothing checked it against anything. That was safe — a missing rule denies, so a
+  misspelled rule and an unwritten one fail the same closed way — but blind in both
+  directions: no list to pick a name from, and a typo indistinguishable from a
+  deliberate deny. The gateway is the only component that can
   close this, because it is the only one that ever talks to a server; it already
   dials each enabled server by name on its roster poll, and `tools/list` is the same
   trip. What comes back is operator-facing metadata and **never an input to
   `policy._decide_tool`** — the names and descriptions are server-authored, they would
   render in the control plane's own UI, and a discovered tool that could write its own
-  rule is a server granting itself capability. Reporting is a **pull**, like everything
-  else on that bridge: the control plane has no leg on the gateway's networks, and
-  giving it one to push is the lateral edge the bind guard exists to prevent.
-  Discovery therefore runs only on *enabled* servers, since disabling means the gateway
+  rule is a server granting itself capability. (Which DIRECTION that report travels is
+  settled in the bullet below, and not the way this one first assumed.)
+  Discovery runs only on *enabled* servers, since disabling means the gateway
   stops dialling — so an operator enables before seeing the tool list, which is safe
   only because the deny default makes an enabled server with no rules able to do
   nothing. The rejected alternative is a subnet sweep. Its fatal form is taking the
@@ -3424,10 +3424,11 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
   it is still the wrong shape, because no MCP port convention exists (8082 is GitHub's
   image default) so a sweep means probing guessed ports across containers holding
   write-capable credentials, and registering by existence would put anything that
-  reaches `mcp-net` in front of an operator as a candidate. **Interim, shipping
-  first:** the gateway audits the mismatch — a rule naming a tool the server does not
-  expose, and a tool no rule decides — which needs no store, no new endpoint, and no
-  server-authored text in the crown jewel.
+  reaches `mcp-net` in front of an operator as a candidate. **The mismatch audit came
+  first:** the gateway reports a rule naming a tool the server does not expose, and a
+  tool no rule decides — which needs no store, no new endpoint, and no server-authored
+  text in the crown jewel, and which still runs beside the inventory rather than having
+  been replaced by it.
   **Open companion:** whether the control plane should learn that a server *exists*
   from `mcp-servers.yml` rather than from an operator retyping its name, seeded the
   way `policies/egress-allowlist.txt` already is (`control-plane/Dockerfile`). That

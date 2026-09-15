@@ -159,10 +159,6 @@ _RELAY_ROUTES = (
     # primitive, and that reasoning does not depend on which direction the call moves.
     ("POST", re.compile(r"^/api/egress/leases/[0-9]{1,19}/revoke$")),
     # ── MCP servers: which of the running servers policy may be written about ──
-    # The SERVERS half only. `/api/mcp/rules*` is deliberately absent: writing a rule
-    # means naming a tool, and naming one blind is what the gateway's discovery report
-    # exists to catch. That surface arrives with the picker, not before it.
-    #
     # None of these four grants, which is worth saying because they are writes on the
     # crown jewel's relay and a reader will ask. Registering leaves `enabled=0` with no
     # rules; enabling a server with no rules still denies every call, since an
@@ -182,6 +178,28 @@ _RELAY_ROUTES = (
     # policy as a side effect.
     ("POST",
      re.compile(r"^/api/mcp/servers/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?/revoke$")),
+    # ── Tool policy: what may be called on those servers ──────────────────────
+    # What each server CLAIMS it exposes — read-only, and the only route here that
+    # relays third-party text rather than the operator's own decisions. It grants
+    # nothing and is not policy: the page uses it to offer real tool names to pick
+    # from, and a server that invents one gets it listed, never permitted.
+    ("GET", re.compile(r"^/api/mcp/inventory$")),
+    ("GET", re.compile(r"^/api/mcp/rules$")),
+    # This one GRANTS, and it is the widest thing on this list by consequence: an
+    # `allow` here lets the agent call that tool with no hold and no click, on a
+    # surface whose payloads are arbitrary JSON. Same class as `POST
+    # /api/egress/rules`, and it arrives now rather than with the servers half
+    # because writing a rule means naming a tool, and naming one blind is what the
+    # inventory above exists to stop.
+    ("POST", re.compile(r"^/api/mcp/rules$")),
+    # Digit-bounded, like the egress rule ids and for the same reason: the segment
+    # lands in a URL path, and a looser class would be a traversal primitive rather
+    # than an id. An edit moves a rule between deny, ask and allow, so it grants in
+    # exactly the way the collection POST does.
+    ("POST", re.compile(r"^/api/mcp/rules/[0-9]{1,19}/edit$")),
+    # Revoking a TOOL rule can only narrow — an unconfigured tool is denied, never
+    # held — so unlike revoking an egress block this one cannot loosen anything.
+    ("POST", re.compile(r"^/api/mcp/rules/[0-9]{1,19}/revoke$")),
     ("GET", re.compile(r"^/api/config$")),
     ("POST", re.compile(r"^/api/saturation/ack$")),
 )

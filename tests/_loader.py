@@ -236,6 +236,21 @@ def load_discovery(env: dict[str, str] | None = None) -> types.ModuleType:
                 os.environ[key] = was
 
 
+def load_surface() -> types.ModuleType:
+    """The gateway's curated tool surface, fresh per call.
+
+    Fresh for the reason ``load_inventory`` is: the published listing is module-level
+    state because one thread writes it and another serves from it, so a shared instance
+    would let one test's roster answer another's ``listing()``."""
+    return _load(f"dockade_surface_{len(sys.modules)}", "tool-gateway/surface.py")
+
+
+def load_protocol() -> types.ModuleType:
+    """The gateway's MCP wire. Stateless, so one instance is reusable — loaded through
+    here anyway so no test has to know where the file lives."""
+    return _load("dockade_protocol", "tool-gateway/protocol.py")
+
+
 def load_tool_gateway(env: dict[str, str] | None = None) -> types.ModuleType:
     """The MCP gateway, with its bind-guard environment applied at import.
 

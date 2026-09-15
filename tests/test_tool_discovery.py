@@ -15,8 +15,10 @@ vanishes on error is worse than one that was never written.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import unittest
+from unittest import mock
 
 from _loader import load_discovery
 
@@ -76,6 +78,65 @@ class ParseTests(unittest.TestCase):
     def test_an_empty_reply_is_an_error(self):
         with self.assertRaises(self.discovery.DiscoveryError):
             self.discovery.parse_tools("")
+
+
+class TrimTests(unittest.TestCase):
+    """What survives a server's reply, and where each narrowing happens.
+
+    There are TWO of them and they are different sizes, which is the thing worth
+    guarding: the reply is trimmed once at the read, to the union of what both readers
+    need, and again at the push, to the much smaller claim the control plane holds in
+    memory. Collapsing them in either direction breaks something silently — trim only
+    to the claim and the served tool list has no schema, so every tool is uncallable;
+    push the read shape and third-party prose accumulates on the crown jewel."""
+
+    def setUp(self):
+        self.discovery = load_discovery()
+
+    def _listed(self, tool: dict) -> dict:
+        """``list_tools`` against a server that answers with exactly ``tool``."""
+        @contextlib.contextmanager
+        def urlopen(*_args, **_kwargs):
+            yield mock.Mock(read=lambda: sse({"tools": [tool]}).encode())
+
+        with mock.patch("urllib.request.urlopen", urlopen):
+            tools = self.discovery.list_tools("mcp-github", {"type": "none"})
+        return tools[0]
+
+    def test_the_schema_survives_the_read(self):
+        # The regression this pair was split for. An agent cannot call a tool whose
+        # arguments it cannot see, so a trim that kept only the name and the read-only
+        # claim produced a tool list that looked complete and was unusable.
+        schema = {"type": "object", "properties": {"owner": {"type": "string"}}}
+        listed = self._listed({"name": "get_issue", "description": "Read an issue.",
+                               "inputSchema": schema})
+        self.assertEqual(listed["inputSchema"], schema)
+        self.assertEqual(listed["description"], "Read an issue.")
+
+    def test_what_nobody_reads_is_dropped_at_the_read(self):
+        # Inline base64 icons are most of a real reply by bytes (NOTES.md). Nothing
+        # renders them here, and this process holds the result in memory between
+        # reconciles.
+        listed = self._listed({"name": "get_issue", "icons": ["data:image/png;base64,AA"],
+                               "outputSchema": {"type": "object"}})
+        self.assertNotIn("icons", listed)
+        self.assertNotIn("outputSchema", listed)
+
+    def test_a_tool_with_no_schema_is_served_rather_than_deleted(self):
+        # Malformed by the spec, which makes it a judgement call: the honest reading is
+        # "no arguments we know of", and dropping it silently would let a server remove
+        # a tool from the operator's view by omitting a field.
+        self.assertEqual(self._listed({"name": "ping"})["inputSchema"],
+                         {"type": "object"})
+
+    def test_the_push_carries_the_name_and_the_claim_and_nothing_else(self):
+        # What crosses to the control plane is what a person choosing a rule reads. A
+        # description is third-party text, and the crown jewel then holds it.
+        claim = self.discovery._as_claim([
+            {"name": "get_issue", "description": "Read an issue.",
+             "inputSchema": {"type": "object"}, "annotations": {"readOnlyHint": True}}])
+        self.assertEqual(claim, [{"name": "get_issue",
+                                  "annotations": {"readOnlyHint": True}}])
 
 
 class AuthHeaderTests(unittest.TestCase):

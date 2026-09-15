@@ -7,12 +7,17 @@ other, exposing a curated tool set under per-tool allow/deny/ask policy held in
 the control plane. It is to tool capability what the egress proxy is to network
 capability. See DESIGN.md, "MCP gateway".
 
-THIS MODULE IS THE PLACEMENT, NOT THE PROTOCOL. It stands the service up on its
-three legs and refuses to start on a configuration that undoes the split; it
-serves no tools yet. That order is deliberate and matches how both control-plane
-bridges landed — the surface is asserted while it is still cheap to change, and
-the placement is the part that is expensive to retrofit because every other
-component's guard has to agree with it.
+THIS MODULE IS THE PLACEMENT. It stands the service up on its three legs and
+refuses to start on a configuration that undoes the split, and it owns nothing
+else: the wire is `protocol.py`, what the agent may see is `surface.py`, and what
+the servers said is `discovery.py`. That order is deliberate and matches how both
+control-plane bridges landed — the surface is asserted while it is still cheap to
+change, and the placement is the part that is expensive to retrofit because every
+other component's guard has to agree with it.
+
+It PRESENTS tools and does not yet run them. `tools/call` is refused, which is
+the same answer an unruled tool would get, so the surface is fail-closed while
+its executing half is built rather than half-open.
 
 Three legs, and the asymmetry between them is the whole design:
 
@@ -44,12 +49,16 @@ pins a worker waiting for a human.
 from __future__ import annotations
 
 import ipaddress
+import json
 import os
 import threading
 import time
 
 import discovery
-from fastapi import FastAPI
+import protocol
+import surface
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, Response
 
 #: The agent-facing MCP listener. Bound to ONE address — see the module docstring
 #: for why a wildcard here is a lateral edge rather than a convenience.
@@ -151,6 +160,46 @@ def healthz() -> dict:
     return {"ok": True}
 
 
+#: The agent's MCP endpoint. One path, matching the convention the server containers
+#: are dialled on (`discovery.MCP_PATH`), so there is one spelling of "the MCP endpoint"
+#: in this system rather than one per direction.
+MCP_PATH = os.environ.get("GATEWAY_MCP_SERVE_PATH", "/mcp")
+
+
+@app.post(MCP_PATH)
+async def mcp(request: Request) -> Response:
+    """One JSON-RPC message in, one out. The decisions are in ``protocol.handle``.
+
+    Deliberately thin, and the thinness is the point: everything worth asserting about
+    this surface — what is served, what is refused, what a notification does — is
+    reachable from a unit test because none of it is in here.
+
+    NO `GET` COUNTERPART, so a client asking for the server→client SSE stream gets the
+    405 the transport specifies for a server that does not offer one. That is honest
+    rather than minimal: the stream's only use here would be `list_changed`, which is
+    not advertised (see protocol.py). An unimplemented handler returning 200 and never
+    sending an event would look to a client like a healthy stream that says nothing.
+
+    NO ORIGIN CHECK, and the reason it is unnecessary is placement rather than
+    diligence. The DNS-rebinding guidance for local MCP servers protects a listener a
+    browser can reach; this one binds the sandbox-net address alone, on an internal
+    network with no host port published, so the only thing that can reach it is the
+    agent — which needs no rebinding trick to send whatever it likes here, and is
+    exactly the party this surface exists to govern."""
+    try:
+        message = json.loads(await request.body())
+    except ValueError:
+        # The one case answered with a non-200: an unparseable body is a transport
+        # failure rather than a protocol answer, and there is no id to reply under.
+        return JSONResponse(protocol.parse_error(), status_code=400)
+    answer = protocol.handle(message, surface.listing())
+    if answer is None:
+        # A notification. Accepted with no body, which is what the transport asks for
+        # and what keeps a client from waiting on a reply that is not coming.
+        return Response(status_code=202)
+    return JSONResponse(answer)
+
+
 #: The BACKSTOP, not the cadence. A report is normally triggered by the roster
 #: changing; this is the longest the gateway will stay silent regardless, so that what
 #: changes without an operator — a server restarting, an image bump adding tools, an
@@ -206,6 +255,11 @@ def _reconcile_forever(stop: threading.Event) -> None:
             digest = discovery.roster_digest(roster)
             if reachable is not True or digest != enumerated or due:
                 results = discovery.reconcile_all(roster)
+                # Published FIRST, before either reader is told. The agent-facing
+                # listing is the one consumer served from this process's own memory,
+                # so it is the one that must not be left a reconcile behind by a
+                # failure in the reporting below.
+                surface.publish(roster, results)
                 for line in discovery.format_report(results):
                     print(line, flush=True)
                 # Pushed on the same trigger as the report, because they are the same

@@ -212,7 +212,14 @@ def list_tools(server: str, auth: dict) -> list[dict]:
     """The tools a server exposes, TRIMMED, by asking it.
 
     One POST, no handshake — see the module docstring for why that is enough, and for
-    where it was measured."""
+    where it was measured.
+
+    TWO READERS, one trim. What comes back is kept to the union of what the reconcile
+    report and the agent-facing surface actually read, and nothing wider: the report
+    wants the name and the read-only claim, and `surface.curate` wants the name, the
+    description and the schema, because an agent cannot call a tool whose arguments it
+    cannot see. Trimming to only the first pair is what this did first, and it made the
+    served tool list uncallable."""
     headers = {"Content-Type": "application/json",
                "Accept": "application/json, text/event-stream"}
     headers.update(auth_header(auth, read_secret(server), secret_path(server)))
@@ -231,12 +238,21 @@ def list_tools(server: str, auth: dict) -> list[dict]:
             f"HTTP {exc.code} from {server} — {exc.reason}") from exc
     except (urllib.error.URLError, OSError) as exc:
         raise DiscoveryError(f"unreachable: {exc}") from exc
-    # Trimmed HERE, at the point of reading, rather than downstream. A real reply is
-    # mostly `inputSchema` and inline base64 `icons` — measured, see the byte split
-    # `make mcp-tools` prints — and none of it is needed to say which tools exist or
-    # to choose rules for them. What crosses to the control plane is what a person
-    # picking a rule reads: the name, and the server's own read-only claim.
+    # Trimmed HERE, at the point of reading, rather than downstream. A real reply
+    # carries inline base64 `icons` as well — measured, see the byte split
+    # `make mcp-tools` prints — and nothing reads them. The narrowing that crosses to
+    # the CONTROL PLANE is narrower still and belongs to the push, not here: see
+    # ``_as_claim``.
+    #
+    # A missing schema becomes the empty object rather than being dropped. `inputSchema`
+    # is required of an MCP tool, so a server that omits one is malformed — but the
+    # honest reading of a malformed entry is "takes no arguments we know of", and
+    # serving it lets policy decide the tool instead of this parser silently deleting it.
     return [{"name": tool["name"],
+             "description": str(tool.get("description") or ""),
+             "inputSchema": (tool.get("inputSchema")
+                             if isinstance(tool.get("inputSchema"), dict)
+                             else {"type": "object"}),
              "annotations": {"readOnlyHint":
                              bool((tool.get("annotations") or {}).get("readOnlyHint"))}}
             for tool in parse_tools(raw)
@@ -357,6 +373,19 @@ def reconcile_all(roster: list[dict]) -> list[dict]:
     return [reconcile(entry) for entry in roster]
 
 
+def _as_claim(tools: list[dict]) -> list[dict]:
+    """What a person choosing a rule reads: the name, and the server's read-only claim.
+
+    Narrowed at the PUSH rather than at the read, because this narrowing is about the
+    reader. A description and a schema are third-party text an operator does not need
+    in order to pick a tool by name, and the control plane holds this in memory to
+    render a picker — so every field that crosses is one the crown jewel then keeps.
+    The agent-facing surface reads the same tools and needs the schema, which is why
+    the two trims are different sizes and neither can be the other's."""
+    return [{"name": tool["name"], "annotations": tool.get("annotations") or {}}
+            for tool in tools]
+
+
 def push_inventory(results: list[dict]) -> str:
     """Report the observed surface to the control plane. Returns "" or a reason.
 
@@ -369,7 +398,8 @@ def push_inventory(results: list[dict]) -> str:
     tool list. That is the difference between "this server exposes nothing" and "we
     could not ask", and an operator needs the second one said out loud — it is the
     state that otherwise surfaces as a 401 reading like a policy problem."""
-    payload = {"servers": {r["server"]: ({"status": r["status"], "tools": r["tools"]}
+    payload = {"servers": {r["server"]: ({"status": r["status"],
+                                          "tools": _as_claim(r["tools"])}
                                          if "tools" in r else {"status": r["status"]})
                            for r in results}}
     request = urllib.request.Request(  # noqa: S310 - fixed http:// scheme, not user input

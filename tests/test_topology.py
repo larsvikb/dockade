@@ -585,6 +585,30 @@ class GatewayPlacementTests(unittest.TestCase):
                         _scalar(_block(_service(svc), "mcp-net", 6), "ipv4_address")),
                     f"{svc} and tool-gateway both claim {addr} on mcp-net")
 
+    def test_the_hand_probe_reaches_the_gateway_where_compose_deploys_it(self):
+        # `make gateway-tools` dials a literal address from a throwaway container,
+        # because the gateway is triple-homed and its NAME resolves to whichever leg
+        # Docker returns. A drift here does not fail loudly: the probe would report an
+        # unreachable gateway on a perfectly healthy deployment, which reads as a
+        # broken surface rather than as a stale constant.
+        makefile = (ROOT / "Makefile").read_text()
+        env = _environment_of("tool-gateway")
+        for name, deployed in (("GATEWAY_ADDR", env["GATEWAY_AGENT_BIND"]),
+                               ("GATEWAY_PORT", _gateway_port())):
+            with self.subTest(variable=name):
+                match = re.search(rf"^{name}\s*\?=\s*(\S+)", makefile, re.M)
+                self.assertIsNotNone(match, f"no {name} in the Makefile")
+                self.assertEqual(match.group(1), deployed)
+
+    def test_the_hand_probe_dials_from_the_agents_own_network(self):
+        # Probing from anywhere else would either fail — which is the whole point of
+        # the single-address bind — or need a published port, which would put the
+        # agent's tool surface on the host.
+        makefile = (ROOT / "Makefile").read_text()
+        target = re.search(r"^gateway-tools:.*?(?=\n\S)", makefile, re.M | re.S)
+        self.assertIsNotNone(target, "no gateway-tools target in the Makefile")
+        self.assertIn("--network sandbox-net", target.group(0))
+
     def test_boundary_check_probes_the_gateway_where_compose_deploys_it(self):
         # The positive control. If this address drifts from compose, the probe fails
         # on a correct deployment and the two bind probes below it go vacuous — they

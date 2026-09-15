@@ -145,6 +145,8 @@ REFFILES := $(SCRIPTS) \
             control-plane/requirements.txt \
             tool-gateway/app.py \
             tool-gateway/discovery.py \
+            tool-gateway/protocol.py \
+            tool-gateway/surface.py \
             tool-gateway/requirements.txt \
             control-plane-ui/app.py \
             control-plane-ui/requirements.txt \
@@ -156,7 +158,7 @@ REFFILES := $(SCRIPTS) \
         up down destroy audit-prune control-tool-preflight backup restore \
         secrets-perm-check \
         rebuild logs-ep logs-cp \
-        mcp-up mcp-down mcp-ps mcp-tools \
+        mcp-up mcp-down mcp-ps mcp-tools gateway-tools \
         claude opencode boundary check-boundary split-check
 
 help: ## Show this help
@@ -660,6 +662,86 @@ mcp-tools: ## List one server's tools and read-only hints: make mcp-tools SERVER
 	  -H 'Accept: application/json, text/event-stream' \
 	  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
 	  | MCP_RAW='$(RAW)' python3 -c "$$MCP_TOOLS_PY"
+
+# The gateway's agent-facing leg, BY ADDRESS. The gateway is triple-homed, so its name
+# resolves to whichever leg Docker's DNS returns and two of the three would be the wrong
+# one — the same reason the gateway itself dials the control plane by address. Held equal
+# to compose by tests/test_topology.py, so a re-pin cannot leave this probing nothing.
+GATEWAY_ADDR ?= 172.30.0.11
+GATEWAY_PORT ?= 8100
+
+# Reads the gateway's reply. Plain JSON rather than SSE — that is the gateway's own
+# choice and not the servers' — but both shapes are accepted here for the reason
+# discovery.py accepts both: the day one changes, a probe that silently printed nothing
+# would be worse than one that kept working.
+define GATEWAY_TOOLS_PY
+import json, os, sys
+
+raw = sys.stdin.read()
+payloads = [line[6:] for line in raw.splitlines() if line.startswith("data: ")]
+body = payloads[0] if payloads else raw.strip()
+if not body:
+    sys.exit("gateway-tools: empty reply — is tool-gateway serving?")
+try:
+    message = json.loads(body)
+except ValueError:
+    sys.exit(f"gateway-tools: not an MCP reply — the gateway said: {body[:200]!r}")
+if os.environ.get("MCP_RAW"):
+    print(json.dumps(message, indent=2))
+    sys.exit(0)
+if "error" in message:
+    sys.exit(f"gateway-tools: the gateway returned an error — {message['error']}")
+
+tools = message["result"]["tools"]
+if not tools:
+    # The empty surface is a real steady state — a fresh install, or every rule denied —
+    # so it gets a sentence of its own rather than the summary below with zeroes in it.
+    # The probe cannot tell the two causes apart from `tools/list`, and says so instead
+    # of picking one.
+    #
+    # Printed and exited ZERO, unlike every other exit in here: those are failures to
+    # get an answer, and this IS the answer.
+    print("no tools. Either no server is enabled, or nothing on one is ruled allow "
+          "or ask — both are the same empty surface from the agent's side.")
+    sys.exit(0)
+
+servers = {}
+for tool in tools:
+    server, _, name = tool["name"].partition("__")
+    servers.setdefault(server, []).append(name)
+for server in sorted(servers):
+    print(server)
+    for name in sorted(servers[server]):
+        print(f"  {name}")
+
+def count(n, noun):
+    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
+
+print(f"\n{count(len(tools), 'tool')} from {count(len(servers), 'server')} — each is "
+      f"ruled allow or ask. A tool with no rule, a denied one, and a tool no server "
+      f"exposes are all absent, and absent means the same thing for all three.")
+endef
+export GATEWAY_TOOLS_PY
+
+gateway-tools: ## List what the gateway serves the AGENT: make gateway-tools [RAW=1]
+	@if ! docker ps --format '{{.Names}}' | grep -qx 'tool-gateway'; then
+	  echo "gateway-tools: tool-gateway is not running — make up"
+	  exit 2
+	fi
+	# A throwaway container on SANDBOX-NET, which is the agent's own position and the
+	# only one this listener is served on. Probing from anywhere else would either fail
+	# (the point of the single-address bind) or need a published port, which would put
+	# the agent's tool surface on the host.
+	#
+	# No Authorization header, unlike mcp-tools: the gateway authenticates nobody. Its
+	# leg is reachable by the sandbox alone, and a credential the agent had to hold
+	# would be a credential the agent holds.
+	docker run --rm --network sandbox-net $(CURL_IMAGE) \
+	  -sS -X POST 'http://$(GATEWAY_ADDR):$(GATEWAY_PORT)/mcp' \
+	  -H 'Content-Type: application/json' \
+	  -H 'Accept: application/json, text/event-stream' \
+	  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
+	  | MCP_RAW='$(RAW)' python3 -c "$$GATEWAY_TOOLS_PY"
 
 destroy: ## Stop infra AND delete BOTH volumes: egress audit log + control-plane policy/audit store (destructive)
 	$(COMPOSE) down -v

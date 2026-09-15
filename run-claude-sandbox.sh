@@ -126,8 +126,33 @@ if [[ "$EGRESS_PROXY_IP" =~ ^[0-9.]+$ ]]; then
     sc_wait_healthy "$EGRESS_PROXY_NAME" \
         "Governed egress is unavailable, and this tier's traffic all flows through it."
 
+    # The MCP gateway, discovered the same way and GOVERNED MODE ONLY — this whole
+    # branch is the governed one, which is what mode-gates the grant below (DESIGN.md:
+    # tier 2 must not acquire a governed tool path by sharing a network).
+    #
+    # BY ADDRESS, not by name. The gateway is triple-homed, so `tool-gateway` is the
+    # one name in this system whose resolution depends on which leg Docker's DNS
+    # feels like returning — the same reason the gateway itself dials the control
+    # plane by address and `make gateway-tools` probes one.
+    TOOL_GATEWAY_NAME="${TOOL_GATEWAY_NAME:-tool-gateway}"
+    TOOL_GATEWAY_PORT="${TOOL_GATEWAY_PORT:-8100}"
+    TOOL_GATEWAY_IP="$(sc_service_ip "$TOOL_GATEWAY_NAME" "$SANDBOX_NET")"
+
     PROXY_URL="http://${EGRESS_PROXY_NAME}:${EGRESS_PROXY_PORT}"
     NO_PROXY_LIST="localhost,127.0.0.1,::1,${EGRESS_PROXY_NAME}"
+    if [[ "$TOOL_GATEWAY_IP" =~ ^[0-9.]+$ ]]; then
+        # THE GATEWAY MUST NOT BE PROXIED, and leaving it out of this list is not a
+        # missing optimisation — it is a broken tool surface with a misleading error.
+        # A client that honours the proxy environment (Claude Code's MCP transport
+        # does) would send every MCP request to the egress proxy, which hard-blocks
+        # private ranges by design; the agent would get "egress denied by policy",
+        # naming the wrong component entirely and describing a refusal that governance
+        # never made. Measured from inside a sandbox before this line existed.
+        #
+        # Both spellings, because the URL is built from the address and a client that
+        # resolved the name would otherwise miss the exemption.
+        NO_PROXY_LIST="${NO_PROXY_LIST},${TOOL_GATEWAY_NAME},${TOOL_GATEWAY_IP}"
+    fi
     # BOTH CASES of each, and the lowercase ones are not redundant styling.
     #
     # curl reads `http_proxy` in LOWER CASE ONLY, while honouring HTTPS_PROXY and
@@ -157,6 +182,28 @@ if [[ "$EGRESS_PROXY_IP" =~ ^[0-9.]+$ ]]; then
         -e "EGRESS_PROXY_PORT=$EGRESS_PROXY_PORT"
     )
     EGRESS_DESC="governed via $EGRESS_PROXY_NAME ($EGRESS_PROXY_IP:$EGRESS_PROXY_PORT)"
+
+    if [[ "$TOOL_GATEWAY_IP" =~ ^[0-9.]+$ ]]; then
+        # Waited on for the reason the proxy is: a container that exists is not one
+        # that serves, and an MCP server that fails to connect at session start is a
+        # startup error the agent then reasons around. Its healthcheck is liveness on
+        # the agent leg, so this is short — and unlike the proxy, the gateway has no
+        # `depends_on` to satisfy first.
+        sc_wait_healthy "$TOOL_GATEWAY_NAME" \
+            "The governed tool surface would be absent from this session."
+        PROXY_ENV_ARGS+=(
+            -e "TOOL_GATEWAY_IP=$TOOL_GATEWAY_IP"
+            -e "TOOL_GATEWAY_PORT=$TOOL_GATEWAY_PORT"
+        )
+        TOOLS_DESC="governed via $TOOL_GATEWAY_NAME ($TOOL_GATEWAY_IP:$TOOL_GATEWAY_PORT)"
+    else
+        # NOT a failure, and the sandbox still launches. `--strict-mcp-config` goes on
+        # unconditionally in the wrapper, so "no gateway" yields a provably empty tool
+        # surface rather than whatever the config volume has accumulated — which is
+        # the whole reason those two flags are separable (DESIGN.md, "Telling the
+        # sandbox it exists").
+        TOOLS_DESC="NONE (no $TOOL_GATEWAY_NAME on $SANDBOX_NET; MCP surface is empty)"
+    fi
 else
     # No proxy found. If sandbox-net is internal (the compose infra defines it
     # that way), there is NO egress route at all, so standalone/direct mode can't
@@ -167,6 +214,10 @@ else
         exit 1
     fi
     EGRESS_DESC="DIRECT (no egress proxy on $SANDBOX_NET; firewall only, no audit)"
+    # Standalone: no governed tool path either, and deliberately not a fallback. The
+    # gateway brokers credentials, so a mode with no audited egress is the last place
+    # to hand one out.
+    TOOLS_DESC="NONE (standalone mode has no governed tool path)"
 fi
 
 sc_alloc_container_name "${SANDBOX_NAME:-claude-sandbox}"
@@ -189,6 +240,7 @@ echo "Plugins:   $SC_PLUGINS_DESC"
 echo "Git ident: ${SC_GIT_NAME:-<none>} <${SC_GIT_EMAIL:-none}>"
 echo "DNS upstreams: $SC_UPSTREAM_DNS (pinned via --dns; whitelisted on :53 in standalone mode only)"
 echo "Egress:    $EGRESS_DESC"
+echo "Tools:     $TOOLS_DESC"
 echo ""
 
 # Launch mode. Everything below this — network, capabilities, mounts, firewall,

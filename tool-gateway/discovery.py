@@ -10,15 +10,15 @@ when no rule matches, so a misspelled rule and an unwritten one fail the same cl
 way — and it is blind in both directions too: a typo is indistinguishable from a
 deny, and there is no list to pick a name from.
 
-This module is the narrow half of closing that, and the half that stores nothing.
 The gateway is the only component that ever talks to a server, so it is the only one
-that can see the gap; here it DIALS, COMPARES and REPORTS, and the report goes to the
-log. Nothing is written back to the control plane and no new endpoint is called. See
-DESIGN.md, "the control plane learns a server's tools from the gateway", for why the
-reporting half is deferred rather than dropped, and for the invariant that governs it
-when it lands: discovered names are operator-facing metadata and must never reach
-`_decide_tool`, because a tool that can write its own rule is a server granting
-itself capability.
+that can see the gap. Here it DIALS, COMPARES, REPORTS to the log, and PUSHES what it
+saw to the control plane, which holds it in memory for an operator choosing rules.
+
+The invariant that governs the push, and the reason it is safe for the crown jewel to
+accept a write from here at all: discovered names are operator-facing metadata and
+never reach `_decide_tool`. A tool that could write its own rule would be a server
+granting itself capability, so what crosses is a CLAIM, and claims decide nothing. See
+DESIGN.md, "the control plane learns a server's tools from the gateway".
 
 NOTHING HERE GRANTS, which is what lets it be this simple. A wrong answer from a
 server — a lie, a truncated list, an unreachable port — can only make this report
@@ -208,8 +208,8 @@ def parse_tools(raw: str) -> list[dict]:
     return message.get("result", {}).get("tools", [])
 
 
-def list_tools(server: str, auth: dict) -> list[str]:
-    """The tool names a server exposes, by asking it.
+def list_tools(server: str, auth: dict) -> list[dict]:
+    """The tools a server exposes, TRIMMED, by asking it.
 
     One POST, no handshake — see the module docstring for why that is enough, and for
     where it was measured."""
@@ -231,7 +231,16 @@ def list_tools(server: str, auth: dict) -> list[str]:
             f"HTTP {exc.code} from {server} — {exc.reason}") from exc
     except (urllib.error.URLError, OSError) as exc:
         raise DiscoveryError(f"unreachable: {exc}") from exc
-    return sorted({tool["name"] for tool in parse_tools(raw) if tool.get("name")})
+    # Trimmed HERE, at the point of reading, rather than downstream. A real reply is
+    # mostly `inputSchema` and inline base64 `icons` — measured, see the byte split
+    # `make mcp-tools` prints — and none of it is needed to say which tools exist or
+    # to choose rules for them. What crosses to the control plane is what a person
+    # picking a rule reads: the name, and the server's own read-only claim.
+    return [{"name": tool["name"],
+             "annotations": {"readOnlyHint":
+                             bool((tool.get("annotations") or {}).get("readOnlyHint"))}}
+            for tool in parse_tools(raw)
+            if isinstance(tool, dict) and tool.get("name")]
 
 
 def reconcile(entry: dict) -> dict:
@@ -251,13 +260,18 @@ def reconcile(entry: dict) -> dict:
     server = entry["server"]
     rules = {rule["tool"]: rule["action"] for rule in entry.get("tools", [])}
     try:
-        exposed = list_tools(server, entry.get("auth") or {})
+        tools = list_tools(server, entry.get("auth") or {})
     except DiscoveryError as exc:
+        # `tools` stays absent rather than empty. An empty list is a CLAIM that the
+        # server exposes nothing, and pushing that on a failed dial would erase a good
+        # inventory because a credential was briefly missing.
         return {"server": server, "status": str(exc), "rules": len(rules)}
+    exposed = sorted({tool["name"] for tool in tools})
     return {"server": server,
             "status": "ok",
             "rules": len(rules),
             "exposed": len(exposed),
+            "tools": tools,
             "ruled_but_absent": sorted(set(rules) - set(exposed)),
             "exposed_but_unruled": sorted(set(exposed) - set(rules))}
 
@@ -325,10 +339,40 @@ def roster_digest(roster: list[dict]) -> str:
     return json.dumps(roster, sort_keys=True, separators=(",", ":"))
 
 
-def report(roster: list[dict]) -> list[str]:
-    """Dial every server on the roster and say where policy and reality disagree.
+def reconcile_all(roster: list[dict]) -> list[dict]:
+    """Dial every server on the roster and compare it with policy.
 
     The expensive half. Each entry is one request to a container holding a
     write-capable credential, which is why the caller runs this on change rather than
     on a short timer."""
-    return format_report([reconcile(entry) for entry in roster])
+    return [reconcile(entry) for entry in roster]
+
+
+def push_inventory(results: list[dict]) -> str:
+    """Report the observed surface to the control plane. Returns "" or a reason.
+
+    The one thing this gateway WRITES anywhere, and it grants nothing: the control
+    plane holds it in memory, shows it to an operator, and never consults it when
+    deciding a call. Pushed because a pull is impossible — the control plane has no leg
+    on this container's networks and must not be given one.
+
+    A server that could not be enumerated is still sent, carrying its status and NO
+    tool list. That is the difference between "this server exposes nothing" and "we
+    could not ask", and an operator needs the second one said out loud — it is the
+    state that otherwise surfaces as a 401 reading like a policy problem."""
+    payload = {"servers": {r["server"]: ({"status": r["status"], "tools": r["tools"]}
+                                         if "tools" in r else {"status": r["status"]})
+                           for r in results}}
+    request = urllib.request.Request(  # noqa: S310 - fixed http:// scheme, not user input
+        f"{CONTROL_URL}/tool/inventory",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:  # noqa: S310
+            answer = json.loads(response.read() or b"{}")
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return f"tool-gateway: inventory not accepted by {CONTROL_URL} — {exc}"
+    if not answer.get("ok"):
+        return (f"tool-gateway: inventory refused — "
+                f"{answer.get('detail') or 'no reason given'}")
+    return ""

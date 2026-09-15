@@ -4259,18 +4259,22 @@ class ApiSurfaceSplitTests(unittest.TestCase):
     AUTHORIZE_ROUTES: ClassVar[set] = {("POST", "/authorize"),
                                        ("GET", "/healthz")}
     #: Everything the gateway-facing listener may serve: decide a call, read the
-    #: roster, claim an ask a human approved. Three rather than one, and the
-    #: criterion that keeps that width honest is that none of them GRANTS — the
-    #: claim releases only what was already decided elsewhere.
+    #: roster, claim an ask a human approved, report what the servers expose. Four
+    #: rather than one, and the criterion that keeps that width honest is unchanged —
+    #: none of them GRANTS. The claim releases only what was already decided elsewhere,
+    #: and the inventory is the only WRITE here: it records a server's claim about
+    #: itself, in memory, that `_decide_tool` never reads. A tool that arrives on it is
+    #: denied exactly as it was before, until a human writes a rule naming it.
     TOOL_ROUTES: ClassVar[set] = {("POST", "/tool/authorize"),
                                   ("GET", "/tool/roster"),
                                   ("POST", "/tool/asks/{approval_id}/claim"),
+                                  ("POST", "/tool/inventory"),
                                   ("GET", "/healthz")}
 
     def test_the_authorize_listener_serves_exactly_two_routes(self):
         self.assertEqual(_routes(cp.authorize_app), self.AUTHORIZE_ROUTES)
 
-    def test_the_tool_listener_serves_exactly_its_three_routes(self):
+    def test_the_tool_listener_serves_exactly_its_four_routes(self):
         self.assertEqual(_routes(cp.tool_app), self.TOOL_ROUTES)
 
     def test_the_two_enforcer_bridges_share_nothing_but_healthz(self):

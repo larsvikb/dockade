@@ -15,9 +15,9 @@ control-plane bridges landed — the surface is asserted while it is still cheap
 change, and the placement is the part that is expensive to retrofit because every
 other component's guard has to agree with it.
 
-It PRESENTS tools and does not yet run them. `tools/call` is refused, which is
-the same answer an unruled tool would get, so the surface is fail-closed while
-its executing half is built rather than half-open.
+It presents tools AND runs them, and neither half decides anything: every call
+is authorised by the control plane first (`execute.py`), and an unconfigured
+tool is denied rather than held.
 
 Three legs, and the asymmetry between them is the whole design:
 
@@ -55,9 +55,11 @@ import threading
 import time
 
 import discovery
+import execute
 import protocol
 import surface
 from fastapi import FastAPI, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response
 
 #: The agent-facing MCP listener. Bound to ONE address — see the module docstring
@@ -192,7 +194,19 @@ async def mcp(request: Request) -> Response:
         # The one case answered with a non-200: an unparseable body is a transport
         # failure rather than a protocol answer, and there is no id to reply under.
         return JSONResponse(protocol.parse_error(), status_code=400)
-    answer = protocol.handle(message, surface.listing())
+    # The peer this listener observed, relayed to the control plane as the calling
+    # SANDBOX — the same arrangement the egress proxy has on `/authorize`, and the same
+    # trust: a gateway that reported its own address instead would make one shared
+    # bucket of every sandbox's ask cap and let one agent's asks answer another's.
+    client = request.client.host if request.client else None
+    # OFF THE EVENT LOOP. A tool call is blocking stdlib HTTP to the control plane and
+    # then to a server, and a server call crosses the internet through the egress proxy
+    # — which may itself be holding it for a human. Run inline, one slow call would
+    # stall every other request this process is serving, `/healthz` included, and the
+    # symptom would be an unhealthy gateway rather than a slow tool.
+    answer = await run_in_threadpool(
+        protocol.handle, message, surface.listing(),
+        lambda name, arguments: execute.call(name, arguments, client))
     if answer is None:
         # A notification. Accepted with no body, which is what the transport asks for
         # and what keeps a client from waiting on a reply that is not coming.

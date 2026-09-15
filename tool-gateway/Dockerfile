@@ -30,6 +30,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # smuggle in a stray file beside them.
 COPY app.py ./app.py
 COPY discovery.py ./discovery.py
+COPY execute.py ./execute.py
 COPY protocol.py ./protocol.py
 COPY surface.py ./surface.py
 

@@ -64,6 +64,61 @@ def split_exposed(name: str) -> tuple[str, str] | None:
     return server, tool
 
 
+#: Prepended to the description of a tool ruled `ask`, and to no other.
+#:
+#: The agent has to learn this from somewhere, and the alternatives are worse. Left
+#: unsaid, an `ask` tool is indistinguishable from an `allow` one until it is called,
+#: so an agent cannot do the gated work first and the unblocked work while it waits,
+#: and cannot tell a human up front that a task will need them. DESIGN.md's rule that
+#: the retry instruction travels in the pending result is about not putting it in a
+#: `CLAUDE.md` that drifts — a description is re-served from here on every `tools/list`
+#: and cannot drift from the policy it describes, which is the property that rule
+#: protects.
+#:
+#: PREPENDED rather than appended so it is not buried under a long server description.
+#: The server's own text shares this string and could forge a copy, which is worth
+#: noticing and not worth preventing: a tool that lies about needing approval gets
+#: approval anyway, and one that lies about not needing it is still refused at the
+#: call. The lie is cosmetic because the boundary is not here.
+ASK_NOTICE = ("Approval required: calling this returns a pending id rather than a "
+              "result, and you finish it with resume_tool_call. ")
+
+#: The gateway's own tools, proxied from no server.
+#:
+#: A CATEGORY WITH ITS OWN RULE, and the rule is that a native tool must not cause an
+#: ungoverned side effect. Resumption sits precisely on that line — it does cause one —
+#: and is admissible only because the effect is bound to an id a human explicitly
+#: approved, with arguments they read. The next native tool will not inherit that
+#: property, which is why the criterion is written down rather than left to be inferred
+#: from this one being safe.
+#:
+#: The name carries NO `__`, and that is structural rather than stylistic: every
+#: proxied name is built by ``exposed_name``, which always inserts the separator, so
+#: ``split_exposed`` already answers None here. The decode built to keep a call
+#: resolving to one (server, tool) pair is therefore also what tells a native tool from
+#: a proxied one, with no reserved server name and no second mechanism.
+RESUME_TOOL = "resume_tool_call"
+
+NATIVE_TOOLS = [{
+    "name": RESUME_TOOL,
+    # Blunt about the two things a model would otherwise get wrong: that this RUNS the
+    # call rather than collecting a result that already exists, and that it is
+    # single-use. A name like `get_result` would have implied both incorrectly, which
+    # is why it is not called that.
+    "description": (
+        "Finish a tool call that was held for human approval. Pass the id from the "
+        "pending result. If the approval was granted this RUNS the call and returns "
+        "its result, and it can only be done once. If it is still pending it says so "
+        "and nothing runs; if it was denied or expired it says that, and retrying "
+        "will not change it."),
+    "inputSchema": {
+        "type": "object",
+        "properties": {"approval_id": {
+            "type": "string",
+            "description": "The id from the pending result, copied verbatim."}},
+        "required": ["approval_id"]}}]
+
+
 def curate(roster: list[dict], enumerated: dict[str, list[dict]]) -> list[dict]:
     """The `tools/list` payload: every ruled-and-present tool, under its exposed name.
 
@@ -89,10 +144,13 @@ def curate(roster: list[dict], enumerated: dict[str, list[dict]]) -> list[dict]:
         server = entry.get("server") or ""
         actions = {rule["tool"]: rule["action"] for rule in entry.get("tools") or []}
         for tool in enumerated.get(server) or []:
-            if actions.get(tool["name"]) not in ("allow", "ask"):
+            action = actions.get(tool["name"])
+            if action not in ("allow", "ask"):
                 continue
+            description = tool.get("description") or ""
             listing.append({"name": exposed_name(server, tool["name"]),
-                            "description": tool.get("description") or "",
+                            "description": (ASK_NOTICE + description
+                                            if action == "ask" else description),
                             "inputSchema": tool.get("inputSchema") or {"type": "object"}})
     return sorted(listing, key=lambda tool: tool["name"])
 
@@ -111,6 +169,7 @@ def curate(roster: list[dict], enumerated: dict[str, list[dict]]) -> list[dict]:
 #: buy nothing.
 _ENUMERATED: dict[str, list[dict]] = {}
 _LISTING: list[dict] = []
+_SERVERS: dict[str, dict] = {}
 
 
 def publish(roster: list[dict], results: list[dict]) -> None:
@@ -127,7 +186,7 @@ def publish(roster: list[dict], results: list[dict]) -> None:
     A server that left the ROSTER does lose its tools, and that is a different event:
     it was disabled or revoked by an operator, which is an answer rather than a
     failure to ask."""
-    global _ENUMERATED, _LISTING
+    global _ENUMERATED, _LISTING, _SERVERS
     enabled = {entry.get("server") for entry in roster}
     enumerated = {server: tools for server, tools in _ENUMERATED.items()
                   if server in enabled}
@@ -138,12 +197,37 @@ def publish(roster: list[dict], results: list[dict]) -> None:
             enumerated[result["server"]] = result["tools"]
     _ENUMERATED = enumerated
     _LISTING = curate(roster, enumerated)
+    # The roster itself, kept because EXECUTION needs the auth descriptor and the
+    # listing does not carry one. Rebuilt outright rather than merged: unlike the
+    # enumeration above, a server missing here is missing because the authority said
+    # so, and holding a descriptor for a server an operator disabled would be keeping
+    # the means to dial something we have been told not to.
+    _SERVERS = {entry["server"]: entry for entry in roster if entry.get("server")}
 
 
 def listing() -> list[dict]:
     """What `tools/list` answers with, right now.
 
-    Empty until the first successful reconcile, which is the correct cold answer: the
-    gateway has not been told what exists, and a tool it cannot describe is one it
-    cannot present. It is also harmless, because an empty list is not a grant."""
-    return _LISTING
+    The gateway's own tools first, then the curated proxied ones. They are concatenated
+    here rather than inside ``curate`` because they are not the same kind of thing: a
+    proxied entry is a join of policy against what a server claimed, and a native one
+    is neither — it is outside the per-tool policy governing everything else on this
+    surface, which is exactly why it needs its own rule (see ``NATIVE_TOOLS``).
+
+    The proxied half is empty until the first successful reconcile, which is the
+    correct cold answer: the gateway has not been told what exists, and a tool it
+    cannot describe is one it cannot present. It is also harmless, because an empty
+    list is not a grant."""
+    return NATIVE_TOOLS + _LISTING
+
+
+def server_entry(server: str) -> dict | None:
+    """The roster entry for ``server``, or None if it is not on the current roster.
+
+    None is a REFUSAL rather than a lookup miss, and the caller must treat it as one.
+    The entry carries the auth descriptor, so a server that is absent here cannot be
+    dialled correctly — and it is absent precisely when the control plane stopped
+    naming it, which is an operator disabling or revoking it. Falling back to dialling
+    without credentials would turn that switch into a 401 the agent reads as a broken
+    tool rather than as a closed one."""
+    return _SERVERS.get(server)

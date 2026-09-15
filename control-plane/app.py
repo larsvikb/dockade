@@ -1984,7 +1984,7 @@ def revoke_lease(lease_id: int, request: Request) -> JSONResponse:
 
 
 # ── MCP gateway policy (human-facing) ───────────────────────────────────────
-# The gateway does not exist yet and none of this waits for it. Tool policy is
+# None of this waits for the gateway, and it was built before it. Tool policy is
 # CONFIGURATION FIRST — an operator states what a server's tools may do before
 # anything calls one — which is the opposite of the egress surface, where rules
 # accumulate from approvals and direct creation was retrofitted (see "Tool policy

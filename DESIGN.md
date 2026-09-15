@@ -3300,6 +3300,7 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | gateway discovery — roster pull, `tools/list`, policy-vs-server report | **done** — reports to the log; writes nothing back |
 | — | MCP client credentials — read-only mount, path derived from the server name | **done** — the gateway is the only holder |
 | — | MCP server registration — UI tab: register, enable/disable, revoke | **done** — servers only; tool rules not yet |
+| — | tool inventory — gateway pushes, control plane holds it in memory | **done** — audited on change; no UI yet |
 | — | MCP gateway — per-tool allow/deny/ask | planned (next: curated tool list on the agent leg) |
 
 The rationale for each shipped item lives under **Governance surfaces** above, not here
@@ -3432,6 +3433,26 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
   way `policies/egress-allowlist.txt` already is (`control-plane/Dockerfile`). That
   half needs no network access and no trust in anything running; it is only the tool
   half that requires the gateway.
+- **RESOLVED — the tool inventory lives in memory, arrives by push, and is audited
+  only when it changes.** The gateway is the only component that can see what a server
+  exposes, so it reports; the control plane holds the result for an operator choosing
+  rules and for nothing else. **In memory, never stored** — it is derived data,
+  rebuildable by asking the servers again, and a stored copy would both outlive a
+  server that has been gone for a week while reading as current and put server-authored
+  text into `make backup`, which is the operator's own decisions and nothing else.
+  **Pushed, because a pull is impossible**: this process has no leg on the gateway's
+  networks and must not be given one, since dialling the agent-facing service from the
+  crown jewel is the lateral edge the gateway's bind guard exists to prevent. That
+  makes `/tool/inventory` the only WRITE on that bridge, and the criterion keeping the
+  bridge's width honest survives intact — it records a claim that `_decide_tool` never
+  reads, so a tool arriving on it is denied exactly as it was before. **Audited on
+  CHANGE**, not per push: a push lands whenever the roster moves, and a row each time
+  would bury the one worth keeping — a server's surface growing without a human in the
+  loop is a supply-chain event. Rows carry tool NAMES, which `policy._TOOL_RE` bounds,
+  and never descriptions, which nothing bounds. Two distinctions are load-bearing
+  enough to name: a server that could not be enumerated keeps its last known surface
+  rather than reading as one that exposes nothing, and a tool whose name falls outside
+  `_TOOL_RE` is dropped but counted, because no rule could ever be written for it.
 - **RESOLVED — a server enters the store because an operator registered it, not
   because a file declared it.** The seeding alternative above was considered and set
   aside rather than rejected. Reading `mcp-servers.yml` directly means a YAML parser

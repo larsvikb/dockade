@@ -30,6 +30,7 @@ COPY control-plane/audit.py ./audit.py
 COPY control-plane/policy.py ./policy.py
 COPY control-plane/holds.py ./holds.py
 COPY control-plane/ingest.py ./ingest.py
+COPY control-plane/inventory.py ./inventory.py
 COPY policies/egress-allowlist.txt /etc/control-plane/egress-allowlist.txt
 
 # The SQLite store lives here; a named volume mounts over it for persistence

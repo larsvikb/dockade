@@ -189,7 +189,11 @@ class ReconcileTests(unittest.TestCase):
         self.discovery = load_discovery()
 
     def _reconcile(self, exposed):
-        self.discovery.list_tools = lambda *_a, **_k: exposed
+        # Shaped like what list_tools now returns — trimmed tool objects, not bare
+        # names — because the inventory push carries the server's read-only claim
+        # alongside each name.
+        self.discovery.list_tools = lambda *_a, **_k: [
+            {"name": n, "annotations": {"readOnlyHint": False}} for n in exposed]
         return self.discovery.reconcile(ENTRY)
 
     def test_the_two_directions_are_separate_findings(self):
@@ -209,7 +213,8 @@ class ReconcileTests(unittest.TestCase):
         # Presentation and enforcement are separate axes: a `deny` row is a decision
         # an operator made, so the tool is not "unruled" and must not be reported as
         # needing a rule. Every rule ships on the roster, deny rows included.
-        self.discovery.list_tools = lambda *_a, **_k: ["dangerous"]
+        self.discovery.list_tools = lambda *_a, **_k: [
+            {"name": "dangerous", "annotations": {}}]
         result = self.discovery.reconcile(
             {"server": "s", "auth": {}, "tools": [{"tool": "dangerous",
                                                    "action": "deny"}]})

@@ -205,8 +205,17 @@ def _reconcile_forever(stop: threading.Event) -> None:
         else:
             digest = discovery.roster_digest(roster)
             if reachable is not True or digest != enumerated or due:
-                for line in discovery.report(roster):
+                results = discovery.reconcile_all(roster)
+                for line in discovery.format_report(results):
                     print(line, flush=True)
+                # Pushed on the same trigger as the report, because they are the same
+                # observation going to two readers — the log for whoever is watching a
+                # terminal, the control plane for whoever is choosing rules in the UI.
+                # A refusal is printed rather than raised: the inventory is the
+                # convenience half, and losing it must not cost the diagnostic half.
+                refused = discovery.push_inventory(results)
+                if refused:
+                    print(refused, flush=True)
                 enumerated = digest
                 deadline = time.monotonic() + DISCOVERY_INTERVAL
             reachable = True

@@ -1503,6 +1503,50 @@ class AuditFilterTests(_CPTestCase):
         self.assertLessEqual(set(re.findall(r'"([a-z]+)"', ingested.group(1))),
                              set(cp.audit.DECISIONS))
 
+    def test_no_caller_facing_error_interpolates_an_underlying_exception(self):
+        """Two exception types are served VERBATIM to a caller — ``audit.FilterError``
+        and ``inventory.InventoryError`` — and both carry the same contract in their
+        docstrings: interpolate the caller's own parameters and this module's
+        constants, nothing else. A code scanning rule flags the ``str(exc)`` on the
+        receiving end from the shape alone, and that contract is the entire reason it
+        is a false positive rather than a finding.
+
+        Until now the contract was PROSE, which is how a bare ``except ValueError``
+        got written next to one of them. This checks the half a machine can see: no
+        raise site may interpolate an underlying exception, which is the one that turns
+        a validation sentence into a disclosure."""
+        leaked = []
+        for module, name in (("audit", "FilterError"), ("inventory", "InventoryError")):
+            source = (ROOT / "control-plane" / f"{module}.py").read_text()
+            for raise_site in re.findall(rf"raise {name}\((.*?)\)\n", source, re.S):
+                if re.search(r"\{\s*(exc|err|e)\b|str\(\s*(exc|err|e)\b", raise_site):
+                    leaked.append(f"{module}.{name}: {raise_site.strip()[:80]}")
+        self.assertEqual(leaked, [], "these raise sites put an underlying exception "
+                                     "into a message served verbatim to a caller")
+
+    def test_an_exception_reaches_a_response_only_through_a_named_type(self):
+        """The receiving half of the same contract. Serving ``str(exc)`` is safe only
+        because the exception is one of ours, raised to be read; catching a bare
+        ``ValueError`` widens that to anything the call happened to raise, which is
+        exactly what a code scanning rule means by information exposure.
+
+        Bare ``except ValueError`` is legitimate elsewhere in this package — parsing a
+        CIDR, a timestamp — so the rule is not "never catch it". It is that a handler
+        which RELAYS the message may not. Written after doing it: the inventory
+        endpoint shipped with a bare catch, and CodeQL found it before review did."""
+        source = (ROOT / "control-plane" / "app.py").read_text()
+        offenders = []
+        for match in re.finditer(r"except ([\w.]+) as exc:\n", source):
+            after = source[match.end():match.end() + 900]
+            # The handler body ends at the next line that is not indented into it.
+            body = after.split("\n    def ")[0]
+            if "str(exc)" in body and match.group(1) in ("ValueError", "Exception",
+                                                         "BaseException"):
+                offenders.append(match.group(1))
+        self.assertEqual(offenders, [],
+                         "a handler relays str(exc) from a catch-all, so an unexpected "
+                         "exception's text would be served to the caller")
+
     def test_the_page_offers_exactly_the_words_the_backend_knows(self):
         # The third end of the same coupling: an <option> the backend does not know is
         # a 400 on click, and a word missing from the page is a filter no operator can
@@ -4259,18 +4303,22 @@ class ApiSurfaceSplitTests(unittest.TestCase):
     AUTHORIZE_ROUTES: ClassVar[set] = {("POST", "/authorize"),
                                        ("GET", "/healthz")}
     #: Everything the gateway-facing listener may serve: decide a call, read the
-    #: roster, claim an ask a human approved. Three rather than one, and the
-    #: criterion that keeps that width honest is that none of them GRANTS — the
-    #: claim releases only what was already decided elsewhere.
+    #: roster, claim an ask a human approved, report what the servers expose. Four
+    #: rather than one, and the criterion that keeps that width honest is unchanged —
+    #: none of them GRANTS. The claim releases only what was already decided elsewhere,
+    #: and the inventory is the only WRITE here: it records a server's claim about
+    #: itself, in memory, that `_decide_tool` never reads. A tool that arrives on it is
+    #: denied exactly as it was before, until a human writes a rule naming it.
     TOOL_ROUTES: ClassVar[set] = {("POST", "/tool/authorize"),
                                   ("GET", "/tool/roster"),
                                   ("POST", "/tool/asks/{approval_id}/claim"),
+                                  ("POST", "/tool/inventory"),
                                   ("GET", "/healthz")}
 
     def test_the_authorize_listener_serves_exactly_two_routes(self):
         self.assertEqual(_routes(cp.authorize_app), self.AUTHORIZE_ROUTES)
 
-    def test_the_tool_listener_serves_exactly_its_three_routes(self):
+    def test_the_tool_listener_serves_exactly_its_four_routes(self):
         self.assertEqual(_routes(cp.tool_app), self.TOOL_ROUTES)
 
     def test_the_two_enforcer_bridges_share_nothing_but_healthz(self):

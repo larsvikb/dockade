@@ -44,7 +44,13 @@ from __future__ import annotations
 # as a constant with the call sites — the writer takes ``decision`` as a plain string
 # from four different places, and a new word appearing there without appearing here
 # would make its rows unfilterable while every other test passed.
-DECISIONS = ("allow", "deny", "hold", "revoke", "create", "edit")
+# "observe" is the odd one and is here deliberately: it is NOT a decision. It records
+# something a server claimed about itself — its tool surface changed — which nothing in
+# this process decided and which decides nothing in return. It shares the column
+# because it shares the question an operator asks of this log ("what happened, and
+# when"), and it is filterable for the same reason the others are: a row nobody can
+# select for is a row nobody reads.
+DECISIONS = ("allow", "deny", "hold", "revoke", "create", "edit", "observe")
 
 # Columns ``q`` searches, PER VIEW, and the rule is that a view searches exactly what
 # it DISPLAYS. Anything else produces the worst kind of result list: rows whose visible

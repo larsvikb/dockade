@@ -138,6 +138,7 @@ from typing import Any
 import audit
 import holds
 import ingest
+import inventory
 import policy
 import store
 from fastapi import FastAPI, Request
@@ -346,6 +347,14 @@ class ServerEditRequest(BaseModel):
     auth_type: str = "none"
     auth_header: str | None = None
     auth_template: str | None = None
+
+
+class InventoryRequest(BaseModel):
+    # What the gateway OBSERVED, which is a different kind of thing from every other
+    # model in this file: those carry an operator's decision and must be right, this
+    # carries a third party's claim and need only be bounded. `inventory.record` is
+    # where that bounding happens — not here, because a shape check is not a cap.
+    servers: dict | None = None
 
 
 class ToolRuleCreateRequest(BaseModel):
@@ -875,6 +884,44 @@ def tool_roster() -> list[dict]:
                       "template": r["auth_template"]},
              "tools": rules.get(r["server"], [])}
             for r in servers]
+
+
+@tool_app.post("/tool/inventory")
+def tool_inventory(req: InventoryRequest, request: Request) -> JSONResponse:
+    """What the gateway found when it dialled each enabled server.
+
+    THE ONLY WRITE ON THIS BRIDGE, and it stays inside the criterion that keeps the
+    bridge's width honest: none of these endpoints grants. Nothing here writes a rule,
+    registers a server or decides an approval — it records a claim, in memory, that
+    ``policy._decide_tool`` never reads. A tool listed here is denied exactly as it was
+    before the push, until a human writes a rule naming it.
+
+    PUSHED rather than pulled, and that direction is forced. This process has no leg on
+    the gateway's networks and must not be given one: dialling the agent-facing service
+    from the crown jewel is the lateral edge the gateway's bind guard exists to
+    prevent. So the component that can reach both ends does the reaching.
+
+    Audits CHANGES only. A push arrives whenever the roster moves, which during an
+    operator's session is often; a row per push would bury the rows worth keeping. What
+    IS worth keeping is a server's surface moving — an image bump that starts exposing
+    a destructive tool, with no human in the loop, is a supply-chain event and reads as
+    one in the log."""
+    try:
+        _, moved = inventory.record({"servers": req.servers or {}})
+    except inventory.InventoryError as exc:
+        # A refusal the gateway can print. Not a 500: this is a well-formed request
+        # carrying something out of bounds, and the sender needs to say so in its log
+        # rather than retry it every poll.
+        #
+        # The TYPE is the point, not the 400. `InventoryError` carries a contract that
+        # its message holds only the caller's own payload shape and this module's
+        # constants, so serving it verbatim discloses nothing; anything else raised in
+        # there is unexpected and becomes a 500 with no body, rather than having its
+        # text relayed. Same arrangement as `audit.FilterError` and `_bad_filter`.
+        return JSONResponse({"ok": False, "detail": str(exc)}, status_code=400)
+    for line in moved:
+        store._audit("observe", stage="mcp-tools", client=_actor(request), reason=line)
+    return JSONResponse({"ok": True, "changed": len(moved)})
 
 
 @tool_app.post("/tool/asks/{approval_id}/claim")
@@ -2134,6 +2181,22 @@ def revoke_mcp_server(server: str, request: Request) -> JSONResponse:
                  reason=f"MCP server {server} registration revoked by {actor}; the "
                         f"gateway will no longer dial it")
     return JSONResponse({"ok": True, "server": server})
+
+
+@app.get("/api/mcp/inventory")
+def api_mcp_inventory() -> dict:
+    """What each server last said it exposes, for an operator choosing rules.
+
+    Served from MEMORY and empty until a gateway has pushed — including after a
+    restart of this process, which is the intended cost rather than a gap. A stored
+    copy would survive a server that has been gone for a week and still read as
+    current; ``seen_at`` is here so a reader can tell the difference.
+
+    OBSERVATION, not policy. Nothing in this response is permitted, and the rules that
+    decide live in ``/api/mcp/servers`` and its rule endpoints. Kept separate for that
+    reason and not merely for tidiness: one is a third party's claim, the other is what
+    a human decided."""
+    return inventory.snapshot()
 
 
 @app.get("/api/mcp/rules")

@@ -204,6 +204,18 @@ def load_control_plane() -> types.ModuleType:
     return _load("dockade_control_plane", "control-plane/app.py")
 
 
+def load_inventory() -> types.ModuleType:
+    """The control plane's in-memory tool inventory, fresh per call.
+
+    A fresh module each time IS the isolation: the inventory is module-level state by
+    design (it must be shared across the three listeners in the one process), so tests
+    that shared one instance would leak a previous case's servers into the next."""
+    pkg_dir = str(ROOT / "control-plane")
+    if pkg_dir not in sys.path:
+        sys.path.insert(0, pkg_dir)
+    return _load(f"dockade_inventory_{len(sys.modules)}", "control-plane/inventory.py")
+
+
 def load_discovery(env: dict[str, str] | None = None) -> types.ModuleType:
     """The gateway's discovery module alone, without importing the app.
 

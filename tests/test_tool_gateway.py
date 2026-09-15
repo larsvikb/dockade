@@ -117,6 +117,7 @@ class ReconcilePacingTests(unittest.TestCase):
             env["GATEWAY_DISCOVERY_INTERVAL"] = interval
         gateway = load_tool_gateway(env)
         replies = iter(polls)
+        pushed = []
 
         class FakeDiscovery:
             @staticmethod
@@ -128,8 +129,17 @@ class ReconcilePacingTests(unittest.TestCase):
                 return json.dumps(roster, sort_keys=True)
 
             @staticmethod
-            def report(roster):
-                return [f"report:{len(roster)}"]
+            def reconcile_all(roster):
+                return list(roster)
+
+            @staticmethod
+            def format_report(results):
+                return [f"report:{len(results)}"]
+
+            @staticmethod
+            def push_inventory(_results):
+                pushed.append(1)
+                return ""
 
         class FakeStop:
             def __init__(self):
@@ -141,6 +151,7 @@ class ReconcilePacingTests(unittest.TestCase):
 
         gateway.discovery = FakeDiscovery
         stop, out = FakeStop(), io.StringIO()
+        self.pushed = pushed
         with contextlib.redirect_stdout(out):
             gateway._reconcile_forever(stop)
         return stop.waits, out.getvalue()

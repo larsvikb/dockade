@@ -115,6 +115,7 @@ JSONFILES := $(shell git ls-files '*.json' 2>/dev/null)
 PYFILES := proxies/egress/addon.py control-plane-ui/app.py \
            control-plane/app.py control-plane/store.py control-plane/policy.py \
            control-plane/holds.py control-plane/ingest.py control-plane/audit.py \
+           control-plane/inventory.py \
            tool-gateway/app.py tool-gateway/discovery.py
 # Dependency-free unit tests for the governance-critical decision logic. Kept
 # separate from PYFILES so they can be linted with the app code but discovered
@@ -140,6 +141,7 @@ REFFILES := $(SCRIPTS) \
             control-plane/policy.py \
             control-plane/holds.py \
             control-plane/ingest.py \
+            control-plane/inventory.py \
             control-plane/requirements.txt \
             tool-gateway/app.py \
             tool-gateway/discovery.py \

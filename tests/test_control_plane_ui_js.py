@@ -2946,6 +2946,30 @@ def _requested_paths(js: str) -> list[list[str]]:
              for stand in _ID_STANDINS] for r in raw]
 
 
+class StylesheetTests(unittest.TestCase):
+    """The palette and the rules that use it are in one file with nothing checking
+    that they agree."""
+
+    def test_every_css_variable_used_is_defined(self):
+        """A `var(--typo)` is SILENT: the declaration still parses, the page still
+        renders, and the styling simply never happens — the property falls through to
+        whatever was inherited. Found by writing one (`var(--muted)` for `--dim`), and
+        the reason it is worth a guard is that nothing about the running page looks
+        wrong afterwards.
+
+        Reads the file that ships rather than restating its palette: the point is that
+        the two halves agree, not what either of them says."""
+        css = INDEX_HTML.read_text()
+        root = re.search(r":root\s*\{(.*?)\}", css, re.S)
+        self.assertIsNotNone(root, "the :root palette block moved")
+        defined = set(re.findall(r"(--[a-z0-9-]+)\s*:", root.group(1)))
+        used = set(re.findall(r"var\((--[a-z0-9-]+)", css))
+        self.assertTrue(used, "no custom properties used — has the stylesheet moved?")
+        self.assertEqual(used - defined, set(),
+                         "used but never defined, so the declarations naming them "
+                         "do nothing")
+
+
 class InlineScriptTests(unittest.TestCase):
     """``script-src 'self'`` is only worth sending while the page has no inline
     script, and that invariant spans two files — so it is checked, not trusted.

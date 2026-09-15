@@ -207,6 +207,10 @@
   .tag.allow { color: var(--allow); } .tag.deny { color: var(--deny); }
   .tag.block { color: var(--deny); }
   .tag.hold { color: var(--hold); }
+  /* Deliberately not one of the decision colours: an observation is a thing a server
+     claimed, not a thing this system decided, and it should not read as a fourth
+     verdict sitting beside allow/deny/hold. */
+  .tag.observe { color: var(--dim); }
   .ts { color: var(--dim); white-space: nowrap; }
   code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   /* A leading-dot pattern is a SUBDOMAIN WILDCARD that looks like a hostname, so
@@ -406,6 +410,7 @@
         <option value="revoke">revoke</option>
         <option value="create">create</option>
         <option value="edit">edit</option>
+        <option value="observe">observe</option>
       </select>
       <!-- Relative windows, not date pickers: the question is "since when". Values
            are the keys of AUDIT_WINDOWS in app.js, held equal by a test. -->

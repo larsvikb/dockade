@@ -10,6 +10,15 @@ here. It is written down so you spend no turns discovering it.
   human decision**, so a request can hang until someone approves it or a timeout
   fires. Prefer `WebFetch` over raw sockets, and expect a first request to a new
   host to be slow rather than to fail.
+- **MCP tools are governed per tool, and one may be held for a human.** The tools
+  under `mcp__dockade__` are brokered by a gateway that asks policy before every
+  call. Three answers: it runs, it is refused, or it is **held for approval** — and
+  a held call comes back immediately as a *result* saying so, carrying an id. That
+  is not a failure and not a hang: do other work, then finish it with
+  `resume_tool_call` and the same id. Calling the tool again instead raises a
+  **second** question for the same person. A tool whose description begins
+  "Approval required" is one of these, so you can plan around it rather than
+  discover it. A refusal says retrying will not help, and means it.
 - **No `git push`, no SSH.** External names do not resolve outside the proxy, so
   `git push`, `ssh` and `scp` fail at DNS resolution. Branch and commit here;
   pushing is the human's step. There is no governed git path yet.

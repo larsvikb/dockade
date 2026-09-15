@@ -102,7 +102,8 @@ SCRIPTS := $(LAUNCHERS) \
            sandbox-common/boundary-check.sh \
            claude-sandbox/tier-setup.sh \
            opencode-sandbox/tier-setup.sh \
-           claude-sandbox/statusline.sh
+           claude-sandbox/statusline.sh \
+           claude-sandbox/claude-wrapper.sh
 DOCKERFILES := claude-sandbox/Dockerfile opencode-sandbox/Dockerfile \
                proxies/egress/Dockerfile \
                control-plane/Dockerfile control-plane-ui/Dockerfile \
@@ -116,7 +117,8 @@ PYFILES := proxies/egress/addon.py control-plane-ui/app.py \
            control-plane/app.py control-plane/store.py control-plane/policy.py \
            control-plane/holds.py control-plane/ingest.py control-plane/audit.py \
            control-plane/inventory.py \
-           tool-gateway/app.py tool-gateway/discovery.py
+           tool-gateway/app.py tool-gateway/discovery.py \
+           tool-gateway/protocol.py tool-gateway/surface.py tool-gateway/execute.py
 # Dependency-free unit tests for the governance-critical decision logic. Kept
 # separate from PYFILES so they can be linted with the app code but discovered
 # and run on their own (python -m unittest, no pip installs — see tests/).

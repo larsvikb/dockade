@@ -101,9 +101,13 @@ WORKDIR /workspace
 # Agent-writable dir goes LAST on PATH, not first: /home/$USERNAME is chown'd to
 # the sandbox user, so a prepended entry would let the agent shadow baked/system
 # binaries — including /usr/local/bin/boundary-check.sh, the containment self-check.
-# Appended, the agent's own tools (claude, ruff, yamllint) still resolve because
-# nothing earlier on PATH shares their names. (The Makefile also invokes
-# boundary-check.sh by absolute path — belt-and-braces for a live docker exec.)
+# Appended, the agent's own tools (ruff, yamllint) still resolve because nothing
+# earlier on PATH shares their names. (The Makefile also invokes boundary-check.sh
+# by absolute path — belt-and-braces for a live docker exec.)
+#
+# `claude` is the ONE deliberate exception, and the ordering is what makes it work:
+# /usr/local/bin/claude is a root-owned wrapper that adds this sandbox's MCP flags,
+# and it shadows the real binary below precisely because this entry comes last.
 ENV PATH="$PATH:/home/$USERNAME/.local/bin"
 # Standardize on bash. The login shell is already /bin/bash (useradd -s above);
 # pinning SHELL makes tools that auto-detect a shell (e.g. Claude Code's
@@ -186,6 +190,10 @@ COPY claude-sandbox/user-settings.json /etc/claude-code/user-settings.json
 COPY claude-sandbox/CLAUDE.md /etc/claude-code/CLAUDE.md.template
 COPY claude-sandbox/statusline.sh /etc/claude-code/statusline.sh
 COPY claude-sandbox/tier-setup.sh /usr/local/bin/tier-setup.sh
+# Shadows ~/.local/bin/claude on PATH — see the PATH note above. Root-owned, so the
+# agent cannot edit it; it is mistake-prevention rather than containment, and the
+# file says why.
+COPY claude-sandbox/claude-wrapper.sh /usr/local/bin/claude
 COPY sandbox-common/init-firewall.sh /usr/local/bin/init-firewall.sh
 COPY sandbox-common/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY sandbox-common/boundary-check.sh /usr/local/bin/boundary-check.sh
@@ -193,6 +201,7 @@ RUN chmod 0644 /etc/claude-code/user-settings.json /etc/claude-code/CLAUDE.md.te
     && chmod 0755 /etc/claude-code/statusline.sh \
     && chmod 0755 /usr/local/bin/init-firewall.sh /usr/local/bin/entrypoint.sh \
                   /usr/local/bin/boundary-check.sh /usr/local/bin/tier-setup.sh \
+                  /usr/local/bin/claude \
     && chown $USERNAME:$USERNAME /home/$USERNAME/.bashrc /home/$USERNAME/.bashrc.tier \
                                  /home/$USERNAME/.vimrc /home/$USERNAME/.inputrc /home/$USERNAME/.gitconfig
 

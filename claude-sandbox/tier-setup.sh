@@ -48,6 +48,50 @@ install -o "$USERNAME" -g "$USERNAME" -m 0644 \
     "$CONFIG_DIR/CLAUDE.md"
 
 # ---------------------------------------------------------------------------
+# The MCP gateway  ->  the file /usr/local/bin/claude points --mcp-config at
+# ---------------------------------------------------------------------------
+# Written HERE rather than baked into the image because the address is discovered
+# at launch, and written to /etc rather than into $CONFIG_DIR because the config
+# volume persists: a gateway entry left there would outlive the launch that found
+# it, and would then name an address nothing serves. /etc is image layer, so this
+# file exists for exactly the life of the container that wrote it.
+#
+# ROOT-OWNED AND 0644. The agent can read it and cannot edit it, which is the same
+# footing as the status-line script — and, like that one, this is mistake-prevention
+# rather than containment (see claude-wrapper.sh on why that is enough here).
+#
+# `mcpServers` is Claude Code's own declarative form, and this is the only channel
+# that works for it: the same block in a settings file is silently ignored, with no
+# warning and no error (measured — NOTES.md).
+#
+# The key is `dockade`, so the agent sees `mcp__dockade__<server>__<tool>`. It names
+# the system doing the governing rather than the container doing the serving, and it
+# is held equal to the gateway's own `protocol.SERVER_NAME` by
+# tests/test_sandbox_wiring.py — a mismatch would be invisible, since both sides
+# would work and only the name in a transcript would be wrong.
+MCP_GATEWAY_CONFIG=/etc/claude-code/mcp-gateway.json
+# Removed first, unconditionally. The absence of this file is what tells the wrapper
+# there is no gateway, so a stale one from an earlier run of the same container is a
+# session pointed at an address that may no longer answer.
+rm -f "$MCP_GATEWAY_CONFIG"
+if [[ "${TOOL_GATEWAY_IP:-}" =~ ^[0-9.]+$ ]]; then
+    # BY ADDRESS. The gateway is triple-homed and `tool-gateway` resolves to whichever
+    # leg Docker's DNS returns; the launcher already resolved the one leg this sandbox
+    # may speak to, and passed it.
+    install -o root -g root -m 0644 /dev/stdin "$MCP_GATEWAY_CONFIG" <<EOF
+{
+  "mcpServers": {
+    "dockade": {
+      "type": "http",
+      "url": "http://${TOOL_GATEWAY_IP}:${TOOL_GATEWAY_PORT:-8100}/mcp"
+    }
+  }
+}
+EOF
+    echo "  MCP gateway -> http://${TOOL_GATEWAY_IP}:${TOOL_GATEWAY_PORT:-8100}/mcp"
+fi
+
+# ---------------------------------------------------------------------------
 # Plugin marketplaces mounted at /marketplaces  ->  settings.json
 # ---------------------------------------------------------------------------
 # The launcher mounts the human's marketplace checkouts read-only (see

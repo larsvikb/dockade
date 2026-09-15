@@ -40,7 +40,7 @@ the repo follows from "containment is by **capability**, not configuration."
   [Server-side execution blind spots](#server-side-execution-accepted-governance-blind-spots)
 - [Capability inventory](#capability-inventory-v1) ·
   [Governance surfaces](#governance-surfaces)
-  (egress proxy · control plane · approval UI · [MCP gateway](#mcp-gateway--governed-tool-capability-built-not-yet-offered-to-the-sandbox))
+  (egress proxy · control plane · approval UI · [MCP gateway](#mcp-gateway--governed-tool-capability))
 - [Startup ordering](#startup-ordering--running-is-not-ready) ·
   [Resource limits](#resource-limits--blast-radius-not-boundary) ·
   [Local inference](#local-inference--an-ungoverned-llm-tool)
@@ -2163,7 +2163,7 @@ the storage mistake above wearing an API hat.
 Not yet built: git/secrets/cache data-plane services, the MCP gateway, skills,
 quality-gate hooks.
 
-### MCP gateway — governed tool capability (built; not yet offered to the sandbox)
+### MCP gateway — governed tool capability
 
 A data-plane service that speaks MCP to the sandbox on one side and to configured
 MCP servers on the other, exposing a **curated** tool set under per-tool
@@ -2254,14 +2254,12 @@ running sandbox, the agent-facing one as a **positive control** so that a silent
 axes themselves: presentation is ergonomics and can be wrong without granting anything,
 while execution is the boundary — so the half that cannot grant shipped first and was
 probed by hand (`make gateway-tools`, which dials the listener from a throwaway
-container on `sandbox-net`, the agent's own position). Both are now built:
-`tool-gateway/surface.py` decides what is shown and `tool-gateway/execute.py` decides
-what runs, with `tool-gateway/protocol.py` holding the wire and no I/O at all.
-
-What remains before an agent can use any of it is the launcher's `--mcp-config` entry
-(below), which is deliberately last: a tool surface that is offered before it works
-misleads the agent about its own capability, which is the same objection that rules out
-a runtime probe there.
+container on `sandbox-net`, the agent's own position). `tool-gateway/surface.py` decides
+what is shown, `tool-gateway/execute.py` decides what runs, and
+`tool-gateway/protocol.py` holds the wire with no I/O at all. The sandbox was pointed at
+it last, deliberately: a tool surface offered before it works misleads the agent about
+its own capability, which is the same objection that rules out a runtime probe in the
+launcher.
 
 **Nothing runs before the control plane has answered, and that is structural rather
 than asserted.** There is exactly one function in the gateway that dials a server, it
@@ -2811,6 +2809,17 @@ above — a server it adds has nothing behind it. The flag's real value is that 
 sandbox's tool surface is *reviewable in the repo* rather than accumulated in a
 volume.
 
+**Reaching the gateway takes three grants, not one, and two of them are invisible when
+missing.** The flags above are only the third. The sandbox needs a firewall `/32` to the
+gateway's agent leg — siblings are unreachable by default, per service and never as a
+subnet allow — and it needs the gateway **exempted from the proxy environment**. That
+second one is the trap: an MCP client that honours `HTTPS_PROXY` sends its requests to
+the egress proxy, whose relay guard hard-blocks private ranges, so the agent gets
+`egress denied by policy` for its own tool gateway. The error names the wrong component
+and describes a refusal governance never made. Both failures look like a gateway that is
+down, which is why `tests/test_sandbox_wiring.py` holds all three together — no single
+file can see more than one of them.
+
 **The flags belong in a root-owned wrapper on `PATH`, not in the `.bashrc.tier`
 alias.** An alias is only expanded by an interactive shell, so `claude -p` from a
 script or a hook would silently run without them — and `-p` is precisely where a
@@ -3347,7 +3356,7 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | tool policy UI — pick from the inventory, write allow/ask/deny, promote | **done** — every row in `tool_rules` now has an operator surface |
 | — | curated tool list on the agent leg — MCP listener, `tools/list` | **done** |
 | — | MCP gateway — per-tool allow/deny/ask on `tools/call`, the pending ask, `resume_tool_call` | **done** — no agent is pointed at it yet |
-| — | tell the sandbox it exists — `--mcp-config` + `--strict-mcp-config` from the launcher | planned (next) |
+| — | tell the sandbox it exists — firewall grant, proxy exemption, `--mcp-config` from a wrapper | **done** |
 
 The rationale for each shipped item lives under **Governance surfaces** above, not here
 — a status line goes stale, the reasoning does not. This section is deliberately the

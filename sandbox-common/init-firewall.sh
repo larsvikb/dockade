@@ -253,6 +253,26 @@ if [[ "$MODE" != "local" && "${EGRESS_PROXY_IP:-}" =~ ^[0-9.]+$ ]]; then
     echo "  egress proxy allowed -> $EGRESS_PROXY_IP:${EGRESS_PROXY_PORT:-8080}"
 fi
 
+# Sanctioned data-plane service: the MCP gateway, GOVERNED mode only. The one
+# service on sandbox-net the agent is supposed to dial directly rather than
+# through a proxy — it speaks MCP, not HTTP-to-the-internet, and it is the choke
+# point for tool capability the way the proxy is for network capability.
+#
+# Mode-gated for the reason the inference grant is, running the other way: tier 2
+# has no governed tool path and must not acquire one by being on the same network.
+# A tier-2 launcher never passes TOOL_GATEWAY_IP, and the $MODE test asserts that
+# here rather than trusting it (the same belt-and-braces as the proxy allow).
+#
+# Until this grant existed the sandbox had NO route to the gateway at all, which
+# is why boundary-check.sh's gateway section skipped: the probe could not tell a
+# stopped gateway from an ungranted path. With the grant, that section's positive
+# control runs and the two bind probes behind it stop being vacuous.
+if [[ "$MODE" = "governed" && "${TOOL_GATEWAY_IP:-}" =~ ^[0-9.]+$ ]]; then
+    iptables -A OUTPUT -p tcp -d "$TOOL_GATEWAY_IP" \
+        --dport "${TOOL_GATEWAY_PORT:-8100}" -j ACCEPT
+    echo "  tool gateway allowed -> $TOOL_GATEWAY_IP:${TOOL_GATEWAY_PORT:-8100}"
+fi
+
 # Sanctioned data-plane service: local LLM inference, for LOCAL mode only. This is
 # the per-service /32 the multi-container NOTE below anticipates — tighter than a
 # subnet allow, so the tier-2 agent reaches the inference service and NOTHING else

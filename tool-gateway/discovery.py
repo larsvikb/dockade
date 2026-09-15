@@ -276,6 +276,11 @@ def reconcile(entry: dict) -> dict:
             "exposed_but_unruled": sorted(set(exposed) - set(rules))}
 
 
+def _count(n: int, noun: str) -> str:
+    """``n`` of ``noun``, pluralised. Only regular nouns are passed to it."""
+    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
+
+
 def format_report(results: list[dict]) -> list[str]:
     """The report as lines, so the caller owns where it goes.
 
@@ -291,8 +296,12 @@ def format_report(results: list[dict]) -> list[str]:
         if result["status"] != "ok":
             lines.append(f"tool-gateway: {server}: NOT ENUMERATED — {result['status']}")
             continue
-        lines.append(f"tool-gateway: {server}: {result['exposed']} tools exposed, "
-                     f"{result['rules']} rules")
+        # Counted nouns, because both of these are routinely 1 — a server with one
+        # tool, and the first rule anyone writes. "1 rules" in the line an operator
+        # reads to check their own change landed is small, and it is exactly the sort
+        # of small that makes the rest of the sentence look unreviewed.
+        lines.append(f"tool-gateway: {server}: {_count(result['exposed'], 'tool')} "
+                     f"exposed, {_count(result['rules'], 'rule')}")
         if result["ruled_but_absent"]:
             lines.append(f"tool-gateway:   rules for tools the server does not expose "
                          f"(dead policy): {', '.join(result['ruled_but_absent'])}")

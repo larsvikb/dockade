@@ -75,7 +75,9 @@ const missing = ["lampState", "backoffDelay", "diffPending", "shouldSweep",
                  "toolRemaining", "payloadDisclosure", "toolOutcomeMessage",
                  "cardSubject",
                  "fmtTime", "fmtStamp", "fmtInstant",
-                 "serverDescriptor", "serverPreview", "serverEditBody"]
+                 "serverDescriptor", "serverPreview", "serverEditBody",
+                 "toolChoices", "toolRulePreview", "toolEditPreview",
+                 "toolRevokePreview", "toolRulesStatus"]
   .filter(n => typeof m[n] !== "function");
 const _row = {server: "mcp-github", enabled: false,
               auth: {type: "header", header: "Authorization",
@@ -100,6 +102,62 @@ console.log(JSON.stringify({
     edit_disable: m.serverEditBody(_row, false),
     edit_no_auth: m.serverEditBody({server: "s", enabled: true}, false),
   },
+  // The picker's join, and the previews written from it. Three servers, because the
+  // states that render identically as an empty tool list are the ones this has to keep
+  // apart: enumerated with tools, enumerated with none, and never enumerated at all.
+  toolpolicy: (() => {
+    const inventory = {
+      "mcp-github": { tools: ["issue_read", "issue_write"], read_only: ["issue_read"],
+                      unnameable: 1, enumerated: true, status: "", seen_at: 1 },
+      "mcp-cold": { tools: [], read_only: [], unnameable: 0, enumerated: false,
+                    status: "secret missing", seen_at: 2 },
+      "mcp-quiet": { tools: [], read_only: [], unnameable: 0, enumerated: true,
+                     status: "", seen_at: 3 },
+    };
+    const rules = [
+      { id: 1, server: "mcp-github", tool: "issue_read", action: "allow" },
+      // Ruled but not exposed — the gateway's `ruled_but_absent`, from this end.
+      { id: 2, server: "mcp-github", tool: "ghost", action: "deny" },
+      // A different server's rule, to catch a join that forgets to filter by server.
+      { id: 3, server: "mcp-quiet", tool: "issue_read", action: "allow" },
+    ];
+    const github = m.toolChoices("mcp-github", inventory, rules);
+    const cold = m.toolChoices("mcp-cold", inventory, rules);
+    return {
+      github,
+      cold,
+      quiet: m.toolChoices("mcp-quiet", inventory, rules),
+      unreported: m.toolChoices("mcp-new", inventory, rules),
+      none_picked: m.toolChoices("", inventory, rules),
+      // A rule on a server nobody has enumerated must NOT be reported absent: the
+      // server has not said it lacks the tool, nobody has been able to ask.
+      absent_while_cold: m.toolChoices("mcp-cold", inventory,
+        [{ id: 9, server: "mcp-cold", tool: "anything", action: "allow" }]).absent,
+      create_allow: m.toolRulePreview("mcp-github", "issue_write", "allow", rules),
+      create_ask: m.toolRulePreview("mcp-github", "issue_write", "ask", rules),
+      create_deny: m.toolRulePreview("mcp-github", "issue_write", "deny", rules),
+      create_conflict: m.toolRulePreview("mcp-github", "issue_read", "deny", rules),
+      create_redundant: m.toolRulePreview("mcp-github", "issue_read", "allow", rules),
+      create_no_server: m.toolRulePreview("", "issue_write", "allow", rules),
+      create_no_tool: m.toolRulePreview("mcp-github", "   ", "allow", rules),
+      // An action this page has never heard of must not fall through into a grant.
+      create_bogus_action: m.toolRulePreview("mcp-github", "issue_write", "sudo",
+                                             rules),
+      edit_promote: m.toolEditPreview(rules[1], "allow"),
+      edit_deny_to_ask: m.toolEditPreview(rules[1], "ask"),
+      edit_demote: m.toolEditPreview(rules[0], "ask"),
+      edit_unchanged: m.toolEditPreview(rules[0], "allow"),
+      edit_missing: m.toolEditPreview(undefined, "allow"),
+      edit_bogus_action: m.toolEditPreview(rules[0], "sudo"),
+      revoke_allow: m.toolRevokePreview(rules[0]),
+      revoke_deny: m.toolRevokePreview(rules[1]),
+      status_empty: m.toolRulesStatus(0, false, true),
+      status_stale: m.toolRulesStatus(3, true, true),
+      status_cold: m.toolRulesStatus(0, true, false),
+      status_quiet: m.toolRulesStatus(2, false, true),
+      rank: m.TOOL_ACTION_RANK,
+    };
+  })(),
   lamp: {
     down_idle: m.lampState(false, 0),
     down_busy: m.lampState(false, 3),
@@ -849,6 +907,180 @@ class PageScriptTests(unittest.TestCase):
         # A `header` descriptor with no template builds a header with no credential,
         # and the upstream answer is a 401 — indistinguishable from an expired token.
         self.assertFalse(self.probe["server"]["preview_half_custom"]["ok"])
+
+    # ── tool policy: the join, and the previews written from it ──────────────
+
+    def test_the_picker_separates_the_undecided_tools_from_the_ruled_ones(self):
+        # The whole point of the join. A tool a server exposes with no rule is denied
+        # AND is the one needing a human, so it cannot be mixed into one alphabetical
+        # list with the tools already decided.
+        github = self.probe["toolpolicy"]["github"]
+        self.assertEqual([t["tool"] for t in github["unruled"]], ["issue_write"])
+        self.assertEqual([t["tool"] for t in github["ruled"]], ["issue_read"])
+        self.assertEqual(github["ruled"][0]["action"], "allow")
+        # `readOnlyHint` is the server's own claim, carried because it is the one
+        # annotation a human choosing rules actually reads.
+        self.assertTrue(github["ruled"][0]["readOnly"])
+        self.assertFalse(github["unruled"][0]["readOnly"])
+
+    def test_the_join_is_scoped_to_one_server(self):
+        # `issue_read` is ruled on mcp-quiet too. A join that filtered only by tool
+        # name would report mcp-github's copy as decided by another server's rule.
+        quiet = self.probe["toolpolicy"]["quiet"]
+        self.assertEqual(quiet["unruled"], [])
+        self.assertEqual(quiet["ruled"], [])
+        # And the rule that names a tool the server does not offer is reported as
+        # absent rather than silently dropped.
+        self.assertEqual(quiet["absent"], ["issue_read"])
+
+    def test_a_rule_for_a_tool_the_server_does_not_offer_is_named(self):
+        # The gateway's `ruled_but_absent`, seen from the operator's end: such a rule
+        # decides nothing while reading in the table exactly like policy in force.
+        github = self.probe["toolpolicy"]["github"]
+        self.assertEqual(github["absent"], ["ghost"])
+        self.assertIn("ghost", github["note"])
+
+    def test_never_enumerated_is_not_the_same_as_exposing_nothing(self):
+        """Two empty tool lists that mean opposite things. `inventory.py` takes
+        deliberate trouble to keep them apart — a server the gateway could not ask
+        keeps its last known surface and says `enumerated: false` — and a picker that
+        collapsed them would tell an operator a server offers no tools at the exact
+        moment the real answer is that its credential is missing."""
+        tp = self.probe["toolpolicy"]
+        self.assertFalse(tp["cold"]["enumerated"])
+        self.assertTrue(tp["quiet"]["enumerated"])
+        self.assertIn("never been enumerated", tp["cold"]["note"])
+        self.assertNotIn("never been enumerated", tp["quiet"]["note"])
+        self.assertIn("offers no tools", tp["quiet"]["note"])
+        # The gateway's own word for why, carried verbatim — this is the state that
+        # otherwise reaches the operator as an empty list with no explanation.
+        self.assertIn("secret missing", tp["cold"]["note"])
+
+    def test_nothing_is_called_absent_before_the_server_has_been_asked(self):
+        # Every rule would look absent against a server nobody could enumerate, which
+        # would turn one credential problem into a list of apparently broken rules.
+        self.assertEqual(self.probe["toolpolicy"]["absent_while_cold"], [])
+
+    def test_a_server_the_gateway_has_not_reported_on_says_so(self):
+        # Distinct again from both empty cases: there is no entry at all, which on a
+        # freshly restarted control plane is the ordinary state for a few seconds.
+        tp = self.probe["toolpolicy"]
+        self.assertFalse(tp["unreported"]["known"])
+        self.assertIn("not reported", tp["unreported"]["note"])
+        self.assertIn("Pick a server", tp["none_picked"]["note"])
+
+    def test_the_names_it_could_not_store_are_counted_not_dropped_silently(self):
+        # `inventory._clean_tools` drops a name outside `policy._TOOL_RE` because no
+        # rule could name it. Showing fewer tools than the server has, without saying
+        # so, is the failure that count exists to prevent.
+        self.assertIn("1 name could not be written as a rule",
+                      self.probe["toolpolicy"]["github"]["note"])
+
+    def test_only_allow_is_flagged_as_the_loosening_direction(self):
+        # `ask` and `deny` both leave a call unable to proceed on its own, so neither
+        # grants anything the missing rule did not already withhold. `allow` is a
+        # standing grant with no hold behind it — the one worth a warning.
+        tp = self.probe["toolpolicy"]
+        self.assertTrue(tp["create_allow"]["danger"])
+        self.assertFalse(tp["create_ask"]["danger"])
+        self.assertFalse(tp["create_deny"]["danger"])
+        self.assertTrue(all(tp[k]["ok"] for k in
+                            ("create_allow", "create_ask", "create_deny")))
+
+    def test_an_unknown_action_previews_as_the_safest_one(self):
+        # The same default createPreview takes: a preview showing `deny` where `allow`
+        # was meant is caught by the operator; the reverse is what this step prevents.
+        tp = self.probe["toolpolicy"]
+        self.assertEqual(tp["create_bogus_action"]["action"], "deny")
+        self.assertFalse(tp["create_bogus_action"]["danger"])
+        self.assertEqual(tp["edit_bogus_action"]["action"], "deny")
+
+    def test_an_existing_rule_is_not_replaced_by_adding_another(self):
+        # The backend answers 409 and says nothing here replaces a rule; the preview
+        # mirrors it because the fix — revoke or move that row — is on screen already.
+        tp = self.probe["toolpolicy"]
+        self.assertFalse(tp["create_conflict"]["ok"])
+        self.assertTrue(tp["create_conflict"]["conflict"])
+        self.assertEqual(tp["create_conflict"]["existing"], "allow")
+        # An identical rule is a 200 that writes nothing, which is easy to misread as
+        # a write — so it is refused here rather than sent.
+        self.assertFalse(tp["create_redundant"]["ok"])
+        self.assertTrue(tp["create_redundant"]["redundant"])
+
+    def test_nothing_selected_yet_is_not_an_error(self):
+        # Reachable without any typing: a server that has reported no tools leaves the
+        # picker empty, so the selection is "". Silence is the right answer — an error
+        # shown before anything has failed is simply wrong, and the note beside the
+        # form is where that state is explained.
+        tp = self.probe["toolpolicy"]
+        self.assertEqual(tp["create_no_tool"]["text"], "")
+        self.assertFalse(tp["create_no_tool"]["ok"])
+        # A missing SERVER does say something, because the picker should never be
+        # empty unless nothing is registered.
+        self.assertIn("Pick the server", tp["create_no_server"]["text"])
+
+    def test_an_edit_describes_the_transition_and_ranks_the_direction(self):
+        """Three actions, so "is it an allow?" is not the question — deny → ask is a
+        loosening too, and a confirm that flagged only `allow` would wave it through.
+        """
+        tp = self.probe["toolpolicy"]
+        self.assertEqual(tp["rank"], {"deny": 0, "ask": 1, "allow": 2})
+        self.assertTrue(tp["edit_promote"]["danger"])
+        self.assertTrue(tp["edit_deny_to_ask"]["danger"])
+        self.assertFalse(tp["edit_demote"]["danger"])
+        # Both ends named, as the audit row names them: "will allow" alone describes a
+        # row, not what changes about the world.
+        self.assertIn("denies now", tp["edit_promote"]["text"])
+        self.assertIn("allow instead", tp["edit_promote"]["text"])
+
+    def test_an_edit_that_changes_nothing_says_so(self):
+        tp = self.probe["toolpolicy"]
+        self.assertTrue(tp["edit_unchanged"]["unchanged"])
+        self.assertFalse(tp["edit_unchanged"]["ok"])
+        # The row went away under the button — revoked in another tab. Said out loud
+        # rather than left as a click that silently does nothing.
+        self.assertFalse(tp["edit_missing"]["ok"])
+        self.assertIn("no longer in the table", tp["edit_missing"]["text"])
+
+    def test_revoking_a_tool_rule_is_never_the_dangerous_direction(self):
+        """The one place this differs from revoking an EGRESS rule, and the reason
+        `toolRevokePreview` is its own function rather than a reworded copy: removing
+        an egress block returns a host to being held, and therefore to being approvable
+        by someone who never knew it had been refused. Removing a tool rule returns the
+        tool to unconfigured, which denies."""
+        tp = self.probe["toolpolicy"]
+        self.assertFalse(tp["revoke_allow"]["danger"])
+        self.assertFalse(tp["revoke_deny"]["danger"])
+        self.assertIn("take capability away", tp["revoke_allow"]["text"])
+        # Revoking a DENY changes nothing the gateway will do, so the sentence has to
+        # be about the record instead: "reviewed and refused" becomes "never looked at",
+        # which is the whole reason an explicit deny row is worth writing.
+        self.assertIn("denied either way", tp["revoke_deny"]["text"])
+        self.assertIn("never looked at", tp["revoke_deny"]["text"])
+
+    def test_the_verbs_are_conjugated(self):
+        # "denys" in a confirm dialog is the kind of thing that makes an operator
+        # distrust the sentence they are being asked to agree to.
+        tp = self.probe["toolpolicy"]
+        for key in ("edit_promote", "edit_unchanged", "create_conflict",
+                    "create_redundant", "revoke_deny"):
+            with self.subTest(preview=key):
+                self.assertNotIn("denys", tp[key]["text"])
+
+    def test_an_empty_tool_policy_says_everything_is_denied(self):
+        """Not the egress wording with a noun swapped: an empty egress policy holds
+        every request for a human, an empty TOOL policy refuses every call outright.
+        One says a queue is coming, the other says nothing will ever arrive."""
+        tp = self.probe["toolpolicy"]
+        self.assertTrue(tp["status_empty"]["show"])
+        self.assertIn("denied", tp["status_empty"]["text"])
+        self.assertNotIn("held", tp["status_empty"]["text"].split("rather than")[0])
+        # Stale outranks empty, and says what is at stake: this table is what the
+        # gateway is enforcing.
+        self.assertEqual(tp["status_stale"]["level"], "warn")
+        self.assertEqual(tp["status_cold"]["level"], "warn")
+        # Rows and no failure is the ordinary state, and says nothing at all.
+        self.assertFalse(tp["status_quiet"]["show"])
 
     def test_the_lamp_treats_being_blind_as_worse_than_being_busy(self):
         lamp = self.probe["lamp"]
@@ -2514,7 +2746,14 @@ class PollGatingSourceTests(unittest.TestCase):
         # The polls that are SKIPPED while hidden, so returning has to catch each of
         # them up. Derived from the source rather than listed, so a fourth one cannot
         # be added to the intervals and forgotten here.
-        gated = set(re.findall(r"if \(visible\(\)\) (\w+)\(\); \}, \d+\);", self.src))
+        #
+        # The condition is matched as `visible()` plus ANYTHING, because a poll may be
+        # gated on more than visibility — the inventory is also gated on its view being
+        # the one on screen. A pattern insisting on `visible()` alone would have
+        # stopped covering exactly the newest poll, silently, which is the failure this
+        # guard exists to catch in the first place.
+        gated = set(re.findall(r"if \(visible\(\)[^)]*\) (\w+)\(\);\s*\}, \d+\);",
+                               self.src))
         self.assertTrue(gated, "no visibility-gated polls found — did they change?")
         for fn in sorted(gated):
             self.assertIn(f"{fn}()", handler.group(0),
@@ -2807,6 +3046,99 @@ class EditRuleSourceTests(unittest.TestCase):
                             self.src, re.S)
         self.assertIsNotNone(current, "currentPreview not found — renamed?")
         self.assertIn("rulesById.get(editingRuleId)", current.group(1))
+
+
+class ToolPolicySourceTests(unittest.TestCase):
+    """The tool-policy renderer and its poll live in `start()`, so the parts that
+    would fail SILENTLY are asserted against the source — the same approach the
+    decisions and policy tables take."""
+
+    def setUp(self):
+        self.src = APP_JS.read_text()
+        self.rows = _fn_body(self.src, "renderToolRules(rows)")
+        self.poll = _fn_body(self.src, "refreshToolRules()")
+        self.picker = _fn_body(self.src, "renderToolPicker()")
+        self.preview = _fn_body(self.src, "renderToolRulePreview()")
+
+    def test_a_tool_name_can_only_be_PICKED_never_typed(self):
+        """The invariant the whole step rests on: a rule can only name a tool some
+        server has actually claimed, so **no grant can precede an observation**. A
+        free-text field would be the one path by which an `allow` could stand waiting
+        for a tool to appear and permit it the moment it did, with no human in the loop
+        at that point — and it would put `ruled_but_absent` back within one typo's
+        reach, which is what this surface exists to stop.
+
+        Asserted against the MARKUP, because that is where it would come back: the
+        script cannot offer a field the page does not have, and a text input is a
+        one-line addition that nothing else here would notice."""
+        html = INDEX_HTML.read_text()
+        form = re.search(r'<form[^>]*id="toolrule-form".*?</form>', html, re.S)
+        self.assertIsNotNone(form, "the tool-rule form is gone — renamed?")
+        self.assertNotIn("<input", form.group(0),
+                         "the tool-rule form takes no free text: a tool name is picked "
+                         "from what a server reported, or no rule is written")
+        # Two selects and a button, and nothing else that could carry a name.
+        self.assertEqual(form.group(0).count("<select"), 3)
+
+    def test_the_picker_is_disabled_rather_than_empty_when_nothing_is_reported(self):
+        # The state this form cannot write its way out of, now that there is no typing:
+        # an empty box that still looks clickable would read as the page being broken
+        # rather than as the server not having answered. The note says which it is.
+        self.assertIn("toolRuleTool.disabled = choices.names.length === 0", self.picker)
+        self.assertIn("toolRuleTool.disabled", self.preview,
+                      "the add button must be off whenever the picker has nothing to "
+                      "pick, or the form offers a write it cannot compose")
+
+    def test_the_table_and_the_picker_never_build_markup_from_strings(self):
+        """Every name rendered here is SERVER-AUTHORED — a third party's answer to
+        `tools/list`, relayed through the gateway. `policy._TOOL_RE` bounds the ones
+        that reach `tool_rules`, but the picker also draws names straight from the
+        inventory, which is bounded only by that same charset and by nothing at all
+        for the surrounding text.
+
+        An escaped template would be correct today and one careless edit from not
+        being; `textContent` cannot be got wrong later. Asserted rather than trusted
+        because the neighbouring egress table does use `innerHTML`, so the safe
+        pattern here is the local exception and reads like an oversight."""
+        for name, body in (("table", self.rows), ("picker", self.picker)):
+            with self.subTest(render=name):
+                self.assertNotIn("innerHTML", body)
+                self.assertIn("textContent", body)
+
+    def test_a_failed_refresh_keeps_the_rules_and_reports_the_staleness(self):
+        # An empty tool policy is a sentence meaning "every call is denied". Rendering
+        # it because a poll failed would state the opposite of what is in force, on the
+        # one table that says what the gateway lets through.
+        self.assertIn("toolRulesFailed = true", self.poll)
+        self.assertNotRegex(self.poll, r"catch[\s\S]*?toolRules\s*=\s*\[\]",
+                            "a failed poll must not blank the table")
+        self.assertRegex(self.poll, r"if\s*\(!res\.ok\)\s*throw")
+
+    def test_a_recovered_poll_clears_the_warning(self):
+        self.assertIn("toolRulesFailed = false", self.poll)
+        self.assertIn("toolRulesLoaded = true", self.poll)
+
+    def test_the_submitted_rule_is_the_one_that_was_previewed(self):
+        """The confirm has to have been about the rule that lands. Re-reading the
+        controls after `confirm()` returns would be a second derivation of a value the
+        operator has already been shown — the same trap the egress form's
+        `client_class` fell into."""
+        handler = re.search(r'toolRuleForm\.addEventListener\("submit"[\s\S]*?\n  \}\);',
+                            self.src)
+        self.assertIsNotNone(handler, "the tool-rule submit handler is gone")
+        body = handler.group(0)
+        self.assertIn("server: p.server", body)
+        self.assertIn("tool: p.tool", body)
+        self.assertIn("action: p.action", body)
+
+    def test_writing_a_rule_refreshes_the_server_table_too(self):
+        # The servers table counts rules per server, so it is stale the moment a tool
+        # rule lands. Two handlers write rules and both have to say so.
+        for handler in (r'toolRuleForm\.addEventListener\("submit"[\s\S]*?\n  \}\);',
+                        r'toolRulesBody\.addEventListener\("click"[\s\S]*?\n  \}\);'):
+            found = re.search(handler, self.src)
+            self.assertIsNotNone(found, f"{handler} no longer matches")
+            self.assertIn("refreshServers()", found.group(0))
 
 
 class PersistConflictSourceTests(unittest.TestCase):

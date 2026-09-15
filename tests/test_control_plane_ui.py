@@ -314,7 +314,17 @@ class RelayAllowlistTests(unittest.TestCase):
                              ("api/mcp/servers", "GET"),
                              ("api/mcp/servers", "POST"),
                              ("api/mcp/servers/mcp-github/edit", "POST"),
-                             ("api/mcp/servers/mcp-github/revoke", "POST")):
+                             ("api/mcp/servers/mcp-github/revoke", "POST"),
+                             # Tool policy. The inventory is read-only and decides
+                             # nothing; the rule writes do decide, and `POST
+                             # api/mcp/rules` with an `allow` is the widest grant on
+                             # this list by consequence — the agent calls that tool
+                             # with no hold and no click.
+                             ("api/mcp/inventory", "GET"),
+                             ("api/mcp/rules", "GET"),
+                             ("api/mcp/rules", "POST"),
+                             ("api/mcp/rules/12/edit", "POST"),
+                             ("api/mcp/rules/12/revoke", "POST")):
             self._proxy(path, method)
             self.assertEqual(urlsplit(_sent["url"]).netloc, "control-plane:8090",
                              f"{method} {path} must relay")
@@ -383,7 +393,22 @@ class RelayAllowlistTests(unittest.TestCase):
                              # notices the old one still works. See "URLs carry the
                              # surface" in DESIGN.md.
                              ("api/rules", "GET"),
-                             ("api/rules/12/revoke", "POST")):
+                             ("api/rules/12/revoke", "POST"),
+                             # The tool-rule paths carry the same digit bound as the
+                             # egress ones, for the same traversal reason, and it is
+                             # asserted separately because the two entries are separate
+                             # regexes — a loosened copy of a bounded pattern is exactly
+                             # the drift a shared assertion would hide.
+                             ("api/mcp/rules/../revoke", "POST"),
+                             ("api/mcp/rules/1.2/edit", "POST"),
+                             ("api/mcp/rules/abc/edit", "POST"),
+                             ("api/mcp/rules//revoke", "POST"),
+                             ("api/mcp/rules/12/revoke", "GET"),
+                             ("api/mcp/rules/12", "POST"),
+                             # The inventory is a READ of third-party text. A write to
+                             # it would be a browser pushing a server's surface into the
+                             # control plane, which only the gateway may do.
+                             ("api/mcp/inventory", "POST")):
             resp = self._proxy(path, method)
             self.assertEqual(getattr(resp, "status_code", None), 403,
                              f"{method} {path} must be refused")

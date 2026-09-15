@@ -51,7 +51,7 @@ class RecordTests(unittest.TestCase):
         # prints is more use than a partial picture nobody can tell is partial.
         too_many = {"servers": {f"s{n}": {"status": "ok", "tools": []}
                                 for n in range(self.inv.MAX_SERVERS + 1)}}
-        with self.assertRaises(ValueError) as caught:
+        with self.assertRaises(self.inv.InventoryError) as caught:
             self.inv.record(too_many)
         self.assertIn("cap", str(caught.exception))
 
@@ -91,7 +91,7 @@ class RecordTests(unittest.TestCase):
 
     def test_a_malformed_payload_is_refused_rather_than_ignored(self):
         for bad in ({}, {"servers": []}, {"servers": "nope"}):
-            with self.subTest(payload=bad), self.assertRaises(ValueError):
+            with self.subTest(payload=bad), self.assertRaises(self.inv.InventoryError):
                 self.inv.record(bad)
 
     def test_a_snapshot_is_a_copy(self):

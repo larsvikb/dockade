@@ -39,6 +39,22 @@ import policy
 MAX_SERVERS = 64
 MAX_TOOLS_PER_SERVER = 256
 
+class InventoryError(ValueError):
+    """A push the gateway must be TOLD about rather than have silently dropped.
+
+    Same contract as ``audit.FilterError``, and for the same reason. **The message is
+    served VERBATIM to the caller**, so interpolate only what the caller already has —
+    their own payload's shape, and this module's constants. Nothing read from the
+    store, the filesystem, or an underlying exception belongs in one; that is what
+    keeps the 400 a validation sentence rather than a disclosure.
+
+    TYPED rather than a bare ``ValueError`` so ``app.py`` can catch exactly the errors
+    written to be read, and let anything unexpected become a 500 with no body. A code
+    scanning rule flags ``str(exc)`` reaching a response from the shape alone, and this
+    is what makes the difference between a finding and a false positive real rather
+    than argued — it holds only as long as every raise site below honours it."""
+
+
 _LOCK = threading.Lock()
 #: server -> {"tools": [name, ...], "read_only": [name, ...], "status": str,
 #:            "unnameable": int, "seen_at": float}
@@ -142,9 +158,9 @@ def record(payload: dict) -> tuple[dict, list[str]]:
     means something is broken rather than something is busy."""
     servers = payload.get("servers")
     if not isinstance(servers, dict):
-        raise ValueError("inventory payload has no 'servers' object")
+        raise InventoryError("inventory payload has no 'servers' object")
     if len(servers) > MAX_SERVERS:
-        raise ValueError(
+        raise InventoryError(
             f"{len(servers)} servers reported, over the {MAX_SERVERS} cap — refusing "
             f"the whole payload rather than storing a partial picture")
 

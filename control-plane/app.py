@@ -908,10 +908,16 @@ def tool_inventory(req: InventoryRequest, request: Request) -> JSONResponse:
     one in the log."""
     try:
         _, moved = inventory.record({"servers": req.servers or {}})
-    except ValueError as exc:
+    except inventory.InventoryError as exc:
         # A refusal the gateway can print. Not a 500: this is a well-formed request
         # carrying something out of bounds, and the sender needs to say so in its log
         # rather than retry it every poll.
+        #
+        # The TYPE is the point, not the 400. `InventoryError` carries a contract that
+        # its message holds only the caller's own payload shape and this module's
+        # constants, so serving it verbatim discloses nothing; anything else raised in
+        # there is unexpected and becomes a 500 with no body, rather than having its
+        # text relayed. Same arrangement as `audit.FilterError` and `_bad_filter`.
         return JSONResponse({"ok": False, "detail": str(exc)}, status_code=400)
     for line in moved:
         store._audit("observe", stage="mcp-tools", client=_actor(request), reason=line)

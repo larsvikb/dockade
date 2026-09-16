@@ -66,7 +66,14 @@ EVENT_SEARCH = ("host", "client", "client_class", "reason", "method", "url")
 # all) are exactly what has to be here, or the interface still cannot answer "which
 # request was it".
 EVENT_COLUMNS = ("id", "ts", "decision", "stage", "host", "port", "proto", "client",
-                 "client_class", "method", "url", "reason")
+                 "client_class", "method", "url", "reason",
+                 # The tool columns, for the same reason ``url`` is here: this is the
+                 # view that answers "which one was it", and the tool rows' identity —
+                 # which server, which tool, which approval — is not in any of the
+                 # columns above. Not added to ``EVENT_SEARCH``: a view searches what it
+                 # DISPLAYS, and the ``reason`` prose that names them is searched
+                 # already, so adding these would only make the same row match twice.
+                 "server", "tool", "approval_id")
 
 # Bound on the search needle. Not a security control — the store's own write cap
 # (``store.DRAIN_MAX_FIELD``) is what keeps the COLUMNS bounded — but a LIKE pattern

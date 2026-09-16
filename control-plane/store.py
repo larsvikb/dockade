@@ -47,7 +47,7 @@ LEGACY_CLIENT_CLASS = "sandbox"
 # The schema this code expects. Every entry in ``_STEPS`` below adds exactly one,
 # and a store records the version it is at (see ``_migrate``), so "what has already
 # run here" is a number to compare rather than a schema to interrogate.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _connect() -> sqlite3.Connection:
@@ -192,6 +192,29 @@ def _step_2_leases(conn: sqlite3.Connection) -> None:
     conn.execute(_LEASES_DDL)
 
 
+def _step_3_tool_correlation(conn: sqlite3.Connection) -> None:
+    """v3 — tool decisions become joinable: ``audit`` gains ``server``, ``tool`` and
+    ``approval_id`` (the DDL in ``_init_db`` carries the reasoning).
+
+    Three ``ALTER TABLE ADD COLUMN``s and nothing else, which is the cheapest step
+    shape after ``_step_2_leases``: no constraint changes, so none of the twelve-step
+    rebuild ``_step_1_client_class`` needed. The loop and the message are modelled on
+    that step's own tail, which added ``client_class`` to these same tables.
+
+    Existing rows keep NULL and are NOT backfilled. The values are derivable from
+    ``reason`` prose for some of them — but only some, and only by parsing a sentence
+    that has been reworded before. A column filled by re-reading old prose would put a
+    claim in the audit trail that nothing observed, which is the same objection that
+    kept ``client_class`` from being backfilled to a wildcard."""
+    added = [column for column in ("server", "tool", "approval_id")
+             if column not in _columns(conn, "audit")]
+    for column in added:
+        conn.execute(f"ALTER TABLE audit ADD COLUMN {column} TEXT")
+    if added:
+        print(f"control-plane: added {', '.join(added)} to audit (existing rows keep "
+              f"NULL — they predate tool correlation)", flush=True)
+
+
 # Ordered, and the order is the only thing that decides what runs: a step is applied
 # when its version exceeds the store's, so steps must be APPEND-ONLY and never
 # renumbered, reordered or edited once shipped — a store in the field has already run
@@ -200,6 +223,7 @@ def _step_2_leases(conn: sqlite3.Connection) -> None:
 _STEPS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = (
     (1, "per-client-class policy", _step_1_client_class),
     (2, "timed grants (leases)", _step_2_leases),
+    (3, "tool correlation columns", _step_3_tool_correlation),
 )
 
 
@@ -354,7 +378,26 @@ def _init_db() -> None:
                 client_class TEXT,
                 method   TEXT,
                 url      TEXT,
-                reason   TEXT
+                reason   TEXT,
+                -- The TOOL columns. Everything above is egress vocabulary, and tool
+                -- decisions used to borrow it by writing "issue_read on mcp-github:
+                -- ..." into `reason` — which reads fine and joins to nothing. These
+                -- three exist so the trail can be QUERIED rather than grepped: which
+                -- rows concern one server, and which rows belong to one approval.
+                --
+                -- `approval_id` is the one that earns the set. A tool ask writes rows
+                -- at four separate moments (the hold, the human's click, the claim,
+                -- and — once the gateway's stream lands — how the call ended), and
+                -- without a column they are joinable only by parsing prose, so the UI
+                -- cannot put an outcome on the card that produced it.
+                --
+                -- NULL on every egress row and on every tool row written before v3,
+                -- for the reason `client_class` is nullable: these are records, not
+                -- constraints, and a row that predates the column genuinely has no
+                -- value for it.
+                server       TEXT,
+                tool         TEXT,
+                approval_id  TEXT
             )""")
         conn.execute("CREATE INDEX IF NOT EXISTS audit_ts ON audit(ts)")
         # This table grows without bound — every decision is kept, and only
@@ -513,20 +556,28 @@ def _audit(decision: str, **fields) -> None:
     with _connect() as conn:
         conn.execute(
             "INSERT INTO audit(ts, decision, stage, host, port, proto, client, "
-            "client_class, method, url, reason) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "client_class, method, url, reason, server, tool, approval_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (time.time(), decision, cap(fields.get("stage")), cap(fields.get("host")),
              fields.get("port"), cap(fields.get("proto")), cap(fields.get("client")),
              cap(fields.get("client_class")),
-             cap(fields.get("method")), cap(fields.get("url")), cap(fields.get("reason"))))
+             cap(fields.get("method")), cap(fields.get("url")), cap(fields.get("reason")),
+             cap(fields.get("server")), cap(fields.get("tool")),
+             cap(fields.get("approval_id"))))
         conn.commit()
     # Mirror every decision to stdout so `docker compose logs -f control-plane`
     # (make logs-cp) is a live decision feed — the same role the egress proxy's
     # stdout audit plays. The SQLite table above stays the durable, queryable
     # record (served at /api/audit); this line is for live viewing only. Compact
     # and greppable: one line, empty fields omitted, reason after a ' :: '.
+    # The tool columns are mirrored too, so a grep for one approval id finds every row
+    # that belongs to it in the live feed — which is the whole point of the columns and
+    # would be lost if the stdout stream still only carried the id inside prose on the
+    # one row whose sentence happens to name it.
     shown = " ".join(
         f"{k}={fields[k]}" for k in
-        ("stage", "host", "port", "proto", "client", "client_class", "method", "url")
+        ("stage", "host", "port", "proto", "client", "client_class", "method", "url",
+         "server", "tool", "approval_id")
         if fields.get(k) is not None)
     reason = fields.get("reason")
     print(f"AUDIT {decision} {shown}" + (f" :: {reason}" if reason else ""),

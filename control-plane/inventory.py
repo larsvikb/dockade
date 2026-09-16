@@ -92,8 +92,13 @@ def _clean_tools(raw: list) -> tuple[list[str], list[str], int]:
     return sorted(names), sorted(read_only), unnameable
 
 
-def changes(before: dict, after: dict) -> list[str]:
-    """One line per server whose exposed tools moved, ready for the audit.
+def changes(before: dict, after: dict) -> list[tuple[str, str]]:
+    """One ``(server, line)`` per server whose exposed tools moved, for the audit.
+
+    The name is returned BESIDE the line rather than left to be read out of it. The
+    line names the server too — it has to, being what a human reads — but the caller
+    writes an ``audit.server`` column from this, and re-deriving a column by parsing a
+    sentence is exactly what that column exists to stop.
 
     NAMES, not prose. A tool name is charset-bounded by ``policy._TOOL_RE``; a
     description is unbounded text a third party wrote, and this is the one part of the
@@ -132,7 +137,7 @@ def changes(before: dict, after: dict) -> list[str]:
             # when the gateway first reported a server is worth a row; counted rather
             # than enumerated, because the names are only interesting as a DELTA and
             # the inventory itself is where the full list is read.
-            lines.append(f"{server} first seen exposing {len(now)} tool(s)")
+            lines.append((server, f"{server} first seen exposing {len(now)} tool(s)"))
             continue
         added, gone = sorted(now - was), sorted(was - now)
         parts = []
@@ -140,11 +145,11 @@ def changes(before: dict, after: dict) -> list[str]:
             parts.append(f"now exposes {', '.join(added)}")
         if gone:
             parts.append(f"no longer exposes {', '.join(gone)}")
-        lines.append(f"{server} {' and '.join(parts)}")
+        lines.append((server, f"{server} {' and '.join(parts)}"))
     return lines
 
 
-def record(payload: dict) -> tuple[dict, list[str]]:
+def record(payload: dict) -> tuple[dict, list[tuple[str, str]]]:
     """Replace the inventory wholesale. Returns the stored view and what changed.
 
     A SNAPSHOT, not a delta. The gateway computes the whole picture every pass, so a

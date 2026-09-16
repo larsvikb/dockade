@@ -87,7 +87,19 @@ class DiscoveryError(Exception):
 
     Carried rather than raised through: one unreachable server must not stop the
     others being reported, and "unreachable" is itself a finding an operator wants to
-    see next to the rest."""
+    see next to the rest.
+
+    ``kind`` exists for the OUTCOME audit and for nothing else. Every caller here does
+    the same thing with this exception — report it and move on — so it does not need
+    subclasses; what the record needs is one bit the message cannot be trusted to
+    carry. A timeout and a refused connection are both "no answer", but only one of
+    them may have LANDED upstream, and for an approved write that is the difference
+    between "it did not happen" and "it might have". Reading that back out of the
+    message text would be the same prose-parsing the audit columns exist to avoid."""
+
+    def __init__(self, message: str, kind: str = "transport-error"):
+        super().__init__(message)
+        self.kind = kind
 
 
 def fetch_roster() -> list[dict]:
@@ -228,13 +240,25 @@ def post(server: str, message: dict, auth: dict, timeout: float | None = None) -
     request = urllib.request.Request(
         f"http://{check_name(server)}:{MCP_PORT}{MCP_PATH}",
         data=json.dumps(message).encode(), headers=headers)
+    # Resolved once, because the timeout REFUSAL names it: a record saying "no answer
+    # within None" would be worse than one that said nothing.
+    deadline = TIMEOUT if timeout is None else timeout
     try:
-        with urllib.request.urlopen(  # noqa: S310
-                request, timeout=TIMEOUT if timeout is None else timeout) as response:
+        with urllib.request.urlopen(request, timeout=deadline) as response:  # noqa: S310
             return response.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
         raise DiscoveryError(f"HTTP {exc.code} from {server} — {exc.reason}") from exc
     except (urllib.error.URLError, OSError) as exc:
+        # TIMEOUT SEPARATED FIRST, because it is the only one of these that leaves the
+        # call's fate unknown: the request was sent and the answer never came, so an
+        # approved write may well have landed. urlopen surfaces it either bare (it is
+        # an OSError subclass) or wrapped in URLError, and both spellings occur — the
+        # wrapped one on a connect timeout, the bare one on a read timeout.
+        timed_out = isinstance(exc, TimeoutError) or isinstance(
+            getattr(exc, "reason", None), TimeoutError)
+        if timed_out:
+            raise DiscoveryError(f"no answer from {server} within {deadline}s",
+                                 kind="timeout") from exc
         raise DiscoveryError(f"unreachable: {exc}") from exc
 
 

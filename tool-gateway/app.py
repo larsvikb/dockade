@@ -56,6 +56,7 @@ import time
 
 import discovery
 import execute
+import outcomes
 import protocol
 import surface
 from fastapi import FastAPI, Request
@@ -300,6 +301,11 @@ def main() -> None:
     ps` as a restart loop, which is the intended operator experience for a
     configuration that cannot be served safely."""
     _assert_bind_is_agent_facing_only()
+    # BEFORE the listener too, and for the same reason the bind guard is: a configured
+    # audit path that cannot be opened is a misconfiguration, and a gateway that served
+    # tool calls while failing to record how they ended would be the quiet version of
+    # the gap this stream exists to close. Raises; `restart: always` makes it visible.
+    outcomes.setup()
 
     # Imported here rather than at module scope so the module stays importable by
     # the test suite without pulling in the server. Same reason control-plane/app.py
@@ -307,7 +313,8 @@ def main() -> None:
     import uvicorn
 
     print(f"tool-gateway: serving the agent-facing MCP endpoint on "
-          f"{AGENT_BIND}:{AGENT_PORT} (this address only)", flush=True)
+          f"{AGENT_BIND}:{AGENT_PORT} (this address only); {outcomes.describe()}",
+          flush=True)
 
     # Started AFTER the guard and before the listener. A daemon thread rather than a
     # FastAPI startup hook: the work is blocking stdlib HTTP, so on the event loop it

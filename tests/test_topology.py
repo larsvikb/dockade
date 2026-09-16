@@ -727,6 +727,63 @@ class GatewayPlacementTests(unittest.TestCase):
         self.assertEqual(pins(gw), pins(cp))
 
 
+class OutcomeStreamWiringTests(unittest.TestCase):
+    """The volume the gateway writes and the control plane drains.
+
+    The one property that cannot be seen from either process. The gateway opens a path
+    and the control plane opens a path, and nothing in either checks that they are the
+    same volume, or that only one of them can write to it. A mismatch produces no error
+    anywhere: the gateway records happily, the ingest finds no file, and the outcome
+    column is simply always empty — the exact failure the stream exists to remove,
+    wearing a working system as a disguise."""
+
+    MOUNT = "/var/log/tool-gateway"
+
+    def _mounts(self, service: str) -> list[str]:
+        return [line.strip().lstrip("- ") for line in _service(service)
+                if line.strip().startswith("- tool-audit:")]
+
+    def test_the_gateway_mounts_it_writable(self):
+        # It is the writer. A `:ro` here would be a gateway that starts, serves tool
+        # calls and fails on the first record — after the call has already happened.
+        mounts = self._mounts("tool-gateway")
+        self.assertEqual(mounts, [f"tool-audit:{self.MOUNT}"])
+
+    def test_nothing_else_touches_it(self):
+        # ONE writer, and when the control plane starts draining this it joins as a
+        # reader with `:ro` — the arrangement the egress proxy's audit volume already
+        # has. A second writer would make the ingest's inode-following cursor
+        # ambiguous about whose records it is draining.
+        for service in _service_names():
+            if service == "tool-gateway":
+                continue
+            with self.subTest(service=service):
+                self.assertEqual(self._mounts(service), [])
+
+    def test_the_gateway_writes_inside_the_volume_it_mounts(self):
+        # The default path and the mount are written in two files with nothing but
+        # this between them. A default outside the mount still WORKS — it lands on the
+        # container filesystem — so the gateway looks healthy while every record dies
+        # with the container.
+        source = (ROOT / "tool-gateway" / "outcomes.py").read_text()
+        default = re.search(
+            r'^AUDIT_PATH = os\.environ\.get\(\s*"[A-Z_]+",\s*"([^"]+)"',
+            source, re.M)
+        self.assertIsNotNone(default, "outcomes.py no longer names AUDIT_PATH")
+        self.assertTrue(default.group(1).startswith(self.MOUNT + "/"),
+                        "the gateway's outcome stream defaults outside the volume it "
+                        "mounts, so records would not survive the container")
+
+    def test_the_gateways_image_creates_the_directory(self):
+        # A fresh named volume inherits ownership and mode from the image path it
+        # covers. Without this the volume is root-owned, and compose runs this service
+        # as the INVOKING USER — so the first record fails on a permission error that
+        # names a log file rather than the mount that caused it.
+        dockerfile = (ROOT / "tool-gateway" / "Dockerfile").read_text()
+        self.assertRegex(dockerfile, rf"mkdir -p {self.MOUNT}")
+        self.assertRegex(dockerfile, rf"chmod 1777 {self.MOUNT}")
+
+
 class RestartPolicyTests(unittest.TestCase):
     """`always` on the substrate, `unless-stopped` on the optional tier-2 model
     server. The line is not stylistic: the two policies differ in exactly one case

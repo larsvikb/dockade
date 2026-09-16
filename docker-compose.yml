@@ -137,6 +137,13 @@ networks:
 volumes:
   egress-audit:
     name: dockade-egress-audit
+  # The tool gateway's OUTCOME stream — how each tool call ended, which only the
+  # gateway can know (its authority's claim row is written before the call). Its own
+  # volume rather than a share of `egress-audit`: two writers on one file would make
+  # the control plane's inode-following ingest cursor ambiguous, and the two streams
+  # rotate on independent schedules.
+  tool-audit:
+    name: dockade-tool-audit
   # The policy + audit SQLite store — the crown-jewel state (DESIGN.md). Kept in
   # its own named volume so it survives container/image churn and is backed up
   # independently.
@@ -566,6 +573,11 @@ services:
       # (tests/test_topology.py). The Makefile exports the real, XDG-aware path; the
       # in-repo default is the fallback for a hand-run compose and is gitignored.
       - ${MCP_SECRETS:-./secrets}:/run/dockade/secrets:ro
+      # The outcome stream this service WRITES and the control plane reads. Writable
+      # here and read-only there, which is the same arrangement — and the same reason —
+      # as the egress proxy's audit volume: the component that made the record owns it,
+      # and the reader must not be able to rewrite the evidence it is reading.
+      - tool-audit:/var/log/tool-gateway
     healthcheck:
       # Dials the PINNED ADDRESS, not loopback, because the listener binds one
       # address and loopback is not it. Read out of the environment rather than

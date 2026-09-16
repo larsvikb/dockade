@@ -2728,6 +2728,27 @@ card names the gap instead.
   it can name tools (see the presentation/execution split above). The audit must
   therefore record the response side, at minimum size and hash, because the forensic
   question is *what entered the agent's context*.
+- **A record written after an irreversible act cannot fail closed; it can only
+  buffer.** This is why the gateway's outcome stream is a file the control plane
+  drains (`tool-gateway/outcomes.py`, the `tool-audit` volume) and not a POST to the
+  bridge it already dials. Authorization is a round trip *before* the side effect, so
+  an unreachable authority means refuse, nothing ran, and fail-closed is a complete
+  answer. The outcome is written *after*, where a failed POST means the call happened
+  and nothing recorded it — the hole itself. Buffering also keeps tool-result latency
+  off the authority's availability, which nothing else in the data plane does, and
+  adds no write surface to the crown jewel. The ingest side is the same arrangement
+  the egress proxy already has, and gets exactly-once for free: the cursor lives in
+  the same SQLite as the rows, so draining and advancing are one transaction.
+- **Only the gateway can say how a call ended, and the reason is structural.** The
+  control plane's claim row is written *before* the call runs, so the authority has
+  answered and gone by the time the call succeeds or fails; an approved write that
+  GitHub then refuses looks, in its trail, exactly like one that landed. The split
+  that follows: **outcome** (a status and a reason — cheap, and the question an
+  incident actually asks) is separable from **content** (size and hash — what entered
+  the context), and they have different destinations. The body belongs in the
+  gateway's own rotating file, which is bounded and disposable; only the facts belong
+  in the crown-jewel store, which is neither. That is what keeps attacker-authored
+  text out of the store, and out of anything that renders it.
 
 **Which servers may be admitted: narrow, named tools.** The three states only have
 purchase when a tool is narrow and named. A tool whose payload is a **program** —
@@ -3357,6 +3378,8 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | curated tool list on the agent leg — MCP listener, `tools/list` | **done** |
 | — | MCP gateway — per-tool allow/deny/ask on `tools/call`, the pending ask, `resume_tool_call` | **done** — no agent is pointed at it yet |
 | — | tell the sandbox it exists — firewall grant, proxy exemption, `--mcp-config` from a wrapper | **done** |
+| — | tool audit is joinable — `server`/`tool`/`approval_id` columns, filled by every writer | **done** |
+| — | the gateway records how a call ENDED — its own JSONL stream | **done** — written and readable; not yet ingested |
 
 The rationale for each shipped item lives under **Governance surfaces** above, not here
 — a status line goes stale, the reasoning does not. This section is deliberately the

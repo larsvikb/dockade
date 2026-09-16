@@ -20,12 +20,17 @@ and answers the AGENT immediately with a pending id. Nothing is held open — no
 agent's call, not a control-plane worker — so the human's window is free to be an hour
 and there is no caller to strand (DESIGN.md, "An `ask` answers immediately").
 
-WHAT IS NOT COVERED YET, stated because it is a gap rather than a decision: the
-response side. The gateway governs the REQUEST, and what steers an agent is the
-third-party text that comes back — an allowed read-only tool is unaudited intake of
-the same shape as WebSearch. DESIGN.md says that record belongs to the gateway's own
-audit stream, ingested the way the proxy's is, and that stream does not exist. What
-the control plane records today is the decision, not the payload and not the reply.
+HOW IT ENDED IS RECORDED HERE, and only here. The control plane audits the decision,
+and structurally cannot audit the outcome: its claim row is written before the call, so
+by the time one succeeds or fails the authority has already answered. Every path that
+dials a server goes through `_run`, which writes to `outcomes.py`'s stream — so an
+approved call that failed upstream is a row rather than a silence.
+
+WHAT IS STILL NOT COVERED, stated because it is a gap rather than a decision: the
+response CONTENT. The gateway governs the request and now records the fate of the
+reply, but not what the reply carried — and an allowed read-only tool is unaudited
+intake of the same shape as WebSearch. DESIGN.md wants size and hash at minimum; the
+stream those belong in now exists, which is what made this the cheaper half.
 """
 from __future__ import annotations
 
@@ -36,6 +41,7 @@ import urllib.error
 import urllib.request
 
 import discovery
+import outcomes
 import surface
 
 #: The shape of an approval id, checked before it is ever put in a URL.
@@ -91,6 +97,21 @@ def text_result(text: str, is_error: bool = False) -> dict:
     return {"content": [{"type": "text", "text": text}], "isError": is_error}
 
 
+def _first_text(result: dict) -> str | None:
+    """The first text block of a ``CallToolResult``, for the audit's reason line.
+
+    Defensive about the shape on purpose: this reads a THIRD PARTY's reply on the
+    failure path, where the reply is least likely to be well formed, and a record that
+    raised while describing an error would lose both the reason and the row. A result
+    whose content is absent, empty, or not text yields None — the status still says
+    what happened, and an absent reason is honest where a stringified dict would be
+    noise."""
+    for block in result.get("content") or ():
+        if isinstance(block, dict) and isinstance(block.get("text"), str):
+            return block["text"]
+    return None
+
+
 def _ask_control(path: str, payload: dict) -> dict:
     """POST to the control plane's tool bridge and return its answer.
 
@@ -121,8 +142,16 @@ def _ask_control(path: str, payload: dict) -> dict:
             f"the control plane did not answer ({exc})") from exc
 
 
-def parse_call(raw: str) -> dict:
-    """The ``CallToolResult`` out of a server's reply, SSE or plain JSON.
+def parse_call(raw: str) -> tuple[dict, str]:
+    """The ``CallToolResult`` out of a server's reply, SSE or plain JSON, WITH the
+    audit status that says which layer answered.
+
+    The status is returned rather than derived afterwards because it cannot be derived
+    afterwards: a JSON-RPC rejection and a tool that ran and failed both leave here as
+    an error-flagged result — they have to, that being the only shape a tool call can
+    answer in — and by then the two are indistinguishable. The distinction is
+    load-bearing for the record: one says the call never ran, the other says it ran and
+    the third party refused it.
 
     Both shapes for the reason ``discovery.parse_tools`` accepts both: only one of them
     is measured, and a version bump that switched must not silently turn every tool
@@ -145,15 +174,21 @@ def parse_call(raw: str) -> dict:
             f"not an MCP reply — the server said: {body[:200]!r}") from exc
     if "error" in message:
         return text_result(f"the server rejected the call: {message['error']}",
-                           is_error=True)
+                           is_error=True), "rpc-error"
     result = message.get("result")
     if not isinstance(result, dict):
         raise discovery.DiscoveryError("the reply carried no result")
-    return result
+    # `isError` on a SUCCESSFUL result is the MCP convention for a tool that ran and
+    # failed, and it is the case an outcome record exists for: a 403 from GitHub arrives
+    # here, inside a 200, in a well-formed result. Anything but a literal True reads as
+    # success, because absent and false both mean the tool is not claiming failure.
+    return result, "tool-error" if result.get("isError") is True else "ok"
 
 
-def _run(server: str, tool: str, arguments: object) -> dict:
-    """Dial the server and make the call. THE ONLY SIDE EFFECT IN THIS FILE.
+def _run(server: str, tool: str, arguments: object, client: str | None = None,
+         approval_id: str | None = None) -> dict:
+    """Dial the server, make the call, and RECORD HOW IT ENDED. The only side effect
+    in this file.
 
     Deliberately reachable from two places and no others, both of which hold a decision
     — ``call`` on an `allow`, and ``resume`` on a claim the control plane granted. It
@@ -161,30 +196,63 @@ def _run(server: str, tool: str, arguments: object) -> dict:
     function that decided as well as ran would have two reasons to be called, and one
     of them would eventually be wrong.
 
+    The outcome audit lives HERE for the same reason, and it is what makes the record
+    complete rather than best-effort: every path that dials a server passes through this
+    function, so there is no way to run a tool call without writing how it went. Every
+    RETURN below is audited, including the two that never reach the wire — a spent grant
+    that produced nothing is the gap this exists to close, so it cannot be the one case
+    that goes unrecorded. (``resume`` records the third such path, where the claim
+    succeeded and the approved arguments would not parse.)
+
+    ``client`` and ``approval_id`` are carried only for that record — nothing about the
+    call itself reads them — and ``approval_id`` being present is exactly what marks a
+    row as having come through a human.
+
     The ARGUMENTS are the caller's to get right. On the resumption path they are the
     ones the human read, handed back by the claim rather than replayed from anything
     the agent sent."""
+    def recorded(result: dict, status: str, reason: str | None = None) -> dict:
+        outcomes.record(status, server, tool, reason=reason, approval_id=approval_id,
+                     client=client)
+        return result
+
     entry = surface.server_entry(server)
     if entry is None:
         # Not a lookup miss. The roster stopped naming this server, which is an
         # operator disabling or revoking it — and the control plane will have said the
         # same thing already, so this is the second of two refusals rather than the
         # only one.
-        return text_result(
-            f"{server!r} is not on the gateway's current roster, so it cannot be "
-            f"dialled. It was disabled, revoked, or never registered.", is_error=True)
+        #
+        # Audited as a transport failure rather than passed over: for an approved call
+        # this is a grant that was spent and produced nothing, which is precisely the
+        # gap between "a human approved it" and "it happened".
+        return recorded(
+            text_result(
+                f"{server!r} is not on the gateway's current roster, so it cannot be "
+                f"dialled. It was disabled, revoked, or never registered.",
+                is_error=True),
+            "transport-error", f"{server} left the roster before the call was made")
     try:
         raw = discovery.post(
             server,
             {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
              "params": {"name": tool, "arguments": arguments if arguments else {}}},
             entry.get("auth") or {}, timeout=CALL_TIMEOUT)
-        return parse_call(raw)
+        result, status = parse_call(raw)
     except discovery.DiscoveryError as exc:
         # A failure to REACH the server, told apart from a failure reported BY it. The
         # distinction matters to whoever reads the transcript: one is an infrastructure
-        # problem and the other is about the call.
-        return text_result(f"could not call {tool} on {server}: {exc}", is_error=True)
+        # problem and the other is about the call. `exc.kind` carries the sharper half
+        # of it — a timeout may have landed upstream where a refusal cannot have.
+        return recorded(
+            text_result(f"could not call {tool} on {server}: {exc}", is_error=True),
+            exc.kind, str(exc))
+    # The reason line for a failure is the server's own text, which is what makes the
+    # row worth reading — "Resource not accessible by personal access token" is the
+    # sentence that was missing when this was discovered. Capped in `outcomes.record`,
+    # because it is third-party text.
+    return recorded(result, status,
+                    None if status == "ok" else _first_text(result))
 
 
 def call(name: str, arguments: object, client: str | None) -> dict:
@@ -230,7 +298,10 @@ def call(name: str, arguments: object, client: str | None) -> dict:
 
     decision, why = answer.get("decision"), answer.get("reason") or "no reason given"
     if decision == "allow":
-        return _run(server, tool, arguments)
+        # No approval_id, and its absence is the signal: an outcome row without one is a
+        # call policy allowed outright. Those are the rows that grow with every tool an
+        # operator enables, and they are the unaudited-intake half of the response side.
+        return _run(server, tool, arguments, client=client)
     if decision == "ask":
         approval_id = answer.get("approval_id")
         # A RESULT, not an error, and the instruction travels inside it — where it
@@ -312,7 +383,22 @@ def resume(arguments: object, client: str | None) -> dict:
     try:
         approved_args = json.loads(answer.get("args_json") or "null")
     except ValueError:
+        # The CLAIM ALREADY SUCCEEDED, so the grant is spent and the call never
+        # happened — the exact shape of gap this audit exists for, and the reason it is
+        # recorded here rather than left to `_run`. It keeps the property whole: every
+        # spent grant produces an outcome row, so a human's approval can never end in
+        # silence. (It should be unreachable — the control plane stores the canonical
+        # form it serialized itself — which is precisely why it must not be silent.)
+        outcomes.record("transport-error", answer.get("server") or "(unknown)",
+                     answer.get("tool") or "(unknown)",
+                     reason="the approved arguments could not be parsed, so the call "
+                            "was never made",
+                     approval_id=approval_id, client=client)
         return text_result(
             f"the approved arguments for {approval_id} could not be read, so nothing "
             f"ran. The approval is spent; raise the call again.", is_error=True)
-    return _run(answer["server"], answer["tool"], approved_args)
+    # The server and tool come from the CLAIM, so the outcome is filed under what the
+    # human approved rather than under anything the agent named — and the id ties this
+    # row to the hold, the click and the release the control plane already recorded.
+    return _run(answer["server"], answer["tool"], approved_args,
+                client=client, approval_id=approval_id)

@@ -281,6 +281,29 @@ def load_execute(env: dict[str, str] | None = None) -> types.ModuleType:
                 os.environ[key] = was
 
 
+def load_outcomes(env: dict[str, str] | None = None) -> types.ModuleType:
+    """The gateway's outcome stream, fresh per call.
+
+    Fresh because the sink is module state: ``setup`` attaches a handler to a
+    module-level logger, so a cached instance would keep writing to the previous
+    test's file. ``env`` is applied at import because ``AUDIT_PATH`` and the caps
+    resolve at module scope, exactly as they do in the container."""
+    pkg_dir = str(ROOT / "tool-gateway")
+    if pkg_dir not in sys.path:
+        sys.path.insert(0, pkg_dir)
+    previous = {k: os.environ.get(k) for k in (env or {})}
+    os.environ.update(env or {})
+    try:
+        return _load(f"dockade_outcomes_{len(sys.modules)}",
+                     "tool-gateway/outcomes.py")
+    finally:
+        for key, was in previous.items():
+            if was is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = was
+
+
 def load_protocol() -> types.ModuleType:
     """The gateway's MCP wire. Stateless, so one instance is reusable — loaded through
     here anyway so no test has to know where the file lives."""

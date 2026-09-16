@@ -29,10 +29,22 @@ RUN pip install --no-cache-dir -r requirements.txt
 # an added module becomes a deliberate line here, and the build context cannot
 # smuggle in a stray file beside them.
 COPY app.py ./app.py
+COPY outcomes.py ./outcomes.py
 COPY discovery.py ./discovery.py
 COPY execute.py ./execute.py
 COPY protocol.py ./protocol.py
 COPY surface.py ./surface.py
+
+# The outcome audit's directory, created in the IMAGE so that a fresh named volume
+# mounted here inherits these permissions — Docker copies an empty volume's ownership
+# and mode from the image path it covers.
+#
+# 1777 rather than a chown, because compose runs this service as the INVOKING USER
+# (see docker-compose.yml) and a build-time chown cannot name a uid that is only known
+# at `up` time. Sticky, as /tmp is: any uid may create its own file, none may remove
+# another's. The volume is shared with exactly one other container, which mounts it
+# read-only, so this is a private log directory rather than a shared writable surface.
+RUN mkdir -p /var/log/tool-gateway && chmod 1777 /var/log/tool-gateway
 
 USER gw
 # One listener: the agent-facing MCP endpoint. EXPOSE is documentation — the

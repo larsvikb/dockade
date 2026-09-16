@@ -174,17 +174,26 @@ def _rules():
 
 
 class _CPTestCase(unittest.TestCase):
-    """Fresh schema + empty tables per test, and ``_audit`` muted — it prints the
-    ``make logs-cp`` live feed to stdout, which is just noise here (no test
-    asserts on audit rows), and its DB write is a fire-and-forget side effect
-    orthogonal to the decision logic under test."""
+    """Fresh schema + empty tables per test, and ``_audit`` muted by default — it
+    prints the ``make logs-cp`` live feed to stdout, which is noise for a test about
+    decision logic, and its DB write is a side effect orthogonal to that.
+
+    A subclass that is ABOUT what lands in the table sets ``audits = True`` and gets
+    the real writer. That distinction has to be a switch rather than a second base
+    class: the columns a row carries are worth asserting on the way THROUGH the write,
+    since a kwarg that reaches ``_audit`` and not the INSERT would satisfy a
+    mock-based assertion and leave the column empty."""
+
+    #: Whether this test's audit rows are real. See the class docstring.
+    audits = False
 
     def setUp(self):
         cp.store._init_db()
         _clear_all()
-        patch = mock.patch.object(cp.store, "_audit")
-        patch.start()
-        self.addCleanup(patch.stop)
+        if not self.audits:
+            patch = mock.patch.object(cp.store, "_audit")
+            patch.start()
+            self.addCleanup(patch.stop)
 
 
 class AuthorizeDecisionTests(_CPTestCase):
@@ -1678,7 +1687,12 @@ class AuditRecordTests(_CPTestCase):
         self.assertEqual(
             set(row),
             {"id", "ts", "decision", "stage", "host", "port", "proto", "client",
-             "client_class", "method", "url", "reason", "fail_closed"})
+             "client_class", "method", "url", "reason", "fail_closed",
+             # The tool columns. Egress rows carry NULL in all three — the identity of
+             # an egress decision is host/port/url — and they are here because this is
+             # the view that answers "which one was it" for a TOOL row, whose identity
+             # is in none of the columns above.
+             "server", "tool", "approval_id"})
         self.assertEqual(row["url"], "https://a.example/x")
 
     def test_nothing_is_folded(self):
@@ -3701,6 +3715,123 @@ class ToolClaimTests(_ToolBridgeTestCase):
                          cp.policy._client_class(CLASS_IP))
 
 
+class ToolCorrelationColumnTests(_ToolBridgeTestCase):
+    """``audit.server`` / ``audit.tool`` / ``audit.approval_id`` — the trail as
+    something to QUERY rather than to grep.
+
+    Every column the audit table had was egress vocabulary, so a tool decision borrowed
+    it by writing "create_pull_request on mcp-github: ..." into ``reason``. That reads
+    well and joins to nothing. One tool ask writes rows at three separate moments here —
+    the hold, the human's click, the claim — and with the id only inside prose, the
+    single question an operator has after an approval ("what came of it?") is a string
+    search whose recall depends on wording that has been reworded before.
+
+    So the property under test is ONE APPROVAL, ONE KEY: every row that belongs to an
+    ask carries its id in a column. Asserted through the endpoints rather than on
+    ``_audit`` calls, because the value has to survive the write — a kwarg that reaches
+    ``_audit`` and not the table would pass a mock-based test and leave the column
+    empty."""
+
+    audits = True
+
+    def _rows_for(self, approval_id):
+        with cp.store._connect() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT decision, stage, server, tool, approval_id FROM audit "
+                "WHERE approval_id=? ORDER BY id", (approval_id,))]
+
+    def test_one_ask_is_three_rows_reachable_by_its_id_alone(self):
+        # The end-to-end property, and the one the UI's outcome-on-the-card needs: the
+        # hold, the human's answer and the release are selectable together WITHOUT
+        # parsing a sentence. The stages are asserted as a set because what matters is
+        # that none of the three is missing, not the order they were written in.
+        _tool_rule("create_pull_request", "ask")
+        approval_id = _tool_call(tool="create_pull_request",
+                                 args={"title": "x"})["approval_id"]
+        _resolve(approval_id, "allow")
+        _claim(approval_id)
+        rows = self._rows_for(approval_id)
+        self.assertEqual({r["stage"] for r in rows},
+                         {"tool-call", "tool-ask", "tool-resume"})
+        for row in rows:
+            with self.subTest(stage=row["stage"]):
+                self.assertEqual(row["server"], "mcp-github")
+                self.assertEqual(row["tool"], "create_pull_request")
+
+    def test_a_decided_call_names_its_tool_without_an_approval(self):
+        # `allow` and `deny` answer immediately, so there is no id to carry — and the
+        # server/tool pair still has to be a column, because "everything that touched
+        # this server" must not silently omit the calls that never became asks. Those
+        # are the rows that grow with every tool an operator allows.
+        _tool_rule("get_me", "allow")
+        _tool_call(tool="get_me")
+        _tool_call(tool="merge_pull_request")            # unconfigured, so denied
+        with cp.store._connect() as conn:
+            rows = {r["tool"]: (r["decision"], r["server"], r["approval_id"])
+                    for r in conn.execute(
+                        "SELECT decision, server, tool, approval_id FROM audit "
+                        "WHERE stage='tool-call'")}
+        self.assertEqual(rows, {"get_me": ("allow", "mcp-github", None),
+                                "merge_pull_request": ("deny", "mcp-github", None)})
+
+    def test_a_call_naming_no_server_records_null_rather_than_a_blank(self):
+        # The bridge accepts an empty server/tool and denies them (the `(no tool)`
+        # wording in the reason). An empty STRING in a column would be a third state
+        # beside "absent" and "present" that every reader would have to know about, and
+        # the one thing a record must not do is assert something nothing observed.
+        _tool_call(server="", tool="")
+        with cp.store._connect() as conn:
+            row = conn.execute("SELECT server, tool FROM audit "
+                               "WHERE stage='tool-call'").fetchone()
+        self.assertEqual((row["server"], row["tool"]), (None, None))
+
+    def test_a_surface_change_names_the_server_it_concerns(self):
+        # The `observe` row is NOT a decision, and it still belongs to a server — so a
+        # filter for one server must not drop exactly the supply-chain rows. The name
+        # travels beside the line from `inventory.changes` rather than being read back
+        # out of it, which is the whole point of the column.
+        cp.tool_inventory(cp.InventoryRequest(servers={
+            "mcp-github": {"status": "ok", "tools": [{"name": "get_me"}]}}),
+            _FakeRequest())
+        cp.tool_inventory(cp.InventoryRequest(servers={
+            "mcp-github": {"status": "ok", "tools": [{"name": "get_me"},
+                                                     {"name": "delete_repository"}]}}),
+            _FakeRequest())
+        with cp.store._connect() as conn:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT server, reason FROM audit WHERE stage='mcp-tools' "
+                "ORDER BY id")]
+        self.assertEqual([r["server"] for r in rows], ["mcp-github", "mcp-github"])
+        self.assertIn("delete_repository", rows[-1]["reason"])
+
+    def test_writing_a_rule_is_filed_under_the_tool_it_governs(self):
+        # Policy rows and the calls they decide, selectable together. Without this, "why
+        # did this tool start being allowed" and "what did it do" are two searches over
+        # two wordings, and only one of them is in the same vocabulary as the decision.
+        rule_id = _tool_rule("get_me", "allow").body["id"]
+        cp.revoke_mcp_rule(rule_id, _FakeRequest())
+        with cp.store._connect() as conn:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT decision, server, tool FROM audit WHERE stage='tool-policy' "
+                "ORDER BY id")]
+        self.assertEqual(rows, [{"decision": "create", "server": "mcp-github",
+                                 "tool": "get_me"},
+                                {"decision": "revoke", "server": "mcp-github",
+                                 "tool": "get_me"}])
+
+    def test_an_egress_decision_leaves_the_tool_columns_empty(self):
+        # The columns are additive, not a re-interpretation of the table. An egress row
+        # whose identity is host/port/url must not acquire a tool identity it never had
+        # — that would make `WHERE server IS NOT NULL` stop meaning "tool rows".
+        _set_rules([("example.com", "allow")])
+        cp.authorize(_auth_req("example.com"))
+        with cp.store._connect() as conn:
+            row = conn.execute("SELECT server, tool, approval_id FROM audit "
+                               "WHERE host='example.com'").fetchone()
+        self.assertEqual((row["server"], row["tool"], row["approval_id"]),
+                         (None, None, None))
+
+
 class _FreshStoreTestCase(unittest.TestCase):
     """Base for tests that need a genuinely empty database rather than the shared one:
     schema questions cannot be asked of a store the rest of the suite has been
@@ -4220,6 +4351,54 @@ class SchemaVersionTests(_FreshStoreTestCase):
             fresh = conn.execute(
                 "SELECT sql FROM sqlite_master WHERE name='leases'").fetchone()[0]
         self.assertEqual(migrated, fresh)
+
+    def test_an_old_store_gains_the_tool_correlation_columns(self):
+        # Step 3 on the stores already in the field. Without it every `_audit` call
+        # fails on the INSERT naming columns that are not there — which is every
+        # decision, egress included, on exactly the deployments that have been
+        # governing the longest.
+        self._old_store("version-correlation.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(audit)")}
+        self.assertLessEqual({"server", "tool", "approval_id"}, cols)
+
+    def test_an_audit_row_that_predates_the_columns_is_not_backfilled(self):
+        # NULL means "nothing observed this", and that is the honest value for a row
+        # written before the gateway reported one. Some of them DO name a server inside
+        # their reason prose — filling the column from that would be the record
+        # asserting something it derived, in the one table whose worth is that it
+        # only holds what was seen.
+        self._old_store("version-correlation-rows.db")
+        with cp.store._connect() as conn:
+            conn.execute("INSERT INTO audit(ts, decision, stage, reason) VALUES "
+                         "(1.0, 'hold', 'tool-call', 'get_me on mcp-github: ask')")
+            conn.commit()
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            row = conn.execute("SELECT server, tool, approval_id, reason FROM audit "
+                               "WHERE stage='tool-call'").fetchone()
+        self.assertEqual((row["server"], row["tool"], row["approval_id"]),
+                         (None, None, None))
+        self.assertIn("mcp-github", row["reason"])      # and the prose is untouched
+
+    def test_a_migrated_and_a_fresh_store_agree_on_the_audit_columns(self):
+        # The DDL and the step are two spellings of one schema with nothing tying
+        # them: a column added to `_init_db` alone is missing on every store in the
+        # field, and one added to the step alone is missing from every new one. The
+        # ORDER legitimately differs — `ALTER TABLE` appends, and `client_class` sits
+        # mid-table in the DDL — so the SET is what has to match.
+        def columns_of(name):
+            self._use_store(name)
+            cp.store._init_db()
+            with cp.store._connect() as conn:
+                return {r["name"] for r in conn.execute("PRAGMA table_info(audit)")}
+
+        self._old_store("audit-agree-migrated.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            migrated = {r["name"] for r in conn.execute("PRAGMA table_info(audit)")}
+        self.assertEqual(migrated, columns_of("audit-agree-fresh.db"))
 
     def test_the_steps_are_contiguous_and_end_at_the_declared_version(self):
         # ``SCHEMA_VERSION`` and ``_STEPS`` are two halves of one fact, and only this

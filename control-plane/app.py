@@ -802,7 +802,7 @@ def tool_authorize(req: ToolCallRequest) -> dict:
 
     if decision in ("allow", "deny"):
         store._audit(decision, stage="tool-call", client=req.client,
-                     client_class=client_class,
+                     client_class=client_class, server=server or None, tool=tool or None,
                      reason=f"{tool or '(no tool)'} on {server or '(no server)'}: "
                             f"{reason}")
         return {"decision": decision, "reason": reason}
@@ -820,7 +820,7 @@ def tool_authorize(req: ToolCallRequest) -> dict:
         # cap case in the saturation account, which is what makes a refusal that
         # raises no card visible to an operator at all.
         store._audit("deny", stage="tool-call", client=req.client,
-                     client_class=client_class,
+                     client_class=client_class, server=server or None, tool=tool or None,
                      reason=f"{tool} on {server}: {ask.refused}")
         return {"decision": "deny", "reason": ask.refused}
 
@@ -833,7 +833,8 @@ def tool_authorize(req: ToolCallRequest) -> dict:
            + (" (joined an identical ask already pending)" if ask.joined else "")
            + " — nothing is blocked; the agent resumes with the id")
     store._audit("hold", stage="tool-call", client=req.client,
-                 client_class=client_class, reason=why)
+                 client_class=client_class, server=server or None, tool=tool or None,
+                 approval_id=ask.approval_id, reason=why)
     return {"decision": "ask", "reason": reason, "approval_id": ask.approval_id,
             # ABSOLUTE, like every other time in a payload here: a remaining-seconds
             # field would tick, which turns the SSE change-detector into a 1 Hz
@@ -919,8 +920,9 @@ def tool_inventory(req: InventoryRequest, request: Request) -> JSONResponse:
         # there is unexpected and becomes a 500 with no body, rather than having its
         # text relayed. Same arrangement as `audit.FilterError` and `_bad_filter`.
         return JSONResponse({"ok": False, "detail": str(exc)}, status_code=400)
-    for line in moved:
-        store._audit("observe", stage="mcp-tools", client=_actor(request), reason=line)
+    for server, line in moved:
+        store._audit("observe", stage="mcp-tools", client=_actor(request),
+                     server=server, reason=line)
     return JSONResponse({"ok": True, "changed": len(moved)})
 
 
@@ -980,7 +982,8 @@ def tool_claim(approval_id: str, req: ToolResumeRequest) -> JSONResponse:
     decision, why = policy._decide_tool(ask["server"], ask["tool"])
     if decision == "deny":
         store._audit("deny", stage="tool-resume", client=ask["client"],
-                     client_class=client_class,
+                     client_class=client_class, server=ask["server"], tool=ask["tool"],
+                     approval_id=approval_id,
                      reason=f"approved tool ask {approval_id} not released: {why} — "
                             f"the approval stands, the server's state does not")
         # TERMINAL, though the underlying state is reversible. An agent should not sit
@@ -1021,7 +1024,8 @@ def tool_claim(approval_id: str, req: ToolResumeRequest) -> JSONResponse:
     # gap between them is exactly the window in which an approved call was never run,
     # and a record with only the first could not show it.
     store._audit("allow", stage="tool-resume", client=claimed["client"],
-                 client_class=client_class,
+                 client_class=client_class, server=claimed["server"],
+                 tool=claimed["tool"], approval_id=approval_id,
                  reason=f"approved tool ask {approval_id} claimed for execution; "
                         f"{claimed['tool']} on {claimed['server']} — single-use, this "
                         f"claim is the only one that can run it")
@@ -1340,7 +1344,8 @@ def _resolve_tool_ask_request(approval_id: str, req: ResolveRequest,
              "status": current["status"] if current else None}, status_code=409)
 
     store._audit("allow" if action == "allow" else "deny", stage="tool-ask",
-                 client=ask["client"],
+                 client=ask["client"], server=ask["server"], tool=ask["tool"],
+                 approval_id=approval_id,
                  reason=f"tool ask {action}ed by {actor}; {ask['tool']} on "
                         f"{ask['server']} — the call runs only if the agent returns "
                         f"for it" if action == "allow" else
@@ -2072,7 +2077,7 @@ def create_mcp_server(req: ServerCreateRequest, request: Request) -> JSONRespons
             (server, auth_type, header or None, template or None, time.time()))
         conn.commit()
 
-    store._audit("create", stage="mcp-server",
+    store._audit("create", stage="mcp-server", server=server,
                  reason=f"MCP server {server} registered by {actor}; disabled, "
                         f"auth {auth_type}, no tools permitted until rules are written")
     return JSONResponse({"ok": True, "created": True, "server": server,
@@ -2133,7 +2138,7 @@ def edit_mcp_server(server: str, req: ServerEditRequest,
     # change with nothing to tie them together is the shape this endpoint exists to
     # avoid. The TEMPLATE is safe to record and the secret is not in it — that is what
     # a descriptor being useless to steal buys.
-    store._audit("edit", stage="mcp-server",
+    store._audit("edit", stage="mcp-server", server=server,
                  reason=f"MCP server {server} edited by {actor}; "
                         f"enabled {before['enabled']} -> {after['enabled']}, "
                         f"auth {before['auth']['type']} -> {after['auth']['type']} "
@@ -2177,7 +2182,7 @@ def revoke_mcp_server(server: str, request: Request) -> JSONResponse:
         conn.execute("DELETE FROM mcp_servers WHERE server=?", (server,))
         conn.commit()
 
-    store._audit("revoke", stage="mcp-server",
+    store._audit("revoke", stage="mcp-server", server=server,
                  reason=f"MCP server {server} registration revoked by {actor}; the "
                         f"gateway will no longer dial it")
     return JSONResponse({"ok": True, "server": server})
@@ -2272,7 +2277,7 @@ def create_mcp_rule(req: ToolRuleCreateRequest, request: Request) -> JSONRespons
             (server, tool, action, time.time())).lastrowid
         conn.commit()
 
-    store._audit("create", stage="tool-policy",
+    store._audit("create", stage="tool-policy", server=server, tool=tool,
                  reason=f"tool rule created by {actor}; {tool} on {server} now "
                         f"{action}s")
     return JSONResponse({"ok": True, "created": True, "already_present": False,
@@ -2308,7 +2313,7 @@ def edit_mcp_rule(rule_id: int, req: ToolRuleEditRequest,
         conn.execute("UPDATE tool_rules SET action=? WHERE id=?", (action, rule_id))
         conn.commit()
 
-    store._audit("edit", stage="tool-policy",
+    store._audit("edit", stage="tool-policy", server=row["server"], tool=row["tool"],
                  reason=f"tool rule edited by {actor}; {row['tool']} on "
                         f"{row['server']} was {row['action']}, now {action}")
     return JSONResponse({"ok": True, "changed": True, "id": rule_id,
@@ -2338,7 +2343,7 @@ def revoke_mcp_rule(rule_id: int, request: Request) -> JSONResponse:
         conn.execute("DELETE FROM tool_rules WHERE id=?", (rule_id,))
         conn.commit()
 
-    store._audit("revoke", stage="tool-policy",
+    store._audit("revoke", stage="tool-policy", server=row["server"], tool=row["tool"],
                  reason=f"tool rule revoked by {actor}; {row['tool']} on "
                         f"{row['server']} was {row['action']}, now unconfigured and "
                         f"therefore denied")

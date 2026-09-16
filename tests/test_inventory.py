@@ -123,8 +123,9 @@ class ChangeTests(unittest.TestCase):
         # what makes names worth reading, and the inventory holds the full list.
         _, moved = self.inv.record(GITHUB)
         self.assertEqual(len(moved), 1)
-        self.assertIn("first seen", moved[0])
-        self.assertNotIn("get_issue", moved[0])
+        self.assertEqual(moved[0][0], "mcp-github")
+        self.assertIn("first seen", moved[0][1])
+        self.assertNotIn("get_issue", moved[0][1])
 
     def test_a_server_that_has_never_been_enumerated_is_not_reported_as_seen(self):
         # Enabling a server with a bad credential must not log "first seen exposing 0
@@ -147,8 +148,9 @@ class ChangeTests(unittest.TestCase):
             {"name": "delete_repository"}]}}}
         _, moved = self.inv.record(grown)
         self.assertEqual(len(moved), 1)
-        self.assertIn("delete_repository", moved[0])
-        self.assertIn("now exposes", moved[0])
+        self.assertEqual(moved[0][0], "mcp-github")
+        self.assertIn("delete_repository", moved[0][1])
+        self.assertIn("now exposes", moved[0][1])
 
     def test_a_server_leaving_the_roster_writes_no_row(self):
         # Disabling a server empties it out of the roster, so the next push omits it
@@ -168,7 +170,7 @@ class ChangeTests(unittest.TestCase):
         self.inv.record(GITHUB)
         _, moved = self.inv.record({"servers": {"mcp-github": {
             "status": "ok", "tools": [{"name": "get_issue"}]}}})
-        self.assertIn("no longer exposes create_pr", moved[0])
+        self.assertIn("no longer exposes create_pr", moved[0][1])
 
     def test_a_server_that_could_not_be_enumerated_does_not_read_as_empty(self):
         # The distinction the gateway takes trouble to preserve: "exposes nothing" and

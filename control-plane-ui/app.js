@@ -128,7 +128,7 @@ const STALE_MAX_MS = 15000;
 // operator performed it and knows the outcome, but may move the mouse away before
 // reading the confirmation), and a card resolved elsewhere least — it is purely
 // informational. Longer than these and stale cards would compete with real pending
-// holds for attention on what is fundamentally a work queue; the Decisions tab is the
+// holds for attention on what is fundamentally a work queue; the Audit tab is the
 // durable record.
 const DWELL_MS = { expired: 60000, resolved: 8000, gone: 5000 };
 
@@ -1008,7 +1008,7 @@ function coverageSummary(rows, total, filtered) {
     // a filter it stays silent, because a permanent "showing 12 of 12" is furniture.
     if (filtered && shown > 0) {
       return { show: true, level: "none", shown, total: Number.isFinite(t) ? t : null,
-               text: `All ${shown.toLocaleString()} matching decisions are shown.` };
+               text: `All ${shown.toLocaleString()} matching events are shown.` };
     }
     return { show: false, level: "none", text: "", shown, total: Number.isFinite(t) ? t : null };
   }
@@ -1018,7 +1018,7 @@ function coverageSummary(rows, total, filtered) {
     shown,
     total: t,
     text: `Showing the ${shown.toLocaleString()} most recent of `
-        + `${t.toLocaleString()} ${filtered ? "matching" : "recorded"} decisions.`,
+        + `${t.toLocaleString()} ${filtered ? "matching" : "recorded"} events.`,
   };
 }
 
@@ -1135,7 +1135,7 @@ function historyPager(page, pageSize, shown, total, hasNext, filtered) {
     // Empty when there is nothing on screen: the list's own status line already says
     // whether that is an empty record or an unmatched filter, and a second sentence
     // saying "0–0" next to it would be noise arguing with prose.
-    text: n ? `Decisions ${from.toLocaleString()}–${to.toLocaleString()}${of}` : "",
+    text: n ? `Events ${from.toLocaleString()}–${to.toLocaleString()}${of}` : "",
   };
 }
 
@@ -1202,26 +1202,30 @@ function pollStatus(texts, rowCount, failed, loaded) {
 }
 
 const AUDIT_STATUS_TEXT = {
-  stale: "Could not refresh — these are the last decisions loaded successfully " +
+  stale: "Could not refresh — these are the last events loaded successfully " +
          "and may be out of date.",
-  cold: "Could not load recent decisions — the control plane may be unreachable.",
-  empty: "No decisions recorded yet. Every allow, deny and hold appears here " +
-         "as it happens.",
+  cold: "Could not load recent events — the control plane may be unreachable.",
+  // Deliberately no longer a LIST of what appears here. It named "every allow, deny
+  // and hold" while the vocabulary was three words; it has since grown policy edits
+  // and observations, and an enumeration in an empty state is the kind of promise
+  // that quietly stops being true — telling the reader the log is narrower than it is.
+  empty: "Nothing recorded yet. Every governed decision, and what came of it, " +
+         "appears here as it happens.",
 };
 // An empty list under a FILTER is not an empty record, and the difference is the same
 // kind of difference as empty-versus-stale: one says the system is quiet, the other
 // says the question found nothing. Getting this wrong is worse than the stale case it
-// borrows from — "no decisions recorded yet" in front of a full store, because the
+// borrows from — "nothing recorded yet" in front of a full store, because the
 // operator typed a host that never asked for anything, reads as governance not running.
 const AUDIT_FILTERED_EMPTY_TEXT =
-  "No decisions match these filters. The record itself is not empty — clear them, " +
+  "No events match these filters. The record itself is not empty — clear them, " +
   "or widen the time window, to see it.";
 // When the backend refuses the filters but says nothing usable about why. Only reachable
 // if the 400 body is missing or unparseable, which is why it is vague where the
 // backend's own sentence is specific — but it still has to name the filter bar as the
 // place to look, because the one thing we do know is that the control plane answered.
 const AUDIT_REFUSED_FALLBACK =
-  "These filters were refused, so the decisions below still answer the previous " +
+  "These filters were refused, so the events below still answer the previous " +
   "question. Adjust them and try again.";
 function auditStatus(rowCount, failed, loaded, filtered, refused) {
   // A REFUSED filter outranks every sentence below it. The query never ran, so the
@@ -1537,7 +1541,7 @@ function start() {
   let leaseSeconds = null;
 
   // ── views ─────────────────────────────────────────────────────────────────
-  const VIEWS = ["approvals", "decisions", "policy", "tools"];
+  const VIEWS = ["approvals", "audit", "policy", "tools"];
   const viewFromHash = () =>
     VIEWS.includes(location.hash.slice(1)) ? location.hash.slice(1) : "approvals";
   let current = viewFromHash();
@@ -2575,7 +2579,7 @@ function start() {
     auditGroupedTable.hidden = events;
     auditEventsTable.hidden = !events;
     auditModeNote.textContent = events
-      ? "· every event, newest first" : "· identical decisions folded";
+      ? "· every event, newest first" : "· identical events folded";
     if (events) renderEvents(rows); else renderGrouped(rows);
 
     renderOutage(outageSummary(rows));

@@ -2157,13 +2157,13 @@ class PageScriptTests(unittest.TestCase):
         self.assertFalse(c["filtered_empty"]["show"])
 
     def test_an_empty_filtered_list_does_not_claim_an_empty_record(self):
-        """The same empty-versus-stale discipline, one level in. "No decisions recorded
+        """The same empty-versus-stale discipline, one level in. "Nothing recorded
         yet" in front of a full store — because the operator searched a host that never
         asked for anything — reads as governance not running at all."""
         s = self.probe["saturation"]["audit_filtered_status"]
-        self.assertIn("No decisions match", s["filtered_empty"]["text"])
+        self.assertIn("No events match", s["filtered_empty"]["text"])
         self.assertIn("record itself is not empty", s["filtered_empty"]["text"])
-        self.assertIn("No decisions recorded yet", s["unfiltered_empty"]["text"])
+        self.assertIn("Nothing recorded yet", s["unfiltered_empty"]["text"])
         # A failed poll outranks the filter: it is the more urgent fact either way.
         self.assertIn("Could not refresh", s["filtered_failed"]["text"])
         self.assertFalse(s["filtered_has_rows"]["show"])
@@ -2310,7 +2310,7 @@ class PageScriptTests(unittest.TestCase):
         # And it says "matching" for the same reason the coverage line does.
         self.assertIn("matching", p["filtered"]["text"])
         # A backend without the total still gets a usable label.
-        self.assertIn("Decisions 1\u20135", p["no_total"]["text"])
+        self.assertIn("Events 1\u20135", p["no_total"]["text"])
         self.assertNotIn(" of ", p["no_total"]["text"])
 
     def test_an_arriving_approval_is_announced_with_its_host(self):
@@ -2380,7 +2380,7 @@ class PageScriptTests(unittest.TestCase):
         # Genuinely empty: say so plainly, no warning styling.
         self.assertTrue(s["genuinely_empty"]["show"])
         self.assertEqual(s["genuinely_empty"]["level"], "none")
-        self.assertIn("No decisions recorded yet", s["genuinely_empty"]["text"])
+        self.assertIn("Nothing recorded yet", s["genuinely_empty"]["text"])
         # Failed: warn, and distinguish "these rows are stale" from "there are none".
         self.assertEqual(s["failed_with_rows"]["level"], "warn")
         self.assertIn("may be out of date", s["failed_with_rows"]["text"])
@@ -2391,7 +2391,7 @@ class PageScriptTests(unittest.TestCase):
 
     def test_nothing_is_claimed_before_the_first_response(self):
         s = self.probe["saturation"]["audit_status"]
-        # "No decisions recorded yet" during the first fetch would be a positive
+        # "Nothing recorded yet" during the first fetch would be a positive
         # all-clear the page has not earned — the same reasoning that keeps the
         # saturation banner hidden at zero rather than rendering one.
         self.assertFalse(s["first_load_in_flight"]["show"])
@@ -2445,7 +2445,7 @@ def _fn_body(src: str, signature: str) -> str:
     return m.group(1)
 
 
-class DecisionsTableSourceTests(unittest.TestCase):
+class AuditTableSourceTests(unittest.TestCase):
     """`refreshAudit` and the two row renderers live in `start()` and cannot be
     unit-tested, so the parts of them that would fail SILENTLY are asserted against
     the source — the same approach the dismiss handler and the duplicate badge use.
@@ -2576,9 +2576,9 @@ class DecisionsTableSourceTests(unittest.TestCase):
         # Scoped to the decisions SECTION, not the first <thead> in the file — the
         # policy table also has one, and a reordering of the two sections would
         # otherwise silently point this assertion at the wrong table.
-        section = re.search(r'<section id="view-decisions".*?</section>',
+        section = re.search(r'<section id="view-audit".*?</section>',
                             INDEX_HTML.read_text(), re.S)
-        self.assertIsNotNone(section, "the decisions section was renamed")
+        self.assertIsNotNone(section, "the audit section was renamed")
         self.assertIn("<th>client</th>", section.group(0),
                       "the column exists in the body but has no header")
 

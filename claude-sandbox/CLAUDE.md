@@ -15,8 +15,12 @@ here. It is written down so you spend no turns discovering it.
   call. Three answers: it runs, it is refused, or it is **held for approval** — and
   a held call comes back immediately as a *result* saying so, carrying an id. That
   is not a failure and not a hang: do other work, then finish it with
-  `resume_tool_call` and the same id. Calling the tool again instead raises a
-  **second** question for the same person. A tool whose description begins
+  `resume_tool_call` and the same id. **Re-calling it while the answer is still
+  pending is free** — nothing runs, the id stays good — so POLL for the answer rather
+  than waiting to be told one arrived; nothing can push it to you. Back off between
+  tries and give up after a few: the human's window is an hour, and a human who has
+  stepped away is not helped by spinning. Calling the TOOL again is the different
+  thing, and raises a **second** question for the same person. A tool whose description begins
   "Approval required" is one of these, so you can plan around it rather than
   discover it. A refusal says retrying will not help, and means it.
 - **No `git push`, no SSH.** External names do not resolve outside the proxy, so

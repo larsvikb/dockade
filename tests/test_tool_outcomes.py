@@ -18,6 +18,7 @@ import logging
 import os
 import tempfile
 import unittest
+from typing import ClassVar
 
 from _loader import load_outcomes
 
@@ -42,7 +43,7 @@ class OutcomeTestCase(unittest.TestCase):
     """A module writing to a real file in a temp dir, because the file IS the
     interface — the control plane reads bytes off a volume, not a Python call."""
 
-    env: dict[str, str] = {}
+    env: ClassVar[dict[str, str]] = {}
 
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
@@ -115,7 +116,7 @@ class RecordShapeTests(OutcomeTestCase):
 
 
 class FieldCapTests(OutcomeTestCase):
-    env = {"GATEWAY_AUDIT_FIELD_MAX": "32"}
+    env: ClassVar[dict[str, str]] = {"GATEWAY_AUDIT_FIELD_MAX": "32"}
 
     def test_a_servers_error_text_cannot_grow_the_file_without_bound(self):
         # THE TRUST BOUNDARY. `reason` is third-party text — an error message a server

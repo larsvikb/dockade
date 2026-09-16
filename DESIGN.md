@@ -1948,7 +1948,7 @@ bind mount exists and the approval surface must be reachable by a human who is o
 the host, no purely host-side control survives host code execution.
 
 **Tabbed views + traffic-light favicon, both driven by "don't hide a failing state."**
-Approvals / Decisions / Policy are tabs (via `location.hash`, with arrow-key nav), and
+Approvals / Audit / Policy are tabs (via `location.hash`, with arrow-key nav), and
 the hazard tabs introduce — a hidden view drifting unnoticed, which standing policy did
 for weeks — is answered by badges that keep polling even the hidden views: a live pending
 count, and a policy **unseen** marker keyed on pattern+action (a flipped rule leaves the

@@ -325,15 +325,15 @@
           aria-selected="true" data-view="approvals">
     Approvals <span class="badge" id="badge-approvals">0</span>
   </button>
-  <button role="tab" id="tab-decisions" aria-controls="view-decisions"
-          aria-selected="false" tabindex="-1" data-view="decisions">
-    Decisions
+  <button role="tab" id="tab-audit" aria-controls="view-audit"
+          aria-selected="false" tabindex="-1" data-view="audit">
+    Audit
   </button>
   <button role="tab" id="tab-policy" aria-controls="view-policy"
           aria-selected="false" tabindex="-1" data-view="policy">
     Policy <span class="badge" id="badge-policy">–</span>
   </button>
-  <!-- No badge, as Decisions has none: a badge here would count servers, and a server
+  <!-- No badge, as Audit has none: a badge here would count servers, and a server
        count is not a thing anyone needs to notice from another tab. The two that carry
        badges both mean "something is waiting for you". -->
   <button role="tab" id="tab-tools" aria-controls="view-tools"
@@ -391,11 +391,11 @@
     <div class="empty" id="leases-empty" hidden></div>
   </section>
 
-  <section id="view-decisions" role="tabpanel" aria-labelledby="tab-decisions" hidden>
+  <section id="view-audit" role="tabpanel" aria-labelledby="tab-audit" hidden>
     <!-- The note says WHICH of the two views is on screen. Without it the heading
          claims "recent" while the table may be showing a filtered window from last
          week, which is the sort of quiet mislabelling this page exists not to do. -->
-    <h2>Decisions <span class="note" id="audit-mode"></span></h2>
+    <h2>Audit <span class="note" id="audit-mode"></span></h2>
     <!-- Filters, shared by both views below. The search box matches the columns the
          view DISPLAYS (host, client, class, reason — plus the request itself in the
          record view), so a row can never match on something the reader cannot see;
@@ -403,7 +403,7 @@
     <div class="filters" role="search">
       <input type="search" id="audit-q" autocomplete="off" spellcheck="false"
              placeholder="search host, client, class, reason"
-             aria-label="Search decisions">
+             aria-label="Search audit events">
       <!-- These option values are the `decision` column's vocabulary, and a test
            holds them equal to the backend's (audit.DECISIONS) — a value this page
            offers that the backend does not know is a 400 on click. -->

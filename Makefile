@@ -117,7 +117,7 @@ PYFILES := proxies/egress/addon.py control-plane-ui/app.py \
            control-plane/app.py control-plane/store.py control-plane/policy.py \
            control-plane/holds.py control-plane/ingest.py control-plane/audit.py \
            control-plane/inventory.py \
-           tool-gateway/app.py tool-gateway/discovery.py \
+           tool-gateway/app.py tool-gateway/outcomes.py tool-gateway/discovery.py \
            tool-gateway/protocol.py tool-gateway/surface.py tool-gateway/execute.py
 # Dependency-free unit tests for the governance-critical decision logic. Kept
 # separate from PYFILES so they can be linted with the app code but discovered
@@ -146,6 +146,7 @@ REFFILES := $(SCRIPTS) \
             control-plane/inventory.py \
             control-plane/requirements.txt \
             tool-gateway/app.py \
+            tool-gateway/outcomes.py \
             tool-gateway/discovery.py \
             tool-gateway/execute.py \
             tool-gateway/protocol.py \
@@ -908,6 +909,25 @@ logs-ep: ## Follow the egress-proxy log — the live per-connection audit stream
 logs-cp: ## Follow the control-plane log (policy seed + decisions)
 	$(COMPOSE) logs -f control-plane
 
+logs-tg: ## Follow the tool-gateway log — decisions taken and how each call ENDED
+	$(COMPOSE) logs -f tool-gateway
+
+# How many outcome records `tool-outcomes` shows. A tail, not a window: this is the
+# raw stream, and the queryable view of it is the control plane's audit (which is
+# where it lands once ingested).
+OUTCOMES ?= 20
+
+tool-outcomes: ## Show the last $$OUTCOMES tool-call outcomes from the gateway's own stream
+	# What the gateway recorded and the control plane drains — the record of how each
+	# call ENDED, which the authority structurally cannot write: its claim row is
+	# written before the call runs.
+	#
+	# Read from the GATEWAY's side of the volume, where it is writable and current.
+	# The control plane's copy is read-only and lags by one drain interval, so a
+	# disagreement between the two is a broken ingest rather than a missing record —
+	# which is exactly the thing worth being able to tell apart.
+	docker exec -e OUTCOMES=$(OUTCOMES) tool-gateway python3 -c "$$TOOL_OUTCOMES_PY"
+
 # ── sandbox lifecycle (run-*-sandbox.sh) ────────────────────────────────────
 
 claude: ## Launch a tier-1 (Claude, governed egress) sandbox (WORKSPACE=/path, default $$PWD)
@@ -1082,6 +1102,51 @@ export SPLIT_CHECK_PY
 
 # Body of `audit-prune` (see the target above). Runs inside the control-plane
 # container so it shares the app's view of the store (CONTROL_DB, WAL mode).
+# Body of `tool-outcomes` (see the target above). Reads the gateway's own JSONL
+# stream and prints it one line per record, newest last.
+#
+# Deliberately incurious, like the control plane's ingest: a line that does not parse
+# is COUNTED and skipped, never guessed at. A half-written tail is normal here — this
+# reads a file another process is appending to — so silently dropping one is right,
+# and saying how many were dropped is what keeps "unparseable" from looking like
+# "nothing happened".
+define TOOL_OUTCOMES_PY
+import json, os, time
+
+path = os.environ.get("GATEWAY_AUDIT_LOG", "/var/log/tool-gateway/audit.jsonl")
+show = int(os.environ.get("OUTCOMES", "20"))
+try:
+    with open(path) as f:
+        lines = f.read().splitlines()
+except OSError as e:
+    raise SystemExit(f"tool-outcomes: cannot read {path} ({e})")
+
+rows, bad = [], 0
+for line in lines[-show * 2:]:
+    if not line.strip():
+        continue
+    try:
+        rows.append(json.loads(line))
+    except ValueError:
+        bad += 1
+
+if not rows:
+    print(f"tool-outcomes: no outcomes recorded yet in {path}")
+    raise SystemExit(0)
+
+for r in rows[-show:]:
+    when = time.strftime("%H:%M:%S", time.localtime(r.get("ts", 0)))
+    who = r.get("approval_id") or "-"
+    line = (f"{when}  {r.get('status','?'):<16} "
+            f"{r.get('server','?')}__{r.get('tool','?')}  approval={who}")
+    if r.get("reason"):
+        line += f"\n{' ' * 10}:: {r['reason']}"
+    print(line)
+print(f"-- {len(rows[-show:])} of {len(rows)} recent record(s)"
+      + (f", {bad} unparseable line(s) skipped" if bad else ""))
+endef
+export TOOL_OUTCOMES_PY
+
 define AUDIT_PRUNE_PY
 import os, sqlite3, time
 

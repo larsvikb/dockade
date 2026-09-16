@@ -3118,11 +3118,51 @@ class ToolPolicySourceTests(unittest.TestCase):
         self.assertIn("toolRulesFailed = false", self.poll)
         self.assertIn("toolRulesLoaded = true", self.poll)
 
+    def test_the_form_does_not_ask_again_for_what_the_preview_already_said(self):
+        """The add form has no confirm step, and that is a decision rather than a
+        regression.
+
+        The egress form confirms because its pattern is DERIVED and the dialog is the
+        first place its breadth is visible. Here the server, the tool and the action are
+        each chosen from a list, and `#toolrule-preview` renders the consequence live
+        BEFORE the click — so a modal repeating it afterwards put the disclosure on the
+        wrong side of the decision and made ruling a long tool list cost a dialog per
+        rule."""
+        handler = re.search(r'toolRuleForm\.addEventListener\("submit"[\s\S]*?\n  \}\);',
+                            self.src)
+        self.assertIsNotNone(handler, "the tool-rule submit handler is gone")
+        self.assertNotIn("window.confirm", handler.group(0))
+        # The preview it replaces has to still be rendered, or this is not a trade.
+        self.assertIn("toolRulePreview", self.src)
+        self.assertIn('id="toolrule-preview"', INDEX_HTML.read_text())
+
+    def test_a_row_action_confirms_only_when_it_widens(self):
+        """A row button is one click with no preview beside it, so the dialog is that
+        path's only disclosure — and it is spent exactly where capability increases.
+
+        `danger` is the criterion rather than "is it an allow", because three actions
+        mean deny → ask is a loosening too (see
+        ``test_an_edit_describes_the_transition_and_ranks_the_direction``)."""
+        handler = re.search(r'toolRulesBody\.addEventListener\("click"[\s\S]*?\n  \}\);',
+                            self.src)
+        self.assertIsNotNone(handler, "the tool-rule row handler is gone")
+        body = handler.group(0)
+        self.assertRegex(body, r"p\.danger\s*\n?\s*&&\s*!window\.confirm")
+
+    def test_revoking_a_tool_rule_never_confirms(self):
+        """Removing a tool rule returns the tool to unconfigured, which DENIES — the one
+        place this surface differs from the egress one, where removing a block returns a
+        host to being held and therefore to being approvable by someone who never knew it
+        had been refused. Narrowing needs no guard rail."""
+        handler = re.search(r'toolRulesBody\.addEventListener\("click"[\s\S]*?\n  \}\);',
+                            self.src)
+        self.assertIn("!revoking && p.danger", handler.group(0))
+
     def test_the_submitted_rule_is_the_one_that_was_previewed(self):
-        """The confirm has to have been about the rule that lands. Re-reading the
-        controls after `confirm()` returns would be a second derivation of a value the
-        operator has already been shown — the same trap the egress form's
-        `client_class` fell into."""
+        """What the preview described has to be what lands. Re-reading the controls
+        inside the handler would be a second derivation of a value the operator has
+        already been shown — the same trap the egress form's `client_class` fell
+        into."""
         handler = re.search(r'toolRuleForm\.addEventListener\("submit"[\s\S]*?\n  \}\);',
                             self.src)
         self.assertIsNotNone(handler, "the tool-rule submit handler is gone")

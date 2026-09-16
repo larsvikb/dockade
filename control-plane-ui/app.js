@@ -3603,12 +3603,19 @@ function start() {
     const p = toolRulePreview(toolRuleServer.value, toolRuleTool.value,
                               toolRuleAction.value, toolRules);
     if (!p.ok) return;
-    // The same friction the egress form applies, and for a reason that does not weaken
-    // for the two non-granting actions: all three take effect on the agent's very next
-    // call, and `allow` is a standing grant with nothing held behind it.
-    if (!window.confirm(`${p.text}\n\nWrite this ${p.action} rule for ${p.tool}?`)) {
-      return;
-    }
+    // NO CONFIRM STEP, and dropping it was a correction rather than a relaxation. The
+    // egress form confirms because its pattern is DERIVED — `example.com` and
+    // `*.example.com` are different grants and the controls do not say which you picked,
+    // so the dialog is the first place the breadth is visible. Nothing here is derived:
+    // the server and the tool are chosen from two lists, the action from a third, and
+    // `#toolrule-preview` renders this exact sentence live, BEFORE the click. A modal
+    // repeating it afterwards asked the operator to read the same text twice and moved
+    // the disclosure to the wrong side of the decision.
+    //
+    // The friction that remains is on the TABLE, where a row action is a single click
+    // with no preview beside it, and only when that click widens — see the handler
+    // below. Ruling a long tool list is mostly `deny` and `ask`, and neither should cost
+    // a dialog.
     toolRuleAdd.disabled = true;
     try {
       const res = await fetch("/api/mcp/rules", {
@@ -3655,7 +3662,19 @@ function start() {
     const revoking = btn.classList.contains("revoke");
     const p = revoking ? toolRevokePreview(row) : toolEditPreview(row, btn.dataset.action);
     if (!revoking && !p.ok) return;
-    if (!window.confirm(`${p.text}\n\n${revoking ? "Revoke" : "Save"} this rule?`)) {
+    // CONFIRMED ONLY WHEN THE CLICK WIDENS, which `toolEditPreview` already computes as
+    // `danger` — `toolRank(to) > toolRank(from)`, so deny→ask counts as well as anything
+    // →allow. The direction is the whole criterion: a row button is one click with no
+    // preview beside it, so the dialog is this path's only disclosure, and it is worth
+    // spending exactly where capability increases.
+    //
+    // Revoking never asks, and that is not an omission. Removing a tool rule returns the
+    // tool to unconfigured, which DENIES — `toolRevokePreview` exists as its own function
+    // because this is the one place the tool surface differs from the egress one, where
+    // removing a block returns a host to being HELD and therefore to being approvable.
+    // Narrowing does not need a guard rail.
+    if (!revoking && p.danger
+        && !window.confirm(`${p.text}\n\nSave this rule?`)) {
       return;
     }
     btn.disabled = true;

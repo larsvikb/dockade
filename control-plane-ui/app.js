@@ -1043,6 +1043,90 @@ function pendingAnnouncement(added, total) {
   return `${added.length} new approvals needed. ${total} pending.`;
 }
 
+// ── desktop notification for an arriving approval ───────────────────────────
+//
+// The same ARRIVALS the live region announces, one surface further out. The `(n)`
+// title prefix and the favicon lamp only reach a tab someone can see; a hold with a
+// two-minute fuse on a page nobody watches needs to reach past the window.
+//
+// One notice per arrival, tagged with the approval id, which buys two things the
+// tag-less form does not: the OS replaces rather than stacks on a repeat, and
+// `renderPending` can CLOSE the notice when its hold leaves. That second one matters
+// here in a way it does not for mail — a notification still asking for a decision
+// that already default-denied is worse than no notification at all.
+//
+// Above NOTIFY_MAX arrivals in a single push that stops being true: a dozen separate
+// notices is not information. They collapse into one summary, which carries no id and
+// is therefore closed for none of them — the count is the message by then, and the
+// page is where the detail is.
+const NOTIFY_MAX = 3;
+
+// The title NAMES THE APP, which a title inside the page never has to. The OS
+// attributes the notification to the browser — "Google Chrome" — so "Approval needed"
+// arrives from an application that has dozens of pages open and says nothing about
+// which one is asking, or that the thing asking is a governance decision at all.
+function approvalNotices(added, total) {
+  if (!added || !added.length) return [];
+  if (added.length > NOTIFY_MAX) {
+    return [{ tag: "", title: `${added.length} Dockade approvals needed`,
+              body: added.map(cardSubject).join(", ") }];
+  }
+  // Only when there is a backlog BEYOND what this notice is about. Two arrivals on an
+  // otherwise empty queue saying "· 2 pending" is the notice restating itself.
+  const pending = total > added.length ? ` · ${total} pending` : "";
+  return added.map(a => ({ tag: a.id || "", title: "Dockade approval needed",
+                           body: cardSubject(a) + pending }));
+}
+
+// Whether an arrival may raise a notification, in one place because the rule is four
+// conditions and three of them are easy to get subtly wrong:
+//
+//   `granted` only. `default` must not notify — asking needs a user gesture in Firefox
+//   and Safari, and the header button is what supplies one.
+//
+//   `primed` is false until the first push has rendered. A reload delivers every
+//   waiting hold as an arrival, and a browser restoring the tab in the background
+//   would fire a notification per hold for approvals that arrived while it was shut.
+//   Nothing NEW happened; the queue was simply read for the first time.
+//
+//   Visible AND on the approvals view means the card is already on screen. Visible is
+//   not focused — a second monitor counts — but in both cases the operator is looking
+//   at the thing the notification would point them to.
+function shouldNotify(permission, primed, visible, view) {
+  if (permission !== "granted" || !primed) return false;
+  return !(visible && view === "approvals");
+}
+
+// The header button, by permission state. Split from the DOM so the states are
+// legible in one glance, since three of the four are states nobody hits by accident:
+//
+//   granted     nothing to offer — it works.
+//   default     the only clickable state, and the gesture the API requires.
+//   denied      SHOWN, disabled. Script cannot undo a denial; only the browser's own
+//               site settings can. Hiding it is how a misclicked "Block" turns into a
+//               feature that is silently gone forever with nothing on screen to say so.
+//   unavailable no API here. Notification needs a SECURE CONTEXT: compose publishes
+//               this UI on 127.0.0.1, which counts as one over plain HTTP, so the
+//               ordinary deployment is fine — but front it under another name and the
+//               API is either absent or auto-denies. That is precisely the operator
+//               who needs telling, hence the title text.
+const NOTIFY_BUTTON = {
+  granted: { hidden: true, disabled: false, text: "", title: "" },
+  default: { hidden: false, disabled: false, text: "notify me",
+             title: "Raise a desktop notification when an approval arrives" },
+  denied: { hidden: false, disabled: true, text: "notifications blocked",
+            title: "This browser is blocking notifications for this site. "
+                 + "Only its site settings can undo that." },
+  unavailable: { hidden: false, disabled: true, text: "notifications unavailable",
+                 title: "Notifications need a secure origin. This page is served over "
+                      + "plain HTTP under a name the browser does not treat as one — "
+                      + "reach it on localhost instead." },
+};
+
+function notifyButton(state) {
+  return NOTIFY_BUTTON[state] || NOTIFY_BUTTON.unavailable;
+}
+
 // What the decisions list is a WINDOW ONTO, in words.
 //
 // The list shows the most recent groups and has always silently truncated. Grouping
@@ -1722,6 +1806,90 @@ function start() {
     pb.classList.toggle("unseen", policyUnseen && current !== "policy");
   }
 
+  // ── desktop notifications ─────────────────────────────────────────────────
+  // The one indicator that reaches OUTSIDE the tab. Everything above it needs the
+  // page to be looked at; see `approvalNotices` for why this one exists and
+  // `shouldNotify` for when it fires.
+  const notifyEl = document.getElementById("notify");
+  // tag (an approval id) -> the live Notification, so a hold that leaves the queue
+  // takes its notice with it.
+  const notices = new Map();
+  let notifyPrimed = false;
+  // Latched by a constructor that throws: some browsers expose `Notification` but
+  // allow only the service-worker form, and a page that has no worker cannot get
+  // there. One failure is enough to know the rest will fail the same way.
+  let notifyBroken = false;
+
+  function notifyState() {
+    if (typeof Notification === "undefined" || !window.isSecureContext
+        || notifyBroken) {
+      return "unavailable";
+    }
+    return Notification.permission;
+  }
+
+  function syncNotifyButton() {
+    const b = notifyButton(notifyState());
+    notifyEl.hidden = b.hidden;
+    notifyEl.disabled = b.disabled;
+    notifyEl.textContent = b.text;
+    notifyEl.title = b.title;
+  }
+
+  notifyEl.addEventListener("click", async () => {
+    await Notification.requestPermission();
+    syncNotifyButton();
+  });
+
+  function notifyArrivals(added, total) {
+    if (!shouldNotify(notifyState(), notifyPrimed, visible(), current)) return;
+    for (const n of approvalNotices(added, total)) {
+      let note;
+      try {
+        // Deliberately NOT `requireInteraction`. Pinning the toast on screen until it
+        // is dealt with reads like the right call for a hold with a ~120s fuse, but
+        // Chrome answers a persistent notification with a Close button of its own —
+        // unlabelable from here, and a second way to dismiss next to the one the
+        // toast already has. An ordinary notification fades after a few seconds into
+        // the OS notification centre, which is where an operator who was away from
+        // the desk looks anyway; `closeNotice` takes it back out of there when the
+        // hold is gone.
+        note = new Notification(n.title, { body: n.body, tag: n.tag || undefined });
+      } catch (e) {
+        notifyBroken = true;
+        syncNotifyButton();
+        return;
+      }
+      note.onclick = () => {
+        // Bring the console forward AND land on the queue: a notification that
+        // raises the window on whatever view was last open has done half its job.
+        window.focus();
+        location.hash = "approvals";
+        note.close();
+      };
+      // Kept until the HOLD departs rather than until the toast does. Dropping the
+      // reference on the notification's own `close` event looks tidier and is wrong:
+      // a toast that has merely faded into the notification centre is still there to
+      // be read, and whether that fires a close event is the browser's business.
+      // `close()` on an already-closed notification does nothing, so holding the
+      // reference costs nothing and never misses.
+      if (n.tag) notices.set(n.tag, note);
+    }
+  }
+
+  // A notice is closed by its hold LEAVING the queue, whichever way it went — the
+  // operator's own click from this page, a resolve from somewhere else, or the
+  // expiry that default-denied it. All three make the question moot, and only the
+  // first is one the operator already knows about. This reaches further than the
+  // screen: a faded toast is still sitting in the OS notification centre, and that
+  // is exactly where a stale one would be read hours later as a live question.
+  function closeNotice(id) {
+    const note = notices.get(id);
+    if (!note) return;
+    notices.delete(id);
+    note.close();
+  }
+
   // ── pending approvals, keyed by approval id ───────────────────────────────
   const pendingEl = document.getElementById("pending");
   const emptyEl = document.getElementById("pending-empty");
@@ -2316,6 +2484,8 @@ function start() {
     // racing the cards that carry it.
     const say = pendingAnnouncement(add, list.length);
     if (say) pendingLive.textContent = say;
+    // The same arrivals, one surface further out.
+    notifyArrivals(add, list.length);
     for (const a of add) {
       const entry = buildCard(a);
       cards.set(a.id, entry);
@@ -2338,6 +2508,7 @@ function start() {
       }
     }
     for (const id of gone) {
+      closeNotice(id);
       const entry = cards.get(id);
       if (entry.state === "pending" || entry.state === "confirming"
           || entry.state === "resolving") {
@@ -2359,6 +2530,10 @@ function start() {
     }
     sweep();
     updateIndicators();
+    // Set AFTER the first push has been rendered, never at load: until a list has
+    // arrived there is nothing to distinguish "the queue was already this long" from
+    // "these just came in", and only the second is worth a notification.
+    notifyPrimed = true;
   }
 
   // Redrawn once a second for every live card. Cheap, and the only thing that makes a
@@ -3801,6 +3976,7 @@ function start() {
   const visible = () => document.visibilityState !== "hidden";
 
   showView(current);
+  syncNotifyButton();
   connect();
   refreshAudit();
   refreshRules();
@@ -3859,6 +4035,7 @@ if (typeof module !== "undefined" && module.exports) {
     leaseLabel, leaseRemaining, leaseCountdown, leasesStatus,
     leaseDomain, groupLeases, LEASE_GROUP_MIN, shortActor,
     outageSummary, pendingAnnouncement, coverageSummary, revokePreview,
+    approvalNotices, shouldNotify, notifyButton, NOTIFY_MAX,
     normalizePattern, createPreview, editPreview,
     serverDescriptor, serverPreview, serverEditBody, SERVER_NAME_RE,
     toolChoices, toolRulePreview, toolEditPreview, toolRevokePreview, toolRulesStatus,

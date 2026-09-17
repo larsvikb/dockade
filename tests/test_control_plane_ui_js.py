@@ -73,7 +73,7 @@ const missing = ["lampState", "backoffDelay", "diffPending", "shouldSweep",
                  "timeWindow", "filterActive", "auditQuery", "eventRow",
                  "historyPager", "renderableHolds",
                  "toolRemaining", "payloadDisclosure", "toolOutcomeMessage",
-                 "cardSubject",
+                 "cardSubject", "approvalNotices", "shouldNotify", "notifyButton",
                  "fmtTime", "fmtStamp", "fmtInstant",
                  "serverDescriptor", "serverPreview", "serverEditBody",
                  "toolChoices", "toolRulePreview", "toolEditPreview",
@@ -214,6 +214,42 @@ console.log(JSON.stringify({
       [{ kind: "tool", tool: "issue_write", server: "mcp-github" }], 1),
     say_tool_nameless: m.cardSubject({ kind: "tool" }),
     say_egress: m.pendingAnnouncement([{ host: "example.com" }], 1),
+  },
+  // The desktop notice for the same arrivals. Tagged with the approval id up to the
+  // cap, because the tag is what lets a resolved hold take its notification with it.
+  notify: {
+    max: m.NOTIFY_MAX,
+    none: m.approvalNotices([], 0),
+    no_list: m.approvalNotices(null, 0),
+    one: m.approvalNotices([{ id: "a1", host: "github.com" }], 1),
+    one_of_many: m.approvalNotices([{ id: "a1", host: "github.com" }], 4),
+    ask: m.approvalNotices(
+      [{ id: "t1", kind: "tool", tool: "issue_write", server: "mcp-github" }], 1),
+    unidentified: m.approvalNotices([{ host: "github.com" }], 1),
+    at_cap: m.approvalNotices(
+      Array.from({ length: m.NOTIFY_MAX }, (_, i) => ({ id: `a${i}`, host: `h${i}` })),
+      m.NOTIFY_MAX),
+    over_cap: m.approvalNotices(
+      Array.from({ length: m.NOTIFY_MAX + 1 },
+                 (_, i) => ({ id: `a${i}`, host: `h${i}` })),
+      m.NOTIFY_MAX + 1),
+    // permission, primed, visible, view
+    gate: {
+      background: m.shouldNotify("granted", true, false, "approvals"),
+      other_view: m.shouldNotify("granted", true, true, "audit"),
+      watching_the_queue: m.shouldNotify("granted", true, true, "approvals"),
+      not_asked_yet: m.shouldNotify("default", true, false, "approvals"),
+      refused: m.shouldNotify("denied", true, false, "approvals"),
+      unavailable: m.shouldNotify("unavailable", true, false, "approvals"),
+      first_push: m.shouldNotify("granted", false, false, "approvals"),
+    },
+    button: {
+      granted: m.notifyButton("granted"),
+      default: m.notifyButton("default"),
+      denied: m.notifyButton("denied"),
+      unavailable: m.notifyButton("unavailable"),
+      junk: m.notifyButton("nonsense"),
+    },
   },
   sweep: {
     idle_fresh: m.shouldSweep(false, 0),
@@ -2483,6 +2519,111 @@ class PageScriptTests(unittest.TestCase):
         # Degrades to a sentence rather than to "Approval needed for undefined."
         self.assertIn("unnamed host", self.probe["saturation"]["announce"]["nameless"])
 
+    def test_an_arriving_approval_notifies_with_its_subject(self):
+        """Same reasoning as the announcement: the subject IS the decision. A notice
+        reading "approval needed" tells the operator to walk back to the machine
+        without telling them whether it is worth doing now."""
+        n = self.probe["notify"]
+        self.assertEqual(len(n["one"]), 1)
+        self.assertEqual(n["one"][0]["body"], "github.com")
+        self.assertEqual(n["one"][0]["tag"], "a1")
+        # A tool ask names the tool, not a host it does not have.
+        self.assertEqual(n["ask"][0]["body"], "issue_write on mcp-github")
+
+    def test_every_title_names_the_app(self):
+        """The OS credits the notification to the BROWSER. "Approval needed" from
+        Google Chrome says neither which of its dozens of pages is asking nor that
+        the question is a governance decision — the one thing the title must carry
+        that a heading inside the page never has to."""
+        n = self.probe["notify"]
+        for case in ("one", "ask", "at_cap", "over_cap"):
+            for notice in n[case]:
+                with self.subTest(case=case):
+                    self.assertIn("Dockade", notice["title"])
+
+    def test_the_backlog_is_named_only_when_it_exceeds_the_arrival(self):
+        # "1 approval needed · 1 pending" is the notice restating itself; the count is
+        # worth saying exactly when it reports holds this notice is NOT about.
+        n = self.probe["notify"]
+        self.assertIn("4 pending", n["one_of_many"][0]["body"])
+        self.assertNotIn("pending", n["one"][0]["body"])
+        self.assertNotIn("pending", n["at_cap"][0]["body"])
+
+    def test_nothing_is_notified_when_nothing_arrived(self):
+        n = self.probe["notify"]
+        self.assertEqual(n["none"], [])
+        self.assertEqual(n["no_list"], [])
+
+    def test_a_burst_collapses_into_one_notice(self):
+        """One notice per arrival is what makes a notification closable when its hold
+        leaves — but a dozen separate notices is not information. Past the cap the
+        count is the message, and the summary carries no tag precisely because it
+        stands for several holds and belongs to none of them."""
+        n = self.probe["notify"]
+        self.assertEqual(len(n["at_cap"]), n["max"])
+        self.assertEqual(len(n["over_cap"]), 1)
+        self.assertEqual(n["over_cap"][0]["tag"], "")
+        self.assertIn(str(n["max"] + 1), n["over_cap"][0]["title"])
+        # The summary still says WHICH, even though it cannot be closed per hold.
+        self.assertIn("h0", n["over_cap"][0]["body"])
+
+    def test_an_approval_with_no_id_still_notifies(self):
+        # Degrades to an untaggable notice — shown, never closed early — rather than
+        # to no notice at all. The id is how it is closed, not whether it is raised.
+        n = self.probe["notify"]
+        self.assertEqual(len(n["unidentified"]), 1)
+        self.assertEqual(n["unidentified"][0]["tag"], "")
+
+    def test_only_a_granted_permission_notifies(self):
+        """`default` must not notify: requesting permission needs a user gesture in
+        Firefox and Safari, and the header button is the only thing that supplies
+        one. A page that asked on load would be refused and never ask again."""
+        g = self.probe["notify"]["gate"]
+        self.assertTrue(g["background"])
+        self.assertFalse(g["not_asked_yet"])
+        self.assertFalse(g["refused"])
+        self.assertFalse(g["unavailable"])
+
+    def test_the_first_push_never_notifies(self):
+        """A reload delivers every waiting hold as an arrival. Notifying there would
+        fire once per hold for approvals that arrived while the page was shut —
+        loudest exactly when nothing new has happened."""
+        self.assertFalse(self.probe["notify"]["gate"]["first_push"])
+
+    def test_watching_the_queue_suppresses_the_notice(self):
+        """The card is already on screen. Visible is not focused — a second monitor
+        counts — but either way the notification would point at what is being looked
+        at. Any other view still notifies: a hidden tab and a hidden VIEW have the
+        same consequence for a hold that default-denies."""
+        g = self.probe["notify"]["gate"]
+        self.assertFalse(g["watching_the_queue"])
+        self.assertTrue(g["other_view"])
+
+    def test_a_blocked_permission_is_shown_rather_than_hidden(self):
+        """Script cannot undo a denial — only the browser's site settings can. Hiding
+        the button is how a misclicked "Block" becomes a feature that is silently gone
+        forever, with nothing on screen to say why the notices stopped."""
+        b = self.probe["notify"]["button"]
+        self.assertTrue(b["granted"]["hidden"])       # working, nothing to offer
+        self.assertFalse(b["default"]["hidden"])      # the only clickable state
+        self.assertFalse(b["default"]["disabled"])
+        self.assertFalse(b["denied"]["hidden"])
+        self.assertTrue(b["denied"]["disabled"])
+        self.assertTrue(b["denied"]["title"])         # and says who can undo it
+
+    def test_an_insecure_origin_says_so_rather_than_going_quiet(self):
+        """Notification needs a secure context. Compose publishes this UI on
+        127.0.0.1, which counts as one over plain HTTP — so the ordinary deployment
+        works and only a UI fronted under another name loses the API. That operator is
+        exactly the one who needs telling, and the API gives them no signal itself."""
+        b = self.probe["notify"]["button"]
+        self.assertFalse(b["unavailable"]["hidden"])
+        self.assertTrue(b["unavailable"]["disabled"])
+        self.assertIn("secure origin", b["unavailable"]["title"])
+        # An unknown state fails toward the same dead end rather than toward a button
+        # that offers a permission the page may not be able to ask for.
+        self.assertEqual(b["junk"], b["unavailable"])
+
     def test_a_repeated_decision_says_how_many_and_over_what_span(self):
         """`/api/audit` groups identical decisions, so a row can stand for many. The
         count without the span is not enough: 47x cannot distinguish a burst from a
@@ -2925,6 +3066,60 @@ class PollGatingSourceTests(unittest.TestCase):
         # updating the page.
         self.assertRegex(
             self.src, r'visible = \(\) => document\.visibilityState !== "hidden"')
+
+
+class NotificationWiringSourceTests(unittest.TestCase):
+    """The notification plumbing lives inside `start()`, so what the pure helpers
+    cannot cover is asserted against the source.
+
+    All three failures here are silent ones. A permission requested outside a click is
+    refused by Firefox and Safari and never asked again — with no error, and a button
+    that has already hidden itself. A notice raised from anything but `diffPending`'s
+    arrivals would re-fire for holds already on screen on every push. And a notice that
+    is never closed keeps asking for a decision that has already default-denied, which
+    is worse than the notification not existing."""
+
+    def setUp(self):
+        self.src = APP_JS.read_text()
+        self.render = re.search(r"\n  function renderPending\(list\) \{[\s\S]*?\n  \}\n",
+                                self.src)
+        self.assertIsNotNone(self.render, "renderPending is gone — renamed?")
+
+    def test_permission_is_requested_only_from_a_click(self):
+        asked = re.findall(r"Notification\.requestPermission\(", self.src)
+        self.assertEqual(len(asked), 1,
+                         "permission is requested from more than one place; only the "
+                         "button's click carries the user gesture the API needs")
+        click = re.search(r'notifyEl\.addEventListener\("click"[\s\S]*?\n  \}\);',
+                          self.src)
+        self.assertIsNotNone(click, "the notify button's click handler is gone")
+        self.assertIn("Notification.requestPermission(", click.group(0))
+
+    def test_the_notice_rides_the_same_arrivals_as_the_announcement(self):
+        # `add` is diffPending's, so it is already empty for holds that survived a
+        # stream reconnect — the cards map outlives the connection. Nothing else in
+        # the page knows which approvals are NEW.
+        body = self.render.group(0)
+        self.assertIn("notifyArrivals(add, list.length)", body)
+        self.assertIn("pendingAnnouncement(add, list.length)", body)
+
+    def test_a_departed_hold_takes_its_notice_with_it(self):
+        # In the `gone` loop, not in the resolve handler: the operator's own click is
+        # the one departure they already know about. The two that matter are a resolve
+        # from elsewhere and the expiry that default-denied.
+        gone = re.search(r"for \(const id of gone\) \{[\s\S]*?\n    \}", self.render.group(0))
+        self.assertIsNotNone(gone, "the departure loop is gone — restructured?")
+        self.assertIn("closeNotice(id)", gone.group(0))
+
+    def test_the_first_render_primes_rather_than_notifies(self):
+        self.assertRegex(self.src, r"let notifyPrimed = false;")
+        self.assertIn("notifyPrimed = true", self.render.group(0))
+
+    def test_the_secure_context_check_survives(self):
+        """Dropping it does nothing visible on 127.0.0.1 — which is where this is
+        developed — and silently leaves an operator on another origin with a button
+        that asks for a permission the browser will not grant."""
+        self.assertIn("window.isSecureContext", self.src)
 
 
 class LeaseTableSourceTests(unittest.TestCase):

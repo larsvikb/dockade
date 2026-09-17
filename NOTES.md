@@ -587,6 +587,27 @@ locale-driven format cannot be asserted, only shape-checked, and a UTC-defaulted
 runner will not catch a UTC-for-local mix-up. Pinning `TZ` to a zone with a non-zero
 offset is what makes that assertable.
 
+## `requireInteraction` buys persistence and costs a Close button
+
+A web `Notification` created with `requireInteraction: true` stays on screen until it
+is acted on instead of fading after a few seconds. Chrome answers that by rendering a
+**Close** button on the notification itself — in addition to the dismiss affordance
+every toast already has. The label is the browser's, so a page cannot reword it to
+"Dismiss" or suppress it; the only lever is whether to ask for persistence at all.
+
+Two facts that decide how much the persistence is worth on Windows:
+
+- **A faded notification is not gone.** It moves into the OS notification centre and
+  stays there, which is where someone who was away from the desk looks anyway. The
+  choice is therefore between "on screen until handled" and "on screen briefly, then
+  filed" — not between seen and lost.
+- **`close()` reaches the notification centre too**, so a page that knows its notice
+  has gone stale can withdraw it from there rather than leaving a question that was
+  answered hours ago sitting in the bell menu.
+
+Found by using it: the Close button is invisible in code review and obvious in the
+first toast.
+
 ## Local inference on an Intel Arc 140V iGPU (Lunar Lake, WSL2)
 
 Decisions these numbers produced are in DESIGN.md → "Local inference"; this is the

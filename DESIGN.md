@@ -1957,7 +1957,17 @@ must not fetch its own control logic or icons per page load) whose lit lamp mean
 **red = blind** (SSE down; an unseen hold default-denies after `CONTROL_HOLD_TIMEOUT`)
 rather than red = denied, with the pre-JS fallback amber ("unknown", not "all clear") and
 a `(n)` title prefix so the background tab nobody watches still shows the count. Rendering
-specifics (lamp opacity, `href`-reassignment throttling) are in `app.js`. A real audit
+specifics (lamp opacity, `href`-reassignment throttling) are in `app.js`.
+Past the tab strip, **an opt-in desktop notification** is the only indicator that reaches
+an operator who is looking at something else — which a ~120s fuse makes the case worth
+covering, since the tab is not what they are watching while the hold burns. Opt-in
+literally: the Notification API needs a user gesture to ask, so a header button asks and
+the browser's own permission is the setting. It notifies per ARRIVAL and only past the
+first push (a reload delivers the whole queue as arrivals), stays quiet while the
+approvals view is on screen, and closes a notice when its hold leaves the queue however
+it left. The rules are `approvalNotices` / `shouldNotify` in `app.js`. Its one
+environmental dependency: a secure context, which `127.0.0.1` satisfies over plain HTTP
+and another origin would not — so the button says so rather than going quiet. A real audit
 browser (filter/search/history) is step 2c; this is the navigation it will extend.
 
 **Standing policy is visible in the UI (`GET /api/egress/rules`).** The UI showed
@@ -3569,14 +3579,17 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
   that produced the reconnect / CSP / keyed-rendering work above, in value order. The
   top two — the hold countdown and the persist preview/confirm with an operator-chosen
   pattern — are **now built**; see "Frontend mechanics" (the hold countdown) and "A
-  `+ persist` says what it will write" under the frontend section. What remains:
+  `+ persist` says what it will write" under the frontend section. What became of the
+  rest:
   - *(A DOM-level test for `start()` was considered here and **declined** — the frontend
     is treated as a convenience layer over a backend that validates every input, with its
     mistakes made detectable rather than prevented. The reasoning, and the condition that
     would reopen it, are under "`start()` is deliberately unverified" above.)*
-  - **Opt-in desktop notification.** `http://localhost` is a secure context, so the
-    Notification API is available; with a ~120s fuse and a page nobody watches, this is
-    the honest fix for the problem the `(n)` title prefix only mitigates.
+  - *(The **opt-in desktop notification** is **now built** — see the traffic-light
+    paragraph under the frontend section. It gained one property on contact that the
+    specification did not have: a notice is closed by its hold leaving the queue,
+    because a notification still asking for a decision that has already default-denied
+    is worse than no notification.)*
   - *(The smaller items filed here — hop-by-hop header stripping on the request side,
     an announcement for arriving approvals, visibility-gated pollers, and "showing N
     of M recorded decisions" — are **now built**. Two of them changed shape on

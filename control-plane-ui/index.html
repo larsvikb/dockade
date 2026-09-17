@@ -27,6 +27,12 @@
     display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
   header h1 { font-size: 16px; margin: 0; font-weight: 600; }
   header .sub { color: var(--dim); font-size: 12px; }
+  /* Quiet, like button.revoke: it grants the browser a permission and decides
+     nothing about governance, so it must not read as one of the resolve buttons. */
+  #notify { background: transparent; color: var(--dim); border-color: var(--line);
+    font-size: 12px; padding: 2px 8px; }
+  #notify:hover:not([disabled]) { color: var(--fg); border-color: var(--dim); }
+  #notify[disabled] { opacity: .7; cursor: default; }
   #conn { margin-left: auto; font-size: 12px; color: var(--dim); }
   #conn.up { color: var(--allow); }
   #conn.down { color: var(--deny); }
@@ -322,6 +328,10 @@
 <header>
   <h1>dockade control plane</h1>
   <span class="sub">hold-for-approval &middot; egress governance</span>
+  <!-- Hidden until the script says otherwise: with no JS there is nothing to ask
+       permission FOR, and the states this button can be in are decided by an API the
+       markup cannot see. app.js fills the label (see `notifyButton`). -->
+  <button type="button" id="notify" hidden></button>
   <span id="conn" class="down">connecting…</span>
 </header>
 

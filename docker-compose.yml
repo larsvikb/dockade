@@ -361,6 +361,11 @@ services:
       # the point: the proxy owns the record, and the reader must not be able to
       # rewrite the evidence it is reading.
       - egress-audit:/var/log/egress:ro
+      # The tool gateway's outcome stream, READ-ONLY, drained by the same ingest for
+      # the same reason: this process records the DECISION, but how the call ENDED is
+      # knowable only to the gateway — the claim row is written before the call runs,
+      # so the authority cannot witness the result of what it authorised.
+      - tool-audit:/var/log/tool-gateway:ro
     # /healthz on the AUTHORIZE listener (8091), which is the one the proxy's
     # service_healthy gate is actually about. Probed over loopback, which reaches it
     # because that listener binds the wildcard. It is the ONLY one of the three that

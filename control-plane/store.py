@@ -47,7 +47,7 @@ LEGACY_CLIENT_CLASS = "sandbox"
 # The schema this code expects. Every entry in ``_STEPS`` below adds exactly one,
 # and a store records the version it is at (see ``_migrate``), so "what has already
 # run here" is a number to compare rather than a schema to interrogate.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def _connect() -> sqlite3.Connection:
@@ -215,6 +215,19 @@ def _step_3_tool_correlation(conn: sqlite3.Connection) -> None:
               f"NULL — they predate tool correlation)", flush=True)
 
 
+def _step_4_tool_status(conn: sqlite3.Connection) -> None:
+    """v4 — ``audit.status``, for how a tool call ended (the DDL carries the reasoning).
+
+    Split from v3 rather than added with the other three, and the split was deliberate:
+    when the correlation columns landed nothing could write this one, and a column no
+    writer fills is schema that documents an intention rather than a record. It gets a
+    step of its own now that the gateway's stream exists to fill it."""
+    if "status" not in _columns(conn, "audit"):
+        conn.execute("ALTER TABLE audit ADD COLUMN status TEXT")
+        print("control-plane: added status to audit (existing rows keep NULL — they "
+              "predate the gateway's outcome stream)", flush=True)
+
+
 # Ordered, and the order is the only thing that decides what runs: a step is applied
 # when its version exceeds the store's, so steps must be APPEND-ONLY and never
 # renumbered, reordered or edited once shipped — a store in the field has already run
@@ -224,6 +237,7 @@ _STEPS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = (
     (1, "per-client-class policy", _step_1_client_class),
     (2, "timed grants (leases)", _step_2_leases),
     (3, "tool correlation columns", _step_3_tool_correlation),
+    (4, "tool outcome status", _step_4_tool_status),
 )
 
 
@@ -397,7 +411,13 @@ def _init_db() -> None:
                 -- value for it.
                 server       TEXT,
                 tool         TEXT,
-                approval_id  TEXT
+                approval_id  TEXT,
+                -- How the call ENDED, from the gateway's own stream (ingest.py). Its
+                -- vocabulary is `ingest.TOOL_STATUSES`, not `decision`'s: an outcome
+                -- is not a decision anyone made, and `ok` / `tool-error` /
+                -- `transport-error` / `timeout` answer a different question than
+                -- allow/deny/hold. NULL on every row that is not a tool outcome.
+                status       TEXT
             )""")
         conn.execute("CREATE INDEX IF NOT EXISTS audit_ts ON audit(ts)")
         # This table grows without bound — every decision is kept, and only
@@ -556,14 +576,14 @@ def _audit(decision: str, **fields) -> None:
     with _connect() as conn:
         conn.execute(
             "INSERT INTO audit(ts, decision, stage, host, port, proto, client, "
-            "client_class, method, url, reason, server, tool, approval_id) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "client_class, method, url, reason, server, tool, approval_id, "
+            "status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (time.time(), decision, cap(fields.get("stage")), cap(fields.get("host")),
              fields.get("port"), cap(fields.get("proto")), cap(fields.get("client")),
              cap(fields.get("client_class")),
              cap(fields.get("method")), cap(fields.get("url")), cap(fields.get("reason")),
              cap(fields.get("server")), cap(fields.get("tool")),
-             cap(fields.get("approval_id"))))
+             cap(fields.get("approval_id")), cap(fields.get("status"))))
         conn.commit()
     # Mirror every decision to stdout so `docker compose logs -f control-plane`
     # (make logs-cp) is a live decision feed — the same role the egress proxy's

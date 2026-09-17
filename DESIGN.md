@@ -3379,7 +3379,8 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | MCP gateway — per-tool allow/deny/ask on `tools/call`, the pending ask, `resume_tool_call` | **done** — no agent is pointed at it yet |
 | — | tell the sandbox it exists — firewall grant, proxy exemption, `--mcp-config` from a wrapper | **done** |
 | — | tool audit is joinable — `server`/`tool`/`approval_id` columns, filled by every writer | **done** |
-| — | the gateway records how a call ENDED — its own JSONL stream | **done** — written and readable; not yet ingested |
+| — | the gateway records how a call ENDED — its own JSONL stream | **done** |
+| — | outcomes ingested — second stream, `status` column, `outcome` in the audit vocabulary | **done** — one approval id now selects the hold, the answer, the claim and the result |
 
 The rationale for each shipped item lives under **Governance surfaces** above, not here
 — a status line goes stale, the reasoning does not. This section is deliberately the

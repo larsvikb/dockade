@@ -44,13 +44,20 @@ from __future__ import annotations
 # as a constant with the call sites — the writer takes ``decision`` as a plain string
 # from four different places, and a new word appearing there without appearing here
 # would make its rows unfilterable while every other test passed.
-# "observe" is the odd one and is here deliberately: it is NOT a decision. It records
-# something a server claimed about itself — its tool surface changed — which nothing in
-# this process decided and which decides nothing in return. It shares the column
-# because it shares the question an operator asks of this log ("what happened, and
-# when"), and it is filterable for the same reason the others are: a row nobody can
-# select for is a row nobody reads.
-DECISIONS = ("allow", "deny", "hold", "revoke", "create", "edit", "observe")
+# "observe" and "outcome" are the two that are NOT decisions, and both are here
+# deliberately. `observe` records something a server claimed about itself — its tool
+# surface changed. `outcome` records how a tool call ended, which only the gateway can
+# know (`ingest.py`). Neither was decided by this process and neither decides anything
+# in return. They share the column because they share the question an operator asks of
+# this log ("what happened, and when"), and they are filterable for the same reason the
+# others are: a row nobody can select for is a row nobody reads.
+#
+# They stay SEPARATE words rather than one "not a decision" bucket, because `observe`
+# earns its worth by being rare — one writer, changes only, and an image bump that
+# starts exposing a destructive tool reads as the alarm it is. Outcome rows are one per
+# tool call. Folding them together would bury the rare signal under the common one.
+DECISIONS = ("allow", "deny", "hold", "revoke", "create", "edit", "observe",
+             "outcome")
 
 # Columns ``q`` searches, PER VIEW, and the rule is that a view searches exactly what
 # it DISPLAYS. Anything else produces the worst kind of result list: rows whose visible
@@ -66,7 +73,7 @@ EVENT_SEARCH = ("host", "client", "client_class", "reason", "method", "url")
 # all) are exactly what has to be here, or the interface still cannot answer "which
 # request was it".
 EVENT_COLUMNS = ("id", "ts", "decision", "stage", "host", "port", "proto", "client",
-                 "client_class", "method", "url", "reason",
+                 "client_class", "method", "url", "reason", "status",
                  # The tool columns, for the same reason ``url`` is here: this is the
                  # view that answers "which one was it", and the tool rows' identity —
                  # which server, which tool, which approval — is not in any of the

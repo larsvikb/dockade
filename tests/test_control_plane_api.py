@@ -1692,7 +1692,9 @@ class AuditRecordTests(_CPTestCase):
              # an egress decision is host/port/url — and they are here because this is
              # the view that answers "which one was it" for a TOOL row, whose identity
              # is in none of the columns above.
-             "server", "tool", "approval_id"})
+             "server", "tool", "approval_id",
+             # And how it ended, for the tool rows the gateway's stream fills.
+             "status"})
         self.assertEqual(row["url"], "https://a.example/x")
 
     def test_nothing_is_folded(self):
@@ -3832,6 +3834,87 @@ class ToolCorrelationColumnTests(_ToolBridgeTestCase):
                          (None, None, None))
 
 
+class TwoServersOneToolNameTests(_ToolBridgeTestCase):
+    """The reason ``server`` is a COLUMN and ``tool_rules`` is UNIQUE on the pair.
+
+    Tool names are not namespaced across servers: two servers can each expose an
+    `issue_read`, and nothing in the name says which. If the audit trail could not tell
+    them apart, every query about one server would quietly merge in the other's history
+    — and policy would be worse than quiet, since one server's rule would decide the
+    other's identically named tool.
+
+    The multi-server path has never run against real containers (only one is
+    registered in `mcp-servers.yml`), which is exactly why it is asserted here."""
+
+    audits = True
+
+    def setUp(self):
+        super().setUp()
+        _register("mcp-other")
+        _enable("mcp-other")
+
+    def test_a_rule_on_one_server_does_not_decide_the_others_tool(self):
+        # The boundary, not the bookkeeping. `issue_read` is allowed on one server and
+        # unconfigured on the other, and unconfigured is DENIED — so a leak here is a
+        # call running against a server no one ruled.
+        _tool_rule("issue_read", "allow", server="mcp-github")
+        self.assertEqual(_tool_call(server="mcp-github", tool="issue_read")["decision"],
+                         "allow")
+        self.assertEqual(_tool_call(server="mcp-other", tool="issue_read")["decision"],
+                         "deny")
+
+    def test_both_servers_can_hold_a_rule_for_the_same_tool_name(self):
+        # UNIQUE(server, tool), not UNIQUE(tool). A constraint on the name alone would
+        # make the second write fail or silently no-op, leaving one server unruled
+        # while the operator believes they configured it.
+        _tool_rule("issue_read", "allow", server="mcp-github")
+        _tool_rule("issue_read", "deny", server="mcp-other")
+        self.assertEqual(_tool_call(server="mcp-github", tool="issue_read")["decision"],
+                         "allow")
+        self.assertEqual(_tool_call(server="mcp-other", tool="issue_read")["decision"],
+                         "deny")
+
+    def test_the_audit_rows_are_told_apart_by_the_column(self):
+        # And not by parsing the reason prose, which names both but is a sentence.
+        _tool_rule("issue_read", "allow", server="mcp-github")
+        _tool_rule("issue_read", "deny", server="mcp-other")
+        _tool_call(server="mcp-github", tool="issue_read")
+        _tool_call(server="mcp-other", tool="issue_read")
+        with cp.store._connect() as conn:
+            rows = {r["server"]: r["decision"] for r in conn.execute(
+                "SELECT server, decision FROM audit WHERE tool='issue_read'")}
+        self.assertEqual(rows, {"mcp-github": "allow", "mcp-other": "deny"})
+
+
+class ToolFieldCapTests(_ToolBridgeTestCase):
+    """The tool columns are agent-INFLUENCED, and nothing upstream bounds them.
+
+    ``ToolCallRequest.tool`` is a bare ``str`` (app.py) — it arrives from the gateway,
+    which relays what the agent named, and no validator caps its length. Before these
+    were columns the text landed only inside ``reason``, which ``store._audit`` has
+    always capped; now it lands in two places, and the cap has to cover both or one
+    oversized call bloats the crown-jewel store and the glanceable list."""
+
+    audits = True
+
+    def test_an_over_long_tool_name_is_capped_rather_than_stored_whole(self):
+        _tool_call(tool="x" * 9000)
+        with cp.store._connect() as conn:
+            row = conn.execute("SELECT tool, reason FROM audit "
+                               "WHERE stage='tool-call'").fetchone()
+        self.assertEqual(len(row["tool"]), cp.store.DRAIN_MAX_FIELD)
+        self.assertLessEqual(len(row["reason"]), cp.store.DRAIN_MAX_FIELD)
+
+    def test_an_over_long_server_name_is_capped_too(self):
+        # Refused by policy long before it could be dialled — a server name is held to
+        # a DNS label — but the REFUSAL is still audited, and the row is what is capped.
+        _tool_call(server="s" * 9000, tool="get_me")
+        with cp.store._connect() as conn:
+            row = conn.execute("SELECT server FROM audit "
+                               "WHERE stage='tool-call'").fetchone()
+        self.assertEqual(len(row["server"]), cp.store.DRAIN_MAX_FIELD)
+
+
 class _FreshStoreTestCase(unittest.TestCase):
     """Base for tests that need a genuinely empty database rather than the shared one:
     schema questions cannot be asked of a store the rest of the suite has been
@@ -4399,6 +4482,24 @@ class SchemaVersionTests(_FreshStoreTestCase):
         with cp.store._connect() as conn:
             migrated = {r["name"] for r in conn.execute("PRAGMA table_info(audit)")}
         self.assertEqual(migrated, columns_of("audit-agree-fresh.db"))
+
+    def test_an_old_store_gains_the_outcome_status_column(self):
+        # Step 4 on the stores already in the field. `_audit`'s INSERT names it, so
+        # without this EVERY audit write fails — egress included — on exactly the
+        # deployments that have been governing the longest.
+        self._old_store("version-status.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            self.assertIn("status", {r["name"] for r in
+                                     conn.execute("PRAGMA table_info(audit)")})
+
+    def test_status_is_a_step_of_its_own_rather_than_part_of_v3(self):
+        # The split was deliberate: when the correlation columns landed nothing could
+        # write this one, and a column no writer fills is schema documenting an
+        # intention rather than a record. Asserted so a later tidy-up does not merge
+        # them — a store already stamped v3 would then never gain the column.
+        self.assertEqual([label for v, label, _ in cp.store._STEPS if v == 4],
+                         ["tool outcome status"])
 
     def test_the_steps_are_contiguous_and_end_at_the_declared_version(self):
         # ``SCHEMA_VERSION`` and ``_STEPS`` are two halves of one fact, and only this

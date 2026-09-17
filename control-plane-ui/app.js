@@ -376,6 +376,24 @@ const AUDIT_ORDINARY_STAGE = "connect";
 // case does nothing to make a value blend into the host beside it.
 const AUDIT_STAGE_SHAPE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,11}$/;
 
+// An outcome row's own shape. `decision` says only that this is a result; the STATUS
+// is the information — `ok` against `tool-error` is the difference between "a human
+// approved a PR being opened" and "a PR was opened". Same bound and charset as the
+// stage shape above, widened because `transport-error` is fifteen characters.
+const AUDIT_OUTCOME = "outcome";
+const AUDIT_STATUS_SHAPE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,19}$/;
+
+// What an outcome row is ABOUT, in the column where an egress row names its host. The
+// flattened `server__tool` is deliberate: it is the name the agent was served and the
+// name a transcript will contain, so an operator searching for what they saw finds it.
+// Falls back rather than inventing — a row missing either half says so.
+function toolSubject(r) {
+  const server = (r && r.server) || "";
+  const tool = (r && r.tool) || "";
+  if (server && tool) return `${server}__${tool}`;
+  return server || tool || "";
+}
+
 // One audit row, shaped for display. Pure, and deliberately does NOT format the
 // timestamp: that is locale-dependent, and a unit test should not have to pin down a
 // locale to assert the parts that carry meaning.
@@ -399,9 +417,19 @@ function auditRow(r) {
     // ABSENT means "connect, or not recorded" — the two are not distinguished here on
     // purpose. This is a hint that something is unusual, not evidence; the audit table
     // holds the exact value and `make logs-cp` prints it.
-    stagePrefix: stage && stage !== AUDIT_ORDINARY_STAGE
-                 && AUDIT_STAGE_SHAPE.test(stage) ? `${stage} · ` : "",
-    host: (r && r.host) || "",
+    // An OUTCOME row qualifies itself by status rather than by stage, and the swap
+    // follows the same rule: the prefix says how, the cell says what. `tool-result`
+    // is what the stage would contribute and it is pure redundancy — it is implied by
+    // the decision word already in the tag — while the status is the whole point of
+    // the row. Left unprefixed, these rows also rendered a dangling `tool-result · `
+    // against an empty host cell, since a tool call has no host.
+    stagePrefix: r && r.decision === AUDIT_OUTCOME
+                 ? (r.status && AUDIT_STATUS_SHAPE.test(r.status)
+                    ? `${r.status} · ` : "")
+                 : (stage && stage !== AUDIT_ORDINARY_STAGE
+                    && AUDIT_STAGE_SHAPE.test(stage) ? `${stage} · ` : ""),
+    host: r && r.decision === AUDIT_OUTCOME
+          ? toolSubject(r) : ((r && r.host) || ""),
     // An em dash rather than an empty cell: blank reads as "this column is broken",
     // whereas the honest statement is that no client was recorded for this row.
     client: (r && r.client) || "—",
@@ -1099,9 +1127,16 @@ function eventRow(r) {
     // — and it is also the only agent-controlled unbounded string on the page. Capped
     // on write (store.DRAIN_MAX_FIELD) and escaped by the renderer; the CSP is what
     // makes an escaping mistake inert rather than fatal.
-    request: [method, url].filter(Boolean).join(" ")
-             || [Number.isFinite(port) && port > 0 ? `:${port}` : "", proto]
-                .filter(Boolean).join(" "),
+    // For an OUTCOME row the equivalent of "which request was it" is WHICH APPROVAL —
+    // the id that ties this row to the hold, the human's answer and the claim the
+    // control plane already recorded. Its absence is information too: a call policy
+    // allowed outright never had one, which is what `—` says here rather than leaving
+    // a blank that reads as a missing value.
+    request: r && r.decision === AUDIT_OUTCOME
+             ? (r.approval_id || "—")
+             : [method, url].filter(Boolean).join(" ")
+               || [Number.isFinite(port) && port > 0 ? `:${port}` : "", proto]
+                  .filter(Boolean).join(" "),
   };
 }
 
@@ -2487,7 +2522,8 @@ function start() {
             ? `<span class="qual">${esc(a.clientClassPrefix)}</span>` : ""
             }${esc(a.client)}</td>
           <td>${esc(a.reason)}${a.firstTs
-            ? esc(` · first seen ${fmtStamp(a.firstTs)}`) : ""}</td></tr>`;
+            ? esc(`${a.reason ? " · " : ""}first seen ${fmtStamp(a.firstTs)}`)
+            : ""}</td></tr>`;
     }).join("");
   }
 

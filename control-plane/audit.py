@@ -44,13 +44,20 @@ from __future__ import annotations
 # as a constant with the call sites — the writer takes ``decision`` as a plain string
 # from four different places, and a new word appearing there without appearing here
 # would make its rows unfilterable while every other test passed.
-# "observe" is the odd one and is here deliberately: it is NOT a decision. It records
-# something a server claimed about itself — its tool surface changed — which nothing in
-# this process decided and which decides nothing in return. It shares the column
-# because it shares the question an operator asks of this log ("what happened, and
-# when"), and it is filterable for the same reason the others are: a row nobody can
-# select for is a row nobody reads.
-DECISIONS = ("allow", "deny", "hold", "revoke", "create", "edit", "observe")
+# "observe" and "outcome" are the two that are NOT decisions, and both are here
+# deliberately. `observe` records something a server claimed about itself — its tool
+# surface changed. `outcome` records how a tool call ended, which only the gateway can
+# know (`ingest.py`). Neither was decided by this process and neither decides anything
+# in return. They share the column because they share the question an operator asks of
+# this log ("what happened, and when"), and they are filterable for the same reason the
+# others are: a row nobody can select for is a row nobody reads.
+#
+# They stay SEPARATE words rather than one "not a decision" bucket, because `observe`
+# earns its worth by being rare — one writer, changes only, and an image bump that
+# starts exposing a destructive tool reads as the alarm it is. Outcome rows are one per
+# tool call. Folding them together would bury the rare signal under the common one.
+DECISIONS = ("allow", "deny", "hold", "revoke", "create", "edit", "observe",
+             "outcome")
 
 # Columns ``q`` searches, PER VIEW, and the rule is that a view searches exactly what
 # it DISPLAYS. Anything else produces the worst kind of result list: rows whose visible
@@ -58,15 +65,22 @@ DECISIONS = ("allow", "deny", "hold", "revoke", "create", "edit", "observe")
 # matched. It is the same discipline the group key follows (see ``api_audit``), applied
 # to search instead of to folding — and it is why ``url`` is searchable in the record
 # view and not in the glance, rather than being either everywhere or nowhere.
-GROUPED_SEARCH = ("host", "client", "client_class", "reason")
-EVENT_SEARCH = ("host", "client", "client_class", "reason", "method", "url")
+GROUPED_SEARCH = ("host", "client", "client_class", "reason",
+                  # The tool columns joined this list when they started being
+                  # DISPLAYED (an outcome row identifies itself as `server__tool`,
+                  # where an egress row names a host). Before that they were correctly
+                  # absent: searching a column nobody can see is how a result list
+                  # gets rows whose visible content does not contain what was typed.
+                  "server", "tool", "status")
+EVENT_SEARCH = ("host", "client", "client_class", "reason", "method", "url",
+                "server", "tool", "status")
 
 # Columns the record view serves. Deliberately the whole row: this is the view the
 # glance defers to, so the fields it drops as noise or as unbounded (``url`` above
 # all) are exactly what has to be here, or the interface still cannot answer "which
 # request was it".
 EVENT_COLUMNS = ("id", "ts", "decision", "stage", "host", "port", "proto", "client",
-                 "client_class", "method", "url", "reason",
+                 "client_class", "method", "url", "reason", "status",
                  # The tool columns, for the same reason ``url`` is here: this is the
                  # view that answers "which one was it", and the tool rows' identity —
                  # which server, which tool, which approval — is not in any of the
@@ -246,6 +260,31 @@ def total(conn, filt: Filter) -> int:
 def grouped(conn, limit: int, filt: Filter, scan: int) -> list:
     """The glance: rows folded by exactly the fields the UI displays, newest first.
 
+    The group key is the DISPLAYED fields, plus one that is not: ``approval_id``.
+
+    The displayed part is why the tool columns are in it — two `ok` outcomes for
+    different tools are different facts, and folding them on `reason` alone (both NULL)
+    would show one row saying "2x" with no way to say what it stood for. Egress rows
+    carry NULL in all of them and SQLite groups NULLs together, so their folding is
+    unchanged.
+
+    ``approval_id`` IS THE EXCEPTION TO THAT RULE, and it is deliberate. It is grouped
+    BY and not selected — the glance serves what it displays, which is why `url` and
+    `port` are absent too, and a 32-character id per row would be payload nothing on
+    screen could use. A grant is
+    single-use by construction, so two approval ids are two distinct human decisions —
+    and folding a row that stands for a SPENT GRANT hides exactly what the approval
+    machinery exists to record. Two separately approved `create_pull_request` calls that
+    both succeeded are two pull requests; shown as one line with a count, the count is
+    the only trace that a second human decision ever happened. Outcomes with no approval
+    still fold (NULLs group together), which keeps the high-volume read-only rows quiet.
+
+    The cost is stated because it is real: two approved rows look identical on screen
+    and nothing there explains why they did not merge. That is the confusion folding-by-
+    displayed-fields exists to prevent, and it is accepted here — two rows that look
+    alike is a far smaller wrong than two grants shown as one. The record view, one
+    toggle away, shows the ids.
+
     The filter applies to the RAW ROWS, before folding — so ``scan`` bounds the
     matching events read rather than the events read, and a narrow filter therefore
     reaches as far back as it needs to fill one screen. That is the whole point of
@@ -256,9 +295,11 @@ def grouped(conn, limit: int, filt: Filter, scan: int) -> list:
     `ts` index to the end of the table. Bounded by the table, not by ``scan``."""
     return conn.execute(
         "SELECT decision, stage, host, client, client_class, reason, "  # noqa: S608
+        "       server, tool, status, "
         "       COUNT(*) AS n, MAX(ts) AS ts, MIN(ts) AS first_ts "
         f"FROM (SELECT * FROM audit {filt.where} ORDER BY ts DESC LIMIT ?) "
-        "GROUP BY decision, stage, host, client, client_class, reason "
+        "GROUP BY decision, stage, host, client, client_class, reason, "
+        "         server, tool, status, approval_id "
         "ORDER BY ts DESC LIMIT ?",
         [*filt.params, scan, limit]).fetchall()
 

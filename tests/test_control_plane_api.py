@@ -1229,7 +1229,13 @@ class AuditViewTests(_CPTestCase):
         self.assertEqual(
             set(_served()[0]),
             {"ts", "decision", "stage", "host", "client", "client_class", "reason",
-             "n", "first_ts", "fail_closed"})
+             "n", "first_ts", "fail_closed",
+             # The tool columns. They are in the GLANCE — unlike url/method/port —
+             # because an outcome row identifies itself with them: an egress row names
+             # a host in that cell, and a tool row names `server__tool`. They are also
+             # in the group key, since two `ok` outcomes for different tools are
+             # different facts and would otherwise fold into one unattributable "2x".
+             "server", "tool", "status"})
 
     def test_the_unbounded_fields_stay_out_of_the_list_view(self):
         # url is AGENT-CONTROLLED and unbounded; method/port/proto are recorded and
@@ -1692,7 +1698,9 @@ class AuditRecordTests(_CPTestCase):
              # an egress decision is host/port/url — and they are here because this is
              # the view that answers "which one was it" for a TOOL row, whose identity
              # is in none of the columns above.
-             "server", "tool", "approval_id"})
+             "server", "tool", "approval_id",
+             # And how it ended, for the tool rows the gateway's stream fills.
+             "status"})
         self.assertEqual(row["url"], "https://a.example/x")
 
     def test_nothing_is_folded(self):
@@ -3832,6 +3840,162 @@ class ToolCorrelationColumnTests(_ToolBridgeTestCase):
                          (None, None, None))
 
 
+class TwoServersOneToolNameTests(_ToolBridgeTestCase):
+    """The reason ``server`` is a COLUMN and ``tool_rules`` is UNIQUE on the pair.
+
+    Tool names are not namespaced across servers: two servers can each expose an
+    `issue_read`, and nothing in the name says which. If the audit trail could not tell
+    them apart, every query about one server would quietly merge in the other's history
+    — and policy would be worse than quiet, since one server's rule would decide the
+    other's identically named tool.
+
+    The multi-server path has never run against real containers (only one is
+    registered in `mcp-servers.yml`), which is exactly why it is asserted here."""
+
+    audits = True
+
+    def setUp(self):
+        super().setUp()
+        _register("mcp-other")
+        _enable("mcp-other")
+
+    def test_a_rule_on_one_server_does_not_decide_the_others_tool(self):
+        # The boundary, not the bookkeeping. `issue_read` is allowed on one server and
+        # unconfigured on the other, and unconfigured is DENIED — so a leak here is a
+        # call running against a server no one ruled.
+        _tool_rule("issue_read", "allow", server="mcp-github")
+        self.assertEqual(_tool_call(server="mcp-github", tool="issue_read")["decision"],
+                         "allow")
+        self.assertEqual(_tool_call(server="mcp-other", tool="issue_read")["decision"],
+                         "deny")
+
+    def test_both_servers_can_hold_a_rule_for_the_same_tool_name(self):
+        # UNIQUE(server, tool), not UNIQUE(tool). A constraint on the name alone would
+        # make the second write fail or silently no-op, leaving one server unruled
+        # while the operator believes they configured it.
+        _tool_rule("issue_read", "allow", server="mcp-github")
+        _tool_rule("issue_read", "deny", server="mcp-other")
+        self.assertEqual(_tool_call(server="mcp-github", tool="issue_read")["decision"],
+                         "allow")
+        self.assertEqual(_tool_call(server="mcp-other", tool="issue_read")["decision"],
+                         "deny")
+
+    def test_the_audit_rows_are_told_apart_by_the_column(self):
+        # And not by parsing the reason prose, which names both but is a sentence.
+        _tool_rule("issue_read", "allow", server="mcp-github")
+        _tool_rule("issue_read", "deny", server="mcp-other")
+        _tool_call(server="mcp-github", tool="issue_read")
+        _tool_call(server="mcp-other", tool="issue_read")
+        with cp.store._connect() as conn:
+            rows = {r["server"]: r["decision"] for r in conn.execute(
+                "SELECT server, decision FROM audit WHERE tool='issue_read'")}
+        self.assertEqual(rows, {"mcp-github": "allow", "mcp-other": "deny"})
+
+
+class ToolFieldCapTests(_ToolBridgeTestCase):
+    """The tool columns are agent-INFLUENCED, and nothing upstream bounds them.
+
+    ``ToolCallRequest.tool`` is a bare ``str`` (app.py) — it arrives from the gateway,
+    which relays what the agent named, and no validator caps its length. Before these
+    were columns the text landed only inside ``reason``, which ``store._audit`` has
+    always capped; now it lands in two places, and the cap has to cover both or one
+    oversized call bloats the crown-jewel store and the glanceable list."""
+
+    audits = True
+
+    def test_an_over_long_tool_name_is_capped_rather_than_stored_whole(self):
+        _tool_call(tool="x" * 9000)
+        with cp.store._connect() as conn:
+            row = conn.execute("SELECT tool, reason FROM audit "
+                               "WHERE stage='tool-call'").fetchone()
+        self.assertEqual(len(row["tool"]), cp.store.DRAIN_MAX_FIELD)
+        self.assertLessEqual(len(row["reason"]), cp.store.DRAIN_MAX_FIELD)
+
+    def test_an_over_long_server_name_is_capped_too(self):
+        # Refused by policy long before it could be dialled — a server name is held to
+        # a DNS label — but the REFUSAL is still audited, and the row is what is capped.
+        _tool_call(server="s" * 9000, tool="get_me")
+        with cp.store._connect() as conn:
+            row = conn.execute("SELECT server FROM audit "
+                               "WHERE stage='tool-call'").fetchone()
+        self.assertEqual(len(row["server"]), cp.store.DRAIN_MAX_FIELD)
+
+
+class OutcomeFoldingTests(_CPTestCase):
+    """What the GLANCE may fold, once rows can stand for side effects.
+
+    Folding is right for a decision repeated: fifty CONNECTs allowed by one rule is one
+    fact fifty times, and a list that showed them all would answer nothing. It is not
+    obviously right for an outcome, because an outcome records that something HAPPENED
+    — and two pull requests opened is not one event seen twice.
+
+    The line drawn here is narrower than "never fold outcomes": what must never merge is
+    two SPENT GRANTS."""
+
+    def _outcomes(self, *rows):
+        with cp.store._connect() as conn:
+            conn.execute("DELETE FROM audit")
+            for i, r in enumerate(rows):
+                conn.execute(
+                    "INSERT INTO audit(ts, decision, stage, client, server, tool, "
+                    "status, approval_id) VALUES (?,'outcome','tool-result',?,?,?,?,?)",
+                    (float(i), "172.30.0.2", r.get("server", "mcp-github"),
+                     r.get("tool", "get_me"), r.get("status", "ok"),
+                     r.get("approval_id")))
+            conn.commit()
+
+    def _grouped(self):
+        with cp.store._connect() as conn:
+            return cp.audit.grouped(conn, 50, cp.audit.parse(), 500)
+
+    def test_two_approved_calls_are_never_one_line(self):
+        # THE ONE THAT MATTERS. A grant is single-use, so two approval ids are two
+        # distinct human decisions and two side effects. Folded, the count would be the
+        # only trace that a second approval ever happened — and the count is exactly
+        # what a reader skims past.
+        self._outcomes({"tool": "create_pull_request", "approval_id": "a" * 32},
+                       {"tool": "create_pull_request", "approval_id": "b" * 32})
+        rows = self._grouped()
+        # Two rows, each standing for exactly one call. The ids themselves are NOT
+        # served here — the glance carries what it displays — so the assertion is the
+        # one an operator can actually see: no count above 1 absorbed a second grant.
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({r["n"] for r in rows}, {1})
+        self.assertNotIn("approval_id", rows[0].keys())
+
+    def test_unapproved_calls_still_fold(self):
+        # The high-volume read-only rows, which are what the glance exists to keep
+        # quiet. Their approval_id is NULL and SQLite groups NULLs together.
+        self._outcomes({"tool": "actions_list"}, {"tool": "actions_list"},
+                       {"tool": "actions_list"})
+        rows = self._grouped()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["n"], 3)
+
+    def test_two_tools_do_not_fold_into_one_unattributable_count(self):
+        # Both `ok`, both with a NULL host and a NULL reason — so before the tool
+        # columns joined the group key these folded into one row saying "2x" with
+        # nothing on it to say what it stood for.
+        self._outcomes({"tool": "get_me"}, {"tool": "actions_list"})
+        self.assertEqual({r["tool"] for r in self._grouped()},
+                         {"get_me", "actions_list"})
+
+    def test_a_failure_does_not_fold_into_the_successes(self):
+        # `status` is in the key, so the one row worth noticing cannot be absorbed by
+        # the run of ordinary ones around it.
+        self._outcomes({}, {}, {"status": "tool-error"})
+        rows = {r["status"]: r["n"] for r in self._grouped()}
+        self.assertEqual(rows, {"ok": 2, "tool-error": 1})
+
+    def test_the_same_tool_on_two_servers_stays_apart(self):
+        # Tool names are not namespaced across servers, so the pair is the identity —
+        # the same reason `tool_rules` is UNIQUE on it.
+        self._outcomes({"server": "mcp-github", "tool": "issue_read"},
+                       {"server": "mcp-other", "tool": "issue_read"})
+        self.assertEqual({r["server"] for r in self._grouped()},
+                         {"mcp-github", "mcp-other"})
+
+
 class _FreshStoreTestCase(unittest.TestCase):
     """Base for tests that need a genuinely empty database rather than the shared one:
     schema questions cannot be asked of a store the rest of the suite has been
@@ -4399,6 +4563,24 @@ class SchemaVersionTests(_FreshStoreTestCase):
         with cp.store._connect() as conn:
             migrated = {r["name"] for r in conn.execute("PRAGMA table_info(audit)")}
         self.assertEqual(migrated, columns_of("audit-agree-fresh.db"))
+
+    def test_an_old_store_gains_the_outcome_status_column(self):
+        # Step 4 on the stores already in the field. `_audit`'s INSERT names it, so
+        # without this EVERY audit write fails — egress included — on exactly the
+        # deployments that have been governing the longest.
+        self._old_store("version-status.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            self.assertIn("status", {r["name"] for r in
+                                     conn.execute("PRAGMA table_info(audit)")})
+
+    def test_status_is_a_step_of_its_own_rather_than_part_of_v3(self):
+        # The split was deliberate: when the correlation columns landed nothing could
+        # write this one, and a column no writer fills is schema documenting an
+        # intention rather than a record. Asserted so a later tidy-up does not merge
+        # them — a store already stamped v3 would then never gain the column.
+        self.assertEqual([label for v, label, _ in cp.store._STEPS if v == 4],
+                         ["tool outcome status"])
 
     def test_the_steps_are_contiguous_and_end_at_the_declared_version(self):
         # ``SCHEMA_VERSION`` and ``_STEPS`` are two halves of one fact, and only this

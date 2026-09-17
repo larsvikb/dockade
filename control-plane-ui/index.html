@@ -216,6 +216,11 @@
      claimed, not a thing this system decided, and it should not read as a fourth
      verdict sitting beside allow/deny/hold. */
   .tag.observe { color: var(--dim); }
+  /* An outcome is not a decision either, but unlike `observe` it is not always
+     benign: `tool-error` and `timeout` are how an approved call failed. Neutral
+     rather than dim — these are rows worth reading, and the `status` beside them
+     carries which kind it was. */
+  .tag.outcome { color: var(--fg); }
   .ts { color: var(--dim); white-space: nowrap; }
   code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   /* A leading-dot pattern is a SUBDOMAIN WILDCARD that looks like a hostname, so
@@ -416,6 +421,7 @@
         <option value="create">create</option>
         <option value="edit">edit</option>
         <option value="observe">observe</option>
+        <option value="outcome">outcome</option>
       </select>
       <!-- Relative windows, not date pickers: the question is "since when". Values
            are the keys of AUDIT_WINDOWS in app.js, held equal by a test. -->

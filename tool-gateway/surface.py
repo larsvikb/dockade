@@ -36,7 +36,7 @@ from __future__ import annotations
 #: contain (`.`, `:`, `-` — all legal in `policy._TOOL_RE`) would not either.
 #:
 #: It is also what Claude Code itself uses to namespace MCP tools, so the agent sees
-#: `mcp__dockade__mcp-github__pull_request_read`. Long, and the length is not a cost
+#: `mcp__gateway__mcp-github__pull_request_read`. Long, and the length is not a cost
 #: worth trading the exactness for.
 SEP = "__"
 

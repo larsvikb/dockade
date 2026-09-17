@@ -383,6 +383,42 @@ const AUDIT_STAGE_SHAPE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,11}$/;
 const AUDIT_OUTCOME = "outcome";
 const AUDIT_STATUS_SHAPE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,19}$/;
 
+// WHAT THE ROW IS ABOUT, for the `target` column.
+//
+// Every kind of row has one, and before this several did not use it: an egress row
+// names a host, a policy row names the pattern it wrote, and every tool-shaped row —
+// the call, the ask, the resumption, the outcome, the rule that governs it — names the
+// tool. Those last ones left the cell EMPTY while still rendering their stage prefix,
+// so the column read `tool-call · ` with nothing after the separator. The fix is not to
+// drop the separator but to fill the cell: the columns to fill it from have existed
+// since the audit trail became joinable.
+//
+// `host` wins where both are present, because a row that has one is an egress decision
+// and the host IS its identity. Nothing sets both today.
+function auditTarget(r) {
+  return (r && r.host) || toolSubject(r) || "";
+}
+
+// The qualifier in front of the target — `http · example.com`, `tool-call ·
+// mcp-github__get_me`. The prefix says HOW, the cell says WHAT.
+//
+// An OUTCOME row qualifies itself by STATUS instead of by stage: `tool-result` is
+// implied by the `outcome` already in the tag, while `ok` against `tool-error` is the
+// whole point of the row.
+//
+// Suppressed entirely when there is no target, because a separator with nothing on its
+// right is not a separator — the same rule the grouped view's `first seen` follows.
+// Belt-and-braces now that `auditTarget` fills the cell for every kind: a row carrying
+// neither a host nor a tool would otherwise reintroduce the dangling prefix.
+function auditPrefix(r, stage) {
+  if (!auditTarget(r)) return "";
+  if (r && r.kind === AUDIT_OUTCOME) {
+    return r.status && AUDIT_STATUS_SHAPE.test(r.status) ? `${r.status} · ` : "";
+  }
+  return stage && stage !== AUDIT_ORDINARY_STAGE && AUDIT_STAGE_SHAPE.test(stage)
+         ? `${stage} · ` : "";
+}
+
 // What an outcome row is ABOUT, in the column where an egress row names its host. The
 // flattened `server__tool` is deliberate: it is the name the agent was served and the
 // name a transcript will contain, so an operator searching for what they saw finds it.
@@ -423,13 +459,8 @@ function auditRow(r) {
     // the kind word already in the tag — while the status is the whole point of
     // the row. Left unprefixed, these rows also rendered a dangling `tool-result · `
     // against an empty host cell, since a tool call has no host.
-    stagePrefix: r && r.kind === AUDIT_OUTCOME
-                 ? (r.status && AUDIT_STATUS_SHAPE.test(r.status)
-                    ? `${r.status} · ` : "")
-                 : (stage && stage !== AUDIT_ORDINARY_STAGE
-                    && AUDIT_STAGE_SHAPE.test(stage) ? `${stage} · ` : ""),
-    target: r && r.kind === AUDIT_OUTCOME
-          ? toolSubject(r) : ((r && r.host) || ""),
+    stagePrefix: auditPrefix(r, stage),
+    target: auditTarget(r),
     // An em dash rather than an empty cell: blank reads as "this column is broken",
     // whereas the honest statement is that no client was recorded for this row.
     client: (r && r.client) || "—",

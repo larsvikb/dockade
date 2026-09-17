@@ -389,6 +389,27 @@ console.log(JSON.stringify({
                                 host: "a.example", client: "172.30.0.2",
                                 reason: "no matching rule" }),
         no_stage: m.auditRow({ ts: 1e9, kind: "hold", host: "a.example" }),
+        // The TOOL-SHAPED rows, which had a stage and no target and so rendered a
+        // separator with nothing after it. They carry `server`/`tool` columns and
+        // simply were not using them.
+        tool_held: m.auditRow({ ts: 1e9, kind: "hold", stage: "tool-call",
+                                server: "mcp-github", tool: "create_pull_request",
+                                client: "172.30.0.2" }),
+        tool_answered: m.auditRow({ ts: 1e9, kind: "allow", stage: "tool-ask",
+                                    server: "mcp-github", tool: "create_pull_request" }),
+        tool_released: m.auditRow({ ts: 1e9, kind: "allow", stage: "tool-resume",
+                                    server: "mcp-github", tool: "create_pull_request" }),
+        // A server's surface moving names the SERVER; there is no one tool it is about.
+        surface_moved: m.auditRow({ ts: 1e9, kind: "observe", stage: "mcp-tools",
+                                    server: "mcp-github" }),
+        // A policy row names the pattern it wrote, in `host` — the egress shape.
+        rule_written: m.auditRow({ ts: 1e9, kind: "create", stage: "policy",
+                                   host: ".github.com" }),
+        // A tool rule names the tool it governs.
+        tool_rule: m.auditRow({ ts: 1e9, kind: "revoke", stage: "tool-policy",
+                               server: "mcp-github", tool: "get_me" }),
+        // Neither a host nor a tool: the prefix goes too, rather than dangling.
+        subjectless: m.auditRow({ ts: 1e9, kind: "edit", stage: "mcp-server" }),
         // OUTCOME rows: the status takes the prefix slot the stage uses, and the
         // subject is the flattened tool name. `tool-result` as a prefix would be pure
         // redundancy against the tag, and it rendered a dangling separator because a
@@ -1851,6 +1872,41 @@ class PageScriptTests(unittest.TestCase):
         self.assertEqual(a["outcome_failed"]["stagePrefix"], "transport-error · ")
         self.assertEqual(a["outcome_failed"]["target"],
                          "mcp-github__create_pull_request")
+
+    def test_every_kind_of_row_names_what_it_is_about(self):
+        """`target` was empty for four of the seven row kinds, which is how the column
+        ended up rendering `tool-call · ` — a separator with nothing after it.
+
+        The columns to fill it from have existed since the trail became joinable; the
+        shaping simply was not using them outside outcome rows. An egress row names its
+        host, a policy row the pattern it wrote, and every tool-shaped row the tool."""
+        a = self.probe["saturation"]["audit"]
+        self.assertEqual(a["tool_held"]["target"], "mcp-github__create_pull_request")
+        self.assertEqual(a["tool_answered"]["target"],
+                         "mcp-github__create_pull_request")
+        self.assertEqual(a["tool_released"]["target"],
+                         "mcp-github__create_pull_request")
+        self.assertEqual(a["tool_rule"]["target"], "mcp-github__get_me")
+        self.assertEqual(a["surface_moved"]["target"], "mcp-github")
+        self.assertEqual(a["rule_written"]["target"], ".github.com")
+
+    def test_the_stage_still_qualifies_the_target_it_now_has(self):
+        """The prefix was never the problem — an empty cell beside it was. With the
+        target filled, `tool-call · mcp-github__create_pull_request` says which point
+        of the lifecycle the row is, which is exactly what the stage is for."""
+        a = self.probe["saturation"]["audit"]
+        self.assertEqual(a["tool_held"]["stagePrefix"], "tool-call · ")
+        self.assertEqual(a["tool_answered"]["stagePrefix"], "tool-ask · ")
+        self.assertEqual(a["tool_released"]["stagePrefix"], "tool-resume · ")
+
+    def test_a_row_with_nothing_to_name_drops_the_prefix_too(self):
+        """A separator with nothing on its right is not a separator. `auditTarget`
+        fills the cell for every kind that exists today, so this is belt-and-braces —
+        and it is the guard that stops the bug coming back the next time a row shape is
+        added that neither names a host nor a tool."""
+        a = self.probe["saturation"]["audit"]
+        self.assertEqual(a["subjectless"]["target"], "")
+        self.assertEqual(a["subjectless"]["stagePrefix"], "")
 
     def test_the_tool_name_is_the_one_the_agent_was_served(self):
         """Flattened `server__tool`, because that is the name in the tool list, in the

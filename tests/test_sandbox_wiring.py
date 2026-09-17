@@ -132,7 +132,7 @@ class GatewayConfigTests(unittest.TestCase):
         return json.loads(rendered)
 
     def test_the_document_is_valid_json_with_one_server(self):
-        self.assertEqual(list(self.config()["mcpServers"]), ["dockade"])
+        self.assertEqual(list(self.config()["mcpServers"]), ["gateway"])
 
     def test_the_key_is_the_name_the_gateway_answers_to(self):
         # The agent sees `mcp__<key>__<server>__<tool>`, so a mismatch is invisible —
@@ -140,7 +140,7 @@ class GatewayConfigTests(unittest.TestCase):
         self.assertIn(load_protocol().SERVER_NAME, self.config()["mcpServers"])
 
     def test_the_url_is_the_path_the_gateway_serves(self):
-        entry = self.config()["mcpServers"]["dockade"]
+        entry = self.config()["mcpServers"]["gateway"]
         self.assertEqual(entry["type"], "http")
         self.assertEqual(entry["url"], "http://172.30.0.11:8100/mcp")
 

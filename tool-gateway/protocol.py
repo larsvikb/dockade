@@ -33,10 +33,11 @@ from __future__ import annotations
 #: expected to disconnect rather than proceed on an assumption.
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 
-#: What the agent sees this server called. Not the container name: it is the prefix
-#: the client puts on every tool (`mcp__dockade__…`), so it names the system doing the
-#: governing rather than the process doing the serving.
-SERVER_NAME = "dockade"
+#: What the agent sees this server called, and the prefix the client puts on every tool
+#: (`mcp__gateway__…`). It names the SURFACE rather than the system: the client renders
+#: a call as "Calling <name>", and `dockade` there claimed the whole system was being
+#: invoked when what is being called is one governed door into it.
+SERVER_NAME = "gateway"
 
 #: Advertised in `serverInfo` because the spec requires the field. Nothing reads it and
 #: nothing should — a client branching on a gateway version would be coupling to an

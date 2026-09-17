@@ -11,7 +11,7 @@ here. It is written down so you spend no turns discovering it.
   fires. Prefer `WebFetch` over raw sockets, and expect a first request to a new
   host to be slow rather than to fail.
 - **MCP tools are governed per tool, and one may be held for a human.** The tools
-  under `mcp__dockade__` are brokered by a gateway that asks policy before every
+  under `mcp__gateway__` are brokered by a gateway that asks policy before every
   call. Three answers: it runs, it is refused, or it is **held for approval** — and
   a held call comes back immediately as a *result* saying so, carrying an id. That
   is not a failure and not a hang: do other work, then finish it with

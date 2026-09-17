@@ -64,9 +64,12 @@ install -o "$USERNAME" -g "$USERNAME" -m 0644 \
 # that works for it: the same block in a settings file is silently ignored, with no
 # warning and no error (measured — NOTES.md).
 #
-# The key is `dockade`, so the agent sees `mcp__dockade__<server>__<tool>`. It names
-# the system doing the governing rather than the container doing the serving, and it
-# is held equal to the gateway's own `protocol.SERVER_NAME` by
+# The key is `gateway`, so the agent sees `mcp__gateway__<server>__<tool>` and the
+# client renders a call as "Calling gateway". It names the SURFACE, not the system:
+# `dockade` there read as the whole system being invoked, when what is being called is
+# one governed door into it. The word is also the one the rest of the repo already
+# uses for this component (`tool-gateway`, `make logs-tg`), so it adds no vocabulary.
+# Held equal to the gateway's own `protocol.SERVER_NAME` by
 # tests/test_sandbox_wiring.py — a mismatch would be invisible, since both sides
 # would work and only the name in a transcript would be wrong.
 MCP_GATEWAY_CONFIG=/etc/claude-code/mcp-gateway.json
@@ -81,7 +84,7 @@ if [[ "${TOOL_GATEWAY_IP:-}" =~ ^[0-9.]+$ ]]; then
     install -o root -g root -m 0644 /dev/stdin "$MCP_GATEWAY_CONFIG" <<EOF
 {
   "mcpServers": {
-    "dockade": {
+    "gateway": {
       "type": "http",
       "url": "http://${TOOL_GATEWAY_IP}:${TOOL_GATEWAY_PORT:-8100}/mcp"
     }

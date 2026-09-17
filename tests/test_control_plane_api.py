@@ -1229,7 +1229,13 @@ class AuditViewTests(_CPTestCase):
         self.assertEqual(
             set(_served()[0]),
             {"ts", "decision", "stage", "host", "client", "client_class", "reason",
-             "n", "first_ts", "fail_closed"})
+             "n", "first_ts", "fail_closed",
+             # The tool columns. They are in the GLANCE — unlike url/method/port —
+             # because an outcome row identifies itself with them: an egress row names
+             # a host in that cell, and a tool row names `server__tool`. They are also
+             # in the group key, since two `ok` outcomes for different tools are
+             # different facts and would otherwise fold into one unattributable "2x".
+             "server", "tool", "status"})
 
     def test_the_unbounded_fields_stay_out_of_the_list_view(self):
         # url is AGENT-CONTROLLED and unbounded; method/port/proto are recorded and

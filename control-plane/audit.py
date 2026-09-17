@@ -65,8 +65,15 @@ DECISIONS = ("allow", "deny", "hold", "revoke", "create", "edit", "observe",
 # matched. It is the same discipline the group key follows (see ``api_audit``), applied
 # to search instead of to folding — and it is why ``url`` is searchable in the record
 # view and not in the glance, rather than being either everywhere or nowhere.
-GROUPED_SEARCH = ("host", "client", "client_class", "reason")
-EVENT_SEARCH = ("host", "client", "client_class", "reason", "method", "url")
+GROUPED_SEARCH = ("host", "client", "client_class", "reason",
+                  # The tool columns joined this list when they started being
+                  # DISPLAYED (an outcome row identifies itself as `server__tool`,
+                  # where an egress row names a host). Before that they were correctly
+                  # absent: searching a column nobody can see is how a result list
+                  # gets rows whose visible content does not contain what was typed.
+                  "server", "tool", "status")
+EVENT_SEARCH = ("host", "client", "client_class", "reason", "method", "url",
+                "server", "tool", "status")
 
 # Columns the record view serves. Deliberately the whole row: this is the view the
 # glance defers to, so the fields it drops as noise or as unbounded (``url`` above
@@ -253,6 +260,12 @@ def total(conn, filt: Filter) -> int:
 def grouped(conn, limit: int, filt: Filter, scan: int) -> list:
     """The glance: rows folded by exactly the fields the UI displays, newest first.
 
+    The group key is the DISPLAYED fields and nothing else, which is why the tool
+    columns are in it: two `ok` outcomes for different tools are different facts, and
+    folding them on `reason` alone (both NULL) would show one row saying "2x" with no
+    way to say what it stood for. Egress rows carry NULL in all three and SQLite groups
+    NULLs together, so their folding is unchanged.
+
     The filter applies to the RAW ROWS, before folding — so ``scan`` bounds the
     matching events read rather than the events read, and a narrow filter therefore
     reaches as far back as it needs to fill one screen. That is the whole point of
@@ -263,9 +276,11 @@ def grouped(conn, limit: int, filt: Filter, scan: int) -> list:
     `ts` index to the end of the table. Bounded by the table, not by ``scan``."""
     return conn.execute(
         "SELECT decision, stage, host, client, client_class, reason, "  # noqa: S608
+        "       server, tool, status, "
         "       COUNT(*) AS n, MAX(ts) AS ts, MIN(ts) AS first_ts "
         f"FROM (SELECT * FROM audit {filt.where} ORDER BY ts DESC LIMIT ?) "
-        "GROUP BY decision, stage, host, client, client_class, reason "
+        "GROUP BY decision, stage, host, client, client_class, reason, "
+        "         server, tool, status "
         "ORDER BY ts DESC LIMIT ?",
         [*filt.params, scan, limit]).fetchall()
 

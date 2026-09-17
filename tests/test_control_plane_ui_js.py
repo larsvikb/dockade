@@ -389,6 +389,37 @@ console.log(JSON.stringify({
                                 host: "a.example", client: "172.30.0.2",
                                 reason: "no matching rule" }),
         no_stage: m.auditRow({ ts: 1e9, decision: "hold", host: "a.example" }),
+        // OUTCOME rows: the status takes the prefix slot the stage uses, and the
+        // subject is the flattened tool name. `tool-result` as a prefix would be pure
+        // redundancy against the tag, and it rendered a dangling separator because a
+        // tool call has no host.
+        outcome_ok: m.auditRow({ ts: 1e9, decision: "outcome", stage: "tool-result",
+                                 server: "mcp-github", tool: "get_me", status: "ok",
+                                 client: "172.30.0.2" }),
+        outcome_failed: m.auditRow({ ts: 1e9, decision: "outcome",
+                                     stage: "tool-result", server: "mcp-github",
+                                     tool: "create_pull_request",
+                                     status: "transport-error",
+                                     reason: "no answer" }),
+        // Half a name is reported as what there is, never assembled into something
+        // that looks whole.
+        outcome_half: m.auditRow({ ts: 1e9, decision: "outcome",
+                                   server: "mcp-github", status: "ok" }).host,
+        outcome_none: m.auditRow({ ts: 1e9, decision: "outcome",
+                                   status: "ok" }).host,
+        // A status the shape rejects is suppressed rather than rendered, exactly as a
+        // malformed stage is — the column has to stay scannable whatever arrives.
+        outcome_bad_status: m.auditRow({ ts: 1e9, decision: "outcome",
+                                         server: "s", tool: "t",
+                                         status: "evil.example" }).stagePrefix,
+        // The record view answers "which one was it" — for an outcome that is WHICH
+        // APPROVAL, and its absence means policy allowed the call outright.
+        outcome_event: m.eventRow({ ts: 1e9, decision: "outcome", server: "mcp-github",
+                                    tool: "get_me", status: "ok",
+                                    approval_id: "a".repeat(32) }).request,
+        outcome_event_unapproved: m.eventRow({ ts: 1e9, decision: "outcome",
+                                               server: "s", tool: "t",
+                                               status: "ok" }).request,
         // The client class, which is what the decision was actually taken against.
         classed: m.auditRow({ ts: 1e9, decision: "allow", host: "api.github.com",
                               client: "172.28.0.3", client_class: "mcp" }),
@@ -1804,6 +1835,54 @@ class PageScriptTests(unittest.TestCase):
         self.assertEqual(a["plaintext"]["stagePrefix"], "http · ")
         # Absent stage renders nothing rather than inventing "connect".
         self.assertEqual(a["no_stage"]["stagePrefix"], "")
+
+    def test_an_outcome_row_qualifies_itself_by_status_and_names_its_tool(self):
+        """The same slot, a different qualifier, and the rule is unchanged: the prefix
+        says HOW, the cell says WHAT.
+
+        For an outcome the stage is `tool-result`, which is pure redundancy against the
+        `outcome` already in the tag — and a tool call has no host, so it rendered a
+        dangling `tool-result · ` in front of an empty cell. The STATUS is the
+        information: `ok` against `tool-error` is the difference between "a human
+        approved a PR being opened" and "a PR was opened"."""
+        a = self.probe["saturation"]["audit"]
+        self.assertEqual(a["outcome_ok"]["stagePrefix"], "ok · ")
+        self.assertEqual(a["outcome_ok"]["host"], "mcp-github__get_me")
+        self.assertEqual(a["outcome_failed"]["stagePrefix"], "transport-error · ")
+        self.assertEqual(a["outcome_failed"]["host"],
+                         "mcp-github__create_pull_request")
+
+    def test_the_tool_name_is_the_one_the_agent_was_served(self):
+        """Flattened `server__tool`, because that is the name in the tool list, in the
+        agent's transcript and in the gateway's own log — an operator searching for
+        what they saw has to find it here."""
+        a = self.probe["saturation"]["audit"]
+        self.assertEqual(a["outcome_ok"]["host"], "mcp-github__get_me")
+        # Half a name reports what there is rather than assembling something that looks
+        # whole: `mcp-github__` would read as a tool whose name is empty.
+        self.assertEqual(a["outcome_half"], "mcp-github")
+        self.assertEqual(a["outcome_none"], "")
+
+    def test_a_malformed_status_is_suppressed_like_a_malformed_stage(self):
+        """The ingest validates `status` against a fixed vocabulary, so nothing
+        legitimate is excluded — and this cell does not depend on that holding. It is
+        the same reasoning as the stage bound: the column stays scannable whatever
+        arrives, and a value that would read as a hostname beside a real one is exactly
+        what the shape test exists to keep out."""
+        self.assertEqual(
+            self.probe["saturation"]["audit"]["outcome_bad_status"], "")
+
+    def test_the_record_view_answers_which_approval_for_an_outcome(self):
+        """`request` is the "which one was it" cell. For an egress row that is the
+        method and URL; for an outcome it is the approval id, which ties the row to the
+        hold, the human's answer and the claim the control plane recorded separately.
+
+        Its ABSENCE is information too — a call policy allowed outright never had an
+        approval — so it renders an em dash rather than a blank that would read as a
+        value the store failed to keep."""
+        a = self.probe["saturation"]["audit"]
+        self.assertEqual(a["outcome_event"], "a" * 32)
+        self.assertEqual(a["outcome_event_unapproved"], "—")
 
     def test_only_a_short_plain_word_can_prefix_the_host(self):
         """`stage` is unvalidated free text from the API model all the way to this

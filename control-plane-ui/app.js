@@ -360,6 +360,12 @@ function requestsLabel(n) {
 // plaintext HTTP decision reaching the proxy at all is unusual.
 const AUDIT_ORDINARY_STAGE = "connect";
 
+// The port a CONNECT tunnel goes to unless something is unusual. Named so the record
+// view can stay quiet about it: `:443` beside a host is the scheme restated, while
+// `:8443` is a thing worth noticing. The proxy's own port gate is what ENFORCES which
+// ports are reachable; this only decides what is worth printing.
+const ORDINARY_PORT = 443;
+
 // What may be rendered AS a stage prefix. The proxy sends one of two literals
 // (`connect`, `http`) and the field is unvalidated free text all the way to the
 // column, so this bounds the shape rather than the vocabulary — a stage a future
@@ -1149,25 +1155,35 @@ function eventRow(r) {
   return {
     ...auditRow(r),
     id: r && r.id !== undefined && r.id !== null ? String(r.id) : "",
-    // WHAT was asked for, in one cell, because the two shapes are alternatives rather
-    // than columns: a plaintext request has a method and a URL, a CONNECT tunnel has
-    // neither and is identified by its port. Rendering both as columns would give
-    // every row two empty cells, which is how a table stops being scannable.
+    // WHAT was asked for, and EMPTY WHENEVER THAT IS THE ORDINARY THING.
     //
-    // The URL is the reason this view exists — it is the field that says WHICH request
-    // — and it is also the only agent-controlled unbounded string on the page. Capped
-    // on write (store.DRAIN_MAX_FIELD) and escaped by the renderer; the CSP is what
-    // makes an escaping mistake inert rather than fatal.
-    // For an OUTCOME row the equivalent of "which request was it" is WHICH APPROVAL —
-    // the id that ties this row to the hold, the human's answer and the claim the
-    // control plane already recorded. Its absence is information too: a call policy
-    // allowed outright never had one, which is what `—` says here rather than leaving
-    // a blank that reads as a missing value.
+    // This cell used to render `:443 connect` for almost every row, because almost
+    // every governed request is a CONNECT tunnel (see AUDIT_ORDINARY_STAGE) — a port
+    // implied by the scheme, beside a host already in `target`. A column that repeats
+    // itself down the page is noise, and noise in the view that exists for reading
+    // carefully is worse than noise in the glance.
+    //
+    // So it follows the rule the stage prefix already follows: suppress the value that
+    // is true of nearly every row, and a non-empty cell then MEANS something. What
+    // survives is the minority worth stopping on —
+    //
+    //   a plaintext URL   which only exists because the proxy does not decrypt TLS, so
+    //                     its presence is itself the finding: an unencrypted request.
+    //                     It is the field that says WHICH request, and the only
+    //                     agent-controlled unbounded string on the page — capped on
+    //                     write (store.DRAIN_MAX_FIELD), escaped by the renderer, with
+    //                     the CSP making an escaping mistake inert rather than fatal.
+    //   an approval id    the outcome row's answer to "which one was it": the key
+    //                     tying it to the hold, the human's answer and the claim.
+    //   a non-standard port   a tunnel to :8443 is worth seeing where :443 is not.
+    //
+    // An outcome with no approval renders `—` rather than blank, because there the
+    // absence is the information: policy allowed that call outright.
     request: r && r.kind === AUDIT_OUTCOME
              ? (r.approval_id || "—")
              : [method, url].filter(Boolean).join(" ")
-               || [Number.isFinite(port) && port > 0 ? `:${port}` : "", proto]
-                  .filter(Boolean).join(" "),
+               || (Number.isFinite(port) && port > 0 && port !== ORDINARY_PORT
+                   ? `:${port}` : ""),
   };
 }
 

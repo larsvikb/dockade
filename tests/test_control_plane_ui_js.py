@@ -578,6 +578,10 @@ console.log(JSON.stringify({
         // A CONNECT tunnel has neither, and is identified by its port.
         tunnel: m.eventRow({ ts: 1e9, id: 8, kind: "allow", host: "b.example",
                              stage: "connect", port: 443, proto: "connect" }),
+        // The same tunnel somewhere unusual. `:443` is the scheme restated; `:8443` is
+        // a thing to stop on.
+        odd_port: m.eventRow({ ts: 1e9, id: 10, kind: "allow", host: "b.example",
+                               stage: "connect", port: 8443, proto: "connect" }),
         // Neither recorded — an empty cell rather than an invented one.
         bare: m.eventRow({ ts: 1e9, id: 9, host: "c.example" }),
         nothing: m.eventRow(null),
@@ -2389,13 +2393,22 @@ class PageScriptTests(unittest.TestCase):
         self.assertEqual(self.probe["saturation"]["query"]["cursor"],
                          "limit=5&before=1704067200.5%3A42")
 
-    def test_an_event_row_identifies_the_request_two_ways(self):
-        """The two shapes are alternatives, not columns: a plaintext request has a
-        method and a URL, a CONNECT tunnel has neither and is identified by its port.
-        Rendering both as columns would give every row two empty cells."""
+    def test_an_event_row_says_what_was_asked_for_only_when_it_is_unusual(self):
+        """The cell used to read `:443 connect` on almost every row, because almost
+        every governed request is a CONNECT tunnel — a port implied by the scheme,
+        beside a host already in `target`. A column that repeats itself down the page
+        is noise, and it is worst in the view meant for reading carefully.
+
+        So it follows the rule the stage prefix already does: suppress what is true of
+        nearly every row, and a non-empty cell then MEANS something."""
         e = self.probe["saturation"]["event_row"]
+        # A plaintext URL exists only because the proxy does not decrypt TLS, so its
+        # presence is itself the finding.
         self.assertEqual(e["http"]["request"], "GET https://a.example/x")
-        self.assertEqual(e["tunnel"]["request"], ":443 connect")
+        # The ordinary tunnel says nothing, because there is nothing to say.
+        self.assertEqual(e["tunnel"]["request"], "")
+        # An unusual port is worth stopping on, and survives.
+        self.assertEqual(e["odd_port"]["request"], ":8443")
         # Neither recorded: an empty cell, not an invented one.
         self.assertEqual(e["bare"]["request"], "")
         self.assertEqual(e["nothing"]["request"], "")

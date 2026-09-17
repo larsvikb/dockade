@@ -2682,8 +2682,8 @@ class AuditTableSourceTests(unittest.TestCase):
                             INDEX_HTML.read_text(), re.S)
         self.assertIsNotNone(section, "the record table was renamed")
         headers = [h.strip() for h in re.findall(r"<th>(.*?)</th>", section.group(0))]
-        self.assertEqual(headers, ["time", "decision", "host", "client", "request",
-                                   "reason"])
+        self.assertEqual(headers, ["time", "kind", "target", "client", "request",
+                                   "detail"])
         row = re.search(r"return `\s*<tr([^>]*)>(.*?)</tr>`", self.events, re.S)
         self.assertIsNotNone(row, "the record row template was restructured")
         cells = row.group(2).split("<td")[1:]
@@ -2743,7 +2743,7 @@ class RecordViewWiringSourceTests(unittest.TestCase):
         self.assertIn("resetPaging()", changed.group(1))
         # Every control goes through it, including the mode switch: the two views page
         # differently, so carrying a cursor across the switch is the same mistake.
-        for control in ("auditQEl", "auditDecisionEl", "auditWindowEl", "auditEveryEl"):
+        for control in ("auditQEl", "auditKindEl", "auditWindowEl", "auditEveryEl"):
             with self.subTest(control=control):
                 self.assertRegex(self.src, rf"{control}[^;]*?filtersChanged\(",
                                  f"{control} must go through filtersChanged, or its "

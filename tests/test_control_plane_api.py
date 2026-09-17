@@ -1567,10 +1567,10 @@ class AuditFilterTests(_CPTestCase):
         # a 400 on click, and a word missing from the page is a filter no operator can
         # reach. Same shape as the fail-closed marker test above — read the file that
         # ships, do not restate its contents.
-        section = re.search(r'<select id="audit-decision".*?</select>',
+        section = re.search(r'<select id="audit-kind".*?</select>',
                             (ROOT / "control-plane-ui" / "index.html").read_text(),
                             re.S)
-        self.assertIsNotNone(section, "the decision facet moved in index.html")
+        self.assertIsNotNone(section, "the kind facet moved in index.html")
         offered = [v for v in re.findall(r'value="([^"]*)"', section.group(0)) if v]
         self.assertEqual(sorted(offered), sorted(cp.audit.DECISIONS))
 

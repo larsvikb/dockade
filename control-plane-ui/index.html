@@ -407,13 +407,13 @@
          the backend enforces that split, this is only the control. -->
     <div class="filters" role="search">
       <input type="search" id="audit-q" autocomplete="off" spellcheck="false"
-             placeholder="search host, client, class, reason"
+             placeholder="search target, client, class, detail"
              aria-label="Search audit events">
       <!-- These option values are the `decision` column's vocabulary, and a test
            holds them equal to the backend's (audit.DECISIONS) — a value this page
            offers that the backend does not know is a 400 on click. -->
-      <select id="audit-decision" aria-label="Filter by decision">
-        <option value="">any decision</option>
+      <select id="audit-kind" aria-label="Filter by kind">
+        <option value="">any kind</option>
         <option value="allow">allow</option>
         <option value="deny">deny</option>
         <option value="hold">hold</option>
@@ -445,16 +445,16 @@
          distinction has to arrive before the rows, not be discovered among them. -->
     <div class="empty" id="audit-outage" hidden></div>
     <table id="audit-grouped-table">
-      <thead><tr><th>time</th><th>decision</th><th>host</th><th>client</th>
-        <th>reason</th></tr></thead>
+      <thead><tr><th>time</th><th>kind</th><th>target</th><th>client</th>
+        <th>detail</th></tr></thead>
       <tbody id="audit"></tbody>
     </table>
     <!-- The record: one row per decision. Carries `request` — the method and URL, or
          the port for a CONNECT tunnel — which is the whole reason to leave the folded
          view, and the field the glance deliberately drops as unbounded. -->
     <table id="audit-events-table" hidden>
-      <thead><tr><th>time</th><th>decision</th><th>host</th><th>client</th>
-        <th>request</th><th>reason</th></tr></thead>
+      <thead><tr><th>time</th><th>kind</th><th>target</th><th>client</th>
+        <th>request</th><th>detail</th></tr></thead>
       <tbody id="audit-events"></tbody>
     </table>
     <!-- Paging, for the record view only. The glance cannot page (a fold is defined

@@ -2473,7 +2473,7 @@ function start() {
   const AUDIT_FILTER_DEBOUNCE_MS = 250;
 
   const auditQEl = document.getElementById("audit-q");
-  const auditDecisionEl = document.getElementById("audit-decision");
+  const auditKindEl = document.getElementById("audit-kind");
   const auditWindowEl = document.getElementById("audit-window");
   const auditEveryEl = document.getElementById("audit-every");
   const auditClearEl = document.getElementById("audit-clear");
@@ -2493,7 +2493,7 @@ function start() {
   let auditCursors = [];
   let auditPage = 0;
 
-  const readFilter = () => ({ q: auditQEl.value, decision: auditDecisionEl.value,
+  const readFilter = () => ({ q: auditQEl.value, decision: auditKindEl.value,
                               preset: auditWindowEl.value });
   const everyEvent = () => auditEveryEl.checked;
   const auditRowCount = () =>
@@ -2653,12 +2653,12 @@ function start() {
   }
 
   auditQEl.addEventListener("input", () => filtersChanged(false));
-  for (const el of [auditDecisionEl, auditWindowEl, auditEveryEl]) {
+  for (const el of [auditKindEl, auditWindowEl, auditEveryEl]) {
     el.addEventListener("change", () => filtersChanged(true));
   }
   auditClearEl.addEventListener("click", () => {
     auditQEl.value = "";
-    auditDecisionEl.value = "";
+    auditKindEl.value = "";
     auditWindowEl.value = "";
     // The view switch is deliberately NOT cleared: it selects which record the
     // filters apply to, so resetting it would answer a question nobody asked.

@@ -260,11 +260,30 @@ def total(conn, filt: Filter) -> int:
 def grouped(conn, limit: int, filt: Filter, scan: int) -> list:
     """The glance: rows folded by exactly the fields the UI displays, newest first.
 
-    The group key is the DISPLAYED fields and nothing else, which is why the tool
-    columns are in it: two `ok` outcomes for different tools are different facts, and
-    folding them on `reason` alone (both NULL) would show one row saying "2x" with no
-    way to say what it stood for. Egress rows carry NULL in all three and SQLite groups
-    NULLs together, so their folding is unchanged.
+    The group key is the DISPLAYED fields, plus one that is not: ``approval_id``.
+
+    The displayed part is why the tool columns are in it — two `ok` outcomes for
+    different tools are different facts, and folding them on `reason` alone (both NULL)
+    would show one row saying "2x" with no way to say what it stood for. Egress rows
+    carry NULL in all of them and SQLite groups NULLs together, so their folding is
+    unchanged.
+
+    ``approval_id`` IS THE EXCEPTION TO THAT RULE, and it is deliberate. It is grouped
+    BY and not selected — the glance serves what it displays, which is why `url` and
+    `port` are absent too, and a 32-character id per row would be payload nothing on
+    screen could use. A grant is
+    single-use by construction, so two approval ids are two distinct human decisions —
+    and folding a row that stands for a SPENT GRANT hides exactly what the approval
+    machinery exists to record. Two separately approved `create_pull_request` calls that
+    both succeeded are two pull requests; shown as one line with a count, the count is
+    the only trace that a second human decision ever happened. Outcomes with no approval
+    still fold (NULLs group together), which keeps the high-volume read-only rows quiet.
+
+    The cost is stated because it is real: two approved rows look identical on screen
+    and nothing there explains why they did not merge. That is the confusion folding-by-
+    displayed-fields exists to prevent, and it is accepted here — two rows that look
+    alike is a far smaller wrong than two grants shown as one. The record view, one
+    toggle away, shows the ids.
 
     The filter applies to the RAW ROWS, before folding — so ``scan`` bounds the
     matching events read rather than the events read, and a narrow filter therefore
@@ -280,7 +299,7 @@ def grouped(conn, limit: int, filt: Filter, scan: int) -> list:
         "       COUNT(*) AS n, MAX(ts) AS ts, MIN(ts) AS first_ts "
         f"FROM (SELECT * FROM audit {filt.where} ORDER BY ts DESC LIMIT ?) "
         "GROUP BY decision, stage, host, client, client_class, reason, "
-        "         server, tool, status "
+        "         server, tool, status, approval_id "
         "ORDER BY ts DESC LIMIT ?",
         [*filt.params, scan, limit]).fetchall()
 

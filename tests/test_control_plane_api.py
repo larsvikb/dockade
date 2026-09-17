@@ -3921,6 +3921,81 @@ class ToolFieldCapTests(_ToolBridgeTestCase):
         self.assertEqual(len(row["server"]), cp.store.DRAIN_MAX_FIELD)
 
 
+class OutcomeFoldingTests(_CPTestCase):
+    """What the GLANCE may fold, once rows can stand for side effects.
+
+    Folding is right for a decision repeated: fifty CONNECTs allowed by one rule is one
+    fact fifty times, and a list that showed them all would answer nothing. It is not
+    obviously right for an outcome, because an outcome records that something HAPPENED
+    — and two pull requests opened is not one event seen twice.
+
+    The line drawn here is narrower than "never fold outcomes": what must never merge is
+    two SPENT GRANTS."""
+
+    def _outcomes(self, *rows):
+        with cp.store._connect() as conn:
+            conn.execute("DELETE FROM audit")
+            for i, r in enumerate(rows):
+                conn.execute(
+                    "INSERT INTO audit(ts, decision, stage, client, server, tool, "
+                    "status, approval_id) VALUES (?,'outcome','tool-result',?,?,?,?,?)",
+                    (float(i), "172.30.0.2", r.get("server", "mcp-github"),
+                     r.get("tool", "get_me"), r.get("status", "ok"),
+                     r.get("approval_id")))
+            conn.commit()
+
+    def _grouped(self):
+        with cp.store._connect() as conn:
+            return cp.audit.grouped(conn, 50, cp.audit.parse(), 500)
+
+    def test_two_approved_calls_are_never_one_line(self):
+        # THE ONE THAT MATTERS. A grant is single-use, so two approval ids are two
+        # distinct human decisions and two side effects. Folded, the count would be the
+        # only trace that a second approval ever happened — and the count is exactly
+        # what a reader skims past.
+        self._outcomes({"tool": "create_pull_request", "approval_id": "a" * 32},
+                       {"tool": "create_pull_request", "approval_id": "b" * 32})
+        rows = self._grouped()
+        # Two rows, each standing for exactly one call. The ids themselves are NOT
+        # served here — the glance carries what it displays — so the assertion is the
+        # one an operator can actually see: no count above 1 absorbed a second grant.
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({r["n"] for r in rows}, {1})
+        self.assertNotIn("approval_id", rows[0].keys())
+
+    def test_unapproved_calls_still_fold(self):
+        # The high-volume read-only rows, which are what the glance exists to keep
+        # quiet. Their approval_id is NULL and SQLite groups NULLs together.
+        self._outcomes({"tool": "actions_list"}, {"tool": "actions_list"},
+                       {"tool": "actions_list"})
+        rows = self._grouped()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["n"], 3)
+
+    def test_two_tools_do_not_fold_into_one_unattributable_count(self):
+        # Both `ok`, both with a NULL host and a NULL reason — so before the tool
+        # columns joined the group key these folded into one row saying "2x" with
+        # nothing on it to say what it stood for.
+        self._outcomes({"tool": "get_me"}, {"tool": "actions_list"})
+        self.assertEqual({r["tool"] for r in self._grouped()},
+                         {"get_me", "actions_list"})
+
+    def test_a_failure_does_not_fold_into_the_successes(self):
+        # `status` is in the key, so the one row worth noticing cannot be absorbed by
+        # the run of ordinary ones around it.
+        self._outcomes({}, {}, {"status": "tool-error"})
+        rows = {r["status"]: r["n"] for r in self._grouped()}
+        self.assertEqual(rows, {"ok": 2, "tool-error": 1})
+
+    def test_the_same_tool_on_two_servers_stays_apart(self):
+        # Tool names are not namespaced across servers, so the pair is the identity —
+        # the same reason `tool_rules` is UNIQUE on it.
+        self._outcomes({"server": "mcp-github", "tool": "issue_read"},
+                       {"server": "mcp-other", "tool": "issue_read"})
+        self.assertEqual({r["server"] for r in self._grouped()},
+                         {"mcp-github", "mcp-other"})
+
+
 class _FreshStoreTestCase(unittest.TestCase):
     """Base for tests that need a genuinely empty database rather than the shared one:
     schema questions cannot be asked of a store the rest of the suite has been

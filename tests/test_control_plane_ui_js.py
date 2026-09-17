@@ -2640,7 +2640,19 @@ class AuditTableSourceTests(unittest.TestCase):
         one word. A decisions table exists to be quotable evidence, so the space and
         the separator are part of the escaped VALUE, never styling."""
         self.assertIn('esc(" " + a.repeat)', self.rows)
-        self.assertIn("esc(` · first seen ${fmtStamp(a.firstTs)}`)", self.rows)
+        self.assertIn('first seen ${fmtStamp(a.firstTs)}', self.rows)
+
+    def test_the_first_seen_separator_appears_only_when_it_separates(self):
+        """A separator with nothing on its left is not a separator, it is a bullet the
+        row starts with — and a successful outcome has an EMPTY reason by design (the
+        only thing left to say would be the reply's own text, which is content and
+        belongs in the gateway's file, not the store). So the common case rendered
+        `· first seen …` with a leading dot and nothing before it.
+
+        Asserted against the source, like its sibling above, because the branch lives
+        inside `renderGrouped` — which is in `start()` and cannot be called from
+        here."""
+        self.assertIn('${a.reason ? " · " : ""}first seen', self.rows)
         # fmtStamp, not fmtTime: a group's span can cover days (the scan behind it is
         # bounded by event count, not by a window), so a bare time reads as today.
         self.assertNotIn("fmtTime(a.firstTs)", self.rows)

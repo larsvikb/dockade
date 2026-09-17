@@ -2522,7 +2522,8 @@ function start() {
             ? `<span class="qual">${esc(a.clientClassPrefix)}</span>` : ""
             }${esc(a.client)}</td>
           <td>${esc(a.reason)}${a.firstTs
-            ? esc(` · first seen ${fmtStamp(a.firstTs)}`) : ""}</td></tr>`;
+            ? esc(`${a.reason ? " · " : ""}first seen ${fmtStamp(a.firstTs)}`)
+            : ""}</td></tr>`;
     }).join("");
   }
 

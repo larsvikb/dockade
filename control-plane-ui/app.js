@@ -376,7 +376,7 @@ const AUDIT_ORDINARY_STAGE = "connect";
 // case does nothing to make a value blend into the host beside it.
 const AUDIT_STAGE_SHAPE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,11}$/;
 
-// An outcome row's own shape. `decision` says only that this is a result; the STATUS
+// An outcome row's own shape. `kind` says only that this is a result; the STATUS
 // is the information — `ok` against `tool-error` is the difference between "a human
 // approved a PR being opened" and "a PR was opened". Same bound and charset as the
 // stage shape above, widened because `transport-error` is fifteen characters.
@@ -401,12 +401,12 @@ function auditRow(r) {
   const stage = (r && r.stage) || "";
   return {
     ts: tsSeconds(r && r.ts),
-    decision: (r && r.decision) || "?",
-    // Prefixes the HOST, not the decision — `http · example.com`, which reads as the
+    kind: (r && r.kind) || "?",
+    // Prefixes the TARGET, not the kind — `http · example.com`, which reads as the
     // scheme it effectively is. The stage does not qualify the decision at all (a deny
     // at the http stage is the same deny as at connect); it describes how the request
     // was MADE, and the host cell is where the request is identified. It also keeps
-    // the decision column uniform, which matters because that is the column an
+    // the kind column uniform, which matters because that is the column an
     // operator scans vertically.
     //
     // Carries its own SEPARATOR rather than relying on a CSS margin. The margin spaced
@@ -420,15 +420,15 @@ function auditRow(r) {
     // An OUTCOME row qualifies itself by status rather than by stage, and the swap
     // follows the same rule: the prefix says how, the cell says what. `tool-result`
     // is what the stage would contribute and it is pure redundancy — it is implied by
-    // the decision word already in the tag — while the status is the whole point of
+    // the kind word already in the tag — while the status is the whole point of
     // the row. Left unprefixed, these rows also rendered a dangling `tool-result · `
     // against an empty host cell, since a tool call has no host.
-    stagePrefix: r && r.decision === AUDIT_OUTCOME
+    stagePrefix: r && r.kind === AUDIT_OUTCOME
                  ? (r.status && AUDIT_STATUS_SHAPE.test(r.status)
                     ? `${r.status} · ` : "")
                  : (stage && stage !== AUDIT_ORDINARY_STAGE
                     && AUDIT_STAGE_SHAPE.test(stage) ? `${stage} · ` : ""),
-    host: r && r.decision === AUDIT_OUTCOME
+    target: r && r.kind === AUDIT_OUTCOME
           ? toolSubject(r) : ((r && r.host) || ""),
     // An em dash rather than an empty cell: blank reads as "this column is broken",
     // whereas the honest statement is that no client was recorded for this row.
@@ -1080,7 +1080,7 @@ function timeWindow(preset, nowMs) {
 // query; whether one was actually applied is the backend's to report (see
 // coverageSummary).
 function filterActive(f) {
-  return !!(f && (((f.q || "").trim()) || f.decision || AUDIT_WINDOWS[f.preset]));
+  return !!(f && (((f.q || "").trim()) || f.kind || AUDIT_WINDOWS[f.preset]));
 }
 
 // The query string both views are fetched with. Pure, so the one place that decides
@@ -1097,7 +1097,7 @@ function auditQuery(f, opts) {
   if (Number.isFinite(limit) && limit > 0) parts.push(`limit=${Math.floor(limit)}`);
   const q = ((f && f.q) || "").trim();
   if (q) parts.push(`q=${encodeURIComponent(q)}`);
-  if (f && f.decision) parts.push(`decision=${encodeURIComponent(f.decision)}`);
+  if (f && f.kind) parts.push(`kind=${encodeURIComponent(f.kind)}`);
   const since = timeWindow(f && f.preset, o.nowMs);
   if (since !== null) parts.push(`since=${since}`);
   if (o.before) parts.push(`before=${encodeURIComponent(o.before)}`);
@@ -1132,7 +1132,7 @@ function eventRow(r) {
     // control plane already recorded. Its absence is information too: a call policy
     // allowed outright never had one, which is what `—` says here rather than leaving
     // a blank that reads as a missing value.
-    request: r && r.decision === AUDIT_OUTCOME
+    request: r && r.kind === AUDIT_OUTCOME
              ? (r.approval_id || "—")
              : [method, url].filter(Boolean).join(" ")
                || [Number.isFinite(port) && port > 0 ? `:${port}` : "", proto]
@@ -2493,7 +2493,7 @@ function start() {
   let auditCursors = [];
   let auditPage = 0;
 
-  const readFilter = () => ({ q: auditQEl.value, decision: auditKindEl.value,
+  const readFilter = () => ({ q: auditQEl.value, kind: auditKindEl.value,
                               preset: auditWindowEl.value });
   const everyEvent = () => auditEveryEl.checked;
   const auditRowCount = () =>
@@ -2514,9 +2514,9 @@ function start() {
       return `
         <tr${a.failClosed ? ' class="outage"' : ""}>
           <td class="ts" title="${esc(fmtInstant(a.ts))}">${esc(fmtStamp(a.ts))}</td>
-          <td><span class="tag ${esc(a.decision)}">${esc(a.decision)}</span></td>
+          <td><span class="tag ${esc(a.kind)}">${esc(a.kind)}</span></td>
           <td>${a.stagePrefix ? `<span class="qual">${esc(a.stagePrefix)}</span>` : ""
-            }${esc(a.host)}${a.repeat
+            }${esc(a.target)}${a.repeat
               ? `<span class="rep">${esc(" " + a.repeat)}</span>` : ""}</td>
           <td class="ts">${a.clientClassPrefix
             ? `<span class="qual">${esc(a.clientClassPrefix)}</span>` : ""
@@ -2536,9 +2536,9 @@ function start() {
       return `
         <tr${a.failClosed ? ' class="outage"' : ""}>
           <td class="ts" title="${esc(fmtInstant(a.ts))}">${esc(fmtStamp(a.ts))}</td>
-          <td><span class="tag ${esc(a.decision)}">${esc(a.decision)}</span></td>
+          <td><span class="tag ${esc(a.kind)}">${esc(a.kind)}</span></td>
           <td>${a.stagePrefix ? `<span class="qual">${esc(a.stagePrefix)}</span>` : ""
-            }${esc(a.host)}</td>
+            }${esc(a.target)}</td>
           <td class="ts">${a.clientClassPrefix
             ? `<span class="qual">${esc(a.clientClassPrefix)}</span>` : ""
             }${esc(a.client)}</td>

@@ -382,54 +382,54 @@ console.log(JSON.stringify({
       },
       audit: {
         ordinary_stage: m.AUDIT_ORDINARY_STAGE,
-        tunnelled: m.auditRow({ ts: 1e9, decision: "allow", stage: "connect",
+        tunnelled: m.auditRow({ ts: 1e9, kind: "allow", stage: "connect",
                                 host: "pypi.org", client: "172.30.0.7",
                                 reason: "allowed by rule (pypi.org)" }),
-        plaintext: m.auditRow({ ts: 1e9, decision: "deny", stage: "http",
+        plaintext: m.auditRow({ ts: 1e9, kind: "deny", stage: "http",
                                 host: "a.example", client: "172.30.0.2",
                                 reason: "no matching rule" }),
-        no_stage: m.auditRow({ ts: 1e9, decision: "hold", host: "a.example" }),
+        no_stage: m.auditRow({ ts: 1e9, kind: "hold", host: "a.example" }),
         // OUTCOME rows: the status takes the prefix slot the stage uses, and the
         // subject is the flattened tool name. `tool-result` as a prefix would be pure
         // redundancy against the tag, and it rendered a dangling separator because a
         // tool call has no host.
-        outcome_ok: m.auditRow({ ts: 1e9, decision: "outcome", stage: "tool-result",
+        outcome_ok: m.auditRow({ ts: 1e9, kind: "outcome", stage: "tool-result",
                                  server: "mcp-github", tool: "get_me", status: "ok",
                                  client: "172.30.0.2" }),
-        outcome_failed: m.auditRow({ ts: 1e9, decision: "outcome",
+        outcome_failed: m.auditRow({ ts: 1e9, kind: "outcome",
                                      stage: "tool-result", server: "mcp-github",
                                      tool: "create_pull_request",
                                      status: "transport-error",
                                      reason: "no answer" }),
         // Half a name is reported as what there is, never assembled into something
         // that looks whole.
-        outcome_half: m.auditRow({ ts: 1e9, decision: "outcome",
-                                   server: "mcp-github", status: "ok" }).host,
-        outcome_none: m.auditRow({ ts: 1e9, decision: "outcome",
-                                   status: "ok" }).host,
+        outcome_half: m.auditRow({ ts: 1e9, kind: "outcome",
+                                   server: "mcp-github", status: "ok" }).target,
+        outcome_none: m.auditRow({ ts: 1e9, kind: "outcome",
+                                   status: "ok" }).target,
         // A status the shape rejects is suppressed rather than rendered, exactly as a
         // malformed stage is — the column has to stay scannable whatever arrives.
-        outcome_bad_status: m.auditRow({ ts: 1e9, decision: "outcome",
+        outcome_bad_status: m.auditRow({ ts: 1e9, kind: "outcome",
                                          server: "s", tool: "t",
                                          status: "evil.example" }).stagePrefix,
         // The record view answers "which one was it" — for an outcome that is WHICH
         // APPROVAL, and its absence means policy allowed the call outright.
-        outcome_event: m.eventRow({ ts: 1e9, decision: "outcome", server: "mcp-github",
+        outcome_event: m.eventRow({ ts: 1e9, kind: "outcome", server: "mcp-github",
                                     tool: "get_me", status: "ok",
                                     approval_id: "a".repeat(32) }).request,
-        outcome_event_unapproved: m.eventRow({ ts: 1e9, decision: "outcome",
+        outcome_event_unapproved: m.eventRow({ ts: 1e9, kind: "outcome",
                                                server: "s", tool: "t",
                                                status: "ok" }).request,
         // The client class, which is what the decision was actually taken against.
-        classed: m.auditRow({ ts: 1e9, decision: "allow", host: "api.github.com",
+        classed: m.auditRow({ ts: 1e9, kind: "allow", host: "api.github.com",
                               client: "172.28.0.3", client_class: "mcp" }),
         // A row from before the column existed, and one the backend could not place.
         // Both render nothing rather than an invented label — these rows are evidence.
-        unclassed: m.auditRow({ ts: 1e9, decision: "allow", host: "a.example",
+        unclassed: m.auditRow({ ts: 1e9, kind: "allow", host: "a.example",
                                 client: "172.30.0.2" }),
         // A stage a future hook might add still shows: the bound is on SHAPE, not on
         // a fixed vocabulary.
-        future_stage: m.auditRow({ ts: 1e9, decision: "deny", stage: "tls",
+        future_stage: m.auditRow({ ts: 1e9, kind: "deny", stage: "tls",
                                    host: "a.example" }).stagePrefix,
         // Case is not part of the bound: it does nothing to make a value blend into
         // the host, and suppressing a future `TLS` would be a silent surprise.
@@ -456,8 +456,8 @@ console.log(JSON.stringify({
                                     host: "a.example" }).stagePrefix]),
         at_the_length_limit: m.auditRow({ ts: 1e9, stage: "x".repeat(12),
                                           host: "a.example" }).stagePrefix,
-        no_client: m.auditRow({ ts: 1e9, decision: "allow", host: "a.example" }),
-        junk_ts: m.auditRow({ ts: "soon", decision: "allow", host: "a.example" }).ts,
+        no_client: m.auditRow({ ts: 1e9, kind: "allow", host: "a.example" }),
+        junk_ts: m.auditRow({ ts: "soon", kind: "allow", host: "a.example" }).ts,
         empty: m.auditRow({}),
         nothing: m.auditRow(null),
       },
@@ -524,19 +524,19 @@ console.log(JSON.stringify({
         presets: Object.keys(m.AUDIT_WINDOWS),
       },
       filter_active: {
-        nothing: m.filterActive({ q: "", decision: "", preset: "" }),
+        nothing: m.filterActive({ q: "", kind: "", preset: "" }),
         no_filter_object: m.filterActive(null),
         text: m.filterActive({ q: "evil" }),
         // Whitespace is not a filter: an accidental space must not relabel the view.
         whitespace: m.filterActive({ q: "   " }),
-        decision: m.filterActive({ decision: "deny" }),
+        kind: m.filterActive({ kind: "deny" }),
         window: m.filterActive({ preset: "24h" }),
         unknown_window: m.filterActive({ preset: "forever" }),
       },
       query: {
         bare: m.auditQuery({}, { limit: 40 }),
         everything: m.auditQuery(
-          { q: "evil", decision: "deny", preset: "1h" },
+          { q: "evil", kind: "deny", preset: "1h" },
           { limit: 100, nowMs: 1704067200000, before: "1704067200.5:42" }),
         // Free text is percent-encoded, or an `&` pasted from a URL splits the
         // query string into parameters the backend would misread or refuse.
@@ -550,12 +550,12 @@ console.log(JSON.stringify({
       },
       event_row: {
         // A plaintext request: method and URL are what identify it.
-        http: m.eventRow({ ts: 1e9, id: 7, decision: "deny", host: "a.example",
+        http: m.eventRow({ ts: 1e9, id: 7, kind: "deny", host: "a.example",
                            stage: "http", method: "GET", url: "https://a.example/x",
                            port: 80, proto: "http", client: "172.30.0.2",
                            client_class: "sandbox", reason: "blocked by rule" }),
         // A CONNECT tunnel has neither, and is identified by its port.
-        tunnel: m.eventRow({ ts: 1e9, id: 8, decision: "allow", host: "b.example",
+        tunnel: m.eventRow({ ts: 1e9, id: 8, kind: "allow", host: "b.example",
                              stage: "connect", port: 443, proto: "connect" }),
         // Neither recorded — an empty cell rather than an invented one.
         bare: m.eventRow({ ts: 1e9, id: 9, host: "c.example" }),
@@ -563,10 +563,10 @@ console.log(JSON.stringify({
         // The shared columns must be IDENTICAL to the folded view's, which is the
         // whole reason eventRow builds on auditRow.
         shares_shaping: (() => {
-          const r = { ts: 1e9, decision: "deny", host: "a.example", stage: "http",
+          const r = { ts: 1e9, kind: "deny", host: "a.example", stage: "http",
                       client_class: "mcp", fail_closed: true };
           const folded = m.auditRow(r), raw = m.eventRow(r);
-          return ["ts", "decision", "host", "client", "stagePrefix",
+          return ["ts", "kind", "host", "client", "stagePrefix",
                   "clientClassPrefix", "reason", "failClosed"]
             .every(k => JSON.stringify(folded[k]) === JSON.stringify(raw[k]));
         })(),
@@ -1847,9 +1847,9 @@ class PageScriptTests(unittest.TestCase):
         approved a PR being opened" and "a PR was opened"."""
         a = self.probe["saturation"]["audit"]
         self.assertEqual(a["outcome_ok"]["stagePrefix"], "ok · ")
-        self.assertEqual(a["outcome_ok"]["host"], "mcp-github__get_me")
+        self.assertEqual(a["outcome_ok"]["target"], "mcp-github__get_me")
         self.assertEqual(a["outcome_failed"]["stagePrefix"], "transport-error · ")
-        self.assertEqual(a["outcome_failed"]["host"],
+        self.assertEqual(a["outcome_failed"]["target"],
                          "mcp-github__create_pull_request")
 
     def test_the_tool_name_is_the_one_the_agent_was_served(self):
@@ -1857,7 +1857,7 @@ class PageScriptTests(unittest.TestCase):
         agent's transcript and in the gateway's own log — an operator searching for
         what they saw has to find it here."""
         a = self.probe["saturation"]["audit"]
-        self.assertEqual(a["outcome_ok"]["host"], "mcp-github__get_me")
+        self.assertEqual(a["outcome_ok"]["target"], "mcp-github__get_me")
         # Half a name reports what there is rather than assembling something that looks
         # whole: `mcp-github__` would read as a tool whose name is empty.
         self.assertEqual(a["outcome_half"], "mcp-github")
@@ -1906,9 +1906,9 @@ class PageScriptTests(unittest.TestCase):
         # This list is fed from a table the agent influences the contents of, so a
         # missing field must degrade to a readable cell, never to a thrown render
         # that leaves the operator with a blank decisions view.
-        self.assertEqual(a["empty"]["decision"], "?")
-        self.assertEqual(a["nothing"]["decision"], "?")
-        self.assertEqual(a["nothing"]["host"], "")
+        self.assertEqual(a["empty"]["kind"], "?")
+        self.assertEqual(a["nothing"]["kind"], "?")
+        self.assertEqual(a["nothing"]["target"], "")
         self.assertIsNone(a["junk_ts"], "a non-numeric ts must not reach Date()")
 
     def test_an_outage_is_not_reported_when_every_denial_was_policy(self):
@@ -2300,7 +2300,7 @@ class PageScriptTests(unittest.TestCase):
         self.assertFalse(f["nothing"])
         self.assertFalse(f["no_filter_object"])
         self.assertTrue(f["text"])
-        self.assertTrue(f["decision"])
+        self.assertTrue(f["kind"])
         self.assertTrue(f["window"])
         # Whitespace is not a filter, and an unknown preset narrows nothing — treating
         # either as active would relabel the whole view for no change in its contents.
@@ -2312,7 +2312,7 @@ class PageScriptTests(unittest.TestCase):
         self.assertEqual(q["bare"], "limit=40")
         self.assertEqual(
             q["everything"],
-            "limit=100&q=evil&decision=deny&since=1704063600"
+            "limit=100&q=evil&kind=deny&since=1704063600"
             "&before=1704067200.5%3A42")
         self.assertEqual(q["trims"], "limit=40&q=evil")
         # An absent or unusable limit is omitted rather than sent as junk — the
@@ -2608,31 +2608,31 @@ class AuditTableSourceTests(unittest.TestCase):
             "the only thing on the row element itself is the outage marker")
         cells = row.group(2).split("<td")[1:]
         self.assertEqual(len(cells), 5, "expected five cells, one per header")
-        time_, decision, host, client, reason = cells
+        time_, kind, target, client, detail = cells
 
         self.assertIn("fmtStamp(a.ts)", time_)
         self.assertIn("fmtInstant(a.ts)", time_)
-        # The decision cell holds the decision and NOTHING else. It is the column an
+        # The kind cell holds the kind and NOTHING else. It is the column an
         # operator scans vertically, so a variable-width extra makes it ragged — and
-        # the stage does not qualify the decision anyway.
-        self.assertIn("a.decision", decision)
-        self.assertNotIn("stagePrefix", decision)
-        # The stage prefixes the HOST, reading as the scheme it effectively is.
-        self.assertIn("a.stagePrefix", host)
-        self.assertIn("esc(a.host)", host)
+        # the stage does not qualify the kind anyway.
+        self.assertIn("a.kind", kind)
+        self.assertNotIn("stagePrefix", kind)
+        # The stage prefixes the TARGET, reading as the scheme it effectively is.
+        self.assertIn("a.stagePrefix", target)
+        self.assertIn("esc(a.target)", target)
         self.assertIn("esc(a.client)", client)
         # The class qualifies the CLIENT, the same way the stage qualifies the host —
         # it is not a sixth column (asserted above) and it must not drift onto the
         # decision cell, which stays uniform for vertical scanning.
         self.assertIn("a.clientClassPrefix", client)
-        self.assertNotIn("clientClassPrefix", decision)
-        self.assertIn("esc(a.reason)", reason)
+        self.assertNotIn("clientClassPrefix", kind)
+        self.assertIn("esc(a.reason)", detail)
         # Grouping annotates two cells and must not add a sixth (asserted above): the
-        # repeat count sits beside the host it repeats, the span beside the reason,
+        # repeat count sits beside the target it repeats, the span beside the detail,
         # which is the column that already carries explanatory text.
-        self.assertIn("a.repeat", host)
-        self.assertIn("a.firstTs", reason)
-        self.assertNotIn("a.repeat", decision, "the decision column stays uniform")
+        self.assertIn("a.repeat", target)
+        self.assertIn("a.firstTs", detail)
+        self.assertNotIn("a.repeat", kind, "the kind column stays uniform")
 
     def test_the_grouping_annotations_carry_their_own_separators(self):
         """The `denyhttp` lesson, which cost a live debug: a CSS margin produced the

@@ -70,9 +70,9 @@ DRAIN_BLOCK = int(os.environ.get("CONTROL_AUDIT_DRAIN_BLOCK", str(1 << 20)))
 # The audit columns each stream fills. Two streams describe different events, so
 # neither should have to carry the other's columns as a row of NULLs it has to know to
 # write — an egress decision has no tool identity, and an outcome has no host or port.
-_EGRESS_COLUMNS = ("ts", "decision", "stage", "host", "port", "proto", "client",
+_EGRESS_COLUMNS = ("ts", "kind", "stage", "host", "port", "proto", "client",
                    "client_class", "method", "url", "reason")
-_TOOL_COLUMNS = ("ts", "decision", "stage", "client", "client_class", "reason",
+_TOOL_COLUMNS = ("ts", "kind", "stage", "client", "client_class", "reason",
                  "server", "tool", "approval_id", "status")
 
 
@@ -160,7 +160,10 @@ def _egress_row(line: bytes) -> dict | None:
     # anyway is what keeps the column populated across the whole audit view, so an
     # operator filtering by client class does not silently lose exactly the alarming
     # rows. It is derived at INGEST, seconds behind the event, not at read time.
-    return {"ts": ts, "decision": _ingest_field(rec.get("decision")),
+    # `decision` on the WIRE, `kind` in the column, and neither is a missed rename:
+    # the proxy writes decisions and that is what its line says, while the column holds
+    # seven kinds of row of which only some are decisions.
+    return {"ts": ts, "kind": _ingest_field(rec.get("decision")),
             "stage": _ingest_field(rec.get("stage")),
             "host": _ingest_field(rec.get("host")), "port": port,
             "proto": _ingest_field(rec.get("proto")), "client": client,
@@ -180,7 +183,7 @@ def _tool_row(line: bytes) -> dict | None:
     status has to be one of the words both sides agreed on, checked here because the
     two are a file apart with no compiler between them.
 
-    ``decision`` is a CONSTANT, not read off the line. An outcome is not a decision the
+    ``kind`` is a CONSTANT, not read off the line. An outcome is not a decision the
     writer made, and a stream that could name its own decision word could write `allow`
     into the audit trail — which would let a compromised gateway forge governance
     history rather than merely report a result. The word it gets is `outcome`, and
@@ -198,7 +201,7 @@ def _tool_row(line: bytes) -> dict | None:
     if ts is None:
         return None
     client = _ingest_field(rec.get("client"))
-    return {"ts": ts, "decision": "outcome", "stage": "tool-result",
+    return {"ts": ts, "kind": "outcome", "stage": "tool-result",
             "client": client, "client_class": policy._client_class(client),
             "reason": _ingest_field(rec.get("reason")),
             "server": _ingest_field(rec.get("server")),
@@ -208,7 +211,7 @@ def _tool_row(line: bytes) -> dict | None:
 
 
 def _describe_egress(row: dict) -> str:
-    return (f"{row['decision']} (ingested) stage={row['stage']} host={row['host']} "
+    return (f"{row['kind']} (ingested) stage={row['stage']} host={row['host']} "
             f"client={row['client']} client_class={row['client_class']} "
             f":: {row['reason']}")
 

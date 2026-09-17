@@ -34,7 +34,7 @@ has no state of its own to get out of step with the store's.
 """
 from __future__ import annotations
 
-# The vocabulary of the ``decision`` column, so a facet can be VALIDATED rather than
+# The vocabulary of the ``kind`` column, so a facet can be VALIDATED rather than
 # passed through to a query that returns nothing. An unknown value must not read as
 # "no decisions matched": that is indistinguishable from a quiet system, which is the
 # one thing a decisions list must not be ambiguous about (the same reasoning as the
@@ -56,8 +56,8 @@ from __future__ import annotations
 # earns its worth by being rare — one writer, changes only, and an image bump that
 # starts exposing a destructive tool reads as the alarm it is. Outcome rows are one per
 # tool call. Folding them together would bury the rare signal under the common one.
-DECISIONS = ("allow", "deny", "hold", "revoke", "create", "edit", "observe",
-             "outcome")
+KINDS = ("allow", "deny", "hold", "revoke", "create", "edit", "observe",
+         "outcome")
 
 # Columns ``q`` searches, PER VIEW, and the rule is that a view searches exactly what
 # it DISPLAYS. Anything else produces the worst kind of result list: rows whose visible
@@ -79,7 +79,7 @@ EVENT_SEARCH = ("host", "client", "client_class", "reason", "method", "url",
 # glance defers to, so the fields it drops as noise or as unbounded (``url`` above
 # all) are exactly what has to be here, or the interface still cannot answer "which
 # request was it".
-EVENT_COLUMNS = ("id", "ts", "decision", "stage", "host", "port", "proto", "client",
+EVENT_COLUMNS = ("id", "ts", "kind", "stage", "host", "port", "proto", "client",
                  "client_class", "method", "url", "reason", "status",
                  # The tool columns, for the same reason ``url`` is here: this is the
                  # view that answers "which one was it", and the tool rows' identity —
@@ -182,7 +182,7 @@ def _time(name: str, value) -> float:
     return ts
 
 
-def parse(q=None, decision=None, since=None, until=None,
+def parse(q=None, kind=None, since=None, until=None,
           search=GROUPED_SEARCH) -> Filter:
     """Validate the filter parameters and build the WHERE clause they mean.
 
@@ -207,18 +207,18 @@ def parse(q=None, decision=None, since=None, until=None,
         clauses.append(f"({ors})")
         params.extend([needle] * len(search))
 
-    if decision:
+    if kind:
         # Comma-separated, because "allow and deny but not hold" is the useful shape
         # of this facet — a single value would make the common "everything that was
         # refused" question two queries the UI would have to merge.
-        wanted = [d.strip().lower() for d in str(decision).split(",") if d.strip()]
-        unknown = [d for d in wanted if d not in DECISIONS]
+        wanted = [k.strip().lower() for k in str(kind).split(",") if k.strip()]
+        unknown = [k for k in wanted if k not in KINDS]
         if unknown:
             raise FilterError(
-                f"unknown decision {', '.join(repr(u) for u in unknown)} — the "
-                f"recorded decisions are {', '.join(DECISIONS)}")
+                f"unknown kind {', '.join(repr(u) for u in unknown)} — the "
+                f"recorded kinds are {', '.join(KINDS)}")
         if wanted:
-            clauses.append(f"decision IN ({','.join('?' for _ in wanted)})")
+            clauses.append(f"kind IN ({','.join('?' for _ in wanted)})")
             params.extend(wanted)
 
     lo = None if since is None else _time("since", since)
@@ -294,11 +294,11 @@ def grouped(conn, limit: int, filt: Filter, scan: int) -> list:
     The cost of that is stated rather than hidden: a filter matching nothing walks the
     `ts` index to the end of the table. Bounded by the table, not by ``scan``."""
     return conn.execute(
-        "SELECT decision, stage, host, client, client_class, reason, "  # noqa: S608
+        "SELECT kind, stage, host, client, client_class, reason, "  # noqa: S608
         "       server, tool, status, "
         "       COUNT(*) AS n, MAX(ts) AS ts, MIN(ts) AS first_ts "
         f"FROM (SELECT * FROM audit {filt.where} ORDER BY ts DESC LIMIT ?) "
-        "GROUP BY decision, stage, host, client, client_class, reason, "
+        "GROUP BY kind, stage, host, client, client_class, reason, "
         "         server, tool, status, approval_id "
         "ORDER BY ts DESC LIMIT ?",
         [*filt.params, scan, limit]).fetchall()

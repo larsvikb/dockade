@@ -142,7 +142,7 @@ class IngestTestCase(unittest.TestCase):
     def rows(self):
         with cp.store._connect() as conn:
             return conn.execute(
-                "SELECT ts, decision, stage, host, port, proto, client, "
+                "SELECT ts, kind, stage, host, port, proto, client, "
                 "client_class, method, url, reason FROM audit ORDER BY id").fetchall()
 
     def cursor(self):
@@ -157,7 +157,7 @@ class RowMappingTests(IngestTestCase):
     def test_local_decision_becomes_a_row(self):
         self.assertEqual(
             cp.ingest._egress_row(_line().encode()),
-            {"ts": 1000.0, "decision": "deny", "stage": "sni", "host": "evil.com",
+            {"ts": 1000.0, "kind": "deny", "stage": "sni", "host": "evil.com",
              "port": None, "proto": None, "client": "172.30.0.2",
              "client_class": "sandbox", "method": None, "url": None,
              "reason": "possible domain-fronting"})
@@ -211,10 +211,10 @@ class RowMappingTests(IngestTestCase):
         """The audit table's vocabulary is allow|deny|hold. The proxy's `startup`
         line lives in the same file and is not a decision."""
         for verb in ("startup", "deny-sni", "", "DENY", "allowish"):
-            with self.subTest(decision=verb):
+            with self.subTest(kind=verb):
                 self.assertIsNone(cp.ingest._egress_row(_line(decision=verb).encode()))
         for verb in ("allow", "deny", "hold"):
-            with self.subTest(decision=verb):
+            with self.subTest(kind=verb):
                 self.assertIsNotNone(cp.ingest._egress_row(_line(decision=verb).encode()))
 
     def test_unusable_timestamps_are_dropped(self):
@@ -422,7 +422,7 @@ class DrainTests(IngestTestCase):
         """One unbounded record must not stop every later decision from arriving."""
         cp.ingest.DRAIN_BLOCK = 512
         try:
-            self.write(json.dumps({"ts": 1.0, "decision": "deny",
+            self.write(json.dumps({"ts": 1.0, "kind": "deny",
                                    "host": "x" * 4000, "central": False}) + "\n")
             self.write(_line(host="after.example"))
             for _ in range(20):
@@ -479,7 +479,7 @@ class ToolOutcomeRowTests(unittest.TestCase):
     def test_an_outcome_becomes_a_row(self):
         self.assertEqual(
             cp.ingest._tool_row(self.line()),
-            {"ts": 1000.0, "decision": "outcome", "stage": "tool-result",
+            {"ts": 1000.0, "kind": "outcome", "stage": "tool-result",
              "client": "172.30.0.2", "client_class": "sandbox", "reason": None,
              "server": "mcp-github", "tool": "get_me", "approval_id": None,
              "status": "ok"})
@@ -496,9 +496,9 @@ class ToolOutcomeRowTests(unittest.TestCase):
         # governance history rather than merely report a result. The word is ours; the
         # stream's own vocabulary lives in `status`.
         for forged in ("allow", "deny", "hold", "revoke", None, 12):
-            with self.subTest(decision=forged):
-                row = cp.ingest._tool_row(self.line(decision=forged))
-                self.assertEqual(row["decision"], "outcome")
+            with self.subTest(kind=forged):
+                row = cp.ingest._tool_row(self.line(kind=forged))
+                self.assertEqual(row["kind"], "outcome")
 
     def test_a_line_from_another_stage_is_dropped(self):
         # `stage` is the discriminator, written on every record by the gateway so this
@@ -590,7 +590,7 @@ class ToolOutcomeDrainTests(IngestTestCase):
     def rows(self):
         with cp.store._connect() as conn:
             return [dict(r) for r in conn.execute(
-                "SELECT decision, stage, server, tool, approval_id, status, reason "
+                "SELECT kind, stage, server, tool, approval_id, status, reason "
                 "FROM audit ORDER BY id")]
 
     def test_an_outcome_reaches_the_store(self):
@@ -598,7 +598,7 @@ class ToolOutcomeDrainTests(IngestTestCase):
                     "reason": "Resource not accessible by personal access token"})
         cp.ingest._drain(self.tool)
         self.assertEqual(self.rows(), [
-            {"decision": "outcome", "stage": "tool-result", "server": "mcp-github",
+            {"kind": "outcome", "stage": "tool-result", "server": "mcp-github",
              "tool": "get_me", "approval_id": "a" * 32, "status": "tool-error",
              "reason": "Resource not accessible by personal access token"}])
 

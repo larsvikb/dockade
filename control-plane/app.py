@@ -1395,7 +1395,7 @@ def _bad_filter(exc: audit.FilterError) -> JSONResponse:
 
 
 @app.get("/api/audit")
-def api_audit(limit: int = 50, q: str | None = None, decision: str | None = None,
+def api_audit(limit: int = 50, q: str | None = None, kind: str | None = None,
               since: float | None = None, until: float | None = None) -> dict:
     """Recent decisions, newest first, for the UI's decisions table.
 
@@ -1466,7 +1466,7 @@ def api_audit(limit: int = 50, q: str | None = None, decision: str | None = None
     work out from the response — it has the parameters it sent, but not whether this
     backend understood them as a filter."""
     try:
-        filt = audit.parse(q=q, decision=decision, since=since, until=until,
+        filt = audit.parse(q=q, kind=kind, since=since, until=until,
                            search=audit.GROUPED_SEARCH)
     except audit.FilterError as exc:
         return _bad_filter(exc)
@@ -1486,7 +1486,7 @@ def api_audit(limit: int = 50, q: str | None = None, decision: str | None = None
 
 @app.get("/api/audit/events")
 def api_audit_events(limit: int = audit.EVENTS_LIMIT_DEFAULT, q: str | None = None,
-                     decision: str | None = None, since: float | None = None,
+                     kind: str | None = None, since: float | None = None,
                      until: float | None = None, before: str | None = None) -> dict:
     """The record itself: one row per decision, newest first, paged backwards without
     bound. The forensic interface ``api_audit``'s docstring keeps deferring to.
@@ -1515,7 +1515,7 @@ def api_audit_events(limit: int = audit.EVENTS_LIMIT_DEFAULT, q: str | None = No
     cursor narrows the query but never the total, or paging back through history would
     look like the record shrinking."""
     try:
-        filt = audit.parse(q=q, decision=decision, since=since, until=until,
+        filt = audit.parse(q=q, kind=kind, since=since, until=until,
                            search=audit.EVENT_SEARCH)
         limit = audit.clamp(limit, audit.EVENTS_LIMIT_DEFAULT, audit.EVENTS_LIMIT_MAX)
         with store._connect() as conn:

@@ -47,7 +47,7 @@ LEGACY_CLIENT_CLASS = "sandbox"
 # The schema this code expects. Every entry in ``_STEPS`` below adds exactly one,
 # and a store records the version it is at (see ``_migrate``), so "what has already
 # run here" is a number to compare rather than a schema to interrogate.
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def _connect() -> sqlite3.Connection:
@@ -228,6 +228,25 @@ def _step_4_tool_status(conn: sqlite3.Connection) -> None:
               "predate the gateway's outcome stream)", flush=True)
 
 
+def _step_5_decision_to_kind(conn: sqlite3.Connection) -> None:
+    """v5 — ``audit.decision`` becomes ``audit.kind`` (the DDL carries the reasoning).
+
+    A RENAME, not a new column and a copy. `ALTER TABLE ... RENAME COLUMN` has been in
+    SQLite since 3.25 and keeps the data in place, so there is no window where the two
+    disagree and nothing to backfill — which matters more here than usual, since the
+    table being migrated is the audit trail itself and a copy that half-ran would leave
+    rows whose kind was invented by a migration rather than recorded by a writer.
+
+    Guarded on the column still being there so a store already migrated is left alone:
+    the version stamp should make that unreachable, but a rename that runs twice raises
+    rather than no-ops, and this table is the one worth being paranoid about."""
+    columns = _columns(conn, "audit")
+    if "decision" in columns and "kind" not in columns:
+        conn.execute("ALTER TABLE audit RENAME COLUMN decision TO kind")
+        print("control-plane: renamed audit.decision to audit.kind (four of its "
+              "values were never decisions)", flush=True)
+
+
 # Ordered, and the order is the only thing that decides what runs: a step is applied
 # when its version exceeds the store's, so steps must be APPEND-ONLY and never
 # renumbered, reordered or edited once shipped — a store in the field has already run
@@ -238,6 +257,7 @@ _STEPS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = (
     (2, "timed grants (leases)", _step_2_leases),
     (3, "tool correlation columns", _step_3_tool_correlation),
     (4, "tool outcome status", _step_4_tool_status),
+    (5, "audit.decision becomes audit.kind", _step_5_decision_to_kind),
 )
 
 
@@ -378,7 +398,16 @@ def _init_db() -> None:
             CREATE TABLE IF NOT EXISTS audit (
                 id       INTEGER PRIMARY KEY,
                 ts       REAL NOT NULL,
-                decision TEXT NOT NULL,       -- allow | deny | hold
+                -- WHAT KIND of thing this row records, not what was decided: four
+                -- of its eight values are not decisions anyone made (`observe` is a
+                -- server's claim about itself, `outcome` is how a call ended, and
+                -- create/edit/revoke are configuration changes). The vocabulary lives
+                -- in `audit.KINDS`.
+                --
+                -- NOT the same word as the `decision` in AuthorizeResponse and on the
+                -- tool bridge. That one really is a decision — the answer to a policy
+                -- question — and keeps its name.
+                kind     TEXT NOT NULL,
                 stage    TEXT,
                 host     TEXT,
                 port     INTEGER,
@@ -564,7 +593,7 @@ def _seed_if_empty() -> int:
         return len(patterns)
 
 
-def _audit(decision: str, **fields) -> None:
+def _audit(kind: str, **fields) -> None:
     # Agent-INFLUENCED fields (host/url/... arrive on /authorize from the proxy, which
     # relays whatever the sandbox asked for) are truncated on write — the same
     # trust-boundary cap the ingest path applies (DRAIN_MAX_FIELD). Without it a
@@ -575,10 +604,10 @@ def _audit(decision: str, **fields) -> None:
         return v[:DRAIN_MAX_FIELD] if isinstance(v, str) else v
     with _connect() as conn:
         conn.execute(
-            "INSERT INTO audit(ts, decision, stage, host, port, proto, client, "
+            "INSERT INTO audit(ts, kind, stage, host, port, proto, client, "
             "client_class, method, url, reason, server, tool, approval_id, "
             "status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (time.time(), decision, cap(fields.get("stage")), cap(fields.get("host")),
+            (time.time(), kind, cap(fields.get("stage")), cap(fields.get("host")),
              fields.get("port"), cap(fields.get("proto")), cap(fields.get("client")),
              cap(fields.get("client_class")),
              cap(fields.get("method")), cap(fields.get("url")), cap(fields.get("reason")),
@@ -600,5 +629,5 @@ def _audit(decision: str, **fields) -> None:
          "server", "tool", "approval_id")
         if fields.get(k) is not None)
     reason = fields.get("reason")
-    print(f"AUDIT {decision} {shown}" + (f" :: {reason}" if reason else ""),
+    print(f"AUDIT {kind} {shown}" + (f" :: {reason}" if reason else ""),
           flush=True)

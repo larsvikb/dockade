@@ -360,6 +360,12 @@ function requestsLabel(n) {
 // plaintext HTTP decision reaching the proxy at all is unusual.
 const AUDIT_ORDINARY_STAGE = "connect";
 
+// The port a CONNECT tunnel goes to unless something is unusual. Named so the record
+// view can stay quiet about it: `:443` beside a host is the scheme restated, while
+// `:8443` is a thing worth noticing. The proxy's own port gate is what ENFORCES which
+// ports are reachable; this only decides what is worth printing.
+const ORDINARY_PORT = 443;
+
 // What may be rendered AS a stage prefix. The proxy sends one of two literals
 // (`connect`, `http`) and the field is unvalidated free text all the way to the
 // column, so this bounds the shape rather than the vocabulary — a stage a future
@@ -376,12 +382,48 @@ const AUDIT_ORDINARY_STAGE = "connect";
 // case does nothing to make a value blend into the host beside it.
 const AUDIT_STAGE_SHAPE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,11}$/;
 
-// An outcome row's own shape. `decision` says only that this is a result; the STATUS
+// An outcome row's own shape. `kind` says only that this is a result; the STATUS
 // is the information — `ok` against `tool-error` is the difference between "a human
 // approved a PR being opened" and "a PR was opened". Same bound and charset as the
 // stage shape above, widened because `transport-error` is fifteen characters.
 const AUDIT_OUTCOME = "outcome";
 const AUDIT_STATUS_SHAPE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,19}$/;
+
+// WHAT THE ROW IS ABOUT, for the `target` column.
+//
+// Every kind of row has one, and before this several did not use it: an egress row
+// names a host, a policy row names the pattern it wrote, and every tool-shaped row —
+// the call, the ask, the resumption, the outcome, the rule that governs it — names the
+// tool. Those last ones left the cell EMPTY while still rendering their stage prefix,
+// so the column read `tool-call · ` with nothing after the separator. The fix is not to
+// drop the separator but to fill the cell: the columns to fill it from have existed
+// since the audit trail became joinable.
+//
+// `host` wins where both are present, because a row that has one is an egress decision
+// and the host IS its identity. Nothing sets both today.
+function auditTarget(r) {
+  return (r && r.host) || toolSubject(r) || "";
+}
+
+// The qualifier in front of the target — `http · example.com`, `tool-call ·
+// mcp-github__get_me`. The prefix says HOW, the cell says WHAT.
+//
+// An OUTCOME row qualifies itself by STATUS instead of by stage: `tool-result` is
+// implied by the `outcome` already in the tag, while `ok` against `tool-error` is the
+// whole point of the row.
+//
+// Suppressed entirely when there is no target, because a separator with nothing on its
+// right is not a separator — the same rule the grouped view's `first seen` follows.
+// Belt-and-braces now that `auditTarget` fills the cell for every kind: a row carrying
+// neither a host nor a tool would otherwise reintroduce the dangling prefix.
+function auditPrefix(r, stage) {
+  if (!auditTarget(r)) return "";
+  if (r && r.kind === AUDIT_OUTCOME) {
+    return r.status && AUDIT_STATUS_SHAPE.test(r.status) ? `${r.status} · ` : "";
+  }
+  return stage && stage !== AUDIT_ORDINARY_STAGE && AUDIT_STAGE_SHAPE.test(stage)
+         ? `${stage} · ` : "";
+}
 
 // What an outcome row is ABOUT, in the column where an egress row names its host. The
 // flattened `server__tool` is deliberate: it is the name the agent was served and the
@@ -401,12 +443,12 @@ function auditRow(r) {
   const stage = (r && r.stage) || "";
   return {
     ts: tsSeconds(r && r.ts),
-    decision: (r && r.decision) || "?",
-    // Prefixes the HOST, not the decision — `http · example.com`, which reads as the
+    kind: (r && r.kind) || "?",
+    // Prefixes the TARGET, not the kind — `http · example.com`, which reads as the
     // scheme it effectively is. The stage does not qualify the decision at all (a deny
     // at the http stage is the same deny as at connect); it describes how the request
     // was MADE, and the host cell is where the request is identified. It also keeps
-    // the decision column uniform, which matters because that is the column an
+    // the kind column uniform, which matters because that is the column an
     // operator scans vertically.
     //
     // Carries its own SEPARATOR rather than relying on a CSS margin. The margin spaced
@@ -420,16 +462,11 @@ function auditRow(r) {
     // An OUTCOME row qualifies itself by status rather than by stage, and the swap
     // follows the same rule: the prefix says how, the cell says what. `tool-result`
     // is what the stage would contribute and it is pure redundancy — it is implied by
-    // the decision word already in the tag — while the status is the whole point of
+    // the kind word already in the tag — while the status is the whole point of
     // the row. Left unprefixed, these rows also rendered a dangling `tool-result · `
     // against an empty host cell, since a tool call has no host.
-    stagePrefix: r && r.decision === AUDIT_OUTCOME
-                 ? (r.status && AUDIT_STATUS_SHAPE.test(r.status)
-                    ? `${r.status} · ` : "")
-                 : (stage && stage !== AUDIT_ORDINARY_STAGE
-                    && AUDIT_STAGE_SHAPE.test(stage) ? `${stage} · ` : ""),
-    host: r && r.decision === AUDIT_OUTCOME
-          ? toolSubject(r) : ((r && r.host) || ""),
+    stagePrefix: auditPrefix(r, stage),
+    target: auditTarget(r),
     // An em dash rather than an empty cell: blank reads as "this column is broken",
     // whereas the honest statement is that no client was recorded for this row.
     client: (r && r.client) || "—",
@@ -1080,7 +1117,7 @@ function timeWindow(preset, nowMs) {
 // query; whether one was actually applied is the backend's to report (see
 // coverageSummary).
 function filterActive(f) {
-  return !!(f && (((f.q || "").trim()) || f.decision || AUDIT_WINDOWS[f.preset]));
+  return !!(f && (((f.q || "").trim()) || f.kind || AUDIT_WINDOWS[f.preset]));
 }
 
 // The query string both views are fetched with. Pure, so the one place that decides
@@ -1097,7 +1134,7 @@ function auditQuery(f, opts) {
   if (Number.isFinite(limit) && limit > 0) parts.push(`limit=${Math.floor(limit)}`);
   const q = ((f && f.q) || "").trim();
   if (q) parts.push(`q=${encodeURIComponent(q)}`);
-  if (f && f.decision) parts.push(`decision=${encodeURIComponent(f.decision)}`);
+  if (f && f.kind) parts.push(`kind=${encodeURIComponent(f.kind)}`);
   const since = timeWindow(f && f.preset, o.nowMs);
   if (since !== null) parts.push(`since=${since}`);
   if (o.before) parts.push(`before=${encodeURIComponent(o.before)}`);
@@ -1118,25 +1155,35 @@ function eventRow(r) {
   return {
     ...auditRow(r),
     id: r && r.id !== undefined && r.id !== null ? String(r.id) : "",
-    // WHAT was asked for, in one cell, because the two shapes are alternatives rather
-    // than columns: a plaintext request has a method and a URL, a CONNECT tunnel has
-    // neither and is identified by its port. Rendering both as columns would give
-    // every row two empty cells, which is how a table stops being scannable.
+    // WHAT was asked for, and EMPTY WHENEVER THAT IS THE ORDINARY THING.
     //
-    // The URL is the reason this view exists — it is the field that says WHICH request
-    // — and it is also the only agent-controlled unbounded string on the page. Capped
-    // on write (store.DRAIN_MAX_FIELD) and escaped by the renderer; the CSP is what
-    // makes an escaping mistake inert rather than fatal.
-    // For an OUTCOME row the equivalent of "which request was it" is WHICH APPROVAL —
-    // the id that ties this row to the hold, the human's answer and the claim the
-    // control plane already recorded. Its absence is information too: a call policy
-    // allowed outright never had one, which is what `—` says here rather than leaving
-    // a blank that reads as a missing value.
-    request: r && r.decision === AUDIT_OUTCOME
+    // This cell used to render `:443 connect` for almost every row, because almost
+    // every governed request is a CONNECT tunnel (see AUDIT_ORDINARY_STAGE) — a port
+    // implied by the scheme, beside a host already in `target`. A column that repeats
+    // itself down the page is noise, and noise in the view that exists for reading
+    // carefully is worse than noise in the glance.
+    //
+    // So it follows the rule the stage prefix already follows: suppress the value that
+    // is true of nearly every row, and a non-empty cell then MEANS something. What
+    // survives is the minority worth stopping on —
+    //
+    //   a plaintext URL   which only exists because the proxy does not decrypt TLS, so
+    //                     its presence is itself the finding: an unencrypted request.
+    //                     It is the field that says WHICH request, and the only
+    //                     agent-controlled unbounded string on the page — capped on
+    //                     write (store.DRAIN_MAX_FIELD), escaped by the renderer, with
+    //                     the CSP making an escaping mistake inert rather than fatal.
+    //   an approval id    the outcome row's answer to "which one was it": the key
+    //                     tying it to the hold, the human's answer and the claim.
+    //   a non-standard port   a tunnel to :8443 is worth seeing where :443 is not.
+    //
+    // An outcome with no approval renders `—` rather than blank, because there the
+    // absence is the information: policy allowed that call outright.
+    request: r && r.kind === AUDIT_OUTCOME
              ? (r.approval_id || "—")
              : [method, url].filter(Boolean).join(" ")
-               || [Number.isFinite(port) && port > 0 ? `:${port}` : "", proto]
-                  .filter(Boolean).join(" "),
+               || (Number.isFinite(port) && port > 0 && port !== ORDINARY_PORT
+                   ? `:${port}` : ""),
   };
 }
 
@@ -2473,7 +2520,7 @@ function start() {
   const AUDIT_FILTER_DEBOUNCE_MS = 250;
 
   const auditQEl = document.getElementById("audit-q");
-  const auditDecisionEl = document.getElementById("audit-decision");
+  const auditKindEl = document.getElementById("audit-kind");
   const auditWindowEl = document.getElementById("audit-window");
   const auditEveryEl = document.getElementById("audit-every");
   const auditClearEl = document.getElementById("audit-clear");
@@ -2493,7 +2540,7 @@ function start() {
   let auditCursors = [];
   let auditPage = 0;
 
-  const readFilter = () => ({ q: auditQEl.value, decision: auditDecisionEl.value,
+  const readFilter = () => ({ q: auditQEl.value, kind: auditKindEl.value,
                               preset: auditWindowEl.value });
   const everyEvent = () => auditEveryEl.checked;
   const auditRowCount = () =>
@@ -2514,9 +2561,9 @@ function start() {
       return `
         <tr${a.failClosed ? ' class="outage"' : ""}>
           <td class="ts" title="${esc(fmtInstant(a.ts))}">${esc(fmtStamp(a.ts))}</td>
-          <td><span class="tag ${esc(a.decision)}">${esc(a.decision)}</span></td>
+          <td><span class="tag ${esc(a.kind)}">${esc(a.kind)}</span></td>
           <td>${a.stagePrefix ? `<span class="qual">${esc(a.stagePrefix)}</span>` : ""
-            }${esc(a.host)}${a.repeat
+            }${esc(a.target)}${a.repeat
               ? `<span class="rep">${esc(" " + a.repeat)}</span>` : ""}</td>
           <td class="ts">${a.clientClassPrefix
             ? `<span class="qual">${esc(a.clientClassPrefix)}</span>` : ""
@@ -2536,9 +2583,9 @@ function start() {
       return `
         <tr${a.failClosed ? ' class="outage"' : ""}>
           <td class="ts" title="${esc(fmtInstant(a.ts))}">${esc(fmtStamp(a.ts))}</td>
-          <td><span class="tag ${esc(a.decision)}">${esc(a.decision)}</span></td>
+          <td><span class="tag ${esc(a.kind)}">${esc(a.kind)}</span></td>
           <td>${a.stagePrefix ? `<span class="qual">${esc(a.stagePrefix)}</span>` : ""
-            }${esc(a.host)}</td>
+            }${esc(a.target)}</td>
           <td class="ts">${a.clientClassPrefix
             ? `<span class="qual">${esc(a.clientClassPrefix)}</span>` : ""
             }${esc(a.client)}</td>
@@ -2653,12 +2700,12 @@ function start() {
   }
 
   auditQEl.addEventListener("input", () => filtersChanged(false));
-  for (const el of [auditDecisionEl, auditWindowEl, auditEveryEl]) {
+  for (const el of [auditKindEl, auditWindowEl, auditEveryEl]) {
     el.addEventListener("change", () => filtersChanged(true));
   }
   auditClearEl.addEventListener("click", () => {
     auditQEl.value = "";
-    auditDecisionEl.value = "";
+    auditKindEl.value = "";
     auditWindowEl.value = "";
     // The view switch is deliberately NOT cleared: it selects which record the
     // filters apply to, so resetting it would answer a question nobody asked.

@@ -1152,9 +1152,9 @@ class AuditViewTests(_CPTestCase):
             conn.execute("DELETE FROM audit")
             for r in rows:
                 conn.execute(
-                    "INSERT INTO audit(ts, decision, stage, host, port, proto, "
+                    "INSERT INTO audit(ts, kind, stage, host, port, proto, "
                     "client, method, url, reason) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    (r.get("ts", 0.0), r.get("decision", "allow"), r.get("stage"),
+                    (r.get("ts", 0.0), r.get("kind", "allow"), r.get("stage"),
                      r.get("host"), r.get("port"), r.get("proto"), r.get("client"),
                      r.get("method"), r.get("url"), r.get("reason")))
             conn.commit()
@@ -1165,9 +1165,9 @@ class AuditViewTests(_CPTestCase):
         # absent with everything being refused. An evening was spent on that
         # ambiguity, hence the flag.
         self._rows(
-            {"host": "a.example", "decision": "deny",
+            {"host": "a.example", "kind": "deny",
              "reason": "blocked by rule (a.example)"},
-            {"host": "b.example", "decision": "deny", "ts": 1.0,
+            {"host": "b.example", "kind": "deny", "ts": 1.0,
              "reason": "control-plane unreachable, fail-closed (timed out)"})
         got = {r["host"]: r["fail_closed"] for r in _served()}
         self.assertEqual(got, {"a.example": False, "b.example": True})
@@ -1192,7 +1192,7 @@ class AuditViewTests(_CPTestCase):
     def test_an_unrecognised_reason_is_not_marked_as_an_outage(self):
         # The classification must not fire on a word that appears in ordinary reasons
         # too — a host can legitimately be named after the control plane.
-        self._rows({"host": "c.example", "decision": "deny",
+        self._rows({"host": "c.example", "kind": "deny",
                     "reason": "blocked by rule (control-plane-mirror.example)"})
         self.assertFalse(_served()[0]["fail_closed"])
 
@@ -1205,7 +1205,7 @@ class AuditViewTests(_CPTestCase):
         #
         # Without this the guard is decorative: `startswith` loosened to `in` passed
         # every other test in this class.
-        self._rows({"host": "d.example", "decision": "deny",
+        self._rows({"host": "d.example", "kind": "deny",
                     "reason": "blocked by rule, recorded while "
                               "control-plane unreachable"})
         self.assertFalse(_served()[0]["fail_closed"])
@@ -1214,7 +1214,7 @@ class AuditViewTests(_CPTestCase):
         # The gap this closes. One control plane serves every sandbox, so a row that
         # records "egress to pypi.org was allowed" without saying which agent asked
         # is not answering the question an audit trail exists for.
-        self._rows({"host": "pypi.org", "client": "172.30.0.7", "decision": "allow"})
+        self._rows({"host": "pypi.org", "client": "172.30.0.7", "kind": "allow"})
         self.assertEqual(_served()[0]["client"], "172.30.0.7")
 
     def test_the_served_columns_are_pinned(self):
@@ -1228,7 +1228,7 @@ class AuditViewTests(_CPTestCase):
         self._rows({"host": "a.example"})
         self.assertEqual(
             set(_served()[0]),
-            {"ts", "decision", "stage", "host", "client", "client_class", "reason",
+            {"ts", "kind", "stage", "host", "client", "client_class", "reason",
              "n", "first_ts", "fail_closed",
              # The tool columns. They are in the GLANCE — unlike url/method/port —
              # because an outcome row identifies itself with them: an egress row names
@@ -1276,7 +1276,7 @@ class AuditViewTests(_CPTestCase):
         The total is RAW decisions, so it can be compared against the sum of the
         counts on screen — a total of groups would be a second number that agrees
         with the first and tells the reader nothing."""
-        self._rows(*[{"host": "chatty.example", "decision": "deny",
+        self._rows(*[{"host": "chatty.example", "kind": "deny",
                       "ts": 1000.0 + i} for i in range(30)])
         served = cp.api_audit()
         self.assertEqual(len(served["rows"]), 1)     # one group
@@ -1296,7 +1296,7 @@ class AuditViewTests(_CPTestCase):
         refuses, once a minute, forever. Ungrouped it writes 1440 rows a day and the
         forty-row list covers under an hour — so a fronting refusal from this morning
         is already off the bottom."""
-        self._rows(*[{"host": "chatty.example", "decision": "deny", "stage": "connect",
+        self._rows(*[{"host": "chatty.example", "kind": "deny", "stage": "connect",
                       "client": "172.30.0.2", "reason": "blocked by rule",
                       "ts": 1000.0 + 60 * i} for i in range(30)])
         served = _served()
@@ -1313,8 +1313,8 @@ class AuditViewTests(_CPTestCase):
         would have folded almost nothing on the very log that motivated it."""
         rows = []
         for i in range(10):
-            rows.append({"host": "chatty.example", "decision": "deny", "ts": 100.0 + 2 * i})
-            rows.append({"host": "api.example", "decision": "allow", "ts": 101.0 + 2 * i})
+            rows.append({"host": "chatty.example", "kind": "deny", "ts": 100.0 + 2 * i})
+            rows.append({"host": "api.example", "kind": "allow", "ts": 101.0 + 2 * i})
         self._rows(*rows)
         served = _served()
         self.assertEqual({r["host"]: r["n"] for r in served},
@@ -1330,9 +1330,9 @@ class AuditViewTests(_CPTestCase):
         """Rows that differ ONLY in a served field must stay apart, and rows that
         differ only in an unserved one must merge — otherwise the list shows entries
         a reader cannot tell apart, which is the failure being fixed."""
-        base = {"host": "a.example", "decision": "deny", "stage": "connect",
+        base = {"host": "a.example", "kind": "deny", "stage": "connect",
                 "client": "172.30.0.2", "reason": "blocked by rule"}
-        for field, other in (("decision", "allow"), ("stage", "sni"),
+        for field, other in (("kind", "allow"), ("stage", "sni"),
                              ("host", "b.example"), ("client", "172.30.0.9"),
                              ("reason", "no matching rule")):
             with self.subTest(field=field):
@@ -1412,9 +1412,9 @@ def _write_audit(*rows):
         conn.execute("DELETE FROM audit")
         for r in rows:
             conn.execute(
-                "INSERT INTO audit(ts, decision, stage, host, port, proto, client, "
+                "INSERT INTO audit(ts, kind, stage, host, port, proto, client, "
                 "client_class, method, url, reason) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (r.get("ts", 0.0), r.get("decision", "allow"), r.get("stage"),
+                (r.get("ts", 0.0), r.get("kind", "allow"), r.get("stage"),
                  r.get("host"), r.get("port"), r.get("proto"), r.get("client"),
                  r.get("client_class"), r.get("method"), r.get("url"), r.get("reason")))
         conn.commit()
@@ -1437,12 +1437,12 @@ class AuditFilterTests(_CPTestCase):
     def setUp(self):
         super().setUp()
         _write_audit(
-            {"host": "pypi.org", "decision": "allow", "client": "172.30.0.2",
+            {"host": "pypi.org", "kind": "allow", "client": "172.30.0.2",
              "client_class": "sandbox", "reason": "allowed by rule (pypi.org)",
              "url": "https://pypi.org/simple/", "method": "GET", "ts": 100.0},
-            {"host": "evil.example", "decision": "deny", "client": "172.30.0.2",
+            {"host": "evil.example", "kind": "deny", "client": "172.30.0.2",
              "client_class": "sandbox", "reason": "blocked by rule", "ts": 200.0},
-            {"host": "slack.com", "decision": "hold", "client": "172.28.0.5",
+            {"host": "slack.com", "kind": "hold", "client": "172.28.0.5",
              "client_class": "mcp", "reason": "held for approval", "ts": 300.0})
 
     def test_search_matches_the_host(self):
@@ -1487,16 +1487,16 @@ class AuditFilterTests(_CPTestCase):
         self.assertEqual(self._hosts(q="lonely"), ["lonely.example"])
 
     def test_the_decision_facet_narrows_to_one_kind(self):
-        self.assertEqual(self._hosts(decision="deny"), ["evil.example"])
+        self.assertEqual(self._hosts(kind="deny"), ["evil.example"])
 
     def test_the_decision_facet_takes_a_set(self):
         # "everything that was refused or is waiting" is one question, and a
         # single-valued facet would make the UI merge two responses to answer it.
-        self.assertEqual(self._hosts(decision="deny,hold"),
+        self.assertEqual(self._hosts(kind="deny,hold"),
                          ["slack.com", "evil.example"])
 
     def test_an_unknown_decision_is_refused_rather_than_matching_nothing(self):
-        resp = cp.api_audit(decision="allowed")
+        resp = cp.api_audit(kind="allowed")
         self.assertEqual(resp.status_code, 400)
         # And it says what the words are, so the refusal has a next step.
         self.assertIn("allow", json.dumps(resp.body))
@@ -1509,14 +1509,14 @@ class AuditFilterTests(_CPTestCase):
         written = set(re.findall(r'store\._audit\(\s*"([a-z]+)"',
                                  (ROOT / "control-plane" / "app.py").read_text()))
         self.assertTrue(written, "no literal audit decisions found in app.py")
-        self.assertLessEqual(written, set(cp.audit.DECISIONS))
+        self.assertLessEqual(written, set(cp.audit.KINDS))
         # The ingest is the other writer, and it validates against its own tuple —
         # so that tuple is the second half of the vocabulary.
         ingested = re.search(r'rec\.get\("decision"\) not in \(([^)]*)\)',
                              (ROOT / "control-plane" / "ingest.py").read_text())
         self.assertIsNotNone(ingested, "the ingest's decision guard moved")
         self.assertLessEqual(set(re.findall(r'"([a-z]+)"', ingested.group(1))),
-                             set(cp.audit.DECISIONS))
+                             set(cp.audit.KINDS))
 
     def test_no_caller_facing_error_interpolates_an_underlying_exception(self):
         """Two exception types are served VERBATIM to a caller — ``audit.FilterError``
@@ -1567,12 +1567,12 @@ class AuditFilterTests(_CPTestCase):
         # a 400 on click, and a word missing from the page is a filter no operator can
         # reach. Same shape as the fail-closed marker test above — read the file that
         # ships, do not restate its contents.
-        section = re.search(r'<select id="audit-decision".*?</select>',
+        section = re.search(r'<select id="audit-kind".*?</select>',
                             (ROOT / "control-plane-ui" / "index.html").read_text(),
                             re.S)
-        self.assertIsNotNone(section, "the decision facet moved in index.html")
+        self.assertIsNotNone(section, "the kind facet moved in index.html")
         offered = [v for v in re.findall(r'value="([^"]*)"', section.group(0)) if v]
-        self.assertEqual(sorted(offered), sorted(cp.audit.DECISIONS))
+        self.assertEqual(sorted(offered), sorted(cp.audit.KINDS))
 
     def test_the_time_window_is_half_open(self):
         # `since` inclusive, `until` exclusive, which is what makes two adjacent
@@ -1595,7 +1595,7 @@ class AuditFilterTests(_CPTestCase):
         # table, a complete filtered view would report itself as truncated — on every
         # filtered query.
         self.assertEqual(cp.api_audit()["total"], 3)
-        self.assertEqual(cp.api_audit(decision="deny")["total"], 1)
+        self.assertEqual(cp.api_audit(kind="deny")["total"], 1)
 
     def test_the_response_says_whether_it_filtered(self):
         # The one thing the browser cannot work out for itself: it knows what it sent,
@@ -1618,8 +1618,8 @@ class AuditFilterTests(_CPTestCase):
         suppressions — ruff will not warn again on those lines, so what stops an
         injected string reaching the text has to be something that fails loudly."""
         hostile = "x' OR 1=1 --"
-        loud = cp.audit.parse(q=hostile, decision="deny,hold", since=1, until=2)
-        plain = cp.audit.parse(q="ordinary", decision="deny,hold", since=3, until=4)
+        loud = cp.audit.parse(q=hostile, kind="deny,hold", since=1, until=2)
+        plain = cp.audit.parse(q="ordinary", kind="deny,hold", since=3, until=4)
         self.assertEqual(loud.where, plain.where,
                          "the WHERE text changed with the VALUES — something is being "
                          "interpolated that must be bound")
@@ -1661,7 +1661,7 @@ class AuditFilterTests(_CPTestCase):
         grouping, one level up."""
         cp.AUDIT_GROUP_SCAN = 10
         try:
-            _write_audit(*([{"host": "quiet.example", "decision": "deny", "ts": 1.0}]
+            _write_audit(*([{"host": "quiet.example", "kind": "deny", "ts": 1.0}]
                            + [{"host": "chatty.example", "ts": 10.0 + i}
                               for i in range(50)]))
             # Unfiltered, the window is all chatter.
@@ -1692,7 +1692,7 @@ class AuditRecordTests(_CPTestCase):
         row = self._rows()[0]
         self.assertEqual(
             set(row),
-            {"id", "ts", "decision", "stage", "host", "port", "proto", "client",
+            {"id", "ts", "kind", "stage", "host", "port", "proto", "client",
              "client_class", "method", "url", "reason", "fail_closed",
              # The tool columns. Egress rows carry NULL in all three — the identity of
              # an egress decision is host/port/url — and they are here because this is
@@ -1706,7 +1706,7 @@ class AuditRecordTests(_CPTestCase):
     def test_nothing_is_folded(self):
         # The whole difference from the glance: identical decisions are separate
         # facts here, because this is the record and folding is a property of a view.
-        _write_audit(*[{"host": "chatty.example", "decision": "deny", "ts": 1.0 + i}
+        _write_audit(*[{"host": "chatty.example", "kind": "deny", "ts": 1.0 + i}
                        for i in range(5)])
         self.assertEqual(len(self._rows()), 5)
         self.assertNotIn("n", self._rows()[0])
@@ -1724,7 +1724,7 @@ class AuditRecordTests(_CPTestCase):
     def test_a_denial_still_says_whether_it_was_policy_or_an_outage(self):
         # Same classification as the glance, from the same helper — an outage denial
         # must not read as policy in the view an incident is reconstructed from.
-        _write_audit({"host": "b.example", "decision": "deny", "ts": 1.0,
+        _write_audit({"host": "b.example", "kind": "deny", "ts": 1.0,
                       "reason": "control-plane unreachable, fail-closed (timed out)"})
         self.assertTrue(self._rows()[0]["fail_closed"])
 
@@ -1766,12 +1766,12 @@ class AuditRecordTests(_CPTestCase):
 
     def test_the_filter_survives_paging_and_bounds_the_total(self):
         _write_audit(*[{"host": f"h{i}.example", "ts": float(i),
-                        "decision": "deny" if i % 2 else "allow"} for i in range(10)])
-        first = cp.api_audit_events(limit=2, decision="deny")
-        second = cp.api_audit_events(limit=2, decision="deny", before=first["next"])
+                        "kind": "deny" if i % 2 else "allow"} for i in range(10)])
+        first = cp.api_audit_events(limit=2, kind="deny")
+        second = cp.api_audit_events(limit=2, kind="deny", before=first["next"])
         self.assertEqual(first["total"], 5)
         self.assertEqual(second["total"], 5)
-        self.assertTrue(all(r["decision"] == "deny"
+        self.assertTrue(all(r["kind"] == "deny"
                             for r in first["rows"] + second["rows"]))
 
     def test_a_malformed_cursor_is_refused_not_treated_as_the_first_page(self):
@@ -3471,7 +3471,7 @@ class ToolAuthorizeDecisionTests(_ToolBridgeTestCase):
         # The same coupling ``test_every_word_the_control_plane_writes_is_filterable``
         # asserts for the file as a whole, narrowed to the words added here — a new
         # decision word would be recorded, rendered, and quietly unfilterable.
-        self.assertLessEqual({"allow", "deny", "hold"}, set(cp.audit.DECISIONS))
+        self.assertLessEqual({"allow", "deny", "hold"}, set(cp.audit.KINDS))
 
 
 class ToolRosterTests(_ToolBridgeTestCase):
@@ -3745,7 +3745,7 @@ class ToolCorrelationColumnTests(_ToolBridgeTestCase):
     def _rows_for(self, approval_id):
         with cp.store._connect() as conn:
             return [dict(r) for r in conn.execute(
-                "SELECT decision, stage, server, tool, approval_id FROM audit "
+                "SELECT kind, stage, server, tool, approval_id FROM audit "
                 "WHERE approval_id=? ORDER BY id", (approval_id,))]
 
     def test_one_ask_is_three_rows_reachable_by_its_id_alone(self):
@@ -3775,9 +3775,9 @@ class ToolCorrelationColumnTests(_ToolBridgeTestCase):
         _tool_call(tool="get_me")
         _tool_call(tool="merge_pull_request")            # unconfigured, so denied
         with cp.store._connect() as conn:
-            rows = {r["tool"]: (r["decision"], r["server"], r["approval_id"])
+            rows = {r["tool"]: (r["kind"], r["server"], r["approval_id"])
                     for r in conn.execute(
-                        "SELECT decision, server, tool, approval_id FROM audit "
+                        "SELECT kind, server, tool, approval_id FROM audit "
                         "WHERE stage='tool-call'")}
         self.assertEqual(rows, {"get_me": ("allow", "mcp-github", None),
                                 "merge_pull_request": ("deny", "mcp-github", None)})
@@ -3820,11 +3820,11 @@ class ToolCorrelationColumnTests(_ToolBridgeTestCase):
         cp.revoke_mcp_rule(rule_id, _FakeRequest())
         with cp.store._connect() as conn:
             rows = [dict(r) for r in conn.execute(
-                "SELECT decision, server, tool FROM audit WHERE stage='tool-policy' "
+                "SELECT kind, server, tool FROM audit WHERE stage='tool-policy' "
                 "ORDER BY id")]
-        self.assertEqual(rows, [{"decision": "create", "server": "mcp-github",
+        self.assertEqual(rows, [{"kind": "create", "server": "mcp-github",
                                  "tool": "get_me"},
-                                {"decision": "revoke", "server": "mcp-github",
+                                {"kind": "revoke", "server": "mcp-github",
                                  "tool": "get_me"}])
 
     def test_an_egress_decision_leaves_the_tool_columns_empty(self):
@@ -3887,8 +3887,8 @@ class TwoServersOneToolNameTests(_ToolBridgeTestCase):
         _tool_call(server="mcp-github", tool="issue_read")
         _tool_call(server="mcp-other", tool="issue_read")
         with cp.store._connect() as conn:
-            rows = {r["server"]: r["decision"] for r in conn.execute(
-                "SELECT server, decision FROM audit WHERE tool='issue_read'")}
+            rows = {r["server"]: r["kind"] for r in conn.execute(
+                "SELECT server, kind FROM audit WHERE tool='issue_read'")}
         self.assertEqual(rows, {"mcp-github": "allow", "mcp-other": "deny"})
 
 
@@ -3937,7 +3937,7 @@ class OutcomeFoldingTests(_CPTestCase):
             conn.execute("DELETE FROM audit")
             for i, r in enumerate(rows):
                 conn.execute(
-                    "INSERT INTO audit(ts, decision, stage, client, server, tool, "
+                    "INSERT INTO audit(ts, kind, stage, client, server, tool, "
                     "status, approval_id) VALUES (?,'outcome','tool-result',?,?,?,?,?)",
                     (float(i), "172.30.0.2", r.get("server", "mcp-github"),
                      r.get("tool", "get_me"), r.get("status", "ok"),
@@ -4260,7 +4260,7 @@ class MigrationTests(_FreshStoreTestCase):
             self.assertIsNone(
                 conn.execute("SELECT client_class FROM audit").fetchone()[0])
             # And the column is writable on new rows, which is the point of adding it.
-            conn.execute("INSERT INTO audit(ts, decision, host, client_class) "
+            conn.execute("INSERT INTO audit(ts, kind, host, client_class) "
                          "VALUES (2.0, 'allow', 'new.example', 'mcp')")
             conn.commit()
 
@@ -4581,6 +4581,47 @@ class SchemaVersionTests(_FreshStoreTestCase):
         # them — a store already stamped v3 would then never gain the column.
         self.assertEqual([label for v, label, _ in cp.store._STEPS if v == 4],
                          ["tool outcome status"])
+
+    def test_an_old_store_renames_the_decision_column(self):
+        # Step 5 on the stores already in the field. `_audit`'s INSERT names `kind`, so
+        # without it EVERY audit write fails — egress included — on exactly the
+        # deployments with the most history to lose.
+        self._old_store("version-kind.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(audit)")}
+        self.assertIn("kind", cols)
+        self.assertNotIn("decision", cols)
+
+    def test_the_rename_carries_the_rows_rather_than_reinventing_them(self):
+        # THE ONE THAT MATTERS on this table. A RENAME keeps the data in place, where a
+        # new-column-and-copy has a window in which the two disagree and a half-run
+        # migration leaves rows whose kind was invented by a migration rather than
+        # recorded by a writer. On the audit trail that is the worst available failure.
+        self._old_store("version-kind-rows.db")
+        with cp.store._connect() as conn:
+            conn.execute("INSERT INTO audit(ts, decision, host, reason) "
+                         "VALUES (1.0, 'hold', 'evil.example', 'held for a human')")
+            conn.commit()
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            row = conn.execute("SELECT kind, host, reason FROM audit "
+                               "WHERE host='evil.example'").fetchone()
+        self.assertEqual((row["kind"], row["reason"]), ("hold", "held for a human"))
+
+    def test_a_store_already_renamed_is_left_alone(self):
+        # `ALTER TABLE ... RENAME COLUMN` raises rather than no-ops if it runs twice.
+        # The version stamp should make that unreachable; the guard is there because
+        # this is the table where being wrong is least recoverable.
+        self._old_store("version-kind-twice.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            conn.execute("PRAGMA user_version = 4")     # pretend v5 never ran
+            conn.commit()
+        cp.store._init_db()                             # must not raise
+        with cp.store._connect() as conn:
+            self.assertIn("kind", {r["name"] for r in
+                                   conn.execute("PRAGMA table_info(audit)")})
 
     def test_the_steps_are_contiguous_and_end_at_the_declared_version(self):
         # ``SCHEMA_VERSION`` and ``_STEPS`` are two halves of one fact, and only this

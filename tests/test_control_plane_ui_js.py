@@ -382,54 +382,75 @@ console.log(JSON.stringify({
       },
       audit: {
         ordinary_stage: m.AUDIT_ORDINARY_STAGE,
-        tunnelled: m.auditRow({ ts: 1e9, decision: "allow", stage: "connect",
+        tunnelled: m.auditRow({ ts: 1e9, kind: "allow", stage: "connect",
                                 host: "pypi.org", client: "172.30.0.7",
                                 reason: "allowed by rule (pypi.org)" }),
-        plaintext: m.auditRow({ ts: 1e9, decision: "deny", stage: "http",
+        plaintext: m.auditRow({ ts: 1e9, kind: "deny", stage: "http",
                                 host: "a.example", client: "172.30.0.2",
                                 reason: "no matching rule" }),
-        no_stage: m.auditRow({ ts: 1e9, decision: "hold", host: "a.example" }),
+        no_stage: m.auditRow({ ts: 1e9, kind: "hold", host: "a.example" }),
+        // The TOOL-SHAPED rows, which had a stage and no target and so rendered a
+        // separator with nothing after it. They carry `server`/`tool` columns and
+        // simply were not using them.
+        tool_held: m.auditRow({ ts: 1e9, kind: "hold", stage: "tool-call",
+                                server: "mcp-github", tool: "create_pull_request",
+                                client: "172.30.0.2" }),
+        tool_answered: m.auditRow({ ts: 1e9, kind: "allow", stage: "tool-ask",
+                                    server: "mcp-github", tool: "create_pull_request" }),
+        tool_released: m.auditRow({ ts: 1e9, kind: "allow", stage: "tool-resume",
+                                    server: "mcp-github", tool: "create_pull_request" }),
+        // A server's surface moving names the SERVER; there is no one tool it is about.
+        surface_moved: m.auditRow({ ts: 1e9, kind: "observe", stage: "mcp-tools",
+                                    server: "mcp-github" }),
+        // A policy row names the pattern it wrote, in `host` — the egress shape.
+        rule_written: m.auditRow({ ts: 1e9, kind: "create", stage: "policy",
+                                   host: ".github.com" }),
+        // A tool rule names the tool it governs.
+        tool_rule: m.auditRow({ ts: 1e9, kind: "revoke", stage: "tool-policy",
+                               server: "mcp-github", tool: "get_me" }),
+        // Neither a host nor a tool: the prefix goes too, rather than dangling.
+        subjectless: m.auditRow({ ts: 1e9, kind: "edit", stage: "mcp-server" }),
         // OUTCOME rows: the status takes the prefix slot the stage uses, and the
         // subject is the flattened tool name. `tool-result` as a prefix would be pure
         // redundancy against the tag, and it rendered a dangling separator because a
         // tool call has no host.
-        outcome_ok: m.auditRow({ ts: 1e9, decision: "outcome", stage: "tool-result",
+        outcome_ok: m.auditRow({ ts: 1e9, kind: "outcome", stage: "tool-result",
                                  server: "mcp-github", tool: "get_me", status: "ok",
                                  client: "172.30.0.2" }),
-        outcome_failed: m.auditRow({ ts: 1e9, decision: "outcome",
+        outcome_failed: m.auditRow({ ts: 1e9, kind: "outcome",
                                      stage: "tool-result", server: "mcp-github",
                                      tool: "create_pull_request",
                                      status: "transport-error",
                                      reason: "no answer" }),
         // Half a name is reported as what there is, never assembled into something
         // that looks whole.
-        outcome_half: m.auditRow({ ts: 1e9, decision: "outcome",
-                                   server: "mcp-github", status: "ok" }).host,
-        outcome_none: m.auditRow({ ts: 1e9, decision: "outcome",
-                                   status: "ok" }).host,
+        outcome_half: m.auditRow({ ts: 1e9, kind: "outcome",
+                                   server: "mcp-github", status: "ok" }).target,
+        outcome_none: m.auditRow({ ts: 1e9, kind: "outcome",
+                                   status: "ok" }).target,
         // A status the shape rejects is suppressed rather than rendered, exactly as a
         // malformed stage is — the column has to stay scannable whatever arrives.
-        outcome_bad_status: m.auditRow({ ts: 1e9, decision: "outcome",
+        outcome_bad_status: m.auditRow({ ts: 1e9, kind: "outcome",
                                          server: "s", tool: "t",
                                          status: "evil.example" }).stagePrefix,
         // The record view answers "which one was it" — for an outcome that is WHICH
         // APPROVAL, and its absence means policy allowed the call outright.
-        outcome_event: m.eventRow({ ts: 1e9, decision: "outcome", server: "mcp-github",
+        outcome_event: m.eventRow({ ts: 1e9, kind: "outcome", server: "mcp-github",
                                     tool: "get_me", status: "ok",
                                     approval_id: "a".repeat(32) }).request,
-        outcome_event_unapproved: m.eventRow({ ts: 1e9, decision: "outcome",
+        outcome_event_unapproved: m.eventRow({ ts: 1e9, kind: "outcome",
                                                server: "s", tool: "t",
                                                status: "ok" }).request,
         // The client class, which is what the decision was actually taken against.
-        classed: m.auditRow({ ts: 1e9, decision: "allow", host: "api.github.com",
+        classed: m.auditRow({ ts: 1e9, kind: "allow", host: "api.github.com",
                               client: "172.28.0.3", client_class: "mcp" }),
         // A row from before the column existed, and one the backend could not place.
         // Both render nothing rather than an invented label — these rows are evidence.
-        unclassed: m.auditRow({ ts: 1e9, decision: "allow", host: "a.example",
+        unclassed: m.auditRow({ ts: 1e9, kind: "allow", host: "a.example",
                                 client: "172.30.0.2" }),
         // A stage a future hook might add still shows: the bound is on SHAPE, not on
         // a fixed vocabulary.
-        future_stage: m.auditRow({ ts: 1e9, decision: "deny", stage: "tls",
+        future_stage: m.auditRow({ ts: 1e9, kind: "deny", stage: "tls",
                                    host: "a.example" }).stagePrefix,
         // Case is not part of the bound: it does nothing to make a value blend into
         // the host, and suppressing a future `TLS` would be a silent surprise.
@@ -456,8 +477,8 @@ console.log(JSON.stringify({
                                     host: "a.example" }).stagePrefix]),
         at_the_length_limit: m.auditRow({ ts: 1e9, stage: "x".repeat(12),
                                           host: "a.example" }).stagePrefix,
-        no_client: m.auditRow({ ts: 1e9, decision: "allow", host: "a.example" }),
-        junk_ts: m.auditRow({ ts: "soon", decision: "allow", host: "a.example" }).ts,
+        no_client: m.auditRow({ ts: 1e9, kind: "allow", host: "a.example" }),
+        junk_ts: m.auditRow({ ts: "soon", kind: "allow", host: "a.example" }).ts,
         empty: m.auditRow({}),
         nothing: m.auditRow(null),
       },
@@ -524,19 +545,19 @@ console.log(JSON.stringify({
         presets: Object.keys(m.AUDIT_WINDOWS),
       },
       filter_active: {
-        nothing: m.filterActive({ q: "", decision: "", preset: "" }),
+        nothing: m.filterActive({ q: "", kind: "", preset: "" }),
         no_filter_object: m.filterActive(null),
         text: m.filterActive({ q: "evil" }),
         // Whitespace is not a filter: an accidental space must not relabel the view.
         whitespace: m.filterActive({ q: "   " }),
-        decision: m.filterActive({ decision: "deny" }),
+        kind: m.filterActive({ kind: "deny" }),
         window: m.filterActive({ preset: "24h" }),
         unknown_window: m.filterActive({ preset: "forever" }),
       },
       query: {
         bare: m.auditQuery({}, { limit: 40 }),
         everything: m.auditQuery(
-          { q: "evil", decision: "deny", preset: "1h" },
+          { q: "evil", kind: "deny", preset: "1h" },
           { limit: 100, nowMs: 1704067200000, before: "1704067200.5:42" }),
         // Free text is percent-encoded, or an `&` pasted from a URL splits the
         // query string into parameters the backend would misread or refuse.
@@ -550,23 +571,27 @@ console.log(JSON.stringify({
       },
       event_row: {
         // A plaintext request: method and URL are what identify it.
-        http: m.eventRow({ ts: 1e9, id: 7, decision: "deny", host: "a.example",
+        http: m.eventRow({ ts: 1e9, id: 7, kind: "deny", host: "a.example",
                            stage: "http", method: "GET", url: "https://a.example/x",
                            port: 80, proto: "http", client: "172.30.0.2",
                            client_class: "sandbox", reason: "blocked by rule" }),
         // A CONNECT tunnel has neither, and is identified by its port.
-        tunnel: m.eventRow({ ts: 1e9, id: 8, decision: "allow", host: "b.example",
+        tunnel: m.eventRow({ ts: 1e9, id: 8, kind: "allow", host: "b.example",
                              stage: "connect", port: 443, proto: "connect" }),
+        // The same tunnel somewhere unusual. `:443` is the scheme restated; `:8443` is
+        // a thing to stop on.
+        odd_port: m.eventRow({ ts: 1e9, id: 10, kind: "allow", host: "b.example",
+                               stage: "connect", port: 8443, proto: "connect" }),
         // Neither recorded — an empty cell rather than an invented one.
         bare: m.eventRow({ ts: 1e9, id: 9, host: "c.example" }),
         nothing: m.eventRow(null),
         // The shared columns must be IDENTICAL to the folded view's, which is the
         // whole reason eventRow builds on auditRow.
         shares_shaping: (() => {
-          const r = { ts: 1e9, decision: "deny", host: "a.example", stage: "http",
+          const r = { ts: 1e9, kind: "deny", host: "a.example", stage: "http",
                       client_class: "mcp", fail_closed: true };
           const folded = m.auditRow(r), raw = m.eventRow(r);
-          return ["ts", "decision", "host", "client", "stagePrefix",
+          return ["ts", "kind", "host", "client", "stagePrefix",
                   "clientClassPrefix", "reason", "failClosed"]
             .every(k => JSON.stringify(folded[k]) === JSON.stringify(raw[k]));
         })(),
@@ -1847,17 +1872,52 @@ class PageScriptTests(unittest.TestCase):
         approved a PR being opened" and "a PR was opened"."""
         a = self.probe["saturation"]["audit"]
         self.assertEqual(a["outcome_ok"]["stagePrefix"], "ok · ")
-        self.assertEqual(a["outcome_ok"]["host"], "mcp-github__get_me")
+        self.assertEqual(a["outcome_ok"]["target"], "mcp-github__get_me")
         self.assertEqual(a["outcome_failed"]["stagePrefix"], "transport-error · ")
-        self.assertEqual(a["outcome_failed"]["host"],
+        self.assertEqual(a["outcome_failed"]["target"],
                          "mcp-github__create_pull_request")
+
+    def test_every_kind_of_row_names_what_it_is_about(self):
+        """`target` was empty for four of the seven row kinds, which is how the column
+        ended up rendering `tool-call · ` — a separator with nothing after it.
+
+        The columns to fill it from have existed since the trail became joinable; the
+        shaping simply was not using them outside outcome rows. An egress row names its
+        host, a policy row the pattern it wrote, and every tool-shaped row the tool."""
+        a = self.probe["saturation"]["audit"]
+        self.assertEqual(a["tool_held"]["target"], "mcp-github__create_pull_request")
+        self.assertEqual(a["tool_answered"]["target"],
+                         "mcp-github__create_pull_request")
+        self.assertEqual(a["tool_released"]["target"],
+                         "mcp-github__create_pull_request")
+        self.assertEqual(a["tool_rule"]["target"], "mcp-github__get_me")
+        self.assertEqual(a["surface_moved"]["target"], "mcp-github")
+        self.assertEqual(a["rule_written"]["target"], ".github.com")
+
+    def test_the_stage_still_qualifies_the_target_it_now_has(self):
+        """The prefix was never the problem — an empty cell beside it was. With the
+        target filled, `tool-call · mcp-github__create_pull_request` says which point
+        of the lifecycle the row is, which is exactly what the stage is for."""
+        a = self.probe["saturation"]["audit"]
+        self.assertEqual(a["tool_held"]["stagePrefix"], "tool-call · ")
+        self.assertEqual(a["tool_answered"]["stagePrefix"], "tool-ask · ")
+        self.assertEqual(a["tool_released"]["stagePrefix"], "tool-resume · ")
+
+    def test_a_row_with_nothing_to_name_drops_the_prefix_too(self):
+        """A separator with nothing on its right is not a separator. `auditTarget`
+        fills the cell for every kind that exists today, so this is belt-and-braces —
+        and it is the guard that stops the bug coming back the next time a row shape is
+        added that neither names a host nor a tool."""
+        a = self.probe["saturation"]["audit"]
+        self.assertEqual(a["subjectless"]["target"], "")
+        self.assertEqual(a["subjectless"]["stagePrefix"], "")
 
     def test_the_tool_name_is_the_one_the_agent_was_served(self):
         """Flattened `server__tool`, because that is the name in the tool list, in the
         agent's transcript and in the gateway's own log — an operator searching for
         what they saw has to find it here."""
         a = self.probe["saturation"]["audit"]
-        self.assertEqual(a["outcome_ok"]["host"], "mcp-github__get_me")
+        self.assertEqual(a["outcome_ok"]["target"], "mcp-github__get_me")
         # Half a name reports what there is rather than assembling something that looks
         # whole: `mcp-github__` would read as a tool whose name is empty.
         self.assertEqual(a["outcome_half"], "mcp-github")
@@ -1906,9 +1966,9 @@ class PageScriptTests(unittest.TestCase):
         # This list is fed from a table the agent influences the contents of, so a
         # missing field must degrade to a readable cell, never to a thrown render
         # that leaves the operator with a blank decisions view.
-        self.assertEqual(a["empty"]["decision"], "?")
-        self.assertEqual(a["nothing"]["decision"], "?")
-        self.assertEqual(a["nothing"]["host"], "")
+        self.assertEqual(a["empty"]["kind"], "?")
+        self.assertEqual(a["nothing"]["kind"], "?")
+        self.assertEqual(a["nothing"]["target"], "")
         self.assertIsNone(a["junk_ts"], "a non-numeric ts must not reach Date()")
 
     def test_an_outage_is_not_reported_when_every_denial_was_policy(self):
@@ -2300,7 +2360,7 @@ class PageScriptTests(unittest.TestCase):
         self.assertFalse(f["nothing"])
         self.assertFalse(f["no_filter_object"])
         self.assertTrue(f["text"])
-        self.assertTrue(f["decision"])
+        self.assertTrue(f["kind"])
         self.assertTrue(f["window"])
         # Whitespace is not a filter, and an unknown preset narrows nothing — treating
         # either as active would relabel the whole view for no change in its contents.
@@ -2312,7 +2372,7 @@ class PageScriptTests(unittest.TestCase):
         self.assertEqual(q["bare"], "limit=40")
         self.assertEqual(
             q["everything"],
-            "limit=100&q=evil&decision=deny&since=1704063600"
+            "limit=100&q=evil&kind=deny&since=1704063600"
             "&before=1704067200.5%3A42")
         self.assertEqual(q["trims"], "limit=40&q=evil")
         # An absent or unusable limit is omitted rather than sent as junk — the
@@ -2333,13 +2393,22 @@ class PageScriptTests(unittest.TestCase):
         self.assertEqual(self.probe["saturation"]["query"]["cursor"],
                          "limit=5&before=1704067200.5%3A42")
 
-    def test_an_event_row_identifies_the_request_two_ways(self):
-        """The two shapes are alternatives, not columns: a plaintext request has a
-        method and a URL, a CONNECT tunnel has neither and is identified by its port.
-        Rendering both as columns would give every row two empty cells."""
+    def test_an_event_row_says_what_was_asked_for_only_when_it_is_unusual(self):
+        """The cell used to read `:443 connect` on almost every row, because almost
+        every governed request is a CONNECT tunnel — a port implied by the scheme,
+        beside a host already in `target`. A column that repeats itself down the page
+        is noise, and it is worst in the view meant for reading carefully.
+
+        So it follows the rule the stage prefix already does: suppress what is true of
+        nearly every row, and a non-empty cell then MEANS something."""
         e = self.probe["saturation"]["event_row"]
+        # A plaintext URL exists only because the proxy does not decrypt TLS, so its
+        # presence is itself the finding.
         self.assertEqual(e["http"]["request"], "GET https://a.example/x")
-        self.assertEqual(e["tunnel"]["request"], ":443 connect")
+        # The ordinary tunnel says nothing, because there is nothing to say.
+        self.assertEqual(e["tunnel"]["request"], "")
+        # An unusual port is worth stopping on, and survives.
+        self.assertEqual(e["odd_port"]["request"], ":8443")
         # Neither recorded: an empty cell, not an invented one.
         self.assertEqual(e["bare"]["request"], "")
         self.assertEqual(e["nothing"]["request"], "")
@@ -2608,31 +2677,31 @@ class AuditTableSourceTests(unittest.TestCase):
             "the only thing on the row element itself is the outage marker")
         cells = row.group(2).split("<td")[1:]
         self.assertEqual(len(cells), 5, "expected five cells, one per header")
-        time_, decision, host, client, reason = cells
+        time_, kind, target, client, detail = cells
 
         self.assertIn("fmtStamp(a.ts)", time_)
         self.assertIn("fmtInstant(a.ts)", time_)
-        # The decision cell holds the decision and NOTHING else. It is the column an
+        # The kind cell holds the kind and NOTHING else. It is the column an
         # operator scans vertically, so a variable-width extra makes it ragged — and
-        # the stage does not qualify the decision anyway.
-        self.assertIn("a.decision", decision)
-        self.assertNotIn("stagePrefix", decision)
-        # The stage prefixes the HOST, reading as the scheme it effectively is.
-        self.assertIn("a.stagePrefix", host)
-        self.assertIn("esc(a.host)", host)
+        # the stage does not qualify the kind anyway.
+        self.assertIn("a.kind", kind)
+        self.assertNotIn("stagePrefix", kind)
+        # The stage prefixes the TARGET, reading as the scheme it effectively is.
+        self.assertIn("a.stagePrefix", target)
+        self.assertIn("esc(a.target)", target)
         self.assertIn("esc(a.client)", client)
         # The class qualifies the CLIENT, the same way the stage qualifies the host —
         # it is not a sixth column (asserted above) and it must not drift onto the
         # decision cell, which stays uniform for vertical scanning.
         self.assertIn("a.clientClassPrefix", client)
-        self.assertNotIn("clientClassPrefix", decision)
-        self.assertIn("esc(a.reason)", reason)
+        self.assertNotIn("clientClassPrefix", kind)
+        self.assertIn("esc(a.reason)", detail)
         # Grouping annotates two cells and must not add a sixth (asserted above): the
-        # repeat count sits beside the host it repeats, the span beside the reason,
+        # repeat count sits beside the target it repeats, the span beside the detail,
         # which is the column that already carries explanatory text.
-        self.assertIn("a.repeat", host)
-        self.assertIn("a.firstTs", reason)
-        self.assertNotIn("a.repeat", decision, "the decision column stays uniform")
+        self.assertIn("a.repeat", target)
+        self.assertIn("a.firstTs", detail)
+        self.assertNotIn("a.repeat", kind, "the kind column stays uniform")
 
     def test_the_grouping_annotations_carry_their_own_separators(self):
         """The `denyhttp` lesson, which cost a live debug: a CSS margin produced the
@@ -2682,8 +2751,8 @@ class AuditTableSourceTests(unittest.TestCase):
                             INDEX_HTML.read_text(), re.S)
         self.assertIsNotNone(section, "the record table was renamed")
         headers = [h.strip() for h in re.findall(r"<th>(.*?)</th>", section.group(0))]
-        self.assertEqual(headers, ["time", "decision", "host", "client", "request",
-                                   "reason"])
+        self.assertEqual(headers, ["time", "kind", "target", "client", "request",
+                                   "detail"])
         row = re.search(r"return `\s*<tr([^>]*)>(.*?)</tr>`", self.events, re.S)
         self.assertIsNotNone(row, "the record row template was restructured")
         cells = row.group(2).split("<td")[1:]
@@ -2743,7 +2812,7 @@ class RecordViewWiringSourceTests(unittest.TestCase):
         self.assertIn("resetPaging()", changed.group(1))
         # Every control goes through it, including the mode switch: the two views page
         # differently, so carrying a cursor across the switch is the same mistake.
-        for control in ("auditQEl", "auditDecisionEl", "auditWindowEl", "auditEveryEl"):
+        for control in ("auditQEl", "auditKindEl", "auditWindowEl", "auditEveryEl"):
             with self.subTest(control=control):
                 self.assertRegex(self.src, rf"{control}[^;]*?filtersChanged\(",
                                  f"{control} must go through filtersChanged, or its "

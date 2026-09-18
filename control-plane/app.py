@@ -644,7 +644,11 @@ def _decision_scope(status_row) -> str:
     the duration and lets that be the record."""
     mode = status_row["mode"] if status_row else None
     if mode == "persist":
-        return "standing rule written"
+        # Names the PATTERN, because "allow api.example.co.uk" and "allow .co.uk"
+        # are the same click and very different policy. Read from the durable
+        # column; a row that predates it says only that a rule was written.
+        pattern = status_row["pattern"]
+        return f"standing rule written: {pattern}" if pattern else "standing rule written"
     if mode == "lease":
         return f"lease written, {policy._short_duration(policy.LEASE_SECONDS)}"
     return "this request only"
@@ -735,7 +739,7 @@ def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
                 "UPDATE approvals SET status='expired', resolved_at=? "
                 "WHERE id=? AND status='pending'", (time.time(), approval_id)).rowcount
             status_row = None if expired else conn.execute(
-                "SELECT status, mode, resolved_by FROM approvals WHERE id=?",
+                "SELECT status, mode, resolved_by, pattern FROM approvals WHERE id=?",
                 (approval_id,)).fetchone()
             conn.commit()
         if expired:
@@ -1233,11 +1237,11 @@ def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResp
         lease_expires_at = None
         now = time.time()
         updated = conn.execute(
-            "UPDATE approvals SET status=?, mode=?, resolved_at=?, resolved_by=? "
-            "WHERE id=? AND status='pending'",
+            "UPDATE approvals SET status=?, mode=?, resolved_at=?, resolved_by=?, "
+            "pattern=? WHERE id=? AND status='pending'",
             ("allowed" if outcome == "allow" else "denied",
              "persist" if persist else "lease" if lease else "once", now, actor,
-             approval_id)).rowcount
+             pattern if persist else None, approval_id)).rowcount
         if updated and lease:
             # INSIDE the `updated` guard, which is the whole of what keeps a lease
             # honest. The conditional UPDATE above is what makes exactly one of this

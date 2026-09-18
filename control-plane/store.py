@@ -47,7 +47,7 @@ LEGACY_CLIENT_CLASS = "sandbox"
 # The schema this code expects. Every entry in ``_STEPS`` below adds exactly one,
 # and a store records the version it is at (see ``_migrate``), so "what has already
 # run here" is a number to compare rather than a schema to interrogate.
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def _connect() -> sqlite3.Connection:
@@ -252,12 +252,24 @@ def _step_5_decision_to_kind(conn: sqlite3.Connection) -> None:
 # renumbered, reordered or edited once shipped — a store in the field has already run
 # the old body and will never run it again. Each entry is (version, label, function),
 # the label being what the operator sees in the log.
+def _step_6_persisted_pattern(conn: sqlite3.Connection) -> None:
+    """v6 — ``approvals.pattern``, the rule a `persist` decision wrote (the DDL
+    carries the reasoning). One nullable ``ALTER TABLE ADD COLUMN``, the cheapest
+    step shape. Existing rows keep NULL: the pattern an old click stored is
+    recoverable from ``rules`` only by guessing, and a guess is not a record."""
+    if "pattern" not in _columns(conn, "approvals"):
+        conn.execute("ALTER TABLE approvals ADD COLUMN pattern TEXT")
+        print("control-plane: added pattern to approvals (existing rows keep NULL — "
+              "they predate the column)", flush=True)
+
+
 _STEPS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = (
     (1, "per-client-class policy", _step_1_client_class),
     (2, "timed grants (leases)", _step_2_leases),
     (3, "tool correlation columns", _step_3_tool_correlation),
     (4, "tool outcome status", _step_4_tool_status),
     (5, "audit.decision becomes audit.kind", _step_5_decision_to_kind),
+    (6, "persisted pattern on approvals", _step_6_persisted_pattern),
 )
 
 
@@ -477,7 +489,14 @@ def _init_db() -> None:
                 -- column would have cost a migration.
                 mode        TEXT,             -- once | lease | persist
                 resolved_at REAL,
-                resolved_by TEXT              -- provenance of the resolver (_actor)
+                resolved_by TEXT,             -- provenance of the resolver (_actor)
+                -- WHAT a `persist` decision wrote: the rule pattern the operator chose
+                -- from the breadth ladder. Without it the record of a click that
+                -- changed standing policy said only which HOST was allowed, and a
+                -- `.co.uk` chosen from the ladder left a trail reading
+                -- "allow api.example.co.uk". NULL for once/lease and for every row
+                -- that predates the column.
+                pattern     TEXT
             )""")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS approvals_status ON approvals(status)")

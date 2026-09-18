@@ -794,6 +794,61 @@ class ToolAskLifecycleTests(_ToolAskTestCase):
         self.assertIsNone(
             cp.holds._resolve_tool_ask(ask.approval_id, "allowed", "operator"))
 
+    def _audit_rows(self, approval_id):
+        with cp.store._connect() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT kind, stage, server, tool, client, client_class, reason "
+                "FROM audit WHERE approval_id=? ORDER BY id", (approval_id,))]
+
+    def test_an_ask_nobody_answered_leaves_a_deny_row(self):
+        # The egress expiry writes one through its released waiter; this one wrote
+        # nothing, so the trail could not tell a still-pending ask from a lapsed one.
+        cp.holds.TOOL_HOLD_TIMEOUT = -1
+        ask = self._ask(client="172.30.0.7")
+        self.assertEqual(cp.holds._expire_tool_asks(), 1)
+        rows = [r for r in self._audit_rows(ask.approval_id) if r["kind"] == "deny"]
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual((row["stage"], row["server"], row["tool"], row["client"]),
+                         ("tool-ask", "mcp-github", "issue_write", "172.30.0.7"))
+        self.assertEqual(row["client_class"], cp.policy._client_class("172.30.0.7"))
+        self.assertIn("no decision within the tool hold window", row["reason"])
+        self.assertIn("will not run", row["reason"])
+
+    def test_a_grant_nobody_redeemed_leaves_a_deny_row_that_says_so(self):
+        # The other window, and the one with more to record: a human clicked allow
+        # and the agent never came back. Distinct wording, so the record can tell a
+        # question nobody answered from an answer nobody collected.
+        ask = self._ask()
+        cp.holds._resolve_tool_ask(ask.approval_id, "allowed", "operator")
+        cp.holds.TOOL_GRANT_TIMEOUT = -1
+        self.assertEqual(cp.holds._expire_tool_asks(), 1)
+        rows = [r for r in self._audit_rows(ask.approval_id) if r["kind"] == "deny"]
+        self.assertEqual(len(rows), 1)
+        self.assertIn("approved but never resumed", rows[0]["reason"])
+        self.assertIn("grant lapsed", rows[0]["reason"])
+
+    def test_expiry_is_audited_once_however_often_the_sweep_runs(self):
+        # The sweep runs on every read of the queue — once a second from the SSE
+        # tick. A row per sweep would bury the one that matters.
+        cp.holds.TOOL_HOLD_TIMEOUT = -1
+        ask = self._ask()
+        cp.holds._expire_tool_asks()
+        cp.holds._expire_tool_asks()
+        cp.holds._get_tool_ask(ask.approval_id)
+        rows = [r for r in self._audit_rows(ask.approval_id) if r["kind"] == "deny"]
+        self.assertEqual(len(rows), 1)
+
+    def test_a_spent_approval_gets_no_expiry_row(self):
+        # It ran; nothing lapsed. The row would say the opposite.
+        ask = self._ask()
+        cp.holds._resolve_tool_ask(ask.approval_id, "allowed", "operator")
+        cp.holds._claim_tool_ask(ask.approval_id)
+        cp.holds.TOOL_GRANT_TIMEOUT = -1
+        self.assertEqual(cp.holds._expire_tool_asks(), 0)
+        self.assertEqual(
+            [r for r in self._audit_rows(ask.approval_id) if r["kind"] == "deny"], [])
+
     def test_an_approval_is_claimable_exactly_once(self):
         # The property that makes lazy execution safe. The gateway runs the call on
         # RESUMPTION, and an agent can resume twice — so without a single-use claim

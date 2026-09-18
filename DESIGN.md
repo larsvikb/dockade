@@ -1279,10 +1279,13 @@ self-approval if reached — on host loopback, with no auth. Loopback binding is
 defense against **DNS rebinding**: a page the operator visits can point its own name
 at `127.0.0.1`, at which point it is *same-origin* with the frontend, so there is no
 preflight and responses are readable — it can list the pending approvals (obtaining
-the `uuid4` ids a blind attacker cannot guess) and resolve them. That, not CSRF, is
-the vector that matters here; plain CSRF is largely self-blocking, because a JSON
-body forces a preflight that fails for want of CORS headers and `resolve` needs an
-unguessable id. Three structural guards now sit in front (`control-plane-ui/app.py`):
+the `uuid4` ids a blind attacker cannot guess) and resolve them. That is the vector
+that matters most here, but plain CSRF is not self-blocking either, as this once
+claimed: a JSON body does not force a preflight (a typeless `Blob` is sent with no
+`Content-Type`, which is CORS-safelisted, and FastAPI parses an untyped body as
+JSON), and the `resolve` id is not blind for a tool ask, because the agent is handed
+it in the pending result. Four structural guards sit in front
+(`control-plane-ui/app.py`):
 
 - **Host allowlist** (`CONTROL_UI_ALLOWED_HOSTS`, default `127.0.0.1,localhost,::1`)
   — closes rebinding. Rebinding *requires* the attacker's own name in `Host`, and
@@ -1293,9 +1296,11 @@ unguessable id. Three structural guards now sit in front (`control-plane-ui/app.
   in-container healthcheck's `:8090`. Import fails closed
   on an empty list (`_assert_host_guard_configured`, mirroring the egress addon).
 - **Cross-origin state changes refused** — `Sec-Fetch-Site` when present, else
-  `Origin`; both absent means no browser is calling, so there is no CSRF to stop and
-  refusing would only break scripting. Belt-and-braces for a future endpoint that is
-  less lucky than the current ones.
+  `Origin` compared as a full authority (host *and* port) against the request's own
+  `Host`: a page on another localhost port is another origin, and a page the agent
+  wrote into the workspace is one dev server away from being served on one. Both
+  headers absent means no browser is calling, so there is no CSRF to stop and
+  refusing would only break scripting. Load-bearing, per the paragraph above.
 - **Relay path allowlist** — only the paths the UI actually uses are proxied. The
   backend surface is not uniformly browser-appropriate: reaching `POST /authorize`
   from a page means forged audit rows and consumed hold slots on the governance

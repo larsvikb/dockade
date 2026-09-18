@@ -30,10 +30,14 @@ allowlist):
      Rebinding structurally requires `Host: <attacker domain>`, and `Host` is a
      forbidden header that JS cannot set, so refusing unexpected Hosts removes the
      class rather than raising its cost.
-  2. **Cross-origin state change refused** — closes CSRF. Largely self-blocking
-     already (a JSON body forces a preflight that fails for want of CORS headers,
-     and `resolve` needs a uuid4 id a blind caller cannot guess), so this is
-     belt-and-braces for the case where a future endpoint is less lucky.
+  2. **Cross-origin state change refused** — closes CSRF, and it is load-bearing
+     rather than belt-and-braces. A JSON body does NOT force a preflight: a `Blob`
+     with no type is sent with no `Content-Type`, which is CORS-safelisted, and
+     FastAPI parses an untyped body as JSON. Nor is the `resolve` id blind for a
+     tool ask — the agent is handed it in the pending result. So the relationship
+     has to be checked: `Sec-Fetch-Site` when the browser sends it, else `Origin`
+     compared as a full authority (host AND port) against the request's own Host,
+     because a page on another localhost port is another origin.
   3. **Relay path allowlist** — the backend surface is NOT all equally suitable for
      a browser. `POST /authorize` is the proxy's decision endpoint; reaching it from
      a page means forged audit rows and consumed hold slots. Only the paths this UI
@@ -324,6 +328,30 @@ def _hostname_of(value: str | None) -> str | None:
         return None
 
 
+def _authority_of(value: str | None, default_port: int = 80) -> tuple[str, int] | None:
+    """``(hostname, port)`` from a `Host` header or an `Origin`, with the port made
+    explicit so the two compare: a browser omits a default port from `Origin`, and an
+    operator may or may not type one into the address bar. An `Origin` carries its
+    scheme, so its default follows it; a `Host` carries none and this app serves plain
+    HTTP, so its default is 80. Unparseable, or no hostname at all (`Origin: null`),
+    is None — which equals nothing."""
+    v = (value or "").strip()
+    if not v:
+        return None
+    if "://" not in v:
+        v = "//" + v
+    try:
+        parts = urlsplit(v)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return None
+    if not host:
+        return None
+    if port is None:
+        port = 443 if parts.scheme == "https" else default_port
+    return host, port
+
+
 def _refuse(detail: str) -> PlainTextResponse:
     """One shape for every guard refusal. 403 rather than 404: this surface is
     loopback-only, so leaking that a path exists costs nothing next to an operator
@@ -356,8 +384,15 @@ async def _guard(request: Request, call_next):
             if site != "same-origin":
                 return _refuse(f"cross-origin state change (Sec-Fetch-Site: {site})")
         else:
+            # The FULL authority, not the hostname: `localhost:3000` is on the
+            # allowlist's hostname and is a different origin, and a page the agent
+            # wrote into the workspace is one dev-server away from being served there.
+            # Compared against the request's own Host rather than the allowlist, so
+            # the question is "is this page us" and not "is this page on a name we
+            # answer to". Scheme is not compared: this app serves one scheme on the
+            # port, so nothing else can share the authority.
             origin = request.headers.get("origin")
-            if origin and _hostname_of(origin) not in ALLOWED_HOSTNAMES:
+            if origin and _authority_of(origin) != _authority_of(request.headers.get("host")):
                 return _refuse(f"cross-origin state change (Origin: {origin})")
     return await call_next(request)
 

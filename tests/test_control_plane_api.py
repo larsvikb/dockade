@@ -12,6 +12,7 @@ thread; ``HOLD_TIMEOUT`` is shortened per-test so a bug fails fast instead of
 blocking the default 120s."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -4974,3 +4975,52 @@ class ActorHeaderAgreementTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BodyCapTests(unittest.TestCase):
+    """The enforcer-facing listeners refuse an oversized body before FastAPI reads it.
+
+    Both peers relay what the sandbox sent, and the request model materializes the
+    whole body before any handler runs — so the cap has to sit in front of the app,
+    as middleware, and decide from the header. Both peers are stdlib urllib, which
+    always sends Content-Length and never chunks, so a POST without one is refused as
+    a peer this listener does not know rather than read to find out its size."""
+
+    class _Request:
+        def __init__(self, method="POST", headers=None):
+            self.method = method
+            self._headers = {k.lower(): v for k, v in (headers or {}).items()}
+            self.headers = types.SimpleNamespace(get=self._headers.get)
+
+    @staticmethod
+    async def _reached(_request):
+        return "REACHED-THE-APP"
+
+    def _run(self, cap, **kw):
+        return asyncio.run(cp._body_cap(cap)(self._Request(**kw), self._reached))
+
+    def test_a_body_within_the_cap_reaches_the_app(self):
+        self.assertEqual(self._run(100, headers={"content-length": "100"}),
+                         "REACHED-THE-APP")
+
+    def test_a_body_over_the_cap_is_refused_with_413(self):
+        resp = self._run(100, headers={"content-length": "101"})
+        self.assertEqual(resp.status_code, 413)
+
+    def test_a_post_without_a_length_is_refused_with_411(self):
+        for headers in ({}, {"content-length": "abc"}, {"content-length": "-1"}):
+            with self.subTest(headers=headers):
+                self.assertEqual(self._run(100, headers=headers).status_code, 411)
+
+    def test_a_get_carries_no_body_and_passes(self):
+        # The roster is fetched by GET, with no Content-Length at all.
+        self.assertEqual(self._run(100, method="GET"), "REACHED-THE-APP")
+
+    def test_the_caps_are_sized_to_their_peers(self):
+        # An egress question is a host, a port and a URL; the tool bridge carries a
+        # tool call's complete arguments behind the gateway's own megabyte cap.
+        self.assertEqual(cp.AUTHORIZE_BODY_MAX, 64 * 1024)
+        self.assertEqual(cp.TOOL_BODY_MAX, 2 * 1024 * 1024)
+        self.assertGreater(cp.TOOL_BODY_MAX, 1024 * 1024,
+                           "the tool bridge must accept what the gateway lets through")
+

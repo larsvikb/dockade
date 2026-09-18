@@ -222,6 +222,19 @@ class ForbiddenGuardTests(unittest.TestCase):
                                side_effect=OSError("no such host")):
             self.assertIsNone(addon._forbidden_reason("nonexistent.invalid"))
 
+    def test_a_name_the_resolver_cannot_encode_is_forbidden(self):
+        """Distinct from the case above. There the resolver was asked and had no
+        answer, which is safe to skip because mitmproxy cannot dial it either. Here
+        the resolver refuses to ASK — ``getaddrinfo`` raises ``UnicodeError``, not
+        ``OSError``, for an empty or over-long label — and the name may be a Host
+        header on a request whose request-line host mitmproxy dials fine. Real
+        resolver, no network: the raise happens at encoding, before any query."""
+        for name in ("a..b", "x" * 64 + ".example.com"):
+            with self.subTest(name=name):
+                reason = addon._forbidden_reason(name)
+                self.assertIsNotNone(reason)
+                self.assertIn("not a resolvable hostname", reason)
+
     def test_blocked_cidr_classifies_ips(self):
         self.assertIsNone(addon._blocked_cidr("not-an-ip"))
         self.assertIsNone(addon._blocked_cidr("8.8.8.8"))

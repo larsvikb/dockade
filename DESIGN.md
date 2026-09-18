@@ -1111,7 +1111,12 @@ edit applies to the very next connection). Two deliberate properties: (1) the
 **permanent lifeline** (Anthropic API/auth) is allowed by a *local* check in the
 proxy *before* the control plane is consulted, so a control-plane outage never
 bricks the agent's own API; (2) everything else **fails closed** — if the control
-plane is unreachable or times out, the request is denied and audited locally.
+plane is unreachable or times out, the request is denied and audited locally. That
+second property has to include the proxy's own errors: mitmproxy answers an
+exception in an addon hook by logging it and letting the flow proceed, so an
+unhandled error anywhere in a hook is a request dialled ungoverned and unaudited.
+Every hook is therefore wrapped to refuse the flow and write a local deny row on
+any exception (`_fail_closed` in `proxies/egress/addon.py`).
 
 **The lifeline is scoped by client, and it is the only decision here that is.**
 Everywhere else this proxy is deliberately client-agnostic: it asks the policy

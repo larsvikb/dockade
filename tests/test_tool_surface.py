@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import unittest
 
-from _loader import load_protocol, load_surface
+from _loader import load_control_plane, load_protocol, load_surface
 
 #: A roster as ``/tool/roster`` serves one. Written out rather than imported from the
 #: control plane for the reason test_tool_discovery.py writes its own: the two are
@@ -105,6 +105,29 @@ class NameTests(unittest.TestCase):
         for bad in ("get_issue", "", "__get_issue", "mcp-github__", "__"):
             with self.subTest(name=bad):
                 self.assertIsNone(self.surface.split_exposed(bad))
+
+    def test_a_name_one_character_away_from_a_real_one_is_refused_not_normalised(self):
+        # The control plane strips and lower-cases what it is asked about; the gateway
+        # used to forward the raw halves. Trailing whitespace of any kind, a control
+        # character, or an upper-case server would have been decided as one name and
+        # dialled as another. Every one of these is refused before anything is asked.
+        real = self.surface.exposed_name("mcp-github", "get_issue")
+        for bad in (real + " ", real + "\t", real + "\u3000", real + "\x1f",
+                    " " + real, "mcp-github__ get_issue", "MCP-GITHUB__get_issue",
+                    "mcp_github__get_issue", "mcp-github__get issue",
+                    "mcp-github__" + "x" * 129):
+            with self.subTest(name=bad):
+                self.assertIsNone(self.surface.split_exposed(bad))
+        self.assertEqual(self.surface.split_exposed(real), ("mcp-github", "get_issue"))
+
+    def test_the_name_patterns_are_the_control_planes_own(self):
+        # Two images, no shared module: the only thing holding the gateway's idea of a
+        # canonical name to the control plane's is this test. If they drift, the
+        # gateway starts forwarding names the control plane normalises, which is the
+        # exact gap the patterns exist to close.
+        policy = load_control_plane().policy
+        self.assertEqual(self.surface.SERVER_RE.pattern, policy._SERVER_RE.pattern)
+        self.assertEqual(self.surface.TOOL_RE.pattern, policy._TOOL_RE.pattern)
 
     def test_two_servers_exposing_one_tool_name_stay_two_tools(self):
         # The collision the flattening exists to prevent. Without it, whichever server

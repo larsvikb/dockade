@@ -24,3 +24,9 @@ Makefile
 .yamllint
 __pycache__
 .ruff_cache
+# Host-local state that the Makefile keeps OUT of the tree by default, listed for the
+# hand-run case that lands it here anyway. Nothing COPYs these today, and the point
+# is that a future `COPY . .` cannot start to.
+backups
+secrets
+.claude

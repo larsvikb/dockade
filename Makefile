@@ -781,10 +781,14 @@ audit-prune: ## Trim audit rows older than AUDIT_RETENTION_DAYS (default 30) and
 	docker exec -e AUDIT_RETENTION_DAYS=$(AUDIT_RETENTION_DAYS) control-plane \
 	  python3 -c "$$AUDIT_PRUNE_PY"
 
-# Where `make backup` writes. Gitignored: a backup is the crown-jewel state — every
-# host the agent has ever asked for, and the operator's whole policy — so it is
-# host-local by default and never a repo artifact.
-BACKUP_DIR ?= backups
+# Where `make backup` writes: OUTSIDE this repo, beside MCP_SECRETS and for the same
+# reason. A backup is the crown-jewel state — every host the agent has ever asked
+# for, and the operator's whole policy — and a sandbox launched with dockade as its
+# workspace bind-mounts this tree read-write. A copy in the tree is one the agent
+# can read whole and edit, and `restore` checks a file's shape, not its provenance,
+# so an in-tree backup is a store the agent gets to write. Gitignoring `backups/`
+# stays as the belt for anyone who points BACKUP_DIR back here by hand.
+BACKUP_DIR ?= $(DOCKADE_CONFIG_HOME)/backups
 
 # The image and volume `backup`/`restore` hand to `docker run`. Both are fixed in
 # docker-compose.yml (the service's `image:` and the volume's `name:`) and restated
@@ -828,7 +832,7 @@ control-tool-preflight:
 	  exit 1
 	fi
 
-backup: control-tool-preflight ## Snapshot the control-plane store (policy + approvals + audit) into BACKUP_DIR (default ./backups)
+backup: control-tool-preflight ## Snapshot the control-plane store (policy + approvals + audit) into BACKUP_DIR (default ~/.config/dockade/backups)
 	@# The crown-jewel state, which DESIGN.md says must be backed up independently of
 	@# any container — this is that path. Non-destructive and safe to run against a
 	@# LIVE stack: `VACUUM INTO` (in BACKUP_PY) takes a read lock and writes a
@@ -846,7 +850,7 @@ backup: control-tool-preflight ## Snapshot the control-plane store (policy + app
 	mv "$$out.partial" "$$out"
 	echo "backup: wrote $$out ($$(du -h "$$out" | cut -f1))"
 
-restore: control-tool-preflight ## Replace the control-plane store from a backup: make restore FILE=backups/… (destructive)
+restore: control-tool-preflight ## Replace the control-plane store from a backup: make restore FILE=<BACKUP_DIR>/… (destructive)
 	@# The other half of `backup`, and the destructive one: it discards the CURRENT
 	@# rules, approvals and audit history. Deliberately manual, deliberately loud,
 	@# and it validates the incoming file in two passes — a cheap one before the

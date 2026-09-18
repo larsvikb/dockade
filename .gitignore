@@ -14,8 +14,11 @@ secrets/
 *.log
 # Local review scratch pad (findings / todo). Working notes, not a repo artifact.
 local-todo.md
-# `make backup` output. The crown-jewel store: every host the agent has asked for and
-# the operator's whole policy — host-local state, never a repo artifact.
+# Fallback location for `make backup` output if BACKUP_DIR is pointed back into the
+# tree by hand — the Makefile's default is under ~/.config/dockade, beside the MCP
+# secrets and for the same reason. The crown-jewel store: every host the agent has
+# asked for and the operator's whole policy, in a file `restore` will install. Never
+# in this tree, because the tree is bind-mounted read-write into the sandbox.
 backups/
 # Claude Code's per-checkout working state: agent worktrees (each one a second copy
 # of this repo) and local settings. Ignored WHOLESALE rather than per-entry, which is

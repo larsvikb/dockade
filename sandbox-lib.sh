@@ -93,11 +93,21 @@ sc_guard_workspace() {
     # Non-fatal: credential material sitting inside the chosen workspace. This is
     # legal (you may genuinely want to work there), but the agent will be able to
     # read and modify it, so make that visible rather than silent.
-    for sensitive in .ssh .aws .gnupg .config/gcloud .kube .docker/config.json .netrc .git-credentials; do
+    for sensitive in .ssh .aws .gnupg .config/gcloud .kube .docker/config.json .netrc .git-credentials secrets; do
         if [[ -e "$real_workspace/$sensitive" ]]; then
             echo "WARNING: workspace contains '$sensitive' — the sandbox agent will have RW access to it." >&2
         fi
     done
+    # dockade's own state, when dockade is the workspace. A control-plane backup is
+    # the whole policy store in a file `make restore` will install after checking its
+    # shape, not its provenance — so a copy the agent can edit is a store the agent
+    # gets to write. The Makefile keeps them out of the tree by default; this catches
+    # the ones that got here anyway.
+    if compgen -G "$real_workspace/backups/dockade-control-*.db" >/dev/null; then
+        echo "WARNING: workspace contains control-plane backups (backups/dockade-control-*.db) —" >&2
+        echo "         the sandbox agent can read and rewrite them, and 'make restore' would install" >&2
+        echo "         one. Move them under \$(make print-config-home)/backups." >&2
+    fi
 
     # shellcheck disable=SC2034  # consumed by the sourcing launcher, not here
     SC_WORKSPACE="$real_workspace"

@@ -23,6 +23,8 @@ and a stored copy is one that can be read back after the thing it described has 
 """
 from __future__ import annotations
 
+import re
+
 #: What joins a server name to a tool name in what the agent sees. The agent talks to
 #: ONE MCP server — this gateway — so names from several backing servers land in one
 #: namespace and `pull_request_read` on two servers would be one name serving two
@@ -46,6 +48,21 @@ def exposed_name(server: str, tool: str) -> str:
     return f"{server}{SEP}{tool}"
 
 
+#: What a server name and a tool name may look like — the SAME patterns the control
+#: plane validates registrations and rules against (``_SERVER_RE`` / ``_TOOL_RE`` in
+#: control-plane/policy.py; tests/test_tool_surface.py holds the two copies equal,
+#: since the images share no module). They are here because the control plane
+#: NORMALISES what it is asked about — ``server.strip().lower()``, ``tool.strip()`` —
+#: and the gateway used to forward the raw halves. So ``mcp-github__get_issue ``
+#: (trailing space) was decided and audited as ``get_issue`` and then dialled as
+#: ``get_issue ``: policy read for one name, a call made under another, and the two
+#: audit rows already disagreeing. Refusing anything outside these patterns before
+#: asking makes the pair the control plane decides on the pair that runs, by
+#: construction — there is no spelling left for the two ends to disagree about.
+SERVER_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+TOOL_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+
+
 def split_exposed(name: str) -> tuple[str, str] | None:
     """``(server, tool)`` back out of an exposed name, or None if it is not one.
 
@@ -57,9 +74,13 @@ def split_exposed(name: str) -> tuple[str, str] | None:
     None rather than a guess. An agent can send any string — the name it was shown, a
     name from a transcript, a name a tool result suggested — and a decoder that
     salvaged something from a malformed one would be inventing the identity policy is
-    then keyed on."""
+    then keyed on. That includes a name that is one character of whitespace or one
+    upper-case letter away from a real one: ``SERVER_RE`` and ``TOOL_RE`` say what a
+    half may be, and a half outside them is not trimmed or folded into something
+    that is, because the control plane would do exactly that and then the two would
+    have decided about different strings."""
     server, found, tool = name.partition(SEP)
-    if not found or not server or not tool:
+    if not found or not SERVER_RE.match(server) or not TOOL_RE.match(tool):
         return None
     return server, tool
 

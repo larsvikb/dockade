@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from unittest import mock
 
 from _loader import load_execute
 
@@ -595,3 +596,17 @@ class OutcomeRecordTests(ExecutionTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NonCanonicalNameTests(unittest.TestCase):
+    """A name the control plane would normalise never reaches it."""
+
+    def test_a_padded_name_is_refused_before_governance_is_asked(self):
+        execute = load_execute()
+        execute._ask_control = mock.Mock(side_effect=AssertionError("must not ask"))
+        for name in ("mcp-github__get_issue ", "MCP-GITHUB__get_issue"):
+            with self.subTest(name=name):
+                result = execute.call(name, {"owner": "o"}, "172.30.0.2")
+                self.assertTrue(result["isError"])
+                self.assertIn("not a tool on this gateway", result["content"][0]["text"])
+

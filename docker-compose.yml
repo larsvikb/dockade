@@ -82,11 +82,11 @@ networks:
   # single all-routes listener, and the port split alone would sit on a network the
   # proxy can already reach.
   #
-  # ONE MEMBER TODAY, which is the same order the MCP catalogue shipped in: the
-  # surface the gateway will speak to is built and asserted before the gateway that
-  # consumes it. The sandbox is never attached — `make consistency` fails on a
-  # launcher that names any control network, and boundary-check.sh probes this
-  # network's address from inside a running sandbox.
+  # Two members: the control plane's third listener and the gateway that consumes
+  # it. The surface shipped first and was asserted before the gateway existed — the
+  # same order the MCP catalogue shipped in. The sandbox is never attached — `make
+  # consistency` fails on a launcher that names any control network, and
+  # boundary-check.sh probes this network's address from inside a running sandbox.
   tool-authorize-net:
     name: tool-authorize-net
     driver: bridge

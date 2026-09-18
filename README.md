@@ -32,8 +32,10 @@ socket, and (by design) no route to a control plane.
 > governed egress) and tier 2 (opencode against a local LLM, no egress and no
 > credentials). The audit trail is **browsable** — filters over the folded glance,
 > and a paged record view of every decision — and standing policy is **fully
-> mutable**, a rule's pattern or action changeable in one audited operation. Still
-> to come per [`DESIGN.md`](DESIGN.md): the MCP gateway, and the git/cache
+> mutable**, a rule's pattern or action changeable in one audited operation. The
+> **MCP gateway** is built and tier 1 is pointed at it: third-party tools reach the
+> agent only through per-tool allow/deny/ask policy, with a held ask resumed by id
+> once a human answers. Still to come per [`DESIGN.md`](DESIGN.md): the git/cache
 > data-plane services. See [Roadmap](#roadmap).
 
 ## Quickstart
@@ -143,7 +145,7 @@ open egress is exactly the state this sandbox exists to prevent.
 
 | Layer | Mechanism |
 |-------|-----------|
-| **Network egress** | With the infra up, `sandbox-net` is `internal: true` — the sandbox has **no route to the internet at all**; the only path off-box is the **egress proxy**, which reaches the internet on a separate `egress-net`. The proxy enforces a **domain**-level allowlist with per-connection audit (closing the shared-CDN/fronting gap that an IP-level rule can't). The in-container firewall (`init-firewall.sh`) is now **defense-in-depth**: in governed mode it permits only the proxy + embedded DNS, so even if it failed there's no route out. IPv6 fully denied. Without the infra, the launcher falls back to **standalone** mode (non-internal net, direct `ipset` IP-allowlist) for proxy-less use. |
+| **Network egress** | With the infra up, `sandbox-net` is `internal: true` — the sandbox has **no route to the internet at all**; the only path off-box is the **egress proxy**, which reaches the internet on a separate `egress-net`. The proxy enforces a **domain**-level allowlist with per-connection audit (closing the shared-CDN/fronting gap that an IP-level rule can't). The in-container firewall (`init-firewall.sh`) is now **defense-in-depth**: in governed mode it permits only the proxy, the tool gateway and embedded DNS, so even if it failed there's no route out. IPv6 fully denied. Without the infra, the launcher falls back to **standalone** mode (non-internal net, direct `ipset` IP-allowlist) for proxy-less use. |
 | **Privilege** | Non-root `sandbox` user; `--cap-drop=ALL` + minimal adds; `no-new-privileges`; no host Docker socket. |
 | **Filesystem** | Only the bind-mounted `/workspace` and the `/config` volume are *persistent* writable state (the rest of the container filesystem is writable but ephemeral). |
 | **Config** | `CLAUDE_CONFIG_DIR=/config`; user settings are re-materialized from a baked template on every boot, so config always matches the repo and volume wipes lose only credentials/runtime state. |
@@ -260,7 +262,7 @@ dockade/
                             #   say script-src 'self'; pure helpers unit-tested under node
     index.html              #   static shell + styles for the SSE approval console
     requirements.txt        #   pinned deps (fastapi, uvicorn, httpx)
-  tool-gateway/             # MCP GATEWAY — governed tool capability (no agent points at it yet)
+  tool-gateway/             # MCP GATEWAY — governed tool capability; tier 1's `--mcp-config` points at it
     Dockerfile              #   FastAPI + uvicorn; triple-homed, no egress leg
     app.py                  #   the bind guard, liveness, and the agent's MCP endpoint
     protocol.py             #   the MCP wire: JSON-RPC in, JSON-RPC out, no I/O
@@ -337,7 +339,10 @@ exposed through governed data-plane services. Next steps toward it:
    **2c-2 done:** standing policy is fully mutable — a rule's pattern or action can be
    changed in one audited operation carrying both states, rather than a revoke and a
    create that leave two half-rows and a window where the host is neither allowed nor
-   blocked. Next: the **MCP gateway**, per-tool allow/deny/ask.
+   blocked. **MCP gateway done:** third-party tools reach the sandbox only through
+   it, under per-tool allow/deny/ask; an `ask` answers the agent at once with a
+   pending id, and the call runs only when a human has approved it and the agent
+   resumes it. How each call ended is recorded and ingested beside the decision.
 3. **Skills + quality-gate hooks** in the image — the enablement half of the
    paved road.
 4. **Pull-through package cache** — fast, governed dependency installs.

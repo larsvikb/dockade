@@ -2069,7 +2069,7 @@ def create_mcp_server(req: ServerCreateRequest, request: Request) -> JSONRespons
     socket on the crown-jewel container — so the operator names the server, matching
     what `mcp-servers.yml` declares. A typo is therefore possible and is not caught
     here: it produces a registered server the gateway will find nothing behind, which
-    the roster reports once a gateway exists. That is the right failure — visible and
+    the roster reports on the gateway's next poll. That is the right failure — visible and
     granting nothing — and it is why this endpoint validates the name's SHAPE
     (``policy._server_name_error``) rather than pretending to validate its existence.
 

@@ -861,6 +861,22 @@ class RelayGuardAgreesWithComposeTests(unittest.TestCase):
                          "the tool bridge's own subnet is forbidden to the listener "
                          "that is required to bind it")
 
+    def test_the_management_bind_guard_names_every_enforcers_network(self):
+        # Same shape for the listener that grants. Both enforcers' networks must be
+        # listed — the proxy's authorize-net and the gateway's tool-authorize-net —
+        # and control-net must not be, because that is the address the management
+        # listener is required to bind.
+        default = re.search(
+            r'"CONTROL_MANAGE_BIND_FORBIDDEN", "([^"]+)"', APP)
+        self.assertIsNotNone(default, "could not find the management bind guard's default")
+        listed = {c.strip() for c in default.group(1).split(",")}
+        for network in ("authorize-net", "tool-authorize-net"):
+            self.assertIn(_subnet_of(network), listed,
+                          f"{network}'s subnet is not in the management bind guard")
+        self.assertNotIn(_subnet_of("control-net"), listed,
+                         "control-net is forbidden to the listener that is required "
+                         "to bind it")
+
     def test_the_lifeline_range_is_the_sandbox_network(self):
         # Same two-ends-no-compiler problem as the guard above, opposite sign: this
         # CIDR decides who KEEPS a grant rather than who is refused one. Pointed at

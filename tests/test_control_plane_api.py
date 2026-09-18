@@ -4840,6 +4840,25 @@ class ListenerSeparationTests(unittest.TestCase):
                 self._check(manage_bind="172.31.0.2", tool_bind=address)
             self.assertIn("CONTROL_TOOL_BIND", str(caught.exception), address)
 
+    def test_a_management_bind_on_an_enforcers_network_is_refused(self):
+        # The management listener is the one that GRANTS, and it had only the
+        # wildcard check: CONTROL_MANAGE_BIND=172.29.0.2 — this container's own
+        # authorize-net address — started cleanly and served `resolve` to the egress
+        # proxy. Both enforcers' networks are refused; control-net is the address it
+        # is required to bind, so that one passes (asserted by the first test above).
+        for address in ("172.29.0.2", "172.27.0.2"):
+            with self.assertRaises(SystemExit, msg=address) as caught:
+                self._check(manage_bind=address)
+            self.assertIn("CONTROL_MANAGE_BIND", str(caught.exception), address)
+            self.assertIn("resolve", str(caught.exception), address)
+
+    def test_the_management_forbidden_list_is_a_typo_away_from_nothing_and_says_so(self):
+        with mock.patch.object(cp, "_MANAGE_BIND_FORBIDDEN",
+                               "172.29.0.0/24,not-a-cidr"), \
+                self.assertRaises(SystemExit) as caught:
+            self._check(manage_bind="172.31.0.2")
+        self.assertIn("CONTROL_MANAGE_BIND_FORBIDDEN", str(caught.exception))
+
     def test_the_forbidden_list_is_a_typo_away_from_nothing_and_says_so(self):
         # Fatal rather than tolerant, unlike the addon's CIDR parsing: that list is
         # long and mostly redundant, this one has two members and dropping either

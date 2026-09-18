@@ -207,6 +207,14 @@ _WILDCARDS = ("", "0.0.0.0", "::", "*")  # noqa: S104
 #: the other's leg.
 _TOOL_BIND_FORBIDDEN = os.environ.get(
     "CONTROL_TOOL_BIND_FORBIDDEN", "172.29.0.0/24,172.31.0.0/24")
+#: The same refusal for the management surface, which is the more dangerous one to
+#: get wrong: `resolve` lives here. A wildcard check alone let
+#: ``CONTROL_MANAGE_BIND=172.29.0.2`` — this container's own authorize-net address —
+#: start cleanly and serve `resolve` and `create_rule` to the egress proxy, with
+#: every healthcheck green. The two enforcers' networks are listed; control-net is
+#: not, because that is the address this listener is required to bind.
+_MANAGE_BIND_FORBIDDEN = os.environ.get(
+    "CONTROL_MANAGE_BIND_FORBIDDEN", "172.29.0.0/24,172.27.0.0/24")
 
 # Everything except /authorize: the approvals API, the read-only views, /status.
 app = FastAPI(title="dockade control plane", version="2b")
@@ -495,25 +503,34 @@ def _warn_on_dead_caps() -> None:
                   flush=True)
 
 
-def _forbidden_tool_nets() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
-    """The networks the tool bridge must not be served on, parsed.
+def _forbidden_nets(var: str, value: str,
+                    ) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    """The networks a listener must not be served on, parsed from one of the two
+    ``*_BIND_FORBIDDEN`` lists (``var`` names it for the error).
 
     An unparseable entry is FATAL here, unlike the addon's tolerant CIDR parsing: that
-    one drops a bad entry because its list is long and mostly redundant, while this one
-    has two members and dropping either silently removes the guard. A typo in a
+    one drops a bad entry because its list is long and mostly redundant, while these
+    have two members each and dropping either silently removes the guard. A typo in a
     hand-set override must not read as "nothing is forbidden"."""
     nets = []
-    for raw in (part.strip() for part in _TOOL_BIND_FORBIDDEN.split(",")):
+    for raw in (part.strip() for part in value.split(",")):
         if not raw:
             continue
         try:
             nets.append(ipaddress.ip_network(raw, strict=False))
         except ValueError as exc:
             raise SystemExit(
-                f"control-plane: CONTROL_TOOL_BIND_FORBIDDEN entry {raw!r} is not a "
-                f"CIDR ({exc}), so the bind guard cannot be evaluated. Refusing to "
-                f"start (fail closed).") from exc
+                f"control-plane: {var} entry {raw!r} is not a CIDR ({exc}), so the "
+                f"bind guard cannot be evaluated. Refusing to start (fail closed).") from exc
     return tuple(nets)
+
+
+def _forbidden_tool_nets() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    return _forbidden_nets("CONTROL_TOOL_BIND_FORBIDDEN", _TOOL_BIND_FORBIDDEN)
+
+
+def _forbidden_manage_nets() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    return _forbidden_nets("CONTROL_MANAGE_BIND_FORBIDDEN", _MANAGE_BIND_FORBIDDEN)
 
 
 def _bind_within(bind: str, net: ipaddress.IPv4Network | ipaddress.IPv6Network) -> bool:
@@ -542,7 +559,8 @@ def _assert_listeners_separated() -> None:
     Three refusals, because a bind can undo the split three ways: a wildcard, a
     concrete address on another enforcer's network, and a shared port. The first two
     are the same mistake spelled differently and one check does not imply the
-    other."""
+    other — and both binds get both, the management one included, because it is
+    the listener that grants."""
     if MANAGE_BIND in _WILDCARDS:
         raise SystemExit(
             f"control-plane: CONTROL_MANAGE_BIND={MANAGE_BIND!r} is a wildcard, "
@@ -560,6 +578,15 @@ def _assert_listeners_separated() -> None:
     # The other spelling of the same mistake, and the one a wildcard test misses: an
     # address on another enforcer's network. Refused for the reason the wildcard is,
     # because the outcome is the same one.
+    for net in _forbidden_manage_nets():
+        if _bind_within(MANAGE_BIND, net):
+            raise SystemExit(
+                f"control-plane: CONTROL_MANAGE_BIND={MANAGE_BIND!r} is inside {net}, "
+                f"which is an enforcer's network — serving the management API "
+                f"(including /approvals/{{id}}/resolve) there puts self-approval "
+                f"within that enforcer's reach, and nothing downstream can detect "
+                f"it. Bind the control-net address instead. Refusing to start "
+                f"(fail closed).")
     for net in _forbidden_tool_nets():
         if _bind_within(TOOL_BIND, net):
             raise SystemExit(

@@ -212,3 +212,60 @@ class ReconcilePacingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReconcileSurvivalTests(unittest.TestCase):
+    """An exception inside one iteration costs one tick, not the thread.
+
+    The loop is the only thing that refreshes the agent-facing listing and the control
+    plane's inventory. Before this guard, anything `reconcile` did not catch — a
+    server answering with a JSON list, say — propagated out of `_reconcile_forever`
+    and ended the daemon thread while the process and `/healthz` stayed green, so a
+    newly enabled server was never dialable and a disabled one kept its descriptor
+    until a restart."""
+
+    def test_a_raising_iteration_is_reported_and_the_loop_goes_on(self):
+        gateway = load_tool_gateway(GOOD)
+        calls = []
+
+        class FakeDiscovery:
+            @staticmethod
+            def poll():
+                return ([{"server": "s", "auth": {}, "tools": []}], "")
+
+            @staticmethod
+            def roster_digest(roster):
+                return json.dumps(roster, sort_keys=True)
+
+            @staticmethod
+            def reconcile_all(roster):
+                calls.append(1)
+                if len(calls) == 1:
+                    raise AttributeError("'list' object has no attribute 'get'")
+                return list(roster)
+
+            @staticmethod
+            def format_report(results):
+                return [f"report:{len(results)}"]
+
+            @staticmethod
+            def push_inventory(_results):
+                return ""
+
+        class FakeStop:
+            waits = 0
+
+            def wait(self, _delay):
+                self.waits += 1
+                return self.waits >= 2
+
+        gateway.discovery = FakeDiscovery
+        gateway.DISCOVERY_INTERVAL = 0  # the retry falls due at once
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            gateway._reconcile_forever(FakeStop())
+        printed = out.getvalue()
+        self.assertEqual(len(calls), 2, "the loop did not come back for a second try")
+        self.assertIn("reconcile failed (AttributeError", printed)
+        self.assertIn("report:1", printed)
+

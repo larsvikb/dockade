@@ -79,6 +79,34 @@ class ParseTests(unittest.TestCase):
         with self.assertRaises(self.discovery.DiscoveryError):
             self.discovery.parse_tools("")
 
+    def test_valid_json_that_is_not_an_object_is_an_error_not_a_crash(self):
+        # `message.get(...)` on a list or a string raised AttributeError, which
+        # `reconcile` does not catch — so one server answering oddly killed the
+        # reconcile thread for the life of the process, healthcheck still green.
+        for raw in ("[]", '"x"', "null", "7", "data: []\n\n"):
+            with self.subTest(raw=raw), \
+                    self.assertRaises(self.discovery.DiscoveryError):
+                self.discovery.parse_tools(raw)
+
+    def test_a_result_without_a_tool_list_is_an_error_not_an_empty_list(self):
+        # `{"result": null}` and `{"result": []}` are not "this server exposes
+        # nothing", which is the claim an empty list makes and which the inventory
+        # push would then carry to the operator's picker.
+        for result in (None, [], "tools", {"tools": None}, {"tools": {"a": 1}}):
+            with self.subTest(result=result):
+                body = json.dumps({"jsonrpc": "2.0", "id": 1, "result": result})
+                with self.assertRaises(self.discovery.DiscoveryError) as caught:
+                    self.discovery.parse_tools(body)
+                self.assertIn("no tool list", str(caught.exception))
+
+    def test_a_malformed_reply_is_a_line_in_the_report_not_a_dead_thread(self):
+        # Through `reconcile`, which is what the loop calls: the shape error has to
+        # arrive as the DiscoveryError it catches, and read as NOT ENUMERATED.
+        self.discovery.post = lambda *_a, **_k: "[]"
+        report = "\n".join(self.discovery.format_report([self.discovery.reconcile(ENTRY)]))
+        self.assertIn("NOT ENUMERATED", report)
+        self.assertIn("expected a JSON object", report)
+
 
 class TrimTests(unittest.TestCase):
     """What survives a server's reply, and where each narrowing happens.

@@ -215,9 +215,23 @@ def parse_tools(raw: str) -> list[dict]:
         # prose with no JSON at all, so the parse error is the symptom and the prose
         # is the diagnosis. Carry the prose.
         raise DiscoveryError(f"not an MCP reply — the server said: {body[:200]!r}") from exc
+    if not isinstance(message, dict):
+        # Valid JSON, wrong shape — a bare string, a list, null. Everything below
+        # assumes an object, and an AttributeError here used to escape `reconcile`
+        # (which catches only DiscoveryError) and kill the reconcile thread for the
+        # life of the process, with the process and its healthcheck still green.
+        raise DiscoveryError(f"not an MCP reply — expected a JSON object, the server "
+                             f"sent {type(message).__name__}: {body[:200]!r}")
     if "error" in message:
         raise DiscoveryError(f"server returned an error: {message['error']}")
-    return message.get("result", {}).get("tools", [])
+    result = message.get("result")
+    tools = result.get("tools") if isinstance(result, dict) else None
+    if not isinstance(tools, list):
+        # `{"result": null}`, `{"result": []}`, a `tools` that is not a list: none of
+        # them is "this server exposes nothing", which is the claim an empty list
+        # makes and which `reconcile` then pushes as the inventory.
+        raise DiscoveryError("the reply carried no tool list")
+    return tools
 
 
 def post(server: str, message: dict, auth: dict, timeout: float | None = None) -> str:

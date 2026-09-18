@@ -266,6 +266,42 @@ class CrossOriginGuardTests(unittest.TestCase):
                                  headers={"origin": "http://127.0.0.1:28090"})),
             "REACHED-THE-APP")
 
+    def test_another_localhost_port_is_another_origin(self):
+        # The fallback used to compare hostnames against the allowlist, so any
+        # localhost origin passed. A page the agent wrote into the workspace, served
+        # by the project's own dev server on another port and opened by the operator
+        # in a browser without Sec-Fetch-Site, could POST a resolve. The port is part
+        # of the origin and is compared.
+        for origin in ("http://localhost:3000", "http://127.0.0.1:3000",
+                       "http://127.0.0.1"):
+            with self.subTest(origin=origin):
+                resp = self._guard(_ok_host(method="POST", headers={"origin": origin}))
+                self.assertEqual(resp.status_code, 403)
+
+    def test_the_origin_is_compared_to_the_requests_own_host_not_the_allowlist(self):
+        # `localhost` and `127.0.0.1` are both allowed Hosts, but a page at one is
+        # not the same origin as a page at the other; the UI's own page always sends
+        # the Origin its address bar shows, which is the Host it dialled.
+        resp = self._guard(_ok_host(method="POST",
+                                    headers={"origin": "http://localhost:28090"}))
+        self.assertEqual(resp.status_code, 403)
+
+    def test_a_default_port_left_implicit_on_either_side_still_matches(self):
+        # Browsers omit :80 from Origin; an operator may or may not type it into Host.
+        for host, origin in (("localhost", "http://localhost"),
+                             ("localhost:80", "http://localhost"),
+                             ("localhost", "http://localhost:80")):
+            with self.subTest(host=host, origin=origin):
+                req = _FakeRequest(method="POST",
+                                   headers={"host": host, "origin": origin})
+                self.assertEqual(self._guard(req), "REACHED-THE-APP")
+
+    def test_an_opaque_origin_is_refused(self):
+        # `Origin: null` — a sandboxed frame, a redirect chain, a data: URL. It is
+        # nobody's authority, so it equals nothing.
+        resp = self._guard(_ok_host(method="POST", headers={"origin": "null"}))
+        self.assertEqual(resp.status_code, 403)
+
     def test_post_with_no_browser_headers_is_accepted(self):
         # Neither header means no browser is calling, so there is no CSRF to stop;
         # refusing here would only break curl/scripting without adding safety. The

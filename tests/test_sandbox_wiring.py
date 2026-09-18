@@ -26,6 +26,7 @@ import json
 import re
 import unittest
 from pathlib import Path
+from typing import ClassVar
 
 from _loader import load_protocol
 from test_topology import _environment_of
@@ -204,3 +205,47 @@ class WrapperTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TierHookPrivilegeTests(unittest.TestCase):
+    """Root touches the image layer; the sandbox user touches the volume.
+
+    The config volume is agent-owned and shared by every concurrent sandbox of a
+    tier, so a sibling's agent can be rearranging it while a boot runs. A root
+    process writing there follows whatever symlink it finds — `install -d` chowns the
+    target, `>>` appends through the link, `jq file` reads through it — and a
+    check-then-act guard only narrows the window. Each hook therefore re-execs itself
+    as the sandbox user before its first volume write. Read from the source, the way
+    the other tests in this file read the heredoc: running the hooks means a root
+    container."""
+
+    REEXEC = 'exec gosu "$USERNAME" "$0" "$@"'
+    HOOKS: ClassVar = {
+        "claude-sandbox": TIER_SETUP,
+        "opencode-sandbox": (ROOT / "opencode-sandbox" / "tier-setup.sh").read_text(),
+    }
+
+    def test_every_hook_hands_itself_to_the_sandbox_user(self):
+        for tier, src in self.HOOKS.items():
+            with self.subTest(tier=tier):
+                self.assertIn(self.REEXEC, src)
+
+    def test_no_hook_writes_agent_owned_files_as_root(self):
+        # `install -o sandbox` is the spelling of "root, writing a file for the
+        # agent" — the exact act the re-exec exists to remove. Its absence is what
+        # keeps the split honest when the next materialized file is added.
+        for tier, src in self.HOOKS.items():
+            with self.subTest(tier=tier):
+                self.assertNotIn('install -o "$USERNAME"', src)
+                self.assertNotIn('install -d -o "$USERNAME"', src)
+                self.assertNotIn('chown -h "$USERNAME', src)
+
+    def test_the_only_root_owned_artefact_lives_in_the_image_layer(self):
+        # Tier 1's gateway pointer is the one thing root writes, and it must be
+        # written BEFORE the re-exec and OUTSIDE the volume.
+        root_phase, user_phase = TIER_SETUP.split(self.REEXEC, 1)
+        self.assertIn("MCP_GATEWAY_CONFIG=/etc/claude-code/", root_phase)
+        self.assertIn("install -o root -g root -m 0644", root_phase)
+        self.assertNotIn("install -o root", user_phase)
+        self.assertNotIn("$CONFIG_DIR/", root_phase.split("CONFIG_DIR=", 1)[1])
+

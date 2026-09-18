@@ -164,6 +164,18 @@ class AuthorizeTests(unittest.TestCase):
         # the only record and must be ingested once the control plane returns.
         self.assertFalse(v.central)
 
+    def test_a_reply_that_is_not_an_object_is_a_deny_not_a_crash(self):
+        """Valid JSON that is not a dict has no ``.get``; before this check it raised
+        out of the hook, and a raised hook is a forwarded flow (``_fail_closed``)."""
+        for reply in (["allow"], "allow", None, 7):
+            with self.subTest(reply=reply):
+                with mock.patch.object(addon, "_post_authorize", return_value=reply):
+                    v = run(addon._authorize("example.com", stage="connect"))
+                self.assertFalse(v.allowed)
+                self.assertIn("malformed", v.reason)
+                # Nothing usable came back, so nothing was centrally recorded.
+                self.assertFalse(v.central)
+
     def test_unexpected_decision_value_is_not_allow(self):
         # Any decision that isn't exactly "allow" must be treated as deny.
         with mock.patch.object(addon, "_post_authorize",
@@ -359,10 +371,12 @@ class InternationalizedHostTests(unittest.TestCase):
         self.assertEqual(addon._a_label(self.ASCII), self.ASCII)
 
     def test_a_label_falls_back_rather_than_rejecting_a_dns_valid_host(self):
-        """The ``idna`` codec is stricter than DNS and than the rest of this proxy.
-        Underscored and over-long labels resolve fine in practice, so raising here
-        would turn a spelling helper into an outage for hosts that were never
-        internationalized. Spelling is this function's job; gating is not."""
+        """The ``idna`` codec is stricter than DNS: an underscored label resolves
+        fine, so raising here would turn a spelling helper into an outage for hosts
+        that were never internationalized. An over-long or empty label does NOT
+        resolve, and still passes through unchanged — spelling is this function's
+        job; the relay guard is where such a name is denied (see
+        ``FailClosedTests``)."""
         for host in ("_dmarc.example.com", "a" * 64 + ".example.com", ""):
             self.assertEqual(addon._a_label(host), host)
 
@@ -588,6 +602,138 @@ class RequestTests(unittest.TestCase):
                                side_effect=AssertionError("must not authorize")):
             run(addon.request(flow))
         self.assertIsNotNone(flow.response)
+
+
+def _unencodable(name, *_args, **_kwargs):
+    """What the real resolver does with a name IDNA cannot encode: raise
+    ``UnicodeError`` (not ``OSError``) before any query is sent. Verified against
+    CPython for an empty label, a 64-character label and a non-encodable character;
+    used as a ``getaddrinfo`` side effect so the guard runs offline."""
+    if ".." in name or any(len(label) > 63 for label in name.split(".")):
+        raise UnicodeError("label empty or too long")
+    return [(2, 1, 6, "", ("93.184.216.34", 0))]
+
+
+class FailClosedTests(unittest.TestCase):
+    """A hook that raises must refuse the flow, because mitmproxy will not: its
+    addon-error handling logs and lets the flow proceed, which for this addon is a
+    request dialled with no port gate, no relay guard, no policy question and no
+    audit row. The first instance found was a plaintext request whose ``Host``
+    header the resolver could not encode — ``getaddrinfo`` raises ``UnicodeError``,
+    ``_forbidden_reason`` caught only ``OSError``. That case is pinned here on its
+    own, and then the class it belongs to: ANY exception, in any hook, refuses."""
+
+    def setUp(self):
+        addon._conn_authority.clear()
+
+    def test_a_host_header_the_resolver_cannot_encode_is_denied(self):
+        """The reproduction: absolute-form request to an arbitrary host and port,
+        ``Host: a..b``. Before the fix the hook raised and mitmproxy relayed it."""
+        flow = _http_flow("exfil.example", "a..b", scheme="http", port=1234)
+        with mock.patch.object(addon.socket, "getaddrinfo", side_effect=_unencodable), \
+             mock.patch.object(addon, "_post_authorize",
+                               side_effect=AssertionError("must not authorize")), \
+             mock.patch.object(addon, "_audit") as audited:
+            run(addon.request(flow))
+        self.assertIsNotNone(flow.response)
+        decision, fields = audited.call_args[0][0], audited.call_args[1]
+        self.assertEqual(decision, "deny")
+        self.assertEqual(fields["host"], "a..b")
+        self.assertIn("not a resolvable hostname", fields["reason"])
+        self.assertFalse(fields["central"])
+
+    def test_an_over_long_label_is_denied_by_the_guard(self):
+        """``_a_label`` passes it through (that test says why); the guard is where
+        it stops. Both the CONNECT authority and a Host header take this path."""
+        name = "a" * 64 + ".example.com"
+        with mock.patch.object(addon.socket, "getaddrinfo", side_effect=_unencodable):
+            self.assertIn("not a resolvable hostname", addon._forbidden_reason(name))
+            flow = _connect_flow(name)
+            with mock.patch.object(addon, "_post_authorize",
+                                   side_effect=AssertionError("must not authorize")):
+                run(addon.http_connect(flow))
+        self.assertIsNotNone(flow.response)
+
+    def test_any_exception_in_http_connect_denies_and_audits(self):
+        flow = _connect_flow("example.com", cid="boom-connect")
+        with mock.patch.object(addon, "_forbidden", side_effect=RuntimeError("boom")), \
+             mock.patch.object(addon, "_audit") as audited:
+            run(addon.http_connect(flow))
+        self.assertIsNotNone(flow.response)
+        # Nothing was authorized, so nothing may be remembered for the SNI stage.
+        self.assertNotIn("boom-connect", addon._conn_authority)
+        decision, fields = audited.call_args[0][0], audited.call_args[1]
+        self.assertEqual(decision, "deny")
+        self.assertEqual(fields["stage"], "connect")
+        self.assertEqual(fields["host"], "example.com")
+        self.assertEqual(fields["port"], 443)
+        self.assertEqual(fields["client"], SANDBOX_PEER)
+        self.assertIn("RuntimeError: boom", fields["reason"])
+        self.assertFalse(fields["central"])
+
+    def test_any_exception_in_request_denies_and_audits(self):
+        flow = _http_flow("example.com", "example.com", scheme="http", port=80,
+                          method="POST")
+        with mock.patch.object(addon, "_forbidden", side_effect=RuntimeError("boom")), \
+             mock.patch.object(addon, "_audit") as audited:
+            run(addon.request(flow))
+        self.assertIsNotNone(flow.response)
+        decision, fields = audited.call_args[0][0], audited.call_args[1]
+        self.assertEqual(decision, "deny")
+        self.assertEqual(fields["stage"], "http")
+        self.assertEqual(fields["host"], "example.com")
+        self.assertEqual(fields["method"], "POST")
+        self.assertEqual(fields["url"], "http://example.com/")
+        self.assertEqual(fields["client"], SANDBOX_PEER)
+        self.assertIn("RuntimeError: boom", fields["reason"])
+
+    def test_any_exception_in_tls_clienthello_refuses_passthrough_and_audits(self):
+        """The TLS stage has no response to set; refusing means interception stays
+        ON, which is the same fail-closed shape the hook already documents."""
+        data = SimpleNamespace(
+            client_hello=SimpleNamespace(sni="example.com"),
+            context=SimpleNamespace(
+                client=SimpleNamespace(id="c1", peername=(SANDBOX_PEER, 5000))),
+            ignore_connection=False)
+        with mock.patch.object(addon, "_conn_authority",
+                               mock.Mock(get=mock.Mock(side_effect=RuntimeError("boom")))), \
+             mock.patch.object(addon, "_audit") as audited:
+            addon.tls_clienthello(data)
+        self.assertFalse(data.ignore_connection)
+        decision, fields = audited.call_args[0][0], audited.call_args[1]
+        self.assertEqual(decision, "deny")
+        self.assertEqual(fields["stage"], "sni")
+        self.assertEqual(fields["host"], "example.com")
+        self.assertEqual(fields["client"], SANDBOX_PEER)
+
+    def test_the_audit_row_survives_a_flow_it_cannot_read(self):
+        """The row is what the operator has when the hook did not get to write its
+        own, so it must land even when the flow object is itself the problem."""
+        flow = SimpleNamespace()  # no request, no client_conn — nothing to read
+        with mock.patch.object(addon, "_audit") as audited:
+            run(addon.http_connect(flow))
+        self.assertIsNotNone(flow.response)
+        decision, fields = audited.call_args[0][0], audited.call_args[1]
+        self.assertEqual(decision, "deny")
+        self.assertEqual(fields["stage"], "connect")
+        self.assertNotIn("host", fields)
+        self.assertNotIn("client", fields)
+        self.assertIn("AttributeError", fields["reason"])
+
+    def test_a_healthy_hook_is_unchanged(self):
+        """The wrapper is transparent on the happy path: same decision, one audit
+        row, and the authority still recorded for the SNI stage."""
+        flow = _connect_flow("example.com", cid="fine")
+        with mock.patch.object(addon.socket, "getaddrinfo",
+                               return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]), \
+             mock.patch.object(addon, "_post_authorize",
+                               return_value={"decision": "allow", "reason": "ok"}), \
+             mock.patch.object(addon, "_audit") as audited:
+            run(addon.http_connect(flow))
+        self.assertIsNone(flow.response)
+        self.assertEqual(addon._conn_authority["fine"], "example.com")
+        audited.assert_called_once()
+        self.assertEqual(audited.call_args[0][0], "allow")
 
 
 class ClientDisconnectedTests(unittest.TestCase):

@@ -41,6 +41,11 @@ Fail-closed, with one deliberate exception:
   - Every other host depends on the control plane. If it is unreachable or slow
     (timeout), the request is DENIED and audited locally — governed egress fails
     closed when the policy authority is down, which is the intended posture.
+  - An exception inside a hook is a DENY too (``_fail_closed``). mitmproxy's own
+    handling of an addon error is to log it and carry on with the flow, which for a
+    proxy whose whole job is refusing flows is fail-OPEN: a request whose gating
+    crashed would be dialled ungoverned and unaudited. So the hooks are their own
+    last line — any error refuses the flow and writes a local audit row.
 
 Control-plane isolation: this proxy is the only component on BOTH sandbox-net and
 a control network, so it — not network segmentation — is what keeps the agent off
@@ -82,6 +87,7 @@ Later: MITM / body-level audit is a per-domain option — enabled by NOT setting
 from __future__ import annotations
 
 import asyncio
+import functools
 import ipaddress
 import json
 import logging
@@ -310,12 +316,13 @@ def _a_label(host: str) -> str:
     is what makes the comparison, the display and the stored rule agree.
 
     Falls back to the input on UnicodeError. The ``idna`` codec is stricter than
-    the hosts we must keep working — it rejects empty, over-long and underscored
-    labels (``_dmarc.example.com``) that DNS and the rest of this proxy handle
-    fine — and this function's job is spelling, not validation. Failing closed
-    here would trade a display bug for an outage on hosts that were never
-    internationalized in the first place; the guards downstream still run either
-    way."""
+    DNS: it rejects an underscored label (``_dmarc.example.com``) that resolves
+    fine, so refusing here would turn a spelling helper into an outage for hosts
+    that were never internationalized. It also rejects empty and over-long labels,
+    which do NOT resolve — ``getaddrinfo`` raises the same ``UnicodeError`` for
+    them — and those are not this function's call either: they fall through
+    unchanged and ``_forbidden_reason`` denies them by name. Spelling here,
+    gating there."""
     try:
         return host.encode("idna").decode("ascii")
     except (UnicodeError, ValueError):
@@ -439,6 +446,15 @@ def _forbidden_reason(host: str) -> str | None:
         # Resolve the NORMALIZED name: a bracketed or trailing-dot form that the
         # raw `host` cannot resolve would otherwise skip this branch entirely.
         infos = socket.getaddrinfo(h, None)
+    except (UnicodeError, ValueError):
+        # Not a resolver failure: the name cannot be ENCODED for DNS at all (an empty
+        # or over-long label, a character IDNA refuses). ``getaddrinfo`` raises this
+        # rather than OSError, so it used to escape the hook — and mitmproxy answers
+        # an addon error by forwarding the flow. The OSError reasoning below does not
+        # hold here either: this may be a Host header, while mitmproxy dials the
+        # request-line host, so "it will not resolve when dialled" is not true of the
+        # thing that gets dialled. A name that is not a name is denied outright.
+        return f"destination {host} is not a resolvable hostname"
     except OSError as e:
         # Cannot run the resolve-based check. Returning None is SAFE (not a silent
         # fail-open): a name that will not resolve here also will not resolve when
@@ -569,6 +585,10 @@ async def _authorize(host: str, *, stage: str, client: str | None = None,
         resp = await asyncio.to_thread(_post_authorize, payload)
     except Exception as e:  # noqa: BLE001 — any failure must fail closed
         return Verdict(False, f"control-plane unreachable, fail-closed ({e})", False)
+    if not isinstance(resp, dict):
+        # Valid JSON that is not an object: ``.get`` on it would raise out of the
+        # hook, and a raised hook is a forwarded flow (see ``_fail_closed``).
+        return Verdict(False, "control-plane reply malformed, fail-closed", False)
     return Verdict(resp.get("decision") == "allow", resp.get("reason", ""), True)
 
 
@@ -620,6 +640,92 @@ def _probe_metadata_reachable() -> None:
         "DNS-rebind gap reaches no metadata endpoint on this host", METADATA_IP)
 
 
+def _deny(flow: http.HTTPFlow) -> None:
+    """Refuse an HTTP-layer flow. Setting a response is how an addon stops
+    mitmproxy from dialling the destination; this is the one shape every refusal in
+    this file takes."""
+    flow.response = http.Response.make(
+        403, b"egress denied by policy\n", {"Content-Type": "text/plain"})
+
+
+def _refuse_tunnel(data: tls.ClientHelloData) -> None:
+    """Refuse to pass a TLS connection through undecrypted. Interception stays on,
+    which fails closed exactly as ``tls_clienthello`` documents: no CA in the sandbox
+    means the handshake dies, and with one the flow lands in ``request`` re-gated."""
+    data.ignore_connection = False
+
+
+def _facts(obj) -> dict:
+    """Whatever the audit row can still say about a flow whose handling crashed.
+    Each field is read on its own, so one unreadable attribute does not cost the
+    others — the row is what an operator has when the hook did not get to write
+    its own, and a bare "deny" with no host is nearly useless."""
+    facts: dict = {}
+    for key, read in (
+            ("host", lambda: obj.request.pretty_host or obj.request.host),
+            ("host", lambda: obj.request.host),
+            ("host", lambda: obj.client_hello.sni),
+            ("port", lambda: obj.request.port),
+            ("client", lambda: obj.client_conn.peername[0]),
+            ("client", lambda: obj.context.client.peername[0]),
+            ("method", lambda: obj.request.method),
+            ("url", lambda: obj.request.pretty_url)):
+        if key in facts:
+            continue
+        try:
+            value = read()
+        except Exception:  # noqa: BLE001, S112 — best effort, by definition
+            continue
+        if value is not None:
+            facts[key] = str(value) if key != "port" else value
+    return facts
+
+
+def _fail_closed(stage: str, refuse):
+    """Make a hook refuse the flow when the hook itself fails.
+
+    mitmproxy runs each hook under its own error handler, and that handler's
+    answer to an exception is to log "Addon error" and let the flow proceed — the
+    right default for an addon that decorates traffic, and the wrong one for the
+    addon that decides whether traffic happens at all. Under it, any exception
+    between the top of ``request`` and ``flow.response = ...`` was a request dialled
+    with no port gate, no relay guard, no policy question and no audit row. The
+    first one found was a Host header the resolver could not encode
+    (``_forbidden_reason``); this exists so the second is a denied, audited row
+    rather than a bypass.
+
+    ``refuse`` is the hook's own way of stopping the flow, and it runs FIRST — the
+    audit row is written after, in a ``finally``, so a refusal that itself fails is
+    still recorded. The row is a plain local ``deny`` at the hook's stage, in the
+    ingest's vocabulary, with a reason that names the error; the traceback goes to
+    the log rather than the audit stream."""
+    def wrap(hook):
+        def on_error(obj, exc: BaseException) -> None:
+            logger.warning("%s hook failed (%s: %s); refusing the flow",
+                           stage, type(exc).__name__, exc)
+            try:
+                refuse(obj)
+            finally:
+                _audit("deny", stage=stage, central=False, **_facts(obj),
+                       reason=f"addon error, fail-closed "
+                              f"({type(exc).__name__}: {exc})")
+
+        if asyncio.iscoroutinefunction(hook):
+            async def guarded(obj):
+                try:
+                    await hook(obj)
+                except Exception as exc:  # noqa: BLE001 — the point is every one
+                    on_error(obj, exc)
+        else:
+            def guarded(obj):
+                try:
+                    hook(obj)
+                except Exception as exc:  # noqa: BLE001 — the point is every one
+                    on_error(obj, exc)
+        return functools.wraps(hook)(guarded)
+    return wrap
+
+
 def load(loader) -> None:  # mitmproxy lifecycle hook
     # Refuse to start with the relay guard's CIDR check disabled (fail closed)
     # BEFORE serving any traffic or announcing readiness.
@@ -637,6 +743,7 @@ def load(loader) -> None:  # mitmproxy lifecycle hook
                          daemon=True).start()
 
 
+@_fail_closed("connect", _deny)
 async def http_connect(flow: http.HTTPFlow) -> None:
     """All HTTPS via a forward proxy arrives as CONNECT host:port. Decide here,
     before any TLS — rejecting with a 403 needs no CA. Port-gate LOCALLY first
@@ -656,16 +763,14 @@ async def http_connect(flow: http.HTTPFlow) -> None:
     if forbidden:
         _audit("deny", stage="connect", proto="connect", host=host, port=port,
                client=client, reason=forbidden, central=False)
-        flow.response = http.Response.make(
-            403, b"egress denied by policy\n", {"Content-Type": "text/plain"})
+        _deny(flow)
         return
     if port not in ALLOWED_CONNECT_PORTS:
         _audit("deny", stage="connect", proto="connect", host=host, port=port,
                client=client, central=False,
                reason=f"port {port} not permitted for CONNECT "
                       f"({sorted(ALLOWED_CONNECT_PORTS)})")
-        flow.response = http.Response.make(
-            403, b"egress denied by policy\n", {"Content-Type": "text/plain"})
+        _deny(flow)
         return
     v = await _authorize(
         host, stage="connect", proto="connect", port=port, client=client)
@@ -678,10 +783,10 @@ async def http_connect(flow: http.HTTPFlow) -> None:
     else:
         _audit("deny", stage="connect", proto="connect", host=host, port=port,
                client=client, reason=v.reason, central=v.central)
-        flow.response = http.Response.make(
-            403, b"egress denied by policy\n", {"Content-Type": "text/plain"})
+        _deny(flow)
 
 
+@_fail_closed("sni", _refuse_tunnel)
 def tls_clienthello(data: tls.ClientHelloData) -> None:
     """Decide whether to pass this HTTPS connection through undecrypted. The
     destination decision was already made (and possibly held for approval) at
@@ -717,6 +822,7 @@ def tls_clienthello(data: tls.ClientHelloData) -> None:
                   f"(possible domain-fronting)")
 
 
+@_fail_closed("http", _deny)
 async def request(flow: http.HTTPFlow) -> None:
     """Gate a decrypted request. Today this only sees PLAIN HTTP (HTTPS is
     tunnelled opaque via ``ignore_connection``), but a denied-SNI flow — or any
@@ -759,8 +865,7 @@ async def request(flow: http.HTTPFlow) -> None:
             _audit("deny", stage="http", proto=proto, host=name, port=port,
                    client=client, method=flow.request.method,
                    url=flow.request.pretty_url, reason=forbidden, central=False)
-            flow.response = http.Response.make(
-                403, b"egress denied by policy\n", {"Content-Type": "text/plain"})
+            _deny(flow)
             return
     if port not in allowed_ports:
         _audit("deny", stage="http", proto=proto, host=asserted_host,
@@ -768,8 +873,7 @@ async def request(flow: http.HTTPFlow) -> None:
                url=flow.request.pretty_url, central=False,
                reason=f"port {port} not permitted for {proto} "
                       f"({sorted(allowed_ports)})")
-        flow.response = http.Response.make(
-            403, b"egress denied by policy\n", {"Content-Type": "text/plain"})
+        _deny(flow)
         return
     # sorted() only to make the "which name failed" report deterministic.
     names = sorted({transport_host, asserted_host})
@@ -795,8 +899,7 @@ async def request(flow: http.HTTPFlow) -> None:
                method=flow.request.method, client=client,
                url=flow.request.pretty_url, central=central,
                reason=f"host not authorized ({bad_name}): {bad_reason}")
-        flow.response = http.Response.make(
-            403, b"egress denied by policy\n", {"Content-Type": "text/plain"})
+        _deny(flow)
 
 
 def client_disconnected(client) -> None:  # mitmproxy lifecycle hook

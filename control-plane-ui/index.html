@@ -144,6 +144,13 @@
      Monospace and pre-wrap because whitespace inside a payload is content. */
   .payload { margin-top: 8px; font-size: 12px; }
   .payload summary { color: var(--dim); cursor: pointer; }
+  /* The warning that precedes a payload carrying characters the eye misses — bidi
+     overrides, zero-width joiners, homoglyphs. In the hold colour, not the deny one:
+     it is a reason to read carefully, not a verdict. The checkbox beside it swaps
+     the escaped rendering for the raw text and back; both are the whole payload. */
+  .payload .hazard { margin-top: 6px; color: var(--hold); display: flex; gap: 12px;
+    align-items: baseline; flex-wrap: wrap; }
+  .payload .hazard label { color: var(--dim); white-space: nowrap; cursor: pointer; }
   .payload pre { margin: 6px 0 0; padding: 8px; background: var(--bg);
     border: 1px solid var(--line); border-radius: 6px;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;

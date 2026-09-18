@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # MCP servers — the catalogue. One container per server, one profile per server.
 #
 # WHY THIS IS A SEPARATE FILE. `docker-compose.yml` owns the topology: every

@@ -591,7 +591,7 @@ def _register_tool_ask(server: str, tool: str, args: object,
         # saturation banner would tell an operator that governance is under pressure
         # when one caller sent something oversized.
         return ToolAsk(None, False,
-                       f"tool arguments are {len(args_json)} bytes; the ceiling is "
+                       f"tool arguments are {len(args_json)} characters; the ceiling is "
                        f"{TOOL_ARGS_MAX} — an ask a human cannot be shown in full is "
                        f"refused rather than shown in part", 0.0)
     _expire_tool_asks()

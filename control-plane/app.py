@@ -7,7 +7,7 @@ never reach — it lives on internal networks the sandbox is not attached to.
 Governed proxies call it on the control path to authorize connections; unknown
 requests are held for a human, who approves/rejects them in a live UI.
 
-This file is the HTTP surface — the two apps, the request models, the routes and
+This file is the HTTP surface — the three apps, the request models, the routes and
 the process entry point. The machinery each route drives lives beside it, one
 module per concern, and every call below is written qualified (``policy._decide``,
 ``holds._reserve_hold``) so a reader can see which one is being asked:
@@ -853,7 +853,7 @@ def tool_authorize(req: ToolCallRequest) -> dict:
 
     # 'hold' rather than a new word, and the vocabulary is the reason: `decision` is
     # shared with the audit views, the filter facet and the page's <option> list
-    # (audit.DECISIONS), which have no compiler between them, and "deferred to a
+    # (audit.KINDS), which have no compiler between them, and "deferred to a
     # human" is what `hold` already means. The reason line carries the difference that
     # matters — nothing is blocked, and the id is how the answer gets collected.
     why = (f"{tool} on {server}: registered as tool ask {ask.approval_id}"
@@ -877,8 +877,9 @@ def tool_roster() -> list[dict]:
 
     POLLABLE, unlike the decision above, and that split is deliberate: this answers
     "what is configured", which the gateway needs at session start and on change, while
-    execution policy is per-call and must never be cached. A `list_changed`
-    notification is what pushes an update into a live session.
+    execution policy is per-call and must never be cached. The gateway re-reads it
+    on an interval rather than being pushed to (protocol.py says why `list_changed`
+    is deliberately not advertised).
 
     A DISABLED server is simply absent, which is the whole meaning of the switch — the
     gateway dials what the roster names. It is not reported as disabled, because the
@@ -1113,11 +1114,14 @@ def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResp
     reasoning is worth being able to read straight through."""
     if holds._get_tool_ask(approval_id) is not None:
         return _resolve_tool_ask_request(approval_id, req, request)
-    if req.action not in EGRESS_ACTIONS:
+    # Normalised the way the tool path normalises its action, so a client that sends
+    # `Allow_Once ` is refused for being unknown rather than for its spelling.
+    action = (req.action or "").strip().lower()
+    if action not in EGRESS_ACTIONS:
         return JSONResponse({"ok": False, "detail": "bad action"}, status_code=400)
-    outcome = "allow" if req.action.startswith("allow") else "deny"
-    persist = req.action.endswith("persist")
-    lease = req.action.endswith("lease")
+    outcome = "allow" if action.startswith("allow") else "deny"
+    persist = action.endswith("persist")
+    lease = action.endswith("lease")
     # Captured BEFORE the update so the same value lands on the durable row and, via
     # that row, in the audit reason the blocked authorize() waiter writes.
     actor = _actor(request)
@@ -1188,7 +1192,7 @@ def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResp
                                f"persist (allowed: {', '.join(allowed)})"},
                     status_code=400)
             # A rule for this pattern may ALREADY EXIST with the opposite action, and
-            # the insert below is INSERT OR IGNORE against a UNIQUE(pattern) — so it
+            # the insert below is INSERT OR IGNORE against UNIQUE(pattern, client_class) — so it
             # would silently write nothing while this endpoint reported persisted:true
             # and the card confirmed a standing rule. Deny-over-allow is the dangerous
             # direction: the operator believes they have permanently blocked a subtree,
@@ -1942,7 +1946,7 @@ def api_leases() -> list[dict]:
     ``resolve``), so what this filters is only what has lapsed since the last grant.
 
     Absolute ``expires_at``, never a remaining-seconds field, for the reason the
-    saturation payload states (``holds._saturation_payload``): a value that changes on
+    saturation payload states (``holds._saturation``): a value that changes on
     every tick defeats change-detection and turns a poll into a firehose. The client
     does the arithmetic, as it already does for the hold countdown.
 

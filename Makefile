@@ -7,7 +7,8 @@
 #                   every image still builds (skipped when docker is unavailable).
 #                   CI-friendly: non-zero on any failure.
 #   - compose/*     thin wrappers over the shared infrastructure (egress proxy +
-#                   control plane + UI, plus the optional llm-* profiles) in
+#                   control plane + UI + tool gateway, plus the optional llm-*
+#                   profiles) in
 #                   docker-compose.yml. Sandboxes themselves are NOT compose
 #                   services (they are ephemeral + plural); launch them with
 #                   `make claude` / `make opencode`, one per agent tier.
@@ -43,7 +44,7 @@ MCP_SECRETS ?= $(DOCKADE_CONFIG_HOME)/secrets
 # in-repo default and every token would read as missing.
 export MCP_SECRETS
 # The gateway bind-mounts that directory read-only, and the files in it are the host
-# user's, mode 0600 — which `secrets-perm-check` above exists to keep that way. A
+# user's, mode 0600 — which `secrets-perm-check` below exists to keep that way. A
 # container running as its image's own system uid simply cannot read them, so it runs
 # as the INVOKING USER instead. Same move sandbox-lib.sh makes with
 # `--build-arg USER_UID`, and for the same reason: a container that reads host-owned
@@ -161,7 +162,7 @@ REFFILES := $(SCRIPTS) \
 .PHONY: help check check-strict lint consistency test verify-build \
         up down destroy audit-prune control-tool-preflight backup restore \
         secrets-perm-check \
-        rebuild logs-ep logs-cp \
+        rebuild logs-ep logs-cp logs-tg tool-outcomes print-config-home \
         mcp-up mcp-down mcp-ps mcp-tools gateway-tools \
         claude opencode boundary check-boundary split-check
 
@@ -405,7 +406,7 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	# and tools that look for it stop reading.
 	if git rev-parse --git-dir >/dev/null 2>&1; then
 	  spdx_files=$$(git ls-files '*.py' '*.sh' '*.js' '*.html' \
-	                             'Makefile' 'docker-compose.yml' \
+	                             'Makefile' 'docker-compose.yml' 'mcp-servers.yml' \
 	                             '*Dockerfile' '.github/workflows/*.yml')
 	  if [ -z "$$spdx_files" ]; then
 	    echo "  FAIL: the SPDX glob matched nothing — it would check silently. Renamed?"
@@ -505,9 +506,9 @@ verify-build: ## Assert every image still builds (skipped if docker unavailable)
 	  echo "SKIP build verification (docker unavailable)"; exit 0
 	fi
 	# Cache-respecting builds: the first run is slow, repeats are near-instant when
-	# nothing changed. Covers every Dockerfile — the three compose services here,
-	# and BOTH sandbox tiers (not compose services) via their launchers.
-	echo "== docker compose build (egress proxy + control plane + UI) =="
+	# nothing changed. Covers every Dockerfile — the compose services here, and
+	# BOTH sandbox tiers (not compose services) via their launchers.
+	echo "== docker compose build (the compose services) =="
 	$(COMPOSE) build
 	for launcher in $(LAUNCHERS); do
 	  echo "== sandbox image build ($$launcher --build-only) =="
@@ -560,7 +561,7 @@ down: ## Stop the shared infra (keeps the named volumes)
 # anyone's shell history.
 mcp-up: ## Start one catalogue MCP server: make mcp-up SERVER=github
 	@if [ -z "$(SERVER)" ]; then
-	  echo "usage: make mcp-up SERVER=github   (profiles: $$(grep -oP '^\s+- \Kmcp-\S+' mcp-servers.yml | tr '\n' ' '))"
+	  echo "usage: make mcp-up SERVER=github   (profiles: $$(grep -oE '^ +- mcp-[^ ]+' mcp-servers.yml | sed 's/.*- //' | tr '\n' ' '))"
 	  exit 2
 	fi
 	# No credential is passed in: measured, github-mcp-server ignores its env token in
@@ -570,8 +571,8 @@ mcp-up: ## Start one catalogue MCP server: make mcp-up SERVER=github
 	#
 	@$(MAKE) --no-print-directory secrets-perm-check
 	# --wait returns when the container is running and its dependencies are
-	# healthy, so a failure here is real rather than a race. The server holds a
-	# credential: if it exits immediately, read its log before re-running.
+	# healthy, so a failure here is real rather than a race. If it exits
+	# immediately, read its log before re-running.
 	$(COMPOSE) --profile mcp-$(SERVER) up -d --wait --wait-timeout 60 mcp-$(SERVER)
 
 mcp-down: ## Stop one catalogue MCP server: make mcp-down SERVER=github

@@ -11,7 +11,7 @@
 # failure. See the REQUIRE_TOOLS comment in the Makefile.
 #
 # Split into two jobs on purpose. `checks` finishes in about a minute; `build`
-# compiles five images, two of which are Debian-based sandbox tiers that apt-install
+# compiles every image, two of which are Debian-based sandbox tiers that apt-install
 # a whole toolchain. Running them in parallel means a shellcheck typo is not queued
 # behind a ten-minute image build.
 #
@@ -159,7 +159,7 @@ jobs:
         with:
           persist-credentials: false
 
-      # Covers all five Dockerfiles: the three compose services, plus BOTH sandbox
+      # Covers every Dockerfile: the compose services, plus BOTH sandbox
       # tiers via each launcher's --build-only (which builds and exits — no workspace
       # mount, no network, no credentials, so it needs nothing from the runner).
       # No layer cache: see the note in the pull request that added this file.

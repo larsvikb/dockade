@@ -1020,8 +1020,9 @@ governance decision depends on it (the egress proxy calls the backend directly).
 **The third net, `authorize-net`, and why the API surface is split.** The egress
 proxy is no longer on `control-net` at all. It sits on a single-conversation
 bridge to the control plane, and the control plane answers a *different surface*
-on each of its two networks: the management API (approvals, `resolve`, the
-read-only views) on `control-net`, and `POST /authorize` alone on `authorize-net`.
+on each of its networks: the management API (approvals, `resolve`, the read-only
+views) on `control-net`, `POST /authorize` alone on `authorize-net`, and — added
+later, on the same principle — the gateway's bridge alone on `tool-authorize-net`.
 
 The reasoning is about which failure is worth designing around. The dangerous
 endpoint is `resolve`, because it is what grants egress — a caller that reaches it
@@ -2882,7 +2883,7 @@ hang.
 
 ## Startup ordering — "running" is not "ready"
 
-Every compose service declares a `healthcheck`, and both launchers gate on it via
+Every infrastructure service declares a `healthcheck`, and both launchers gate on it via
 `sc_wait_healthy` in `sandbox-lib.sh`. This is an **audit-integrity** measure
 before it is an ergonomic one.
 
@@ -2897,7 +2898,7 @@ service_healthy` (proxy and UI both wait for the backend), and the tier-1 launch
 waiting on the proxy's own health before starting a sandbox.
 
 The probes are deliberately shallow — a TCP connect for the proxy, a static
-`/healthz` for the two Python services. In particular the proxy is **not** probed
+`/healthz` for the Python services. In particular the proxy is **not** probed
 by making a real CONNECT through itself: that would exercise the policy path end
 to end, but it would also write an audit record every interval, and a periodic
 synthetic `deny` is exactly the signal a human reviewing the log is watching for.
@@ -2916,7 +2917,7 @@ absence of a probe is not evidence of a problem.
 
 Both sandbox tiers are capped by their launcher — tier 1 at 4g, tier 2 at 2g, both
 `--cpus=4 --pids-limit=512` and both overridable per launch via `SANDBOX_MEMORY` /
-`SANDBOX_CPUS`. The three infra services are capped in `docker-compose.yml`
+`SANDBOX_CPUS`. The infra services are capped in `docker-compose.yml`
 (1g/512m/256m). Everywhere, swap is disabled by setting the swap ceiling equal to
 the memory ceiling (`--memory-swap` / `memswap_limit`): Docker otherwise defaults
 swap to 2x memory, so a bare 4g cap really means 4g RAM + 4g swap — on a 15 GiB

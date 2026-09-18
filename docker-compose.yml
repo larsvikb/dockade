@@ -15,7 +15,7 @@ name: dockade
 networks:
   # The agent's network. internal:true => NO route to the internet for anything
   # on it. The sandbox lives ONLY here, so it has no possible direct egress even
-  # if its in-container firewall failed — the egress proxy (dual-homed below) is
+  # if its in-container firewall failed — the egress proxy (multi-homed below) is
   # the sole way off-box. The fixed subnet gives the proxy a stable IP the
   # sandbox firewall allowlists.
   sandbox-net:
@@ -159,7 +159,7 @@ services:
     image: dockade-egress-proxy
     container_name: egress-proxy
     hostname: egress-proxy
-    # `always`, not `unless-stopped`, and only on the three infra services. The two
+    # `always`, not `unless-stopped`, and only on the infra services. The two
     # differ in exactly one case: whether a container that was down when the daemon
     # stopped comes back when it starts. That case is not hypothetical here — a
     # normal Windows power cycle left this stack with the control plane exited
@@ -313,12 +313,14 @@ services:
   # crown-jewel state. Fully internal: no sandbox-net (the agent has no route to
   # it), no egress-net, no published port. Zero non-internal surface.
   #
-  # It is the ONE service on both internal networks, and it serves a DIFFERENT
-  # surface on each: the human reaches the management API over control-net (via
-  # the control-plane-ui frontend below, the only other member), and the egress
-  # proxy reaches /authorize over authorize-net and can reach nothing else. Two
-  # ports, two bind addresses, one process — see app.py's module docstring for
-  # why the process cannot be split even though the sockets must be.
+  # It is the ONE service on every internal control network, and it serves a
+  # DIFFERENT surface on each: the human reaches the management API over
+  # control-net (via the control-plane-ui frontend below, the only other member),
+  # the egress proxy reaches /authorize over authorize-net and can reach nothing
+  # else, and the tool gateway reaches its bridge over tool-authorize-net on the
+  # same terms. One port and one bind address per surface, one process — see
+  # app.py's module docstring for why the process cannot be split even though the
+  # sockets must be.
   control-plane:
     build:
       # Repo root so the Dockerfile can COPY the top-level policies/ seed.
@@ -690,7 +692,7 @@ services:
     # required form, because compose interpolates the WHOLE FILE BEFORE profiles
     # select services — verified: with the variable empty, `docker compose up -d`
     # (no profile) failed on `services.llm-intel.entrypoint` and refused to start the
-    # three infra services. A `:?` in a profile-gated service is therefore a
+    # infra services. A `:?` in a profile-gated service is therefore a
     # whole-project requirement, which is exactly what profiles are supposed to
     # prevent. The default keeps the failure where it belongs — llama-server exits
     # naming the variable, and only if you actually start an llm-* profile. Cost of
@@ -767,7 +769,7 @@ services:
       timeout: 5s
       retries: 3
       start_period: 300s
-    # DELIBERATELY no mem_limit, unlike the three infra services above. Two ways a
+    # DELIBERATELY no mem_limit, unlike the infra services above. Two ways a
     # naive cap misfires here:
     #   - llama.cpp mmaps the GGUF, so the weights are reclaimable page cache
     #     charged to this cgroup. A tight limit produces disk thrashing on every

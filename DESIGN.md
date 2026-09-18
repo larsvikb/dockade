@@ -80,8 +80,8 @@ the internal sandbox network. Meaningful/risky capabilities are exposed as
 **governed proxies/tools**; safe high-value capabilities are exposed as
 **ungoverned tools**. Capabilities are surfaced to the agent as **skills**.
 
-**MCP reaches the sandbox only through the governed MCP gateway** (planned — see
-"MCP gateway" under Governance surfaces). Skills stay the interface for capabilities
+**MCP reaches the sandbox only through the governed MCP gateway** (see "MCP
+gateway" under Governance surfaces). Skills stay the interface for capabilities
 we design; the gateway is for third-party tool surfaces we did not. Nothing is lost
 by the agent adding an MCP server of its own: one it spawns in its own container
 inherits the sandbox's capability, which is no egress and no credentials. The
@@ -674,7 +674,7 @@ Registry (re-test when Claude Code adds/changes tools):
 | WebSearch | server-side | **No** | what the agent searches for; unaudited web *intake*; low-bandwidth exfil via query strings (read-only — no upload/POST) |
 | WebFetch | client-side | Yes | — (network-governed) |
 | Bash / file / Task / Notebook tools | client-side | Yes | — (local, firewall-governed) |
-| MCP tools via the gateway *(planned)* | client-side | Yes | — (the gateway is the choke point; see "MCP gateway") |
+| MCP tools via the gateway | client-side | Yes | — (the gateway is the choke point; see "MCP gateway") |
 | claude.ai MCP connectors (hosted) | server-side | **No** | everything a connector does — which is why this one is **closed at the transport** rather than accepted as WebSearch is |
 
 Scope: this concerns governing *actions on external systems*. The conversation
@@ -716,7 +716,7 @@ host-bind-mounted workspace. Dependencies: pull-through cache.
   direction**. v1: git over HTTPS through the egress proxy, push allowed to
   allowlisted repos/orgs, unknown → hold. The push token is a write-capable
   credential and stays governed (not in the sandbox).
-- **MCP gateway** *(planned — see "MCP gateway")* — the sole MCP surface offered to
+- **MCP gateway** *(see "MCP gateway")* — the sole MCP surface offered to
   the sandbox, exposing a curated tool set from configured MCP servers under
   per-tool allow/deny/ask policy. It holds those servers' credentials so the
   sandbox never does, which makes it the first concrete instance of the
@@ -777,7 +777,7 @@ no separate artifact-export path is needed in v1.
 ## Governance surfaces
 
 The services that actually implement governance, and the reasoning each one
-rests on (three built, plus the MCP gateway's design). This is the "why it is this way" that a change has to keep true — it was
+rests on, each of them built. This is the "why it is this way" that a change has to keep true — it was
 previously filed under a heading called *Build status*, which is why it kept
 growing without anyone noticing.
 
@@ -813,7 +813,9 @@ proxied traffic).
 finds the proxy it sets `EGRESS_PROXY_IP`, and `init-firewall.sh` switches to a
 minimal **governed** posture — the sandbox's only `OUTPUT` ACCEPTs become:
 loopback (incl. embedded DNS `127.0.0.11`), DNS **to `127.0.0.11` only**, the
-proxy `/32:8080`, and `ESTABLISHED,RELATED`; everything else is REJECTed. Dropped
+proxy `/32:8080`, the tool gateway's `/32:8100` when the launcher found one (see
+"MCP gateway"), and `ESTABLISHED,RELATED`;
+everything else is REJECTed. Dropped
 in governed mode vs the old posture: the direct per-domain IP allowlist (so **no
 ipset**), the **upstream DNS forward** (closing the residual DNS-exfil channel —
 a crafted name can no longer reach a recursive resolver; sibling names like
@@ -2778,7 +2780,7 @@ skills for capabilities we can name, the gateway for third-party tool surfaces w
 did not design.
 
 **First server: GitHub — shipped as `mcp-github` in `mcp-servers.yml`, ahead of the
-gateway that will front it.** It is the capability actually missing rather than a
+gateway that now fronts it.** It is the capability actually missing rather than a
 demonstration — `gh` is deliberately absent, no write-capable credential lives in
 the sandbox, and pushing is the human's step, so a fine-grained PAT held beside the
 server is what lets the agent finish a unit of work. It is also kind to the parts that are
@@ -3173,7 +3175,7 @@ STANDALONE:
 
 | Mode | Selected by | Permits |
 | --- | --- | --- |
-| GOVERNED | `EGRESS_PROXY_IP` set | loopback, embedded DNS, established, `/32` → egress proxy |
+| GOVERNED | `EGRESS_PROXY_IP` set | loopback, embedded DNS, established, `/32` → egress proxy, `/32` → tool gateway (tier 1, when found) |
 | LOCAL | `SANDBOX_MODE=local` | loopback, embedded DNS, established, `/32` → `llm:8080` |
 | STANDALONE | neither | direct `ipset` IP-allowlist (proxy-less fallback, tier 1 only) |
 
@@ -3391,7 +3393,7 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | tool inventory — gateway pushes, control plane holds it in memory | **done** — audited on change; no UI yet |
 | — | tool policy UI — pick from the inventory, write allow/ask/deny, promote | **done** — every row in `tool_rules` now has an operator surface |
 | — | curated tool list on the agent leg — MCP listener, `tools/list` | **done** |
-| — | MCP gateway — per-tool allow/deny/ask on `tools/call`, the pending ask, `resume_tool_call` | **done** — no agent is pointed at it yet |
+| — | MCP gateway — per-tool allow/deny/ask on `tools/call`, the pending ask, `resume_tool_call` | **done** |
 | — | tell the sandbox it exists — firewall grant, proxy exemption, `--mcp-config` from a wrapper | **done** |
 | — | tool audit is joinable — `server`/`tool`/`approval_id` columns, filled by every writer | **done** |
 | — | the gateway records how a call ENDED — its own JSONL stream | **done** |

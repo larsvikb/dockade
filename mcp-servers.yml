@@ -33,7 +33,7 @@
 #   - No published ports. Nothing on the host reaches these either.
 #
 # Governance happens at two altitudes and neither substitutes for the other: the
-# MCP gateway (not built yet — see DESIGN.md) decides per tool call; the egress
+# MCP gateway (tool-gateway/, see DESIGN.md) decides per tool call; the egress
 # proxy decides where the server's own process may connect.
 #
 # A FOURTH property, load-bearing for the second altitude: every server pins its

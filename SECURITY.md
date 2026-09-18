@@ -70,6 +70,15 @@ Anything that **crosses a boundary the design claims to hold**:
 - **Credential exposure** — anything that puts the Anthropic session credential, or
   any credential the design says stays *outside* the sandbox, somewhere it should not
   be.
+- **A tool call that evades the MCP gateway's policy.** The gateway is the only
+  path from a sandbox to a third-party tool, and it holds the servers' credentials
+  so the sandbox never does. In scope: a `tools/call` that runs without a decision
+  from the control plane, a tool the curated list does not offer, an approved call
+  re-run or run with arguments other than the ones the human read, a
+  `resume_tool_call` that redeems another client's ask, a route from a sandbox to
+  the gateway's bridge (`tool-authorize-net`) or to an MCP server container on
+  `mcp-net`, and any way a server credential reaches the sandbox — through a tool
+  result, an error message or a tool description.
 - **A control-plane-ui relay bypass** — reaching `POST /authorize` or any
   non-allowlisted backend path through the frontend, or overriding the pinned
   upstream host.
@@ -170,11 +179,9 @@ report.
   cannot run the infrastructure. Governed mode is the default and the one the
   invariants describe.
 - **Components that do not exist yet** — the git proxy, secrets broker, package
-  cache, MCP gateway, skills and quality-gate hooks are described in `DESIGN.md` as
-  planned. They cannot have vulnerabilities until they are built. The MCP *server
-  catalogue* (`mcp-servers.yml`) does ship and its containers do run, but no
-  sandbox has a route to them until the gateway exists — so what is testable today
-  is that absence of a route, not the gateway's per-tool policy.
+  cache, skills and quality-gate hooks are described in `DESIGN.md` as planned.
+  They cannot have vulnerabilities until they are built. The MCP gateway is no
+  longer one of them: it ships, tier 1 is pointed at it, and it is in scope above.
 - **"The control-plane UI has no authentication."** Correct, and deliberate: it is
   bound to host loopback behind structural browser-facing guards, and see the first
   item for why adding auth would not address the threat that actually matters. A

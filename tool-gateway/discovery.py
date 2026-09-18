@@ -338,10 +338,10 @@ def _count(n: int, noun: str) -> str:
 def format_report(results: list[dict]) -> list[str]:
     """The report as lines, so the caller owns where it goes.
 
-    Stdout today: this grants nothing and records no capability, so the audit
-    invariant — which exists to record capability GRANTED — does not reach it. When
-    the gateway has an audit path, this is a natural second sink rather than a
-    rewrite."""
+    Stdout, deliberately, even now that the gateway has an audit path
+    (``outcomes.py``): this grants nothing and records no capability, so the audit
+    invariant — which exists to record capability GRANTED — does not reach it, and
+    the outcome stream records how CALLS ended, which a roster report is not."""
     if not results:
         return ["tool-gateway: no enabled servers on the roster — nothing to reconcile"]
     lines = []

@@ -348,8 +348,8 @@ class CitedArtifactTests(_NeedsGit):
 
     Deliberately NOT extended to every backticked identifier. That reader finds
     ~18 symbols in no tracked source, and all of them are correct: upstream Claude
-    Code env vars, mitmproxy and github-mcp-server internals, the not-yet-built
-    gateway's planned field names, and identifiers named precisely to say they are
+    Code env vars, mitmproxy and github-mcp-server internals, wire field names
+    from the gateway's third-party peers, and identifiers named precisely to say they are
     NOT used (`ANTHROPIC_API_KEY`, `env_file`, a rejected `elapsed_seconds` field).
     Separating those from a real rename needs an allowlist of exceptions, and a
     guard with a growing exception list is one that gets appeased rather than read.
@@ -389,6 +389,63 @@ class CitedArtifactTests(_NeedsGit):
                                   f"{doc} tells the reader to run `make {target}`, "
                                   f"which the Makefile does not define")
         self.assertGreater(checked, 0, "no `make <target>` citations found in docs")
+
+
+class ShippedComponentTests(_NeedsGit):
+    """A component the Status table says is built is not described as unbuilt.
+
+    The failure this guards against already happened: the MCP gateway shipped over a
+    dozen PRs, and eleven passages across four documents kept saying "planned", "not
+    built yet" and "no agent is pointed at it yet" — SECURITY.md among them, which
+    declared the live tool-execution path unreportable. The Status table in DESIGN.md
+    is the one place that tracks sequence, so it is the source of truth here; a
+    phrase is only stale relative to it.
+
+    Deliberately narrow: the phrases are the ones actually written, not a theory of
+    how staleness is spelled. A new component gets its own row here when it ships and
+    its docs are swept, not before."""
+
+    #: (Status-row fragment, stale phrases) — the row is matched on the `What`
+    #: column, and its state must read `**done**` for the phrases to be forbidden.
+    SHIPPED: ClassVar = {
+        "MCP gateway — per-tool allow/deny/ask": (
+            r"gateway\b[^.\n]{0,40}\((planned|not built)",
+            r"until the gateway exists",
+            r"before the gateway exists",
+            r"no agent (is )?point(s|ed) at it yet",
+        ),
+    }
+
+    def _status_rows(self) -> dict[str, str]:
+        design = (ROOT / "DESIGN.md").read_text()
+        status = design.split("\n## Status\n", 1)[1].split("\n## ", 1)[0]
+        rows = {}
+        for line in status.splitlines():
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            if len(cells) == 3:
+                rows[cells[1]] = cells[2]
+        self.assertTrue(rows, "no Status rows parsed — did the table change shape?")
+        return rows
+
+    def test_a_done_row_is_not_contradicted_by_the_prose(self):
+        rows = self._status_rows()
+        # Anything a reader or the agent is handed: the docs, the compose files, and
+        # the comments in the code that describe the topology.
+        files = _docs() + [f for f in _tracked()
+                           if f.endswith((".yml", ".py")) and not f.startswith("tests/")]
+        for fragment, phrases in self.SHIPPED.items():
+            state = next((s for what, s in rows.items() if fragment in what), None)
+            self.assertIsNotNone(state, f"no Status row contains {fragment!r}")
+            if "**done**" not in state:
+                continue
+            for f in files:
+                text = (ROOT / f).read_text()
+                for phrase in phrases:
+                    with self.subTest(file=f, phrase=phrase):
+                        self.assertIsNone(
+                            re.search(phrase, text),
+                            f"{f} still describes a shipped component as unbuilt "
+                            f"(Status says {state!r}): /{phrase}/")
 
 
 if __name__ == "__main__":

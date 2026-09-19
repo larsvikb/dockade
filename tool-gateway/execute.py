@@ -172,6 +172,14 @@ def parse_call(raw: str) -> tuple[dict, str]:
     except ValueError as exc:
         raise discovery.DiscoveryError(
             f"not an MCP reply — the server said: {body[:200]!r}") from exc
+    if not isinstance(message, dict):
+        # Valid JSON that is not a JSON-RPC message: a bare string, a list, null. The
+        # membership test and `.get` below assume an object, and without this they
+        # raised TypeError/AttributeError out of `_run` — past the outcome record, so
+        # an approved call that ran and answered oddly left no row at all.
+        raise discovery.DiscoveryError(
+            f"not an MCP reply — expected a JSON object, the server sent "
+            f"{type(message).__name__}: {body[:200]!r}")
     if "error" in message:
         return text_result(f"the server rejected the call: {message['error']}",
                            is_error=True), "rpc-error"
@@ -247,6 +255,19 @@ def _run(server: str, tool: str, arguments: object, client: str | None = None,
         return recorded(
             text_result(f"could not call {tool} on {server}: {exc}", is_error=True),
             exc.kind, str(exc))
+    except Exception as exc:  # noqa: BLE001 — the record's own last line
+        # Anything the two layers above did not foresee. The call may well have run —
+        # the request was sent before whatever this is happened — so the one thing
+        # that must not follow is silence: an exception here propagated to a 500 with
+        # no outcome row, which is exactly the gap this function exists to close.
+        # Filed as a transport error because that is the closest word the shared
+        # status vocabulary has for "the reply arrived and could not be used".
+        return recorded(
+            text_result(f"could not read the reply from {tool} on {server}: the "
+                        f"gateway failed while handling it ({type(exc).__name__}: "
+                        f"{exc})", is_error=True),
+            "transport-error",
+            f"gateway failed handling the reply ({type(exc).__name__}: {exc})")
     # The reason line for a failure is the server's own text, which is what makes the
     # row worth reading — "Resource not accessible by personal access token" is the
     # sentence that was missing when this was discovered. Capped in `outcomes.record`,

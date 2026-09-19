@@ -404,6 +404,17 @@ class UpstreamReplyTests(ExecutionTestCase):
                                                              "isError": flag}
                 self.assertEqual(self.execute.parse_call(sse(body))[1], "ok")
 
+    def test_valid_json_that_is_not_an_object_is_an_error_not_a_crash(self):
+        # `"error" in message` and `message.get(...)` assume a dict. A bare string, a
+        # list, null or a number are all valid JSON and all raised TypeError or
+        # AttributeError straight out of `_run` — past the outcome record.
+        for raw in ('"error"', '["error"]', "[1]", '"ok"', "null", "7",
+                    'data: "ok"\n\n', "data: []\n\n"):
+            with self.subTest(raw=raw):
+                with self.assertRaises(self.execute.discovery.DiscoveryError) as caught:
+                    self.execute.parse_call(raw)
+                self.assertIn("expected a JSON object", str(caught.exception))
+
     def test_a_reply_that_is_not_one_is_an_error_rather_than_an_empty_result(self):
         # An empty result would read to the agent as a tool that succeeded and said
         # nothing, which is the one thing a transport failure must not look like.
@@ -551,6 +562,33 @@ class OutcomeRecordTests(ExecutionTestCase):
         self.assertEqual(self.rows[0]["status"], "transport-error")
         self.assertEqual(self.rows[0]["approval_id"], APPROVAL)
         self.assertEqual(self.called, [])
+
+    def test_a_grant_answered_with_a_non_object_reply_is_not_silent(self):
+        # The gap S8 named: the call was claimed (the control plane audited the
+        # claim), the server ran it and answered `"error"` or `[]`, and the gateway
+        # raised past `recorded` — a FastAPI 500 to the agent and no row anywhere.
+        for reply in ('"error"', "[]", "null"):
+            with self.subTest(reply=reply):
+                self.rows.clear()
+                self.reply = reply
+                self.granted()
+                self.assertEqual(len(self.rows), 1)
+                self.assertEqual(self.rows[0]["status"], "transport-error")
+                self.assertEqual(self.rows[0]["approval_id"], APPROVAL)
+                self.assertIn("expected a JSON object", self.rows[0]["reason"])
+
+    def test_an_exception_the_gateway_did_not_foresee_still_leaves_a_row(self):
+        # The class, not the instance: whatever the next unforeseen shape is, a call
+        # that was dispatched must end in a row. Only the dial is stubbed to raise;
+        # the request has, by then, been sent.
+        def boom(*_a, **_k):
+            raise TypeError("something new")
+        self.execute.discovery.post = boom
+        result = self.granted()
+        self.assertTrue(result["isError"])
+        self.assertEqual(len(self.rows), 1)
+        self.assertEqual(self.rows[0]["status"], "transport-error")
+        self.assertIn("TypeError: something new", self.rows[0]["reason"])
 
     def test_a_grant_spent_on_unparseable_arguments_is_not_silent_either(self):
         # The third path where a claim succeeds and no call happens. Should be

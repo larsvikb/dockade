@@ -239,9 +239,11 @@ ROSTER_INTERVAL = float(os.environ.get("GATEWAY_ROSTER_INTERVAL", "10"))
 def _reconcile_forever(stop: threading.Event) -> None:
     """Report the gap between what the servers expose and what policy decides.
 
-    A DAEMON loop that cannot fail the process: ``discovery.poll`` swallows its own
-    errors and returns them as text, and the sleep is on an Event so a shutdown is not
-    held for the interval.
+    A DAEMON loop that cannot fail the process, and — since the process would carry
+    on without it — cannot be allowed to die either: ``discovery.poll`` swallows its
+    own errors and returns them as text, the rest of an iteration is guarded below so
+    an exception from any one server's reply costs one tick rather than every future
+    one, and the sleep is on an Event so a shutdown is not held for the interval.
 
     POLLING AND SPEAKING ARE DIFFERENT RATES, and the split is the design. The roster
     is re-read every ROSTER_INTERVAL; the servers are dialled — and a report printed —
@@ -258,38 +260,58 @@ def _reconcile_forever(stop: threading.Event) -> None:
     reachable = None    # None until the control plane has ever answered
     deadline = 0.0      # monotonic time the slow tick next falls due
     while True:
-        roster, failure = discovery.poll()
-        due = time.monotonic() >= deadline
-        if roster is None:
-            # Flipping into failure is news; staying there is not, until the tick.
-            if reachable is not False or due:
-                print(failure, flush=True)
-                deadline = time.monotonic() + DISCOVERY_INTERVAL
-            reachable = False
-        else:
-            digest = discovery.roster_digest(roster)
-            if reachable is not True or digest != enumerated or due:
-                results = discovery.reconcile_all(roster)
-                # Published FIRST, before either reader is told. The agent-facing
-                # listing is the one consumer served from this process's own memory,
-                # so it is the one that must not be left a reconcile behind by a
-                # failure in the reporting below.
-                surface.publish(roster, results)
-                for line in discovery.format_report(results):
-                    print(line, flush=True)
-                # Pushed on the same trigger as the report, because they are the same
-                # observation going to two readers — the log for whoever is watching a
-                # terminal, the control plane for whoever is choosing rules in the UI.
-                # A refusal is printed rather than raised: the inventory is the
-                # convenience half, and losing it must not cost the diagnostic half.
-                refused = discovery.push_inventory(results)
-                if refused:
-                    print(refused, flush=True)
-                enumerated = digest
-                deadline = time.monotonic() + DISCOVERY_INTERVAL
-            reachable = True
+        try:
+            enumerated, reachable, deadline = _reconcile_once(
+                enumerated, reachable, deadline)
+        except Exception as exc:  # noqa: BLE001 — a dead thread is the failure here
+            # The thread is the only thing that refreshes the agent-facing listing and
+            # the control plane's inventory. Dead, it leaves both frozen at their last
+            # state while `/healthz` stays green — a diagnostic gone silent exactly
+            # when something is broken. Say so, on the slow tick like any other
+            # persistent fault, and try again next time.
+            print(f"tool-gateway: reconcile failed ({type(exc).__name__}: {exc}); "
+                  f"the listing and inventory are unchanged until the next attempt",
+                  flush=True)
+            deadline = time.monotonic() + DISCOVERY_INTERVAL
         if stop.wait(ROSTER_INTERVAL):
             return
+
+
+def _reconcile_once(enumerated, reachable, deadline):
+    """One iteration of ``_reconcile_forever``: poll, and speak if there is news.
+    Returns the three pieces of state the next iteration needs. Split out so the
+    loop's guard wraps the whole body and nothing else."""
+    roster, failure = discovery.poll()
+    due = time.monotonic() >= deadline
+    if roster is None:
+        # Flipping into failure is news; staying there is not, until the tick.
+        if reachable is not False or due:
+            print(failure, flush=True)
+            deadline = time.monotonic() + DISCOVERY_INTERVAL
+        reachable = False
+    else:
+        digest = discovery.roster_digest(roster)
+        if reachable is not True or digest != enumerated or due:
+            results = discovery.reconcile_all(roster)
+            # Published FIRST, before either reader is told. The agent-facing
+            # listing is the one consumer served from this process's own memory,
+            # so it is the one that must not be left a reconcile behind by a
+            # failure in the reporting below.
+            surface.publish(roster, results)
+            for line in discovery.format_report(results):
+                print(line, flush=True)
+            # Pushed on the same trigger as the report, because they are the same
+            # observation going to two readers — the log for whoever is watching a
+            # terminal, the control plane for whoever is choosing rules in the UI.
+            # A refusal is printed rather than raised: the inventory is the
+            # convenience half, and losing it must not cost the diagnostic half.
+            refused = discovery.push_inventory(results)
+            if refused:
+                print(refused, flush=True)
+            enumerated = digest
+            deadline = time.monotonic() + DISCOVERY_INTERVAL
+        reachable = True
+    return enumerated, reachable, deadline
 
 
 def main() -> None:

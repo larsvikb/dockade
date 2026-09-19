@@ -14,6 +14,7 @@ of the mistake are tested here, because one check does not imply the other.
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import io
 import json
@@ -268,4 +269,52 @@ class ReconcileSurvivalTests(unittest.TestCase):
         self.assertEqual(len(calls), 2, "the loop did not come back for a second try")
         self.assertIn("reconcile failed (AttributeError", printed)
         self.assertIn("report:1", printed)
+
+
+class BodyCapTests(unittest.TestCase):
+    """The agent's body is read up to a cap and no further.
+
+    Everything downstream of this listener buffers the whole message — `json.loads`,
+    then the complete arguments POSTed to the control plane, then its request model —
+    so an uncapped body was a sandbox-reachable OOM kill of the governance authority.
+    Streamed, because Content-Length is the sender's claim: a chunked request has none
+    and a lying one is caught only after the buffering it was meant to prevent."""
+
+    class _Request:
+        def __init__(self, chunks):
+            self._chunks = chunks
+
+        async def stream(self):
+            for chunk in self._chunks:
+                yield chunk
+
+    def _read(self, chunks, cap):
+        gateway = load_tool_gateway(GOOD)
+        return asyncio.run(gateway.read_body(self._Request(chunks), cap=cap))
+
+    def test_a_body_within_the_cap_is_read_whole(self):
+        self.assertEqual(self._read([b"abc", b"def"], cap=6), b"abcdef")
+
+    def test_a_body_over_the_cap_is_refused_at_the_chunk_that_crosses_it(self):
+        gateway = load_tool_gateway(GOOD)
+        seen = []
+
+        class Counting(self._Request):
+            async def stream(self):
+                for chunk in self._chunks:
+                    seen.append(chunk)
+                    yield chunk
+
+        with self.assertRaises(gateway.BodyTooLarge):
+            asyncio.run(gateway.read_body(Counting([b"a" * 4, b"b" * 4, b"c" * 4]),
+                                          cap=6))
+        # The third chunk was never asked for: the read stops where the cap does.
+        self.assertEqual(seen, [b"a" * 4, b"b" * 4])
+
+    def test_the_default_cap_is_a_megabyte_and_comes_from_the_environment(self):
+        self.assertEqual(load_tool_gateway(GOOD).BODY_MAX, 1024 * 1024)
+        gateway = load_tool_gateway({**GOOD, "GATEWAY_BODY_MAX": "10"})
+        self.assertEqual(gateway.BODY_MAX, 10)
+        with self.assertRaises(gateway.BodyTooLarge):
+            asyncio.run(gateway.read_body(self._Request([b"x" * 11])))
 

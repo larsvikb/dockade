@@ -168,6 +168,40 @@ def healthz() -> dict:
 #: in this system rather than one per direction.
 MCP_PATH = os.environ.get("GATEWAY_MCP_SERVE_PATH", "/mcp")
 
+#: The most this listener will read of one request, in bytes. The body is the agent's
+#: to write, and everything downstream buffers it whole: `json.loads` here, then the
+#: complete `arguments` POSTed to the control plane's tool bridge for the decision,
+#: then materialized by its request model. With no cap, a few hundred megabytes of
+#: `arguments` was a sandbox-reachable OOM kill of the governance authority — not a
+#: bypass (egress fails closed while it restarts), but the one lever the sandbox had
+#: to take governance down on demand. A megabyte is far beyond any tool call worth
+#: governing and far below the control plane's memory limit. Fail-closed, so an env
+#: var rather than a config surface (DESIGN.md, "Hold bounds are fail-closed").
+BODY_MAX = int(os.environ.get("GATEWAY_BODY_MAX", str(1024 * 1024)))
+
+
+class BodyTooLarge(Exception):
+    """The request body passed ``BODY_MAX``. Raised from ``read_body`` so the endpoint
+    can answer 413 without having held the oversized part in memory."""
+
+
+async def read_body(request: Request, cap: int | None = None) -> bytes:
+    """The request body, or ``BodyTooLarge`` the moment it exceeds ``cap``.
+
+    Streamed rather than `await request.body()`, because a Content-Length check alone
+    trusts a header the sender controls: a chunked request carries none, and a lying
+    one is caught only after the whole body has been buffered. Reading chunk by chunk
+    and stopping at the cap bounds the memory this process spends on a request to the
+    cap itself, whatever the headers said."""
+    cap = BODY_MAX if cap is None else cap
+    chunks, size = [], 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > cap:
+            raise BodyTooLarge(size)
+        chunks.append(chunk)
+    return b"".join(chunks)
+
 
 @app.post(MCP_PATH)
 async def mcp(request: Request) -> Response:
@@ -190,9 +224,16 @@ async def mcp(request: Request) -> Response:
     agent — which needs no rebinding trick to send whatever it likes here, and is
     exactly the party this surface exists to govern."""
     try:
-        message = json.loads(await request.body())
+        message = json.loads(await read_body(request))
+    except BodyTooLarge:
+        # Refused before anything downstream sees it (see ``BODY_MAX``). 413 rather
+        # than a JSON-RPC error: the message was never read, so there is no id to
+        # answer under and no claim about its content to make.
+        return JSONResponse(
+            {"error": f"request body exceeds {BODY_MAX} bytes and was not read"},
+            status_code=413)
     except ValueError:
-        # The one case answered with a non-200: an unparseable body is a transport
+        # The other case answered with a non-200: an unparseable body is a transport
         # failure rather than a protocol answer, and there is no id to reply under.
         return JSONResponse(protocol.parse_error(), status_code=400)
     # The peer this listener observed, relayed to the control plane as the calling

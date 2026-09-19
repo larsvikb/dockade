@@ -216,6 +216,24 @@ _TOOL_BIND_FORBIDDEN = os.environ.get(
 _MANAGE_BIND_FORBIDDEN = os.environ.get(
     "CONTROL_MANAGE_BIND_FORBIDDEN", "172.29.0.0/24,172.27.0.0/24")
 
+#: The most either enforcer-facing listener accepts in one request body, in bytes.
+#: Both peers — the proxy on `/authorize`, the gateway on the tool bridge — relay what
+#: the SANDBOX sent, and FastAPI materializes the whole body through the request
+#: model before any handler can measure it (``ToolCallRequest.args`` is `Any`, and
+#: ``holds.TOOL_ARGS_MAX`` applies only after the parse, on the `ask` path). Uncapped,
+#: a few hundred megabytes of `args` was an OOM kill of this process under its 512m
+#: limit — governance down on the sandbox's say-so. Not a bypass, since egress fails
+#: closed while the container restarts, but the sandbox's one lever against
+#: availability, and SECURITY.md puts "pressure becoming permission" in scope.
+#:
+#: Sized to the peer. An egress question is a host, a port and a URL; the tool bridge
+#: carries a tool call's complete arguments, which the gateway has already bounded
+#: at its own intake (``GATEWAY_BODY_MAX``), so this is the backstop behind that cap
+#: rather than the cap itself. Fail-closed bounds, so env vars (DESIGN.md, "Hold
+#: bounds are fail-closed, so their values stay env vars").
+AUTHORIZE_BODY_MAX = int(os.environ.get("CONTROL_AUTHORIZE_BODY_MAX", str(64 * 1024)))
+TOOL_BODY_MAX = int(os.environ.get("CONTROL_TOOL_BODY_MAX", str(2 * 1024 * 1024)))
+
 # Everything except /authorize: the approvals API, the read-only views, /status.
 app = FastAPI(title="dockade control plane", version="2b")
 # POST /authorize and GET /healthz, and nothing else, ever. Adding a route here
@@ -230,6 +248,38 @@ authorize_app = FastAPI(title="dockade control plane (authorize)", version="2b")
 # GRANT — no rule is written here and no approval is decided here (`resolve` stays on
 # the management app, asserted by tests/test_control_plane_api.py).
 tool_app = FastAPI(title="dockade control plane (tool)", version="2b")
+
+
+def _body_cap(cap: int):
+    """Middleware refusing a request body over ``cap`` BEFORE FastAPI reads it.
+
+    Decided from ``Content-Length`` alone, and that is enough here where it would not
+    be on the gateway's agent-facing listener: both peers of these two apps are the
+    stdlib `urllib` in the proxy and the gateway, which always sends the header and
+    never chunks. A POST without one is therefore not a peer this listener knows, and
+    is refused as such (411) rather than read to find out how big it is. A GET carries
+    no body and passes untouched — the roster is fetched that way."""
+    async def middleware(request: Request, call_next):
+        if request.method.upper() in ("POST", "PUT", "PATCH"):
+            declared = request.headers.get("content-length")
+            if declared is None or not declared.isdigit():
+                return JSONResponse(
+                    {"detail": "Content-Length required on this listener"},
+                    status_code=411)
+            if int(declared) > cap:
+                return JSONResponse(
+                    {"detail": f"request body of {declared} bytes exceeds the "
+                               f"{cap}-byte cap for this listener"},
+                    status_code=413)
+        return await call_next(request)
+    return middleware
+
+
+# Registered on the two enforcer-facing apps and NOT on the management app: the
+# management surface is the operator's, reached through the UI relay, and is not
+# what the sandbox can lean on.
+authorize_app.middleware("http")(_body_cap(AUTHORIZE_BODY_MAX))
+tool_app.middleware("http")(_body_cap(TOOL_BODY_MAX))
 
 
 # ── provenance ──────────────────────────────────────────────────────────────

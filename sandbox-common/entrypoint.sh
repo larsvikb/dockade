@@ -20,10 +20,20 @@ SANDBOX_CONFIG_DIR="${SANDBOX_CONFIG_DIR:-${CLAUDE_CONFIG_DIR:-/config}}"
 export SANDBOX_CONFIG_DIR
 chown -R "$USERNAME:$USERNAME" "$SANDBOX_CONFIG_DIR" 2>/dev/null || true
 
-# Per-tier setup hook: baked root-owned by each image, run as root BEFORE the
+# Per-tier setup hook: baked root-owned by each image, invoked as root BEFORE the
 # firewall and the privilege drop. This is where agent-specific declarative config
 # is materialized (tier 1: Claude user settings; tier 2: the opencode provider
 # config). Optional — a tier that needs nothing simply ships no hook.
+#
+# THE HOOK'S CONTRACT: root touches only the image layer (/etc), and everything
+# written into the config volume or the agent's home is written AS THE SANDBOX
+# USER — each hook re-execs itself through gosu for that half. The volume is
+# agent-owned and shared by every concurrent sandbox of the tier, so a sibling's
+# agent can be rearranging it while this boot runs; a root process writing there
+# follows whatever symlink it finds, and a check-then-act guard only narrows the
+# window. Writing as the user closes it: a symlink can then lead only to places the
+# agent could already write. The one root-owned artefact (tier 1's gateway pointer)
+# lives in /etc for the life of the container and never in the volume.
 if [ -x /usr/local/bin/tier-setup.sh ]; then
     /usr/local/bin/tier-setup.sh
 fi

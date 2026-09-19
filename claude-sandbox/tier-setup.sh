@@ -2,15 +2,88 @@
 # SPDX-License-Identifier: Apache-2.0
 set -euo pipefail
 
-# Tier-1 (Claude) setup hook. Run as root by the shared entrypoint, before the
-# firewall is armed and before the drop to the non-root sandbox user.
+# Tier-1 (Claude) setup hook. Invoked as root by the shared entrypoint, before the
+# firewall is armed and before the drop to the non-root sandbox user — and it hands
+# itself to that user as soon as root has done the one thing only root can.
 #
 # Only Claude-specific materialization belongs here. Everything tier-agnostic —
 # config ownership, git identity, the firewall, the capability assertion, the
 # gosu drop — lives in sandbox-common/entrypoint.sh and is shared with tier 2.
+#
+# TWO PHASES, split by privilege rather than by topic (the entrypoint states the
+# contract). Root writes the gateway pointer into /etc, image layer, and nothing
+# else. Then `exec gosu` re-runs this script as the sandbox user for everything that
+# lands in $CONFIG_DIR — a volume the agent owns and every concurrent tier-1
+# sandbox shares, so a sibling's agent can be rearranging it while this boot runs.
+# Written as root, a settings.json that had become a symlink was a root write (and
+# a root READ, through jq) wherever the link pointed; written as the user, a
+# symlink leads only to places the agent could already write.
 
 USERNAME=sandbox
 CONFIG_DIR="${SANDBOX_CONFIG_DIR:-${CLAUDE_CONFIG_DIR:-/config}}"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase 1 — root. The image layer only.
+# ═══════════════════════════════════════════════════════════════════════════
+if [ "$(id -u)" -eq 0 ]; then
+    # ---------------------------------------------------------------------------
+    # The MCP gateway  ->  the file /usr/local/bin/claude points --mcp-config at
+    # ---------------------------------------------------------------------------
+    # Written HERE rather than baked into the image because the address is discovered
+    # at launch, and written to /etc rather than into $CONFIG_DIR because the config
+    # volume persists: a gateway entry left there would outlive the launch that found
+    # it, and would then name an address nothing serves. /etc is image layer, so this
+    # file exists for exactly the life of the container that wrote it.
+    #
+    # ROOT-OWNED AND 0644. The agent can read it and cannot edit it, which is the same
+    # footing as the status-line script — and, like that one, this is mistake-prevention
+    # rather than containment (see claude-wrapper.sh on why that is enough here).
+    #
+    # `mcpServers` is Claude Code's own declarative form, and this is the only channel
+    # that works for it: the same block in a settings file is silently ignored, with no
+    # warning and no error (measured — NOTES.md).
+    #
+    # The key is `gateway`, so the agent sees `mcp__gateway__<server>__<tool>` and the
+    # client renders a call as "Calling gateway". It names the SURFACE, not the system:
+    # `dockade` there read as the whole system being invoked, when what is being called is
+    # one governed door into it. The word is also the one the rest of the repo already
+    # uses for this component (`tool-gateway`, `make logs-tg`), so it adds no vocabulary.
+    # Held equal to the gateway's own `protocol.SERVER_NAME` by
+    # tests/test_sandbox_wiring.py — a mismatch would be invisible, since both sides
+    # would work and only the name in a transcript would be wrong.
+    MCP_GATEWAY_CONFIG=/etc/claude-code/mcp-gateway.json
+    # Removed first, unconditionally. The absence of this file is what tells the wrapper
+    # there is no gateway, so a stale one from an earlier run of the same container is a
+    # session pointed at an address that may no longer answer.
+    rm -f "$MCP_GATEWAY_CONFIG"
+    if [[ "${TOOL_GATEWAY_IP:-}" =~ ^[0-9.]+$ ]]; then
+        # BY ADDRESS. The gateway is triple-homed and `tool-gateway` resolves to whichever
+        # leg Docker's DNS returns; the launcher already resolved the one leg this sandbox
+        # may speak to, and passed it.
+        install -o root -g root -m 0644 /dev/stdin "$MCP_GATEWAY_CONFIG" <<EOF
+{
+  "mcpServers": {
+    "gateway": {
+      "type": "http",
+      "url": "http://${TOOL_GATEWAY_IP}:${TOOL_GATEWAY_PORT:-8100}/mcp"
+    }
+  }
+}
+EOF
+        echo "  MCP gateway -> http://${TOOL_GATEWAY_IP}:${TOOL_GATEWAY_PORT:-8100}/mcp"
+    fi
+
+    # Root is done. Everything below lands in the agent-owned volume, so it runs as
+    # the agent. `exec` so there is one process and one exit status, and the env
+    # (SANDBOX_PLUGINS, the config dir) travels through gosu unchanged.
+    exec gosu "$USERNAME" "$0" "$@"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase 2 — the sandbox user. The config volume.
+# ═══════════════════════════════════════════════════════════════════════════
+# No `-o`/`-g` on the installs below: the files are owned by whoever writes them,
+# and that is now the user they are for.
 
 # User settings are declarative config owned by the image, not mutable state in
 # the volume. Overwrite them authoritatively on every boot from the baked
@@ -26,9 +99,7 @@ CONFIG_DIR="${SANDBOX_CONFIG_DIR:-${CLAUDE_CONFIG_DIR:-/config}}"
 # at /etc/claude-code/statusline.sh — only the pointer is user-editable. No
 # chmod-to-read-only: it would be theater (owner can re-chmod, and /config is
 # agent-writable so the file can be replaced). See DESIGN.md.
-install -o "$USERNAME" -g "$USERNAME" -m 0644 \
-    /etc/claude-code/user-settings.json \
-    "$CONFIG_DIR/settings.json"
+install -m 0644 /etc/claude-code/user-settings.json "$CONFIG_DIR/settings.json"
 
 # User-scope CLAUDE.md, on the same terms and for the same reasons as the
 # settings above: baked in the image, overwritten every boot, transient if the
@@ -43,56 +114,7 @@ install -o "$USERNAME" -g "$USERNAME" -m 0644 \
 # a CLAUDE.md sitting there is loaded as managed memory in its own right, which
 # put the same text in context twice. The extension is what keeps the baked copy
 # inert. See the Dockerfile comment and NOTES.md.
-install -o "$USERNAME" -g "$USERNAME" -m 0644 \
-    /etc/claude-code/CLAUDE.md.template \
-    "$CONFIG_DIR/CLAUDE.md"
-
-# ---------------------------------------------------------------------------
-# The MCP gateway  ->  the file /usr/local/bin/claude points --mcp-config at
-# ---------------------------------------------------------------------------
-# Written HERE rather than baked into the image because the address is discovered
-# at launch, and written to /etc rather than into $CONFIG_DIR because the config
-# volume persists: a gateway entry left there would outlive the launch that found
-# it, and would then name an address nothing serves. /etc is image layer, so this
-# file exists for exactly the life of the container that wrote it.
-#
-# ROOT-OWNED AND 0644. The agent can read it and cannot edit it, which is the same
-# footing as the status-line script — and, like that one, this is mistake-prevention
-# rather than containment (see claude-wrapper.sh on why that is enough here).
-#
-# `mcpServers` is Claude Code's own declarative form, and this is the only channel
-# that works for it: the same block in a settings file is silently ignored, with no
-# warning and no error (measured — NOTES.md).
-#
-# The key is `gateway`, so the agent sees `mcp__gateway__<server>__<tool>` and the
-# client renders a call as "Calling gateway". It names the SURFACE, not the system:
-# `dockade` there read as the whole system being invoked, when what is being called is
-# one governed door into it. The word is also the one the rest of the repo already
-# uses for this component (`tool-gateway`, `make logs-tg`), so it adds no vocabulary.
-# Held equal to the gateway's own `protocol.SERVER_NAME` by
-# tests/test_sandbox_wiring.py — a mismatch would be invisible, since both sides
-# would work and only the name in a transcript would be wrong.
-MCP_GATEWAY_CONFIG=/etc/claude-code/mcp-gateway.json
-# Removed first, unconditionally. The absence of this file is what tells the wrapper
-# there is no gateway, so a stale one from an earlier run of the same container is a
-# session pointed at an address that may no longer answer.
-rm -f "$MCP_GATEWAY_CONFIG"
-if [[ "${TOOL_GATEWAY_IP:-}" =~ ^[0-9.]+$ ]]; then
-    # BY ADDRESS. The gateway is triple-homed and `tool-gateway` resolves to whichever
-    # leg Docker's DNS returns; the launcher already resolved the one leg this sandbox
-    # may speak to, and passed it.
-    install -o root -g root -m 0644 /dev/stdin "$MCP_GATEWAY_CONFIG" <<EOF
-{
-  "mcpServers": {
-    "gateway": {
-      "type": "http",
-      "url": "http://${TOOL_GATEWAY_IP}:${TOOL_GATEWAY_PORT:-8100}/mcp"
-    }
-  }
-}
-EOF
-    echo "  MCP gateway -> http://${TOOL_GATEWAY_IP}:${TOOL_GATEWAY_PORT:-8100}/mcp"
-fi
+install -m 0644 /etc/claude-code/CLAUDE.md.template "$CONFIG_DIR/CLAUDE.md"
 
 # ---------------------------------------------------------------------------
 # Plugin marketplaces mounted at /marketplaces  ->  settings.json
@@ -108,9 +130,7 @@ fi
 # Generated here rather than by shelling out to `claude plugin marketplace add`,
 # for three reasons. The CLI would be a SECOND writer to the file this script
 # owns authoritatively, which is how "config always matches the repo" stops being
-# true. It would have to run as the sandbox user (this runs as root, before the
-# gosu drop), so it needs a gosu hop to avoid leaving root-owned files in
-# /config. And deriving the whole set from what is mounted, on every boot, means
+# true. And deriving the whole set from what is mounted, on every boot, means
 # removing a checkout on the host makes it disappear here — no stale entry to
 # clean up, and no state that outlives its source.
 #
@@ -207,7 +227,7 @@ if [[ "$mk_json" != '{}' || "$en_json" != '{}' ]]; then
         + (if ($mk | length) > 0 then {extraKnownMarketplaces: $mk} else {} end)
         + (if ($en | length) > 0 then {enabledPlugins: $en} else {} end)
     ' "$SETTINGS" > "$tmp"
-    install -o "$USERNAME" -g "$USERNAME" -m 0644 "$tmp" "$SETTINGS"
+    install -m 0644 "$tmp" "$SETTINGS"
     rm -f "$tmp"
 fi
 

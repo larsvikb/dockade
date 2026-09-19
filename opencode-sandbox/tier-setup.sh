@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 set -euo pipefail
 
-# Tier-2 (opencode) setup hook. Run as root by the shared entrypoint, before the
-# firewall is armed and before the drop to the non-root sandbox user.
+# Tier-2 (opencode) setup hook. Invoked as root by the shared entrypoint, before
+# the firewall is armed and before the drop to the non-root sandbox user — and it
+# hands itself to that user at once, because nothing here needs root: every write
+# lands in the config volume or the agent's home (see the entrypoint's contract).
 #
 # Materializes the opencode provider config pointing at the local inference
 # service. Same rationale as tier 1's hook: this is DECLARATIVE CONFIG OWNED BY
@@ -38,21 +40,25 @@ set -euo pipefail
 USERNAME=sandbox
 CONFIG_DIR="${SANDBOX_CONFIG_DIR:-/config}"
 
-# $CONFIG_DIR is a persistent volume the agent OWNS, so it can plant a symlink at
-# this path between boots. `install -d` — run here as root, before the firewall and
-# the privilege drop — FOLLOWS a symlink and chowns/chmods its target, turning an
-# agent-controlled config path into a privileged write/chown outside the volume.
-# Refuse a symlink (or any non-directory) first; a real directory from a previous
-# boot is kept. (The file `install` below replaces a symlink destination rather than
-# writing through it, so only the directory create needs this guard.)
+# Root has nothing to do here. Re-exec as the sandbox user before the first write,
+# so a symlink an agent planted in the shared volume — between boots, or from a
+# sibling sandbox while this one boots — can lead only to places the agent could
+# already write. The check-then-act guard this replaces narrowed that window as
+# root; running as the user removes it.
+if [ "$(id -u)" -eq 0 ]; then
+    exec gosu "$USERNAME" "$0" "$@"
+fi
+
+# $CONFIG_DIR is a persistent volume the agent owns. A symlink or a stray file at
+# this path is not the directory the installs below expect, so clear it and create
+# a real one; a real directory from a previous boot is kept. Hygiene now, not a
+# privilege matter: whatever a link points at, this user could write there anyway.
 if [ -L "$CONFIG_DIR/opencode" ] || \
    { [ -e "$CONFIG_DIR/opencode" ] && [ ! -d "$CONFIG_DIR/opencode" ]; }; then
     rm -f "$CONFIG_DIR/opencode"
 fi
-install -d -o "$USERNAME" -g "$USERNAME" -m 0755 "$CONFIG_DIR/opencode"
-install -o "$USERNAME" -g "$USERNAME" -m 0644 \
-    /etc/opencode/opencode.json \
-    "$CONFIG_DIR/opencode/opencode.json"
+install -d -m 0755 "$CONFIG_DIR/opencode"
+install -m 0644 /etc/opencode/opencode.json "$CONFIG_DIR/opencode/opencode.json"
 
 # AGENTS.md beside it, on the same terms. This is opencode's instruction file:
 # the session path (opencode/src/session/instruction.ts) reads
@@ -73,13 +79,10 @@ install -o "$USERNAME" -g "$USERNAME" -m 0644 \
 # has neither a proxy nor egress. Shorter, too, and for a reason beyond taste — the
 # window here is 32k with a base prompt already taking a quarter of it, so
 # instructions cost roughly thirty times what they cost in tier 1.
-install -o "$USERNAME" -g "$USERNAME" -m 0644 \
-    /etc/opencode/AGENTS.md.template \
-    "$CONFIG_DIR/opencode/AGENTS.md"
+install -m 0644 /etc/opencode/AGENTS.md.template "$CONFIG_DIR/opencode/AGENTS.md"
 
 # opencode reads its user-scope config from ~/.config/opencode (the XDG default;
 # nothing here overrides it). Symlink that at the persistent volume so session
 # state survives container churn, and so the config above is the one it loads.
-install -d -o "$USERNAME" -g "$USERNAME" -m 0755 "/home/$USERNAME/.config"
-ln -sfn "$CONFIG_DIR/opencode" "/home/$USERNAME/.config/opencode"
-chown -h "$USERNAME:$USERNAME" "/home/$USERNAME/.config/opencode"
+install -d -m 0755 "$HOME/.config"
+ln -sfn "$CONFIG_DIR/opencode" "$HOME/.config/opencode"

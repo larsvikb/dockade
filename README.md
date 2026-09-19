@@ -163,7 +163,7 @@ enabled in v1; details in [`DESIGN.md`](DESIGN.md).
 
 **Verifying the boundary:** run `boundary-check.sh` inside the container (as the
 agent) for an on-demand pass/fail check of the invariants — arbitrary egress
-blocked, IPv6 blocked, the control plane unreachable on either of its internal
+blocked, IPv6 blocked, the control plane unreachable on any of its internal
 networks, agent holds no capabilities, `no_new_privs` set, no Docker socket, plus a
 set of attempts to abuse the egress proxy (non-443 CONNECT, SNI fronting, relaying
 to a control network by name, by IP and by IPv4-mapped IPv6, relaying to the
@@ -253,7 +253,8 @@ dockade/
     policy.py               #   what a rule pattern matches; peer address -> client
                             #   class; (host, class) -> allow/deny/hold
     holds.py                #   the in-process registry a held request blocks on
-    ingest.py               #   drains the proxy's locally-decided audit lines in
+    inventory.py            #   what each server exposes, as the gateway last reported it
+    ingest.py               #   drains the proxy's and the gateway's audit streams in
     requirements.txt        #   pinned deps (fastapi, uvicorn)
   control-plane-ui/         # UI FRONTEND — serves the UI + reverse-proxies the API
     Dockerfile              #   FastAPI + httpx; control-ui-net (loopback) + control-net
@@ -269,6 +270,7 @@ dockade/
     surface.py              #   which tools the agent is shown, and under what name
     execute.py              #   authorize, then run: the only thing here that calls a server
     discovery.py            #   dials each server, reconciles against policy, pushes the inventory
+    outcomes.py             #   how each call ended — the gateway's own audit stream
     requirements.txt        #   pinned deps, held equal to the control plane's
   policies/                 # seed policy config (loaded into the control plane)
     egress-allowlist.txt    #   default-deny seed for the control plane's egress policy store
@@ -284,6 +286,7 @@ dockade/
   claude-sandbox/           # TIER 1 image — Claude, governed egress
     Dockerfile
     tier-setup.sh           # tier hook: materialize Claude user settings
+    claude-wrapper.sh       # the `claude` on PATH: adds --mcp-config when a gateway was found
     user-settings.json      # baked template, materialized to /config each boot
     statusline.sh           # sandbox-indicator status line
     dotfiles/               # .bashrc.tier — tier-1 shell hook (claude-yolo alias)
@@ -291,6 +294,7 @@ dockade/
     Dockerfile
     tier-setup.sh           # tier hook: materialize the opencode provider config
     opencode.json           # points opencode at the local `llm` service
+    AGENTS.md               # tier-2 capability facts, materialized to the config dir
     dotfiles/               # .bashrc.tier — tier-2 shell hook (oc alias, distinct prompt)
   tests/                    # dependency-free unit tests for the governance logic (make check)
   models/                   # GGUF weights for the local LLM (gitignored)

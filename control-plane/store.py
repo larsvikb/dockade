@@ -243,7 +243,7 @@ def _step_5_decision_to_kind(conn: sqlite3.Connection) -> None:
     columns = _columns(conn, "audit")
     if "decision" in columns and "kind" not in columns:
         conn.execute("ALTER TABLE audit RENAME COLUMN decision TO kind")
-        print("control-plane: renamed audit.decision to audit.kind (four of its "
+        print("control-plane: renamed audit.decision to audit.kind (several of its "
               "values were never decisions)", flush=True)
 
 
@@ -411,7 +411,7 @@ def _init_db() -> None:
                 id       INTEGER PRIMARY KEY,
                 ts       REAL NOT NULL,
                 -- WHAT KIND of thing this row records, not what was decided: four
-                -- of its eight values are not decisions anyone made (`observe` is a
+                -- of its values are not decisions anyone made (`observe` is a
                 -- server's claim about itself, `outcome` is how a call ended, and
                 -- create/edit/revoke are configuration changes). The vocabulary lives
                 -- in `audit.KINDS`.

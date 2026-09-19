@@ -20,8 +20,8 @@ Everything else here is mechanics.
 
 You need **Docker** and **GNU make**. That is enough to run the project.
 
-For the full gate you also want `shellcheck`, `hadolint`, `ruff`, `yamllint`, `node`
-and `python3`. You do not have to install them: every linter stage **skips** when its
+For the full gate you also want `shellcheck`, `hadolint`, `ruff`, `yamllint`, `node`,
+`git` and `python3`. You do not have to install them: every linter stage **skips** when its
 tool is absent, so a partial toolchain still runs the checks it can. CI installs all
 of them and refuses to skip (see below).
 
@@ -55,7 +55,7 @@ not about your code being wrong:
   executable *in the git index* (not just on disk — a bind mount with
   `core.fileMode=false` hides that, and it has shipped a broken clone before), and the
   sandbox must have no path to the control plane.
-- **`verify-build`** — builds all five images. Skipped automatically when Docker is
+- **`verify-build`** — builds every image. Skipped automatically when Docker is
   unavailable, so a green local run does not always mean CI will agree.
 - **`lint` reads the git index too, so stage a new file before you trust it.** Ruff's
   file list is `git ls-files 'tests/*.py'`, which means a new test you have not
@@ -123,7 +123,7 @@ failure it warns about.
 - **New source file?** Add an `SPDX-License-Identifier: Apache-2.0` header in the
   first three lines, so licence scanners never have to parse `LICENSE`.
   `make consistency` enforces this for the file types where it applies — scripts,
-  Python, JS, HTML, Dockerfiles, the compose file, the Makefile and the workflow. Not for JSON,
+  Python, JS, HTML, Dockerfiles, both compose files, the Makefile and the workflow. Not for JSON,
   which has no comment syntax, nor for markdown, linter configs or the baked
   dotfiles, which are settings and data rather than works.
 - **Adding a recurring workflow?** Make it a skill or a `make` target rather than a

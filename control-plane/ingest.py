@@ -162,7 +162,7 @@ def _egress_row(line: bytes) -> dict | None:
     # rows. It is derived at INGEST, seconds behind the event, not at read time.
     # `decision` on the WIRE, `kind` in the column, and neither is a missed rename:
     # the proxy writes decisions and that is what its line says, while the column holds
-    # seven kinds of row of which only some are decisions.
+    # several kinds of row (audit.KINDS) of which only some are decisions.
     return {"ts": ts, "kind": _ingest_field(rec.get("decision")),
             "stage": _ingest_field(rec.get("stage")),
             "host": _ingest_field(rec.get("host")), "port": port,

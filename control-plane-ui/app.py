@@ -19,7 +19,7 @@ backend directly).
 
 BUT it is not indifferent to WHO is calling, because it publishes the one API that
 can grant egress: `POST /approvals/{id}/resolve` is self-approval if reached. It
-therefore enforces three cheap, structural guards (`_guard` below, plus the relay
+therefore enforces four cheap, structural guards (`_guard` below, plus the relay
 allowlist):
 
   1. **Host allowlist** — closes DNS REBINDING, which is the vector that actually

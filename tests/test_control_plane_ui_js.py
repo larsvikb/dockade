@@ -72,7 +72,8 @@ const missing = ["lampState", "backoffDelay", "diffPending", "shouldSweep",
                  "leaseDomain", "groupLeases", "shortActor",
                  "timeWindow", "filterActive", "auditQuery", "eventRow",
                  "historyPager", "renderableHolds",
-                 "toolRemaining", "payloadDisclosure", "toolOutcomeMessage",
+                 "toolRemaining", "payloadDisclosure", "payloadHazards",
+                 "escapePayload", "toolOutcomeMessage",
                  "cardSubject", "approvalNotices", "shouldNotify", "notifyButton",
                  "fmtTime", "fmtStamp", "fmtInstant",
                  "serverDescriptor", "serverPreview", "serverEditBody",
@@ -196,6 +197,15 @@ console.log(JSON.stringify({
     fold: m.PAYLOAD_FOLD_BYTES,
     // Short payloads are readable without a click; long ones fold so one card cannot
     // push every other pending decision off the screen. Neither truncates.
+    hazards_clean: m.payloadHazards('{"owner":"octo","repo":"hello"}'),
+    // U+202E RIGHT-TO-LEFT OVERRIDE inside a value: the browser draws the rest of the
+    // line backwards while the bytes stay put.
+    hazards_bidi: m.payloadHazards('{"repo":"safe\u202eevil"}'),
+    // U+0430 CYRILLIC SMALL LETTER A for the Latin one: visible, and identical.
+    hazards_homoglyph: m.payloadHazards('{"owner":"\u0430pple"}'),
+    // Astral: JSON writes a surrogate pair, and so must the escaped form.
+    hazards_astral: m.payloadHazards('{"title":"\ud83d\ude00"}'),
+    hazards_missing: m.payloadHazards(undefined),
     short: m.payloadDisclosure('{"a":1}'),
     long: m.payloadDisclosure("x".repeat(m.PAYLOAD_FOLD_BYTES + 1)),
     at_fold: m.payloadDisclosure("x".repeat(m.PAYLOAD_FOLD_BYTES)).open,
@@ -3882,3 +3892,52 @@ class InlineScriptTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipIf(not _NODE and not _STRICT,
+                 "node is not installed — skipping app.js unit tests")
+class PayloadHazardTests(PageScriptTests):
+    """A payload the eye cannot read correctly is flagged, and shown escaped first.
+
+    The arguments are agent-authored and land in front of the approver verbatim
+    (``holds._canonical_args`` writes them with ``ensure_ascii=False``). A U+202E in a
+    value visually reorders the JSON the operator reads; U+0430 CYRILLIC SMALL LETTER
+    A in `owner` is indistinguishable from the Latin one. The egress card is safe here because the
+    proxy A-labels hostnames; the tool card had nothing."""
+
+    def test_a_plain_payload_is_not_flagged_and_not_changed(self):
+        clean = self.probe["tool"]["hazards_clean"]
+        self.assertFalse(clean["flagged"])
+        self.assertEqual(clean["escaped"], '{"owner":"octo","repo":"hello"}')
+        self.assertEqual(clean["note"], "")
+
+    def test_a_bidi_override_is_counted_as_invisible_and_spelled_out(self):
+        bidi = self.probe["tool"]["hazards_bidi"]
+        self.assertTrue(bidi["flagged"])
+        self.assertEqual((bidi["invisible"], bidi["nonAscii"]), (1, 1))
+        self.assertEqual(bidi["escaped"], '{"repo":"safe\\u202eevil"}')
+        self.assertIn("1 invisible or direction-changing character", bidi["note"])
+        self.assertIn("what you read may not be what runs", bidi["note"])
+
+    def test_a_homoglyph_is_flagged_as_non_ascii_but_not_invisible(self):
+        h = self.probe["tool"]["hazards_homoglyph"]
+        self.assertTrue(h["flagged"])
+        self.assertEqual((h["invisible"], h["nonAscii"]), (0, 1))
+        self.assertEqual(h["escaped"], '{"owner":"\\u0430pple"}')
+        self.assertIn("1 non-ASCII character", h["note"])
+
+    def test_an_astral_character_escapes_to_the_surrogate_pair_json_writes(self):
+        self.assertEqual(self.probe["tool"]["hazards_astral"]["escaped"],
+                         '{"title":"\\ud83d\\ude00"}')
+
+    def test_a_missing_payload_is_not_flagged(self):
+        self.assertFalse(self.probe["tool"]["hazards_missing"]["flagged"])
+
+    def test_the_card_shows_the_escaped_form_first_and_the_raw_on_request(self):
+        # Source-level, like the other DOM assertions in this file: the flagged card
+        # sets `pre` to the escaped text, and the only path back to raw is the toggle.
+        src = APP_JS.read_text()
+        self.assertRegex(src, r"pre\.textContent = hazards\.flagged \? hazards\.escaped : raw")
+        self.assertRegex(src, r"box\.checked \? hazards\.escaped : raw")
+        self.assertRegex(src, r"details\.open = disclosure\.open \|\| hazards\.flagged")
+

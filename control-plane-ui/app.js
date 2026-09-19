@@ -91,6 +91,61 @@ function payloadDisclosure(argsJson) {
            summary: `arguments · ${bytes} bytes` };
 }
 
+// Characters that render as nothing, or as something else. `Cf` is the format class —
+// the bidi overrides and isolates (U+202E, U+2066..2069), zero-width joiners, the BOM —
+// and `Cc`/`Zl`/`Zp` are raw controls and line separators, none of which the canonical
+// JSON form ever contains legitimately (json.dumps escapes controls and uses no
+// whitespace). Any one of them in a payload means the text on screen is not the text
+// that runs: a single U+202E makes the browser draw the rest of the line backwards
+// while the bytes stay exactly as they are — the reordering DESIGN warns a view must
+// never do, performed by the renderer rather than by a prettifier.
+const INVISIBLE_RE = /[\p{Cf}\p{Cc}\p{Zl}\p{Zp}]/gu;
+// Everything outside printable ASCII, the invisible set included. Counted rather than
+// classified: U+0430 CYRILLIC SMALL LETTER A in an `owner` field is indistinguishable
+// from the Latin one on screen, and no confusables table is needed to say "this is not the plain text it
+// looks like". The count is what tells an operator whether escaped form is worth the
+// read.
+const NON_ASCII_RE = /[^\x20-\x7E]/gu;
+
+// JSON's own escaping applied to a string that already IS JSON: every code point
+// outside printable ASCII becomes `\uXXXX`, astral ones as the surrogate pair JSON
+// would write. Lossless and byte-for-byte reversible — this is the form
+// `json.dumps(ensure_ascii=True)` would have produced — so showing it is the opposite
+// of the unescaping the payload rule forbids. Nothing is dropped, summarized or
+// reordered; what changes is that an override is spelled out where it sits instead
+// of acting on the text around it.
+function escapePayload(text) {
+  return text.replace(NON_ASCII_RE, (ch) => {
+    const code = ch.codePointAt(0);
+    if (code <= 0xFFFF) return "\\u" + code.toString(16).padStart(4, "0");
+    const hi = 0xD800 + ((code - 0x10000) >> 10);
+    const lo = 0xDC00 + ((code - 0x10000) & 0x3FF);
+    return "\\u" + hi.toString(16) + "\\u" + lo.toString(16);
+  });
+}
+
+// What the card has to say before the operator reads the arguments. `flagged` when
+// any character could make the visible text differ from the real one; `escaped` is
+// then the form the card shows FIRST, with the raw text one click away rather than
+// the reverse — a bidi override in the raw form can hide the very thing the note is
+// warning about. Counted by code point, not by byte, since it is characters the eye
+// misses.
+function payloadHazards(argsJson) {
+  const text = typeof argsJson === "string" ? argsJson : "";
+  const invisible = (text.match(INVISIBLE_RE) || []).length;
+  const nonAscii = (text.match(NON_ASCII_RE) || []).length;
+  const flagged = nonAscii > 0;
+  const parts = [];
+  if (invisible) parts.push(`${invisible} invisible or direction-changing`);
+  if (nonAscii - invisible) parts.push(`${nonAscii - invisible} non-ASCII`);
+  const note = flagged
+    ? `${parts.join(" and ")} character${nonAscii === 1 ? "" : "s"} in the arguments — `
+      + "what you read may not be what runs. Shown escaped; untick to see the raw text."
+    : "";
+  return { flagged, invisible, nonAscii, note,
+           escaped: flagged ? escapePayload(text) : text };
+}
+
 // What a decided tool ask says on the card. "Allowed" is NOT "ran": the gateway
 // executes on resumption, when the agent comes back and claims the approval, so a
 // message reading like a completed action would misreport the one property that keeps
@@ -1952,14 +2007,36 @@ function start() {
     // approved: the tool name says what KIND of act it is and only the arguments say
     // what it does to which repository.
     const disclosure = payloadDisclosure(a.args_json);
+    const hazards = payloadHazards(a.args_json);
     const details = document.createElement("details");
     details.className = "payload";
-    details.open = disclosure.open;
+    // A flagged payload starts OPEN whatever its size: the note below is only worth
+    // anything beside the text it is about.
+    details.open = disclosure.open || hazards.flagged;
     const summary = document.createElement("summary");
     summary.textContent = disclosure.summary;
     const pre = document.createElement("pre");
-    pre.textContent = typeof a.args_json === "string" ? a.args_json : "";
-    details.append(summary, pre);
+    const raw = typeof a.args_json === "string" ? a.args_json : "";
+    pre.textContent = hazards.flagged ? hazards.escaped : raw;
+    details.append(summary);
+    if (hazards.flagged) {
+      // Escaped FIRST, raw on request — see payloadHazards for why not the reverse.
+      const hazard = document.createElement("div");
+      hazard.className = "hazard";
+      const note = document.createElement("span");
+      note.textContent = hazards.note;
+      const toggle = document.createElement("label");
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.checked = true;
+      box.addEventListener("change", () => {
+        pre.textContent = box.checked ? hazards.escaped : raw;
+      });
+      toggle.append(box, document.createTextNode(" escaped"));
+      hazard.append(note, toggle);
+      details.append(hazard);
+    }
+    details.append(pre);
 
     const cd = document.createElement("div");
     cd.className = "countdown";
@@ -4046,5 +4123,6 @@ if (typeof module !== "undefined" && module.exports) {
     RECONNECT_MIN_MS, RECONNECT_MAX_MS, STALE_MAX_MS, COUNTDOWN_URGENT_S,
     DWELL_MS, SATURATION_RECENT_MS, SATURATION_WARN_FRAC,
     RENDERABLE_KINDS, PAYLOAD_FOLD_BYTES,
+    payloadHazards, escapePayload,
   };
 }

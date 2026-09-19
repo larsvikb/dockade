@@ -2050,6 +2050,39 @@ class ProvenanceTests(_CPTestCase):
         self.assertTrue(any("standing rule written" in r for r in reasons),
                         f"persist not distinguishable in audit reasons: {reasons}")
 
+    def test_audit_reason_names_the_pattern_a_persist_wrote(self):
+        # "allow api.example.co.uk" and "allow .co.uk" are the same click and very
+        # different policy. The released waiter's row carried the HOST and the words
+        # "standing rule written", so a broad wildcard found in the rules view months
+        # later had no row saying which card, click or breadth choice produced it.
+        # The pattern is stored on the approval and read back into the reason.
+        saved = cp.holds.HOLD_TIMEOUT
+        cp.holds.HOLD_TIMEOUT = 5
+        try:
+            t, result, approval_id = HoldHandshakeTests._authorize_in_thread(
+                self, "api.persisted.example.com")
+            _resolve(approval_id, "allow_persist", pattern=".example.com")
+            t.join(2)
+        finally:
+            cp.holds.HOLD_TIMEOUT = saved
+        self.assertEqual(result["resp"].decision, "allow")
+        reasons = [c.kwargs.get("reason", "") for c in cp.store._audit.call_args_list]
+        self.assertTrue(
+            any("standing rule written: .example.com" in r for r in reasons),
+            f"pattern missing from audit reasons: {reasons}")
+        with cp.store._connect() as conn:
+            row = conn.execute("SELECT mode, pattern FROM approvals WHERE id=?",
+                               (approval_id,)).fetchone()
+        self.assertEqual((row["mode"], row["pattern"]),
+                         ("persist", ".example.com"))
+
+    def test_a_once_or_lease_decision_stores_no_pattern(self):
+        _hold("once.example.com", approval_id="once-1")
+        _resolve("once-1", "allow_once")
+        with cp.store._connect() as conn:
+            self.assertIsNone(conn.execute(
+                "SELECT pattern FROM approvals WHERE id='once-1'").fetchone()["pattern"])
+
     def test_audit_reason_marks_a_one_off_as_one_off(self):
         saved = cp.holds.HOLD_TIMEOUT
         cp.holds.HOLD_TIMEOUT = 5
@@ -4026,6 +4059,7 @@ class FreshSchemaTests(_FreshStoreTestCase):
         with cp.store._connect() as conn:
             cols = {r["name"] for r in conn.execute("PRAGMA table_info(approvals)")}
         self.assertIn("resolved_by", cols)
+        self.assertIn("pattern", cols)
         cp.store._init_db()          # idempotent: a second run must not fail
 
     def test_new_store_has_the_tool_policy_table(self):
@@ -4608,6 +4642,22 @@ class SchemaVersionTests(_FreshStoreTestCase):
             row = conn.execute("SELECT kind, host, reason FROM audit "
                                "WHERE host='evil.example'").fetchone()
         self.assertEqual((row["kind"], row["reason"]), ("hold", "held for a human"))
+
+    def test_v6_adds_the_persisted_pattern_to_approvals(self):
+        # A store from before the column, brought forward: the column exists, old
+        # rows read NULL, and `_decision_scope` on such a row still says a rule was
+        # written without inventing which.
+        self._old_store("version-pattern.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            conn.execute("INSERT INTO approvals(id, ts, host, status, mode) "
+                         "VALUES ('old-persist', 1.0, 'old.example', 'allowed', "
+                         "'persist')")
+            conn.commit()
+            row = conn.execute("SELECT status, mode, resolved_by, pattern FROM "
+                               "approvals WHERE id='old-persist'").fetchone()
+        self.assertIsNone(row["pattern"])
+        self.assertEqual(cp._decision_scope(row), "standing rule written")
 
     def test_a_store_already_renamed_is_left_alone(self):
         # `ALTER TABLE ... RENAME COLUMN` raises rather than no-ops if it runs twice.

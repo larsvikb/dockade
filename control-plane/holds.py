@@ -545,30 +545,58 @@ def _expire_tool_asks() -> int:
     crown-jewel store every time — the file the governance path is reading, where a
     lock contended at the wrong moment becomes a fail-closed deny. The check makes the
     common case a WAL read. It is racy in the harmless direction: a row falling due
-    between the two statements is expired on the next read instead of this one."""
+    between the two statements is expired on the next read instead of this one.
+
+    Every row retired here gets an AUDIT ROW, as the egress expiry does through its
+    released waiter (a `deny` with "no decision within hold timeout"). It did not,
+    and the trail could not then tell a still-pending ask from one that had lapsed,
+    nor see that a grant a human had clicked was never redeemed — a state change on
+    the approval surface with no record, against "everything consequential is
+    audited". Retired ROW BY ROW with the same conditional predicate, so the row
+    that is audited is exactly the row this call changed: a sibling process that
+    expired it first leaves nothing for this one to say."""
     now = time.time()
     grant_cutoff = now - TOOL_GRANT_TIMEOUT
     with store._connect() as conn:
         # One probe for both windows, so the nothing-to-do case stays a single read.
         due = conn.execute(
-            "SELECT 1 FROM tool_approvals WHERE (status='pending' AND deadline <= ?) "
+            "SELECT id, server, tool, client, status FROM tool_approvals "
+            "WHERE (status='pending' AND deadline <= ?) "
             "OR (status='allowed' AND claimed_at IS NULL "
-            "    AND resolved_at IS NOT NULL AND resolved_at <= ?) LIMIT 1",
-            (now, grant_cutoff)).fetchone()
-        if due is None:
+            "    AND resolved_at IS NOT NULL AND resolved_at <= ?)",
+            (now, grant_cutoff)).fetchall()
+        if not due:
             return 0
-        retired = conn.execute(
-            "UPDATE tool_approvals SET status='expired', resolved_at=? "
-            "WHERE status='pending' AND deadline <= ?", (now, now)).rowcount
-        # Separate statement rather than one OR'd UPDATE, because the SET clauses
-        # differ: see the ``resolved_at`` paragraph above.
-        retired += conn.execute(
-            "UPDATE tool_approvals SET status='expired' "
-            "WHERE status='allowed' AND claimed_at IS NULL "
-            "AND resolved_at IS NOT NULL AND resolved_at <= ?",
-            (grant_cutoff,)).rowcount
+        retired = []
+        for row in due:
+            if row["status"] == "pending":
+                changed = conn.execute(
+                    "UPDATE tool_approvals SET status='expired', resolved_at=? "
+                    "WHERE id=? AND status='pending' AND deadline <= ?",
+                    (now, row["id"], now)).rowcount
+                why = (f"no decision within the tool hold window "
+                       f"({policy._short_duration(TOOL_HOLD_TIMEOUT)}) — default-deny; "
+                       f"{row['tool']} on {row['server']} will not run")
+            else:
+                # Separate statement rather than one OR'd UPDATE, because the SET
+                # clauses differ: see the ``resolved_at`` paragraph above.
+                changed = conn.execute(
+                    "UPDATE tool_approvals SET status='expired' "
+                    "WHERE id=? AND status='allowed' AND claimed_at IS NULL "
+                    "AND resolved_at IS NOT NULL AND resolved_at <= ?",
+                    (row["id"], grant_cutoff)).rowcount
+                why = (f"approved but never resumed within "
+                       f"{policy._short_duration(TOOL_GRANT_TIMEOUT)} — grant lapsed; "
+                       f"{row['tool']} on {row['server']} will not run")
+            if changed:
+                retired.append((row, why))
         conn.commit()
-        return retired
+    for row, why in retired:
+        store._audit("deny", stage="tool-ask", client=row["client"],
+                     client_class=policy._client_class(row["client"]),
+                     server=row["server"], tool=row["tool"], approval_id=row["id"],
+                     reason=why)
+    return len(retired)
 
 
 def _register_tool_ask(server: str, tool: str, args: object,

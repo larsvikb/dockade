@@ -636,6 +636,90 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class ResumeWaitTests(ExecutionTestCase):
+    """`resume_tool_call` may wait for the human, and waiting changes nothing else.
+
+    The wait is a tool call that takes a while, which is the only mechanism every MCP
+    client already has — no backgrounding, no server-initiated request, nothing to
+    negotiate. So the same code path answers a client that can wait and one that
+    cannot, and WHICH happens is the agent's choice: only the agent knows whether it
+    has other work while a human decides.
+
+    Governance is untouched by all of it. Every assertion below is about latency and
+    about the number of times a free question gets asked."""
+
+    ID = "a" * 32
+
+    def setUp(self):
+        super().setUp()
+        # Real sleeps, shrunk: the loop's arithmetic is what is under test, and a
+        # faked clock would test the fake. Rebound on the module that READS them.
+        self.execute.RESUME_POLL_INTERVAL = 0.01
+        self.execute.MAX_RESUME_WAIT = 0.2
+
+    def _answers(self, *sequence):
+        """Claim answers in order, the last one repeating."""
+        self.seen = []
+        remaining = list(sequence)
+
+        def ask_control(path, payload):
+            self.seen.append(path)
+            return remaining.pop(0) if len(remaining) > 1 else remaining[0]
+
+        self.execute._ask_control = ask_control
+
+    def test_no_wait_asks_once_and_returns_what_it_found(self):
+        self._answers({"ok": False, "status": "pending"})
+        result = self.execute.resume({"approval_id": self.ID}, "172.30.0.2")
+        self.assertEqual(len(self.seen), 1)
+        self.assertIn("Still waiting on a human", self.text(result))
+
+    def test_a_wait_stops_the_moment_the_human_answers(self):
+        self._answers({"ok": False, "status": "pending"},
+                      {"ok": False, "status": "pending"},
+                      {"ok": True, "server": "mcp-github", "tool": "get_issue",
+                       "args_json": '{"owner":"o"}'})
+        result = self.execute.resume(
+            {"approval_id": self.ID, "wait_seconds": 5}, "172.30.0.2")
+        # Ran, rather than reported — and it did not sit out the rest of the wait.
+        self.assertEqual(len(self.called), 1)
+        self.assertNotIn("Still waiting", self.text(result))
+        self.assertEqual(len(self.seen), 3)
+
+    def test_a_terminal_answer_ends_the_wait_immediately(self):
+        # A denial does not become an approval by being asked again, so waiting on
+        # one would be the loop spending a human's decision time on nothing.
+        self._answers({"ok": False, "terminal": True, "status": "denied"})
+        result = self.execute.resume(
+            {"approval_id": self.ID, "wait_seconds": 5}, "172.30.0.2")
+        self.assertEqual(len(self.seen), 1)
+        self.assertIn("A human refused this request", self.text(result))
+
+    def test_an_unanswered_wait_ends_in_exactly_the_no_wait_answer(self):
+        self._answers({"ok": False, "status": "pending"})
+        result = self.execute.resume(
+            {"approval_id": self.ID, "wait_seconds": 0.05}, "172.30.0.2")
+        self.assertGreater(len(self.seen), 1)
+        self.assertIn("Still waiting on a human", self.text(result))
+        self.assertIn("Waited 0.05s", self.text(result))
+        self.assertFalse(result["isError"])
+
+    def test_the_wait_is_clamped_to_the_servers_ceiling(self):
+        # The agent does not have to know the cap, so asking past it is not an error.
+        self.assertEqual(self.execute._resume_wait({"wait_seconds": 9999}), 0.2)
+        self.assertEqual(self.execute._resume_wait({"wait_seconds": -5}), 0.0)
+
+    def test_an_unreadable_wait_means_do_not_wait(self):
+        # The behaviour of every caller that never heard of the parameter. It buys
+        # latency and decides nothing, so refusing a resumption over it would cost a
+        # round trip to say something the agent can do nothing with.
+        for value in ("45", None, True, [45], {}):
+            with self.subTest(value=value):
+                self.assertEqual(self.execute._resume_wait({"wait_seconds": value}), 0.0)
+        self.assertEqual(self.execute._resume_wait({}), 0.0)
+        self.assertEqual(self.execute._resume_wait("not a dict"), 0.0)
+
+
 class NonCanonicalNameTests(unittest.TestCase):
     """A name the control plane would normalise never reaches it."""
 

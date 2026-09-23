@@ -14,11 +14,13 @@ here. It is written down so you spend no turns discovering it.
   under `mcp__gateway__` are brokered by a gateway that asks policy before every
   call. Three answers: it runs, it is refused, or it is **held for approval** — and
   a held call comes back immediately as a *result* saying so, carrying an id. That
-  is not a failure and not a hang: do other work, then finish it with
-  `resume_tool_call` and the same id. **Re-calling it while the answer is still
-  pending is free** — nothing runs, the id stays good — so POLL for the answer rather
-  than waiting to be told one arrived; nothing can push it to you. Back off between
-  tries and give up after a few: the human's window is an hour, and a human who has
+  is not a failure and not a hang: finish it with `resume_tool_call` and the same id.
+  **Re-calling it while the answer is still pending is free** — nothing runs, the id
+  stays good. Nothing can push the answer to you, so you choose how to collect it:
+  pass `wait_seconds` and the call blocks until the human answers (capped, and well
+  inside any timeout), or do other work and come back with a zero wait. Prefer the
+  wait when you have nothing else to do and the zero wait when you have. Either way
+  give up after a few tries: the human's window is an hour, and a human who has
   stepped away is not helped by spinning. Calling the TOOL again is the different
   thing, and raises a **second** question for the same person. A tool whose description begins
   "Approval required" is one of these, so you can plan around it rather than

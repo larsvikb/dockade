@@ -1981,7 +1981,7 @@ approvals view is on screen, and closes a notice when its hold leaves the queue 
 it left. The rules are `approvalNotices` / `shouldNotify` in `app.js`. Its one
 environmental dependency: a secure context, which `127.0.0.1` satisfies over plain HTTP
 and another origin would not — so the button says so rather than going quiet. A real audit
-browser (filter/search/history) is step 2c; this is the navigation it will extend.
+browser (filter/search/history) would extend this navigation rather than replace it.
 
 **Standing policy is visible in the UI (`GET /api/egress/rules`).** The UI showed
 pending approvals and recent decisions but never the **rules** — the thing that
@@ -2932,10 +2932,10 @@ containment boundary and nothing about the threat model rests on them — the
 boundary is capability (network segmentation, dropped caps, non-root, no
 control-plane route).
 
-The sandbox numbers are sized for the **workload, not the agent**: a measured
-tier-1 session (linters, a 68-test suite, ~25 compiles) peaked at 353 MB, so the
-agent process is never what needs the headroom — `tsc`, `jest`, `cargo` or a
-language server on a large tree is. Hence a modest default plus a per-workspace
+The sandbox numbers are sized for the **workload, not the agent**: a measured tier-1
+session peaked well under the cap (figures in `NOTES.md`), so the agent process is
+never what needs the headroom — `tsc`, `jest`, `cargo` or a language server on a
+large tree is. Hence a modest default plus a per-workspace
 override, rather than carrying the worst case for every launch. Tier 2 is lower
 still on the merits: opencode is a thin client (inference lives in the `llm`
 service) and the tier has no egress, so `npm install` / `pip install` cannot fetch
@@ -3080,24 +3080,17 @@ flag converts one into either a loud failure or a bounded cost. Measurements and
   an agent means evicting its system prompt and tool definitions mid-conversation.
   Presents as the model becoming inexplicably confused rather than as an error.
 - **`-c 32768`, and the client's `limit.context` must be materially SMALLER** — a ratio
-  guarded by `make consistency` (`CTX_HEADROOM`). 8k is not merely tight but unusable —
-  opencode's base prompt exceeds it before the first user turn. The upper bound is **not**
-  the memory pool, which has room to spare; it is that cold-load time grows with `-c`
-  until the load outruns the healthcheck's `start_period`, at which point the service
-  works and reports unhealthy and the tier-2 launcher refuses to run in front of it. So
-  the two knobs move together, and the constraint is a *liveness* one rather than a
-  capacity one (figures in `NOTES.md`). Avoid `-c 0`, which would size the allocation
-  from the model's native window.
-
-  The headroom is the part that is not obvious, and the repo learned it by getting it
-  wrong: the guard originally required the two numbers to be **equal**, on the reasoning
-  that a client told the true window would respect it. A client told the true window
-  overshoots it anyway (measurements in `NOTES.md`), because its token accounting is its
-  own and tool output arrives after the turn is budgeted. So the invariant that survives
-  contact is *the server's window exceeds what the client believes*, by enough to absorb
-  the client's undercount — and it is free, because `-c` sets the KV allocation and does
-  not move. **A cross-component agreement check is only as good as its direction**; two
-  numbers matching is not the same as two components agreeing.
+  guarded by `make consistency` (`CTX_HEADROOM`). The invariant is DIRECTIONAL: *the
+  server's window exceeds what the client believes*, by enough to absorb the client's
+  undercount. Equality was the original guard and is the wrong one — **a
+  cross-component agreement check is only as good as its direction**, and two numbers
+  matching is not the same as two components agreeing (the overshoots that showed it,
+  and what the base prompt costs before the first turn, are in `NOTES.md`). The ceiling
+  on `-c` is not the memory pool but LIVENESS: cold-load time grows with it until the
+  load outruns the healthcheck's `start_period`, at which point the service works,
+  reports unhealthy, and the tier-2 launcher refuses to run in front of it — so those
+  two knobs move together across `docker-compose.yml` and `run-opencode-sandbox.sh`.
+  The rest of the sizing sits beside the flag in compose.
 - **One model at a time**, and `temperature: 0` for extraction/classification.
 
 Two properties worth carrying in the reader's head, because they shape task design more
@@ -3329,7 +3322,7 @@ saying so — the same "silently checks nothing" failure the `LAUNCHERS` glob gu
 closed against. `DOCKADE_REQUIRE_TOOLS=1` turns every such skip into a failure. It lives
 in the **Makefile, not the workflow YAML**, because the Makefile already owns
 what-must-be-true and a requirement encoded only in CI is invisible to whoever runs the
-checks by hand. Verified in all four directions (docker, hadolint, node, all-present).
+checks by hand.
 
 **The tooling floats on purpose, so the workflow is built around that.** `ruff.toml`
 pins the rule *selection* and lets the binary drift; base images are pinned by tag, not
@@ -3363,13 +3356,12 @@ guard's comment in the `Makefile`, next to the code it constrains.
 **No Docker layer cache, and that is settled rather than deferred.** Caching on hosted
 runners needs `--cache-to/--cache-from type=gha` on the build, which `docker compose
 build` does not accept — so it would mean diverging CI from `make verify-build`, the
-property that makes CI reproducible locally. The measured cold build is **~2m 22s** (19s
-compose, 68s `claude-sandbox`, 54s `opencode-sandbox`), far below the 5–15 minutes
-estimated, so the divergence buys nothing. Image sizes from the same run: both sandbox
-tiers ~1.2GB, the three services 142–255MB. Worth knowing that **tier 2 is not the
-smaller image** despite being the thinner *tier* — "thin client" describes where
-inference runs and what capability it holds, not the toolchain both tiers inherit from
-`sandbox-common`.
+property that makes CI reproducible locally. The measured cold build came in far below
+the 5–15 minutes that would have justified the divergence, so it buys nothing (that
+figure and the image sizes from the same run are in `NOTES.md`). Worth knowing that
+**tier 2 is not the smaller image** despite being the thinner *tier* — "thin client"
+describes where inference runs and what capability it holds, not the toolchain both
+tiers inherit from `sandbox-common`.
 
 *Each of the incidents above is recorded blow-by-blow in the commit that fixed it, which
 is the copy that is dated and cannot drift. What is kept here is the resulting invariant.*

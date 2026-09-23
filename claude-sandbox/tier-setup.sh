@@ -57,9 +57,10 @@ if [ "$(id -u)" -eq 0 ]; then
     # session pointed at an address that may no longer answer.
     rm -f "$MCP_GATEWAY_CONFIG"
     if [[ "${TOOL_GATEWAY_IP:-}" =~ ^[0-9.]+$ ]]; then
-        # BY ADDRESS. The gateway is triple-homed and `tool-gateway` resolves to whichever
-        # leg Docker's DNS returns; the launcher already resolved the one leg this sandbox
-        # may speak to, and passed it.
+        # BY ADDRESS, and not because a name would resolve wrongly: the launcher had
+        # to resolve this leg anyway to arm the firewall's /32 grant, and reusing that
+        # value is what keeps the config and the grant on one address (the launcher
+        # says why).
         install -o root -g root -m 0644 /dev/stdin "$MCP_GATEWAY_CONFIG" <<EOF
 {
   "mcpServers": {

@@ -586,9 +586,11 @@ class GatewayPlacementTests(unittest.TestCase):
                     f"{svc} and tool-gateway both claim {addr} on mcp-net")
 
     def test_the_hand_probe_reaches_the_gateway_where_compose_deploys_it(self):
-        # `make gateway-tools` dials a literal address from a throwaway container,
-        # because the gateway is triple-homed and its NAME resolves to whichever leg
-        # Docker returns. A drift here does not fail loudly: the probe would report an
+        # `make gateway-tools` dials a literal address from a throwaway container on
+        # sandbox-net. The name would resolve to that same leg — embedded DNS answers
+        # only with the legs the querier shares — but a literal is what this test can
+        # hold against the deployed address. A drift here does not fail loudly: the
+        # probe would report an
         # unreachable gateway on a perfectly healthy deployment, which reads as a
         # broken surface rather than as a stale constant.
         makefile = (ROOT / "Makefile").read_text()
@@ -637,9 +639,10 @@ class GatewayPlacementTests(unittest.TestCase):
     def test_the_gateway_dials_the_control_planes_tool_leg_and_not_another(self):
         # The gateway reaches the control plane by ADDRESS while it reaches servers by
         # NAME, and the asymmetry is the property under test. A server is single-homed,
-        # so its name resolves to its one leg; the control plane has four, and three of
-        # them are networks this container must never speak to. `control-plane` would
-        # resolve to whichever Docker's DNS returned, so only an address names a leg.
+        # so its name resolves to its one leg; the control plane has three, two of them
+        # networks this container must never speak to. An address names the LEG rather
+        # than the container, so it stays correct if a second shared network is ever
+        # added — and it is what this test can hold against the bind.
         #
         # Held against CONTROL_TOOL_BIND rather than against a literal: that variable
         # is what the control plane actually binds, so this fails if either side moves

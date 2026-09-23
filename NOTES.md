@@ -398,6 +398,30 @@ reaches at all, by either route.
 113,844 bytes and still 55%. The result also declares `ttlMs: 0` and
 `cacheScope: "public"` — the server's own answer to whether its list may be cached is no.
 
+## What a sandbox session and a cold build actually cost
+
+Two sets of figures DESIGN.md used to carry inline, where they were both evidence for a
+decision and a number waiting to rot. The decisions they justify — a modest memory
+default plus a per-workspace override, and no Docker layer cache in CI — are in
+DESIGN.md; these are the measurements behind them, taken on the reference machine
+(15 GiB, WSL2).
+
+**A tier-1 session peaks nowhere near its cap.** A measured session — linters, a
+68-test project suite, ~25 compiles — peaked at **353 MB** against a 4g default. The
+agent process is not what needs the headroom; a `tsc`, `jest`, `cargo` or language
+server on a large tree is, which is why the cap is a launch-time override rather than a
+number sized for the worst case. Tier 2 is lower still on the merits: opencode is a
+thin client and the tier has no egress, so `npm install` / `pip install` cannot fetch,
+and its workload cannot grow the way tier 1's can.
+
+**The cold build is minutes, not tens of minutes.** ~**2m 22s** total with no cache: 19s
+for the compose services, 68s `claude-sandbox`, 54s `opencode-sandbox`. That is the
+number that settled the CI cache question — the estimate that would have justified
+diverging CI from `make verify-build` was 5–15 minutes. Image sizes from the same run:
+both sandbox tiers ~**1.2 GB**, the services **142–255 MB**. Both tiers are large for
+the same reason, and it is the toolchain they share from `sandbox-common` rather than
+anything about what either tier is allowed to do.
+
 ## Publishing a host port: the private range is the wrong instinct on WSL2
 
 Choosing a port for Docker to publish on the host, the principled-looking answer is

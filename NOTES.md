@@ -431,6 +431,57 @@ reaches at all, by either route.
 113,844 bytes and still 55%. The result also declares `ttlMs: 0` and
 `cacheScope: "public"` — the server's own answer to whether its list may be cached is no.
 
+## `mcp-github` v1.9.0 → v1.12.2: lockdown was never on, and what else moved
+
+Read from the upstream source and tool snapshots (`pkg/github/__toolsnaps__/`) at both
+tags, not measured against a running container.
+
+**`GITHUB_LOCKDOWN_MODE` was inert on v1.9.0.** In http mode the effective flag was
+`d.lockdownMode && ghcontext.IsLockdownMode(ctx)` (`pkg/github/dependencies.go`) — the
+server setting AND a per-request `X-MCP-Lockdown` header, which nothing in dockade sends.
+v1.10.0 (github/github-mcp-server#3112) made it `||`, so the server setting is an upper
+bound on its own. It is the same shape as the read-only flag through v0.31.0: set,
+documented, and doing nothing. The consequence of the bump is that lockdown turns ON —
+public-repo content from authors without push access is filtered from results.
+
+**Tool surface within `context,repos,issues,pull_requests`**, from the snapshots:
+
+- two new write tools in the snapshots: `update_issue_comment`, and
+  `delete_repository`. The latter completes only through a multi-round-trip
+  elicitation read from `req.Params.InputResponses`, which the gateway does not relay
+  (it sends `name` and `arguments`, nothing else), and needs the `delete_repo` scope —
+  and the running server does not list it at all (below);
+- `merge_pull_request` gains optional `expectedHeadSha` (GitHub rejects the merge if the
+  head moved); `issue_write` gains `parent_*` for atomic sub-issue creation;
+  `create_or_update_file` gains `allow_symlink_write`, and symlink writes now need it;
+- no dispatcher's `method` enum grew. `pull_request_read`, `issue_read`,
+  `pull_request_review_write` and `issue_write` keep the operation sets listed above.
+
+**With `GITHUB_MCP_TOOLSETS=all` and `GITHUB_MCP_READ_ONLY=0`** — measured with `make
+mcp-tools SERVER=github` on v1.12.2: 90 tools, 34 not read-only. Against the snapshots:
+
+- `delete_repository` is NOT listed. The server withholds it here — the snapshot has
+  it, the running server does not offer it — so it is absent rather than merely
+  unable to complete. The three reaction removals are absent too: they are in the
+  granular toolsets, which `all` does not include;
+- new write tools that ARE listed: `update_issue_comment`, and from a new Governance
+  toolset `create_repository_ruleset` and `custom_properties_write`, beside
+  `custom_properties_read` and `repository_ruleset_read` — the last a new
+  dispatcher, five read methods under one name;
+- `projects_write` gains `create_project_view`, `update_project_view` and
+  `delete_project_view`, so a rule written for it on v1.9.0 now also decides deleting
+  a project view; `projects_get` and `projects_list` gain view reads;
+- the two notification-subscription tools now declare `destructiveHint: true`.
+
+**Per-call OAuth scope challenges (v1.11.0) do not apply to a PAT.** The middleware acts
+only on `gho_` OAuth tokens. The classic-PAT tool filter still skips itself when the
+scope lookup fails, so the gateway's dummy `ghp_` enumeration is unaffected; a real
+classic PAT is filtered under the rewritten visibility rules, a fine-grained one not at
+all.
+
+**The server's new request-body cap is 5 MiB** (github/github-mcp-server#3111), above
+the gateway's own, so the gateway's stays the one a caller meets.
+
 ## What a sandbox session and a cold build actually cost
 
 Two sets of figures DESIGN.md used to carry inline, where they were both evidence for a

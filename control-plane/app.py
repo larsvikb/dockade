@@ -2496,12 +2496,11 @@ async def main() -> None:
     # not obvious: each ``serve()`` wraps itself in ``capture_signals()``, so the
     # second server's handler replaces the first's — but on exit it restores what
     # it replaced and re-raises the signal it caught, which then reaches the first.
-    # Measured on the pinned 0.34.0 with TWO listeners (NOTES.md): SIGTERM logged a
-    # clean shutdown for each and the process was gone inside a second. The count is
-    # the measurement's, not this file's — three listeners ship now, and the chain is
-    # per-server rather than pairwise (each ``capture_signals`` restores and re-raises
-    # for exactly one ``serve()``), so it extends by construction rather than by
-    # having been re-measured. An earlier version of this function added handlers of
+    # Measured with all three listeners (NOTES.md): SIGTERM logged a clean shutdown
+    # for each and the process was gone inside a second. The chain is per-server
+    # rather than pairwise (each ``capture_signals`` restores and re-raises for
+    # exactly one ``serve()``), and it leans on a uvicorn internal — re-measure it
+    # when the uvicorn pin moves. An earlier version of this function added handlers of
     # its own to "fix" the overwrite; they were inert — uvicorn installs via
     # ``signal.signal``, which displaces asyncio's — and removing them changed
     # nothing, so they are gone rather than kept as insurance.

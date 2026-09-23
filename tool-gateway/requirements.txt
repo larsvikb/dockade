@@ -7,5 +7,5 @@
 # run the same stack for the same reason CI runs `make check` rather than
 # reimplementing it — one definition of "the Python service shape we ship", so a
 # FastAPI upgrade is one decision instead of a drift between two services.
-fastapi==0.115.6
-uvicorn==0.34.0
+fastapi==0.141.1
+uvicorn==0.53.0

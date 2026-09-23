@@ -581,7 +581,7 @@ Probing an internationalized host with its **A-label** (`xn--bcher-kva.de`) side
 the question entirely, and is the more faithful test regardless — the A-label is what
 any client puts on the wire.
 
-## Two `uvicorn.Server`s in one event loop still both stop on SIGTERM
+## Several `uvicorn.Server`s in one event loop all stop on SIGTERM
 
 Running two servers from one `asyncio.gather` looks like it should break signal
 handling, and the reasoning is sound as far as it goes: `serve()` wraps itself in
@@ -594,14 +594,15 @@ first server's — and then re-raises the signals it captured
 (`signal.raise_signal`, LIFO). The re-raised SIGTERM lands on the restored
 handler, so the first server shuts down too.
 
-Measured on uvicorn **0.34.0** (the pin in `control-plane/requirements.txt`), two
-servers on one loop, `kill -TERM` on the process: two `Finished server process`
-lines and the process gone in about 500 ms.
+Measured on uvicorn **0.34.0**, two servers on one loop, `kill -TERM` on the
+process: two `Finished server process` lines and the process gone in about 500 ms.
 
-Not re-measured since the control plane grew a third listener. The mechanism is
-per-server — each `capture_signals` restores and re-raises for exactly one
-`serve()`, so the restorations nest — which is why the code did not change; but
-the timing above is a two-server number and should be read as one.
+Re-measured on uvicorn **0.53.0** (2026-09-23, the bump from 0.34.0) with the
+control plane's real three listeners, run from a venv rather than the image: three
+`Finished server process` lines and the process gone in about 520 ms, against about
+620 ms for 0.34.0 on the same three-listener run. `capture_signals` is unchanged
+between the two versions — restore, then `signal.raise_signal` LIFO — so the chain
+nests one level per `serve()` rather than pairwise.
 
 The corollary is the part worth writing down: hand-rolled handlers added "to be
 safe" do nothing here. `loop.add_signal_handler` installs through asyncio's own

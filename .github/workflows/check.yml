@@ -61,7 +61,7 @@ jobs:
       # consistency guards use `git ls-files`/`rev-parse`, both local; verify-build
       # touches git not at all), so leaving the token in .git/config for the job's
       # duration buys nothing and widens the window in which a later step could read it.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -157,7 +157,7 @@ jobs:
       # consistency guards use `git ls-files`/`rev-parse`, both local; verify-build
       # touches git not at all), so leaving the token in .git/config for the job's
       # duration buys nothing and widens the window in which a later step could read it.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 

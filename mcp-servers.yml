@@ -67,7 +67,7 @@ services:
       - mcp-github
     # Pinned deliberately: this container holds a write-capable credential, so an
     # unreviewed `latest` would be an auto-updating supply chain into it.
-    image: ghcr.io/github/github-mcp-server:v1.9.0
+    image: ghcr.io/github/github-mcp-server:v1.12.2
     container_name: mcp-github
     hostname: mcp-github
     # `http` is the streamable-HTTP transport. stdio is the image's default and is
@@ -107,6 +107,10 @@ services:
       # Limits what content from PUBLIC repos is surfaced, by checking whether the
       # author has push access. Directly aimed at the response-side risk: issue and
       # PR bodies are attacker-authored text that lands in the agent's context.
+      # In effect only from v1.10.0: before it, http mode also required a per-request
+      # `X-MCP-Lockdown` header (github/github-mcp-server#3112), which the gateway
+      # never sends — the second of this server's flags found inert (NOTES.md). Like
+      # read-only, a best-effort filter and not the boundary.
       GITHUB_LOCKDOWN_MODE: "1"
       # Real process env, not a shell export (same rule as the sandbox's proxy
       # vars). Go's net/http honours these; a Node-based server would not without

@@ -3164,8 +3164,10 @@ launch with `make opencode`.
 `LLM_IP`, `LLM_PORT` and git identity — and deliberately *no* proxy env, *no*
 `UPSTREAM_DNS`, *no* `--dns`. Absence of capability is the mechanism; there is no
 setting to get wrong. The launcher also refuses the standalone-network fallback
-(`sc_ensure_network ... false`), because a non-internal bridge would hand a
-no-egress agent exactly the egress its design forbids, and treats a missing `llm`
+(`sc_ensure_network ... false`) — both creating a non-internal bridge and *adopting*
+one a tier-1 standalone run left behind, since by name the two are the same network —
+because either would hand a no-egress agent exactly the egress its design forbids.
+It treats a missing `llm`
 service as **fatal** rather than degraded: an opencode sandbox with no model is
 broken, not reduced. `LLM_IP` is discovered from the running container rather than
 hardcoded, so a compose subnet change cannot silently break the firewall's `/32`.

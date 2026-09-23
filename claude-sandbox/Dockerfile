@@ -41,21 +41,27 @@ RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
 
 # hadolint — Dockerfile linter. Single static binary with no runtime deps, so it
 # works under the sandbox's default-deny egress (nothing to fetch at run time).
-# Pinned version; arch-mapped so the same build works on amd64 and arm64 hosts.
-# Fetched at BUILD time, where egress is unrestricted (the firewall only arms at
-# container start). To harden further, pin the per-arch sha256 from the release
-# page and verify it here.
-ARG HADOLINT_VERSION=v2.12.0
+# Pinned version and per-arch sha256; arch-mapped so the same build works on amd64
+# and arm64 hosts. Fetched at BUILD time, where egress is unrestricted (the firewall
+# only arms at container start), which is why the checksum is checked before the
+# binary is installed. CI reads all of these ARGs from here (.github/workflows/
+# check.yml), so a bump is these three lines: the digests are in the release's
+# checksums.sha256. Asset names are lowercase from v2.15 on.
+ARG HADOLINT_VERSION=v2.15.1
+ARG HADOLINT_SHA256_X86_64=c7187db94eeeeca956519a6af171adc31453941a1e777961f6e680f697c8c507
+ARG HADOLINT_SHA256_ARM64=f6198ef8090f404dbb771abfee086eb8c48ac177f30da7fd3510aca35b344b5d
 RUN arch="$(dpkg --print-architecture)" \
     && case "$arch" in \
-         amd64) hadolint_arch=x86_64 ;; \
-         arm64) hadolint_arch=arm64 ;; \
+         amd64) hadolint_arch=x86_64; sha="$HADOLINT_SHA256_X86_64" ;; \
+         arm64) hadolint_arch=arm64; sha="$HADOLINT_SHA256_ARM64" ;; \
          *) echo "unsupported arch '$arch' for hadolint" >&2; exit 1 ;; \
        esac \
     && curl -fsSL \
-       "https://github.com/hadolint/hadolint/releases/download/${HADOLINT_VERSION}/hadolint-Linux-${hadolint_arch}" \
-       -o /usr/local/bin/hadolint \
-    && chmod 0755 /usr/local/bin/hadolint \
+       "https://github.com/hadolint/hadolint/releases/download/${HADOLINT_VERSION}/hadolint-linux-${hadolint_arch}" \
+       -o /tmp/hadolint \
+    && echo "${sha}  /tmp/hadolint" | sha256sum -c - \
+    && install -m 0755 /tmp/hadolint /usr/local/bin/hadolint \
+    && rm /tmp/hadolint \
     && hadolint --version
 
 # Non-root user. Unlike ubuntu:24.04 (which ships a stock `ubuntu` user at uid
@@ -65,6 +71,8 @@ RUN arch="$(dpkg --print-architecture)" \
 # Windows-drive files as the host uid; a mismatch leaves the agent read-only on
 # its own workspace). USER_UID/USER_GID default to 1000 and are set from the host
 # by the launcher (sandbox-lib.sh); override for a different host uid.
+# DL3064 matches the ARG's NAME; this is an account name, not a credential.
+# hadolint ignore=DL3064
 ARG USERNAME=sandbox
 ARG USER_UID=1000
 ARG USER_GID=1000

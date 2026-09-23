@@ -3331,9 +3331,9 @@ weekly schedule surfaces it on its own rather than ambushing the next pull reque
 every tool's version is printed so a verdict traces to what produced it. Three
 consequences that are load-bearing rather than incidental:
 
-- **hadolint's version is *derived* from `claude-sandbox/Dockerfile`'s
-  `ARG HADOLINT_VERSION`**, not restated, and the step fails loudly rather than falling
-  back to `latest`. It is the one linter this repo pins, so CI and the image cannot
+- **hadolint's version and checksum are *derived* from `claude-sandbox/Dockerfile`'s
+  `ARG`s**, not restated, and the step fails loudly rather than falling back to
+  `latest` or installing an unverified binary. It is the one linter this repo pins, so CI and the image cannot
   drift apart and a deliberate bump moves both.
 - **The linters install into a private `PIPX_HOME` under `RUNNER_TEMP`.** The runner
   image ships its own pipx tools in a shared, root-owned `/opt/pipx`, where a plain

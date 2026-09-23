@@ -57,6 +57,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
 
 # Non-root user, uid/gid matched to the host by the launcher so bind-mounted
 # workspaces stay writable from both sides (see claude-sandbox/Dockerfile).
+# hadolint ignore=DL3064
 ARG USERNAME=sandbox
 ARG USER_UID=1000
 ARG USER_GID=1000

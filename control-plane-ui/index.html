@@ -145,11 +145,15 @@
   .payload { margin-top: 8px; font-size: 12px; }
   .payload summary { color: var(--dim); cursor: pointer; }
   /* The warning that precedes a payload carrying characters the eye misses — bidi
-     overrides, zero-width joiners, homoglyphs. In the hold colour, not the deny one:
+     overrides, zero-width joiners, raw controls. In the hold colour, not the deny one:
      it is a reason to read carefully, not a verdict. The checkbox beside it swaps
      the escaped rendering for the raw text and back; both are the whole payload. */
   .payload .hazard { margin-top: 6px; color: var(--hold); display: flex; gap: 12px;
     align-items: baseline; flex-wrap: wrap; }
+  /* The quiet tier: an em dash or an accented letter is worth SAYING and not worth
+     colouring like a hazard. Same row, same toggle, dim like the summary above it —
+     if this looked like the alarm above, the alarm would stop meaning anything. */
+  .payload .hazard.quiet { color: var(--dim); }
   .payload .hazard label { color: var(--dim); white-space: nowrap; cursor: pointer; }
   .payload pre { margin: 6px 0 0; padding: 8px; background: var(--bg);
     border: 1px solid var(--line); border-radius: 6px;

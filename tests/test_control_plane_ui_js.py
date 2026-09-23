@@ -203,6 +203,13 @@ console.log(JSON.stringify({
     hazards_bidi: m.payloadHazards('{"repo":"safe\u202eevil"}'),
     // U+0430 CYRILLIC SMALL LETTER A for the Latin one: visible, and identical.
     hazards_homoglyph: m.payloadHazards('{"owner":"\u0430pple"}'),
+    // Ordinary prose in an argument \u2014 the case that made every card shout.
+    hazards_prose: m.payloadHazards(
+      '{"body":"S14 \u2014 the gateway \u2192 the plane \u2014 fixed"}'),
+    // Both tiers at once: the override decides the level, the dashes ride along.
+    hazards_mixed: m.payloadHazards('{"body":"a \u2014 b\u202ec \u2014 d"}'),
+    // More distinct characters than the tally names.
+    hazards_many: m.payloadHazards('{"b":"\u00e1\u00e9\u00ed\u00f3\u00fa\u00fc"}'),
     // Astral: JSON writes a surrogate pair, and so must the escaped form.
     hazards_astral: m.payloadHazards('{"title":"\ud83d\ude00"}'),
     hazards_missing: m.payloadHazards(undefined),
@@ -3897,31 +3904,64 @@ if __name__ == "__main__":
 @unittest.skipIf(not _NODE and not _STRICT,
                  "node is not installed — skipping app.js unit tests")
 class PayloadHazardTests(PageScriptTests):
-    """A payload the eye cannot read correctly is flagged, and shown escaped first.
+    """A payload the eye cannot read correctly is flagged; one it can is only noted.
 
     The arguments are agent-authored and land in front of the approver verbatim
     (``holds._canonical_args`` writes them with ``ensure_ascii=False``). A U+202E in a
-    value visually reorders the JSON the operator reads; U+0430 CYRILLIC SMALL LETTER
-    A in `owner` is indistinguishable from the Latin one. The egress card is safe here because the
-    proxy A-labels hostnames; the tool card had nothing."""
+    value visually reorders the JSON the operator reads, and that is the `danger`
+    tier. An em dash in a PR body does not, and alarming about it is worse than
+    useless: the operator reads escaped soup on every card and learns to click past
+    the warning, which is the state a real override needs to get through. The egress
+    card is safe from both because the proxy A-labels hostnames; the tool card had
+    nothing."""
 
     def test_a_plain_payload_is_not_flagged_and_not_changed(self):
         clean = self.probe["tool"]["hazards_clean"]
-        self.assertFalse(clean["flagged"])
+        self.assertEqual(clean["level"], "none")
         self.assertEqual(clean["escaped"], '{"owner":"octo","repo":"hello"}')
         self.assertEqual(clean["note"], "")
 
-    def test_a_bidi_override_is_counted_as_invisible_and_spelled_out(self):
+    def test_a_bidi_override_is_the_danger_tier_and_is_spelled_out(self):
         bidi = self.probe["tool"]["hazards_bidi"]
-        self.assertTrue(bidi["flagged"])
+        self.assertEqual(bidi["level"], "danger")
         self.assertEqual((bidi["invisible"], bidi["nonAscii"]), (1, 1))
         self.assertEqual(bidi["escaped"], '{"repo":"safe\\u202eevil"}')
         self.assertIn("1 invisible or direction-changing character", bidi["note"])
         self.assertIn("what you read may not be what runs", bidi["note"])
 
-    def test_a_homoglyph_is_flagged_as_non_ascii_but_not_invisible(self):
+    def test_the_note_names_the_characters_it_found(self):
+        # The question the count alone made an operator untick the box to answer.
+        prose = self.probe["tool"]["hazards_prose"]
+        self.assertIn("(— x2, → x1)", prose["note"])
+
+    def test_an_invisible_character_is_named_escaped_even_inside_the_note(self):
+        # A raw U+202E in the warning would reorder the warning.
+        mixed = self.probe["tool"]["hazards_mixed"]
+        self.assertIn("\\u202e", mixed["note"])
+        self.assertNotIn("‮", mixed["note"])
+        self.assertEqual(mixed["level"], "danger")
+        self.assertIn("1 invisible or direction-changing and 2 other non-ASCII",
+                      mixed["note"])
+
+    def test_the_tally_summarises_past_its_limit(self):
+        many = self.probe["tool"]["hazards_many"]
+        named = many["note"].split("(")[1].split(")")[0].split(", ")
+        self.assertEqual(len(named), 5)
+        self.assertEqual(named[-1], "+2 more")
+
+    def test_ordinary_prose_is_noted_and_left_exactly_as_it_is(self):
+        prose = self.probe["tool"]["hazards_prose"]
+        self.assertEqual(prose["level"], "note")
+        self.assertEqual(prose["invisible"], 0)
+        self.assertIn("nothing is hidden", prose["note"])
+        # Still escapable on request — the toggle works in both tiers.
+        self.assertIn("\\u2014", prose["escaped"])
+
+    def test_a_homoglyph_is_noted_as_non_ascii_but_not_invisible(self):
+        # The quiet tier reports it and does not vouch for it; catching a homoglyph
+        # as such needs mixed-script detection, which is a separate question.
         h = self.probe["tool"]["hazards_homoglyph"]
-        self.assertTrue(h["flagged"])
+        self.assertEqual(h["level"], "note")
         self.assertEqual((h["invisible"], h["nonAscii"]), (0, 1))
         self.assertEqual(h["escaped"], '{"owner":"\\u0430pple"}')
         self.assertIn("1 non-ASCII character", h["note"])
@@ -3931,13 +3971,17 @@ class PayloadHazardTests(PageScriptTests):
                          '{"title":"\\ud83d\\ude00"}')
 
     def test_a_missing_payload_is_not_flagged(self):
-        self.assertFalse(self.probe["tool"]["hazards_missing"]["flagged"])
+        self.assertEqual(self.probe["tool"]["hazards_missing"]["level"], "none")
 
-    def test_the_card_shows_the_escaped_form_first_and_the_raw_on_request(self):
-        # Source-level, like the other DOM assertions in this file: the flagged card
-        # sets `pre` to the escaped text, and the only path back to raw is the toggle.
+    def test_only_the_danger_tier_rewrites_the_card(self):
+        # Source-level, like the other DOM assertions in this file: escaped-first and
+        # forced-open are both keyed on `danger`, while the note itself appears for
+        # either tier.
         src = APP_JS.read_text()
-        self.assertRegex(src, r"pre\.textContent = hazards\.flagged \? hazards\.escaped : raw")
+        self.assertRegex(src, r'const danger = hazards\.level === "danger"')
+        self.assertRegex(src, r"pre\.textContent = danger \? hazards\.escaped : raw")
+        self.assertRegex(src, r"box\.checked = danger")
         self.assertRegex(src, r"box\.checked \? hazards\.escaped : raw")
-        self.assertRegex(src, r"details\.open = disclosure\.open \|\| hazards\.flagged")
+        self.assertRegex(src, r"details\.open = disclosure\.open \|\| danger")
+        self.assertRegex(src, r'if \(hazards\.level !== "none"\)')
 

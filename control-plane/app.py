@@ -1444,9 +1444,20 @@ def _resolve_tool_ask_request(approval_id: str, req: ResolveRequest,
 @app.get("/approvals/stream")
 async def approvals_stream(request: Request) -> StreamingResponse:
     """Server-sent events: push the pending-approval payload whenever it changes.
-    Polls SQLite once a second (a fast indexed query; the brief sync read is
-    negligible on the event loop) and emits on change, plus a periodic heartbeat
-    so proxies/clients can detect a dead stream.
+    Polls SQLite once a second and emits on change, plus a periodic heartbeat so
+    proxies/clients can detect a dead stream.
+
+    BUILT IN A WORKER THREAD, which the once-a-second cadence makes look optional
+    and is not. This process serves every listener from one event loop (see
+    ``main``), so anything this generator does synchronously is done instead of
+    answering ``/authorize`` — the call every sandbox's egress waits on. And the
+    payload is no longer the "brief indexed read" this once described: it takes
+    ``holds._LOCK`` twice (``_list_pending``, ``_saturation``), and that lock is
+    held by ``_register_tool_ask`` across a SQLite write, which in turn waits out
+    the 5 s busy timeout when another writer has the store. Two chains, and the
+    loop used to be on both. It also serializes up to ``TOOL_ARGS_MAX`` per tool
+    card, which is not free either. A worker thread costs a hop per client per
+    second and takes the loop off all of it.
 
     Change-detection is on the SERIALIZED payload, which is why every field in it
     must be stable while nothing happens — see the note in ``holds._saturation``
@@ -1456,7 +1467,8 @@ async def approvals_stream(request: Request) -> StreamingResponse:
         while True:
             if await request.is_disconnected():
                 break
-            payload = json.dumps(holds._pending_payload())
+            payload = await asyncio.to_thread(
+                lambda: json.dumps(holds._pending_payload()))
             if payload != last:
                 last = payload
                 yield f"event: pending\ndata: {payload}\n\n"

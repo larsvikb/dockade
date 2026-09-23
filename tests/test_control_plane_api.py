@@ -92,12 +92,20 @@ def _auth_req(host, **kw):
 
 class _FakeRequest:
     """Stand-in for the Starlette Request that ``resolve`` reads provenance from
-    (``_actor``). Headers are lowercased like Starlette's case-insensitive mapping."""
+    (``_actor``). Headers are lowercased like Starlette's case-insensitive mapping.
 
-    def __init__(self, peer="172.31.0.3", headers=None):
+    ``is_disconnected`` is here for ``approvals_stream``, the one handler that reads
+    the connection rather than the request: still connected unless a test says
+    otherwise, which is what makes the stream produce a tick to assert on."""
+
+    def __init__(self, peer="172.31.0.3", headers=None, disconnected=False):
         self._headers = {k.lower(): v for k, v in (headers or {}).items()}
         self.headers = types.SimpleNamespace(get=self._headers.get)
         self.client = types.SimpleNamespace(host=peer) if peer else None
+        self._disconnected = disconnected
+
+    async def is_disconnected(self):
+        return self._disconnected
 
 
 def _resolve(approval_id, action, request=None, **fields):
@@ -2915,6 +2923,45 @@ class MergedQueueTests(_CPTestCase):
         # Unsplit: over a cap nothing raises a card on either surface, so a refusal is
         # invisible in the queue, and an operator should not have to read two banners.
         self.assertIn("saturation", cp.holds._pending_payload())
+
+
+class ApprovalStreamTests(_CPTestCase):
+    """Where the SSE tick does its work, which is the part of it that is not about
+    the operator at all: one event loop serves every listener in this process, so a
+    synchronous payload build here is time not spent answering ``/authorize``."""
+
+    def test_the_payload_is_built_off_the_event_loop(self):
+        # Asserted on the THREAD rather than on the presence of `to_thread`, because
+        # what matters is where the work lands: the build takes `holds._LOCK`, which
+        # `_register_tool_ask` holds across a SQLite write that waits out the 5 s busy
+        # timeout when another writer has the store. On the loop, that wait is every
+        # sandbox's egress decision waiting with it.
+        built_on = []
+
+        def record():
+            built_on.append(threading.get_ident())
+            return {"holds": [], "saturation": {}}
+
+        async def first_tick():
+            response = await cp.approvals_stream(_FakeRequest())
+            with mock.patch.object(cp.holds, "_pending_payload", record):
+                await response.body.__anext__()
+            await response.body.aclose()
+            return threading.get_ident()
+
+        loop_thread = asyncio.run(first_tick())
+        self.assertEqual(len(built_on), 1)
+        self.assertNotEqual(built_on[0], loop_thread,
+                            "the pending payload was built on the event loop thread")
+
+    def test_a_disconnected_client_ends_the_stream(self):
+        # The other half of reading the connection: the generator must stop rather
+        # than tick forever for a browser that has gone.
+        async def drain():
+            response = await cp.approvals_stream(_FakeRequest(disconnected=True))
+            return [chunk async for chunk in response.body]
+
+        self.assertEqual(asyncio.run(drain()), [])
 
 
 class ResolveToolAskTests(_CPTestCase):

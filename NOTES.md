@@ -553,6 +553,46 @@ That view is the allocator's own record, so it also shows an address held by a s
 endpoint with no live container — the other way this fails after an unclean shutdown,
 cured with `docker network disconnect -f` or by recreating the network.
 
+## Docker's embedded resolver refuses to forward off an internal network — and `dig` exits 0 saying so
+
+Measured inside a governed tier-1 sandbox on `sandbox-net` (`internal: true`), Docker
+Engine on WSL2, dig 9.20.29. `/etc/resolv.conf` names `127.0.0.11` and *does* list the
+host's upstreams in its comment block — `ExtServers: [192.168.1.1 192.168.68.1]` — so
+the file reads as though forwarding were configured. It is not:
+
+    $ dig example.com
+    ;; ->>HEADER<<- opcode: QUERY, status: SERVFAIL, id: 47537
+    ;; WARNING: recursion requested but not available
+    ;; Query time: 0 msec
+
+    $ echo $?
+    0
+
+Two things worth keeping. First, the refusal is immediate (0 ms) and comes from the
+embedded resolver itself, which answers but will not recurse for a container whose only
+network is internal — the engine's behaviour, not anything configured here. The
+`ExtServers` comment describes what the resolver *knows*, not what it will *do*.
+
+Second, and the trap: **`dig` exits 0 on SERVFAIL.** It exits non-zero only when it
+reaches no server at all (rc 9). So `if dig name >/dev/null; then` reads a working
+refusal as a successful lookup — precisely backwards for a leak check. The three
+usable signals:
+
+| probe | forwarding works | refused (SERVFAIL) | no resolver |
+|---|---|---|---|
+| `getent hosts NAME` | rc 0 | rc 2 | rc 2 |
+| `dig +short NAME` | address on stdout | empty | empty |
+| `dig NAME` \| `status:` | `NOERROR` | `SERVFAIL` | line absent |
+
+`getent` is the one to assert a leak on: it walks the same NSS path curl, git and ssh
+do, and it separates "resolved" from "did not" by exit status. It cannot, though,
+separate a resolver that refuses from one that is absent — both are rc 2 — so a leak
+check built on it alone passes vacuously in a container with no DNS. The `status:`
+line is what distinguishes those, which is why `boundary-check.sh` reads both.
+
+Note also that the container's own hostname resolves from `/etc/hosts` (Docker writes
+it there), so resolving it proves nothing about the resolver being alive.
+
 ## `curl` reads `http_proxy` in lower case only
 
 Same host, same shell, curl 8.14.1. `example.com` carries a **block** rule, so reaching

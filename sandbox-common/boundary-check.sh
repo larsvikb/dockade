@@ -459,6 +459,43 @@ if command -v dig >/dev/null 2>&1; then
 else
     info "dig not available; skipping DNS probe"
 fi
+# The probe above tests a resolver the firewall BLOCKS. The resolver it ALLOWS —
+# Docker's embedded 127.0.0.11 — is the one a smuggled name would actually travel
+# through, and "no DNS exfil channel" rests entirely on Docker refusing to forward
+# for an internal-only network. That refusal is the ENGINE's behaviour, not this
+# repo's: it would disappear on an older engine, or on a network that stopped being
+# internal (see sc_ensure_network), with nothing here to notice. So assert it.
+#
+# Two facts, because either alone can lie:
+#   leak     — `getent`, which walks the same NSS path curl, git and ssh do, and
+#              exits non-zero when a name does not resolve.
+#   liveness — `dig`, to tell a resolver that REFUSES from one that is not there.
+#              Without it a container with no DNS at all would pass, which is the
+#              vacuous pass this check exists to avoid.
+# Never `if dig ...` for the leak: the embedded resolver answers SERVFAIL
+# ("recursion requested but not available") and dig EXITS 0 for it, so the exit
+# status reads a working refusal as a leak. Assert on the answer, not the status.
+if [ "${SANDBOX_MODE:-}" = "local" ] || [ -n "${HTTPS_PROXY:-}" ]; then
+    # Both tiers that sit on an internal network: tier 2 has no egress at all, and
+    # governed tier 1 has the proxy resolve on its behalf. Neither should be able to
+    # resolve an external name itself.
+    if getent hosts example.com >/dev/null 2>&1; then
+        bad "external name resolved via the default resolver — embedded DNS is forwarding off an internal network (exfil channel)"
+    elif command -v dig >/dev/null 2>&1 &&
+         ! dig +time=3 +tries=1 example.com 2>/dev/null | grep -q 'status: '; then
+        info "external names unresolvable, but the embedded resolver did not answer either — inconclusive, not asserted"
+    else
+        ok "embedded resolver refuses external names (no DNS forwarding off an internal network)"
+    fi
+else
+    # Standalone: the pinned upstreams are deliberately permitted on :53, so
+    # resolution here is expected and host-dependent. Report, don't assert.
+    if getent hosts example.com >/dev/null 2>&1; then
+        info "external names resolve via the pinned upstreams (standalone mode)"
+    else
+        info "external names do not resolve (standalone mode; upstreams may be unreachable)"
+    fi
+fi
 
 echo
 if [ "$fail" -gt 0 ]; then

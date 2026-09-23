@@ -819,7 +819,12 @@ everything else is REJECTed. Dropped
 in governed mode vs the old posture: the direct per-domain IP allowlist (so **no
 ipset**), the **upstream DNS forward** (closing the residual DNS-exfil channel —
 a crafted name can no longer reach a recursive resolver; sibling names like
-`egress-proxy` still resolve locally), and the **gateway `/32`** (host-local
+`egress-proxy` still resolve locally). Note what closes that channel: the firewall
+drops the upstream forward, but the resolver the firewall still permits declines to
+recurse on its own — the **engine's** behaviour for a container whose only network
+is `internal`, not this repo's. `boundary-check.sh` therefore asserts it rather than
+inheriting it, in both tiers that sit on such a network. Also dropped: the
+**gateway `/32`** (host-local
 surface). Without a proxy the firewall keeps the fuller **standalone** allowlist
 (ipset + upstreams + gateway). Net effect: with the proxy up, the sandbox's only
 paths off-box are the proxy (HTTP/S, domain-governed + audited) and — narrowly —

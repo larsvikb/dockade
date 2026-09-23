@@ -308,9 +308,31 @@ sc_plugin_allowlist() {
 # its own firewall allowlist. allow_fallback=false (tier 2): a tier with no egress
 # has nothing to fall back TO, and silently creating a non-internal bridge would
 # hand it the egress its design says it must not have — so refuse instead.
+#
+# Which is why, for tier 2, existence is not the question. A tier-1 standalone run
+# creates sandbox-net as exactly that plain non-internal bridge, and the network
+# outlives the container that prompted it. A later tier-2 launch asking only "does
+# it exist?" would adopt it and get the egress the refusal above exists to prevent,
+# with nothing to see: same name, same DNS, same subnet shape. So assert the
+# property the tier depends on rather than the name it travels under.
 sc_ensure_network() {
     local net="$1" allow_fallback="$2"
-    docker network inspect "$net" >/dev/null 2>&1 && return 0
+
+    if docker network inspect "$net" >/dev/null 2>&1; then
+        if [[ "$allow_fallback" == "true" ]]; then
+            return 0
+        fi
+        if [[ "$(docker network inspect "$net" -f '{{.Internal}}' 2>/dev/null)" == "true" ]]; then
+            return 0
+        fi
+        echo "ERROR: network '$net' exists but is NOT internal." >&2
+        echo "       This tier's 'no egress' is enforced by the network being" >&2
+        echo "       internal, so adopting this one would hand it egress. A bridge" >&2
+        echo "       left behind by a tier-1 standalone run looks exactly like this." >&2
+        echo "       Remove it and start the infrastructure:" >&2
+        echo "         docker network rm $net && docker compose up -d" >&2
+        exit 1
+    fi
 
     if [[ "$allow_fallback" != "true" ]]; then
         echo "ERROR: network '$net' not found." >&2

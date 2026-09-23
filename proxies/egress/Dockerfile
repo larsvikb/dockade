@@ -24,8 +24,14 @@ RUN mkdir -p /var/log/egress \
 USER mitmproxy
 
 # Regular (forward) proxy on 8080.
-#   connection_strategy=lazy — don't dial upstream until after we've decided, so
-#     a denied CONNECT never opens an outbound connection.
+#   connection_strategy=lazy — don't dial upstream until after we've decided, so a
+#     CONNECT refused at the connect stage never opens an outbound connection. The
+#     SNI stage is the exception, and it is one: a fronting mismatch is refused by
+#     KEEPING interception on rather than by killing the flow (addon.py,
+#     `tls_clienthello`), and interception makes mitmproxy dial upstream for the
+#     certificate it mints from — carrying the client's SNI. Nothing is relayed
+#     either way, because `request` re-gates the flow by name, but the connection
+#     is made.
 #   flow_detail=1 — keep mitmdump's own output terse; our addon emits the
 #     structured JSON audit lines.
 ENTRYPOINT ["mitmdump", \

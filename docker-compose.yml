@@ -122,12 +122,16 @@ networks:
   # bridge is REQUIRED here because Docker cannot publish a host port from a
   # container that lives solely on an internal network — the publish is silently
   # inert. Masquerade is disabled so this bridge carries the inbound
-  # loopback-published UI but is NOT an internet egress path: inbound publishing
-  # is DNAT and needs no SNAT, while outbound has no SNAT here so it does not
-  # function as egress. This is the reverse-proxy-sidecar split in practice: the
-  # control-plane-ui frontend (below) carries this one non-internal surface so the
-  # control-plane BACKEND needs no published port and stays control-net-only /
-  # fully internal — zero non-internal exposure for the crown jewel. Sandbox never here.
+  # loopback-published UI without being a usable egress path: inbound publishing is
+  # DNAT and needs no SNAT, while outbound gets no SNAT here, so a reply can never
+  # come back to an RFC1918 source and nothing two-way works. Not the same as "no
+  # packet leaves" — a one-shot UDP datagram still goes out and is simply never
+  # answered — so this is a bridge nothing can converse over rather than a wall.
+  # Only the UI sits here, and it is ours. This is the reverse-proxy-sidecar split
+  # in practice: the control-plane-ui frontend (below) carries this one non-internal
+  # surface so the control-plane BACKEND needs no published port and stays
+  # control-net-only / fully internal — zero non-internal exposure for the crown
+  # jewel. Sandbox never here.
   control-ui-net:
     name: control-ui-net
     driver: bridge
@@ -544,10 +548,13 @@ services:
       # same mechanism, and the same reasoning, as CONTROL_MANAGE_BIND above.
       GATEWAY_AGENT_BIND: 172.30.0.11
       GATEWAY_AGENT_PORT: "8100"
-      # The control plane's TOOL bridge, by ADDRESS and not by name. The control
-      # plane is multi-homed and only this leg may be spoken to; `control-plane`
-      # resolves to whichever of its legs Docker's DNS returns, and most of them
-      # would be the wrong one. Servers are dialled by NAME instead — they are
+      # The control plane's TOOL bridge, by ADDRESS and not by name. The name would
+      # answer correctly today — embedded DNS returns only the legs the querier
+      # shares, and these two share exactly one (see EGRESS_CONTROL_PLANE_URL above,
+      # which relies on that) — but that is a property of the topology rather than of
+      # this URL: attach either container to a second shared network and the name
+      # turns ambiguous while the address stays right. An address names the LEG; a
+      # name names the container. Servers are dialled by NAME instead — they are
       # single-homed, so there is no leg to pick. Held equal to CONTROL_TOOL_BIND
       # and CONTROL_TOOL_PORT by tests/test_topology.py.
       GATEWAY_CONTROL_URL: http://172.27.0.2:8092

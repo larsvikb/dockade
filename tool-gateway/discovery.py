@@ -50,11 +50,14 @@ import urllib.request
 _SERVER_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 
 #: The control plane's TOOL bridge, by ADDRESS rather than by name — the one place
-#: here that does not dial a name. The control plane is multi-homed and only its
-#: tool-authorize-net leg may be spoken to; `control-plane` resolves to whichever leg
-#: Docker's DNS feels like returning, and three of the four would be the wrong one.
-#: The address is the only thing that names a LEG. This is the same reason compose
-#: pins CONTROL_TOOL_BIND rather than letting that listener take a wildcard.
+#: here that does not dial a name. The control plane has three legs and only its
+#: tool-authorize-net one may be spoken to. The name would pick that one today, since
+#: embedded DNS answers only with the legs the querier shares and these two share just
+#: it; the address is used because it names the LEG rather than the container, so it
+#: stays right if a second shared network is ever added, and because
+#: tests/test_topology.py can hold it equal to what the control plane binds. Same
+#: reason compose pins CONTROL_TOOL_BIND rather than letting that listener take a
+#: wildcard.
 CONTROL_URL = os.environ.get("GATEWAY_CONTROL_URL", "http://172.27.0.2:8092")
 
 #: Servers are dialled BY NAME, and that is the identity per-tool policy is keyed on

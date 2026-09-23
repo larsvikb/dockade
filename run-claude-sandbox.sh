@@ -130,10 +130,14 @@ if [[ "$EGRESS_PROXY_IP" =~ ^[0-9.]+$ ]]; then
     # branch is the governed one, which is what mode-gates the grant below (DESIGN.md:
     # tier 2 must not acquire a governed tool path by sharing a network).
     #
-    # BY ADDRESS, not by name. The gateway is triple-homed, so `tool-gateway` is the
-    # one name in this system whose resolution depends on which leg Docker's DNS
-    # feels like returning — the same reason the gateway itself dials the control
-    # plane by address and `make gateway-tools` probes one.
+    # BY ADDRESS, not by name — and not because the name would resolve wrongly.
+    # Docker's embedded DNS answers a querier only with the legs it SHARES with the
+    # target, and this sandbox shares exactly one with the triple-homed gateway, so
+    # the name would give the same answer. The address is used because it is needed
+    # here regardless: the in-container firewall grants a /32, which means the leg
+    # has to be resolved before the container starts. Handing that one resolution to
+    # both the grant and the client config is what keeps them naming one address
+    # rather than two that agree by luck.
     TOOL_GATEWAY_NAME="${TOOL_GATEWAY_NAME:-tool-gateway}"
     TOOL_GATEWAY_PORT="${TOOL_GATEWAY_PORT:-8100}"
     TOOL_GATEWAY_IP="$(sc_service_ip "$TOOL_GATEWAY_NAME" "$SANDBOX_NET")"

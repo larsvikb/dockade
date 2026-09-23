@@ -126,17 +126,38 @@ NATIVE_TOOLS = [{
     # call rather than collecting a result that already exists, and that it is
     # single-use. A name like `get_result` would have implied both incorrectly, which
     # is why it is not called that.
+    # Every MCP client puts this text in front of the model, which makes it the one
+    # channel that reaches an agent whatever harness it is running in. Anything an
+    # agent MUST know to use this correctly belongs here rather than in a per-harness
+    # instruction file, which is why `wait_seconds` is described here and not only in
+    # the sandbox's CLAUDE.md / AGENTS.md.
     "description": (
         "Finish a tool call that was held for human approval. Pass the id from the "
         "pending result. If the approval was granted this RUNS the call and returns "
         "its result, and it can only be done once. If it is still pending it says so "
         "and nothing runs; if it was denied or expired it says that, and retrying "
-        "will not change it."),
+        "will not change it. Asking again while it is pending is free. Set "
+        "wait_seconds to have this call block until the answer arrives instead of "
+        "returning immediately — useful when you have nothing else to do, while a "
+        "zero wait lets you go and do other work and come back."),
     "inputSchema": {
         "type": "object",
-        "properties": {"approval_id": {
-            "type": "string",
-            "description": "The id from the pending result, copied verbatim."}},
+        "properties": {
+            "approval_id": {
+                "type": "string",
+                "description": "The id from the pending result, copied verbatim."},
+            # The cap is not stated as a number here: it is configurable, and a
+            # description that named 45 would be a second copy of the value to keep
+            # true. An over-large request is clamped rather than refused, so nothing
+            # rests on the agent knowing the ceiling.
+            "wait_seconds": {
+                "type": "number",
+                "description": (
+                    "Optional. Block for up to this many seconds waiting for the "
+                    "human, returning as soon as they answer. Capped by the server, "
+                    "and capped well below any client's request timeout. Omit it (or "
+                    "pass 0) to get the answer as it stands right now, which is the "
+                    "right choice when you have other work to get on with.")}},
         "required": ["approval_id"]}}]
 
 

@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 
@@ -83,6 +84,34 @@ CONTROL_URL = discovery.CONTROL_URL
 #: cannot be obtained is refused, so this bound is the one that keeps a wedged control
 #: plane from wedging the agent instead of failing it closed.
 DECIDE_TIMEOUT = float(os.environ.get("GATEWAY_DECIDE_TIMEOUT", "10"))
+
+#: The longest ``resume_tool_call`` will hold its own call waiting for a human, and
+#: how often it re-asks while it waits.
+#:
+#: SIZED FOR THE STRICTEST CLIENT WE KNOW OF, not for the one in front of us. A wait
+#: is just a tool call that takes a while, which is the only mechanism every MCP
+#: client already has — no backgrounding, no server-initiated request, no
+#: notification, nothing to negotiate. What bounds it is the tightest per-request
+#: timer any client applies, and the lowest documented floor is 60 s (Claude Code's
+#: first-byte timer, which cannot be configured below that; NOTES.md). Forty-five
+#: leaves room for the round trip inside it and needs no client configuration
+#: anywhere. A harness known to tolerate more can be given more — that is what the
+#: env var is for — but the DEFAULT has to work on a client nobody can configure.
+#:
+#: This deliberately stays under Claude Code's two-minute backgrounding threshold,
+#: so that feature never engages. It is a better mechanism and it exists in exactly
+#: one harness; leaning on it would buy latency at the cost of the property this
+#: design is for.
+#:
+#: Nothing about governance depends on any of it. The approval row is the authority,
+#: the wait is latency, and an expired wait returns precisely what a zero wait
+#: returns today.
+MAX_RESUME_WAIT = float(os.environ.get("GATEWAY_MAX_RESUME_WAIT", "45"))
+#: Re-ask cadence while waiting. A pending claim is a read that changes nothing (the
+#: control plane answers "still pending" without touching the row), so this is a
+#: cheap indexed select against a sibling — a second is far below what a human's
+#: click latency makes worth optimising.
+RESUME_POLL_INTERVAL = float(os.environ.get("GATEWAY_RESUME_POLL_INTERVAL", "1"))
 
 
 def text_result(text: str, is_error: bool = False) -> dict:
@@ -343,6 +372,25 @@ def call(name: str, arguments: object, client: str | None) -> dict:
     return text_result(f"Denied: {why}. This will not succeed on retry.", is_error=True)
 
 
+def _resume_wait(arguments: object) -> float:
+    """How long this resumption may block, from the agent's request and the cap.
+
+    OUT OF RANGE IS NOT AN ERROR, and neither is the wrong type. This parameter buys
+    latency and decides nothing: every value produces the same answers, sooner or
+    later, and a resumption refused over its optional argument would cost a round
+    trip to say something the agent can do nothing useful with. So it is clamped —
+    anything unreadable means "do not wait", which is the behaviour of every caller
+    that never heard of it.
+
+    ``bool`` is excluded explicitly because it is an ``int`` in Python, and
+    ``wait_seconds: true`` meaning "one second" would be a worse reading of the
+    agent's intent than "not a number"."""
+    raw = arguments.get("wait_seconds") if isinstance(arguments, dict) else None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return 0.0
+    return max(0.0, min(float(raw), MAX_RESUME_WAIT))
+
+
 def resume(arguments: object, client: str | None) -> dict:
     """Finish a call that was held: claim the approval, then run what it released.
 
@@ -352,7 +400,14 @@ def resume(arguments: object, client: str | None) -> dict:
 
     The arguments come back FROM the claim and are the ones the human read. Nothing the
     agent sends here contributes to the call beyond the id, which is what closes the
-    gap between what was approved and what runs."""
+    gap between what was approved and what runs.
+
+    MAY WAIT, if the agent asks it to (``wait_seconds``). Re-asking is the whole
+    mechanism — a pending claim is free and changes nothing — so waiting here is the
+    same question the agent would ask by calling again, asked on its behalf. Which of
+    the two happens is the AGENT'S call and deliberately not this module's: only the
+    agent knows whether it has other work to do while a human decides. Zero is the
+    default and is exactly today's behaviour."""
     approval_id = arguments.get("approval_id") if isinstance(arguments, dict) else None
     # STRIPPED before it is checked, and that is safe in a way a looser cleanup would
     # not be: the id is bounded hex, so removing surrounding whitespace cannot turn one
@@ -370,12 +425,22 @@ def resume(arguments: object, client: str | None) -> dict:
             "resume_tool_call needs the approval_id from a pending result, copied "
             "verbatim.", is_error=True)
 
-    try:
-        answer = _ask_control(f"/tool/asks/{approval_id}/claim", {"client": client})
-    except discovery.DiscoveryError as exc:
-        return text_result(
-            f"could not reach governance to claim {approval_id} ({exc}). Nothing ran, "
-            f"and the approval is untouched — try again.", is_error=True)
+    wait = _resume_wait(arguments)
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            answer = _ask_control(f"/tool/asks/{approval_id}/claim", {"client": client})
+        except discovery.DiscoveryError as exc:
+            return text_result(
+                f"could not reach governance to claim {approval_id} ({exc}). Nothing "
+                f"ran, and the approval is untouched — try again.", is_error=True)
+        # Decided either way, or out of time: stop asking. Re-asking a PENDING claim is
+        # the same free question the agent would ask by calling again, which is what
+        # lets this loop exist without a second endpoint and without the control plane
+        # learning anything about waiting.
+        if answer.get("ok") or answer.get("terminal") or time.monotonic() >= deadline:
+            break
+        time.sleep(min(RESUME_POLL_INTERVAL, max(0.0, deadline - time.monotonic())))
 
     if not answer.get("ok"):
         # The control plane's `detail` is machine-shaped for the states it has no prose
@@ -394,10 +459,13 @@ def resume(arguments: object, client: str | None) -> dict:
                 f"needed; that raises a new question for the human.", is_error=True)
         # STILL PENDING, and therefore not an error. Nobody has answered yet, nothing
         # has run, and the id is still good.
+        waited = (f" Waited {wait:g}s for it." if wait else "")
         return text_result(
-            f"Still waiting on a human for {approval_id}. Nothing has run. Come back "
-            f"with the same id later — do not call the tool again, which would raise "
-            f"a second question for the same person.")
+            f"Still waiting on a human for {approval_id}. Nothing has run.{waited} "
+            f"Come back with the same id later — do not call the tool again, which "
+            f"would raise a second question for the same person. Pass "
+            f"wait_seconds to have this call block until the answer arrives, up to "
+            f"{MAX_RESUME_WAIT:g}s, if you have nothing else to do meanwhile.")
 
     # Claimed. From here the call is authorised and the arguments are the approved
     # ones, parsed from the canonical form the digest covers and the human was shown.

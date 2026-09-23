@@ -203,6 +203,39 @@ Three consequences, in the order they surprised:
   caller and relies on the default to bound it hangs the agent for a day rather than
   failing — the failure mode arrives in someone else's config, not the author's.
 
+**Re-read 2026-09-23, and two of the three conclusions above needed amending.** The
+page had gained a fourth timer and a client feature; still documented rather than
+measured, and the probe is still worth doing.
+
+| Timer | Scope | Default |
+| --- | --- | --- |
+| idle — no response *and no progress notification* | per tool call, HTTP/SSE/WS/connector | **5 min** (30 min stdio; IDE and in-process exempt), `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`, v2.1.187+ |
+
+- **Progress notifications are useless against the wall clock and REQUIRED against the
+  idle timer.** The bullet above is right that they do not extend the per-server
+  `timeout`; it now reads as "keepalive is unavailable", and that is wrong. A call
+  that intends to sit quietly for more than five minutes needs them.
+- **The first-byte comparison excludes the 28-hour default**, which the bullet above
+  misses: the timer is the greatest of 60 s, the server's `timeout`, and `MCP_TIMEOUT`,
+  "and the 28-hour default of an unset `MCP_TOOL_TIMEOUT` doesn't enter that
+  comparison". So an unconfigured HTTP server gets exactly 60 s and a value below 60
+  cannot shorten it. **60 s is therefore the floor a portable server has to fit
+  inside** — it is the one number no configuration can lower.
+- **One field settles all three.** A per-server `timeout` of at least 1000 ms sets the
+  wall clock, raises the first-byte timer to match, and (v2.1.203+) acts as a floor on
+  the idle timeout.
+- **Automatic backgrounding (v2.1.212+) is the real answer to blocking — in this
+  client only.** "An MCP tool call in the main conversation that is still running after
+  two minutes moves to a background task instead of blocking the session. Claude
+  receives the task ID immediately and keeps working, and the result arrives as a task
+  notification when the call settles." Threshold via
+  `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS`. **Not** applied to subagent calls, IDE servers,
+  or non-interactive runs unless `CLAUDE_AUTO_BACKGROUND_TASKS=1`.
+- **Elicitation is supported**, and a call waiting on an open elicitation dialog is
+  explicitly *not* backgrounded — it blocks the session until the dialog closes.
+- **Resumable Streamable HTTP (`Last-Event-ID`) is not documented for this client.**
+  Nothing to build on.
+
 ## A directory marketplace is used in place, and `settings.json` is the whole declaration
 
 Measured in-container on Claude Code 2.1.236, with a fixture marketplace

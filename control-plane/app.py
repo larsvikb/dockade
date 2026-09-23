@@ -671,7 +671,15 @@ def _assert_listeners_separated() -> None:
 @app.get("/healthz")
 @authorize_app.get("/healthz")
 @tool_app.get("/healthz")
-def healthz() -> dict:
+async def healthz() -> dict:
+    """``async`` so the probe is answered on the event loop and never queues behind
+    a worker thread. ``authorize`` is a plain ``def`` that BLOCKS on a hold for up to
+    ``holds.HOLD_TIMEOUT``, and Starlette runs it in a bounded threadpool; a sync
+    probe shares that pool. Today ``MAX_WAITERS`` (16) is under the pool's default
+    size, so the queue cannot form — but that is an accident of two numbers set in
+    different files, and the failure it prevents is compose restarting the control
+    plane in the middle of the holds that made it look unhealthy. There is nothing
+    to await here, so the fix costs nothing and stops depending on the arithmetic."""
     return {"status": "ok"}
 
 

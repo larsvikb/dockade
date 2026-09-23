@@ -638,8 +638,34 @@ class ResponseShapeTests(_CPTestCase):
                 declared = typing.get_type_hints(call).get("return")
                 self.assertIsNotNone(declared, f"{name} declares no return type, so "
                                                f"FastAPI will not validate it")
+                # An async endpoint hands back a coroutine; run it for its value.
+                # The roster is about what each one RETURNS, and that must not
+                # depend on which side of the threadpool it is answered from.
+                result = call()
+                if asyncio.iscoroutine(result):
+                    result = asyncio.run(result)
                 # `list[dict]` -> `list`; a bare `dict` has no origin and is its own.
-                self.assertIsInstance(call(), typing.get_origin(declared) or declared)
+                self.assertIsInstance(result, typing.get_origin(declared) or declared)
+
+
+class HealthProbeTests(unittest.TestCase):
+    """The probe is answered on the event loop, for the reason the gateway's is.
+
+    `authorize` is a plain `def` that blocks on a hold for up to `HOLD_TIMEOUT`, and
+    Starlette runs it in a bounded threadpool. A sync `/healthz` shares that pool, so
+    enough blocked authorizes queue the probe and compose restarts the control plane
+    in the middle of the holds that made it look unhealthy — fail-closed egress for
+    every sandbox, caused by the healthcheck. `MAX_WAITERS` is under the pool's
+    default size today, which is what keeps it theoretical; this stops it depending
+    on two numbers in different files agreeing."""
+
+    def test_healthz_is_answered_on_the_event_loop(self):
+        self.assertTrue(asyncio.iscoroutinefunction(cp.healthz))
+
+    def test_every_listener_serves_the_same_probe(self):
+        # One function, three apps: the split is about which ROUTES each listener
+        # carries, and liveness is the one they deliberately share.
+        self.assertEqual(asyncio.run(cp.healthz()), {"status": "ok"})
 
 
 class RevokeRuleTests(_CPTestCase):

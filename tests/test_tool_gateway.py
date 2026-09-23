@@ -271,6 +271,26 @@ class ReconcileSurvivalTests(unittest.TestCase):
         self.assertIn("report:1", printed)
 
 
+class HealthProbeTests(unittest.TestCase):
+    """The probe is answered on the event loop, not from the tool-call threadpool.
+
+    Starlette runs a plain `def` endpoint in a bounded worker pool, and that pool is
+    where this process puts its BLOCKING work — a tool call holds a worker for up to
+    `execute.CALL_TIMEOUT`, and a held approval would hold one for longer still.
+    Sharing it with `/healthz` means enough slow calls queue the probe behind them and
+    compose restarts the container, killing the in-flight calls in order to report
+    that calls were slow. Asserted on the function rather than through a client,
+    because `async def` IS the fix: there is nothing else to observe."""
+
+    def test_healthz_is_answered_on_the_event_loop(self):
+        gateway = load_tool_gateway(GOOD)
+        self.assertTrue(asyncio.iscoroutinefunction(gateway.healthz))
+
+    def test_healthz_still_answers_ok(self):
+        gateway = load_tool_gateway(GOOD)
+        self.assertEqual(asyncio.run(gateway.healthz()), {"ok": True})
+
+
 class BodyCapTests(unittest.TestCase):
     """The agent's body is read up to a cap and no further.
 

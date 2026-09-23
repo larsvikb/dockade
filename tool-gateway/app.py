@@ -150,8 +150,17 @@ app = FastAPI(title="dockade MCP gateway", docs_url=None, redoc_url=None)
 
 
 @app.get("/healthz")
-def healthz() -> dict:
+async def healthz() -> dict:
     """Liveness only, and reachable by the agent — which is fine and worth saying.
+
+    ``async`` so it is answered ON THE EVENT LOOP and never waits for a worker
+    thread. Starlette runs a plain ``def`` endpoint in the same bounded threadpool
+    the MCP endpoint hands its blocking work to, and that pool is exactly what a
+    slow tool call occupies: enough concurrent calls, each holding a worker for up
+    to ``execute.CALL_TIMEOUT``, and the healthcheck queues behind them. Compose
+    restarts the container for it — killing the in-flight calls to report that
+    in-flight calls were slow. There is nothing to await here, which is what makes
+    the fix free: the body is a literal.
 
     This listener is the agent's by design, so there is no surface here it should
     not see. It reports nothing about policy, nothing about which servers are

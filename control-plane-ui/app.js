@@ -100,12 +100,20 @@ function payloadDisclosure(argsJson) {
 // while the bytes stay exactly as they are — the reordering DESIGN warns a view must
 // never do, performed by the renderer rather than by a prettifier.
 const INVISIBLE_RE = /[\p{Cf}\p{Cc}\p{Zl}\p{Zp}]/gu;
+// The same set for asking about ONE character. A `g` regex carries `lastIndex` across
+// calls, so `INVISIBLE_RE.test(ch)` alternates true and false on the same input — a
+// bug that would show up as a tally spelling half its overrides out and half of them
+// not.
+const INVISIBLE_ONE = /[\p{Cf}\p{Cc}\p{Zl}\p{Zp}]/u;
 // Everything outside printable ASCII, the invisible set included. Counted rather than
 // classified: U+0430 CYRILLIC SMALL LETTER A in an `owner` field is indistinguishable
-// from the Latin one on screen, and no confusables table is needed to say "this is not the plain text it
-// looks like". The count is what tells an operator whether escaped form is worth the
-// read.
+// from the Latin one on screen, and no confusables table is needed to say "this is not
+// the plain text it looks like".
 const NON_ASCII_RE = /[^\x20-\x7E]/gu;
+// How many DISTINCT characters the note names before it summarises the rest. Real
+// payloads carry one or two kinds of dash, not twenty, so this is about keeping a
+// pathological payload from writing an essay into the card.
+const HAZARD_TALLY_MAX = 4;
 
 // JSON's own escaping applied to a string that already IS JSON: every code point
 // outside printable ASCII becomes `\uXXXX`, astral ones as the surrogate pair JSON
@@ -124,26 +132,80 @@ function escapePayload(text) {
   });
 }
 
-// What the card has to say before the operator reads the arguments. `flagged` when
-// any character could make the visible text differ from the real one; `escaped` is
-// then the form the card shows FIRST, with the raw text one click away rather than
-// the reverse — a bidi override in the raw form can hide the very thing the note is
-// warning about. Counted by code point, not by byte, since it is characters the eye
-// misses.
+// WHICH characters, not just how many. An operator who has to untick the box and hunt
+// for what the note means is being asked to do the thing the note exists to save them
+// from. Ordered by count so the dominant character leads, then by code point so two
+// payloads with the same characters read the same way.
+//
+// An invisible character is always spelled `\uXXXX` here, including in this note — a
+// raw U+202E in the warning would reorder the warning, which is precisely the trick
+// being reported.
+//
+// The counts read `x3` in plain ASCII rather than `×3`, so the only character in the
+// parentheses that is not ASCII is the one being REPORTED. A multiplication sign here
+// would be indistinguishable from a multiplication sign in the payload — the note
+// would be committing the confusion it exists to point out. (`ruff`'s RUF001 makes the
+// same objection about the test that asserts this.)
+function hazardTally(text) {
+  const counts = new Map();
+  for (const ch of text.match(NON_ASCII_RE) || []) {
+    counts.set(ch, (counts.get(ch) || 0) + 1);
+  }
+  const ranked = [...counts].sort(
+    (a, b) => b[1] - a[1] || a[0].codePointAt(0) - b[0].codePointAt(0));
+  const shown = ranked.slice(0, HAZARD_TALLY_MAX).map(
+    ([ch, n]) => `${INVISIBLE_ONE.test(ch) ? escapePayload(ch) : ch} x${n}`);
+  if (ranked.length > shown.length) {
+    shown.push(`+${ranked.length - shown.length} more`);
+  }
+  return shown;
+}
+
+// What the card has to say before the operator reads the arguments, at one of TWO
+// levels — and the split is the point.
+//
+//   `danger`  an invisible or direction-changing character (`Cf`/`Cc`/`Zl`/`Zp`).
+//             None of these has a legitimate place in the canonical JSON form, and one
+//             of them makes the text on screen differ from the text that runs. The card
+//             opens itself and shows the ESCAPED form first, with raw one click away
+//             rather than the reverse — a bidi override in the raw form can hide the
+//             very thing the note is warning about.
+//   `note`    any other non-ASCII. Said, not shouted: the payload is shown exactly as
+//             it is, the card does not force itself open, and the escape toggle is
+//             there for anyone who wants it.
+//
+// One level for both was the first shape of this, and it was wrong in the direction
+// that costs the most. Ordinary prose in an argument — an em dash in a PR body, an
+// arrow in a commit message — flagged every card and rendered every payload as
+// `—` soup, which is harder to review, not easier. A warning that fires on
+// everything is one an operator learns to click past, and that habit is exactly what a
+// real U+202E needs to get through. The quiet tier keeps the reporting while leaving
+// the alarm for the characters that earn it.
+//
+// What the quiet tier gives up is the HOMOGLYPH case — a Cyrillic `а` in `owner` is
+// non-ASCII and perfectly visible. Catching that properly means mixed-script detection
+// within a token, not a blanket non-ASCII alarm, and it is deliberately a separate
+// question (see the note's wording: this tier reports, it does not vouch).
 function payloadHazards(argsJson) {
   const text = typeof argsJson === "string" ? argsJson : "";
   const invisible = (text.match(INVISIBLE_RE) || []).length;
   const nonAscii = (text.match(NON_ASCII_RE) || []).length;
-  const flagged = nonAscii > 0;
+  const level = invisible ? "danger" : nonAscii ? "note" : "none";
   const parts = [];
   if (invisible) parts.push(`${invisible} invisible or direction-changing`);
-  if (nonAscii - invisible) parts.push(`${nonAscii - invisible} non-ASCII`);
-  const note = flagged
-    ? `${parts.join(" and ")} character${nonAscii === 1 ? "" : "s"} in the arguments — `
-      + "what you read may not be what runs. Shown escaped; untick to see the raw text."
+  if (nonAscii - invisible) {
+    parts.push(`${nonAscii - invisible}${invisible ? " other" : ""} non-ASCII`);
+  }
+  const counted = `${parts.join(" and ")} character${nonAscii === 1 ? "" : "s"} `
+    + `in the arguments (${hazardTally(text).join(", ")})`;
+  const note = level === "danger"
+    ? `${counted} — what you read may not be what runs. Shown escaped; untick to see `
+      + "the raw text."
+    : level === "note"
+    ? `${counted} — nothing is hidden; tick to see them escaped.`
     : "";
-  return { flagged, invisible, nonAscii, note,
-           escaped: flagged ? escapePayload(text) : text };
+  return { level, invisible, nonAscii, note,
+           escaped: nonAscii ? escapePayload(text) : text };
 }
 
 // What a decided tool ask says on the card. "Allowed" is NOT "ran": the gateway
@@ -2010,25 +2072,27 @@ function start() {
     const hazards = payloadHazards(a.args_json);
     const details = document.createElement("details");
     details.className = "payload";
-    // A flagged payload starts OPEN whatever its size: the note below is only worth
-    // anything beside the text it is about.
-    details.open = disclosure.open || hazards.flagged;
+    // A DANGEROUS payload starts OPEN whatever its size: the note below is only worth
+    // anything beside the text it is about. A merely non-ASCII one is left alone —
+    // it gets the note and nothing else (see payloadHazards for why the two differ).
+    const danger = hazards.level === "danger";
+    details.open = disclosure.open || danger;
     const summary = document.createElement("summary");
     summary.textContent = disclosure.summary;
     const pre = document.createElement("pre");
     const raw = typeof a.args_json === "string" ? a.args_json : "";
-    pre.textContent = hazards.flagged ? hazards.escaped : raw;
+    pre.textContent = danger ? hazards.escaped : raw;
     details.append(summary);
-    if (hazards.flagged) {
+    if (hazards.level !== "none") {
       // Escaped FIRST, raw on request — see payloadHazards for why not the reverse.
       const hazard = document.createElement("div");
-      hazard.className = "hazard";
+      hazard.className = danger ? "hazard" : "hazard quiet";
       const note = document.createElement("span");
       note.textContent = hazards.note;
       const toggle = document.createElement("label");
       const box = document.createElement("input");
       box.type = "checkbox";
-      box.checked = true;
+      box.checked = danger;
       box.addEventListener("change", () => {
         pre.textContent = box.checked ? hazards.escaped : raw;
       });

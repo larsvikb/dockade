@@ -34,6 +34,7 @@ stream those belong in now exists, which is what made this the cheaper half.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
@@ -141,13 +142,22 @@ def _first_text(result: dict) -> str | None:
     return None
 
 
+class Unanswered(discovery.DiscoveryError):
+    """The request reached the control plane and no usable answer came back, so
+    whatever it does on receipt may have happened. For a decision that is one more
+    reason to refuse; for a CLAIM it means the approval may be spent."""
+
+
 def _ask_control(path: str, payload: dict) -> dict:
     """POST to the control plane's tool bridge and return its answer.
 
-    Raises ``DiscoveryError`` when there is no answer to be had. Reusing that type
-    rather than adding a second one: every caller here does the same thing with it —
-    refuse the call and say why — and a second exception would be two names for one
-    outcome. Its message is fit to print, which is the contract that matters.
+    Raises ``DiscoveryError`` when there is no answer to be had, and the subclass
+    ``Unanswered`` when the request was DELIVERED first. A decision is refused either
+    way, so ``call`` catches the base type; ``resume`` needs them apart, because only an
+    undelivered claim leaves the approval certainly untouched. The line between them is
+    urllib's own: it wraps a failure to connect or to SEND in ``URLError``, and lets
+    everything after the request is out — a read timeout, a reset, an unreadable body —
+    through unwrapped. Messages are fit to print, which is the contract that matters.
 
     A NON-200 IS STILL AN ANSWER on this bridge. ``/tool/authorize`` always returns 200
     because a policy question has a policy answer, but the claim endpoint uses 404 and
@@ -158,17 +168,20 @@ def _ask_control(path: str, payload: dict) -> dict:
         headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(request, timeout=DECIDE_TIMEOUT) as response:  # noqa: S310
-            return json.loads(response.read() or b"{}")
+            answer = json.loads(response.read() or b"{}")
     except urllib.error.HTTPError as exc:
         try:
-            return json.loads(exc.read() or b"{}")
-        except ValueError as parse_failure:
-            raise discovery.DiscoveryError(
-                f"HTTP {exc.code} from the control plane with no readable body"
-            ) from parse_failure
-    except (urllib.error.URLError, OSError, ValueError) as exc:
+            answer = json.loads(exc.read() or b"{}")
+        except (OSError, http.client.HTTPException, ValueError) as parse_failure:
+            raise Unanswered(f"HTTP {exc.code} with no readable body") from parse_failure
+    except urllib.error.URLError as exc:
         raise discovery.DiscoveryError(
-            f"the control plane did not answer ({exc})") from exc
+            f"the control plane could not be reached ({exc.reason})") from exc
+    except (OSError, http.client.HTTPException, ValueError) as exc:
+        raise Unanswered(f"{type(exc).__name__}: {exc}") from exc
+    if not isinstance(answer, dict):
+        raise Unanswered(f"a {type(answer).__name__} where an object was expected")
+    return answer
 
 
 def parse_call(raw: str) -> tuple[dict, str]:
@@ -343,7 +356,7 @@ def call(name: str, arguments: object, client: str | None) -> dict:
         # FAIL CLOSED, and loudly. A gateway that ran a call because it could not ask
         # would be a default-allow wearing an outage as a disguise.
         return text_result(
-            f"refused: the gateway could not reach governance to decide this call "
+            f"refused: the gateway got no answer from governance to decide this call "
             f"({exc}). Nothing ran.", is_error=True)
 
     decision, why = answer.get("decision"), answer.get("reason") or "no reason given"
@@ -391,6 +404,43 @@ def _resume_wait(arguments: object) -> float:
     return max(0.0, min(float(raw), MAX_RESUME_WAIT))
 
 
+#: Approval ids whose claim was delivered and got no usable answer, in this process.
+#: Wording only: a later "already claimed" for one of these may be that lost claim, and
+#: the agent should hear so rather than assume its call ran. "May", because a
+#: concurrent resumption of the same id could have been the one that won. Each id
+#: leaves on its next settled answer; a restart forgets them and costs only the
+#: sentence.
+_UNSETTLED: set[str] = set()
+
+
+def _pending(answer: dict) -> bool:
+    """A claim answer that means "a human has not decided yet", and nothing else.
+    ``terminal`` is checked as well as the status because a policy refusal carries the
+    ask's own status, which can itself be `pending`."""
+    return (not answer.get("ok") and not answer.get("terminal")
+            and answer.get("status") == "pending")
+
+
+def _unsettled(approval_id: str, client: str | None, why: str) -> dict:
+    """A claim the control plane received and did not usably answer. It may have
+    landed — the claim is written before its answer is sent — so the grant may be
+    spent with nothing run, and that is recorded as an outcome for the reason every
+    spent grant is: an approval must not end in silence. Server and tool are the
+    claim's to supply and it supplied nothing; the id is what joins the row to the
+    ask."""
+    _UNSETTLED.add(approval_id)
+    outcomes.record("transport-error", "(unknown)", "(unknown)",
+                    reason=f"the claim reached the control plane but got no usable "
+                           f"answer ({why}), so the call was never made; the approval "
+                           f"may be spent",
+                    approval_id=approval_id, client=client)
+    return text_result(
+        f"governance received the claim for {approval_id} but gave no usable answer "
+        f"({why}). Nothing ran. The claim may have gone through anyway, so try again "
+        f"with the same id; if that says it was already claimed, the call needs a new "
+        f"approval.", is_error=True)
+
+
 def resume(arguments: object, client: str | None) -> dict:
     """Finish a call that was held: claim the approval, then run what it released.
 
@@ -430,15 +480,17 @@ def resume(arguments: object, client: str | None) -> dict:
     while True:
         try:
             answer = _ask_control(f"/tool/asks/{approval_id}/claim", {"client": client})
+        except Unanswered as exc:
+            return _unsettled(approval_id, client, str(exc))
         except discovery.DiscoveryError as exc:
+            # Never delivered, so this one IS certain: the control plane did not see it.
             return text_result(
                 f"could not reach governance to claim {approval_id} ({exc}). Nothing "
                 f"ran, and the approval is untouched — try again.", is_error=True)
-        # Decided either way, or out of time: stop asking. Re-asking a PENDING claim is
-        # the same free question the agent would ask by calling again, which is what
-        # lets this loop exist without a second endpoint and without the control plane
-        # learning anything about waiting.
-        if answer.get("ok") or answer.get("terminal") or time.monotonic() >= deadline:
+        # Only PENDING is worth asking again. Re-asking it is the same free question the
+        # agent would ask by calling again, which is what lets this loop exist without a
+        # second endpoint and without the control plane learning anything about waiting.
+        if not _pending(answer) or time.monotonic() >= deadline:
             break
         time.sleep(min(RESUME_POLL_INTERVAL, max(0.0, deadline - time.monotonic())))
 
@@ -453,10 +505,19 @@ def resume(arguments: object, client: str | None) -> dict:
         if answer.get("terminal"):
             # `denied`, `expired`, or already spent. Said plainly and finally, because
             # an agent that cannot tell a refusal from a delay retries one forever.
+            lost = (" An earlier claim of it got no usable answer, so it may have been "
+                    "spent by that claim without its call running."
+                    if answer.get("spent") and approval_id in _UNSETTLED else "")
+            _UNSETTLED.discard(approval_id)
             return text_result(
-                f"{detail}. This is final — {approval_id} will not become runnable, "
-                f"so do not retry it. Call the tool again if the work is still "
-                f"needed; that raises a new question for the human.", is_error=True)
+                f"{detail}.{lost} This is final — {approval_id} will not become "
+                f"runnable, so do not retry it. Call the tool again if the work is "
+                f"still needed; that raises a new question for the human.",
+                is_error=True)
+        if not _pending(answer):
+            # Neither a verdict nor a delay. Reading it as pending would tell the agent
+            # a human is still deciding; it is the same unknown as a lost answer.
+            return _unsettled(approval_id, client, "a reply with no verdict in it")
         # STILL PENDING, and therefore not an error. Nobody has answered yet, nothing
         # has run, and the id is still good.
         waited = (f" Waited {wait:g}s for it." if wait else "")
@@ -469,6 +530,7 @@ def resume(arguments: object, client: str | None) -> dict:
 
     # Claimed. From here the call is authorised and the arguments are the approved
     # ones, parsed from the canonical form the digest covers and the human was shown.
+    _UNSETTLED.discard(approval_id)
     try:
         approved_args = json.loads(answer.get("args_json") or "null")
     except ValueError:

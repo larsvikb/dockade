@@ -1118,11 +1118,14 @@ def tool_claim(approval_id: str, req: ToolResumeRequest) -> JSONResponse:
         # come back later, `denied` and `expired` are terminal and must be
         # unmistakably so — an agent that cannot tell a refusal from a delay retries
         # one forever — and an already-claimed approval is spent rather than refused,
-        # which is the answer to a duplicate resumption of a call that already ran.
+        # which is the answer to a duplicate resumption. Spent, not "its call has run":
+        # the claim is written before the call, and a claim whose answer was lost on
+        # the way back spent the grant with nothing run.
         spent = current["status"] == "allowed" and current["claimed_at"] is not None
         return JSONResponse(
             {"ok": False,
-             "detail": ("this approval has already been claimed and its call has run"
+             "detail": ("this approval has already been claimed, and a claim is "
+                        "single-use"
                         if spent else
                         f"not claimable ({current['status']})"),
              "status": current["status"], "spent": spent,

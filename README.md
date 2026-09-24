@@ -293,6 +293,7 @@ dockade/
     tier-setup.sh           # tier hook: materialize Claude user settings
     claude-wrapper.sh       # the `claude` on PATH: adds --mcp-config when a gateway was found
     user-settings.json      # baked template, materialized to /config each boot
+    user-CLAUDE.md          # the agent's user-scope instructions, installed the same way
     statusline.sh           # sandbox-indicator status line
     dotfiles/               # .bashrc.tier — tier-1 shell hook (claude-yolo alias)
   opencode-sandbox/         # TIER 2 image — opencode + local LLM, no egress

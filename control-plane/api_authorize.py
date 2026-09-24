@@ -2,18 +2,13 @@
 """The egress proxy's question, ``POST /authorize`` — served on the authorize
 listener and nowhere else (see app.py).
 
-The authorize flow (one call from the proxy, `POST /authorize`). Every rule is scoped
-to a CLIENT CLASS — the ingress network the caller reached the proxy on, named by
-``policy._client_class`` — so "matches" below means matches for the class asking, and
-a rule written for one client population decides nothing for another:
-  - host matches a BLOCK rule            -> deny   (audited)
-  - host matches an ALLOW rule           -> allow  (audited)
-  - no matching rule                     -> HOLD: record a pending approval and
-    BLOCK the request until a human resolves it or CONTROL_HOLD_TIMEOUT elapses
-    (-> default-deny). The proxy only ever sees allow/deny; the hold is internal.
-    A request identical to one already held JOINS it rather than raising a second
-    approval, so a retrying agent produces one card and one decision — which is
-    also why one click can release several blocked requests (see holds._group_key).
+``policy._decide`` answers allow, deny or hold for the CLIENT CLASS asking (the
+ingress network the caller reached the proxy on), so a rule written for one population
+decides nothing for another. Allow and deny are audited and returned. A hold BLOCKS the
+request until a human resolves it or CONTROL_HOLD_TIMEOUT elapses and default-denies;
+the proxy only ever sees allow or deny. A request identical to one already held JOINS
+it (``holds._group_key``), so a retrying agent raises one card, and one click can
+release several waiting requests.
 """
 from __future__ import annotations
 
@@ -48,18 +43,12 @@ class AuthorizeResponse(BaseModel):
 def _decision_scope(status_row) -> str:
     """How far a human's decision reached, for the audit reason a released waiter
     writes. Read from the durable ``mode`` column, so it reports what was RECORDED
-    rather than what was asked for.
+    rather than what was asked for. No row at all is the expiry path, whose reason
+    does not use this.
 
-    A function rather than the inline conditional it replaced, because there are three
-    modes now and the middle one is the reason: a lease is neither "this request only"
-    nor standing policy, and a log that collapsed it into either would misreport the one
-    thing an operator comes to this line to find out. `None` — no resolver row at all —
-    is the expiry path, which reached nothing.
-
-    Naming the lease's own deadline here would mean a second read of the ``leases``
-    table per released request; the configured duration is the same for every lease and
-    the row itself carries the exact instant (``/api/egress/leases``), so this states
-    the duration and lets that be the record."""
+    A lease states the configured duration, not its own deadline: that would be a
+    second read of ``leases`` per released request, and the lease row already carries
+    the exact instant (``/api/egress/leases``)."""
     mode = status_row["mode"] if status_row else None
     if mode == "persist":
         # Names the PATTERN, because "allow api.example.co.uk" and "allow .co.uk"
@@ -74,26 +63,21 @@ def _decision_scope(status_row) -> str:
 
 @router.post("/authorize", response_model=AuthorizeResponse)
 def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
-    # Derived HERE, once, and carried through every write this request makes — the
-    # audit rows, the approvals row, and via that row the rule a persist writes. One
-    # derivation rather than several means the value that DECIDED the request is the
-    # same one that gets recorded, by construction instead of by two lookups agreeing.
+    # Derived once and carried through every write this request makes: the audit
+    # rows, the approvals row, and through that row the rule a persist writes. So the
+    # class that DECIDED the request is the one recorded, by construction.
     client_class = policy._client_class(req.client)
     decision, reason = policy._decide(req.host, client_class)
 
     if decision in ("allow", "deny"):
-        # Every decision is audited — no governed path bypasses the log (CLAUDE.md).
         store._audit(decision, stage=req.stage, host=req.host, port=req.port,
                      proto=req.proto, client=req.client, client_class=client_class,
                      method=req.method, url=req.url, reason=reason)
         return AuthorizeResponse(decision=decision, reason=reason)
 
-    # HOLD (bounded): reserve a hold slot atomically with the cap check, so
-    # concurrent holds can't race past the cap. Over the global or per-client cap,
-    # fail CLOSED immediately rather than registering another worker-blocking hold.
-    # A request identical to one already held JOINS it instead of raising a second
-    # card (holds._group_key) — a retrying agent used to fill its whole card budget
-    # with copies of one question.
+    # HOLD, bounded. The cap check and the reservation are one atomic step, so
+    # concurrent holds cannot race past a cap; over the global or per-client cap this
+    # fails CLOSED at once rather than blocking another worker.
     slot = holds._reserve_hold(uuid.uuid4().hex, threading.Event(), req.client,
                                req.host, req.port, req.proto)
     if slot.refused is not None:
@@ -103,21 +87,16 @@ def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
         return AuthorizeResponse(decision="deny", reason=slot.refused)
     approval_id, event = slot.approval_id, slot.event
 
-    # From here the slot is RESERVED, so every exit has to give it back — which is what
-    # the `finally` is for, and it is not defensive habit. A reservation that leaks is
-    # not merely a lost slot: `_GROUPS` still names this approval id, so every later
-    # request with the same (client, host, port, proto) JOINS a card that has no
-    # approvals row and no waiter coming for it. Those requests block out the original
-    # window, default-deny with a reason that reads as operator inaction, and never
-    # raise a card anyone can approve — so one failed write makes that destination
-    # permanently un-decidable, and enough of them exhaust MAX_WAITERS and fail every
-    # sandbox's holds closed until a restart. The store write below is the reachable
-    # trigger (a full disk, a lock held past the busy timeout).
+    # The slot is RESERVED from here, and the `finally` is what gives it back. A leaked
+    # reservation leaves `_GROUPS` naming this approval id, so every later request with
+    # the same (client, host, port, proto) joins a card with no approvals row and no
+    # waiter: it blocks out the window and default-denies as if the operator ignored
+    # it, and nothing for that destination can be approved until a restart. Enough of
+    # them exhaust MAX_WAITERS and fail every sandbox's holds closed. The store write
+    # below is the reachable trigger (a full disk, a lock past the busy timeout).
     #
-    # Nothing is audited on that path and nothing needs to be: the exception becomes a
-    # 500, the proxy's `_authorize` fails closed on it, and the proxy writes the denial
-    # to its own stream, which the ingest picks up. The decision is recorded by the
-    # component that made it.
+    # That path audits nothing here: the 500 makes the proxy's `_authorize` fail
+    # closed, and the proxy records the denial in its own stream, which is ingested.
     try:
         if not slot.joined:
             now = time.time()
@@ -129,10 +108,9 @@ def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
                     (approval_id, now, req.host, req.port, req.proto, req.client,
                      client_class, req.method, req.url))
                 conn.commit()
-        # Audited PER REQUEST either way, with this request's own method and url,
-        # because grouping is a concept of the screen and the worker pool — never of
-        # the record. The joiner's reason names the card it attached to, so the log
-        # explains on its own terms why four requests produced one approval and one
+        # Audited PER REQUEST, joined or not, with this request's own method and url:
+        # grouping belongs to the screen and the worker pool, never to the record. A
+        # joiner's reason names the card, so the log shows why four requests got one
         # decision.
         store._audit("hold", stage=req.stage, host=req.host, port=req.port,
                      proto=req.proto, client=req.client, client_class=client_class,
@@ -142,15 +120,13 @@ def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
                              if slot.joined else "held for approval"))
 
         # Block until a human resolves this hold or the window elapses. The wakeup is
-        # advisory: the DURABLE approvals row is the single source of truth for the
-        # outcome. Exactly one of this timeout path and resolve() flips the row out of
-        # 'pending' — each via an atomic conditional UPDATE (…WHERE status='pending')
-        # that SQLite serializes — so a resolve landing just as the hold times out can
-        # no longer leave the row 'allowed' (and persist a rule) while the agent is
-        # told 'deny'. Whoever's UPDATE wins decides; the loser reads the winner's row.
-        # The card's remaining window, not a fresh one — see holds._PENDING_DEADLINE.
-        # Every waiter on a card therefore wakes at the same instant, which is what
-        # lets them race harmlessly for the expiry UPDATE below.
+        # advisory; the DURABLE approvals row is the outcome. This timeout and
+        # ``resolve`` each flip the row out of 'pending' with a conditional UPDATE
+        # (…WHERE status='pending'), so exactly one of them decides and the other reads
+        # its row. Otherwise a resolve landing as the hold times out could leave the
+        # row 'allowed', and a rule written, while the agent is told 'deny'.
+        # The card's remaining window, not a fresh one (``holds._PENDING_DEADLINE``),
+        # so every waiter on a card wakes at once and races harmlessly for the expiry.
         event.wait(max(0.0, slot.deadline - time.time()))
         with store._connect() as conn:
             expired = conn.execute(
@@ -168,17 +144,13 @@ def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
     finally:
         holds._release_hold(approval_id)
 
-    # Carry the resolver's provenance (recorded by resolve()) into the audit reason,
-    # so the log answers "who granted this egress" and not merely "a human did".
+    # The resolver's provenance, so the log says who granted this egress and not
+    # merely that a human did.
     actor = (status_row["resolved_by"] if status_row else None) or "actor unrecorded"
-    # How far the decision REACHED belongs in the audit line: three modes that are the
-    # same allow for this request and very different afterwards, and the log said
-    # nothing about which had happened. See ``_decision_scope``.
     scope = _decision_scope(status_row)
-    # Read the STATUS rather than "did I win the expiry UPDATE": with duplicates
-    # grouped, several waiters wake together and only one of them wins it. The losers
-    # read status='expired' and must report the timeout too — testing `expired` alone
-    # would have told every one of them a human had rejected their request.
+    # The STATUS, not "did I win the expiry UPDATE": grouped waiters wake together and
+    # only one wins it. Testing `expired` alone would tell the losers that a human
+    # rejected their request.
     status = "expired" if expired or status_row is None else status_row["status"]
     if status == "expired":
         final, why = "deny", "no decision within hold timeout — default-deny"

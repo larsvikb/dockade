@@ -1,22 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """Provenance — who performed a privileged act, for the durable record.
 
-Granting egress is the privileged act here, and there are two ways to perform it:
-resolving a hold, and writing a standing rule outright (``create_rule``, the config-
-first half of policy — the other three rule paths are all downstream of a request the
-agent already made). Both record the PROVENANCE of whoever did it (``_actor``) — on
-the durable approvals row (``resolved_by``) and in the audit reason for a resolution,
-in the audit reason for a rule written or revoked. That is detection, not prevention:
-the self-reported fields are forgeable by a host-local caller. It exists so a forged approval is at least visible in the
-record afterwards, which it previously was not — an operator's click and a
-scripted POST were indistinguishable once written.
+Whoever resolves an approval or changes policy is recorded as ``_actor(request)`` in
+the audit row, and for a resolution also on the row it writes (``resolved_by``, a
+lease's ``granted_by``). It is detection, not prevention: a process on the host can
+forge every self-reported field, and only a human-presence gesture the host cannot
+replay would close that (DESIGN.md, "Approval provenance — detection where prevention
+is not available"). Until then, a forged act should at least read differently in the
+record from an operator's click.
 """
 from __future__ import annotations
 
-# Header the control-plane-ui relay uses to assert the BROWSER's address. The relay
-# strips any client-supplied copy before setting it (see control-plane-ui/app.py),
-# so a caller cannot self-report this value — but it is only as trustworthy as the
-# relay, which is why _actor labels it as asserted rather than observed.
+# The header the control-plane-ui relay sets to the BROWSER's address. The relay
+# strips any client-supplied copy first (control-plane-ui/app.py), so a caller cannot
+# self-report it, but it is only as trustworthy as the relay: hence ``via-ui=``,
+# asserted rather than observed. A test pins the name against the relay's.
 ACTOR_HEADER = "x-dockade-actor"
 # Bound each recorded self-reported header (User-Agent, Origin) so a hostile one
 # cannot bloat the store.
@@ -24,22 +22,12 @@ _ACTOR_UA_MAX = 120
 
 
 def _actor(request) -> str:
-    """Compact provenance for whoever resolved an approval, for the durable record.
-
-    The trust level differs per field, so the labels distinguish them:
-      - ``peer``   — the socket address this process itself observed. Unforgeable by
-        the caller, but for anything arriving through the UI it is the
-        control-plane-ui container, so it identifies the RELAY, not the human.
+    """The actor string, in labelled fields because each is trusted differently:
+      - ``peer``   — the socket address this process observed. The caller cannot forge
+        it, but through the UI it is the relay's address, not the human's.
       - ``via-ui`` — the browser address the relay asserts (``ACTOR_HEADER``).
-      - ``origin`` / ``ua`` — self-reported by the client, therefore forgeable.
-        Recorded anyway because they are usually what betrays a non-browser caller.
-
-    DETECTION, not prevention. A process running on the host can forge every
-    self-reported field, and origin/Host checks in the relay are browser-enforced so
-    they do not constrain it either. Preventing host-local forgery needs a human
-    presence gesture the host cannot replay (WebAuthn user-presence or an
-    out-of-band confirm) — see DESIGN.md. Until then the goal is that a forged
-    approval leaves a trace that reads differently from an operator's click."""
+      - ``origin`` / ``ua`` — self-reported, so forgeable. Recorded anyway because they
+        are usually what betrays a non-browser caller."""
     if request is None:                      # hand-invoked / non-HTTP caller
         return "unrecorded (no request context)"
     client = getattr(request, "client", None)

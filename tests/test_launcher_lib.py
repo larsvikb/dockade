@@ -157,5 +157,94 @@ class EnsureNetworkTests(unittest.TestCase):
         self.assertEqual(run.status, 0, run.stderr)
 
 
+
+_GUARD_HARNESS = ('set -euo pipefail; source "$1"; sc_guard_workspace "$2"; '
+                  'printf "%s\\n" "$SC_WORKSPACE"')
+_MARKETPLACE_HARNESS = 'set -euo pipefail; source "$1"; sc_marketplaces'
+
+
+@unittest.skipUnless(_BASH or _STRICT, "bash is not installed")
+class WorkspaceGuardTests(unittest.TestCase):
+    """``sc_guard_workspace`` on a host laid out as we say.
+
+    The Windows half is S30: on WSL the user's Windows profile is mounted at
+    ``/mnt/c/Users/<name>``, far from ``$HOME``, so the home-directory checks never
+    saw it. The profile is recognised by its registry hive, so the tree below is a
+    fake one in a temp directory — which is also why the rule cannot depend on
+    WSL being the host."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name).resolve()
+        self.home = self.root / "home" / "alice"
+        self.home.mkdir(parents=True)
+        self.drive = self.root / "mnt" / "c"
+        self.profile = self.drive / "Users" / "Alice"
+        self.project = self.profile / "source" / "app"
+        self.project.mkdir(parents=True)
+        (self.profile / "NTUSER.DAT").touch()
+
+    def guard(self, workspace, **env_over):
+        env = {k: v for k, v in os.environ.items() if k != "ALLOW_UNSAFE_WORKSPACE"}
+        env.update(HOME=str(self.home), **env_over)
+        return subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
+            [_BASH, "-c", _GUARD_HARNESS, "sc_guard_workspace", str(LIB),
+             str(workspace)], capture_output=True, text=True, env=env, timeout=60)
+
+    def assertRefused(self, proc, why):
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("REFUSING to mount workspace", proc.stderr)
+        self.assertIn(why, proc.stderr)
+
+    def test_a_windows_profile_is_refused_like_a_home_directory(self):
+        self.assertRefused(self.guard(self.profile), "that is a Windows user profile")
+
+    def test_every_directory_holding_a_profile_is_refused_and_names_it(self):
+        # The Users folder, the drive root, and the mount root holding the drives —
+        # the three places a WSL user might reasonably `cd` to and launch from.
+        for workspace in (self.drive / "Users", self.drive, self.drive.parent):
+            with self.subTest(workspace=workspace):
+                self.assertRefused(self.guard(workspace), f"({self.profile})")
+
+    def test_a_project_inside_a_profile_is_allowed(self):
+        # The ordinary WSL layout, like a project under $HOME: the guard refuses the
+        # profile, not everything in it.
+        proc = self.guard(self.project)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), str(self.project))
+
+    def test_the_override_still_overrides(self):
+        proc = self.guard(self.profile, ALLOW_UNSAFE_WORKSPACE="1")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_the_home_directory_rules_still_hold(self):
+        # Untested until now, and the Windows rule was added beside them.
+        self.assertRefused(self.guard(self.home), "that is your home directory")
+        self.assertRefused(self.guard(self.home.parent), "your home directory")
+        self.assertRefused(self.guard(Path("/")), "that is the filesystem root")
+
+    def test_an_ordinary_directory_is_allowed_and_resolved(self):
+        plain = self.root / "work" / "app"
+        plain.mkdir(parents=True)
+        link = self.root / "link"
+        link.symlink_to(plain)
+        proc = self.guard(link)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), str(plain))
+
+    def test_the_marketplaces_mount_is_held_to_the_same_rule(self):
+        # Its guard says it refuses what this one refuses; read-only stops the agent
+        # writing a profile, not reading one.
+        env = dict(os.environ, HOME=str(self.home),
+                   SANDBOX_MARKETPLACES_DIR=str(self.profile))
+        proc = subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
+            [_BASH, "-c", _MARKETPLACE_HARNESS, "sc_marketplaces", str(LIB)],
+            capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("REFUSING to mount marketplaces", proc.stderr)
+        self.assertIn("that is a Windows user profile", proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

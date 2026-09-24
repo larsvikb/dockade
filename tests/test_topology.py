@@ -519,6 +519,18 @@ def _gateway_forbidden_default() -> set[str]:
     return {part.strip() for part in match.group(1).split(",") if part.strip()}
 
 
+def _gateway_mcp_net_default() -> str:
+    """The network tool-gateway/discovery.py lets a credential be sent to. Read out of
+    the source for the reason ``_gateway_forbidden_default`` is."""
+    source = (ROOT / "tool-gateway" / "discovery.py").read_text()
+    match = re.search(r'"GATEWAY_MCP_NET",\s*"([^"]+)"', source)
+    if not match:
+        raise AssertionError(
+            "tool-gateway/discovery.py no longer has a GATEWAY_MCP_NET default this can "
+            "read, so where credentials go is no longer held equal to mcp-net")
+    return match.group(1)
+
+
 class GatewayPlacementTests(unittest.TestCase):
     """The gateway is triple-homed, and only ONE of the three legs is served on.
 
@@ -533,6 +545,15 @@ class GatewayPlacementTests(unittest.TestCase):
         # breaks nothing at runtime and every probe below would keep passing.
         self.assertEqual(_networks_of("tool-gateway"),
                          {"sandbox-net", "mcp-net", "tool-authorize-net"})
+
+    def test_credentials_go_only_to_the_mcp_net_compose_deploys(self):
+        # The gateway checks a server's resolved address against this before sending
+        # its bearer token. A default that drifted from the real subnet would refuse
+        # every server — loud — or, worse, admit a network the agent is on.
+        self.assertEqual(_gateway_mcp_net_default(), _subnet_of("mcp-net"))
+        override = _environment_of("tool-gateway").get("GATEWAY_MCP_NET")
+        if override is not None:
+            self.assertEqual(override.strip('"\''), _subnet_of("mcp-net"))
 
     def test_the_gateway_has_no_egress_of_its_own(self):
         # The whole point of the servers' egress going through the proxy is that a

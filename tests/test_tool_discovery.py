@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import contextlib
 import json
+import socket
+import threading
 import unittest
 from unittest import mock
 
@@ -108,6 +110,123 @@ class ParseTests(unittest.TestCase):
         self.assertIn("expected a JSON object", report)
 
 
+def _resolves_to(*addresses):
+    """A ``getaddrinfo`` that answers with ``addresses``, in order — Docker DNS for a
+    name the gateway can see on more than one network."""
+    def getaddrinfo(host, port, *args, **kwargs):
+        return [(2, 1, 6, "", (address, port)) for address in addresses]
+    return getaddrinfo
+
+
+class PlacementTests(unittest.TestCase):
+    """Where a server's credential may go (S21). The gateway dials by name and Docker
+    DNS answers from every network it shares, sandbox-net included, so the address is
+    what decides — and it has to be on mcp-net."""
+
+    def setUp(self):
+        self.discovery = load_discovery()
+        self.discovery.read_secret = lambda server: "the-token"
+        self.dialled = []
+
+        @contextlib.contextmanager
+        def urlopen(request, *args, **kwargs):
+            self.dialled.append(request)
+            yield mock.Mock(read=lambda: sse({"tools": []}).encode())
+
+        patcher = mock.patch("urllib.request.urlopen", urlopen)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def post(self, *addresses):
+        with mock.patch("socket.getaddrinfo", _resolves_to(*addresses)):
+            return self.discovery.post("mcp-github", {"id": 1}, ENTRY["auth"])
+
+    def test_the_server_is_dialled_at_its_mcp_net_address_under_its_own_name(self):
+        self.post("172.28.0.11")
+        [request] = self.dialled
+        self.assertEqual(request.full_url, "http://172.28.0.11:8082/mcp")
+        # What urllib sent when the name was in the URL, so the server sees no change.
+        self.assertEqual(request.get_header("Host"), "mcp-github:8082")
+        self.assertEqual(request.get_header("Authorization"), "Bearer the-token")
+
+    def test_a_name_that_leads_off_mcp_net_is_not_sent_the_credential(self):
+        # The finding: a sandbox-net container answering to a server's name.
+        with self.assertRaises(self.discovery.DiscoveryError) as caught:
+            self.post("172.30.0.9")
+        self.assertEqual(self.dialled, [])
+        self.assertIn("172.30.0.9", str(caught.exception))
+        self.assertIn("mcp-net", str(caught.exception))
+
+    def test_the_mcp_net_answer_is_chosen_whatever_order_dns_gives(self):
+        self.post("172.30.0.9", "172.28.0.11")
+        self.assertEqual(self.dialled[0].full_url, "http://172.28.0.11:8082/mcp")
+
+    def test_a_name_that_does_not_resolve_dials_nothing(self):
+        def unresolvable(*args, **kwargs):
+            raise OSError("Name or service not known")
+
+        with mock.patch("socket.getaddrinfo", unresolvable), \
+                self.assertRaises(self.discovery.DiscoveryError) as caught:
+            self.discovery.post("mcp-github", {"id": 1}, ENTRY["auth"])
+        self.assertEqual(self.dialled, [])
+        self.assertIn("does not resolve", str(caught.exception))
+
+    def test_the_name_is_resolved_once_and_the_answer_is_what_is_dialled(self):
+        # Checking one lookup and connecting on another would check one answer and
+        # use another. The URL carrying the address is what makes the second lookup
+        # impossible, so it is the thing asserted.
+        calls = []
+
+        def counting(host, port, *args, **kwargs):
+            calls.append(host)
+            return [(2, 1, 6, "", ("172.28.0.11", port))]
+
+        with mock.patch("socket.getaddrinfo", counting):
+            self.discovery.post("mcp-github", {"id": 1}, ENTRY["auth"])
+        self.assertEqual(calls, ["mcp-github"])
+        self.assertTrue(self.dialled[0].host.startswith("172.28.0.11"))
+
+    def test_a_network_that_cannot_be_parsed_refuses_to_start(self):
+        with self.assertRaises(SystemExit) as caught:
+            load_discovery({"GATEWAY_MCP_NET": "not-a-cidr"})
+        self.assertIn("GATEWAY_MCP_NET", str(caught.exception))
+
+
+class PlacementOnTheWireTests(unittest.TestCase):
+    """The same property through the real urllib: the connection goes to the checked
+    address and the request line still names the server. Loopback stands in for
+    mcp-net, so the check under test is the real one with a different network."""
+
+    def test_the_request_on_the_wire_names_the_server_not_the_address(self):
+        listener = socket.create_server(("127.0.0.1", 0))
+        self.addCleanup(listener.close)
+        port = listener.getsockname()[1]
+        seen = []
+
+        def serve():
+            conn, _ = listener.accept()
+            with conn:
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    data += conn.recv(65536)
+                seen.append(data.decode("latin-1"))
+                body = sse({"tools": []}).encode()
+                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                             b"Content-Length: %d\r\nConnection: close\r\n\r\n%s"
+                             % (len(body), body))
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 2)
+        discovery = load_discovery({"GATEWAY_MCP_NET": "127.0.0.0/8",
+                                    "GATEWAY_MCP_PORT": str(port)})
+        with mock.patch("socket.getaddrinfo", _resolves_to("127.0.0.1")):
+            discovery.post("mcp-github", {"id": 1}, {"type": "none"})
+        head = seen[0].lower()
+        self.assertIn(f"host: mcp-github:{port}\r\n", head)
+        self.assertEqual(head.count("host:"), 1)
+
+
 class TrimTests(unittest.TestCase):
     """What survives a server's reply, and where each narrowing happens.
 
@@ -127,7 +246,8 @@ class TrimTests(unittest.TestCase):
         def urlopen(*_args, **_kwargs):
             yield mock.Mock(read=lambda: sse({"tools": [tool]}).encode())
 
-        with mock.patch("urllib.request.urlopen", urlopen):
+        with mock.patch("urllib.request.urlopen", urlopen), \
+                mock.patch("socket.getaddrinfo", _resolves_to("172.28.0.11")):
             tools = self.discovery.list_tools("mcp-github", {"type": "none"})
         return tools[0]
 

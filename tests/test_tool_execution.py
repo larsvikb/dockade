@@ -902,6 +902,15 @@ class ControlAnswerTests(unittest.TestCase):
         # certainly untouched.
         with socket.create_server(("127.0.0.1", 0)) as probe:
             port = probe.getsockname()[1]
+        # Not every stack refuses it: under WSL2's mirrored networking the connect
+        # succeeds and the request is then reset (NOTES.md), which `Unanswered` rightly
+        # reads as maybe-delivered. There the precondition cannot be produced at all.
+        with socket.socket() as raw:
+            raw.settimeout(2)
+            if raw.connect_ex(("127.0.0.1", port)) == 0:
+                self.skipTest("this machine accepts a connection to a closed loopback "
+                              "port (WSL2 mirrored networking, see NOTES.md), so a "
+                              "refused connection cannot be produced here")
         self.execute.CONTROL_URL = f"http://127.0.0.1:{port}"
         with self.assertRaises(self.execute.discovery.DiscoveryError) as caught:
             self.ask()

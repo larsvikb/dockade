@@ -263,7 +263,7 @@ class InstructionFileTests(_NeedsGit):
 
     Adding one is fine; this makes it a decision rather than an accident."""
 
-    INTENDED: ClassVar[set] = {"CLAUDE.md"}
+    INTENDED: ClassVar[set] = {"CLAUDE.md", "control-plane/CLAUDE.md"}
 
     def test_every_claude_md_is_meant_as_instructions(self):
         found = {f for f in _tracked()

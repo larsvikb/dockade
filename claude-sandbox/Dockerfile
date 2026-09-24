@@ -195,7 +195,10 @@ COPY claude-sandbox/user-settings.json /etc/claude-code/user-settings.json
 # managed-settings note above: a local managed *settings* file is ignored under
 # org auth, a local managed *CLAUDE.md* is not. `.template` keeps this file inert
 # until tier-setup.sh puts it where it belongs (user scope). See NOTES.md.
-COPY claude-sandbox/CLAUDE.md /etc/claude-code/CLAUDE.md.template
+# The SOURCE is not named CLAUDE.md either, for the same reason one level up: a
+# subdirectory's CLAUDE.md is loaded as project instructions whenever a session
+# reads a file beside it, which on the host would tell that session it is in here.
+COPY claude-sandbox/user-CLAUDE.md /etc/claude-code/CLAUDE.md.template
 COPY claude-sandbox/statusline.sh /etc/claude-code/statusline.sh
 COPY claude-sandbox/tier-setup.sh /usr/local/bin/tier-setup.sh
 # Shadows ~/.local/bin/claude on PATH — see the PATH note above. Root-owned, so the

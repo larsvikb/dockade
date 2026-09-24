@@ -254,6 +254,25 @@ class DocPathReferenceTests(_NeedsGit):
                                        "or the docs changed shape")
 
 
+class InstructionFileTests(_NeedsGit):
+    """Every tracked ``CLAUDE.md`` is one somebody meant as instructions for working
+    in the repo. Claude Code loads the root one at launch and a subdirectory's when a
+    session reads a file beside it, so the NAME alone makes a file instructions. The
+    sandbox's baked user-scope file carried it, and told any session reading
+    ``claude-sandbox/`` that it had no `git push` and no Docker — on the host too.
+
+    Adding one is fine; this makes it a decision rather than an accident."""
+
+    INTENDED: ClassVar[set] = {"CLAUDE.md"}
+
+    def test_every_claude_md_is_meant_as_instructions(self):
+        found = {f for f in _tracked()
+                 if f.rsplit("/", 1)[-1] in ("CLAUDE.md", "CLAUDE.local.md")}
+        self.assertEqual(found, self.INTENDED,
+                         "a file named CLAUDE.md is loaded as instructions by path; "
+                         "rename one that is not, or list one that is here")
+
+
 class MarkdownAnchorTests(_NeedsGit):
     """Every in-document link resolves to a heading in that document.
 

@@ -132,7 +132,7 @@ TESTFILES := $(shell git ls-files 'tests/*.py' 2>/dev/null)
 # rename can't silently break the build.
 REFFILES := $(SCRIPTS) \
             claude-sandbox/user-settings.json \
-            claude-sandbox/CLAUDE.md \
+            claude-sandbox/user-CLAUDE.md \
             opencode-sandbox/opencode.json \
             opencode-sandbox/AGENTS.md \
             sandbox-common/dotfiles/.bashrc \

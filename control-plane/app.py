@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-Control plane — governance authority for the governed data-plane proxies.
-
-Step 2b: policy + audit + **hold-for-approval**. The management app the agent can
-never reach — it lives on internal networks the sandbox is not attached to.
-Governed proxies call it on the control path to authorize connections; unknown
-requests are held for a human, who approves/rejects them in a live UI.
+Control plane — the governance authority the data plane asks: policy, audit and
+hold-for-approval, on internal networks the sandbox is not attached to. The egress
+proxy and the MCP gateway ask it before acting, and what policy does not decide is
+held for a human, who answers in the UI.
 
 This file is the PROCESS — the three listeners, which surface each one serves, the
 boot, and the entry point. The routes live one module per surface, each on its own
@@ -17,7 +15,7 @@ router, and are mounted on a listener here and nowhere else:
   - ``api_egress``    — standing egress rules, and the leases a card granted.
   - ``api_mcp``       — MCP servers and tool rules.
   - ``api_views``     — the audit record, the UI's settings, /status. Grants nothing.
-  - ``provenance``    — ``_actor``, recorded by every write that grants.
+  - ``provenance``    — ``_actor``: who resolved an approval or changed policy.
 
 The machinery those routes drive lives beside them, one module per concern, and
 every call is written qualified (``policy._decide``, ``holds._reserve_hold``) so a
@@ -36,47 +34,42 @@ They import in that order and never back. The ``api_*`` modules import them and
 ``provenance`` but never each other, and nothing imports this file.
 
 THREE LISTENERS, on three networks, because the dangerous surface is the management
-API and not the questions the enforcers ask it. Both ways of granting egress live on
-the management one — `resolve` and `create_rule` — so anything that reaches it can
-self-approve, while an enforcer's bridge can only ever answer a policy question.
-They are therefore served separately (``main``):
+API, not the questions the enforcers ask it. Every way of granting lives on the
+management one (`resolve` and every policy write), so anything that reaches it can
+self-approve, while an enforcer's bridge can only answer a policy question:
 
   - the AUTHORIZE listener (CONTROL_AUTHORIZE_PORT, on authorize-net) serves
     exactly POST /authorize and GET /healthz — ``authorize_app`` below. It is the
     only surface the egress proxy has a route to.
   - the TOOL listener (CONTROL_TOOL_PORT, on tool-authorize-net) serves the MCP
-    gateway's three questions and nothing else — ``tool_app`` below.
+    gateway's bridge and nothing else — ``tool_app`` below.
   - the MANAGEMENT listener (CONTROL_MANAGE_PORT, bound to the control-net address
     ALONE — a wildcard bind is refused at startup) serves everything else, and is
     reachable only from control-plane-ui.
 
-The two enforcer bridges are separate networks and separate sockets rather than one
-shared "ask policy" surface, because a lateral edge between two enforcers is what
-splitting them bought its way out of: the proxy's relay guard is best-effort by
-construction, and a bypassed proxy must not gain a route to the gateway's claim
-endpoint, which is the one place a side effect gets released. That is also why the
-TOOL listener binds ONE address where the authorize listener binds the wildcard —
-the asymmetry is not an oversight, it is the whole point (see
-``_assert_listeners_separated``).
+The two enforcer bridges are separate networks and sockets, not one shared "ask
+policy" surface. The proxy's relay guard is best-effort by construction, and a
+bypassed proxy must not gain a route to the gateway's claim endpoint, the one place
+a side effect is released. That is why the TOOL listener binds ONE address where the
+authorize listener binds the wildcard (``_assert_listeners_separated``).
 
 This is blast-radius containment, not the primary control: the agent is kept off
 this service by network topology, by the proxy's relay guard and by the proxy's
 port gate. What the split adds is that all three failing at once yields a policy
 QUERY rather than a self-approval. See DESIGN.md.
 
-Concurrency model: run under a SINGLE uvicorn worker. `/authorize` and the
-resolve endpoint are sync (FastAPI runs them in a threadpool); a held request
-blocks its worker on a threading.Event that the resolve endpoint sets. Blocked
-workers are bounded (CONTROL_MAX_WAITERS / CONTROL_MAX_WAITERS_PER_CLIENT) so a
-sandbox cannot pin every worker and stall governance for all sandboxes; CARDS are
-bounded separately (CONTROL_MAX_PENDING / CONTROL_MAX_PENDING_PER_CLIENT), which
-protects the operator's attention rather than the pool — see holds.py for why the
-two nouns need four caps. Over any of them /authorize fails closed. The SQLite store is the source of truth for the UI
-(the SSE stream polls it). Do NOT run multiple workers — the pending-event
-registry is in-process (holds.py). That constraint is also why the listeners
-above are separate sockets in ONE process rather than separate services: a held
-/authorize and the `resolve` that releases it must share memory, precisely because
-they must not share a socket.
+Concurrency: a SINGLE uvicorn worker. `/authorize` and `resolve` are sync (run in
+a threadpool), and a held request blocks its worker on a threading.Event that
+`resolve` sets. Blocked workers are capped (CONTROL_MAX_WAITERS, and per client) so
+one sandbox cannot stall governance for all; cards are capped separately
+(CONTROL_MAX_PENDING, and per client) to protect the operator's attention. holds.py
+says why the two nouns need four caps. Over any cap, /authorize fails closed. The
+SQLite store is the UI's source of truth (the SSE stream polls it).
+
+Never run more than one worker: the registry a held request waits on is in-process
+(holds.py). It is also why the listeners are three sockets in ONE process rather
+than three services: a held /authorize and the `resolve` that releases it must share
+memory, precisely because they must not share a socket.
 
 No egress: this service sits on control-net, authorize-net and tool-authorize-net,
 all internal. It must never be given an internet route — it is pure management
@@ -111,38 +104,28 @@ AUTHORIZE_BIND = os.environ.get("CONTROL_AUTHORIZE_BIND", "0.0.0.0")  # noqa: S1
 AUTHORIZE_PORT = int(os.environ.get("CONTROL_AUTHORIZE_PORT", "8091"))
 MANAGE_BIND = os.environ.get("CONTROL_MANAGE_BIND", "127.0.0.1")
 MANAGE_PORT = int(os.environ.get("CONTROL_MANAGE_PORT", "8090"))
-# The MCP gateway's bridge. Binds ONE address like the management surface, not the
-# wildcard the authorize surface uses, and the default is loopback for the same
-# reason: a deployment that forgets to set it fails VISIBLY (the gateway cannot
-# reach it) rather than silently serving the claim endpoint on authorize-net, where
-# the egress proxy could burn an approved ask the agent is coming back for.
+# The MCP gateway's bridge binds ONE address too, defaulting to loopback for the
+# same reason: forgetting to set it fails VISIBLY (the gateway cannot reach it)
+# instead of serving the claim endpoint on authorize-net, where the egress proxy
+# could burn an approved ask the agent is coming back for.
 #
-# The consequence of the authorize listener's wildcard, stated rather than left to be
-# discovered: the gateway CAN reach /authorize, since that socket answers on every
-# interface. Accepted, because that surface only ever answers a policy question — the
-# same property that makes it safe for the proxy. The reverse direction is the one
-# that had to be closed, and this bind is what closes it.
+# The other direction is open and accepted: the gateway CAN reach /authorize, which
+# answers on every interface, and only ever answers a policy question.
 TOOL_BIND = os.environ.get("CONTROL_TOOL_BIND", "127.0.0.1")
 TOOL_PORT = int(os.environ.get("CONTROL_TOOL_PORT", "8092"))
 #: Every spelling of "listen on every interface", including the empty string, which
 #: uvicorn treats as one. Listed rather than substring-matched: a substring test
 #: would also reject a legitimate address that happens to contain one of these.
 _WILDCARDS = ("", "0.0.0.0", "::", "*")  # noqa: S104
-#: Where the tool bridge must NOT be served, as CIDRs rather than as a wildcard test.
-#: A wildcard is one way to put the claim endpoint on authorize-net; naming that
-#: network's address outright is the other, and it passes a wildcard check while
-#: producing exactly the outcome the check exists to refuse — the claim endpoint
-#: within the egress proxy's reach, with every healthcheck green. This is the whole
-#: reason the assertion is in the app and not only in tests/test_topology.py: it is
-#: here so as not to trust the compose file, so it cannot be satisfied by a test that
-#: reads the compose file.
+#: Where the tool bridge must NOT be served, as CIDRs. A wildcard is one way to put
+#: the claim endpoint on authorize-net; binding that network's address outright is
+#: the other, and it passes a wildcard check with every healthcheck green. Checked in
+#: the app, not only in tests/test_topology.py, so as not to trust the compose file.
 #:
-#: Defaults mirror docker-compose.yml, the same arrangement ``FORBIDDEN_CIDRS`` in
-#: proxies/egress/addon.py uses, and tests/test_topology.py holds them equal to the
-#: real subnets. control-net is listed alongside authorize-net because the rule is one
-#: bridge per enforcer: sharing the management network would not reach the proxy, but
-#: it would put the gateway on the operator's path, and neither enforcer belongs on
-#: the other's leg.
+#: Defaults mirror docker-compose.yml, as ``FORBIDDEN_CIDRS`` in
+#: proxies/egress/addon.py does, and tests/test_topology.py holds them equal to the
+#: real subnets. control-net is listed as well because the rule is one bridge per
+#: enforcer: the gateway does not belong on the operator's path either.
 _TOOL_BIND_FORBIDDEN = os.environ.get(
     "CONTROL_TOOL_BIND_FORBIDDEN", "172.29.0.0/24,172.31.0.0/24")
 #: The same refusal for the management surface, which is the more dangerous one to
@@ -155,20 +138,17 @@ _MANAGE_BIND_FORBIDDEN = os.environ.get(
     "CONTROL_MANAGE_BIND_FORBIDDEN", "172.29.0.0/24,172.27.0.0/24")
 
 #: The most either enforcer-facing listener accepts in one request body, in bytes.
-#: Both peers — the proxy on `/authorize`, the gateway on the tool bridge — relay what
-#: the SANDBOX sent, and FastAPI materializes the whole body through the request
-#: model before any handler can measure it (``ToolCallRequest.args`` is `Any`, and
-#: ``holds.TOOL_ARGS_MAX`` applies only after the parse, on the `ask` path). Uncapped,
-#: a few hundred megabytes of `args` was an OOM kill of this process under its 512m
-#: limit — governance down on the sandbox's say-so. Not a bypass, since egress fails
-#: closed while the container restarts, but the sandbox's one lever against
-#: availability, and SECURITY.md puts "pressure becoming permission" in scope.
+#: Both peers relay what the SANDBOX sent, and FastAPI parses the whole body into the
+#: request model before a handler can measure it (``holds.TOOL_ARGS_MAX`` applies
+#: only after, on the `ask` path). Uncapped, a few hundred megabytes of `args` was
+#: an OOM kill of this process under its 512m limit: not a bypass, since egress fails
+#: closed while it restarts, but governance down on the sandbox's say-so.
 #:
 #: Sized to the peer. An egress question is a host, a port and a URL; the tool bridge
-#: carries a tool call's complete arguments, which the gateway has already bounded
-#: at its own intake (``GATEWAY_BODY_MAX``), so this is the backstop behind that cap
-#: rather than the cap itself. Fail-closed bounds, so env vars (DESIGN.md, "Hold
-#: bounds are fail-closed, so their values stay env vars").
+#: carries complete tool arguments, already capped at the gateway's intake
+#: (``GATEWAY_BODY_MAX``), so this is the backstop behind that cap. Env vars, since
+#: they fail closed (DESIGN.md, "Hold bounds are fail-closed, so their values stay
+#: env vars").
 AUTHORIZE_BODY_MAX = int(os.environ.get("CONTROL_AUTHORIZE_BODY_MAX", str(64 * 1024)))
 TOOL_BODY_MAX = int(os.environ.get("CONTROL_TOOL_BODY_MAX", str(2 * 1024 * 1024)))
 
@@ -177,7 +157,7 @@ TOOL_BODY_MAX = int(os.environ.get("CONTROL_TOOL_BODY_MAX", str(2 * 1024 * 1024)
 # /redoc), which it adds to every app unless told not to; tests/test_topology.py
 # holds every app in the repo to that.
 #
-# Everything except /authorize: the approvals API, the read-only views, /status.
+# Everything but the two bridges: the approvals API, policy, the views, /status.
 app = FastAPI(title="dockade control plane",
               openapi_url=None, docs_url=None, redoc_url=None)
 # POST /authorize and GET /healthz, and nothing else, ever. Adding a route here
@@ -186,12 +166,10 @@ app = FastAPI(title="dockade control plane",
 # read-only" but "would I let a bypassed relay guard call it".
 authorize_app = FastAPI(title="dockade control plane (authorize)",
                         openapi_url=None, docs_url=None, redoc_url=None)
-# The MCP gateway's three questions, and nothing else, ever: what may this call do,
-# which servers and tools are configured, and may I now run the ask a human approved.
-# The question to ask of any new route here is the one above with a different
-# enforcer: "would I let a compromised MCP gateway call it". Nothing on this app may
-# GRANT — no rule is written here and no approval is decided here (`resolve` stays on
-# the management app, asserted by tests/test_control_plane_api.py).
+# The MCP gateway's bridge (``api_tool``), and nothing else, ever. The question for
+# any new route is the one above with a different enforcer: "would I let a
+# compromised MCP gateway call it". Nothing on this app may GRANT; `resolve` stays on
+# the management app (asserted by tests/test_control_plane_api.py).
 tool_app = FastAPI(title="dockade control plane (tool)",
                    openapi_url=None, docs_url=None, redoc_url=None)
 
@@ -244,35 +222,27 @@ app.include_router(api_views.router)
 @tool_app.get("/healthz")
 async def healthz() -> dict:
     """``async`` so the probe is answered on the event loop and never queues behind
-    a worker thread. ``authorize`` is a plain ``def`` that BLOCKS on a hold for up to
-    ``holds.HOLD_TIMEOUT``, and Starlette runs it in a bounded threadpool; a sync
-    probe shares that pool. Today ``MAX_WAITERS`` (16) is under the pool's default
-    size, so the queue cannot form — but that is an accident of two numbers set in
-    different files, and the failure it prevents is compose restarting the control
-    plane in the middle of the holds that made it look unhealthy. There is nothing
-    to await here, so the fix costs nothing and stops depending on the arithmetic."""
+    a worker thread. ``authorize`` BLOCKS on a hold in Starlette's bounded
+    threadpool, which a sync probe would share. ``MAX_WAITERS`` is below the pool's
+    size today, but only by coincidence of two numbers in different files, and a
+    probe queued behind holds would have compose restart the control plane in the
+    middle of them."""
     return {"status": "ok"}
 
 
 # ── lifecycle ───────────────────────────────────────────────────────────────
 
 def _bootstrap() -> None:
-    """Prepare the store. Called by ``main`` BEFORE either listener binds, so no
-    request — from the proxy or the UI — can observe an unseeded database. This
-    used to be a Starlette startup handler, which worked only because there was a
-    single app: with two, each has its own lifespan and the authorize listener
-    would race the management one's seed."""
+    """Prepare the store. Called by ``main`` BEFORE any listener binds, so no request
+    can observe an unseeded database. Not a startup handler: each app has its own
+    lifespan, and the authorize listener would race the management one's seed."""
     store._init_db()
-    # A held request cannot survive a restart (its blocked connection is gone),
-    # so any 'pending' rows from a previous process are stale — expire them.
+    # A held request cannot survive a restart (its blocked connection is gone), so
+    # 'pending' rows from a previous process are stale.
     #
-    # ``tool_approvals`` is deliberately NOT swept here, and the difference is the
-    # whole point of that table: nothing is blocked on a tool ask, so a pending one
-    # is not stale after a restart — it is a question still waiting for a human, with
-    # an agent that can still come back for the answer. Its window is enforced by its
-    # own ``deadline`` column instead (``holds._expire_tool_asks``). Sweeping it here
-    # would throw away exactly the state that answering immediately was chosen to make
-    # durable.
+    # ``tool_approvals`` is NOT swept: nothing blocks on a tool ask, so a pending one
+    # is still a live question an agent can come back for. Its own ``deadline`` ends
+    # it (``holds._expire_tool_asks``).
     with store._connect() as conn:
         conn.execute(
             "UPDATE approvals SET status='expired', resolved_at=? "
@@ -282,19 +252,15 @@ def _bootstrap() -> None:
     if seeded:
         print(f"control-plane: seeded {seeded} allow rules from {store.SEED_PATH}",
               flush=True)
-    # The hold caps, with their UNITS, once per boot. Not decoration: `CONTROL_MAX_
-    # PENDING` used to count blocked requests and now counts cards, so an operator who
-    # set it under the old meaning has a different limit than they think. A line that
-    # says which noun each number counts is what makes that discoverable without
-    # reading holds.py, and it costs one line in a log an operator already tails for
-    # the live decision feed.
+    # The hold caps with their UNITS, once per boot. `CONTROL_MAX_PENDING` used to
+    # count blocked requests and now counts cards; naming the noun is what tells an
+    # operator who set it under the old meaning.
     print(f"control-plane: hold caps — cards {holds.MAX_PENDING} global / "
           f"{holds.MAX_PENDING_PER_CLIENT} per client, blocked requests "
           f"{holds.MAX_WAITERS} global / {holds.MAX_WAITERS_PER_CLIENT} per client "
           f"(0 = refuse all on a global cap, disabled on a per-client one)", flush=True)
-    # The tool surface's bounds, on their own line because they count a different
-    # thing: cards only, since nothing blocks on an ask, and a window measured against
-    # a human's attention rather than against a proxy's patience.
+    # The tool surface's bounds on their own line: cards only, since nothing blocks on
+    # an ask.
     print(f"control-plane: tool asks — cards {holds.MAX_TOOL_PENDING} global / "
           f"{holds.MAX_TOOL_PENDING_PER_CLIENT} per client, ask window "
           f"{holds.TOOL_HOLD_TIMEOUT:g}s, grant window "
@@ -306,24 +272,16 @@ def _bootstrap() -> None:
 def _warn_on_dead_caps() -> None:
     """Name a cap that cannot fire, at the boot that configured it.
 
-    A card holds at least one blocked request, so cards are always <= waiters and a card
-    cap set at or above its waiter cap can never be the one to refuse — the waiter cap
-    gets there first, and the card number is a limit the operator believes in and does
-    not have. ``test_a_card_cap_at_or_above_its_waiter_cap_is_dead`` pins the shipped
-    defaults against that, which covers every case except the one the caps exist for:
-    being set by hand.
+    Every card holds at least one blocked request, so a card cap at or above its
+    waiter cap never refuses: the waiter cap gets there first.
+    ``test_a_card_cap_at_or_above_its_waiter_cap_is_dead`` pins the shipped defaults;
+    this covers a cap set by hand.
 
-    A WARNING rather than the ``SystemExit`` that ``_assert_listeners_separated`` uses,
-    and the asymmetry is the point. A wildcard management bind restores a self-approval
-    path, so refusing to start is strictly safer than starting. A dead cap is not a
-    containment failure at all — waiters still bound cards, so the hold queue stays
-    bounded and only the operator's model of WHICH limit binds is wrong. Refusing to boot
-    would answer that by taking the governance authority down, which denies every
-    sandbox's egress: a worse outcome than the misconfiguration, and caused by us.
-
-    Zero is exempt at both scopes because zero is meaningful at both — a global zero
-    refuses everything, a per-client zero disables that cap (see ``holds.py``). Warning
-    on either would be warning that a documented setting works.
+    A WARNING, where ``_assert_listeners_separated`` exits. A dead cap is no
+    containment failure (waiters still bound cards, so the queue stays bounded), and
+    refusing to boot would take governance down and deny every sandbox's egress, a
+    worse outcome than the misconfiguration. Zero is exempt at both scopes, where it
+    is meaningful (``holds.py``).
     """
     for cards, waiters, scope in (
             (holds.MAX_PENDING, holds.MAX_WAITERS, "global"),
@@ -382,18 +340,13 @@ def _bind_within(bind: str, net: ipaddress.IPv4Network | ipaddress.IPv6Network) 
 def _assert_listeners_separated() -> None:
     """Fail closed on a configuration that undoes the split.
 
-    The management API is only out of the proxy's reach because it binds ONE
-    address, on a network the proxy is not attached to. A wildcard bind serves it
-    on every interface — including authorize-net — which silently restores exactly
-    the self-approval path the split removes, while every healthcheck and every
-    page in the UI keeps working. Nothing downstream can detect that, so it is
-    refused here (the same shape as the proxy's ``_assert_guard_configured``).
-
-    Three refusals, because a bind can undo the split three ways: a wildcard, a
-    concrete address on another enforcer's network, and a shared port. The first two
-    are the same mistake spelled differently and one check does not imply the
-    other — and both binds get both, the management one included, because it is
-    the listener that grants."""
+    The management API is out of the proxy's reach only because it binds ONE address,
+    on a network the proxy is not attached to. A bind that undoes that restores the
+    self-approval path while every healthcheck and every UI page keeps working, so
+    nothing downstream can detect it (the shape of the proxy's
+    ``_assert_guard_configured``). There are three ways to do it: a wildcard, an
+    address on an enforcer's network, and a shared port. Both one-address binds get
+    all three checks."""
     if MANAGE_BIND in _WILDCARDS:
         raise SystemExit(
             f"control-plane: CONTROL_MANAGE_BIND={MANAGE_BIND!r} is a wildcard, "
@@ -408,9 +361,8 @@ def _assert_listeners_separated() -> None:
             f"releases an approved call) on authorize-net, where the egress proxy "
             f"can reach it — a lateral edge between two enforcers. Bind the "
             f"tool-authorize-net address instead. Refusing to start (fail closed).")
-    # The other spelling of the same mistake, and the one a wildcard test misses: an
-    # address on another enforcer's network. Refused for the reason the wildcard is,
-    # because the outcome is the same one.
+    # The same mistake spelled as an address on an enforcer's network, which a
+    # wildcard test misses.
     for net in _forbidden_manage_nets():
         if _bind_within(MANAGE_BIND, net):
             raise SystemExit(
@@ -428,14 +380,10 @@ def _assert_listeners_separated() -> None:
                 f"there is the lateral edge the separate bridge exists to remove, and "
                 f"nothing downstream can detect it. Bind the tool-authorize-net "
                 f"address instead. Refusing to start (fail closed).")
-    # Every listener gets its OWN PORT, checked across all three pairs and without
-    # regard to the addresses. Same address and same port is one socket serving two
-    # apps' worth of surface, which is the obvious case; same port on different
-    # addresses is the subtle one and is refused too, because with a wildcard in the
-    # mix — and the authorize listener is one — which app answers depends on which
-    # bind is more specific for the address dialled. That is not a property an
-    # operator reading a healthcheck or a firewall rule can see, and nothing here
-    # needs it.
+    # Every listener gets its OWN PORT, whatever the addresses. With a wildcard in the
+    # mix (the authorize listener is one), a shared port means which app answers
+    # depends on which bind is more specific for the address dialled, which nobody
+    # reading a healthcheck or a firewall rule can see.
     for (a_name, a_bind, a_port), (b_name, b_bind, b_port) in (
             (("management", MANAGE_BIND, MANAGE_PORT),
              ("authorize", AUTHORIZE_BIND, AUTHORIZE_PORT)),
@@ -454,7 +402,7 @@ def _assert_listeners_separated() -> None:
 # ── entry point ─────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    """Serve both listeners from one process and one event loop.
+    """Serve the three listeners from one process and one event loop.
 
     ``uvicorn`` is imported HERE rather than at module scope so the module stays
     importable with only the stdlib — the unit suite loads this file directly with
@@ -467,11 +415,9 @@ async def main() -> None:
           f"tool on {TOOL_BIND}:{TOOL_PORT}, "
           f"management on {MANAGE_BIND}:{MANAGE_PORT}", flush=True)
 
-    # The ingest is a plain task on this loop rather than a lifespan hook, for the
-    # same reason _bootstrap is not one: it belongs to the PROCESS, not to either
-    # app. Holding the reference matters — asyncio keeps only a weak one, so a
-    # create_task whose result nobody holds can be collected mid-flight and the
-    # ingest would stop with no error anywhere.
+    # A task on this loop, not a lifespan hook, as with _bootstrap: it belongs to the
+    # PROCESS. The reference is held because asyncio keeps only a weak one, and an
+    # unreferenced task can be collected mid-flight, stopping ingest with no error.
     drain = None
     if ingest.DRAIN_INTERVAL > 0:
         drain = asyncio.create_task(ingest._audit_drain_loop())
@@ -480,22 +426,17 @@ async def main() -> None:
               "(CONTROL_AUDIT_DRAIN_INTERVAL=0); locally-decided egress will "
               "appear only in the proxy's own log", flush=True)
 
-    # Servers sharing one process means sharing one set of signal handlers,
-    # and SIGTERM has to stop ALL of them or `docker compose down` waits out the grace
-    # period and SIGKILLs the governance authority with holds in flight.
+    # One process means one set of signal handlers, and SIGTERM must stop ALL the
+    # servers, or `docker compose down` waits out the grace period and SIGKILLs the
+    # governance authority with holds in flight.
     #
-    # uvicorn already handles this, and the mechanism is worth naming because it is
-    # not obvious: each ``serve()`` wraps itself in ``capture_signals()``, so the
-    # second server's handler replaces the first's — but on exit it restores what
-    # it replaced and re-raises the signal it caught, which then reaches the first.
-    # Measured with all three listeners (NOTES.md): SIGTERM logged a clean shutdown
-    # for each and the process was gone inside a second. The chain is per-server
-    # rather than pairwise (each ``capture_signals`` restores and re-raises for
-    # exactly one ``serve()``), and it leans on a uvicorn internal — re-measure it
-    # when the uvicorn pin moves. An earlier version of this function added handlers of
-    # its own to "fix" the overwrite; they were inert — uvicorn installs via
-    # ``signal.signal``, which displaces asyncio's — and removing them changed
-    # nothing, so they are gone rather than kept as insurance.
+    # uvicorn handles it, not obviously: each ``serve()`` wraps itself in
+    # ``capture_signals()``, so each server's handler replaces the one before, and on
+    # exit restores it and re-raises the signal to it. Measured with
+    # all three listeners (NOTES.md): a clean shutdown for each, the process gone in
+    # under a second. It leans on a uvicorn internal, so re-measure when the pin moves.
+    # Handlers of our own were tried and were inert (uvicorn's ``signal.signal``
+    # displaces asyncio's), so there are none.
     servers = [
         uvicorn.Server(uvicorn.Config(
             authorize_app, host=AUTHORIZE_BIND, port=AUTHORIZE_PORT,

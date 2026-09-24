@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for the control plane's security-load-bearing logic
-(``control-plane/app.py``): the policy decision ``_decide`` (block-wins-over-allow,
-subdomain semantics, default-hold, and per-client-class scoping), the per-tool
-decision ``_decide_tool`` that answers the same question for the MCP gateway's
-surface, the address -> class mapping that feeds the first, and the hold registry
-(``_reserve_hold`` / ``_release_hold``: the two caps, and duplicate grouping).
+(``control-plane/policy.py`` and ``holds.py``): the policy decision ``_decide``
+(block-wins-over-allow, subdomain semantics, default-hold, and per-client-class
+scoping), the per-tool decision ``_decide_tool`` that answers the same question for
+the MCP gateway's surface, the address -> class mapping that feeds the first, and
+the hold registry (``_reserve_hold`` / ``_release_hold``: the two caps, and duplicate
+grouping).
 
 The hold cap is exactly what ``boundary-check.sh`` cannot assert: an over-cap
 request returns the same opaque 403 to the agent as any other deny, so the cap's

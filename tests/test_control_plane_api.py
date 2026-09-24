@@ -952,6 +952,22 @@ class CreateRuleTests(_CPTestCase):
         # And the conflict is described, so the UI can say which rule is in the way.
         self.assertEqual(resp.body["conflict"]["action"], "block")
 
+    def test_the_conflict_names_the_fix_that_works_for_that_rule(self):
+        # The UI shows `detail` verbatim, so it has to be advice the operator can take.
+        # An operator rule can be edited or revoked; a seed rule can be neither here
+        # (edit_rule and revoke_rule both refuse it), so its fix is the seed file.
+        _create("evil.example", "block")
+        detail = _create("evil.example", "allow").body["detail"]
+        self.assertIn("Edit it, or revoke it first", detail)
+        with cp.store._connect() as conn:
+            conn.execute("INSERT INTO rules(pattern, action, source, created_at, "
+                         "client_class) VALUES ('pypi.org', 'allow', 'seed', 0, ?)",
+                         (CLASS,))
+            conn.commit()
+        detail = _create("pypi.org", "block").body["detail"]
+        self.assertIn("policies/egress-allowlist.txt", detail)
+        self.assertNotIn("Edit it", detail)
+
     def test_the_same_rule_twice_reports_a_non_write_rather_than_an_error(self):
         # The policy asked for IS the policy — but the response must not claim a write
         # it did not make, which is the distinction `resolve` already draws.

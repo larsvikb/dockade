@@ -196,7 +196,7 @@ def tool_claim(approval_id: str, req: ToolResumeRequest) -> JSONResponse:
     gateway's own copy.
 
     POLICY IS RE-READ HERE; the approval alone does not release the call. Between the
-    decision and the claim the server may have been disabled (``revoke_mcp_server``)
+    decision and the claim the server may have been disabled (``edit_mcp_server``)
     or the rule revoked or flipped to `deny`, and none of those touch
     `tool_approvals`. Without this check the switch an operator reaches for would not
     reach the one surface that releases a side effect."""

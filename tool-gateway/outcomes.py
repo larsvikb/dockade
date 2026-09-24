@@ -37,6 +37,7 @@ import json
 import logging
 import logging.handlers
 import os
+import re
 import time
 
 #: Where the JSONL lands, on a volume the control plane mounts read-only. Set to the
@@ -146,6 +147,22 @@ def _field(value: object) -> object:
     return value[:FIELD_MAX] if isinstance(value, str) else value
 
 
+#: What ends or rewrites a terminal line: C0 and C1 controls (newline, carriage
+#: return, the ESC that opens an ANSI sequence), DEL, and the Unicode line and
+#: paragraph separators.
+_UNPRINTABLE = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
+def _printable(value: object) -> str:
+    """One field of the stdout line: capped like the file's, and kept on one line.
+    ``reason`` is a third party's text, and with its newlines intact a server could
+    append a whole forged ``OUTCOME ok …`` line to `make logs-tg` — the feed a human
+    reads to see what ran. Escaped rather than stripped, so what was sent stays
+    visible."""
+    return _UNPRINTABLE.sub(lambda m: m.group().encode("unicode_escape").decode("ascii"),
+                            str(_field(value)))
+
+
 def record(status: str, server: str, tool: str, reason: str | None = None,
            approval_id: str | None = None, client: str | None = None) -> None:
     """Write one outcome. Returns nothing and RAISES NOTHING.
@@ -176,7 +193,7 @@ def record(status: str, server: str, tool: str, reason: str | None = None,
               f"below is the only copy", flush=True)
     # After the file, and unconditionally: if the write above failed this is the
     # remaining copy, and if it succeeded this is the live feed.
-    print(f"OUTCOME {status} {server}__{tool}"
-          + (f" approval_id={approval_id}" if approval_id else "")
-          + (f" client={client}" if client else "")
-          + (f" :: {reason}" if reason else ""), flush=True)
+    print(f"OUTCOME {status} {_printable(server)}__{_printable(tool)}"
+          + (f" approval_id={_printable(approval_id)}" if approval_id else "")
+          + (f" client={_printable(client)}" if client else "")
+          + (f" :: {_printable(reason)}" if reason else ""), flush=True)

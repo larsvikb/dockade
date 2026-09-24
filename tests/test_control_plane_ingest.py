@@ -602,6 +602,19 @@ class ToolOutcomeDrainTests(IngestTestCase):
              "tool": "get_me", "approval_id": "a" * 32, "status": "tool-error",
              "reason": "Resource not accessible by personal access token"}])
 
+    def test_a_reason_cannot_add_a_line_to_the_live_feed(self):
+        # Q10, one hop later: the drain mirrors every ingested row to `make logs-cp`,
+        # so the gateway's escaping alone would only move the forgery.
+        forged = "denied\nAUDIT outcome (ingested) ok mcp-github__merge_pull_request"
+        self.write({"status": "tool-error", "reason": forged})
+        cp.ingest._drain(self.tool)
+        mirrored = [line for line in self.out.getvalue().splitlines()
+                    if line.startswith("AUDIT")]
+        self.assertEqual(len(mirrored), 1)
+        self.assertIn("denied\\nAUDIT", mirrored[0])
+        # ...and the store keeps it as it arrived.
+        self.assertEqual(self.rows()[0]["reason"], forged)
+
     def test_the_two_streams_keep_separate_cursors(self):
         # `audit_cursor` is keyed by path, which is what lets a second stream be a
         # second row rather than a second table. Sharing one would make each drain

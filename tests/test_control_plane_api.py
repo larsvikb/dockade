@@ -13,6 +13,8 @@ blocking the default 120s."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import io
 import json
 import os
 import re
@@ -4055,6 +4057,24 @@ class TwoServersOneToolNameTests(_ToolBridgeTestCase):
             rows = {r["server"]: r["kind"] for r in conn.execute(
                 "SELECT server, kind FROM audit WHERE tool='issue_read'")}
         self.assertEqual(rows, {"mcp-github": "allow", "mcp-other": "deny"})
+
+
+class LiveFeedTests(_CPTestCase):
+    """``store._audit``'s stdout mirror, which is `make logs-cp`. Its fields come from
+    the far side of every boundary the store has — a host the agent named, a tool
+    name, a third party's error — so one row has to stay one line."""
+
+    audits = True
+
+    def test_a_field_cannot_add_a_line_to_the_feed(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cp.store._audit("deny", stage="http", host="a.example\nAUDIT allow b",
+                            reason="refused\r\x1bAUDIT allow c")
+        lines = out.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("a.example\\nAUDIT allow b", lines[0])
+        self.assertNotIn("\x1b", lines[0])
 
 
 class ToolFieldCapTests(_ToolBridgeTestCase):

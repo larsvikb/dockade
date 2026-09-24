@@ -14,6 +14,7 @@ control plane, so the schema and its migration constraint (the NOTE below
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import time
 from collections.abc import Callable
@@ -612,6 +613,22 @@ def _seed_if_empty() -> int:
         return len(patterns)
 
 
+#: What ends or rewrites a terminal line: C0 and C1 controls, DEL, and the Unicode
+#: line and paragraph separators. The gateway's outcome stream has the same guard.
+_UNPRINTABLE = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
+def _printable(value: object) -> str:
+    """One field of a live-feed line, capped and on one line. The feed carries text
+    from the far side of every trust boundary this store has — a host the agent
+    named, a third-party server's error — and a newline in it would let that text
+    append a forged `AUDIT …` line to `make logs-cp`. Escaped rather than stripped,
+    so what arrived stays visible."""
+    text = str(value)[:DRAIN_MAX_FIELD]
+    return _UNPRINTABLE.sub(lambda m: m.group().encode("unicode_escape").decode("ascii"),
+                            text)
+
+
 def _audit(kind: str, **fields) -> None:
     # Agent-INFLUENCED fields (host/url/... arrive on /authorize from the proxy, which
     # relays whatever the sandbox asked for) are truncated on write — the same
@@ -643,10 +660,10 @@ def _audit(kind: str, **fields) -> None:
     # would be lost if the stdout stream still only carried the id inside prose on the
     # one row whose sentence happens to name it.
     shown = " ".join(
-        f"{k}={fields[k]}" for k in
+        f"{k}={_printable(fields[k])}" for k in
         ("stage", "host", "port", "proto", "client", "client_class", "method", "url",
          "server", "tool", "approval_id")
         if fields.get(k) is not None)
     reason = fields.get("reason")
-    print(f"AUDIT {kind} {shown}" + (f" :: {reason}" if reason else ""),
+    print(f"AUDIT {kind} {shown}" + (f" :: {_printable(reason)}" if reason else ""),
           flush=True)

@@ -211,18 +211,20 @@ def _tool_row(line: bytes) -> dict | None:
 
 
 def _describe_egress(row: dict) -> str:
-    return (f"{row['kind']} (ingested) stage={row['stage']} host={row['host']} "
-            f"client={row['client']} client_class={row['client_class']} "
-            f":: {row['reason']}")
+    shown = {k: store._printable(v) for k, v in row.items()}
+    return (f"{shown['kind']} (ingested) stage={shown['stage']} host={shown['host']} "
+            f"client={shown['client']} client_class={shown['client_class']} "
+            f":: {shown['reason']}")
 
 
 def _describe_tool(row: dict) -> str:
     # Shaped like the gateway's own OUTCOME line so the two logs read alike side by
     # side, which is how a broken ingest is spotted: the same call present in
     # `make logs-tg` and absent here.
-    return (f"outcome (ingested) {row['status']} {row['server']}__{row['tool']}"
-            + (f" approval_id={row['approval_id']}" if row["approval_id"] else "")
-            + (f" :: {row['reason']}" if row["reason"] else ""))
+    shown = {k: store._printable(v) for k, v in row.items()}
+    return (f"outcome (ingested) {shown['status']} {shown['server']}__{shown['tool']}"
+            + (f" approval_id={shown['approval_id']}" if row["approval_id"] else "")
+            + (f" :: {shown['reason']}" if row["reason"] else ""))
 
 
 #: The gateway's status vocabulary, restated rather than imported: that module lives in

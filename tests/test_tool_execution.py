@@ -426,6 +426,12 @@ class UpstreamReplyTests(ExecutionTestCase):
         body = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"content": []}})
         self.assertEqual(self.execute.parse_call(body), ({"content": []}, "ok"))
 
+    def test_a_rejection_with_a_null_id_is_still_the_answer(self):
+        # How a server answers a request it could not parse: it cannot know our id.
+        _, status = self.execute.parse_call(
+            'data: {"jsonrpc":"2.0","id":null,"error":{"code":-32700}}\n\n')
+        self.assertEqual(status, "rpc-error")
+
     def test_a_rejected_request_is_not_passed_off_as_a_failed_tool(self):
         # The protocol separates "the call ran and the tool reports a problem" from
         # "the request was rejected". Flattening them would tell an agent its arguments
@@ -583,6 +589,15 @@ class OutcomeRecordTests(ExecutionTestCase):
                                  "error": {"code": -32602, "message": "bad params"}})
         self.allow()
         self.assertEqual(self.rows[0]["status"], "rpc-error")
+
+    def test_a_server_that_notifies_before_answering_is_recorded_as_ran(self):
+        # Q4's symptom. The call ran and the server answered; a progress notification
+        # ahead of the answer made it a `transport-error` with "no result".
+        self.reply = ('data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1}}\n\n'
+                      + sse({"content": [{"type": "text", "text": "the issue"}]}))
+        result = self.allow()
+        self.assertFalse(result.get("isError"))
+        self.assertEqual([r["status"] for r in self.rows], ["ok"])
 
     def test_a_successful_call_records_no_reason(self):
         # The reason line is for failures. On success it would be the reply's first

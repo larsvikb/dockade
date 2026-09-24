@@ -264,8 +264,8 @@ class HttpConnectTests(unittest.TestCase):
 
 class TlsClientHelloTests(unittest.TestCase):
     """The SNI-vs-CONNECT-authority check (anti-domain-fronting). Passthrough
-    (``ignore_connection``) is granted ONLY when the SNI is absent or matches the
-    authority recorded at CONNECT."""
+    (``ignore_connection``) is granted ONLY when the SNI matches the authority
+    recorded at CONNECT, or is absent for an authority that is an IP literal."""
 
     def _data(self, sni, cid="c1", peer="172.30.0.2"):
         # `peername` mirrors _connect_flow / _http_flow. Its absence here is why the
@@ -285,11 +285,36 @@ class TlsClientHelloTests(unittest.TestCase):
         addon.tls_clienthello(data)
         self.assertTrue(data.ignore_connection)
 
-    def test_sni_absent_tunnels(self):
+    def test_sni_absent_for_a_named_authority_refuses_passthrough(self):
+        """Leaving the SNI out is fronting by omission: the CDN routes the handshake
+        by it, so an authorized CONNECT with no SNI could carry any tenant's Host."""
         addon._conn_authority["c1"] = "example.com"
         data = self._data(None)
         addon.tls_clienthello(data)
-        self.assertTrue(data.ignore_connection)
+        self.assertFalse(data.ignore_connection)            # fails closed
+
+    def test_sni_absent_for_an_ip_literal_authority_tunnels(self):
+        # RFC 6066 forbids an address in SNI, so a client dialling an IP sends none.
+        for authority in ("93.184.215.14", "2606:2800:21f:cb07:6820:80da:af6b:8b2c",
+                          "[2606:2800:21f:cb07:6820:80da:af6b:8b2c]"):
+            with self.subTest(authority=authority):
+                addon._conn_authority["c1"] = authority
+                data = self._data(None)
+                addon.tls_clienthello(data)
+                self.assertTrue(data.ignore_connection)
+
+    def test_sni_absent_with_no_recorded_authority_refuses(self):
+        data = self._data(None)                             # nothing recorded
+        addon.tls_clienthello(data)
+        self.assertFalse(data.ignore_connection)
+
+    def test_name_shaped_like_an_ip_is_not_an_ip_literal(self):
+        for authority in ("93.184.215.14.nip.io", "1.2.3", "0x5db8d70e"):
+            with self.subTest(authority=authority):
+                addon._conn_authority["c1"] = authority
+                data = self._data(None)
+                addon.tls_clienthello(data)
+                self.assertFalse(data.ignore_connection)
 
     def test_sni_mismatch_refuses_passthrough(self):
         addon._conn_authority["c1"] = "example.com"
@@ -330,13 +355,41 @@ class TlsClientHelloTests(unittest.TestCase):
         # Must not render as the string "None" where an authority would be.
         self.assertNotIn("None", fields["reason"])
 
+    def test_sni_absent_refusal_names_the_authority_and_is_not_called_fronting(self):
+        """No SNI means no asserted name, so the row's `host` is the authority —
+        the only name the connection has — and the reason says what was missing
+        rather than accusing a mismatch that did not happen."""
+        addon._conn_authority["c1"] = "example.com"
+        with mock.patch.object(addon, "_audit") as audited:
+            addon.tls_clienthello(self._data(None))
+        audited.assert_called_once()
+        decision, fields = audited.call_args[0][0], audited.call_args[1]
+        self.assertEqual(decision, "deny")
+        self.assertEqual(fields["stage"], "sni")
+        self.assertEqual(fields["host"], "example.com")
+        self.assertIsNone(fields["sni"])
+        self.assertIn("no SNI", fields["reason"])
+        self.assertIn("example.com", fields["reason"])
+        self.assertNotIn("does not match", fields["reason"])
+        self.assertEqual(fields["client"], "172.30.0.2")
+        self.assertFalse(fields["central"])
+
+    def test_sni_absent_refusal_with_no_authority_does_not_say_none(self):
+        with mock.patch.object(addon, "_audit") as audited:
+            addon.tls_clienthello(self._data(None, peer="172.30.0.9"))
+        fields = audited.call_args[1]
+        self.assertEqual(fields["client"], "172.30.0.9")
+        self.assertIsNone(fields["host"])
+        self.assertNotIn("None", fields["reason"])
+
     def test_tunnelled_connections_are_not_audited(self):
         """Passthrough is the non-event. Auditing it would put a line per TLS
         connection into a file the control plane now reads every 2 seconds."""
         addon._conn_authority["c1"] = "example.com"
+        addon._conn_authority["c2"] = "93.184.215.14"
         with mock.patch.object(addon, "_audit") as audited:
             addon.tls_clienthello(self._data("example.com"))
-            addon.tls_clienthello(self._data(None))
+            addon.tls_clienthello(self._data(None, cid="c2"))
         audited.assert_not_called()
 
 

@@ -8,7 +8,9 @@ decrypt TLS — HTTPS is tunnelled untouched (``data.ignore_connection = True`` 
 ``tls_clienthello``), so the sandbox needs no custom CA. We govern by name
 because the CONNECT authority and the TLS SNI both name the destination, which
 is all domain-level control needs — and, unlike the v1 IP firewall, naming the
-host is what closes the shared-CDN / domain-fronting gap.
+host is what closes the shared-CDN / domain-fronting gap. That holds only
+because a handshake that names no host is refused unless it was dialled by IP
+(see ``tls_clienthello``).
 
 Step 2a — this proxy is now a CONTROL-PLANE CLIENT. Instead of reading a static
 allowlist file, it asks the control plane per connection:
@@ -292,6 +294,14 @@ def _unbracket(host: str) -> str:
     if host.startswith("[") and host.endswith("]"):
         return host[1:-1]
     return host
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(_unbracket(host))
+    except ValueError:
+        return False
+    return True
 
 
 def _a_label(host: str) -> str:
@@ -830,16 +840,24 @@ def tls_clienthello(data: tls.ClientHelloData) -> None:
     local string comparison — NO second control-plane call — so a host a human
     approved "once" (no persisted rule) is never re-held mid-connection.
 
-      - SNI absent, or SNI == the authorized authority -> tunnel it
-        (``ignore_connection``); no CA needed.
-      - SNI names a different / unrecorded host -> refuse to tunnel. Interception
-        stays ON, which fails CLOSED both ways: with no mitmproxy CA in the
-        sandbox (the standing invariant) the client rejects the minted cert and
-        the handshake dies; if a CA is ever added for per-domain MITM, the flow
-        is instead decrypted and re-gated at the HTTP layer by ``request``."""
+      - SNI == the authorized authority -> tunnel it (``ignore_connection``); no
+        CA needed.
+      - SNI absent and the authority an IP literal -> tunnel it. RFC 6066 forbids
+        an address in SNI, so a client dialling an IP never sends one, and an
+        operator who allowed an IP allowed whatever answers there by any name.
+      - anything else -> refuse to tunnel: an SNI naming a different host, no
+        recorded authority, or no SNI for a NAMED authority. The last is fronting
+        too — the SNI is the name the far end routes the handshake by, so leaving
+        it out lets an authorized CONNECT carry a Host the CDN serves as a
+        different tenant. Interception stays ON, which fails CLOSED both ways:
+        with no mitmproxy CA in the sandbox (the standing invariant) the client
+        rejects the minted cert and the handshake dies; a client that skips
+        verification, or any client once a CA is added for per-domain MITM, is
+        instead decrypted and re-gated at the HTTP layer by ``request``."""
     sni = data.client_hello.sni
     authority = _conn_authority.get(data.context.client.id)
-    if sni is None or (authority is not None and sni.lower() == authority):
+    if authority is not None and (sni.lower() == authority if sni is not None
+                                  else _is_ip_literal(authority)):
         data.ignore_connection = True
         return
     # Recorded as a plain `deny` at stage `sni`, NOT as its own `deny-sni` decision
@@ -847,14 +865,21 @@ def tls_clienthello(data: tls.ClientHelloData) -> None:
     # and renders in the UI with the stage as a qualifier — `deny  sni · fronted.host`
     # — instead of arriving as an unstyled tag the frontend has no rule for. `host` is
     # the SNI because that is the name the client actually asserted; the authority it
-    # contradicts is in the reason. `sni`/`authority` stay as separate fields for the
-    # local stream, where they are still worth grepping on their own.
+    # contradicts is in the reason. With no SNI there is no asserted name, so `host`
+    # falls back to the authority, the only one the connection has. `sni`/`authority`
+    # stay as separate fields for the local stream, where they are still worth
+    # grepping on their own.
+    recorded = authority or "none recorded"
+    if sni is None:
+        reason = (f"no SNI for the authorized CONNECT authority ({recorded}); "
+                  f"refusing passthrough (the handshake names no host to check)")
+    else:
+        reason = (f"SNI does not match the authorized CONNECT authority "
+                  f"({recorded}); refusing passthrough (possible domain-fronting)")
     peer = data.context.client.peername
-    _audit("deny", stage="sni", host=sni, client=peer[0] if peer else None,
-           sni=sni, authority=authority, central=False,
-           reason=f"SNI does not match the authorized CONNECT authority "
-                  f"({authority or 'none recorded'}); refusing passthrough "
-                  f"(possible domain-fronting)")
+    _audit("deny", stage="sni", host=sni or authority,
+           client=peer[0] if peer else None, sni=sni, authority=authority,
+           central=False, reason=reason)
 
 
 @_fail_closed("http", _deny)

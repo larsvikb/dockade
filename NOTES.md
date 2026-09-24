@@ -525,6 +525,22 @@ Windows host running WSL2 it is the worst band available, for two independent re
 So the usable band is *above* the crowded 8000–9000 development block and *below* the
 ephemeral floor: roughly 20000–32767.
 
+## WSL2 in mirrored networking mode accepts a connection to a closed loopback port
+
+On the development host (`wslinfo --networking-mode` prints `mirrored`), binding an
+ephemeral port on `127.0.0.1`, closing it, and connecting to it succeeds:
+`connect_ex` returns `0` where Linux returns `111` (`ECONNREFUSED`). An HTTP request
+sent over that connection then fails with `ECONNRESET` when the response is read.
+Measured 2026-09-24.
+
+So on this host "nothing listens there" cannot produce a refused connection, and
+anything that treats a refusal as proof nothing was delivered sees a reset instead.
+The gateway's `_ask_control` reads that as "maybe delivered" (`Unanswered`), which is
+the safe reading of what it observed. The one test that needs a real refusal,
+`test_a_refused_connection_is_not_delivered`, checks for this first and skips.
+Traffic between the containers crosses Docker bridge networks rather than the
+distro's loopback, so this concerns tests and tools run on the host distro.
+
 ## Docker's dynamic IP is the lowest free one, so it collides with `.2`
 
 A container attached to a user-defined bridge without an `ipv4_address` is not given

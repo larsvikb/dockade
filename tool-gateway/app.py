@@ -146,7 +146,10 @@ def _assert_bind_is_agent_facing_only() -> None:
                 f"on sandbox-net and nowhere else. Refusing to start (fail closed).")
 
 
-app = FastAPI(title="dockade MCP gateway", docs_url=None, redoc_url=None)
+# The schema as well as the pages: /openapi.json is still served with the other two
+# off, and this listener faces the agent (tests/test_topology.py).
+app = FastAPI(title="dockade MCP gateway",
+              openapi_url=None, docs_url=None, redoc_url=None)
 
 
 @app.get("/healthz")

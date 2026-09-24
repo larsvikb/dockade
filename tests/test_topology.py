@@ -20,6 +20,7 @@ elsewhere in the file cannot confuse it.
 """
 from __future__ import annotations
 
+import ast
 import ipaddress
 import re
 import unittest
@@ -1106,6 +1107,49 @@ class AppPortDefaultsAgreeTests(unittest.TestCase):
         ports = {self._default(f"CONTROL_{name}_PORT")
                  for name in ("AUTHORIZE", "MANAGE", "TOOL")}
         self.assertEqual(len(ports), 3, ports)
+
+
+class NoAppServesFastApiDocsTests(unittest.TestCase):
+    """FastAPI serves ``/openapi.json``, ``/docs`` and ``/redoc`` on every app unless
+    each is turned off, and no roster in this suite can see them: the stubs record
+    only the routes our code declares. Measured under the pinned FastAPI before this
+    guard existed, every app served the schema — both enforcer bridges, the
+    browser-facing relay, and the agent-facing gateway, which had turned off the two
+    pages but not the schema behind them.
+
+    Read from the source for the reason the module docstring gives, and over every
+    ``FastAPI(...)`` call rather than a list, so a new app is held to it too."""
+
+    OFF = ("openapi_url", "docs_url", "redoc_url")
+
+    def _apps(self) -> dict[str, list[str]]:
+        """``path:line`` of each ``FastAPI(...)`` call → the routes it leaves on."""
+        found = {}
+        tops = [d for d in sorted(ROOT.iterdir())
+                if d.is_dir() and not d.name.startswith(".") and d.name != "tests"]
+        for path in (p for d in tops for p in sorted(d.rglob("*.py"))):
+            rel = path.relative_to(ROOT)
+            for node in ast.walk(ast.parse(path.read_text())):
+                func = getattr(node, "func", None)
+                name = getattr(func, "id", None) or getattr(func, "attr", None)
+                if isinstance(node, ast.Call) and name == "FastAPI":
+                    given = {k.arg: k.value for k in node.keywords}
+                    found[f"{rel}:{node.lineno}"] = [
+                        n for n in self.OFF
+                        if not (isinstance(given.get(n), ast.Constant)
+                                and given[n].value is None)]
+        return found
+
+    def test_every_service_is_searched(self):
+        # A guard that found no apps would pass; name the services it must find.
+        files = {site.rsplit(":", 1)[0] for site in self._apps()}
+        self.assertLessEqual({"control-plane/app.py", "control-plane-ui/app.py",
+                              "tool-gateway/app.py"}, files)
+
+    def test_no_app_serves_the_schema_or_the_docs_pages(self):
+        left_on = {site: routes for site, routes in self._apps().items() if routes}
+        self.assertEqual(left_on, {}, "pass openapi_url=None, docs_url=None and "
+                                      "redoc_url=None, each as a literal")
 
 
 class ProxyOutlastsTheHoldWindowTests(unittest.TestCase):

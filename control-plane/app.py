@@ -173,20 +173,27 @@ AUTHORIZE_BODY_MAX = int(os.environ.get("CONTROL_AUTHORIZE_BODY_MAX", str(64 * 1
 TOOL_BODY_MAX = int(os.environ.get("CONTROL_TOOL_BODY_MAX", str(2 * 1024 * 1024)))
 
 
+# None of the three serves FastAPI's schema or docs pages (/openapi.json, /docs,
+# /redoc), which it adds to every app unless told not to; tests/test_topology.py
+# holds every app in the repo to that.
+#
 # Everything except /authorize: the approvals API, the read-only views, /status.
-app = FastAPI(title="dockade control plane", version="2b")
+app = FastAPI(title="dockade control plane",
+              openapi_url=None, docs_url=None, redoc_url=None)
 # POST /authorize and GET /healthz, and nothing else, ever. Adding a route here
 # hands it to the egress proxy — the one component whose compromise this split
 # exists to survive — so the question to ask of any new endpoint is not "is it
 # read-only" but "would I let a bypassed relay guard call it".
-authorize_app = FastAPI(title="dockade control plane (authorize)", version="2b")
+authorize_app = FastAPI(title="dockade control plane (authorize)",
+                        openapi_url=None, docs_url=None, redoc_url=None)
 # The MCP gateway's three questions, and nothing else, ever: what may this call do,
 # which servers and tools are configured, and may I now run the ask a human approved.
 # The question to ask of any new route here is the one above with a different
 # enforcer: "would I let a compromised MCP gateway call it". Nothing on this app may
 # GRANT — no rule is written here and no approval is decided here (`resolve` stays on
 # the management app, asserted by tests/test_control_plane_api.py).
-tool_app = FastAPI(title="dockade control plane (tool)", version="2b")
+tool_app = FastAPI(title="dockade control plane (tool)",
+                   openapi_url=None, docs_url=None, redoc_url=None)
 
 
 def _body_cap(cap: int):

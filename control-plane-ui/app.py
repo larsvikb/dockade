@@ -287,7 +287,10 @@ _SECURITY_HEADERS = {
     "referrer-policy": "no-referrer",
 }
 
-app = FastAPI(title="dockade control-plane UI", version="2b-2")
+# No schema or docs pages: what this server hands out stays the list a human wrote
+# (tests/test_topology.py).
+app = FastAPI(title="dockade control-plane UI",
+              openapi_url=None, docs_url=None, redoc_url=None)
 
 # timeout=None: the SSE stream (/approvals/stream) is long-lived; other calls are
 # fast. Reused across requests for connection pooling to the backend.

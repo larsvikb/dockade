@@ -156,5 +156,5 @@ def status() -> str:
         audits = conn.execute("SELECT COUNT(*) FROM audit").fetchone()[0]
         pending = conn.execute(
             "SELECT COUNT(*) FROM approvals WHERE status='pending'").fetchone()[0]
-    return (f"dockade control plane (2b) — {rules} rules, {audits} audit rows, "
+    return (f"dockade control plane — {rules} rules, {audits} audit rows, "
             f"{pending} pending approvals\n")

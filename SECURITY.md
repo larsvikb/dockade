@@ -124,7 +124,7 @@ than restated.
   commits the decision outside `_LOCK` and closes the group inside it, so a request
   can arrive between the two and inherit an outcome it did not wait for. Bounded: a
   joiner is identical by group key, and a deny is fail-safe. The gap and the reason it
-  is tolerated are at the `_close_group_locked` call site in `control-plane/app.py`.
+  is tolerated are at the `_close_group_locked` call site in `control-plane/api_approvals.py`.
 
 ## Out of scope
 

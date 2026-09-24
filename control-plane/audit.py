@@ -26,7 +26,7 @@ Both take the SAME filters, and a filter means the same thing in either view —
 is what lets an operator narrow the glance and then walk the history of what they
 found without re-learning the controls.
 
-Queries only. Nothing here shapes an HTTP response (``app.py`` does that, including
+Queries only. Nothing here shapes an HTTP response (``api_views`` does that, including
 the ``fail_closed`` classification), and nothing here writes — the audit WRITE lives
 in ``store._audit``, next to the schema. It imports NOTHING: every function takes the
 connection its caller already holds, so this module is the SQL and the validation and
@@ -40,7 +40,7 @@ from __future__ import annotations
 # one thing a decisions list must not be ambiguous about (the same reasoning as the
 # empty-versus-stale states in the frontend).
 #
-# Held in agreement with what ``app.py`` actually writes by a test, rather than shared
+# Held in agreement with what the handlers actually write by a test, rather than shared
 # as a constant with the call sites — the writer takes ``decision`` as a plain string
 # from four different places, and a new word appearing there without appearing here
 # would make its rows unfilterable while every other test passed.
@@ -109,7 +109,7 @@ class FilterError(ValueError):
     Every raise here is a case where silently dropping the filter would answer a
     different question than the one asked — an unparseable time range widens the
     result set, an unknown decision word narrows it to nothing — and both look like
-    an answer. ``app.py`` turns this into a 400 carrying the message.
+    an answer. ``api_views`` turns this into a 400 carrying the message.
 
     **The message is served VERBATIM to the caller** (``_bad_filter``), so interpolate
     only what the caller already has: their own parameters, and this module's constants.

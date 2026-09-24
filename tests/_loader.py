@@ -19,13 +19,15 @@ Both modules are loaded by absolute path (``control-plane`` has a hyphen, so it
 is not importable as a package name) under a private module name.
 
 ``control-plane/app.py`` is itself the top of a small set of sibling modules
-(``store``, ``policy``, ``holds``, ``ingest``) that it imports by plain name — the
-way any script does from its own directory. So the loader puts that directory on
+(``store``, ``policy``, ``holds``, ``ingest``, the ``api_*`` surfaces) that it
+imports by plain name — the way any script does from its own directory. So the
+loader puts that directory on
 ``sys.path`` before executing it, which is exactly what ``python app.py`` does for
 the container. Tests reach a sibling through the app module (``cp.holds``), and
 that indirection is load-bearing: rebinding a tunable has to happen on the module
 whose functions READ it, so ``cp.holds.MAX_PENDING = 2`` works where a re-exported
-``cp.MAX_PENDING = 2`` would silently not.
+``cp.MAX_PENDING = 2`` would silently not. The same holds for a handler's own
+tunable: ``cp.api_views.AUDIT_GROUP_SCAN``, never ``cp.AUDIT_GROUP_SCAN``.
 """
 from __future__ import annotations
 
@@ -63,18 +65,26 @@ def _install_mitmproxy_stub() -> None:
 def _route_recorder(method: str):
     """A stub route decorator that REMEMBERS what it registered.
 
-    The control plane serves two apps — the management API and a proxy-facing
-    ``/authorize`` — and which app a handler lands on is a security property (see
-    the module docstring in control-plane/app.py). Identity decorators would make
-    that partition invisible to the suite, so the stub records ``(method, path)``
-    per app instance and a test asserts the split directly, instead of asserting a
-    constant that merely claims to describe the decorators."""
+    The control plane serves three apps, and which app a handler lands on is a
+    security property (see the module docstring in control-plane/app.py). Identity
+    decorators would make that partition invisible to the suite, so the stub records
+    ``(method, path)`` per app or router instance, ``include_router`` carries a
+    router's into the app, and a test asserts the split directly, instead of
+    asserting a constant that merely claims to describe the decorators."""
     def route(self, path, *_args, **_kwargs):
         def register(fn):
             self.__dict__.setdefault("routes", []).append((method, path))
             return fn
         return register
     return route
+
+
+def _include_router(self, router, *_args, **_kwargs) -> None:
+    """Copy a router's recorded routes into the app, so the app's ``routes`` is what
+    that listener serves. FastAPI 0.141 resolves an included router lazily instead;
+    copying gives the same answer because every route is registered at import,
+    before app.py includes the router."""
+    self.__dict__.setdefault("routes", []).extend(getattr(router, "routes", []))
 
 
 def _install_recording_routes(klass) -> None:
@@ -87,6 +97,7 @@ def _install_recording_routes(klass) -> None:
     failure this repo keeps rejecting elsewhere."""
     klass.get = _route_recorder("GET")
     klass.post = _route_recorder("POST")
+    klass.include_router = _include_router
     # `middleware` and `on_event` take a kind ("http" / "startup"), not a path, so
     # they stay identity — recording them as routes would be a lie.
     for name in ("middleware", "on_event", "api_route"):
@@ -116,6 +127,10 @@ def _install_fastapi_stub() -> None:
         get = _route_recorder("GET")
         post = _route_recorder("POST")
 
+    class APIRouter:
+        def __init__(self, *args, **kwargs):
+            self.routes: list[tuple[str, str]] = []
+
     class Request:  # only referenced in a handler signature
         pass
 
@@ -127,7 +142,10 @@ def _install_fastapi_stub() -> None:
         fa.FastAPI = FastAPI
     if not hasattr(fa, "Request"):
         fa.Request = Request
+    if not hasattr(fa, "APIRouter"):
+        fa.APIRouter = APIRouter
     _install_recording_routes(fa.FastAPI)
+    _install_recording_routes(fa.APIRouter)
 
     responses = sys.modules.get("fastapi.responses")
     if responses is None:
@@ -215,7 +233,14 @@ def load_control_plane() -> types.ModuleType:
     pkg_dir = str(ROOT / "control-plane")
     if pkg_dir not in sys.path:
         sys.path.insert(0, pkg_dir)
-    return _load("dockade_control_plane", "control-plane/app.py")
+    module = _load("dockade_control_plane", "control-plane/app.py")
+    # Every sibling reachable as ``cp.<name>`` whether or not app.py imports it, since
+    # app.py imports only what the process needs. These attributes would mask app.py
+    # using a name it never imported; `make lint` (pyflakes) is what catches that.
+    for path in sorted((ROOT / "control-plane").glob("*.py")):
+        if not hasattr(module, path.stem):
+            setattr(module, path.stem, importlib.import_module(path.stem))
+    return module
 
 
 def load_inventory() -> types.ModuleType:

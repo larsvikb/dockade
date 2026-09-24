@@ -1,15 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """MCP gateway policy — the servers the gateway may dial, and what each one's
-tools may do.
+tools may do. On the management listener only, like everything that grants.
 
-None of this waits for the gateway, and it was built before it. Tool policy is
-CONFIGURATION FIRST — an operator states what a server's tools may do before
-anything calls one — which is the opposite of the egress surface, where rules
-accumulate from approvals and direct creation was retrofitted (see "Tool policy
-gets its own table" in DESIGN.md). So the config surface is the primary path here,
-and it is built before the consumer rather than after it.
-
-Everything here is off the AUTHORIZE listener, like everything else that grants.
+Tool policy is CONFIGURATION FIRST: an operator states what a server's tools may do
+before anything calls one. Egress is the opposite, with rules accumulating from
+approvals (DESIGN.md, "Tool policy gets its own table"), so here the config surface
+is the primary path rather than a retrofit.
 """
 from __future__ import annotations
 
@@ -27,23 +23,22 @@ router = APIRouter()
 
 
 class ServerCreateRequest(BaseModel):
-    # Registering a server, not starting one: compose declares it and a human brings
-    # the container up. This names it so policy can be written about it.
+    # Registers a server, and starts nothing: compose declares it and a human brings
+    # the container up.
     server: str
-    # The auth descriptor, defaulted to the preferred case — a server holding its own
-    # credential, with the gateway injecting nothing. `header` is for a server that
-    # refuses that, and then both fields below are required (policy._auth_descriptor_error).
+    # The auth descriptor. The default is the preferred case: the server holds its
+    # own credential and the gateway injects nothing. `header` is for a server that
+    # refuses that, and needs both fields below (``policy._auth_descriptor_error``).
     auth_type: str = "none"
     auth_header: str | None = None
     auth_template: str | None = None
-    # NOTE the field that is absent: ``enabled``. A registration cannot arrive
-    # pre-enabled, because then one call both introduces a server and opens it — and
-    # the audit row for "registered" would be the same row as "turned on".
+    # No ``enabled``: a registration that arrived enabled would introduce a server and
+    # open it in one call, under one audit row.
 
 
 class ServerEditRequest(BaseModel):
-    # The TARGET state, for the reason ``RuleEditRequest`` gives: an absent field
-    # meaning "leave this alone" is indistinguishable from one a caller meant to send.
+    # The TARGET state, as with ``api_egress.RuleEditRequest``: an absent field meaning
+    # "leave this alone" looks the same as one a caller meant to send.
     enabled: bool
     auth_type: str = "none"
     auth_header: str | None = None
@@ -51,20 +46,14 @@ class ServerEditRequest(BaseModel):
 
 
 class ToolRuleCreateRequest(BaseModel):
-    # Which server's tool. Checked for EXISTENCE against ``mcp_servers`` rather than
-    # re-validated as a name — a rule naming a server nobody registered is inert, and
-    # an inert rule reads as policy in force while deciding nothing.
     server: str
     tool: str
     action: str                    # allow | deny | ask
 
 
 class ToolRuleEditRequest(BaseModel):
-    # ACTION only, and the two absent fields are the point. A tool rule's identity IS
-    # (server, tool): changing either does not adjust a rule, it retires one and
-    # writes another, which is two changes wearing one audit row. Promoting a tool
-    # between deny, ask and allow is the operator's actual workflow, and that is what
-    # this is.
+    # ACTION only. A tool rule's identity is (server, tool): changing either retires
+    # one rule and writes another, which is two changes under one audit row.
     action: str
 
 
@@ -90,11 +79,9 @@ def _descriptor(req) -> tuple[str, str, str]:
 def api_mcp_servers() -> list[dict]:
     """The registered servers, with how many tool rules each one carries.
 
-    Unpaginated, for the reason ``api_rules`` is: this is the complete configuration
-    and a truncated view of it hides exactly what the interface exists to show. The
-    rule count rides along because it is what makes the list actionable — a server
-    with none has nothing its tools may do, which is a fully denied surface rather
-    than a broken one, and only the count says which."""
+    Unpaginated, like ``api_egress.api_rules``: a truncated view of the complete
+    configuration hides what it exists to show. The count is what tells a server with
+    no rules, whose every tool is denied, from a broken one."""
     with store._connect() as conn:
         rows = conn.execute(
             "SELECT server, enabled, auth_type, auth_header, auth_template, "
@@ -108,17 +95,14 @@ def api_mcp_servers() -> list[dict]:
 def create_mcp_server(req: ServerCreateRequest, request: Request) -> JSONResponse:
     """Register a server so policy can be written about it. Starts nothing.
 
-    The control plane cannot enumerate what is running — that would mean a docker
-    socket on the crown-jewel container — so the operator names the server, matching
-    what `mcp-servers.yml` declares. A typo is therefore possible and is not caught
-    here: it produces a registered server the gateway will find nothing behind, which
-    the roster reports on the gateway's next poll. That is the right failure — visible and
-    granting nothing — and it is why this endpoint validates the name's SHAPE
-    (``policy._server_name_error``) rather than pretending to validate its existence.
+    The operator names the server, matching `mcp-servers.yml`, because enumerating
+    what runs would need a docker socket on this container. So only the name's SHAPE
+    is checked (``policy._server_name_error``). A typo registers a server with nothing
+    behind it, which the inventory reports as unreachable once it is enabled: visible,
+    and granting nothing.
 
-    Registered is not enabled. A fresh row is `enabled=0` with no tool rules, which is
-    a server the gateway will not dial and whose every tool would be denied if it
-    did — the two defaults agreeing, rather than one covering for the other."""
+    Registered is not enabled. A fresh row is disabled with no tool rules, so the
+    gateway will not dial it and would deny every tool if it did."""
     actor = provenance._actor(request)
     server = (getattr(req, "server", "") or "").strip().lower()
     auth_type, header, template = _descriptor(req)
@@ -132,10 +116,9 @@ def create_mcp_server(req: ServerCreateRequest, request: Request) -> JSONRespons
     with store._connect() as conn:
         if conn.execute("SELECT 1 FROM mcp_servers WHERE server=?",
                         (server,)).fetchone() is not None:
-            # Not a silent replace, for the reason ``create_rule`` refuses one: this
-            # would overwrite an auth descriptor, and a descriptor changed by a call
-            # that reported "registered" is a credential swap with no before in the
-            # record. ``edit`` is where that has one.
+            # Not a silent replace, as ``api_egress.create_rule`` refuses one: it would
+            # overwrite an auth descriptor, a credential swap with no before in the
+            # record. ``edit_mcp_server`` records one.
             return JSONResponse(
                 {"ok": False,
                  "detail": f"server {server!r} is already registered; nothing here "
@@ -162,15 +145,11 @@ def edit_mcp_server(server: str, req: ServerEditRequest,
                     request: Request) -> JSONResponse:
     """Enable or disable a server, and change how the gateway authenticates to it.
 
-    One operation for both, because they are one configuration: a server enabled with
-    a descriptor that does not resolve is a surface that fails as though policy
-    refused it. Splitting them would also put an ordering trap where there is no need
-    for one — enable-then-fix versus fix-then-enable, with a window either way.
-
-    Disabling is the taking-back verb, and it is the blunt one: it stops the gateway
-    dialling the server at all, where revoking a single tool rule returns that one
-    tool to the default deny. Both directions are here because a governance plane
-    that could only grant is the gap ``revoke_rule`` was built to close."""
+    One operation, because it is one configuration: enabled with a descriptor that
+    does not resolve, a server fails as though policy refused it, and two calls would
+    leave that window open in either order. Disabling is the blunt way back: the
+    gateway stops dialling the server at all, where revoking a tool rule returns one
+    tool to deny."""
     actor = provenance._actor(request)
     server = (server or "").strip().lower()
     enabled = bool(getattr(req, "enabled", False))
@@ -204,10 +183,8 @@ def edit_mcp_server(server: str, req: ServerEditRequest,
             "SELECT server, enabled, auth_type, auth_header, auth_template, "
             "created_at FROM mcp_servers WHERE server=?", (server,)).fetchone())
 
-    # ONE row carrying both states, as ``edit_rule`` writes one: the two halves of a
-    # change with nothing to tie them together is the shape this endpoint exists to
-    # avoid. The TEMPLATE is safe to record and the secret is not in it — that is what
-    # a descriptor being useless to steal buys.
+    # ONE row carrying both states, as ``api_egress.edit_rule`` writes. The template
+    # is safe to record because the secret is never in it.
     store._audit("edit", stage="mcp-server", server=server,
                  reason=f"MCP server {server} edited by {actor}; "
                         f"enabled {before['enabled']} -> {after['enabled']}, "
@@ -223,14 +200,11 @@ def edit_mcp_server(server: str, req: ServerEditRequest,
 def revoke_mcp_server(server: str, request: Request) -> JSONResponse:
     """Remove a registration entirely.
 
-    **Refused while the server still has tool rules**, rather than cascading. A
-    cascade behind one POST would delete standing policy the operator cannot see from
-    the button they pressed, and there is no undo in this system — the audit row would
-    be the only record that a dozen decisions had been made and unmade. Deleting them
-    is safe in the sense that removal never grants (an unconfigured tool is denied),
-    but safe is not the same as visible, and this is the surface whose whole job is
-    visibility. Disabling is the one-click way to stop a server without touching its
-    policy, which is what an operator reaching for this usually wants."""
+    **Refused while the server still has tool rules**, rather than cascading. Deleting
+    them could not grant (an unconfigured tool is denied), but it would unmake
+    standing policy the operator cannot see from the button, with no undo and only an
+    audit row as the record. Disabling stops a server without touching its policy,
+    which is usually what is wanted."""
     actor = provenance._actor(request)
     server = (server or "").strip().lower()
     with store._connect() as conn:
@@ -262,15 +236,10 @@ def revoke_mcp_server(server: str, request: Request) -> JSONResponse:
 def api_mcp_inventory() -> dict:
     """What each server last said it exposes, for an operator choosing rules.
 
-    Served from MEMORY and empty until a gateway has pushed — including after a
-    restart of this process, which is the intended cost rather than a gap. A stored
-    copy would survive a server that has been gone for a week and still read as
-    current; ``seen_at`` is here so a reader can tell the difference.
-
-    OBSERVATION, not policy. Nothing in this response is permitted, and the rules that
-    decide live in ``/api/mcp/servers`` and its rule endpoints. Kept separate for that
-    reason and not merely for tidiness: one is a third party's claim, the other is what
-    a human decided."""
+    From MEMORY (``inventory`` says why), so empty until a gateway has pushed,
+    including after a restart; ``seen_at`` says how fresh each entry is. OBSERVATION,
+    not policy: nothing here is permitted. It stays apart from the rules because one
+    is a server's claim and the other an operator's decision."""
     return inventory.snapshot()
 
 
@@ -278,17 +247,13 @@ def api_mcp_inventory() -> dict:
 def api_mcp_rules() -> list[dict]:
     """Standing tool policy — what each registered server's tools may do.
 
-    Grouped by server, then allow before ask before deny, so the widest grants are
-    read first. That is a different order from ``api_rules``, which puts blocks first
-    because ``policy._decide`` lets a block win over an allow; nothing here competes,
-    since a tool matches at most one rule, so the order can serve the reader instead.
+    Grouped by server, then allow, ask, deny, so the widest grants read first.
+    ``api_egress.api_rules`` puts blocks first because a block beats an allow; a tool
+    matches at most one rule, so nothing competes here.
 
-    What this view CANNOT show is the tools a server exposes that have no rule — they
-    are denied, and they are also the ones most needing a decision. That join is the
-    caller's to make, against ``/api/mcp/inventory``: the two are served separately
-    because one is what an operator decided and the other is what a server claimed,
-    and merging them here would produce a single list in which those are
-    indistinguishable."""
+    Tools with no rule are absent. They are denied, and they are the ones most in
+    need of a decision; the caller finds them by joining against
+    ``/api/mcp/inventory``."""
     with store._connect() as conn:
         rows = conn.execute(
             "SELECT id, server, tool, action, source, created_at FROM tool_rules "
@@ -301,10 +266,9 @@ def api_mcp_rules() -> list[dict]:
 def create_mcp_rule(req: ToolRuleCreateRequest, request: Request) -> JSONResponse:
     """Write a standing tool rule.
 
-    An explicit ``deny`` is worth writing even though an unconfigured tool is already
-    denied, and that is not redundancy: the row is what distinguishes "reviewed and
-    refused" from "never looked at". Those are the same decision to the gateway and
-    very different facts to an operator deciding what still needs attention."""
+    An explicit ``deny`` is worth writing though an unconfigured tool is already
+    denied: the row tells "reviewed and refused" from "never looked at", which the
+    gateway treats alike and an operator does not."""
     actor = provenance._actor(request)
     server = (getattr(req, "server", "") or "").strip().lower()
     tool = (getattr(req, "tool", "") or "").strip()
@@ -317,9 +281,9 @@ def create_mcp_rule(req: ToolRuleCreateRequest, request: Request) -> JSONRespons
     with store._connect() as conn:
         if conn.execute("SELECT 1 FROM mcp_servers WHERE server=?",
                         (server,)).fetchone() is None:
-            # The tool-surface twin of ``create_rule``'s unknown-class refusal, and
-            # the same failure it prevents: a rule for a server nobody registered
-            # decides nothing while reading, in this view, as policy in force.
+            # Checked for EXISTENCE, as ``api_egress.create_rule`` refuses an unknown
+            # class: a rule for a server nobody registered decides nothing while
+            # reading as policy in force.
             return JSONResponse(
                 {"ok": False,
                  "detail": f"no MCP server named {server!r} is registered; register "
@@ -360,9 +324,8 @@ def edit_mcp_rule(rule_id: int, req: ToolRuleEditRequest,
                   request: Request) -> JSONResponse:
     """Move a tool between deny, ask and allow — the operator's actual workflow.
 
-    Only the action changes; see ``ToolRuleEditRequest`` for why the identity does
-    not. There is no uniqueness clash to handle for the same reason: the key is
-    untouched, so this cannot collide with another row."""
+    Only the action changes (``ToolRuleEditRequest``), so the key is untouched and
+    cannot collide with another row."""
     actor = provenance._actor(request)
     action = (getattr(req, "action", "") or "").strip().lower()
 
@@ -393,15 +356,10 @@ def edit_mcp_rule(rule_id: int, req: ToolRuleEditRequest,
 
 @router.post("/api/mcp/rules/{rule_id}/revoke")
 def revoke_mcp_rule(rule_id: int, request: Request) -> JSONResponse:
-    """Remove one tool rule, returning that tool to the default.
-
-    Which is a DENY, not a hold — the one place this differs from revoking an egress
-    rule, where the host reverts to being held for approval. Revoking here can
-    therefore only narrow, whatever the rule said, and the record names the
-    destination rather than leaving it to be inferred from the action removed.
-
-    There is no seed to refuse, as ``revoke_rule`` refuses one: no file seeds this
-    table, so every row in it is an operator's."""
+    """Remove one tool rule, returning that tool to the default: DENY, where a revoked
+    egress rule returns its host to a hold. So revoking here can only narrow, and the
+    audit reason names where the tool ends up. Nothing seeds this table, so there is
+    no seed to refuse, as ``api_egress.revoke_rule`` does."""
     actor = provenance._actor(request)
     with store._connect() as conn:
         row = conn.execute(

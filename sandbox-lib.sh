@@ -64,8 +64,33 @@ sc_build_image() {
 #
 # This applies to EVERY tier. A tier-2 agent has no egress, but it still writes to
 # the host filesystem, and host-side execution of what it writes is the risk here.
+# A Windows user profile is a home directory by another name: AppData holds browser
+# profiles and credential stores, and the Startup folder runs whatever is written
+# there at the next login. On WSL it is mounted at /mnt/c/Users/<name>, nowhere near
+# $HOME, so the home-directory checks never see it. Recognised by what is IN it
+# rather than where it is — every profile root holds NTUSER.DAT, the user's registry
+# hive — which holds for any automount root, any drive letter, WSL 1 or 2, and a
+# Windows disk mounted on plain Linux. Prints the reason to refuse, or nothing.
+# Looks only at the directory and a fixed shape below it (a Users folder, a drive
+# root, a mount root holding drives), so it never walks an ordinary project tree.
+_sc_windows_profile_reason() {
+    local dir="$1" pattern match
+    if [[ -e "$dir/NTUSER.DAT" ]]; then
+        echo "that is a Windows user profile."
+        return 0
+    fi
+    for pattern in "$dir/*/NTUSER.DAT" "$dir/Users/*/NTUSER.DAT" \
+                   "$dir/*/Users/*/NTUSER.DAT"; do
+        match="$(compgen -G "$pattern" | head -n 1 || true)"
+        if [[ -n "$match" ]]; then
+            echo "a Windows user profile (${match%/NTUSER.DAT}) is inside it."
+            return 0
+        fi
+    done
+}
+
 sc_guard_workspace() {
-    local real_workspace real_home sensitive
+    local real_workspace real_home sensitive reason
     real_workspace="$(cd "$1" && pwd -P)"   # canonical, symlinks resolved
     real_home="$(cd "$HOME" 2>/dev/null && pwd -P || echo "$HOME")"
 
@@ -88,6 +113,8 @@ sc_guard_workspace() {
             # Workspace is an ancestor of $HOME, so mounting it exposes the whole home.
             _sc_deny_workspace "your home directory ($real_home) is inside it."
         fi
+        reason="$(_sc_windows_profile_reason "$real_workspace")"
+        [[ -z "$reason" ]] || _sc_deny_workspace "$reason"
     fi
 
     # Non-fatal: credential material sitting inside the chosen workspace. This is
@@ -184,7 +211,7 @@ sc_marketplaces() {
         return 0
     fi
 
-    local real real_home secrets
+    local real real_home secrets reason
     real="$(cd "$dir" && pwd -P)"        # canonical, symlinks resolved
     real_home="$(cd "$HOME" 2>/dev/null && pwd -P || echo "$HOME")"
     secrets="$(sc_config_home)/secrets"
@@ -209,6 +236,8 @@ sc_marketplaces() {
     elif [[ "$real_home" == "$real"/* ]]; then
         _sc_deny_marketplaces "your home directory ($real_home) is inside it."
     fi
+    reason="$(_sc_windows_profile_reason "$real")"
+    [[ -z "$reason" ]] || _sc_deny_marketplaces "$reason"
 
     # A footgun this layout creates rather than one it inherits: the MCP client
     # credentials live next door, under the same config home, so the obvious

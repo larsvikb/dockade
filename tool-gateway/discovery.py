@@ -47,6 +47,11 @@ import urllib.request
 
 #: A DNS label, the same shape `policy._server_name_error` holds registration to. The
 #: name is used as a hostname and as a filename, so both uses want exactly this.
+#: The id every request to a server carries. One call per connection, so one id is
+#: enough — and it is a name rather than a literal because the parser has to pick the
+#: reply that answers it out of whatever else the stream carries.
+REQUEST_ID = 1
+
 _SERVER_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 
 #: The control plane's TOOL bridge, by ADDRESS rather than by name — the one place
@@ -200,31 +205,70 @@ def auth_header(auth: dict, secret: str | None, where: str = "") -> dict[str, st
     return {name: template.replace("{secret}", secret)}
 
 
-def parse_tools(raw: str) -> list[dict]:
-    """The tool list out of an MCP reply, SSE or plain JSON.
+def _sse_events(raw: str) -> list[str]:
+    """The data of each event in an SSE body, by the spec's rules rather than by
+    line: an event ends at a blank line, its ``data`` lines join with a newline, the
+    space after the colon is optional, and ``event:``, ``id:`` and ``:`` comments are
+    not data. Lines split on CR and LF only — ``str.splitlines`` also splits on
+    characters a JSON string may carry unescaped."""
+    events, data = [], []
+    for line in re.split(r"\r\n|\r|\n", raw):
+        if not line:
+            if data:
+                events.append("\n".join(data))
+                data = []
+        elif line.startswith("data:"):
+            value = line[5:]
+            data.append(value[1:] if value.startswith(" ") else value)
+    if data:
+        events.append("\n".join(data))
+    return events
+
+
+def response_message(raw: str) -> dict:
+    """The JSON-RPC response to our request out of an MCP reply, SSE or plain JSON.
 
     Both shapes are accepted because only one of them is measured. The server answers
     SSE today; a bare JSON body is legal for this transport and a version bump could
-    start sending one, and a discovery report that silently emptied itself on that day
-    would be worse than one that kept working."""
-    payloads = [line[6:] for line in raw.splitlines() if line.startswith("data: ")]
-    body = payloads[0] if payloads else raw.strip()
-    if not body:
+    start sending one, and a reader that silently failed on that day would be worse
+    than one that kept working.
+
+    THE RESPONSE, NOT THE FIRST EVENT. A stream may carry other messages ahead of it —
+    a progress or log notification, a request from the server — and the response is
+    the one with no ``method`` whose id is ours (or null, which is how a server answers
+    a request it could not parse). Taking the first event read a notification as the
+    reply, and recorded a call that ran as one with no result."""
+    bodies = [b for b in (_sse_events(raw) if re.search(r"(?m)^data:", raw)
+                          else [raw.strip()]) if b.strip()]
+    if not bodies:
         raise DiscoveryError("empty reply — not an MCP response")
-    try:
-        message = json.loads(body)
-    except ValueError as exc:
-        # The failure mode worth naming: a bad bearer comes back as a bare line of
-        # prose with no JSON at all, so the parse error is the symptom and the prose
-        # is the diagnosis. Carry the prose.
-        raise DiscoveryError(f"not an MCP reply — the server said: {body[:200]!r}") from exc
-    if not isinstance(message, dict):
-        # Valid JSON, wrong shape — a bare string, a list, null. Everything below
-        # assumes an object, and an AttributeError here used to escape `reconcile`
-        # (which catches only DiscoveryError) and kill the reconcile thread for the
-        # life of the process, with the process and its healthcheck still green.
-        raise DiscoveryError(f"not an MCP reply — expected a JSON object, the server "
-                             f"sent {type(message).__name__}: {body[:200]!r}")
+    problem = None
+    for body in bodies:
+        try:
+            message = json.loads(body)
+        except ValueError:
+            # The failure mode worth naming: a bad bearer comes back as a bare line of
+            # prose with no JSON at all, so the parse error is the symptom and the
+            # prose is the diagnosis. Carry the prose.
+            problem = problem or f"not an MCP reply — the server said: {body[:200]!r}"
+            continue
+        if not isinstance(message, dict):
+            # Valid JSON, wrong shape — a bare string, a list, null. Everything
+            # downstream assumes an object. An AttributeError there once escaped
+            # `reconcile` (which catches only DiscoveryError) and killed the reconcile
+            # thread with its healthcheck still green, and once escaped `_run` past the
+            # outcome record, so an approved call that answered oddly left no row.
+            problem = problem or (f"not an MCP reply — expected a JSON object, the "
+                                  f"server sent {type(message).__name__}: {body[:200]!r}")
+            continue
+        if "method" not in message and message.get("id") in (REQUEST_ID, None):
+            return message
+    raise DiscoveryError(problem or "the reply carried no response to the request")
+
+
+def parse_tools(raw: str) -> list[dict]:
+    """The tool list out of an MCP reply (see ``response_message`` for the shapes)."""
+    message = response_message(raw)
     if "error" in message:
         raise DiscoveryError(f"server returned an error: {message['error']}")
     result = message.get("result")
@@ -291,7 +335,7 @@ def list_tools(server: str, auth: dict) -> list[dict]:
     description and the schema, because an agent cannot call a tool whose arguments it
     cannot see. Trimming to only the first pair is what this did first, and it made the
     served tool list uncallable."""
-    raw = post(server, {"jsonrpc": "2.0", "id": 1, "method": "tools/list",
+    raw = post(server, {"jsonrpc": "2.0", "id": REQUEST_ID, "method": "tools/list",
                         "params": {}}, auth)
     # Trimmed HERE, at the point of reading, rather than downstream. A real reply
     # carries inline base64 `icons` as well — measured, see the byte split

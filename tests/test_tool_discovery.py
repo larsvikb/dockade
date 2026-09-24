@@ -99,6 +99,40 @@ class ParseTests(unittest.TestCase):
                     self.discovery.parse_tools(body)
                 self.assertIn("no tool list", str(caught.exception))
 
+    def test_a_notification_ahead_of_the_response_is_skipped(self):
+        # Q4. A stream may carry progress or log notifications before the response;
+        # taking the first event read one of those as the reply.
+        raw = ('data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1}}\n\n'
+               + sse({"tools": [{"name": "get_issue"}]}))
+        self.assertEqual([t["name"] for t in self.discovery.parse_tools(raw)],
+                         ["get_issue"])
+
+    def test_a_request_from_the_server_is_not_taken_for_the_reply(self):
+        # It has an id — possibly OUR id — and a `method`. The method is what marks it
+        # as a request rather than the response to ours.
+        raw = ('data: {"jsonrpc":"2.0","id":1,"method":"sampling/createMessage"}\n\n'
+               + sse({"tools": [{"name": "get_issue"}]}))
+        self.assertEqual([t["name"] for t in self.discovery.parse_tools(raw)],
+                         ["get_issue"])
+
+    def test_sse_is_read_by_the_spec_not_by_the_line(self):
+        # The optional space, a message split over several data lines, CRLF endings,
+        # and the fields that are not data. Each is legal SSE a server may send.
+        body = {"jsonrpc": "2.0", "id": 1, "result": {"tools": [{"name": "x"}]}}
+        text = json.dumps(body, indent=1)
+        split = "".join(f"data:{line}\r\n" for line in text.splitlines())
+        raw = (": a comment\r\nevent: message\r\nid: 7\r\n" + split + "\r\n")
+        self.assertEqual([t["name"] for t in self.discovery.parse_tools(raw)], ["x"])
+
+    def test_a_stream_that_never_answers_our_request_is_an_error(self):
+        for raw in ('data: {"jsonrpc":"2.0","method":"notifications/progress",'
+                    '"params":{"progress":1}}\n\n',
+                    sse({"tools": []}).replace('"id": 1', '"id": 2')):
+            with self.subTest(raw=raw), \
+                    self.assertRaises(self.discovery.DiscoveryError) as caught:
+                self.discovery.parse_tools(raw)
+            self.assertIn("no response", str(caught.exception))
+
     def test_a_malformed_reply_is_a_line_in_the_report_not_a_dead_thread(self):
         # Through `reconcile`, which is what the loop calls: the shape error has to
         # arrive as the DiscoveryError it catches, and read as NOT ENUMERATED.

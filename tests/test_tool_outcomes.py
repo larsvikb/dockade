@@ -115,6 +115,40 @@ class RecordShapeTests(OutcomeTestCase):
                          list(self.outcomes.STATUSES))
 
 
+class LiveFeedTests(OutcomeTestCase):
+    """The stdout line is what a human reads in `make logs-tg`, and ``reason`` is a
+    third party's text. One record has to be one line there."""
+
+    FORGED = "denied\nOUTCOME ok mcp-github__merge_pull_request approval_id=" + "a" * 32
+
+    def test_a_servers_error_text_cannot_add_a_line_to_the_feed(self):
+        # Q10. With the newline kept, the forged half reads as its own record.
+        with _captured() as out:
+            self.outcomes.record("tool-error", "mcp-github", "get_me", reason=self.FORGED)
+        lines = out.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("denied\\nOUTCOME ok", lines[0])     # shown, not obeyed
+
+    def test_carriage_returns_and_escape_sequences_are_shown_not_obeyed(self):
+        # A terminal does not need a newline to be lied to: `\r` rewrites the line
+        # in place and ESC opens a sequence that can clear it.
+        with _captured() as out:
+            self.outcomes.record("tool-error", "mcp-github", "get_me",
+                                 reason="x\rOUTCOME ok\x1b[2K\u2028y")
+        line = out.getvalue().rstrip("\n")
+        for raw in ("\r", "\x1b", "\u2028"):
+            self.assertNotIn(raw, line)
+        self.assertIn("\\r", line)
+        self.assertIn("\\x1b", line)
+
+    def test_the_file_keeps_what_the_server_sent(self):
+        # Escaping is for the terminal. The JSONL is parsed, not displayed, and the
+        # ingest owes the store the text as it arrived.
+        with _captured():
+            self.outcomes.record("tool-error", "mcp-github", "get_me", reason=self.FORGED)
+        self.assertEqual(self.lines()[0]["reason"], self.FORGED)
+
+
 class FieldCapTests(OutcomeTestCase):
     env: ClassVar[dict[str, str]] = {"GATEWAY_AUDIT_FIELD_MAX": "32"}
 
@@ -125,6 +159,13 @@ class FieldCapTests(OutcomeTestCase):
         # crown-jewel store.
         self.outcomes.record("tool-error", "mcp-github", "get_me", reason="x" * 5000)
         self.assertEqual(len(self.lines()[0]["reason"]), 32)
+
+    def test_the_live_feed_is_capped_like_the_file(self):
+        # The stdout line is the other copy of the same third-party text, and the only
+        # one when the file write fails.
+        with _captured() as out:
+            self.outcomes.record("tool-error", "mcp-github", "get_me", reason="x" * 5000)
+        self.assertLess(len(out.getvalue()), 200)
 
     def test_the_cap_applies_to_every_string_not_only_the_reason(self):
         # `server` and `tool` are charset-bounded upstream TODAY. The cap does not

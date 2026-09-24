@@ -195,9 +195,8 @@ def parse_call(raw: str) -> tuple[dict, str]:
     load-bearing for the record: one says the call never ran, the other says it ran and
     the third party refused it.
 
-    Both shapes for the reason ``discovery.parse_tools`` accepts both: only one of them
-    is measured, and a version bump that switched must not silently turn every tool
-    call into a parse failure.
+    Which message in the reply is the response is ``discovery.response_message``'s
+    call, shared with ``tools/list`` so the two cannot read the same stream differently.
 
     A JSON-RPC ERROR IS NOT A TOOL FAILURE and is not passed off as one. The protocol
     distinguishes "the call ran and the tool reports a problem" (a result with
@@ -205,23 +204,7 @@ def parse_call(raw: str) -> tuple[dict, str]:
     would tell an agent its arguments were wrong when the server was unreachable, or
     the reverse. It becomes an error-flagged result here because that is the only shape
     a tool call can answer in, but the TEXT says which it was."""
-    payloads = [line[6:] for line in raw.splitlines() if line.startswith("data: ")]
-    body = payloads[0] if payloads else raw.strip()
-    if not body:
-        raise discovery.DiscoveryError("empty reply — not an MCP response")
-    try:
-        message = json.loads(body)
-    except ValueError as exc:
-        raise discovery.DiscoveryError(
-            f"not an MCP reply — the server said: {body[:200]!r}") from exc
-    if not isinstance(message, dict):
-        # Valid JSON that is not a JSON-RPC message: a bare string, a list, null. The
-        # membership test and `.get` below assume an object, and without this they
-        # raised TypeError/AttributeError out of `_run` — past the outcome record, so
-        # an approved call that ran and answered oddly left no row at all.
-        raise discovery.DiscoveryError(
-            f"not an MCP reply — expected a JSON object, the server sent "
-            f"{type(message).__name__}: {body[:200]!r}")
+    message = discovery.response_message(raw)
     if "error" in message:
         return text_result(f"the server rejected the call: {message['error']}",
                            is_error=True), "rpc-error"
@@ -285,7 +268,7 @@ def _run(server: str, tool: str, arguments: object, client: str | None = None,
     try:
         raw = discovery.post(
             server,
-            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            {"jsonrpc": "2.0", "id": discovery.REQUEST_ID, "method": "tools/call",
              "params": {"name": tool, "arguments": arguments if arguments else {}}},
             entry.get("auth") or {}, timeout=CALL_TIMEOUT)
         result, status = parse_call(raw)

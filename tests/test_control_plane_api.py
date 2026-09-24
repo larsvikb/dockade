@@ -3710,6 +3710,9 @@ class ToolClaimTests(_ToolBridgeTestCase):
         self.assertEqual(resp.status_code, 409)
         self.assertTrue(resp.body["spent"])
         self.assertTrue(resp.body["terminal"])
+        # Spent is all this endpoint knows. The claim is written before the call, so
+        # a claim whose answer was lost spent the grant with nothing run.
+        self.assertNotIn("has run", resp.body["detail"])
 
     def test_another_sandboxs_id_is_unknown_rather_than_forbidden(self):
         # Both tiers share sandbox-net, so an id that leaked between them must not

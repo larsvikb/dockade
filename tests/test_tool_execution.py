@@ -19,6 +19,10 @@ is every decision between them, which is the part that can be wrong.
 from __future__ import annotations
 
 import json
+import re
+import socket
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -264,8 +268,8 @@ class ResumeTests(ExecutionTestCase):
 
     def test_every_terminal_refusal_is_final_and_says_so(self):
         # `denied`, `expired` and `spent` are three different states and one answer:
-        # stop. A spent approval in particular must not be retried, because the call
-        # it released already ran.
+        # stop. A spent approval in particular must not be retried: a claim is
+        # single-use whether or not the call it released ever ran.
         for status, spent in (("denied", False), ("expired", False), ("allowed", True)):
             with self.subTest(status=status):
                 self.called.clear()
@@ -294,8 +298,8 @@ class ResumeTests(ExecutionTestCase):
         # through to it is what keeps this map from having to track every state the
         # control plane can report.
         self.answer = {"ok": False,
-                       "detail": "this approval has already been claimed and its call "
-                                 "has run",
+                       "detail": "this approval has already been claimed, and a claim "
+                                 "is single-use",
                        "status": "allowed", "spent": True, "terminal": True}
         self.assertIn("already been claimed", self.text(self.resume()))
 
@@ -356,6 +360,57 @@ class ResumeTests(ExecutionTestCase):
         self.assertEqual(self.called, [])
         self.assertTrue(result["isError"])
         self.assertIn("untouched", self.text(result))
+
+    def test_a_claim_with_no_answer_does_not_promise_the_approval_is_intact(self):
+        # Delivered, so the control plane may have written the claim before its answer
+        # was lost. "Untouched" would be the one false thing to say here.
+        def lost(path, payload):
+            raise self.execute.Unanswered("TimeoutError: timed out")
+
+        self.execute._ask_control = lost
+        result = self.resume()
+        text = self.text(result)
+        self.assertEqual(self.called, [])
+        self.assertTrue(result["isError"])
+        self.assertNotIn("untouched", text)
+        self.assertIn("may have gone through", text)
+        self.assertIn(APPROVAL, text)
+
+    def test_an_answer_with_no_verdict_is_not_taken_for_a_wait(self):
+        # S23. Neither ok, terminal nor pending — a validation 422, a JSON 5xx — used
+        # to fall through to "Still waiting on a human", which tells the agent a
+        # person is deciding when nothing says anyone is.
+        for answer in ({"detail": [{"msg": "field required"}]},
+                       {"detail": "Internal Server Error"}, {}):
+            with self.subTest(answer=answer):
+                self.answer = answer
+                result = self.resume()
+                self.assertEqual(self.called, [])
+                self.assertTrue(result["isError"])
+                self.assertNotIn("Still waiting", self.text(result))
+
+    def test_a_refusal_after_a_lost_claim_says_the_call_may_never_have_run(self):
+        # The retry the lost-answer message invites. "Already claimed" alone reads as
+        # "your call ran", and here the likeliest story is that it never did.
+        def lost(path, payload):
+            raise self.execute.Unanswered("TimeoutError: timed out")
+
+        real, self.execute._ask_control = self.execute._ask_control, lost
+        self.resume()
+        self.execute._ask_control = real
+        self.answer = {"ok": False, "status": "allowed", "spent": True,
+                       "terminal": True,
+                       "detail": "this approval has already been claimed, and a "
+                                 "claim is single-use"}
+        text = self.text(self.resume())
+        self.assertIn("may have been spent by that claim without its call running",
+                      text)
+        self.assertIn("final", text)
+
+    def test_a_spent_approval_with_no_lost_claim_behind_it_says_nothing_extra(self):
+        self.answer = {"ok": False, "status": "allowed", "spent": True,
+                       "terminal": True, "detail": "already claimed"}
+        self.assertNotIn("without its call running", self.text(self.resume()))
 
 
 class UpstreamReplyTests(ExecutionTestCase):
@@ -449,7 +504,9 @@ class OutcomeRecordTests(ExecutionTestCase):
     The sink's own behaviour is in tests/test_tool_outcomes.py; this is about
     completeness. The property is that **a call which performed, or consumed the
     authority to perform, a side effect always produces exactly one outcome row** —
-    because the gap this closes is an approval a human granted ending in silence.
+    because the gap this closes is an approval a human granted ending in silence. A
+    claim that MAY have consumed it — delivered, and never usably answered — produces
+    one saying so, since the gateway cannot tell which it was.
 
     Recorded through a stub rather than a file: what is under test is the set of rows,
     and reading them back off disk would only add a parser between the assertion and
@@ -600,6 +657,30 @@ class OutcomeRecordTests(ExecutionTestCase):
         self.assertEqual(self.rows[0]["approval_id"], APPROVAL)
         self.assertEqual(self.called, [])
 
+    def test_a_claim_that_may_have_spent_the_grant_is_not_silent(self):
+        # S22. The control plane writes the claim before it answers, so a lost answer
+        # can be a spent grant with nothing run — the one way an approval could still
+        # end with no outcome at all.
+        def lost(path, payload):
+            raise self.execute.Unanswered("TimeoutError: timed out")
+
+        for label, arrange in (
+                ("lost answer", lambda: setattr(self.execute, "_ask_control", lost)),
+                ("no verdict", lambda: setattr(self, "answer", {"detail": "boom"}))):
+            with self.subTest(case=label):
+                self.rows.clear()
+                arrange()
+                self.execute.call(self.execute.surface.RESUME_TOOL,
+                                  {"approval_id": APPROVAL}, "172.30.0.5")
+                self.assertEqual(len(self.rows), 1)
+                row = self.rows[0]
+                self.assertEqual(row["status"], "transport-error")
+                self.assertEqual(row["approval_id"], APPROVAL)
+                self.assertEqual(row["client"], "172.30.0.5")
+                self.assertIn("never made", row["reason"])
+                self.assertIn("may be spent", row["reason"])
+                self.assertEqual(self.called, [])
+
     def test_nothing_that_did_not_run_is_recorded(self):
         # The other half of completeness, and the one that would make the log lie in
         # the more alarming direction: a deny, an ask, an unresolvable name and a
@@ -620,6 +701,7 @@ class OutcomeRecordTests(ExecutionTestCase):
             "denied by a human": lambda: self._with_answer(
                 {"ok": False, "status": "denied", "terminal": True},
                 self.execute.surface.RESUME_TOOL, {"approval_id": APPROVAL}),
+            "claim never delivered": self._undelivered_claim,
         }
         for label, run in cases.items():
             with self.subTest(case=label):
@@ -630,6 +712,17 @@ class OutcomeRecordTests(ExecutionTestCase):
     def _with_answer(self, answer, name, args=None):
         self.answer = answer
         return self.execute.call(name, args or {}, "172.30.0.5")
+
+    def _undelivered_claim(self):
+        def refused(path, payload):
+            raise self.execute.discovery.DiscoveryError("connection refused")
+
+        real, self.execute._ask_control = self.execute._ask_control, refused
+        try:
+            return self.execute.call(self.execute.surface.RESUME_TOOL,
+                                     {"approval_id": APPROVAL}, "172.30.0.5")
+        finally:
+            self.execute._ask_control = real
 
 
 if __name__ == "__main__":
@@ -695,6 +788,23 @@ class ResumeWaitTests(ExecutionTestCase):
         self.assertEqual(len(self.seen), 1)
         self.assertIn("A human refused this request", self.text(result))
 
+    def test_a_policy_refusal_ends_the_wait_while_the_ask_is_still_pending(self):
+        # The refusal carries the ask's OWN status, which is `pending` when the server
+        # was switched off before anyone answered. The status alone would keep polling.
+        self._answers({"ok": False, "terminal": True, "status": "pending",
+                       "detail": "not releasable (server disabled)"})
+        result = self.execute.resume(
+            {"approval_id": self.ID, "wait_seconds": 5}, "172.30.0.2")
+        self.assertEqual(len(self.seen), 1)
+        self.assertIn("final", self.text(result))
+
+    def test_an_answer_with_no_verdict_ends_the_wait_immediately(self):
+        self._answers({"detail": "Internal Server Error"})
+        result = self.execute.resume(
+            {"approval_id": self.ID, "wait_seconds": 5}, "172.30.0.2")
+        self.assertEqual(len(self.seen), 1)
+        self.assertNotIn("Still waiting", self.text(result))
+
     def test_an_unanswered_wait_ends_in_exactly_the_no_wait_answer(self):
         self._answers({"ok": False, "status": "pending"})
         result = self.execute.resume(
@@ -732,3 +842,91 @@ class NonCanonicalNameTests(unittest.TestCase):
                 self.assertTrue(result["isError"])
                 self.assertIn("not a tool on this gateway", result["content"][0]["text"])
 
+
+class ControlAnswerTests(unittest.TestCase):
+    """Where "never delivered" ends and "delivered, no usable answer" begins.
+
+    Against the real urllib over loopback, because the line is urllib's — it wraps a
+    failure to connect or send in ``URLError`` and nothing after — and a stub would
+    only restate this file's belief about that. Each server records the request it
+    received, so "delivered" is asserted rather than assumed."""
+
+    def setUp(self):
+        self.execute = load_execute({"GATEWAY_DECIDE_TIMEOUT": "0.5"})
+        self.received: list[dict] = []
+
+    def _serve(self, respond):
+        """One connection on loopback: read the whole request, record its body, then
+        ``respond(conn)``."""
+        listener = socket.create_server(("127.0.0.1", 0))
+        self.addCleanup(listener.close)
+
+        def run():
+            conn, _ = listener.accept()
+            with conn:
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    data += conn.recv(65536)
+                head, _, body = data.partition(b"\r\n\r\n")
+                length = int(re.search(rb"(?i)content-length: *(\d+)", head).group(1))
+                while len(body) < length:
+                    body += conn.recv(65536)
+                self.received.append(json.loads(body))
+                respond(conn)
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 2)
+        self.execute.CONTROL_URL = f"http://127.0.0.1:{listener.getsockname()[1]}"
+
+    def ask(self):
+        return self.execute._ask_control("/tool/asks/x/claim", {"client": "c"})
+
+    def test_a_refused_connection_is_not_delivered(self):
+        # A port nothing listens on: the one failure after which the approval is
+        # certainly untouched.
+        with socket.create_server(("127.0.0.1", 0)) as probe:
+            port = probe.getsockname()[1]
+        self.execute.CONTROL_URL = f"http://127.0.0.1:{port}"
+        with self.assertRaises(self.execute.discovery.DiscoveryError) as caught:
+            self.ask()
+        self.assertNotIsInstance(caught.exception, self.execute.Unanswered)
+
+    def test_a_connection_dropped_after_the_request_is_unanswered(self):
+        self._serve(lambda conn: None)
+        with self.assertRaises(self.execute.Unanswered):
+            self.ask()
+        self.assertEqual(self.received, [{"client": "c"}])
+
+    def test_a_timeout_after_the_request_is_unanswered(self):
+        # The S22 shape: the control plane has the claim and is slow to answer it.
+        self._serve(lambda conn: time.sleep(1))
+        with self.assertRaises(self.execute.Unanswered):
+            self.ask()
+        self.assertEqual(self.received, [{"client": "c"}])
+
+    def test_an_error_page_that_is_not_json_is_unanswered(self):
+        # Starlette's own 500 is plain text, and it can follow a claim already written.
+        body = b"Internal Server Error"
+        self._serve(lambda conn: conn.sendall(
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\n"
+            b"Content-Length: %d\r\nConnection: close\r\n\r\n%s" % (len(body), body)))
+        with self.assertRaises(self.execute.Unanswered):
+            self.ask()
+
+    def test_json_that_is_not_an_object_is_unanswered(self):
+        # Every caller reads the answer with `.get`; a list would have been a crash
+        # inside the gateway rather than an answer it could act on.
+        body = b"[]"
+        self._serve(lambda conn: conn.sendall(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            b"Content-Length: %d\r\nConnection: close\r\n\r\n%s" % (len(body), body)))
+        with self.assertRaises(self.execute.Unanswered):
+            self.ask()
+
+    def test_a_refusal_with_a_json_body_is_an_answer(self):
+        body = json.dumps({"ok": False, "status": "pending", "terminal": False}).encode()
+        self._serve(lambda conn: conn.sendall(
+            b"HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\n"
+            b"Content-Length: %d\r\nConnection: close\r\n\r\n%s" % (len(body), body)))
+        self.assertEqual(self.ask()["status"], "pending")

@@ -53,7 +53,7 @@ only the invariants and conventions for working in the repo.
 
 ### Where writing goes
 
-Five places, and the test is **what would have to change for this to become
+For each place, the test is **what would have to change for this to become
 wrong.** Getting this wrong is how `DESIGN.md` grew a 616-line section called
 "Build status" that was really the architecture rationale.
 
@@ -61,9 +61,10 @@ wrong.** Getting this wrong is how `DESIGN.md` grew a 616-line section called
 |---|---|---|
 | **code comment** | it explains the code it sits next to | none — moves with the code |
 | **commit message** | how a specific bug was found and fixed | none — dated, immutable |
-| **`DESIGN.md`** | a decision or invariant that constrains *this* repo | rots if it restates the other four |
+| **`DESIGN.md`** | a decision or invariant that constrains *this* repo | rots if it restates the others |
 | **`NOTES.md`** | evidence: measurements, environment behaviour, dead ends | low — facts about the world |
 | **`CLAUDE.md`** | an invariant or convention to follow *while working* | rots fastest — keep it lean |
+| **a component's `CLAUDE.md`** (`control-plane/CLAUDE.md`) | how to work in *that* component: its checklists, as pointers | as `CLAUDE.md`; loads only once a file beside it is read |
 
 Consequences worth stating, because each was learned by violating it:
 

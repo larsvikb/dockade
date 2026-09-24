@@ -6,7 +6,7 @@ An unmatched host is HELD: ``/authorize`` blocks its worker on a
 (-> default-deny). This module owns everything that state needs — the caps that
 bound it, the grouping that collapses a retry storm into one card, and the
 saturation counters the UI's banner reads — but not the endpoints that drive it,
-which are in ``app.py``.
+which are in the ``api_*`` modules.
 
 SINGLE PROCESS ONLY. Every dict below is in-memory, so a held ``/authorize`` and
 the ``resolve`` that releases it must share memory; that constraint is what makes

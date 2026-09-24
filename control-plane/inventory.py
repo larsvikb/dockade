@@ -48,7 +48,7 @@ class InventoryError(ValueError):
     store, the filesystem, or an underlying exception belongs in one; that is what
     keeps the 400 a validation sentence rather than a disclosure.
 
-    TYPED rather than a bare ``ValueError`` so ``app.py`` can catch exactly the errors
+    TYPED rather than a bare ``ValueError`` so ``api_tool`` can catch exactly the errors
     written to be read, and let anything unexpected become a 500 with no body. A code
     scanning rule flags ``str(exc)`` reaching a response from the shape alone, and this
     is what makes the difference between a finding and a false positive real rather

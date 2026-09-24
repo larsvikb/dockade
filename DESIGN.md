@@ -2524,7 +2524,7 @@ gateway dialled — the other of the two identities "Per-server identity has two
 different answers" above keeps apart. Sharing the column puts both meanings in one
 table, sorting `mcp` (a network whose egress is being decided) beside `mcp-github` (a
 server whose tools are) in a view that groups by that column precisely so unrelated
-rules are never adjacent (`api_rules` in `control-plane/app.py`). `pattern` fares no
+rules are never adjacent (`api_rules` in `control-plane/api_egress.py`). `pattern` fares no
 better: its leading-dot wildcard and the breadth ladder built over it
 (`policy._match`, `policy._persist_candidates`) describe a host namespace, and a tool
 name has no hierarchy to widen along.

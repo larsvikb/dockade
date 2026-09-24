@@ -1515,7 +1515,7 @@ function auditStatus(rowCount, failed, loaded, filtered, refused) {
   // rows on screen are the PREVIOUS question's answer — and unlike a failed poll this
   // is something the operator can act on, in the filter bar, right now. Leaving it to
   // the stale wording would blame the control plane for a parameter the page sent.
-  // The backend's sentence is used verbatim (`_bad_filter` in control-plane/app.py)
+  // The backend's sentence is used verbatim (`_bad_filter` in control-plane/api_views.py)
   // because it names which filter and why, which nothing written here could.
   if (refused) return { show: true, level: "warn", text: refused };
   const s = pollStatus(AUDIT_STATUS_TEXT, rowCount, failed, loaded);

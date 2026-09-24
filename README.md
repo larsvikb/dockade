@@ -243,10 +243,15 @@ dockade/
   sandbox-lib.sh            # launcher plumbing shared by both tiers
   control-plane/            # governance authority BACKEND (agent cannot reach it)
     Dockerfile              #   FastAPI over SQLite; internal nets only, fully internal
-    app.py                  #   the HTTP surface: /authorize on authorize-net; the
-                            #   gateway's bridge on tool-authorize-net; the
-                            #   management API (approvals, resolve, the read-only
-                            #   views) on control-net; every listener's entry point
+    app.py                  #   the process: three listeners, which surface each
+                            #   serves, the bind guard, boot, entry point
+    api_authorize.py        #   POST /authorize — the egress proxy's question (authorize-net)
+    api_tool.py             #   /tool/* — the gateway's bridge (tool-authorize-net)
+    api_approvals.py        #   the queue and resolve — the endpoint that grants
+    api_egress.py           #   standing egress rules, and leases
+    api_mcp.py              #   MCP servers and tool rules
+    api_views.py            #   the audit record, the UI's settings, /status — grants nothing
+    provenance.py           #   who performed a privileged act, for the record
     store.py                #   SQLite — schema, the audit write, the policy seed
     audit.py                #   the read side: the folded glance, the paged record,
                             #   and the filters both share

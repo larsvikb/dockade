@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for the control plane's request-handling flow
-(``control-plane/app.py``): the ``authorize`` handler's allow/deny/hold
-orchestration (including the timeout-defaults-to-deny path and the
-resolve-wakes-the-waiter handshake), the ``resolve`` handler (persist-writes-a-
+(``control-plane/app.py`` and the ``api_*`` surfaces it mounts): the ``authorize``
+handler's allow/deny/hold orchestration (including the timeout-defaults-to-deny path
+and the resolve-wakes-the-waiter handshake), the ``resolve`` handler (persist-writes-a-
 rule, bad-action, and the already-resolved race), and ``_seed_if_empty``.
 
 Feasible dependency-free because the FastAPI stub (``tests/_loader.py``) leaves
@@ -47,6 +47,13 @@ cp = load_control_plane()
 CLASS = cp.store.LEGACY_CLIENT_CLASS
 CLASS_IP = "172.30.0.2"
 
+#: Every module that answers a request, as one text: app.py and the ``api_*`` surfaces
+#: it mounts. For the source-reading guards, which must see every handler wherever it
+#: lives — a glob, so a new surface module is covered without being registered here.
+_HANDLER_SOURCE = "\n".join(
+    p.read_text() for p in [*sorted((ROOT / "control-plane").glob("api_*.py")),
+                            ROOT / "control-plane" / "app.py"])
+
 
 def _set_rules(rules):
     """(pattern, action) tuples, or (pattern, action, client_class) where the class
@@ -89,7 +96,7 @@ def _auth_req(host, **kw):
     rule and is held, so every decision test would otherwise be testing the
     unclassified path by accident."""
     kw.setdefault("client", CLASS_IP)
-    return cp.AuthorizeRequest(host=host, **kw)
+    return cp.api_authorize.AuthorizeRequest(host=host, **kw)
 
 
 class _FakeRequest:
@@ -113,8 +120,9 @@ class _FakeRequest:
 def _resolve(approval_id, action, request=None, **fields):
     """resolve() with a default request, so tests that don't care about provenance
     stay readable. Extra kwargs go on the ResolveRequest (e.g. ``pattern=``)."""
-    return cp.resolve(approval_id, cp.ResolveRequest(action=action, **fields),
-                      request if request is not None else _FakeRequest())
+    return cp.api_approvals.resolve(
+        approval_id, cp.api_approvals.ResolveRequest(action=action, **fields),
+        request if request is not None else _FakeRequest())
 
 
 def _hold(host, approval_id="hold-1", client=None, client_class=CLASS):
@@ -210,14 +218,14 @@ class _CPTestCase(unittest.TestCase):
 class AuthorizeDecisionTests(_CPTestCase):
     def test_allow_rule_returns_allow_without_holding(self):
         _set_rules([("example.com", "allow")])
-        resp = cp.authorize(_auth_req("example.com"))
+        resp = cp.api_authorize.authorize(_auth_req("example.com"))
         self.assertEqual(resp.decision, "allow")
         # An allow decision must not create an approval row.
         self.assertEqual(cp.holds._list_pending(), [])
 
     def test_block_rule_returns_deny(self):
         _set_rules([("blocked.com", "block")])
-        resp = cp.authorize(_auth_req("blocked.com"))
+        resp = cp.api_authorize.authorize(_auth_req("blocked.com"))
         self.assertEqual(resp.decision, "deny")
 
     def test_over_cap_hold_fails_closed_immediately(self):
@@ -226,7 +234,7 @@ class AuthorizeDecisionTests(_CPTestCase):
         cp.holds.MAX_PENDING = 0
         try:
             start = time.monotonic()
-            resp = cp.authorize(_auth_req("unknown.com", client="a"))
+            resp = cp.api_authorize.authorize(_auth_req("unknown.com", client="a"))
             elapsed = time.monotonic() - start
         finally:
             cp.holds.MAX_PENDING = saved
@@ -247,7 +255,7 @@ class AuthorizeDecisionTests(_CPTestCase):
         with mock.patch.object(cp.store, "_connect",
                                lambda: _FailsTheApprovalsInsert(real())), \
                 self.assertRaises(sqlite3.OperationalError):
-            cp.authorize(_auth_req("unknown.com", client=CLASS_IP))
+            cp.api_authorize.authorize(_auth_req("unknown.com", client=CLASS_IP))
 
         # Every registry, because a partial release is the same defect wearing fewer
         # entries — and _GROUPS is the one that decides whether the next request for
@@ -267,12 +275,12 @@ class AuthorizeDecisionTests(_CPTestCase):
         with mock.patch.object(cp.store, "_connect",
                                lambda: _FailsTheApprovalsInsert(real())), \
                 self.assertRaises(sqlite3.OperationalError):
-            cp.authorize(_auth_req("unknown.com", client=CLASS_IP))
+            cp.api_authorize.authorize(_auth_req("unknown.com", client=CLASS_IP))
 
         saved = cp.holds.HOLD_TIMEOUT
         cp.holds.HOLD_TIMEOUT = 0.05
         try:
-            resp = cp.authorize(_auth_req("unknown.com", client=CLASS_IP))
+            resp = cp.api_authorize.authorize(_auth_req("unknown.com", client=CLASS_IP))
         finally:
             cp.holds.HOLD_TIMEOUT = saved
         self.assertEqual(resp.decision, "deny")
@@ -288,7 +296,7 @@ class AuthorizeDecisionTests(_CPTestCase):
         saved = cp.holds.HOLD_TIMEOUT
         cp.holds.HOLD_TIMEOUT = 0.05
         try:
-            resp = cp.authorize(_auth_req("slow.com", client="a"))
+            resp = cp.api_authorize.authorize(_auth_req("slow.com", client="a"))
         finally:
             cp.holds.HOLD_TIMEOUT = saved
         self.assertEqual(resp.decision, "deny")
@@ -307,7 +315,7 @@ class HoldHandshakeTests(_CPTestCase):
         result = {}
 
         def worker():
-            result["resp"] = cp.authorize(_auth_req(host, client=client))
+            result["resp"] = cp.api_authorize.authorize(_auth_req(host, client=client))
 
         t = threading.Thread(target=worker)
         t.start()
@@ -361,7 +369,7 @@ class DuplicateHoldTests(_CPTestCase):
         results = [None] * n
 
         def worker(i):
-            results[i] = cp.authorize(_auth_req(
+            results[i] = cp.api_authorize.authorize(_auth_req(
                 host, client=client, url=(urls[i] if urls else None)))
 
         threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
@@ -505,7 +513,8 @@ class DuplicateHoldTests(_CPTestCase):
             for t in threads:
                 t.join(5)
             cp.holds.HOLD_TIMEOUT = 0.2
-            late = cp.authorize(_auth_req("again.example", client=CLASS_IP))
+            late = cp.api_authorize.authorize(
+                _auth_req("again.example", client=CLASS_IP))
         finally:
             cp.holds.HOLD_TIMEOUT = saved
         self.assertEqual(late.decision, "deny")
@@ -627,11 +636,11 @@ class ResponseShapeTests(_CPTestCase):
 
     def test_each_json_endpoint_returns_what_it_declares(self):
         for name, call in (("healthz", cp.healthz),
-                           ("approvals", cp.approvals),
-                           ("api_rules", cp.api_rules),
-                           ("api_audit", cp.api_audit),
-                           ("api_config", cp.api_config),
-                           ("tool_roster", cp.tool_roster)):
+                           ("approvals", cp.api_approvals.approvals),
+                           ("api_rules", cp.api_egress.api_rules),
+                           ("api_audit", cp.api_views.api_audit),
+                           ("api_config", cp.api_views.api_config),
+                           ("tool_roster", cp.api_tool.tool_roster)):
             with self.subTest(endpoint=name):
                 # get_type_hints, not __annotations__: the module carries
                 # `from __future__ import annotations`, so the raw values are
@@ -694,7 +703,7 @@ class RevokeRuleTests(_CPTestCase):
 
     def test_an_operator_rule_is_removed(self):
         rid = self._rule("evil.example", "block")
-        resp = cp.revoke_rule(rid, _FakeRequest())
+        resp = cp.api_egress.revoke_rule(rid, _FakeRequest())
         self.assertEqual(resp.status_code, 200)
         self.assertNotIn("evil.example", self._patterns())
 
@@ -705,14 +714,14 @@ class RevokeRuleTests(_CPTestCase):
         table is empty, so a store whose every rule could be revoked would resurrect
         the entire seed allowlist on the next restart."""
         rid = self._rule("pypi.org", "allow", source="seed")
-        resp = cp.revoke_rule(rid, _FakeRequest())
+        resp = cp.api_egress.revoke_rule(rid, _FakeRequest())
         self.assertEqual(resp.status_code, 403)
         self.assertIn("pypi.org", self._patterns())
 
     def test_the_refusal_says_where_to_change_it_instead(self):
         # A refusal with no next step is a dead end; the seed file IS the next step.
         rid = self._rule("pypi.org", "allow", source="seed")
-        body = cp.revoke_rule(rid, _FakeRequest()).body
+        body = cp.api_egress.revoke_rule(rid, _FakeRequest()).body
         self.assertIn("egress-allowlist.txt", json.dumps(body))
 
     def test_the_rules_table_can_never_be_emptied_by_revocation(self):
@@ -721,13 +730,14 @@ class RevokeRuleTests(_CPTestCase):
         self._rule("seeded.example", "allow", source="seed")
         ids = [self._rule(f"op{i}.example") for i in range(3)]
         for rid in ids:
-            cp.revoke_rule(rid, _FakeRequest())
+            cp.api_egress.revoke_rule(rid, _FakeRequest())
         self.assertEqual(self._patterns(), {"seeded.example"})
         # And therefore a restart does not re-seed.
         self.assertEqual(cp.store._seed_if_empty(), 0)
 
     def test_an_unknown_id_is_a_404_not_a_silent_success(self):
-        self.assertEqual(cp.revoke_rule(999999, _FakeRequest()).status_code, 404)
+        self.assertEqual(
+            cp.api_egress.revoke_rule(999999, _FakeRequest()).status_code, 404)
 
     def test_revocation_is_audited_with_provenance(self):
         """Editing standing policy is more consequential than any single egress
@@ -736,7 +746,7 @@ class RevokeRuleTests(_CPTestCase):
         caller — but a forged revocation is at least visible afterwards."""
         rid = self._rule(".github.com", "allow")
         with mock.patch.object(cp.store, "_audit") as audit:
-            cp.revoke_rule(rid, _FakeRequest(peer="172.31.0.9"))
+            cp.api_egress.revoke_rule(rid, _FakeRequest(peer="172.31.0.9"))
         self.assertEqual(audit.call_args.args[0], "revoke")
         kwargs = audit.call_args.kwargs
         self.assertEqual(kwargs["host"], ".github.com")
@@ -748,7 +758,7 @@ class RevokeRuleTests(_CPTestCase):
         # rule is gone rather than replaced.
         rid = self._rule("evil.example", "block")
         with mock.patch.object(cp.store, "_audit") as audit:
-            cp.revoke_rule(rid, _FakeRequest())
+            cp.api_egress.revoke_rule(rid, _FakeRequest())
         self.assertIn("held for approval", audit.call_args.kwargs["reason"])
 
     def test_a_revoked_allow_stops_deciding_requests(self):
@@ -756,7 +766,7 @@ class RevokeRuleTests(_CPTestCase):
         # inspecting the table: policy actually changes.
         rid = self._rule("gone.example", "allow")
         self.assertEqual(cp.policy._decide("gone.example", CLASS)[0], "allow")
-        cp.revoke_rule(rid, _FakeRequest())
+        cp.api_egress.revoke_rule(rid, _FakeRequest())
         self.assertEqual(cp.policy._decide("gone.example", CLASS)[0], "hold")
 
     def test_a_revoked_block_reverts_to_hold_not_allow(self):
@@ -764,7 +774,7 @@ class RevokeRuleTests(_CPTestCase):
         # it does NOT become allowed, it becomes decidable.
         rid = self._rule("bad.example", "block")
         self.assertEqual(cp.policy._decide("bad.example", CLASS)[0], "deny")
-        cp.revoke_rule(rid, _FakeRequest())
+        cp.api_egress.revoke_rule(rid, _FakeRequest())
         self.assertEqual(cp.policy._decide("bad.example", CLASS)[0], "hold")
 
 
@@ -852,9 +862,9 @@ class PatternValidationTests(unittest.TestCase):
 
 
 def _create(pattern, action="allow", client_class=CLASS, request=None):
-    return cp.create_rule(
-        cp.RuleCreateRequest(pattern=pattern, action=action,
-                             client_class=client_class),
+    return cp.api_egress.create_rule(
+        cp.api_egress.RuleCreateRequest(pattern=pattern, action=action,
+                                        client_class=client_class),
         request if request is not None else _FakeRequest())
 
 
@@ -897,9 +907,9 @@ class CreateRuleTests(_CPTestCase):
         could set it could write an UNREVOCABLE rule — and one that would also stop
         ``_seed_if_empty`` from ever re-reading the file, since the table is no longer
         empty. The model has no such field; this asserts the model stays that way."""
-        req = cp.RuleCreateRequest(pattern="sneaky.example", action="allow",
-                                   client_class=CLASS, source="seed")
-        cp.create_rule(req, _FakeRequest())
+        req = cp.api_egress.RuleCreateRequest(pattern="sneaky.example", action="allow",
+                                              client_class=CLASS, source="seed")
+        cp.api_egress.create_rule(req, _FakeRequest())
         self.assertEqual(self._row("sneaky.example")["source"], "operator")
 
     def test_an_unconfigured_client_class_is_refused(self):
@@ -991,7 +1001,8 @@ class CreateRuleTests(_CPTestCase):
         # The round trip: what this writes is an operator rule, so the other half of
         # the governance plane can take it back.
         rid = _create("example.com", "allow").body["id"]
-        self.assertEqual(cp.revoke_rule(rid, _FakeRequest()).status_code, 200)
+        self.assertEqual(
+            cp.api_egress.revoke_rule(rid, _FakeRequest()).status_code, 200)
         self.assertEqual(cp.policy._decide("example.com", CLASS)[0], "hold")
 
 
@@ -1001,7 +1012,7 @@ def _served(**kw):
     The endpoint returns ``{"rows": [...], "total": n}`` — the total being what the
     view is a window onto. These tests are about the rows unless they say otherwise,
     so the unwrapping lives here rather than in forty assertions."""
-    return cp.api_audit(**kw)["rows"]
+    return cp.api_views.api_audit(**kw)["rows"]
 
 
 class EditRuleTests(_CPTestCase):
@@ -1024,8 +1035,9 @@ class EditRuleTests(_CPTestCase):
             return cur.lastrowid
 
     def _edit(self, rule_id, pattern, action, request=None):
-        return cp.edit_rule(rule_id, cp.RuleEditRequest(pattern=pattern, action=action),
-                            request if request is not None else _FakeRequest())
+        return cp.api_egress.edit_rule(
+            rule_id, cp.api_egress.RuleEditRequest(pattern=pattern, action=action),
+            request if request is not None else _FakeRequest())
 
     def test_an_action_flips_in_one_operation(self):
         # Through `_decide`, like the create tests: the assertion is that policy moved,
@@ -1163,9 +1175,9 @@ class EditRuleTests(_CPTestCase):
         revoke-then-create says that honestly. This asserts the model stays shut, the
         same way the create tests assert ``source`` does."""
         rid = self._rule("example.com", "allow")
-        req = cp.RuleEditRequest(pattern="example.com", action="allow",
-                                 client_class="mcp")
-        cp.edit_rule(rid, req, _FakeRequest())
+        req = cp.api_egress.RuleEditRequest(pattern="example.com", action="allow",
+                                            client_class="mcp")
+        cp.api_egress.edit_rule(rid, req, _FakeRequest())
         with cp.store._connect() as conn:
             self.assertEqual(
                 conn.execute("SELECT client_class FROM rules WHERE id=?",
@@ -1211,20 +1223,21 @@ class AuditViewTests(_CPTestCase):
 
     def test_the_marker_matches_what_the_proxy_actually_writes(self):
         """The reason text is produced in proxies/egress/addon.py and classified in
-        control-plane/app.py — two services, two images, no shared module. Nothing but
-        this test connects them, and the drift is silent: a renamed reason simply stops
-        being recognised and the row reverts to looking like a policy denial.
+        control-plane/api_views.py — two services, two images, no shared module.
+        Nothing but this test connects them, and the drift is silent: a renamed reason
+        simply stops being recognised and the row reverts to looking like a policy
+        denial.
 
         Reads the addon's SOURCE rather than importing it, because the point is to pin
         the literal that ships in the other image."""
         addon = (ROOT / "proxies" / "egress" / "addon.py").read_text()
         produced = re.findall(r'Verdict\(False,\s*f?"([^"{]*)', addon)
         self.assertTrue(
-            any(p.startswith(cp.FAIL_CLOSED_REASON) for p in produced),
+            any(p.startswith(cp.api_views.FAIL_CLOSED_REASON) for p in produced),
             f"no fail-closed Verdict reason in addon.py starts with "
-            f"{cp.FAIL_CLOSED_REASON!r}; found {produced!r}. If the wording moved, "
-            f"move FAIL_CLOSED_REASON with it — otherwise outage denials go back to "
-            f"being indistinguishable from policy denials in the UI.")
+            f"{cp.api_views.FAIL_CLOSED_REASON!r}; found {produced!r}. If the wording "
+            f"moved, move FAIL_CLOSED_REASON with it — otherwise outage denials go "
+            f"back to being indistinguishable from policy denials in the UI.")
 
     def test_an_unrecognised_reason_is_not_marked_as_an_outage(self):
         # The classification must not fire on a word that appears in ordinary reasons
@@ -1303,7 +1316,7 @@ class AuditViewTests(_CPTestCase):
         # The frontend distinguishes "nothing yet" from "the poll failed", which only
         # works if this reports the first as success.
         self.assertEqual(_served(), [])
-        self.assertEqual(cp.api_audit()["total"], 0)
+        self.assertEqual(cp.api_views.api_audit()["total"], 0)
 
     def test_the_total_counts_decisions_not_rows(self):
         """The list is a window and used to say so nowhere. Grouping made that worse
@@ -1315,7 +1328,7 @@ class AuditViewTests(_CPTestCase):
         with the first and tells the reader nothing."""
         self._rows(*[{"host": "chatty.example", "kind": "deny",
                       "ts": 1000.0 + i} for i in range(30)])
-        served = cp.api_audit()
+        served = cp.api_views.api_audit()
         self.assertEqual(len(served["rows"]), 1)     # one group
         self.assertEqual(served["rows"][0]["n"], 30)
         self.assertEqual(served["total"], 30)        # thirty decisions
@@ -1326,7 +1339,7 @@ class AuditViewTests(_CPTestCase):
         # could never report truncation.
         self._rows(*[{"host": f"h{i}.example", "ts": float(i)} for i in range(12)])
         self.assertEqual(len(_served(limit=3)), 3)
-        self.assertEqual(cp.api_audit(limit=3)["total"], 12)
+        self.assertEqual(cp.api_views.api_audit(limit=3)["total"], 12)
 
     def test_identical_decisions_collapse_to_one_row(self):
         """The case that forced this: a client retrying a host that a standing rule
@@ -1407,7 +1420,7 @@ class AuditViewTests(_CPTestCase):
         the groups gives ten. A first version of this test used forty distinct hosts,
         where both orderings happen to return the same ten rows, and the swap survived
         it."""
-        cp.AUDIT_GROUP_SCAN = 10
+        cp.api_views.AUDIT_GROUP_SCAN = 10
         try:
             self._rows(*([{"host": f"old{i}.example", "ts": float(i)}
                           for i in range(30)]
@@ -1420,13 +1433,13 @@ class AuditViewTests(_CPTestCase):
             # summarises recent events, not the whole table.
             self.assertEqual(served[0]["n"], 10)
         finally:
-            cp.AUDIT_GROUP_SCAN = 5000
+            cp.api_views.AUDIT_GROUP_SCAN = 5000
 
     def test_rows_older_than_the_scan_are_kept_but_not_shown(self):
         # Cost has to be fixed as the table grows, since this is polled every few
         # seconds against a table that only ever gets longer. The trade is stated
         # rather than hidden: the record keeps everything, this view does not.
-        cp.AUDIT_GROUP_SCAN = 5
+        cp.api_views.AUDIT_GROUP_SCAN = 5
         try:
             self._rows(*[{"host": f"h{i}.example", "ts": float(i)}
                          for i in range(20)])
@@ -1436,7 +1449,7 @@ class AuditViewTests(_CPTestCase):
                 self.assertEqual(
                     conn.execute("SELECT COUNT(*) FROM audit").fetchone()[0], 20)
         finally:
-            cp.AUDIT_GROUP_SCAN = 5000
+            cp.api_views.AUDIT_GROUP_SCAN = 5000
 
 
 def _write_audit(*rows):
@@ -1469,7 +1482,7 @@ class AuditFilterTests(_CPTestCase):
     neither is visible on screen."""
 
     def _hosts(self, **kw):
-        return [r["host"] for r in cp.api_audit(**kw)["rows"]]
+        return [r["host"] for r in cp.api_views.api_audit(**kw)["rows"]]
 
     def setUp(self):
         super().setUp()
@@ -1504,8 +1517,9 @@ class AuditFilterTests(_CPTestCase):
         same failure the group key avoids by keying on the displayed fields."""
         self.assertEqual(self._hosts(q="simple"), [])
         # And it IS searchable where it is shown.
-        self.assertEqual([r["host"] for r in cp.api_audit_events(q="simple")["rows"]],
-                         ["pypi.org"])
+        self.assertEqual(
+            [r["host"] for r in cp.api_views.api_audit_events(q="simple")["rows"]],
+            ["pypi.org"])
 
     def test_search_is_a_literal_substring_not_a_like_pattern(self):
         # Unescaped, `%` matches every row and `_` matches any character — so the
@@ -1533,7 +1547,7 @@ class AuditFilterTests(_CPTestCase):
                          ["slack.com", "evil.example"])
 
     def test_an_unknown_decision_is_refused_rather_than_matching_nothing(self):
-        resp = cp.api_audit(kind="allowed")
+        resp = cp.api_views.api_audit(kind="allowed")
         self.assertEqual(resp.status_code, 400)
         # And it says what the words are, so the refusal has a next step.
         self.assertIn("allow", json.dumps(resp.body))
@@ -1543,9 +1557,8 @@ class AuditFilterTests(_CPTestCase):
         between them: a new decision word would be recorded, rendered, and quietly
         unfilterable — its facet a 400. Read from the SOURCE rather than exercised,
         because the point is the set of literals that ship."""
-        written = set(re.findall(r'store\._audit\(\s*"([a-z]+)"',
-                                 (ROOT / "control-plane" / "app.py").read_text()))
-        self.assertTrue(written, "no literal audit decisions found in app.py")
+        written = set(re.findall(r'store\._audit\(\s*"([a-z]+)"', _HANDLER_SOURCE))
+        self.assertTrue(written, "no literal audit decisions found in the handlers")
         self.assertLessEqual(written, set(cp.audit.KINDS))
         # The ingest is the other writer, and it validates against its own tuple —
         # so that tuple is the second half of the vocabulary.
@@ -1586,10 +1599,9 @@ class AuditFilterTests(_CPTestCase):
         CIDR, a timestamp — so the rule is not "never catch it". It is that a handler
         which RELAYS the message may not. Written after doing it: the inventory
         endpoint shipped with a bare catch, and CodeQL found it before review did."""
-        source = (ROOT / "control-plane" / "app.py").read_text()
         offenders = []
-        for match in re.finditer(r"except ([\w.]+) as exc:\n", source):
-            after = source[match.end():match.end() + 900]
+        for match in re.finditer(r"except ([\w.]+) as exc:\n", _HANDLER_SOURCE):
+            after = _HANDLER_SOURCE[match.end():match.end() + 900]
             # The handler body ends at the next line that is not indented into it.
             body = after.split("\n    def ")[0]
             if "str(exc)" in body and match.group(1) in ("ValueError", "Exception",
@@ -1618,31 +1630,32 @@ class AuditFilterTests(_CPTestCase):
         self.assertEqual(self._hosts(until=200.0), ["pypi.org"])
 
     def test_an_inverted_window_is_refused_not_answered_with_nothing(self):
-        self.assertEqual(cp.api_audit(since=300.0, until=100.0).status_code, 400)
+        self.assertEqual(
+            cp.api_views.api_audit(since=300.0, until=100.0).status_code, 400)
 
     def test_an_unusable_time_bound_is_refused(self):
         # NaN is the one worth naming: every comparison against it is false, so it
         # would answer "nothing happened" for a store full of decisions.
         for bad in (float("nan"), float("inf"), "yesterday"):
             with self.subTest(since=bad):
-                self.assertEqual(cp.api_audit(since=bad).status_code, 400)
+                self.assertEqual(cp.api_views.api_audit(since=bad).status_code, 400)
 
     def test_the_total_follows_the_filter(self):
         # The total exists to say how much was NOT shown. Measured against the whole
         # table, a complete filtered view would report itself as truncated — on every
         # filtered query.
-        self.assertEqual(cp.api_audit()["total"], 3)
-        self.assertEqual(cp.api_audit(kind="deny")["total"], 1)
+        self.assertEqual(cp.api_views.api_audit()["total"], 3)
+        self.assertEqual(cp.api_views.api_audit(kind="deny")["total"], 1)
 
     def test_the_response_says_whether_it_filtered(self):
         # The one thing the browser cannot work out for itself: it knows what it sent,
         # not whether this backend understood it. Without it the coverage line would
         # say "matching" against an older backend that ignored the parameters.
-        self.assertFalse(cp.api_audit()["filtered"])
-        self.assertTrue(cp.api_audit(q="evil")["filtered"])
+        self.assertFalse(cp.api_views.api_audit()["filtered"])
+        self.assertTrue(cp.api_views.api_audit(q="evil")["filtered"])
         # Whitespace is not a filter, and treating it as one would make an accidental
         # space in the box relabel the whole view.
-        self.assertFalse(cp.api_audit(q="   ")["filtered"])
+        self.assertFalse(cp.api_views.api_audit(q="   ")["filtered"])
 
     def test_no_filter_value_ever_reaches_the_sql_text(self):
         """The property the whole filter design rests on, asserted DIRECTLY rather than
@@ -1673,9 +1686,9 @@ class AuditFilterTests(_CPTestCase):
         for payload in ("x' OR '1'='1", "'; DROP TABLE audit; --",
                         "1); DELETE FROM rules; --", "\\", "%' --"):
             with self.subTest(payload=payload):
-                body = cp.api_audit(q=payload)
+                body = cp.api_views.api_audit(q=payload)
                 self.assertEqual(body["rows"], [])
-                self.assertEqual(cp.api_audit_events(q=payload)["rows"], [])
+                self.assertEqual(cp.api_views.api_audit_events(q=payload)["rows"], [])
         with cp.store._connect() as conn:
             self.assertEqual(
                 conn.execute("SELECT COUNT(*) FROM audit").fetchone()[0], 2)
@@ -1689,14 +1702,15 @@ class AuditFilterTests(_CPTestCase):
         self.assertEqual(self._hosts(q="back\\slash"), ["back\\slash.example"])
 
     def test_an_overlong_search_is_refused(self):
-        self.assertEqual(cp.api_audit(q="x" * (cp.audit.Q_MAX + 1)).status_code, 400)
+        self.assertEqual(
+            cp.api_views.api_audit(q="x" * (cp.audit.Q_MAX + 1)).status_code, 400)
 
     def test_filtering_happens_before_the_fold_so_the_scan_reaches_back(self):
         """The property that makes filtering worth having on a bounded window: the scan
         counts MATCHING events, not events. Unfiltered, a chatty host fills the window
         and everything older is invisible — which is the exact complaint that motivated
         grouping, one level up."""
-        cp.AUDIT_GROUP_SCAN = 10
+        cp.api_views.AUDIT_GROUP_SCAN = 10
         try:
             _write_audit(*([{"host": "quiet.example", "kind": "deny", "ts": 1.0}]
                            + [{"host": "chatty.example", "ts": 10.0 + i}
@@ -1706,7 +1720,7 @@ class AuditFilterTests(_CPTestCase):
             # Filtered, it reaches the one row that matters.
             self.assertEqual(self._hosts(q="quiet"), ["quiet.example"])
         finally:
-            cp.AUDIT_GROUP_SCAN = 5000
+            cp.api_views.AUDIT_GROUP_SCAN = 5000
 
 
 class AuditRecordTests(_CPTestCase):
@@ -1718,7 +1732,7 @@ class AuditRecordTests(_CPTestCase):
     `docker compose exec` and SQL against the volume."""
 
     def _rows(self, **kw):
-        return cp.api_audit_events(**kw)["rows"]
+        return cp.api_views.api_audit_events(**kw)["rows"]
 
     def test_the_dropped_columns_are_here(self):
         # The glance omits these on purpose (a forty-row list must stay legible, and
@@ -1774,7 +1788,7 @@ class AuditRecordTests(_CPTestCase):
                        for i in range(20)])          # deliberate ts ties, pairwise
         walked, cursor, pages = [], None, 0
         while True:
-            body = cp.api_audit_events(limit=3, before=cursor)
+            body = cp.api_views.api_audit_events(limit=3, before=cursor)
             walked.extend(r["host"] for r in body["rows"])
             pages += 1
             cursor = body["next"]
@@ -1789,23 +1803,24 @@ class AuditRecordTests(_CPTestCase):
         # How the pager knows to stop. A cursor that always came back would offer an
         # "older" that lands on an empty page.
         _write_audit(*[{"host": f"h{i}.example", "ts": float(i)} for i in range(3)])
-        self.assertIsNone(cp.api_audit_events(limit=3)["next"])
-        self.assertIsNotNone(cp.api_audit_events(limit=2)["next"])
+        self.assertIsNone(cp.api_views.api_audit_events(limit=3)["next"])
+        self.assertIsNotNone(cp.api_views.api_audit_events(limit=2)["next"])
 
     def test_the_total_does_not_move_while_paging(self):
         # The cursor narrows the query but never the total: a page counter that walked
         # down to zero would read as the record shrinking as it was examined.
         _write_audit(*[{"host": f"h{i}.example", "ts": float(i)} for i in range(10)])
-        first = cp.api_audit_events(limit=4)
-        second = cp.api_audit_events(limit=4, before=first["next"])
+        first = cp.api_views.api_audit_events(limit=4)
+        second = cp.api_views.api_audit_events(limit=4, before=first["next"])
         self.assertEqual(first["total"], 10)
         self.assertEqual(second["total"], 10)
 
     def test_the_filter_survives_paging_and_bounds_the_total(self):
         _write_audit(*[{"host": f"h{i}.example", "ts": float(i),
                         "kind": "deny" if i % 2 else "allow"} for i in range(10)])
-        first = cp.api_audit_events(limit=2, kind="deny")
-        second = cp.api_audit_events(limit=2, kind="deny", before=first["next"])
+        first = cp.api_views.api_audit_events(limit=2, kind="deny")
+        second = cp.api_views.api_audit_events(limit=2, kind="deny",
+                                               before=first["next"])
         self.assertEqual(first["total"], 5)
         self.assertEqual(second["total"], 5)
         self.assertTrue(all(r["kind"] == "deny"
@@ -1821,7 +1836,7 @@ class AuditRecordTests(_CPTestCase):
         for bad in ("nonsense", "", ":", "abc:def", "1.0:x",
                     "nan:1", "inf:1", "-inf:1", "1e400:1"):
             with self.subTest(cursor=bad):
-                resp = cp.api_audit_events(before=bad)
+                resp = cp.api_views.api_audit_events(before=bad)
                 if bad == "":                      # absent, not malformed
                     self.assertIn("rows", resp)
                 else:
@@ -1848,7 +1863,7 @@ class AuditRecordTests(_CPTestCase):
                              "so the pager's row numbers overstate every page")
 
     def test_an_empty_record_is_an_empty_page_not_an_error(self):
-        body = cp.api_audit_events()
+        body = cp.api_views.api_audit_events()
         self.assertEqual(body["rows"], [])
         self.assertEqual(body["total"], 0)
         self.assertIsNone(body["next"])
@@ -2011,8 +2026,8 @@ class ProvenanceTests(_CPTestCase):
     observed and asserted values apart."""
 
     def test_actor_separates_observed_peer_from_self_reported_fields(self):
-        actor = cp._actor(_FakeRequest(peer="172.31.0.3", headers={
-            cp.ACTOR_HEADER: "127.0.0.1",
+        actor = cp.provenance._actor(_FakeRequest(peer="172.31.0.3", headers={
+            cp.provenance.ACTOR_HEADER: "127.0.0.1",
             "origin": "http://127.0.0.1:28090",
             "user-agent": "Mozilla/5.0 (X11)"}))
         self.assertIn("peer=172.31.0.3", actor)      # observed by us
@@ -2021,11 +2036,11 @@ class ProvenanceTests(_CPTestCase):
         self.assertIn('ua="Mozilla/5.0 (X11)"', actor)
 
     def test_actor_tolerates_a_bare_request(self):
-        self.assertIn("peer=?", cp._actor(_FakeRequest(peer=None)))
-        self.assertIn("unrecorded", cp._actor(None))
+        self.assertIn("peer=?", cp.provenance._actor(_FakeRequest(peer=None)))
+        self.assertIn("unrecorded", cp.provenance._actor(None))
 
     def test_actor_bounds_a_hostile_user_agent(self):
-        actor = cp._actor(_FakeRequest(headers={"user-agent": "A" * 5000}))
+        actor = cp.provenance._actor(_FakeRequest(headers={"user-agent": "A" * 5000}))
         self.assertLess(len(actor), 400)
 
     def test_resolution_records_provenance_on_the_approval_row(self):
@@ -2036,7 +2051,7 @@ class ProvenanceTests(_CPTestCase):
                 self, "provenance.com")
             _resolve(approval_id, "allow_once",
                      _FakeRequest(peer="172.31.0.3",
-                                  headers={cp.ACTOR_HEADER: "10.1.2.3",
+                                  headers={cp.provenance.ACTOR_HEADER: "10.1.2.3",
                                            "user-agent": "curl/8.5.0"}))
             t.join(2)
         finally:
@@ -2138,7 +2153,7 @@ class ProvenanceTests(_CPTestCase):
         saved = cp.holds.HOLD_TIMEOUT
         cp.holds.HOLD_TIMEOUT = 0.05
         try:
-            resp = cp.authorize(_auth_req("nobody.com", client="a"))
+            resp = cp.api_authorize.authorize(_auth_req("nobody.com", client="a"))
         finally:
             cp.holds.HOLD_TIMEOUT = saved
         self.assertEqual(resp.decision, "deny")
@@ -2272,7 +2287,7 @@ class RulesViewTests(_CPTestCase):
         # actions, which reads as a contradiction rather than as two scoped rules.
         _set_rules([("pypi.org", "allow", CLASS), ("pypi.org", "block", "mcp")])
         classes = {(r["pattern"], r["action"]): r["client_class"]
-                   for r in cp.api_rules()}
+                   for r in cp.api_egress.api_rules()}
         self.assertEqual(classes, {("pypi.org", "allow"): CLASS,
                                    ("pypi.org", "block"): "mcp"})
 
@@ -2282,14 +2297,14 @@ class RulesViewTests(_CPTestCase):
         # within each.
         _set_rules([("a.example", "allow", "mcp"), ("b.example", "block", "mcp"),
                     ("c.example", "allow", CLASS), ("d.example", "block", CLASS)])
-        listed = [(r["client_class"], r["action"]) for r in cp.api_rules()]
+        listed = [(r["client_class"], r["action"]) for r in cp.api_egress.api_rules()]
         self.assertEqual(listed, [("mcp", "block"), ("mcp", "allow"),
                                   (CLASS, "block"), (CLASS, "allow")])
 
     def test_lists_every_rule_with_source_and_scope(self):
         _set_rules([("example.com", "allow"), ("bad.com", "block"),
                     (".github.com", "allow")])
-        rows = cp.api_rules()
+        rows = cp.api_egress.api_rules()
         self.assertEqual(len(rows), 3)
         by_pattern = {r["pattern"]: r for r in rows}
         self.assertEqual(by_pattern["example.com"]["action"], "allow")
@@ -2300,7 +2315,7 @@ class RulesViewTests(_CPTestCase):
 
     def test_blocks_are_listed_first_because_block_wins(self):
         _set_rules([("aaa-allow.com", "allow"), ("zzz-block.com", "block")])
-        actions = [r["action"] for r in cp.api_rules()]
+        actions = [r["action"] for r in cp.api_egress.api_rules()]
         # Alphabetically 'allow' < 'block' and aaa- < zzz-, so a naive ordering would
         # invert this. The listing must read in DECISION precedence order.
         self.assertEqual(actions, ["block", "allow"])
@@ -2309,7 +2324,7 @@ class RulesViewTests(_CPTestCase):
         # A leading dot is a subdomain wildcard that LOOKS like a hostname — the
         # thing that makes an over-broad persisted rule easy to miss.
         _set_rules([(".example.com", "allow"), ("example.com", "allow")])
-        scope = {r["pattern"]: r["scope"] for r in cp.api_rules()}
+        scope = {r["pattern"]: r["scope"] for r in cp.api_egress.api_rules()}
         self.assertEqual(scope[".example.com"], "host + subdomains")
         self.assertEqual(scope["example.com"], "exact host")
 
@@ -2322,7 +2337,7 @@ class RulesViewTests(_CPTestCase):
 
     def test_empty_policy_is_an_empty_list_not_an_error(self):
         _set_rules([])
-        self.assertEqual(cp.api_rules(), [])
+        self.assertEqual(cp.api_egress.api_rules(), [])
 
 
 class LeaseGrantTests(_CPTestCase):
@@ -2431,7 +2446,7 @@ class LeaseGrantTests(_CPTestCase):
     def test_there_is_no_deny_lease(self):
         # An unmatched host is HELD, not denied, so a timed deny would mean "suppress
         # the card for a while" — a different feature wearing this one's name.
-        self.assertNotIn("deny_lease", cp.EGRESS_ACTIONS)
+        self.assertNotIn("deny_lease", cp.api_approvals.EGRESS_ACTIONS)
         _hold("api.example.com")
         self.assertEqual(_resolve("hold-1", "deny_lease").status_code, 400)
 
@@ -2481,8 +2496,8 @@ class LeaseGrantTests(_CPTestCase):
             result = {}
 
             def worker():
-                result["resp"] = cp.authorize(_auth_req("leased.com",
-                                                        client=CLASS_IP))
+                result["resp"] = cp.api_authorize.authorize(_auth_req("leased.com",
+                                                                      client=CLASS_IP))
 
             t = threading.Thread(target=worker)
             t.start()
@@ -2500,7 +2515,8 @@ class LeaseGrantTests(_CPTestCase):
         self.assertFalse(t.is_alive())
         self.assertEqual(result["resp"].decision, "allow")
         # And the NEXT request needs no card at all, which is the point of the rung.
-        self.assertEqual(cp.authorize(_auth_req("leased.com")).decision, "allow")
+        self.assertEqual(
+            cp.api_authorize.authorize(_auth_req("leased.com")).decision, "allow")
 
 
 class LeaseCardTests(_CPTestCase):
@@ -2547,7 +2563,7 @@ class LeaseViewTests(_CPTestCase):
 
     def test_a_live_lease_is_listed(self):
         self._insert("api.example.com", 300)
-        rows = cp.api_leases()
+        rows = cp.api_egress.api_leases()
         self.assertEqual([r["host"] for r in rows], ["api.example.com"])
         self.assertEqual(rows[0]["client_class"], CLASS)
         self.assertEqual(rows[0]["granted_by"], "someone")
@@ -2556,14 +2572,14 @@ class LeaseViewTests(_CPTestCase):
         # An expired lease is not policy, so listing it would put something in the
         # operator's "what is granted" view that grants nothing.
         self._insert("gone.example.com", -1)
-        self.assertEqual(cp.api_leases(), [])
+        self.assertEqual(cp.api_egress.api_leases(), [])
 
     def test_the_deadline_is_absolute_not_a_remaining_count(self):
         # A remaining-seconds field would change on every tick, which is what makes the
         # page's four-second poll a firehose and its countdown unable to run between
         # polls. The client does the arithmetic.
         self._insert("api.example.com", 300)
-        row = cp.api_leases()[0]
+        row = cp.api_egress.api_leases()[0]
         self.assertIn("expires_at", row)
         self.assertNotIn("remaining", row)
         self.assertGreater(row["expires_at"], time.time())
@@ -2571,7 +2587,7 @@ class LeaseViewTests(_CPTestCase):
     def test_the_soonest_to_expire_comes_first(self):
         self._insert("later.example.com", 900)
         self._insert("sooner.example.com", 60)
-        self.assertEqual([r["host"] for r in cp.api_leases()],
+        self.assertEqual([r["host"] for r in cp.api_egress.api_leases()],
                          ["sooner.example.com", "later.example.com"])
 
 
@@ -2593,7 +2609,7 @@ class LeaseRevokeTests(_CPTestCase):
     def test_revoking_stops_the_lease_deciding_requests(self):
         lease_id = self._insert("api.example.com", 900)
         self.assertEqual(cp.policy._decide("api.example.com", CLASS)[0], "allow")
-        resp = cp.revoke_lease(lease_id, _FakeRequest())
+        resp = cp.api_egress.revoke_lease(lease_id, _FakeRequest())
         self.assertTrue(resp.args[0]["ok"])
         self.assertTrue(resp.args[0]["was_live"])
         self.assertEqual(cp.policy._decide("api.example.com", CLASS)[0], "hold")
@@ -2602,7 +2618,7 @@ class LeaseRevokeTests(_CPTestCase):
         # This table is transient by construction, so a dead row would be the only
         # long-lived thing in it and every reader would have to filter for it.
         lease_id = self._insert("api.example.com", 900)
-        cp.revoke_lease(lease_id, _FakeRequest())
+        cp.api_egress.revoke_lease(lease_id, _FakeRequest())
         with cp.store._connect() as conn:
             self.assertEqual(
                 conn.execute("SELECT COUNT(*) FROM leases").fetchone()[0], 0)
@@ -2610,7 +2626,7 @@ class LeaseRevokeTests(_CPTestCase):
     def test_revocation_is_audited_with_provenance_and_what_it_reverts_to(self):
         lease_id = self._insert("api.example.com", 900)
         with mock.patch.object(cp.store, "_audit") as audit:
-            cp.revoke_lease(lease_id, _FakeRequest(peer="172.31.0.9"))
+            cp.api_egress.revoke_lease(lease_id, _FakeRequest(peer="172.31.0.9"))
         self.assertEqual(audit.call_args.args[0], "revoke")
         kwargs = audit.call_args.kwargs
         self.assertEqual(kwargs["host"], "api.example.com")
@@ -2627,22 +2643,23 @@ class LeaseRevokeTests(_CPTestCase):
         # and now the row is gone too — is both true and what was being asked for.
         lease_id = self._insert("gone.example.com", -5)
         with mock.patch.object(cp.store, "_audit") as audit:
-            resp = cp.revoke_lease(lease_id, _FakeRequest())
+            resp = cp.api_egress.revoke_lease(lease_id, _FakeRequest())
         self.assertTrue(resp.args[0]["ok"])
         self.assertFalse(resp.args[0]["was_live"])
         self.assertIn("already stopped deciding",
                       audit.call_args.kwargs["reason"])
 
     def test_an_unknown_id_is_a_404_not_a_silent_success(self):
-        resp = cp.revoke_lease(999999, _FakeRequest())
+        resp = cp.api_egress.revoke_lease(999999, _FakeRequest())
         self.assertEqual(resp.status_code, 404)
         self.assertFalse(resp.args[0]["ok"])
 
     def test_revoking_one_lease_leaves_the_others(self):
         keep = self._insert("keep.example.com", 900)
         drop = self._insert("drop.example.com", 900)
-        cp.revoke_lease(drop, _FakeRequest())
-        self.assertEqual([r["host"] for r in cp.api_leases()], ["keep.example.com"])
+        cp.api_egress.revoke_lease(drop, _FakeRequest())
+        self.assertEqual(
+            [r["host"] for r in cp.api_egress.api_leases()], ["keep.example.com"])
         self.assertTrue(keep)
 
 
@@ -2654,13 +2671,14 @@ class ConfigViewTests(_CPTestCase):
     know, so a page that guessed the list would offer rules that cannot be written."""
 
     def test_config_reports_the_hold_window(self):
-        self.assertEqual(cp.api_config()["hold_timeout"], cp.holds.HOLD_TIMEOUT)
+        self.assertEqual(
+            cp.api_views.api_config()["hold_timeout"], cp.holds.HOLD_TIMEOUT)
 
     def test_config_follows_the_operator_setting_rather_than_a_constant(self):
         saved = cp.holds.HOLD_TIMEOUT
         cp.holds.HOLD_TIMEOUT = 45.0
         try:
-            self.assertEqual(cp.api_config()["hold_timeout"], 45.0)
+            self.assertEqual(cp.api_views.api_config()["hold_timeout"], 45.0)
         finally:
             cp.holds.HOLD_TIMEOUT = saved
 
@@ -2668,32 +2686,34 @@ class ConfigViewTests(_CPTestCase):
         # Served so the lease BUTTON can label itself. A page that spelled the number
         # into its own markup would keep saying it on a store configured differently,
         # which is why the action is `allow_lease` and not `allow_30m`.
-        self.assertEqual(cp.api_config()["lease_seconds"], cp.policy.LEASE_SECONDS)
+        self.assertEqual(
+            cp.api_views.api_config()["lease_seconds"], cp.policy.LEASE_SECONDS)
 
     def test_config_follows_the_operator_lease_setting_too(self):
         saved = cp.policy.LEASE_SECONDS
         cp.policy.LEASE_SECONDS = 300.0
         try:
-            self.assertEqual(cp.api_config()["lease_seconds"], 300.0)
+            self.assertEqual(cp.api_views.api_config()["lease_seconds"], 300.0)
         finally:
             cp.policy.LEASE_SECONDS = saved
 
     def test_config_reports_the_classes_a_rule_can_be_scoped_to(self):
-        self.assertEqual(cp.api_config()["client_classes"],
+        self.assertEqual(cp.api_views.api_config()["client_classes"],
                          list(cp.policy._class_names()))
-        self.assertIn(CLASS, cp.api_config()["client_classes"])
+        self.assertIn(CLASS, cp.api_views.api_config()["client_classes"])
 
     def test_config_never_offers_the_unclassified_pseudo_class(self):
         # It is not a rule scope — `create_rule` and `resolve` both refuse it — so a
         # page that offered it would present a choice that can only ever 400.
-        self.assertNotIn(cp.policy.UNCLASSIFIED, cp.api_config()["client_classes"])
+        self.assertNotIn(
+            cp.policy.UNCLASSIFIED, cp.api_views.api_config()["client_classes"])
 
     def test_config_exposes_nothing_but_that(self):
         # A read-only view of NON-SECRET config on the one interface that can grant
         # egress: whatever gets added here has to stay harmless to publish. The class
         # names pass that test — they are network LABELS, and the CIDRs behind them
         # stay here.
-        self.assertEqual(set(cp.api_config()),
+        self.assertEqual(set(cp.api_views.api_config()),
                          {"hold_timeout", "lease_seconds", "client_classes"})
 
 
@@ -2710,7 +2730,7 @@ class SaturationTests(_CPTestCase):
         saved = getattr(cp.holds, cap)
         setattr(cp.holds, cap, 0)
         try:
-            return cp.authorize(_auth_req(host, client=client))
+            return cp.api_authorize.authorize(_auth_req(host, client=client))
         finally:
             setattr(cp.holds, cap, saved)
 
@@ -2743,7 +2763,7 @@ class SaturationTests(_CPTestCase):
         try:
             _hold("a.example", "held-1")
             cp.holds._PENDING_CLIENT["held-1"] = "172.30.0.9"
-            cp.authorize(_auth_req("b.example", client="172.30.0.9"))
+            cp.api_authorize.authorize(_auth_req("b.example", client="172.30.0.9"))
         finally:
             cp.holds.MAX_PENDING_PER_CLIENT = saved
         # Distinguishable from a global exhaustion: "one agent is hammering" and
@@ -2758,7 +2778,7 @@ class SaturationTests(_CPTestCase):
         cp.holds.MAX_WAITERS_PER_CLIENT = 1
         try:
             _hold("a.example", "held-1", client="172.30.0.9")
-            cp.authorize(_auth_req("a.example", client="172.30.0.9"))
+            cp.api_authorize.authorize(_auth_req("a.example", client="172.30.0.9"))
         finally:
             cp.holds.MAX_WAITERS_PER_CLIENT = saved
         self.assertEqual(cp.holds._saturation()["last_scope"],
@@ -2798,7 +2818,7 @@ class SaturationTests(_CPTestCase):
 
     def test_the_payload_carries_the_holds_and_the_pressure_together(self):
         _hold("a.example", "held-1")
-        payload = cp.approvals()
+        payload = cp.api_approvals.approvals()
         self.assertEqual(set(payload), {"holds", "saturation"})
         self.assertEqual([h["id"] for h in payload["holds"]], ["held-1"])
         self.assertEqual(payload["saturation"]["in_flight"], 1)
@@ -2843,7 +2863,7 @@ class SaturationTests(_CPTestCase):
         # that disagrees on refresh is worse than offering no button.
         self._over_cap()
         self._over_cap()
-        cp.api_saturation_ack(cp.AckRequest(count=2))
+        cp.api_views.api_saturation_ack(cp.api_views.AckRequest(count=2))
         sat = cp.holds._saturation()
         self.assertEqual(sat["rejections"], 2)
         self.assertEqual(sat["acknowledged"], 2)
@@ -2855,15 +2875,16 @@ class SaturationTests(_CPTestCase):
         self._over_cap()
         self._over_cap()
         self._over_cap()                       # arrives while the click is in flight
-        cp.api_saturation_ack(cp.AckRequest(count=2))
+        cp.api_views.api_saturation_ack(cp.api_views.AckRequest(count=2))
         sat = cp.holds._saturation()
         self.assertEqual(sat["rejections"] - sat["acknowledged"], 1)
 
     def test_acknowledgement_never_goes_backwards(self):
         for _ in range(3):
             self._over_cap()
-        cp.api_saturation_ack(cp.AckRequest(count=3))
-        cp.api_saturation_ack(cp.AckRequest(count=1))   # a stale tab, or a replay
+        cp.api_views.api_saturation_ack(cp.api_views.AckRequest(count=3))
+        # a stale tab, or a replay
+        cp.api_views.api_saturation_ack(cp.api_views.AckRequest(count=1))
         self.assertEqual(cp.holds._saturation()["acknowledged"], 3)
 
     def test_acknowledging_more_than_happened_is_clamped(self):
@@ -2871,7 +2892,7 @@ class SaturationTests(_CPTestCase):
         # a governance signal suppressed by an unvalidated input. Same reasoning as
         # validating `pattern` in resolve, and the same answer.
         self._over_cap()
-        cp.api_saturation_ack(cp.AckRequest(count=10_000))
+        cp.api_views.api_saturation_ack(cp.api_views.AckRequest(count=10_000))
         self.assertEqual(cp.holds._saturation()["acknowledged"], 1)
         self._over_cap()
         sat = cp.holds._saturation()
@@ -2879,7 +2900,7 @@ class SaturationTests(_CPTestCase):
 
     def test_negative_acknowledgements_are_floored(self):
         self._over_cap()
-        cp.api_saturation_ack(cp.AckRequest(count=-5))
+        cp.api_views.api_saturation_ack(cp.api_views.AckRequest(count=-5))
         self.assertEqual(cp.holds._saturation()["acknowledged"], 0)
 
     def test_the_window_moves_to_the_dismissal(self):
@@ -2888,16 +2909,17 @@ class SaturationTests(_CPTestCase):
         self._over_cap()
         before = cp.holds._saturation()["since"]
         self.assertEqual(before, cp.holds._STARTED_TS)
-        cp.api_saturation_ack(cp.AckRequest(count=1))
+        cp.api_views.api_saturation_ack(cp.api_views.AckRequest(count=1))
         after = cp.holds._saturation()["since"]
         self.assertNotEqual(after, cp.holds._STARTED_TS)
         self.assertGreaterEqual(after, before)
 
     def test_an_acknowledgement_that_changes_nothing_leaves_the_window_alone(self):
         self._over_cap()
-        cp.api_saturation_ack(cp.AckRequest(count=1))
+        cp.api_views.api_saturation_ack(cp.api_views.AckRequest(count=1))
         stamped = cp.holds._saturation()["since"]
-        cp.api_saturation_ack(cp.AckRequest(count=1))   # idempotent replay
+        # idempotent replay
+        cp.api_views.api_saturation_ack(cp.api_views.AckRequest(count=1))
         self.assertEqual(cp.holds._saturation()["since"], stamped)
 
 
@@ -2971,7 +2993,7 @@ class ApprovalStreamTests(_CPTestCase):
             return {"holds": [], "saturation": {}}
 
         async def first_tick():
-            response = await cp.approvals_stream(_FakeRequest())
+            response = await cp.api_approvals.approvals_stream(_FakeRequest())
             with mock.patch.object(cp.holds, "_pending_payload", record):
                 await response.body.__anext__()
             await response.body.aclose()
@@ -2986,7 +3008,8 @@ class ApprovalStreamTests(_CPTestCase):
         # The other half of reading the connection: the generator must stop rather
         # than tick forever for a browser that has gone.
         async def drain():
-            response = await cp.approvals_stream(_FakeRequest(disconnected=True))
+            response = await cp.api_approvals.approvals_stream(
+                _FakeRequest(disconnected=True))
             return [chunk async for chunk in response.body]
 
         self.assertEqual(asyncio.run(drain()), [])
@@ -3069,8 +3092,9 @@ class ResolveToolAskTests(_CPTestCase):
 
 
 def _register(server="mcp-github", request=None, **kw):
-    return cp.create_mcp_server(cp.ServerCreateRequest(server=server, **kw),
-                                request if request is not None else _FakeRequest())
+    return cp.api_mcp.create_mcp_server(
+        cp.api_mcp.ServerCreateRequest(server=server, **kw),
+        request if request is not None else _FakeRequest())
 
 
 def _enable(server="mcp-github", request=None, **kw):
@@ -3079,13 +3103,14 @@ def _enable(server="mcp-github", request=None, **kw):
     Separate from ``_register`` because a registration cannot arrive pre-enabled, and
     needed by every test whose subject is what a rule DECIDES: a rule on a disabled
     server decides nothing (``policy._decide_tool``), which is the switch working."""
-    return cp.edit_mcp_server(server, cp.ServerEditRequest(enabled=True, **kw),
-                              request if request is not None else _FakeRequest())
+    return cp.api_mcp.edit_mcp_server(
+        server, cp.api_mcp.ServerEditRequest(enabled=True, **kw),
+        request if request is not None else _FakeRequest())
 
 
 def _tool_rule(tool, action="allow", server="mcp-github", request=None):
-    return cp.create_mcp_rule(
-        cp.ToolRuleCreateRequest(server=server, tool=tool, action=action),
+    return cp.api_mcp.create_mcp_rule(
+        cp.api_mcp.ToolRuleCreateRequest(server=server, tool=tool, action=action),
         request if request is not None else _FakeRequest())
 
 
@@ -3117,8 +3142,9 @@ class McpServerRegistrationTests(_CPTestCase):
     def test_enabled_cannot_be_set_at_registration(self):
         # Asserts the MODEL stays without the field, the way the egress suite asserts
         # `source` cannot be caller-supplied.
-        cp.create_mcp_server(
-            cp.ServerCreateRequest(server="mcp-sneaky", enabled=True), _FakeRequest())
+        cp.api_mcp.create_mcp_server(
+            cp.api_mcp.ServerCreateRequest(server="mcp-sneaky", enabled=True),
+            _FakeRequest())
         self.assertEqual(self._row("mcp-sneaky")["enabled"], 0)
 
     def test_a_name_that_is_not_dialable_is_refused(self):
@@ -3176,35 +3202,39 @@ class McpServerEditTests(_CPTestCase):
         _register()
 
     def test_enabling_and_disabling_reports_both_states(self):
-        resp = cp.edit_mcp_server("mcp-github", cp.ServerEditRequest(enabled=True),
-                                  _FakeRequest())
+        resp = cp.api_mcp.edit_mcp_server("mcp-github",
+                                          cp.api_mcp.ServerEditRequest(enabled=True),
+                                          _FakeRequest())
         self.assertTrue(resp.body["changed"])
         self.assertTrue(resp.body["enabled"])
         self.assertFalse(resp.body["previous"]["enabled"])
 
     def test_asking_for_what_is_already_configured_writes_nothing(self):
-        resp = cp.edit_mcp_server("mcp-github", cp.ServerEditRequest(enabled=False),
-                                  _FakeRequest())
+        resp = cp.api_mcp.edit_mcp_server("mcp-github",
+                                          cp.api_mcp.ServerEditRequest(enabled=False),
+                                          _FakeRequest())
         self.assertFalse(resp.body["changed"])
 
     def test_the_descriptor_travels_with_the_switch(self):
         # One operation for both, because they are one configuration: a server enabled
         # with a descriptor that cannot build a request fails as though policy refused
         # it, and splitting them puts a window either side of the ordering.
-        resp = cp.edit_mcp_server(
+        resp = cp.api_mcp.edit_mcp_server(
             "mcp-github",
-            cp.ServerEditRequest(enabled=True, auth_type="header",
-                                 auth_header="Authorization",
-                                 auth_template="Bearer {secret}"), _FakeRequest())
+            cp.api_mcp.ServerEditRequest(enabled=True, auth_type="header",
+                                         auth_header="Authorization",
+                                         auth_template="Bearer {secret}"),
+            _FakeRequest())
         self.assertEqual(resp.body["auth"]["type"], "header")
         self.assertTrue(resp.body["enabled"])
 
     def test_a_bad_descriptor_is_refused_before_anything_is_enabled(self):
-        resp = cp.edit_mcp_server(
+        resp = cp.api_mcp.edit_mcp_server(
             "mcp-github",
-            cp.ServerEditRequest(enabled=True, auth_type="header",
-                                 auth_header="Authorization",
-                                 auth_template="Bearer nothing"), _FakeRequest())
+            cp.api_mcp.ServerEditRequest(enabled=True, auth_type="header",
+                                         auth_header="Authorization",
+                                         auth_template="Bearer nothing"),
+            _FakeRequest())
         self.assertEqual(resp.status_code, 400)
         with cp.store._connect() as conn:
             self.assertEqual(
@@ -3212,8 +3242,9 @@ class McpServerEditTests(_CPTestCase):
                              ("mcp-github",)).fetchone()[0], 0)
 
     def test_an_unknown_server_is_a_404(self):
-        resp = cp.edit_mcp_server("mcp-nope", cp.ServerEditRequest(enabled=True),
-                                  _FakeRequest())
+        resp = cp.api_mcp.edit_mcp_server("mcp-nope",
+                                          cp.api_mcp.ServerEditRequest(enabled=True),
+                                          _FakeRequest())
         self.assertEqual(resp.status_code, 404)
 
 
@@ -3223,8 +3254,8 @@ class McpServerRevokeTests(_CPTestCase):
         _register()
 
     def test_a_registration_with_no_rules_is_removed(self):
-        self.assertEqual(cp.revoke_mcp_server("mcp-github",
-                                              _FakeRequest()).status_code, 200)
+        self.assertEqual(cp.api_mcp.revoke_mcp_server("mcp-github",
+                                                      _FakeRequest()).status_code, 200)
         with cp.store._connect() as conn:
             self.assertEqual(
                 conn.execute("SELECT COUNT(*) FROM mcp_servers").fetchone()[0], 0)
@@ -3235,7 +3266,7 @@ class McpServerRevokeTests(_CPTestCase):
         # safe DIRECTION — an unconfigured tool is denied — but safe is not visible,
         # and visibility is this surface's entire job.
         _tool_rule("get_me")
-        resp = cp.revoke_mcp_server("mcp-github", _FakeRequest())
+        resp = cp.api_mcp.revoke_mcp_server("mcp-github", _FakeRequest())
         self.assertEqual(resp.status_code, 409)
         self.assertEqual(resp.body["tool_rules"], 1)
         with cp.store._connect() as conn:
@@ -3243,8 +3274,8 @@ class McpServerRevokeTests(_CPTestCase):
                 conn.execute("SELECT COUNT(*) FROM tool_rules").fetchone()[0], 1)
 
     def test_an_unknown_server_is_a_404(self):
-        self.assertEqual(cp.revoke_mcp_server("mcp-nope",
-                                              _FakeRequest()).status_code, 404)
+        self.assertEqual(cp.api_mcp.revoke_mcp_server("mcp-nope",
+                                                      _FakeRequest()).status_code, 404)
 
 
 class McpToolRuleTests(_CPTestCase):
@@ -3274,10 +3305,11 @@ class McpToolRuleTests(_CPTestCase):
         # while it is off. That is the difference between disabling a server and
         # revoking its rules, and both verbs exist because both are wanted.
         _tool_rule("get_me", "allow")
-        cp.edit_mcp_server("mcp-github", cp.ServerEditRequest(enabled=False),
-                           _FakeRequest())
+        cp.api_mcp.edit_mcp_server("mcp-github",
+                                   cp.api_mcp.ServerEditRequest(enabled=False),
+                                   _FakeRequest())
         self.assertEqual(cp.policy._decide_tool("mcp-github", "get_me")[0], "deny")
-        self.assertEqual([r["tool"] for r in cp.api_mcp_rules()], ["get_me"])
+        self.assertEqual([r["tool"] for r in cp.api_mcp.api_mcp_rules()], ["get_me"])
 
     def test_a_rule_for_an_unregistered_server_is_refused(self):
         # The tool-surface twin of the unknown-client-class refusal: the row would
@@ -3334,9 +3366,10 @@ class McpToolRuleTests(_CPTestCase):
         self.assertFalse(again.body["created"])
 
     def test_the_source_is_server_set(self):
-        cp.create_mcp_rule(
-            cp.ToolRuleCreateRequest(server="mcp-github", tool="get_me",
-                                     action="allow", source="seed"), _FakeRequest())
+        cp.api_mcp.create_mcp_rule(
+            cp.api_mcp.ToolRuleCreateRequest(server="mcp-github", tool="get_me",
+                                             action="allow", source="seed"),
+            _FakeRequest())
         with cp.store._connect() as conn:
             self.assertEqual(
                 conn.execute("SELECT source FROM tool_rules").fetchone()[0],
@@ -3348,33 +3381,36 @@ class McpToolRuleTests(_CPTestCase):
         # unconfigured and no second row in the record.
         rule_id = _tool_rule("issue_write", "deny").body["id"]
         for action in ("ask", "allow"):
-            resp = cp.edit_mcp_rule(rule_id, cp.ToolRuleEditRequest(action=action),
-                                    _FakeRequest())
+            resp = cp.api_mcp.edit_mcp_rule(
+                rule_id, cp.api_mcp.ToolRuleEditRequest(action=action), _FakeRequest())
             self.assertTrue(resp.body["changed"])
             self.assertEqual(
                 cp.policy._decide_tool("mcp-github", "issue_write")[0], action)
 
     def test_an_edit_to_the_same_action_writes_nothing(self):
         rule_id = _tool_rule("get_me", "allow").body["id"]
-        resp = cp.edit_mcp_rule(rule_id, cp.ToolRuleEditRequest(action="allow"),
-                                _FakeRequest())
+        resp = cp.api_mcp.edit_mcp_rule(
+            rule_id, cp.api_mcp.ToolRuleEditRequest(action="allow"), _FakeRequest())
         self.assertFalse(resp.body["changed"])
 
     def test_an_edit_validates_the_action_and_the_rule_id(self):
         rule_id = _tool_rule("get_me", "allow").body["id"]
         self.assertEqual(
-            cp.edit_mcp_rule(rule_id, cp.ToolRuleEditRequest(action="block"),
-                             _FakeRequest()).status_code, 400)
+            cp.api_mcp.edit_mcp_rule(rule_id,
+                                     cp.api_mcp.ToolRuleEditRequest(action="block"),
+                                     _FakeRequest()).status_code, 400)
         self.assertEqual(
-            cp.edit_mcp_rule(9999, cp.ToolRuleEditRequest(action="allow"),
-                             _FakeRequest()).status_code, 404)
+            cp.api_mcp.edit_mcp_rule(9999,
+                                     cp.api_mcp.ToolRuleEditRequest(action="allow"),
+                                     _FakeRequest()).status_code, 404)
 
     def test_revoking_returns_the_tool_to_denied_not_to_held(self):
         # The one place this differs from revoking an egress rule, where the host
         # reverts to being HELD for approval. Here it reverts to the default deny, so
         # a revoke can only ever narrow.
         rule_id = _tool_rule("get_me", "allow").body["id"]
-        self.assertEqual(cp.revoke_mcp_rule(rule_id, _FakeRequest()).status_code, 200)
+        self.assertEqual(
+            cp.api_mcp.revoke_mcp_rule(rule_id, _FakeRequest()).status_code, 200)
         self.assertEqual(cp.policy._decide_tool("mcp-github", "get_me")[0], "deny")
 
     def test_the_view_groups_by_server_then_widest_first(self):
@@ -3383,7 +3419,7 @@ class McpToolRuleTests(_CPTestCase):
         _tool_rule("a_ask", "ask", server="mcp-other")
         _tool_rule("z_allow", "allow")
         _tool_rule("a_deny", "deny")
-        served = [(r["server"], r["action"]) for r in cp.api_mcp_rules()]
+        served = [(r["server"], r["action"]) for r in cp.api_mcp.api_mcp_rules()]
         self.assertEqual(served, [("mcp-github", "allow"), ("mcp-github", "deny"),
                                   ("mcp-other", "ask"), ("mcp-other", "deny")])
 
@@ -3392,7 +3428,7 @@ class McpToolRuleTests(_CPTestCase):
         # surface rather than a broken one, and only the count says which.
         _tool_rule("get_me", "allow")
         _tool_rule("get_teams", "ask")
-        served = {s["server"]: s["tool_rules"] for s in cp.api_mcp_servers()}
+        served = {s["server"]: s["tool_rules"] for s in cp.api_mcp.api_mcp_servers()}
         self.assertEqual(served, {"mcp-github": 2})
 
 
@@ -3400,12 +3436,13 @@ def _tool_call(server="mcp-github", tool="get_me", args=None, client=CLASS_IP):
     """One tool call put to the bridge. ``client`` defaults to a real sandbox-net
     address for the reason ``_auth_req`` does: it is what the per-client cap counts
     and what an identical retry joins on."""
-    return cp.tool_authorize(cp.ToolCallRequest(server=server, tool=tool, args=args,
-                                                client=client))
+    return cp.api_tool.tool_authorize(
+        cp.api_tool.ToolCallRequest(server=server, tool=tool, args=args, client=client))
 
 
 def _claim(approval_id, client=CLASS_IP):
-    return cp.tool_claim(approval_id, cp.ToolResumeRequest(client=client))
+    return cp.api_tool.tool_claim(approval_id,
+                                  cp.api_tool.ToolResumeRequest(client=client))
 
 
 class _ToolBridgeTestCase(_CPTestCase):
@@ -3451,8 +3488,9 @@ class ToolAuthorizeDecisionTests(_ToolBridgeTestCase):
     def test_an_unregistered_or_disabled_server_is_denied_by_the_authority(self):
         _tool_rule("get_me", "allow")
         self.assertEqual(_tool_call(server="mcp-nobody")["decision"], "deny")
-        cp.edit_mcp_server("mcp-github", cp.ServerEditRequest(enabled=False),
-                           _FakeRequest())
+        cp.api_mcp.edit_mcp_server("mcp-github",
+                                   cp.api_mcp.ServerEditRequest(enabled=False),
+                                   _FakeRequest())
         self.assertEqual(_tool_call()["decision"], "deny")
 
     def test_every_outcome_is_an_answer_rather_than_an_error(self):
@@ -3593,7 +3631,7 @@ class ToolRosterTests(_ToolBridgeTestCase):
     def test_an_enabled_server_arrives_with_its_rules(self):
         _tool_rule("get_me", "allow")
         _tool_rule("create_pull_request", "ask")
-        roster = cp.tool_roster()
+        roster = cp.api_tool.tool_roster()
         self.assertEqual([s["server"] for s in roster], ["mcp-github"])
         self.assertEqual(roster[0]["tools"],
                          [{"tool": "create_pull_request", "action": "ask"},
@@ -3604,49 +3642,51 @@ class ToolRosterTests(_ToolBridgeTestCase):
         # and has nothing different to do with the fact that a server exists but is
         # off. The operator's view of that is /api/mcp/servers.
         _tool_rule("get_me", "allow")
-        cp.edit_mcp_server("mcp-github", cp.ServerEditRequest(enabled=False),
-                           _FakeRequest())
-        self.assertEqual(cp.tool_roster(), [])
-        self.assertEqual([s["server"] for s in cp.api_mcp_servers()], ["mcp-github"])
+        cp.api_mcp.edit_mcp_server("mcp-github",
+                                   cp.api_mcp.ServerEditRequest(enabled=False),
+                                   _FakeRequest())
+        self.assertEqual(cp.api_tool.tool_roster(), [])
+        self.assertEqual(
+            [s["server"] for s in cp.api_mcp.api_mcp_servers()], ["mcp-github"])
 
     def test_an_enabled_server_with_no_rules_is_still_named(self):
         # A fully denied surface rather than a broken one — and the gateway still has
         # to dial it, because enumerating its tools is what turns "never looked at"
         # into a decision an operator can make.
-        self.assertEqual(cp.tool_roster()[0]["tools"], [])
+        self.assertEqual(cp.api_tool.tool_roster()[0]["tools"], [])
 
     def test_deny_rules_ship_too(self):
         # Presentation is the gateway's filter; enforcement is the decision
         # endpoint's. Serving the deny rows is what lets the gateway tell "reviewed
         # and refused" from "never configured" without asking again.
         _tool_rule("delete_file", "deny")
-        self.assertEqual(cp.tool_roster()[0]["tools"],
+        self.assertEqual(cp.api_tool.tool_roster()[0]["tools"],
                          [{"tool": "delete_file", "action": "deny"}])
 
     def test_the_descriptor_travels_and_the_secret_does_not(self):
         # Enough to build a request, useless to steal. The material lives in a file
         # at a path DERIVED from the server name, so nothing here — and nothing in
         # the store behind it — can point one server at another's credential.
-        cp.edit_mcp_server(
+        cp.api_mcp.edit_mcp_server(
             "mcp-github",
-            cp.ServerEditRequest(enabled=True, auth_type="header",
-                                 auth_header="Authorization",
-                                 auth_template="Bearer {secret}"),
+            cp.api_mcp.ServerEditRequest(enabled=True, auth_type="header",
+                                         auth_header="Authorization",
+                                         auth_template="Bearer {secret}"),
             _FakeRequest())
-        auth = cp.tool_roster()[0]["auth"]
+        auth = cp.api_tool.tool_roster()[0]["auth"]
         self.assertEqual(auth, {"type": "header", "header": "Authorization",
                                 "template": "Bearer {secret}"})
-        self.assertNotIn("secret", json.dumps(cp.tool_roster()).replace(
+        self.assertNotIn("secret", json.dumps(cp.api_tool.tool_roster()).replace(
             "{secret}", ""))
 
     def test_no_server_is_an_empty_list_not_an_error(self):
-        cp.revoke_mcp_server("mcp-github", _FakeRequest())
-        self.assertEqual(cp.tool_roster(), [])
+        cp.api_mcp.revoke_mcp_server("mcp-github", _FakeRequest())
+        self.assertEqual(cp.api_tool.tool_roster(), [])
 
     def test_the_roster_carries_no_constant_enabled_field(self):
         # Every server here is enabled by definition, and a field that never varies
         # invites a reader to believe it does.
-        self.assertNotIn("enabled", cp.tool_roster()[0])
+        self.assertNotIn("enabled", cp.api_tool.tool_roster()[0])
 
 
 class ToolClaimTests(_ToolBridgeTestCase):
@@ -3779,8 +3819,9 @@ class ToolClaimTests(_ToolBridgeTestCase):
         # stop button leaves every outstanding grant redeemable.
         ask = self._ask()
         _resolve(ask, "allow")
-        cp.edit_mcp_server("mcp-github", cp.ServerEditRequest(enabled=False),
-                           _FakeRequest())
+        cp.api_mcp.edit_mcp_server("mcp-github",
+                                   cp.api_mcp.ServerEditRequest(enabled=False),
+                                   _FakeRequest())
         resp = _claim(ask)
         self.assertEqual(resp.status_code, 409)
         self.assertTrue(resp.body["terminal"])
@@ -3793,10 +3834,10 @@ class ToolClaimTests(_ToolBridgeTestCase):
         # Two shapes of the same operator move. Nothing REPLACES a rule, so flipping
         # one to `deny` is a revoke followed by a write — both halves land here.
         def _flip_to_deny(rule_id):
-            cp.revoke_mcp_rule(rule_id, _FakeRequest())
+            cp.api_mcp.revoke_mcp_rule(rule_id, _FakeRequest())
             _tool_rule("create_pull_request", "deny")
 
-        for undo in (lambda rid: cp.revoke_mcp_rule(rid, _FakeRequest()),
+        for undo in (lambda rid: cp.api_mcp.revoke_mcp_rule(rid, _FakeRequest()),
                      _flip_to_deny):
             with self.subTest(undo=undo):
                 rule_id = _tool_rule("create_pull_request", "ask").body["id"]
@@ -3811,8 +3852,9 @@ class ToolClaimTests(_ToolBridgeTestCase):
         # server can be switched back on, and the human's answer is still there.
         ask = self._ask()
         _resolve(ask, "allow")
-        cp.edit_mcp_server("mcp-github", cp.ServerEditRequest(enabled=False),
-                           _FakeRequest())
+        cp.api_mcp.edit_mcp_server("mcp-github",
+                                   cp.api_mcp.ServerEditRequest(enabled=False),
+                                   _FakeRequest())
         self.assertEqual(_claim(ask).status_code, 409)
         self.assertIsNone(cp.holds._get_tool_ask(ask)["claimed_at"])
         _enable()
@@ -3824,8 +3866,9 @@ class ToolClaimTests(_ToolBridgeTestCase):
         # only evidence the operator's switch did anything.
         ask = self._ask()
         _resolve(ask, "allow")
-        cp.edit_mcp_server("mcp-github", cp.ServerEditRequest(enabled=False),
-                           _FakeRequest())
+        cp.api_mcp.edit_mcp_server("mcp-github",
+                                   cp.api_mcp.ServerEditRequest(enabled=False),
+                                   _FakeRequest())
         with mock.patch.object(cp.store, "_audit") as audited:
             _claim(ask)
         self.assertEqual(audited.call_args[0][0], "deny")
@@ -3965,10 +4008,10 @@ class ToolCorrelationColumnTests(_ToolBridgeTestCase):
         # filter for one server must not drop exactly the supply-chain rows. The name
         # travels beside the line from `inventory.changes` rather than being read back
         # out of it, which is the whole point of the column.
-        cp.tool_inventory(cp.InventoryRequest(servers={
+        cp.api_tool.tool_inventory(cp.api_tool.InventoryRequest(servers={
             "mcp-github": {"status": "ok", "tools": [{"name": "get_me"}]}}),
             _FakeRequest())
-        cp.tool_inventory(cp.InventoryRequest(servers={
+        cp.api_tool.tool_inventory(cp.api_tool.InventoryRequest(servers={
             "mcp-github": {"status": "ok", "tools": [{"name": "get_me"},
                                                      {"name": "delete_repository"}]}}),
             _FakeRequest())
@@ -3984,7 +4027,7 @@ class ToolCorrelationColumnTests(_ToolBridgeTestCase):
         # did this tool start being allowed" and "what did it do" are two searches over
         # two wordings, and only one of them is in the same vocabulary as the decision.
         rule_id = _tool_rule("get_me", "allow").body["id"]
-        cp.revoke_mcp_rule(rule_id, _FakeRequest())
+        cp.api_mcp.revoke_mcp_rule(rule_id, _FakeRequest())
         with cp.store._connect() as conn:
             rows = [dict(r) for r in conn.execute(
                 "SELECT kind, server, tool FROM audit WHERE stage='tool-policy' "
@@ -3999,7 +4042,7 @@ class ToolCorrelationColumnTests(_ToolBridgeTestCase):
         # whose identity is host/port/url must not acquire a tool identity it never had
         # — that would make `WHERE server IS NOT NULL` stop meaning "tool rows".
         _set_rules([("example.com", "allow")])
-        cp.authorize(_auth_req("example.com"))
+        cp.api_authorize.authorize(_auth_req("example.com"))
         with cp.store._connect() as conn:
             row = conn.execute("SELECT server, tool, approval_id FROM audit "
                                "WHERE host='example.com'").fetchone()
@@ -4809,7 +4852,7 @@ class SchemaVersionTests(_FreshStoreTestCase):
             row = conn.execute("SELECT status, mode, resolved_by, pattern FROM "
                                "approvals WHERE id='old-persist'").fetchone()
         self.assertIsNone(row["pattern"])
-        self.assertEqual(cp._decision_scope(row), "standing rule written")
+        self.assertEqual(cp.api_authorize._decision_scope(row), "standing rule written")
 
     def test_a_store_already_renamed_is_left_alone(self):
         # `ALTER TABLE ... RENAME COLUMN` raises rather than no-ops if it runs twice.
@@ -5121,7 +5164,7 @@ class ActorHeaderAgreementTests(unittest.TestCase):
         ui_src = (ROOT / "control-plane-ui" / "app.py").read_text()
         m = re.search(r'^ACTOR_HEADER\s*=\s*"([^"]+)"', ui_src, re.MULTILINE)
         self.assertIsNotNone(m, "ACTOR_HEADER not found in control-plane-ui/app.py")
-        self.assertEqual(m.group(1), cp.ACTOR_HEADER)
+        self.assertEqual(m.group(1), cp.provenance.ACTOR_HEADER)
 
 
 if __name__ == "__main__":

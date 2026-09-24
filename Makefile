@@ -117,7 +117,10 @@ JSONFILES := $(shell git ls-files '*.json' 2>/dev/null)
 PYFILES := proxies/egress/addon.py control-plane-ui/app.py \
            control-plane/app.py control-plane/store.py control-plane/policy.py \
            control-plane/holds.py control-plane/ingest.py control-plane/audit.py \
-           control-plane/inventory.py \
+           control-plane/inventory.py control-plane/provenance.py \
+           control-plane/api_authorize.py control-plane/api_tool.py \
+           control-plane/api_approvals.py control-plane/api_egress.py \
+           control-plane/api_mcp.py control-plane/api_views.py \
            tool-gateway/app.py tool-gateway/outcomes.py tool-gateway/discovery.py \
            tool-gateway/protocol.py tool-gateway/surface.py tool-gateway/execute.py
 # Dependency-free unit tests for the governance-critical decision logic. Kept
@@ -145,6 +148,13 @@ REFFILES := $(SCRIPTS) \
             control-plane/holds.py \
             control-plane/ingest.py \
             control-plane/inventory.py \
+            control-plane/provenance.py \
+            control-plane/api_authorize.py \
+            control-plane/api_tool.py \
+            control-plane/api_approvals.py \
+            control-plane/api_egress.py \
+            control-plane/api_mcp.py \
+            control-plane/api_views.py \
             control-plane/requirements.txt \
             tool-gateway/app.py \
             tool-gateway/outcomes.py \

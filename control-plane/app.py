@@ -1051,6 +1051,27 @@ def tool_claim(approval_id: str, req: ToolResumeRequest) -> JSONResponse:
     trusted not to act on."""
     ask = holds._get_tool_ask(approval_id)
     if ask is None or (ask["client"] or None) != (req.client or None):
+        # One answer to the caller, two rows for the operator. Which of the two it
+        # was is exactly what the 404 hides from the sandbox, and exactly what the
+        # operator needs: an id claimed by the wrong client is the one sign that an
+        # approval id leaked between sandboxes, and an unknown one is a probe or a
+        # mangled copy. The foreign row carries the ask's server and tool so it lands
+        # in that approval's own history. A PENDING claim writes nothing — it is
+        # refused further down, and it is the answer an agent polls for.
+        if ask is None:
+            store._audit("deny", stage="tool-resume", client=req.client,
+                         client_class=policy._client_class(req.client),
+                         approval_id=approval_id,
+                         reason=f"claim for unknown approval {approval_id} refused")
+        else:
+            store._audit("deny", stage="tool-resume", client=req.client,
+                         client_class=policy._client_class(req.client),
+                         server=ask["server"], tool=ask["tool"],
+                         approval_id=approval_id,
+                         reason=f"claim for approval {approval_id} refused: it was "
+                                f"raised by {ask['client'] or 'no client'}, not by "
+                                f"this caller — a leaked or guessed id; answered "
+                                f"as unknown")
         # ``terminal`` is set here too, so the gateway branches on one field for
         # every refusal below: an id that is unknown to this caller does not become
         # known by asking again, whatever the reason it is unknown.

@@ -3741,6 +3741,15 @@ class ToolClaimTests(_ToolBridgeTestCase):
         self.assertEqual(audited.call_args[1]["stage"], "tool-resume")
         self.assertIn(ask, audited.call_args[1]["reason"])
 
+    def test_auditing_the_split_does_not_leak_it_to_the_caller(self):
+        # Two rows, one answer: the branches were split to write different records,
+        # and the response must not follow them apart.
+        ask = self._ask()
+        foreign = _claim(ask, client="172.30.0.9")
+        unknown = _claim("f" * 32, client="172.30.0.9")
+        self.assertEqual((foreign.status_code, foreign.body),
+                         (unknown.status_code, unknown.body))
+
     def test_a_refused_claim_is_not_audited_as_a_release(self):
         # The ask is raised OUTSIDE the patch: registering it audits a hold of its
         # own, and counting that here would report the release this asserts is absent.
@@ -3828,6 +3837,52 @@ class ToolClaimTests(_ToolBridgeTestCase):
             _claim(ask)
         self.assertEqual(audited.call_args[1]["client_class"],
                          cp.policy._client_class(CLASS_IP))
+
+
+class RefusedClaimAuditTests(_ToolBridgeTestCase):
+    """A claim refused as UNKNOWN still leaves a row. The caller gets one 404 for an
+    id that does not exist and for one that belongs to another client, so the
+    difference is only ever visible here — and the second is how a leaked approval id
+    shows up at all. Asserted through the table for the reason ``audits`` exists."""
+
+    audits = True
+
+    def _ask(self):
+        _tool_rule("create_pull_request", "ask")
+        return _tool_call(tool="create_pull_request", args={"title": "x"})["approval_id"]
+
+    def _resume_rows(self, approval_id):
+        with cp.store._connect() as conn:
+            return conn.execute(
+                "SELECT kind, stage, client, server, tool, reason FROM audit "
+                "WHERE stage='tool-resume' AND approval_id=?",
+                (approval_id,)).fetchall()
+
+    def test_a_claim_from_another_client_is_audited_against_the_ask(self):
+        # The leaked-id signal. The caller is told "unknown"; the operator is told
+        # whose id it was, in a row that joins the ask's own history by id.
+        ask = self._ask()
+        _resolve(ask, "allow")
+        _claim(ask, client="172.30.0.9")
+        [(kind, stage, client, server, tool, reason)] = self._resume_rows(ask)
+        self.assertEqual((kind, stage, client), ("deny", "tool-resume", "172.30.0.9"))
+        self.assertEqual((server, tool), ("mcp-github", "create_pull_request"))
+        self.assertIn(CLASS_IP, reason)                     # whose id it was
+
+    def test_an_unknown_id_is_audited_with_the_id_it_named(self):
+        _claim("f" * 32, client="172.30.0.9")
+        [(kind, stage, client, server, tool, reason)] = self._resume_rows("f" * 32)
+        self.assertEqual((kind, stage, client), ("deny", "tool-resume", "172.30.0.9"))
+        self.assertEqual((server, tool), (None, None))
+        self.assertIn("unknown", reason)
+
+    def test_polling_a_pending_ask_writes_nothing(self):
+        # What keeps the new rows from becoming a flood: an agent waiting on a human
+        # re-claims its own pending id, and that answer is a delay, not a refusal.
+        ask = self._ask()
+        for _ in range(3):
+            _claim(ask)
+        self.assertEqual(self._resume_rows(ask), [])
 
 
 class ToolCorrelationColumnTests(_ToolBridgeTestCase):

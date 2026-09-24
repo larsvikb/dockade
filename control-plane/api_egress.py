@@ -104,11 +104,15 @@ def create_rule(req: RuleCreateRequest, request: Request) -> JSONResponse:
             "SELECT id, action, source FROM rules WHERE pattern=? AND client_class=?",
             (pattern, client_class)).fetchone()
         if existing is not None and existing["action"] != action:
+            # The UI shows `detail` verbatim, so it names a fix that works: a seed rule
+            # can be neither edited nor revoked here.
+            fix = ("Change it in policies/egress-allowlist.txt"
+                   if existing["source"] == "seed" else "Edit it, or revoke it first")
             return JSONResponse(
                 {"ok": False,
                  "detail": f"a standing rule for {pattern!r} already exists for client "
                            f"class {client_class!r} and {existing['action']}s it; "
-                           f"nothing here replaces a rule. Revoke it first, or write a "
+                           f"nothing here replaces a rule. {fix}, or write a "
                            f"different pattern.",
                  "conflict": {"id": existing["id"], "pattern": pattern,
                               "action": existing["action"], "source": existing["source"],

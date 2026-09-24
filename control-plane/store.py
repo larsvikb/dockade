@@ -165,7 +165,7 @@ _LEASES_DDL = """
         approval_id  TEXT NOT NULL,
         created_at   REAL NOT NULL,
         expires_at   REAL NOT NULL,
-        granted_by   TEXT NOT NULL   -- provenance of the resolver (app._actor)
+        granted_by   TEXT NOT NULL   -- provenance of the resolver (provenance._actor)
         -- NO UNIQUE constraint, and that is a consequence rather than an omission. A
         -- second lease for a host already covered by a live one is UNREACHABLE: the
         -- live lease would have decided the request in `policy._decide`, so no card

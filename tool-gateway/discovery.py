@@ -39,9 +39,11 @@ hand"; `make mcp-tools` is the same request by hand):
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
+import socket
 import urllib.error
 import urllib.request
 
@@ -66,10 +68,8 @@ _SERVER_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 CONTROL_URL = os.environ.get("GATEWAY_CONTROL_URL", "http://172.27.0.2:8092")
 
 #: Servers are dialled BY NAME, and that is the identity per-tool policy is keyed on
-#: (DESIGN.md, "Per-server identity has two different answers"). A server is
-#: single-homed on mcp-net, so its name resolves to the one leg it has — the
-#: ambiguity that forces an address above does not exist here. The gateway needs no
-#: address for a server and is deliberately never given one.
+#: (DESIGN.md, "Per-server identity has two different answers"). The gateway is never
+#: given a server's address; where the name may LEAD is ``MCP_NET``'s business.
 #:
 #: Port and path are one convention rather than per-server config, matching the
 #: Makefile's MCP_PORT/MCP_PATH: 8082 and /mcp are what the first server listens on,
@@ -77,6 +77,27 @@ CONTROL_URL = os.environ.get("GATEWAY_CONTROL_URL", "http://172.27.0.2:8092")
 #: lookup until that server exists.
 MCP_PORT = int(os.environ.get("GATEWAY_MCP_PORT", "8082"))
 MCP_PATH = os.environ.get("GATEWAY_MCP_PATH", "/mcp")
+
+
+def _network(raw: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network:
+    try:
+        return ipaddress.ip_network(raw, strict=False)
+    except ValueError as exc:
+        raise SystemExit(
+            f"tool-gateway: GATEWAY_MCP_NET {raw!r} is not a CIDR ({exc}), so no "
+            f"server's address can be checked before its credential is sent. Refusing "
+            f"to start (fail closed).") from exc
+
+
+#: The one network a server's credential may be sent to. A server is single-homed on
+#: mcp-net, but its NAME is not: Docker's embedded DNS answers from every network the
+#: querier shares, and the gateway also sits on sandbox-net, where the agent lives. A
+#: container there carrying a server's name or alias would be handed that server's
+#: bearer token. Nothing creates one today — the launchers set only `--name` — and
+#: that is a fact about the launchers, so the address is checked here instead:
+#: placement, not DNS, decides where a credential goes. Held equal to compose's
+#: `mcp-net` subnet by tests/test_topology.py.
+MCP_NET = _network(os.environ.get("GATEWAY_MCP_NET", "172.28.0.0/24"))
 
 #: Where a server's credential lives, DERIVED from the server name and never read
 #: from the store. A free-text path in a store row would let a forged config write
@@ -292,14 +313,21 @@ def post(server: str, message: dict, auth: dict, timeout: float | None = None) -
 
     The URL is assembled here and nowhere else. ``check_name`` runs on every call, so a
     server name that is not a DNS label cannot become a host, a path or a filename —
-    checked at this choke point rather than trusted from the roster that supplied it."""
+    checked at this choke point rather than trusted from the roster that supplied it.
+    The address it dials is decided here too, before the credential is read
+    (``_placed``)."""
+    address = _placed(server)
     headers = {"Content-Type": "application/json",
-               "Accept": "application/json, text/event-stream"}
+               "Accept": "application/json, text/event-stream",
+               # What urllib would have sent for the name, so the server sees the
+               # request it always saw.
+               "Host": f"{server}:{MCP_PORT}"}
     headers.update(auth_header(auth, read_secret(server), secret_path(server)))
     # The scheme is a literal here, so there is no S310 to suppress: the only variable
-    # part is a server NAME off the roster, which is what this is supposed to dial.
+    # part is an address `_placed` has already put on mcp-net.
+    host = f"[{address}]" if ":" in address else address
     request = urllib.request.Request(
-        f"http://{check_name(server)}:{MCP_PORT}{MCP_PATH}",
+        f"http://{host}:{MCP_PORT}{MCP_PATH}",
         data=json.dumps(message).encode(), headers=headers)
     # Resolved once, because the timeout REFUSAL names it: a record saying "no answer
     # within None" would be worse than one that said nothing.
@@ -321,6 +349,29 @@ def post(server: str, message: dict, auth: dict, timeout: float | None = None) -
             raise DiscoveryError(f"no answer from {server} within {deadline}s",
                                  kind="timeout") from exc
         raise DiscoveryError(f"unreachable: {exc}") from exc
+
+
+def _placed(server: str) -> str:
+    """The address to dial for ``server``: resolved ONCE, and only if it is on mcp-net.
+
+    Once, and then dialled as an address, because checking one lookup and letting
+    urllib do a second to connect would check one answer and use another — and a name
+    on two networks can answer differently each time. The first answer on mcp-net
+    wins; one elsewhere is skipped rather than fatal, since sharing a name with a
+    container on another network is not this server's fault. None at all refuses the
+    call before a credential is read."""
+    name = check_name(server)
+    try:
+        infos = socket.getaddrinfo(name, MCP_PORT, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise DiscoveryError(f"unreachable: {server} does not resolve ({exc})") from exc
+    addresses = list(dict.fromkeys(info[4][0] for info in infos))
+    for address in addresses:
+        if ipaddress.ip_address(address) in MCP_NET:
+            return address
+    raise DiscoveryError(
+        f"refusing to dial {server}: it resolves to {', '.join(addresses)}, none of "
+        f"it on mcp-net ({MCP_NET}), and its credential goes nowhere else")
 
 
 def list_tools(server: str, auth: dict) -> list[dict]:

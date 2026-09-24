@@ -2338,7 +2338,11 @@ that do not meet.** Conflating them is the easy mistake here.
 - **Tool calls** run sandbox → gateway → server. The gateway *dialled* the server,
   by name, so the identity is the name it used. It needs no address, no resolution
   and no registry lookup to say which server a call is for. This is the identity
-  per-tool policy is keyed on.
+  per-tool policy is keyed on. Where that name may *lead* is a separate question,
+  answered by placement: Docker DNS answers from every network the gateway shares,
+  sandbox-net included, so a server's credential is sent only to an address on
+  `mcp-net` (`_placed` in `tool-gateway/discovery.py`, held to compose's subnet by
+  `tests/test_topology.py`).
 - **A server's own egress** runs server → egress proxy → internet, and the gateway
   is not in it: `HTTPS_PROXY` on each server container points at the egress proxy
   directly. The proxy has a TCP connection and nothing else, so the peer **address**

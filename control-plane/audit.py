@@ -65,7 +65,7 @@ KINDS = ("allow", "deny", "hold", "revoke", "create", "edit", "observe",
 GROUPED_SEARCH = ("host", "client", "client_class", "reason",
                   "server", "tool", "status")
 EVENT_SEARCH = ("host", "client", "client_class", "reason", "method", "url",
-                "server", "tool", "status")
+                "server", "tool", "status", "approval_id")
 
 # Columns the record view serves. Deliberately the whole row: this is the view the
 # glance defers to, so the fields it drops as noise or as unbounded (``url`` above

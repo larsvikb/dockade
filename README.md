@@ -373,7 +373,8 @@ exposed through governed data-plane services. Next steps toward it:
   [`opencode-sandbox/NOTES.md`](opencode-sandbox/NOTES.md) — the same pair for tier 2
   and the local LLM service, the one consumer of each.
 - [`control-plane/DESIGN.md`](control-plane/DESIGN.md) — the control plane's half of the
-  approval flow: how a card grants, holds under load, the audit views, standing policy.
+  approval flow: how a card grants, holds under load, the audit views, standing policy,
+  and why the tool surface gets tables of its own but shares the queue.
 - [`control-plane-ui/DESIGN.md`](control-plane-ui/DESIGN.md) — the approval page: its
   browser boundary, how it keeps a failing state visible, and its tests.
 - [`proxies/egress/DESIGN.md`](proxies/egress/DESIGN.md) — the egress proxy: what its

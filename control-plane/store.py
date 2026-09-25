@@ -380,8 +380,8 @@ def _init_db() -> None:
             )""")
         # The OTHER policy table, for the MCP gateway's surface. It is a separate
         # table rather than a scope on `rules` because the rows are a different kind,
-        # not a differently keyed one — the reasoning is in DESIGN.md, "Tool policy
-        # gets its own table". `action` is the only column the two share.
+        # not a differently keyed one — the reasoning is in control-plane/DESIGN.md,
+        # "Tool policy gets its own table". `action` is the only column the two share.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS tool_rules (
                 id         INTEGER PRIMARY KEY,
@@ -509,8 +509,8 @@ def _init_db() -> None:
         conn.execute(_LEASES_DDL)
         # The tool surface's approvals, which split from the table above for the
         # reason the rules did: the rows are egress-shaped there — host, port, proto,
-        # method, url — against a server, a tool and a payload here (DESIGN.md,
-        # "``approvals`` splits the same way").
+        # method, url — against a server, a tool and a payload here
+        # (control-plane/DESIGN.md, "``approvals`` splits the same way").
         #
         # What does NOT split is the operator's pending queue; these rows and those
         # are two builders behind one list.

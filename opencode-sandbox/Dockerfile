@@ -140,7 +140,11 @@ COPY opencode-sandbox/opencode.json /etc/opencode/opencode.json
 # parked in a managed dir got loaded in its own right — see NOTES.md), and this
 # costs nothing while making the baked copy inert whatever search paths appear
 # later. tier-setup.sh installs it where opencode does look.
-COPY opencode-sandbox/AGENTS.md /etc/opencode/AGENTS.md.template
+# The SOURCE is not named AGENTS.md either. That is the instruction file several
+# coding agents read, and the convention scopes one to the directory holding it, so
+# on the host this one would tell an agent working in opencode-sandbox/ that it has
+# no network.
+COPY opencode-sandbox/user-AGENTS.md /etc/opencode/AGENTS.md.template
 COPY sandbox-common/init-firewall.sh /usr/local/bin/init-firewall.sh
 COPY sandbox-common/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY sandbox-common/boundary-check.sh /usr/local/bin/boundary-check.sh

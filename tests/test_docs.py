@@ -255,22 +255,24 @@ class DocPathReferenceTests(_NeedsGit):
 
 
 class InstructionFileTests(_NeedsGit):
-    """Every tracked ``CLAUDE.md`` is one somebody meant as instructions for working
-    in the repo. Claude Code loads the root one at launch and a subdirectory's when a
-    session reads a file beside it, so the NAME alone makes a file instructions. The
-    sandbox's baked user-scope file carried it, and told any session reading
-    ``claude-sandbox/`` that it had no `git push` and no Docker — on the host too.
+    """Every tracked ``CLAUDE.md`` or ``AGENTS.md`` is one somebody meant as instructions
+    for working in the repo. Claude Code loads the root ``CLAUDE.md`` at launch and a
+    subdirectory's when a session reads a file beside it, and ``AGENTS.md`` is the same
+    file for other coding agents, scoped to the directory that holds it. So the NAME
+    alone makes a file instructions. Both sandboxes' baked user-scope files carried it,
+    and told an agent working beside them, on the host too, that it had no `git push`,
+    no Docker, or no network.
 
     Adding one is fine; this makes it a decision rather than an accident."""
 
+    NAMES = ("CLAUDE.md", "CLAUDE.local.md", "AGENTS.md")
     INTENDED: ClassVar[set] = {"CLAUDE.md", "control-plane/CLAUDE.md"}
 
-    def test_every_claude_md_is_meant_as_instructions(self):
-        found = {f for f in _tracked()
-                 if f.rsplit("/", 1)[-1] in ("CLAUDE.md", "CLAUDE.local.md")}
+    def test_every_instruction_file_is_meant_as_instructions(self):
+        found = {f for f in _tracked() if f.rsplit("/", 1)[-1] in self.NAMES}
         self.assertEqual(found, self.INTENDED,
-                         "a file named CLAUDE.md is loaded as instructions by path; "
-                         "rename one that is not, or list one that is here")
+                         "a file with one of these names is loaded as instructions by "
+                         "path; rename one that is not, or list one that is here")
 
 
 class MarkdownAnchorTests(_NeedsGit):

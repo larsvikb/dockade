@@ -11,8 +11,9 @@ system stays in the root, and this file does not repeat it:
 - what a client class is, `DESIGN.md` → "Policy is scoped to a client class";
 - the hold-for-approval flow across the proxy, this backend and the page,
   `DESIGN.md` → "Hold-for-approval";
-- the frontend and the browser boundary, `DESIGN.md` → "Approval UI — the one surface
-  that can grant egress";
+- why the frontend is a container of its own, `DESIGN.md` → "Approval UI — the one
+  surface that can grant egress", and its browser boundary and the page, in
+  `control-plane-ui/DESIGN.md`;
 - the tool surface, `DESIGN.md` → "MCP gateway — governed tool capability".
 
 ## Client classes, where the control plane applies them

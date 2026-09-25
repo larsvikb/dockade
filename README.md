@@ -269,6 +269,7 @@ dockade/
     app.js                  #   the approval console's behaviour — a file so the CSP can
                             #   say script-src 'self'; pure helpers unit-tested under node
     index.html              #   static shell + styles for the SSE approval console
+    DESIGN.md               #   the browser boundary and the page's mechanics
     requirements.txt        #   pinned deps (fastapi, uvicorn, httpx)
   tool-gateway/             # MCP GATEWAY — governed tool capability; tier 1's `--mcp-config` points at it
     Dockerfile              #   FastAPI + uvicorn; triple-homed, no egress leg
@@ -371,6 +372,8 @@ exposed through governed data-plane services. Next steps toward it:
   and the local LLM service, the one consumer of each.
 - [`control-plane/DESIGN.md`](control-plane/DESIGN.md) — the control plane's half of the
   approval flow: how a card grants, holds under load, the audit views, standing policy.
+- [`control-plane-ui/DESIGN.md`](control-plane-ui/DESIGN.md) — the approval page: its
+  browser boundary, how it keeps a failing state visible, and its tests.
 - [`CLAUDE.md`](CLAUDE.md) — the invariants that must never be violated and the
   conventions for working in this repo.
 - [`SECURITY.md`](SECURITY.md) — how to report a boundary bypass, and — worth

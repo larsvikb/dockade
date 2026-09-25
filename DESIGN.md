@@ -1641,8 +1641,7 @@ reordering this rule forbids, performed by the renderer (`payloadHazards` in
 `control-plane-ui/app.js`). The
 limit worth stating rather than engineering around: an operator cannot judge an
 opaque identifier, and resolving one would mean the control plane making its own MCP
-calls — new capability on the crown-jewel container and a fine SSRF surface. The
-card names the gap instead.
+calls — new capability on the crown-jewel container and a fine SSRF surface.
 
 **Two failure modes the egress proxy does not have.**
 - **Executing after the caller is gone.** If a held call outlives the client's MCP

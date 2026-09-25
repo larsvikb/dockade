@@ -348,10 +348,10 @@ everything (fail-closed, and a plausible way to say "stop holding anything"), on
 per-client cap it disables the cap — the fail-closed reading would make every client's
 first hold impossible, which cannot be what setting it meant.
 
-**Hold bounds are fail-closed, so their values stay env vars.** Step 2c-2 was going to
-move the four caps and `CONTROL_HOLD_TIMEOUT` into the store, on the reasoning that
-governs everything else here: policy belongs in the crown-jewel volume, and every change
-to it is audited. That reasoning does not reach these values, and the distinction decides
+**Hold bounds are fail-closed, so their values stay env vars.** The obvious home for the
+four caps and `CONTROL_HOLD_TIMEOUT` would be the store, on the reasoning that governs
+everything else here: policy belongs in the crown-jewel volume, and every change to it
+is audited. That reasoning does not reach these values, and the distinction decides
 where the next governed service's numbers live too.
 
 Every one of these knobs can only produce a **deny**. Over a cap, `/authorize` refuses
@@ -397,24 +397,22 @@ beside the caps line that `_bootstrap` already emits.
 
 ## The audit views
 
-**A decision row now says whose request it was.** `/api/audit` selected `stage` — which
-nothing rendered — while omitting `client`, which the proxy has always populated with
-the sandbox peer address. On a control plane **shared across every sandbox** that is
-the difference between a record and half a record: "egress to pypi.org was allowed" does
-not answer the question an audit trail exists for once two agents are running.
+**A decision row says whose request it was.** `/api/audit` carries `client`, the peer
+address the proxy records on every decision. On a control plane **shared across every
+sandbox** that is the difference between a record and half a record: "egress to
+pypi.org was allowed" does not answer the question an audit trail exists for once two
+agents are running.
 
 This is not a reversal of keeping client identity out of the saturation banner's
 headline. That banner is a glanceable alert where a bare IP is noise; this table is the
 forensic view where *who* is the entire question. The two decisions point the same way —
 put the address where someone is reading carefully, not where they are only glancing.
 
-Adding the column immediately showed that the **proxy was not sending the value on one
-of its two paths**: `http_connect` had always passed the peer address, and the plaintext
-`request` hook never did, so every HTTP decision was stored against no client at all.
-Invisible for as long as nothing rendered it, and invisible to the tests too — the
-request-flow stub had no `client_conn` for a test to have caught it with. Both hooks
-derive it identically now, and a test asserts they agree, because one derivation in two
-places is exactly the shape that drifts silently.
+Both proxy hooks — `http_connect` and the plaintext `request` — derive `client` the
+same way, and `test_a_connect_and_a_request_report_the_client_the_same_way` holds
+them to it, because one derivation in two places is exactly the shape that drifts
+silently: an HTTP decision stored against no client at all stays invisible for as long
+as nothing renders the column.
 
 What stays out of the response matters as much: `url` is agent-controlled and unbounded,
 and `method`/`port`/`proto` are noise in a forty-row glance. All four remain in the
@@ -732,26 +730,23 @@ and the audit history, i.e. the crown jewels. The mechanism (a stamped schema
 version, append-only ordered steps, and the three edits a new column needs) lives in
 `control-plane/store.py`: read the NOTE below `_init_db` before touching the schema.
 
-Step 2c-2 is egress rule **editing**, and it is built: all three verbs now exist, with
-changing a rule an atomic operation rather than revoke-then-create (see "Changing a rule
-is one operation, not two"). The per-proxy config surface this step also used to mean is
-**not** being built — those
-values are fail-closed bounds rather than policy, so they stay env vars and a second
-governed service names its own (see "Hold bounds are fail-closed, so their values stay
-env vars"). Tool policy lands in its own table (see "Tool policy gets its own table"
-above), so the gateway is not waiting on a config surface for it.
+Standing egress policy has all three verbs — create, revoke, and change as one atomic
+operation rather than revoke-then-create (see "Changing a rule is one operation, not
+two") — and no config surface beside them: the per-proxy values are fail-closed bounds
+rather than policy, so they stay env vars and a second governed service names its own
+(see "Hold bounds are fail-closed, so their values stay env vars"). Tool policy is a
+table of its own (see "Tool policy gets its own table" above), so the gateway needs no
+config surface either.
 
 **URLs carry the surface.** `/api/egress/rules` is the standing-policy view and
 `/api/egress/rules/{id}/revoke` takes a rule back; `/api/mcp/rules` and
 `/api/mcp/servers` are the gateway surface's, and they precede the gateway rather
 than arriving with it — tool policy is configuration first, so the surface that
-states it is usable before anything consumes it. The `/api/rules` the egress
-prefix replaced was a generic name on a specific thing,
-and the rename landed before 2c-2 hung a POST and a config surface off it, while the
-only consumers were the UI and the relay's path allowlist. The lifecycle endpoints keep
+states it is usable before anything consumes it. A bare `/api/rules` would be a
+generic name on a specific thing. The lifecycle endpoints keep
 unprefixed names (`/approvals`, `/approvals/stream`, `/approvals/{id}/resolve`), so
 the URL shape states the split itself: prefixed is per-surface policy, unprefixed is
 the one queue every surface feeds (see "`approvals` splits the same way" above). The
-shape rejected on the way is `/api/rules?surface=…`, a discriminator over a single path
+shape rejected is `/api/rules?surface=…`, a discriminator over a single path
 — the storage mistake "Tool policy gets its own table" above turns down, wearing an API
 hat.

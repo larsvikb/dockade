@@ -125,23 +125,18 @@ limit worth stating rather than engineering around: an operator cannot judge an
 opaque identifier, and resolving one would mean the control plane making its own MCP
 calls — new capability on the crown-jewel container and a fine SSRF surface.
 
-**`hidden` did not hide, and it was never only the banner.** The banner shipped
-permanently visible and empty — a Dismiss button with nothing to dismiss. The script
-hides things by setting `.hidden`, which relies on the user-agent rule
-`[hidden] { display: none }`, and that rule loses to *any* author rule setting `display`
-on the same element, because author beats user-agent at equal specificity.
-`.saturation` sets `display: flex`. So does `.countdown` — meaning empty countdown rows
-had been rendering on every card before `/api/config` answered, and stale ones staying
-put after a resolve, unnoticed for as long as the countdown has existed.
-
-The page was already carrying a `[role="tabpanel"][hidden] { display: none }` rule: the
-same bug, met once, patched for the one element that had it, class left open for the
-next occurrence to be found from the running UI. It is now a global
-`[hidden] { display: none !important; }` — the one context where `!important` is the
-right tool rather than a smell, since outranking author `display` declarations on hidden
-elements is the rule's entire job. The test guards **the global rule**, not a list of
-elements, and fails on a narrower re-patch: one rule makes the class impossible, whereas
-an enumeration is something someone has to remember to extend.
+**`[hidden]` wins globally, and the test guards the rule rather than a list.** The
+script hides things by setting `.hidden`, which relies on the user-agent rule
+`[hidden] { display: none }` — and that rule loses to *any* author rule setting
+`display` on the same element, because author beats user-agent at equal specificity.
+`.saturation` and `.countdown` both set `display: flex`, so on its own the attribute
+would leave a dismissed banner and an empty countdown row on screen. The stylesheet
+therefore carries a global `[hidden] { display: none !important; }` — the one context
+where `!important` is the right tool rather than a smell, since outranking author
+`display` declarations on hidden elements is the rule's entire job.
+`test_the_hidden_attribute_survives_this_stylesheet` guards **the global rule**, not a
+list of elements, and fails on a narrower re-patch: one rule makes the class
+impossible, whereas an enumeration is something someone has to remember to extend.
 
 **Timestamps are formatted, not deferred to the viewer's locale.** A correctness call,
 not a preference: `toLocaleString()` renders the same audit row as different dates for
@@ -189,16 +184,15 @@ guard was verified by removing the route and watching it fail. The guard earned 
 a second time on `POST /api/saturation/ack`: removing the route from the allowlist fails
 the suite rather than the browser.
 
-The **converse** is now asserted too — every relayed route must be called by the page —
-and that direction is about a different failure. A route with no caller does not break
-anything, which is exactly the problem: nothing would reveal it if it were wrong. Two
-had accumulated. `/status` was harmless (a plain-text count summary, mostly duplicating
-what the page already shows). `GET /approvals` was not: the non-streaming form of the
-pending list, superseded by the SSE stream, still relaying the pending hosts, clients and
-URLs to any caller that got past the Host and `Sec-Fetch` guards. Both still serve on
-control-net; only the browser's path to them is gone. The test carries no exception list
-on purpose — a route that must stay uncalled should arrive with its reason attached, as
-an edit someone has to justify.
+The **converse** is asserted too — every relayed route must be called by the page
+(`test_every_relayed_route_is_actually_called`) — and that direction is about a
+different failure. A route with no caller does not break anything, which is exactly
+the problem: nothing would reveal it if it were wrong, and a relayed route the page has
+stopped using still hands whatever it serves — a superseded form of the pending list
+carries every pending host, client and URL — to any caller that gets past the Host and
+`Sec-Fetch` guards. The test carries no exception list on purpose: a route that must
+stay uncalled should arrive with its reason attached, as an edit someone has to
+justify.
 
 A further guard is source-level rather than behavioural: `shouldSweep`'s dwell floor
 defaults to `0`, so **dropping the argument at the call site** would restore the

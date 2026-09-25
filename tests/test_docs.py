@@ -486,6 +486,7 @@ class ShippedComponentTests(_NeedsGit):
             r"until the gateway exists",
             r"before the gateway exists",
             r"no agent (is )?point(s|ed) at it yet",
+            r"[Nn]ot yet built[^.]{0,80}\bMCP gateway",
         ),
     }
 

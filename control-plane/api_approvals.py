@@ -277,7 +277,9 @@ def _resolve_tool_ask_request(approval_id: str, req: ResolveRequest,
              "status": current["status"] if current else None}, status_code=409)
 
     store._audit("allow" if action == "allow" else "deny", stage="tool-ask",
-                 client=ask["client"], server=ask["server"], tool=ask["tool"],
+                 client=ask["client"],
+                 client_class=policy._client_class(ask["client"]),
+                 server=ask["server"], tool=ask["tool"],
                  approval_id=approval_id,
                  reason=f"tool ask {action}ed by {actor}; {ask['tool']} on "
                         f"{ask['server']} — the call runs only if the agent returns "

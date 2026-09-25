@@ -130,8 +130,8 @@ networks:
   # Only the UI sits here, and it is ours. This is the reverse-proxy-sidecar split
   # in practice: the control-plane-ui frontend (below) carries this one non-internal
   # surface so the control-plane BACKEND needs no published port and stays
-  # control-net-only / fully internal — zero non-internal exposure for the crown
-  # jewel. Sandbox never here.
+  # internal on every leg — zero non-internal exposure for the crown jewel.
+  # Sandbox never here.
   control-ui-net:
     name: control-ui-net
     driver: bridge

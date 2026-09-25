@@ -108,9 +108,10 @@ the tool's JSON Schema gives a field tree with each field's description beside i
 but the rule the approval UI already established governs: the **raw payload is
 authoritative and always one click away**, exactly as the persist-confirm shows a
 chosen pattern verbatim rather than describing it. A prettifier that truncates,
-unescapes or reorders is a place to hide something from the person deciding. The one
-transformation the card does make runs the other way: a payload carrying invisible or
-non-ASCII characters is shown *escaped* by default, `\u202e` spelled out where it
+unescapes or reorders is a place to hide something from the person deciding, so the
+card's indentation is whitespace between tokens and nothing else (`indentPayload`).
+The one change to content the card does make runs the other way: a payload carrying
+invisible or non-ASCII characters is shown *escaped* by default, `\u202e` spelled out where it
 sits, with the raw text one click away — because a bidi override lets the browser
 reorder what the operator reads while the bytes stay as they are, which is the
 reordering this rule forbids, performed by the renderer (`payloadHazards` in

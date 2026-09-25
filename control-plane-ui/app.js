@@ -92,6 +92,45 @@ function payloadDisclosure(argsJson) {
            summary: `arguments · ${bytes} bytes` };
 }
 
+// The payload one line per field, indented by depth. WHITESPACE ONLY, added outside
+// string literals: strip it and the canonical bytes come back exactly. It walks the
+// text rather than parsing it, because a JSON.parse/stringify round trip is the
+// prettifier control-plane-ui/DESIGN.md forbids — it rounds integers past 2^53,
+// moves integer-like keys to the front and decodes `\u` escapes.
+function indentPayload(argsJson) {
+  const text = typeof argsJson === "string" ? argsJson : "";
+  let out = "", depth = 0, inString = false;
+  const newline = () => "\n" + "  ".repeat(depth);
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      out += ch;
+      if (ch === "\\") out += text[++i] ?? "";
+      else if (ch === '"') inString = false;
+    } else if (ch === '"') {
+      out += ch;
+      inString = true;
+    } else if (ch === "{" || ch === "[") {
+      if (text[i + 1] === (ch === "{" ? "}" : "]")) {
+        out += ch + text[++i];
+      } else {
+        depth++;
+        out += ch + newline();
+      }
+    } else if (ch === "}" || ch === "]") {
+      depth = Math.max(0, depth - 1);
+      out += newline() + ch;
+    } else if (ch === ",") {
+      out += ch + newline();
+    } else if (ch === ":") {
+      out += ": ";
+    } else {
+      out += ch;
+    }
+  }
+  return out;
+}
+
 // Characters that render as nothing, or as something else. `Cf` is the format class —
 // the bidi overrides and isolates (U+202E, U+2066..2069), zero-width joiners, the BOM —
 // and `Cc`/`Zl`/`Zp` are raw controls and line separators, none of which the canonical
@@ -2069,8 +2108,12 @@ function start() {
     // The payload, verbatim, one click away at worst. This is the thing being
     // approved: the tool name says what KIND of act it is and only the arguments say
     // what it does to which repository.
+    // Measured, checked and escaped on the payload as sent, indented only for display:
+    // the newlines indenting adds are control characters to payloadHazards.
     const disclosure = payloadDisclosure(a.args_json);
     const hazards = payloadHazards(a.args_json);
+    const raw = indentPayload(a.args_json);
+    const escaped = indentPayload(hazards.escaped);
     const details = document.createElement("details");
     details.className = "payload";
     // A DANGEROUS payload starts OPEN whatever its size: the note below is only worth
@@ -2081,8 +2124,7 @@ function start() {
     const summary = document.createElement("summary");
     summary.textContent = disclosure.summary;
     const pre = document.createElement("pre");
-    const raw = typeof a.args_json === "string" ? a.args_json : "";
-    pre.textContent = danger ? hazards.escaped : raw;
+    pre.textContent = danger ? escaped : raw;
     details.append(summary);
     if (hazards.level !== "none") {
       // Escaped FIRST, raw on request — see payloadHazards for why not the reverse.
@@ -2095,7 +2137,7 @@ function start() {
       box.type = "checkbox";
       box.checked = danger;
       box.addEventListener("change", () => {
-        pre.textContent = box.checked ? hazards.escaped : raw;
+        pre.textContent = box.checked ? escaped : raw;
       });
       toggle.append(box, document.createTextNode(" escaped"));
       hazard.append(note, toggle);
@@ -4188,6 +4230,6 @@ if (typeof module !== "undefined" && module.exports) {
     RECONNECT_MIN_MS, RECONNECT_MAX_MS, STALE_MAX_MS, COUNTDOWN_URGENT_S,
     DWELL_MS, SATURATION_RECENT_MS, SATURATION_WARN_FRAC,
     RENDERABLE_KINDS, PAYLOAD_FOLD_BYTES,
-    payloadHazards, escapePayload,
+    payloadHazards, escapePayload, indentPayload,
   };
 }

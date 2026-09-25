@@ -159,6 +159,13 @@
     border: 1px solid var(--line); border-radius: 6px;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
     white-space: pre-wrap; word-break: break-all; max-height: 40vh; overflow: auto; }
+  /* The payload's colours (renderPayload). None of them is allow, deny or hold, which
+     mean something else on this page. The break mark is dim like the punctuation, so
+     a `↵` carried inside a string shows in the string's colour and not the mark's. */
+  .j-key { color: #7cb7ff; }
+  .j-value { color: #c4a7e7; }
+  .j-escape { color: #56d4dd; }
+  .j-punct, .j-mark { color: var(--dim); }
   .actions { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
   /* Card outcome states. A resolve reports itself HERE rather than by the card
      disappearing on the next SSE tick — that was the only feedback before, so with

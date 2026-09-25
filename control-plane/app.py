@@ -147,8 +147,8 @@ _MANAGE_BIND_FORBIDDEN = os.environ.get(
 #: Sized to the peer. An egress question is a host, a port and a URL; the tool bridge
 #: carries complete tool arguments, already capped at the gateway's intake
 #: (``GATEWAY_BODY_MAX``), so this is the backstop behind that cap. Env vars, since
-#: they fail closed (DESIGN.md, "Hold bounds are fail-closed, so their values stay
-#: env vars").
+#: they fail closed (control-plane/DESIGN.md, "Hold bounds are fail-closed, so their
+#: values stay env vars").
 AUTHORIZE_BODY_MAX = int(os.environ.get("CONTROL_AUTHORIZE_BODY_MAX", str(64 * 1024)))
 TOOL_BODY_MAX = int(os.environ.get("CONTROL_TOOL_BODY_MAX", str(2 * 1024 * 1024)))
 

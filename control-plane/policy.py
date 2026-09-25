@@ -177,7 +177,7 @@ def _pattern_scope(pattern: str) -> str:
     while looking like an ordinary hostname: a rule persisted for ``.example.com``
     also grants every subdomain, and nothing in the approval flow says so (the
     pattern comes verbatim from the requested host — see the rule-management item in
-    DESIGN.md). Naming the scope is the cheap half of that fix."""
+    control-plane/DESIGN.md). Naming the scope is the cheap half of that fix."""
     return "host + subdomains" if pattern.startswith(".") else "exact host"
 
 

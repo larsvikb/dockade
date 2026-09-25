@@ -262,6 +262,7 @@ dockade/
     inventory.py            #   what each server exposes, as the gateway last reported it
     ingest.py               #   drains the proxy's and the gateway's audit streams in
     requirements.txt        #   pinned deps (fastapi, uvicorn)
+    CLAUDE.md, DESIGN.md    #   how to work here; the approval flow's design
   control-plane-ui/         # UI FRONTEND — serves the UI + reverse-proxies the API
     Dockerfile              #   FastAPI + httpx; control-ui-net (loopback) + control-net
     app.py                  #   static UI at / + streaming reverse proxy to the backend
@@ -368,6 +369,8 @@ exposed through governed data-plane services. Next steps toward it:
 - [`opencode-sandbox/DESIGN.md`](opencode-sandbox/DESIGN.md) and
   [`opencode-sandbox/NOTES.md`](opencode-sandbox/NOTES.md) — the same pair for tier 2
   and the local LLM service, the one consumer of each.
+- [`control-plane/DESIGN.md`](control-plane/DESIGN.md) — the control plane's half of the
+  approval flow: how a card grants, holds under load, the audit views, standing policy.
 - [`CLAUDE.md`](CLAUDE.md) — the invariants that must never be violated and the
   conventions for working in this repo.
 - [`SECURITY.md`](SECURITY.md) — how to report a boundary bypass, and — worth

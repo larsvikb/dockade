@@ -136,7 +136,8 @@ def _step_1_client_class(conn: sqlite3.Connection) -> None:
 
 # The TIMED GRANTS: an `allow_lease` decision, which allows one host for one client
 # class until it expires. A third grant duration between `*_once` (this request) and
-# `*_persist` (standing policy) — see DESIGN.md, "A lease is the third grant duration".
+# `*_persist` (standing policy) — see control-plane/DESIGN.md, "A lease is the third
+# grant duration".
 #
 # ONE definition, shared by the v2 step and the fresh-store DDL, where the v1 rules
 # rebuild deliberately kept two near-copies. The difference is that this is a NEW

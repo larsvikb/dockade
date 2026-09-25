@@ -110,9 +110,10 @@ the agent's endpoint is `http://llm:8080` whatever the host has. `llm-vulkan` al
 needs `DOCKADE_RENDER_GID` (the host gid owning `/dev/dri/renderD128`) and is the
 one variant not yet verified on hardware.
 
-See [`DESIGN.md`](DESIGN.md) → *Local inference* for the accelerator setup, the
-tuning decisions, and why the LLM service is ungoverned (it has no egress of its own
-to govern); [`NOTES.md`](NOTES.md) has the measured throughput behind those decisions.
+See [`opencode-sandbox/DESIGN.md`](opencode-sandbox/DESIGN.md) for the accelerator
+setup, the tuning decisions, and why the LLM service is ungoverned (it has no egress
+of its own to govern); [`opencode-sandbox/NOTES.md`](opencode-sandbox/NOTES.md) has
+the measured throughput behind those decisions.
 
 ## What the launcher does
 
@@ -301,6 +302,7 @@ dockade/
     tier-setup.sh           # tier hook: materialize the opencode provider config
     opencode.json           # points opencode at the local `llm` service
     AGENTS.md               # tier-2 capability facts, materialized to the config dir
+    DESIGN.md, NOTES.md     # tier 2 and the local LLM service: rationale, evidence
     dotfiles/               # .bashrc.tier — tier-2 shell hook (oc alias, distinct prompt)
   tests/                    # dependency-free unit tests for the governance logic (make check)
   models/                   # GGUF weights for the local LLM (gitignored)
@@ -363,6 +365,9 @@ exposed through governed data-plane services. Next steps toward it:
   rationale behind every decision. Start here to understand *why*.
 - [`NOTES.md`](NOTES.md) — the lab notebook: measurements, hardware behaviour,
   and dead ends. Evidence for what `DESIGN.md` decides.
+- [`opencode-sandbox/DESIGN.md`](opencode-sandbox/DESIGN.md) and
+  [`opencode-sandbox/NOTES.md`](opencode-sandbox/NOTES.md) — the same pair for tier 2
+  and the local LLM service, the one consumer of each.
 - [`CLAUDE.md`](CLAUDE.md) — the invariants that must never be violated and the
   conventions for working in this repo.
 - [`SECURITY.md`](SECURITY.md) — how to report a boundary bypass, and — worth

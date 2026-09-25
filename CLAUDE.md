@@ -64,6 +64,7 @@ wrong.** Getting this wrong is how `DESIGN.md` grew a 616-line section called
 | **`DESIGN.md`** | a decision or invariant that constrains *this* repo | rots if it restates the others |
 | **`NOTES.md`** | evidence: measurements, environment behaviour, dead ends | low — facts about the world |
 | **`CLAUDE.md`** | an invariant or convention to follow *while working* | rots fastest — keep it lean |
+| **a component's `DESIGN.md`, `NOTES.md`** (`opencode-sandbox/`) | as the root pair, when every *why* is that component's code; reasoning across components stays in the root | as the root pair |
 | **a component's `CLAUDE.md`** (`control-plane/CLAUDE.md`) | how to work in *that* component: its checklists, as pointers | as `CLAUDE.md`; loads only once a file beside it is read |
 
 Consequences worth stating, because each was learned by violating it:

@@ -5,8 +5,8 @@
 The control plane cannot discover tools: it has no leg on `mcp-net`, and enumerating
 what runs would mean a docker socket on the crown-jewel container. The gateway is the
 only component that ever talks to a server, so this is what it reports back — the
-operator-facing half of "the control plane learns a server's tools from the gateway"
-(DESIGN.md).
+operator-facing half of "The control plane learns a server's tools from the gateway"
+in DESIGN.md.
 
 NOT PERSISTED, and every reason points the same way. It is derived data, rebuildable
 by asking the servers again, so a restart costs one poll. A stored copy would go stale
@@ -16,9 +16,7 @@ which is the operator's own decisions and nothing else.
 
 THE INVARIANT THIS MODULE EXISTS UNDER: nothing here is an input to
 ``policy._decide_tool``. A tool in this map is not permitted, not registered, and not
-half-registered — it is a thing a server claimed, and claims decide nothing. A
-discovered tool that could write its own rule would be a server granting itself
-capability, which is the whole reason the gateway reports rather than registers.
+half-registered — it is a thing a server claimed, and claims decide nothing.
 
 So the trust gradient runs the other way from everywhere else in this process:
 `mcp_servers` and `tool_rules` hold what an OPERATOR decided and must be right; this
@@ -42,22 +40,16 @@ MAX_TOOLS_PER_SERVER = 256
 class InventoryError(ValueError):
     """A push the gateway must be TOLD about rather than have silently dropped.
 
-    Same contract as ``audit.FilterError``, and for the same reason. **The message is
-    served VERBATIM to the caller**, so interpolate only what the caller already has —
-    their own payload's shape, and this module's constants. Nothing read from the
-    store, the filesystem, or an underlying exception belongs in one; that is what
-    keeps the 400 a validation sentence rather than a disclosure.
-
-    TYPED rather than a bare ``ValueError`` so ``api_tool`` can catch exactly the errors
-    written to be read, and let anything unexpected become a 500 with no body. A code
-    scanning rule flags ``str(exc)`` reaching a response from the shape alone, and this
-    is what makes the difference between a finding and a false positive real rather
-    than argued — it holds only as long as every raise site below honours it."""
+    Same contract as ``audit.FilterError``: **the message is served VERBATIM to the
+    caller**, so interpolate only the caller's own payload's shape and this module's
+    constants. TYPED rather than a bare ``ValueError`` so ``api_tool`` can catch exactly
+    the errors written to be read, and let anything unexpected become a 500 with no
+    body."""
 
 
 _LOCK = threading.Lock()
-#: server -> {"tools": [name, ...], "read_only": [name, ...], "status": str,
-#:            "unnameable": int, "seen_at": float}
+#: server -> {"tools": [name, ...], "read_only": [name, ...], "unnameable": int,
+#:            "enumerated": bool, "status": str, "seen_at": float}
 _SEEN: dict[str, dict] = {}
 
 
@@ -97,8 +89,8 @@ def changes(before: dict, after: dict) -> list[tuple[str, str]]:
 
     The name is returned BESIDE the line rather than left to be read out of it. The
     line names the server too — it has to, being what a human reads — but the caller
-    writes an ``audit.server`` column from this, and re-deriving a column by parsing a
-    sentence is exactly what that column exists to stop.
+    writes the audit table's ``server`` column from this, and re-deriving a column by
+    parsing a sentence is exactly what that column exists to stop.
 
     NAMES, not prose. A tool name is charset-bounded by ``policy._TOOL_RE``; a
     description is unbounded text a third party wrote, and this is the one part of the
@@ -106,8 +98,8 @@ def changes(before: dict, after: dict) -> list[tuple[str, str]]:
     bump that starts exposing a destructive tool, with no human in the loop, is a
     supply-chain event and the reason this is audited at all.
 
-    Only CHANGES. A push every few minutes saying the same thing is not a record, it is
-    a way to make the record unreadable."""
+    Only CHANGES. A push on every roster poll saying the same thing is not a record, it
+    is a way to make the record unreadable."""
     lines = []
     for server in sorted(set(before) | set(after)):
         if server not in after:
@@ -125,9 +117,8 @@ def changes(before: dict, after: dict) -> list[tuple[str, str]]:
             # with a bad credential gives it an empty tool list and no previous entry,
             # so both sides are empty and it falls out here — rather than reaching the
             # first-sighting line below and claiming it "exposes 0 tools", which would
-            # say the server offers nothing when the truth is nobody could ask. Stated
-            # because an explicit guard for it lower down was UNREACHABLE: this check
-            # gets there first, and a second one only looked like protection.
+            # say the server offers nothing when the truth is nobody could ask. This
+            # check is the only guard for that case; nothing below repeats it.
             continue
         if server not in before:
             # FIRST SIGHTING, which is not a change and must not read as one. This map
@@ -196,8 +187,7 @@ def record(payload: dict) -> tuple[dict, list[tuple[str, str]]]:
             # Whether the tool list above is an OBSERVATION or merely the absence of
             # one. A server registered with a bad credential has never been
             # enumerated, and its empty list means "we could not ask" rather than
-            # "it offers nothing" — a distinction the audit and the picker both need,
-            # and the one this module keeps getting wrong when it is left implicit.
+            # "it offers nothing" — a distinction the audit and the picker both need.
             "enumerated": "tools" in body or bool(was.get("enumerated")),
             # Carried verbatim from the gateway, capped: "secret missing" and
             # "unreachable" are the states an operator most needs, and they are the
@@ -208,8 +198,8 @@ def record(payload: dict) -> tuple[dict, list[tuple[str, str]]]:
 
     with _LOCK:
         moved = changes(previous, fresh)
-        # Whole-map replacement under the lock, so a reader never observes a half-built
-        # inventory. Rebinding rather than mutating is what makes that true.
+        # Whole-map replacement under the lock, so a reader — ``snapshot`` takes it
+        # too — never observes a half-built inventory.
         _SEEN.clear()
         _SEEN.update(fresh)
     return fresh, moved

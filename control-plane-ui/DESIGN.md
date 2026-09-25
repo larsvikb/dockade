@@ -1,11 +1,12 @@
 # Control-plane UI — the approval page and its browser boundary
 
 The frontend that puts the control plane in front of a human: the guards between the
-published loopback port and a browser, and how the page keeps a failing state visible.
-Every block here is about code in this directory and its tests. What the page presents
-is decided in the backend, and designed in `control-plane/DESIGN.md`. What stays in the
-root is the frontend's place in the system, and the threat no guard in a browser can
-close: `DESIGN.md` → "Approval UI — the one surface that can grant egress".
+published loopback port and a browser, how the page keeps a failing state visible, and
+how it shows a tool ask's payload. Every block here is about code in this directory and
+its tests. What the page presents is decided in the backend, and designed in
+`control-plane/DESIGN.md`. What stays in the root is the frontend's place in the system,
+and the threat no guard in a browser can close: `DESIGN.md` → "Approval UI — the one
+surface that can grant egress".
 
 ## The browser boundary
 
@@ -101,6 +102,22 @@ point of use in `app.js`; only the cross-cutting points are kept here.
   comes from `GET /api/config` (`{"hold_timeout"}`, on the relay allowlist — the one
   cross-component piece) with a two-clock clamp so skew makes it wrong, not absurd. Fails
   soft: no config, no countdown, page otherwise unaffected.
+
+**Presenting a payload for approval.** A schema-driven view gets most of the way —
+the tool's JSON Schema gives a field tree with each field's description beside it —
+but the rule the approval UI already established governs: the **raw payload is
+authoritative and always one click away**, exactly as the persist-confirm shows a
+chosen pattern verbatim rather than describing it. A prettifier that truncates,
+unescapes or reorders is a place to hide something from the person deciding. The one
+transformation the card does make runs the other way: a payload carrying invisible or
+non-ASCII characters is shown *escaped* by default, `\u202e` spelled out where it
+sits, with the raw text one click away — because a bidi override lets the browser
+reorder what the operator reads while the bytes stay as they are, which is the
+reordering this rule forbids, performed by the renderer (`payloadHazards` in
+`control-plane-ui/app.js`). The
+limit worth stating rather than engineering around: an operator cannot judge an
+opaque identifier, and resolving one would mean the control plane making its own MCP
+calls — new capability on the crown-jewel container and a fine SSRF surface.
 
 **`hidden` did not hide, and it was never only the banner.** The banner shipped
 permanently visible and empty — a Dismiss button with nothing to dismiss. The script

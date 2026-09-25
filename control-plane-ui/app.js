@@ -80,10 +80,11 @@ function toolRemaining(deadline, nowMs) {
 const PAYLOAD_FOLD_BYTES = 400;
 
 // The disclosure around a tool ask's arguments. The raw payload is authoritative and
-// always reachable — DESIGN is explicit that a view which truncates, unescapes or
-// reorders is a place to hide something from the person deciding — so this decides
-// only whether it starts OPEN, and says how many bytes are there either way. The size
-// is on the summary so a collapsed card still tells you how much you have not read.
+// always reachable — control-plane-ui/DESIGN.md is explicit that a view which
+// truncates, unescapes or reorders is a place to hide something from the person
+// deciding — so this decides only whether it starts OPEN, and says how many bytes are
+// there either way. The size is on the summary so a collapsed card still tells you how
+// much you have not read.
 function payloadDisclosure(argsJson) {
   const text = typeof argsJson === "string" ? argsJson : "";
   const bytes = text.length;
@@ -97,8 +98,8 @@ function payloadDisclosure(argsJson) {
 // JSON form ever contains legitimately (json.dumps escapes controls and uses no
 // whitespace). Any one of them in a payload means the text on screen is not the text
 // that runs: a single U+202E makes the browser draw the rest of the line backwards
-// while the bytes stay exactly as they are — the reordering DESIGN warns a view must
-// never do, performed by the renderer rather than by a prettifier.
+// while the bytes stay exactly as they are — the reordering control-plane-ui/DESIGN.md
+// warns a view must never do, performed by the renderer rather than by a prettifier.
 const INVISIBLE_RE = /[\p{Cf}\p{Cc}\p{Zl}\p{Zp}]/gu;
 // The same set for asking about ONE character. A `g` regex carries `lastIndex` across
 // calls, so `INVISIBLE_RE.test(ch)` alternates true and false on the same input — a

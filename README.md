@@ -376,7 +376,8 @@ exposed through governed data-plane services. Next steps toward it:
   approval flow: how a card grants, holds under load, the audit views, standing policy,
   and why the tool surface gets tables of its own but shares the queue.
 - [`control-plane-ui/DESIGN.md`](control-plane-ui/DESIGN.md) — the approval page: its
-  browser boundary, how it keeps a failing state visible, and its tests.
+  browser boundary, how it keeps a failing state visible, how it shows a tool payload,
+  and its tests.
 - [`proxies/egress/DESIGN.md`](proxies/egress/DESIGN.md) — the egress proxy: what its
   relay guard refuses before policy is asked, and how it asks the control plane.
 - [`tool-gateway/DESIGN.md`](tool-gateway/DESIGN.md) — the MCP gateway: which tools the

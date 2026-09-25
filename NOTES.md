@@ -232,55 +232,39 @@ headless runs a directory can start a process merely by containing a file. The
 interactive path was **not** tested and may well prompt; the point is that the
 prompt is not what makes it safe.
 
-## An MCP tool call has three timers, and the one that bites defaults to ~28 hours
+## An MCP tool call has four timers, and the one that bites defaults to ~28 hours
 
 From the Claude Code MCP documentation (`https://code.claude.com/docs/en/mcp`), read
-while deciding whether a gateway `ask` may block the agent. **Documented, not
-measured** — the defaults below have not been probed in-container, and the 28-hour
-figure especially is worth pinning before anything depends on it.
+while deciding whether a gateway `ask` may block the agent, and re-read 2026-09-23,
+by which time the page had gained a fourth timer and a client feature. **Documented,
+not measured** — the defaults below have not been probed in-container, and the
+28-hour figure especially is worth pinning before anything depends on it.
 
 | Timer | Scope | Default |
 | --- | --- | --- |
 | `MCP_TIMEOUT` | server **startup** | not stated in the docs |
 | `MCP_TOOL_TIMEOUT` | per tool call, when no per-server `timeout` is set | ~28 hours |
 | per-server `timeout` (ms, in the server's config entry) | per tool call | unset |
-| first-response-byte, HTTP/SSE/WS servers only | per request | 60 s, raised to match `timeout` / `MCP_TOOL_TIMEOUT` when either is ≥ 60 s |
+| first-response-byte, HTTP/SSE/WS servers only | per request | the greatest of 60 s, the server's `timeout` and `MCP_TIMEOUT` — "the 28-hour default of an unset `MCP_TOOL_TIMEOUT` doesn't enter that comparison" |
+| idle — no response *and no progress notification* | per tool call, HTTP/SSE/WS/connector | **5 min** (30 min stdio; IDE and in-process exempt), `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`, v2.1.187+ |
 
-Three consequences, in the order they surprised:
+What follows, in the order it matters:
 
 - The per-server `timeout` is a **hard wall-clock limit**, and **progress
-  notifications do not extend it**. MCP's own keepalive mechanism is therefore
-  unavailable as a way to hold a call open past the limit — the option that looks
-  obvious from the protocol does not exist in this client.
-- The first-byte timer is the one an HTTP server hits first, and it is only 60 s
-  *until* a longer `timeout` is configured, at which point it rises to match. So a
-  server that intends to answer slowly must set `timeout`; there is nothing to set on
-  the first-byte timer directly.
+  notifications do not extend it** — but they are **required against the idle
+  timer**: a call that intends to sit quietly for more than five minutes needs them.
+  Keepalive exists in this client; it buys idle time, never wall-clock time.
+- **60 s is the floor a portable server has to fit inside** — the one number no
+  configuration can lower. The first-byte timer is the greatest of 60 s, the server's
+  `timeout` and `MCP_TIMEOUT`, so an unconfigured HTTP server gets exactly 60 s, a
+  value below 60 cannot shorten it, and a server that intends to answer slowly must
+  set `timeout`; there is nothing to set on the first-byte timer directly.
 - Unset means ~28 hours, not "a sensible minute or two". Any design that blocks the
   caller and relies on the default to bound it hangs the agent for a day rather than
   failing — the failure mode arrives in someone else's config, not the author's.
-
-**Re-read 2026-09-23, and two of the three conclusions above needed amending.** The
-page had gained a fourth timer and a client feature; still documented rather than
-measured, and the probe is still worth doing.
-
-| Timer | Scope | Default |
-| --- | --- | --- |
-| idle — no response *and no progress notification* | per tool call, HTTP/SSE/WS/connector | **5 min** (30 min stdio; IDE and in-process exempt), `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`, v2.1.187+ |
-
-- **Progress notifications are useless against the wall clock and REQUIRED against the
-  idle timer.** The bullet above is right that they do not extend the per-server
-  `timeout`; it now reads as "keepalive is unavailable", and that is wrong. A call
-  that intends to sit quietly for more than five minutes needs them.
-- **The first-byte comparison excludes the 28-hour default**, which the bullet above
-  misses: the timer is the greatest of 60 s, the server's `timeout`, and `MCP_TIMEOUT`,
-  "and the 28-hour default of an unset `MCP_TOOL_TIMEOUT` doesn't enter that
-  comparison". So an unconfigured HTTP server gets exactly 60 s and a value below 60
-  cannot shorten it. **60 s is therefore the floor a portable server has to fit
-  inside** — it is the one number no configuration can lower.
-- **One field settles all three.** A per-server `timeout` of at least 1000 ms sets the
-  wall clock, raises the first-byte timer to match, and (v2.1.203+) acts as a floor on
-  the idle timeout.
+- **One field settles the three that can be set.** A per-server `timeout` of at least
+  1000 ms sets the wall clock, raises the first-byte timer to match, and (v2.1.203+)
+  acts as a floor on the idle timeout.
 - **Automatic backgrounding (v2.1.212+) is the real answer to blocking — in this
   client only.** "An MCP tool call in the main conversation that is still running after
   two minutes moves to a background task instead of blocking the session. Claude

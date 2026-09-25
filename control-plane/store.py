@@ -23,26 +23,22 @@ DB_PATH = os.environ.get("CONTROL_DB", "/var/lib/control-plane/control.db")
 SEED_PATH = os.environ.get(
     "CONTROL_SEED", "/etc/control-plane/egress-allowlist.txt")
 
-# Cap on any single ingested string. These fields are agent-INFLUENCED (a host or URL
-# the sandbox asked for), and this is a trust boundary: the proxy writes them faithfully,
-# including a megabyte-long URL if the agent sent one. Truncating here keeps one request
-# from bloating the store or the glanceable UI list. Applied on BOTH write paths — the
-# ingest (ingest.py) and this module's own ``_audit`` — which is why it lives here.
+# Cap on any single audited string. These fields are agent-INFLUENCED (a host or URL
+# the sandbox asked for), faithfully relayed even at a megabyte, so truncating keeps
+# one request from bloating the store or the UI list. Both write paths apply it — the
+# ingest (ingest.py) and ``_audit`` below — which is why it lives here.
 DRAIN_MAX_FIELD = 2048
 
 # What every rule that predates the client_class column is scoped to, and what a
 # rules row falls back to if an INSERT ever omits the column.
 #
-# It is 'sandbox' because that is the truth about those rows rather than a
-# convenience: while the proxy had exactly one client population, every rule an
-# operator approved and every entry in the seed allowlist was approved FOR THE AGENT.
-# Backfilling them to a wildcard would have preserved today's behaviour by granting
-# the whole accumulated allowlist to mcp-net, which is the thing the column exists to
-# stop; backfilling to anything else would silently revoke policy a human decided.
+# 'sandbox' because it is the truth about those rows: with one client population,
+# every rule and seed entry was approved FOR THE AGENT. A wildcard would have granted
+# the whole allowlist to mcp-net; anything else would have revoked policy a human
+# decided.
 #
-# Held equal to a class name in ``policy.CLIENT_CLASSES_DEFAULT`` by a test — this
-# module is the bottom of the dependency order and must not import ``policy``, so the
-# two spellings are tied by the suite rather than by a shared constant.
+# Held equal to a class name in ``policy.CLIENT_CLASSES_DEFAULT`` by a test, since
+# this module must not import ``policy``.
 LEGACY_CLIENT_CLASS = "sandbox"
 
 # The schema this code expects. Every entry in ``_STEPS`` below adds exactly one,
@@ -97,14 +93,12 @@ def _step_1_client_class(conn: sqlite3.Connection) -> None:
     are records, not constraints, and a row written before classes existed genuinely
     has no class — NULL says that, where backfilling a name would put a claim in the
     audit trail that nothing observed."""
-    # A REBUILD rather than an ADD COLUMN, because the constraint changes too:
-    # uniqueness becomes (pattern, client_class). The old column-level
-    # UNIQUE(pattern) would let one class's rule for a host block another's —
-    # `INSERT OR IGNORE` in ``resolve`` would silently write nothing, report the
-    # rule already present, and leave the second client held forever on a host the
-    # operator believes they approved. SQLite cannot drop a column-level constraint
-    # in place, so the table is rebuilt: the twelve-step procedure, minus the steps
-    # that only apply to foreign keys, triggers and views (this schema has none).
+    # A REBUILD rather than an ADD COLUMN, because uniqueness becomes (pattern,
+    # client_class). Under the old UNIQUE(pattern), one class's rule would block
+    # another's: `INSERT OR IGNORE` in ``api_approvals.resolve`` would write nothing and
+    # leave the second client held forever. SQLite cannot drop a column-level
+    # constraint in place, so this is the twelve-step procedure, minus the steps for
+    # foreign keys, triggers and views (this schema has none).
     conn.execute("DROP TABLE IF EXISTS rules_migrating")
     conn.execute("""
         CREATE TABLE rules_migrating (
@@ -139,12 +133,9 @@ def _step_1_client_class(conn: sqlite3.Connection) -> None:
 # `*_persist` (standing policy) — see control-plane/DESIGN.md, "A lease is the third
 # grant duration".
 #
-# ONE definition, shared by the v2 step and the fresh-store DDL, where the v1 rules
-# rebuild deliberately kept two near-copies. The difference is that this is a NEW
-# table: there is no constraint to change, so the step has no temporary table to
-# parameterize a shared string by, which was the whole reason `_step_1_client_class`
-# could not share one. Sharing here makes the divergence a test had to catch there
-# impossible instead.
+# ONE definition, shared by the v2 step and the fresh-store DDL. The v1 rules rebuild
+# could not share one, because its temporary table would have had to parameterize the
+# string; a new table has no such table, so here divergence is impossible, not tested.
 _LEASES_DDL = """
     CREATE TABLE IF NOT EXISTS leases (
         id           INTEGER PRIMARY KEY,
@@ -179,18 +170,15 @@ _LEASES_DDL = """
 def _step_2_leases(conn: sqlite3.Connection) -> None:
     """v2 — timed grants get their own table (``_LEASES_DDL``).
 
-    The cheapest shape a step can have: a new table, so nothing existing is read,
-    rewritten or constrained differently, and a store that has never leased anything
-    is fully migrated by creating it empty. Contrast ``_step_1_client_class``, which
-    had to rebuild the crown-jewel rules table to change a constraint.
+    The cheapest shape a step can have: a new table, created empty, so nothing
+    existing is read or rewritten.
 
     A separate table rather than an ``expires_at`` column on ``rules``, because the
-    rows are a different KIND — the same test that gave tool policy its own table
-    (DESIGN.md). The consequence that decided it: every existing reader of ``rules``
-    is a reader of standing policy, and a nullable expiry on it would mean the rules
-    view, the conflict check in ``resolve``, ``revoke_rule``, the edit path and
-    ``policy._decide`` each had to learn "except the expired ones" — five places to
-    drift instead of one new pass."""
+    rows are a different KIND (control-plane/DESIGN.md, "A lease is the third grant
+    duration"). Every reader of ``rules`` reads standing policy, and a nullable expiry
+    would make each of them — the rules view, ``api_approvals.resolve``'s conflict
+    check, ``api_egress.revoke_rule``, the edit path, ``policy._decide`` — learn
+    "except the expired ones"."""
     conn.execute(_LEASES_DDL)
 
 
@@ -198,16 +186,11 @@ def _step_3_tool_correlation(conn: sqlite3.Connection) -> None:
     """v3 — tool decisions become joinable: ``audit`` gains ``server``, ``tool`` and
     ``approval_id`` (the DDL in ``_init_db`` carries the reasoning).
 
-    Three ``ALTER TABLE ADD COLUMN``s and nothing else, which is the cheapest step
-    shape after ``_step_2_leases``: no constraint changes, so none of the twelve-step
-    rebuild ``_step_1_client_class`` needed. The loop and the message are modelled on
-    that step's own tail, which added ``client_class`` to these same tables.
+    Three ``ALTER TABLE ADD COLUMN``s and nothing else.
 
-    Existing rows keep NULL and are NOT backfilled. The values are derivable from
-    ``reason`` prose for some of them — but only some, and only by parsing a sentence
-    that has been reworded before. A column filled by re-reading old prose would put a
-    claim in the audit trail that nothing observed, which is the same objection that
-    kept ``client_class`` from being backfilled to a wildcard."""
+    Existing rows keep NULL and are NOT backfilled. Some values could be parsed out of
+    ``reason`` prose, but a column filled by re-reading old sentences would put a
+    claim in the audit trail that nothing observed."""
     added = [column for column in ("server", "tool", "approval_id")
              if column not in _columns(conn, "audit")]
     for column in added:
@@ -220,10 +203,9 @@ def _step_3_tool_correlation(conn: sqlite3.Connection) -> None:
 def _step_4_tool_status(conn: sqlite3.Connection) -> None:
     """v4 — ``audit.status``, for how a tool call ended (the DDL carries the reasoning).
 
-    Split from v3 rather than added with the other three, and the split was deliberate:
-    when the correlation columns landed nothing could write this one, and a column no
-    writer fills is schema that documents an intention rather than a record. It gets a
-    step of its own now that the gateway's stream exists to fill it."""
+    Its own step, added with its writer (the gateway's outcome stream) rather than
+    with v3's columns: a column no writer fills documents an intention, not a
+    record."""
     if "status" not in _columns(conn, "audit"):
         conn.execute("ALTER TABLE audit ADD COLUMN status TEXT")
         print("control-plane: added status to audit (existing rows keep NULL — they "
@@ -249,11 +231,6 @@ def _step_5_decision_to_kind(conn: sqlite3.Connection) -> None:
               "values were never decisions)", flush=True)
 
 
-# Ordered, and the order is the only thing that decides what runs: a step is applied
-# when its version exceeds the store's, so steps must be APPEND-ONLY and never
-# renumbered, reordered or edited once shipped — a store in the field has already run
-# the old body and will never run it again. Each entry is (version, label, function),
-# the label being what the operator sees in the log.
 def _step_6_persisted_pattern(conn: sqlite3.Connection) -> None:
     """v6 — ``approvals.pattern``, the rule a `persist` decision wrote (the DDL
     carries the reasoning). One nullable ``ALTER TABLE ADD COLUMN``, the cheapest
@@ -265,6 +242,11 @@ def _step_6_persisted_pattern(conn: sqlite3.Connection) -> None:
               "they predate the column)", flush=True)
 
 
+# Ordered, and the order is the only thing that decides what runs: a step is applied
+# when its version exceeds the store's, so steps must be APPEND-ONLY and never
+# renumbered, reordered or edited once shipped — a store in the field has already run
+# the old body and will never run it again. Each entry is (version, label, function),
+# the label being what the operator sees in the log.
 _STEPS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = (
     (1, "per-client-class policy", _step_1_client_class),
     (2, "timed grants (leases)", _step_2_leases),
@@ -280,24 +262,18 @@ def _migrate() -> None:
     ``CREATE TABLE IF NOT EXISTS`` block, so on a fresh store it applies nothing and
     the DDL below is the whole definition.
 
-    It exists because the store is a long-lived named volume that outlives container
-    and image churn, and ``CREATE TABLE IF NOT EXISTS`` is a NO-OP on an existing
-    table — so without this, a column added to the DDL would be missing on every
-    store created before it and every statement naming it would fail at runtime.
+    Why it cannot be skipped is the NOTE below ``_init_db``.
 
     The version lives in SQLite's own ``user_version`` header field rather than in a
-    table of ours. It needs no DDL to exist (so there is no bootstrap step that
-    itself needs migrating), it is written inside the same transaction as the step it
-    records, and it costs no query on the hot path — nothing reads it but this
-    function. Stores that predate the stamp are placed once by ``_detect_version``.
+    table of ours: it needs no DDL to exist (so nothing bootstraps it), it is written
+    in the same transaction as the step it records, and nothing on the hot path reads
+    it. Stores that predate the stamp are placed once by ``_detect_version``.
 
     Its own connection in AUTOCOMMIT mode with an explicit ``BEGIN``/``COMMIT``,
-    which is load-bearing rather than stylistic: Python's sqlite3 opens an implicit
-    transaction for DML only, so DDL issued on a default connection runs outside one.
-    The v1 rules rebuild drops a table, and a crash between the copy and the drop
-    with no transaction around them loses the crown-jewel policy rules. SQLite itself
-    has transactional DDL; this is what lets us use it — and it covers the stamp too,
-    so a failed step leaves the version where it was and the retry is the same run."""
+    which is load-bearing: Python's sqlite3 opens an implicit transaction for DML
+    only, so DDL on a default connection runs outside one, and a crash inside the v1
+    rules rebuild would lose the policy rules. The transaction covers the stamp too,
+    so a failed step leaves the version where it was."""
     with _connect() as conn:
         conn.isolation_level = None                   # explicit transaction control
         conn.execute("BEGIN IMMEDIATE")
@@ -346,13 +322,10 @@ def _init_db() -> None:
                 client_class TEXT NOT NULL DEFAULT '%s',
                 UNIQUE(pattern, client_class)
             )""" % LEGACY_CLIENT_CLASS)
-        # The servers whose tools `tool_rules` decides for. Compose DECLARES a server
-        # and a human brings the container up; this table is the other half of that
-        # split — which of the running servers is enabled, and how the gateway
-        # authenticates to it (DESIGN.md, "The control plane configures servers; it
-        # never starts them"). Nothing here starts anything, and nothing here grants:
-        # the row is configuration, and the credential it describes lives outside this
-        # store entirely.
+        # The servers whose tools `tool_rules` decides for: which running servers are
+        # enabled, and how the gateway authenticates to them (DESIGN.md, "The control
+        # plane configures servers; it never starts them"). Configuration only — the
+        # credential it describes lives outside this store.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS mcp_servers (
                 -- The name the gateway dials, which is also the container's name. The
@@ -463,13 +436,9 @@ def _init_db() -> None:
                 status       TEXT
             )""")
         conn.execute("CREATE INDEX IF NOT EXISTS audit_ts ON audit(ts)")
-        # This table grows without bound — every decision is kept, and only
-        # /api/audit's VIEW is windowed (see api_audit), never the record itself.
-        # That is deliberate: the trail is the artifact. There is no automatic
-        # rotation; an operator thins it on their own schedule with `make
-        # audit-prune`, which deletes rows past a retention window and VACUUMs to
-        # return the disk. The `audit_ts` index above is what keeps that DELETE cheap
-        # (and `make destroy` remains the separate, whole-store reset).
+        # The audit table grows without bound on purpose: only the VIEW is windowed
+        # (``api_views.api_audit``), never the record. An operator thins it with
+        # `make audit-prune`, which the `audit_ts` index above keeps cheap.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS approvals (
                 id          TEXT PRIMARY KEY,
@@ -503,9 +472,8 @@ def _init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS approvals_status ON approvals(status)")
         # Timed grants. No index: `policy._decide` reads this table only when no rule
-        # decided the request, and it holds at most a handful of rows — one per live
-        # lease, swept on the grant path (see the lease branch in `resolve`). An index
-        # on a table that small buys nothing and would be one more thing to keep true.
+        # decided, and it holds a handful of rows, swept on the grant path
+        # (``api_approvals.resolve``'s lease branch).
         conn.execute(_LEASES_DDL)
         # The tool surface's approvals, which split from the table above for the
         # reason the rules did: the rows are egress-shaped there — host, port, proto,
@@ -551,12 +519,10 @@ def _init_db() -> None:
             )""")
         conn.execute("CREATE INDEX IF NOT EXISTS tool_approvals_status "
                      "ON tool_approvals(status)")
-        # Ingest cursor for the egress proxy's audit file (see _drain_egress_audit).
-        # A NEW TABLE, deliberately — not a column on an existing one — so it needs
-        # no migration on the long-lived store (read the note below this function).
-        # `inode` is what distinguishes a rotated/replaced file from an appended one;
-        # without it a fresh file inherits the old offset and its first N bytes are
-        # never ingested.
+        # Ingest cursors, one per audit file the control plane tails (``ingest._drain``:
+        # the egress proxy's and the tool gateway's). `inode` tells a rotated file from
+        # an appended one; without it a fresh file inherits the old offset and its
+        # first N bytes are never ingested.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS audit_cursor (
                 path   TEXT PRIMARY KEY,
@@ -590,12 +556,10 @@ def _seed_if_empty() -> int:
     exists the store is authoritative and the file is never re-read.
 
     Every seeded rule is scoped to ``LEGACY_CLIENT_CLASS``, written EXPLICITLY rather
-    than left to the column default. The seed file is the agent's transitional
-    allowlist — package registries and GitHub, pending the cache and git paths (see
-    DESIGN.md) — so scoping it to the agent is what it means, and stating it here is
-    what keeps the file from quietly becoming policy for every future client
-    population. A seed entry for another class would need a syntax the file does not
-    have; that is a decision for whoever first needs one."""
+    than left to the column default: the seed file is the agent's transitional
+    allowlist (package registries and GitHub, pending the cache and git paths), and
+    must not quietly become policy for every client population. A seed entry for
+    another class would need a syntax the file does not have."""
     with _connect() as conn:
         if conn.execute("SELECT COUNT(*) FROM rules").fetchone()[0] > 0:
             return 0
@@ -631,12 +595,7 @@ def _printable(value: object) -> str:
 
 
 def _audit(kind: str, **fields) -> None:
-    # Agent-INFLUENCED fields (host/url/... arrive on /authorize from the proxy, which
-    # relays whatever the sandbox asked for) are truncated on write — the same
-    # trust-boundary cap the ingest path applies (DRAIN_MAX_FIELD). Without it a
-    # megabyte-long URL on a single request would bloat the crown-jewel store and the
-    # glanceable /api/audit list. Non-string fields (port) and the server-set decision
-    # pass through untouched.
+    # String fields are capped at DRAIN_MAX_FIELD, as the ingest path caps them.
     def cap(v):
         return v[:DRAIN_MAX_FIELD] if isinstance(v, str) else v
     with _connect() as conn:
@@ -651,15 +610,9 @@ def _audit(kind: str, **fields) -> None:
              cap(fields.get("server")), cap(fields.get("tool")),
              cap(fields.get("approval_id")), cap(fields.get("status"))))
         conn.commit()
-    # Mirror every decision to stdout so `docker compose logs -f control-plane`
-    # (make logs-cp) is a live decision feed — the same role the egress proxy's
-    # stdout audit plays. The SQLite table above stays the durable, queryable
-    # record (served at /api/audit); this line is for live viewing only. Compact
-    # and greppable: one line, empty fields omitted, reason after a ' :: '.
-    # The tool columns are mirrored too, so a grep for one approval id finds every row
-    # that belongs to it in the live feed — which is the whole point of the columns and
-    # would be lost if the stdout stream still only carried the id inside prose on the
-    # one row whose sentence happens to name it.
+    # Mirror every row to stdout, so `make logs-cp` is a live feed; the table stays
+    # the record. One greppable line: empty fields omitted, reason after ' :: ', and
+    # the tool columns included so a grep for one approval id finds all its rows.
     shown = " ".join(
         f"{k}={_printable(fields[k])}" for k in
         ("stage", "host", "port", "proto", "client", "client_class", "method", "url",

@@ -97,16 +97,26 @@ function payloadDisclosure(argsJson) {
 // text rather than parsing it, because a JSON.parse/stringify round trip is the
 // prettifier control-plane-ui/DESIGN.md forbids — it rounds integers past 2^53,
 // moves integer-like keys to the front and decodes `\u` escapes.
-function indentPayload(argsJson) {
+//
+// With `breaks`, the one exception: a `\n` inside a string becomes `↵` and a line
+// break, continuing one level deeper than the string's key so it cannot line up
+// with a field. Every other escape stays spelled out.
+function indentPayload(argsJson, { breaks = false } = {}) {
   const text = typeof argsJson === "string" ? argsJson : "";
   let out = "", depth = 0, inString = false;
   const newline = () => "\n" + "  ".repeat(depth);
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
     if (inString) {
-      out += ch;
-      if (ch === "\\") out += text[++i] ?? "";
-      else if (ch === '"') inString = false;
+      if (ch === "\\" && breaks && text[i + 1] === "n") {
+        out += "↵\n" + "  ".repeat(depth + 1);
+        i++;
+      } else if (ch === "\\") {
+        out += ch + (text[++i] ?? "");
+      } else {
+        out += ch;
+        if (ch === '"') inString = false;
+      }
     } else if (ch === '"') {
       out += ch;
       inString = true;
@@ -2112,7 +2122,7 @@ function start() {
     // the newlines indenting adds are control characters to payloadHazards.
     const disclosure = payloadDisclosure(a.args_json);
     const hazards = payloadHazards(a.args_json);
-    const raw = indentPayload(a.args_json);
+    const raw = indentPayload(a.args_json, { breaks: true });
     const escaped = indentPayload(hazards.escaped);
     const details = document.createElement("details");
     details.className = "payload";

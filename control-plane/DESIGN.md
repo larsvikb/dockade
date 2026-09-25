@@ -131,8 +131,9 @@ otherwise add later as an obvious improvement:
   grant scoped to "whoever we could not identify" covers a population rather than a
   client.
 
-Revocation is why the default is half an hour rather than the five minutes the feature
-was first sketched with. `POST /api/egress/leases/{id}/revoke` closes a grant early, so
+Revocation is why `CONTROL_LEASE_SECONDS` defaults long (the value is beside it in
+`control-plane/policy.py`) rather than to the few minutes a safety floor would want.
+`POST /api/egress/leases/{id}/revoke` closes a grant early, so
 the duration stopped being a safety floor and became an ergonomics number — long enough
 that an agent finishes what it was doing without a second card. The action is named
 `allow_lease` and not `allow_30m` for the same reason: the number is configuration, and
@@ -270,9 +271,10 @@ field set for that reason rather than for tidiness.
 
 **Duplicate holds share one card — and that changes what a click grants.** A retrying
 agent asks the same question repeatedly, and each attempt used to become its own card
-and its own slot. With `CONTROL_MAX_PENDING_PER_CLIENT` at 4, four retries filled the
-client's whole budget with copies of one question and the fifth was refused with no card
-at all — the failure the banner above exists to report, reached by the most ordinary
+and its own slot. With `CONTROL_MAX_PENDING_PER_CLIENT` at its default, as many
+retries as it allows filled the client's whole budget with copies of one question and
+the next was refused with no card at all — the failure the banner above exists to
+report, reached by the most ordinary
 behaviour an agent has. Identical holds now attach to the existing card, keyed on
 `(client, host, port, proto)`: `client` is in the key because approving one sandbox's
 request must not release another's, and `method`/`url` are out because they are exactly
@@ -340,8 +342,8 @@ recoverable from the constants:
   is already on the operator's screen.
 - **The defaults are chosen so every cap can fire first.** Cards are always ≤ waiters,
   so a card cap set equal to its waiter cap is dead code that no test would notice.
-  12/4 cards against 16/8 waiters keeps all four live, and a test asserts the
-  relationship rather than the numbers.
+  The defaults in `control-plane/holds.py` keep all four live — each card cap strictly
+  below its waiter cap — and a test asserts the relationship rather than the numbers.
 
 Zero means different things by scope, deliberately: on a global cap it refuses
 everything (fail-closed, and a plausible way to say "stop holding anything"), on a

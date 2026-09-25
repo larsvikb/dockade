@@ -26,6 +26,7 @@ silently reduce the Content-Security-Policy to decoration.
 """
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -73,7 +74,7 @@ const missing = ["lampState", "backoffDelay", "diffPending", "shouldSweep",
                  "timeWindow", "filterActive", "auditQuery", "eventRow",
                  "historyPager", "renderableHolds",
                  "toolRemaining", "payloadDisclosure", "payloadHazards",
-                 "escapePayload", "toolOutcomeMessage",
+                 "escapePayload", "indentPayload", "toolOutcomeMessage",
                  "cardSubject", "approvalNotices", "shouldNotify", "notifyButton",
                  "fmtTime", "fmtStamp", "fmtInstant",
                  "serverDescriptor", "serverPreview", "serverEditBody",
@@ -213,6 +214,19 @@ console.log(JSON.stringify({
     // Astral: JSON writes a surrogate pair, and so must the escaped form.
     hazards_astral: m.payloadHazards('{"title":"\ud83d\ude00"}'),
     hazards_missing: m.payloadHazards(undefined),
+    // Spelled the way holds._canonical_args writes a payload: sorted keys, no whitespace.
+    indent_flat: m.indentPayload('{"owner":"octo","repo":"hello"}'),
+    indent_nested: m.indentPayload('{"a":{"b":[1,2]},"c":[],"d":{}}'),
+    // Structural characters and escaped quotes INSIDE a string must not move it.
+    indent_tricky: m.indentPayload('{"q":"a, {b}: [c] \\"d\\" \\\\","z":1}'),
+    // Past 2^53, and an integer-like key after a word key: the two things a
+    // JSON.parse round trip would silently change.
+    indent_bignum: m.indentPayload('{"b":1,"2":12345678901234567891}'),
+    indent_escaped: m.indentPayload(
+      m.payloadHazards('{"repo":"safe\u202eevil"}').escaped),
+    indent_top_array: m.indentPayload('[{"a":1},"x"]'),
+    indent_scalar: m.indentPayload("null"),
+    indent_missing: m.indentPayload(undefined),
     short: m.payloadDisclosure('{"a":1}'),
     long: m.payloadDisclosure("x".repeat(m.PAYLOAD_FOLD_BYTES + 1)),
     at_fold: m.payloadDisclosure("x".repeat(m.PAYLOAD_FOLD_BYTES)).open,
@@ -907,6 +921,33 @@ console.log(JSON.stringify({
 """
 
 
+@functools.cache
+def _probe() -> dict:
+    if not _NODE:
+        raise AssertionError(
+            "node is not installed and DOCKADE_REQUIRE_TOOLS is set — refusing to "
+            "report success for the app.js tests, which are the only coverage that "
+            "file has. Install node, or drop strict mode to skip them knowingly.")
+    # _NODE comes from shutil.which (absolute path, no shell), and both arguments
+    # are repo paths — no untrusted input reaches the command line.
+    # TZ is PINNED, and not to UTC. The formatters render LOCAL time, so a UTC
+    # runner would let a UTC-vs-local mix-up pass unnoticed; a zone two hours off
+    # makes that mistake a failing assertion. The offset also has to be one whose
+    # local date differs from the UTC date for the sample instants below.
+    proc = subprocess.run(  # noqa: S603 (absolute path, fixed args — see above)
+        [_NODE, "-e", _PROBE],
+        env={**os.environ, "DOCKADE_APP_JS": str(APP_JS),
+             "TZ": "Europe/Stockholm"},
+        capture_output=True, text=True, timeout=60, check=False)
+    if proc.returncode != 0:
+        raise AssertionError(
+            "requiring control-plane-ui/app.js under node failed. The module must "
+            "be importable with NO side effects — everything that touches the DOM "
+            "belongs inside start(), which only runs in a browser. node said:\n"
+            + proc.stderr)
+    return json.loads(proc.stdout)
+
+
 @unittest.skipIf(not _NODE and not _STRICT,
                  "node is not installed — skipping app.js unit tests")
 class PageScriptTests(unittest.TestCase):
@@ -916,29 +957,7 @@ class PageScriptTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        if not _NODE:
-            raise AssertionError(
-                "node is not installed and DOCKADE_REQUIRE_TOOLS is set — refusing to "
-                "report success for the app.js tests, which are the only coverage that "
-                "file has. Install node, or drop strict mode to skip them knowingly.")
-        # _NODE comes from shutil.which (absolute path, no shell), and both arguments
-        # are repo paths — no untrusted input reaches the command line.
-        # TZ is PINNED, and not to UTC. The formatters render LOCAL time, so a UTC
-        # runner would let a UTC-vs-local mix-up pass unnoticed; a zone two hours off
-        # makes that mistake a failing assertion. The offset also has to be one whose
-        # local date differs from the UTC date for the sample instants below.
-        proc = subprocess.run(  # noqa: S603 (absolute path, fixed args — see above)
-            [_NODE, "-e", _PROBE],
-            env={**os.environ, "DOCKADE_APP_JS": str(APP_JS),
-                 "TZ": "Europe/Stockholm"},
-            capture_output=True, text=True, timeout=60, check=False)
-        if proc.returncode != 0:
-            raise AssertionError(
-                "requiring control-plane-ui/app.js under node failed. The module must "
-                "be importable with NO side effects — everything that touches the DOM "
-                "belongs inside start(), which only runs in a browser. node said:\n"
-                + proc.stderr)
-        cls.probe = json.loads(proc.stdout)
+        cls.probe = _probe()
 
     def test_every_helper_is_exported(self):
         # Guards the export block: dropping a name there silently disables its tests.
@@ -3979,9 +3998,100 @@ class PayloadHazardTests(PageScriptTests):
         # either tier.
         src = APP_JS.read_text()
         self.assertRegex(src, r'const danger = hazards\.level === "danger"')
-        self.assertRegex(src, r"pre\.textContent = danger \? hazards\.escaped : raw")
+        self.assertRegex(src, r"pre\.textContent = danger \? escaped : raw")
         self.assertRegex(src, r"box\.checked = danger")
-        self.assertRegex(src, r"box\.checked \? hazards\.escaped : raw")
+        self.assertRegex(src, r"box\.checked \? escaped : raw")
         self.assertRegex(src, r"details\.open = disclosure\.open \|\| danger")
         self.assertRegex(src, r'if \(hazards\.level !== "none"\)')
+
+
+def _unindent(text: str) -> str:
+    """Drop whitespace outside JSON string literals — the inverse of indentPayload on
+    a payload that had none to begin with."""
+    out, in_string, escaped = [], False, False
+    for ch in text:
+        if in_string:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            out.append(ch)
+            in_string = True
+        elif ch not in " \n":
+            out.append(ch)
+    return "".join(out)
+
+
+# What each `indent_*` probe was given.
+_INDENT_ORIGINALS = {
+    "indent_flat": '{"owner":"octo","repo":"hello"}',
+    "indent_nested": '{"a":{"b":[1,2]},"c":[],"d":{}}',
+    "indent_tricky": '{"q":"a, {b}: [c] \\"d\\" \\\\","z":1}',
+    "indent_bignum": '{"b":1,"2":12345678901234567891}',
+    "indent_escaped": '{"repo":"safe\\u202eevil"}',
+    "indent_top_array": '[{"a":1},"x"]',
+    "indent_scalar": "null",
+    "indent_missing": "",
+}
+
+
+@unittest.skipIf(not _NODE and not _STRICT,
+                 "node is not installed — skipping app.js unit tests")
+class PayloadIndentTests(unittest.TestCase):
+    """The card shows the payload one field per line, and adds nothing but whitespace.
+
+    The raw payload is the thing approved (control-plane-ui/DESIGN.md), so the
+    indented view has to be the same bytes with whitespace between tokens — never a
+    re-serialization that could round a number, move a key or decode an escape."""
+
+    probe: dict
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.probe = _probe()
+
+    def test_stripping_the_added_whitespace_gives_the_payload_back(self):
+        for key, original in _INDENT_ORIGINALS.items():
+            with self.subTest(key):
+                self.assertEqual(_unindent(self.probe["tool"][key]), original)
+
+    def test_each_field_is_on_its_own_line(self):
+        self.assertEqual(self.probe["tool"]["indent_flat"],
+                         '{\n  "owner": "octo",\n  "repo": "hello"\n}')
+
+    def test_nesting_indents_by_depth_and_empty_containers_stay_shut(self):
+        self.assertEqual(self.probe["tool"]["indent_nested"],
+                         '{\n  "a": {\n    "b": [\n      1,\n      2\n    ]\n  },\n'
+                         '  "c": [],\n  "d": {}\n}')
+
+    def test_structure_inside_a_string_is_left_alone(self):
+        self.assertEqual(self.probe["tool"]["indent_tricky"],
+                         '{\n  "q": "a, {b}: [c] \\"d\\" \\\\",\n  "z": 1\n}')
+
+    def test_numbers_and_key_order_are_the_payloads_own(self):
+        # Both of these change under JSON.parse: the integer rounds to
+        # 12345678901234567000, and "2" jumps ahead of "b".
+        self.assertEqual(self.probe["tool"]["indent_bignum"],
+                         '{\n  "b": 1,\n  "2": 12345678901234567891\n}')
+
+    def test_the_escaped_form_is_indented_without_decoding_it(self):
+        shown = self.probe["tool"]["indent_escaped"]
+        self.assertEqual(shown, '{\n  "repo": "safe\\u202eevil"\n}')
+        self.assertNotIn("‮", shown)
+
+    def test_a_missing_payload_is_empty(self):
+        self.assertEqual(self.probe["tool"]["indent_missing"], "")
+
+    def test_the_card_checks_the_payload_as_sent_and_indents_only_what_it_shows(self):
+        # The newlines indenting adds are `Cc` characters: checked after indenting,
+        # every payload would read as the danger tier and escape its line breaks.
+        src = APP_JS.read_text()
+        self.assertRegex(src, r"payloadHazards\(a\.args_json\)")
+        self.assertRegex(src, r"payloadDisclosure\(a\.args_json\)")
+        self.assertRegex(src, r"const raw = indentPayload\(a\.args_json\)")
+        self.assertRegex(src, r"const escaped = indentPayload\(hazards\.escaped\)")
 

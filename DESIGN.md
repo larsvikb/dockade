@@ -673,28 +673,27 @@ growing without anyone noticing.
 
 ### Egress proxy — the sole path off-box
 
-**The proxy and the compose split** (`docker-compose.yml` + `proxies/egress/`). The
-multi-container phase has begun, with a deliberate split the topology relies on:
-`docker-compose.yml` owns the **shared, long-lived infrastructure** (the data
-plane — the egress proxy at this step; the control plane + UI frontend and the
-profile-gated inference service joined as later steps landed), and the
-`run-*-sandbox.sh` launchers still
-launch the **ephemeral sandbox(es)** that attach to it (`docker run -it --rm`,
-one or many, each per-workspace with its own firewall/DNS/git wiring). Sandboxes
-are intentionally *not* compose services: they are interactive, disposable, and
-plural, which `compose run` models poorly.
+**The proxy and the compose split** (`docker-compose.yml` + `proxies/egress/`). A
+deliberate split the topology relies on: `docker-compose.yml` owns the **shared,
+long-lived infrastructure** — the egress proxy, the control plane and its UI
+frontend, the MCP gateway, the profile-gated inference service, with the MCP servers
+beside it in `mcp-servers.yml` — and the `run-*-sandbox.sh` launchers launch the
+**ephemeral sandbox(es)** that attach to it (`docker run -it --rm`, one or many,
+each per-workspace with its own firewall/DNS/git wiring). Sandboxes are
+intentionally *not* compose services: they are interactive, disposable, and plural,
+which `compose run` models poorly.
 
 The proxy itself is `mitmproxy` in regular (forward) mode with a policy/audit
 addon (`proxies/egress/addon.py`): **CONNECT-level, default-deny domain
 allowlist, per-connection JSON audit, no TLS interception** (HTTPS is tunnelled
 via `ignore_connection`, so no CA in the sandbox). The launcher discovers the
 proxy on `sandbox-net`, points the agent's `HTTPS_PROXY` at it, and allowlists it
-in the firewall (`EGRESS_PROXY_IP`). Chosen properties: it does **not** weaken the
-boundary while we validate — the allowlist is default-deny from the first commit, so
-arbitrary egress via the proxy is refused (not allow-all), and `boundary-check.sh`
-stays meaningful; and the allowlist was re-read per connection, a cheap stand-in for
-"dynamic" until the control plane existed (2a replaced the baked allowlist
-entirely — the proxy is a control-plane client now, see "A control-plane client" in
+in the firewall (`EGRESS_PROXY_IP`). Two properties are chosen rather than
+incidental. It does **not** weaken the boundary: the allowlist is default-deny, so
+arbitrary egress via the proxy is refused rather than allowed, and
+`boundary-check.sh` stays meaningful. And it bakes no allowlist of its own: the
+proxy is a control-plane client that asks on every connection, so an operator's
+edit applies to the next one (see "A control-plane client" in
 `proxies/egress/DESIGN.md`). Governs by **name**, so it closes the
 shared-CDN/fronting gap the IP firewall can't (for proxied traffic).
 
@@ -804,24 +803,23 @@ over-long labels that DNS and the rest of this proxy accept.
 ### Control plane — policy, audit, hold-for-approval
 
 **The backend and its isolation** (`control-plane/` + `control-net`). The
-governance authority now exists as a service the **agent cannot reach**: it is
-not on `sandbox-net`, so the sandbox has no route to it (`boundary-check.sh`
-probes the control plane's fixed control-net address and asserts it is
-unreachable from the sandbox; `make check` asserts the launcher never attaches
-the sandbox to any control network). In 2a it sat on `control-net`
-(internal) for the proxy control path and on `control-ui-net` for the human UI;
-2b-2 moved `control-ui-net` to the UI frontend, and the API-surface split moved
-the proxy's control path off `control-net` onto `authorize-net`, so the backend
-now spans the internal control nets and serves a different surface on each — one
-more of them since the MCP gateway got a bridge of its own (see below).
-That UI bridge is non-internal **by necessity** — Docker cannot publish a host
-port from a container that is on an internal network alone — but has masquerade
-disabled, so it carries the loopback UI publish without being an egress path.
-The control plane is a small FastAPI app over a SQLite policy+audit store (its own
-named volume — the crown-jewel state — seeded from `policies/egress-allowlist.txt` on
-first boot); the management surface reaches the host as **loopback only**
-(`127.0.0.1`, on the port `docker-compose.yml` publishes), published since 2b-2 by the
-UI frontend rather than the backend.
+governance authority is a service the **agent cannot reach**: it is not on
+`sandbox-net`, so the sandbox has no route to it (`boundary-check.sh` probes the
+control plane's fixed control-net address and asserts it is unreachable from the
+sandbox; `make check` asserts the launcher never attaches the sandbox to any
+control network). The backend is **triple-homed** (`control-net` + `authorize-net` +
+`tool-authorize-net`), every leg `internal`, and serves a different surface on each:
+the management API on `control-net`, the egress proxy's `/authorize` alone on
+`authorize-net`, the MCP gateway's bridge alone on `tool-authorize-net` (see below).
+The human UI is not the backend's to publish: `control-ui-net` belongs to the UI
+frontend. That bridge is non-internal **by necessity** — Docker cannot publish a
+host port from a container that is on an internal network alone — but has
+masquerade disabled, so it carries the loopback UI publish without being an egress
+path. The control plane is a small FastAPI app over a SQLite policy+audit store (its
+own named volume — the crown-jewel state — seeded from
+`policies/egress-allowlist.txt` on first boot); the management surface reaches the
+host as **loopback only** (`127.0.0.1`, on the port `docker-compose.yml` publishes),
+through the frontend and never the backend.
 
 *Design note — why the control path is more than one net, and the frontend split.*
 There are two kinds of net here and the distinction is what keeps the count from
@@ -832,34 +830,29 @@ share a bridge — that second rule is the one that costs a net each time, and i
 the property that a bypass of one enforcer reaches a policy query and not another
 enforcer's surface.
 
-`control-net` stays
-hard-`internal` because it is the **shared** control path for the whole governed
-data plane (the UI today; git/secrets proxies later), and egress is granted
-**only** by `egress-net` membership — a non-internal `control-net` would silently
-hand ungoverned egress to every service on it (see "Networks"). Publishing a host
-port, though, forces *some* non-internal surface, so `control-ui-net` quarantines
-it to a single-member bridge. Honest caveat: before 2b-2 — when the backend
-itself carried `control-ui-net`'s soft-egress surface — the split's security
-gain was ~nil, and collapsing to one non-internal `control-net` would have been
-observably equivalent; but that would have baked in a non-internal shared
-control path that becomes a real hole the moment a must-stay-egress-free tenant
-(secrets broker) joins. Keeping the split was cheap insurance against that
-footgun. **Done in 2b-2:** the UI is now a **distinct
+`control-net` stays hard-`internal` because it is the **shared** control path for
+the whole governed data plane (the UI today; git/secrets proxies later), and egress
+is granted **only** by `egress-net` membership — a non-internal `control-net` would
+silently hand ungoverned egress to every service on it (see "Networks"). Publishing
+a host port, though, forces *some* non-internal surface, so `control-ui-net`
+quarantines it to a single-member bridge, and the member is a **distinct
 `control-plane-ui` frontend container** (its own lifecycle) that depends on the
 `control-plane` backend and talks to it over `control-net`. The frontend owns the
-`control-ui-net` non-internal surface; the backend is now `control-net`-only and
-fully `internal`, so the crown-jewel container has **zero non-internal exposure**
-— the split now buys something concrete, not just future insurance. This is
-deliberately a **separate service**, not a co-located sidecar: the frontend is a
-stateless reverse proxy + static server (FastAPI + httpx), holds no state, and no
-governance decision depends on it (the egress proxy calls the backend directly).
+non-internal surface; every leg of the backend is `internal`, so the crown-jewel
+container has **zero non-internal exposure**. Had the backend carried the published
+port itself, the split would have bought nothing observable — and it would have
+baked in a non-internal shared control path, which becomes a real hole the moment a
+must-stay-egress-free tenant (secrets broker) joins. The frontend is deliberately a
+**separate service**, not a co-located sidecar: a stateless reverse proxy + static
+server (FastAPI + httpx), holding no state, with no governance decision depending
+on it (the egress proxy calls the backend directly).
 
 **The third net, `authorize-net`, and why the API surface is split.** The egress
-proxy is no longer on `control-net` at all. It sits on a single-conversation
-bridge to the control plane, and the control plane answers a *different surface*
-on each of its networks: the management API (approvals, `resolve`, the read-only
-views) on `control-net`, `POST /authorize` alone on `authorize-net`, and — added
-later, on the same principle — the gateway's bridge alone on `tool-authorize-net`.
+proxy is not on `control-net` at all. It sits on a single-conversation bridge to
+the control plane, and the control plane answers a *different surface* on each of
+its networks: the management API (approvals, `resolve`, the read-only views) on
+`control-net`, `POST /authorize` alone on `authorize-net`, and, on the same
+principle, the gateway's bridge alone on `tool-authorize-net`.
 
 The reasoning is about which failure is worth designing around. The dangerous
 endpoint is `resolve`, because it is what grants egress — a caller that reaches it
@@ -1078,14 +1071,15 @@ stays here is why the frontend is a container of its own, when a lease stops cou
 and what no guard in a browser can do.
 
 **Why the frontend is a separate container.** The approval UI and the API/SSE relay
-now live in a distinct **`control-plane-ui`** container (FastAPI + httpx: serves
-the static UI at `/`, reverse-proxies everything else — including the SSE stream
-— to the backend over `control-net`). The **backend is now `control-net`-only
-and fully `internal`**: no published port, no non-internal surface, nothing to
-exfiltrate even if reached. The frontend carries the sole host-facing surface
-(`control-ui-net`), holds no state, and is not on `sandbox-net`. Browsers hit the
-published loopback port → frontend → backend; the egress proxy still calls the
-backend's `/authorize` directly. See the step-2a design note for the rationale.
+live in a distinct **`control-plane-ui`** container (FastAPI + httpx: serves the
+static UI at `/`, reverse-proxies everything else — including the SSE stream — to
+the backend over `control-net`). The **backend is `internal` on every leg**: no
+published port, no non-internal surface, nothing to exfiltrate even if reached. The
+frontend carries the sole host-facing surface (`control-ui-net`), holds no state,
+and is not on `sandbox-net`. Browsers hit the published loopback port → frontend →
+backend; the egress proxy calls the backend's `/authorize` directly. The rationale
+is under "Design note — why the control path is more than one net, and the frontend
+split".
 
 **A lease bounds authorization, not connection lifetime.** The egress proxy authorizes
 **once per CONNECT tunnel** (`http_connect` in `proxies/egress/addon.py`), and the SNI
@@ -1632,10 +1626,9 @@ identifier is left unresolved — is the page's own code, and is designed in
   The proxy has no side effects to strand, which is why this appears for the first
   time here. **Answering an `ask` immediately removes it** (see "An `ask` answers
   immediately"): nothing is held open, so there is no caller to lose and no
-  disconnect to cancel on. The earlier plan — cancel on disconnect and keep the hold
-  window under the client timeout — was written for a blocking gateway and does not
-  apply; the timers that killed it are in NOTES.md (documented, not measured — see
-  "An `ask` answers immediately").
+  disconnect to cancel on. A blocking gateway would have to cancel on disconnect and
+  keep its hold window under the client timeout, and the timers that rule that out
+  are in NOTES.md (documented, not measured — see "An `ask` answers immediately").
 - **The response is the channel.** The gateway governs the *request*, but what steers
   an agent is the third-party text arriving in its context — an `allow`-ed,
   read-only tool is unaudited intake of the same shape as WebSearch, and content in

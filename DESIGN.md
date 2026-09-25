@@ -2129,8 +2129,9 @@ shares with tier 1". What is open here:
 - Docs mirror / offline docs tool.
 - Progressive auto-approval driven by accumulated policy + audit history.
 - **Human-presence on approval (WebAuthn user-presence, or an out-of-band confirm).**
-  The *only* thing that closes host-local forgery of an approval — see the
-  browser-facing-guards note under "Approval UI". Worth building for that specific
+  The *only* thing that closes host-local forgery of an approval — see "Browser-facing
+  guards on the frontend (and their honest limit)" in `control-plane-ui/DESIGN.md`.
+  Worth building for that specific
   threat (the agent reaching host execution via the workspace mount), not because "the
   UI has no auth"; naive auth does not help, since any credential at rest on the host is
   readable by the same process. The MCP gateway raises the stakes of this item without

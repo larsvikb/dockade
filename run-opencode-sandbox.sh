@@ -14,7 +14,7 @@
 #
 # That makes this the strongest available test of the containment boundary: run
 # boundary-check.sh inside it and everything should fail except the inference
-# service. See DESIGN.md "Local inference".
+# service. See opencode-sandbox/DESIGN.md "Verified empirically, not asserted".
 #
 # --build-only builds the image and exits WITHOUT launching; implies a rebuild.
 # --no-cache forces a from-scratch build; implies a rebuild.

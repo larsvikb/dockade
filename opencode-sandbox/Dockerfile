@@ -94,7 +94,8 @@ ENV EDITOR=vim \
 # ("npm": "@ai-sdk/openai-compatible" in the config below). At runtime this tier
 # has no egress, so an unwarmed fetch would fail on first use — install it here,
 # where the network is available. Verified empirically that a warmed opencode
-# completes a request with no egress; see DESIGN.md "Local inference".
+# completes a request with no egress; see opencode-sandbox/DESIGN.md "Runtime deps
+# are baked at build time".
 # npm's default global prefix is root-owned (/usr/lib/node_modules), so a `-g`
 # install as the non-root user fails with EACCES. Point the prefix at the user's
 # ~/.local instead — already on PATH above, and the same place tier 1 puts Claude

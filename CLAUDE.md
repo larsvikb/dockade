@@ -64,7 +64,7 @@ wrong.** Getting this wrong is how `DESIGN.md` grew a 616-line section called
 | **`DESIGN.md`** | a decision or invariant that constrains *this* repo | rots if it restates the others |
 | **`NOTES.md`** | evidence: measurements, environment behaviour, dead ends | low — facts about the world |
 | **`CLAUDE.md`** | an invariant or convention to follow *while working* | rots fastest — keep it lean |
-| **a component's `DESIGN.md`, `NOTES.md`** (`opencode-sandbox/`) | as the root pair, when every *why* is that component's code; reasoning across components stays in the root | as the root pair |
+| **a component's `DESIGN.md`, `NOTES.md`** (every component with a `DESIGN.md` beside its code) | as the root pair, when every *why* is that component's code; reasoning across components stays in the root | as the root pair |
 | **a component's `CLAUDE.md`** (`control-plane/CLAUDE.md`) | how to work in *that* component: its checklists, as pointers | as `CLAUDE.md`; loads only once a file beside it is read |
 
 Consequences worth stating, because each was learned by violating it:
@@ -85,7 +85,7 @@ Consequences worth stating, because each was learned by violating it:
 - **Numbers in prose rot.** Don't restate a test count or a version a command
   reports; name the command.
 - **A doc claim with a machine-checkable counterpart gets a guard.**
-  `tests/test_docs.py` holds the derivable ones — the `DESIGN.md` network roster
-  against compose, `**N-homed**` claims against a service's real legs, backticked
-  repo paths, and in-document anchors. Prose only a human can judge stays out of
-  it: a guard that needs appeasing gets deleted, and takes the useful ones along.
+  `tests/test_docs.py` holds the derivable ones — a claim about compose, a path, an
+  anchor, a quoted section name, a cited test or target — each class with its reason
+  in its docstring. Prose only a human can judge stays out of it: a guard that needs
+  appeasing gets deleted, and takes the useful ones along.

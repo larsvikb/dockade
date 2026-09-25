@@ -42,7 +42,8 @@ the repo follows from "containment is by **capability**, not configuration."
   [Server-side execution blind spots](#server-side-execution-accepted-governance-blind-spots)
 - [Capability inventory](#capability-inventory-v1) ·
   [Governance surfaces](#governance-surfaces)
-  (egress proxy · control plane · approval UI · [MCP gateway](#mcp-gateway--governed-tool-capability))
+  (egress proxy · control plane · [client class](#policy-is-scoped-to-a-client-class) ·
+  approval UI · [MCP gateway](#mcp-gateway--governed-tool-capability))
 - [Startup ordering](#startup-ordering--running-is-not-ready) ·
   [Resource limits](#resource-limits--blast-radius-not-boundary) ·
   [Local inference](#local-inference--an-ungoverned-llm-tool)

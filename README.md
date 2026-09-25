@@ -249,7 +249,8 @@ dockade/
                             #   class; (host, class) -> allow/deny/hold
     holds.py                #   the in-process registry a held request blocks on
     inventory.py            #   what each server exposes, as the gateway last reported it
-    ingest.py               #   drains the proxy's and the gateway's audit streams in
+    ingest.py               #   drains the proxy's and the gateway's audit streams into
+                            #   the store — rows and cursor advance in one transaction
     requirements.txt        #   pinned deps (fastapi, uvicorn)
     CLAUDE.md, DESIGN.md    #   how to work here; the approval flow's design
   control-plane-ui/         # UI FRONTEND — serves the UI + reverse-proxies the API

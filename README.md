@@ -19,24 +19,12 @@ the sandbox is deliberately impoverished: no direct network egress beyond a
 strict allowlist, non-root user, dropped Linux capabilities, no host Docker
 socket, and (by design) no route to a control plane.
 
-> **Status: multi-container, control plane step 2c.** The sandbox lives on an
-> internal network with **no direct egress**; a governed **egress proxy** is the
-> sole path off-box, and it defers every decision to a **control plane** the
-> agent cannot reach (policy + audit in SQLite). An unknown host is **held for
-> approval** — a human approves/rejects it in a live UI (backend fully internal;
-> a separate `control-plane-ui` frontend carries the loopback UI). The backend's
-> API surface is **split across internal networks**, one bridge per enforcer, so
-> each can ask its own policy question and none of them can reach the approvals
-> API at all. There are now
-> **two sandbox tiers** sharing one boundary implementation: tier 1 (Claude,
-> governed egress) and tier 2 (opencode against a local LLM, no egress and no
-> credentials). The audit trail is **browsable** — filters over the folded glance,
-> and a paged record view of every decision — and standing policy is **fully
-> mutable**, a rule's pattern or action changeable in one audited operation. The
-> **MCP gateway** is built and tier 1 is pointed at it: third-party tools reach the
-> agent only through per-tool allow/deny/ask policy, with a held ask resumed by id
-> once a human answers. Still to come per [`DESIGN.md`](DESIGN.md): the git/cache
-> data-plane services. See [Roadmap](#roadmap).
+> **Status.** The sandbox has no direct egress: a governed **egress proxy** is the
+> sole path off-box, and it defers every decision to a **control plane** the agent
+> cannot reach, where a human approves an unknown host in a live UI and every
+> decision is audited and browsable. Third-party tools reach the agent only through
+> the **MCP gateway**, under per-tool allow/deny/ask policy. What has landed and what
+> is still planned is one table, [`DESIGN.md` → "Status"](DESIGN.md#status).
 
 ## Quickstart
 
@@ -66,8 +54,9 @@ audit). Standalone needs kernel ipset support, which stock WSL2 kernels lack —
 there, bring the infra up and use the proxy path. With the infra up, the launcher auto-detects the proxy, routes the
 sandbox's HTTP(S) through it, and allowlists it in the firewall. You can start
 **several sandboxes** against one proxy — each gets a unique name (override with
-`SANDBOX_NAME`). Audit trail: `docker compose logs -f egress-proxy` (or the
-`dockade-egress-audit` volume).
+`SANDBOX_NAME`). Held requests are approved, and the audit trail browsed, in the UI
+at `http://localhost:28090` (the default `DOCKADE_UI_PORT`); the raw stream is
+`docker compose logs -f egress-proxy` (or the `dockade-egress-audit` volume).
 
 On first run the image builds and you'll be dropped into a shell in the
 container. **Authenticate once** by starting Claude Code and completing the
@@ -314,54 +303,14 @@ dockade/
 
 ## Roadmap
 
-The target architecture (see [`DESIGN.md`](DESIGN.md)) is a multi-container
-setup with the agent on an isolated network and all meaningful capability
-exposed through governed data-plane services. Next steps toward it:
-
-1. **Egress HTTP(S) proxy** — *done* (`docker-compose.yml` + `proxies/egress/`):
-   a CONNECT-level domain allowlist with per-connection audit, and (step 1) the
-   **sole** egress path — `sandbox-net` is `internal: true` with the proxy's
-   internet leg on `egress-net`.
-2. **Control plane** — *step 2a done* (`control-plane/`): a FastAPI + SQLite
-   governance authority the **agent cannot reach** — it lives only on internal
-   networks the sandbox is not attached to. The UI is reachable from the host
-   browser at `http://localhost:28090` (the default `DOCKADE_UI_PORT`). The egress proxy asks it
-   `POST /authorize` per connection — one call that both decides policy and
-   records audit — with the Anthropic lifeline allowed locally so a control-plane
-   outage never bricks the agent, and everything else failing closed.
-   **Step 2b done:** an unknown host is **held for approval** — the request blocks
-   while a human approves/rejects it in a live SSE UI (allow/deny, once or
-   persist-as-rule), defaulting to deny after a timeout (2b-1). The card counts
-   down to that default-deny, and a persist names the rule it will write and asks
-   twice, with exact-host-vs-subdomain-wildcard chosen by the operator from a set
-   the backend derives and validates. The UI is a distinct `control-plane-ui`
-   frontend on `control-net`; the backend is fully internal and reachable only
-   through it (2b-2). **2b-3:** the backend's API surface is split across two
-   internal networks — the egress proxy is on `authorize-net` and can reach
-   `POST /authorize` and nothing else, while the management API (approvals,
-   `resolve`, the read-only views) is served on a separate port bound to the
-   `control-net` address alone. The proxy's relay guard is best-effort against DNS
-   rebinding, so the design assumes it can be beaten and makes the far side worth
-   little: even a total bypass yields a policy *query*, never a self-approval.
-   Every rule is scoped to a **client class** — the ingress network the caller
-   reached the proxy on — so a host approved for the agent is still unknown to an
-   MCP server container and is held the first time one asks; a single allowlist
-   would otherwise become the union of every client's needs.
-   **2c-1 done:** the audit trail is **browsable**. The decisions view takes filters
-   (free-text search, a decision facet, a relative time window) and offers a second
-   view of the same table — one row per decision instead of the folded glance, with
-   the request itself and cursor paging back through the whole record. Reading the
-   log no longer means `docker compose exec` and SQL against the crown-jewel volume.
-   **2c-2 done:** standing policy is fully mutable — a rule's pattern or action can be
-   changed in one audited operation carrying both states, rather than a revoke and a
-   create that leave two half-rows and a window where the host is neither allowed nor
-   blocked. **MCP gateway done:** third-party tools reach the sandbox only through
-   it, under per-tool allow/deny/ask; an `ask` answers the agent at once with a
-   pending id, and the call runs only when a human has approved it and the agent
-   resumes it. How each call ended is recorded and ingested beside the decision.
-3. **Skills + quality-gate hooks** in the image — the enablement half of the
-   paved road.
-4. **Pull-through package cache** — fast, governed dependency installs.
+The target architecture (see [`DESIGN.md`](DESIGN.md)) is a multi-container setup
+with the agent on an isolated network and all meaningful capability exposed through
+governed data-plane services. The governance half is built: the egress proxy, the
+control plane with its approval UI, and the MCP gateway. Still ahead is the
+enablement half of the paved road — **skills and quality-gate hooks** in the image
+and a **pull-through package cache** — beside the governed git path. Which step is
+which, and what each one landed, is one table:
+[`DESIGN.md` → "Status"](DESIGN.md#status).
 
 ## Documentation
 

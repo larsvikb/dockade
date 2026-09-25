@@ -445,9 +445,9 @@ def _forbidden_reason(host: str) -> str | None:
     port gate (the control plane listens on :8090 and :8091; CONNECT/HTTP are
     gated to :443/:80), so a rebound name is dialed on a port nothing serves — and
     if all of that failed, the API-surface split leaves this container able to
-    reach an /authorize listener and nothing else. See DESIGN.md "Control-plane
-    relay guard". The startup ``_assert_guard_configured`` refuses to run with the
-    CIDR check disabled, so this is never silently off."""
+    reach an /authorize listener and nothing else. See proxies/egress/DESIGN.md
+    "Control-plane relay guard". The startup ``_assert_guard_configured`` refuses
+    to run with the CIDR check disabled, so this is never silently off."""
     return _forbidden_static(host) or _forbidden_resolved(host)
 
 

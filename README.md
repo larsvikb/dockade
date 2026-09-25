@@ -286,6 +286,7 @@ dockade/
     egress/                 # CONNECT-level egress proxy: control-plane client
       Dockerfile            #   mitmproxy + the policy/audit addon
       addon.py              #   per-connection /authorize + local audit stream
+      DESIGN.md             #   the relay guard and the proxy's side of /authorize
   sandbox-common/           # ONE boundary implementation, shared by every tier
     entrypoint.sh           # root: firewall + config, then drops to non-root
     init-firewall.sh        # default-deny egress firewall (governed/local/standalone)
@@ -374,6 +375,8 @@ exposed through governed data-plane services. Next steps toward it:
   approval flow: how a card grants, holds under load, the audit views, standing policy.
 - [`control-plane-ui/DESIGN.md`](control-plane-ui/DESIGN.md) — the approval page: its
   browser boundary, how it keeps a failing state visible, and its tests.
+- [`proxies/egress/DESIGN.md`](proxies/egress/DESIGN.md) — the egress proxy: what its
+  relay guard refuses before policy is asked, and how it asks the control plane.
 - [`CLAUDE.md`](CLAUDE.md) — the invariants that must never be violated and the
   conventions for working in this repo.
 - [`SECURITY.md`](SECURITY.md) — how to report a boundary bypass, and — worth

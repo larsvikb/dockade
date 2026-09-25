@@ -472,8 +472,8 @@ implementation detail:
   `(ts, id)`, and serves the columns the glance drops. An offset would have been
   simpler and wrong: this table takes an insert per governed request, so
   `LIMIT/OFFSET` drops rows between pages exactly while something interesting is
-  happening, and a `ts`-only cursor mis-pages on the tie a single held request
-  produces (a `hold` row and its outcome, with no guarantee the clock advanced).
+  happening, and a `ts`-only cursor mis-pages whenever two rows share a timestamp,
+  which nothing rules out (`time.time()` need not advance between two writes).
 
 Three consequences worth stating because each was a choice against the obvious one.
 **A view searches exactly what it displays** — the same discipline the group key

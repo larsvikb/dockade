@@ -3992,6 +3992,21 @@ class ToolCorrelationColumnTests(_ToolBridgeTestCase):
                 self.assertEqual(row["server"], "mcp-github")
                 self.assertEqual(row["tool"], "create_pull_request")
 
+    def test_every_row_of_one_ask_carries_the_same_client_class(self):
+        # Filtering the audit by class must not drop the human's decision: the hold
+        # and the answer both belong to the one agent that asked.
+        _tool_rule("create_pull_request", "ask")
+        approval_id = _tool_call(tool="create_pull_request",
+                                 args={"title": "x"})["approval_id"]
+        _resolve(approval_id, "deny")
+        with cp.store._connect() as conn:
+            rows = conn.execute("SELECT stage, client_class FROM audit "
+                                "WHERE approval_id=?", (approval_id,)).fetchall()
+        self.assertEqual({r["stage"] for r in rows}, {"tool-call", "tool-ask"})
+        classes = {r["client_class"] for r in rows}
+        self.assertEqual(len(classes), 1, classes)
+        self.assertIsNotNone(classes.pop())
+
     def test_a_decided_call_names_its_tool_without_an_approval(self):
         # `allow` and `deny` answer immediately, so there is no id to carry — and the
         # server/tool pair still has to be a column, because "everything that touched

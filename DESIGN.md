@@ -817,10 +817,11 @@ more of them since the MCP gateway got a bridge of its own (see below).
 That UI bridge is non-internal **by necessity** — Docker cannot publish a host
 port from a container that is on an internal network alone — but has masquerade
 disabled, so it carries the loopback UI publish without being an egress path.
-The control plane is a small FastAPI app over a SQLite policy+audit store (its
-own named volume — the crown-jewel state); the management surface reaches the
-host as **loopback only** (`127.0.0.1`, on the port `docker-compose.yml` publishes),
-published since 2b-2 by the UI frontend rather than the backend.
+The control plane is a small FastAPI app over a SQLite policy+audit store (its own
+named volume — the crown-jewel state — seeded from `policies/egress-allowlist.txt` on
+first boot); the management surface reaches the host as **loopback only**
+(`127.0.0.1`, on the port `docker-compose.yml` publishes), published since 2b-2 by the
+UI frontend rather than the backend.
 
 *Design note — why the control path is more than one net, and the frontend split.*
 There are two kinds of net here and the distinction is what keeps the count from
@@ -1419,6 +1420,70 @@ own rather than a scope on `rules`, tool asks in their own approvals table, and 
 pending queue for both surfaces — is the control plane's own code, and is designed in
 `control-plane/DESIGN.md` → "The tool surface: its own tables, the one queue".
 
+**The control plane learns a server's tools from the gateway, never by
+scanning `mcp-net`.** Before it did, a `tool_rules` row was a name an operator typed
+and nothing checked it against anything. That was safe — a missing rule denies, so a
+misspelled rule and an unwritten one fail the same closed way — but blind in both
+directions: no list to pick a name from, and a typo indistinguishable from a
+deliberate deny. The gateway is the only component that can
+close this, because it is the only one that ever talks to a server; it already
+dials each enabled server by name on its roster poll, and `tools/list` is the same
+trip. What comes back is operator-facing metadata and **never an input to
+`policy._decide_tool`** — the names and descriptions are server-authored, they would
+render in the control plane's own UI, and a discovered tool that could write its own
+rule is a server granting itself capability.
+Discovery runs only on *enabled* servers, since disabling means the gateway
+stops dialling — so an operator enables before seeing the tool list, which is safe
+only because the deny default makes an enabled server with no rules able to do
+nothing. The rejected alternative is a subnet sweep. Its fatal form is taking the
+name from the server's own answer, which under name-keyed policy lets a server
+choose its rules; Docker's reverse DNS may well supply an honest name instead, and
+it is still the wrong shape, because no MCP port convention exists (8082 is GitHub's
+image default) so a sweep means probing guessed ports across containers holding
+write-capable credentials, and registering by existence would put anything that
+reaches `mcp-net` in front of an operator as a candidate. **The mismatch audit is a
+separate report:** the gateway reports a rule naming a tool the server does not
+expose, and a tool no rule decides — which needs no store, no new endpoint, and no
+server-authored text in the crown jewel, and which runs beside the inventory rather
+than having been replaced by it.
+
+**The tool inventory lives in memory, arrives by push, and is audited
+only when it changes.** The gateway is the only component that can see what a server
+exposes, so it reports; the control plane holds the result for an operator choosing
+rules and for nothing else. **In memory, never stored** — it is derived data,
+rebuildable by asking the servers again, and a stored copy would both outlive a
+server that has been gone for a week while reading as current and put server-authored
+text into `make backup`, which is the operator's own decisions and nothing else.
+**Pushed, because a pull is impossible**: this process has no leg on the gateway's
+networks and must not be given one, since dialling the agent-facing service from the
+crown jewel is the lateral edge the gateway's bind guard exists to prevent. That
+makes `/tool/inventory` the only WRITE on that bridge, and the criterion keeping the
+bridge's width honest survives intact — it records a claim that `_decide_tool` never
+reads, so a tool arriving on it is denied exactly as it was before. **Audited on
+CHANGE**, not per push: a push lands whenever the roster moves, and a row each time
+would bury the one worth keeping — a server's surface growing without a human in the
+loop is a supply-chain event. Rows carry tool NAMES, which `policy._TOOL_RE` bounds,
+and never descriptions, which nothing bounds. Two distinctions are load-bearing
+enough to name: a server that could not be enumerated keeps its last known surface
+rather than reading as one that exposes nothing, and a tool whose name falls outside
+`_TOOL_RE` is dropped but counted, because no rule could ever be written for it.
+
+**A server enters the store because an operator registered it, not
+because a file declared it.** Seeding from a file was considered and set
+aside rather than rejected. Reading `mcp-servers.yml` directly means a YAML parser
+in the component whose compromise is total, parsing a document almost none of which
+concerns it, and coupling the control plane to a compose file's format; a small
+purpose-built seed file avoids all three and is this repo's existing idiom, but
+costs two files per server plus a drift guard to remove one typing step. What
+decides it for now is that seeding removes only the *register* call: `enabled`
+stays an operator decision under every option, so the UI surface is the same either
+way, and building the registration path answers the question while leaving it open.
+The accepted cost is that the name is typed against nothing — this container cannot
+enumerate what is running — so a typo registers a server the gateway finds nothing
+behind. That is tolerable **because** the gateway's discovery report names it as
+`NOT ENUMERATED` within one interval; without that report this decision would be
+the wrong one.
+
 **An unconfigured tool is denied and reported, not held — a deliberate divergence
 from the egress proxy.** There, an unmatched host is held because the set of hosts
 is unbounded and discovered at runtime; default-deny without a human would make the
@@ -1452,6 +1517,8 @@ tool ask pins no threadpool worker and does not draw on `MAX_WAITERS`, whose who
 purpose is that a slow decision must never starve the `/authorize` path the agent
 depends on to work at all. And the gateway answers the *agent* immediately too, with
 a **pending result** naming the approval, rather than holding the MCP call open.
+Nothing is held open at either end, so there is nothing to withdraw: no stranded
+caller exists to cancel.
 
 Blocking the agent was available — a per-server `timeout` raises the first-byte timer
 to match, so a long wait is configurable — and is rejected on the shape of the limit
@@ -1644,6 +1711,40 @@ in its image, which is a real cost when choosing the next one.
 GitHub server's `--read-only` was silently inert in `http` mode through v0.32.0 (fixed
 in v0.33.0) — write tools stayed in `tools/list` and executed. Set them anyway; rely on
 the gateway's deny state, and verify `tools/list` rather than the flag.
+
+**The MCP gateway owns repo writes.** The governed git path is scoped to
+clone/fetch. Two governed roads to "write to a repo" under different policy
+models is a hole, because an actor — or a confused agent — takes the weaker one,
+which is why this was decided before either path existed rather than after both
+did. The earlier inclination was the opposite one — a branch and force-push policy
+wants to see refs, not JSON — and what overturns it is that **the REST write set
+cannot express the destructive operations that policy exists to catch**: a
+create-or-update-file style tool appends a commit and fails on a stale blob sha,
+and nothing in the set rewrites history or deletes a ref. A wire proxy would be
+enforcing against operations the surviving path cannot perform. Nor could it have
+owned writes alone whatever else was decided, because `merge_pull_request` moves
+the ref **server-side** where nothing watching the wire sees it. The cost, because
+it is real: the API path writes **new** commits from file contents rather than
+pushing ones already made locally, so a branch must never be written both ways.
+Three consequences, in the order they bite. `GITHUB_READ_ONLY` flips off **with the
+gateway and not before** — until something fronts the server that flag is the only
+thing narrowing it — after which the gateway's `deny` is the whole boundary, which
+is what "a server's own restriction flags are defence in depth" has to survive. It
+has not flipped yet: `mcp-servers.yml` still defaults it on, so the write set is not
+offered, and turning it off is the step that makes the rest of this bullet live
+(see "Status"). Per-tool repo scoping stops being optional, putting the unmeasured
+`x-mcp-header` override question (NOTES.md) on the gateway's critical path. And a
+dispatcher tool means one name decides several operations, so the argument-shaped
+`ask` ladder is needed for the write set rather than deferrable past it.
+`merge_pull_request` is denied outright: merging stays the human's step, as pushing
+is today.
+
+*Reasoned from the REST surface, not measured.* The write tools are enumerable —
+`make mcp-tools SERVER=github` with `GITHUB_MCP_READ_ONLY=0` prints their schemas —
+and confirming this before allowing any of them is cheap. `push_files` is the one
+to look at first and the reason this is flagged rather than asserted: it builds a
+commit through the Git Database API, where a ref update *can* carry `force`, so it
+is the single tool in the set that could falsify the paragraph above.
 
 **Telling the sandbox it exists: `--mcp-config` + `--strict-mcp-config`, from the
 launcher.** Four channels can declare an MCP server, and the choice is not a matter
@@ -1865,10 +1966,6 @@ mode, so the proxy is not merely unused but unreachable.
   give its network a class in `policy.CLIENT_CLASSES` and its rules are its own
   (see "Policy is scoped to a client class"). Still not needed until a worker task
   needs to fetch something.
-- **RESOLVED — per-client-class policy.** Shipped: rules, audit rows and approvals
-  carry a client class, keyed on the ingress network. What remains open from this
-  item is only the *worker* half above — an unattended tier's posture differs in
-  its approval semantics, not in how its rules are scoped.
 - **Where does worker output go, and is it audited?** An unattended job's output
   *is* its consequential action, but with no egress there is nothing at the
   network choke point to log. "Everything consequential is audited" currently has
@@ -2032,140 +2129,17 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
 
 ## Open decisions
 
-- **RESOLVED — control-plane stack is Python (FastAPI) over SQLite.** Shipped in
-  2a (`control-plane/`): FastAPI app, stdlib `sqlite3` store, plain `def`
-  endpoints (FastAPI's threadpool keeps the blocking DB off the event loop). The
-  SSE approval UI shipped with 2b-1 and moved to the separate `control-plane-ui`
-  app in 2b-2. `mitmproxy` remains the egress-proxy engine.
+The unattended worker tier's questions are kept with it, under "Tier 2, and what it
+shares with tier 1". What is open here:
+
 - **HTTPS inspection depth** — CONNECT/SNI (domain-level, no CA in sandbox) vs
   full MITM (URL/body-level, needs a generated CA in the sandbox). Likely start
   CONNECT-level, allow MITM per-domain later. Both are documented-supported by
   the CLI (MITM via `NODE_EXTRA_CA_CERTS` / `CLAUDE_CODE_CERT_STORE`, in `NOTES.md`
   → "Claude Code honours `HTTPS_PROXY`, and WebFetch inherits it"), so the choice is
   ours, not gated by tool support.
-- **RESOLVED — policy storage is SQLite** (2a), in its own named volume
-  (`dockade-control-state`), seeded from `policies/egress-allowlist.txt`.
 - **Web search backend** — which third-party search API for the `websearch`
   skill (Brave / SerpAPI / Google CSE).
-- **RESOLVED — a tool `ask` is registered and answered immediately, not held.** The
-  egress shape blocks: `/authorize` is held open inside the control plane and woken by
-  a `threading.Event`, pinning a threadpool worker. A tool ask does neither — the
-  gateway registers it and answers the agent with a pending result. See "An `ask`
-  answers immediately" for the reasoning and for what makes the pending answer safe.
-  Three consequences settled with it: a tool ask does **not** draw on `MAX_WAITERS`
-  and gets its own cap, the tool hold window is a second number free of any client
-  timeout (a constant of its own, not a config surface — see "Hold bounds are
-  fail-closed, so their values stay env vars" in `control-plane/DESIGN.md`), and
-  **withdrawal is moot** — nothing is held open, so there is no stranded caller to
-  cancel. It also means the single-queue decision now rests on the SSE argument
-  alone: the worker pool is no longer shared.
-- **RESOLVED — the hold bounds stay env vars, and 2c-2 is rule editing alone.** The
-  per-proxy config surface is not being built. The four caps and the two timeouts can
-  only ever produce a deny, so the audit invariant — which exists to record capability
-  *granted* — does not reach them, and for values changed this rarely a compose diff is
-  a better trail than a store row. See "Hold bounds are fail-closed, so their values
-  stay env vars" in `control-plane/DESIGN.md`. The two cross-value invariants such a surface would have validated on
-  write are guarded at boot and in `tests/test_topology.py` instead.
-- **RESOLVED — the MCP gateway owns repo writes.** The governed git path is scoped to
-  clone/fetch. Two governed roads to "write to a repo" under different policy
-  models is a hole, because an actor — or a confused agent — takes the weaker one,
-  which is why this was decided before either path existed rather than after both
-  did. The earlier inclination was the opposite one — a branch and force-push policy
-  wants to see refs, not JSON — and what overturns it is that **the REST write set
-  cannot express the destructive operations that policy exists to catch**: a
-  create-or-update-file style tool appends a commit and fails on a stale blob sha,
-  and nothing in the set rewrites history or deletes a ref. A wire proxy would be
-  enforcing against operations the surviving path cannot perform. Nor could it have
-  owned writes alone whatever else was decided, because `merge_pull_request` moves
-  the ref **server-side** where nothing watching the wire sees it. The cost, because
-  it is real: the API path writes **new** commits from file contents rather than
-  pushing ones already made locally, so a branch must never be written both ways.
-  Three consequences, in the order they bite. `GITHUB_READ_ONLY` flips off **with the
-  gateway and not before** — until something fronts the server that flag is the only
-  thing narrowing it — after which the gateway's `deny` is the whole boundary, which
-  is what "a server's own restriction flags are defence in depth" has to survive. It
-  has not flipped yet: `mcp-servers.yml` still defaults it on, so the write set is not
-  offered, and turning it off is the step that makes the rest of this bullet live
-  (see "Status"). Per-tool repo scoping stops being optional, putting the unmeasured
-  `x-mcp-header` override question (NOTES.md) on the gateway's critical path. And a
-  dispatcher tool means one name decides several operations, so the argument-shaped
-  `ask` ladder is needed for the write set rather than deferrable past it.
-  `merge_pull_request` is denied outright: merging stays the human's step, as pushing
-  is today.
-
-  *Reasoned from the REST surface, not measured.* The write tools are enumerable —
-  `make mcp-tools SERVER=github` with `GITHUB_MCP_READ_ONLY=0` prints their schemas —
-  and confirming this before allowing any of them is cheap. `push_files` is the one
-  to look at first and the reason this is flagged rather than asserted: it builds a
-  commit through the Git Database API, where a ref update *can* carry `force`, so it
-  is the single tool in the set that could falsify the paragraph above.
-- **RESOLVED — the control plane learns a server's tools from the gateway, never by
-  scanning `mcp-net`.** Before it did, a `tool_rules` row was a name an operator typed
-  and nothing checked it against anything. That was safe — a missing rule denies, so a
-  misspelled rule and an unwritten one fail the same closed way — but blind in both
-  directions: no list to pick a name from, and a typo indistinguishable from a
-  deliberate deny. The gateway is the only component that can
-  close this, because it is the only one that ever talks to a server; it already
-  dials each enabled server by name on its roster poll, and `tools/list` is the same
-  trip. What comes back is operator-facing metadata and **never an input to
-  `policy._decide_tool`** — the names and descriptions are server-authored, they would
-  render in the control plane's own UI, and a discovered tool that could write its own
-  rule is a server granting itself capability. (Which DIRECTION that report travels is
-  settled in the bullet below, and not the way this one first assumed.)
-  Discovery runs only on *enabled* servers, since disabling means the gateway
-  stops dialling — so an operator enables before seeing the tool list, which is safe
-  only because the deny default makes an enabled server with no rules able to do
-  nothing. The rejected alternative is a subnet sweep. Its fatal form is taking the
-  name from the server's own answer, which under name-keyed policy lets a server
-  choose its rules; Docker's reverse DNS may well supply an honest name instead, and
-  it is still the wrong shape, because no MCP port convention exists (8082 is GitHub's
-  image default) so a sweep means probing guessed ports across containers holding
-  write-capable credentials, and registering by existence would put anything that
-  reaches `mcp-net` in front of an operator as a candidate. **The mismatch audit came
-  first:** the gateway reports a rule naming a tool the server does not expose, and a
-  tool no rule decides — which needs no store, no new endpoint, and no server-authored
-  text in the crown jewel, and which still runs beside the inventory rather than having
-  been replaced by it.
-  **Open companion:** whether the control plane should learn that a server *exists*
-  from `mcp-servers.yml` rather than from an operator retyping its name, seeded the
-  way `policies/egress-allowlist.txt` already is (`control-plane/Dockerfile`). That
-  half needs no network access and no trust in anything running; it is only the tool
-  half that requires the gateway.
-- **RESOLVED — the tool inventory lives in memory, arrives by push, and is audited
-  only when it changes.** The gateway is the only component that can see what a server
-  exposes, so it reports; the control plane holds the result for an operator choosing
-  rules and for nothing else. **In memory, never stored** — it is derived data,
-  rebuildable by asking the servers again, and a stored copy would both outlive a
-  server that has been gone for a week while reading as current and put server-authored
-  text into `make backup`, which is the operator's own decisions and nothing else.
-  **Pushed, because a pull is impossible**: this process has no leg on the gateway's
-  networks and must not be given one, since dialling the agent-facing service from the
-  crown jewel is the lateral edge the gateway's bind guard exists to prevent. That
-  makes `/tool/inventory` the only WRITE on that bridge, and the criterion keeping the
-  bridge's width honest survives intact — it records a claim that `_decide_tool` never
-  reads, so a tool arriving on it is denied exactly as it was before. **Audited on
-  CHANGE**, not per push: a push lands whenever the roster moves, and a row each time
-  would bury the one worth keeping — a server's surface growing without a human in the
-  loop is a supply-chain event. Rows carry tool NAMES, which `policy._TOOL_RE` bounds,
-  and never descriptions, which nothing bounds. Two distinctions are load-bearing
-  enough to name: a server that could not be enumerated keeps its last known surface
-  rather than reading as one that exposes nothing, and a tool whose name falls outside
-  `_TOOL_RE` is dropped but counted, because no rule could ever be written for it.
-- **RESOLVED — a server enters the store because an operator registered it, not
-  because a file declared it.** The seeding alternative above was considered and set
-  aside rather than rejected. Reading `mcp-servers.yml` directly means a YAML parser
-  in the component whose compromise is total, parsing a document almost none of which
-  concerns it, and coupling the control plane to a compose file's format; a small
-  purpose-built seed file avoids all three and is this repo's existing idiom, but
-  costs two files per server plus a drift guard to remove one typing step. What
-  decides it for now is that seeding removes only the *register* call: `enabled`
-  stays an operator decision under every option, so the UI surface is the same either
-  way, and building the registration path answers the question while leaving it open.
-  The accepted cost is that the name is typed against nothing — this container cannot
-  enumerate what is running — so a typo registers a server the gateway finds nothing
-  behind. That is tolerable **because** the gateway's discovery report names it as
-  `NOT ENUMERATED` within one interval; without that report this decision would be
-  the wrong one.
 
 ## Future improvements
 - Dedicated git proxy that speaks the git protocol, per-repo, instead of

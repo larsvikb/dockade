@@ -139,8 +139,8 @@
   .card.tool { border-left-color: var(--accent); }
   /* THE payload, and the reason this card exists at all: the tool name says what kind
      of act is being asked for, and only the arguments say what it does to which
-     repository. Never truncated and never reformatted — collapsed at most, with the
-     byte count on the summary so a folded card still says how much has not been read.
+     repository. Never truncated: open by default, and capped in height by the max-height
+     below so a long one scrolls inside its box rather than pushing the queue off screen.
      Monospace and pre-wrap because whitespace inside a payload is content. */
   .payload { margin-top: 8px; font-size: 12px; }
   .payload summary { color: var(--dim); cursor: pointer; }

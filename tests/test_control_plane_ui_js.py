@@ -195,7 +195,6 @@ console.log(JSON.stringify({
     absent: m.renderableHolds(undefined),
   },
   tool: {
-    fold: m.PAYLOAD_FOLD_BYTES,
     // Short payloads are readable without a click; long ones fold so one card cannot
     // push every other pending decision off the screen. Neither truncates.
     hazards_clean: m.payloadHazards('{"owner":"octo","repo":"hello"}'),
@@ -247,8 +246,7 @@ console.log(JSON.stringify({
     // A literal mark in a string would read as a break; the quiet tier names it.
     breaks_forged_mark: m.payloadHazards('{"b":"x↵"}'),
     short: m.payloadDisclosure('{"a":1}'),
-    long: m.payloadDisclosure("x".repeat(m.PAYLOAD_FOLD_BYTES + 1)),
-    at_fold: m.payloadDisclosure("x".repeat(m.PAYLOAD_FOLD_BYTES)).open,
+    long: m.payloadDisclosure("x".repeat(5000)),
     missing: m.payloadDisclosure(undefined),
     // Read off the card's own absolute deadline, so it works before /api/config has
     // answered and needs no knowledge of the backend's tool window.
@@ -1301,18 +1299,13 @@ class PageScriptTests(unittest.TestCase):
         self.assertEqual(self.probe["kinds"]["empty"], [])
         self.assertEqual(self.probe["kinds"]["absent"], [])
 
-    def test_a_payload_is_folded_but_never_shortened(self):
-        # The fold is about the QUEUE, not about the payload: a card whose arguments
-        # run to pages pushes every other pending decision off the screen, and a
-        # decision nobody scrolls to is one nobody makes. The whole string is in the
-        # DOM either way — only the disclosure state changes — and the byte count is
-        # on the summary so a folded card still says how much has not been read.
+    def test_the_summary_counts_the_payload_whatever_its_size(self):
+        # The card starts open at any size (see the source check in
+        # PayloadHazardTests); the count is what says how much there is to scroll.
         tool = self.probe["tool"]
-        self.assertTrue(tool["short"]["open"])
-        self.assertFalse(tool["long"]["open"])
-        self.assertTrue(tool["at_fold"])          # the fold is a ceiling, not a floor
-        self.assertEqual(tool["long"]["bytes"], tool["fold"] + 1)
-        self.assertIn(str(tool["fold"] + 1), tool["long"]["summary"])
+        self.assertEqual(tool["short"]["bytes"], 7)
+        self.assertEqual(tool["long"]["bytes"], 5000)
+        self.assertIn("5000 bytes", tool["long"]["summary"])
 
     def test_a_missing_payload_is_zero_bytes_rather_than_a_crash(self):
         # A card that threw while building would take the whole queue's render with
@@ -4018,15 +4011,15 @@ class PayloadHazardTests(unittest.TestCase):
         self.assertEqual(self.probe["tool"]["hazards_missing"]["level"], "none")
 
     def test_only_the_danger_tier_rewrites_the_card(self):
-        # Source-level, like the other DOM assertions in this file: escaped-first and
-        # forced-open are both keyed on `danger`, while the note itself appears for
-        # either tier.
+        # Source-level, like the other DOM assertions in this file: escaped-first is
+        # keyed on `danger`, the note appears for either tier, and every card starts
+        # open, dangerous or not.
         src = APP_JS.read_text()
         self.assertRegex(src, r'const danger = hazards\.level === "danger"')
         self.assertRegex(src, r"pre\.textContent = danger \? escaped : raw")
         self.assertRegex(src, r"box\.checked = danger")
         self.assertRegex(src, r"box\.checked \? escaped : raw")
-        self.assertRegex(src, r"details\.open = disclosure\.open \|\| danger")
+        self.assertRegex(src, r"details\.open = true;")
         self.assertRegex(src, r'if \(hazards\.level !== "none"\)')
 
 

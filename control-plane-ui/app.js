@@ -73,23 +73,14 @@ function toolRemaining(deadline, nowMs) {
   return Math.max(0, deadline - nowMs / 1000);
 }
 
-// Payload above this many bytes starts collapsed. Not a truncation — the whole string
-// is in the DOM either way and one click reveals it. What it protects is the QUEUE: a
-// card whose arguments run to pages pushes every other pending decision off the
-// screen, and a decision nobody scrolls to is one nobody makes.
-const PAYLOAD_FOLD_BYTES = 400;
-
-// The disclosure around a tool ask's arguments. The raw payload is authoritative and
-// always reachable — control-plane-ui/DESIGN.md is explicit that a view which
-// truncates, unescapes or reorders is a place to hide something from the person
-// deciding — so this decides only whether it starts OPEN, and says how many bytes are
-// there either way. The size is on the summary so a collapsed card still tells you how
-// much you have not read.
+// The summary line above a tool ask's arguments. The payload always starts open: the
+// box's max-height (`.payload pre` in index.html) is what keeps a long one from
+// pushing the rest of the queue off screen, and a fold on top of it cost a click on
+// every review. The byte count says how much there is to scroll through.
 function payloadDisclosure(argsJson) {
   const text = typeof argsJson === "string" ? argsJson : "";
   const bytes = text.length;
-  return { bytes, open: bytes <= PAYLOAD_FOLD_BYTES,
-           summary: `arguments · ${bytes} bytes` };
+  return { bytes, summary: `arguments · ${bytes} bytes` };
 }
 
 // The payload one line per field, indented by depth. WHITESPACE ONLY, added outside
@@ -2157,11 +2148,10 @@ function start() {
     const escaped = indentPayload(hazards.escaped);
     const details = document.createElement("details");
     details.className = "payload";
-    // A DANGEROUS payload starts OPEN whatever its size: the note below is only worth
-    // anything beside the text it is about. A merely non-ASCII one is left alone —
-    // it gets the note and nothing else (see payloadHazards for why the two differ).
+    details.open = true;
+    // A DANGEROUS payload is shown escaped first; a merely non-ASCII one gets the note
+    // and nothing else (see payloadHazards for why the two differ).
     const danger = hazards.level === "danger";
-    details.open = disclosure.open || danger;
     const summary = document.createElement("summary");
     summary.textContent = disclosure.summary;
     const pre = document.createElement("pre");
@@ -4270,7 +4260,7 @@ if (typeof module !== "undefined" && module.exports) {
     AUDIT_ORDINARY_STAGE, AUDIT_WINDOWS, WILDCARD_MIN_LABELS,
     RECONNECT_MIN_MS, RECONNECT_MAX_MS, STALE_MAX_MS, COUNTDOWN_URGENT_S,
     DWELL_MS, SATURATION_RECENT_MS, SATURATION_WARN_FRAC,
-    RENDERABLE_KINDS, PAYLOAD_FOLD_BYTES,
+    RENDERABLE_KINDS,
     payloadHazards, escapePayload, indentPayload, INLINE_ARRAY_MAX,
   };
 }

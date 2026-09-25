@@ -1292,51 +1292,12 @@ the real subnets — and `boundary-check.sh` probes all three legs from inside a
 running sandbox, the agent-facing one as a **positive control** so that a silent
 `mcp-net` is a statement about binding rather than about nothing listening.
 
-**The two axes landed one at a time, presentation first.** The order followed from the
-axes themselves: presentation is ergonomics and can be wrong without granting anything,
-while execution is the boundary — so the half that cannot grant shipped first and was
-probed by hand (`make gateway-tools`, which dials the listener from a throwaway
-container on `sandbox-net`, the agent's own position). `tool-gateway/surface.py` decides
-what is shown, `tool-gateway/execute.py` decides what runs, and
-`tool-gateway/protocol.py` holds the wire with no I/O at all. The sandbox was pointed at
-it last, deliberately: a tool surface offered before it works misleads the agent about
-its own capability, which is the same objection that rules out a runtime probe in the
-launcher.
-
-**Nothing runs before the control plane has answered, and that is structural rather
-than asserted.** There is exactly one function in the gateway that dials a server, it
-takes no policy argument, and it is reached from exactly two places — an `allow` from
-`/tool/authorize`, and a successful claim on an ask a human approved. A function that
-both decided and ran would have two reasons to be called and one of them would
-eventually be wrong. The failure direction is the one that matters: an unreachable
-control plane refuses the call rather than running it, so an outage cannot become a
-default-allow wearing a disguise.
-
-**Every refusal reaches the agent as a RESULT, not a protocol error**, generalising
-what DESIGN already required of the pending answer. An agent can act on a result — read
-the reason, do something else, come back — where an error is something it records as a
-failed call, carrying nothing it can use. The corollary is that the text has to carry
-the distinction the agent needs: a `deny` says retrying will not help, a pending ask
-says come back with the same id, and a `denied`/`expired`/`spent` approval says the
-matter is final. An agent that cannot tell a refusal from a delay retries one forever,
-and that is a property of the wording rather than of the protocol.
-
-**Flattening several servers into one namespace, reversibly.** The agent talks to one
-MCP server, so tools arrive from several backing servers into a single list and a name
-has to carry the server: `tool-gateway/surface.py` exposes `<server>__<tool>`. What
-makes that safe is a property spanning three files rather than a convention — a server
-name is a DNS label (`discovery.check_name`), so it cannot contain `_`, which makes the
-*first* `__` in an exposed name always the join no matter what the tool name contains.
-The decode is therefore exact, and that exactness is the whole of it: a call arriving
-under a flattened name must resolve to precisely the `(server, tool)` policy is keyed
-on, or the rule that was read and the call that runs are for different tools.
-
-**A server's own annotations stop at the gateway.** `readOnlyHint` reaches the
-operator's picker, where a human reads it as a claim, and it is not forwarded to the
-agent. This is the "server-supplied and therefore untrusted" rule applied to the one
-place it would otherwise leak: a client that treats the hint as grounds to skip its own
-prompt would be taking a third party's word for how dangerous a call is. Nothing is
-lost, because the hint decides nothing on either side of the boundary.
+What the gateway shows the agent and what it runs — the two axes and the order they
+landed in, why nothing runs before the control plane has answered, and why every
+refusal reaches the agent as a result — is the gateway's own code, and is designed in
+`tool-gateway/DESIGN.md` → "What is shown, and what runs". How several servers share
+the agent's one namespace, and which of a server's fields cross into it, is beside it
+in "What the tool list carries".
 
 **The control plane configures servers; it never starts them.** Adding a server
 means starting a container, and that would mean a docker socket on the
@@ -1598,14 +1559,6 @@ per-surface action sets (dispatched on the card's kind, since the approval id al
 determines its table), each surface renders its own card, and the merged payload is a
 union of two per-surface builders rather than one query over a discriminator column.
 
-**Two axes, not one.** A rule here governs two separable things: whether a tool's
-schema is **presented**, and whether a call is **executed**. Withholding a schema is
-ergonomics — it keeps the agent from planning around a capability it cannot have.
-Execution is the boundary, and `deny` must be enforced there *regardless of
-presentation*, because a tool name can arrive from anywhere: a transcript, a
-`CLAUDE.md`, text injected into the agent's context by an earlier tool result. Same
-shape as settings-versus-capability everywhere else in this design.
-
 **An unconfigured tool is denied and reported, not held — a deliberate divergence
 from the egress proxy.** There, an unmatched host is held because the set of hosts
 is unbounded and discovered at runtime; default-deny without a human would make the
@@ -1722,14 +1675,9 @@ which both tiers share, so a roster would leak approvals the caller never raised
 past the leak it hands the agent a read on the operator's queue, a nudge surface kept
 away from it everywhere else here.
 
-**Gateway-native tools are a category, and need their own rule.** Resume is proxied
-from no MCP server; it is the gateway's own, permanently `allow`, and therefore outside
-the per-tool policy governing everything else on the surface. The rule that keeps the
-category honest: **a native tool must not cause an ungoverned side effect.** Resume
-sits precisely on that line, because it does cause one — admissible only because the
-effect is bound to an id a human explicitly approved, with arguments they read. The
-next native tool will not inherit that property, which is why the criterion is written
-here rather than left to be inferred from this one being safe.
+Resume is the gateway's first tool of its own, proxied from no server; the rule the
+next one must meet is in `tool-gateway/DESIGN.md` → "Gateway-native tools are a
+category".
 
 **Elicitation routes to the wrong human.** Worth naming because it is the protocol's
 own answer to everything above: MCP lets a server ask the *client* to prompt its user
@@ -1777,9 +1725,9 @@ card names the gap instead.
 - **The response is the channel.** The gateway governs the *request*, but what steers
   an agent is the third-party text arriving in its context — an `allow`-ed,
   read-only tool is unaudited intake of the same shape as WebSearch, and content in
-  it can name tools (see the presentation/execution split above). The audit must
-  therefore record the response side, at minimum size and hash, because the forensic
-  question is *what entered the agent's context*.
+  it can name tools (see "Two axes, not one" in `tool-gateway/DESIGN.md`). The audit
+  must therefore record the response side, at minimum size and hash, because the
+  forensic question is *what entered the agent's context*.
 - **A record written after an irreversible act cannot fail closed; it can only
   buffer.** This is why the gateway's outcome stream is a file the control plane
   drains (`tool-gateway/outcomes.py`, the `tool-audit` volume) and not a POST to the
@@ -2441,8 +2389,9 @@ the evidence behind decisions recorded here (see CLAUDE.md → "Where writing go
 which file takes what). A component whose reasoning is its own keeps it beside its code:
 tier 2 in `opencode-sandbox/DESIGN.md` and `opencode-sandbox/NOTES.md`, the control
 plane in `control-plane/DESIGN.md`, its frontend in `control-plane-ui/DESIGN.md`, the
-egress proxy's relay guard and its side of `/authorize` in `proxies/egress/DESIGN.md`.
-Still-planned additions to the tree:
+egress proxy's relay guard and its side of `/authorize` in `proxies/egress/DESIGN.md`,
+and what the MCP gateway shows and runs in `tool-gateway/DESIGN.md`. Still-planned
+additions to the tree:
 
 ```
 dockade/

@@ -5,10 +5,10 @@
 Presentation, not enforcement, and the two must not be confused. This module decides
 which tools appear in `tools/list`; `policy._decide_tool` in the control plane decides
 whether a call runs, per call, and it is consulted whether or not the tool was ever
-presented here. DESIGN.md, "Two axes, not one": withholding a schema keeps an agent
-from planning around a capability it cannot have, and that is ergonomics. A tool name
-can arrive from a transcript, a `CLAUDE.md`, or text an earlier tool result injected,
-so a surface that hid a tool would still have to deny the call.
+presented here. tool-gateway/DESIGN.md, "Two axes, not one": withholding a schema keeps
+an agent from planning around a capability it cannot have, and that is ergonomics. A
+tool name can arrive from a transcript, a `CLAUDE.md`, or text an earlier tool result
+injected, so a surface that hid a tool would still have to deny the call.
 
 Which is what makes the curation rule safe to state simply: a tool is shown when a
 rule `allow`s or `ask`s it AND the server said it exists. `deny` and unruled are the

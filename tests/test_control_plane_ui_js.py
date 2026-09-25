@@ -227,6 +227,18 @@ console.log(JSON.stringify({
     indent_top_array: m.indentPayload('[{"a":1},"x"]'),
     indent_scalar: m.indentPayload("null"),
     indent_missing: m.indentPayload(undefined),
+    // With breaks, a string's `\n` is drawn as a marked line break. Nothing else is.
+    breaks_body: m.indentPayload('{"body":"a\\nb","z":1}', { breaks: true }),
+    breaks_nested: m.indentPayload('{"a":["x\\ny"]}', { breaks: true }),
+    // An escaped backslash followed by `n` is not a newline.
+    breaks_backslash_n: m.indentPayload('{"p":"C:\\\\new"}', { breaks: true }),
+    breaks_other_escapes: m.indentPayload('{"s":"t\\tq\\"\\u00e9\\r"}', { breaks: true }),
+    // Markdown indents with leading spaces; they are the string's, not ours.
+    breaks_leading_spaces: m.indentPayload('{"b":"x\\n  1. y\\n\\nz"}', { breaks: true }),
+    breaks_top_string: m.indentPayload('"a\\nb"', { breaks: true }),
+    breaks_off: m.indentPayload('{"body":"a\\nb"}'),
+    // A literal mark in a string would read as a break; the quiet tier names it.
+    breaks_forged_mark: m.payloadHazards('{"b":"x↵"}'),
     short: m.payloadDisclosure('{"a":1}'),
     long: m.payloadDisclosure("x".repeat(m.PAYLOAD_FOLD_BYTES + 1)),
     at_fold: m.payloadDisclosure("x".repeat(m.PAYLOAD_FOLD_BYTES)).open,
@@ -4006,27 +4018,35 @@ class PayloadHazardTests(PageScriptTests):
 
 
 def _unindent(text: str) -> str:
-    """Drop whitespace outside JSON string literals — the inverse of indentPayload on
-    a payload that had none to begin with."""
-    out, in_string, escaped = [], False, False
-    for ch in text:
+    """The inverse of indentPayload on a payload with no whitespace of its own: drop
+    whitespace outside strings, and turn each marked break inside one back into `\\n`
+    along with exactly the indentation it was given."""
+    out, depth, in_string, i = [], 0, False, 0
+    while i < len(text):
+        ch = text[i]
         if in_string:
+            if ch == "\\":
+                out.append(text[i:i + 2])
+                i += 2
+                continue
+            indent = "  " * (depth + 1)
+            if text.startswith("↵\n" + indent, i):
+                out.append("\\n")
+                i += 2 + len(indent)
+                continue
             out.append(ch)
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
-                in_string = False
+            in_string = ch != '"'
         elif ch == '"':
             out.append(ch)
             in_string = True
         elif ch not in " \n":
+            depth += (ch in "{[") - (ch in "}]")
             out.append(ch)
+        i += 1
     return "".join(out)
 
 
-# What each `indent_*` probe was given.
+# What each `indent_*` and `breaks_*` probe was given.
 _INDENT_ORIGINALS = {
     "indent_flat": '{"owner":"octo","repo":"hello"}',
     "indent_nested": '{"a":{"b":[1,2]},"c":[],"d":{}}',
@@ -4036,6 +4056,13 @@ _INDENT_ORIGINALS = {
     "indent_top_array": '[{"a":1},"x"]',
     "indent_scalar": "null",
     "indent_missing": "",
+    "breaks_body": '{"body":"a\\nb","z":1}',
+    "breaks_nested": '{"a":["x\\ny"]}',
+    "breaks_backslash_n": '{"p":"C:\\\\new"}',
+    "breaks_other_escapes": '{"s":"t\\tq\\"\\u00e9\\r"}',
+    "breaks_leading_spaces": '{"b":"x\\n  1. y\\n\\nz"}',
+    "breaks_top_string": '"a\\nb"',
+    "breaks_off": '{"body":"a\\nb"}',
 }
 
 
@@ -4092,6 +4119,37 @@ class PayloadIndentTests(unittest.TestCase):
         src = APP_JS.read_text()
         self.assertRegex(src, r"payloadHazards\(a\.args_json\)")
         self.assertRegex(src, r"payloadDisclosure\(a\.args_json\)")
-        self.assertRegex(src, r"const raw = indentPayload\(a\.args_json\)")
-        self.assertRegex(src, r"const escaped = indentPayload\(hazards\.escaped\)")
+        # Breaks in the raw view only: the escaped view is the exact bytes, and the
+        # danger tier's default.
+        self.assertRegex(
+            src, r"const raw = indentPayload\(a\.args_json, \{ breaks: true \}\)")
+        self.assertRegex(src, r"const escaped = indentPayload\(hazards\.escaped\);")
+
+    def test_a_newline_in_a_string_is_a_marked_break_one_level_in(self):
+        self.assertEqual(self.probe["tool"]["breaks_body"],
+                         '{\n  "body": "a↵\n    b",\n  "z": 1\n}')
+        self.assertEqual(self.probe["tool"]["breaks_nested"],
+                         '{\n  "a": [\n    "x↵\n      y"\n  ]\n}')
+        self.assertEqual(self.probe["tool"]["breaks_top_string"], '"a↵\n  b"')
+
+    def test_only_a_newline_is_drawn_and_every_other_escape_stays_spelled_out(self):
+        self.assertEqual(self.probe["tool"]["breaks_backslash_n"],
+                         '{\n  "p": "C:\\\\new"\n}')
+        self.assertEqual(self.probe["tool"]["breaks_other_escapes"],
+                         '{\n  "s": "t\\tq\\"\\u00e9\\r"\n}')
+
+    def test_a_strings_own_leading_spaces_survive_the_break(self):
+        self.assertEqual(self.probe["tool"]["breaks_leading_spaces"],
+                         '{\n  "b": "x↵\n      1. y↵\n    ↵\n    z"\n}')
+
+    def test_without_breaks_a_newline_stays_escaped(self):
+        self.assertEqual(self.probe["tool"]["breaks_off"],
+                         '{\n  "body": "a\\nb"\n}')
+
+    def test_a_literal_mark_in_a_string_is_named_by_the_note(self):
+        # The mark is what tells a break inside a string from one between fields, so
+        # a payload carrying its own `↵` must not pass silently.
+        forged = self.probe["tool"]["breaks_forged_mark"]
+        self.assertEqual(forged["level"], "note")
+        self.assertIn("↵ x1", forged["note"])
 

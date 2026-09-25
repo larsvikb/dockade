@@ -161,45 +161,52 @@ def record(payload: dict) -> tuple[dict, list[tuple[str, str]]]:
             f"the whole payload rather than storing a partial picture")
 
     now = time.time()
-    previous = snapshot()
-    fresh: dict[str, dict] = {}
-    for name, body in servers.items():
-        if policy._server_name_error(str(name)) is not None or not isinstance(body, dict):
-            continue
-        name = str(name)
-        if "tools" in body:
-            tools, read_only, unnameable = _clean_tools(body.get("tools") or [])
-        else:
-            # ABSENT IS NOT EMPTY, and the gateway takes trouble to keep them apart:
-            # it omits the list entirely when it could not ask. Reading that as "this
-            # server exposes nothing" would turn every brief credential problem into an
-            # audit row saying the server lost its whole surface, and would empty the
-            # picker while the operator is trying to work out why. So the last known
-            # surface stands, and `status` is what says it may be stale.
-            was = previous.get(name, {})
-            tools = list(was.get("tools", ()))
-            read_only = list(was.get("read_only", ()))
-            unnameable = was.get("unnameable", 0)
-        fresh[name] = {
-            "tools": tools,
-            "read_only": read_only,
-            "unnameable": unnameable,
-            # Whether the tool list above is an OBSERVATION or merely the absence of
-            # one. A server registered with a bad credential has never been
-            # enumerated, and its empty list means "we could not ask" rather than
-            # "it offers nothing" — a distinction the audit and the picker both need.
-            "enumerated": "tools" in body or bool(was.get("enumerated")),
-            # Carried verbatim from the gateway, capped: "secret missing" and
-            # "unreachable" are the states an operator most needs, and they are the
-            # ones that otherwise surface as a 401 that reads like a policy problem.
-            "status": str(body.get("status") or "")[:200],
-            "seen_at": now,
-        }
-
+    # ONE hold of the lock from reading the old map to replacing it. Read outside it,
+    # two overlapping pushes would both diff against the same old map: each would
+    # report the other's change again, and the slower one would overwrite the newer
+    # picture. Holding it also means a reader (``snapshot`` takes it too) never
+    # observes a half-built inventory.
     with _LOCK:
+        # Shallow is enough: the bodies are replaced below, never mutated.
+        previous = dict(_SEEN)
+        fresh: dict[str, dict] = {}
+        for name, body in servers.items():
+            if (policy._server_name_error(str(name)) is not None
+                    or not isinstance(body, dict)):
+                continue
+            name = str(name)
+            if "tools" in body:
+                tools, read_only, unnameable = _clean_tools(body.get("tools") or [])
+            else:
+                # ABSENT IS NOT EMPTY, and the gateway takes trouble to keep them
+                # apart: it omits the list entirely when it could not ask. Reading
+                # that as "this server exposes nothing" would turn every brief
+                # credential problem into an audit row saying the server lost its
+                # whole surface, and would empty the picker while the operator is
+                # trying to work out why. So the last known surface stands, and
+                # `status` is what says it may be stale.
+                was = previous.get(name, {})
+                tools = list(was.get("tools", ()))
+                read_only = list(was.get("read_only", ()))
+                unnameable = was.get("unnameable", 0)
+            fresh[name] = {
+                "tools": tools,
+                "read_only": read_only,
+                "unnameable": unnameable,
+                # Whether the tool list above is an OBSERVATION or merely the absence
+                # of one. A server registered with a bad credential has never been
+                # enumerated, and its empty list means "we could not ask" rather than
+                # "it offers nothing" — a distinction the audit and the picker both
+                # need.
+                "enumerated": "tools" in body or bool(was.get("enumerated")),
+                # Carried verbatim from the gateway, capped: "secret missing" and
+                # "unreachable" are the states an operator most needs, and they are
+                # the ones that otherwise surface as a 401 that reads like a policy
+                # problem.
+                "status": str(body.get("status") or "")[:200],
+                "seen_at": now,
+            }
         moved = changes(previous, fresh)
-        # Whole-map replacement under the lock, so a reader — ``snapshot`` takes it
-        # too — never observes a half-built inventory.
         _SEEN.clear()
         _SEEN.update(fresh)
     return fresh, moved

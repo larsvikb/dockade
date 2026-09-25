@@ -12,6 +12,7 @@ tool in this map is denied exactly as it was before it appeared.
 """
 from __future__ import annotations
 
+import threading
 import unittest
 
 from _loader import load_inventory
@@ -185,6 +186,38 @@ class ChangeTests(unittest.TestCase):
         seen = self.inv.snapshot()["mcp-github"]
         self.assertEqual(seen["tools"], ["create_pr", "get_issue"])
         self.assertIn("unreachable", seen["status"])
+
+    def test_overlapping_pushes_diff_against_each_other_not_the_same_old_map(self):
+        # Push A stalls while cleaning its tools; push B arrives meanwhile. Were the old
+        # map read outside the lock, both would diff against the empty map — two
+        # "first seen" rows — and A, finishing last, would overwrite B's newer picture.
+        entered, release = threading.Event(), threading.Event()
+        clean = self.inv._clean_tools
+
+        def stalling(raw):
+            if not entered.is_set():
+                entered.set()
+                release.wait(5)
+            return clean(raw)
+
+        self.inv._clean_tools = stalling
+        self.addCleanup(setattr, self.inv, "_clean_tools", clean)
+        grown = {"servers": {"mcp-github": {"status": "ok", "tools": [
+            *GITHUB["servers"]["mcp-github"]["tools"], {"name": "merge_pr"}]}}}
+        moved = []
+        a = threading.Thread(target=lambda: moved.extend(self.inv.record(GITHUB)[1]))
+        b = threading.Thread(target=lambda: moved.extend(self.inv.record(grown)[1]))
+        a.start()
+        self.assertTrue(entered.wait(5))
+        b.start()
+        b.join(0.2)             # B either finishes against the old map, or waits for A
+        release.set()
+        a.join(5)
+        b.join(5)
+        self.assertEqual(sorted(line for _, line in moved),
+                         ["mcp-github first seen exposing 2 tool(s)",
+                          "mcp-github now exposes merge_pr"])
+        self.assertIn("merge_pr", self.inv.snapshot()["mcp-github"]["tools"])
 
 
 if __name__ == "__main__":

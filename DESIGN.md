@@ -298,19 +298,17 @@ is gated behind an interactive approval dialog the yolo launch flow suppresses,
 so it would never apply. User scope needs only workspace trust (already granted).
 
 The **yolo disclaimer acceptance ships this way too** —
-`skipDangerousModePermissionPrompt: true` in the template. This is a consequence
-of the materialize-each-boot mechanism, not an exception to it. In current Claude
-Code (verified on 2.1.207) accepting the `--dangerously-skip-permissions`
-disclaimer writes `skipDangerousModePermissionPrompt: true` into **user settings**
-(`/config/settings.json`) — the old global `bypassPermissionsModeAccepted` flag in
-`.claude.json` was migrated away and is deleted on startup, so it no longer
-persists the acceptance. Because the entrypoint overwrites `settings.json` from the
-template every boot, an interactively-accepted disclaimer would be wiped on the
-next start and the agent would be re-prompted every launch; baking the flag into
-the template is what makes the acceptance survive restarts and volume wipes. This
-does **not** force yolo — starting in bypass mode is still a conscious opt-in via
-the `claude-yolo` alias; the flag only pre-accepts the disclaimer for a sandbox
-built precisely for that mode.
+`skipDangerousModePermissionPrompt: true` in the template. This is a consequence of
+the materialize-each-boot mechanism, not an exception to it: Claude Code records an
+accepted `--dangerously-skip-permissions` disclaimer in **user settings**
+(`/config/settings.json`; where it moved from is in `NOTES.md` → "Claude Code records
+the yolo disclaimer in user settings"), and the entrypoint overwrites `settings.json`
+from the template every boot, so an interactively accepted disclaimer would be wiped
+on the next start and the agent re-prompted every launch. Baking the flag into the
+template is what makes the acceptance survive restarts and volume wipes. This does
+**not** force yolo — starting in bypass mode is still a conscious opt-in via the
+`claude-yolo` alias; the flag only pre-accepts the disclaimer for a sandbox built
+precisely for that mode.
 
 Context usage is read from the **transcript file Claude Code already writes**
 (handed to the script as `.transcript_path` on stdin; the latest main-chain
@@ -755,14 +753,12 @@ posture, reached early. Consequence to remember: a tool that does its own
 external DNS or connects direct *without* honoring `HTTPS_PROXY` now fails closed
 (by design — proxied tools hand the hostname to the proxy, which resolves it).
 
-**WSL2 kernel gotcha (`xt_set`).** On stock WSL2 kernels `ipset create` can
-succeed while iptables `-m set --match-set` fails with `Can't open socket to
-ipset` — the kernel ships enough of `ip_set` for the userspace tool but not the
-`xt_set` match module. This is a *kernel*-capability gap, unrelated to container
-caps (`ipset`/xtables need `NET_ADMIN`, never `NET_RAW` — re-adding `NET_RAW`
-does not help and re-opens a hole). Governed mode sidesteps it entirely (no ipset
-path); standalone mode fails **closed** with a pointer to use the proxy. Do not
-"fix" ipset errors by adding capabilities — use the proxy.
+**Standalone mode fails closed on a kernel without `xt_set`.** Stock WSL2 kernels
+carry enough of `ip_set` for `ipset create` to succeed while the iptables match fails
+(`NOTES.md` → "Stock WSL2 kernels ship `ip_set` without the `xt_set` match"). Governed
+mode has no ipset path and sidesteps it; standalone mode aborts with a pointer to use
+the proxy. Do not "fix" an ipset error by adding capabilities: `ipset`/xtables need
+`NET_ADMIN`, never `NET_RAW`, so re-adding `NET_RAW` does not help and re-opens a hole.
 
 **The proxy is the sole egress at the network layer.**
 `sandbox-net` is now `internal: true` (no route off-box for anything on it) and a
@@ -1976,14 +1972,10 @@ services — which is what lets the same gate run on a dev machine, in CI, and i
 sandbox image that bakes the linters. `make test` reports the current count; it is
 deliberately not restated here, because a number in prose only ever rots.
 
-What it covers is the **security-load-bearing decision logic**: the proxy's `_forbidden`
-relay guard, `_match`, the permanent-lifeline short-circuit, the mitmproxy hooks via
-`SimpleNamespace` fakes (CONNECT ordering, the SNI-vs-authority anti-fronting guard, the
-Host/`:authority` gate that catches a fronted header under an authorized CONNECT); and
-on the control plane `_decide`, the `authorize` orchestration including
-hold-timeout→deny, the resolve handshake, the persist-pattern candidate set and its
-server-side validation. Per-function detail belongs in the test names, which read as
-sentences for exactly that reason — `tests/` is the inventory, not this file.
+What it covers is the **security-load-bearing decision logic** on both sides of
+`/authorize` — the proxy's guards and hooks, the control plane's decide, hold and
+resolve path — and per-function detail belongs in the test names, which read as
+sentences for exactly that reason: `tests/` is the inventory, not this file.
 
 Two things are worth stating because the code shape depends on them. The **hold-cap
 reservation was extracted** out of the `authorize` handler into `_reserve_hold` /

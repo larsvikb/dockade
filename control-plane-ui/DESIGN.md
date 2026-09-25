@@ -157,19 +157,10 @@ currently allowed before an operator decides a hold. Details in `app.js`.
 
 **The frontend's own tests.** `tests/test_control_plane_ui_js.py` runs the pure helpers
 under `node` (skipped when node is absent, the way `make lint` skips a missing linter)
-and asserts in Python, so failures read like the rest of `tests/`. It covers the lamp
-precedence (blind outranks busy), the backoff bounds and monotonicity, the keyed-diff
-properties, the sweep gating, the countdown arithmetic (including the clock-skew clamps
-and the `expiring now`-not-`expired` wording), the expiry-vs-resolved-elsewhere
-distinction, the persist preview's wildcard flag, the saturation banner's levels,
-recency boundary and count-based dismissal, the duplicate-count badge, and the
-decisions table's row shaping, repeat-count annotation and empty-versus-stale states —
-the last of these for the policy table too, including that the two views' wordings stay
-distinct. The 2c-1 helpers are covered the same way: the window arithmetic, the query
-string the backend is actually asked for (encoding included), the record row's two ways
-of identifying a request, and the pager's row numbers.
-Everything that touches the DOM
-lives inside `start()`, which runs only in a browser — so requiring the module under
+and asserts in Python, so failures read like the rest of `tests/`. What each helper
+must hold is in its test's name; that file is the inventory, not this one. Everything
+that touches the DOM lives inside `start()`, which runs only in a browser — so
+requiring the module under
 node must be side-effect free, and the test asserts that too: if DOM work migrates to
 the top level, `require` throws and the file cannot quietly become untestable again.
 

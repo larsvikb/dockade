@@ -160,6 +160,15 @@ Also confirmed while establishing this: with `CLAUDE_CONFIG_DIR` set, user-scope
 memory follows it (`/config/CLAUDE.md`, not `~/.claude/CLAUDE.md`), and `~/.claude`
 holds only a downloads cache.
 
+## Claude Code records the yolo disclaimer in user settings
+
+Measured on Claude Code 2.1.207: accepting the `--dangerously-skip-permissions`
+disclaimer writes `skipDangerousModePermissionPrompt: true` into user settings
+(`/config/settings.json`, under `CLAUDE_CONFIG_DIR=/config`). The older global
+`bypassPermissionsModeAccepted` flag in `.claude.json` is migrated away and deleted on
+startup, so it no longer persists the acceptance — a template that set only the old
+flag would re-prompt on every launch.
+
 ## An MCP server can be declared four ways, and `settings.json` is not one of them
 
 Measured in-container on Claude Code 2.1.234, because the channel that looks most
@@ -589,6 +598,16 @@ the safe reading of what it observed. The one test that needs a real refusal,
 `test_a_refused_connection_is_not_delivered`, checks for this first and skips.
 Traffic between the containers crosses Docker bridge networks rather than the
 distro's loopback, so this concerns tests and tools run on the host distro.
+
+## Stock WSL2 kernels ship `ip_set` without the `xt_set` match
+
+`ipset create` succeeds, and `iptables -m set --match-set` then fails with `Can't open
+socket to ipset`: the kernel carries enough of `ip_set` for the userspace tool and not
+the `xt_set` match module. It is a kernel gap, not a container one — `ipset` and
+xtables need `NET_ADMIN`, which the firewall step holds, and never `NET_RAW` — so no
+capability makes the match work. The first `--match-set` rule is the probe that tells
+the two apart (`init-firewall.sh`); the fix is a kernel with the module, or a path
+that needs no ipset at all, which is what governed mode is.
 
 ## Docker's dynamic IP is the lowest free one, so it collides with `.2`
 

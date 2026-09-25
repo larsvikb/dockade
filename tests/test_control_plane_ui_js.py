@@ -237,6 +237,13 @@ console.log(JSON.stringify({
     breaks_leading_spaces: m.indentPayload('{"b":"x\\n  1. y\\n\\nz"}', { breaks: true }),
     breaks_top_string: m.indentPayload('"a\\nb"', { breaks: true }),
     breaks_off: m.indentPayload('{"body":"a\\nb"}'),
+    inline_reviewers: m.indentPayload('{"reviewers":["octo","hubot"],"z":true}'),
+    inline_tricky: m.indentPayload('[",]","a\\"]",null]'),
+    inline_long: m.indentPayload(
+      JSON.stringify(["x".repeat(m.INLINE_ARRAY_MAX - 3)])),
+    inline_at_max: m.indentPayload(
+      JSON.stringify(["x".repeat(m.INLINE_ARRAY_MAX - 4)])),
+    inline_break_off: m.indentPayload('{"a":["x\\ny"]}'),
     // A literal mark in a string would read as a break; the quiet tier names it.
     breaks_forged_mark: m.payloadHazards('{"b":"x↵"}'),
     short: m.payloadDisclosure('{"a":1}'),
@@ -4052,7 +4059,7 @@ def _unindent(text: str) -> str:
     return "".join(out)
 
 
-# What each `indent_*` and `breaks_*` probe was given.
+# What each `indent_*`, `breaks_*` and `inline_*` probe was given.
 _INDENT_ORIGINALS = {
     "indent_flat": '{"owner":"octo","repo":"hello"}',
     "indent_nested": '{"a":{"b":[1,2]},"c":[],"d":{}}',
@@ -4069,6 +4076,9 @@ _INDENT_ORIGINALS = {
     "breaks_leading_spaces": '{"b":"x\\n  1. y\\n\\nz"}',
     "breaks_top_string": '"a\\nb"',
     "breaks_off": '{"body":"a\\nb"}',
+    "inline_reviewers": '{"reviewers":["octo","hubot"],"z":true}',
+    "inline_tricky": '[",]","a\\"]",null]',
+    "inline_break_off": '{"a":["x\\ny"]}',
 }
 
 
@@ -4098,8 +4108,29 @@ class PayloadIndentTests(unittest.TestCase):
 
     def test_nesting_indents_by_depth_and_empty_containers_stay_shut(self):
         self.assertEqual(self.probe["tool"]["indent_nested"],
-                         '{\n  "a": {\n    "b": [\n      1,\n      2\n    ]\n  },\n'
+                         '{\n  "a": {\n    "b": [1, 2]\n  },\n'
                          '  "c": [],\n  "d": {}\n}')
+
+    def test_a_short_array_of_plain_values_stays_on_one_line(self):
+        self.assertEqual(self.probe["tool"]["inline_reviewers"],
+                         '{\n  "reviewers": ["octo", "hubot"],\n  "z": true\n}')
+        # Commas and brackets inside its strings are text, not structure.
+        self.assertEqual(self.probe["tool"]["inline_tricky"],
+                         '[",]", "a\\"]", null]')
+
+    def test_an_array_goes_multi_line_when_it_holds_a_container_or_runs_long(self):
+        self.assertEqual(self.probe["tool"]["indent_top_array"],
+                         '[\n  {\n    "a": 1\n  },\n  "x"\n]')
+        long_ = self.probe["tool"]["inline_long"]
+        self.assertTrue(long_.startswith("[\n  "), long_)
+        self.assertEqual(self.probe["tool"]["inline_at_max"].count("\n"), 0)
+
+    def test_an_array_whose_string_breaks_a_line_is_not_inlined(self):
+        # A break inside a one-line array would leave it neither one line nor many.
+        self.assertEqual(self.probe["tool"]["breaks_nested"],
+                         '{\n  "a": [\n    "x↵\n      y"\n  ]\n}')
+        self.assertEqual(self.probe["tool"]["inline_break_off"],
+                         '{\n  "a": ["x\\ny"]\n}')
 
     def test_structure_inside_a_string_is_left_alone(self):
         self.assertEqual(self.probe["tool"]["indent_tricky"],

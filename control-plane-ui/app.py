@@ -138,7 +138,7 @@ _RELAY_ROUTES = (
     ("GET", re.compile(r"^/api/audit/events$")),
     # Surface-prefixed: policy paths name the governed surface they decide for, so the
     # gateway's `/api/mcp/rules` lands as its own entry rather than widening this one
-    # (see "URLs carry the surface" in DESIGN.md).
+    # (see "URLs carry the surface" in control-plane/DESIGN.md).
     ("GET", re.compile(r"^/api/egress/rules$")),
     # The write half of that view. A SEPARATE entry from the GET above rather than a
     # method list on one, because the two differ in consequence and not only in verb:

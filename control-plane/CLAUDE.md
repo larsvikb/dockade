@@ -1,8 +1,10 @@
 # control-plane
 
-How to work in this component. The root `CLAUDE.md` still applies, and the module
-docstring in `app.py` is the map: which module serves which surface, and the order
-they import in. Each line below points at where a rule lives rather than restating it.
+How to work in this component. Its design is in `control-plane/DESIGN.md`, and what it
+shares with the rest of the system is in the root `DESIGN.md`. The root `CLAUDE.md`
+still applies, and the module docstring in `app.py` is the map: which module serves
+which surface, and the order they import in. Each line below points at where a rule
+lives rather than restating it.
 
 ## Adding things
 
@@ -18,7 +20,7 @@ they import in. Each line below points at where a rule lives rather than restati
   `test_every_endpoint_the_page_calls_is_served_or_relayed` and
   `test_every_relayed_route_is_actually_called` check both directions.
 - **A column:** a migration step, never the DDL alone — see "Schema note (read before
-  adding a column)" in `DESIGN.md`, then the NOTE below `_init_db` in `store.py`. A
+  adding a column)" in `control-plane/DESIGN.md`, then the NOTE below `_init_db` in `store.py`. A
   comment inside a DDL string is schema text a fresh store records.
 - **An audit word** (the first argument to `store._audit`): add it to `audit.KINDS`,
   which the filters and the UI share; `test_every_word_the_control_plane_writes_is_filterable`
@@ -27,7 +29,8 @@ they import in. Each line below points at where a rule lives rather than restati
   holds the caller's own input and module constants (`audit.FilterError`,
   `inventory.InventoryError`); `test_an_exception_reaches_a_response_only_through_a_named_type`.
 - **A bound or cap:** an env var, because it fails closed — see "Hold bounds are
-  fail-closed, so their values stay env vars" in `DESIGN.md`.
+  fail-closed, so their values stay env vars" in
+  `control-plane/DESIGN.md`.
 
 ## Testing
 

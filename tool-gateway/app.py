@@ -188,7 +188,8 @@ MCP_PATH = os.environ.get("GATEWAY_MCP_SERVE_PATH", "/mcp")
 #: bypass (egress fails closed while it restarts), but the one lever the sandbox had
 #: to take governance down on demand. A megabyte is far beyond any tool call worth
 #: governing and far below the control plane's memory limit. Fail-closed, so an env
-#: var rather than a config surface (DESIGN.md, "Hold bounds are fail-closed").
+#: var rather than a config surface (control-plane/DESIGN.md, "Hold bounds are
+#: fail-closed").
 BODY_MAX = int(os.environ.get("GATEWAY_BODY_MAX", str(1024 * 1024)))
 
 

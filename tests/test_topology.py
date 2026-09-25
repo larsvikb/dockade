@@ -1166,8 +1166,8 @@ class ProxyOutlastsTheHoldWindowTests(unittest.TestCase):
     same no-compiler-between-the-ends situation as the rest of this file. Compose
     overrides neither today, so the source defaults are what deploys (the reasoning for
     leaving them in the environment at all is under "Hold bounds are fail-closed, so
-    their values stay env vars" in DESIGN.md). The override is read anyway, so setting
-    one later does not silently retire this guard.
+    their values stay env vars" in control-plane/DESIGN.md). The override is read
+    anyway, so setting one later does not silently retire this guard.
     """
 
     @staticmethod

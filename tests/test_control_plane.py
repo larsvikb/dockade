@@ -1075,7 +1075,7 @@ class DeadCapWarningTests(_HoldRegistryTestCase):
     a waiter cap on its own silenced the matching card cap with nothing anywhere saying
     so. The boot line is where that becomes visible, because it is the moment the values
     are read (see "Hold bounds are fail-closed, so their values stay env vars" in
-    DESIGN.md for why they are read from the environment at all).
+    control-plane/DESIGN.md for why they are read from the environment at all).
 
     Asserted on the WARNING's presence and on which scope it names, never on its
     wording."""

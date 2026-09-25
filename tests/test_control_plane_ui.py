@@ -427,7 +427,7 @@ class RelayAllowlistTests(unittest.TestCase):
                              # to drop the old one relays both, and every other test
                              # here passes: the UI calls the new path and never
                              # notices the old one still works. See "URLs carry the
-                             # surface" in DESIGN.md.
+                             # surface" in control-plane/DESIGN.md.
                              ("api/rules", "GET"),
                              ("api/rules/12/revoke", "POST"),
                              # The tool-rule paths carry the same digit bound as the

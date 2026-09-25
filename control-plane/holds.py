@@ -438,8 +438,8 @@ def _list_pending() -> list[dict]:
 # ``HOLD_TIMEOUT``: that one is bounded by what a blocked agent and a proxy will sit
 # through, and this one is bounded by nothing at all, because nothing is waiting on
 # it. So it is free to be a human interval — an hour, rather than two minutes.
-# Fail-closed like the rest of the bounds, so it stays an env var (DESIGN.md, "Hold
-# bounds are fail-closed").
+# Fail-closed like the rest of the bounds, so it stays an env var
+# (control-plane/DESIGN.md, "Hold bounds are fail-closed").
 TOOL_HOLD_TIMEOUT = float(os.environ.get("CONTROL_TOOL_HOLD_TIMEOUT", "3600"))
 # The window an APPROVED ask waits for the gateway to come back and claim it. A third
 # number rather than a reuse of the one above, because the two bound different waits:

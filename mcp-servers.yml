@@ -99,9 +99,9 @@ services:
       # this repo.
       # Narrow the surface at the source as well as at the gateway. This is defence
       # in depth and NOT the boundary: read-only was silently inert in http mode
-      # until v0.31.0 (github/github-mcp-server#2156, fixed by #2208), which is
-      # precisely why the gateway's deny state — not a server's own flag — is what
-      # the design relies on. Verify `tools/list` rather than trusting either.
+      # through v0.32.0 (github/github-mcp-server#2156, fixed by #2208 in v0.33.0),
+      # which is precisely why the gateway's deny state — not a server's own flag —
+      # is what the design relies on. Verify `tools/list` rather than trusting either.
       GITHUB_TOOLSETS: ${GITHUB_MCP_TOOLSETS:-context,repos,issues,pull_requests}
       GITHUB_READ_ONLY: ${GITHUB_MCP_READ_ONLY:-1}
       # Limits what content from PUBLIC repos is surfaced, by checking whether the

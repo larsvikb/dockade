@@ -128,8 +128,9 @@ than restated.
 
 ## Out of scope
 
-These are **known and accepted**, each with its reasoning in `DESIGN.md`. They are
-not secrets and not oversights, so please raise them as **public issues** if you
+These are **known and accepted**, each with its reasoning in a `DESIGN.md` — the
+root's unless a component's is named. They are not secrets and not oversights, so
+please raise them as **public issues** if you
 disagree with the reasoning — that is a design discussion, not a vulnerability
 report.
 
@@ -138,7 +139,7 @@ report.
   so they do not constrain it. Authentication would not close it either: any
   credential at rest on the host is readable by that same process. Closing it needs a
   human-presence gesture the host cannot replay. See *Browser-facing guards on the
-  frontend (and their honest limit)*.
+  frontend (and their honest limit)* in `control-plane-ui/DESIGN.md`.
 - **The read-write workspace bind mount as a delayed path to host execution.**
   Anything the agent writes there — a git hook, a build script, `.envrc`, an editor
   task file — runs outside the sandbox the next time the host touches the repo. The
@@ -165,8 +166,8 @@ report.
   lets a request through undecided, or an audit line dropped because the system was
   busy. One cross-sandbox availability defect of that kind — one client filling the
   hold pool for every other — was listed here and is now fixed; the caps that bound it
-  are described in `DESIGN.md` under *Four hold caps: two nouns, two scopes*. Another
-  of that shape would be worth reporting.
+  are described in `control-plane/DESIGN.md` under *Four hold caps: two nouns, two
+  scopes*. Another of that shape would be worth reporting.
 - **Base images pinned by tag rather than digest**, everywhere except the one place
   it would matter: the egress proxy is the security choke point and its base *is*
   digest-pinned, so a repointed tag cannot change the component that enforces egress.

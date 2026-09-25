@@ -20,8 +20,10 @@ audited.**
   authorize each connection. An unknown host is **held** for a human, who approves or
   rejects it in a small loopback **UI**; no decision → default-deny after a timeout.
 - The agent **cannot reach the control plane**: it's on separate internal networks the
-  sandbox isn't attached to, and the proxy — the only component that touches both sides —
-  hard-refuses to relay onto them.
+  sandbox isn't attached to. Two components touch both sides — the egress proxy and the
+  MCP gateway — and neither relays: the proxy hard-refuses a control subnet as a
+  destination, and the gateway serves the agent on one address and dials the control
+  plane only to ask about a tool call, so there is no relay in it to turn.
 
 Two agent **tiers**: **tier 1** is Claude with governed egress through the proxy; **tier
 2** is a local-LLM agent (opencode) with *no egress and no credentials at all*. Three
@@ -97,8 +99,8 @@ anything behind it.
                                             / audit / config    │
         ┌───────────────────────────────────────────────────────┘
         │
-   GOVERNED proxies/tools   (dual-homed: sandbox-net + a control net;
-        │   egress ones also on egress-net) ─────────────► internet
+   GOVERNED proxies/tools   (multi-homed: sandbox-net + a control bridge of
+        │   its own; egress ones also on egress-net) ────► internet
         │
 ════════╪═══ sandbox-net (internal) ═══════════════════════════════
         │
@@ -164,10 +166,10 @@ egress** — sandbox-net only. These make good practices cheap and fast. Example
   not attached.
 - `tool-authorize-net` (`internal: true`) — the MCP gateway's authorize path, one
   conversation only: gateway → the control plane's tool listener (decide a call,
-  read the roster, claim an approved ask). A second bridge rather than a share of
-  `authorize-net`, so a bypassed egress proxy gains no route to the gateway's claim
-  endpoint — the one place an approved side effect is released. Sandbox not
-  attached.
+  read the roster, push the inventory, claim an approved ask). A second bridge
+  rather than a share of `authorize-net`, so a bypassed egress proxy gains no route
+  to the gateway's claim endpoint — the one place an approved side effect is
+  released. Sandbox not attached.
 - `mcp-net` (`internal: true`) — the MCP data path, two conversations only: the
   MCP gateway dialing the server containers, and those containers reaching the
   egress proxy for their own upstream calls. The servers live here and never on
@@ -712,10 +714,12 @@ host-bind-mounted workspace. Dependencies: pull-through cache.
   ever disabled and replaced by the `websearch` skill. While built-in WebSearch
   stays enabled, no backend is required. Would be a third-party search API via the
   egress proxy with a read-only key.
-- **Git push path** — clone/pull is low-risk; **push is the governed-risky
-  direction**. v1: git over HTTPS through the egress proxy, push allowed to
-  allowlisted repos/orgs, unknown → hold. The push token is a write-capable
-  credential and stays governed (not in the sandbox).
+- **Git path** — clone/fetch is low-risk and is all the governed git path is scoped
+  to *(not built yet — see "Status")*; **writes are the MCP gateway's**, under its
+  per-tool policy, so no second road to a repo exists (see "the MCP gateway owns repo
+  writes"). Until then the transitional allowlist lets clone and fetch reach GitHub
+  over HTTPS through the egress proxy. A push token is a write-capable credential
+  and never enters the sandbox.
 - **MCP gateway** *(see "MCP gateway")* — the sole MCP surface offered to
   the sandbox, exposing a curated tool set from configured MCP servers under
   per-tool allow/deny/ask policy. It holds those servers' credentials so the
@@ -845,8 +849,9 @@ path); standalone mode fails **closed** with a pointer to use the proxy. Do not
 **The proxy is the sole egress at the network layer.**
 `sandbox-net` is now `internal: true` (no route off-box for anything on it) and a
 separate `egress-net` carries the only internet path, with the egress proxy
-**dual-homed** across both (default route via egress-net; a stable sandbox-net IP
-the firewall allowlists). The in-container firewall is now **defense-in-depth**
+attached to both, among its four legs (default route via egress-net; a stable
+sandbox-net IP the firewall allowlists; the two control legs are in "Networks").
+The in-container firewall is now **defense-in-depth**
 rather than the sole boundary: even if it failed, the sandbox has no route out.
 The launcher refuses to start a sandbox on an internal `sandbox-net` when no
 proxy is running. **Standalone** mode (no compose infra → non-internal net +
@@ -963,8 +968,8 @@ into two containers would mean externalising the hold registry, which trades a
 narrow, checkable property for a distributed-state problem.
 
 **The MCP gateway's bridge, `tool-authorize-net`, repeats the shape and does not
-share the net.** It is a third listener in the same process, serving the gateway's
-three questions — decide a tool call, read the roster, claim an approved ask — and
+share the net.** It is a third listener in the same process, serving four calls —
+decide a tool call, read the roster, push the inventory, claim an approved ask — and
 nothing that grants. `authorize-net` would have done the job for one line of YAML,
 and the reason it is not reused is the design assumption above: the relay guard is
 best-effort, so a bypassed proxy is planned for, and it must not land on the
@@ -1050,7 +1055,8 @@ already CIDR-matches one — but only for the lifeline, and only because the lif
 is the allow it makes *without* asking. Every other decision belongs to the policy
 authority, so the class is derived where the decision is taken. One mapping then
 serves however many governed proxies call `/authorize`, rather than each carrying a
-copy to drift; the MCP gateway will be the second.
+copy to drift. The second client population is not the MCP gateway, which never calls
+`/authorize` and has no egress, but the server containers on `mcp-net` — class `mcp`.
 
 How the control plane applies the class, what it refuses for a client it cannot place
 and how the rules already written were scoped, is in `control-plane/DESIGN.md` →
@@ -1464,15 +1470,14 @@ explicitly: **a crown-jewel backup never contains a credential.**
 `secrets:`.** A `secrets:` entry whose `file:` source is absent fails at `up` time for
 the whole project — the same eager-validation trap as `${VAR:?}`, and this repo has
 paid for that lesson twice. A directory bind degrades instead: a missing file means
-*that* server fails closed while every other service is unaffected. `make mcp-up` is
-where that lands — it already warns on the mode of anything under `MCP_SECRETS`, and
-ensuring the directory exists belongs beside that check rather than in `make up`,
-which starts the infra and has no MCP server in it to serve.
+*that* server fails closed while every other service is unaffected. Both `make up`
+and `make mcp-up` warn on the mode of anything under `MCP_SECRETS`
+(`secrets-perm-check` in the `Makefile`); neither creates the directory.
 
 **What the UI can say without ever seeing a value:** whether the secret *resolves*,
 per server. That is what makes a forced-injection server fail legibly — "configured,
 secret missing" — instead of surfacing an upstream 401 that reads like a policy
-problem. Rotation is replacing the file; the gateway re-reads on mtime change, so
+problem. Rotation is replacing the file; the gateway reads it on every call, so
 there is nothing to restart and nothing to edit in the UI.
 
 **The gateway pulls, and what it may cache is not uniform.** Same shape as the
@@ -1480,10 +1485,13 @@ proxy's `/authorize`, for the same reason: no client-side cache means an operato
 edit applies to the very next call. But two questions travel this path, and only one
 is per-call. **Execution policy must never be cached** — a `deny` set in the UI that
 waits for a TTL is not a deny. The **roster and tool list** are needed at session
-start and on change, so they may be polled, with `notifications/tools/list_changed`
-pushing the update into a live session. The gateway's bridge therefore answers three
-endpoints where the proxy's answers one — decide, roster, claim — and the criterion
-that keeps that width honest is that none of them *grants*: no rule is written there
+start and on change, so they may be polled — and polled is all they are: the gateway
+re-reconciles on an interval and a client re-lists, because the stateless transport
+has no server-to-client stream and `notifications/tools/list_changed` is deliberately
+not advertised (`tool-gateway/protocol.py`). The gateway's bridge therefore answers
+four endpoints where the proxy's answers one — decide, roster, inventory, claim — and
+the criterion that keeps that width honest is that none of them *grants*: the
+inventory push records a claim `_decide_tool` never reads, no rule is written there
 and no approval is decided there, which is why `resolve` stays off it and why the
 claim can only release what a human already approved.
 
@@ -1620,8 +1628,9 @@ control-plane UI, in a different trust domain from the agent's session, so routi
 decision through the agent's own client would put it inside the boundary being governed
 — where "no Claude Code settings file is a containment boundary" already applies.
 Whether the client implements it is therefore not worth establishing for this purpose.
-What MCP does supply is the brokering half: a curated `tools/list` plus
-`notifications/tools/list_changed` is exactly the configuration-artifact roster above.
+What MCP does supply is the brokering half: a curated `tools/list` is exactly the
+configuration-artifact roster above (the `list_changed` notification that would
+announce a change is not offered here — see "The gateway pulls").
 What it supplies nothing of is the deferred half — no accepted-come-back-later, no
 resumption primitive, no timeout extension (see NOTES.md). That absence argues *for*
 answering immediately rather than against it: fail-fast asks the protocol only for what
@@ -1713,9 +1722,9 @@ may hold. GitHub's server has an `http` subcommand; a stdio-only server needs a 
 in its image, which is a real cost when choosing the next one.
 
 **A server's own restriction flags are defence in depth, never the boundary.** The
-GitHub server's `--read-only` was silently inert in `http` mode through v0.31.0 —
-write tools stayed in `tools/list` and executed. Set them anyway; rely on the
-gateway's deny state, and verify `tools/list` rather than the flag.
+GitHub server's `--read-only` was silently inert in `http` mode through v0.32.0 (fixed
+in v0.33.0) — write tools stayed in `tools/list` and executed. Set them anyway; rely on
+the gateway's deny state, and verify `tools/list` rather than the flag.
 
 **Telling the sandbox it exists: `--mcp-config` + `--strict-mcp-config`, from the
 launcher.** Four channels can declare an MCP server, and the choice is not a matter
@@ -1775,9 +1784,9 @@ the agent about its own capability. The two flags are separable, and that decide
 the gateway-absent case cleanly: pass `--strict-mcp-config` **unconditionally** and
 add `--mcp-config` only when the gateway is up. Strict with nothing supplied yields
 zero MCP servers (measured), so "no gateway" means a provably empty tool surface
-rather than whatever the config volume happens to have accumulated. The baked `CLAUDE.md` must also say that a
-gateway tool call can block on a human, or an `ask` is indistinguishable from a
-hang.
+rather than whatever the config volume happens to have accumulated. The baked
+`CLAUDE.md` must also say that a gateway tool call can come back as a pending id, and
+that resuming it may wait on a human, or an `ask` is indistinguishable from a failure.
 
 ## Startup ordering — "running" is not "ready"
 
@@ -1981,7 +1990,7 @@ Deliberately untested surface is low-weight I/O: `_audit` sinks,
 **The CI gate runs the same `make` targets rather than reimplementing them**
 (`.github/workflows/check.yml`), so there is one definition of "does this repo pass" and
 a CI failure reproduces locally with `make check-strict`. Two parallel jobs — lint +
-consistency + tests (about a minute) and the five-image build verification — so a
+consistency + tests (about a minute) and the build verification of every image — so a
 shellcheck typo is not queued behind an image build.
 
 **The build job then runs `make check-boundary`, which is the only automated evidence
@@ -1992,9 +2001,9 @@ reads `docker-compose.yml` as YAML. Between them they assert what the boundary i
 — the strongest containment evidence the repo has was a manual `make boundary`. So the
 job stands the stack up and runs `boundary-check.sh` inside a real tier-1 sandbox, from
 the agent's own security context. It rides on the build job because that job has already
-compiled the images; a third job shares no layer cache and would rebuild all five to run
-a two-minute check. What CI cannot cover stays manual and is named in the workflow: tier
-2 needs a GPU, standalone mode needs a host with no compose infra.
+compiled the images; a third job shares no layer cache and would rebuild every image
+to run a two-minute check. What CI cannot cover stays manual and is named in the
+workflow: tier 2 needs a GPU, standalone mode needs a host with no compose infra.
 
 **Strict mode is the part that makes the gate mean anything.** Every stage degrades to a
 SKIP when its tool is absent, which is right on a dev machine (running the checks you
@@ -2065,13 +2074,14 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | 3 | skills + quality-gate hooks in the image | planned |
 | 4 | pull-through package cache | planned |
 | — | governed git path — clone/fetch (writes are the gateway's) | planned |
+| — | GitHub write set — `GITHUB_READ_ONLY` off behind the gateway, with per-tool repo scoping | planned |
 | — | `mcp-net` + MCP server catalogue (`mcp-servers.yml`) | **done** |
 | — | per-client-class egress policy | **done** |
 | — | tool policy: store (`tool_rules`, `mcp_servers`) + config API (`/api/mcp/…`) | **done** |
 | — | tool asks: `tool_approvals`, the ask registry, one merged queue, `resolve` split | **done** |
 | — | the tool card — raw payload, per-surface actions | **done** — no schema-driven view; the raw payload is the whole of it |
 | — | timed grants (`leases`) — `allow_lease`, the live-lease strip, revoke | **done** — exact host only; no breadth ladder |
-| — | the gateway's bridge — `tool-authorize-net`, third listener, decide/roster/claim | **done** — all four endpoints in use |
+| — | the gateway's bridge — `tool-authorize-net`, third listener, decide/roster/inventory/claim | **done** |
 | — | `tool-gateway` placement — triple-homed, agent leg only, bind guard | **done** |
 | — | gateway discovery — roster pull, `tools/list`, policy-vs-server report | **done** — reports to the log; writes nothing back |
 | — | MCP client credentials — read-only mount, path derived from the server name | **done** — the gateway is the only holder |
@@ -2162,12 +2172,15 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
   Three consequences, in the order they bite. `GITHUB_READ_ONLY` flips off **with the
   gateway and not before** — until something fronts the server that flag is the only
   thing narrowing it — after which the gateway's `deny` is the whole boundary, which
-  is what "a server's own restriction flags are defence in depth" has to survive.
-  Per-tool repo scoping stops being optional, putting the unmeasured `x-mcp-header`
-  override question (NOTES.md) on the gateway's critical path. And a dispatcher tool
-  means one name decides several operations, so the argument-shaped `ask` ladder is
-  needed for the write set rather than deferrable past it. `merge_pull_request` is
-  denied outright: merging stays the human's step, as pushing is today.
+  is what "a server's own restriction flags are defence in depth" has to survive. It
+  has not flipped yet: `mcp-servers.yml` still defaults it on, so the write set is not
+  offered, and turning it off is the step that makes the rest of this bullet live
+  (see "Status"). Per-tool repo scoping stops being optional, putting the unmeasured
+  `x-mcp-header` override question (NOTES.md) on the gateway's critical path. And a
+  dispatcher tool means one name decides several operations, so the argument-shaped
+  `ask` ladder is needed for the write set rather than deferrable past it.
+  `merge_pull_request` is denied outright: merging stays the human's step, as pushing
+  is today.
 
   *Reasoned from the REST surface, not measured.* The write tools are enumerable —
   `make mcp-tools SERVER=github` with `GITHUB_MCP_READ_ONLY=0` prints their schemas —

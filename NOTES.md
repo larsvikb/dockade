@@ -83,6 +83,47 @@ or fails on allocator luck. Write to a sibling path and `os.replace()` it over t
 target instead: the new file's inode is allocated while the old one is still linked, so
 it is guaranteed to differ.
 
+## Claude Code honours `HTTPS_PROXY`, and WebFetch inherits it
+
+What the CLI does with a proxy, per Anthropic's
+[Enterprise network configuration](https://code.claude.com/docs/en/network-config)
+docs, and the probe that confirmed the parts `DESIGN.md` leans on. Documented:
+
+- It reads `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` — the docs spell them in upper
+  case — Node-natively and **once at startup**; basic auth as `user:pass@` in the URL;
+  no SOCKS. A plain forward proxy named in the environment is therefore enough, with
+  no transparent redirect of port 443.
+- WebFetch uses the same variables — the docs describe no separate mechanism — and
+  fires a domain-safety **preflight to `api.anthropic.com` on every fetch**, which
+  `skipWebFetchPreflight: true` disables.
+- TLS interception is a documented scenario, not a hack: a custom CA via
+  `NODE_EXTRA_CA_CERTS=/path/ca.pem`, `CLAUDE_CODE_CERT_STORE` (default
+  `bundled,system`) to pick the trust stores, and mTLS via `CLAUDE_CODE_CLIENT_CERT` /
+  `CLAUDE_CODE_CLIENT_KEY` / `CLAUDE_CODE_CLIENT_KEY_PASSPHRASE`.
+- Beyond `api.anthropic.com` it reaches `downloads.claude.ai` and
+  `storage.googleapis.com` (the native installer and auto-updater),
+  `raw.githubusercontent.com` (the `/release-notes` changelog) and
+  `mcp-proxy.anthropic.com`, which carries the claude.ai MCP connectors and is on by
+  default (`ENABLE_CLAUDEAI_MCP_SERVERS=false` turns them off). The statsig,
+  feature-flag and telemetry chatter goes with
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`.
+- Background and supervisor processes do not reliably inherit a shell's environment,
+  so the channels the docs call robust for the proxy variables are the settings `env`
+  block and the real process environment.
+
+Measured with the proxy running and the sandbox in governed mode
+(`HTTPS_PROXY=http://egress-proxy:8080`, the firewall allowing only the proxy and
+embedded DNS): `boundary-check.sh` reported `api.anthropic.com reachable (via proxy
+http://egress-proxy:8080)`, so the CLI's own API traffic went through the proxy, and
+the same run had the proxy refuse a non-allowlisted domain — `egress proxy does not
+allow non-allowlisted example.com (held or denied)` — with direct egress, IPv6 and
+direct external DNS all blocked. WebFetch separately: fetching an allowlisted host
+(`pypi.org`) succeeded, a non-allowlisted one (`example.com`) failed with `Socket is
+closed`, and the proxy's audit log showed the matching `allow` and `deny` CONNECT
+rows. That is what makes WebFetch client-side and proxy-governed: had it run
+server-side like WebSearch, `example.com` would have succeeded and never reached the
+proxy.
+
 ## Claude Code reads a managed `CLAUDE.md` even where it ignores managed settings
 
 The two managed tiers do not behave alike, and the asymmetry is easy to walk into.

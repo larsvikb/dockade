@@ -1479,10 +1479,13 @@ def _write_audit(*rows):
         for r in rows:
             conn.execute(
                 "INSERT INTO audit(ts, kind, stage, host, port, proto, client, "
-                "client_class, method, url, reason) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "client_class, method, url, reason, server, tool, approval_id, status) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (r.get("ts", 0.0), r.get("kind", "allow"), r.get("stage"),
                  r.get("host"), r.get("port"), r.get("proto"), r.get("client"),
-                 r.get("client_class"), r.get("method"), r.get("url"), r.get("reason")))
+                 r.get("client_class"), r.get("method"), r.get("url"), r.get("reason"),
+                 r.get("server"), r.get("tool"), r.get("approval_id"),
+                 r.get("status")))
         conn.commit()
 
 
@@ -1536,6 +1539,22 @@ class AuditFilterTests(_CPTestCase):
         self.assertEqual(
             [r["host"] for r in cp.api_views.api_audit_events(q="simple")["rows"]],
             ["pypi.org"])
+
+    def test_the_record_finds_an_outcome_by_the_approval_id_it_shows(self):
+        # The record view shows an outcome row's approval id, so it must search it:
+        # an id copied off one row is how an operator pulls up the rest of the story.
+        # The glance shows no id, so there it must not match.
+        _write_audit(
+            {"kind": "outcome", "stage": "tool-result", "server": "mcp-github",
+             "tool": "create_pull_request", "status": "ok",
+             "approval_id": "d2e24cc51df24451bbed5591d99e33c1", "ts": 1.0},
+            {"kind": "outcome", "stage": "tool-result", "server": "mcp-github",
+             "tool": "create_pull_request", "status": "ok",
+             "approval_id": "1ad86183797045d5941a675492d168e0", "ts": 2.0})
+        rows = cp.api_views.api_audit_events(q="d2e24cc5")["rows"]
+        self.assertEqual([r["approval_id"] for r in rows],
+                         ["d2e24cc51df24451bbed5591d99e33c1"])
+        self.assertEqual(cp.api_views.api_audit(q="d2e24cc5")["rows"], [])
 
     def test_search_is_a_literal_substring_not_a_like_pattern(self):
         # Unescaped, `%` matches every row and `_` matches any character — so the

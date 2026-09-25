@@ -101,9 +101,11 @@ function payloadDisclosure(argsJson) {
 // With `breaks`, the one exception: a `\n` inside a string becomes `↵` and a line
 // break, continuing one level deeper than the string's key so it cannot line up
 // with a field. Every other escape stays spelled out.
+//
+// An array of plain values short enough to read at a glance stays on one line.
 function indentPayload(argsJson, { breaks = false } = {}) {
   const text = typeof argsJson === "string" ? argsJson : "";
-  let out = "", depth = 0, inString = false;
+  let out = "", depth = 0, inString = false, flat = false;
   const newline = () => "\n" + "  ".repeat(depth);
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
@@ -120,18 +122,23 @@ function indentPayload(argsJson, { breaks = false } = {}) {
     } else if (ch === '"') {
       out += ch;
       inString = true;
+    } else if (ch === "{" && text[i + 1] === "}") {
+      out += "{}";
+      i++;
+    } else if (ch === "[" && isInlineArray(text, i, breaks)) {
+      out += ch;
+      flat = true;
     } else if (ch === "{" || ch === "[") {
-      if (text[i + 1] === (ch === "{" ? "}" : "]")) {
-        out += ch + text[++i];
-      } else {
-        depth++;
-        out += ch + newline();
-      }
+      depth++;
+      out += ch + newline();
+    } else if (ch === "]" && flat) {
+      out += ch;
+      flat = false;
     } else if (ch === "}" || ch === "]") {
       depth = Math.max(0, depth - 1);
       out += newline() + ch;
     } else if (ch === ",") {
-      out += ch + newline();
+      out += flat ? ", " : ch + newline();
     } else if (ch === ":") {
       out += ": ";
     } else {
@@ -139,6 +146,30 @@ function indentPayload(argsJson, { breaks = false } = {}) {
     }
   }
   return out;
+}
+
+// Longest array, as sent, that indentPayload keeps on one line.
+const INLINE_ARRAY_MAX = 60;
+
+// Whether the array opening at `start` holds only plain values, fits in
+// INLINE_ARRAY_MAX, and — with breaks on — has no string that would break a line.
+function isInlineArray(text, start, breaks) {
+  let inString = false;
+  for (let j = start + 1; j < text.length && j - start < INLINE_ARRAY_MAX; j++) {
+    const ch = text[j];
+    if (inString) {
+      if (ch === "\\" && breaks && text[j + 1] === "n") return false;
+      if (ch === "\\") j++;
+      else if (ch === '"') inString = false;
+    } else if (ch === '"') {
+      inString = true;
+    } else if (ch === "{" || ch === "[") {
+      return false;
+    } else if (ch === "]") {
+      return true;
+    }
+  }
+  return false;
 }
 
 // Characters that render as nothing, or as something else. `Cf` is the format class —
@@ -4240,6 +4271,6 @@ if (typeof module !== "undefined" && module.exports) {
     RECONNECT_MIN_MS, RECONNECT_MAX_MS, STALE_MAX_MS, COUNTDOWN_URGENT_S,
     DWELL_MS, SATURATION_RECENT_MS, SATURATION_WARN_FRAC,
     RENDERABLE_KINDS, PAYLOAD_FOLD_BYTES,
-    payloadHazards, escapePayload, indentPayload,
+    payloadHazards, escapePayload, indentPayload, INLINE_ARRAY_MAX,
   };
 }

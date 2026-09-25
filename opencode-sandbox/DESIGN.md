@@ -135,6 +135,15 @@ flag converts one into either a loud failure or a bounded cost. Measurements and
   rest of the sizing sits beside the flag in compose.
 - **One model at a time**, and `temperature: 0` for extraction/classification.
 
+**The service is deliberately uncapped, and `-c`/`-ngl` is its budget.** Every other
+container here carries a memory cap; this one does not, and `tests/test_topology.py`
+treats the absent cap as the choice it is. The two ways a cap misfires — mmap'd
+weights are reclaimable page cache that a tight limit thrashes rather than kills, and
+iGPU "VRAM" is host RAM whose cgroup accounting is not safe to assume — are written
+beside the `llm-intel` service in `docker-compose.yml`, and the other two variants
+point to it. What bounds the service is `-c` and `-ngl` against the shared pool, a
+budget rather than a kill threshold; the pool's size is in `opencode-sandbox/NOTES.md`.
+
 Two properties worth carrying in the reader's head, because they shape task design more
 than model choice does: decode is memory-bandwidth-bound while prefill is compute-bound
 (a ~10x asymmetry, so this machine is good at prompt-heavy short-output work and bad at

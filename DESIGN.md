@@ -265,8 +265,9 @@ image is where **enablement** lives:
   yet in the image (see Status)*
 - a default **status line** (`claude-sandbox/statusline.sh`, seeded into user
   settings by the tier-1 setup hook the entrypoint runs — see below)
-- the **skills** that are the sanctioned interface to every capability —
-  *planned, not yet in the image*
+- the **skills** that are the sanctioned interface to every capability, doing
+  double duty: the capability interface **and** the right *way* to do a task,
+  steering the agent onto the paved road — *planned, not yet in the image*
 - non-root `sandbox` user, resource limits
 
 ### User settings — image-owned config, materialized each boot
@@ -446,9 +447,6 @@ even where it ignores managed settings". What follows:
   the default-deny firewall, like everything else. Trust the firewall for
   containment, not the env flag; don't claim telemetry is off until export behavior
   is actually checked.
-
-Skills do double duty: they are the capability interface **and** they encode the
-right *way* to do a task, steering the agent onto the paved road.
 
 ### What the image ships today
 
@@ -1860,16 +1858,9 @@ Every direction of failure here is fail-safe: lose the control plane and the add
 denies; lose the proxy and `sandbox-net` (internal) leaves no egress at all. The
 caps are therefore sized to *never fire* in normal operation, because an OOM-killed
 control plane writes denials to the audit log — the same pollution the readiness
-gating exists to prevent.
-
-**The LLM services are deliberately uncapped.** `llama.cpp` mmaps the GGUF, so the
-weights are reclaimable page cache charged to the cgroup: a tight limit thrashes
-the disk instead of OOM-ing, which is a slow failure rather than a loud one. And on
-the Intel iGPU "VRAM" is host RAM allocated through `/dev/dxg` by the driver, so
-whether it is charged to the container cgroup is not safe to assume — guessing
-wrong means an OOM-kill mid-load plus a `restart: unless-stopped` crash loop. What
-bounds that service is `-c`/`-ngl` against the ~16.9 GB shared pool, which is a
-budget rather than a kill threshold.
+gating exists to prevent. The `llm-*` services are the one deliberate exception,
+uncapped for reasons that are the inference service's own (see "The service is
+deliberately uncapped" in `opencode-sandbox/DESIGN.md`).
 
 ## Local inference — an ungoverned LLM tool
 

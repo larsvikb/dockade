@@ -1129,8 +1129,6 @@ self-reported and forgeable — recorded anyway because they are usually what be
 a non-browser caller. None of this was recorded before: an operator's click and a
 scripted POST were indistinguishable after the fact.
 
-Not yet built: git/secrets/cache data-plane services, skills, quality-gate hooks.
-
 ### MCP gateway — governed tool capability
 
 A data-plane service that speaks MCP to the sandbox on one side and to configured
@@ -2158,30 +2156,6 @@ shares with tier 1". What is open here:
   readable by the same process. The MCP gateway raises the stakes of this item without
   changing its reasoning: a forged egress approval lets a socket out, a forged `ask`
   sends the mail.
-- **Approval-UI follow-ups (reviewed and specified, not built).** From the same review
-  that produced the reconnect / CSP / keyed-rendering work in
-  `control-plane-ui/DESIGN.md`, in value order. The top two — the hold countdown and the
-  persist preview/confirm with an operator-chosen pattern — are **now built**; see
-  "Frontend mechanics" in `control-plane-ui/DESIGN.md` (the hold countdown) and "A
-  `+ persist` says what it will write" in `control-plane/DESIGN.md`. What became of
-  the rest:
-  - *(A DOM-level test for `start()` was considered here and **declined** — the frontend
-    is treated as a convenience layer over a backend that validates every input, with its
-    mistakes made detectable rather than prevented. The reasoning, and the condition that
-    would reopen it, are under "`start()` is deliberately unverified" in
-    `control-plane-ui/DESIGN.md`.)*
-  - *(The **opt-in desktop notification** is **now built** — see the traffic-light
-    paragraph in `control-plane-ui/DESIGN.md`. It gained one property on contact that the
-    specification did not have: a notice is closed by its hold leaving the queue,
-    because a notification still asking for a decision that has already default-denied
-    is worse than no notification.)*
-  - *(The smaller items filed here — hop-by-hop header stripping on the request side,
-    an announcement for arriving approvals, visibility-gated pollers, and "showing N
-    of M recorded decisions" — are **now built**. Two of them changed shape on
-    contact: a live region belongs on a separate element rather than on the card list,
-    whose countdowns rewrite once a second; and the coverage line compares decisions
-    with decisions, since the view is grouped and a rows-versus-decisions ratio reads
-    as truncation even when nothing was truncated.)*
 - **`boundary-check.sh` manufactures the most alarming rows the audit log can hold** —
   control-plane relay attempts, SNI fronting, metadata-IP SSRF — and they are
   indistinguishable from an agent genuinely attempting them. That is arguably correct:

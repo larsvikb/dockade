@@ -146,9 +146,9 @@ _LEASES_DDL = """
         -- wildcard here and `policy._match` is not used on this column.
         host         TEXT NOT NULL,
         -- WHICH client population this grant covers, exactly as on `rules` and for
-        -- the same reason. NOT NULL with no default: `resolve` refuses to lease for an
-        -- unclassified client, so a row with no class cannot be written, and the
-        -- constraint says so rather than leaving a fallback nobody meant.
+        -- the same reason. NOT NULL with no default: `api_approvals.resolve` refuses to
+        -- lease for an unclassified client, so a row with no class cannot be written,
+        -- and the constraint says so rather than leaving a fallback nobody meant.
         client_class TEXT NOT NULL,
         -- The card this was granted from. Provenance a rule has no equivalent of, and
         -- it is what makes the trail joinable end to end: the approvals row says what
@@ -409,17 +409,13 @@ def _init_db() -> None:
                 method   TEXT,
                 url      TEXT,
                 reason   TEXT,
-                -- The TOOL columns. Everything above is egress vocabulary, and tool
-                -- decisions used to borrow it by writing "issue_read on mcp-github:
-                -- ..." into `reason` — which reads fine and joins to nothing. These
-                -- three exist so the trail can be QUERIED rather than grepped: which
-                -- rows concern one server, and which rows belong to one approval.
+                -- The TOOL columns, so the trail can be QUERIED rather than grepped:
+                -- which rows concern one server, and which belong to one approval.
                 --
                 -- `approval_id` is the one that earns the set. A tool ask writes rows
                 -- at four separate moments (the hold, the human's click, the claim,
-                -- and — once the gateway's stream lands — how the call ended), and
-                -- without a column they are joinable only by parsing prose, so the UI
-                -- cannot put an outcome on the card that produced it.
+                -- and how the call ended), and this column is what joins them, so the
+                -- UI can put an outcome on the card that produced it.
                 --
                 -- NULL on every egress row and on every tool row written before v3,
                 -- for the reason `client_class` is nullable: these are records, not
@@ -429,10 +425,9 @@ def _init_db() -> None:
                 tool         TEXT,
                 approval_id  TEXT,
                 -- How the call ENDED, from the gateway's own stream (ingest.py). Its
-                -- vocabulary is `ingest.TOOL_STATUSES`, not `decision`'s: an outcome
-                -- is not a decision anyone made, and `ok` / `tool-error` /
-                -- `transport-error` / `timeout` answer a different question than
-                -- allow/deny/hold. NULL on every row that is not a tool outcome.
+                -- vocabulary is `ingest.TOOL_STATUSES`, not `kind`'s: an outcome
+                -- answers a different question than allow/deny/hold. NULL on every
+                -- row that is not a tool outcome.
                 status       TEXT
             )""")
         conn.execute("CREATE INDEX IF NOT EXISTS audit_ts ON audit(ts)")
@@ -447,9 +442,9 @@ def _init_db() -> None:
                 port        INTEGER,
                 proto       TEXT,
                 client      TEXT,
-                -- Settled when the hold is raised and read back by ``resolve``, so a
-                -- persisted rule is scoped to the class the request was DECIDED under
-                -- rather than to a second derivation made at the click.
+                -- Settled when the hold is raised and read back by
+                -- ``api_approvals.resolve``, so a persisted rule is scoped to the class
+                -- the request was DECIDED under, not a second derivation at the click.
                 client_class TEXT,
                 method      TEXT,
                 url         TEXT,
@@ -460,7 +455,7 @@ def _init_db() -> None:
                 -- column would have cost a migration.
                 mode        TEXT,             -- once | lease | persist
                 resolved_at REAL,
-                resolved_by TEXT,             -- provenance of the resolver (_actor)
+                resolved_by TEXT,             -- provenance of the resolver (provenance._actor)
                 -- WHAT a `persist` decision wrote: the rule pattern the operator chose
                 -- from the breadth ladder. Without it the record of a click that
                 -- changed standing policy said only which HOST was allowed, and a
@@ -502,15 +497,13 @@ def _init_db() -> None:
                 args_digest TEXT NOT NULL,
                 client      TEXT,
                 status      TEXT NOT NULL,   -- pending | allowed | denied | expired
-                -- Durable, where the egress deadline lives only in `holds._PENDING_
-                -- DEADLINE`. Nothing is blocked on a tool ask, so there is no worker
-                -- whose timeout would enforce a window and no in-process state to
-                -- lose: expiry is decided by reading this column (holds.
-                -- ``_expire_tool_asks``), which also means a restart cannot resurrect
-                -- an ask as pending forever.
+                -- Durable, where the egress deadline lives only in
+                -- `holds._PENDING_DEADLINE`. Nothing blocks on a tool ask, so expiry is
+                -- decided by reading this column (`holds._expire_tool_asks`), and a
+                -- restart cannot resurrect an ask as pending forever.
                 deadline    REAL NOT NULL,
                 resolved_at REAL,
-                resolved_by TEXT,            -- provenance of the resolver (_actor)
+                resolved_by TEXT,            -- provenance of the resolver (provenance._actor)
                 -- Set when the gateway EXECUTES this ask, which happens on resumption
                 -- rather than at the human's click. It is what makes an approval
                 -- single-use: the claim is a conditional UPDATE, so two resumptions

@@ -279,6 +279,7 @@ dockade/
     execute.py              #   authorize, then run: the only thing here that calls a server
     discovery.py            #   dials each server, reconciles against policy, pushes the inventory
     outcomes.py             #   how each call ended — the gateway's own audit stream
+    DESIGN.md               #   what the agent is shown, and what runs
     requirements.txt        #   pinned deps, held equal to the control plane's
   policies/                 # seed policy config (loaded into the control plane)
     egress-allowlist.txt    #   default-deny seed for the control plane's egress policy store
@@ -377,6 +378,9 @@ exposed through governed data-plane services. Next steps toward it:
   browser boundary, how it keeps a failing state visible, and its tests.
 - [`proxies/egress/DESIGN.md`](proxies/egress/DESIGN.md) — the egress proxy: what its
   relay guard refuses before policy is asked, and how it asks the control plane.
+- [`tool-gateway/DESIGN.md`](tool-gateway/DESIGN.md) — the MCP gateway: which tools the
+  agent is shown and under what name, what must hold before a call runs, and the rule
+  for tools of its own.
 - [`CLAUDE.md`](CLAUDE.md) — the invariants that must never be violated and the
   conventions for working in this repo.
 - [`SECURITY.md`](SECURITY.md) — how to report a boundary bypass, and — worth

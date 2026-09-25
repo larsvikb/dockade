@@ -1483,10 +1483,11 @@ instead of silently widening what the agent can reach.
 holds collapse duplicates onto one card and persist into rules, so the human's
 decision count trends toward zero as trust accrues — the progressive-trust path this
 system is built around. Tool payloads are per-call and never repeat exactly, so a
-naive `ask` is a permanent tax with no such path. What is needed is an
-argument-shaped analogue of `_persist_candidates`: *this call* → *this tool with
-these arguments* → *this tool with one field pinned* → *this tool always*. Copy its
-shape exactly, because the property that matters is the same one — the backend
+naive `ask` is a permanent tax with no such path. What is needed — and **not built
+yet**, see "Status" — is an argument-shaped analogue of `_persist_candidates`:
+*this call* → *this tool with these arguments* → *this tool with one field pinned* →
+*this tool always*. Copy its shape exactly, because the property that matters is the
+same one — the backend
 derives a **bounded** candidate set, the operator picks from it, and the chosen
 value is shown verbatim; nothing is persisted from a string the requester supplied.
 Deriving that ladder is server-specific, and it — not rendering — is where "any kind
@@ -2065,6 +2066,7 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | 4 | pull-through package cache | planned |
 | — | governed git path — clone/fetch (writes are the gateway's) | planned |
 | — | GitHub write set — `GITHUB_READ_ONLY` off behind the gateway, with per-tool repo scoping | planned |
+| — | argument-shaped `ask` ladder — this call → these arguments → one field pinned → always | planned |
 | — | `mcp-net` + MCP server catalogue (`mcp-servers.yml`) | **done** |
 | — | per-client-class egress policy | **done** |
 | — | tool policy: store (`tool_rules`, `mcp_servers`) + config API (`/api/mcp/…`) | **done** |

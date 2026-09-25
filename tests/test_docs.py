@@ -57,6 +57,24 @@ def _docs() -> list[str]:
     return [f for f in _tracked() if f.endswith(".md")]
 
 
+def _lead_ins(text: str) -> set[str]:
+    """What a doc's sections go by: its headings, and the bold or italic phrase a
+    paragraph or bullet opens with. Each opening is read across the next two lines as
+    well, since a bold lead-in in a hard-wrapped doc wraps as often as not."""
+    lines = text.splitlines()
+    found = set()
+    for i, line in enumerate(lines):
+        if m := re.match(r"#+\s+(.*)$", line):
+            found.add(m.group(1))
+            continue
+        opening = " ".join(lines[i:i + 3])
+        m = (re.match(r"\s*(?:[-*]\s+)?\*\*(.+?)\*\*", opening)
+             or re.match(r"\s*\*([^*]{4,200})\*", opening))
+        if m:
+            found.add(m.group(1))
+    return found
+
+
 def _compose_text() -> str:
     return "\n".join((ROOT / f).read_text() for f in COMPOSE_FILES)
 
@@ -368,7 +386,12 @@ class SectionCitationTests(_NeedsGit):
     constraints", a heading that was in NOTES.md. Resolved in the NAMED file, because a
     reference is only as good as the file a reader opens, and as text rather than as a
     heading: a comment may quote a phrase from inside a section. The path is from the
-    repo root, so `DESIGN.md` inside `opencode-sandbox/` still means the root one."""
+    repo root, so `DESIGN.md` inside `opencode-sandbox/` still means the root one.
+
+    Text, unless the phrase is the name of a section somewhere, and then it must name
+    one in the file cited. A section that moves to another file leaves its name behind
+    in the pointer that replaces it, so the text still matches. Twice, when a section
+    moved to a component's `DESIGN.md`, that hid a citation still naming the root."""
 
     #: `DESIGN.md, "X"`, `NOTES.md "X"`, `DESIGN.md → "X"` (the name may be backticked),
     #: and `"X" in DESIGN.md`. The separator is required, so a file name inside a string
@@ -386,8 +409,8 @@ class SectionCitationTests(_NeedsGit):
     def _norm(s: str) -> str:
         return re.sub(r"\s+", " ", s.lower().replace("*", "").replace("`", "")).strip()
 
-    def test_every_cited_section_is_in_the_file_it_names(self):
-        checked = 0
+    def _citations(self):
+        """(citing file, doc it names, phrase it quotes), for every tracked file."""
         for name in _tracked():
             path = ROOT / name
             if not path.is_file():
@@ -396,18 +419,41 @@ class SectionCitationTests(_NeedsGit):
                 text = self._flat(path.read_text())
             except UnicodeDecodeError:
                 continue
-            cites = ([m.groups() for m in self.NAMED_FIRST.finditer(text)]
-                     + [m.groups()[::-1] for m in self.QUOTE_FIRST.finditer(text)])
-            for doc, ref in cites:
-                checked += 1
-                with self.subTest(file=name, doc=doc, ref=ref):
-                    target = ROOT / doc
-                    self.assertTrue(target.is_file(), f"{name} cites {doc}, which "
-                                                      f"does not exist")
-                    self.assertTrue(self._norm(ref) in self._norm(target.read_text()),
-                                    f'{name} cites {doc} "{ref}", which is not in it')
+            for m in self.NAMED_FIRST.finditer(text):
+                yield name, *m.groups()
+            for m in self.QUOTE_FIRST.finditer(text):
+                yield name, *m.groups()[::-1]
+
+    def test_every_cited_section_is_in_the_file_it_names(self):
+        checked = 0
+        for name, doc, ref in self._citations():
+            checked += 1
+            with self.subTest(file=name, doc=doc, ref=ref):
+                target = ROOT / doc
+                self.assertTrue(target.is_file(), f"{name} cites {doc}, which "
+                                                  f"does not exist")
+                self.assertTrue(self._norm(ref) in self._norm(target.read_text()),
+                                f'{name} cites {doc} "{ref}", which is not in it')
         self.assertGreater(checked, 0, "no citations found — the syntax changed and "
                                        "this checks nothing")
+
+    def test_a_cited_section_name_is_one_in_the_file_it_names(self):
+        names = {doc: {self._norm(n) for n in _lead_ins((ROOT / doc).read_text())}
+                 for doc in _docs()}
+        checked = 0
+        for name, doc, ref in self._citations():
+            phrase = self._norm(ref)
+            homes = sorted(d for d, ns in names.items() if any(phrase in n for n in ns))
+            if not homes:
+                continue  # a phrase from inside a section, which the text check covers
+            checked += 1
+            with self.subTest(file=name, doc=doc, ref=ref):
+                self.assertIn(doc, homes,
+                              f'{name} cites {doc} "{ref}", which names a section in '
+                              f"{', '.join(homes)} but none in {doc} — moved without "
+                              f"the citation?")
+        self.assertGreater(checked, 0, "no citation names a section — the lead-in "
+                                       "patterns changed and this checks nothing")
 
 
 class CitedArtifactTests(_NeedsGit):

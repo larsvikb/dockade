@@ -2188,8 +2188,7 @@ the one queue every surface feeds (see "`approvals` splits the same way"). The s
 rejected on the way is `/api/rules?surface=…`, a discriminator over a single path —
 the storage mistake above wearing an API hat.
 
-Not yet built: git/secrets/cache data-plane services, the MCP gateway, skills,
-quality-gate hooks.
+Not yet built: git/secrets/cache data-plane services, skills, quality-gate hooks.
 
 ### MCP gateway — governed tool capability
 

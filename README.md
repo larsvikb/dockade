@@ -301,7 +301,7 @@ dockade/
     Dockerfile
     tier-setup.sh           # tier hook: materialize the opencode provider config
     opencode.json           # points opencode at the local `llm` service
-    AGENTS.md               # tier-2 capability facts, materialized to the config dir
+    user-AGENTS.md          # tier-2 capability facts, materialized to the config dir
     DESIGN.md, NOTES.md     # tier 2 and the local LLM service: rationale, evidence
     dotfiles/               # .bashrc.tier — tier-2 shell hook (oc alias, distinct prompt)
   tests/                    # dependency-free unit tests for the governance logic (make check)

@@ -94,49 +94,84 @@ function payloadDisclosure(argsJson) {
 // with a field. Every other escape stays spelled out.
 //
 // An array of plain values short enough to read at a glance stays on one line.
-function indentPayload(argsJson, { breaks = false } = {}) {
+//
+// Returned as `[kind, text]` pieces so the card can colour them: key, string,
+// escape, mark (the `↵`), value (numbers and true/false/null), punct, space. The
+// pieces joined are indentPayload's string, so colouring cannot change the text.
+function payloadTokens(argsJson, { breaks = false } = {}) {
   const text = typeof argsJson === "string" ? argsJson : "";
-  let out = "", depth = 0, inString = false, flat = false;
+  const tokens = [];
+  const push = (kind, piece) => {
+    const last = tokens[tokens.length - 1];
+    if (last && last[0] === kind) last[1] += piece;
+    else tokens.push([kind, piece]);
+  };
+  let depth = 0, flat = false;
   const newline = () => "\n" + "  ".repeat(depth);
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
-    if (inString) {
-      if (ch === "\\" && breaks && text[i + 1] === "n") {
-        out += "↵\n" + "  ".repeat(depth + 1);
-        i++;
-      } else if (ch === "\\") {
-        out += ch + (text[++i] ?? "");
-      } else {
-        out += ch;
-        if (ch === '"') inString = false;
-      }
-    } else if (ch === '"') {
-      out += ch;
-      inString = true;
+    if (ch === '"') {
+      i = pushString(text, i, depth, breaks, push);
     } else if (ch === "{" && text[i + 1] === "}") {
-      out += "{}";
+      push("punct", "{}");
       i++;
     } else if (ch === "[" && isInlineArray(text, i, breaks)) {
-      out += ch;
+      push("punct", ch);
       flat = true;
     } else if (ch === "{" || ch === "[") {
       depth++;
-      out += ch + newline();
+      push("punct", ch);
+      push("space", newline());
     } else if (ch === "]" && flat) {
-      out += ch;
+      push("punct", ch);
       flat = false;
     } else if (ch === "}" || ch === "]") {
       depth = Math.max(0, depth - 1);
-      out += newline() + ch;
+      push("space", newline());
+      push("punct", ch);
     } else if (ch === ",") {
-      out += flat ? ", " : ch + newline();
+      push("punct", ch);
+      push("space", flat ? " " : newline());
     } else if (ch === ":") {
-      out += ": ";
+      push("punct", ch);
+      push("space", " ");
     } else {
-      out += ch;
+      let j = i;
+      while (j + 1 < text.length && !'"{}[],:'.includes(text[j + 1])) j++;
+      push("value", text.slice(i, j + 1));
+      i = j;
     }
   }
-  return out;
+  return tokens;
+}
+
+// One string literal, from its opening quote; returns the index of its closing one.
+// A string is a key when a `:` follows it — the canonical form has no space between.
+function pushString(text, start, depth, breaks, push) {
+  let end = start + 1;
+  while (end < text.length && text[end] !== '"') end += text[end] === "\\" ? 2 : 1;
+  end = Math.min(end, text.length);
+  const kind = text[end + 1] === ":" ? "key" : "string";
+  push(kind, '"');
+  for (let i = start + 1; i < end; i++) {
+    if (text[i] !== "\\") {
+      push(kind, text[i]);
+    } else if (breaks && text[i + 1] === "n") {
+      push("mark", "↵");
+      push("space", "\n" + "  ".repeat(depth + 1));
+      i++;
+    } else {
+      const escape = text.slice(i, i + (text[i + 1] === "u" ? 6 : 2));
+      push("escape", escape);
+      i += escape.length - 1;
+    }
+  }
+  if (end < text.length) push(kind, '"');
+  return end;
+}
+
+function indentPayload(argsJson, options) {
+  return payloadTokens(argsJson, options).map(([, piece]) => piece).join("");
 }
 
 // Longest array, as sent, that indentPayload keeps on one line.
@@ -2113,6 +2148,18 @@ function start() {
   //: tool forever" is not a rung anyone should reach by clicking twice.
   const TOOL_CARD_ACTIONS = [["allow", "Allow", "allow"], ["deny", "Deny", "deny"]];
 
+  // The payload's pieces as coloured spans, built with textContent like the rest of
+  // the card: the text is agent-authored, and a span's class is ours.
+  function renderPayload(pre, tokens) {
+    pre.replaceChildren(...tokens.map(([kind, piece]) => {
+      if (kind === "space") return document.createTextNode(piece);
+      const span = document.createElement("span");
+      span.className = `j-${kind}`;
+      span.textContent = piece;
+      return span;
+    }));
+  }
+
   // A tool ask, which shares the card's shell and almost none of its body. No persist
   // confirm panel, no duplicate badge (nothing joins a card by waiting on it), and a
   // payload where an egress card has a URL.
@@ -2144,8 +2191,8 @@ function start() {
     // the newlines indenting adds are control characters to payloadHazards.
     const disclosure = payloadDisclosure(a.args_json);
     const hazards = payloadHazards(a.args_json);
-    const raw = indentPayload(a.args_json, { breaks: true });
-    const escaped = indentPayload(hazards.escaped);
+    const raw = payloadTokens(a.args_json, { breaks: true });
+    const escaped = payloadTokens(hazards.escaped);
     const details = document.createElement("details");
     details.className = "payload";
     details.open = true;
@@ -2155,7 +2202,7 @@ function start() {
     const summary = document.createElement("summary");
     summary.textContent = disclosure.summary;
     const pre = document.createElement("pre");
-    pre.textContent = danger ? escaped : raw;
+    renderPayload(pre, danger ? escaped : raw);
     details.append(summary);
     if (hazards.level !== "none") {
       // Escaped FIRST, raw on request — see payloadHazards for why not the reverse.
@@ -2168,7 +2215,7 @@ function start() {
       box.type = "checkbox";
       box.checked = danger;
       box.addEventListener("change", () => {
-        pre.textContent = box.checked ? escaped : raw;
+        renderPayload(pre, box.checked ? escaped : raw);
       });
       toggle.append(box, document.createTextNode(" escaped"));
       hazard.append(note, toggle);
@@ -4261,6 +4308,6 @@ if (typeof module !== "undefined" && module.exports) {
     RECONNECT_MIN_MS, RECONNECT_MAX_MS, STALE_MAX_MS, COUNTDOWN_URGENT_S,
     DWELL_MS, SATURATION_RECENT_MS, SATURATION_WARN_FRAC,
     RENDERABLE_KINDS,
-    payloadHazards, escapePayload, indentPayload, INLINE_ARRAY_MAX,
+    payloadHazards, escapePayload, indentPayload, payloadTokens, INLINE_ARRAY_MAX,
   };
 }

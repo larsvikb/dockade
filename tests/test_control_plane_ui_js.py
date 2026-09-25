@@ -243,6 +243,14 @@ console.log(JSON.stringify({
     inline_at_max: m.indentPayload(
       JSON.stringify(["x".repeat(m.INLINE_ARRAY_MAX - 4)])),
     inline_break_off: m.indentPayload('{"a":["x\\ny"]}'),
+    tokens_sample: m.payloadTokens(
+      '{"a":"x\\ny","b":[1,true,null],"c":"\\u202e","d":{}}', { breaks: true }),
+    // A colon inside a string does not make it a key; one after it does.
+    tokens_colon: m.payloadTokens('{"a":"b:","c":[":"]}'),
+    tokens_forged_mark: m.payloadTokens('{"b":"x↵"}', { breaks: true }),
+    tokens_escaped_view: m.payloadTokens(
+      m.payloadHazards('{"repo":"safe\u202eevil"}').escaped),
+    tokens_unterminated: m.payloadTokens('{"a":"b\\'),
     // A literal mark in a string would read as a break; the quiet tier names it.
     breaks_forged_mark: m.payloadHazards('{"b":"x↵"}'),
     short: m.payloadDisclosure('{"a":1}'),
@@ -4016,7 +4024,7 @@ class PayloadHazardTests(unittest.TestCase):
         # open, dangerous or not.
         src = APP_JS.read_text()
         self.assertRegex(src, r'const danger = hazards\.level === "danger"')
-        self.assertRegex(src, r"pre\.textContent = danger \? escaped : raw")
+        self.assertRegex(src, r"renderPayload\(pre, danger \? escaped : raw\)")
         self.assertRegex(src, r"box\.checked = danger")
         self.assertRegex(src, r"box\.checked \? escaped : raw")
         self.assertRegex(src, r"details\.open = true;")
@@ -4152,8 +4160,8 @@ class PayloadIndentTests(unittest.TestCase):
         # Breaks in the raw view only: the escaped view is the exact bytes, and the
         # danger tier's default.
         self.assertRegex(
-            src, r"const raw = indentPayload\(a\.args_json, \{ breaks: true \}\)")
-        self.assertRegex(src, r"const escaped = indentPayload\(hazards\.escaped\);")
+            src, r"const raw = payloadTokens\(a\.args_json, \{ breaks: true \}\)")
+        self.assertRegex(src, r"const escaped = payloadTokens\(hazards\.escaped\);")
 
     def test_a_newline_in_a_string_is_a_marked_break_one_level_in(self):
         self.assertEqual(self.probe["tool"]["breaks_body"],
@@ -4182,4 +4190,80 @@ class PayloadIndentTests(unittest.TestCase):
         forged = self.probe["tool"]["breaks_forged_mark"]
         self.assertEqual(forged["level"], "note")
         self.assertIn("↵ x1", forged["note"])
+
+
+@unittest.skipIf(not _NODE and not _STRICT,
+                 "node is not installed — skipping app.js unit tests")
+class PayloadColourTests(unittest.TestCase):
+    """The card colours the payload by kind, and colouring changes no text.
+
+    indentPayload is payloadTokens joined, so every layout test above is also a test
+    of these pieces' text. What is left to hold is the kinds."""
+
+    probe: dict
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.probe = _probe()
+
+    def test_each_piece_has_the_kind_its_place_gives_it(self):
+        self.assertEqual(self.probe["tool"]["tokens_sample"], [
+            ["punct", "{"], ["space", "\n  "],
+            ["key", '"a"'], ["punct", ":"], ["space", " "],
+            ["string", '"x'], ["mark", "↵"], ["space", "\n    "], ["string", 'y"'],
+            ["punct", ","], ["space", "\n  "],
+            ["key", '"b"'], ["punct", ":"], ["space", " "],
+            ["punct", "["], ["value", "1"], ["punct", ","], ["space", " "],
+            ["value", "true"], ["punct", ","], ["space", " "], ["value", "null"],
+            ["punct", "],"], ["space", "\n  "],
+            ["key", '"c"'], ["punct", ":"], ["space", " "],
+            ["string", '"'], ["escape", "\\u202e"], ["string", '"'],
+            ["punct", ","], ["space", "\n  "],
+            ["key", '"d"'], ["punct", ":"], ["space", " "], ["punct", "{}"],
+            ["space", "\n"], ["punct", "}"],
+        ])
+
+    def test_a_key_is_a_string_followed_by_a_colon_and_nothing_else(self):
+        kinds = {text: kind for kind, text in self.probe["tool"]["tokens_colon"]}
+        self.assertEqual(kinds['"a"'], "key")
+        self.assertEqual(kinds['"c"'], "key")
+        self.assertEqual(kinds['"b:"'], "string")
+        self.assertEqual(kinds['":"'], "string")
+
+    def test_a_literal_mark_is_coloured_as_the_string_it_sits_in(self):
+        # The mark's own colour is what tells a real break from a smuggled `↵`.
+        tokens = self.probe["tool"]["tokens_forged_mark"]
+        self.assertIn(["string", '"x↵"'], tokens)
+        self.assertNotIn("mark", [kind for kind, _ in tokens])
+
+    def test_the_escaped_view_colours_the_override_it_spells_out(self):
+        self.assertIn(["escape", "\\u202e"], self.probe["tool"]["tokens_escaped_view"])
+
+    def test_an_unterminated_string_loses_no_text(self):
+        joined = "".join(t for _, t in self.probe["tool"]["tokens_unterminated"])
+        self.assertEqual(joined.replace(" ", "").replace("\n", ""), '{"a":"b\\')
+
+    def test_only_whitespace_goes_uncoloured(self):
+        for key in ("tokens_sample", "tokens_colon", "tokens_escaped_view"):
+            for kind, text in self.probe["tool"][key]:
+                if kind == "space":
+                    with self.subTest(key=key, text=text):
+                        self.assertEqual(text.strip(" \n"), "")
+
+    def test_the_card_builds_its_spans_without_markup(self):
+        # The pieces are agent-authored; a class name is the only thing of ours.
+        body = re.search(r"function renderPayload\(pre, tokens\) \{(.*?)\n  \}",
+                         APP_JS.read_text(), re.S)
+        self.assertIsNotNone(body, "renderPayload not found — did it get renamed?")
+        self.assertIn("span.textContent = piece", body.group(1))
+        self.assertIn("createTextNode(piece)", body.group(1))
+        self.assertNotIn("innerHTML", body.group(1))
+        self.assertNotIn("insertAdjacentHTML", body.group(1))
+
+    def test_every_kind_but_space_and_string_has_a_colour(self):
+        # A string keeps the payload's default colour; the rest need a rule.
+        html = (APP_JS.parent / "index.html").read_text()
+        for kind in ("key", "value", "escape", "punct", "mark"):
+            with self.subTest(kind):
+                self.assertRegex(html, rf"\.j-{kind}\b[^{{]*\{{[^}}]*color:")
 

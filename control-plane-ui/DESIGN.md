@@ -113,7 +113,8 @@ card's indentation is whitespace between tokens (`indentPayload`), with one exce
 A `\n` inside a string is drawn as `↵` and a line break, because a PR body as one line
 of escapes is the text most worth reading and the hardest to read. The mark is what
 keeps a break inside a string from passing for one between fields, so a payload
-carrying its own `↵` is named in the note. Nothing else is unescaped, and the escaped
+carrying its own `↵` is named in the note, and shows it in the string's colour rather
+than the mark's. Nothing else is unescaped, and the escaped
 view shows `\n` as written. The other change to content runs the opposite way: a
 payload carrying invisible or non-ASCII characters is shown *escaped* by default, `\u202e` spelled out where it
 sits, with the raw text one click away — because a bidi override lets the browser

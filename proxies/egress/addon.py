@@ -671,7 +671,7 @@ def _probe_metadata_reachable() -> None:
             "cloud sanity check: instance-metadata service is REACHABLE from the egress "
             "proxy (%s:%d). The relay guard blocks it for literal/known targets, but the "
             "DNS-rebind gap is best-effort — on a cloud host, pin the resolved IP (see "
-            "DESIGN.md). Heads-up, not a boundary.", METADATA_IP, port)
+            'SECURITY.md, "Known open findings"). Heads-up, not a boundary.', METADATA_IP, port)
         return
     logger.info(
         "cloud sanity check: instance-metadata service not reachable (%s) — the "

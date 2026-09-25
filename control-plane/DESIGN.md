@@ -80,8 +80,9 @@ is exactly why the operator picks and why the pattern is shown verbatim in a ste
 it is still reversible. The audit trail also learned to say whether policy changed at
 all — the reason now reads `human approval (standing rule written) [peer=…]` vs
 `(this request only)`, from the durable `mode` column. Naming the *pattern* there would
-need a new column on `approvals`, which has no migration step (see the NOTE above
-`_seed_if_empty`); the rule itself is recorded with its pattern and `source='operator'`
+need a new column on `approvals`, which is a migration step and not a DDL edit (see the
+NOTE above `_seed_if_empty`); the rule itself is recorded with its pattern and
+`source='operator'`
 in the rules table, and every later use of it is audited as `allowed by rule (…)`.
 
 **A lease is the third grant duration.** The resolve vocabulary had two rungs — this

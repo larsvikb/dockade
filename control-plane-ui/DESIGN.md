@@ -259,5 +259,4 @@ first push (a reload delivers the whole queue as arrivals), stays quiet while th
 approvals view is on screen, and closes a notice when its hold leaves the queue however
 it left. The rules are `approvalNotices` / `shouldNotify` in `app.js`. Its one
 environmental dependency: a secure context, which `127.0.0.1` satisfies over plain HTTP
-and another origin would not — so the button says so rather than going quiet. A real audit
-browser (filter/search/history) would extend this navigation rather than replace it.
+and another origin would not — so the button says so rather than going quiet.

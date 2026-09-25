@@ -19,11 +19,12 @@ root, and this file does not repeat it:
 ## The relay guard — refused before policy is asked
 
 **Control-plane relay guard (the proxy is the bridge, so the proxy must refuse
-it).** The egress proxy is the *one* component attached to both `sandbox-net` and
+it).** The egress proxy is one of two components attached to both `sandbox-net` and
 a control network (`authorize-net` — see "The third net" in `DESIGN.md`; it is
-deliberately **not** on `control-net`), so segmentation alone does **not** isolate
-the agent from the control plane — the proxy could in principle relay a connection
-onto that network. It therefore hard-refuses, **before** any policy /
+deliberately **not** on `control-net`). The other, the MCP gateway, carries no relay
+to turn (`tool-gateway/app.py`); this one does, so segmentation alone does **not**
+isolate the agent from the control plane — the proxy could in principle relay a
+connection onto that network. It therefore hard-refuses, **before** any policy /
 permanent-lifeline / port check, any destination that names a control-plane host (`control-plane`,
 `control-plane-ui`) or resolves into **any** control subnet — every network the
 control plane is homed on, not only the one this proxy can route to, because
@@ -95,8 +96,8 @@ alone); the resolve branch is **best-effort** — it depends on a DNS lookup, so
 carries a TOCTOU/rebind gap (mitmproxy re-resolves when it dials) and can be
 skipped on resolution failure (logged, returns "not forbidden" — safe, because an
 unresolvable name is also undialable, and reaching the control plane is prevented
-first by topology and by the port gate: the control plane listens on `:8090` and
-`:8091` while CONNECT/HTTP are gated to `:443`/`:80`, so a rebound name is dialed
+first by topology and by the port gate: the control plane listens on `:8090`, `:8091`
+and `:8092` while CONNECT/HTTP are gated to `:443`/`:80`, so a rebound name is dialed
 on a port nothing serves). **That last bound covers the control plane and nothing
 else** — the other destinations this guard exists to refuse (the metadata IP, the
 Docker host, the LAN) answer on the very `:80`/`:443` the port gate permits, so for

@@ -217,7 +217,7 @@ destination — pointing opencode elsewhere yields a rejected connection, not eg
 That is the "capability, not configuration" split in miniature.
 
 **The harness's prompt budget is trimmed by capability, not by taste.** On a 24k window
-the base prompt is a quarter of it and tool descriptions are its largest part
+the base prompt is over a third of it and tool descriptions are its largest part
 (decomposition in `opencode-sandbox/NOTES.md`), so `opencode.json` disables the tools
 this tier has no capability behind — the rationale is in `tier-setup.sh`, beside the
 list. The system prompt is deliberately left as upstream ships it. Replacing it is

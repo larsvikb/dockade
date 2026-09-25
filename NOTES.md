@@ -381,8 +381,9 @@ at startup without holding one.
 **25 tools, every one `readOnlyHint: true` — and the flag is what does it.** Re-running
 the same probe with `GITHUB_MCP_READ_ONLY=0` and nothing else changed returns **41
 tools, 16 of them not read-only**, so `GITHUB_READ_ONLY` really filters in v1.9.0 rather
-than being the silently inert flag it was through v0.31.0
-(github/github-mcp-server#2156). The toolset selection is not what produced the
+than being the silently inert flag it was through v0.32.0
+(github/github-mcp-server#2156, fixed in v0.33.0 by #2208). The toolset selection is
+not what produced the
 read-only list. This is defence in depth and still not the boundary — the flag was
 believed to work before, too.
 
@@ -440,7 +441,7 @@ tags, not measured against a running container.
 `d.lockdownMode && ghcontext.IsLockdownMode(ctx)` (`pkg/github/dependencies.go`) — the
 server setting AND a per-request `X-MCP-Lockdown` header, which nothing in dockade sends.
 v1.10.0 (github/github-mcp-server#3112) made it `||`, so the server setting is an upper
-bound on its own. It is the same shape as the read-only flag through v0.31.0: set,
+bound on its own. It is the same shape as the read-only flag through v0.32.0: set,
 documented, and doing nothing. The consequence of the bump is that lockdown turns ON —
 public-repo content from authors without push access is filtered from results.
 

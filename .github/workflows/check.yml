@@ -21,7 +21,7 @@
 # manual `make boundary`, i.e. a firewall regression is invisible to every other
 # check here. It rides on `build` rather than a third job because that job has
 # already compiled the images into this runner's daemon; a separate job shares no
-# layer cache and would rebuild all five from scratch to run a two-minute check.
+# layer cache and would rebuild every image from scratch to run a two-minute check.
 name: check
 
 on:

@@ -138,8 +138,8 @@ report.
   reachable by anything on the host, and the frontend's guards are browser-enforced,
   so they do not constrain it. Authentication would not close it either: any
   credential at rest on the host is readable by that same process. Closing it needs a
-  human-presence gesture the host cannot replay. See *Browser-facing guards on the
-  frontend (and their honest limit)* in `control-plane-ui/DESIGN.md`.
+  human-presence gesture the host cannot replay. See "Browser-facing guards on the
+  frontend (and their honest limit)" in `control-plane-ui/DESIGN.md`.
 - **The read-write workspace bind mount as a delayed path to host execution.**
   Anything the agent writes there — a git hook, a build script, `.envrc`, an editor
   task file — runs outside the sandbox the next time the host touches the repo. The
@@ -148,8 +148,8 @@ report.
   acknowledged cost of the one deliberate host coupling.
 - **`WebSearch` being unauditable.** It executes server-side on Anthropic
   infrastructure, so no local firewall or proxy can see it. It is read-only and left
-  enabled as a standing, revisitable decision. See *Server-side execution: accepted
-  governance blind spots*.
+  enabled as a standing, revisitable decision. See "Server-side execution: accepted
+  governance blind spots" in `DESIGN.md`.
 - **Any Claude Code settings file being bypassable**, including a
   `permissions.deny` and a local `managed-settings.json`. No client settings file is
   a containment boundary here, and under organisation authentication the local

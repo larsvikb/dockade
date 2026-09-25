@@ -356,21 +356,23 @@ class CrossReferenceTests(_NeedsGit):
                                        "convention changed and this checks nothing")
 
 
-class CodeCitationTests(_NeedsGit):
-    """A section a CODE comment cites, as ``DESIGN.md, "X"`` or ``"X" in NOTES.md``, is
-    in the file it names.
+class SectionCitationTests(_NeedsGit):
+    """A section cited by FILE, as ``DESIGN.md, "X"`` or ``"X" in NOTES.md``, is in the
+    file it names, whether a code comment cites it or another doc does.
 
-    ``CrossReferenceTests`` holds the docs' own references; comments cite sections the
-    same way, from the other end, and nothing read them. The first run found
-    `docker-compose.yml` sending readers to DESIGN.md for "Operational constraints", a
-    heading that is in NOTES.md. Resolved in the NAMED file, because a reference is only
-    as good as the file a reader opens, and as text rather than as a heading: a comment
-    may quote a phrase from inside a section."""
+    ``CrossReferenceTests`` resolves a bare ``see "X"`` against every doc at once, which
+    suits a reference that names no file and is too lax for one that does. The first
+    run found `docker-compose.yml` sending readers to DESIGN.md for "Operational
+    constraints", a heading that was in NOTES.md. Resolved in the NAMED file, because a
+    reference is only as good as the file a reader opens, and as text rather than as a
+    heading: a comment may quote a phrase from inside a section. The path is from the
+    repo root, so `DESIGN.md` inside `opencode-sandbox/` still means the root one."""
 
-    #: `DESIGN.md, "X"`, `NOTES.md "X"`, `DESIGN.md → "X"`, and `"X" in DESIGN.md`. The
-    #: separator is required, so a file name inside a string literal is not a citation.
+    #: `DESIGN.md, "X"`, `NOTES.md "X"`, `DESIGN.md → "X"` (the name may be backticked),
+    #: and `"X" in DESIGN.md`. The separator is required, so a file name inside a string
+    #: literal is not a citation.
     NAMED_FIRST = re.compile(
-        r'\b([\w./-]*[A-Z][\w./-]*\.md)(?:,\s*|:\s*|\s+|\s*→\s*)"([^"]{4,120})"')
+        r'\b([\w./-]*[A-Z][\w./-]*\.md)`?(?:,\s*|:\s*|\s+|\s*→\s*)"([^"]{4,120})"')
     QUOTE_FIRST = re.compile(r'"([^"]{4,120})"\s+in\s+`?([\w./-]*[A-Z][\w./-]*\.md)\b')
 
     @staticmethod
@@ -382,11 +384,11 @@ class CodeCitationTests(_NeedsGit):
     def _norm(s: str) -> str:
         return re.sub(r"\s+", " ", s.lower().replace("*", "").replace("`", "")).strip()
 
-    def test_every_section_a_comment_cites_is_in_the_file_it_names(self):
+    def test_every_cited_section_is_in_the_file_it_names(self):
         checked = 0
         for name in _tracked():
             path = ROOT / name
-            if name.endswith(".md") or not path.is_file():
+            if not path.is_file():
                 continue
             try:
                 text = self._flat(path.read_text())
@@ -402,8 +404,8 @@ class CodeCitationTests(_NeedsGit):
                                                       f"does not exist")
                     self.assertTrue(self._norm(ref) in self._norm(target.read_text()),
                                     f'{name} cites {doc} "{ref}", which is not in it')
-        self.assertGreater(checked, 0, "no citations found in code — the syntax "
-                                       "changed and this checks nothing")
+        self.assertGreater(checked, 0, "no citations found — the syntax changed and "
+                                       "this checks nothing")
 
 
 class CitedArtifactTests(_NeedsGit):

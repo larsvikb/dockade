@@ -1,25 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 """Policy matching — what a stored rule means, and what a request decides to.
 
-Every function here is a pure reading of a policy table: ``_decide`` answers
-allow/deny/hold for a host AND the class of client asking, and the rest exist so
-that nothing else has to re-derive what a pattern matches. That is the point of
-the module — a leading dot is a subdomain wildcard, and the two places that must
-agree about it (the matcher and the patterns an operator may persist) are written
-side by side so they cannot drift.
+``_decide`` answers allow/deny/hold for a host AND the class of client asking; the
+rest exist so that nothing else re-derives what a pattern matches. A leading dot is a
+subdomain wildcard, and the two places that must agree about it (the matcher and the
+patterns an operator may persist) sit side by side so they cannot drift.
 
-``_decide`` reads TWO tables, and the second is the one that expires: a lease is an
-allow scoped to one host, one client class and a deadline (``_live_lease``). It is
-consulted last, so it loses to a block like any other allow — see ``_decide``.
+``_decide`` reads two tables. The second, leases, holds allows that expire
+(``_live_lease``), and is consulted last, so a lease loses to a block like any
+other allow.
 
-``_decide_tool`` at the bottom does the same job for the MCP gateway's own table,
-and shares no code with the host matcher on purpose: it is here to be read next to
-``_decide``, because the ways the two differ are each a decision.
+``_client_class`` maps a peer address to the class a rule is scoped to. It lives
+beside the matcher that consumes it, not in the proxy that observed the address.
 
-``_client_class`` is the second half of that: a rule is scoped to a client class,
-so the mapping from an observed peer address to a class name lives here, beside
-the matcher that consumes it, rather than in the proxy that observed the address.
-That placement is deliberate — see the comment above ``CLIENT_CLASSES``.
+``_decide_tool`` at the bottom does the same job for the MCP gateway's table and
+shares no code with the host matcher: it sits next to ``_decide`` because each way
+the two differ is a decision.
 """
 from __future__ import annotations
 
@@ -30,41 +26,17 @@ import time
 
 import store
 
-# What a client is, for policy purposes: the INGRESS NETWORK it reached the proxy
-# on, named. Everything below hangs off that one choice, so the reasoning for it:
+# What a client is, for policy purposes: the ingress network it reached the proxy on,
+# named. Why the network and not the address, and why the mapping lives here and not
+# in the proxy: DESIGN.md, "Policy is scoped to a client class".
 #
-# A single global allowlist is the union of every client's needs, and it stops being
-# least privilege the moment there is a second consumer. Since mcp-net the egress
-# proxy has one: MCP server containers, which hold a credential the sandbox must not
-# have and want a different, usually narrower, set of hosts. Without a class on the
-# rule, every host an operator ever approved for the agent is reachable by every
-# container the proxy serves — attaching a network to that proxy adds a CLIENT
-# POPULATION, not just a route.
-#
-# The identity is the NETWORK and not the address, because the network is provable
-# from the topology while an address is not: sandboxes are ephemeral and Docker hands
-# out `.2` to whichever container starts first, so a rule keyed to an address would
-# silently transfer to the next tenant of it (the same caveat /api/audit states about
-# reading a grouped `client`).
-#
-# Mapped HERE rather than in the proxy, even though the proxy is what observes the
-# peer address and already CIDR-matches one for the permanent lifeline. The lifeline
-# is the one allow made without asking this service, so its client check has to live
-# where the decision does; every other decision is the policy authority's, and the
-# proxy is deliberately client-agnostic about them (see ``_is_lifeline`` in
-# proxies/egress/addon.py). Keeping the classification on this side also means one
-# mapping serves however many governed proxies call /authorize, rather than each one
-# carrying a copy to drift.
-#
-# Defaults mirror docker-compose.yml; tests/test_topology.py holds them equal to the
-# real subnets, so renaming a network's subnet without this fails the suite. An
-# address in no listed range is UNCLASSIFIED, which matches no rule and is therefore
-# held — the fail-safe direction, and the same default-deny an unknown host gets.
+# Defaults mirror docker-compose.yml, and tests/test_topology.py holds them equal to
+# the real subnets. An address in no listed range is UNCLASSIFIED, which matches no
+# rule and is therefore held, like an unknown host.
 CLIENT_CLASSES_DEFAULT = "sandbox=172.30.0.0/24,mcp=172.28.0.0/24"
-# The class of a client whose address is in none of the ranges above. Not a valid
-# rule scope: ``resolve`` refuses to persist one (a rule keyed to "whoever we could
-# not identify" would grant to every future unidentified client, which is the
-# union-of-needs erosion this whole dimension exists to stop).
+# Not a valid rule scope: ``api_approvals.resolve`` refuses to persist one, because a
+# rule for "whoever we could not identify" would grant every future unidentified
+# client.
 UNCLASSIFIED = "unclassified"
 
 
@@ -98,10 +70,9 @@ CLIENT_CLASSES = _parse_client_classes(
 def _class_names() -> tuple[str, ...]:
     """Every configured class name, in listed order, deduplicated.
 
-    A class may span several CIDRs, so the parsed pairs repeat names; this is the set
-    a rule may legitimately be scoped TO. UNCLASSIFIED is absent by construction —
-    ``_parse_client_classes`` refuses it as a name — which is what makes this usable
-    as the validation list for an operator-supplied class without a second exclusion."""
+    The set a rule may be scoped to. UNCLASSIFIED is absent because
+    ``_parse_client_classes`` refuses it as a name, so this validates an
+    operator-supplied class without a second exclusion."""
     seen: list[str] = []
     for name, _ in CLIENT_CLASSES:
         if name not in seen:
@@ -122,8 +93,6 @@ def _client_class(client: str | None) -> str:
     except ValueError:
         return UNCLASSIFIED
     for name, net in CLIENT_CLASSES:
-        # Containment never crosses address families, so a v4 client simply misses a
-        # v6 range and vice versa — no need to guard the version explicitly.
         if addr.version == net.version and addr in net:
             return name
     return UNCLASSIFIED
@@ -132,26 +101,20 @@ def _client_class(client: str | None) -> str:
 def _normalize_host(host: str) -> str:
     """A hostname in the ONE form ``_decide`` compares and the lease table stores.
 
-    The trailing FQDN dot goes for the reason ``_decide`` always removed it: `evil.com.`
-    and `evil.com` are the same destination, so an operator's block of one must not miss
-    the other. What is new is that a second consumer now needs the identical shape — a
-    lease is matched by EQUALITY against this (``_live_lease``), so a host normalized
-    differently on the two paths is a grant no request can ever equal.
+    The trailing FQDN dot goes: `evil.com.` and `evil.com` are the same destination,
+    so a block of one must not miss the other. A lease is matched by EQUALITY against
+    this form (``_live_lease``), so a host normalized differently on the two paths is
+    a grant no request can ever equal.
 
-    A LEADING dot survives, unlike in ``_persist_candidates``. That asymmetry is the
-    point: a pattern is a namespace an operator picked from a bounded set, while this is
-    whatever the agent asked for, and folding `.example.com` down to `example.com` here
-    would silently widen a grant to the parent name.
+    A LEADING dot survives, unlike in ``_persist_candidates``: this is whatever the
+    agent asked for, and folding `.example.com` down to `example.com` would widen a
+    grant to the parent name.
 
-    Surrounding whitespace also survives, where ``_persist_candidates`` strips it, and
-    that is deliberately NOT tidied. This is the matcher's own normalization, unchanged
-    from before leases existed and doing the same two things to a name that the proxy's
-    relay guard does (``_forbidden_reason`` lowercases and drops the trailing dot too;
-    it additionally unbrackets IPv6, which nothing here needs). Adding a ``strip()``
-    would make a padded host match a rule it currently misses, and on an ALLOW rule
-    that is a loosening. As-is, a padded host stays unknown and gets a card — the
-    fail-safe direction — and a lease stored for one is padded identically, so it still
-    matches itself."""
+    Surrounding whitespace survives too, deliberately. A ``strip()`` would make a
+    padded host match a rule it currently misses, which on an allow rule is a
+    loosening; as it is, a padded host stays unknown and gets a card. The proxy's
+    ``_forbidden_reason`` (proxies/egress/addon.py) does the same two things to a
+    name."""
     return (host or "").lower().rstrip(".")
 
 
@@ -172,12 +135,9 @@ def _match(host: str, pattern: str) -> bool:
 def _pattern_scope(pattern: str) -> str:
     """How broadly a stored pattern matches, in words, for the rules view.
 
-    Derived HERE, beside the ``_match`` that implements it, so the UI cannot drift
-    from the real semantics. It matters because a leading dot is a SUBDOMAIN WILDCARD
-    while looking like an ordinary hostname: a rule persisted for ``.example.com``
-    also grants every subdomain, and nothing in the approval flow says so (the
-    pattern comes verbatim from the requested host — see the rule-management item in
-    control-plane/DESIGN.md). Naming the scope is the cheap half of that fix."""
+    Beside the ``_match`` that implements it, so the two cannot disagree. A leading
+    dot is a subdomain wildcard that looks like an ordinary hostname, so a rule for
+    ``.example.com`` needs saying out loud."""
     return "host + subdomains" if pattern.startswith(".") else "exact host"
 
 
@@ -190,13 +150,11 @@ _WILDCARD_MIN_LABELS = 2
 def _persist_candidates(host: str) -> list[str]:
     """The patterns an operator may persist for a held host, NARROWEST FIRST.
 
-    Exists because ``resolve`` used to store the requested host verbatim. Two facts
-    made that sharper than it looks: a leading dot is a subdomain wildcard (``_match``),
-    and the host on an approval is chosen by the AGENT — so a request for
-    ``.example.com`` persisted a rule covering every subdomain of example.com, and
-    nothing in this system revokes a rule. Deriving the candidate set here, in the
-    module that defines matching, makes exact-vs-wildcard an *operator choice from a
-    bounded set* instead of a string the requester supplies.
+    The host on an approval is chosen by the AGENT, and a leading dot is a subdomain
+    wildcard (``_match``), so storing it verbatim would let a request for
+    ``.example.com`` persist a rule for every subdomain. Deriving the candidates here
+    makes exact-vs-wildcard an operator's choice from a bounded set, not a string the
+    requester supplies.
 
     Three at most, in increasing order of breadth — so the first is both the safest and
     the default:
@@ -238,27 +196,21 @@ def _persist_candidates(host: str) -> list[str]:
     return out
 
 
-# What a stored pattern may contain, per label. Deliberately narrower than DNS
-# permits: this is the charset of a hostname an agent could actually ask for, and a
-# pattern outside it can only ever be a typo or an injection attempt, never a rule
-# that decides anything. Underscore is in because service names (`_dns.example.com`)
-# use it and a resolver will happily be asked for one.
+# What a stored pattern may contain, per label: narrower than DNS permits, because a
+# pattern outside a hostname's charset is a typo or an injection attempt, never a
+# rule that decides anything. Underscore is in for service names (`_dns.example.com`).
 _LABEL_RE = re.compile(r"^[a-z0-9_-]+$")
-# The DNS name ceiling. A bound rather than a semantic check: patterns are stored,
-# listed in full by the rules view and compared on every decision, so an unbounded
-# one is a way to bloat the crown-jewel store through a governance endpoint.
+# The DNS name ceiling, as a size bound: patterns are stored, listed in full and
+# compared on every decision.
 _PATTERN_MAX_LEN = 253
 
 
 def _normalize_pattern(pattern: str) -> str:
     """A pattern as the store holds it: trimmed, lowercased, trailing FQDN dot removed.
 
-    The single definition of that shape, because two paths now write rules — a
-    ``*_persist`` approval (whose candidates ``_persist_candidates`` already produces
-    in this form) and direct operator creation — and a pattern normalized differently
-    by one of them is a rule that silently never matches. ``_decide`` lowercases the
-    host and strips its trailing dot before comparing, so anything this does not
-    remove here is a mismatch that reads, in the rules view, as policy in force.
+    One definition, because two paths write rules — a ``*_persist`` approval and
+    direct operator creation — and a pattern normalized differently by one of them
+    silently never matches, while reading in the rules view as policy in force.
 
     A LEADING dot survives: it is the subdomain-wildcard marker (``_match``), which is
     why this cannot be the ``.strip('.')`` used for a host."""
@@ -270,12 +222,10 @@ def _rule_error(pattern: str, action: str) -> str | None:
     """Why ``pattern`` cannot be stored as an ``action`` rule, or None if it can.
     Expects an already-``_normalize_pattern``'d pattern.
 
-    The validation an operator-supplied pattern needs and a persisted one does not:
-    ``_persist_candidates`` derives its patterns from a host the proxy observed, so
-    they are well-formed and bounded by construction. Here the string comes from a
-    caller, and a rule is standing policy — a malformed one is refused outright rather
-    than stored inert, because an inert rule reads as policy in force in the rules view
-    and the operator stops asking why the host is still being held.
+    Only an operator-supplied pattern needs this: ``_persist_candidates`` derives its
+    patterns from an observed host, well-formed by construction. A malformed pattern
+    is refused rather than stored inert, because an inert rule reads as policy in
+    force and the operator stops asking why the host is still being held.
 
     **The wildcard floor applies to ALLOW only, and the asymmetry is the point.** A
     one-label wildcard is ``.com``: as an allow it ends governance for an entire TLD in
@@ -316,30 +266,23 @@ def _rule_error(pattern: str, action: str) -> str | None:
 
 
 # ── leases: an allow that expires ────────────────────────────────────────────
-# How long an `allow_lease` grant decides for, and it lives HERE — beside the pass
-# that enforces the expiry — rather than with ``holds.HOLD_TIMEOUT``. The two are
-# unrelated timers that a reader will otherwise conflate: HOLD_TIMEOUT bounds how
-# long a human has to ANSWER, this bounds how long the answer LASTS. (Which is also
-# why nothing in this feature is called a "window": that word is already taken.)
+# How long an `allow_lease` grant decides for. Not to be confused with
+# ``holds.HOLD_TIMEOUT``: that bounds how long a human has to ANSWER, this how long
+# the answer LASTS (so nothing here is called a "window", which is taken).
 #
-# 30 minutes rather than the 5 the feature was first sketched with, and revocation is
-# what made that safe: `/api/egress/leases/{id}/revoke` closes a grant early, so the
-# duration stopped being a safety floor and became an ergonomics number — long enough
-# that an agent finishes what it was doing without a second card.
-#
-# Configurable, and the ACTION NAME deliberately does not encode the number for that
-# reason: an `allow_5m` button on a store configured for 30 minutes would be a lie
-# nothing could catch.
+# An ergonomics number, not a safety floor, because `/api/egress/leases/{id}/revoke`
+# closes a grant early: long enough that an agent finishes without a second card.
+# Configurable, which is why the action is not named for its duration — an
+# `allow_5m` button on a store set to 30 minutes would be a lie nothing catches.
 LEASE_SECONDS = float(os.environ.get("CONTROL_LEASE_SECONDS", "1800"))
 
 
 def _live_lease(conn, host: str, client_class: str, now: float):
     """The live lease covering ``host`` for ``client_class``, or None.
 
-    Expiry is enforced HERE, in the read, rather than by a sweeper — so a row that
-    outlives its deadline cannot grant no matter what did or did not delete it. The
-    sweep on the grant path (see the lease branch in ``resolve``) only bounds the
-    table's size; it is not what makes a lease end.
+    Expiry is enforced HERE, in the read, so a row that outlives its deadline cannot
+    grant whatever did or did not delete it. The sweep in ``api_approvals.resolve``'s
+    lease branch only bounds the table's size.
 
     ``host`` is matched by equality on the ``_normalize_host`` form, never by
     ``_match``: a lease names one destination and has no wildcard to widen along.
@@ -357,16 +300,14 @@ def _live_lease(conn, host: str, client_class: str, now: float):
 
 def _decide(host: str, client_class: str) -> tuple[str, str]:
     """(decision, reason). Block wins over allow; an unmatched host is HELD for
-    human approval (2b) rather than denied outright.
+    human approval rather than denied outright.
 
-    A rule decides only for the class it was written for. Both halves of the key
-    matter and they fail differently: a host with no rule at all is unknown, while a
-    host allowed for ANOTHER class is a least-privilege boundary doing its job — and
-    those are indistinguishable to an operator who is looking at a rule they are sure
-    they already approved. So the hold reason names the classes that DO match, which
-    is the whole of what "why am I being asked this again" needs answering.
+    A rule decides only for the class it was written for. A host with no rule at all
+    and a host allowed only for ANOTHER class look the same to an operator sure they
+    already approved it, so the hold reason names the classes that do match — which
+    answers "why am I being asked this again".
 
-    THREE passes now, and their order is the decision. Blocks first, then standing
+    Three passes, and their order is the decision. Blocks first, then standing
     allows, then live leases:
 
       - A lease is an allow that expires, so it LOSES TO A BLOCK exactly as any allow
@@ -390,16 +331,13 @@ def _decide(host: str, client_class: str) -> tuple[str, str]:
         for r in mine:
             if r["action"] == "allow" and _match(host, r["pattern"]):
                 return "allow", f"allowed by rule ({r['pattern']} for {client_class})"
-        # Same connection as the rules read, so one decision is one open of the store
-        # rather than two — and the lease is only consulted when no rule decided, which
-        # is what keeps this off the path of every already-allowed request.
+        # Same connection as the rules read, and reached only when no rule decided, so
+        # an already-allowed request never pays for it.
         now = time.time()
         lease = _live_lease(conn, host, client_class, now)
     if lease is not None:
         # The remaining time goes IN THE REASON, so the trail explains a burst of
-        # allows on its own terms. Without it the log shows one human approval followed
-        # by traffic with no recorded cause: the record would exist and still not
-        # answer why any individual request was allowed.
+        # allows after one human approval without anyone reconstructing it.
         return "allow", (f"allowed by lease ({host} for {client_class}, "
                          f"{_short_duration(lease['expires_at'] - now)} left)")
     elsewhere = sorted({r["client_class"] for r in rows
@@ -438,12 +376,10 @@ SECRET_PLACEHOLDER = "{secret}"  # noqa: S105 (the hole a secret goes in, not on
 # than to anything looser: whatever is stored here must be dialable, and the failure
 # mode of a name that is not is a tool surface that never answers.
 _SERVER_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
-# A tool name is compared byte-for-byte by ``_decide_tool``, so its charset is a
-# STORAGE bound rather than a semantic one: the characters MCP servers use in
-# practice, plus the ':' that namespaced names carry. The consequence is worth
-# stating because it is a real limit — a server exposing a tool outside this charset
-# cannot have a rule written for it, and an unconfigured tool is denied, so that tool
-# is unreachable rather than ungoverned. Widen this if such a server ever appears.
+# A tool name is compared byte-for-byte by ``_decide_tool``, so this is a storage
+# bound: the characters MCP servers use in practice, plus ':' for namespaced names. A
+# tool outside it cannot have a rule, so it is denied — unreachable, not ungoverned.
+# Widen this if such a server appears.
 _TOOL_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 # An HTTP field name, narrower than the RFC's token: the characters a header an
 # operator would actually configure is spelled with.
@@ -533,11 +469,11 @@ def _decide_tool(server: str, tool: str) -> tuple[str, str]:
     The SERVER's state is part of the decision, not a separate gate the caller
     applies afterwards. A rule on a server nobody registered, or on one an operator
     switched off, decides nothing here — it denies. The disable switch means "the
-    gateway will no longer dial this server" (``edit_mcp_server``), and a gateway that
-    asks anyway must get a refusal from the authority rather than a grant it is
-    trusted not to act on. Two lookups rather than one JOIN, because the REASONS
-    differ and each names a different operator action: an unregistered server needs
-    registering, a disabled one enabling, an unconfigured tool a rule.
+    gateway will no longer dial this server" (``api_mcp.edit_mcp_server``), and a
+    gateway that asks anyway must get a refusal from the authority rather than a
+    grant it is trusted not to act on. Two lookups rather than one JOIN, because the
+    REASONS differ and each names a different operator action: an unregistered server
+    needs registering, a disabled one enabling, an unconfigured tool a rule.
 
     Every failure direction is a deny, including a stored action this code does not
     recognize. That last case is not reachable through the API — it validates on

@@ -469,7 +469,7 @@ single-container image and launcher centered on this design. Notable properties:
   both) and host-uid matching behave identically, verified by a build +
   `boundary-check.sh` pass on the Debian base. The Ubuntu LTS+ESM support window is
   the one trade-off, minor under rebuild-to-update.
-- Baseline stack: **Node current LTS (24.x)** + pipx, plus baked linters
+- Baseline stack: **Node, current LTS** + pipx, plus baked linters
   (shellcheck / hadolint / ruff / yamllint, all self-contained so they run under
   default-deny egress). Node tracks the latest LTS line (even majors); bump the NodeSource
   `setup_NN.x` major to move it. Firewall allowlist trimmed to this design
@@ -1033,7 +1033,8 @@ the safe direction.
 **Hold-for-approval.** An unmatched host is no longer denied
 outright: `_decide` returns **`hold`**, and `/authorize` records a pending
 approval and **blocks** the request until a human resolves it or
-`CONTROL_HOLD_TIMEOUT` (default 120s) elapses → default-deny. The proxy is
+`CONTROL_HOLD_TIMEOUT` elapses (its default is beside it in `control-plane/holds.py`)
+→ default-deny. The proxy is
 unchanged except for a longer authorize timeout to cover the wait — it still
 sees only allow/deny (the hold is internal to the control plane). A human
 resolves holds in a **live SSE UI** served at `/`, and the vocabulary is a ladder
@@ -1829,13 +1830,15 @@ absence of a probe is not evidence of a problem.
 
 ## Resource limits — blast radius, not boundary
 
-Both sandbox tiers are capped by their launcher — tier 1 at 4g, tier 2 at 2g, both
-`--cpus=4 --pids-limit=512` and both overridable per launch via `SANDBOX_MEMORY` /
-`SANDBOX_CPUS`. The infra services are capped in `docker-compose.yml`
-(1g/512m/256m). Everywhere, swap is disabled by setting the swap ceiling equal to
-the memory ceiling (`--memory-swap` / `memswap_limit`): Docker otherwise defaults
-swap to 2x memory, so a bare 4g cap really means 4g RAM + 4g swap — on a 15 GiB
-host, a ceiling above what exists is no ceiling at all. These are **not** a
+Both sandbox tiers are capped by their launcher — memory, CPUs and pids, tier 2
+lower — and both are overridable per launch via `SANDBOX_MEMORY` / `SANDBOX_CPUS`;
+the defaults sit at the top of each `run-*-sandbox.sh`. The infra services are capped
+per service (`mem_limit` in `docker-compose.yml` and `mcp-servers.yml`). Everywhere,
+swap is disabled by setting the swap ceiling equal to the memory ceiling
+(`--memory-swap` / `memswap_limit`, which `tests/test_topology.py` holds equal for
+every capped service): Docker otherwise defaults swap to 2x memory, so a bare cap
+really means that much RAM plus as much again in swap — on a host with less than
+twice the cap, a ceiling above what exists is no ceiling at all. These are **not** a
 containment boundary and nothing about the threat model rests on them — the
 boundary is capability (network segmentation, dropped caps, non-root, no
 control-plane route).
@@ -1916,9 +1919,7 @@ the tier-2 local-model sandbox". What it shares with tier 1:
 launcher plumbing means both tiers run *byte-identical* enforcement; each image
 supplies only a `tier-setup.sh` hook for its own declarative config. A firewall fix
 lands in both tiers at once, and neither tier can drift into a weaker posture
-unnoticed. Tier 1 re-verified unchanged after the extraction (15/15, including
-`api.anthropic.com reachable via proxy` and all six proxy refusals).
-`init-firewall.sh` gained a **third mode** alongside GOVERNED and STANDALONE:
+unnoticed. `init-firewall.sh` has a **third mode** alongside GOVERNED and STANDALONE:
 
 | Mode | Selected by | Permits |
 | --- | --- | --- |

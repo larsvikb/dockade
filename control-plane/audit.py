@@ -1,15 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Audit VIEWS — the read queries behind the decisions interface.
+"""Audit VIEWS — the read queries behind the decisions interface: filters, and the
+history the glance deliberately truncates.
 
-The audit table is the artifact this design exists to keep trustworthy, and until
-now the only way to read it was the live forty-row summary at ``/api/audit`` (plus
-``make logs-cp``, which is a tail, and `sqlite3` against the volume, which is not an
-interface). This module is what makes it *browsable*: filters, and the history the
-summary deliberately truncates.
-
-**Two views over one table, not one view with a page parameter.** The distinction is
-the same one ``api_audit``'s docstring already drew and it is worth keeping in the
-code shape rather than in a flag:
+**Two views over one table, not one view with a page parameter**, kept in the code
+shape rather than in a flag (control-plane/DESIGN.md, "Browsing it: two views"):
 
   - ``grouped`` — the GLANCE. Folds rows whose displayed fields are identical, bounds
     its work by event count, and answers "what is happening". It cannot page, because
@@ -40,10 +34,11 @@ from __future__ import annotations
 # one thing a decisions list must not be ambiguous about (the same reasoning as the
 # empty-versus-stale states in the frontend).
 #
-# Held in agreement with what the handlers actually write by a test, rather than shared
-# as a constant with the call sites — the writer takes ``decision`` as a plain string
-# from four different places, and a new word appearing there without appearing here
-# would make its rows unfilterable while every other test passed.
+# Held in agreement with what the handlers actually write by a test
+# (``test_every_word_the_control_plane_writes_is_filterable``), rather than shared as a
+# constant with the call sites — ``store._audit`` takes ``kind`` as a plain string from
+# many places, and a new word appearing there without appearing here would make its
+# rows unfilterable while every other test passed.
 # "observe" and "outcome" are the two that are NOT decisions, and both are here
 # deliberately. `observe` records something a server claimed about itself — its tool
 # surface changed. `outcome` records how a tool call ended, which only the gateway can
@@ -62,15 +57,12 @@ KINDS = ("allow", "deny", "hold", "revoke", "create", "edit", "observe",
 # Columns ``q`` searches, PER VIEW, and the rule is that a view searches exactly what
 # it DISPLAYS. Anything else produces the worst kind of result list: rows whose visible
 # content does not contain what was typed, with nothing on screen to explain why they
-# matched. It is the same discipline the group key follows (see ``api_audit``), applied
+# matched. It is the same discipline the group key follows (see ``grouped``), applied
 # to search instead of to folding — and it is why ``url`` is searchable in the record
-# view and not in the glance, rather than being either everywhere or nowhere.
+# view and not in the glance, rather than being either everywhere or nowhere. The tool
+# columns are in both because an outcome row displays itself as `status · server__tool`
+# where an egress row names a host.
 GROUPED_SEARCH = ("host", "client", "client_class", "reason",
-                  # The tool columns joined this list when they started being
-                  # DISPLAYED (an outcome row identifies itself as `server__tool`,
-                  # where an egress row names a host). Before that they were correctly
-                  # absent: searching a column nobody can see is how a result list
-                  # gets rows whose visible content does not contain what was typed.
                   "server", "tool", "status")
 EVENT_SEARCH = ("host", "client", "client_class", "reason", "method", "url",
                 "server", "tool", "status")
@@ -84,9 +76,7 @@ EVENT_COLUMNS = ("id", "ts", "kind", "stage", "host", "port", "proto", "client",
                  # The tool columns, for the same reason ``url`` is here: this is the
                  # view that answers "which one was it", and the tool rows' identity —
                  # which server, which tool, which approval — is not in any of the
-                 # columns above. Not added to ``EVENT_SEARCH``: a view searches what it
-                 # DISPLAYS, and the ``reason`` prose that names them is searched
-                 # already, so adding these would only make the same row match twice.
+                 # columns above.
                  "server", "tool", "approval_id")
 
 # Bound on the search needle. Not a security control — the store's own write cap
@@ -245,14 +235,14 @@ def total(conn, filt: Filter) -> int:
     query.
 
     A `COUNT(*)` per poll, and with a text filter it is a scan the `audit_ts` index
-    cannot serve (no index answers `LIKE '%x%'`). That is affordable for the reason
-    the un-filtered count already was — the frontend stops polling in a hidden tab,
-    and the deployment target is one operator's machine, where this store is thinned
-    by `make audit-prune` rather than left to grow for years."""
+    cannot serve (no index answers `LIKE '%x%'`). That is affordable because the
+    frontend stops polling in a hidden tab, and the deployment target is one
+    operator's machine, where this store is thinned by `make audit-prune` rather than
+    left to grow for years."""
     # The interpolation is `Filter.where`, which is built HERE from fixed clause
     # literals — every caller value is a bound parameter in `filt.params` and no
-    # request string ever reaches the SQL text. Same reasoning as `_AUDIT_INSERT` in
-    # ingest.py, and the same suppression; it applies to the two queries below too.
+    # request string ever reaches the SQL text. Same reasoning as `ingest._insert_for`,
+    # and the same suppression; it applies to the two queries below too.
     return conn.execute(f"SELECT COUNT(*) FROM audit {filt.where}",  # noqa: S608
                         filt.params).fetchone()[0]
 
@@ -265,14 +255,14 @@ def grouped(conn, limit: int, filt: Filter, scan: int) -> list:
     The displayed part is why the tool columns are in it — two `ok` outcomes for
     different tools are different facts, and folding them on `reason` alone (both NULL)
     would show one row saying "2x" with no way to say what it stood for. Egress rows
-    carry NULL in all of them and SQLite groups NULLs together, so their folding is
-    unchanged.
+    carry NULL in all of them and SQLite groups NULLs together, so they fold as if the
+    tool columns were absent.
 
     ``approval_id`` IS THE EXCEPTION TO THAT RULE, and it is deliberate. It is grouped
     BY and not selected — the glance serves what it displays, which is why `url` and
     `port` are absent too, and a 32-character id per row would be payload nothing on
-    screen could use. A grant is
-    single-use by construction, so two approval ids are two distinct human decisions —
+    screen could use. A grant is single-use by construction, so two approval ids are
+    two distinct human decisions —
     and folding a row that stands for a SPENT GRANT hides exactly what the approval
     machinery exists to record. Two separately approved `create_pull_request` calls that
     both succeeded are two pull requests; shown as one line with a count, the count is
@@ -307,9 +297,9 @@ def grouped(conn, limit: int, filt: Filter, scan: int) -> list:
 def encode_cursor(row) -> str:
     """Where the next page starts, as an opaque-ish string the client hands back.
 
-    ``(ts, id)`` and not ``ts`` alone: two decisions can share a timestamp (one
-    request writes a `hold` row and its outcome row, and `time.time()` is not
-    guaranteed to advance between them), and a cursor that cannot break that tie
+    ``(ts, id)`` and not ``ts`` alone: two rows can share a timestamp (`time.time()`
+    is not guaranteed to advance between two writes), and a cursor that cannot break
+    that tie
     either skips a row or repeats one at every page boundary. ``id`` is the store's
     own monotonic key, so the pair is a total order.
 
@@ -373,8 +363,7 @@ def events(conn, limit: int, filt: Filter, before: str | None = None) -> tuple[l
 
 def clamp(value, default: int, ceiling: int) -> int:
     """One row is the floor, never zero: a limit of 0 serves an empty list, which the
-    frontend cannot tell from "nothing recorded". Mirrors what ``api_audit`` has always
-    done with its own limit, in one place now that two views need it."""
+    frontend cannot tell from "nothing recorded". Both views' limits go through here."""
     try:
         n = int(value)
     except (TypeError, ValueError):

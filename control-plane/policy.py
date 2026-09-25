@@ -412,8 +412,8 @@ def _decide(host: str, client_class: str) -> tuple[str, str]:
 
 # ── tool policy: what a `tool_rules` row means ───────────────────────────────
 # The gateway's surface, keyed on (server, tool). Written beside ``_decide`` and
-# not merged into it: the two decide different KINDS of row (DESIGN.md, "Tool
-# policy gets its own table"), and reading them together is what shows the three
+# not merged into it: the two decide different KINDS of row (control-plane/DESIGN.md,
+# "Tool policy gets its own table"), and reading them together is what shows the three
 # divergences below are deliberate rather than an omission.
 #
 #   - No wildcards. An exact (server, tool) match or no match at all.

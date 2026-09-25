@@ -1487,77 +1487,10 @@ that keeps that width honest is that none of them *grants*: no rule is written t
 and no approval is decided there, which is why `resolve` stays off it and why the
 claim can only release what a human already approved.
 
-**Tool policy gets its own table, not a new scope on `rules`.** The three states are
-the same three (`allow` / `deny` / `ask` against `allow` / `block` / `hold`), and the
-two-column key looks like a near-fit — a tool rule wants `(tool, server)` where an
-egress rule has `(pattern, client_class)`. Both are false friends. `action` is the
-only column that carries over.
-
-`client_class` is not a label anyone writes: `policy._client_class` derives it from
-the peer address, and it names a *network*. The server on a tool call is the name the
-gateway dialled — the other of the two identities "Per-server identity has two
-different answers" above keeps apart. Sharing the column puts both meanings in one
-table, sorting `mcp` (a network whose egress is being decided) beside `mcp-github` (a
-server whose tools are) in a view that groups by that column precisely so unrelated
-rules are never adjacent (`api_rules` in `control-plane/api_egress.py`). `pattern` fares no
-better: its leading-dot wildcard and the breadth ladder built over it
-(`policy._match`, `policy._persist_candidates`) describe a host namespace, and a tool
-name has no hierarchy to widen along.
-
-Deeper than the key, and the reason this is a different *kind* of row rather than a
-differently keyed one: an egress rule decides a whole request, because the host is
-the unit of decision, while a tool name is only a prefix of one — the payload carries
-the rest. `ask` not decaying (below) is a consequence of that same fact, and it makes
-pinning an argument a predicate over a payload rather than a string in a column. The
-write paths also run opposite ways: egress policy accumulates from approvals, with
-editing retrofitted onto it; tool policy is configuration first, with growth-by-use
-the thing to prevent.
-
-Cost breaks the same direction, which settles the choice rather than makes the case
-for it. A new table is a `CREATE TABLE IF NOT EXISTS` over no existing rows; a shared
-one needs a discriminator inside `UNIQUE(pattern, client_class)`, and SQLite cannot
-add a uniqueness constraint by `ALTER`, so that is the drop-copy-rename rebuild
-`_migrate` in `control-plane/store.py` already had to write once. What the two
-surfaces share is a *pattern* and not code — the backend derives a bounded candidate
-set, the operator picks from it, the chosen value is shown verbatim — and the ladders
-themselves have no common implementation: one is host-breadth, the other
-argument-shaped and server-specific.
-
-**`approvals` splits the same way; the operator's queue does not.** The approvals
-table is egress-shaped exactly as `rules` is — `host`, `port`, `proto`, `client`,
-`client_class`, `method`, `url`, against a tool ask's server, tool and arguments — so
-it splits for the same reasons, and `control-plane/holds.py` splits with it along a
-seam it already has. The in-memory registry (events, deadlines, waiter counts, the
-caps) is keyed by approval id and is entirely payload-agnostic; `_group_key` and
-`_list_pending`'s SELECT and `persist_options` are not. The gateway brings its own
-rim and reuses the core.
-
-What must **not** split is the pending queue: one list, one SSE stream, one saturation
-accounting. The principle is not that reads merge — it is that a union is worth
-serving only when the union is itself the object. Nobody asks for every rule across
-every subsystem, which is why the rules views stay per-surface. "How many decisions
-are waiting, how long have I got, and is the queue at capacity" is asked constantly
-and cannot be answered one surface at a time.
-
-What forces it is that **a partly connected merged view is indistinguishable from an
-empty one.** A pending decision is time-bounded and blocks work; with one stream,
-"disconnected" is a single honest boolean the UI can show, whereas two streams merged
-in the browser render a silent subset when one drops — and a subset of a queue looks
-exactly like an empty queue. Saturation reporting pulls the same way, though less
-hard: over a cap a request fails closed *without raising a card* (the invisibility
-`_SATURATION` exists to fix), and an operator should not have to check two banners to
-learn that governance is refusing things.
-
-An earlier draft of this section rested the argument on a shared worker pool as well.
-That leg is gone: a tool ask no longer pins a control-plane worker and no longer draws
-on `MAX_WAITERS` (see "An `ask` answers immediately"), so the two surfaces have
-separate capacity and the "one queue empties while another consumes the pool" case
-cannot arise. The decision stands on the stream.
-
-Merging the queue merges little else. The tables are separate, `resolve` keeps
-per-surface action sets (dispatched on the card's kind, since the approval id already
-determines its table), each surface renders its own card, and the merged payload is a
-union of two per-surface builders rather than one query over a discriminator column.
+How the control plane keeps what the gateway brings it — tool policy in a table of its
+own rather than a scope on `rules`, tool asks in their own approvals table, and one
+pending queue for both surfaces — is the control plane's own code, and is designed in
+`control-plane/DESIGN.md` → "The tool surface: its own tables, the one queue".
 
 **An unconfigured tool is denied and reported, not held — a deliberate divergence
 from the egress proxy.** There, an unmatched host is held because the set of hosts

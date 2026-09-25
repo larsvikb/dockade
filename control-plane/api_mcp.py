@@ -4,8 +4,8 @@ tools may do. On the management listener only, like everything that grants.
 
 Tool policy is CONFIGURATION FIRST: an operator states what a server's tools may do
 before anything calls one. Egress is the opposite, with rules accumulating from
-approvals (DESIGN.md, "Tool policy gets its own table"), so here the config surface
-is the primary path rather than a retrofit.
+approvals (control-plane/DESIGN.md, "Tool policy gets its own table"), so here the
+config surface is the primary path rather than a retrofit.
 """
 from __future__ import annotations
 

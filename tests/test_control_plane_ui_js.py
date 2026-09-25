@@ -3934,7 +3934,7 @@ if __name__ == "__main__":
 
 @unittest.skipIf(not _NODE and not _STRICT,
                  "node is not installed — skipping app.js unit tests")
-class PayloadHazardTests(PageScriptTests):
+class PayloadHazardTests(unittest.TestCase):
     """A payload the eye cannot read correctly is flagged; one it can is only noted.
 
     The arguments are agent-authored and land in front of the approver verbatim
@@ -3945,6 +3945,12 @@ class PayloadHazardTests(PageScriptTests):
     the warning, which is the state a real override needs to get through. The egress
     card is safe from both because the proxy A-labels hostnames; the tool card had
     nothing."""
+
+    probe: dict
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.probe = _probe()
 
     def test_a_plain_payload_is_not_flagged_and_not_changed(self):
         clean = self.probe["tool"]["hazards_clean"]

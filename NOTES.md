@@ -88,9 +88,16 @@ it is guaranteed to differ.
 The two managed tiers do not behave alike, and the asymmetry is easy to walk into.
 
 Under org auth, a local `managed-settings.json` is ignored entirely — the org's
-remote managed source is the sole managed *settings* tier (verified separately; the
-consequence for this repo is in DESIGN.md). A local managed **`CLAUDE.md`** is not
-ignored. Dropping one in `/etc/claude-code` and running `/context` lists it:
+remote managed source is the sole managed *settings* tier. Measured in the running
+container, with `CLAUDE_CONFIG_DIR=/config`: `/status` reports the setting sources
+as *"User settings, Enterprise managed settings (remote)"*, with the local file
+absent from the list, and a live `WebSearch` call succeeded despite that file's
+`permissions.deny: ["WebSearch"]` — the deny never applied. The remote source is
+cached at `/config/remote-settings.json` and `/config/policy-limits.json`, which
+the sandbox cannot edit. (The consequence for this repo is in `DESIGN.md` →
+"Managed settings are NOT an enforcement lever here".) A local managed
+**`CLAUDE.md`** is not ignored. Dropping one in `/etc/claude-code` and running
+`/context` lists it:
 
 | Type | Path |
 | --- | --- |

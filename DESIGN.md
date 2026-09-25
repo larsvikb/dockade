@@ -419,24 +419,14 @@ commit time (`Author identity unknown`), which is legible and recoverable.
 Claude Code's managed-settings tier is **single-source**: when more than one
 managed source exists, one wins and the others are ignored — they do **not**
 merge. Under **organization authentication** (an org-governed Claude account), the
-winning source is Anthropic's **remote** server-managed settings, cached locally
-at `/config/remote-settings.json` and `/config/policy-limits.json` (un-editable by
-the sandbox). The `/etc/claude-code/managed-settings.json` the Dockerfile used to
-deliver was therefore **not loaded at all** in this configuration — and has since
-been removed from the build (see below).
+winning source is Anthropic's **remote** server-managed settings, so a local
+`/etc/claude-code/managed-settings.json` is **not loaded at all** — measured, with a
+deny that never applied, in `NOTES.md` → "Claude Code reads a managed `CLAUDE.md`
+even where it ignores managed settings". What follows:
 
-**Verified in the running container:**
-- `/status` reports setting sources as *"User settings, Enterprise managed
-  settings (remote)"* — the local file is **absent** from the list.
-- A live `WebSearch` call **succeeded** despite the (now-removed) local file's
-  `permissions.deny: ["WebSearch"]` — the deny never applied.
-
-Consequences, now settled:
-
-- **The local `managed-settings.json` has been removed from the build.** Shipping
-  a file that claims enforcement it does not provide is worse than not shipping it.
-  (It would only take effect on a *personal*, non-org login — out of scope for
-  this org-governed sandbox.)
+- **The image ships no `managed-settings.json`.** A file that claims enforcement it
+  does not provide is worse than none, and it would only take effect on a
+  *personal*, non-org login — out of scope for this org-governed sandbox.
 - **The real enforcement levers are capability containment and egress control** —
   the firewall, the non-root user, dropped caps, and no route to the control plane
   — plus, for policy that must not be bypassable, the **org admin console**, which
@@ -468,13 +458,10 @@ right *way* to do a task, steering the agent onto the paved road.
 single-container image and launcher centered on this design. Notable properties:
 - **Isolated persistent config** via `CLAUDE_CONFIG_DIR=/config` backed by its
   own named volume — no host `~/.claude` sharing.
-- **No local managed-settings enforcement layer** — removed after verifying it is
-  shadowed by the org's remote managed source under org auth (see "Managed settings
-  are NOT an enforcement lever here"). Hardening opt-outs live as real Dockerfile
-  `ENV`; any `permissions.deny` would go in user-scope `settings.json` as
-  mistake-prevention only. Enforcement is the firewall + capability containment;
-  hard policy is the org admin console. Does **not** force yolo — starting in yolo
-  is a conscious opt-in via the `claude-yolo` alias.
+- **No local `managed-settings.json`** — not loaded under org auth (see "Managed
+  settings are NOT an enforcement lever here"); hardening opt-outs are real
+  Dockerfile `ENV`. Does **not** force yolo — starting in yolo is a conscious
+  opt-in via the `claude-yolo` alias.
 - **Baseline user settings** (`claude-sandbox/user-settings.json`) baked in and
   materialized to `/config/settings.json` authoritatively on each boot — the
   default status line ships this way; config is image-owned, the volume holds
@@ -531,7 +518,7 @@ Consequences:
   api.anthropic.com, which the agent needs. Nor is there any *client-side* lever: a
   yolo agent edits or relaunches around a user-scope `permissions.deny`, and the one
   mechanism that could have outranked it — a root-owned local managed file — is **not
-  loaded** under org auth (verified; see "Managed settings are NOT an enforcement lever
+  loaded** under org auth (see "Managed settings are NOT an enforcement lever
   here"). So the only real controls are the **org admin console** (server-managed) or
   **removing the capability**, replacing WebSearch with a governed `websearch` skill
   (below). A user-scope deny stays available as *accident* prevention — none ships in
@@ -2188,14 +2175,6 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
   to look at first and the reason this is flagged rather than asserted: it builds a
   commit through the Git Database API, where a ref update *can* carry `force`, so it
   is the single tool in the set that could falsify the paragraph above.
-- **RESOLVED — the local managed file is not an enforcement lever under org auth.**
-  Verified in-container: `/status` shows the managed source as *remote* (org
-  server-managed); the local `/etc/claude-code/managed-settings.json` is not loaded,
-  and a live WebSearch succeeded despite its `deny`. The yolo-vs-managed-deny
-  question is moot here — the file simply isn't a source. The design no longer
-  relies on managed settings; hard policy goes to the org admin console, and the
-  local managed file has been removed from the build. See "Managed settings are NOT
-  an enforcement lever here".
 - **RESOLVED — the control plane learns a server's tools from the gateway, never by
   scanning `mcp-net`.** Before it did, a `tool_rules` row was a name an operator typed
   and nothing checked it against anything. That was safe — a missing rule denies, so a

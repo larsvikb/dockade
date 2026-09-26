@@ -58,6 +58,31 @@ def _imports(js: str) -> list[str]:
     """The module names `js` imports — relative, same directory, as the page's are."""
     return re.findall(r'''from\s+["']\./([^"']+)["']''', js)
 
+
+def _exports(js: str) -> set[str]:
+    """The names `js` exports: inline `export function`/`export const`, and an
+    `export { … }` block."""
+    names = set(re.findall(r"^export (?:async )?(?:function|const|let) (\w+)", js, re.M))
+    for block in re.findall(r"^export \{(.*?)\};", js, re.S | re.M):
+        names.update(n.strip() for n in block.split(",") if n.strip())
+    return names
+
+
+def _named_imports(js: str) -> dict[str, set[str]]:
+    """Module name → the names `js` imports from it."""
+    out: dict[str, set[str]] = {}
+    for names, module in re.findall(r'import \{(.*?)\}\s*from\s+"\./([^"]+)"', js, re.S):
+        out.setdefault(module, set()).update(n.strip() for n in names.split(",")
+                                             if n.strip())
+    return out
+
+
+def _code(js: str) -> str:
+    """`js` with its comments and import statements gone — what a reference in it is."""
+    code = re.sub(r"^\s*//.*$", "", js, flags=re.M)
+    code = re.sub(r"/\*.*?\*/", "", code, flags=re.S)
+    return re.sub(r'import \{.*?\}\s*from\s+"[^"]+";', "", code, flags=re.S)
+
 # `make test` runs discovery with `-t tests`, so sibling modules import by bare name;
 # this keeps the file runnable on its own too. Imported for `_CSP` / `_directives` —
 # the policy and its parser live with the app, so this module does not restate them.
@@ -89,21 +114,23 @@ const dir = process.env.DOCKADE_UI_DIR;
 const load = name => import(pathToFileURL(`${dir}/${name}`).href);
 // Which module owns each helper: a helper that moves shows up here, as a rename would.
 const owner = {
-  "app.js": ["lampState", "backoffDelay", "diffPending", "shouldSweep",
-             "holdRemaining", "countdownState", "departure", "persistPreview",
+  "app.js": ["lampState", "backoffDelay",
              "normalizePattern", "createPreview", "editPreview",
-             "saturationState", "ackCount", "capScope", "requestsLabel",
+             "saturationState", "ackCount", "capScope",
              "auditRow", "auditStatus", "rulesStatus", "repeatCount",
              "leaseLabel", "leaseRemaining", "leaseCountdown", "leasesStatus",
              "leaseDomain", "groupLeases", "shortActor",
              "timeWindow", "filterActive", "auditQuery", "eventRow",
-             "historyPager", "renderableHolds",
-             "toolRemaining", "toolOutcomeMessage",
-             "cardSubject", "approvalNotices", "shouldNotify", "notifyButton",
+             "historyPager",
              "fmtTime", "fmtStamp", "fmtInstant",
              "serverDescriptor", "serverPreview", "serverEditBody",
              "toolChoices", "toolRulePreview", "toolEditPreview",
              "toolRevokePreview", "toolRulesStatus"],
+  "holds.js": ["renderableHolds", "diffPending", "shouldSweep",
+               "toolRemaining", "toolOutcomeMessage",
+               "holdRemaining", "countdownState", "departure", "persistPreview",
+               "requestsLabel", "cardSubject", "pendingAnnouncement",
+               "approvalNotices", "shouldNotify", "notifyButton"],
   "payload.js": ["payloadDisclosure", "payloadTokens", "indentPayload",
                  "escapePayload", "payloadHazards", "renderPayload"],
 };
@@ -3995,6 +4022,30 @@ class InlineScriptTests(unittest.TestCase):
                          "imported but not served — add it to UI_MODULES")
         self.assertEqual(set(ui.UI_MODULES) - imported - {"app.js"}, set(),
                          "served but nothing imports it — the page never loads it")
+
+    def test_a_name_used_across_modules_is_imported_and_exported(self):
+        """The two mistakes a move between files makes, and only a browser reports:
+        a name used without an import is a ReferenceError the first time that code
+        runs — for a helper on the resolve path, at the click — and an import of a
+        name the module does not export stops the page at link time, blank. Neither
+        is a syntax error, so `node --check` passes both; the probe's `import` catches
+        the second, never the first."""
+        texts = _module_texts()
+        exports = {name: _exports(js) for name, js in texts.items()}
+        for user, js in texts.items():
+            imports = _named_imports(js)
+            code = _code(js)
+            for module, names in imports.items():
+                self.assertEqual(
+                    names - exports[module], set(),
+                    f"{user} imports these from {module}, which does not export them")
+            for module, names in exports.items():
+                if module == user:
+                    continue
+                used = {n for n in names if re.search(rf"\b{re.escape(n)}\b", code)}
+                self.assertEqual(
+                    used - imports.get(module, set()), set(),
+                    f"{user} uses these from {module} without importing them")
 
 
 if __name__ == "__main__":

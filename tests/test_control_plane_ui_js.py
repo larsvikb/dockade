@@ -114,7 +114,8 @@ const dir = process.env.DOCKADE_UI_DIR;
 const load = name => import(pathToFileURL(`${dir}/${name}`).href);
 // Which module owns each helper: a helper that moves shows up here, as a rename would.
 const owner = {
-  "app.js": ["lampState", "backoffDelay", "saturationState", "ackCount", "capScope"],
+  "app.js": ["lampState", "backoffDelay"],
+  "saturation.js": ["capScope", "saturationState", "ackCount"],
   "audit.js": ["auditRow", "repeatCount", "timeWindow", "filterActive", "auditQuery",
                "eventRow", "historyPager"],
   "egress-rules.js": ["revokePreview", "normalizePattern", "createPreview",

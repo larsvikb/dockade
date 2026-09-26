@@ -28,6 +28,7 @@ COPY leases.js ./leases.js
 COPY mcp.js ./mcp.js
 COPY payload.js ./payload.js
 COPY provenance.js ./provenance.js
+COPY saturation.js ./saturation.js
 COPY status.js ./status.js
 COPY time.js ./time.js
 

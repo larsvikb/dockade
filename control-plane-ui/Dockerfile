@@ -23,6 +23,7 @@ COPY index.html ./index.html
 COPY app.js ./app.js
 COPY egress-rules.js ./egress-rules.js
 COPY holds.js ./holds.js
+COPY mcp.js ./mcp.js
 COPY payload.js ./payload.js
 
 USER cpui

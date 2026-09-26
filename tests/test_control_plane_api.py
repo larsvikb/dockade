@@ -3095,8 +3095,8 @@ class ResolveToolAskTests(_CPTestCase):
 
     def test_the_egress_vocabulary_is_refused_on_a_tool_card(self):
         # Per-surface action sets, not a union. `allow_persist` on a tool ask would
-        # have to mean "allow this tool forever" — the one rung of a ladder that does
-        # not exist that nobody should reach by clicking the same button twice.
+        # have to mean "allow this tool forever", which is promoting the rule in the
+        # MCP tab and never a rung reached by clicking the same button twice.
         ask = self._ask()
         for action in ("allow_once", "allow_persist", "deny_once", "deny_persist"):
             resp = _resolve(ask, action)
@@ -3105,7 +3105,7 @@ class ResolveToolAskTests(_CPTestCase):
 
     def test_the_tool_vocabulary_is_refused_on_an_egress_card(self):
         _hold("example.com", "hold-1")
-        for action in ("allow", "deny"):
+        for action in ("allow", "allow_pinned", "deny"):
             self.assertEqual(_resolve("hold-1", action).status_code, 400, action)
 
     def test_a_pattern_on_a_tool_ask_is_refused_not_ignored(self):
@@ -3842,6 +3842,115 @@ class McpPinTests(_CPTestCase):
         cp.api_mcp.revoke_mcp_pin(self.pin_id, _FakeRequest())
         self.assertEqual(
             cp.api_mcp.revoke_mcp_rule(self.rule_id, _FakeRequest()).status_code, 200)
+
+
+class PinFromCardTests(_ToolBridgeTestCase):
+    """``allow_pinned``: allowing a tool ask and pinning the fields an operator ticked,
+    so that later calls carrying the same values run without a card."""
+
+    audits = True
+
+    def setUp(self):
+        super().setUp()
+        self.rule_id = _tool_rule("create_pull_request", "ask").body["id"]
+        self.ask = _tool_call(tool="create_pull_request", args=_PR_ARGS)["approval_id"]
+
+    def _pin_rows(self):
+        with cp.store._connect() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT server, tool, pins_json, approval_id, granted_by "
+                "FROM tool_pins ORDER BY id")]
+
+    def test_the_card_offers_what_resolve_will_accept(self):
+        [card] = cp.holds._pending_payload()["holds"]
+        options = card["pin_options"]
+        self.assertIsNone(options["refused"])
+        self.assertEqual({o["field"] for o in options["fields"]}, set(_PR_ARGS))
+
+    def test_pinning_allows_this_call_and_answers_the_next_one(self):
+        resp = _resolve(self.ask, "allow_pinned", pins=["owner", "repo"])
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.body["pin"]["fields"], ["owner", "repo"])
+        self.assertTrue(resp.body["pin"]["created"])
+        self.assertEqual(cp.holds._get_tool_ask(self.ask)["status"], "allowed")
+        self.assertTrue(_claim(self.ask).body["ok"])
+        # A different PR on the same repository runs without a card.
+        later = _tool_call(tool="create_pull_request",
+                           args={**_PR_ARGS, "title": "another", "head": "other"})
+        self.assertEqual(later["decision"], "allow")
+
+    def test_the_values_come_from_the_stored_ask_and_the_pin_names_its_card(self):
+        _resolve(self.ask, "allow_pinned", pins=["repo"])
+        [pin] = self._pin_rows()
+        self.assertEqual(pin["pins_json"], cp.policy._canonical_pins({"repo": "dockade"}))
+        self.assertEqual((pin["approval_id"], pin["tool"]),
+                         (self.ask, "create_pull_request"))
+        self.assertTrue(pin["granted_by"])
+
+    def test_a_field_the_ask_does_not_offer_is_refused_and_nothing_is_written(self):
+        for pins in (["reviewers"], ["owner", "nope"], [], ["owner", "owner"], "owner",
+                     [{"owner": "x"}], None):
+            with self.subTest(pins=pins):
+                self.assertEqual(
+                    _resolve(self.ask, "allow_pinned", pins=pins).status_code, 400)
+        self.assertEqual(cp.holds._get_tool_ask(self.ask)["status"], "pending")
+        self.assertEqual(self._pin_rows(), [])
+
+    def test_pins_on_any_other_action_are_refused(self):
+        for action in ("allow", "deny"):
+            with self.subTest(action=action):
+                self.assertEqual(
+                    _resolve(self.ask, action, pins=["owner"]).status_code, 400)
+        self.assertEqual(cp.holds._get_tool_ask(self.ask)["status"], "pending")
+
+    def test_a_rule_moved_while_the_card_was_pending_refuses_the_pin_only(self):
+        for action in ("deny", "allow"):
+            with self.subTest(action=action):
+                cp.api_mcp.edit_mcp_rule(
+                    self.rule_id, cp.api_mcp.ToolRuleEditRequest(action=action),
+                    _FakeRequest())
+                resp = _resolve(self.ask, "allow_pinned", pins=["owner"])
+                self.assertEqual(resp.status_code, 409)
+                self.assertTrue(resp.body["pin_refused"])
+                self.assertIn(f"is ruled '{action}'", resp.body["detail"])
+        self.assertEqual(self._pin_rows(), [])
+        # The card is still decidable, and a plain allow still works.
+        self.assertEqual(_resolve(self.ask, "allow").status_code, 200)
+
+    def test_a_pin_already_in_place_allows_the_call_and_writes_nothing(self):
+        _resolve(self.ask, "allow_pinned", pins=["owner", "repo"])
+        second = _tool_call(tool="create_pull_request",
+                            args={**_PR_ARGS, "repo": "hemel"})["approval_id"]
+        # The same values as the first pin, from a call it did not answer.
+        with cp.store._connect() as conn:
+            conn.execute("UPDATE tool_pins SET pins_json=?",
+                         (cp.policy._canonical_pins({"owner": "larsvikb",
+                                                     "repo": "hemel"}),))
+            conn.commit()
+        resp = _resolve(second, "allow_pinned", pins=["owner", "repo"])
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(resp.body["pin"]["created"])
+        self.assertEqual(len(self._pin_rows()), 1)
+
+    def test_an_answered_card_cannot_be_pinned(self):
+        _resolve(self.ask, "deny")
+        resp = _resolve(self.ask, "allow_pinned", pins=["owner"])
+        self.assertEqual(resp.status_code, 409)
+        self.assertNotIn("pin_refused", resp.body)
+        self.assertEqual(self._pin_rows(), [])
+
+    def test_the_record_has_the_answer_and_the_policy_write_under_one_id(self):
+        _resolve(self.ask, "allow_pinned", pins=["owner", "repo"])
+        with cp.store._connect() as conn:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT kind, stage, actor, reason FROM audit WHERE approval_id=? "
+                "AND stage IN ('tool-ask', 'tool-policy') ORDER BY id", (self.ask,))]
+        self.assertEqual([(r["kind"], r["stage"]) for r in rows],
+                         [("allow", "tool-ask"), ("create", "tool-policy")])
+        for row in rows:
+            self.assertIn("owner, repo", row["reason"])
+            self.assertIsNotNone(row["actor"])
+            self.assertNotIn("larsvikb", row["reason"])
 
 
 class ToolRosterTests(_ToolBridgeTestCase):

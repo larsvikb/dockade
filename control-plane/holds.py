@@ -605,6 +605,67 @@ def _resolve_tool_ask(approval_id: str, decision: str, actor: str) -> str | None
     return decision if changed else None
 
 
+class PinnedAnswer(NamedTuple):
+    """Outcome of allowing an ask and pinning it. ``status`` is None when nothing was
+    written; then ``refused`` says why if the card is still pending and decidable, and
+    is None if it is not pending at all. ``created`` is False when the same pin was
+    already in place."""
+    status: str | None
+    refused: str | None
+    pin_id: int | None
+    created: bool
+
+
+def _resolve_tool_ask_pinned(approval_id: str, actor: str,
+                             pins_json: str) -> PinnedAnswer:
+    """Allow the ask and write its pin in ONE transaction, or do neither.
+
+    The tool's rule is read inside that transaction, and the pin is refused unless it
+    is `ask`. A rule moved or revoked while the card was pending would otherwise get a
+    pin that decides nothing, and one that comes back with the next `ask` rule for the
+    same tool. BEGIN IMMEDIATE takes the write lock before the read, so a revoke cannot
+    land between the check and the insert; ``api_mcp.revoke_mcp_rule`` closes the other
+    direction in its DELETE."""
+    now = time.time()
+    with store._connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            ask = conn.execute(
+                "SELECT server, tool FROM tool_approvals "
+                "WHERE id=? AND status='pending'", (approval_id,)).fetchone()
+            if ask is None:
+                conn.rollback()
+                return PinnedAnswer(None, None, None, False)
+            rule = conn.execute(
+                "SELECT action FROM tool_rules WHERE server=? AND tool=?",
+                (ask["server"], ask["tool"])).fetchone()
+            if rule is None or rule["action"] != "ask":
+                conn.rollback()
+                now_ruled = ("has no rule" if rule is None
+                             else f"is ruled {rule['action']!r}")
+                return PinnedAnswer(
+                    None, f"{ask['tool']} on {ask['server']} {now_ruled} now, and a pin "
+                          f"decides only under 'ask'; allow this call without a pin "
+                          f"instead", None, False)
+            conn.execute(
+                "UPDATE tool_approvals SET status='allowed', resolved_at=?, "
+                "resolved_by=? WHERE id=? AND status='pending'",
+                (now, actor, approval_id))
+            inserted = conn.execute(
+                "INSERT OR IGNORE INTO tool_pins(server, tool, pins_json, approval_id, "
+                "created_at, granted_by) VALUES (?,?,?,?,?,?)",
+                (ask["server"], ask["tool"], pins_json, approval_id, now, actor))
+            created = inserted.rowcount > 0
+            pin_id = inserted.lastrowid if created else conn.execute(
+                "SELECT id FROM tool_pins WHERE server=? AND tool=? AND pins_json=?",
+                (ask["server"], ask["tool"], pins_json)).fetchone()["id"]
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return PinnedAnswer("allowed", None, pin_id, created)
+
+
 def _claim_tool_ask(approval_id: str) -> dict | None:
     """Take single-use ownership of an APPROVED ask, for the gateway about to run it.
     Returns the ask if this caller now owns it, None if it is not claimable.
@@ -632,15 +693,17 @@ def _claim_tool_ask(approval_id: str) -> dict | None:
 def _list_tool_asks() -> list[dict]:
     """Pending asks, oldest first — the tool half of the operator's queue.
 
-    A separate builder feeding one list (``_pending_payload``). It carries none of
-    ``_list_pending``'s extras: no ``requests``, because a joiner adds no waiter; no
-    ``persist_options``, because nothing derives what an ask could be persisted AS."""
+    A separate builder feeding one list (``_pending_payload``). No ``requests``,
+    because a joiner adds no waiter. ``pin_options`` is the tool side's
+    ``persist_options``: what a pin may be made of, derived here so the card offers
+    exactly what ``resolve`` will accept (``policy._pin_candidates``)."""
     _expire_tool_asks()
     with store._connect() as conn:
         rows = conn.execute(
             "SELECT id, ts, server, tool, args_json, client, deadline "
             "FROM tool_approvals WHERE status='pending' ORDER BY ts").fetchall()
-    return [dict(r, kind="tool") for r in rows]
+    return [dict(r, kind="tool", pin_options=policy._pin_candidates(r["args_json"]))
+            for r in rows]
 
 
 def _pending_payload() -> dict:

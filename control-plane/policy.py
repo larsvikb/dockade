@@ -520,21 +520,70 @@ def _parse_pins(pins_json: str) -> dict | None:
     return pins
 
 
+def _unambiguous(args: dict) -> bool:
+    """Whether every parser reads the same fields out of ``args``: each key an ASCII
+    identifier (``_PIN_FIELD_RE``), and no two keys equal once lower-cased."""
+    keys = list(args)
+    return (all(isinstance(key, str) and _PIN_FIELD_RE.fullmatch(key) for key in keys)
+            and len({key.lower() for key in keys}) == len(keys))
+
+
 def _pin_matches(pins: dict, args: object) -> bool:
     """Whether a call with ``args`` carries every pinned field with its exact value.
 
-    Every key of the call is checked, not only the pinned ones (``_PIN_FIELD_RE``): a
-    key outside the shape, or two keys differing only in case, make the call
-    ambiguous to some parser, and an ambiguous call gets a card."""
-    if not isinstance(args, dict):
-        return False
-    keys = list(args)
-    if not all(isinstance(key, str) and _PIN_FIELD_RE.fullmatch(key) for key in keys):
-        return False
-    if len({key.lower() for key in keys}) != len(keys):
+    Every key of the call is checked, not only the pinned ones: an ambiguous call
+    (``_unambiguous``) gets a card."""
+    if not isinstance(args, dict) or not _unambiguous(args):
         return False
     return all(field in args and _pin_value(args[field]) == _pin_value(value)
                for field, value in pins.items())
+
+
+def _why_unpinnable(value: object) -> str:
+    """Why ``_pin_value`` refuses ``value``, in words for the card."""
+    if isinstance(value, list):
+        return "a list"
+    if isinstance(value, dict):
+        return "an object"
+    if value is None:
+        return "null"
+    if isinstance(value, float):
+        return "a number with a fraction or an exponent"
+    return (f"longer than {_PIN_VALUE_MAX} characters, which is content rather than "
+            f"a name")
+
+
+def _pin_candidates(args_json: str) -> dict:
+    """What a pin may be made of for one held call, derived from the call as stored.
+
+    ``fields`` are the ones an operator may tick, each with the value a pin would hold
+    (``_pin_value``); ``unpinnable`` are the rest, each with why not. Any non-empty
+    subset of ``fields`` makes a pin that answers this very call, which is what keeps
+    the choice bounded: nothing is offered that the call on the card does not carry.
+
+    ``refused`` says why no pin can be made at all. An ambiguous call is refused whole
+    rather than offered the fields that do parse, because a pin made from it would
+    never answer a call shaped like it."""
+    try:
+        args = json.loads(args_json)
+    except (TypeError, ValueError):
+        args = None
+    if not isinstance(args, dict):
+        return {"fields": [], "unpinnable": [],
+                "refused": "the arguments are not an object, so there is no field to pin"}
+    if not _unambiguous(args):
+        return {"fields": [], "unpinnable": [],
+                "refused": "a key is not a plain identifier, or two keys differ only in "
+                           "case, so no pin could answer a call like this one"}
+    fields, unpinnable = [], []
+    for field in sorted(args):
+        value = _pin_value(args[field])
+        if value is None:
+            unpinnable.append({"field": field, "why": _why_unpinnable(args[field])})
+        else:
+            fields.append({"field": field, "value": value})
+    return {"fields": fields, "unpinnable": unpinnable,
+            "refused": None if fields else "none of this call's arguments can be pinned"}
 
 
 def _answering_pin(conn, server: str, tool: str,

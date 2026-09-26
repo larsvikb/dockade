@@ -398,6 +398,56 @@ class PinnedAllowDecisionTests(unittest.TestCase):
                          cp.policy._canonical_pins({"owner": "l", "repo": "dockade"}))
 
 
+class PinCandidateTests(unittest.TestCase):
+    """``_pin_candidates``: what a card may pin, derived from the call it is for."""
+
+    def _candidates(self, args):
+        return cp.policy._pin_candidates(json.dumps(args))
+
+    def test_the_pinnable_fields_carry_the_values_a_pin_would_hold(self):
+        c = self._candidates({**_PR, "draft": False, "reviewers": ["x"]})
+        self.assertIsNone(c["refused"])
+        self.assertEqual([f["field"] for f in c["fields"]],
+                         ["base", "body", "draft", "head", "owner", "repo", "title"])
+        values = {f["field"]: f["value"] for f in c["fields"]}
+        self.assertEqual((values["owner"], values["draft"]), ('"larsvikb"', "false"))
+        self.assertEqual(c["unpinnable"], [{"field": "reviewers", "why": "a list"}])
+
+    def test_every_subset_of_the_offered_fields_answers_the_call_it_came_from(self):
+        # The bound that keeps the choice honest: nothing is offered that the call on
+        # the card does not itself carry.
+        args = {**_PR, "pullNumber": 147, "draft": True}
+        offered = [f["field"] for f in self._candidates(args)["fields"]]
+        for chosen in ([offered[0]], ["owner", "repo"], offered):
+            with self.subTest(chosen=chosen):
+                self.assertTrue(cp.policy._pin_matches(
+                    {field: args[field] for field in chosen}, args))
+
+    def test_each_unpinnable_value_says_why(self):
+        c = self._candidates({"a": 1.5, "b": None, "c": {"x": 1}, "d": [1],
+                              "e": "x" * (cp.policy._PIN_VALUE_MAX + 1), "f": "ok"})
+        self.assertEqual({u["field"]: u["why"].split(",")[0] for u in c["unpinnable"]},
+                         {"a": "a number with a fraction or an exponent", "b": "null",
+                          "c": "an object", "d": "a list",
+                          "e": f"longer than {cp.policy._PIN_VALUE_MAX} characters"})
+        self.assertEqual([f["field"] for f in c["fields"]], ["f"])
+
+    def test_an_ambiguous_call_offers_nothing(self):
+        # A pin made from it could never answer a call shaped like it.
+        for args in ({**_PR, "Repo": "other"}, {**_PR, "x-y": 1}):
+            with self.subTest(args=args):
+                c = self._candidates(args)
+                self.assertEqual(c["fields"], [])
+                self.assertIn("no pin could answer", c["refused"])
+
+    def test_a_call_with_nothing_pinnable_is_refused_in_words(self):
+        for raw in ("[]", '"x"', "not json", "{}", '{"reviewers": ["x"]}'):
+            with self.subTest(raw=raw):
+                c = cp.policy._pin_candidates(raw)
+                self.assertEqual(c["fields"], [])
+                self.assertTrue(c["refused"])
+
+
 class LeaseDecisionTests(unittest.TestCase):
     """``_decide``'s third pass: a lease is an allow that expires.
 

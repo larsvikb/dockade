@@ -405,6 +405,15 @@ sandbox** that is the difference between a record and half a record: "egress to
 pypi.org was allowed" does not answer the question an audit trail exists for once two
 agents are running.
 
+**`client` asked; `actor` acted.** `client` is only ever the sandbox whose request the
+row concerns, and `client_class` is derived from it alone, so a row no sandbox asked
+for — a rule written, a server registered, an inventory push — carries neither, and an
+egress rule's class goes in its reason. Whoever performed the act, when that is not
+the client, is `actor`: the operator behind a click, or the gateway behind a push. A
+row with both is a human answering a sandbox's request. Kept apart because a search
+for one sandbox or one class must return what that population asked for, not the
+configuration written about it. `ActorColumnTests` holds every writer to this.
+
 This is not a reversal of keeping client identity out of the saturation banner's
 headline. That banner is a glanceable alert where a bare IP is noise; this table is the
 forensic view where *who* is the entire question. The two decisions point the same way —

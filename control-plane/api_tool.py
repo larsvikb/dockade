@@ -178,7 +178,7 @@ def tool_inventory(req: InventoryRequest, request: Request) -> JSONResponse:
         # `api_views._bad_filter`. Anything else raised is a 500 with no body.
         return JSONResponse({"ok": False, "detail": str(exc)}, status_code=400)
     for server, line in moved:
-        store._audit("observe", stage="mcp-tools", client=provenance._actor(request),
+        store._audit("observe", stage="mcp-tools", actor=provenance._actor(request),
                      server=server, reason=line)
     return JSONResponse({"ok": True, "changed": len(moved)})
 

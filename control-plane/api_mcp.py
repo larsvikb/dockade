@@ -130,7 +130,7 @@ def create_mcp_server(req: ServerCreateRequest, request: Request) -> JSONRespons
             (server, auth_type, header or None, template or None, time.time()))
         conn.commit()
 
-    store._audit("create", stage="mcp-server", server=server,
+    store._audit("create", stage="mcp-server", server=server, actor=actor,
                  reason=f"MCP server {server} registered by {actor}; disabled, "
                         f"auth {auth_type}, no tools permitted until rules are written")
     return JSONResponse({"ok": True, "created": True, "server": server,
@@ -185,7 +185,7 @@ def edit_mcp_server(server: str, req: ServerEditRequest,
 
     # ONE row carrying both states, as ``api_egress.edit_rule`` writes. The template
     # is safe to record because the secret is never in it.
-    store._audit("edit", stage="mcp-server", server=server,
+    store._audit("edit", stage="mcp-server", server=server, actor=actor,
                  reason=f"MCP server {server} edited by {actor}; "
                         f"enabled {before['enabled']} -> {after['enabled']}, "
                         f"auth {before['auth']['type']} -> {after['auth']['type']} "
@@ -226,7 +226,7 @@ def revoke_mcp_server(server: str, request: Request) -> JSONResponse:
         conn.execute("DELETE FROM mcp_servers WHERE server=?", (server,))
         conn.commit()
 
-    store._audit("revoke", stage="mcp-server", server=server,
+    store._audit("revoke", stage="mcp-server", server=server, actor=actor,
                  reason=f"MCP server {server} registration revoked by {actor}; the "
                         f"gateway will no longer dial it")
     return JSONResponse({"ok": True, "server": server})
@@ -312,6 +312,7 @@ def create_mcp_rule(req: ToolRuleCreateRequest, request: Request) -> JSONRespons
         conn.commit()
 
     store._audit("create", stage="tool-policy", server=server, tool=tool,
+                 actor=actor,
                  reason=f"tool rule created by {actor}; {tool} on {server} now "
                         f"{action}s")
     return JSONResponse({"ok": True, "created": True, "already_present": False,
@@ -347,6 +348,7 @@ def edit_mcp_rule(rule_id: int, req: ToolRuleEditRequest,
         conn.commit()
 
     store._audit("edit", stage="tool-policy", server=row["server"], tool=row["tool"],
+                 actor=actor,
                  reason=f"tool rule edited by {actor}; {row['tool']} on "
                         f"{row['server']} was {row['action']}, now {action}")
     return JSONResponse({"ok": True, "changed": True, "id": rule_id,
@@ -372,6 +374,7 @@ def revoke_mcp_rule(rule_id: int, request: Request) -> JSONResponse:
         conn.commit()
 
     store._audit("revoke", stage="tool-policy", server=row["server"], tool=row["tool"],
+                 actor=actor,
                  reason=f"tool rule revoked by {actor}; {row['tool']} on "
                         f"{row['server']} was {row['action']}, now unconfigured and "
                         f"therefore denied")

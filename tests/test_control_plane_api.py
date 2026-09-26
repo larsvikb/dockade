@@ -86,6 +86,7 @@ def _clear_all():
     # process-lifetime by design, which across tests means it leaks.
     cp.holds._SATURATION.update(count=0, last_ts=None, last_scope=None, last_host=None,
                           acked=0, acked_ts=None)
+    cp.inventory._SEEN.clear()
 
 
 def _auth_req(host, **kw):
@@ -1000,8 +1001,11 @@ class CreateRuleTests(_CPTestCase):
         self.assertEqual(audit.call_args.args[0], "create")
         kwargs = audit.call_args.kwargs
         self.assertEqual(kwargs["host"], ".github.example")
-        self.assertEqual(kwargs["client_class"], CLASS)
-        self.assertIn("peer=172.31.0.9", kwargs["reason"])
+        self.assertIn("peer=172.31.0.9", kwargs["actor"])
+        # The class the rule governs is part of what was written, so the reason names
+        # it; `client_class` stays empty, since no client made this row.
+        self.assertIn(f"client class {CLASS}", kwargs["reason"])
+        self.assertIsNone(kwargs.get("client_class"))
         # The scope, in words, because a leading dot is a wildcard that looks like a
         # hostname — the same thing the rules view spells out.
         self.assertIn("host + subdomains", kwargs["reason"])
@@ -2665,8 +2669,9 @@ class LeaseRevokeTests(_CPTestCase):
         self.assertEqual(audit.call_args.args[0], "revoke")
         kwargs = audit.call_args.kwargs
         self.assertEqual(kwargs["host"], "api.example.com")
-        self.assertEqual(kwargs["client_class"], CLASS)
-        self.assertIn("peer=172.31.0.9", kwargs["reason"])
+        self.assertIn("peer=172.31.0.9", kwargs["actor"])
+        self.assertIn(f"client class {CLASS}", kwargs["reason"])
+        self.assertIsNone(kwargs.get("client_class"))
         # Held, not denied — the same distinction a rule revocation records, and only
         # the reason line carries it. And how much time was cut short, which is the
         # part a rule revocation has no equivalent of.
@@ -2683,6 +2688,8 @@ class LeaseRevokeTests(_CPTestCase):
         self.assertFalse(resp.args[0]["was_live"])
         self.assertIn("already stopped deciding",
                       audit.call_args.kwargs["reason"])
+        # The only place this row names the class, now that `client_class` is empty.
+        self.assertIn(f"client class {CLASS}", audit.call_args.kwargs["reason"])
 
     def test_an_unknown_id_is_a_404_not_a_silent_success(self):
         resp = cp.api_egress.revoke_lease(999999, _FakeRequest())
@@ -4100,6 +4107,113 @@ class ToolCorrelationColumnTests(_ToolBridgeTestCase):
                          (None, None, None))
 
 
+class ActorColumnTests(_ToolBridgeTestCase):
+    """``audit.actor`` beside ``audit.client``: who performed the act, and which
+    sandbox's request the row concerns.
+
+    Before the column the operator was in ``reason`` prose on six kinds of row and the
+    gateway was in ``client`` on one, so "what did this operator do" was a text search
+    and a search for a sandbox could match an inventory push."""
+
+    audits = True
+    OPERATOR = "172.31.0.9"
+
+    def _operator(self):
+        return _FakeRequest(peer=self.OPERATOR)
+
+    def _rows(self, where, *params):
+        with cp.store._connect() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT kind, stage, host, client, client_class, actor FROM audit "  # noqa: S608
+                f"WHERE {where} ORDER BY id", params)]
+
+    def test_every_configuration_change_names_its_actor_and_no_client(self):
+        # No sandbox asked for any of these, so `client` is empty and so is the class
+        # derived from it. An egress rule's class is in its reason instead.
+        op = self._operator()
+        rule = _create(".example.com", "allow", request=op).body["id"]
+        cp.api_egress.edit_rule(
+            rule, cp.api_egress.RuleEditRequest(pattern="example.com", action="allow"),
+            op)
+        cp.api_egress.revoke_rule(rule, op)
+        cp.api_egress.revoke_lease(
+            LeaseRevokeTests._insert(self, "api.example.com", 900), op)
+        tool = _tool_rule("get_me", "allow", request=op).body["id"]
+        cp.api_mcp.edit_mcp_rule(tool, cp.api_mcp.ToolRuleEditRequest(action="ask"), op)
+        cp.api_mcp.revoke_mcp_rule(tool, op)
+        _register("mcp-other", request=op)
+        cp.api_mcp.edit_mcp_server("mcp-other",
+                                   cp.api_mcp.ServerEditRequest(enabled=True), op)
+        cp.api_mcp.revoke_mcp_server("mcp-other", op)
+
+        rows = self._rows("stage IN ('policy', 'tool-policy', 'mcp-server')")
+        mine = [r for r in rows if f"peer={self.OPERATOR}" in (r["actor"] or "")]
+        self.assertEqual(len(mine), 10)
+        for row in rows:                       # setUp's register and enable included
+            with self.subTest(stage=row["stage"], kind=row["kind"]):
+                self.assertIsNotNone(row["actor"])
+                self.assertEqual((row["client"], row["client_class"]), (None, None))
+
+    def test_a_human_answer_to_a_tool_ask_keeps_the_asker_and_names_the_answerer(self):
+        _tool_rule("create_pull_request", "ask")
+        ask = _tool_call(tool="create_pull_request", args={"title": "x"})["approval_id"]
+        _resolve(ask, "deny", self._operator())
+        [row] = self._rows("stage='tool-ask' AND approval_id=?", ask)
+        self.assertEqual((row["client"], row["client_class"]),
+                         (CLASS_IP, cp.policy._client_class(CLASS_IP)))
+        self.assertIn(f"peer={self.OPERATOR}", row["actor"])
+
+    def test_an_egress_request_a_human_decided_names_the_human(self):
+        saved = cp.holds.HOLD_TIMEOUT
+        cp.holds.HOLD_TIMEOUT = 5
+        try:
+            t, _result, approval_id = HoldHandshakeTests._authorize_in_thread(
+                self, "decided.example.com")
+            _resolve(approval_id, "deny_once", self._operator())
+            t.join(2)
+        finally:
+            cp.holds.HOLD_TIMEOUT = saved
+        hold, decided = self._rows("host='decided.example.com'")
+        self.assertEqual((hold["kind"], hold["actor"]), ("hold", None))
+        self.assertEqual((decided["kind"], decided["client"]), ("deny", CLASS_IP))
+        self.assertIn(f"peer={self.OPERATOR}", decided["actor"])
+
+    def test_rows_nobody_acted_on_carry_no_actor(self):
+        # Policy answered, or a window ran out. An actor here would claim a human was
+        # involved in a decision no human saw.
+        _set_rules([("example.com", "allow")])
+        cp.api_authorize.authorize(_auth_req("example.com", stage="connect"))
+        _tool_rule("get_me", "allow")
+        _tool_call(tool="get_me")
+        _tool_rule("create_pull_request", "ask")
+        saved = cp.holds.HOLD_TIMEOUT, cp.holds.TOOL_HOLD_TIMEOUT
+        cp.holds.HOLD_TIMEOUT, cp.holds.TOOL_HOLD_TIMEOUT = 0.05, -1
+        try:
+            cp.api_authorize.authorize(_auth_req("nobody.example.com", stage="connect"))
+            _tool_call(tool="create_pull_request", args={"title": "x"})
+            cp.holds._expire_tool_asks()
+        finally:
+            cp.holds.HOLD_TIMEOUT, cp.holds.TOOL_HOLD_TIMEOUT = saved
+        rows = self._rows("stage NOT IN ('policy', 'tool-policy', 'mcp-server')")
+        self.assertEqual({(r["stage"], r["kind"]) for r in rows},
+                         {("connect", "allow"), ("connect", "hold"),
+                          ("connect", "deny"), ("tool-call", "allow"),
+                          ("tool-call", "hold"), ("tool-ask", "deny")})
+        for row in rows:
+            with self.subTest(stage=row["stage"], kind=row["kind"]):
+                self.assertIsNone(row["actor"])
+
+    def test_an_inventory_push_names_the_gateway_as_actor_not_as_client(self):
+        # The one row that used to put an actor in `client`: a formatted provenance
+        # string where every other row has a sandbox address.
+        cp.api_tool.tool_inventory(cp.api_tool.InventoryRequest(servers={
+            "mcp-github": {"status": "ok", "tools": [{"name": "get_me"}]}}),
+            _FakeRequest(peer="172.29.0.4"))
+        [row] = self._rows("stage='mcp-tools'")
+        self.assertEqual((row["client"], row["client_class"]), (None, None))
+        self.assertIn("peer=172.29.0.4", row["actor"])
+
+
 class TwoServersOneToolNameTests(_ToolBridgeTestCase):
     """The reason ``server`` is a COLUMN and ``tool_rules`` is UNIQUE on the pair.
 
@@ -4903,6 +5017,22 @@ class SchemaVersionTests(_FreshStoreTestCase):
                                "approvals WHERE id='old-persist'").fetchone()
         self.assertIsNone(row["pattern"])
         self.assertEqual(cp.api_authorize._decision_scope(row), "standing rule written")
+
+    def test_v7_adds_the_actor_without_reading_it_out_of_old_reasons(self):
+        # The actor of an old config row IS in its reason, and stays there only: a
+        # column filled by parsing sentences would record what a regex found.
+        self._old_store("version-actor.db")
+        with cp.store._connect() as conn:
+            conn.execute("INSERT INTO audit(ts, decision, host, reason) VALUES "
+                         "(1.0, 'create', '.example.com', "
+                         "'allow rule created by peer=172.31.0.9; .example.com')")
+            conn.commit()
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            row = conn.execute("SELECT actor, reason FROM audit "
+                               "WHERE host='.example.com'").fetchone()
+        self.assertIsNone(row["actor"])
+        self.assertIn("peer=172.31.0.9", row["reason"])
 
     def test_a_store_already_renamed_is_left_alone(self):
         # `ALTER TABLE ... RENAME COLUMN` raises rather than no-ops if it runs twice.

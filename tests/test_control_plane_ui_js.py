@@ -115,7 +115,6 @@ const load = name => import(pathToFileURL(`${dir}/${name}`).href);
 // Which module owns each helper: a helper that moves shows up here, as a rename would.
 const owner = {
   "app.js": ["lampState", "backoffDelay",
-             "normalizePattern", "createPreview", "editPreview",
              "saturationState", "ackCount", "capScope",
              "auditRow", "auditStatus", "rulesStatus", "repeatCount",
              "leaseLabel", "leaseRemaining", "leaseCountdown", "leasesStatus",
@@ -126,6 +125,8 @@ const owner = {
              "serverDescriptor", "serverPreview", "serverEditBody",
              "toolChoices", "toolRulePreview", "toolEditPreview",
              "toolRevokePreview", "toolRulesStatus"],
+  "egress-rules.js": ["revokePreview", "normalizePattern", "createPreview",
+                      "editPreview"],
   "holds.js": ["renderableHolds", "diffPending", "shouldSweep",
                "toolRemaining", "toolOutcomeMessage",
                "holdRemaining", "countdownState", "departure", "persistPreview",

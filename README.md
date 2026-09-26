@@ -258,6 +258,8 @@ dockade/
     app.py                  #   static UI at / + streaming reverse proxy to the backend
     app.js                  #   the approval console's behaviour — a file so the CSP can
                             #   say script-src 'self'; pure helpers unit-tested under node
+    egress-rules.js         #   what creating, editing or revoking a standing rule is about
+                            #   to do, said before the click
     holds.js                #   the pending queue's decisions: what a push changes, when a
                             #   card may go, how a countdown reads, how an arrival is announced
     payload.js              #   a tool ask's payload as the operator sees it — imported by app.js

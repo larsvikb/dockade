@@ -3208,6 +3208,35 @@ class RecordViewWiringSourceTests(unittest.TestCase):
         self.assertRegex(body, r"auditPagerEl\.hidden = !events")
 
 
+class McpTabStartupSourceTests(unittest.TestCase):
+    """The MCP tab's one-off loads run at startup, not when the SSE stream opens.
+
+    They sat inside `es.onopen` from #41 to here, under a comment saying "once", so
+    with the stream down at page load the servers, rules and pins never loaded at all
+    — the tab read as empty policy rather than as unloaded. The pending queue needs
+    the stream; nothing in this tab does."""
+
+    LOADS = ("refreshServers();", "refreshToolRules();", "refreshInventory();",
+             "refreshToolPins();")
+
+    def setUp(self):
+        self.src = APP_JS.read_text()
+
+    def test_the_stream_opening_does_not_load_the_mcp_tab(self):
+        onopen = re.search(r"es\.onopen = \(\) => \{(.*?)\n    \};", self.src, re.S)
+        self.assertIsNotNone(onopen, "es.onopen not found — did it move?")
+        for call in self.LOADS:
+            with self.subTest(call=call):
+                self.assertNotIn(call, onopen.group(1))
+
+    def test_the_page_loads_the_mcp_tab_at_startup(self):
+        # Between `connect();` and the first poll timer: the startup calls.
+        startup = self.src.split("\n  connect();\n", 1)[1].split("setInterval", 1)[0]
+        for call in self.LOADS:
+            with self.subTest(call=call):
+                self.assertIn(f"\n  {call}", startup)
+
+
 class PollGatingSourceTests(unittest.TestCase):
     """The poll wiring lives at the bottom of `start()` and cannot be unit-tested, so
     the properties that would fail silently are asserted against the source.

@@ -1954,17 +1954,6 @@ function start() {
       // only exist because this stream delivered it, so this is the earliest useful
       // moment — and a reconnect may be a restarted backend with a different window.
       refreshConfig();
-  // Once, not polled. Server registration changes when an operator changes it,
-  // and this view is the thing doing the changing — each action refreshes after
-  // itself. A four-second poll here would be watching for edits nobody else makes.
-  //
-  // Tool rules are the same kind of state and get the same treatment. The INVENTORY
-  // is not: it changes because the gateway pushed, which happens without anyone
-  // touching this page, so it is the one thing in this view that is polled.
-  refreshServers();
-  refreshToolRules();
-  refreshInventory();
-  refreshToolPins();
     };
     es.addEventListener("pending", e => {
       const d = JSON.parse(e.data);
@@ -2604,6 +2593,18 @@ function start() {
   // has to work while the SSE feed is down — which is exactly when an operator is most
   // likely to be writing policy by hand rather than clicking cards.
   refreshConfig();
+  // Once, not polled, and not on the stream's open either: the MCP tab must load while
+  // the feed is down, for the reason the line above gives. Server registration changes
+  // when an operator changes it, and this view is the thing doing the changing — each
+  // action refreshes after itself.
+  //
+  // Tool rules and pins are the same kind of state and get the same treatment. The
+  // INVENTORY is not: it changes because the gateway pushed, which happens without
+  // anyone touching this page, so it is the one thing in this view that is polled.
+  refreshServers();
+  refreshToolRules();
+  refreshInventory();
+  refreshToolPins();
   // Both keep polling regardless of which VIEW is showing — otherwise the badges
   // could not report a hidden view's state, which is the whole reason they exist.
   //

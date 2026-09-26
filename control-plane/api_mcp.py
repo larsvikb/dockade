@@ -405,7 +405,10 @@ def api_mcp_pins() -> list[dict]:
     ``decides`` is the conditions ``policy._decide_tool`` reads a pin under, so the
     view cannot call a pin live that the decision passes over: the tool's rule is
     `ask`, its server is enabled, and the row holds a pin set. ``pins`` is None for a
-    row that does not (``policy._parse_pins``)."""
+    row that does not (``policy._parse_pins``).
+
+    ``pins_json`` is the row as stored, for the page to show without parsing: a
+    browser's JSON.parse rounds an integer past 2^53, and a pin is compared exactly."""
     with store._connect() as conn:
         rows = conn.execute(
             "SELECT p.id, p.server, p.tool, p.pins_json, p.approval_id, "
@@ -417,7 +420,7 @@ def api_mcp_pins() -> list[dict]:
     for r in rows:
         pins = policy._parse_pins(r["pins_json"])
         out.append({"id": r["id"], "server": r["server"], "tool": r["tool"],
-                    "pins": pins, "rule": r["action"],
+                    "pins": pins, "pins_json": r["pins_json"], "rule": r["action"],
                     "decides": (pins is not None and r["action"] == "ask"
                                 and bool(r["enabled"])),
                     "approval_id": r["approval_id"], "created_at": r["created_at"],

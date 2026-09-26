@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 /* The MCP surface as the operator configures it — the backend's api_mcp.py, seen
- * from the form: what a server registration will record, and the tool policy picker
- * with what a rule written from it will do. The backend decides; these shape the
- * previews and have to agree with it.
+ * from the form: what a server registration will record, the tool policy picker
+ * with what a rule written from it will do, and how a pin reads. The backend
+ * decides; these shape the previews and have to agree with it.
  *
  * No DOM at import, so the unit tests import this file under node
  * (tests/test_control_plane_ui_js.py).
  */
+import { escapePayload } from "./payload.js";
 
 // The DNS label a server name has to be. Three spellings of one rule — here, in the
 // relay's path pattern, and in `policy._server_name_error` — each load-bearing in a
@@ -276,4 +277,43 @@ export function toolRevokePreview(rule) {
   return { danger: false, tool, server, was,
            text: `${tool} on ${server} will no longer ${toolUndo(was)}. With no rule it `
                + `is denied, so this can only take capability away.` };
+}
+
+// ── pinned allows: an `ask` answered in advance ──────────────────────────────
+
+// A pin set as the operator reads it: the stored canonical JSON, never a parsed copy,
+// with EVERY non-ASCII character spelled out. Stricter than a payload, where only the
+// invisible ones are (`payloadHazards`), because a pin value is an identifier and not
+// prose. U+0430 CYRILLIC SMALL LETTER A in a pinned `owner` looks exactly like the Latin
+// one, and here it means the pin answers calls for a different owner than the one on
+// screen.
+export function pinText(pinsJson) {
+  const raw = typeof pinsJson === "string" ? pinsJson : "";
+  const text = escapePayload(raw);
+  return { text, escaped: text !== raw };
+}
+
+// Whether a pin decides anything now, and if not, which condition fails. `decides` is
+// the backend's (api_mcp.api_mcp_pins), so this only NAMES the reason, and the order
+// follows `policy._decide_tool`: a row that is not a pin set, then the rule, then the
+// server.
+export function pinState(pin) {
+  const tool = (pin && pin.tool) || "";
+  const server = (pin && pin.server) || "";
+  if (pin && pin.decides) {
+    return { live: true, text: "answers the calls that carry these values" };
+  }
+  if (!pin || !pin.pins) {
+    return { live: false, text: "not a pin set this control plane can read, so it "
+                              + "decides nothing" };
+  }
+  if (!pin.rule) {
+    return { live: false, text: `${tool} has no rule, so it is denied and this `
+                              + `decides nothing` };
+  }
+  if (pin.rule !== "ask") {
+    return { live: false, text: `the rule ${toolVerb(pin.rule)} ${tool}, and a pin `
+                              + `decides only while it asks` };
+  }
+  return { live: false, text: `${server} is disabled, so this decides nothing` };
 }

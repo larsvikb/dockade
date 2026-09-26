@@ -360,7 +360,10 @@ class RelayAllowlistTests(unittest.TestCase):
                              ("api/mcp/rules", "GET"),
                              ("api/mcp/rules", "POST"),
                              ("api/mcp/rules/12/edit", "POST"),
-                             ("api/mcp/rules/12/revoke", "POST")):
+                             ("api/mcp/rules/12/revoke", "POST"),
+                             # Pins: read, and taken back, which only narrows.
+                             ("api/mcp/pins", "GET"),
+                             ("api/mcp/pins/12/revoke", "POST")):
             self._proxy(path, method)
             self.assertEqual(urlsplit(_sent["url"]).netloc, "control-plane:8090",
                              f"{method} {path} must relay")
@@ -444,7 +447,15 @@ class RelayAllowlistTests(unittest.TestCase):
                              # The inventory is a READ of third-party text. A write to
                              # it would be a browser pushing a server's surface into the
                              # control plane, which only the gateway may do.
-                             ("api/mcp/inventory", "POST")):
+                             ("api/mcp/inventory", "POST"),
+                             # No collection POST: a pin is written by resolving a
+                             # card, never from a form. The id is digit-bounded as the
+                             # rule ids are.
+                             ("api/mcp/pins", "POST"),
+                             ("api/mcp/pins/../revoke", "POST"),
+                             ("api/mcp/pins/abc/revoke", "POST"),
+                             ("api/mcp/pins/12/revoke", "GET"),
+                             ("api/mcp/pins/12", "POST")):
             resp = self._proxy(path, method)
             self.assertEqual(getattr(resp, "status_code", None), 403,
                              f"{method} {path} must be refused")

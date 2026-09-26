@@ -2114,8 +2114,8 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | 4 | pull-through package cache | planned |
 | — | governed git path — clone/fetch (writes are the gateway's) | planned |
 | — | GitHub write set — `GITHUB_READ_ONLY` off behind the gateway, with per-tool repo scoping | planned |
-| — | pinned allows — `tool_pins`, read under an `ask` rule only; view and revoke | **done** — nothing writes one yet |
-| — | pinning from a tool card — `allow_pinned`, the field picker, pins in the policy tab | planned |
+| — | pinned allows — `tool_pins`, read under an `ask` rule only; listed and revocable in the MCP tab | **done** — nothing writes one yet |
+| — | pinning from a tool card — `allow_pinned` and the field picker | planned |
 | — | `mcp-net` + MCP server catalogue (`mcp-servers.yml`) | **done** |
 | — | per-client-class egress policy | **done** |
 | — | tool policy: store (`tool_rules`, `mcp_servers`) + config API (`/api/mcp/…`) | **done** |

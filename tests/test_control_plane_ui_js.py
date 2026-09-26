@@ -121,11 +121,12 @@ const owner = {
   "egress-rules.js": ["revokePreview", "normalizePattern", "createPreview",
                       "editPreview"],
   "mcp.js": ["serverDescriptor", "serverPreview", "serverEditBody",
-             "toolChoices", "toolRulePreview", "toolEditPreview", "toolRevokePreview"],
+             "toolChoices", "toolRulePreview", "toolEditPreview", "toolRevokePreview",
+             "pinText", "pinState"],
   "leases.js": ["leaseLabel", "leaseRemaining", "leaseCountdown", "leaseDomain",
                 "groupLeases"],
   "status.js": ["pollStatus", "auditStatus", "rulesStatus", "toolRulesStatus",
-                "leasesStatus"],
+                "toolPinsStatus", "leasesStatus"],
   "holds.js": ["renderableHolds", "diffPending", "shouldSweep",
                "toolRemaining", "toolOutcomeMessage",
                "holdRemaining", "countdownState", "departure", "persistPreview",
@@ -223,6 +224,29 @@ console.log(JSON.stringify({
       status_cold: m.toolRulesStatus(0, true, false),
       status_quiet: m.toolRulesStatus(2, false, true),
       rank: m.TOOL_ACTION_RANK,
+    };
+  })(),
+  // A pin as the MCP tab shows it, and which of the decision's conditions it fails.
+  pins: (() => {
+    const pin = (fields) => ({ server: "mcp-github", tool: "list_commits",
+                               pins: { repo: "dockade" }, rule: "ask",
+                               decides: false, ...fields });
+    return {
+      plain: m.pinText('{"owner":"larsvikb","repo":"dockade"}'),
+      homoglyph: m.pinText('{"owner":"l\u0430rsvikb"}'),
+      bidi: m.pinText('{"repo":"safe\u202eevil"}'),
+      // Past 2^53, where a JSON.parse round trip would read 9007199254740992.
+      big: m.pinText('{"n":9007199254740993}'),
+      missing: m.pinText(undefined),
+      live: m.pinState(pin({ decides: true })),
+      unreadable: m.pinState(pin({ pins: null })),
+      unruled: m.pinState(pin({ rule: null })),
+      under_allow: m.pinState(pin({ rule: "allow" })),
+      under_deny: m.pinState(pin({ rule: "deny" })),
+      disabled: m.pinState(pin({})),
+      status_empty: m.toolPinsStatus(0, false, true),
+      status_stale: m.toolPinsStatus(2, true, true),
+      status_quiet: m.toolPinsStatus(1, false, true),
     };
   })(),
   lamp: {
@@ -4093,6 +4117,85 @@ if __name__ == "__main__":
 
 @unittest.skipIf(not _NODE and not _STRICT,
                  "node is not installed — skipping app.js unit tests")
+class PinnedAllowViewTests(unittest.TestCase):
+    """How the MCP tab shows a pin: as stored, every non-ASCII character spelled out,
+    and in words when it decides nothing."""
+
+    probe: dict
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.probe = _probe()
+
+    def test_a_plain_pin_is_shown_exactly_as_stored(self):
+        plain = self.probe["pins"]["plain"]
+        self.assertEqual(plain["text"], '{"owner":"larsvikb","repo":"dockade"}')
+        self.assertFalse(plain["escaped"])
+
+    def test_a_homoglyph_is_spelled_out_where_a_payload_would_only_note_it(self):
+        # A Cyrillic a in `owner` looks Latin on screen and pins a different owner.
+        homoglyph = self.probe["pins"]["homoglyph"]
+        self.assertEqual(homoglyph["text"], '{"owner":"l\\u0430rsvikb"}')
+        self.assertTrue(homoglyph["escaped"])
+
+    def test_a_bidi_override_is_spelled_out(self):
+        self.assertEqual(self.probe["pins"]["bidi"]["text"],
+                         '{"repo":"safe\\u202eevil"}')
+
+    def test_a_large_integer_is_not_rounded_by_a_parse(self):
+        self.assertIn("9007199254740993", self.probe["pins"]["big"]["text"])
+
+    def test_a_missing_pin_set_shows_nothing_rather_than_throwing(self):
+        self.assertEqual(self.probe["pins"]["missing"], {"text": "", "escaped": False})
+
+    def test_the_backends_decides_is_what_makes_a_pin_live(self):
+        self.assertTrue(self.probe["pins"]["live"]["live"])
+
+    def test_an_inert_pin_says_which_condition_it_fails(self):
+        pins = self.probe["pins"]
+        for key, words in (("unreadable", "can read"), ("unruled", "no rule"),
+                           ("under_allow", "the rule allows"),
+                           ("under_deny", "the rule denies"), ("disabled", "disabled")):
+            with self.subTest(state=key):
+                self.assertFalse(pins[key]["live"])
+                self.assertIn(words, pins[key]["text"])
+
+    def test_the_status_line_says_what_an_empty_or_stale_list_means(self):
+        pins = self.probe["pins"]
+        self.assertTrue(pins["status_empty"]["show"])
+        self.assertIn("raises a card", pins["status_empty"]["text"])
+        self.assertEqual(pins["status_stale"]["level"], "warn")
+        self.assertIn("may be missing", pins["status_stale"]["text"])
+        self.assertFalse(pins["status_quiet"]["show"])
+
+
+class PinnedAllowTableSourceTests(unittest.TestCase):
+    """The pins table lives in `start()`, so what would fail silently is asserted
+    against the source, as for the tool rules."""
+
+    def setUp(self):
+        src = APP_JS.read_text()
+        self.rows = _fn_body(src, "renderToolPins(rows)")
+        self.poll = _fn_body(src, "refreshToolPins()")
+
+    def test_the_values_are_set_as_text_and_from_the_stored_form(self):
+        # Agent-authored values, so never markup, and never a parsed-and-restringified
+        # copy of them.
+        self.assertNotIn("innerHTML", self.rows)
+        self.assertIn("pinText(row.pins_json)", self.rows)
+        self.assertNotIn("JSON.stringify", self.rows)
+
+    def test_a_refused_poll_is_not_rendered_as_no_pins(self):
+        self.assertIn("if (!res.ok) throw", self.poll)
+
+    def test_there_is_no_way_to_add_a_pin_from_this_view(self):
+        # A pin is written by resolving a card, as a lease is.
+        html = INDEX_HTML.read_text()
+        section = html.split('id="toolpincount"', 1)[1].split("</section>", 1)[0]
+        self.assertNotIn("<form", section)
+        self.assertNotIn("<input", section)
+
+
 class PayloadHazardTests(unittest.TestCase):
     """A payload the eye cannot read correctly is flagged; one it can is only noted.
 

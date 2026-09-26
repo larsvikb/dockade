@@ -3774,6 +3774,8 @@ class McpPinTests(_CPTestCase):
     def test_the_view_serves_the_pin_set_and_its_provenance(self):
         [served] = cp.api_mcp.api_mcp_pins()
         self.assertEqual(served["pins"], _PINNED)
+        # As stored, for the page to show without a parse that rounds large integers.
+        self.assertEqual(served["pins_json"], cp.policy._canonical_pins(_PINNED))
         self.assertEqual((served["server"], served["tool"], served["rule"]),
                          ("mcp-github", "create_pull_request", "ask"))
         self.assertEqual(served["approval_id"], "a1")

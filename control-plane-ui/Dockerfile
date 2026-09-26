@@ -17,9 +17,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py ./app.py
 COPY index.html ./index.html
-# The page script, served as a file rather than inlined into index.html — that is
-# what lets the CSP say `script-src 'self'` (see _CSP in app.py).
+# The page's modules, served as files rather than inlined into index.html — that is
+# what lets the CSP say `script-src 'self'` (see _CSP in app.py). One line each: a
+# test holds this list equal to UI_MODULES there.
 COPY app.js ./app.js
+COPY payload.js ./payload.js
 
 USER cpui
 EXPOSE 8090

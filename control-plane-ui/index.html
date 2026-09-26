@@ -681,11 +681,12 @@
     <div class="empty" id="toolrules-empty" hidden></div>
   </section>
 </main>
-<!-- Behaviour lives in app.js, NOT inline: an external script is what lets the
-     Content-Security-Policy this app sends say `script-src 'self'` instead of
-     `'unsafe-inline'`, and it is what makes the decision logic unit-testable
-     (tests/test_control_plane_ui_js.py). Same origin, served by this container —
-     never a CDN. -->
-<script src="/app.js" defer></script>
+<!-- Behaviour lives in app.js and the modules it imports, NOT inline: an external
+     script is what lets the Content-Security-Policy this app sends say
+     `script-src 'self'` instead of `'unsafe-inline'`, and it is what makes the
+     decision logic unit-testable (tests/test_control_plane_ui_js.py). Same origin,
+     served by this container — never a CDN. A module script is deferred by
+     definition, so there is no `defer` to forget. -->
+<script type="module" src="/app.js"></script>
 </body>
 </html>

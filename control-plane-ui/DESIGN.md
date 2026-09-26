@@ -120,7 +120,7 @@ payload carrying invisible or non-ASCII characters is shown *escaped* by default
 sits, with the raw text one click away — because a bidi override lets the browser
 reorder what the operator reads while the bytes stay as they are, which is the
 reordering this rule forbids, performed by the renderer (`payloadHazards` in
-`control-plane-ui/app.js`). The
+`control-plane-ui/payload.js`). The
 limit worth stating rather than engineering around: an operator cannot judge an
 opaque identifier, and resolving one would mean the control plane making its own MCP
 calls — new capability on the crown-jewel container and a fine SSRF surface.
@@ -159,10 +159,18 @@ currently allowed before an operator decides a hold. Details in `app.js`.
 under `node` (skipped when node is absent, the way `make lint` skips a missing linter)
 and asserts in Python, so failures read like the rest of `tests/`. What each helper
 must hold is in its test's name; that file is the inventory, not this one. Everything
-that touches the DOM lives inside `start()`, which runs only in a browser — so
-requiring the module under
-node must be side-effect free, and the test asserts that too: if DOM work migrates to
-the top level, `require` throws and the file cannot quietly become untestable again.
+that touches the DOM runs from `start()`, which only a browser calls — so importing
+a module under node must be side-effect free, and the test asserts that too: if DOM
+work migrates to import time, the `import` throws and the file cannot quietly become
+untestable again.
+
+The page is ES modules, one file per surface, and `app.py` serves them by name from
+`UI_MODULES` — a list a human wrote, looked up before a name becomes a path, so the
+route hands out nothing else in the directory. The list has two other copies with no
+compiler between them, the Dockerfile's `COPY` lines and the modules' own imports, and
+a test holds each equal to it; a module left out of the image would 404 in the
+container with every unit test green, and stop the whole page at the entry's first
+`import`.
 
 Two cross-file couplings have no compiler between their ends, and a test stands in at
 each. The first asserts every `getElementById` in `app.js` matches an id in `index.html`. The

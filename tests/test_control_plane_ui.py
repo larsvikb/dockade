@@ -656,7 +656,18 @@ class StaticRevalidationTests(unittest.TestCase):
     per-surface. A real pending decision, on screen, that cannot be actioned."""
 
     def test_the_page_script_is_revalidated_on_every_load(self):
-        self.assertEqual(ui.script().headers["cache-control"], "no-cache")
+        for name in sorted(ui.UI_MODULES):
+            with self.subTest(module=name):
+                self.assertEqual(ui.script(name.removesuffix(".js"))
+                                 .headers["cache-control"], "no-cache")
+
+    def test_a_module_nobody_listed_is_not_served(self):
+        # The name comes off the URL and is looked up in `UI_MODULES` BEFORE it becomes
+        # a path, so the route cannot be used to read anything else in the directory —
+        # `..` included, which the route pattern lets through as a name.
+        for name in ("evil", "..", "app.js", "requirements"):
+            with self.subTest(name=name):
+                self.assertEqual(ui.script(name).status_code, 404)
 
     def test_the_document_is_revalidated_too(self):
         # The markup carries the stylesheet and the element ids the script binds to,
@@ -667,7 +678,7 @@ class StaticRevalidationTests(unittest.TestCase):
         # `no-store` would refetch both files in full on every load and every
         # reconnect. The validators are already being sent, so `no-cache` gets the same
         # guarantee for one conditional request and a 304.
-        for headers in (ui.script().headers, ui.index().headers):
+        for headers in (ui.script("app").headers, ui.index().headers):
             self.assertNotIn("no-store", headers["cache-control"])
 
     def test_the_security_middleware_does_not_drop_it(self):
@@ -675,7 +686,7 @@ class StaticRevalidationTests(unittest.TestCase):
         # If it ever assigned a whole header mapping instead, this would go silently —
         # and silence is exactly the failure mode being closed here.
         async def _next(_request):
-            return ui.script()
+            return ui.script("app")
 
         resp = asyncio.run(ui._security_headers(_ok_host(), _next))
         self.assertEqual(resp.headers["cache-control"], "no-cache")

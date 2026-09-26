@@ -10,14 +10,19 @@ leave the I/O to the integration checks).
 
 Two groups:
 
-**Pure helpers, under node.** ``node`` evaluates the module and dumps the results of a
+**Pure helpers, under node.** ``node`` imports the modules and dumps the results of a
 fixed set of calls as JSON; the assertions stay here, in Python, so they read like the
 rest of ``tests/``. Skipped when node is absent, the same way ``make lint`` skips a
 linter that is not installed — the intrinsic guards below still run. This also asserts
-the property that makes the file testable at all: requiring it under node must have NO
-side effects, because everything touching the DOM lives inside ``start()``, which runs
-only in a browser. If DOM work ever migrates to the top level, ``require`` throws and
+the property that makes the files testable at all: importing them under node must have
+NO side effects, because everything touching the DOM runs from ``start()``, which only
+a browser calls. If DOM work ever migrates to import time, the ``import`` throws and
 these tests fail loudly rather than the file quietly becoming untestable again.
+
+The page is ES modules, one per surface, and ``UI_MODULES`` in ``app.py`` is the list
+of what the script route serves. Three files agree on that list with no compiler
+between them — the directory, the Dockerfile and the modules' own imports — so each
+pair is asserted below.
 
 **CSP/markup agreement, no node needed.** ``script-src 'self'`` is only worth sending
 while the page has no inline script. That is an invariant spanning two files, so it is
@@ -37,8 +42,21 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-APP_JS = ROOT / "control-plane-ui" / "app.js"
-INDEX_HTML = ROOT / "control-plane-ui" / "index.html"
+UI_DIR = ROOT / "control-plane-ui"
+APP_JS = UI_DIR / "app.js"
+PAYLOAD_JS = UI_DIR / "payload.js"
+INDEX_HTML = UI_DIR / "index.html"
+
+
+def _module_texts() -> dict[str, str]:
+    """Every module the page is made of, by file name — for the guards that read
+    source, so a helper moving to another module does not move out of their sight."""
+    return {p.name: p.read_text() for p in sorted(UI_DIR.glob("*.js"))}
+
+
+def _imports(js: str) -> list[str]:
+    """The module names `js` imports — relative, same directory, as the page's are."""
+    return re.findall(r'''from\s+["']\./([^"']+)["']''', js)
 
 # `make test` runs discovery with `-t tests`, so sibling modules import by bare name;
 # this keeps the file runnable on its own too. Imported for `_CSP` / `_directives` —
@@ -58,34 +76,52 @@ _NODE = shutil.which("node")
 # these ten tests are the only coverage app.js has. Mirrors the Makefile's strict mode.
 _STRICT = bool(os.environ.get("DOCKADE_REQUIRE_TOOLS"))
 
-# Evaluate the module and report a fixed set of calls. Deliberately data-only: no
+# Import the modules and report a fixed set of calls. Deliberately data-only: no
 # assertions live here, so a failure is reported by Python with a normal diff.
-# The path arrives by environment rather than argv: `node -e` shifts the argument
-# vector (there is no script filename), so an index would be quietly wrong.
+# The directory arrives by environment rather than argv: `node -e` shifts the
+# argument vector (there is no script filename), so an index would be quietly wrong.
+#
+# `.js` files with `import`/`export` in them are read as ES modules from their syntax
+# (node 22.7 and 20.19 on; no package.json is needed or wanted, there is no npm here).
 _PROBE = r"""
-const m = require(process.env.DOCKADE_APP_JS);
-const missing = ["lampState", "backoffDelay", "diffPending", "shouldSweep",
-                 "holdRemaining", "countdownState", "departure", "persistPreview",
-                 "normalizePattern", "createPreview", "editPreview",
-                 "saturationState", "ackCount", "capScope", "requestsLabel",
-                 "auditRow", "auditStatus", "rulesStatus", "repeatCount",
-                 "leaseLabel", "leaseRemaining", "leaseCountdown", "leasesStatus",
-                 "leaseDomain", "groupLeases", "shortActor",
-                 "timeWindow", "filterActive", "auditQuery", "eventRow",
-                 "historyPager", "renderableHolds",
-                 "toolRemaining", "payloadDisclosure", "payloadHazards",
-                 "escapePayload", "indentPayload", "toolOutcomeMessage",
-                 "cardSubject", "approvalNotices", "shouldNotify", "notifyButton",
-                 "fmtTime", "fmtStamp", "fmtInstant",
-                 "serverDescriptor", "serverPreview", "serverEditBody",
-                 "toolChoices", "toolRulePreview", "toolEditPreview",
-                 "toolRevokePreview", "toolRulesStatus"]
-  .filter(n => typeof m[n] !== "function");
+import { pathToFileURL } from "node:url";
+const dir = process.env.DOCKADE_UI_DIR;
+const load = name => import(pathToFileURL(`${dir}/${name}`).href);
+// Which module owns each helper: a helper that moves shows up here, as a rename would.
+const owner = {
+  "app.js": ["lampState", "backoffDelay", "diffPending", "shouldSweep",
+             "holdRemaining", "countdownState", "departure", "persistPreview",
+             "normalizePattern", "createPreview", "editPreview",
+             "saturationState", "ackCount", "capScope", "requestsLabel",
+             "auditRow", "auditStatus", "rulesStatus", "repeatCount",
+             "leaseLabel", "leaseRemaining", "leaseCountdown", "leasesStatus",
+             "leaseDomain", "groupLeases", "shortActor",
+             "timeWindow", "filterActive", "auditQuery", "eventRow",
+             "historyPager", "renderableHolds",
+             "toolRemaining", "toolOutcomeMessage",
+             "cardSubject", "approvalNotices", "shouldNotify", "notifyButton",
+             "fmtTime", "fmtStamp", "fmtInstant",
+             "serverDescriptor", "serverPreview", "serverEditBody",
+             "toolChoices", "toolRulePreview", "toolEditPreview",
+             "toolRevokePreview", "toolRulesStatus"],
+  "payload.js": ["payloadDisclosure", "payloadTokens", "indentPayload",
+                 "escapePayload", "payloadHazards", "renderPayload"],
+};
+const modules = Object.fromEntries(await Promise.all(
+  Object.keys(owner).map(async name => [name, await load(name)])));
+const missing = Object.entries(owner).flatMap(([name, names]) =>
+  names.filter(n => typeof modules[name][n] !== "function").map(n => `${name}:${n}`));
+// One namespace for the calls below. Two modules exporting one name would hide one
+// of them here, so that is reported too.
+const exported = Object.values(modules).flatMap(ns => Object.keys(ns));
+const duplicated = exported.filter((n, i) => exported.indexOf(n) !== i);
+const m = Object.assign({}, ...Object.values(modules));
 const _row = {server: "mcp-github", enabled: false,
               auth: {type: "header", header: "Authorization",
                      template: "Bearer {secret}"}};
 console.log(JSON.stringify({
   missing,
+  duplicated,
   server: {
     none: m.serverDescriptor("none"),
     bearer: m.serverDescriptor("header"),
@@ -960,15 +996,15 @@ def _probe() -> dict:
     # makes that mistake a failing assertion. The offset also has to be one whose
     # local date differs from the UTC date for the sample instants below.
     proc = subprocess.run(  # noqa: S603 (absolute path, fixed args — see above)
-        [_NODE, "-e", _PROBE],
-        env={**os.environ, "DOCKADE_APP_JS": str(APP_JS),
+        [_NODE, "--input-type=module", "-e", _PROBE],
+        env={**os.environ, "DOCKADE_UI_DIR": str(UI_DIR),
              "TZ": "Europe/Stockholm"},
         capture_output=True, text=True, timeout=60, check=False)
     if proc.returncode != 0:
         raise AssertionError(
-            "requiring control-plane-ui/app.js under node failed. The module must "
-            "be importable with NO side effects — everything that touches the DOM "
-            "belongs inside start(), which only runs in a browser. node said:\n"
+            "importing the control-plane-ui modules under node failed. Each must be "
+            "importable with NO side effects — everything that touches the DOM runs "
+            "from start(), which only a browser calls. node said:\n"
             + proc.stderr)
     return json.loads(proc.stdout)
 
@@ -985,8 +1021,10 @@ class PageScriptTests(unittest.TestCase):
         cls.probe = _probe()
 
     def test_every_helper_is_exported(self):
-        # Guards the export block: dropping a name there silently disables its tests.
+        # Guards the export blocks: dropping a name there silently disables its tests,
+        # and a name exported twice would hide one of the two from them.
         self.assertEqual(self.probe["missing"], [])
+        self.assertEqual(self.probe["duplicated"], [])
 
     def test_the_bearer_preset_ignores_stale_custom_fields(self):
         # The custom inputs stay in the DOM when the preset changes back, so a form
@@ -3768,7 +3806,10 @@ class InlineScriptTests(unittest.TestCase):
 
     def test_the_page_loads_the_script_from_this_origin(self):
         html = INDEX_HTML.read_text()
-        self.assertIn('<script src="/app.js"', html)
+        # As a MODULE: the entry imports the others, and a classic script stops at
+        # its first `import` with a SyntaxError — a blank page, and nothing here to
+        # say why.
+        self.assertIn('<script type="module" src="/app.js">', html)
         # Never a third party: a governance UI must not fetch its own control logic
         # from a CDN, which is also why the favicon is an inline data URI.
         self.assertNotIn("//cdn", html)
@@ -3823,7 +3864,7 @@ class InlineScriptTests(unittest.TestCase):
         dereferences it, so a renamed id is a TypeError that only appears in a browser
         — with no test and no linter between the edit and the operator. Same spirit as
         the Makefile's cross-file consistency guards."""
-        js = APP_JS.read_text()
+        js = "\n".join(_module_texts().values())
         html = INDEX_HTML.read_text()
         ids = set(re.findall(r"""getElementById\(["']([^"']+)["']\)""", js))
         # The per-view ids are built by concatenation (`"view-" + v`), so expand them
@@ -3849,9 +3890,9 @@ class InlineScriptTests(unittest.TestCase):
         Paths only, not methods: the shapes here are simple and the method-level
         allowlist has its own tests in test_control_plane_ui.py. The converse direction
         has its own test below."""
-        js = APP_JS.read_text()
+        js = "\n".join(_module_texts().values())
         # Served by this container rather than relayed (see control-plane-ui/app.py).
-        local = {"/", "/app.js", "/healthz"}
+        local = {"/", "/healthz"} | {f"/{name}" for name in ui.UI_MODULES}
         calls = _requested_paths(js)
         self.assertGreater(len(calls), 3, "no fetch/EventSource calls found — did the "
                                           "page's I/O move somewhere this cannot see?")
@@ -3873,7 +3914,7 @@ class InlineScriptTests(unittest.TestCase):
         real possibility, but it should arrive with its reason attached, as a change to
         this test that someone has to justify — not as an entry that quietly stops
         matching anything."""
-        js = APP_JS.read_text()
+        js = "\n".join(_module_texts().values())
         calls = [p for variants in _requested_paths(js) for p in variants]
         self.assertTrue(calls, "no fetch/EventSource calls found")
         unused = [f"{method} {pattern.pattern}"
@@ -3929,11 +3970,31 @@ class InlineScriptTests(unittest.TestCase):
             "the handler must adopt the acknowledgement the BACKEND recorded; without "
             "that echo a wrong count fails silently instead of re-raising the banner")
 
-    def test_the_script_file_is_the_one_the_app_serves(self):
-        # UI_SCRIPT points into the image; assert the repo file the Dockerfile copies
-        # there is the one this test suite has been asserting on.
-        self.assertTrue(APP_JS.is_file())
-        self.assertEqual(Path(ui.UI_SCRIPT).name, APP_JS.name)
+    def test_the_modules_the_app_serves_are_the_files_in_this_directory(self):
+        # Both directions in one equality: a file nobody listed is a 404 in the
+        # browser, and a listed file nobody wrote is one too.
+        self.assertEqual(set(ui.UI_MODULES), set(_module_texts()))
+        self.assertIn("app.js", ui.UI_MODULES)
+
+    def test_every_module_is_copied_into_the_image(self):
+        # UI_DIR points into the image, and the Dockerfile copies files by name. A
+        # module left out of it passes every test here and 404s in the container —
+        # and the entry's first `import` of it stops the whole page.
+        dockerfile = (UI_DIR / "Dockerfile").read_text()
+        for name in sorted(ui.UI_MODULES):
+            with self.subTest(module=name):
+                self.assertRegex(dockerfile, rf"(?m)^COPY {re.escape(name)} ")
+
+    def test_every_import_names_a_served_module_and_every_module_is_imported(self):
+        # The browser fetches `./x.js` from this origin, so an import of a file
+        # outside `UI_MODULES` is a 404 at load time. The converse keeps the list
+        # honest: a served module nothing imports is a file the page does not use.
+        texts = _module_texts()
+        imported = {name for js in texts.values() for name in _imports(js)}
+        self.assertEqual(imported - set(ui.UI_MODULES), set(),
+                         "imported but not served — add it to UI_MODULES")
+        self.assertEqual(set(ui.UI_MODULES) - imported - {"app.js"}, set(),
+                         "served but nothing imports it — the page never loads it")
 
 
 if __name__ == "__main__":
@@ -4252,8 +4313,8 @@ class PayloadColourTests(unittest.TestCase):
 
     def test_the_card_builds_its_spans_without_markup(self):
         # The pieces are agent-authored; a class name is the only thing of ours.
-        body = re.search(r"function renderPayload\(pre, tokens\) \{(.*?)\n  \}",
-                         APP_JS.read_text(), re.S)
+        body = re.search(r"function renderPayload\(pre, tokens\) \{(.*?)\n\}",
+                         PAYLOAD_JS.read_text(), re.S)
         self.assertIsNotNone(body, "renderPayload not found — did it get renamed?")
         self.assertIn("span.textContent = piece", body.group(1))
         self.assertIn("createTextNode(piece)", body.group(1))

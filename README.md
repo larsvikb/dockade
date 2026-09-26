@@ -258,6 +258,7 @@ dockade/
     app.py                  #   static UI at / + streaming reverse proxy to the backend
     app.js                  #   the approval console's behaviour — a file so the CSP can
                             #   say script-src 'self'; pure helpers unit-tested under node
+    payload.js              #   a tool ask's payload as the operator sees it — imported by app.js
     index.html              #   static shell + styles for the SSE approval console
     DESIGN.md               #   the browser boundary and the page's mechanics
     requirements.txt        #   pinned deps (fastapi, uvicorn, httpx)

@@ -79,12 +79,22 @@ from starlette.background import BackgroundTask
 BACKEND = os.environ.get(
     "CONTROL_BACKEND_URL", "http://control-plane:8090").rstrip("/")
 UI_INDEX = os.environ.get("CONTROL_UI_INDEX", "/opt/control-plane-ui/index.html")
-# The page's behaviour, served as a separate file rather than inline in the HTML.
+# The page's behaviour, served as separate files rather than inline in the HTML.
 # That is what lets the CSP below say `script-src 'self'` instead of
 # `'unsafe-inline'` — an inline-script allowance makes the whole policy decorative
 # against injection — and it is what makes the frontend's decision logic testable
 # (tests/test_control_plane_ui_js.py).
-UI_SCRIPT = os.environ.get("CONTROL_UI_SCRIPT", "/opt/control-plane-ui/app.js")
+#
+# ES modules, one per surface, and this list is the whole of what the script route
+# hands out. A test holds it equal to the files in the directory and to what the
+# modules import from each other.
+UI_DIR = os.environ.get("CONTROL_UI_DIR", "/opt/control-plane-ui")
+UI_MODULES = frozenset({"app.js", "payload.js"})
+# The path behind each name, built here from the list and never from a request: the
+# name off the URL only picks an entry, so no string a caller sent reaches the
+# filesystem — which is also what lets a scanner see it, rather than having to trust
+# a membership check upstream of a join.
+_UI_MODULE_PATHS = {name: os.path.join(UI_DIR, name) for name in UI_MODULES}
 
 
 def _hostnames(env: str, default: str) -> frozenset[str]:
@@ -450,16 +460,18 @@ def index() -> FileResponse:
     return FileResponse(UI_INDEX, media_type="text/html", headers=_REVALIDATE)
 
 
-@app.get("/app.js")
-def script() -> FileResponse:
-    """The page's behaviour. A local static file — never a CDN reference, for the same
-    reason the favicon is an inline data URI: a governance UI must not fetch its own
-    control logic from a third party.
+@app.get("/{name}.js")
+def script(name: str) -> Response:
+    """The page's behaviour, one module per request. Local static files — never a CDN
+    reference, for the same reason the favicon is an inline data URI: a governance UI
+    must not fetch its own control logic from a third party.
 
-    Which makes staleness this file's failure mode rather than a third party's, and
+    Which makes staleness these files' failure mode rather than a third party's, and
     `_REVALIDATE` above is the answer to it."""
-    return FileResponse(UI_SCRIPT, media_type="text/javascript",
-                        headers=_REVALIDATE)
+    path = _UI_MODULE_PATHS.get(f"{name}.js")
+    if path is None:
+        return PlainTextResponse("not found\n", status_code=404)
+    return FileResponse(path, media_type="text/javascript", headers=_REVALIDATE)
 
 
 def _relay_allowed(method: str, path: str) -> bool:

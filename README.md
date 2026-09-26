@@ -270,6 +270,8 @@ dockade/
                             #   records, the tool picker, what a tool rule will do
     payload.js              #   a tool ask's payload as the operator sees it — imported by app.js
     provenance.js           #   who acted, cut to what a table cell can hold
+    saturation.js           #   hold-cap pressure: when requests are being refused unheard,
+                            #   the banner, and what dismissing it acknowledges
     status.js               #   what each polled table says about itself: empty, stale, or
                             #   not yet loaded — one decision, four tables' sentences
     time.js                 #   timestamps as the page shows them

@@ -292,8 +292,7 @@ containment is capability + egress, not file bits or any settings scope.
 
 The default **status line** ships this way. It shows a sandbox indicator,
 directory, git branch, **used context window** (tokens + %), and 5h/7d
-subscription rate-limit usage with reset countdowns (the model id is read only
-to size the context window, not displayed). The **script
+subscription rate-limit usage with reset countdowns. The **script
 itself stays root-owned and baked** at `/etc/claude-code/statusline.sh`, so the
 non-root agent can toggle the pointer but not tamper with the code it runs — an
 acceptable trade-off for a cosmetic feature. User-scope delivery (not managed
@@ -314,15 +313,12 @@ template is what makes the acceptance survive restarts and volume wipes. This do
 `claude-yolo` alias; the flag only pre-accepts the disclaimer for a sandbox built
 precisely for that mode.
 
-Context usage is read from the **transcript file Claude Code already writes**
-(handed to the script as `.transcript_path` on stdin; the latest main-chain
-turn's `usage` is the current context), **not** from any API call. This is a
-deliberate consequence of the no-egress invariant: a status line renders
-constantly and has no governed path to `api.anthropic.com`, so a network call
-there would be blocked and would need embedded credentials — while the exact
-figure is already local and free. The parse is cached on the transcript's mtime
-so a large JSONL is only re-read when it changes; the win is avoiding re-parse
-latency, not a (nonexistent) network round-trip.
+Context usage and the window's size are read from the **JSON Claude Code hands
+the script on stdin** (`.context_window`, filled from its own inference
+responses), **not** from any API call. This is a deliberate consequence of the
+no-egress invariant: a status line renders constantly and has no governed path
+to `api.anthropic.com`, so a network call there would be blocked and would need
+embedded credentials — while the exact figure is already local and free.
 
 ### Durable host config lives outside the repo (`~/.config/dockade`)
 

@@ -61,18 +61,20 @@ KINDS = ("allow", "deny", "hold", "revoke", "create", "edit", "observe",
 # to search instead of to folding — and it is why ``url`` is searchable in the record
 # view and not in the glance, rather than being either everywhere or nowhere. The tool
 # columns are in both because an outcome row displays itself as `status · server__tool`
-# where an egress row names a host.
-GROUPED_SEARCH = ("host", "client", "client_class", "reason",
+# where an egress row names a host. ``actor`` is in both as displayed: its cell shows
+# the peer and via-ui fields and holds the whole string in its title (``shortActor``
+# in control-plane-ui/app.js), so a match on the User-Agent is one hover away.
+GROUPED_SEARCH = ("host", "client", "client_class", "actor", "reason",
                   "server", "tool", "status")
-EVENT_SEARCH = ("host", "client", "client_class", "reason", "method", "url",
-                "server", "tool", "status", "approval_id")
+EVENT_SEARCH = ("host", "client", "client_class", "actor", "reason", "method",
+                "url", "server", "tool", "status", "approval_id")
 
 # Columns the record view serves. Deliberately the whole row: this is the view the
 # glance defers to, so the fields it drops as noise or as unbounded (``url`` above
 # all) are exactly what has to be here, or the interface still cannot answer "which
 # request was it".
 EVENT_COLUMNS = ("id", "ts", "kind", "stage", "host", "port", "proto", "client",
-                 "client_class", "method", "url", "reason", "status",
+                 "client_class", "actor", "method", "url", "reason", "status",
                  # The tool columns, for the same reason ``url`` is here: this is the
                  # view that answers "which one was it", and the tool rows' identity —
                  # which server, which tool, which approval — is not in any of the
@@ -284,11 +286,11 @@ def grouped(conn, limit: int, filt: Filter, scan: int) -> list:
     The cost of that is stated rather than hidden: a filter matching nothing walks the
     `ts` index to the end of the table. Bounded by the table, not by ``scan``."""
     return conn.execute(
-        "SELECT kind, stage, host, client, client_class, reason, "  # noqa: S608
+        "SELECT kind, stage, host, client, client_class, actor, reason, "  # noqa: S608
         "       server, tool, status, "
         "       COUNT(*) AS n, MAX(ts) AS ts, MIN(ts) AS first_ts "
         f"FROM (SELECT * FROM audit {filt.where} ORDER BY ts DESC LIMIT ?) "
-        "GROUP BY kind, stage, host, client, client_class, reason, "
+        "GROUP BY kind, stage, host, client, client_class, actor, reason, "
         "         server, tool, status, approval_id "
         "ORDER BY ts DESC LIMIT ?",
         [*filt.params, scan, limit]).fetchall()

@@ -347,8 +347,9 @@ class CrossReferenceTests(_NeedsGit):
     """
 
     #: Bold and italic lead-ins count as targets, not just headings: the docs
-    #: legitimately reference `*Design note — why three control nets*` and
-    #: `**HTTPS inspection depth**`, neither of which is a heading.
+    #: legitimately reference `*Design note — why the control path is more than one
+    #: net*` and `**Anthropic traffic goes through the proxy too**`, neither of which
+    #: is a heading.
     TARGET_PATTERNS = (r"^#+\s+(.*)$", r"^\s*[-*]?\s*\*\*(.+?)\*\*",
                        r"^\s*\*([^*]{4,90})\*")
     REFERENCE_PATTERNS = (r'\b(?:see|under|in)\s+"([^"]{4,90})"',

@@ -131,8 +131,10 @@ proxy ↔ control plane.
 allow/block rules and audit history grow more valuable over time — they are the
 institutional memory of "what's known-safe" that lets the system auto-approve
 progressively more (less human-in-the-loop as trust accrues) and enables
-analytics / anomaly detection. Persist it in a versioned, exportable store,
-backed up independently of any container.
+analytics / anomaly detection. So it lives in a schema-versioned SQLite store,
+backed up independently of any container: `make backup` writes a snapshot outside
+this tree (why outside is beside `BACKUP_DIR` in the `Makefile`), and `make restore`
+puts one back.
 
 ### Data plane — governed proxies/tools
 Single-purpose services that **enforce** policy pulled from the control plane
@@ -693,6 +695,16 @@ proxy is a control-plane client that asks on every connection, so an operator's
 edit applies to the next one (see "A control-plane client" in
 `proxies/egress/DESIGN.md`). Governs by **name**, so it closes the
 shared-CDN/fronting gap the IP firewall can't (for proxied traffic).
+
+**Inspection stops at the host name.** CONNECT and SNI give domain-level policy with no
+CA in the sandbox; URL- or body-level policy would need full interception and a
+generated CA the sandbox trusts. The CLI supports both (`NOTES.md` → "Claude Code
+honours `HTTPS_PROXY`, and WebFetch inherits it"), so the depth is this repo's choice
+and not a tooling limit. A CA is not a pure addition: the no-CA posture is a standing
+invariant the SNI fronting guard is written against, and `tls_clienthello` in
+`proxies/egress/addon.py` says what adding one changes. Interception stays available
+per domain — stop tunnelling that one host — and is filed under "Future improvements"
+as selective MITM on credentialed hosts, where it would buy true brokering.
 
 **Anthropic traffic goes through the proxy too.** The sandbox has no direct route
 off-box, so reaching the API is a deliberate path, and it is this one: the CLI honours
@@ -2077,10 +2089,10 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | timed grants (`leases`) — `allow_lease`, the live-lease strip, revoke | **done** — exact host only; no breadth ladder |
 | — | the gateway's bridge — `tool-authorize-net`, third listener, decide/roster/inventory/claim | **done** |
 | — | `tool-gateway` placement — triple-homed, agent leg only, bind guard | **done** |
-| — | gateway discovery — roster pull, `tools/list`, policy-vs-server report | **done** — reports to the log; writes nothing back |
+| — | gateway discovery — roster pull, `tools/list`, policy-vs-server report | **done** — reports to the log; writes no rule |
 | — | MCP client credentials — read-only mount, path derived from the server name | **done** — the gateway is the only holder |
-| — | MCP server registration — UI tab: register, enable/disable, revoke | **done** — servers only; tool rules not yet |
-| — | tool inventory — gateway pushes, control plane holds it in memory | **done** — audited on change; no UI yet |
+| — | MCP server registration — UI tab: register, enable/disable, revoke | **done** |
+| — | tool inventory — gateway pushes, control plane holds it in memory | **done** — audited on change |
 | — | tool policy UI — pick from the inventory, write allow/ask/deny, promote | **done** — every row in `tool_rules` now has an operator surface |
 | — | curated tool list on the agent leg — MCP listener, `tools/list` | **done** |
 | — | MCP gateway — per-tool allow/deny/ask on `tools/call`, the pending ask, `resume_tool_call` | **done** |
@@ -2110,12 +2122,6 @@ PERMANENT vs TRANSITIONAL in `init-firewall.sh` to make this explicit.
 The unattended worker tier's questions are kept with it, under "Tier 2, and what it
 shares with tier 1". What is open here:
 
-- **HTTPS inspection depth** — CONNECT/SNI (domain-level, no CA in sandbox) vs
-  full MITM (URL/body-level, needs a generated CA in the sandbox). Likely start
-  CONNECT-level, allow MITM per-domain later. Both are documented-supported by
-  the CLI (MITM via `NODE_EXTRA_CA_CERTS` / `CLAUDE_CODE_CERT_STORE`, in `NOTES.md`
-  → "Claude Code honours `HTTPS_PROXY`, and WebFetch inherits it"), so the choice is
-  ours, not gated by tool support.
 - **Web search backend** — which third-party search API for the `websearch`
   skill (Brave / SerpAPI / Google CSE).
 

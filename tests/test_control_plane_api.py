@@ -752,7 +752,7 @@ class RevokeRuleTests(_CPTestCase):
         self.assertEqual(audit.call_args.args[0], "revoke")
         kwargs = audit.call_args.kwargs
         self.assertEqual(kwargs["host"], ".github.com")
-        self.assertIn("peer=172.31.0.9", kwargs["reason"])
+        self.assertIn("peer=172.31.0.9", kwargs["actor"])
         self.assertIn("allow rule revoked", kwargs["reason"])
 
     def test_the_audit_reason_says_what_the_host_reverts_to(self):
@@ -1180,7 +1180,7 @@ class EditRuleTests(_CPTestCase):
         self.assertIn("api.example.com", reason)       # what it is
         self.assertIn("allow", reason)
         self.assertIn("block", reason)
-        self.assertIn("peer=172.31.0.9", reason)
+        self.assertIn("peer=172.31.0.9", audit.call_args.kwargs["actor"])
         # `host` is the NEW pattern: it is what decides from now on.
         self.assertEqual(audit.call_args.kwargs["host"], "api.example.com")
 
@@ -2125,7 +2125,7 @@ class ProvenanceTests(_CPTestCase):
         # A non-browser caller is exactly what the UA field is for.
         self.assertIn("curl/8.5.0", row["resolved_by"])
 
-    def test_audit_reason_carries_the_actor(self):
+    def test_the_released_waiters_row_carries_the_actor(self):
         # _audit is mocked by _CPTestCase, so assert on what the waiter passed it —
         # that is the record an operator actually reads back.
         saved = cp.holds.HOLD_TIMEOUT
@@ -2138,10 +2138,9 @@ class ProvenanceTests(_CPTestCase):
         finally:
             cp.holds.HOLD_TIMEOUT = saved
         self.assertEqual(result["resp"].decision, "allow")
-        reasons = [c.kwargs.get("reason", "") for c in cp.store._audit.call_args_list]
-        self.assertTrue(any("human approval" in r and "peer=172.31.0.9" in r
-                            for r in reasons),
-                        f"actor missing from audit reasons: {reasons}")
+        [decided] = [c.kwargs for c in cp.store._audit.call_args_list
+                     if "human approval" in (c.kwargs.get("reason") or "")]
+        self.assertIn("peer=172.31.0.9", decided["actor"])
 
     def test_audit_reason_says_whether_standing_policy_was_written(self):
         # A one-off and a persist are the same allow for THIS request and very
@@ -3822,6 +3821,7 @@ class McpPinTests(_CPTestCase):
         self.assertEqual((row["kind"], row["stage"], row["tool"]),
                          ("revoke", "tool-policy", "create_pull_request"))
         self.assertIsNotNone(row["actor"])
+        self.assertNotIn("peer=", row["reason"])
         self.assertIn(f"pin {self.pin_id}", row["reason"])
         self.assertIn("owner, repo", row["reason"])
 
@@ -4303,7 +4303,8 @@ class ActorColumnTests(_ToolBridgeTestCase):
     def _rows(self, where, *params):
         with cp.store._connect() as conn:
             return [dict(r) for r in conn.execute(
-                "SELECT kind, stage, host, client, client_class, actor FROM audit "  # noqa: S608
+                "SELECT kind, stage, host, client, client_class, actor, reason "  # noqa: S608
+                "FROM audit "
                 f"WHERE {where} ORDER BY id", params)]
 
     def test_every_configuration_change_names_its_actor_and_no_client(self):
@@ -4332,6 +4333,8 @@ class ActorColumnTests(_ToolBridgeTestCase):
             with self.subTest(stage=row["stage"], kind=row["kind"]):
                 self.assertIsNotNone(row["actor"])
                 self.assertEqual((row["client"], row["client_class"]), (None, None))
+                # Said once, in its column; the reason says what happened.
+                self.assertNotIn("peer=", row["reason"])
 
     def test_a_human_answer_to_a_tool_ask_keeps_the_asker_and_names_the_answerer(self):
         _tool_rule("create_pull_request", "ask")
@@ -4341,6 +4344,7 @@ class ActorColumnTests(_ToolBridgeTestCase):
         self.assertEqual((row["client"], row["client_class"]),
                          (CLASS_IP, cp.policy._client_class(CLASS_IP)))
         self.assertIn(f"peer={self.OPERATOR}", row["actor"])
+        self.assertNotIn("peer=", row["reason"])
 
     def test_an_egress_request_a_human_decided_names_the_human(self):
         saved = cp.holds.HOLD_TIMEOUT
@@ -4356,6 +4360,7 @@ class ActorColumnTests(_ToolBridgeTestCase):
         self.assertEqual((hold["kind"], hold["actor"]), ("hold", None))
         self.assertEqual((decided["kind"], decided["client"]), ("deny", CLASS_IP))
         self.assertIn(f"peer={self.OPERATOR}", decided["actor"])
+        self.assertNotIn("peer=", decided["reason"])
 
     def test_rows_nobody_acted_on_carry_no_actor(self):
         # Policy answered, or a window ran out. An actor here would claim a human was
@@ -4381,6 +4386,14 @@ class ActorColumnTests(_ToolBridgeTestCase):
         for row in rows:
             with self.subTest(stage=row["stage"], kind=row["kind"]):
                 self.assertIsNone(row["actor"])
+
+    def test_no_handler_builds_a_reason_with_the_actor_in_it(self):
+        # The tests above exercise the writers that exist; this covers the next one.
+        # Every actor a handler holds is a local named for what it is, so one
+        # interpolated into an f-string is an actor on its way into a reason.
+        for name in ("{actor}", "{resolved_by}", "{granted_by}"):
+            with self.subTest(name=name):
+                self.assertNotIn(name, _HANDLER_SOURCE)
 
     def test_an_inventory_push_names_the_gateway_as_actor_not_as_client(self):
         # The one row that used to put an actor in `client`: a formatted provenance

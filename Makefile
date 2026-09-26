@@ -167,10 +167,13 @@ REFFILES := $(SCRIPTS) \
             control-plane-ui/requirements.txt \
             control-plane-ui/index.html \
             control-plane-ui/app.js \
+            control-plane-ui/audit.js \
             control-plane-ui/egress-rules.js \
             control-plane-ui/holds.js \
             control-plane-ui/mcp.js \
             control-plane-ui/payload.js \
+            control-plane-ui/provenance.js \
+            control-plane-ui/time.js \
             policies/egress-allowlist.txt
 
 .PHONY: help check check-strict lint consistency test verify-build \

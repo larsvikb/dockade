@@ -21,10 +21,13 @@ COPY index.html ./index.html
 # what lets the CSP say `script-src 'self'` (see _CSP in app.py). One line each: a
 # test holds this list equal to UI_MODULES there.
 COPY app.js ./app.js
+COPY audit.js ./audit.js
 COPY egress-rules.js ./egress-rules.js
 COPY holds.js ./holds.js
 COPY mcp.js ./mcp.js
 COPY payload.js ./payload.js
+COPY provenance.js ./provenance.js
+COPY time.js ./time.js
 
 USER cpui
 EXPOSE 8090

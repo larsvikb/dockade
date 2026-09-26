@@ -24,9 +24,11 @@ COPY app.js ./app.js
 COPY audit.js ./audit.js
 COPY egress-rules.js ./egress-rules.js
 COPY holds.js ./holds.js
+COPY leases.js ./leases.js
 COPY mcp.js ./mcp.js
 COPY payload.js ./payload.js
 COPY provenance.js ./provenance.js
+COPY status.js ./status.js
 COPY time.js ./time.js
 
 USER cpui

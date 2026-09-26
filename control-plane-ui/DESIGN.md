@@ -232,22 +232,22 @@ cannot report.
 
 **Tabbed views + traffic-light favicon, both driven by "don't hide a failing state."**
 Approvals / Audit / Policy are tabs (via `location.hash`, with arrow-key nav), and
-the hazard tabs introduce — a hidden view drifting unnoticed, which standing policy did
-for weeks — is answered by badges that keep polling even the hidden views: a live pending
-count, and a policy **unseen** marker keyed on pattern+action (a flipped rule leaves the
-count unchanged). The favicon is an inline SVG data URI (never a CDN — a governance UI
-must not fetch its own control logic or icons per page load) whose lit lamp means
-**red = blind** (SSE down; an unseen hold default-denies after `CONTROL_HOLD_TIMEOUT`)
-rather than red = denied, with the pre-JS fallback amber ("unknown", not "all clear") and
-a `(n)` title prefix so the background tab nobody watches still shows the count. Rendering
-specifics (lamp opacity, `href`-reassignment throttling) are in `app.js`.
-Past the tab strip, **an opt-in desktop notification** is the only indicator that reaches
-an operator who is looking at something else — which a ~120s fuse makes the case worth
-covering, since the tab is not what they are watching while the hold burns. Opt-in
-literally: the Notification API needs a user gesture to ask, so a header button asks and
-the browser's own permission is the setting. It notifies per ARRIVAL and only past the
-first push (a reload delivers the whole queue as arrivals), stays quiet while the
-approvals view is on screen, and closes a notice when its hold leaves the queue however
-it left. The rules are `approvalNotices` / `shouldNotify` in `app.js`. Its one
-environmental dependency: a secure context, which `127.0.0.1` satisfies over plain HTTP
-and another origin would not — so the button says so rather than going quiet.
+the hazard tabs introduce — a hidden view drifting unnoticed — is answered by badges
+that keep polling even the hidden views: a live pending count, and a policy **unseen**
+marker keyed on pattern+action (a flipped rule leaves the count unchanged). The favicon
+is an inline SVG data URI (never a CDN — a governance UI must not fetch its own control
+logic or icons per page load) whose lit lamp means **red = blind** (SSE down; an unseen
+hold default-denies after `CONTROL_HOLD_TIMEOUT`) rather than red = denied, with the
+pre-JS fallback amber ("unknown", not "all clear") and a `(n)` title prefix so the
+background tab nobody watches still shows the count. Rendering specifics (lamp opacity,
+`href`-reassignment throttling) are in `app.js`. Past the tab strip, **an opt-in desktop
+notification** is the only indicator that reaches an operator who is looking at
+something else — which a ~120s fuse makes the case worth covering, since the tab is not
+what they are watching while the hold burns. Opt-in literally: the Notification API
+needs a user gesture to ask, so a header button asks and the browser's own permission is
+the setting. It notifies per ARRIVAL and only past the first push (a reload delivers the
+whole queue as arrivals), stays quiet while the approvals view is on screen, and closes
+a notice when its hold leaves the queue however it left. The rules are `approvalNotices`
+/ `shouldNotify` in `app.js`. Its one environmental dependency: a secure context, which
+`127.0.0.1` satisfies over plain HTTP and another origin would not — so the button says
+so rather than going quiet.

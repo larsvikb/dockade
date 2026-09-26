@@ -82,6 +82,9 @@ Consequences worth stating, because each was learned by violating it:
   single file, which is exactly why it belongs there.
 - **No status logs, no DONE lists, anywhere but `## Status`.** They only grow. One
   table that tracks sequence, so nothing else needs editing when a step lands.
+- **A resolved open decision is a section that has not been written yet.** Move the
+  reasoning to the surface it decides for and delete the bullet; left under "Open
+  decisions" it is a status log, with the *why* where nobody reads for it.
 - **Numbers in prose rot.** Don't restate a test count or a version a command
   reports; name the command.
 - **A doc claim with a machine-checkable counterpart gets a guard.**

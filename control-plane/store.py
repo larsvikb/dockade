@@ -44,7 +44,7 @@ LEGACY_CLIENT_CLASS = "sandbox"
 # The schema this code expects. Every entry in ``_STEPS`` below adds exactly one,
 # and a store records the version it is at (see ``_migrate``), so "what has already
 # run here" is a number to compare rather than a schema to interrogate.
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 def _connect() -> sqlite3.Connection:
@@ -242,6 +242,16 @@ def _step_6_persisted_pattern(conn: sqlite3.Connection) -> None:
               "they predate the column)", flush=True)
 
 
+def _step_7_audit_actor(conn: sqlite3.Connection) -> None:
+    """v7 — ``audit.actor``, who performed the recorded act (the DDL carries the
+    reasoning). Existing rows keep NULL and are NOT backfilled from the "by …" in
+    their ``reason``, for the reason v3 gives."""
+    if "actor" not in _columns(conn, "audit"):
+        conn.execute("ALTER TABLE audit ADD COLUMN actor TEXT")
+        print("control-plane: added actor to audit (existing rows keep NULL — they "
+              "predate the column)", flush=True)
+
+
 # Ordered, and the order is the only thing that decides what runs: a step is applied
 # when its version exceeds the store's, so steps must be APPEND-ONLY and never
 # renumbered, reordered or edited once shipped — a store in the field has already run
@@ -254,6 +264,7 @@ _STEPS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = (
     (4, "tool outcome status", _step_4_tool_status),
     (5, "audit.decision becomes audit.kind", _step_5_decision_to_kind),
     (6, "persisted pattern on approvals", _step_6_persisted_pattern),
+    (7, "audit actor column", _step_7_audit_actor),
 )
 
 
@@ -399,13 +410,22 @@ def _init_db() -> None:
                 host     TEXT,
                 port     INTEGER,
                 proto    TEXT,
+                -- The SANDBOX whose request this row concerns: the peer address the
+                -- proxy or the gateway observed. Never an operator and never a
+                -- service; whoever else performed the act is `actor`.
                 client   TEXT,
                 -- The class ``client`` was placed in when the decision was made, kept
                 -- rather than re-derived: the CIDR map is configuration and can change,
                 -- so re-deriving would relabel history under today's topology. NULL is
-                -- reachable on a migrated store (rows that predate classes) and on an
-                -- unclassified client, and means exactly that.
+                -- reachable on a migrated store (rows that predate classes), on an
+                -- unclassified client, and on every row with no client — a policy row
+                -- names the class its rule governs in `reason`, not here.
                 client_class TEXT,
+                -- WHO performed the act this row records, when that is not the client:
+                -- the operator behind a click (provenance._actor), or the gateway
+                -- behind an inventory push. NULL where the client asked and policy
+                -- answered, where nobody acted (an expiry), and on rows older than v7.
+                actor    TEXT,
                 method   TEXT,
                 url      TEXT,
                 reason   TEXT,
@@ -594,11 +614,11 @@ def _audit(kind: str, **fields) -> None:
     with _connect() as conn:
         conn.execute(
             "INSERT INTO audit(ts, kind, stage, host, port, proto, client, "
-            "client_class, method, url, reason, server, tool, approval_id, "
-            "status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "client_class, actor, method, url, reason, server, tool, approval_id, "
+            "status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (time.time(), kind, cap(fields.get("stage")), cap(fields.get("host")),
              fields.get("port"), cap(fields.get("proto")), cap(fields.get("client")),
-             cap(fields.get("client_class")),
+             cap(fields.get("client_class")), cap(fields.get("actor")),
              cap(fields.get("method")), cap(fields.get("url")), cap(fields.get("reason")),
              cap(fields.get("server")), cap(fields.get("tool")),
              cap(fields.get("approval_id")), cap(fields.get("status"))))
@@ -608,8 +628,8 @@ def _audit(kind: str, **fields) -> None:
     # the tool columns included so a grep for one approval id finds all its rows.
     shown = " ".join(
         f"{k}={_printable(fields[k])}" for k in
-        ("stage", "host", "port", "proto", "client", "client_class", "method", "url",
-         "server", "tool", "approval_id")
+        ("stage", "host", "port", "proto", "client", "client_class", "actor",
+         "method", "url", "server", "tool", "approval_id")
         if fields.get(k) is not None)
     reason = fields.get("reason")
     print(f"AUDIT {kind} {shown}" + (f" :: {_printable(reason)}" if reason else ""),

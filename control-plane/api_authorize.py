@@ -146,7 +146,8 @@ def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
 
     # The resolver's provenance, so the log says who granted this egress and not
     # merely that a human did.
-    actor = (status_row["resolved_by"] if status_row else None) or "actor unrecorded"
+    resolved_by = status_row["resolved_by"] if status_row else None
+    actor = resolved_by or "actor unrecorded"
     scope = _decision_scope(status_row)
     # The STATUS, not "did I win the expiry UPDATE": grouped waiters wake together and
     # only one wins it. Testing `expired` alone would tell the losers that a human
@@ -160,5 +161,5 @@ def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
         final, why = "deny", f"human rejection ({scope}) [{actor}]"
     store._audit(final, stage=req.stage, host=req.host, port=req.port,
                  proto=req.proto, client=req.client, client_class=client_class,
-                 method=req.method, url=req.url, reason=why)
+                 actor=resolved_by, method=req.method, url=req.url, reason=why)
     return AuthorizeResponse(decision=final, reason=why)

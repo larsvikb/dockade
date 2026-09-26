@@ -2,8 +2,8 @@
 """Provenance — who performed a privileged act, for the durable record.
 
 Whoever resolves an approval or changes policy is recorded as ``_actor(request)`` in
-the audit row, and for a resolution also on the row it writes (``resolved_by``, a
-lease's ``granted_by``). It is detection, not prevention: a process on the host can
+the audit row's ``actor``, and for a resolution also on the row it writes
+(``resolved_by``, a lease's ``granted_by``). It is detection, not prevention: a process on the host can
 forge every self-reported field, and only a human-presence gesture the host cannot
 replay would close that (DESIGN.md, "Approval provenance — detection where prevention
 is not available"). Until then, a forged act should at least read differently in the

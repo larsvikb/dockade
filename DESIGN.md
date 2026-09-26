@@ -1123,7 +1123,7 @@ ceiling, the frontend and backend at least make a forged approval *visible*. The
 relay strips client-supplied provenance headers (`X-Dockade-Actor`,
 `X-Forwarded-*`, `Forwarded`, `X-Real-IP`) and re-adds `X-Dockade-Actor` with the
 peer address it actually observed; the backend's `_actor` records that on the
-approvals row (`resolved_by`) and carries it into the audit reason, so the log
+approvals row (`resolved_by`) and on the audit row (`actor`), so the log
 answers "who granted this egress" rather than merely "a human did". The labels keep
 trust levels apart: `peer=` is observed by the backend (but is the *relay* for
 anything via the UI), `via-ui=` is asserted by the relay, and `origin=` / `ua=` are

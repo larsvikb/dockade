@@ -251,6 +251,9 @@
      rather than dim — these are rows worth reading, and the `status` beside them
      carries which kind it was. */
   .tag.outcome { color: var(--fg); }
+  /* A pin that decides nothing now. Dim rather than red: it refuses nothing, it is
+     standing policy that is switched off by its rule or its server. */
+  .tag.inert { color: var(--dim); }
   .ts { color: var(--dim); white-space: nowrap; }
   code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   /* A leading-dot pattern is a SUBDOMAIN WILDCARD that looks like a hostname, so
@@ -685,6 +688,24 @@
          policy holds everything for a human, an empty tool policy refuses everything
          outright. -->
     <div class="empty" id="toolrules-empty" hidden></div>
+
+    <h2>Pinned allows <span class="note" id="toolpincount"></span></h2>
+    <div class="empty">
+      A call to an <code>ask</code> tool that carries exactly these values runs without
+      a card; every other argument is free. A pin decides only while its tool&rsquo;s
+      rule is <code>ask</code>, so it can only let through what you could have allowed
+      from a card. Values are shown as stored, with anything outside printable ASCII
+      spelled out.
+    </div>
+    <!-- No add form: a pin is written by resolving a card, as a lease is. -->
+    <table>
+      <thead>
+        <tr><th>server</th><th>tool</th><th>pinned</th><th>decides</th>
+          <th>pinned at</th><th></th></tr>
+      </thead>
+      <tbody id="toolpins"></tbody>
+    </table>
+    <div class="empty" id="toolpins-empty" hidden></div>
   </section>
 </main>
 <!-- Behaviour lives in app.js and the modules it imports, NOT inline: an external

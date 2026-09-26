@@ -27,6 +27,7 @@ import { leaseLabel, leaseRemaining, leaseCountdown, groupLeases } from "./lease
 import {
   SERVER_NAME_RE, serverDescriptor, serverPreview, serverEditBody,
   toolChoices, toolRulePreview, toolEditPreview, toolRevokePreview,
+  pinText, pinState,
 } from "./mcp.js";
 import {
   renderableHolds, diffPending, shouldSweep, DWELL_MS,
@@ -38,7 +39,8 @@ import { payloadDisclosure, payloadHazards, payloadTokens, renderPayload }
   from "./payload.js";
 import { shortActor } from "./provenance.js";
 import {
-  auditStatus, rulesStatus, toolRulesStatus, leasesStatus, AUDIT_REFUSED_FALLBACK,
+  auditStatus, rulesStatus, toolRulesStatus, toolPinsStatus, leasesStatus,
+  AUDIT_REFUSED_FALLBACK,
 } from "./status.js";
 import { tsSeconds, fmtTime, fmtStamp, fmtInstant } from "./time.js";
 
@@ -228,7 +230,9 @@ function start() {
     // a long absence arbitrarily so. Asking on arrival is the same reasoning as the
     // refresh on `visibilitychange`: the stale moment to avoid is the one where
     // attention has just landed on the data.
-    if (current === "tools") { refreshInventory(); }
+    // The pins too: nothing polls them, and a card in the pending view is where one
+    // will be written.
+    if (current === "tools") { refreshInventory(); refreshToolPins(); }
     updateIndicators();
   }
 
@@ -1984,6 +1988,7 @@ function start() {
   refreshServers();
   refreshToolRules();
   refreshInventory();
+  refreshToolPins();
     };
     es.addEventListener("pending", e => {
       const d = JSON.parse(e.data);
@@ -2171,6 +2176,8 @@ function start() {
       return;
     }
     refreshServers();
+    // A pin on a disabled server decides nothing, so the pins read differently now.
+    refreshToolPins();
   });
 
   // ── tool policy ───────────────────────────────────────────────────────────
@@ -2187,6 +2194,9 @@ function start() {
   const toolRuleNote = document.getElementById("toolrule-note");
   const toolRulePreviewEl = document.getElementById("toolrule-preview");
   const toolRuleCountEl = document.getElementById("toolrulecount");
+  const toolPinsBody = document.getElementById("toolpins");
+  const toolPinsEmpty = document.getElementById("toolpins-empty");
+  const toolPinCountEl = document.getElementById("toolpincount");
 
   let toolRules = [];
   let toolRulesById = new Map();
@@ -2194,6 +2204,10 @@ function start() {
   let toolRulesLoaded = false;
   let inventory = {};
   let inventoryFailed = false;
+  let toolPins = [];
+  let toolPinsById = new Map();
+  let toolPinsFailed = false;
+  let toolPinsLoaded = false;
   // What the last submit came back with, outranking the preview while it stands — the
   // same split the egress form draws between "what this click would do" and "what the
   // last one did", including the refusals this page deliberately does not mirror.
@@ -2443,6 +2457,7 @@ function start() {
     await refreshToolRules();
     // The servers table counts rules per server, so it is stale the moment this lands.
     refreshServers();
+    refreshToolPins();
   });
 
   // Delegated, because the table is replaced wholesale on every refresh — a handler
@@ -2498,6 +2513,103 @@ function start() {
     }
     await refreshToolRules();
     refreshServers();
+    // A pin decides only while its rule asks, so moving the rule moves the pins.
+    refreshToolPins();
+  });
+
+  // ── pinned allows ─────────────────────────────────────────────────────────
+  // Beside the rules they sit under, and in a table of their own for the reason the
+  // live leases are not rows of the standing policy: a pin is a narrower allow on top
+  // of one rule, and a tool can have several.
+  function renderToolPins(rows) {
+    toolPinsById = new Map(rows.map(r => [String(r.id), r]));
+    toolPinsBody.replaceChildren();
+    for (const row of rows) {
+      const tr = document.createElement("tr");
+      const cell = (value, cls) => {
+        const td = document.createElement("td");
+        td.textContent = value;
+        if (cls) td.className = cls;
+        tr.appendChild(td);
+        return td;
+      };
+      cell(row.server);
+      cell(row.tool);
+      // The values came from an agent's payload, so textContent, as on the card.
+      const shown = pinText(row.pins_json);
+      const pinnedCell = document.createElement("td");
+      const code = document.createElement("code");
+      code.textContent = shown.text;
+      pinnedCell.appendChild(code);
+      if (shown.escaped) {
+        const note = document.createElement("div");
+        note.className = "note";
+        note.textContent = "non-ASCII spelled out";
+        pinnedCell.appendChild(note);
+      }
+      tr.appendChild(pinnedCell);
+      const state = pinState(row);
+      const stateCell = document.createElement("td");
+      const tag = document.createElement("span");
+      tag.className = `tag ${state.live ? "allow" : "inert"}`;
+      tag.textContent = state.live ? "live" : "inert";
+      stateCell.append(tag, ` ${state.text}`);
+      tr.appendChild(stateCell);
+      cell(row.created_at ? fmtStamp(row.created_at) : "", "ts");
+      // Not a revoke-time confirm: taking a pin back only sends its calls to a card.
+      const actions = document.createElement("td");
+      const revoke = document.createElement("button");
+      revoke.type = "button";
+      revoke.className = "revoke";
+      revoke.dataset.pin = String(row.id);
+      revoke.textContent = "revoke";
+      actions.appendChild(revoke);
+      tr.appendChild(actions);
+      toolPinsBody.appendChild(tr);
+    }
+    toolPinCountEl.textContent =
+      rows.length ? `· ${rows.length} pin${rows.length === 1 ? "" : "s"}` : "· none";
+    renderListStatus(toolPinsEmpty,
+                     toolPinsStatus(rows.length, toolPinsFailed, toolPinsLoaded));
+  }
+
+  async function refreshToolPins() {
+    try {
+      const res = await fetch("/api/mcp/pins");
+      // `res.ok` first, as for the rules: a refused poll rendered as an empty list
+      // would say no call is answered without a card, which is the one thing a
+      // failure must not say.
+      if (!res.ok) throw new Error(String(res.status));
+      toolPins = await res.json();
+      toolPinsFailed = false;
+      toolPinsLoaded = true;
+    } catch (e) {
+      toolPinsFailed = true;
+    }
+    renderToolPins(toolPins);
+  }
+
+  toolPinsBody.addEventListener("click", async ev => {
+    const btn = ev.target.closest("button.revoke");
+    if (!btn) return;
+    const row = toolPinsById.get(btn.dataset.pin);
+    if (!row) return;
+    btn.disabled = true;
+    const id = encodeURIComponent(String(row.id));
+    try {
+      const res = await fetch(`/api/mcp/pins/${id}/revoke`, { method: "POST" });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok || !body.ok) {
+        window.alert(`Could not revoke: ${body.detail || res.status}`);
+        btn.disabled = false;
+        return;
+      }
+    } catch (e) {
+      window.alert("Could not reach the control plane.");
+      btn.disabled = false;
+      return;
+    }
+    refreshToolPins();
   });
 
   // ── wiring ────────────────────────────────────────────────────────────────

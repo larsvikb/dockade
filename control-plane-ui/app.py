@@ -215,6 +215,11 @@ _RELAY_ROUTES = (
     # Revoking a TOOL rule can only narrow — an unconfigured tool is denied, never
     # held — so unlike revoking an egress block this one cannot loosen anything.
     ("POST", re.compile(r"^/api/mcp/rules/[0-9]{1,19}/revoke$")),
+    # Pinned allows: read, and taken back. No collection POST, because a pin is only
+    # ever written by resolving a card, as a lease is. Revoking one narrows — the calls
+    # it answered go back to their rule's card.
+    ("GET", re.compile(r"^/api/mcp/pins$")),
+    ("POST", re.compile(r"^/api/mcp/pins/[0-9]{1,19}/revoke$")),
     ("GET", re.compile(r"^/api/config$")),
     ("POST", re.compile(r"^/api/saturation/ack$")),
 )

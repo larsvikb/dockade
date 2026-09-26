@@ -111,6 +111,18 @@ export function toolRulesStatus(rowCount, failed, loaded) {
   return pollStatus(TOOL_RULES_STATUS_TEXT, rowCount, failed, loaded);
 }
 
+// Stale is the one that matters: a pin the table no longer shows may still be
+// answering calls with no card.
+const TOOL_PINS_STATUS_TEXT = {
+  stale: "Could not refresh — these are the last pins loaded successfully, and a " +
+         "pin revoked or added since may be missing.",
+  cold: "Could not load the pins — the control plane may be unreachable.",
+  empty: "No pins, so every call to an ask tool raises a card.",
+};
+export function toolPinsStatus(rowCount, failed, loaded) {
+  return pollStatus(TOOL_PINS_STATUS_TEXT, rowCount, failed, loaded);
+}
+
 const LEASES_STATUS_TEXT = {
   stale: "Could not refresh — these are the last live leases loaded successfully, " +
          "and one may have lapsed or been revoked since.",

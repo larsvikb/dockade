@@ -125,6 +125,14 @@ limit worth stating rather than engineering around: an operator cannot judge an
 opaque identifier, and resolving one would mean the control plane making its own MCP
 calls — new capability on the crown-jewel container and a fine SSRF surface.
 
+**A pin is shown stricter than a payload.** The same rule applies — the stored form,
+never a parsed copy — and one level further: every non-ASCII character in a pin is
+spelled out, not only the invisible ones (`pinText` in `control-plane-ui/mcp.js`). A
+payload is often prose, where an em dash is ordinary and alarming about it teaches the
+operator to click past the warning. A pin value is an identifier that a future call
+must equal exactly, so a U+0430 CYRILLIC SMALL LETTER A in a pinned `owner` is a grant
+for a different owner than the one on screen, and there is no prose to protect.
+
 **`[hidden]` wins globally, and the test guards the rule rather than a list.** The
 script hides things by setting `.hidden`, which relies on the user-agent rule
 `[hidden] { display: none }` — and that rule loses to *any* author rule setting

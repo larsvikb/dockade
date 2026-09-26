@@ -169,6 +169,7 @@ REFFILES := $(SCRIPTS) \
             control-plane-ui/app.js \
             control-plane-ui/egress-rules.js \
             control-plane-ui/holds.js \
+            control-plane-ui/mcp.js \
             control-plane-ui/payload.js \
             policies/egress-allowlist.txt
 

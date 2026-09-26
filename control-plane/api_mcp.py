@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MCP gateway policy — the servers the gateway may dial, and what each one's
-tools may do. On the management listener only, like everything that grants.
+"""MCP gateway policy — the servers the gateway may dial, what each one's tools may
+do, and the pins that answer a tool's asks in advance. On the management listener
+only, like everything that grants.
 
 Tool policy is CONFIGURATION FIRST: an operator states what a server's tools may do
 before anything calls one. Egress is the opposite, with rules accumulating from
@@ -361,7 +362,11 @@ def revoke_mcp_rule(rule_id: int, request: Request) -> JSONResponse:
     """Remove one tool rule, returning that tool to the default: DENY, where a revoked
     egress rule returns its host to a hold. So revoking here can only narrow, and the
     audit reason names where the tool ends up. Nothing seeds this table, so there is
-    no seed to refuse, as ``api_egress.revoke_rule`` does."""
+    no seed to refuse, as ``api_egress.revoke_rule`` does.
+
+    **Refused while the tool still has pins**, as ``revoke_mcp_server`` refuses a
+    server with rules. A pin outliving its rule decides nothing, until a rule for the
+    same tool comes back as `ask` and brings it back with it."""
     actor = provenance._actor(request)
     with store._connect() as conn:
         row = conn.execute(
@@ -370,6 +375,17 @@ def revoke_mcp_rule(rule_id: int, request: Request) -> JSONResponse:
         if row is None:
             return JSONResponse({"ok": False, "detail": "unknown rule"},
                                 status_code=404)
+        pins = conn.execute(
+            "SELECT COUNT(*) FROM tool_pins WHERE server=? AND tool=?",
+            (row["server"], row["tool"])).fetchone()[0]
+        if pins:
+            return JSONResponse(
+                {"ok": False,
+                 "detail": f"{row['tool']} on {row['server']} still has {pins} "
+                           f"pin(s); nothing here deletes standing policy as a side "
+                           f"effect. Revoke them first, or edit the rule instead.",
+                 "tool_pins": pins},
+                status_code=409)
         conn.execute("DELETE FROM tool_rules WHERE id=?", (rule_id,))
         conn.commit()
 
@@ -380,3 +396,56 @@ def revoke_mcp_rule(rule_id: int, request: Request) -> JSONResponse:
                         f"therefore denied")
     return JSONResponse({"ok": True, "id": rule_id, "server": row["server"],
                          "tool": row["tool"], "action": row["action"]})
+
+
+@router.get("/api/mcp/pins")
+def api_mcp_pins() -> list[dict]:
+    """Every pinned allow, with whether it decides anything now.
+
+    ``decides`` is the conditions ``policy._decide_tool`` reads a pin under, so the
+    view cannot call a pin live that the decision passes over: the tool's rule is
+    `ask`, its server is enabled, and the row holds a pin set. ``pins`` is None for a
+    row that does not (``policy._parse_pins``)."""
+    with store._connect() as conn:
+        rows = conn.execute(
+            "SELECT p.id, p.server, p.tool, p.pins_json, p.approval_id, "
+            "p.created_at, p.granted_by, r.action, s.enabled FROM tool_pins p "
+            "LEFT JOIN tool_rules r ON r.server = p.server AND r.tool = p.tool "
+            "LEFT JOIN mcp_servers s ON s.server = p.server "
+            "ORDER BY p.server, p.tool, p.id").fetchall()
+    out = []
+    for r in rows:
+        pins = policy._parse_pins(r["pins_json"])
+        out.append({"id": r["id"], "server": r["server"], "tool": r["tool"],
+                    "pins": pins, "rule": r["action"],
+                    "decides": (pins is not None and r["action"] == "ask"
+                                and bool(r["enabled"])),
+                    "approval_id": r["approval_id"], "created_at": r["created_at"],
+                    "granted_by": r["granted_by"]})
+    return out
+
+
+@router.post("/api/mcp/pins/{pin_id}/revoke")
+def revoke_mcp_pin(pin_id: int, request: Request) -> JSONResponse:
+    """Remove one pin, so the calls it answered go back to the tool's rule. Revoking a
+    pin can only narrow: the most it takes away is an answer a card can give again."""
+    actor = provenance._actor(request)
+    with store._connect() as conn:
+        row = conn.execute(
+            "SELECT server, tool, pins_json FROM tool_pins WHERE id=?",
+            (pin_id,)).fetchone()
+        if row is None:
+            return JSONResponse({"ok": False, "detail": "unknown pin"},
+                                status_code=404)
+        conn.execute("DELETE FROM tool_pins WHERE id=?", (pin_id,))
+        conn.commit()
+
+    pins = policy._parse_pins(row["pins_json"])
+    fields = ", ".join(sorted(pins)) if pins else "an unreadable pin set"
+    store._audit("revoke", stage="tool-policy", server=row["server"], tool=row["tool"],
+                 actor=actor,
+                 reason=f"pin {pin_id} revoked by {actor}; {row['tool']} on "
+                        f"{row['server']} pinned on {fields} is decided by its rule "
+                        f"again")
+    return JSONResponse({"ok": True, "id": pin_id, "server": row["server"],
+                         "tool": row["tool"]})

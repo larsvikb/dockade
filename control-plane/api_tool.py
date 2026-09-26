@@ -80,7 +80,12 @@ def tool_authorize(req: ToolCallRequest) -> dict:
     client_class = policy._client_class(req.client)
     server = (getattr(req, "server", "") or "").strip().lower()
     tool = (getattr(req, "tool", "") or "").strip()
-    decision, reason = policy._decide_tool(server, tool)
+    # A pin answers only what a card could have, and a card refuses a payload past
+    # the ceiling rather than show it in part (``holds._register_tool_ask``), so the
+    # pins are not offered one either.
+    showable = len(holds._canonical_args(req.args)) <= holds.TOOL_ARGS_MAX
+    decision, reason = policy._decide_tool(server, tool,
+                                           req.args if showable else None)
 
     if decision in ("allow", "deny"):
         store._audit(decision, stage="tool-call", client=req.client,

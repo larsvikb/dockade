@@ -72,6 +72,7 @@ def _clear_all():
         conn.execute("DELETE FROM rules")
         conn.execute("DELETE FROM leases")
         conn.execute("DELETE FROM tool_rules")
+        conn.execute("DELETE FROM tool_pins")
         conn.execute("DELETE FROM mcp_servers")
         conn.execute("DELETE FROM approvals")
         conn.execute("DELETE FROM tool_approvals")
@@ -3683,6 +3684,164 @@ class ToolAuthorizeDecisionTests(_ToolBridgeTestCase):
         self.assertLessEqual({"allow", "deny", "hold"}, set(cp.audit.KINDS))
 
 
+def _pin(pins, tool="create_pull_request", server="mcp-github"):
+    """Write a pin as the card will, and return its id. Nothing writes one through the
+    API yet, so the test writes the row."""
+    with cp.store._connect() as conn:
+        pin_id = conn.execute(
+            "INSERT INTO tool_pins(server, tool, pins_json, approval_id, created_at, "
+            "granted_by) VALUES (?,?,?, 'a1', 0, 'peer=172.31.0.3')",
+            (server, tool, cp.policy._canonical_pins(pins))).lastrowid
+        conn.commit()
+    return pin_id
+
+
+_PINNED = {"owner": "larsvikb", "repo": "dockade"}
+_PR_ARGS = {**_PINNED, "title": "t", "body": "b", "head": "topic", "base": "main"}
+
+
+class PinnedAllowBridgeTests(_ToolBridgeTestCase):
+    """``/tool/authorize`` with a pin: the call runs without a card, and the record
+    says which pin answered it."""
+
+    audits = True
+
+    def setUp(self):
+        super().setUp()
+        _tool_rule("create_pull_request", "ask")
+        self.pin_id = _pin(_PINNED)
+
+    def test_a_pinned_call_is_allowed_and_raises_no_card(self):
+        answer = _tool_call(tool="create_pull_request", args=_PR_ARGS)
+        self.assertEqual(answer["decision"], "allow")
+        self.assertNotIn("approval_id", answer)
+        self.assertEqual(cp.holds._list_tool_asks(), [])
+
+    def test_the_record_names_the_pin_and_carries_no_approval(self):
+        _tool_call(tool="create_pull_request", args=_PR_ARGS)
+        with cp.store._connect() as conn:
+            row = conn.execute("SELECT kind, stage, server, tool, approval_id, reason "
+                               "FROM audit ORDER BY id DESC LIMIT 1").fetchone()
+        self.assertEqual((row["kind"], row["stage"], row["server"], row["tool"]),
+                         ("allow", "tool-call", "mcp-github", "create_pull_request"))
+        self.assertIsNone(row["approval_id"])
+        self.assertIn(f"by pin {self.pin_id}", row["reason"])
+        # Field names, never values: the values are agent-authored.
+        self.assertNotIn("dockade", row["reason"])
+
+    def test_a_call_that_misses_the_pin_raises_a_card_as_before(self):
+        answer = _tool_call(tool="create_pull_request",
+                            args={**_PR_ARGS, "repo": "hemel"})
+        self.assertEqual(answer["decision"], "ask")
+        self.assertEqual(len(cp.holds._list_tool_asks()), 1)
+
+    def test_a_payload_too_large_for_a_card_is_not_offered_to_the_pins(self):
+        # The card refuses it rather than show it in part, and a pin answers only what
+        # a card could have.
+        answer = _tool_call(tool="create_pull_request",
+                            args={**_PR_ARGS, "body": "x" * cp.holds.TOOL_ARGS_MAX})
+        self.assertEqual(answer["decision"], "deny")
+        self.assertIn("ceiling", answer["reason"])
+
+    def test_a_payload_at_the_ceiling_is_still_answered(self):
+        args = {**_PR_ARGS, "body": ""}
+        args["body"] = "x" * (cp.holds.TOOL_ARGS_MAX - len(cp.holds._canonical_args(args)))
+        self.assertEqual(len(cp.holds._canonical_args(args)), cp.holds.TOOL_ARGS_MAX)
+        self.assertEqual(_tool_call(tool="create_pull_request", args=args)["decision"],
+                         "allow")
+
+
+class McpPinTests(_CPTestCase):
+    """``/api/mcp/pins`` and taking a pin back, and what a pin does to its rule's
+    verbs."""
+
+    audits = True
+
+    def setUp(self):
+        super().setUp()
+        _register()
+        _enable()
+        self.rule_id = _tool_rule("create_pull_request", "ask").body["id"]
+        self.pin_id = _pin(_PINNED)
+
+    def _edit_rule(self, action):
+        return cp.api_mcp.edit_mcp_rule(
+            self.rule_id, cp.api_mcp.ToolRuleEditRequest(action=action),
+            _FakeRequest())
+
+    def _decides(self):
+        return {p["id"]: p["decides"] for p in cp.api_mcp.api_mcp_pins()}
+
+    def test_the_view_serves_the_pin_set_and_its_provenance(self):
+        [served] = cp.api_mcp.api_mcp_pins()
+        self.assertEqual(served["pins"], _PINNED)
+        self.assertEqual((served["server"], served["tool"], served["rule"]),
+                         ("mcp-github", "create_pull_request", "ask"))
+        self.assertEqual(served["approval_id"], "a1")
+        self.assertTrue(served["decides"])
+
+    def test_the_view_says_a_pin_decides_only_when_the_decision_would_read_it(self):
+        for action in ("allow", "deny"):
+            with self.subTest(action=action):
+                self._edit_rule(action)
+                self.assertEqual(self._decides(), {self.pin_id: False})
+        self._edit_rule("ask")
+        self.assertEqual(self._decides(), {self.pin_id: True})
+        cp.api_mcp.edit_mcp_server("mcp-github",
+                                   cp.api_mcp.ServerEditRequest(enabled=False),
+                                   _FakeRequest())
+        self.assertEqual(self._decides(), {self.pin_id: False})
+
+    def test_an_unreadable_row_is_listed_as_deciding_nothing(self):
+        with cp.store._connect() as conn:
+            conn.execute("UPDATE tool_pins SET pins_json='{}' WHERE id=?",
+                         (self.pin_id,))
+            conn.commit()
+        [served] = cp.api_mcp.api_mcp_pins()
+        self.assertIsNone(served["pins"])
+        self.assertFalse(served["decides"])
+
+    def test_editing_the_rule_keeps_its_pins(self):
+        self._edit_rule("deny")
+        self._edit_rule("ask")
+        self.assertEqual(
+            _tool_call(tool="create_pull_request", args=_PR_ARGS)["decision"], "allow")
+
+    def test_revoking_a_pin_sends_its_calls_back_to_a_card(self):
+        resp = cp.api_mcp.revoke_mcp_pin(self.pin_id, _FakeRequest())
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(cp.api_mcp.api_mcp_pins(), [])
+        self.assertEqual(
+            _tool_call(tool="create_pull_request", args=_PR_ARGS)["decision"], "ask")
+
+    def test_a_revoked_pin_is_audited_with_its_fields_and_actor(self):
+        cp.api_mcp.revoke_mcp_pin(self.pin_id, _FakeRequest())
+        with cp.store._connect() as conn:
+            row = conn.execute("SELECT kind, stage, tool, actor, reason FROM audit "
+                               "WHERE kind='revoke' ORDER BY id DESC LIMIT 1").fetchone()
+        self.assertEqual((row["kind"], row["stage"], row["tool"]),
+                         ("revoke", "tool-policy", "create_pull_request"))
+        self.assertIsNotNone(row["actor"])
+        self.assertIn(f"pin {self.pin_id}", row["reason"])
+        self.assertIn("owner, repo", row["reason"])
+
+    def test_revoking_an_unknown_pin_is_a_404(self):
+        self.assertEqual(
+            cp.api_mcp.revoke_mcp_pin(self.pin_id + 1, _FakeRequest()).status_code, 404)
+
+    def test_a_rule_with_pins_cannot_be_revoked_until_they_are(self):
+        # A pin left behind would come back, unasked, with the next `ask` rule for
+        # the same tool.
+        refused = cp.api_mcp.revoke_mcp_rule(self.rule_id, _FakeRequest())
+        self.assertEqual(refused.status_code, 409)
+        self.assertEqual(refused.body["tool_pins"], 1)
+        self.assertEqual(cp.policy._decide_tool("mcp-github",
+                                                "create_pull_request")[0], "ask")
+        cp.api_mcp.revoke_mcp_pin(self.pin_id, _FakeRequest())
+        self.assertEqual(
+            cp.api_mcp.revoke_mcp_rule(self.rule_id, _FakeRequest()).status_code, 200)
+
+
 class ToolRosterTests(_ToolBridgeTestCase):
     """``GET /tool/roster`` — what the gateway may dial and what it may present.
 
@@ -4462,6 +4621,22 @@ class FreshSchemaTests(_FreshStoreTestCase):
         self.assertEqual(cols, {"id", "host", "client_class", "approval_id",
                                 "created_at", "expires_at", "granted_by"})
 
+    def test_new_store_has_the_pins_table(self):
+        # Exact, for the reason the leases set is: no `action` column, because a pin
+        # only ever allows — a pinned deny is dodged by any spelling the server reads
+        # as the same value.
+        self._use_store("fresh-pins.db")
+        cp.store._init_db()
+        insert = ("INSERT INTO tool_pins(server, tool, pins_json, approval_id, "
+                  "created_at, granted_by) VALUES ('s', 't', '{\"a\":1}', ?, 0, 'g')")
+        with cp.store._connect() as conn:
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(tool_pins)")}
+            conn.execute(insert, ("a1",))
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(insert, ("a2",))     # the same pin set from another card
+        self.assertEqual(cols, {"id", "server", "tool", "pins_json", "approval_id",
+                                "created_at", "granted_by"})
+
     def test_a_fresh_store_lets_two_leases_hold_the_same_host(self):
         # The absent UNIQUE, asserted rather than assumed. Unreachable through the API
         # — a live lease decides the request, so no card is raised to grant a second
@@ -4730,15 +4905,22 @@ class MigrationTests(_FreshStoreTestCase):
         self._old_store("migrate-new-table.db")
         cp.store._init_db()
         with cp.store._connect() as conn:
-            # BOTH new tables, because the decision below reads both: a rule grants
-            # nothing for a server that is not registered and enabled.
+            # EVERY new table, because the decisions below read them all: a rule grants
+            # nothing for a server that is not registered and enabled, and a pin
+            # nothing without an `ask` rule.
             conn.execute("INSERT INTO mcp_servers(server, enabled, auth_type, "
                          "created_at) VALUES ('mcp-github', 1, 'none', 0)")
             conn.execute("INSERT INTO tool_rules(server, tool, action, source, "
                          "created_at) VALUES ('mcp-github','get_me','allow',"
+                         "'operator',0), ('mcp-github','issue_write','ask',"
                          "'operator',0)")
+            conn.execute("INSERT INTO tool_pins(server, tool, pins_json, approval_id, "
+                         "created_at, granted_by) VALUES ('mcp-github','issue_write',"
+                         "'{\"method\":\"create\"}','a1',0,'g')")
             conn.commit()
         self.assertEqual(cp.policy._decide_tool("mcp-github", "get_me")[0], "allow")
+        self.assertEqual(cp.policy._decide_tool("mcp-github", "issue_write",
+                                                {"method": "create"})[0], "allow")
 
     def test_migration_is_idempotent(self):
         self._old_store("migrate-twice.db")
@@ -5220,7 +5402,8 @@ class ApiSurfaceSplitTests(unittest.TestCase):
                                   ("POST", "/api/mcp/servers/{server}/revoke"),
                                   ("POST", "/api/mcp/rules"),
                                   ("POST", "/api/mcp/rules/{rule_id}/edit"),
-                                  ("POST", "/api/mcp/rules/{rule_id}/revoke")})
+                                  ("POST", "/api/mcp/rules/{rule_id}/revoke"),
+                                  ("POST", "/api/mcp/pins/{pin_id}/revoke")})
         self.assertEqual(writes & _routes(cp.authorize_app), set())
         self.assertEqual(writes & _routes(cp.tool_app), set())
 
@@ -5230,7 +5413,7 @@ class ApiSurfaceSplitTests(unittest.TestCase):
         # be able to read them either.
         for path in ("/approvals", "/approvals/stream", "/api/audit",
                      "/api/audit/events", "/api/egress/rules", "/api/mcp/servers",
-                     "/api/mcp/rules", "/api/config", "/status"):
+                     "/api/mcp/rules", "/api/mcp/pins", "/api/config", "/status"):
             self.assertIn(("GET", path), _routes(cp.app), path)
             self.assertNotIn(("GET", path), _routes(cp.authorize_app), path)
             # Nor on the gateway's bridge. It reads policy — that is what the roster

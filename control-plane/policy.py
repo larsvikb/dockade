@@ -15,11 +15,13 @@ beside the matcher that consumes it, not in the proxy that observed the address.
 
 ``_decide_tool`` at the bottom does the same job for the MCP gateway's table and
 shares no code with the host matcher: it sits next to ``_decide`` because each way
-the two differ is a decision.
+the two differ is a decision. Where a tool's rule is `ask`, a pin may answer the call
+in advance (``_answering_pin``).
 """
 from __future__ import annotations
 
 import ipaddress
+import json
 import os
 import re
 import time
@@ -458,7 +460,99 @@ def _tool_rule_error(tool: str, action: str) -> str | None:
     return None
 
 
-def _decide_tool(server: str, tool: str) -> tuple[str, str]:
+# ── pinned allows: an `ask` answered in advance ──────────────────────────────
+# A `tool_pins` row allows the calls to one tool whose arguments carry exact values in
+# the fields it names; every other field is free. ``_decide_tool`` reads one only
+# while that tool's rule is `ask`, so a pin can release only what a human could have
+# released from a card (DESIGN.md, "A pinned allow is an ask answered in advance").
+#
+# There is no pinned DENY, and that is what makes exact equality safe. How a server
+# compares values is unknown here (GitHub reads `Dockade` as `dockade`): a value that
+# misses an allow falls back to a card, where one that missed a deny would run.
+
+#: A field a pin may name, and the shape of EVERY key in a call a pin answers: an
+#: ASCII identifier. Go's encoding/json matches object keys to struct fields
+#: case-insensitively, folding U+017F (long s) to `s` and the Kelvin sign to `k`, so
+#: `{"repo": "dockade", "Repo": "other"}` could meet a pin on `repo` while the server
+#: reads the other key. Keys that are ASCII and distinct once lower-cased leave any
+#: parser one key per field.
+_PIN_FIELD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+#: The longest string a pin holds. A pin names a target — a repository, a method, a
+#: channel — and a longer string is content, which a pin is not for.
+_PIN_VALUE_MAX = 200
+
+
+def _pin_value(value: object) -> str | None:
+    """``value`` in the form a pin holds and compares, or None if no pin can hold it.
+
+    Canonical JSON rather than ``==``, because Python's equality is wider than the
+    wire's: ``True == 1`` and ``147 == 147.0``, while a server receives `true`, `1`
+    and `147.0` as three different values. Strings, integers and booleans only: a
+    float, a null, a list or an object is not an identifier."""
+    if isinstance(value, (bool, int)) or (
+            isinstance(value, str) and len(value) <= _PIN_VALUE_MAX):
+        return json.dumps(value, ensure_ascii=False)
+    return None
+
+
+def _canonical_pins(pins: dict) -> str:
+    """The stored form of a pin set, one canonical JSON object, so that two equal pin
+    sets are one string and ``UNIQUE(server, tool, pins_json)`` means what it says."""
+    return json.dumps(pins, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _parse_pins(pins_json: str) -> dict | None:
+    """A stored pin set, or None if the row does not hold one.
+
+    Nothing writes an invalid row through the API, so every None here is a store
+    edited by hand or corrupted, and such a row must never grant. An EMPTY set above
+    all: it would answer every call to the tool, which is promoting the tool to
+    `allow` without its rule saying so."""
+    try:
+        pins = json.loads(pins_json)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(pins, dict) or not pins:
+        return None
+    if not all(_PIN_FIELD_RE.fullmatch(field) and _pin_value(value) is not None
+               for field, value in pins.items()):
+        return None
+    return pins
+
+
+def _pin_matches(pins: dict, args: object) -> bool:
+    """Whether a call with ``args`` carries every pinned field with its exact value.
+
+    Every key of the call is checked, not only the pinned ones (``_PIN_FIELD_RE``): a
+    key outside the shape, or two keys differing only in case, make the call
+    ambiguous to some parser, and an ambiguous call gets a card."""
+    if not isinstance(args, dict):
+        return False
+    keys = list(args)
+    if not all(isinstance(key, str) and _PIN_FIELD_RE.fullmatch(key) for key in keys):
+        return False
+    if len({key.lower() for key in keys}) != len(keys):
+        return False
+    return all(field in args and _pin_value(args[field]) == _pin_value(value)
+               for field, value in pins.items())
+
+
+def _answering_pin(conn, server: str, tool: str,
+                   args: object) -> tuple[int, dict] | None:
+    """The oldest pin on (``server``, ``tool``) that ``args`` meets, as (id, pins), or
+    None. The caller has found the tool's rule to be `ask`."""
+    if not isinstance(args, dict):
+        return None
+    for row in conn.execute(
+            "SELECT id, pins_json FROM tool_pins WHERE server = ? AND tool = ? "
+            "ORDER BY id", (server, tool)):
+        pins = _parse_pins(row["pins_json"])
+        if pins is not None and _pin_matches(pins, args):
+            return row["id"], pins
+    return None
+
+
+def _decide_tool(server: str, tool: str, args: object = None) -> tuple[str, str]:
     """(decision, reason) for calling ``tool`` on ``server``: allow, deny or ask.
 
     ``ask`` is not this path's ``hold``. An egress hold blocks the request inside the
@@ -478,7 +572,12 @@ def _decide_tool(server: str, tool: str) -> tuple[str, str]:
     Every failure direction is a deny, including a stored action this code does not
     recognize. That last case is not reachable through the API — it validates on
     write — which is exactly why it is handled here: the store is a file on a volume,
-    and the one thing a hand-edited or corrupted row must never do is grant."""
+    and the one thing a hand-edited or corrupted row must never do is grant.
+
+    Under an `ask` rule, a pin that ``args`` meets answers the call, and the decision
+    is `allow`. Under any other rule no pin is read: a pin cannot soften a `deny`, and
+    an `allow` has nothing to answer. The claim passes no ``args``, because a human
+    has already answered its call."""
     server, tool = (server or "").strip(), (tool or "").strip()
     if not server or not tool:
         return "deny", "a tool call needs both a server and a tool name"
@@ -494,11 +593,16 @@ def _decide_tool(server: str, tool: str) -> tuple[str, str]:
         row = conn.execute(
             "SELECT action FROM tool_rules WHERE server = ? AND tool = ?",
             (server, tool)).fetchone()
-    if row is None:
-        return "deny", (f"no rule for {tool!r} on {server!r} — an unconfigured tool "
-                        f"is denied, not held")
-    action = row["action"]
-    if action not in _TOOL_ACTIONS:
-        return "deny", (f"the rule for {tool!r} on {server!r} carries an unknown "
-                        f"action {action!r}")
+        if row is None:
+            return "deny", (f"no rule for {tool!r} on {server!r} — an unconfigured "
+                            f"tool is denied, not held")
+        action = row["action"]
+        if action not in _TOOL_ACTIONS:
+            return "deny", (f"the rule for {tool!r} on {server!r} carries an unknown "
+                            f"action {action!r}")
+        pin = _answering_pin(conn, server, tool, args) if action == "ask" else None
+    if pin is not None:
+        pin_id, pins = pin
+        return "allow", (f"'allow' by pin {pin_id} ({tool} on {server}, pinned: "
+                         f"{', '.join(sorted(pins))})")
     return action, f"{action!r} by rule ({tool} on {server})"

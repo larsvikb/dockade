@@ -13,7 +13,7 @@ router, and are mounted on a listener here and nowhere else:
   - ``api_tool``      — ``/tool/*``, the MCP gateway's bridge.
   - ``api_approvals`` — the queue and ``resolve``: the endpoint that grants.
   - ``api_egress``    — standing egress rules, and the leases a card granted.
-  - ``api_mcp``       — MCP servers and tool rules.
+  - ``api_mcp``       — MCP servers, tool rules, and the pins that answer asks.
   - ``api_views``     — the audit record, the UI's settings, /status. Grants nothing.
   - ``provenance``    — ``_actor``: who resolved an approval or changed policy.
 

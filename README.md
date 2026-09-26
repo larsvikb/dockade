@@ -264,10 +264,14 @@ dockade/
                             #   to do, said before the click
     holds.js                #   the pending queue's decisions: what a push changes, when a
                             #   card may go, how a countdown reads, how an arrival is announced
+    leases.js               #   timed grants as shown: the button label, each lease's countdown,
+                            #   sibling hosts folded into one line
     mcp.js                  #   the MCP surface from the form: what a server registration
                             #   records, the tool picker, what a tool rule will do
     payload.js              #   a tool ask's payload as the operator sees it — imported by app.js
     provenance.js           #   who acted, cut to what a table cell can hold
+    status.js               #   what each polled table says about itself: empty, stale, or
+                            #   not yet loaded — one decision, four tables' sentences
     time.js                 #   timestamps as the page shows them
     index.html              #   static shell + styles for the SSE approval console
     DESIGN.md               #   the browser boundary and the page's mechanics

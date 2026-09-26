@@ -89,8 +89,8 @@ UI_INDEX = os.environ.get("CONTROL_UI_INDEX", "/opt/control-plane-ui/index.html"
 # hands out. A test holds it equal to the files in the directory and to what the
 # modules import from each other.
 UI_DIR = os.environ.get("CONTROL_UI_DIR", "/opt/control-plane-ui")
-UI_MODULES = frozenset({"app.js", "audit.js", "egress-rules.js", "holds.js", "mcp.js",
-                        "payload.js", "provenance.js", "time.js"})
+UI_MODULES = frozenset({"app.js", "audit.js", "egress-rules.js", "holds.js", "leases.js",
+                        "mcp.js", "payload.js", "provenance.js", "status.js", "time.js"})
 # The path behind each name, built here from the list and never from a request: the
 # name off the URL only picks an entry, so no string a caller sent reaches the
 # filesystem — which is also what lets a scanner see it, rather than having to trust

@@ -1222,10 +1222,11 @@ class AuditViewTests(_CPTestCase):
             for r in rows:
                 conn.execute(
                     "INSERT INTO audit(ts, kind, stage, host, port, proto, "
-                    "client, method, url, reason) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    "client, actor, method, url, reason) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     (r.get("ts", 0.0), r.get("kind", "allow"), r.get("stage"),
                      r.get("host"), r.get("port"), r.get("proto"), r.get("client"),
-                     r.get("method"), r.get("url"), r.get("reason")))
+                     r.get("actor"), r.get("method"), r.get("url"), r.get("reason")))
             conn.commit()
 
     def test_a_denial_says_whether_it_was_policy_or_an_outage(self):
@@ -1300,6 +1301,9 @@ class AuditViewTests(_CPTestCase):
             set(_served()[0]),
             {"ts", "kind", "stage", "host", "client", "client_class", "reason",
              "n", "first_ts", "fail_closed",
+             # Who acted, shown under the client, so in the group key too: two rules
+             # written by different people are two facts.
+             "actor",
              # The tool columns. They are in the GLANCE — unlike url/method/port —
              # because an outcome row identifies itself with them: an egress row names
              # a host in that cell, and a tool row names `server__tool`. They are also
@@ -1404,6 +1408,7 @@ class AuditViewTests(_CPTestCase):
                 "client": "172.30.0.2", "reason": "blocked by rule"}
         for field, other in (("kind", "allow"), ("stage", "sni"),
                              ("host", "b.example"), ("client", "172.30.0.9"),
+                             ("actor", "peer=172.31.0.3"),
                              ("reason", "no matching rule")):
             with self.subTest(field=field):
                 self._rows(base, {**base, field: other})
@@ -1483,11 +1488,12 @@ def _write_audit(*rows):
         for r in rows:
             conn.execute(
                 "INSERT INTO audit(ts, kind, stage, host, port, proto, client, "
-                "client_class, method, url, reason, server, tool, approval_id, status) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "client_class, actor, method, url, reason, server, tool, approval_id, "
+                "status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (r.get("ts", 0.0), r.get("kind", "allow"), r.get("stage"),
                  r.get("host"), r.get("port"), r.get("proto"), r.get("client"),
-                 r.get("client_class"), r.get("method"), r.get("url"), r.get("reason"),
+                 r.get("client_class"), r.get("actor"), r.get("method"), r.get("url"),
+                 r.get("reason"),
                  r.get("server"), r.get("tool"), r.get("approval_id"),
                  r.get("status")))
         conn.commit()
@@ -1529,6 +1535,20 @@ class AuditFilterTests(_CPTestCase):
 
     def test_search_matches_the_reason(self):
         self.assertEqual(self._hosts(q="blocked by rule"), ["evil.example"])
+
+    def test_search_matches_the_actor_in_both_views(self):
+        # "What did this operator do" is a question about the actor column, and
+        # both views show it. The User-Agent is matched too: the cell's title holds it.
+        _write_audit({"host": ".github.com", "kind": "create", "stage": "policy",
+                      "actor": 'peer=172.31.0.3 via-ui=10.1.2.3 ua="curl/8.5.0"',
+                      "ts": 1.0},
+                     {"host": "pypi.org", "client": "172.30.0.2", "ts": 2.0})
+        for q in ("via-ui=10.1.2.3", "curl"):
+            with self.subTest(q=q):
+                self.assertEqual(self._hosts(q=q), [".github.com"])
+                self.assertEqual(
+                    [r["host"] for r in cp.api_views.api_audit_events(q=q)["rows"]],
+                    [".github.com"])
 
     def test_search_is_case_insensitive(self):
         self.assertEqual(self._hosts(q="EVIL"), ["evil.example"])
@@ -1783,7 +1803,7 @@ class AuditRecordTests(_CPTestCase):
         self.assertEqual(
             set(row),
             {"id", "ts", "kind", "stage", "host", "port", "proto", "client",
-             "client_class", "method", "url", "reason", "fail_closed",
+             "client_class", "actor", "method", "url", "reason", "fail_closed",
              # The tool columns. Egress rows carry NULL in all three — the identity of
              # an egress decision is host/port/url — and they are here because this is
              # the view that answers "which one was it" for a TOOL row, whose identity

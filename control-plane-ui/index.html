@@ -97,6 +97,12 @@
      space is part of the TEXT, not a margin, so a copied row reads
      "chatty.example 47x" and not "chatty.example47x". */
   .rep { color: var(--dim); font-size: 11px; white-space: pre; }
+  /* Who ACTED, on its own line under the client in the audit `who` cell (`actor` in
+     auditRow). Capped like `td.actor` in the leases strip, and for the same reason:
+     the title holds the whole `_actor` string. The break is `display: block`, so the
+     separating space is part of the TEXT, as for .qual and .rep. */
+  .by { display: block; font-size: 12px; max-width: 260px; overflow: hidden;
+    text-overflow: ellipsis; }
   /* Saturation banner. Three levels, and the difference between them is EMPHASIS
      rather than presence: a rejection notice never disappears on a timer (see
      saturationState), it just stops shouting. `recent` borrows the deny colour
@@ -473,7 +479,7 @@
          distinction has to arrive before the rows, not be discovered among them. -->
     <div class="empty" id="audit-outage" hidden></div>
     <table id="audit-grouped-table">
-      <thead><tr><th>time</th><th>kind</th><th>target</th><th>client</th>
+      <thead><tr><th>time</th><th>kind</th><th>target</th><th>who</th>
         <th>detail</th></tr></thead>
       <tbody id="audit"></tbody>
     </table>
@@ -481,7 +487,7 @@
          the port for a CONNECT tunnel — which is the whole reason to leave the folded
          view, and the field the glance deliberately drops as unbounded. -->
     <table id="audit-events-table" hidden>
-      <thead><tr><th>time</th><th>kind</th><th>target</th><th>client</th>
+      <thead><tr><th>time</th><th>kind</th><th>target</th><th>who</th>
         <th>request</th><th>detail</th></tr></thead>
       <tbody id="audit-events"></tbody>
     </table>

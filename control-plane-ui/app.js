@@ -252,6 +252,7 @@ function toolSubject(r) {
 // locale to assert the parts that carry meaning.
 function auditRow(r) {
   const stage = (r && r.stage) || "";
+  const client = (r && r.client) || "";
   return {
     ts: tsSeconds(r && r.ts),
     kind: (r && r.kind) || "?",
@@ -279,8 +280,9 @@ function auditRow(r) {
     stagePrefix: auditPrefix(r, stage),
     target: auditTarget(r),
     // An em dash rather than an empty cell: blank reads as "this column is broken",
-    // whereas the honest statement is that no client was recorded for this row.
-    client: (r && r.client) || "—",
+    // whereas the honest statement is that no client was recorded for this row. Not
+    // on a row with an actor, whose line fills the cell.
+    client: client || (r && r.actor ? "" : "—"),
     // The client CLASS, prefixed to the address the same way `stagePrefix` qualifies
     // the host — because it is what the decision was actually taken against, while
     // the address is only how the class was worked out. An operator scanning this
@@ -290,6 +292,13 @@ function auditRow(r) {
     // backend could not place. Rendering nothing in that case is deliberate: an
     // invented label would be a claim, and these rows are evidence.
     clientClassPrefix: r && r.client_class ? `${r.client_class} · ` : "",
+    // WHO ACTED, when that was not the client (`audit.actor`): the operator behind a
+    // click, or the gateway behind an inventory push. Its own line under the client,
+    // labelled, so "which sandbox asked" and "who did it" never share a value; the
+    // title gets the whole string, as in the leases strip. The line break is CSS, so
+    // the space before `by` is in the text: a copied cell reads "… 172.30.0.2 by …".
+    actor: r && r.actor ? `${client ? " " : ""}by ${shortActor(r.actor)}` : "",
+    actorTitle: (r && r.actor) || "",
     reason: (r && r.reason) || "",
     // /api/audit groups rows by exactly the fields rendered here, so `n` is how many
     // identical decisions this line stands for. Empty at n<=1, which is the ordinary
@@ -1963,7 +1972,9 @@ function start() {
               ? `<span class="rep">${esc(" " + a.repeat)}</span>` : ""}</td>
           <td class="ts">${a.clientClassPrefix
             ? `<span class="qual">${esc(a.clientClassPrefix)}</span>` : ""
-            }${esc(a.client)}</td>
+            }${esc(a.client)}${a.actor
+              ? `<span class="by" title="${esc(a.actorTitle)}">${esc(a.actor)}</span>`
+              : ""}</td>
           <td>${esc(a.reason)}${a.firstTs
             ? esc(`${a.reason ? " · " : ""}first seen ${fmtStamp(a.firstTs)}`)
             : ""}</td></tr>`;
@@ -1984,7 +1995,9 @@ function start() {
             }${esc(a.target)}</td>
           <td class="ts">${a.clientClassPrefix
             ? `<span class="qual">${esc(a.clientClassPrefix)}</span>` : ""
-            }${esc(a.client)}</td>
+            }${esc(a.client)}${a.actor
+              ? `<span class="by" title="${esc(a.actorTitle)}">${esc(a.actor)}</span>`
+              : ""}</td>
           <td class="req"><code>${esc(a.request)}</code></td>
           <td>${esc(a.reason)}</td></tr>`;
     }).join("");

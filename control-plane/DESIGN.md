@@ -412,7 +412,9 @@ egress rule's class goes in its reason. Whoever performed the act, when that is 
 the client, is `actor`: the operator behind a click, or the gateway behind a push. A
 row with both is a human answering a sandbox's request. Kept apart because a search
 for one sandbox or one class must return what that population asked for, not the
-configuration written about it. `ActorColumnTests` holds every writer to this.
+configuration written about it. `ActorColumnTests` holds every writer to this. On the
+page the two share one `who` cell, the actor on a labelled line of its own (`auditRow`
+in `control-plane-ui/app.js`): apart in the store, adjacent where a reader asks "who".
 
 This is not a reversal of keeping client identity out of the saturation banner's
 headline. That banner is a glanceable alert where a bare IP is noise; this table is the

@@ -633,6 +633,14 @@ console.log(JSON.stringify({
         at_the_length_limit: m.auditRow({ ts: 1e9, stage: "x".repeat(12),
                                           host: "a.example" }).stagePrefix,
         no_client: m.auditRow({ ts: 1e9, kind: "allow", host: "a.example" }),
+        // WHO ACTED, beside who asked: a rule written has an actor and no client, and
+        // a human's answer to a sandbox's request has both.
+        acted: m.auditRow({ ts: 1e9, kind: "create", stage: "policy",
+                            host: ".github.com",
+                            actor: 'peer=172.31.0.3 via-ui=10.1.2.3 ua="curl/8.5.0"' }),
+        answered: m.auditRow({ ts: 1e9, kind: "allow", host: "pypi.org",
+                               client: "172.30.0.2", client_class: "sandbox",
+                               actor: "peer=172.31.0.3 via-ui=10.1.2.3" }),
         junk_ts: m.auditRow({ ts: "soon", kind: "allow", host: "a.example" }).ts,
         empty: m.auditRow({}),
         nothing: m.auditRow(null),
@@ -744,10 +752,11 @@ console.log(JSON.stringify({
         // whole reason eventRow builds on auditRow.
         shares_shaping: (() => {
           const r = { ts: 1e9, kind: "deny", host: "a.example", stage: "http",
-                      client_class: "mcp", fail_closed: true };
+                      client_class: "mcp", fail_closed: true,
+                      actor: "peer=172.31.0.3" };
           const folded = m.auditRow(r), raw = m.eventRow(r);
           return ["ts", "kind", "host", "client", "stagePrefix",
-                  "clientClassPrefix", "reason", "failClosed"]
+                  "clientClassPrefix", "actor", "actorTitle", "reason", "failClosed"]
             .every(k => JSON.stringify(folded[k]) === JSON.stringify(raw[k]));
         })(),
       },
@@ -1990,6 +1999,31 @@ class PageScriptTests(unittest.TestCase):
         # The address is still there — losing the class must not lose the row.
         self.assertEqual(a["unclassed"]["client"], "172.30.0.2")
 
+    def test_a_row_says_who_acted_on_a_line_of_its_own(self):
+        a = self.probe["saturation"]["audit"]
+        # A rule written: no sandbox asked, so no client and no em dash — the actor
+        # line fills the cell, shortened to the fields that say who, with the whole
+        # string kept for the title.
+        self.assertEqual(a["acted"]["client"], "")
+        self.assertEqual(a["acted"]["actor"], "by peer=172.31.0.3 via-ui=10.1.2.3")
+        self.assertEqual(a["acted"]["actorTitle"],
+                         'peer=172.31.0.3 via-ui=10.1.2.3 ua="curl/8.5.0"')
+        # A human answering a sandbox: both, and the client is unchanged by the actor.
+        self.assertEqual(a["answered"]["client"], "172.30.0.2")
+        self.assertEqual(a["answered"]["clientClassPrefix"], "sandbox · ")
+        # An agent's own row has no actor line at all, not an empty one.
+        self.assertEqual((a["tunnelled"]["actor"], a["tunnelled"]["actorTitle"]),
+                         ("", ""))
+
+    def test_the_actor_line_carries_its_own_separator(self):
+        # The line break is `display: block`, which `textContent` does not see, so
+        # a copied cell would read "172.30.0.2by peer=…" without the space. Only a
+        # client needs separating from; alone, the line starts at `by`.
+        a = self.probe["saturation"]["audit"]
+        self.assertEqual(a["answered"]["actor"],
+                         " by peer=172.31.0.3 via-ui=10.1.2.3")
+        self.assertTrue(a["acted"]["actor"].startswith("by "))
+
     def test_the_class_prefix_carries_its_own_separator(self):
         # The `denyhttp` lesson again: a CSS margin gives the right pixels and the
         # wrong `textContent`, so a row copied into a ticket reads as one word. This
@@ -2991,17 +3025,20 @@ class AuditTableSourceTests(unittest.TestCase):
         # every row — the annotation exists to mark the exception, not the rule.
         self.assertNotIn("a.repeat", self.events)
 
-    def test_the_client_column_is_rendered_and_escaped(self):
+    def test_the_who_column_is_rendered_and_escaped(self):
+        # The client, and under it the actor, whose title is the full `_actor` string:
+        # self-reported fields and all, so it is escaped like everything else here.
         for view, body in (("folded", self.rows), ("record", self.events)):
             with self.subTest(view=view):
                 self.assertIn("esc(a.client)", body)
+                self.assertIn('title="${esc(a.actorTitle)}">${esc(a.actor)}', body)
         # Scoped to the decisions SECTION, not the first <thead> in the file — the
         # policy table also has one, and a reordering of the two sections would
         # otherwise silently point this assertion at the wrong table.
         section = re.search(r'<section id="view-audit".*?</section>',
                             INDEX_HTML.read_text(), re.S)
         self.assertIsNotNone(section, "the audit section was renamed")
-        self.assertIn("<th>client</th>", section.group(0),
+        self.assertIn("<th>who</th>", section.group(0),
                       "the column exists in the body but has no header")
 
     def test_the_record_table_body_agrees_with_its_header(self):
@@ -3013,7 +3050,7 @@ class AuditTableSourceTests(unittest.TestCase):
                             INDEX_HTML.read_text(), re.S)
         self.assertIsNotNone(section, "the record table was renamed")
         headers = [h.strip() for h in re.findall(r"<th>(.*?)</th>", section.group(0))]
-        self.assertEqual(headers, ["time", "kind", "target", "client", "request",
+        self.assertEqual(headers, ["time", "kind", "target", "who", "request",
                                    "detail"])
         row = re.search(r"return `\s*<tr([^>]*)>(.*?)</tr>`", self.events, re.S)
         self.assertIsNotNone(row, "the record row template was restructured")

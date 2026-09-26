@@ -1489,22 +1489,60 @@ that the exposed tool list becomes a *configuration artifact* rather than a mirr
 of upstream: a server upgrade that adds tools raises a notice in the control plane
 instead of silently widening what the agent can reach.
 
-**`ask` does not decay, and that is the problem this design has to answer.** Egress
+**`ask` does not decay on its own, and a pinned allow is what makes it.** Egress
 holds collapse duplicates onto one card and persist into rules, so the human's
 decision count trends toward zero as trust accrues — the progressive-trust path this
 system is built around. Tool payloads are per-call and never repeat exactly, so a
-naive `ask` is a permanent tax with no such path. What is needed — and **not built
-yet**, see "Status" — is an argument-shaped analogue of `_persist_candidates`:
-*this call* → *this tool with these arguments* → *this tool with one field pinned* →
-*this tool always*. Copy its shape exactly, because the property that matters is the
-same one — the backend
-derives a **bounded** candidate set, the operator picks from it, and the chosen
-value is shown verbatim; nothing is persisted from a string the requester supplied.
-Deriving that ladder is server-specific, and it — not rendering — is where "any kind
-of MCP server" actually bites. MCP's own `readOnlyHint` / `destructiveHint`
-annotations are **server-supplied and therefore untrusted**: they may sort and label
-the configuration surface ("this server claims these are read-only"), and they must
+bare `ask` is a permanent tax. The ladder that answers it has three rungs and only
+the middle one is new: *this call* (a card's Allow, bound to the payload), *these
+fields pinned* (a pin), *this tool always* (promoting the rule to `allow`, which
+stays off the card). *These exact arguments* is not a rung: payloads do not repeat,
+so it would decay nothing.
+
+**A pinned allow is an ask answered in advance.** A pin names some of a tool's
+fields and a value for each, and allows every call carrying exactly those values;
+every other field is free. It is read only while the tool's rule is `ask`, and that
+is the whole safety argument: everything a pin can release, a human could already
+have released by clicking Allow on a card. It cannot reach a denied or unruled tool
+or a disabled server, and a payload too large for a card to show is not offered to
+the pins either.
+
+**A pin only allows, because a server's notion of equal is unknown here.** GitHub
+reads `Dockade` and `dockade` as one repository. Against an unknown equivalence an
+allowlist that misses falls back to a card, while a blocklist that misses lets the
+call run — a deny pinned on `repo=secrets` is dodged by `Secrets`. Exact equality is
+safe in one direction only, and a pin is written only in that one. The rule is the
+ceiling, as a block is for a lease: a pin under `deny` decides nothing.
+
+**The candidates are generic; what they mean is server-specific, and stays with the
+human.** This keeps `_persist_candidates`' shape — the backend derives a **bounded**
+candidate set, the operator picks from it, and the chosen value is shown verbatim —
+without any per-server code. The operator picks *fields*, from the top-level strings,
+integers and booleans of the held payload; the *values* are copied from the stored
+ask, never from the request that resolves it. A pin has no wildcard syntax, so a
+value the agent supplied can only ever match itself — the hole a leading dot opened
+on the egress side has nowhere to open here. Which fields actually scope a call
+(`owner` and `repo`, a dispatcher's `method`) is knowledge about one server, and the
+operator supplies it. MCP's own `readOnlyHint` / `destructiveHint` annotations are
+**server-supplied and therefore untrusted**: they may sort and label the
+configuration surface ("this server claims these are read-only"), and they must
 never decide.
+
+**A pinned call is one the decision and the server read alike.** The gateway parses
+the agent's JSON once and sends both `/tool/authorize` and the server a
+re-serialization of that one parse (`tool-gateway/app.py`, then `execute.call`), so
+a duplicate key cannot show one value to policy and another to the server. What one
+parse cannot close is a server that matches keys more loosely than Python, as Go's
+`encoding/json` does; the key shape that closes it is `policy._PIN_FIELD_RE`.
+
+**What a pin does not cover, stated so it is known rather than found.** It constrains
+the fields it names and nothing else: a server that also reads an alias field, or an
+upgrade adding a field that retargets the call, widens a pin with nothing to report
+it. Binding a pin to the tool's schema would close that, and needs a schema digest
+the control plane does not hold (`_as_claim` in `tool-gateway/discovery.py` strips
+schemas at the push). A pin also gives up the per-call read, and with it the rate
+limit a human is; every call it answers is audited, naming the pin. And as with a
+lease, a new pin does not release a matching card that is already pending.
 
 **An `ask` answers immediately.** The gateway never blocks the agent, and never blocks
 a control-plane worker either — two independent choices, both away from the egress
@@ -2076,7 +2114,8 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | 4 | pull-through package cache | planned |
 | — | governed git path — clone/fetch (writes are the gateway's) | planned |
 | — | GitHub write set — `GITHUB_READ_ONLY` off behind the gateway, with per-tool repo scoping | planned |
-| — | argument-shaped `ask` ladder — this call → these arguments → one field pinned → always | planned |
+| — | pinned allows — `tool_pins`, read under an `ask` rule only; view and revoke | **done** — nothing writes one yet |
+| — | pinning from a tool card — `allow_pinned`, the field picker, pins in the policy tab | planned |
 | — | `mcp-net` + MCP server catalogue (`mcp-servers.yml`) | **done** |
 | — | per-client-class egress policy | **done** |
 | — | tool policy: store (`tool_rules`, `mcp_servers`) + config API (`/api/mcp/…`) | **done** |

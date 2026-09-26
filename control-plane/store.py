@@ -3,9 +3,10 @@
 
 This is the crown-jewel state: the policy rules that decide egress, the timed
 leases that decide it for a while, the per-tool rules that decide the MCP
-gateway's surface, the audit trail those decisions are written to, the durable
-approvals rows that are the single source of truth for a hold's outcome, and the
-ingest cursor. Everything else in this service reads and writes through here.
+gateway's surface and the pins that answer its asks in advance, the audit trail
+those decisions are written to, the durable approvals rows that are the single
+source of truth for a hold's outcome, and the ingest cursor. Everything else in
+this service reads and writes through here.
 
 Bottom of the dependency order: this module imports no other module of the
 control plane, so the schema and its migration constraint (the NOTE below
@@ -391,6 +392,25 @@ def _init_db() -> None:
                 -- the server half is what stops one server's policy deciding for
                 -- the other's identically named tool.
                 UNIQUE(server, tool)
+            )""")
+        # PINNED ALLOWS: an `ask` answered in advance, for the calls whose arguments
+        # carry these exact values (DESIGN.md, "A pinned allow is an ask answered in
+        # advance"). A new table, so it needs no `_STEPS` entry, as `tool_rules` did
+        # not.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS tool_pins (
+                id          INTEGER PRIMARY KEY,
+                server      TEXT NOT NULL,
+                tool        TEXT NOT NULL,
+                -- The pinned fields and their values, as ONE canonical JSON object
+                -- (policy._canonical_pins), so that equal pins are equal strings and
+                -- the UNIQUE below means what it says.
+                pins_json   TEXT NOT NULL,
+                -- The card this was pinned from, as on `leases`.
+                approval_id TEXT NOT NULL,
+                created_at  REAL NOT NULL,
+                granted_by  TEXT NOT NULL,   -- provenance of the resolver (provenance._actor)
+                UNIQUE(server, tool, pins_json)
             )""")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS audit (

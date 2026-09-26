@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import tempfile
 import threading
@@ -252,6 +253,149 @@ class DecideToolTests(unittest.TestCase):
         # consistent no-op rather than a silent downgrade to deny.
         _set_tool_rules([("mcp-github", "get_me", "allow")])
         self.assertEqual(cp.policy._decide_tool("mcp-github ", " get_me")[0], "allow")
+
+
+def _set_pins(pins):
+    """Replace the tool_pins table with (server, tool, pins) tuples. A dict is stored
+    in its canonical form, as the writer will store it; a string is stored verbatim,
+    as a hand-edited row would be."""
+    with cp.store._connect() as conn:
+        conn.execute("DELETE FROM tool_pins")
+        conn.executemany(
+            "INSERT INTO tool_pins(server, tool, pins_json, approval_id, created_at, "
+            "granted_by) VALUES (?,?,?, 'test', 0, 'test')",
+            [(server, tool, p if isinstance(p, str) else cp.policy._canonical_pins(p))
+             for server, tool, p in pins])
+        conn.commit()
+
+
+#: A `create_pull_request` call on the pinned repository.
+_PR = {"owner": "larsvikb", "repo": "dockade", "title": "t", "body": "b",
+       "head": "topic", "base": "main"}
+
+
+class PinnedAllowDecisionTests(unittest.TestCase):
+    """``_decide_tool`` with a pin: an `ask` answered in advance, and nothing more.
+
+    Every test here is one direction a pin must NOT reach. A pin that answered a call a
+    card could not have released would be the ladder granting past the operator."""
+
+    def setUp(self):
+        cp.store._init_db()
+        _set_tool_rules([("mcp-github", "create_pull_request", "ask")])
+        _set_pins([("mcp-github", "create_pull_request",
+                    {"owner": "larsvikb", "repo": "dockade"})])
+
+    def _decide(self, args, server="mcp-github", tool="create_pull_request"):
+        return cp.policy._decide_tool(server, tool, args)
+
+    def test_a_call_carrying_the_pinned_values_is_allowed_and_names_the_pin(self):
+        decision, reason = self._decide(_PR)
+        self.assertEqual(decision, "allow")
+        self.assertIn("by pin", reason)
+        self.assertIn("pinned: owner, repo", reason)
+
+    def test_the_unpinned_fields_are_free(self):
+        self.assertEqual(self._decide({**_PR, "title": "another", "draft": True,
+                                       "reviewers": ["someone"]})[0], "allow")
+
+    def test_a_call_that_misses_the_pin_asks_rather_than_being_denied(self):
+        # `Dockade` is the case that matters: GitHub would read it as the pinned
+        # repository, and it still gets a card, because a pin compares exactly.
+        missing = {k: v for k, v in _PR.items() if k != "repo"}
+        for args in ({**_PR, "repo": "hemel"}, {**_PR, "repo": "Dockade"},
+                     {**_PR, "repo": "dockade "}, missing):
+            with self.subTest(args=args):
+                self.assertEqual(self._decide(args)[0], "ask")
+
+    def test_no_pin_is_read_without_arguments(self):
+        # What the claim passes: its call was answered by a human, not by a pin.
+        self.assertEqual(
+            cp.policy._decide_tool("mcp-github", "create_pull_request")[0], "ask")
+        for args in (None, [], "dockade", 1):
+            self.assertEqual(self._decide(args)[0], "ask", args)
+
+    def test_a_pin_cannot_soften_a_deny(self):
+        _set_tool_rules([("mcp-github", "create_pull_request", "deny")])
+        self.assertEqual(self._decide(_PR)[0], "deny")
+
+    def test_a_pin_cannot_reach_an_unruled_tool(self):
+        _set_tool_rules([], servers=["mcp-github"])
+        self.assertEqual(self._decide(_PR)[0], "deny")
+
+    def test_a_pin_decides_nothing_on_a_disabled_server(self):
+        with cp.store._connect() as conn:
+            conn.execute("UPDATE mcp_servers SET enabled=0 WHERE server='mcp-github'")
+            conn.commit()
+        self.assertEqual(self._decide(_PR)[0], "deny")
+
+    def test_under_an_allow_rule_the_rule_answers(self):
+        _set_tool_rules([("mcp-github", "create_pull_request", "allow")])
+        decision, reason = self._decide(_PR)
+        self.assertEqual(decision, "allow")
+        self.assertIn("by rule", reason)
+
+    def test_a_pin_answers_only_its_own_server_and_tool(self):
+        _set_tool_rules([("mcp-github", "create_pull_request", "ask"),
+                         ("mcp-github", "update_pull_request", "ask"),
+                         ("mcp-other", "create_pull_request", "ask")])
+        self.assertEqual(self._decide(_PR, tool="update_pull_request")[0], "ask")
+        self.assertEqual(self._decide(_PR, server="mcp-other")[0], "ask")
+
+    def test_several_pins_on_one_tool_are_alternatives(self):
+        _set_pins([("mcp-github", "create_pull_request",
+                    {"owner": "larsvikb", "repo": "dockade"}),
+                   ("mcp-github", "create_pull_request",
+                    {"owner": "larsvikb", "repo": "hemel"})])
+        self.assertEqual(self._decide(_PR)[0], "allow")
+        self.assertEqual(self._decide({**_PR, "repo": "hemel"})[0], "allow")
+        self.assertEqual(self._decide({**_PR, "repo": "other"})[0], "ask")
+
+    def test_values_compare_as_the_server_receives_them_not_by_python_equality(self):
+        # `True == 1` and `147 == 147.0` in Python; a server gets three values.
+        _set_tool_rules([("mcp-github", "add_issue_comment", "ask")])
+        _set_pins([("mcp-github", "add_issue_comment",
+                    {"issue_number": 147, "locked": True})])
+        pinned = {"issue_number": 147, "locked": True, "body": "b"}
+        self.assertEqual(self._decide(pinned, tool="add_issue_comment")[0], "allow")
+        for args in ({**pinned, "issue_number": 147.0},
+                     {**pinned, "issue_number": "147"},
+                     {**pinned, "locked": 1}):
+            with self.subTest(args=args):
+                self.assertEqual(self._decide(args, tool="add_issue_comment")[0],
+                                 "ask")
+
+    def test_keys_differing_only_in_case_get_a_card(self):
+        # Which of the two a case-insensitive decoder reads as `repo` is not this
+        # code's to know, so neither is taken as the pinned one.
+        self.assertEqual(self._decide({**_PR, "Repo": "secrets"})[0], "ask")
+
+    def test_a_key_outside_the_identifier_shape_gets_a_card(self):
+        # U+017F folds to `s` in Go's encoding/json; U+FF52 is a fullwidth `r`; the
+        # newline is what `$` would have let through where `fullmatch` does not.
+        for key in ("i\u017f\u017fue_number", "\uff52epo", "repo\n",
+                    "x-mcp-header", "a b", ""):
+            with self.subTest(key=key):
+                self.assertEqual(self._decide({**_PR, key: "v"})[0], "ask")
+
+    def test_a_list_or_object_in_a_pinned_field_never_matches(self):
+        for value in (["dockade"], {"name": "dockade"}):
+            with self.subTest(value=value):
+                self.assertEqual(self._decide({**_PR, "repo": value})[0], "ask")
+
+    def test_a_row_that_holds_no_pin_set_matches_nothing(self):
+        # The empty set above all: it would answer every call to the tool.
+        for raw in ("{}", "not json", "[]", '"dockade"', '{"repo": null}',
+                    '{"repo": 1.5}', '{"repo": ["dockade"]}', '{"re po": "dockade"}',
+                    json.dumps({"repo": "d" * (cp.policy._PIN_VALUE_MAX + 1)})):
+            with self.subTest(raw=raw):
+                _set_pins([("mcp-github", "create_pull_request", raw)])
+                self.assertEqual(self._decide({**_PR, "repo": "dockade"})[0], "ask")
+
+    def test_equal_pin_sets_are_one_stored_string(self):
+        # What makes UNIQUE(server, tool, pins_json) mean what it says.
+        self.assertEqual(cp.policy._canonical_pins({"repo": "dockade", "owner": "l"}),
+                         cp.policy._canonical_pins({"owner": "l", "repo": "dockade"}))
 
 
 class LeaseDecisionTests(unittest.TestCase):

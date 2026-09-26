@@ -684,7 +684,8 @@ the rest. `ask` not decaying (see "`ask` does not decay" in `DESIGN.md`) is a
 consequence of that same fact, and it makes pinning an argument a predicate over a
 payload rather than a string in a column. The write paths also run opposite ways: egress
 policy accumulates from approvals, with editing retrofitted onto it; tool policy is
-configuration first, with growth-by-use the thing to prevent.
+configuration first, and the one thing that grows by use, a pin, grows only beneath an
+`ask` an operator configured.
 
 Cost breaks the same direction, which settles the choice rather than makes the case
 for it. A new table is a `CREATE TABLE IF NOT EXISTS` over no existing rows; a shared
@@ -694,7 +695,18 @@ add a uniqueness constraint by `ALTER`, so that is the drop-copy-rename rebuild
 surfaces share is a *pattern* and not code — the backend derives a bounded candidate
 set, the operator picks from it, the chosen value is shown verbatim — and the ladders
 themselves have no common implementation: one is host-breadth, the other
-argument-shaped and server-specific.
+argument-shaped.
+
+**Pins get a table of their own, and a rule with pins cannot be revoked.** A rule is
+one row per (server, tool); a pin set is a predicate over the payload, and a tool can
+have several, so `tool_pins` sits beside `tool_rules` rather than in it.
+`UNIQUE(server, tool, pins_json)` means what it says because a pin set is stored in
+one canonical form (`policy._canonical_pins`). Revoking a rule that still has pins is
+refused rather than cascading, as revoking a server that still has rules is. The
+reason is specific: a pin outliving its rule decides nothing until a rule for the
+same tool returns as `ask`, and then the pin returns with it, with nobody having
+asked for it. Editing the rule's action keeps its pins, and `/api/mcp/pins` reports
+them as not deciding while the rule is `allow` or `deny`.
 
 **`approvals` splits the same way; the operator's queue does not.** The approvals
 table is egress-shaped exactly as `rules` is — `host`, `port`, `proto`, `client`,

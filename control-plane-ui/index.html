@@ -224,6 +224,9 @@
   .confirm .cwarn.bad { color: var(--deny); }
   .confirm .confirmgo:disabled { opacity: .5; cursor: not-allowed; }
   .confirm .cactions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+  /* One field per line, so a value is read beside the box that pins it. */
+  .confirm .cpins { display: flex; flex-direction: column; gap: 4px; margin-top: 8px;
+    font-size: 12px; }
   button { font: inherit; border: 1px solid var(--line); background: #202632;
     color: var(--fg); border-radius: 6px; padding: 6px 10px; cursor: pointer; }
   button:hover { border-color: var(--accent); }

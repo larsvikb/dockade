@@ -375,10 +375,16 @@ def revoke_mcp_rule(rule_id: int, request: Request) -> JSONResponse:
         if row is None:
             return JSONResponse({"ok": False, "detail": "unknown rule"},
                                 status_code=404)
-        pins = conn.execute(
-            "SELECT COUNT(*) FROM tool_pins WHERE server=? AND tool=?",
-            (row["server"], row["tool"])).fetchone()[0]
-        if pins:
+        # The pin check is IN the delete, so a pin written from a card between a count
+        # and the delete cannot be left behind (``holds._resolve_tool_ask_pinned``).
+        deleted = conn.execute(
+            "DELETE FROM tool_rules WHERE id=? AND NOT EXISTS "
+            "(SELECT 1 FROM tool_pins WHERE server=? AND tool=?)",
+            (rule_id, row["server"], row["tool"])).rowcount
+        if not deleted:
+            pins = conn.execute(
+                "SELECT COUNT(*) FROM tool_pins WHERE server=? AND tool=?",
+                (row["server"], row["tool"])).fetchone()[0]
             return JSONResponse(
                 {"ok": False,
                  "detail": f"{row['tool']} on {row['server']} still has {pins} "
@@ -386,7 +392,6 @@ def revoke_mcp_rule(rule_id: int, request: Request) -> JSONResponse:
                            f"effect. Revoke them first, or edit the rule instead.",
                  "tool_pins": pins},
                 status_code=409)
-        conn.execute("DELETE FROM tool_rules WHERE id=?", (rule_id,))
         conn.commit()
 
     store._audit("revoke", stage="tool-policy", server=row["server"], tool=row["tool"],

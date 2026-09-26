@@ -128,7 +128,7 @@ const owner = {
   "status.js": ["pollStatus", "auditStatus", "rulesStatus", "toolRulesStatus",
                 "toolPinsStatus", "leasesStatus"],
   "holds.js": ["renderableHolds", "diffPending", "shouldSweep",
-               "toolRemaining", "toolOutcomeMessage",
+               "toolRemaining", "toolOutcomeMessage", "pinPreview",
                "holdRemaining", "countdownState", "departure", "persistPreview",
                "requestsLabel", "cardSubject", "pendingAnnouncement",
                "approvalNotices", "shouldNotify", "notifyButton"],
@@ -353,6 +353,25 @@ console.log(JSON.stringify({
     allowed: m.toolOutcomeMessage({ outcome: "allow" }),
     denied: m.toolOutcomeMessage({ outcome: "deny" }),
     nothing: m.toolOutcomeMessage(undefined),
+    pinned: m.toolOutcomeMessage({ outcome: "allow",
+                                   pin: { id: 3, fields: ["owner", "repo"],
+                                          created: true } }),
+    already_pinned: m.toolOutcomeMessage({ outcome: "allow",
+                                           pin: { id: 3, fields: ["repo"],
+                                                  created: false } }),
+    // The card's pin panel. `repo` carries a U+0430, which the panel must spell out.
+    pin_preview: (() => {
+      const options = { fields: [{ field: "owner", value: '"larsvikb"' },
+                                 { field: "repo", value: '"d\u0430"' }],
+                        unpinnable: [{ field: "reviewers", why: "a list" }],
+                        refused: null };
+      const bare = { ...options, unpinnable: [] };
+      const p = (o, chosen) => m.pinPreview(o, chosen, "create_pull_request",
+                                            "mcp-github");
+      return { none: p(options, []), both: p(options, ["owner", "repo"]),
+               owner: p(options, ["owner"]), every: p(bare, ["owner", "repo"]),
+               unoffered: p(options, ["reviewers", "nope"]) };
+    })(),
     // The announcement is the only place a screen-reader user learns WHICH decision
     // arrived, so a tool ask read out as a host describes the wrong sort of thing.
     say_tool: m.pendingAnnouncement(
@@ -1436,6 +1455,10 @@ class PageScriptTests(unittest.TestCase):
         tool = self.probe["tool"]
         self.assertIn("returns", tool["allowed"]["text"])
         self.assertEqual(tool["allowed"]["tone"], "ok")
+        # What the backend PINNED, and whether it was new.
+        self.assertIn("pinned on owner, repo (pin 3)", tool["pinned"]["text"])
+        self.assertIn("already pinned on repo", tool["already_pinned"]["text"])
+        self.assertNotIn("pinned", tool["allowed"]["text"])
         self.assertIn("not run", tool["denied"]["text"])
         self.assertEqual(tool["nothing"]["tone"], "bad")   # unknown fails to denied
 
@@ -3745,17 +3768,18 @@ class PersistConflictSourceTests(unittest.TestCase):
         self.assertRegex(body, r"entry\.confirmBtn\.disabled \?\s*entry\.select")
 
     def test_a_conflict_409_does_not_mark_the_card_stale(self):
-        # Two different 409s reach this handler. "No longer pending" means the card is
-        # dead; a persist conflict means the approval is deliberately still pending so
-        # the operator can choose again. Treating the second as the first would retire
-        # a live card and strand the request until it default-denies.
-        conflict = re.search(r"r\.status === 409 && d\.conflict\)\s*\{(.*?)\n      \}",
-                             self.src, re.S)
+        # Different 409s reach this handler. "No longer pending" means the card is
+        # dead; a persist conflict, or a pin refused because the tool is no longer
+        # ruled `ask`, means the approval is deliberately still pending so the operator
+        # can choose again. Treating those as the first would retire a live card and
+        # strand the request until it default-denies.
+        head = "r.status === 409 && (d.conflict || d.pin_refused)"
+        conflict = re.search(re.escape(head) + r"\)\s*\{(.*?)\n      \}", self.src, re.S)
         self.assertIsNotNone(conflict, "the conflict 409 is not distinguished")
         self.assertIn("disableActions(entry, false)", conflict.group(1))
         self.assertNotIn("markStale", conflict.group(1))
         # And the narrower branch must come FIRST, or the general one swallows it.
-        self.assertLess(self.src.index("r.status === 409 && d.conflict"),
+        self.assertLess(self.src.index(head),
                         self.src.index("} else if (r.status === 409) {"))
 
     def test_the_card_distinguishes_a_written_rule_from_one_already_there(self):
@@ -4194,6 +4218,75 @@ class PinnedAllowTableSourceTests(unittest.TestCase):
         section = html.split('id="toolpincount"', 1)[1].split("</section>", 1)[0]
         self.assertNotIn("<form", section)
         self.assertNotIn("<input", section)
+
+
+class PinPanelTests(unittest.TestCase):
+    """What the card's "Allow + pin" panel says it is about to write."""
+
+    probe: dict
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.probe = _probe()
+
+    def test_nothing_ticked_writes_nothing(self):
+        none = self.probe["tool"]["pin_preview"]["none"]
+        self.assertFalse(none["ok"])
+        self.assertEqual(none["fields"], [])
+
+    def test_the_sentence_names_the_values_and_every_field_left_free(self):
+        owner = self.probe["tool"]["pin_preview"]["owner"]
+        self.assertTrue(owner["ok"])
+        self.assertIn('with owner = "larsvikb" runs without a card', owner["text"])
+        # `repo` is unticked and `reviewers` unpinnable: both are free, and so is
+        # anything the call did not set.
+        self.assertIn("free: repo, reviewers, and any this call did not set",
+                      owner["text"])
+        self.assertEqual(owner["label"], "Confirm — allow and pin owner")
+
+    def test_a_value_is_spelled_out_before_it_becomes_policy(self):
+        both = self.probe["tool"]["pin_preview"]["both"]
+        self.assertIn('repo = "d\\u0430"', both["text"])
+        self.assertEqual(both["fields"], ["owner", "repo"])
+
+    def test_pinning_every_field_still_says_what_is_free(self):
+        every = self.probe["tool"]["pin_preview"]["every"]
+        self.assertIn("one it did not set is still free", every["text"])
+
+    def test_only_offered_fields_can_be_pinned(self):
+        unoffered = self.probe["tool"]["pin_preview"]["unoffered"]
+        self.assertFalse(unoffered["ok"])
+        self.assertEqual(unoffered["fields"], [])
+
+
+class PinPanelSourceTests(unittest.TestCase):
+    """The panel's DOM half, asserted against the source like the persist panel."""
+
+    def setUp(self):
+        src = APP_JS.read_text()
+        self.src = src
+        self.panel = re.search(r"function buildPinConfirm\(entry, a, options\) \{(.*?)\n  \}",
+                               src, re.S).group(1)
+
+    def test_values_are_text_and_spelled_out(self):
+        self.assertNotIn("innerHTML", self.panel)
+        self.assertIn("code.textContent = pinText(f.value).text", self.panel)
+
+    def test_nothing_starts_ticked(self):
+        # Pinning every field answers only this call and pinning none is not a pin, so
+        # there is no safe default to pre-select.
+        self.assertNotIn("checked = true", self.panel)
+
+    def test_confirm_sends_only_what_the_preview_confirmed(self):
+        self.assertIn('resolve(a, "allow_pinned", null, p.fields)', self.panel)
+        self.assertIn("if (p.ok)", self.panel)
+
+    def test_the_panel_sits_below_the_buttons(self):
+        body = re.search(r"function buildToolCard\(a\) \{(.*?)\n  \}", self.src,
+                         re.S).group(1)
+        parts = [p.strip() for p in
+                 re.search(r"el\.append\((.*?)\);", body, re.S).group(1).split(",")]
+        self.assertEqual(parts.index("entry.confirm"), parts.index("actions") + 1)
 
 
 class PayloadHazardTests(unittest.TestCase):

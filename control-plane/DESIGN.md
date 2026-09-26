@@ -709,6 +709,18 @@ same tool returns as `ask`, and then the pin returns with it, with nobody having
 asked for it. Editing the rule's action keeps its pins, and `/api/mcp/pins` reports
 them as not deciding while the rule is `allow` or `deny`.
 
+**A card pins only under `ask`, and the two writers cannot interleave.** A card
+outlives the moment it was raised, so the rule may have been moved or revoked by the
+time the operator pins from it, and a pin written then would be the leftover the
+refusal above exists to prevent. `allow_pinned` therefore reads the rule and writes
+the approval and the pin in one `BEGIN IMMEDIATE` transaction, and refuses the pin
+(leaving the card decidable) unless the rule is still `ask`
+(`holds._resolve_tool_ask_pinned`). The revoke puts its pin check inside its
+`DELETE` (`api_mcp.revoke_mcp_rule`). Each side's check is atomic with its write, and
+SQLite serializes the two writes, so whichever lands second sees the other. Neither
+guard alone is enough, because a check separate from its write leaves room for the
+other side to land in between.
+
 **`approvals` splits the same way; the operator's queue does not.** The approvals
 table is egress-shaped exactly as `rules` is — `host`, `port`, `proto`, `client`,
 `client_class`, `method`, `url`, against a tool ask's server, tool and arguments — so

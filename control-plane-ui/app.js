@@ -32,7 +32,7 @@ import {
 import {
   renderableHolds, diffPending, shouldSweep, DWELL_MS,
   toolRemaining, toolOutcomeMessage, holdRemaining, countdownState, departure,
-  COUNTDOWN_URGENT_S, persistPreview, requestsLabel,
+  COUNTDOWN_URGENT_S, persistPreview, pinPreview, requestsLabel,
   pendingAnnouncement, approvalNotices, shouldNotify, notifyButton,
 } from "./holds.js";
 import { payloadDisclosure, payloadHazards, payloadTokens, renderPayload }
@@ -299,16 +299,18 @@ function start() {
   // escaping to be safe, so the question of whether esc() covers every context
   // does not arise for this list at all. The persist patterns are derived from that
   // same host by the backend, so they get the same treatment.
-  //: A tool ask's two answers. Deliberately not ACTIONS above: the backend keeps
+  //: A tool ask's answers. Deliberately not ACTIONS above: the backend keeps
   //: per-surface action sets and refuses the egress vocabulary here, so a shared list
-  //: would render buttons that 400. There is no `+ persist` counterpart because the
-  //: argument-shaped ladder that would derive one does not exist — and "allow this
-  //: tool forever" is not a rung anyone should reach by clicking twice.
-  const TOOL_CARD_ACTIONS = [["allow", "Allow", "allow"], ["deny", "Deny", "deny"]];
+  //: would render buttons that 400. `allow_pinned` is the one that writes standing
+  //: policy, so it opens a confirm panel. "Allow this tool forever" is not here: it is
+  //: promoting the rule in the MCP tab, not a rung anyone should reach by clicking twice.
+  const TOOL_CARD_ACTIONS = [["allow", "Allow", "allow"],
+                             ["allow_pinned", "Allow + pin…", "allow"],
+                             ["deny", "Deny", "deny"]];
 
-  // A tool ask, which shares the card's shell and almost none of its body. No persist
-  // confirm panel, no duplicate badge (nothing joins a card by waiting on it), and a
-  // payload where an egress card has a URL.
+  // A tool ask, which shares the card's shell and almost none of its body. A pin
+  // panel where an egress card has its persist panel, no duplicate badge (nothing
+  // joins a card by waiting on it), and a payload where an egress card has a URL.
   //
   // Built with createElement/textContent throughout, and here that matters more than
   // it does for a host: the arguments are AGENT-AUTHORED and may contain anything a
@@ -398,16 +400,110 @@ function start() {
       window: Number(a.deadline) - Number(a.ts),
     };
 
+    // No `pin_options` means a backend that predates pins, and nothing is offered.
+    const pinOptions = a.pin_options || { fields: [], unpinnable: [],
+                                          refused: "this control plane offers no pins" };
     for (const [action, label, kind] of TOOL_CARD_ACTIONS) {
       const b = document.createElement("button");
       b.className = kind;
       b.textContent = label;
-      b.addEventListener("click", () => resolve(a, action));
+      if (action === "allow_pinned" && pinOptions.refused) {
+        // Said before the click, as an unclassified egress card says it cannot persist.
+        b.disabled = true;
+        b.title = `Nothing to pin: ${pinOptions.refused}.`;
+        actions.append(b);
+        continue;
+      }
+      b.addEventListener("click", () => action === "allow_pinned"
+        ? askPin(a) : resolve(a, action));
       actions.append(b);
     }
 
-    el.append(title, meta, details, cd, actions, msg);
+    buildPinConfirm(entry, a, pinOptions);
+    el.append(title, meta, details, cd, actions, entry.confirm, msg);
     return entry;
+  }
+
+  // ── the confirm step for "Allow + pin" ────────────────────────────────────
+  // The persist panel's shape, for the persist panel's reason: this click writes
+  // standing policy. Below the action row, which is disabled while it is open, and
+  // nothing is ticked to begin with — there is no "narrowest" default, because pinning
+  // every field answers only this call and pinning none is not a pin.
+  function buildPinConfirm(entry, a, options) {
+    const box = document.createElement("div");
+    box.className = "confirm";
+    box.hidden = true;
+
+    const what = document.createElement("div");
+    what.className = "cwhat";
+
+    const choices = document.createElement("div");
+    choices.className = "cpins";
+    const boxes = [];
+    for (const f of options.fields) {
+      const label = document.createElement("label");
+      const tick = document.createElement("input");
+      tick.type = "checkbox";
+      tick.value = f.field;
+      tick.addEventListener("change", () => renderPinPreview(entry, a));
+      const code = document.createElement("code");
+      // The value as the backend will store it, every non-ASCII character spelled out.
+      code.textContent = pinText(f.value).text;
+      label.append(tick, document.createTextNode(` ${f.field} = `), code);
+      choices.append(label);
+      boxes.push(tick);
+    }
+    for (const u of options.unpinnable) {
+      const line = document.createElement("div");
+      line.className = "note";
+      line.textContent = `${u.field} — not pinnable: ${u.why}`;
+      choices.append(line);
+    }
+
+    const cactions = document.createElement("div");
+    cactions.className = "cactions";
+    const go = document.createElement("button");
+    go.className = "confirmgo allow";
+    const cancel = document.createElement("button");
+    cancel.textContent = "Cancel";
+    cancel.addEventListener("click", () => cancelConfirm(entry));
+    go.addEventListener("click", () => {
+      const p = pinPreview(options, entry.pinned(), a.tool, a.server);
+      if (p.ok) resolve(a, "allow_pinned", null, p.fields);
+    });
+    cactions.append(go, cancel);
+
+    box.addEventListener("keydown", e => {
+      if (e.key === "Escape") { e.preventDefault(); cancelConfirm(entry); }
+    });
+
+    box.append(what, choices, cactions);
+    Object.assign(entry, {
+      confirm: box, cwhat: what, confirmBtn: go, pinBoxes: boxes, pinOptions: options,
+      pinned: () => boxes.filter(t => t.checked).map(t => t.value),
+    });
+  }
+
+  function renderPinPreview(entry, a) {
+    const p = pinPreview(entry.pinOptions, entry.pinned(), a.tool, a.server);
+    entry.cwhat.textContent = p.text;
+    entry.confirmBtn.disabled = !p.ok;
+    entry.confirmBtn.textContent = p.label;
+  }
+
+  function askPin(a) {
+    const entry = cards.get(a.id);
+    // No boxes means nothing to pin. The button is disabled for that, but an error
+    // path re-enables the whole action row (`disableActions`).
+    if (!entry || entry.state !== "pending" || !entry.pinBoxes.length) return;
+    entry.state = "confirming";
+    entry.el.classList.add("confirming");
+    disableActions(entry, true);
+    renderPinPreview(entry, a);
+    entry.confirm.hidden = false;
+    // The first box, not Confirm: Confirm starts disabled, and focusing a disabled
+    // button would drop focus out of the panel that Escape is bound on.
+    entry.pinBoxes[0].focus();
   }
 
   function buildCard(a) {
@@ -594,13 +690,13 @@ function start() {
     go.className = "confirmgo";
     const cancel = document.createElement("button");
     cancel.textContent = "Cancel";
-    cancel.addEventListener("click", () => cancelPersist(entry));
+    cancel.addEventListener("click", () => cancelConfirm(entry));
     go.addEventListener("click", () => resolve(a, entry.action, select.value));
     cactions.append(go, cancel);
 
     // Escape backs out, as a dialog-shaped thing should.
     box.addEventListener("keydown", e => {
-      if (e.key === "Escape") { e.preventDefault(); cancelPersist(entry); }
+      if (e.key === "Escape") { e.preventDefault(); cancelConfirm(entry); }
     });
 
     box.append(what, label, warn, cactions);
@@ -664,7 +760,7 @@ function start() {
     (entry.confirmBtn.disabled ? entry.select : entry.confirmBtn).focus();
   }
 
-  function cancelPersist(entry) {
+  function cancelConfirm(entry) {
     if (entry.state !== "confirming") return;
     entry.state = "pending";
     entry.action = null;
@@ -701,16 +797,15 @@ function start() {
     setMessage(entry, d.text, "bad");
   }
 
-  // `pattern` is sent only for the `*_persist` actions, and only ever a value the
-  // backend itself offered on this approval (it re-derives and re-validates the set,
-  // so the choice is bounded there too, not merely here).
-  async function resolve(a, action, pattern) {
+  // `pattern` is sent only for the `*_persist` actions, and `pins` only for
+  // `allow_pinned`, and each is only ever what the backend itself offered on this
+  // approval (it re-derives and re-validates the set, so the choice is bounded there
+  // too, not merely here).
+  async function resolve(a, action, pattern, pins) {
     const entry = cards.get(a.id);
     if (!entry || (entry.state !== "pending" && entry.state !== "confirming")) return;
     entry.state = "resolving";
-    // A tool card has no confirm panel to close: nothing it can do writes standing
-    // policy, so there is no irreversible step to put a step in front of.
-    if (entry.confirm) entry.confirm.hidden = true;
+    entry.confirm.hidden = true;
     entry.el.classList.remove("confirming");
     entry.el.classList.add("busy");
     disableActions(entry, true);
@@ -718,7 +813,8 @@ function start() {
     try {
       const r = await fetch(`/approvals/${encodeURIComponent(a.id)}/resolve`, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(pattern ? { action, pattern } : { action }),
+        body: JSON.stringify({ action, ...(pattern ? { pattern } : {}),
+                               ...(pins ? { pins } : {}) }),
       });
       const d = await r.json().catch(() => ({}));
       if (r.ok) {
@@ -744,6 +840,8 @@ function start() {
           const m = toolOutcomeMessage(d);
           setMessage(entry, m.text, m.tone);
           refreshAudit();
+          // A pin is standing policy in the MCP tab's table, so it appears there now.
+          if (d.pin) refreshToolPins();
           return;
         }
         // The pattern comes back from the BACKEND, so this reports what was stored
@@ -771,10 +869,11 @@ function start() {
                 ? ` · leased until ${fmtTime(d.lease_expires_at)}`
                 : " · this request only"),
           d.outcome === "allow" ? "ok" : "bad");
-      } else if (r.status === 409 && d.conflict) {
-        // A persist that would contradict an existing rule. NOT a stale card: the
-        // approval is deliberately left pending so the operator can choose again, so
-        // the buttons come back — the same treatment as a rejected pattern.
+      } else if (r.status === 409 && (d.conflict || d.pin_refused)) {
+        // A persist that would contradict an existing rule, or a pin whose tool is no
+        // longer ruled `ask`. NOT a stale card: the approval is deliberately left
+        // pending so the operator can choose again, so the buttons come back — the
+        // same treatment as a rejected pattern.
         entry.state = "pending";
         entry.el.classList.remove("busy");
         disableActions(entry, false);

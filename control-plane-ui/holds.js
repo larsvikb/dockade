@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 /* The pending queue's decisions: which cards a payload yields, what changed between
  * two pushes, when a departed card may be swept, how a hold's countdown reads, what a
- * persist click is about to write, and how an arrival is announced. Everything here
+ * persist or pin click is about to write, and how an arrival is announced. Everything here
  * decides whether a hold reaches a human and what they are told; the DOM work that
  * draws the answer is in app.js.
  *
  * No DOM at import, so the unit tests import this file under node
  * (tests/test_control_plane_ui_js.py).
  */
+import { escapePayload } from "./payload.js";
 
 // What changed between the pending list on screen and the one just pushed, keyed by
 // approval id so a surviving card is kept and updated IN PLACE.
@@ -52,9 +53,47 @@ export function toolRemaining(deadline, nowMs) {
 // message reading like a completed action would misreport the one property that keeps
 // an approved side effect from happening with nobody to receive it.
 export function toolOutcomeMessage(d) {
-  return d && d.outcome === "allow"
-    ? { text: "✓ allowed · runs when the agent returns for it", tone: "ok" }
-    : { text: "✕ denied · the call will not run", tone: "bad" };
+  if (!d || d.outcome !== "allow") {
+    return { text: "✕ denied · the call will not run", tone: "bad" };
+  }
+  // The fields come back from the BACKEND, so this reports what was pinned rather
+  // than what was ticked, and says so when nothing new was written.
+  const pin = d.pin;
+  const pinned = !pin ? ""
+    : ` · ${pin.created ? "pinned" : "already pinned"} on `
+      + `${(pin.fields || []).join(", ")} (pin ${pin.id})`;
+  return { text: `✓ allowed${pinned} · runs when the agent returns for it`,
+           tone: "ok" };
+}
+
+// What "Allow + pin" is about to write, for the confirm panel: which calls it will
+// answer from now on, and which arguments stay free. `options` is the card's
+// `pin_options` (policy._pin_candidates), so every field and value here is one the
+// backend offered for this call; `chosen` is the field names ticked.
+//
+// Values are spelled with every non-ASCII character escaped, as the pins table shows
+// them (`pinText` in mcp.js): a pin value is an identifier, and this is the last look
+// at it before it becomes standing policy.
+export function pinPreview(options, chosen, tool, server) {
+  const offered = (options && options.fields) || [];
+  const ticked = new Set(chosen || []);
+  const picked = offered.filter(f => ticked.has(f.field));
+  if (!picked.length) {
+    return { ok: false, fields: [],
+             text: "Tick the fields a later call must match exactly.",
+             label: "Pick a field to pin" };
+  }
+  const free = [...offered.filter(f => !ticked.has(f.field)).map(f => f.field),
+                ...((options && options.unpinnable) || []).map(u => u.field)];
+  const conditions = picked.map(f => `${f.field} = ${escapePayload(f.value)}`)
+    .join(" and ");
+  const rest = free.length
+    ? `Every other argument is free: ${free.join(", ")}, and any this call did not set.`
+    : "Every argument this call carries is pinned; one it did not set is still free.";
+  return { ok: true, fields: picked.map(f => f.field),
+           text: `Allows this call, and from now on every ${tool} call on ${server} `
+               + `with ${conditions} runs without a card. ${rest}`,
+           label: `Confirm — allow and pin ${picked.map(f => f.field).join(", ")}` };
 }
 
 export function diffPending(shownIds, list) {

@@ -12,6 +12,11 @@ with a standing rule: ``EGRESS_ACTIONS``. A persisted rule is how trust accrues
 (DESIGN.md, on progressive trust), and WHICH rule is the operator's choice from
 candidates derived from the held host (``policy._persist_candidates``), never a
 string the agent's request can supply.
+
+A tool card is answered for this call, for this call and every later one carrying the
+pinned values, or refused: ``TOOL_ACTIONS``. Which fields a pin holds is the
+operator's choice from ``policy._pin_candidates``, and the values are the stored
+call's.
 """
 from __future__ import annotations
 
@@ -36,6 +41,10 @@ class ResolveRequest(BaseModel):
     # ``policy._persist_candidates``, the narrowest (the exact host) if omitted.
     # Ignored by every other egress action; refused on a tool ask.
     pattern: str | None = None
+    # Which fields an `allow_pinned` pins: NAMES only, each one of the ask's
+    # ``policy._pin_candidates``. The values are copied from the stored ask, never
+    # taken from here. Refused on a tool ask's other actions; an egress card has none.
+    pins: list[str] | None = None
 
 
 @router.get("/approvals")
@@ -54,12 +63,13 @@ def approvals() -> dict:
 #:   - No breadth choice on `allow_lease`. A permanent rule needs a decision about how
 #:     wide it is; a lease answers that by expiring, so it is always the exact host.
 #:
-#: The tool set has no `*_persist`: its analogue for a payload (this call, this tool
-#: with these arguments, this tool always) is not built, and `allow_persist` would have
-#: to mean "allow this tool forever", reached by clicking the same button twice.
+#: The tool set is `allow` (this call), `allow_pinned` (this call, and every later one
+#: carrying the pinned values) and `deny`. "This tool always" is promoting the rule,
+#: in the MCP tab, and is not a rung reached from a card. There is no pinned deny
+#: (DESIGN.md, "A pin only allows").
 EGRESS_ACTIONS = ("allow_once", "allow_lease", "allow_persist",
                   "deny_once", "deny_persist")
-TOOL_ACTIONS = ("allow", "deny")
+TOOL_ACTIONS = ("allow", "allow_pinned", "deny")
 
 
 @router.post("/approvals/{approval_id}/resolve")
@@ -260,11 +270,20 @@ def _resolve_tool_ask_request(approval_id: str, req: ResolveRequest,
         # persists, so a pattern means a caller that thinks it is writing policy.
         return JSONResponse(
             {"ok": False,
-             "detail": "a tool ask persists nothing, so it takes no pattern"},
+             "detail": "a tool ask takes no pattern; a pin names fields, in `pins`"},
+            status_code=400)
+    fields = getattr(req, "pins", None)
+    if fields and action != "allow_pinned":
+        # Refused rather than ignored, for the reason a pattern is: pins sent with a
+        # plain allow mean a caller that believes it is writing policy.
+        return JSONResponse(
+            {"ok": False, "detail": f"only allow_pinned takes pins, not {action!r}"},
             status_code=400)
 
     actor = provenance._actor(request)
     ask = holds._get_tool_ask(approval_id)
+    if action == "allow_pinned":
+        return _allow_pinned(approval_id, ask, fields, actor)
     status = holds._resolve_tool_ask(
         approval_id, "allowed" if action == "allow" else "denied", actor)
     if status is None:
@@ -289,6 +308,70 @@ def _resolve_tool_ask_request(approval_id: str, req: ResolveRequest,
     return JSONResponse({"ok": True, "kind": "tool", "outcome": action,
                          "status": status, "server": ask["server"],
                          "tool": ask["tool"]})
+
+
+def _allow_pinned(approval_id: str, ask: dict | None, fields: object,
+                  actor: str) -> JSONResponse:
+    """Allow this call, and pin the chosen fields so that later calls carrying the same
+    values run without a card.
+
+    Only the field NAMES come from the request. Each must be one the ask offers
+    (``policy._pin_candidates``), and every value is copied from the ask as stored,
+    the move ``resolve`` makes for a persist pattern. A refusal writes nothing, so the
+    card stays pending and the operator can choose again."""
+    if ask is None:
+        return JSONResponse({"ok": False, "detail": "not pending (unknown)",
+                             "status": None}, status_code=409)
+    candidates = policy._pin_candidates(ask["args_json"])
+    if candidates["refused"]:
+        return JSONResponse({"ok": False, "detail": candidates["refused"]},
+                            status_code=400)
+    offered = {c["field"] for c in candidates["fields"]}
+    chosen = fields if isinstance(fields, list) else []
+    if (not chosen or not all(isinstance(f, str) for f in chosen)
+            or len(set(chosen)) != len(chosen) or not set(chosen) <= offered):
+        return JSONResponse(
+            {"ok": False,
+             "detail": f"pins must name one or more of this ask's pinnable fields "
+                       f"({', '.join(sorted(offered))}), each once"},
+            status_code=400)
+    args = json.loads(ask["args_json"])
+    pins_json = policy._canonical_pins({field: args[field] for field in chosen})
+
+    answer = holds._resolve_tool_ask_pinned(approval_id, actor, pins_json)
+    if answer.refused:
+        # The rule moved while the card was pending. Not stale: the card can still be
+        # allowed without a pin, or denied.
+        return JSONResponse({"ok": False, "detail": answer.refused,
+                             "pin_refused": True}, status_code=409)
+    if answer.status is None:
+        current = holds._get_tool_ask(approval_id)
+        return JSONResponse(
+            {"ok": False,
+             "detail": f"not pending ({current['status'] if current else 'unknown'})",
+             "status": current["status"] if current else None}, status_code=409)
+
+    named = ", ".join(sorted(chosen))
+    where = dict(client=ask["client"], client_class=policy._client_class(ask["client"]),
+                 actor=actor, server=ask["server"], tool=ask["tool"],
+                 approval_id=approval_id)
+    store._audit("allow", stage="tool-ask", **where,
+                 reason=f"tool ask allowed and pinned on {named} (pin "
+                        f"{answer.pin_id}{'' if answer.created else ', already in place'}"
+                        f"); {ask['tool']} on {ask['server']} — the call runs only if "
+                        f"the agent returns for it")
+    if answer.created:
+        # Standing policy, recorded as policy is: the same word a rule's creation
+        # gets, and the pin's revoke is its counterpart.
+        store._audit("create", stage="tool-policy", **where,
+                     reason=f"pin {answer.pin_id} created from this ask; {ask['tool']} "
+                            f"on {ask['server']} pinned on {named} runs without a card "
+                            f"while its rule asks")
+    return JSONResponse({"ok": True, "kind": "tool", "outcome": "allow",
+                         "status": answer.status, "server": ask["server"],
+                         "tool": ask["tool"],
+                         "pin": {"id": answer.pin_id, "fields": sorted(chosen),
+                                 "created": answer.created}})
 
 
 @router.get("/approvals/stream")

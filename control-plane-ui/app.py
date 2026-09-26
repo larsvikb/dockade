@@ -86,11 +86,15 @@ UI_INDEX = os.environ.get("CONTROL_UI_INDEX", "/opt/control-plane-ui/index.html"
 # (tests/test_control_plane_ui_js.py).
 #
 # ES modules, one per surface, and this list is the whole of what the script route
-# hands out: a name is looked up here before it becomes a path, so the route cannot
-# be asked for a file nobody listed. A test holds the list equal to the files in the
-# directory and to what the modules import from each other.
+# hands out. A test holds it equal to the files in the directory and to what the
+# modules import from each other.
 UI_DIR = os.environ.get("CONTROL_UI_DIR", "/opt/control-plane-ui")
 UI_MODULES = frozenset({"app.js", "payload.js"})
+# The path behind each name, built here from the list and never from a request: the
+# name off the URL only picks an entry, so no string a caller sent reaches the
+# filesystem — which is also what lets a scanner see it, rather than having to trust
+# a membership check upstream of a join.
+_UI_MODULE_PATHS = {name: os.path.join(UI_DIR, name) for name in UI_MODULES}
 
 
 def _hostnames(env: str, default: str) -> frozenset[str]:
@@ -464,11 +468,10 @@ def script(name: str) -> Response:
 
     Which makes staleness these files' failure mode rather than a third party's, and
     `_REVALIDATE` above is the answer to it."""
-    filename = f"{name}.js"
-    if filename not in UI_MODULES:
+    path = _UI_MODULE_PATHS.get(f"{name}.js")
+    if path is None:
         return PlainTextResponse("not found\n", status_code=404)
-    return FileResponse(os.path.join(UI_DIR, filename), media_type="text/javascript",
-                        headers=_REVALIDATE)
+    return FileResponse(path, media_type="text/javascript", headers=_REVALIDATE)
 
 
 def _relay_allowed(method: str, path: str) -> bool:

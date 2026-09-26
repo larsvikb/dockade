@@ -662,12 +662,21 @@ class StaticRevalidationTests(unittest.TestCase):
                                  .headers["cache-control"], "no-cache")
 
     def test_a_module_nobody_listed_is_not_served(self):
-        # The name comes off the URL and is looked up in `UI_MODULES` BEFORE it becomes
-        # a path, so the route cannot be used to read anything else in the directory —
-        # `..` included, which the route pattern lets through as a name.
+        # The name off the URL only picks an entry in `UI_MODULES`, so the route
+        # cannot be used to read anything else in the directory — `..` included, which
+        # the route pattern lets through as a name.
         for name in ("evil", "..", "app.js", "requirements"):
             with self.subTest(name=name):
                 self.assertEqual(ui.script(name).status_code, 404)
+
+    def test_a_served_module_is_read_from_the_path_behind_its_name(self):
+        # The path is built from the list at import, never from the request: nothing
+        # a caller sent is joined into it, which is what makes the point above true
+        # by construction rather than by a check a later edit could move.
+        for name in sorted(ui.UI_MODULES):
+            with self.subTest(module=name):
+                self.assertEqual(ui.script(name.removesuffix(".js")).args[0],
+                                 f"{ui.UI_DIR}/{name}")
 
     def test_the_document_is_revalidated_too(self):
         # The markup carries the stylesheet and the element ids the script binds to,

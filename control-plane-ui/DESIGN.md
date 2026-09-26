@@ -165,8 +165,9 @@ work migrates to import time, the `import` throws and the file cannot quietly be
 untestable again.
 
 The page is ES modules, one file per surface, and `app.py` serves them by name from
-`UI_MODULES` — a list a human wrote, looked up before a name becomes a path, so the
-route hands out nothing else in the directory. The list has two other copies with no
+`UI_MODULES` — a list a human wrote, with the path behind each name built from it at
+import; the name off the URL only picks an entry, so the route hands out nothing else
+in the directory. The list has two other copies with no
 compiler between them, the Dockerfile's `COPY` lines and the modules' own imports, and
 a test holds each equal to it; a module left out of the image would 404 in the
 container with every unit test green, and stop the whole page at the entry's first

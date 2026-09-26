@@ -409,8 +409,9 @@ agents are running.
 row concerns, and `client_class` is derived from it alone, so a row no sandbox asked
 for — a rule written, a server registered, an inventory push — carries neither, and an
 egress rule's class goes in its reason. Whoever performed the act, when that is not
-the client, is `actor`: the operator behind a click, or the gateway behind a push. A
-row with both is a human answering a sandbox's request. Kept apart because a search
+the client, is `actor`: the operator behind a click, or the gateway behind a push, and
+only there, since a reason says what happened rather than who did it. A row with both
+is a human answering a sandbox's request. Kept apart because a search
 for one sandbox or one class must return what that population asked for, not the
 configuration written about it. `ActorColumnTests` holds every writer to this. On the
 page the two share one `who` cell, the actor on a labelled line of its own (`auditRow`

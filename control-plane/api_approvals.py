@@ -80,8 +80,8 @@ def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResp
     outcome = "allow" if action.startswith("allow") else "deny"
     persist = action.endswith("persist")
     lease = action.endswith("lease")
-    # Before the UPDATE, so the durable row carries it, and through that row the audit
-    # reason the released ``authorize`` waiter writes.
+    # Before the UPDATE, so the durable row carries it, and through that row the
+    # audit row the released ``authorize`` waiter writes.
     actor = provenance._actor(request)
 
     with holds._LOCK:
@@ -281,10 +281,10 @@ def _resolve_tool_ask_request(approval_id: str, req: ResolveRequest,
                  client_class=policy._client_class(ask["client"]),
                  actor=actor, server=ask["server"], tool=ask["tool"],
                  approval_id=approval_id,
-                 reason=f"tool ask {action}ed by {actor}; {ask['tool']} on "
+                 reason=f"tool ask {action}ed; {ask['tool']} on "
                         f"{ask['server']} — the call runs only if the agent returns "
                         f"for it" if action == "allow" else
-                        f"tool ask denied by {actor}; {ask['tool']} on "
+                        f"tool ask denied; {ask['tool']} on "
                         f"{ask['server']} will not run")
     return JSONResponse({"ok": True, "kind": "tool", "outcome": action,
                          "status": status, "server": ask["server"],

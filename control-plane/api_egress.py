@@ -136,7 +136,7 @@ def create_rule(req: RuleCreateRequest, request: Request) -> JSONResponse:
     # is the only thing that says where it came from. The NORMALIZED pattern, because
     # that is what was stored and what decides.
     store._audit("create", stage="policy", host=pattern, actor=actor,
-                 reason=f"{action} rule created by {actor}; {pattern} "
+                 reason=f"{action} rule created; {pattern} "
                         f"({policy._pattern_scope(pattern)}) now {action}s for client "
                         f"class {client_class} without being held for approval")
     return JSONResponse({"ok": True, "created": True, "already_present": False,
@@ -214,7 +214,7 @@ def edit_rule(rule_id: int, req: RuleEditRequest, request: Request) -> JSONRespo
     # ONE row carrying both states. ``host`` is the NEW pattern, since that decides
     # from now on, and the reason says what it replaced.
     store._audit("edit", stage="policy", host=pattern, actor=actor,
-                 reason=f"rule edited by {actor}; {row['pattern']} ({row['action']}) is "
+                 reason=f"rule edited; {row['pattern']} ({row['action']}) is "
                         f"now {pattern} ({action}, {policy._pattern_scope(pattern)}) "
                         f"for client class {row['client_class']}")
     return JSONResponse({"ok": True, "changed": True, "id": rule_id,
@@ -259,7 +259,7 @@ def revoke_rule(rule_id: int, request: Request) -> JSONResponse:
     # revoked. The class is named too, since a revoke touches ONE population and two
     # classes can each have a `.github.com` allow.
     store._audit("revoke", stage="policy", host=row["pattern"], actor=actor,
-                 reason=f"{row['action']} rule revoked by {actor}; {row['pattern']} is "
+                 reason=f"{row['action']} rule revoked; {row['pattern']} is "
                         f"now unknown for client class {row['client_class']} and will "
                         f"be held for approval")
     return JSONResponse({"ok": True, "pattern": row["pattern"],
@@ -324,12 +324,12 @@ def revoke_lease(lease_id: int, request: Request) -> JSONResponse:
     # As for a rule, the reason says where the host lands: held, not denied.
     store._audit(
         "revoke", stage="policy", host=row["host"], actor=actor,
-        reason=(f"lease revoked by {actor} with "
+        reason=(f"lease revoked with "
                 f"{policy._short_duration(row['expires_at'] - now)} left; "
                 f"{row['host']} is now unknown for client class "
                 f"{row['client_class']} and will be held for approval"
                 if was_live else
-                f"expired lease removed by {actor}; it had already stopped deciding "
+                f"expired lease removed; it had already stopped deciding "
                 f"requests for {row['host']} from client class "
                 f"{row['client_class']}"))
     return JSONResponse({"ok": True, "host": row["host"],

@@ -338,6 +338,12 @@ class CrossReferenceTests(_NeedsGit):
     `## Status`, two paragraphs above a sentence explaining the rename. Unquoted
     references cannot be checked without flagging ordinary prose ("see the CSP note
     above"), so the convention is to quote them, and this holds the quoted ones.
+
+    Italic ones too, and either way regardless of case: `See "X"` at the start of a
+    sentence went unmatched by a lowercase pattern, and `see *X*` unmatched by a
+    quoted one, which is how SECURITY.md carried references through four section
+    moves without a failure. Italic counts only after `see` or `under`, because
+    `in *that*` is emphasis.
     """
 
     #: Bold and italic lead-ins count as targets, not just headings: the docs
@@ -345,6 +351,8 @@ class CrossReferenceTests(_NeedsGit):
     #: `**HTTPS inspection depth**`, neither of which is a heading.
     TARGET_PATTERNS = (r"^#+\s+(.*)$", r"^\s*[-*]?\s*\*\*(.+?)\*\*",
                        r"^\s*\*([^*]{4,90})\*")
+    REFERENCE_PATTERNS = (r'\b(?:see|under|in)\s+"([^"]{4,90})"',
+                          r"\b(?:see|under)\s+\*([^*]{4,90})\*")
 
     @staticmethod
     def _norm(s: str) -> str:
@@ -363,15 +371,16 @@ class CrossReferenceTests(_NeedsGit):
         checked = 0
         for doc in _docs():
             text = (ROOT / doc).read_text()
-            for m in re.finditer(r'\b(?:see|under|in)\s+"([^"]{4,90})"', text, re.S):
-                ref = self._norm(m.group(1))
-                checked += 1
-                line = text[:m.start()].count("\n") + 1
-                with self.subTest(doc=doc, line=line, ref=ref):
-                    self.assertTrue(
-                        any(ref == t or ref in t for t in targets),
-                        f'{doc}:{line} references "{ref}", which is no heading or '
-                        f"bold/italic lead-in in any doc — renamed or removed")
+            for pattern in self.REFERENCE_PATTERNS:
+                for m in re.finditer(pattern, text, re.S | re.I):
+                    ref = self._norm(m.group(1))
+                    checked += 1
+                    line = text[:m.start()].count("\n") + 1
+                    with self.subTest(doc=doc, line=line, ref=ref):
+                        self.assertTrue(
+                            any(ref == t or ref in t for t in targets),
+                            f'{doc}:{line} references "{ref}", which is no heading '
+                            f"or bold/italic lead-in in any doc — renamed or removed")
         self.assertGreater(checked, 0, "no quoted cross-references found — the "
                                        "convention changed and this checks nothing")
 

@@ -258,6 +258,8 @@ dockade/
     app.py                  #   static UI at / + streaming reverse proxy to the backend
     app.js                  #   the approval console's behaviour — a file so the CSP can
                             #   say script-src 'self'; pure helpers unit-tested under node
+    audit.js                #   the record as browsed: what a row says, how rows fold, the
+                            #   filters and their query, the pager, coverage and outage summaries
     egress-rules.js         #   what creating, editing or revoking a standing rule is about
                             #   to do, said before the click
     holds.js                #   the pending queue's decisions: what a push changes, when a
@@ -265,6 +267,8 @@ dockade/
     mcp.js                  #   the MCP surface from the form: what a server registration
                             #   records, the tool picker, what a tool rule will do
     payload.js              #   a tool ask's payload as the operator sees it — imported by app.js
+    provenance.js           #   who acted, cut to what a table cell can hold
+    time.js                 #   timestamps as the page shows them
     index.html              #   static shell + styles for the SSE approval console
     DESIGN.md               #   the browser boundary and the page's mechanics
     requirements.txt        #   pinned deps (fastapi, uvicorn, httpx)

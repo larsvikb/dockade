@@ -116,12 +116,11 @@ const load = name => import(pathToFileURL(`${dir}/${name}`).href);
 const owner = {
   "app.js": ["lampState", "backoffDelay",
              "saturationState", "ackCount", "capScope",
-             "auditRow", "auditStatus", "rulesStatus", "repeatCount",
+             "auditStatus", "rulesStatus", "toolRulesStatus",
              "leaseLabel", "leaseRemaining", "leaseCountdown", "leasesStatus",
-             "leaseDomain", "groupLeases", "shortActor",
-             "timeWindow", "filterActive", "auditQuery", "eventRow",
-             "historyPager",
-             "fmtTime", "fmtStamp", "fmtInstant", "toolRulesStatus"],
+             "leaseDomain", "groupLeases"],
+  "audit.js": ["auditRow", "repeatCount", "timeWindow", "filterActive", "auditQuery",
+               "eventRow", "historyPager"],
   "egress-rules.js": ["revokePreview", "normalizePattern", "createPreview",
                       "editPreview"],
   "mcp.js": ["serverDescriptor", "serverPreview", "serverEditBody",
@@ -133,6 +132,8 @@ const owner = {
                "approvalNotices", "shouldNotify", "notifyButton"],
   "payload.js": ["payloadDisclosure", "payloadTokens", "indentPayload",
                  "escapePayload", "payloadHazards", "renderPayload"],
+  "provenance.js": ["shortActor"],
+  "time.js": ["fmtTime", "fmtStamp", "fmtInstant"],
 };
 const modules = Object.fromEntries(await Promise.all(
   Object.keys(owner).map(async name => [name, await load(name)])));

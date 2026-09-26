@@ -167,6 +167,7 @@ REFFILES := $(SCRIPTS) \
             control-plane-ui/requirements.txt \
             control-plane-ui/index.html \
             control-plane-ui/app.js \
+            control-plane-ui/egress-rules.js \
             control-plane-ui/holds.js \
             control-plane-ui/payload.js \
             policies/egress-allowlist.txt

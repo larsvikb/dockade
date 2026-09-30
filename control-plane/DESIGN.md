@@ -721,6 +721,16 @@ SQLite serializes the two writes, so whichever lands second sees the other. Neit
 guard alone is enough, because a check separate from its write leaves room for the
 other side to land in between.
 
+**A timed pin is a column on `tool_pins`, where a lease got a table.** A lease needed
+one because of who reads `rules`: every reader of standing policy would have had to
+learn "except the expired ones" (`store._step_2_leases`). A timed pin is the same
+predicate under the same ceiling as a permanent one and differs only in how long it
+answers, and the readers that must know are few and name it: the decision
+(`policy._answering_pin`), the pins view, the rule revoke's pin check, and the write
+that widens a pin set already in place (`holds._resolve_tool_ask_pinned`). As for a
+lease, expiry is enforced in the read, and the sweep on the grant path only bounds
+the table.
+
 **`approvals` splits the same way; the operator's queue does not.** The approvals
 table is egress-shaped exactly as `rules` is — `host`, `port`, `proto`, `client`,
 `client_class`, `method`, `url`, against a tool ask's server, tool and arguments — so

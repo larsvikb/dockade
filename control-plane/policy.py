@@ -121,9 +121,12 @@ def _normalize_host(host: str) -> str:
 
 
 def _short_duration(seconds: float) -> str:
-    """A duration for a human to read in an audit reason. Minutes and seconds only —
-    nothing here is ever longer than a lease, and an hours field would be dead code."""
+    """A duration for a human to read in an audit reason: hours and minutes from an
+    hour up, since a timed pin runs for hours (``PIN_LEASE_SECONDS``), and minutes and
+    seconds below."""
     whole = max(0, int(seconds))
+    if whole >= 3600:
+        return f"{whole // 3600}h{whole % 3600 // 60:02d}m"
     return f"{whole // 60}m{whole % 60:02d}s" if whole >= 60 else f"{whole}s"
 
 
@@ -481,6 +484,12 @@ _PIN_FIELD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
 #: channel — and a longer string is content, which a pin is not for.
 _PIN_VALUE_MAX = 200
 
+# How long an `allow_pinned_lease` pin answers for. Longer than ``LEASE_SECONDS``
+# because the two cover different stretches of work: an egress lease the hosts behind
+# one page load, a pin the calls of a working session. An ergonomics number for the
+# reason that one is: `/api/mcp/pins/{id}/revoke` ends a pin early.
+PIN_LEASE_SECONDS = float(os.environ.get("CONTROL_PIN_LEASE_SECONDS", "14400"))
+
 
 def _pin_value(value: object) -> str | None:
     """``value`` in the form a pin holds and compares, or None if no pin can hold it.
@@ -586,18 +595,27 @@ def _pin_candidates(args_json: str) -> dict:
             "refused": None if fields else "none of this call's arguments can be pinned"}
 
 
-def _answering_pin(conn, server: str, tool: str,
-                   args: object) -> tuple[int, dict] | None:
-    """The oldest pin on (``server``, ``tool``) that ``args`` meets, as (id, pins), or
-    None. The caller has found the tool's rule to be `ask`."""
+def _answering_pin(conn, server: str, tool: str, args: object,
+                   now: float) -> tuple[int, dict, float | None] | None:
+    """The live pin on (``server``, ``tool``) that ``args`` meets, as (id, pins,
+    expires_at), or None. The caller has found the tool's rule to be `ask`.
+
+    Expiry is enforced HERE, as ``_live_lease`` enforces it, so a pin that outlives its
+    deadline cannot answer whatever did or did not sweep it.
+
+    Permanent pins first, then the longest-lived, for the reason ``_decide`` reads
+    standing rules before leases: which of two pins answers cannot change the answer,
+    only the audit line, and the one that will still answer later explains more."""
     if not isinstance(args, dict):
         return None
     for row in conn.execute(
-            "SELECT id, pins_json FROM tool_pins WHERE server = ? AND tool = ? "
-            "ORDER BY id", (server, tool)):
+            "SELECT id, pins_json, expires_at FROM tool_pins "
+            "WHERE server = ? AND tool = ? AND (expires_at IS NULL OR expires_at > ?) "
+            "ORDER BY expires_at IS NOT NULL, expires_at DESC, id",
+            (server, tool, now)):
         pins = _parse_pins(row["pins_json"])
         if pins is not None and _pin_matches(pins, args):
-            return row["id"], pins
+            return row["id"], pins, row["expires_at"]
     return None
 
 
@@ -649,9 +667,14 @@ def _decide_tool(server: str, tool: str, args: object = None) -> tuple[str, str]
         if action not in _TOOL_ACTIONS:
             return "deny", (f"the rule for {tool!r} on {server!r} carries an unknown "
                             f"action {action!r}")
-        pin = _answering_pin(conn, server, tool, args) if action == "ask" else None
+        now = time.time()
+        pin = (_answering_pin(conn, server, tool, args, now) if action == "ask"
+               else None)
     if pin is not None:
-        pin_id, pins = pin
+        pin_id, pins, expires_at = pin
+        # The remaining time in the reason, as a lease's is.
+        left = ("" if expires_at is None
+                else f", {_short_duration(expires_at - now)} left")
         return "allow", (f"'allow' by pin {pin_id} ({tool} on {server}, pinned: "
-                         f"{', '.join(sorted(pins))})")
+                         f"{', '.join(sorted(pins))}{left})")
     return action, f"{action!r} by rule ({tool} on {server})"

@@ -3683,14 +3683,14 @@ class ToolAuthorizeDecisionTests(_ToolBridgeTestCase):
         self.assertLessEqual({"allow", "deny", "hold"}, set(cp.audit.KINDS))
 
 
-def _pin(pins, tool="create_pull_request", server="mcp-github"):
-    """Write a pin as the card will, and return its id. Nothing writes one through the
-    API yet, so the test writes the row."""
+def _pin(pins, tool="create_pull_request", server="mcp-github", expires_at=None):
+    """Write a pin as the card would, and return its id: a row in place before the
+    card under test is answered."""
     with cp.store._connect() as conn:
         pin_id = conn.execute(
             "INSERT INTO tool_pins(server, tool, pins_json, approval_id, created_at, "
-            "granted_by) VALUES (?,?,?, 'a1', 0, 'peer=172.31.0.3')",
-            (server, tool, cp.policy._canonical_pins(pins))).lastrowid
+            "granted_by, expires_at) VALUES (?,?,?, 'a1', 0, 'peer=172.31.0.3', ?)",
+            (server, tool, cp.policy._canonical_pins(pins), expires_at)).lastrowid
         conn.commit()
     return pin_id
 
@@ -3779,6 +3779,7 @@ class McpPinTests(_CPTestCase):
         self.assertEqual((served["server"], served["tool"], served["rule"]),
                          ("mcp-github", "create_pull_request", "ask"))
         self.assertEqual(served["approval_id"], "a1")
+        self.assertIsNone(served["expires_at"])
         self.assertTrue(served["decides"])
 
     def test_the_view_says_a_pin_decides_only_when_the_decision_would_read_it(self):
@@ -3830,6 +3831,56 @@ class McpPinTests(_CPTestCase):
     def test_revoking_an_unknown_pin_is_a_404(self):
         self.assertEqual(
             cp.api_mcp.revoke_mcp_pin(self.pin_id + 1, _FakeRequest()).status_code, 404)
+
+    def _expire(self, pin_id, offset):
+        with cp.store._connect() as conn:
+            conn.execute("UPDATE tool_pins SET expires_at=? WHERE id=?",
+                         (time.time() + offset, pin_id))
+            conn.commit()
+
+    def _revoke_reason(self):
+        with cp.store._connect() as conn:
+            return conn.execute("SELECT reason FROM audit WHERE kind='revoke' "
+                                "ORDER BY id DESC LIMIT 1").fetchone()["reason"]
+
+    def test_the_view_serves_a_timed_pins_deadline_and_leaves_out_an_expired_one(self):
+        deadline = time.time() + 600
+        self._expire(self.pin_id, 600)
+        [served] = cp.api_mcp.api_mcp_pins()
+        self.assertAlmostEqual(served["expires_at"], deadline, delta=5)
+        self._expire(self.pin_id, -1)
+        self.assertEqual(cp.api_mcp.api_mcp_pins(), [])
+
+    def test_revoking_a_timed_pin_names_the_time_it_had_left(self):
+        self._expire(self.pin_id, 7200)
+        resp = cp.api_mcp.revoke_mcp_pin(self.pin_id, _FakeRequest())
+        self.assertTrue(resp.body["was_live"])
+        self.assertIn("revoked with 1h59m left", self._revoke_reason())
+
+    def test_revoking_an_expired_pin_says_it_had_already_stopped(self):
+        # The page listed it before it lapsed; the click still removes it.
+        self._expire(self.pin_id, -1)
+        resp = cp.api_mcp.revoke_mcp_pin(self.pin_id, _FakeRequest())
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(resp.body["was_live"])
+        self.assertIn("expired pin", self._revoke_reason())
+
+    def test_a_live_timed_pin_holds_its_rule_as_a_permanent_one_does(self):
+        self._expire(self.pin_id, 600)
+        self.assertEqual(
+            cp.api_mcp.revoke_mcp_rule(self.rule_id, _FakeRequest()).status_code, 409)
+
+    def test_expired_pins_do_not_hold_their_rule_and_go_with_it(self):
+        # An expired pin cannot come back with the next `ask` rule, so it holds
+        # nothing back; a pin on another tool is not touched.
+        _tool_rule("update_pull_request", "ask")
+        other = _pin(_PINNED, tool="update_pull_request", expires_at=time.time() - 1)
+        self._expire(self.pin_id, -1)
+        self.assertEqual(
+            cp.api_mcp.revoke_mcp_rule(self.rule_id, _FakeRequest()).status_code, 200)
+        with cp.store._connect() as conn:
+            left = [r["id"] for r in conn.execute("SELECT id FROM tool_pins")]
+        self.assertEqual(left, [other])
 
     def test_a_rule_with_pins_cannot_be_revoked_until_they_are(self):
         # A pin left behind would come back, unasked, with the next `ask` rule for
@@ -3951,6 +4002,121 @@ class PinFromCardTests(_ToolBridgeTestCase):
             self.assertIn("owner, repo", row["reason"])
             self.assertIsNotNone(row["actor"])
             self.assertNotIn("larsvikb", row["reason"])
+
+
+class TimedPinFromCardTests(_ToolBridgeTestCase):
+    """``allow_pinned_lease``: a pin from a card that answers for
+    ``policy.PIN_LEASE_SECONDS``, and what a second grant of the same values does to
+    it. One row per pin set, so a second grant only ever widens the one in place."""
+
+    audits = True
+
+    def setUp(self):
+        super().setUp()
+        saved = cp.policy.PIN_LEASE_SECONDS
+        cp.policy.PIN_LEASE_SECONDS = 300.0
+        self.addCleanup(setattr, cp.policy, "PIN_LEASE_SECONDS", saved)
+        self.rule_id = _tool_rule("create_pull_request", "ask").body["id"]
+        self.ask = _tool_call(tool="create_pull_request", args=_PR_ARGS)["approval_id"]
+
+    def _pins(self):
+        with cp.store._connect() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT id, expires_at FROM tool_pins ORDER BY id")]
+
+    def _policy_rows(self):
+        with cp.store._connect() as conn:
+            return [(r["kind"], r["reason"]) for r in conn.execute(
+                "SELECT kind, reason FROM audit WHERE approval_id=? "
+                "AND stage='tool-policy' ORDER BY id", (self.ask,))]
+
+    def _later_call(self):
+        return _tool_call(tool="create_pull_request",
+                          args={**_PR_ARGS, "title": "another"})["decision"]
+
+    def test_a_timed_pin_answers_until_its_deadline_and_not_after(self):
+        before = time.time()
+        resp = _resolve(self.ask, "allow_pinned_lease", pins=["owner", "repo"])
+        self.assertEqual(resp.status_code, 200)
+        pin = resp.body["pin"]
+        self.assertTrue(pin["created"])
+        self.assertGreaterEqual(pin["expires_at"], before + 300)
+        self.assertLess(pin["expires_at"], before + 310)
+        # What the card is told is what was stored.
+        self.assertEqual(self._pins(), [{"id": pin["id"],
+                                         "expires_at": pin["expires_at"]}])
+        self.assertEqual(self._later_call(), "allow")
+        with cp.store._connect() as conn:
+            conn.execute("UPDATE tool_pins SET expires_at=?", (time.time() - 1,))
+            conn.commit()
+        self.assertEqual(self._later_call(), "ask")
+
+    def test_the_policy_row_says_how_long_the_pin_answers_for(self):
+        _resolve(self.ask, "allow_pinned_lease", pins=["owner", "repo"])
+        [(kind, reason)] = self._policy_rows()
+        self.assertEqual(kind, "create")
+        self.assertIn("for 5m00s while its rule asks", reason)
+
+    def test_a_timed_pin_is_refused_where_a_permanent_one_is(self):
+        for pins in ([], ["reviewers"], None):
+            with self.subTest(pins=pins):
+                self.assertEqual(_resolve(self.ask, "allow_pinned_lease",
+                                          pins=pins).status_code, 400)
+        cp.api_mcp.edit_mcp_rule(self.rule_id,
+                                 cp.api_mcp.ToolRuleEditRequest(action="deny"),
+                                 _FakeRequest())
+        resp = _resolve(self.ask, "allow_pinned_lease", pins=["owner"])
+        self.assertEqual(resp.status_code, 409)
+        self.assertTrue(resp.body["pin_refused"])
+        self.assertEqual(self._pins(), [])
+
+    def test_a_timed_pin_on_values_pinned_for_good_leaves_them_permanent(self):
+        permanent = _pin(_PINNED)
+        resp = _resolve(self.ask, "allow_pinned_lease", pins=["owner", "repo"])
+        pin = resp.body["pin"]
+        self.assertEqual((pin["id"], pin["created"], pin["extended"], pin["expires_at"]),
+                         (permanent, False, False, None))
+        self.assertEqual(self._pins(), [{"id": permanent, "expires_at": None}])
+        self.assertEqual(self._policy_rows(), [])
+
+    def test_a_permanent_pin_on_a_timed_one_removes_its_expiry(self):
+        timed = _pin(_PINNED, expires_at=time.time() + 60)
+        resp = _resolve(self.ask, "allow_pinned", pins=["owner", "repo"])
+        self.assertTrue(resp.body["pin"]["extended"])
+        self.assertIsNone(resp.body["pin"]["expires_at"])
+        self.assertEqual(self._pins(), [{"id": timed, "expires_at": None}])
+        [(kind, reason)] = self._policy_rows()
+        self.assertEqual(kind, "edit")
+        self.assertIn("with no expiry", reason)
+
+    def test_a_second_timed_pin_renews_the_first(self):
+        timed = _pin(_PINNED, expires_at=time.time() + 60)
+        resp = _resolve(self.ask, "allow_pinned_lease", pins=["owner", "repo"])
+        self.assertTrue(resp.body["pin"]["extended"])
+        self.assertGreater(resp.body["pin"]["expires_at"], time.time() + 290)
+        self.assertEqual(self._pins()[0]["id"], timed)
+        [(kind, reason)] = self._policy_rows()
+        self.assertEqual(kind, "edit")
+        self.assertIn("for 5m00s", reason)
+
+    def test_a_renewal_never_shortens_a_pin(self):
+        # Reachable when the duration is configured shorter than it was.
+        deadline = time.time() + 3600
+        _pin(_PINNED, expires_at=deadline)
+        resp = _resolve(self.ask, "allow_pinned_lease", pins=["owner", "repo"])
+        self.assertFalse(resp.body["pin"]["extended"])
+        self.assertEqual(resp.body["pin"]["expires_at"], deadline)
+        self.assertEqual(self._pins()[0]["expires_at"], deadline)
+
+    def test_a_lapsed_pin_is_swept_and_granted_again_as_a_new_one(self):
+        # By the card it came from, since the id may be the swept row's again.
+        _pin(_PINNED, expires_at=time.time() - 1)
+        resp = _resolve(self.ask, "allow_pinned_lease", pins=["owner", "repo"])
+        self.assertTrue(resp.body["pin"]["created"])
+        with cp.store._connect() as conn:
+            rows = [r["approval_id"] for r in
+                    conn.execute("SELECT approval_id FROM tool_pins")]
+        self.assertEqual(rows, [self.ask])
 
 
 class ToolRosterTests(_ToolBridgeTestCase):
@@ -4759,7 +4925,7 @@ class FreshSchemaTests(_FreshStoreTestCase):
             with self.assertRaises(sqlite3.IntegrityError):
                 conn.execute(insert, ("a2",))     # the same pin set from another card
         self.assertEqual(cols, {"id", "server", "tool", "pins_json", "approval_id",
-                                "created_at", "granted_by"})
+                                "created_at", "granted_by", "expires_at"})
 
     def test_a_fresh_store_lets_two_leases_hold_the_same_host(self):
         # The absent UNIQUE, asserted rather than assumed. Unreachable through the API
@@ -5359,6 +5525,46 @@ class SchemaVersionTests(_FreshStoreTestCase):
                                "WHERE host='.example.com'").fetchone()
         self.assertIsNone(row["actor"])
         self.assertIn("peer=172.31.0.9", row["reason"])
+
+    # `tool_pins` as #155 created it, before `expires_at`.
+    _PINS_V7 = """CREATE TABLE tool_pins (
+        id INTEGER PRIMARY KEY, server TEXT NOT NULL, tool TEXT NOT NULL,
+        pins_json TEXT NOT NULL, approval_id TEXT NOT NULL, created_at REAL NOT NULL,
+        granted_by TEXT NOT NULL, UNIQUE(server, tool, pins_json))"""
+
+    def _v7_store(self, name, pins_table):
+        """A store at v7, with ``tool_pins`` as #155 made it or, where
+        ``pins_table`` is False, from before it existed."""
+        self._old_store(name)
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            conn.execute("DROP TABLE tool_pins")
+            if pins_table:
+                conn.execute(self._PINS_V7)
+                conn.execute("INSERT INTO tool_pins(server, tool, pins_json, "
+                             "approval_id, created_at, granted_by) "
+                             "VALUES ('s', 't', '{\"repo\":\"dockade\"}', 'a', 0, 'g')")
+            conn.execute("PRAGMA user_version = 7")
+            conn.commit()
+
+    def test_v8_adds_the_expiry_and_existing_pins_stay_permanent(self):
+        self._v7_store("version-pin-expiry.db", pins_table=True)
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            self.assertIn("expires_at", cp.store._columns(conn, "tool_pins"))
+            self.assertIsNone(conn.execute(
+                "SELECT expires_at FROM tool_pins").fetchone()["expires_at"])
+            self.assertIsNotNone(cp.policy._answering_pin(
+                conn, "s", "t", {"repo": "dockade"}, time.time()))
+        self.assertEqual(self._version(), cp.store.SCHEMA_VERSION)
+
+    def test_v8_on_a_store_from_before_the_pins_table(self):
+        # Stamped v7 by #149-#154, which had no `tool_pins`: the step has nothing to
+        # alter, and the DDL creates the table with the column.
+        self._v7_store("version-pin-expiry-no-table.db", pins_table=False)
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            self.assertIn("expires_at", cp.store._columns(conn, "tool_pins"))
 
     def test_a_store_already_renamed_is_left_alone(self):
         # `ALTER TABLE ... RENAME COLUMN` raises rather than no-ops if it runs twice.

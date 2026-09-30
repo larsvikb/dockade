@@ -1505,7 +1505,9 @@ every other field is free. It is read only while the tool's rule is `ask`, and t
 is the whole safety argument: everything a pin can release, a human could already
 have released by clicking Allow on a card. It cannot reach a denied or unruled tool
 or a disabled server, and a payload too large for a card to show is not offered to
-the pins either.
+the pins either. A pin answers for good (`allow_pinned`) or for
+`CONTROL_PIN_LEASE_SECONDS` (`allow_pinned_lease`); the expiry bounds how long it
+answers and never what, so nothing below depends on it.
 
 **A pin only allows, because a server's notion of equal is unknown here.** GitHub
 reads `Dockade` and `dockade` as one repository. Against an unknown equivalence an
@@ -2115,7 +2117,8 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | governed git path — clone/fetch (writes are the gateway's) | planned |
 | — | GitHub write set — `GITHUB_READ_ONLY` off behind the gateway, with per-tool repo scoping | planned |
 | — | pinned allows — `tool_pins`, read under an `ask` rule only; listed and revocable in the MCP tab | **done** |
-| — | pinning from a tool card — `allow_pinned` and the field picker | **done** — permanent pins only; no timed pin yet |
+| — | pinning from a tool card — `allow_pinned` and the field picker | **done** |
+| — | timed pins — `allow_pinned_lease`, `expires_at` on `tool_pins` | **done** — API only; the card's button waits on the `app.js` split |
 | — | `mcp-net` + MCP server catalogue (`mcp-servers.yml`) | **done** |
 | — | per-client-class egress policy | **done** |
 | — | tool policy: store (`tool_rules`, `mcp_servers`) + config API (`/api/mcp/…`) | **done** |

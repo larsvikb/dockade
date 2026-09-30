@@ -45,7 +45,7 @@ LEGACY_CLIENT_CLASS = "sandbox"
 # The schema this code expects. Every entry in ``_STEPS`` below adds exactly one,
 # and a store records the version it is at (see ``_migrate``), so "what has already
 # run here" is a number to compare rather than a schema to interrogate.
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 def _connect() -> sqlite3.Connection:
@@ -253,6 +253,20 @@ def _step_7_audit_actor(conn: sqlite3.Connection) -> None:
               "predate the column)", flush=True)
 
 
+def _step_8_pin_expiry(conn: sqlite3.Connection) -> None:
+    """v8 — ``tool_pins.expires_at``, so a pin can answer for a while rather than for
+    good. Existing pins keep NULL, which is what they were granted as: permanent.
+
+    The only step whose table may be ABSENT. ``tool_pins`` came in with no step of
+    its own, so a store stamped v7 before it existed reaches here without one, and
+    the DDL in ``_init_db`` then creates it with the column."""
+    columns = _columns(conn, "tool_pins")
+    if columns and "expires_at" not in columns:
+        conn.execute("ALTER TABLE tool_pins ADD COLUMN expires_at REAL")
+        print("control-plane: added expires_at to tool_pins (existing pins keep NULL "
+              "— they were granted permanent)", flush=True)
+
+
 # Ordered, and the order is the only thing that decides what runs: a step is applied
 # when its version exceeds the store's, so steps must be APPEND-ONLY and never
 # renumbered, reordered or edited once shipped — a store in the field has already run
@@ -266,6 +280,7 @@ _STEPS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = (
     (5, "audit.decision becomes audit.kind", _step_5_decision_to_kind),
     (6, "persisted pattern on approvals", _step_6_persisted_pattern),
     (7, "audit actor column", _step_7_audit_actor),
+    (8, "pin expiry", _step_8_pin_expiry),
 )
 
 
@@ -395,8 +410,8 @@ def _init_db() -> None:
             )""")
         # PINNED ALLOWS: an `ask` answered in advance, for the calls whose arguments
         # carry these exact values (DESIGN.md, "A pinned allow is an ask answered in
-        # advance"). A new table, so it needs no `_STEPS` entry, as `tool_rules` did
-        # not.
+        # advance"). New as a table, so it needed no `_STEPS` entry; `expires_at`,
+        # added to it later, did (v8).
         conn.execute("""
             CREATE TABLE IF NOT EXISTS tool_pins (
                 id          INTEGER PRIMARY KEY,
@@ -410,6 +425,9 @@ def _init_db() -> None:
                 approval_id TEXT NOT NULL,
                 created_at  REAL NOT NULL,
                 granted_by  TEXT NOT NULL,   -- provenance of the resolver (provenance._actor)
+                -- NULL for a permanent pin (`allow_pinned`), the deadline for a
+                -- timed one (`allow_pinned_lease`).
+                expires_at  REAL,
                 UNIQUE(server, tool, pins_json)
             )""")
         conn.execute("""

@@ -349,12 +349,24 @@ def _migrate() -> None:
     which is load-bearing: Python's sqlite3 opens an implicit transaction for DML
     only, so DDL on a default connection runs outside one, and a crash inside the v1
     rules rebuild would lose the policy rules. The transaction covers the stamp too,
-    so a failed step leaves the version where it was."""
+    so a failed step leaves the version where it was.
+
+    A store stamped NEWER than this code is refused, and the process does not start.
+    Steps run forward only, and older code can read newer policy more widely than it
+    was written: a column it does not know may be the one that narrows a row. Without
+    this refusal it would stamp the newer version back and serve the rows as it
+    reads them."""
     with _connect() as conn:
         conn.isolation_level = None                   # explicit transaction control
         conn.execute("BEGIN IMMEDIATE")
         try:
             at = conn.execute("PRAGMA user_version").fetchone()[0]
+            if at > SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"the store is at schema v{at}, newer than this code's "
+                    f"v{SCHEMA_VERSION}; refusing to start rather than read policy a "
+                    f"newer version wrote. Run that version again, or `make restore` "
+                    f"a backup taken before it.")
             if at == 0:                  # unstamped: placed by shape, exactly once
                 at = _detect_version(conn)
             for version, label, step in _STEPS:

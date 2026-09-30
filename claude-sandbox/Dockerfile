@@ -42,6 +42,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # setuid helper, neither of which this container should grant; and
 # --disable-dev-shm-usage, because /dev/shm here is 64 MB and, unlike the full
 # browser's wrapper, nothing adds it for the shell. The build renders a page with both.
+# To keep it off the proxy, pass --proxy-server=direct://: the shell takes its proxy
+# from https_proxy and ignores --no-proxy-server (NOTES.md).
 RUN apt-get update && apt-get install -y --no-install-recommends chromium-headless-shell \
     && apt-get clean && rm -rf /var/lib/apt/lists/* \
     && dpkg-query -W chromium-headless-shell \

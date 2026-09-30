@@ -605,11 +605,20 @@ it exports Debian's public Google API keys, presumably what switches on the sign
 services among those hosts. The same directory adds `--disable-dev-shm-usage` whenever
 `/dev/shm` is under 3.8 GB, which covers the sandbox's 64 MB.
 
-**The headless shell calls nothing.** The same netlog, the same page, with only
-`--no-proxy-server`, named no host but the page's. It gets neither half of the above:
-`/usr/bin/chromium-headless-shell` is a script that does not source `/etc/chromium.d/`,
-and the package installs nothing there — so no API keys, and no automatic
-`--disable-dev-shm-usage`, which a caller must pass itself inside a 64 MB `/dev/shm`.
+**The headless shell calls nothing.** The same netlog, the same page, named no host
+but the page's, and 20 seconds of an idle shell under the real proxy settings raised no
+approval card. It gets neither half of the above: `/usr/bin/chromium-headless-shell` is
+a script that does not source `/etc/chromium.d/`, and the package installs nothing
+there — so no API keys, and no automatic `--disable-dev-shm-usage`, which a caller must
+pass itself inside a 64 MB `/dev/shm`.
+
+**The shell ignores `--no-proxy-server`.** It takes its proxy from the environment:
+`https_proxy` for the outside (asked for `https://1.1.1.1/` with `--no-proxy-server`
+set, it raised an approval card for 1.1.1.1) and `no_proxy` for the local page, which
+loaded direct. Two things do keep it off the proxy, each checked by the absence of a
+card for the same URL: `--proxy-server=direct://`, and running it with the four proxy
+variables unset. So the netlog run above, flag and all, was already under the real
+proxy settings.
 
 ## Publishing a host port: the private range is the wrong instinct on WSL2
 

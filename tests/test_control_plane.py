@@ -256,16 +256,20 @@ class DecideToolTests(unittest.TestCase):
 
 
 def _set_pins(pins):
-    """Replace the tool_pins table with (server, tool, pins) tuples. A dict is stored
-    in its canonical form, as the writer will store it; a string is stored verbatim,
-    as a hand-edited row would be."""
+    """Replace the tool_pins table with (server, tool, pins) tuples, or (server, tool,
+    pins, seconds_from_now) for a timed pin, the offset relative as in ``_set_leases``.
+    A dict is stored in its canonical form, as the writer will store it; a string is
+    stored verbatim, as a hand-edited row would be."""
+    now = time.time()
     with cp.store._connect() as conn:
         conn.execute("DELETE FROM tool_pins")
         conn.executemany(
             "INSERT INTO tool_pins(server, tool, pins_json, approval_id, created_at, "
-            "granted_by) VALUES (?,?,?, 'test', 0, 'test')",
-            [(server, tool, p if isinstance(p, str) else cp.policy._canonical_pins(p))
-             for server, tool, p in pins])
+            "granted_by, expires_at) VALUES (?,?,?, 'test', 0, 'test', ?)",
+            [(server, tool, p if isinstance(p, str) else cp.policy._canonical_pins(p),
+              None if offset is None else now + offset)
+             for server, tool, p, offset in
+             [(pin if len(pin) == 4 else (*pin, None)) for pin in pins]])
         conn.commit()
 
 
@@ -446,6 +450,72 @@ class PinCandidateTests(unittest.TestCase):
                 c = cp.policy._pin_candidates(raw)
                 self.assertEqual(c["fields"], [])
                 self.assertTrue(c["refused"])
+
+
+class TimedPinDecisionTests(unittest.TestCase):
+    """``_decide_tool`` with a pin that expires: it answers until its deadline and
+    not after, and the reason says how long it has left."""
+
+    def setUp(self):
+        cp.store._init_db()
+        _set_tool_rules([("mcp-github", "create_pull_request", "ask")])
+
+    def _decide(self):
+        return cp.policy._decide_tool("mcp-github", "create_pull_request", _PR)
+
+    def test_a_live_timed_pin_answers_and_names_its_remaining_time(self):
+        _set_pins([("mcp-github", "create_pull_request", {"repo": "dockade"}, 7200)])
+        decision, reason = self._decide()
+        self.assertEqual(decision, "allow")
+        self.assertIn("pinned: repo, 1h59m left", reason)
+
+    def test_an_expired_pin_asks_and_is_still_in_the_table(self):
+        # Present and inert: the read enforces the deadline, not a sweep.
+        _set_pins([("mcp-github", "create_pull_request", {"repo": "dockade"}, -1)])
+        self.assertEqual(self._decide()[0], "ask")
+        with cp.store._connect() as conn:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM tool_pins").fetchone()[0], 1)
+
+    def test_a_permanent_pin_is_the_reason_when_a_timed_one_also_matches(self):
+        # The timed pin is the older row, so id order alone would name it.
+        _set_pins([("mcp-github", "create_pull_request", {"repo": "dockade"}, 600),
+                   ("mcp-github", "create_pull_request", {"owner": "larsvikb"})])
+        reason = self._decide()[1]
+        self.assertIn("pinned: owner)", reason)
+
+    def test_of_two_timed_pins_the_longest_lived_is_the_reason(self):
+        _set_pins([("mcp-github", "create_pull_request", {"repo": "dockade"}, 600),
+                   ("mcp-github", "create_pull_request", {"owner": "larsvikb"}, 7200)])
+        self.assertIn("pinned: owner, 1h59m left", self._decide()[1])
+
+
+class GrantSecondsTests(unittest.TestCase):
+    """A timed grant's duration is refused at startup unless finite and above zero:
+    a NaN deadline is stored as NULL, which a pin reads as permanent."""
+
+    def test_a_usable_duration_is_read(self):
+        with mock.patch.dict(os.environ, {"CONTROL_X": "14400"}):
+            self.assertEqual(cp.policy._grant_seconds("CONTROL_X", "1"), 14400.0)
+        self.assertEqual(cp.policy._grant_seconds("CONTROL_UNSET_X", "1800"), 1800.0)
+
+    def test_nan_infinity_and_nothing_are_refused(self):
+        for value in ("nan", "inf", "-inf", "0", "-5"):
+            with self.subTest(value=value), \
+                    mock.patch.dict(os.environ, {"CONTROL_X": value}), \
+                    self.assertRaisesRegex(ValueError, "CONTROL_X"):
+                cp.policy._grant_seconds("CONTROL_X", "1")
+
+
+class ShortDurationTests(unittest.TestCase):
+    """``_short_duration`` reads in hours from an hour up, where a timed pin runs."""
+
+    def test_each_range_reads_in_its_own_units(self):
+        for seconds, shown in ((59, "59s"), (60, "1m00s"), (3599, "59m59s"),
+                               (3600, "1h00m"), (14400, "4h00m"), (14399.9, "3h59m"),
+                               (-5, "0s")):
+            with self.subTest(seconds=seconds):
+                self.assertEqual(cp.policy._short_duration(seconds), shown)
 
 
 class LeaseDecisionTests(unittest.TestCase):

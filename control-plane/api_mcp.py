@@ -364,10 +364,12 @@ def revoke_mcp_rule(rule_id: int, request: Request) -> JSONResponse:
     audit reason names where the tool ends up. Nothing seeds this table, so there is
     no seed to refuse, as ``api_egress.revoke_rule`` does.
 
-    **Refused while the tool still has pins**, as ``revoke_mcp_server`` refuses a
+    **Refused while the tool still has live pins**, as ``revoke_mcp_server`` refuses a
     server with rules. A pin outliving its rule decides nothing, until a rule for the
-    same tool comes back as `ask` and brings it back with it."""
+    same tool comes back as `ask` and brings it back with it. An EXPIRED pin can never
+    decide again, so it holds nothing back, and it goes with the rule."""
     actor = provenance._actor(request)
+    now = time.time()
     with store._connect() as conn:
         row = conn.execute(
             "SELECT server, tool, action FROM tool_rules WHERE id=?",
@@ -379,12 +381,14 @@ def revoke_mcp_rule(rule_id: int, request: Request) -> JSONResponse:
         # and the delete cannot be left behind (``holds._resolve_tool_ask_pinned``).
         deleted = conn.execute(
             "DELETE FROM tool_rules WHERE id=? AND NOT EXISTS "
-            "(SELECT 1 FROM tool_pins WHERE server=? AND tool=?)",
-            (rule_id, row["server"], row["tool"])).rowcount
+            "(SELECT 1 FROM tool_pins WHERE server=? AND tool=? "
+            "AND (expires_at IS NULL OR expires_at > ?))",
+            (rule_id, row["server"], row["tool"], now)).rowcount
         if not deleted:
             pins = conn.execute(
-                "SELECT COUNT(*) FROM tool_pins WHERE server=? AND tool=?",
-                (row["server"], row["tool"])).fetchone()[0]
+                "SELECT COUNT(*) FROM tool_pins WHERE server=? AND tool=? "
+                "AND (expires_at IS NULL OR expires_at > ?)",
+                (row["server"], row["tool"], now)).fetchone()[0]
             return JSONResponse(
                 {"ok": False,
                  "detail": f"{row['tool']} on {row['server']} still has {pins} "
@@ -392,35 +396,45 @@ def revoke_mcp_rule(rule_id: int, request: Request) -> JSONResponse:
                            f"effect. Revoke them first, or edit the rule instead.",
                  "tool_pins": pins},
                 status_code=409)
+        lapsed = conn.execute(
+            "DELETE FROM tool_pins WHERE server=? AND tool=? AND expires_at <= ?",
+            (row["server"], row["tool"], now)).rowcount
         conn.commit()
 
     store._audit("revoke", stage="tool-policy", server=row["server"], tool=row["tool"],
                  actor=actor,
                  reason=f"tool rule revoked; {row['tool']} on "
                         f"{row['server']} was {row['action']}, now unconfigured and "
-                        f"therefore denied")
+                        f"therefore denied"
+                        + (f"; {lapsed} expired pin(s) removed with it" if lapsed
+                           else ""))
     return JSONResponse({"ok": True, "id": rule_id, "server": row["server"],
                          "tool": row["tool"], "action": row["action"]})
 
 
 @router.get("/api/mcp/pins")
 def api_mcp_pins() -> list[dict]:
-    """Every pinned allow, with whether it decides anything now.
+    """Every pinned allow that has not expired, with whether it decides anything now.
 
     ``decides`` is the conditions ``policy._decide_tool`` reads a pin under, so the
     view cannot call a pin live that the decision passes over: the tool's rule is
     `ask`, its server is enabled, and the row holds a pin set. ``pins`` is None for a
-    row that does not (``policy._parse_pins``).
+    row that does not (``policy._parse_pins``). An expired pin is left out rather
+    than listed as deciding nothing, as ``api_egress.api_leases`` leaves out an
+    expired lease: nothing will make it decide again.
 
     ``pins_json`` is the row as stored, for the page to show without parsing: a
-    browser's JSON.parse rounds an integer past 2^53, and a pin is compared exactly."""
+    browser's JSON.parse rounds an integer past 2^53, and a pin is compared exactly.
+    ``expires_at`` is absolute, None for a permanent pin."""
     with store._connect() as conn:
         rows = conn.execute(
             "SELECT p.id, p.server, p.tool, p.pins_json, p.approval_id, "
-            "p.created_at, p.granted_by, r.action, s.enabled FROM tool_pins p "
+            "p.created_at, p.granted_by, p.expires_at, r.action, s.enabled "
+            "FROM tool_pins p "
             "LEFT JOIN tool_rules r ON r.server = p.server AND r.tool = p.tool "
             "LEFT JOIN mcp_servers s ON s.server = p.server "
-            "ORDER BY p.server, p.tool, p.id").fetchall()
+            "WHERE p.expires_at IS NULL OR p.expires_at > ? "
+            "ORDER BY p.server, p.tool, p.id", (time.time(),)).fetchall()
     out = []
     for r in rows:
         pins = policy._parse_pins(r["pins_json"])
@@ -429,20 +443,29 @@ def api_mcp_pins() -> list[dict]:
                     "decides": (pins is not None and r["action"] == "ask"
                                 and bool(r["enabled"])),
                     "approval_id": r["approval_id"], "created_at": r["created_at"],
-                    "granted_by": r["granted_by"]})
+                    "granted_by": r["granted_by"], "expires_at": r["expires_at"]})
     return out
 
 
 @router.post("/api/mcp/pins/{pin_id}/revoke")
 def revoke_mcp_pin(pin_id: int, request: Request) -> JSONResponse:
     """Remove one pin, so the calls it answered go back to the tool's rule. Revoking a
-    pin can only narrow: the most it takes away is an answer a card can give again."""
+    pin can only narrow: the most it takes away is an answer a card can give again.
+
+    An ALREADY-EXPIRED pin is removed too and reported as such, not refused, as
+    ``api_egress.revoke_lease`` treats a lapsed lease: the pin was listed when the page
+    last loaded, and a refusal would look like a bug."""
     actor = provenance._actor(request)
+    now = time.time()
     with store._connect() as conn:
+        # One write transaction, so the row the audit describes is the row deleted: a
+        # pinned grant in between could otherwise extend it.
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT server, tool, pins_json FROM tool_pins WHERE id=?",
+            "SELECT server, tool, pins_json, expires_at FROM tool_pins WHERE id=?",
             (pin_id,)).fetchone()
         if row is None:
+            conn.rollback()
             return JSONResponse({"ok": False, "detail": "unknown pin"},
                                 status_code=404)
         conn.execute("DELETE FROM tool_pins WHERE id=?", (pin_id,))
@@ -450,10 +473,17 @@ def revoke_mcp_pin(pin_id: int, request: Request) -> JSONResponse:
 
     pins = policy._parse_pins(row["pins_json"])
     fields = ", ".join(sorted(pins)) if pins else "an unreadable pin set"
+    expires_at = row["expires_at"]
+    was_live = expires_at is None or expires_at > now
+    left = ("" if expires_at is None or not was_live
+            else f" with {policy._short_duration(expires_at - now)} left")
     store._audit("revoke", stage="tool-policy", server=row["server"], tool=row["tool"],
                  actor=actor,
-                 reason=f"pin {pin_id} revoked; {row['tool']} on "
-                        f"{row['server']} pinned on {fields} is decided by its rule "
-                        f"again")
+                 reason=(f"pin {pin_id} revoked{left}; {row['tool']} on "
+                         f"{row['server']} pinned on {fields} is decided by its rule "
+                         f"again" if was_live else
+                         f"expired pin {pin_id} removed; it had already stopped "
+                         f"answering {row['tool']} on {row['server']} pinned on "
+                         f"{fields}"))
     return JSONResponse({"ok": True, "id": pin_id, "server": row["server"],
-                         "tool": row["tool"]})
+                         "tool": row["tool"], "was_live": was_live})

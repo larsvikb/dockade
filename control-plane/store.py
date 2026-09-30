@@ -45,7 +45,7 @@ LEGACY_CLIENT_CLASS = "sandbox"
 # The schema this code expects. Every entry in ``_STEPS`` below adds exactly one,
 # and a store records the version it is at (see ``_migrate``), so "what has already
 # run here" is a number to compare rather than a schema to interrogate.
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 def _connect() -> sqlite3.Connection:
@@ -134,12 +134,14 @@ def _step_1_client_class(conn: sqlite3.Connection) -> None:
 # `*_persist` (standing policy) — see control-plane/DESIGN.md, "A lease is the third
 # grant duration".
 #
-# ONE definition, shared by the v2 step and the fresh-store DDL. The v1 rules rebuild
-# could not share one, because its temporary table would have had to parameterize the
-# string; a new table has no such table, so here divergence is impossible, not tested.
+# ONE definition, shared by the v2 step, the v9 rebuild and the fresh-store DDL, so a
+# migrated store and a fresh one cannot diverge. v9 copies rows into whatever this
+# says, so a column added later needs a default, and its step must skip a table that
+# already has it.
 _LEASES_DDL = """
     CREATE TABLE IF NOT EXISTS leases (
-        id           INTEGER PRIMARY KEY,
+        -- Never reused: a revoke from an open page names a lease by it.
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
         -- ONE exact host, in `policy._normalize_host` form, matched by EQUALITY.
         -- Deliberately not a `pattern`: the breadth ladder on `rules` exists because
         -- a standing rule needs an operator choice about how wide it is, and a lease
@@ -316,6 +318,36 @@ def _step_8_timed_pins(conn: sqlite3.Connection) -> None:
           f"revoked) — recreated with expiry and ids that are never reused", flush=True)
 
 
+def _step_9_lease_ids(conn: sqlite3.Connection) -> None:
+    """v9 — ``leases`` is rebuilt from ``_LEASES_DDL`` with AUTOINCREMENT ids, for
+    v8's reason: the grant path sweeps expired leases and a revoke deletes one, so
+    without it the next lease can take the highest freed id while an open page still
+    offers to revoke the old one.
+
+    Copied, not dropped as v8 dropped the pins: the columns are unchanged, so every row
+    keeps its id and nothing is narrowed. Copying the ids sets the sequence too, so
+    numbering continues past them.
+
+    The OLD table is renamed aside, where v1 builds the new one under a temporary name,
+    so that the new one comes from the shared string. Safe because nothing refers to
+    ``leases``: no foreign key, trigger or view follows the rename.
+
+    The table may be ABSENT, though only on a damaged store: a fresh one stopped after
+    its stamp but before its DDL, or a partial restore. The DDL after ``_migrate``
+    creates it then, where a rename here would refuse to boot."""
+    if not _columns(conn, "leases"):
+        return
+    conn.execute("ALTER TABLE leases RENAME TO leases_v8")
+    conn.execute(_LEASES_DDL)
+    copied = conn.execute(
+        "INSERT INTO leases(id, host, client_class, approval_id, created_at, "
+        "expires_at, granted_by) SELECT id, host, client_class, approval_id, "
+        "created_at, expires_at, granted_by FROM leases_v8").rowcount
+    conn.execute("DROP TABLE leases_v8")
+    print(f"control-plane: rebuilt leases ({copied} row(s) copied) with ids that are "
+          f"never reused", flush=True)
+
+
 # Ordered, and the order is the only thing that decides what runs: a step is applied
 # when its version exceeds the store's, so steps must be APPEND-ONLY and never
 # renumbered, reordered or edited once shipped — a store in the field has already run
@@ -330,6 +362,7 @@ _STEPS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = (
     (6, "persisted pattern on approvals", _step_6_persisted_pattern),
     (7, "audit actor column", _step_7_audit_actor),
     (8, "timed pins: tool_pins recreated", _step_8_timed_pins),
+    (9, "lease ids: leases rebuilt", _step_9_lease_ids),
 )
 
 

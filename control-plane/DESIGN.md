@@ -731,8 +731,8 @@ that widens a pin set already in place (`holds._resolve_tool_ask_pinned`). The c
 a reader that cannot learn: code from before v8 reads every timed pin as permanent,
 lapsed ones included, as code from before v1 applies a class-scoped rule to every
 client. Delete the timed pins before older code runs on the store. A pin is also the one
-policy row a migration may discard, which is how v8 gets its AUTOINCREMENT ids: a pin
-only allows, so dropping one sends its calls back to a card.
+policy row a migration may discard, which is why v8 could drop the pins rather than
+copy them: a pin only allows, so dropping one sends its calls back to a card.
 
 **`approvals` splits the same way; the operator's queue does not.** The approvals
 table is egress-shaped exactly as `rules` is — `host`, `port`, `proto`, `client`,

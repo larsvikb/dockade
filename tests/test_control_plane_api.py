@@ -2533,6 +2533,22 @@ class LeaseGrantTests(_CPTestCase):
         _resolve("hold-1", "allow_lease")
         self.assertEqual([r["host"] for r in self._leases()], ["api.example.com"])
 
+    def test_a_swept_leases_id_is_not_handed_to_the_next(self):
+        # A revoke from a page still showing the swept lease must miss, not end the
+        # lease that took its place.
+        now = time.time()
+        with cp.store._connect() as conn:
+            swept = conn.execute(
+                "INSERT INTO leases(host, client_class, approval_id, created_at, "
+                "expires_at, granted_by) VALUES ('old.example.com', ?, 'x', ?, ?, 'y')",
+                (CLASS, now - 100, now - 1)).lastrowid
+            conn.commit()
+        _hold("api.example.com")
+        _resolve("hold-1", "allow_lease")
+        resp = cp.api_egress.revoke_lease(swept, _FakeRequest())
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual([r["host"] for r in self._leases()], ["api.example.com"])
+
     def test_an_expired_card_does_not_leave_a_live_lease_behind(self):
         # The race the `updated` guard closes. The waiter's timeout and this call race
         # for one conditional UPDATE; if the lease were written outside that guard —
@@ -5668,6 +5684,61 @@ class SchemaVersionTests(_FreshStoreTestCase):
             self.assertIn("expires_at", cp.store._columns(conn, "tool_pins"))
             self.assertEqual(conn.execute(
                 "SELECT COUNT(*) FROM audit WHERE stage='tool-policy'").fetchone()[0], 0)
+
+    # `leases` as v2 created it, before AUTOINCREMENT.
+    _LEASES_V8 = """CREATE TABLE leases (
+        id INTEGER PRIMARY KEY, host TEXT NOT NULL, client_class TEXT NOT NULL,
+        approval_id TEXT NOT NULL, created_at REAL NOT NULL, expires_at REAL NOT NULL,
+        granted_by TEXT NOT NULL)"""
+
+    def test_v9_rebuilds_the_leases_keeping_each_under_its_id(self):
+        self._old_store("version-lease-ids.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            conn.execute("DROP TABLE leases")
+            conn.execute(self._LEASES_V8)
+            conn.executemany(
+                "INSERT INTO leases(id, host, client_class, approval_id, created_at, "
+                "expires_at, granted_by) VALUES (?, ?, ?, ?, 0, ?, 'g')",
+                [(1, "lapsed.test", CLASS, "a", 1.0),
+                 (2, "live.test", CLASS, "b", time.time() + 900)])
+            conn.execute("PRAGMA user_version = 8")
+            conn.commit()
+        cp.store._init_db()
+        self.assertEqual(self._version(), cp.store.SCHEMA_VERSION)
+        with cp.store._connect() as conn:
+            self.assertEqual(
+                [(r["id"], r["host"], r["approval_id"]) for r in conn.execute(
+                    "SELECT id, host, approval_id FROM leases ORDER BY id")],
+                [(1, "lapsed.test", "a"), (2, "live.test", "b")])
+            self.assertIn("AUTOINCREMENT", conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name='leases'").fetchone()[0])
+            self.assertIsNone(conn.execute(
+                "SELECT name FROM sqlite_master WHERE name='leases_v8'").fetchone())
+        # Carried, so the live one still decides and nothing was narrowed.
+        self.assertEqual(cp.policy._decide("live.test", CLASS)[0], "allow")
+        # The highest id swept, and the next lease does not take it.
+        with cp.store._connect() as conn:
+            conn.execute("DELETE FROM leases WHERE id=2")
+            new_id = conn.execute(
+                "INSERT INTO leases(host, client_class, approval_id, created_at, "
+                "expires_at, granted_by) VALUES ('next.test', ?, 'c', 0, 0, 'g')",
+                (CLASS,)).lastrowid
+        self.assertEqual(new_id, 3)
+
+    def test_v9_on_a_store_missing_the_leases_table_still_boots(self):
+        # A damaged store, not one any release leaves: refusing to boot over it would
+        # leave hand SQL as the only way out, and the DDL creates the table anyway.
+        self._old_store("version-lease-ids-no-table.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            conn.execute("DROP TABLE leases")
+            conn.execute("PRAGMA user_version = 8")
+            conn.commit()
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            self.assertIn("AUTOINCREMENT", conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name='leases'").fetchone()[0])
 
     def test_a_store_already_renamed_is_left_alone(self):
         # `ALTER TABLE ... RENAME COLUMN` raises rather than no-ops if it runs twice.

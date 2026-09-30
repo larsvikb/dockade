@@ -24,13 +24,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && update-alternatives --set editor /usr/bin/vim.basic
 
 # chromium-headless-shell — so a test can drive a web frontend in a real browser
-# engine over the DevTools protocol. Upstream's OLD headless, kept as a separate build
-# on the same engine, and chosen over the full `chromium` (both measured in NOTES.md):
-# it is smaller, it is the build Playwright uses for headless runs (Playwright pins
-# its own copy of it), and it makes no calls of its own, where the full browser calls
-# Google at every start and each call reaches the approval queue. The full browser's
-# extras do not apply: there is no GPU here, and tests script notifications and tab
-# visibility in either build. Early, and its own layer, because it is the largest.
+# engine over the DevTools protocol. Chosen over the full `chromium` (both measured in
+# NOTES.md): it is smaller, it is the build Playwright uses for headless runs
+# (Playwright pins its own copy of it), and it makes no calls of its own, where the
+# full browser calls Google at every start and each call reaches the approval queue.
+# Early, and its own layer, because it is the largest.
 #
 # Switch to `chromium` when the harness finds Playwright cannot drive this build, when
 # a check passes in an operator's browser and fails only here, when Playwright stops
@@ -48,13 +46,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends chromium-headle
     && apt-get clean && rm -rf /var/lib/apt/lists/* \
     && dpkg-query -W chromium-headless-shell \
     && profile="$(mktemp -d)" \
-    && out="$(chromium-headless-shell --headless --no-sandbox --disable-dev-shm-usage \
-              --user-data-dir="$profile" --dump-dom 'data:text/html,<p>ok</p>' 2>/dev/null \
-              || true)" \
-    && rm -rf "$profile" \
+    && out="$(timeout 60 chromium-headless-shell --headless --no-sandbox \
+              --disable-dev-shm-usage --user-data-dir="$profile" \
+              --dump-dom 'data:text/html,<p>ok</p>' 2>"$profile.err" || true)" \
     && if [[ "$out" != *'<p>ok</p>'* ]]; then \
-         echo "chromium-headless-shell did not render a page" >&2; exit 1; \
-       fi
+         echo "chromium-headless-shell did not render within 60s; stderr ends:" >&2; \
+         tail -n 20 "$profile.err" >&2; exit 1; \
+       fi \
+    && rm -rf "$profile" "$profile.err"
 
 # Node.js — current LTS line (greenfield coding baseline). Even-numbered majors
 # are LTS; bump this to the next even major (24 -> 26 -> ...) to move LTS lines.

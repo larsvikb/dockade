@@ -154,8 +154,9 @@ egress** — sandbox-net only. These make good practices cheap and fast. Example
 - local scratch DB, cache, docs mirror
 - headless browser **only if** its egress is forced through the governed proxy
   (otherwise it is an ungoverned egress hole — treat as governed). The one in the
-  tier-1 image qualifies without being a service: it runs inside the sandbox, whose
-  only route out is the proxy.
+  tier-1 image qualifies without being a service: it runs inside the sandbox, so its
+  egress is the sandbox's — the proxy in governed mode, and in the standalone fallback
+  the same direct allowlist as every other process there.
 
 ## Networks
 
@@ -2093,8 +2094,8 @@ build` does not accept — so it would mean diverging CI from `make verify-build
 property that makes CI reproducible locally. The measured cold build came in far below
 the 5–15 minutes that would have justified the divergence, so it buys nothing (that
 figure and the image sizes from the same run are in `NOTES.md`). Worth knowing that
-**tier 2 is smaller only by the browser tier 1 carries** — without it the two are the
-same size, despite tier 2 being the thinner *tier*: "thin client" describes where
+**tier 2 is smaller only by the browser tier 1 carries** — without it both came out
+at about 1.2 GB, despite tier 2 being the thinner *tier*: "thin client" describes where
 inference runs and what capability it holds, not the toolchain both tiers inherit
 from `sandbox-common`.
 

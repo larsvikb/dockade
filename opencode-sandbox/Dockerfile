@@ -28,8 +28,8 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # Baseline. Leaner than tier 1 where the omission is principled: no
 # openssh-client (with no egress there is no git remote to reach), no
 # build-essential, no hadolint/shellcheck (this tier evaluates the local model,
-# it does not lint this repo). iptables/ipset/dnsutils are required by the shared
-# firewall script.
+# it does not lint this repo), no browser. iptables/ipset/dnsutils are required by
+# the shared firewall script.
 #
 # python3 IS included, despite the lean intent, because of an asymmetry specific
 # to this tier: with no egress, `pip install` and `npm install` cannot fetch

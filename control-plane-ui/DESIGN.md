@@ -241,11 +241,14 @@ value-flow class but largely asserts its own shape and needs editing on every ma
 change. A headless browser is the only thing that catches *layout-level* deception (a
 warning that renders invisible, a confirm button that lands under the pointer), but it
 does not merely add a dependency — it breaks the property that this suite runs
-identically on a host, in CI, **and inside the sandbox image**, where it would skip for
-want of egress to install a browser. That is precisely the "silently checks nothing where
-the agent actually runs" failure `DOCKADE_REQUIRE_TOOLS` exists to prevent. Revisit if
-the UI ever gains a control whose mistake the backend cannot refuse and the response
-cannot report.
+identically on a host, in CI, **and inside the sandbox image**. The image now carries
+a headless browser (`claude-sandbox/Dockerfile`), so that third leg holds; the other two
+do not by themselves — a host without a browser skips such a test, and CI's strict mode
+(`DOCKADE_REQUIRE_TOOLS`) fails it, which is the "silently checks nothing" failure that
+mode exists to prevent. Revisit if the UI ever gains a control whose mistake the backend
+cannot refuse and the response cannot report — or when a change moves `start()`'s
+untested code wholesale, as the `app.js` split does; its test harness has to answer the
+host and CI legs.
 
 **Tabbed views + traffic-light favicon, both driven by "don't hide a failing state."**
 Approvals / Audit / Policy are tabs (via `location.hash`, with arrow-key nav), and

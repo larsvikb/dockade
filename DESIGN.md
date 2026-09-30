@@ -153,7 +153,10 @@ egress** — sandbox-net only. These make good practices cheap and fast. Example
 - language servers, linters, formatters
 - local scratch DB, cache, docs mirror
 - headless browser **only if** its egress is forced through the governed proxy
-  (otherwise it is an ungoverned egress hole — treat as governed)
+  (otherwise it is an ungoverned egress hole — treat as governed). The one in the
+  tier-1 image qualifies without being a service: it runs inside the sandbox, so its
+  egress is the sandbox's — the proxy in governed mode, and in the standalone fallback
+  the same direct allowlist as every other process there.
 
 ## Networks
 
@@ -469,9 +472,11 @@ single-container image and launcher centered on this design. Notable properties:
   the one trade-off, minor under rebuild-to-update.
 - Baseline stack: **Node, current LTS** + pipx, plus baked linters
   (shellcheck / hadolint / ruff / yamllint, all self-contained so they run under
-  default-deny egress). Node tracks the latest LTS line (even majors); bump the NodeSource
-  `setup_NN.x` major to move it. Firewall allowlist trimmed to this design
-  (Anthropic + GitHub + npm + PyPI).
+  default-deny egress), and Chromium's headless shell, so a test can drive a web
+  frontend in a real browser engine (why the shell, and when to switch to the full
+  browser: `claude-sandbox/Dockerfile`). Node tracks the latest LTS line (even
+  majors); bump the NodeSource `setup_NN.x` major to move it. Firewall allowlist
+  trimmed to this design (Anthropic + GitHub + npm + PyPI).
 - **Own user-defined bridge `sandbox-net`** (owned by `docker-compose.yml`,
   created idempotently by the launcher when the compose infra is absent), not
   Docker's default bridge — gets embedded DNS (`127.0.0.11`, which the firewall
@@ -2091,9 +2096,10 @@ build` does not accept — so it would mean diverging CI from `make verify-build
 property that makes CI reproducible locally. The measured cold build came in far below
 the 5–15 minutes that would have justified the divergence, so it buys nothing (that
 figure and the image sizes from the same run are in `NOTES.md`). Worth knowing that
-**tier 2 is not the smaller image** despite being the thinner *tier* — "thin client"
-describes where inference runs and what capability it holds, not the toolchain both
-tiers inherit from `sandbox-common`.
+**tier 2 is smaller only by the browser tier 1 carries** — without it both came out
+at about 1.2 GB, despite tier 2 being the thinner *tier*: "thin client" describes where
+inference runs and what capability it holds, not the toolchain both tiers inherit
+from `sandbox-common`.
 
 *Each of the incidents above is recorded blow-by-blow in the commit that fixed it, which
 is the copy that is dated and cannot drift. What is kept here is the resulting invariant.*

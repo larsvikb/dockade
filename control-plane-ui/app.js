@@ -2578,6 +2578,11 @@ function start() {
       cells.push({ key: `${cell.dataset.pin}@${cell.dataset.expires}`,
                    lapsed: left.lapsed });
     }
+    // Only the rows on screen are remembered, so the map is no longer than the table.
+    const shown = new Set(cells.map(c => c.key));
+    for (const key of pinLapsesAsked.keys()) {
+      if (!shown.has(key)) pinLapsesAsked.delete(key);
+    }
     const due = pinLapsesDue(cells, pinLapsesAsked, now);
     for (const key of due) pinLapsesAsked.set(key, now);
     if (due.length) refreshToolPins();

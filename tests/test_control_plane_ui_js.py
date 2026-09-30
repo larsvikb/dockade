@@ -4339,6 +4339,8 @@ class PinnedAllowTableSourceTests(unittest.TestCase):
         self.assertIn("const due = pinLapsesDue(cells, pinLapsesAsked, now)", tick)
         self.assertIn("for (const key of due) pinLapsesAsked.set(key, now)", tick)
         self.assertIn("if (due.length) refreshToolPins()", tick)
+        # And forgets the rows no longer shown, so a page left open does not grow it.
+        self.assertIn("if (!shown.has(key)) pinLapsesAsked.delete(key)", tick)
         self.assertEqual(tick.count("refreshToolPins("), 1)
         self.assertIn("updatePinCountdowns();", src.split("setInterval(() => {", 1)[1]
                       .split("}, 1000)", 1)[0])

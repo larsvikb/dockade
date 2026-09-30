@@ -124,6 +124,8 @@ def api_config() -> dict:
         # So the lease button labels itself from the server. For the same reason the
         # action is ``allow_lease``, not named after a number.
         "lease_seconds": policy.LEASE_SECONDS,
+        # The same, for the pin panel's timed button (``allow_pinned_lease``).
+        "pin_lease_seconds": policy.PIN_LEASE_SECONDS,
         # ``create_rule`` refuses a class it does not know. Not derived from the rules:
         # a class with none yet, the one most in need of its first, would be missing.
         "client_classes": list(policy._class_names()),

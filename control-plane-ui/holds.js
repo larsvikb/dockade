@@ -9,6 +9,7 @@
  * (tests/test_control_plane_ui_js.py).
  */
 import { escapePayload } from "./payload.js";
+import { durationWords, fmtStamp } from "./time.js";
 
 // What changed between the pending list on screen and the one just pushed, keyed by
 // approval id so a surviving card is kept and updated IN PLACE.
@@ -57,31 +58,44 @@ export function toolOutcomeMessage(d) {
     return { text: "✕ denied · the call will not run", tone: "bad" };
   }
   // The fields come back from the BACKEND, so this reports what was pinned rather
-  // than what was ticked, and says so when nothing new was written.
+  // than what was ticked, and says so when nothing new was written. The deadline is
+  // the pin's as stored, not the button's, and a pin with none is said to be "for
+  // good" outright: a timed click on values already pinned for good leaves that pin
+  // permanent, and whoever clicked must not come away thinking the grant has an end.
+  // A date and not only a time, since four hours from the evening is tomorrow.
   const pin = d.pin;
+  const stamp = pin ? fmtStamp(pin.expires_at) : "";
+  const what = !pin ? ""
+    : pin.created ? "pinned"
+    : pin.extended ? (stamp ? "pin extended" : "pin made permanent")
+    : "already pinned";
+  const forGood = pin && !stamp && !pin.extended ? " for good" : "";
+  const until = stamp ? ` until ${stamp}` : "";
   const pinned = !pin ? ""
-    : ` · ${pin.created ? "pinned" : "already pinned"} on `
-      + `${(pin.fields || []).join(", ")} (pin ${pin.id})`;
+    : ` · ${what}${forGood} on ${(pin.fields || []).join(", ")}${until} (pin ${pin.id})`;
   return { text: `✓ allowed${pinned} · runs when the agent returns for it`,
            tone: "ok" };
 }
 
 // What "Allow + pin" is about to write, for the confirm panel: which calls it will
-// answer from now on, and which arguments stay free. `options` is the card's
-// `pin_options` (policy._pin_candidates), so every field and value here is one the
-// backend offered for this call; `chosen` is the field names ticked.
+// answer, which arguments stay free, and a label for each of its two buttons. `options`
+// is the card's `pin_options` (policy._pin_candidates), so every field and value here
+// is one the backend offered for this call; `chosen` is the field names ticked.
+// `leaseSeconds` is `/api/config`'s `pin_lease_seconds`, for the timed button's label
+// only: the backend owns the duration, so an unknown one still pins, "for a while".
 //
 // Values are spelled with every non-ASCII character escaped, as the pins table shows
 // them (`pinText` in mcp.js): a pin value is an identifier, and this is the last look
 // at it before it becomes standing policy.
-export function pinPreview(options, chosen, tool, server) {
+export function pinPreview(options, chosen, tool, server, leaseSeconds) {
   const offered = (options && options.fields) || [];
   const ticked = new Set(chosen || []);
   const picked = offered.filter(f => ticked.has(f.field));
+  const lasting = `for ${durationWords(leaseSeconds) || "a while"}`;
   if (!picked.length) {
     return { ok: false, fields: [],
              text: "Tick the fields a later call must match exactly.",
-             label: "Pick a field to pin" };
+             label: "Pin for good", timedLabel: `Pin ${lasting}` };
   }
   const free = [...offered.filter(f => !ticked.has(f.field)).map(f => f.field),
                 ...((options && options.unpinnable) || []).map(u => u.field)];
@@ -90,10 +104,12 @@ export function pinPreview(options, chosen, tool, server) {
   const rest = free.length
     ? `Every other argument is free: ${free.join(", ")}, and any this call did not set.`
     : "Every argument this call carries is pinned; one it did not set is still free.";
+  const names = picked.map(f => f.field).join(", ");
   return { ok: true, fields: picked.map(f => f.field),
-           text: `Allows this call, and from now on every ${tool} call on ${server} `
-               + `with ${conditions} runs without a card. ${rest}`,
-           label: `Confirm — allow and pin ${picked.map(f => f.field).join(", ")}` };
+           text: `Allows this call, and every later ${tool} call on ${server} `
+               + `with ${conditions} runs without a card while the pin lasts. ${rest}`,
+           label: `Confirm — allow and pin ${names} for good`,
+           timedLabel: `Confirm — allow and pin ${names} ${lasting}` };
 }
 
 export function diffPending(shownIds, list) {

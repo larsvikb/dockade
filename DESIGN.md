@@ -2118,7 +2118,7 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | GitHub write set — `GITHUB_READ_ONLY` off behind the gateway, with per-tool repo scoping | planned |
 | — | pinned allows — `tool_pins`, read under an `ask` rule only; listed and revocable in the MCP tab | **done** |
 | — | pinning from a tool card — `allow_pinned` and the field picker | **done** |
-| — | timed pins — `allow_pinned_lease`, `expires_at` on `tool_pins` | **done** — API only; the card's button waits on the `app.js` split |
+| — | timed pins — `allow_pinned_lease`, `expires_at` on `tool_pins`, the pin panel's timed button | **done** |
 | — | `mcp-net` + MCP server catalogue (`mcp-servers.yml`) | **done** |
 | — | per-client-class egress policy | **done** |
 | — | tool policy: store (`tool_rules`, `mcp_servers`) + config API (`/api/mcp/…`) | **done** |

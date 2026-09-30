@@ -7,7 +7,9 @@
  * No DOM at import, so the unit tests import this file under node
  * (tests/test_control_plane_ui_js.py).
  */
+import { leaseCountdown, leaseRemaining } from "./leases.js";
 import { escapePayload } from "./payload.js";
+import { tsSeconds } from "./time.js";
 
 // The DNS label a server name has to be. Three spellings of one rule — here, in the
 // relay's path pattern, and in `policy._server_name_error` — each load-bearing in a
@@ -291,6 +293,33 @@ export function pinText(pinsJson) {
   const raw = typeof pinsJson === "string" ? pinsJson : "";
   const text = escapePayload(raw);
   return { text, escaped: text !== raw };
+}
+
+// A pin's expiry as its cell in the MCP tab: "never" for a permanent pin, and for a
+// timed one the lease countdown, read from the pin's own absolute deadline. `lapsed`
+// means the row should be asked about (`pinLapsesDue`).
+export function pinExpiry(expiresAt, nowMs) {
+  if (tsSeconds(expiresAt) === null) {
+    return { text: "never", urgent: false, lapsed: false, timed: false };
+  }
+  const left = leaseRemaining(expiresAt, nowMs);
+  return { ...leaseCountdown(left), lapsed: left === 0, timed: true };
+}
+
+// Nothing polls the pins table, so a row that lapses on screen asks for it. Not once
+// only: with the browser's clock ahead of the control plane's, the backend still lists
+// a pin this page reads as lapsed, and a single refetch would leave the row at "0s"
+// until something else redraws. Not every tick either, which would make the tick a
+// poll. So a lapsed row asks again this often, for as long as the skew lasts.
+export const PIN_LAPSE_RETRY_MS = 5000;
+
+// The keys of the lapsed cells due a refetch now: never asked about, or last asked
+// `PIN_LAPSE_RETRY_MS` ago or more. `cells` are `{ key, lapsed }`, the key naming a pin
+// and its deadline, so an id reused under a new deadline counts as a new row; `asked`
+// maps a key to when it was last asked about.
+export function pinLapsesDue(cells, asked, nowMs) {
+  return cells.filter(c => c.lapsed).map(c => c.key)
+    .filter(key => !asked.has(key) || nowMs - asked.get(key) >= PIN_LAPSE_RETRY_MS);
 }
 
 // Whether a pin decides anything now, and if not, which condition fails. `decides` is

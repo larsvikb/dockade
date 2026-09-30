@@ -8,6 +8,7 @@
  */
 
 import { COUNTDOWN_URGENT_S } from "./holds.js";
+import { durationWords } from "./time.js";
 
 // A lease is the middle rung of the resolve ladder — this request, this host for a
 // while, this pattern forever — so the button granting one has to say WHICH of the
@@ -22,11 +23,8 @@ import { COUNTDOWN_URGENT_S } from "./holds.js";
 // length. The button still WORKS in that state, because the backend owns the duration
 // and does not need the page to tell it: what is unknown here is only what to call it.
 export function leaseLabel(seconds) {
-  const s = Number(seconds);
-  if (!Number.isFinite(s) || s <= 0) return "Allow for a while";
-  if (s % 3600 === 0) return `Allow for ${s / 3600} h`;
-  if (s % 60 === 0) return `Allow for ${s / 60} min`;
-  return `Allow for ${Math.round(s)} s`;
+  const words = durationWords(seconds);
+  return words ? `Allow for ${words}` : "Allow for a while";
 }
 
 // How long a live lease has left, from its own ABSOLUTE deadline. The same discipline
@@ -45,13 +43,16 @@ export function leaseRemaining(expiresAt, nowMs) {
 
 // A lease's remaining time as a cell: the text, and whether it is about to lapse.
 // `urgent` reuses COUNTDOWN_URGENT_S so "nearly out of time" looks the same here as on
-// a hold card — two thresholds would make the same colour mean two things.
+// a hold card — two thresholds would make the same colour mean two things. The units
+// are the backend's reasons' (`policy._short_duration`).
 export function leaseCountdown(remainingS) {
   if (remainingS === null) return { text: "unknown", urgent: false };
   const whole = Math.max(0, Math.floor(remainingS));
   const mins = Math.floor(whole / 60);
+  const pad = n => String(n).padStart(2, "0");
   return {
-    text: mins >= 1 ? `${mins}m ${String(whole % 60).padStart(2, "0")}s` : `${whole}s`,
+    text: whole >= 3600 ? `${Math.floor(whole / 3600)}h ${pad(mins % 60)}m`
+        : mins >= 1 ? `${mins}m ${pad(whole % 60)}s` : `${whole}s`,
     urgent: whole <= COUNTDOWN_URGENT_S,
   };
 }

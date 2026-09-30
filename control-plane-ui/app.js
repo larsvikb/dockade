@@ -27,7 +27,7 @@ import { leaseLabel, leaseRemaining, leaseCountdown, groupLeases } from "./lease
 import {
   SERVER_NAME_RE, serverDescriptor, serverPreview, serverEditBody,
   toolChoices, toolRulePreview, toolEditPreview, toolRevokePreview,
-  pinText, pinState,
+  pinText, pinState, pinExpiry, pinLapsesDue,
 } from "./mcp.js";
 import {
   renderableHolds, diffPending, shouldSweep, DWELL_MS,
@@ -85,6 +85,9 @@ function start() {
   // cosmetic, while a locally-computed expiry could show a grant ending at a time it
   // does not, and the second failure is the one that matters.
   let leaseSeconds = null;
+  // Seconds a timed pin lasts, from the same GET, for the pin panel's timed button
+  // label and nothing else, for the same reason.
+  let pinLeaseSeconds = null;
 
   // ── views ─────────────────────────────────────────────────────────────────
   const VIEWS = ["approvals", "audit", "policy", "tools"];
@@ -302,8 +305,9 @@ function start() {
   //: A tool ask's answers. Deliberately not ACTIONS above: the backend keeps
   //: per-surface action sets and refuses the egress vocabulary here, so a shared list
   //: would render buttons that 400. `allow_pinned` is the one that writes standing
-  //: policy, so it opens a confirm panel. "Allow this tool forever" is not here: it is
-  //: promoting the rule in the MCP tab, not a rung anyone should reach by clicking twice.
+  //: policy, so it opens a confirm panel, whose buttons send it or its timed twin
+  //: `allow_pinned_lease`. "Allow this tool forever" is not here: it is promoting the
+  //: rule in the MCP tab, not a rung anyone should reach by clicking twice.
   const TOOL_CARD_ACTIONS = [["allow", "Allow", "allow"],
                              ["allow_pinned", "Allow + pin…", "allow"],
                              ["deny", "Deny", "deny"]];
@@ -460,18 +464,26 @@ function start() {
       choices.append(line);
     }
 
+    // Two confirms, the shorter grant first, as the egress card orders its lease
+    // before its persist.
     const cactions = document.createElement("div");
     cactions.className = "cactions";
+    const goTimed = document.createElement("button");
+    goTimed.className = "confirmgo allow";
     const go = document.createElement("button");
     go.className = "confirmgo allow";
     const cancel = document.createElement("button");
     cancel.textContent = "Cancel";
     cancel.addEventListener("click", () => cancelConfirm(entry));
+    goTimed.addEventListener("click", () => {
+      const p = pinPreview(options, entry.pinned(), a.tool, a.server, pinLeaseSeconds);
+      if (p.ok) resolve(a, "allow_pinned_lease", null, p.fields);
+    });
     go.addEventListener("click", () => {
-      const p = pinPreview(options, entry.pinned(), a.tool, a.server);
+      const p = pinPreview(options, entry.pinned(), a.tool, a.server, pinLeaseSeconds);
       if (p.ok) resolve(a, "allow_pinned", null, p.fields);
     });
-    cactions.append(go, cancel);
+    cactions.append(goTimed, go, cancel);
 
     box.addEventListener("keydown", e => {
       if (e.key === "Escape") { e.preventDefault(); cancelConfirm(entry); }
@@ -479,16 +491,19 @@ function start() {
 
     box.append(what, choices, cactions);
     Object.assign(entry, {
-      confirm: box, cwhat: what, confirmBtn: go, pinBoxes: boxes, pinOptions: options,
+      confirm: box, cwhat: what, confirmBtn: go, timedBtn: goTimed, pinBoxes: boxes,
+      pinOptions: options,
       pinned: () => boxes.filter(t => t.checked).map(t => t.value),
     });
   }
 
   function renderPinPreview(entry, a) {
-    const p = pinPreview(entry.pinOptions, entry.pinned(), a.tool, a.server);
+    const p = pinPreview(entry.pinOptions, entry.pinned(), a.tool, a.server,
+                         pinLeaseSeconds);
     entry.cwhat.textContent = p.text;
-    entry.confirmBtn.disabled = !p.ok;
+    entry.confirmBtn.disabled = entry.timedBtn.disabled = !p.ok;
     entry.confirmBtn.textContent = p.label;
+    entry.timedBtn.textContent = p.timedLabel;
   }
 
   function askPin(a) {
@@ -797,8 +812,8 @@ function start() {
     setMessage(entry, d.text, "bad");
   }
 
-  // `pattern` is sent only for the `*_persist` actions, and `pins` only for
-  // `allow_pinned`, and each is only ever what the backend itself offered on this
+  // `pattern` is sent only for the `*_persist` actions, and `pins` only for the two
+  // pinning actions, and each is only ever what the backend itself offered on this
   // approval (it re-derives and re-validates the set, so the choice is bounded there
   // too, not merely here).
   async function resolve(a, action, pattern, pins) {
@@ -1081,6 +1096,7 @@ function start() {
   // push a redraw at the moment one is needed.
   setInterval(() => {
     updateCountdowns(); sweep(); renderSaturation(); updateLeaseCountdowns();
+    updatePinCountdowns();
   }, 1000);
 
   // ── config (the hold window behind the countdown) ─────────────────────────
@@ -1099,6 +1115,9 @@ function start() {
       const ls = Number(c.lease_seconds);
       leaseSeconds = Number.isFinite(ls) && ls > 0 ? ls : null;
       relabelLeaseButtons();
+      // Needs no relabelling: a pin panel reads it each time it renders.
+      const ps = Number(c.pin_lease_seconds);
+      pinLeaseSeconds = Number.isFinite(ps) && ps > 0 ? ps : null;
       // The classes a rule may be scoped to, from the backend rather than guessed:
       // `create_rule` refuses one it does not know, so a guessed list offers rules that
       // cannot be written. Filtered to strings for the same reason the window above is
@@ -2520,6 +2539,14 @@ function start() {
       tag.textContent = state.live ? "live" : "inert";
       stateCell.append(tag, ` ${state.text}`);
       tr.appendChild(stateCell);
+      // `data-expires` lets the one-second tick move it, as in the leases table.
+      const left = pinExpiry(row.expires_at, Date.now());
+      const leftCell = cell(left.text,
+                            left.timed ? `lease-left${left.urgent ? " urgent" : ""}` : "");
+      if (left.timed) {
+        leftCell.dataset.expires = String(row.expires_at);
+        leftCell.dataset.pin = String(row.id);
+      }
       cell(row.created_at ? fmtStamp(row.created_at) : "", "ts");
       // Not a revoke-time confirm: taking a pin back only sends its calls to a card.
       const actions = document.createElement("td");
@@ -2536,6 +2563,29 @@ function start() {
       rows.length ? `· ${rows.length} pin${rows.length === 1 ? "" : "s"}` : "· none";
     renderListStatus(toolPinsEmpty,
                      toolPinsStatus(rows.length, toolPinsFailed, toolPinsLoaded));
+  }
+
+  // The expiry cells, as `updateLeaseCountdowns` moves the leases'. The table is
+  // redrawn only when a lapsed row is due a refetch (`pinLapsesDue`).
+  const pinLapsesAsked = new Map();
+  function updatePinCountdowns() {
+    const now = Date.now();
+    const cells = [];
+    for (const cell of toolPinsBody.querySelectorAll("td.lease-left")) {
+      const left = pinExpiry(cell.dataset.expires, now);
+      cell.textContent = left.text;
+      cell.classList.toggle("urgent", left.urgent);
+      cells.push({ key: `${cell.dataset.pin}@${cell.dataset.expires}`,
+                   lapsed: left.lapsed });
+    }
+    // Only the rows on screen are remembered, so the map is no longer than the table.
+    const shown = new Set(cells.map(c => c.key));
+    for (const key of pinLapsesAsked.keys()) {
+      if (!shown.has(key)) pinLapsesAsked.delete(key);
+    }
+    const due = pinLapsesDue(cells, pinLapsesAsked, now);
+    for (const key of due) pinLapsesAsked.set(key, now);
+    if (due.length) refreshToolPins();
   }
 
   async function refreshToolPins() {
@@ -2565,8 +2615,13 @@ function start() {
       const res = await fetch(`/api/mcp/pins/${id}/revoke`, { method: "POST" });
       const body = await res.json().catch(() => ({}));
       if (!res.ok || !body.ok) {
-        window.alert(`Could not revoke: ${body.detail || res.status}`);
+        // A 404 is the ordinary race, as for a lease: the pin was revoked elsewhere,
+        // or lapsed and was swept, after this table was drawn.
+        window.alert(res.status === 404
+          ? "That pin is already gone — it was revoked elsewhere, or expired."
+          : `Could not revoke: ${body.detail || res.status}`);
         btn.disabled = false;
+        refreshToolPins();
         return;
       }
     } catch (e) {

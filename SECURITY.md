@@ -142,7 +142,9 @@ report.
   frontend (and their honest limit)" in `control-plane-ui/DESIGN.md`.
 - **The read-write workspace bind mount as a delayed path to host execution.**
   Anything the agent writes there — a git hook, a build script, `.envrc`, an editor
-  task file — runs outside the sandbox the next time the host touches the repo. The
+  task file, Claude Code project config such as a skill or `settings.local.json` —
+  runs outside the sandbox the next time the host touches the repo; a host Claude Code
+  session picks up the last kind live. The
   launcher's workspace guard hard-refuses dangerous roots and warns on nearby
   credentials, which narrows the path rather than closing it. This is the
   acknowledged cost of the one deliberate host coupling.

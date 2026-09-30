@@ -767,9 +767,10 @@ here, and the alternative to it is `make destroy`** — which discards the polic
 and the audit history, i.e. the crown jewels. The mechanism (a stamped schema
 version, append-only ordered steps, and the three edits a new column needs) lives in
 `control-plane/store.py`: read the NOTE below `_init_db` before touching the schema.
-Migration runs forward only. A store newer than the code refuses to boot (`_migrate`),
-because older code can read newer policy more widely than it was written. The way back
-past a step is `make restore` of a backup taken before it, not an older image.
+Migration runs forward only, and a store newer than the code refuses to boot (`_migrate`
+says why). So the way back past a step takes both an older image and `make restore` of
+a backup from before the step. The older image alone refuses to start, and a restore
+under the newer image migrates forward again at the next boot.
 
 Standing egress policy has all three verbs — create, revoke, and change as one atomic
 operation rather than revoke-then-create (see "Changing a rule is one operation, not

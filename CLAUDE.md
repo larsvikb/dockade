@@ -50,6 +50,8 @@ only the invariants and conventions for working in the repo.
 - New recurring workflow → make it a skill. Skills encode good practice, not
   just access.
 - Don't commit or push unless asked.
+- In the main session, before handing a commit over for push, run the
+  `review-before-push` skill.
 
 ### Where writing goes
 

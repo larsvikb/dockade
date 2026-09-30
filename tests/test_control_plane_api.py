@@ -2759,6 +2759,12 @@ class ConfigViewTests(_CPTestCase):
         finally:
             cp.policy.LEASE_SECONDS = saved
 
+    def test_config_serves_the_pin_lease_duration_for_the_pin_panel(self):
+        saved = cp.policy.PIN_LEASE_SECONDS
+        cp.policy.PIN_LEASE_SECONDS = 300.0
+        self.addCleanup(setattr, cp.policy, "PIN_LEASE_SECONDS", saved)
+        self.assertEqual(cp.api_views.api_config()["pin_lease_seconds"], 300.0)
+
     def test_config_reports_the_classes_a_rule_can_be_scoped_to(self):
         self.assertEqual(cp.api_views.api_config()["client_classes"],
                          list(cp.policy._class_names()))
@@ -2776,7 +2782,8 @@ class ConfigViewTests(_CPTestCase):
         # names pass that test — they are network LABELS, and the CIDRs behind them
         # stay here.
         self.assertEqual(set(cp.api_views.api_config()),
-                         {"hold_timeout", "lease_seconds", "client_classes"})
+                         {"hold_timeout", "lease_seconds", "pin_lease_seconds",
+                          "client_classes"})
 
 
 class SaturationTests(_CPTestCase):

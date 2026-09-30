@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-/* Timestamps as the page shows them. Formatted here, in the page's own locale, and
- * the reasons are below.
+/* Timestamps as the page shows them, and a configured duration in words. Formatted
+ * here, in the page's own locale, and the reasons are below.
  */
 
 // Formatted HERE rather than deferred to the viewer's locale, and that is a
@@ -55,6 +55,18 @@ export function fmtStamp(ts) {
   return d ? `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} `
              + fmtTime(ts)
            : "";
+}
+
+// A configured duration for a button to name — "4 h", "30 min", "90 s" — or null when
+// it is unusable, which includes the `null` that stands for "the first /api/config has
+// not answered yet". Shared by the egress lease button and the pin panel, so the two
+// grants that expire say how long in the same words.
+export function durationWords(seconds) {
+  const s = Number(seconds);
+  if (!Number.isFinite(s) || s <= 0) return null;
+  if (s % 3600 === 0) return `${s / 3600} h`;
+  if (s % 60 === 0) return `${s / 60} min`;
+  return `${Math.round(s)} s`;
 }
 
 // The unambiguous instant, for a `title` on audit rows. The displayed stamp is LOCAL

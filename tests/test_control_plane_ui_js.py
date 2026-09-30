@@ -122,7 +122,7 @@ const owner = {
                       "editPreview"],
   "mcp.js": ["serverDescriptor", "serverPreview", "serverEditBody",
              "toolChoices", "toolRulePreview", "toolEditPreview", "toolRevokePreview",
-             "pinText", "pinState"],
+             "pinText", "pinState", "pinExpiry", "pinLapsesDue"],
   "leases.js": ["leaseLabel", "leaseRemaining", "leaseCountdown", "leaseDomain",
                 "groupLeases"],
   "status.js": ["pollStatus", "auditStatus", "rulesStatus", "toolRulesStatus",
@@ -135,7 +135,7 @@ const owner = {
   "payload.js": ["payloadDisclosure", "payloadTokens", "indentPayload",
                  "escapePayload", "payloadHazards", "renderPayload"],
   "provenance.js": ["shortActor"],
-  "time.js": ["fmtTime", "fmtStamp", "fmtInstant"],
+  "time.js": ["fmtTime", "fmtStamp", "fmtInstant", "durationWords"],
 };
 const modules = Object.fromEntries(await Promise.all(
   Object.keys(owner).map(async name => [name, await load(name)])));
@@ -247,6 +247,27 @@ console.log(JSON.stringify({
       status_empty: m.toolPinsStatus(0, false, true),
       status_stale: m.toolPinsStatus(2, true, true),
       status_quiet: m.toolPinsStatus(1, false, true),
+      // A deadline at t=2000 or t=20000, read from a browser clock at t=1000s. The
+      // string is how the tick reads it back, from `data-expires`.
+      expiry_permanent: m.pinExpiry(null, 1000 * 1000),
+      expiry_minutes: m.pinExpiry(2000, 1000 * 1000),
+      expiry_hours: m.pinExpiry(20000, 1000 * 1000),
+      expiry_from_the_cell: m.pinExpiry("2000", 1000 * 1000),
+      expiry_lapsed: m.pinExpiry(1000, 5000 * 1000),
+      // Keys are `pin@deadline`. Pin 1 was asked about at t=10000 ms; `1@9000` is the
+      // same id under a new deadline.
+      lapses: (() => {
+        const asked = new Map([["1@2000", 10000]]);
+        const cells = [{ key: "1@2000", lapsed: true }, { key: "2@3000", lapsed: false },
+                       { key: "1@9000", lapsed: true }];
+        return {
+          first: m.pinLapsesDue([{ key: "1@2000", lapsed: true }], new Map(), 10000),
+          too_soon: m.pinLapsesDue(cells, asked, 10000 + m.PIN_LAPSE_RETRY_MS - 1),
+          again: m.pinLapsesDue(cells, asked, 10000 + m.PIN_LAPSE_RETRY_MS),
+          live: m.pinLapsesDue([{ key: "2@3000", lapsed: false }], new Map(), 0),
+          retry_ms: m.PIN_LAPSE_RETRY_MS,
+        };
+      })(),
     };
   })(),
   lamp: {
@@ -359,6 +380,25 @@ console.log(JSON.stringify({
     already_pinned: m.toolOutcomeMessage({ outcome: "allow",
                                            pin: { id: 3, fields: ["repo"],
                                                   created: false } }),
+    // A timed pin, and the two ways a second grant widens one. 1786055405 is
+    // 2026-08-07 00:30:05 in Stockholm, as in `stamps` below.
+    pinned_timed: m.toolOutcomeMessage({ outcome: "allow",
+                                         pin: { id: 4, fields: ["repo"], created: true,
+                                                extended: false,
+                                                expires_at: 1786055405 } }),
+    renewed: m.toolOutcomeMessage({ outcome: "allow",
+                                    pin: { id: 4, fields: ["repo"], created: false,
+                                           extended: true, expires_at: 1786055405 } }),
+    made_permanent: m.toolOutcomeMessage({ outcome: "allow",
+                                           pin: { id: 4, fields: ["repo"],
+                                                  created: false, extended: true,
+                                                  expires_at: null } }),
+    // A timed click on a pin that has more time left, after the duration was
+    // configured shorter.
+    already_timed: m.toolOutcomeMessage({ outcome: "allow",
+                                          pin: { id: 4, fields: ["repo"],
+                                                 created: false, extended: false,
+                                                 expires_at: 1786055405 } }),
     // The card's pin panel. `repo` carries a U+0430, which the panel must spell out.
     pin_preview: (() => {
       const options = { fields: [{ field: "owner", value: '"larsvikb"' },
@@ -366,11 +406,12 @@ console.log(JSON.stringify({
                         unpinnable: [{ field: "reviewers", why: "a list" }],
                         refused: null };
       const bare = { ...options, unpinnable: [] };
-      const p = (o, chosen) => m.pinPreview(o, chosen, "create_pull_request",
-                                            "mcp-github");
+      const p = (o, chosen, seconds = 14400) =>
+        m.pinPreview(o, chosen, "create_pull_request", "mcp-github", seconds);
       return { none: p(options, []), both: p(options, ["owner", "repo"]),
                owner: p(options, ["owner"]), every: p(bare, ["owner", "repo"]),
-               unoffered: p(options, ["reviewers", "nope"]) };
+               unoffered: p(options, ["reviewers", "nope"]),
+               unknown_duration: p(options, ["owner"], null) };
     })(),
     // The announcement is the only place a screen-reader user learns WHICH decision
     // arrived, so a tool ask read out as a host describes the wrong sort of thing.
@@ -972,6 +1013,9 @@ console.log(JSON.stringify({
     remaining_past: m.leaseRemaining(1000, 5000 * 1000),
     remaining_unknown: m.leaseRemaining(undefined, 0),
     cell_minutes: m.leaseCountdown(1805),
+    cell_hour: m.leaseCountdown(3600),
+    cell_hours: m.leaseCountdown(14399),
+    words: [14400, 1800, 90, null, 0, "soon"].map(m.durationWords),
     cell_seconds: m.leaseCountdown(9),
     cell_at_urgent: m.leaseCountdown(m.COUNTDOWN_URGENT_S),
     cell_outside_urgent: m.leaseCountdown(m.COUNTDOWN_URGENT_S + 1),
@@ -1456,11 +1500,25 @@ class PageScriptTests(unittest.TestCase):
         self.assertIn("returns", tool["allowed"]["text"])
         self.assertEqual(tool["allowed"]["tone"], "ok")
         # What the backend PINNED, and whether it was new.
-        self.assertIn("pinned on owner, repo (pin 3)", tool["pinned"]["text"])
-        self.assertIn("already pinned on repo", tool["already_pinned"]["text"])
+        self.assertIn("pinned for good on owner, repo (pin 3)", tool["pinned"]["text"])
+        self.assertIn("already pinned for good on repo", tool["already_pinned"]["text"])
+        self.assertNotIn("until", tool["pinned"]["text"])
         self.assertNotIn("pinned", tool["allowed"]["text"])
         self.assertIn("not run", tool["denied"]["text"])
         self.assertEqual(tool["nothing"]["tone"], "bad")   # unknown fails to denied
+
+    def test_a_timed_pin_says_until_when_as_stored(self):
+        # The deadline the backend returned, with its date: four hours from the
+        # evening is tomorrow.
+        tool = self.probe["tool"]
+        self.assertIn("pinned on repo until 2026-08-07 00:30:05 (pin 4)",
+                      tool["pinned_timed"]["text"])
+        self.assertIn("pin extended on repo until 2026-08-07 00:30:05",
+                      tool["renewed"]["text"])
+        self.assertIn("pin made permanent on repo (pin 4)",
+                      tool["made_permanent"]["text"])
+        self.assertIn("already pinned on repo until 2026-08-07 00:30:05 (pin 4)",
+                      tool["already_timed"]["text"])
 
     def test_a_new_tool_ask_is_announced_as_a_tool_and_not_as_a_host(self):
         # The live region is the only place a screen-reader user learns which decision
@@ -1561,12 +1619,18 @@ class PageScriptTests(unittest.TestCase):
     def test_a_lease_cell_reads_as_a_clock(self):
         lease = self.probe["lease"]
         self.assertEqual(lease["cell_minutes"]["text"], "30m 05s")
+        self.assertEqual(lease["cell_hour"]["text"], "1h 00m")
+        self.assertEqual(lease["cell_hours"]["text"], "3h 59m")
         self.assertEqual(lease["cell_seconds"]["text"], "9s")
         # A deadline the page cannot compute says so rather than showing "0s", which
         # would read as a grant about to lapse — the one thing an urgency signal must
         # never say when it does not know.
         self.assertEqual(lease["cell_unknown"]["text"], "unknown")
         self.assertFalse(lease["cell_unknown"]["urgent"])
+
+    def test_both_expiring_grants_name_their_duration_in_the_same_words(self):
+        self.assertEqual(self.probe["lease"]["words"],
+                         ["4 h", "30 min", "90 s", None, None, None])
 
     def test_a_lease_about_to_lapse_is_flagged_at_the_same_threshold_as_a_hold(self):
         # One threshold, so the same colour means one thing across the page.
@@ -4213,6 +4277,30 @@ class PinnedAllowViewTests(unittest.TestCase):
                 self.assertFalse(pins[key]["live"])
                 self.assertIn(words, pins[key]["text"])
 
+    def test_a_permanent_pin_never_expires_and_a_timed_one_counts_down(self):
+        pins = self.probe["pins"]
+        self.assertEqual(pins["expiry_permanent"]["text"], "never")
+        self.assertFalse(pins["expiry_permanent"]["timed"])
+        self.assertEqual(pins["expiry_minutes"]["text"], "16m 40s")
+        self.assertEqual(pins["expiry_hours"]["text"], "5h 16m")
+        self.assertEqual(pins["expiry_from_the_cell"], pins["expiry_minutes"])
+        self.assertFalse(pins["expiry_minutes"]["lapsed"])
+
+    def test_a_pin_that_lapses_on_screen_is_the_moment_to_ask_again(self):
+        lapsed = self.probe["pins"]["expiry_lapsed"]
+        self.assertTrue(lapsed["lapsed"])
+        self.assertEqual(lapsed["text"], "0s")
+
+    def test_a_lapsed_row_asks_again_on_a_slow_timer_and_never_every_tick(self):
+        # Slow enough that the tick is never a poll, and repeated, so a browser clock
+        # ahead of the control plane's cannot leave the row at "0s" for good.
+        lapses = self.probe["pins"]["lapses"]
+        self.assertEqual(lapses["retry_ms"], 5000)
+        self.assertEqual(lapses["first"], ["1@2000"])
+        self.assertEqual(lapses["too_soon"], ["1@9000"])
+        self.assertEqual(lapses["again"], ["1@2000", "1@9000"])
+        self.assertEqual(lapses["live"], [])
+
     def test_the_status_line_says_what_an_empty_or_stale_list_means(self):
         pins = self.probe["pins"]
         self.assertTrue(pins["status_empty"]["show"])
@@ -4240,6 +4328,20 @@ class PinnedAllowTableSourceTests(unittest.TestCase):
 
     def test_a_refused_poll_is_not_rendered_as_no_pins(self):
         self.assertIn("if (!res.ok) throw", self.poll)
+
+    def test_a_timed_pins_cell_carries_its_deadline_for_the_tick(self):
+        self.assertIn("leftCell.dataset.expires = String(row.expires_at)", self.rows)
+        src = APP_JS.read_text()
+        tick = _fn_body(src, "updatePinCountdowns()")
+        # The tick moves cells, and fetches the table again only for the rows
+        # `pinLapsesDue` names, recording when it asked.
+        self.assertNotIn("renderToolPins", tick)
+        self.assertIn("const due = pinLapsesDue(cells, pinLapsesAsked, now)", tick)
+        self.assertIn("for (const key of due) pinLapsesAsked.set(key, now)", tick)
+        self.assertIn("if (due.length) refreshToolPins()", tick)
+        self.assertEqual(tick.count("refreshToolPins("), 1)
+        self.assertIn("updatePinCountdowns();", src.split("setInterval(() => {", 1)[1]
+                      .split("}, 1000)", 1)[0])
 
     def test_there_is_no_way_to_add_a_pin_from_this_view(self):
         # A pin is written by resolving a card, as a lease is.
@@ -4271,7 +4373,8 @@ class PinPanelTests(unittest.TestCase):
         # anything the call did not set.
         self.assertIn("free: repo, reviewers, and any this call did not set",
                       owner["text"])
-        self.assertEqual(owner["label"], "Confirm — allow and pin owner")
+        self.assertEqual(owner["label"], "Confirm — allow and pin owner for good")
+        self.assertEqual(owner["timedLabel"], "Confirm — allow and pin owner for 4 h")
 
     def test_a_value_is_spelled_out_before_it_becomes_policy(self):
         both = self.probe["tool"]["pin_preview"]["both"]
@@ -4281,6 +4384,14 @@ class PinPanelTests(unittest.TestCase):
     def test_pinning_every_field_still_says_what_is_free(self):
         every = self.probe["tool"]["pin_preview"]["every"]
         self.assertIn("one it did not set is still free", every["text"])
+
+    def test_the_timed_button_promises_no_number_it_does_not_know(self):
+        # Before /api/config answers. The backend owns the duration, so the button
+        # still pins; what is unknown is only what to call it.
+        unknown = self.probe["tool"]["pin_preview"]["unknown_duration"]
+        self.assertEqual(unknown["timedLabel"], "Confirm — allow and pin owner for a while")
+        self.assertEqual(self.probe["tool"]["pin_preview"]["none"]["timedLabel"],
+                         "Pin for 4 h")
 
     def test_only_offered_fields_can_be_pinned(self):
         unoffered = self.probe["tool"]["pin_preview"]["unoffered"]
@@ -4307,8 +4418,13 @@ class PinPanelSourceTests(unittest.TestCase):
         self.assertNotIn("checked = true", self.panel)
 
     def test_confirm_sends_only_what_the_preview_confirmed(self):
-        self.assertIn('resolve(a, "allow_pinned", null, p.fields)', self.panel)
-        self.assertIn("if (p.ok)", self.panel)
+        self.assertIn('if (p.ok) resolve(a, "allow_pinned", null, p.fields)', self.panel)
+        self.assertIn('if (p.ok) resolve(a, "allow_pinned_lease", null, p.fields)',
+                      self.panel)
+
+    def test_the_shorter_grant_comes_first(self):
+        # As the egress card orders its lease before its persist.
+        self.assertIn("cactions.append(goTimed, go, cancel)", self.panel)
 
     def test_the_panel_sits_below_the_buttons(self):
         body = re.search(r"function buildToolCard\(a\) \{(.*?)\n  \}", self.src,

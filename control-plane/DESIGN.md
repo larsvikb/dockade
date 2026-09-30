@@ -729,8 +729,8 @@ answers, and the readers that must know are few and name it: the decision
 (`policy._answering_pin`), the pins view, the rule revoke's pin check, and the write
 that widens a pin set already in place (`holds._resolve_tool_ask_pinned`). The cost is
 a reader that cannot learn: code from before v8 reads every timed pin as permanent,
-lapsed ones included, so this is the first schema step whose rollback widens policy.
-Delete the timed pins before older code runs on the store. A pin is also the one
+lapsed ones included, as code from before v1 applies a class-scoped rule to every
+client. Delete the timed pins before older code runs on the store. A pin is also the one
 policy row a migration may discard, which is how v8 gets its AUTOINCREMENT ids: a pin
 only allows, so dropping one sends its calls back to a card.
 

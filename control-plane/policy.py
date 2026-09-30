@@ -504,13 +504,6 @@ _PIN_VALUE_MAX = 200
 PIN_LEASE_SECONDS = _grant_seconds("CONTROL_PIN_LEASE_SECONDS", "14400")
 
 
-def _readable_deadline(expires_at: object) -> bool:
-    """Whether a stored ``expires_at`` is one this code wrote: NULL or a number. Any
-    other value is a store edited by hand, and such a row must never grant. SQLite
-    orders text above every number, so the query's ``expires_at > ?`` passes it."""
-    return expires_at is None or isinstance(expires_at, (int, float))
-
-
 def _pin_value(value: object) -> str | None:
     """``value`` in the form a pin holds and compares, or None if no pin can hold it.
 
@@ -633,8 +626,6 @@ def _answering_pin(conn, server: str, tool: str, args: object,
             "WHERE server = ? AND tool = ? AND (expires_at IS NULL OR expires_at > ?) "
             "ORDER BY expires_at IS NOT NULL, expires_at DESC, id",
             (server, tool, now)):
-        if not _readable_deadline(row["expires_at"]):
-            continue
         pins = _parse_pins(row["pins_json"])
         if pins is not None and _pin_matches(pins, args):
             return row["id"], pins, row["expires_at"]

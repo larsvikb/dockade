@@ -3902,17 +3902,16 @@ class McpPinTests(_CPTestCase):
         self.assertEqual(
             _tool_call(tool="create_pull_request", args=_PR_ARGS)["decision"], "allow")
 
-    def test_a_deadline_this_code_did_not_write_never_grants(self):
-        # A hand-edited store: SQLite orders text above every number, so the query
-        # alone would read this pin as live.
+    def test_a_deadline_that_is_not_a_number_cannot_be_stored(self):
+        # SQLite orders text above every number, so a text deadline would read as live
+        # in every query on this table. The column refuses it, hand edits included.
         with cp.store._connect() as conn:
-            conn.execute("UPDATE tool_pins SET expires_at='2099-01-01'")
-            conn.commit()
-        self.assertEqual(
-            _tool_call(tool="create_pull_request", args=_PR_ARGS)["decision"], "ask")
-        [served] = cp.api_mcp.api_mcp_pins()
-        self.assertIsNone(served["pins"])
-        self.assertFalse(served["decides"])
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "CHECK"):
+                conn.execute("UPDATE tool_pins SET expires_at='2099-01-01'")
+            # A number written as text is a number: the column's REAL affinity.
+            conn.execute("UPDATE tool_pins SET expires_at='4102444800'")
+            self.assertEqual(conn.execute(
+                "SELECT typeof(expires_at) FROM tool_pins").fetchone()[0], "real")
 
     def test_expired_pins_do_not_hold_their_rule_and_go_with_it(self):
         # An expired pin cannot come back with the next `ask` rule, so it holds

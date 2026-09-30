@@ -272,8 +272,10 @@ _TOOL_PINS_DDL = """
         created_at  REAL NOT NULL,
         granted_by  TEXT NOT NULL,   -- provenance of the resolver (provenance._actor)
         -- NULL for a permanent pin (`allow_pinned`), the deadline for a timed one
-        -- (`allow_pinned_lease`).
-        expires_at  REAL,
+        -- (`allow_pinned_lease`). Nothing else can be stored, a hand edit included:
+        -- SQLite orders text above every number, so a text deadline would read as
+        -- live in every query here.
+        expires_at  REAL CHECK (expires_at IS NULL OR typeof(expires_at) = 'real'),
         UNIQUE(server, tool, pins_json)
     )"""
 

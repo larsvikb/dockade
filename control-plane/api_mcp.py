@@ -419,8 +419,7 @@ def api_mcp_pins() -> list[dict]:
     ``decides`` is the conditions ``policy._decide_tool`` reads a pin under, so the
     view cannot call a pin live that the decision passes over: the tool's rule is
     `ask`, its server is enabled, and the row holds a pin set. ``pins`` is None for a
-    row that does not (``policy._parse_pins``), or whose deadline this code did not
-    write (``policy._readable_deadline``). An expired pin is left out rather
+    row that does not (``policy._parse_pins``). An expired pin is left out rather
     than listed as deciding nothing, as ``api_egress.api_leases`` leaves out an
     expired lease: nothing will make it decide again.
 
@@ -438,8 +437,7 @@ def api_mcp_pins() -> list[dict]:
             "ORDER BY p.server, p.tool, p.id", (time.time(),)).fetchall()
     out = []
     for r in rows:
-        pins = (policy._parse_pins(r["pins_json"])
-                if policy._readable_deadline(r["expires_at"]) else None)
+        pins = policy._parse_pins(r["pins_json"])
         out.append({"id": r["id"], "server": r["server"], "tool": r["tool"],
                     "pins": pins, "pins_json": r["pins_json"], "rule": r["action"],
                     "decides": (pins is not None and r["action"] == "ask"

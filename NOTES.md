@@ -544,9 +544,72 @@ and its workload cannot grow the way tier 1's can.
 for the compose services, 68s `claude-sandbox`, 54s `opencode-sandbox`. That is the
 number that settled the CI cache question — the estimate that would have justified
 diverging CI from `make verify-build` was 5–15 minutes. Image sizes from the same run:
-both sandbox tiers ~**1.2 GB**, the services **142–255 MB**. Both tiers are large for
+both sandbox tiers ~**1.2 GB**, the services **142–255 MB**. Both tiers were large for
 the same reason, and it is the toolchain they share from `sandbox-common` rather than
-anything about what either tier is allowed to do.
+anything about what either tier is allowed to do. Tier 1 has since gained a browser,
+measured in the next section.
+
+## Chromium in the tier-1 image: what it costs, and what it calls
+
+Measured 2026-09-30 on the reference machine. The shell measured was
+`154.0.8037.57-1~deb13u1`; the full browser came from the same archive the same day.
+
+**Size.** Each Debian package installed as one layer on top of the existing 1.20 GB
+`claude-sandbox`: `chromium` adds **701 MB** (42s to build the layer),
+`chromium-headless-shell` **542 MB** (31s). The image this repo builds with the shell
+came out 543 MB over the one without. The gap is smaller than the names suggest, most
+likely because most of either is the engine and the libraries they share. What the
+extra 160 MB buys is the current headless mode: Chrome 132 removed the old one from
+the browser, and it survives only as the separate headless-shell build, which Debian's
+package description calls the "old headless shell"
+([Chrome's announcement](https://developer.chrome.com/blog/removing-headless-old-from-chrome)).
+It is not abandoned — it is built for every Chrome release, it gets the same Debian
+security updates (one source package), and Playwright uses its own pinned copy of it
+for headless runs by default — but it is a separate implementation from the browser an
+operator runs. Both logged a screenful of D-Bus connection errors on every run we made
+(there is no bus in the container) without being affected by it.
+
+**Under the launcher's limits, either build leaves most of the budget.** Inside a
+sandbox started by `run-claude-sandbox.sh` (no capabilities, `no-new-privileges`, 4 GiB
+with no swap, 512 pids), with the browser holding the control-plane UI open — every
+module loaded — and `make test` running:
+
+| Build | Threads | Processes | PSS | Container anon, peak |
+| --- | --- | --- | --- | --- |
+| `chromium` | ~110 | 9 | 391 MiB | 216 MiB |
+| `chromium-headless-shell` | 69 | 7 | 199 MiB | 129 MiB |
+
+The rows are not quite like for like: the full browser ran with the quieting flags
+listed below and the shell with none, though the full browser's one unflagged run came
+out much the same (113 threads in 9 processes). Claude Code adds 13 threads of its own;
+with it and the full browser the container peaked at **139 of 512** tasks. The pids
+limit counts threads, so what would reach it is concurrent browsers: with Claude Code
+and `make test` holding about 24, seven shells fit and an eighth would not, four full
+browsers and not a fifth. PSS came out higher than everything the container was
+charged, most likely because it counts the browser's share of its mapped binary, whose
+page cache the kernel had charged to an earlier container that loaded it first. The
+anon column is the whole container, `make test` included, Claude Code not.
+
+**Full Chromium calls Google at start, and flags do not stop it.** Through `https_proxy`
+each call is a held request — `www.google.com`, `update.googleapis.com`,
+`redirector.gvt1.com` and `clients2.google.com` arrived as approval cards on the first
+run. With the standard quieting flags (`--disable-background-networking`,
+`--disable-component-update`, `--disable-sync`, `--disable-default-apps`,
+`--disable-domain-reliability`, `--no-first-run`, `--metrics-recording-only`) its netlog
+still names `accounts.google.com`, `android.clients.google.com`,
+`content-autofill.googleapis.com`, `optimizationguide-pa.googleapis.com`,
+`update.googleapis.com`, `clients2.google.com` and `www.google.com`; with
+`--no-proxy-server` those went direct and failed at DNS. Part of the reason is
+`/etc/chromium.d/`, which Debian's `/usr/bin/chromium` wrapper sources on every launch:
+it exports Debian's public Google API keys, presumably what switches on the signed-in
+services among those hosts. The same directory adds `--disable-dev-shm-usage` whenever
+`/dev/shm` is under 3.8 GB, which covers the sandbox's 64 MB.
+
+**The headless shell calls nothing.** The same netlog, the same page, with only
+`--no-proxy-server`, named no host but the page's. It gets neither half of the above:
+`/usr/bin/chromium-headless-shell` is a script that does not source `/etc/chromium.d/`,
+and the package installs nothing there — so no API keys, and no automatic
+`--disable-dev-shm-usage`, which a caller must pass itself inside a 64 MB `/dev/shm`.
 
 ## Publishing a host port: the private range is the wrong instinct on WSL2
 

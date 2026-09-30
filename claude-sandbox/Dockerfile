@@ -23,6 +23,37 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean && rm -rf /var/lib/apt/lists/* \
     && update-alternatives --set editor /usr/bin/vim.basic
 
+# chromium-headless-shell — so a test can drive a web frontend in a real browser
+# engine over the DevTools protocol. Upstream's OLD headless, kept as a separate build
+# on the same engine, and chosen over the full `chromium` (both measured in NOTES.md):
+# it is smaller, it is the build Playwright uses for headless runs (Playwright pins
+# its own copy of it), and it makes no calls of its own, where the full browser calls
+# Google at every start and each call reaches the approval queue. The full browser's
+# extras do not apply: there is no GPU here, and tests script notifications and tab
+# visibility in either build. Early, and its own layer, because it is the largest.
+#
+# Switch to `chromium` when the harness finds Playwright cannot drive this build, when
+# a check passes in an operator's browser and fails only here, when Playwright stops
+# using the shell for headless runs, or when upstream or Debian stops shipping it —
+# and launch the full browser with --no-proxy-server, or its calls become cards.
+#
+# Its egress is this container's, so the firewall governs it as it does curl's.
+# Callers pass --no-sandbox, because Chromium's own sandbox needs user namespaces or a
+# setuid helper, neither of which this container should grant; and
+# --disable-dev-shm-usage, because /dev/shm here is 64 MB and, unlike the full
+# browser's wrapper, nothing adds it for the shell. The build renders a page with both.
+RUN apt-get update && apt-get install -y --no-install-recommends chromium-headless-shell \
+    && apt-get clean && rm -rf /var/lib/apt/lists/* \
+    && dpkg-query -W chromium-headless-shell \
+    && profile="$(mktemp -d)" \
+    && out="$(chromium-headless-shell --headless --no-sandbox --disable-dev-shm-usage \
+              --user-data-dir="$profile" --dump-dom 'data:text/html,<p>ok</p>' 2>/dev/null \
+              || true)" \
+    && rm -rf "$profile" \
+    && if [[ "$out" != *'<p>ok</p>'* ]]; then \
+         echo "chromium-headless-shell did not render a page" >&2; exit 1; \
+       fi
+
 # Node.js — current LTS line (greenfield coding baseline). Even-numbered majors
 # are LTS; bump this to the next even major (24 -> 26 -> ...) to move LTS lines.
 RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \

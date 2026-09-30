@@ -25,7 +25,7 @@ import os
 import threading
 import time
 import uuid
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 import policy
 import store
@@ -613,12 +613,13 @@ class PinnedAnswer(NamedTuple):
     ``change`` is what the pin write did: "created", "extended" (a timed pin with the
     same values now lasts longer, or for good), or None when the pin in place already
     reached as far. ``expires_at`` is the pin's deadline as stored after the write,
-    None for a permanent pin."""
+    None for a permanent pin, and ``replaced`` the deadline an extension moved."""
     status: str | None
     refused: str | None
     pin_id: int | None
-    change: str | None
+    change: Literal["created", "extended"] | None
     expires_at: float | None
+    replaced: float | None
 
 
 def _resolve_tool_ask_pinned(approval_id: str, actor: str, pins_json: str,
@@ -635,7 +636,8 @@ def _resolve_tool_ask_pinned(approval_id: str, actor: str, pins_json: str,
 
     One row per pin set (the UNIQUE on ``tool_pins``), so a pin set already in place
     is only ever widened: no expiry beats any, and otherwise the later one wins.
-    Allowing a card never shortens a grant."""
+    Allowing a card never shortens a grant. A widened row names this card and this
+    resolver, who decided how far it now reaches; the audit keeps the first grant."""
     now = time.time()
     expires_at = None if lasts is None else now + lasts
     with store._connect() as conn:
@@ -646,7 +648,7 @@ def _resolve_tool_ask_pinned(approval_id: str, actor: str, pins_json: str,
                 "WHERE id=? AND status='pending'", (approval_id,)).fetchone()
             if ask is None:
                 conn.rollback()
-                return PinnedAnswer(None, None, None, None, None)
+                return PinnedAnswer(None, None, None, None, None, None)
             rule = conn.execute(
                 "SELECT action FROM tool_rules WHERE server=? AND tool=?",
                 (ask["server"], ask["tool"])).fetchone()
@@ -657,7 +659,7 @@ def _resolve_tool_ask_pinned(approval_id: str, actor: str, pins_json: str,
                 return PinnedAnswer(
                     None, f"{ask['tool']} on {ask['server']} {now_ruled} now, and a pin "
                           f"decides only under 'ask'; allow this call without a pin "
-                          f"instead", None, None, None)
+                          f"instead", None, None, None, None)
             conn.execute(
                 "UPDATE tool_approvals SET status='allowed', resolved_at=?, "
                 "resolved_by=? WHERE id=? AND status='pending'",
@@ -671,6 +673,7 @@ def _resolve_tool_ask_pinned(approval_id: str, actor: str, pins_json: str,
                 "SELECT id, expires_at FROM tool_pins "
                 "WHERE server=? AND tool=? AND pins_json=?",
                 (ask["server"], ask["tool"], pins_json)).fetchone()
+            replaced = None
             if existing is None:
                 pin_id = conn.execute(
                     "INSERT INTO tool_pins(server, tool, pins_json, approval_id, "
@@ -680,9 +683,10 @@ def _resolve_tool_ask_pinned(approval_id: str, actor: str, pins_json: str,
                 change = "created"
             elif existing["expires_at"] is not None and (
                     expires_at is None or expires_at > existing["expires_at"]):
-                pin_id = existing["id"]
-                conn.execute("UPDATE tool_pins SET expires_at=? WHERE id=?",
-                             (expires_at, pin_id))
+                pin_id, replaced = existing["id"], existing["expires_at"]
+                conn.execute(
+                    "UPDATE tool_pins SET expires_at=?, approval_id=?, granted_by=? "
+                    "WHERE id=?", (expires_at, approval_id, actor, pin_id))
                 change = "extended"
             else:
                 pin_id, expires_at = existing["id"], existing["expires_at"]
@@ -691,7 +695,7 @@ def _resolve_tool_ask_pinned(approval_id: str, actor: str, pins_json: str,
         except Exception:
             conn.rollback()
             raise
-    return PinnedAnswer("allowed", None, pin_id, change, expires_at)
+    return PinnedAnswer("allowed", None, pin_id, change, expires_at, replaced)
 
 
 def _claim_tool_ask(approval_id: str) -> dict | None:

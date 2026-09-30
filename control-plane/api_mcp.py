@@ -396,16 +396,18 @@ def revoke_mcp_rule(rule_id: int, request: Request) -> JSONResponse:
                            f"effect. Revoke them first, or edit the rule instead.",
                  "tool_pins": pins},
                 status_code=409)
-        conn.execute(
+        lapsed = conn.execute(
             "DELETE FROM tool_pins WHERE server=? AND tool=? AND expires_at <= ?",
-            (row["server"], row["tool"], now))
+            (row["server"], row["tool"], now)).rowcount
         conn.commit()
 
     store._audit("revoke", stage="tool-policy", server=row["server"], tool=row["tool"],
                  actor=actor,
                  reason=f"tool rule revoked; {row['tool']} on "
                         f"{row['server']} was {row['action']}, now unconfigured and "
-                        f"therefore denied")
+                        f"therefore denied"
+                        + (f"; {lapsed} expired pin(s) removed with it" if lapsed
+                           else ""))
     return JSONResponse({"ok": True, "id": rule_id, "server": row["server"],
                          "tool": row["tool"], "action": row["action"]})
 
@@ -417,7 +419,8 @@ def api_mcp_pins() -> list[dict]:
     ``decides`` is the conditions ``policy._decide_tool`` reads a pin under, so the
     view cannot call a pin live that the decision passes over: the tool's rule is
     `ask`, its server is enabled, and the row holds a pin set. ``pins`` is None for a
-    row that does not (``policy._parse_pins``). An expired pin is left out rather
+    row that does not (``policy._parse_pins``), or whose deadline this code did not
+    write (``policy._readable_deadline``). An expired pin is left out rather
     than listed as deciding nothing, as ``api_egress.api_leases`` leaves out an
     expired lease: nothing will make it decide again.
 
@@ -435,7 +438,8 @@ def api_mcp_pins() -> list[dict]:
             "ORDER BY p.server, p.tool, p.id", (time.time(),)).fetchall()
     out = []
     for r in rows:
-        pins = policy._parse_pins(r["pins_json"])
+        pins = (policy._parse_pins(r["pins_json"])
+                if policy._readable_deadline(r["expires_at"]) else None)
         out.append({"id": r["id"], "server": r["server"], "tool": r["tool"],
                     "pins": pins, "pins_json": r["pins_json"], "rule": r["action"],
                     "decides": (pins is not None and r["action"] == "ask"
@@ -456,10 +460,14 @@ def revoke_mcp_pin(pin_id: int, request: Request) -> JSONResponse:
     actor = provenance._actor(request)
     now = time.time()
     with store._connect() as conn:
+        # One write transaction, so the row the audit describes is the row deleted: a
+        # pinned grant in between could otherwise extend it.
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT server, tool, pins_json, expires_at FROM tool_pins WHERE id=?",
             (pin_id,)).fetchone()
         if row is None:
+            conn.rollback()
             return JSONResponse({"ok": False, "detail": "unknown pin"},
                                 status_code=404)
         conn.execute("DELETE FROM tool_pins WHERE id=?", (pin_id,))

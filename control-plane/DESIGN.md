@@ -727,9 +727,12 @@ learn "except the expired ones" (`store._step_2_leases`). A timed pin is the sam
 predicate under the same ceiling as a permanent one and differs only in how long it
 answers, and the readers that must know are few and name it: the decision
 (`policy._answering_pin`), the pins view, the rule revoke's pin check, and the write
-that widens a pin set already in place (`holds._resolve_tool_ask_pinned`). As for a
-lease, expiry is enforced in the read, and the sweep on the grant path only bounds
-the table.
+that widens a pin set already in place (`holds._resolve_tool_ask_pinned`). The cost is
+a reader that cannot learn: code from before v8 reads every timed pin as permanent,
+lapsed ones included, so this is the first schema step whose rollback widens policy.
+Delete the timed pins before older code runs on the store. A pin is also the one
+policy row a migration may discard, which is how v8 gets its AUTOINCREMENT ids: a pin
+only allows, so dropping one sends its calls back to a card.
 
 **`approvals` splits the same way; the operator's queue does not.** The approvals
 table is egress-shaped exactly as `rules` is — `host`, `port`, `proto`, `client`,

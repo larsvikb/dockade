@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import math
 import os
 import re
 import time
@@ -271,6 +272,18 @@ def _rule_error(pattern: str, action: str) -> str | None:
 
 
 # ── leases: an allow that expires ────────────────────────────────────────────
+def _grant_seconds(var: str, default: str) -> float:
+    """How long a timed grant lasts, from ``var``. Refused at startup unless finite and
+    above zero, because these numbers GRANT, where a hold bound can only deny: SQLite
+    stores a NaN deadline as NULL, which a pin reads as permanent, and an infinite one
+    never ends."""
+    seconds = float(os.environ.get(var, default))
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError(f"{var} must be a finite number of seconds above zero, "
+                         f"not {seconds!r}")
+    return seconds
+
+
 # How long an `allow_lease` grant decides for. Not to be confused with
 # ``holds.HOLD_TIMEOUT``: that bounds how long a human has to ANSWER, this how long
 # the answer LASTS (so nothing here is called a "window", which is taken).
@@ -279,7 +292,7 @@ def _rule_error(pattern: str, action: str) -> str | None:
 # closes a grant early: long enough that an agent finishes without a second card.
 # Configurable, which is why the action is not named for its duration — an
 # `allow_5m` button on a store set to 30 minutes would be a lie nothing catches.
-LEASE_SECONDS = float(os.environ.get("CONTROL_LEASE_SECONDS", "1800"))
+LEASE_SECONDS = _grant_seconds("CONTROL_LEASE_SECONDS", "1800")
 
 
 def _live_lease(conn, host: str, client_class: str, now: float):
@@ -488,7 +501,14 @@ _PIN_VALUE_MAX = 200
 # because the two cover different stretches of work: an egress lease the hosts behind
 # one page load, a pin the calls of a working session. An ergonomics number for the
 # reason that one is: `/api/mcp/pins/{id}/revoke` ends a pin early.
-PIN_LEASE_SECONDS = float(os.environ.get("CONTROL_PIN_LEASE_SECONDS", "14400"))
+PIN_LEASE_SECONDS = _grant_seconds("CONTROL_PIN_LEASE_SECONDS", "14400")
+
+
+def _readable_deadline(expires_at: object) -> bool:
+    """Whether a stored ``expires_at`` is one this code wrote: NULL or a number. Any
+    other value is a store edited by hand, and such a row must never grant. SQLite
+    orders text above every number, so the query's ``expires_at > ?`` passes it."""
+    return expires_at is None or isinstance(expires_at, (int, float))
 
 
 def _pin_value(value: object) -> str | None:
@@ -613,6 +633,8 @@ def _answering_pin(conn, server: str, tool: str, args: object,
             "WHERE server = ? AND tool = ? AND (expires_at IS NULL OR expires_at > ?) "
             "ORDER BY expires_at IS NOT NULL, expires_at DESC, id",
             (server, tool, now)):
+        if not _readable_deadline(row["expires_at"]):
+            continue
         pins = _parse_pins(row["pins_json"])
         if pins is not None and _pin_matches(pins, args):
             return row["id"], pins, row["expires_at"]
@@ -672,7 +694,6 @@ def _decide_tool(server: str, tool: str, args: object = None) -> tuple[str, str]
                else None)
     if pin is not None:
         pin_id, pins, expires_at = pin
-        # The remaining time in the reason, as a lease's is.
         left = ("" if expires_at is None
                 else f", {_short_duration(expires_at - now)} left")
         return "allow", (f"'allow' by pin {pin_id} ({tool} on {server}, pinned: "

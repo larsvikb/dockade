@@ -253,18 +253,65 @@ def _step_7_audit_actor(conn: sqlite3.Connection) -> None:
               "predate the column)", flush=True)
 
 
-def _step_8_pin_expiry(conn: sqlite3.Connection) -> None:
-    """v8 — ``tool_pins.expires_at``, so a pin can answer for a while rather than for
-    good. Existing pins keep NULL, which is what they were granted as: permanent.
+# PINNED ALLOWS: an `ask` answered in advance, for the calls whose arguments carry
+# these exact values (DESIGN.md, "A pinned allow is an ask answered in advance").
+#
+# ONE definition, shared by the v8 step and the fresh-store DDL, as `_LEASES_DDL` is.
+_TOOL_PINS_DDL = """
+    CREATE TABLE IF NOT EXISTS tool_pins (
+        -- Never reused: the audit and a revoke name a pin by it.
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        server      TEXT NOT NULL,
+        tool        TEXT NOT NULL,
+        -- The pinned fields and their values, as ONE canonical JSON object
+        -- (policy._canonical_pins), so that equal pins are equal strings and the
+        -- UNIQUE below means what it says.
+        pins_json   TEXT NOT NULL,
+        -- The card this was pinned from, as on `leases`.
+        approval_id TEXT NOT NULL,
+        created_at  REAL NOT NULL,
+        granted_by  TEXT NOT NULL,   -- provenance of the resolver (provenance._actor)
+        -- NULL for a permanent pin (`allow_pinned`), the deadline for a timed one
+        -- (`allow_pinned_lease`).
+        expires_at  REAL,
+        UNIQUE(server, tool, pins_json)
+    )"""
 
-    The only step whose table may be ABSENT. ``tool_pins`` came in with no step of
-    its own, so a store stamped v7 before it existed reaches here without one, and
-    the DDL in ``_init_db`` then creates it with the column."""
-    columns = _columns(conn, "tool_pins")
-    if columns and "expires_at" not in columns:
-        conn.execute("ALTER TABLE tool_pins ADD COLUMN expires_at REAL")
-        print("control-plane: added expires_at to tool_pins (existing pins keep NULL "
-              "— they were granted permanent)", flush=True)
+
+def _step_8_timed_pins(conn: sqlite3.Connection) -> None:
+    """v8 — ``tool_pins`` is dropped and created again (``_TOOL_PINS_DDL``), with
+    ``expires_at`` and AUTOINCREMENT ids. Without AUTOINCREMENT the expiry sweep hands
+    a swept pin's id to the next pin, while an audit row or an open page still names
+    the old one. The sequence starts past the dropped ids, for the same reason.
+
+    Dropped, not rebuilt: SQLite cannot add AUTOINCREMENT by ALTER, and a pin is the
+    one policy row a migration may discard (control-plane/DESIGN.md, "A timed pin is a
+    column"). Each dropped pin is audited in this transaction, since ``_audit`` would
+    wait on the write lock it holds.
+
+    The table may be ABSENT: ``tool_pins`` came in with no step of its own, so a store
+    stamped v7 before it existed reaches here without one."""
+    if not _columns(conn, "tool_pins"):
+        return
+    now = time.time()
+    dropped = conn.execute(
+        "SELECT id, server, tool, approval_id FROM tool_pins").fetchall()
+    last_id = max((pin["id"] for pin in dropped), default=None)
+    for pin in dropped:
+        conn.execute(
+            "INSERT INTO audit(ts, kind, stage, server, tool, approval_id, reason) "
+            "VALUES (?, 'revoke', 'tool-policy', ?, ?, ?, ?)",
+            (now, pin["server"], pin["tool"], pin["approval_id"],
+             f"pin {pin['id']} dropped by schema v8, which recreates the pins table; "
+             f"{pin['tool']} on {pin['server']} raises a card again until it is "
+             f"pinned anew"))
+    conn.execute("DROP TABLE tool_pins")
+    conn.execute(_TOOL_PINS_DDL)
+    if last_id is not None:
+        conn.execute("INSERT INTO sqlite_sequence(name, seq) VALUES ('tool_pins', ?)",
+                     (last_id,))
+    print(f"control-plane: dropped tool_pins ({len(dropped)} pin(s), each audited as "
+          f"revoked) — recreated with expiry and ids that are never reused", flush=True)
 
 
 # Ordered, and the order is the only thing that decides what runs: a step is applied
@@ -280,7 +327,7 @@ _STEPS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = (
     (5, "audit.decision becomes audit.kind", _step_5_decision_to_kind),
     (6, "persisted pattern on approvals", _step_6_persisted_pattern),
     (7, "audit actor column", _step_7_audit_actor),
-    (8, "pin expiry", _step_8_pin_expiry),
+    (8, "timed pins: tool_pins recreated", _step_8_timed_pins),
 )
 
 
@@ -408,28 +455,9 @@ def _init_db() -> None:
                 -- the other's identically named tool.
                 UNIQUE(server, tool)
             )""")
-        # PINNED ALLOWS: an `ask` answered in advance, for the calls whose arguments
-        # carry these exact values (DESIGN.md, "A pinned allow is an ask answered in
-        # advance"). New as a table, so it needed no `_STEPS` entry; `expires_at`,
-        # added to it later, did (v8).
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS tool_pins (
-                id          INTEGER PRIMARY KEY,
-                server      TEXT NOT NULL,
-                tool        TEXT NOT NULL,
-                -- The pinned fields and their values, as ONE canonical JSON object
-                -- (policy._canonical_pins), so that equal pins are equal strings and
-                -- the UNIQUE below means what it says.
-                pins_json   TEXT NOT NULL,
-                -- The card this was pinned from, as on `leases`.
-                approval_id TEXT NOT NULL,
-                created_at  REAL NOT NULL,
-                granted_by  TEXT NOT NULL,   -- provenance of the resolver (provenance._actor)
-                -- NULL for a permanent pin (`allow_pinned`), the deadline for a
-                -- timed one (`allow_pinned_lease`).
-                expires_at  REAL,
-                UNIQUE(server, tool, pins_json)
-            )""")
+        # Pinned allows (``_TOOL_PINS_DDL``). New as a table, so it needed no `_STEPS`
+        # entry until v8 recreated it.
+        conn.execute(_TOOL_PINS_DDL)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS audit (
                 id       INTEGER PRIMARY KEY,

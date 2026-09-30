@@ -358,18 +358,29 @@ def _allow_pinned(approval_id: str, ask: dict | None, fields: object,
              "status": current["status"] if current else None}, status_code=409)
 
     named = ", ".join(sorted(chosen))
-    # Used only where this click wrote the pin's deadline, so a deadline there is the
-    # full configured duration.
+    now = time.time()
+    # From the configured duration, as the egress lease's reason is
+    # (``api_authorize._decision_scope``). Read only where this click wrote the
+    # deadline.
     lasting = ("" if answer.expires_at is None else
                f" for {policy._short_duration(policy.PIN_LEASE_SECONDS)}")
+    # A click that changed nothing says what is in place, and what was asked for when
+    # that differs: a timed pin on values pinned for good is a permanent grant.
+    if answer.change:
+        in_place = ""
+    elif answer.expires_at is None:
+        in_place = (", already in place for good; a timed pin was asked for" if leased
+                    else ", already in place")
+    else:
+        in_place = (f", already in place with "
+                    f"{policy._short_duration(answer.expires_at - now)} left")
     where = dict(client=ask["client"], client_class=policy._client_class(ask["client"]),
                  actor=actor, server=ask["server"], tool=ask["tool"],
                  approval_id=approval_id)
     store._audit("allow", stage="tool-ask", **where,
                  reason=f"tool ask allowed and pinned on {named} (pin "
-                        f"{answer.pin_id}{'' if answer.change else ', already in place'}"
-                        f"); {ask['tool']} on {ask['server']} — the call runs only if "
-                        f"the agent returns for it")
+                        f"{answer.pin_id}{in_place}); {ask['tool']} on {ask['server']} "
+                        f"— the call runs only if the agent returns for it")
     # Standing policy, recorded as policy is: a new pin gets the word a rule's creation
     # gets, a pin that now lasts longer the word a rule's edit gets, and the pin's
     # revoke is the counterpart of both.
@@ -379,9 +390,11 @@ def _allow_pinned(approval_id: str, ask: dict | None, fields: object,
                             f"on {ask['server']} pinned on {named} runs without a card"
                             f"{lasting} while its rule asks")
     elif answer.change == "extended":
+        had = policy._short_duration(answer.replaced - now)
         store._audit("edit", stage="tool-policy", **where,
-                     reason=f"pin {answer.pin_id} extended from this ask; {ask['tool']} "
-                            f"on {ask['server']} pinned on {named} runs without a card"
+                     reason=f"pin {answer.pin_id} extended from this ask ({had} left "
+                            f"before it); {ask['tool']} on {ask['server']} pinned on "
+                            f"{named} runs without a card"
                             f"{lasting or ', with no expiry,'} while its rule asks")
     return JSONResponse({"ok": True, "kind": "tool", "outcome": "allow",
                          "status": answer.status, "server": ask["server"],

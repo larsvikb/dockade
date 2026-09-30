@@ -490,6 +490,23 @@ class TimedPinDecisionTests(unittest.TestCase):
         self.assertIn("pinned: owner, 1h59m left", self._decide()[1])
 
 
+class GrantSecondsTests(unittest.TestCase):
+    """A timed grant's duration is refused at startup unless finite and above zero:
+    a NaN deadline is stored as NULL, which a pin reads as permanent."""
+
+    def test_a_usable_duration_is_read(self):
+        with mock.patch.dict(os.environ, {"CONTROL_X": "14400"}):
+            self.assertEqual(cp.policy._grant_seconds("CONTROL_X", "1"), 14400.0)
+        self.assertEqual(cp.policy._grant_seconds("CONTROL_UNSET_X", "1800"), 1800.0)
+
+    def test_nan_infinity_and_nothing_are_refused(self):
+        for value in ("nan", "inf", "-inf", "0", "-5"):
+            with self.subTest(value=value), \
+                    mock.patch.dict(os.environ, {"CONTROL_X": value}), \
+                    self.assertRaisesRegex(ValueError, "CONTROL_X"):
+                cp.policy._grant_seconds("CONTROL_X", "1")
+
+
 class ShortDurationTests(unittest.TestCase):
     """``_short_duration`` reads in hours from an hour up, where a timed pin runs."""
 

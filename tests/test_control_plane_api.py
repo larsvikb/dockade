@@ -5374,6 +5374,18 @@ class SchemaVersionTests(_FreshStoreTestCase):
             self.assertIn("kind", {r["name"] for r in
                                    conn.execute("PRAGMA table_info(audit)")})
 
+    def test_a_store_newer_than_the_code_refuses_to_boot_and_is_left_alone(self):
+        # Older code can read newer policy more widely than it was written, so the
+        # way back past a step is a restore, never a quiet re-stamp.
+        self._use_store("version-newer.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            conn.execute(f"PRAGMA user_version = {cp.store.SCHEMA_VERSION + 1}")
+            conn.commit()
+        with self.assertRaisesRegex(RuntimeError, "newer than this code"):
+            cp.store._init_db()
+        self.assertEqual(self._version(), cp.store.SCHEMA_VERSION + 1)
+
     def test_the_steps_are_contiguous_and_end_at_the_declared_version(self):
         # ``SCHEMA_VERSION`` and ``_STEPS`` are two halves of one fact, and only this
         # holds them together. A step appended without the bump would never run (its

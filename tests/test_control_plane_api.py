@@ -3720,7 +3720,7 @@ def _pin(pins, tool="create_pull_request", server="mcp-github", expires_at=None)
     return pin_id
 
 
-_PINNED = {"owner": "larsvikb", "repo": "dockade"}
+_PINNED = {"owner": "acme", "repo": "dockade"}
 _PR_ARGS = {**_PINNED, "title": "t", "body": "b", "head": "topic", "base": "main"}
 
 
@@ -3755,7 +3755,7 @@ class PinnedAllowBridgeTests(_ToolBridgeTestCase):
 
     def test_a_call_that_misses_the_pin_raises_a_card_as_before(self):
         answer = _tool_call(tool="create_pull_request",
-                            args={**_PR_ARGS, "repo": "hemel"})
+                            args={**_PR_ARGS, "repo": "widgets"})
         self.assertEqual(answer["decision"], "ask")
         self.assertEqual(len(cp.holds._list_tool_asks()), 1)
 
@@ -3896,7 +3896,7 @@ class McpPinTests(_CPTestCase):
             cp.api_mcp.revoke_mcp_rule(self.rule_id, _FakeRequest()).status_code, 409)
 
     def test_a_refused_rule_revoke_counts_only_live_pins_and_keeps_the_lapsed_one(self):
-        lapsed = _pin({"owner": "larsvikb"}, expires_at=time.time() - 1)
+        lapsed = _pin({"owner": "acme"}, expires_at=time.time() - 1)
         refused = cp.api_mcp.revoke_mcp_rule(self.rule_id, _FakeRequest())
         self.assertEqual((refused.status_code, refused.body["tool_pins"]), (409, 1))
         with cp.store._connect() as conn:
@@ -4041,12 +4041,12 @@ class PinFromCardTests(_ToolBridgeTestCase):
     def test_a_pin_already_in_place_allows_the_call_and_writes_nothing(self):
         _resolve(self.ask, "allow_pinned", pins=["owner", "repo"])
         second = _tool_call(tool="create_pull_request",
-                            args={**_PR_ARGS, "repo": "hemel"})["approval_id"]
+                            args={**_PR_ARGS, "repo": "widgets"})["approval_id"]
         # The same values as the first pin, from a call it did not answer.
         with cp.store._connect() as conn:
             conn.execute("UPDATE tool_pins SET pins_json=?",
-                         (cp.policy._canonical_pins({"owner": "larsvikb",
-                                                     "repo": "hemel"}),))
+                         (cp.policy._canonical_pins({"owner": "acme",
+                                                     "repo": "widgets"}),))
             conn.commit()
         resp = _resolve(second, "allow_pinned", pins=["owner", "repo"])
         self.assertEqual(resp.status_code, 200)
@@ -4071,7 +4071,7 @@ class PinFromCardTests(_ToolBridgeTestCase):
         for row in rows:
             self.assertIn("owner, repo", row["reason"])
             self.assertIsNotNone(row["actor"])
-            self.assertNotIn("larsvikb", row["reason"])
+            self.assertNotIn("acme", row["reason"])
 
 
 class TimedPinFromCardTests(_ToolBridgeTestCase):

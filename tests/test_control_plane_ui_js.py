@@ -232,7 +232,7 @@ console.log(JSON.stringify({
                                pins: { repo: "dockade" }, rule: "ask",
                                decides: false, ...fields });
     return {
-      plain: m.pinText('{"owner":"larsvikb","repo":"dockade"}'),
+      plain: m.pinText('{"owner":"acme","repo":"dockade"}'),
       homoglyph: m.pinText('{"owner":"l\u0430rsvikb"}'),
       bidi: m.pinText('{"repo":"safe\u202eevil"}'),
       // Past 2^53, where a JSON.parse round trip would read 9007199254740992.
@@ -401,7 +401,7 @@ console.log(JSON.stringify({
                                                  expires_at: 1786055405 } }),
     // The card's pin panel. `repo` carries a U+0430, which the panel must spell out.
     pin_preview: (() => {
-      const options = { fields: [{ field: "owner", value: '"larsvikb"' },
+      const options = { fields: [{ field: "owner", value: '"acme"' },
                                  { field: "repo", value: '"d\u0430"' }],
                         unpinnable: [{ field: "reviewers", why: "a list" }],
                         refused: null };
@@ -4246,7 +4246,7 @@ class PinnedAllowViewTests(unittest.TestCase):
 
     def test_a_plain_pin_is_shown_exactly_as_stored(self):
         plain = self.probe["pins"]["plain"]
-        self.assertEqual(plain["text"], '{"owner":"larsvikb","repo":"dockade"}')
+        self.assertEqual(plain["text"], '{"owner":"acme","repo":"dockade"}')
         self.assertFalse(plain["escaped"])
 
     def test_a_homoglyph_is_spelled_out_where_a_payload_would_only_note_it(self):
@@ -4370,7 +4370,7 @@ class PinPanelTests(unittest.TestCase):
     def test_the_sentence_names_the_values_and_every_field_left_free(self):
         owner = self.probe["tool"]["pin_preview"]["owner"]
         self.assertTrue(owner["ok"])
-        self.assertIn('with owner = "larsvikb" runs without a card', owner["text"])
+        self.assertIn('with owner = "acme" runs without a card', owner["text"])
         # `repo` is unticked and `reviewers` unpinnable: both are free, and so is
         # anything the call did not set.
         self.assertIn("free: repo, reviewers, and any this call did not set",

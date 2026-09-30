@@ -274,7 +274,7 @@ def _set_pins(pins):
 
 
 #: A `create_pull_request` call on the pinned repository.
-_PR = {"owner": "larsvikb", "repo": "dockade", "title": "t", "body": "b",
+_PR = {"owner": "acme", "repo": "dockade", "title": "t", "body": "b",
        "head": "topic", "base": "main"}
 
 
@@ -288,7 +288,7 @@ class PinnedAllowDecisionTests(unittest.TestCase):
         cp.store._init_db()
         _set_tool_rules([("mcp-github", "create_pull_request", "ask")])
         _set_pins([("mcp-github", "create_pull_request",
-                    {"owner": "larsvikb", "repo": "dockade"})])
+                    {"owner": "acme", "repo": "dockade"})])
 
     def _decide(self, args, server="mcp-github", tool="create_pull_request"):
         return cp.policy._decide_tool(server, tool, args)
@@ -307,7 +307,7 @@ class PinnedAllowDecisionTests(unittest.TestCase):
         # `Dockade` is the case that matters: GitHub would read it as the pinned
         # repository, and it still gets a card, because a pin compares exactly.
         missing = {k: v for k, v in _PR.items() if k != "repo"}
-        for args in ({**_PR, "repo": "hemel"}, {**_PR, "repo": "Dockade"},
+        for args in ({**_PR, "repo": "widgets"}, {**_PR, "repo": "Dockade"},
                      {**_PR, "repo": "dockade "}, missing):
             with self.subTest(args=args):
                 self.assertEqual(self._decide(args)[0], "ask")
@@ -348,11 +348,11 @@ class PinnedAllowDecisionTests(unittest.TestCase):
 
     def test_several_pins_on_one_tool_are_alternatives(self):
         _set_pins([("mcp-github", "create_pull_request",
-                    {"owner": "larsvikb", "repo": "dockade"}),
+                    {"owner": "acme", "repo": "dockade"}),
                    ("mcp-github", "create_pull_request",
-                    {"owner": "larsvikb", "repo": "hemel"})])
+                    {"owner": "acme", "repo": "widgets"})])
         self.assertEqual(self._decide(_PR)[0], "allow")
-        self.assertEqual(self._decide({**_PR, "repo": "hemel"})[0], "allow")
+        self.assertEqual(self._decide({**_PR, "repo": "widgets"})[0], "allow")
         self.assertEqual(self._decide({**_PR, "repo": "other"})[0], "ask")
 
     def test_values_compare_as_the_server_receives_them_not_by_python_equality(self):
@@ -414,7 +414,7 @@ class PinCandidateTests(unittest.TestCase):
         self.assertEqual([f["field"] for f in c["fields"]],
                          ["base", "body", "draft", "head", "owner", "repo", "title"])
         values = {f["field"]: f["value"] for f in c["fields"]}
-        self.assertEqual((values["owner"], values["draft"]), ('"larsvikb"', "false"))
+        self.assertEqual((values["owner"], values["draft"]), ('"acme"', "false"))
         self.assertEqual(c["unpinnable"], [{"field": "reviewers", "why": "a list"}])
 
     def test_every_subset_of_the_offered_fields_answers_the_call_it_came_from(self):
@@ -480,13 +480,13 @@ class TimedPinDecisionTests(unittest.TestCase):
     def test_a_permanent_pin_is_the_reason_when_a_timed_one_also_matches(self):
         # The timed pin is the older row, so id order alone would name it.
         _set_pins([("mcp-github", "create_pull_request", {"repo": "dockade"}, 600),
-                   ("mcp-github", "create_pull_request", {"owner": "larsvikb"})])
+                   ("mcp-github", "create_pull_request", {"owner": "acme"})])
         reason = self._decide()[1]
         self.assertIn("pinned: owner)", reason)
 
     def test_of_two_timed_pins_the_longest_lived_is_the_reason(self):
         _set_pins([("mcp-github", "create_pull_request", {"repo": "dockade"}, 600),
-                   ("mcp-github", "create_pull_request", {"owner": "larsvikb"}, 7200)])
+                   ("mcp-github", "create_pull_request", {"owner": "acme"}, 7200)])
         self.assertIn("pinned: owner, 1h59m left", self._decide()[1])
 
 

@@ -49,6 +49,11 @@ only the invariants and conventions for working in the repo.
   clarity over cleverness.
 - New recurring workflow → make it a skill. Skills encode good practice, not
   just access.
+- Keep one line per open branch in `inflight.md` at your checkout's root (gitignored):
+  what it is for and its state — not the files it touches, which
+  `git diff --stat main...<branch>` gives — and drop the line when the branch merges.
+  Before work that could collide, read every checkout's note; `git worktree list`
+  gives their roots.
 - Don't commit or push unless asked.
 - In the main session, before handing a commit over for push, run the
   `review-before-push` skill.

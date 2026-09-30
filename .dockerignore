@@ -29,4 +29,6 @@ __pycache__
 # is that a future `COPY . .` cannot start to.
 backups
 secrets
+# Claude Code's project directory: agent worktrees and local settings, and the repo's
+# own skills and agents, which are instructions for a session, never image content.
 .claude

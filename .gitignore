@@ -20,10 +20,10 @@ local-todo.md
 # asked for and the operator's whole policy, in a file `restore` will install. Never
 # in this tree, because the tree is bind-mounted read-write into the sandbox.
 backups/
-# Claude Code's per-checkout working state: agent worktrees (each one a second copy
-# of this repo) and local settings. Ignored WHOLESALE rather than per-entry, which is
-# a decision and not laziness — /workspace is bind-mounted read-write, so a committed
-# `.claude/` deciding which hooks, agents or skills load would be exactly the
-# agent-writable config knob DESIGN.md refuses. The paved road ships in the image
-# (claude-sandbox/), and durable per-machine settings live in ~/.config/dockade.
-.claude/
+# Claude Code's per-checkout state: agent worktrees (each one a second copy of this
+# repo) and machine-local settings. The rest of .claude/ stays visible on purpose:
+# committed skills and agents are reviewed like any other change, and
+# tests/test_claude_config.py refuses anything else there. Why: DESIGN.md "Durable host
+# config lives outside the repo".
+.claude/worktrees/
+.claude/settings.local.json

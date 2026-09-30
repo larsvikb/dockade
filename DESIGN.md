@@ -346,6 +346,27 @@ cannot read a Makefile. `make consistency` invokes both and compares, including
 under a set `XDG_CONFIG_HOME` — the same two-spellings-plus-a-drift-guard shape as
 the firewall/policy allowlist check.
 
+**Claude Code's own project files are a different case.** Refusing a config file inside
+the repo is about config the *launcher* reads — what the host mounts, enables or hands
+over — where an edit made inside the sandbox would steer the next launch from outside
+it. `.claude/` is read by the agents instead, never the launcher, and they load whatever
+is there whether git tracks it or not; ignoring it never kept the agent from writing it,
+only kept what it wrote out of `git status` and review. So skills and agents are
+committed and reviewed like `CLAUDE.md`, which already reaches every session the same
+way, and nothing else under `.claude/` is: what may be committed there is an allowed
+list, with its reasons, in `tests/test_claude_config.py`. Only per-checkout state stays
+ignored: agent worktrees and `settings.local.json`. A skill that serves every project
+rather than this repo still belongs in the image.
+
+**That covers commits, not the live checkout.** The host's own checkout *is*
+`/workspace`, and a host session reads its working tree — reloading settings
+mid-session — before any commit or test sees a change. There an agent-written skill,
+agent or settings file is SECURITY.md's accepted delayed path to host execution, and
+two things stay out of `git status` altogether: `settings.local.json`, whose allow rules
+skip workspace trust precisely because it is untracked, and the agent worktrees, each a
+full agent-written checkout the host cannot run git in. Closing that channel would take
+capability, not review.
+
 ### Plugin marketplaces — host-curated, read-only, re-derived each boot
 
 `~/.config/dockade/marketplaces` is auto-mounted at `/marketplaces` **read-only**

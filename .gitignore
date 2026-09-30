@@ -27,3 +27,7 @@ backups/
 # config lives outside the repo".
 .claude/worktrees/
 .claude/settings.local.json
+# Each checkout's note of what its branch is doing, for parallel sessions to read
+# (CLAUDE.md, Conventions). One writer per file, so sessions never collide, and the
+# note goes when its worktree does.
+/inflight.md

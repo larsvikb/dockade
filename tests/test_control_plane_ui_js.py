@@ -120,7 +120,7 @@ const owner = {
                "eventRow", "historyPager"],
   "egress-rules.js": ["revokePreview", "normalizePattern", "createPreview",
                       "editPreview"],
-  "mcp.js": ["serverDescriptor", "serverPreview", "serverEditBody",
+  "mcp.js": ["serverDescriptor", "serverEndpoint", "serverPreview", "serverEditBody",
              "toolChoices", "toolRulePreview", "toolEditPreview", "toolRevokePreview",
              "pinText", "pinState", "pinExpiry", "pinLapsesDue"],
   "leases.js": ["leaseLabel", "leaseRemaining", "leaseCountdown", "leaseDomain",
@@ -148,7 +148,9 @@ const duplicated = exported.filter((n, i) => exported.indexOf(n) !== i);
 const m = Object.assign({}, ...Object.values(modules));
 const _row = {server: "mcp-github", enabled: false,
               auth: {type: "header", header: "Authorization",
-                     template: "Bearer {secret}"}};
+                     template: "Bearer {secret}"},
+              endpoint: {port: 3000, path: "/v1/mcp"}};
+const _at = m.serverEndpoint("8082", "/mcp");
 console.log(JSON.stringify({
   missing,
   duplicated,
@@ -161,16 +163,26 @@ console.log(JSON.stringify({
     bearer_with_stale_custom: m.serverDescriptor("header", "X-Evil", "{secret}-nope"),
     basic: m.serverDescriptor("basic"),
     basic_with_stale_custom: m.serverDescriptor("basic", "X-Evil", "{secret}-nope"),
-    preview_basic: m.serverPreview("mcp-jira", m.serverDescriptor("basic")),
+    preview_basic: m.serverPreview("mcp-jira", m.serverDescriptor("basic"), _at),
     preview_basic_custom: m.serverPreview(
-      "mcp-jira", m.serverDescriptor("custom", "Authorization", "basic  {secret}")).text,
-    preview_none: m.serverPreview("mcp-github", m.serverDescriptor("none")).text,
-    preview_bearer: m.serverPreview("mcp-github", m.serverDescriptor("header")).text,
-    preview_blank: m.serverPreview("   ", m.serverDescriptor("none")),
-    preview_upper: m.serverPreview("Mcp-GitHub", m.serverDescriptor("none")),
-    preview_traversal: m.serverPreview("../etc/passwd", m.serverDescriptor("none")),
-    preview_single: m.serverPreview("a", m.serverDescriptor("none")).ok,
-    preview_half_custom: m.serverPreview("mcp-x", m.serverDescriptor("custom", "H", "")),
+      "mcp-jira", m.serverDescriptor("custom", "Authorization", "basic  {secret}"),
+      _at).text,
+    preview_none: m.serverPreview("mcp-github", m.serverDescriptor("none"), _at).text,
+    preview_bearer: m.serverPreview("mcp-github", m.serverDescriptor("header"), _at).text,
+    preview_blank: m.serverPreview("   ", m.serverDescriptor("none"), _at),
+    preview_upper: m.serverPreview("Mcp-GitHub", m.serverDescriptor("none"), _at),
+    preview_traversal: m.serverPreview("../etc/passwd", m.serverDescriptor("none"), _at),
+    preview_single: m.serverPreview("a", m.serverDescriptor("none"), _at).ok,
+    preview_half_custom: m.serverPreview("mcp-x", m.serverDescriptor("custom", "H", ""), _at),
+    endpoint: m.serverEndpoint(" 3000 ", " /v1/mcp "),
+    endpoint_bad_ports: ["", "0", "65536", "80a", "1e3", "-1", " "].map(
+      p => m.serverEndpoint(p, "/mcp").port),
+    preview_endpoint: m.serverPreview("mcp-x", m.serverDescriptor("none"),
+                                      m.serverEndpoint("3000", "/v1/mcp")),
+    preview_bad_port: m.serverPreview("mcp-x", m.serverDescriptor("none"),
+                                      m.serverEndpoint("http", "/mcp")),
+    preview_bad_path: m.serverPreview("mcp-x", m.serverDescriptor("none"),
+                                      m.serverEndpoint("8082", "mcp")),
     edit_enable: m.serverEditBody(_row, true),
     edit_disable: m.serverEditBody(_row, false),
     edit_no_auth: m.serverEditBody({server: "s", enabled: true}, false),
@@ -1212,14 +1224,16 @@ class PageScriptTests(unittest.TestCase):
                 self.assertEqual(srv[key], {"enabled": enabled,
                                             "auth_type": "header",
                                             "auth_header": "Authorization",
-                                            "auth_template": "Bearer {secret}"})
+                                            "auth_template": "Bearer {secret}",
+                                            "port": 3000, "path": "/v1/mcp"})
 
     def test_an_edit_on_a_server_with_no_descriptor_sends_none(self):
         # The other direction: absent auth must produce a well-formed 'none', not
         # undefined fields that serialize out of the body entirely.
         self.assertEqual(self.probe["server"]["edit_no_auth"],
                          {"enabled": False, "auth_type": "none",
-                          "auth_header": None, "auth_template": None})
+                          "auth_header": None, "auth_template": None,
+                          "port": None, "path": None})
 
     def test_the_preview_refuses_a_name_that_is_not_a_dns_label(self):
         # The name becomes a path segment at the relay and a hostname at the gateway.
@@ -1243,6 +1257,19 @@ class PageScriptTests(unittest.TestCase):
         # Registering is not enabling and enabling is not permitting. The page has to
         # say so, because "register" reads like "turn on" everywhere else.
         self.assertIn("disabled", self.probe["server"]["preview_none"])
+
+    def test_the_endpoint_fields_become_what_the_api_takes(self):
+        srv = self.probe["server"]
+        self.assertEqual(srv["endpoint"], {"port": 3000, "path": "/v1/mcp"})
+        # Null, not a default: the backend refuses it rather than dialling 8082.
+        self.assertEqual(srv["endpoint_bad_ports"], [None] * 7)
+
+    def test_the_preview_names_the_url_the_gateway_will_dial(self):
+        srv = self.probe["server"]
+        self.assertTrue(srv["preview_endpoint"]["ok"])
+        self.assertIn("http://mcp-x:3000/v1/mcp", srv["preview_endpoint"]["text"])
+        self.assertFalse(srv["preview_bad_port"]["ok"])
+        self.assertFalse(srv["preview_bad_path"]["ok"])
 
     def test_a_half_filled_custom_descriptor_is_not_ok(self):
         # A `header` descriptor with no template builds a header with no credential,

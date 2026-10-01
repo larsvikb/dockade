@@ -33,6 +33,10 @@ class ServerCreateRequest(BaseModel):
     auth_type: str = "none"
     auth_header: str | None = None
     auth_template: str | None = None
+    # Where the server listens. Defaulted to the first catalogue server's, so a
+    # caller that predates the fields registers what it always did.
+    port: int = policy.DEFAULT_PORT
+    path: str = policy.DEFAULT_PATH
     # No ``enabled``: a registration that arrived enabled would introduce a server and
     # open it in one call, under one audit row.
 
@@ -44,6 +48,10 @@ class ServerEditRequest(BaseModel):
     auth_type: str = "none"
     auth_header: str | None = None
     auth_template: str | None = None
+    # REQUIRED, where the auth fields default: a caller that leaves them out is
+    # refused rather than moved back to the default endpoint without noticing.
+    port: int
+    path: str
 
 
 class ToolRuleCreateRequest(BaseModel):
@@ -65,6 +73,7 @@ def _server_view(row) -> dict:
     return {"server": row["server"], "enabled": bool(row["enabled"]),
             "auth": {"type": row["auth_type"], "header": row["auth_header"],
                      "template": row["auth_template"]},
+            "endpoint": {"port": row["port"], "path": row["path"]},
             "created_at": row["created_at"]}
 
 
@@ -74,6 +83,11 @@ def _descriptor(req) -> tuple[str, str, str]:
     return ((getattr(req, "auth_type", "") or "").strip().lower(),
             (getattr(req, "auth_header", "") or "").strip(),
             (getattr(req, "auth_template", "") or "").strip())
+
+
+def _endpoint(req) -> tuple[int, str]:
+    """The endpoint off a request, the path stripped as the descriptor's fields are."""
+    return getattr(req, "port", None), (getattr(req, "path", "") or "").strip()
 
 
 @router.get("/api/mcp/servers")
@@ -86,7 +100,7 @@ def api_mcp_servers() -> list[dict]:
     with store._connect() as conn:
         rows = conn.execute(
             "SELECT server, enabled, auth_type, auth_header, auth_template, "
-            "created_at FROM mcp_servers ORDER BY server").fetchall()
+            "created_at, port, path FROM mcp_servers ORDER BY server").fetchall()
         counts = {r["server"]: r["n"] for r in conn.execute(
             "SELECT server, COUNT(*) AS n FROM tool_rules GROUP BY server")}
     return [dict(_server_view(r), tool_rules=counts.get(r["server"], 0)) for r in rows]
@@ -107,10 +121,13 @@ def create_mcp_server(req: ServerCreateRequest, request: Request) -> JSONRespons
     actor = provenance._actor(request)
     server = (getattr(req, "server", "") or "").strip().lower()
     auth_type, header, template = _descriptor(req)
+    port, path = _endpoint(req)
 
     error = policy._server_name_error(server)
     if error is None:
         error = policy._auth_descriptor_error(auth_type, header, template)
+    if error is None:
+        error = policy._endpoint_error(port, path)
     if error is not None:
         return JSONResponse({"ok": False, "detail": error}, status_code=400)
 
@@ -127,24 +144,27 @@ def create_mcp_server(req: ServerCreateRequest, request: Request) -> JSONRespons
                 status_code=409)
         conn.execute(
             "INSERT INTO mcp_servers(server, enabled, auth_type, auth_header, "
-            "auth_template, created_at) VALUES (?, 0, ?, ?, ?, ?)",
-            (server, auth_type, header or None, template or None, time.time()))
+            "auth_template, created_at, port, path) VALUES (?, 0, ?, ?, ?, ?, ?, ?)",
+            (server, auth_type, header or None, template or None, time.time(),
+             port, path))
         conn.commit()
 
     store._audit("create", stage="mcp-server", server=server, actor=actor,
                  reason=f"MCP server {server} registered; disabled, "
-                        f"auth {auth_type}, no tools permitted until rules are written")
+                        f"auth {auth_type}, dialled on :{port}{path}, no tools "
+                        f"permitted until rules are written")
     return JSONResponse({"ok": True, "created": True, "server": server,
                          "enabled": False,
                          "auth": {"type": auth_type, "header": header or None,
-                                  "template": template or None}},
+                                  "template": template or None},
+                         "endpoint": {"port": port, "path": path}},
                         status_code=201)
 
 
 @router.post("/api/mcp/servers/{server}/edit")
 def edit_mcp_server(server: str, req: ServerEditRequest,
                     request: Request) -> JSONResponse:
-    """Enable or disable a server, and change how the gateway authenticates to it.
+    """Enable or disable a server, and change how and where the gateway dials it.
 
     One operation, because it is one configuration: enabled with a descriptor that
     does not resolve, a server fails as though policy refused it, and two calls would
@@ -155,34 +175,40 @@ def edit_mcp_server(server: str, req: ServerEditRequest,
     server = (server or "").strip().lower()
     enabled = bool(getattr(req, "enabled", False))
     auth_type, header, template = _descriptor(req)
+    port, path = _endpoint(req)
 
     error = policy._auth_descriptor_error(auth_type, header, template)
+    if error is None:
+        error = policy._endpoint_error(port, path)
     if error is not None:
         return JSONResponse({"ok": False, "detail": error}, status_code=400)
 
     with store._connect() as conn:
         row = conn.execute(
             "SELECT server, enabled, auth_type, auth_header, auth_template, "
-            "created_at FROM mcp_servers WHERE server=?", (server,)).fetchone()
+            "created_at, port, path FROM mcp_servers WHERE server=?",
+            (server,)).fetchone()
         if row is None:
             return JSONResponse({"ok": False, "detail": "unknown server"},
                                 status_code=404)
         before = _server_view(row)
         if (before["enabled"] == enabled and row["auth_type"] == auth_type
                 and (row["auth_header"] or "") == header
-                and (row["auth_template"] or "") == template):
+                and (row["auth_template"] or "") == template
+                and row["port"] == port and row["path"] == path):
             # Asked for what is already configured — a non-write, reported as one, so
             # the audit trail does not claim the surface moved when it did not.
             return JSONResponse({"ok": True, "changed": False, **before})
         conn.execute(
             "UPDATE mcp_servers SET enabled=?, auth_type=?, auth_header=?, "
-            "auth_template=? WHERE server=?",
+            "auth_template=?, port=?, path=? WHERE server=?",
             (1 if enabled else 0, auth_type, header or None, template or None,
-             server))
+             port, path, server))
         conn.commit()
         after = _server_view(conn.execute(
             "SELECT server, enabled, auth_type, auth_header, auth_template, "
-            "created_at FROM mcp_servers WHERE server=?", (server,)).fetchone())
+            "created_at, port, path FROM mcp_servers WHERE server=?",
+            (server,)).fetchone())
 
     # ONE row carrying both states, as ``api_egress.edit_rule`` writes. The template
     # is safe to record because the secret is never in it.
@@ -192,7 +218,10 @@ def edit_mcp_server(server: str, req: ServerEditRequest,
                         f"auth {before['auth']['type']} -> {after['auth']['type']} "
                         f"(header {before['auth']['header']} -> "
                         f"{after['auth']['header']}, template "
-                        f"{before['auth']['template']} -> {after['auth']['template']})")
+                        f"{before['auth']['template']} -> {after['auth']['template']}), "
+                        f"endpoint :{before['endpoint']['port']}"
+                        f"{before['endpoint']['path']} -> :{after['endpoint']['port']}"
+                        f"{after['endpoint']['path']}")
     return JSONResponse({"ok": True, "changed": True, **after,
                          "previous": before})
 

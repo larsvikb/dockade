@@ -666,8 +666,8 @@ mcp-ps: ## Who is on mcp-net right now (should be the proxy plus enabled servers
 # real token returns: `make mcp-tools SERVER=github MCP_PROBE_TOKEN=$$tok`.
 MCP_PROBE_TOKEN ?= ghp_000000000000000000000000000000000000
 # The first catalogue server's transport, which is the image's own default rather than
-# anything this repo chose. A second server that listens elsewhere makes these
-# per-server; until one exists, two variables beat a lookup.
+# anything this repo chose. For a server that listens elsewhere, pass the port and path
+# it is registered with: `make mcp-tools SERVER=x MCP_PORT=3000 MCP_PATH=/v1/mcp`.
 MCP_PORT ?= 8082
 MCP_PATH ?= /mcp
 # Unpinned on purpose, and the contrast with mcp-servers.yml is the reason: that file

@@ -125,9 +125,9 @@ def tool_authorize(req: ToolCallRequest) -> dict:
 
 @router.get("/tool/roster")
 def tool_roster() -> list[dict]:
-    """The enabled servers, their auth descriptors, and the standing policy for each
-    one's tools — everything the gateway needs to know what to dial and what to
-    present.
+    """The enabled servers, their auth descriptors and endpoints, and the standing
+    policy for each one's tools — everything the gateway needs to know what to dial,
+    how, and what to present.
 
     Pollable, unlike ``tool_authorize``: configuration may be cached, a decision may
     not. The gateway re-reads it on an interval (protocol.py says why `list_changed`
@@ -145,7 +145,8 @@ def tool_roster() -> list[dict]:
     with store._connect() as conn:
         servers = conn.execute(
             "SELECT server, enabled, auth_type, auth_header, auth_template, "
-            "created_at FROM mcp_servers WHERE enabled=1 ORDER BY server").fetchall()
+            "created_at, port, path FROM mcp_servers WHERE enabled=1 "
+            "ORDER BY server").fetchall()
         rules: dict[str, list[dict]] = {}
         for row in conn.execute(
                 "SELECT server, tool, action FROM tool_rules ORDER BY server, tool"):
@@ -156,6 +157,7 @@ def tool_roster() -> list[dict]:
     return [{"server": r["server"],
              "auth": {"type": r["auth_type"], "header": r["auth_header"],
                       "template": r["auth_template"]},
+             "endpoint": {"port": r["port"], "path": r["path"]},
              "tools": rules.get(r["server"], [])}
             for r in servers]
 

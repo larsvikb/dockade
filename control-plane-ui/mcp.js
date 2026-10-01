@@ -45,9 +45,17 @@ export function serverDescriptor(kind, header, template) {
   return { auth_type: "none", auth_header: null, auth_template: null };
 }
 
+// The port and path fields as the API takes them. A port that is not a whole number
+// in range is null, which the backend refuses rather than reads as a default.
+export function serverEndpoint(port, path) {
+  const p = String(port ?? "").trim();
+  const n = /^[0-9]{1,5}$/.test(p) ? Number(p) : NaN;
+  return { port: n >= 1 && n <= 65535 ? n : null, path: String(path ?? "").trim() };
+}
+
 // What registering will do, in the world. A DELIBERATELY partial mirror of the
 // backend's validation, like createPreview: it describes, and the backend refuses.
-export function serverPreview(name, desc) {
+export function serverPreview(name, desc, endpoint) {
   const n = (name || "").trim();
   if (!n) return { ok: false, text: "" };
   if (!SERVER_NAME_RE.test(n)) {
@@ -56,15 +64,23 @@ export function serverPreview(name, desc) {
                  + `starting or ending with '-'. It is the container name, so it has `
                  + `to match what mcp-servers.yml declares.` };
   }
+  if (endpoint.port === null) {
+    return { ok: false, text: "The port must be a number from 1 to 65535." };
+  }
+  if (!endpoint.path.startsWith("/")) {
+    return { ok: false, text: "The path starts with '/', such as /mcp." };
+  }
+  const where = `Register ${n}, disabled, dialled at `
+              + `http://${n}:${endpoint.port}${endpoint.path}.`;
   if (desc.auth_type === "none") {
     return { ok: true,
-             text: `Register ${n}, disabled, with the gateway injecting nothing — the `
-                 + `server holds its own credential. Nothing runs until you enable it `
-                 + `and write tool rules.` };
+             text: `${where} The gateway injects nothing — the server holds its own `
+                 + `credential. Nothing runs until you enable it and write tool `
+                 + `rules.` };
   }
   // Named rather than implied: the token's path is DERIVED from the server name, so
   // the operator can see which file they are about to make load-bearing.
-  const text = `Register ${n}, disabled. The gateway will send `
+  const text = `${where} The gateway will send `
              + `${desc.auth_header || "(no header)"}: `
              + `${desc.auth_template || "(no template)"}, reading the token from `
              + `${n}.json in the secrets directory.`;
@@ -82,13 +98,17 @@ export function serverPreview(name, desc) {
 // so a body carrying only `enabled` does not mean "leave auth alone" — it means "set
 // auth to none". A server toggled off and on again would come back stripped of its
 // credential descriptor, the next enumeration would send no header, and the 401 that
-// followed would read like an expired token rather than like this.
+// followed would read like an expired token rather than like this. The endpoint is
+// echoed too; the backend requires it, so a row without one is refused, not reset.
 export function serverEditBody(row, enabled) {
   const auth = row.auth || {};
+  const endpoint = row.endpoint || {};
   return { enabled: enabled,
            auth_type: auth.type || "none",
            auth_header: auth.header || null,
-           auth_template: auth.template || null };
+           auth_template: auth.template || null,
+           port: endpoint.port ?? null,
+           path: endpoint.path ?? null };
 }
 
 // ── tool policy: what a server CLAIMS, joined against what a human DECIDED ───

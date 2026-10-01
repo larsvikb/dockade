@@ -267,10 +267,10 @@ def _run(server: str, tool: str, arguments: object, client: str | None = None,
             "transport-error", f"{server} left the roster before the call was made")
     try:
         raw = discovery.post(
-            server,
+            entry,
             {"jsonrpc": "2.0", "id": discovery.REQUEST_ID, "method": "tools/call",
              "params": {"name": tool, "arguments": arguments if arguments else {}}},
-            entry.get("auth") or {}, timeout=CALL_TIMEOUT)
+            timeout=CALL_TIMEOUT)
         result, status = parse_call(raw)
     except discovery.DiscoveryError as exc:
         # A failure to REACH the server, told apart from a failure reported BY it. The

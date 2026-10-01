@@ -403,6 +403,20 @@ _TOOL_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 # operator would actually configure is spelled with.
 _HEADER_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 _TEMPLATE_MAX_LEN = 200
+# Where a server listens. The gateway appends the path straight after the port, so a
+# path is held to segments of unreserved characters: nothing in it can end the
+# authority ('@', '?', '#', '\'), and nothing can be decoded into something that does
+# ('%'). Held equal to the gateway's copy by tests/test_tool_discovery.py.
+#
+# Used with ``fullmatch``, and written so each string has ONE way to match: a segment
+# is ended by its '/', so the engine never chooses where a run of letters splits. The
+# first spelling had an optional '/' after each segment, which made a failed match
+# exponential in the path's length — and this runs in the control plane's only
+# process, so one pasted path froze every decision behind it.
+_PATH_RE = re.compile(r"/(?:[A-Za-z0-9._~-]+/)*[A-Za-z0-9._~-]*")
+_PATH_MAX_LEN = 128
+DEFAULT_PORT = 8082
+DEFAULT_PATH = "/mcp"
 
 
 def _server_name_error(server: str) -> str | None:
@@ -452,6 +466,23 @@ def _auth_descriptor_error(auth_type: str, header: str, template: str) -> str | 
         return (f"the template must contain {SECRET_PLACEHOLDER} exactly once, so the "
                 f"gateway has one place to put the secret — {template!r} has "
                 f"{template.count(SECRET_PLACEHOLDER)}")
+    return None
+
+
+def _endpoint_error(port, path: str) -> str | None:
+    """Why ``port`` and ``path`` cannot be where the gateway dials a server, or None.
+
+    The path is the one stored string that lands in the URL a credential travels on,
+    after the address ``discovery._placed`` checked. So the shapes refused are the
+    ones that could move the host: ``@evil.example`` after ``:8082`` becomes it."""
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        return f"the port must be a number from 1 to 65535, not {port!r}"
+    if len(path) > _PATH_MAX_LEN:
+        return f"the path is {len(path)} characters; the ceiling is {_PATH_MAX_LEN}"
+    if not _PATH_RE.fullmatch(path) or {".", ".."} & set(path.split("/")):
+        return (f"{path!r} is not a path the gateway will dial — expected '/' and "
+                f"segments of letters, digits and '.', '_', '~', '-', with no '.' or "
+                f"'..' segment, such as /mcp")
     return None
 
 

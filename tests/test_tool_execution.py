@@ -31,6 +31,7 @@ from _loader import load_execute
 #: One enabled server with one rule per action. Auth is `none`, so no secret file is
 #: read — the descriptor path is discovery's business and is tested there.
 ROSTER = [{"server": "mcp-github", "auth": {"type": "none"},
+           "endpoint": {"port": 8082, "path": "/mcp"},
            "tools": [{"tool": "get_issue", "action": "allow"},
                      {"tool": "create_pr", "action": "ask"},
                      {"tool": "delete_repo", "action": "deny"}]}]
@@ -66,8 +67,8 @@ class ExecutionTestCase(unittest.TestCase):
             self.asked.append((path, payload))
             return self.answer
 
-        def post(server, message, auth, timeout=None):
-            self.called.append({"server": server, "message": message, "auth": auth,
+        def post(entry, message, timeout=None):
+            self.called.append({"entry": entry, "message": message,
                                 "timeout": timeout})
             return self.reply
 
@@ -485,7 +486,7 @@ class UpstreamReplyTests(ExecutionTestCase):
                 self.execute.parse_call(raw)
 
     def test_an_unreachable_server_is_reported_as_a_failed_call(self):
-        def boom(server, message, auth, timeout=None):
+        def boom(entry, message, timeout=None):
             raise self.execute.discovery.DiscoveryError("unreachable: refused")
 
         self.execute.discovery.post = boom
@@ -616,7 +617,7 @@ class OutcomeRecordTests(ExecutionTestCase):
             with self.subTest(kind=kind):
                 self.rows.clear()
 
-                def boom(server, message, auth, timeout=None, _k=kind):
+                def boom(entry, message, timeout=None, _k=kind):
                     raise self.execute.discovery.DiscoveryError("no answer", kind=_k)
 
                 self.execute.discovery.post = boom

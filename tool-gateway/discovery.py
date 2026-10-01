@@ -67,16 +67,16 @@ _SERVER_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 #: wildcard.
 CONTROL_URL = os.environ.get("GATEWAY_CONTROL_URL", "http://172.27.0.2:8092")
 
-#: Servers are dialled BY NAME, and that is the identity per-tool policy is keyed on
-#: (DESIGN.md, "Per-server identity has two different answers"). The gateway is never
-#: given a server's address; where the name may LEAD is ``MCP_NET``'s business.
-#:
-#: Port and path are one convention rather than per-server config, matching the
-#: Makefile's MCP_PORT/MCP_PATH: 8082 and /mcp are what the first server listens on,
-#: and a second server that differs makes these a lookup. Two constants beat a
-#: lookup until that server exists.
-MCP_PORT = int(os.environ.get("GATEWAY_MCP_PORT", "8082"))
-MCP_PATH = os.environ.get("GATEWAY_MCP_PATH", "/mcp")
+# Servers are dialled BY NAME, and that is the identity per-tool policy is keyed on
+# (DESIGN.md, "Per-server identity has two different answers"). The gateway is never
+# given a server's address; where the name may LEAD is ``MCP_NET``'s business. The
+# port and path come from each roster entry (``check_endpoint``).
+
+#: The path shape `policy._endpoint_error` holds registration to, used with
+#: ``fullmatch`` (the comment there says why it is spelled this way). Held equal to it
+#: by tests/test_tool_discovery.py.
+_PATH_RE = re.compile(r"/(?:[A-Za-z0-9._~-]+/)*[A-Za-z0-9._~-]*")
+_PATH_MAX_LEN = 128
 
 
 def _network(raw: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network:
@@ -154,11 +154,28 @@ def check_name(server: str) -> str:
     later given a second write path; the check costs a regex and removes the question.
     A DNS label cannot contain ``/``, ``.`` or a null, so a name that passes cannot
     leave SECRETS_DIR."""
-    if not _SERVER_RE.match(server or ""):
+    if not _SERVER_RE.fullmatch(server or ""):
         raise DiscoveryError(
             f"{server!r} is not a DNS label, so it names neither a container to dial "
             f"nor a file to read")
     return server
+
+
+def check_endpoint(endpoint) -> tuple[int, str]:
+    """A roster entry's port and path, or a refusal — checked here for ``check_name``'s
+    reason. The path is appended to the URL after the checked address, so a path that
+    could end the authority would send the credential to a host ``_placed`` never saw.
+
+    No default for a missing endpoint: the control plane always sends one, and a roster
+    without it is not one this code was written against."""
+    port = endpoint.get("port") if isinstance(endpoint, dict) else None
+    path = endpoint.get("path") if isinstance(endpoint, dict) else None
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise DiscoveryError(f"the roster gives no usable port ({port!r})")
+    if (not isinstance(path, str) or len(path) > _PATH_MAX_LEN
+            or not _PATH_RE.fullmatch(path) or {".", ".."} & set(path.split("/"))):
+        raise DiscoveryError(f"the roster gives no usable path ({path!r})")
+    return port, path
 
 
 def secret_path(server: str) -> str:
@@ -302,8 +319,8 @@ def parse_tools(raw: str) -> list[dict]:
     return tools
 
 
-def post(server: str, message: dict, auth: dict, timeout: float | None = None) -> str:
-    """One MCP request to a server, returning its raw reply body.
+def post(entry: dict, message: dict, timeout: float | None = None) -> str:
+    """One MCP request to the server a roster entry names, returning its raw reply body.
 
     THE ONLY PLACE ANYTHING DIALS A SERVER, which is what makes the properties below
     hold for enumeration and execution alike rather than for whichever one was written
@@ -311,23 +328,26 @@ def post(server: str, message: dict, auth: dict, timeout: float | None = None) -
     same errors turned into `DiscoveryError`; the difference between them is the
     message and the timeout, which is exactly what the two arguments are.
 
-    The URL is assembled here and nowhere else. ``check_name`` runs on every call, so a
-    server name that is not a DNS label cannot become a host, a path or a filename —
-    checked at this choke point rather than trusted from the roster that supplied it.
+    The URL is assembled here and nowhere else. ``check_name`` and ``check_endpoint``
+    run on every call, so neither the name nor the endpoint can move the host —
+    checked at this choke point rather than trusted from the roster that supplied them.
     The address it dials is decided here too, before the credential is read
     (``_placed``)."""
-    address = _placed(server)
+    server = entry.get("server")
+    port, path = check_endpoint(entry.get("endpoint"))
+    address = _placed(server, port)
     headers = {"Content-Type": "application/json",
                "Accept": "application/json, text/event-stream",
                # What urllib would have sent for the name, so the server sees the
                # request it always saw.
-               "Host": f"{server}:{MCP_PORT}"}
-    headers.update(auth_header(auth, read_secret(server), secret_path(server)))
-    # The scheme is a literal here, so there is no S310 to suppress: the only variable
-    # part is an address `_placed` has already put on mcp-net.
+               "Host": f"{server}:{port}"}
+    headers.update(auth_header(entry.get("auth") or {}, read_secret(server),
+                               secret_path(server)))
+    # The scheme is a literal here, so there is no S310 to suppress: the address is one
+    # `_placed` has put on mcp-net, and the path one `check_endpoint` let through.
     host = f"[{address}]" if ":" in address else address
     request = urllib.request.Request(
-        f"http://{host}:{MCP_PORT}{MCP_PATH}",
+        f"http://{host}:{port}{path}",
         data=json.dumps(message).encode(), headers=headers)
     # Resolved once, because the timeout REFUSAL names it: a record saying "no answer
     # within None" would be worse than one that said nothing.
@@ -351,7 +371,7 @@ def post(server: str, message: dict, auth: dict, timeout: float | None = None) -
         raise DiscoveryError(f"unreachable: {exc}") from exc
 
 
-def _placed(server: str) -> str:
+def _placed(server: str, port: int) -> str:
     """The address to dial for ``server``: resolved ONCE, and only if it is on mcp-net.
 
     Once, and then dialled as an address, because checking one lookup and letting
@@ -362,7 +382,7 @@ def _placed(server: str) -> str:
     call before a credential is read."""
     name = check_name(server)
     try:
-        infos = socket.getaddrinfo(name, MCP_PORT, type=socket.SOCK_STREAM)
+        infos = socket.getaddrinfo(name, port, type=socket.SOCK_STREAM)
     except OSError as exc:
         raise DiscoveryError(f"unreachable: {server} does not resolve ({exc})") from exc
     addresses = list(dict.fromkeys(info[4][0] for info in infos))
@@ -374,7 +394,7 @@ def _placed(server: str) -> str:
         f"it on mcp-net ({MCP_NET}), and its credential goes nowhere else")
 
 
-def list_tools(server: str, auth: dict) -> list[dict]:
+def list_tools(entry: dict) -> list[dict]:
     """The tools a server exposes, TRIMMED, by asking it.
 
     One POST, no handshake — see the module docstring for why that is enough, and for
@@ -386,8 +406,8 @@ def list_tools(server: str, auth: dict) -> list[dict]:
     description and the schema, because an agent cannot call a tool whose arguments it
     cannot see. Trimming to only the first pair is what this did first, and it made the
     served tool list uncallable."""
-    raw = post(server, {"jsonrpc": "2.0", "id": REQUEST_ID, "method": "tools/list",
-                        "params": {}}, auth)
+    raw = post(entry, {"jsonrpc": "2.0", "id": REQUEST_ID, "method": "tools/list",
+                       "params": {}})
     # Trimmed HERE, at the point of reading, rather than downstream. A real reply
     # carries inline base64 `icons` as well — measured, see the byte split
     # `make mcp-tools` prints — and nothing reads them. The narrowing that crosses to
@@ -426,7 +446,7 @@ def reconcile(entry: dict) -> dict:
     server = entry["server"]
     rules = {rule["tool"]: rule["action"] for rule in entry.get("tools", [])}
     try:
-        tools = list_tools(server, entry.get("auth") or {})
+        tools = list_tools(entry)
     except DiscoveryError as exc:
         # `tools` stays absent rather than empty. An empty list is a CLAIM that the
         # server exposes nothing, and pushing that on a failed dial would erase a good

@@ -240,10 +240,10 @@ def publish(roster: list[dict], results: list[dict]) -> None:
     _ENUMERATED = enumerated
     _LISTING = curate(roster, enumerated)
     # The roster itself, kept because EXECUTION needs the auth descriptor and the
-    # listing does not carry one. Rebuilt outright rather than merged: unlike the
-    # enumeration above, a server missing here is missing because the authority said
-    # so, and holding a descriptor for a server an operator disabled would be keeping
-    # the means to dial something we have been told not to.
+    # endpoint, and the listing carries neither. Rebuilt outright rather than merged:
+    # unlike the enumeration above, a server missing here is missing because the
+    # authority said so, and holding a descriptor for a server an operator disabled
+    # would be keeping the means to dial something we have been told not to.
     _SERVERS = {entry["server"]: entry for entry in roster if entry.get("server")}
 
 

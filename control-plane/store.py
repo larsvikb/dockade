@@ -45,7 +45,7 @@ LEGACY_CLIENT_CLASS = "sandbox"
 # The schema this code expects. Every entry in ``_STEPS`` below adds exactly one,
 # and a store records the version it is at (see ``_migrate``), so "what has already
 # run here" is a number to compare rather than a schema to interrogate.
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 def _connect() -> sqlite3.Connection:
@@ -348,6 +348,26 @@ def _step_9_lease_ids(conn: sqlite3.Connection) -> None:
           f"never reused", flush=True)
 
 
+def _step_10_server_endpoint(conn: sqlite3.Connection) -> None:
+    """v10 — ``mcp_servers.port`` and ``.path``, where the gateway dials each server,
+    replacing the gateway's one GATEWAY_MCP_PORT and GATEWAY_MCP_PATH. Existing rows
+    take that pair's defaults, which is where every one of them was being dialled.
+
+    The table may be ABSENT: it came in with no step of its own, and the DDL after
+    ``_migrate`` creates it with both columns."""
+    cols = _columns(conn, "mcp_servers")
+    if not cols:
+        return
+    if "port" not in cols:
+        conn.execute("ALTER TABLE mcp_servers ADD COLUMN "
+                     "port INTEGER NOT NULL DEFAULT 8082")
+    if "path" not in cols:
+        conn.execute("ALTER TABLE mcp_servers ADD COLUMN "
+                     "path TEXT NOT NULL DEFAULT '/mcp'")
+    print("control-plane: added port and path to mcp_servers (existing servers keep "
+          "8082 and /mcp, where they were dialled)", flush=True)
+
+
 # Ordered, and the order is the only thing that decides what runs: a step is applied
 # when its version exceeds the store's, so steps must be APPEND-ONLY and never
 # renumbered, reordered or edited once shipped — a store in the field has already run
@@ -363,6 +383,7 @@ _STEPS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = (
     (7, "audit actor column", _step_7_audit_actor),
     (8, "timed pins: tool_pins recreated", _step_8_timed_pins),
     (9, "lease ids: leases rebuilt", _step_9_lease_ids),
+    (10, "per-server MCP endpoint", _step_10_server_endpoint),
 )
 
 
@@ -464,10 +485,15 @@ def _init_db() -> None:
                 auth_type     TEXT NOT NULL DEFAULT 'none',   -- 'none' | 'header'
                 auth_header   TEXT,             -- e.g. 'Authorization'
                 auth_template TEXT,             -- e.g. 'Bearer {secret}'
-                created_at    REAL NOT NULL
+                created_at    REAL NOT NULL,
+                -- Where the server listens: the gateway dials <port><path> on the
+                -- server's mcp-net address, under its name. The defaults are the first
+                -- catalogue server's, which every row before v10 was dialled on.
+                port          INTEGER NOT NULL DEFAULT 8082,
+                path          TEXT NOT NULL DEFAULT '/mcp'
                 -- NOTE what is absent: any reference to the secret. The gateway reads
                 -- exactly `/run/dockade/secrets/<server>.json`, DERIVED from the
-                -- name above, because a stored free-text path would let a forged
+                -- name above, because a stored file reference would let a forged
                 -- config write point one server at another server's credential. Making
                 -- that impossible beats validating against it — the move
                 -- `_persist_candidates` already makes for egress patterns.

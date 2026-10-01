@@ -53,9 +53,14 @@ the commit in its own clone, so your checkout may move.
   git tracks, so check it by staging it: `git add -N` it, run
   `(cd tests && python3 -m unittest test_docs)`, then `git rm -q --cached` it.
 - Tell the maintainer the verdict and the findings in plain words, before the push.
-- Add one line to the "Review log" in `local-todo.md` — the PR, the reviewer and how
-  long it took, the findings in the diff by severity and what became of them, anything
-  outside the diff — and move what is left over into its sections. A worktree session
-  cannot write that file: write an anchored script that makes the edit, dry-run it on
-  a copy, and hand it to the maintainer to run from the main checkout.
+- Add one line to `local-review-log.md` — the PR, the reviewer and how long it took,
+  the findings in the diff by severity and what became of them, anything outside the
+  diff — and move what is left over into the sections of `local-todo.md`. Both are
+  the maintainer's untracked files in the main checkout, and a worktree session cannot
+  write them: write an anchored script that makes the edits, dry-run it on a copy,
+  and hand it to the maintainer to run from the main checkout.
+- When the log shows a pattern that changes the reviewer's brief or this skill, the
+  commit that changes it states the evidence in its message: the log is untracked, and
+  the reason for a committed change must not be. A finding about reviews that would
+  hold in another repo is evidence for `NOTES.md` instead.
 - Delete the report once the branch is pushed.

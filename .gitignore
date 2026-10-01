@@ -14,6 +14,10 @@ secrets/
 *.log
 # Local review scratch pad (findings / todo). Working notes, not a repo artifact.
 local-todo.md
+# The maintainer's log of how each pre-push review went, kept to tune the reviewer's
+# brief. Workflow data, not a repo artifact: what it teaches reaches the repo the way
+# the review-before-push skill's step that records a review says.
+/local-review-log.md
 # Fallback location for `make backup` output if BACKUP_DIR is pointed back into the
 # tree by hand — the Makefile's default is under ~/.config/dockade, beside the MCP
 # secrets and for the same reason. The crown-jewel store: every host the agent has

@@ -6,8 +6,8 @@ disallowedTools: Edit, Write, NotebookEdit, Agent, Skill
 
 You review one commit of the dockade repo before its author hands it to the maintainer to push.
 You start without the author's conversation, on purpose: you are here to find what the
-author could not see. The maintainer reads your report and runs its Verify commands
-by hand, so a false finding costs as much as a missed one.
+author could not see. The maintainer acts on your report, so a false finding costs as
+much as a missed one.
 
 ## First: your own copy of the commit
 
@@ -45,11 +45,15 @@ production runs, what was tested where — check it.
    becomes the PR description: numbers and what is derived from them, and wording that
    says more was tested than was (a plain `docker run` is not the launcher; a run
    without Claude Code is not a run with it).
-3. **The Verify list.** The maintainer runs each step by hand on the host, not in the
-   sandbox. On the reference machine NOTES.md names — WSL2, the checkout on a
-   case-insensitive /mnt/c, no node, `DOCKADE_REQUIRE_TOOLS=1` — git cannot read a
-   sandbox-made worktree, so host steps run in a host-native one. Will each command, in
-   order, do what it says? Does concrete output tell pass from fail?
+3. **The host-check plan.** The brief lists the checks the author will ask the
+   maintainer to run on the host, if any; the commit body says what ran and what did
+   not. Flag a planned step the sandbox could have run, a step whose result could not
+   change the merge, and any instruction to the maintainer in the body. For each step
+   that stays, hold it against the host as NOTES.md, "A worktree made in the sandbox is
+   unreadable to git on the host" describes it: will it do what it says there, and
+   does its output tell pass from fail? A script runs on the host with the
+   maintainer's privileges, so it must be short enough to read and do nothing beyond
+   the check.
 4. **What the commit makes false.** A doc, comment, test name or guard elsewhere that
    now says something untrue.
 5. **New tests, mutation-checked.** Remove the fix in your clone and confirm the new
@@ -58,13 +62,14 @@ production runs, what was tested where — check it.
 6. **The code against the invariants:** governance, containment, credentials,
    default-deny, audit.
 7. **Where this repo's defects cluster:** prose about migration, rollback and restore;
-   claims about what was tested and under which conditions; Verify steps; a doc claim
+   claims about what was tested and under which conditions; host-check steps; a doc claim
    with a machine-checkable counterpart and no guard in `tests/test_docs.py`.
 8. **Writing:** placement per "Where writing goes"; a comment that narrates instead of
    recording a hard-won fact; the same reasoning in two places.
 
 By tier: **Light** covers 2, 3, 4, 7 and 8; **Standard** all eight; **Full** all eight,
-and also runs whatever of the Verify list can run in your clone.
+and also runs whatever of the host-check plan can run in your clone: a step that runs
+there did not need the host.
 
 ## How to verify
 

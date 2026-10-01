@@ -4,23 +4,42 @@ set -euo pipefail
 
 # Tier-1 (Claude) setup hook. Invoked as root by the shared entrypoint, before the
 # firewall is armed and before the drop to the non-root sandbox user — and it hands
-# itself to that user as soon as root has done the one thing only root can.
+# itself to that user as soon as root has done the things only root can.
 #
 # Only Claude-specific materialization belongs here. Everything tier-agnostic —
 # config ownership, git identity, the firewall, the capability assertion, the
 # gosu drop — lives in sandbox-common/entrypoint.sh and is shared with tier 2.
 #
 # TWO PHASES, split by privilege rather than by topic (the entrypoint states the
-# contract). Root writes the gateway pointer into /etc, image layer, and nothing
-# else. Then `exec gosu` re-runs this script as the sandbox user for everything that
-# lands in $CONFIG_DIR — a volume the agent owns and every concurrent tier-1
-# sandbox shares, so a sibling's agent can be rearranging it while this boot runs.
+# contract). Root writes the gateway pointer and the refs note into /etc, image
+# layer, and nothing else. Then `exec gosu` re-runs this script as the sandbox
+# user for everything that lands in $CONFIG_DIR — a volume the agent owns and
+# every concurrent tier-1 sandbox shares, so a sibling's agent can be rearranging
+# it while this boot runs.
 # Written as root, a settings.json that had become a symlink was a root write (and
 # a root READ, through jq) wherever the link pointed; written as the user, a
 # symlink leads only to places the agent could already write.
 
 USERNAME=sandbox
 CONFIG_DIR="${SANDBOX_CONFIG_DIR:-${CLAUDE_CONFIG_DIR:-/config}}"
+
+# The refs the launcher mounted under <dir> (sc_refs in sandbox-lib.sh), as one
+# instruction bullet naming them; nothing when none are.
+# shellcheck disable=SC2016  # the backticks are markdown, not command substitution
+refs_note() {
+    local names=() d list
+    for d in "$1"/*/; do
+        [[ -d "$d" ]] && names+=("$(basename "$d")")
+    done
+    (( ${#names[@]} > 0 )) || return 0
+    list="$(printf '`%s`, ' "${names[@]/#/$1/}")"
+    printf -- '- **Reference material is mounted read-only**: %s.\n' "${list%, }"
+    cat <<'REFS_NOTE'
+  Host directories the human mounted for you to read — another checkout, docs, a
+  library's source. Look there when the task points outside `/workspace`;
+  changes belong in `/workspace`, never there.
+REFS_NOTE
+}
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Phase 1 — root. The image layer only.
@@ -72,6 +91,18 @@ if [ "$(id -u)" -eq 0 ]; then
 }
 EOF
         echo "  MCP gateway -> http://${TOOL_GATEWAY_IP}:${TOOL_GATEWAY_PORT:-8100}/mcp"
+    fi
+
+    # The refs note, in /etc for the gateway pointer's reason and a sharper one:
+    # every concurrent tier-1 sandbox shares the config volume, and each launch has
+    # its own SANDBOX_REFS, so a note there would name whichever sibling booted last.
+    # A CLAUDE.md in /etc/claude-code loads as managed memory beside the user-scope
+    # one (measured — NOTES.md), so this needs no pointer.
+    REFS_NOTE=/etc/claude-code/CLAUDE.md
+    rm -f "$REFS_NOTE"
+    note="$(refs_note /refs)"
+    if [[ -n "$note" ]]; then
+        install -o root -g root -m 0644 /dev/stdin "$REFS_NOTE" <<<"$note"
     fi
 
     # Root is done. Everything below lands in the agent-owned volume, so it runs as

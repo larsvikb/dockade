@@ -240,11 +240,12 @@ class TierHookPrivilegeTests(unittest.TestCase):
                 self.assertNotIn('install -d -o "$USERNAME"', src)
                 self.assertNotIn('chown -h "$USERNAME', src)
 
-    def test_the_only_root_owned_artefact_lives_in_the_image_layer(self):
-        # Tier 1's gateway pointer is the one thing root writes, and it must be
-        # written BEFORE the re-exec and OUTSIDE the volume.
+    def test_root_owned_artefacts_live_only_in_the_image_layer(self):
+        # Tier 1's gateway pointer and refs note are what root writes, and they must
+        # be written BEFORE the re-exec and OUTSIDE the volume.
         root_phase, user_phase = TIER_SETUP.split(self.REEXEC, 1)
         self.assertIn("MCP_GATEWAY_CONFIG=/etc/claude-code/", root_phase)
+        self.assertIn("REFS_NOTE=/etc/claude-code/", root_phase)
         self.assertIn("install -o root -g root -m 0644", root_phase)
         self.assertNotIn("install -o root", user_phase)
         self.assertNotIn("$CONFIG_DIR/", root_phase.split("CONFIG_DIR=", 1)[1])

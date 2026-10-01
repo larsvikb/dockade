@@ -44,8 +44,10 @@ const LEASES = [
 
 const SERVERS = [
   { server: "mcp-github", enabled: true, tool_rules: 2,
-    auth: { type: "header", header: "Authorization", template: "Bearer {token}" } },
-  { server: "mcp-notes", enabled: false, tool_rules: 0, auth: { type: "none" } },
+    endpoint: { port: 8082, path: "/mcp" },
+    auth: { type: "header", header: "Authorization", template: "Bearer {secret}" } },
+  { server: "mcp-notes", enabled: false, tool_rules: 0,
+    endpoint: { port: 8082, path: "/mcp" }, auth: { type: "none" } },
 ];
 
 const TOOL_RULES = [
@@ -115,6 +117,16 @@ function resolved(id, body) {
   return answer;
 }
 
+// The MCP tab's writes. Each answers as the backend does when the write lands; the
+// lists it would change stay as they were, since every read above is fixed.
+const MCP_WRITES = [
+  [/^\/api\/mcp\/servers$/, () => ({ ok: true })],
+  [/^\/api\/mcp\/servers\/[^/]+\/(edit|revoke)$/, () => ({ ok: true })],
+  [/^\/api\/mcp\/rules$/, body => ({ ok: true, created: true, ...body })],
+  [/^\/api\/mcp\/rules\/[^/]+\/(edit|revoke)$/, () => ({ ok: true })],
+  [/^\/api\/mcp\/pins\/[^/]+\/revoke$/, () => ({ ok: true })],
+];
+
 // `{status, json}` for a request, or null for one this backend does not know — which
 // the harness records, since a path the page asks for and no fixture answers is
 // either a fixture to add or a change in what the page asks.
@@ -124,5 +136,7 @@ export function respond(method, path, body) {
   if (method === "POST" && resolve) {
     return { status: 200, json: resolved(decodeURIComponent(resolve[1]), body) };
   }
+  const write = method === "POST" && MCP_WRITES.find(([re]) => re.test(path));
+  if (write) return { status: 200, json: write[1](body) };
   return null;
 }

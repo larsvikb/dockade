@@ -76,8 +76,8 @@ favicon is an inline data URI: a governance UI must not fetch its own control lo
 a third party). The payoff is doubled: it also made the frontend testable for the first
 time. Because that invariant spans two files and re-inlining would break nothing
 *visible*, a test asserts the page carries no inline script or event handlers, and
-another asserts every `getElementById` in `app.js` matches an id that exists in
-`index.html` — the split's new failure mode is a renamed id, which is a `null`
+another asserts every `getElementById` in the page's modules matches an id that
+exists in `index.html` — the split's new failure mode is a renamed id, which is a `null`
 dereference that would otherwise appear only in a browser.
 
 ## The page
@@ -181,10 +181,18 @@ a test holds each equal to it; a module left out of the image would 404 in the
 container with every unit test green, and stop the whole page at the entry's first
 `import`.
 
+A surface's DOM code sits in its own module below the pure half, and `start()` mounts
+it. Its `mount…()` functions look up its elements into module-level `let`s and wire
+its listeners, since a lookup at import would fail under node. Its state lives in the
+module that writes it, and what other modules call is a named export, so a misspelling
+stops the page at link time, where the import test sees it, not at a click. The one
+mistake this shape adds is a lookup left out of a mount, a name that resolves and holds
+`undefined`; `MountedElementTests` is its guard.
+
 Two cross-file couplings have no compiler between their ends, and a test stands in at
-each. The first asserts every `getElementById` in `app.js` matches an id in `index.html`. The
-second asserts **every path the page `fetch`es is either served here or on the relay
-allowlist** — the deliberately narrow allowlist is what keeps `POST /authorize`
+each. The first asserts every `getElementById` in the page's modules matches an id in
+`index.html`. The second asserts **every path the page `fetch`es is either served here
+or on the relay allowlist** — the deliberately narrow allowlist is what keeps `POST /authorize`
 unreachable from a browser, and the cost of that narrowness is that adding a call
 without adding its route yields a 403 visible only to an operator loading the real page
 against a real backend. That is precisely how `/api/config` would have failed; the

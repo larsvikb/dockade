@@ -119,7 +119,13 @@ async function main() {
   let inFlight = 0;
   page.on("console", m => log.push(`console.${m.type()}: ${m.text()}`));
   page.on("pageerror", e => log.push(`pageerror: ${e.message}`));
-  page.on("dialog", d => { log.push(`dialog.${d.type()}: ${d.message()}`); d.dismiss(); });
+  // Dismissed unless the step running has called `accept()`, so no confirm-guarded
+  // write happens by accident, and a step's answer never carries into the next.
+  let accepting = false;
+  page.on("dialog", d => {
+    log.push(`dialog.${d.type()} ${accepting ? "accepted" : "dismissed"}: ${d.message()}`);
+    return accepting ? d.accept() : d.dismiss();
+  });
 
   await page.route("**/*", async route => {
     inFlight++;
@@ -168,6 +174,7 @@ async function main() {
     push: holds => page.evaluate(h => window.__harnessPush({ holds: h }), holds),
     clock: ms => page.clock.runFor(ms),
     load: () => page.goto(ORIGIN + "/"),
+    accept: () => { accepting = true; },
   };
 
   // A failed step ends the run but still writes what it saw: the page error that broke
@@ -175,6 +182,7 @@ async function main() {
   const out = [];
   let failed = false;
   for (const [i, [name, act]] of STEPS.entries()) {
+    accepting = false;
     try {
       await act(helpers);
     } catch (e) {

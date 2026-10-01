@@ -681,6 +681,11 @@ nothing and each fails its `checked > 0` assertion. Seen 2026-09-30.
   gc` left that entry alone while it was fresh, and removed it once its index file was
   backdated past `gc.worktreePruneExpire` (three months by default), so a sandbox
   worktree idle that long goes at the next host `gc`, the automatic one included.
+- **The other direction fails the same way.** A worktree made on the host and
+  launched as the workspace has a `.git` file naming a `/mnt/c/...` gitdir the
+  container does not have, so every git command run inside it fails in the sandbox.
+  Seen 2026-10-01, when such a launch died at boot in the entrypoint's git identity
+  block; that block now runs from `/` (see its comment).
 - **A worktree carries only tracked files.** The main checkout's `.env` (the LLM
   model, the GitHub server's toolsets and read-only flag) and `models/` are not in it.
   The Makefile's compose reads `.env` from the directory it runs in, so compose run

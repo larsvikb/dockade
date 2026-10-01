@@ -199,6 +199,14 @@ jobs:
       # hard-block gets exercised against something that would actually answer. If
       # the proxy logs its metadata-reachability warning at startup here, that is
       # the warning doing its job, not a fault to fix.
+      #
+      # The runner has no git identity, and without one the launcher forwards
+      # none and the entrypoint skips its identity block; this one is made up so
+      # that block runs here, in the image, as it does on a developer's machine.
+      - name: Git identity for the sandbox
+        run: |
+          git config --global user.name "dockade CI"
+          git config --global user.email "ci@example.invalid"
       - name: Boundary check (tier 1, governed)
         run: make check-boundary
 

@@ -147,7 +147,7 @@ report.
   session picks up the last kind live. The
   launcher's workspace guard hard-refuses dangerous roots and warns on nearby
   credentials, which narrows the path rather than closing it. This is the
-  acknowledged cost of the one deliberate host coupling.
+  acknowledged cost of the one deliberate writable host coupling.
 - **`WebSearch` being unauditable.** It executes server-side on Anthropic
   infrastructure, so no local firewall or proxy can see it. It is read-only and left
   enabled as a standing, revisitable decision. See "Server-side execution: accepted

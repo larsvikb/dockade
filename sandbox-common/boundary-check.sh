@@ -408,6 +408,21 @@ if [ -d /marketplaces ]; then
 else
     info "/marketplaces not mounted (no host marketplaces configured)"
 fi
+# /refs/<name> are the operator's own host directories (SANDBOX_REFS), handed in
+# to be read. Writable, the agent would be editing a checkout it was never given
+# — outside /workspace, so outside the review its commits get.
+refs=0
+for ref in /refs/*/; do
+    [ -d "$ref" ] || continue
+    refs=$((refs + 1))
+    if touch "$ref.boundary-check-probe" 2>/dev/null; then
+        rm -f "$ref.boundary-check-probe"
+        bad "${ref%/} is WRITABLE — reference mounts must be read-only"
+    else
+        ok "${ref%/} is read-only"
+    fi
+done
+[ "$refs" -gt 0 ] || info "/refs not mounted (SANDBOX_REFS unset)"
 
 printf '%s== privilege ==%s\n' "$bold" "$reset"
 # THE load-bearing property: the agent holds no Linux capabilities, so it cannot

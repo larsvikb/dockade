@@ -13,6 +13,8 @@ from in here.
 - **No git remote.** Commit locally; pushing is the human's step.
 - **`/workspace` is the human's checkout, live.** Your edits and branch switches
   appear outside this container immediately. Say so when you switch branches.
+- **`/refs/<name>`, when present, is reference material.** Host directories the
+  human mounted read-only for you to read. Changes belong in `/workspace`.
 - **`rm` is aliased to `-I`.** One prompt for a recursive delete or three or more
   files, none for a single file. A non-interactive caller cannot answer that prompt,
   so a bulk remove does nothing and still exits 0. Use `rm -f` when deleting many at

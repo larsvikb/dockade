@@ -419,6 +419,35 @@ has no route but the proxy), but it does sidestep the curated catalogue in
 `mcp-servers.yml`, and plugin hooks execute commands. Host-curated, read-only and
 boot-derived is the whole mitigation; the trust decision itself stays the human's.
 
+### Reference mounts — `SANDBOX_REFS`, read-only at `/refs/<name>`, every tier
+
+Host directories the operator lists in `SANDBOX_REFS` are mounted read-only at
+`/refs/<name>` (`sc_refs` in `sandbox-lib.sh`). Reading a file needs no
+capability, so both tiers get them, and it is enablement rather than a widening
+of the boundary — provided what is mounted is only files.
+
+- **One guard for every read-only mount.** `/refs` and `/marketplaces` refuse the
+  same paths through one function (`_sc_ro_mount_reason`), because what a
+  read-only mount exposes does not depend on why the directory was mounted.
+- **`:ro` is not "only readable".** A unix socket under a read-only bind can still
+  be connected to and a FIFO written (measured; `NOTES.md`), and the sandbox user
+  has the host's uid, so a mounted tmux or ssh-agent socket is host command
+  execution from a tier with no egress. The guard therefore refuses the runtime
+  directories and any directory with a socket or FIFO in its top three levels.
+  Deeper ones are not looked for, which is the same exposure the read-write
+  workspace already carries.
+- **Submounts:** `-v …:ro` makes mounts nested inside a ref read-only only on
+  Docker 25+ with kernel 5.12+, and falls back silently to the top level
+  otherwise. `boundary-check.sh` probes each ref's top level, not its submounts.
+- **Read-only is asserted twice, as for `/marketplaces`:** `make consistency` checks
+  the `:ro` in the source, and `boundary-check.sh` probes every `/refs/*` in the
+  running container. A writable ref would let the agent edit a host checkout
+  outside `/workspace`, so outside the review its commits get.
+- **The trust framing differs from marketplaces:** a ref is data the agent reads,
+  not code it loads, so no hook or skill runs from it. Its content is still
+  untrusted input — a ref can steer the agent the way any file it reads can — and
+  is bounded by the same egress and tool governance as everything else.
+
 ### Git identity — from the host at launch, not the tree
 
 Git **conventions** are shared and safe to ship, so the baked `~/.gitconfig`
@@ -681,7 +710,8 @@ under the MCP gateway for the file's shape and why a directory bind beats a comp
 `secrets:` entry. `.env` keeps the non-secret overrides it was meant for: DNS, model
 selection, the render gid, a port.
 
-**Workspace bind-mount:** the one deliberate direct host coupling. Scope it to a
+**Workspace bind-mount:** the one deliberate writable host coupling (the
+read-only ones are `/marketplaces` and `/refs`). Scope it to a
 single project directory, read-write. Because work lands on the host FS directly,
 no separate artifact-export path is needed in v1.
 

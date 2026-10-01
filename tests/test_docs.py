@@ -19,9 +19,11 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from typing import ClassVar
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_FILES = ("docker-compose.yml", "mcp-servers.yml")
@@ -40,17 +42,20 @@ COUNT_WORDS = {"single": 1, "dual": 2, "double": 2, "triple": 3, "quadruple": 4,
                "quintuple": 5, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6}
 
 
-def _tracked() -> list[str]:
+def _tracked(root: Path = ROOT) -> list[str]:
     """Files git knows about. Read from the INDEX rather than the filesystem for two
     reasons: an untracked scratch file (`local-todo.md` is gitignored and present)
     must not fail the gate, and a new doc must be covered the moment it is staged.
+    NUL-separated, so a name with a space or a non-ASCII byte arrives whole instead
+    of split or C-quoted, and decoded as ``parse_ls_files`` in
+    ``test_claude_config.py`` does, whatever the locale.
     """
     if not _GIT:
         return []
     out = subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
-        [_GIT, "-C", str(ROOT), "ls-files"],
-        capture_output=True, text=True, check=False)
-    return out.stdout.split() if out.returncode == 0 else []
+        [_GIT, "-C", str(root), "ls-files", "-z"],
+        capture_output=True, encoding="utf-8", errors="surrogateescape", check=False)
+    return [f for f in out.stdout.split("\0") if f] if out.returncode == 0 else []
 
 
 def _docs() -> list[str]:
@@ -125,6 +130,23 @@ class _NeedsGit(unittest.TestCase):
                 "tracked doc from a gitignored scratch file. Install git, or drop "
                 "strict mode to skip them knowingly.")
         raise unittest.SkipTest("git is not installed — cannot read the index")
+
+
+class TrackedListingTests(_NeedsGit):
+    """``_tracked`` itself: every guard below sees the repo through it."""
+
+    def test_a_name_with_a_space_or_a_non_ascii_byte_arrives_whole(self):
+        names = ["plain.md", "with space.md", "ångström.md"]
+        # A git hook exports GIT_DIR and GIT_INDEX_FILE: inherited, they would stage
+        # these names into the real repository's index. -f, past a global ignore.
+        clean = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, clean, clear=True):
+            git = [_GIT, "-C", tmp]
+            subprocess.run([*git, "init", "-q"], check=True)  # noqa: S603 (absolute path from shutil.which, fixed args)
+            for name in names:
+                (Path(tmp) / name).touch()
+            subprocess.run([*git, "add", "-f", "--", *names], check=True)  # noqa: S603 (absolute path from shutil.which, fixed args)
+            self.assertEqual(sorted(_tracked(Path(tmp))), sorted(names))
 
 
 class NetworkRosterTests(unittest.TestCase):

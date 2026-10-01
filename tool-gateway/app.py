@@ -175,9 +175,8 @@ async def healthz() -> dict:
     return {"ok": True}
 
 
-#: The agent's MCP endpoint. One path, matching the convention the server containers
-#: are dialled on (`discovery.MCP_PATH`), so there is one spelling of "the MCP endpoint"
-#: in this system rather than one per direction.
+#: The agent's MCP endpoint. Its own setting: the servers are dialled on whatever path
+#: each is registered with (`discovery.check_endpoint`).
 MCP_PATH = os.environ.get("GATEWAY_MCP_SERVE_PATH", "/mcp")
 
 #: The most this listener will read of one request, in bytes. The body is the agent's

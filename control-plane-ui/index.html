@@ -313,6 +313,8 @@
   .ruleform input[type="text"] { font: inherit; font-size: 13px; flex: 1;
     min-width: 220px; background: #202632; color: var(--fg);
     border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+  .ruleform input.port { flex: 0 0 7ch; min-width: 0; }
+  .ruleform input.path { flex: 0 0 14ch; min-width: 0; }
   .ruleform select { font: inherit; font-size: 13px; background: #202632;
     color: var(--fg); border: 1px solid var(--line); border-radius: 6px;
     padding: 5px 6px; }
@@ -599,6 +601,12 @@
       <input type="text" id="server-name" spellcheck="false" autocapitalize="off"
              placeholder="mcp-github &mdash; the container name, exactly"
              aria-label="Server name">
+      <!-- Where the server listens. Pre-filled with the first catalogue server's,
+           which is also what the API assumes when a registration names neither. -->
+      <input type="text" id="server-port" class="port" inputmode="numeric"
+             spellcheck="false" value="8082" aria-label="Port">
+      <input type="text" id="server-path" class="path" spellcheck="false"
+             autocapitalize="off" value="/mcp" aria-label="Path">
       <!-- The descriptor, as presets. The real cases are "the server holds its own
            credential" and "the gateway injects a bearer or a Basic token"; custom
            exists so this form can express everything the store can, rather than
@@ -625,7 +633,8 @@
     <div class="note" id="server-preview" aria-live="polite"></div>
     <table>
       <thead>
-        <tr><th>server</th><th>state</th><th>auth</th><th>rules</th><th></th></tr>
+        <tr><th>server</th><th>state</th><th>endpoint</th><th>auth</th><th>rules</th>
+            <th></th></tr>
       </thead>
       <tbody id="servers"></tbody>
     </table>

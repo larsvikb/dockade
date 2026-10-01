@@ -25,7 +25,7 @@ import {
 import { revokePreview, createPreview, editPreview } from "./egress-rules.js";
 import { leaseLabel, leaseRemaining, leaseCountdown, groupLeases } from "./leases.js";
 import {
-  SERVER_NAME_RE, serverDescriptor, serverPreview, serverEditBody,
+  SERVER_NAME_RE, serverDescriptor, serverEndpoint, serverPreview, serverEditBody,
   toolChoices, toolRulePreview, toolEditPreview, toolRevokePreview,
   pinText, pinState, pinExpiry, pinLapsesDue,
 } from "./mcp.js";
@@ -2013,22 +2013,22 @@ function start() {
   const serverAuth = document.getElementById("server-auth");
   const serverHeader = document.getElementById("server-header");
   const serverTemplate = document.getElementById("server-template");
+  const serverPort = document.getElementById("server-port");
+  const serverPath = document.getElementById("server-path");
   const serverPreviewEl = document.getElementById("server-preview");
   let serversFailed = false;
   const serversByName = new Map();
 
-  // No PORT anywhere in this form, and that is the convention rather than an omission:
-  // every catalogue server listens on the one the gateway dials (tool-gateway's
-  // MCP_PORT), so a port here would be a field that must always hold the same value.
-
   const authFields = () =>
     serverDescriptor(serverAuth.value, serverHeader.value, serverTemplate.value);
+  const endpointFields = () => serverEndpoint(serverPort.value, serverPath.value);
 
   function renderServerPreview() {
     const custom = serverAuth.value === "custom";
     serverHeader.hidden = !custom;
     serverTemplate.hidden = !custom;
-    serverPreviewEl.textContent = serverPreview(serverName.value, authFields()).text;
+    serverPreviewEl.textContent =
+      serverPreview(serverName.value, authFields(), endpointFields()).text;
   }
 
   function renderServers(rows) {
@@ -2045,6 +2045,7 @@ function start() {
       };
       cell(row.server);
       cell(row.enabled ? "enabled" : "disabled");
+      cell(row.endpoint ? `:${row.endpoint.port}${row.endpoint.path}` : "");
       cell(row.auth && row.auth.type === "header"
              ? `${row.auth.header}: ${row.auth.template}` : "none");
       cell(String(row.tool_rules));
@@ -2095,12 +2096,15 @@ function start() {
   serverName.addEventListener("input", renderServerPreview);
   serverHeader.addEventListener("input", renderServerPreview);
   serverTemplate.addEventListener("input", renderServerPreview);
+  serverPort.addEventListener("input", renderServerPreview);
+  serverPath.addEventListener("input", renderServerPreview);
 
   serverForm.addEventListener("submit", async ev => {
     ev.preventDefault();
     const name = serverName.value.trim();
     if (!SERVER_NAME_RE.test(name)) return;
-    const body = JSON.stringify(Object.assign({ server: name }, authFields()));
+    const body = JSON.stringify(
+      Object.assign({ server: name }, authFields(), endpointFields()));
     try {
       const res = await fetch("/api/mcp/servers", {
         method: "POST", headers: { "Content-Type": "application/json" }, body });

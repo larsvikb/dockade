@@ -1405,6 +1405,16 @@ without a per-server special case anywhere in the code — there is no GitHub-sp
 branch. The gateway substitutes the secret verbatim and never encodes it, so a scheme
 that wants an encoding, as Basic wants base64, is stored already encoded.
 
+**Where a server listens is stored per server, and its shape is what keeps the
+credential on `mcp-net`.** Each registration carries a port and a path, editable like
+the descriptor; there is no gateway-wide default, because MCP servers agree on
+neither. The path is the one stored string that reaches the URL a credential is sent
+on, after the address `_placed` checked, so it is held to segments of unreserved
+characters: a path such as `@evil.example` would otherwise make that the host. The
+control plane refuses it at registration (`policy._endpoint_error`) and the gateway
+again at the dial (`discovery.check_endpoint`), for the reason `check_name` repeats the
+name check.
+
 **The secret's path is derived from the server name, never stored as a reference.**
 The gateway reads exactly `/run/dockade/secrets/<server>.json` and nothing else. No
 prefix is added, because the name already carries one — the server IS `mcp-github`,

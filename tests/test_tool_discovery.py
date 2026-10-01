@@ -19,10 +19,11 @@ import contextlib
 import json
 import socket
 import threading
+import time
 import unittest
 from unittest import mock
 
-from _loader import load_discovery
+from _loader import load_control_plane, load_discovery
 
 #: A roster entry as ``/tool/roster`` serves one, trimmed to what this module reads.
 #: Written out rather than imported from the control plane: these two are separate
@@ -31,6 +32,7 @@ from _loader import load_discovery
 ENTRY = {"server": "mcp-github",
          "auth": {"type": "header", "header": "Authorization",
                   "template": "Bearer {secret}"},
+         "endpoint": {"port": 8082, "path": "/mcp"},
          "tools": [{"tool": "get_issue", "action": "allow"},
                    {"tool": "create_pr", "action": "ask"}]}
 
@@ -173,7 +175,7 @@ class PlacementTests(unittest.TestCase):
 
     def post(self, *addresses):
         with mock.patch("socket.getaddrinfo", _resolves_to(*addresses)):
-            return self.discovery.post("mcp-github", {"id": 1}, ENTRY["auth"])
+            return self.discovery.post(ENTRY, {"id": 1})
 
     def test_the_server_is_dialled_at_its_mcp_net_address_under_its_own_name(self):
         self.post("172.28.0.11")
@@ -182,6 +184,73 @@ class PlacementTests(unittest.TestCase):
         # What urllib sent when the name was in the URL, so the server sees no change.
         self.assertEqual(request.get_header("Host"), "mcp-github:8082")
         self.assertEqual(request.get_header("Authorization"), "Bearer the-token")
+
+    def test_the_port_and_path_are_the_ones_the_roster_gives(self):
+        entry = {**ENTRY, "endpoint": {"port": 3000, "path": "/v1/mcp"}}
+        with mock.patch("socket.getaddrinfo", _resolves_to("172.28.0.11")):
+            self.discovery.post(entry, {"id": 1})
+        [request] = self.dialled
+        self.assertEqual(request.full_url, "http://172.28.0.11:3000/v1/mcp")
+        self.assertEqual(request.get_header("Host"), "mcp-github:3000")
+
+    def test_an_endpoint_that_could_move_the_host_dials_nothing(self):
+        # The path follows the checked address in the URL, so `@host` there would make
+        # `host` the one dialled, with the credential. Refused before anything resolves
+        # or any secret is read, as a bad name is.
+        self.discovery.read_secret = mock.Mock(return_value="the-token")
+        for endpoint in ({"port": 8082, "path": "@evil.example/mcp"},
+                         {"port": 8082, "path": "//evil.example/mcp"},
+                         {"port": 8082, "path": "/mcp?x=@evil.example"},
+                         {"port": 8082, "path": "/%40evil.example"},
+                         {"port": 8082, "path": "/../mcp"},
+                         {"port": 8082, "path": "mcp"},
+                         {"port": "8082@evil.example", "path": "/mcp"},
+                         {"port": 0, "path": "/mcp"},
+                         {"port": True, "path": "/mcp"},
+                         {"path": "/mcp"},
+                         None):
+            with self.subTest(endpoint=endpoint), \
+                    self.assertRaises(self.discovery.DiscoveryError):
+                self.post_to({**ENTRY, "endpoint": endpoint}, "172.28.0.11")
+        self.assertEqual(self.dialled, [])
+        self.discovery.read_secret.assert_not_called()
+
+    def post_to(self, entry, *addresses):
+        with mock.patch("socket.getaddrinfo", _resolves_to(*addresses)):
+            return self.discovery.post(entry, {"id": 1})
+
+    def test_the_path_pattern_is_the_control_planes_own(self):
+        # Two images, no shared module, as in test_tool_surface: this test is what
+        # holds the gateway's check to the one registration is held to.
+        policy = load_control_plane().policy
+        self.assertEqual(self.discovery._PATH_RE.pattern, policy._PATH_RE.pattern)
+        self.assertEqual(self.discovery._PATH_MAX_LEN, policy._PATH_MAX_LEN)
+        # The pattern is half of each check; the segment rule and the length cap are
+        # the other half, so the two checks are held to the same answers as well.
+        for path in ("/", "/mcp", "/v1/mcp/", "/.well-known/mcp", "/../mcp", "/./x",
+                     "/a//b", "//x", "@x/mcp", "/mcp\n", "/mcp?x", "/" + "a" * 127,
+                     "/" + "a" * 128):
+            with self.subTest(path=path):
+                try:
+                    self.discovery.check_endpoint({"port": 8082, "path": path})
+                    gateway = True
+                except self.discovery.DiscoveryError:
+                    gateway = False
+                self.assertEqual(gateway, policy._endpoint_error(8082, path) is None)
+
+    def test_a_long_path_is_refused_at_once(self):
+        # The first spelling of the pattern backtracked exponentially: this path took it
+        # seconds, a 128-char one would never return. Kept short so a regression FAILS
+        # here rather than hanging the run.
+        started = time.monotonic()
+        with self.assertRaises(self.discovery.DiscoveryError):
+            self.discovery.check_endpoint({"port": 8082, "path": "/" + "a" * 28 + "!"})
+        self.assertLess(time.monotonic() - started, 0.5)
+
+    def test_a_name_with_a_trailing_newline_is_not_a_name(self):
+        # `$` matches before a final newline; the check is a fullmatch so it cannot.
+        with self.assertRaises(self.discovery.DiscoveryError):
+            self.discovery.check_name("mcp-github\n")
 
     def test_a_name_that_leads_off_mcp_net_is_not_sent_the_credential(self):
         # The finding: a sandbox-net container answering to a server's name.
@@ -201,7 +270,7 @@ class PlacementTests(unittest.TestCase):
 
         with mock.patch("socket.getaddrinfo", unresolvable), \
                 self.assertRaises(self.discovery.DiscoveryError) as caught:
-            self.discovery.post("mcp-github", {"id": 1}, ENTRY["auth"])
+            self.discovery.post(ENTRY, {"id": 1})
         self.assertEqual(self.dialled, [])
         self.assertIn("does not resolve", str(caught.exception))
 
@@ -216,7 +285,7 @@ class PlacementTests(unittest.TestCase):
             return [(2, 1, 6, "", ("172.28.0.11", port))]
 
         with mock.patch("socket.getaddrinfo", counting):
-            self.discovery.post("mcp-github", {"id": 1}, ENTRY["auth"])
+            self.discovery.post(ENTRY, {"id": 1})
         self.assertEqual(calls, ["mcp-github"])
         self.assertTrue(self.dialled[0].host.startswith("172.28.0.11"))
 
@@ -252,10 +321,10 @@ class PlacementOnTheWireTests(unittest.TestCase):
         thread = threading.Thread(target=serve, daemon=True)
         thread.start()
         self.addCleanup(thread.join, 2)
-        discovery = load_discovery({"GATEWAY_MCP_NET": "127.0.0.0/8",
-                                    "GATEWAY_MCP_PORT": str(port)})
+        discovery = load_discovery({"GATEWAY_MCP_NET": "127.0.0.0/8"})
         with mock.patch("socket.getaddrinfo", _resolves_to("127.0.0.1")):
-            discovery.post("mcp-github", {"id": 1}, {"type": "none"})
+            discovery.post({"server": "mcp-github", "auth": {"type": "none"},
+                            "endpoint": {"port": port, "path": "/mcp"}}, {"id": 1})
         head = seen[0].lower()
         self.assertIn(f"host: mcp-github:{port}\r\n", head)
         self.assertEqual(head.count("host:"), 1)
@@ -282,7 +351,7 @@ class TrimTests(unittest.TestCase):
 
         with mock.patch("urllib.request.urlopen", urlopen), \
                 mock.patch("socket.getaddrinfo", _resolves_to("172.28.0.11")):
-            tools = self.discovery.list_tools("mcp-github", {"type": "none"})
+            tools = self.discovery.list_tools({**ENTRY, "auth": {"type": "none"}})
         return tools[0]
 
     def test_the_schema_survives_the_read(self):
@@ -503,12 +572,19 @@ class DigestTests(unittest.TestCase):
         self.assertNotEqual(self.discovery.roster_digest([ENTRY]),
                             self.discovery.roster_digest([other]))
 
+    def test_an_endpoint_edit_changes_the_digest(self):
+        # Where a server is dialled, so a server re-pointed at its right path is asked
+        # again at once rather than at the backstop.
+        other = {**ENTRY, "endpoint": {"port": 8082, "path": "/v1/mcp"}}
+        self.assertNotEqual(self.discovery.roster_digest([ENTRY]),
+                            self.discovery.roster_digest([other]))
+
     def test_key_order_is_not_a_change(self):
         # JSON object order is not meaningful and the control plane is free to change
         # it. Without sorting, an unrelated backend edit would look like a roster
         # change forever and the loop would re-dial every server on every poll.
         reordered = {"tools": ENTRY["tools"], "auth": ENTRY["auth"],
-                     "server": ENTRY["server"]}
+                     "endpoint": ENTRY["endpoint"], "server": ENTRY["server"]}
         self.assertEqual(self.discovery.roster_digest([ENTRY]),
                          self.discovery.roster_digest([reordered]))
 

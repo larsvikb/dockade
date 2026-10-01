@@ -3184,6 +3184,11 @@ def _register(server="mcp-github", request=None, **kw):
         request if request is not None else _FakeRequest())
 
 
+def _edit_request(port=8082, path="/mcp", **kw):
+    """An edit body, the endpoint filled in: the endpoint is required on an edit."""
+    return cp.api_mcp.ServerEditRequest(port=port, path=path, **kw)
+
+
 def _enable(server="mcp-github", request=None, **kw):
     """Flip a registered server on, through the endpoint that owns the switch.
 
@@ -3191,7 +3196,7 @@ def _enable(server="mcp-github", request=None, **kw):
     needed by every test whose subject is what a rule DECIDES: a rule on a disabled
     server decides nothing (``policy._decide_tool``), which is the switch working."""
     return cp.api_mcp.edit_mcp_server(
-        server, cp.api_mcp.ServerEditRequest(enabled=True, **kw),
+        server, _edit_request(enabled=True, **kw),
         request if request is not None else _FakeRequest())
 
 
@@ -3282,6 +3287,46 @@ class McpServerRegistrationTests(_CPTestCase):
     def test_an_unknown_auth_type_is_refused(self):
         self.assertEqual(_register(auth_type="oauth").status_code, 400)
 
+    def test_the_endpoint_defaults_to_where_servers_were_always_dialled(self):
+        self.assertEqual(_register().body["endpoint"], {"port": 8082, "path": "/mcp"})
+        self.assertEqual(cp.api_mcp.api_mcp_servers()[0]["endpoint"],
+                         {"port": 8082, "path": "/mcp"})
+
+    def test_a_registration_records_its_own_endpoint(self):
+        _register(port=3000, path=" /v1/mcp ")
+        row = self._row()
+        self.assertEqual((row["port"], row["path"]), (3000, "/v1/mcp"))
+
+    def test_an_endpoint_that_could_move_the_host_is_refused(self):
+        # The gateway appends the path straight after the checked address, and the
+        # credential goes wherever the URL then points. `@` ends the authority there.
+        for port, path in ((8082, "@evil.example/mcp"), (8082, "//evil.example"),
+                           (8082, "/mcp?x=1"), (8082, "/mcp#x"), (8082, "/%40x"),
+                           (8082, "/a\\b"), (8082, "/../mcp"), (8082, "/./mcp"),
+                           (8082, "mcp"), (8082, ""), (8082, "/" + "a" * 128),
+                           (0, "/mcp"), (65536, "/mcp"), (True, "/mcp"),
+                           (None, "/mcp")):
+            with self.subTest(port=port, path=path):
+                self.assertEqual(
+                    _register(server="mcp-x", port=port, path=path).status_code, 400)
+        self.assertIsNone(self._row("mcp-x"))
+
+    def test_a_long_bad_path_is_refused_at_once(self):
+        # This runs in the one process that also answers /authorize, so a pattern that
+        # backtracks on a pasted path stalls every decision. The first one did. The
+        # inputs take it seconds, not forever, so a regression fails here rather than
+        # hanging the run.
+        started = time.monotonic()
+        self.assertIsNotNone(
+            cp.policy._endpoint_error(8082, "/mcp/streamable-http-transport?" + "a" * 90))
+        self.assertIsNotNone(cp.policy._endpoint_error(8082, "/" + "a" * 28 + "!"))
+        self.assertLess(time.monotonic() - started, 0.5)
+
+    def test_the_paths_a_server_actually_uses_are_accepted(self):
+        for path in ("/", "/mcp", "/mcp/", "/v1/mcp", "/.well-known/mcp", "/a_b~c-d"):
+            with self.subTest(path=path):
+                self.assertIsNone(cp.policy._endpoint_error(8082, path))
+
 
 class McpServerEditTests(_CPTestCase):
     def setUp(self):
@@ -3290,7 +3335,7 @@ class McpServerEditTests(_CPTestCase):
 
     def test_enabling_and_disabling_reports_both_states(self):
         resp = cp.api_mcp.edit_mcp_server("mcp-github",
-                                          cp.api_mcp.ServerEditRequest(enabled=True),
+                                          _edit_request(enabled=True),
                                           _FakeRequest())
         self.assertTrue(resp.body["changed"])
         self.assertTrue(resp.body["enabled"])
@@ -3298,7 +3343,7 @@ class McpServerEditTests(_CPTestCase):
 
     def test_asking_for_what_is_already_configured_writes_nothing(self):
         resp = cp.api_mcp.edit_mcp_server("mcp-github",
-                                          cp.api_mcp.ServerEditRequest(enabled=False),
+                                          _edit_request(enabled=False),
                                           _FakeRequest())
         self.assertFalse(resp.body["changed"])
 
@@ -3308,9 +3353,9 @@ class McpServerEditTests(_CPTestCase):
         # it, and splitting them puts a window either side of the ordering.
         resp = cp.api_mcp.edit_mcp_server(
             "mcp-github",
-            cp.api_mcp.ServerEditRequest(enabled=True, auth_type="header",
-                                         auth_header="Authorization",
-                                         auth_template="Bearer {secret}"),
+            _edit_request(enabled=True, auth_type="header",
+                          auth_header="Authorization",
+                          auth_template="Bearer {secret}"),
             _FakeRequest())
         self.assertEqual(resp.body["auth"]["type"], "header")
         self.assertTrue(resp.body["enabled"])
@@ -3318,9 +3363,9 @@ class McpServerEditTests(_CPTestCase):
     def test_a_bad_descriptor_is_refused_before_anything_is_enabled(self):
         resp = cp.api_mcp.edit_mcp_server(
             "mcp-github",
-            cp.api_mcp.ServerEditRequest(enabled=True, auth_type="header",
-                                         auth_header="Authorization",
-                                         auth_template="Bearer nothing"),
+            _edit_request(enabled=True, auth_type="header",
+                          auth_header="Authorization",
+                          auth_template="Bearer nothing"),
             _FakeRequest())
         self.assertEqual(resp.status_code, 400)
         with cp.store._connect() as conn:
@@ -3330,9 +3375,40 @@ class McpServerEditTests(_CPTestCase):
 
     def test_an_unknown_server_is_a_404(self):
         resp = cp.api_mcp.edit_mcp_server("mcp-nope",
-                                          cp.api_mcp.ServerEditRequest(enabled=True),
+                                          _edit_request(enabled=True),
                                           _FakeRequest())
         self.assertEqual(resp.status_code, 404)
+
+    def test_the_endpoint_moves_and_the_audit_row_has_both(self):
+        with mock.patch.object(cp.store, "_audit") as audited:
+            resp = cp.api_mcp.edit_mcp_server(
+                "mcp-github", _edit_request(enabled=False, port=3000, path="/v1/mcp"),
+                _FakeRequest())
+        self.assertTrue(resp.body["changed"])
+        self.assertEqual(resp.body["endpoint"], {"port": 3000, "path": "/v1/mcp"})
+        self.assertEqual(resp.body["previous"]["endpoint"],
+                         {"port": 8082, "path": "/mcp"})
+        self.assertIn(":8082/mcp -> :3000/v1/mcp", audited.call_args[1]["reason"])
+
+    def test_an_edit_without_an_endpoint_is_refused_not_reset(self):
+        # The endpoint is required on an edit where auth defaults, so a caller that
+        # leaves it out cannot move a server back to 8082 and /mcp without noticing.
+        cp.api_mcp.edit_mcp_server(
+            "mcp-github", _edit_request(enabled=False, port=3000, path="/v1/mcp"),
+            _FakeRequest())
+        resp = cp.api_mcp.edit_mcp_server(
+            "mcp-github", cp.api_mcp.ServerEditRequest(enabled=True), _FakeRequest())
+        self.assertEqual(resp.status_code, 400)
+        server = cp.api_mcp.api_mcp_servers()[0]
+        self.assertEqual(server["endpoint"], {"port": 3000, "path": "/v1/mcp"})
+        self.assertFalse(server["enabled"])
+
+    def test_a_bad_endpoint_is_refused_before_anything_is_enabled(self):
+        resp = cp.api_mcp.edit_mcp_server(
+            "mcp-github", _edit_request(enabled=True, path="@evil.example/mcp"),
+            _FakeRequest())
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(cp.api_mcp.api_mcp_servers()[0]["enabled"])
 
 
 class McpServerRevokeTests(_CPTestCase):
@@ -3393,7 +3469,7 @@ class McpToolRuleTests(_CPTestCase):
         # revoking its rules, and both verbs exist because both are wanted.
         _tool_rule("get_me", "allow")
         cp.api_mcp.edit_mcp_server("mcp-github",
-                                   cp.api_mcp.ServerEditRequest(enabled=False),
+                                   _edit_request(enabled=False),
                                    _FakeRequest())
         self.assertEqual(cp.policy._decide_tool("mcp-github", "get_me")[0], "deny")
         self.assertEqual([r["tool"] for r in cp.api_mcp.api_mcp_rules()], ["get_me"])
@@ -3576,7 +3652,7 @@ class ToolAuthorizeDecisionTests(_ToolBridgeTestCase):
         _tool_rule("get_me", "allow")
         self.assertEqual(_tool_call(server="mcp-nobody")["decision"], "deny")
         cp.api_mcp.edit_mcp_server("mcp-github",
-                                   cp.api_mcp.ServerEditRequest(enabled=False),
+                                   _edit_request(enabled=False),
                                    _FakeRequest())
         self.assertEqual(_tool_call()["decision"], "deny")
 
@@ -3815,7 +3891,7 @@ class McpPinTests(_CPTestCase):
         self._edit_rule("ask")
         self.assertEqual(self._decides(), {self.pin_id: True})
         cp.api_mcp.edit_mcp_server("mcp-github",
-                                   cp.api_mcp.ServerEditRequest(enabled=False),
+                                   _edit_request(enabled=False),
                                    _FakeRequest())
         self.assertEqual(self._decides(), {self.pin_id: False})
 
@@ -4229,7 +4305,7 @@ class ToolRosterTests(_ToolBridgeTestCase):
         # off. The operator's view of that is /api/mcp/servers.
         _tool_rule("get_me", "allow")
         cp.api_mcp.edit_mcp_server("mcp-github",
-                                   cp.api_mcp.ServerEditRequest(enabled=False),
+                                   _edit_request(enabled=False),
                                    _FakeRequest())
         self.assertEqual(cp.api_tool.tool_roster(), [])
         self.assertEqual(
@@ -4255,15 +4331,22 @@ class ToolRosterTests(_ToolBridgeTestCase):
         # the store behind it — can point one server at another's credential.
         cp.api_mcp.edit_mcp_server(
             "mcp-github",
-            cp.api_mcp.ServerEditRequest(enabled=True, auth_type="header",
-                                         auth_header="Authorization",
-                                         auth_template="Bearer {secret}"),
+            _edit_request(enabled=True, auth_type="header",
+                          auth_header="Authorization",
+                          auth_template="Bearer {secret}"),
             _FakeRequest())
         auth = cp.api_tool.tool_roster()[0]["auth"]
         self.assertEqual(auth, {"type": "header", "header": "Authorization",
                                 "template": "Bearer {secret}"})
         self.assertNotIn("secret", json.dumps(cp.api_tool.tool_roster()).replace(
             "{secret}", ""))
+
+    def test_the_endpoint_travels(self):
+        cp.api_mcp.edit_mcp_server(
+            "mcp-github", _edit_request(enabled=True, port=3000, path="/v1/mcp"),
+            _FakeRequest())
+        self.assertEqual(cp.api_tool.tool_roster()[0]["endpoint"],
+                         {"port": 3000, "path": "/v1/mcp"})
 
     def test_no_server_is_an_empty_list_not_an_error(self):
         cp.api_mcp.revoke_mcp_server("mcp-github", _FakeRequest())
@@ -4406,7 +4489,7 @@ class ToolClaimTests(_ToolBridgeTestCase):
         ask = self._ask()
         _resolve(ask, "allow")
         cp.api_mcp.edit_mcp_server("mcp-github",
-                                   cp.api_mcp.ServerEditRequest(enabled=False),
+                                   _edit_request(enabled=False),
                                    _FakeRequest())
         resp = _claim(ask)
         self.assertEqual(resp.status_code, 409)
@@ -4439,7 +4522,7 @@ class ToolClaimTests(_ToolBridgeTestCase):
         ask = self._ask()
         _resolve(ask, "allow")
         cp.api_mcp.edit_mcp_server("mcp-github",
-                                   cp.api_mcp.ServerEditRequest(enabled=False),
+                                   _edit_request(enabled=False),
                                    _FakeRequest())
         self.assertEqual(_claim(ask).status_code, 409)
         self.assertIsNone(cp.holds._get_tool_ask(ask)["claimed_at"])
@@ -4453,7 +4536,7 @@ class ToolClaimTests(_ToolBridgeTestCase):
         ask = self._ask()
         _resolve(ask, "allow")
         cp.api_mcp.edit_mcp_server("mcp-github",
-                                   cp.api_mcp.ServerEditRequest(enabled=False),
+                                   _edit_request(enabled=False),
                                    _FakeRequest())
         with mock.patch.object(cp.store, "_audit") as audited:
             _claim(ask)
@@ -4688,7 +4771,7 @@ class ActorColumnTests(_ToolBridgeTestCase):
         cp.api_mcp.revoke_mcp_rule(tool, op)
         _register("mcp-other", request=op)
         cp.api_mcp.edit_mcp_server("mcp-other",
-                                   cp.api_mcp.ServerEditRequest(enabled=True), op)
+                                   _edit_request(enabled=True), op)
         cp.api_mcp.revoke_mcp_server("mcp-other", op)
 
         rows = self._rows("stage IN ('policy', 'tool-policy', 'mcp-server')")
@@ -5050,14 +5133,16 @@ class FreshSchemaTests(_FreshStoreTestCase):
         # holding a path or a handle to the credential is what must never appear here,
         # because a stored free-text reference is what would let a forged config write
         # point one server at another's secret. It is also what keeps the property
-        # that a crown-jewel backup contains no credential.
+        # that a crown-jewel backup contains no credential. `path` is the URL path the
+        # server is dialled on, held to a shape that names no file
+        # (``policy._endpoint_error``).
         self._use_store("fresh-mcp-servers.db")
         cp.store._init_db()
         with cp.store._connect() as conn:
             cols = {r["name"] for r in
                     conn.execute("PRAGMA table_info(mcp_servers)")}
         self.assertEqual(cols, {"server", "enabled", "auth_type", "auth_header",
-                                "auth_template", "created_at"})
+                                "auth_template", "created_at", "port", "path"})
 
     def test_the_tool_policy_key_is_the_server_tool_pair(self):
         # Tool names are not namespaced across servers, so uniqueness has to be the
@@ -5739,6 +5824,52 @@ class SchemaVersionTests(_FreshStoreTestCase):
         with cp.store._connect() as conn:
             self.assertIn("AUTOINCREMENT", conn.execute(
                 "SELECT sql FROM sqlite_master WHERE name='leases'").fetchone()[0])
+
+    # `mcp_servers` as it was before v10.
+    _MCP_SERVERS_V9 = """CREATE TABLE mcp_servers (
+        server TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0,
+        auth_type TEXT NOT NULL DEFAULT 'none', auth_header TEXT, auth_template TEXT,
+        created_at REAL NOT NULL)"""
+
+    def test_v10_keeps_each_server_where_it_was_dialled(self):
+        self._old_store("version-server-endpoint.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            conn.execute("DROP TABLE mcp_servers")
+            conn.execute(self._MCP_SERVERS_V9)
+            conn.execute("INSERT INTO mcp_servers(server, enabled, created_at) "
+                         "VALUES ('mcp-github', 1, 0)")
+            conn.execute("PRAGMA user_version = 9")
+            conn.commit()
+        cp.store._init_db()
+        self.assertEqual(self._version(), cp.store.SCHEMA_VERSION)
+        [server] = cp.api_mcp.api_mcp_servers()
+        self.assertEqual(server["endpoint"], {"port": 8082, "path": "/mcp"})
+        self.assertTrue(server["enabled"])
+        # The step's defaults are the API's, so a migrated row and a fresh
+        # registration with no endpoint given are dialled the same way.
+        self.assertEqual((cp.policy.DEFAULT_PORT, cp.policy.DEFAULT_PATH),
+                         (8082, "/mcp"))
+
+    def test_a_migrated_and_a_fresh_store_agree_on_the_server_columns(self):
+        # Compared column by column rather than by the stored SQL: v10 ALTERs the
+        # columns in, so its text differs from the CREATE even where the schema agrees.
+        def columns(name, migrate):
+            self._old_store(name) if migrate else self._use_store(name)
+            cp.store._init_db()
+            with cp.store._connect() as conn:
+                if migrate:
+                    conn.execute("DROP TABLE mcp_servers")
+                    conn.execute(self._MCP_SERVERS_V9)
+                    conn.execute("PRAGMA user_version = 9")
+                    conn.commit()
+            cp.store._init_db()
+            with cp.store._connect() as conn:
+                return {tuple(r)[1:] for r in
+                        conn.execute("PRAGMA table_info(mcp_servers)")}
+
+        self.assertEqual(columns("agree-servers-migrated.db", True),
+                         columns("agree-servers-fresh.db", False))
 
     def test_a_store_already_renamed_is_left_alone(self):
         # `ALTER TABLE ... RENAME COLUMN` raises rather than no-ops if it runs twice.

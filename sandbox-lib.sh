@@ -89,6 +89,26 @@ _sc_windows_profile_reason() {
     done
 }
 
+# A host unix socket in a mounted directory can be connected to from inside, read-only
+# or not, and the sandbox user has the host's uid: a tmux server or an ssh-agent there
+# is host command execution. Prints the reason to refuse, or nothing.
+# /tmp also holds ordinary scratch directories, so only it and what holds it are
+# refused; /run and $XDG_RUNTIME_DIR hold nothing anyone means to hand over.
+_sc_runtime_dir_reason() {
+    local real="$1" runtime
+    for runtime in /tmp /run /var/run ${XDG_RUNTIME_DIR:+"$XDG_RUNTIME_DIR"}; do
+        [[ -d "$runtime" ]] || continue
+        runtime="$(cd "$runtime" && pwd -P)"
+        if [[ "$real" == "$runtime" || ( "$runtime" != /tmp && "$real" == "$runtime"/* ) ]]; then
+            echo "that is $runtime, where host processes keep their sockets."
+            return 0
+        elif [[ "$runtime" == "$real"/* ]]; then
+            echo "$runtime, where host processes keep their sockets, is inside it."
+            return 0
+        fi
+    done
+}
+
 # _sc_warn_credentials <dir> <what> <access>
 # Non-fatal: credential material sitting inside a directory about to be mounted.
 # Legal (you may genuinely want to work there), but the agent will be able to read
@@ -111,8 +131,9 @@ sc_guard_workspace() {
     _sc_deny_workspace() {
         echo "REFUSING to mount workspace: $real_workspace" >&2
         echo "  $1" >&2
-        echo "  This would give the sandbox agent RW access to sensitive host files, and" >&2
-        echo "  anything it writes there runs on the host later (git hooks, build scripts)." >&2
+        echo "  This would give the sandbox agent RW access to sensitive host files or live" >&2
+        echo "  host sockets, and anything it writes there runs on the host later (git hooks," >&2
+        echo "  build scripts)." >&2
         echo "  Re-run from a dedicated project directory, or set ALLOW_UNSAFE_WORKSPACE=1" >&2
         echo "  to override deliberately." >&2
         exit 1
@@ -128,6 +149,8 @@ sc_guard_workspace() {
             _sc_deny_workspace "your home directory ($real_home) is inside it."
         fi
         reason="$(_sc_windows_profile_reason "$real_workspace")"
+        [[ -z "$reason" ]] || _sc_deny_workspace "$reason"
+        reason="$(_sc_runtime_dir_reason "$real_workspace")"
         [[ -z "$reason" ]] || _sc_deny_workspace "$reason"
     fi
 
@@ -188,7 +211,7 @@ sc_config_home() {
 # a tmux server or an ssh-agent would take the agent's requests. Hence the
 # runtime directories, where those live, and a shallow scan for any elsewhere.
 _sc_ro_mount_reason() {
-    local real="$1" real_home secrets runtime reason hit
+    local real="$1" real_home secrets reason hit
     real_home="$(cd "$HOME" 2>/dev/null && pwd -P || echo "$HOME")"
     secrets="$(sc_config_home)/secrets"
     [[ -d "$secrets" ]] && secrets="$(cd "$secrets" && pwd -P)"
@@ -212,20 +235,12 @@ _sc_ro_mount_reason() {
         echo "the MCP secrets directory ($secrets) is inside it."
         return 0
     fi
-    # /tmp also holds ordinary scratch directories, so only it and what holds it
-    # are refused, and the scan below covers its tmux-<uid> and ssh-* children;
-    # /run and $XDG_RUNTIME_DIR hold nothing anyone means to hand over.
-    for runtime in /tmp /run /var/run ${XDG_RUNTIME_DIR:+"$XDG_RUNTIME_DIR"}; do
-        [[ -d "$runtime" ]] || continue
-        runtime="$(cd "$runtime" && pwd -P)"
-        if [[ "$real" == "$runtime" || ( "$runtime" != /tmp && "$real" == "$runtime"/* ) ]]; then
-            echo "that is $runtime, where host processes keep their sockets."
-            return 0
-        elif [[ "$runtime" == "$real"/* ]]; then
-            echo "$runtime, where host processes keep their sockets, is inside it."
-            return 0
-        fi
-    done
+    # The scan below covers the tmux-<uid> and ssh-* children of /tmp.
+    reason="$(_sc_runtime_dir_reason "$real")"
+    if [[ -n "$reason" ]]; then
+        echo "$reason"
+        return 0
+    fi
     reason="$(_sc_windows_profile_reason "$real")"
     if [[ -n "$reason" ]]; then
         echo "$reason"

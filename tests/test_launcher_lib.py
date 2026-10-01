@@ -187,8 +187,10 @@ class WorkspaceGuardTests(unittest.TestCase):
         (self.profile / "NTUSER.DAT").touch()
 
     def guard(self, workspace, **env_over):
-        env = {k: v for k, v in os.environ.items() if k != "ALLOW_UNSAFE_WORKSPACE"}
-        env.update(HOME=str(self.home), **env_over)
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("ALLOW_UNSAFE_WORKSPACE", "XDG_RUNTIME_DIR")}
+        env.update(HOME=str(self.home))
+        env.update(env_over)
         return subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
             [_BASH, "-c", _GUARD_HARNESS, "sc_guard_workspace", str(LIB),
              str(workspace)], capture_output=True, text=True, env=env, timeout=60)
@@ -233,6 +235,31 @@ class WorkspaceGuardTests(unittest.TestCase):
         proc = self.guard(link)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), str(plain))
+
+    def test_the_runtime_directories_are_refused(self):
+        # A host socket there is as reachable read-write as it is read-only.
+        runtime = self.root / "run-user"
+        (runtime / "bus-dir").mkdir(parents=True)
+        # This fixture's home lives under /tmp, which would refuse /tmp and the
+        # fixture root for a different reason; a home elsewhere isolates the rule.
+        elsewhere = {"HOME": "/nonexistent-home"}
+        cases = [(Path("/tmp"), "that is /tmp", elsewhere),  # noqa: S108 (/tmp itself is the rule under test)
+                 (runtime, f"that is {runtime}", {}),
+                 (runtime / "bus-dir", f"that is {runtime}", {}),
+                 (self.root, f"{runtime}, where", elsewhere)]
+        for fixed in (Path("/run"), Path("/var/run")):
+            if fixed.is_dir():
+                cases.append((fixed, f"that is {fixed.resolve()}", {}))
+        for workspace, why, env in cases:
+            with self.subTest(workspace=workspace):
+                self.assertRefused(self.guard(workspace, XDG_RUNTIME_DIR=str(runtime), **env), why)
+        # Unlike /tmp, whose children are ordinary scratch: one is allowed as usual.
+        scratch = Path("/tmp") / f"dockade-workspace-test-{os.getpid()}"  # noqa: S108 (a child of /tmp is the point)
+        scratch.mkdir()
+        self.addCleanup(scratch.rmdir)
+        proc = self.guard(scratch)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), str(scratch.resolve()))
 
     def test_the_marketplaces_mount_is_held_to_the_same_rule(self):
         # Its guard says it refuses what this one refuses; read-only stops the agent

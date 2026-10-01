@@ -435,7 +435,10 @@ of the boundary — provided what is mounted is only files.
   execution from a tier with no egress. The guard therefore refuses the runtime
   directories and any directory with a socket or FIFO in its top three levels.
   Deeper ones are not looked for, which is the same exposure the read-write
-  workspace already carries.
+  workspace already carries: `sc_guard_workspace` refuses the runtime directories
+  too, but does not scan, since a project can hold a socket of its own (a
+  project-local database's) and the workspace is the one mount that has to be the
+  project.
 - **Submounts:** `-v …:ro` makes mounts nested inside a ref read-only only on
   Docker 25+ with kernel 5.12+, and falls back silently to the top level
   otherwise. `boundary-check.sh` probes each ref's top level, not its submounts.

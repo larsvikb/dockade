@@ -25,10 +25,10 @@ const BASIC_RE = /^basic\s+\{secret\}$/i;
 // A UI preset expanded into the three fields the store actually holds.
 //
 // This file is the ONLY place a concrete header scheme is spelled anywhere in the
-// system.
-// The gateway builds its request from whatever descriptor the roster carries and has
-// no idea which server it belongs to, which is how "no per-server branch in the code"
-// stays true while this form still offers a one-click answer for the common case.
+// system. The gateway builds its request from whatever descriptor the roster carries
+// and has no idea which server it belongs to, which is how "no per-server branch in
+// the code" stays true while this form still offers a one-click answer for the common
+// case.
 export function serverDescriptor(kind, header, template) {
   if (kind === "header") {
     return { auth_type: "header", auth_header: "Authorization",
@@ -53,6 +53,37 @@ export function serverEndpoint(port, path) {
   return { port: n >= 1 && n <= 65535 ? n : null, path: String(path ?? "").trim() };
 }
 
+// The preset and custom fields that show a stored descriptor, for the edit form: the
+// inverse of serverDescriptor, so a server registered from a preset opens on it.
+export function serverPreset(auth) {
+  const a = auth || {};
+  if (a.type !== "header") return { kind: "none", header: "", template: "" };
+  if (a.header === "Authorization" && a.template === "Bearer {secret}") {
+    return { kind: "header", header: "", template: "" };
+  }
+  if (a.header === "Authorization" && a.template === BASIC_TEMPLATE) {
+    return { kind: "basic", header: "", template: "" };
+  }
+  return { kind: "custom", header: a.header || "", template: a.template || "" };
+}
+
+// Why an endpoint cannot be sent, or "" if it can — the part of the backend's check
+// the form mirrors.
+function endpointProblem(endpoint) {
+  if (endpoint.port === null) return "The port must be a number from 1 to 65535.";
+  if (!endpoint.path.startsWith("/")) return "The path starts with '/', such as /mcp.";
+  return "";
+}
+
+const authText = d => (d.auth_type === "header"
+  ? `${d.auth_header || "(no header)"}: ${d.auth_template || "(no template)"}`
+  : "no auth");
+
+// The gateway substitutes the token as it is and encodes nothing, so a Basic token has
+// to be stored already encoded. A raw `user:pass` there is a 401.
+const basicNote = d => (BASIC_RE.test(d.auth_template || "")
+  ? " The token must be the base64 of user:password, already encoded." : "");
+
 // What registering will do, in the world. A DELIBERATELY partial mirror of the
 // backend's validation, like createPreview: it describes, and the backend refuses.
 export function serverPreview(name, desc, endpoint) {
@@ -64,12 +95,8 @@ export function serverPreview(name, desc, endpoint) {
                  + `starting or ending with '-'. It is the container name, so it has `
                  + `to match what mcp-servers.yml declares.` };
   }
-  if (endpoint.port === null) {
-    return { ok: false, text: "The port must be a number from 1 to 65535." };
-  }
-  if (!endpoint.path.startsWith("/")) {
-    return { ok: false, text: "The path starts with '/', such as /mcp." };
-  }
+  const problem = endpointProblem(endpoint);
+  if (problem) return { ok: false, text: problem };
   const where = `Register ${n}, disabled, dialled at `
               + `http://${n}:${endpoint.port}${endpoint.path}.`;
   if (desc.auth_type === "none") {
@@ -80,15 +107,56 @@ export function serverPreview(name, desc, endpoint) {
   }
   // Named rather than implied: the token's path is DERIVED from the server name, so
   // the operator can see which file they are about to make load-bearing.
-  const text = `${where} The gateway will send `
-             + `${desc.auth_header || "(no header)"}: `
-             + `${desc.auth_template || "(no template)"}, reading the token from `
-             + `${n}.json in the secrets directory.`;
-  // The gateway substitutes the token as it is and encodes nothing, so a Basic token
-  // has to be stored already encoded. A raw `user:pass` there is a 401.
-  const basic = BASIC_RE.test(desc.auth_template || "")
-    ? " The token must be the base64 of user:password, already encoded." : "";
-  return { ok: Boolean(desc.auth_header && desc.auth_template), text: text + basic };
+  const text = `${where} The gateway will send ${authText(desc)}, reading the token `
+             + `from ${n}.json in the secrets directory.`;
+  return { ok: Boolean(desc.auth_header && desc.auth_template),
+           text: text + basicNote(desc) };
+}
+
+// What saving the edit form will change. The TRANSITION, as toolEditPreview states
+// one: each field that moves, from and to, and nothing about the ones that do not.
+export function serverEditPreview(row, desc, endpoint) {
+  if (!row) {
+    return { ok: false, unchanged: false,
+             text: "That server is no longer registered; it may have been revoked "
+                 + "elsewhere." };
+  }
+  const problem = endpointProblem(endpoint);
+  if (problem) return { ok: false, unchanged: false, text: problem };
+  if (desc.auth_type === "header" && !(desc.auth_header && desc.auth_template)) {
+    return { ok: false, unchanged: false,
+             text: "A custom header needs both a name and a template with {secret}." };
+  }
+  const n = row.server;
+  const was = row.endpoint || {};
+  const url = e => `http://${n}:${e.port}${e.path}`;
+  const before = serverEditBody(row, row.enabled);
+  const changes = [];
+  if (was.port !== endpoint.port || was.path !== endpoint.path) {
+    changes.push(`endpoint ${url(was)} → ${url(endpoint)}`);
+  }
+  const authMoves = before.auth_type !== desc.auth_type
+    || before.auth_header !== desc.auth_header
+    || before.auth_template !== desc.auth_template;
+  if (authMoves) changes.push(`auth ${authText(before)} → ${authText(desc)}`);
+  if (!changes.length) {
+    return { ok: false, unchanged: true,
+             text: `This is how ${n} is configured now; nothing to save.` };
+  }
+  const token = desc.auth_type === "header" && before.auth_type !== "header"
+    ? ` The token is read from ${n}.json in the secrets directory.` : "";
+  const when = row.enabled
+    ? ` ${n} is enabled, so this takes effect at the gateway's next roster poll.`
+    : ` ${n} stays disabled.`;
+  return { ok: true, unchanged: false,
+           text: `${n}: ${changes.join("; ")}.${token}`
+               + `${authMoves ? basicNote(desc) : ""}${when}` };
+}
+
+// The body of saving the edit form: the server's CURRENT enabled state, so editing
+// how it is dialled cannot also switch it.
+export function serverSaveBody(row, desc, endpoint) {
+  return Object.assign({ enabled: Boolean(row && row.enabled) }, desc, endpoint);
 }
 
 // The body of an enable/disable edit.

@@ -25,7 +25,8 @@ import {
 import { revokePreview, createPreview, editPreview } from "./egress-rules.js";
 import { leaseLabel, leaseRemaining, leaseCountdown, groupLeases } from "./leases.js";
 import {
-  SERVER_NAME_RE, serverDescriptor, serverEndpoint, serverPreview, serverEditBody,
+  SERVER_NAME_RE, serverDescriptor, serverEndpoint, serverPreset, serverPreview,
+  serverEditPreview, serverEditBody, serverSaveBody,
   toolChoices, toolRulePreview, toolEditPreview, toolRevokePreview,
   pinText, pinState, pinExpiry, pinLapsesDue,
 } from "./mcp.js";
@@ -2016,19 +2017,68 @@ function start() {
   const serverPort = document.getElementById("server-port");
   const serverPath = document.getElementById("server-path");
   const serverPreviewEl = document.getElementById("server-preview");
+  const serverAdd = document.getElementById("server-add");
+  const serverCancel = document.getElementById("server-cancel");
   let serversFailed = false;
   const serversByName = new Map();
+  // The server being edited, or null for the register form. The same form for both,
+  // for the reason the egress rule form is shared: same fields, same checks.
+  let editingServer = null;
+  // True while a save is on the wire, so a re-render cannot turn Save back on.
+  let serverSaving = false;
 
   const authFields = () =>
     serverDescriptor(serverAuth.value, serverHeader.value, serverTemplate.value);
   const endpointFields = () => serverEndpoint(serverPort.value, serverPath.value);
 
+  // Looked up on every render rather than captured on entry. The list is not polled,
+  // so a save fetches it again first (`submitServerEdit`): that is what notices a
+  // change made in another tab rather than writing over it.
+  const currentServerPreview = () => (editingServer === null
+    ? serverPreview(serverName.value, authFields(), endpointFields())
+    : serverEditPreview(serversByName.get(editingServer), authFields(),
+                        endpointFields()));
+
   function renderServerPreview() {
     const custom = serverAuth.value === "custom";
     serverHeader.hidden = !custom;
     serverTemplate.hidden = !custom;
-    serverPreviewEl.textContent =
-      serverPreview(serverName.value, authFields(), endpointFields()).text;
+    const p = currentServerPreview();
+    if (editingServer !== null) serverAdd.disabled = serverSaving || !p.ok;
+    serverPreviewEl.textContent = p.text;
+  }
+
+  function enterServerEdit(row) {
+    editingServer = row.server;
+    // The name is shown but LOCKED: it is the container dialled, the secret's filename
+    // and the key every tool rule points at, so changing it is revoke-and-register.
+    serverName.value = row.server;
+    serverName.readOnly = true;
+    const preset = serverPreset(row.auth);
+    serverAuth.value = preset.kind;
+    serverHeader.value = preset.header;
+    serverTemplate.value = preset.template;
+    serverPort.value = String((row.endpoint || {}).port ?? "");
+    serverPath.value = (row.endpoint || {}).path ?? "";
+    serverAdd.textContent = "save changes";
+    serverCancel.hidden = false;
+    renderServerPreview();
+    serverPort.focus();
+  }
+
+  function leaveServerEdit() {
+    editingServer = null;
+    serverName.readOnly = false;
+    serverName.value = "";
+    serverAuth.value = "none";
+    serverHeader.value = "";
+    serverTemplate.value = "";
+    serverPort.value = "8082";
+    serverPath.value = "/mcp";
+    serverAdd.textContent = "register";
+    serverAdd.disabled = false;
+    serverCancel.hidden = true;
+    renderServerPreview();
   }
 
   function renderServers(rows) {
@@ -2050,7 +2100,8 @@ function start() {
              ? `${row.auth.header}: ${row.auth.template}` : "none");
       cell(String(row.tool_rules));
       const actions = document.createElement("td");
-      for (const [cls, label] of [["toggle", row.enabled ? "disable" : "enable"],
+      for (const [cls, label] of [["edit", "edit"],
+                                  ["toggle", row.enabled ? "disable" : "enable"],
                                   ["revoke", "revoke"]]) {
         const b = document.createElement("button");
         b.className = cls;
@@ -2075,6 +2126,7 @@ function start() {
     // for whichever poll happens to run next. Without it, arriving before the servers
     // did leaves a form that says nothing is registered after everything is.
     renderToolPicker();
+    if (editingServer !== null) renderServerPreview();
   }
 
   async function refreshServers() {
@@ -2098,9 +2150,15 @@ function start() {
   serverTemplate.addEventListener("input", renderServerPreview);
   serverPort.addEventListener("input", renderServerPreview);
   serverPath.addEventListener("input", renderServerPreview);
+  // Nothing has been sent, so there is nothing to undo and no confirm to ask for.
+  serverCancel.addEventListener("click", leaveServerEdit);
 
   serverForm.addEventListener("submit", async ev => {
     ev.preventDefault();
+    if (editingServer !== null) {
+      await submitServerEdit();
+      return;
+    }
     const name = serverName.value.trim();
     if (!SERVER_NAME_RE.test(name)) return;
     const body = JSON.stringify(
@@ -2125,13 +2183,74 @@ function start() {
     refreshServers();
   });
 
+  // The current state of one server, fetched rather than remembered: the list is not
+  // polled, so what this page holds may predate a change made in another tab, and an
+  // edit is the TARGET state — sending the old copy back would undo that change.
+  // Null, after an alert, when the list could not be fetched or the server is gone.
+  async function freshServer(server) {
+    await refreshServers();
+    if (serversFailed) {
+      window.alert("Could not reach the control plane, so nothing was changed.");
+      return null;
+    }
+    const row = serversByName.get(server);
+    if (!row) window.alert(`${server} is no longer registered; nothing was changed.`);
+    return row || null;
+  }
+
+  // The edit half of that submit: the confirm names the transition against the
+  // server as it is now, and success leaves edit mode.
+  async function submitServerEdit() {
+    const server = editingServer;
+    serverSaving = true;
+    serverAdd.disabled = true;
+    try {
+      const row = await freshServer(server);
+      // The form may have moved to another server, or been cancelled, while the fetch
+      // was out. Its fields are no longer about `server` then, so nothing is sent.
+      if (editingServer !== server) return;
+      // The preview is rebuilt from the fresh row; if that changed what saving would
+      // do, the operator reads the new preview instead of confirming the old one.
+      const p = currentServerPreview();
+      if (!row || !p.ok ||
+          !window.confirm(`${p.text}\n\nSave this change to ${row.server}?`)) return;
+      const res = await fetch(`/api/mcp/servers/${encodeURIComponent(server)}/edit`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(serverSaveBody(row, authFields(), endpointFields())) });
+      const answer = await res.json().catch(() => ({}));
+      if (!res.ok || !answer.ok) {
+        window.alert(`Could not save: ${answer.detail || res.status}`);
+        refreshServers();
+        return;
+      }
+      // Only if the form is still on this server: an edit opened on another row while
+      // this was in flight is the operator's newer intent.
+      if (editingServer === server) leaveServerEdit();
+      refreshServers();
+    } catch (e) {
+      window.alert("Could not save: the control plane is unreachable.");
+    } finally {
+      serverSaving = false;
+      renderServerPreview();
+    }
+  }
+
   serversBody.addEventListener("click", async ev => {
+    const editBtn = ev.target.closest("button.edit");
+    if (editBtn) {
+      const editRow = serversByName.get(editBtn.dataset.server);
+      if (editRow) enterServerEdit(editRow);
+      return;
+    }
     const btn = ev.target.closest("button.toggle, button.revoke");
     if (!btn) return;
-    const row = serversByName.get(btn.dataset.server);
+    let row = serversByName.get(btn.dataset.server);
     if (!row) return;
     const name = encodeURIComponent(row.server);
     const revoking = btn.classList.contains("revoke");
+    // What the button SAID, which is the operator's intent; the descriptor and endpoint
+    // sent with it come from the server as it is now (`freshServer`).
+    const enable = !row.enabled;
     if (revoking &&
         !window.confirm(
           `Revoke ${row.server}? The gateway stops dialling it. Its tool rules are ` +
@@ -2139,6 +2258,10 @@ function start() {
       return;
     }
     btn.disabled = true;
+    if (!revoking) {
+      row = await freshServer(row.server);
+      if (!row) return;
+    }
     try {
       const res = revoking
         ? await fetch(`/api/mcp/servers/${name}/revoke`, { method: "POST" })
@@ -2148,7 +2271,7 @@ function start() {
         // would send no credential and the 401 would read like a policy problem.
         : await fetch(`/api/mcp/servers/${name}/edit`, {
             method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(serverEditBody(row, !row.enabled)) });
+            body: JSON.stringify(serverEditBody(row, enable)) });
       const answer = await res.json().catch(() => ({}));
       if (!res.ok || !answer.ok) {
         // 409 on revoke is the one an operator most needs to read: it names how many
@@ -2654,8 +2777,9 @@ function start() {
   refreshConfig();
   // Once, not polled, and not on the stream's open either: the MCP tab must load while
   // the feed is down, for the reason the line above gives. Server registration changes
-  // when an operator changes it, and this view is the thing doing the changing — each
-  // action refreshes after itself.
+  // when an operator changes it, and each action refreshes after itself. Another tab
+  // can change it too, which is why a server write fetches it again first
+  // (`freshServer`) rather than trusting this copy.
   //
   // Tool rules and pins are the same kind of state and get the same treatment. The
   // INVENTORY is not: it changes because the gateway pushed, which happens without

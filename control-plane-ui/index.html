@@ -626,10 +626,12 @@
              autocapitalize="off" placeholder="{secret}"
              aria-label="Header value template">
       <button type="submit" id="server-add">register</button>
+      <!-- Only while a server is being edited, as the rule form's cancel is. -->
+      <button type="button" id="server-cancel" hidden>cancel</button>
     </form>
-    <!-- What registering will do, in the world rather than in the table — the same
-         discipline the rule form's preview follows, and the place the backend's own
-         refusal lands. Polite, because it changes as a consequence of typing. -->
+    <!-- What registering, or saving an edit, will do, in the world rather than in the
+         table — the same discipline the rule form's preview follows. Polite, because
+         it changes as a consequence of typing. -->
     <div class="note" id="server-preview" aria-live="polite"></div>
     <table>
       <thead>

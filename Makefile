@@ -184,7 +184,7 @@ REFFILES := $(SCRIPTS) \
         secrets-perm-check \
         rebuild logs-ep logs-cp logs-tg tool-outcomes print-config-home \
         mcp-up mcp-down mcp-ps mcp-tools gateway-tools \
-        claude opencode boundary check-boundary split-check
+        claude opencode boundary check-boundary split-check ui-diff
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -534,6 +534,39 @@ test: ## Run the governance unit tests (dependency-free; python -m unittest)
 	# the Python side, so the default stays "skip".
 	DOCKADE_REQUIRE_TOOLS=$(REQUIRE_TOOLS) \
 	  python3 -W ignore::ResourceWarning -m unittest discover -s tests -t tests -v
+
+# Not part of `check`: it needs a browser and an npm install, and its question — does
+# the page still do what it did on the base — only has an answer on a branch. Both runs
+# use THIS tree's harness and scenario, so steps a branch adds run against the base too.
+UI_DIFF_BASE ?= main
+ui-diff: ## Run the UI scenario on UI_DIFF_BASE (default main) and on this tree in a headless browser, and diff the two
+	@harness=tests/ui-harness
+	pinned=$$(node -p 'require("./'$$harness'/package.json").dependencies["playwright-core"]')
+	installed=$$(node -p 'try { require("./'$$harness'/node_modules/playwright-core/package.json").version } catch { "" }')
+	if [ "$$installed" != "$$pinned" ]; then
+	  echo "== installing playwright-core $$pinned from the harness's lockfile =="
+	  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci --prefix "$$harness" --no-audit --no-fund --ignore-scripts
+	fi
+	out=$$(mktemp -d)
+	git archive "$(UI_DIFF_BASE)" control-plane-ui | tar -x -C "$$out"
+	# A run whose step failed still writes its transcript, so the diff runs either way.
+	failed=""
+	echo "== $(UI_DIFF_BASE) =="
+	node "$$harness/harness.js" "$$out/control-plane-ui" "$$out/base.txt" >/dev/null \
+	  || failed="$$failed $(UI_DIFF_BASE)"
+	[ -s "$$out/base.txt" ] || exit 1   # the harness could not run at all
+	echo "== this tree =="
+	node "$$harness/harness.js" control-plane-ui "$$out/tree.txt" \
+	  || failed="$$failed this-tree"
+	[ -s "$$out/tree.txt" ] || exit 1
+	if diff -u --label "$(UI_DIFF_BASE)" --label "this tree" "$$out/base.txt" "$$out/tree.txt" \
+	   && [ -z "$$failed" ]; then
+	  echo "== the page behaves the same; transcripts in $$out =="
+	else
+	  echo "== the page behaves differently$${failed:+ (a step failed on:$$failed)};" \
+	       "transcripts in $$out =="
+	  exit 1
+	fi
 
 verify-build: ## Assert every image still builds (skipped if docker unavailable)
 	@if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then

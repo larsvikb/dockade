@@ -210,7 +210,7 @@ alternative — making omission impossible — is what was done for `markStale` 
 `shouldSweep` keeps its primitive signature because that is what makes it cheap to
 assert at the boundaries.
 
-**`start()` is deliberately unverified, and that is a decision rather than a gap.** Its
+**`start()` has no test in the suite, and that is a decision rather than a gap.** Its
 DOM path is covered only by the guards above; the card wiring (countdown, confirm panel,
 pattern select, dwell) was checked once against a throwaway stub DOM under node and not
 kept. The cost is real and measurable: mutation testing was run twice across this work,
@@ -246,9 +246,18 @@ a headless browser (`claude-sandbox/Dockerfile`), so that third leg holds; the o
 do not by themselves — a host without a browser skips such a test, and CI's strict mode
 (`DOCKADE_REQUIRE_TOOLS`) fails it, which is the "silently checks nothing" failure that
 mode exists to prevent. Revisit if the UI ever gains a control whose mistake the backend
-cannot refuse and the response cannot report — or when a change moves `start()`'s
-untested code wholesale, as the `app.js` split does; its test harness has to answer the
-host and CI legs.
+cannot refuse and the response cannot report.
+
+**Moving `start()`'s code is checked by comparison, outside the suite.** The `app.js`
+split moves exactly that code, so it does get a browser, as `make ui-diff` rather than
+a test in `make test`. `tests/ui-harness/` drives one scenario against the base tree and
+against this one, with the backend faked and the clock frozen, and diffs what each page
+did: its DOM after every step, every request it sent, everything on its console. The
+oracle is the previous page, so there are no expected values to keep up, and the
+question only has an answer on a branch — which is what keeps it out of `check`.
+Neither the host nor CI runs it; a move PR runs it in the tier-1 image.
+Each move PR adds the steps that exercise its surface to
+`tests/ui-harness/scenario.js`.
 
 **Tabbed views + traffic-light favicon, both driven by "don't hide a failing state."**
 Approvals / Audit / Policy are tabs (via `location.hash`, with arrow-key nav), and

@@ -620,6 +620,15 @@ card for the same URL: `--proxy-server=direct://`, and running it with the four 
 variables unset. So the netlog run above, flag and all, was already under the real
 proxy settings.
 
+**Playwright drives Debian's shell without its own download.** Measured 2026-10-01:
+`playwright-core` 1.63.0, which pins Chromium 153, launched Debian's
+`chromium-headless-shell` 154 through `executablePath` with
+`PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` set, with `--no-sandbox` (its reason is in
+`claude-sandbox/Dockerfile`) and the two flags above, and loaded a page in about 0.3 s.
+The package is a single one with no dependencies, 14 MB installed. Through one version
+of skew, 1.63 drives the 154 shell through the whole UI harness scenario; nothing was
+run on Playwright's own 153 to compare against.
+
 ## Publishing a host port: the private range is the wrong instinct on WSL2
 
 Choosing a port for Docker to publish on the host, the principled-looking answer is

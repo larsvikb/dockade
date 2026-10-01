@@ -1,0 +1,9 @@
+{
+  "name": "dockade-ui-harness",
+  "private": true,
+  "description": "Drives control-plane-ui in a headless browser; see harness.js",
+  "type": "module",
+  "dependencies": {
+    "playwright-core": "1.63.0"
+  }
+}

@@ -664,6 +664,39 @@ the safe reading of what it observed. The one test that needs a real refusal,
 Traffic between the containers crosses Docker bridge networks rather than the
 distro's loopback, so this concerns tests and tools run on the host distro.
 
+## A worktree made in the sandbox is unreadable to git on the host
+
+The sandbox sees the checkout at `/workspace`; the development host has it on a
+case-insensitive `/mnt/c`. A `git worktree add` in the sandbox writes absolute paths
+both ways (the worktree's `.git` says `gitdir: /workspace/.git/worktrees/<name>`), and
+container git (2.47.3) predates `worktree add --relative-paths` (2.48). On the host,
+every git command inside such a worktree fails, so the doc guards' `_tracked()` returns
+nothing and each fails its `checked > 0` assertion. Seen 2026-09-30.
+
+- **Host git can delete them.** It lists the sandbox's worktrees as `prunable`, since
+  their `/workspace` paths do not exist there, and `git worktree prune` deletes their
+  `.git/worktrees/<name>` entries, which breaks them inside the sandbox. Reproduced
+  2026-10-01 in a throwaway repo with a gitdir pointed at a missing path: `prune -v`
+  printed `Removing worktrees/wt: gitdir file points to non-existent location`. `git
+  gc` left that entry alone while it was fresh, and removed it once its index file was
+  backdated past `gc.worktreePruneExpire` (three months by default), so a sandbox
+  worktree idle that long goes at the next host `gc`, the automatic one included.
+- **A worktree carries only tracked files.** The main checkout's `.env` (the LLM
+  model, the GitHub server's toolsets and read-only flag) and `models/` are not in it.
+  The Makefile's compose reads `.env` from the directory it runs in, so compose run
+  from a worktree falls back to the defaults (`mcp-servers.yml`'s read-only, four
+  toolsets), and `DOCKADE_MODELS_DIR` to the worktree's empty `./models`. The compose
+  file names the project `dockade` wherever it runs, so the containers it starts
+  replace the live stack's and outlive the worktree; and it names its volumes
+  (`dockade-control-state` among them), so the branch's code runs against the live
+  policy and audit store. A branch that migrates the store past `main`'s schema
+  leaves `main`'s control plane refusing to start ("newer than this code's"). That is
+  compose's documented lookup, read against `.env`'s keys, the compose file and
+  `control-plane/store.py`; Docker was not run.
+- The host has no node. Under strict mode (`DOCKADE_REQUIRE_TOOLS=1`) the `app.js`
+  tests error there instead of skipping, which stops `make check` before
+  `verify-build`; they run in the sandbox instead.
+
 ## Stock WSL2 kernels ship `ip_set` without the `xt_set` match
 
 `ipset create` succeeds, and `iptables -m set --match-set` then fails with `Can't open

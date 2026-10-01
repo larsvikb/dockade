@@ -57,6 +57,9 @@ only the invariants and conventions for working in the repo.
 - Don't commit or push unless asked.
 - In the main session, before handing a commit over for push, run the
   `review-before-push` skill.
+- Test what the container can, and let the commit body say what ran and what did not —
+  never what the maintainer should run. Host checks:
+  `.claude/skills/review-before-push/SKILL.md`, "Host checks, when one earns it".
 
 ### Where writing goes
 

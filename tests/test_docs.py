@@ -405,9 +405,10 @@ class SectionCitationTests(_NeedsGit):
 
     #: `DESIGN.md, "X"`, `NOTES.md "X"`, `DESIGN.md → "X"` (the name may be backticked),
     #: and `"X" in DESIGN.md`. The separator is required, so a file name inside a string
-    #: literal is not a citation.
+    #: literal is not a citation. The path starts after any character a path can hold,
+    #: not at `\b`: there is no word boundary before `.`, so `.claude/` read as `claude/`.
     NAMED_FIRST = re.compile(
-        r'\b([\w./-]*[A-Z][\w./-]*\.md)`?(?:,\s*|:\s*|\s+|\s*→\s*)"([^"]{4,120})"')
+        r'(?<![\w./-])([\w./-]*[A-Z][\w./-]*\.md)`?(?:,\s*|:\s*|\s+|\s*→\s*)"([^"]{4,120})"')
     QUOTE_FIRST = re.compile(r'"([^"]{4,120})"\s+in\s+`?([\w./-]*[A-Z][\w./-]*\.md)\b')
 
     @staticmethod

@@ -35,3 +35,5 @@ backups/
 # (CLAUDE.md, Conventions). One writer per file, so sessions never collide, and the
 # note goes when its worktree does.
 /inflight.md
+# The UI harness's npm install (`make ui-diff` runs `npm ci` from its lockfile).
+tests/ui-harness/node_modules/

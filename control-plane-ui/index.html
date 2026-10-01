@@ -599,14 +599,17 @@
       <input type="text" id="server-name" spellcheck="false" autocapitalize="off"
              placeholder="mcp-github &mdash; the container name, exactly"
              aria-label="Server name">
-      <!-- The descriptor, as presets. The two real cases are "the server holds its own
-           credential" and "the gateway injects a bearer"; custom exists so this form
-           can express everything the store can, rather than quietly being narrower
-           than the API behind it. No server is named in any of it — the gateway builds
-           the header from these fields and has no per-server branch. -->
+      <!-- The descriptor, as presets. The real cases are "the server holds its own
+           credential" and "the gateway injects a bearer or a Basic token"; custom
+           exists so this form can express everything the store can, rather than
+           quietly being narrower than the API behind it. No server is named in any
+           of it — the gateway builds the header from these fields and has no
+           per-server branch. Every option value is a kind serverDescriptor knows
+           (tests/test_control_plane_ui_js.py). -->
       <select id="server-auth" aria-label="How the gateway authenticates">
         <option value="none">no auth &mdash; the server holds its own credential</option>
         <option value="header">bearer in Authorization</option>
+        <option value="basic">basic in Authorization</option>
         <option value="custom">custom header&hellip;</option>
       </select>
       <input type="text" id="server-header" hidden spellcheck="false"

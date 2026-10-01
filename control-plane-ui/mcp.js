@@ -17,9 +17,15 @@ import { tsSeconds } from "./time.js";
 // the preview, so a drift makes the preview wrong rather than the policy wrong.
 export const SERVER_NAME_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 
+const BASIC_TEMPLATE = "Basic {secret}";
+// Any spelling of a Basic template, since the scheme name is case-insensitive: the
+// encoding note is about what the server will read, not about which preset made it.
+const BASIC_RE = /^basic\s+\{secret\}$/i;
+
 // A UI preset expanded into the three fields the store actually holds.
 //
-// This is the ONLY place a concrete header scheme is spelled anywhere in the system.
+// This file is the ONLY place a concrete header scheme is spelled anywhere in the
+// system.
 // The gateway builds its request from whatever descriptor the roster carries and has
 // no idea which server it belongs to, which is how "no per-server branch in the code"
 // stays true while this form still offers a one-click answer for the common case.
@@ -27,6 +33,10 @@ export function serverDescriptor(kind, header, template) {
   if (kind === "header") {
     return { auth_type: "header", auth_header: "Authorization",
              auth_template: "Bearer {secret}" };
+  }
+  if (kind === "basic") {
+    return { auth_type: "header", auth_header: "Authorization",
+             auth_template: BASIC_TEMPLATE };
   }
   if (kind === "custom") {
     return { auth_type: "header", auth_header: (header || "").trim(),
@@ -54,11 +64,15 @@ export function serverPreview(name, desc) {
   }
   // Named rather than implied: the token's path is DERIVED from the server name, so
   // the operator can see which file they are about to make load-bearing.
-  return { ok: Boolean(desc.auth_header && desc.auth_template),
-           text: `Register ${n}, disabled. The gateway will send `
-               + `${desc.auth_header || "(no header)"}: `
-               + `${desc.auth_template || "(no template)"}, reading the token from `
-               + `${n}.json in the secrets directory.` };
+  const text = `Register ${n}, disabled. The gateway will send `
+             + `${desc.auth_header || "(no header)"}: `
+             + `${desc.auth_template || "(no template)"}, reading the token from `
+             + `${n}.json in the secrets directory.`;
+  // The gateway substitutes the token as it is and encodes nothing, so a Basic token
+  // has to be stored already encoded. A raw `user:pass` there is a 401.
+  const basic = BASIC_RE.test(desc.auth_template || "")
+    ? " The token must be the base64 of user:password, already encoded." : "";
+  return { ok: Boolean(desc.auth_header && desc.auth_template), text: text + basic };
 }
 
 // The body of an enable/disable edit.

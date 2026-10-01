@@ -1400,8 +1400,10 @@ gets an **auth descriptor** per server — enough to build a request, useless to
 
 `type: none` is the default and covers the preferred case where the server holds its
 own credential and the gateway injects nothing. One `{secret}` placeholder covers the
-variations that actually occur (`Bearer …`, `token …`, `X-Api-Key: …`) without a
-per-server special case anywhere in the code — there is no GitHub-specific branch.
+variations that actually occur (`Bearer …`, `token …`, `Basic …`, `X-Api-Key: …`)
+without a per-server special case anywhere in the code — there is no GitHub-specific
+branch. The gateway substitutes the secret verbatim and never encodes it, so a scheme
+that wants an encoding, as Basic wants base64, is stored already encoded.
 
 **The secret's path is derived from the server name, never stored as a reference.**
 The gateway reads exactly `/run/dockade/secrets/<server>.json` and nothing else. No

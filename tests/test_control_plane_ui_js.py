@@ -159,6 +159,11 @@ console.log(JSON.stringify({
     // The preset must ignore whatever sits in the custom fields, or a half-filled
     // form would smuggle values into a descriptor the operator did not pick.
     bearer_with_stale_custom: m.serverDescriptor("header", "X-Evil", "{secret}-nope"),
+    basic: m.serverDescriptor("basic"),
+    basic_with_stale_custom: m.serverDescriptor("basic", "X-Evil", "{secret}-nope"),
+    preview_basic: m.serverPreview("mcp-jira", m.serverDescriptor("basic")),
+    preview_basic_custom: m.serverPreview(
+      "mcp-jira", m.serverDescriptor("custom", "Authorization", "basic  {secret}")).text,
     preview_none: m.serverPreview("mcp-github", m.serverDescriptor("none")).text,
     preview_bearer: m.serverPreview("mcp-github", m.serverDescriptor("header")).text,
     preview_blank: m.serverPreview("   ", m.serverDescriptor("none")),
@@ -1158,6 +1163,26 @@ class PageScriptTests(unittest.TestCase):
         srv = self.probe["server"]
         self.assertEqual(srv["bearer"], srv["bearer_with_stale_custom"])
         self.assertEqual(srv["bearer"]["auth_header"], "Authorization")
+
+    def test_the_basic_preset_is_a_header_descriptor_and_ignores_custom_fields(self):
+        # No `basic` auth type: the backend stores a header and a template, and the
+        # gateway substitutes the token into it without knowing the scheme.
+        srv = self.probe["server"]
+        self.assertEqual(srv["basic"], {"auth_type": "header",
+                                        "auth_header": "Authorization",
+                                        "auth_template": "Basic {secret}"})
+        self.assertEqual(srv["basic"], srv["basic_with_stale_custom"])
+
+    def test_the_basic_preview_says_the_token_is_stored_encoded(self):
+        # The gateway encodes nothing, so a raw `user:password` in the secret file is
+        # sent as it is and the server answers 401.
+        preview = self.probe["server"]["preview_basic"]
+        self.assertTrue(preview["ok"])
+        self.assertIn("base64", preview["text"])
+        self.assertIn("mcp-jira.json", preview["text"])
+        self.assertNotIn("base64", self.probe["server"]["preview_bearer"])
+        # The scheme name is case-insensitive, so a custom spelling is the same Basic.
+        self.assertIn("base64", self.probe["server"]["preview_basic_custom"])
 
     def test_a_none_descriptor_carries_no_header_fields(self):
         # `policy._auth_descriptor_error` refuses a 'none' descriptor carrying header
@@ -3701,6 +3726,26 @@ class EditRuleSourceTests(unittest.TestCase):
                             self.src, re.S)
         self.assertIsNotNone(current, "currentPreview not found — renamed?")
         self.assertIn("rulesById.get(editingRuleId)", current.group(1))
+
+
+class ServerAuthOptionTests(unittest.TestCase):
+    """The auth presets, read from the source so it runs without node."""
+
+    def test_every_auth_option_is_a_kind_the_descriptor_knows(self):
+        # `serverDescriptor` turns a kind it does not know into `none`, so a typo in an
+        # option value would register a server with no auth, and only the preview's
+        # wording would show it.
+        html = INDEX_HTML.read_text()
+        select = re.search(r'<select id="server-auth".*?</select>', html, re.S)
+        self.assertIsNotNone(select, "the auth select moved in index.html")
+        options = re.findall(r'<option value="([^"]+)"', select.group(0))
+        body = re.search(r"export function serverDescriptor\(.*?\n\}",
+                         (UI_DIR / "mcp.js").read_text(), re.S)
+        self.assertIsNotNone(body, "serverDescriptor moved out of mcp.js")
+        # `none` is the fallthrough, so it has no branch of its own to find.
+        known = set(re.findall(r'kind === "([^"]+)"', body.group(0))) | {"none"}
+        self.assertEqual(options, ["none", "header", "basic", "custom"])
+        self.assertLessEqual(set(options), known)
 
 
 class ToolPolicySourceTests(unittest.TestCase):

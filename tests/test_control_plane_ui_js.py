@@ -120,7 +120,8 @@ const owner = {
                "eventRow", "historyPager"],
   "egress-rules.js": ["revokePreview", "normalizePattern", "createPreview",
                       "editPreview"],
-  "mcp.js": ["serverDescriptor", "serverEndpoint", "serverPreview", "serverEditBody",
+  "mcp.js": ["serverDescriptor", "serverEndpoint", "serverPreset", "serverPreview",
+             "serverEditPreview", "serverEditBody", "serverSaveBody",
              "toolChoices", "toolRulePreview", "toolEditPreview", "toolRevokePreview",
              "pinText", "pinState", "pinExpiry", "pinLapsesDue"],
   "leases.js": ["leaseLabel", "leaseRemaining", "leaseCountdown", "leaseDomain",
@@ -183,6 +184,44 @@ console.log(JSON.stringify({
                                       m.serverEndpoint("http", "/mcp")),
     preview_bad_path: m.serverPreview("mcp-x", m.serverDescriptor("none"),
                                       m.serverEndpoint("8082", "mcp")),
+    // The edit form: a stored descriptor opens on its preset, and the preview states
+    // what moves.
+    presets: ["none", "header", "basic"].map(k => {
+      const d = m.serverDescriptor(k);
+      return m.serverPreset({type: d.auth_type, header: d.auth_header,
+                             template: d.auth_template}).kind;
+    }),
+    preset_custom: m.serverPreset({type: "header", header: "X-Api-Key",
+                                   template: "{secret}"}),
+    preset_missing: m.serverPreset(undefined).kind,
+    edit_same: m.serverEditPreview(_row, m.serverDescriptor("header"),
+                                   m.serverEndpoint("3000", "/v1/mcp")),
+    edit_endpoint: m.serverEditPreview(_row, m.serverDescriptor("header"),
+                                       m.serverEndpoint("8082", "/mcp")),
+    edit_auth: m.serverEditPreview(_row, m.serverDescriptor("basic"),
+                                   m.serverEndpoint("3000", "/v1/mcp")),
+    edit_path_only: m.serverEditPreview(_row, m.serverDescriptor("header"),
+                                        m.serverEndpoint("3000", "/nope")),
+    edit_basic_endpoint_only: m.serverEditPreview(
+      {..._row, auth: {type: "header", header: "Authorization",
+                       template: "Basic {secret}"}},
+      m.serverDescriptor("basic"), m.serverEndpoint("8083", "/v1/mcp")),
+    edit_to_header: m.serverEditPreview(
+      {..._row, auth: {type: "none", header: null, template: null}},
+      m.serverDescriptor("header"), m.serverEndpoint("3000", "/v1/mcp")),
+    edit_enabled: m.serverEditPreview({..._row, enabled: true},
+                                      m.serverDescriptor("none"),
+                                      m.serverEndpoint("3000", "/v1/mcp")),
+    edit_gone: m.serverEditPreview(undefined, m.serverDescriptor("none"),
+                                   m.serverEndpoint("3000", "/v1/mcp")),
+    edit_bad_port: m.serverEditPreview(_row, m.serverDescriptor("header"),
+                                       m.serverEndpoint("x", "/v1/mcp")),
+    edit_half_custom: m.serverEditPreview(_row, m.serverDescriptor("custom", "H", ""),
+                                          m.serverEndpoint("3000", "/v1/mcp")),
+    save_disabled: m.serverSaveBody(_row, m.serverDescriptor("none"),
+                                    m.serverEndpoint("3000", "/v1/mcp")),
+    save_enabled: m.serverSaveBody({..._row, enabled: true}, m.serverDescriptor("none"),
+                                   m.serverEndpoint("3000", "/v1/mcp")).enabled,
     edit_enable: m.serverEditBody(_row, true),
     edit_disable: m.serverEditBody(_row, false),
     edit_no_auth: m.serverEditBody({server: "s", enabled: true}, false),
@@ -1270,6 +1309,67 @@ class PageScriptTests(unittest.TestCase):
         self.assertIn("http://mcp-x:3000/v1/mcp", srv["preview_endpoint"]["text"])
         self.assertFalse(srv["preview_bad_port"]["ok"])
         self.assertFalse(srv["preview_bad_path"]["ok"])
+
+    def test_a_stored_descriptor_opens_on_the_preset_that_made_it(self):
+        # Otherwise every bearer server opens as "custom", and saving it unchanged
+        # would look like an edit to the operator, if not to the backend.
+        srv = self.probe["server"]
+        self.assertEqual(srv["presets"], ["none", "header", "basic"])
+        self.assertEqual(srv["preset_custom"], {"kind": "custom", "header": "X-Api-Key",
+                                                "template": "{secret}"})
+        self.assertEqual(srv["preset_missing"], "none")
+
+    def test_the_edit_preview_states_only_what_moves(self):
+        srv = self.probe["server"]
+        self.assertEqual((srv["edit_same"]["ok"], srv["edit_same"]["unchanged"]),
+                         (False, True))
+        endpoint = srv["edit_endpoint"]
+        self.assertTrue(endpoint["ok"])
+        self.assertIn("http://mcp-github:3000/v1/mcp → http://mcp-github:8082/mcp",
+                      endpoint["text"])
+        self.assertNotIn("auth", endpoint["text"])
+        auth = srv["edit_auth"]
+        self.assertIn("Bearer {secret} → Authorization: Basic {secret}", auth["text"])
+        self.assertIn("base64", auth["text"])
+        self.assertNotIn("endpoint", auth["text"])
+
+    def test_a_path_alone_is_a_change(self):
+        # The port is unchanged here, so a comparison that read only the port would
+        # call this "nothing to save".
+        preview = self.probe["server"]["edit_path_only"]
+        self.assertTrue(preview["ok"])
+        self.assertIn("http://mcp-github:3000/v1/mcp → http://mcp-github:3000/nope",
+                      preview["text"])
+
+    def test_the_basic_note_comes_only_with_an_auth_change(self):
+        # Moving a Basic server's port changes nothing about its token.
+        preview = self.probe["server"]["edit_basic_endpoint_only"]
+        self.assertTrue(preview["ok"])
+        self.assertNotIn("base64", preview["text"])
+
+    def test_the_edit_preview_names_the_token_file_when_one_starts_being_read(self):
+        self.assertIn("mcp-github.json", self.probe["server"]["edit_to_header"]["text"])
+        self.assertNotIn("mcp-github.json", self.probe["server"]["edit_auth"]["text"])
+
+    def test_the_edit_preview_says_when_an_enabled_server_moves(self):
+        srv = self.probe["server"]
+        self.assertIn("next roster poll", srv["edit_enabled"]["text"])
+        self.assertIn("stays disabled", srv["edit_endpoint"]["text"])
+
+    def test_the_edit_preview_refuses_what_cannot_be_saved(self):
+        srv = self.probe["server"]
+        for key in ("edit_gone", "edit_bad_port", "edit_half_custom"):
+            with self.subTest(key=key):
+                self.assertFalse(srv[key]["ok"])
+        self.assertIn("revoked", srv["edit_gone"]["text"])
+
+    def test_saving_an_edit_keeps_the_server_enabled_or_disabled(self):
+        # The form does not show the switch, so it must not move it.
+        srv = self.probe["server"]
+        self.assertEqual(srv["save_disabled"],
+                         {"enabled": False, "auth_type": "none", "auth_header": None,
+                          "auth_template": None, "port": 3000, "path": "/v1/mcp"})
+        self.assertTrue(srv["save_enabled"])
 
     def test_a_half_filled_custom_descriptor_is_not_ok(self):
         # A `header` descriptor with no template builds a header with no credential,
@@ -3773,6 +3873,43 @@ class ServerAuthOptionTests(unittest.TestCase):
         known = set(re.findall(r'kind === "([^"]+)"', body.group(0))) | {"none"}
         self.assertEqual(options, ["none", "header", "basic", "custom"])
         self.assertLessEqual(set(options), known)
+
+
+class ServerWriteSourceTests(unittest.TestCase):
+    """Both writes on a server send its WHOLE configuration — an edit is the target
+    state — and the servers list is not polled. So each must fetch the server again
+    before sending, or a change made in another tab is silently undone."""
+
+    def setUp(self):
+        self.src = APP_JS.read_text()
+
+    def _fetches_fresh_before_writing(self, body):
+        fresh = body.find("await freshServer(")
+        write = body.find("/edit`")
+        self.assertNotEqual(fresh, -1, "the write no longer fetches the server first")
+        self.assertNotEqual(write, -1, "the edit call moved")
+        self.assertLess(fresh, write)
+
+    def test_saving_the_edit_form_fetches_the_server_first(self):
+        self._fetches_fresh_before_writing(_fn_body(self.src, "submitServerEdit()"))
+
+    def test_a_form_moved_during_the_fetch_sends_nothing(self):
+        # The operator can open another row, or cancel, while the fetch is out; the
+        # fields are then about a different server than the one the save would hit.
+        body = _fn_body(self.src, "submitServerEdit()")
+        guard = body.find("if (editingServer !== server) return;")
+        self.assertNotEqual(guard, -1, "the re-check after the fetch is gone")
+        self.assertLess(body.find("await freshServer("), guard)
+        self.assertLess(guard, body.find("/edit`"))
+
+    def test_enable_and_disable_fetch_the_server_first(self):
+        handler = re.search(r'serversBody\.addEventListener\("click".*?\n  \}\);',
+                            self.src, re.S)
+        self.assertIsNotNone(handler, "the servers table click handler moved")
+        self._fetches_fresh_before_writing(handler.group(0))
+        # And what is sent is that fresh row, not the one the click was made on.
+        self.assertIn("serverEditBody(row, enable)", handler.group(0))
+        self.assertIn("row = await freshServer(", handler.group(0))
 
 
 class ToolPolicySourceTests(unittest.TestCase):

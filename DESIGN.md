@@ -1298,7 +1298,9 @@ that do not meet.** Conflating them is the easy mistake here.
   answered by placement: Docker DNS answers from every network the gateway shares,
   sandbox-net included, so a server's credential is sent only to an address on
   `mcp-net` (`_placed` in `tool-gateway/discovery.py`, held to compose's subnet by
-  `tests/test_topology.py`).
+  `tests/test_topology.py`). The server cannot move it either: a redirect is refused
+  rather than followed (`_NoRedirect`), since a followed one is dialled on a host
+  `_placed` never checked.
 - **A server's own egress** runs server → egress proxy → internet, and the gateway
   is not in it: `HTTPS_PROXY` on each server container points at the egress proxy
   directly. The proxy has a TCP connection and nothing else, so the peer **address**

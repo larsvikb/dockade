@@ -39,6 +39,7 @@ hand"; `make mcp-tools` is the same request by hand):
 """
 from __future__ import annotations
 
+import http.client
 import ipaddress
 import json
 import os
@@ -319,6 +320,29 @@ def parse_tools(raw: str) -> list[dict]:
     return tools
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect, so a 3xx surfaces as the HTTPError it is.
+
+    urllib's default re-issues a redirected POST as a GET to the `Location`, with every
+    header but the content ones — `Authorization` included — and resolves that host
+    itself, so ``_placed`` never sees where the credential goes. Two cases make that
+    matter, neither needing a compromised server: a routine redirect (a trailing-slash
+    301 to `http://mcp-github:8082/mcp/`) re-resolves the NAME, reopening the DNS
+    question ``_placed`` closes; and a followed GET can reach anything on the gateway's
+    three networks, the control plane's tool bridge included, with the start of the
+    answer handed back to the agent in an error."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+#: The opener every dial goes through: urlopen's default handlers, with redirects
+#: refused and proxies off. Compose sets no proxy env on the gateway, but a Docker
+#: client's `proxies` config injects one into every container, and a dial through a
+#: proxy is not a dial to the address ``_placed`` chose.
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+
+
 def post(entry: dict, message: dict, timeout: float | None = None) -> str:
     """One MCP request to the server a roster entry names, returning its raw reply body.
 
@@ -353,10 +377,22 @@ def post(entry: dict, message: dict, timeout: float | None = None) -> str:
     # within None" would be worse than one that said nothing.
     deadline = TIMEOUT if timeout is None else timeout
     try:
-        with urllib.request.urlopen(request, timeout=deadline) as response:  # noqa: S310
+        with _OPENER.open(request, timeout=deadline) as response:
             return response.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
-        raise DiscoveryError(f"HTTP {exc.code} from {server} — {exc.reason}") from exc
+        # The reason phrase and the Location are the SERVER'S text, and this message is
+        # printed to the log an operator reads: repr, so a CR or an escape sequence
+        # cannot forge a line there, and the Location capped and last, so a long one
+        # cannot push the explanation out of the 200 characters inventory keeps.
+        if 300 <= exc.code < 400:
+            location = exc.headers.get("Location")
+            where = (f"to {location[:120]!r}" if location is not None
+                     else "with no Location")
+            raise DiscoveryError(
+                f"HTTP {exc.code} from {server}, a redirect, not followed: its "
+                f"credential goes only to the address it was dialled on; it pointed "
+                f"{where}") from exc
+        raise DiscoveryError(f"HTTP {exc.code} from {server} — {exc.reason!r}") from exc
     except (urllib.error.URLError, OSError) as exc:
         # TIMEOUT SEPARATED FIRST, because it is the only one of these that leaves the
         # call's fate unknown: the request was sent and the answer never came, so an
@@ -369,6 +405,12 @@ def post(entry: dict, message: dict, timeout: float | None = None) -> str:
             raise DiscoveryError(f"no answer from {server} within {deadline}s",
                                  kind="timeout") from exc
         raise DiscoveryError(f"unreachable: {exc}") from exc
+    except http.client.HTTPException as exc:
+        # A reply that is not HTTP (`BadStatusLine` and kin), which is not an OSError,
+        # so it escaped `post` and ended the whole enumeration tick, every other
+        # server's included. AFTER the OSError clause, so `RemoteDisconnected`, which
+        # is both, still reads as unreachable.
+        raise DiscoveryError(f"not an HTTP reply from {server}: {exc!r}") from exc
 
 
 def _placed(server: str, port: int) -> str:

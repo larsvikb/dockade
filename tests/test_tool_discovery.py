@@ -16,6 +16,7 @@ vanishes on error is worse than one that was never written.
 from __future__ import annotations
 
 import contextlib
+import http.server
 import json
 import socket
 import threading
@@ -169,7 +170,7 @@ class PlacementTests(unittest.TestCase):
             self.dialled.append(request)
             yield mock.Mock(read=lambda: sse({"tools": []}).encode())
 
-        patcher = mock.patch("urllib.request.urlopen", urlopen)
+        patcher = mock.patch.object(self.discovery._OPENER, "open", urlopen)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -330,6 +331,103 @@ class PlacementOnTheWireTests(unittest.TestCase):
         self.assertEqual(head.count("host:"), 1)
 
 
+class RedirectTests(unittest.TestCase):
+    """What a server's reply can make the dial do, through the real urllib over
+    loopback. A followed redirect would carry the credential to a host the gateway
+    resolved without ``_placed`` (S21's property, from the server's side rather than
+    DNS's); a reply that is not HTTP must cost one server's report, not the tick."""
+
+    def _listen(self, handler):
+        server = http.server.HTTPServer(("127.0.0.1", 0), handler)
+        self.addCleanup(server.server_close)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.shutdown)
+        return server.server_address[1]
+
+    def _post_to(self, port):
+        discovery = load_discovery({"GATEWAY_MCP_NET": "127.0.0.0/8"})
+        discovery.read_secret = lambda server: "the-token"
+        entry = {**ENTRY, "endpoint": {"port": port, "path": "/mcp"}}
+        with mock.patch("socket.getaddrinfo", _resolves_to("127.0.0.1")), \
+                self.assertRaises(discovery.DiscoveryError) as caught:
+            discovery.post(entry, {"id": 1})
+        return str(caught.exception)
+
+    def _answering(self, code, headers=(), reason=None):
+        class Answer(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(code, reason)
+                for name, value in headers:
+                    self.send_header(name, value)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *_args):
+                pass
+
+        return self._listen(Answer)
+
+    def test_no_redirect_is_followed_and_the_credential_stays(self):
+        seen = []
+
+        class Sink(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append(self.headers.get("Authorization"))
+                self.send_response(200)
+                self.end_headers()
+
+            do_POST = do_GET
+
+            def log_message(self, *_args):
+                pass
+
+        sink = self._listen(Sink)
+        # 301-303 are the ones urllib followed for a POST; 307 and 308 it refused
+        # already, and are here so that stays true whatever the handler does.
+        for code in (301, 302, 303, 307, 308):
+            with self.subTest(code=code):
+                port = self._answering(
+                    code, [("Location", f"http://127.0.0.1:{sink}/elsewhere")])
+                message = self._post_to(port)
+                self.assertIn(f"HTTP {code}", message)
+                self.assertIn("not followed", message)
+        self.assertEqual(seen, [])
+
+    def test_the_location_is_reported_capped_and_last(self):
+        # Last and capped, so a long one cannot push the explanation out of the 200
+        # characters the inventory keeps of a status.
+        long = "http://127.0.0.1:9/" + "a" * 500
+        message = self._post_to(self._answering(302, [("Location", long)]))
+        self.assertLess(message.index("not followed"), message.index("http://127"))
+        self.assertNotIn("a" * 200, message)
+        self.assertIn("with no Location", self._post_to(self._answering(302)))
+
+    def test_a_reason_phrase_cannot_forge_a_log_line(self):
+        # The reason phrase is server text, and the report is printed to the log.
+        message = self._post_to(
+            self._answering(500, reason="Oops\rtool-gateway: mcp-x: 9 tools exposed"))
+        self.assertNotIn("\r", message)
+
+    def test_a_reply_that_is_not_http_is_one_servers_failure(self):
+        # `BadStatusLine` is not an OSError, and it used to escape `post` and end the
+        # whole enumeration tick.
+        listener = socket.create_server(("127.0.0.1", 0))
+        self.addCleanup(listener.close)
+
+        def serve():
+            conn, _ = listener.accept()
+            with conn:
+                conn.recv(65536)
+                conn.sendall(b"garbage\r\n\r\n")
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 2)
+        self.assertIn("not an HTTP reply", self._post_to(listener.getsockname()[1]))
+
+
 class TrimTests(unittest.TestCase):
     """What survives a server's reply, and where each narrowing happens.
 
@@ -349,7 +447,7 @@ class TrimTests(unittest.TestCase):
         def urlopen(*_args, **_kwargs):
             yield mock.Mock(read=lambda: sse({"tools": [tool]}).encode())
 
-        with mock.patch("urllib.request.urlopen", urlopen), \
+        with mock.patch.object(self.discovery._OPENER, "open", urlopen), \
                 mock.patch("socket.getaddrinfo", _resolves_to("172.28.0.11")):
             tools = self.discovery.list_tools({**ENTRY, "auth": {"type": "none"}})
         return tools[0]

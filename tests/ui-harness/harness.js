@@ -143,7 +143,8 @@ async function main() {
           body: await readFile(path.join(uiDir, file)),
         });
       }
-      const answer = respond(req.method(), url.pathname, body ? JSON.parse(body) : null);
+      const answer = respond(req.method(), url.pathname, body ? JSON.parse(body) : null,
+                             url.searchParams);
       if (!answer) {
         log.push(`  ^ no fixture answers this; 404`);
         return await route.fulfill({ status: 404, json: { detail: "no fixture" } });

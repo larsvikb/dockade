@@ -3,14 +3,17 @@
  * how consecutive rows fold and what the fold hides, the filters and the window that
  * narrow the record and the query they become, the pager over the raw events, and
  * the two summaries drawn from a page — how much of the record it shows, and whether
- * any of it is the proxy failing closed.
+ * any of it is the proxy failing closed. Below them, the decisions view itself, which
+ * `mountAudit` wires when `start()` calls it.
  *
  * No DOM at import, so the unit tests import this file under node
  * (tests/test_control_plane_ui_js.py).
  */
 
+import { esc } from "./dom.js";
 import { shortActor } from "./provenance.js";
-import { tsSeconds } from "./time.js";
+import { auditStatus, AUDIT_REFUSED_FALLBACK, renderListStatus } from "./status.js";
+import { fmtInstant, fmtStamp, tsSeconds } from "./time.js";
 
 // Nearly every governed request is a CONNECT tunnel, so `stage` is "connect" on almost
 // every row and a column of it would be forty repetitions of one word. It is shown only
@@ -391,4 +394,262 @@ export function outageSummary(rows) {
         + `fails closed, so ${decisions === 1 ? "it was" : "they were"} refused `
         + `without any rule being consulted.`,
   };
+}
+
+// ── the decisions view ───────────────────────────────────────────────────────
+// The DOM half of this surface, wired by `mountAudit`, which `start()` calls. The
+// elements are looked up there rather than at import, so the node tests can still
+// import this file with no DOM.
+let auditEmpty, auditOutage, auditCoverage, auditQEl, auditKindEl, auditWindowEl,
+    auditEveryEl, auditClearEl, auditModeNote, auditGroupedTable, auditEventsTable,
+    auditPagerEl, auditOlderEl, auditNewerEl, auditPageEl;
+// Whether a successful load has EVER completed, and whether the most recent one
+// failed. Two facts rather than one, because "never loaded" and "loaded once, now
+// failing" want different sentences — see auditStatus.
+let auditLoaded = false;
+let auditFailed = false;
+// The refusal sentence from the last 400, or null. A third fact rather than a flavour
+// of `auditFailed`, because the transport SUCCEEDED — the control plane answered, and
+// answered with the reason. Collapsing the two would report a bad filter as an
+// unreachable control plane, which sends the operator to the wrong place entirely.
+let auditRefused = null;
+
+// Same element contract as the two status lines, so it goes through the same
+// renderer — a third hand-rolled show/hide is how the first two drifted apart.
+function renderOutage(s) {
+  renderListStatus(auditOutage, s);
+}
+
+function renderCoverage(s) {
+  renderListStatus(auditCoverage, s);
+}
+
+function renderAuditStatus(rowCount, filtered) {
+  renderListStatus(auditEmpty,
+                   auditStatus(rowCount, auditFailed, auditLoaded, filtered,
+                               auditRefused));
+}
+
+// ── the decisions view's controls ────────────────────────────────────────────
+// Rows the two views ask for. The glance stays at forty — it is read at a glance
+// and the number is what the coverage line is honest about. The record's page is
+// larger because it is read deliberately and paged, and it is bounded by the
+// backend's own ceiling regardless of what is asked for here (audit.EVENTS_LIMIT_MAX).
+const AUDIT_LIMIT = 40;
+const EVENTS_LIMIT = 100;
+// A keystroke is a query against the crown-jewel store, so the text box waits for a
+// pause. The selects do not: a click is already a deliberate act, and delaying it
+// reads as the page ignoring the click.
+const AUDIT_FILTER_DEBOUNCE_MS = 250;
+
+// Paging state for the record view. `auditCursors[i]` is the cursor that OPENS page
+// i+1 — i.e. what the backend returned as `next` while serving page i — so walking
+// back is popping an index rather than re-deriving anything. Kept as a list rather
+// than a single cursor because keyset paging is one-directional: there is no
+// "previous" cursor to compute, only one already seen.
+let auditCursors = [];
+let auditPage = 0;
+
+const readFilter = () => ({ q: auditQEl.value, kind: auditKindEl.value,
+                            preset: auditWindowEl.value });
+const everyEvent = () => auditEveryEl.checked;
+const auditRowCount = () =>
+  document.getElementById(everyEvent() ? "audit-events" : "audit").rows.length;
+
+function resetPaging() {
+  auditCursors = [];
+  auditPage = 0;
+}
+
+function renderGrouped(rows) {
+  // Dates, not times: forty rows routinely span midnight, and a time-only stamp makes
+  // them read as out of order at exactly the moment ordering matters. The `title`
+  // carries the UTC instant, because the visible stamp is local and states no offset
+  // — see fmtInstant.
+  document.getElementById("audit").innerHTML = rows.map(r => {
+    const a = auditRow(r);
+    return `
+        <tr${a.failClosed ? ' class="outage"' : ""}>
+          <td class="ts" title="${esc(fmtInstant(a.ts))}">${esc(fmtStamp(a.ts))}</td>
+          <td><span class="tag ${esc(a.kind)}">${esc(a.kind)}</span></td>
+          <td>${a.stagePrefix ? `<span class="qual">${esc(a.stagePrefix)}</span>` : ""
+            }${esc(a.target)}${a.repeat
+              ? `<span class="rep">${esc(" " + a.repeat)}</span>` : ""}</td>
+          <td class="ts">${a.clientClassPrefix
+            ? `<span class="qual">${esc(a.clientClassPrefix)}</span>` : ""
+            }${esc(a.client)}${a.actor
+              ? `<span class="by" title="${esc(a.actorTitle)}">${esc(a.actor)}</span>`
+              : ""}</td>
+          <td>${esc(a.reason)}${a.firstTs
+            ? esc(`${a.reason ? " · " : ""}first seen ${fmtStamp(a.firstTs)}`)
+            : ""}</td></tr>`;
+  }).join("");
+}
+
+// The record view. Same five columns as the glance, rendered from the same shaping
+// (see eventRow), plus the request itself — which is the column this view exists for
+// and the one the glance cannot carry.
+function renderEvents(rows) {
+  document.getElementById("audit-events").innerHTML = rows.map(r => {
+    const a = eventRow(r);
+    return `
+        <tr${a.failClosed ? ' class="outage"' : ""}>
+          <td class="ts" title="${esc(fmtInstant(a.ts))}">${esc(fmtStamp(a.ts))}</td>
+          <td><span class="tag ${esc(a.kind)}">${esc(a.kind)}</span></td>
+          <td>${a.stagePrefix ? `<span class="qual">${esc(a.stagePrefix)}</span>` : ""
+            }${esc(a.target)}</td>
+          <td class="ts">${a.clientClassPrefix
+            ? `<span class="qual">${esc(a.clientClassPrefix)}</span>` : ""
+            }${esc(a.client)}${a.actor
+              ? `<span class="by" title="${esc(a.actorTitle)}">${esc(a.actor)}</span>`
+              : ""}</td>
+          <td class="req"><code>${esc(a.request)}</code></td>
+          <td>${esc(a.reason)}</td></tr>`;
+  }).join("");
+}
+
+export async function refreshAudit() {
+  const f = readFilter();
+  const events = everyEvent();
+  const qs = auditQuery(f, {
+    limit: events ? EVENTS_LIMIT : AUDIT_LIMIT,
+    nowMs: Date.now(),
+    // The cursor for the page being shown. Absent on page 0, which is what makes a
+    // filter change (which resets paging) return to the newest rows.
+    before: events ? auditCursors[auditPage - 1] : "",
+  });
+  let body;
+  try {
+    // Two calls rather than one with a computed path: the relay allowlist is
+    // matched against the literal each `fetch` starts with (see the guard in
+    // tests/test_control_plane_ui_js.py), and a path built by a ternary is a path
+    // that test cannot see — which would take the 403-in-the-browser guard off
+    // exactly the route being added.
+    const res = events ? await fetch(`/api/audit/events?${qs}`)
+                       : await fetch(`/api/audit?${qs}`);
+    // 400 is the backend REFUSING these parameters and saying which one and why —
+    // the sentence is the entire reason that response is a 400 rather than a
+    // best-effort list (see `_bad_filter`). Throwing it into the catch below would
+    // discard the sentence and render "could not refresh", which is both wrong about
+    // the cause and unactionable. `.catch` on the parse because a refusal that
+    // arrives without a readable body must still surface AS a refusal.
+    if (res.status === 400) {
+      const refusal = await res.json().catch(() => null);
+      auditFailed = false;
+      auditRefused = (refusal && refusal.detail) || AUDIT_REFUSED_FALLBACK;
+      renderAuditStatus(auditRowCount(), filterActive(f));
+      return;
+    }
+    if (!res.ok) throw new Error(String(res.status));
+    body = await res.json();
+  } catch (e) {
+    // A failed refresh leaves the previous rows in place and SAYS SO. Silently
+    // swallowing this is what let the list sit indefinitely stale while the header
+    // read "live" — the stream and this poll are different transports.
+    auditFailed = true;
+    auditRefused = null;
+    renderAuditStatus(auditRowCount(), filterActive(f));
+    return;
+  }
+  auditFailed = false;
+  auditRefused = null;
+  auditLoaded = true;
+  // {rows, total, filtered, next}. Tolerates a bare array from an older backend, in
+  // which case `total` is undefined and coverageSummary stays silent rather than
+  // guessing — and `filtered` is false, because a backend that ignored the
+  // parameters served an unfiltered list whatever the controls on screen say.
+  const rows = Array.isArray(body) ? body : (body && body.rows) || [];
+  const total = Array.isArray(body) ? undefined : body && body.total;
+  const filtered = !Array.isArray(body) && !!(body && body.filtered);
+  const next = Array.isArray(body) ? null : (body && body.next) || null;
+
+  // A page that fell off the end of the record. Reachable without anyone doing
+  // anything wrong: `make audit-prune` deletes rows a cursor still points at. Snap
+  // back to the newest page rather than render an empty table, which would read as
+  // "nothing here" for a record that is not empty. Cannot loop — the retry is at
+  // page 0, where an empty result is the honest answer.
+  if (events && !rows.length && auditPage > 0) {
+    resetPaging();
+    return refreshAudit();
+  }
+
+  auditGroupedTable.hidden = events;
+  auditEventsTable.hidden = !events;
+  auditModeNote.textContent = events
+    ? "· every event, newest first" : "· identical events folded";
+  if (events) renderEvents(rows); else renderGrouped(rows);
+
+  renderOutage(outageSummary(rows));
+  // The two views answer "was there more?" differently, so only one of them speaks:
+  // the glance has a coverage line because it silently truncates, the record has a
+  // pager because it does not.
+  renderCoverage(events ? { show: false, level: "none", text: "" }
+                        : coverageSummary(rows, total, filtered));
+  if (events) {
+    // Remember the cursor that opens the NEXT page, and forget any beyond it — the
+    // record can shrink under `make audit-prune`, and stale cursors would offer an
+    // "older" that lands nowhere.
+    if (next) auditCursors[auditPage] = next;
+    else auditCursors.length = auditPage;
+    const pager = historyPager(auditPage, EVENTS_LIMIT, rows.length, total,
+                               !!next, filtered);
+    auditPageEl.textContent = pager.text;
+    auditOlderEl.disabled = !pager.older;
+    auditNewerEl.disabled = !pager.newer;
+  }
+  auditPagerEl.hidden = !events;
+  renderAuditStatus(rows.length, filtered);
+}
+
+// A filter change RESETS paging, always. Keeping the cursor would apply a position
+// derived from one query to the results of another — the rows at that cursor may not
+// match the new filter at all, so the operator would land on an arbitrary page of a
+// list they just narrowed.
+let auditFilterTimer = null;
+function filtersChanged(immediate) {
+  clearTimeout(auditFilterTimer);
+  resetPaging();
+  auditFilterTimer = setTimeout(refreshAudit,
+                                immediate ? 0 : AUDIT_FILTER_DEBOUNCE_MS);
+}
+
+export function mountAudit() {
+  auditEmpty = document.getElementById("audit-empty");
+  auditOutage = document.getElementById("audit-outage");
+  auditCoverage = document.getElementById("audit-coverage");
+  auditQEl = document.getElementById("audit-q");
+  auditKindEl = document.getElementById("audit-kind");
+  auditWindowEl = document.getElementById("audit-window");
+  auditEveryEl = document.getElementById("audit-every");
+  auditClearEl = document.getElementById("audit-clear");
+  auditModeNote = document.getElementById("audit-mode");
+  auditGroupedTable = document.getElementById("audit-grouped-table");
+  auditEventsTable = document.getElementById("audit-events-table");
+  auditPagerEl = document.getElementById("audit-pager");
+  auditOlderEl = document.getElementById("audit-older");
+  auditNewerEl = document.getElementById("audit-newer");
+  auditPageEl = document.getElementById("audit-page");
+
+  auditQEl.addEventListener("input", () => filtersChanged(false));
+  for (const el of [auditKindEl, auditWindowEl, auditEveryEl]) {
+    el.addEventListener("change", () => filtersChanged(true));
+  }
+  auditClearEl.addEventListener("click", () => {
+    auditQEl.value = "";
+    auditKindEl.value = "";
+    auditWindowEl.value = "";
+    // The view switch is deliberately NOT cleared: it selects which record the
+    // filters apply to, so resetting it would answer a question nobody asked.
+    filtersChanged(true);
+  });
+  auditOlderEl.addEventListener("click", () => {
+    if (auditCursors[auditPage] === undefined) return;   // no next page to open
+    auditPage += 1;
+    refreshAudit();
+  });
+  auditNewerEl.addEventListener("click", () => {
+    if (auditPage === 0) return;
+    auditPage -= 1;
+    refreshAudit();
+  });
 }

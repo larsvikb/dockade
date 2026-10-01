@@ -46,6 +46,7 @@ ROOT = Path(__file__).resolve().parents[1]
 UI_DIR = ROOT / "control-plane-ui"
 APP_JS = UI_DIR / "app.js"
 MCP_JS = UI_DIR / "mcp.js"
+AUDIT_JS = UI_DIR / "audit.js"
 PAYLOAD_JS = UI_DIR / "payload.js"
 INDEX_HTML = UI_DIR / "index.html"
 
@@ -3158,9 +3159,10 @@ def _fn_body(src: str, signature: str, indent: str = "  ") -> str:
 
 
 class AuditTableSourceTests(unittest.TestCase):
-    """`refreshAudit` and the two row renderers live in `start()` and cannot be
-    unit-tested, so the parts of them that would fail SILENTLY are asserted against
-    the source — the same approach the dismiss handler and the duplicate badge use.
+    """`refreshAudit` and the two row renderers touch the DOM, in `audit.js`, and
+    cannot be unit-tested, so the parts of them that would fail SILENTLY are asserted
+    against the source — the same approach the dismiss handler and the duplicate badge
+    use.
 
     `self.body` is the poll; `self.rows` and `self.events` are the folded and the raw
     row templates. The shared claims are asserted for BOTH, because the two views
@@ -3168,12 +3170,12 @@ class AuditTableSourceTests(unittest.TestCase):
     is that they must not be able to disagree."""
 
     def setUp(self):
-        self.src = APP_JS.read_text()
-        self.body = re.search(r"async function refreshAudit\(\)\s*\{(.*?)\n  \}",
+        self.src = AUDIT_JS.read_text()
+        self.body = re.search(r"async function refreshAudit\(\)\s*\{(.*?)\n\}",
                               self.src, re.S)
         self.assertIsNotNone(self.body, "refreshAudit not found — renamed?")
-        self.rows = _fn_body(self.src, "renderGrouped(rows)")
-        self.events = _fn_body(self.src, "renderEvents(rows)")
+        self.rows = _fn_body(self.src, "renderGrouped(rows)", "")
+        self.events = _fn_body(self.src, "renderEvents(rows)", "")
 
     def test_the_decisions_table_stamps_the_date_not_only_the_time(self):
         # Forty rows routinely span midnight, and a time-only stamp makes them read
@@ -3207,7 +3209,8 @@ class AuditTableSourceTests(unittest.TestCase):
         # The recovery half, which was asserted for neither table until a mutation of
         # the policy one survived. Both strings appear in the failure path too, so the
         # split at the catch's `return` is what makes this about the SUCCESS path.
-        _, sep, success = self.body.group(1).partition("return;\n    }")
+        # At the catch's closing indent: the 400 branch's `return;` closes deeper.
+        _, sep, success = self.body.group(1).partition("return;\n  }")
         self.assertTrue(sep, "the failure path no longer returns early")
         self.assertIn("auditFailed = false", success)
         self.assertIn("renderAuditStatus(", success)
@@ -3223,8 +3226,8 @@ class AuditTableSourceTests(unittest.TestCase):
         self.assertRegex(self.body.group(1), r"if\s*\(!res\.ok\)\s*throw")
 
     def test_each_cell_renders_the_field_its_header_promises(self):
-        """A structural guard over the row template, because the render lives in
-        `start()` where no unit test reaches — and two mutations proved value tests
+        """A structural guard over the row template, because the render touches the
+        DOM, where no unit test reaches — and two mutations proved value tests
         alone are not enough: moving the stage prefix back onto the decision cell, and
         dropping the host entirely, both left every assertion passing.
 
@@ -3283,7 +3286,7 @@ class AuditTableSourceTests(unittest.TestCase):
         `· first seen …` with a leading dot and nothing before it.
 
         Asserted against the source, like its sibling above, because the branch lives
-        inside `renderGrouped` — which is in `start()` and cannot be called from
+        inside `renderGrouped` — which touches the DOM and cannot be called from
         here."""
         self.assertIn('${a.reason ? " · " : ""}first seen', self.rows)
         # fmtStamp, not fmtTime: a group's span can cover days (the scan behind it is
@@ -3358,13 +3361,13 @@ class AuditTableSourceTests(unittest.TestCase):
 
 
 class RecordViewWiringSourceTests(unittest.TestCase):
-    """The filter and paging wiring lives in `start()`, and each property below fails
+    """The filter and paging wiring lives in `audit.js`, and each property below fails
     SILENTLY if it is dropped — the page keeps rendering a table of real decisions,
     which is exactly what makes a wrong one hard to notice."""
 
     def setUp(self):
-        self.src = APP_JS.read_text()
-        self.refresh = re.search(r"async function refreshAudit\(\)\s*\{(.*?)\n  \}",
+        self.src = AUDIT_JS.read_text()
+        self.refresh = re.search(r"async function refreshAudit\(\)\s*\{(.*?)\n\}",
                                  self.src, re.S)
         self.assertIsNotNone(self.refresh, "refreshAudit not found — renamed?")
 
@@ -3373,7 +3376,7 @@ class RecordViewWiringSourceTests(unittest.TestCase):
         points into a list that no longer exists, so the operator lands on an arbitrary
         page of the thing they just narrowed — with rows on screen, which reads as an
         answer rather than as a bug."""
-        changed = re.search(r"function filtersChanged\(immediate\)\s*\{(.*?)\n  \}",
+        changed = re.search(r"function filtersChanged\(immediate\)\s*\{(.*?)\n\}",
                             self.src, re.S)
         self.assertIsNotNone(changed, "filtersChanged not found — renamed?")
         self.assertIn("resetPaging()", changed.group(1))
@@ -4208,6 +4211,38 @@ class StylesheetTests(unittest.TestCase):
         self.assertEqual(used - defined, set(),
                          "used but never defined, so the declarations naming them "
                          "do nothing")
+
+
+@unittest.skipIf(not _NODE and not _STRICT,
+                 "node is not installed — skipping the dom.js unit tests")
+class EscapeTests(unittest.TestCase):
+    """`esc` is what stands between an agent-chosen string and the tables the page
+    builds from HTML strings (the rules, the leases, the audit rows). The source guards
+    check that it is called at the cells they name; this checks that it escapes."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if not _NODE:
+            raise AssertionError("node is not installed and DOCKADE_REQUIRE_TOOLS is set")
+        script = ('import { esc } from "' + (UI_DIR / "dom.js").as_uri() + '";\n'
+                  'console.log(JSON.stringify([`<img src=x onerror="a(\'b\')"> & c`, '
+                  'null, undefined, 0, 42].map(esc)));')
+        # _NODE is absolute (shutil.which), no shell; the script names a repo path.
+        proc = subprocess.run(  # noqa: S603
+            [_NODE, "--input-type=module", "-e", script],
+            capture_output=True, text=True, timeout=60, check=False)
+        if proc.returncode != 0:
+            raise AssertionError(f"node could not import dom.js:\n{proc.stderr}")
+        cls.out = json.loads(proc.stdout)
+
+    def test_every_character_that_ends_text_or_an_attribute_is_escaped(self):
+        self.assertEqual(self.out[0], "&lt;img src=x onerror=&quot;a(&#39;b&#39;)&quot;&gt;"
+                                      " &amp; c")
+
+    def test_a_missing_value_is_empty_and_a_number_is_its_digits(self):
+        # A null or undefined cell renders blank, never "null"; 0 is a value, not
+        # missing.
+        self.assertEqual(self.out[1:], ["", "", "0", "42"])
 
 
 class InlineScriptTests(unittest.TestCase):

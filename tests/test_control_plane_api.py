@@ -1915,9 +1915,9 @@ class AuditRecordTests(_CPTestCase):
         for ("decisions 101 to 200"), so a ceiling below that request makes every label
         wrong by the difference — silently, because the rows themselves are correct.
         Two ends, one file each, no compiler between them."""
-        js = (ROOT / "control-plane-ui" / "app.js").read_text()
+        js = (ROOT / "control-plane-ui" / "audit.js").read_text()
         asked = re.search(r"const EVENTS_LIMIT = (\d+);", js)
-        self.assertIsNotNone(asked, "EVENTS_LIMIT moved in app.js")
+        self.assertIsNotNone(asked, "EVENTS_LIMIT moved in audit.js")
         self.assertLessEqual(int(asked.group(1)), cp.audit.EVENTS_LIMIT_MAX,
                              "the page asks for more rows than the backend will serve, "
                              "so the pager's row numbers overstate every page")

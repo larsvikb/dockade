@@ -283,6 +283,8 @@ dockade/
                             #   say script-src 'self'; pure helpers unit-tested under node
     audit.js                #   the record as browsed: what a row says, how rows fold, the
                             #   filters and their query, the pager, coverage and outage summaries
+                            #   — and the decisions view itself, which start() mounts
+    dom.js                  #   what more than one surface needs to build markup: esc
     egress-rules.js         #   what creating, editing or revoking a standing rule is about
                             #   to do, said before the click
     holds.js                #   the pending queue's decisions: what a push changes, when a

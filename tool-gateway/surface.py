@@ -80,7 +80,7 @@ def split_exposed(name: str) -> tuple[str, str] | None:
     that is, because the control plane would do exactly that and then the two would
     have decided about different strings."""
     server, found, tool = name.partition(SEP)
-    if not found or not SERVER_RE.match(server) or not TOOL_RE.match(tool):
+    if not found or not SERVER_RE.fullmatch(server) or not TOOL_RE.fullmatch(tool):
         return None
     return server, tool
 

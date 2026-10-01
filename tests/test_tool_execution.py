@@ -852,7 +852,9 @@ class NonCanonicalNameTests(unittest.TestCase):
     def test_a_padded_name_is_refused_before_governance_is_asked(self):
         execute = load_execute()
         execute._ask_control = mock.Mock(side_effect=AssertionError("must not ask"))
-        for name in ("mcp-github__get_issue ", "MCP-GITHUB__get_issue"):
+        for name in ("mcp-github__get_issue ", "MCP-GITHUB__get_issue",
+                     # `$` matches before a final newline, so these got through.
+                     "mcp-github__get_issue\n", "mcp-github\n__get_issue"):
             with self.subTest(name=name):
                 result = execute.call(name, {"owner": "o"}, "172.30.0.2")
                 self.assertTrue(result["isError"])

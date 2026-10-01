@@ -107,4 +107,35 @@ export const STEPS = [
   ["pin revoked", async ({ page }) => {
     await page.click('#toolpins button.revoke[data-pin="4"]');
   }],
+
+  // The decisions view (audit.js): the filters, the switch to the record, its pager,
+  // and a filter the backend refuses. A filter waits for its timer, and the page's
+  // timers are frozen, so each step moves the clock past it.
+  ["audit tab, again", async ({ page }) => { await page.click("#tab-audit"); }],
+  ["audit searched", async ({ page, clock }) => {
+    await page.fill("#audit-q", "pypi");
+    await clock(250);
+  }],
+  ["audit kind picked", async ({ page, clock }) => {
+    await page.selectOption("#audit-kind", "deny");
+    await clock(1);
+  }],
+  ["audit window picked", async ({ page, clock }) => {
+    await page.selectOption("#audit-window", "1h");
+    await clock(1);
+  }],
+  ["every event", async ({ page, clock }) => {
+    await page.check("#audit-every");
+    await clock(1);
+  }],
+  ["older page", async ({ page }) => { await page.click("#audit-older"); }],
+  ["newer page", async ({ page }) => { await page.click("#audit-newer"); }],
+  ["audit search refused", async ({ page, clock }) => {
+    await page.fill("#audit-q", "refuse me");
+    await clock(250);
+  }],
+  ["audit filters cleared", async ({ page, clock }) => {
+    await page.click("#audit-clear");
+    await clock(1);
+  }],
 ];

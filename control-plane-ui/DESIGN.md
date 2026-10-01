@@ -151,7 +151,7 @@ not a preference: `toLocaleString()` renders the same audit row as different dat
 different browsers, and a record of *when* something happened cannot mean two things. So
 the UI fixes ISO-8601 ordering, local time, 24-hour, with the UTC instant on the row's
 `title`, and pins the format in a test. The shaping and the `Number(null)`→`1970-01-01`
-guard live in `app.js`; `NOTES.md` has what six locales produce.
+guard live in `time.js`; `NOTES.md` has what six locales produce.
 
 **Empty vs. stale, on both polled lists.** "Nothing has happened yet" and "the poll
 failed" must not render identically — and the header cannot disambiguate them, because
@@ -161,7 +161,8 @@ facts (has a load ever succeeded; did the last one fail), keeps its rows on a fa
 refresh while saying they may be stale, and stays silent before the first response. The
 three-state logic is shared (`pollStatus`) with per-view wording a test keeps distinct —
 a stale **policy** table is worse than a stale decisions one, since it misstates what is
-currently allowed before an operator decides a hold. Details in `app.js`.
+currently allowed before an operator decides a hold. Details in `audit.js` and
+`app.js`, the two polls.
 
 **The frontend's own tests.** `tests/test_control_plane_ui_js.py` runs the pure helpers
 under `node` (skipped when node is absent, the way `make lint` skips a missing linter)

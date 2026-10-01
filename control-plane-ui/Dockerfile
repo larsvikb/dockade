@@ -22,6 +22,7 @@ COPY index.html ./index.html
 # test holds this list equal to UI_MODULES there.
 COPY app.js ./app.js
 COPY audit.js ./audit.js
+COPY dom.js ./dom.js
 COPY egress-rules.js ./egress-rules.js
 COPY holds.js ./holds.js
 COPY leases.js ./leases.js

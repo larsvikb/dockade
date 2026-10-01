@@ -19,8 +19,10 @@ const AUDIT = {
     { id: 3, ts: NOW - 30, kind: "allow", host: "pypi.org", port: 443,
       client: "172.28.0.5", client_class: "agent", reason: "rule .pypi.org", n: 4,
       first_ts: NOW - 600 },
+    // Markup in a field the agent can influence, so the run shows it rendered as text.
     { id: 2, ts: NOW - 90, kind: "deny", host: "evil.example", stage: "http",
-      client: "172.28.0.5", client_class: "agent", reason: "operator",
+      client: "172.28.0.5", client_class: "agent",
+      reason: `operator: <img src=x onerror="alert('x')"> & more`,
       actor: "operator@127.0.0.1" },
     { id: 1, ts: NOW - 300, kind: "tool-ask", server: "mcp-github", tool: "get_me",
       client: "172.28.0.5", reason: "rule ask", fail_closed: false },
@@ -89,10 +91,28 @@ export const HOLDS = [
     } },
 ];
 
+// The record view, two pages of it: the first says there is an older one, and the
+// second, asked for with that cursor, says there is not.
+const EVENTS = {
+  rows: [
+    { id: 12, ts: NOW - 40, kind: "deny", host: "plain.example", port: 80, proto: "http",
+      stage: "http", method: "GET", url: "http://plain.example/setup.sh",
+      client: "172.28.0.5", client_class: "agent", reason: "operator" },
+    { id: 11, ts: NOW - 60, kind: "allow", host: "pypi.org", port: 443,
+      client: "172.28.0.5", client_class: "agent", reason: "rule .pypi.org" },
+  ],
+  total: 102, filtered: false, next: "cursor-11",
+};
+const EVENTS_OLDER = {
+  rows: [{ id: 2, ts: NOW - 90, kind: "deny", host: "evil.example", stage: "http",
+           client: "172.28.0.5", client_class: "agent", reason: "operator" }],
+  total: 102, filtered: false, next: null,
+};
+
 const GETS = {
   "/api/config": CONFIG,
   "/api/audit": AUDIT,
-  "/api/audit/events": AUDIT,
+  "/api/audit/events": EVENTS,
   "/api/egress/rules": RULES,
   "/api/egress/leases": LEASES,
   "/api/mcp/servers": SERVERS,
@@ -130,7 +150,14 @@ const MCP_WRITES = [
 // `{status, json}` for a request, or null for one this backend does not know — which
 // the harness records, since a path the page asks for and no fixture answers is
 // either a fixture to add or a change in what the page asks.
-export function respond(method, path, body) {
+export function respond(method, path, body, query) {
+  // A filter the backend refuses, said in its own words, as `_bad_filter` does.
+  if (path.startsWith("/api/audit") && query.get("q") === "refuse me") {
+    return { status: 400, json: { detail: "q: the search text is longer than allowed" } };
+  }
+  if (path === "/api/audit/events" && query.get("before") === "cursor-11") {
+    return { status: 200, json: EVENTS_OLDER };
+  }
   if (method === "GET" && path in GETS) return { status: 200, json: GETS[path] };
   const resolve = path.match(/^\/approvals\/([^/]+)\/resolve$/);
   if (method === "POST" && resolve) {

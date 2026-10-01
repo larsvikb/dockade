@@ -135,3 +135,11 @@ const LEASES_STATUS_TEXT = {
 export function leasesStatus(rowCount, failed, loaded) {
   return pollStatus(LEASES_STATUS_TEXT, rowCount, failed, loaded);
 }
+
+// The DOM half of every status line above, one renderer for all of them: the element
+// contract is identical, and two copies drifting apart is precisely what happened once.
+export function renderListStatus(el, s) {
+  el.hidden = !s.show;
+  el.textContent = s.text;
+  el.className = "empty" + (s.level === "warn" ? " warn" : "");
+}

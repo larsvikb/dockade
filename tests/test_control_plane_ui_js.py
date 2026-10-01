@@ -45,6 +45,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 UI_DIR = ROOT / "control-plane-ui"
 APP_JS = UI_DIR / "app.js"
+MCP_JS = UI_DIR / "mcp.js"
 PAYLOAD_JS = UI_DIR / "payload.js"
 INDEX_HTML = UI_DIR / "index.html"
 
@@ -3140,16 +3141,17 @@ class PageScriptTests(unittest.TestCase):
         self.assertIn("no longer be what is in force", r["failed_with_rows"]["text"])
 
 
-def _fn_body(src: str, signature: str) -> str:
-    """The body of a two-space-indented function inside `start()`.
+def _fn_body(src: str, signature: str, indent: str = "  ") -> str:
+    """The body of a function inside `start()`, which closes at two spaces of
+    indent, or at `indent` for one a module declares at its top level.
 
     The row templates moved out of `refreshAudit` when the decisions view grew a
     second table, so the source guards below name the RENDERER they are about — which
     also means each of them can be asserted for both tables rather than for whichever
     one the poll happened to inline."""
-    m = re.search(rf"function {re.escape(signature)}\s*\{{(.*?)\n  \}}", src, re.S)
+    m = re.search(rf"function {re.escape(signature)}\s*\{{(.*?)\n{indent}\}}", src, re.S)
     if m is None:
-        raise AssertionError(f"{signature} not found in app.js — renamed? The source "
+        raise AssertionError(f"{signature} not found — renamed, or moved? The source "
                              f"guards below cannot assert a renderer they cannot find, "
                              f"and would otherwise pass by looking at nothing.")
     return m.group(1)
@@ -3882,7 +3884,7 @@ class ServerWriteSourceTests(unittest.TestCase):
     before sending, or a change made in another tab is silently undone."""
 
     def setUp(self):
-        self.src = APP_JS.read_text()
+        self.src = MCP_JS.read_text()
 
     def _fetches_fresh_before_writing(self, body):
         fresh = body.find("await freshServer(")
@@ -3892,12 +3894,12 @@ class ServerWriteSourceTests(unittest.TestCase):
         self.assertLess(fresh, write)
 
     def test_saving_the_edit_form_fetches_the_server_first(self):
-        self._fetches_fresh_before_writing(_fn_body(self.src, "submitServerEdit()"))
+        self._fetches_fresh_before_writing(_fn_body(self.src, "submitServerEdit()", ""))
 
     def test_a_form_moved_during_the_fetch_sends_nothing(self):
         # The operator can open another row, or cancel, while the fetch is out; the
         # fields are then about a different server than the one the save would hit.
-        body = _fn_body(self.src, "submitServerEdit()")
+        body = _fn_body(self.src, "submitServerEdit()", "")
         guard = body.find("if (editingServer !== server) return;")
         self.assertNotEqual(guard, -1, "the re-check after the fetch is gone")
         self.assertLess(body.find("await freshServer("), guard)
@@ -3914,16 +3916,16 @@ class ServerWriteSourceTests(unittest.TestCase):
 
 
 class ToolPolicySourceTests(unittest.TestCase):
-    """The tool-policy renderer and its poll live in `start()`, so the parts that
-    would fail SILENTLY are asserted against the source — the same approach the
+    """The tool-policy renderer and its poll touch the DOM, in `mcp.js`, so the parts
+    that would fail SILENTLY are asserted against the source — the same approach the
     decisions and policy tables take."""
 
     def setUp(self):
-        self.src = APP_JS.read_text()
-        self.rows = _fn_body(self.src, "renderToolRules(rows)")
-        self.poll = _fn_body(self.src, "refreshToolRules()")
-        self.picker = _fn_body(self.src, "renderToolPicker()")
-        self.preview = _fn_body(self.src, "renderToolRulePreview()")
+        self.src = MCP_JS.read_text()
+        self.rows = _fn_body(self.src, "renderToolRules(rows)", "")
+        self.poll = _fn_body(self.src, "refreshToolRules()", "")
+        self.picker = _fn_body(self.src, "renderToolPicker()", "")
+        self.preview = _fn_body(self.src, "renderToolRulePreview()", "")
 
     def test_a_tool_name_can_only_be_PICKED_never_typed(self):
         """The invariant the whole step rests on: a rule can only name a tool some
@@ -4293,7 +4295,7 @@ class InlineScriptTests(unittest.TestCase):
         self.assertIn("pending-empty", ids)  # the keyed-render empty state
         for element_id in sorted(ids):
             self.assertRegex(html, rf'id="{re.escape(element_id)}"',
-                             f'app.js reaches for #{element_id}, which index.html '
+                             f'the page reaches for #{element_id}, which index.html '
                              f'does not define')
 
     def test_every_endpoint_the_page_calls_is_served_or_relayed(self):
@@ -4317,7 +4319,7 @@ class InlineScriptTests(unittest.TestCase):
             self.assertTrue(
                 any(p in local or ui._relay_allowed("GET", p)
                     or ui._relay_allowed("POST", p) for p in variants),
-                f"app.js calls {variants[0]}, which control-plane-ui neither serves "
+                f"the page calls {variants[0]}, which control-plane-ui neither serves "
                 f"nor relays — add it to _RELAY_ROUTES or it will 403 in the browser")
 
     def test_every_relayed_route_is_actually_called(self):
@@ -4526,6 +4528,34 @@ class FreeNameTests(unittest.TestCase):
         self.assertEqual(found.get("cards"), {"start"})
 
 
+class MountedElementTests(unittest.TestCase):
+    """A surface moved out of `start()` keeps its elements in module-level `let`s that
+    its `mount…()` functions assign, because a lookup at import would fail under node.
+    That trades a mistake `FreeNameTests` catches for one nothing else does: a lookup
+    left out of the mount is a name that resolves and holds `undefined`, a TypeError
+    at the first click that reaches it. So each name a module declares with a bare
+    `let` must be looked up exactly once, inside a mount function. Any other state is
+    declared with a value, which also says what it starts as."""
+
+    def test_every_element_a_module_declares_is_looked_up_once_in_its_mount(self):
+        declared_anywhere = False
+        for module, js in _module_texts().items():
+            names = [n.strip() for block in re.findall(r"^let ([\w\s,]+);$", js, re.M)
+                     for n in block.split(",")]
+            mounts = "\n".join(re.findall(
+                r"^(?:export )?function mount\w*\(\) \{\n(.*?)^\}", js, re.M | re.S))
+            for name in names:
+                declared_anywhere = True
+                lookup = rf"^\s+{name} = document\.getElementById\("
+                with self.subTest(module=module, element=name):
+                    self.assertEqual(len(re.findall(lookup, mounts, re.M)), 1,
+                                     "looked up in no mount function, or in two")
+                    self.assertEqual(len(re.findall(lookup, js, re.M)), 1,
+                                     "looked up outside a mount function too")
+        # The pattern is in use, so a regex that stopped matching it would pass empty.
+        self.assertTrue(declared_anywhere, "no bare `let` found; did the shape change?")
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -4609,13 +4639,13 @@ class PinnedAllowViewTests(unittest.TestCase):
 
 
 class PinnedAllowTableSourceTests(unittest.TestCase):
-    """The pins table lives in `start()`, so what would fail silently is asserted
-    against the source, as for the tool rules."""
+    """The pins table touches the DOM, in `mcp.js`, so what would fail silently is
+    asserted against the source, as for the tool rules."""
 
     def setUp(self):
-        src = APP_JS.read_text()
-        self.rows = _fn_body(src, "renderToolPins(rows)")
-        self.poll = _fn_body(src, "refreshToolPins()")
+        src = MCP_JS.read_text()
+        self.rows = _fn_body(src, "renderToolPins(rows)", "")
+        self.poll = _fn_body(src, "refreshToolPins()", "")
 
     def test_the_values_are_set_as_text_and_from_the_stored_form(self):
         # Agent-authored values, so never markup, and never a parsed-and-restringified
@@ -4629,8 +4659,7 @@ class PinnedAllowTableSourceTests(unittest.TestCase):
 
     def test_a_timed_pins_cell_carries_its_deadline_for_the_tick(self):
         self.assertIn("leftCell.dataset.expires = String(row.expires_at)", self.rows)
-        src = APP_JS.read_text()
-        tick = _fn_body(src, "updatePinCountdowns()")
+        tick = _fn_body(MCP_JS.read_text(), "updatePinCountdowns()", "")
         # The tick moves cells, and fetches the table again only for the rows
         # `pinLapsesDue` names, recording when it asked.
         self.assertNotIn("renderToolPins", tick)
@@ -4640,7 +4669,8 @@ class PinnedAllowTableSourceTests(unittest.TestCase):
         # And forgets the rows no longer shown, so a page left open does not grow it.
         self.assertIn("if (!shown.has(key)) pinLapsesAsked.delete(key)", tick)
         self.assertEqual(tick.count("refreshToolPins("), 1)
-        self.assertIn("updatePinCountdowns();", src.split("setInterval(() => {", 1)[1]
+        self.assertIn("updatePinCountdowns();", APP_JS.read_text()
+                      .split("setInterval(() => {", 1)[1]
                       .split("}, 1000)", 1)[0])
 
     def test_there_is_no_way_to_add_a_pin_from_this_view(self):

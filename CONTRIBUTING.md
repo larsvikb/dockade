@@ -82,9 +82,10 @@ tree**, never `git checkout --` — that reverts to `HEAD` and eats uncommitted 
 And confirm each mutation actually applied; one that silently fails to match its
 pattern reports a reassuring "caught" while testing nothing.
 
-Behaviour that lives in `start()` in `control-plane-ui/app.js` runs only in a browser
+Behaviour that touches the DOM — `start()` in `control-plane-ui/app.js`, and the DOM
+half of a surface's own module, which `start()` mounts — runs only in a browser
 and is deliberately not unit-tested. Where a mistake there would be silent, the
-convention is a **source-level guard** — a test that reads `app.js` and asserts the
+convention is a **source-level guard** — a test that reads that module and asserts the
 call site looks right. There are several to copy from.
 
 ## Commits

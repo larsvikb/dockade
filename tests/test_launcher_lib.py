@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import socket
 import subprocess
 import tempfile
 import unittest
@@ -244,6 +245,180 @@ class WorkspaceGuardTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 1, proc.stderr)
         self.assertIn("REFUSING to mount marketplaces", proc.stderr)
         self.assertIn("that is a Windows user profile", proc.stderr)
+
+
+_REFS_HARNESS = ('set -euo pipefail; source "$1"; sc_refs; '
+                 '[ ${#SC_REFS_ARGS[@]} -eq 0 ] || printf "%s\\n" "${SC_REFS_ARGS[@]}"')
+
+
+@unittest.skipUnless(_BASH or _STRICT, "bash is not installed")
+class RefsTests(unittest.TestCase):
+    """``sc_refs`` turning ``SANDBOX_REFS`` into read-only ``/refs/<name>`` mounts.
+
+    Every entry is something the operator named, so each failure is asserted to be
+    a refusal with the entry in it — a skipped entry would launch a sandbox that
+    looks right and is missing what the agent was told to read."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name).resolve()
+        self.home = self.root / "home" / "alice"
+        self.home.mkdir(parents=True)
+        self.config = self.root / "config"
+        (self.config / "secrets").mkdir(parents=True)
+        self.src = self.root / "src"
+        for d in ("tools/dockade", "games/platformer", "a/docs", "b/docs"):
+            (self.src / d).mkdir(parents=True)
+
+    def refs(self, value, **env_over):
+        env = {k: v for k, v in os.environ.items() if k != "XDG_RUNTIME_DIR"}
+        env.update(HOME=str(self.home), SANDBOX_REFS=value,
+                   DOCKADE_CONFIG_HOME=str(self.config))
+        env.update(env_over)
+        return subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
+            [_BASH, "-c", _REFS_HARNESS, "sc_refs", str(LIB)],
+            capture_output=True, text=True, env=env, timeout=60)
+
+    def mounts(self, value):
+        """The ``-v`` operands, after asserting every other word is ``-v``."""
+        proc = self.refs(value)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        args = proc.stdout.splitlines()
+        self.assertEqual(args[::2], ["-v"] * (len(args) // 2), args)
+        return args[1::2]
+
+    def assertRefused(self, value, why):
+        proc = self.refs(value)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("REFUSING to mount ref", proc.stderr)
+        self.assertIn(why, proc.stderr)
+
+    def test_unset_mounts_nothing(self):
+        self.assertEqual(self.mounts(""), [])
+
+    def test_each_path_mounts_read_only_under_its_basename(self):
+        value = f"{self.src}/tools/dockade,{self.src}/games/platformer/"
+        self.assertEqual(self.mounts(value), [
+            f"{self.src}/tools/dockade:/refs/dockade:ro",
+            f"{self.src}/games/platformer:/refs/platformer:ro",
+        ])
+
+    def test_an_explicit_name_wins(self):
+        self.assertEqual(self.mounts(f"docs-b={self.src}/b/docs"),
+                         [f"{self.src}/b/docs:/refs/docs-b:ro"])
+
+    def test_two_entries_with_one_name_are_refused_not_suffixed(self):
+        self.assertRefused(f"{self.src}/a/docs,{self.src}/b/docs",
+                           "/refs/docs is already taken")
+        self.assertEqual(len(self.mounts(f"{self.src}/a/docs,b={self.src}/b/docs")), 2)
+
+    def test_blank_entries_and_padding_are_ignored(self):
+        self.assertEqual(self.mounts(f" {self.src}/tools/dockade , ,"),
+                         [f"{self.src}/tools/dockade:/refs/dockade:ro"])
+
+    def test_a_quoted_tilde_means_home(self):
+        (self.home / "notes").mkdir()
+        self.assertEqual(self.mounts("~/notes"), [f"{self.home}/notes:/refs/notes:ro"])
+
+    def test_a_symlink_mounts_its_target_under_the_target_name(self):
+        link = self.root / "link"
+        link.symlink_to(self.src / "tools" / "dockade")
+        self.assertEqual(self.mounts(str(link)),
+                         [f"{self.src}/tools/dockade:/refs/dockade:ro"])
+
+    def test_a_missing_directory_is_refused(self):
+        self.assertRefused(f"{self.src}/nope", "is not a directory")
+
+    def test_the_read_only_mount_rules_hold(self):
+        profile = self.root / "mnt" / "c" / "Users" / "Alice"
+        profile.mkdir(parents=True)
+        (profile / "NTUSER.DAT").touch()
+        for value, why in ((str(self.home), "that is your home directory"),
+                           (str(self.home.parent), "your home directory"),
+                           ("/", "that is the filesystem root"),
+                           (str(self.config), "the MCP secrets directory"),
+                           (str(profile), "that is a Windows user profile")):
+            with self.subTest(value=value):
+                self.assertRefused(value, why)
+
+    def test_a_name_docker_or_the_agent_cannot_use_is_refused(self):
+        odd = self.src / "has space"
+        odd.mkdir()
+        self.assertRefused(str(odd), "not a usable name under /refs")
+        self.assertEqual(self.mounts(f"spaced={odd}"), [f"{odd}:/refs/spaced:ro"])
+        colon = self.src / "a:b"
+        colon.mkdir()
+        self.assertRefused(f"ab={colon}", "contains ':'")
+
+    def test_credentials_inside_warn_without_refusing(self):
+        (self.src / "tools" / "dockade" / ".ssh").mkdir()
+        proc = self.refs(f"{self.src}/tools/dockade")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("WARNING: ref 'dockade' contains '.ssh'", proc.stderr)
+
+    def test_a_ref_that_is_credential_material_is_refused(self):
+        (self.home / ".ssh").mkdir()
+        (self.home / ".aws" / "sso").mkdir(parents=True)
+        self.assertRefused("keys=~/.ssh", "is credential material ('.ssh')")
+        self.assertRefused("sso=~/.aws/sso", "is credential material ('.aws')")
+
+    def test_a_newline_separates_entries_like_a_comma(self):
+        # `read` alone would stop at the newline and drop the second entry.
+        self.assertEqual(self.mounts(f"{self.src}/tools/dockade,\n{self.src}/a/docs"), [
+            f"{self.src}/tools/dockade:/refs/dockade:ro",
+            f"{self.src}/a/docs:/refs/docs:ro",
+        ])
+
+    def test_a_name_with_a_leading_dot_is_refused(self):
+        # Hidden from `ls /refs` and from boundary-check.sh's /refs/*/ probe.
+        dotted = self.src / ".dotfiles"
+        dotted.mkdir()
+        for value in (str(dotted), f".x={self.src}/a/docs", f"..={self.src}/a/docs",
+                      f".={self.src}/a/docs"):
+            with self.subTest(value=value):
+                self.assertRefused(value, "not a usable name under /refs")
+        self.assertEqual(self.mounts(f"dotfiles={dotted}"),
+                         [f"{dotted}:/refs/dotfiles:ro"])
+
+    def test_the_runtime_directories_are_refused(self):
+        runtime = self.root / "run-user"
+        (runtime / "bus-dir").mkdir(parents=True)
+        # This fixture's home and config live under /tmp, which would refuse /tmp
+        # for a different reason; a home elsewhere isolates the rule under test.
+        elsewhere = {"HOME": "/nonexistent-home", "DOCKADE_CONFIG_HOME": "/nonexistent-cfg"}
+        for value, why, env in (("/tmp", "that is /tmp", elsewhere),  # noqa: S108 (/tmp itself is the rule under test)
+                                (str(runtime), f"that is {runtime}", {}),
+                                (str(runtime / "bus-dir"), f"that is {runtime}", {})):
+            with self.subTest(value=value):
+                proc = self.refs(value, XDG_RUNTIME_DIR=str(runtime), **env)
+                self.assertEqual(proc.returncode, 1, proc.stderr)
+                self.assertIn(why, proc.stderr)
+        # Unlike /tmp, whose children are ordinary scratch: one is mounted as usual.
+        scratch = Path("/tmp") / f"dockade-refs-test-{os.getpid()}"  # noqa: S108 (a child of /tmp is the point)
+        scratch.mkdir()
+        self.addCleanup(scratch.rmdir)
+        self.assertEqual(self.mounts(str(scratch)),
+                         [f"{scratch.resolve()}:/refs/{scratch.name}:ro"])
+
+    def test_a_socket_or_fifo_near_the_top_is_refused(self):
+        # A :ro bind does not stop connect() on a socket or a write to a FIFO.
+        sock_dir = self.src / "tools" / "dockade" / "tmux-1000"
+        sock_dir.mkdir()
+        server = socket.socket(socket.AF_UNIX)
+        self.addCleanup(server.close)
+        server.bind(str(sock_dir / "default"))
+        self.assertRefused(f"{self.src}/tools/dockade", "holds a socket or FIFO")
+        os.mkfifo(self.src / "a" / "docs" / "pipe")
+        self.assertRefused(f"{self.src}/a/docs", "holds a socket or FIFO")
+
+    def test_the_socket_scan_stops_at_three_levels(self):
+        # The bound, pinned: deep enough for tmux-<uid>/default and ssh-*/agent.*,
+        # shallow enough not to walk a whole checkout on every launch.
+        deep = self.src / "b" / "docs" / "one" / "two" / "three"
+        deep.mkdir(parents=True)
+        os.mkfifo(deep / "pipe")
+        self.assertEqual(len(self.mounts(f"{self.src}/b/docs")), 1)
 
 
 if __name__ == "__main__":

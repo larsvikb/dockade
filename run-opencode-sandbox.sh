@@ -10,7 +10,8 @@
 #   TIER 2 GRANT: the local inference service on sandbox-net, and nothing else.
 #   NO credentials of any kind (no Anthropic session, no tokens). NO egress,
 #   governed or direct — so no proxy env, no upstream DNS. No route to the
-#   control plane. The workspace bind mount is the only host coupling.
+#   control plane. The workspace bind mount is the only writable host coupling;
+#   SANDBOX_REFS adds read-only ones at /refs/<name> (sandbox-lib.sh, sc_refs).
 #
 # That makes this the strongest available test of the containment boundary: run
 # boundary-check.sh inside it and everything should fail except the inference
@@ -72,6 +73,7 @@ fi
 
 sc_guard_workspace "$WORKSPACE"
 WORKSPACE="$SC_WORKSPACE"
+sc_refs
 
 if [[ "$REBUILD" == "true" ]] || ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
     sc_build_image "$IMAGE_NAME" "$IMAGE_DIR" "$CACHE_FLAG"
@@ -122,6 +124,7 @@ sc_host_timezone
 
 echo "Sandbox:   $SC_CONTAINER_NAME (tier 2 — opencode, local model)"
 echo "Workspace: $WORKSPACE -> /workspace"
+echo "Refs:      $SC_REFS_DESC"
 echo "Git ident: ${SC_GIT_NAME:-<none>} <${SC_GIT_EMAIL:-none}>"
 echo "Inference: $LLM_NAME ($LLM_IP:$LLM_PORT) — the ONLY permitted destination"
 echo "Egress:    NONE (no proxy, no direct; no credentials in this tier)"
@@ -162,6 +165,7 @@ docker run -it --rm \
     \
     -v "$WORKSPACE":/workspace \
     -v "$CONFIG_VOLUME":/config \
+    ${SC_REFS_ARGS[@]+"${SC_REFS_ARGS[@]}"} \
     \
     -e "TERM=${TERM:-xterm-256color}" \
     -e "TZ=$SC_TZ" \

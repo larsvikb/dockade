@@ -8,6 +8,9 @@
 # Claude config/auth persists in the named volume `claude-sandbox-config`,
 # isolated from the host's ~/.claude. Authenticate once on first run.
 #
+# SANDBOX_REFS, a comma-separated list of host directories, mounts each one
+# READ-ONLY at /refs/<name> as reference material (see sandbox-lib.sh, sc_refs).
+#
 # ~/.config/dockade/marketplaces, when it exists, is mounted READ-ONLY at
 # /marketplaces and every marketplace in it is registered at boot;
 # ~/.config/dockade/plugins lists the `plugin@marketplace` ids to enable. Both
@@ -98,6 +101,7 @@ fi
 
 sc_guard_workspace "$WORKSPACE"
 WORKSPACE="$SC_WORKSPACE"
+sc_refs
 
 if [[ "$REBUILD" == "true" ]] || ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
     sc_build_image "$IMAGE_NAME" "$IMAGE_DIR" "$CACHE_FLAG"
@@ -239,6 +243,7 @@ sc_plugin_allowlist
 
 echo "Sandbox:   $SC_CONTAINER_NAME (tier 1 — Claude)"
 echo "Workspace: $WORKSPACE -> /workspace"
+echo "Refs:      $SC_REFS_DESC"
 echo "Markets:   $SC_MARKETPLACE_DESC"
 echo "Plugins:   $SC_PLUGINS_DESC"
 echo "Git ident: ${SC_GIT_NAME:-<none>} <${SC_GIT_EMAIL:-none}>"
@@ -324,6 +329,7 @@ docker run "${RUN_MODE_ARGS[@]}" \
     -v "$WORKSPACE":/workspace \
     -v "$CONFIG_VOLUME":/config \
     ${SC_MARKETPLACE_ARGS[@]+"${SC_MARKETPLACE_ARGS[@]}"} \
+    ${SC_REFS_ARGS[@]+"${SC_REFS_ARGS[@]}"} \
     \
     -e "TERM=${TERM:-xterm-256color}" \
     -e "TZ=$SC_TZ" \

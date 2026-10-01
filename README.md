@@ -121,6 +121,8 @@ the measured throughput behind those decisions.
 - **Mounts your plugin marketplaces** at `/marketplaces` (**read-only**) when
   `~/.config/dockade/marketplaces` exists, and registers every one of them at
   boot — see *Plugins and marketplaces* below.
+- **Mounts reference material** at `/refs/<name>` (**read-only**, both tiers)
+  for each directory in `SANDBOX_REFS` — see *Reference material* below.
 - **Forwards your host git identity** into the container (it is not baked into
   the image).
 - **Runs the agent** as non-root — the container starts as root only to arm the
@@ -173,6 +175,27 @@ Bypass-permissions mode is available via the `claude-yolo` alias but is **never
 forced** — starting in it is a conscious opt-in. The image pre-accepts the
 bypass-mode disclaimer (in the baked user settings) so the acceptance survives
 restarts and volume wipes; it does not start Claude in yolo automatically.
+
+## Reference material
+
+To give the agent something to read beyond its workspace — another checkout, a
+library's source, a docs archive — list host directories in `SANDBOX_REFS`:
+
+```bash
+SANDBOX_REFS=~/src/dockade,~/src/platformer/ ./run-claude-sandbox.sh
+#   -> /refs/dockade, /refs/platformer   (read-only)
+SANDBOX_REFS=docs-a=~/a/docs,docs-b=~/b/docs ./run-opencode-sandbox.sh
+#   -> name=path picks the name; two entries with one name are refused
+```
+
+Both tiers take the same variable, separated by commas or newlines. The paths
+`/marketplaces` refuses are refused here too: the filesystem root, your home or
+anything holding it, a Windows profile, the dockade secrets directory, `/tmp`,
+`/run` and `$XDG_RUNTIME_DIR`, and any directory with a unix socket or FIFO near
+its top — read-only does not stop the agent using those. So is a credential
+directory such as `~/.ssh`, a name with a leading dot, and an entry that is not
+a directory: every entry was named on purpose, so a bad one stops the launch
+rather than vanishing.
 
 ## Plugins and marketplaces
 

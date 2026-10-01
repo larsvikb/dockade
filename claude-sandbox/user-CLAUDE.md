@@ -37,6 +37,10 @@ here. It is written down so you spend no turns discovering it.
 - **`/workspace` is the human's checkout, live.** Commits, branch switches and
   edits appear outside the container immediately; switching branches moves their
   working tree too. Say so when you do it.
+- **`/refs/<name>`, when present, is reference material.** Host directories the
+  human mounted read-only for you to read — another checkout, docs, a library's
+  source. Look there when the task points outside `/workspace`; changes belong in
+  `/workspace`, never there.
 - **The control plane is unreachable by design.** It is on a network this
   container has no route to. Read its source to reason about it; do not try to
   query it.

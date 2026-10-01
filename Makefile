@@ -406,6 +406,27 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	  echo "        If the feature was removed deliberately, remove this guard too."
 	  exit 1
 	fi
+	echo "== reference mounts are READ-ONLY =="
+	# Same one-character mitigation as above, for the operator's own directories
+	# (SANDBOX_REFS, built in sc_refs). Writable, the agent edits a host checkout
+	# it was handed only to read, outside the review /workspace commits get.
+	mounted=0
+	for f in $(LAUNCHERS) sandbox-lib.sh; do
+	  tot=$$(grep -cE -- '-v "[^"]*":/refs/' "$$f" || true)
+	  [ "$$tot" -gt 0 ] || continue
+	  ro=$$(grep -cE -- '-v "[^"]*":/refs/[^ ]*:ro\)?$$' "$$f" || true)
+	  if [ "$$tot" != "$$ro" ]; then
+	    echo "  FAIL: $$f constructs $$tot /refs mount(s) but only $$ro carry :ro."
+	    exit 1
+	  fi
+	  mounted=$$((mounted + tot))
+	  echo "  ok $$f ($$tot mount(s), all :ro)"
+	done
+	if [ "$$mounted" -eq 0 ]; then
+	  echo "  FAIL: nothing constructs a /refs mount, so this guard checked nothing."
+	  echo "        sc_refs does — did the mount change shape?"
+	  exit 1
+	fi
 	echo "== every tracked source file carries an SPDX header =="
 	# CONTRIBUTING.md tells contributors to add one, and a documented convention with
 	# nothing enforcing it is the kind that holds at 100% until it quietly does not.

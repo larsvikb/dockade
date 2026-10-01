@@ -733,6 +733,21 @@ line is what distinguishes those, which is why `boundary-check.sh` reads both.
 Note also that the container's own hostname resolves from `/etc/hosts` (Docker writes
 it there), so resolving it proves nothing about the resolver being alive.
 
+## A unix socket under a read-only bind mount still accepts connections
+
+Read-only stops writes to regular files, directories and symlinks; a unix socket's
+`connect()` and a FIFO's `write()` only need write permission on the inode, which a
+read-only mount does not take away. Measured on the development host (WSL2) on
+2026-10-01: a host process listened on `/tmp/sockref/s`, and a container run with
+the host uid and `-v /tmp/sockref:/r:ro` connected to `/r/s` and sent a message,
+which the host process received (`host got: b'through ro'`).
+
+So mounting a directory read-only does not make it safe to hand over if it holds a
+socket a host process serves — a tmux server or an ssh-agent takes commands from any
+peer with the same uid. This is why the read-only mount guard refuses the runtime
+directories and directories with sockets near the top (`_sc_ro_mount_reason` in
+`sandbox-lib.sh`).
+
 ## `curl` reads `http_proxy` in lower case only
 
 Same host, same shell, curl 8.14.1. `example.com` carries a **block** rule, so reaching

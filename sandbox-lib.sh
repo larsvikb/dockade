@@ -5,7 +5,7 @@
 # Sourced by run-claude-sandbox.sh (tier 1, Claude + governed egress) and
 # run-opencode-sandbox.sh (tier 2, local LLM, no egress). This file owns the
 # mechanics that MUST NOT differ between tiers — above all the workspace safety
-# guard, which is the single deliberate host coupling and the place where a
+# guard, which is the single deliberate writable host coupling and the place where a
 # copy-paste divergence would do the most damage.
 #
 # What deliberately does NOT live here: each tier's capability profile (which
@@ -89,8 +89,22 @@ _sc_windows_profile_reason() {
     done
 }
 
+# _sc_warn_credentials <dir> <what> <access>
+# Non-fatal: credential material sitting inside a directory about to be mounted.
+# Legal (you may genuinely want to work there), but the agent will be able to read
+# it, so make that visible rather than silent.
+_SC_CREDENTIAL_PATHS=(.ssh .aws .gnupg .config/gcloud .kube .docker/config.json .netrc .git-credentials secrets)
+_sc_warn_credentials() {
+    local sensitive
+    for sensitive in "${_SC_CREDENTIAL_PATHS[@]}"; do
+        if [[ -e "$1/$sensitive" ]]; then
+            echo "WARNING: $2 contains '$sensitive' — the sandbox agent will have $3 access to it." >&2
+        fi
+    done
+}
+
 sc_guard_workspace() {
-    local real_workspace real_home sensitive reason
+    local real_workspace real_home reason
     real_workspace="$(cd "$1" && pwd -P)"   # canonical, symlinks resolved
     real_home="$(cd "$HOME" 2>/dev/null && pwd -P || echo "$HOME")"
 
@@ -117,14 +131,7 @@ sc_guard_workspace() {
         [[ -z "$reason" ]] || _sc_deny_workspace "$reason"
     fi
 
-    # Non-fatal: credential material sitting inside the chosen workspace. This is
-    # legal (you may genuinely want to work there), but the agent will be able to
-    # read and modify it, so make that visible rather than silent.
-    for sensitive in .ssh .aws .gnupg .config/gcloud .kube .docker/config.json .netrc .git-credentials secrets; do
-        if [[ -e "$real_workspace/$sensitive" ]]; then
-            echo "WARNING: workspace contains '$sensitive' — the sandbox agent will have RW access to it." >&2
-        fi
-    done
+    _sc_warn_credentials "$real_workspace" "workspace" "RW"
     # dockade's own state, when dockade is the workspace. A control-plane backup is
     # the whole policy store in a file `make restore` will install after checking its
     # shape, not its provenance — so a copy the agent can edit is a store the agent
@@ -160,6 +167,75 @@ sc_config_home() {
         printf '%s\n' "$DOCKADE_CONFIG_HOME"
     else
         printf '%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}/dockade"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Read-only mount guard  ->  echoes why <canonical_dir> must not be mounted
+# ---------------------------------------------------------------------------
+# Echoes nothing when the directory may be mounted. Shared by every read-only
+# host mount (sc_marketplaces, sc_refs), so they cannot drift apart on what
+# they refuse.
+#
+# Read-only keeps the agent from WRITING what it reads; it does nothing about
+# what it can read. So the same over-broad paths sc_guard_workspace refuses are
+# refused here too, for the narrower reason that they would hand the agent the
+# contents of a home directory — and, unlike the workspace, with no override.
+#
+# Read-only is also narrower than it sounds: it stops writes to files,
+# directories and symlinks, but a unix socket under a :ro bind can still be
+# connected to and a FIFO written — and the sandbox user has the host's uid, so
+# a tmux server or an ssh-agent would take the agent's requests. Hence the
+# runtime directories, where those live, and a shallow scan for any elsewhere.
+_sc_ro_mount_reason() {
+    local real="$1" real_home secrets runtime reason hit
+    real_home="$(cd "$HOME" 2>/dev/null && pwd -P || echo "$HOME")"
+    secrets="$(sc_config_home)/secrets"
+    [[ -d "$secrets" ]] && secrets="$(cd "$secrets" && pwd -P)"
+
+    if [[ "$real" == "/" ]]; then
+        echo "that is the filesystem root."
+        return 0
+    elif [[ "$real" == "$real_home" ]]; then
+        echo "that is your home directory."
+        return 0
+    elif [[ "$real_home" == "$real"/* ]]; then
+        echo "your home directory ($real_home) is inside it."
+        return 0
+    fi
+    # A footgun the config-home layout creates rather than one it inherits: the
+    # MCP client credentials live under the same config home as the marketplaces,
+    # so the obvious near-miss (~/.config/dockade) would mount the secrets tree
+    # into the sandbox. Read-only is no comfort for a credential — readable IS
+    # the compromise.
+    if [[ "$secrets" == "$real" || "$secrets" == "$real"/* ]]; then
+        echo "the MCP secrets directory ($secrets) is inside it."
+        return 0
+    fi
+    # /tmp also holds ordinary scratch directories, so only it and what holds it
+    # are refused, and the scan below covers its tmux-<uid> and ssh-* children;
+    # /run and $XDG_RUNTIME_DIR hold nothing anyone means to hand over.
+    for runtime in /tmp /run /var/run ${XDG_RUNTIME_DIR:+"$XDG_RUNTIME_DIR"}; do
+        [[ -d "$runtime" ]] || continue
+        runtime="$(cd "$runtime" && pwd -P)"
+        if [[ "$real" == "$runtime" || ( "$runtime" != /tmp && "$real" == "$runtime"/* ) ]]; then
+            echo "that is $runtime, where host processes keep their sockets."
+            return 0
+        elif [[ "$runtime" == "$real"/* ]]; then
+            echo "$runtime, where host processes keep their sockets, is inside it."
+            return 0
+        fi
+    done
+    reason="$(_sc_windows_profile_reason "$real")"
+    if [[ -n "$reason" ]]; then
+        echo "$reason"
+        return 0
+    fi
+    # Three levels reaches /tmp/tmux-<uid>/default and /tmp/ssh-*/agent.* from
+    # anything holding them, without walking a whole checkout on every launch.
+    hit="$(find "$real" -maxdepth 3 \( -type s -o -type p \) -print -quit 2>/dev/null || true)"
+    if [[ -n "$hit" ]]; then
+        echo "it holds a socket or FIFO ($hit), which read-only does not stop the agent using."
     fi
 }
 
@@ -211,41 +287,15 @@ sc_marketplaces() {
         return 0
     fi
 
-    local real real_home secrets reason
+    local real reason
     real="$(cd "$dir" && pwd -P)"        # canonical, symlinks resolved
-    real_home="$(cd "$HOME" 2>/dev/null && pwd -P || echo "$HOME")"
-    secrets="$(sc_config_home)/secrets"
-    [[ -d "$secrets" ]] && secrets="$(cd "$secrets" && pwd -P)"
-
-    _sc_deny_marketplaces() {
+    reason="$(_sc_ro_mount_reason "$real")"
+    if [[ -n "$reason" ]]; then
         echo "REFUSING to mount marketplaces: $real" >&2
-        echo "  $1" >&2
+        echo "  $reason" >&2
         echo "  Point SANDBOX_MARKETPLACES_DIR at a directory that holds ONLY" >&2
         echo "  marketplace checkouts (default: $(sc_config_home)/marketplaces)." >&2
         exit 1
-    }
-
-    # Read-only keeps the agent from WRITING what it reads; it does nothing about
-    # what it can read. So the same over-broad paths sc_guard_workspace refuses
-    # are refused here too, for the narrower reason that they would hand the agent
-    # the contents of a home directory.
-    if [[ "$real" == "/" ]]; then
-        _sc_deny_marketplaces "that is the filesystem root."
-    elif [[ "$real" == "$real_home" ]]; then
-        _sc_deny_marketplaces "that is your home directory."
-    elif [[ "$real_home" == "$real"/* ]]; then
-        _sc_deny_marketplaces "your home directory ($real_home) is inside it."
-    fi
-    reason="$(_sc_windows_profile_reason "$real")"
-    [[ -z "$reason" ]] || _sc_deny_marketplaces "$reason"
-
-    # A footgun this layout creates rather than one it inherits: the MCP client
-    # credentials live next door, under the same config home, so the obvious
-    # near-miss (SANDBOX_MARKETPLACES_DIR=~/.config/dockade) would mount the
-    # secrets tree into the sandbox. Read-only, which is no comfort at all for a
-    # credential — readable IS the compromise.
-    if [[ "$secrets" == "$real" || "$secrets" == "$real"/* ]]; then
-        _sc_deny_marketplaces "the MCP secrets directory ($secrets) is inside it."
     fi
 
     # Count what is actually there, so the launch line distinguishes "mounted, 3
@@ -273,6 +323,85 @@ sc_marketplaces() {
         echo "NOTE: $real holds no .claude-plugin/marketplace.json — mounting it" >&2
         echo "      anyway, but no marketplace will be registered." >&2
     fi
+}
+
+# ---------------------------------------------------------------------------
+# Reference mounts  ->  sets SC_REFS_ARGS (array), SC_REFS_DESC
+# ---------------------------------------------------------------------------
+# SANDBOX_REFS is a comma-separated list of host directories to mount READ-ONLY
+# at /refs/<name>, as material for the agent to read: another checkout, a
+# library's source, a design archive. Every tier gets them; DESIGN.md says why.
+#
+#     SANDBOX_REFS=~/src/dockade,docs-b=/srv/b/docs
+#
+# <name> is the basename of the resolved path unless the entry says `name=path`.
+# Two entries with one name are refused rather than suffixed: a /refs/docs-2
+# would leave the agent guessing which is which. Every entry was named on
+# purpose, so anything wrong with one is fatal, as with SANDBOX_MARKETPLACES_DIR.
+#
+# A symlink inside a ref resolves in the container's namespace, so one pointing
+# at ~/.ssh dangles rather than leaks; what else inside a ref matters is
+# _sc_ro_mount_reason's to find.
+sc_refs() {
+    SC_REFS_ARGS=()
+    SC_REFS_DESC="none"
+    [[ -n "${SANDBOX_REFS:-}" ]] || return 0
+
+    local entries entry name path real reason sensitive seen=" "
+    _sc_deny_ref() {
+        echo "REFUSING to mount ref '$entry' (from SANDBOX_REFS)" >&2
+        echo "  $1" >&2
+        exit 1
+    }
+
+    # Newlines become commas: `read` stops at the first one, and a multi-line
+    # export would otherwise lose everything after it without a word.
+    IFS=',' read -ra entries <<< "${SANDBOX_REFS//$'\n'/,}"
+    for entry in "${entries[@]}"; do
+        entry="$(printf '%s' "$entry" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        [[ -n "$entry" ]] || continue
+
+        name=""
+        path="$entry"
+        if [[ "$entry" =~ ^([A-Za-z0-9._-]+)=(.*)$ ]]; then
+            name="${BASH_REMATCH[1]}"
+            path="${BASH_REMATCH[2]}"
+        fi
+        # A quoted SANDBOX_REFS reaches us with its tildes unexpanded.
+        # shellcheck disable=SC2088  # matching the literal tilde is the point
+        [[ "$path" == "~" || "$path" == "~/"* ]] && path="$HOME${path:1}"
+
+        [[ -d "$path" ]] || _sc_deny_ref "'$path' is not a directory."
+        real="$(cd "$path" && pwd -P)"
+        reason="$(_sc_ro_mount_reason "$real")"
+        [[ -z "$reason" ]] || _sc_deny_ref "$real: $reason"
+        # docker -v splits on ':', so a path holding one would mount something else.
+        [[ "$real" != *:* ]] || _sc_deny_ref "$real contains ':', which docker -v cannot mount."
+        # The workspace only warns about these, because it may hold one by the
+        # way; a ref that IS one was named on purpose, and has nothing else in it.
+        for sensitive in "${_SC_CREDENTIAL_PATHS[@]}"; do
+            if [[ "$real" == */"$sensitive" || "$real" == */"$sensitive"/* ]]; then
+                _sc_deny_ref "$real is credential material ('$sensitive')."
+            fi
+        done
+
+        [[ -n "$name" ]] || name="${real##*/}"
+        # No leading dot: that would also allow `..`, and hide the ref from both
+        # `ls /refs` and boundary-check.sh's /refs/*/ probe.
+        if [[ ! "$name" =~ ^[A-Za-z0-9_-][A-Za-z0-9._-]*$ ]]; then
+            _sc_deny_ref "'$name' is not a usable name under /refs; give one as name=path."
+        fi
+        [[ "$seen" != *" $name "* ]] || _sc_deny_ref "/refs/$name is already taken; give one as name=path."
+        seen="$seen$name "
+
+        _sc_warn_credentials "$real" "ref '$name'" "read"
+        SC_REFS_ARGS+=(-v "$real":/refs/"$name":ro)
+        if [[ "$SC_REFS_DESC" == "none" ]]; then
+            SC_REFS_DESC="$real -> /refs/$name:ro"
+        else
+            SC_REFS_DESC="$SC_REFS_DESC"$'\n'"           $real -> /refs/$name:ro"
+        fi
+    done
 }
 
 # ---------------------------------------------------------------------------

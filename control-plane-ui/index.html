@@ -254,6 +254,9 @@
      rather than dim — these are rows worth reading, and the `status` beside them
      carries which kind it was. */
   .tag.outcome { color: var(--fg); }
+  /* The agent dropping its own ask. Dim like `observe`: nobody decided anything and
+     nothing ran, so it must not read as a verdict. */
+  .tag.withdraw { color: var(--dim); }
   /* A pin that decides nothing now. Dim rather than red: it refuses nothing, it is
      standing policy that is switched off by its rule or its server. */
   .tag.inert { color: var(--dim); }
@@ -464,6 +467,7 @@
         <option value="edit">edit</option>
         <option value="observe">observe</option>
         <option value="outcome">outcome</option>
+        <option value="withdraw">withdraw</option>
       </select>
       <!-- Relative windows, not date pickers: the question is "since when". Values
            are the keys of AUDIT_WINDOWS in app.js, held equal by a test. -->

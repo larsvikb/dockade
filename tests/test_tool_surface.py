@@ -309,6 +309,12 @@ class NativeToolTests(unittest.TestCase):
         self.assertIn("RUNS the call", resume["description"])
         self.assertIn("once", resume["description"])
 
+    def test_the_withdraw_tool_takes_only_the_id(self):
+        withdraw = next(t for t in self.surface.NATIVE_TOOLS
+                        if t["name"] == self.surface.WITHDRAW_TOOL)
+        self.assertEqual(withdraw["inputSchema"]["required"], ["approval_id"])
+        self.assertEqual(list(withdraw["inputSchema"]["properties"]), ["approval_id"])
+
     def test_a_native_tool_is_not_produced_by_the_policy_join(self):
         # It is proxied from no server, so no roster and no enumeration can contribute
         # it — and no rule can withdraw it either.

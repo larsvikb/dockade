@@ -207,6 +207,10 @@ class AskTests(ExecutionTestCase):
         text = self.text(self.execute.call("mcp-github__create_pr", {}, None))
         self.assertIn("second question", text)
 
+    def test_the_pending_result_names_the_way_to_take_it_back(self):
+        text = self.text(self.execute.call("mcp-github__create_pr", {}, None))
+        self.assertIn(self.execute.surface.WITHDRAW_TOOL, text)
+
     def test_joining_an_identical_ask_is_said_out_loud(self):
         self.answer = {**self.answer, "joined": True}
         self.assertIn("joined",
@@ -412,6 +416,77 @@ class ResumeTests(ExecutionTestCase):
         self.answer = {"ok": False, "status": "allowed", "spent": True,
                        "terminal": True, "detail": "already claimed"}
         self.assertNotIn("without its call running", self.text(self.resume()))
+
+
+class WithdrawTests(ExecutionTestCase):
+    """``withdraw_tool_call``: nothing runs on any answer, and every answer says what
+    became of the id."""
+
+    def withdraw(self, arguments=None):
+        return self.execute.call(
+            self.execute.surface.WITHDRAW_TOOL,
+            {"approval_id": APPROVAL} if arguments is None else arguments,
+            "172.30.0.5")
+
+    def test_it_asks_the_withdraw_endpoint_for_the_sandboxs_own_id(self):
+        self.answer = {"ok": True, "status": "withdrawn", "spent": False,
+                       "terminal": True}
+        result = self.withdraw()
+        self.assertEqual(self.asked, [(f"/tool/asks/{APPROVAL}/withdraw",
+                                       {"client": "172.30.0.5"})])
+        self.assertEqual(self.called, [])
+        self.assertFalse(result.get("isError"))
+        self.assertIn("Withdrawn", self.text(result))
+
+    def test_an_ask_already_closed_is_not_an_error(self):
+        # Closed is what the agent wanted, whoever closed it.
+        for status in ("denied", "expired", "withdrawn"):
+            with self.subTest(status=status):
+                self.answer = {"ok": False, "detail": f"not withdrawable ({status})",
+                               "status": status, "spent": False, "terminal": True}
+                result = self.withdraw()
+                self.assertFalse(result.get("isError"))
+                self.assertIn("nothing left to withdraw", self.text(result))
+
+    def test_a_spent_approval_says_its_call_may_have_run(self):
+        self.answer = {"ok": False, "detail": "already claimed", "status": "allowed",
+                       "spent": True, "terminal": True}
+        result = self.withdraw()
+        self.assertTrue(result["isError"])
+        self.assertIn("may have run", self.text(result))
+
+    def test_an_unknown_id_is_an_error(self):
+        self.answer = {"ok": False, "detail": "unknown approval", "status": None,
+                       "spent": False, "terminal": True}
+        result = self.withdraw()
+        self.assertTrue(result["isError"])
+        self.assertIn("unknown approval", self.text(result))
+
+    def test_a_bad_id_never_reaches_the_bridge(self):
+        for bad in ({}, {"approval_id": "../../tool/roster"}, {"approval_id": 7}):
+            with self.subTest(value=bad):
+                self.asked.clear()
+                result = self.withdraw(bad)
+                self.assertEqual(self.asked, [])
+                self.assertTrue(result["isError"])
+                self.assertIn(self.execute.surface.WITHDRAW_TOOL, self.text(result))
+
+    def test_a_copied_id_with_whitespace_is_still_the_id(self):
+        self.answer = {"ok": True, "status": "withdrawn"}
+        self.withdraw({"approval_id": f" {APPROVAL}\n"})
+        self.assertEqual(self.asked[0][0], f"/tool/asks/{APPROVAL}/withdraw")
+
+    def test_no_answer_says_to_try_again(self):
+        # Repeating a withdrawal is harmless, so delivered-or-not needs no distinction.
+        for exc in (self.execute.Unanswered("reset"),
+                    self.execute.discovery.DiscoveryError("refused")):
+            with self.subTest(exc=type(exc).__name__):
+                def boom(path, payload, exc=exc):
+                    raise exc
+                self.execute._ask_control = boom
+                result = self.withdraw()
+                self.assertTrue(result["isError"])
+                self.assertIn("try again", self.text(result))
 
 
 class UpstreamReplyTests(ExecutionTestCase):

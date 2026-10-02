@@ -1478,11 +1478,12 @@ start and on change, so they may be polled — and polled is all they are: the g
 re-reconciles on an interval and a client re-lists, because the stateless transport
 has no server-to-client stream and `notifications/tools/list_changed` is deliberately
 not advertised (`tool-gateway/protocol.py`). The gateway's bridge therefore answers
-four endpoints where the proxy's answers one — decide, roster, inventory, claim — and
-the criterion that keeps that width honest is that none of them *grants*: the
-inventory push records a claim `_decide_tool` never reads, no rule is written there
-and no approval is decided there, which is why `resolve` stays off it and why the
-claim can only release what a human already approved.
+five endpoints where the proxy's answers one — decide, roster, inventory, claim,
+withdraw — and the criterion that keeps that width honest is that none of them
+*grants*: the inventory push records a claim `_decide_tool` never reads, no rule is
+written there and no approval is decided there, which is why `resolve` stays off it,
+why the claim can only release what a human already approved, and why a withdrawal
+can only retire an ask.
 
 How the control plane keeps what the gateway brings it — tool policy in a table of its
 own rather than a scope on `rules`, tool asks in their own approvals table, and one
@@ -1654,9 +1655,9 @@ Three properties make the pending answer safe rather than merely non-blocking:
   arguments cannot ride an approval given for different ones. The same hash is the
   join key: an identical retry attaches to the pending ask instead of raising a
   second card, which is what `_GROUPS` does for egress duplicates.
-- **A decided ask is terminal and says so.** `denied` and `expired` must be
-  unmistakably distinct from `pending`, and unmistakably final, or an agent retries a
-  refusal forever.
+- **A decided ask is terminal and says so.** `denied`, `expired` and `withdrawn` must
+  be unmistakably distinct from `pending`, and unmistakably final, or an agent retries
+  a refusal forever.
 
 **Retry pressure is contained by the caps, not by instructions.** The instruction to
 retry travels *in the pending result*, where it cannot be forgotten mid-session and
@@ -1712,7 +1713,7 @@ which both tiers share, so a roster would leak approvals the caller never raised
 past the leak it hands the agent a read on the operator's queue, a nudge surface kept
 away from it everywhere else here.
 
-Resume is the gateway's first tool of its own, proxied from no server; the rule the
+Resume and withdraw are the gateway's own tools, proxied from no server; the rule the
 next one must meet is in `tool-gateway/DESIGN.md` → "Gateway-native tools are a
 category".
 
@@ -2208,6 +2209,7 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | tool policy UI — pick from the inventory, write allow/ask/deny, promote | **done** — every row in `tool_rules` now has an operator surface |
 | — | curated tool list on the agent leg — MCP listener, `tools/list` | **done** |
 | — | MCP gateway — per-tool allow/deny/ask on `tools/call`, the pending ask, `resume_tool_call` | **done** |
+| — | `withdraw_tool_call` — the agent retires its own pending or unclaimed ask; the bridge's fifth endpoint | **done** |
 | — | tell the sandbox it exists — firewall grant, proxy exemption, `--mcp-config` from a wrapper | **done** |
 | — | tool audit is joinable — `server`/`tool`/`approval_id` columns, filled by every writer | **done** |
 | — | the gateway records how a call ENDED — its own JSONL stream | **done** |

@@ -75,11 +75,13 @@ the one place it would otherwise leak: a client that treats the hint as grounds 
 its own prompt would be taking a third party's word for how dangerous a call is. Nothing
 is lost, because the hint decides nothing on either side of the boundary.
 
-**Gateway-native tools are a category, and need their own rule.** Resume is proxied
-from no MCP server; it is the gateway's own, permanently `allow`, and therefore outside
-the per-tool policy governing everything else on the surface. The rule that keeps the
-category honest: **a native tool must not cause an ungoverned side effect.** Resume
-sits precisely on that line, because it does cause one — admissible only because the
-effect is bound to an id a human explicitly approved, with arguments they read. The
-next native tool will not inherit that property, which is why the criterion is written
-here rather than left to be inferred from this one being safe.
+**Gateway-native tools are a category, and need their own rule.** Resume and withdraw
+are proxied from no MCP server; they are the gateway's own, permanently `allow`, and
+therefore outside the per-tool policy governing everything else on the surface. The
+rule that keeps the category honest: **a native tool must not cause an ungoverned side
+effect.** Resume sits precisely on that line, because it does cause one — admissible
+only because the effect is bound to an id a human explicitly approved, with arguments
+they read. Withdraw meets it from the other side: its only effect is to retire an ask
+the same client raised, which removes capability and never adds any. The next native
+tool will inherit neither property, which is why the criterion is written here rather
+than left to be inferred from these two being safe.

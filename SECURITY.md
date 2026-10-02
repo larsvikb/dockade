@@ -75,7 +75,8 @@ Anything that **crosses a boundary the design claims to hold**:
   so the sandbox never does. In scope: a `tools/call` that runs without a decision
   from the control plane, a tool the curated list does not offer, an approved call
   re-run or run with arguments other than the ones the human read, a
-  `resume_tool_call` that redeems another client's ask, a route from a sandbox to
+  `resume_tool_call` that redeems another client's ask, a `withdraw_tool_call` that
+  releases anything rather than only retiring an ask, a route from a sandbox to
   the gateway's bridge (`tool-authorize-net`) or to an MCP server container on
   `mcp-net`, and any way a server credential reaches the sandbox — through a tool
   result, an error message or a tool description.

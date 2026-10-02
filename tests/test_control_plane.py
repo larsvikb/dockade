@@ -1176,6 +1176,16 @@ class ToolAskLifecycleTests(_ToolAskTestCase):
         self.assertIsNone(
             cp.holds._get_tool_ask(ask.approval_id)["claimed_at"])
 
+    def test_a_stale_grant_is_not_withdrawn_by_the_write_either(self):
+        # The same predicate in the withdrawal's UPDATE: a grant past its window is
+        # the sweep's to expire, and must not be recorded as something the agent did.
+        ask = self._ask()
+        cp.holds._resolve_tool_ask(ask.approval_id, "allowed", "operator")
+        with mock.patch.object(cp.holds, "_expire_tool_asks", return_value=0):
+            cp.holds.TOOL_GRANT_TIMEOUT = -1
+            self.assertFalse(cp.holds._withdraw_tool_ask(ask.approval_id))
+        self.assertEqual(cp.holds._get_tool_ask(ask.approval_id)["status"], "expired")
+
     def test_a_spent_approval_is_never_relabelled_expired(self):
         # The distinction a duplicate resumption depends on: `spent` says the call
         # happened, `expired` says it never will. An aged claimed row must keep saying

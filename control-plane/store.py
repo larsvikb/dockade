@@ -655,7 +655,7 @@ def _init_db() -> None:
                 -- VALUE is a different ask and cannot ride this approval.
                 args_digest TEXT NOT NULL,
                 client      TEXT,
-                status      TEXT NOT NULL,   -- pending | allowed | denied | expired
+                status      TEXT NOT NULL,   -- pending | allowed | denied | expired | withdrawn
                 -- Durable, where the egress deadline lives only in
                 -- `holds._PENDING_DEADLINE`. Nothing blocks on a tool ask, so expiry is
                 -- decided by reading this column (`holds._expire_tool_asks`), and a

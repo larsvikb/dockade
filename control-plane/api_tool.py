@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """The tool bridge — ``/tool/*``, the MCP gateway's side of the control plane.
 
-Three questions and one report: may this call run, what is configured, may I now run
-the ask a human approved, and what the gateway found on each server. All of it is on
+Three questions, one report and one retraction: may this call run, what is
+configured, may I now run the ask a human approved, what the gateway found on each
+server, and drop an ask the agent no longer wants. All of it is on
 ``tool_app``, its own socket on its own network, and none of it grants (see
 ``tool_app`` in app.py).
 
@@ -54,8 +55,13 @@ class ToolCallRequest(BaseModel):
 
 
 class ToolResumeRequest(BaseModel):
-    """Resumption: the agent has come back for an ask a human approved."""
+    """Resumption or withdrawal: the agent has come back for an ask it raised."""
     client: str | None = None
+
+
+#: Statuses no later answer can change. An approved ask closes when it is claimed,
+#: which is a column rather than a status (``spent`` in the answers below).
+_CLOSED = ("denied", "expired", "withdrawn")
 
 
 @router.post("/tool/authorize")
@@ -190,6 +196,39 @@ def tool_inventory(req: InventoryRequest, request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "changed": len(moved)})
 
 
+def _own_ask(approval_id: str, client: str | None, verb: str,
+             stage: str) -> dict | JSONResponse:
+    """The ask, if ``client`` raised it; otherwise the 404 to answer with.
+
+    Unknown and foreign get the same 404: both tiers share `sandbox-net`, so an id
+    leaked between them must not confirm it exists. The operator gets two different
+    rows, because a foreign attempt is the one sign an id leaked, and it carries the
+    ask's server and tool so it joins that approval's history."""
+    ask = holds._get_tool_ask(approval_id)
+    if ask is not None and (ask["client"] or None) == (client or None):
+        return ask
+    if ask is None:
+        store._audit("deny", stage=stage, client=client,
+                     client_class=policy._client_class(client),
+                     approval_id=approval_id,
+                     reason=f"{verb} for unknown approval {approval_id} refused")
+    else:
+        store._audit("deny", stage=stage, client=client,
+                     client_class=policy._client_class(client),
+                     server=ask["server"], tool=ask["tool"],
+                     approval_id=approval_id,
+                     reason=f"{verb} for approval {approval_id} refused: it was "
+                            f"raised by {ask['client'] or 'no client'}, not by "
+                            f"this caller — a leaked or guessed id; answered "
+                            f"as unknown")
+    # ``terminal`` here too, so the gateway branches on one field for every refusal:
+    # an id unknown to this caller does not become known by asking again.
+    return JSONResponse(
+        {"ok": False, "detail": "unknown approval", "status": None,
+         "spent": False, "terminal": True},
+        status_code=404)
+
+
 @router.post("/tool/asks/{approval_id}/claim")
 def tool_claim(approval_id: str, req: ToolResumeRequest) -> JSONResponse:
     """Take single-use ownership of an approved ask, and hand back what to run.
@@ -207,33 +246,10 @@ def tool_claim(approval_id: str, req: ToolResumeRequest) -> JSONResponse:
     or the rule revoked or flipped to `deny`, and none of those touch
     `tool_approvals`. Without this check the switch an operator reaches for would not
     reach the one surface that releases a side effect."""
-    ask = holds._get_tool_ask(approval_id)
-    if ask is None or (ask["client"] or None) != (req.client or None):
-        # Unknown and foreign get the same 404: both tiers share `sandbox-net`, so an
-        # id leaked between them must not confirm it exists. The operator gets two
-        # different rows, because a foreign claim is the one sign an id leaked, and
-        # it carries the ask's server and tool so it joins that approval's history. A
-        # PENDING claim writes nothing; it is refused further down, and agents poll it.
-        if ask is None:
-            store._audit("deny", stage="tool-resume", client=req.client,
-                         client_class=policy._client_class(req.client),
-                         approval_id=approval_id,
-                         reason=f"claim for unknown approval {approval_id} refused")
-        else:
-            store._audit("deny", stage="tool-resume", client=req.client,
-                         client_class=policy._client_class(req.client),
-                         server=ask["server"], tool=ask["tool"],
-                         approval_id=approval_id,
-                         reason=f"claim for approval {approval_id} refused: it was "
-                                f"raised by {ask['client'] or 'no client'}, not by "
-                                f"this caller — a leaked or guessed id; answered "
-                                f"as unknown")
-        # ``terminal`` here too, so the gateway branches on one field for every
-        # refusal: an id unknown to this caller does not become known by asking again.
-        return JSONResponse(
-            {"ok": False, "detail": "unknown approval", "status": None,
-             "spent": False, "terminal": True},
-            status_code=404)
+    # A PENDING claim writes nothing; it is refused further down, and agents poll it.
+    ask = _own_ask(approval_id, req.client, "claim", "tool-resume")
+    if isinstance(ask, JSONResponse):
+        return ask
     # The check above holds ``ask["client"]`` equal to ``req.client``; the stored one
     # is what the card was raised under.
     client_class = policy._client_class(ask["client"])
@@ -262,8 +278,8 @@ def tool_claim(approval_id: str, req: ToolResumeRequest) -> JSONResponse:
     claimed = holds._claim_tool_ask(approval_id)
     if claimed is None:
         current = holds._get_tool_ask(approval_id) or ask
-        # `pending` means come back later; `denied` and `expired` must read as
-        # terminal, or an agent retries them forever. An approval already claimed is
+        # `pending` means come back later; every `_CLOSED` status must read as
+        # terminal, or an agent retries it forever. An approval already claimed is
         # SPENT, which is not "its call has run": the claim is written before the call,
         # and a claim whose answer was lost spent the grant with nothing run.
         spent = current["status"] == "allowed" and current["claimed_at"] is not None
@@ -274,7 +290,7 @@ def tool_claim(approval_id: str, req: ToolResumeRequest) -> JSONResponse:
                         if spent else
                         f"not claimable ({current['status']})"),
              "status": current["status"], "spent": spent,
-             "terminal": spent or current["status"] in ("denied", "expired")},
+             "terminal": spent or current["status"] in _CLOSED},
             status_code=409)
 
     # An ALLOW here, when capability is released, as well as the resolve row when a
@@ -294,3 +310,39 @@ def tool_claim(approval_id: str, req: ToolResumeRequest) -> JSONResponse:
                          # payload that differs from the approved one.
                          "args_json": claimed["args_json"],
                          "claimed_at": claimed["claimed_at"]})
+
+
+@router.post("/tool/asks/{approval_id}/withdraw")
+def tool_withdraw(approval_id: str, req: ToolResumeRequest) -> JSONResponse:
+    """Drop an ask the agent no longer wants, so it stops costing a human attention.
+
+    The one write on this bridge an AGENT asks for, and it keeps the bridge's criterion
+    that none of it grants: a withdrawal only removes a question or an unclaimed grant
+    (``holds._withdraw_tool_ask``). Scoped to one id and the client that raised it, as
+    the claim is. A compromised gateway calling it can only drop asks, which it can
+    already do by never resuming them.
+
+    An ask already closed is a no-op that names its status. A spent one says so,
+    because "its call may have run" is the answer an agent must not read as dropped."""
+    ask = _own_ask(approval_id, req.client, "withdrawal", "tool-withdraw")
+    if isinstance(ask, JSONResponse):
+        return ask
+    if not holds._withdraw_tool_ask(approval_id):
+        current = holds._get_tool_ask(approval_id) or ask
+        spent = current["status"] == "allowed" and current["claimed_at"] is not None
+        return JSONResponse(
+            {"ok": False,
+             "detail": ("this approval was already claimed, so its call may have run"
+                        if spent else f"not withdrawable ({current['status']})"),
+             "status": current["status"], "spent": spent, "terminal": True},
+            status_code=409)
+    # Its own word rather than `revoke`, which takes back a standing rule: this is the
+    # agent taking back its own question.
+    store._audit("withdraw", stage="tool-withdraw", client=ask["client"],
+                 client_class=policy._client_class(ask["client"]),
+                 server=ask["server"], tool=ask["tool"], approval_id=approval_id,
+                 reason=f"tool ask {approval_id} withdrawn by the agent while "
+                        f"{ask['status']}; {ask['tool']} on {ask['server']} will not "
+                        f"run under it")
+    return JSONResponse({"ok": True, "status": "withdrawn", "spent": False,
+                         "terminal": True})

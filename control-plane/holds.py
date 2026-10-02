@@ -722,6 +722,32 @@ def _claim_tool_ask(approval_id: str) -> dict | None:
     return _get_tool_ask(approval_id) if changed else None
 
 
+def _withdraw_tool_ask(approval_id: str) -> bool:
+    """Retire an ask its own agent no longer wants. True if this call retired it.
+
+    Only ever REDUCES: a pending ask stops waiting on a human, and an approved one
+    nobody has claimed becomes unclaimable. Withdrawing the second is allowed because
+    an agent declining capability it was granted is strictly safe, and the alternative
+    is a grant that sits redeemable until ``TOOL_GRANT_TIMEOUT``.
+
+    The grant predicate is ``_claim_tool_ask``'s, inside the UPDATE for the same
+    reason, so a withdrawal and a claim racing for one approval cannot both land. The
+    human's ``resolved_at`` and ``resolved_by`` are kept on an approved row: they record
+    what was decided, and the audit row records that it was dropped."""
+    _expire_tool_asks()
+    now = time.time()
+    with store._connect() as conn:
+        changed = conn.execute(
+            "UPDATE tool_approvals SET status='withdrawn', "
+            "resolved_at=COALESCE(resolved_at, ?) "
+            "WHERE id=? AND (status='pending' "
+            "OR (status='allowed' AND claimed_at IS NULL "
+            "AND resolved_at IS NOT NULL AND resolved_at > ?))",
+            (now, approval_id, now - TOOL_GRANT_TIMEOUT)).rowcount
+        conn.commit()
+    return bool(changed)
+
+
 def _list_tool_asks() -> list[dict]:
     """Pending asks, oldest first — the tool half of the operator's queue.
 

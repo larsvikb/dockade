@@ -66,6 +66,7 @@ _APPROVAL_RE = re.compile(r"^[0-9a-f]{32}$")
 _TERMINAL_TEXT = {
     "denied": "A human refused this request",
     "expired": "This request expired before anyone answered it",
+    "withdrawn": "This request was withdrawn",
 }
 
 #: How long a tool call may take. Its own number, an order of magnitude above
@@ -319,10 +320,12 @@ def call(name: str, arguments: object, client: str | None) -> dict:
     rule exists — which tells the agent a little about policy shape. Worth it: a
     refusal an agent cannot understand is one it retries, and everything named is
     already discoverable by reading the tool list it was served."""
+    # Routed before the split, because a native tool has no server to decide against.
+    # See NATIVE_TOOLS for why the category needs its own rule.
     if name == surface.RESUME_TOOL:
-        # Routed before the split, because a native tool has no server to decide
-        # against. See NATIVE_TOOLS for why the category needs its own rule.
         return resume(arguments, client)
+    if name == surface.WITHDRAW_TOOL:
+        return withdraw(arguments, client)
     pair = surface.split_exposed(name)
     if pair is None:
         return text_result(
@@ -358,14 +361,42 @@ def call(name: str, arguments: object, client: str | None) -> dict:
             f"approval_id: {approval_id}\n"
             f"Call {surface.RESUME_TOOL} with that id to finish this call. It is "
             f"waiting on a person, so do other work and come back rather than "
-            f"retrying immediately; retrying this tool instead opens a second "
-            f"question for the same human."
+            f"retrying immediately; calling this tool again cannot finish it, and "
+            f"with any change in the arguments it opens a second question for the "
+            f"same human. If you no longer want the call, {surface.WITHDRAW_TOOL} "
+            f"with the same id takes the question back."
             + ("\nAn identical request was already waiting, and this joined it."
                if answer.get("joined") else ""))
     # Every other answer is a deny, INCLUDING one this code does not recognise. The
     # control plane already refuses that way; repeating it here means a bridge that
     # answered something new could not turn into a grant on the way through.
     return text_result(f"Denied: {why}. This will not succeed on retry.", is_error=True)
+
+
+def _approval_id(arguments: object) -> str | None:
+    """The id an agent passed to a native tool, or None if it is missing or malformed.
+
+    STRIPPED before it is checked, and that is safe in a way a looser cleanup would not
+    be: the id is bounded hex, so removing surrounding whitespace cannot turn one valid
+    id into another and cannot make an invalid one valid. It is worth doing because the
+    failure it prevents is a real one — an id copied out of a pending result arrives
+    with a stray newline or trailing space often enough, and the cost is an approval a
+    human granted that can no longer be redeemed."""
+    approval_id = arguments.get("approval_id") if isinstance(arguments, dict) else None
+    if isinstance(approval_id, str):
+        approval_id = approval_id.strip()
+    if not isinstance(approval_id, str) or not _APPROVAL_RE.match(approval_id):
+        return None
+    return approval_id
+
+
+def _bad_id(tool: str) -> dict:
+    """One message for "missing" and for "malformed", because the agent's next move is
+    the same either way and neither tells it anything about whether some other id
+    exists."""
+    return text_result(
+        f"{tool} needs the approval_id from a pending result, copied verbatim.",
+        is_error=True)
 
 
 def _resume_wait(arguments: object) -> float:
@@ -441,22 +472,9 @@ def resume(arguments: object, client: str | None) -> dict:
     the two happens is the AGENT'S call and deliberately not this module's: only the
     agent knows whether it has other work to do while a human decides. Zero is the
     default and is exactly today's behaviour."""
-    approval_id = arguments.get("approval_id") if isinstance(arguments, dict) else None
-    # STRIPPED before it is checked, and that is safe in a way a looser cleanup would
-    # not be: the id is bounded hex, so removing surrounding whitespace cannot turn one
-    # valid id into another and cannot make an invalid one valid. It is worth doing
-    # because the failure it prevents is a real one — an id copied out of a pending
-    # result arrives with a stray newline or trailing space often enough, and the cost
-    # is an approval a human granted that can no longer be redeemed.
-    if isinstance(approval_id, str):
-        approval_id = approval_id.strip()
-    if not isinstance(approval_id, str) or not _APPROVAL_RE.match(approval_id):
-        # One message for "missing" and for "malformed", because the agent's next move
-        # is the same either way and neither tells it anything about whether some other
-        # id exists.
-        return text_result(
-            "resume_tool_call needs the approval_id from a pending result, copied "
-            "verbatim.", is_error=True)
+    approval_id = _approval_id(arguments)
+    if approval_id is None:
+        return _bad_id(surface.RESUME_TOOL)
 
     wait = _resume_wait(arguments)
     deadline = time.monotonic() + wait
@@ -507,9 +525,12 @@ def resume(arguments: object, client: str | None) -> dict:
         return text_result(
             f"Still waiting on a human for {approval_id}. Nothing has run.{waited} "
             f"Come back with the same id later — do not call the tool again, which "
-            f"would raise a second question for the same person. Pass "
+            f"cannot finish this one and, with any change in the arguments, raises a "
+            f"second question for the same person. Pass "
             f"wait_seconds to have this call block until the answer arrives, up to "
-            f"{MAX_RESUME_WAIT:g}s, if you have nothing else to do meanwhile.")
+            f"{MAX_RESUME_WAIT:g}s, if you have nothing else to do meanwhile. If you "
+            f"no longer want the call, {surface.WITHDRAW_TOOL} takes the question "
+            f"back.")
 
     # Claimed. From here the call is authorised and the arguments are the approved
     # ones, parsed from the canonical form the digest covers and the human was shown.
@@ -536,3 +557,40 @@ def resume(arguments: object, client: str | None) -> dict:
     # row to the hold, the click and the release the control plane already recorded.
     return _run(answer["server"], answer["tool"], approved_args,
                 client=client, approval_id=approval_id)
+
+
+def withdraw(arguments: object, client: str | None) -> dict:
+    """Take back an ask the agent no longer wants: ``withdraw_tool_call``.
+
+    Nothing runs here and no outcome is recorded, because no grant is spent: the
+    control plane retires the ask or answers that it was already closed. Repeating a
+    withdrawal is harmless, which is why every failure to get an answer, delivered or
+    not, says the same thing — try again."""
+    approval_id = _approval_id(arguments)
+    if approval_id is None:
+        return _bad_id(surface.WITHDRAW_TOOL)
+    try:
+        answer = _ask_control(f"/tool/asks/{approval_id}/withdraw", {"client": client})
+    except discovery.DiscoveryError as exc:
+        return text_result(
+            f"could not get an answer from governance to withdraw {approval_id} "
+            f"({exc}). Nothing ran; try again — withdrawing twice is harmless.",
+            is_error=True)
+    if answer.get("ok"):
+        return text_result(
+            f"Withdrawn: {approval_id}. The human is no longer asked, and nothing will "
+            f"run under this id.")
+    status = answer.get("status")
+    if answer.get("spent"):
+        # The one answer that is not "it is gone": the claim is written before the call,
+        # so the agent must find out from the result of that resume whether it ran.
+        return text_result(
+            f"{approval_id} was already resumed, so its call may have run; withdrawing "
+            f"it changed nothing.", is_error=True)
+    if status in _TERMINAL_TEXT:
+        # Closed already, which is what the agent wanted: not an error.
+        return text_result(
+            f"{_TERMINAL_TEXT[status]}, so there was nothing left to withdraw. "
+            f"Nothing will run under {approval_id}.")
+    return text_result(
+        f"{answer.get('detail') or 'not withdrawable'}: {approval_id}.", is_error=True)

@@ -3608,6 +3608,11 @@ def _claim(approval_id, client=CLASS_IP):
                                   cp.api_tool.ToolResumeRequest(client=client))
 
 
+def _withdraw(approval_id, client=CLASS_IP):
+    return cp.api_tool.tool_withdraw(approval_id,
+                                     cp.api_tool.ToolResumeRequest(client=client))
+
+
 class _ToolBridgeTestCase(_CPTestCase):
     """A registered, enabled server, which is the state every question on this bridge
     is asked in. The two server-state refusals get their own tests."""
@@ -4554,6 +4559,143 @@ class ToolClaimTests(_ToolBridgeTestCase):
             _claim(ask)
         self.assertEqual(audited.call_args[1]["client_class"],
                          cp.policy._client_class(CLASS_IP))
+
+
+class ToolWithdrawTests(_ToolBridgeTestCase):
+    """``POST /tool/asks/{id}/withdraw`` — the agent taking back its own ask.
+
+    The property that makes it admissible on this bridge is that it only ever REDUCES:
+    it retires a question or an unclaimed grant, and nothing it can be asked releases
+    a call."""
+
+    def _ask(self, args=None, client=CLASS_IP):
+        _tool_rule("create_pull_request", "ask")
+        return _tool_call(tool="create_pull_request",
+                          args={"title": "x"} if args is None else args,
+                          client=client)["approval_id"]
+
+    def test_a_pending_ask_leaves_the_operators_queue(self):
+        ask = self._ask()
+        resp = _withdraw(ask)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.body["status"], "withdrawn")
+        self.assertEqual(cp.holds._get_tool_ask(ask)["status"], "withdrawn")
+        self.assertNotIn(ask, [a["id"] for a in cp.holds._list_tool_asks()])
+
+    def test_a_withdrawn_ask_can_no_longer_be_approved_or_claimed(self):
+        ask = self._ask()
+        _withdraw(ask)
+        self.assertIsNone(cp.holds._resolve_tool_ask(ask, "allowed", "test"))
+        resp = _claim(ask)
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.body["status"], "withdrawn")
+        self.assertTrue(resp.body["terminal"])
+
+    def test_an_approved_ask_nobody_claimed_can_be_withdrawn(self):
+        # Declining a grant is strictly safe, and otherwise it stays redeemable until
+        # TOOL_GRANT_TIMEOUT.
+        ask = self._ask()
+        _resolve(ask, "allow")
+        decided = cp.holds._get_tool_ask(ask)["resolved_at"]
+        self.assertEqual(_withdraw(ask).status_code, 200)
+        self.assertEqual(_claim(ask).status_code, 409)
+        # The human's decision time stays: it records what was decided, and the audit
+        # row records that it was dropped.
+        self.assertEqual(cp.holds._get_tool_ask(ask)["resolved_at"], decided)
+
+    def test_a_spent_approval_is_left_alone_and_says_so(self):
+        # "Its call may have run" must not read as "dropped".
+        ask = self._ask()
+        _resolve(ask, "allow")
+        _claim(ask)
+        resp = _withdraw(ask)
+        self.assertEqual(resp.status_code, 409)
+        self.assertTrue(resp.body["spent"])
+        self.assertTrue(resp.body["terminal"])
+        self.assertEqual(cp.holds._get_tool_ask(ask)["status"], "allowed")
+
+    def test_a_closed_ask_is_a_terminal_no_op_naming_its_status(self):
+        denied = self._ask(args={"n": 1})
+        _resolve(denied, "deny")
+        twice = self._ask(args={"n": 2})
+        _withdraw(twice)
+        for ask, status in ((denied, "denied"), (twice, "withdrawn")):
+            with self.subTest(status=status):
+                resp = _withdraw(ask)
+                self.assertEqual(resp.status_code, 409)
+                self.assertEqual(resp.body["status"], status)
+                self.assertTrue(resp.body["terminal"])
+                self.assertFalse(resp.body["spent"])
+
+    def test_a_stale_grant_reads_as_expired_not_withdrawn(self):
+        # The grant window is in the UPDATE, as it is in the claim: a grant past it is
+        # expired, and must not be rewritten as something the agent did.
+        ask = self._ask()
+        _resolve(ask, "allow")
+        with mock.patch.object(cp.holds, "TOOL_GRANT_TIMEOUT", -1):
+            resp = _withdraw(ask)
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.body["status"], "expired")
+
+    def test_another_sandboxs_id_is_unknown_and_its_ask_survives(self):
+        ask = self._ask()
+        foreign = _withdraw(ask, client="172.30.0.9")
+        unknown = _withdraw("f" * 32, client="172.30.0.9")
+        self.assertEqual(foreign.status_code, 404)
+        self.assertEqual((foreign.status_code, foreign.body),
+                         (unknown.status_code, unknown.body))
+        self.assertEqual(cp.holds._get_tool_ask(ask)["status"], "pending")
+
+    def test_withdrawing_frees_the_per_client_slot(self):
+        # The caps count pending rows, so the slot comes back with the status change.
+        with mock.patch.object(cp.holds, "MAX_TOOL_PENDING_PER_CLIENT", 1):
+            first = self._ask(args={"n": 1})
+            self.assertEqual(
+                _tool_call(tool="create_pull_request", args={"n": 2})["decision"],
+                "deny")
+            _withdraw(first)
+            self.assertEqual(
+                _tool_call(tool="create_pull_request", args={"n": 2})["decision"],
+                "ask")
+
+
+class WithdrawAuditTests(_ToolBridgeTestCase):
+    """What a withdrawal leaves in the trail, asserted through the table."""
+
+    audits = True
+
+    def _ask(self):
+        _tool_rule("create_pull_request", "ask")
+        return _tool_call(tool="create_pull_request", args={"title": "x"})["approval_id"]
+
+    def _rows(self, approval_id):
+        with cp.store._connect() as conn:
+            return conn.execute(
+                "SELECT kind, stage, client, server, tool, reason FROM audit "
+                "WHERE stage='tool-withdraw' AND approval_id=?",
+                (approval_id,)).fetchall()
+
+    def test_a_withdrawal_is_one_row_against_the_ask(self):
+        ask = self._ask()
+        _withdraw(ask)
+        [(kind, stage, client, server, tool, reason)] = self._rows(ask)
+        self.assertEqual((kind, stage, client), ("withdraw", "tool-withdraw", CLASS_IP))
+        self.assertEqual((server, tool), ("mcp-github", "create_pull_request"))
+        self.assertIn("pending", reason)
+
+    def test_a_foreign_withdrawal_is_audited_as_a_leaked_id(self):
+        ask = self._ask()
+        _withdraw(ask, client="172.30.0.9")
+        [(kind, _stage, client, _server, _tool, reason)] = self._rows(ask)
+        self.assertEqual((kind, client), ("deny", "172.30.0.9"))
+        self.assertIn(CLASS_IP, reason)
+
+    def test_a_no_op_withdrawal_writes_nothing(self):
+        # Repeating a withdrawal is harmless, and should not look like a second one.
+        ask = self._ask()
+        _withdraw(ask)
+        _withdraw(ask)
+        self.assertEqual(len(self._rows(ask)), 1)
 
 
 class RefusedClaimAuditTests(_ToolBridgeTestCase):
@@ -5979,22 +6121,24 @@ class ApiSurfaceSplitTests(unittest.TestCase):
     AUTHORIZE_ROUTES: ClassVar[set] = {("POST", "/authorize"),
                                        ("GET", "/healthz")}
     #: Everything the gateway-facing listener may serve: decide a call, read the
-    #: roster, claim an ask a human approved, report what the servers expose. Four
-    #: rather than one, and the criterion that keeps that width honest is unchanged —
-    #: none of them GRANTS. The claim releases only what was already decided elsewhere,
-    #: and the inventory is the only WRITE here: it records a server's claim about
-    #: itself, in memory, that `_decide_tool` never reads. A tool that arrives on it is
-    #: denied exactly as it was before, until a human writes a rule naming it.
+    #: roster, claim an ask a human approved, withdraw one the agent no longer wants,
+    #: report what the servers expose. Five rather than one, and the criterion that
+    #: keeps that width honest is unchanged — none of them GRANTS. The claim releases
+    #: only what was already decided elsewhere, a withdrawal only retires an ask, and
+    #: the inventory records a server's claim about itself, in memory, that
+    #: `_decide_tool` never reads. A tool that arrives on it is denied exactly as it
+    #: was before, until a human writes a rule naming it.
     TOOL_ROUTES: ClassVar[set] = {("POST", "/tool/authorize"),
                                   ("GET", "/tool/roster"),
                                   ("POST", "/tool/asks/{approval_id}/claim"),
+                                  ("POST", "/tool/asks/{approval_id}/withdraw"),
                                   ("POST", "/tool/inventory"),
                                   ("GET", "/healthz")}
 
     def test_the_authorize_listener_serves_exactly_two_routes(self):
         self.assertEqual(_routes(cp.authorize_app), self.AUTHORIZE_ROUTES)
 
-    def test_the_tool_listener_serves_exactly_its_four_routes(self):
+    def test_the_tool_listener_serves_exactly_its_five_routes(self):
         self.assertEqual(_routes(cp.tool_app), self.TOOL_ROUTES)
 
     def test_the_two_enforcer_bridges_share_nothing_but_healthz(self):

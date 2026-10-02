@@ -39,11 +39,12 @@ from __future__ import annotations
 # constant with the call sites — ``store._audit`` takes ``kind`` as a plain string from
 # many places, and a new word appearing there without appearing here would make its
 # rows unfilterable while every other test passed.
-# "observe" and "outcome" are the two that are NOT decisions, and both are here
-# deliberately. `observe` records something a server claimed about itself — its tool
-# surface changed. `outcome` records how a tool call ended, which only the gateway can
-# know (`ingest.py`). Neither was decided by this process and neither decides anything
-# in return. They share the column because they share the question an operator asks of
+# "observe", "outcome" and "withdraw" are the three that are NOT decisions, and all
+# three are here deliberately. `observe` records something a server claimed about
+# itself — its tool surface changed. `outcome` records how a tool call ended, which
+# only the gateway can know (`ingest.py`). `withdraw` records an agent taking back its
+# own tool ask, which grants nothing. None was decided by this process and none decides
+# anything in return. They share the column because they share the question an operator asks of
 # this log ("what happened, and when"), and they are filterable for the same reason the
 # others are: a row nobody can select for is a row nobody reads.
 #
@@ -52,7 +53,7 @@ from __future__ import annotations
 # starts exposing a destructive tool reads as the alarm it is. Outcome rows are one per
 # tool call. Folding them together would bury the rare signal under the common one.
 KINDS = ("allow", "deny", "hold", "revoke", "create", "edit", "observe",
-         "outcome")
+         "outcome", "withdraw")
 
 # Columns ``q`` searches, PER VIEW, and the rule is that a view searches exactly what
 # it DISPLAYS. Anything else produces the worst kind of result list: rows whose visible

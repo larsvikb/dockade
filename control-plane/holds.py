@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import threading
 import time
@@ -385,6 +386,10 @@ TOOL_GRANT_TIMEOUT = float(os.environ.get("CONTROL_TOOL_GRANT_TIMEOUT", "900"))
 MAX_TOOL_PENDING = int(os.environ.get("CONTROL_MAX_TOOL_PENDING", "12"))
 MAX_TOOL_PENDING_PER_CLIENT = int(
     os.environ.get("CONTROL_MAX_TOOL_PENDING_PER_CLIENT", "4"))
+# How long an ask the agent withdrew while pending still counts against its client's
+# cap (DESIGN.md, "Retry pressure is contained by the caps"). 0 turns it off, and it
+# does nothing while the per-client cap is off.
+TOOL_WITHDRAW_COOLDOWN = float(os.environ.get("CONTROL_TOOL_WITHDRAW_COOLDOWN", "60"))
 # Ceiling on a payload this will store. REFUSED over it, not truncated as
 # ``store.DRAIN_MAX_FIELD`` truncates a URL: a truncated payload is shown to a human
 # as the thing they are approving, and the hidden tail is where anything worth hiding
@@ -541,10 +546,28 @@ def _register_tool_ask(server: str, tool: str, args: object,
 
         if len(pending) >= MAX_TOOL_PENDING:
             return _refuse_tool("global tool asks")
-        if (client is not None and MAX_TOOL_PENDING_PER_CLIENT > 0
-                and sum(1 for r in pending if r["client"] == client)
-                >= MAX_TOOL_PENDING_PER_CLIENT):
-            return _refuse_tool(f"client {client} tool asks")
+        if client is not None and MAX_TOOL_PENDING_PER_CLIENT > 0:
+            # Withdrawn WHILE PENDING only (``resolved_by`` NULL): an approved ask
+            # withdrawn later already cost a human decision, which paces it.
+            # ``resolved_at`` on such a row is the moment of the withdrawal.
+            cooling = []
+            if TOOL_WITHDRAW_COOLDOWN > 0:
+                cooling = [r["resolved_at"] for r in conn.execute(
+                    "SELECT resolved_at FROM tool_approvals WHERE client=? "
+                    "AND status='withdrawn' AND resolved_by IS NULL "
+                    "AND resolved_at > ? ORDER BY resolved_at",
+                    (client, now - TOOL_WITHDRAW_COOLDOWN))]
+            if (sum(1 for r in pending if r["client"] == client) + len(cooling)
+                    >= MAX_TOOL_PENDING_PER_CLIENT):
+                detail = ""
+                if cooling:
+                    # Not finite when the cooldown is set to inf: then it never does.
+                    frees = cooling[0] + TOOL_WITHDRAW_COOLDOWN - now
+                    detail = (f"; {len(cooling)} of them withdrawn in the last "
+                              f"{TOOL_WITHDRAW_COOLDOWN:g}s, and the oldest stops "
+                              + (f"counting in {math.ceil(frees)}s"
+                                 if math.isfinite(frees) else "counting never"))
+                return _refuse_tool(f"client {client} tool asks", detail)
 
         approval_id = uuid.uuid4().hex
         deadline = now + TOOL_HOLD_TIMEOUT
@@ -557,18 +580,19 @@ def _register_tool_ask(server: str, tool: str, args: object,
         return ToolAsk(approval_id, False, None, deadline)
 
 
-def _refuse_tool(scope: str) -> ToolAsk:
+def _refuse_tool(scope: str, detail: str = "") -> ToolAsk:
     """Record an over-cap tool ask in the ONE saturation account and refuse it.
     Caller holds ``_LOCK``.
 
     One account for both surfaces, so an operator reads one banner. ``last_host`` is
     left alone: the banner's subject field is host-shaped, and the scope string says
-    what this was."""
+    what this was. ``detail`` reaches the refusal only, since it may be relative to
+    now and the account outlives the moment."""
     _SATURATION["count"] = int(_SATURATION["count"]) + 1  # type: ignore[arg-type]
     _SATURATION["last_ts"] = time.time()
     _SATURATION["last_scope"] = scope
     return ToolAsk(None, False,
-                   f"tool ask capacity exceeded ({scope}) — fail-closed", 0.0)
+                   f"tool ask capacity exceeded ({scope}{detail}) — fail-closed", 0.0)
 
 
 def _get_tool_ask(approval_id: str) -> dict | None:

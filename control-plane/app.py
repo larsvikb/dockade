@@ -262,7 +262,8 @@ def _bootstrap() -> None:
     # The tool surface's bounds on their own line: cards only, since nothing blocks on
     # an ask.
     print(f"control-plane: tool asks — cards {holds.MAX_TOOL_PENDING} global / "
-          f"{holds.MAX_TOOL_PENDING_PER_CLIENT} per client, ask window "
+          f"{holds.MAX_TOOL_PENDING_PER_CLIENT} per client (an ask withdrawn while "
+          f"pending counts for {holds.TOOL_WITHDRAW_COOLDOWN:g}s more), ask window "
           f"{holds.TOOL_HOLD_TIMEOUT:g}s, grant window "
           f"{holds.TOOL_GRANT_TIMEOUT:g}s, payload ceiling {holds.TOOL_ARGS_MAX}B",
           flush=True)

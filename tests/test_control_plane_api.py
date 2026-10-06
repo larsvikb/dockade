@@ -4646,14 +4646,20 @@ class ToolWithdrawTests(_ToolBridgeTestCase):
                          (unknown.status_code, unknown.body))
         self.assertEqual(cp.holds._get_tool_ask(ask)["status"], "pending")
 
-    def test_withdrawing_frees_the_per_client_slot(self):
-        # The caps count pending rows, so the slot comes back with the status change.
-        with mock.patch.object(cp.holds, "MAX_TOOL_PENDING_PER_CLIENT", 1):
+    def test_withdrawing_frees_the_per_client_slot_after_the_cooldown(self):
+        # Not at once: an ask-withdraw loop would otherwise raise cards without limit
+        # (``holds.TOOL_WITHDRAW_COOLDOWN``).
+        with mock.patch.object(cp.holds, "MAX_TOOL_PENDING_PER_CLIENT", 1), \
+                mock.patch.object(cp.holds, "TOOL_WITHDRAW_COOLDOWN", 60):
             first = self._ask(args={"n": 1})
-            self.assertEqual(
-                _tool_call(tool="create_pull_request", args={"n": 2})["decision"],
-                "deny")
             _withdraw(first)
+            refused = _tool_call(tool="create_pull_request", args={"n": 2})
+            self.assertEqual(refused["decision"], "deny")
+            self.assertIn("withdrawn in the last 60s", refused["reason"])
+            with cp.store._connect() as conn:
+                conn.execute("UPDATE tool_approvals SET resolved_at=? WHERE id=?",
+                             (time.time() - 61, first))
+                conn.commit()
             self.assertEqual(
                 _tool_call(tool="create_pull_request", args={"n": 2})["decision"],
                 "ask")

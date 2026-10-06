@@ -830,7 +830,7 @@ class _ToolAskTestCase(unittest.TestCase):
 
     CAPS: ClassVar[tuple] = ("MAX_TOOL_PENDING", "MAX_TOOL_PENDING_PER_CLIENT",
                              "TOOL_HOLD_TIMEOUT", "TOOL_GRANT_TIMEOUT",
-                             "TOOL_ARGS_MAX")
+                             "TOOL_WITHDRAW_COOLDOWN", "TOOL_ARGS_MAX")
 
     def setUp(self):
         cp.store._init_db()
@@ -990,6 +990,91 @@ class ToolAskCapTests(_ToolAskTestCase):
         joined = self._ask(1)
         self.assertTrue(joined.joined)
         self.assertEqual(joined.approval_id, first.approval_id)
+
+    def _withdraw_ago(self, ask, seconds):
+        """Withdraw ``ask`` as if it had happened ``seconds`` ago."""
+        self.assertTrue(cp.holds._withdraw_tool_ask(ask.approval_id))
+        with cp.store._connect() as conn:
+            conn.execute("UPDATE tool_approvals SET resolved_at=? WHERE id=?",
+                         (time.time() - seconds, ask.approval_id))
+            conn.commit()
+
+    def test_a_withdrawn_ask_keeps_its_slot_through_the_cooldown(self):
+        # Without it the per-client cap bounds cards at once and nothing bounds them
+        # over time: ask, withdraw and ask again never fills the queue.
+        cp.holds.MAX_TOOL_PENDING = 100
+        cp.holds.MAX_TOOL_PENDING_PER_CLIENT = 3
+        cp.holds.TOOL_WITHDRAW_COOLDOWN = 60
+        self._withdraw_ago(self._ask(1), 20)
+        self._withdraw_ago(self._ask(2), 50)
+        self.assertIsNotNone(self._ask(3).approval_id)
+        refused = self._ask(4)
+        self.assertIsNone(refused.approval_id)
+        # Says it was the agent's own withdrawals, and when the first slot comes back,
+        # so the refusal does not read as an operator who is swamped.
+        self.assertIn("2 of them withdrawn in the last 60s", refused.refused)
+        self.assertIn("stops counting in 10s", refused.refused)
+        # The account keeps the scope alone: "in 10s" is only true right now.
+        self.assertEqual(cp.holds._saturation()["last_scope"],
+                         "client 172.30.0.2 tool asks")
+        # Another sandbox is unaffected, as with the cap itself. Three asks, so this
+        # client's two withdrawals would fill its cap if they were counted here.
+        for n in range(3):
+            self.assertIsNotNone(self._ask(n, client="172.30.0.9").approval_id)
+
+    def test_an_expired_ask_frees_its_slot_at_once(self):
+        # Only a withdrawal is paced by the agent; the ask window paced this one.
+        cp.holds.MAX_TOOL_PENDING = 100
+        cp.holds.MAX_TOOL_PENDING_PER_CLIENT = 1
+        cp.holds.TOOL_WITHDRAW_COOLDOWN = 60
+        cp.holds.TOOL_HOLD_TIMEOUT = -1
+        self._ask(1)
+        cp.holds._expire_tool_asks()
+        self.assertEqual(len(self._rows("expired")), 1)
+        self.assertIsNotNone(self._ask(2).approval_id)
+
+    def test_an_infinite_cooldown_refuses_rather_than_raising(self):
+        # A setting that means "a withdrawal never frees its slot" must still come
+        # back as a refusal, which is audited, and not as an exception.
+        cp.holds.MAX_TOOL_PENDING = 100
+        cp.holds.MAX_TOOL_PENDING_PER_CLIENT = 1
+        cp.holds.TOOL_WITHDRAW_COOLDOWN = float("inf")
+        self._withdraw_ago(self._ask(1), 10 ** 6)
+        refused = self._ask(2)
+        self.assertIsNone(refused.approval_id)
+        self.assertIn("stops counting never", refused.refused)
+
+    def test_the_slot_comes_back_once_the_cooldown_has_passed(self):
+        cp.holds.MAX_TOOL_PENDING = 100
+        cp.holds.MAX_TOOL_PENDING_PER_CLIENT = 1
+        cp.holds.TOOL_WITHDRAW_COOLDOWN = 60
+        self._withdraw_ago(self._ask(1), 61)
+        self.assertIsNotNone(self._ask(2).approval_id)
+
+    def test_an_approval_withdrawn_later_does_not_count(self):
+        # A human decided it, and that already paced the loop.
+        cp.holds.MAX_TOOL_PENDING = 100
+        cp.holds.MAX_TOOL_PENDING_PER_CLIENT = 1
+        cp.holds.TOOL_WITHDRAW_COOLDOWN = 60
+        first = self._ask(1)
+        cp.holds._resolve_tool_ask(first.approval_id, "allowed", "test")
+        self.assertTrue(cp.holds._withdraw_tool_ask(first.approval_id))
+        self.assertIsNotNone(self._ask(2).approval_id)
+
+    def test_a_zero_cooldown_frees_the_slot_at_once(self):
+        cp.holds.MAX_TOOL_PENDING = 100
+        cp.holds.MAX_TOOL_PENDING_PER_CLIENT = 1
+        cp.holds.TOOL_WITHDRAW_COOLDOWN = 0
+        self._withdraw_ago(self._ask(1), 0)
+        self.assertIsNotNone(self._ask(2).approval_id)
+
+    def test_the_cooldown_is_inert_when_the_per_client_cap_is_off(self):
+        cp.holds.MAX_TOOL_PENDING = 100
+        cp.holds.MAX_TOOL_PENDING_PER_CLIENT = 0
+        cp.holds.TOOL_WITHDRAW_COOLDOWN = 60
+        for n in range(6):
+            self._withdraw_ago(self._ask(n), 0)
+        self.assertIsNotNone(self._ask(6).approval_id)
 
     def test_an_oversized_payload_is_refused_but_is_not_saturation(self):
         # Refused rather than truncated, because the payload is what a human reads to

@@ -96,6 +96,7 @@ import logging
 import logging.handlers
 import os
 import socket
+import sys
 import threading
 import time
 import urllib.request
@@ -545,22 +546,49 @@ def _assert_guard_configured() -> None:
 _conn_authority: dict[str, str] = {}
 
 
+class _LoudFileHandler(logging.handlers.RotatingFileHandler):
+    """A rotating file sink that SAYS when it could not write.
+
+    ``logging.FileHandler.emit`` catches its own exceptions and routes them to
+    ``handleError``, whose default prints a bare "--- Logging error ---" traceback
+    and carries on. This file is the only path by which the
+    decisions this proxy makes ITSELF (lifeline allows, relay-guard, port and SNI
+    denials, fail-closed denials) reach the control plane's audit store, so a full
+    volume would stop that silently. The tool gateway's ``outcomes._LoudFileHandler``
+    is the same need; this image is separate, so it is a copy rather than a share.
+
+    ``print``, not the logger: this logger is the one that just failed, and an ERROR
+    record at startup is fatal under mitmdump's errorcheck. The record itself still
+    reaches stdout after this line, through the root logger mitmproxy prints."""
+
+    def handleError(self, record: logging.LogRecord) -> None:
+        exc = sys.exc_info()[1]
+        print(f"egress: AUDIT FAILED to write to {AUDIT_PATH} ({exc}) — the record "
+              f"below may not reach the control plane's audit store; stdout has it",
+              flush=True)
+
+
 def _setup_audit_file() -> None:
-    """Best-effort durable local audit sink. Never fatal: stdout is always the
-    primary local audit stream (captured by ``docker compose logs egress-proxy``)
-    and the control plane is the central, queryable store; this file is a
-    convenience for persistence and grep on the mounted volume."""
+    """Attach the durable local audit sink, which the control plane ingests. Stdout
+    (``docker compose logs egress-proxy``) carries every line too, but only this file
+    carries the locally-made decisions into the central record.
+
+    Not fatal when it cannot be opened, unlike the gateway's: a proxy that will not
+    start cuts the lifeline too, and stdout still carries every line. The warning says
+    what is lost."""
     try:
         os.makedirs(os.path.dirname(AUDIT_PATH), exist_ok=True)
         # Size-rotating so the file cannot grow without bound (see AUDIT_MAX_BYTES).
         # maxBytes=0 keeps the old single-file behaviour (RotatingFileHandler never
         # rolls over then), which is the documented off switch.
-        handler = logging.handlers.RotatingFileHandler(
+        handler = _LoudFileHandler(
             AUDIT_PATH, maxBytes=AUDIT_MAX_BYTES, backupCount=AUDIT_BACKUPS)
         handler.setFormatter(logging.Formatter("%(message)s"))
         logger.addHandler(handler)
     except OSError as e:
-        logger.warning("audit file unavailable (%s); logging to stdout only", e)
+        logger.warning("audit file unavailable (%s); logging to stdout only — the "
+                       "decisions this proxy makes itself will not reach the "
+                       "control plane's audit store", e)
 
 
 def _match(host: str, pattern: str) -> bool:

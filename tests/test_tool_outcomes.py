@@ -228,12 +228,9 @@ class SetupTests(unittest.TestCase):
     """The two configured states, and the one that must not be reachable by accident."""
 
     def test_a_configured_path_that_cannot_be_opened_refuses_to_start(self):
-        # Not best-effort, and that is the difference from the egress proxy's audit
-        # file — for the proxy, stdout is primary and the control plane holds the
-        # central record, so its file is a convenience. Here the file is the ONLY path
-        # into the durable record, so a path that was configured and does not work is a
-        # misconfiguration to surface at start rather than an empty table to discover
-        # weeks later.
+        # Not best-effort: the file is the ONLY path into the durable record, so a
+        # path that was configured and does not work is a misconfiguration to surface
+        # at start rather than an empty table to discover weeks later.
         outcomes = load_outcomes({"GATEWAY_AUDIT_LOG": "/proc/1/cannot/exist.jsonl"})
         with self.assertRaises(OSError):
             outcomes.setup()

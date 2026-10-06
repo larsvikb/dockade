@@ -15,9 +15,9 @@ FROM mitmproxy/mitmproxy:12.2.3@sha256:00b77b5d8804c8ad18cb6caefbf9d5849e895e898
 COPY addon.py /opt/egress/addon.py
 
 # Durable audit sink directory, owned by the runtime user so a mounted named
-# volume inherits writable ownership. stdout remains the primary local audit
-# stream (captured by `docker compose logs egress-proxy`); the control plane is
-# the central store; this file is for persistence.
+# volume inherits writable ownership. The control plane ingests this file, which
+# is how the decisions the proxy makes itself reach the central store; stdout
+# (`docker compose logs egress-proxy`) carries the same lines live.
 USER root
 RUN mkdir -p /var/log/egress \
     && chown -R mitmproxy:mitmproxy /var/log/egress /opt/egress

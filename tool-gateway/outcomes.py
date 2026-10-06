@@ -94,7 +94,7 @@ class _LoudFileHandler(logging.handlers.RotatingFileHandler):
 
     def handleError(self, record: logging.LogRecord) -> None:
         print(f"tool-gateway: OUTCOME AUDIT FAILED to write to {AUDIT_PATH} — the "
-              f"record below is the only copy", flush=True)
+              f"record below may be the only copy", flush=True)
 
 #: Whether ``setup`` has attached a file handler. Read only by ``describe``, so the
 #: startup banner can say which of the two configured states this process is in.
@@ -104,12 +104,10 @@ _to_file = False
 def setup() -> None:
     """Attach the file sink, or FAIL TO START.
 
-    Not best-effort, and that is the difference from the egress proxy's audit file. For
-    the proxy, stdout is the primary local stream and the control plane holds the
-    authoritative central record, so the file is a convenience. Here the file is the
-    ONLY path into the durable record — nothing else carries an outcome anywhere — so a
-    path that was configured and does not work is a misconfiguration to surface at
-    start, not a degradation to discover weeks later by noticing an empty table.
+    Not best-effort. The file is the ONLY path into the durable record — nothing else
+    carries an outcome anywhere — so a path that was configured and does not work is a
+    misconfiguration to surface at start, not a degradation to discover weeks later by
+    noticing an empty table.
 
     The off switch is explicit and empty: ``GATEWAY_AUDIT_LOG=""`` runs with stdout
     only, for a hand-run container with no volume. Same idiom as the egress proxy's

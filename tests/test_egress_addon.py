@@ -9,6 +9,11 @@ from the sandbox, but cannot exercise the guard's name/IP/resolve branches or th
 env-parsing edge cases directly. Dependency-free (see ``tests/_loader.py``)."""
 from __future__ import annotations
 
+import contextlib
+import io
+import logging
+import os
+import tempfile
 import unittest
 from unittest import mock
 
@@ -371,23 +376,58 @@ class AuditFileRotationTests(unittest.TestCase):
         with mock.patch.object(addon.os, "makedirs"), \
                 mock.patch.object(addon.logger, "addHandler"), \
                 mock.patch.multiple(addon, AUDIT_MAX_BYTES=4096, AUDIT_BACKUPS=3), \
-                mock.patch.object(addon.logging.handlers,
-                                  "RotatingFileHandler") as rfh:
+                mock.patch.object(addon, "_LoudFileHandler") as rfh:
             addon._setup_audit_file()
         self.assertTrue(rfh.called)
+        self.assertTrue(issubclass(addon._LoudFileHandler,
+                                   logging.handlers.RotatingFileHandler))
         _, kwargs = rfh.call_args
         self.assertEqual(kwargs["maxBytes"], 4096)
         self.assertEqual(kwargs["backupCount"], 3)
 
     def test_audit_file_failure_is_not_fatal(self):
-        # Best-effort sink: a filesystem error warns and falls back to stdout, never
-        # raises — a proxy that cannot open its convenience log must still run.
+        # A filesystem error at startup warns and falls back to stdout, never raises:
+        # the proxy keeps serving, and the warning says what the central record loses.
         log = mock.Mock()
         with mock.patch.object(addon.os, "makedirs",
                                side_effect=OSError("read-only fs")), \
                 mock.patch.object(addon, "logger", log):
             addon._setup_audit_file()
         self.assertTrue(log.warning.called)
+
+
+class LoudAuditFileTests(unittest.TestCase):
+    """A write the audit file could not take is announced on stdout (see
+    ``_LoudFileHandler``). Driven through the real ``emit``, with a stream that fails
+    the way a full volume does; a raise out of ``emit`` would error the test."""
+
+    class _FullDisk(io.StringIO):
+        def write(self, _):
+            raise OSError(28, "No space left on device")
+
+    def setUp(self):
+        fd, self.path = tempfile.mkstemp(prefix="egress-audit-test-")
+        os.close(fd)
+        self.handler = addon._LoudFileHandler(self.path, maxBytes=0, backupCount=0)
+        self.addCleanup(os.remove, self.path)
+        self.addCleanup(self.handler.close)
+
+    def _emit_into_a_full_disk(self) -> str:
+        self.handler.stream.close()
+        self.handler.stream = self._FullDisk()
+        record = logging.LogRecord("egress", logging.INFO, __file__, 1,
+                                   '{"decision": "deny"}', None, None)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.handler.emit(record)
+        return out.getvalue()
+
+    def test_a_failed_write_is_announced_with_the_path_and_the_error(self):
+        out = self._emit_into_a_full_disk()
+        self.assertIn("AUDIT FAILED", out)
+        self.assertIn(addon.AUDIT_PATH, out)
+        self.assertIn("No space left on device", out)
 
 
 if __name__ == "__main__":

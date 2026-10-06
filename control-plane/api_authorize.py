@@ -17,6 +17,7 @@ import time
 import uuid
 
 import holds
+import ingest
 import policy
 import store
 from fastapi import APIRouter
@@ -63,6 +64,15 @@ def _decision_scope(status_row) -> str:
 
 @router.post("/authorize", response_model=AuthorizeResponse)
 def authorize(req: AuthorizeRequest) -> AuthorizeResponse:
+    # Every answer, a 500 included, is one the proxy records as a line in its audit
+    # file, so ingest can tell a file that stopped growing from a quiet proxy.
+    try:
+        return _answer(req)
+    finally:
+        ingest._expect_line("egress")
+
+
+def _answer(req: AuthorizeRequest) -> AuthorizeResponse:
     # Derived once and carried through every write this request makes: the audit
     # rows, the approvals row, and through that row the rule a persist writes. So the
     # class that DECIDED the request is the one recorded, by construction.

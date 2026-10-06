@@ -1076,6 +1076,14 @@ volume is lost is gone. That was judged acceptable — the alternative is durabi
 machinery for rows that are almost all `deny — control-plane unreachable`, recorded
 during a window in which nobody could load the UI either.
 
+**A file that stops growing** is a full or read-only volume under a proxy that keeps
+deciding and enforcing; to the drain it looks like a quiet proxy. Each side warns about
+what it can see. The proxy names every failed write on its own stdout
+(`_LoudFileHandler` in `proxies/egress/addon.py`). The control plane knows each
+`/authorize` answer is followed by at least one line, so ingest reports a file that
+stays still after answers (`_check_growth` in `control-plane/ingest.py`). Decisions
+the proxy makes alone, while nothing asks `/authorize`, are seen only by the first.
+
 **Telling an outage denial from a policy denial.** Those `control-plane unreachable`
 rows carry the same red `deny` tag as a rule refusing a host, against the same host
 column, and they mean the opposite thing: not "your policy refused this" but "no

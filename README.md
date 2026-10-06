@@ -372,7 +372,7 @@ which, and what each one landed, is one table:
   browser boundary, how it keeps a failing state visible, how it shows a tool payload,
   and its tests.
 - [`proxies/egress/DESIGN.md`](proxies/egress/DESIGN.md) — the egress proxy: what its
-  relay guard refuses before policy is asked, and how it asks the control plane.
+  relay guard refuses whatever policy says, and how it asks the control plane.
 - [`tool-gateway/DESIGN.md`](tool-gateway/DESIGN.md) — the MCP gateway: which tools the
   agent is shown and under what name, what must hold before a call runs, and the rule
   for tools of its own.

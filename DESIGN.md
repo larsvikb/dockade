@@ -1673,6 +1673,14 @@ human, which is the attention-DoS `MAX_PENDING_PER_CLIENT` exists for on the egr
 side. The tool surface needs that cap most, and its own, since the two surfaces no
 longer share a pool.
 
+The cap counts cards on screen at once, and it bounds them over time only while a
+slot is freed by a human's answer or the ask window. `withdraw_tool_call` frees one at
+the agent's own pace, so an ask the agent withdrew while pending keeps counting for a
+short cooldown, `TOOL_WITHDRAW_COOLDOWN` in `control-plane/holds.py`. Short on
+purpose: a withdrawal is mostly an agent correcting itself, and the cooldown has to
+cost that case little while still bounding the loop. It rides on the per-client cap,
+so an operator who turns that cap off unbounds this loop with it.
+
 **Resumption is a tool, keyed on the approval id.** The agent needs a way back to a
 pending ask, and the obvious one — retry the original call — is safe but fragile. Safe
 because the gateway re-checks policy before executing, so a still-pending ask returns

@@ -1478,6 +1478,108 @@ class DeadCapWarningTests(_HoldRegistryTestCase):
         self.assertEqual(self._warnings(), [])
 
 
+class OrphanedHoldSweepTests(_ToolAskTestCase):
+    """``_expire_orphaned_holds`` retires the egress cards a previous process left
+    pending, and leaves an audit row for each.
+
+    Built on the tool-ask fixture because one case is a tool ask the sweep must leave
+    alone."""
+
+    def setUp(self):
+        super().setUp()
+        self._wipe_cards()
+
+    def tearDown(self):
+        self._wipe_cards()
+        super().tearDown()
+
+    @staticmethod
+    def _wipe_cards():
+        with cp.store._connect() as conn:
+            conn.execute("DELETE FROM approvals")
+            conn.commit()
+
+    @staticmethod
+    def _card(approval_id, status="pending", client="172.30.0.7",
+              client_class="sandbox"):
+        with cp.store._connect() as conn:
+            conn.execute(
+                "INSERT INTO approvals(id, ts, host, port, proto, client, "
+                "client_class, method, url, status) "
+                "VALUES (?, 0, 'example.org', 443, 'https', ?, ?, 'CONNECT', "
+                "'example.org:443', ?)",
+                (approval_id, client, client_class, status))
+            conn.commit()
+
+    @staticmethod
+    def _status(approval_id):
+        with cp.store._connect() as conn:
+            return conn.execute("SELECT status, resolved_at FROM approvals "
+                                "WHERE id=?", (approval_id,)).fetchone()
+
+    @staticmethod
+    def _audit_rows(approval_id):
+        with cp.store._connect() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT kind, stage, host, port, proto, client, client_class, method, "
+                "url, reason FROM audit WHERE approval_id=? ORDER BY id",
+                (approval_id,))]
+
+    def test_a_pending_card_is_expired_and_leaves_a_deny_row(self):
+        self._card("orphan-1")
+        self.assertEqual(cp.holds._expire_orphaned_holds(), 1)
+        row = self._status("orphan-1")
+        self.assertEqual(row["status"], "expired")
+        self.assertIsNotNone(row["resolved_at"])
+        rows = self._audit_rows("orphan-1")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            {k: rows[0][k] for k in ("kind", "stage", "host", "port", "proto",
+                                     "client", "method", "url")},
+            {"kind": "deny", "stage": "boot-sweep", "host": "example.org",
+             "port": 443, "proto": "https", "client": "172.30.0.7",
+             "method": "CONNECT", "url": "example.org:443"})
+        self.assertIn("previous control-plane process", rows[0]["reason"])
+
+    def test_the_row_keeps_the_class_the_card_was_raised_under(self):
+        # Not re-derived from today's CIDR map, which may have changed across the
+        # restart: the record is of the decision as it was framed.
+        self._card("orphan-2", client="172.30.0.7", client_class="then-class")
+        cp.holds._expire_orphaned_holds()
+        self.assertEqual(self._audit_rows("orphan-2")[0]["client_class"],
+                         "then-class")
+
+    def test_a_decided_card_is_left_alone_and_gets_no_row(self):
+        for status in ("allowed", "denied", "expired"):
+            self._card(f"done-{status}", status=status)
+        self.assertEqual(cp.holds._expire_orphaned_holds(), 0)
+        for status in ("allowed", "denied", "expired"):
+            self.assertEqual(self._status(f"done-{status}")["status"], status)
+            self.assertEqual(self._audit_rows(f"done-{status}"), [])
+
+    def test_a_pending_tool_ask_survives_the_sweep(self):
+        # Nothing blocks on an ask, so a restart does not orphan it.
+        ask = cp.holds._register_tool_ask("mcp-github", "issue_write", {"n": 1})
+        cp.holds._expire_orphaned_holds()
+        self.assertEqual(cp.holds._get_tool_ask(ask.approval_id)["status"], "pending")
+        self.assertEqual(self._audit_rows(ask.approval_id), [])
+
+    def test_a_second_sweep_writes_nothing_more(self):
+        self._card("orphan-3")
+        cp.holds._expire_orphaned_holds()
+        self.assertEqual(cp.holds._expire_orphaned_holds(), 0)
+        self.assertEqual(len(self._audit_rows("orphan-3")), 1)
+
+    def test_boot_runs_the_sweep(self):
+        # The wiring: ``_bootstrap`` is what a restart actually runs.
+        self._card("orphan-4")
+        with contextlib.redirect_stdout(io.StringIO()):
+            cp._bootstrap()
+        self.assertEqual(self._status("orphan-4")["status"], "expired")
+        self.assertEqual([r["stage"] for r in self._audit_rows("orphan-4")],
+                         ["boot-sweep"])
+
+
 class DuplicateGroupingTests(_HoldRegistryTestCase):
     """A retrying agent asks the same question repeatedly. Those requests share ONE
     card and one decision; they do not share a worker, and they never share an audit

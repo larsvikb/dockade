@@ -80,7 +80,6 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import os
-import time
 
 import api_approvals
 import api_authorize
@@ -237,17 +236,7 @@ def _bootstrap() -> None:
     can observe an unseeded database. Not a startup handler: each app has its own
     lifespan, and the authorize listener would race the management one's seed."""
     store._init_db()
-    # A held request cannot survive a restart (its blocked connection is gone), so
-    # 'pending' rows from a previous process are stale.
-    #
-    # ``tool_approvals`` is NOT swept: nothing blocks on a tool ask, so a pending one
-    # is still a live question an agent can come back for. Its own ``deadline`` ends
-    # it (``holds._expire_tool_asks``).
-    with store._connect() as conn:
-        conn.execute(
-            "UPDATE approvals SET status='expired', resolved_at=? "
-            "WHERE status='pending'", (time.time(),))
-        conn.commit()
+    holds._expire_orphaned_holds()
     seeded = store._seed_if_empty()
     if seeded:
         print(f"control-plane: seeded {seeded} allow rules from {store.SEED_PATH}",

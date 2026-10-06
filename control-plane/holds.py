@@ -302,6 +302,41 @@ def _release_hold(approval_id: str) -> None:
         _close_group_locked(approval_id)
 
 
+def _expire_orphaned_holds() -> int:
+    """Retire every egress card a previous process left pending. Returns how many.
+
+    Called once at boot, before any listener binds. A held request cannot survive a
+    restart: its blocked connection is gone, and the proxy records it as a fail-closed
+    deny unless the proxy went down too. The card is what is left, retired here with an
+    AUDIT ROW per card, as ``_expire_tool_asks`` writes one per lapsed ask, so the
+    trail can say what became of a card the operator saw disappear.
+
+    ``tool_approvals`` is NOT swept: nothing blocks on a tool ask, so a pending one is
+    still a live question an agent can come back for. Its own ``deadline`` ends it.
+
+    The class is the row's, settled when the hold was raised, not re-derived: the CIDR
+    map is configuration and may have changed across the restart."""
+    now = time.time()
+    with store._connect() as conn:
+        due = conn.execute(
+            "SELECT id, host, port, proto, client, client_class, method, url "
+            "FROM approvals WHERE status='pending'").fetchall()
+        # One UPDATE for the rows just read, with nothing between them: no listener
+        # has bound yet, so nothing else can be writing this table.
+        conn.execute("UPDATE approvals SET status='expired', resolved_at=? "
+                     "WHERE status='pending'", (now,))
+        conn.commit()
+    for row in due:
+        store._audit("deny", stage="boot-sweep", host=row["host"], port=row["port"],
+                     proto=row["proto"], client=row["client"],
+                     client_class=row["client_class"], method=row["method"],
+                     url=row["url"], approval_id=row["id"],
+                     reason="left pending by a previous control-plane process — "
+                            "default-deny; nothing is left to answer it, and its "
+                            "held requests went down with that process")
+    return len(due)
+
+
 def _classified(client_class: str | None) -> bool:
     """Whether a grant that OUTLIVES the request can be scoped to this card's client.
 
@@ -332,8 +367,9 @@ def _list_pending() -> list[dict]:
     #       into offering a pattern the backend rejects.
     #   ``requests``  how many blocked requests one click decides: with duplicates
     #       grouped, "allow once" can grant several. At least 1 — a pending row always
-    #       has a waiter in this process (``app._bootstrap`` expires any left by a
-    #       previous one), and "0 requests" would read as a card that decides nothing.
+    #       has a waiter in this process (``_expire_orphaned_holds`` retires any left
+    #       by a previous one), and "0 requests" would read as a card that decides
+    #       nothing.
     #   ``existing``  the action of a standing rule already holding a pattern, so the
     #       confirm panel can warn before ``api_approvals.resolve`` refuses to replace
     #       it. The rule can still appear between render and click; resolve covers that.

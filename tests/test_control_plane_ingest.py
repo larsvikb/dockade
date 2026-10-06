@@ -30,12 +30,14 @@ Dependency-free: ``fastapi``/``pydantic`` are stubbed (see ``tests/_loader.py``)
 and the store is a throwaway SQLite file in a temp dir set before import."""
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import io
 import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 _TMP = tempfile.mkdtemp(prefix="dockade-cp-ingest-test-")
 os.environ["CONTROL_DB"] = os.path.join(_TMP, "control.db")
@@ -661,6 +663,128 @@ class ToolOutcomeDrainTests(IngestTestCase):
         self.assertIn("outcome (ingested) tool-error mcp-github__get_me", printed)
         self.assertIn("approval_id=" + "b" * 32, printed)
         self.assertIn(":: 403", printed)
+
+
+class StalledStreamTests(IngestTestCase):
+    """``_check_growth`` reports an egress file that stopped growing while
+    ``/authorize`` kept answering, and stays quiet for a proxy that is merely quiet.
+
+    Driven with explicit clock values rather than sleeps; each call is one drain pass."""
+
+    def setUp(self):
+        super().setUp()
+        for state in (cp.ingest._owed, cp.ingest._growth, cp.ingest._stalled):
+            self.addCleanup(state.pop, "egress", None)
+            state.pop("egress", None)
+        self.grace = cp.ingest.STALL_GRACE
+        self.write(_line())
+
+    def answer(self, n=1):
+        for _ in range(n):
+            cp.ingest._expect_line("egress")
+
+    def check(self, now):
+        cp.ingest._check_growth(self.stream, now)
+
+    def reports(self, word):
+        return [ln for ln in self.out.getvalue().splitlines() if word in ln]
+
+    def test_answers_with_no_new_line_past_the_grace_are_reported_once(self):
+        self.answer()
+        self.check(0)                       # baseline
+        self.answer(2)
+        self.check(1)                       # owed lines first seen
+        self.check(1 + self.grace)
+        self.check(2 + self.grace)
+        stalled = self.reports("STALLED")
+        self.assertEqual(len(stalled), 1)
+        self.assertIn(self.path, stalled[0])
+        self.assertIn("2 answered", stalled[0])
+        self.assertIn("may never reach /api/audit", stalled[0])
+
+    def test_a_stall_from_the_very_first_answer_is_caught(self):
+        # The baseline is taken before anything is owed, so one answer is enough.
+        self.check(0)
+        self.answer()
+        self.check(1)
+        self.check(1 + self.grace)
+        self.assertEqual(len(self.reports("STALLED")), 1)
+        self.assertIn("1 answered", self.reports("STALLED")[0])
+
+    def test_within_the_grace_it_is_silent(self):
+        self.answer()
+        self.check(0)
+        self.answer()
+        self.check(1)
+        self.check(self.grace)
+        self.assertEqual(self.reports("STALLED"), [])
+
+    def test_a_file_that_grows_after_answers_is_silent(self):
+        self.answer()
+        self.check(0)
+        self.answer()
+        self.check(1)
+        self.write(_line())
+        self.check(1 + self.grace)
+        self.assertEqual(self.reports("STALLED"), [])
+
+    def test_a_quiet_proxy_is_not_a_stalled_one(self):
+        # No answers since the file last moved: nothing is owed, however long.
+        self.answer()
+        self.check(0)
+        self.check(10 * self.grace)
+        self.check(20 * self.grace)
+        self.assertEqual(self.reports("STALLED"), [])
+
+    def test_growth_after_a_stall_is_reported_once(self):
+        self.answer()
+        self.check(0)
+        self.answer()
+        self.check(1)
+        self.check(1 + self.grace)
+        self.write(_line())
+        self.check(2 + self.grace)
+        self.check(3 + self.grace)
+        self.assertEqual(len(self.reports("growing again")), 1)
+
+    def test_a_rotation_counts_as_growth(self):
+        # A new inode under the path is the writer working, even at the same size.
+        self.answer()
+        self.check(0)
+        self.answer()
+        self.check(1)
+        self.replace_file(_line())
+        self.check(1 + self.grace)
+        self.assertEqual(self.reports("STALLED"), [])
+
+    def test_a_missing_file_is_left_to_the_drain_to_report(self):
+        self.answer()
+        os.remove(self.path)
+        self.check(0)
+        self.check(10 * self.grace)
+        self.assertEqual(self.reports("STALLED"), [])
+
+    def test_the_drain_loop_checks_every_stream(self):
+        checked = []
+        with mock.patch.object(cp.ingest, "_drain_stream", mock.AsyncMock()), \
+                mock.patch.object(cp.ingest, "_check_growth",
+                                  side_effect=lambda st, now: checked.append(st)), \
+                mock.patch.object(cp.ingest.asyncio, "sleep",
+                                  side_effect=asyncio.CancelledError), \
+                self.assertRaises(asyncio.CancelledError):
+            asyncio.run(cp.ingest._audit_drain_loop())
+        self.assertEqual(checked, list(cp.ingest.STREAMS))
+
+    def test_every_authorize_answer_is_owed_a_line_even_a_failed_one(self):
+        # A 500 is still a line: the proxy records its fail-closed deny.
+        before = cp.ingest._owed.get("egress", 0)
+        with mock.patch.object(cp.api_authorize, "_answer",
+                               side_effect=RuntimeError("store locked")), \
+                self.assertRaises(RuntimeError):
+            cp.api_authorize.authorize(object())
+        with mock.patch.object(cp.api_authorize, "_answer", return_value="ok"):
+            cp.api_authorize.authorize(object())
+        self.assertEqual(cp.ingest._owed["egress"], before + 2)
 
 
 if __name__ == "__main__":

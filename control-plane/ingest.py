@@ -41,6 +41,8 @@ import glob
 import json
 import math
 import os
+import threading
+import time
 
 import policy
 import store
@@ -383,10 +385,83 @@ _STREAM_STAKES = {
 }
 
 
+# A file that stops GROWING while its writer is still deciding things. The drain
+# cannot see that: a writer whose volume is full keeps serving, its file just stays
+# the same size, and "nothing new" is also what a quiet writer looks like. What tells
+# them apart is a line this process KNOWS is owed: every /authorize answer is one the
+# proxy records (``api_authorize.authorize``). So a file whose inode and size have not
+# moved for STALL_GRACE seconds since an answer was given is reported, once on the way
+# in and once on the way out, as with ``_drain_failing``.
+#
+# Only streams something here expects lines for can be reported. The tool stream owes
+# lines too (an allowed call, a granted claim), but each follows a call that can run
+# for GATEWAY_CALL_TIMEOUT, longer than this grace, so it is not wired yet. A writer
+# failing only SOME of its writes still grows the file and is not caught.
+STALL_GRACE = 30.0
+
+_owed: dict[str, int] = {}
+_owed_lock = threading.Lock()
+
+
+def _expect_line(stream_name: str) -> None:
+    """Record that the writer of ``stream_name`` owes one more line. Called from the
+    request threads, hence the lock."""
+    with _owed_lock:
+        _owed[stream_name] = _owed.get(stream_name, 0) + 1
+
+
+class _Growth:
+    """What a stream's active file looked like when it last grew, how many lines were
+    owed then, and since when more have been owed without it growing."""
+
+    def __init__(self, sig, owed):
+        self.sig = sig                # (inode, size) of the active file
+        self.owed = owed
+        self.owed_since = None        # monotonic time a newer owed line was first seen
+
+
+_growth: dict[str, _Growth] = {}
+_stalled: dict[str, bool] = {}
+
+
+def _check_growth(stream: _Stream, now: float) -> None:
+    # Zero before the first answer, so the baseline is taken before anything is owed
+    # and one answer is enough. A stream nothing expects lines for stays at zero and
+    # is never reported.
+    owed = _owed.get(stream.name, 0)
+    try:
+        st = os.stat(stream.path)
+    except OSError:
+        return                         # a missing file is _drain_stream's to report
+    sig = (st.st_ino, st.st_size)
+    last = _growth.get(stream.name)
+    if last is None or sig != last.sig:
+        if _stalled.get(stream.name):
+            print(f"control-plane: {stream.name} audit file growing again "
+                  f"({stream.path}) — lines written while it was stalled may be "
+                  f"missing from /api/audit", flush=True)
+            _stalled[stream.name] = False
+        _growth[stream.name] = _Growth(sig, owed)
+        return
+    if owed == last.owed:
+        return
+    if last.owed_since is None:
+        last.owed_since = now
+        return
+    if now - last.owed_since >= STALL_GRACE and not _stalled.get(stream.name):
+        print(f"control-plane: {stream.name} audit file STALLED ({stream.path}): "
+              f"{owed - last.owed} answered request(s) and no new line in "
+              f"{now - last.owed_since:.0f}s — its writer's volume may be full or "
+              f"read-only; lines written during the stall may never reach "
+              f"/api/audit, and its writer's stdout has every one", flush=True)
+        _stalled[stream.name] = True
+
+
 async def _audit_drain_loop() -> None:
     while True:
         for stream in STREAMS:
             await _drain_stream(stream)
+            _check_growth(stream, time.monotonic())
         await asyncio.sleep(DRAIN_INTERVAL)
 
 

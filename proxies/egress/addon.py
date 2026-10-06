@@ -522,9 +522,15 @@ def _assert_guard_configured() -> None:
     resolves into a control subnet. There is no legitimate reason to run this proxy
     with that check off, so refuse to start rather than serve with the hole
     (matches the repo's "no silent unsafe defaults"). The hostname list is a cheap
-    fast-path on top of this, not a substitute for it."""
+    fast-path on top of this, not a substitute for it.
+
+    ``SystemExit``, not an ``Exception``: mitmproxy logs and swallows an
+    ``Exception`` from ``load``, and the process then exits only because a
+    separate addon, errorcheck, exits on a logged startup error (NOTES.md,
+    "mitmproxy binds an IP-literal listener before any script loads, and
+    swallows an exception from `load`")."""
     if not FORBIDDEN_CIDRS:
-        raise RuntimeError(
+        raise SystemExit(
             "EGRESS_FORBIDDEN_CIDRS is empty — the control-plane relay guard would "
             "not block the control networks by IP. Refusing to start (fail "
             "closed). Set it to the control subnets, e.g. "
@@ -766,7 +772,8 @@ def _fail_closed(stage: str, refuse):
 
 def load(loader) -> None:  # mitmproxy lifecycle hook
     # Refuse to start with the relay guard's CIDR check disabled (fail closed)
-    # BEFORE serving any traffic or announcing readiness.
+    # before announcing readiness. mitmproxy has already bound the listener by
+    # now; this exits before any of the addon's hooks is registered.
     _assert_guard_configured()
     _setup_audit_file()
     _audit("startup", control_plane=AUTHORIZE_URL, audit=AUDIT_PATH,

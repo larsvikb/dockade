@@ -333,7 +333,7 @@ class GuardConfigTests(unittest.TestCase):
 
     def test_startup_fails_closed_without_forbidden_cidrs(self):
         with mock.patch.object(addon, "FORBIDDEN_CIDRS", ()), \
-                self.assertRaises(RuntimeError):
+                self.assertRaises(SystemExit):
             addon._assert_guard_configured()
 
 

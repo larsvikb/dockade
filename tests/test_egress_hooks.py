@@ -681,9 +681,9 @@ class FailClosedTests(unittest.TestCase):
 
     def test_a_host_header_the_resolver_cannot_encode_is_denied(self):
         """The reproduction: absolute-form request to an arbitrary host,
-        ``Host: a..b``. Before the fix the hook raised and mitmproxy relayed it. On a
-        permitted port, because the port gate now runs before the resolve and a
-        refused port never reaches it (``PortGateOrderTests``)."""
+        ``Host: a..b``. Before the fix the hook raised and mitmproxy relayed it. Now
+        the static half refuses it, before the port gate and before policy
+        (``ResolveAfterAllowTests``)."""
         flow = _http_flow("exfil.example", "a..b", scheme="http", port=80)
         with mock.patch.object(addon.socket, "getaddrinfo", side_effect=_unencodable), \
              mock.patch.object(addon, "_post_authorize",
@@ -712,6 +712,8 @@ class FailClosedTests(unittest.TestCase):
     def test_any_exception_in_http_connect_denies_and_audits(self):
         flow = _connect_flow("example.com", cid="boom-connect")
         with mock.patch.object(addon, "_forbidden", side_effect=RuntimeError("boom")), \
+             mock.patch.object(addon, "_post_authorize",
+                               return_value={"decision": "allow", "reason": "ok"}), \
              mock.patch.object(addon, "_audit") as audited:
             run(addon.http_connect(flow))
         self.assertIsNotNone(flow.response)
@@ -730,6 +732,8 @@ class FailClosedTests(unittest.TestCase):
         flow = _http_flow("example.com", "example.com", scheme="http", port=80,
                           method="POST")
         with mock.patch.object(addon, "_forbidden", side_effect=RuntimeError("boom")), \
+             mock.patch.object(addon, "_post_authorize",
+                               return_value={"decision": "allow", "reason": "ok"}), \
              mock.patch.object(addon, "_audit") as audited:
             run(addon.request(flow))
         self.assertIsNotNone(flow.response)
@@ -792,13 +796,9 @@ class FailClosedTests(unittest.TestCase):
 
 
 class PortGateOrderTests(unittest.TestCase):
-    """The relay guard is two halves around the port gate. The static half (a
-    forbidden hostname or literal IP) runs first, so a probe at the control plane is
-    refused for what it is whatever port it picked — `boundary-check.sh` relies on
-    that 403. The resolving half runs AFTER the port gate, because a DNS query on the
-    sandbox's behalf is a channel: ``CONNECT <data>.attacker.example:22`` used to
-    resolve before the port refused it, one query per request with nothing to slow
-    it. Behind the gate, only a request that could proceed gets to resolve."""
+    """The static half of the relay guard (a forbidden hostname or literal IP) runs
+    first, so a probe at the control plane is refused for what it is whatever port it
+    picked — `boundary-check.sh` relies on that 403. A refused port never resolves."""
 
     def setUp(self):
         addon._conn_authority.clear()
@@ -845,19 +845,6 @@ class PortGateOrderTests(unittest.TestCase):
             run(addon.http_connect(flow))
         self.assertIn("forbidden destination IP", audited.call_args[1]["reason"])
 
-    def test_a_permitted_port_still_resolves_before_policy(self):
-        """The resolving half is not lost, only moved: a name that resolves into
-        control-net is refused before the control plane is asked."""
-        rebound = [(2, 1, 6, "", ("172.31.0.2", 0))]
-        flow = _connect_flow("rebind.example.com")
-        with mock.patch.object(addon.socket, "getaddrinfo", return_value=rebound), \
-             mock.patch.object(addon, "_post_authorize",
-                               side_effect=AssertionError("must not authorize")), \
-             mock.patch.object(addon, "_audit") as audited:
-            run(addon.http_connect(flow))
-        self.assertIsNotNone(flow.response)
-        self.assertIn("resolves to forbidden", audited.call_args[1]["reason"])
-
     def test_the_whole_verdict_is_still_one_call(self):
         """``_forbidden_reason`` remains the two halves joined, for callers that
         want it in one place — and the tests that exercise it as such."""
@@ -866,6 +853,124 @@ class PortGateOrderTests(unittest.TestCase):
         with mock.patch.object(addon.socket, "getaddrinfo",
                                return_value=[(2, 1, 6, "", ("172.31.0.2", 0))]):
             self.assertIn("resolves to", addon._forbidden_reason("rebind.example.com"))
+
+
+class ResolveAfterAllowTests(unittest.TestCase):
+    """The resolving half runs only once policy allowed the name (see
+    ``_forbidden_resolved``): a refused or held-then-refused name never resolves; an
+    allowed one still cannot reach a forbidden range."""
+
+    REBOUND = ((2, 1, 6, "", ("172.31.0.2", 0)),)
+    PUBLIC = ((2, 1, 6, "", ("93.184.216.34", 0)),)
+
+    def setUp(self):
+        addon._conn_authority.clear()
+
+    def _resolver(self, **kwargs):
+        """A recording resolver, asserted on afterwards. Not one that raises: the
+        hooks' fail-closed wrapper turns any exception into a deny, which would let
+        a resolve-first regression pass a test that only checks for the deny."""
+        kwargs.setdefault("return_value", self.PUBLIC)
+        return mock.patch.object(addon.socket, "getaddrinfo", **kwargs)
+
+    def _policy(self, decision, reason="r"):
+        return mock.patch.object(addon, "_post_authorize",
+                                 return_value={"decision": decision, "reason": reason})
+
+    def test_a_name_policy_refuses_never_resolves(self):
+        for reason in ("blocked by rule", "hold capacity exceeded",
+                       "no decision within hold timeout — default-deny"):
+            with self.subTest(reason=reason):
+                flow = _connect_flow("chunk1.attacker.example")
+                with self._resolver() as resolved, self._policy("deny", reason):
+                    run(addon.http_connect(flow))
+                self.assertIsNotNone(flow.response)
+                resolved.assert_not_called()
+
+    def test_a_plaintext_request_policy_refuses_never_resolves_either_name(self):
+        flow = _http_flow("chunk1.attacker.example", "chunk2.attacker.example",
+                          scheme="http", port=80)
+        with self._resolver() as resolved, self._policy("deny"):
+            run(addon.request(flow))
+        self.assertIsNotNone(flow.response)
+        resolved.assert_not_called()
+
+    def test_an_unreachable_control_plane_never_resolves(self):
+        flow = _connect_flow("chunk1.attacker.example")
+        with self._resolver() as resolved, \
+             mock.patch.object(addon, "_post_authorize",
+                               side_effect=OSError("control plane is down")):
+            run(addon.http_connect(flow))
+        self.assertIsNotNone(flow.response)
+        resolved.assert_not_called()
+
+    def test_an_allowed_name_is_resolved_and_passes(self):
+        flow = _connect_flow("ok.example", cid="ok")
+        with self._resolver() as resolved, self._policy("allow"):
+            run(addon.http_connect(flow))
+        self.assertIsNone(flow.response)
+        self.assertEqual(addon._conn_authority["ok"], "ok.example")
+        resolved.assert_called_once()
+
+    def test_an_allowed_name_that_resolves_into_control_net_is_still_refused(self):
+        flow = _connect_flow("rebind.example.com", cid="rb")
+        with self._resolver(return_value=self.REBOUND), self._policy("allow"), \
+             mock.patch.object(addon, "_audit") as audited:
+            run(addon.http_connect(flow))
+        self.assertIsNotNone(flow.response)
+        self.assertNotIn("rb", addon._conn_authority)
+        audited.assert_called_once()
+        decision, fields = audited.call_args[0][0], audited.call_args[1]
+        self.assertEqual(decision, "deny")
+        self.assertIn("resolves to forbidden", fields["reason"])
+        # Decided here after the control plane recorded its allow, so it is ingested.
+        self.assertFalse(fields["central"])
+
+    def test_an_allowed_plaintext_request_is_refused_if_either_name_is_rebound(self):
+        def resolve(name, *_):
+            return self.REBOUND if name == "fronted.example" else self.PUBLIC
+        flow = _http_flow("ok.example", "fronted.example", scheme="http", port=80)
+        with self._resolver(side_effect=resolve), self._policy("allow"), \
+             mock.patch.object(addon, "_audit") as audited:
+            run(addon.request(flow))
+        self.assertIsNotNone(flow.response)
+        self.assertEqual(audited.call_args[1]["host"], "fronted.example")
+        self.assertIn("resolves to forbidden", audited.call_args[1]["reason"])
+
+    def test_an_allowed_plaintext_request_is_refused_if_the_transport_host_is_rebound(self):
+        # The transport host is the one mitmproxy dials, so it must be checked too.
+        def resolve(name, *_):
+            return self.REBOUND if name == "dialled.example" else self.PUBLIC
+        flow = _http_flow("dialled.example", "public.example", scheme="http", port=80)
+        with self._resolver(side_effect=resolve), self._policy("allow"), \
+             mock.patch.object(addon, "_audit") as audited:
+            run(addon.request(flow))
+        self.assertIsNotNone(flow.response)
+        self.assertEqual(audited.call_args[1]["host"], "dialled.example")
+        self.assertIn("resolves to forbidden", audited.call_args[1]["reason"])
+
+    def test_the_lifeline_is_resolved_too(self):
+        # Allowed locally, with no control-plane call, and still checked.
+        flow = _connect_flow("api.anthropic.com", cid="lf")
+        with self._resolver(return_value=self.REBOUND), \
+             mock.patch.object(addon, "_post_authorize") as posted:
+            run(addon.http_connect(flow))
+        self.assertIsNotNone(flow.response)
+        self.assertNotIn("lf", addon._conn_authority)
+        posted.assert_not_called()
+
+    def test_an_unencodable_name_is_refused_before_policy(self):
+        # The one resolver failure that needs no query stays ahead of policy, so a
+        # name that is not a name cannot raise a card.
+        flow = _connect_flow("a..b")
+        with self._resolver() as resolved, \
+             mock.patch.object(addon, "_post_authorize") as posted, \
+             mock.patch.object(addon, "_audit") as audited:
+            run(addon.http_connect(flow))
+        self.assertIsNotNone(flow.response)
+        self.assertIn("not a resolvable hostname", audited.call_args[1]["reason"])
+        posted.assert_not_called()
+        resolved.assert_not_called()
 
 
 class ClientDisconnectedTests(unittest.TestCase):

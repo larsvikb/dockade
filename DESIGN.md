@@ -839,10 +839,10 @@ direct ipset allowlist) remains for proxy-less use. DNS needs nothing extra: the
 sandbox resolves only sibling names via the embedded resolver (local, works on
 internal nets); external resolution happens at the proxy on egress-net.
 
-What the proxy refuses before any policy is asked — the control-plane relay guard, the
+What the proxy refuses whatever policy says — the control-plane relay guard, the
 private and special-use ranges, the spelling normalization both rest on, and the honest
 limit of the resolve branch — is the proxy's own code, and is designed in
-`proxies/egress/DESIGN.md` → "The relay guard — refused before policy is asked".
+`proxies/egress/DESIGN.md` → "The relay guard — refused whatever policy says".
 
 *One destination, one spelling — the IDNA fold.* The same problem as "A destination,
 not a string" in `proxies/egress/DESIGN.md` recurs one layer up, where the consumers

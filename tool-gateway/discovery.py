@@ -81,13 +81,16 @@ _PATH_MAX_LEN = 128
 
 
 def _network(raw: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network:
+    """Strict: masking host bits off would read ``172.28.0.0/2`` as ``128.0.0.0/2``,
+    which contains sandbox-net, the network ``MCP_NET`` exists to keep credentials
+    off."""
     try:
-        return ipaddress.ip_network(raw, strict=False)
+        return ipaddress.ip_network(raw)
     except ValueError as exc:
         raise SystemExit(
-            f"tool-gateway: GATEWAY_MCP_NET {raw!r} is not a CIDR ({exc}), so no "
-            f"server's address can be checked before its credential is sent. Refusing "
-            f"to start (fail closed).") from exc
+            f"tool-gateway: GATEWAY_MCP_NET {raw!r} is not a CIDR ({exc}). It decides "
+            f"where a server's credential may be sent. Refusing to start (fail "
+            f"closed).") from exc
 
 
 #: The one network a server's credential may be sent to. A server is single-homed on

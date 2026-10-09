@@ -114,9 +114,9 @@ def _parsed(env: str, value: str, parse, expected: str):
     ``_assert_guard_configured``."""
     try:
         return parse(value)
-    except ValueError:
-        raise SystemExit(f"{env}: {value!r} is not {expected}. Refusing to start "
-                         "(fail closed).") from None
+    except ValueError as exc:
+        raise SystemExit(f"{env}: {value!r} is not {expected} ({exc}). Refusing to "
+                         "start (fail closed).") from None
 
 
 def _number(env: str, default: str, parse, expected: str):
@@ -198,8 +198,10 @@ logger = logging.getLogger("egress")
 # request. That is the point of the split — this guard is racy by nature, so the
 # far side is arranged to be worth little rather than the guard being trusted.
 def _parse_cidrs(env: str, default: str) -> tuple:
-    cidr = functools.partial(ipaddress.ip_network, strict=False)
-    return tuple(_parsed(env, c.strip(), cidr, "a CIDR")
+    """Strict: masking host bits off would read a one-digit typo, ``172.30.0.0/2`` for
+    ``/24``, as ``128.0.0.0/2``. In the lifeline list that hands the lifeline to every
+    client; in a block list it blocks a quarter of IPv4."""
+    return tuple(_parsed(env, c.strip(), ipaddress.ip_network, "a CIDR")
                  for c in os.environ.get(env, default).split(",") if c.strip())
 
 # Defaults mirror docker-compose.yml. EVERY control network is listed, and

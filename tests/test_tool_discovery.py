@@ -295,6 +295,11 @@ class PlacementTests(unittest.TestCase):
             load_discovery({"GATEWAY_MCP_NET": "not-a-cidr"})
         self.assertIn("GATEWAY_MCP_NET", str(caught.exception))
 
+    def test_a_network_with_host_bits_refuses_to_start(self):
+        with self.assertRaises(SystemExit) as caught:
+            load_discovery({"GATEWAY_MCP_NET": "172.28.0.0/2"})
+        self.assertIn("host bits", str(caught.exception))
+
 
 class PlacementOnTheWireTests(unittest.TestCase):
     """The same property through the real urllib: the connection goes to the checked

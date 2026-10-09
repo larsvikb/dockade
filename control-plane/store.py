@@ -45,7 +45,7 @@ LEGACY_CLIENT_CLASS = "sandbox"
 # The schema this code expects. Every entry in ``_STEPS`` below adds exactly one,
 # and a store records the version it is at (see ``_migrate``), so "what has already
 # run here" is a number to compare rather than a schema to interrogate.
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 def _connect() -> sqlite3.Connection:
@@ -83,12 +83,10 @@ def _step_1_client_class(conn: sqlite3.Connection) -> None:
     (pattern, client_class), ``audit`` and ``approvals`` record the class a decision
     was made under.
 
-    The rebuilt ``rules`` DDL here is a near-copy of the one in ``_init_db``, and the
-    two have to stay identical or a migrated store and a fresh one diverge in ways
-    nothing would notice until one of them hit an insert path the other had not. They
-    are compared, statement to statement, by a test rather than shared as a constant —
-    a shared one would have to be parameterized by table name, which is how the
-    migration's temporary table would end up in the fresh store's schema.
+    The rebuilt ``rules`` DDL here is the table as v1 shipped it, written out rather
+    than shared with ``_RULES_DDL``: a step keeps doing what it did when it shipped.
+    v11 rebuilds the table again from ``_RULES_DDL``, which is what makes a migrated
+    store and a fresh one agree, and a test compares the two.
 
     ``audit`` and ``approvals`` take the column NULLABLE and with no default. Those
     are records, not constraints, and a row written before classes existed genuinely
@@ -368,6 +366,91 @@ def _step_10_server_endpoint(conn: sqlite3.Connection) -> None:
           "8082 and /mcp, where they were dialled)", flush=True)
 
 
+# STANDING EGRESS POLICY. ONE definition, shared by the v11 rebuild and the fresh-store
+# DDL, as ``_LEASES_DDL`` is, and with its rule: v11 copies rows into whatever this
+# says, so a column added later needs a default, and its step must skip a table that
+# already has it.
+_RULES_DDL = """
+    CREATE TABLE IF NOT EXISTS rules (
+        -- Never reused: an edit or a revoke from an open page names a rule by it.
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        pattern    TEXT NOT NULL,          -- host or .suffix (see _match)
+        action     TEXT NOT NULL,          -- 'allow' | 'block'
+        source     TEXT NOT NULL,          -- 'seed' | 'operator'
+        created_at REAL NOT NULL,
+        -- WHICH client population this rule decides for (policy._client_class).
+        -- A rule is scoped, so the same pattern can be allowed for one class
+        -- and unknown to another — which is the point, and why uniqueness is
+        -- the PAIR. The default is the class v1 gave every rule that
+        -- predates the column.
+        client_class TEXT NOT NULL DEFAULT '%s',
+        UNIQUE(pattern, client_class)
+    )""" % LEGACY_CLIENT_CLASS
+
+# The OTHER policy table, for the MCP gateway's surface. It is a separate table rather
+# than a scope on `rules` because the rows are a different kind, not a differently
+# keyed one — the reasoning is in control-plane/DESIGN.md, "Tool policy gets its own
+# table". `action` is the only column the two share. Shared as ``_RULES_DDL`` is, under
+# the same rule for a column added later.
+_TOOL_RULES_DDL = """
+    CREATE TABLE IF NOT EXISTS tool_rules (
+        -- Never reused, as on `rules`.
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        -- The server the gateway DIALLED, by name. Not an address and not a
+        -- client_class: those name a network and are derived from a peer
+        -- address, which is the OTHER of the two identities (DESIGN.md,
+        -- "Per-server identity has two different answers"). Nothing here is
+        -- derived — the gateway knows the name because it used it.
+        server     TEXT NOT NULL,
+        -- One exact tool name. There is no wildcard and no breadth ladder:
+        -- `policy._match`'s leading dot describes a host namespace, and a
+        -- tool name has no hierarchy to widen along.
+        tool       TEXT NOT NULL,
+        action     TEXT NOT NULL,          -- 'allow' | 'deny' | 'ask'
+        -- 'operator' is the only value today, and the column is here anyway:
+        -- provenance on a policy row is what the rules view labels, and a
+        -- COLUMN is the expensive kind to add to a long-lived store (the NOTE
+        -- below `_init_db`) where this whole table was free.
+        source     TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        -- Uniqueness is the PAIR, because tool names are not namespaced
+        -- across servers: two servers can each expose an `issue_read`, and
+        -- the server half is what stops one server's policy deciding for
+        -- the other's identically named tool.
+        UNIQUE(server, tool)
+    )"""
+
+
+def _step_11_rule_ids(conn: sqlite3.Connection) -> None:
+    """v11 — ``rules`` and ``tool_rules`` are rebuilt from ``_RULES_DDL`` and
+    ``_TOOL_RULES_DDL`` with AUTOINCREMENT ids, for v9's reason with a worse outcome.
+    The UI edits a rule by id, so once the highest-id rule was revoked the next rule
+    created took its id, and an edit from a page still showing the old rule landed on
+    the new one. An `allow` meant for one tool then allowed another.
+
+    Copied as v9 copies, keeping every id, since both tables are standing policy.
+
+    ``tool_rules`` may be ABSENT: it came in with no step of its own, so a store
+    stamped before it existed reaches here without one. ``rules`` is absent only on a
+    damaged store, as v9 says of ``leases``. Either way the DDL after ``_migrate``
+    creates the table."""
+    for table, ddl, columns in (
+            ("rules", _RULES_DDL,
+             "id, pattern, action, source, created_at, client_class"),
+            ("tool_rules", _TOOL_RULES_DDL,
+             "id, server, tool, action, source, created_at")):
+        if not _columns(conn, table):
+            continue
+        conn.execute(f"ALTER TABLE {table} RENAME TO {table}_v10")
+        conn.execute(ddl)
+        copied = conn.execute(            # every name is a literal from the tuple above
+            f"INSERT INTO {table}({columns}) SELECT {columns} FROM {table}_v10"  # noqa: S608
+        ).rowcount
+        conn.execute(f"DROP TABLE {table}_v10")
+        print(f"control-plane: rebuilt {table} ({copied} row(s) copied) with ids "
+              f"that are never reused", flush=True)
+
+
 # Ordered, and the order is the only thing that decides what runs: a step is applied
 # when its version exceeds the store's, so steps must be APPEND-ONLY and never
 # renumbered, reordered or edited once shipped — a store in the field has already run
@@ -384,6 +467,7 @@ _STEPS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = (
     (8, "timed pins: tool_pins recreated", _step_8_timed_pins),
     (9, "lease ids: leases rebuilt", _step_9_lease_ids),
     (10, "per-server MCP endpoint", _step_10_server_endpoint),
+    (11, "rule ids: rules and tool_rules rebuilt", _step_11_rule_ids),
 )
 
 
@@ -448,22 +532,7 @@ def _init_db() -> None:
     # `CREATE TABLE IF NOT EXISTS rules` that would recreate the table empty.
     _migrate()
     with _connect() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS rules (
-                id         INTEGER PRIMARY KEY,
-                pattern    TEXT NOT NULL,          -- host or .suffix (see _match)
-                action     TEXT NOT NULL,          -- 'allow' | 'block'
-                source     TEXT NOT NULL,          -- 'seed' | 'operator'
-                created_at REAL NOT NULL,
-                -- WHICH client population this rule decides for (policy._client_class).
-                -- A rule is scoped, so the same pattern can be allowed for one class
-                -- and unknown to another — which is the point, and why uniqueness is
-                -- the PAIR. The default is mirrored from the migration deliberately,
-                -- so a fresh store and a migrated one have identical schemas and an
-                -- insert path cannot behave differently between them.
-                client_class TEXT NOT NULL DEFAULT '%s',
-                UNIQUE(pattern, client_class)
-            )""" % LEGACY_CLIENT_CLASS)
+        conn.execute(_RULES_DDL)
         # The servers whose tools `tool_rules` decides for: which running servers are
         # enabled, and how the gateway authenticates to them (DESIGN.md, "The control
         # plane configures servers; it never starts them"). Configuration only — the
@@ -498,36 +567,7 @@ def _init_db() -> None:
                 -- that impossible beats validating against it — the move
                 -- `_persist_candidates` already makes for egress patterns.
             )""")
-        # The OTHER policy table, for the MCP gateway's surface. It is a separate
-        # table rather than a scope on `rules` because the rows are a different kind,
-        # not a differently keyed one — the reasoning is in control-plane/DESIGN.md,
-        # "Tool policy gets its own table". `action` is the only column the two share.
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS tool_rules (
-                id         INTEGER PRIMARY KEY,
-                -- The server the gateway DIALLED, by name. Not an address and not a
-                -- client_class: those name a network and are derived from a peer
-                -- address, which is the OTHER of the two identities (DESIGN.md,
-                -- "Per-server identity has two different answers"). Nothing here is
-                -- derived — the gateway knows the name because it used it.
-                server     TEXT NOT NULL,
-                -- One exact tool name. There is no wildcard and no breadth ladder:
-                -- `policy._match`'s leading dot describes a host namespace, and a
-                -- tool name has no hierarchy to widen along.
-                tool       TEXT NOT NULL,
-                action     TEXT NOT NULL,          -- 'allow' | 'deny' | 'ask'
-                -- 'operator' is the only value today, and the column is here anyway:
-                -- provenance on a policy row is what the rules view labels, and a
-                -- COLUMN is the expensive kind to add to a long-lived store (the NOTE
-                -- below `_init_db`) where this whole table was free.
-                source     TEXT NOT NULL,
-                created_at REAL NOT NULL,
-                -- Uniqueness is the PAIR, because tool names are not namespaced
-                -- across servers: two servers can each expose an `issue_read`, and
-                -- the server half is what stops one server's policy deciding for
-                -- the other's identically named tool.
-                UNIQUE(server, tool)
-            )""")
+        conn.execute(_TOOL_RULES_DDL)
         # Pinned allows (``_TOOL_PINS_DDL``). New as a table, so it needed no `_STEPS`
         # entry until v8 recreated it.
         conn.execute(_TOOL_PINS_DDL)
@@ -688,6 +728,9 @@ def _init_db() -> None:
 #   1. the DDL above, which is what a fresh store gets;
 #   2. a new `_step_N` above, which is what every store already in the field gets;
 #   3. `SCHEMA_VERSION` and `_STEPS`, bumped and appended by one.
+# A table defined by a shared `_*_DDL` string is also what an earlier rebuild step
+# creates (v8, v9, v11), so on a store below that step the column already exists when
+# the new step runs: give it a default, and skip a table that has it.
 # `CREATE TABLE IF NOT EXISTS` is a NO-OP on an existing table — it silently does not
 # add columns — and this store is a long-lived named volume that deliberately outlives
 # container and image churn, so a column added at (1) alone is MISSING on any store

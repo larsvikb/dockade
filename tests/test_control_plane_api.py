@@ -1115,6 +1115,16 @@ class EditRuleTests(_CPTestCase):
     def test_an_unknown_id_is_a_404_not_a_silent_success(self):
         self.assertEqual(self._edit(999999, "example.com", "allow").status_code, 404)
 
+    def test_a_stale_edit_does_not_land_on_the_rule_created_after_a_revoke(self):
+        # The edit writes the typed pattern and action, so landing on another rule
+        # would replace it wholesale: here, turn a block into an allow.
+        stale = self._rule("old.example", "block")
+        cp.api_egress.revoke_rule(stale, _FakeRequest())
+        fresh = self._rule("evil.example", "block")
+        self.assertNotEqual(fresh, stale)
+        self.assertEqual(self._edit(stale, "evil.example", "allow").status_code, 404)
+        self.assertEqual(cp.policy._decide("evil.example", CLASS)[0], "deny")
+
     def test_a_malformed_pattern_is_refused_and_changes_nothing(self):
         rid = self._rule("example.com", "allow")
         resp = self._edit(rid, "http://evil.example", "allow")
@@ -3567,6 +3577,19 @@ class McpToolRuleTests(_CPTestCase):
                                      cp.api_mcp.ToolRuleEditRequest(action="allow"),
                                      _FakeRequest()).status_code, 404)
 
+    def test_a_stale_edit_does_not_land_on_the_rule_created_after_a_revoke(self):
+        # Tab A shows get_me; tab B revokes it and denies delete_repo. Had the new rule
+        # taken get_me's freed id, tab A's "allow" would have allowed delete_repo.
+        stale = _tool_rule("get_me", "ask").body["id"]
+        cp.api_mcp.revoke_mcp_rule(stale, _FakeRequest())
+        fresh = _tool_rule("delete_repo", "deny").body["id"]
+        self.assertNotEqual(fresh, stale)
+        resp = cp.api_mcp.edit_mcp_rule(
+            stale, cp.api_mcp.ToolRuleEditRequest(action="allow"), _FakeRequest())
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(cp.policy._decide_tool("mcp-github", "delete_repo")[0],
+                         "deny")
+
     def test_revoking_returns_the_tool_to_denied_not_to_held(self):
         # The one place this differs from revoking an egress rule, where the host
         # reverts to being HELD for approval. Here it reverts to the default deny, so
@@ -5477,11 +5500,10 @@ class MigrationTests(_FreshStoreTestCase):
         self.assertEqual(cp.policy._decide("example.com", "mcp")[0], "hold")
 
     def test_a_migrated_rules_table_has_the_same_schema_as_a_fresh_one(self):
-        # The DDL is written twice — once in `_init_db`, once in the rebuild — and
-        # divergence between them is the failure mode with no symptom: both stores
-        # work, differently, until one hits an insert path the other has not. Compared
-        # as SQL text, normalized for whitespace and for the temporary table name the
-        # rebuild renames away.
+        # Divergence is the failure mode with no symptom: both stores work,
+        # differently, until one hits an insert path the other has not. One string
+        # (`store._RULES_DDL`) is behind both, through v11's rebuild, so the stored SQL
+        # matches byte for byte, as for the pins.
         self._old_store("migrate-schema.db")
         cp.store._init_db()
         migrated = self._rules_sql()
@@ -5492,18 +5514,9 @@ class MigrationTests(_FreshStoreTestCase):
     @staticmethod
     def _rules_sql():
         with cp.store._connect() as conn:
-            sql = conn.execute(
+            return conn.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='rules'"
             ).fetchone()[0]
-        # Comments and indentation differ between the two definitions on purpose —
-        # one explains itself in place, the other explains itself in `_migrate`. What
-        # must match is the columns, their types, their defaults and the constraint.
-        sql = re.sub(r"--[^\n]*", " ", sql)
-        # `ALTER TABLE ... RENAME TO` rewrites the stored DDL with the new name
-        # QUOTED, so a migrated table reads `CREATE TABLE "rules"` where a fresh one
-        # reads `CREATE TABLE rules`. Same table, SQLite's own spelling.
-        sql = sql.replace('"rules"', "rules").replace("rules_migrating", "rules")
-        return " ".join(sql.split())
 
     def test_a_new_table_reaches_an_existing_store_without_a_step(self):
         # Why `tool_rules` appends no `_STEPS` entry, asserted rather than argued:
@@ -6018,6 +6031,117 @@ class SchemaVersionTests(_FreshStoreTestCase):
 
         self.assertEqual(columns("agree-servers-migrated.db", True),
                          columns("agree-servers-fresh.db", False))
+
+    # `rules` as v1 rebuilt it and `tool_rules` as it arrived, before AUTOINCREMENT.
+    _RULES_V10 = """CREATE TABLE rules (
+        id INTEGER PRIMARY KEY, pattern TEXT NOT NULL, action TEXT NOT NULL,
+        source TEXT NOT NULL, created_at REAL NOT NULL,
+        client_class TEXT NOT NULL DEFAULT 'sandbox', UNIQUE(pattern, client_class))"""
+    _TOOL_RULES_V10 = """CREATE TABLE tool_rules (
+        id INTEGER PRIMARY KEY, server TEXT NOT NULL, tool TEXT NOT NULL,
+        action TEXT NOT NULL, source TEXT NOT NULL, created_at REAL NOT NULL,
+        UNIQUE(server, tool))"""
+
+    def _v10_store(self, name, tool_rules_table=True):
+        """A store at v10, with both policy tables as v10 left them or, where
+        ``tool_rules_table`` is False, from before ``tool_rules`` existed. The ids have
+        gaps, as revokes leave them, so a copy that renumbered would be seen."""
+        self._old_store(name)
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            conn.execute("DROP TABLE rules")
+            conn.execute(self._RULES_V10)
+            conn.executemany(
+                "INSERT INTO rules(id, pattern, action, source, created_at, "
+                "client_class) VALUES (?, ?, ?, 'operator', 0, ?)",
+                [(2, "kept.test", "allow", CLASS), (5, "blocked.test", "block", CLASS)])
+            conn.execute("DROP TABLE tool_rules")
+            if tool_rules_table:
+                conn.execute(self._TOOL_RULES_V10)
+                conn.executemany(
+                    "INSERT INTO tool_rules(id, server, tool, action, source, "
+                    "created_at) VALUES (?, 'mcp-github', ?, ?, 'operator', 0)",
+                    [(2, "get_me", "allow"), (5, "delete_repo", "deny")])
+            conn.execute("PRAGMA user_version = 10")
+            conn.commit()
+
+    def test_v11_rebuilds_both_policy_tables_keeping_each_rule_under_its_id(self):
+        self._v10_store("version-rule-ids.db")
+        cp.store._init_db()
+        self.assertEqual(self._version(), cp.store.SCHEMA_VERSION)
+        with cp.store._connect() as conn:
+            self.assertEqual(
+                [tuple(r) for r in conn.execute(
+                    "SELECT id, pattern, action FROM rules ORDER BY id")],
+                [(2, "kept.test", "allow"), (5, "blocked.test", "block")])
+            self.assertEqual(
+                [tuple(r) for r in conn.execute(
+                    "SELECT id, tool, action FROM tool_rules ORDER BY id")],
+                [(2, "get_me", "allow"), (5, "delete_repo", "deny")])
+            for table in ("rules", "tool_rules"):
+                self.assertIn("AUTOINCREMENT", conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE name=?",
+                    (table,)).fetchone()[0])
+                self.assertIsNone(conn.execute(
+                    "SELECT name FROM sqlite_master WHERE name=?",
+                    (f"{table}_v10",)).fetchone())
+        # Carried, so policy decides as it did.
+        self.assertEqual(cp.policy._decide("kept.test", CLASS)[0], "allow")
+        self.assertEqual(cp.policy._decide("blocked.test", CLASS)[0], "deny")
+        _register()
+        _enable()
+        self.assertEqual(cp.policy._decide_tool("mcp-github", "get_me")[0], "allow")
+        # The highest id revoked, and the next rule does not take it.
+        with cp.store._connect() as conn:
+            conn.execute("DELETE FROM rules WHERE id=5")
+            conn.execute("DELETE FROM tool_rules WHERE id=5")
+            new_rule = conn.execute(
+                "INSERT INTO rules(pattern, action, source, created_at, client_class) "
+                "VALUES ('next.test', 'allow', 'operator', 0, ?)", (CLASS,)).lastrowid
+            new_tool_rule = conn.execute(
+                "INSERT INTO tool_rules(server, tool, action, source, created_at) "
+                "VALUES ('mcp-github', 'get_teams', 'ask', 'operator', 0)").lastrowid
+        self.assertEqual((new_rule, new_tool_rule), (6, 6))
+
+    def test_a_failed_v11_leaves_both_policy_tables_as_they_were(self):
+        # Failed at the second table, after the first is already rebuilt: the
+        # transaction has to take back the first table's rebuild too.
+        self._v10_store("version-rule-ids-failed.db")
+        with mock.patch.object(cp.store, "_TOOL_RULES_DDL", "CREATE TABLE broken ("), \
+                self.assertRaises(sqlite3.OperationalError):
+            cp.store._init_db()
+        self.assertEqual(self._version(), 10)
+        with cp.store._connect() as conn:
+            for table in ("rules", "tool_rules"):
+                self.assertEqual([r[0] for r in conn.execute(
+                    f"SELECT id FROM {table} ORDER BY id")], [2, 5])  # noqa: S608
+                self.assertNotIn("AUTOINCREMENT", conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE name=?",
+                    (table,)).fetchone()[0])
+            self.assertIsNone(conn.execute(
+                "SELECT name FROM sqlite_master WHERE name LIKE '%_v10'").fetchone())
+        cp.store._init_db()                             # and a retry completes it
+        self.assertEqual(self._version(), cp.store.SCHEMA_VERSION)
+
+    def test_v11_on_a_store_from_before_the_tool_rules_table(self):
+        self._v10_store("version-rule-ids-no-tool-rules.db", tool_rules_table=False)
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            self.assertIn("AUTOINCREMENT", conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name='tool_rules'").fetchone()[0])
+
+    def test_a_migrated_and_a_fresh_store_agree_on_the_tool_rules_table(self):
+        self._v10_store("tool-rules-agree-migrated.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            migrated = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name='tool_rules'").fetchone()[0]
+        self._use_store("tool-rules-agree-fresh.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            fresh = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name='tool_rules'").fetchone()[0]
+        self.assertEqual(migrated, fresh)
 
     def test_a_store_already_renamed_is_left_alone(self):
         # `ALTER TABLE ... RENAME COLUMN` raises rather than no-ops if it runs twice.

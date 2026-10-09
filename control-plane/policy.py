@@ -47,22 +47,28 @@ def _parse_client_classes(spec: str) -> tuple[tuple[str, object], ...]:
     """``name=cidr`` pairs, comma-separated, into (name, network) in listed order.
 
     A name may repeat, so one class can span several ranges. First match wins, which
-    is why order is preserved rather than collapsed into a dict. An unparseable entry
-    is dropped rather than fatal: the consequence is that its clients fall through to
-    UNCLASSIFIED and are held, so a typo costs approvals rather than granting any."""
+    is why order is preserved rather than collapsed into a dict.
+
+    An entry that does not parse is FATAL. Ranges may overlap, so dropping a narrow
+    class's entry would move its clients into a broader class listed after it, with
+    that class's rules and leases. Host bits are FATAL too, not masked off: masking
+    reads a one-digit typo, ``172.30.0.128/2`` for ``/25``, as ``128.0.0.0/2``, a
+    class that takes every client. UNCLASSIFIED is refused as a name: rules written
+    for clients nobody could place would start deciding for a real network."""
     out = []
-    for entry in spec.split(","):
-        entry = entry.strip()
+    for entry in (part.strip() for part in spec.split(",")):
         if not entry:
             continue
         name, _, cidr = entry.partition("=")
-        name, cidr = name.strip().lower(), cidr.strip()
-        if not name or not cidr or name == UNCLASSIFIED:
-            continue
+        name = name.strip().lower()
         try:
-            out.append((name, ipaddress.ip_network(cidr, strict=False)))
-        except ValueError:
-            continue
+            if not name or name == UNCLASSIFIED:
+                raise ValueError(f"the class name must be set and not {UNCLASSIFIED!r}")
+            out.append((name, ipaddress.ip_network(cidr.strip())))
+        except ValueError as exc:
+            raise SystemExit(
+                f"control-plane: CONTROL_CLIENT_CLASSES entry {entry!r} is not a usable "
+                f"class ({exc}). Refusing to start (fail closed).") from exc
     return tuple(out)
 
 

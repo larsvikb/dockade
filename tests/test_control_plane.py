@@ -17,6 +17,7 @@ and the store is a throwaway SQLite file in a temp dir set before import."""
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import io
 import json
 import os
@@ -33,7 +34,7 @@ _TMP = tempfile.mkdtemp(prefix="dockade-cp-test-")
 os.environ["CONTROL_DB"] = os.path.join(_TMP, "control.db")
 os.environ["CONTROL_SEED"] = os.path.join(_TMP, "nonexistent-seed.txt")
 
-from _loader import load_control_plane  # noqa: E402 (must set env first)
+from _loader import ROOT, load_control_plane  # noqa: E402 (must set env first)
 
 cp = load_control_plane()
 
@@ -758,19 +759,38 @@ class ClientClassMappingTests(unittest.TestCase):
         spec = "first=10.0.0.0/8,second=10.0.0.0/8"
         self.assertEqual(self._classify("10.1.1.1", spec), "first")
 
-    def test_an_unparseable_entry_is_dropped_not_fatal(self):
-        # Its clients fall through to UNCLASSIFIED and are HELD, so a typo in the
-        # config costs approvals rather than granting any.
-        spec = "sandbox=not-a-cidr,mcp=172.28.0.0/24"
-        self.assertEqual(self._classify("172.30.0.2", spec), cp.policy.UNCLASSIFIED)
-        self.assertEqual(self._classify("172.28.0.2", spec), "mcp")
+    def test_an_entry_that_does_not_parse_refuses_to_start(self):
+        # Dropped, `ci`'s typo would make its clients `sandbox`, with sandbox's
+        # rules: the narrow range is listed first precisely because they overlap.
+        # `/2` for `/25` parses, but masked it is 128.0.0.0/2 and takes every client.
+        for bad in ("ci=172.30.0.128/2S", "ci 172.30.0.128/25", "=172.30.0.128/25",
+                    "ci=", "ci=172.30.0.128/2"):
+            with self.subTest(entry=bad):
+                with self.assertRaises(SystemExit) as caught:
+                    cp.policy._parse_client_classes(f"{bad},sandbox=172.30.0.0/24")
+                self.assertIn("CONTROL_CLIENT_CLASSES", str(caught.exception))
+                self.assertIn(repr(bad), str(caught.exception))
+
+    def test_empty_entries_and_an_empty_list_are_not_typos(self):
+        self.assertEqual(cp.policy._parse_client_classes(""), ())
+        self.assertEqual(self._classify("172.30.0.2", " ,sandbox=172.30.0.0/24, "),
+                         "sandbox")
 
     def test_unclassified_cannot_be_claimed_as_a_class_name(self):
         # Otherwise a config could name a real network `unclassified` and rules
         # written for genuinely-unplaceable clients would start deciding for it.
-        spec = f"{cp.policy.UNCLASSIFIED}=10.0.0.0/8"
-        self.assertEqual(self._classify("10.1.1.1", spec), cp.policy.UNCLASSIFIED)
-        self.assertEqual(cp.policy._parse_client_classes(spec), ())
+        with self.assertRaises(SystemExit):
+            cp.policy._parse_client_classes(f"{cp.policy.UNCLASSIFIED}=10.0.0.0/8")
+
+    def test_the_setting_refuses_a_typo_at_import(self):
+        # The parser is only half of it: the module-level setting has to go through
+        # it, so the control plane stops before it serves a request.
+        spec = importlib.util.spec_from_file_location(
+            "dockade_policy_typo", ROOT / "control-plane/policy.py")
+        with mock.patch.dict(os.environ, {"CONTROL_CLIENT_CLASSES": "ci=10.0.0.O/8"}), \
+                self.assertRaises(SystemExit) as caught:
+            spec.loader.exec_module(importlib.util.module_from_spec(spec))
+        self.assertIn("'ci=10.0.0.O/8'", str(caught.exception))
 
 
 class MatchTests(unittest.TestCase):

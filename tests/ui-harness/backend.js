@@ -41,7 +41,9 @@ const LEASES = [
   { id: 1, host: "files.pythonhosted.org", client_class: "agent",
     expires_at: NOW + 900, granted_by: "operator@127.0.0.1" },
   { id: 2, host: "a.cdn.example", client_class: "agent", expires_at: NOW + 300 },
-  { id: 3, host: "b.cdn.example", client_class: "agent", expires_at: NOW + 600 },
+  // Markup in the host, which the agent chooses, so the run shows it rendered as text.
+  { id: 3, host: `b<img src=x onerror="alert('x')">.cdn.example`, client_class: "agent",
+    expires_at: NOW + 600 },
 ];
 
 const SERVERS = [
@@ -157,6 +159,14 @@ export function respond(method, path, body, query) {
   }
   if (path === "/api/audit/events" && query.get("before") === "cursor-11") {
     return { status: 200, json: EVENTS_OLDER };
+  }
+  // Lease 2 lapsed between the table being drawn and the click, as the backend's 404
+  // says; any other revoke lands. The list stays fixed, like the MCP tab's.
+  const lease = path.match(/^\/api\/egress\/leases\/([^/]+)\/revoke$/);
+  if (method === "POST" && lease) {
+    return lease[1] === "2"
+      ? { status: 404, json: { ok: false, detail: "unknown lease" } }
+      : { status: 200, json: { ok: true } };
   }
   if (method === "GET" && path in GETS) return { status: 200, json: GETS[path] };
   const resolve = path.match(/^\/approvals\/([^/]+)\/resolve$/);

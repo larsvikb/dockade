@@ -21,7 +21,7 @@
 import { mountAudit, refreshAudit } from "./audit.js";
 import { esc } from "./dom.js";
 import { revokePreview, createPreview, editPreview } from "./egress-rules.js";
-import { leaseLabel, leaseRemaining, leaseCountdown, groupLeases } from "./leases.js";
+import { leaseLabel, mountLeases, refreshLeases, updateLeaseCountdowns } from "./leases.js";
 import {
   pinText,
   mountMcp, refreshServers, refreshToolRules, refreshInventory, refreshToolPins,
@@ -35,9 +35,8 @@ import {
 } from "./holds.js";
 import { payloadDisclosure, payloadHazards, payloadTokens, renderPayload }
   from "./payload.js";
-import { shortActor } from "./provenance.js";
 import { saturationState, ackCount } from "./saturation.js";
-import { rulesStatus, leasesStatus, renderListStatus } from "./status.js";
+import { rulesStatus, renderListStatus } from "./status.js";
 import { fmtTime, fmtStamp } from "./time.js";
 
 // ── pure decision helpers (unit-tested) ─────────────────────────────────────
@@ -1128,22 +1127,12 @@ function start() {
   // ── the decisions view: audit.js ──────────────────────────────────────────
   mountAudit();
 
-  // ── the rules and leases tables ───────────────────────────────────────────
+  // ── the rules table ───────────────────────────────────────────────────────
   // Whether a load has ever succeeded, and whether the last one failed (`pollStatus`
   // in status.js says what each pair means on screen).
   let rulesLoaded = false;
   let rulesFailed = false;
   let rulesById = new Map();
-  // The same two facts for the leases poll, kept separately rather than folded into the
-  // rules ones: the two views are filled by two fetches, and one of them failing while
-  // the other succeeds is a state the page has to be able to describe.
-  let leasesLoaded = false;
-  let leasesFailed = false;
-  let leasesById = new Map();
-  // Which lease groups the operator has opened, by (class, domain) key. Outside the
-  // render deliberately — see the toggle handler — and pruned to the live groups on
-  // every refresh so a lapsed domain does not keep an expansion nobody asked for.
-  const expandedLeaseGroups = new Set();
   // Populated by refreshConfig, not by the rules table: a class with no rules yet is
   // exactly the one an operator most needs to write the first rule for.
   let clientClasses = [];
@@ -1156,15 +1145,6 @@ function start() {
 
   function renderRulesStatus(rowCount) {
     renderListStatus(rulesEmpty, rulesStatus(rowCount, rulesFailed, rulesLoaded));
-  }
-
-  const leasesEl = document.getElementById("leases");
-  const leasesTableEl = document.getElementById("leases-table");
-  const leasesEmptyEl = document.getElementById("leases-empty");
-  const leasesCountEl = document.getElementById("leasecount");
-
-  function renderLeasesStatus(rowCount) {
-    renderListStatus(leasesEmptyEl, leasesStatus(rowCount, leasesFailed, leasesLoaded));
   }
 
   async function refreshRules() {
@@ -1288,180 +1268,8 @@ function start() {
     refreshRules();
   });
 
-  // ── the live leases ───────────────────────────────────────────────────────
-  // What is being allowed RIGHT NOW on a timer, which until this table existed was
-  // the one kind of granted egress with nowhere to see it: a lease writes no rule, so
-  // the standing-policy view is silent about it, and by the time an operator went
-  // looking in the decisions log the grant might already have lapsed.
-  //
-  // It also makes the revoke button worth having. A grant nobody can see is a grant
-  // nobody closes early, which would leave the configured duration doing the whole job
-  // — and it is exactly that revocability that let the default be half an hour rather
-  // than a few minutes.
-  async function refreshLeases() {
-    let rows;
-    try {
-      const res = await fetch("/api/egress/leases");
-      // Checked like the rules poll: a 4xx body reaching .json() either throws
-      // somewhere less obvious or parses into something that renders as "nothing is
-      // leased", which is the reassuring reading and the wrong one.
-      if (!res.ok) throw new Error(String(res.status));
-      rows = await res.json();
-    } catch (e) {
-      // Keeps the rows and says so, rather than blanking a table whose whole subject
-      // is what is in force at this moment — an empty one would read as "nothing is
-      // granted" when what happened is that we stopped being able to tell.
-      leasesFailed = true;
-      renderLeasesStatus(document.getElementById("leases").rows.length);
-      return;
-    }
-    leasesFailed = false;
-    leasesLoaded = true;
-    leasesById = new Map(rows.map(r => [String(r.id), r]));
-    // The count is of LEASES, not of rendered rows: it answers "how much is granted
-    // right now", and a number that shrank because four hosts folded into one line
-    // would be answering a question about the table instead.
-    leasesCountEl.textContent = rows.length ? `· ${rows.length} live` : "";
-    leasesTableEl.hidden = rows.length === 0;
-    const groups = groupLeases(rows);
-    // Groups that no longer exist are dropped from the expanded set here rather than
-    // left to accumulate: the key is (class, domain), so a group whose last lease
-    // lapsed would otherwise keep its expansion and silently re-expand if the same
-    // domain were leased again half an hour later.
-    const live = new Set(groups.map(g => g.key));
-    for (const key of [...expandedLeaseGroups]) {
-      if (!live.has(key)) expandedLeaseGroups.delete(key);
-    }
-    leasesEl.innerHTML = groups.map(g => {
-      if (!g.grouped) return leaseRow(g.leases[0], false);
-      const open = expandedLeaseGroups.has(g.key);
-      const cd = leaseCountdown(leaseRemaining(g.soonest, Date.now()));
-      // The summary counts down by the group's SOONEST expiry, which is the next thing
-      // about it that will change — and it carries `data-expires` like any other
-      // countdown cell, so the one-second tick moves it with no special case.
-      //
-      // No revoke on this row. A button that ended four grants at once is a different
-      // and much sharper action than the per-lease one, and it would need the confirm
-      // step this table deliberately does not have; revocation stays where the thing
-      // being revoked is named.
-      const summary = `<tr class="lease-group">
-        <td><button type="button" class="group-toggle"
-              data-group="${esc(g.key)}" aria-expanded="${open}"
-            >${open ? "▾" : "▸"}</button>
-          <code>${esc(g.domain)}</code>
-          <span class="ts">${g.count} hosts</span></td>
-        <td class="ts">${esc(g.clientClass)}</td>
-        <td class="lease-left${cd.urgent ? " urgent" : ""}"
-            data-expires="${esc(String(g.soonest))}">${esc(cd.text)}</td>
-        <td class="ts">first to lapse</td>
-        <td></td></tr>`;
-      return summary + g.leases.map(r => leaseRow(r, true, g.key, open)).join("");
-    }).join("");
-    renderLeasesStatus(rows.length);
-  }
-
-  // One lease as a row. `member` rows belong to a drawn group: indented, and hidden
-  // while it is collapsed — HIDDEN rather than omitted, so expanding is a class flip on
-  // rows already in the DOM and cannot race the four-second poll that would otherwise
-  // have to re-render to produce them.
-  //
-  // `data-expires` carries the absolute deadline so the one-second tick can rewrite the
-  // countdown without another fetch. The row is otherwise static, and re-polling once a
-  // second to move a clock would be the firehose `/api/egress/leases` avoids by not
-  // sending a remaining-seconds field at all.
-  function leaseRow(r, member, groupKey, open) {
-    const cd = leaseCountdown(leaseRemaining(r.expires_at, Date.now()));
-    return `<tr${member ? ` class="lease-member" data-group="${esc(groupKey)}"` : ""}
-        ${member && !open ? "hidden" : ""}>
-      <td><code>${esc(r.host)}</code></td>
-      <td class="ts">${esc(r.client_class || "")}</td>
-      <td class="lease-left${cd.urgent ? " urgent" : ""}"
-          data-expires="${esc(String(r.expires_at))}">${esc(cd.text)}</td>
-      <td class="actor" title="${esc(r.granted_by || "")}"
-        >${esc(shortActor(r.granted_by))}</td>
-      <td><button type="button" class="revoke"
-            data-lease="${esc(String(r.id))}">revoke</button></td></tr>`;
-  }
-
-  // Only the countdown cells, and only their text and urgency — never the row. Rebuilding
-  // the table every second would drop a click landing on a revoke button at the moment
-  // the tick fired, which is precisely when an operator is most likely to be pressing one.
-  function updateLeaseCountdowns() {
-    const now = Date.now();
-    for (const cell of leasesEl.querySelectorAll("td.lease-left")) {
-      const cd = leaseCountdown(leaseRemaining(cell.dataset.expires, now));
-      cell.textContent = cd.text;
-      cell.classList.toggle("urgent", cd.urgent);
-    }
-  }
-
-  // Delegated for the reason the rules table's handler is: the tbody is replaced
-  // wholesale on every poll, so a per-button listener would be re-bound every four
-  // seconds and lost in between.
-  //
-  // No `confirm()`, where revoking a RULE has one. The asymmetry is the point: that
-  // dialog guards an action with no undo, and this one has an obvious undo — the host
-  // goes back to being held, so the next request raises a card and the operator can
-  // grant it again. Making the reversible action as heavy as the irreversible one is
-  // how a confirmation stops being read.
-  document.getElementById("leases").addEventListener("click", async (ev) => {
-    // Expanding a group changes nothing and reaches nothing, so it is handled before
-    // the revoke path and takes none of its ceremony. The state lives OUTSIDE the
-    // render (`expandedLeaseGroups`) because the table is replaced wholesale every four
-    // seconds: held in the DOM alone, an expanded group would collapse itself on the
-    // next poll, which is the same class of bug as re-rendering on the one-second tick.
-    const toggle = ev.target.closest("button.group-toggle");
-    if (toggle) {
-      const key = toggle.dataset.group;
-      if (expandedLeaseGroups.has(key)) expandedLeaseGroups.delete(key);
-      else expandedLeaseGroups.add(key);
-      const open = expandedLeaseGroups.has(key);
-      // Applied to the rows already on screen rather than by re-rendering, so the click
-      // does not depend on a fetch and cannot be undone by one in flight.
-      toggle.textContent = open ? "▾" : "▸";
-      toggle.setAttribute("aria-expanded", String(open));
-      // Matched by comparing `dataset.group` rather than by an attribute SELECTOR built
-      // from the key. Half the key is a host the agent chose, so a selector would need
-      // escaping to be correct inside a quoted attribute value — `CSS.escape` does in
-      // fact produce a string that matches there, but reasoning about why is work this
-      // does not need to cost. A comparison has no escaping question to get wrong.
-      for (const row of leasesEl.querySelectorAll("tr.lease-member")) {
-        if (row.dataset.group === key) row.hidden = !open;
-      }
-      return;
-    }
-    const btn = ev.target.closest("button.revoke");
-    if (!btn) return;
-    const row = leasesById.get(btn.dataset.lease);
-    if (!row) return;
-    btn.disabled = true;
-    try {
-      const res = await fetch(
-        `/api/egress/leases/${encodeURIComponent(btn.dataset.lease)}/revoke`,
-        { method: "POST" });
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok || !body.ok) {
-        // A 404 here is the ordinary race, not a fault: the lease expired, or another
-        // tab revoked it, between this table being drawn and the click. Said plainly
-        // rather than as a failure, because the operator's intent — that host is no
-        // longer leased — is now satisfied either way.
-        window.alert(res.status === 404
-          ? "That lease is already gone — it expired or was revoked elsewhere."
-          : `Could not revoke: ${body.detail || res.status}`);
-        btn.disabled = false;
-        refreshLeases();
-        return;
-      }
-    } catch (e) {
-      window.alert("Could not revoke: the control plane is unreachable.");
-      btn.disabled = false;
-      return;
-    }
-    refreshLeases();
-    // The revocation is an audited decision, so it belongs in the decisions view as
-    // soon as it happened rather than on that view's own next poll.
-    refreshAudit();
-  });
+  // ── the live leases: leases.js ────────────────────────────────────────────
+  mountLeases();
 
   // ── writing a rule with no held request behind it ─────────────────────────
   // The config-first half of policy. Every other rule in the store is downstream of

@@ -138,4 +138,23 @@ export const STEPS = [
     await page.click("#audit-clear");
     await clock(1);
   }],
+
+  // The live leases (leases.js): a folded group opened, the countdowns moving on the
+  // one-second tick, a revoke, one that lost the race with the lease's expiry, and the
+  // group closed again. Revoking re-fetches the table, so the group staying open
+  // through it is part of what the run records.
+  ["approvals tab, again", async ({ page }) => { await page.click("#tab-approvals"); }],
+  ["lease group opened", async ({ page }) => {
+    await page.click("#leases button.group-toggle");
+  }],
+  ["lease countdowns tick", async ({ clock }) => { await clock(1000); }],
+  ["lease revoked", async ({ page }) => {
+    await page.click('#leases button.revoke[data-lease="1"]');
+  }],
+  ["lease already gone", async ({ page }) => {
+    await page.click('#leases button.revoke[data-lease="2"]');
+  }],
+  ["lease group closed", async ({ page }) => {
+    await page.click("#leases button.group-toggle");
+  }],
 ];

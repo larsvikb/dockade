@@ -162,8 +162,8 @@ _RELAY_ROUTES = (
     # primitive rather than an id.
     ("POST", re.compile(r"^/api/egress/rules/[0-9]{1,19}/revoke$")),
     # Its own entry, not a widened one, for the reason the GET/POST split above gives:
-    # an edit can flip a block into an allow, so it grants exactly as the collection
-    # POST does and belongs in that class rather than beside the revoke it sits next to.
+    # an edit can flip a block into an allow, so it grants as directly as the
+    # collection POST does. (The revoke above can loosen too, by lifting a block.)
     ("POST", re.compile(r"^/api/egress/rules/[0-9]{1,19}/edit$")),
     # The TIMED grants, under the same surface prefix. Two entries and not three: a
     # lease is only ever created by resolving a card, so there is no collection POST

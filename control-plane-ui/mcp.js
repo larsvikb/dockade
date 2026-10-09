@@ -1068,11 +1068,15 @@ function mountToolPolicy() {
         ? await fetch(`/api/mcp/rules/${id}/revoke`, { method: "POST" })
         : await fetch(`/api/mcp/rules/${id}/edit`, {
             method: "POST", headers: { "content-type": "application/json" },
-            body: JSON.stringify({ action: btn.dataset.action }) });
+            // The row this button was rendered with, so a table older than the rule
+            // now holding this id is refused (409) rather than edits that rule.
+            body: JSON.stringify({ action: btn.dataset.action,
+                                   expected_server: row.server, expected_tool: row.tool,
+                                   expected_action: row.action }) });
       const body = await res.json().catch(() => ({}));
       if (!res.ok || !body.ok) {
-        // 404 is the one worth reading: the rule was revoked in another tab, so the
-        // table on screen is stale and retrying cannot help.
+        // 404 and 409 are the ones worth reading: the rule was revoked or changed in
+        // another tab, so the table on screen is stale and retrying cannot help.
         window.alert(`Could not ${revoking ? "revoke" : "update"}: ` +
                      `${body.detail || res.status}`);
         btn.disabled = false;

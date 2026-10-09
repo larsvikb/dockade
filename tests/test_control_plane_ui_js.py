@@ -3159,6 +3159,21 @@ def _fn_body(src: str, signature: str, indent: str = "  ") -> str:
     return m.group(1)
 
 
+def _poll_paths(body: str, indent: str = "  ") -> tuple[str, str]:
+    """A poll's failure path, from its `catch (e) {` to the brace that closes it at
+    `indent`, and its success path, everything after. Each is asserted alone because
+    both make the same calls, so a path that stopped reporting would pass a check over
+    the whole body. The catch must end in `return;`, or the code after it is not the
+    success path."""
+    _, catch, after = body.partition("catch (e) {")
+    failure, sep, success = after.partition(f"\n{indent}}}")
+    if not (catch and sep and failure.rstrip().endswith("return;")):
+        raise AssertionError("no `catch (e) {` that ends in `return;` — the failure "
+                             "path changed shape, and the guards that read it would "
+                             "read the wrong code")
+    return failure, success
+
+
 class AuditTableSourceTests(unittest.TestCase):
     """`refreshAudit` and the two row renderers touch the DOM, in `audit.js`, and
     cannot be unit-tested, so the parts of them that would fail SILENTLY are asserted
@@ -3199,8 +3214,12 @@ class AuditTableSourceTests(unittest.TestCase):
     def test_a_failed_refresh_keeps_the_rows_and_reports_the_staleness(self):
         # Both halves matter. Clearing on failure would throw away the only data the
         # operator has; not reporting it is the bug being fixed.
-        self.assertIn("auditFailed = true", self.body.group(1))
-        self.assertIn("renderAuditStatus(", self.body.group(1))
+        failure, _ = _poll_paths(self.body.group(1))
+        self.assertIn("auditFailed = true", failure)
+        self.assertIn("renderAuditStatus(", failure)
+        # A refusal outranks every other status line, so a failure that kept the last
+        # one would show the refusal instead of saying the refresh failed.
+        self.assertIn("auditRefused = null", failure)
         self.assertNotRegex(
             self.body.group(1),
             r'catch[^}]*innerHTML\s*=\s*""',
@@ -3209,12 +3228,12 @@ class AuditTableSourceTests(unittest.TestCase):
     def test_a_recovered_poll_clears_the_warning_and_re_renders(self):
         # The recovery half, which was asserted for neither table until a mutation of
         # the policy one survived. Both strings appear in the failure path too, so the
-        # split at the catch's `return` is what makes this about the SUCCESS path.
-        # At the catch's closing indent: the 400 branch's `return;` closes deeper.
-        _, sep, success = self.body.group(1).partition("return;\n  }")
-        self.assertTrue(sep, "the failure path no longer returns early")
+        # split at the catch is what makes this about the SUCCESS path.
+        _, success = _poll_paths(self.body.group(1))
         self.assertIn("auditFailed = false", success)
         self.assertIn("renderAuditStatus(", success)
+        # And the refusal goes once a poll succeeds; kept, it would sit above good rows.
+        self.assertIn("auditRefused = null", success)
 
     def test_a_non_ok_response_is_a_failure_not_a_row_of_json(self):
         # `fetch` does not reject on 4xx/5xx. Without this check a 502 from the relay
@@ -3597,12 +3616,7 @@ class LeaseTableSourceTests(unittest.TestCase):
 
     def test_a_failed_refresh_keeps_the_rows_and_reports_the_staleness(self):
         body = self.body
-        # The failure path alone: the success path renders the status too, so over the
-        # whole body a catch that stopped reporting would still pass.
-        _, catch, after = body.partition("catch (e) {")
-        self.assertTrue(catch, "refreshLeases no longer catches a failed poll")
-        failure, sep, _ = after.partition("return;\n  }")
-        self.assertTrue(sep, "the failure path no longer returns early")
+        failure, _ = _poll_paths(body)
         self.assertIn("leasesFailed = true", failure)
         self.assertIn("renderLeasesStatus(", failure)
         self.assertNotRegex(body, r'catch[^}]*innerHTML\s*=\s*""',
@@ -3615,8 +3629,7 @@ class LeaseTableSourceTests(unittest.TestCase):
         self.assertRegex(self.body, r"if\s*\(!res\.ok\)\s*throw")
 
     def test_a_recovered_poll_clears_the_warning_and_re_renders(self):
-        _, sep, success = self.body.partition("return;\n  }")
-        self.assertTrue(sep, "the failure path no longer returns early")
+        _, success = _poll_paths(self.body)
         self.assertIn("leasesFailed = false", success)
         self.assertIn("renderLeasesStatus(", success)
 
@@ -3715,8 +3728,10 @@ class PolicyTableSourceTests(unittest.TestCase):
 
     def test_a_failed_refresh_keeps_the_rules_and_reports_the_staleness(self):
         body = self.body.group(1)
-        self.assertIn("rulesFailed = true", body)
-        self.assertIn("renderRulesStatus(", body)
+        # Inside `start()`, so the catch closes at four spaces.
+        failure, _ = _poll_paths(body, "    ")
+        self.assertIn("rulesFailed = true", failure)
+        self.assertIn("renderRulesStatus(", failure)
         self.assertNotRegex(body, r'catch[^}]*innerHTML\s*=\s*""',
                             "a failed poll must not blank the policy table")
         # The specific regression: a catch that discards the error and says nothing.
@@ -3739,11 +3754,9 @@ class PolicyTableSourceTests(unittest.TestCase):
         one blip; without a render on the success path the warning stays on screen
         until the next failure, and the empty state never appears at all.
 
-        Split at the catch's `return`, so these are asserted on the SUCCESS path
-        specifically — both strings also occur in the failure path, where they prove
-        nothing."""
-        _, sep, success = self.body.group(1).partition("return;\n    }")
-        self.assertTrue(sep, "the failure path no longer returns early")
+        Split at the catch, so these are asserted on the SUCCESS path specifically —
+        both strings also occur in the failure path, where they prove nothing."""
+        _, success = _poll_paths(self.body.group(1), "    ")
         self.assertIn("rulesFailed = false", success)
         self.assertIn("renderRulesStatus(", success)
 
@@ -3918,6 +3931,35 @@ class ServerWriteSourceTests(unittest.TestCase):
         # And what is sent is that fresh row, not the one the click was made on.
         self.assertIn("serverEditBody(row, enable)", handler.group(0))
         self.assertIn("row = await freshServer(", handler.group(0))
+
+
+class ServerAndInventoryRefreshSourceTests(unittest.TestCase):
+    """The servers and inventory refreshes in `mcp.js` keep their last list on a
+    failure and set a flag the view words as "did not refresh". Each flag is set once,
+    and the servers' failure path renders a list spelled differently from the success
+    path's, so the whole function can be searched for each."""
+
+    def setUp(self):
+        src = MCP_JS.read_text()
+        self.servers = _fn_body(src, "refreshServers()", "")
+        self.inventory = _fn_body(src, "refreshInventory()", "")
+
+    def test_a_failed_servers_refresh_keeps_the_list_and_says_so(self):
+        # The flag also stops `freshServer` acting on a stale copy; the kept list is
+        # what the warning sits above.
+        self.assertIn("serversFailed = true", self.servers)
+        self.assertIn("renderServers([...serversByName.values()])", self.servers)
+
+    def test_a_recovered_servers_refresh_clears_the_warning(self):
+        self.assertIn("serversFailed = false", self.servers)
+
+    def test_a_failed_inventory_poll_keeps_the_picture_and_says_so(self):
+        self.assertIn("inventoryFailed = true", self.inventory)
+        self.assertNotRegex(self.inventory, r"catch[\s\S]*?inventory\s*=\s*\{\}",
+                            "a failed poll must not empty the picker")
+
+    def test_a_recovered_inventory_poll_clears_the_warning(self):
+        self.assertIn("inventoryFailed = false", self.inventory)
 
 
 class ToolPolicySourceTests(unittest.TestCase):
@@ -4693,6 +4735,18 @@ class PinnedAllowTableSourceTests(unittest.TestCase):
 
     def test_a_refused_poll_is_not_rendered_as_no_pins(self):
         self.assertIn("if (!res.ok) throw", self.poll)
+
+    def test_a_failed_refresh_keeps_the_pins_and_reports_the_staleness(self):
+        # The flag is what makes the kept rows read as stale rather than current; each
+        # assignment occurs once, so the whole poll can be searched for it.
+        self.assertIn("toolPinsFailed = true", self.poll)
+        # An empty list would say no call is answered without a card.
+        self.assertNotRegex(self.poll, r"catch[\s\S]*?toolPins\s*=\s*\[\]",
+                            "a failed poll must not blank the table")
+
+    def test_a_recovered_poll_clears_the_warning(self):
+        self.assertIn("toolPinsFailed = false", self.poll)
+        self.assertIn("toolPinsLoaded = true", self.poll)
 
     def test_a_timed_pins_cell_carries_its_deadline_for_the_tick(self):
         self.assertIn("leftCell.dataset.expires = String(row.expires_at)", self.rows)

@@ -149,6 +149,17 @@ const MCP_WRITES = [
   [/^\/api\/mcp\/pins\/[^/]+\/revoke$/, () => ({ ok: true })],
 ];
 
+// A standing rule's edit and revoke, answered as ones that landed on the fixture's rule.
+const RULE_WRITES = [
+  [/^\/api\/egress\/rules\/[^/]+\/revoke$/, () => ({ ok: true })],
+  [/^\/api\/egress\/rules\/([^/]+)\/edit$/, (body, [, id]) => {
+    const rule = RULES.find(r => String(r.id) === decodeURIComponent(id));
+    return { ok: true, changed: true, pattern: body.pattern, action: body.action,
+             client_class: rule.client_class,
+             previous: { pattern: rule.pattern, action: rule.action } };
+  }],
+];
+
 // `{status, json}` for a request, or null for one this backend does not know — which
 // the harness records, since a path the page asks for and no fixture answers is
 // either a fixture to add or a change in what the page asks.
@@ -173,7 +184,8 @@ export function respond(method, path, body, query) {
   if (method === "POST" && resolve) {
     return { status: 200, json: resolved(decodeURIComponent(resolve[1]), body) };
   }
-  const write = method === "POST" && MCP_WRITES.find(([re]) => re.test(path));
-  if (write) return { status: 200, json: write[1](body) };
+  const write = method === "POST"
+    && [...MCP_WRITES, ...RULE_WRITES].find(([re]) => re.test(path));
+  if (write) return { status: 200, json: write[1](body, path.match(write[0])) };
   return null;
 }

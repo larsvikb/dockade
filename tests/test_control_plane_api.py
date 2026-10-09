@@ -705,7 +705,7 @@ class RevokeRuleTests(_CPTestCase):
 
     def test_an_operator_rule_is_removed(self):
         rid = self._rule("evil.example", "block")
-        resp = cp.api_egress.revoke_rule(rid, _FakeRequest())
+        resp = _revoke_rule(rid, _FakeRequest())
         self.assertEqual(resp.status_code, 200)
         self.assertNotIn("evil.example", self._patterns())
 
@@ -716,14 +716,14 @@ class RevokeRuleTests(_CPTestCase):
         table is empty, so a store whose every rule could be revoked would resurrect
         the entire seed allowlist on the next restart."""
         rid = self._rule("pypi.org", "allow", source="seed")
-        resp = cp.api_egress.revoke_rule(rid, _FakeRequest())
+        resp = _revoke_rule(rid, _FakeRequest())
         self.assertEqual(resp.status_code, 403)
         self.assertIn("pypi.org", self._patterns())
 
     def test_the_refusal_says_where_to_change_it_instead(self):
         # A refusal with no next step is a dead end; the seed file IS the next step.
         rid = self._rule("pypi.org", "allow", source="seed")
-        body = cp.api_egress.revoke_rule(rid, _FakeRequest()).body
+        body = _revoke_rule(rid, _FakeRequest()).body
         self.assertIn("egress-allowlist.txt", json.dumps(body))
 
     def test_the_rules_table_can_never_be_emptied_by_revocation(self):
@@ -732,14 +732,58 @@ class RevokeRuleTests(_CPTestCase):
         self._rule("seeded.example", "allow", source="seed")
         ids = [self._rule(f"op{i}.example") for i in range(3)]
         for rid in ids:
-            cp.api_egress.revoke_rule(rid, _FakeRequest())
+            _revoke_rule(rid, _FakeRequest())
         self.assertEqual(self._patterns(), {"seeded.example"})
         # And therefore a restart does not re-seed.
         self.assertEqual(cp.store._seed_if_empty(), 0)
 
     def test_an_unknown_id_is_a_404_not_a_silent_success(self):
         self.assertEqual(
-            cp.api_egress.revoke_rule(999999, _FakeRequest()).status_code, 404)
+            _revoke_rule(999999, _FakeRequest()).status_code, 404)
+
+    def test_a_stale_revoke_does_not_uncover_a_wider_allow(self):
+        # The page shows old.test; the id now holds a block on evil.example.com, under
+        # an allow on .example.com. Revoking that block would let it through.
+        self._rule(".example.com", "allow")
+        rid = self._rule("old.test", "allow")
+        with cp.store._connect() as conn:
+            conn.execute("DELETE FROM rules WHERE id=?", (rid,))
+            conn.execute("INSERT INTO rules(id, pattern, action, source, created_at) "
+                         "VALUES (?, 'evil.example.com', 'block', 'operator', 0)",
+                         (rid,))
+        resp = _revoke_rule(rid, seen={"pattern": "old.test", "action": "allow"})
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn("evil.example.com (block)", resp.body["detail"])
+        self.assertEqual(cp.policy._decide("evil.example.com", CLASS)[0], "deny")
+
+    def test_a_revoke_racing_another_write_is_refused(self):
+        # As the edit's race test: the DELETE carries the checked row in its WHERE.
+        # A rule revoked meanwhile is a 404, as it would have been a moment earlier.
+        for other, status in (("UPDATE rules SET action='allow' WHERE id=?", 409),
+                              ("DELETE FROM rules WHERE id=?", 404)):
+            with self.subTest(other=other):
+                rid = self._rule("race.example", "block")
+
+                def other_operator(rule_id, row, req, sql=other):
+                    with cp.store._connect() as conn:
+                        conn.execute(sql, (rule_id,))
+                    return None
+
+                with mock.patch.object(cp.api_egress, "_stale",
+                                       side_effect=other_operator):
+                    resp = _revoke_rule(rid)
+                self.assertEqual(resp.status_code, status)
+                with cp.store._connect() as conn:
+                    conn.execute("DELETE FROM rules")
+
+    def test_a_revoke_from_a_page_older_than_another_edit_is_refused(self):
+        # Another operator turned the block into an allow; this page still offers to
+        # revoke the block, and its confirm said so.
+        rid = self._rule("example.com", "block")
+        _edit_rule(rid, "example.com", "allow")
+        resp = _revoke_rule(rid, seen={"action": "block"})
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(self._patterns(), {"example.com"})
 
     def test_revocation_is_audited_with_provenance(self):
         """Editing standing policy is more consequential than any single egress
@@ -748,7 +792,7 @@ class RevokeRuleTests(_CPTestCase):
         caller — but a forged revocation is at least visible afterwards."""
         rid = self._rule(".github.com", "allow")
         with mock.patch.object(cp.store, "_audit") as audit:
-            cp.api_egress.revoke_rule(rid, _FakeRequest(peer="172.31.0.9"))
+            _revoke_rule(rid, _FakeRequest(peer="172.31.0.9"))
         self.assertEqual(audit.call_args.args[0], "revoke")
         kwargs = audit.call_args.kwargs
         self.assertEqual(kwargs["host"], ".github.com")
@@ -760,7 +804,7 @@ class RevokeRuleTests(_CPTestCase):
         # rule is gone rather than replaced.
         rid = self._rule("evil.example", "block")
         with mock.patch.object(cp.store, "_audit") as audit:
-            cp.api_egress.revoke_rule(rid, _FakeRequest())
+            _revoke_rule(rid, _FakeRequest())
         self.assertIn("held for approval", audit.call_args.kwargs["reason"])
 
     def test_a_revoked_allow_stops_deciding_requests(self):
@@ -768,7 +812,7 @@ class RevokeRuleTests(_CPTestCase):
         # inspecting the table: policy actually changes.
         rid = self._rule("gone.example", "allow")
         self.assertEqual(cp.policy._decide("gone.example", CLASS)[0], "allow")
-        cp.api_egress.revoke_rule(rid, _FakeRequest())
+        _revoke_rule(rid, _FakeRequest())
         self.assertEqual(cp.policy._decide("gone.example", CLASS)[0], "hold")
 
     def test_a_revoked_block_reverts_to_hold_not_allow(self):
@@ -776,7 +820,7 @@ class RevokeRuleTests(_CPTestCase):
         # it does NOT become allowed, it becomes decidable.
         rid = self._rule("bad.example", "block")
         self.assertEqual(cp.policy._decide("bad.example", CLASS)[0], "deny")
-        cp.api_egress.revoke_rule(rid, _FakeRequest())
+        _revoke_rule(rid, _FakeRequest())
         self.assertEqual(cp.policy._decide("bad.example", CLASS)[0], "hold")
 
 
@@ -867,6 +911,31 @@ def _create(pattern, action="allow", client_class=CLASS, request=None):
     return cp.api_egress.create_rule(
         cp.api_egress.RuleCreateRequest(pattern=pattern, action=action,
                                         client_class=client_class),
+        request if request is not None else _FakeRequest())
+
+
+def _shown_rule(rule_id, seen=None):
+    """The ``RuleExpectation`` fields a page showing the rule as it stands sends;
+    ``seen`` overrides fields of that row, for a page that is out of date."""
+    with cp.store._connect() as conn:
+        row = conn.execute("SELECT pattern, action, client_class FROM rules WHERE id=?",
+                           (rule_id,)).fetchone()
+    shown = {**(dict(row) if row else {}), **(seen or {})}
+    return {"expected_pattern": shown.get("pattern"),
+            "expected_action": shown.get("action"),
+            "expected_client_class": shown.get("client_class")}
+
+
+def _edit_rule(rule_id, pattern, action, request=None, seen=None):
+    return cp.api_egress.edit_rule(
+        rule_id, cp.api_egress.RuleEditRequest(pattern=pattern, action=action,
+                                               **_shown_rule(rule_id, seen)),
+        request if request is not None else _FakeRequest())
+
+
+def _revoke_rule(rule_id, request=None, seen=None):
+    return cp.api_egress.revoke_rule(
+        rule_id, cp.api_egress.RuleRevokeRequest(**_shown_rule(rule_id, seen)),
         request if request is not None else _FakeRequest())
 
 
@@ -1023,7 +1092,7 @@ class CreateRuleTests(_CPTestCase):
         # the governance plane can take it back.
         rid = _create("example.com", "allow").body["id"]
         self.assertEqual(
-            cp.api_egress.revoke_rule(rid, _FakeRequest()).status_code, 200)
+            _revoke_rule(rid, _FakeRequest()).status_code, 200)
         self.assertEqual(cp.policy._decide("example.com", CLASS)[0], "hold")
 
 
@@ -1056,9 +1125,7 @@ class EditRuleTests(_CPTestCase):
             return cur.lastrowid
 
     def _edit(self, rule_id, pattern, action, request=None):
-        return cp.api_egress.edit_rule(
-            rule_id, cp.api_egress.RuleEditRequest(pattern=pattern, action=action),
-            request if request is not None else _FakeRequest())
+        return _edit_rule(rule_id, pattern, action, request)
 
     def test_an_action_flips_in_one_operation(self):
         # Through `_decide`, like the create tests: the assertion is that policy moved,
@@ -1119,11 +1186,64 @@ class EditRuleTests(_CPTestCase):
         # The edit writes the typed pattern and action, so landing on another rule
         # would replace it wholesale: here, turn a block into an allow.
         stale = self._rule("old.example", "block")
-        cp.api_egress.revoke_rule(stale, _FakeRequest())
+        _revoke_rule(stale, _FakeRequest())
         fresh = self._rule("evil.example", "block")
         self.assertNotEqual(fresh, stale)
-        self.assertEqual(self._edit(stale, "evil.example", "allow").status_code, 404)
+        resp = _edit_rule(stale, "evil.example", "allow", seen={
+            "pattern": "old.example", "action": "block", "client_class": CLASS})
+        self.assertEqual(resp.status_code, 404)
         self.assertEqual(cp.policy._decide("evil.example", CLASS)[0], "deny")
+
+    def test_an_edit_over_another_operators_edit_is_refused(self):
+        # Two pages show `evil.example` blocked; one allows it, then the other, still
+        # showing the block, narrows it. Without the expectation the second write would
+        # silently undo the first operator's decision.
+        rid = self._rule("evil.example", "block")
+        self._edit(rid, "evil.example", "allow")
+        resp = _edit_rule(rid, "api.evil.example", "block", seen={"action": "block"})
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.body["current"]["action"], "allow")
+        self.assertEqual(_rules(), {("evil.example", "allow")})
+
+    def test_an_edit_landing_on_a_different_rule_under_the_same_id_is_refused(self):
+        # The id names whatever row holds it now. Reused here by hand; the store
+        # does not hand an id on, so this is the backstop for a row that reached it
+        # some other way.
+        # Same action on both, so only the pattern tells them apart; the stale save
+        # would turn the block on evil.example into one on old.example.
+        rid = self._rule("old.example", "block")
+        with cp.store._connect() as conn:
+            conn.execute("DELETE FROM rules WHERE id=?", (rid,))
+            conn.execute("INSERT INTO rules(id, pattern, action, source, created_at, "
+                         "client_class) VALUES (?, 'evil.example', 'block', "
+                         "'operator', 0, ?)", (rid, CLASS))
+        resp = _edit_rule(rid, "old.example", "allow",
+                          seen={"pattern": "old.example"})
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn("evil.example (block)", resp.body["detail"])
+        self.assertEqual(cp.policy._decide("evil.example", CLASS)[0], "deny")
+
+    def test_a_write_landing_after_the_check_is_not_overwritten(self):
+        # Another operator's edit commits between `_stale`'s read and this write. The
+        # write's own WHERE is what notices.
+        rid = self._rule("race.example", "block")
+
+        def other_operator(rule_id, row, req):
+            with cp.store._connect() as conn:
+                conn.execute("UPDATE rules SET action='allow' WHERE id=?", (rule_id,))
+            return None
+
+        with mock.patch.object(cp.api_egress, "_stale", side_effect=other_operator):
+            resp = self._edit(rid, "api.race.example", "block")
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.body["current"]["action"], "allow")
+        self.assertEqual(_rules(), {("race.example", "allow")})
+
+    def test_the_class_is_part_of_what_the_edit_expects(self):
+        rid = self._rule("example.com", "block")
+        resp = _edit_rule(rid, "example.com", "allow", seen={"client_class": "mcp"})
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(cp.policy._decide("example.com", CLASS)[0], "deny")
 
     def test_a_malformed_pattern_is_refused_and_changes_nothing(self):
         rid = self._rule("example.com", "allow")
@@ -1206,8 +1326,10 @@ class EditRuleTests(_CPTestCase):
         revoke-then-create says that honestly. This asserts the model stays shut, the
         same way the create tests assert ``source`` does."""
         rid = self._rule("example.com", "allow")
-        req = cp.api_egress.RuleEditRequest(pattern="example.com", action="allow",
-                                            client_class="mcp")
+        req = cp.api_egress.RuleEditRequest(
+            pattern="example.com", action="allow", client_class="mcp",
+            expected_pattern="example.com", expected_action="allow",
+            expected_client_class=CLASS)
         cp.api_egress.edit_rule(rid, req, _FakeRequest())
         with cp.store._connect() as conn:
             self.assertEqual(
@@ -3216,6 +3338,19 @@ def _tool_rule(tool, action="allow", server="mcp-github", request=None):
         request if request is not None else _FakeRequest())
 
 
+def _edit_tool_rule(rule_id, action, request=None, seen=None):
+    """An edit from a page showing the rule as it stands, as ``_edit_rule``."""
+    with cp.store._connect() as conn:
+        row = conn.execute("SELECT server, tool, action FROM tool_rules WHERE id=?",
+                           (rule_id,)).fetchone()
+    shown = {**(dict(row) if row else {}), **(seen or {})}
+    return cp.api_mcp.edit_mcp_rule(
+        rule_id, cp.api_mcp.ToolRuleEditRequest(
+            action=action, expected_server=shown.get("server"),
+            expected_tool=shown.get("tool"), expected_action=shown.get("action")),
+        request if request is not None else _FakeRequest())
+
+
 class McpServerRegistrationTests(_CPTestCase):
     """``/api/mcp/servers`` — the half of server configuration the control plane owns.
 
@@ -3554,28 +3689,74 @@ class McpToolRuleTests(_CPTestCase):
         # unconfigured and no second row in the record.
         rule_id = _tool_rule("issue_write", "deny").body["id"]
         for action in ("ask", "allow"):
-            resp = cp.api_mcp.edit_mcp_rule(
-                rule_id, cp.api_mcp.ToolRuleEditRequest(action=action), _FakeRequest())
+            resp = _edit_tool_rule(rule_id, action)
             self.assertTrue(resp.body["changed"])
             self.assertEqual(
                 cp.policy._decide_tool("mcp-github", "issue_write")[0], action)
 
     def test_an_edit_to_the_same_action_writes_nothing(self):
         rule_id = _tool_rule("get_me", "allow").body["id"]
-        resp = cp.api_mcp.edit_mcp_rule(
-            rule_id, cp.api_mcp.ToolRuleEditRequest(action="allow"), _FakeRequest())
+        resp = _edit_tool_rule(rule_id, "allow")
         self.assertFalse(resp.body["changed"])
 
     def test_an_edit_validates_the_action_and_the_rule_id(self):
         rule_id = _tool_rule("get_me", "allow").body["id"]
-        self.assertEqual(
-            cp.api_mcp.edit_mcp_rule(rule_id,
-                                     cp.api_mcp.ToolRuleEditRequest(action="block"),
-                                     _FakeRequest()).status_code, 400)
-        self.assertEqual(
-            cp.api_mcp.edit_mcp_rule(9999,
-                                     cp.api_mcp.ToolRuleEditRequest(action="allow"),
-                                     _FakeRequest()).status_code, 404)
+        self.assertEqual(_edit_tool_rule(rule_id, "block").status_code, 400)
+        self.assertEqual(_edit_tool_rule(9999, "allow").status_code, 404)
+
+    def test_an_edit_from_a_stale_table_is_refused(self):
+        # Another tab moved the tool to deny; this one, still showing allow, asks.
+        # Without the expectation the ask would undo the deny unseen.
+        rule_id = _tool_rule("get_me", "allow").body["id"]
+        _edit_tool_rule(rule_id, "deny")
+        resp = _edit_tool_rule(rule_id, "ask", seen={"action": "allow"})
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.body["current"]["action"], "deny")
+        self.assertEqual(cp.policy._decide_tool("mcp-github", "get_me")[0], "deny")
+
+    def test_a_write_landing_after_the_check_is_not_overwritten(self):
+        # Another tab's edit commits between the check and the write; injected at the
+        # validation call that runs between them.
+        rule_id = _tool_rule("get_me", "ask").body["id"]
+        real = cp.api_mcp.policy._tool_rule_error
+
+        def other_tab(tool, action):
+            with cp.store._connect() as conn:
+                conn.execute("UPDATE tool_rules SET action='deny' WHERE id=?",
+                             (rule_id,))
+            return real(tool, action)
+
+        with mock.patch.object(cp.api_mcp.policy, "_tool_rule_error",
+                               side_effect=other_tab):
+            resp = _edit_tool_rule(rule_id, "allow")
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(cp.policy._decide_tool("mcp-github", "get_me")[0], "deny")
+
+    def test_the_server_is_part_of_what_the_edit_expects(self):
+        # The same tool and action on another server, under the id the page showed:
+        # only the server tells the two rules apart.
+        _register(server="mcp-other")
+        _enable(server="mcp-other")
+        rule_id = _tool_rule("get_me", "ask", server="mcp-other").body["id"]
+        resp = _edit_tool_rule(rule_id, "allow", seen={"server": "mcp-github"})
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(cp.policy._decide_tool("mcp-other", "get_me")[0], "ask")
+
+    def test_an_edit_landing_on_a_different_tool_under_the_same_id_is_refused(self):
+        # The finding's case with the id reused by hand, as on the egress side: the
+        # page shows get_me, the id now holds delete_repo, and "allow" would allow it.
+        # Both ask, so only the tool name tells them apart.
+        rule_id = _tool_rule("get_me", "ask").body["id"]
+        with cp.store._connect() as conn:
+            conn.execute("DELETE FROM tool_rules WHERE id=?", (rule_id,))
+            conn.execute("INSERT INTO tool_rules(id, server, tool, action, source, "
+                         "created_at) VALUES (?, 'mcp-github', 'delete_repo', 'ask', "
+                         "'operator', 0)", (rule_id,))
+        resp = _edit_tool_rule(rule_id, "allow", seen={"tool": "get_me"})
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn("delete_repo", resp.body["detail"])
+        self.assertEqual(cp.policy._decide_tool("mcp-github", "delete_repo")[0],
+                         "ask")
 
     def test_a_stale_edit_does_not_land_on_the_rule_created_after_a_revoke(self):
         # Tab A shows get_me; tab B revokes it and denies delete_repo. Had the new rule
@@ -3584,8 +3765,8 @@ class McpToolRuleTests(_CPTestCase):
         cp.api_mcp.revoke_mcp_rule(stale, _FakeRequest())
         fresh = _tool_rule("delete_repo", "deny").body["id"]
         self.assertNotEqual(fresh, stale)
-        resp = cp.api_mcp.edit_mcp_rule(
-            stale, cp.api_mcp.ToolRuleEditRequest(action="allow"), _FakeRequest())
+        resp = _edit_tool_rule(stale, "allow", seen={
+            "server": "mcp-github", "tool": "get_me", "action": "ask"})
         self.assertEqual(resp.status_code, 404)
         self.assertEqual(cp.policy._decide_tool("mcp-github", "delete_repo")[0],
                          "deny")
@@ -3893,9 +4074,7 @@ class McpPinTests(_CPTestCase):
         self.pin_id = _pin(_PINNED)
 
     def _edit_rule(self, action):
-        return cp.api_mcp.edit_mcp_rule(
-            self.rule_id, cp.api_mcp.ToolRuleEditRequest(action=action),
-            _FakeRequest())
+        return _edit_tool_rule(self.rule_id, action)
 
     def _decides(self):
         return {p["id"]: p["decides"] for p in cp.api_mcp.api_mcp_pins()}
@@ -4131,9 +4310,7 @@ class PinFromCardTests(_ToolBridgeTestCase):
     def test_a_rule_moved_while_the_card_was_pending_refuses_the_pin_only(self):
         for action in ("deny", "allow"):
             with self.subTest(action=action):
-                cp.api_mcp.edit_mcp_rule(
-                    self.rule_id, cp.api_mcp.ToolRuleEditRequest(action=action),
-                    _FakeRequest())
+                _edit_tool_rule(self.rule_id, action)
                 resp = _resolve(self.ask, "allow_pinned", pins=["owner"])
                 self.assertEqual(resp.status_code, 409)
                 self.assertTrue(resp.body["pin_refused"])
@@ -4242,9 +4419,7 @@ class TimedPinFromCardTests(_ToolBridgeTestCase):
             with self.subTest(pins=pins):
                 self.assertEqual(_resolve(self.ask, "allow_pinned_lease",
                                           pins=pins).status_code, 400)
-        cp.api_mcp.edit_mcp_rule(self.rule_id,
-                                 cp.api_mcp.ToolRuleEditRequest(action="deny"),
-                                 _FakeRequest())
+        _edit_tool_rule(self.rule_id, "deny")
         resp = _resolve(self.ask, "allow_pinned_lease", pins=["owner"])
         self.assertEqual(resp.status_code, 409)
         self.assertTrue(resp.body["pin_refused"])
@@ -4931,14 +5106,12 @@ class ActorColumnTests(_ToolBridgeTestCase):
         # derived from it. An egress rule's class is in its reason instead.
         op = self._operator()
         rule = _create(".example.com", "allow", request=op).body["id"]
-        cp.api_egress.edit_rule(
-            rule, cp.api_egress.RuleEditRequest(pattern="example.com", action="allow"),
-            op)
-        cp.api_egress.revoke_rule(rule, op)
+        _edit_rule(rule, "example.com", "allow", op)
+        _revoke_rule(rule, op)
         cp.api_egress.revoke_lease(
             LeaseRevokeTests._insert(self, "api.example.com", 900), op)
         tool = _tool_rule("get_me", "allow", request=op).body["id"]
-        cp.api_mcp.edit_mcp_rule(tool, cp.api_mcp.ToolRuleEditRequest(action="ask"), op)
+        _edit_tool_rule(tool, "ask", op)
         cp.api_mcp.revoke_mcp_rule(tool, op)
         _register("mcp-other", request=op)
         cp.api_mcp.edit_mcp_server("mcp-other",

@@ -33,7 +33,16 @@ class RuleCreateRequest(BaseModel):
     # could write a rule ``revoke_rule`` refuses to delete.
 
 
-class RuleEditRequest(BaseModel):
+class RuleExpectation(BaseModel):
+    # The rule as the caller last saw it, required on every write that names a rule by
+    # id (``_stale``). The id alone names whatever row holds it now, which a page left
+    # open may never have shown.
+    expected_pattern: str
+    expected_action: str
+    expected_client_class: str
+
+
+class RuleEditRequest(RuleExpectation):
     # The TARGET state, not a delta, so both fields are required. An absent field
     # meaning "leave this alone" looks the same as one the caller meant to send, and
     # for ``action`` that ambiguity decides egress.
@@ -42,6 +51,56 @@ class RuleEditRequest(BaseModel):
     # No ``source``, as in ``RuleCreateRequest``. No ``client_class``: moving a rule
     # between classes takes policy from one population and gives it to another, two
     # changes under one audit row.
+
+
+class RuleRevokeRequest(RuleExpectation):
+    pass
+
+
+def _stale(rule_id: int, row, req: RuleExpectation) -> JSONResponse | None:
+    """A 409 when ``row`` is not the rule the caller saw, else None.
+
+    Both writes need it, because both can widen: an edit can turn a block into an
+    allow, and revoking a block can uncover a wider allow beneath it (a block outranks
+    an allow in ``policy._decide``). A stale page aims either at a rule nobody chose,
+    whether another operator changed it or a different rule now holds the id.
+
+    The write repeats the check in its WHERE (``_RULE_AS_CHECKED``), since another
+    connection can commit between this SELECT and it; ``_lost`` answers when it did."""
+    current = (row["pattern"], row["action"], row["client_class"])
+    if current == (getattr(req, "expected_pattern", None),
+                   getattr(req, "expected_action", None),
+                   getattr(req, "expected_client_class", None)):
+        return None
+    return _changed(rule_id, row)
+
+
+_RULE_AS_CHECKED = "id=? AND pattern=? AND action=? AND client_class=?"
+
+
+def _as_checked(rule_id: int, row) -> tuple:
+    return (rule_id, row["pattern"], row["action"], row["client_class"])
+
+
+def _lost(conn, rule_id: int) -> JSONResponse:
+    """The answer to a write that matched no row: the rule moved after ``_stale``."""
+    row = conn.execute("SELECT pattern, action, client_class FROM rules WHERE id=?",
+                       (rule_id,)).fetchone()
+    if row is None:
+        return JSONResponse({"ok": False, "detail": "unknown rule"}, status_code=404)
+    return _changed(rule_id, row)
+
+
+def _changed(rule_id: int, row) -> JSONResponse:
+    return JSONResponse(
+        {"ok": False,
+         "detail": f"rule {rule_id} changed since this page showed it: it is now "
+                   f"{row['pattern']} ({row['action']}) for client class "
+                   f"{row['client_class']}. Nothing was changed; reload the rules and "
+                   f"try again.",
+         "current": {"id": rule_id, "pattern": row["pattern"], "action": row["action"],
+                     "client_class": row["client_class"]}},
+        status_code=409)
 
 
 @router.get("/api/egress/rules")
@@ -161,7 +220,9 @@ def edit_rule(rule_id: int, req: RuleEditRequest, request: Request) -> JSONRespo
 
     ``created_at`` is untouched. It is the same rule on new terms, the audit row dates
     the change, and the rules view sorts on when policy came into force. The class is
-    not editable (``RuleEditRequest``)."""
+    not editable (``RuleEditRequest``).
+
+    **A stale edit is refused** (``_stale``)."""
     actor = provenance._actor(request)
     pattern = policy._normalize_pattern(getattr(req, "pattern", "") or "")
     action = (getattr(req, "action", "") or "").strip().lower()
@@ -177,6 +238,9 @@ def edit_rule(rule_id: int, req: RuleEditRequest, request: Request) -> JSONRespo
         if row is None:
             return JSONResponse({"ok": False, "detail": "unknown rule"},
                                 status_code=404)
+        stale = _stale(rule_id, row, req)
+        if stale is not None:
+            return stale
         if row["source"] == "seed":
             return JSONResponse(
                 {"ok": False,
@@ -207,8 +271,10 @@ def edit_rule(rule_id: int, req: RuleEditRequest, request: Request) -> JSONRespo
                               "action": clash["action"], "source": clash["source"],
                               "client_class": row["client_class"]}},
                 status_code=409)
-        conn.execute("UPDATE rules SET pattern=?, action=? WHERE id=?",
-                     (pattern, action, rule_id))
+        if not conn.execute(
+                f"UPDATE rules SET pattern=?, action=? WHERE {_RULE_AS_CHECKED}",  # noqa: S608
+                (pattern, action, *_as_checked(rule_id, row))).rowcount:
+            return _lost(conn, rule_id)
         conn.commit()
 
     # ONE row carrying both states. ``host`` is the NEW pattern, since that decides
@@ -225,7 +291,8 @@ def edit_rule(rule_id: int, req: RuleEditRequest, request: Request) -> JSONRespo
 
 
 @router.post("/api/egress/rules/{rule_id}/revoke")
-def revoke_rule(rule_id: int, request: Request) -> JSONResponse:
+def revoke_rule(rule_id: int, req: RuleRevokeRequest,
+                request: Request) -> JSONResponse:
     """Remove one operator-created rule.
 
     **Seed rules are refused here, not merely hidden in the UI.** Their source of
@@ -237,7 +304,8 @@ def revoke_rule(rule_id: int, request: Request) -> JSONResponse:
     replaces it.
 
     Deletion, not a tombstone: the audit row is the history, and dead rows would have
-    to be filtered by every reader, ``policy._decide`` included."""
+    to be filtered by every reader, ``policy._decide`` included. A stale revoke is
+    refused (``_stale``)."""
     actor = provenance._actor(request)
     with store._connect() as conn:
         row = conn.execute(
@@ -246,13 +314,18 @@ def revoke_rule(rule_id: int, request: Request) -> JSONResponse:
         if row is None:
             return JSONResponse({"ok": False, "detail": "unknown rule"},
                                 status_code=404)
+        stale = _stale(rule_id, row, req)
+        if stale is not None:
+            return stale
         if row["source"] == "seed":
             return JSONResponse(
                 {"ok": False,
                  "detail": f"{row['pattern']} came from the policy seed and cannot "
                            f"be revoked here — edit policies/egress-allowlist.txt"},
                 status_code=403)
-        conn.execute("DELETE FROM rules WHERE id=?", (rule_id,))
+        if not conn.execute(f"DELETE FROM rules WHERE {_RULE_AS_CHECKED}",  # noqa: S608
+                            _as_checked(rule_id, row)).rowcount:
+            return _lost(conn, rule_id)
         conn.commit()
 
     # The reason says where the host lands: held for approval, whichever action was

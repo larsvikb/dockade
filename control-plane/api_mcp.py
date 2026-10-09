@@ -64,6 +64,10 @@ class ToolRuleEditRequest(BaseModel):
     # ACTION only. A tool rule's identity is (server, tool): changing either retires
     # one rule and writes another, which is two changes under one audit row.
     action: str
+    # The rule as the caller last saw it, as on ``api_egress.RuleEditRequest``.
+    expected_server: str
+    expected_tool: str
+    expected_action: str
 
 
 def _server_view(row) -> dict:
@@ -350,13 +354,25 @@ def create_mcp_rule(req: ToolRuleCreateRequest, request: Request) -> JSONRespons
                          "action": action, "source": "operator"}, status_code=201)
 
 
+def _tool_rule_changed(rule_id: int, row) -> JSONResponse:
+    return JSONResponse(
+        {"ok": False,
+         "detail": f"rule {rule_id} changed since this page showed it: it is now "
+                   f"{row['tool']} on {row['server']}, {row['action']}. Nothing was "
+                   f"changed; reload the rules and try again.",
+         "current": {"id": rule_id, "server": row["server"], "tool": row["tool"],
+                     "action": row["action"]}},
+        status_code=409)
+
+
 @router.post("/api/mcp/rules/{rule_id}/edit")
 def edit_mcp_rule(rule_id: int, req: ToolRuleEditRequest,
                   request: Request) -> JSONResponse:
     """Move a tool between deny, ask and allow — the operator's actual workflow.
 
     Only the action changes (``ToolRuleEditRequest``), so the key is untouched and
-    cannot collide with another row."""
+    cannot collide with another row. A stale edit is refused, as
+    ``api_egress.edit_rule`` refuses one."""
     actor = provenance._actor(request)
     action = (getattr(req, "action", "") or "").strip().lower()
 
@@ -367,6 +383,11 @@ def edit_mcp_rule(rule_id: int, req: ToolRuleEditRequest,
         if row is None:
             return JSONResponse({"ok": False, "detail": "unknown rule"},
                                 status_code=404)
+        current = (row["server"], row["tool"], row["action"])
+        if current != (getattr(req, "expected_server", None),
+                       getattr(req, "expected_tool", None),
+                       getattr(req, "expected_action", None)):
+            return _tool_rule_changed(rule_id, row)
         error = policy._tool_rule_error(row["tool"], action)
         if error is not None:
             return JSONResponse({"ok": False, "detail": error}, status_code=400)
@@ -374,7 +395,18 @@ def edit_mcp_rule(rule_id: int, req: ToolRuleEditRequest,
             return JSONResponse({"ok": True, "changed": False, "id": rule_id,
                                  "server": row["server"], "tool": row["tool"],
                                  "action": action})
-        conn.execute("UPDATE tool_rules SET action=? WHERE id=?", (action, rule_id))
+        # Conditioned on the row as checked, as ``api_egress._stale`` explains.
+        if not conn.execute(
+                "UPDATE tool_rules SET action=? "
+                "WHERE id=? AND server=? AND tool=? AND action=?",
+                (action, rule_id, *current)).rowcount:
+            moved = conn.execute(
+                "SELECT server, tool, action FROM tool_rules WHERE id=?",
+                (rule_id,)).fetchone()
+            if moved is None:
+                return JSONResponse({"ok": False, "detail": "unknown rule"},
+                                    status_code=404)
+            return _tool_rule_changed(rule_id, moved)
         conn.commit()
 
     store._audit("edit", stage="tool-policy", server=row["server"], tool=row["tool"],

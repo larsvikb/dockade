@@ -108,6 +108,24 @@ export const STEPS = [
     await page.click('#toolpins button.revoke[data-pin="4"]');
   }],
 
+  // A standing rule's edit and revoke: each sends the rule the page showed, and
+  // the edit the one it opened rather than the one the table holds at save.
+  ["policy tab, to edit", async ({ page }) => { await page.click("#tab-policy"); }],
+  ["rule edit opens", async ({ page }) => {
+    await page.click('#rules button.edit[data-rule="2"]');
+  }],
+  ["rule edit, narrowed", async ({ page }) => {
+    await page.fill("#rule-pattern", "api.evil.example");
+  }],
+  ["rule edit saved", async ({ page, accept }) => {
+    accept();
+    await page.click("#rule-add");
+  }],
+  ["rule revoked", async ({ page, accept }) => {
+    accept();
+    await page.click('#rules button.revoke[data-rule="2"]');
+  }],
+
   // The decisions view (audit.js): the filters, the switch to the record, its pager,
   // and a filter the backend refuses. A filter waits for its timer, and the page's
   // timers are frozen, so each step moves the clock past it.

@@ -1248,14 +1248,18 @@ function start() {
     if (!window.confirm(`${p.text}\n\nRevoke ${p.pattern}?`)) return;
     btn.disabled = true;
     try {
-      const res = await fetch(`/api/egress/rules/${encodeURIComponent(btn.dataset.rule)}/revoke`,
-                              { method: "POST" });
+      const res = await fetch(`/api/egress/rules/${encodeURIComponent(btn.dataset.rule)}/revoke`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        // The row this button was rendered with, which the confirm described: a
+        // revoke can widen, so one aimed at a rule since changed is refused (409).
+        body: JSON.stringify({ expected_pattern: row.pattern, expected_action: row.action,
+                               expected_client_class: row.client_class }) });
       const body = await res.json().catch(() => ({}));
       if (!res.ok || !body.ok) {
         // Says what the backend said. The refusals that matter here are 403 (a seed
-        // rule, which the UI should not have offered) and 404 (already revoked, or
-        // the table on screen is stale) — both are worth reading rather than
-        // collapsing into "failed".
+        // rule, which the UI should not have offered), and 404 and 409 (already
+        // revoked, or changed: the table on screen is stale) — all worth reading
+        // rather than collapsing into "failed".
         window.alert(`Could not revoke: ${body.detail || res.status}`);
         btn.disabled = false;
         return;
@@ -1290,6 +1294,10 @@ function start() {
   // and the conflict check to drift out of. It also means an operator cannot be halfway
   // through both at once.
   let editingRuleId = null;
+  // The rule as it stood when the operator chose to edit it, sent with the save. The
+  // preview re-reads `rulesById`, which after a revoke elsewhere can hold a different
+  // rule under the same id; this cannot, so the backend refuses the save instead.
+  let editingExpected = null;
   // What the last submit came back with. A separate fact from the preview, and it
   // OUTRANKS it: the preview describes what a click would do, and this describes what
   // the last one actually did — including the refusals this page deliberately does not
@@ -1318,6 +1326,8 @@ function start() {
 
   function enterEditMode(row) {
     editingRuleId = String(row.id);
+    editingExpected = { expected_pattern: row.pattern, expected_action: row.action,
+                        expected_client_class: row.client_class };
     rulePatternEl.value = row.pattern || "";
     ruleActionEl.value = row.action === "block" ? "block" : "allow";
     // The class is shown but LOCKED. Moving a rule between client classes takes policy
@@ -1336,6 +1346,7 @@ function start() {
 
   function leaveEditMode() {
     editingRuleId = null;
+    editingExpected = null;
     rulePatternEl.value = "";
     ruleClassEl.disabled = !clientClasses.length;
     ruleCancelEl.hidden = true;
@@ -1346,8 +1357,9 @@ function start() {
   function currentPreview() {
     const rules = [...rulesById.values()];
     if (editingRuleId !== null) {
-      // Looked up on every render rather than captured at entry, so a rule revoked or
-      // changed under the form is noticed by the preview instead of being written over.
+      // Looked up on every render rather than captured at entry, so a rule revoked under
+      // the form is noticed by the preview. A rule CHANGED under it is described as it
+      // now stands; what stops the save writing over it is `editingExpected`.
       return editPreview(rulesById.get(editingRuleId), rulePatternEl.value,
                          ruleActionEl.value, rules);
     }
@@ -1467,16 +1479,20 @@ function start() {
           // The PREVIEWED pattern, not the typed one, for the reason the create path
           // gives: normalization can change what lands, and the confirm has to have been
           // about the rule that does.
-          body: JSON.stringify({ pattern: p.pattern, action: p.verb }),
+          body: JSON.stringify({ pattern: p.pattern, action: p.verb,
+                                 ...editingExpected }),
         });
       const body = await res.json().catch(() => ({}));
       if (!res.ok || !body.ok) {
-        // 404 is the one worth reading here and it has no analogue on the create path:
-        // the rule was revoked while the form was open, so there is nothing to edit and
-        // retrying cannot help.
+        // 404 and 409 are the ones worth reading here: the rule was revoked, or changed
+        // into another, while the form was open, so retrying cannot help.
         ruleNotice = { bad: true,
                        text: `Not saved: ${body.detail || `the control plane answered `
                                                         + `${res.status}`}` };
+        // The expectation this form holds is the one refused, so every retry from it
+        // would be refused too. Leaving edit mode makes the next attempt start from
+        // the rule as it now stands; the notice stays up to say why.
+        if (res.status === 409 && body.current) leaveEditMode();
       } else if (body.changed === false) {
         ruleNotice = { bad: false,
                        text: `${body.pattern} already ${body.action}s for `

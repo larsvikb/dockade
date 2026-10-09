@@ -3850,10 +3850,47 @@ class EditRuleSourceTests(unittest.TestCase):
         sent = re.search(r"body:\s*JSON\.stringify\(\{(.*?)\}\)",
                          self.body.group(0), re.S)
         self.assertIsNotNone(sent, "the edit request body moved — restructured?")
-        self.assertNotIn("client_class", sent.group(1))
+        # The body spreads `editingExpected` in, so its literal is part of what is
+        # sent; there the class may appear only as the expectation.
+        spread = re.search(r"editingExpected = \{(.*?)\};",
+                           _fn_body(self.src, "enterEditMode(row)"), re.S)
+        self.assertIsNotNone(spread, "the expectation literal moved — restructured?")
+        for literal in (sent.group(1), spread.group(1)):
+            self.assertNotRegex(literal, r"(?<!expected_)client_class\s*:")
 
     def test_an_edit_that_wrote_nothing_is_not_reported_as_a_write(self):
         self.assertIn("body.changed === false", self.body.group(0))
+
+    def test_the_save_sends_the_rule_as_it_was_opened(self):
+        """The backend refuses an edit whose expectation does not match the row (409).
+        Built from `rulesById` at save time, the expectation would match whatever rule
+        holds the id by then, so it is the row captured when edit mode began."""
+        sent = re.search(r"body:\s*JSON\.stringify\(\{(.*?)\}\)",
+                         self.body.group(0), re.S)
+        self.assertIsNotNone(sent, "the edit request body moved — restructured?")
+        self.assertIn("...editingExpected", sent.group(1))
+        enter = _fn_body(self.src, "enterEditMode(row)")
+        for field in ("pattern", "action", "client_class"):
+            self.assertRegex(enter, rf"expected_{field}:\s*row\.{field}\b")
+        self.assertIn("editingExpected = null;", _fn_body(self.src, "leaveEditMode()"))
+
+    def test_a_stale_save_leaves_edit_mode(self):
+        """The form's expectation is the one the backend refused, so staying in edit
+        mode would refuse every retry. Only the stale 409 (it carries `current`); the
+        other, a clash with another rule, is fixed by changing the pattern."""
+        self.assertRegex(self.body.group(0),
+                         r"res\.status === 409 && body\.current\)\s*leaveEditMode\(\)")
+
+    def test_a_revoke_sends_the_row_its_button_was_rendered_with(self):
+        """Revoking a block can widen, so the revoke carries its expectation too; the
+        row is looked up from the same render as the button and the confirm."""
+        handler = re.search(
+            r'getElementById\("rules"\)\.addEventListener\("click"[\s\S]*?\n  \}\);',
+            self.src)
+        self.assertIsNotNone(handler, "the rules table click handler moved")
+        revoke = handler.group(0)[handler.group(0).find("button.revoke"):]
+        for field in ("pattern", "action", "client_class"):
+            self.assertRegex(revoke, rf"expected_{field}:\s*row\.{field}\b")
 
     def test_a_config_poll_cannot_unlock_the_class_picker_mid_edit(self):
         """`renderClassOptions` re-enables every control from the config poll, which runs
@@ -4084,6 +4121,15 @@ class ToolPolicySourceTests(unittest.TestCase):
         self.assertIn("server: p.server", body)
         self.assertIn("tool: p.tool", body)
         self.assertIn("action: p.action", body)
+
+    def test_a_row_edit_sends_the_row_its_button_was_rendered_with(self):
+        """A table older than the rule now holding an id is refused by the backend
+        (409) only if the edit says which rule the operator was looking at."""
+        handler = re.search(r'toolRulesBody\.addEventListener\("click"[\s\S]*?\n  \}\);',
+                            self.src)
+        self.assertIsNotNone(handler, "the tool-rule row handler is gone")
+        for field in ("server", "tool", "action"):
+            self.assertRegex(handler.group(0), rf"expected_{field}:\s*row\.{field}\b")
 
     def test_writing_a_rule_refreshes_the_server_table_too(self):
         # The servers table counts rules per server, so it is stale the moment a tool

@@ -551,7 +551,8 @@ recording, because none of them is the obvious one:
 - **Keyed on `id`, not pattern.** A pattern-keyed delete would have to exact-match the
   stored `rules.pattern` string, inheriting every normalization subtlety (case, a
   leading wildcard dot) and possibly missing the row the operator is looking at; an
-  integer `id` is unambiguous. The relay bounds that segment to digits, and the bound is
+  integer `id` is unambiguous about the row, and the request names the rule it expects
+  for the rest (see "Changing a rule is one operation, not two"). The relay bounds that segment to digits, and the bound is
   load-bearing rather than tidy: it lands in a URL path, so a looser class admits
   dot-segments that httpx resolves upstream into a different path than the allowlist
   approved.
@@ -651,6 +652,13 @@ Four things follow, and each is a consequence of *which* endpoint this resembles
   with an `id<>?` clause and `editPreview` in `app.js` mirrors it; both are tested,
   because a page that previews a collision with itself makes the operation look broken
   rather than refused.
+
+**An id names a row, not the rule a page showed.** So the egress edit and revoke and
+the tool rule edit each carry the rule as the page showed it, and are refused on a
+mismatch; why each can widen is in `api_egress._stale`. The check holds only because
+each page sends the row its confirm described, which for the egress form is the row
+captured on entering edit mode (`editingExpected` in `app.js`), not the one its preview
+re-reads at save.
 
 `audit.DECISIONS` gains `edit`, and the row carries **both** states. That is the whole
 difference from what it replaces: the record now says what a rule was, not only what it

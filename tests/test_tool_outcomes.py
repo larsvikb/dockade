@@ -13,12 +13,14 @@ performs the side effect they describe.
 """
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
 import tempfile
 import unittest
 from typing import ClassVar
+from unittest import mock
 
 from _loader import load_outcomes
 
@@ -39,6 +41,15 @@ class _captured:
         return self._ctx.__exit__(*exc)
 
 
+def _detach(outcomes) -> None:
+    """Remove and close the file handlers. Removed as well as closed: the logger is
+    shared by every module ``load_outcomes`` returns, and a closed FileHandler
+    reopens on its next emit."""
+    for handler in list(outcomes.logger.handlers):
+        outcomes.logger.removeHandler(handler)
+        handler.close()
+
+
 class OutcomeTestCase(unittest.TestCase):
     """A module writing to a real file in a temp dir, because the file IS the
     interface — the control plane reads bytes off a volume, not a Python call."""
@@ -57,9 +68,7 @@ class OutcomeTestCase(unittest.TestCase):
         self.addCleanup(self._close)
 
     def _close(self):
-        for handler in list(self.outcomes.logger.handlers):
-            self.outcomes.logger.removeHandler(handler)
-            handler.close()
+        _detach(self.outcomes)
 
     def lines(self) -> list[dict]:
         with open(self.path) as f:
@@ -261,9 +270,77 @@ class SetupTests(unittest.TestCase):
                 {"GATEWAY_AUDIT_LOG": os.path.join(tmp, "a.jsonl")})
             outcomes.setup()
             self.assertFalse(outcomes.logger.propagate)
-            for handler in list(outcomes.logger.handlers):
-                outcomes.logger.removeHandler(handler)
-                handler.close()
+            _detach(outcomes)
+
+
+class TornRecordTests(unittest.TestCase):
+    """``setup`` ends a record an earlier run left half-written (see
+    ``outcomes._end_torn_record``)."""
+
+    FRAGMENT = '{"ts": 1.0, "stage": "tool-result", "sta'
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.path = os.path.join(self.dir.name, "audit.jsonl")
+
+    def _start_with(self, existing: str | None) -> tuple[list[str], str]:
+        """Start on a file holding ``existing`` (None: no file), record one outcome;
+        return the file's lines and what was printed."""
+        if existing is not None:
+            with open(self.path, "w") as f:
+                f.write(existing)
+        outcomes = load_outcomes({"GATEWAY_AUDIT_LOG": self.path})
+        with _captured() as out:
+            outcomes.setup()
+            outcomes.record("ok", "github", "get_me")
+        _detach(outcomes)
+        with open(self.path) as f:
+            return f.read().splitlines(), out.getvalue()
+
+    def test_a_torn_record_is_ended_so_the_next_one_survives(self):
+        lines, out = self._start_with(self.FRAGMENT)
+        self.assertEqual(lines[0], self.FRAGMENT)
+        self.assertEqual(json.loads(lines[1])["tool"], "get_me")
+        self.assertIn("ended mid-record", out)
+
+    def test_a_healthy_start_says_nothing_about_the_file(self):
+        whole = '{"ts": 1.0, "stage": "tool-result"}'
+        for existing, before in ((None, []), ("", []), (whole + "\n", [whole])):
+            with self.subTest(existing=existing):
+                lines, out = self._start_with(existing)
+                self.assertEqual(lines[:-1], before)
+                self.assertEqual(json.loads(lines[-1])["tool"], "get_me")
+                self.assertNotIn(self.path, out)
+                os.remove(self.path)
+
+    class _FullVolume(io.BytesIO):
+        """Opens, seeks and reads; refuses the newline, as a full volume does."""
+
+        def write(self, _):
+            raise OSError(28, "No space left on device")
+
+    def test_a_fragment_that_cannot_be_ended_does_not_stop_the_gateway(self):
+        # The volume is still full: not a misconfiguration, so ``setup`` still
+        # attaches the file and says what the next record will cost. ``open`` is
+        # patched in the module's namespace only; the handler opens through logging's.
+        with open(self.path, "w") as f:
+            f.write(self.FRAGMENT)
+        refusals = {
+            "at open": OSError(28, "No space left on device"),
+            # Where a full volume actually refuses: everything up to the write works.
+            "at write": lambda *_: self._FullVolume(self.FRAGMENT.encode()),
+        }
+        for where, refusal in refusals.items():
+            with self.subTest(where=where):
+                outcomes = load_outcomes({"GATEWAY_AUDIT_LOG": self.path})
+                self.addCleanup(_detach, outcomes)
+                with _captured() as out, \
+                        mock.patch.object(outcomes, "open", create=True,
+                                          side_effect=refusal):
+                    outcomes.setup()
+                self.assertTrue(outcomes._to_file)
+                self.assertIn("No space left on device", out.getvalue())
 
 
 if __name__ == "__main__":

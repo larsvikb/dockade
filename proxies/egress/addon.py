@@ -824,6 +824,9 @@ def load(loader) -> None:  # mitmproxy lifecycle hook
     # now; this exits before any of the addon's hooks is registered.
     _assert_guard_configured()
     _setup_audit_file()
+    # The first line after the file opens, and one ingest skips (no ``central``): if
+    # an earlier run left a torn record, this is what merges into it. Write a decision
+    # first and that decision is lost instead — see ``outcomes._end_torn_record``.
     _audit("startup", control_plane=AUTHORIZE_URL, audit=AUDIT_PATH,
            permanent=list(PERMANENT_HOSTS),
            lifeline_cidrs=[str(n) for n in LIFELINE_CIDRS],

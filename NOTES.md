@@ -882,6 +882,11 @@ after the listeners are set up, and that calls `sys.exit(1)` on finding one.
 
 **A `BaseException` from `load` passes `safecall`** and ends the event loop from
 inside the script loader, with the exception's message as the last line on stderr.
+The same holds while the module is imported: `load_script` catches only
+`ImportError` and `Exception`, so a `SystemExit` raised at import passes it and
+`safecall` both. Measured with a typo in each of four of the addon's settings
+(`EGRESS_FORBIDDEN_CIDRS`, `EGRESS_CONNECT_PORTS`, `EGRESS_CONTROL_TIMEOUT`,
+`EGRESS_AUDIT_BACKUPS`): exit 1, "Loading script" and then the message, nothing else.
 
 What the window between bind and exit does, on `127.0.0.1` with a client that sends a
 proxied `GET` to a local backend the moment `listen()` returns, 20 runs each:
@@ -890,7 +895,7 @@ proxied `GET` to a local backend the moment `listen()` returns, 20 runs each:
 |---|---|---|
 | `load` raises `RuntimeError` (exits via `ErrorCheck`) | yes | 0 of 20 |
 | `load` raises `SystemExit` | yes | 0 of 20 |
-| import-time `ValueError`, `EGRESS_CONNECT_PORTS=44x` (exits via `ErrorCheck`) | yes | 0 of 20 |
+| import-time `ValueError`, from `int("44x")` (exits via `ErrorCheck`) | yes | 0 of 20 |
 
 The process exits 1 every time. The control, a no-op script in place of the addon, did
 forward, about 36 ms after `listen()`: the probe sees forwarding when it happens. The

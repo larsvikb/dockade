@@ -289,10 +289,9 @@ def _forbidden_nets(var: str, value: str,
     """The networks a listener must not be served on, parsed from one of the two
     ``*_BIND_FORBIDDEN`` lists (``var`` names it for the error).
 
-    An unparseable entry is FATAL here, unlike the addon's tolerant CIDR parsing: that
-    one drops a bad entry because its list is long and mostly redundant, while these
-    have two members each and dropping either silently removes the guard. A typo in a
-    hand-set override must not read as "nothing is forbidden"."""
+    An unparseable entry is FATAL, as it is in the egress addon's ``_parsed``: these
+    have two members each, and dropping either silently removes the guard. A typo in
+    a hand-set override must not read as "nothing is forbidden"."""
     nets = []
     for raw in (part.strip() for part in value.split(",")):
         if not raw:

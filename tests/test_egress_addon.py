@@ -10,6 +10,7 @@ env-parsing edge cases directly. Dependency-free (see ``tests/_loader.py``)."""
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import io
 import logging
 import os
@@ -17,7 +18,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from _loader import load_egress_addon
+from _loader import ROOT, load_egress_addon
 
 addon = load_egress_addon()
 
@@ -132,11 +133,43 @@ class EnvParsingTests(unittest.TestCase):
         self.assertEqual(addon._ports("DOCKADE_UNSET_PORTS", "443, 8443 ,"),
                          frozenset({443, 8443}))
 
-    def test_parse_cidrs_keeps_valid_drops_invalid(self):
-        nets = addon._parse_cidrs("DOCKADE_UNSET_CIDRS",
-                                  "172.31.0.0/24, not-a-cidr, 10.0.0.0/8")
-        rendered = {str(n) for n in nets}
-        self.assertEqual(rendered, {"172.31.0.0/24", "10.0.0.0/8"})
+    def test_parse_cidrs_keeps_valid_drops_blanks(self):
+        nets = addon._parse_cidrs("DOCKADE_UNSET_CIDRS", "172.31.0.0/24, ,10.0.0.0/8,")
+        self.assertEqual({str(n) for n in nets}, {"172.31.0.0/24", "10.0.0.0/8"})
+
+    def test_an_entry_that_does_not_parse_refuses_to_start(self):
+        # One bad entry among good ones: dropping it would run the proxy on a list
+        # the operator did not write, and in an overridden EGRESS_PRIVATE_CIDRS
+        # that un-blocks the range the typo was meant to cover.
+        for parse, default in ((addon._parse_cidrs, "172.31.0.0/24, 172.29.0.O/24"),
+                               (addon._ports, "443, 44x")):
+            with self.subTest(default=default):
+                with self.assertRaises(SystemExit) as caught:
+                    parse("DOCKADE_UNSET_SETTING", default)
+                self.assertIn("DOCKADE_UNSET_SETTING", str(caught.exception))
+                self.assertIn(default.split(", ")[1], str(caught.exception))
+
+    def test_a_number_that_does_not_parse_refuses_to_start(self):
+        self.assertEqual(addon._number("DOCKADE_UNSET_SETTING", "1.5", float, "x"), 1.5)
+        with self.assertRaises(SystemExit) as caught:
+            addon._number("DOCKADE_UNSET_SETTING", "13O", float, "a number")
+        self.assertIn("DOCKADE_UNSET_SETTING: '13O' is not a number",
+                      str(caught.exception))
+
+    def test_every_parsed_setting_refuses_a_typo_at_import(self):
+        # The helpers above are only half of it: each module-level setting has to
+        # go through them. SystemExit, not an Exception, because mitmproxy logs and
+        # swallows an Exception raised while it imports a script.
+        for env in ("EGRESS_AUDIT_MAX_BYTES", "EGRESS_AUDIT_BACKUPS",
+                    "EGRESS_CONTROL_TIMEOUT", "EGRESS_CONNECT_PORTS",
+                    "EGRESS_HTTP_PORTS", "EGRESS_FORBIDDEN_CIDRS",
+                    "EGRESS_PRIVATE_CIDRS", "EGRESS_LIFELINE_CIDRS"):
+            spec = importlib.util.spec_from_file_location(
+                "dockade_egress_addon_typo", ROOT / "proxies/egress/addon.py")
+            with self.subTest(env=env), mock.patch.dict(os.environ, {env: "O"}):
+                with self.assertRaises(SystemExit) as caught:
+                    spec.loader.exec_module(importlib.util.module_from_spec(spec))
+                self.assertIn(env, str(caught.exception))
 
 
 class ForbiddenGuardTests(unittest.TestCase):

@@ -106,6 +106,23 @@ from typing import NamedTuple
 
 from mitmproxy import http, tls
 
+
+def _parsed(env: str, value: str, parse, expected: str):
+    """``parse(value)``, or refuse to start naming ``env``: a setting that does not
+    parse is a typo, and dropping or defaulting it would run the proxy on a policy
+    the operator did not write. ``SystemExit`` for the reason in
+    ``_assert_guard_configured``."""
+    try:
+        return parse(value)
+    except ValueError:
+        raise SystemExit(f"{env}: {value!r} is not {expected}. Refusing to start "
+                         "(fail closed).") from None
+
+
+def _number(env: str, default: str, parse, expected: str):
+    return _parsed(env, os.environ.get(env, default), parse, expected)
+
+
 AUDIT_PATH = os.environ.get("EGRESS_AUDIT_LOG", "/var/log/egress/audit.jsonl")
 # The local audit file is otherwise unbounded on a long-lived volume. Rotate it by
 # SIZE (rename-aside at the cap, keep a few backups, drop the oldest), which caps
@@ -114,8 +131,9 @@ AUDIT_PATH = os.environ.get("EGRESS_AUDIT_LOG", "/var/log/egress/audit.jsonl")
 # and drains rotated siblings oldest-first, so nothing is lost when we roll over
 # (see ``_drain_egress_audit`` in control-plane/ingest.py). Set the cap to 0 to disable
 # rotation. Keep it comfortably above one drain block so the reader always keeps up.
-AUDIT_MAX_BYTES = int(os.environ.get("EGRESS_AUDIT_MAX_BYTES", str(8 * 1024 * 1024)))
-AUDIT_BACKUPS = int(os.environ.get("EGRESS_AUDIT_BACKUPS", "5"))
+AUDIT_MAX_BYTES = _number("EGRESS_AUDIT_MAX_BYTES", str(8 * 1024 * 1024), int,
+                          "an integer")
+AUDIT_BACKUPS = _number("EGRESS_AUDIT_BACKUPS", "5", int, "an integer")
 
 # Control plane: where policy decisions + audit go. One call per connection.
 # Default port is 8091 — the AUTHORIZE listener on authorize-net (compose sets this
@@ -130,7 +148,7 @@ AUTHORIZE_URL = CONTROL_PLANE_URL + "/authorize"
 # 120s). It is a read timeout, so the fail-closed cases are unaffected: an
 # unreachable control plane fails immediately (connection refused / DNS), not by
 # waiting this out — only a genuine hold (or a hung control plane) waits long.
-CONTROL_TIMEOUT = float(os.environ.get("EGRESS_CONTROL_TIMEOUT", "130"))
+CONTROL_TIMEOUT = _number("EGRESS_CONTROL_TIMEOUT", "130", float, "a number")
 
 # Permanent lifeline — allowed locally, BEFORE the control plane is consulted,
 # so an outage of the control plane can never sever the agent's own API/auth.
@@ -153,7 +171,8 @@ PERMANENT_HOSTS = _hosts("EGRESS_PERMANENT_HOSTS",
 # the channel well past what "allow example.com" is meant to grant. Override for
 # the rare host that legitimately serves HTTP(S) on a non-standard port.
 def _ports(env: str, default: str) -> frozenset[int]:
-    return frozenset(int(p) for p in os.environ.get(env, default).split(",") if p.strip())
+    return frozenset(_parsed(env, p.strip(), int, "a port number")
+                     for p in os.environ.get(env, default).split(",") if p.strip())
 
 ALLOWED_CONNECT_PORTS = _ports("EGRESS_CONNECT_PORTS", "443")  # HTTPS tunnels
 ALLOWED_HTTP_PORTS = _ports("EGRESS_HTTP_PORTS", "80")         # plain HTTP
@@ -179,16 +198,9 @@ logger = logging.getLogger("egress")
 # request. That is the point of the split — this guard is racy by nature, so the
 # far side is arranged to be worth little rather than the guard being trusted.
 def _parse_cidrs(env: str, default: str) -> tuple:
-    nets = []
-    for c in os.environ.get(env, default).split(","):
-        c = c.strip()
-        if not c:
-            continue
-        try:
-            nets.append(ipaddress.ip_network(c, strict=False))
-        except ValueError:
-            logger.warning("ignoring invalid forbidden CIDR %r", c)
-    return tuple(nets)
+    cidr = functools.partial(ipaddress.ip_network, strict=False)
+    return tuple(_parsed(env, c.strip(), cidr, "a CIDR")
+                 for c in os.environ.get(env, default).split(",") if c.strip())
 
 # Defaults mirror docker-compose.yml. EVERY control network is listed, and
 # authorize-net (172.29.0.0/24) is the one that matters operationally: it is the
@@ -445,7 +457,7 @@ def _forbidden_reason(host: str) -> str | None:
     resolution failure. That is acceptable here ONLY because it is not the
     load-bearing control. Reaching the control plane is prevented first by network
     topology (the sandbox has no route to either control network) and by the local
-    port gate (the control plane listens on :8090 and :8091; CONNECT/HTTP are
+    port gate (the control plane listens on :8090, :8091 and :8092; CONNECT/HTTP are
     gated to :443/:80), so a rebound name is dialed on a port nothing serves — and
     if all of that failed, the API-surface split leaves this container able to
     reach an /authorize listener and nothing else. See proxies/egress/DESIGN.md

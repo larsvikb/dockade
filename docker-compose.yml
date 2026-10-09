@@ -264,8 +264,8 @@ services:
     # mitmdump is a forward proxy, so there is no HTTP health endpoint to hit —
     # the probe is a plain TCP connect to the listener, which catches the one
     # failure the container's own exit does not: process alive, listener wedged.
-    # (Misconfiguration is already covered — the addon's _assert_guard_configured()
-    # refuses to start, so the container dies visibly.)
+    # (Misconfiguration is already covered — the addon refuses to start on a setting
+    # it cannot parse or an empty forbidden list, so the container dies visibly.)
     #
     # Deliberately NOT a real CONNECT through the proxy. That would prove the whole
     # policy path end to end, but it would also write an audit record every

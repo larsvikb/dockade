@@ -123,6 +123,18 @@ def _number(env: str, default: str, parse, expected: str):
     return _parsed(env, os.environ.get(env, default), parse, expected)
 
 
+def _seconds(value: str) -> float:
+    """A timeout a socket can hold: above zero, at most ``threading.TIMEOUT_MAX``.
+    ``float`` also accepts NaN, the infinities, zero, negatives and larger values, and
+    each fails every /authorize call (``settimeout`` refuses all but zero, which makes
+    the connect non-blocking), so the proxy would start and then deny everything
+    governed as "control-plane unreachable". NaN fails the comparison too."""
+    seconds = float(value)
+    if not 0 < seconds <= threading.TIMEOUT_MAX:
+        raise ValueError(value)
+    return seconds
+
+
 AUDIT_PATH = os.environ.get("EGRESS_AUDIT_LOG", "/var/log/egress/audit.jsonl")
 # The local audit file is otherwise unbounded on a long-lived volume. Rotate it by
 # SIZE (rename-aside at the cap, keep a few backups, drop the oldest), which caps
@@ -148,7 +160,9 @@ AUTHORIZE_URL = CONTROL_PLANE_URL + "/authorize"
 # 120s). It is a read timeout, so the fail-closed cases are unaffected: an
 # unreachable control plane fails immediately (connection refused / DNS), not by
 # waiting this out — only a genuine hold (or a hung control plane) waits long.
-CONTROL_TIMEOUT = _number("EGRESS_CONTROL_TIMEOUT", "130", float, "a number")
+CONTROL_TIMEOUT = _number("EGRESS_CONTROL_TIMEOUT", "130", _seconds,
+                          f"a number of seconds above 0 and at most "
+                          f"{threading.TIMEOUT_MAX:.0f}")
 
 # Permanent lifeline — allowed locally, BEFORE the control plane is consulted,
 # so an outage of the control plane can never sever the agent's own API/auth.

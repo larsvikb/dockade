@@ -15,6 +15,7 @@ import io
 import logging
 import os
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -156,17 +157,33 @@ class EnvParsingTests(unittest.TestCase):
         self.assertIn("DOCKADE_UNSET_SETTING: '13O' is not a number",
                       str(caught.exception))
 
-    def test_every_parsed_setting_refuses_a_typo_at_import(self):
+    def test_a_timeout_that_cannot_time_anything_refuses_to_start(self):
+        # Each of these parses as a float and then fails every /authorize call.
+        for value in ("0.5", str(threading.TIMEOUT_MAX)):
+            self.assertEqual(addon._number("DOCKADE_UNSET_SETTING", value,
+                                           addon._seconds, "x"), float(value))
+        for value in ("nan", "inf", "-inf", "0", "-5", "1e10"):
+            with self.subTest(value=value):
+                with self.assertRaises(SystemExit) as caught:
+                    addon._number("DOCKADE_UNSET_SETTING", value, addon._seconds,
+                                  "a number of seconds")
+                self.assertIn(f"DOCKADE_UNSET_SETTING: {value!r} is not a number",
+                              str(caught.exception))
+
+    def test_every_parsed_setting_refuses_a_bad_value_at_import(self):
         # The helpers above are only half of it: each module-level setting has to
         # go through them. SystemExit, not an Exception, because mitmproxy logs and
         # swallows an Exception raised while it imports a script.
-        for env in ("EGRESS_AUDIT_MAX_BYTES", "EGRESS_AUDIT_BACKUPS",
-                    "EGRESS_CONTROL_TIMEOUT", "EGRESS_CONNECT_PORTS",
-                    "EGRESS_HTTP_PORTS", "EGRESS_FORBIDDEN_CIDRS",
-                    "EGRESS_PRIVATE_CIDRS", "EGRESS_LIFELINE_CIDRS"):
+        bad = [(env, "O") for env in (
+            "EGRESS_AUDIT_MAX_BYTES", "EGRESS_AUDIT_BACKUPS", "EGRESS_CONTROL_TIMEOUT",
+            "EGRESS_CONNECT_PORTS", "EGRESS_HTTP_PORTS", "EGRESS_FORBIDDEN_CIDRS",
+            "EGRESS_PRIVATE_CIDRS", "EGRESS_LIFELINE_CIDRS")]
+        bad.append(("EGRESS_CONTROL_TIMEOUT", "0"))
+        for env, value in bad:
             spec = importlib.util.spec_from_file_location(
                 "dockade_egress_addon_typo", ROOT / "proxies/egress/addon.py")
-            with self.subTest(env=env), mock.patch.dict(os.environ, {env: "O"}):
+            with self.subTest(env=env, value=value), \
+                    mock.patch.dict(os.environ, {env: value}):
                 with self.assertRaises(SystemExit) as caught:
                     spec.loader.exec_module(importlib.util.module_from_spec(spec))
                 self.assertIn(env, str(caught.exception))

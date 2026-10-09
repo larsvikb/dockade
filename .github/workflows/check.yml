@@ -161,6 +161,27 @@ jobs:
         with:
           persist-credentials: false
 
+      # Signed-in pulls are counted against the account. Anonymous ones from hosted
+      # runners have been refused with 429, though GitHub documents them as exempt
+      # from Docker Hub's rate limit. The token is a Docker Hub access token with
+      # read-only scope, and nothing else here needs it. Plain `docker login` rather
+      # than an action, so no tag-pinned action's code runs with the token. It stays
+      # logged in for the whole job: the boundary step's `make up` builds again, and
+      # BuildKit re-resolves the `python:3.12-slim` tag at the registry when it does.
+      # Without the secrets (a fork's pull request gets none) the step says so and
+      # the job pulls anonymously.
+      - name: Log in to Docker Hub (read-only token)
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -z "$DOCKERHUB_USERNAME" ] || [ -z "$DOCKERHUB_TOKEN" ]; then
+            echo "::notice::No Docker Hub secrets; pulling anonymously."
+            exit 0
+          fi
+          printf '%s' "$DOCKERHUB_TOKEN" \
+            | docker login --username "$DOCKERHUB_USERNAME" --password-stdin
+
       # Covers every Dockerfile: the compose services, plus BOTH sandbox
       # tiers via each launcher's --build-only (which builds and exits — no workspace
       # mount, no network, no credentials, so it needs nothing from the runner).

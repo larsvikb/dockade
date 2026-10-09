@@ -47,6 +47,7 @@ UI_DIR = ROOT / "control-plane-ui"
 APP_JS = UI_DIR / "app.js"
 MCP_JS = UI_DIR / "mcp.js"
 AUDIT_JS = UI_DIR / "audit.js"
+LEASES_JS = UI_DIR / "leases.js"
 PAYLOAD_JS = UI_DIR / "payload.js"
 INDEX_HTML = UI_DIR / "index.html"
 
@@ -3590,15 +3591,20 @@ class LeaseTableSourceTests(unittest.TestCase):
     stopped being able to tell."""
 
     def setUp(self):
-        self.src = APP_JS.read_text()
-        self.body = re.search(r"async function refreshLeases\(\)\s*\{(.*?)\n  \}",
-                              self.src, re.S)
-        self.assertIsNotNone(self.body, "refreshLeases not found — renamed?")
+        self.src = LEASES_JS.read_text()
+        self.body = _fn_body(self.src, "refreshLeases()", "")
+        self.row = _fn_body(self.src, "leaseRow(r, member, groupKey, open)", "")
 
     def test_a_failed_refresh_keeps_the_rows_and_reports_the_staleness(self):
-        body = self.body.group(1)
-        self.assertIn("leasesFailed = true", body)
-        self.assertIn("renderLeasesStatus(", body)
+        body = self.body
+        # The failure path alone: the success path renders the status too, so over the
+        # whole body a catch that stopped reporting would still pass.
+        _, catch, after = body.partition("catch (e) {")
+        self.assertTrue(catch, "refreshLeases no longer catches a failed poll")
+        failure, sep, _ = after.partition("return;\n  }")
+        self.assertTrue(sep, "the failure path no longer returns early")
+        self.assertIn("leasesFailed = true", failure)
+        self.assertIn("renderLeasesStatus(", failure)
         self.assertNotRegex(body, r'catch[^}]*innerHTML\s*=\s*""',
                             "a failed poll must not blank the leases table")
         self.assertNotRegex(
@@ -3606,10 +3612,10 @@ class LeaseTableSourceTests(unittest.TestCase):
             "the failure path is a comment, not a reported state")
 
     def test_a_non_ok_response_is_a_failure_not_a_row_of_json(self):
-        self.assertRegex(self.body.group(1), r"if\s*\(!res\.ok\)\s*throw")
+        self.assertRegex(self.body, r"if\s*\(!res\.ok\)\s*throw")
 
     def test_a_recovered_poll_clears_the_warning_and_re_renders(self):
-        _, sep, success = self.body.group(1).partition("return;\n    }")
+        _, sep, success = self.body.partition("return;\n  }")
         self.assertTrue(sep, "the failure path no longer returns early")
         self.assertIn("leasesFailed = false", success)
         self.assertIn("renderLeasesStatus(", success)
@@ -3619,13 +3625,14 @@ class LeaseTableSourceTests(unittest.TestCase):
         just the countdown cells. Rebuilding the table on that tick instead would drop a
         click landing on a revoke button at the moment it fired — which is exactly when
         an operator is most likely to be pressing one."""
-        tick = re.search(r"function updateLeaseCountdowns\(\)\s*\{(.*?)\n  \}",
-                         self.src, re.S)
-        self.assertIsNotNone(tick, "updateLeaseCountdowns not found — renamed?")
-        body = tick.group(1)
+        body = _fn_body(self.src, "updateLeaseCountdowns()", "")
         self.assertIn("dataset.expires", body)
         self.assertNotIn("innerHTML", body)
         self.assertNotIn("fetch(", body)
+        # And the tick calls it, now from the other side of an import.
+        self.assertIn("updateLeaseCountdowns();", APP_JS.read_text()
+                      .split("setInterval(() => {", 1)[1]
+                      .split("}, 1000)", 1)[0])
 
     def test_a_folded_group_hides_its_rows_rather_than_omitting_them(self):
         """Expanding has to be a flip on rows already in the DOM. Rendering members only
@@ -3633,44 +3640,37 @@ class LeaseTableSourceTests(unittest.TestCase):
         them, so a click could be undone by a fetch already in flight — the same class
         of bug as rebuilding the table on the one-second tick."""
         # Every member is emitted; `open` only decides the `hidden` attribute on it.
-        body = self.body.group(1)
+        body = self.body
         self.assertRegex(body, r"g\.leases\.map\(r => leaseRow\(")
         self.assertNotRegex(body, r"open\s*\?\s*g\.leases\.map",
                             "members must be rendered and hidden, not conditionally "
                             "rendered")
-        row = re.search(r"function leaseRow\(([^)]*)\)\s*\{(.*?)\n  \}",
-                        self.src, re.S)
-        self.assertIsNotNone(row, "leaseRow not found — renamed?")
-        self.assertIn("lease-member", row.group(2))
-        self.assertRegex(row.group(2), r'!open\s*\?\s*"hidden"')
+        self.assertIn("lease-member", self.row)
+        self.assertRegex(self.row, r'!open\s*\?\s*"hidden"')
 
     def test_expansion_survives_the_poll(self):
         """The table is replaced wholesale every four seconds, so expansion state held
         in the DOM alone would collapse itself on the next tick. It lives in a Set
         outside the render, and the render reads it back."""
         self.assertIn("const expandedLeaseGroups = new Set()", self.src)
-        self.assertIn("expandedLeaseGroups.has(g.key)", self.body.group(1))
+        self.assertIn("expandedLeaseGroups.has(g.key)", self.body)
 
     def test_a_lapsed_group_does_not_keep_its_expansion(self):
         # The key is (class, domain), which outlives the leases under it: without the
         # prune, a domain leased again half an hour later would silently come back
         # expanded because a previous group with the same key had been opened.
-        body = self.body.group(1)
-        self.assertIn("expandedLeaseGroups.delete(key)", body)
+        self.assertIn("expandedLeaseGroups.delete(key)", self.body)
 
     def test_the_count_in_the_header_counts_grants_not_rows(self):
         # Folding four hosts into one line must not make the number shrink: the header
         # answers "how much is granted right now", not "how tall is this table".
-        self.assertIn("leasesCountEl.textContent = rows.length", self.body.group(1))
+        self.assertIn("leasesCountEl.textContent = rows.length", self.body)
 
     def test_the_full_provenance_survives_in_the_cell_title(self):
         """The shortener is a RENDERING. The stored `granted_by` is evidence and stays
         whole in the store, in the audit reason, and in this cell's tooltip — so
         nothing an operator might need to quote is only in the abbreviated form."""
-        row = re.search(r"function leaseRow\(([^)]*)\)\s*\{(.*?)\n  \}",
-                        self.src, re.S)
-        self.assertIsNotNone(row, "leaseRow not found — renamed?")
-        body = row.group(2)
+        body = self.row
         self.assertRegex(body, r'title="\$\{esc\(r\.granted_by')
         self.assertIn("shortActor(r.granted_by)", body)
         # And it is NOT in a `.ts` cell — that class is `white-space: nowrap` with no
@@ -3694,10 +3694,12 @@ class LeaseTableSourceTests(unittest.TestCase):
         question behind it. Asserted because the obvious "safer" edit is to route it
         through `askPersist` like its neighbours, which would then 400: the confirm
         panel sends a `pattern` the lease path does not accept."""
+        # The card's code, which is still in `start()`.
+        cards = APP_JS.read_text()
         self.assertRegex(
-            self.src,
+            cards,
             r"action\.endsWith\(\"persist\"\)\s*\n\s*\?\s*askPersist\(a, action\)")
-        self.assertNotRegex(self.src, r"askPersist\(a, \"allow_lease\"\)")
+        self.assertNotRegex(cards, r"askPersist\(a, \"allow_lease\"\)")
 
 
 class PolicyTableSourceTests(unittest.TestCase):

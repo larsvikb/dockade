@@ -290,7 +290,8 @@ dockade/
     holds.js                #   the pending queue's decisions: what a push changes, when a
                             #   card may go, how a countdown reads, how an arrival is announced
     leases.js               #   timed grants as shown: the button label, each lease's countdown,
-                            #   sibling hosts folded into one line
+                            #   sibling hosts folded into one line — and the live leases
+                            #   table itself, which start() mounts
     mcp.js                  #   the MCP surface from the form: what a server registration
                             #   records, the tool picker, what a tool rule will do — and
                             #   the MCP tab itself, which start() mounts

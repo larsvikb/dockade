@@ -859,8 +859,8 @@ the fix is one fold to the A-label at the point each name enters `addon.py`
 (`_a_label`), chosen over normalizing at display time because only the entry point is
 upstream of all three consumers. Folding spelling must not fold destinations — a Host
 header naming a genuinely different site still gates separately — and the fold falls
-back to the input rather than raising, since the `idna` codec rejects underscored and
-over-long labels that DNS and the rest of this proxy accept.
+back to the input rather than raising: a name the `idna` codec cannot encode does not
+resolve either, and refusing it is the relay guard's call.
 
 ### Control plane — policy, audit, hold-for-approval
 

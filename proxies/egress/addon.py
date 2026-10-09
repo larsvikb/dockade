@@ -330,14 +330,11 @@ def _a_label(host: str) -> str:
     Both are the same bug: a name spelled two ways. Canonicalizing to the A-label
     is what makes the comparison, the display and the stored rule agree.
 
-    Falls back to the input on UnicodeError. The ``idna`` codec is stricter than
-    DNS: it rejects an underscored label (``_dmarc.example.com``) that resolves
-    fine, so refusing here would turn a spelling helper into an outage for hosts
-    that were never internationalized. It also rejects empty and over-long labels,
-    which do NOT resolve — ``getaddrinfo`` raises the same ``UnicodeError`` for
-    them — and those are not this function's call either: they fall through
-    unchanged and ``_forbidden_reason`` denies them by name. Spelling here,
-    gating there."""
+    Falls back to the input on UnicodeError. The ``idna`` codec raises it for an
+    empty or over-long label, which does not resolve either — ``getaddrinfo``
+    raises the same ``UnicodeError`` — but refusing is not this function's call:
+    such a name falls through unchanged and ``_forbidden_static`` denies it by
+    name. Spelling here, gating there."""
     try:
         return host.encode("idna").decode("ascii")
     except (UnicodeError, ValueError):

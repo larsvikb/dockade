@@ -103,7 +103,7 @@ reasoning for each lives in `DESIGN.md` or beside the code and is referenced rat
 than restated.
 
 - **The relay guard's resolve branch is beatable by DNS rebinding.**
-  `proxies/egress/addon.py` `_forbidden_reason` re-resolves instead of pinning the
+  `proxies/egress/addon.py` `_forbidden_resolved` re-resolves instead of pinning the
   resolved address, so a name can change answers between the check and the dial. The
   *consequence* is capped rather than the gap closed — see the API-surface split in
   `DESIGN.md`, which is why even a total bypass reaches a listener that can only ask

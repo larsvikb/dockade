@@ -202,21 +202,21 @@ class HttpConnectTests(unittest.TestCase):
 
     def test_forbidden_host_denied_before_authority_recorded(self):
         flow = _connect_flow("control-plane", cid="c2")
-        with mock.patch.object(addon, "_post_authorize",
-                               side_effect=AssertionError("must not authorize")):
+        with mock.patch.object(addon, "_post_authorize") as posted:
             run(addon.http_connect(flow))
         self.assertIsNotNone(flow.response)                  # denied by the guard
         self.assertNotIn("c2", addon._conn_authority)
+        posted.assert_not_called()
 
     def test_bad_port_denied(self):
         flow = _connect_flow("example.com", port=22, cid="c3")
         with mock.patch.object(addon.socket, "getaddrinfo",
                                return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]), \
-             mock.patch.object(addon, "_post_authorize",
-                               side_effect=AssertionError("must not authorize")):
+             mock.patch.object(addon, "_post_authorize") as posted:
             run(addon.http_connect(flow))
         self.assertIsNotNone(flow.response)
         self.assertNotIn("c3", addon._conn_authority)
+        posted.assert_not_called()
 
     def test_control_plane_deny_denies_and_records_nothing(self):
         flow = _connect_flow("blocked.com", cid="c4")
@@ -422,15 +422,15 @@ class InternationalizedHostTests(unittest.TestCase):
         # Already-ASCII names, including an A-label, must survive untouched.
         self.assertEqual(addon._a_label("example.com"), "example.com")
         self.assertEqual(addon._a_label(self.ASCII), self.ASCII)
+        # The stdlib codec accepts an underscore. An IDNA 2008 encoder would raise,
+        # and the fallback would leave this name in Unicode.
+        self.assertEqual(addon._a_label("_dmarc." + self.UNICODE), "_dmarc." + self.ASCII)
 
-    def test_a_label_falls_back_rather_than_rejecting_a_dns_valid_host(self):
-        """The ``idna`` codec is stricter than DNS: an underscored label resolves
-        fine, so raising here would turn a spelling helper into an outage for hosts
-        that were never internationalized. An over-long or empty label does NOT
-        resolve, and still passes through unchanged — spelling is this function's
-        job; the relay guard is where such a name is denied (see
-        ``FailClosedTests``)."""
-        for host in ("_dmarc.example.com", "a" * 64 + ".example.com", ""):
+    def test_a_label_passes_an_unencodable_name_through_to_the_guard(self):
+        """An over-long or empty label does not resolve, and still passes through
+        unchanged — spelling is this function's job; the relay guard is where such
+        a name is denied (see ``FailClosedTests``)."""
+        for host in ("a" * 64 + ".example.com", "a..b"):
             self.assertEqual(addon._a_label(host), host)
 
     def test_connect_asks_the_control_plane_in_ascii(self):
@@ -578,10 +578,13 @@ class RequestTests(unittest.TestCase):
                           peer="172.30.0.7")
         with mock.patch.object(addon.socket, "getaddrinfo",
                                return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]), \
+             mock.patch.object(addon, "_post_authorize") as posted, \
              mock.patch.object(addon, "_audit") as audited:
             run(addon.request(flow))
-        self.assertIsNotNone(flow.response)                 # port-gated
+        self.assertIsNotNone(flow.response)
+        posted.assert_not_called()
         fields = audited.call_args[1]
+        self.assertIn("port 8080 not permitted", fields["reason"])
         self.assertEqual(fields["client"], "172.30.0.7")
         self.assertEqual(fields["host"], "allowed.com")
         self.assertFalse(fields["central"])
@@ -642,19 +645,19 @@ class RequestTests(unittest.TestCase):
 
     def test_forbidden_authority_denied_by_guard(self):
         flow = _http_flow("allowed.com", "control-plane")
-        with mock.patch.object(addon, "_post_authorize",
-                               side_effect=AssertionError("must not authorize")):
+        with mock.patch.object(addon, "_post_authorize") as posted:
             run(addon.request(flow))
         self.assertIsNotNone(flow.response)
+        posted.assert_not_called()
 
     def test_bad_port_denied(self):
         flow = _http_flow("allowed.com", "allowed.com", scheme="http", port=8080)
         with mock.patch.object(addon.socket, "getaddrinfo",
                                return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]), \
-             mock.patch.object(addon, "_post_authorize",
-                               side_effect=AssertionError("must not authorize")):
+             mock.patch.object(addon, "_post_authorize") as posted:
             run(addon.request(flow))
         self.assertIsNotNone(flow.response)
+        posted.assert_not_called()
 
 
 def _unencodable(name, *_args, **_kwargs):
@@ -686,8 +689,7 @@ class FailClosedTests(unittest.TestCase):
         (``ResolveAfterAllowTests``)."""
         flow = _http_flow("exfil.example", "a..b", scheme="http", port=80)
         with mock.patch.object(addon.socket, "getaddrinfo", side_effect=_unencodable), \
-             mock.patch.object(addon, "_post_authorize",
-                               side_effect=AssertionError("must not authorize")), \
+             mock.patch.object(addon, "_post_authorize") as posted, \
              mock.patch.object(addon, "_audit") as audited:
             run(addon.request(flow))
         self.assertIsNotNone(flow.response)
@@ -696,6 +698,7 @@ class FailClosedTests(unittest.TestCase):
         self.assertEqual(fields["host"], "a..b")
         self.assertIn("not a resolvable hostname", fields["reason"])
         self.assertFalse(fields["central"])
+        posted.assert_not_called()
 
     def test_an_over_long_label_is_denied_by_the_guard(self):
         """``_a_label`` passes it through (that test says why); the guard is where
@@ -704,10 +707,10 @@ class FailClosedTests(unittest.TestCase):
         with mock.patch.object(addon.socket, "getaddrinfo", side_effect=_unencodable):
             self.assertIn("not a resolvable hostname", addon._forbidden_reason(name))
             flow = _connect_flow(name)
-            with mock.patch.object(addon, "_post_authorize",
-                                   side_effect=AssertionError("must not authorize")):
+            with mock.patch.object(addon, "_post_authorize") as posted:
                 run(addon.http_connect(flow))
         self.assertIsNotNone(flow.response)
+        posted.assert_not_called()
 
     def test_any_exception_in_http_connect_denies_and_audits(self):
         flow = _connect_flow("example.com", cid="boom-connect")
@@ -804,29 +807,33 @@ class PortGateOrderTests(unittest.TestCase):
         addon._conn_authority.clear()
 
     def _never_resolve(self):
+        """Recording, asserted afterwards, for the reason ``ResolveAfterAllowTests``
+        gives."""
         return mock.patch.object(addon.socket, "getaddrinfo",
-                                 side_effect=AssertionError("must not resolve"))
+                                 return_value=[(2, 1, 6, "", ("93.184.216.34", 0))])
 
     def test_a_refused_connect_port_never_resolves(self):
         flow = _connect_flow("exfil.attacker.example", port=22)
-        with self._never_resolve(), \
-             mock.patch.object(addon, "_post_authorize",
-                               side_effect=AssertionError("must not authorize")), \
+        with self._never_resolve() as resolved, \
+             mock.patch.object(addon, "_post_authorize") as posted, \
              mock.patch.object(addon, "_audit") as audited:
             run(addon.http_connect(flow))
         self.assertIsNotNone(flow.response)
         self.assertIn("port 22 not permitted", audited.call_args[1]["reason"])
+        posted.assert_not_called()
+        resolved.assert_not_called()
 
     def test_a_refused_http_port_never_resolves_either_name(self):
         flow = _http_flow("exfil.attacker.example", "other.attacker.example",
                           scheme="http", port=8080)
-        with self._never_resolve(), \
-             mock.patch.object(addon, "_post_authorize",
-                               side_effect=AssertionError("must not authorize")), \
+        with self._never_resolve() as resolved, \
+             mock.patch.object(addon, "_post_authorize") as posted, \
              mock.patch.object(addon, "_audit") as audited:
             run(addon.request(flow))
         self.assertIsNotNone(flow.response)
         self.assertIn("port 8080 not permitted", audited.call_args[1]["reason"])
+        posted.assert_not_called()
+        resolved.assert_not_called()
 
     def test_a_forbidden_name_on_a_refused_port_is_still_refused_as_forbidden(self):
         """Static half first: the audit row names the control plane, not the port."""
@@ -834,22 +841,27 @@ class PortGateOrderTests(unittest.TestCase):
                            (_http_flow("control-plane", "control-plane", scheme="http",
                                        port=8090), addon.request)):
             with self.subTest(hook=hook.__name__):
-                with self._never_resolve(), mock.patch.object(addon, "_audit") as audited:
+                with self._never_resolve() as resolved, \
+                     mock.patch.object(addon, "_audit") as audited:
                     run(hook(flow))
                 self.assertIsNotNone(flow.response)
                 self.assertIn("forbidden destination host", audited.call_args[1]["reason"])
+                resolved.assert_not_called()
 
     def test_a_literal_forbidden_ip_on_a_refused_port_is_still_refused_as_forbidden(self):
         flow = _connect_flow("172.31.0.2", port=8090)
-        with self._never_resolve(), mock.patch.object(addon, "_audit") as audited:
+        with self._never_resolve() as resolved, \
+             mock.patch.object(addon, "_audit") as audited:
             run(addon.http_connect(flow))
         self.assertIn("forbidden destination IP", audited.call_args[1]["reason"])
+        resolved.assert_not_called()
 
     def test_the_whole_verdict_is_still_one_call(self):
         """``_forbidden_reason`` remains the two halves joined, for callers that
         want it in one place — and the tests that exercise it as such."""
-        with self._never_resolve():
+        with self._never_resolve() as resolved:
             self.assertIn("control plane", addon._forbidden_reason("control-plane"))
+        resolved.assert_not_called()
         with mock.patch.object(addon.socket, "getaddrinfo",
                                return_value=[(2, 1, 6, "", ("172.31.0.2", 0))]):
             self.assertIn("resolves to", addon._forbidden_reason("rebind.example.com"))

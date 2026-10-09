@@ -6285,8 +6285,7 @@ class ListenerSeparationTests(unittest.TestCase):
         self.assertIn("CONTROL_MANAGE_BIND_FORBIDDEN", str(caught.exception))
 
     def test_the_forbidden_list_is_a_typo_away_from_nothing_and_says_so(self):
-        # Fatal rather than tolerant, unlike the addon's CIDR parsing: that list is
-        # long and mostly redundant, this one has two members and dropping either
+        # Fatal rather than tolerant: this list has two members, and dropping either
         # silently removes the guard.
         with mock.patch.object(cp, "_TOOL_BIND_FORBIDDEN",
                                "172.29.0.0/24,not-a-cidr"), \

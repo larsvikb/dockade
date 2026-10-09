@@ -17,8 +17,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import io
+import ipaddress
 import json
 import unittest
+from unittest import mock
 
 from _loader import load_tool_gateway
 
@@ -86,6 +88,20 @@ class BindGuardTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as caught:
             self._guard({**GOOD, "GATEWAY_BIND_FORBIDDEN": "172.28.0.0/24,not-a-cidr"})
         self.assertIn("not a CIDR", str(caught.exception))
+
+    def test_an_mcp_net_holding_the_agent_bind_is_refused(self):
+        # `/14` for `/24` has no host bits, so only this check stands between it and
+        # credentials sent onto sandbox-net. Through main(), which must run it before
+        # it serves; the deployed pair passes it.
+        gateway = load_tool_gateway(GOOD)
+        gateway._assert_mcp_net_excludes_the_agent()
+        with mock.patch.object(gateway.discovery, "MCP_NET",
+                               ipaddress.ip_network("172.28.0.0/14")), \
+                mock.patch.object(gateway.outcomes, "setup",
+                                  side_effect=AssertionError("got past the guard")), \
+                self.assertRaises(SystemExit) as caught:
+            gateway.main()
+        self.assertIn("172.30.0.11", str(caught.exception))
 
     def test_the_guard_is_not_disabled_by_an_empty_forbidden_list(self):
         # An empty list legitimately parses to "nothing forbidden", so the wildcard

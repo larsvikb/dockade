@@ -146,6 +146,21 @@ def _assert_bind_is_agent_facing_only() -> None:
                 f"on sandbox-net and nowhere else. Refusing to start (fail closed).")
 
 
+def _assert_mcp_net_excludes_the_agent() -> None:
+    """Fail closed when ``discovery.MCP_NET`` holds the gateway's own sandbox-net
+    address: server credentials would then be allowed onto the agent's network.
+
+    This catches what strict parsing cannot, a typo that lands on a network boundary
+    (``172.28.0.0/14`` for ``/24``). A range that holds part of sandbox-net but not
+    this address still passes."""
+    if _bind_within(AGENT_BIND, discovery.MCP_NET):
+        raise SystemExit(
+            f"tool-gateway: GATEWAY_MCP_NET {discovery.MCP_NET} contains "
+            f"GATEWAY_AGENT_BIND={AGENT_BIND!r}, the agent's network, so a server's "
+            f"credential could be sent to a container there. Refusing to start "
+            f"(fail closed).")
+
+
 # The schema as well as the pages: /openapi.json is still served with the other two
 # off, and this listener faces the agent (tests/test_topology.py).
 app = FastAPI(title="dockade MCP gateway",
@@ -376,6 +391,7 @@ def main() -> None:
     ps` as a restart loop, which is the intended operator experience for a
     configuration that cannot be served safely."""
     _assert_bind_is_agent_facing_only()
+    _assert_mcp_net_excludes_the_agent()
     # BEFORE the listener too, and for the same reason the bind guard is: a configured
     # audit path that cannot be opened is a misconfiguration, and a gateway that served
     # tool calls while failing to record how they ended would be the quiet version of

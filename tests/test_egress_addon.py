@@ -143,6 +143,7 @@ class EnvParsingTests(unittest.TestCase):
         # the operator did not write, and in an overridden EGRESS_PRIVATE_CIDRS
         # that un-blocks the range the typo was meant to cover.
         for parse, default in ((addon._parse_cidrs, "172.31.0.0/24, 172.29.0.O/24"),
+                               (addon._parse_cidrs, "172.31.0.0/24, 172.30.0.0/2"),
                                (addon._ports, "443, 44x")):
             with self.subTest(default=default):
                 with self.assertRaises(SystemExit) as caught:

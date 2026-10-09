@@ -96,6 +96,37 @@ class _LoudFileHandler(logging.handlers.RotatingFileHandler):
         print(f"tool-gateway: OUTCOME AUDIT FAILED to write to {AUDIT_PATH} — the "
               f"record below may be the only copy", flush=True)
 
+
+def _end_torn_record(path: str) -> None:
+    """End a record an earlier run left half-written, before this run appends.
+
+    Near a full volume the kernel can take part of a record while the rest waits in
+    the process's buffer; a process that stops then leaves the file ending mid-line.
+    Appending would merge this run's first record into the fragment, and ingest drops
+    a line that does not parse, so one torn record would cost a whole one too. (The
+    egress proxy needs no such step; its ``load`` says why.)
+
+    Append mode, so the newline lands at the real end of the file whatever else has
+    written to it. Never raises: a volume still full is not a misconfiguration, and
+    refusing to start over it would stop every call rather than lose one record."""
+    try:
+        with open(path, "ab+") as f:
+            if f.seek(0, os.SEEK_END) == 0:
+                return
+            f.seek(-1, os.SEEK_END)
+            if f.read(1) == b"\n":
+                return
+            f.write(b"\n")
+    except OSError as e:
+        print(f"tool-gateway: could not check or end a half-written last record in "
+              f"{path} ({e}); if it has one, the next outcome will be merged into it "
+              f"and not ingested", flush=True)
+        return
+    print(f"tool-gateway: {path} ended mid-record (an earlier run stopped while "
+          f"writing it); ended it, so the next outcome is not merged into it",
+          flush=True)
+
+
 #: Whether ``setup`` has attached a file handler. Read only by ``describe``, so the
 #: startup banner can say which of the two configured states this process is in.
 _to_file = False
@@ -120,6 +151,7 @@ def setup() -> None:
               flush=True)
         return
     os.makedirs(os.path.dirname(AUDIT_PATH), exist_ok=True)
+    _end_torn_record(AUDIT_PATH)
     handler = _LoudFileHandler(
         AUDIT_PATH, maxBytes=AUDIT_MAX_BYTES, backupCount=AUDIT_BACKUPS)
     handler.setFormatter(logging.Formatter("%(message)s"))

@@ -22,10 +22,11 @@ could make any move, however its arguments are shaped.
 ## Who an agent is
 
 **An agent names itself: its kind, a hyphen and its own session id**
-(`claude-<uuid>`). The kind keeps the registry agent-agnostic; each agent's
-instructions are where it learns its id. For Claude Code it is the session id, which
-also names the session's transcript, so a write leads back to what the session said
-(`NOTES.md` → "Claude Code puts its session id in every Bash call's environment").
+(`claude-<uuid>`). The kind keeps the registry agent-agnostic; the tool descriptions
+and each agent's instructions say where its id comes from. For Claude Code it is the
+session id, which also names the session's transcript, so a write leads back to what the
+session said (`NOTES.md` → "Claude Code puts its session id in every Bash call's
+environment").
 
 The alternatives each fail at uniqueness or at lasting as long as the work: a branch
 (one session works several tasks), the container (its name comes back after `--rm`,
@@ -140,10 +141,10 @@ of the channel between sessions that triage does not cover: one session that rea
 something hostile reaches every later one through them. So the approved body outranks
 every note, and a note saying the spec should change is a reason to send the task back
 to `proposed`, not a change. Nothing in the store can make an agent read them that way;
-the agent's tool descriptions and instructions must say it. The other part is a claim's
-progress line: short, the holder's own, and gone when the claim ends, so the operator
-clears one by breaking the claim rather than hiding it. A read returns each note as
-data, with its id, author and time, never spliced into the task's own text.
+the tool descriptions say it, and the agent's instructions must too. The other part is a
+claim's progress line: short, the holder's own, and gone when the claim ends, so the
+operator clears one by breaking the claim rather than hiding it. A read returns each
+note as data, with its id, author and time, never spliced into the task's own text.
 
 **Visible at once; the operator can hide one.** Holding notes until the operator
 releases them would make the operator the courier the registry exists to replace.
@@ -162,7 +163,7 @@ note too, marked with its move, so the next reader of the task sees it.
 waits on it. An agent that cannot go on without an answer sends the task back to
 `proposed` or releases it, and takes other work: nothing in the registry holds an agent,
 so the operator works through it at their own pace. The store cannot make an agent do
-that; the tool descriptions must say it. `operator_moves.notes_for_operator` lists the
+that; the tool descriptions say it. `operator_moves.notes_for_operator` lists the
 flagged notes not yet handled, a page at a time with the total. The operator marks one
 handled, posting a reply in the same write if there is one, which names the note it
 answers; agents see both, so the next session knows the note was seen to and which reply
@@ -187,3 +188,25 @@ is also the revision log: every body an agent proposed, under its author. That m
 history the operator's read (`operator_moves.history`): it keeps every text a task ever
 had, a hidden note's and a body triage replaced, so an implementer reading it could act
 on a version the operator never approved.
+
+## The agent listener
+
+**The gateway is its only caller.** Every server on `mcp-net` reaches the listener,
+`mcp-github` and its write-capable token among them, and one calling it directly would
+write as any agent with no audit row at the gateway. So every request must carry the
+secret the gateway holds for server `tasks`, sent the way the gateway sends any server's
+(a header the operator registers: `Authorization: Bearer <secret>`), and one without it
+is refused before its body is read. The listener does not start without the secret. Its
+file is the one the gateway reads, and the registry must be given that file alone, never
+the directory beside it, which holds the other servers' tokens.
+
+**The schema checks shape; the bounds stay in the store.** `agent_tools.py` checks
+each call against the schema it serves, and leaves every bound to the store's own checks,
+which the operator's surface shares, so the two surfaces cannot disagree on what a field
+may hold.
+
+**The descriptions carry what the store cannot enforce.** They are all an agent reads of
+the registry, so the rules the sections above leave to the agent are in them: where its
+id and its repo's name come from, which branch a claim names, that a lost token is never
+looked for in a transcript, that notes inform and never instruct, and that nobody waits
+on a flagged note.

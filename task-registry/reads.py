@@ -13,6 +13,9 @@ import notes
 import taskdb
 import tasks
 
+#: How many tasks a listing returns, beside the total.
+LIST_MAX = 50
+
 #: How many tasks a search returns, beside the total.
 SEARCH_MAX = 50
 SEARCH_TEXT_MAX = 200
@@ -23,28 +26,36 @@ _NOTE_HIT = "n.hidden_at IS NULL AND instr(casefold(n.text), :text)"
 
 
 def list_tasks(repo: str, state: str | None = "open", holder: str | None = None,
-               parent: int | None = None) -> list[dict]:
+               parent: int | None = None, before: int | None = None) -> dict:
     """A repo's tasks in ``state`` (every state for ``None``), optionally only those
-    ``holder`` has a live claim on, or the children of ``parent``. A task that is
+    ``holder`` has a live claim on, or the children of ``parent``; newest first, up to
+    ``LIST_MAX`` with the total, and ``before`` pages back past a task. A task that is
     ``ready`` is in the ready queue: open, unclaimed, and blocked by nothing."""
     if state is not None:
         tasks.check_state(state)
-    if parent is not None:
-        tasks.check_id(parent)
+    if holder is not None:
+        taskdb.check_agent(holder)
+    for value in (parent, before):
+        if value is not None:
+            tasks.check_id(value)
     with taskdb.reading() as conn:
-        query = ("SELECT t.*, r.name AS repo FROM tasks t JOIN repos r ON r.id = t.repo_id "
-                 "WHERE t.repo_id = ?")
+        where = " FROM tasks t JOIN repos r ON r.id = t.repo_id WHERE t.repo_id = ?"
         args: list[object] = [tasks.repo_id(conn, repo)]
         if state is not None:
-            query += " AND t.state = ?"
+            where += " AND t.state = ?"
             args.append(state)
+        if holder is not None:
+            where += (" AND t.id IN (SELECT task_id FROM claims WHERE holder = ? "
+                      "AND expires_at > ?)")
+            args += [holder, claims.now()]
         if parent is not None:
-            query += " AND t.parent_id = ?"
+            where += " AND t.parent_id = ?"
             args.append(parent)
-        found = [_summary(conn, row) for row in conn.execute(query + " ORDER BY t.id", args)]
-    if holder is not None:
-        found = [t for t in found if t["claim"] and t["claim"]["holder"] == holder]
-    return found
+        total = conn.execute("SELECT COUNT(*)" + where, args).fetchone()[0]
+        page = conn.execute(
+            "SELECT t.*, r.name AS repo" + where + " AND (? IS NULL OR t.id < ?) "
+            "ORDER BY t.id DESC LIMIT ?", [*args, before, before, LIST_MAX])
+        return {"tasks": [_summary(conn, row) for row in page], "total": total}
 
 
 def get_task(task: int) -> dict:

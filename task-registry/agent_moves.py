@@ -25,7 +25,7 @@ def propose(agent: str, repo: str, title: str, body: str, severity: str | None =
     with taskdb.writing() as conn:
         repo_id = tasks.repo_id(conn, repo, for_new_task=True)
         tasks.check_parent(conn, repo_id, parent)
-        tasks.check_blockers(conn, repo_id, list(blocked_by))
+        tasks.check_blockers(conn, repo_id, blocked_by)
         task = tasks.insert(conn, repo_id, title, body, "proposed", severity, kind, parent)
         tasks.set_blockers(conn, task, list(blocked_by))
         taskdb.record(conn, agent, "propose", task, title=title, body=body,

@@ -182,10 +182,10 @@ def storable(text: str) -> bool:
     return True
 
 
-def check_agent(agent: str) -> str:
+def check_agent(agent: object) -> str:
     """``agent``, if it has the shape of an agent id: a shape, not a proof
     (``task-registry/DESIGN.md``, "Who an agent is")."""
-    match = _AGENT_RE.fullmatch(agent or "")
+    match = _AGENT_RE.fullmatch(agent) if isinstance(agent, str) else None
     if match is None or match["kind"] in (OPERATOR, REGISTRY):
         raise Refused(
             f"{agent!r} is not an agent id: the agent's kind, a hyphen and its own "

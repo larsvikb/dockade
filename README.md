@@ -323,6 +323,9 @@ dockade/
     reads.py                #   what any surface may read; nothing here writes
     agent_moves.py          #   what an agent may do: propose, edit a proposal, work a
                             #   claim, add a note
+    agent_tools.py          #   the tools an agent sees: descriptions, schemas, the
+                            #   argument check
+    agent_api.py            #   the agent listener: MCP for the gateway, behind its secret
     operator_moves.py       #   what only the operator may do or see: any edit, any move,
                             #   break a claim, hide or handle a note, the repo list;
                             #   the history

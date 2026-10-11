@@ -187,11 +187,19 @@ class ExpiryTests(_Store):
         task = self.open_task()
         token = self.claim(task)["token"]
         self.clock += claims.CLAIM_SECONDS
-        got = reads.list_tasks("widgets")[0]
+        got = reads.list_tasks("widgets")["tasks"][0]
         self.assertEqual((got["claim"], got["ready"]), (None, True))
         refusal = self.refused(agent.update, ALICE, "widgets", task, token)
         self.assertIn("lapsed", refusal.reason)
         self.assertEqual(refusal.current["holder"], None)
+
+    def test_a_lapsed_claim_is_not_listed_as_held(self):
+        task = self.open_task()
+        self.claim(task)
+        self.assertEqual(reads.list_tasks("widgets", holder=ALICE)["total"], 1)
+        self.clock += claims.CLAIM_SECONDS
+        self.assertEqual(reads.list_tasks("widgets", holder=ALICE),
+                         {"tasks": [], "total": 0})
 
     def test_a_holder_whose_task_left_open_is_told_its_state(self):
         task = self.open_task()
@@ -286,7 +294,7 @@ class ReadyQueueTests(_Store):
         claimed = self.open_task("Claimed")
         self.claim(claimed)
         free = self.open_task("Free")
-        ready = {t["id"]: t["ready"] for t in reads.list_tasks("widgets")}
+        ready = {t["id"]: t["ready"] for t in reads.list_tasks("widgets")["tasks"]}
         self.assertEqual(ready, {blocker: True, waiting: False, claimed: False, free: True})
 
     def test_a_blocked_task_can_still_be_claimed_and_says_by_what(self):
@@ -300,8 +308,8 @@ class ReadyQueueTests(_Store):
         self.open_task("Nobody's")
         self.claim(mine)
         self.claim(theirs, who=BOB)
-        self.assertEqual([t["id"] for t in reads.list_tasks("widgets", holder=ALICE)],
-                         [mine])
+        self.assertEqual([t["id"] for t in
+                          reads.list_tasks("widgets", holder=ALICE)["tasks"]], [mine])
 
 
 class OperatorTests(_Store):

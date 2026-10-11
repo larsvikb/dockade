@@ -54,7 +54,9 @@ class SearchTests(unittest.TestCase):
                          ([by_note, by_body, by_title], 3))
         self.assertEqual([(t["matched_notes"], t["matched_notes_total"])
                           for t in got["tasks"]], [([noted], 1), ([], 0), ([], 0)])
-        self.assertEqual(got["tasks"][0]["title"], reads.list_tasks("widgets")[2]["title"])
+        listed = {t["id"]: t for t in reads.list_tasks("widgets")["tasks"]}
+        self.assertEqual({k: v for k, v in got["tasks"][0].items()
+                          if not k.startswith("matched_")}, listed[by_note])
 
     def test_case_is_folded_beyond_ascii_and_nothing_is_a_wildcard(self):
         task = self.task(title="Åtgärda straße")

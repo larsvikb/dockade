@@ -29,13 +29,14 @@ REMOTE_RE = re.compile(r"[A-Za-z0-9.-]+(/[A-Za-z0-9._-]+){2,4}")
 
 # --- fields ----------------------------------------------------------------------
 
-def check_fields(title: str | None = None, body: str | None = None,
-                 severity: str | None = None, kind: str | None = None) -> None:
+def check_fields(title: object = None, body: object = None, severity: object = None,
+                 kind: object = None) -> None:
     """Refuse a field outside its bounds. ``None`` is "not given" and passes."""
-    if title is not None and not (title.strip() and len(title) <= TITLE_MAX
-                                  and taskdb.storable(title)):
+    if title is not None and not (isinstance(title, str) and title.strip()
+                                  and len(title) <= TITLE_MAX and taskdb.storable(title)):
         raise Refused(f"a title is 1 to {TITLE_MAX} characters of text")
-    if body is not None and not (len(body) <= BODY_MAX and taskdb.storable(body)):
+    if body is not None and not (isinstance(body, str) and len(body) <= BODY_MAX
+                                 and taskdb.storable(body)):
         raise Refused(f"a body is at most {BODY_MAX} characters of text")
     if severity is not None and severity not in SEVERITIES:
         raise Refused(f"severity is one of {', '.join(SEVERITIES)}")
@@ -79,9 +80,9 @@ def check_id(value: object, what: str = "task") -> int:
 
 # --- repos -----------------------------------------------------------------------
 
-def repo_id(conn: sqlite3.Connection, name: str, *, for_new_task: bool = False) -> int:
+def repo_id(conn: sqlite3.Connection, name: object, *, for_new_task: bool = False) -> int:
     """The id of repo ``name``. A retired repo takes no new task."""
-    row = None if not taskdb.storable(name) else conn.execute(
+    row = None if not (isinstance(name, str) and taskdb.storable(name)) else conn.execute(
         "SELECT id, retired_at FROM repos WHERE name = ?", (name,)).fetchone()
     if row is None:
         raise Refused(f"no repo {name!r} in the registry", {"repos": active_repos(conn)})
@@ -184,6 +185,8 @@ def check_parent(conn: sqlite3.Connection, repo_id: int, parent: int | None,
 def check_blockers(conn: sqlite3.Connection, repo_id: int, blockers: list[int],
                    task: int | None = None) -> None:
     """Refuse a blocker outside the repo, or one that waits on ``task`` itself."""
+    if not isinstance(blockers, (list, tuple)):
+        raise Refused("blocked_by is a list of task ids")
     for blocker in blockers:
         check_id(blocker)
         if blocker == task:

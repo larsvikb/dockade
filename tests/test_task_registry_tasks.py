@@ -54,7 +54,8 @@ class AgentIdTests(unittest.TestCase):
 
     def test_anything_else_is_refused(self):
         for bad in ("", "operator", "claude", "claude-", "claude-abc", "-4f2a91c0",
-                    "Claude-4f2a91c0", "claude 4f2a91c0", "claude-4f2a91c0\n"):
+                    "Claude-4f2a91c0", "claude 4f2a91c0", "claude-4f2a91c0\n", None, 7,
+                    [ALICE]):
             with self.subTest(agent=bad), self.assertRaises(Refused):
                 reg.taskdb.check_agent(bad)
 
@@ -96,7 +97,7 @@ class RepoListTests(_Store):
         op.retire_repo("widgets")
         self.refused(self.propose)
         self.refused(op.create, "widgets", "T", "B", "open")
-        self.assertEqual([t["id"] for t in reads.list_tasks("widgets", None)], [task])
+        self.assertEqual([t["id"] for t in reads.list_tasks("widgets", None)["tasks"]], [task])
         op.retire_repo("widgets", retired=False)
         self.propose()
 
@@ -131,7 +132,7 @@ class ProposeTests(_Store):
 
     def test_a_proposal_needs_an_agent_id(self):
         self.refused(self.propose, who="operator")
-        self.assertEqual(reads.list_tasks("widgets", None), [])
+        self.assertEqual(reads.list_tasks("widgets", None), {"tasks": [], "total": 0})
 
     def test_no_agent_write_is_recorded_as_the_operators(self):
         task = self.propose()
@@ -219,7 +220,7 @@ class OperatorMoveTests(_Store):
         elsewhere = self.open_task(repo="gadgets")
         self.refused(self.open_task, parent=elsewhere)
         self.refused(self.open_task, blocked_by=[elsewhere])
-        self.assertEqual(reads.list_tasks("widgets", None), [])
+        self.assertEqual(reads.list_tasks("widgets", None), {"tasks": [], "total": 0})
 
 
 class StructureTests(_Store):
@@ -231,8 +232,9 @@ class StructureTests(_Store):
         self.assertEqual([c["id"] for c in got["children"]], [first, second])
         self.assertEqual(reads.get_task(first)["parent"],
                          {"id": objective, "title": "Objective", "state": "proposed"})
-        self.assertEqual([t["id"] for t in reads.list_tasks("widgets", None, parent=objective)],
-                         [first, second])
+        self.assertEqual([t["id"] for t in
+                          reads.list_tasks("widgets", None, parent=objective)["tasks"]],
+                         [second, first])
 
     def test_a_parent_and_a_blocker_are_in_the_same_repo(self):
         elsewhere = self.propose(repo="gadgets")
@@ -265,7 +267,7 @@ class StructureTests(_Store):
         third = self.open_task("Third", blocked_by=[first, second])
 
         def blocked():
-            return {t["id"]: t["blocked"] for t in reads.list_tasks("widgets")}[third]
+            return {t["id"]: t["blocked"] for t in reads.list_tasks("widgets")["tasks"]}[third]
 
         self.assertTrue(blocked())
         op.move(first, 1, "closed")
@@ -314,12 +316,26 @@ class ReadTests(_Store):
     def test_a_list_is_one_repo_in_one_state_open_by_default(self):
         proposed, opened = self.propose("Proposed"), self.open_task("Open")
         self.open_task("Elsewhere", repo="gadgets")
-        self.assertEqual([t["id"] for t in reads.list_tasks("widgets")], [opened])
-        self.assertEqual([t["id"] for t in reads.list_tasks("widgets", "proposed")],
+        self.assertEqual([t["id"] for t in reads.list_tasks("widgets")["tasks"]], [opened])
+        self.assertEqual([t["id"] for t in reads.list_tasks("widgets", "proposed")["tasks"]],
                          [proposed])
-        self.assertEqual([t["id"] for t in reads.list_tasks("widgets", None)],
-                         [proposed, opened])
+        self.assertEqual([t["id"] for t in reads.list_tasks("widgets", None)["tasks"]],
+                         [opened, proposed])
         self.refused(reads.list_tasks, "widgets", "done")
+
+    def test_a_list_comes_a_page_at_a_time_newest_first(self):
+        made = [self.open_task(f"Task {i}") for i in range(reads.LIST_MAX + 3)]
+        self.propose("Not open")
+        first = reads.list_tasks("widgets")
+        self.assertEqual(([t["id"] for t in first["tasks"]], first["total"]),
+                         (made[3:][::-1], reads.LIST_MAX + 3))
+        rest = reads.list_tasks("widgets", before=first["tasks"][-1]["id"])
+        self.assertEqual(([t["id"] for t in rest["tasks"]], rest["total"]),
+                         (made[:3][::-1], reads.LIST_MAX + 3))
+        for bad in ("1", 0, True):
+            with self.subTest(before=bad):
+                self.refused(reads.list_tasks, "widgets", before=bad)
+        self.refused(reads.list_tasks, "widgets", holder="operator")
 
     def test_an_unknown_task_is_refused(self):
         self.refused(reads.get_task, 999)
@@ -354,6 +370,19 @@ class BoundsTests(_Store):
             with self.subTest(read=read.__name__):
                 self.refused(read, 2**64)
                 self.assertIn("no task", self.refused(read, reg.tasks.ID_MAX).reason)
+
+    def test_a_value_of_the_wrong_type_is_refused_not_raised(self):
+        self.refused(self.propose, repo=7)
+        self.refused(self.propose, title=7)
+        self.refused(agent.propose, ALICE, "widgets", "T", 7)
+        self.refused(agent.propose, 7, "widgets", "T", "B")
+        self.refused(op.create, "widgets", ["T"], "B", "open")
+        self.refused(reads.list_tasks, 7)
+        self.refused(reads.search_tasks, "x", repo=7)
+        self.refused(self.propose, blocked_by=7)
+        task = self.propose()
+        self.refused(agent.edit_proposal, ALICE, "widgets", task, 1, blocked_by=7)
+        self.assertEqual(reads.list_tasks("widgets", None)["total"], 1)
 
     def test_padding_counts_toward_a_title(self):
         self.refused(self.propose, title="x" + " " * reg.tasks.TITLE_MAX)

@@ -377,3 +377,13 @@ def load_task_registry() -> types.SimpleNamespace:
         name: importlib.import_module(name)
         for name in ("taskdb", "tasks", "claims", "notes", "reads", "agent_moves",
                      "operator_moves")})
+
+
+def load_task_registry_agent_api() -> types.SimpleNamespace:
+    """The task registry's store with its agent listener on top: ``agent_api`` imports
+    ``fastapi``, so the shared stubs go in first."""
+    _install_fastapi_stub()
+    reg = load_task_registry()
+    reg.agent_tools = importlib.import_module("agent_tools")
+    reg.agent_api = importlib.import_module("agent_api")
+    return reg

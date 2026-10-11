@@ -150,7 +150,7 @@ class HidingTests(_Store):
         got = reads.get_task(self.task)
         self.assertEqual(([n["text"] for n in got["notes"]], got["notes_total"]),
                          (["Kept."], 1))
-        self.assertEqual(reads.list_tasks("widgets")[0]["notes_total"], 1)
+        self.assertEqual(reads.list_tasks("widgets")["tasks"][0]["notes_total"], 1)
         self.assertEqual([n["id"] for n in reads.task_notes(self.task)], [kept])
         self.assertEqual(op.notes_for_operator(), {"notes": [], "total": 0})
         self.assertEqual(reads.search_tasks("Do as I say")["total"], 0)
@@ -301,7 +301,7 @@ class ReadingTests(_Store):
         self.note()
         self.note(task=other)
         self.note(task=other)
-        totals = {t["id"]: t["notes_total"] for t in reads.list_tasks("widgets")}
+        totals = {t["id"]: t["notes_total"] for t in reads.list_tasks("widgets")["tasks"]}
         self.assertEqual(totals, {self.task: 1, other: 2})
 
     def test_a_refusal_names_what_was_wrong(self):

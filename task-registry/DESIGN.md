@@ -2,8 +2,8 @@
 
 A work list that agent sessions and the operator share: an agent proposes and shapes
 tasks, the operator approves them, and each write is recorded with its author. The
-store is `taskdb.py`, `tasks.py`, `agent_moves.py` and `operator_moves.py`, tested by
-`tests/test_task_registry_tasks.py`.
+store is `taskdb.py`, `tasks.py`, `reads.py`, `agent_moves.py` and `operator_moves.py`,
+tested by `tests/test_task_registry_tasks.py`.
 
 ## Two writers, two modules
 
@@ -15,9 +15,9 @@ task reaches the agents who implement it only once the operator has approved it.
 **The split is in what a surface calls, not in a check.** `agent_moves.py` holds what
 an agent may do; `operator_moves.py` holds what only the operator may do, and every
 write there is authored by `taskdb.OPERATOR`. A surface for agents must call only
-`agent_moves` and the reads in `tasks`. Not importing `operator_moves` is not enough on
-its own: the plain writes in `tasks` check nothing, so a surface that called them
-directly could make any move, however its arguments are shaped.
+`agent_moves` and `reads`. Not importing `operator_moves` is not enough on its own:
+the plain writes in `tasks` check nothing, so a surface that called them directly
+could make any move, however its arguments are shaped.
 
 ## Who an agent is
 

@@ -2,8 +2,9 @@
 
 A work list that agent sessions and the operator share: an agent proposes and shapes
 tasks, the operator approves them, and each write is recorded with its author. The
-store is `taskdb.py`, `tasks.py`, `reads.py`, `agent_moves.py` and `operator_moves.py`,
-tested by `tests/test_task_registry_tasks.py`.
+store is `taskdb.py`, `tasks.py`, `claims.py`, `reads.py`, `agent_moves.py` and
+`operator_moves.py`, tested by `tests/test_task_registry_tasks.py` and
+`tests/test_task_registry_claims.py`.
 
 ## Two writers, two modules
 
@@ -66,12 +67,15 @@ proposed task's title, body, severity, kind and blockers. From `open` on, only t
 operator may, so what an implementer reads is what the operator approved. The operator
 moves any task to any state.
 
-**One revision covers content and state.** Every change bumps it, and every write to an
-existing task names the revision it read; a stale one is refused with the task as it
-is now. For the operator this is what makes triage mean something: moving a task to
-`open` approves the spec as the operator read it, not as an agent edited it a moment
-later. Same idea as the control plane's rule writes, which name the rule as the page
-showed it.
+**One revision covers content, state, and who holds the task.** Every change to them
+bumps it, and every write to an existing task names the revision it read; a stale one
+is refused with the task as it is now. For the operator this is what makes triage mean
+something: moving a task to `open` approves the spec as the operator read it, not as an
+agent edited it a moment later. Same idea as the control plane's rule writes, which
+name the rule as the page showed it. Taking a claim and ending one bump it too, so a
+page that showed a task unclaimed cannot defer it once an agent holds it; an expired
+claim bumps it when it is swept, not the moment it expires. A holder's update does not:
+its checkpoints would otherwise make the operator's page stale all day.
 
 ## Parent and blockers
 
@@ -86,6 +90,47 @@ own ancestor is refused, and so is a blocker that already waits on the task. Blo
 freeze for agents at `open` with the rest of the spec, since the order is part of the
 plan the operator approves. Strict for now; loosening a rule later is cheaper than
 tightening one under data that broke it.
+
+## Claims
+
+**A claim is not a state; it sits on an `open` one.** One agent at a time holds a task,
+with a branch, a footprint and a free-text progress line: how the work goes changes
+too fast for states. The branch is the one the work will land on: the store takes any
+name git would, so telling a placeholder from it is the agent's to know. Claiming a
+`landing` task takes it back to `open` for rework, and releasing it then leaves it
+`open`. A claim ends when its holder submits (`landing`), sends the task back
+(`proposed`, with a note on what is unclear) or releases it; when the operator breaks
+it or moves the task off `open`; or when it expires. No agent can end another's. The
+history row of every ending keeps the claim's branch, so what to land outlives the
+claim.
+
+**The token makes a claim one deliberate act away from anyone else.** Only `claim`'s
+reply carries it, and the store keeps its hash. The holder's id is shown wherever
+claims are listed, so without a token releasing another's claim would take one
+argument, the path a helpful coordinator would take to free a stuck worker. With one,
+it means reading another session's transcript, where the reply sits. Not containment:
+every session can read those. For the same reason nobody gets a second token for a
+claim that is held, not even under the holder's own id. A token lost to compaction
+costs the claim: it lapses, or the operator breaks it. A session's subagents share its
+id, so a coordinator's subagent workers hold claims as the coordinator, and get the
+token from it.
+
+**A claim lives four hours from its last write** (`TASKS_CLAIM_SECONDS`), so a session
+that stopped lets its work go by the next morning. Each `update` renews it, and with
+nothing else given is only a renewal. An expired claim is not held from the moment it
+expires; the next claim or operator move sweeps it, under the registry's own name, and
+bumps the revision as any ending does. A write by its old holder is refused, saying
+who holds the task now, or that it is free or no longer open, so a returning session
+learns it lost the task rather than working on.
+
+**Footprints and blockers inform; they never refuse.** A footprint is at least one path
+in the repo; `.` is all of it, and the honest answer before the paths are known, since a
+claim with none would overlap nothing. Claiming or updating reports every other live
+claim in the repo whose footprint overlaps, one path containing the other, and claiming
+a blocked task names the blockers still open. Whether two claims really collide, or
+whether stacking on an unmerged branch is right, is a judgement for whoever coordinates,
+not a rule the store can apply. The ready queue is what needs no judgement: `open`,
+unclaimed, and blocked by nothing.
 
 ## Every write leaves a history row
 

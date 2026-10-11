@@ -24,9 +24,11 @@ DB_PATH = os.environ.get("TASKS_DB", "/var/lib/task-registry/tasks.db")
 # migration.
 SCHEMA_VERSION = 1
 
-#: The author of every write the operator makes. No agent id can equal it: an agent
-#: id is a kind, a hyphen and an id, and `check_agent` refuses this word as a kind.
+#: The author of every write the operator makes, and of the registry's own (an expired
+#: claim swept away). No agent id can equal either: an agent id is a kind, a hyphen and
+#: an id, and `check_agent` refuses these words as a kind.
 OPERATOR = "operator"
+REGISTRY = "registry"
 
 # `claude-<session uuid>`: the kind says which agent's id follows, so the registry
 # needs no knowledge of any one agent.
@@ -56,6 +58,18 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 CREATE INDEX IF NOT EXISTS tasks_by_repo_state ON tasks(repo_id, state);
 CREATE INDEX IF NOT EXISTS tasks_by_parent ON tasks(parent_id);
+CREATE TABLE IF NOT EXISTS claims (
+    -- The primary key is the task: one holder at a time.
+    task_id     INTEGER PRIMARY KEY REFERENCES tasks(id),
+    holder      TEXT NOT NULL,
+    branch      TEXT NOT NULL,
+    -- sha256 of the token, which only the claim's reply ever carries.
+    token_hash  TEXT NOT NULL,
+    footprint   TEXT NOT NULL,
+    progress    TEXT,
+    claimed_at  REAL NOT NULL,
+    expires_at  REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS blockers (
     task_id     INTEGER NOT NULL REFERENCES tasks(id),
     blocker_id  INTEGER NOT NULL REFERENCES tasks(id),
@@ -144,7 +158,7 @@ def check_agent(agent: str) -> str:
     """``agent``, if it has the shape of an agent id: a shape, not a proof
     (``task-registry/DESIGN.md``, "Who an agent is")."""
     match = _AGENT_RE.fullmatch(agent or "")
-    if match is None or match["kind"] == OPERATOR:
+    if match is None or match["kind"] in (OPERATOR, REGISTRY):
         raise Refused(
             f"{agent!r} is not an agent id: the agent's kind, a hyphen and its own "
             f"session id, as in claude-<session id>")

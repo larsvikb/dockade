@@ -226,7 +226,7 @@ class StructureTests(_Store):
         self.assertEqual([c["id"] for c in got["children"]], [first, second])
         self.assertEqual(reads.get_task(first)["parent"],
                          {"id": objective, "title": "Objective", "state": "proposed"})
-        self.assertEqual([t["id"] for t in reads.list_tasks("widgets", None, objective)],
+        self.assertEqual([t["id"] for t in reads.list_tasks("widgets", None, parent=objective)],
                          [first, second])
 
     def test_a_parent_and_a_blocker_are_in_the_same_repo(self):
@@ -291,7 +291,7 @@ class StructureTests(_Store):
                              blocked_by=[bad])
                 self.refused(self.propose, parent=bad)
                 self.refused(op.reparent, first, 1, bad)
-                self.refused(reads.list_tasks, "widgets", None, bad)
+                self.refused(reads.list_tasks, "widgets", None, parent=bad)
         for bad in ("1", True):
             with self.subTest(revision=bad):
                 self.refused(agent.edit_proposal, ALICE, "widgets", task, bad, body="X")

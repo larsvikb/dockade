@@ -6,14 +6,16 @@ from __future__ import annotations
 import json
 import sqlite3
 
+import claims
 import taskdb
 import tasks
 
 
-def list_tasks(repo: str, state: str | None = "open",
+def list_tasks(repo: str, state: str | None = "open", holder: str | None = None,
                parent: int | None = None) -> list[dict]:
-    """A repo's tasks in ``state`` (every state for ``None``), optionally only the
-    children of ``parent``."""
+    """A repo's tasks in ``state`` (every state for ``None``), optionally only those
+    ``holder`` has a live claim on, or the children of ``parent``. A task that is
+    ``ready`` is in the ready queue: open, unclaimed, and blocked by nothing."""
     if state is not None:
         tasks.check_state(state)
     if parent is not None:
@@ -28,7 +30,10 @@ def list_tasks(repo: str, state: str | None = "open",
         if parent is not None:
             query += " AND t.parent_id = ?"
             args.append(parent)
-        return [_summary(conn, row) for row in conn.execute(query + " ORDER BY t.id", args)]
+        found = [_summary(conn, row) for row in conn.execute(query + " ORDER BY t.id", args)]
+    if holder is not None:
+        found = [t for t in found if t["claim"] and t["claim"]["holder"] == holder]
+    return found
 
 
 def get_task(task: int) -> dict:
@@ -54,12 +59,22 @@ def repos() -> list[dict]:
 
 
 def _summary(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
+    return _summarize(conn, row, claims.live(conn, row["id"]))
+
+
+def _summarize(conn: sqlite3.Connection, row: sqlite3.Row,
+               held: sqlite3.Row | None) -> dict:
     blocked = conn.execute(
         "SELECT 1 FROM blockers b JOIN tasks t ON t.id = b.blocker_id "
         "WHERE b.task_id = ? AND t.state != 'closed' LIMIT 1", (row["id"],)).fetchone()
+    claim = None if held is None else {
+        "holder": held["holder"], "branch": held["branch"],
+        "progress": held["progress"], "expires_at": held["expires_at"]}
     return {"id": row["id"], "repo": row["repo"], "title": row["title"],
             "state": row["state"], "severity": row["severity"], "kind": row["kind"],
             "parent": row["parent_id"], "blocked": blocked is not None,
+            "claim": claim,
+            "ready": row["state"] == "open" and claim is None and blocked is None,
             "revision": row["revision"]}
 
 
@@ -70,7 +85,12 @@ def detail(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
 
     parent = brief("SELECT p.id, p.title, p.state FROM tasks t "
                    "JOIN tasks p ON p.id = t.parent_id WHERE t.id = ?")
-    return {**_summary(conn, row), "body": row["body"],
+    held = claims.live(conn, row["id"])
+    summary = _summarize(conn, row, held)
+    if held is not None:
+        summary["claim"] |= {"footprint": json.loads(held["footprint"]),
+                             "claimed_at": held["claimed_at"]}
+    return {**summary, "body": row["body"],
             "parent": parent[0] if parent else None,
             "children": brief("SELECT id, title, state FROM tasks "
                               "WHERE parent_id = ? ORDER BY id"),

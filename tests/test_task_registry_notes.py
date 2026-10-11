@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """The task registry's notes (``task-registry/notes.py`` and the note moves in
 ``agent_moves.py`` and ``operator_moves.py``): who may write one, that none is ever
-changed, the operator's hide, and how reads return them. Each test gets a store of
-its own."""
+changed, the operator's hide and handled mark, and how reads return them. Each test
+gets a store of its own."""
 from __future__ import annotations
 
 import inspect
@@ -134,7 +134,7 @@ class MoveNoteTests(_Store):
         token = agent.claim(ALICE, "widgets", self.task, "fix", ["."])["token"]
         agent.submit(ALICE, "widgets", self.task, token, "Ready to land.")
         self.assertFalse(reads.get_task(self.task)["notes"][0]["for_operator"])
-        self.assertEqual(op.notes_for_operator(), [])
+        self.assertEqual(op.notes_for_operator(), {"notes": [], "total": 0})
 
     def test_a_move_without_a_note_posts_none(self):
         token = agent.claim(ALICE, "widgets", self.task, "fix", ["."])["token"]
@@ -152,7 +152,8 @@ class HidingTests(_Store):
                          (["Kept."], 1))
         self.assertEqual(reads.list_tasks("widgets")[0]["notes_total"], 1)
         self.assertEqual([n["id"] for n in reads.task_notes(self.task)], [kept])
-        self.assertEqual(op.notes_for_operator(), [])
+        self.assertEqual(op.notes_for_operator(), {"notes": [], "total": 0})
+        self.assertEqual(reads.search_tasks("Do as I say")["total"], 0)
         self.assertEqual([(n["id"], n["hidden"]) for n in op.all_notes(self.task)],
                          [(kept, False), (hidden, True)])
         last = op.history(self.task)[-1]
@@ -168,6 +169,7 @@ class HidingTests(_Store):
         calls = {"list_tasks": lambda: reads.list_tasks("widgets", None),
                  "get_task": lambda: reads.get_task(self.task),
                  "task_notes": lambda: reads.task_notes(self.task),
+                 "search_tasks": lambda: reads.search_tasks("SECRET"),
                  "repos": reads.repos, "detail": self.detail}
         defined = {name for name, value in inspect.getmembers(reads, callable)
                    if not name.startswith("_") and not inspect.ismodule(value)}
@@ -175,6 +177,8 @@ class HidingTests(_Store):
         for name, call in calls.items():
             with self.subTest(read=name):
                 self.assertNotIn("SECRET", repr(call()))
+        # A hit would say what the hidden text holds without returning it.
+        self.assertEqual(reads.search_tasks("SECRET")["total"], 0)
         self.assertIn("SECRET-MOVE-NOTE", repr(op.history(self.task)))
 
     def test_the_operator_can_put_one_back(self):
@@ -189,6 +193,98 @@ class HidingTests(_Store):
                 self.refused(op.hide_note, bad)
         self.refused(op.hide_note, self.note(), hidden="yes")
         self.assertEqual(self.texts(), ["Seen this."])
+
+
+class HandledTests(_Store):
+    def flagged(self, text="Need a decision.", **kw):
+        return self.note(text, for_operator=True, **kw)
+
+    def listed(self, **kw):
+        return [n["id"] for n in op.notes_for_operator(**kw)["notes"]]
+
+    def test_a_handled_note_leaves_the_list_and_agents_see_the_mark(self):
+        note = self.flagged()
+        before = reads.get_task(self.task)["revision"]
+        self.assertEqual(op.handle_note(note),
+                         {"task": self.task, "note": note, "reply": None})
+        self.assertEqual((self.listed(), op.notes_for_operator()["total"]), ([], 0))
+        self.assertEqual(self.listed(handled=True), [note])
+        got = reads.get_task(self.task)
+        self.assertEqual(([n["handled"] for n in got["notes"]], got["revision"]),
+                         ([True], before))
+        last = op.history(self.task)[-1]
+        self.assertEqual((last["author"], last["action"], last["detail"]),
+                         (reg.taskdb.OPERATOR, "handle_note",
+                          {"note_id": note, "handled": True, "reply": None,
+                           "reply_id": None}))
+
+    def test_a_reply_is_the_operators_note_in_the_same_write(self):
+        note = self.flagged()
+        reply = op.handle_note(note, reply="Use the second one.")["reply"]
+        self.assertEqual([(n["id"], n["author"], n["text"], n["for_operator"],
+                           n["reply_to"]) for n in reads.get_task(self.task)["notes"]],
+                         [(note, ALICE, "Need a decision.", True, None),
+                          (reply, reg.taskdb.OPERATOR, "Use the second one.", False,
+                           note)])
+        written = op.history(self.task)
+        self.assertEqual([h["action"] for h in written], ["create", "note", "handle_note"])
+        self.assertEqual((written[-1]["detail"]["reply"], written[-1]["detail"]["reply_id"]),
+                         ("Use the second one.", reply))
+
+    def test_the_operator_can_put_one_back_on_the_list(self):
+        note = self.flagged()
+        op.handle_note(note)
+        op.handle_note(note, handled=False)
+        self.assertEqual((self.listed(), self.listed(handled=True)), ([note], []))
+        self.assertFalse(reads.get_task(self.task)["notes"][0]["handled"])
+
+    def test_only_a_note_marked_for_the_operator_is_handled(self):
+        plain, note = self.note(), self.flagged()
+        refusal = self.refused(op.handle_note, plain, reply="Noted.")
+        self.assertIn("not marked for the operator", refusal.reason)
+        for bad in (999, "1", True):
+            with self.subTest(note=bad):
+                self.refused(op.handle_note, bad)
+        self.refused(op.handle_note, note, handled="yes")
+        for bad in ("", "  ", "x" * (notes.NOTE_MAX + 1), 7, "half \ud800"):
+            with self.subTest(reply=bad):
+                self.refused(op.handle_note, note, reply=bad)
+        self.assertEqual(self.texts(), ["Seen this.", "Need a decision."])
+        self.assertEqual(self.listed(), [note])
+
+    def test_a_hidden_note_is_on_neither_list_nor_in_the_total(self):
+        note, handled = self.flagged(), self.flagged("Old question.")
+        op.handle_note(handled)
+        op.hide_note(note)
+        op.hide_note(handled)
+        for flag in (False, True):
+            with self.subTest(handled=flag):
+                self.assertEqual(op.notes_for_operator(handled=flag),
+                                 {"notes": [], "total": 0})
+
+    def test_the_list_comes_a_page_at_a_time_with_the_total(self):
+        page_size = op.FOR_OPERATOR_PAGE
+        made = [self.flagged(f"Q{i}") for i in range(page_size + 3)]
+        other = op.create("gadgets", "T", "B", "open")["task"]
+        elsewhere = agent.add_note(BOB, "gadgets", other, "Q", for_operator=True)["note"]
+        op.handle_note(made[0])
+        first = op.notes_for_operator("widgets")
+        self.assertEqual(first["total"], page_size + 2)
+        self.assertEqual([n["id"] for n in first["notes"]], made[3:][::-1])
+        seen, page = [], first["notes"]
+        for _ in range(10):
+            if not page:
+                break
+            seen += [n["id"] for n in page]
+            page = op.notes_for_operator("widgets", before=page[-1]["id"])["notes"]
+        self.assertEqual(seen, made[1:][::-1])
+        self.assertEqual(op.notes_for_operator()["total"], page_size + 3)
+        self.assertEqual(self.listed()[0], elsewhere)
+        self.assertEqual(op.notes_for_operator("widgets", handled=True)["total"], 1)
+        for bad in ("1", 0, True):
+            with self.subTest(before=bad):
+                self.refused(op.notes_for_operator, before=bad)
+        self.refused(op.notes_for_operator, handled=None)
 
 
 class ReadingTests(_Store):
@@ -235,8 +331,10 @@ class ReadingTests(_Store):
         self.note("Just saying.")
         second = agent.add_note(BOB, "gadgets", other, "Blocked on access.",
                                 for_operator=True)["note"]
-        self.assertEqual([n["id"] for n in op.notes_for_operator()], [second, first])
-        self.assertEqual([n["id"] for n in op.notes_for_operator("widgets")], [first])
+        self.assertEqual([n["id"] for n in op.notes_for_operator()["notes"]],
+                         [second, first])
+        self.assertEqual([n["id"] for n in op.notes_for_operator("widgets")["notes"]],
+                         [first])
         self.refused(op.notes_for_operator, "gizmos")
 
 

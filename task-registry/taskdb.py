@@ -84,9 +84,13 @@ CREATE TABLE IF NOT EXISTS notes (
     for_operator INTEGER NOT NULL,
     -- The claim move the note came with (`submit`, `send_back`, `release`), if any.
     move         TEXT,
+    -- The flagged note this one answers: the operator's reply when marking it handled.
+    reply_to     INTEGER REFERENCES notes(id),
     created_at   REAL NOT NULL,
     -- Set by the operator: the note stays in the record and leaves agents' reads.
-    hidden_at    REAL
+    hidden_at    REAL,
+    -- Set by the operator on a note marked for it: dealt with, and off its list.
+    handled_at   REAL
 );
 CREATE INDEX IF NOT EXISTS notes_by_task ON notes(task_id, id);
 CREATE TABLE IF NOT EXISTS history (

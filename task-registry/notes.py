@@ -21,11 +21,12 @@ def check_note(text: object, *, required: bool = True) -> None:
 
 
 def post(conn: sqlite3.Connection, task: int, author: str, text: str,
-         for_operator: bool = False, move: str | None = None) -> int:
+         for_operator: bool = False, move: str | None = None,
+         reply_to: int | None = None) -> int:
     cur = conn.execute(
-        "INSERT INTO notes(task_id, author, text, for_operator, move, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)", (task, author, text, int(for_operator), move,
-                                      time.time()))
+        "INSERT INTO notes(task_id, author, text, for_operator, move, reply_to, "
+        "created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (task, author, text, int(for_operator), move, reply_to, time.time()))
     return cur.lastrowid
 
 
@@ -42,7 +43,8 @@ def shown(row: sqlite3.Row, *, with_hidden: bool = False) -> dict:
     spliced into anything else."""
     note = {"id": row["id"], "task": row["task_id"], "author": row["author"],
             "text": row["text"], "for_operator": bool(row["for_operator"]),
-            "move": row["move"], "at": row["created_at"]}
+            "move": row["move"], "reply_to": row["reply_to"], "at": row["created_at"],
+            "handled": row["handled_at"] is not None}
     if with_hidden:
         note["hidden"] = row["hidden_at"] is not None
     return note

@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """What only the operator may do or see: create and edit any task, move any task to
-any state, re-parent, break a claim, note and hide notes, keep the repo list; read the
-history, every note, and the notes marked for the operator. Every write is recorded
-under ``taskdb.OPERATOR``, and every write to a task's spec, state or claim names the
-revision the operator read.
+any state, re-parent, break a claim, note, hide and mark notes handled, keep the repo
+list; read the history, every note, and the notes marked for the operator. Every write
+is recorded under ``taskdb.OPERATOR``, and every write to a task's spec, state or claim
+names the revision the operator read.
 
 An agent-facing surface must not call anything here (``task-registry/DESIGN.md``,
 "Two writers, two modules")."""
@@ -17,6 +17,9 @@ import notes
 import taskdb
 import tasks
 from taskdb import OPERATOR, Refused
+
+#: How many notes marked for the operator one read returns, beside the total.
+FOR_OPERATOR_PAGE = 50
 
 # --- tasks -----------------------------------------------------------------------
 
@@ -127,6 +130,26 @@ def hide_note(note: int, hidden: bool = True) -> None:
                       hidden=hidden)
 
 
+def handle_note(note: int, handled: bool = True, reply: str | None = None) -> dict:
+    """Mark a note an agent marked for the operator as dealt with, or not; with
+    ``reply``, post it as the operator's note on the same task in the same write,
+    naming the note it answers. Agents see both, so the next session knows the note
+    was seen to, and which reply is its answer."""
+    tasks.check_flag(handled, "handled")
+    notes.check_note(reply, required=False)
+    with taskdb.writing() as conn:
+        row = notes.note_row(conn, note)
+        if not row["for_operator"]:
+            raise Refused(f"note {note} is not marked for the operator")
+        conn.execute("UPDATE notes SET handled_at = ? WHERE id = ?",
+                     (time.time() if handled else None, note))
+        reply_id = (None if reply is None
+                    else notes.post(conn, row["task_id"], OPERATOR, reply, reply_to=note))
+        taskdb.record(conn, OPERATOR, "handle_note", row["task_id"], note_id=note,
+                      handled=handled, reply=reply, reply_id=reply_id)
+    return {"task": row["task_id"], "note": note, "reply": reply_id}
+
+
 def all_notes(task: int) -> list[dict]:
     """Every note on ``task``, hidden ones marked: the operator's read, which no
     agent-facing surface may offer."""
@@ -136,17 +159,27 @@ def all_notes(task: int) -> list[dict]:
             "SELECT * FROM notes WHERE task_id = ? ORDER BY id", (task,))]
 
 
-def notes_for_operator(repo: str | None = None) -> list[dict]:
-    """Visible notes an agent marked for the operator, newest first, in one repo or
-    all."""
+def notes_for_operator(repo: str | None = None, handled: bool = False,
+                       before: int | None = None) -> dict:
+    """Visible notes an agent marked for the operator, in one repo or all: those not
+    yet handled, or with ``handled`` those that were. Newest first, a page at a time
+    with the total; ``before`` pages back past a note."""
+    tasks.check_flag(handled, "handled")
+    if before is not None:
+        tasks.check_id(before, "note")
     with taskdb.reading() as conn:
-        query = ("SELECT n.* FROM notes n JOIN tasks t ON t.id = n.task_id "
-                 "WHERE n.for_operator = 1 AND n.hidden_at IS NULL")
+        where = ("FROM notes n JOIN tasks t ON t.id = n.task_id WHERE n.for_operator = 1 "
+                 "AND n.hidden_at IS NULL AND n.handled_at IS "
+                 + ("NOT NULL" if handled else "NULL"))
         args: list[object] = []
         if repo is not None:
-            query += " AND t.repo_id = ?"
+            where += " AND t.repo_id = ?"
             args.append(tasks.repo_id(conn, repo))
-        return [notes.shown(r) for r in conn.execute(query + " ORDER BY n.id DESC", args)]
+        total = conn.execute("SELECT COUNT(*) " + where, args).fetchone()[0]
+        page = conn.execute(
+            "SELECT n.* " + where + " AND (? IS NULL OR n.id < ?) ORDER BY n.id DESC "
+            "LIMIT ?", [*args, before, before, FOR_OPERATOR_PAGE])
+        return {"notes": [notes.shown(r) for r in page], "total": total}
 
 
 def history(task: int) -> list[dict]:

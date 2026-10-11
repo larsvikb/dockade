@@ -319,10 +319,12 @@ dockade/
     taskdb.py               #   SQLite — schema, the write transaction, the history every write leaves
     tasks.py                #   fields, states, parent and blockers; the plain writes
     claims.py               #   a claim's token, expiry and footprint; the plain claim writes
+    notes.py                #   a note's bounds, the plain write, the shape a note is read in
     reads.py                #   what any surface may read; nothing here writes
-    agent_moves.py          #   what an agent may do: propose, edit a proposal, work a claim
-    operator_moves.py       #   what only the operator may do: any edit, any move, break a
-                            #   claim, the repo list
+    agent_moves.py          #   what an agent may do: propose, edit a proposal, work a
+                            #   claim, add a note
+    operator_moves.py       #   what only the operator may do or see: any edit, any move,
+                            #   break a claim, hide a note, the repo list; the history
     DESIGN.md               #   who writes what, and why
   policies/                 # seed policy config (loaded into the control plane)
     egress-allowlist.txt    #   default-deny seed for the control plane's egress policy store

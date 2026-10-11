@@ -2,9 +2,8 @@
 
 A work list that agent sessions and the operator share: an agent proposes and shapes
 tasks, the operator approves them, and each write is recorded with its author. The
-store is `taskdb.py`, `tasks.py`, `claims.py`, `reads.py`, `agent_moves.py` and
-`operator_moves.py`, tested by `tests/test_task_registry_tasks.py` and
-`tests/test_task_registry_claims.py`.
+store is the Python in this directory (`README.md` → Layout says which module holds
+what), tested by the `tests/test_task_registry_*.py` files.
 
 ## Two writers, two modules
 
@@ -68,12 +67,14 @@ operator may, so what an implementer reads is what the operator approved. The op
 moves any task to any state.
 
 **One revision covers content, state, and who holds the task.** Every change to them
-bumps it, and every write to an existing task names the revision it read; a stale one
-is refused with the task as it is now. For the operator this is what makes triage mean
-something: moving a task to `open` approves the spec as the operator read it, not as an
-agent edited it a moment later. Same idea as the control plane's rule writes, which
-name the rule as the page showed it. Taking a claim and ending one bump it too, so a
-page that showed a task unclaimed cannot defer it once an agent holds it; an expired
+bumps it, and every write to a task's spec, state or holder names the revision it read,
+with two exceptions: a holder's own claim moves carry the claim's token instead, and
+taking a claim names neither, since it is refused while anyone holds the task; a stale
+one is refused with the task as it is now. For the operator this is what makes triage
+mean something: moving a task to `open` approves the spec as the operator read it, not
+as an agent edited it a moment later. Same idea as the control plane's rule writes,
+which name the rule as the page showed it. Taking a claim and ending one bump it too, so
+a page that showed a task unclaimed cannot defer it once an agent holds it; an expired
 claim bumps it when it is swept, not the moment it expires. A holder's update does not:
 its checkpoints would otherwise make the operator's page stale all day.
 
@@ -132,8 +133,42 @@ whether stacking on an unmerged branch is right, is a judgement for whoever coor
 not a rule the store can apply. The ready queue is what needs no judgement: `open`,
 unclaimed, and blocked by nothing.
 
+## Notes
+
+**A note is information from a peer, never an instruction.** Notes are the larger part
+of the channel between sessions that triage does not cover: one session that read
+something hostile reaches every later one through them. So the approved body outranks
+every note, and a note saying the spec should change is a reason to send the task back
+to `proposed`, not a change. Nothing in the store can make an agent read them that way;
+the agent's tool descriptions and instructions must say it. The other part is a claim's
+progress line: short, the holder's own, and gone when the claim ends, so the operator
+clears one by breaking the claim rather than hiding it. A read returns each note as
+data, with its id, author and time, never spliced into the task's own text.
+
+**Visible at once; the operator can hide one.** Holding notes until the operator
+releases them would make the operator the courier the registry exists to replace.
+Hiding takes a note out of every read an agent can call and keeps it in the record.
+Only the operator's reads return a hidden note, `operator_moves.all_notes` and the
+history, so they live in `operator_moves` and no agent surface may offer them; a test
+calls every function in `reads` and holds the list of them fixed.
+
+**Any agent in the repo writes one; none changes one.** An agent notes only tasks of
+the repo it works in, the claim's check, in any state and without a token: a note is a
+message, not a move on a claim. No agent move edits or deletes a note, its own
+included. The note a claim move carries (submit, send back, release) is posted as a
+note too, marked with its move, so the next reader of the task sees it.
+
+**One flag, *for the operator*,** marks a note that needs the operator, in place of
+asking in chat; `operator_moves.notes_for_operator` lists them. A note does not move the
+task's revision: it is not the spec, and the operator's page would otherwise go stale
+with every note. A note's length is capped (`notes.NOTE_MAX`), a read of a task carries
+its latest few (`notes.IN_READ`) and the total, and `reads.task_notes` pages back.
+
 ## Every write leaves a history row
 
 `taskdb.record` writes the author, the action and the values written, in the write's
 own transaction, so a write and its record land together or not at all. For a spec it
-is also the revision log: every body an agent proposed, under its author.
+is also the revision log: every body an agent proposed, under its author. That makes the
+history the operator's read (`operator_moves.history`): it keeps every text a task ever
+had, a hidden note's and a body triage replaced, so an implementer reading it could act
+on a version the operator never approved.

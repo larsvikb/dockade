@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""What any surface may read: a repo's tasks, one task in full, a task's history, and
-the repo list. Nothing here writes."""
+"""What any surface may read, agents' included: a repo's tasks, one task in full with its
+latest notes, older notes page by page, and the repo list. Nothing here writes, and
+nothing here returns what the operator alone may see: a hidden note, or the history,
+which keeps every text a task ever had."""
 from __future__ import annotations
 
 import json
 import sqlite3
 
 import claims
+import notes
 import taskdb
 import tasks
 
@@ -41,16 +44,6 @@ def get_task(task: int) -> dict:
         return detail(conn, tasks.task_row(conn, task))
 
 
-def history(task: int) -> list[dict]:
-    """Every write a task has had, oldest first, with its author."""
-    with taskdb.reading() as conn:
-        tasks.task_row(conn, task)
-        return [{"ts": r["ts"], "author": r["author"], "action": r["action"],
-                 "detail": json.loads(r["detail"])}
-                for r in conn.execute(
-                    "SELECT * FROM history WHERE task_id = ? ORDER BY id", (task,))]
-
-
 def repos() -> list[dict]:
     with taskdb.reading() as conn:
         return [{"name": r["name"], "remote": r["remote"],
@@ -75,6 +68,7 @@ def _summarize(conn: sqlite3.Connection, row: sqlite3.Row,
             "parent": row["parent_id"], "blocked": blocked is not None,
             "claim": claim,
             "ready": row["state"] == "open" and claim is None and blocked is None,
+            "notes_total": notes.count(conn, row["id"]),
             "revision": row["revision"]}
 
 
@@ -90,7 +84,7 @@ def detail(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
     if held is not None:
         summary["claim"] |= {"footprint": json.loads(held["footprint"]),
                              "claimed_at": held["claimed_at"]}
-    return {**summary, "body": row["body"],
+    return {**summary, "body": row["body"], "notes": notes.visible(conn, row["id"]),
             "parent": parent[0] if parent else None,
             "children": brief("SELECT id, title, state FROM tasks "
                               "WHERE parent_id = ? ORDER BY id"),
@@ -98,3 +92,13 @@ def detail(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
                               "JOIN tasks t ON t.id = b.blocker_id "
                               "WHERE b.task_id = ? ORDER BY t.id"),
             "created_at": row["created_at"], "updated_at": row["updated_at"]}
+
+
+def task_notes(task: int, before: int | None = None) -> list[dict]:
+    """The task's notes older than note ``before``, as many as a read of the task
+    carries: how an agent pages back past the latest."""
+    if before is not None:
+        tasks.check_id(before, "note")
+    with taskdb.reading() as conn:
+        tasks.task_row(conn, task)
+        return notes.visible(conn, task, before)

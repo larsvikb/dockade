@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 
 import claims
+import notes
 import taskdb
 import tasks
 from taskdb import Refused
@@ -98,7 +99,7 @@ def update(agent: str, repo: str, task: int, token: str, progress: str | None = 
     """Say how the work goes, correct the branch or footprint, and renew the claim;
     with nothing else given, only renew it."""
     taskdb.check_agent(agent)
-    claims.check_text(progress, claims.PROGRESS_MAX, "a progress line")
+    tasks.check_text(progress, claims.PROGRESS_MAX, "a progress line")
     if branch is not None:
         claims.check_branch(branch)
     paths = None if footprint is None else claims.footprint(footprint)
@@ -134,13 +135,34 @@ def release(agent: str, repo: str, task: int, token: str, note: str | None = Non
 def _end_claim(agent: str, repo: str, task: int, token: str, note: str | None,
                action: str, state: str | None) -> dict:
     taskdb.check_agent(agent)
-    claims.check_text(note, claims.NOTE_MAX, "a note", required=action == "send_back")
+    notes.check_note(note, required=action == "send_back")
     with taskdb.writing() as conn:
         row = tasks.task_row(conn, task)
         tasks.check_in_repo(row, repo)
         held = claims.check_holder(conn, row, agent, token)
         claims.end(conn, task)
         revision = tasks.update(conn, task, {} if state is None else {"state": state})
+        note_id = None if note is None else notes.post(conn, task, agent, note, move=action)
         taskdb.record(conn, agent, action, task, revision=revision, note=note,
-                      **claims.ended(held))
+                      note_id=note_id, **claims.ended(held))
     return {"task": task, "revision": revision}
+
+
+# --- notes -----------------------------------------------------------------------
+
+
+def add_note(agent: str, repo: str, task: int, text: str,
+             for_operator: bool = False) -> dict:
+    """Say something about a task in the agent's repo; no claim needed. A note
+    informs and never instructs: the approved spec outranks it. ``for_operator``
+    marks one that needs the operator."""
+    taskdb.check_agent(agent)
+    notes.check_note(text)
+    tasks.check_flag(for_operator, "for_operator")
+    with taskdb.writing() as conn:
+        row = tasks.task_row(conn, task)
+        tasks.check_in_repo(row, repo)
+        note = notes.post(conn, task, agent, text, for_operator)
+        taskdb.record(conn, agent, "note", task, note_id=note, note=text,
+                      for_operator=for_operator)
+    return {"task": task, "note": note}

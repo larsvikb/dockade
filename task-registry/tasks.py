@@ -32,7 +32,7 @@ REMOTE_RE = re.compile(r"[A-Za-z0-9.-]+(/[A-Za-z0-9._-]+){2,4}")
 def check_fields(title: str | None = None, body: str | None = None,
                  severity: str | None = None, kind: str | None = None) -> None:
     """Refuse a field outside its bounds. ``None`` is "not given" and passes."""
-    if title is not None and not (0 < len(title.strip()) <= TITLE_MAX
+    if title is not None and not (title.strip() and len(title) <= TITLE_MAX
                                   and taskdb.storable(title)):
         raise Refused(f"a title is 1 to {TITLE_MAX} characters of text")
     if body is not None and not (len(body) <= BODY_MAX and taskdb.storable(body)):
@@ -43,17 +43,37 @@ def check_fields(title: str | None = None, body: str | None = None,
         raise Refused(f"kind is one of {', '.join(KINDS)}")
 
 
+def check_text(text: object, limit: int, what: str, *, required: bool = False) -> None:
+    """Text that is not blank, at most ``limit`` long counting every character (padding
+    too), and storable."""
+    if text is None and not required:
+        return
+    if (not isinstance(text, str) or not text.strip() or len(text) > limit
+            or not taskdb.storable(text)):
+        raise Refused(f"{what} is 1 to {limit} characters of text")
+
+
 def check_state(state: str) -> str:
     if state not in STATES:
         raise Refused(f"state is one of {', '.join(STATES)}")
     return state
 
 
-def check_id(value: object) -> int:
-    """A task id, which must be an int: SQLite finds task 3 under ``"3"`` too, where
-    the loop checks' ``==`` would not match it, and a loop would pass."""
-    if type(value) is not int or value < 1:
-        raise Refused(f"{value!r} is not a task id")
+def check_flag(value: object, name: str) -> bool:
+    if type(value) is not bool:
+        raise Refused(f"{name} is true or false")
+    return value
+
+
+#: SQLite's largest integer: a bigger one raises OverflowError when bound.
+ID_MAX = 2**63 - 1
+
+
+def check_id(value: object, what: str = "task") -> int:
+    """An id, which must be an int: SQLite finds task 3 under ``"3"`` too, where the
+    loop checks' ``==`` would not match it, and a loop would pass."""
+    if type(value) is not int or not 0 < value <= ID_MAX:
+        raise Refused(f"{value!r} is not a {what} id")
     return value
 
 

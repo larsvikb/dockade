@@ -375,4 +375,5 @@ def load_task_registry() -> types.SimpleNamespace:
         sys.path.insert(0, pkg_dir)
     return types.SimpleNamespace(**{
         name: importlib.import_module(name)
-        for name in ("taskdb", "tasks", "claims", "reads", "agent_moves", "operator_moves")})
+        for name in ("taskdb", "tasks", "claims", "notes", "reads", "agent_moves",
+                     "operator_moves")})

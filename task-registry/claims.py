@@ -37,7 +37,6 @@ CLAIM_SECONDS = _claim_seconds(os.environ.get("TASKS_CLAIM_SECONDS", "14400"))
 
 BRANCH_MAX = 200
 PROGRESS_MAX = 500
-NOTE_MAX = 4000
 FOOTPRINT_MAX = 50
 PATH_MAX = 300
 
@@ -58,14 +57,6 @@ def check_branch(branch: object) -> str:
             or branch.endswith(("/", ".", ".lock")) or ".." in branch or "//" in branch):
         raise Refused(f"{branch!r} is not a branch name")
     return branch
-
-
-def check_text(text: object, limit: int, what: str, *, required: bool = False) -> None:
-    if text is None and not required:
-        return
-    if (not isinstance(text, str) or not 0 < len(text.strip()) <= limit
-            or not taskdb.storable(text)):
-        raise Refused(f"{what} is 1 to {limit} characters of text")
 
 
 def footprint(paths: object) -> list[str]:

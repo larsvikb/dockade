@@ -21,7 +21,7 @@ def propose(agent: str, repo: str, title: str, body: str, severity: str | None =
             blocked_by: list[int] | tuple[int, ...] = ()) -> dict:
     """File a task for the operator to triage."""
     taskdb.check_agent(agent)
-    tasks.check_fields(title, body, severity, kind)
+    tasks.check_new(title, body, severity, kind)
     with taskdb.writing() as conn:
         repo_id = tasks.repo_id(conn, repo, for_new_task=True)
         tasks.check_parent(conn, repo_id, parent)

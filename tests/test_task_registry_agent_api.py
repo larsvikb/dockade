@@ -5,7 +5,6 @@ call is checked against, and that the surface calls only what an agent may. Each
 that touches the store gets one of its own."""
 from __future__ import annotations
 
-import ast
 import asyncio
 import inspect
 import json
@@ -15,6 +14,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import _surface
 from _loader import ROOT, load_task_registry_agent_api
 
 reg = load_task_registry_agent_api()
@@ -212,35 +212,24 @@ class SurfaceTests(unittest.TestCase):
     store (``task-registry/DESIGN.md``, "Two writers, two modules"): from any other
     registry module it reads constants only."""
 
-    STORE = frozenset({"taskdb", "tasks", "claims", "notes", "reads", "agent_moves",
-                       "operator_moves"})
     CALLABLE = frozenset({"agent_moves", "reads"})
 
-    def references(self, module: str) -> tuple[set[str], list[tuple[str, str]]]:
-        tree = ast.parse((ROOT / "task-registry" / f"{module}.py").read_text())
-        imported, used = set(), []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                imported |= {alias.name for alias in node.names}
-            elif isinstance(node, ast.ImportFrom):
-                imported.add(node.module)
-                used += [(node.module, alias.name) for alias in node.names]
-            elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-                used.append((node.value.id, node.attr))
-        return imported, used
+    def source(self, module: str) -> str:
+        return (ROOT / "task-registry" / f"{module}.py").read_text()
 
     def test_the_tools_call_only_what_an_agent_may(self):
-        imported, used = self.references("agent_tools")
+        imported, chains = _surface.reached(self.source("agent_tools"))
         self.assertNotIn("operator_moves", imported)
-        for module, name in used:
-            if module in self.STORE and module not in self.CALLABLE:
-                with self.subTest(name=f"{module}.{name}"):
-                    self.assertTrue(name.isupper() or (module, name) == ("taskdb", "Refused"))
+        self.assertEqual(_surface.overreach(chains, self.CALLABLE,
+                                            frozenset({("taskdb", "Refused")})), [])
 
     def test_the_listener_reaches_the_store_only_through_the_tools(self):
-        imported, _ = self.references("agent_api")
-        self.assertEqual(imported & (self.STORE | {"operator_api"}), set())
+        imported, _ = _surface.reached(self.source("agent_api"))
+        self.assertEqual(imported & (_surface.STORE | {"operator_api"}), set())
         self.assertIn("agent_tools", imported)
+        # Nor through them: ``agent_tools.reads`` is the store all the same.
+        _, through = _surface.reached(self.source("agent_api"), frozenset({"agent_tools"}))
+        self.assertEqual(_surface.overreach(through, frozenset({"agent_tools"})), [])
 
 
 class CallTests(_Store):

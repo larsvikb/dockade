@@ -1,15 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """What only the operator may do: create and edit any task, move any task to any
 state, re-parent, and keep the repo list. Every write is recorded under
-``taskdb.OPERATOR``.
+``taskdb.OPERATOR``, and every write to a task names the revision the operator read.
 
-No agent-facing surface imports this module; that, not a check in here, is what
-keeps these moves out of an agent's reach.
-
-Every write to a task names the revision the operator read, so a page that is out
-of date cannot overwrite what changed since: above all, moving a task to ``open``
-approves its spec as the operator read it, not as an agent edited it a moment
-later."""
+An agent-facing surface must not call anything here (``task-registry/DESIGN.md``,
+"Two writers, two modules")."""
 from __future__ import annotations
 
 import time
@@ -131,6 +126,9 @@ def _check_repo_name(name: str) -> None:
 
 
 def _check_remote(remote: str | None) -> None:
-    if remote is not None and not tasks.REMOTE_RE.fullmatch(remote):
+    if remote is None:
+        return
+    if (not tasks.REMOTE_RE.fullmatch(remote)
+            or any(part in (".", "..") for part in remote.split("/"))):
         raise Refused(f"{remote!r} is not a remote: host/owner/repo, as in "
                       f"github.com/acme/widgets")

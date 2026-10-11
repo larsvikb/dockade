@@ -1,9 +1,9 @@
 # Task registry — who writes what
 
 A work list that agent sessions and the operator share: an agent proposes and shapes
-tasks, the operator approves them, and each write is recorded with its author. What is
-built so far is the store: `taskdb.py`, `tasks.py`, `agent_moves.py` and
-`operator_moves.py`, tested by `tests/test_task_registry_tasks.py`.
+tasks, the operator approves them, and each write is recorded with its author. The
+store is `taskdb.py`, `tasks.py`, `agent_moves.py` and `operator_moves.py`, tested by
+`tests/test_task_registry_tasks.py`.
 
 ## Two writers, two modules
 
@@ -12,16 +12,18 @@ session and acted on by another, so a session that read something hostile could 
 every later one through it. The operator stands on that path: an agent proposes, and a
 task reaches the agents who implement it only once the operator has approved it.
 
-**The split is a module boundary, not a check.** `agent_moves.py` holds what an agent
-may do; `operator_moves.py` holds what only the operator may do, and every write there
-is authored by `taskdb.OPERATOR`. An agent-facing surface that never imports
-`operator_moves` cannot make those moves, however its arguments are shaped.
+**The split is in what a surface calls, not in a check.** `agent_moves.py` holds what
+an agent may do; `operator_moves.py` holds what only the operator may do, and every
+write there is authored by `taskdb.OPERATOR`. A surface for agents must call only
+`agent_moves` and the reads in `tasks`. Not importing `operator_moves` is not enough on
+its own: the plain writes in `tasks` check nothing, so a surface that called them
+directly could make any move, however its arguments are shaped.
 
 ## Who an agent is
 
 **An agent names itself: its kind, a hyphen and its own session id**
 (`claude-<uuid>`). The kind keeps the registry agent-agnostic; each agent's
-instructions say where its id comes from. For Claude Code it is the session id, which
+instructions are where it learns its id. For Claude Code it is the session id, which
 also names the session's transcript, so a write leads back to what the session said
 (`NOTES.md` → "Claude Code puts its session id in every Bash call's environment").
 
@@ -38,11 +40,12 @@ carry it through compaction).
 
 Every task belongs to one repo, named from a list the operator maintains. Not a git
 remote: a repo needs none, and inside the sandbox every workspace is `/workspace`, so
-the path says nothing either. A repo's committed instructions file gives its name,
-committed because a worktree carries only tracked files. An unknown name is refused
-with the known ones, so a typo cannot start a repo. A retired repo keeps its tasks and
-takes no new one. A repo may record its remote (`host/owner/repo`), so anything later
-scoped to a repo is scoped by the operator's data rather than an agent's.
+the path says nothing either. A repo's agents learn its name from the repo's
+instructions file, a committed one because a worktree carries only tracked files. An
+unknown name is refused with the known ones, so a typo cannot start a repo. A retired
+repo keeps its tasks and takes no new one. A repo may record its remote
+(`host/owner/repo`, never an owner alone), so anything later scoped to a repo is scoped
+by the operator's data rather than an agent's.
 
 **A filter, not a wall.** Reads cross repos. An agent's write names the repo it works
 in and is refused on a task of another, which stops a session in one repo from shaping

@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tasks: their fields and states, how they relate, and the reads.
+"""Tasks: their fields and states, how they relate, the reads, and the plain writes.
 
-The rules here hold for every writer. What an agent may do is in ``agent_moves``,
-what only the operator may do in ``operator_moves``."""
+The checks here hold for every writer. The writes (``insert``, ``update``,
+``set_blockers``) check nothing: ``agent_moves`` and ``operator_moves`` call them after
+their checks, and a surface for agents calls ``agent_moves`` and the reads, never
+these."""
 from __future__ import annotations
 
 import json
@@ -21,8 +23,9 @@ TITLE_MAX = 200
 BODY_MAX = 32_000
 
 REPO_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
-# host/owner/repo, the form a push or PR grant would be scoped by.
-REMOTE_RE = re.compile(r"[A-Za-z0-9.-]+(/[A-Za-z0-9._-]+){1,4}")
+# host/owner/repo, or host/group/subgroup/repo on a forge with groups: never an owner
+# alone, which would scope anything keyed on it to every repo the owner has.
+REMOTE_RE = re.compile(r"[A-Za-z0-9.-]+(/[A-Za-z0-9._-]+){2,4}")
 
 
 # --- fields ----------------------------------------------------------------------
@@ -46,6 +49,14 @@ def check_state(state: str) -> str:
     return state
 
 
+def check_id(value: object) -> int:
+    """A task id, which must be an int: SQLite finds task 3 under ``"3"`` too, where
+    the loop checks' ``==`` would not match it, and a loop would pass."""
+    if type(value) is not int or value < 1:
+        raise Refused(f"{value!r} is not a task id")
+    return value
+
+
 # --- repos -----------------------------------------------------------------------
 
 def repo_id(conn: sqlite3.Connection, name: str, *, for_new_task: bool = False) -> int:
@@ -66,6 +77,7 @@ def active_repos(conn: sqlite3.Connection) -> list[str]:
 # --- one task --------------------------------------------------------------------
 
 def task_row(conn: sqlite3.Connection, task: int) -> sqlite3.Row:
+    check_id(task)
     row = conn.execute(
         "SELECT t.*, r.name AS repo FROM tasks t JOIN repos r ON r.id = t.repo_id "
         "WHERE t.id = ?", (task,)).fetchone()
@@ -83,6 +95,8 @@ def check_in_repo(row: sqlite3.Row, repo: str) -> None:
 
 def check_revision(conn: sqlite3.Connection, row: sqlite3.Row, revision: int) -> None:
     """Refuse a write based on a task as it no longer is, with the task as it is."""
+    if type(revision) is not int:
+        raise Refused(f"{revision!r} is not a revision")
     if row["revision"] != revision:
         raise Refused(
             f"task {row['id']} is at revision {row['revision']}, not {revision}: it "
@@ -129,13 +143,18 @@ def check_parent(conn: sqlite3.Connection, repo_id: int, parent: int | None,
     ancestor."""
     if parent is None:
         return
+    check_id(parent)
     row = conn.execute("SELECT repo_id FROM tasks WHERE id = ?", (parent,)).fetchone()
     if row is None or row["repo_id"] != repo_id:
         raise Refused(f"no task {parent} in this repo to be a parent")
-    ancestor = parent
+    ancestor, seen = parent, set()
     while ancestor is not None:
         if ancestor == task:
             raise Refused(f"task {parent} descends from task {task}, so cannot be its parent")
+        if ancestor in seen:
+            raise Refused(f"the parents above task {parent} loop; the operator must "
+                          f"re-parent one of them first")
+        seen.add(ancestor)
         ancestor = conn.execute(
             "SELECT parent_id FROM tasks WHERE id = ?", (ancestor,)).fetchone()[0]
 
@@ -144,6 +163,7 @@ def check_blockers(conn: sqlite3.Connection, repo_id: int, blockers: list[int],
                    task: int | None = None) -> None:
     """Refuse a blocker outside the repo, or one that waits on ``task`` itself."""
     for blocker in blockers:
+        check_id(blocker)
         if blocker == task:
             raise Refused(f"task {task} cannot block on itself")
         row = conn.execute("SELECT repo_id FROM tasks WHERE id = ?", (blocker,)).fetchone()
@@ -182,6 +202,8 @@ def list_tasks(repo: str, state: str | None = "open",
     children of ``parent``."""
     if state is not None:
         check_state(state)
+    if parent is not None:
+        check_id(parent)
     with taskdb.reading() as conn:
         query = ("SELECT t.*, r.name AS repo FROM tasks t JOIN repos r ON r.id = t.repo_id "
                  "WHERE t.repo_id = ?")

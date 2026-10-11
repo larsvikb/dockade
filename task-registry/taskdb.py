@@ -19,10 +19,13 @@ from collections.abc import Iterator
 
 DB_PATH = os.environ.get("TASKS_DB", "/var/lib/task-registry/tasks.db")
 
+# _SCHEMA creates what is missing and alters nothing: `IF NOT EXISTS` adds no column
+# to a table that exists. Changing an existing table takes a version bump and a
+# migration.
 SCHEMA_VERSION = 1
 
-#: The author of every write the operator makes. No agent id can equal it or start
-#: with it: an agent id is a kind, a hyphen and an id, and this word is no agent kind.
+#: The author of every write the operator makes. No agent id can equal it: an agent
+#: id is a kind, a hyphen and an id, and `check_agent` refuses this word as a kind.
 OPERATOR = "operator"
 
 # `claude-<session uuid>`: the kind says which agent's id follows, so the registry
@@ -138,8 +141,8 @@ def record(conn: sqlite3.Connection, author: str, action: str, task_id: int | No
 
 
 def check_agent(agent: str) -> str:
-    """``agent``, if it has the shape of an agent id. Self-declared: this keeps
-    cooperating sessions apart and proves nothing about who is calling."""
+    """``agent``, if it has the shape of an agent id: a shape, not a proof
+    (``task-registry/DESIGN.md``, "Who an agent is")."""
     match = _AGENT_RE.fullmatch(agent or "")
     if match is None or match["kind"] == OPERATOR:
         raise Refused(

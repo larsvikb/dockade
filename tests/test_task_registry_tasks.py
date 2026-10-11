@@ -78,6 +78,11 @@ class RepoListTests(_Store):
         for bad in ("widgets", "https://github.com/acme/widgets", "github.com/acme widgets"):
             with self.subTest(remote=bad):
                 self.refused(op.set_remote, "gadgets", bad)
+        for bad in ("github.com/acme", "github.com/../widgets", "../acme/widgets",
+                    "github.com/acme/./widgets", "a/b/c/d/e/f"):
+            with self.subTest(remote=bad):
+                self.refused(op.set_remote, "gadgets", bad)
+        op.set_remote("gadgets", "gitlab.com/acme/tools/gadgets")
 
     def test_a_rename_carries_the_tasks_and_retires_the_old_name(self):
         task = self.propose()
@@ -122,6 +127,13 @@ class ProposeTests(_Store):
     def test_a_proposal_needs_an_agent_id(self):
         self.refused(self.propose, who="operator")
         self.assertEqual(tasks.list_tasks("widgets", None), [])
+
+    def test_no_agent_write_is_recorded_as_the_operators(self):
+        task = self.propose()
+        for who in ("operator", "operator-4f2a91c0"):
+            with self.subTest(agent=who):
+                self.refused(agent.edit_proposal, who, "widgets", task, 1, body="X")
+        self.assertEqual([h["author"] for h in tasks.history(task)], [ALICE])
 
 
 class EditProposalTests(_Store):
@@ -188,6 +200,21 @@ class OperatorMoveTests(_Store):
                 self.assertEqual(tasks.get_task(created)["state"], state)
         self.refused(op.create, "gadgets", "T", "B", "done")
 
+    def test_a_stale_edit_or_reparent_is_refused_and_changes_nothing(self):
+        parent, task = self.open_task("Parent"), self.open_task("Task")
+        op.edit(task, 1, title="Read by another page")
+        self.refused(op.edit, task, 1, body="Stale.")
+        self.refused(op.reparent, task, 1, parent)
+        got = tasks.get_task(task)
+        self.assertEqual((got["body"], got["parent"], got["revision"]),
+                         ("What to do.", None, 2))
+
+    def test_create_keeps_parent_and_blockers_in_the_repo(self):
+        elsewhere = self.open_task(repo="gadgets")
+        self.refused(self.open_task, parent=elsewhere)
+        self.refused(self.open_task, blocked_by=[elsewhere])
+        self.assertEqual(tasks.list_tasks("widgets", None), [])
+
 
 class StructureTests(_Store):
     def test_a_parent_lists_its_children(self):
@@ -249,6 +276,32 @@ class StructureTests(_Store):
         self.refused(agent.edit_proposal, ALICE, "widgets", task, 2, blocked_by=[first])
         op.edit(task, 2, blocked_by=[first])
         self.assertEqual([b["id"] for b in tasks.get_task(task)["blockers"]], [first])
+
+    def test_an_id_that_is_not_an_int_is_refused_everywhere(self):
+        first, task = self.propose("First"), self.propose("Second")
+        for bad in (str(task), True, 0, -1, 1.0):
+            with self.subTest(task=bad):
+                self.refused(agent.edit_proposal, ALICE, "widgets", bad, 1, body="X")
+                self.refused(op.reparent, bad, 1, first)
+                self.refused(tasks.get_task, bad)
+        for bad in (str(task), str(first), True):
+            with self.subTest(related=bad):
+                self.refused(agent.edit_proposal, ALICE, "widgets", task, 1,
+                             blocked_by=[bad])
+                self.refused(self.propose, parent=bad)
+                self.refused(op.reparent, first, 1, bad)
+                self.refused(tasks.list_tasks, "widgets", None, bad)
+        for bad in ("1", True):
+            with self.subTest(revision=bad):
+                self.refused(agent.edit_proposal, ALICE, "widgets", task, bad, body="X")
+        self.assertEqual(self.revision(task), 1)
+
+    def test_a_parent_loop_already_in_the_store_is_refused_not_walked(self):
+        top, under = self.propose("Top"), self.propose("Under")
+        with reg.taskdb.writing() as conn:
+            conn.execute("UPDATE tasks SET parent_id = ? WHERE id = ?", (under, top))
+            conn.execute("UPDATE tasks SET parent_id = ? WHERE id = ?", (top, under))
+        self.refused(self.propose, parent=under)
 
 
 class ReadTests(_Store):

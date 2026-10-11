@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """What only the operator may do: create and edit any task, move any task to any
-state, re-parent, and keep the repo list. Every write is recorded under
+state, re-parent, break a claim, and keep the repo list. Every write is recorded under
 ``taskdb.OPERATOR``, and every write to a task names the revision the operator read.
 
 An agent-facing surface must not call anything here (``task-registry/DESIGN.md``,
@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import time
 
+import claims
 import taskdb
 import tasks
 from taskdb import OPERATOR, Refused
@@ -54,14 +55,36 @@ def edit(task: int, revision: int, title: str | None = None, body: str | None = 
 
 
 def move(task: int, revision: int, state: str) -> dict:
-    """Any state to any state: triage, deferring, reopening, closing."""
+    """Any state to any state: triage, deferring, reopening, closing. A move to any
+    state but ``open`` ends the task's claim."""
     tasks.check_state(state)
     with taskdb.writing() as conn:
         row = tasks.task_row(conn, task)
         tasks.check_revision(conn, row, revision)
+        claims.sweep(conn)
+        held = claims.live(conn, task)
+        ending = held is not None and state != "open"
+        if ending:
+            claims.end(conn, task)
         new_revision = tasks.update(conn, task, {"state": state})
         taskdb.record(conn, OPERATOR, "move", task, revision=new_revision,
-                      before=row["state"], state=state)
+                      before=row["state"], state=state,
+                      ended_claim=claims.ended(held) if ending else None)
+    return {"task": task, "revision": new_revision}
+
+
+def break_claim(task: int, revision: int) -> dict:
+    """End any agent's claim."""
+    with taskdb.writing() as conn:
+        row = tasks.task_row(conn, task)
+        tasks.check_revision(conn, row, revision)
+        held = claims.live(conn, task)
+        if held is None:
+            raise Refused(f"task {task} has no live claim to break")
+        claims.end(conn, task)
+        new_revision = tasks.update(conn, task, {})
+        taskdb.record(conn, OPERATOR, "break_claim", task, revision=new_revision,
+                      **claims.ended(held))
     return {"task": task, "revision": new_revision}
 
 

@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tasks: their fields and states, how they relate, the reads, and the plain writes.
+"""Tasks: their fields and states, how they relate, and the plain writes.
 
 The checks here hold for every writer. The writes (``insert``, ``update``,
 ``set_blockers``) check nothing: ``agent_moves`` and ``operator_moves`` call them after
-their checks, and a surface for agents calls ``agent_moves`` and the reads, never
+their checks, and a surface for agents calls ``agent_moves`` and ``reads``, never
 these."""
 from __future__ import annotations
 
-import json
 import re
 import sqlite3
 import time
@@ -33,10 +32,11 @@ REMOTE_RE = re.compile(r"[A-Za-z0-9.-]+(/[A-Za-z0-9._-]+){2,4}")
 def check_fields(title: str | None = None, body: str | None = None,
                  severity: str | None = None, kind: str | None = None) -> None:
     """Refuse a field outside its bounds. ``None`` is "not given" and passes."""
-    if title is not None and not 0 < len(title.strip()) <= TITLE_MAX:
-        raise Refused(f"a title is 1 to {TITLE_MAX} characters")
-    if body is not None and len(body) > BODY_MAX:
-        raise Refused(f"a body is at most {BODY_MAX} characters")
+    if title is not None and not (0 < len(title.strip()) <= TITLE_MAX
+                                  and taskdb.storable(title)):
+        raise Refused(f"a title is 1 to {TITLE_MAX} characters of text")
+    if body is not None and not (len(body) <= BODY_MAX and taskdb.storable(body)):
+        raise Refused(f"a body is at most {BODY_MAX} characters of text")
     if severity is not None and severity not in SEVERITIES:
         raise Refused(f"severity is one of {', '.join(SEVERITIES)}")
     if kind is not None and kind not in KINDS:
@@ -61,7 +61,8 @@ def check_id(value: object) -> int:
 
 def repo_id(conn: sqlite3.Connection, name: str, *, for_new_task: bool = False) -> int:
     """The id of repo ``name``. A retired repo takes no new task."""
-    row = conn.execute("SELECT id, retired_at FROM repos WHERE name = ?", (name,)).fetchone()
+    row = None if not taskdb.storable(name) else conn.execute(
+        "SELECT id, retired_at FROM repos WHERE name = ?", (name,)).fetchone()
     if row is None:
         raise Refused(f"no repo {name!r} in the registry", {"repos": active_repos(conn)})
     if for_new_task and row["retired_at"] is not None:
@@ -98,9 +99,10 @@ def check_revision(conn: sqlite3.Connection, row: sqlite3.Row, revision: int) ->
     if type(revision) is not int:
         raise Refused(f"{revision!r} is not a revision")
     if row["revision"] != revision:
+        import reads  # here, not at the top: reads imports this module
         raise Refused(
             f"task {row['id']} is at revision {row['revision']}, not {revision}: it "
-            f"changed since it was read", _detail(conn, row))
+            f"changed since it was read", reads.detail(conn, row))
 
 
 _UPDATABLE = frozenset({"title", "body", "state", "severity", "kind", "parent_id"})
@@ -192,75 +194,3 @@ def set_blockers(conn: sqlite3.Connection, task: int, blockers: list[int]) -> No
     conn.execute("DELETE FROM blockers WHERE task_id = ?", (task,))
     conn.executemany("INSERT INTO blockers(task_id, blocker_id) VALUES (?, ?)",
                      [(task, b) for b in dict.fromkeys(blockers)])
-
-
-# --- reads -----------------------------------------------------------------------
-
-def list_tasks(repo: str, state: str | None = "open",
-               parent: int | None = None) -> list[dict]:
-    """A repo's tasks in ``state`` (every state for ``None``), optionally only the
-    children of ``parent``."""
-    if state is not None:
-        check_state(state)
-    if parent is not None:
-        check_id(parent)
-    with taskdb.reading() as conn:
-        query = ("SELECT t.*, r.name AS repo FROM tasks t JOIN repos r ON r.id = t.repo_id "
-                 "WHERE t.repo_id = ?")
-        args: list[object] = [repo_id(conn, repo)]
-        if state is not None:
-            query += " AND t.state = ?"
-            args.append(state)
-        if parent is not None:
-            query += " AND t.parent_id = ?"
-            args.append(parent)
-        return [_summary(conn, row) for row in conn.execute(query + " ORDER BY t.id", args)]
-
-
-def get_task(task: int) -> dict:
-    with taskdb.reading() as conn:
-        return _detail(conn, task_row(conn, task))
-
-
-def history(task: int) -> list[dict]:
-    """Every write a task has had, oldest first, with its author."""
-    with taskdb.reading() as conn:
-        task_row(conn, task)
-        return [{"ts": r["ts"], "author": r["author"], "action": r["action"],
-                 "detail": json.loads(r["detail"])}
-                for r in conn.execute(
-                    "SELECT * FROM history WHERE task_id = ? ORDER BY id", (task,))]
-
-
-def repos() -> list[dict]:
-    with taskdb.reading() as conn:
-        return [{"name": r["name"], "remote": r["remote"],
-                 "retired": r["retired_at"] is not None}
-                for r in conn.execute("SELECT * FROM repos ORDER BY name")]
-
-
-def _summary(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
-    blocked = conn.execute(
-        "SELECT 1 FROM blockers b JOIN tasks t ON t.id = b.blocker_id "
-        "WHERE b.task_id = ? AND t.state != 'closed' LIMIT 1", (row["id"],)).fetchone()
-    return {"id": row["id"], "repo": row["repo"], "title": row["title"],
-            "state": row["state"], "severity": row["severity"], "kind": row["kind"],
-            "parent": row["parent_id"], "blocked": blocked is not None,
-            "revision": row["revision"]}
-
-
-def _detail(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
-    def brief(query: str) -> list[dict]:
-        return [{"id": r["id"], "title": r["title"], "state": r["state"]}
-                for r in conn.execute(query, (row["id"],))]
-
-    parent = brief("SELECT p.id, p.title, p.state FROM tasks t "
-                   "JOIN tasks p ON p.id = t.parent_id WHERE t.id = ?")
-    return {**_summary(conn, row), "body": row["body"],
-            "parent": parent[0] if parent else None,
-            "children": brief("SELECT id, title, state FROM tasks "
-                              "WHERE parent_id = ? ORDER BY id"),
-            "blockers": brief("SELECT t.id, t.title, t.state FROM blockers b "
-                              "JOIN tasks t ON t.id = b.blocker_id "
-                              "WHERE b.task_id = ? ORDER BY t.id"),
-            "created_at": row["created_at"], "updated_at": row["updated_at"]}

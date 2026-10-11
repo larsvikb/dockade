@@ -123,7 +123,8 @@ PYFILES := proxies/egress/addon.py control-plane-ui/app.py \
            control-plane/api_mcp.py control-plane/api_views.py \
            tool-gateway/app.py tool-gateway/outcomes.py tool-gateway/discovery.py \
            tool-gateway/protocol.py tool-gateway/surface.py tool-gateway/execute.py \
-           task-registry/taskdb.py task-registry/tasks.py \
+           task-registry/taskdb.py task-registry/tasks.py task-registry/reads.py \
+           task-registry/claims.py \
            task-registry/agent_moves.py task-registry/operator_moves.py
 # Dependency-free unit tests for the governance-critical decision logic. Kept
 # separate from PYFILES so they can be linted with the app code but discovered

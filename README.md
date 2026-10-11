@@ -317,9 +317,12 @@ dockade/
     requirements.txt        #   pinned deps, held equal to the control plane's
   task-registry/            # TASK REGISTRY — the work list agent sessions and the operator share
     taskdb.py               #   SQLite — schema, the write transaction, the history every write leaves
-    tasks.py                #   fields, states, parent and blockers; the reads
-    agent_moves.py          #   what an agent may do: propose, edit a proposal
-    operator_moves.py       #   what only the operator may do: any edit, any move, the repo list
+    tasks.py                #   fields, states, parent and blockers; the plain writes
+    claims.py               #   a claim's token, expiry and footprint; the plain claim writes
+    reads.py                #   what any surface may read; nothing here writes
+    agent_moves.py          #   what an agent may do: propose, edit a proposal, work a claim
+    operator_moves.py       #   what only the operator may do: any edit, any move, break a
+                            #   claim, the repo list
     DESIGN.md               #   who writes what, and why
   policies/                 # seed policy config (loaded into the control plane)
     egress-allowlist.txt    #   default-deny seed for the control plane's egress policy store

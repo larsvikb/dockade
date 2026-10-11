@@ -154,6 +154,16 @@ def record(conn: sqlite3.Connection, author: str, action: str, task_id: int | No
         (time.time(), author, action, task_id, json.dumps(detail, sort_keys=True)))
 
 
+def storable(text: str) -> bool:
+    """Whether SQLite can store ``text``. A lone surrogate, which JSON can carry as
+    ``\\ud800``, has no UTF-8 form, and binding it raises instead of refusing."""
+    try:
+        text.encode()
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def check_agent(agent: str) -> str:
     """``agent``, if it has the shape of an agent id: a shape, not a proof
     (``task-registry/DESIGN.md``, "Who an agent is")."""

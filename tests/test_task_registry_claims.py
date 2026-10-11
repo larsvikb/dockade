@@ -171,6 +171,16 @@ class HolderTests(_Store):
         self.refused(op.move, task, seen, "deferred")
 
 
+    def test_text_that_cannot_be_stored_is_refused(self):
+        bad = "half " + "\ud800"
+        self.refused(agent.update, ALICE, "widgets", self.task, self.token, progress=bad)
+        self.refused(agent.update, ALICE, "widgets", self.task, self.token, footprint=[bad])
+        self.refused(agent.update, ALICE, "widgets", self.task, bad)
+        self.refused(agent.release, ALICE, "widgets", self.task, self.token, note=bad)
+        self.refused(self.claim, self.open_task(), footprint=[bad])
+        self.assertIsNotNone(reads.get_task(self.task)["claim"])
+
+
 class ExpiryTests(_Store):
     def test_a_lapsed_claim_is_not_held_and_its_holder_is_told(self):
         task = self.open_task()

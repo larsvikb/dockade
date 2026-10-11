@@ -63,8 +63,9 @@ def check_branch(branch: object) -> str:
 def check_text(text: object, limit: int, what: str, *, required: bool = False) -> None:
     if text is None and not required:
         return
-    if not isinstance(text, str) or not 0 < len(text.strip()) <= limit:
-        raise Refused(f"{what} is 1 to {limit} characters")
+    if (not isinstance(text, str) or not 0 < len(text.strip()) <= limit
+            or not taskdb.storable(text)):
+        raise Refused(f"{what} is 1 to {limit} characters of text")
 
 
 def footprint(paths: object) -> list[str]:
@@ -76,7 +77,7 @@ def footprint(paths: object) -> list[str]:
     out = []
     for path in paths:
         if (not isinstance(path, str) or not 0 < len(path) <= PATH_MAX
-                or any(ord(c) < 32 for c in path)):
+                or any(ord(c) < 32 for c in path) or not taskdb.storable(path)):
             raise Refused(f"{path!r} is not a path in the repo")
         norm = posixpath.normpath(path)
         if norm == ".." or norm.startswith(("/", "../")):
@@ -114,8 +115,8 @@ def check_holder(conn: sqlite3.Connection, row: sqlite3.Row, agent: str,
     if claim["holder"] != agent:
         raise Refused(f"task {row['id']} is held by {claim['holder']}",
                       {"holder": claim["holder"], "expires_at": claim["expires_at"]})
-    if not isinstance(token, str) or not hmac.compare_digest(
-            _hash(token), claim["token_hash"]):
+    if (not isinstance(token, str) or not taskdb.storable(token)
+            or not hmac.compare_digest(_hash(token), claim["token_hash"])):
         raise Refused(f"that is not the token of the claim on task {row['id']}")
     return claim
 

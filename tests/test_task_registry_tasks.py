@@ -326,6 +326,23 @@ class ReadTests(_Store):
         self.assertEqual(reads.get_task(task)["repo"], "gadgets")
 
 
+class UnstorableTextTests(_Store):
+    """A lone surrogate, which JSON can carry as ``\\ud800``, has no UTF-8 form: it is
+    refused like any bad value, not raised as an encoding error."""
+
+    def test_every_text_field_refuses_it(self):
+        bad = "half " + "\ud800"
+        task = self.propose()
+        self.refused(self.propose, title=bad)
+        self.refused(agent.propose, ALICE, "widgets", "T", bad)
+        self.refused(agent.edit_proposal, ALICE, "widgets", task, 1, body=bad)
+        self.refused(op.create, "widgets", bad, "B", "open")
+        self.refused(op.edit, task, 1, title=bad)
+        self.refused(self.propose, repo="widgets" + "\ud800")
+        self.refused(reads.list_tasks, "widgets" + "\ud800")
+        self.assertEqual(self.revision(task), 1)
+
+
 class SchemaTests(_Store):
     def test_init_is_idempotent(self):
         task = self.propose()

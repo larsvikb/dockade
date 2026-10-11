@@ -11,6 +11,7 @@ import re
 import sqlite3
 import time
 
+import taskdb
 from taskdb import Refused
 
 STATES = ("proposed", "open", "landing", "deferred", "closed")
@@ -31,10 +32,11 @@ REMOTE_RE = re.compile(r"[A-Za-z0-9.-]+(/[A-Za-z0-9._-]+){2,4}")
 def check_fields(title: str | None = None, body: str | None = None,
                  severity: str | None = None, kind: str | None = None) -> None:
     """Refuse a field outside its bounds. ``None`` is "not given" and passes."""
-    if title is not None and not 0 < len(title.strip()) <= TITLE_MAX:
-        raise Refused(f"a title is 1 to {TITLE_MAX} characters")
-    if body is not None and len(body) > BODY_MAX:
-        raise Refused(f"a body is at most {BODY_MAX} characters")
+    if title is not None and not (0 < len(title.strip()) <= TITLE_MAX
+                                  and taskdb.storable(title)):
+        raise Refused(f"a title is 1 to {TITLE_MAX} characters of text")
+    if body is not None and not (len(body) <= BODY_MAX and taskdb.storable(body)):
+        raise Refused(f"a body is at most {BODY_MAX} characters of text")
     if severity is not None and severity not in SEVERITIES:
         raise Refused(f"severity is one of {', '.join(SEVERITIES)}")
     if kind is not None and kind not in KINDS:
@@ -59,7 +61,8 @@ def check_id(value: object) -> int:
 
 def repo_id(conn: sqlite3.Connection, name: str, *, for_new_task: bool = False) -> int:
     """The id of repo ``name``. A retired repo takes no new task."""
-    row = conn.execute("SELECT id, retired_at FROM repos WHERE name = ?", (name,)).fetchone()
+    row = None if not taskdb.storable(name) else conn.execute(
+        "SELECT id, retired_at FROM repos WHERE name = ?", (name,)).fetchone()
     if row is None:
         raise Refused(f"no repo {name!r} in the registry", {"repos": active_repos(conn)})
     if for_new_task and row["retired_at"] is not None:

@@ -33,6 +33,22 @@ upsert is harmless rather than a silent no-write bug — and, in the other direc
 at all. One of these was written as a mutation-testing case and reported SURVIVED before
 it turned out to be a no-op.
 
+## A cached `.pyc` can stand in for a mutant, and `-B` alone does not stop it
+
+CPython reuses `__pycache__/<module>.cpython-*.pyc` while the source's size and
+modification time, in whole seconds, match what the cache recorded. So a mutation
+script that writes a mutant the same length as an earlier one within the same second
+runs the earlier one's bytecode. `-B` only stops a run writing a cache; it still reads
+one that is there:
+
+```sh
+echo 'X = 1' > m.py; python3 -c 'import m'                   # caches X = 1
+echo 'X = 2' > m.py; python3 -B -c 'import m; print(m.X)'    # -> 1
+```
+
+Delete `__pycache__` before the first mutant and run every mutant with `-B`. Seen in a
+review on Python 3.13, where a mutant reported caught in fact survived.
+
 ## Python's `sqlite3` leaves DDL outside its implicit transaction
 
 SQLite itself has transactional DDL — a `DROP TABLE` inside a transaction is undone by
@@ -168,6 +184,17 @@ disclaimer writes `skipDangerousModePermissionPrompt: true` into user settings
 `bypassPermissionsModeAccepted` flag in `.claude.json` is migrated away and deleted on
 startup, so it no longer persists the acceptance — a template that set only the old
 flag would re-prompt on every launch.
+
+## Claude Code puts its session id in every Bash call's environment
+
+Measured on Claude Code 2.1.296: `CLAUDE_CODE_SESSION_ID` holds the session's UUID, and
+the session's transcript is named by it, `<id>.jsonl` beside a directory `<id>/` under
+`$CLAUDE_CONFIG_DIR/projects/<workspace slug>/`. A subagent's Bash call sees the same
+value and the same `CLAUDE_PID`, and the subagent's transcript sits under the parent's
+`<id>/subagents/`, so a session and the subagents it starts share one id. `claude
+--help` describes `--fork-session` as "When resuming, create a new session ID instead
+of reusing the original", so a plain `--resume` is documented to keep the id. Not
+measured: that resume, or whether `/clear` starts a new id.
 
 ## An MCP server can be declared four ways, and `settings.json` is not one of them
 

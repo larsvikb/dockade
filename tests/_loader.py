@@ -443,3 +443,11 @@ def load_operator_api() -> types.ModuleType:
     _install_fastapi_stub()
     load_task_registry()
     return importlib.import_module("operator_api")
+
+
+def load_task_registry_serve() -> types.ModuleType:
+    """The task registry's entry, with both apps under it. It imports uvicorn only
+    inside ``main``, so a test puts a recording one in ``sys.modules`` first."""
+    load_task_registry_agent_api()
+    load_operator_api()
+    return importlib.import_module("serve")

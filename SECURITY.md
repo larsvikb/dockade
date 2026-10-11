@@ -80,6 +80,13 @@ Anything that **crosses a boundary the design claims to hold**:
   the gateway's bridge (`tool-authorize-net`) or to an MCP server container on
   `mcp-net`, and any way a server credential reaches the sandbox — through a tool
   result, an error message or a tool description.
+- **Acting as the operator in the task registry from anywhere else.** Its operator
+  listener takes no token and answers on `tasks-operator-net` alone, and its agent
+  listener answers only the gateway's secret. In scope: a route to the operator
+  listener from a sandbox, an MCP server or the gateway; a call to the agent listener
+  that is served without that secret; and an agent move that does what only the
+  operator may — changes an approved spec, ends another session's claim, or hides,
+  unhides or rewrites a note.
 - **A control-plane-ui relay bypass** — reaching `POST /authorize` or any
   non-allowlisted backend path through the frontend, or overriding the pinned
   upstream host.
@@ -135,9 +142,10 @@ please raise them as **public issues** if you
 disagree with the reasoning — that is a design discussion, not a vulnerability
 report.
 
-- **A process already running on the host forging an approval.** The approval API is
-  reachable by anything on the host, and the frontend's guards are browser-enforced,
-  so they do not constrain it. Authentication would not close it either: any
+- **A process already running on the host forging an approval or an operator write.**
+  The approval API is reachable by anything on the host, and so is the task registry's
+  operator listener, since the host holds an address on its network; the frontend's
+  guards are browser-enforced, so they do not constrain it. Authentication would not close it either: any
   credential at rest on the host is readable by that same process. Closing it needs a
   human-presence gesture the host cannot replay. See "Browser-facing guards on the
   frontend (and their honest limit)" in `control-plane-ui/DESIGN.md`.

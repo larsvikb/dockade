@@ -1,0 +1,8 @@
+# Task registry runtime deps, pinned like the gateway's. fastapi and uvicorn are held
+# equal to the control plane's by tests/test_topology.py, one Python service shape.
+#
+# pydantic pinned too, unlike there: the operator API's strict request bodies
+# (operator_api.Body) are pydantic's behaviour, and fastapi only bounds its version.
+fastapi==0.141.1
+uvicorn==0.53.0
+pydantic==2.14.1

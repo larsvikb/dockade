@@ -43,7 +43,8 @@ the repo follows from "containment is by **capability**, not configuration."
 - [Capability inventory](#capability-inventory-v1) ·
   [Governance surfaces](#governance-surfaces)
   (egress proxy · control plane · [client class](#policy-is-scoped-to-a-client-class) ·
-  approval UI · [MCP gateway](#mcp-gateway--governed-tool-capability))
+  approval UI · [MCP gateway](#mcp-gateway--governed-tool-capability) ·
+  [task registry](#task-registry--an-mcp-server-with-an-operator-side))
 - [Startup ordering](#startup-ordering--running-is-not-ready) ·
   [Resource limits](#resource-limits--blast-radius-not-boundary) ·
   [Local inference](#local-inference--an-ungoverned-llm-tool)
@@ -187,6 +188,10 @@ egress** — sandbox-net only. These make good practices cheap and fast. Example
   host-reachable but not an egress path. Needed because Docker cannot publish a
   host port from a container that is on an internal network alone. Sandbox not
   attached.
+- `tasks-operator-net` (`internal: true`) — the task registry's OPERATOR path, one
+  conversation only: the control-plane UI → the registry's operator listener, which
+  takes no token, so being on this network is the permission to write as the operator.
+  Nothing else is served on it. Sandbox not attached. See "Task registry".
 
 **Status:** every network above is implemented. `sandbox-net` (internal) and
 `egress-net` carry the agent and the sole egress; the internal control nets carry
@@ -198,7 +203,8 @@ control-plane **backend** is **triple-homed**
 (control-net + authorize-net + tool-authorize-net) and fully
 internal (no `sandbox-net`, no `egress-net`, no published port), serving a
 different surface on each; the **control-plane-ui** frontend is on `control-net`
-(to reach the backend) plus `control-ui-net` (host-loopback UI). The sandbox is on
+(to reach the backend) plus `control-ui-net` (host-loopback UI). The task registry,
+when its profile runs, is dual-homed (`mcp-net` + `tasks-operator-net`). The sandbox is on
 `sandbox-net` only — never any control network (asserted by the launcher guard in
 `make consistency` and by `boundary-check.sh`, which probes it from inside a running
 sandbox; a sandbox is not a compose service, so `tests/test_topology.py` cannot see
@@ -1467,9 +1473,10 @@ explicitly: **a crown-jewel backup never contains a credential.**
 `secrets:`.** A `secrets:` entry whose `file:` source is absent fails at `up` time for
 the whole project — the same eager-validation trap as `${VAR:?}`, and this repo has
 paid for that lesson twice. A directory bind degrades instead: a missing file means
-*that* server fails closed while every other service is unaffected. Both `make up`
-and `make mcp-up` warn on the mode of anything under `MCP_SECRETS`
-(`secrets-perm-check` in the `Makefile`); neither creates the directory.
+*that* server fails closed while every other service is unaffected. `make up`,
+`make mcp-up` and `make tasks-up` warn on the mode of anything under `MCP_SECRETS`
+(`secrets-perm-check` in the `Makefile`). Only `make tasks-up` writes there: the task
+registry's secret, which no one issues, made once and never overwritten.
 
 **What the UI can say without ever seeing a value:** whether the secret *resolves*,
 per server. That is what makes a forced-injection server fail legibly — "configured,
@@ -1934,6 +1941,48 @@ rather than whatever the config volume happens to have accumulated. The baked
 `CLAUDE.md` must also say that a gateway tool call can come back as a pending id, and
 that resuming it may wait on a human, or an `ask` is indistinguishable from a failure.
 
+### Task registry — an MCP server with an operator side
+
+The work list agent sessions and the operator share. Who writes what, and why, is in
+`task-registry/DESIGN.md`; here is what spans components: where it sits, and who can
+reach each of its two surfaces.
+
+**Behind the gateway, so an agent's write is a governed tool call.** Agents reach it
+only as `mcp__gateway__tasks__…`: the operator registers server `tasks` in the MCP tab,
+with the descriptor's template `Bearer {secret}`, and each tool is denied until a rule
+allows it. The gateway's audit row records an agent's write; the operator's writes
+have no gateway in front of them, so the registry records those itself, in its history.
+The tools that carry a claim's token (`update`, `submit`, `send_back`, `release`) stay
+at allow: an `ask` card shows a call's arguments and the store keeps them, while an
+allow row records none (`control-plane/api_tool.py`).
+
+**Two surfaces, two networks, one process.** The agent listener is on `mcp-net`, where
+every MCP server can dial it, so it answers only the secret the gateway holds for
+`tasks`; `make tasks-up` writes that file, the one secret nobody issues, and the
+registry is given it alone. The operator listener takes no token, so its network is
+the permission: `tasks-operator-net`. Each binds its own leg's address alone, and
+`task-registry/serve.py` refuses to start otherwise, since an operator listener on
+`mcp-net` would hand every server the operator's writes. The bind alone does not
+choose the leg a packet arrives on: Linux takes a packet for any of its addresses on
+any interface, so each listener also refuses a peer outside its own network, and no
+neighbour can route or forge such a packet, since every service drops every capability
+(`EveryServiceDropsEveryCapabilityTests`, which holds the gateway's agent listener and
+the control plane's management listener to the same). Nor does the registry forward
+between its legs, so it carries no neighbour across to the other network's members. One process because both serve
+one SQLite store.
+
+**Declared in `docker-compose.yml`, behind a profile, and nothing depends on it.**
+Not in `mcp-servers.yml`, whose servers sit on `mcp-net` alone: a second leg is
+topology. `make up` is unchanged. A stopped registry keeps its tools listed, since a
+restart must not look like a withdrawal (`tool-gateway/surface.py`), and each call
+fails as unreachable; disabling `tasks` in the MCP tab is what withdraws them.
+
+**It parses agent text, so it joins no network the agent or the control plane is
+on.** Never `sandbox-net` or a control network, and no egress leg; from `mcp-net` it
+reaches what any server does. When the UI joins `tasks-operator-net` to give the
+registry a view, the UI serves nothing there: a registry compromised through a body
+or a note would otherwise find the UI's relay, and through it the management API.
+
 ## Startup ordering — "running" is not "ready"
 
 Every infrastructure service declares a `healthcheck`, and both launchers gate on it via
@@ -2219,7 +2268,7 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | the gateway's bridge — `tool-authorize-net`, third listener, decide/roster/inventory/claim | **done** |
 | — | `tool-gateway` placement — triple-homed, agent leg only, bind guard | **done** |
 | — | gateway discovery — roster pull, `tools/list`, policy-vs-server report | **done** — reports to the log; writes no rule |
-| — | MCP client credentials — read-only mount, path derived from the server name | **done** — the gateway is the only holder |
+| — | MCP client credentials — read-only mount, path derived from the server name | **done** — the gateway holds the directory; the task registry, its own file alone |
 | — | MCP server registration — UI tab: register, enable/disable, revoke | **done** |
 | — | tool inventory — gateway pushes, control plane holds it in memory | **done** — audited on change |
 | — | tool policy UI — pick from the inventory, write allow/ask/deny, promote | **done** — every row in `tool_rules` now has an operator surface |
@@ -2230,6 +2279,8 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | tool audit is joinable — `server`/`tool`/`approval_id` columns, filled by every writer | **done** |
 | — | the gateway records how a call ENDED — its own JSONL stream | **done** |
 | — | outcomes ingested — second stream, `status` column, `outcome` in the audit vocabulary | **done** — one approval id now selects the hold, the answer, the claim and the result |
+| — | task registry — the store, the agent listener (MCP, behind the gateway's secret), the operator API | **done** |
+| — | task registry as a service — `tasks` behind a profile on `mcp-net` + `tasks-operator-net`, one listener per leg | **done** — no UI view yet; no backup |
 
 The rationale for each shipped item lives under **Governance surfaces** above, not here
 — a status line goes stale, the reasoning does not. This section is deliberately the
@@ -2292,7 +2343,8 @@ which file takes what). A component whose reasoning is its own keeps it beside i
 tier 2 in `opencode-sandbox/DESIGN.md` and `opencode-sandbox/NOTES.md`, the control
 plane in `control-plane/DESIGN.md`, its frontend in `control-plane-ui/DESIGN.md`, the
 egress proxy's relay guard and its side of `/authorize` in `proxies/egress/DESIGN.md`,
-and what the MCP gateway shows and runs in `tool-gateway/DESIGN.md`. Still-planned
+what the MCP gateway shows and runs in `tool-gateway/DESIGN.md`, and who writes what in
+the task registry in `task-registry/DESIGN.md`. Still-planned
 additions to the tree:
 
 ```

@@ -807,6 +807,25 @@ line is what distinguishes those, which is why `boundary-check.sh` reads both.
 Note also that the container's own hostname resolves from `/etc/hosts` (Docker writes
 it there), so resolving it proves nothing about the resolver being alive.
 
+## Docker drops a packet routed to another network's address on a shared neighbour
+
+Measured on the maintainer's host (rootful Docker Engine on WSL2) on 2026-10-12, by the
+task registry's host check. A throwaway `alpine:3` container on `mcp-net`, given
+`--cap-add NET_ADMIN`, routed the operator network through the registry, whose other
+leg is on it, and dialled the registry's operator listener there:
+
+    ip route add 172.26.0.0/24 via 172.28.0.3
+    wget -T 4 -O- http://172.26.0.2:8111/api/repos
+    Connecting to 172.26.0.2:8111 (172.26.0.2:8111)
+    wget: download timed out
+
+The kernel inside the registry would take such a packet (Linux answers for any of its
+addresses on any interface), so the drop is the engine's, on this host; which rule does
+it, the bridge's netfilter or an internal network's isolation, was not looked for. One
+host, and nothing here leans on it: the registry refuses an off-network peer
+(`task-registry/serve.py`, `OnlyFrom`), and every service drops the capabilities that
+routing or forging such a packet takes (`EveryServiceDropsEveryCapabilityTests`).
+
 ## A unix socket under a read-only bind mount still accepts connections
 
 Read-only stops writes to regular files, directories and symlinks; a unix socket's

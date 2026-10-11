@@ -8,7 +8,7 @@
 #                   CI-friendly: non-zero on any failure.
 #   - compose/*     thin wrappers over the shared infrastructure (egress proxy +
 #                   control plane + UI + tool gateway, plus the optional llm-*
-#                   profiles) in
+#                   profiles and task registry) in
 #                   docker-compose.yml. Sandboxes themselves are NOT compose
 #                   services (they are ephemeral + plural); launch them with
 #                   `make claude` / `make opencode`, one per agent tier.
@@ -108,7 +108,7 @@ SCRIPTS := $(LAUNCHERS) \
 DOCKERFILES := claude-sandbox/Dockerfile opencode-sandbox/Dockerfile \
                proxies/egress/Dockerfile \
                control-plane/Dockerfile control-plane-ui/Dockerfile \
-               tool-gateway/Dockerfile
+               tool-gateway/Dockerfile task-registry/Dockerfile
 # A GLOB for the workflows, not a list, so a second workflow is linted without
 # anyone remembering to register it — same reasoning as LAUNCHERS above.
 YAMLFILES := docker-compose.yml mcp-servers.yml .hadolint.yaml .yamllint \
@@ -127,7 +127,7 @@ PYFILES := proxies/egress/addon.py control-plane-ui/app.py \
            task-registry/claims.py task-registry/notes.py \
            task-registry/agent_moves.py task-registry/operator_moves.py \
            task-registry/agent_tools.py task-registry/agent_api.py \
-           task-registry/operator_api.py
+           task-registry/operator_api.py task-registry/serve.py
 # Dependency-free unit tests for the governance-critical decision logic. Kept
 # separate from PYFILES so they can be linted with the app code but discovered
 # and run on their own (python -m unittest, no pip installs — see tests/).
@@ -183,13 +183,25 @@ REFFILES := $(SCRIPTS) \
             control-plane-ui/saturation.js \
             control-plane-ui/status.js \
             control-plane-ui/time.js \
+            task-registry/serve.py \
+            task-registry/taskdb.py \
+            task-registry/tasks.py \
+            task-registry/claims.py \
+            task-registry/notes.py \
+            task-registry/reads.py \
+            task-registry/agent_moves.py \
+            task-registry/operator_moves.py \
+            task-registry/agent_tools.py \
+            task-registry/agent_api.py \
+            task-registry/operator_api.py \
+            task-registry/requirements.txt \
             policies/egress-allowlist.txt
 
 .PHONY: help check check-strict lint consistency test verify-build \
         up down destroy audit-prune control-tool-preflight backup restore \
         secrets-perm-check \
         rebuild logs-ep logs-cp logs-tg tool-outcomes print-config-home \
-        mcp-up mcp-down mcp-ps mcp-tools gateway-tools \
+        mcp-up mcp-down mcp-ps mcp-tools gateway-tools tasks-up tasks-down \
         claude opencode boundary check-boundary split-check ui-diff
 
 help: ## Show this help
@@ -485,12 +497,13 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	  exit 1
 	fi
 	for launcher in $(LAUNCHERS); do
-	  if grep -qE 'control-(ui-)?net|(tool-)?authorize-net' "$$launcher"; then
+	  if grep -qE 'control-(ui-)?net|(tool-)?authorize-net|tasks-operator-net' "$$launcher"; then
 	    echo "  FAIL: $$launcher references a control-plane network — no sandbox tier"
-	    echo "        may EVER attach to control-net, control-ui-net, authorize-net"
-	    echo "        or tool-authorize-net (the agent must have no route to the"
-	    echo "        control plane, and both authorize nets reach it just as"
-	    echo "        directly as the others)"
+	    echo "        may EVER attach to control-net, control-ui-net, authorize-net,"
+	    echo "        tool-authorize-net or tasks-operator-net (the agent must have no"
+	    echo "        route to the control plane, both authorize nets reach it just as"
+	    echo "        directly as the others, and the last is where the task"
+	    echo "        registry takes the operator's writes with no token)"
 	    exit 1
 	  fi
 	done
@@ -500,7 +513,8 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	# tool-authorize-net (the MCP gateway's), each of which reaches the control
 	# plane just as directly — and mcp-net, whose internal-ness is what leaves the
 	# egress proxy as the only thing an MCP server container can reach, from a
-	# container holding a write-capable credential. Check each BY NAME — a bare count of 'internal:
+	# container holding a write-capable credential — and tasks-operator-net, where the
+	# task registry's operator listener answers with no token. Check each BY NAME — a bare count of 'internal:
 	# true' can't tell that the RIGHT nets are the internal ones (a future edit
 	# could flip sandbox-net to non-internal while some other net gained
 	# 'internal: true', and a count would still pass). awk isolates each top-level
@@ -508,7 +522,8 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	# appears inside it. tests/test_topology.py asserts the same property from the
 	# other side, along with who is attached to what; this stays because it is the
 	# one that runs in `make consistency` alongside the launcher check above.
-	for net in sandbox-net control-net authorize-net tool-authorize-net mcp-net; do
+	for net in sandbox-net control-net authorize-net tool-authorize-net mcp-net \
+	           tasks-operator-net; do
 	  if ! awk -v net="$$net" '
 	        $$0 ~ "^  " net ":" {inb=1; next}
 	        inb && /^  [A-Za-z]/ {inb=0}
@@ -519,7 +534,7 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	    exit 1
 	  fi
 	done
-	echo "  ok — no launcher attaches the sandbox to a control network; sandbox-net, control-net, authorize-net, tool-authorize-net and mcp-net all internal"
+	echo "  ok — no launcher attaches the sandbox to a control network; sandbox-net, control-net, authorize-net, tool-authorize-net, mcp-net and tasks-operator-net all internal"
 
 # No `##` description, so it stays out of `make help`: it exists for the config-home
 # drift guard above, which needs make's own answer under a modified environment.
@@ -587,9 +602,12 @@ verify-build: ## Assert every image still builds (skipped if docker unavailable)
 	fi
 	# Cache-respecting builds: the first run is slow, repeats are near-instant when
 	# nothing changed. Covers every Dockerfile — the compose services here, and
-	# BOTH sandbox tiers (not compose services) via their launchers.
+	# BOTH sandbox tiers (not compose services) via their launchers. `--profile tasks`
+	# because compose builds only the services its active profiles enable, and the
+	# task registry is the one profile-gated service built here
+	# (tests/test_topology.py holds this to every such profile).
 	echo "== docker compose build (the compose services) =="
-	$(COMPOSE) build
+	$(COMPOSE) --profile tasks build
 	for launcher in $(LAUNCHERS); do
 	  echo "== sandbox image build ($$launcher --build-only) =="
 	  "./$$launcher" --build-only
@@ -664,6 +682,41 @@ mcp-down: ## Stop one catalogue MCP server: make mcp-down SERVER=github
 mcp-ps: ## Who is on mcp-net right now (should be the proxy plus enabled servers)
 	docker network inspect mcp-net \
 	  -f '{{range .Containers}}{{printf "%-16s %s\n" .Name .IPv4Address}}{{end}}'
+
+# The task registry (task-registry/DESIGN.md) is optional: `make up` leaves it alone,
+# and this adds it. Its secret is the one the gateway sends for server `tasks`, and
+# nobody issues it, so the first start writes one, beside the other servers' files and
+# read the same way (DESIGN.md, "The secret's path is derived from the server name"):
+# random, mode 0600, never overwritten. The registry reads it at start and the gateway
+# on every call, so rotation is deleting the file, then `make tasks-down tasks-up`.
+tasks-up: ## Start the task registry (optional); writes its secret on the first start
+	@secret="$(MCP_SECRETS)/tasks.json"
+	if [ ! -e "$$secret" ]; then
+	  # Made before the file is opened, so a failure leaves no empty file behind for
+	  # the next run to keep. URL-safe, so it goes into the JSON as it is.
+	  token=$$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')
+	  mkdir -p -m 700 "$(MCP_SECRETS)"
+	  # Docker makes the directory, as root, if the gateway started before it existed
+	  # (a missing bind source becomes a directory); say so rather than fail on a
+	  # bare "Permission denied".
+	  if [ ! -w "$(MCP_SECRETS)" ]; then
+	    echo "$(MCP_SECRETS) is not writable by you (owner: $$(stat -c %U "$(MCP_SECRETS)"));"
+	    echo "chown it to yourself, mode 700, and run this again."
+	    exit 1
+	  fi
+	  (umask 077; set -C
+	   printf '{"token": "%s", "note": "written by make tasks-up"}\n' "$$token" > "$$secret")
+	  echo "wrote $$secret"
+	fi
+	$(MAKE) --no-print-directory secrets-perm-check
+	$(COMPOSE) --profile tasks up -d --build --wait --wait-timeout 120 tasks
+	echo "Registered yet? The UI's MCP tab: server tasks, port 8110, path /mcp, header"
+	echo "Authorization, template 'Bearer {secret}'. Its tools are denied until rules allow them."
+
+tasks-down: ## Stop the task registry (keeps its store and its secret)
+	# stop+rm rather than `down`, which would take the shared infra with it.
+	$(COMPOSE) stop tasks
+	$(COMPOSE) rm -f tasks
 
 # A well-formed DUMMY, and both halves matter. Enumeration never calls GitHub, so no
 # real credential is needed to read a server's tool surface — but the bearer is
@@ -837,7 +890,7 @@ gateway-tools: ## List what the gateway serves the AGENT: make gateway-tools [RA
 	  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
 	  | MCP_RAW='$(RAW)' python3 -c "$$GATEWAY_TOOLS_PY"
 
-destroy: ## Stop infra AND delete BOTH volumes: egress audit log + control-plane policy/audit store (destructive)
+destroy: ## Stop infra AND delete its volumes: egress audit, tool audit, control-plane store (destructive); leaves the task registry and its store
 	$(COMPOSE) down -v
 
 # Retention window for `audit-prune`, in days. A variable, not a literal in the
@@ -971,7 +1024,7 @@ restore: control-tool-preflight ## Replace the control-plane store from a backup
 	trap '$(COMPOSE) up -d --wait --wait-timeout 120' EXIT
 	$(CONTROL_TOOL) -c "$$RESTORE_PY" < "$(FILE)"
 
-rebuild: ## Rebuild every image from scratch — proxy + control plane + UI + both sandbox tiers — then recreate the infra
+rebuild: ## Rebuild every image from scratch — proxy, control plane, UI, gateway, task registry, both sandbox tiers — then recreate the infra
 	# Deliberately does NOT `down` first. A build touches no running container, so
 	# taking the governance plane offline for the whole --no-cache build bought
 	# nothing and cost real downtime; the only unavoidable interruption is the
@@ -984,7 +1037,10 @@ rebuild: ## Rebuild every image from scratch — proxy + control plane + UI + bo
 	# (`docker run --rm`) and per-workspace, so a running session keeps the image
 	# it started with and the next `make claude` / `make opencode` picks up the new
 	# one. Nothing to recreate.
-	$(COMPOSE) build --no-cache
+	#
+	# The task registry's image too (see verify-build for the profile). The `up` below
+	# leaves a running registry alone; `make tasks-up` recreates it on the new image.
+	$(COMPOSE) --profile tasks build --no-cache
 	for launcher in $(LAUNCHERS); do "./$$launcher" --build-only --no-cache; done
 	$(COMPOSE) up -d --wait --wait-timeout 120
 

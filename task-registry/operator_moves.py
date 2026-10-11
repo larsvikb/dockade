@@ -1,15 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""What only the operator may do: create and edit any task, move any task to any
-state, re-parent, break a claim, and keep the repo list. Every write is recorded under
-``taskdb.OPERATOR``, and every write to a task names the revision the operator read.
+"""What only the operator may do or see: create and edit any task, move any task to
+any state, re-parent, break a claim, note and hide notes, keep the repo list; read the
+history, every note, and the notes marked for the operator. Every write is recorded
+under ``taskdb.OPERATOR``, and every write to a task's spec, state or claim names the
+revision the operator read.
 
 An agent-facing surface must not call anything here (``task-registry/DESIGN.md``,
 "Two writers, two modules")."""
 from __future__ import annotations
 
+import json
 import time
 
 import claims
+import notes
 import taskdb
 import tasks
 from taskdb import OPERATOR, Refused
@@ -100,6 +104,63 @@ def reparent(task: int, revision: int, parent: int | None) -> dict:
     return {"task": task, "revision": new_revision}
 
 
+# --- notes -----------------------------------------------------------------------
+
+
+def add_note(task: int, text: str) -> dict:
+    notes.check_note(text)
+    with taskdb.writing() as conn:
+        tasks.task_row(conn, task)
+        note = notes.post(conn, task, OPERATOR, text)
+        taskdb.record(conn, OPERATOR, "note", task, note_id=note, note=text)
+    return {"task": task, "note": note}
+
+
+def hide_note(note: int, hidden: bool = True) -> None:
+    """Take a note out of agents' reads, or put it back. The note itself stays."""
+    tasks.check_flag(hidden, "hidden")
+    with taskdb.writing() as conn:
+        row = notes.note_row(conn, note)
+        conn.execute("UPDATE notes SET hidden_at = ? WHERE id = ?",
+                     (time.time() if hidden else None, note))
+        taskdb.record(conn, OPERATOR, "hide_note", row["task_id"], note_id=note,
+                      hidden=hidden)
+
+
+def all_notes(task: int) -> list[dict]:
+    """Every note on ``task``, hidden ones marked: the operator's read, which no
+    agent-facing surface may offer."""
+    with taskdb.reading() as conn:
+        tasks.task_row(conn, task)
+        return [notes.shown(r, with_hidden=True) for r in conn.execute(
+            "SELECT * FROM notes WHERE task_id = ? ORDER BY id", (task,))]
+
+
+def notes_for_operator(repo: str | None = None) -> list[dict]:
+    """Visible notes an agent marked for the operator, newest first, in one repo or
+    all."""
+    with taskdb.reading() as conn:
+        query = ("SELECT n.* FROM notes n JOIN tasks t ON t.id = n.task_id "
+                 "WHERE n.for_operator = 1 AND n.hidden_at IS NULL")
+        args: list[object] = []
+        if repo is not None:
+            query += " AND t.repo_id = ?"
+            args.append(tasks.repo_id(conn, repo))
+        return [notes.shown(r) for r in conn.execute(query + " ORDER BY n.id DESC", args)]
+
+
+def history(task: int) -> list[dict]:
+    """Every write a task has had, oldest first, with its author and the values
+    written: every body an agent proposed and every note, hidden ones too. The
+    operator's read, which no agent-facing surface may offer."""
+    with taskdb.reading() as conn:
+        tasks.task_row(conn, task)
+        return [{"ts": r["ts"], "author": r["author"], "action": r["action"],
+                 "detail": json.loads(r["detail"])}
+                for r in conn.execute(
+                    "SELECT * FROM history WHERE task_id = ? ORDER BY id", (task,))]
+
+
 # --- repos -----------------------------------------------------------------------
 
 
@@ -135,6 +196,7 @@ def set_remote(name: str, remote: str | None) -> None:
 
 def retire_repo(name: str, retired: bool = True) -> None:
     """A retired repo keeps its tasks and takes no new ones."""
+    tasks.check_flag(retired, "retired")
     with taskdb.writing() as conn:
         tasks.repo_id(conn, name)
         conn.execute("UPDATE repos SET retired_at = ? WHERE name = ?",

@@ -75,6 +75,20 @@ CREATE TABLE IF NOT EXISTS blockers (
     blocker_id  INTEGER NOT NULL REFERENCES tasks(id),
     PRIMARY KEY (task_id, blocker_id)
 );
+CREATE TABLE IF NOT EXISTS notes (
+    -- AUTOINCREMENT, as for tasks: hiding names a note by id.
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id      INTEGER NOT NULL REFERENCES tasks(id),
+    author       TEXT NOT NULL,
+    text         TEXT NOT NULL,
+    for_operator INTEGER NOT NULL,
+    -- The claim move the note came with (`submit`, `send_back`, `release`), if any.
+    move         TEXT,
+    created_at   REAL NOT NULL,
+    -- Set by the operator: the note stays in the record and leaves agents' reads.
+    hidden_at    REAL
+);
+CREATE INDEX IF NOT EXISTS notes_by_task ON notes(task_id, id);
 CREATE TABLE IF NOT EXISTS history (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     ts          REAL NOT NULL,

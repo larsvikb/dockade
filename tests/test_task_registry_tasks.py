@@ -100,6 +100,11 @@ class RepoListTests(_Store):
         op.retire_repo("widgets", retired=False)
         self.propose()
 
+    def test_retiring_takes_true_or_false_only(self):
+        self.assertIn("retired is true or false",
+                      self.refused(op.retire_repo, "widgets", retired="false").reason)
+        self.propose()
+
     def test_the_repo_list_reads_back(self):
         op.retire_repo("gadgets")
         self.assertEqual(reads.repos(), [
@@ -113,7 +118,7 @@ class ProposeTests(_Store):
         got = reads.get_task(task)
         self.assertEqual((got["state"], got["revision"], got["severity"], got["kind"]),
                          ("proposed", 1, "low", "finding"))
-        [entry] = reads.history(task)
+        [entry] = op.history(task)
         self.assertEqual((entry["author"], entry["action"]), (ALICE, "propose"))
         self.assertEqual(entry["detail"]["body"], "What to do.")
 
@@ -133,7 +138,7 @@ class ProposeTests(_Store):
         for who in ("operator", "operator-4f2a91c0"):
             with self.subTest(agent=who):
                 self.refused(agent.edit_proposal, who, "widgets", task, 1, body="X")
-        self.assertEqual([h["author"] for h in reads.history(task)], [ALICE])
+        self.assertEqual([h["author"] for h in op.history(task)], [ALICE])
 
 
 class EditProposalTests(_Store):
@@ -145,7 +150,7 @@ class EditProposalTests(_Store):
         self.assertEqual((refusal.current["revision"], refusal.current["body"]),
                          (2, "Sharper."))
         self.assertEqual(refusal.current, reads.get_task(task))
-        self.assertEqual([h["author"] for h in reads.history(task)], [ALICE, BOB])
+        self.assertEqual([h["author"] for h in op.history(task)], [ALICE, BOB])
 
     def test_an_agent_edits_a_spec_only_while_it_is_proposed(self):
         task = self.propose()
@@ -179,7 +184,7 @@ class OperatorMoveTests(_Store):
         for state in ("open", "landing", "deferred", "closed", "proposed", "open"):
             op.move(task, self.revision(task), state)
             self.assertEqual(reads.get_task(task)["state"], state)
-        self.assertEqual({h["author"] for h in reads.history(task)[1:]},
+        self.assertEqual({h["author"] for h in op.history(task)[1:]},
                          {reg.taskdb.OPERATOR})
         self.refused(op.move, task, self.revision(task), "done")
 
@@ -318,7 +323,7 @@ class ReadTests(_Store):
 
     def test_an_unknown_task_is_refused(self):
         self.refused(reads.get_task, 999)
-        self.refused(reads.history, 999)
+        self.refused(op.history, 999)
         self.refused(op.move, 999, 1, "open")
 
     def test_reads_cross_repos(self):
@@ -341,6 +346,18 @@ class UnstorableTextTests(_Store):
         self.refused(self.propose, repo="widgets" + "\ud800")
         self.refused(reads.list_tasks, "widgets" + "\ud800")
         self.assertEqual(self.revision(task), 1)
+
+
+class BoundsTests(_Store):
+    def test_an_id_beyond_what_sqlite_holds_is_refused(self):
+        for read in (reads.get_task, op.history):
+            with self.subTest(read=read.__name__):
+                self.refused(read, 2**64)
+                self.assertIn("no task", self.refused(read, reg.tasks.ID_MAX).reason)
+
+    def test_padding_counts_toward_a_title(self):
+        self.refused(self.propose, title="x" + " " * reg.tasks.TITLE_MAX)
+        self.propose(title="x" + " " * (reg.tasks.TITLE_MAX - 1))
 
 
 class SchemaTests(_Store):

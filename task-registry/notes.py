@@ -8,7 +8,7 @@ import sqlite3
 import time
 
 import tasks
-from taskdb import Refused
+from taskdb import Missing
 
 NOTE_MAX = 4000
 
@@ -34,7 +34,7 @@ def note_row(conn: sqlite3.Connection, note: int) -> sqlite3.Row:
     tasks.check_id(note, "note")
     row = conn.execute("SELECT * FROM notes WHERE id = ?", (note,)).fetchone()
     if row is None:
-        raise Refused(f"no note {note}")
+        raise Missing(f"no note {note}")
     return row
 
 

@@ -62,7 +62,7 @@ class TakingTests(_Store):
         self.assertEqual((got["holder"], got["branch"], got["footprint"], got["progress"]),
                          (ALICE, "fix-widgets", ["task-registry"], None))
         everything = repr(reads.get_task(task)) + repr(reads.list_tasks("widgets")) + \
-            repr(op.history(task))
+            repr(op.history(task)["history"])
         self.assertNotIn(reply["token"], everything)
         self.assertNotIn(claims._hash(reply["token"]), everything)
 
@@ -127,7 +127,7 @@ class HolderTests(_Store):
         agent.update(ALICE, "widgets", self.task, self.token)
         self.assertEqual(reads.get_task(self.task)["claim"]["progress"], "Investigating")
         self.assertEqual(self.revision(self.task), before)
-        self.assertEqual([h["action"] for h in op.history(self.task)][-2:],
+        self.assertEqual([h["action"] for h in op.history(self.task)["history"]][-2:],
                          ["update", "update"])
 
     def test_submit_send_back_and_release_end_the_claim(self):
@@ -138,7 +138,7 @@ class HolderTests(_Store):
                 move(ALICE, "widgets", task, token, note="Done here.")
                 got = reads.get_task(task)
                 self.assertEqual((got["state"], got["claim"]), (state, None))
-                self.assertEqual(op.history(task)[-1]["detail"]["note"], "Done here.")
+                self.assertEqual(op.history(task)["history"][-1]["detail"]["note"], "Done here.")
                 self.refused(agent.update, ALICE, "widgets", task, token)
         for empty in (None, "  "):
             with self.subTest(note=empty):
@@ -149,7 +149,7 @@ class HolderTests(_Store):
     def test_an_ending_records_the_branch_to_land(self):
         agent.update(ALICE, "widgets", self.task, self.token, branch="fix-widgets-2")
         agent.submit(ALICE, "widgets", self.task, self.token)
-        last = op.history(self.task)[-1]["detail"]
+        last = op.history(self.task)["history"][-1]["detail"]
         self.assertEqual((last["branch"], last["holder"]), ("fix-widgets-2", ALICE))
 
     def test_progress_and_notes_have_bounds(self):
@@ -214,10 +214,10 @@ class ExpiryTests(_Store):
         self.claim(task)
         self.clock += claims.CLAIM_SECONDS + 1
         op.move(task, self.revision(task), "deferred")
-        actions = [(h["author"], h["action"]) for h in op.history(task)]
+        actions = [(h["author"], h["action"]) for h in op.history(task)["history"]]
         self.assertEqual(actions[-2:], [(reg.taskdb.REGISTRY, "lapse"),
                                         (reg.taskdb.OPERATOR, "move")])
-        self.assertIsNone(op.history(task)[-1]["detail"]["ended_claim"])
+        self.assertIsNone(op.history(task)["history"][-1]["detail"]["ended_claim"])
 
     def test_the_next_claim_sweeps_it_and_its_old_holder_learns_who_holds_now(self):
         task = self.open_task()
@@ -225,7 +225,7 @@ class ExpiryTests(_Store):
         before = self.revision(task)
         self.clock += claims.CLAIM_SECONDS + 1
         self.claim(task, who=BOB)
-        lapse = [h for h in op.history(task) if h["action"] == "lapse"]
+        lapse = [h for h in op.history(task)["history"] if h["action"] == "lapse"]
         self.assertEqual([(h["author"], h["detail"]["holder"], h["detail"]["expired_at"])
                           for h in lapse],
                          [(reg.taskdb.REGISTRY, ALICE, START + claims.CLAIM_SECONDS)])
@@ -319,7 +319,7 @@ class OperatorTests(_Store):
         self.refused(op.break_claim, task, 1)
         op.break_claim(task, self.revision(task))
         self.assertIsNone(reads.get_task(task)["claim"])
-        last = op.history(task)[-1]
+        last = op.history(task)["history"][-1]
         self.assertEqual((last["author"], last["action"], last["detail"]["holder"]),
                          (reg.taskdb.OPERATOR, "break_claim", ALICE))
         self.refused(agent.update, ALICE, "widgets", task, token)
@@ -342,7 +342,7 @@ class OperatorTests(_Store):
                 token = self.claim(task)["token"]
                 op.move(task, self.revision(task), state)
                 self.assertIsNone(reads.get_task(task)["claim"])
-                self.assertEqual(op.history(task)[-1]["detail"]["ended_claim"],
+                self.assertEqual(op.history(task)["history"][-1]["detail"]["ended_claim"],
                                  {"holder": ALICE, "branch": "fix-widgets",
                                   "footprint": ["."]})
                 self.refused(agent.update, ALICE, "widgets", task, token)

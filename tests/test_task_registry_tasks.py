@@ -119,7 +119,7 @@ class ProposeTests(_Store):
         got = reads.get_task(task)
         self.assertEqual((got["state"], got["revision"], got["severity"], got["kind"]),
                          ("proposed", 1, "low", "finding"))
-        [entry] = op.history(task)
+        [entry] = op.history(task)["history"]
         self.assertEqual((entry["author"], entry["action"]), (ALICE, "propose"))
         self.assertEqual(entry["detail"]["body"], "What to do.")
 
@@ -139,7 +139,7 @@ class ProposeTests(_Store):
         for who in ("operator", "operator-4f2a91c0"):
             with self.subTest(agent=who):
                 self.refused(agent.edit_proposal, who, "widgets", task, 1, body="X")
-        self.assertEqual([h["author"] for h in op.history(task)], [ALICE])
+        self.assertEqual([h["author"] for h in op.history(task)["history"]], [ALICE])
 
 
 class EditProposalTests(_Store):
@@ -151,7 +151,7 @@ class EditProposalTests(_Store):
         self.assertEqual((refusal.current["revision"], refusal.current["body"]),
                          (2, "Sharper."))
         self.assertEqual(refusal.current, reads.get_task(task))
-        self.assertEqual([h["author"] for h in op.history(task)], [ALICE, BOB])
+        self.assertEqual([h["author"] for h in op.history(task)["history"]], [ALICE, BOB])
 
     def test_an_agent_edits_a_spec_only_while_it_is_proposed(self):
         task = self.propose()
@@ -185,7 +185,7 @@ class OperatorMoveTests(_Store):
         for state in ("open", "landing", "deferred", "closed", "proposed", "open"):
             op.move(task, self.revision(task), state)
             self.assertEqual(reads.get_task(task)["state"], state)
-        self.assertEqual({h["author"] for h in op.history(task)[1:]},
+        self.assertEqual({h["author"] for h in op.history(task)["history"][1:]},
                          {reg.taskdb.OPERATOR})
         self.refused(op.move, task, self.revision(task), "done")
 

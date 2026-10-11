@@ -115,6 +115,15 @@ class Refused(Exception):
         self.current = current
 
 
+class Missing(Refused):
+    """Refused because the task, note or repo it names does not exist."""
+
+
+class Stale(Refused):
+    """Refused because the task changed since the revision the write names; ``current``
+    is the task as it is now."""
+
+
 def init() -> None:
     """Create the store, or open one this code's schema version wrote."""
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)

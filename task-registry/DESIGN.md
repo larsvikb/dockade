@@ -180,6 +180,28 @@ proposing one, and what earlier sessions said about the same problem. That bring
 to sessions on unrelated work, which is why a note being information, never an
 instruction, matters more here. A hidden note does not even match.
 
+## The operator API
+
+**`operator_api` serves `operator_moves` and `reads` as JSON, and its one caller must be
+the control-plane UI,** which renders agent text behind the escaping and framing guards
+it already has; the API serves no HTML, and nothing an agent calls. It takes no token:
+as with the UI's relay to the control plane, being on its network is the permission, so
+whatever serves it must bind it where no agent and no MCP server has a leg.
+
+**A body is checked for shape before the store's checks run** (`operator_api.Body`), as
+the agent listener's calls are: an unknown field is refused, and ids, revisions and
+flags are taken strictly, so `true` is no id here either. Every bound stays the store's.
+
+**A refusal says what kind it is** (`taskdb.Missing`, `taskdb.Stale`; the statuses are
+in `task-registry/operator_api.py`), so a page tells "changed since you read it" from
+any other refusal without parsing a reason, and redraws from the task the answer
+carries rather than reading again.
+
+**The operator's reads come a page at a time with the total** (the flagged notes, a
+task's notes, its history), and a bulk hide or handle names its notes rather than
+matching a filter: a flood is cleared by what a page showed, so a note that arrives
+meanwhile is not swept up unseen. All of a bulk lands, or none of it.
+
 ## Every write leaves a history row
 
 `taskdb.record` writes the author, the action and the values written, in the write's

@@ -79,6 +79,16 @@ def _route_recorder(method: str):
     return route
 
 
+def _record_exception_handler(self, exc_class):
+    """A stub ``exception_handler`` that keeps what it registered in
+    ``exception_handlers``, the attribute FastAPI keeps it in, so a test asserts which
+    handler an app answers an exception with."""
+    def register(fn):
+        self.__dict__.setdefault("exception_handlers", {})[exc_class] = fn
+        return fn
+    return register
+
+
 def _include_router(self, router, *_args, **_kwargs) -> None:
     """Copy a router's recorded routes into the app, so the app's ``routes`` is what
     that listener serves. FastAPI 0.141 resolves an included router lazily instead;
@@ -146,6 +156,7 @@ def _install_fastapi_stub() -> None:
         fa.APIRouter = APIRouter
     _install_recording_routes(fa.FastAPI)
     _install_recording_routes(fa.APIRouter)
+    fa.FastAPI.exception_handler = _record_exception_handler
 
     responses = sys.modules.get("fastapi.responses")
     if responses is None:
@@ -189,6 +200,38 @@ def _install_fastapi_stub() -> None:
     fa.concurrency = concurrency
     sys.modules["fastapi.concurrency"] = concurrency
 
+    # The task registry's operator API answers FastAPI's validation failures itself;
+    # the handler is tested by calling it with one of these.
+    exceptions = sys.modules.get("fastapi.exceptions")
+    if exceptions is None:
+        exceptions = types.ModuleType("fastapi.exceptions")
+    if not hasattr(exceptions, "RequestValidationError"):
+        class RequestValidationError(Exception):
+            def __init__(self, errors=()):
+                super().__init__(errors)
+                self._errors = list(errors)
+
+            def errors(self):
+                return self._errors
+        exceptions.RequestValidationError = RequestValidationError
+    fa.exceptions = exceptions
+    sys.modules["fastapi.exceptions"] = exceptions
+
+    # And Starlette's own, raised for what it turns away before a route runs (an
+    # unknown path, a body it cannot parse), which that API answers in its shape too.
+    starlette = sys.modules.setdefault("starlette", types.ModuleType("starlette"))
+    starlette_exceptions = sys.modules.get("starlette.exceptions")
+    if starlette_exceptions is None:
+        starlette_exceptions = types.ModuleType("starlette.exceptions")
+    if not hasattr(starlette_exceptions, "HTTPException"):
+        class HTTPException(Exception):
+            def __init__(self, status_code, detail=None, headers=None):
+                super().__init__(status_code, detail)
+                self.status_code, self.detail, self.headers = status_code, detail, headers
+        starlette_exceptions.HTTPException = HTTPException
+    starlette.exceptions = starlette_exceptions
+    sys.modules["starlette.exceptions"] = starlette_exceptions
+
     class BaseModel:
         """Enough of pydantic for the control plane's request/response models to
         be constructed directly in tests: apply class-declared field defaults
@@ -210,6 +253,11 @@ def _install_fastapi_stub() -> None:
         sys.modules["pydantic"] = pydantic
     if not hasattr(pydantic, "BaseModel"):
         pydantic.BaseModel = BaseModel
+    # Names a model's annotations use; the stub validates nothing, so the plain types
+    # stand in for the strict ones, and a config is the dict it is in pydantic.
+    for name, stand_in in (("StrictInt", int), ("StrictBool", bool), ("ConfigDict", dict)):
+        if not hasattr(pydantic, name):
+            setattr(pydantic, name, stand_in)
 
 
 def _load(name: str, relpath: str) -> types.ModuleType:
@@ -387,3 +435,11 @@ def load_task_registry_agent_api() -> types.SimpleNamespace:
     reg.agent_tools = importlib.import_module("agent_tools")
     reg.agent_api = importlib.import_module("agent_api")
     return reg
+
+
+def load_operator_api() -> types.ModuleType:
+    """The task registry's operator API, over the shared fastapi stub, whose route
+    recorder lets a test pin exactly what the app serves."""
+    _install_fastapi_stub()
+    load_task_registry()
+    return importlib.import_module("operator_api")

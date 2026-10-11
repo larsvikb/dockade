@@ -329,6 +329,8 @@ dockade/
     operator_moves.py       #   what only the operator may do or see: any edit, any move,
                             #   break a claim, hide or handle a note, the repo list;
                             #   the history
+    operator_api.py         #   the operator API: those moves and the reads as JSON over
+                            #   HTTP, for the UI to relay to
     DESIGN.md               #   who writes what, and why
   policies/                 # seed policy config (loaded into the control plane)
     egress-allowlist.txt    #   default-deny seed for the control plane's egress policy store

@@ -12,7 +12,7 @@ import sqlite3
 import time
 
 import taskdb
-from taskdb import Refused
+from taskdb import Missing, Refused, Stale
 
 STATES = ("proposed", "open", "landing", "deferred", "closed")
 SEVERITIES = ("high", "medium", "low")
@@ -42,6 +42,14 @@ def check_fields(title: object = None, body: object = None, severity: object = N
         raise Refused(f"severity is one of {', '.join(SEVERITIES)}")
     if kind is not None and kind not in KINDS:
         raise Refused(f"kind is one of {', '.join(KINDS)}")
+
+
+def check_new(title: object, body: object, severity: object, kind: object) -> None:
+    """``check_fields`` for a task being created: there a title or body of ``None`` is
+    missing, not "not given"."""
+    if title is None or body is None:
+        raise Refused("a new task has a title and a body")
+    check_fields(title, body, severity, kind)
 
 
 def check_text(text: object, limit: int, what: str, *, required: bool = False) -> None:
@@ -85,7 +93,7 @@ def repo_id(conn: sqlite3.Connection, name: object, *, for_new_task: bool = Fals
     row = None if not (isinstance(name, str) and taskdb.storable(name)) else conn.execute(
         "SELECT id, retired_at FROM repos WHERE name = ?", (name,)).fetchone()
     if row is None:
-        raise Refused(f"no repo {name!r} in the registry", {"repos": active_repos(conn)})
+        raise Missing(f"no repo {name!r} in the registry", {"repos": active_repos(conn)})
     if for_new_task and row["retired_at"] is not None:
         raise Refused(f"repo {name!r} is retired", {"repos": active_repos(conn)})
     return row["id"]
@@ -104,7 +112,7 @@ def task_row(conn: sqlite3.Connection, task: int) -> sqlite3.Row:
         "SELECT t.*, r.name AS repo FROM tasks t JOIN repos r ON r.id = t.repo_id "
         "WHERE t.id = ?", (task,)).fetchone()
     if row is None:
-        raise Refused(f"no task {task}")
+        raise Missing(f"no task {task}")
     return row
 
 
@@ -121,7 +129,7 @@ def check_revision(conn: sqlite3.Connection, row: sqlite3.Row, revision: int) ->
         raise Refused(f"{revision!r} is not a revision")
     if row["revision"] != revision:
         import reads  # here, not at the top: reads imports this module
-        raise Refused(
+        raise Stale(
             f"task {row['id']} is at revision {row['revision']}, not {revision}: it "
             f"changed since it was read", reads.detail(conn, row))
 

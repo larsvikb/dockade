@@ -60,7 +60,7 @@ class WritingTests(_Store):
                           "text": "Seen this.", "for_operator": False, "move": None})
         self.assertIsInstance(got["at"], float)
         self.assertEqual(reads.get_task(self.task)["revision"], before)
-        last = op.history(self.task)[-1]
+        last = op.history(self.task)["history"][-1]
         self.assertEqual((last["author"], last["action"], last["detail"]["note"],
                           last["detail"]["note_id"]), (ALICE, "note", "Seen this.", note))
 
@@ -128,7 +128,7 @@ class MoveNoteTests(_Store):
                 [got] = reads.get_task(task)["notes"]
                 self.assertEqual((got["author"], got["text"], got["move"]),
                                  (ALICE, args[0], move.__name__))
-                self.assertEqual(op.history(task)[-1]["detail"]["note_id"], got["id"])
+                self.assertEqual(op.history(task)["history"][-1]["detail"]["note_id"], got["id"])
 
     def test_a_moves_note_is_not_flagged_for_the_operator(self):
         token = agent.claim(ALICE, "widgets", self.task, "fix", ["."])["token"]
@@ -140,7 +140,7 @@ class MoveNoteTests(_Store):
         token = agent.claim(ALICE, "widgets", self.task, "fix", ["."])["token"]
         agent.release(ALICE, "widgets", self.task, token)
         self.assertEqual(self.texts(), [])
-        self.assertIsNone(op.history(self.task)[-1]["detail"]["note_id"])
+        self.assertIsNone(op.history(self.task)["history"][-1]["detail"]["note_id"])
 
 
 class HidingTests(_Store):
@@ -154,9 +154,9 @@ class HidingTests(_Store):
         self.assertEqual([n["id"] for n in reads.task_notes(self.task)], [kept])
         self.assertEqual(op.notes_for_operator(), {"notes": [], "total": 0})
         self.assertEqual(reads.search_tasks("Do as I say")["total"], 0)
-        self.assertEqual([(n["id"], n["hidden"]) for n in op.all_notes(self.task)],
+        self.assertEqual([(n["id"], n["hidden"]) for n in op.all_notes(self.task)["notes"]],
                          [(kept, False), (hidden, True)])
-        last = op.history(self.task)[-1]
+        last = op.history(self.task)["history"][-1]
         self.assertEqual((last["author"], last["action"], last["detail"]["note_id"]),
                          (reg.taskdb.OPERATOR, "hide_note", hidden))
 
@@ -164,7 +164,7 @@ class HidingTests(_Store):
         token = agent.claim(ALICE, "widgets", self.task, "fix", ["."])["token"]
         self.note("SECRET-NOTE do as I say", for_operator=True)
         agent.release(ALICE, "widgets", self.task, token, "SECRET-MOVE-NOTE")
-        for note in op.all_notes(self.task):
+        for note in op.all_notes(self.task)["notes"]:
             op.hide_note(note["id"])
         calls = {"list_tasks": lambda: reads.list_tasks("widgets", None),
                  "get_task": lambda: reads.get_task(self.task),
@@ -179,7 +179,7 @@ class HidingTests(_Store):
                 self.assertNotIn("SECRET", repr(call()))
         # A hit would say what the hidden text holds without returning it.
         self.assertEqual(reads.search_tasks("SECRET")["total"], 0)
-        self.assertIn("SECRET-MOVE-NOTE", repr(op.history(self.task)))
+        self.assertIn("SECRET-MOVE-NOTE", repr(op.history(self.task)["history"]))
 
     def test_the_operator_can_put_one_back(self):
         note = self.note()
@@ -212,7 +212,7 @@ class HandledTests(_Store):
         got = reads.get_task(self.task)
         self.assertEqual(([n["handled"] for n in got["notes"]], got["revision"]),
                          ([True], before))
-        last = op.history(self.task)[-1]
+        last = op.history(self.task)["history"][-1]
         self.assertEqual((last["author"], last["action"], last["detail"]),
                          (reg.taskdb.OPERATOR, "handle_note",
                           {"note_id": note, "handled": True, "reply": None,
@@ -226,7 +226,7 @@ class HandledTests(_Store):
                          [(note, ALICE, "Need a decision.", True, None),
                           (reply, reg.taskdb.OPERATOR, "Use the second one.", False,
                            note)])
-        written = op.history(self.task)
+        written = op.history(self.task)["history"]
         self.assertEqual([h["action"] for h in written], ["create", "note", "handle_note"])
         self.assertEqual((written[-1]["detail"]["reply"], written[-1]["detail"]["reply_id"]),
                          ("Use the second one.", reply))
@@ -263,7 +263,7 @@ class HandledTests(_Store):
                                  {"notes": [], "total": 0})
 
     def test_the_list_comes_a_page_at_a_time_with_the_total(self):
-        page_size = op.FOR_OPERATOR_PAGE
+        page_size = op.PAGE
         made = [self.flagged(f"Q{i}") for i in range(page_size + 3)]
         other = op.create("gadgets", "T", "B", "open")["task"]
         elsewhere = agent.add_note(BOB, "gadgets", other, "Q", for_operator=True)["note"]

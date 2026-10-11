@@ -315,6 +315,12 @@ dockade/
     outcomes.py             #   how each call ended — the gateway's own audit stream
     DESIGN.md               #   what the agent is shown, and what runs
     requirements.txt        #   pinned deps, held equal to the control plane's
+  task-registry/            # TASK REGISTRY — the work list agent sessions and the operator share
+    taskdb.py               #   SQLite — schema, the write transaction, the history every write leaves
+    tasks.py                #   fields, states, parent and blockers; the reads
+    agent_moves.py          #   what an agent may do: propose, edit a proposal
+    operator_moves.py       #   what only the operator may do: any edit, any move, the repo list
+    DESIGN.md               #   who writes what, and why
   policies/                 # seed policy config (loaded into the control plane)
     egress-allowlist.txt    #   default-deny seed for the control plane's egress policy store
   proxies/                  # governed data-plane services (one dir per proxy)

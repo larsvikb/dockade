@@ -364,3 +364,15 @@ def load_tool_gateway(env: dict[str, str] | None = None) -> types.ModuleType:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = was
+
+
+def load_task_registry() -> types.SimpleNamespace:
+    """The task registry's store modules, imported by plain name as they import each
+    other. The store is wherever ``taskdb.DB_PATH`` points when a call runs, so a test
+    rebinds it and calls ``taskdb.init()`` for a store of its own."""
+    pkg_dir = str(ROOT / "task-registry")
+    if pkg_dir not in sys.path:
+        sys.path.insert(0, pkg_dir)
+    return types.SimpleNamespace(**{
+        name: importlib.import_module(name)
+        for name in ("taskdb", "tasks", "agent_moves", "operator_moves")})

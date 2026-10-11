@@ -169,6 +169,16 @@ disclaimer writes `skipDangerousModePermissionPrompt: true` into user settings
 startup, so it no longer persists the acceptance — a template that set only the old
 flag would re-prompt on every launch.
 
+## Claude Code puts its session id in every Bash call's environment
+
+Measured on Claude Code 2.1.296: `CLAUDE_CODE_SESSION_ID` holds the session's UUID, and
+the session's transcript is named by it, `<id>.jsonl` beside a directory `<id>/` under
+`$CLAUDE_CONFIG_DIR/projects/<workspace slug>/`. A subagent's Bash call sees the same
+value and the same `CLAUDE_PID`, and the subagent's transcript sits under the parent's
+`<id>/subagents/`, so a session and the subagents it starts share one id. Not measured:
+whether `claude --resume` keeps the id; a `--fork-session` flag exists to get a new one
+on resume, which suggests a plain resume does not.
+
 ## An MCP server can be declared four ways, and `settings.json` is not one of them
 
 Measured in-container on Claude Code 2.1.234, because the channel that looks most

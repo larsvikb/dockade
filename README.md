@@ -324,7 +324,8 @@ dockade/
     agent_moves.py          #   what an agent may do: propose, edit a proposal, work a
                             #   claim, add a note
     operator_moves.py       #   what only the operator may do or see: any edit, any move,
-                            #   break a claim, hide a note, the repo list; the history
+                            #   break a claim, hide or handle a note, the repo list;
+                            #   the history
     DESIGN.md               #   who writes what, and why
   policies/                 # seed policy config (loaded into the control plane)
     egress-allowlist.txt    #   default-deny seed for the control plane's egress policy store

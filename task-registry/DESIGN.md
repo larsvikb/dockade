@@ -158,11 +158,26 @@ message, not a move on a claim. No agent move edits or deletes a note, its own
 included. The note a claim move carries (submit, send back, release) is posted as a
 note too, marked with its move, so the next reader of the task sees it.
 
-**One flag, *for the operator*,** marks a note that needs the operator, in place of
-asking in chat; `operator_moves.notes_for_operator` lists them. A note does not move the
-task's revision: it is not the spec, and the operator's page would otherwise go stale
-with every note. A note's length is capped (`notes.NOTE_MAX`), a read of a task carries
-its latest few (`notes.IN_READ`) and the total, and `reads.task_notes` pages back.
+**One flag, *for the operator*,** marks a note that needs the operator, and nobody
+waits on it. An agent that cannot go on without an answer sends the task back to
+`proposed` or releases it, and takes other work: nothing in the registry holds an agent,
+so the operator works through it at their own pace. The store cannot make an agent do
+that; the tool descriptions must say it. `operator_moves.notes_for_operator` lists the
+flagged notes not yet handled, a page at a time with the total. The operator marks one
+handled, posting a reply in the same write if there is one, which names the note it
+answers; agents see both, so the next session knows the note was seen to and which reply
+is its answer, and unlike hiding, marking it takes the note from no one.
+
+A note does not move the task's revision: it is not the spec, and the operator's page
+would otherwise go stale with every note. A note's length is capped (`notes.NOTE_MAX`), a
+read of a task carries its latest few (`notes.IN_READ`) and the total, and
+`reads.task_notes` pages back.
+
+**Search carries a note past its task.** `reads.search_tasks` matches titles, bodies and
+visible notes in every state and repo, so an agent finds an existing task before
+proposing one, and what earlier sessions said about the same problem. That brings a note
+to sessions on unrelated work, which is why a note being information, never an
+instruction, matters more here. A hidden note does not even match.
 
 ## Every write leaves a history row
 

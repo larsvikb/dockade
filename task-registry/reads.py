@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """What any surface may read, agents' included: a repo's tasks, one task in full with its
-latest notes, older notes page by page, and the repo list. Nothing here writes, and
-nothing here returns what the operator alone may see: a hidden note, or the history,
-which keeps every text a task ever had."""
+latest notes, older notes page by page, a search, and the repo list. Nothing here
+writes, and nothing here returns what the operator alone may see: a hidden note, or the
+history, which keeps every text a task ever had."""
 from __future__ import annotations
 
 import json
@@ -12,6 +12,14 @@ import claims
 import notes
 import taskdb
 import tasks
+
+#: How many tasks a search returns, beside the total.
+SEARCH_MAX = 50
+SEARCH_TEXT_MAX = 200
+
+# A note matches a search only if agents may read it: a hit alone would say what a
+# hidden note holds.
+_NOTE_HIT = "n.hidden_at IS NULL AND instr(casefold(n.text), :text)"
 
 
 def list_tasks(repo: str, state: str | None = "open", holder: str | None = None,
@@ -42,6 +50,34 @@ def list_tasks(repo: str, state: str | None = "open", holder: str | None = None,
 def get_task(task: int) -> dict:
     with taskdb.reading() as conn:
         return detail(conn, tasks.task_row(conn, task))
+
+
+def search_tasks(text: str, repo: str | None = None) -> dict:
+    """Tasks whose title, body or a visible note holds ``text``, as written but for
+    case, in one repo or all; newest first, up to ``SEARCH_MAX``, with the total. Each
+    names the latest of its notes that matched, as many as a read of a task carries,
+    with their total."""
+    tasks.check_text(text, SEARCH_TEXT_MAX, "a search", required=True)
+    with taskdb.reading() as conn:
+        conn.create_function("casefold", 1, str.casefold)
+        query = ("SELECT t.*, r.name AS repo FROM tasks t JOIN repos r ON r.id = t.repo_id "  # noqa: S608
+                 "WHERE (instr(casefold(t.title), :text) OR instr(casefold(t.body), :text) "
+                 f"OR EXISTS (SELECT 1 FROM notes n WHERE n.task_id = t.id AND {_NOTE_HIT}))")
+        args: dict[str, object] = {"text": text.casefold()}
+        if repo is not None:
+            query += " AND t.repo_id = :repo"
+            args["repo"] = tasks.repo_id(conn, repo)
+        found = conn.execute(query + " ORDER BY t.id DESC", args).fetchall()
+        return {"tasks": [_hit(conn, row, args["text"]) for row in found[:SEARCH_MAX]],
+                "total": len(found)}
+
+
+def _hit(conn: sqlite3.Connection, row: sqlite3.Row, text: str) -> dict:
+    matched = [n["id"] for n in conn.execute(
+        f"SELECT n.id FROM notes n WHERE n.task_id = :task AND {_NOTE_HIT} ORDER BY n.id",  # noqa: S608
+        {"task": row["id"], "text": text})]
+    return _summary(conn, row) | {"matched_notes": matched[-notes.IN_READ:],
+                                  "matched_notes_total": len(matched)}
 
 
 def repos() -> list[dict]:

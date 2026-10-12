@@ -12,8 +12,9 @@
 import { refreshAudit } from "./audit.js";
 import { esc } from "./dom.js";
 import { COUNTDOWN_URGENT_S } from "./holds.js";
+import { renderListStatus } from "./list-status.js";
 import { shortActor } from "./provenance.js";
-import { leasesStatus, renderListStatus } from "./status.js";
+import { leasesStatus } from "./status.js";
 import { durationWords } from "./time.js";
 
 // A lease is the middle rung of the resolve ladder — this request, this host for a
@@ -154,7 +155,7 @@ export function groupLeases(rows) {
 // import this file with no DOM.
 let leasesEl, leasesTableEl, leasesEmptyEl, leasesCountEl;
 // Whether a load has ever succeeded, and whether the last one failed (`pollStatus`
-// in status.js says what each pair means on screen). Kept apart from the rules
+// in list-status.js says what each pair means on screen). Kept apart from the rules
 // poll's pair: the two views are filled by two fetches, and one of them failing
 // while the other succeeds is a state the page has to be able to describe.
 let leasesLoaded = false;

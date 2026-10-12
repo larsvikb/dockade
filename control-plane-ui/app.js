@@ -22,6 +22,7 @@ import { mountAudit, refreshAudit } from "./audit.js";
 import { esc } from "./dom.js";
 import { revokePreview, createPreview, editPreview } from "./egress-rules.js";
 import { leaseLabel, mountLeases, refreshLeases, updateLeaseCountdowns } from "./leases.js";
+import { renderListStatus } from "./list-status.js";
 import {
   pinText,
   mountMcp, refreshServers, refreshToolRules, refreshInventory, refreshToolPins,
@@ -36,7 +37,7 @@ import {
 import { payloadDisclosure, payloadHazards, payloadTokens, renderPayload }
   from "./payload.js";
 import { saturationState, ackCount } from "./saturation.js";
-import { rulesStatus, renderListStatus } from "./status.js";
+import { rulesStatus } from "./status.js";
 import {
   mountTasks, probeRegistry, refreshTasks, refreshFlagged, registryIsRunning,
   TASKS_POLL_MS,
@@ -1138,7 +1139,7 @@ function start() {
 
   // ── the rules table ───────────────────────────────────────────────────────
   // Whether a load has ever succeeded, and whether the last one failed (`pollStatus`
-  // in status.js says what each pair means on screen).
+  // in list-status.js says what each pair means on screen).
   let rulesLoaded = false;
   let rulesFailed = false;
   let rulesById = new Map();

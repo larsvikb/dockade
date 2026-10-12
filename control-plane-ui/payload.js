@@ -7,6 +7,7 @@
  * handed — so the unit tests can import this file under node
  * (tests/test_control_plane_ui_js.py).
  */
+import { escapePayload, NON_ASCII_RE } from "./escape.js";
 
 // The summary line above a tool ask's arguments. The payload always starts open: the
 // box's max-height (`.payload pre` in index.html) is what keeps a long one from
@@ -147,32 +148,15 @@ const INVISIBLE_RE = /[\p{Cf}\p{Cc}\p{Zl}\p{Zp}]/gu;
 // bug that would show up as a tally spelling half its overrides out and half of them
 // not.
 const INVISIBLE_ONE = /[\p{Cf}\p{Cc}\p{Zl}\p{Zp}]/u;
-// Everything outside printable ASCII, the invisible set included. Counted rather than
-// classified: U+0430 CYRILLIC SMALL LETTER A in an `owner` field is indistinguishable
-// from the Latin one on screen, and no confusables table is needed to say "this is not
-// the plain text it looks like".
-const NON_ASCII_RE = /[^\x20-\x7E]/gu;
+// NON_ASCII_RE (escape.js) is everything outside printable ASCII, the invisible set
+// included, which `payloadHazards` relies on when it counts the one apart from the
+// other. Counted rather than classified: U+0430 CYRILLIC SMALL LETTER A in an `owner`
+// field is indistinguishable from the Latin one on screen, and no confusables table is
+// needed to say "this is not the plain text it looks like".
 // How many DISTINCT characters the note names before it summarises the rest. Real
 // payloads carry one or two kinds of dash, not twenty, so this is about keeping a
 // pathological payload from writing an essay into the card.
 const HAZARD_TALLY_MAX = 4;
-
-// JSON's own escaping applied to a string that already IS JSON: every code point
-// outside printable ASCII becomes `\uXXXX`, astral ones as the surrogate pair JSON
-// would write. Lossless and byte-for-byte reversible — this is the form
-// `json.dumps(ensure_ascii=True)` would have produced — so showing it is the opposite
-// of the unescaping the payload rule forbids. Nothing is dropped, summarized or
-// reordered; what changes is that an override is spelled out where it sits instead
-// of acting on the text around it.
-export function escapePayload(text) {
-  return text.replace(NON_ASCII_RE, (ch) => {
-    const code = ch.codePointAt(0);
-    if (code <= 0xFFFF) return "\\u" + code.toString(16).padStart(4, "0");
-    const hi = 0xD800 + ((code - 0x10000) >> 10);
-    const lo = 0xDC00 + ((code - 0x10000) & 0x3FF);
-    return "\\u" + hi.toString(16) + "\\u" + lo.toString(16);
-  });
-}
 
 // WHICH characters, not just how many. An operator who has to untick the box and hunt
 // for what the note means is being asked to do the thing the note exists to save them

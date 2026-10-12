@@ -8,7 +8,7 @@
  * No DOM at import, so the unit tests import this file under node
  * (tests/test_control_plane_ui_js.py).
  */
-import { escapePayload } from "./payload.js";
+import { escapePayload } from "./escape.js";
 import { durationWords, fmtStamp } from "./time.js";
 
 // What changed between the pending list on screen and the one just pushed, keyed by

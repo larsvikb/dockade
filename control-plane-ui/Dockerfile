@@ -27,8 +27,10 @@ COPY control-plane-ui/app.js ./app.js
 COPY control-plane-ui/audit.js ./audit.js
 COPY control-plane-ui/dom.js ./dom.js
 COPY control-plane-ui/egress-rules.js ./egress-rules.js
+COPY ui-common/escape.js ./escape.js
 COPY control-plane-ui/holds.js ./holds.js
 COPY control-plane-ui/leases.js ./leases.js
+COPY ui-common/list-status.js ./list-status.js
 COPY control-plane-ui/mcp.js ./mcp.js
 COPY control-plane-ui/payload.js ./payload.js
 COPY control-plane-ui/provenance.js ./provenance.js

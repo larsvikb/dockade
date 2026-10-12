@@ -185,6 +185,8 @@ REFFILES := $(SCRIPTS) \
             control-plane-ui/saturation.js \
             control-plane-ui/status.js \
             control-plane-ui/tasks.js \
+            ui-common/escape.js \
+            ui-common/list-status.js \
             ui-common/time.js \
             task-registry/serve.py \
             task-registry/taskdb.py \

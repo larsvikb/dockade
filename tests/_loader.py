@@ -169,7 +169,7 @@ def _install_fastapi_stub() -> None:
         control-plane-ui tests, which share whichever fastapi stub loads first).
 
         ``headers`` is a plain dict standing in for Starlette's ``MutableHeaders``:
-        the UI's ``_security_headers`` middleware writes the CSP onto whatever
+        the UIs' ``security_headers`` middleware writes the CSP onto whatever
         response it wraps, refusals included, so a response object without it is not
         enough of a response to test that path."""
 

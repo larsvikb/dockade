@@ -20,42 +20,21 @@ and a governance decision never depends on it (the egress proxy talks to the
 backend directly).
 
 It serves one address, its `control-ui-net` one, which the loopback publish reaches,
-and `check_bind` refuses to start on any other. A wildcard would serve the relay on
-every leg, and a leg on a network whose other members parse agent text is a route
-from them to the management API.
+and `guards.check_bind` refuses to start on any other. A wildcard would serve the
+relay on every leg, and a leg on a network whose other members parse agent text is a
+route from them to the management API.
 
 BUT it is not indifferent to WHO is calling, because it publishes the one API that
 can grant egress: `POST /approvals/{id}/resolve` is self-approval if reached. It
-therefore enforces four cheap, structural guards (`_guard` below, plus the relay
-allowlist):
+therefore enforces four cheap, structural guards: the three every UI here installs
+from `guards.py` (a Host allowlist against DNS rebinding, the refusal of a
+cross-origin state change against CSRF, the refusal to be embedded against
+clickjacking; each is explained there), plus the relay allowlist:
 
-  1. **Host allowlist** — closes DNS REBINDING, which is the vector that actually
-     matters here. Binding to host loopback is no defense against it: a page the
-     operator visits can make its own name resolve to 127.0.0.1, at which point it
-     is SAME-ORIGIN with this app — no preflight, and responses are readable, so it
-     can list pending approvals (getting the unguessable ids) and resolve them.
-     Rebinding structurally requires `Host: <attacker domain>`, and `Host` is a
-     forbidden header that JS cannot set, so refusing unexpected Hosts removes the
-     class rather than raising its cost.
-  2. **Cross-origin state change refused** — closes CSRF, and it is load-bearing
-     rather than belt-and-braces. A JSON body does NOT force a preflight: a `Blob`
-     with no type is sent with no `Content-Type`, which is CORS-safelisted, and
-     FastAPI parses an untyped body as JSON. Nor is the `resolve` id blind for a
-     tool ask — the agent is handed it in the pending result. So the relationship
-     has to be checked: `Sec-Fetch-Site` when the browser sends it, else `Origin`
-     compared as a full authority (host AND port) against the request's own Host,
-     because a page on another localhost port is another origin.
-  3. **Relay path allowlist** — the backend surface is NOT all equally suitable for
+  4. **Relay path allowlist** — the backend surface is NOT all equally suitable for
      a browser. `POST /authorize` is the proxy's decision endpoint; reaching it from
      a page means forged audit rows and consumed hold slots. Only the paths this UI
      actually uses are relayed.
-  4. **Refusal to be EMBEDDED** (`frame-ancestors 'none'` in the CSP, plus a
-     `Sec-Fetch-Dest` check) — closes CLICKJACKING, which guards 1 and 2 cannot see.
-     An attacker page that frames this UI sends a perfectly legitimate
-     `Host: 127.0.0.1`, and the framed document's own `resolve` POST is *same-origin
-     from inside the frame*, so both guards pass; cross-origin reads stay blocked, but
-     a UI-redress click needs no read — it lands on the real "Allow + persist rule"
-     button. See `_CSP` / `_FRAMED_DESTS`.
 
 What these guards CANNOT do, stated plainly so the boundary is not overclaimed:
 they are BROWSER-ENFORCED. A process running on the host sets any header it likes,
@@ -69,11 +48,10 @@ the backend records on the approval row and in the audit reason (`_actor` there)
 """
 from __future__ import annotations
 
-import ipaddress
 import os
 import re
-from urllib.parse import urlsplit
 
+import guards
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import (
@@ -85,6 +63,8 @@ from fastapi.responses import (
 )
 from starlette.background import BackgroundTask
 
+#: The name every refusal and startup failure here carries.
+NAME = "control-plane-ui"
 BACKEND = os.environ.get(
     "CONTROL_BACKEND_URL", "http://control-plane:8090").rstrip("/")
 #: The task registry's operator listener, which this UI relays the Tasks tab to. By its
@@ -100,14 +80,14 @@ PORT = int(os.environ.get("CONTROL_UI_PORT", "8090"))
 UI_NET = os.environ.get("CONTROL_UI_NET", "172.25.0.0/24")
 UI_INDEX = os.environ.get("CONTROL_UI_INDEX", "/opt/control-plane-ui/index.html")
 # The page's behaviour, served as separate files rather than inline in the HTML.
-# That is what lets the CSP below say `script-src 'self'` instead of
-# `'unsafe-inline'` — an inline-script allowance makes the whole policy decorative
-# against injection — and it is what makes the frontend's decision logic testable
-# (tests/test_control_plane_ui_js.py).
+# That is what lets the CSP (`CSP` in ui-common/guards.py) say `script-src 'self'`
+# instead of `'unsafe-inline'` — an inline-script allowance makes the whole policy
+# decorative against injection — and it is what makes the frontend's decision logic
+# testable (tests/test_control_plane_ui_js.py).
 #
 # ES modules, one per surface, and this list is the whole of what the script route
-# hands out. A test holds it equal to the files in the directory and to what the
-# modules import from each other.
+# hands out. A test holds it equal to the files the image copies in, from this
+# directory and ui-common/, and to what the modules import from each other.
 UI_DIR = os.environ.get("CONTROL_UI_DIR", "/opt/control-plane-ui")
 UI_MODULES = frozenset({"app.js", "audit.js", "dom.js", "egress-rules.js", "holds.js",
                         "leases.js", "mcp.js", "payload.js", "provenance.js",
@@ -119,30 +99,13 @@ UI_MODULES = frozenset({"app.js", "audit.js", "dom.js", "egress-rules.js", "hold
 _UI_MODULE_PATHS = {name: os.path.join(UI_DIR, name) for name in UI_MODULES}
 
 
-def _hostnames(env: str, default: str) -> frozenset[str]:
-    return frozenset(h.strip().lower() for h in os.environ.get(env, default).split(",")
-                     if h.strip())
-
-
-# Hostnames this app may be addressed as. Compared WITHOUT the port on purpose:
-# rebinding needs the attacker's own NAME, so the port is irrelevant to the guard,
-# and ignoring it keeps the list valid whatever port the host publishes
-# (DOCKADE_UI_PORT, so pinning one would be wrong twice over). The in-container
-# healthcheck dials CONTROL_UI_BIND and names 127.0.0.1 as its Host.
-#
-# Widen this only for a deployment that legitimately fronts the UI under another
-# name (a reverse proxy, or access from another machine) — and understand that
-# doing so re-opens rebinding for that name unless the front end authenticates.
-# The request must still arrive from control-ui-net (OnlyFrom), as Docker's userland
-# proxy delivers a published port's connections.
-ALLOWED_HOSTNAMES = _hostnames("CONTROL_UI_ALLOWED_HOSTS",
-                               "127.0.0.1,localhost,::1")
-
-# Methods that CHANGE STATE, so cross-origin callers must be refused. GET is left
-# to the Host guard alone: a cross-origin GET's response is unreadable without CORS
-# headers (which this app never sends), and the readable case IS rebinding, which
-# guard 1 already blocks.
-_UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+# Hostnames this app may be addressed as, without the port (`allowed_hostnames` says
+# why, and what widening the list costs): valid whatever DOCKADE_UI_PORT publishes. The
+# in-container healthcheck dials CONTROL_UI_BIND and names 127.0.0.1 as its Host. A
+# request must still arrive from control-ui-net (OnlyFrom), as Docker's userland proxy
+# delivers a published port's connections.
+ALLOWED_HOSTNAMES = guards.allowed_hostnames("CONTROL_UI_ALLOWED_HOSTS",
+                                             "127.0.0.1,localhost,::1")
 
 # Exactly the backend paths this UI needs, as (method, pattern). Everything else —
 # above all `POST /authorize` — is refused rather than relayed. The approval id is
@@ -302,53 +265,11 @@ _STRIP_REQ = _SPOOFABLE | _HOP_BY_HOP | _STRIP_FRAMING
 # which is a request header and would be meaningless here.
 _STRIP_RESP = _HOP_BY_HOP | {"content-length"}
 
-# Fetch destinations that mean "this response is being EMBEDDED in another page".
-# Refused because neither guard above can see the difference: an attacker page that
-# frames the UI's loopback origin causes a request with a legitimate `Host: 127.0.0.1`
-# (guard 1 passes) using GET, which is deliberately allowed cross-origin (guard 2
-# does not apply) — and the framed page's own resolve POST then reads as
-# `Sec-Fetch-Site: same-origin`, because from inside the frame it is. The attacker
-# cannot READ the framed UI, but clickjacking does not need a read: overlay a decoy,
-# and the operator's click lands on the real "Allow + persist rule" button.
-#
-# `frame-ancestors 'none'` in _CSP is the primary control; this check is not
-# redundant with it. Both are browser-enforced, but refusing the embedded document
-# HERE means the attempt appears as a 403 in this app's log rather than only in the
-# operator's console — visibility being what this repo falls back on wherever
-# prevention is browser-dependent (see the provenance note above).
-_FRAMED_DESTS = frozenset({"iframe", "frame", "embed", "object"})
-
-# Sent on EVERY response, refusals included (see `_security_headers`).
-#
-# `default-src 'none'` then names only what the page genuinely uses: its own script
-# (`'self'` — hence app.js being a file), the inline <style> block, the data-URI
-# favicon under img-src, and same-origin fetch/EventSource under connect-src. The
-# effect worth having is that the pending list renders AGENT-CONTROLLED strings
-# (host, url, client), so if an escaping mistake ever became script, that script
-# could still reach no external origin, load nothing, and submit nowhere.
-_CSP = ("default-src 'none'; "
-        "script-src 'self'; "
-        "style-src 'unsafe-inline'; "
-        "img-src data:; "
-        "connect-src 'self'; "
-        "base-uri 'none'; "
-        "form-action 'none'; "
-        "frame-ancestors 'none'")
-
-_SECURITY_HEADERS = {
-    "content-security-policy": _CSP,
-    # Redundant with frame-ancestors on any current browser; kept because it costs a
-    # header and covers an old one that honours neither Sec-Fetch-Dest nor CSP 2.
-    "x-frame-options": "DENY",
-    "x-content-type-options": "nosniff",
-    # This origin's URLs name approval ids; nothing should carry them outward.
-    "referrer-policy": "no-referrer",
-}
-
 # No schema or docs pages: what this server hands out stays the list a human wrote
 # (tests/test_topology.py).
 app = FastAPI(title="dockade control-plane UI",
               openapi_url=None, docs_url=None, redoc_url=None)
+guards.install(app, NAME, ALLOWED_HOSTNAMES)
 
 # timeout=None: the SSE stream (/approvals/stream) is long-lived; other calls are
 # fast. Reused across requests for connection pooling to the backend.
@@ -359,128 +280,6 @@ _tasks_client = httpx.AsyncClient(base_url=TASKS_URL,
                                   timeout=httpx.Timeout(10.0, connect=2.0))
 
 
-def _assert_host_guard_configured() -> None:
-    """Fail CLOSED at import (so the container dies visibly instead of serving) if
-    the Host allowlist is empty. An empty list would make `_guard` refuse every
-    request, not permit them — but a guard that is silently misconfigured into
-    uselessness-or-outage is exactly what the repo's "no silent unsafe defaults"
-    rule exists to prevent, and the operator needs to be told which variable did it.
-    Mirrors the egress addon's `_assert_guard_configured`."""
-    if not ALLOWED_HOSTNAMES:
-        raise RuntimeError(
-            "CONTROL_UI_ALLOWED_HOSTS is empty — the Host allowlist is what closes "
-            "DNS rebinding against this UI, and with no entries every request is "
-            "refused. Refusing to start (fail closed). Set it to the hostname(s) "
-            "this UI is addressed as, e.g. 127.0.0.1,localhost,::1.")
-
-
-_assert_host_guard_configured()
-
-
-def _hostname_of(value: str | None) -> str | None:
-    """Hostname from a `Host` header (a bare authority) or an `Origin` (an absolute
-    URL). Routed through urlsplit so port stripping, `[v6]` unwrapping and
-    lowercasing are the stdlib's problem rather than ours; a schemeless authority is
-    given the `//` prefix that makes it a network-path reference."""
-    v = (value or "").strip()
-    if not v:
-        return None
-    if "://" not in v:
-        v = "//" + v
-    try:
-        return urlsplit(v).hostname
-    except ValueError:
-        return None
-
-
-def _authority_of(value: str | None, default_port: int = 80) -> tuple[str, int] | None:
-    """``(hostname, port)`` from a `Host` header or an `Origin`, with the port made
-    explicit so the two compare: a browser omits a default port from `Origin`, and an
-    operator may or may not type one into the address bar. An `Origin` carries its
-    scheme, so its default follows it; a `Host` carries none and this app serves plain
-    HTTP, so its default is 80. Unparseable, or no hostname at all (`Origin: null`),
-    is None — which equals nothing."""
-    v = (value or "").strip()
-    if not v:
-        return None
-    if "://" not in v:
-        v = "//" + v
-    try:
-        parts = urlsplit(v)
-        host, port = parts.hostname, parts.port
-    except ValueError:
-        return None
-    if not host:
-        return None
-    if port is None:
-        port = 443 if parts.scheme == "https" else default_port
-    return host, port
-
-
-def _refuse(detail: str) -> PlainTextResponse:
-    """One shape for every guard refusal. 403 rather than 404: this surface is
-    loopback-only, so leaking that a path exists costs nothing next to an operator
-    being able to tell a guard refusal from a missing route while debugging."""
-    return PlainTextResponse(f"refused by control-plane-ui: {detail}\n",
-                             status_code=403)
-
-
-@app.middleware("http")
-async def _guard(request: Request, call_next):
-    """Host + cross-origin guards, as MIDDLEWARE so they cover every route
-    (including `/` and `/healthz`) and cannot be forgotten on a route added later."""
-    hostname = _hostname_of(request.headers.get("host"))
-    if hostname not in ALLOWED_HOSTNAMES:
-        # Also catches a missing Host, which HTTP/1.1 forbids anyway.
-        return _refuse(f"unexpected Host {hostname or '<absent>'!r} "
-                       f"(allowed: {sorted(ALLOWED_HOSTNAMES)}) — possible DNS rebinding")
-    dest = (request.headers.get("sec-fetch-dest") or "").lower()
-    if dest in _FRAMED_DESTS:
-        return _refuse(f"refusing to be embedded (Sec-Fetch-Dest: {dest}) — "
-                       f"clickjacking of the approval buttons")
-    if request.method.upper() in _UNSAFE_METHODS:
-        # Prefer Sec-Fetch-Site when the browser sends it: it states the relationship
-        # directly and, like Host and Origin, JS cannot forge it. Absent (older
-        # browser, or a non-browser client) fall back to Origin. BOTH absent means no
-        # browser is making this request, so there is no CSRF to prevent — let it
-        # through, which is also what keeps curl/scripting usable.
-        site = (request.headers.get("sec-fetch-site") or "").lower()
-        if site:
-            if site != "same-origin":
-                return _refuse(f"cross-origin state change (Sec-Fetch-Site: {site})")
-        else:
-            # The FULL authority, not the hostname: `localhost:3000` is on the
-            # allowlist's hostname and is a different origin, and a page the agent
-            # wrote into the workspace is one dev-server away from being served there.
-            # Compared against the request's own Host rather than the allowlist, so
-            # the question is "is this page us" and not "is this page on a name we
-            # answer to". Scheme is not compared: this app serves one scheme on the
-            # port, so nothing else can share the authority.
-            origin = request.headers.get("origin")
-            if origin and _authority_of(origin) != _authority_of(request.headers.get("host")):
-                return _refuse(f"cross-origin state change (Origin: {origin})")
-    return await call_next(request)
-
-
-# Declared AFTER `_guard` on purpose: with Starlette's `@app.middleware("http")` the
-# last-registered middleware is the OUTERMOST, so this one wraps the guard and
-# therefore also hardens its 403 refusals — including the refused framing attempt,
-# whose response a browser would otherwise render with no policy at all.
-@app.middleware("http")
-async def _security_headers(request: Request, call_next):
-    """Set the browser-facing security headers on every response.
-
-    Kept separate from `_guard` rather than folded into it because the two do
-    different jobs: `_guard` decides whether to serve at all, this decides what the
-    browser is permitted to do with what was served. Plain assignment, not
-    `setdefault`: these responses include RELAYED backend ones, and a header from
-    upstream must not be able to weaken the frontend's policy."""
-    response = await call_next(request)
-    for name, value in _SECURITY_HEADERS.items():
-        response.headers[name] = value
-    return response
-
-
 @app.get("/healthz")
 def healthz() -> dict:
     return {"status": "ok"}
@@ -488,7 +287,7 @@ def healthz() -> dict:
 
 # The two static files must be REVALIDATED on every load, and this is a correctness
 # header rather than a performance one — which is why it is not in
-# `_SECURITY_HEADERS` and not applied to relayed responses.
+# `guards.SECURITY_HEADERS` and not applied to relayed responses.
 #
 # `FileResponse` sends `Last-Modified` and `ETag` but no `Cache-Control`, and that
 # combination is the trap: with no explicit policy a browser is free to apply
@@ -575,7 +374,7 @@ async def proxy(path: str, request: Request) -> Response:
         # network-path reference once the prefix is off.
         upstream_path = "/" + upstream_path.removeprefix(TASKS_PREFIX).lstrip("/")
     else:
-        return _refuse(f"{method} {upstream_path} is not a relayed path")
+        return guards.refuse(NAME, f"{method} {upstream_path} is not a relayed path")
     peer = getattr(request.client, "host", None) or "unknown"
     req = client.build_request(
         method, upstream_path,
@@ -623,73 +422,20 @@ def _registry_unreachable(exc: Exception) -> JSONResponse:
                                    f"({type(exc).__name__})"}, status_code=502)
 
 
-def check_bind(bind: str, net: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network:
-    """Refuse to start unless the page is served on one address inside ``net``, and
-    return that network."""
-    try:
-        network = ipaddress.ip_network(net)
-    except ValueError as exc:
-        raise SystemExit(f"control-plane-ui: CONTROL_UI_NET={net!r} is not a network "
-                         f"({exc}). Refusing to start (fail closed).") from exc
-    try:
-        inside = ipaddress.ip_address(bind) in network
-    except ValueError:
-        inside = False
-    if not inside:
-        raise SystemExit(
-            f"control-plane-ui: CONTROL_UI_BIND={bind!r} is not an address inside "
-            f"{network}. The relay reaches the management API, so it is served on its "
-            f"control-ui-net address alone, where the loopback publish arrives, and on "
-            f"no leg another container shares. Refusing to start (fail closed).")
-    return network
-
-
-_OFF_NETWORK = b"refused by control-plane-ui: this page answers its own network only\n"
-
-
-class OnlyFrom:
-    """The app, answering only peers inside ``net``: the loopback publish arrives from
-    the bridge's own address on it, and the healthcheck from the bound one.
-
-    The bind does not choose the leg a packet arrives on (``OnlyFrom`` in
-    ``task-registry/serve.py`` says why), and since the UI joined the task registry's
-    network its neighbours include one that parses agent text. None can route a packet
-    here today, since every service drops every capability; this holds whether or not
-    that does. Outside the app, so its refusal carries the security headers itself."""
-
-    def __init__(self, app: object, net: ipaddress.IPv4Network | ipaddress.IPv6Network
-                 ) -> None:
-        self.app, self.net = app, net
-
-    def _admits(self, client: object) -> bool:
-        try:
-            return ipaddress.ip_address(client[0]) in self.net
-        except (TypeError, IndexError, ValueError):
-            return False
-
-    async def __call__(self, scope: dict, receive: object, send: object) -> None:
-        if scope["type"] != "lifespan" and not self._admits(scope.get("client")):
-            if scope["type"] == "http":
-                headers = [(b"content-type", b"text/plain; charset=utf-8"),
-                           *((k.encode(), v.encode()) for k, v in _SECURITY_HEADERS.items())]
-                await send({"type": "http.response.start", "status": 403,
-                            "headers": headers})
-                await send({"type": "http.response.body", "body": _OFF_NETWORK})
-            else:
-                await send({"type": "websocket.close"})
-            return
-        await self.app(scope, receive, send)
-
-
 def main() -> None:
     # Here rather than at module scope, so the suite imports this with no uvicorn.
     import uvicorn
 
-    network = check_bind(BIND, UI_NET)
+    network = guards.check_bind(
+        BIND, UI_NET, name=NAME, bind_variable="CONTROL_UI_BIND",
+        net_variable="CONTROL_UI_NET",
+        why="The relay reaches the management API, so it is served on its control-ui-net "
+            "address alone, where the loopback publish arrives, and on no leg another "
+            "container shares.")
     # Proxy headers off: the peer the relay asserts as the actor, and the one OnlyFrom
     # admits, is the socket's.
-    uvicorn.run(OnlyFrom(app, network), host=BIND, port=PORT, proxy_headers=False,
-                log_level="info")
+    uvicorn.run(guards.OnlyFrom(app, network, NAME), host=BIND, port=PORT,
+                proxy_headers=False, log_level="info")
 
 
 if __name__ == "__main__":

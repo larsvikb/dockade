@@ -21,15 +21,16 @@ that matters most here, but plain CSRF is not self-blocking either, as this once
 claimed: a JSON body does not force a preflight (a typeless `Blob` is sent with no
 `Content-Type`, which is CORS-safelisted, and FastAPI parses an untyped body as
 JSON), and the `resolve` id is not blind for a tool ask, because the agent is handed
-it in the pending result. Four structural guards sit in front
-(`control-plane-ui/app.py`):
+it in the pending result. Four structural guards sit in front: three that every UI
+installs from `ui-common/guards.py`, and the relay's own table in
+`control-plane-ui/app.py`:
 
 - **Host allowlist** (`CONTROL_UI_ALLOWED_HOSTS`, default `127.0.0.1,localhost,::1`)
   — closes rebinding. Rebinding *requires* the attacker's own name in `Host`, and
   `Host` is a forbidden header JS cannot set, so this removes the attack class
-  rather than raising its cost. Compared without the port, for the reason at
-  `ALLOWED_HOSTNAMES` in `control-plane-ui/app.py`. Import fails closed
-  on an empty list (`_assert_host_guard_configured`, mirroring the egress addon).
+  rather than raising its cost. Compared without the port, and fails closed at
+  import on an empty list, both for the reasons at `allowed_hostnames` in
+  `ui-common/guards.py`.
 - **Cross-origin state changes refused** — `Sec-Fetch-Site` when present, else
   `Origin` compared as a full authority (host *and* port) against the request's own
   `Host`: a page on another localhost port is another origin, and a page the agent
@@ -53,10 +54,10 @@ it in the pending result. Four structural guards sit in front
   lands on the real "Allow + persist rule" button, granting standing egress. The
   unguessable `uuid4` id that defeats a blind CSRF is no help either — a click does
   not need to know it. Closed by `frame-ancestors 'none'` in the CSP below, plus a
-  `Sec-Fetch-Dest: iframe|frame|embed|object` refusal in `_guard`; the second is not
-  redundant, it makes the attempt a 403 in *this app's* log rather than a message in
-  the operator's browser console, which is the visibility this repo falls back on
-  wherever prevention is browser-dependent.
+  `Sec-Fetch-Dest: iframe|frame|embed|object` refusal in `request_guard`; the second
+  is not redundant, it makes the attempt a 403 in *this app's* log rather than a
+  message in the operator's browser console, which is the visibility this repo falls
+  back on wherever prevention is browser-dependent.
 
 Beneath the four, the network: the page is served on the UI's `control-ui-net` address
 alone (`check_bind`) and only to peers on that network (`OnlyFrom`), where the loopback
@@ -65,10 +66,11 @@ registry's network, whose other member parses agent text; why the bind alone doe
 keep them out is the root `DESIGN.md`'s "Task registry".
 
 **Security headers on every response, and why the script became a file.** A
-`_security_headers` middleware sets a Content-Security-Policy (plus `X-Frame-Options`,
-`nosniff`, `no-referrer`) on everything this app serves, refusals included — it is
-registered *after* `_guard`, which under Starlette makes it the **outer** middleware,
-so a refused framing attempt is itself delivered under the policy. The policy is
+`security_headers` middleware sets a Content-Security-Policy (plus `X-Frame-Options`,
+`nosniff`, `no-referrer`) on everything this app serves, refusals included —
+`install` registers it *after* the request guard, which under Starlette makes it the
+**outer** middleware, so a refused framing attempt is itself delivered under the
+policy. The policy is
 `default-src 'none'` naming only what the page uses, and it is applied by assignment
 rather than `setdefault` because relayed backend responses pass through it and an
 upstream header must not be able to weaken the frontend's policy.
@@ -208,7 +210,9 @@ in the directory. The list has two other copies with no
 compiler between them, the Dockerfile's `COPY` lines and the modules' own imports, and
 a test holds each equal to it; a module left out of the image would 404 in the
 container with every unit test green, and stop the whole page at the entry's first
-`import`.
+`import`. A module another UI shares sits in `ui-common/` instead, and the image copies
+it in beside these, so the page imports it as `./time.js` like any other; the tests and
+`make ui-diff` assemble the same single directory.
 
 A surface's DOM code sits in its own module below the pure half, and `start()` mounts
 it. Its `mount…()` functions look up its elements into module-level `let`s and wire

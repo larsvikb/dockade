@@ -446,7 +446,9 @@ services:
   # Holds no state — a governance decision never depends on it.
   control-plane-ui:
     build:
-      context: ./control-plane-ui
+      # Repo root, to COPY ui-common/ beside the UI's own files.
+      context: .
+      dockerfile: control-plane-ui/Dockerfile
     image: dockade-control-plane-ui
     container_name: control-plane-ui
     hostname: control-plane-ui
@@ -474,7 +476,7 @@ services:
       # control-plane-ui/app.py).
       CONTROL_UI_TASKS_URL: http://172.26.0.2:8111
       # Its control-ui-net leg, where the publish arrives, and nothing else will start
-      # (check_bind in control-plane-ui/app.py): not control-net, nor any leg it gains.
+      # (check_bind in ui-common/guards.py): not control-net, nor any leg it gains.
       CONTROL_UI_BIND: 172.25.0.2
       CONTROL_UI_PORT: "8090"
     # Human-only management surface, bound to host loopback (never 0.0.0.0):

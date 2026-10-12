@@ -278,7 +278,7 @@ dockade/
     CLAUDE.md, DESIGN.md    #   how to work here; the approval flow's design
   control-plane-ui/         # UI FRONTEND — serves the UI + reverse-proxies the API
     Dockerfile              #   FastAPI + httpx; control-ui-net (loopback) + control-net
-                            #   + tasks-operator-net
+                            #   + tasks-operator-net; built from the root, for ui-common/
     app.py                  #   static UI at / + streaming reverse proxy to the backend,
                             #   and the Tasks tab's to the task registry
     app.js                  #   the approval console's behaviour — a file so the CSP can
@@ -305,10 +305,13 @@ dockade/
                             #   not yet loaded — one decision, four tables' sentences
     tasks.js                #   the Tasks tab: the task registry's work list, its not-running
                             #   state, agent prose with hidden characters spelled out
-    time.js                 #   timestamps as the page shows them
     index.html              #   static shell + styles for the SSE approval console
     DESIGN.md               #   the browser boundary and the page's mechanics
     requirements.txt        #   pinned deps (fastapi, uvicorn, httpx)
+  ui-common/                # what every UI shares, copied in beside its own files
+    guards.py               #   the browser guards, the security headers, the bind and
+                            #   peer checks a UI starts with
+    time.js                 #   timestamps as the page shows them
   tool-gateway/             # MCP GATEWAY — governed tool capability; tier 1's `--mcp-config` points at it
     Dockerfile              #   FastAPI + uvicorn; triple-homed, no egress leg
     app.py                  #   the bind guard, liveness, and the agent's MCP endpoint

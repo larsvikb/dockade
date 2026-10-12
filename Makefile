@@ -114,7 +114,7 @@ DOCKERFILES := claude-sandbox/Dockerfile opencode-sandbox/Dockerfile \
 YAMLFILES := docker-compose.yml mcp-servers.yml .hadolint.yaml .yamllint \
              $(wildcard .github/workflows/*.yml)
 JSONFILES := $(shell git ls-files '*.json' 2>/dev/null)
-PYFILES := proxies/egress/addon.py control-plane-ui/app.py \
+PYFILES := proxies/egress/addon.py control-plane-ui/app.py ui-common/guards.py \
            control-plane/app.py control-plane/store.py control-plane/policy.py \
            control-plane/holds.py control-plane/ingest.py control-plane/audit.py \
            control-plane/inventory.py control-plane/provenance.py \
@@ -170,6 +170,7 @@ REFFILES := $(SCRIPTS) \
             tool-gateway/surface.py \
             tool-gateway/requirements.txt \
             control-plane-ui/app.py \
+            ui-common/guards.py \
             control-plane-ui/requirements.txt \
             control-plane-ui/index.html \
             control-plane-ui/app.js \
@@ -184,7 +185,7 @@ REFFILES := $(SCRIPTS) \
             control-plane-ui/saturation.js \
             control-plane-ui/status.js \
             control-plane-ui/tasks.js \
-            control-plane-ui/time.js \
+            ui-common/time.js \
             task-registry/serve.py \
             task-registry/taskdb.py \
             task-registry/tasks.py \
@@ -573,15 +574,23 @@ ui-diff: ## Run the UI scenario on UI_DIFF_BASE (default main) and on this tree 
 	  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci --prefix "$$harness" --no-audit --no-fund --ignore-scripts
 	fi
 	out=$$(mktemp -d)
-	git archive "$(UI_DIFF_BASE)" control-plane-ui | tar -x -C "$$out"
+	# Each page as the image serves it: the UI's files and ui-common/'s in one
+	# directory. A base from before ui-common/ has only the first.
+	base_dirs=$$(git ls-tree -d --name-only "$(UI_DIFF_BASE)" control-plane-ui ui-common)
+	git archive "$(UI_DIFF_BASE)" $$base_dirs | tar -x -C "$$out"
+	mkdir "$$out/base" "$$out/tree"
+	for d in $$base_dirs; do cp "$$out/$$d"/*.js "$$out/base/"; done
+	cp "$$out/control-plane-ui/index.html" "$$out/base/"
+	for d in control-plane-ui ui-common; do cp "$$d"/*.js "$$out/tree/"; done
+	cp control-plane-ui/index.html "$$out/tree/"
 	# A run whose step failed still writes its transcript, so the diff runs either way.
 	failed=""
 	echo "== $(UI_DIFF_BASE) =="
-	node "$$harness/harness.js" "$$out/control-plane-ui" "$$out/base.txt" >/dev/null \
+	node "$$harness/harness.js" "$$out/base" "$$out/base.txt" >/dev/null \
 	  || failed="$$failed $(UI_DIFF_BASE)"
 	[ -s "$$out/base.txt" ] || exit 1   # the harness could not run at all
 	echo "== this tree =="
-	node "$$harness/harness.js" control-plane-ui "$$out/tree.txt" \
+	node "$$harness/harness.js" "$$out/tree" "$$out/tree.txt" \
 	  || failed="$$failed this-tree"
 	[ -s "$$out/tree.txt" ] || exit 1
 	if diff -u --label "$(UI_DIFF_BASE)" --label "this tree" "$$out/base.txt" "$$out/tree.txt" \

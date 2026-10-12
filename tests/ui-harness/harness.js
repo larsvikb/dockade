@@ -5,7 +5,10 @@
 // base tree and on the branch and diffs the two transcripts, so the oracle is the
 // previous version of the page.
 //
-//   node harness.js <control-plane-ui dir> <transcript out>
+//   node harness.js <served dir> <transcript out>
+//
+// The served dir holds the page as the image does: control-plane-ui's index.html and
+// modules, and ui-common's modules beside them (`make ui-diff` assembles it).
 
 import { readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -22,7 +25,7 @@ const BROWSER = process.env.UI_HARNESS_BROWSER || "/usr/lib/chromium/chromium-he
 
 const [uiDir, outFile] = process.argv.slice(2);
 if (!uiDir || !outFile) {
-  console.error("usage: node harness.js <control-plane-ui dir> <transcript out>");
+  console.error("usage: node harness.js <served dir> <transcript out>");
   process.exit(2);
 }
 if (!existsSync(BROWSER)) {

@@ -137,6 +137,10 @@ networks:
     driver: bridge
     driver_opts:
       com.docker.network.bridge.enable_ip_masquerade: "false"
+    # A subnet so the UI's address here can be pinned: it binds that address alone.
+    ipam:
+      config:
+        - subnet: 172.25.0.0/24
   # The task registry's OPERATOR path. internal:true. Carries one conversation: the
   # control-plane UI dialing the registry's operator listener, which takes no token, so
   # membership of this network is the permission to write as the operator. Hence its
@@ -455,10 +459,16 @@ services:
       # why that is a reboot-order race and not a theoretical one.
       control-net:
         ipv4_address: 172.31.0.10
-      # Host-UI reachability only; not an egress path (see control-ui-net).
+      # Host-UI reachability only; not an egress path (see control-ui-net). The one
+      # address the page is served on, so pinned.
       control-ui-net:
+        ipv4_address: 172.25.0.2
     environment:
       CONTROL_BACKEND_URL: http://control-plane:8090
+      # Its control-ui-net leg, where the publish arrives, and nothing else will start
+      # (check_bind in control-plane-ui/app.py): not control-net, nor any leg it gains.
+      CONTROL_UI_BIND: 172.25.0.2
+      CONTROL_UI_PORT: "8090"
     # Human-only management surface, bound to host loopback (never 0.0.0.0):
     # reachable from the host browser, not from the sandbox or other machines.
     #
@@ -489,12 +499,17 @@ services:
     # frontend holds no state, so a red here should mean "the UI is down", not
     # "something behind the UI is down". This is the only host-published surface,
     # so it is also the health a human actually reads off `docker compose ps`.
+    # At the bound address, since nothing listens on loopback, naming a Host the
+    # app's allowlist takes.
     healthcheck:
       test:
         - CMD
         - python3
         - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/healthz', timeout=3)"
+        - >-
+          import os, urllib.request as u;
+          u.urlopen(u.Request('http://%s:%s/healthz' % (os.environ['CONTROL_UI_BIND'],
+          os.environ['CONTROL_UI_PORT']), headers={'Host': '127.0.0.1'}), timeout=3)
       interval: 30s
       timeout: 5s
       retries: 3
@@ -509,6 +524,10 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    # Not a router between its legs, as the task registry is not: with forwarding on,
+    # a neighbour that could add a route would cross to control-net through it.
+    sysctls:
+      net.ipv4.ip_forward: "0"
 
   # ── MCP gateway (GOVERNED data-plane tool) ──────────────────────────────────
   # Speaks MCP to the sandbox and to the server containers, under per-tool policy

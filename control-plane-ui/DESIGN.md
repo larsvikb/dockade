@@ -27,10 +27,8 @@ it in the pending result. Four structural guards sit in front
 - **Host allowlist** (`CONTROL_UI_ALLOWED_HOSTS`, default `127.0.0.1,localhost,::1`)
   — closes rebinding. Rebinding *requires* the attacker's own name in `Host`, and
   `Host` is a forbidden header JS cannot set, so this removes the attack class
-  rather than raising its cost. Compared without the port on purpose: the port is
-  irrelevant to the guard, and ignoring it keeps one list valid for both the
-  published port (configurable, so pinning it would be wrong twice over) and the
-  in-container healthcheck's `:8090`. Import fails closed
+  rather than raising its cost. Compared without the port, for the reason at
+  `ALLOWED_HOSTNAMES` in `control-plane-ui/app.py`. Import fails closed
   on an empty list (`_assert_host_guard_configured`, mirroring the egress addon).
 - **Cross-origin state changes refused** — `Sec-Fetch-Site` when present, else
   `Origin` compared as a full authority (host *and* port) against the request's own

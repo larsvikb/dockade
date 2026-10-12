@@ -333,6 +333,9 @@ dockade/
                             #   the history
     operator_api.py         #   the operator API: those moves and the reads as JSON over
                             #   HTTP, for the UI to relay to
+    backup.py               #   the store copied out and put back, for make backup and
+                            #   make restore-tasks
+    export.py               #   a backup as markdown, for reading without the server
     DESIGN.md               #   who writes what, and why
     requirements.txt        #   pinned deps; fastapi and uvicorn held equal to the control plane's
   policies/                 # seed policy config (loaded into the control plane)

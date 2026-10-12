@@ -158,12 +158,17 @@ sc_guard_workspace() {
     # dockade's own state, when dockade is the workspace. A control-plane backup is
     # the whole policy store in a file `make restore` will install after checking its
     # shape, not its provenance — so a copy the agent can edit is a store the agent
-    # gets to write. The Makefile keeps them out of the tree by default; this catches
-    # the ones that got here anyway.
-    if compgen -G "$real_workspace/backups/dockade-control-*.db" >/dev/null; then
-        echo "WARNING: workspace contains control-plane backups (backups/dockade-control-*.db) —" >&2
-        echo "         the sandbox agent can read and rewrite them, and 'make restore' would install" >&2
-        echo "         one. Move them under \$(make print-config-home)/backups." >&2
+    # gets to write. A task registry backup is the same for `make restore-tasks`, and
+    # its export beside it carries the notes the operator hid from agents. The
+    # Makefile keeps them out of the tree by default; this catches the ones that got
+    # here anyway.
+    if compgen -G "$real_workspace/backups/dockade-control-*.db" >/dev/null \
+        || compgen -G "$real_workspace/backups/dockade-tasks-*.db" >/dev/null \
+        || compgen -G "$real_workspace/backups/dockade-tasks-*.md" >/dev/null; then
+        echo "WARNING: workspace contains dockade backups (backups/dockade-control-*.db," >&2
+        echo "         dockade-tasks-*.db or .md) — the sandbox agent can read and rewrite them," >&2
+        echo "         and 'make restore' or 'make restore-tasks' would install one. Move them" >&2
+        echo "         under \$(make print-config-home)/backups." >&2
     fi
 
     # shellcheck disable=SC2034  # consumed by the sourcing launcher, not here

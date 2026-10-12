@@ -1539,7 +1539,8 @@ exposes, so it reports; the control plane holds the result for an operator choos
 rules and for nothing else. **In memory, never stored** — it is derived data,
 rebuildable by asking the servers again, and a stored copy would both outlive a
 server that has been gone for a week while reading as current and put server-authored
-text into `make backup`, which is the operator's own decisions and nothing else.
+text into the control plane's backup, which is the operator's own decisions and nothing
+else.
 **Pushed, because a pull is impossible**: this process has no leg on the gateway's
 networks and must not be given one, since dialling the agent-facing service from the
 crown jewel is the lateral edge the gateway's bind guard exists to prevent. That
@@ -2285,8 +2286,9 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | the gateway records how a call ENDED — its own JSONL stream | **done** |
 | — | outcomes ingested — second stream, `status` column, `outcome` in the audit vocabulary | **done** — one approval id now selects the hold, the answer, the claim and the result |
 | — | task registry — the store, the agent listener (MCP, behind the gateway's secret), the operator API | **done** |
-| — | task registry as a service — `tasks` behind a profile on `mcp-net` + `tasks-operator-net`, one listener per leg | **done** — no UI view yet; no backup |
+| — | task registry as a service — `tasks` behind a profile on `mcp-net` + `tasks-operator-net`, one listener per leg | **done** — no UI view yet |
 | — | task registry, agent side — where the id comes from in the image's instructions, dockade's repo name and checkpoints in `CLAUDE.md`, the id in the status line | **done** — `inflight.md` and `local-todo.md` stay the record beside it |
+| — | task registry backups — its store and a markdown export in `make backup`, `make restore-tasks` | **done** |
 
 The rationale for each shipped item lives under **Governance surfaces** above, not here
 — a status line goes stale, the reasoning does not. This section is deliberately the

@@ -28,6 +28,9 @@ COPY operator_moves.py ./operator_moves.py
 COPY agent_tools.py ./agent_tools.py
 COPY agent_api.py ./agent_api.py
 COPY operator_api.py ./operator_api.py
+# Not served: run by `make backup` and `make restore-tasks` in a throwaway container.
+COPY backup.py ./backup.py
+COPY export.py ./export.py
 
 # The store's directory, made in the IMAGE so a fresh named volume mounted here takes
 # its mode. 1777 for the reason tool-gateway/Dockerfile gives its audit directory: the

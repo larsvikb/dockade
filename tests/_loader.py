@@ -451,3 +451,12 @@ def load_task_registry_serve() -> types.ModuleType:
     load_task_registry_agent_api()
     load_operator_api()
     return importlib.import_module("serve")
+
+
+def load_task_registry_backup() -> types.SimpleNamespace:
+    """The task registry's store with ``backup`` and ``export``, which ``make backup``
+    and ``make restore-tasks`` run in a container from its image."""
+    reg = load_task_registry()
+    reg.backup = importlib.import_module("backup")
+    reg.export = importlib.import_module("export")
+    return reg

@@ -236,6 +236,21 @@ class WorkspaceGuardTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), str(plain))
 
+    def test_a_backup_in_the_workspace_warns_without_refusing(self):
+        # Each is a store a restore installs, or the operator's read of one.
+        plain = self.root / "work" / "dockade"
+        (plain / "backups").mkdir(parents=True)
+        proc = self.guard(plain)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("backups", proc.stderr)
+        for name in ("dockade-control-1.db", "dockade-tasks-1.db", "dockade-tasks-1.md"):
+            with self.subTest(name=name):
+                (plain / "backups" / name).touch()
+                proc = self.guard(plain)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("WARNING: workspace contains dockade backups", proc.stderr)
+                (plain / "backups" / name).unlink()
+
     def test_the_runtime_directories_are_refused(self):
         # A host socket there is as reachable read-write as it is read-only.
         runtime = self.root / "run-user"

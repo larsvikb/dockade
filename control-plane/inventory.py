@@ -11,8 +11,8 @@ in DESIGN.md.
 NOT PERSISTED, and every reason points the same way. It is derived data, rebuildable
 by asking the servers again, so a restart costs one poll. A stored copy would go stale
 against a server that has been down for a week while still reading as authoritative.
-And it is SERVER-AUTHORED text: putting it in the store would put it in `make backup`,
-which is the operator's own decisions and nothing else.
+And it is SERVER-AUTHORED text: putting it in the store would put it in the control
+plane's backup, which is the operator's own decisions and nothing else.
 
 THE INVARIANT THIS MODULE EXISTS UNDER: nothing here is an input to
 ``policy._decide_tool``. A tool in this map is not permitted, not registered, and not

@@ -127,7 +127,8 @@ PYFILES := proxies/egress/addon.py control-plane-ui/app.py \
            task-registry/claims.py task-registry/notes.py \
            task-registry/agent_moves.py task-registry/operator_moves.py \
            task-registry/agent_tools.py task-registry/agent_api.py \
-           task-registry/operator_api.py task-registry/serve.py
+           task-registry/operator_api.py task-registry/serve.py \
+           task-registry/backup.py task-registry/export.py
 # Dependency-free unit tests for the governance-critical decision logic. Kept
 # separate from PYFILES so they can be linted with the app code but discovered
 # and run on their own (python -m unittest, no pip installs — see tests/).
@@ -194,12 +195,14 @@ REFFILES := $(SCRIPTS) \
             task-registry/agent_tools.py \
             task-registry/agent_api.py \
             task-registry/operator_api.py \
+            task-registry/backup.py \
+            task-registry/export.py \
             task-registry/requirements.txt \
             policies/egress-allowlist.txt
 
 .PHONY: help check check-strict lint consistency test verify-build \
         up down destroy audit-prune control-tool-preflight backup restore \
-        secrets-perm-check \
+        tasks-tool-preflight restore-tasks secrets-perm-check \
         rebuild logs-ep logs-cp logs-tg tool-outcomes print-config-home \
         mcp-up mcp-down mcp-ps mcp-tools gateway-tools tasks-up tasks-down \
         claude opencode boundary check-boundary split-check ui-diff
@@ -966,14 +969,43 @@ control-tool-preflight:
 	  exit 1
 	fi
 
-backup: control-tool-preflight ## Snapshot the control-plane store (policy + approvals + audit) into BACKUP_DIR (default ~/.config/dockade/backups)
+# The same for the task registry's store, for the reasons given above CONTROL_IMAGE,
+# CONTROL_TOOL and control-tool-preflight; the registry pins its addresses too. As the
+# invoking user, as compose runs the service: a reader of a WAL store needs write access
+# to its -shm, and a restored store must be that user's, the directory being sticky.
+TASKS_IMAGE := dockade-task-registry
+TASKS_VOLUME := dockade-tasks-state
+TASKS_TOOL = docker run --rm -i --network none \
+  --user $(DOCKADE_UID):$(DOCKADE_GID) \
+  -v $(TASKS_VOLUME):/var/lib/task-registry \
+  --entrypoint python3 $(TASKS_IMAGE)
+# The export needs only the snapshot, which it reads on stdin, so it is given no volume.
+TASKS_EXPORT = docker run --rm -i --network none --entrypoint python3 $(TASKS_IMAGE)
+
+tasks-tool-preflight:
+	@if ! docker image inspect $(TASKS_IMAGE) >/dev/null 2>&1; then
+	  echo "no $(TASKS_IMAGE) image — build it first (make tasks-up)"
+	  exit 1
+	fi
+	@if ! docker volume inspect $(TASKS_VOLUME) >/dev/null 2>&1; then
+	  echo "no $(TASKS_VOLUME) volume — the task registry has never run here (make tasks-up)"
+	  exit 1
+	fi
+	@# Before anything is stopped: `make up` never rebuilds the profile's image.
+	if ! docker run --rm --network none --entrypoint test $(TASKS_IMAGE) -f backup.py; then
+	  echo "the $(TASKS_IMAGE) image predates backup.py — make tasks-up rebuilds it"
+	  exit 1
+	fi
+
+backup: control-tool-preflight ## Snapshot the control-plane store (policy + approvals + audit), and the task registry's with a markdown export, into BACKUP_DIR (default ~/.config/dockade/backups)
 	@# The crown-jewel state, which DESIGN.md says must be backed up independently of
 	@# any container — this is that path. Non-destructive and safe to run against a
 	@# LIVE stack: `VACUUM INTO` (in BACKUP_PY) takes a read lock and writes a
 	@# consistent, compacted copy, so nothing has to be stopped and no decision is
 	@# denied while it runs.
 	@mkdir -p "$(BACKUP_DIR)"
-	@out="$(BACKUP_DIR)/dockade-control-$$(date -u +%Y%m%dT%H%M%SZ).db"
+	@stamp=$$(date -u +%Y%m%dT%H%M%SZ)
+	out="$(BACKUP_DIR)/dockade-control-$$stamp.db"
 	# Written to `.partial` and renamed only after the check below, so an interrupted
 	# transfer never leaves something that looks like a usable backup.
 	$(CONTROL_TOOL) -c "$$BACKUP_PY" > "$$out.partial"
@@ -983,6 +1015,39 @@ backup: control-tool-preflight ## Snapshot the control-plane store (policy + app
 	fi
 	mv "$$out.partial" "$$out"
 	echo "backup: wrote $$out ($$(du -h "$$out" | cut -f1))"
+	# The task registry's store, under the same stamp, when there is one
+	# (task-registry/DESIGN.md, "Backups"). From here on the exit status is the
+	# registry's: the control plane's backup above is already written.
+	if ! docker volume inspect $(TASKS_VOLUME) >/dev/null 2>&1; then
+	  echo "backup: no $(TASKS_VOLUME) volume, so no task registry store to back up"
+	  exit 0
+	fi
+	if ! docker image inspect $(TASKS_IMAGE) >/dev/null 2>&1; then
+	  echo "backup: FAILED — $(TASKS_VOLUME) holds the task registry's store, and there is no $(TASKS_IMAGE) image to read it with (make tasks-up builds it)"
+	  exit 1
+	fi
+	tasks_out="$(BACKUP_DIR)/dockade-tasks-$$stamp"
+	if ! $(TASKS_TOOL) backup.py snapshot > "$$tasks_out.db.partial"; then
+	  rm -f "$$tasks_out.db.partial"
+	  # `make up` never rebuilds the profile's image, so the likely cause is named.
+	  echo "backup: FAILED — the task registry's snapshot did not run; an image built before this Makefile has no backup.py (make tasks-up rebuilds it)"
+	  exit 1
+	fi
+	# Empty, with no failure: the volume holds no store yet, which backup.py has said.
+	if [ ! -s "$$tasks_out.db.partial" ]; then rm -f "$$tasks_out.db.partial"; exit 0; fi
+	if [ "$$(head -c 15 "$$tasks_out.db.partial" 2>/dev/null)" != "SQLite format 3" ]; then
+	  echo "backup: FAILED — the task registry's stream is not a SQLite database. Left at $$tasks_out.db.partial"
+	  exit 1
+	fi
+	mv "$$tasks_out.db.partial" "$$tasks_out.db"
+	echo "backup: wrote $$tasks_out.db ($$(du -h "$$tasks_out.db" | cut -f1))"
+	# Rendered from that file rather than the live store, so the two say the same.
+	if ! $(TASKS_EXPORT) export.py < "$$tasks_out.db" > "$$tasks_out.md.partial"; then
+	  echo "backup: the export FAILED, and $$tasks_out.db is whole. Left at $$tasks_out.md.partial"
+	  exit 1
+	fi
+	mv "$$tasks_out.md.partial" "$$tasks_out.md"
+	echo "backup: wrote $$tasks_out.md"
 
 restore: control-tool-preflight ## Replace the control-plane store from a backup: make restore FILE=<BACKUP_DIR>/… (destructive)
 	@# The other half of `backup`, and the destructive one: it discards the CURRENT
@@ -995,6 +1060,12 @@ restore: control-tool-preflight ## Replace the control-plane store from a backup
 	  exit 2
 	fi
 	@if [ ! -f "$(FILE)" ]; then echo "restore: no such file: $(FILE)"; exit 2; fi
+	@# The task registry's backups are named for it, and refused here before the stack
+	# is stopped rather than by RESTORE_PY's table check inside the window.
+	case "$$(basename "$(FILE)")" in dockade-tasks-*)
+	  echo "restore: $(FILE) is a task registry backup — make restore-tasks FILE=… restores it"
+	  exit 2;;
+	esac
 	@# The cheap half of the validation, hoisted to BEFORE the stack is touched. The
 	# full check (integrity, the four tables, the schema version) needs the container
 	# and therefore the maintenance window, but the mistake people actually make is
@@ -1023,6 +1094,41 @@ restore: control-tool-preflight ## Replace the control-plane store from a backup
 	# window. Observed, not theorised: `make restore FILE=README.md`.
 	trap '$(COMPOSE) up -d --wait --wait-timeout 120' EXIT
 	$(CONTROL_TOOL) -c "$$RESTORE_PY" < "$(FILE)"
+
+restore-tasks: tasks-tool-preflight ## Replace the task registry's store from a backup: make restore-tasks FILE=<BACKUP_DIR>/dockade-tasks-… (destructive)
+	@# `restore` for the registry's store, a target of its own (task-registry/DESIGN.md,
+	@# "Backups"). It discards every task, note and history row written since the
+	@# backup. The same two passes as `restore`.
+	@if [ -z "$(FILE)" ]; then
+	  echo "usage: make restore-tasks FILE=$(BACKUP_DIR)/dockade-tasks-<stamp>.db"
+	  exit 2
+	fi
+	@if [ ! -f "$(FILE)" ]; then echo "restore-tasks: no such file: $(FILE)"; exit 2; fi
+	@case "$$(basename "$(FILE)")" in dockade-control-*)
+	  echo "restore-tasks: $(FILE) is a control-plane backup — make restore FILE=… restores it"
+	  exit 2;;
+	esac
+	@if [ "$$(head -c 15 "$(FILE)" 2>/dev/null)" != "SQLite format 3" ]; then
+	  echo "restore-tasks: $(FILE) is not a SQLite database — nothing was touched"
+	  exit 2
+	fi
+	@if [ -z "$(FORCE)" ]; then
+	  printf 'Replace the task registry store (every task, note and their history) with %s? [y/N] ' "$(FILE)"
+	  read -r reply
+	  case "$$reply" in y|Y|yes) ;; *) echo "restore-tasks: aborted"; exit 1;; esac
+	fi
+	@# Stopped first, since the store and its sidecars are replaced under it, and
+	# started again, whatever happens next, only if it was running: a restore the
+	# checks refuse must cost nothing but the window (`restore` says how that was
+	# learned). A registry that was stopped stays stopped.
+	running=$$($(COMPOSE) --profile tasks ps -q --status running tasks)
+	$(COMPOSE) --profile tasks stop tasks
+	if [ -n "$$running" ]; then
+	  trap '$(COMPOSE) --profile tasks up -d --wait --wait-timeout 120 tasks' EXIT
+	else
+	  echo "restore-tasks: the registry was not running, and stays stopped (make tasks-up)"
+	fi
+	$(TASKS_TOOL) backup.py restore < "$(FILE)"
 
 rebuild: ## Rebuild every image from scratch — proxy, control plane, UI, gateway, task registry, both sandbox tiers — then recreate the infra
 	# Deliberately does NOT `down` first. A build touches no running container, so

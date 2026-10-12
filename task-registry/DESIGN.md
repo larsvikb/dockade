@@ -213,6 +213,29 @@ history the operator's read (`operator_moves.history`): it keeps every text a ta
 had, a hidden note's and a body triage replaced, so an implementer reading it could act
 on a version the operator never approved.
 
+## Backups
+
+**`make backup` takes the registry's store beside the control plane's,** under the same
+stamp, when there is one: the registry is optional, and a host that never started it is
+told so in a line. It goes outside this tree for the reason the `Makefile` gives
+`BACKUP_DIR`: a copy in the tree is one the agent edits, and restoring it would put
+agent text back into approved bodies.
+
+**Restoring is a target of its own, `make restore-tasks FILE=…`,** since a destructive
+step names its store rather than guessing it from the file. It refuses a file the
+registry would not open before it replaces anything, and starts the registry again only
+if it was running. Ids carry on from the store it replaces wherever that one had gone
+further, so an id a session or the gateway's audit holds never comes to name another
+task (`backup._keep_ids_moving`).
+
+**Every backup writes a markdown export beside the `.db`,** per repo and state: each
+task's fields, body, claim and notes. For reading without the server, and one-way:
+nothing imports it, so the `.db` stays the only backup format. It carries the hidden
+notes, marked, which makes it the operator's read, as the history is. Agent text in it
+renders as nothing but text (`task-registry/export.py`). Nothing else reads the store:
+the UI serves the operator, the tools serve the agents, and the export is the reading
+without the server, so there is no command line.
+
 ## The agent listener
 
 **The gateway is its only caller.** Every server on `mcp-net` reaches the listener,

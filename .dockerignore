@@ -1,11 +1,11 @@
 # Applies to every build whose context is the repo root: the control-plane (needs
-# control-plane/ + the top-level policies/ seed), BOTH sandbox tiers (claude-sandbox/ and opencode-sandbox/, each of which also
-# needs the shared sandbox-common/ scripts), and the control-plane UI (its own
-# directory + the shared ui-common/). The sandbox images use a root context
-# precisely so they can COPY sandbox-common/ — a build context cannot reach outside
-# itself, and the firewall must have ONE implementation, not a copy per tier; the
-# UI's reason is the same for ui-common/. The egress proxy uses its own context
-# (proxies/egress), unaffected.
+# control-plane/ + the top-level policies/ seed), BOTH sandbox tiers (claude-sandbox/
+# and opencode-sandbox/, each of which also needs the shared sandbox-common/ scripts),
+# and both UIs, the control-plane UI and the tasks UI (each its own directory + the
+# shared ui-common/). The sandbox images use a root context precisely so they can COPY
+# sandbox-common/ — a build context cannot reach outside itself, and the firewall must
+# have ONE implementation, not a copy per tier; the UIs' reason is the same for
+# ui-common/. The egress proxy uses its own context (proxies/egress), unaffected.
 #
 # Keep the root context small: exclude anything no root-context image needs.
 .git

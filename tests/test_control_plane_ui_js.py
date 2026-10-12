@@ -42,8 +42,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from typing import ClassVar
 
 ROOT = Path(__file__).resolve().parents[1]
 UI_DIR = ROOT / "control-plane-ui"
@@ -56,26 +58,39 @@ PAYLOAD_JS = UI_DIR / "payload.js"
 INDEX_HTML = UI_DIR / "index.html"
 
 
-def _module_paths() -> dict[str, Path]:
-    """Every module the page is made of, by the name it is served under: this
-    directory's, and ``ui-common/``'s, which the image copies in beside them."""
-    return {p.name: p for d in (UI_DIR, COMMON_DIR) for p in sorted(d.glob("*.js"))}
+def _page_modules(ui_dir: Path) -> dict[str, Path]:
+    """Every module a page is made of, by the name it is served under: its folder's,
+    and the ``ui-common/`` modules they import, directly or through one another, which
+    its image copies in beside them."""
+    modules = {p.name: p for p in sorted(ui_dir.glob("*.js"))}
+    todo = list(modules.values())
+    while todo:
+        for name in _imports(todo.pop().read_text()):
+            shared = COMMON_DIR / name
+            if name not in modules and shared.is_file():
+                modules[name] = shared
+                todo.append(shared)
+    return modules
 
 
-def _module_texts() -> dict[str, str]:
-    """Every module the page is made of, by file name — for the guards that read
+def _module_paths(ui_dir: Path = UI_DIR) -> dict[str, Path]:
+    return dict(sorted(_page_modules(ui_dir).items()))
+
+
+def _module_texts(ui_dir: Path = UI_DIR) -> dict[str, str]:
+    """Every module a page is made of, by file name — for the guards that read
     source, so a helper moving to another module does not move out of their sight."""
-    return {name: p.read_text() for name, p in sorted(_module_paths().items())}
+    return {name: p.read_text() for name, p in _module_paths(ui_dir).items()}
 
 
 @functools.cache
-def _served_dir() -> Path:
-    """The modules in one directory, as the image serves them. A module imports
+def _served_dir(ui_dir: Path = UI_DIR) -> Path:
+    """A page's modules in one directory, as its image serves them. A module imports
     `./time.js` whichever folder its source sits in, and node, like the browser,
     resolves that beside the importer."""
     out = Path(tempfile.mkdtemp(prefix="dockade-ui-modules-"))
     atexit.register(shutil.rmtree, out, ignore_errors=True)
-    for name, path in _module_paths().items():
+    for name, path in _module_paths(ui_dir).items():
         shutil.copyfile(path, out / name)
     return out
 
@@ -4303,30 +4318,6 @@ def _requested_paths(js: str) -> list[list[str]]:
              for stand in _ID_STANDINS] for r in raw]
 
 
-class StylesheetTests(unittest.TestCase):
-    """The palette and the rules that use it are in one file with nothing checking
-    that they agree."""
-
-    def test_every_css_variable_used_is_defined(self):
-        """A `var(--typo)` is SILENT: the declaration still parses, the page still
-        renders, and the styling simply never happens — the property falls through to
-        whatever was inherited. Found by writing one (`var(--muted)` for `--dim`), and
-        the reason it is worth a guard is that nothing about the running page looks
-        wrong afterwards.
-
-        Reads the file that ships rather than restating its palette: the point is that
-        the two halves agree, not what either of them says."""
-        css = INDEX_HTML.read_text()
-        root = re.search(r":root\s*\{(.*?)\}", css, re.S)
-        self.assertIsNotNone(root, "the :root palette block moved")
-        defined = set(re.findall(r"(--[a-z0-9-]+)\s*:", root.group(1)))
-        used = set(re.findall(r"var\((--[a-z0-9-]+)", css))
-        self.assertTrue(used, "no custom properties used — has the stylesheet moved?")
-        self.assertEqual(used - defined, set(),
-                         "used but never defined, so the declarations naming them "
-                         "do nothing")
-
-
 @unittest.skipIf(not _NODE and not _STRICT,
                  "node is not installed — skipping the dom.js unit tests")
 class EscapeTests(unittest.TestCase):
@@ -4359,145 +4350,8 @@ class EscapeTests(unittest.TestCase):
         self.assertEqual(self.out[1:], ["", "", "0", "42"])
 
 
-class InlineScriptTests(unittest.TestCase):
-    """``script-src 'self'`` is only worth sending while the page has no inline
-    script, and that invariant spans two files — so it is checked, not trusted.
-    Re-inlining would not break anything visible; it would quietly reduce the CSP to
-    decoration on the one page that renders agent-controlled strings."""
-
-    def test_the_page_carries_no_inline_script(self):
-        html = INDEX_HTML.read_text()
-        self.assertNotIn("<script>", html)
-        self.assertNotIn("javascript:", html)
-        # No inline handlers either (onclick=, onload=, …), which 'self' also forbids.
-        self.assertNotRegex(html, r"<[^>]+\son[a-z]+\s*=")
-
-    def test_the_page_loads_the_script_from_this_origin(self):
-        html = INDEX_HTML.read_text()
-        # As a MODULE: the entry imports the others, and a classic script stops at
-        # its first `import` with a SyntaxError — a blank page, and nothing here to
-        # say why.
-        self.assertIn('<script type="module" src="/app.js">', html)
-        # Never a third party: a governance UI must not fetch its own control logic
-        # from a CDN, which is also why the favicon is an inline data URI.
-        self.assertNotIn("//cdn", html)
-        self.assertNotRegex(html, r'src="https?://')
-
-    def test_the_policy_still_permits_what_the_page_actually_uses(self):
-        # The favicon is a data: URI in the markup and rewritten to another one at
-        # runtime, so img-src must keep allowing data: — the CSP and the page have to
-        # be edited together or the icon silently stops rendering.
-        html = INDEX_HTML.read_text()
-        csp = _directives(ui.guards.CSP)
-        self.assertIn("data:image/svg+xml", html)
-        self.assertEqual(csp["img-src"], ["data:"])
-        self.assertIn("<style>", html)
-        self.assertEqual(csp["style-src"], ["'unsafe-inline'"])
-
-    def test_the_hidden_attribute_survives_this_stylesheet(self):
-        """The script hides things by setting `.hidden`, which relies on the UA rule
-        `[hidden] { display: none }` — and that rule loses to ANY author rule setting
-        `display` on the same element, because author beats user-agent at equal
-        specificity. `.saturation` and `.countdown` both set `display: flex`, so both
-        were visible while the script believed otherwise; the saturation banner shipped
-        as a permanently open empty panel offering a Dismiss button.
-
-        Guarding the global override rather than enumerating the elements is the point:
-        one rule makes the whole class impossible, whereas a per-element list is a list
-        someone has to remember to extend. The page had a narrow
-        `[role="tabpanel"][hidden]` patch — the same bug, fixed once, for one element.
-        """
-        html = INDEX_HTML.read_text()
-        self.assertRegex(
-            html, r"\[hidden\]\s*\{[^}]*display:\s*none\s*!important",
-            "index.html must carry a global `[hidden] { display: none !important; }`. "
-            "Without it, any rule that sets `display` on an element the script hides "
-            "leaves it on screen — see this test's docstring.")
-        # Every element the script toggles `hidden` on, and every one the markup ships
-        # hidden, is covered by that one rule — so a NARROWER re-patch is a signal the
-        # global rule was lost or misunderstood.
-        # Comments stripped first: the rationale above this rule quotes `[hidden] {`
-        # in prose, and a scan that reads its own explanation as a violation is worse
-        # than no scan.
-        rules = re.sub(r"/\*.*?\*/", "", html, flags=re.S)
-        narrower = [s for s in re.findall(r"^\s*([^{\n]*\[hidden\][^{\n]*)\{", rules, re.M)
-                    if s.strip() != "[hidden]"]
-        self.assertEqual(narrower, [],
-                         "a scoped [hidden] rule is redundant with the global one; if "
-                         "it is there because the global rule stopped working, fix that")
-
-    def test_every_element_the_script_reaches_for_exists_in_the_page(self):
-        """Splitting the script out of the markup created a way for the two to drift:
-        a `getElementById` that matches nothing returns null, and the very next line
-        dereferences it, so a renamed id is a TypeError that only appears in a browser
-        — with no test and no linter between the edit and the operator. Same spirit as
-        the Makefile's cross-file consistency guards."""
-        js = "\n".join(_module_texts().values())
-        html = INDEX_HTML.read_text()
-        ids = set(re.findall(r"""getElementById\(["']([^"']+)["']\)""", js))
-        # The per-view ids are built by concatenation (`"view-" + v`), so expand them
-        # from the view list rather than pretending the regex could see them.
-        views = re.search(r"const VIEWS = \[([^\]]+)\]", js)
-        self.assertIsNotNone(views, "VIEWS list not found — did the view wiring move?")
-        for view in re.findall(r'"([^"]+)"', views.group(1)):
-            ids.update({f"view-{view}", f"tab-{view}"})
-        self.assertIn("pending-empty", ids)  # the keyed-render empty state
-        for element_id in sorted(ids):
-            self.assertRegex(html, rf'id="{re.escape(element_id)}"',
-                             f'the page reaches for #{element_id}, which index.html '
-                             f'does not define')
-
-    def test_every_endpoint_the_page_calls_is_served_or_relayed(self):
-        """The relay allowlist is deliberately narrow — only the backend paths this UI
-        needs cross it, so that `POST /authorize` and anything else never can. The cost
-        is a coupling with no compiler between the two ends: adding a `fetch()` to
-        app.js without adding its path to `_RELAY_ROUTES` yields a 403 that appears only
-        when a real operator loads the page against a real backend. That is exactly how
-        `/api/config` (the countdown's window) would have failed.
-
-        Paths only, not methods: the shapes here are simple and the method-level
-        allowlist has its own tests in test_control_plane_ui.py. The converse direction
-        has its own test below."""
-        js = "\n".join(_module_texts().values())
-        # Served by this container rather than relayed (see control-plane-ui/app.py).
-        local = ({"/", "/healthz", "/tasks/running"}
-                 | {f"/{name}" for name in ui.UI_MODULES})
-        calls = _requested_paths(js)
-        self.assertGreater(len(calls), 3, "no fetch/EventSource calls found — did the "
-                                          "page's I/O move somewhere this cannot see?")
-        for variants in calls:
-            self.assertTrue(
-                any(p in local or any(allowed(method, p)
-                                      for allowed in (ui._relay_allowed,
-                                                      ui._tasks_relay_allowed)
-                                      for method in ("GET", "POST"))
-                    for p in variants),
-                f"the page calls {variants[0]}, which control-plane-ui neither serves "
-                f"nor relays — add it to _RELAY_ROUTES (or _TASKS_RELAY_ROUTES) or it "
-                f"will 403 in the browser")
-
-    def test_every_relayed_route_is_actually_called(self):
-        """The converse, and the one that keeps a default-deny allowlist worth reading.
-        An entry with no caller cannot be reasoned about: nothing breaks if it is wrong,
-        so nobody finds out that it is. Two had already accumulated — `/status`, and
-        `GET /approvals`, which carries the pending hosts, clients and URLs and had been
-        superseded by the SSE stream.
-
-        Deliberately has NO exception list. A route that must stay without a caller is a
-        real possibility, but it should arrive with its reason attached, as a change to
-        this test that someone has to justify — not as an entry that quietly stops
-        matching anything."""
-        js = "\n".join(_module_texts().values())
-        calls = [p for variants in _requested_paths(js) for p in variants]
-        self.assertTrue(calls, "no fetch/EventSource calls found")
-        unused = [f"{method} {pattern.pattern}"
-                  for method, pattern in (*ui._RELAY_ROUTES, *ui._TASKS_RELAY_ROUTES)
-                  if not any(pattern.match(c) for c in calls)]
-        self.assertEqual(
-            unused, [],
-            "these routes cross the relay but nothing on the page calls them — drop "
-            "them, or wire them up; the backend keeps serving them on the "
-            "management listener either way")
+class CallSiteSourceTests(unittest.TestCase):
+    """Two call sites in app.js whose argument or order the unit probes cannot see."""
 
     def test_the_sweep_call_site_passes_a_per_card_dwell(self):
         """`shouldSweep` grew a minimum dwell because the `expired — default-denied`
@@ -4542,67 +4396,6 @@ class InlineScriptTests(unittest.TestCase):
             body, r"localAck\s*=\s*Number\([^;]*\.acknowledged\)",
             "the handler must adopt the acknowledgement the BACKEND recorded; without "
             "that echo a wrong count fails silently instead of re-raising the banner")
-
-    def test_the_modules_the_app_serves_are_the_files_it_is_served_from(self):
-        # Both directions in one equality: a file nobody listed is a 404 in the
-        # browser, and a listed file nobody wrote is one too.
-        self.assertEqual(set(ui.UI_MODULES), set(_module_texts()))
-        self.assertIn("app.js", ui.UI_MODULES)
-
-    def test_every_module_is_copied_into_the_image(self):
-        # UI_DIR points into the image, and the Dockerfile copies files by name, from
-        # the folder each sits in. A module left out of it passes every test here and
-        # 404s in the container — and the entry's first `import` of it stops the page.
-        dockerfile = (UI_DIR / "Dockerfile").read_text()
-        for name, path in sorted(_module_paths().items()):
-            with self.subTest(module=name):
-                source = path.relative_to(ROOT).as_posix()
-                self.assertRegex(dockerfile,
-                                 rf"(?m)^COPY {re.escape(source)} \./{re.escape(name)}$")
-
-    def test_no_module_name_is_in_both_folders(self):
-        # The image copies both into one directory, so the second would replace the
-        # first there while the tests read whichever they globbed last.
-        here = {p.name for p in UI_DIR.glob("*.js")}
-        common = {p.name for p in COMMON_DIR.glob("*.js")}
-        self.assertEqual(here & common, set())
-
-    def test_every_import_names_a_served_module_and_every_module_is_imported(self):
-        # The browser fetches `./x.js` from this origin, so an import of a file
-        # outside `UI_MODULES` is a 404 at load time. The converse keeps the list
-        # honest: a served module nothing imports is a file the page does not use.
-        texts = _module_texts()
-        imported = {name for js in texts.values() for name in _imports(js)}
-        self.assertEqual(imported - set(ui.UI_MODULES), set(),
-                         "imported but not served — add it to UI_MODULES")
-        self.assertEqual(set(ui.UI_MODULES) - imported - {"app.js"}, set(),
-                         "served but nothing imports it — the page never loads it")
-
-    def test_a_name_used_across_modules_is_imported_and_exported(self):
-        """The two mistakes a move between files makes, and only a browser reports:
-        a name used without an import is a ReferenceError the first time that code
-        runs — for a helper on the resolve path, at the click — and an import of a
-        name the module does not export stops the page at link time, blank. Neither
-        is a syntax error, so `node --check` passes both; the probe's `import` catches
-        the second, never the first."""
-        texts = _module_texts()
-        exports = {name: _exports(js) for name, js in texts.items()}
-        for user, js in texts.items():
-            imports = _named_imports(js)
-            code = _code(js)
-            for module, names in imports.items():
-                self.assertEqual(
-                    names - exports[module], set(),
-                    f"{user} imports these from {module}, which does not export them")
-            for module, names in exports.items():
-                if module == user:
-                    continue
-                used = {n for n in names if re.search(rf"\b{re.escape(n)}\b", code)}
-                self.assertEqual(
-                    used - imports.get(module, set()), set(),
-                    f"{user} uses these from {module} without importing them")
-
-
 #: Every name the page's modules may use without declaring or importing it: the
 #: browser's own that the page uses today. Anything else is treated as a name no scope
 #: provides, so using a further browser global is an edit here, reviewed as one.
@@ -4653,21 +4446,8 @@ def _free_names(paths: list[Path]) -> dict[str, set[str]]:
 @unittest.skipIf(not _NODE and not _STRICT,
                  "node is not installed — skipping app.js unit tests")
 class FreeNameTests(unittest.TestCase):
-    """A name a module neither declares nor imports, such as a `start()` local left
-    behind by a move, is a ReferenceError only when the code using it runs, often at a
-    click. The cross-module test above cannot see one that is no module's export. V8
-    can: it compiles such a name as a global access, and the page's only globals are
-    the browser's."""
-
-    def test_every_free_name_in_the_page_is_a_browser_global(self):
-        found = _free_names(sorted(_served_dir().glob("*.js")))
-        # Every module that touches the DOM reads `document`, so a run that found
-        # nothing is a node whose dump format changed, not a clean page.
-        self.assertIn("document", found, "the dump was not parsed; did node change it?")
-        unknown = {name: sorted(fns) for name, fns in found.items()
-                   if name not in _BROWSER_GLOBALS}
-        self.assertEqual(unknown, {},
-                         "used by these functions and declared or imported nowhere")
+    """`_free_names`, which PageChecks runs over each page, shown to find a free name
+    where a move leaves one."""
 
     def test_a_planted_free_name_is_found_inside_a_handler_nothing_calls(self):
         # The shape a move leaves behind: a closure inside a mount function, reading a
@@ -4692,18 +4472,237 @@ class FreeNameTests(unittest.TestCase):
         self.assertEqual(found.get("cards"), {"start"})
 
 
-class MountedElementTests(unittest.TestCase):
-    """A surface moved out of `start()` keeps its elements in module-level `let`s that
-    its `mount…()` functions assign, because a lookup at import would fail under node.
-    That trades a mistake `FreeNameTests` catches for one nothing else does: a lookup
-    left out of the mount is a name that resolves and holds `undefined`, a TypeError
-    at the first click that reaches it. So each name a module declares with a bare
-    `let` must be looked up exactly once, inside a mount function. Any other state is
-    declared with a value, which also says what it starts as."""
+class PageChecks:
+    """What every page here must keep true across its files, run for each page by a
+    TestCase that names it (``ApprovalPageTests`` below, ``TasksPageTests`` in
+    ``tests/test_tasks_ui_js.py``). Each check spans two files with no compiler between
+    them — markup and script, script and stylesheet, the module list, the Dockerfile and
+    the imports, the page's fetches and its server's relay table — so each is checked
+    rather than trusted."""
+
+    UI_DIR: ClassVar[Path]
+    APP: ClassVar[types.ModuleType]
+    #: The paths the page's own server answers, besides its modules.
+    LOCAL: ClassVar[frozenset[str]]
+    #: Fewer fetch/EventSource calls found than this is the scan going blind, not the
+    #: page calling less: each page's count today, less a margin.
+    MIN_CALLS: ClassVar[int]
+
+    @property
+    def index(self) -> str:
+        return (self.UI_DIR / "index.html").read_text()
+
+    def texts(self) -> dict[str, str]:
+        return _module_texts(self.UI_DIR)
+
+    def element_ids(self, js: str) -> set[str]:
+        """The ids the script reaches for; a page that builds some by concatenation
+        adds them."""
+        return set(re.findall(r"""getElementById\(["']([^"']+)["']\)""", js))
+
+    def test_every_css_variable_used_is_defined(self):
+        """A `var(--typo)` is SILENT: the declaration still parses, the page still
+        renders, and the styling simply never happens — the property falls through to
+        whatever was inherited. Found by writing one (`var(--muted)` for `--dim`), and
+        the reason it is worth a guard is that nothing about the running page looks
+        wrong afterwards."""
+        css = self.index
+        root = re.search(r":root\s*\{(.*?)\}", css, re.S)
+        self.assertIsNotNone(root, "the :root palette block moved")
+        defined = set(re.findall(r"(--[a-z0-9-]+)\s*:", root.group(1)))
+        used = set(re.findall(r"var\((--[a-z0-9-]+)", css))
+        self.assertTrue(used, "no custom properties used — has the stylesheet moved?")
+        self.assertEqual(used - defined, set(),
+                         "used but never defined, so the declarations naming them "
+                         "do nothing")
+
+    def test_the_page_carries_no_inline_script(self):
+        # `script-src 'self'` is only worth sending while there is none: re-inlining
+        # would break nothing visible and reduce the CSP to decoration.
+        html = self.index
+        self.assertNotIn("<script>", html)
+        self.assertNotIn("javascript:", html)
+        # No inline handlers either (onclick=, onload=, …), which 'self' also forbids.
+        self.assertNotRegex(html, r"<[^>]+\son[a-z]+\s*=")
+
+    def test_the_page_loads_the_script_from_this_origin(self):
+        html = self.index
+        # As a MODULE: the entry imports the others, and a classic script stops at
+        # its first `import` with a SyntaxError — a blank page, and nothing here to
+        # say why.
+        self.assertIn('<script type="module" src="/app.js">', html)
+        # Never a third party: a UI here must not fetch its own logic from a CDN,
+        # which is also why the favicon is an inline data URI.
+        self.assertNotIn("//cdn", html)
+        self.assertNotRegex(html, r'src="https?://')
+
+    def test_the_policy_still_permits_what_the_page_actually_uses(self):
+        # The favicon is a data: URI and the styles an inline block, so img-src and
+        # style-src must keep allowing them — the CSP (ui-common/guards.py) and each
+        # page have to be edited together or the icon or the styles silently go.
+        html = self.index
+        csp = _directives(self.APP.guards.CSP)
+        self.assertIn("data:image/svg+xml", html)
+        self.assertEqual(csp["img-src"], ["data:"])
+        self.assertIn("<style>", html)
+        self.assertEqual(csp["style-src"], ["'unsafe-inline'"])
+
+    def test_the_hidden_attribute_survives_this_stylesheet(self):
+        """The script hides things by setting `.hidden`, which relies on the UA rule
+        `[hidden] { display: none }` — and that rule loses to ANY author rule setting
+        `display` on the same element, because author beats user-agent at equal
+        specificity. `.saturation` and `.countdown` both set `display: flex`, so both
+        were visible while the script believed otherwise; the saturation banner shipped
+        as a permanently open empty panel offering a Dismiss button.
+
+        Guarding the global override rather than enumerating the elements is the point:
+        one rule makes the whole class impossible, whereas a per-element list is a list
+        someone has to remember to extend."""
+        html = self.index
+        self.assertRegex(
+            html, r"\[hidden\]\s*\{[^}]*display:\s*none\s*!important",
+            "index.html must carry a global `[hidden] { display: none !important; }`. "
+            "Without it, any rule that sets `display` on an element the script hides "
+            "leaves it on screen — see this test's docstring.")
+        # A NARROWER re-patch is a signal the global rule was lost or misunderstood.
+        # Comments stripped first: a rationale may quote `[hidden] {` in prose.
+        rules = re.sub(r"/\*.*?\*/", "", html, flags=re.S)
+        narrower = [s for s in re.findall(r"^\s*([^{\n]*\[hidden\][^{\n]*)\{", rules, re.M)
+                    if s.strip() != "[hidden]"]
+        self.assertEqual(narrower, [],
+                         "a scoped [hidden] rule is redundant with the global one; if "
+                         "it is there because the global rule stopped working, fix that")
+
+    def test_every_element_the_script_reaches_for_exists_in_the_page(self):
+        """A `getElementById` that matches nothing returns null, and the very next line
+        dereferences it, so a renamed id is a TypeError that only appears in a browser
+        — with no test and no linter between the edit and the operator."""
+        js = "\n".join(self.texts().values())
+        html = self.index
+        ids = self.element_ids(js)
+        self.assertTrue(ids, "no getElementById found — did the page's wiring move?")
+        for element_id in sorted(ids):
+            self.assertRegex(html, rf'id="{re.escape(element_id)}"',
+                             f'the page reaches for #{element_id}, which index.html '
+                             f'does not define')
+
+    def test_every_endpoint_the_page_calls_is_served_or_relayed(self):
+        """The relay allowlist is deliberately narrow, so a `fetch()` added without its
+        path in `_RELAY_ROUTES` is a 403 that appears only when a real operator loads
+        the page against a real upstream. Paths only, not methods: the method-level
+        allowlist has its own tests beside each app's. The converse is below."""
+        js = "\n".join(self.texts().values())
+        local = self.LOCAL | {f"/{name}" for name in self.APP.UI_MODULES}
+        calls = _requested_paths(js)
+        self.assertGreaterEqual(len(calls), self.MIN_CALLS,
+                                "too few fetch/EventSource calls found — did the page's "
+                                "I/O move somewhere this cannot see?")
+        for variants in calls:
+            self.assertTrue(
+                any(p in local or any(self.APP._relay_allowed(method, p)
+                                      for method in ("GET", "POST"))
+                    for p in variants),
+                f"the page calls {variants[0]}, which its server neither serves nor "
+                f"relays — add it to _RELAY_ROUTES or it will 403 in the browser")
+
+    def test_every_relayed_route_is_actually_called(self):
+        """The converse, and the one that keeps a default-deny allowlist worth reading:
+        an entry with no caller cannot be reasoned about, because nothing breaks if it
+        is wrong. Deliberately has NO exception list: a route that must stay without a
+        caller should arrive with its reason, as a change to this test."""
+        js = "\n".join(self.texts().values())
+        calls = [p for variants in _requested_paths(js) for p in variants]
+        self.assertTrue(calls, "no fetch/EventSource calls found")
+        unused = [f"{method} {pattern.pattern}"
+                  for method, pattern in self.APP._RELAY_ROUTES
+                  if not any(pattern.match(c) for c in calls)]
+        self.assertEqual(unused, [], "these routes cross the relay but nothing on the "
+                                     "page calls them — drop them, or wire them up")
+
+    def test_the_modules_the_app_serves_are_the_files_it_is_served_from(self):
+        # Both directions in one equality: a file nobody listed is a 404 in the
+        # browser, and a listed file nobody wrote is one too.
+        self.assertEqual(set(self.APP.UI_MODULES), set(self.texts()))
+        self.assertIn("app.js", self.APP.UI_MODULES)
+
+    def test_every_module_is_copied_into_the_image(self):
+        # The app's UI_DIR points into the image, and the Dockerfile copies files by
+        # name, from the folder each sits in. A module left out of it passes every test
+        # here and 404s in the container — and the first `import` of it stops the page.
+        dockerfile = (self.UI_DIR / "Dockerfile").read_text()
+        for name, path in _module_paths(self.UI_DIR).items():
+            with self.subTest(module=name):
+                source = path.relative_to(ROOT).as_posix()
+                self.assertRegex(dockerfile,
+                                 rf"(?m)^COPY {re.escape(source)} \./{re.escape(name)}$")
+        copied = set(re.findall(r"(?m)^COPY \S+\.js \./(\S+\.js)$", dockerfile))
+        self.assertEqual(copied, set(self.APP.UI_MODULES), "copied but not served")
+
+    def test_no_module_name_is_in_both_folders(self):
+        # The image copies both into one directory, so the second would replace the
+        # first there while the tests read whichever they found first.
+        here = {p.name for p in self.UI_DIR.glob("*.js")}
+        common = {p.name for p in COMMON_DIR.glob("*.js")}
+        self.assertEqual(here & common, set())
+
+    def test_every_import_names_a_served_module_and_every_module_is_imported(self):
+        # The browser fetches `./x.js` from this origin, so an import of a file
+        # outside `UI_MODULES` is a 404 at load time. The converse keeps the list
+        # honest: a served module nothing imports is a file the page does not use.
+        texts = self.texts()
+        imported = {name for js in texts.values() for name in _imports(js)}
+        self.assertEqual(imported - set(self.APP.UI_MODULES), set(),
+                         "imported but not served — add it to UI_MODULES")
+        self.assertEqual(set(self.APP.UI_MODULES) - imported - {"app.js"}, set(),
+                         "served but nothing imports it — the page never loads it")
+
+    def test_a_name_used_across_modules_is_imported_and_exported(self):
+        """The two mistakes a move between files makes, and only a browser reports:
+        a name used without an import is a ReferenceError the first time that code
+        runs, and an import of a name the module does not export stops the page at
+        link time, blank. Neither is a syntax error, so `node --check` passes both."""
+        texts = self.texts()
+        exports = {name: _exports(js) for name, js in texts.items()}
+        for user, js in texts.items():
+            imports = _named_imports(js)
+            code = _code(js)
+            for module, names in imports.items():
+                self.assertEqual(
+                    names - exports[module], set(),
+                    f"{user} imports these from {module}, which does not export them")
+            for module, names in exports.items():
+                if module == user:
+                    continue
+                used = {n for n in names if re.search(rf"\b{re.escape(n)}\b", code)}
+                self.assertEqual(
+                    used - imports.get(module, set()), set(),
+                    f"{user} uses these from {module} without importing them")
+
+    def test_every_free_name_in_the_page_is_a_browser_global(self):
+        """A name a module neither declares nor imports, such as a `start()` local left
+        behind by a move, is a ReferenceError only when the code using it runs, often
+        at a click. The cross-module test above cannot see one that is no module's
+        export. V8 can: it compiles such a name as a global access, and a page's only
+        globals are the browser's."""
+        if not _NODE and not _STRICT:
+            self.skipTest("node is not installed")
+        found = _free_names(sorted(_served_dir(self.UI_DIR).glob("*.js")))
+        # Every module that touches the DOM reads `document`, so a run that found
+        # nothing is a node whose dump format changed, not a clean page.
+        self.assertIn("document", found, "the dump was not parsed; did node change it?")
+        unknown = {name: sorted(fns) for name, fns in found.items()
+                   if name not in _BROWSER_GLOBALS}
+        self.assertEqual(unknown, {},
+                         "used by these functions and declared or imported nowhere")
 
     def test_every_element_a_module_declares_is_looked_up_once_in_its_mount(self):
+        """A surface's elements live in module-level `let`s that its `mount…()`
+        functions assign, because a lookup at import would fail under node. A lookup
+        left out of the mount is a name that resolves and holds `undefined`, a TypeError
+        at the first click that reaches it. So each name a module declares with a bare
+        `let` must be looked up exactly once, inside a mount function."""
         declared_anywhere = False
-        for module, js in _module_texts().items():
+        for module, js in self.texts().items():
             names = [n.strip() for block in re.findall(r"^let ([\w\s,]+);$", js, re.M)
                      for n in block.split(",")]
             mounts = "\n".join(re.findall(
@@ -4718,6 +4717,32 @@ class MountedElementTests(unittest.TestCase):
                                      "looked up outside a mount function too")
         # The pattern is in use, so a regex that stopped matching it would pass empty.
         self.assertTrue(declared_anywhere, "no bare `let` found; did the shape change?")
+
+
+class ApprovalPageTests(PageChecks, unittest.TestCase):
+    UI_DIR = UI_DIR
+    APP = ui
+    LOCAL = frozenset({"/", "/healthz", "/tasks-link"})
+    MIN_CALLS = 20
+
+    def test_the_link_to_the_tasks_ui_opens_apart_from_this_page(self):
+        # A new tab with no `window.opener` handle back on this one, and no referrer:
+        # the page it opens renders what agents wrote.
+        link = re.search(r'<a id="tasks-link"[^>]*>', self.index)
+        self.assertIsNotNone(link)
+        self.assertIn('target="_blank"', link.group(0))
+        self.assertIn('rel="noopener noreferrer"', link.group(0))
+
+    def element_ids(self, js: str) -> set[str]:
+        ids = super().element_ids(js)
+        # The per-view ids are built by concatenation (`"view-" + v`), so expand them
+        # from the view list rather than pretending the regex could see them.
+        views = re.search(r"const VIEWS = \[([^\]]+)\]", js)
+        self.assertIsNotNone(views, "VIEWS list not found — did the view wiring move?")
+        for view in re.findall(r'"([^"]+)"', views.group(1)):
+            ids.update({f"view-{view}", f"tab-{view}"})
+        self.assertIn("pending-empty", ids)  # the keyed-render empty state
+        return ids
 
 
 if __name__ == "__main__":
@@ -5264,296 +5289,3 @@ class PayloadColourTests(unittest.TestCase):
         for kind in ("key", "value", "escape", "punct", "mark"):
             with self.subTest(kind):
                 self.assertRegex(html, rf"\.j-{kind}\b[^{{]*\{{[^}}]*color:")
-
-
-
-_TASKS_PROBE = r"""
-import { pathToFileURL } from "node:url";
-const t = await import(pathToFileURL(`${process.env.DOCKADE_UI_DIR}/tasks.js`).href);
-const ids = n => Array.from({length: n}, (_, i) => ({id: 100 - i}));
-console.log(JSON.stringify({
-  states: t.TASK_STATES, every: t.EVERY_STATE, not_running: t.NOT_RUNNING_STATUS,
-  not_running_text: t.NOT_RUNNING_TEXT, poll_ms: t.TASKS_POLL_MS, page_max: t.PAGE_MAX,
-  spell: {
-    plain: t.spellHidden("fix the relay\n\tthen the tests"),
-    bidi: t.spellHidden("approve\u202e;tpircs"),
-    zero_width: t.spellHidden("a\u200bb\u2066c\u2069"),
-    controls: t.spellHidden("a\rb\u0007c\u2028d"),
-    astral: t.spellHidden("tag\u{E0041}"),
-    separators: t.spellHidden("a\u2029b"),
-    ignorable: t.spellHidden("ok\u2705\ufe0f a\u034fb\u3164c\u{E0101}d"),
-    visible: t.spellHidden("em \u2014 dash, caf\u00e9, \u0430"),
-    missing: t.spellHidden(undefined),
-  },
-  note: [t.hiddenNote(0), t.hiddenNote(1), t.hiddenNote(3)],
-  older: {
-    newest_first: t.olderCursor(ids(50), "newest-first", 0, 120),
-    oldest_first: t.olderCursor(ids(50), "oldest-first", 0, 120),
-    last_page: t.olderCursor(ids(20), "newest-first", 100, 120),
-    exactly_one_page: t.olderCursor(ids(50), "newest-first", 0, 50),
-    short_page_stale_total: t.olderCursor(ids(30), "newest-first", 0, 120),
-    second_of_three: t.olderCursor(ids(50), "newest-first", 50, 120),
-    empty: t.olderCursor([], "newest-first", 0, 3),
-    not_a_list: t.olderCursor(null, "newest-first", 0, 3),
-    bad_id: t.olderCursor([{id: "7"}], "newest-first", 0, 3),
-  },
-  children: {
-    some: t.childrenLeft([{state: "closed"}, {state: "landing"}, {state: "open"}]),
-    done: t.childrenLeft([{state: "closed"}]),
-    none: t.childrenLeft([]),
-    missing: t.childrenLeft(undefined),
-  },
-  claim: {
-    full: t.claimText({holder: "claude-1234", branch: "fix-relay",
-                       expires_at: 1789466400}),
-    hostile: t.claimText({holder: "claude-x\u202e", branch: "b\u200b"}),
-    none: t.claimText(null),
-  },
-  badge: [0, 1, 12, null, undefined, "3", 2.5, -1].map(t.flaggedBadge),
-  status: {
-    empty: t.tasksStatus(0, false, true, false),
-    search_empty: t.tasksStatus(0, false, true, true),
-    search_failed: t.tasksStatus(0, true, true, true),
-    stale: t.tasksStatus(4, true, true, false),
-    cold: t.tasksStatus(0, true, false, false),
-    quiet: t.tasksStatus(4, false, true, false),
-    flagged_empty: t.flaggedStatus(0, false, true),
-    flagged_stale: t.flaggedStatus(2, true, true),
-  },
-}));
-"""
-
-
-@unittest.skipIf(not _NODE and not _STRICT,
-                 "node is not installed — skipping app.js unit tests")
-class TaskViewTests(unittest.TestCase):
-    """The Tasks tab's pure half (``tasks.js``): agent text with its hidden characters
-    spelled out, the two paging orders, and what each list says about itself."""
-
-    probe: dict
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        proc = subprocess.run(  # noqa: S603 (absolute path, fixed args, as _probe)
-            [_NODE, "--input-type=module", "-e", _TASKS_PROBE],
-            env={**os.environ, "DOCKADE_UI_DIR": str(_served_dir()), "TZ": "Europe/Stockholm"},
-            capture_output=True, text=True, timeout=60, check=False)
-        if proc.returncode != 0:
-            raise AssertionError("importing tasks.js under node failed:\n" + proc.stderr)
-        cls.probe = json.loads(proc.stdout)
-
-    def test_the_states_are_the_registrys(self):
-        source = (ROOT / "task-registry" / "tasks.py").read_text()
-        states = re.search(r"^STATES = \(([^)]*)\)", source, re.M).group(1)
-        self.assertEqual(self.probe["states"], re.findall(r'"([^"]+)"', states))
-        api = (ROOT / "task-registry" / "operator_api.py").read_text()
-        self.assertIn(f'EVERY_STATE = "{self.probe["every"]}"', api)
-
-    def test_the_not_running_status_is_the_one_the_relay_sends(self):
-        self.assertEqual(self.probe["not_running"], 502)
-        src = (UI_DIR / "app.py").read_text()
-        body = re.search(r"def _registry_unreachable.*?(?=\ndef )", src, re.S).group(0)
-        self.assertIn("status_code=502", body)
-        self.assertIn("make tasks-up", self.probe["not_running_text"])
-
-    def test_prose_keeps_its_line_breaks_and_tabs(self):
-        self.assertEqual(self.probe["spell"]["plain"],
-                         {"text": "fix the relay\n\tthen the tests", "hidden": 0})
-
-    def test_a_direction_override_is_spelled_out_where_it_sits(self):
-        self.assertEqual(self.probe["spell"]["bidi"],
-                         {"text": "approve\\u202e;tpircs", "hidden": 1})
-
-    def test_every_invisible_kind_is_spelled_and_counted(self):
-        spell = self.probe["spell"]
-        self.assertEqual(spell["zero_width"],
-                         {"text": "a\\u200bb\\u2066c\\u2069", "hidden": 3})
-        self.assertEqual(spell["controls"],
-                         {"text": "a\\u000db\\u0007c\\u2028d", "hidden": 3})
-        # Outside the BMP, as the surrogate pair JSON would write.
-        self.assertEqual(spell["astral"], {"text": "tag\\udb40\\udc41", "hidden": 1})
-        self.assertEqual(spell["separators"], {"text": "a\\u2029b", "hidden": 1})
-
-    def test_default_ignorable_characters_are_spelled_too(self):
-        # A variation selector can carry a payload no reader sees; an emoji's U+FE0F is
-        # spelled with them rather than guessed harmless.
-        self.assertEqual(self.probe["spell"]["ignorable"],
-                         {"text": "ok\u2705\\ufe0f a\\u034fb\\u3164c\\udb40\\udd01d",
-                          "hidden": 4})
-
-    def test_visible_non_ascii_is_left_as_written(self):
-        # Prose is full of dashes and accents; a homoglyph is visible, and this view
-        # does not vouch for one (the pin view does, where a value must match exactly).
-        self.assertEqual(self.probe["spell"]["visible"],
-                         {"text": "em \u2014 dash, caf\u00e9, \u0430", "hidden": 0})
-        self.assertEqual(self.probe["spell"]["missing"], {"text": "", "hidden": 0})
-
-    def test_the_note_counts_what_was_spelled(self):
-        self.assertEqual(self.probe["note"][0], "")
-        self.assertIn("1 invisible or direction-changing character spelled",
-                      self.probe["note"][1])
-        self.assertIn("3 invisible or direction-changing characters", self.probe["note"][2])
-
-    def test_each_paging_order_takes_its_cursor_from_its_own_end(self):
-        older = self.probe["older"]
-        self.assertEqual(older["newest_first"], 51)   # the last of 100..51
-        self.assertEqual(older["oldest_first"], 100)  # the first
-        self.assertEqual(older["second_of_three"], 51)
-
-    def test_nothing_older_is_offered_past_the_total(self):
-        older = self.probe["older"]
-        # A page short of full is the last even when the total, which counts what
-        # arrived since, says otherwise.
-        for key in ("last_page", "exactly_one_page", "short_page_stale_total", "empty",
-                    "not_a_list", "bad_id"):
-            with self.subTest(case=key):
-                self.assertIsNone(older[key])
-
-    def test_a_parent_counts_every_child_not_closed(self):
-        children = self.probe["children"]
-        self.assertEqual(children["some"], {"left": 2, "total": 3,
-                                            "text": "2 of 3 not closed"})
-        self.assertEqual(children["done"]["left"], 0)
-        self.assertEqual(children["none"], {"left": 0, "total": 0, "text": ""})
-        self.assertEqual(children["missing"], children["none"])
-
-    def test_a_claim_names_its_holder_branch_and_end(self):
-        claim = self.probe["claim"]
-        self.assertTrue(claim["full"].startswith("held by claude-1234 on fix-relay, until "))
-        self.assertRegex(claim["full"], r"until \d{4}-\d\d-\d\d \d\d:\d\d:\d\d$")
-        self.assertEqual(claim["hostile"], "held by claude-x\\u202e on b\\u200b")
-        self.assertEqual(claim["none"], "")
-
-    def test_the_badge_is_a_count_or_nothing(self):
-        self.assertEqual(self.probe["badge"], ["", "1", "12", "", "", "3", "", ""])
-
-    def test_each_list_says_what_its_empty_and_its_stale_mean(self):
-        status = self.probe["status"]
-        self.assertEqual(status["empty"]["text"], "No tasks here.")
-        self.assertEqual(status["search_empty"]["text"], "No task matches that search.")
-        # A failed search is a failure, not an empty answer.
-        self.assertEqual(status["search_failed"]["level"], "warn")
-        self.assertIn("Could not", status["search_failed"]["text"])
-        self.assertIn("may be out of date", status["stale"]["text"])
-        self.assertEqual(status["cold"]["text"], "Could not load the tasks.")
-        self.assertFalse(status["quiet"]["show"])
-        self.assertEqual(status["flagged_empty"]["text"], "No note waits on you.")
-        self.assertEqual(status["flagged_stale"]["level"], "warn")
-
-    def test_a_page_is_the_registrys_page(self):
-        reads = (ROOT / "task-registry" / "reads.py").read_text()
-        moves = (ROOT / "task-registry" / "operator_moves.py").read_text()
-        self.assertIn(f"LIST_MAX = {self.probe['page_max']}\n", reads)
-        self.assertIn(f"PAGE = {self.probe['page_max']}\n", moves)
-
-    def test_the_poll_is_slower_than_the_policy_views(self):
-        self.assertGreater(self.probe["poll_ms"], 4000)
-
-
-class TaskPollingSourceTests(unittest.TestCase):
-    """The registry is optional: the page asks this container whether it answers, and
-    nothing calls it, or polls it, unless it did. Read from the source, as the other
-    poll-gating guards are, since only a browser runs ``start()``."""
-
-    APP = APP_JS.read_text()
-    TASKS = (UI_DIR / "tasks.js").read_text()
-
-    def _function(self, src: str, name: str) -> str:
-        return re.search(rf"^(?:export )?(?:async )?function {name}\(.*?^\}}", src,
-                         re.M | re.S).group(0)
-
-    def test_every_registry_read_returns_early_unless_it_answers(self):
-        for name in ("refreshTasks", "refreshFlagged"):
-            with self.subTest(function=name):
-                body = self._function(self.TASKS, name)
-                first = body.split("\n")[1].strip()
-                self.assertTrue(first.startswith("if (!registryIsRunning()"), first)
-
-    def test_the_poll_is_gated_on_the_registry_answering(self):
-        polls = re.findall(r"setInterval\(\(\) => \{\n([^\n]*)\n(?:[^\n]*\n){0,3}?"
-                           r"  \}, TASKS_POLL_MS\)", self.APP)
-        self.assertEqual(len(polls), 1, "one interval paced by TASKS_POLL_MS in app.js")
-        self.assertIn("!registryIsRunning()", polls[0])
-
-    def test_startup_asks_this_container_and_not_the_registry(self):
-        start = self._function(self.APP, "start")
-        wiring = start[start.index("showView(current);"):]
-        self.assertIn("probeRegistry();", wiring)
-        probe = self._function(self.TASKS, "probe")
-        self.assertIn('fetch("/tasks/running")', probe)
-        # Running only on the answer's word, not on the UI having answered at all.
-        self.assertIn(".running === true", probe)
-        # The registry's own reads only after it answered.
-        self.assertLess(probe.index('fetch("/tasks/running")'), probe.index("if (up)"))
-        self.assertLess(probe.index("if (up)"), probe.index("refreshTasks()"))
-
-    def test_one_ask_at_a_time(self):
-        # Loaded at #tasks, the view opening and start-up would each ask.
-        body = self._function(self.TASKS, "probeRegistry")
-        self.assertIn("if (!probing) probing = probe()", body)
-        self.assertIn("return probing;", body)
-
-    def test_a_flagged_read_that_finds_it_gone_draws_nothing(self):
-        # Checked again after the fetch: a 502 clears the badge, and drawing the old
-        # page would set it back.
-        body = self._function(self.TASKS, "refreshFlagged")
-        after = body[body.index("registryJson(await fetch"):]
-        self.assertIn("if (!registryIsRunning()) return;", after)
-
-    def test_opening_the_tab_asks_again_when_it_was_not_running(self):
-        show = re.search(r"function showView\(name\) \{.*?\n  \}", self.APP, re.S).group(0)
-        self.assertIn('if (current === "tasks")', show)
-        self.assertIn("else probeRegistry();", show)
-
-    def test_a_502_stops_the_polls(self):
-        body = self._function(self.TASKS, "registryJson")
-        self.assertIn("res.status === NOT_RUNNING_STATUS", body)
-        self.assertIn("setRunning(false)", body)
-
-    def test_the_tab_badge_is_never_hot(self):
-        # A backlog nobody waits on: quiet, unlike the approvals badge.
-        self.assertNotRegex(self.TASKS, r"badge.*hot|classList.*hot")
-        html = INDEX_HTML.read_text()
-        self.assertIn('<span class="badge" id="badge-tasks"></span>', html)
-
-
-class TaskRenderingSourceTests(unittest.TestCase):
-    """How the Tasks tab draws agent text, read from the source as the pin panel's is:
-    a browser is the only thing that runs it. Every field an agent wrote reaches the
-    page through ``spellHidden``, directly or through a helper that calls it, and as
-    text."""
-
-    TASKS = (UI_DIR / "tasks.js").read_text()
-    # A field an agent wrote, read off one of the registry's records.
-    FIELD = re.compile(r"\b(?:t|n|h|task|claim)(?:\.claim)?\."
-                       r"(?:title|body|text|author|holder|branch|progress|footprint)\b")
-    SPELT = ("spellHidden(", "proseBlock(", "textCell(", "authorCell(", "claimText(")
-
-    def test_nothing_is_parsed_as_markup(self):
-        self.assertNotRegex(self.TASKS, r"innerHTML|outerHTML|insertAdjacentHTML|"
-                                        r"document\.write|DOMParser")
-
-    def test_every_agent_field_goes_through_the_spelling(self):
-        code = _code(self.TASKS)
-        lines = [ln for ln in code.splitlines() if self.FIELD.search(ln)]
-        self.assertGreater(len(lines), 10, "the field pattern found too little")
-        for ln in lines:
-            if re.match(r"\s*if \(", ln):
-                continue        # a condition reads the field; it draws nothing
-            with self.subTest(line=ln.strip()):
-                self.assertTrue(any(s in ln for s in self.SPELT), ln)
-
-    def test_the_helpers_spell_and_set_text(self):
-        for name in ("proseBlock", "authorCell"):
-            body = re.search(rf"^function {name}\(.*?^\}}", self.TASKS,
-                             re.M | re.S).group(0)
-            with self.subTest(helper=name):
-                self.assertIn("spellHidden(", body)
-        prose = re.search(r"^function proseBlock\(.*?^\}", self.TASKS, re.M | re.S)
-        self.assertIn("pre.textContent = shown.text", prose.group(0))
-        text = re.search(r"^function textCell\(.*?^\}", self.TASKS, re.M | re.S)
-        self.assertIn("proseBlock(text)", text.group(0))
-
-    def test_a_history_value_is_spelled_whatever_its_type(self):
-        self.assertIn('typeof value === "string" ? proseBlock(value)', self.TASKS)
-        self.assertIn("spellHidden(JSON.stringify(value)).text", self.TASKS)

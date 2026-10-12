@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The operator API: ``operator_moves`` and ``reads`` as plain JSON over HTTP, for the
-control-plane UI to relay to. No HTML and no MCP: the UI renders, and agents reach the
-registry through the gateway alone.
+tasks UI (``tasks-ui/app.py``) to relay to. No HTML and no MCP: the UI renders, and
+agents reach the registry through the gateway alone.
 
 The app object only. What binds it, and where, is the service's entry
 (``task-registry/DESIGN.md``, "The operator API").

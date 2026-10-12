@@ -184,11 +184,11 @@ instruction, matters more here. A hidden note does not even match.
 ## The operator API
 
 **`operator_api` serves `operator_moves` and `reads` as JSON, and its one caller must be
-the control-plane UI,** which renders agent text behind the escaping and framing guards
-it already has; the API serves no HTML, and nothing an agent calls. It takes no token:
-as with the UI's relay to the control plane, being on its network is the permission, so
-`serve.py` binds it on a network of its own, refuses to start anywhere else, and
-answers that network's peers only (the root `DESIGN.md`, "Task registry").
+the tasks UI (`tasks-ui/`),** which renders agent text behind the browser guards both
+UIs share; the API serves no HTML, and nothing an agent calls. It takes no token: as
+with the approval UI's relay to the control plane, being on its network is the
+permission, so `serve.py` binds it on a network of its own, refuses to start anywhere
+else, and answers that network's peers only (the root `DESIGN.md`, "Task registry").
 
 **A body is checked for shape before the store's checks run** (`operator_api.Body`), as
 the agent listener's calls are: an unknown field is refused, and ids, revisions and

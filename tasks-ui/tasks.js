@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-/* The Tasks tab: the task registry's work list, read through this UI's relay to the
- * registry's operator listener (`/tasks/api/…`, control-plane-ui/app.py). A backlog
- * nobody waits on, so nothing here alerts the way a hold does: the tab carries a quiet
- * count of the notes agents flagged for the operator, and the lamp ignores it.
+/* The tasks page: the task registry's work list, read through this UI's relay to the
+ * registry's operator listener (`/api/…`, tasks-ui/app.py). A backlog nobody waits on,
+ * so nothing here alerts the way a hold does: the page's title carries a quiet count of
+ * the notes agents flagged for the operator.
  *
- * The registry is optional (`make tasks-up`). The page asks `/tasks/running` first,
- * which this container answers itself, so a registry that is not running is one line
- * on this tab rather than a failed request in the console; and nothing here polls it
- * until the operator opens the tab again.
+ * The registry can stop on its own. The page asks `/running` first, which this
+ * container answers itself, so a registry that is not running is one line on the page
+ * rather than a failed request in the console; and nothing here calls it again until
+ * `/running` says it answers.
  *
  * Every string a task carries was written by an agent, or by the operator for agents
  * to read, so it is set as textContent, and a character that renders as nothing or
@@ -27,12 +27,13 @@ export const TASK_STATES = ["proposed", "open", "landing", "deferred", "closed"]
 export const EVERY_STATE = "all";
 
 // Characters that render as nothing or reorder what is around them: the payload
-// view's set (payload.js), less the line break and the tab, since this is prose, and
-// with Unicode's default-ignorable code points, which include the variation selectors
-// a hidden payload can ride on to an agent. One U+202E in a body draws the rest of its
-// line backwards, and an approved body is what every later session reads, so the
-// operator must see what is in it rather than what the browser makes of it. An emoji's
-// U+FE0F is spelled too: the price of not guessing which selector carries nothing.
+// view's set (control-plane-ui/payload.js), less the line break and the tab, since this
+// is prose, and with Unicode's default-ignorable code points, which include the
+// variation selectors a hidden payload can ride on to an agent. One U+202E in a body
+// draws the rest of its line backwards, and an approved body is what every later
+// session reads, so the operator must see what is in it rather than what the browser
+// makes of it. An emoji's U+FE0F is spelled too: the price of not guessing which
+// selector carries nothing.
 // The task registry's export spells the same set (task-registry/export.py).
 const HIDDEN_RE =
   /(?![\n\t])[\p{Cf}\p{Cc}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}]/gu;
@@ -92,11 +93,19 @@ export function claimText(claim) {
   return text;
 }
 
-// The tab's quiet count: notes waiting on the operator, or nothing. Never "0", which
-// would still draw the eye to a tab nobody needs to open.
+// The quiet count: notes waiting on the operator, or nothing. Never "0", which would
+// still draw the eye to a page nobody needs to open.
 export function flaggedBadge(total) {
   const n = Number(total);
   return Number.isInteger(n) && n > 0 ? String(n) : "";
+}
+
+// The page's title, with that count ahead of it as the approval page puts its pending
+// count, so a background tab shows it in the tab strip.
+export const PAGE_TITLE = "dockade tasks";
+export function pageTitle(total) {
+  const count = flaggedBadge(total);
+  return (count ? `(${count}) ` : "") + PAGE_TITLE;
 }
 
 // What a list says about itself, as every polled list does (list-status.js). Its own
@@ -126,14 +135,14 @@ export function flaggedStatus(rowCount, failed, loaded) {
 }
 
 // The relay's answer when the registry did not answer (`_registry_unreachable` in
-// control-plane-ui/app.py); the registry never sends it itself.
+// tasks-ui/app.py); the registry never sends it itself.
 export const NOT_RUNNING_STATUS = 502;
 export const NO_REPOS_TEXT =
   "The registry has no repos yet. A repo is one the operator adds; until then no "
   + "agent can file a task.";
 export const NOT_RUNNING_TEXT =
-  "The task registry is not running, or this UI cannot reach it. make tasks-up starts "
-  + "it; this tab asks again when you open it.";
+  "The task registry is not running, or this page cannot reach it. make tasks-up "
+  + "starts it; this page picks it up again when it answers.";
 
 // ── the DOM ─────────────────────────────────────────────────────────────────
 
@@ -143,7 +152,7 @@ export const TASKS_POLL_MS = 15000;
 
 let tasksDown, tasksUp, tasksRepo, tasksState, tasksSearch, tasksBody, tasksEmpty,
   tasksOlder, tasksNewest, taskCountEl, taskDetail, flaggedBody, flaggedEmpty,
-  flaggedOlder, flaggedNewest, flaggedCountEl, tasksBadge;
+  flaggedOlder, flaggedNewest, flaggedCountEl;
 
 let running = null;        // null: not asked yet
 let probing = null;        // the ask in flight, if one is
@@ -181,12 +190,12 @@ function setRunning(up) {
   running = up;
   tasksDown.hidden = up;
   tasksUp.hidden = !up;
-  if (!up) tasksBadge.textContent = "";
+  if (!up) document.title = PAGE_TITLE;
 }
 
-// Ask this container whether the registry answers, then load what the tab shows.
-// One ask at a time: a page loaded at #tasks would otherwise ask twice, once as its
-// view opens and once at start-up.
+// Ask this container whether the registry answers, then load what the page shows.
+// One ask at a time: a return to the page while the first ask is out would otherwise
+// make a second.
 export function probeRegistry() {
   if (!probing) probing = probe().finally(() => { probing = null; });
   return probing;
@@ -195,7 +204,7 @@ export function probeRegistry() {
 async function probe() {
   let up = false;
   try {
-    const res = await fetch("/tasks/running");
+    const res = await fetch("/running");
     up = res.ok && (await res.json()).running === true;
   } catch (e) {
     up = false;
@@ -210,7 +219,7 @@ async function probe() {
 
 async function refreshRepos() {
   try {
-    repos = await registryJson(await fetch("/tasks/api/repos"));
+    repos = await registryJson(await fetch("/api/repos"));
   } catch (e) {
     return;
   }
@@ -278,11 +287,11 @@ export async function refreshTasks() {
     if (searching) {
       const q = new URLSearchParams({ text: searching });
       if (tasksRepo.value) q.set("repo", tasksRepo.value);
-      page = await registryJson(await fetch(`/tasks/api/search?${q}`));
+      page = await registryJson(await fetch(`/api/search?${q}`));
     } else {
       const q = new URLSearchParams({ repo: tasksRepo.value, state: tasksState.value });
       if (before !== undefined) q.set("before", String(before));
-      page = await registryJson(await fetch(`/tasks/api/tasks?${q}`));
+      page = await registryJson(await fetch(`/api/tasks?${q}`));
     }
     lastTasks = page.tasks;
     lastTotal = page.total;
@@ -311,7 +320,7 @@ export async function refreshFlagged() {
   const before = flaggedPages[flaggedPages.length - 1];
   if (before !== undefined) q.set("before", String(before));
   try {
-    const page = await registryJson(await fetch(`/tasks/api/notes/flagged?${q}`));
+    const page = await registryJson(await fetch(`/api/notes/flagged?${q}`));
     lastFlagged = page.notes;
     lastFlaggedTotal = page.total;
     flaggedFailed = false;
@@ -338,9 +347,9 @@ export async function refreshFlagged() {
     flaggedBody.appendChild(tr);
   }
   flaggedCountEl.textContent = flaggedLoaded ? `· ${lastFlaggedTotal}` : "";
-  // The badge counts every flagged note not yet handled, whichever page is shown.
+  // The count is every flagged note not yet handled, whichever page is shown.
   if (flaggedPages.length === 0 && flaggedLoaded) {
-    tasksBadge.textContent = flaggedBadge(lastFlaggedTotal);
+    document.title = pageTitle(lastFlaggedTotal);
   }
   renderListStatus(flaggedEmpty,
                    flaggedStatus(lastFlagged.length, flaggedFailed, flaggedLoaded));
@@ -401,8 +410,8 @@ async function showTask(id) {
   let task, notes;
   try {
     const path = encodeURIComponent(id);
-    task = await registryJson(await fetch(`/tasks/api/tasks/${path}`));
-    notes = await registryJson(await fetch(`/tasks/api/tasks/${path}/notes`));
+    task = await registryJson(await fetch(`/api/tasks/${path}`));
+    notes = await registryJson(await fetch(`/api/tasks/${path}/notes`));
   } catch (e) {
     if (openTask !== id) return;
     const failed = document.createElement("div");
@@ -510,8 +519,8 @@ async function showPage(btn) {
   let page;
   try {
     page = await registryJson(kind === "notes"
-      ? await fetch(`/tasks/api/tasks/${path}/notes?${q}`)
-      : await fetch(`/tasks/api/tasks/${path}/history?${q}`));
+      ? await fetch(`/api/tasks/${path}/notes?${q}`)
+      : await fetch(`/api/tasks/${path}/history?${q}`));
   } catch (e) {
     btn.textContent = `could not load the ${kind}`;
     return;
@@ -569,7 +578,6 @@ export function mountTasks() {
   flaggedOlder = document.getElementById("flagged-older");
   flaggedNewest = document.getElementById("flagged-newest");
   flaggedCountEl = document.getElementById("flaggedcount");
-  tasksBadge = document.getElementById("badge-tasks");
 
   tasksDown.textContent = NOT_RUNNING_TEXT;
   for (const s of [...TASK_STATES, EVERY_STATE]) {

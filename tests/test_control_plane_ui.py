@@ -28,144 +28,26 @@ the tests assert real end-to-end outcomes rather than string shapes."""
 from __future__ import annotations
 
 import asyncio
-import importlib.util
-import ipaddress
 import os
 import re
 import sys
 import types
 import unittest
 from pathlib import Path
-from typing import ClassVar
 from unittest import mock
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urlsplit
+
+from _ui import load_ui, ok_host, sent
 
 ROOT = Path(__file__).resolve().parents[1]
+# The relay stub records what it was asked to send here (tests/_ui.py).
+_sent = sent
 
 _BASE = "http://control-plane:8090"
-_sent: dict = {}
-
-
-def _install_stubs() -> None:
-    # httpx: an AsyncClient whose build_request resolves the path against base_url
-    # (RFC-3986, via urljoin) so we can assert the effective upstream authority, and
-    # records the outgoing headers so we can assert provenance handling.
-    if "httpx" not in sys.modules:
-        httpx = types.ModuleType("httpx")
-
-        class _Resp:
-            status_code = 200
-            headers: ClassVar[dict] = {}
-
-            def aiter_raw(self):
-                async def _gen():
-                    if False:
-                        yield b""
-                return _gen()
-
-            async def aclose(self):
-                pass
-
-        class AsyncClient:
-            def __init__(self, *args, base_url="", **kwargs):
-                self._base = str(base_url)
-
-            def build_request(self, method, url, **kwargs):
-                _sent["url"] = urljoin(self._base, url)
-                _sent["method"] = method
-                _sent["headers"] = list(kwargs.get("headers") or [])
-                return object()
-
-            async def send(self, req, stream=False):
-                return _Resp()
-
-        class RequestError(Exception):
-            """Stand-in for the base of httpx's transport errors — what the relay
-            catches to answer 502 when the backend is unreachable."""
-
-        httpx.AsyncClient = AsyncClient
-        httpx.RequestError = RequestError
-        sys.modules["httpx"] = httpx
-
-    # Augment rather than assume ownership: discovery order is arbitrary, so another
-    # module may have installed an httpx stub of its own first.
-    if not hasattr(sys.modules["httpx"], "RequestError"):
-        sys.modules["httpx"].RequestError = type("RequestError", (Exception,), {})
-    if not hasattr(sys.modules["httpx"], "Timeout"):
-        sys.modules["httpx"].Timeout = lambda *a, **k: (a, k)
-
-    # Another test module may have installed the shared fastapi stub first (test
-    # discovery order is arbitrary), so augment whatever exists rather than assume
-    # a clean slate: ensure FastAPI.api_route/.middleware and the responses the UI
-    # imports. Response stubs expose .status_code so guard refusals are assertable.
-    def _decorator(*_a, **_k):
-        return lambda fn: fn
-
-    class _R:
-        def __init__(self, *a, **k):
-            self.args, self.kwargs = a, k
-            self.status_code = k.get("status_code", 200)
-            self.body = a[0] if a else None
-            # A dict stands in for Starlette's MutableHeaders — `security_headers`
-            # writes onto every response it wraps, refusals included.
-            self.headers = dict(k.get("headers") or {})
-
-    if "fastapi" not in sys.modules:
-        fa = types.ModuleType("fastapi")
-
-        class FastAPI:
-            def __init__(self, *a, **k):
-                pass
-
-            get = staticmethod(_decorator)
-            post = staticmethod(_decorator)
-            api_route = staticmethod(_decorator)
-            middleware = staticmethod(_decorator)
-
-        class Request:
-            pass
-
-        fa.FastAPI = FastAPI
-        fa.Request = Request
-        responses = types.ModuleType("fastapi.responses")
-        responses.StreamingResponse = _R
-        fa.responses = responses
-        sys.modules["fastapi"] = fa
-        sys.modules["fastapi.responses"] = responses
-
-    fa = sys.modules["fastapi"]
-    for meth in ("get", "post", "api_route", "middleware"):
-        if not hasattr(fa.FastAPI, meth):
-            setattr(fa.FastAPI, meth, staticmethod(_decorator))
-    responses = sys.modules["fastapi.responses"]
-    # `Response` is the BASE class the relay handler is annotated with (a union
-    # annotation makes real FastAPI raise at import — see the note on `proxy`), so the
-    # stub must expose it too or the module under test cannot be imported at all.
-    for name in ("FileResponse", "StreamingResponse", "PlainTextResponse",
-                 "JSONResponse", "Response"):
-        if not hasattr(responses, name):
-            setattr(responses, name, _R)
-
-    if "starlette.background" not in sys.modules:
-        starlette = sys.modules.setdefault("starlette", types.ModuleType("starlette"))
-        bg = types.ModuleType("starlette.background")
-        bg.BackgroundTask = lambda *a, **k: None
-        starlette.background = bg
-        sys.modules["starlette.background"] = bg
 
 
 def _load_ui(name: str = "dockade_control_plane_ui") -> types.ModuleType:
-    _install_stubs()
-    # The image copies ui-common/'s modules beside app.py, which imports them by plain
-    # name; here they are found on the path instead.
-    if str(ROOT / "ui-common") not in sys.path:
-        sys.path.insert(0, str(ROOT / "ui-common"))
-    path = ROOT / "control-plane-ui" / "app.py"
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
+    return load_ui("control-plane-ui", name)
 
 
 ui = _load_ui()
@@ -176,33 +58,6 @@ ui = _load_ui()
 _ALLOW_ANYTHING = (("GET", re.compile(r"^/.*$")), ("POST", re.compile(r"^/.*$")))
 
 
-class _FakeRequest:
-    """Minimal stand-in for a Starlette Request. Headers are lowercased on the way
-    in, matching Starlette's case-insensitive mapping, since the app reads them in
-    lowercase."""
-
-    def __init__(self, method="GET", headers=None, peer="127.0.0.1"):
-        self.method = method
-        self.query_params = {}
-        self._headers = {k.lower(): v for k, v in (headers or {}).items()}
-        self.headers = types.SimpleNamespace(
-            get=self._headers.get, items=lambda: list(self._headers.items()))
-        self.client = types.SimpleNamespace(host=peer) if peer else None
-
-    async def body(self) -> bytes:
-        return b""
-
-
-def _ok_host(**kw):
-    """A request that already satisfies the Host guard, for tests about other guards."""
-    headers = {"host": "127.0.0.1:28090", **kw.pop("headers", {})}
-    return _FakeRequest(headers=headers, **kw)
-
-
-async def _passthrough(_request):
-    return "REACHED-THE-APP"
-
-
 class RelayAllowlistTests(unittest.TestCase):
     """Only the paths this UI actually uses are relayed — above all NOT
     ``POST /authorize``, reaching which means forged audit rows and consumed hold
@@ -210,7 +65,7 @@ class RelayAllowlistTests(unittest.TestCase):
 
     def _proxy(self, captured_path, method="GET"):
         _sent.clear()
-        return asyncio.run(ui.proxy(captured_path, _ok_host(method=method)))
+        return asyncio.run(ui.proxy(captured_path, ok_host(method=method)))
 
     def test_ui_paths_are_relayed(self):
         for path, method in (("approvals/stream", "GET"),
@@ -359,11 +214,11 @@ class ProvenanceHeaderTests(unittest.TestCase):
         return _sent["headers"]
 
     def test_actor_header_is_set_from_the_observed_peer(self):
-        headers = self._relay_headers(_ok_host(peer="10.9.9.9"))
+        headers = self._relay_headers(ok_host(peer="10.9.9.9"))
         self.assertIn((ui.ACTOR_HEADER, "10.9.9.9"), headers)
 
     def test_client_supplied_actor_and_forwarding_headers_are_stripped(self):
-        headers = self._relay_headers(_ok_host(peer="10.9.9.9", headers={
+        headers = self._relay_headers(ok_host(peer="10.9.9.9", headers={
             ui.ACTOR_HEADER: "the-operator-honest-really",
             "x-forwarded-for": "1.2.3.4",
             "x-real-ip": "1.2.3.4",
@@ -378,7 +233,7 @@ class ProvenanceHeaderTests(unittest.TestCase):
 
     def test_host_header_is_not_forwarded(self):
         # httpx must set Host for the backend, or the upstream sees the UI's.
-        names = [k.lower() for k, _ in self._relay_headers(_ok_host())]
+        names = [k.lower() for k, _ in self._relay_headers(ok_host())]
         self.assertNotIn("host", names)
 
     def test_framing_headers_are_not_forwarded(self):
@@ -390,7 +245,7 @@ class ProvenanceHeaderTests(unittest.TestCase):
 
         `expect: 100-continue` is stripped for a different reason: the backend would
         wait for an interim response this relay never sends."""
-        headers = self._relay_headers(_ok_host(headers={
+        headers = self._relay_headers(ok_host(headers={
             "content-length": "9999",
             "transfer-encoding": "chunked",
             "expect": "100-continue",
@@ -403,7 +258,7 @@ class ProvenanceHeaderTests(unittest.TestCase):
         # They describe the connection they arrived on, not the message, so copying
         # them onto a different connection is a protocol error. Applied to requests
         # as well as responses — it used to be responses only.
-        headers = self._relay_headers(_ok_host(headers={
+        headers = self._relay_headers(ok_host(headers={
             "connection": "keep-alive", "keep-alive": "timeout=5",
             "upgrade": "websocket", "te": "trailers",
             "proxy-authorization": "Basic Zm9v",
@@ -422,7 +277,7 @@ class ProvenanceHeaderTests(unittest.TestCase):
     def test_ordinary_headers_still_reach_the_backend(self):
         # The stripping must be a list, not a filter that eats everything: a relay
         # that forwarded no headers would pass every test above.
-        headers = self._relay_headers(_ok_host(headers={
+        headers = self._relay_headers(ok_host(headers={
             "accept": "application/json", "if-none-match": '"abc"',
         }))
         names = [k.lower() for k, _ in headers]
@@ -484,7 +339,7 @@ class StaticRevalidationTests(unittest.TestCase):
         async def _next(_request):
             return ui.script("app")
 
-        resp = asyncio.run(ui.guards.security_headers(_ok_host(), _next))
+        resp = asyncio.run(ui.guards.security_headers(ok_host(), _next))
         self.assertEqual(resp.headers["cache-control"], "no-cache")
         self.assertIn("content-security-policy", resp.headers)
 
@@ -511,7 +366,7 @@ class BackendUnreachableTests(unittest.TestCase):
 
         _sent.clear()
         with mock.patch.object(ui._client, "send", _boom):
-            return asyncio.run(ui.proxy(path, _ok_host(method=method)))
+            return asyncio.run(ui.proxy(path, ok_host(method=method)))
 
     def test_transport_error_becomes_502(self):
         resp = self._proxy_with_dead_backend()
@@ -539,7 +394,7 @@ class RelayHostPinningTests(unittest.TestCase):
     def _upstream_host(self, captured_path: str) -> str:
         _sent.clear()
         with mock.patch.object(ui, "_RELAY_ROUTES", _ALLOW_ANYTHING):
-            asyncio.run(ui.proxy(captured_path, _ok_host()))
+            asyncio.run(ui.proxy(captured_path, ok_host()))
         return urlsplit(_sent["url"]).netloc
 
     def test_normal_paths_reach_the_backend(self):
@@ -559,180 +414,45 @@ class RelayHostPinningTests(unittest.TestCase):
     def test_network_path_reference_is_also_refused_by_the_allowlist(self):
         # Belt and braces: with the real allowlist in place it never gets that far.
         _sent.clear()
-        resp = asyncio.run(ui.proxy("/evil.com/x", _ok_host()))
+        resp = asyncio.run(ui.proxy("/evil.com/x", ok_host()))
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(_sent, {})
 
 
-class TasksRelayTests(unittest.TestCase):
-    """The Tasks tab's relay: ``/tasks/api/…`` goes to the task registry's operator
-    listener as ``/api/…``, exactly the routes the page calls, and nothing else does.
-    That listener takes no token, so this table is the whole of what a browser on the
-    loopback port can do there."""
+class TasksLinkTests(unittest.TestCase):
+    """``GET /tasks-link``: where the tasks UI is, for the header's link. This UI has
+    no leg on the registry's networks and asks it nothing (tasks-ui/app.py has the
+    registry's relay)."""
 
-    def _proxy(self, captured_path, method="GET", **kw):
-        _sent.clear()
-        return asyncio.run(ui.proxy(captured_path, _ok_host(method=method, **kw)))
-
-    def test_the_reads_reach_the_registry_with_the_prefix_taken_off(self):
-        for path, upstream in (("tasks/api/repos", "/api/repos"),
-                               ("tasks/api/tasks", "/api/tasks"),
-                               ("tasks/api/tasks/12", "/api/tasks/12"),
-                               ("tasks/api/tasks/12/notes", "/api/tasks/12/notes"),
-                               ("tasks/api/tasks/12/history", "/api/tasks/12/history"),
-                               ("tasks/api/notes/flagged", "/api/notes/flagged"),
-                               ("tasks/api/search", "/api/search")):
-            with self.subTest(path=path):
-                resp = self._proxy(path)
-                self.assertNotEqual(resp.status_code, 403)
-                self.assertEqual(_sent["url"], ui.TASKS_URL + upstream)
-
-    def test_nothing_else_reaches_it(self):
-        # No write yet; an id that is not digits; a control-plane path under the
-        # prefix, or a registry path without it; the agent listener's paths, and the
-        # pages FastAPI would add.
-        for path, method in (("tasks/api/tasks", "POST"),
-                             ("tasks/api/tasks/12/move", "POST"),
-                             ("tasks/api/tasks/12/break-claim", "POST"),
-                             ("tasks/api/tasks/12/notes", "POST"),
-                             ("tasks/api/notes/hide", "POST"),
-                             ("tasks/api/repos", "POST"),
-                             ("tasks/api/tasks/abc", "GET"),
-                             ("tasks/api/tasks/1/../../../api/audit", "GET"),
-                             ("tasks/api/tasks/12345678901234567890", "GET"),
-                             ("tasks/api/audit", "GET"),
-                             ("tasks/approvals/stream", "GET"),
-                             ("tasks/api/config", "GET"),
-                             ("api/repos", "GET"), ("api/tasks", "GET"),
-                             ("api/notes/flagged", "GET"),
-                             ("tasks/mcp", "POST"), ("tasks/healthz", "GET"),
-                             ("tasks/openapi.json", "GET"), ("tasks/docs", "GET"),
-                             ("tasks/running", "POST")):
-            with self.subTest(path=path, method=method):
-                resp = self._proxy(path, method)
-                self.assertEqual(resp.status_code, 403)
-                self.assertEqual(_sent, {})
-
-    def test_no_path_belongs_to_both_tables(self):
-        # The prefix is what keeps each path to one upstream.
-        for _method, rx in ui._TASKS_RELAY_ROUTES:
-            with self.subTest(pattern=rx.pattern):
-                self.assertTrue(rx.pattern.startswith("^/tasks/api/"))
-        for _method, rx in ui._RELAY_ROUTES:
-            with self.subTest(pattern=rx.pattern):
-                self.assertFalse(rx.pattern.startswith("^/tasks"))
-
-    def test_the_upstream_stays_the_registry_whatever_the_table_lets_through(self):
-        # As RelayHostPinningTests, with this table opened up: the prefix comes off and
-        # what is left is still an absolute path on the registry.
-        with mock.patch.object(ui, "_TASKS_RELAY_ROUTES",
-                               (("GET", re.compile(r"^/tasks/.*$")),)):
-            for path in ("tasks//evil.com/x", "tasks///evil.com", "/tasks//x:1/y"):
-                with self.subTest(path=path):
-                    self._proxy(path)
-                    self.assertEqual(urlsplit(_sent["url"]).netloc,
-                                     urlsplit(ui.TASKS_URL).netloc)
-
-    def test_client_provenance_headers_are_stripped_here_too(self):
-        self._proxy("tasks/api/repos", headers={"x-forwarded-for": "10.9.9.9",
-                                                ui.ACTOR_HEADER: "forged"})
-        sent = dict(_sent["headers"])
-        self.assertNotIn("x-forwarded-for", sent)
-        self.assertEqual(sent[ui.ACTOR_HEADER], "127.0.0.1")
-
-    def test_the_registrys_answer_carries_none_of_its_headers(self):
-        # The lower-trust upstream: its JSON body, and no header of its choosing.
-        class _Hostile:
-            status_code = 200
-            headers: ClassVar[dict] = {"set-cookie": "s=1", "location": "http://x/",
-                                       "content-type": "text/html",
-                                       "access-control-allow-origin": "*"}
-
-            def aiter_raw(self):
-                async def _gen():
-                    if False:
-                        yield b""
-                return _gen()
-
-            async def aclose(self):
-                pass
-
-        async def send(_req, stream=False):
-            return _Hostile()
-
-        with mock.patch.object(ui._tasks_client, "send", send), \
-                mock.patch.object(ui._client, "send", send):
-            registry = self._proxy("tasks/api/repos")
-            backend = self._proxy("api/config")
-        self.assertEqual(registry.kwargs["headers"], {"content-type": "application/json"})
-        # The control plane's are relayed as before.
-        self.assertEqual(backend.kwargs["headers"]["location"], "http://x/")
-
-    def test_a_registry_that_does_not_answer_is_a_502_in_its_own_shape(self):
-        # The status the page reads as "not running", which the registry never sends:
-        # its refusals are 400, 404, 409 and 422 (task-registry/operator_api.py).
-        async def _boom(_req, stream=False):
-            raise sys.modules["httpx"].RequestError("connection refused")
-
-        with mock.patch.object(ui._tasks_client, "send", _boom), \
-                mock.patch.object(ui._client, "send", _boom):
-            registry = self._proxy("tasks/api/repos")
-            backend = self._proxy("api/config")
-        self.assertEqual(registry.status_code, 502)
-        self.assertEqual(registry.args[0]["ok"], False)
-        self.assertIsNone(registry.args[0]["current"])
-        self.assertIn("task registry did not answer", registry.args[0]["detail"])
-        # The control plane's own stays as it was.
-        self.assertEqual(backend.status_code, 502)
-        self.assertIn("control-plane backend unreachable", backend.args[0])
-
-    def test_the_registry_is_dialled_by_address_and_with_a_bounded_wait(self):
-        # By name, a stopped registry's `tasks` would be asked of the host's DNS.
-        host = urlsplit(ui.TASKS_URL).hostname
-        self.assertEqual(str(ipaddress.ip_address(host)), host)
-        src = (ROOT / "control-plane-ui" / "app.py").read_text()
-        self.assertRegex(src, r"_tasks_client = httpx\.AsyncClient\(base_url=TASKS_URL,"
-                              r"\s+timeout=httpx\.Timeout\(10\.0, connect=2\.0\)\)")
-
-
-class TasksRunningTests(unittest.TestCase):
-    """``GET /tasks/running``, which this container answers itself: whether the task
-    registry answers, so the page asks it before calling the registry at all."""
-
-    def _ask(self, get):
-        with mock.patch.object(ui._tasks_client, "get", get, create=True):
-            return asyncio.run(ui.tasks_running())
-
-    def test_running_when_its_repo_list_answers(self):
-        asked = []
-
-        async def get(path):
-            asked.append(path)
-            return types.SimpleNamespace(status_code=200)
-
-        self.assertEqual(self._ask(get), {"running": True})
-        self.assertEqual(asked, ["/api/repos"])
-
-    def test_not_running_when_nothing_answers(self):
-        async def get(path):
-            raise sys.modules["httpx"].RequestError("timed out")
-
-        self.assertEqual(self._ask(get), {"running": False})
-
-    def test_not_running_when_it_answers_anything_but_the_list(self):
-        # A 403 is its peer check refusing this UI's address: there is no tab to show.
-        for status in (403, 404, 500):
-            async def get(path, status=status):
-                return types.SimpleNamespace(status_code=status)
-
-            with self.subTest(status=status):
-                self.assertEqual(self._ask(get), {"running": False})
+    def test_it_answers_the_configured_address(self):
+        self.assertEqual(ui.tasks_link(), {"url": ui.TASKS_LINK})
+        self.assertEqual(ui.TASKS_LINK, "http://127.0.0.1:28091/")
 
     def test_it_is_served_here_before_the_relay_route(self):
-        # Declared above the catch-all, which would otherwise take it and refuse it.
         src = (ROOT / "control-plane-ui" / "app.py").read_text()
-        self.assertLess(src.index('@app.get("/tasks/running")'),
+        self.assertLess(src.index('@app.get("/tasks-link")'),
                         src.index('@app.api_route("/{path:path}"'))
+
+    def test_only_an_http_address_is_offered(self):
+        # The page puts it in an href.
+        for url in ("javascript:alert(1)", "data:text/html,x", "//127.0.0.1:28091/",
+                    "127.0.0.1:28091", "", "http://"):
+            with self.subTest(url=url), \
+                    mock.patch.dict(os.environ, {"CONTROL_UI_TASKS_LINK": url}), \
+                    self.assertRaises(RuntimeError) as caught:
+                _load_ui("dockade_control_plane_ui_link")
+            self.assertIn("CONTROL_UI_TASKS_LINK=", str(caught.exception))
+        with mock.patch.dict(os.environ, {"CONTROL_UI_TASKS_LINK": "https://t.example/"}):
+            self.assertEqual(_load_ui("dockade_control_plane_ui_link").TASKS_LINK,
+                             "https://t.example/")
+
+    def test_the_registry_is_not_a_relayed_upstream(self):
+        for path in ("tasks/api/repos", "api/repos", "api/tasks", "tasks/running"):
+            with self.subTest(path=path):
+                _sent.clear()
+                resp = asyncio.run(ui.proxy(path, ok_host()))
+                self.assertEqual(resp.status_code, 403)
+                self.assertEqual(_sent, {})
 
 
 class GuardWiringTests(unittest.TestCase):
@@ -794,11 +514,11 @@ class EntryTests(unittest.TestCase):
     def test_anything_but_an_address_on_control_ui_net_starts_nothing(self):
         # A wildcard serves every leg; a name would make the check depend on DNS; the
         # mapped spelling is another family, which uvicorn would bind as such. Then the
-        # UI's control-net leg, and the task registry's operator network, which the UI
-        # joins for the registry's view.
+        # UI's control-net leg, and the tasks UI's address on the registry's network,
+        # and the one the approval UI held there before that page existed.
         for bind in ("", "0.0.0.0", "::", "*", "control-plane-ui", "localhost",  # noqa: S104
                      "127.0.0.1", "::1", "::ffff:172.25.0.2", "172.31.0.10",
-                     "172.26.0.3"):
+                     "172.26.0.3", "172.26.0.4"):
             with self.subTest(bind=bind), self.assertRaises(SystemExit) as caught:
                 self.run_main(bind)
             message = str(caught.exception)

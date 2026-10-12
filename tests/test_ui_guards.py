@@ -7,7 +7,7 @@ checks a UI's ``main`` starts with. Why each exists is the module's docstring.
 Run with the control-plane UI's allowlist and network, the case each was written for,
 under a name and variables no UI has, so one written into the module shows; that the UI
 passes its own is ``tests/test_control_plane_ui.py``. The stubs and fake requests are
-that module's."""
+``tests/_ui.py``'s."""
 from __future__ import annotations
 
 import asyncio
@@ -15,14 +15,8 @@ import os
 import unittest
 from unittest import mock
 
-from test_control_plane_ui import (
-    UI_BIND,
-    UI_NET,
-    _FakeRequest,
-    _ok_host,
-    _passthrough,
-    ui,
-)
+from _ui import FakeRequest, ok_host, passthrough
+from test_control_plane_ui import UI_BIND, UI_NET, ui
 
 # The module the UI imported: loading it put ui-common/ on the path, after the stubs.
 guards = ui.guards
@@ -36,7 +30,7 @@ class HostGuardTests(unittest.TestCase):
     header, so refusing unexpected Hosts removes the attack class."""
 
     def _guard(self, request):
-        return asyncio.run(GUARD(request, _passthrough))
+        return asyncio.run(GUARD(request, passthrough))
 
     def test_loopback_hosts_are_accepted_regardless_of_port(self):
         # The published port and the in-container healthcheck port (8090) differ
@@ -45,25 +39,25 @@ class HostGuardTests(unittest.TestCase):
         # (DOCKADE_UI_PORT), and pinning it would make this a test of the default.
         for host in ("127.0.0.1:28090", "localhost:28090", "127.0.0.1:8090",
                      "localhost", "[::1]:28090"):
-            self.assertEqual(self._guard(_FakeRequest(headers={"host": host})),
+            self.assertEqual(self._guard(FakeRequest(headers={"host": host})),
                              "REACHED-THE-APP", host)
 
     def test_rebinding_host_is_refused(self):
         for host in ("evil.com", "evil.com:28090", "attacker.test:28090",
                      "127.0.0.1.evil.com:28090"):
-            resp = self._guard(_FakeRequest(headers={"host": host}))
+            resp = self._guard(FakeRequest(headers={"host": host}))
             self.assertEqual(getattr(resp, "status_code", None), 403, host)
 
     def test_absent_host_is_refused(self):
-        resp = self._guard(_FakeRequest(headers={}))
+        resp = self._guard(FakeRequest(headers={}))
         self.assertEqual(resp.status_code, 403)
 
     def test_guard_fails_closed_when_allowlist_is_emptied(self):
         # Not a supported configuration (`allowed_hostnames` refuses it) — this pins
         # the direction of failure if it is somehow reached: refuse, never wave through.
         empty = guards.request_guard(NAME, frozenset())
-        resp = asyncio.run(empty(_FakeRequest(headers={"host": "127.0.0.1:28090"}),
-                                 _passthrough))
+        resp = asyncio.run(empty(FakeRequest(headers={"host": "127.0.0.1:28090"}),
+                                 passthrough))
         self.assertEqual(resp.status_code, 403)
 
     def test_an_empty_allowlist_refuses_to_start(self):
@@ -88,10 +82,10 @@ class CrossOriginGuardTests(unittest.TestCase):
     """State-changing requests must not be accepted from another origin."""
 
     def _guard(self, request):
-        return asyncio.run(GUARD(request, _passthrough))
+        return asyncio.run(GUARD(request, passthrough))
 
     def test_cross_site_post_is_refused_via_sec_fetch_site(self):
-        resp = self._guard(_ok_host(
+        resp = self._guard(ok_host(
             method="POST", headers={"sec-fetch-site": "cross-site"}))
         self.assertEqual(resp.status_code, 403)
 
@@ -102,7 +96,7 @@ class CrossOriginGuardTests(unittest.TestCase):
             for headers in ({"sec-fetch-site": "cross-site"},
                             {"origin": "https://evil.com"}):
                 with self.subTest(method=method, headers=headers):
-                    resp = self._guard(_ok_host(method=method, headers=headers))
+                    resp = self._guard(ok_host(method=method, headers=headers))
                     self.assertEqual(getattr(resp, "status_code", None), 403)
 
     def test_only_same_origin_passes_via_sec_fetch_site(self):
@@ -111,25 +105,25 @@ class CrossOriginGuardTests(unittest.TestCase):
         # is no page at all; neither is this origin.
         for site in ("same-site", "none", "cross-site"):
             with self.subTest(site=site):
-                resp = self._guard(_ok_host(method="POST",
+                resp = self._guard(ok_host(method="POST",
                                             headers={"sec-fetch-site": site}))
                 self.assertEqual(getattr(resp, "status_code", None), 403)
 
     def test_same_origin_post_is_accepted(self):
         self.assertEqual(
-            self._guard(_ok_host(method="POST",
+            self._guard(ok_host(method="POST",
                                  headers={"sec-fetch-site": "same-origin"})),
             "REACHED-THE-APP")
 
     def test_cross_origin_post_is_refused_via_origin_header(self):
         # Older browser with no Sec-Fetch-Site: fall back to Origin.
-        resp = self._guard(_ok_host(
+        resp = self._guard(ok_host(
             method="POST", headers={"origin": "https://evil.com"}))
         self.assertEqual(resp.status_code, 403)
 
     def test_same_origin_post_via_origin_header_is_accepted(self):
         self.assertEqual(
-            self._guard(_ok_host(method="POST",
+            self._guard(ok_host(method="POST",
                                  headers={"origin": "http://127.0.0.1:28090"})),
             "REACHED-THE-APP")
 
@@ -142,14 +136,14 @@ class CrossOriginGuardTests(unittest.TestCase):
         for origin in ("http://localhost:3000", "http://127.0.0.1:3000",
                        "http://127.0.0.1"):
             with self.subTest(origin=origin):
-                resp = self._guard(_ok_host(method="POST", headers={"origin": origin}))
+                resp = self._guard(ok_host(method="POST", headers={"origin": origin}))
                 self.assertEqual(resp.status_code, 403)
 
     def test_the_origin_is_compared_to_the_requests_own_host_not_the_allowlist(self):
         # `localhost` and `127.0.0.1` are both allowed Hosts, but a page at one is
         # not the same origin as a page at the other; the UI's own page always sends
         # the Origin its address bar shows, which is the Host it dialled.
-        resp = self._guard(_ok_host(method="POST",
+        resp = self._guard(ok_host(method="POST",
                                     headers={"origin": "http://localhost:28090"}))
         self.assertEqual(resp.status_code, 403)
 
@@ -159,7 +153,7 @@ class CrossOriginGuardTests(unittest.TestCase):
                              ("localhost:80", "http://localhost"),
                              ("localhost", "http://localhost:80")):
             with self.subTest(host=host, origin=origin):
-                req = _FakeRequest(method="POST",
+                req = FakeRequest(method="POST",
                                    headers={"host": host, "origin": origin})
                 self.assertEqual(self._guard(req), "REACHED-THE-APP")
 
@@ -169,13 +163,13 @@ class CrossOriginGuardTests(unittest.TestCase):
         for host, origin in (("127.0.0.1", "https://127.0.0.1"),
                              ("127.0.0.1:443", "http://127.0.0.1")):
             with self.subTest(host=host, origin=origin):
-                req = _FakeRequest(method="POST", headers={"host": host, "origin": origin})
+                req = FakeRequest(method="POST", headers={"host": host, "origin": origin})
                 self.assertEqual(getattr(self._guard(req), "status_code", None), 403)
 
     def test_an_opaque_origin_is_refused(self):
         # `Origin: null` — a sandboxed frame, a redirect chain, a data: URL. It is
         # nobody's authority, so it equals nothing.
-        resp = self._guard(_ok_host(method="POST", headers={"origin": "null"}))
+        resp = self._guard(ok_host(method="POST", headers={"origin": "null"}))
         self.assertEqual(resp.status_code, 403)
 
     def test_post_with_no_browser_headers_is_accepted(self):
@@ -184,13 +178,13 @@ class CrossOriginGuardTests(unittest.TestCase):
         # host-local caller this admits is out of reach of any browser-enforced
         # guard anyway (see guards.py's docstring) — it is handled by recording
         # provenance, not by pretending to block it.
-        self.assertEqual(self._guard(_ok_host(method="POST")), "REACHED-THE-APP")
+        self.assertEqual(self._guard(ok_host(method="POST")), "REACHED-THE-APP")
 
     def test_cross_site_GET_is_not_refused_by_the_origin_guard(self):
         # A cross-origin GET's response is unreadable without CORS headers (never
         # sent), and the readable case is rebinding — already refused by Host.
         self.assertEqual(
-            self._guard(_ok_host(headers={"sec-fetch-site": "cross-site"})),
+            self._guard(ok_host(headers={"sec-fetch-site": "cross-site"})),
             "REACHED-THE-APP")
 
 
@@ -202,24 +196,24 @@ class FramingGuardTests(unittest.TestCase):
     on the real "Allow + persist rule" button."""
 
     def _guard(self, request):
-        return asyncio.run(GUARD(request, _passthrough))
+        return asyncio.run(GUARD(request, passthrough))
 
     def test_embedded_destinations_are_refused(self):
         for dest in ("iframe", "frame", "embed", "object"):
-            resp = self._guard(_ok_host(headers={"sec-fetch-dest": dest}))
+            resp = self._guard(ok_host(headers={"sec-fetch-dest": dest}))
             self.assertEqual(getattr(resp, "status_code", None), 403, dest)
 
     def test_normal_destinations_are_served(self):
         # The top-level page, the script, and the fetch/EventSource calls.
         for dest in ("document", "script", "empty", ""):
             self.assertEqual(
-                self._guard(_ok_host(headers={"sec-fetch-dest": dest})),
+                self._guard(ok_host(headers={"sec-fetch-dest": dest})),
                 "REACHED-THE-APP", dest or "<absent>")
 
     def test_embedded_post_is_refused_even_when_same_origin(self):
         # The POST from inside a frame is genuinely same-origin, so guard 2 passes it;
         # this must not be the only thing standing between a frame and `resolve`.
-        resp = self._guard(_ok_host(method="POST", headers={
+        resp = self._guard(ok_host(method="POST", headers={
             "sec-fetch-site": "same-origin", "sec-fetch-dest": "iframe"}))
         self.assertEqual(resp.status_code, 403)
 
@@ -250,7 +244,7 @@ class SecurityHeaderTests(unittest.TestCase):
     def _headers(self, upstream=None, status_code=200):
         async def _next(_request):
             return _FakeResponse(status_code=status_code, headers=upstream or {})
-        resp = asyncio.run(guards.security_headers(_ok_host(), _next))
+        resp = asyncio.run(guards.security_headers(ok_host(), _next))
         return resp.headers
 
     def test_frame_ancestors_none_is_present(self):
@@ -300,7 +294,7 @@ class SecurityHeaderTests(unittest.TestCase):
         async def _refusing(_request):
             return guards.refuse(NAME, "nope")
 
-        resp = asyncio.run(guards.security_headers(_ok_host(), _refusing))
+        resp = asyncio.run(guards.security_headers(ok_host(), _refusing))
         self.assertEqual(resp.status_code, 403)
         self.assertIn("frame-ancestors 'none'", resp.headers["content-security-policy"])
 
@@ -338,12 +332,12 @@ class InstallTests(unittest.TestCase):
 
     def test_the_guard_registered_is_this_uis_with_its_allowlist(self):
         guard = self.app.registered[0][1]
-        refused = asyncio.run(guard(_FakeRequest(headers={"host": "localhost"}),
-                                    _passthrough))
+        refused = asyncio.run(guard(FakeRequest(headers={"host": "localhost"}),
+                                    passthrough))
         self.assertEqual(refused.status_code, 403)
         self.assertTrue(refused.body.startswith(f"refused by {NAME}: "))
-        self.assertEqual(asyncio.run(guard(_FakeRequest(headers={"host": "127.0.0.1"}),
-                                           _passthrough)), "REACHED-THE-APP")
+        self.assertEqual(asyncio.run(guard(FakeRequest(headers={"host": "127.0.0.1"}),
+                                           passthrough)), "REACHED-THE-APP")
 
     def test_a_refusal_carries_the_name_of_the_ui_that_refused(self):
         self.assertEqual(guards.refuse("some-ui", "why").body,
@@ -371,8 +365,7 @@ class BindTests(unittest.TestCase):
     def test_anything_but_an_address_on_control_ui_net_is_refused(self):
         # A wildcard serves every leg; a name would make the check depend on DNS; the
         # mapped spelling is another family, which uvicorn would bind as such. Then the
-        # UI's control-net leg, and the task registry's operator network, which the UI
-        # joins for the registry's view.
+        # UI's control-net leg, and an address on the task registry's operator network.
         for bind in ("", "0.0.0.0", "::", "*", "control-plane-ui", "localhost",  # noqa: S104
                      "127.0.0.1", "::1", "::ffff:172.25.0.2", "172.31.0.10",
                      "172.26.0.3"):

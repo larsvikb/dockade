@@ -357,6 +357,18 @@
      approvals tab cannot land silently. */
   .badge.unseen { border-color: var(--hold); color: var(--hold); }
   .badge.unseen::after { content: " •"; }
+
+  /* ── tasks ───────────────────────────────────────────────────────────────
+     Agent prose: kept as written, line breaks included, and wrapped anywhere so a long
+     unbroken string cannot push the table off screen. */
+  .prose { white-space: pre-wrap; word-break: break-word; }
+  .task-body { margin: 10px 0; padding: 8px; background: var(--bg);
+    border: 1px solid var(--line); border-radius: 6px; max-height: 50vh; overflow: auto; }
+  #task-detail { margin: 12px 0 20px; padding: 10px 12px; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 8px; }
+  #task-detail h3 { font-size: 14px; margin: 4px 0 8px; }
+  /* Kept in the record and out of every agent's read: shown, and shown as set aside. */
+  tr.hidden-note { opacity: .55; }
 </style>
 </head>
 <body>
@@ -389,6 +401,13 @@
   <button role="tab" id="tab-tools" aria-controls="view-tools"
           aria-selected="false" tabindex="-1" data-view="tools">
     Tools
+  </button>
+  <!-- A quiet badge, never `hot`: it counts notes agents flagged for the operator, and
+       nobody waits on one (task-registry/DESIGN.md, "Notes"). Empty when there are
+       none, and when the registry is not running. -->
+  <button role="tab" id="tab-tasks" aria-controls="view-tasks"
+          aria-selected="false" tabindex="-1" data-view="tasks">
+    Tasks <span class="badge" id="badge-tasks"></span>
   </button>
 </nav>
 
@@ -727,6 +746,55 @@
       <tbody id="toolpins"></tbody>
     </table>
     <div class="empty" id="toolpins-empty" hidden></div>
+  </section>
+
+  <section id="view-tasks" role="tabpanel" aria-labelledby="tab-tasks" hidden>
+    <h2>Tasks <span class="note" id="taskcount"></span></h2>
+    <!-- The task registry is optional, so not running is a state of this tab rather
+         than an error: tasks.js fills this line, and asks again when the tab opens. -->
+    <div class="empty" id="tasks-down" hidden></div>
+    <div id="tasks-up" hidden>
+      <div class="empty">
+        The work list agent sessions and you share, read from the task registry. Every
+        title, body and note here was written by an agent or for one; a character that
+        would render as nothing, or reorder the text around it, is spelled out.
+      </div>
+      <!-- Plain controls, as the audit filter bar is: they narrow what is shown. The
+           state options are filled from TASK_STATES in tasks.js. -->
+      <div class="filters" role="search">
+        <select id="tasks-repo" aria-label="Repo"></select>
+        <select id="tasks-state" aria-label="State"></select>
+        <input type="search" id="tasks-search" autocomplete="off" spellcheck="false"
+               placeholder="search titles, bodies and notes in every state"
+               aria-label="Search tasks">
+      </div>
+      <table>
+        <thead><tr><th>task</th><th>title</th><th>state</th><th>severity · kind</th>
+          <th>held by</th><th>notes</th></tr></thead>
+        <tbody id="tasks"></tbody>
+      </table>
+      <div class="empty" id="tasks-empty" hidden></div>
+      <div class="pager">
+        <button type="button" id="tasks-newest" hidden>&larr; newest</button>
+        <button type="button" id="tasks-older" hidden>older &rarr;</button>
+      </div>
+      <div id="task-detail" hidden></div>
+
+      <h2>For you <span class="note" id="flaggedcount"></span></h2>
+      <div class="empty">
+        Notes agents flagged for the operator, not yet handled. Nobody waits on one: an
+        agent that cannot go on sends its task back or releases it.
+      </div>
+      <table>
+        <thead><tr><th>task</th><th>by</th><th>when</th><th>note</th></tr></thead>
+        <tbody id="flagged"></tbody>
+      </table>
+      <div class="empty" id="flagged-empty" hidden></div>
+      <div class="pager">
+        <button type="button" id="flagged-newest" hidden>&larr; newest</button>
+        <button type="button" id="flagged-older" hidden>older &rarr;</button>
+      </div>
+    </div>
   </section>
 </main>
 <!-- Behaviour lives in app.js and the modules it imports, NOT inline: an external

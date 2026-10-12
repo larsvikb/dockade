@@ -8,9 +8,11 @@ exists so the backend (policy + audit — the crown-jewel state) can stay on
 frontend takes the one unavoidable non-internal surface (the host-loopback UI
 publish on `control-ui-net`) and holds no state of its own.
 
-It does two things:
+It does three things:
   - serves the static approval UI at `/`;
-  - reverse-proxies the approvals API + SSE stream to the backend over `control-net`.
+  - reverse-proxies the approvals API + SSE stream to the backend over `control-net`;
+  - relays the Tasks tab's reads to the task registry's operator listener over
+    `tasks-operator-net`, when the registry runs.
 
 The browser only ever talks to this frontend (same-origin), which relays to the
 backend the browser cannot reach. Still deliberately dumb — no policy, no storage,
@@ -76,6 +78,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import (
     FileResponse,
+    JSONResponse,
     PlainTextResponse,
     Response,
     StreamingResponse,
@@ -84,6 +87,11 @@ from starlette.background import BackgroundTask
 
 BACKEND = os.environ.get(
     "CONTROL_BACKEND_URL", "http://control-plane:8090").rstrip("/")
+#: The task registry's operator listener, which this UI relays the Tasks tab to. By its
+#: pinned address, not its name: this container has a non-internal leg, so a name
+#: Docker's resolver does not know is asked of the host's DNS, and `tasks` is one
+#: whenever the registry is stopped.
+TASKS_URL = os.environ.get("CONTROL_UI_TASKS_URL", "http://172.26.0.2:8111").rstrip("/")
 BIND = os.environ.get("CONTROL_UI_BIND", "")
 PORT = int(os.environ.get("CONTROL_UI_PORT", "8090"))
 #: The network BIND must sit inside: an allowlist, so a wildcard, a name and an
@@ -103,7 +111,7 @@ UI_INDEX = os.environ.get("CONTROL_UI_INDEX", "/opt/control-plane-ui/index.html"
 UI_DIR = os.environ.get("CONTROL_UI_DIR", "/opt/control-plane-ui")
 UI_MODULES = frozenset({"app.js", "audit.js", "dom.js", "egress-rules.js", "holds.js",
                         "leases.js", "mcp.js", "payload.js", "provenance.js",
-                        "saturation.js", "status.js", "time.js"})
+                        "saturation.js", "status.js", "tasks.js", "time.js"})
 # The path behind each name, built here from the list and never from a request: the
 # name off the URL only picks an entry, so no string a caller sent reaches the
 # filesystem — which is also what lets a scanner see it, rather than having to trust
@@ -125,6 +133,8 @@ def _hostnames(env: str, default: str) -> frozenset[str]:
 # Widen this only for a deployment that legitimately fronts the UI under another
 # name (a reverse proxy, or access from another machine) — and understand that
 # doing so re-opens rebinding for that name unless the front end authenticates.
+# The request must still arrive from control-ui-net (OnlyFrom), as Docker's userland
+# proxy delivers a published port's connections.
 ALLOWED_HOSTNAMES = _hostnames("CONTROL_UI_ALLOWED_HOSTS",
                                "127.0.0.1,localhost,::1")
 
@@ -238,6 +248,24 @@ _RELAY_ROUTES = (
     ("POST", re.compile(r"^/api/saturation/ack$")),
 )
 
+# The task registry's operator API (task-registry/operator_api.py), relayed to
+# TASKS_URL with this prefix taken off, and nothing else is: the prefix keeps every
+# path to one upstream, so no entry in either table can be reached on the other. The
+# rule above holds here too, exactly the routes the page calls, and ids are digits,
+# bounded, for the reason given there. Reads only, so far.
+TASKS_PREFIX = "/tasks"
+_TASKS_RELAY_ROUTES = (
+    ("GET", re.compile(r"^/tasks/api/repos$")),
+    ("GET", re.compile(r"^/tasks/api/tasks$")),
+    ("GET", re.compile(r"^/tasks/api/tasks/[0-9]{1,19}$")),
+    # A task's every note, hidden ones marked, and its history: the operator's reads,
+    # which no agent surface offers (task-registry/DESIGN.md, "Notes").
+    ("GET", re.compile(r"^/tasks/api/tasks/[0-9]{1,19}/notes$")),
+    ("GET", re.compile(r"^/tasks/api/tasks/[0-9]{1,19}/history$")),
+    ("GET", re.compile(r"^/tasks/api/notes/flagged$")),
+    ("GET", re.compile(r"^/tasks/api/search$")),
+)
+
 # Provenance headers a CLIENT must never be able to set, because the backend reads
 # ACTOR_HEADER as this relay's own assertion about the browser. Stripped from every
 # inbound request before ACTOR_HEADER is re-added with the real peer address —
@@ -325,6 +353,10 @@ app = FastAPI(title="dockade control-plane UI",
 # timeout=None: the SSE stream (/approvals/stream) is long-lived; other calls are
 # fast. Reused across requests for connection pooling to the backend.
 _client = httpx.AsyncClient(base_url=BACKEND, timeout=None)  # noqa: S113 (deliberate — see above)
+# Bounded, unlike the backend's: nothing here streams, and a stopped registry's address
+# answers nothing at all, which the page must learn in seconds rather than never.
+_tasks_client = httpx.AsyncClient(base_url=TASKS_URL,
+                                  timeout=httpx.Timeout(10.0, connect=2.0))
 
 
 def _assert_host_guard_configured() -> None:
@@ -498,6 +530,23 @@ def _relay_allowed(method: str, path: str) -> bool:
     return any(method == m and rx.match(path) for m, rx in _RELAY_ROUTES)
 
 
+def _tasks_relay_allowed(method: str, path: str) -> bool:
+    return any(method == m and rx.match(path) for m, rx in _TASKS_RELAY_ROUTES)
+
+
+@app.get("/tasks/running")
+async def tasks_running() -> dict:
+    """Whether the task registry answers, asked by the page before it calls it. The
+    registry is optional, so not running is a state rather than an error, and a relayed
+    call would put a failed request in the browser's console on every load. Its repo
+    list is the cheapest read it serves."""
+    try:
+        resp = await _tasks_client.get("/api/repos")
+    except httpx.RequestError:
+        return {"running": False}
+    return {"running": resp.status_code == 200}
+
+
 # Annotated as the base Response, NOT `StreamingResponse | PlainTextResponse`: this
 # handler genuinely returns either (a relay stream, or a guard refusal), but FastAPI
 # derives a response MODEL from the return annotation and only skips that for a
@@ -506,22 +555,29 @@ def _relay_allowed(method: str, path: str) -> bool:
 # real FastAPI; the stubbed unit tests ignore annotations entirely.
 @app.api_route("/{path:path}", methods=["GET", "POST"])
 async def proxy(path: str, request: Request) -> Response:
-    """Relay an allowlisted path to the backend, streaming the response so the SSE
-    approvals feed flows through unbuffered.
+    """Relay an allowlisted path to the backend, or to the task registry, streaming
+    the response so the SSE approvals feed flows through unbuffered.
 
-    The upstream is PINNED to BACKEND. `{path:path}` retains a leading slash for a
+    The upstream is PINNED to BACKEND, or to TASKS_URL. `{path:path}` retains a leading slash for a
     request like `//evil.com/x` (captured as `/evil.com/x`), and the old `"/" +
     path` turned that back into `//evil.com/x` — a network-path reference httpx
     resolves against the base as a DIFFERENT authority (`http://evil.com/x`), i.e.
     a caller-controlled host override / SSRF primitive. Collapsing to a single
     leading slash keeps the request a plain absolute-path reference, so the host
-    always stays BACKEND."""
+    always stays the one its table names."""
     upstream_path = "/" + path.lstrip("/")
     method = request.method.upper()
-    if not _relay_allowed(method, upstream_path):
+    if _relay_allowed(method, upstream_path):
+        client = _client
+    elif _tasks_relay_allowed(method, upstream_path):
+        client = _tasks_client
+        # Collapsed again for the reason given above: `/tasks//host` must not become a
+        # network-path reference once the prefix is off.
+        upstream_path = "/" + upstream_path.removeprefix(TASKS_PREFIX).lstrip("/")
+    else:
         return _refuse(f"{method} {upstream_path} is not a relayed path")
     peer = getattr(request.client, "host", None) or "unknown"
-    req = _client.build_request(
+    req = client.build_request(
         method, upstream_path,
         params=request.query_params,
         content=await request.body(),
@@ -530,8 +586,10 @@ async def proxy(path: str, request: Request) -> Response:
                  if k.lower() not in _STRIP_REQ] + [(ACTOR_HEADER, peer)],
     )
     try:
-        resp = await _client.send(req, stream=True)
+        resp = await client.send(req, stream=True)
     except httpx.RequestError as exc:
+        if client is _tasks_client:
+            return _registry_unreachable(exc)
         # The backend is down, restarting, or unresolvable. Answer a clean 502 rather
         # than letting the exception surface as a 500 with a traceback.
         #
@@ -543,17 +601,31 @@ async def proxy(path: str, request: Request) -> Response:
         return PlainTextResponse(
             f"control-plane backend unreachable: {type(exc).__name__}\n",
             status_code=502)
+    # The registry is the lower-trust upstream: it parses agent text. What it answers is
+    # JSON, and none of its other headers is this origin's to carry.
+    headers = ({"content-type": "application/json"} if client is _tasks_client
+               else {k: v for k, v in resp.headers.items()
+                     if k.lower() not in _STRIP_RESP})
     return StreamingResponse(
         resp.aiter_raw(),
         status_code=resp.status_code,
-        headers={k: v for k, v in resp.headers.items()
-                 if k.lower() not in _STRIP_RESP},
+        headers=headers,
         background=BackgroundTask(resp.aclose),
     )
 
 
-def check_bind(bind: str, net: str) -> None:
-    """Refuse to start unless the page is served on one address inside ``net``."""
+def _registry_unreachable(exc: Exception) -> JSONResponse:
+    """The task registry did not answer: stopped, starting, or not on this network.
+    In the operator API's shape, and a status the registry itself never sends, so the
+    page can tell it from a refusal."""
+    return JSONResponse({"ok": False, "current": None,
+                         "detail": f"the task registry did not answer "
+                                   f"({type(exc).__name__})"}, status_code=502)
+
+
+def check_bind(bind: str, net: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network:
+    """Refuse to start unless the page is served on one address inside ``net``, and
+    return that network."""
     try:
         network = ipaddress.ip_network(net)
     except ValueError as exc:
@@ -569,15 +641,55 @@ def check_bind(bind: str, net: str) -> None:
             f"{network}. The relay reaches the management API, so it is served on its "
             f"control-ui-net address alone, where the loopback publish arrives, and on "
             f"no leg another container shares. Refusing to start (fail closed).")
+    return network
+
+
+_OFF_NETWORK = b"refused by control-plane-ui: this page answers its own network only\n"
+
+
+class OnlyFrom:
+    """The app, answering only peers inside ``net``: the loopback publish arrives from
+    the bridge's own address on it, and the healthcheck from the bound one.
+
+    The bind does not choose the leg a packet arrives on (``OnlyFrom`` in
+    ``task-registry/serve.py`` says why), and since the UI joined the task registry's
+    network its neighbours include one that parses agent text. None can route a packet
+    here today, since every service drops every capability; this holds whether or not
+    that does. Outside the app, so its refusal carries the security headers itself."""
+
+    def __init__(self, app: object, net: ipaddress.IPv4Network | ipaddress.IPv6Network
+                 ) -> None:
+        self.app, self.net = app, net
+
+    def _admits(self, client: object) -> bool:
+        try:
+            return ipaddress.ip_address(client[0]) in self.net
+        except (TypeError, IndexError, ValueError):
+            return False
+
+    async def __call__(self, scope: dict, receive: object, send: object) -> None:
+        if scope["type"] != "lifespan" and not self._admits(scope.get("client")):
+            if scope["type"] == "http":
+                headers = [(b"content-type", b"text/plain; charset=utf-8"),
+                           *((k.encode(), v.encode()) for k, v in _SECURITY_HEADERS.items())]
+                await send({"type": "http.response.start", "status": 403,
+                            "headers": headers})
+                await send({"type": "http.response.body", "body": _OFF_NETWORK})
+            else:
+                await send({"type": "websocket.close"})
+            return
+        await self.app(scope, receive, send)
 
 
 def main() -> None:
     # Here rather than at module scope, so the suite imports this with no uvicorn.
     import uvicorn
 
-    check_bind(BIND, UI_NET)
-    # Proxy headers off: the peer the relay asserts as the actor is the socket's.
-    uvicorn.run(app, host=BIND, port=PORT, proxy_headers=False, log_level="info")
+    network = check_bind(BIND, UI_NET)
+    # Proxy headers off: the peer the relay asserts as the actor, and the one OnlyFrom
+    # admits, is the socket's.
+    uvicorn.run(OnlyFrom(app, network), host=BIND, port=PORT, proxy_headers=False,
+                log_level="info")
 
 
 if __name__ == "__main__":

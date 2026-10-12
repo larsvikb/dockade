@@ -278,7 +278,9 @@ dockade/
     CLAUDE.md, DESIGN.md    #   how to work here; the approval flow's design
   control-plane-ui/         # UI FRONTEND — serves the UI + reverse-proxies the API
     Dockerfile              #   FastAPI + httpx; control-ui-net (loopback) + control-net
-    app.py                  #   static UI at / + streaming reverse proxy to the backend
+                            #   + tasks-operator-net
+    app.py                  #   static UI at / + streaming reverse proxy to the backend,
+                            #   and the Tasks tab's to the task registry
     app.js                  #   the approval console's behaviour — a file so the CSP can
                             #   say script-src 'self'; pure helpers unit-tested under node
     audit.js                #   the record as browsed: what a row says, how rows fold, the
@@ -301,6 +303,8 @@ dockade/
                             #   the banner, and what dismissing it acknowledges
     status.js               #   what each polled table says about itself: empty, stale, or
                             #   not yet loaded — one decision, four tables' sentences
+    tasks.js                #   the Tasks tab: the task registry's work list, its not-running
+                            #   state, agent prose with hidden characters spelled out
     time.js                 #   timestamps as the page shows them
     index.html              #   static shell + styles for the SSE approval console
     DESIGN.md               #   the browser boundary and the page's mechanics

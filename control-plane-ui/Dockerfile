@@ -31,6 +31,7 @@ COPY payload.js ./payload.js
 COPY provenance.js ./provenance.js
 COPY saturation.js ./saturation.js
 COPY status.js ./status.js
+COPY tasks.js ./tasks.js
 COPY time.js ./time.js
 
 USER cpui

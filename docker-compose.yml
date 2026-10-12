@@ -463,8 +463,16 @@ services:
       # address the page is served on, so pinned.
       control-ui-net:
         ipv4_address: 172.25.0.2
+      # To dial the task registry's operator listener for the Tasks tab, and nothing
+      # is served here: the registry parses agent text (DESIGN.md, "Task registry").
+      # Pinned, as the registry's leg is: one pinned member pins them all.
+      tasks-operator-net:
+        ipv4_address: 172.26.0.3
     environment:
       CONTROL_BACKEND_URL: http://control-plane:8090
+      # The registry's pinned operator address, not its name (see TASKS_URL in
+      # control-plane-ui/app.py).
+      CONTROL_UI_TASKS_URL: http://172.26.0.2:8111
       # Its control-ui-net leg, where the publish arrives, and nothing else will start
       # (check_bind in control-plane-ui/app.py): not control-net, nor any leg it gains.
       CONTROL_UI_BIND: 172.25.0.2

@@ -186,8 +186,11 @@ egress** — sandbox-net only. These make good practices cheap and fast. Example
 - `control-ui-net` — non-internal bridge carrying ONLY the control-plane-ui
   frontend's host-loopback UI publish; masquerade disabled so it is
   host-reachable but not an egress path. Needed because Docker cannot publish a
-  host port from a container that is on an internal network alone. Sandbox not
-  attached.
+  host port from a container that is on an internal network alone. The UI serves
+  its address here alone (`check_bind` in `control-plane-ui/app.py`), and no
+  neighbour can route a packet to it, since every service drops every capability
+  (`EveryServiceDropsEveryCapabilityTests`): so no container on its other legs
+  reaches the page or the relay. Sandbox not attached.
 - `tasks-operator-net` (`internal: true`) — the task registry's OPERATOR path, one
   conversation only: the control-plane UI → the registry's operator listener, which
   takes no token, so being on this network is the permission to write as the operator.

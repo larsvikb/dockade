@@ -17,6 +17,11 @@ backend the browser cannot reach. Still deliberately dumb — no policy, no stor
 and a governance decision never depends on it (the egress proxy talks to the
 backend directly).
 
+It serves one address, its `control-ui-net` one, which the loopback publish reaches,
+and `check_bind` refuses to start on any other. A wildcard would serve the relay on
+every leg, and a leg on a network whose other members parse agent text is a route
+from them to the management API.
+
 BUT it is not indifferent to WHO is calling, because it publishes the one API that
 can grant egress: `POST /approvals/{id}/resolve` is self-approval if reached. It
 therefore enforces four cheap, structural guards (`_guard` below, plus the relay
@@ -62,6 +67,7 @@ the backend records on the approval row and in the audit reason (`_actor` there)
 """
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 from urllib.parse import urlsplit
@@ -78,6 +84,12 @@ from starlette.background import BackgroundTask
 
 BACKEND = os.environ.get(
     "CONTROL_BACKEND_URL", "http://control-plane:8090").rstrip("/")
+BIND = os.environ.get("CONTROL_UI_BIND", "")
+PORT = int(os.environ.get("CONTROL_UI_PORT", "8090"))
+#: The network BIND must sit inside: an allowlist, so a wildcard, a name and an
+#: address on any other leg are all refused. The default mirrors docker-compose.yml,
+#: and tests/test_topology.py holds it equal to control-ui-net's subnet.
+UI_NET = os.environ.get("CONTROL_UI_NET", "172.25.0.0/24")
 UI_INDEX = os.environ.get("CONTROL_UI_INDEX", "/opt/control-plane-ui/index.html")
 # The page's behaviour, served as separate files rather than inline in the HTML.
 # That is what lets the CSP below say `script-src 'self'` instead of
@@ -106,8 +118,9 @@ def _hostnames(env: str, default: str) -> frozenset[str]:
 
 # Hostnames this app may be addressed as. Compared WITHOUT the port on purpose:
 # rebinding needs the attacker's own NAME, so the port is irrelevant to the guard,
-# and ignoring it keeps one list valid for both the published host port and the
-# in-container healthcheck (which addresses 127.0.0.1:8090 directly).
+# and ignoring it keeps the list valid whatever port the host publishes
+# (DOCKADE_UI_PORT, so pinning one would be wrong twice over). The in-container
+# healthcheck dials CONTROL_UI_BIND and names 127.0.0.1 as its Host.
 #
 # Widen this only for a deployment that legitimately fronts the UI under another
 # name (a reverse proxy, or access from another machine) — and understand that
@@ -537,3 +550,35 @@ async def proxy(path: str, request: Request) -> Response:
                  if k.lower() not in _STRIP_RESP},
         background=BackgroundTask(resp.aclose),
     )
+
+
+def check_bind(bind: str, net: str) -> None:
+    """Refuse to start unless the page is served on one address inside ``net``."""
+    try:
+        network = ipaddress.ip_network(net)
+    except ValueError as exc:
+        raise SystemExit(f"control-plane-ui: CONTROL_UI_NET={net!r} is not a network "
+                         f"({exc}). Refusing to start (fail closed).") from exc
+    try:
+        inside = ipaddress.ip_address(bind) in network
+    except ValueError:
+        inside = False
+    if not inside:
+        raise SystemExit(
+            f"control-plane-ui: CONTROL_UI_BIND={bind!r} is not an address inside "
+            f"{network}. The relay reaches the management API, so it is served on its "
+            f"control-ui-net address alone, where the loopback publish arrives, and on "
+            f"no leg another container shares. Refusing to start (fail closed).")
+
+
+def main() -> None:
+    # Here rather than at module scope, so the suite imports this with no uvicorn.
+    import uvicorn
+
+    check_bind(BIND, UI_NET)
+    # Proxy headers off: the peer the relay asserts as the actor is the socket's.
+    uvicorn.run(app, host=BIND, port=PORT, proxy_headers=False, log_level="info")
+
+
+if __name__ == "__main__":
+    main()

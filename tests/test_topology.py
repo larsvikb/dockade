@@ -482,6 +482,91 @@ class ControlPlaneBindTests(unittest.TestCase):
         self.assertEqual(members, {"egress-proxy", "control-plane"})
 
 
+UI_APP = (ROOT / "control-plane-ui" / "app.py").read_text()
+
+
+def _ui_default(variable: str) -> str:
+    """A default ``control-plane-ui/app.py`` sets, read as text for the reason
+    ``_gateway_forbidden_default`` gives."""
+    match = re.search(rf'"{variable}",\s*"([^"]+)"', UI_APP)
+    if not match:
+        raise AssertionError(f"control-plane-ui/app.py no longer has a {variable} default "
+                             f"this can read")
+    return match.group(1)
+
+
+class ControlPlaneUiBindTests(unittest.TestCase):
+    """The page is served on one address, its ``control-ui-net`` one, and
+    ``check_bind`` in ``control-plane-ui/app.py`` says why and refuses any other. These
+    hold compose to it."""
+
+    def test_the_bind_is_the_control_ui_net_leg_compose_pins(self):
+        pinned = _scalar(_block(_service("control-plane-ui"), "control-ui-net", 6),
+                         "ipv4_address")
+        self.assertIsNotNone(pinned, "the UI's control-ui-net leg is not pinned")
+        self.assertEqual(_environment_of("control-plane-ui")["CONTROL_UI_BIND"], pinned)
+
+    def test_the_app_reads_the_variables_compose_sets(self):
+        # A renamed variable would leave the bind empty, and check_bind refuses that,
+        # but at the host's `make up` rather than here.
+        for var in ("CONTROL_UI_BIND", "CONTROL_UI_PORT", "CONTROL_UI_NET"):
+            with self.subTest(variable=var):
+                self.assertRegex(UI_APP, rf'os\.environ\.get\("{var}",')
+        for var in ("CONTROL_UI_BIND", "CONTROL_UI_PORT"):
+            with self.subTest(variable=var):
+                self.assertIn(var, _environment_of("control-plane-ui"))
+
+    def test_the_bind_check_allows_exactly_control_ui_nets_subnet(self):
+        # A default that drifted from compose would refuse the real address, loud, or
+        # allow another network's, silent.
+        self.assertEqual(_ui_default("CONTROL_UI_NET"), _subnet_of("control-ui-net"))
+        env = _environment_of("control-plane-ui")
+        if "CONTROL_UI_NET" in env:
+            self.assertEqual(env["CONTROL_UI_NET"].strip('"\''),
+                             _subnet_of("control-ui-net"))
+
+    def test_control_ui_net_is_apart_from_every_other_network(self):
+        subnet = ipaddress.ip_network(_subnet_of("control-ui-net"))
+        # Inside the range the relay guard hard-blocks, so the proxy refuses it as a
+        # CONNECT target too.
+        self.assertTrue(subnet.subnet_of(ipaddress.ip_network("172.16.0.0/12")))
+        networks = [m.group(1) for ln in _block(COMPOSE, "networks", 0)
+                    if (m := re.match(r"  ([a-z0-9-]+):\s*$", ln))]
+        self.assertIn("control-ui-net", networks)
+        for net in networks:
+            if net == "control-ui-net" or not any(
+                    "subnet:" in ln for ln in _block(_block(COMPOSE, "networks", 0), net, 2)):
+                continue
+            with self.subTest(network=net):
+                self.assertFalse(subnet.overlaps(ipaddress.ip_network(_subnet_of(net))))
+
+    def test_the_publish_and_the_healthcheck_reach_the_port_it_serves(self):
+        body = _service("control-plane-ui")
+        port = _environment_of("control-plane-ui")["CONTROL_UI_PORT"].strip('"\'')
+        self.assertEqual(_ui_default("CONTROL_UI_PORT"), port)
+        publish = [ln.strip() for ln in _block(body, "ports", 4)
+                   if ln.strip() and not ln.strip().startswith("#")]
+        self.assertEqual(publish, [f'- "127.0.0.1:${{DOCKADE_UI_PORT:-28090}}:{port}"'])
+        # The page binds no loopback, so the probe dials the bound address, and names a
+        # Host the allowlist takes, since the address is not one.
+        probe = "".join(_block(body, "healthcheck", 4))
+        for var in ("CONTROL_UI_BIND", "CONTROL_UI_PORT"):
+            self.assertIn(f"os.environ['{var}']", probe)
+        self.assertIn("headers={'Host': '127.0.0.1'}", probe)
+        self.assertIn("/healthz", probe)
+
+    def test_it_forwards_nothing_between_its_legs(self):
+        sysctls = [ln.strip() for ln in _block(_service("control-plane-ui"), "sysctls", 4)
+                   if ln.strip() and not ln.strip().startswith("#")]
+        self.assertEqual(sysctls, ['net.ipv4.ip_forward: "0"'])
+
+    def test_the_image_starts_the_entry_that_checks_the_bind(self):
+        # uvicorn's own command line would take any --host and check nothing.
+        dockerfile = (ROOT / "control-plane-ui" / "Dockerfile").read_text()
+        entry = [ln for ln in dockerfile.splitlines() if ln.startswith("ENTRYPOINT")]
+        self.assertEqual(entry, ['ENTRYPOINT ["python", "app.py"]'])
+
+
 def _raw_networks(service: str) -> set[str]:
     """``_networks_of`` for a service that may declare no networks at all (the
     profile-gated llm-* variants do declare some; a future one might not)."""
@@ -1270,6 +1355,15 @@ class TaskRegistryPlacementTests(unittest.TestCase):
             with self.subTest(network=net):
                 self.assertFalse(subnet.overlaps(ipaddress.ip_network(_subnet_of(net))))
 
+    def test_serve_reads_the_variables_compose_sets(self):
+        # The binds default to "", which check_binds refuses, so a renamed one would
+        # fail only at the host's start.
+        source = (REGISTRY / "serve.py").read_text()
+        for var in (*self.LEGS, "TASKS_AGENT_PORT", "TASKS_OPERATOR_PORT"):
+            with self.subTest(variable=var):
+                self.assertRegex(source, rf'os\.environ\.get\("{var}",')
+                self.assertIn(var, _environment_of("tasks"))
+
     def test_each_listener_binds_the_leg_compose_pins(self):
         env = _environment_of("tasks")
         for var, net in self.LEGS.items():
@@ -1412,7 +1506,8 @@ class EveryServiceDropsEveryCapabilityTests(unittest.TestCase):
     its addresses on any interface, so a neighbour that could route or forge one would
     reach a listener bound to another network's address through the leg they share: an
     MCP server reaching the task registry's operator listener or the gateway's agent
-    listener, the egress proxy the control plane's management listener. Routing takes
+    listener, the egress proxy the control plane's management listener, the control
+    plane the UI's page. Routing takes
     NET_ADMIN and forging takes NET_RAW, which Docker grants by default. So every
     service drops them all, and none adds one back or runs privileged."""
 

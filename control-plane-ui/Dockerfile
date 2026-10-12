@@ -35,4 +35,5 @@ COPY time.js ./time.js
 
 USER cpui
 EXPOSE 8090
-ENTRYPOINT ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8090"]
+# app.py serves itself, so it can refuse a bind before the socket opens (check_bind).
+ENTRYPOINT ["python", "app.py"]

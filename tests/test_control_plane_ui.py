@@ -819,5 +819,72 @@ class GuardMiddlewareWiringTests(unittest.TestCase):
             "the 403 refusals with the CSP")
 
 
+UI_NET, UI_BIND = "172.25.0.0/24", "172.25.0.2"
+
+
+class BindTests(unittest.TestCase):
+    """Where the page may be served: one address inside control-ui-net. Where compose
+    puts it is held in ``tests/test_topology.py``."""
+
+    def refused(self, bind: str = UI_BIND, net: str = UI_NET) -> str:
+        with self.assertRaises(SystemExit) as caught:
+            ui.check_bind(bind, net)
+        return str(caught.exception)
+
+    def test_an_address_on_control_ui_net_starts(self):
+        ui.check_bind(UI_BIND, UI_NET)
+
+    def test_anything_but_an_address_on_control_ui_net_is_refused(self):
+        # A wildcard serves every leg; a name would make the check depend on DNS; the
+        # mapped spelling is another family, which uvicorn would bind as such. Then the
+        # UI's control-net leg, and the task registry's operator network, which the UI
+        # joins for the registry's view.
+        for bind in ("", "0.0.0.0", "::", "*", "control-plane-ui", "localhost",  # noqa: S104
+                     "127.0.0.1", "::1", "::ffff:172.25.0.2", "172.31.0.10",
+                     "172.26.0.3"):
+            with self.subTest(bind=bind):
+                message = self.refused(bind=bind)
+                self.assertIn(f"CONTROL_UI_BIND={bind!r}", message)
+                self.assertIn("fail closed", message)
+
+    def test_a_network_that_does_not_parse_is_refused(self):
+        # Host bits set is a typo too: 172.25.0.2/24 for 172.25.0.0/24.
+        for net in ("", "172.25.0.2/24", "172.25.0.0/33", "control-ui-net"):
+            with self.subTest(net=net):
+                self.assertIn(f"CONTROL_UI_NET={net!r}", self.refused(net=net))
+
+
+class EntryTests(unittest.TestCase):
+    """``main``: the bind is checked before uvicorn runs, and the app it runs is this
+    one, on that address alone, with the peer taken from the socket."""
+
+    def setUp(self):
+        self.calls: list[tuple[tuple, dict]] = []
+
+    def run_main(self, bind: str) -> None:
+        uvicorn = types.ModuleType("uvicorn")
+        uvicorn.run = lambda *a, **k: self.calls.append((a, k))
+        with mock.patch.dict(sys.modules, {"uvicorn": uvicorn}), \
+                mock.patch.object(ui, "BIND", bind), mock.patch.object(ui, "PORT", 18090):
+            ui.main()
+
+    def test_it_serves_this_app_on_the_bound_address_alone(self):
+        self.run_main(UI_BIND)
+        self.assertEqual(self.calls,
+                         [((ui.app,), {"host": UI_BIND, "port": 18090,
+                                       "proxy_headers": False, "log_level": "info"})])
+
+    def test_a_refused_bind_starts_nothing(self):
+        with self.assertRaises(SystemExit):
+            self.run_main("0.0.0.0")  # noqa: S104
+        self.assertEqual(self.calls, [])
+
+    def test_the_network_checked_is_control_ui_nets(self):
+        self.assertEqual(ui.UI_NET, UI_NET)
+
+    def test_the_port_defaults_to_the_one_the_image_exposes(self):
+        self.assertEqual(ui.PORT, 8090)
+
+
 if __name__ == "__main__":
     unittest.main()

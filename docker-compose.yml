@@ -137,6 +137,19 @@ networks:
     driver: bridge
     driver_opts:
       com.docker.network.bridge.enable_ip_masquerade: "false"
+  # The task registry's OPERATOR path. internal:true. Carries one conversation: the
+  # control-plane UI dialing the registry's operator listener, which takes no token, so
+  # membership of this network is the permission to write as the operator. Hence its
+  # roster is asserted in tests/test_topology.py: no sandbox, no MCP server, no
+  # gateway, ever. Nothing but that listener is served here (DESIGN.md, "Task
+  # registry — an MCP server with an operator side").
+  tasks-operator-net:
+    name: tasks-operator-net
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.26.0.0/24
 
 volumes:
   egress-audit:
@@ -153,6 +166,9 @@ volumes:
   # independently.
   control-state:
     name: dockade-control-state
+  # The task registry's store (task-registry/DESIGN.md), mounted by that service alone.
+  tasks-state:
+    name: dockade-tasks-state
 
 services:
   # Governed egress proxy — the central choke point (step 0: CONNECT-level
@@ -612,6 +628,90 @@ services:
       start_period: 10s
     # See egress-proxy for the rationale. A FastAPI process that brokers calls and
     # holds no store: the footprint is small and this is headroom, not a target.
+    mem_limit: 256m
+    memswap_limit: 256m
+    pids_limit: 128
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # ── Task registry (an MCP server with an operator side) ─────────────────────
+  # The work list agent sessions and the operator share; task-registry/DESIGN.md has
+  # who writes what, and DESIGN.md, "Task registry — an MCP server with an operator
+  # side", why it sits here rather than in mcp-servers.yml, on these legs and no others.
+  # OPTIONAL: behind a profile, started by `make tasks-up`, and nothing depends on it.
+  #
+  # DUAL-HOMED, one listener per leg, each bound to its leg's address alone and
+  # answering that network's peers only; serve.py refuses to start otherwise, since
+  # the operator listener takes no token.
+  tasks:
+    profiles:
+      - tasks
+    build:
+      context: ./task-registry
+    image: dockade-task-registry
+    # `tasks` is the server name the gateway dials and keys its tools on
+    # (mcp__gateway__tasks__…), and the name agent_api serves under.
+    container_name: tasks
+    hostname: tasks
+    # As the other optional services: a deliberate stop survives a reboot.
+    restart: unless-stopped
+    networks:
+      # The agent listener, which the gateway dials by name. .3, below the catalogue's
+      # .11+ block, as the gateway's .2 is: not a tenant of mcp-servers.yml.
+      mcp-net:
+        ipv4_address: 172.28.0.3
+      # The operator listener, for the control-plane UI.
+      tasks-operator-net:
+        ipv4_address: 172.26.0.2
+    environment:
+      # Each the pinned address of its leg, and nothing else will start (serve.py).
+      TASKS_AGENT_BIND: 172.28.0.3
+      TASKS_AGENT_PORT: "8110"
+      TASKS_OPERATOR_BIND: 172.26.0.2
+      TASKS_OPERATOR_PORT: "8111"
+    # The invoking user, for the gateway's reason: the secret file is the host user's,
+    # mode 0600. `:-`, never `:?`; the Makefile exports both.
+    user: "${DOCKADE_UID:-1000}:${DOCKADE_GID:-1000}"
+    volumes:
+      - tasks-state:/var/lib/task-registry
+      # The secret the gateway sends for server `tasks`: that ONE file, never the
+      # directory, which holds the other servers' tokens. The long form, so a missing
+      # file fails this container's start: the short form would create a root-owned
+      # directory in its place, beside the gateway's secrets. `make tasks-up` writes
+      # the file first.
+      - type: bind
+        source: ${MCP_SECRETS:-./secrets}/tasks.json
+        target: /run/dockade/secrets/tasks.json
+        read_only: true
+        bind:
+          create_host_path: false
+    # Writes only its store. A /tmp for SQLite's temporary files, which it puts in the
+    # first writable one of /var/tmp, /usr/tmp and /tmp.
+    read_only: true
+    tmpfs:
+      - /tmp
+    # Not a router between its legs: with forwarding on, an mcp-net neighbour that
+    # could add a route would cross to tasks-operator-net through this container.
+    sysctls:
+      net.ipv4.ip_forward: "0"
+    healthcheck:
+      # The agent listener's /healthz, which needs no secret, at its pinned address:
+      # it binds no loopback. Read from the environment, as the gateway's probe is.
+      test:
+        - CMD
+        - python3
+        - -c
+        - >-
+          import os, urllib.request as u;
+          u.urlopen('http://%s:%s/healthz' % (os.environ['TASKS_AGENT_BIND'],
+          os.environ['TASKS_AGENT_PORT']), timeout=3)
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    # See egress-proxy for the rationale. One process, two small apps and SQLite.
     mem_limit: 256m
     memswap_limit: 256m
     pids_limit: 128

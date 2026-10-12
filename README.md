@@ -316,6 +316,8 @@ dockade/
     DESIGN.md               #   what the agent is shown, and what runs
     requirements.txt        #   pinned deps, held equal to the control plane's
   task-registry/            # TASK REGISTRY — the work list agent sessions and the operator share
+    Dockerfile              #   FastAPI + uvicorn; mcp-net + tasks-operator-net, behind a profile
+    serve.py                #   the bind check, then both listeners in one process
     taskdb.py               #   SQLite — schema, the write transaction, the history every write leaves
     tasks.py                #   fields, states, parent and blockers; the plain writes
     claims.py               #   a claim's token, expiry and footprint; the plain claim writes
@@ -332,6 +334,7 @@ dockade/
     operator_api.py         #   the operator API: those moves and the reads as JSON over
                             #   HTTP, for the UI to relay to
     DESIGN.md               #   who writes what, and why
+    requirements.txt        #   pinned deps; fastapi and uvicorn held equal to the control plane's
   policies/                 # seed policy config (loaded into the control plane)
     egress-allowlist.txt    #   default-deny seed for the control plane's egress policy store
   proxies/                  # governed data-plane services (one dir per proxy)

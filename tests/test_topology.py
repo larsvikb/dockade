@@ -730,13 +730,16 @@ class GatewayPlacementTests(unittest.TestCase):
         self.assertEqual(shared, {}, f"uid claimed by more than one image: {shared}")
 
     def test_no_other_service_is_given_the_secrets(self):
-        # One holder, deliberately. Every additional container with the directory is
-        # another process whose compromise spends the same token, and the servers in
+        # One holder of the directory, deliberately. Every additional container with it
+        # is another process whose compromise spends the same token, and the servers in
         # particular must NOT have it — in http mode they ignore an env credential
-        # anyway (NOTES.md), so a copy there would be exposure buying nothing.
+        # anyway (NOTES.md), so a copy there would be exposure buying nothing. The task
+        # registry is the one other service given anything from it: its own file, alone
+        # (``TaskRegistryPlacementTests``).
         holders = {svc for svc in _service_names()
-                   if any("/run/dockade/secrets" in ln for ln in _service(svc))}
-        self.assertEqual(holders, {"tool-gateway"},
+                   if any("MCP_SECRETS" in ln or "/run/dockade/secrets" in ln
+                          for ln in _service(svc) if not ln.strip().startswith("#"))}
+        self.assertEqual(holders, {"tool-gateway", "tasks"},
                          f"more than the gateway is given the MCP credentials: {holders}")
 
     def test_the_gateway_runs_the_same_stack_as_the_control_plane(self):
@@ -1200,6 +1203,251 @@ class ProxyOutlastsTheHoldWindowTests(unittest.TestCase):
             f"{hold}s, so a held request dies on the proxy side while its card is "
             f"still pending — raise EGRESS_CONTROL_TIMEOUT or lower "
             f"CONTROL_HOLD_TIMEOUT")
+
+
+REGISTRY = ROOT / "task-registry"
+
+
+def _registry_default(module: str, variable: str) -> str:
+    """A default the registry's source sets, read as text for the reason
+    ``_gateway_forbidden_default`` gives."""
+    match = re.search(rf'"{variable}",\s*"([^"]+)"', (REGISTRY / module).read_text())
+    if not match:
+        raise AssertionError(f"task-registry/{module} no longer has a {variable} default "
+                             f"this can read")
+    return match.group(1)
+
+
+def _long_mount(service: str, target: str) -> dict[str, str]:
+    """The keys of a long-form volume entry, by its target, nested keys included."""
+    lines = _block(_service(service), "volumes", 4)
+    for i, line in enumerate(lines):
+        if line.strip() == "- type: bind":
+            item = [line.replace("- ", "  ", 1)]
+            for rest in lines[i + 1:]:
+                if rest.strip().startswith("- ") or len(rest) - len(rest.lstrip()) <= 6:
+                    break
+                item.append(rest)
+            keys = dict(ln.strip().partition(": ")[::2] for ln in item if ": " in ln)
+            if keys.get("target") == target:
+                return keys
+    raise AssertionError(f"{service} mounts nothing at {target} in the long form")
+
+
+class TaskRegistryPlacementTests(unittest.TestCase):
+    """The task registry: an MCP server on ``mcp-net`` with a second leg for the
+    operator, whose listener takes no token. So which networks it joins, and where each
+    listener binds, decide who can write as the operator. ``serve.py`` refuses a bind
+    off its own network; these hold compose to the same networks."""
+
+    LEGS: ClassVar[dict[str, str]] = {"TASKS_AGENT_BIND": "mcp-net",
+                                      "TASKS_OPERATOR_BIND": "tasks-operator-net"}
+
+    def test_it_is_on_exactly_its_two_legs(self):
+        # Exhaustive, as the gateway's legs are: a third breaks nothing at runtime. Never
+        # sandbox-net or a control network, since it parses agent text.
+        self.assertEqual(_networks_of("tasks"), {"mcp-net", "tasks-operator-net"})
+
+    def test_nothing_else_joins_the_operator_network(self):
+        # Being on it is the permission to write as the operator. The UI joins it when
+        # it gains the registry's view, and serves nothing there: the registry parses
+        # agent text, and a compromised one must not find the UI's relay, and the
+        # management API behind it. Anything else is an agent, a server or the gateway
+        # acting as the operator.
+        members = {svc for svc in _service_names()
+                   if "tasks-operator-net" in _raw_networks(svc)}
+        self.assertEqual(members, {"tasks"})
+
+    def test_the_operator_network_is_internal_and_apart(self):
+        body = _block(_block(COMPOSE, "networks", 0), "tasks-operator-net", 2)
+        self.assertTrue(any(re.match(r"\s*internal:\s*true\s*$", ln) for ln in body))
+        subnet = ipaddress.ip_network(_subnet_of("tasks-operator-net"))
+        # Inside the range the relay guard hard-blocks, so the proxy refuses it as a
+        # CONNECT target too.
+        self.assertTrue(subnet.subnet_of(ipaddress.ip_network("172.16.0.0/12")))
+        for net in ("sandbox-net", "control-net", "authorize-net", "tool-authorize-net",
+                    "mcp-net"):
+            with self.subTest(network=net):
+                self.assertFalse(subnet.overlaps(ipaddress.ip_network(_subnet_of(net))))
+
+    def test_each_listener_binds_the_leg_compose_pins(self):
+        env = _environment_of("tasks")
+        for var, net in self.LEGS.items():
+            with self.subTest(variable=var):
+                pinned = _scalar(_block(_service("tasks"), net, 6), "ipv4_address")
+                self.assertIsNotNone(pinned, f"the registry's {net} leg is not pinned")
+                self.assertEqual(env[var], pinned)
+
+    def test_the_bind_check_allows_exactly_the_compose_subnets(self):
+        # serve.py refuses a bind outside these. A default that drifted from compose
+        # would refuse the real address, loud, or allow another network's, silent.
+        env = _environment_of("tasks")
+        for var, net in (("TASKS_AGENT_NET", "mcp-net"),
+                         ("TASKS_OPERATOR_NET", "tasks-operator-net")):
+            with self.subTest(variable=var):
+                self.assertEqual(_registry_default("serve.py", var), _subnet_of(net))
+                if var in env:
+                    self.assertEqual(env[var].strip('"\''), _subnet_of(net))
+
+    def test_its_mcp_net_address_is_its_own(self):
+        mine = _scalar(_block(_service("tasks"), "mcp-net", 6), "ipv4_address")
+        for svc in _service_names():
+            if svc == "tasks" or "mcp-net" not in _raw_networks(svc):
+                continue
+            with self.subTest(service=svc):
+                self.assertNotEqual(
+                    _scalar(_block(_service(svc), "mcp-net", 6), "ipv4_address"), mine)
+
+    def test_it_publishes_no_port_and_nothing_waits_on_it(self):
+        # Optional everywhere: behind its own profile, and no service depends on it.
+        body = _service("tasks")
+        self.assertFalse([ln for ln in body if ln.strip().startswith("ports:")])
+        self.assertEqual(_block(body, "profiles", 4), ["      - tasks"])
+        for svc in _service_names():
+            # Both spellings: the block, and the flow form on the key's own line.
+            inline = [ln for ln in _service(svc) if re.match(r"    depends_on:", ln)]
+            try:
+                waits_on = _block(_service(svc), "depends_on", 4)
+            except AssertionError:
+                waits_on = []
+            with self.subTest(service=svc):
+                self.assertNotIn("tasks", {ln.strip().lstrip("- ").rstrip(":")
+                                           for ln in waits_on})
+                self.assertFalse([ln for ln in inline if re.search(r"\btasks\b", ln)])
+
+    def test_the_gateway_dials_it_by_the_name_it_serves_under(self):
+        # The gateway dials a server by its registered name, and keys its tools on it.
+        name = re.search(r'^SERVER_NAME = "([^"]+)"',
+                         (REGISTRY / "agent_api.py").read_text(), re.M).group(1)
+        self.assertIn("tasks", _service_names())
+        self.assertEqual(name, "tasks")
+        for key in ("container_name", "hostname"):
+            with self.subTest(key=key):
+                self.assertEqual(_scalar(_service("tasks"), key), name)
+
+    def test_it_is_given_its_own_secret_file_alone_read_only(self):
+        # Never the directory, which holds the other servers' tokens; and a missing file
+        # must fail its start rather than become a directory beside them.
+        target = _registry_default("agent_api.py", "TASKS_SECRET_FILE")
+        mount = _long_mount("tasks", target)
+        self.assertEqual(mount["source"], "${MCP_SECRETS:-./secrets}/tasks.json")
+        self.assertEqual(mount["read_only"], "true")
+        self.assertEqual(mount["create_host_path"], "false")
+        named = [ln.strip() for ln in _service("tasks") if not ln.strip().startswith("#")
+                 and ("MCP_SECRETS" in ln or "/run/dockade/secrets" in ln)]
+        self.assertEqual(named, [f"source: {mount['source']}", f"target: {target}"])
+
+    def test_tasks_up_writes_the_file_compose_mounts(self):
+        makefile = (ROOT / "Makefile").read_text()
+        recipe = re.search(r"^tasks-up:.*?(?=\n\S)", makefile, re.M | re.S)
+        self.assertIsNotNone(recipe, "no tasks-up target in the Makefile")
+        self.assertIn('secret="$(MCP_SECRETS)/tasks.json"', recipe.group(0))
+        self.assertIn("--profile tasks", recipe.group(0))
+
+    def test_it_forwards_nothing_between_its_legs(self):
+        # Its peer check guards its own listeners; this keeps it from carrying a
+        # neighbour's packet across to the other network's members.
+        sysctls = [ln.strip() for ln in _block(_service("tasks"), "sysctls", 4)
+                   if ln.strip() and not ln.strip().startswith("#")]
+        self.assertEqual(sysctls, ['net.ipv4.ip_forward: "0"'])
+
+    def test_it_runs_as_a_user_that_can_read_its_secret(self):
+        # For the gateway's reason (test_the_gateway_runs_as_a_user_that_can_read_...).
+        user = [ln.strip() for ln in _service("tasks") if ln.strip().startswith("user:")]
+        self.assertEqual(len(user), 1)
+        self.assertIn("DOCKADE_UID", user[0])
+        self.assertNotIn('"0:', user[0])
+        self.assertNotIn("root", user[0])
+
+    def test_its_store_is_a_volume_of_its_own_where_the_store_looks(self):
+        where = _registry_default("taskdb.py", "TASKS_DB").rsplit("/", 1)[0]
+        for svc in _service_names():
+            mounts = [ln.strip().lstrip("- ") for ln in _service(svc)
+                      if ln.strip().startswith("- tasks-state:")]
+            with self.subTest(service=svc):
+                self.assertEqual(mounts, [f"tasks-state:{where}"] if svc == "tasks" else [])
+
+    def test_the_healthcheck_dials_the_agent_listener_where_it_binds(self):
+        # The listener binds no loopback, so a probe of 127.0.0.1 would never pass.
+        probe = "".join(_block(_service("tasks"), "healthcheck", 4))
+        for var in ("TASKS_AGENT_BIND", "TASKS_AGENT_PORT"):
+            self.assertIn(f"os.environ['{var}']", probe)
+        self.assertIn("/healthz", probe)
+
+    def test_it_runs_the_control_planes_stack_and_pins_pydantic(self):
+        pins = lambda path: {  # noqa: E731
+            line.strip() for line in path.read_text().splitlines()
+            if line.strip() and not line.startswith("#")}
+        mine = pins(REGISTRY / "requirements.txt")
+        self.assertLessEqual(pins(ROOT / "control-plane" / "requirements.txt"), mine)
+        self.assertEqual({p.split("==")[0] for p in mine}, {"fastapi", "uvicorn", "pydantic"})
+        self.assertTrue(all("==" in p for p in mine), mine)
+
+    def test_every_module_is_shipped_and_the_entry_is_serve(self):
+        # As ControlPlaneModulesAreShippedTests: a module with no COPY line passes every
+        # test here and fails the container's start.
+        dockerfile = (REGISTRY / "Dockerfile").read_text()
+        for path in sorted(REGISTRY.glob("*.py")):
+            with self.subTest(module=path.name):
+                self.assertIn(f"COPY {path.name} ./{path.name}", dockerfile)
+        self.assertIn('ENTRYPOINT ["python", "serve.py"]', dockerfile)
+
+
+class NoServiceSharesANetworkNamespaceTests(unittest.TestCase):
+    """``network_mode: service:<name>`` gives a service another's legs with no
+    ``networks:`` block, so every roster here would miss it, and its connections to a
+    listener in that namespace come from the listener's own address, which a peer check
+    on the network admits; ``host`` reaches every bridge through the host's address.
+    A sidecar of the task registry would write as the operator."""
+
+    def test_no_service_sets_a_network_mode(self):
+        for svc in _service_names():
+            with self.subTest(service=svc):
+                self.assertFalse([ln for ln in _service(svc)
+                                  if re.match(r"\s+network_mode:", ln)])
+
+
+class EveryServiceDropsEveryCapabilityTests(unittest.TestCase):
+    """What keeps a single-address bind on its own leg. Linux takes a packet for any of
+    its addresses on any interface, so a neighbour that could route or forge one would
+    reach a listener bound to another network's address through the leg they share: an
+    MCP server reaching the task registry's operator listener or the gateway's agent
+    listener, the egress proxy the control plane's management listener. Routing takes
+    NET_ADMIN and forging takes NET_RAW, which Docker grants by default. So every
+    service drops them all, and none adds one back or runs privileged."""
+
+    def test_every_service_drops_all_and_adds_none(self):
+        for svc in _service_names():
+            body = _service(svc)
+            with self.subTest(service=svc):
+                self.assertEqual([ln.strip() for ln in _block(body, "cap_drop", 4)
+                                  if ln.strip() and not ln.strip().startswith("#")],
+                                 ["- ALL"])
+                self.assertFalse([ln for ln in body if re.match(r"    cap_add:", ln)])
+                self.assertFalse([ln for ln in body
+                                  if re.match(r"    privileged:\s*true", ln)])
+
+
+class EveryImageIsBuiltTests(unittest.TestCase):
+    """`make verify-build` is the one check that a Dockerfile still builds, and compose
+    builds only the services its active profiles enable. So a profile-gated service
+    built from a Dockerfile is built there only if its profile is named."""
+
+    def test_verify_build_names_every_profile_with_a_build(self):
+        makefile = (ROOT / "Makefile").read_text()
+        recipe = re.search(r"^verify-build:.*?(?=\n\S)", makefile, re.M | re.S).group(0)
+        gated = {}
+        for svc in _service_names():
+            body = _service(svc)
+            if any(re.match(r"    build:", ln) for ln in body) and \
+                    any(re.match(r"    profiles:", ln) for ln in body):
+                gated[svc] = [ln.strip().lstrip("- ") for ln in _block(body, "profiles", 4)
+                              if ln.strip().startswith("- ")]
+        self.assertEqual(set(gated), {"tasks"})
+        for svc, profiles in gated.items():
+            for profile in profiles:
+                with self.subTest(service=svc, profile=profile):
+                    self.assertIn(f"--profile {profile} build", recipe)
 
 
 if __name__ == "__main__":

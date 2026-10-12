@@ -186,7 +186,8 @@ instruction, matters more here. A hidden note does not even match.
 the control-plane UI,** which renders agent text behind the escaping and framing guards
 it already has; the API serves no HTML, and nothing an agent calls. It takes no token:
 as with the UI's relay to the control plane, being on its network is the permission, so
-whatever serves it must bind it where no agent and no MCP server has a leg.
+`serve.py` binds it on a network of its own, refuses to start anywhere else, and
+answers that network's peers only (the root `DESIGN.md`, "Task registry").
 
 **A body is checked for shape before the store's checks run** (`operator_api.Body`), as
 the agent listener's calls are: an unknown field is refused, and ids, revisions and

@@ -16,8 +16,8 @@
  * No DOM at import, so the unit tests import this file under node
  * (tests/test_control_plane_ui_js.py).
  */
-import { escapePayload } from "./payload.js";
-import { pollStatus, renderListStatus } from "./status.js";
+import { escapePayload } from "./escape.js";
+import { pollStatus, renderListStatus } from "./list-status.js";
 import { fmtStamp, fmtInstant } from "./time.js";
 
 // The registry's states, in the order work moves through them
@@ -99,7 +99,7 @@ export function flaggedBadge(total) {
   return Number.isInteger(n) && n > 0 ? String(n) : "";
 }
 
-// What a list says about itself, as every polled list here does (status.js). Its own
+// What a list says about itself, as every polled list does (list-status.js). Its own
 // sentence when a search found nothing, since that is a question's answer and not an
 // empty backlog.
 const TASKS_STATUS_TEXT = {

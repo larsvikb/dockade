@@ -301,8 +301,8 @@ dockade/
     provenance.js           #   who acted, cut to what a table cell can hold
     saturation.js           #   hold-cap pressure: when requests are being refused unheard,
                             #   the banner, and what dismissing it acknowledges
-    status.js               #   what each polled table says about itself: empty, stale, or
-                            #   not yet loaded — one decision, four tables' sentences
+    status.js               #   what each polled table says about itself: its sentences for
+                            #   empty, stale, or not yet loaded
     tasks.js                #   the Tasks tab: the task registry's work list, its not-running
                             #   state, agent prose with hidden characters spelled out
     index.html              #   static shell + styles for the SSE approval console
@@ -311,6 +311,8 @@ dockade/
   ui-common/                # what every UI shares, copied in beside its own files
     guards.py               #   the browser guards, the security headers, the bind and
                             #   peer checks a UI starts with
+    escape.js               #   non-ASCII spelled `\uXXXX`, as JSON writes it
+    list-status.js          #   empty, stale or not yet loaded: one decision, one renderer
     time.js                 #   timestamps as the page shows them
   tool-gateway/             # MCP GATEWAY — governed tool capability; tier 1's `--mcp-config` points at it
     Dockerfile              #   FastAPI + uvicorn; triple-homed, no egress leg

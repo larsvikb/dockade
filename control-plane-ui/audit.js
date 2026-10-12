@@ -11,8 +11,9 @@
  */
 
 import { esc } from "./dom.js";
+import { renderListStatus } from "./list-status.js";
 import { shortActor } from "./provenance.js";
-import { auditStatus, AUDIT_REFUSED_FALLBACK, renderListStatus } from "./status.js";
+import { auditStatus, AUDIT_REFUSED_FALLBACK } from "./status.js";
 import { fmtInstant, fmtStamp, tsSeconds } from "./time.js";
 
 // Nearly every governed request is a CONNECT tunnel, so `stage` is "connect" on almost

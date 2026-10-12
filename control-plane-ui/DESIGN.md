@@ -189,10 +189,10 @@ failed" must not render identically — and the header cannot disambiguate them,
 *separate poll* that can be failing while the stream is healthy. So each list tracks two
 facts (has a load ever succeeded; did the last one fail), keeps its rows on a failed
 refresh while saying they may be stale, and stays silent before the first response. The
-three-state logic is shared (`pollStatus`) with per-view wording a test keeps distinct —
-a stale **policy** table is worse than a stale decisions one, since it misstates what is
-currently allowed before an operator decides a hold. Details in `audit.js` and
-`app.js`, the two polls.
+three-state logic is shared (`pollStatus`, in `ui-common/`) with per-view wording a test
+keeps distinct — a stale **policy** table is worse than a stale decisions one, since it
+misstates what is currently allowed before an operator decides a hold. Details in
+`audit.js` and `app.js`, the two polls.
 
 **The frontend's own tests.** `tests/test_control_plane_ui_js.py` runs the pure helpers
 under `node` (skipped when node is absent, the way `make lint` skips a missing linter)

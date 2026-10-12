@@ -8,9 +8,10 @@
  * No DOM at import, so the unit tests import this file under node
  * (tests/test_control_plane_ui_js.py).
  */
+import { escapePayload } from "./escape.js";
 import { leaseCountdown, leaseRemaining } from "./leases.js";
-import { escapePayload } from "./payload.js";
-import { renderListStatus, toolPinsStatus, toolRulesStatus } from "./status.js";
+import { renderListStatus } from "./list-status.js";
+import { toolPinsStatus, toolRulesStatus } from "./status.js";
 import { fmtStamp, tsSeconds } from "./time.js";
 
 // The DNS label a server name has to be. Three spellings of one rule — here, in the

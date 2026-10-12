@@ -187,7 +187,7 @@ egress** — sandbox-net only. These make good practices cheap and fast. Example
   frontend's host-loopback UI publish; masquerade disabled so it is
   host-reachable but not an egress path. Needed because Docker cannot publish a
   host port from a container that is on an internal network alone. The UI serves
-  its address here alone (`check_bind` in `control-plane-ui/app.py`), and no
+  its address here alone (`check_bind` in `ui-common/guards.py`), and no
   neighbour can route a packet to it, since every service drops every capability
   (`EveryServiceDropsEveryCapabilityTests`): so no container on its other legs
   reaches the page or the relay. Sandbox not attached.
@@ -2299,6 +2299,7 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | task registry, agent side — where the id comes from in the image's instructions, dockade's repo name and checkpoints in `CLAUDE.md`, the id in the status line | **done** — `inflight.md` and `local-todo.md` stay the record beside it |
 | — | task registry backups — its store and a markdown export in `make backup`, `make restore-tasks` | **done** |
 | — | task registry view — the UI's Tasks tab, relayed to the operator listener over `tasks-operator-net` | **done** — reads only; the operator's moves next |
+| — | the task registry's own UI — `tasks-ui`, on another origin and with no `control-net` leg; what both UIs share in `ui-common/` | in progress — what both UIs share goes to `ui-common/` first |
 
 The rationale for each shipped item lives under **Governance surfaces** above, not here
 — a status line goes stale, the reasoning does not. This section is deliberately the

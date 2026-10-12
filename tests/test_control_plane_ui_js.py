@@ -21,8 +21,10 @@ these tests fail loudly rather than the file quietly becoming untestable again.
 
 The page is ES modules, one per surface, and ``UI_MODULES`` in ``app.py`` is the list
 of what the script route serves. Three files agree on that list with no compiler
-between them — the directory, the Dockerfile and the modules' own imports — so each
-pair is asserted below.
+between them — the directories, the Dockerfile and the modules' own imports — so each
+pair is asserted below. The directories are two: this one and ``ui-common/``, whose
+modules the image copies in beside these, so node imports them all from one directory
+built the same way (``_served_dir``).
 
 **CSP/markup agreement, no node needed.** ``script-src 'self'`` is only worth sending
 while the page has no inline script. That is an invariant spanning two files, so it is
@@ -31,6 +33,7 @@ silently reduce the Content-Security-Policy to decoration.
 """
 from __future__ import annotations
 
+import atexit
 import functools
 import json
 import os
@@ -44,6 +47,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 UI_DIR = ROOT / "control-plane-ui"
+COMMON_DIR = ROOT / "ui-common"
 APP_JS = UI_DIR / "app.js"
 MCP_JS = UI_DIR / "mcp.js"
 AUDIT_JS = UI_DIR / "audit.js"
@@ -52,10 +56,28 @@ PAYLOAD_JS = UI_DIR / "payload.js"
 INDEX_HTML = UI_DIR / "index.html"
 
 
+def _module_paths() -> dict[str, Path]:
+    """Every module the page is made of, by the name it is served under: this
+    directory's, and ``ui-common/``'s, which the image copies in beside them."""
+    return {p.name: p for d in (UI_DIR, COMMON_DIR) for p in sorted(d.glob("*.js"))}
+
+
 def _module_texts() -> dict[str, str]:
     """Every module the page is made of, by file name — for the guards that read
     source, so a helper moving to another module does not move out of their sight."""
-    return {p.name: p.read_text() for p in sorted(UI_DIR.glob("*.js"))}
+    return {name: p.read_text() for name, p in sorted(_module_paths().items())}
+
+
+@functools.cache
+def _served_dir() -> Path:
+    """The modules in one directory, as the image serves them. A module imports
+    `./time.js` whichever folder its source sits in, and node, like the browser,
+    resolves that beside the importer."""
+    out = Path(tempfile.mkdtemp(prefix="dockade-ui-modules-"))
+    atexit.register(shutil.rmtree, out, ignore_errors=True)
+    for name, path in _module_paths().items():
+        shutil.copyfile(path, out / name)
+    return out
 
 
 def _imports(js: str) -> list[str]:
@@ -88,15 +110,16 @@ def _code(js: str) -> str:
     return re.sub(r'import \{.*?\}\s*from\s+"[^"]+";', "", code, flags=re.S)
 
 # `make test` runs discovery with `-t tests`, so sibling modules import by bare name;
-# this keeps the file runnable on its own too. Imported for `_CSP` / `_directives` —
-# the policy and its parser live with the app, so this module does not restate them.
+# this keeps the file runnable on its own too. Imported for the CSP and `_directives`:
+# the policy and its parser live with the guards, so this module does not restate them.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 # ``cp`` is the loaded control plane, for the two places this page duplicates a backend
 # rule and has to be held equal to it: `normalizePattern` and the wildcard floor.
 # Imported from the sibling test module rather than loaded again — that module already
 # owns the temp-store setup, and loading twice would give two modules with two databases.
 from test_control_plane_api import cp  # noqa: E402 (path set above)
-from test_control_plane_ui import _directives, ui  # noqa: E402 (path set above)
+from test_control_plane_ui import ui  # noqa: E402 (path set above)
+from test_ui_guards import _directives  # noqa: E402 (path set above)
 
 _NODE = shutil.which("node")
 # Missing node SKIPS on a dev machine — running the checks you can run beats running
@@ -1182,7 +1205,7 @@ def _probe() -> dict:
     # local date differs from the UTC date for the sample instants below.
     proc = subprocess.run(  # noqa: S603 (absolute path, fixed args — see above)
         [_NODE, "--input-type=module", "-e", _PROBE],
-        env={**os.environ, "DOCKADE_UI_DIR": str(UI_DIR),
+        env={**os.environ, "DOCKADE_UI_DIR": str(_served_dir()),
              "TZ": "Europe/Stockholm"},
         capture_output=True, text=True, timeout=60, check=False)
     if proc.returncode != 0:
@@ -3788,8 +3811,7 @@ class CreateRuleSourceTests(unittest.TestCase):
         test and total in a real one: the click does nothing, silently, and the form
         reads as broken rather than as blocked."""
         self.assertIn("ev.preventDefault()", self.body.group(0))
-        self.assertIn("form-action 'none'",
-                      (ROOT / "control-plane-ui" / "app.py").read_text())
+        self.assertIn("form-action 'none'", ui.guards.CSP)
 
     def test_the_body_carries_the_pattern_that_was_confirmed(self):
         # `p.pattern` is normalized; the input box is not. Sending the raw value would
@@ -4364,7 +4386,7 @@ class InlineScriptTests(unittest.TestCase):
         # runtime, so img-src must keep allowing data: — the CSP and the page have to
         # be edited together or the icon silently stops rendering.
         html = INDEX_HTML.read_text()
-        csp = _directives(ui._CSP)
+        csp = _directives(ui.guards.CSP)
         self.assertIn("data:image/svg+xml", html)
         self.assertEqual(csp["img-src"], ["data:"])
         self.assertIn("<style>", html)
@@ -4519,20 +4541,29 @@ class InlineScriptTests(unittest.TestCase):
             "the handler must adopt the acknowledgement the BACKEND recorded; without "
             "that echo a wrong count fails silently instead of re-raising the banner")
 
-    def test_the_modules_the_app_serves_are_the_files_in_this_directory(self):
+    def test_the_modules_the_app_serves_are_the_files_it_is_served_from(self):
         # Both directions in one equality: a file nobody listed is a 404 in the
         # browser, and a listed file nobody wrote is one too.
         self.assertEqual(set(ui.UI_MODULES), set(_module_texts()))
         self.assertIn("app.js", ui.UI_MODULES)
 
     def test_every_module_is_copied_into_the_image(self):
-        # UI_DIR points into the image, and the Dockerfile copies files by name. A
-        # module left out of it passes every test here and 404s in the container —
-        # and the entry's first `import` of it stops the whole page.
+        # UI_DIR points into the image, and the Dockerfile copies files by name, from
+        # the folder each sits in. A module left out of it passes every test here and
+        # 404s in the container — and the entry's first `import` of it stops the page.
         dockerfile = (UI_DIR / "Dockerfile").read_text()
-        for name in sorted(ui.UI_MODULES):
+        for name, path in sorted(_module_paths().items()):
             with self.subTest(module=name):
-                self.assertRegex(dockerfile, rf"(?m)^COPY {re.escape(name)} ")
+                source = path.relative_to(ROOT).as_posix()
+                self.assertRegex(dockerfile,
+                                 rf"(?m)^COPY {re.escape(source)} \./{re.escape(name)}$")
+
+    def test_no_module_name_is_in_both_folders(self):
+        # The image copies both into one directory, so the second would replace the
+        # first there while the tests read whichever they globbed last.
+        here = {p.name for p in UI_DIR.glob("*.js")}
+        common = {p.name for p in COMMON_DIR.glob("*.js")}
+        self.assertEqual(here & common, set())
 
     def test_every_import_names_a_served_module_and_every_module_is_imported(self):
         # The browser fetches `./x.js` from this origin, so an import of a file
@@ -4627,7 +4658,7 @@ class FreeNameTests(unittest.TestCase):
     the browser's."""
 
     def test_every_free_name_in_the_page_is_a_browser_global(self):
-        found = _free_names(sorted(UI_DIR.glob("*.js")))
+        found = _free_names(sorted(_served_dir().glob("*.js")))
         # Every module that touches the DOM reads `document`, so a run that found
         # nothing is a node whose dump format changed, not a clean page.
         self.assertIn("document", found, "the dump was not parsed; did node change it?")
@@ -5303,7 +5334,7 @@ class TaskViewTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         proc = subprocess.run(  # noqa: S603 (absolute path, fixed args, as _probe)
             [_NODE, "--input-type=module", "-e", _TASKS_PROBE],
-            env={**os.environ, "DOCKADE_UI_DIR": str(UI_DIR), "TZ": "Europe/Stockholm"},
+            env={**os.environ, "DOCKADE_UI_DIR": str(_served_dir()), "TZ": "Europe/Stockholm"},
             capture_output=True, text=True, timeout=60, check=False)
         if proc.returncode != 0:
             raise AssertionError("importing tasks.js under node failed:\n" + proc.stderr)

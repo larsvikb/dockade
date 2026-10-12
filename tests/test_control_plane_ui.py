@@ -12,13 +12,12 @@ upstream host always stays the backend.
 
 **Browser-facing guards.** This app publishes the only API that can grant egress
 (``POST /approvals/{id}/resolve`` is self-approval if reached), on host loopback,
-with no auth. Loopback binding is no defense against DNS REBINDING: a page the
-operator visits can point its own name at 127.0.0.1 and become same-origin, at which
-point it can read the pending approvals (getting the unguessable ids) and resolve
-them. So the app now enforces a Host allowlist (closes rebinding), refuses
-cross-origin state changes (closes CSRF), relays only an allowlist of backend paths
-(so ``POST /authorize`` is unreachable from a page), and replaces client-supplied
-provenance headers with the peer address it actually observed.
+with no auth. The Host allowlist (against DNS rebinding), the refusals of a
+cross-origin state change and of being embedded, and the security headers are
+``ui-common/guards.py``'s, tested in ``tests/test_ui_guards.py``. Here: that this app
+installs them under its own name and allowlist, relays only an allowlist of backend
+paths (so ``POST /authorize`` is unreachable from a page), and replaces
+client-supplied provenance headers with the peer address it actually observed.
 
 Dependency-free: like ``tests/_loader.py`` we stub the third-party imports
 (``httpx``, the ``fastapi``/``starlette`` bits) before loading the module by path.
@@ -31,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import ipaddress
+import os
 import re
 import sys
 import types
@@ -106,7 +106,7 @@ def _install_stubs() -> None:
             self.args, self.kwargs = a, k
             self.status_code = k.get("status_code", 200)
             self.body = a[0] if a else None
-            # A dict stands in for Starlette's MutableHeaders — `_security_headers`
+            # A dict stands in for Starlette's MutableHeaders — `security_headers`
             # writes onto every response it wraps, refusals included.
             self.headers = dict(k.get("headers") or {})
 
@@ -154,12 +154,16 @@ def _install_stubs() -> None:
         sys.modules["starlette.background"] = bg
 
 
-def _load_ui() -> types.ModuleType:
+def _load_ui(name: str = "dockade_control_plane_ui") -> types.ModuleType:
     _install_stubs()
+    # The image copies ui-common/'s modules beside app.py, which imports them by plain
+    # name; here they are found on the path instead.
+    if str(ROOT / "ui-common") not in sys.path:
+        sys.path.insert(0, str(ROOT / "ui-common"))
     path = ROOT / "control-plane-ui" / "app.py"
-    spec = importlib.util.spec_from_file_location("dockade_control_plane_ui", path)
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
-    sys.modules["dockade_control_plane_ui"] = module
+    sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -197,128 +201,6 @@ def _ok_host(**kw):
 
 async def _passthrough(_request):
     return "REACHED-THE-APP"
-
-
-class HostGuardTests(unittest.TestCase):
-    """The Host allowlist is the load-bearing anti-rebinding control: rebinding
-    structurally requires the attacker's own name in Host, and JS cannot set that
-    header, so refusing unexpected Hosts removes the attack class."""
-
-    def _guard(self, request):
-        return asyncio.run(ui._guard(request, _passthrough))
-
-    def test_loopback_hosts_are_accepted_regardless_of_port(self):
-        # The published port and the in-container healthcheck port (8090) differ
-        # and must both work off ONE list — hence port-insensitive comparison.
-        # The published number is deliberately arbitrary here: it is configurable
-        # (DOCKADE_UI_PORT), and pinning it would make this a test of the default.
-        for host in ("127.0.0.1:28090", "localhost:28090", "127.0.0.1:8090",
-                     "localhost", "[::1]:28090"):
-            self.assertEqual(self._guard(_FakeRequest(headers={"host": host})),
-                             "REACHED-THE-APP", host)
-
-    def test_rebinding_host_is_refused(self):
-        for host in ("evil.com", "evil.com:28090", "attacker.test:28090",
-                     "127.0.0.1.evil.com:28090"):
-            resp = self._guard(_FakeRequest(headers={"host": host}))
-            self.assertEqual(getattr(resp, "status_code", None), 403, host)
-
-    def test_absent_host_is_refused(self):
-        resp = self._guard(_FakeRequest(headers={}))
-        self.assertEqual(resp.status_code, 403)
-
-    def test_guard_fails_closed_when_allowlist_is_emptied(self):
-        # Not a supported configuration (import asserts against it) — this pins the
-        # direction of failure if it is somehow reached: refuse, never wave through.
-        with mock.patch.object(ui, "ALLOWED_HOSTNAMES", frozenset()):
-            resp = self._guard(_FakeRequest(headers={"host": "127.0.0.1:28090"}))
-        self.assertEqual(resp.status_code, 403)
-
-    def test_import_refuses_an_empty_allowlist(self):
-        with mock.patch.object(ui, "ALLOWED_HOSTNAMES", frozenset()), \
-                self.assertRaises(RuntimeError):
-            ui._assert_host_guard_configured()
-
-
-class CrossOriginGuardTests(unittest.TestCase):
-    """State-changing requests must not be accepted from another origin."""
-
-    def _guard(self, request):
-        return asyncio.run(ui._guard(request, _passthrough))
-
-    def test_cross_site_post_is_refused_via_sec_fetch_site(self):
-        resp = self._guard(_ok_host(
-            method="POST", headers={"sec-fetch-site": "cross-site"}))
-        self.assertEqual(resp.status_code, 403)
-
-    def test_same_origin_post_is_accepted(self):
-        self.assertEqual(
-            self._guard(_ok_host(method="POST",
-                                 headers={"sec-fetch-site": "same-origin"})),
-            "REACHED-THE-APP")
-
-    def test_cross_origin_post_is_refused_via_origin_header(self):
-        # Older browser with no Sec-Fetch-Site: fall back to Origin.
-        resp = self._guard(_ok_host(
-            method="POST", headers={"origin": "https://evil.com"}))
-        self.assertEqual(resp.status_code, 403)
-
-    def test_same_origin_post_via_origin_header_is_accepted(self):
-        self.assertEqual(
-            self._guard(_ok_host(method="POST",
-                                 headers={"origin": "http://127.0.0.1:28090"})),
-            "REACHED-THE-APP")
-
-    def test_another_localhost_port_is_another_origin(self):
-        # The fallback used to compare hostnames against the allowlist, so any
-        # localhost origin passed. A page the agent wrote into the workspace, served
-        # by the project's own dev server on another port and opened by the operator
-        # in a browser without Sec-Fetch-Site, could POST a resolve. The port is part
-        # of the origin and is compared.
-        for origin in ("http://localhost:3000", "http://127.0.0.1:3000",
-                       "http://127.0.0.1"):
-            with self.subTest(origin=origin):
-                resp = self._guard(_ok_host(method="POST", headers={"origin": origin}))
-                self.assertEqual(resp.status_code, 403)
-
-    def test_the_origin_is_compared_to_the_requests_own_host_not_the_allowlist(self):
-        # `localhost` and `127.0.0.1` are both allowed Hosts, but a page at one is
-        # not the same origin as a page at the other; the UI's own page always sends
-        # the Origin its address bar shows, which is the Host it dialled.
-        resp = self._guard(_ok_host(method="POST",
-                                    headers={"origin": "http://localhost:28090"}))
-        self.assertEqual(resp.status_code, 403)
-
-    def test_a_default_port_left_implicit_on_either_side_still_matches(self):
-        # Browsers omit :80 from Origin; an operator may or may not type it into Host.
-        for host, origin in (("localhost", "http://localhost"),
-                             ("localhost:80", "http://localhost"),
-                             ("localhost", "http://localhost:80")):
-            with self.subTest(host=host, origin=origin):
-                req = _FakeRequest(method="POST",
-                                   headers={"host": host, "origin": origin})
-                self.assertEqual(self._guard(req), "REACHED-THE-APP")
-
-    def test_an_opaque_origin_is_refused(self):
-        # `Origin: null` — a sandboxed frame, a redirect chain, a data: URL. It is
-        # nobody's authority, so it equals nothing.
-        resp = self._guard(_ok_host(method="POST", headers={"origin": "null"}))
-        self.assertEqual(resp.status_code, 403)
-
-    def test_post_with_no_browser_headers_is_accepted(self):
-        # Neither header means no browser is calling, so there is no CSRF to stop;
-        # refusing here would only break curl/scripting without adding safety. The
-        # host-local caller this admits is out of reach of any browser-enforced
-        # guard anyway (see the module docstring) — it is handled by recording
-        # provenance, not by pretending to block it.
-        self.assertEqual(self._guard(_ok_host(method="POST")), "REACHED-THE-APP")
-
-    def test_cross_site_GET_is_not_refused_by_the_origin_guard(self):
-        # A cross-origin GET's response is unreadable without CORS headers (never
-        # sent), and the readable case is rebinding — already refused by Host.
-        self.assertEqual(
-            self._guard(_ok_host(headers={"sec-fetch-site": "cross-site"})),
-            "REACHED-THE-APP")
 
 
 class RelayAllowlistTests(unittest.TestCase):
@@ -375,6 +257,8 @@ class RelayAllowlistTests(unittest.TestCase):
         # The proxy's decision endpoint: no browser has any business reaching it.
         resp = self._proxy("authorize", "POST")
         self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.body, "refused by control-plane-ui: POST /authorize is not a "
+                                    "relayed path\n")
         self.assertEqual(_sent, {}, "must not reach the backend at all")
 
     def test_unknown_and_wrong_method_paths_are_not_relayed(self):
@@ -546,117 +430,6 @@ class ProvenanceHeaderTests(unittest.TestCase):
         self.assertIn("if-none-match", names)
 
 
-class FramingGuardTests(unittest.TestCase):
-    """Clickjacking is the one browser-side vector the Host and cross-origin guards
-    cannot see: framing this UI produces a legitimate `Host: 127.0.0.1` on a GET
-    (allowed cross-origin by design), and the framed page's own resolve POST really is
-    same-origin. Reads stay blocked, but a UI-redress click needs no read — it lands
-    on the real "Allow + persist rule" button."""
-
-    def _guard(self, request):
-        return asyncio.run(ui._guard(request, _passthrough))
-
-    def test_embedded_destinations_are_refused(self):
-        for dest in ("iframe", "frame", "embed", "object"):
-            resp = self._guard(_ok_host(headers={"sec-fetch-dest": dest}))
-            self.assertEqual(getattr(resp, "status_code", None), 403, dest)
-
-    def test_normal_destinations_are_served(self):
-        # The top-level page, the script, and the fetch/EventSource calls.
-        for dest in ("document", "script", "empty", ""):
-            self.assertEqual(
-                self._guard(_ok_host(headers={"sec-fetch-dest": dest})),
-                "REACHED-THE-APP", dest or "<absent>")
-
-    def test_embedded_post_is_refused_even_when_same_origin(self):
-        # The POST from inside a frame is genuinely same-origin, so guard 2 passes it;
-        # this must not be the only thing standing between a frame and `resolve`.
-        resp = self._guard(_ok_host(method="POST", headers={
-            "sec-fetch-site": "same-origin", "sec-fetch-dest": "iframe"}))
-        self.assertEqual(resp.status_code, 403)
-
-
-def _directives(csp: str) -> dict[str, list[str]]:
-    """Parse a CSP into {directive: [sources]} so tests assert on the POLICY rather
-    than on a substring of a header value."""
-    out = {}
-    for part in csp.split(";"):
-        part = part.strip()
-        if not part:
-            continue
-        name, _, rest = part.partition(" ")
-        out[name.lower()] = rest.split()
-    return out
-
-
-class _FakeResponse:
-    def __init__(self, status_code=200, headers=None):
-        self.status_code = status_code
-        self.headers = dict(headers or {})
-
-
-class SecurityHeaderTests(unittest.TestCase):
-    """Every response carries the browser-facing policy — refusals included, since a
-    refusal is still a document a browser may have framed."""
-
-    def _headers(self, upstream=None, status_code=200):
-        async def _next(_request):
-            return _FakeResponse(status_code=status_code, headers=upstream or {})
-        resp = asyncio.run(ui._security_headers(_ok_host(), _next))
-        return resp.headers
-
-    def test_frame_ancestors_none_is_present(self):
-        # The load-bearing directive: this is what actually closes clickjacking in a
-        # browser (the Sec-Fetch-Dest refusal above is for the log trail).
-        csp = _directives(self._headers()["content-security-policy"])
-        self.assertEqual(csp.get("frame-ancestors"), ["'none'"])
-
-    def test_script_src_is_self_and_never_unsafe_inline(self):
-        # The whole reason app.js is a file. An 'unsafe-inline' script-src would make
-        # the rest of this policy decorative against an injection in the pending list,
-        # which renders agent-controlled host/url/client strings.
-        csp = _directives(self._headers()["content-security-policy"])
-        self.assertEqual(csp.get("script-src"), ["'self'"])
-
-    def test_policy_denies_by_default_and_allows_only_what_the_page_uses(self):
-        csp = _directives(self._headers()["content-security-policy"])
-        self.assertEqual(csp.get("default-src"), ["'none'"])
-        self.assertEqual(csp.get("connect-src"), ["'self'"])   # fetch + EventSource
-        self.assertEqual(csp.get("img-src"), ["data:"])        # the inline favicon
-        self.assertEqual(csp.get("base-uri"), ["'none'"])
-        self.assertEqual(csp.get("form-action"), ["'none'"])
-        # No external origin is permitted anywhere in the policy — a governance UI
-        # must not be able to load or reach a third party even under an injection.
-        for sources in csp.values():
-            for src in sources:
-                self.assertNotIn("//", src)
-                self.assertNotIn("*", src)
-
-    def test_supporting_headers_are_set(self):
-        headers = self._headers()
-        self.assertEqual(headers["x-frame-options"], "DENY")
-        self.assertEqual(headers["x-content-type-options"], "nosniff")
-        self.assertEqual(headers["referrer-policy"], "no-referrer")
-
-    def test_a_relayed_backend_header_cannot_weaken_the_policy(self):
-        # These responses include relayed ones, so upstream headers pass through this
-        # middleware. Assignment (not setdefault) is what makes the frontend's policy
-        # authoritative over anything the backend might send.
-        headers = self._headers(upstream={"content-security-policy": "default-src *"})
-        self.assertEqual(headers["content-security-policy"], ui._CSP)
-
-    def test_guard_refusals_are_hardened_too(self):
-        # `_security_headers` is registered AFTER `_guard`, which under Starlette makes
-        # it the OUTER middleware — so it wraps the guard's 403s. If that ordering is
-        # ever inverted, a refused framing attempt would render with no policy at all.
-        async def _refusing(_request):
-            return ui._refuse("nope")
-
-        resp = asyncio.run(ui._security_headers(_ok_host(), _refusing))
-        self.assertEqual(resp.status_code, 403)
-        self.assertIn("frame-ancestors 'none'", resp.headers["content-security-policy"])
-
-
 class StaticRevalidationTests(unittest.TestCase):
     """The page must not run a version of its own control logic older than the one
     the container is serving.
@@ -705,23 +478,23 @@ class StaticRevalidationTests(unittest.TestCase):
             self.assertNotIn("no-store", headers["cache-control"])
 
     def test_the_security_middleware_does_not_drop_it(self):
-        # `_security_headers` wraps every response and assigns its own names onto it.
+        # `security_headers` wraps every response and assigns its own names onto it.
         # If it ever assigned a whole header mapping instead, this would go silently —
         # and silence is exactly the failure mode being closed here.
         async def _next(_request):
             return ui.script("app")
 
-        resp = asyncio.run(ui._security_headers(_ok_host(), _next))
+        resp = asyncio.run(ui.guards.security_headers(_ok_host(), _next))
         self.assertEqual(resp.headers["cache-control"], "no-cache")
         self.assertIn("content-security-policy", resp.headers)
 
     def test_relayed_responses_are_left_alone(self):
-        # Not a security header and deliberately not in `_SECURITY_HEADERS`: it answers
+        # Not a security header and deliberately not in `SECURITY_HEADERS`: it answers
         # a staleness problem the two STATIC files have, because they are the only
         # responses here carrying validators with no policy beside them. Putting it on
         # every relayed response would change caching for the API and the SSE stream to
         # fix something neither of them has.
-        self.assertNotIn("cache-control", ui._SECURITY_HEADERS)
+        self.assertNotIn("cache-control", ui.guards.SECURITY_HEADERS)
 
 
 class BackendUnreachableTests(unittest.TestCase):
@@ -962,118 +735,34 @@ class TasksRunningTests(unittest.TestCase):
                         src.index('@app.api_route("/{path:path}"'))
 
 
-class GuardMiddlewareWiringTests(unittest.TestCase):
-    """The tests above exercise ``_guard`` / ``_security_headers`` as plain functions,
-    but the stub's ``@app.middleware`` decorator is identity — so whether the app
-    actually REGISTERS them, and in the right order, is invisible to them. Removing the
-    decorator off ``_guard`` (disabling the Host/CSRF/framing guards) or swapping the
-    two would pass the whole behavioural suite. Assert the wiring from the source.
+class GuardWiringTests(unittest.TestCase):
+    """The shared guards, put on this app at import under its name and allowlist."""
 
-    Order matters: under Starlette the LAST-registered ``@app.middleware('http')`` is
-    the OUTERMOST, so ``_security_headers`` must be declared AFTER ``_guard`` for a
-    refused (403) framing/rebinding attempt to still carry the CSP."""
+    def test_they_are_installed_on_this_app_once(self):
+        calls = []
+        with mock.patch.object(ui.guards, "install", lambda *a: calls.append(a)):
+            fresh = _load_ui("dockade_control_plane_ui_wiring")
+        self.assertEqual(len(calls), 1)
+        app, name, allowed = calls[0]
+        self.assertIs(app, fresh.app)
+        self.assertEqual(name, "control-plane-ui")
+        self.assertIs(allowed, fresh.ALLOWED_HOSTNAMES)
 
-    SRC: ClassVar[str] = (ROOT / "control-plane-ui" / "app.py").read_text()
+    def test_the_allowlist_is_loopback_unless_its_variable_says_otherwise(self):
+        # Compared without the port, so it holds whatever port the host publishes.
+        self.assertEqual(ui.ALLOWED_HOSTNAMES, {"127.0.0.1", "localhost", "::1"})
+        with mock.patch.dict(os.environ, {"CONTROL_UI_ALLOWED_HOSTS": "ui.example"}):
+            fresh = _load_ui("dockade_control_plane_ui_hosts")
+        self.assertEqual(fresh.ALLOWED_HOSTNAMES, {"ui.example"})
 
-    def _mw(self, fn: str):
-        return re.search(rf'@app\.middleware\("http"\)\s*\nasync def {fn}\b', self.SRC)
-
-    def test_guard_is_registered_as_middleware(self):
-        self.assertIsNotNone(
-            self._mw("_guard"),
-            "_guard must be an @app.middleware('http') — it is the Host/CSRF/framing guard")
-
-    def test_security_headers_is_registered_after_guard(self):
-        guard, headers = self._mw("_guard"), self._mw("_security_headers")
-        self.assertIsNotNone(
-            headers, "_security_headers must be an @app.middleware('http')")
-        self.assertLess(
-            guard.start(), headers.start(),
-            "_security_headers must be declared AFTER _guard so it wraps it and hardens "
-            "the 403 refusals with the CSP")
+    def test_an_empty_allowlist_stops_the_import(self):
+        with mock.patch.dict(os.environ, {"CONTROL_UI_ALLOWED_HOSTS": " , "}), \
+                self.assertRaises(RuntimeError) as caught:
+            _load_ui("dockade_control_plane_ui_empty")
+        self.assertIn("CONTROL_UI_ALLOWED_HOSTS is empty", str(caught.exception))
 
 
 UI_NET, UI_BIND = "172.25.0.0/24", "172.25.0.2"
-
-
-class BindTests(unittest.TestCase):
-    """Where the page may be served: one address inside control-ui-net. Where compose
-    puts it is held in ``tests/test_topology.py``."""
-
-    def refused(self, bind: str = UI_BIND, net: str = UI_NET) -> str:
-        with self.assertRaises(SystemExit) as caught:
-            ui.check_bind(bind, net)
-        return str(caught.exception)
-
-    def test_an_address_on_control_ui_net_starts(self):
-        ui.check_bind(UI_BIND, UI_NET)
-
-    def test_anything_but_an_address_on_control_ui_net_is_refused(self):
-        # A wildcard serves every leg; a name would make the check depend on DNS; the
-        # mapped spelling is another family, which uvicorn would bind as such. Then the
-        # UI's control-net leg, and the task registry's operator network, which the UI
-        # joins for the registry's view.
-        for bind in ("", "0.0.0.0", "::", "*", "control-plane-ui", "localhost",  # noqa: S104
-                     "127.0.0.1", "::1", "::ffff:172.25.0.2", "172.31.0.10",
-                     "172.26.0.3"):
-            with self.subTest(bind=bind):
-                message = self.refused(bind=bind)
-                self.assertIn(f"CONTROL_UI_BIND={bind!r}", message)
-                self.assertIn("fail closed", message)
-
-    def test_a_network_that_does_not_parse_is_refused(self):
-        # Host bits set is a typo too: 172.25.0.2/24 for 172.25.0.0/24.
-        for net in ("", "172.25.0.2/24", "172.25.0.0/33", "control-ui-net"):
-            with self.subTest(net=net):
-                self.assertIn(f"CONTROL_UI_NET={net!r}", self.refused(net=net))
-
-
-class OnlyFromTests(unittest.TestCase):
-    """The peer check the app is served in: a peer outside control-ui-net is refused
-    before the app sees the request, with the headers the app would have set."""
-
-    def call(self, scope: dict) -> tuple[list[dict], list[dict]]:
-        seen, sent = [], []
-
-        async def app(scope, receive, send):
-            seen.append(scope)
-
-        async def send(message):
-            sent.append(message)
-
-        wrapped = ui.OnlyFrom(app, ui.check_bind(UI_BIND, UI_NET))
-        asyncio.run(wrapped(scope, None, send))
-        return seen, sent
-
-    def test_the_publish_and_the_healthcheck_reach_the_app(self):
-        # The bridge's gateway address, and the bound one.
-        for peer in ("172.25.0.1", "172.25.0.2"):
-            with self.subTest(peer=peer):
-                scope = {"type": "http", "client": (peer, 40000)}
-                self.assertEqual(self.call(scope), ([scope], []))
-
-    def test_any_other_peer_is_refused_and_the_app_never_runs(self):
-        # The registry and the UI's own address on its network, the control plane, the
-        # UI's control-net address, loopback, the mapped spelling, a name, none.
-        for client in (("172.26.0.2", 1), ("172.26.0.3", 1), ("172.31.0.2", 1),
-                       ("172.31.0.10", 1), ("127.0.0.1", 1), ("::ffff:172.25.0.1", 1),
-                       ("control-plane-ui", 1), (), None):
-            with self.subTest(client=client):
-                seen, sent = self.call({"type": "http", "client": client})
-                self.assertEqual(seen, [])
-                self.assertEqual(sent[0]["status"], 403)
-                headers = dict(sent[0]["headers"])
-                for name, value in ui._SECURITY_HEADERS.items():
-                    self.assertEqual(headers[name.encode()], value.encode())
-                self.assertIn(b"answers its own network only", sent[1]["body"])
-
-    def test_the_servers_own_lifespan_passes(self):
-        scope = {"type": "lifespan"}
-        self.assertEqual(self.call(scope), ([scope], []))
-
-    def test_a_websocket_from_elsewhere_is_closed_before_its_handshake(self):
-        seen, sent = self.call({"type": "websocket", "client": ("172.26.0.2", 1)})
-        self.assertEqual((seen, sent), ([], [{"type": "websocket.close"}]))
 
 
 class EntryTests(unittest.TestCase):
@@ -1096,14 +785,34 @@ class EntryTests(unittest.TestCase):
         (served,), kwargs = self.calls[0]
         self.assertEqual(kwargs, {"host": UI_BIND, "port": 18090,
                                   "proxy_headers": False, "log_level": "info"})
-        # Inside the peer check, for its own network.
-        self.assertIsInstance(served, ui.OnlyFrom)
+        # Inside the peer check, for its own network, refusing in its own name.
+        self.assertIsInstance(served, ui.guards.OnlyFrom)
         self.assertIs(served.app, ui.app)
         self.assertEqual(str(served.net), UI_NET)
+        self.assertIn(b"refused by control-plane-ui: ", served._refusal)
 
-    def test_a_refused_bind_starts_nothing(self):
-        with self.assertRaises(SystemExit):
-            self.run_main("0.0.0.0")  # noqa: S104
+    def test_anything_but_an_address_on_control_ui_net_starts_nothing(self):
+        # A wildcard serves every leg; a name would make the check depend on DNS; the
+        # mapped spelling is another family, which uvicorn would bind as such. Then the
+        # UI's control-net leg, and the task registry's operator network, which the UI
+        # joins for the registry's view.
+        for bind in ("", "0.0.0.0", "::", "*", "control-plane-ui", "localhost",  # noqa: S104
+                     "127.0.0.1", "::1", "::ffff:172.25.0.2", "172.31.0.10",
+                     "172.26.0.3"):
+            with self.subTest(bind=bind), self.assertRaises(SystemExit) as caught:
+                self.run_main(bind)
+            message = str(caught.exception)
+            self.assertTrue(
+                message.startswith(f"control-plane-ui: CONTROL_UI_BIND={bind!r} "), message)
+            self.assertIn("The relay reaches the management API", message)
+        self.assertEqual(self.calls, [])
+
+    def test_a_network_that_does_not_parse_starts_nothing(self):
+        with mock.patch.object(ui, "UI_NET", "control-ui-net"), \
+                self.assertRaises(SystemExit) as caught:
+            self.run_main(UI_BIND)
+        self.assertIn("control-plane-ui: CONTROL_UI_NET='control-ui-net'",
+                      str(caught.exception))
         self.assertEqual(self.calls, [])
 
     def test_the_network_checked_is_control_ui_nets(self):

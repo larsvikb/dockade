@@ -496,9 +496,9 @@ def _ui_default(variable: str) -> str:
 
 
 class ControlPlaneUiBindTests(unittest.TestCase):
-    """The page is served on one address, its ``control-ui-net`` one, and
-    ``check_bind`` in ``control-plane-ui/app.py`` says why and refuses any other. These
-    hold compose to it."""
+    """The page is served on one address, its ``control-ui-net`` one: ``main`` in
+    ``control-plane-ui/app.py`` says why, and ``check_bind`` in ``ui-common/guards.py``
+    refuses any other. These hold compose to it."""
 
     def test_the_bind_is_the_control_ui_net_leg_compose_pins(self):
         pinned = _scalar(_block(_service("control-plane-ui"), "control-ui-net", 6),
@@ -572,6 +572,26 @@ class ControlPlaneUiBindTests(unittest.TestCase):
         dockerfile = (ROOT / "control-plane-ui" / "Dockerfile").read_text()
         entry = [ln for ln in dockerfile.splitlines() if ln.startswith("ENTRYPOINT")]
         self.assertEqual(entry, ['ENTRYPOINT ["python", "app.py"]'])
+
+    def test_the_image_carries_each_shared_module_the_app_imports(self):
+        # By plain name, from beside it: a Dockerfile without the line still builds,
+        # and the container dies at its first import.
+        dockerfile = (ROOT / "control-plane-ui" / "Dockerfile").read_text()
+        shared = [name for name in re.findall(r"(?m)^import (\w+)$", UI_APP)
+                  if (ROOT / "ui-common" / f"{name}.py").is_file()]
+        self.assertIn("guards", shared)
+        for name in shared:
+            with self.subTest(module=name):
+                self.assertRegex(dockerfile,
+                                 rf"(?m)^COPY ui-common/{name}\.py \./{name}\.py$")
+
+    def test_the_image_is_built_from_the_root_to_reach_ui_common(self):
+        build = _block(_service("control-plane-ui"), "build", 4)
+        self.assertEqual(_scalar(build, "context"), ".")
+        self.assertEqual(_scalar(build, "dockerfile"), "control-plane-ui/Dockerfile")
+        ignored = (ROOT / ".dockerignore").read_text().splitlines()
+        for folder in ("control-plane-ui", "ui-common"):
+            self.assertNotIn(folder, ignored)
 
 
 def _raw_networks(service: str) -> set[str]:

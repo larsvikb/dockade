@@ -300,7 +300,8 @@ writable directory. There is no client-side immutability against the agent;
 containment is capability + egress, not file bits or any settings scope.
 
 The default **status line** ships this way. It shows a sandbox indicator,
-directory, git branch, **used context window** (tokens + %), and 5h/7d
+directory, git branch, the session id's first eight characters (why, in
+`claude-sandbox/statusline.sh`), **used context window** (tokens + %), and 5h/7d
 subscription rate-limit usage with reset countdowns. The **script
 itself stays root-owned and baked** at `/etc/claude-code/statusline.sh`, so the
 non-root agent can toggle the pointer but not tamper with the code it runs — an
@@ -1973,9 +1974,13 @@ one SQLite store.
 
 **Declared in `docker-compose.yml`, behind a profile, and nothing depends on it.**
 Not in `mcp-servers.yml`, whose servers sit on `mcp-net` alone: a second leg is
-topology. `make up` is unchanged. A stopped registry keeps its tools listed, since a
-restart must not look like a withdrawal (`tool-gateway/surface.py`), and each call
-fails as unreachable; disabling `tasks` in the MCP tab is what withdraws them.
+topology. `make up` is unchanged. A registry that stops keeps the tools the gateway
+has already listed, since a restart must not look like a withdrawal
+(`tool-gateway/surface.py`), and each call fails as unreachable; disabling `tasks` in
+the MCP tab is what withdraws them. That memory is the gateway process's own: a gateway
+that starts while the registry is down lists none of its tools until it next dials it
+and is answered (on a roster change, or the slow tick in `tool-gateway/app.py`), and a
+tool with no allow or ask rule is never listed.
 
 **It parses agent text, so it joins no network the agent or the control plane is
 on.** Never `sandbox-net` or a control network, and no egress leg; from `mcp-net` it
@@ -2281,6 +2286,7 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | outcomes ingested — second stream, `status` column, `outcome` in the audit vocabulary | **done** — one approval id now selects the hold, the answer, the claim and the result |
 | — | task registry — the store, the agent listener (MCP, behind the gateway's secret), the operator API | **done** |
 | — | task registry as a service — `tasks` behind a profile on `mcp-net` + `tasks-operator-net`, one listener per leg | **done** — no UI view yet; no backup |
+| — | task registry, agent side — where the id comes from in the image's instructions, dockade's repo name and checkpoints in `CLAUDE.md`, the id in the status line | **done** — `inflight.md` and `local-todo.md` stay the record beside it |
 
 The rationale for each shipped item lives under **Governance surfaces** above, not here
 — a status line goes stale, the reasoning does not. This section is deliberately the

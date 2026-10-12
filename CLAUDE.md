@@ -56,6 +56,19 @@ only the invariants and conventions for working in the repo.
   worktree session starts on a placeholder `worktree-…` one) or its state changes, and
   drop it when the branch merges. Before work that could collide, read every
   checkout's note; `git worktree list` gives their roots.
+- dockade's name in the task registry is `dockade`. With no `tasks__` tools, or a call
+  that could not reach `tasks`, `inflight.md` and `local-todo.md` (untracked, in the
+  main checkout only) are the whole record. When it answers, they stay the record
+  beside it, new work still goes in `local-todo.md` rather than `tasks__propose` until
+  that file is migrated, and a session checks the registry at four points:
+  - at session start, and before work that could collide, `tasks__list_tasks`;
+  - before the first edit on one of its tasks, `tasks__claim`;
+  - after each commit, `tasks__update`;
+  - once the review passes, `tasks__submit`.
+
+  A session that briefs a worker claims the task itself and puts the token in the
+  brief; the worker updates after each commit, and the briefing session submits once
+  the review passes.
 - Don't commit or push unless asked.
 - In the main session, before handing a commit over for push, run the
   `review-before-push` skill.

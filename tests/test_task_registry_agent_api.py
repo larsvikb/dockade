@@ -9,9 +9,11 @@ import asyncio
 import inspect
 import json
 import os
+import re
 import shutil
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 
 import _surface
@@ -230,6 +232,41 @@ class SurfaceTests(unittest.TestCase):
         # Nor through them: ``agent_tools.reads`` is the store all the same.
         _, through = _surface.reached(self.source("agent_api"), frozenset({"agent_tools"}))
         self.assertEqual(_surface.overreach(through, frozenset({"agent_tools"})), [])
+
+
+class InstructionTests(unittest.TestCase):
+    """The descriptions name the variable an agent's id is made from and leave its
+    repo's name to the repo's ``CLAUDE.md``; the instructions say where that variable is
+    and give the name (``task-registry/DESIGN.md``, "Who an agent is" and "Repos are a
+    list the operator keeps"), and name tools by name. Each must still match what the
+    registry serves, or a session meets the mismatch at its first call."""
+
+    IMAGE = ROOT / "claude-sandbox" / "user-CLAUDE.md"
+    REPO = ROOT / "CLAUDE.md"
+    # Any whitespace between the words, so a reflowed paragraph still matches.
+    REPO_NAME = re.compile(r"name\s+in\s+the\s+task\s+registry\s+is\s+`([^`]*)`")
+
+    def test_the_image_names_the_variable_the_id_description_names(self):
+        variables = re.findall(r"\$([A-Z][A-Z0-9_]*)", tools.AGENT.description)
+        self.assertEqual(len(variables), 1, variables)
+        self.assertIn(f"`${variables[0]}`", self.IMAGE.read_text())
+        # A session id is a UUID, and `claude-` and one is an id the store takes.
+        agent = f"claude-{uuid.uuid4()}"
+        self.assertEqual(reg.taskdb.check_agent(agent), agent)
+
+    def test_this_repo_gives_one_name_the_store_would_take(self):
+        self.assertIn("CLAUDE.md", tools.REPO.description)
+        names = self.REPO_NAME.findall(self.REPO.read_text())
+        self.assertEqual(len(names), 1, names)
+        self.assertTrue(reg.tasks.REPO_NAME_RE.fullmatch(names[0]), names[0])
+
+    def test_every_tool_the_instructions_name_is_served(self):
+        named = {path.name: re.findall(r"tasks__(\w+)", path.read_text())
+                 for path in (self.IMAGE, self.REPO)}
+        self.assertTrue(named[self.REPO.name])
+        for where, names in named.items():
+            with self.subTest(file=where):
+                self.assertEqual(sorted(set(names) - set(tools.TOOLS)), [])
 
 
 class CallTests(_Store):

@@ -12,6 +12,10 @@
 #   - a sandbox indicator (this is a contained environment, always show it)
 #   - the current directory (basename)
 #   - the git branch, when inside a repo
+#   - the session id's first eight characters. The id names the session's transcript
+#     (NOTES.md, "Claude Code puts its session id in every Bash call's environment"),
+#     and a task registry records a claim's holder as `claude-` and the whole id, so
+#     this tells the operator which terminal wrote a transcript or holds a claim
 #   - used context window (tokens + %)
 #   - subscription rate-limit usage: the rolling 5-hour and 7-day windows,
 #     each with a ⟳ countdown to when that window resets
@@ -34,9 +38,16 @@ input="$(cat)"
 field() { printf '%s' "$input" | jq -r "$1"; }
 
 cwd="$(field '.workspace.current_dir // .cwd // ""')"
+# Only the characters an agent id may hold (taskdb's pattern), so nothing else reaches
+# the terminal.
+session="$(field '.session_id // ""')"
+session="${session//[^0-9A-Za-z_-]/}"
 
 dir="workspace"
 [ -n "$cwd" ] && dir="$(basename "$cwd")"
+# A directory name can carry escape sequences (a terminal title, the clipboard), and
+# whoever made the directory chose it: no control character reaches the terminal.
+dir="${dir//[[:cntrl:]]/}"
 
 # Rate-limit windows: percentage of each rolling limit consumed (0-100, may be a
 # float) plus the epoch-seconds instant the window resets. Either may be absent
@@ -101,6 +112,7 @@ limseg() {
 
 line="${yellow}🔒 sandbox${reset} ${dim}·${reset} ${green}${dir}${reset}"
 [ -n "$branch" ] && line="${line} ${dim}·${reset} ${cyan}⎇ ${branch}${reset}"
+[ -n "$session" ] && line="${line} ${dim}· id ${session:0:8}${reset}"
 
 if [ -n "$used" ] && [ -n "$ctx_limit" ]; then
     pct=$(( used * 100 / ctx_limit ))

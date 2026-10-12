@@ -23,10 +23,11 @@ could make any move, however its arguments are shaped.
 
 **An agent names itself: its kind, a hyphen and its own session id**
 (`claude-<uuid>`). The kind keeps the registry agent-agnostic; the tool descriptions
-and each agent's instructions say where its id comes from. For Claude Code it is the
-session id, which also names the session's transcript, so a write leads back to what the
-session said (`NOTES.md` → "Claude Code puts its session id in every Bash call's
-environment").
+and each agent's instructions say where its id comes from (for the sandbox's Claude
+Code, `claude-sandbox/user-CLAUDE.md`). For Claude Code it is the session id, which
+also names the session's transcript, so a write leads back to what the session said
+(`NOTES.md` → "Claude Code puts its session id in every Bash call's environment"), and
+the status line shows its first eight characters (`claude-sandbox/statusline.sh`).
 
 The alternatives each fail at uniqueness or at lasting as long as the work: a branch
 (one session works several tasks), the container (its name comes back after `--rm`,

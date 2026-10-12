@@ -1,21 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
-// Runs scenario.js against one copy of control-plane-ui in a headless browser and
-// writes a transcript: after every step, the requests the page sent, what reached its
-// console, and its DOM. There are no expected values. `make ui-diff` runs this on the
-// base tree and on the branch and diffs the two transcripts, so the oracle is the
-// previous version of the page.
+// Runs a page's scenario against one copy of it in a headless browser and writes a
+// transcript: after every step, the requests the page sent, what reached its console,
+// and its DOM. There are no expected values. `make ui-diff` runs this on the base tree
+// and on the branch and diffs the two transcripts, so the oracle is the previous
+// version of the page.
 //
-//   node harness.js <served dir> <transcript out>
+//   node harness.js <served dir> <transcript out> [approval|tasks]
 //
-// The served dir holds the page as the image does: control-plane-ui's index.html and
-// modules, and ui-common's modules beside them (`make ui-diff` assembles it).
+// The served dir holds the page as its image does: the UI's index.html and modules,
+// and ui-common's modules beside them (`make ui-diff` assembles it). The page picks the
+// fake upstream and the steps: backend.js and scenario.js for the approval page
+// (control-plane-ui), tasks-backend.js and tasks-scenario.js for the tasks page.
 
 import { readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { chromium } from "playwright-core";
-import { NOW_MS, respond } from "./backend.js";
-import { STEPS } from "./scenario.js";
+import { NOW_MS } from "./backend.js";
 
 // Loopback, as the real UI is served, so the page is a secure context and the
 // notification button takes the branch an operator's browser takes. Nothing listens
@@ -23,11 +24,17 @@ import { STEPS } from "./scenario.js";
 const ORIGIN = "http://127.0.0.1:8090";
 const BROWSER = process.env.UI_HARNESS_BROWSER || "/usr/lib/chromium/chromium-headless-shell";
 
-const [uiDir, outFile] = process.argv.slice(2);
-if (!uiDir || !outFile) {
-  console.error("usage: node harness.js <served dir> <transcript out>");
+const PAGES = {
+  approval: ["./backend.js", "./scenario.js"],
+  tasks: ["./tasks-backend.js", "./tasks-scenario.js"],
+};
+const [uiDir, outFile, which = "approval"] = process.argv.slice(2);
+if (!uiDir || !outFile || !PAGES[which]) {
+  console.error("usage: node harness.js <served dir> <transcript out> [approval|tasks]");
   process.exit(2);
 }
+const { respond } = await import(PAGES[which][0]);
+const { STEPS } = await import(PAGES[which][1]);
 if (!existsSync(BROWSER)) {
   console.error(`no browser at ${BROWSER}. The tier-1 sandbox image has one; elsewhere, `
                 + "point UI_HARNESS_BROWSER at a Chromium or headless-shell binary.");
@@ -70,7 +77,7 @@ function fakeEventSource() {
 // element, since the attributes alone would not show them.
 function snapshot() {
   const lines = [`title: ${document.title}`,
-                 `favicon: ${document.getElementById("favicon").href}`,
+                 `favicon: ${document.getElementById("favicon")?.href ?? "none"}`,
                  `focus: ${describe(document.activeElement)}`];
   function describe(el) {
     if (!el) return "none";

@@ -176,11 +176,4 @@ export const STEPS = [
     await page.click("#leases button.group-toggle");
   }],
 
-  // The Tasks tab (tasks.js) with the task registry not running: one line, the tab
-  // asking again as it opens, and no call to the registry itself, then or on the
-  // polls. Last, since the base tree has no such tab and its run ends here.
-  ["tasks tab, registry not running", async ({ page }) => {
-    await page.click("#tab-tasks");
-  }],
-  ["a poll interval passes", async ({ clock }) => { await clock(16000); }],
 ];

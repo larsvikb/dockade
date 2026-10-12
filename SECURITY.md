@@ -87,12 +87,17 @@ Anything that **crosses a boundary the design claims to hold**:
   that is served without that secret; and an agent move that does what only the
   operator may — changes an approved spec, ends another session's claim, or hides,
   unhides or rewrites a note.
-- **A control-plane-ui relay bypass** — reaching `POST /authorize` or any
-  non-allowlisted backend path through the frontend, reaching a task-registry path the
-  Tasks tab does not call, or overriding either pinned upstream.
+- **A relay bypass in either UI** — reaching `POST /authorize` or any non-allowlisted
+  backend path through the control-plane UI, reaching a task-registry path the tasks
+  page does not call through the tasks UI, or overriding either one's pinned upstream.
+- **The tasks UI reaching the control plane** — a route from `tasks-ui` (or from the
+  task registry through it) to `control-net`, to the control-plane UI's relay, or to an
+  approval: the separation is what keeps the page that renders agent prose apart from
+  the one that grants.
 - **A browser-facing vector that survives the current guards** — a DNS-rebinding,
   CSRF or clickjacking path that still works against the Host allowlist, the
-  cross-origin refusal, the embedding refusal and the CSP.
+  cross-origin refusal, the embedding refusal and the CSP, on either UI, including a
+  page on one UI's origin changing state on the other's.
 
 ## Known open findings
 
@@ -194,10 +199,10 @@ report.
   cache, skills and quality-gate hooks are described in `DESIGN.md` as planned.
   They cannot have vulnerabilities until they are built. The MCP gateway is no
   longer one of them: it ships, tier 1 is pointed at it, and it is in scope above.
-- **"The control-plane UI has no authentication."** Correct, and deliberate: it is
-  bound to host loopback behind structural browser-facing guards, and see the first
-  item for why adding auth would not address the threat that actually matters. A
-  *specific* bypass of those guards is in scope; their absence-of-auth is not.
+- **"Neither UI has authentication."** Correct, and deliberate: each is bound to host
+  loopback behind structural browser-facing guards, and see the first item for why
+  adding auth would not address the threat that actually matters. A *specific*
+  bypass of those guards is in scope; their absence-of-auth is not.
 
 ## Supported versions
 

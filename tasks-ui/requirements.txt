@@ -1,0 +1,6 @@
+# Tasks UI deps. Pinned for reproducible builds, and held equal to
+# control-plane-ui/requirements.txt (tests/test_topology.py): both run ui-common's
+# guards, which were tested against these.
+fastapi==0.141.1
+uvicorn==0.53.0
+httpx==0.28.1

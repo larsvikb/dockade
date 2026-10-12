@@ -142,11 +142,11 @@ networks:
       config:
         - subnet: 172.25.0.0/24
   # The task registry's OPERATOR path. internal:true. Carries one conversation: the
-  # control-plane UI dialing the registry's operator listener, which takes no token, so
+  # tasks UI dialing the registry's operator listener, which takes no token, so
   # membership of this network is the permission to write as the operator. Hence its
   # roster is asserted in tests/test_topology.py: no sandbox, no MCP server, no
-  # gateway, ever. Nothing but that listener is served here (DESIGN.md, "Task
-  # registry — an MCP server with an operator side").
+  # gateway, and nothing on control-net, ever. Nothing but that listener is served here
+  # (DESIGN.md, "Task registry — an MCP server with an operator side").
   tasks-operator-net:
     name: tasks-operator-net
     driver: bridge
@@ -154,6 +154,22 @@ networks:
     ipam:
       config:
         - subnet: 172.26.0.0/24
+  # The tasks UI's host-loopback publish, as control-ui-net is the approval UI's:
+  # non-internal because Docker cannot publish from an internal network alone, and
+  # masquerade off, so nothing on it can hold a two-way exchange with the outside (a
+  # one-shot datagram still leaves, as control-ui-net's comment says). Its own network
+  # rather than a second
+  # member of control-ui-net: the two pages are two origins, and neither is a step
+  # from the other's container. Only the tasks UI sits here. Sandbox never here.
+  tasks-ui-net:
+    name: tasks-ui-net
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+    # A subnet so the UI's address here can be pinned: it binds that address alone.
+    ipam:
+      config:
+        - subnet: 172.24.0.0/24
 
 volumes:
   egress-audit:
@@ -465,16 +481,12 @@ services:
       # address the page is served on, so pinned.
       control-ui-net:
         ipv4_address: 172.25.0.2
-      # To dial the task registry's operator listener for the Tasks tab, and nothing
-      # is served here: the registry parses agent text (DESIGN.md, "Task registry").
-      # Pinned, as the registry's leg is: one pinned member pins them all.
-      tasks-operator-net:
-        ipv4_address: 172.26.0.3
     environment:
       CONTROL_BACKEND_URL: http://control-plane:8090
-      # The registry's pinned operator address, not its name (see TASKS_URL in
-      # control-plane-ui/app.py).
-      CONTROL_UI_TASKS_URL: http://172.26.0.2:8111
+      # Where the page's link to the tasks UI points: its publish, nothing more. The
+      # approval UI has no leg on the registry's networks, so it cannot know whether
+      # that page is up; the link is offered either way.
+      CONTROL_UI_TASKS_LINK: http://127.0.0.1:${DOCKADE_TASKS_UI_PORT:-28091}/
       # Its control-ui-net leg, where the publish arrives, and nothing else will start
       # (check_bind in ui-common/guards.py): not control-net, nor any leg it gains.
       CONTROL_UI_BIND: 172.25.0.2
@@ -482,12 +494,12 @@ services:
     # Human-only management surface, bound to host loopback (never 0.0.0.0):
     # reachable from the host browser, not from the sandbox or other machines.
     #
-    # This is the ONLY port the whole stack publishes — everything else (the
-    # proxy's 8080, the control plane's 8090/8091, the model server's 8080) is
-    # container-internal on a network the host does not join. So it is also the
-    # only thing here that can collide with whatever else the operator is running,
-    # which is why it is a variable: a collision should cost an env var, not an
-    # edit. DOCKADE_UI_PORT overrides it.
+    # This is the ONLY port `make up` publishes; the tasks UI's, behind the `tasks`
+    # profile, is the one other — everything else (the proxy's 8080, the control
+    # plane's 8090/8091, the model server's 8080) is container-internal on a network
+    # the host does not join. So these are also the only things here that can collide
+    # with whatever else the operator is running, which is why each is a variable: a
+    # collision should cost an env var, not an edit. DOCKADE_UI_PORT overrides this one.
     #
     # The default avoids the crowded 8000-9000 block, where 8081 in particular is
     # the reflexive "8080 was already taken" port, AND stays below the ephemeral
@@ -507,8 +519,8 @@ services:
     # that the frontend serves, NOT that the backend is reachable. Relaying that
     # upstream state would couple two services this design keeps separate — the
     # frontend holds no state, so a red here should mean "the UI is down", not
-    # "something behind the UI is down". This is the only host-published surface,
-    # so it is also the health a human actually reads off `docker compose ps`.
+    # "something behind the UI is down". This is the host-published surface `make up`
+    # starts, so it is also the health a human actually reads off `docker compose ps`.
     # At the bound address, since nothing listens on loopback, naming a Host the
     # app's allowlist takes.
     healthcheck:
@@ -669,7 +681,8 @@ services:
   # The work list agent sessions and the operator share; task-registry/DESIGN.md has
   # who writes what, and DESIGN.md, "Task registry — an MCP server with an operator
   # side", why it sits here rather than in mcp-servers.yml, on these legs and no others.
-  # OPTIONAL: behind a profile, started by `make tasks-up`, and nothing depends on it.
+  # OPTIONAL: behind a profile, started by `make tasks-up`, and nothing outside that
+  # profile depends on it; its page, tasks-ui, does.
   #
   # DUAL-HOMED, one listener per leg, each bound to its leg's address alone and
   # answering that network's peers only; serve.py refuses to start otherwise, since
@@ -691,7 +704,7 @@ services:
       # .11+ block, as the gateway's .2 is: not a tenant of mcp-servers.yml.
       mcp-net:
         ipv4_address: 172.28.0.3
-      # The operator listener, for the control-plane UI.
+      # The operator listener, for the tasks UI.
       tasks-operator-net:
         ipv4_address: 172.26.0.2
     environment:
@@ -748,6 +761,89 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+
+  # ── Tasks UI (the operator's page onto the task registry) ────────────────────
+  # The work list as the operator reads it, on its own origin and in its own
+  # container: it renders what agents wrote, so it is no part of the page that grants
+  # egress and has no leg on control-net (DESIGN.md, "Task registry"). Behind the
+  # registry's profile: `make tasks-up` starts the two, and nothing outside the profile
+  # depends on either.
+  #
+  # DUAL-HOMED: tasks-ui-net, where the loopback publish arrives and the one address it
+  # serves; tasks-operator-net, where it dials the registry and serves nothing. Its
+  # bind and its peer check are the approval UI's (ui-common/guards.py).
+  tasks-ui:
+    profiles:
+      - tasks
+    build:
+      # Repo root, to COPY ui-common/ beside the UI's own files.
+      context: .
+      dockerfile: tasks-ui/Dockerfile
+    image: dockade-tasks-ui
+    container_name: tasks-ui
+    hostname: tasks-ui
+    # As the registry: a deliberate stop survives a reboot.
+    restart: unless-stopped
+    networks:
+      # The one address the page is served on, so pinned.
+      tasks-ui-net:
+        ipv4_address: 172.24.0.2
+      # To dial the registry's operator listener; nothing is served here. Pinned, as the
+      # registry's leg is: one pinned member pins them all. Not .3, which the approval
+      # UI held here before this page existed: a stack still running that UI, or rolled
+      # back to it, would leave the two containers racing for one address.
+      tasks-operator-net:
+        ipv4_address: 172.26.0.4
+    environment:
+      # The registry's pinned operator address, not its name (REGISTRY_URL in
+      # tasks-ui/app.py says why).
+      TASKS_UI_REGISTRY_URL: http://172.26.0.2:8111
+      # Its tasks-ui-net leg, where the publish arrives, and nothing else will start
+      # (check_bind in ui-common/guards.py).
+      TASKS_UI_BIND: 172.24.0.2
+      TASKS_UI_PORT: "8091"
+    # Host loopback only, as the approval UI's publish; the next number up from it.
+    # DOCKADE_TASKS_UI_PORT overrides it, and the approval page's link follows.
+    ports:
+      - "127.0.0.1:${DOCKADE_TASKS_UI_PORT:-28091}:8091"
+    # So the first page load after `make tasks-up` finds a registry that answers. The
+    # page copes with one that does not (tasks.js), as it must: the registry can stop
+    # on its own.
+    depends_on:
+      tasks:
+        condition: service_healthy
+    # Shallow, as the approval UI's: it says the page is served, not that the registry
+    # answers. At the bound address, naming a Host the allowlist takes.
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - >-
+          import os, urllib.request as u;
+          u.urlopen(u.Request('http://%s:%s/healthz' % (os.environ['TASKS_UI_BIND'],
+          os.environ['TASKS_UI_PORT']), headers={'Host': '127.0.0.1'}), timeout=3)
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    # As the approval UI: a stateless relay. Read-only besides, as the registry is: it
+    # is the container this split expects could be the one compromised, through what
+    # agents wrote. A /tmp in case anything asks for one; nothing here writes.
+    mem_limit: 256m
+    memswap_limit: 256m
+    pids_limit: 128
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Not a router between its legs: with forwarding on, a neighbour that could add a
+    # route would cross to the registry's operator listener through it.
+    sysctls:
+      net.ipv4.ip_forward: "0"
 
   # ── Local LLM inference (UNGOVERNED data-plane tool) ────────────────────────
   # An ungoverned tool in DESIGN.md's taxonomy: exposed fully to the agent, no

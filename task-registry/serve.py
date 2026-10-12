@@ -4,8 +4,8 @@ own network and bound to that network's address alone.
 
   mcp-net             the agent listener (``agent_api``), which the gateway dials
                       with the secret it holds for server ``tasks``.
-  tasks-operator-net  the operator listener (``operator_api``), for the control-plane
-                      UI. It takes no token: being on this network is the permission.
+  tasks-operator-net  the operator listener (``operator_api``), for the tasks UI. It
+                      takes no token: being on this network is the permission.
 
 So where each binds, and whom each answers, is the boundary between the two writers.
 ``check_binds`` refuses to start on anything but one address inside each listener's

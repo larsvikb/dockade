@@ -36,7 +36,6 @@ COPY control-plane-ui/payload.js ./payload.js
 COPY control-plane-ui/provenance.js ./provenance.js
 COPY control-plane-ui/saturation.js ./saturation.js
 COPY control-plane-ui/status.js ./status.js
-COPY control-plane-ui/tasks.js ./tasks.js
 COPY ui-common/time.js ./time.js
 
 USER cpui

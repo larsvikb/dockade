@@ -464,8 +464,9 @@ class ControlPlaneBindTests(unittest.TestCase):
         self.assertNotIn("tool-authorize-net", _networks_of("egress-proxy"))
 
     def test_the_ui_talks_to_the_management_port_over_control_net(self):
-        self.assertEqual(_networks_of("control-plane-ui"),
-                         {"control-net", "control-ui-net", "tasks-operator-net"})
+        # Its two legs and no third: the task registry's page is another service
+        # (tasks-ui), so nothing that reads the registry is on control-net.
+        self.assertEqual(_networks_of("control-plane-ui"), {"control-net", "control-ui-net"})
         url = _environment_of("control-plane-ui")["CONTROL_BACKEND_URL"]
         self.assertTrue(url.endswith(f":{MANAGE_PORT}"), url)
 
@@ -483,101 +484,118 @@ class ControlPlaneBindTests(unittest.TestCase):
 
 
 UI_APP = (ROOT / "control-plane-ui" / "app.py").read_text()
+TASKS_UI_APP = (ROOT / "tasks-ui" / "app.py").read_text()
 
 
-def _ui_default(variable: str) -> str:
-    """A default ``control-plane-ui/app.py`` sets, read as text for the reason
+def _ui_default(variable: str, app: str = UI_APP) -> str:
+    """A default a UI's ``app.py`` sets, read as text for the reason
     ``_gateway_forbidden_default`` gives."""
-    match = re.search(rf'"{variable}",\s*"([^"]+)"', UI_APP)
+    match = re.search(rf'"{variable}",\s*"([^"]+)"', app)
     if not match:
-        raise AssertionError(f"control-plane-ui/app.py no longer has a {variable} default "
-                             f"this can read")
+        raise AssertionError(f"no {variable} default this can read")
     return match.group(1)
 
 
-class ControlPlaneUiBindTests(unittest.TestCase):
-    """The page is served on one address, its ``control-ui-net`` one: ``main`` in
-    ``control-plane-ui/app.py`` says why, and ``check_bind`` in ``ui-common/guards.py``
-    refuses any other. These hold compose to it."""
+class _UiServiceChecks:
+    """A UI page is served on one address, the one on its own loopback-published
+    network: ``main`` in its ``app.py`` says why, and ``check_bind`` in
+    ``ui-common/guards.py`` refuses any other. These hold compose to it, for each UI."""
 
-    def test_the_bind_is_the_control_ui_net_leg_compose_pins(self):
-        pinned = _scalar(_block(_service("control-plane-ui"), "control-ui-net", 6),
-                         "ipv4_address")
-        self.assertIsNotNone(pinned, "the UI's control-ui-net leg is not pinned")
-        self.assertEqual(_environment_of("control-plane-ui")["CONTROL_UI_BIND"], pinned)
+    SERVICE: ClassVar[str]
+    NET: ClassVar[str]
+    ENV: ClassVar[str]          # the prefix of its variables
+    PUBLISH: ClassVar[str]      # the host side of its port mapping
 
-    def test_nothing_else_joins_control_ui_net(self):
-        # OnlyFrom admits this whole network, so a member reaches the page and the
-        # relay, approvals included. The UI alone, as DESIGN.md's Networks says.
-        members = {svc for svc in _service_names()
-                   if "control-ui-net" in _raw_networks(svc)}
-        self.assertEqual(members, {"control-plane-ui"})
+    @property
+    def app(self) -> str:
+        return (ROOT / self.SERVICE / "app.py").read_text()
+
+    def test_the_bind_is_the_leg_compose_pins(self):
+        pinned = _scalar(_block(_service(self.SERVICE), self.NET, 6), "ipv4_address")
+        self.assertIsNotNone(pinned, f"the UI's {self.NET} leg is not pinned")
+        self.assertEqual(_environment_of(self.SERVICE)[f"{self.ENV}_BIND"], pinned)
+
+    def test_nothing_else_joins_its_network(self):
+        # OnlyFrom admits this whole network, so a member reaches the page and its
+        # relay. The UI alone, as DESIGN.md's Networks says.
+        members = {svc for svc in _service_names() if self.NET in _raw_networks(svc)}
+        self.assertEqual(members, {self.SERVICE})
 
     def test_the_app_reads_the_variables_compose_sets(self):
         # A renamed variable would leave the bind empty, and check_bind refuses that,
         # but at the host's `make up` rather than here.
-        for var in ("CONTROL_UI_BIND", "CONTROL_UI_PORT", "CONTROL_UI_NET"):
+        for var in ("BIND", "PORT", "NET"):
             with self.subTest(variable=var):
-                self.assertRegex(UI_APP, rf'os\.environ\.get\("{var}",')
-        for var in ("CONTROL_UI_BIND", "CONTROL_UI_PORT"):
+                self.assertRegex(self.app, rf'os\.environ\.get\("{self.ENV}_{var}",')
+        for var in ("BIND", "PORT"):
             with self.subTest(variable=var):
-                self.assertIn(var, _environment_of("control-plane-ui"))
+                self.assertIn(f"{self.ENV}_{var}", _environment_of(self.SERVICE))
 
-    def test_the_bind_check_allows_exactly_control_ui_nets_subnet(self):
+    def test_the_bind_check_allows_exactly_its_networks_subnet(self):
         # A default that drifted from compose would refuse the real address, loud, or
         # allow another network's, silent.
-        self.assertEqual(_ui_default("CONTROL_UI_NET"), _subnet_of("control-ui-net"))
-        env = _environment_of("control-plane-ui")
-        if "CONTROL_UI_NET" in env:
-            self.assertEqual(env["CONTROL_UI_NET"].strip('"\''),
-                             _subnet_of("control-ui-net"))
+        self.assertEqual(_ui_default(f"{self.ENV}_NET", self.app), _subnet_of(self.NET))
+        env = _environment_of(self.SERVICE)
+        if f"{self.ENV}_NET" in env:
+            self.assertEqual(env[f"{self.ENV}_NET"].strip('"\''), _subnet_of(self.NET))
 
-    def test_control_ui_net_is_apart_from_every_other_network(self):
-        subnet = ipaddress.ip_network(_subnet_of("control-ui-net"))
+    def test_its_network_is_apart_from_every_other(self):
+        subnet = ipaddress.ip_network(_subnet_of(self.NET))
         # Inside the range the relay guard hard-blocks, so the proxy refuses it as a
         # CONNECT target too.
         self.assertTrue(subnet.subnet_of(ipaddress.ip_network("172.16.0.0/12")))
         networks = [m.group(1) for ln in _block(COMPOSE, "networks", 0)
                     if (m := re.match(r"  ([a-z0-9-]+):\s*$", ln))]
-        self.assertIn("control-ui-net", networks)
+        self.assertIn(self.NET, networks)
         for net in networks:
-            if net == "control-ui-net" or not any(
+            if net == self.NET or not any(
                     "subnet:" in ln for ln in _block(_block(COMPOSE, "networks", 0), net, 2)):
                 continue
             with self.subTest(network=net):
                 self.assertFalse(subnet.overlaps(ipaddress.ip_network(_subnet_of(net))))
 
+    def test_its_network_is_a_publish_and_no_egress_path(self):
+        # Non-internal, since Docker publishes from no internal network alone, and so
+        # masquerade off: nothing on it converses with the outside.
+        body = _block(_block(COMPOSE, "networks", 0), self.NET, 2)
+        self.assertFalse(any(re.match(r"\s*internal:\s*true\s*$", ln) for ln in body))
+        self.assertTrue(any(re.match(
+            r'\s*com\.docker\.network\.bridge\.enable_ip_masquerade:\s*"false"\s*$', ln)
+            for ln in body))
+
     def test_the_publish_and_the_healthcheck_reach_the_port_it_serves(self):
-        body = _service("control-plane-ui")
-        port = _environment_of("control-plane-ui")["CONTROL_UI_PORT"].strip('"\'')
-        self.assertEqual(_ui_default("CONTROL_UI_PORT"), port)
+        body = _service(self.SERVICE)
+        port = _environment_of(self.SERVICE)[f"{self.ENV}_PORT"].strip('"\'')
+        self.assertEqual(_ui_default(f"{self.ENV}_PORT", self.app), port)
         publish = [ln.strip() for ln in _block(body, "ports", 4)
                    if ln.strip() and not ln.strip().startswith("#")]
-        self.assertEqual(publish, [f'- "127.0.0.1:${{DOCKADE_UI_PORT:-28090}}:{port}"'])
+        self.assertEqual(publish, [f'- "{self.PUBLISH}:{port}"'])
+        self.assertIn(f'EXPOSE {port}\n',
+                      (ROOT / self.SERVICE / "Dockerfile").read_text())
         # The page binds no loopback, so the probe dials the bound address, and names a
         # Host the allowlist takes, since the address is not one.
         probe = "".join(_block(body, "healthcheck", 4))
-        for var in ("CONTROL_UI_BIND", "CONTROL_UI_PORT"):
-            self.assertIn(f"os.environ['{var}']", probe)
+        for var in ("BIND", "PORT"):
+            self.assertIn(f"os.environ['{self.ENV}_{var}']", probe)
         self.assertIn("headers={'Host': '127.0.0.1'}", probe)
         self.assertIn("/healthz", probe)
 
     def test_it_forwards_nothing_between_its_legs(self):
-        sysctls = [ln.strip() for ln in _block(_service("control-plane-ui"), "sysctls", 4)
+        sysctls = [ln.strip() for ln in _block(_service(self.SERVICE), "sysctls", 4)
                    if ln.strip() and not ln.strip().startswith("#")]
         self.assertEqual(sysctls, ['net.ipv4.ip_forward: "0"'])
 
     def test_the_image_starts_the_entry_that_checks_the_bind(self):
         # uvicorn's own command line would take any --host and check nothing.
-        dockerfile = (ROOT / "control-plane-ui" / "Dockerfile").read_text()
+        dockerfile = (ROOT / self.SERVICE / "Dockerfile").read_text()
         entry = [ln for ln in dockerfile.splitlines() if ln.startswith("ENTRYPOINT")]
         self.assertEqual(entry, ['ENTRYPOINT ["python", "app.py"]'])
 
     def test_the_image_carries_each_shared_module_the_app_imports(self):
         # By plain name, from beside it: a Dockerfile without the line still builds,
         # and the container dies at its first import.
-        dockerfile = (ROOT / "control-plane-ui" / "Dockerfile").read_text()
-        shared = [name for name in re.findall(r"(?m)^import (\w+)$", UI_APP)
+        dockerfile = (ROOT / self.SERVICE / "Dockerfile").read_text()
+        shared = [name for name in re.findall(r"(?m)^import (\w+)$", self.app)
                   if (ROOT / "ui-common" / f"{name}.py").is_file()]
         self.assertIn("guards", shared)
         for name in shared:
@@ -586,12 +604,72 @@ class ControlPlaneUiBindTests(unittest.TestCase):
                                  rf"(?m)^COPY ui-common/{name}\.py \./{name}\.py$")
 
     def test_the_image_is_built_from_the_root_to_reach_ui_common(self):
-        build = _block(_service("control-plane-ui"), "build", 4)
+        build = _block(_service(self.SERVICE), "build", 4)
         self.assertEqual(_scalar(build, "context"), ".")
-        self.assertEqual(_scalar(build, "dockerfile"), "control-plane-ui/Dockerfile")
+        self.assertEqual(_scalar(build, "dockerfile"), f"{self.SERVICE}/Dockerfile")
         ignored = (ROOT / ".dockerignore").read_text().splitlines()
-        for folder in ("control-plane-ui", "ui-common"):
+        for folder in (self.SERVICE, "ui-common"):
             self.assertNotIn(folder, ignored)
+
+
+class ControlPlaneUiBindTests(_UiServiceChecks, unittest.TestCase):
+    SERVICE, NET, ENV = "control-plane-ui", "control-ui-net", "CONTROL_UI"
+    PUBLISH = "127.0.0.1:${DOCKADE_UI_PORT:-28090}"
+
+    def test_the_link_to_the_tasks_ui_is_its_publish(self):
+        # An address and nothing else; the default and compose's follow the tasks UI's
+        # published port.
+        link = _environment_of("control-plane-ui")["CONTROL_UI_TASKS_LINK"]
+        self.assertEqual(link, f"http://{TasksUiBindTests.PUBLISH}/")
+        self.assertEqual(_ui_default("CONTROL_UI_TASKS_LINK"), "http://127.0.0.1:28091/")
+
+
+class TasksUiBindTests(_UiServiceChecks, unittest.TestCase):
+    SERVICE, NET, ENV = "tasks-ui", "tasks-ui-net", "TASKS_UI"
+    PUBLISH = "127.0.0.1:${DOCKADE_TASKS_UI_PORT:-28091}"
+
+    def test_it_is_on_exactly_its_two_legs(self):
+        # The registry's operator network and its own publish: never control-net, the
+        # sandbox's network or an egress leg. It reads what agents wrote.
+        self.assertEqual(_networks_of("tasks-ui"), {"tasks-ui-net", "tasks-operator-net"})
+
+    def test_it_runs_with_the_registry_and_waits_for_it(self):
+        body = _service("tasks-ui")
+        self.assertEqual([ln.strip() for ln in _block(body, "profiles", 4)], ["- tasks"])
+        self.assertEqual(_scalar(_block(_block(body, "depends_on", 4), "tasks", 6),
+                                 "condition"), "service_healthy")
+
+    def test_make_starts_and_stops_it_with_the_registry(self):
+        # The page is the registry's: up together, down together, and back together
+        # after a restore, which stops the registry under it.
+        makefile = (ROOT / "Makefile").read_text()
+
+        def recipe(target):
+            return re.search(rf"^{target}:.*?(?=\n\S)", makefile, re.M | re.S).group(0)
+        self.assertRegex(recipe("tasks-up"), r"up -d [^\n]*\btasks tasks-ui\n")
+        self.assertIn("stop tasks-ui tasks\n", recipe("tasks-down"))
+        self.assertIn("rm -f tasks-ui tasks\n", recipe("tasks-down"))
+        self.assertRegex(recipe("restore-tasks"), r"trap '[^']*up -d [^']*\btasks tasks-ui' EXIT")
+
+    def test_its_registry_leg_is_not_the_approval_uis_old_address(self):
+        # 172.26.0.3 was the approval UI's leg here until this page existed. A host still
+        # running that UI, or rolled back to it, would have the two racing for one pinned
+        # address, and whichever starts second does not start.
+        mine = _scalar(_block(_service("tasks-ui"), "tasks-operator-net", 6), "ipv4_address")
+        self.assertNotEqual(mine, "172.26.0.3")
+
+    def test_it_writes_nothing_but_a_tmpfs(self):
+        body = _service("tasks-ui")
+        self.assertEqual(_scalar(body, "read_only"), "true")
+        self.assertEqual([ln.strip() for ln in _block(body, "tmpfs", 4)], ["- /tmp"])
+
+    def test_its_pins_are_the_approval_uis(self):
+        # Both run ui-common's guards, which were tested against these.
+        def pins(path):
+            return sorted(ln for ln in path.read_text().splitlines()
+                          if ln and not ln.startswith("#"))
+        self.assertEqual(pins(ROOT / "tasks-ui" / "requirements.txt"),
+                         pins(ROOT / "control-plane-ui" / "requirements.txt"))
 
 
 def _raw_networks(service: str) -> set[str]:
@@ -1361,25 +1439,25 @@ class TaskRegistryPlacementTests(unittest.TestCase):
         self.assertEqual(_networks_of("tasks"), {"mcp-net", "tasks-operator-net"})
 
     def test_nothing_else_joins_the_operator_network(self):
-        # Being on it is the permission to write as the operator. The UI is on it for
-        # the registry's view, and serves nothing there (ControlPlaneUiBindTests): the
-        # registry parses agent text, and a compromised one must not find the UI's
-        # relay, and the management API behind it. Anything else is an agent, a server
-        # or the gateway acting as the operator.
+        # Being on it is the permission to write as the operator. The tasks UI is on it
+        # for the registry's page, and serves nothing there (TasksUiBindTests): the
+        # registry parses agent text, and a compromised one must not find the page's
+        # relay. Anything else is an agent, a server or the gateway acting as the
+        # operator, or a container on control-net within the registry's reach.
         members = {svc for svc in _service_names()
                    if "tasks-operator-net" in _raw_networks(svc)}
-        self.assertEqual(members, {"tasks", "control-plane-ui"})
+        self.assertEqual(members, {"tasks", "tasks-ui"})
 
     def test_the_ui_dials_the_operator_listener_where_it_binds(self):
         # By address: the UI's resolver would ask the host's DNS for a stopped
         # registry's name. The port is the listener's, and the UI's own address on the
         # network is one the listener's peer check admits.
         env = _environment_of("tasks")
-        url = _environment_of("control-plane-ui")["CONTROL_UI_TASKS_URL"]
+        url = _environment_of("tasks-ui")["TASKS_UI_REGISTRY_URL"]
         self.assertEqual(url, f"http://{env['TASKS_OPERATOR_BIND']}:"
                               f"{env['TASKS_OPERATOR_PORT'].strip(chr(34))}")
-        self.assertEqual(_ui_default("CONTROL_UI_TASKS_URL"), url)
-        mine = _scalar(_block(_service("control-plane-ui"), "tasks-operator-net", 6),
+        self.assertEqual(_ui_default("TASKS_UI_REGISTRY_URL", TASKS_UI_APP), url)
+        mine = _scalar(_block(_service("tasks-ui"), "tasks-operator-net", 6),
                        "ipv4_address")
         self.assertIn(ipaddress.ip_address(mine),
                       ipaddress.ip_network(_registry_default("serve.py",
@@ -1435,21 +1513,30 @@ class TaskRegistryPlacementTests(unittest.TestCase):
                     _scalar(_block(_service(svc), "mcp-net", 6), "ipv4_address"), mine)
 
     def test_it_publishes_no_port_and_nothing_waits_on_it(self):
-        # Optional everywhere: behind its own profile, and no service depends on it.
+        # Optional everywhere: behind its own profile, and nothing outside that profile
+        # depends on it, so `make up` never starts it. Its page waits on it, inside.
         body = _service("tasks")
         self.assertFalse([ln for ln in body if ln.strip().startswith("ports:")])
         self.assertEqual(_block(body, "profiles", 4), ["      - tasks"])
-        for svc in _service_names():
+
+        def profiles(svc):
+            try:
+                return {ln.strip().lstrip("- ") for ln in _block(_service(svc), "profiles", 4)}
+            except AssertionError:
+                return set()
+        for svc in sorted(s for s in _service_names() if "tasks" not in profiles(s)):
             # Both spellings: the block, and the flow form on the key's own line.
             inline = [ln for ln in _service(svc) if re.match(r"    depends_on:", ln)]
             try:
                 waits_on = _block(_service(svc), "depends_on", 4)
             except AssertionError:
                 waits_on = []
-            with self.subTest(service=svc):
-                self.assertNotIn("tasks", {ln.strip().lstrip("- ").rstrip(":")
-                                           for ln in waits_on})
-                self.assertFalse([ln for ln in inline if re.search(r"\btasks\b", ln)])
+            for needed in ("tasks", "tasks-ui"):
+                with self.subTest(service=svc, needs=needed):
+                    self.assertNotIn(needed, {ln.strip().lstrip("- ").rstrip(":")
+                                              for ln in waits_on})
+                    self.assertFalse([ln for ln in inline
+                                      if re.search(rf"(?<![\w-]){needed}(?![\w-])", ln)])
 
     def test_the_gateway_dials_it_by_the_name_it_serves_under(self):
         # The gateway dials a server by its registered name, and keys its tools on it.
@@ -1543,6 +1630,25 @@ class NoServiceSharesANetworkNamespaceTests(unittest.TestCase):
                                   if re.match(r"\s+network_mode:", ln)])
 
 
+class PublishedPortTests(unittest.TestCase):
+    """DESIGN.md says the two UIs' pages are the only ports the stack publishes, and only
+    on host loopback: every other listener is on a network the host does not join."""
+
+    def test_only_the_two_uis_publish_and_only_on_loopback(self):
+        published = {}
+        for svc in _service_names():
+            body = _service(svc)
+            if any(re.match(r"    ports:", ln) for ln in body):
+                published[svc] = [ln.strip() for ln in _block(body, "ports", 4)
+                                  if ln.strip() and not ln.strip().startswith("#")]
+        self.assertEqual(set(published), {"control-plane-ui", "tasks-ui"})
+        for svc, lines in published.items():
+            with self.subTest(service=svc):
+                self.assertTrue(lines)
+                for ln in lines:
+                    self.assertTrue(ln.startswith('- "127.0.0.1:'), ln)
+
+
 class EveryServiceDropsEveryCapabilityTests(unittest.TestCase):
     """What keeps a single-address bind on its own leg. Linux takes a packet for any of
     its addresses on any interface, so a neighbour that could route or forge one would
@@ -1580,7 +1686,7 @@ class EveryImageIsBuiltTests(unittest.TestCase):
                     any(re.match(r"    profiles:", ln) for ln in body):
                 gated[svc] = [ln.strip().lstrip("- ") for ln in _block(body, "profiles", 4)
                               if ln.strip().startswith("- ")]
-        self.assertEqual(set(gated), {"tasks"})
+        self.assertEqual(set(gated), {"tasks", "tasks-ui"})
         for svc, profiles in gated.items():
             for profile in profiles:
                 with self.subTest(service=svc, profile=profile):

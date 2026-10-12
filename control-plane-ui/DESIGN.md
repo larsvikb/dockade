@@ -41,8 +41,7 @@ installs from `ui-common/guards.py`, and the relay's own table in
   backend surface is not uniformly browser-appropriate: reaching `POST /authorize`
   from a page means forged audit rows and consumed hold slots on the governance
   authority. The old catch-all `/{path:path}` relayed it. The task registry's operator
-  API has a table of its own, under `/tasks`, so no path can reach both upstreams; that
-  listener takes no token, so its table is the whole of what a page can do there.
+  API is no upstream of this UI: its page is `tasks-ui/`, with a table of its own.
 - **Refusal to be embedded** — closes **clickjacking**, which is the gap the first
   three guards structurally cannot see, and it was open until now. An attacker page
   that frames the UI's loopback origin produces a request with a perfectly legitimate
@@ -61,9 +60,12 @@ installs from `ui-common/guards.py`, and the relay's own table in
 
 Beneath the four, the network: the page is served on the UI's `control-ui-net` address
 alone (`check_bind`) and only to peers on that network (`OnlyFrom`), where the loopback
-publish and the healthcheck arrive. The UI's other legs are `control-net` and the task
-registry's network, whose other member parses agent text; why the bind alone does not
-keep them out is the root `DESIGN.md`'s "Task registry".
+publish and the healthcheck arrive. Its other leg is `control-net`; why the bind alone
+does not keep a leg's neighbours out is the root `DESIGN.md`'s "Task registry", and why
+the task registry's page is a container of its own rather than a tab here.
+
+The four guards are `tasks-ui`'s too, with its own relay table: `ui-common/` holds what
+both UIs share, and the image copies it in beside this directory's files.
 
 **Security headers on every response, and why the script became a file.** A
 `security_headers` middleware sets a Content-Security-Policy (plus `X-Frame-Options`,
@@ -139,18 +141,8 @@ spelled out, not only the invisible ones (`pinText` in `control-plane-ui/mcp.js`
 payload is often prose, where an em dash is ordinary and alarming about it teaches the
 operator to click past the warning. A pin value is an identifier that a future call
 must equal exactly, so a U+0430 CYRILLIC SMALL LETTER A in a pinned `owner` is a grant
-for a different owner than the one on screen, and there is no prose to protect.
-
-**Agent prose is spelled where it hides, and only there.** A task's title, body,
-notes and claim are prose, so they keep their line breaks and tabs and show visible
-non-ASCII as written; a dash or an accent is ordinary there, and spelling it would
-bury the one that matters. A character that renders as nothing or reorders the text
-around it (`Cf`, `Cc` but the line break and tab, `Zl`, `Zp`, and Unicode's
-default-ignorable code points, variation selectors among them) is spelled `\uXXXX`
-where it sits, with a note counting them (`spellHidden` in `control-plane-ui/tasks.js`),
-because an approved body is what every later session reads, and the operator must see
-what is in it rather than what the browser draws. Between the payload's rule, which
-notes non-ASCII, and the pin's, which spells it all, for that reason.
+for a different owner than the one on screen, and there is no prose to protect. Task
+prose is a third rule, between the two (`tasks-ui/DESIGN.md`).
 
 **`[hidden]` wins globally, and the test guards the rule rather than a list.** The
 script hides things by setting `.hidden`, which relies on the user-agent rule
@@ -171,17 +163,6 @@ different browsers, and a record of *when* something happened cannot mean two th
 the UI fixes ISO-8601 ordering, local time, 24-hour, with the UTC instant on the row's
 `title`, and pins the format in a test. The shaping and the `Number(null)`→`1970-01-01`
 guard live in `time.js`; `NOTES.md` has what six locales produce.
-
-**Not running, a third state, on the Tasks tab.** The task registry is optional
-(`make tasks-up`), so its absence is a state the tab shows, not a failure. The page asks
-`/tasks/running`, which this container answers itself, before it calls the registry at
-all: a relayed call to a stopped registry would be a failed request in the console on
-every load. Not running is one line on the tab and no poll, until the operator opens
-the tab again; a registry that stops mid-session is found by the next poll, whose 502
-(`_registry_unreachable`, a status the registry never sends) ends the polling the same
-way. The tab's badge counts the notes agents flagged for the operator and is never
-`hot`, and the lamp ignores it: nobody waits on a flagged note
-(`task-registry/DESIGN.md`, "Notes").
 
 **Empty vs. stale, on both polled lists.** "Nothing has happened yet" and "the poll
 failed" must not render identically — and the header cannot disambiguate them, because
@@ -220,7 +201,8 @@ its listeners, since a lookup at import would fail under node. Its state lives i
 module that writes it, and what other modules call is a named export, so a misspelling
 stops the page at link time, where the import test sees it, not at a click. The one
 mistake this shape adds is a lookup left out of a mount, a name that resolves and holds
-`undefined`; `MountedElementTests` is its guard.
+`undefined`; `test_every_element_a_module_declares_is_looked_up_once_in_its_mount`
+(`PageChecks`, run for this page and the tasks page) is its guard.
 
 Two cross-file couplings have no compiler between their ends, and a test stands in at
 each. The first asserts every `getElementById` in the page's modules matches an id in
@@ -298,17 +280,19 @@ oracle is the previous page, so there are no expected values to keep up, and the
 question only has an answer on a branch — which is what keeps it out of `check`.
 Neither the host nor CI runs it; a move PR runs it in the tier-1 image.
 Each move PR adds the steps that exercise its surface to
-`tests/ui-harness/scenario.js`.
+`tests/ui-harness/scenario.js`; the tasks page has its own
+(`tests/ui-harness/tasks-scenario.js`, `make ui-diff UI_DIFF_PAGE=tasks`).
 
 The comparison sees behaviour only where its scenario runs, and the commonest mistake a
 move makes needs no scenario: a `start()` local left behind, referenced from its new
-file, is a ReferenceError at the first click that reaches it. `FreeNameTests` sees that
+file, is a ReferenceError at the first click that reaches it.
+`test_every_free_name_in_the_page_is_a_browser_global` (`PageChecks`) sees that
 everywhere and sees nothing else: V8 compiles every function eagerly and names each
 reference it could not resolve, and the page's only unresolved names may be the
 browser's.
 
 **Tabbed views + traffic-light favicon, both driven by "don't hide a failing state."**
-Approvals / Audit / Policy / Tools / Tasks are tabs (via `location.hash`, with arrow-key nav), and
+Approvals / Audit / Policy / Tools are tabs (via `location.hash`, with arrow-key nav), and
 the hazard tabs introduce — a hidden view drifting unnoticed — is answered by badges
 that keep polling even the hidden views: a live pending count, and a policy **unseen**
 marker keyed on pattern+action (a flipped rule leaves the count unchanged). The favicon

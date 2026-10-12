@@ -277,10 +277,10 @@ dockade/
     requirements.txt        #   pinned deps (fastapi, uvicorn)
     CLAUDE.md, DESIGN.md    #   how to work here; the approval flow's design
   control-plane-ui/         # UI FRONTEND — serves the UI + reverse-proxies the API
-    Dockerfile              #   FastAPI + httpx; control-ui-net (loopback) + control-net
-                            #   + tasks-operator-net; built from the root, for ui-common/
+    Dockerfile              #   FastAPI + httpx; control-ui-net (loopback) + control-net;
+                            #   built from the root, for ui-common/
     app.py                  #   static UI at / + streaming reverse proxy to the backend,
-                            #   and the Tasks tab's to the task registry
+                            #   and the address of the tasks UI for the header's link
     app.js                  #   the approval console's behaviour — a file so the CSP can
                             #   say script-src 'self'; pure helpers unit-tested under node
     audit.js                #   the record as browsed: what a row says, how rows fold, the
@@ -303,11 +303,20 @@ dockade/
                             #   the banner, and what dismissing it acknowledges
     status.js               #   what each polled table says about itself: its sentences for
                             #   empty, stale, or not yet loaded
-    tasks.js                #   the Tasks tab: the task registry's work list, its not-running
-                            #   state, agent prose with hidden characters spelled out
     index.html              #   static shell + styles for the SSE approval console
     DESIGN.md               #   the browser boundary and the page's mechanics
     requirements.txt        #   pinned deps (fastapi, uvicorn, httpx)
+  tasks-ui/                 # TASKS UI — the operator's page onto the task registry, its own origin
+    Dockerfile              #   FastAPI + httpx; tasks-ui-net (loopback) + tasks-operator-net,
+                            #   behind the registry's profile; built from the root, for ui-common/
+    app.py                  #   static page at / + the relay to the registry's operator
+                            #   listener, and whether the registry answers
+    app.js                  #   the page's entry: mount, ask, poll while it answers
+    tasks.js                #   the work list, its not-running state, agent prose with
+                            #   hidden characters spelled out
+    index.html              #   static shell + styles
+    DESIGN.md               #   the relay's table, the not-running state, how prose is spelled
+    requirements.txt        #   pinned deps, held equal to the approval UI's
   ui-common/                # what every UI shares, copied in beside its own files
     guards.py               #   the browser guards, the security headers, the bind and
                             #   peer checks a UI starts with

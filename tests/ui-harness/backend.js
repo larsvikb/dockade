@@ -121,10 +121,8 @@ const GETS = {
   "/api/mcp/rules": TOOL_RULES,
   "/api/mcp/inventory": INVENTORY,
   "/api/mcp/pins": PINS,
-  // The task registry is not running: what this UI's own `/tasks/running` answers then
-  // (control-plane-ui/app.py). Every `/tasks/api/…` path stays unanswered, so a call
-  // the page should not make shows up in the run as a 404.
-  "/tasks/running": { running: false },
+  // Where the header's link points, which this UI answers itself (control-plane-ui/app.py).
+  "/tasks-link": { url: "http://127.0.0.1:28091/" },
 };
 
 function resolved(id, body) {

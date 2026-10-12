@@ -107,7 +107,7 @@ SCRIPTS := $(LAUNCHERS) \
            claude-sandbox/claude-wrapper.sh
 DOCKERFILES := claude-sandbox/Dockerfile opencode-sandbox/Dockerfile \
                proxies/egress/Dockerfile \
-               control-plane/Dockerfile control-plane-ui/Dockerfile \
+               control-plane/Dockerfile control-plane-ui/Dockerfile tasks-ui/Dockerfile \
                tool-gateway/Dockerfile task-registry/Dockerfile
 # A GLOB for the workflows, not a list, so a second workflow is linted without
 # anyone remembering to register it — same reasoning as LAUNCHERS above.
@@ -115,6 +115,7 @@ YAMLFILES := docker-compose.yml mcp-servers.yml .hadolint.yaml .yamllint \
              $(wildcard .github/workflows/*.yml)
 JSONFILES := $(shell git ls-files '*.json' 2>/dev/null)
 PYFILES := proxies/egress/addon.py control-plane-ui/app.py ui-common/guards.py \
+           tasks-ui/app.py \
            control-plane/app.py control-plane/store.py control-plane/policy.py \
            control-plane/holds.py control-plane/ingest.py control-plane/audit.py \
            control-plane/inventory.py control-plane/provenance.py \
@@ -184,10 +185,14 @@ REFFILES := $(SCRIPTS) \
             control-plane-ui/provenance.js \
             control-plane-ui/saturation.js \
             control-plane-ui/status.js \
-            control-plane-ui/tasks.js \
             ui-common/escape.js \
             ui-common/list-status.js \
             ui-common/time.js \
+            tasks-ui/app.py \
+            tasks-ui/requirements.txt \
+            tasks-ui/index.html \
+            tasks-ui/app.js \
+            tasks-ui/tasks.js \
             task-registry/serve.py \
             task-registry/taskdb.py \
             task-registry/tasks.py \
@@ -504,13 +509,14 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	  exit 1
 	fi
 	for launcher in $(LAUNCHERS); do
-	  if grep -qE 'control-(ui-)?net|(tool-)?authorize-net|tasks-operator-net' "$$launcher"; then
+	  if grep -qE 'control-(ui-)?net|(tool-)?authorize-net|tasks-(operator|ui)-net' "$$launcher"; then
 	    echo "  FAIL: $$launcher references a control-plane network — no sandbox tier"
 	    echo "        may EVER attach to control-net, control-ui-net, authorize-net,"
-	    echo "        tool-authorize-net or tasks-operator-net (the agent must have no"
-	    echo "        route to the control plane, both authorize nets reach it just as"
-	    echo "        directly as the others, and the last is where the task"
-	    echo "        registry takes the operator's writes with no token)"
+	    echo "        tool-authorize-net, tasks-operator-net or tasks-ui-net (the agent"
+	    echo "        must have no route to the control plane, both authorize nets reach"
+	    echo "        it just as directly as the others, and the last two are where the"
+	    echo "        task registry takes the operator's writes with no token, and the"
+	    echo "        page that sends them)"
 	    exit 1
 	  fi
 	done
@@ -566,9 +572,16 @@ test: ## Run the governance unit tests (dependency-free; python -m unittest)
 # Not part of `check`: it needs a browser and an npm install, and its question — does
 # the page still do what it did on the base — only has an answer on a branch. Both runs
 # use THIS tree's harness and scenario, so steps a branch adds run against the base too.
+# UI_DIFF_PAGE picks the page: approval (control-plane-ui) or tasks (tasks-ui).
 UI_DIFF_BASE ?= main
-ui-diff: ## Run the UI scenario on UI_DIFF_BASE (default main) and on this tree in a headless browser, and diff the two
+UI_DIFF_PAGE ?= approval
+ui-diff: ## Run a page's scenario (UI_DIFF_PAGE=approval|tasks) on UI_DIFF_BASE (default main) and on this tree in a headless browser, and diff the two
 	@harness=tests/ui-harness
+	case "$(UI_DIFF_PAGE)" in
+	  approval) ui=control-plane-ui;;
+	  tasks) ui=tasks-ui;;
+	  *) echo "UI_DIFF_PAGE is approval or tasks, not $(UI_DIFF_PAGE)"; exit 2;;
+	esac
 	pinned=$$(node -p 'require("./'$$harness'/package.json").dependencies["playwright-core"]')
 	installed=$$(node -p 'try { require("./'$$harness'/node_modules/playwright-core/package.json").version } catch { "" }')
 	if [ "$$installed" != "$$pinned" ]; then
@@ -576,23 +589,25 @@ ui-diff: ## Run the UI scenario on UI_DIFF_BASE (default main) and on this tree 
 	  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci --prefix "$$harness" --no-audit --no-fund --ignore-scripts
 	fi
 	out=$$(mktemp -d)
-	# Each page as the image serves it: the UI's files and ui-common/'s in one
-	# directory. A base from before ui-common/ has only the first.
-	base_dirs=$$(git ls-tree -d --name-only "$(UI_DIFF_BASE)" control-plane-ui ui-common)
-	git archive "$(UI_DIFF_BASE)" $$base_dirs | tar -x -C "$$out"
+	# Each page as its image serves it: the UI's files and ui-common/'s in one
+	# directory. A base from before ui-common/, or before the UI, has only what it had.
+	base_dirs=$$(git ls-tree -d --name-only "$(UI_DIFF_BASE)" "$$ui" ui-common)
 	mkdir "$$out/base" "$$out/tree"
-	for d in $$base_dirs; do cp "$$out/$$d"/*.js "$$out/base/"; done
-	cp "$$out/control-plane-ui/index.html" "$$out/base/"
-	for d in control-plane-ui ui-common; do cp "$$d"/*.js "$$out/tree/"; done
-	cp control-plane-ui/index.html "$$out/tree/"
+	if [ -n "$$base_dirs" ]; then
+	  git archive "$(UI_DIFF_BASE)" $$base_dirs | tar -x -C "$$out"
+	  for d in $$base_dirs; do cp "$$out/$$d"/*.js "$$out/base/"; done
+	  cp "$$out/$$ui/index.html" "$$out/base/" 2>/dev/null || true
+	fi
+	for d in "$$ui" ui-common; do cp "$$d"/*.js "$$out/tree/"; done
+	cp "$$ui/index.html" "$$out/tree/"
 	# A run whose step failed still writes its transcript, so the diff runs either way.
 	failed=""
 	echo "== $(UI_DIFF_BASE) =="
-	node "$$harness/harness.js" "$$out/base" "$$out/base.txt" >/dev/null \
+	node "$$harness/harness.js" "$$out/base" "$$out/base.txt" "$(UI_DIFF_PAGE)" >/dev/null \
 	  || failed="$$failed $(UI_DIFF_BASE)"
 	[ -s "$$out/base.txt" ] || exit 1   # the harness could not run at all
 	echo "== this tree =="
-	node "$$harness/harness.js" "$$out/tree" "$$out/tree.txt" \
+	node "$$harness/harness.js" "$$out/tree" "$$out/tree.txt" "$(UI_DIFF_PAGE)" \
 	  || failed="$$failed this-tree"
 	[ -s "$$out/tree.txt" ] || exit 1
 	if diff -u --label "$(UI_DIFF_BASE)" --label "this tree" "$$out/base.txt" "$$out/tree.txt" \
@@ -619,7 +634,7 @@ verify-build: ## Assert every image still builds (skipped if docker unavailable)
 	# nothing changed. Covers every Dockerfile — the compose services here, and
 	# BOTH sandbox tiers (not compose services) via their launchers. `--profile tasks`
 	# because compose builds only the services its active profiles enable, and the
-	# task registry is the one profile-gated service built here
+	# task registry and its page are the profile-gated services built here
 	# (tests/test_topology.py holds this to every such profile).
 	echo "== docker compose build (the compose services) =="
 	$(COMPOSE) --profile tasks build
@@ -704,7 +719,7 @@ mcp-ps: ## Who is on mcp-net right now (should be the proxy plus enabled servers
 # read the same way (DESIGN.md, "The secret's path is derived from the server name"):
 # random, mode 0600, never overwritten. The registry reads it at start and the gateway
 # on every call, so rotation is deleting the file, then `make tasks-down tasks-up`.
-tasks-up: ## Start the task registry (optional); writes its secret on the first start
+tasks-up: ## Start the task registry and its page (optional); writes its secret on the first start
 	@secret="$(MCP_SECRETS)/tasks.json"
 	if [ ! -e "$$secret" ]; then
 	  # Made before the file is opened, so a failure leaves no empty file behind for
@@ -724,14 +739,16 @@ tasks-up: ## Start the task registry (optional); writes its secret on the first 
 	  echo "wrote $$secret"
 	fi
 	$(MAKE) --no-print-directory secrets-perm-check
-	$(COMPOSE) --profile tasks up -d --build --wait --wait-timeout 120 tasks
+	$(COMPOSE) --profile tasks up -d --build --wait --wait-timeout 120 tasks tasks-ui
+	# Asked of compose rather than spelled here, so a port set in .env is the one shown.
+	echo "The work list: http://$$($(COMPOSE) --profile tasks port tasks-ui 8091)/"
 	echo "Registered yet? The UI's MCP tab: server tasks, port 8110, path /mcp, header"
 	echo "Authorization, template 'Bearer {secret}'. Its tools are denied until rules allow them."
 
-tasks-down: ## Stop the task registry (keeps its store and its secret)
+tasks-down: ## Stop the task registry and its page (keeps its store and its secret)
 	# stop+rm rather than `down`, which would take the shared infra with it.
-	$(COMPOSE) stop tasks
-	$(COMPOSE) rm -f tasks
+	$(COMPOSE) stop tasks-ui tasks
+	$(COMPOSE) rm -f tasks-ui tasks
 
 # A well-formed DUMMY, and both halves matter. Enumeration never calls GitHub, so no
 # real credential is needed to read a server's tool surface — but the bearer is
@@ -1132,11 +1149,12 @@ restore-tasks: tasks-tool-preflight ## Replace the task registry's store from a 
 	@# Stopped first, since the store and its sidecars are replaced under it, and
 	# started again, whatever happens next, only if it was running: a restore the
 	# checks refuse must cost nothing but the window (`restore` says how that was
-	# learned). A registry that was stopped stays stopped.
+	# learned). A registry that was stopped stays stopped. Its page is started with it,
+	# as `tasks-up` does, since compose may stop a dependent with the service it needs.
 	running=$$($(COMPOSE) --profile tasks ps -q --status running tasks)
 	$(COMPOSE) --profile tasks stop tasks
 	if [ -n "$$running" ]; then
-	  trap '$(COMPOSE) --profile tasks up -d --wait --wait-timeout 120 tasks' EXIT
+	  trap '$(COMPOSE) --profile tasks up -d --wait --wait-timeout 120 tasks tasks-ui' EXIT
 	else
 	  echo "restore-tasks: the registry was not running, and stays stopped (make tasks-up)"
 	fi
@@ -1156,8 +1174,8 @@ rebuild: ## Rebuild every image from scratch — proxy, control plane, UI, gatew
 	# it started with and the next `make claude` / `make opencode` picks up the new
 	# one. Nothing to recreate.
 	#
-	# The task registry's image too (see verify-build for the profile). The `up` below
-	# leaves a running registry alone; `make tasks-up` recreates it on the new image.
+	# The task registry's and its page's images too (see verify-build for the profile).
+	# The `up` below leaves them alone; `make tasks-up` recreates both on the new images.
 	$(COMPOSE) --profile tasks build --no-cache
 	for launcher in $(LAUNCHERS); do "./$$launcher" --build-only --no-cache; done
 	$(COMPOSE) up -d --wait --wait-timeout 120

@@ -38,10 +38,6 @@ import { payloadDisclosure, payloadHazards, payloadTokens, renderPayload }
   from "./payload.js";
 import { saturationState, ackCount } from "./saturation.js";
 import { rulesStatus } from "./status.js";
-import {
-  mountTasks, probeRegistry, refreshTasks, refreshFlagged, registryIsRunning,
-  TASKS_POLL_MS,
-} from "./tasks.js";
 import { fmtTime, fmtStamp } from "./time.js";
 
 // ── pure decision helpers (unit-tested) ─────────────────────────────────────
@@ -86,7 +82,7 @@ function start() {
   let pinLeaseSeconds = null;
 
   // ── views ─────────────────────────────────────────────────────────────────
-  const VIEWS = ["approvals", "audit", "policy", "tools", "tasks"];
+  const VIEWS = ["approvals", "audit", "policy", "tools"];
   const viewFromHash = () =>
     VIEWS.includes(location.hash.slice(1)) ? location.hash.slice(1) : "approvals";
   let current = viewFromHash();
@@ -109,11 +105,6 @@ function start() {
     // The pins too: nothing polls them, and a card in the pending view is where one
     // will be written.
     if (current === "tools") { refreshInventory(); refreshToolPins(); }
-    // The registry is optional, and a poll stops when it stops answering: opening the
-    // tab is when the page asks again (tasks.js).
-    if (current === "tasks") {
-      if (registryIsRunning()) { refreshTasks(); refreshFlagged(); } else probeRegistry();
-    }
     updateIndicators();
   }
 
@@ -1579,8 +1570,20 @@ function start() {
   // ── MCP servers, tool policy and pinned allows: mcp.js ────────────────────
   mountMcp();
 
-  // ── the task registry's work list: tasks.js ─────────────────────────────────
-  mountTasks();
+  // ── the tasks UI's address, for the header's link ─────────────────────────
+  // Asked once: it is configuration (CONTROL_UI_TASKS_LINK), not state. Without an
+  // answer the link stays hidden rather than pointing somewhere guessed.
+  async function showTasksLink() {
+    try {
+      const res = await fetch("/tasks-link");
+      if (!res.ok) return;
+      const link = document.getElementById("tasks-link");
+      link.href = (await res.json()).url;
+      link.hidden = false;
+    } catch (e) {
+      // Stays hidden.
+    }
+  }
 
   // ── wiring ────────────────────────────────────────────────────────────────
   // `visibilityState` is absent in some non-browser hosts; treat unknown as
@@ -1590,6 +1593,7 @@ function start() {
 
   showView(current);
   syncNotifyButton();
+  showTasksLink();
   connect();
   refreshAudit();
   refreshRules();
@@ -1611,9 +1615,6 @@ function start() {
   refreshToolRules();
   refreshInventory();
   refreshToolPins();
-  // Once, through this container, which answers whether the registry does: nothing
-  // else here calls it unless it did.
-  probeRegistry();
   // Both keep polling regardless of which VIEW is showing — otherwise the badges
   // could not report a hidden view's state, which is the whole reason they exist.
   //
@@ -1640,14 +1641,6 @@ function start() {
   setInterval(() => {
     if (visible() && current === "tools") refreshInventory();
   }, 10000);
-  // The flagged count feeds the tab's badge, so it polls whichever view is up, as the
-  // three above do; the list only while it is on screen. Neither while the registry
-  // is not answering.
-  setInterval(() => {
-    if (!visible() || !registryIsRunning()) return;
-    // In turn, so a registry that stopped meanwhile costs one failed call, not two.
-    refreshFlagged().then(() => { if (current === "tasks") refreshTasks(); });
-  }, TASKS_POLL_MS);
   // Refresh IMMEDIATELY on return, rather than leaving up to four seconds of
   // stale-but-unlabelled data on screen at the moment attention comes back to it.
   document.addEventListener("visibilitychange", () => {
@@ -1656,9 +1649,6 @@ function start() {
       refreshRules();
       refreshLeases();
       if (current === "tools") refreshInventory();
-      if (registryIsRunning()) {
-        refreshFlagged().then(() => { if (current === "tasks") refreshTasks(); });
-      }
     }
   });
 }

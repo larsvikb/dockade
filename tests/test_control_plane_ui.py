@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import ipaddress
 import re
 import sys
 import types
@@ -90,6 +91,8 @@ def _install_stubs() -> None:
     # module may have installed an httpx stub of its own first.
     if not hasattr(sys.modules["httpx"], "RequestError"):
         sys.modules["httpx"].RequestError = type("RequestError", (Exception,), {})
+    if not hasattr(sys.modules["httpx"], "Timeout"):
+        sys.modules["httpx"].Timeout = lambda *a, **k: (a, k)
 
     # Another test module may have installed the shared fastapi stub first (test
     # discovery order is arbitrary), so augment whatever exists rather than assume
@@ -788,6 +791,177 @@ class RelayHostPinningTests(unittest.TestCase):
         self.assertEqual(_sent, {})
 
 
+class TasksRelayTests(unittest.TestCase):
+    """The Tasks tab's relay: ``/tasks/api/…`` goes to the task registry's operator
+    listener as ``/api/…``, exactly the routes the page calls, and nothing else does.
+    That listener takes no token, so this table is the whole of what a browser on the
+    loopback port can do there."""
+
+    def _proxy(self, captured_path, method="GET", **kw):
+        _sent.clear()
+        return asyncio.run(ui.proxy(captured_path, _ok_host(method=method, **kw)))
+
+    def test_the_reads_reach_the_registry_with_the_prefix_taken_off(self):
+        for path, upstream in (("tasks/api/repos", "/api/repos"),
+                               ("tasks/api/tasks", "/api/tasks"),
+                               ("tasks/api/tasks/12", "/api/tasks/12"),
+                               ("tasks/api/tasks/12/notes", "/api/tasks/12/notes"),
+                               ("tasks/api/tasks/12/history", "/api/tasks/12/history"),
+                               ("tasks/api/notes/flagged", "/api/notes/flagged"),
+                               ("tasks/api/search", "/api/search")):
+            with self.subTest(path=path):
+                resp = self._proxy(path)
+                self.assertNotEqual(resp.status_code, 403)
+                self.assertEqual(_sent["url"], ui.TASKS_URL + upstream)
+
+    def test_nothing_else_reaches_it(self):
+        # No write yet; an id that is not digits; a control-plane path under the
+        # prefix, or a registry path without it; the agent listener's paths, and the
+        # pages FastAPI would add.
+        for path, method in (("tasks/api/tasks", "POST"),
+                             ("tasks/api/tasks/12/move", "POST"),
+                             ("tasks/api/tasks/12/break-claim", "POST"),
+                             ("tasks/api/tasks/12/notes", "POST"),
+                             ("tasks/api/notes/hide", "POST"),
+                             ("tasks/api/repos", "POST"),
+                             ("tasks/api/tasks/abc", "GET"),
+                             ("tasks/api/tasks/1/../../../api/audit", "GET"),
+                             ("tasks/api/tasks/12345678901234567890", "GET"),
+                             ("tasks/api/audit", "GET"),
+                             ("tasks/approvals/stream", "GET"),
+                             ("tasks/api/config", "GET"),
+                             ("api/repos", "GET"), ("api/tasks", "GET"),
+                             ("api/notes/flagged", "GET"),
+                             ("tasks/mcp", "POST"), ("tasks/healthz", "GET"),
+                             ("tasks/openapi.json", "GET"), ("tasks/docs", "GET"),
+                             ("tasks/running", "POST")):
+            with self.subTest(path=path, method=method):
+                resp = self._proxy(path, method)
+                self.assertEqual(resp.status_code, 403)
+                self.assertEqual(_sent, {})
+
+    def test_no_path_belongs_to_both_tables(self):
+        # The prefix is what keeps each path to one upstream.
+        for _method, rx in ui._TASKS_RELAY_ROUTES:
+            with self.subTest(pattern=rx.pattern):
+                self.assertTrue(rx.pattern.startswith("^/tasks/api/"))
+        for _method, rx in ui._RELAY_ROUTES:
+            with self.subTest(pattern=rx.pattern):
+                self.assertFalse(rx.pattern.startswith("^/tasks"))
+
+    def test_the_upstream_stays_the_registry_whatever_the_table_lets_through(self):
+        # As RelayHostPinningTests, with this table opened up: the prefix comes off and
+        # what is left is still an absolute path on the registry.
+        with mock.patch.object(ui, "_TASKS_RELAY_ROUTES",
+                               (("GET", re.compile(r"^/tasks/.*$")),)):
+            for path in ("tasks//evil.com/x", "tasks///evil.com", "/tasks//x:1/y"):
+                with self.subTest(path=path):
+                    self._proxy(path)
+                    self.assertEqual(urlsplit(_sent["url"]).netloc,
+                                     urlsplit(ui.TASKS_URL).netloc)
+
+    def test_client_provenance_headers_are_stripped_here_too(self):
+        self._proxy("tasks/api/repos", headers={"x-forwarded-for": "10.9.9.9",
+                                                ui.ACTOR_HEADER: "forged"})
+        sent = dict(_sent["headers"])
+        self.assertNotIn("x-forwarded-for", sent)
+        self.assertEqual(sent[ui.ACTOR_HEADER], "127.0.0.1")
+
+    def test_the_registrys_answer_carries_none_of_its_headers(self):
+        # The lower-trust upstream: its JSON body, and no header of its choosing.
+        class _Hostile:
+            status_code = 200
+            headers: ClassVar[dict] = {"set-cookie": "s=1", "location": "http://x/",
+                                       "content-type": "text/html",
+                                       "access-control-allow-origin": "*"}
+
+            def aiter_raw(self):
+                async def _gen():
+                    if False:
+                        yield b""
+                return _gen()
+
+            async def aclose(self):
+                pass
+
+        async def send(_req, stream=False):
+            return _Hostile()
+
+        with mock.patch.object(ui._tasks_client, "send", send), \
+                mock.patch.object(ui._client, "send", send):
+            registry = self._proxy("tasks/api/repos")
+            backend = self._proxy("api/config")
+        self.assertEqual(registry.kwargs["headers"], {"content-type": "application/json"})
+        # The control plane's are relayed as before.
+        self.assertEqual(backend.kwargs["headers"]["location"], "http://x/")
+
+    def test_a_registry_that_does_not_answer_is_a_502_in_its_own_shape(self):
+        # The status the page reads as "not running", which the registry never sends:
+        # its refusals are 400, 404, 409 and 422 (task-registry/operator_api.py).
+        async def _boom(_req, stream=False):
+            raise sys.modules["httpx"].RequestError("connection refused")
+
+        with mock.patch.object(ui._tasks_client, "send", _boom), \
+                mock.patch.object(ui._client, "send", _boom):
+            registry = self._proxy("tasks/api/repos")
+            backend = self._proxy("api/config")
+        self.assertEqual(registry.status_code, 502)
+        self.assertEqual(registry.args[0]["ok"], False)
+        self.assertIsNone(registry.args[0]["current"])
+        self.assertIn("task registry did not answer", registry.args[0]["detail"])
+        # The control plane's own stays as it was.
+        self.assertEqual(backend.status_code, 502)
+        self.assertIn("control-plane backend unreachable", backend.args[0])
+
+    def test_the_registry_is_dialled_by_address_and_with_a_bounded_wait(self):
+        # By name, a stopped registry's `tasks` would be asked of the host's DNS.
+        host = urlsplit(ui.TASKS_URL).hostname
+        self.assertEqual(str(ipaddress.ip_address(host)), host)
+        src = (ROOT / "control-plane-ui" / "app.py").read_text()
+        self.assertRegex(src, r"_tasks_client = httpx\.AsyncClient\(base_url=TASKS_URL,"
+                              r"\s+timeout=httpx\.Timeout\(10\.0, connect=2\.0\)\)")
+
+
+class TasksRunningTests(unittest.TestCase):
+    """``GET /tasks/running``, which this container answers itself: whether the task
+    registry answers, so the page asks it before calling the registry at all."""
+
+    def _ask(self, get):
+        with mock.patch.object(ui._tasks_client, "get", get, create=True):
+            return asyncio.run(ui.tasks_running())
+
+    def test_running_when_its_repo_list_answers(self):
+        asked = []
+
+        async def get(path):
+            asked.append(path)
+            return types.SimpleNamespace(status_code=200)
+
+        self.assertEqual(self._ask(get), {"running": True})
+        self.assertEqual(asked, ["/api/repos"])
+
+    def test_not_running_when_nothing_answers(self):
+        async def get(path):
+            raise sys.modules["httpx"].RequestError("timed out")
+
+        self.assertEqual(self._ask(get), {"running": False})
+
+    def test_not_running_when_it_answers_anything_but_the_list(self):
+        # A 403 is its peer check refusing this UI's address: there is no tab to show.
+        for status in (403, 404, 500):
+            async def get(path, status=status):
+                return types.SimpleNamespace(status_code=status)
+
+            with self.subTest(status=status):
+                self.assertEqual(self._ask(get), {"running": False})
+
+    def test_it_is_served_here_before_the_relay_route(self):
+        # Declared above the catch-all, which would otherwise take it and refuse it.
+        src = (ROOT / "control-plane-ui" / "app.py").read_text()
+        self.assertLess(src.index('@app.get("/tasks/running")'),
+                        src.index('@app.api_route("/{path:path}"'))
+
+
 class GuardMiddlewareWiringTests(unittest.TestCase):
     """The tests above exercise ``_guard`` / ``_security_headers`` as plain functions,
     but the stub's ``@app.middleware`` decorator is identity — so whether the app
@@ -854,6 +1028,54 @@ class BindTests(unittest.TestCase):
                 self.assertIn(f"CONTROL_UI_NET={net!r}", self.refused(net=net))
 
 
+class OnlyFromTests(unittest.TestCase):
+    """The peer check the app is served in: a peer outside control-ui-net is refused
+    before the app sees the request, with the headers the app would have set."""
+
+    def call(self, scope: dict) -> tuple[list[dict], list[dict]]:
+        seen, sent = [], []
+
+        async def app(scope, receive, send):
+            seen.append(scope)
+
+        async def send(message):
+            sent.append(message)
+
+        wrapped = ui.OnlyFrom(app, ui.check_bind(UI_BIND, UI_NET))
+        asyncio.run(wrapped(scope, None, send))
+        return seen, sent
+
+    def test_the_publish_and_the_healthcheck_reach_the_app(self):
+        # The bridge's gateway address, and the bound one.
+        for peer in ("172.25.0.1", "172.25.0.2"):
+            with self.subTest(peer=peer):
+                scope = {"type": "http", "client": (peer, 40000)}
+                self.assertEqual(self.call(scope), ([scope], []))
+
+    def test_any_other_peer_is_refused_and_the_app_never_runs(self):
+        # The registry and the UI's own address on its network, the control plane, the
+        # UI's control-net address, loopback, the mapped spelling, a name, none.
+        for client in (("172.26.0.2", 1), ("172.26.0.3", 1), ("172.31.0.2", 1),
+                       ("172.31.0.10", 1), ("127.0.0.1", 1), ("::ffff:172.25.0.1", 1),
+                       ("control-plane-ui", 1), (), None):
+            with self.subTest(client=client):
+                seen, sent = self.call({"type": "http", "client": client})
+                self.assertEqual(seen, [])
+                self.assertEqual(sent[0]["status"], 403)
+                headers = dict(sent[0]["headers"])
+                for name, value in ui._SECURITY_HEADERS.items():
+                    self.assertEqual(headers[name.encode()], value.encode())
+                self.assertIn(b"answers its own network only", sent[1]["body"])
+
+    def test_the_servers_own_lifespan_passes(self):
+        scope = {"type": "lifespan"}
+        self.assertEqual(self.call(scope), ([scope], []))
+
+    def test_a_websocket_from_elsewhere_is_closed_before_its_handshake(self):
+        seen, sent = self.call({"type": "websocket", "client": ("172.26.0.2", 1)})
+        self.assertEqual((seen, sent), ([], [{"type": "websocket.close"}]))
+
+
 class EntryTests(unittest.TestCase):
     """``main``: the bind is checked before uvicorn runs, and the app it runs is this
     one, on that address alone, with the peer taken from the socket."""
@@ -870,9 +1092,14 @@ class EntryTests(unittest.TestCase):
 
     def test_it_serves_this_app_on_the_bound_address_alone(self):
         self.run_main(UI_BIND)
-        self.assertEqual(self.calls,
-                         [((ui.app,), {"host": UI_BIND, "port": 18090,
-                                       "proxy_headers": False, "log_level": "info"})])
+        self.assertEqual(len(self.calls), 1)
+        (served,), kwargs = self.calls[0]
+        self.assertEqual(kwargs, {"host": UI_BIND, "port": 18090,
+                                  "proxy_headers": False, "log_level": "info"})
+        # Inside the peer check, for its own network.
+        self.assertIsInstance(served, ui.OnlyFrom)
+        self.assertIs(served.app, ui.app)
+        self.assertEqual(str(served.net), UI_NET)
 
     def test_a_refused_bind_starts_nothing(self):
         with self.assertRaises(SystemExit):

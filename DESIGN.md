@@ -205,8 +205,9 @@ single-conversation bridge per enforcer. The egress proxy is **quadruple-homed**
 control-plane **backend** is **triple-homed**
 (control-net + authorize-net + tool-authorize-net) and fully
 internal (no `sandbox-net`, no `egress-net`, no published port), serving a
-different surface on each; the **control-plane-ui** frontend is on `control-net`
-(to reach the backend) plus `control-ui-net` (host-loopback UI). The task registry,
+different surface on each; the **control-plane-ui** frontend is **triple-homed**
+(`control-net` + `control-ui-net` + `tasks-operator-net`): the backend, the
+host-loopback UI, and the task registry's operator listener. The task registry,
 when its profile runs, is dual-homed (`mcp-net` + `tasks-operator-net`). The sandbox is on
 `sandbox-net` only — never any control network (asserted by the launcher guard in
 `make consistency` and by `boundary-check.sh`, which probes it from inside a running
@@ -1153,8 +1154,9 @@ and what no guard in a browser can do.
 
 **Why the frontend is a separate container.** The approval UI and the API/SSE relay
 live in a distinct **`control-plane-ui`** container (FastAPI + httpx: serves the
-static UI at `/`, reverse-proxies everything else — including the SSE stream — to
-the backend over `control-net`). The **backend is `internal` on every leg**: no
+static UI at `/`, reverse-proxies the backend's paths — including the SSE stream —
+over `control-net`, and the Tasks tab's to the task registry over
+`tasks-operator-net`). The **backend is `internal` on every leg**: no
 published port, no non-internal surface, nothing to exfiltrate even if reached. The
 frontend carries the sole host-facing surface (`control-ui-net`), holds no state,
 and is not on `sandbox-net`. Browsers hit the published loopback port → frontend →
@@ -1976,21 +1978,25 @@ the control plane's management listener to the same). Nor does the registry forw
 between its legs, so it carries no neighbour across to the other network's members. One process because both serve
 one SQLite store.
 
-**Declared in `docker-compose.yml`, behind a profile, and nothing depends on it.**
-Not in `mcp-servers.yml`, whose servers sit on `mcp-net` alone: a second leg is
-topology. `make up` is unchanged. A registry that stops keeps the tools the gateway
-has already listed, since a restart must not look like a withdrawal
-(`tool-gateway/surface.py`), and each call fails as unreachable; disabling `tasks` in
-the MCP tab is what withdraws them. That memory is the gateway process's own: a gateway
-that starts while the registry is down lists none of its tools until it next dials it
-and is answered (on a roster change, or the slow tick in `tool-gateway/app.py`), and a
-tool with no allow or ask rule is never listed.
+**Declared in `docker-compose.yml`, behind a profile, and nothing depends on it.** Not
+in `mcp-servers.yml`, whose servers sit on `mcp-net` alone: a second leg is topology.
+`make up` starts none of it, though it makes `tasks-operator-net` for the UI's leg. A
+registry that stops keeps the tools the gateway has already listed, since a restart
+must not look like a withdrawal (`tool-gateway/surface.py`), and each call fails as
+unreachable; disabling `tasks` in the MCP tab is what withdraws them. That memory is
+the gateway process's own: a gateway that starts while the registry is down lists none
+of its tools until it next dials it and is answered (on a roster change, or the slow
+tick in `tool-gateway/app.py`), and a tool with no allow or ask rule is never listed.
 
 **It parses agent text, so it joins no network the agent or the control plane is
 on.** Never `sandbox-net` or a control network, and no egress leg; from `mcp-net` it
-reaches what any server does. When the UI joins `tasks-operator-net` to give the
-registry a view, the UI serves nothing there: a registry compromised through a body
-or a note would otherwise find the UI's relay, and through it the management API.
+reaches what any server does. The UI joins `tasks-operator-net` to give the registry
+a view, and serves nothing there: it binds its `control-ui-net` address alone and
+answers that network's peers only, as the registry's listeners do theirs. A registry
+compromised through a body or a note would otherwise find the UI's relay, and through
+it the management API. In the other direction the relay is the operator
+listener's one client, so its table of registry routes (`control-plane-ui/app.py`) is
+the whole of what a browser on the loopback port can do there.
 
 ## Startup ordering — "running" is not "ready"
 
@@ -2289,9 +2295,10 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | the gateway records how a call ENDED — its own JSONL stream | **done** |
 | — | outcomes ingested — second stream, `status` column, `outcome` in the audit vocabulary | **done** — one approval id now selects the hold, the answer, the claim and the result |
 | — | task registry — the store, the agent listener (MCP, behind the gateway's secret), the operator API | **done** |
-| — | task registry as a service — `tasks` behind a profile on `mcp-net` + `tasks-operator-net`, one listener per leg | **done** — no UI view yet |
+| — | task registry as a service — `tasks` behind a profile on `mcp-net` + `tasks-operator-net`, one listener per leg | **done** |
 | — | task registry, agent side — where the id comes from in the image's instructions, dockade's repo name and checkpoints in `CLAUDE.md`, the id in the status line | **done** — `inflight.md` and `local-todo.md` stay the record beside it |
 | — | task registry backups — its store and a markdown export in `make backup`, `make restore-tasks` | **done** |
+| — | task registry view — the UI's Tasks tab, relayed to the operator listener over `tasks-operator-net` | **done** — reads only; the operator's moves next |
 
 The rationale for each shipped item lives under **Governance surfaces** above, not here
 — a status line goes stale, the reasoning does not. This section is deliberately the

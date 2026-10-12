@@ -465,7 +465,7 @@ class ControlPlaneBindTests(unittest.TestCase):
 
     def test_the_ui_talks_to_the_management_port_over_control_net(self):
         self.assertEqual(_networks_of("control-plane-ui"),
-                         {"control-net", "control-ui-net"})
+                         {"control-net", "control-ui-net", "tasks-operator-net"})
         url = _environment_of("control-plane-ui")["CONTROL_BACKEND_URL"]
         self.assertTrue(url.endswith(f":{MANAGE_PORT}"), url)
 
@@ -505,6 +505,13 @@ class ControlPlaneUiBindTests(unittest.TestCase):
                          "ipv4_address")
         self.assertIsNotNone(pinned, "the UI's control-ui-net leg is not pinned")
         self.assertEqual(_environment_of("control-plane-ui")["CONTROL_UI_BIND"], pinned)
+
+    def test_nothing_else_joins_control_ui_net(self):
+        # OnlyFrom admits this whole network, so a member reaches the page and the
+        # relay, approvals included. The UI alone, as DESIGN.md's Networks says.
+        members = {svc for svc in _service_names()
+                   if "control-ui-net" in _raw_networks(svc)}
+        self.assertEqual(members, {"control-plane-ui"})
 
     def test_the_app_reads_the_variables_compose_sets(self):
         # A renamed variable would leave the bind empty, and check_bind refuses that,
@@ -1334,14 +1341,29 @@ class TaskRegistryPlacementTests(unittest.TestCase):
         self.assertEqual(_networks_of("tasks"), {"mcp-net", "tasks-operator-net"})
 
     def test_nothing_else_joins_the_operator_network(self):
-        # Being on it is the permission to write as the operator. The UI joins it when
-        # it gains the registry's view, and serves nothing there: the registry parses
-        # agent text, and a compromised one must not find the UI's relay, and the
-        # management API behind it. Anything else is an agent, a server or the gateway
-        # acting as the operator.
+        # Being on it is the permission to write as the operator. The UI is on it for
+        # the registry's view, and serves nothing there (ControlPlaneUiBindTests): the
+        # registry parses agent text, and a compromised one must not find the UI's
+        # relay, and the management API behind it. Anything else is an agent, a server
+        # or the gateway acting as the operator.
         members = {svc for svc in _service_names()
                    if "tasks-operator-net" in _raw_networks(svc)}
-        self.assertEqual(members, {"tasks"})
+        self.assertEqual(members, {"tasks", "control-plane-ui"})
+
+    def test_the_ui_dials_the_operator_listener_where_it_binds(self):
+        # By address: the UI's resolver would ask the host's DNS for a stopped
+        # registry's name. The port is the listener's, and the UI's own address on the
+        # network is one the listener's peer check admits.
+        env = _environment_of("tasks")
+        url = _environment_of("control-plane-ui")["CONTROL_UI_TASKS_URL"]
+        self.assertEqual(url, f"http://{env['TASKS_OPERATOR_BIND']}:"
+                              f"{env['TASKS_OPERATOR_PORT'].strip(chr(34))}")
+        self.assertEqual(_ui_default("CONTROL_UI_TASKS_URL"), url)
+        mine = _scalar(_block(_service("control-plane-ui"), "tasks-operator-net", 6),
+                       "ipv4_address")
+        self.assertIn(ipaddress.ip_address(mine),
+                      ipaddress.ip_network(_registry_default("serve.py",
+                                                             "TASKS_OPERATOR_NET")))
 
     def test_the_operator_network_is_internal_and_apart(self):
         body = _block(_block(COMPOSE, "networks", 0), "tasks-operator-net", 2)

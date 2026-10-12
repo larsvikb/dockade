@@ -88,8 +88,8 @@ Anything that **crosses a boundary the design claims to hold**:
   operator may — changes an approved spec, ends another session's claim, or hides,
   unhides or rewrites a note.
 - **A control-plane-ui relay bypass** — reaching `POST /authorize` or any
-  non-allowlisted backend path through the frontend, or overriding the pinned
-  upstream host.
+  non-allowlisted backend path through the frontend, reaching a task-registry path the
+  Tasks tab does not call, or overriding either pinned upstream.
 - **A browser-facing vector that survives the current guards** — a DNS-rebinding,
   CSRF or clickjacking path that still works against the Host allowlist, the
   cross-origin refusal, the embedding refusal and the CSP.

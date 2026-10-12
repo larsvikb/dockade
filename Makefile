@@ -183,6 +183,7 @@ REFFILES := $(SCRIPTS) \
             control-plane-ui/provenance.js \
             control-plane-ui/saturation.js \
             control-plane-ui/status.js \
+            control-plane-ui/tasks.js \
             control-plane-ui/time.js \
             task-registry/serve.py \
             task-registry/taskdb.py \

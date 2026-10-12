@@ -4436,16 +4436,21 @@ class InlineScriptTests(unittest.TestCase):
         has its own test below."""
         js = "\n".join(_module_texts().values())
         # Served by this container rather than relayed (see control-plane-ui/app.py).
-        local = {"/", "/healthz"} | {f"/{name}" for name in ui.UI_MODULES}
+        local = ({"/", "/healthz", "/tasks/running"}
+                 | {f"/{name}" for name in ui.UI_MODULES})
         calls = _requested_paths(js)
         self.assertGreater(len(calls), 3, "no fetch/EventSource calls found — did the "
                                           "page's I/O move somewhere this cannot see?")
         for variants in calls:
             self.assertTrue(
-                any(p in local or ui._relay_allowed("GET", p)
-                    or ui._relay_allowed("POST", p) for p in variants),
+                any(p in local or any(allowed(method, p)
+                                      for allowed in (ui._relay_allowed,
+                                                      ui._tasks_relay_allowed)
+                                      for method in ("GET", "POST"))
+                    for p in variants),
                 f"the page calls {variants[0]}, which control-plane-ui neither serves "
-                f"nor relays — add it to _RELAY_ROUTES or it will 403 in the browser")
+                f"nor relays — add it to _RELAY_ROUTES (or _TASKS_RELAY_ROUTES) or it "
+                f"will 403 in the browser")
 
     def test_every_relayed_route_is_actually_called(self):
         """The converse, and the one that keeps a default-deny allowlist worth reading.
@@ -4462,7 +4467,7 @@ class InlineScriptTests(unittest.TestCase):
         calls = [p for variants in _requested_paths(js) for p in variants]
         self.assertTrue(calls, "no fetch/EventSource calls found")
         unused = [f"{method} {pattern.pattern}"
-                  for method, pattern in ui._RELAY_ROUTES
+                  for method, pattern in (*ui._RELAY_ROUTES, *ui._TASKS_RELAY_ROUTES)
                   if not any(pattern.match(c) for c in calls)]
         self.assertEqual(
             unused, [],
@@ -4570,8 +4575,9 @@ class InlineScriptTests(unittest.TestCase):
 #: provides, so using a further browser global is an edit here, reviewed as one.
 _BROWSER_GLOBALS = frozenset({
     "Array", "Boolean", "Date", "Error", "EventSource", "JSON", "Map", "Math", "NaN",
-    "Notification", "Number", "Object", "Set", "String", "clearTimeout", "document",
-    "encodeURIComponent", "fetch", "location", "setInterval", "setTimeout", "window",
+    "Notification", "Number", "Object", "Set", "String", "URLSearchParams",
+    "clearTimeout", "document", "encodeURIComponent", "fetch", "location",
+    "setInterval", "setTimeout", "window",
 })
 
 # The bytecodes V8 emits for a name it resolved to no local, closure slot or import.
@@ -5226,3 +5232,295 @@ class PayloadColourTests(unittest.TestCase):
             with self.subTest(kind):
                 self.assertRegex(html, rf"\.j-{kind}\b[^{{]*\{{[^}}]*color:")
 
+
+
+_TASKS_PROBE = r"""
+import { pathToFileURL } from "node:url";
+const t = await import(pathToFileURL(`${process.env.DOCKADE_UI_DIR}/tasks.js`).href);
+const ids = n => Array.from({length: n}, (_, i) => ({id: 100 - i}));
+console.log(JSON.stringify({
+  states: t.TASK_STATES, every: t.EVERY_STATE, not_running: t.NOT_RUNNING_STATUS,
+  not_running_text: t.NOT_RUNNING_TEXT, poll_ms: t.TASKS_POLL_MS, page_max: t.PAGE_MAX,
+  spell: {
+    plain: t.spellHidden("fix the relay\n\tthen the tests"),
+    bidi: t.spellHidden("approve\u202e;tpircs"),
+    zero_width: t.spellHidden("a\u200bb\u2066c\u2069"),
+    controls: t.spellHidden("a\rb\u0007c\u2028d"),
+    astral: t.spellHidden("tag\u{E0041}"),
+    separators: t.spellHidden("a\u2029b"),
+    ignorable: t.spellHidden("ok\u2705\ufe0f a\u034fb\u3164c\u{E0101}d"),
+    visible: t.spellHidden("em \u2014 dash, caf\u00e9, \u0430"),
+    missing: t.spellHidden(undefined),
+  },
+  note: [t.hiddenNote(0), t.hiddenNote(1), t.hiddenNote(3)],
+  older: {
+    newest_first: t.olderCursor(ids(50), "newest-first", 0, 120),
+    oldest_first: t.olderCursor(ids(50), "oldest-first", 0, 120),
+    last_page: t.olderCursor(ids(20), "newest-first", 100, 120),
+    exactly_one_page: t.olderCursor(ids(50), "newest-first", 0, 50),
+    short_page_stale_total: t.olderCursor(ids(30), "newest-first", 0, 120),
+    second_of_three: t.olderCursor(ids(50), "newest-first", 50, 120),
+    empty: t.olderCursor([], "newest-first", 0, 3),
+    not_a_list: t.olderCursor(null, "newest-first", 0, 3),
+    bad_id: t.olderCursor([{id: "7"}], "newest-first", 0, 3),
+  },
+  children: {
+    some: t.childrenLeft([{state: "closed"}, {state: "landing"}, {state: "open"}]),
+    done: t.childrenLeft([{state: "closed"}]),
+    none: t.childrenLeft([]),
+    missing: t.childrenLeft(undefined),
+  },
+  claim: {
+    full: t.claimText({holder: "claude-1234", branch: "fix-relay",
+                       expires_at: 1789466400}),
+    hostile: t.claimText({holder: "claude-x\u202e", branch: "b\u200b"}),
+    none: t.claimText(null),
+  },
+  badge: [0, 1, 12, null, undefined, "3", 2.5, -1].map(t.flaggedBadge),
+  status: {
+    empty: t.tasksStatus(0, false, true, false),
+    search_empty: t.tasksStatus(0, false, true, true),
+    search_failed: t.tasksStatus(0, true, true, true),
+    stale: t.tasksStatus(4, true, true, false),
+    cold: t.tasksStatus(0, true, false, false),
+    quiet: t.tasksStatus(4, false, true, false),
+    flagged_empty: t.flaggedStatus(0, false, true),
+    flagged_stale: t.flaggedStatus(2, true, true),
+  },
+}));
+"""
+
+
+@unittest.skipIf(not _NODE and not _STRICT,
+                 "node is not installed — skipping app.js unit tests")
+class TaskViewTests(unittest.TestCase):
+    """The Tasks tab's pure half (``tasks.js``): agent text with its hidden characters
+    spelled out, the two paging orders, and what each list says about itself."""
+
+    probe: dict
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        proc = subprocess.run(  # noqa: S603 (absolute path, fixed args, as _probe)
+            [_NODE, "--input-type=module", "-e", _TASKS_PROBE],
+            env={**os.environ, "DOCKADE_UI_DIR": str(UI_DIR), "TZ": "Europe/Stockholm"},
+            capture_output=True, text=True, timeout=60, check=False)
+        if proc.returncode != 0:
+            raise AssertionError("importing tasks.js under node failed:\n" + proc.stderr)
+        cls.probe = json.loads(proc.stdout)
+
+    def test_the_states_are_the_registrys(self):
+        source = (ROOT / "task-registry" / "tasks.py").read_text()
+        states = re.search(r"^STATES = \(([^)]*)\)", source, re.M).group(1)
+        self.assertEqual(self.probe["states"], re.findall(r'"([^"]+)"', states))
+        api = (ROOT / "task-registry" / "operator_api.py").read_text()
+        self.assertIn(f'EVERY_STATE = "{self.probe["every"]}"', api)
+
+    def test_the_not_running_status_is_the_one_the_relay_sends(self):
+        self.assertEqual(self.probe["not_running"], 502)
+        src = (UI_DIR / "app.py").read_text()
+        body = re.search(r"def _registry_unreachable.*?(?=\ndef )", src, re.S).group(0)
+        self.assertIn("status_code=502", body)
+        self.assertIn("make tasks-up", self.probe["not_running_text"])
+
+    def test_prose_keeps_its_line_breaks_and_tabs(self):
+        self.assertEqual(self.probe["spell"]["plain"],
+                         {"text": "fix the relay\n\tthen the tests", "hidden": 0})
+
+    def test_a_direction_override_is_spelled_out_where_it_sits(self):
+        self.assertEqual(self.probe["spell"]["bidi"],
+                         {"text": "approve\\u202e;tpircs", "hidden": 1})
+
+    def test_every_invisible_kind_is_spelled_and_counted(self):
+        spell = self.probe["spell"]
+        self.assertEqual(spell["zero_width"],
+                         {"text": "a\\u200bb\\u2066c\\u2069", "hidden": 3})
+        self.assertEqual(spell["controls"],
+                         {"text": "a\\u000db\\u0007c\\u2028d", "hidden": 3})
+        # Outside the BMP, as the surrogate pair JSON would write.
+        self.assertEqual(spell["astral"], {"text": "tag\\udb40\\udc41", "hidden": 1})
+        self.assertEqual(spell["separators"], {"text": "a\\u2029b", "hidden": 1})
+
+    def test_default_ignorable_characters_are_spelled_too(self):
+        # A variation selector can carry a payload no reader sees; an emoji's U+FE0F is
+        # spelled with them rather than guessed harmless.
+        self.assertEqual(self.probe["spell"]["ignorable"],
+                         {"text": "ok\u2705\\ufe0f a\\u034fb\\u3164c\\udb40\\udd01d",
+                          "hidden": 4})
+
+    def test_visible_non_ascii_is_left_as_written(self):
+        # Prose is full of dashes and accents; a homoglyph is visible, and this view
+        # does not vouch for one (the pin view does, where a value must match exactly).
+        self.assertEqual(self.probe["spell"]["visible"],
+                         {"text": "em \u2014 dash, caf\u00e9, \u0430", "hidden": 0})
+        self.assertEqual(self.probe["spell"]["missing"], {"text": "", "hidden": 0})
+
+    def test_the_note_counts_what_was_spelled(self):
+        self.assertEqual(self.probe["note"][0], "")
+        self.assertIn("1 invisible or direction-changing character spelled",
+                      self.probe["note"][1])
+        self.assertIn("3 invisible or direction-changing characters", self.probe["note"][2])
+
+    def test_each_paging_order_takes_its_cursor_from_its_own_end(self):
+        older = self.probe["older"]
+        self.assertEqual(older["newest_first"], 51)   # the last of 100..51
+        self.assertEqual(older["oldest_first"], 100)  # the first
+        self.assertEqual(older["second_of_three"], 51)
+
+    def test_nothing_older_is_offered_past_the_total(self):
+        older = self.probe["older"]
+        # A page short of full is the last even when the total, which counts what
+        # arrived since, says otherwise.
+        for key in ("last_page", "exactly_one_page", "short_page_stale_total", "empty",
+                    "not_a_list", "bad_id"):
+            with self.subTest(case=key):
+                self.assertIsNone(older[key])
+
+    def test_a_parent_counts_every_child_not_closed(self):
+        children = self.probe["children"]
+        self.assertEqual(children["some"], {"left": 2, "total": 3,
+                                            "text": "2 of 3 not closed"})
+        self.assertEqual(children["done"]["left"], 0)
+        self.assertEqual(children["none"], {"left": 0, "total": 0, "text": ""})
+        self.assertEqual(children["missing"], children["none"])
+
+    def test_a_claim_names_its_holder_branch_and_end(self):
+        claim = self.probe["claim"]
+        self.assertTrue(claim["full"].startswith("held by claude-1234 on fix-relay, until "))
+        self.assertRegex(claim["full"], r"until \d{4}-\d\d-\d\d \d\d:\d\d:\d\d$")
+        self.assertEqual(claim["hostile"], "held by claude-x\\u202e on b\\u200b")
+        self.assertEqual(claim["none"], "")
+
+    def test_the_badge_is_a_count_or_nothing(self):
+        self.assertEqual(self.probe["badge"], ["", "1", "12", "", "", "3", "", ""])
+
+    def test_each_list_says_what_its_empty_and_its_stale_mean(self):
+        status = self.probe["status"]
+        self.assertEqual(status["empty"]["text"], "No tasks here.")
+        self.assertEqual(status["search_empty"]["text"], "No task matches that search.")
+        # A failed search is a failure, not an empty answer.
+        self.assertEqual(status["search_failed"]["level"], "warn")
+        self.assertIn("Could not", status["search_failed"]["text"])
+        self.assertIn("may be out of date", status["stale"]["text"])
+        self.assertEqual(status["cold"]["text"], "Could not load the tasks.")
+        self.assertFalse(status["quiet"]["show"])
+        self.assertEqual(status["flagged_empty"]["text"], "No note waits on you.")
+        self.assertEqual(status["flagged_stale"]["level"], "warn")
+
+    def test_a_page_is_the_registrys_page(self):
+        reads = (ROOT / "task-registry" / "reads.py").read_text()
+        moves = (ROOT / "task-registry" / "operator_moves.py").read_text()
+        self.assertIn(f"LIST_MAX = {self.probe['page_max']}\n", reads)
+        self.assertIn(f"PAGE = {self.probe['page_max']}\n", moves)
+
+    def test_the_poll_is_slower_than_the_policy_views(self):
+        self.assertGreater(self.probe["poll_ms"], 4000)
+
+
+class TaskPollingSourceTests(unittest.TestCase):
+    """The registry is optional: the page asks this container whether it answers, and
+    nothing calls it, or polls it, unless it did. Read from the source, as the other
+    poll-gating guards are, since only a browser runs ``start()``."""
+
+    APP = APP_JS.read_text()
+    TASKS = (UI_DIR / "tasks.js").read_text()
+
+    def _function(self, src: str, name: str) -> str:
+        return re.search(rf"^(?:export )?(?:async )?function {name}\(.*?^\}}", src,
+                         re.M | re.S).group(0)
+
+    def test_every_registry_read_returns_early_unless_it_answers(self):
+        for name in ("refreshTasks", "refreshFlagged"):
+            with self.subTest(function=name):
+                body = self._function(self.TASKS, name)
+                first = body.split("\n")[1].strip()
+                self.assertTrue(first.startswith("if (!registryIsRunning()"), first)
+
+    def test_the_poll_is_gated_on_the_registry_answering(self):
+        polls = re.findall(r"setInterval\(\(\) => \{\n([^\n]*)\n(?:[^\n]*\n){0,3}?"
+                           r"  \}, TASKS_POLL_MS\)", self.APP)
+        self.assertEqual(len(polls), 1, "one interval paced by TASKS_POLL_MS in app.js")
+        self.assertIn("!registryIsRunning()", polls[0])
+
+    def test_startup_asks_this_container_and_not_the_registry(self):
+        start = self._function(self.APP, "start")
+        wiring = start[start.index("showView(current);"):]
+        self.assertIn("probeRegistry();", wiring)
+        probe = self._function(self.TASKS, "probe")
+        self.assertIn('fetch("/tasks/running")', probe)
+        # Running only on the answer's word, not on the UI having answered at all.
+        self.assertIn(".running === true", probe)
+        # The registry's own reads only after it answered.
+        self.assertLess(probe.index('fetch("/tasks/running")'), probe.index("if (up)"))
+        self.assertLess(probe.index("if (up)"), probe.index("refreshTasks()"))
+
+    def test_one_ask_at_a_time(self):
+        # Loaded at #tasks, the view opening and start-up would each ask.
+        body = self._function(self.TASKS, "probeRegistry")
+        self.assertIn("if (!probing) probing = probe()", body)
+        self.assertIn("return probing;", body)
+
+    def test_a_flagged_read_that_finds_it_gone_draws_nothing(self):
+        # Checked again after the fetch: a 502 clears the badge, and drawing the old
+        # page would set it back.
+        body = self._function(self.TASKS, "refreshFlagged")
+        after = body[body.index("registryJson(await fetch"):]
+        self.assertIn("if (!registryIsRunning()) return;", after)
+
+    def test_opening_the_tab_asks_again_when_it_was_not_running(self):
+        show = re.search(r"function showView\(name\) \{.*?\n  \}", self.APP, re.S).group(0)
+        self.assertIn('if (current === "tasks")', show)
+        self.assertIn("else probeRegistry();", show)
+
+    def test_a_502_stops_the_polls(self):
+        body = self._function(self.TASKS, "registryJson")
+        self.assertIn("res.status === NOT_RUNNING_STATUS", body)
+        self.assertIn("setRunning(false)", body)
+
+    def test_the_tab_badge_is_never_hot(self):
+        # A backlog nobody waits on: quiet, unlike the approvals badge.
+        self.assertNotRegex(self.TASKS, r"badge.*hot|classList.*hot")
+        html = INDEX_HTML.read_text()
+        self.assertIn('<span class="badge" id="badge-tasks"></span>', html)
+
+
+class TaskRenderingSourceTests(unittest.TestCase):
+    """How the Tasks tab draws agent text, read from the source as the pin panel's is:
+    a browser is the only thing that runs it. Every field an agent wrote reaches the
+    page through ``spellHidden``, directly or through a helper that calls it, and as
+    text."""
+
+    TASKS = (UI_DIR / "tasks.js").read_text()
+    # A field an agent wrote, read off one of the registry's records.
+    FIELD = re.compile(r"\b(?:t|n|h|task|claim)(?:\.claim)?\."
+                       r"(?:title|body|text|author|holder|branch|progress|footprint)\b")
+    SPELT = ("spellHidden(", "proseBlock(", "textCell(", "authorCell(", "claimText(")
+
+    def test_nothing_is_parsed_as_markup(self):
+        self.assertNotRegex(self.TASKS, r"innerHTML|outerHTML|insertAdjacentHTML|"
+                                        r"document\.write|DOMParser")
+
+    def test_every_agent_field_goes_through_the_spelling(self):
+        code = _code(self.TASKS)
+        lines = [ln for ln in code.splitlines() if self.FIELD.search(ln)]
+        self.assertGreater(len(lines), 10, "the field pattern found too little")
+        for ln in lines:
+            if re.match(r"\s*if \(", ln):
+                continue        # a condition reads the field; it draws nothing
+            with self.subTest(line=ln.strip()):
+                self.assertTrue(any(s in ln for s in self.SPELT), ln)
+
+    def test_the_helpers_spell_and_set_text(self):
+        for name in ("proseBlock", "authorCell"):
+            body = re.search(rf"^function {name}\(.*?^\}}", self.TASKS,
+                             re.M | re.S).group(0)
+            with self.subTest(helper=name):
+                self.assertIn("spellHidden(", body)
+        prose = re.search(r"^function proseBlock\(.*?^\}", self.TASKS, re.M | re.S)
+        self.assertIn("pre.textContent = shown.text", prose.group(0))
+        text = re.search(r"^function textCell\(.*?^\}", self.TASKS, re.M | re.S)
+        self.assertIn("proseBlock(text)", text.group(0))
+
+    def test_a_history_value_is_spelled_whatever_its_type(self):
+        self.assertIn('typeof value === "string" ? proseBlock(value)', self.TASKS)
+        self.assertIn("spellHidden(JSON.stringify(value)).text", self.TASKS)

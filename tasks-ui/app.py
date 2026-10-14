@@ -76,6 +76,8 @@ _RELAY_ROUTES = (
     # which no agent surface offers (task-registry/DESIGN.md, "Notes").
     ("GET", re.compile(r"^/api/tasks/[0-9]{1,19}/notes$")),
     ("GET", re.compile(r"^/api/tasks/[0-9]{1,19}/history$")),
+    # Every plan a task had, superseded ones marked: what a plan replaced.
+    ("GET", re.compile(r"^/api/tasks/[0-9]{1,19}/plans$")),
     ("GET", re.compile(r"^/api/notes/flagged$")),
     ("GET", re.compile(r"^/api/search$")),
 )

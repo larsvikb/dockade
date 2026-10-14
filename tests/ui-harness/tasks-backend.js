@@ -30,6 +30,19 @@ const TASKS = [
   { id: 1, title: "Plain one", state: "open", notes_total: 0 },
 ];
 
+const PLAN = {
+  id: 2, task: 3, task_revision: 3, author: "claude-3f2a9c1e", at: NOW - 7200,
+  approach: `Relay first, then the page.\nKeep ${RLO}it small.`,
+  footprint: ["tasks-ui/app.py", `tasks-ui/tasks${ZWSP}.js`],
+  tests: "The relay table; the page under node.", out_of_scope: "None.",
+  risks: "A route the page calls and the relay refuses.", review_rounds: 2,
+  review_verdict: "Passes.", superseded_at: null,
+};
+const OLDER_PLAN = {
+  ...PLAN, id: 1, task_revision: 1, at: NOW - 80000, review_rounds: 1,
+  approach: "Everything in one change.", superseded_at: NOW - 76000,
+};
+
 const TASK = {
   ...TASKS[0], repo: "dockade", revision: 4, created_at: NOW - 86400,
   updated_at: NOW - 600,
@@ -38,7 +51,19 @@ const TASK = {
   children: [{ id: 4, title: "Child", state: "closed" },
              { id: 5, title: "Other child", state: "landing" }],
   blockers: [{ id: 2, title: "Back up the store", state: "open" }],
+  plan: PLAN,
 };
+
+// Task 1 went back to proposed: its plan is the superseded one. Task 2 was opened with
+// no plan.
+const SENT_BACK = { ...TASKS[2], state: "proposed", ready: false, repo: "dockade",
+                    revision: 6, created_at: NOW - 90000,
+                    updated_at: NOW - 76000, body: "Plain.", children: [], blockers: [],
+                    plan: OLDER_PLAN };
+const UNPLANNED = { ...TASKS[1], repo: "dockade", revision: 1, created_at: NOW - 5000,
+                    updated_at: NOW - 5000, body: "Back it up.", children: [],
+                    blockers: [], plan: null };
+const NO_NOTES = { notes: [], total: 0 };
 
 const NOTES = {
   notes: [
@@ -97,5 +122,11 @@ export function respond(method, path, body, params) {
   if (path === "/api/tasks/3") return { status: 200, json: TASK };
   if (path === "/api/tasks/3/notes") return { status: 200, json: NOTES };
   if (path === "/api/tasks/3/history") return { status: 200, json: HISTORY };
+  if (path === "/api/tasks/3/plans") return { status: 200, json: [PLAN, OLDER_PLAN] };
+  if (path === "/api/tasks/1") return { status: 200, json: SENT_BACK };
+  if (path === "/api/tasks/2") return { status: 200, json: UNPLANNED };
+  if (path === "/api/tasks/1/notes" || path === "/api/tasks/2/notes") {
+    return { status: 200, json: NO_NOTES };
+  }
   return null;
 }

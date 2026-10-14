@@ -43,6 +43,15 @@ what is in it rather than what the browser draws. Between the approval page's tw
 the payload's, which notes non-ASCII, and the pin's, which spells it all
 (`control-plane-ui/DESIGN.md`), for that reason.
 
+**The plan sits under the body, part by part.** Approving a refined task approves its
+body and plan together (`task-registry/DESIGN.md`, "Plans"), so the detail shows both,
+the plan in the order `submit_plan` takes its parts, each as prose spelled like the
+body. A missing or superseded plan is read against the task's state (`planNotice`):
+only a proposed task is refined by an agent, so only there does the page say a plan is
+coming; past it, the operator moved the task on without one. A superseded plan is never
+something to approve, so it carries a warning. Earlier plans load on request, newest
+first, so what a plan replaced can be read beside it.
+
 **Its tests.** `tests/test_tasks_ui.py` holds the server: the relay's table, `/running`,
 the files it serves, and that it starts behind the shared guards under its own name,
 allowlist, address and network. `tests/test_tasks_ui_js.py` holds the page: every

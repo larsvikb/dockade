@@ -14,7 +14,7 @@
  * reorders the text around it is spelled out where it sits (`spellHidden`).
  *
  * No DOM at import, so the unit tests import this file under node
- * (tests/test_control_plane_ui_js.py).
+ * (tests/test_tasks_ui_js.py).
  */
 import { escapePayload } from "./escape.js";
 import { pollStatus, renderListStatus } from "./list-status.js";
@@ -91,6 +91,62 @@ export function claimText(claim) {
   const until = fmtStamp(claim.expires_at);
   if (until) text += `, until ${until}`;
   return text;
+}
+
+// A plan's parts, in the order `submit_plan` asks for them (task-registry/agent_tools.py),
+// each with its label: what the operator reads beside the body before approving the
+// two. The footprint one path to a line. The text is the agent's, spelled where it is
+// drawn.
+export const PLAN_PARTS = [["approach", "approach"], ["footprint", "footprint"],
+                           ["tests", "tests"], ["out_of_scope", "out of scope"],
+                           ["risks", "risks"], ["review_verdict", "review verdict"]];
+export function planParts(plan) {
+  if (!plan || typeof plan !== "object") return [];
+  return PLAN_PARTS.map(([key, label]) => {
+    const value = plan[key];
+    const text = Array.isArray(value) ? value.join("\n") : String(value ?? "");
+    return { label, text };
+  });
+}
+
+// What a plan says about itself: which one, whose, when, against which revision of the
+// task, after how many reviews, and whether it was superseded.
+export function planHeading(plan) {
+  if (!plan || typeof plan !== "object") return "";
+  const rounds = Number(plan.review_rounds);
+  const parts = [`plan ${plan.id}`, `by ${spellHidden(plan.author).text}`,
+                 fmtStamp(plan.at), `at revision ${plan.task_revision}`,
+                 Number.isInteger(rounds)
+                   ? `${rounds} review round${rounds === 1 ? "" : "s"}` : ""];
+  if (plan.superseded_at) parts.push(`superseded ${fmtStamp(plan.superseded_at)}`);
+  return parts.filter(Boolean).join(" · ");
+}
+
+// What the task's own plan, or its lack of one, means in the task's state: a line and
+// whether it warns, or null. Only a proposed task is refined by an agent
+// (`submit_plan` refuses any other), so only there is a missing plan the ordinary
+// case; the operator can move a task on with no plan, or past a superseded one, and
+// then nobody will hand one in.
+export function planNotice(plan, state) {
+  const proposed = state === "proposed";
+  if (!plan) {
+    return proposed
+      ? { text: "No plan yet: an agent that claims the proposal hands one in.",
+          warn: false }
+      : { text: "No plan: this task was moved on without one.", warn: true };
+  }
+  if (!plan.superseded_at) return null;
+  return { text: proposed
+             ? "Superseded: no plan is current until an agent refines the task again."
+             : "Superseded: no plan is current.",
+           warn: true };
+}
+
+// Every plan but the one shown above, in the order the registry sent them (newest
+// first). Ids compared as numbers: the shown one comes back from a data attribute.
+export function earlierPlans(plans, shownId) {
+  const shown = Number(shownId);
+  return (Array.isArray(plans) ? plans : []).filter(p => p && Number(p.id) !== shown);
 }
 
 // The quiet count: notes waiting on the operator, or nothing. Never "0", which would
@@ -399,6 +455,55 @@ function line(label, value) {
   return div;
 }
 
+// One plan, its parts as the agent wrote them, and under its heading what it means for
+// a task in `state` (`planNotice`). Among the earlier plans `state` is null: a newer
+// plan is the task's, and the heading's "superseded" is enough.
+function planBlock(plan, state) {
+  const block = document.createElement("div");
+  block.className = "plan";
+  const head = document.createElement("div");
+  head.className = "qual";
+  head.textContent = planHeading(plan);
+  block.appendChild(head);
+  const notice = state === null ? null : planNotice(plan, state);
+  if (notice) block.appendChild(noticeLine(notice));
+  for (const part of planParts(plan)) {
+    block.appendChild(line(part.label, proseBlock(part.text)));
+  }
+  return block;
+}
+
+// Every plan the task had but the one shown, newest first, under the button that
+// asked: what a plan replaced, to read beside it.
+async function showPlans(btn) {
+  const id = openTask;
+  let plans;
+  try {
+    plans = await registryJson(await fetch(`/api/tasks/${encodeURIComponent(id)}/plans`));
+  } catch (e) {
+    btn.textContent = "could not load the earlier plans";
+    return;
+  }
+  if (openTask !== id) return;
+  const holder = document.createElement("div");
+  const earlier = earlierPlans(plans, btn.dataset.shown);
+  if (!earlier.length) {
+    const none = document.createElement("div");
+    none.className = "empty";
+    none.textContent = "No earlier plan.";
+    holder.appendChild(none);
+  }
+  for (const plan of earlier) holder.appendChild(planBlock(plan, null));
+  btn.replaceWith(holder);
+}
+
+function noticeLine(notice) {
+  const div = document.createElement("div");
+  div.className = notice.warn ? "empty warn" : "empty";
+  div.textContent = notice.text;
+  return div;
+}
+
 function brief(t) {
   return t ? `#${t.id} ${spellHidden(t.title).text} (${t.state})` : "";
 }
@@ -451,7 +556,7 @@ async function showTask(id) {
     taskDetail.appendChild(line("claim", claimText(task.claim)));
     if (Array.isArray(task.claim.footprint)) {
       const paths = task.claim.footprint.map(p => spellHidden(p).text).join(", ");
-      taskDetail.appendChild(line("footprint", paths));
+      taskDetail.appendChild(line("claim's footprint", paths));
     }
     if (task.claim.progress) {
       taskDetail.appendChild(line("progress", proseBlock(task.claim.progress)));
@@ -460,6 +565,19 @@ async function showTask(id) {
   const body = proseBlock(task.body);
   body.className = "task-body";
   taskDetail.appendChild(body);
+  // The plan beside the body: approving a refined task approves the two together
+  // (task-registry/DESIGN.md, "Plans").
+  const planHead = document.createElement("h3");
+  planHead.textContent = "Plan";
+  taskDetail.appendChild(planHead);
+  if (task.plan) {
+    taskDetail.appendChild(planBlock(task.plan, task.state));
+    const more = pagerButton("earlier plans", "plans", "");
+    more.dataset.shown = String(task.plan.id);
+    taskDetail.appendChild(more);
+  } else {
+    taskDetail.appendChild(noticeLine(planNotice(null, task.state)));
+  }
   const notesHead = document.createElement("h3");
   notesHead.textContent = `Notes · ${notes.total}`;
   taskDetail.appendChild(notesHead);
@@ -625,6 +743,6 @@ export function mountTasks() {
       return;
     }
     const page = ev.target.closest("button[data-page]");
-    if (page) showPage(page);
+    if (page) (page.dataset.page === "plans" ? showPlans : showPage)(page);
   });
 }

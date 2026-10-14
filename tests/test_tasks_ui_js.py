@@ -78,6 +78,35 @@ console.log(JSON.stringify({
   },
   badge: [0, 1, 12, null, undefined, "3", 2.5, -1].map(t.flaggedBadge),
   title: [0, 1, 12].map(t.pageTitle),
+  plan: {
+    keys: t.PLAN_PARTS.map(([key]) => key),
+    parts: t.planParts({id: 7, approach: "Rotate.\nIn place.", footprint: ["a.py", "b/"],
+                        tests: "Old keys read.", out_of_scope: "None.", risks: "Races.",
+                        review_verdict: "Passes.", extra: "not a part"}),
+    missing_parts: t.planParts({id: 7}),
+    none: t.planParts(null),
+    heading: t.planHeading({id: 7, author: "claude-x\u202e", at: 1789466400,
+                            task_revision: 4, review_rounds: 2}),
+    one_round: t.planHeading({id: 8, author: "a", at: 1789466400, task_revision: 1,
+                              review_rounds: 1, superseded_at: 1789470000}),
+    no_heading: t.planHeading(undefined),
+    no_rounds: t.planHeading({id: 9, author: "a", at: 1789466400, task_revision: 1}),
+    notice: {
+      none_proposed: t.planNotice(null, "proposed"),
+      none_open: t.planNotice(null, "open"),
+      none_closed: t.planNotice(null, "closed"),
+      current: t.planNotice({id: 1, superseded_at: null}, "refined"),
+      superseded_proposed: t.planNotice({id: 1, superseded_at: 1789466400}, "proposed"),
+      superseded_open: t.planNotice({id: 1, superseded_at: 1789466400}, "open"),
+    },
+    earlier: {
+      by_number: t.earlierPlans([{id: 3}, {id: 2}, {id: 1}], 2).map(p => p.id),
+      by_string: t.earlierPlans([{id: 3}, {id: 2}, {id: 1}], "2").map(p => p.id),
+      none_shown: t.earlierPlans([{id: 3}], "").map(p => p.id),
+      not_a_list: t.earlierPlans(null, 2),
+      holes: t.earlierPlans([null, {id: 1}], 1),
+    },
+  },
   status: {
     empty: t.tasksStatus(0, false, true, false),
     search_empty: t.tasksStatus(0, false, true, true),
@@ -193,6 +222,56 @@ class TaskViewTests(unittest.TestCase):
         self.assertEqual(claim["hostile"], "held by claude-x\\u202e on b\\u200b")
         self.assertEqual(claim["none"], "")
 
+    def test_a_plans_parts_come_in_the_tools_order_labelled(self):
+        plan = self.probe["plan"]
+        self.assertEqual([p["label"] for p in plan["parts"]],
+                         ["approach", "footprint", "tests", "out of scope", "risks",
+                          "review verdict"])
+        self.assertEqual(plan["parts"][0]["text"], "Rotate.\nIn place.")
+        self.assertEqual(plan["parts"][1]["text"], "a.py\nb/")
+        self.assertEqual([p["text"] for p in plan["missing_parts"]], [""] * 6)
+        self.assertEqual(plan["none"], [])
+        # The tool's parts, in its order, but the review rounds, which the heading
+        # carries: a part the registry adds is a part this page must show.
+        tools = (ROOT / "task-registry" / "agent_tools.py").read_text()
+        block = tools[tools.index('"submit_plan": Tool('):tools.index('"submit_work": Tool(')]
+        taken = [name for name in re.findall(r'Param\("(\w+)"', block)
+                 if name != "review_rounds"]
+        self.assertEqual(plan["keys"], taken)
+
+    def test_a_plans_heading_says_whose_when_and_whether_superseded(self):
+        plan = self.probe["plan"]
+        self.assertRegex(plan["heading"], r"^plan 7 · by claude-x\\u202e · "
+                                          r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d · at revision 4 · "
+                                          r"2 review rounds$")
+        self.assertRegex(plan["one_round"], r"· 1 review round · superseded \d{4}-")
+        self.assertEqual(plan["no_heading"], "")
+        self.assertNotIn("NaN", plan["no_rounds"])
+        self.assertTrue(plan["no_rounds"].endswith("at revision 1"))
+
+    def test_a_missing_or_superseded_plan_is_read_against_the_tasks_state(self):
+        # Only a proposed task is refined by an agent; past it, nobody will hand a plan
+        # in, so the page must not say one is coming.
+        notice = self.probe["plan"]["notice"]
+        self.assertEqual(notice["none_proposed"]["warn"], False)
+        self.assertIn("an agent that claims the proposal", notice["none_proposed"]["text"])
+        for key in ("none_open", "none_closed"):
+            with self.subTest(case=key):
+                self.assertEqual(notice[key], {
+                    "text": "No plan: this task was moved on without one.", "warn": True})
+        self.assertIsNone(notice["current"])
+        self.assertIn("until an agent refines", notice["superseded_proposed"]["text"])
+        self.assertEqual(notice["superseded_open"],
+                         {"text": "Superseded: no plan is current.", "warn": True})
+
+    def test_the_earlier_plans_leave_out_the_one_shown_whatever_its_ids_type(self):
+        earlier = self.probe["plan"]["earlier"]
+        self.assertEqual(earlier["by_number"], [3, 1])
+        self.assertEqual(earlier["by_string"], [3, 1])
+        self.assertEqual(earlier["none_shown"], [3])
+        self.assertEqual(earlier["not_a_list"], [])
+        self.assertEqual(earlier["holes"], [])
+
     def test_the_count_is_a_number_or_nothing(self):
         self.assertEqual(self.probe["badge"], ["", "1", "12", "", "", "3", "", ""])
 
@@ -304,8 +383,9 @@ class TaskRenderingSourceTests(unittest.TestCase):
 
     TASKS = (TASKS_DIR / "tasks.js").read_text()
     # A field an agent wrote, read off one of the registry's records.
-    FIELD = re.compile(r"\b(?:t|n|h|task|claim)(?:\.claim)?\."
-                       r"(?:title|body|text|author|holder|branch|progress|footprint)\b")
+    FIELD = re.compile(r"\b(?:t|n|h|task|claim|plan|part)(?:\.claim)?\."
+                       r"(?:title|body|text|author|holder|branch|progress|footprint|"
+                       r"approach|tests|out_of_scope|risks|review_verdict)\b")
     SPELT = ("spellHidden(", "proseBlock(", "textCell(", "authorCell(", "claimText(")
 
     def test_nothing_is_parsed_as_markup(self):
@@ -321,6 +401,16 @@ class TaskRenderingSourceTests(unittest.TestCase):
                 continue        # a condition reads the field; it draws nothing
             with self.subTest(line=ln.strip()):
                 self.assertTrue(any(s in ln for s in self.SPELT), ln)
+
+    def test_the_plans_are_drawn_against_what_they_are(self):
+        # The task's own plan is read against its state; an earlier plan, against none,
+        # since a newer one is the task's; the shown one stays out of the earlier list.
+        self.assertIn("planBlock(task.plan, task.state)", self.TASKS)
+        self.assertIn("planBlock(plan, null)", self.TASKS)
+        self.assertIn("planNotice(null, task.state)", self.TASKS)
+        self.assertIn("earlierPlans(plans, btn.dataset.shown)", self.TASKS)
+        self.assertIn("more.dataset.shown = String(task.plan.id);", self.TASKS)
+        self.assertIn('page.dataset.page === "plans" ? showPlans : showPage', self.TASKS)
 
     def test_the_helpers_spell_and_set_text(self):
         for name in ("proseBlock", "authorCell"):

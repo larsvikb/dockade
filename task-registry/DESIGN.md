@@ -1,7 +1,8 @@
 # Task registry — who writes what
 
-A work list that agent sessions and the operator share: an agent proposes and shapes
-tasks, the operator approves them, and each write is recorded with its author. The
+A work list that agent sessions and the operator share: an agent proposes a task and
+refines it into a plan, the operator approves the two together, and each write is
+recorded with its author. The
 store is the Python in this directory (`README.md` → Layout says which module holds
 what), tested by the `tests/test_task_registry_*.py` files.
 
@@ -57,16 +58,19 @@ another's work. Separation that must hold is a second registry with its own stor
 
 | State | Meaning |
 |---|---|
-| `proposed` | Being specified: the operator and an agent shape the body until it is as clear as the implementation needs |
+| `proposed` | Being specified: agents shape the body, and one that claims the task refines it into a plan |
+| `refined` | A plan, reviewed, waits for the operator; frozen to agents |
 | `open` | Approved by the operator; the spec is frozen to agents |
 | `landing` | The work is done and waits for the operator to land it; who pushes may change, the merge is the operator's |
 | `deferred` | Parked: needs a decision, an environment, or the operator |
 | `closed` | Landed or dropped |
 
-**The spec is settled in `proposed` and frozen at `open`.** Any agent may edit a
-proposed task's title, body, severity, kind and blockers. From `open` on, only the
+**The spec is settled in `proposed` and frozen at `refined`.** The spec is the body and
+the plan (see "Plans"). Any agent may edit a proposed task's title, body, severity,
+kind and blockers, but only the holder while it is claimed. From `refined` on, only the
 operator may, so what an implementer reads is what the operator approved. The operator
-moves any task to any state.
+moves any task to any state, but to `refined` only with a current plan: a trivial
+proposal can go straight to `open`, while a task is refined only by a plan.
 
 **One revision covers content, state, and who holds the task.** Every change to them
 bumps it, and every write to a task's spec, state or holder names the revision it read,
@@ -80,6 +84,33 @@ a page that showed a task unclaimed cannot defer it once an agent holds it; an e
 claim bumps it when it is swept, not the moment it expires. A holder's update does not:
 its checkpoints would otherwise make the operator's page stale all day.
 
+## Plans
+
+**The body says what and why; a plan says how.** A proposal is cheap to file and stays
+out of the operator's way; an agent claims it, works out the plan, and hands it in with
+`submit_plan`, which makes the task `refined`. The operator reads the two together and
+approves them by moving the task to `open`.
+
+**A plan's parts are fields, each required and capped** (`plans.TEXTS`): the approach,
+a footprint, the tests, what is out of scope, the risks, and the review it had. The caps
+are a shape as much as storage: a plan past them is over-detailed, or more than one
+task. The footprint is a claim's, but `.` is refused, since saying where is the point of
+a plan; when the work is claimed it is the claim's footprint unless the claim names one.
+The review fields are the agent's word that a fresh-context reviewer read the plan, not
+proof; the operator's approval is the check. Overlaps with other plans are reported, as
+a claim's are, and never refused.
+
+**Every plan is kept; one is current.** `submit_plan` adds a row and nothing changes
+one, so the operator can compare a plan with the one before. A task that enters
+`proposed`, by whoever's move, has its current plan superseded (`tasks.update`, the one
+place a state is written): a claim on a `refined` task, a `send_back`, or the operator
+moving it back. So a plan reaches `open` only as handed in, and an agent changes a
+refined plan only by claiming the task back and handing in another.
+
+**The revision pins the plan.** `submit_plan` bumps it, so a move to `open` naming the
+revision the operator read approves the plan the operator read; there is no plan id to
+name besides.
+
 ## Parent and blockers
 
 The work arrives as an objective, a design, a breakdown and a spec per task, and two
@@ -90,22 +121,24 @@ not landed.
 
 Both stay inside one repo, and neither may loop: a re-parent that would make a task its
 own ancestor is refused, and so is a blocker that already waits on the task. Blockers
-freeze for agents at `open` with the rest of the spec, since the order is part of the
+freeze for agents at `refined` with the rest of the spec, since the order is part of the
 plan the operator approves. Strict for now; loosening a rule later is cheaper than
 tightening one under data that broke it.
 
 ## Claims
 
-**A claim is not a state; it sits on an `open` one.** One agent at a time holds a task,
-with a branch, a footprint and a free-text progress line: how the work goes changes
-too fast for states. The branch is the one the work will land on: the store takes any
-name git would, so telling a placeholder from it is the agent's to know. Claiming a
-`landing` task takes it back to `open` for rework, and releasing it then leaves it
-`open`. A claim ends when its holder submits (`landing`), sends the task back
+**A claim is not a state; it sits on a `proposed` task, to refine it, or an `open`
+one, to do it.** One agent at a time holds a task, with a branch, a footprint and a
+free-text progress line: how the work goes changes too fast for states. The branch is
+the one the work will land on: the store takes any name git would, so telling a
+placeholder from it is the agent's to know. Claiming a task past either state takes it
+back for rework (`claims.CLAIMED_INTO`): `refined` to `proposed`, `landing` to `open`;
+releasing it then leaves it there. A claim ends when its holder hands in
+(`submit_plan` to `refined`, `submit_work` to `landing`), sends an open task back
 (`proposed`, with a note on what is unclear) or releases it; when the operator breaks
-it or moves the task off `open`; or when it expires. No agent can end another's. The
-history row of every ending keeps the claim's branch, so what to land outlives the
-claim.
+it or moves the task to another state; or when it expires. Each hand-in is refused on
+the other kind of claim, naming the right one. No agent can end another's. The history
+row of every ending keeps the claim's branch, so what to land outlives the claim.
 
 **The token makes a claim one deliberate act away from anyone else.** Only `claim`'s
 reply carries it, and the store keeps its hash. The holder's id is shown wherever
@@ -123,8 +156,8 @@ that stopped lets its work go by the next morning. Each `update` renews it, and 
 nothing else given is only a renewal. An expired claim is not held from the moment it
 expires; the next claim or operator move sweeps it, under the registry's own name, and
 bumps the revision as any ending does. A write by its old holder is refused, saying
-who holds the task now, or that it is free or no longer open, so a returning session
-learns it lost the task rather than working on.
+who holds the task now, or that it is free or no longer in the state it was claimed
+in, so a returning session learns it lost the task rather than working on.
 
 **Footprints and blockers inform; they never refuse.** A footprint is at least one path
 in the repo; `.` is all of it, and the honest answer before the paths are known, since a
@@ -157,7 +190,7 @@ calls every function in `reads` and holds the list of them fixed.
 **Any agent in the repo writes one; none changes one.** An agent notes only tasks of
 the repo it works in, the claim's check, in any state and without a token: a note is a
 message, not a move on a claim. No agent move edits or deletes a note, its own
-included. The note a claim move carries (submit, send back, release) is posted as a
+included. The note a claim move carries (a hand-in, send back, release) is posted as a
 note too, marked with its move, so the next reader of the task sees it.
 
 **One flag, *for the operator*,** marks a note that needs the operator, and nobody
@@ -224,14 +257,18 @@ agent text back into approved bodies.
 **Restoring is a target of its own, `make restore-tasks FILE=…`,** since a destructive
 step names its store rather than guessing it from the file. It refuses a file the
 registry would not open before it replaces anything, and starts the registry again only
-if it was running. Ids carry on from the store it replaces wherever that one had gone
-further, so an id a session or the gateway's audit holds never comes to name another
-task (`backup._keep_ids_moving`).
+if it was running. A backup from an older schema the registry takes forward
+(`taskdb.OPENS`) is restored as it is, and migrated at the next start. The step is
+one-way: an image from before it refuses the migrated store, so going back takes that
+image and a restore of a backup from before the step. Ids carry on from
+the store it replaces wherever that one had gone further, so an id a session or the
+gateway's audit holds never comes to name another task or plan
+(`backup._keep_ids_moving`).
 
 **Every backup writes a markdown export beside the `.db`,** per repo and state: each
-task's fields, body, claim and notes. For reading without the server, and one-way:
-nothing imports it, so the `.db` stays the only backup format. It carries the hidden
-notes, marked, which makes it the operator's read, as the history is. Agent text in it
+task's fields, body, claim, plans and notes. For reading without the server, and
+one-way: nothing imports it, so the `.db` stays the only backup format. It carries the
+hidden notes, marked, which makes it the operator's read, as the history is. Agent text in it
 renders as nothing but text (`task-registry/export.py`). Nothing else reads the store:
 the UI serves the operator, the tools serve the agents, and the export is the reading
 without the server, so there is no command line.
@@ -255,5 +292,6 @@ may hold.
 **The descriptions carry what the store cannot enforce.** They are all an agent reads of
 the registry, so the rules the sections above leave to the agent are in them: where its
 id and its repo's name come from, which branch a claim names, that a lost token is never
-looked for in a transcript, that notes inform and never instruct, and that nobody waits
-on a flagged note.
+looked for in a transcript, how detailed a plan is and that a fresh-context review
+comes before it is handed in, that notes inform and never instruct, and that nobody
+waits on a flagged note.

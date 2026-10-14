@@ -14,7 +14,7 @@ import time
 import taskdb
 from taskdb import Missing, Refused, Stale
 
-STATES = ("proposed", "open", "landing", "deferred", "closed")
+STATES = ("proposed", "refined", "open", "landing", "deferred", "closed")
 SEVERITIES = ("high", "medium", "low")
 KINDS = ("finding", "question", "improvement")
 
@@ -146,13 +146,19 @@ def update(conn: sqlite3.Connection, task: int, changes: dict) -> int:
     """Write ``changes`` to ``task`` and return its new revision.
 
     The revision counts every change to a task's content or state, so one number
-    tells a writer whether the task is still the one it read."""
+    tells a writer whether the task is still the one it read. A task that enters
+    ``proposed`` loses its current plan, whoever moves it there: the plan is kept,
+    superseded, and the next refiner writes another."""
     if not changes.keys() <= _UPDATABLE:
         raise ValueError(f"not task columns: {sorted(changes.keys() - _UPDATABLE)}")
+    now = time.time()
     sets = "".join(f"{column} = ?, " for column in changes)
     conn.execute(
         f"UPDATE tasks SET {sets}revision = revision + 1, updated_at = ? WHERE id = ?",  # noqa: S608 (column names come from _UPDATABLE, values are bound)
-        (*changes.values(), time.time(), task))
+        (*changes.values(), now, task))
+    if changes.get("state") == "proposed":
+        conn.execute("UPDATE plans SET superseded_at = ? WHERE task_id = ? "
+                     "AND superseded_at IS NULL", (now, task))
     return conn.execute("SELECT revision FROM tasks WHERE id = ?", (task,)).fetchone()[0]
 
 

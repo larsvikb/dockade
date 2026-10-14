@@ -22,8 +22,11 @@ from typing import BinaryIO, NoReturn
 
 import taskdb
 
-#: The registry's tables: a file without every one is not a registry store.
-TABLES = ("repos", "tasks", "claims", "blockers", "notes", "history")
+#: The registry's tables: a file without every one is not a registry store, but for
+#: the ones a later version added, which a store from before it lacks.
+TABLES = ("repos", "tasks", "claims", "blockers", "notes", "history", "plans",
+          "plan_paths")
+ADDED_IN = {"plans": 2, "plan_paths": 2}
 
 #: What a snapshot and a restore report counting.
 COUNTED = ("repos", "tasks", "notes")
@@ -93,18 +96,19 @@ def restore(inp: BinaryIO) -> None:
         reject(f"not a readable SQLite database ({e})")
     if integrity != "ok":
         reject(f"integrity_check says {integrity!r}")
-    missing = set(TABLES) - tables
+    missing = {t for t in TABLES if t not in tables
+               and not (0 < version < ADDED_IN.get(t, 0))}
     if missing:
         reject(f"not a task registry store — missing table(s): {', '.join(sorted(missing))}")
-    # taskdb.init opens v0 or its own version and refuses any other, with no migration
-    # between versions yet: a file it would refuse leaves the registry down with its
-    # old store gone, so it is refused here first.
+    # taskdb.init refuses a version outside `taskdb.OPENS`: a file it would refuse
+    # leaves the registry down with its old store gone, so it is refused here first. An
+    # older version it opens is taken forward at the registry's next start.
     if version > taskdb.SCHEMA_VERSION:
         reject(f"backup is schema v{version}, this registry understands "
                f"v{taskdb.SCHEMA_VERSION} — update the image first")
-    if version not in (0, taskdb.SCHEMA_VERSION):
+    if version not in taskdb.OPENS:
         reject(f"backup is schema v{version}, and this registry opens "
-               f"v{taskdb.SCHEMA_VERSION} only")
+               f"{', '.join(f'v{v}' for v in taskdb.OPENS if v)} only")
 
     _keep_ids_moving(dst, tmp)
     _, counts = _describe(tmp)

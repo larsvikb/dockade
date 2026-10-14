@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """A backup of the task registry as markdown, for reading without the server: per repo
-and state, each task's fields, body, claim and notes, the hidden notes marked. One-way:
+and state, each task's fields, body, claim, plans and notes, the superseded plans and
+hidden notes marked. One-way:
 nothing reads it back, so the ``.db`` beside it stays the only backup format.
 
     python3 export.py < tasks.db > tasks.md
@@ -94,7 +95,7 @@ def _word(value: object, known: tuple[str, ...]) -> str:
 
 
 def render(conn: sqlite3.Connection, now: float) -> str:
-    """The store on ``conn``, a registry store at this code's schema version, as
+    """The store on ``conn``, a registry store at a schema version this code reads, as
     markdown."""
     conn.row_factory = sqlite3.Row
     repos = conn.execute("SELECT * FROM repos ORDER BY name, id").fetchall()
@@ -108,12 +109,13 @@ def render(conn: sqlite3.Connection, now: float) -> str:
     notes: dict[int, list[sqlite3.Row]] = {}
     for n in conn.execute("SELECT * FROM notes ORDER BY id"):
         notes.setdefault(int(n["task_id"]), []).append(n)
+    plans = _plans(conn)
     hidden = sum(n["hidden_at"] is not None for ns in notes.values() for n in ns)
 
     out = [
         "# Task registry export",
         "",
-        f"Rendered {when(now)} from a schema-v{taskdb.SCHEMA_VERSION} store: "
+        f"Rendered {when(now)} from a schema-v{_version(conn)} store: "
         f"{len(repos)} repos, {len(all_tasks)} tasks, "
         f"{sum(map(len, notes.values()))} notes ({hidden} hidden).",
         "",
@@ -140,12 +142,13 @@ def render(conn: sqlite3.Connection, now: float) -> str:
             if group:
                 out += ["", f"### {_word(state, tasks.STATES)} ({len(group)})"]
                 for task in group:
-                    out += _task(task, states, claims, blockers, notes)
+                    out += _task(task, states, claims, blockers, notes, plans)
     return "\n".join(out) + "\n"
 
 
 def _task(task: sqlite3.Row, states: dict[int, str], claims: dict[int, sqlite3.Row],
-          blockers: dict[int, list[int]], notes: dict[int, list[sqlite3.Row]]) -> list[str]:
+          blockers: dict[int, list[int]], notes: dict[int, list[sqlite3.Row]],
+          plans: dict[int, list[tuple[sqlite3.Row, list[str]]]]) -> list[str]:
     tid = int(task["id"])
     facts = [f"state {_word(task['state'], tasks.STATES)}"]
     if task["severity"] is not None:
@@ -170,6 +173,11 @@ def _task(task: sqlite3.Row, states: dict[int, str], claims: dict[int, sqlite3.R
         if claim["progress"] is not None:
             lines += ["", "Progress:", "", block(claim["progress"])]
     lines += ["", "Body:", "", block(task["body"])]
+    for plan, paths in plans.get(tid, []):
+        lines += ["", _plan_line(plan) + ":", "",
+                  "- footprint " + (", ".join(inline(p) for p in paths) or "(none)")]
+        for part in ("approach", "tests", "out_of_scope", "risks", "review_verdict"):
+            lines += ["", f"{part.replace('_', ' ').capitalize()}:", "", block(plan[part])]
     mine = notes.get(tid, [])
     if mine:
         hidden = sum(n["hidden_at"] is not None for n in mine)
@@ -188,6 +196,34 @@ def _footprint(stored: str) -> str:
     if isinstance(paths, list) and paths and all(isinstance(p, str) for p in paths):
         return ", ".join(inline(p) for p in paths)
     return inline(stored)
+
+
+def _version(conn: sqlite3.Connection) -> int:
+    return conn.execute("PRAGMA user_version").fetchone()[0]
+
+
+def _plans(conn: sqlite3.Connection) -> dict[int, list[tuple[sqlite3.Row, list[str]]]]:
+    """Every plan by task, oldest first, with its paths; none from a v1 store, which
+    has no plans table."""
+    if _version(conn) < 2:
+        return {}
+    paths: dict[int, list[str]] = {}
+    for p in conn.execute("SELECT plan_id, path FROM plan_paths ORDER BY rowid"):
+        paths.setdefault(int(p["plan_id"]), []).append(p["path"])
+    plans: dict[int, list[tuple[sqlite3.Row, list[str]]]] = {}
+    for plan in conn.execute("SELECT * FROM plans ORDER BY id"):
+        plans.setdefault(int(plan["task_id"]), []).append(
+            (plan, paths.get(int(plan["id"]), [])))
+    return plans
+
+
+def _plan_line(plan: sqlite3.Row) -> str:
+    parts = [f"Plan {int(plan['id'])}", f"by {inline(plan['author'])}",
+             when(plan["created_at"]), f"at task revision {int(plan['task_revision'])}",
+             f"{int(plan['review_rounds'])} review round(s)"]
+    if plan["superseded_at"] is not None:
+        parts.append(f"**SUPERSEDED** {when(plan['superseded_at'])}")
+    return ", ".join(parts)
 
 
 def _note_line(note: sqlite3.Row) -> str:
@@ -219,9 +255,10 @@ def main(data: bytes) -> str:
     try:
         conn.deserialize(data)
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if version != taskdb.SCHEMA_VERSION:
+        readable = [v for v in taskdb.OPENS if v]
+        if version not in readable:
             sys.exit(f"export: the backup is schema v{version}, this export reads "
-                     f"v{taskdb.SCHEMA_VERSION}")
+                     f"{', '.join(f'v{v}' for v in readable)}")
         return render(conn, time.time())
     finally:
         conn.close()

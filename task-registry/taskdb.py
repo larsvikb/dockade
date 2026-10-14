@@ -22,7 +22,12 @@ DB_PATH = os.environ.get("TASKS_DB", "/var/lib/task-registry/tasks.db")
 # _SCHEMA creates what is missing and alters nothing: `IF NOT EXISTS` adds no column
 # to a table that exists. Changing an existing table takes a version bump and a
 # migration.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+#: The versions `init` opens: v0, a file `_SCHEMA` has not run in, and v1, whose step
+#: to v2 only added tables (`plans`, `plan_paths`), so running `_SCHEMA` is the whole
+#: migration.
+OPENS = (0, 1, SCHEMA_VERSION)
 
 #: The author of every write the operator makes, and of the registry's own (an expired
 #: claim swept away). No agent id can equal either: an agent id is a kind, a hyphen and
@@ -82,7 +87,8 @@ CREATE TABLE IF NOT EXISTS notes (
     author       TEXT NOT NULL,
     text         TEXT NOT NULL,
     for_operator INTEGER NOT NULL,
-    -- The claim move the note came with (`submit`, `send_back`, `release`), if any.
+    -- The claim move the note came with (`submit_plan`, `submit_work`, `send_back`,
+    -- `release`), if any.
     move         TEXT,
     -- The flagged note this one answers: the operator's reply when marking it handled.
     reply_to     INTEGER REFERENCES notes(id),
@@ -93,6 +99,29 @@ CREATE TABLE IF NOT EXISTS notes (
     handled_at   REAL
 );
 CREATE INDEX IF NOT EXISTS notes_by_task ON notes(task_id, id);
+CREATE TABLE IF NOT EXISTS plans (
+    -- AUTOINCREMENT, as for tasks: a plan is named by id, and never reused.
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id        INTEGER NOT NULL REFERENCES tasks(id),
+    -- The task's revision the submit left it at, which approval names.
+    task_revision  INTEGER NOT NULL,
+    author         TEXT NOT NULL,
+    created_at     REAL NOT NULL,
+    approach       TEXT NOT NULL,
+    tests          TEXT NOT NULL,
+    out_of_scope   TEXT NOT NULL,
+    risks          TEXT NOT NULL,
+    review_rounds  INTEGER NOT NULL,
+    review_verdict TEXT NOT NULL,
+    -- Set when the task re-enters `proposed`; the row stays.
+    superseded_at  REAL
+);
+CREATE INDEX IF NOT EXISTS plans_by_task ON plans(task_id, id);
+CREATE TABLE IF NOT EXISTS plan_paths (
+    plan_id     INTEGER NOT NULL REFERENCES plans(id),
+    path        TEXT NOT NULL,
+    PRIMARY KEY (plan_id, path)
+);
 CREATE TABLE IF NOT EXISTS history (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     ts          REAL NOT NULL,
@@ -125,13 +154,13 @@ class Stale(Refused):
 
 
 def init() -> None:
-    """Create the store, or open one this code's schema version wrote."""
+    """Create the store, or open one at a version this code takes forward."""
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = _connect()
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, SCHEMA_VERSION):
+        if version not in OPENS:
             raise RuntimeError(
                 f"{DB_PATH} is at schema v{version}; this code knows v{SCHEMA_VERSION}")
         conn.executescript(_SCHEMA)

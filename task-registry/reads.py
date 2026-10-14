@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """What any surface may read, agents' included: a repo's tasks, one task in full with its
-latest notes, older notes page by page, a search, and the repo list. Nothing here
+latest notes and its plan, older notes page by page, every plan a task had, a search,
+and the repo list. Nothing here
 writes, and nothing here returns what the operator alone may see: a hidden note, or the
 history, which keeps every text a task ever had."""
 from __future__ import annotations
@@ -10,6 +11,7 @@ import sqlite3
 
 import claims
 import notes
+import plans
 import taskdb
 import tasks
 
@@ -131,7 +133,8 @@ def detail(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
     if held is not None:
         summary["claim"] |= {"footprint": json.loads(held["footprint"]),
                              "claimed_at": held["claimed_at"]}
-    return {**summary, "body": row["body"], "notes": notes.visible(conn, row["id"]),
+    return {**summary, "body": row["body"], "plan": plans.latest(conn, row["id"]),
+            "notes": notes.visible(conn, row["id"]),
             "parent": parent[0] if parent else None,
             "children": brief("SELECT id, title, state FROM tasks "
                               "WHERE parent_id = ? ORDER BY id"),
@@ -139,6 +142,14 @@ def detail(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
                               "JOIN tasks t ON t.id = b.blocker_id "
                               "WHERE b.task_id = ? ORDER BY t.id"),
             "created_at": row["created_at"], "updated_at": row["updated_at"]}
+
+
+def task_plans(task: int) -> list[dict]:
+    """Every plan the task had, newest first, superseded ones marked: what the operator
+    compares a plan with the one before."""
+    with taskdb.reading() as conn:
+        tasks.task_row(conn, task)
+        return plans.every(conn, task)
 
 
 def task_notes(task: int, before: int | None = None) -> list[dict]:

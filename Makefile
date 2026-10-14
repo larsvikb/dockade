@@ -125,7 +125,7 @@ PYFILES := proxies/egress/addon.py control-plane-ui/app.py ui-common/guards.py \
            tool-gateway/app.py tool-gateway/outcomes.py tool-gateway/discovery.py \
            tool-gateway/protocol.py tool-gateway/surface.py tool-gateway/execute.py \
            task-registry/taskdb.py task-registry/tasks.py task-registry/reads.py \
-           task-registry/claims.py task-registry/notes.py \
+           task-registry/claims.py task-registry/notes.py task-registry/plans.py \
            task-registry/agent_moves.py task-registry/operator_moves.py \
            task-registry/agent_tools.py task-registry/agent_api.py \
            task-registry/operator_api.py task-registry/serve.py \
@@ -198,6 +198,7 @@ REFFILES := $(SCRIPTS) \
             task-registry/tasks.py \
             task-registry/claims.py \
             task-registry/notes.py \
+            task-registry/plans.py \
             task-registry/reads.py \
             task-registry/agent_moves.py \
             task-registry/operator_moves.py \

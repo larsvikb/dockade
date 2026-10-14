@@ -202,6 +202,7 @@ class RouteTests(_Store):
         ("GET", "/api/tasks/{task}"), ("POST", "/api/tasks/{task}/edit"),
         ("POST", "/api/tasks/{task}/move"), ("POST", "/api/tasks/{task}/break-claim"),
         ("POST", "/api/tasks/{task}/reparent"), ("GET", "/api/tasks/{task}/history"),
+        ("GET", "/api/tasks/{task}/plans"),
         ("GET", "/api/tasks/{task}/notes"), ("POST", "/api/tasks/{task}/notes"),
         ("GET", "/api/notes/flagged"), ("POST", "/api/notes/hide"),
         ("POST", "/api/notes/handle"), ("POST", "/api/notes/{note}/handle"),
@@ -364,6 +365,7 @@ class RouteTests(_Store):
 READS = {
     "list_tasks": (reads, "list_tasks"), "search_tasks": (reads, "search_tasks"),
     "get_task": (reads, "get_task"), "repos": (reads, "repos"),
+    "task_plans": (reads, "task_plans"),
     "history": (op, "history"), "all_notes": (op, "all_notes"),
     "notes_for_operator": (op, "notes_for_operator"),
 }

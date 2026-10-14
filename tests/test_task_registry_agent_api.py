@@ -29,8 +29,13 @@ SECRET = "s3cret-" * 6
 EXPECTED = f"Bearer {SECRET}".encode()
 
 TOOL_NAMES = ["list_tasks", "get_task", "task_notes", "search_tasks", "repos", "propose",
-              "edit_proposal", "claim", "update", "submit", "send_back", "release",
-              "add_note"]
+              "edit_proposal", "claim", "update", "submit_plan", "submit_work", "send_back",
+              "release", "add_note"]
+
+PLAN = {"approach": "A rotate step in the key store.", "footprint": ["src/keys.py"],
+        "tests": "A rotation keeps old keys readable.", "out_of_scope": "None.",
+        "risks": "A reader mid-rotation.", "review_rounds": 2,
+        "review_verdict": "Passes."}
 
 
 def rpc(method: str, params: dict | None = None, message_id: object = 7) -> dict:
@@ -279,7 +284,7 @@ class CallTests(_Store):
                           token=token, progress="Halfway.")
         self.assertEqual(updated["task"], self.task)
         self.ok("add_note", agent=BOB, repo="widgets", task=self.task, text="Watch src/x.")
-        self.ok("submit", agent=ALICE, repo="widgets", task=self.task, token=token,
+        self.ok("submit_work", agent=ALICE, repo="widgets", task=self.task, token=token,
                 note="Ready.")
         got = self.ok("get_task", task=self.task)
         self.assertEqual((got["state"], [n["text"] for n in got["notes"]]),
@@ -295,6 +300,31 @@ class CallTests(_Store):
                 body="Every 30 days.", severity=None)
         self.assertEqual(self.ok("get_task", task=task)["body"], "Every 30 days.")
         self.assertEqual(self.ok("repos")[0]["name"], "gadgets")
+
+    def test_a_proposal_planned_approved_and_done(self):
+        task = self.ok("propose", agent=ALICE, repo="widgets", title="Rotate keys",
+                       body="Every 90 days.")["task"]
+        token = self.ok("claim", agent=ALICE, repo="widgets", task=task,
+                        branch="rotate-keys", footprint=["src"])["token"]
+        planned = self.ok("submit_plan", agent=ALICE, repo="widgets", task=task,
+                          token=token, **PLAN)
+        got = self.ok("get_task", task=task)
+        self.assertEqual((got["state"], got["revision"]), ("refined", planned["revision"]))
+        self.assertEqual({k: got["plan"][k] for k in PLAN}, PLAN)
+        op.move(task, planned["revision"], "open")
+        claimed = self.ok("claim", agent=BOB, repo="widgets", task=task,
+                          branch="rotate-keys")
+        self.assertEqual(reads.get_task(task)["claim"]["footprint"], ["src/keys.py"])
+        self.ok("submit_work", agent=BOB, repo="widgets", task=task,
+                token=claimed["token"])
+        self.assertEqual(self.ok("get_task", task=task)["state"], "landing")
+
+    def test_each_hand_in_names_the_other_on_the_wrong_state(self):
+        token = self.ok("claim", agent=ALICE, repo="widgets", task=self.task,
+                        branch="b", footprint=["."])["token"]
+        reason, _ = self.refused("submit_plan", {"agent": ALICE, "repo": "widgets",
+                                                 "task": self.task, "token": token, **PLAN})
+        self.assertIn("submit_work", reason)
 
     def test_a_refusal_says_why_first_and_what_is_there_now_after(self):
         self.ok("claim", agent=ALICE, repo="widgets", task=self.task, branch="b",
@@ -334,7 +364,7 @@ class CallTests(_Store):
             "an unknown argument": ("get_task", {"task": self.task, "as": "operator"},
                                     "no argument 'as'"),
             "a missing argument": ("claim", {"agent": ALICE, "repo": "widgets"},
-                                   "missing task, branch, footprint"),
+                                   "missing task, branch"),
             "true for an id": ("get_task", {"task": True}, "task is an integer"),
             "a string for an id": ("get_task", {"task": str(self.task)},
                                    "task is an integer"),
@@ -361,13 +391,14 @@ class OddArgumentTests(_Store):
 
     def baseline(self, name: str) -> dict:
         token = agent_claim = None
-        if name in ("update", "submit", "send_back", "release"):
-            task = op.create("widgets", "T", "B", "open")["task"]
+        if name in ("update", "submit_plan", "submit_work", "send_back", "release"):
+            state = "proposed" if name == "submit_plan" else "open"
+            task = op.create("widgets", "T", "B", state)["task"]
             agent_claim = reg.agent_moves.claim(ALICE, "widgets", task, "b", ["."])
             token = agent_claim["token"]
         values = {"agent": ALICE, "repo": "widgets", "task": self.task, "token": token,
                   "title": "T", "body": "B", "text": "x", "branch": "b",
-                  "footprint": ["."], "revision": 1, "note": "n", "progress": "p"}
+                  "revision": 1, "note": "n", "progress": "p", **PLAN}
         if agent_claim is not None:
             values["task"] = agent_claim["task"]
         params = tools.TOOLS[name].params

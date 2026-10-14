@@ -22,6 +22,7 @@ COPY taskdb.py ./taskdb.py
 COPY tasks.py ./tasks.py
 COPY claims.py ./claims.py
 COPY notes.py ./notes.py
+COPY plans.py ./plans.py
 COPY reads.py ./reads.py
 COPY agent_moves.py ./agent_moves.py
 COPY operator_moves.py ./operator_moves.py

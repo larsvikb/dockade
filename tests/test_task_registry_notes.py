@@ -67,7 +67,7 @@ class WritingTests(_Store):
     def test_no_claim_is_needed_and_any_state_takes_one(self):
         token = agent.claim(ALICE, "widgets", self.task, "fix", ["."])["token"]
         self.note("From the side.", who=BOB)
-        agent.submit(ALICE, "widgets", self.task, token)
+        agent.submit_work(ALICE, "widgets", self.task, token)
         self.note("After it landed.", who=BOB)
         self.assertEqual(self.texts(), ["From the side.", "After it landed."])
 
@@ -118,7 +118,7 @@ class WritingTests(_Store):
 
 class MoveNoteTests(_Store):
     def test_a_claim_move_posts_its_note(self):
-        for move, args in ((agent.submit, ("Ready to land.",)),
+        for move, args in ((agent.submit_work, ("Ready to land.",)),
                            (agent.release, ("Out of my depth.",)),
                            (agent.send_back, ("Which widgets?",))):
             with self.subTest(move=move.__name__):
@@ -132,7 +132,7 @@ class MoveNoteTests(_Store):
 
     def test_a_moves_note_is_not_flagged_for_the_operator(self):
         token = agent.claim(ALICE, "widgets", self.task, "fix", ["."])["token"]
-        agent.submit(ALICE, "widgets", self.task, token, "Ready to land.")
+        agent.submit_work(ALICE, "widgets", self.task, token, "Ready to land.")
         self.assertFalse(reads.get_task(self.task)["notes"][0]["for_operator"])
         self.assertEqual(op.notes_for_operator(), {"notes": [], "total": 0})
 
@@ -169,6 +169,7 @@ class HidingTests(_Store):
         calls = {"list_tasks": lambda: reads.list_tasks("widgets", None),
                  "get_task": lambda: reads.get_task(self.task),
                  "task_notes": lambda: reads.task_notes(self.task),
+                 "task_plans": lambda: reads.task_plans(self.task),
                  "search_tasks": lambda: reads.search_tasks("SECRET"),
                  "repos": reads.repos, "detail": self.detail}
         defined = {name for name, value in inspect.getmembers(reads, callable)

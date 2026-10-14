@@ -1964,9 +1964,11 @@ only as `mcp__gateway__tasks__…`: the operator registers server `tasks` in the
 with the descriptor's template `Bearer {secret}`, and each tool is denied until a rule
 allows it. The gateway's audit row records an agent's write; the operator's writes
 have no gateway in front of them, so the registry records those itself, in its history.
-The tools that carry a claim's token (`update`, `submit`, `send_back`, `release`) stay
-at allow: an `ask` card shows a call's arguments and the store keeps them, while an
-allow row records none (`control-plane/api_tool.py`).
+The tools that carry a claim's token (`update`, `submit_plan`, `submit_work`,
+`send_back`, `release`, and `edit_proposal`, which a holder calls with it) stay at
+allow: an `ask` card shows a call's arguments and the store keeps them, while an allow
+row records none (`control-plane/api_tool.py`). So the operator's check on a plan is
+the approval, moving its task from `refined` to `open`, never an `ask` on `submit_plan`.
 
 **Two surfaces, two networks, one process.** The agent listener is on `mcp-net`, where
 every MCP server can dial it, so it answers only the secret the gateway holds for
@@ -2327,6 +2329,7 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | task registry backups — its store and a markdown export in `make backup`, `make restore-tasks` | **done** |
 | — | task registry view — read-only, the operator listener's one client | **done** — reads only; the operator's moves next |
 | — | the task registry's own UI — `tasks-ui`, on another origin and with no `control-net` leg; what both UIs share in `ui-common/` | **done** — the approval page links to it |
+| — | task registry plans — `refined`, claims that refine a proposal, `submit_plan` and `submit_work`, every plan kept; the store's first migration | **done** — showing a plan is the tasks UI's inbox, next |
 
 The rationale for each shipped item lives under **Governance surfaces** above, not here
 — a status line goes stale, the reasoning does not. This section is deliberately the

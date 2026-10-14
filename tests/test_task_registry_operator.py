@@ -206,6 +206,7 @@ class RouteTests(_Store):
         ("GET", "/api/tasks/{task}/notes"), ("POST", "/api/tasks/{task}/notes"),
         ("GET", "/api/notes/flagged"), ("POST", "/api/notes/hide"),
         ("POST", "/api/notes/handle"), ("POST", "/api/notes/{note}/handle"),
+        ("GET", "/api/inbox"),
     })
 
     def call(self, route, *args):
@@ -326,6 +327,8 @@ class RouteTests(_Store):
                          op.notes_for_operator("widgets", handled=True))
         self.assertEqual(self.call(api.notes_for_operator, None, False, notes[2])[1],
                          op.notes_for_operator(before=notes[2]))
+        self.assertEqual(self.call(api.inbox)[1], op.inbox())
+        self.assertEqual(op.inbox()["waiting"]["total"], 1)
 
     def test_a_refusal_answers_its_reason_and_what_is_there_now(self):
         cases = [
@@ -367,7 +370,7 @@ READS = {
     "get_task": (reads, "get_task"), "repos": (reads, "repos"),
     "task_plans": (reads, "task_plans"),
     "history": (op, "history"), "all_notes": (op, "all_notes"),
-    "notes_for_operator": (op, "notes_for_operator"),
+    "notes_for_operator": (op, "notes_for_operator"), "inbox": (op, "inbox"),
 }
 # (route, parameter): what the route turns a value into, where it does not pass it on
 # as it came.

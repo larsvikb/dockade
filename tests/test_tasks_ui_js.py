@@ -76,7 +76,7 @@ console.log(JSON.stringify({
     hostile: t.claimText({holder: "claude-x\u202e", branch: "b\u200b"}),
     none: t.claimText(null),
   },
-  badge: [0, 1, 12, null, undefined, "3", 2.5, -1].map(t.flaggedBadge),
+  badge: [0, 1, 12, null, undefined, "3", 2.5, -1].map(t.countBadge),
   title: [0, 1, 12].map(t.pageTitle),
   plan: {
     keys: t.PLAN_PARTS.map(([key]) => key),
@@ -107,6 +107,39 @@ console.log(JSON.stringify({
       holes: t.earlierPlans([null, {id: 1}], 1),
     },
   },
+  inbox: {
+    sections: t.INBOX_SECTIONS.map(([key]) => key),
+    reasons: {
+      flagged: t.reasonText({why: "flagged", since: 1789466400, notes: 2}),
+      one_note: t.reasonText({why: "flagged", since: 1789466400, notes: 1}),
+      landing: t.reasonText({why: "landing", since: 1789466400, branch: "fix\u202e"}),
+      landing_bare: t.reasonText({why: "landing", since: 1789466400, branch: null}),
+      refined: t.reasonText({why: "refined", since: 1789466400, plan: 6,
+                             review_rounds: 3}),
+      lapsed: t.reasonText({why: "lapsed", since: 1789466400, holder: "claude-x\u200b",
+                            branch: "b"}),
+      quiet: t.reasonText({why: "quiet", since: 1789466400}),
+      unknown: t.reasonText({why: "new\u202e", since: 1789466400}),
+      none: t.reasonText(null),
+    },
+    count: [t.sectionCount(3, 3), t.sectionCount(50, 61)],
+    hash: {
+      empty: t.parseHash(""),
+      task: t.parseHash("#task=14"),
+      all: t.parseHash("#view=all&task=7"),
+      bad_task: t.parseHash("#task=../api"),
+      bad_view: t.parseHash("#view=audit"),
+      zeros: t.parseHash("#task=006"),
+      zero: t.parseHash("#task=0"),
+      long_id: t.parseHash("#task=9223372036854775807"),
+      missing: t.parseHash(undefined),
+      inbox_none: t.hashFor("inbox", null),
+      inbox_task: t.hashFor("inbox", "14"),
+      all_none: t.hashFor("all", null),
+      all_task: t.hashFor("all", 7),
+      round_trip: t.parseHash(t.hashFor("all", "9")),
+    },
+  },
   status: {
     empty: t.tasksStatus(0, false, true, false),
     search_empty: t.tasksStatus(0, false, true, true),
@@ -114,8 +147,8 @@ console.log(JSON.stringify({
     stale: t.tasksStatus(4, true, true, false),
     cold: t.tasksStatus(0, true, false, false),
     quiet: t.tasksStatus(4, false, true, false),
-    flagged_empty: t.flaggedStatus(0, false, true),
-    flagged_stale: t.flaggedStatus(2, true, true),
+    inbox_empty: t.inboxStatus(0, false, true),
+    inbox_stale: t.inboxStatus(2, true, true),
   },
 }));
 """
@@ -272,6 +305,52 @@ class TaskViewTests(unittest.TestCase):
         self.assertEqual(earlier["not_a_list"], [])
         self.assertEqual(earlier["holes"], [])
 
+    def test_the_inboxs_sections_and_reasons_are_the_registrys(self):
+        moves = (ROOT / "task-registry" / "operator_moves.py").read_text()
+        block = re.search(r"^SECTIONS = \{(.*?)\}", moves, re.M | re.S).group(1)
+        self.assertEqual(self.probe["inbox"]["sections"], re.findall(r'"(\w+)": \(', block))
+        whys = re.findall(r'"(\w+)"', re.sub(r'"\w+": \(', "(", block))
+        tasks_js = (TASKS_DIR / "tasks.js").read_text()
+        body = tasks_js[tasks_js.index("export function reasonText("):]
+        body = body[:body.index("\n}\n")]
+        self.assertEqual(re.findall(r'case "(\w+)":', body), whys)
+
+    def test_each_reason_says_why_and_since_when(self):
+        r = self.probe["inbox"]["reasons"]
+        stamp = r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d"
+        self.assertRegex(r["flagged"], rf"^2 notes for you since {stamp}$")
+        self.assertRegex(r["one_note"], rf"^1 note for you since {stamp}$")
+        self.assertRegex(r["landing"], rf"^landing since {stamp} on fix\\u202e$")
+        self.assertRegex(r["landing_bare"], rf"^landing since {stamp}$")
+        self.assertRegex(r["refined"], rf"^refined since {stamp}, plan 6, 3 review rounds$")
+        self.assertRegex(r["lapsed"],
+                         rf"^claim by claude-x\\u200b on b ran out {stamp}$")
+        self.assertRegex(r["quiet"], rf"^nothing written since {stamp}$")
+        self.assertEqual(r["unknown"], "new\\u202e")
+        self.assertEqual(r["none"], "")
+
+    def test_a_section_says_when_a_page_does_not_hold_it_all(self):
+        self.assertEqual(self.probe["inbox"]["count"], ["· 3", "· 50 of 61, oldest first"])
+
+    def test_the_hash_names_a_view_and_a_task_and_nothing_else(self):
+        h = self.probe["inbox"]["hash"]
+        inbox = {"view": "inbox", "task": None}
+        self.assertEqual(h["empty"], inbox)
+        self.assertEqual(h["missing"], inbox)
+        self.assertEqual(h["task"], {"view": "inbox", "task": "14"})
+        self.assertEqual(h["all"], {"view": "all", "task": "7"})
+        # Only digits name a task, as the relay takes one, and only a known view.
+        self.assertEqual(h["bad_task"], inbox)
+        self.assertEqual(h["bad_view"], inbox)
+        self.assertEqual((h["inbox_none"], h["inbox_task"], h["all_none"], h["all_task"]),
+                         ("", "#task=14", "#view=all", "#view=all&task=7"))
+        self.assertEqual(h["round_trip"], {"view": "all", "task": "9"})
+        # As a row names it, so the row is marked and not read twice; never through a
+        # Number, which would round an id past 2^53.
+        self.assertEqual(h["zeros"]["task"], "6")
+        self.assertEqual(h["zero"]["task"], "0")
+        self.assertEqual(h["long_id"]["task"], "9223372036854775807")
+
     def test_the_count_is_a_number_or_nothing(self):
         self.assertEqual(self.probe["badge"], ["", "1", "12", "", "", "3", "", ""])
 
@@ -291,8 +370,8 @@ class TaskViewTests(unittest.TestCase):
         self.assertIn("may be out of date", status["stale"]["text"])
         self.assertEqual(status["cold"]["text"], "Could not load the tasks.")
         self.assertFalse(status["quiet"]["show"])
-        self.assertEqual(status["flagged_empty"]["text"], "No note waits on you.")
-        self.assertEqual(status["flagged_stale"]["level"], "warn")
+        self.assertIn("Nothing is your turn", status["inbox_empty"]["text"])
+        self.assertEqual(status["inbox_stale"]["level"], "warn")
 
     def test_a_page_is_the_registrys_page(self):
         reads = (ROOT / "task-registry" / "reads.py").read_text()
@@ -317,7 +396,7 @@ class TaskPollingSourceTests(unittest.TestCase):
                          re.M | re.S).group(0)
 
     def test_every_registry_read_returns_early_unless_it_answers(self):
-        for name in ("refreshTasks", "refreshFlagged"):
+        for name in ("refreshTasks", "refreshInbox"):
             with self.subTest(function=name):
                 body = self._function(self.TASKS, name)
                 first = body.split("\n")[1].strip()
@@ -330,7 +409,7 @@ class TaskPollingSourceTests(unittest.TestCase):
         body = [ln.strip() for ln in polls[0].splitlines()]
         self.assertEqual(body, [
             "if (!visible()) return;",
-            "if (registryIsRunning()) refreshFlagged().then(() => refreshTasks());",
+            "if (registryIsRunning()) refreshInbox().then(() => refreshTasks());",
             "else probeRegistry();"])
 
     def test_startup_asks_its_server_and_not_the_registry(self):
@@ -350,10 +429,10 @@ class TaskPollingSourceTests(unittest.TestCase):
         self.assertIn("if (!probing) probing = probe()", body)
         self.assertIn("return probing;", body)
 
-    def test_a_flagged_read_that_finds_it_gone_draws_nothing(self):
+    def test_an_inbox_read_that_finds_it_gone_draws_nothing(self):
         # Checked again after the fetch: a 502 clears the count, and drawing the old
-        # page would set it back.
-        body = self._function(self.TASKS, "refreshFlagged")
+        # inbox would set it back.
+        body = self._function(self.TASKS, "refreshInbox")
         after = body[body.index("registryJson(await fetch"):]
         self.assertIn("if (!registryIsRunning()) return;", after)
 
@@ -363,6 +442,36 @@ class TaskPollingSourceTests(unittest.TestCase):
         self.assertIn("if (registryIsRunning())", back)
         self.assertIn("else probeRegistry();", back)
 
+    def test_the_hash_opens_a_task_only_once_the_registry_answers(self):
+        # At load the hash is read before /running answers: the view at once, the task
+        # when probe finds the registry up and reads the hash again.
+        body = self._function(self.TASKS, "applyHash")
+        self.assertLess(body.index("showView(named.view);"),
+                        body.index("if (!registryIsRunning()) return;"))
+        self.assertLess(body.index("if (!registryIsRunning()) return;"),
+                        body.index("showTask("))
+        probe = self._function(self.TASKS, "probe")
+        self.assertLess(probe.index("if (up)"), probe.index("applyHash();"))
+        go = self._function(self.TASKS, "goTo")
+        self.assertIn("} else if (registryIsRunning()) {\n    showTask(task);", go)
+
+    def test_a_task_the_registry_could_not_answer_for_is_read_when_it_does(self):
+        body = self._function(self.TASKS, "showTask")
+        after = body[body.index("} catch (e) {"):]
+        self.assertIn("if (!registryIsRunning()) openTask = null;", after)
+
+    def test_every_list_redraw_marks_the_open_task_again(self):
+        for name in ("renderTasks", "renderInbox", "showTask", "closeTask"):
+            with self.subTest(function=name):
+                self.assertIn("markOpen();", self._function(self.TASKS, name))
+
+    def test_every_open_goes_through_the_hash(self):
+        # showTask is called from the hash, and from a click naming what the hash names.
+        calls = re.findall(r"^.*\bshowTask\(.*$", self.TASKS, re.M)
+        callers = [ln.strip() for ln in calls if "function showTask" not in ln]
+        self.assertEqual(sorted(callers), ["showTask(named.task);", "showTask(task);"])
+        self.assertIn('window.addEventListener("hashchange", applyHash);', self.TASKS)
+
     def test_a_502_stops_the_polls(self):
         body = self._function(self.TASKS, "registryJson")
         self.assertIn("res.status === NOT_RUNNING_STATUS", body)
@@ -371,7 +480,9 @@ class TaskPollingSourceTests(unittest.TestCase):
     def test_the_count_is_in_the_title_and_never_hot(self):
         # A backlog nobody waits on: no alarm, and gone when the registry is.
         self.assertNotRegex(self.TASKS, r"\bhot\b")
-        self.assertIn("document.title = pageTitle(lastFlaggedTotal);", self.TASKS)
+        # The count is what waits on the operator, the inbox's first section.
+        self.assertIn("if (inboxLoaded) document.title = pageTitle(waiting);", self.TASKS)
+        self.assertIn("inbox.waiting.total", self.TASKS)
         self.assertIn("if (!up) document.title = PAGE_TITLE;", self.TASKS)
 
 
@@ -383,7 +494,7 @@ class TaskRenderingSourceTests(unittest.TestCase):
 
     TASKS = (TASKS_DIR / "tasks.js").read_text()
     # A field an agent wrote, read off one of the registry's records.
-    FIELD = re.compile(r"\b(?:t|n|h|task|claim|plan|part)(?:\.claim)?\."
+    FIELD = re.compile(r"\b(?:t|n|h|task|claim|plan|part|reason)(?:\.claim)?\."
                        r"(?:title|body|text|author|holder|branch|progress|footprint|"
                        r"approach|tests|out_of_scope|risks|review_verdict)\b")
     SPELT = ("spellHidden(", "proseBlock(", "textCell(", "authorCell(", "claimText(")

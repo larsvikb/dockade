@@ -44,7 +44,7 @@ class RelayTests(unittest.TestCase):
 
     def test_the_reads_reach_the_registry(self):
         for path in ("api/repos", "api/tasks", "api/tasks/12", "api/tasks/12/notes",
-                     "api/tasks/12/history", "api/tasks/12/plans", "api/notes/flagged",
+                     "api/tasks/12/history", "api/tasks/12/plans", "api/inbox",
                      "api/search"):
             with self.subTest(path=path):
                 resp = self._proxy(path)
@@ -57,7 +57,9 @@ class RelayTests(unittest.TestCase):
         for path, method in (("api/tasks", "POST"), ("api/tasks/12/move", "POST"),
                              ("api/tasks/12/break-claim", "POST"),
                              ("api/tasks/12/notes", "POST"), ("api/notes/hide", "POST"),
-                             ("api/tasks/12/plans", "POST"),
+                             ("api/tasks/12/plans", "POST"), ("api/inbox", "POST"),
+                             # The flagged list the inbox replaced.
+                             ("api/notes/flagged", "GET"),
                              ("api/repos", "POST"), ("api/tasks/abc", "GET"),
                              ("api/tasks/1/../../../api/audit", "GET"),
                              ("api/tasks/12345678901234567890", "GET"),

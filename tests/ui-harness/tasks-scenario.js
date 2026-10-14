@@ -7,6 +7,25 @@ import { startRegistry, stopRegistry } from "./tasks-backend.js";
 
 export const STEPS = [
   ["load", async ({ load }) => { await load(); }],
+  ["opened from the inbox", async ({ page }) => {
+    await page.click('#inbox button[data-task="3"]');
+  }],
+  ["its earlier plans", async ({ page }) => {
+    await page.click('#task-detail button[data-page="plans"]');
+  }],
+  ["its history", async ({ page }) => {
+    await page.click('#task-detail button[data-page="history"]');
+  }],
+  ["a refined task from triage", async ({ page }) => {
+    await page.click('#inbox button[data-task="6"]');
+  }],
+  // The hash names the task: a reload reads it again, and back goes to the one before.
+  ["reloaded", async ({ page }) => { await page.reload(); }],
+  ["back", async ({ page }) => { await page.goBack(); }],
+  ["a landing task", async ({ page }) => {
+    await page.click('#inbox button[data-task="5"]');
+  }],
+  ["all tasks", async ({ page }) => { await page.click("#view-all"); }],
   ["repo picked", async ({ page }) => {
     await page.selectOption("#tasks-repo", "dockade");
   }],
@@ -16,12 +35,6 @@ export const STEPS = [
   ["a task opened", async ({ page }) => {
     await page.click('#tasks button[data-task="3"]');
   }],
-  ["its earlier plans", async ({ page }) => {
-    await page.click('#task-detail button[data-page="plans"]');
-  }],
-  ["its history", async ({ page }) => {
-    await page.click('#task-detail button[data-page="history"]');
-  }],
   ["a task whose plan was superseded", async ({ page }) => {
     await page.click('#tasks button[data-task="1"]');
   }],
@@ -30,9 +43,6 @@ export const STEPS = [
   }],
   ["task closed", async ({ page }) => {
     await page.click("#task-detail button[data-close]");
-  }],
-  ["opened from the flagged list", async ({ page }) => {
-    await page.click('#flagged button[data-task="3"]');
   }],
   ["search", async ({ page }) => {
     await page.fill("#tasks-search", "back up");
@@ -55,4 +65,5 @@ export const STEPS = [
     startRegistry();
     await clock(16000);
   }],
+  ["back to the inbox", async ({ page }) => { await page.click("#view-inbox"); }],
 ];

@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """What only the operator may do or see: create and edit any task, move any task to
 any state, re-parent, break a claim, note, hide and mark notes handled, keep the repo
-list; read the history, every note, and the notes marked for the operator. Every write
-is recorded under ``taskdb.OPERATOR``, and every write to a task's spec, state or claim
-names the revision the operator read.
+list; read the history, every note, the notes marked for the operator, and the inbox.
+Every write is recorded under ``taskdb.OPERATOR``, and every write to a task's spec,
+state or claim names the revision the operator read.
 
 An agent-facing surface must not call anything here (``task-registry/DESIGN.md``,
 "Two writers, two modules")."""
@@ -275,6 +275,105 @@ def history(task: int, before: int | None = None) -> dict:
                              "action": r["action"], "detail": json.loads(r["detail"])}
                             for r in reversed(page)],
                 "total": total}
+
+
+# --- the inbox -------------------------------------------------------------------
+
+#: How long a proposed or open task nobody holds goes without a write before the inbox
+#: calls it drifting, and how many drifting tasks it shows: a few to decide on, not a
+#: second backlog.
+QUIET_SECONDS = 14 * 24 * 3600
+DRIFTING_MAX = 5
+
+# Each reason a task is in the inbox, and the section it puts the task in, highest
+# first: what only the operator can answer or land, then a plan to triage, then what
+# goes wrong slowly (tasks-ui/DESIGN.md, "The inbox: whose turn it is, worked out").
+SECTIONS = {"waiting": ("flagged", "landing"), "triage": ("refined",),
+            "drifting": ("lapsed", "quiet")}
+_REASONS = [why for whys in SECTIONS.values() for why in whys]
+_SECTION_OF = {why: name for name, whys in SECTIONS.items() for why in whys}
+
+# The writes that put a task in `landing` or `refined`: a hand-in, and a task the
+# operator created landing; a move does when it changes the state. A claim only ever
+# takes a task out of the two. History is never rewritten, and a store from before
+# plans (schema 1) recorded `submit_work` as `submit`.
+_ENTERING = frozenset({"create", "submit_plan", "submit_work", "submit"})
+
+
+def inbox() -> dict:
+    """Whose turn it is the operator's, worked out from the store as it is, never
+    stored. Every task with a reason to be here, in the highest section one of its
+    reasons puts it, with all of them; each reason says since when. Oldest first, every
+    repo; all of what waits and is to triage, since a task cut from those would be the
+    operator's turn and nowhere on the page, and the oldest few of what drifts, with
+    each section's total."""
+    with taskdb.reading() as conn:
+        # One snapshot for every statement below, so the sections agree with each other
+        # and a refined task's plan is still there when it is read.
+        conn.execute("BEGIN")
+        now = claims.now()
+        found: dict[int, list[dict]] = {}
+        for r in conn.execute(
+                "SELECT task_id, COUNT(*) AS n, MIN(created_at) AS first FROM notes "
+                "WHERE for_operator = 1 AND hidden_at IS NULL AND handled_at IS NULL "
+                "GROUP BY task_id"):
+            found.setdefault(r["task_id"], []).append(
+                {"why": "flagged", "since": r["first"], "notes": r["n"]})
+        for r in conn.execute("SELECT id, state FROM tasks "
+                              "WHERE state IN ('landing', 'refined')"):
+            since, detail = _entered(conn, r["id"])
+            if r["state"] == "landing":
+                ended = detail.get("ended_claim") or {}
+                reason = {"why": "landing", "since": since,
+                          "branch": detail.get("branch") or ended.get("branch")}
+            else:
+                plan = plans.current(conn, r["id"])
+                reason = {"why": "refined", "since": since, "plan": plan["id"],
+                          "review_rounds": plan["review_rounds"]}
+            found.setdefault(r["id"], []).append(reason)
+        for r in conn.execute("SELECT task_id, holder, branch, expires_at FROM claims "
+                              "WHERE expires_at <= ?", (now,)):
+            found.setdefault(r["task_id"], []).append(
+                {"why": "lapsed", "since": r["expires_at"], "holder": r["holder"],
+                 "branch": r["branch"]})
+        for r in conn.execute(
+                "SELECT t.id, MAX(h.ts) AS last FROM tasks t "
+                "JOIN history h ON h.task_id = t.id "
+                "WHERE t.state IN ('proposed', 'open') "
+                "AND NOT EXISTS (SELECT 1 FROM claims c WHERE c.task_id = t.id) "
+                "GROUP BY t.id HAVING last <= ?", (now - QUIET_SECONDS,)):
+            found.setdefault(r["id"], []).append({"why": "quiet", "since": r["last"]})
+        sections: dict[str, list] = {name: [] for name in SECTIONS}
+        for task, reasons in found.items():
+            reasons.sort(key=lambda r: _REASONS.index(r["why"]))
+            sections[_SECTION_OF[reasons[0]["why"]]].append(
+                (min(r["since"] for r in reasons), task, reasons))
+        return {name: _section(conn, sorted(rows, key=lambda row: row[:2]),
+                               DRIFTING_MAX if name == "drifting" else None)
+                for name, rows in sections.items()}
+
+
+def _section(conn: sqlite3.Connection, rows: list, limit: int | None) -> dict:
+    shown = []
+    for since, task, reasons in rows[:limit]:
+        row = conn.execute("SELECT t.title, t.state, r.name AS repo FROM tasks t "
+                           "JOIN repos r ON r.id = t.repo_id WHERE t.id = ?",
+                           (task,)).fetchone()
+        shown.append({"task": task, "repo": row["repo"], "title": row["title"],
+                      "state": row["state"], "since": since, "reasons": reasons})
+    return {"tasks": shown, "total": len(rows)}
+
+
+def _entered(conn: sqlite3.Connection, task: int) -> tuple[float, dict]:
+    """When a landing or refined task entered its state, and what the write that put it
+    there recorded."""
+    for row in conn.execute("SELECT ts, action, detail FROM history WHERE task_id = ? "
+                            "ORDER BY id DESC", (task,)):
+        detail = json.loads(row["detail"])
+        if (row["action"] in _ENTERING
+                or (row["action"] == "move" and detail["before"] != detail["state"])):
+            return row["ts"], detail
+    raise RuntimeError(f"task {task} has no history row that put it in its state")
 
 
 # --- repos -----------------------------------------------------------------------

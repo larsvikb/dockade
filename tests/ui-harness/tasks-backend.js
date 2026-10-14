@@ -85,10 +85,43 @@ const HISTORY = {
   total: 2,
 };
 
-const FLAGGED = {
-  notes: [{ id: 12, task: 3, author: "claude-3f2a9c1e", at: NOW - 100,
-            text: "Need a decision on the port.", for_operator: true }],
-  total: 1,
+// Task 6 waits for triage with the current plan; task 5 to land, its claim ended.
+const REFINED = { ...TASK, id: 6, title: "Refined one", state: "refined", ready: false,
+                  claim: null, revision: 7, parent: null, children: [], blockers: [] };
+const LANDING = { ...REFINED, id: 5, title: `Landing ${RLO}one`, state: "landing",
+                  revision: 9 };
+
+// Every section, every reason: task 3 has a note for the operator, task 5 waits to
+// land, task 6 is refined, task 1's claim ran out and task 2
+// went quiet. Drifting shows the oldest few of more.
+const INBOX = {
+  waiting: {
+    tasks: [
+      { task: 5, repo: "dockade", title: `Landing ${RLO}one`, state: "landing",
+        since: NOW - 9000,
+        reasons: [{ why: "landing", since: NOW - 9000, branch: `land${ZWSP}-it` }] },
+      { task: 3, repo: "dockade", title: TASKS[0].title, state: "open", since: NOW - 100,
+        reasons: [{ why: "flagged", since: NOW - 100, notes: 2 }] },
+    ],
+    total: 2,
+  },
+  triage: {
+    tasks: [{ task: 6, repo: "old-repo", title: "Refined one", state: "refined",
+              since: NOW - 7200,
+              reasons: [{ why: "refined", since: NOW - 7200, plan: 2,
+                          review_rounds: 2 }] }],
+    total: 1,
+  },
+  drifting: {
+    tasks: [
+      { task: 2, repo: "dockade", title: "Back up the store", state: "open",
+        since: NOW - 20 * 86400, reasons: [{ why: "quiet", since: NOW - 20 * 86400 }] },
+      { task: 1, repo: "dockade", title: "Plain one", state: "proposed",
+        since: NOW - 4000, reasons: [{ why: "lapsed", since: NOW - 4000,
+                                       holder: `claude-${RLO}x`, branch: "plain" }] },
+    ],
+    total: 7,
+  },
 };
 
 let registryUp = true;
@@ -118,14 +151,18 @@ export function respond(method, path, body, params) {
       (params.get("text") || "").toLowerCase()));
     return { status: 200, json: { tasks: rows, total: rows.length } };
   }
-  if (path === "/api/notes/flagged") return { status: 200, json: FLAGGED };
+  if (path === "/api/inbox") return { status: 200, json: INBOX };
   if (path === "/api/tasks/3") return { status: 200, json: TASK };
   if (path === "/api/tasks/3/notes") return { status: 200, json: NOTES };
   if (path === "/api/tasks/3/history") return { status: 200, json: HISTORY };
   if (path === "/api/tasks/3/plans") return { status: 200, json: [PLAN, OLDER_PLAN] };
   if (path === "/api/tasks/1") return { status: 200, json: SENT_BACK };
   if (path === "/api/tasks/2") return { status: 200, json: UNPLANNED };
-  if (path === "/api/tasks/1/notes" || path === "/api/tasks/2/notes") {
+  if (path === "/api/tasks/6") return { status: 200, json: REFINED };
+  if (path === "/api/tasks/6/plans") return { status: 200, json: [PLAN] };
+  if (path === "/api/tasks/5") return { status: 200, json: LANDING };
+  if (["/api/tasks/1/notes", "/api/tasks/2/notes", "/api/tasks/5/notes",
+       "/api/tasks/6/notes"].includes(path)) {
     return { status: 200, json: NO_NOTES };
   }
   return null;

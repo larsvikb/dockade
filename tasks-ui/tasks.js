@@ -23,7 +23,7 @@ import { fmtStamp, fmtInstant } from "./time.js";
 // The registry's states, in the order work moves through them
 // (task-registry/DESIGN.md, "States"), and what `GET /api/tasks` takes for all of them
 // (operator_api.EVERY_STATE). A test holds both to the registry's.
-export const TASK_STATES = ["proposed", "open", "landing", "deferred", "closed"];
+export const TASK_STATES = ["proposed", "refined", "open", "landing", "deferred", "closed"];
 export const EVERY_STATE = "all";
 
 // Characters that render as nothing or reorder what is around them: the payload

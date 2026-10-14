@@ -340,9 +340,11 @@ dockade/
     tasks.py                #   fields, states, parent and blockers; the plain writes
     claims.py               #   a claim's token, expiry and footprint; the plain claim writes
     notes.py                #   a note's bounds, the plain write, the shape a note is read in
+    plans.py                #   a plan's parts and caps, the plain writes, the shape a plan
+                            #   is read in, its overlaps
     reads.py                #   what any surface may read; nothing here writes
     agent_moves.py          #   what an agent may do: propose, edit a proposal, work a
-                            #   claim, add a note
+                            #   claim, hand in a plan or the work, add a note
     agent_tools.py          #   the tools an agent sees: descriptions, schemas, the
                             #   argument check
     agent_api.py            #   the agent listener: MCP for the gateway, behind its secret

@@ -196,13 +196,16 @@ class OperatorMoveTests(_Store):
         self.refused(op.move, task, read, "open")
         self.assertEqual(reads.get_task(task)["state"], "proposed")
 
-    def test_the_operator_edits_any_state_and_create_takes_any_state(self):
+    def test_the_operator_edits_any_state_and_create_takes_any_state_but_refined(self):
         task = self.open_task()
         op.edit(task, 1, title="Renamed", severity="high")
         got = reads.get_task(task)
         self.assertEqual((got["title"], got["severity"], got["revision"]), ("Renamed", "high", 2))
         for state in reg.tasks.STATES:
             with self.subTest(state=state):
+                if state == "refined":  # a plan makes a task refined, and a new one has none
+                    self.refused(op.create, "gadgets", "T", "B", state)
+                    continue
                 created = op.create("gadgets", "T", "B", state)["task"]
                 self.assertEqual(reads.get_task(created)["state"], state)
         self.refused(op.create, "gadgets", "T", "B", "done")
@@ -402,6 +405,18 @@ class SchemaTests(_Store):
         with reg.taskdb.reading() as conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM history "
                                           "WHERE author = ?", (ALICE,)).fetchone()[0], 0)
+
+    def test_a_v1_store_is_taken_forward_by_adding_the_plan_tables(self):
+        task = op.create("widgets", "A task", "B", "proposed")["task"]
+        conn = sqlite3.connect(reg.taskdb.DB_PATH)
+        conn.executescript("DROP TABLE plan_paths; DROP TABLE plans; "
+                           "PRAGMA user_version = 1;")
+        conn.close()
+        reg.taskdb.init()
+        with reg.taskdb.reading() as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM plans").fetchone()[0], 0)
+        self.assertEqual(reads.get_task(task)["plan"], None)
 
     def test_a_store_from_another_schema_version_is_refused(self):
         conn = sqlite3.connect(reg.taskdb.DB_PATH)

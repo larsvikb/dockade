@@ -15,6 +15,7 @@ import time
 
 import claims
 import notes
+import plans
 import taskdb
 import tasks
 from taskdb import OPERATOR, Refused
@@ -38,6 +39,8 @@ def create(repo: str, title: str, body: str, state: str, severity: str | None = 
            blocked_by: list[int] | tuple[int, ...] = ()) -> dict:
     tasks.check_new(title, body, severity, kind)
     tasks.check_state(state)
+    if state == "refined":
+        raise Refused("a new task has no plan, so cannot start refined")
     with taskdb.writing() as conn:
         repo_id = tasks.repo_id(conn, repo, for_new_task=True)
         tasks.check_parent(conn, repo_id, parent)
@@ -86,15 +89,20 @@ def _check_clear(clear: object, given: dict) -> list[str]:
 
 
 def move(task: int, revision: int, state: str) -> dict:
-    """Any state to any state: triage, deferring, reopening, closing. A move to any
-    state but ``open`` ends the task's claim."""
+    """Any state to any state: triage, deferring, reopening, closing; ``refined`` only
+    with a current plan. A claim works in the state it was taken in, so a move that
+    changes the state ends it. Moving a refined task to ``open`` approves its body and
+    plan as of ``revision``: the revision pins the plan."""
     tasks.check_state(state)
     with taskdb.writing() as conn:
         row = tasks.task_row(conn, task)
         tasks.check_revision(conn, row, revision)
+        if state == "refined" and plans.current(conn, task) is None:
+            raise Refused(f"task {task} has no current plan; an agent's submit_plan "
+                          f"makes a task refined", {"state": row["state"]})
         claims.sweep(conn)
         held = claims.live(conn, task)
-        ending = held is not None and state != "open"
+        ending = held is not None and state != row["state"]
         if ending:
             claims.end(conn, task)
         new_revision = tasks.update(conn, task, {"state": state})

@@ -238,6 +238,11 @@ def reparent(task: int, req: Reparent) -> JSONResponse:
     return _reply(write(operator_moves.reparent, task, req.revision, req.parent))
 
 
+@app.get("/api/tasks/{task}/plans")
+def task_plans(task: int) -> JSONResponse:
+    return _reply(read(reads.task_plans, task))
+
+
 @app.get("/api/tasks/{task}/history")
 def history(task: int, before: int | None = None) -> JSONResponse:
     return _reply(read(operator_moves.history, task, before))

@@ -76,6 +76,23 @@ class _Stores(unittest.TestCase):
         finally:
             conn.close()
 
+    def as_v1(self, data: bytes) -> bytes:
+        """``data`` as a store from before plans: no plan tables, at v1."""
+        path = self.write("v1.db", data)
+        conn = sqlite3.connect(path)
+        conn.executescript("DROP TABLE plan_paths; DROP TABLE plans; "
+                           "PRAGMA user_version = 1;")
+        conn.close()
+        return _read(path)
+
+    def planned(self, repo: str = "widgets") -> dict:
+        """A proposal in ``repo`` refined into a plan; the reply of ``submit_plan``."""
+        task = agent.propose(ALICE, repo, "Rotate keys", "Every 90 days.")["task"]
+        token = agent.claim(ALICE, repo, task, "rotate-keys", ["."])["token"]
+        return agent.submit_plan(ALICE, repo, task, token, "Rotate in place.",
+                                 ["src/keys.py", "tests"], "Old keys still read.",
+                                 "None.", "A reader mid-rotation.", 2, "Passes.")
+
     def write(self, name: str, data: bytes) -> str:
         path = os.path.join(self.dir, name)
         with open(path, "wb") as f:
@@ -214,7 +231,32 @@ class RestoreTests(_Stores):
                             "update the image first")
 
     def test_a_schema_the_registry_would_not_open_is_refused(self):
-        self.assert_refused(self.with_version(-1), "opens v1 only")
+        self.assert_refused(self.with_version(-1), "opens v1, v2 only")
+
+    def test_a_v1_backup_is_restored_and_taken_forward_at_the_next_start(self):
+        self.assertIn("schema-v1 backup", self.restore(self.as_v1(self.backup)))
+        reg.taskdb.init()
+        with reg.taskdb.reading() as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],
+                             reg.taskdb.SCHEMA_VERSION)
+        self.assertEqual(reg.reads.list_tasks("widgets")["total"], 2)
+        self.assertEqual(self.planned()["plan"], 1)
+
+    def test_a_v2_backup_without_its_plan_tables_is_refused(self):
+        path = self.write("no-plans.db", self.backup)
+        conn = sqlite3.connect(path)
+        conn.executescript("DROP TABLE plan_paths; DROP TABLE plans;")
+        conn.close()
+        self.assert_refused(_read(path), "missing table(s): plan_paths, plans")
+
+    def test_plan_ids_carry_on_past_a_v1_restore(self):
+        # A plan id the live store handed out must not name another plan after a
+        # restore of a backup from before plans existed.
+        reg.taskdb.DB_PATH = self.live
+        self.assertEqual(self.planned("gadgets")["plan"], 1)
+        self.restore(self.as_v1(self.backup))
+        reg.taskdb.init()
+        self.assertEqual(self.planned()["plan"], 2)
 
     def test_a_store_never_versioned_is_one_the_registry_opens(self):
         self.restore(self.with_version(0))
@@ -394,7 +436,7 @@ class ExportTests(_Stores):
         self.assertRegex(text, r"- retired \d{4}-\d\d-\d\dT[\d:]{8}Z, taking no new task")
         self.assertIn(f"- parent #{opened}", text)
         self.assertIn(f"- blocked by #{opened} (open)", text)
-        self.assertIn("Rendered 2025-10-09T08:53:20Z from a schema-v1 store: 2 repos, "
+        self.assertIn("Rendered 2025-10-09T08:53:20Z from a schema-v2 store: 2 repos, "
                       "4 tasks, 0 notes (0 hidden).", text)
 
     def test_the_claim_and_every_note_with_the_hidden_ones_marked(self):
@@ -435,6 +477,13 @@ class ExportTests(_Stores):
             conn.execute("INSERT INTO notes(task_id, author, text, for_operator, move, "
                          "created_at) VALUES (?, ?, ?, 0, ?, 0)",
                          (task, hostile, hostile, hostile))
+            plan = conn.execute(
+                "INSERT INTO plans(task_id, task_revision, author, created_at, approach, "
+                "tests, out_of_scope, risks, review_rounds, review_verdict) "
+                "VALUES (?, 1, ?, 0, ?, ?, ?, ?, 1, ?)",
+                (task, hostile, *[hostile] * 5)).lastrowid
+            conn.execute("INSERT INTO plan_paths(plan_id, path) VALUES (?, ?)",
+                         (plan, hostile))
         text = self.render()
         self.assertEqual(_headings(text), [
             "# Task registry export", f"## Repo {export.inline(hostile)}",
@@ -448,6 +497,32 @@ class ExportTests(_Stores):
         self.assertIn("on branch `` `b` ``", text)
         self.assertIn("footprint ``a`b``, `\\u000a# x`", text)
         self.assertIn(f", with {export.inline(hostile)}:", text)
+        self.assertIn(f"Plan {plan}, by {export.inline(hostile)}, ", text)
+        self.assertIn(f"- footprint {export.inline(hostile)}", text)
+
+    def test_each_plan_with_the_superseded_ones_marked(self):
+        self.use("live")
+        op.add_repo("widgets")
+        first = self.planned()
+        task = reg.reads.get_task(first["task"])
+        agent.claim(ALICE, "widgets", task["id"], "again", ["."])
+        text = self.render()
+        self.assertRegex(text, rf"Plan {first['plan']}, by `{ALICE}`, \S+Z, at task "
+                               rf"revision {first['revision']}, 2 review round\(s\), "
+                               rf"\*\*SUPERSEDED\*\* \S+Z:")
+        self.assertIn("- footprint `src/keys.py`, `tests`", text)
+        for part, value in (("Approach", "Rotate in place."), ("Tests", "Old keys still read."),
+                            ("Out of scope", "None."), ("Risks", "A reader mid-rotation."),
+                            ("Review verdict", "Passes.")):
+            self.assertIn(f"{part}:\n\n```text\n{value}\n```", text)
+        self.assertLess(text.index("Body:"), text.index(f"Plan {first['plan']}"))
+
+    def test_a_v1_store_renders_without_plans(self):
+        self.use("live")
+        self.fill()
+        text = export.main(self.as_v1(self.snapshot()))
+        self.assertIn("from a schema-v1 store: 1 repos, 2 tasks", text)
+        self.assertNotIn("Plan ", text)
 
     def test_a_footprint_that_is_not_a_list_of_paths_is_shown_as_stored(self):
         for stored in ("not json", "[]", '{"a": 1}', "[1]"):
@@ -475,13 +550,14 @@ class ExportTests(_Stores):
         with self.assertRaises(SystemExit) as caught:
             export.main(b"# a markdown file\n")
         self.assertIn("not a SQLite database", str(caught.exception.code))
-        path = self.write("v2.db", data)
+        newer = reg.taskdb.SCHEMA_VERSION + 1
+        path = self.write("newer.db", data)
         conn = sqlite3.connect(path)
-        conn.execute("PRAGMA user_version = 2")
+        conn.execute(f"PRAGMA user_version = {newer}")
         conn.close()
         with self.assertRaises(SystemExit) as caught:
             export.main(_read(path))
-        self.assertIn("schema v2", str(caught.exception.code))
+        self.assertIn(f"schema v{newer}", str(caught.exception.code))
 
 
 class MakefileTargetsAgreeTests(unittest.TestCase):

@@ -13,8 +13,8 @@ from __future__ import annotations
 import ast
 
 #: The task registry's store modules.
-STORE = frozenset({"taskdb", "tasks", "claims", "notes", "reads", "agent_moves",
-                   "operator_moves"})
+STORE = frozenset({"taskdb", "tasks", "claims", "notes", "plans", "reads",
+                   "agent_moves", "operator_moves"})
 
 
 def reached(source: str, roots: frozenset[str] = STORE,

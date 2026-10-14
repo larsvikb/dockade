@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Claims: one agent's hold on an ``open`` task, the token that proves it, its expiry,
-and the footprint it declares. The checks and plain writes here; the moves that take
-and end a claim are in ``agent_moves`` and ``operator_moves``."""
+"""Claims: one agent's hold on a task, to refine it while ``proposed`` or to do it while
+``open``, the token that proves it, its expiry, and the footprint it declares. The
+checks and plain writes here; the moves that take and end a claim are in
+``agent_moves`` and ``operator_moves``."""
 from __future__ import annotations
 
 import hashlib
@@ -39,6 +40,12 @@ BRANCH_MAX = 200
 PROGRESS_MAX = 500
 FOOTPRINT_MAX = 50
 PATH_MAX = 300
+
+#: The state a claim takes a task into, by the state it was in: a claim refines a
+#: ``proposed`` task or does an ``open`` one, and claiming a task past either takes it
+#: back for rework.
+CLAIMED_INTO = {"proposed": "proposed", "refined": "proposed", "open": "open",
+                "landing": "open"}
 
 _BRANCH_RE = re.compile(r"[A-Za-z0-9._/-]+")
 
@@ -81,6 +88,11 @@ def _contains(outer: str, inner: str) -> bool:
     return outer in (".", inner) or inner.startswith(outer + "/")
 
 
+def shared(theirs: list[str], mine: list[str]) -> list[str]:
+    """The paths of ``theirs`` that overlap ``mine``: one path containing the other."""
+    return [p for p in theirs if any(_contains(p, m) or _contains(m, p) for m in mine)]
+
+
 # --- the live claim --------------------------------------------------------------
 
 def live(conn: sqlite3.Connection, task: int) -> sqlite3.Row | None:
@@ -97,7 +109,7 @@ def check_holder(conn: sqlite3.Connection, row: sqlite3.Row, agent: str,
     claim = conn.execute("SELECT * FROM claims WHERE task_id = ?", (row["id"],)).fetchone()
     if claim is None or claim["expires_at"] <= now():
         mine = claim is not None and claim["holder"] == agent
-        now_ = ("it is free to claim" if row["state"] in ("open", "landing")
+        now_ = ("it is free to claim" if row["state"] in CLAIMED_INTO
                 else f"it is {row['state']}")
         raise Refused(
             f"your claim on task {row['id']} lapsed; {now_}" if mine
@@ -121,12 +133,11 @@ def overlaps(conn: sqlite3.Connection, repo_id: int, task: int,
             "SELECT c.*, t.title FROM claims c JOIN tasks t ON t.id = c.task_id "
             "WHERE t.repo_id = ? AND c.task_id != ? AND c.expires_at > ? "
             "ORDER BY c.task_id", (repo_id, task, now())):
-        shared = [p for p in json.loads(other["footprint"])
-                  if any(_contains(p, mine) or _contains(mine, p) for mine in paths)]
-        if shared:
+        common = shared(json.loads(other["footprint"]), paths)
+        if common:
             found.append({"task": other["task_id"], "title": other["title"],
                           "holder": other["holder"], "branch": other["branch"],
-                          "paths": shared})
+                          "paths": common})
     return found
 
 

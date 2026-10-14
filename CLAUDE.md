@@ -64,7 +64,7 @@ only the invariants and conventions for working in the repo.
   - at session start, and before work that could collide, `tasks__list_tasks`;
   - before the first edit on one of its tasks, `tasks__claim`;
   - after each commit, `tasks__update`;
-  - once the review passes, `tasks__submit`.
+  - once the review passes, `tasks__submit_work`.
 
   A session that briefs a worker claims the task itself and puts the token in the
   brief; the worker updates after each commit, and the briefing session submits once

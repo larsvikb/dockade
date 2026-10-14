@@ -66,8 +66,8 @@ class TakingTests(_Store):
         self.assertNotIn(reply["token"], everything)
         self.assertNotIn(claims._hash(reply["token"]), everything)
 
-    def test_only_an_open_or_landing_task_can_be_claimed(self):
-        for state in ("proposed", "deferred", "closed"):
+    def test_a_deferred_or_closed_task_cannot_be_claimed(self):
+        for state in ("deferred", "closed"):
             with self.subTest(state=state):
                 task = op.create("widgets", "T", "B", state)["task"]
                 self.assertEqual(self.refused(self.claim, task).current, {"state": state})
@@ -82,7 +82,7 @@ class TakingTests(_Store):
     def test_claiming_a_landing_task_reopens_it(self):
         task = self.open_task()
         token = self.claim(task)["token"]
-        agent.submit(ALICE, "widgets", task, token)
+        agent.submit_work(ALICE, "widgets", task, token)
         self.assertEqual(reads.get_task(task)["state"], "landing")
         self.claim(task, who=BOB)
         self.assertEqual(reads.get_task(task)["state"], "open")
@@ -130,8 +130,8 @@ class HolderTests(_Store):
         self.assertEqual([h["action"] for h in op.history(self.task)["history"]][-2:],
                          ["update", "update"])
 
-    def test_submit_send_back_and_release_end_the_claim(self):
-        for move, state in ((agent.submit, "landing"), (agent.release, "open")):
+    def test_submit_work_send_back_and_release_end_the_claim(self):
+        for move, state in ((agent.submit_work, "landing"), (agent.release, "open")):
             with self.subTest(move=move.__name__):
                 task = self.open_task()
                 token = self.claim(task)["token"]
@@ -148,7 +148,7 @@ class HolderTests(_Store):
 
     def test_an_ending_records_the_branch_to_land(self):
         agent.update(ALICE, "widgets", self.task, self.token, branch="fix-widgets-2")
-        agent.submit(ALICE, "widgets", self.task, self.token)
+        agent.submit_work(ALICE, "widgets", self.task, self.token)
         last = op.history(self.task)["history"][-1]["detail"]
         self.assertEqual((last["branch"], last["holder"]), ("fix-widgets-2", ALICE))
 

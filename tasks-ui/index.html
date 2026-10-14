@@ -23,7 +23,7 @@
     display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
   header h1 { font-size: 16px; margin: 0; font-weight: 600; }
   header .sub { color: var(--dim); font-size: 12px; }
-  main { padding: 20px; max-width: 960px; margin: 0 auto; }
+  main { padding: 20px; max-width: 1440px; margin: 0 auto; }
   h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
     color: var(--dim); margin: 4px 0 10px; }
   h2 .note { text-transform: none; letter-spacing: 0; font-weight: 400; }
@@ -71,8 +71,25 @@
   .prose { white-space: pre-wrap; word-break: break-word; }
   .task-body { margin: 10px 0; padding: 8px; background: var(--bg);
     border: 1px solid var(--line); border-radius: 6px; max-height: 50vh; overflow: auto; }
-  #task-detail { margin: 12px 0 20px; padding: 10px 12px; background: var(--panel);
-    border: 1px solid var(--line); border-radius: 8px; }
+  /* The list, and the task read beside it once one is open: the detail keeps its
+     place while the list scrolls. One column on a narrow window, the task below. */
+  .panes { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px;
+    align-items: start; }
+  .panes.reading { grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); }
+  @media (max-width: 960px) {
+    .panes.reading { grid-template-columns: minmax(0, 1fr); }
+  }
+  #task-detail { padding: 10px 12px; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 8px;
+    position: sticky; top: 12px; max-height: calc(100vh - 24px); overflow: auto; }
+  .views { display: flex; gap: 6px; margin: 4px 0 14px; }
+  .views button[aria-pressed="true"] { border-color: var(--accent); }
+  .views .note { font-size: 12px; }
+  /* An inbox row's reasons, under its title: why it is the operator's turn. */
+  .why { color: var(--dim); font-size: 12px; }
+  #inbox h2 { margin-top: 18px; }
+  #inbox .empty { padding: 0 0 6px; }
+  tr[aria-current] td { background: var(--panel); }
   #task-detail h3 { font-size: 14px; margin: 4px 0 8px; }
   /* A plan, part by part, set apart from the body it goes with. */
   .plan { margin: 6px 0 10px; padding: 8px; border: 1px solid var(--line);
@@ -89,7 +106,6 @@
 </header>
 
 <main>
-  <h2>Tasks <span class="note" id="taskcount"></span></h2>
   <!-- The task registry can stop on its own, so not running is a state of this page
        rather than an error: tasks.js fills this line, and the poll asks again. -->
   <div class="empty" id="tasks-down" hidden></div>
@@ -99,40 +115,44 @@
       title, body and note here was written by an agent or for one; a character that
       would render as nothing, or reorder the text around it, is spelled out.
     </div>
-    <!-- Plain controls, as the audit filter bar is: they narrow what is shown. The
-         state options are filled from TASK_STATES in tasks.js. -->
-    <div class="filters" role="search">
-      <select id="tasks-repo" aria-label="Repo"></select>
-      <select id="tasks-state" aria-label="State"></select>
-      <input type="search" id="tasks-search" autocomplete="off" spellcheck="false"
-             placeholder="search titles, bodies and notes in every state"
-             aria-label="Search tasks">
-    </div>
-    <table>
-      <thead><tr><th>task</th><th>title</th><th>state</th><th>severity · kind</th>
-        <th>held by</th><th>notes</th></tr></thead>
-      <tbody id="tasks"></tbody>
-    </table>
-    <div class="empty" id="tasks-empty" hidden></div>
-    <div class="pager">
-      <button type="button" id="tasks-newest" hidden>&larr; newest</button>
-      <button type="button" id="tasks-older" hidden>older &rarr;</button>
-    </div>
-    <div id="task-detail" hidden></div>
-
-    <h2>For you <span class="note" id="flaggedcount"></span></h2>
-    <div class="empty">
-      Notes agents flagged for the operator, not yet handled. Nobody waits on one: an
-      agent that cannot go on sends its task back or releases it.
-    </div>
-    <table>
-      <thead><tr><th>task</th><th>by</th><th>when</th><th>note</th></tr></thead>
-      <tbody id="flagged"></tbody>
-    </table>
-    <div class="empty" id="flagged-empty" hidden></div>
-    <div class="pager">
-      <button type="button" id="flagged-newest" hidden>&larr; newest</button>
-      <button type="button" id="flagged-older" hidden>older &rarr;</button>
+    <!-- Two views of one list pane; the task read beside it stays as the view changes.
+         The URL's hash names both (parseHash in tasks.js). -->
+    <nav class="views" aria-label="Views">
+      <button type="button" id="view-inbox" aria-pressed="true">Inbox
+        <span class="note" id="inboxcount"></span></button>
+      <button type="button" id="view-all" aria-pressed="false">All tasks</button>
+    </nav>
+    <div class="panes" id="panes">
+      <div class="list-pane">
+        <section id="inbox-view">
+          <!-- Filled from the registry's inbox, a section at a time (renderInbox). -->
+          <div id="inbox"></div>
+          <div class="empty" id="inbox-empty" hidden></div>
+        </section>
+        <section id="all-view" hidden>
+          <h2>Tasks <span class="note" id="taskcount"></span></h2>
+          <!-- Plain controls, as the audit filter bar is: they narrow what is shown. The
+               state options are filled from TASK_STATES in tasks.js. -->
+          <div class="filters" role="search">
+            <select id="tasks-repo" aria-label="Repo"></select>
+            <select id="tasks-state" aria-label="State"></select>
+            <input type="search" id="tasks-search" autocomplete="off" spellcheck="false"
+                   placeholder="search titles, bodies and notes in every state"
+                   aria-label="Search tasks">
+          </div>
+          <table>
+            <thead><tr><th>task</th><th>title</th><th>state</th><th>severity · kind</th>
+              <th>held by</th><th>notes</th></tr></thead>
+            <tbody id="tasks"></tbody>
+          </table>
+          <div class="empty" id="tasks-empty" hidden></div>
+          <div class="pager">
+            <button type="button" id="tasks-newest" hidden>&larr; newest</button>
+            <button type="button" id="tasks-older" hidden>older &rarr;</button>
+          </div>
+        </section>
+      </div>
+      <div id="task-detail" hidden></div>
     </div>
   </div>
 </main>

@@ -235,7 +235,10 @@ carries rather than reading again.
 **The operator's reads come a page at a time with the total** (the flagged notes, a
 task's notes, its history), and a bulk hide or handle names its notes rather than
 matching a filter: a flood is cleared by what a page showed, so a note that arrives
-meanwhile is not swept up unseen. All of a bulk lands, or none of it.
+meanwhile is not swept up unseen. All of a bulk lands, or none of it. The inbox
+(`operator_moves.inbox`) is the exception: what waits on the operator and what is to
+triage come whole, since a task a page left out would be the operator's turn and shown
+nowhere, and their size is what the operator has not yet done.
 
 ## Every write leaves a history row
 

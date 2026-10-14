@@ -284,6 +284,11 @@ def handle_notes(req: HandleNotes) -> JSONResponse:
     return _reply(write(operator_moves.handle_notes, req.notes, req.handled))
 
 
+@app.get("/api/inbox")
+def inbox() -> JSONResponse:
+    return _reply(read(operator_moves.inbox))
+
+
 # --- repos ------------------------------------------------------------------------
 
 @app.get("/api/repos")

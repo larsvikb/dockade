@@ -78,7 +78,8 @@ _RELAY_ROUTES = (
     ("GET", re.compile(r"^/api/tasks/[0-9]{1,19}/history$")),
     # Every plan a task had, superseded ones marked: what a plan replaced.
     ("GET", re.compile(r"^/api/tasks/[0-9]{1,19}/plans$")),
-    ("GET", re.compile(r"^/api/notes/flagged$")),
+    # Whose turn it is the operator's: the page opens on it.
+    ("GET", re.compile(r"^/api/inbox$")),
     ("GET", re.compile(r"^/api/search$")),
 )
 

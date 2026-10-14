@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 /* The tasks page: the task registry's work list, read through this UI's relay to the
- * registry's operator listener (`/api/…`, tasks-ui/app.py). A backlog nobody waits on,
- * so nothing here alerts the way a hold does: the page's title carries a quiet count of
- * the notes agents flagged for the operator.
+ * registry's operator listener (`/api/…`, tasks-ui/app.py). It opens on the inbox,
+ * what is the operator's turn, with the task read beside it; every task is a view
+ * away. A backlog nobody waits on, so nothing here alerts the way a hold does: the
+ * page's title carries a quiet count of what waits on the operator.
  *
  * The registry can stop on its own. The page asks `/running` first, which this
  * container answers itself, so a registry that is not running is one line on the page
@@ -109,15 +110,19 @@ export function planParts(plan) {
   });
 }
 
+// "2 review rounds", or nothing when the count is missing.
+function reviewRounds(value) {
+  const rounds = Number(value);
+  return Number.isInteger(rounds) ? `${rounds} review round${rounds === 1 ? "" : "s"}` : "";
+}
+
 // What a plan says about itself: which one, whose, when, against which revision of the
 // task, after how many reviews, and whether it was superseded.
 export function planHeading(plan) {
   if (!plan || typeof plan !== "object") return "";
-  const rounds = Number(plan.review_rounds);
   const parts = [`plan ${plan.id}`, `by ${spellHidden(plan.author).text}`,
                  fmtStamp(plan.at), `at revision ${plan.task_revision}`,
-                 Number.isInteger(rounds)
-                   ? `${rounds} review round${rounds === 1 ? "" : "s"}` : ""];
+                 reviewRounds(plan.review_rounds)];
   if (plan.superseded_at) parts.push(`superseded ${fmtStamp(plan.superseded_at)}`);
   return parts.filter(Boolean).join(" · ");
 }
@@ -149,9 +154,54 @@ export function earlierPlans(plans, shownId) {
   return (Array.isArray(plans) ? plans : []).filter(p => p && Number(p.id) !== shown);
 }
 
-// The quiet count: notes waiting on the operator, or nothing. Never "0", which would
+// The inbox's sections, highest first, as the registry names them
+// (`operator_moves.SECTIONS`; a test holds them equal), each with its heading and what
+// puts a task there.
+export const INBOX_SECTIONS = [
+  ["waiting", "Waiting on you",
+   "A note an agent flagged for you, or work handed in for you to land."],
+  ["triage", "To triage",
+   "A plan an agent had reviewed and handed in, for you to approve or send back."],
+  ["drifting", "Drifting",
+   "A claim that ran out and nobody swept, or a task nobody holds that went quiet."],
+];
+
+// One reason a task is in the inbox, and since when. A holder and a branch are an
+// agent's, so spelled.
+export function reasonText(reason) {
+  if (!reason || typeof reason !== "object") return "";
+  const since = fmtStamp(reason.since);
+  switch (reason.why) {
+    case "flagged": {
+      const n = Number(reason.notes);
+      return `${n} note${n === 1 ? "" : "s"} for you since ${since}`;
+    }
+    case "landing":
+      return `landing since ${since}`
+        + (reason.branch ? ` on ${spellHidden(reason.branch).text}` : "");
+    case "refined":
+      return [`refined since ${since}`, `plan ${reason.plan}`,
+              reviewRounds(reason.review_rounds)]
+        .filter(Boolean).join(", ");
+    case "lapsed":
+      return `claim by ${spellHidden(reason.holder).text} on `
+        + `${spellHidden(reason.branch).text} ran out ${since}`;
+    case "quiet":
+      return `nothing written since ${since}`;
+    default:
+      return spellHidden(String(reason.why)).text;
+  }
+}
+
+// A section's count beside its heading: the total, and how many are shown when a page
+// does not hold them all.
+export function sectionCount(shown, total) {
+  return shown < total ? `· ${shown} of ${total}, oldest first` : `· ${total}`;
+}
+
+// The quiet count: what waits on the operator, or nothing. Never "0", which would
 // still draw the eye to a page nobody needs to open.
-export function flaggedBadge(total) {
+export function countBadge(total) {
   const n = Number(total);
   return Number.isInteger(n) && n > 0 ? String(n) : "";
 }
@@ -160,8 +210,27 @@ export function flaggedBadge(total) {
 // count, so a background tab shows it in the tab strip.
 export const PAGE_TITLE = "dockade tasks";
 export function pageTitle(total) {
-  const count = flaggedBadge(total);
+  const count = countBadge(total);
   return (count ? `(${count}) ` : "") + PAGE_TITLE;
+}
+
+// The URL's hash names the view and the task read beside it, so a reload or a link
+// keeps both, and the browser's back goes to the task read before. A task id is
+// digits, as the relay takes one, without leading zeros, as a row names it; anything
+// else names none. Not through Number: an id may pass 2^53.
+export function parseHash(hash) {
+  const q = new URLSearchParams(String(hash ?? "").replace(/^#/, ""));
+  const task = q.get("task");
+  return { view: q.get("view") === "all" ? "all" : "inbox",
+           task: task !== null && /^[0-9]{1,19}$/.test(task)
+             ? task.replace(/^0+(?=[0-9])/, "") : null };
+}
+export function hashFor(view, task) {
+  const q = new URLSearchParams();
+  if (view === "all") q.set("view", "all");
+  if (task !== null && task !== undefined && task !== "") q.set("task", String(task));
+  const s = q.toString();
+  return s ? `#${s}` : "";
 }
 
 // What a list says about itself, as every polled list does (list-status.js). Its own
@@ -180,14 +249,13 @@ export function tasksStatus(rowCount, failed, loaded, searching) {
   return s;
 }
 
-const FLAGGED_STATUS_TEXT = {
-  stale: "Could not refresh — these are the last flagged notes loaded and may be out "
-         + "of date.",
-  cold: "Could not load the flagged notes.",
-  empty: "No note waits on you.",
+const INBOX_STATUS_TEXT = {
+  stale: "Could not refresh — this is the inbox as last loaded and may be out of date.",
+  cold: "Could not load the inbox.",
+  empty: "Nothing is your turn: no note for you, nothing to land, triage or look into.",
 };
-export function flaggedStatus(rowCount, failed, loaded) {
-  return pollStatus(FLAGGED_STATUS_TEXT, rowCount, failed, loaded);
+export function inboxStatus(rowCount, failed, loaded) {
+  return pollStatus(INBOX_STATUS_TEXT, rowCount, failed, loaded);
 }
 
 // The relay's answer when the registry did not answer (`_registry_unreachable` in
@@ -207,8 +275,8 @@ export const NOT_RUNNING_TEXT =
 export const TASKS_POLL_MS = 15000;
 
 let tasksDown, tasksUp, tasksRepo, tasksState, tasksSearch, tasksBody, tasksEmpty,
-  tasksOlder, tasksNewest, taskCountEl, taskDetail, flaggedBody, flaggedEmpty,
-  flaggedOlder, flaggedNewest, flaggedCountEl;
+  tasksOlder, tasksNewest, taskCountEl, taskDetail, panes, inboxEl, inboxEmpty,
+  inboxCountEl, viewInbox, viewAll, inboxView, allView;
 
 let running = null;        // null: not asked yet
 let probing = null;        // the ask in flight, if one is
@@ -220,13 +288,11 @@ let listLoaded = false;
 let searching = "";
 let lastTasks = [];
 let lastTotal = 0;
-let flaggedPages = [];
-let flaggedSeen = 0;
-let flaggedFailed = false;
-let flaggedLoaded = false;
-let lastFlagged = [];
-let lastFlaggedTotal = 0;
-let openTask = null;       // the id whose detail is shown
+let inboxFailed = false;
+let inboxLoaded = false;
+let lastInbox = null;
+let view = "inbox";
+let openTask = null;       // the id whose detail is shown, as the hash names it
 
 export function registryIsRunning() { return running === true; }
 
@@ -268,8 +334,9 @@ async function probe() {
   setRunning(up);
   if (up) {
     await refreshRepos();
+    refreshInbox();
     refreshTasks();
-    refreshFlagged();
+    applyHash();
   }
 }
 
@@ -305,14 +372,7 @@ function renderTasks(rows, total) {
   tasksBody.replaceChildren();
   for (const t of rows) {
     const tr = document.createElement("tr");
-    const idCell = document.createElement("td");
-    const open = document.createElement("button");
-    open.type = "button";
-    open.className = "group-toggle";
-    open.dataset.task = String(t.id);
-    open.textContent = `#${t.id}`;
-    idCell.appendChild(open);
-    tr.appendChild(idCell);
+    tr.appendChild(openCell(t.id));
     cell(tr, spellHidden(t.title).text);
     const stateCell = document.createElement("td");
     const tag = document.createElement("span");
@@ -331,6 +391,7 @@ function renderTasks(rows, total) {
   taskCountEl.textContent = !listLoaded ? ""
     : searching && rows.length < total ? `· ${rows.length} of ${total} found, newest first`
     : `· ${total} ${searching ? "found" : "in all"}`;
+  markOpen();
   renderListStatus(tasksEmpty,
                    tasksStatus(rows.length, listFailed, listLoaded, Boolean(searching)));
 }
@@ -370,49 +431,88 @@ function resetList() {
   listLoaded = false;
 }
 
-export async function refreshFlagged() {
+export async function refreshInbox() {
   if (!registryIsRunning()) return;
-  const q = new URLSearchParams();
-  const before = flaggedPages[flaggedPages.length - 1];
-  if (before !== undefined) q.set("before", String(before));
   try {
-    const page = await registryJson(await fetch(`/api/notes/flagged?${q}`));
-    lastFlagged = page.notes;
-    lastFlaggedTotal = page.total;
-    flaggedFailed = false;
-    flaggedLoaded = true;
+    lastInbox = await registryJson(await fetch("/api/inbox"));
+    inboxFailed = false;
+    inboxLoaded = true;
   } catch (e) {
-    flaggedFailed = true;
+    inboxFailed = true;
   }
+  // Checked again: a 502 clears the count, and drawing the old inbox would set it back.
   if (!registryIsRunning()) return;
-  flaggedBody.replaceChildren();
-  for (const n of lastFlagged) {
-    const tr = document.createElement("tr");
-    const taskCell = document.createElement("td");
-    const open = document.createElement("button");
-    open.type = "button";
-    open.className = "group-toggle";
-    open.dataset.task = String(n.task);
-    open.textContent = `#${n.task}`;
-    taskCell.appendChild(open);
-    tr.appendChild(taskCell);
-    authorCell(tr, n.author);
-    const at = cell(tr, fmtStamp(n.at), "ts");
-    at.title = fmtInstant(n.at);
-    textCell(tr, n.text);
-    flaggedBody.appendChild(tr);
+  renderInbox(lastInbox);
+}
+
+// Each section that has a task in it, highest first, one row per task with every
+// reason it is there.
+function renderInbox(inbox) {
+  inboxEl.replaceChildren();
+  let rows = 0;
+  for (const [key, heading, about] of INBOX_SECTIONS) {
+    const section = inbox && inbox[key];
+    const shown = section && Array.isArray(section.tasks) ? section.tasks : [];
+    if (!shown.length) continue;
+    rows += shown.length;
+    const head = document.createElement("h2");
+    const count = document.createElement("span");
+    count.className = "note";
+    count.textContent = sectionCount(shown.length, section.total);
+    head.append(`${heading} `, count);
+    const line = document.createElement("div");
+    line.className = "empty";
+    line.textContent = about;
+    const table = document.createElement("table");
+    const tbody = document.createElement("tbody");
+    for (const t of shown) tbody.appendChild(inboxRow(t));
+    table.appendChild(tbody);
+    inboxEl.append(head, line, table);
   }
-  flaggedCountEl.textContent = flaggedLoaded ? `· ${lastFlaggedTotal}` : "";
-  // The count is every flagged note not yet handled, whichever page is shown.
-  if (flaggedPages.length === 0 && flaggedLoaded) {
-    document.title = pageTitle(lastFlaggedTotal);
+  const waiting = inbox && inbox.waiting ? inbox.waiting.total : 0;
+  inboxCountEl.textContent = countBadge(waiting);
+  if (inboxLoaded) document.title = pageTitle(waiting);
+  renderListStatus(inboxEmpty, inboxStatus(rows, inboxFailed, inboxLoaded));
+  markOpen();
+}
+
+function inboxRow(t) {
+  const tr = document.createElement("tr");
+  tr.appendChild(openCell(t.task));
+  const td = document.createElement("td");
+  const title = document.createElement("div");
+  const tag = document.createElement("span");
+  tag.className = "tag";
+  tag.textContent = t.state;
+  title.append(spellHidden(t.title).text, " ", tag);
+  const why = document.createElement("div");
+  why.className = "why";
+  why.textContent = [t.repo, ...(Array.isArray(t.reasons) ? t.reasons : [])
+    .map(reasonText)].filter(Boolean).join(" · ");
+  td.append(title, why);
+  tr.appendChild(td);
+  return tr;
+}
+
+// The cell that opens a task beside the list, by naming it in the hash.
+function openCell(id) {
+  const td = document.createElement("td");
+  const open = document.createElement("button");
+  open.type = "button";
+  open.className = "group-toggle";
+  open.dataset.task = String(id);
+  open.textContent = `#${id}`;
+  td.appendChild(open);
+  return td;
+}
+
+// The row of the task read beside the list, in either view, marked as the one.
+function markOpen() {
+  for (const btn of panes.querySelectorAll("button[data-task]")) {
+    const row = btn.closest("tr");
+    if (btn.dataset.task === openTask) row.setAttribute("aria-current", "true");
+    else row.removeAttribute("aria-current");
   }
-  renderListStatus(flaggedEmpty,
-                   flaggedStatus(lastFlagged.length, flaggedFailed, flaggedLoaded));
-  const older = olderCursor(lastFlagged, "newest-first", flaggedSeen, lastFlaggedTotal);
-  flaggedOlder.hidden = older === null;
-  flaggedOlder.dataset.before = older === null ? "" : String(older);
-  flaggedNewest.hidden = flaggedPages.length === 0;
 }
 
 // An author, cut to the cell as `td.actor` cuts it, whole on hover.
@@ -512,6 +612,8 @@ function brief(t) {
 // marked, and its history on request.
 async function showTask(id) {
   openTask = id;
+  panes.classList.add("reading");
+  markOpen();
   let task, notes;
   try {
     const path = encodeURIComponent(id);
@@ -519,6 +621,9 @@ async function showTask(id) {
     notes = await registryJson(await fetch(`/api/tasks/${path}/notes`));
   } catch (e) {
     if (openTask !== id) return;
+    // A registry that stopped is read again when it answers: applyHash reads a task
+    // only when it is not the one open.
+    if (!registryIsRunning()) openTask = null;
     const failed = document.createElement("div");
     failed.className = "empty warn";
     failed.textContent = `Could not load task #${id}.`;
@@ -535,6 +640,7 @@ async function showTask(id) {
   close.className = "group-toggle";
   close.dataset.close = "1";
   close.textContent = "close";
+  close.title = "close this task (the list stays)";
   head.append(" ", close);
   taskDetail.appendChild(head);
   taskDetail.appendChild(line("state", `${task.state}${task.ready ? ", ready" : ""}`
@@ -679,6 +785,49 @@ async function showPage(btn) {
   btn.replaceWith(holder);
 }
 
+function closeTask() {
+  openTask = null;
+  panes.classList.remove("reading");
+  taskDetail.hidden = true;
+  taskDetail.replaceChildren();
+  markOpen();
+}
+
+function showView(name) {
+  view = name;
+  inboxView.hidden = name !== "inbox";
+  allView.hidden = name !== "all";
+  viewInbox.setAttribute("aria-pressed", String(name === "inbox"));
+  viewAll.setAttribute("aria-pressed", String(name === "all"));
+}
+
+// The page as the hash names it: the view at once, the task once the registry answers
+// (probe calls this again when it does).
+function applyHash() {
+  const named = parseHash(location.hash);
+  showView(named.view);
+  if (!registryIsRunning()) return;
+  if (named.task === null) {
+    if (openTask !== null) closeTask();
+  } else if (named.task !== openTask) {
+    showTask(named.task);
+  }
+}
+
+// Every way to open, close or switch goes through the hash, so back and a reload agree
+// with what was clicked. A click naming what the hash already names reads the task
+// again, or closes it.
+function goTo(nextView, task) {
+  const next = hashFor(nextView, task);
+  if (next !== location.hash) {
+    location.hash = next;
+  } else if (task === null) {
+    closeTask();
+  } else if (registryIsRunning()) {
+    showTask(task);
+  }
+}
+
 export function mountTasks() {
   tasksDown = document.getElementById("tasks-down");
   tasksUp = document.getElementById("tasks-up");
@@ -691,11 +840,14 @@ export function mountTasks() {
   tasksNewest = document.getElementById("tasks-newest");
   taskCountEl = document.getElementById("taskcount");
   taskDetail = document.getElementById("task-detail");
-  flaggedBody = document.getElementById("flagged");
-  flaggedEmpty = document.getElementById("flagged-empty");
-  flaggedOlder = document.getElementById("flagged-older");
-  flaggedNewest = document.getElementById("flagged-newest");
-  flaggedCountEl = document.getElementById("flaggedcount");
+  panes = document.getElementById("panes");
+  inboxEl = document.getElementById("inbox");
+  inboxEmpty = document.getElementById("inbox-empty");
+  inboxCountEl = document.getElementById("inboxcount");
+  viewInbox = document.getElementById("view-inbox");
+  viewAll = document.getElementById("view-all");
+  inboxView = document.getElementById("inbox-view");
+  allView = document.getElementById("all-view");
 
   tasksDown.textContent = NOT_RUNNING_TEXT;
   for (const s of [...TASK_STATES, EVERY_STATE]) {
@@ -719,30 +871,20 @@ export function mountTasks() {
     refreshTasks();
   });
   tasksNewest.addEventListener("click", () => { resetList(); refreshTasks(); });
-  flaggedOlder.addEventListener("click", () => {
-    flaggedSeen += lastFlagged.length;
-    flaggedPages.push(Number(flaggedOlder.dataset.before));
-    refreshFlagged();
-  });
-  flaggedNewest.addEventListener("click", () => {
-    flaggedPages = [];
-    flaggedSeen = 0;
-    refreshFlagged();
-  });
-  const opener = ev => {
+  viewInbox.addEventListener("click", () => goTo("inbox", openTask));
+  viewAll.addEventListener("click", () => goTo("all", openTask));
+  panes.addEventListener("click", ev => {
     const btn = ev.target.closest("button[data-task]");
-    if (btn) showTask(btn.dataset.task);
-  };
-  tasksBody.addEventListener("click", opener);
-  flaggedBody.addEventListener("click", opener);
+    if (btn) goTo(view, btn.dataset.task);
+  });
   taskDetail.addEventListener("click", ev => {
     if (ev.target.closest("button[data-close]")) {
-      openTask = null;
-      taskDetail.hidden = true;
-      taskDetail.replaceChildren();
+      goTo(view, null);
       return;
     }
     const page = ev.target.closest("button[data-page]");
     if (page) (page.dataset.page === "plans" ? showPlans : showPage)(page);
   });
+  window.addEventListener("hashchange", applyHash);
+  applyHash();
 }

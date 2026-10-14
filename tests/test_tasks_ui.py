@@ -44,7 +44,8 @@ class RelayTests(unittest.TestCase):
 
     def test_the_reads_reach_the_registry(self):
         for path in ("api/repos", "api/tasks", "api/tasks/12", "api/tasks/12/notes",
-                     "api/tasks/12/history", "api/notes/flagged", "api/search"):
+                     "api/tasks/12/history", "api/tasks/12/plans", "api/notes/flagged",
+                     "api/search"):
             with self.subTest(path=path):
                 resp = self._proxy(path)
                 self.assertNotEqual(resp.status_code, 403)
@@ -56,6 +57,7 @@ class RelayTests(unittest.TestCase):
         for path, method in (("api/tasks", "POST"), ("api/tasks/12/move", "POST"),
                              ("api/tasks/12/break-claim", "POST"),
                              ("api/tasks/12/notes", "POST"), ("api/notes/hide", "POST"),
+                             ("api/tasks/12/plans", "POST"),
                              ("api/repos", "POST"), ("api/tasks/abc", "GET"),
                              ("api/tasks/1/../../../api/audit", "GET"),
                              ("api/tasks/12345678901234567890", "GET"),

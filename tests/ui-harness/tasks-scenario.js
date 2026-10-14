@@ -16,8 +16,17 @@ export const STEPS = [
   ["a task opened", async ({ page }) => {
     await page.click('#tasks button[data-task="3"]');
   }],
+  ["its earlier plans", async ({ page }) => {
+    await page.click('#task-detail button[data-page="plans"]');
+  }],
   ["its history", async ({ page }) => {
     await page.click('#task-detail button[data-page="history"]');
+  }],
+  ["a task whose plan was superseded", async ({ page }) => {
+    await page.click('#tasks button[data-task="1"]');
+  }],
+  ["a task with no plan", async ({ page }) => {
+    await page.click('#tasks button[data-task="2"]');
   }],
   ["task closed", async ({ page }) => {
     await page.click("#task-detail button[data-close]");

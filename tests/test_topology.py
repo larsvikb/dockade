@@ -170,6 +170,26 @@ def _subnet_of(network: str) -> str:
     raise AssertionError(f"network {network!r} declares no subnet")
 
 
+def _ipam_of(network: str, key: str) -> str | None:
+    """A per-subnet IPAM key (``ip_range``, ``gateway``) of a network, or None."""
+    body = _block(_block(COMPOSE, "networks", 0), network, 2)
+    for line in body:
+        m = re.search(rf"\b{key}:\s*(\S+)", line)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _sandbox_pool() -> str:
+    """sandbox-net's dynamic pool: where every launched sandbox, and only a sandbox,
+    gets its address, so the range the agent's class and lifeline are scoped to."""
+    pool = _ipam_of("sandbox-net", "ip_range")
+    if pool is None:
+        raise AssertionError("sandbox-net declares no ip_range, so the agent's class "
+                             "would have to be the whole subnet, infra included")
+    return pool
+
+
 class ProxyReachabilityTests(unittest.TestCase):
     """What the egress proxy can and cannot dial.
 
@@ -323,7 +343,7 @@ class AddressAllocationTests(unittest.TestCase):
     """Per network: pin every member's address, or pin none of them.
 
     Mixing the two is a reboot-order race, and it does not look like one in review.
-    Docker hands a dynamic member the LOWEST free address in the subnet, which is
+    Docker hands a dynamic member the LOWEST free address in its range, which is
     the same ``.2`` a pinned member is most likely to have asked for; whoever the
     daemon starts first takes it and the other dies with "Address already in use".
     `depends_on` does not help — it orders `compose up`, not the daemon bringing
@@ -331,8 +351,8 @@ class AddressAllocationTests(unittest.TestCase):
     the order differs from the one that was tested.
 
     Scoped to attachments DECLARED IN COMPOSE. The sandboxes are dynamic on
-    sandbox-net by design: the launchers start them long after the substrate holds
-    its pinned addresses, so they can only ever be handed what is left."""
+    sandbox-net by design, and drawn from its pool (``ip_range``), which every pin
+    there sits below: ``test_no_pin_on_the_agent_network_is_in_the_sandbox_pool``."""
 
     @staticmethod
     def _legs() -> dict[str, dict[str, str | None]]:
@@ -1095,22 +1115,49 @@ class RelayGuardAgreesWithComposeTests(unittest.TestCase):
                          "control-net is forbidden to the listener that is required "
                          "to bind it")
 
-    def test_the_lifeline_range_is_the_sandbox_network(self):
+    def test_the_agent_network_declares_a_sandbox_pool_inside_its_subnet(self):
+        # The pool is what makes "a sandbox" a range: Docker draws dynamic addresses
+        # from it alone. The gateway is pinned outside it because an unset one may be
+        # taken from the pool, putting the host-side bridge in the agent's class.
+        subnet = ipaddress.ip_network(_subnet_of("sandbox-net"))
+        pool = ipaddress.ip_network(_sandbox_pool())
+        self.assertTrue(pool.subnet_of(subnet), f"{pool} is not inside {subnet}")
+        self.assertNotEqual(pool, subnet, "the pool is the whole subnet, infra and all")
+        gateway = _ipam_of("sandbox-net", "gateway")
+        self.assertIsNotNone(gateway, "sandbox-net leaves its gateway to Docker")
+        self.assertIn(ipaddress.ip_address(gateway), subnet)
+        self.assertNotIn(ipaddress.ip_address(gateway), pool)
+
+    def test_no_pin_on_the_agent_network_is_in_the_sandbox_pool(self):
+        # The guard the class and the lifeline rest on: a pinned address is infra (the
+        # proxy, the tool gateway, the llm), and one pinned into the pool would be
+        # decided as the agent and take its lifeline.
+        pool = ipaddress.ip_network(_sandbox_pool())
+        pinned = AddressAllocationTests._legs()["sandbox-net"]
+        self.assertTrue(any(pinned.values()), "found no pin on sandbox-net to check")
+        for svc, addr in pinned.items():
+            with self.subTest(service=svc):
+                self.assertIsNotNone(addr, f"{svc} floats on sandbox-net")
+                self.assertNotIn(ipaddress.ip_address(addr), pool,
+                                 f"{svc} pins {addr}, inside the sandbox pool {pool}")
+
+    def test_the_lifeline_range_is_the_sandbox_pool(self):
         # Same two-ends-no-compiler problem as the guard above, opposite sign: this
         # CIDR decides who KEEPS a grant rather than who is refused one. Pointed at
         # a subnet nothing uses it fails safe but silently — the lifeline stops
         # working for the agent and every Anthropic call starts depending on the
         # control plane being up, which looks like an outage, not a config error.
         # Pointed at too WIDE a range it hands the local allow to mcp-net, which is
-        # the thing _is_lifeline exists to prevent.
+        # the thing _is_lifeline exists to prevent, and at sandbox-net's whole subnet it
+        # hands it to the llm and the tool gateway.
         default = re.search(r'"EGRESS_LIFELINE_CIDRS",\s*\n?\s*"([^"]+)"', ADDON)
         self.assertIsNotNone(default, "could not find the LIFELINE_CIDRS default")
         listed = {c.strip() for c in default.group(1).split(",")}
-        self.assertEqual(listed, {_subnet_of("sandbox-net")})
+        self.assertEqual(listed, {_sandbox_pool()})
 
     def test_no_other_network_is_inside_the_lifeline_range(self):
         # The assertion the one above cannot make on its own: equality with
-        # sandbox-net's subnet is only meaningful while no other network is a
+        # sandbox-net's pool is only meaningful while no other network is a
         # subnet of it. mcp-net is the one this matters for today.
         default = re.search(r'"EGRESS_LIFELINE_CIDRS",\s*\n?\s*"([^"]+)"', ADDON)
         lifeline = [ipaddress.ip_network(c.strip())
@@ -1123,7 +1170,7 @@ class RelayGuardAgreesWithComposeTests(unittest.TestCase):
                     subnet.subnet_of(granted),
                     f"{network} sits inside the permanent lifeline's client range")
 
-    def test_every_client_class_range_is_a_real_compose_subnet(self):
+    def test_every_client_class_range_is_a_real_compose_range(self):
         # Third instance of the same two-ends-no-compiler problem, and the one with
         # the quietest failure. A class range that matches no network places nobody:
         # its clients fall through to UNCLASSIFIED, match no rule, and are HELD — so
@@ -1134,17 +1181,20 @@ class RelayGuardAgreesWithComposeTests(unittest.TestCase):
         self.assertIsNotNone(default, "could not find the CLIENT_CLASSES default")
         subnets = {_subnet_of(n) for n in ("sandbox-net", "mcp-net", "control-net",
                                            "authorize-net", "tool-authorize-net")}
+        subnets.add(_sandbox_pool())
         mapped = {}
         for entry in default.group(1).split(","):
             name, _, cidr = entry.partition("=")
             self.assertIn(cidr.strip(), subnets,
                           f"client class {name!r} maps to {cidr!r}, which is not a "
-                          f"subnet any network in compose declares")
+                          f"subnet or ip_range any network in compose declares")
             mapped[name.strip()] = cidr.strip()
         # The two populations the egress proxy actually serves, each named. The proxy
         # has a leg on both, so both reach /authorize and both must be placeable —
         # an unmapped one is the union-of-needs problem returning by omission.
-        self.assertEqual(mapped, {"sandbox": _subnet_of("sandbox-net"),
+        # The agent's is the pool, not the subnet, so the infra pinned below it is
+        # in no class: held, never decided as the agent.
+        self.assertEqual(mapped, {"sandbox": _sandbox_pool(),
                                   "mcp": _subnet_of("mcp-net")})
 
     def test_the_class_ranges_do_not_overlap(self):

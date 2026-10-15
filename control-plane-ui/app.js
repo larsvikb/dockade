@@ -605,7 +605,10 @@ function start() {
         b.disabled = true;
         b.title = `No ${action.endsWith("lease") ? "lease" : "standing rule"} can be `
                 + "written for an unclassified client — decide this request with a "
-                + "once action, or map its network in CONTROL_CLIENT_CLASSES.";
+                + "once action, or map its network in CONTROL_CLIENT_CLASSES. Deny "
+                + "requests from infra (the tool gateway, the llm) rather than mapping "
+                + "its network; a sandbox outside sandbox-net's pool means that "
+                + "network kept its old IPAM.";
         actions.append(b);
         continue;
       }

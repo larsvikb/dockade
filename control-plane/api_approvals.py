@@ -132,7 +132,11 @@ def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResp
                            f"({row['client_class'] or 'none recorded'}), so no "
                            f"{'standing rule' if persist else 'lease'} can be scoped "
                            f"to it. Decide it with a *_once action, or map its network "
-                           f"in CONTROL_CLIENT_CLASSES."}, status_code=400)
+                           f"in CONTROL_CLIENT_CLASSES. Deny requests from infra (the "
+                           f"tool gateway, the llm) rather than mapping its network; a "
+                           f"sandbox outside sandbox-net's pool means that network kept "
+                           f"its old IPAM."},
+                status_code=400)
         if persist:
             allowed = policy._persist_candidates(row["host"])
             if not allowed:

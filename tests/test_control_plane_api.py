@@ -45,7 +45,7 @@ cp = load_control_plane()
 # request that must match it have to agree — naming both here keeps that agreement in
 # one place rather than in every fixture.
 CLASS = cp.store.LEGACY_CLIENT_CLASS
-CLASS_IP = "172.30.0.2"
+CLASS_IP = "172.30.0.130"
 
 #: Every module that answers a request, as one text: app.py and the ``api_*`` surfaces
 #: it mounts. For the source-reading guards, which must see every handler wherever it
@@ -1418,8 +1418,8 @@ class AuditViewTests(_CPTestCase):
         # The gap this closes. One control plane serves every sandbox, so a row that
         # records "egress to pypi.org was allowed" without saying which agent asked
         # is not answering the question an audit trail exists for.
-        self._rows({"host": "pypi.org", "client": "172.30.0.7", "kind": "allow"})
-        self.assertEqual(_served()[0]["client"], "172.30.0.7")
+        self._rows({"host": "pypi.org", "client": "172.30.0.135", "kind": "allow"})
+        self.assertEqual(_served()[0]["client"], "172.30.0.135")
 
     def test_the_served_columns_are_pinned(self):
         # Named, so adding or dropping one is a deliberate act with a failing test
@@ -1504,7 +1504,7 @@ class AuditViewTests(_CPTestCase):
         forty-row list covers under an hour — so a fronting refusal from this morning
         is already off the bottom."""
         self._rows(*[{"host": "chatty.example", "kind": "deny", "stage": "connect",
-                      "client": "172.30.0.2", "reason": "blocked by rule",
+                      "client": "172.30.0.130", "reason": "blocked by rule",
                       "ts": 1000.0 + 60 * i} for i in range(30)])
         served = _served()
         self.assertEqual(len(served), 1)
@@ -1538,9 +1538,9 @@ class AuditViewTests(_CPTestCase):
         differ only in an unserved one must merge — otherwise the list shows entries
         a reader cannot tell apart, which is the failure being fixed."""
         base = {"host": "a.example", "kind": "deny", "stage": "connect",
-                "client": "172.30.0.2", "reason": "blocked by rule"}
+                "client": "172.30.0.130", "reason": "blocked by rule"}
         for field, other in (("kind", "allow"), ("stage", "sni"),
-                             ("host", "b.example"), ("client", "172.30.0.9"),
+                             ("host", "b.example"), ("client", "172.30.0.137"),
                              ("actor", "peer=172.31.0.3"),
                              ("reason", "no matching rule")):
             with self.subTest(field=field):
@@ -1555,10 +1555,10 @@ class AuditViewTests(_CPTestCase):
     def test_one_sandbox_never_absorbs_another(self):
         # Attribution is the whole reason the client column exists; folding two
         # sandboxes into one row would quietly undo it.
-        self._rows({"host": "a.example", "client": "172.30.0.2"},
-                   {"host": "a.example", "client": "172.30.0.3"})
+        self._rows({"host": "a.example", "client": "172.30.0.130"},
+                   {"host": "a.example", "client": "172.30.0.131"})
         self.assertEqual({r["client"] for r in _served()},
-                         {"172.30.0.2", "172.30.0.3"})
+                         {"172.30.0.130", "172.30.0.131"})
 
     def test_groups_are_ordered_by_their_latest_occurrence(self):
         self._rows({"host": "chatty.example", "ts": 10.0},
@@ -1649,10 +1649,10 @@ class AuditFilterTests(_CPTestCase):
     def setUp(self):
         super().setUp()
         _write_audit(
-            {"host": "pypi.org", "kind": "allow", "client": "172.30.0.2",
+            {"host": "pypi.org", "kind": "allow", "client": "172.30.0.130",
              "client_class": "sandbox", "reason": "allowed by rule (pypi.org)",
              "url": "https://pypi.org/simple/", "method": "GET", "ts": 100.0},
-            {"host": "evil.example", "kind": "deny", "client": "172.30.0.2",
+            {"host": "evil.example", "kind": "deny", "client": "172.30.0.130",
              "client_class": "sandbox", "reason": "blocked by rule", "ts": 200.0},
             {"host": "slack.com", "kind": "hold", "client": "172.28.0.5",
              "client_class": "mcp", "reason": "held for approval", "ts": 300.0})
@@ -1675,7 +1675,7 @@ class AuditFilterTests(_CPTestCase):
         _write_audit({"host": ".github.com", "kind": "create", "stage": "policy",
                       "actor": 'peer=172.31.0.3 via-ui=10.1.2.3 ua="curl/8.5.0"',
                       "ts": 1.0},
-                     {"host": "pypi.org", "client": "172.30.0.2", "ts": 2.0})
+                     {"host": "pypi.org", "client": "172.30.0.130", "ts": 2.0})
         for q in ("via-ui=10.1.2.3", "curl"):
             with self.subTest(q=q):
                 self.assertEqual(self._hosts(q=q), [".github.com"])
@@ -2377,7 +2377,7 @@ class PersistClassScopeTests(_CPTestCase):
         # and a second implementation of the classification — for the one caller whose
         # answer becomes standing policy — is exactly the drift worth refusing. The
         # address here maps to `sandbox`; the rule must still be written for `mcp`.
-        approval = _hold("x.example", client="172.30.0.9", client_class="mcp")
+        approval = _hold("x.example", client="172.30.0.137", client_class="mcp")
         _resolve(approval, "allow_persist")
         self.assertEqual(self._stored(), {("x.example", "allow", "mcp")})
 
@@ -2979,14 +2979,14 @@ class SaturationTests(_CPTestCase):
         cp.holds.MAX_PENDING_PER_CLIENT = 1
         try:
             _hold("a.example", "held-1")
-            cp.holds._PENDING_CLIENT["held-1"] = "172.30.0.9"
-            cp.api_authorize.authorize(_auth_req("b.example", client="172.30.0.9"))
+            cp.holds._PENDING_CLIENT["held-1"] = "172.30.0.137"
+            cp.api_authorize.authorize(_auth_req("b.example", client="172.30.0.137"))
         finally:
             cp.holds.MAX_PENDING_PER_CLIENT = saved
         # Distinguishable from a global exhaustion: "one agent is hammering" and
         # "the whole control plane is loaded" want different responses.
         self.assertEqual(cp.holds._saturation()["last_scope"],
-                         "client 172.30.0.9 cards")
+                         "client 172.30.0.137 cards")
 
     def test_the_per_client_waiter_cap_is_recorded_as_its_own_scope(self):
         """The fourth scope, and the one whose absence was the finding. A client that
@@ -2994,12 +2994,12 @@ class SaturationTests(_CPTestCase):
         saved = cp.holds.MAX_WAITERS_PER_CLIENT
         cp.holds.MAX_WAITERS_PER_CLIENT = 1
         try:
-            _hold("a.example", "held-1", client="172.30.0.9")
-            cp.api_authorize.authorize(_auth_req("a.example", client="172.30.0.9"))
+            _hold("a.example", "held-1", client="172.30.0.137")
+            cp.api_authorize.authorize(_auth_req("a.example", client="172.30.0.137"))
         finally:
             cp.holds.MAX_WAITERS_PER_CLIENT = saved
         self.assertEqual(cp.holds._saturation()["last_scope"],
-                         "client 172.30.0.9 waiters")
+                         "client 172.30.0.137 waiters")
 
     def test_nothing_is_recorded_when_the_hold_is_accepted(self):
         _hold("quiet.example", "held-1")
@@ -3024,9 +3024,9 @@ class SaturationTests(_CPTestCase):
         # The second divergence, and the reason both numbers are in the payload:
         # duplicates share a card, so "12/16 in flight" beside three cards is not a
         # contradiction. Each number is measured against its OWN cap.
-        _hold("a.example", "held-1", client="172.30.0.2")
+        _hold("a.example", "held-1", client="172.30.0.130")
         for _ in range(4):
-            slot = cp.holds._reserve_hold("ignored", threading.Event(), "172.30.0.2",
+            slot = cp.holds._reserve_hold("ignored", threading.Event(), "172.30.0.130",
                                     "a.example")
             self.assertTrue(slot.joined)
         sat = cp.holds._saturation()
@@ -3919,7 +3919,7 @@ class ToolAuthorizeDecisionTests(_ToolBridgeTestCase):
         _tool_rule("create_pull_request", "ask")
         mine = _tool_call(tool="create_pull_request", args={"a": 1})
         theirs = _tool_call(tool="create_pull_request", args={"a": 1},
-                            client="172.30.0.9")
+                            client="172.30.0.137")
         self.assertNotEqual(theirs["approval_id"], mine["approval_id"])
 
     def test_an_oversized_payload_is_denied_rather_than_shown_in_part(self):
@@ -3955,7 +3955,7 @@ class ToolAuthorizeDecisionTests(_ToolBridgeTestCase):
             _tool_call(tool="create_pull_request", args={"n": 1})
             mine = _tool_call(tool="create_pull_request", args={"n": 2})
             theirs = _tool_call(tool="create_pull_request", args={"n": 3},
-                                client="172.30.0.9")
+                                client="172.30.0.137")
         self.assertEqual(mine["decision"], "deny")
         self.assertEqual(theirs["decision"], "ask")
 
@@ -4633,7 +4633,7 @@ class ToolClaimTests(_ToolBridgeTestCase):
         # confirm that it exists: a guessed id and a real one answer identically.
         ask = self._ask()
         _resolve(ask, "allow")
-        resp = _claim(ask, client="172.30.0.9")
+        resp = _claim(ask, client="172.30.0.137")
         self.assertEqual(resp.status_code, 404)
         self.assertIsNone(resp.body["status"])
         # ...and the approval is still there, unclaimed, for the client that raised it.
@@ -4662,8 +4662,8 @@ class ToolClaimTests(_ToolBridgeTestCase):
         # Two rows, one answer: the branches were split to write different records,
         # and the response must not follow them apart.
         ask = self._ask()
-        foreign = _claim(ask, client="172.30.0.9")
-        unknown = _claim("f" * 32, client="172.30.0.9")
+        foreign = _claim(ask, client="172.30.0.137")
+        unknown = _claim("f" * 32, client="172.30.0.137")
         self.assertEqual((foreign.status_code, foreign.body),
                          (unknown.status_code, unknown.body))
 
@@ -4837,8 +4837,8 @@ class ToolWithdrawTests(_ToolBridgeTestCase):
 
     def test_another_sandboxs_id_is_unknown_and_its_ask_survives(self):
         ask = self._ask()
-        foreign = _withdraw(ask, client="172.30.0.9")
-        unknown = _withdraw("f" * 32, client="172.30.0.9")
+        foreign = _withdraw(ask, client="172.30.0.137")
+        unknown = _withdraw("f" * 32, client="172.30.0.137")
         self.assertEqual(foreign.status_code, 404)
         self.assertEqual((foreign.status_code, foreign.body),
                          (unknown.status_code, unknown.body))
@@ -4889,9 +4889,9 @@ class WithdrawAuditTests(_ToolBridgeTestCase):
 
     def test_a_foreign_withdrawal_is_audited_as_a_leaked_id(self):
         ask = self._ask()
-        _withdraw(ask, client="172.30.0.9")
+        _withdraw(ask, client="172.30.0.137")
         [(kind, _stage, client, _server, _tool, reason)] = self._rows(ask)
-        self.assertEqual((kind, client), ("deny", "172.30.0.9"))
+        self.assertEqual((kind, client), ("deny", "172.30.0.137"))
         self.assertIn(CLASS_IP, reason)
 
     def test_a_no_op_withdrawal_writes_nothing(self):
@@ -4926,16 +4926,16 @@ class RefusedClaimAuditTests(_ToolBridgeTestCase):
         # whose id it was, in a row that joins the ask's own history by id.
         ask = self._ask()
         _resolve(ask, "allow")
-        _claim(ask, client="172.30.0.9")
+        _claim(ask, client="172.30.0.137")
         [(kind, stage, client, server, tool, reason)] = self._resume_rows(ask)
-        self.assertEqual((kind, stage, client), ("deny", "tool-resume", "172.30.0.9"))
+        self.assertEqual((kind, stage, client), ("deny", "tool-resume", "172.30.0.137"))
         self.assertEqual((server, tool), ("mcp-github", "create_pull_request"))
         self.assertIn(CLASS_IP, reason)                     # whose id it was
 
     def test_an_unknown_id_is_audited_with_the_id_it_named(self):
-        _claim("f" * 32, client="172.30.0.9")
+        _claim("f" * 32, client="172.30.0.137")
         [(kind, stage, client, server, tool, reason)] = self._resume_rows("f" * 32)
-        self.assertEqual((kind, stage, client), ("deny", "tool-resume", "172.30.0.9"))
+        self.assertEqual((kind, stage, client), ("deny", "tool-resume", "172.30.0.137"))
         self.assertEqual((server, tool), (None, None))
         self.assertIn("unknown", reason)
 
@@ -5315,7 +5315,7 @@ class OutcomeFoldingTests(_CPTestCase):
                 conn.execute(
                     "INSERT INTO audit(ts, kind, stage, client, server, tool, "
                     "status, approval_id) VALUES (?,'outcome','tool-result',?,?,?,?,?)",
-                    (float(i), "172.30.0.2", r.get("server", "mcp-github"),
+                    (float(i), "172.30.0.130", r.get("server", "mcp-github"),
                      r.get("tool", "get_me"), r.get("status", "ok"),
                      r.get("approval_id")))
             conn.commit()
@@ -5591,7 +5591,7 @@ class MigrationTests(_FreshStoreTestCase):
                 "VALUES (?,?,?, 0)", rules)
             conn.execute(
                 "INSERT INTO audit(ts, decision, host, client) "
-                "VALUES (1.0, 'allow', 'old.example', '172.30.0.2')")
+                "VALUES (1.0, 'allow', 'old.example', '172.30.0.130')")
             conn.commit()
 
     def test_existing_rules_survive_and_are_scoped_to_the_agent(self):

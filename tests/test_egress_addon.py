@@ -73,7 +73,7 @@ class LifelineScopeTests(unittest.TestCase):
     talk to Anthropic. A host-only check hands them the sole allow that skips the
     policy authority."""
 
-    SANDBOX = "172.30.0.2"
+    SANDBOX = "172.30.0.130"
     MCP = "172.28.0.2"
 
     def test_the_sandbox_gets_the_lifeline(self):
@@ -82,8 +82,15 @@ class LifelineScopeTests(unittest.TestCase):
     def test_an_mcp_server_does_not(self):
         self.assertFalse(addon._is_lifeline("api.anthropic.com", self.MCP))
 
+    def test_infra_on_the_agents_network_does_not(self):
+        # The llm and the tool gateway share sandbox-net but sit below the sandbox
+        # pool, and so does the proxy's own leg.
+        for client in ("172.30.0.20", "172.30.0.11", "172.30.0.10"):
+            with self.subTest(client=client):
+                self.assertFalse(addon._is_lifeline("api.anthropic.com", client))
+
     def test_the_host_half_still_binds(self):
-        # Being on sandbox-net grants the lifeline for lifeline hosts only —
+        # Being in sandbox-net's pool grants the lifeline for lifeline hosts only —
         # everything else the agent asks for is still the control plane's call.
         self.assertFalse(addon._is_lifeline("example.com", self.SANDBOX))
 

@@ -38,8 +38,8 @@ Fail-closed, with one deliberate exception:
   - The **permanent lifeline** hosts (``EGRESS_PERMANENT_HOSTS`` — the Anthropic
     API/auth endpoints) are allowed by a LOCAL check *before* the control plane
     is consulted, so a control-plane outage never bricks the agent's own API.
-    Scoped to clients on ``EGRESS_LIFELINE_CIDRS`` (sandbox-net), because that
-    sentence names the only client it is for — see ``_is_lifeline``.
+    Scoped to clients on ``EGRESS_LIFELINE_CIDRS`` (sandbox-net's sandbox pool),
+    because that sentence names the only client it is for — see ``_is_lifeline``.
   - Every other host depends on the control plane. If it is unreachable or slow
     (timeout), the request is DENIED and audited locally — governed egress fails
     closed when the policy authority is down, which is the intended posture.
@@ -277,19 +277,23 @@ _BLOCKED_CIDRS = FORBIDDEN_CIDRS + PRIVATE_CIDRS
 #
 # It exists for exactly one reason, and the reason names its own scope: a
 # control-plane outage must never sever THE AGENT's own API/auth. Only sandbox-net
-# runs the agent. Since mcp-net was added, this proxy also serves MCP server
-# containers — third-party images that hold or are handed a credential and never
-# talk to Anthropic at all. Granting them an unheld, centrally-unaudited tunnel to
-# api.anthropic.com would hand the one component whose compromise this topology
-# plans for the one egress path the policy authority never sees.
+# runs the agent, and on it only the dynamic pool: the tool gateway and the llm
+# share the network and are not the agent. Since mcp-net was added, this proxy also
+# serves MCP server containers — third-party images that hold or are handed a
+# credential and never talk to Anthropic at all. Granting them an unheld,
+# centrally-unaudited tunnel to api.anthropic.com would hand the one component whose
+# compromise this topology plans for the one egress path the policy authority never
+# sees.
 #
-# Default mirrors sandbox-net in docker-compose.yml (tests/test_topology.py holds
-# the two together). Unlike EGRESS_FORBIDDEN_CIDRS there is no startup assertion,
+# Default mirrors sandbox-net's dynamic pool in docker-compose.yml, not its subnet:
+# the tool gateway and the llm are pinned below the pool, so a process in either is
+# not the agent and does not get its lifeline (tests/test_topology.py holds the two
+# together). Unlike EGRESS_FORBIDDEN_CIDRS there is no startup assertion,
 # because emptying this one fails the SAFE way: no client qualifies, the lifeline
 # is off, and every host — Anthropic's included — goes to the control plane and is
 # centrally audited. The cost of that is outage resilience, not containment, which
 # is why it is a knob rather than a guard.
-LIFELINE_CIDRS = _parse_cidrs("EGRESS_LIFELINE_CIDRS", "172.30.0.0/24")
+LIFELINE_CIDRS = _parse_cidrs("EGRESS_LIFELINE_CIDRS", "172.30.0.128/25")
 
 # IPv6 forms that CARRY an embedded IPv4 address, and are therefore a way to write
 # a blocked v4 destination that a v4-only blocklist does not recognize.
@@ -418,8 +422,8 @@ def _in_cidrs(ip_str: str | None, nets: tuple) -> bool:
     Folds the IPv4-embedding IPv6 forms down the same way ``_blocked_cidr`` does,
     for the opposite reason: there the fold stops a blocked destination hiding
     behind a spelling, here it stops a legitimate client LOSING a grant because of
-    one. A v4 sandbox peer can be reported as ``::ffff:172.30.0.2`` on a dual-stack
-    listener, and that is the same client by any measure that matters.
+    one. A v4 sandbox peer can be reported as ``::ffff:172.30.0.130`` on a
+    dual-stack listener, and that is the same client by any measure that matters.
 
     Unparseable or absent -> False, which for the only caller means the request
     goes to the control plane instead of short-circuiting. That is the fail-safe
@@ -647,7 +651,8 @@ def _is_lifeline(host: str, client: str | None) -> bool:
     without it every container this proxy serves inherits an allow the control
     plane never sees. A client outside the range is not denied — it simply falls
     through to ``/authorize`` like any other request, so an Anthropic host reached
-    from mcp-net is governed and centrally audited rather than short-circuited."""
+    from mcp-net, or from the llm on sandbox-net, is governed and centrally audited
+    rather than short-circuited."""
     return _is_permanent(host) and _in_cidrs(client, LIFELINE_CIDRS)
 
 

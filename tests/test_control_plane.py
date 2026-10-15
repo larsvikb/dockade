@@ -735,6 +735,16 @@ class ClientClassMappingTests(unittest.TestCase):
         self.assertEqual(self._classify("172.30.0.2"), "sandbox")
         self.assertEqual(self._classify("172.28.0.3"), "mcp")
 
+    def test_under_the_defaults_only_the_sandbox_pool_is_the_agent(self):
+        # The tool gateway's and the llm's sandbox-net legs are pinned below the pool
+        # (tests/test_topology.py), so a request from either is held as theirs, never
+        # decided as the agent's.
+        spec = cp.policy.CLIENT_CLASSES_DEFAULT
+        self.assertEqual(self._classify("172.30.0.130", spec), "sandbox")
+        for infra in ("172.30.0.11", "172.30.0.20"):
+            with self.subTest(client=infra):
+                self.assertEqual(self._classify(infra, spec), cp.policy.UNCLASSIFIED)
+
     def test_an_address_outside_every_range_is_unclassified(self):
         self.assertEqual(self._classify("10.1.2.3"), cp.policy.UNCLASSIFIED)
 

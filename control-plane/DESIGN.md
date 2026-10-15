@@ -461,7 +461,7 @@ Three choices in it are less obvious than the feature:
   system, which is the one thing a decisions list must not do.
 
 It also introduced one honest limitation, which is filed here rather than fixed: a
-grouped `client` is an **address**, not a sandbox. Docker reassigns `172.30.0.2` to
+grouped `client` is an **address**, not a sandbox. Docker reassigns `172.30.0.130` to
 whichever container starts first, so a group spanning days covers every sandbox that
 held that address. Concurrently the column still does its job — two live sandboxes are
 two rows — but folding a fortnight into one line makes an address look like an identity,

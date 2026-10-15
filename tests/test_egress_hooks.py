@@ -36,7 +36,7 @@ def run(coro):
 # assertion about the fallthrough path instead. MCP_PEER is the other side of that
 # — an address on mcp-net, which this proxy also serves and which must NOT inherit
 # the agent's local allow.
-SANDBOX_PEER = "172.30.0.2"
+SANDBOX_PEER = "172.30.0.130"
 MCP_PEER = "172.28.0.2"
 
 
@@ -113,7 +113,7 @@ class AuthorizeTests(unittest.TestCase):
                 self.assertEqual(v.reason, "ok")
 
     def test_a_v4_mapped_sandbox_peer_keeps_its_lifeline(self):
-        # A dual-stack listener can report the sandbox as ::ffff:172.30.0.2. Same
+        # A dual-stack listener can report the sandbox as ::ffff:172.30.0.130. Same
         # client; losing the lifeline over a spelling would break the outage
         # resilience this exists for. (_in_cidrs folds it, as _blocked_cidr does.)
         with mock.patch.object(addon, "_post_authorize",
@@ -267,7 +267,7 @@ class TlsClientHelloTests(unittest.TestCase):
     (``ignore_connection``) is granted ONLY when the SNI matches the authority
     recorded at CONNECT, or is absent for an authority that is an IP literal."""
 
-    def _data(self, sni, cid="c1", peer="172.30.0.2"):
+    def _data(self, sni, cid="c1", peer="172.30.0.130"):
         # `peername` mirrors _connect_flow / _http_flow. Its absence here is why the
         # fronting refusal could be recorded with no client for as long as it was.
         return SimpleNamespace(
@@ -342,15 +342,15 @@ class TlsClientHelloTests(unittest.TestCase):
         # named in the reason, so one row carries both sides of the mismatch.
         self.assertEqual(fields["host"], "evil.com")
         self.assertIn("example.com", fields["reason"])
-        self.assertEqual(fields["client"], "172.30.0.2")
+        self.assertEqual(fields["client"], "172.30.0.130")
         # No /authorize call happens on this path at all, by design.
         self.assertFalse(fields["central"])
 
     def test_refusal_with_no_authority_still_names_a_client_and_reason(self):
         with mock.patch.object(addon, "_audit") as audited:
-            addon.tls_clienthello(self._data("evil.com", peer="172.30.0.9"))
+            addon.tls_clienthello(self._data("evil.com", peer="172.30.0.137"))
         fields = audited.call_args[1]
-        self.assertEqual(fields["client"], "172.30.0.9")
+        self.assertEqual(fields["client"], "172.30.0.137")
         self.assertEqual(fields["host"], "evil.com")
         # Must not render as the string "None" where an authority would be.
         self.assertNotIn("None", fields["reason"])
@@ -371,14 +371,14 @@ class TlsClientHelloTests(unittest.TestCase):
         self.assertIn("no SNI", fields["reason"])
         self.assertIn("example.com", fields["reason"])
         self.assertNotIn("does not match", fields["reason"])
-        self.assertEqual(fields["client"], "172.30.0.2")
+        self.assertEqual(fields["client"], "172.30.0.130")
         self.assertFalse(fields["central"])
 
     def test_sni_absent_refusal_with_no_authority_does_not_say_none(self):
         with mock.patch.object(addon, "_audit") as audited:
-            addon.tls_clienthello(self._data(None, peer="172.30.0.9"))
+            addon.tls_clienthello(self._data(None, peer="172.30.0.137"))
         fields = audited.call_args[1]
-        self.assertEqual(fields["client"], "172.30.0.9")
+        self.assertEqual(fields["client"], "172.30.0.137")
         self.assertIsNone(fields["host"])
         self.assertNotIn("None", fields["reason"])
 
@@ -472,7 +472,7 @@ class InternationalizedHostTests(unittest.TestCase):
         data = SimpleNamespace(
             client_hello=SimpleNamespace(sni=self.ASCII),   # what TLS carries
             context=SimpleNamespace(
-                client=SimpleNamespace(id="idn3", peername=("172.30.0.2", 5000))),
+                client=SimpleNamespace(id="idn3", peername=("172.30.0.130", 5000))),
             ignore_connection=False)
         addon.tls_clienthello(data)
         self.assertTrue(data.ignore_connection)
@@ -484,7 +484,7 @@ class InternationalizedHostTests(unittest.TestCase):
         data = SimpleNamespace(
             client_hello=SimpleNamespace(sni="evil.com"),
             context=SimpleNamespace(
-                client=SimpleNamespace(id="idn4", peername=("172.30.0.2", 5000))),
+                client=SimpleNamespace(id="idn4", peername=("172.30.0.130", 5000))),
             ignore_connection=False)
         addon.tls_clienthello(data)
         self.assertFalse(data.ignore_connection)
@@ -575,7 +575,7 @@ class RequestTests(unittest.TestCase):
         half a record. They read the peer only after the guards until this ingest
         made them visible, which is where the omission would have shown up."""
         flow = _http_flow("allowed.com", "allowed.com", scheme="http", port=8080,
-                          peer="172.30.0.7")
+                          peer="172.30.0.135")
         with mock.patch.object(addon.socket, "getaddrinfo",
                                return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]), \
              mock.patch.object(addon, "_post_authorize") as posted, \
@@ -585,7 +585,7 @@ class RequestTests(unittest.TestCase):
         posted.assert_not_called()
         fields = audited.call_args[1]
         self.assertIn("port 8080 not permitted", fields["reason"])
-        self.assertEqual(fields["client"], "172.30.0.7")
+        self.assertEqual(fields["client"], "172.30.0.135")
         self.assertEqual(fields["host"], "allowed.com")
         self.assertFalse(fields["central"])
 
@@ -604,13 +604,13 @@ class RequestTests(unittest.TestCase):
             seen.append(payload)
             return {"decision": "allow", "reason": "ok"}
 
-        flow = _http_flow("allowed.com", "allowed.com", peer="172.30.0.2")
+        flow = _http_flow("allowed.com", "allowed.com", peer="172.30.0.130")
         with mock.patch.object(addon.socket, "getaddrinfo",
                                return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]), \
              mock.patch.object(addon, "_post_authorize", side_effect=capture):
             run(addon.request(flow))
         self.assertTrue(seen, "no authorize call was made")
-        self.assertEqual(seen[0]["client"], "172.30.0.2")
+        self.assertEqual(seen[0]["client"], "172.30.0.130")
         # The stage travels too — it is what the decisions table renders as the
         # qualifier distinguishing a plaintext decision from a tunnelled one.
         self.assertEqual(seen[0]["stage"], "http")
@@ -627,10 +627,10 @@ class RequestTests(unittest.TestCase):
         with mock.patch.object(addon.socket, "getaddrinfo",
                                return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]), \
              mock.patch.object(addon, "_post_authorize", side_effect=capture):
-            run(addon.http_connect(_connect_flow("allowed.com", peer="172.30.0.9")))
+            run(addon.http_connect(_connect_flow("allowed.com", peer="172.30.0.137")))
             run(addon.request(_http_flow("allowed.com", "allowed.com",
-                                         peer="172.30.0.9")))
-        self.assertEqual([c["client"] for c in calls], ["172.30.0.9", "172.30.0.9"])
+                                         peer="172.30.0.137")))
+        self.assertEqual([c["client"] for c in calls], ["172.30.0.137", "172.30.0.137"])
 
     def test_fronted_host_header_is_denied(self):
         # Transport host is authorized, but the Host header names a different,

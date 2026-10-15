@@ -34,9 +34,11 @@ import store
 # in the proxy: DESIGN.md, "Policy is scoped to a client class".
 #
 # Defaults mirror docker-compose.yml, and tests/test_topology.py holds them equal to
-# the real subnets. An address in no listed range is UNCLASSIFIED, which matches no
-# rule and is therefore held, like an unknown host.
-CLIENT_CLASSES_DEFAULT = "sandbox=172.30.0.0/24,mcp=172.28.0.0/24"
+# the real ranges: mcp-net's subnet, and sandbox-net's dynamic pool rather than its
+# subnet, so the infra compose pins below the pool (the tool gateway, the llm) is in
+# no class. An address in no listed range is UNCLASSIFIED, which matches no rule and
+# is therefore held, like an unknown host.
+CLIENT_CLASSES_DEFAULT = "sandbox=172.30.0.128/25,mcp=172.28.0.0/24"
 # Not a valid rule scope: ``api_approvals.resolve`` refuses to persist one, because a
 # rule for "whoever we could not identify" would grant every future unidentified
 # client.

@@ -191,6 +191,13 @@ report.
   pinned by version in each `requirements.txt` but not by hash, and their transitive
   dependencies are not pinned at all — the same choice one layer down, and a real
   supply-chain path into the control plane if you disagree with it.
+- **Infra containers reaching the egress proxy.** The tool gateway and
+  the llm share sandbox-net with the agent, and the proxy accepts on it. Their
+  requests are not the agent's: they fall outside the sandbox pool, so they are
+  unclassified, held for a human, attributed to their own address, and can be
+  approved only once — never as a rule or lease, and never by the lifeline. The
+  control plane's authorize-net leg, which the proxy also accepts on, is the same
+  case. See "Policy is scoped to a client class" in `DESIGN.md`.
 - **The standalone (proxy-less) fallback being weaker than governed mode.** It
   keeps a narrow, allowlisted, *unaudited* direct path by design, for hosts that
   cannot run the infrastructure. Governed mode is the default and the one the

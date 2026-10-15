@@ -18,6 +18,11 @@ networks:
   # if its in-container firewall failed — the egress proxy (multi-homed below) is
   # the sole way off-box. The fixed subnet gives the proxy a stable IP the
   # sandbox firewall allowlists.
+  #
+  # ip_range is the sandbox pool, the agent's client class and lifeline range. Every
+  # pin sits below it, so infra here is not the agent (DESIGN.md, "Policy is scoped
+  # to a client class"). The gateway is pinned because, left unset, Docker may take
+  # it from the pool and put the host-side bridge in the agent's class.
   sandbox-net:
     name: sandbox-net
     driver: bridge
@@ -25,6 +30,8 @@ networks:
     ipam:
       config:
         - subnet: 172.30.0.0/24
+          ip_range: 172.30.0.128/25
+          gateway: 172.30.0.1
   # Outbound-only network: the single bridge with real internet egress. ONLY the
   # egress proxy is attached here — nothing else on sandbox-net gets a route out.
   egress-net:
@@ -221,12 +228,13 @@ services:
     restart: always
     networks:
       # Serve the sandbox on the internal net at a stable address the sandbox
-      # firewall allowlists (matches the launcher's discovery). Keep in-subnet.
+      # firewall allowlists (matches the launcher's discovery). Keep in-subnet,
+      # below the pool.
       sandbox-net:
         ipv4_address: 172.30.0.10
         priority: 10
       # Reach the internet on the egress net. Higher priority so THIS is the
-      # proxy's default route — sandbox-net is internal and has no gateway, so
+      # proxy's default route — sandbox-net is internal and has no default route, so
       # all upstream traffic (and the pinned DNS below) must leave via here.
       egress-net:
         priority: 100
@@ -883,7 +891,8 @@ services:
       sandbox-net:
         # Stable address so the sandbox firewall can allow a literal /32 rather
         # than the whole subnet (per-service /32s are tighter — see the firewall
-        # NOTE). Keep in-subnet with sandbox-net's 172.30.0.0/24.
+        # NOTE). Keep in-subnet with sandbox-net's 172.30.0.0/24, below the
+        # sandbox pool (.128/25), or the llm is decided as the agent.
         ipv4_address: 172.30.0.20
         # Accelerator-independent name for the agent: always http://llm:8080.
         aliases:

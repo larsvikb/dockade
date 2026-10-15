@@ -1035,11 +1035,19 @@ second consumer, and the second consumer here is the one process holding a
 write-capable credential.
 
 **The identity primitive is the ingress network**, not the source address. Topology
-is provable; addresses are not, since sandboxes are ephemeral and Docker hands `.2`
-to whichever container starts first — a rule keyed to an address would silently
-transfer to the next tenant of it. Named ranges live in `policy.CLIENT_CLASSES`, and
-`tests/test_topology.py` holds them equal to the compose subnets, non-overlapping,
-and equal to the lifeline's range for the agent's class.
+is provable; addresses are not, since sandboxes are ephemeral and Docker hands the
+lowest free address to whichever container starts first — a rule keyed to an address
+would silently transfer to the next tenant of it. Named ranges live in
+`policy.CLIENT_CLASSES`, and `tests/test_topology.py` holds them equal to the ranges
+compose declares, non-overlapping, and equal to the lifeline's range for the agent's
+class.
+
+On sandbox-net the agent's class is the network's dynamic pool (`ip_range`), not its
+subnet, because infra shares that network: the tool gateway and the llm are pinned
+below the pool, so their traffic through the proxy is unclassified (held, never a
+standing grant, attributed to its own address) and never takes the lifeline. The pool
+is still a topology fact compose declares, and it also keeps Docker from handing a
+sandbox an infra address while that service is down.
 
 **The classification is the control plane's, not the proxy's**, which is the one
 placement decision here worth arguing. The proxy observes the peer address and

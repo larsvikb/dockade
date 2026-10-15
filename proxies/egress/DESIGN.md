@@ -155,11 +155,13 @@ any exception (`_fail_closed` in `proxies/egress/addon.py`).
 Everywhere else this proxy is deliberately client-agnostic: it asks the policy
 authority and the authority decides on the host. The lifeline is the one allow that
 skips that call, so who is asking has to be part of it — its justification names its
-own scope, *the agent's* own API, and only sandbox-net runs the agent. Since
+own scope, *the agent's* own API, and only sandbox-net's sandbox pool runs the
+agent — the tool gateway and the llm share the network, pinned below the pool. Since
 `mcp-net`, this proxy also serves MCP server containers, which hold credentials and
 never talk to Anthropic; a host-only check would hand them the sole egress path
 nothing holds and the control plane never records. Enforced by `_is_lifeline` in
 `proxies/egress/addon.py` against `EGRESS_LIFELINE_CIDRS`, whose default
-`tests/test_topology.py` holds equal to sandbox-net's subnet. Emptying it fails the
-safe way — no client qualifies and every host becomes the control plane's call —
-which is why, unlike `EGRESS_FORBIDDEN_CIDRS`, it carries no startup assertion.
+`tests/test_topology.py` holds equal to that pool (sandbox-net's `ip_range`).
+Emptying it fails the safe way — no client qualifies and every host becomes the
+control plane's call — which is why, unlike `EGRESS_FORBIDDEN_CIDRS`, it carries no
+startup assertion.

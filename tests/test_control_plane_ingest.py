@@ -54,7 +54,7 @@ cp = load_control_plane()
 def _line(**over) -> str:
     """A well-formed locally-decided audit line, as the proxy's _audit writes it."""
     rec = {"ts": 1000.0, "decision": "deny", "stage": "sni", "host": "evil.com",
-           "client": "172.30.0.2", "reason": "possible domain-fronting",
+           "client": "172.30.0.130", "reason": "possible domain-fronting",
            "central": False}
     rec.update(over)
     return json.dumps(rec) + "\n"
@@ -160,7 +160,7 @@ class RowMappingTests(IngestTestCase):
         self.assertEqual(
             cp.ingest._egress_row(_line().encode()),
             {"ts": 1000.0, "kind": "deny", "stage": "sni", "host": "evil.com",
-             "port": None, "proto": None, "client": "172.30.0.2",
+             "port": None, "proto": None, "client": "172.30.0.130",
              "client_class": "sandbox", "method": None, "url": None,
              "reason": "possible domain-fronting"})
 
@@ -474,7 +474,7 @@ class ToolOutcomeRowTests(unittest.TestCase):
     def line(**over):
         rec = {"ts": 1000.0, "stage": "tool-result", "status": "ok",
                "server": "mcp-github", "tool": "get_me", "approval_id": None,
-               "client": "172.30.0.2", "reason": None}
+               "client": "172.30.0.130", "reason": None}
         rec.update(over)
         return (json.dumps(rec) + "\n").encode()
 
@@ -482,7 +482,7 @@ class ToolOutcomeRowTests(unittest.TestCase):
         self.assertEqual(
             cp.ingest._tool_row(self.line()),
             {"ts": 1000.0, "kind": "outcome", "stage": "tool-result",
-             "client": "172.30.0.2", "client_class": "sandbox", "reason": None,
+             "client": "172.30.0.130", "client_class": "sandbox", "reason": None,
              "server": "mcp-github", "tool": "get_me", "approval_id": None,
              "status": "ok"})
 
@@ -586,7 +586,7 @@ class ToolOutcomeDrainTests(IngestTestCase):
             for rec in records:
                 f.write(json.dumps({"ts": 1000.0, "stage": "tool-result",
                                     "status": "ok", "server": "mcp-github",
-                                    "tool": "get_me", "client": "172.30.0.2",
+                                    "tool": "get_me", "client": "172.30.0.130",
                                     **rec}) + "\n")
 
     def rows(self):

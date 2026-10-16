@@ -17,6 +17,7 @@
  * No DOM at import, so the unit tests import this file under node
  * (tests/test_tasks_ui_js.py).
  */
+import { lineDiff, wordDiff } from "./diff.js";
 import { escapePayload } from "./escape.js";
 import { pollStatus, renderListStatus } from "./list-status.js";
 import {
@@ -108,7 +109,7 @@ export function planParts(plan) {
   return PLAN_PARTS.map(([key, label]) => {
     const value = plan[key];
     const text = Array.isArray(value) ? value.join("\n") : String(value ?? "");
-    return { label, text };
+    return { key, label, text };
   });
 }
 
@@ -154,6 +155,48 @@ export function planNotice(plan, state) {
 export function earlierPlans(plans, shownId) {
   const shown = Number(shownId);
   return (Array.isArray(plans) ? plans : []).filter(p => p && Number(p.id) !== shown);
+}
+
+// The plan the shown one replaced: the next lower id among the task's plans. None when
+// the shown one is the first, or is not among them, as when a refusal brought a task
+// whose plan is newer than the list the page holds.
+export function planPredecessor(plans, shownId) {
+  const list = (Array.isArray(plans) ? plans : []).filter(p => p && typeof p === "object");
+  const shown = Number(shownId);
+  if (!list.some(p => Number(p.id) === shown)) return null;
+  return list.filter(p => Number(p.id) < shown)
+    .reduce((best, p) => (best === null || Number(p.id) > Number(best.id) ? p : best), null);
+}
+
+// What changed from `previous` to `plan`, part by part in PLAN_PARTS' order: each
+// unchanged, added, removed or changed, with its runs (diff.js), the footprint path by
+// path. A part `previous` lacks is added, so a part the registry adds is one more
+// section. A change only whitespace makes is said to be. An unchanged part that carries
+// a hidden character keeps its text, so approve's count of them is drawn somewhere.
+export function planDiff(plan, previous) {
+  const before = new Map(planParts(previous).map(p => [p.key, p.text]));
+  return planParts(plan).map(({ key, label, text }) => {
+    const was = before.get(key) ?? "";
+    if (was === text) {
+      return { label, kind: "unchanged",
+               runs: spellHidden(text).hidden ? [{ op: "same", text }] : [] };
+    }
+    if (was === "") return { label, kind: "added", runs: [{ op: "add", text }] };
+    if (text === "") return { label, kind: "removed", runs: [{ op: "del", text: was }] };
+    const { runs, rewritten } = (key === "footprint" ? lineDiff : wordDiff)(was, text);
+    return { label, kind: "changed", runs, rewritten,
+             // Not \s, which takes U+FEFF and U+2028, characters spellHidden spells.
+             whitespaceOnly: was.replace(/[\t\n\r ]+/g, "") === text.replace(/[\t\n\r ]+/g, "") };
+  });
+}
+
+// What a changed section says of itself beside its runs, or nothing.
+export function changeNote(section) {
+  if (!section || section.kind === "unchanged") return "";
+  if (section.kind === "added") return "added";
+  if (section.kind === "removed") return "removed";
+  if (section.rewritten) return "rewritten: too different to compare word by word";
+  return section.whitespaceOnly ? "changed in whitespace only" : "";
 }
 
 // The inbox's sections, highest first, as the registry names them
@@ -317,7 +360,7 @@ export function outcomeText(write, outcome, detail) {
                      + "landed yet. Sending it again cannot apply it twice.", warn: true };
     case "not-found-yet":
       return { text: `${name}: no answer came, and the note is not on the task yet. It `
-                     + "may still land: look at the notes before sending it again.",
+                     + "may still land: look at the timeline before sending it again.",
                warn: true };
     case "could-not-check":
       return { text: `${name}: no answer came, and the task could not be read again, `
@@ -331,6 +374,57 @@ export function outcomeText(write, outcome, detail) {
       return { text: `${name}: no answer came, so whether it landed is not known. Read `
                      + "the task before trying again.", warn: true };
   }
+}
+
+// What marks a note: whom it is for, whether it was handled or hidden, the move it came
+// with, and the note it answers.
+export function noteMarks(n) {
+  if (!n || typeof n !== "object") return [];
+  return [`#${n.id}`, n.for_operator ? "for you" : "", n.handled ? "handled" : "",
+          n.hidden ? "hidden" : "", n.move || "",
+          n.reply_to ? `reply to #${n.reply_to}` : ""].filter(Boolean);
+}
+
+// What one entry of the timeline shows besides its time, author and action
+// (`operator_moves.history`): the note its write posted, once, with its marks, and what
+// else the write recorded, folded. The note's text and id are in the detail too, a
+// handle's reply as `reply` and `reply_id`, any other's as `note` and `note_id`, so
+// those go. The note a hide or a handle acts on stays in the open, to match it with the
+// entry that posted it.
+export function timelineEntry(h) {
+  if (!h || typeof h !== "object") return null;
+  const detail = { ...(h.detail && typeof h.detail === "object" ? h.detail : {}) };
+  const note = h.note && typeof h.note === "object" ? h.note : null;
+  const handle = h.action === "handle_note";
+  if (note) {
+    delete detail[handle ? "reply" : "note"];
+    delete detail[handle ? "reply_id" : "note_id"];
+  }
+  let named = "";
+  if ((handle || h.action === "hide_note") && detail.note_id != null) {
+    named = `#${detail.note_id}`;
+    delete detail.note_id;
+  }
+  return { note, marks: noteMarks(note), named, folded: Object.entries(detail) };
+}
+
+// What a poll's read of the open task says against the one drawn: changed, at a newer
+// revision; new notes, when only a note came, since a note moves no revision
+// (tasks-ui/DESIGN.md, "A task that changed while it is read"); else null, as for
+// another task, or a read older than the one drawn.
+export function taskUpdate(shown, polled) {
+  if (!shown || !polled || typeof shown !== "object" || typeof polled !== "object"
+      || String(shown.id) !== String(polled.id)) return null;
+  const was = Number(shown.revision), now = Number(polled.revision);
+  if (now > was) {
+    return { kind: "changed",
+             text: `This task changed since it was drawn: it is at revision ${now}, `
+                   + `this shows ${was}.` };
+  }
+  if (now === was && lastNoteId(polled) > lastNoteId(shown)) {
+    return { kind: "notes", text: "New notes on this task since it was drawn." };
+  }
+  return null;
 }
 
 export const NO_REPOS_TEXT =
@@ -365,8 +459,10 @@ let inboxLoaded = false;
 let lastInbox = null;
 let view = "inbox";
 let openTask = null;       // the id whose detail is shown, as the hash names it
-let shownTask = null;      // the task drawn beside the list, and the notes the page holds
-let shownNotes = null;
+let shownTask = null;      // the task drawn beside the list
+let shownHeld = null;      // and what the page holds with it: its timeline and plans
+let draws = 0;             // how many times a task was drawn: what a poll's answer checks
+let noticeSlot = null;     // the line atop the detail that says the task changed
 let writing = null;        // the write in flight: one at a time
 let outcome = null;        // what the last write came to, while its task is open
 let noteDraft = { task: null, text: "" };   // kept until it lands
@@ -599,14 +695,7 @@ function authorCell(tr, author) {
   return td;
 }
 
-// A text cell for agent prose: pre-wrapped, hidden characters spelled out and noted.
-function textCell(tr, text) {
-  const td = document.createElement("td");
-  td.appendChild(proseBlock(text));
-  tr.appendChild(td);
-  return td;
-}
-
+// Agent prose: pre-wrapped, hidden characters spelled out and noted.
 function proseBlock(text) {
   const wrap = document.createElement("div");
   const pre = document.createElement("div");
@@ -634,8 +723,9 @@ function line(label, value) {
 
 // One plan, its parts as the agent wrote them, and under its heading what it means for
 // a task in `state` (`planNotice`). Among the earlier plans `state` is null: a newer
-// plan is the task's, and the heading's "superseded" is enough.
-function planBlock(plan, state) {
+// plan is the task's, and the heading's "superseded" is enough. With the plan it
+// replaced, `previous`, it is drawn as what changed from it, the whole a toggle away.
+function planBlock(plan, state, previous = null) {
   const block = document.createElement("div");
   block.className = "plan";
   const head = document.createElement("div");
@@ -644,26 +734,70 @@ function planBlock(plan, state) {
   block.appendChild(head);
   const notice = state === null ? null : planNotice(plan, state);
   if (notice) block.appendChild(noticeLine(notice));
+  const whole = document.createElement("div");
+  whole.className = "plan-whole";
   for (const part of planParts(plan)) {
-    block.appendChild(line(part.label, proseBlock(part.text)));
+    whole.appendChild(line(part.label, proseBlock(part.text)));
   }
+  if (!previous) {
+    block.appendChild(whole);
+    return block;
+  }
+  const changes = document.createElement("div");
+  changes.className = "plan-changes";
+  for (const section of planDiff(plan, previous)) changes.appendChild(diffLine(section));
+  whole.hidden = true;
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "group-toggle";
+  toggle.dataset.planView = "whole";
+  toggle.textContent = "show the whole plan";
+  const about = document.createElement("div");
+  about.append(`What changed from plan ${previous.id} `, toggle);
+  block.append(about, changes, whole);
   return block;
 }
 
-// Every plan the task had but the one shown, newest first, under the button that
-// asked: what a plan replaced, to read beside it.
-async function showPlans(btn) {
-  const id = openTask;
-  let plans;
-  try {
-    plans = await registryJson(await fetch(`/api/tasks/${encodeURIComponent(id)}/plans`));
-  } catch (e) {
-    btn.textContent = "could not load the earlier plans";
-    return;
+// One part of a plan as what changed in it: a line when nothing did, else its runs,
+// each spelled, added and removed ones marked by their element as well as their colour.
+function diffLine(section) {
+  if (section.kind === "unchanged" && !section.runs.length) {
+    return line(section.label, "unchanged");
   }
-  if (openTask !== id) return;
+  const wrap = document.createElement("div");
+  const said = section.kind === "unchanged" ? "unchanged" : changeNote(section);
+  if (said) wrap.appendChild(noticeLine({ text: said, warn: false }));
+  const runs = document.createElement("div");
+  runs.className = "prose";
+  let hidden = 0;
+  for (const run of section.runs) {
+    const shown = spellHidden(run.text);
+    hidden += shown.hidden;
+    const el = document.createElement(run.op === "add" ? "ins"
+      : run.op === "del" ? "del" : "span");
+    el.textContent = shown.text;
+    runs.appendChild(el);
+  }
+  wrap.appendChild(runs);
+  if (hidden) wrap.appendChild(noticeLine({ text: hiddenNote(hidden), warn: true }));
+  return line(section.label, wrap);
+}
+
+// The plan block's toggle: what changed, or the whole plan.
+function togglePlanView(btn) {
+  const block = btn.closest(".plan");
+  const whole = btn.dataset.planView === "whole";
+  block.querySelector(".plan-changes").hidden = whole;
+  block.querySelector(".plan-whole").hidden = !whole;
+  btn.dataset.planView = whole ? "changes" : "whole";
+  btn.textContent = whole ? "show what changed" : "show the whole plan";
+}
+
+// Every plan the task had but the one shown, newest first, under the button that
+// asked: what a plan replaced, to read beside it, from the plans the page holds.
+function showPlans(btn) {
   const holder = document.createElement("div");
-  const earlier = earlierPlans(plans, btn.dataset.shown);
+  const earlier = earlierPlans(shownHeld && shownHeld.plans, btn.dataset.shown);
   if (!earlier.length) {
     const none = document.createElement("div");
     none.className = "empty";
@@ -685,12 +819,15 @@ function brief(t) {
   return t ? `#${t.id} ${spellHidden(t.title).text} (${t.state})` : "";
 }
 
-// A task and every note on it, hidden ones marked: what the detail is drawn from.
+// A task, the newest page of its timeline, and for a task with a plan every plan it
+// had: what the detail is drawn from.
 async function readTask(id) {
   const path = encodeURIComponent(id);
   const task = await registryJson(await fetch(`/api/tasks/${path}`));
-  const notes = await registryJson(await fetch(`/api/tasks/${path}/notes`));
-  return { task, notes };
+  const timeline = await registryJson(await fetch(`/api/tasks/${path}/history`));
+  const plans = task.plan
+    ? await registryJson(await fetch(`/api/tasks/${path}/plans`)) : [];
+  return { task, held: { timeline, plans } };
 }
 
 // One task in full, read and drawn beside the list.
@@ -702,9 +839,9 @@ async function showTask(id) {
   // The detail still drawn is another task's until this one is read: its controls go
   // off now, so no click on it is sent while the page loads another.
   markWriting();
-  let task, notes;
+  let task, held;
   try {
-    ({ task, notes } = await readTask(id));
+    ({ task, held } = await readTask(id));
   } catch (e) {
     if (openTask !== id) return;
     // A registry that stopped is read again when it answers: applyHash reads a task
@@ -718,15 +855,24 @@ async function showTask(id) {
     return;
   }
   if (openTask !== id) return;
-  drawTask(task, notes);
+  drawTask(task, held);
 }
 
-// What an agent reads of a task, its plan, the operator's moves on it, then every note
-// with the hidden ones marked and a note to add, and its history on request.
-function drawTask(task, notes) {
+// Under a line kept for what changed since, what an agent reads of a task, its plan,
+// the operator's moves on it, then its timeline, every note with the hidden ones marked
+// among the other writes, and a note to add.
+function drawTask(task, held) {
   shownTask = task;
-  shownNotes = notes;
+  shownHeld = held;
+  draws += 1;
   taskDetail.replaceChildren();
+  // Its space is kept whether or not it says anything, so filling it moves nothing.
+  noticeSlot = document.createElement("div");
+  noticeSlot.className = "notice-slot";
+  taskDetail.appendChild(noticeSlot);
+  if (outcome && outcome.task === String(task.id) && outcome.result === "stale") {
+    fillSlot(outcome);
+  }
   const head = document.createElement("h3");
   head.textContent = `#${task.id} ${spellHidden(task.title).text}`;
   const close = document.createElement("button");
@@ -771,7 +917,8 @@ function drawTask(task, notes) {
   planHead.textContent = "Plan";
   taskDetail.appendChild(planHead);
   if (task.plan) {
-    taskDetail.appendChild(planBlock(task.plan, task.state));
+    taskDetail.appendChild(planBlock(task.plan, task.state,
+                                     planPredecessor(held.plans, task.plan.id)));
     const more = pagerButton("earlier plans", "plans", "");
     more.dataset.shown = String(task.plan.id);
     taskDetail.appendChild(more);
@@ -780,39 +927,76 @@ function drawTask(task, notes) {
   }
   // Below the plan, so what a move approves is read before it.
   taskDetail.appendChild(movesBlock(task));
-  const notesHead = document.createElement("h3");
-  notesHead.textContent = `Notes · ${notes.total}`;
-  taskDetail.appendChild(notesHead);
-  // Earlier pages go above the one shown, so the notes read oldest first throughout.
-  const earlier = olderCursor(notes.notes, "oldest-first", 0, notes.total);
+  const timeline = held.timeline;
+  const timelineHead = document.createElement("h3");
+  timelineHead.textContent = `Timeline · ${timeline.total}`;
+  taskDetail.appendChild(timelineHead);
+  // Earlier pages go above the one shown, so the timeline reads oldest first throughout.
+  const earlier = olderCursor(timeline.history, "oldest-first", 0, timeline.total);
   if (earlier !== null) {
-    const btn = pagerButton("earlier notes", "notes", earlier);
-    btn.dataset.seen = String(notes.notes.length);
+    const btn = pagerButton("earlier", "history", earlier);
+    btn.dataset.seen = String(timeline.history.length);
     taskDetail.appendChild(btn);
   }
-  const notesTable = document.createElement("table");
-  const notesBody = document.createElement("tbody");
-  renderNotes(notesBody, notes.notes);
-  notesTable.appendChild(notesBody);
-  taskDetail.appendChild(notesTable);
+  const timelineTable = document.createElement("table");
+  const timelineBody = document.createElement("tbody");
+  renderTimeline(timelineBody, timeline.history);
+  timelineTable.appendChild(timelineBody);
+  taskDetail.appendChild(timelineTable);
   taskDetail.appendChild(noteForm(task));
-  const history = document.createElement("div");
-  history.className = "history";
-  history.appendChild(pagerButton("history", "history", ""));
-  taskDetail.appendChild(history);
   taskDetail.hidden = false;
   markWriting();
 }
 
+// The line atop the detail, filled: what changed since the task was drawn, and the
+// way to read it again.
+function fillSlot(notice) {
+  const show = document.createElement("button");
+  show.type = "button";
+  show.className = "group-toggle";
+  show.dataset.show = "1";
+  show.textContent = "show it";
+  const text = document.createElement("span");
+  text.textContent = notice.text;
+  text.title = notice.text;
+  noticeSlot.className = notice.warn ? "notice-slot warn" : "notice-slot";
+  noticeSlot.dataset.kind = notice.kind || notice.result;
+  noticeSlot.replaceChildren(show, text);
+}
+
+// The open task read again by the poll, to say in the slot when it changed since it
+// was drawn (`taskUpdate`), and to draw nothing else: the reader asks for the newer one.
+// Only while the registry answers, no write is out and the task drawn is the one named;
+// an answer a draw overtook is dropped, since it was asked against a task no longer
+// shown. It fills the slot or replaces what fills it, and never empties it: only a draw
+// does. New notes do not displace a refused write's notice; a newer change does.
+export async function refreshOpenTask() {
+  if (!registryIsRunning() || writing || !drawnIsOpen()) return;
+  const asked = draws;
+  let polled;
+  try {
+    polled = await registryJson(await fetch(`/api/tasks/${encodeURIComponent(openTask)}`));
+  } catch (e) {
+    return;
+  }
+  if (draws !== asked || writing || !drawnIsOpen()) return;
+  const update = taskUpdate(shownTask, polled);
+  if (!update || (update.kind === "notes" && noticeSlot.dataset.kind === "stale")) return;
+  fillSlot({ ...update, warn: update.kind === "changed" });
+}
+
 // The moves the operator API takes from the task's state, and what the last one came
-// to. Approve and send back are each a control of their own, as a refined task's two
+// to, but a refusal for a task that changed, which the slot atop the detail says.
+// Approve and send back are each a control of their own, as a refined task's two
 // answers; approve names what it approves.
 function movesBlock(task) {
   const block = document.createElement("div");
   const head = document.createElement("h3");
   head.textContent = "Moves";
   block.appendChild(head);
-  if (outcome && outcome.task === String(task.id)) block.appendChild(noticeLine(outcome));
+  if (outcome && outcome.task === String(task.id) && outcome.result !== "stale") {
+    block.appendChild(noticeLine(outcome));
+  }
   const row = document.createElement("div");
   row.className = "moves";
   for (const move of movesFor(task)) {
@@ -880,7 +1064,7 @@ async function runWrite(write) {
   if (result === "not-running") {
     setRunning(false);
   } else if (result === "stale") {
-    drawn = { task: answer.body.current, notes: shownNotes };
+    drawn = { task: answer.body.current, held: shownHeld };
   } else {
     drawn = await readTask(write.task).catch(() => null);
     if (result === "unknown") result = checkWrite(write, drawn);
@@ -894,9 +1078,9 @@ async function runWrite(write) {
   if (openTask === write.task) {
     const detail = answer && answer.body && typeof answer.body === "object"
       ? answer.body.detail : answer && answer.text;
-    outcome = { task: write.task, ...outcomeText(write, result, detail) };
-    if (drawn) drawTask(drawn.task, drawn.notes);
-    else if (shownTask) drawTask(shownTask, shownNotes);
+    outcome = { task: write.task, result, ...outcomeText(write, result, detail) };
+    if (drawn) drawTask(drawn.task, drawn.held);
+    else if (shownTask) drawTask(shownTask, shownHeld);
   } else {
     markWriting();
   }
@@ -912,7 +1096,7 @@ async function runWrite(write) {
 function writeFor(btn) {
   if (!drawnIsOpen()) return null;
   const base = { task: String(shownTask.id), revision: shownTask.revision,
-                 lastNote: lastNoteId(shownNotes) };
+                 lastNote: lastNoteId(shownTask) };
   if (btn.dataset.write === "move") {
     return { ...base, kind: "move", state: btn.dataset.value, verb: btn.dataset.verb };
   }
@@ -931,68 +1115,64 @@ function pagerButton(label, kind, before) {
   return btn;
 }
 
-function renderNotes(tbody, notes) {
-  for (const n of notes) {
+// Timeline entries as rows: when, who, the action with the marks of the note it posted,
+// then that note, the note a hide or a handle acts on, and the rest of the write folded.
+function renderTimeline(tbody, history) {
+  for (const h of history) {
+    const entry = timelineEntry(h);
+    if (!entry) continue;
     const tr = document.createElement("tr");
-    const marks = [n.for_operator ? "for you" : "", n.handled ? "handled" : "",
-                   n.hidden ? "hidden" : "", n.move || "",
-                   n.reply_to ? `reply to #${n.reply_to}` : ""].filter(Boolean);
-    cell(tr, `#${n.id}`, "ts");
-    authorCell(tr, n.author);
-    const at = cell(tr, fmtStamp(n.at), "ts");
-    at.title = fmtInstant(n.at);
-    cell(tr, marks.join(" · "), "qual");
-    textCell(tr, n.text);
-    if (n.hidden) tr.className = "hidden-note";
+    const at = cell(tr, fmtStamp(h.ts), "ts");
+    at.title = fmtInstant(h.ts);
+    authorCell(tr, h.author);
+    cell(tr, [h.action, ...entry.marks].join(" · "), "qual");
+    const td = document.createElement("td");
+    if (entry.note) {
+      td.appendChild(proseBlock(entry.note.text));
+    }
+    if (entry.named) td.appendChild(line("note", entry.named));
+    if (entry.folded.length) {
+      const folded = document.createElement("details");
+      const summary = document.createElement("summary");
+      summary.className = "qual";
+      summary.textContent = entry.folded.map(([key]) => key).join(", ");
+      folded.appendChild(summary);
+      for (const [key, value] of entry.folded) {
+        folded.appendChild(line(key, typeof value === "string" ? proseBlock(value)
+          : spellHidden(JSON.stringify(value)).text));
+      }
+      td.appendChild(folded);
+    }
+    tr.appendChild(td);
+    if (entry.note && entry.note.hidden) tr.className = "hidden-note";
     tbody.appendChild(tr);
   }
 }
 
-// An older page of a task's notes or its history, shown under the button that asked.
+// An older page of the timeline, under the button that asked.
 async function showPage(btn) {
   const id = openTask;
-  const kind = btn.dataset.page;
   const q = new URLSearchParams();
   if (btn.dataset.before) q.set("before", btn.dataset.before);
-  const path = encodeURIComponent(id);
   let page;
   try {
-    page = await registryJson(kind === "notes"
-      ? await fetch(`/api/tasks/${path}/notes?${q}`)
-      : await fetch(`/api/tasks/${path}/history?${q}`));
+    page = await registryJson(
+      await fetch(`/api/tasks/${encodeURIComponent(id)}/history?${q}`));
   } catch (e) {
-    btn.textContent = `could not load the ${kind}`;
+    btn.textContent = "could not load the earlier entries";
     return;
   }
   if (openTask !== id) return;
   const table = document.createElement("table");
   const tbody = document.createElement("tbody");
-  const items = kind === "notes" ? page.notes : page.history;
-  if (kind === "notes") {
-    renderNotes(tbody, items);
-  } else {
-    for (const h of items) {
-      const tr = document.createElement("tr");
-      const at = cell(tr, fmtStamp(h.ts), "ts");
-      at.title = fmtInstant(h.ts);
-      authorCell(tr, h.author);
-      cell(tr, h.action, "qual");
-      const td = document.createElement("td");
-      for (const [key, value] of Object.entries(h.detail || {})) {
-        td.appendChild(line(key, typeof value === "string" ? proseBlock(value)
-          : spellHidden(JSON.stringify(value)).text));
-      }
-      tr.appendChild(td);
-      tbody.appendChild(tr);
-    }
-  }
+  renderTimeline(tbody, page.history);
   table.appendChild(tbody);
-  const seen = Number(btn.dataset.seen || 0) + items.length;
-  const more = olderCursor(items, "oldest-first", seen, page.total);
-  // Above this page, as in showTask, so the record reads oldest first.
+  const seen = Number(btn.dataset.seen || 0) + page.history.length;
+  const more = olderCursor(page.history, "oldest-first", seen, page.total);
+  // Above this page, as in drawTask, so the timeline reads oldest first.
   const holder = document.createElement("div");
   if (more !== null) {
-    const next = pagerButton(`earlier ${kind}`, kind, more);
+    const next = pagerButton("earlier", "history", more);
     next.dataset.seen = String(seen);
     holder.appendChild(next);
   }
@@ -1003,7 +1183,7 @@ async function showPage(btn) {
 function closeTask() {
   openTask = null;
   shownTask = null;
-  shownNotes = null;
+  shownHeld = null;
   outcome = null;
   panes.classList.remove("reading");
   taskDetail.hidden = true;
@@ -1100,6 +1280,13 @@ export function mountTasks() {
       goTo(view, null);
       return;
     }
+    // The task read again, through the hash as every open is.
+    if (ev.target.closest("button[data-show]")) {
+      goTo(view, openTask);
+      return;
+    }
+    const planView = ev.target.closest("button[data-plan-view]");
+    if (planView) togglePlanView(planView);
     const page = ev.target.closest("button[data-page]");
     if (page) (page.dataset.page === "plans" ? showPlans : showPage)(page);
     const btn = ev.target.closest("button[data-write]");

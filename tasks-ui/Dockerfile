@@ -21,6 +21,7 @@ COPY tasks-ui/index.html ./index.html
 # The page's modules, one line each: a test holds this list equal to UI_MODULES in
 # app.py.
 COPY tasks-ui/app.js ./app.js
+COPY tasks-ui/diff.js ./diff.js
 COPY ui-common/escape.js ./escape.js
 COPY ui-common/list-status.js ./list-status.js
 COPY tasks-ui/moves.js ./moves.js

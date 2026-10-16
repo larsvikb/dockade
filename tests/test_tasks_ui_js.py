@@ -28,6 +28,11 @@ from test_tasks_ui import tui
 TASKS_DIR = ROOT / "tasks-ui"
 
 
+def _function(src: str, name: str) -> str:
+    return re.search(rf"^(?:export )?(?:async )?function {name}\(.*?^\}}", src,
+                     re.M | re.S).group(0)
+
+
 class TasksPageTests(PageChecks, unittest.TestCase):
     UI_DIR = TASKS_DIR
     APP = tui
@@ -414,8 +419,9 @@ const move = {kind: "move", task: "7", revision: 4, state: "open", verb: "approv
 const brk = {kind: "break", task: "7", revision: 4, verb: "break the claim", lastNote: 12};
 const note = {kind: "note", task: "7", revision: 4, text: "Seen.", lastNote: 12,
               verb: "add the note"};
-const after = (extra, notes = []) => ({task: task("open", {revision: 5, ...extra}),
-                                       notes: {notes, total: notes.length}});
+const after = (extra, notes = []) => ({task: task("open", {revision: 5, notes, ...extra}),
+                                       held: {timeline: {history: [], total: 0},
+                                              plans: []}});
 console.log(JSON.stringify({
   moves: {
     proposed: moves(task("proposed")),
@@ -627,6 +633,333 @@ class MoveTests(unittest.TestCase):
         self.assertEqual(texts["refused"]["text"], "Approve: refused. no\\u202e")
 
 
+_CHANGES_PROBE = r"""
+import { pathToFileURL } from "node:url";
+const t = await import(pathToFileURL(`${process.env.DOCKADE_UI_DIR}/tasks.js`).href);
+const d = await import(pathToFileURL(`${process.env.DOCKADE_UI_DIR}/diff.js`).href);
+// What a diff's runs make of each side, beside the runs themselves.
+const sides = r => ({
+  runs: r.runs, rewritten: r.rewritten,
+  before: r.runs.filter(x => x.op !== "add").map(x => x.text).join(""),
+  after: r.runs.filter(x => x.op !== "del").map(x => x.text).join(""),
+});
+const words = (n, w) => Array.from({length: n}, (_, i) => `${w}${i}`).join(" ");
+const big = [words(d.EDIT_MAX, "a"), words(d.EDIT_MAX, "b")];
+const plan = {id: 5, approach: "Relay first, then the page.", footprint: ["a.py", "b/"],
+              tests: "Under node.", out_of_scope: "None.", risks: "Races.",
+              review_verdict: "Passes."};
+const previous = {id: 3, approach: "Relay first.", footprint: ["a.py"],
+                  tests: "Under node.", out_of_scope: "None. ", risks: "",
+                  review_verdict: undefined};
+const note = {id: 4, text: "Land it?", for_operator: true, handled: true, hidden: true,
+              move: null, reply_to: null};
+const reply = {id: 7, text: "Yes.", for_operator: false, handled: false, hidden: false,
+               move: null, reply_to: 4};
+const shown = {id: 7, revision: 5, notes: [{id: 3}]};
+console.log(JSON.stringify({
+  word: {
+    equal: sides(d.wordDiff("the fox", "the fox")),
+    insert: sides(d.wordDiff("the fox", "the red fox")),
+    delete: sides(d.wordDiff("the red fox", "the fox")),
+    replace: sides(d.wordDiff("the quick fox", "the slow fox")),
+    whitespace: sides(d.wordDiff("a b\nc", "a  b c")),
+    hidden: sides(d.wordDiff("approve it", "approve\u200b it")),
+    from_nothing: sides(d.wordDiff("", "new")),
+    rephrased: sides(d.wordDiff("Keep it in one change, then test.",
+                                "Keep it small, then test.")),
+    ceiling: sides(d.wordDiff(...big)),
+    under_ceiling: d.wordDiff(words(200, "a"), words(200, "b")).rewritten,
+    lines: sides(d.lineDiff("a.py\nb/", "a.py\nb/\nc")),
+  },
+  big,
+  plan: t.planDiff(plan, previous).map(s => [s.label, s.kind, s.whitespaceOnly ?? null,
+                                             t.changeNote(s)]),
+  footprint: t.planDiff(plan, previous)[1].runs,
+  approach: sides(t.planDiff(plan, previous)[0]),
+  same_plan: t.planDiff(plan, plan).map(s => s.kind),
+  same_hidden: t.planDiff({tests: "run \u202e it"}, {tests: "run \u202e it"})
+    .filter(s => s.label === "tests").map(s => [s.kind, s.runs]),
+  not_whitespace: ["\ufeff", "\u2028", "\u00a0"].map(c =>
+    t.planDiff({tests: `a${c}b`}, {tests: "a b"})
+      .filter(s => s.label === "tests").map(s => t.changeNote(s))[0]),
+  predecessor: {
+    newest: t.planPredecessor([{id: 5}, {id: 3}, {id: 2}], 5),
+    by_string: t.planPredecessor([{id: 5}, {id: 3}, {id: 2}], "3"),
+    string_ids: t.planPredecessor([{id: "5"}, {id: "3"}], 5),
+    unordered: t.planPredecessor([{id: 2}, {id: 5}, {id: 3}], 5),
+    first: t.planPredecessor([{id: 5}, {id: 3}, {id: 2}], 2),
+    not_held: t.planPredecessor([{id: 5}, {id: 3}], 9),
+    none: t.planPredecessor(null, 5),
+    holes: t.planPredecessor([null, {id: 5}, {id: 4}], 5),
+  },
+  entry: {
+    note: t.timelineEntry({action: "note", author: "claude-a", ts: 1,
+                           detail: {note: "Land it?", note_id: 4, for_operator: true},
+                           note}),
+    handle: t.timelineEntry({action: "handle_note", author: "operator", ts: 2,
+                             detail: {note_id: 4, handled: true, reply: "Yes.",
+                                      reply_id: 7, actor: null},
+                             note: reply}),
+    handle_bare: t.timelineEntry({action: "handle_note", author: "operator", ts: 2,
+                                  detail: {note_id: 4, handled: true, reply: null,
+                                           reply_id: null}, note: null}),
+    hide: t.timelineEntry({action: "hide_note", author: "operator", ts: 3,
+                           detail: {note_id: 4, hidden: true}, note: null}),
+    plan: t.timelineEntry({action: "submit_plan", author: "claude-a", ts: 4,
+                           detail: {note: null, note_id: null, approach: "A."},
+                           note: null}),
+    none: t.timelineEntry(null),
+  },
+  update: {
+    nothing_shown: t.taskUpdate(null, shown),
+    same: t.taskUpdate(shown, {...shown}),
+    newer: t.taskUpdate(shown, {...shown, revision: 6}),
+    new_note: t.taskUpdate(shown, {...shown, notes: [{id: 3}, {id: 4}]}),
+    other_task: t.taskUpdate(shown, {...shown, id: 8, revision: 9}),
+    older: t.taskUpdate(shown, {...shown, revision: 4, notes: [{id: 9}]}),
+    string_id: t.taskUpdate(shown, {...shown, id: "7", revision: 6}),
+  },
+}));
+"""
+
+
+@unittest.skipIf(not _NODE and not _STRICT,
+                 "node is not installed — skipping app.js unit tests")
+class ChangeTests(unittest.TestCase):
+    """What makes a revision quick to approve, the pure halves: a plan as what changed
+    from the one before (``diff.js``, ``planDiff``, ``planPredecessor``), one timeline of
+    notes and the other writes (``timelineEntry``), and what a poll finds against the
+    task drawn (``taskUpdate``)."""
+
+    probe: dict
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        proc = subprocess.run(  # noqa: S603 (absolute path, fixed args, as _probe)
+            [_NODE, "--input-type=module", "-e", _CHANGES_PROBE],
+            env={**os.environ, "DOCKADE_UI_DIR": str(_served_dir(TASKS_DIR)),
+                 "TZ": "Europe/Stockholm"},
+            capture_output=True, text=True, timeout=60, check=False)
+        if proc.returncode != 0:
+            raise AssertionError("importing diff.js under node failed:\n" + proc.stderr)
+        cls.probe = json.loads(proc.stdout)
+
+    def test_a_word_diff_keeps_both_sides_whole(self):
+        for key, (before, after) in {
+                "equal": ("the fox", "the fox"), "insert": ("the fox", "the red fox"),
+                "delete": ("the red fox", "the fox"),
+                "replace": ("the quick fox", "the slow fox"),
+                "whitespace": ("a b\nc", "a  b c"),
+                "hidden": ("approve it", "approve\u200b it"),
+                "from_nothing": ("", "new")}.items():
+            with self.subTest(case=key):
+                got = self.probe["word"][key]
+                self.assertEqual((got["before"], got["after"], got["rewritten"]),
+                                 (before, after, False))
+
+    def test_a_word_diff_finds_the_words_that_changed(self):
+        w = self.probe["word"]
+        self.assertEqual(w["equal"]["runs"], [{"op": "same", "text": "the fox"}])
+        self.assertEqual([r["text"].strip() for r in w["insert"]["runs"]
+                          if r["op"] == "add"], ["red"])
+        self.assertEqual([r["op"] for r in w["delete"]["runs"]], ["same", "del", "same"])
+        self.assertEqual(w["replace"]["runs"], [
+            {"op": "same", "text": "the "}, {"op": "del", "text": "quick"},
+            {"op": "add", "text": "slow"}, {"op": "same", "text": " fox"}])
+        self.assertEqual(w["from_nothing"]["runs"], [{"op": "add", "text": "new"}])
+
+    def test_a_rephrased_stretch_reads_as_what_went_then_what_came(self):
+        # Not word by word: the space between two changed words is part of the change.
+        runs = self.probe["word"]["rephrased"]["runs"]
+        self.assertEqual([(r["op"], r["text"].strip()) for r in runs], [
+            ("same", "Keep it"), ("del", "in one change,"), ("add", "small,"),
+            ("same", "then test.")])
+        self.assertEqual(self.probe["word"]["rephrased"]["after"],
+                         "Keep it small, then test.")
+
+    def test_whitespace_and_a_hidden_character_are_changes(self):
+        w = self.probe["word"]
+        self.assertEqual([(r["op"], r["text"]) for r in w["whitespace"]["runs"]
+                          if r["op"] != "same"],
+                         [("del", " "), ("add", "  "), ("del", "\n"), ("add", " ")])
+        # Raw text compared: the page spells the run where it draws it.
+        self.assertEqual([(r["op"], r["text"]) for r in w["hidden"]["runs"]
+                          if r["op"] != "same"],
+                         [("del", "approve"), ("add", "approve\u200b")])
+
+    def test_past_the_ceiling_a_text_is_rewritten_whole(self):
+        ceiling = self.probe["word"]["ceiling"]
+        self.assertTrue(ceiling["rewritten"])
+        self.assertEqual(ceiling["runs"], [{"op": "del", "text": self.probe["big"][0]},
+                                           {"op": "add", "text": self.probe["big"][1]}])
+        self.assertFalse(self.probe["word"]["under_ceiling"])
+        src = (TASKS_DIR / "diff.js").read_text()
+        self.assertIn("const max = Math.min(n + m, EDIT_MAX);", src)
+
+    def test_a_line_diff_keeps_each_line_whole(self):
+        self.assertEqual(self.probe["word"]["lines"]["runs"],
+                         [{"op": "same", "text": "a.py\nb/\n"}, {"op": "add", "text": "c\n"}])
+
+    def test_a_plan_diff_says_each_section_unchanged_added_removed_or_changed(self):
+        self.assertEqual(self.probe["plan"], [
+            ["approach", "changed", False, ""],
+            ["footprint", "changed", False, ""],
+            ["tests", "unchanged", None, ""],
+            ["out of scope", "changed", True, "changed in whitespace only"],
+            ["risks", "added", None, "added"],
+            ["review verdict", "added", None, "added"]])
+        self.assertEqual(self.probe["approach"]["after"], "Relay first, then the page.")
+        self.assertEqual(self.probe["same_plan"], ["unchanged"] * 6)
+
+    def test_an_unchanged_section_with_a_hidden_character_keeps_its_text(self):
+        # approveHidden counts the whole plan: what it counts must be drawn spelled.
+        self.assertEqual(self.probe["same_hidden"],
+                         [["unchanged", [{"op": "same", "text": "run \u202e it"}]]])
+        src = (TASKS_DIR / "tasks.js").read_text()
+        self.assertIn('if (section.kind === "unchanged" && !section.runs.length) {', src)
+
+    def test_a_hidden_character_is_not_whitespace(self):
+        self.assertEqual(self.probe["not_whitespace"], ["", "", ""])
+
+    def test_a_plan_diff_takes_the_footprint_path_by_path(self):
+        self.assertEqual(self.probe["footprint"], [{"op": "same", "text": "a.py\n"},
+                                                   {"op": "add", "text": "b/\n"}])
+
+    def test_a_section_emptied_is_removed(self):
+        src = (TASKS_DIR / "tasks.js").read_text()
+        self.assertIn('if (text === "") return { label, kind: "removed", '
+                      'runs: [{ op: "del", text: was }] };', src)
+
+    def test_the_predecessor_is_the_next_lower_plan_held(self):
+        p = self.probe["predecessor"]
+        self.assertEqual((p["newest"]["id"], p["by_string"]["id"], p["string_ids"]["id"],
+                          p["unordered"]["id"], p["holes"]["id"]), (3, 2, "3", 3, 4))
+        # The first plan has none; nor does one the page does not hold, as a refusal's.
+        for key in ("first", "not_held", "none"):
+            with self.subTest(case=key):
+                self.assertIsNone(p[key])
+
+    def test_a_note_is_shown_once_with_its_marks(self):
+        e = self.probe["entry"]["note"]
+        self.assertEqual(e["note"]["text"], "Land it?")
+        self.assertEqual(e["marks"], ["#4", "for you", "handled", "hidden"])
+        self.assertEqual(e["folded"], [["for_operator", True]])
+        self.assertEqual(e["named"], "")
+
+    def test_a_handle_shows_its_reply_once_and_the_note_it_answers(self):
+        e = self.probe["entry"]["handle"]
+        self.assertEqual(e["note"]["text"], "Yes.")
+        self.assertIn("reply to #4", e["marks"])
+        self.assertEqual(e["named"], "#4")
+        self.assertEqual([key for key, _ in e["folded"]], ["handled", "actor"])
+        bare = self.probe["entry"]["handle_bare"]
+        self.assertEqual((bare["note"], bare["named"]), (None, "#4"))
+        self.assertEqual([key for key, _ in bare["folded"]],
+                         ["handled", "reply", "reply_id"])
+
+    def test_a_hide_names_its_note_in_the_open_and_carries_none(self):
+        e = self.probe["entry"]["hide"]
+        self.assertEqual((e["note"], e["marks"], e["named"]), (None, [], "#4"))
+        self.assertEqual(e["folded"], [["hidden", True]])
+
+    def test_a_write_that_posted_no_note_keeps_its_detail(self):
+        e = self.probe["entry"]["plan"]
+        self.assertEqual([key for key, _ in e["folded"]], ["note", "note_id", "approach"])
+        self.assertIsNone(self.probe["entry"]["none"])
+
+    def test_a_poll_says_changed_new_notes_or_nothing(self):
+        u = self.probe["update"]
+        self.assertEqual(u["newer"]["kind"], "changed")
+        self.assertIn("revision 6, this shows 5", u["newer"]["text"])
+        self.assertEqual(u["string_id"]["kind"], "changed")
+        self.assertEqual(u["new_note"]["kind"], "notes")
+        for key in ("nothing_shown", "same", "other_task", "older"):
+            with self.subTest(case=key):
+                self.assertIsNone(u[key])
+
+
+class TaskTimelineSourceTests(unittest.TestCase):
+    """The detail's timeline and the line atop it that says the task changed, from
+    source: a browser is the only thing that runs them."""
+
+    TASKS = (TASKS_DIR / "tasks.js").read_text()
+    HTML = (TASKS_DIR / "index.html").read_text()
+
+    def test_the_poll_reads_the_open_task_only_when_it_can_compare(self):
+        body = _function(self.TASKS, "refreshOpenTask")
+        self.assertEqual(body.splitlines()[1].strip(),
+                         "if (!registryIsRunning() || writing || !drawnIsOpen()) return;")
+
+    def test_an_answer_a_draw_or_a_write_overtook_is_dropped(self):
+        body = _function(self.TASKS, "refreshOpenTask")
+        check = "if (draws !== asked || writing || !drawnIsOpen()) return;"
+        self.assertLess(body.index("const asked = draws;"), body.index("await fetch("))
+        self.assertLess(body.index("await fetch("), body.index(check))
+        self.assertLess(body.index(check), body.index("taskUpdate("))
+        # Every draw counts, the 409's and a write's redraw among them.
+        self.assertIn("draws += 1;", _function(self.TASKS, "drawTask"))
+        self.assertEqual(len(re.findall(r"\bdraws \+= 1;", self.TASKS)), 1)
+
+    def test_the_poll_fills_the_slot_and_draws_nothing_else(self):
+        body = _function(self.TASKS, "refreshOpenTask")
+        for drawing in ("drawTask(", "taskDetail", "replaceChildren(", "appendChild(",
+                        "noticeSlot =", "outcome =", "shownTask =", "shownHeld ="):
+            with self.subTest(drawing=drawing):
+                self.assertNotIn(drawing, body)
+        self.assertEqual(body.count("fillSlot("), 1)
+        # Filled, or its notice replaced, never emptied: only a draw makes a new slot.
+        self.assertIn("noticeSlot.replaceChildren(show, text);",
+                      _function(self.TASKS, "fillSlot"))
+        self.assertEqual(re.findall(r"\bnoticeSlot = ([^;]*);", self.TASKS),
+                         ["null", 'document.createElement("div")'])
+        self.assertIn("noticeSlot = document.createElement(", _function(self.TASKS, "drawTask"))
+        # A refused write's notice outweighs a note's.
+        self.assertIn('(update.kind === "notes" && noticeSlot.dataset.kind === "stale")',
+                      body)
+
+    def test_the_slot_is_shared_with_a_refused_write_and_keeps_its_space(self):
+        draw = _function(self.TASKS, "drawTask")
+        self.assertIn('outcome.result === "stale"', draw)
+        self.assertIn("fillSlot(outcome);", draw)
+        self.assertIn('outcome.result !== "stale"', _function(self.TASKS, "movesBlock"))
+        self.assertIn("outcome = { task: write.task, result, ",
+                      _function(self.TASKS, "runWrite"))
+        # Atop the detail, there whether it says anything or not, one fixed line high.
+        self.assertLess(draw.index("taskDetail.appendChild(noticeSlot);"),
+                        draw.index("taskDetail.appendChild(head);"))
+        rule = re.search(r"\.notice-slot \{([^}]*)\}", self.HTML).group(1)
+        self.assertRegex(rule, r"\bheight: \d+px;")
+        self.assertIn("overflow: hidden;", rule)
+        self.assertIn("white-space: nowrap;", rule)
+        self.assertRegex(self.HTML, r"\.notice-slot:not\(:empty\) \{ position: sticky; top: 0;")
+
+    def test_show_it_reads_the_task_again_through_the_hash(self):
+        self.assertIn('if (ev.target.closest("button[data-show]")) {\n'
+                      "      goTo(view, openTask);", self.TASKS)
+        self.assertIn('show.dataset.show = "1";', _function(self.TASKS, "fillSlot"))
+
+    def test_the_timeline_reads_oldest_first_earlier_pages_above(self):
+        draw = _function(self.TASKS, "drawTask")
+        self.assertIn('olderCursor(timeline.history, "oldest-first", 0, timeline.total)',
+                      draw)
+        self.assertLess(draw.index('pagerButton("earlier", "history", earlier)'),
+                        draw.index("taskDetail.appendChild(timelineTable);"))
+        page = _function(self.TASKS, "showPage")
+        self.assertLess(page.index("holder.appendChild(next);"),
+                        page.index("holder.appendChild(table);"))
+        self.assertIn("renderTimeline(tbody, page.history);", page)
+
+    def test_the_detail_reads_the_timeline_and_no_notes(self):
+        read = _function(self.TASKS, "readTask")
+        self.assertIn("fetch(`/api/tasks/${path}/history`)", read)
+        self.assertNotIn("/notes", self.TASKS)
+
+    def test_diff_js_imports_nothing_and_draws_nothing(self):
+        src = (TASKS_DIR / "diff.js").read_text()
+        self.assertNotRegex(_code(src), r"\bimport\b")
+        self.assertNotIn("document", _code(src))
+
+
 class TaskWriteSourceTests(unittest.TestCase):
     """How the page sends its writes and draws what they came to, from source, as the
     polling guards are: a browser is the only thing that runs it."""
@@ -693,8 +1026,8 @@ class TaskWriteSourceTests(unittest.TestCase):
         stale = stale[:stale.index("} else {")]
         self.assertIn("answer.body.current", stale)
         self.assertNotIn("readTask(", stale)
-        # The notes the page holds, since the task's own are what agents read.
-        self.assertIn("notes: shownNotes", stale)
+        # The timeline and plans the page holds, not read again either.
+        self.assertIn("held: shownHeld", stale)
 
     def test_a_lost_answer_is_decided_from_a_read_and_never_resent(self):
         body = self._function(self.TASKS, "runWrite")
@@ -751,8 +1084,11 @@ class TaskPollingSourceTests(unittest.TestCase):
         body = [ln.strip() for ln in polls[0].splitlines()]
         self.assertEqual(body, [
             "if (!visible()) return;",
-            "if (registryIsRunning()) refreshInbox().then(() => refreshTasks());",
+            "if (registryIsRunning()) readRegistry();",
             "else probeRegistry();"])
+        # In turn, so a registry that stopped costs one failed call.
+        self.assertIn("refreshInbox().then(() => refreshTasks()).then(() => "
+                      "refreshOpenTask());", self.APP)
 
     def test_startup_asks_its_server_and_not_the_registry(self):
         start = self._function(self.APP, "start")
@@ -836,10 +1172,12 @@ class TaskRenderingSourceTests(unittest.TestCase):
 
     TASKS = (TASKS_DIR / "tasks.js").read_text()
     # A field an agent wrote, read off one of the registry's records.
-    FIELD = re.compile(r"\b(?:t|n|h|task|claim|plan|part|reason)(?:\.claim)?\."
+    # A timeline entry's note, and a diff's run, are agent text too.
+    FIELD = re.compile(r"\b(?:t|n|h|task|claim|plan|part|reason|entry|run)"
+                       r"(?:\.claim|\.note)?\."
                        r"(?:title|body|text|author|holder|branch|progress|footprint|"
                        r"approach|tests|out_of_scope|risks|review_verdict)\b")
-    SPELT = ("spellHidden(", "proseBlock(", "textCell(", "authorCell(", "claimText(")
+    SPELT = ("spellHidden(", "proseBlock(", "authorCell(", "claimText(")
 
     # Every module the page is made of, so a helper moving to another module does not
     # move out of these guards' sight.
@@ -865,14 +1203,26 @@ class TaskRenderingSourceTests(unittest.TestCase):
                 self.assertTrue(any(s in ln for s in self.SPELT), ln)
 
     def test_the_plans_are_drawn_against_what_they_are(self):
-        # The task's own plan is read against its state; an earlier plan, against none,
-        # since a newer one is the task's; the shown one stays out of the earlier list.
-        self.assertIn("planBlock(task.plan, task.state)", self.TASKS)
+        # The task's own plan is read against its state and drawn as what changed from
+        # the one before; an earlier plan against none, since a newer one is the
+        # task's, and whole; the shown one stays out of the earlier list.
+        self.assertIn("planBlock(task.plan, task.state,\n"
+                      "                                     planPredecessor(held.plans, "
+                      "task.plan.id))", self.TASKS)
         self.assertIn("planBlock(plan, null)", self.TASKS)
         self.assertIn("planNotice(null, task.state)", self.TASKS)
-        self.assertIn("earlierPlans(plans, btn.dataset.shown)", self.TASKS)
         self.assertIn("more.dataset.shown = String(task.plan.id);", self.TASKS)
         self.assertIn('page.dataset.page === "plans" ? showPlans : showPage', self.TASKS)
+
+    def test_the_earlier_plans_are_the_ones_the_page_holds(self):
+        # Read with the task, so the diff and the earlier plans are the same list.
+        show = _function(self.TASKS, "showPlans")
+        self.assertIn("earlierPlans(shownHeld && shownHeld.plans, btn.dataset.shown)", show)
+        self.assertNotIn("fetch(", show)
+        read = _function(self.TASKS, "readTask")
+        self.assertIn("const plans = task.plan\n"
+                      "    ? await registryJson(await fetch(`/api/tasks/${path}/plans`))",
+                      read)
 
     def test_the_helpers_spell_and_set_text(self):
         for name in ("proseBlock", "authorCell"):
@@ -882,8 +1232,17 @@ class TaskRenderingSourceTests(unittest.TestCase):
                 self.assertIn("spellHidden(", body)
         prose = re.search(r"^function proseBlock\(.*?^\}", self.TASKS, re.M | re.S)
         self.assertIn("pre.textContent = shown.text", prose.group(0))
-        text = re.search(r"^function textCell\(.*?^\}", self.TASKS, re.M | re.S)
-        self.assertIn("proseBlock(text)", text.group(0))
+
+    def test_a_diff_spells_every_run_and_marks_it_by_more_than_colour(self):
+        body = _function(self.TASKS, "diffLine")
+        self.assertIn("const shown = spellHidden(run.text);", body)
+        self.assertIn("el.textContent = shown.text;", body)
+        self.assertIn('document.createElement(run.op === "add" ? "ins"\n'
+                      '      : run.op === "del" ? "del" : "span")', body)
+        self.assertIn("hiddenNote(hidden)", body)
+        html = (TASKS_DIR / "index.html").read_text()
+        self.assertRegex(html, r"\bins \{ text-decoration: underline;")
+        self.assertRegex(html, r"\bdel \{ text-decoration: line-through;")
 
     def test_a_history_value_is_spelled_whatever_its_type(self):
         self.assertIn('typeof value === "string" ? proseBlock(value)', self.TASKS)

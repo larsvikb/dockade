@@ -46,7 +46,7 @@ class RelayTests(unittest.TestCase):
         return asyncio.run(tui.proxy(captured_path, ok_host(method=method, **kw)))
 
     def test_the_reads_reach_the_registry(self):
-        for path in ("api/repos", "api/tasks", "api/tasks/12", "api/tasks/12/notes",
+        for path in ("api/repos", "api/tasks", "api/tasks/12",
                      "api/tasks/12/history", "api/tasks/12/plans", "api/inbox",
                      "api/search"):
             with self.subTest(path=path):
@@ -71,6 +71,8 @@ class RelayTests(unittest.TestCase):
                              ("api/tasks/12/reparent", "POST"),
                              ("api/tasks/12/move", "GET"),
                              ("api/tasks/12/break-claim", "GET"),
+                             # Every note: the history carries them.
+                             ("api/tasks/12/notes", "GET"),
                              ("api/tasks/abc/move", "POST"),
                              ("api/tasks/12/move/x", "POST"),
                              ("api/tasks/12345678901234567890/notes", "POST"),

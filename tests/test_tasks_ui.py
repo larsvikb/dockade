@@ -33,6 +33,9 @@ def _load(name: str = "dockade_tasks_ui") -> types.ModuleType:
 
 tui = _load()
 
+#: The writes the relay passes, each as the page posts it.
+WRITES = ("api/tasks/12/move", "api/tasks/12/break-claim", "api/tasks/12/notes")
+
 
 class RelayTests(unittest.TestCase):
     """``/api/…`` goes to the registry's operator listener as it came, exactly the
@@ -49,14 +52,30 @@ class RelayTests(unittest.TestCase):
             with self.subTest(path=path):
                 resp = self._proxy(path)
                 self.assertNotEqual(resp.status_code, 403)
-                self.assertEqual(sent["url"], f"{tui.REGISTRY_URL}/{path}")
+                self.assertEqual((sent["method"], sent["url"]),
+                                 ("GET", f"{tui.REGISTRY_URL}/{path}"))
+
+    def test_the_three_writes_reach_it_as_posts(self):
+        for path in WRITES:
+            with self.subTest(path=path):
+                resp = self._proxy(path, "POST")
+                self.assertNotEqual(resp.status_code, 403)
+                self.assertEqual((sent["method"], sent["url"]),
+                                 ("POST", f"{tui.REGISTRY_URL}/{path}"))
 
     def test_nothing_else_reaches_it(self):
-        # No write yet; an id that is not digits, or too long; the old prefix; the
-        # control plane's paths; the agent listener's; the pages FastAPI would add.
-        for path, method in (("api/tasks", "POST"), ("api/tasks/12/move", "POST"),
-                             ("api/tasks/12/break-claim", "POST"),
-                             ("api/tasks/12/notes", "POST"), ("api/notes/hide", "POST"),
+        # Every other write, and the three by another method or with another id; an id
+        # that is not digits, or too long; the old prefix; the control plane's paths;
+        # the agent listener's; the pages FastAPI would add.
+        for path, method in (("api/tasks", "POST"), ("api/tasks/12/edit", "POST"),
+                             ("api/tasks/12/reparent", "POST"),
+                             ("api/tasks/12/move", "GET"),
+                             ("api/tasks/12/break-claim", "GET"),
+                             ("api/tasks/abc/move", "POST"),
+                             ("api/tasks/12/move/x", "POST"),
+                             ("api/tasks/12345678901234567890/notes", "POST"),
+                             ("api/notes/hide", "POST"), ("api/notes/handle", "POST"),
+                             ("api/notes/3/handle", "POST"),
                              ("api/tasks/12/plans", "POST"), ("api/inbox", "POST"),
                              # The flagged list the inbox replaced.
                              ("api/notes/flagged", "GET"),
@@ -84,15 +103,45 @@ class RelayTests(unittest.TestCase):
                     self.assertEqual(urlsplit(sent["url"]).netloc,
                                      urlsplit(tui.REGISTRY_URL).netloc)
 
-    def test_no_claim_about_who_or_where_is_passed_on(self):
-        self._proxy("api/repos", headers={"x-forwarded-for": "10.9.9.9",
-                                          "x-dockade-actor": "forged", "forwarded": "x",
-                                          "connection": "close", "accept": "*/*"})
-        headers = dict(sent["headers"])
-        for name in ("x-forwarded-for", "x-dockade-actor", "forwarded", "connection",
-                     "host"):
-            self.assertNotIn(name, headers)
-        self.assertEqual(headers["accept"], "*/*")
+    def test_the_only_claim_about_who_is_the_relays_own(self):
+        # A client's actor is dropped and the peer this relay saw put in its place,
+        # once, which the registry records as `via-ui=` (operator_api.actor).
+        for path, method in (("api/repos", "GET"), ("api/tasks/12/move", "POST")):
+            with self.subTest(method=method):
+                self._proxy(path, method, peer="172.24.0.1",
+                            headers={"x-forwarded-for": "10.9.9.9",
+                                     "x-dockade-actor": "forged", "forwarded": "x",
+                                     "connection": "close", "accept": "*/*"})
+                headers = sent["headers"]
+                self.assertEqual([v for k, v in headers if k == tui.ACTOR_HEADER],
+                                 ["172.24.0.1"])
+                names = {k for k, _ in headers}
+                for name in ("x-forwarded-for", "forwarded", "connection", "host"):
+                    self.assertNotIn(name, names)
+                self.assertEqual(dict(headers)["accept"], "*/*")
+
+    def test_a_cross_origin_write_is_refused_before_the_relay(self):
+        # The shared guard (tests/test_ui_guards.py), in front of each write.
+        guard = tui.guards.request_guard(tui.NAME, tui.ALLOWED_HOSTNAMES)
+
+        async def relay(request, path):
+            return await tui.proxy(path, request)
+
+        for path in WRITES:
+            for headers in ({"sec-fetch-site": "cross-site"},
+                            {"sec-fetch-site": "same-site"},
+                            {"origin": "http://127.0.0.1:3000"}):
+                with self.subTest(path=path, headers=headers):
+                    sent.clear()
+                    request = ok_host(method="POST", headers=headers)
+                    resp = asyncio.run(guard(request, lambda r, p=path: relay(r, p)))
+                    self.assertEqual(resp.status_code, 403)
+                    self.assertEqual(sent, {})
+            with self.subTest(path=path, headers="same-origin"):
+                request = ok_host(method="POST", headers={"sec-fetch-site": "same-origin"})
+                resp = asyncio.run(guard(request, lambda r, p=path: relay(r, p)))
+                self.assertNotEqual(resp.status_code, 403)
+                self.assertEqual(sent["method"], "POST")
 
     def test_it_strips_what_the_approval_ui_strips(self):
         # One reason per header, given once in control-plane-ui/app.py.
@@ -121,18 +170,64 @@ class RelayTests(unittest.TestCase):
             resp = self._proxy("api/repos")
         self.assertEqual(resp.kwargs["headers"], {"content-type": "application/json"})
 
+    def _failing(self, path, method, error):
+        async def _boom(_req, stream=False):
+            raise getattr(sys.modules["httpx"], error)("boom")
+
+        with mock.patch.object(tui._client, "send", _boom):
+            return self._proxy(path, method)
+
     def test_a_registry_that_does_not_answer_is_a_502_in_its_own_shape(self):
         # The status the page reads as "not running", which the registry never sends:
         # its refusals are 400, 404, 409 and 422 (task-registry/operator_api.py).
-        async def _boom(_req, stream=False):
-            raise sys.modules["httpx"].RequestError("connection refused")
-
-        with mock.patch.object(tui._client, "send", _boom):
-            resp = self._proxy("api/repos")
+        resp = self._failing("api/repos", "GET", "ConnectError")
         self.assertEqual(resp.status_code, 502)
         self.assertEqual(resp.args[0]["ok"], False)
         self.assertIsNone(resp.args[0]["current"])
         self.assertIn("task registry did not answer", resp.args[0]["detail"])
+
+    def test_a_write_that_was_never_sent_is_a_502_too(self):
+        # Nothing reached the registry, so the page may say it is not running.
+        for error in ("ConnectError", "ConnectTimeout", "PoolTimeout"):
+            for path in WRITES:
+                with self.subTest(error=error, path=path):
+                    resp = self._failing(path, "POST", error)
+                    self.assertEqual(resp.status_code, 502)
+                    self.assertIn(f"({error})", resp.args[0]["detail"])
+
+    def test_a_write_sent_and_not_answered_is_a_504_in_its_own_shape(self):
+        # It may have landed: a status nothing else sends, so the page reads the task
+        # again rather than offer to send it again. The base class too, and any other
+        # this relay does not name, is taken as sent.
+        for error in ("ReadTimeout", "WriteTimeout", "ReadError", "WriteError",
+                      "RemoteProtocolError", "RequestError"):
+            for path in WRITES:
+                with self.subTest(error=error, path=path):
+                    resp = self._failing(path, "POST", error)
+                    self.assertEqual(resp.status_code, 504)
+                    body = resp.args[0]
+                    self.assertEqual((body["ok"], body["current"]), (False, None))
+                    self.assertIn("may have landed", body["detail"])
+                    self.assertIn(f"({error})", body["detail"])
+
+    def test_a_read_with_no_answer_is_not_running_whatever_the_error(self):
+        # A read changes nothing, so asking again is always safe.
+        for error in ("ConnectError", "ReadTimeout", "RemoteProtocolError",
+                      "RequestError"):
+            with self.subTest(error=error):
+                self.assertEqual(self._failing("api/tasks/12", "GET", error).status_code,
+                                 502)
+
+    def test_the_not_sent_list_is_these_three_and_each_is_a_request_error(self):
+        httpx = sys.modules["httpx"]
+        self.assertEqual(tui._NOT_SENT,
+                         (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout))
+        for error in tui._NOT_SENT:
+            self.assertTrue(issubclass(error, httpx.RequestError))
+        # Neither status is one the registry sends (task-registry/operator_api.py).
+        api = (ROOT / "task-registry" / "operator_api.py").read_text()
+        for status in ("502", "504"):
+            self.assertNotIn(status, api)
 
     def test_the_registry_is_dialled_by_address_and_with_a_bounded_wait(self):
         # By name, a stopped registry's `tasks` would be asked of the host's DNS.

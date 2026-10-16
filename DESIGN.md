@@ -1217,7 +1217,10 @@ trust levels apart: `peer=` is observed by the backend (but is the *relay* for
 anything via the UI), `via-ui=` is asserted by the relay, and `origin=` / `ua=` are
 self-reported and forgeable — recorded anyway because they are usually what betrays
 a non-browser caller. None of this was recorded before: an operator's click and a
-scripted POST were indistinguishable after the fact.
+scripted POST were indistinguishable after the fact. The tasks UI's relay asserts the
+same header to the task registry, which records it, in the same fields, on every
+operator write's history row (`tasks-ui/DESIGN.md`, "Where an operator write came
+from").
 
 ### MCP gateway — governed tool capability
 
@@ -2034,9 +2037,10 @@ The approval page links to it, an address and nothing else (`CONTROL_UI_TASKS_LI
 `tasks-ui` binds its `tasks-ui-net` address alone and answers that network's peers
 only, as the registry's listeners do theirs, so a registry compromised through a body
 or a note does not find its relay. In the other direction the relay is the operator
-listener's one client, so its table of registry routes (`tasks-ui/app.py`) is the
-whole of what a browser on the loopback port can do there. Its own design, the page's
-not-running state and how it spells agent prose, is `tasks-ui/DESIGN.md`.
+listener's one client, so its table of registry routes (`tasks-ui/app.py`), the page's
+reads and its three writes, is the whole of what a browser on the loopback port can do
+there. Its own design, the page's not-running state, how it spells agent prose and
+what it makes of a write whose answer was lost, is `tasks-ui/DESIGN.md`.
 
 ## Startup ordering — "running" is not "ready"
 

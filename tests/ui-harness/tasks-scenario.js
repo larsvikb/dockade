@@ -3,7 +3,9 @@
 // scenario.js does to the approval page. Addressed by what the operator sees, so the
 // same steps run against the base tree and the branch.
 
-import { startRegistry, stopRegistry } from "./tasks-backend.js";
+import {
+  editElsewhere, loseNextAnswer, startRegistry, stopRegistry,
+} from "./tasks-backend.js";
 
 export const STEPS = [
   ["load", async ({ load }) => { await load(); }],
@@ -66,4 +68,42 @@ export const STEPS = [
     await clock(16000);
   }],
   ["back to the inbox", async ({ page }) => { await page.click("#view-inbox"); }],
+  // The operator's writes, each followed by the detail and the inbox drawn again.
+  ["a refined task to triage", async ({ page }) => {
+    await page.click('#inbox button[data-task="6"]');
+  }],
+  ["approved", async ({ page }) => {
+    await page.click('#task-detail button[data-verb="approve"]');
+  }],
+  // Another session moves task 8 after the page read it: approving the revision shown
+  // is refused, and the page draws the task the refusal carries, saying so.
+  ["another refined task", async ({ page }) => {
+    await page.click('#inbox button[data-task="8"]');
+  }],
+  ["approved after it changed elsewhere", async ({ page }) => {
+    editElsewhere(8);
+    await page.click('#task-detail button[data-verb="approve"]');
+  }],
+  ["sent back", async ({ page }) => {
+    await page.click('#task-detail button[data-verb="send back"]');
+  }],
+  ["a claimed task", async ({ page }) => {
+    await page.click('#inbox button[data-task="3"]');
+  }],
+  ["its claim broken", async ({ page }) => {
+    await page.click('#task-detail button[data-write="break"]');
+  }],
+  ["a note added", async ({ page }) => {
+    await page.fill("#task-detail textarea[data-note]", "Looked at this.");
+    await page.click('#task-detail button[data-write="note"]');
+  }],
+  // The note lands and its answer is lost: the page reads the task again and finds it.
+  ["a note whose answer is lost", async ({ page }) => {
+    loseNextAnswer();
+    await page.fill("#task-detail textarea[data-note]", "And this.");
+    await page.click('#task-detail button[data-write="note"]');
+  }],
+  ["closed", async ({ page }) => {
+    await page.click('#task-detail button[data-verb="close"]');
+  }],
 ];

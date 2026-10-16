@@ -7,14 +7,15 @@ The app object only. What binds it, and where, is the service's entry
 (``task-registry/DESIGN.md``, "The operator API").
 
 Reads answer with what the read returns. Writes answer ``{"ok": true, ...}`` with the
-move's result. A refusal answers ``{"ok": false, "detail": <reason>, "current": <what
-is there now>}``: 404 when the task in the path, or a note or repo the request names,
-does not exist; 409 when the revision named is stale (``current`` is then the task as
-it is now); 400 for every other refusal, a missing parent or blocker among them. A
-request not shaped as its route takes it answers 422 in the same shape (``invalid``),
-and one Starlette turns away first, an unknown path, a wrong method or a body it cannot
-parse, answers Starlette's status in the same shape too (``failed``), both before the
-registry sees anything. So every answer carries ``ok``.
+move's result, and each records who made it (``actor``) in its history row. A refusal
+answers ``{"ok": false, "detail": <reason>, "current": <what is there now>}``: 404 when
+the task in the path, or a note or repo the request names, does not exist; 409 when the
+revision named is stale (``current`` is then the task as it is now); 400 for every other
+refusal, a missing parent or blocker among them. A request not shaped as its route takes
+it answers 422 in the same shape (``invalid``), and one Starlette turns away first, an
+unknown path, a wrong method or a body it cannot parse, answers Starlette's status in
+the same shape too (``failed``), both before the registry sees anything. So every answer
+carries ``ok``.
 """
 from __future__ import annotations
 
@@ -38,6 +39,14 @@ EVERY_STATE = "all"
 #: How many of a request's faults a 422 names; the rest are counted.
 FAULTS_SHOWN = 10
 
+#: The header the tasks UI's relay sets to the browser's address, after dropping any
+#: copy a client sent (``tasks-ui/app.py``), and how much of each header ``actor``
+#: records, so a hostile one cannot bloat the history. The approval UI's relay and the
+#: control plane use the same name and cap (``control-plane/provenance.py``); a test
+#: holds the three equal.
+ACTOR_HEADER = "x-dockade-actor"
+ACTOR_FIELD_MAX = 120
+
 
 # --- what a route answers: plain functions, so tests need no server ---------------
 
@@ -48,12 +57,38 @@ def read(fn: Callable, *args: object, **kwargs: object) -> tuple[int, object]:
         return refused(refusal)
 
 
-def write(fn: Callable, *args: object, **kwargs: object) -> tuple[int, dict]:
+def write(request: Request, fn: Callable, *args: object,
+          **kwargs: object) -> tuple[int, dict]:
     try:
-        result = fn(*args, **kwargs)
+        result = fn(*args, actor=actor(request), **kwargs)
     except Refused as refusal:
         return refused(refusal)
     return 200, {"ok": True, **(result or {})}
+
+
+def actor(request: Request) -> str:
+    """Who made an operator write, for its history row, in the labelled fields the
+    control plane records on an approval (``control-plane/provenance.py``), because each
+    is trusted differently:
+      - ``peer``: the socket address this process saw. The caller cannot forge it: the
+        tasks UI's, or the host's, which holds an address on this network (SECURITY.md).
+      - ``via-ui``: the address the relay saw, asserted. Through the loopback publish it
+        is the publish's gateway rather than a browser's own, so it says the write came
+        through the page. Only as trustworthy as whoever set it: absent, the write was
+        posted to the registry straight; the host could also set it.
+      - ``origin`` / ``ua``: self-reported, so forgeable; recorded because they are what
+        usually betrays a caller that is not a browser.
+    Detection, not prevention, for the reason that module gives."""
+    client = getattr(request, "client", None)
+    parts = [f"peer={getattr(client, 'host', None) or '?'}"]
+    for label, header in (("via-ui", ACTOR_HEADER), ("origin", "origin")):
+        value = request.headers.get(header)
+        if value:
+            parts.append(f"{label}={value[:ACTOR_FIELD_MAX]}")
+    ua = request.headers.get("user-agent")
+    if ua:
+        parts.append(f'ua="{ua[:ACTOR_FIELD_MAX]}"')
+    return " ".join(parts)
 
 
 def refused(refusal: Refused) -> tuple[int, dict]:
@@ -210,32 +245,33 @@ def get_task(task: int) -> JSONResponse:
 
 
 @app.post("/api/tasks")
-def create_task(req: CreateTask) -> JSONResponse:
-    return _reply(write(operator_moves.create, req.repo, req.title, req.body, req.state,
-                        severity=req.severity, kind=req.kind, parent=req.parent,
-                        blocked_by=req.blocked_by))
+def create_task(req: CreateTask, request: Request) -> JSONResponse:
+    return _reply(write(request, operator_moves.create, req.repo, req.title, req.body,
+                        req.state, severity=req.severity, kind=req.kind,
+                        parent=req.parent, blocked_by=req.blocked_by))
 
 
 @app.post("/api/tasks/{task}/edit")
-def edit_task(task: int, req: EditTask) -> JSONResponse:
-    return _reply(write(operator_moves.edit, task, req.revision, title=req.title,
-                        body=req.body, severity=req.severity, kind=req.kind,
-                        blocked_by=req.blocked_by, clear=req.clear))
+def edit_task(task: int, req: EditTask, request: Request) -> JSONResponse:
+    return _reply(write(request, operator_moves.edit, task, req.revision,
+                        title=req.title, body=req.body, severity=req.severity,
+                        kind=req.kind, blocked_by=req.blocked_by, clear=req.clear))
 
 
 @app.post("/api/tasks/{task}/move")
-def move_task(task: int, req: MoveTask) -> JSONResponse:
-    return _reply(write(operator_moves.move, task, req.revision, req.state))
+def move_task(task: int, req: MoveTask, request: Request) -> JSONResponse:
+    return _reply(write(request, operator_moves.move, task, req.revision, req.state))
 
 
 @app.post("/api/tasks/{task}/break-claim")
-def break_claim(task: int, req: AtRevision) -> JSONResponse:
-    return _reply(write(operator_moves.break_claim, task, req.revision))
+def break_claim(task: int, req: AtRevision, request: Request) -> JSONResponse:
+    return _reply(write(request, operator_moves.break_claim, task, req.revision))
 
 
 @app.post("/api/tasks/{task}/reparent")
-def reparent(task: int, req: Reparent) -> JSONResponse:
-    return _reply(write(operator_moves.reparent, task, req.revision, req.parent))
+def reparent(task: int, req: Reparent, request: Request) -> JSONResponse:
+    return _reply(write(request, operator_moves.reparent, task, req.revision,
+                        req.parent))
 
 
 @app.get("/api/tasks/{task}/plans")
@@ -256,8 +292,8 @@ def all_notes(task: int, before: int | None = None) -> JSONResponse:
 
 
 @app.post("/api/tasks/{task}/notes")
-def add_note(task: int, req: NoteText) -> JSONResponse:
-    return _reply(write(operator_moves.add_note, task, req.text))
+def add_note(task: int, req: NoteText, request: Request) -> JSONResponse:
+    return _reply(write(request, operator_moves.add_note, task, req.text))
 
 
 @app.get("/api/notes/flagged")
@@ -267,21 +303,22 @@ def notes_for_operator(repo: str | None = None, handled: bool = False,
 
 
 @app.post("/api/notes/hide")
-def hide_notes(req: HideNotes) -> JSONResponse:
+def hide_notes(req: HideNotes, request: Request) -> JSONResponse:
     """Hide or show the notes named; one note is a list of one."""
-    return _reply(write(operator_moves.hide_notes, req.notes, req.hidden))
+    return _reply(write(request, operator_moves.hide_notes, req.notes, req.hidden))
 
 
 @app.post("/api/notes/{note}/handle")
-def handle_note(note: int, req: HandleNote) -> JSONResponse:
+def handle_note(note: int, req: HandleNote, request: Request) -> JSONResponse:
     """Mark one note handled, with a reply if there is one."""
-    return _reply(write(operator_moves.handle_note, note, req.handled, req.reply))
+    return _reply(write(request, operator_moves.handle_note, note, req.handled,
+                        req.reply))
 
 
 @app.post("/api/notes/handle")
-def handle_notes(req: HandleNotes) -> JSONResponse:
+def handle_notes(req: HandleNotes, request: Request) -> JSONResponse:
     """Mark the notes named handled, or not, without a reply: for after a flood."""
-    return _reply(write(operator_moves.handle_notes, req.notes, req.handled))
+    return _reply(write(request, operator_moves.handle_notes, req.notes, req.handled))
 
 
 @app.get("/api/inbox")
@@ -297,20 +334,20 @@ def repos() -> JSONResponse:
 
 
 @app.post("/api/repos")
-def add_repo(req: AddRepo) -> JSONResponse:
-    return _reply(write(operator_moves.add_repo, req.name, req.remote))
+def add_repo(req: AddRepo, request: Request) -> JSONResponse:
+    return _reply(write(request, operator_moves.add_repo, req.name, req.remote))
 
 
 @app.post("/api/repos/{name}/rename")
-def rename_repo(name: str, req: RenameRepo) -> JSONResponse:
-    return _reply(write(operator_moves.rename_repo, name, req.new_name))
+def rename_repo(name: str, req: RenameRepo, request: Request) -> JSONResponse:
+    return _reply(write(request, operator_moves.rename_repo, name, req.new_name))
 
 
 @app.post("/api/repos/{name}/remote")
-def set_remote(name: str, req: SetRemote) -> JSONResponse:
-    return _reply(write(operator_moves.set_remote, name, req.remote))
+def set_remote(name: str, req: SetRemote, request: Request) -> JSONResponse:
+    return _reply(write(request, operator_moves.set_remote, name, req.remote))
 
 
 @app.post("/api/repos/{name}/retire")
-def retire_repo(name: str, req: RetireRepo) -> JSONResponse:
-    return _reply(write(operator_moves.retire_repo, name, req.retired))
+def retire_repo(name: str, req: RetireRepo, request: Request) -> JSONResponse:
+    return _reply(write(request, operator_moves.retire_repo, name, req.retired))

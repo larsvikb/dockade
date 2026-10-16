@@ -22,6 +22,18 @@ ROOT = Path(__file__).resolve().parents[1]
 
 sent: dict = {}
 
+# (class, its parent), parents first, as httpx declares them.
+_HTTPX_ERRORS = (
+    ("TransportError", "RequestError"),
+    ("TimeoutException", "TransportError"),
+    ("ConnectTimeout", "TimeoutException"), ("PoolTimeout", "TimeoutException"),
+    ("ReadTimeout", "TimeoutException"), ("WriteTimeout", "TimeoutException"),
+    ("NetworkError", "TransportError"),
+    ("ConnectError", "NetworkError"), ("ReadError", "NetworkError"),
+    ("WriteError", "NetworkError"),
+    ("ProtocolError", "TransportError"), ("RemoteProtocolError", "ProtocolError"),
+)
+
 
 def install_stubs() -> None:
     # httpx: an AsyncClient whose build_request resolves the path against base_url
@@ -68,6 +80,12 @@ def install_stubs() -> None:
     # module may have installed an httpx stub of its own first.
     if not hasattr(sys.modules["httpx"], "RequestError"):
         sys.modules["httpx"].RequestError = type("RequestError", (Exception,), {})
+    # httpx's transport errors, as much of its hierarchy as the tasks UI's relay splits
+    # on (`_NOT_SENT` there): what fails before a request is sent, and what after.
+    for name, parent in _HTTPX_ERRORS:
+        if not hasattr(sys.modules["httpx"], name):
+            base = getattr(sys.modules["httpx"], parent)
+            setattr(sys.modules["httpx"], name, type(name, (base,), {}))
     if not hasattr(sys.modules["httpx"], "Timeout"):
         sys.modules["httpx"].Timeout = lambda *a, **k: (a, k)
 

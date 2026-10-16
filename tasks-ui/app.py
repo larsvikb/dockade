@@ -11,9 +11,9 @@ registry's operator listener.
 
 It does two things:
   - serves the static page at `/`;
-  - relays the page's reads to the registry's operator listener, which takes no token,
-    and answers `/running` itself, so a registry that is down is a state of the page
-    rather than a failed request in its console.
+  - relays the page's reads and its three writes to the registry's operator listener,
+    which takes no token, and answers `/running` itself, so a registry that is down is
+    a state of the page rather than a failed request in its console.
 
 It serves one address, its `tasks-ui-net` one, and `guards.check_bind` refuses to start
 on any other: the relay is the operator's whole say in the registry, and its other leg's
@@ -53,7 +53,8 @@ UI_INDEX = os.environ.get("TASKS_UI_INDEX", "/opt/tasks-ui/index.html")
 # is the whole of what the script route hands out; a test holds it equal to the files
 # the image copies and to what the modules import from each other.
 UI_DIR = os.environ.get("TASKS_UI_DIR", "/opt/tasks-ui")
-UI_MODULES = frozenset({"app.js", "escape.js", "list-status.js", "tasks.js", "time.js"})
+UI_MODULES = frozenset({"app.js", "escape.js", "list-status.js", "moves.js", "tasks.js",
+                        "time.js"})
 # Built from the list, never from a request: the name off the URL only picks an entry.
 _UI_MODULE_PATHS = {name: os.path.join(UI_DIR, name) for name in UI_MODULES}
 
@@ -67,7 +68,7 @@ ALLOWED_HOSTNAMES = guards.allowed_hostnames("TASKS_UI_ALLOWED_HOSTS",
 # page calls and nothing else: that listener takes no token, so this table is the whole
 # of what a page can do there. Ids are digits, bounded, so no path-shaped segment can be
 # smuggled through one. Add a route when a fetch needs it, never in anticipation; a test
-# holds this table and tasks.js's fetches equal in both directions. Reads only, so far.
+# holds this table and the page's fetches equal in both directions, method and all.
 _RELAY_ROUTES = (
     ("GET", re.compile(r"^/api/repos$")),
     ("GET", re.compile(r"^/api/tasks$")),
@@ -81,14 +82,26 @@ _RELAY_ROUTES = (
     # Whose turn it is the operator's: the page opens on it.
     ("GET", re.compile(r"^/api/inbox$")),
     ("GET", re.compile(r"^/api/search$")),
+    # The operator's triage, each naming the revision the page showed: a move to any
+    # state, breaking a claim. And a note, which names none (tasks-ui/DESIGN.md, "A note
+    # names no revision"). The rest of the operator API waits for a page that calls it.
+    ("POST", re.compile(r"^/api/tasks/[0-9]{1,19}/move$")),
+    ("POST", re.compile(r"^/api/tasks/[0-9]{1,19}/break-claim$")),
+    ("POST", re.compile(r"^/api/tasks/[0-9]{1,19}/notes$")),
 )
 
+# The registry records ACTOR_HEADER as this relay's word for the browser's address
+# (`operator_api.actor`), so a client's copy is dropped with the other claims about who
+# or where it is, and the relay adds its own, as the approval UI's does
+# (control-plane-ui/app.py). A test holds the name equal to the registry's.
+ACTOR_HEADER = "x-dockade-actor"
+
 # What a page may not send on to the registry: a claim about who or where it is, a
-# hop-by-hop header, or framing this relay owns. The registry reads none of the first,
-# but a relay copying the others onto its own connection is a smuggling primitive
-# whichever upstream it is. The approval UI strips the same set, and says why for each
-# (`_STRIP_REQ` in control-plane-ui/app.py); a test holds the two equal.
-_STRIP_REQ = {"host", "x-dockade-actor", "x-forwarded-for", "x-forwarded-host",
+# hop-by-hop header, or framing this relay owns. A relay copying the last two onto its
+# own connection is a smuggling primitive whichever upstream it is. The approval UI
+# strips the same set, and says why for each (`_STRIP_REQ` in control-plane-ui/app.py);
+# a test holds the two equal.
+_STRIP_REQ = {"host", ACTOR_HEADER, "x-forwarded-for", "x-forwarded-host",
               "x-forwarded-proto", "x-real-ip", "forwarded",
               "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
               "te", "trailer", "transfer-encoding", "upgrade",
@@ -159,17 +172,22 @@ async def proxy(path: str, request: Request) -> Response:
     method = request.method.upper()
     if not _relay_allowed(method, upstream_path):
         return guards.refuse(NAME, f"{method} {upstream_path} is not a relayed path")
+    peer = getattr(request.client, "host", None) or "unknown"
     req = _client.build_request(
         method, upstream_path,
         params=request.query_params,
         content=await request.body(),
         headers=[(k, v) for k, v in request.headers.items()
-                 if k.lower() not in _STRIP_REQ],
+                 if k.lower() not in _STRIP_REQ] + [(ACTOR_HEADER, peer)],
     )
     try:
         resp = await _client.send(req, stream=True)
-    except httpx.RequestError as exc:
+    except _NOT_SENT as exc:
         return _registry_unreachable(exc)
+    except httpx.RequestError as exc:
+        if method == "GET":
+            return _registry_unreachable(exc)
+        return _outcome_unknown(exc)
     # The registry parses agent text. What it answers is JSON, and none of its other
     # headers is this origin's to carry.
     return StreamingResponse(
@@ -181,12 +199,30 @@ async def proxy(path: str, request: Request) -> Response:
 
 
 def _registry_unreachable(exc: Exception) -> JSONResponse:
-    """The task registry did not answer: stopped, starting, or not on this network.
-    In the operator API's shape, and a status the registry itself never sends, so the
-    page can tell it from a refusal."""
+    """The task registry did not answer: stopped, starting, or not on this network;
+    for a write, before anything was sent (`_NOT_SENT`). In the operator API's shape,
+    and a status the registry itself never sends, so the page can tell it from a
+    refusal."""
     return JSONResponse({"ok": False, "current": None,
                          "detail": f"the task registry did not answer "
                                    f"({type(exc).__name__})"}, status_code=502)
+
+
+# The errors httpx raises before a request is on the wire: no connection was made, or
+# none was free. Only these mean nothing reached the registry. Listed, not inferred,
+# so an error this list does not name is taken as sent, the safe way to be wrong: a
+# write reported as not sent invites a retry, and a retried note is two notes.
+_NOT_SENT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+
+
+def _outcome_unknown(exc: Exception) -> JSONResponse:
+    """A write was sent and no answer came back: it may have landed or not. In the
+    operator API's shape, and a status nothing else here sends, so the page reads the
+    task again to learn which rather than offer to send it again."""
+    return JSONResponse({"ok": False, "current": None,
+                         "detail": f"the task registry did not answer a write it was "
+                                   f"sent ({type(exc).__name__}): it may have landed"},
+                        status_code=504)
 
 
 def main() -> None:

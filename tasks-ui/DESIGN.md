@@ -111,8 +111,45 @@ the plan in the order `submit_plan` takes its parts, each as prose spelled like 
 body. A missing or superseded plan is read against the task's state (`planNotice`):
 only a proposed task is refined by an agent, so only there does the page say a plan is
 coming; past it, the operator moved the task on without one. A superseded plan is never
-something to approve, so it carries a warning. Earlier plans load on request, newest
-first, so what a plan replaced can be read beside it.
+something to approve, so it carries a warning. Every plan the task had is read with it,
+and the earlier ones are drawn whole on request, newest first, so what a plan replaced
+can be read beside it.
+
+**A revised plan is drawn as what changed.** A refiner's revision is mostly the plan it
+replaced, so a plan with a predecessor (`planPredecessor`: the next lower id, not the one
+the operator last read) opens on what changed from it, section by section in the same
+order (`planDiff`), and the whole plan is one toggle away. A section is unchanged,
+added, removed or changed; a changed one is its words, kept, added and removed
+(`diff.js`), each run spelled as the body is, added and removed marked by their element
+as well as their colour. Equality is on the raw text, so a change only a hidden
+character makes shows, and one only whitespace makes is said in words, since its runs
+may draw as nothing. Past an edit ceiling a section is shown rewritten, both sides
+whole, because the search's cost grows with the edits and the text is an agent's. The
+approve control counts hidden characters over the whole plan whichever view is open,
+so an unchanged section that carries one is drawn spelled rather than as a line: what
+the count warns of is on screen in either view.
+
+**One timeline: the history, carrying its notes.** Each note is posted beside the
+history row that names it, and the history read carries it there as it is now
+(`task-registry/DESIGN.md`, "Every write leaves a history row"), so the detail shows
+one record, oldest first and paged as the history is, with each note once among the
+writes around it, its marks beside it and a hidden one set aside. A page-side merge of
+the notes read and the history read could not page both by one cursor. Each entry's
+other values are folded; the note a hide or a handle acts on stays in the open, to
+match it with the entry that posted it.
+
+**A task that changed while it is read says so, and moves nothing.** The poll reads
+the task open beside the list (`refreshOpenTask`) and compares it with the one drawn
+(`taskUpdate`): a newer revision is a change, and a newer note alone is one too,
+though no revision moves for a note, because a note saying "don't approve this" that
+arrives while the operator reads is worth a line. Either fills one line atop the detail
+whose space is kept whether it says anything or not, so filling it shifts nothing; it
+stays in view as the detail scrolls, and "show it" reads the task again through the
+hash. A refused move's "the task changed" notice is drawn in the same line, since the
+task it draws is the refusal's and the timeline is the one held; every other outcome
+stays under the moves, beside the controls it is about. When the poll may fill or
+replace the line, and why it never empties it, is `refreshOpenTask`'s comment. A move
+from a stale view still meets the revision's refusal.
 
 **Its tests.** `tests/test_tasks_ui.py` holds the server: the relay's table, the guard
 in front of its writes, which errors are not running and which an unknown outcome,
@@ -120,9 +157,11 @@ in front of its writes, which errors are not running and which an unknown outcom
 own name, allowlist, address and network. `tests/test_tasks_ui_js.py` holds the page:
 every structural check the approval page has (`PageChecks`: markup and script, the
 module list against the Dockerfile and the imports, fetches against the relay, free
-names), the writes' methods against the relay, the pure halves of `tasks.js` and
-`moves.js` under node, and, from source, how the page gates the registry, sends its
-writes and draws agent text; `tests/test_task_registry_inbox.py` holds what the inbox
-counts.
+names), the writes' methods against the relay, the pure halves of `tasks.js`,
+`moves.js` and `diff.js` under node, and, from source, how the page gates the
+registry, sends its writes, draws agent text and fills the line atop the detail;
+`tests/test_task_registry_inbox.py` holds what the inbox counts, and
+`tests/test_task_registry_operator.py` that each note is on the history row that
+posted it.
 `make ui-diff UI_DIFF_PAGE=tasks` runs `tests/ui-harness/tasks-scenario.js` on the base
 and on the branch.

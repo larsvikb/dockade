@@ -10,6 +10,8 @@ import { NOW_MS } from "./backend.js";
 const NOW = NOW_MS / 1000;
 const RLO = "\u202E";
 const ZWSP = "\u200B";
+// As `operator_moves.PAGE`: how many entries a page of a task's history holds.
+const PAGE = 50;
 
 const REPOS = [
   { name: "dockade", retired: false },
@@ -38,10 +40,23 @@ const PLAN = {
   risks: "A route the page calls and the relay refuses.", review_rounds: 2,
   review_verdict: "Passes.", superseded_at: null,
 };
+// What plan 2 replaced: another approach, one path fewer, the risks spaced otherwise.
 const OLDER_PLAN = {
   ...PLAN, id: 1, task_revision: 1, at: NOW - 80000, review_rounds: 1,
-  approach: "Everything in one change.", superseded_at: NOW - 76000,
+  approach: "Everything in one change.", footprint: ["tasks-ui/app.py"],
+  risks: "A route the page calls and  the relay refuses.", superseded_at: NOW - 76000,
 };
+
+// A task's notes as a read of it carries them: visible ones only, its latest few.
+const STARTED = { id: 10, task: 3, author: "claude-3f2a9c1e", at: NOW - 3000,
+                  text: "Started.", for_operator: true, handled: true, hidden: false,
+                  move: null, reply_to: null };
+const HIDDEN = { id: 11, task: 3, author: "operator", at: NOW - 2000,
+                 text: `Hidden ${RLO}one`, for_operator: false, handled: false,
+                 hidden: true, move: null, reply_to: 10 };
+const ANSWER = { id: 12, task: 3, author: "operator", at: NOW - 900, text: "Seen.",
+                 for_operator: false, handled: false, hidden: false, move: null,
+                 reply_to: 10 };
 
 const TASK = {
   ...TASKS[0], repo: "dockade", revision: 4, created_at: NOW - 86400,
@@ -51,7 +66,7 @@ const TASK = {
   children: [{ id: 4, title: "Child", state: "closed" },
              { id: 5, title: "Other child", state: "landing" }],
   blockers: [{ id: 2, title: "Back up the store", state: "open" }],
-  plan: PLAN,
+  plan: PLAN, notes: [STARTED, ANSWER],
 };
 
 // Task 1 went back to proposed: its plan is the superseded one. Task 2 was opened with
@@ -59,39 +74,90 @@ const TASK = {
 const SENT_BACK = { ...TASKS[2], state: "proposed", ready: false, repo: "dockade",
                     revision: 6, created_at: NOW - 90000,
                     updated_at: NOW - 76000, body: "Plain.", children: [], blockers: [],
-                    plan: OLDER_PLAN };
+                    plan: OLDER_PLAN, notes: [] };
 const UNPLANNED = { ...TASKS[1], repo: "dockade", revision: 1, created_at: NOW - 5000,
                     updated_at: NOW - 5000, body: "Back it up.", children: [],
-                    blockers: [], plan: null };
-const NO_NOTES = { notes: [], total: 0 };
+                    blockers: [], plan: null, notes: [] };
 
-const NOTES = {
-  notes: [
-    { id: 10, author: "claude-3f2a9c1e", at: NOW - 3000, text: "Started.",
-      for_operator: false },
-    { id: 11, author: "operator", at: NOW - 2000, text: `Hidden ${RLO}one`,
-      hidden: true, reply_to: 10 },
-  ],
-  total: 2,
-};
-
-const HISTORY = {
-  history: [
-    { ts: NOW - 86400, author: "operator", action: "approve",
-      detail: { body: `Approved ${RLO}text`, revision: 1 } },
-    { ts: NOW - 600, author: "claude-3f2a9c1e", action: "claim_work",
-      detail: { branch: "tasks-ui" } },
-  ],
-  total: 2,
-};
-
-// Task 6 waits for triage with the current plan, and task 8 behind it; task 5 to land,
-// its claim ended.
+// Task 6 waits for triage with a plan that replaced another, and task 8 behind it with
+// its first; task 5 to land, its claim ended.
 const REFINED = { ...TASK, id: 6, title: "Refined one", state: "refined", ready: false,
-                  claim: null, revision: 7, parent: null, children: [], blockers: [] };
+                  claim: null, revision: 7, parent: null, children: [], blockers: [],
+                  notes: [] };
 const LANDING = { ...REFINED, id: 5, title: `Landing ${RLO}one`, state: "landing",
                   revision: 9 };
 const SECOND = { ...REFINED, id: 8, title: "Second refined", revision: 2 };
+
+const PLANS = { 1: [OLDER_PLAN], 3: [PLAN, OLDER_PLAN], 5: [PLAN],
+                6: [PLAN, OLDER_PLAN], 8: [PLAN] };
+
+// Each task's history, oldest first, as `operator_moves.history` reads it: every write,
+// with the note it posted as it is now.
+let nextEntry = 1000;
+function entry(author, action, ts, detail, note = null) {
+  return { id: nextEntry++, ts, author, action, detail, note };
+}
+const PLAN_DETAIL = { approach: PLAN.approach, footprint: PLAN.footprint,
+                      tests: PLAN.tests, review_rounds: PLAN.review_rounds };
+
+// Task 3's runs past a page: a claim's progress checkpoints between its notes, one
+// flagged and handled with a reply, and the operator's own, hidden.
+function claimedHistory() {
+  const rows = [
+    entry("operator", "create", NOW - 86400, { title: TASKS[0].title, body: TASK.body,
+                                               state: "proposed", actor: null }),
+    entry("operator", "move", NOW - 86000, { before: "refined", state: "open",
+                                             revision: 3, ended_claim: null, actor: null }),
+    entry(claim.holder, "claim_work", NOW - 80000, { branch: "tasks-ui",
+                                                     footprint: claim.footprint }),
+  ];
+  for (let i = 0; i < PAGE; i++) {
+    rows.push(entry(claim.holder, "update", NOW - 70000 + i * 1000,
+                    { progress: `Step ${i} of the relay.` }));
+  }
+  rows.push(
+    entry(claim.holder, "note", STARTED.at,
+          { note: STARTED.text, note_id: 10, for_operator: true }, STARTED),
+    entry("operator", "note", HIDDEN.at, { note: HIDDEN.text, note_id: 11, actor: null },
+          HIDDEN),
+    entry("operator", "hide_note", NOW - 1000, { note_id: 11, hidden: true, actor: null }),
+    entry("operator", "handle_note", ANSWER.at,
+          { note_id: 10, handled: true, reply: ANSWER.text, reply_id: 12, actor: null },
+          ANSWER));
+  return rows;
+}
+
+function refinedHistory(created) {
+  const planned = { id: 30, author: PLAN.author, at: PLAN.at, text: "Planned.",
+                    for_operator: false, handled: false, hidden: false,
+                    move: "submit_plan", reply_to: null };
+  return [
+    entry("claude-3f2a9c1e", "propose", created, { title: "Refined one", body: "B" }),
+    entry("claude-3f2a9c1e", "submit_plan", PLAN.at,
+          { revision: 7, note: planned.text, note_id: planned.id, plan: PLAN.id,
+            ...PLAN_DETAIL }, planned),
+  ];
+}
+
+const HISTORIES = {
+  1: [entry("operator", "create", NOW - 90000, { title: "Plain one", state: "proposed" }),
+      entry("claude-3f2a9c1e", "send_back", NOW - 76000,
+            { revision: 6, note: null, note_id: null })],
+  2: [entry("operator", "create", NOW - 5000, { title: "Back up the store",
+                                                state: "open" })],
+  3: claimedHistory(),
+  5: [entry("claude-3f2a9c1e", "submit_work", NOW - 9000,
+            { revision: 9, note: null, note_id: null, branch: `land${ZWSP}-it` })],
+  6: refinedHistory(NOW - 9000),
+  8: refinedHistory(NOW - 4000),
+};
+
+function historyPage(id, params) {
+  const all = HISTORIES[id];
+  const before = Number(params.get("before") || Infinity);
+  const older = all.filter(h => h.id < before);
+  return { history: older.slice(-PAGE), total: all.length };
+}
 
 // Every section, every reason: task 3 has a note for the operator, task 5 waits to
 // land, task 6 is refined, task 1's claim ran out and task 2
@@ -139,16 +205,22 @@ export function startRegistry() { registryUp = true; }
 const UNREACHABLE = { ok: false, current: null,
                       detail: "the task registry did not answer (ConnectError)" };
 
-// The tasks the steps write to, and their notes: copies, moved as the operator API
-// would move them (task-registry/operator_moves.py), so a read after a write shows it.
-const WRITTEN = { 3: { ...TASK }, 6: { ...REFINED }, 8: { ...SECOND } };
-const WRITTEN_NOTES = { 3: { notes: [...NOTES.notes], total: NOTES.total },
-                        6: { notes: [], total: 0 }, 8: { notes: [], total: 0 } };
+// The tasks the steps write to: copies, moved as the operator API would move them
+// (task-registry/operator_moves.py), each write recorded in their history, so a read
+// after a write shows it.
+const WRITTEN = { 3: { ...TASK, notes: [...TASK.notes] }, 6: { ...REFINED, notes: [] },
+                  8: { ...SECOND, notes: [] } };
 let nextNote = 20;
 
 // A step changes a task behind the page's back, as another session would: the page's
 // next move on it names a revision that is no longer the task's.
-export function editElsewhere(id) { WRITTEN[id].revision += 1; }
+export function editElsewhere(id) {
+  const t = WRITTEN[id];
+  t.revision += 1;
+  t.body = `${t.body}\nEdited elsewhere.`;
+  HISTORIES[id].push(entry("operator", "edit", NOW, { revision: t.revision,
+                                                      body: t.body, actor: null }));
+}
 // A step loses the next write's answer after the write lands: the relay's 504.
 let loseNext = false;
 export function loseNextAnswer() { loseNext = true; }
@@ -162,14 +234,17 @@ function write(path, body) {
   const m = path.match(/^\/api\/tasks\/(\d+)\/(move|break-claim|notes)$/);
   const t = m && WRITTEN[m[1]];
   if (!t) return null;
+  const history = HISTORIES[m[1]];
   let answer;
   if (m[2] === "notes") {
     const id = nextNote++;
-    const notes = WRITTEN_NOTES[m[1]];
-    notes.notes.push({ id, task: t.id, author: "operator", text: body.text, at: NOW,
-                       for_operator: false, move: null, reply_to: null, handled: false,
-                       hidden: false });
-    notes.total += 1;
+    const note = { id, task: t.id, author: "operator", text: body.text, at: NOW,
+                   for_operator: false, move: null, reply_to: null, handled: false,
+                   hidden: false };
+    t.notes.push(note);
+    t.notes_total += 1;
+    history.push(entry("operator", "note", NOW, { note: body.text, note_id: id,
+                                                  actor: null }, note));
     answer = { status: 200, json: { ok: true, task: t.id, note: id } };
   } else if (body.revision !== t.revision) {
     return changed(t);
@@ -180,11 +255,16 @@ function write(path, body) {
     }
     t.claim = null;
     t.revision += 1;
+    history.push(entry("operator", "break_claim", NOW, { revision: t.revision,
+                                                         actor: null }));
     answer = { status: 200, json: { ok: true, task: t.id, revision: t.revision } };
   } else {
+    const before = t.state;
     if (body.state !== t.state) t.claim = null;
     t.state = body.state;
     t.revision += 1;
+    history.push(entry("operator", "move", NOW, { before, state: t.state,
+                                                  revision: t.revision, actor: null }));
     answer = { status: 200, json: { ok: true, task: t.id, revision: t.revision } };
   }
   if (loseNext) {
@@ -196,6 +276,8 @@ function write(path, body) {
   return answer;
 }
 
+const READ = { 1: SENT_BACK, 2: UNPLANNED, 5: LANDING };
+
 export function respond(method, path, body, params) {
   if (method === "GET" && path === "/running") {
     return { status: 200, json: { running: registryUp } };
@@ -204,12 +286,14 @@ export function respond(method, path, body, params) {
   if (!registryUp) return { status: 502, json: UNREACHABLE };
   if (method === "POST") return write(path, body);
   if (method !== "GET") return null;
-  const id = (path.match(/^\/api\/tasks\/(\d+)$/) || [])[1];
-  if (id && WRITTEN[id]) return { status: 200, json: WRITTEN[id] };
-  const notesOf = (path.match(/^\/api\/tasks\/(\d+)\/notes$/) || [])[1];
-  if (notesOf && WRITTEN_NOTES[notesOf]) {
-    return { status: 200, json: WRITTEN_NOTES[notesOf] };
+  const [, id, what] = path.match(/^\/api\/tasks\/(\d+)(?:\/(history|plans))?$/) || [];
+  if (id && !what && (WRITTEN[id] || READ[id])) {
+    return { status: 200, json: WRITTEN[id] || READ[id] };
   }
+  if (what === "history" && HISTORIES[id]) {
+    return { status: 200, json: historyPage(id, params) };
+  }
+  if (what === "plans" && PLANS[id]) return { status: 200, json: PLANS[id] };
   if (path === "/api/repos") return { status: 200, json: REPOS };
   if (path === "/api/tasks") {
     const rows = params.get("repo") === "dockade" && params.get("state") === "open"
@@ -222,16 +306,5 @@ export function respond(method, path, body, params) {
     return { status: 200, json: { tasks: rows, total: rows.length } };
   }
   if (path === "/api/inbox") return { status: 200, json: INBOX };
-  if (path === "/api/tasks/3/history") return { status: 200, json: HISTORY };
-  if (path === "/api/tasks/3/plans") return { status: 200, json: [PLAN, OLDER_PLAN] };
-  if (path === "/api/tasks/1") return { status: 200, json: SENT_BACK };
-  if (path === "/api/tasks/2") return { status: 200, json: UNPLANNED };
-  if (path === "/api/tasks/6/plans" || path === "/api/tasks/8/plans") {
-    return { status: 200, json: [PLAN] };
-  }
-  if (path === "/api/tasks/5") return { status: 200, json: LANDING };
-  if (["/api/tasks/1/notes", "/api/tasks/2/notes", "/api/tasks/5/notes"].includes(path)) {
-    return { status: 200, json: NO_NOTES };
-  }
   return null;
 }

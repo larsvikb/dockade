@@ -272,6 +272,12 @@ makes the history the operator's read (`operator_moves.history`): it keeps every
 task ever had, a hidden note's and a body triage replaced, so an implementer reading it
 could act on a version the operator never approved.
 
+**Every note has the one row that posted it,** which names its id: a note is posted
+only beside its record (a test holds every `notes.post` to it). So the history read
+carries each note on that row, as it is now, hidden or handled since, and a task's notes
+and its other writes come as one order, paged by one cursor, which is the tasks UI's
+timeline.
+
 ## Backups
 
 **`make backup` takes the registry's store beside the control plane's,** under the same

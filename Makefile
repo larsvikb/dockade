@@ -192,6 +192,7 @@ REFFILES := $(SCRIPTS) \
             tasks-ui/requirements.txt \
             tasks-ui/index.html \
             tasks-ui/app.js \
+            tasks-ui/diff.js \
             tasks-ui/moves.js \
             tasks-ui/tasks.js \
             task-registry/serve.py \

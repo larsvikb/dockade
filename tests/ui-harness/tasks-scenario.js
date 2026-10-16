@@ -15,7 +15,7 @@ export const STEPS = [
   ["its earlier plans", async ({ page }) => {
     await page.click('#task-detail button[data-page="plans"]');
   }],
-  ["its history", async ({ page }) => {
+  ["its earlier timeline", async ({ page }) => {
     await page.click('#task-detail button[data-page="history"]');
   }],
   ["a refined task from triage", async ({ page }) => {
@@ -105,5 +105,21 @@ export const STEPS = [
   }],
   ["closed", async ({ page }) => {
     await page.click('#task-detail button[data-verb="close"]');
+  }],
+  // A plan that replaced another opens on what changed, the whole one toggle away.
+  ["a re-refined task, on what changed", async ({ page }) => {
+    await page.click('#inbox button[data-task="6"]');
+  }],
+  ["the whole plan", async ({ page }) => {
+    await page.click("#task-detail button[data-plan-view]");
+  }],
+  // Another session changes the task while it is read: the poll on coming back to the
+  // page says so atop the detail and redraws nothing, until the operator asks.
+  ["it changes elsewhere, and the page is come back to", async ({ page }) => {
+    editElsewhere(6);
+    await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
+  }],
+  ["show it", async ({ page }) => {
+    await page.click("#task-detail button[data-show]");
   }],
 ];

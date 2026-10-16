@@ -95,6 +95,19 @@
   .plan { margin: 6px 0 10px; padding: 8px; border: 1px solid var(--line);
     border-radius: 6px; background: var(--bg); }
   .plan > div { margin: 4px 0; }
+  /* What changed in a plan: the element says added or removed, the colour repeats it. */
+  ins { text-decoration: underline; background: rgba(46, 160, 67, .2); }
+  del { text-decoration: line-through; background: rgba(209, 36, 47, .2); }
+  /* The line atop the task read that says it changed since: one line high whether it
+     says anything or not, so filling it moves nothing, and kept in view, opaque, once
+     it does. */
+  .notice-slot { height: 28px; display: flex; align-items: center; gap: 8px;
+    white-space: nowrap; overflow: hidden; }
+  .notice-slot > span { overflow: hidden; text-overflow: ellipsis; }
+  .notice-slot:not(:empty) { position: sticky; top: 0; z-index: 1;
+    background: var(--panel); border-bottom: 1px solid var(--line); }
+  .notice-slot.warn { color: var(--hold); }
+  details > summary { cursor: pointer; }
   /* Kept in the record and out of every agent's read: shown, and shown as set aside. */
   tr.hidden-note { opacity: .55; }
   /* The operator's moves on the task read, and a note to it. */

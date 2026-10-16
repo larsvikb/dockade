@@ -102,8 +102,8 @@ export function writeOutcome(answer) {
   return "refused";
 }
 
-// Whether a write whose answer was lost landed, from the task and notes read after it,
-// or `null` when that read failed:
+// Whether a write whose answer was lost landed, from the task read after it, which
+// carries its latest notes, or `null` when that read failed:
 //   found           the task shows it landed: a move's revision moved and its state is
 //                   the target; a break's moved and nobody holds it; a note of the
 //                   operator's with its text is newer than any the page held;
@@ -119,7 +119,7 @@ export function checkWrite(write, reread) {
   }
   const task = reread.task;
   if (write.kind === "note") {
-    const notes = reread.notes && Array.isArray(reread.notes.notes) ? reread.notes.notes : [];
+    const notes = Array.isArray(task.notes) ? task.notes : [];
     for (const n of notes) {
       if (n && n.author === "operator" && n.text === write.text
           && Number(n.id) > Number(write.lastNote)) return "found";
@@ -132,8 +132,9 @@ export function checkWrite(write, reread) {
   return "changed";
 }
 
-// The id of the newest note the page holds, or 0: what a note's check counts from.
-export function lastNoteId(notes) {
-  const list = notes && Array.isArray(notes.notes) ? notes.notes : [];
+// The id of the newest note a read of the task carries, or 0: what a note's check counts
+// from.
+export function lastNoteId(task) {
+  const list = task && Array.isArray(task.notes) ? task.notes : [];
   return list.reduce((top, n) => (n && Number(n.id) > top ? Number(n.id) : top), 0);
 }

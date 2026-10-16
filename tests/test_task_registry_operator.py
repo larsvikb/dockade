@@ -5,6 +5,7 @@ and the clear in ``task-registry/operator_moves.py``, and the HTTP API over them
 refusal becomes a status. Each test gets a store of its own."""
 from __future__ import annotations
 
+import ast
 import asyncio
 import inspect
 import json
@@ -105,6 +106,119 @@ class PagingTests(_Store):
         for bad in ("1", 0, True):
             with self.subTest(before=bad):
                 self.refused(op.history, self.task, before=bad)
+
+
+PLAN = {"approach": "A rotate step in the key store.", "footprint": ["src/keys.py"],
+        "tests": "A rotation keeps old keys readable.", "out_of_scope": "None.",
+        "risks": "A reader mid-rotation.", "review_rounds": 2,
+        "review_verdict": "Passes."}
+
+
+class TimelineTests(_Store):
+    """The history read carries each note as the entry of the write that posted it, so
+    the tasks UI reads one timeline (``tasks-ui/DESIGN.md``)."""
+
+    def posted(self, task=None):
+        return [(h["action"], h["note"] and h["note"]["text"])
+                for h in op.history(task or self.task)["history"]]
+
+    def test_every_note_is_one_entrys_note_as_it_is_now(self):
+        task = agent.propose(ALICE, "widgets", "T", "B")["task"]
+        token = agent.claim_plan(ALICE, "widgets", task, ["src"])["token"]
+        agent.submit_plan(ALICE, "widgets", task, token, **PLAN, note="Planned.")
+        op.move(task, self.revision(task), "open")
+        token = agent.claim_work(ALICE, "widgets", task, "fix")["token"]
+        agent.send_back(ALICE, "widgets", task, token, "Unclear.")
+        token = agent.claim_plan(ALICE, "widgets", task, ["src"])["token"]
+        agent.release(ALICE, "widgets", task, token, "Gave up.")
+        token = agent.claim_plan(ALICE, "widgets", task, ["src"])["token"]
+        agent.submit_plan(ALICE, "widgets", task, token, **PLAN)
+        op.move(task, self.revision(task), "open")
+        token = agent.claim_work(ALICE, "widgets", task, "fix")["token"]
+        agent.submit_work(ALICE, "widgets", task, token, "Done.")
+        flagged = agent.add_note(ALICE, "widgets", task, "Land it?", for_operator=True)
+        op.add_note(task, "Noted.")
+        op.handle_note(flagged["note"], reply="Yes.")
+        op.hide_note(flagged["note"])
+        self.assertEqual(self.posted(task), [
+            ("propose", None), ("claim_plan", None), ("submit_plan", "Planned."),
+            ("move", None), ("claim_work", None), ("send_back", "Unclear."),
+            ("claim_plan", None), ("release", "Gave up."), ("claim_plan", None),
+            ("submit_plan", None), ("move", None), ("claim_work", None),
+            ("submit_work", "Done."), ("note", "Land it?"), ("note", "Noted."),
+            ("handle_note", "Yes."), ("hide_note", None)])
+        entries = op.history(task)["history"]
+        asked = next(h["note"] for h in entries if h["action"] == "note")
+        self.assertEqual((asked["id"], asked["hidden"], asked["handled"]),
+                         (flagged["note"], True, True))
+        reply = entries[-2]["note"]
+        self.assertEqual((reply["reply_to"], reply["author"], reply["hidden"]),
+                         (flagged["note"], reg.taskdb.OPERATOR, False))
+        every = op.all_notes(task)["notes"]
+        self.assertEqual(sorted(h["note"]["id"] for h in entries if h["note"]),
+                         [n["id"] for n in every])
+
+    def test_a_handle_without_a_reply_and_a_hide_carry_none(self):
+        note = self.note(for_operator=True)
+        op.handle_notes([note])
+        op.hide_notes([note])
+        self.assertEqual(self.posted(), [("create", None), ("note", "Seen this."),
+                                         ("handle_note", None), ("hide_note", None)])
+
+    def test_paging_keeps_each_note_on_its_own_entry(self):
+        made = [self.note(f"Note {i}") for i in range(op.PAGE + 3)]
+        first = op.history(self.task)
+        older = op.history(self.task, before=first["history"][0]["id"])
+        self.assertEqual(first["total"], op.PAGE + 4)
+        seen = older["history"] + first["history"]
+        self.assertEqual([h["note"] and h["note"]["id"] for h in seen], [None, *made])
+        self.assertEqual([h["note"]["text"] for h in seen[1:]],
+                         [h["detail"]["note"] for h in seen[1:]])
+
+    def test_every_post_is_recorded_beside_the_id_it_returns(self):
+        """What the history read relies on: a ``notes.post`` whose id no history row
+        names would be a note missing from the timeline."""
+        found = 0
+        for path in sorted((ROOT / "task-registry").glob("*.py")):
+            for fn in ast.walk(ast.parse(path.read_text())):
+                if (not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        or path.name == "notes.py"):
+                    continue
+                for node in ast.walk(fn):
+                    if not (isinstance(node, ast.Call) and _calls(node, "notes", "post")):
+                        continue
+                    found += 1
+                    named = _assigned(fn, node)
+                    with self.subTest(file=path.name, function=fn.name):
+                        self.assertIsNotNone(named)
+                        self.assertTrue(any(
+                            _calls(call, "taskdb", "record") and any(
+                                kw.arg == _posted_key(call)
+                                and isinstance(kw.value, ast.Name) and kw.value.id == named
+                                for kw in call.keywords)
+                            for call in ast.walk(fn) if isinstance(call, ast.Call)))
+        self.assertEqual(found, 5)
+
+
+def _calls(call: ast.Call, module: str, name: str) -> bool:
+    return (isinstance(call.func, ast.Attribute) and call.func.attr == name
+            and isinstance(call.func.value, ast.Name) and call.func.value.id == module)
+
+
+def _posted_key(record: ast.Call) -> str:
+    """The key `operator_moves._posted` reads a record's note from, by its action."""
+    action = record.args[2] if len(record.args) > 2 else None
+    handle = isinstance(action, ast.Constant) and action.value == "handle_note"
+    return "reply_id" if handle else "note_id"
+
+
+def _assigned(fn: ast.FunctionDef, call: ast.Call) -> str | None:
+    for node in ast.walk(fn):
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and any(inner is call for inner in ast.walk(node.value))):
+            return node.targets[0].id
+    return None
 
 
 class BulkTests(_Store):

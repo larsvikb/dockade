@@ -266,9 +266,12 @@ def notes_for_operator(repo: str | None = None, handled: bool = False,
 
 def history(task: int, before: int | None = None) -> dict:
     """The writes a task has had, with their author and the values written: every body
-    an agent proposed and every note, hidden ones too. A page at a time with the
-    total, the latest chosen and returned oldest first; ``before`` pages back past an
-    entry. The operator's read, which no agent-facing surface may offer."""
+    an agent proposed and every note, hidden ones too. Each entry carries ``note``, the
+    note its write posted as it is now, or null: every note is posted beside the entry
+    that names it, so this is the task's notes and its history in one order. A page at
+    a time with the total, the latest chosen and returned oldest first; ``before``
+    pages back past an entry. The operator's read, which no agent-facing surface may
+    offer."""
     if before is not None:
         tasks.check_id(before, "history entry")
     with taskdb.reading() as conn:
@@ -278,10 +281,27 @@ def history(task: int, before: int | None = None) -> dict:
         page = conn.execute(
             "SELECT * FROM history WHERE task_id = ? AND (? IS NULL OR id < ?) "
             "ORDER BY id DESC LIMIT ?", (task, before, before, PAGE)).fetchall()
-        return {"history": [{"id": r["id"], "ts": r["ts"], "author": r["author"],
-                             "action": r["action"], "detail": json.loads(r["detail"])}
-                            for r in reversed(page)],
-                "total": total}
+        entries = [{"id": r["id"], "ts": r["ts"], "author": r["author"],
+                    "action": r["action"], "detail": json.loads(r["detail"])}
+                   for r in reversed(page)]
+        posted = [_posted(e) for e in entries]
+        found = {r["id"]: notes.shown(r, with_hidden=True) for r in conn.execute(
+            "SELECT * FROM notes WHERE task_id = ? AND id IN "
+            "(SELECT value FROM json_each(?))",
+            (task, json.dumps([n for n in posted if n is not None])))}
+        for entry, note in zip(entries, posted, strict=True):
+            entry["note"] = found.get(note)
+        return {"history": entries, "total": total}
+
+
+def _posted(entry: dict) -> int | None:
+    """The note an entry's write posted: a handle's reply, and never the note a hide or
+    a handle names, which an earlier write posted."""
+    if entry["action"] == "hide_note":
+        return None
+    if entry["action"] == "handle_note":
+        return entry["detail"].get("reply_id")
+    return entry["detail"].get("note_id")
 
 
 # --- the inbox -------------------------------------------------------------------

@@ -53,8 +53,8 @@ UI_INDEX = os.environ.get("TASKS_UI_INDEX", "/opt/tasks-ui/index.html")
 # is the whole of what the script route hands out; a test holds it equal to the files
 # the image copies and to what the modules import from each other.
 UI_DIR = os.environ.get("TASKS_UI_DIR", "/opt/tasks-ui")
-UI_MODULES = frozenset({"app.js", "escape.js", "list-status.js", "moves.js", "tasks.js",
-                        "time.js"})
+UI_MODULES = frozenset({"app.js", "diff.js", "escape.js", "list-status.js", "moves.js",
+                        "tasks.js", "time.js"})
 # Built from the list, never from a request: the name off the URL only picks an entry.
 _UI_MODULE_PATHS = {name: os.path.join(UI_DIR, name) for name in UI_MODULES}
 
@@ -73,9 +73,8 @@ _RELAY_ROUTES = (
     ("GET", re.compile(r"^/api/repos$")),
     ("GET", re.compile(r"^/api/tasks$")),
     ("GET", re.compile(r"^/api/tasks/[0-9]{1,19}$")),
-    # A task's every note, hidden ones marked, and its history: the operator's reads,
-    # which no agent surface offers (task-registry/DESIGN.md, "Notes").
-    ("GET", re.compile(r"^/api/tasks/[0-9]{1,19}/notes$")),
+    # A task's history, which carries every note, hidden ones marked: the operator's
+    # read, which no agent surface offers (task-registry/DESIGN.md, "Notes").
     ("GET", re.compile(r"^/api/tasks/[0-9]{1,19}/history$")),
     # Every plan a task had, superseded ones marked: what a plan replaced.
     ("GET", re.compile(r"^/api/tasks/[0-9]{1,19}/plans$")),

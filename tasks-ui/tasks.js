@@ -19,12 +19,14 @@
  */
 import { escapePayload } from "./escape.js";
 import { pollStatus, renderListStatus } from "./list-status.js";
+import {
+  TASK_STATES, NOT_RUNNING_STATUS, movesFor, sendWrite, readAnswer, writeOutcome,
+  checkWrite, lastNoteId,
+} from "./moves.js";
 import { fmtStamp, fmtInstant } from "./time.js";
 
-// The registry's states, in the order work moves through them
-// (task-registry/DESIGN.md, "States"), and what `GET /api/tasks` takes for all of them
-// (operator_api.EVERY_STATE). A test holds both to the registry's.
-export const TASK_STATES = ["proposed", "refined", "open", "landing", "deferred", "closed"];
+// What `GET /api/tasks` takes for every state (operator_api.EVERY_STATE), beside the
+// states themselves (TASK_STATES, moves.js). A test holds it to the registry's.
 export const EVERY_STATE = "all";
 
 // Characters that render as nothing or reorder what is around them: the payload
@@ -259,9 +261,78 @@ export function inboxStatus(rowCount, failed, loaded) {
   return pollStatus(INBOX_STATUS_TEXT, rowCount, failed, loaded);
 }
 
-// The relay's answer when the registry did not answer (`_registry_unreachable` in
-// tasks-ui/app.py); the registry never sends it itself.
-export const NOT_RUNNING_STATUS = 502;
+// What a move's button says: its verb, approve's naming what it approves, and whose
+// claim it ends, since a move to another state ends the claim (`operator_moves.move`).
+// The holder is an agent's, so spelled.
+export function moveLabel(move, task) {
+  if (!move || typeof move !== "object" || !task || typeof task !== "object") return "";
+  const verb = move.verb === "approve" ? approveLabel(task) : move.verb;
+  return move.endsClaim && task.claim
+    ? `${verb} (ends ${spellHidden(task.claim.holder).text}'s claim)` : verb;
+}
+
+export function breakLabel(claim) {
+  return claim ? `break ${spellHidden(claim.holder).text}'s claim` : "";
+}
+
+// Approving a refined task approves its body and plan as the page shows them
+// (task-registry/DESIGN.md, "Plans"), so the button names the revision and the plan,
+// and says when the title, body or plan carry a character spelled out above it.
+export function approveLabel(task) {
+  if (!task || typeof task !== "object" || !task.plan) return "";
+  return `approve revision ${task.revision} and plan ${task.plan.id}`;
+}
+export function approveHidden(task) {
+  if (!task || typeof task !== "object") return "";
+  const plan = planParts(task.plan).map(p => p.text);
+  const hidden = [task.title, task.body, ...plan].map(text => spellHidden(text).hidden)
+    .reduce((sum, n) => sum + n, 0);
+  return hidden > 0
+    ? `What this approves carries ${hidden} invisible or direction-changing `
+      + `character${hidden === 1 ? "" : "s"}, spelled out above: read them first.`
+    : "";
+}
+
+// What a write came to, in a line, and whether it warns: `writeOutcome`'s word, or for
+// an answer that was lost, `checkWrite`'s. `detail` is the refusal's own reason.
+export function outcomeText(write, outcome, detail) {
+  const what = write && write.kind === "note" ? "The note" : `${write && write.verb}`;
+  const name = what.charAt(0).toUpperCase() + what.slice(1);
+  switch (outcome) {
+    case "landed":
+      return { text: `${name}: done.`, warn: false };
+    case "stale":
+      return { text: `${name}: not done. The task changed since this page read it; `
+                     + "this is the task as it is now.", warn: true };
+    case "refused":
+      return { text: `${name}: refused. ${spellHidden(String(detail ?? "")).text}`.trim(),
+               warn: true };
+    case "not-running":
+      return { text: `${name}: not sent. The task registry is not running.`, warn: true };
+    case "found":
+      return { text: `${name}: no answer came, but the task shows it landed.`,
+               warn: false };
+    case "not-landed":
+      return { text: `${name}: no answer came, and the task is unchanged, so it has not `
+                     + "landed yet. Sending it again cannot apply it twice.", warn: true };
+    case "not-found-yet":
+      return { text: `${name}: no answer came, and the note is not on the task yet. It `
+                     + "may still land: look at the notes before sending it again.",
+               warn: true };
+    case "could-not-check":
+      return { text: `${name}: no answer came, and the task could not be read again, `
+                     + "so whether it landed is not known. Read the task before "
+                     + "trying again.", warn: true };
+    case "changed":
+      return { text: `${name}: no answer came, and the task has changed, but not as `
+                     + "this would have changed it. This is the task as it is now.",
+               warn: true };
+    default:
+      return { text: `${name}: no answer came, so whether it landed is not known. Read `
+                     + "the task before trying again.", warn: true };
+  }
+}
+
 export const NO_REPOS_TEXT =
   "The registry has no repos yet. A repo is one the operator adds; until then no "
   + "agent can file a task.";
@@ -294,6 +365,11 @@ let inboxLoaded = false;
 let lastInbox = null;
 let view = "inbox";
 let openTask = null;       // the id whose detail is shown, as the hash names it
+let shownTask = null;      // the task drawn beside the list, and the notes the page holds
+let shownNotes = null;
+let writing = null;        // the write in flight: one at a time
+let outcome = null;        // what the last write came to, while its task is open
+let noteDraft = { task: null, text: "" };   // kept until it lands
 
 export function registryIsRunning() { return running === true; }
 
@@ -609,17 +685,26 @@ function brief(t) {
   return t ? `#${t.id} ${spellHidden(t.title).text} (${t.state})` : "";
 }
 
-// One task in full: what an agent reads of it, then every note with the hidden ones
-// marked, and its history on request.
+// A task and every note on it, hidden ones marked: what the detail is drawn from.
+async function readTask(id) {
+  const path = encodeURIComponent(id);
+  const task = await registryJson(await fetch(`/api/tasks/${path}`));
+  const notes = await registryJson(await fetch(`/api/tasks/${path}/notes`));
+  return { task, notes };
+}
+
+// One task in full, read and drawn beside the list.
 async function showTask(id) {
   openTask = id;
+  outcome = null;
   panes.classList.add("reading");
   markOpen();
+  // The detail still drawn is another task's until this one is read: its controls go
+  // off now, so no click on it is sent while the page loads another.
+  markWriting();
   let task, notes;
   try {
-    const path = encodeURIComponent(id);
-    task = await registryJson(await fetch(`/api/tasks/${path}`));
-    notes = await registryJson(await fetch(`/api/tasks/${path}/notes`));
+    ({ task, notes } = await readTask(id));
   } catch (e) {
     if (openTask !== id) return;
     // A registry that stopped is read again when it answers: applyHash reads a task
@@ -633,6 +718,14 @@ async function showTask(id) {
     return;
   }
   if (openTask !== id) return;
+  drawTask(task, notes);
+}
+
+// What an agent reads of a task, its plan, the operator's moves on it, then every note
+// with the hidden ones marked and a note to add, and its history on request.
+function drawTask(task, notes) {
+  shownTask = task;
+  shownNotes = notes;
   taskDetail.replaceChildren();
   const head = document.createElement("h3");
   head.textContent = `#${task.id} ${spellHidden(task.title).text}`;
@@ -685,6 +778,8 @@ async function showTask(id) {
   } else {
     taskDetail.appendChild(noticeLine(planNotice(null, task.state)));
   }
+  // Below the plan, so what a move approves is read before it.
+  taskDetail.appendChild(movesBlock(task));
   const notesHead = document.createElement("h3");
   notesHead.textContent = `Notes · ${notes.total}`;
   taskDetail.appendChild(notesHead);
@@ -700,11 +795,130 @@ async function showTask(id) {
   renderNotes(notesBody, notes.notes);
   notesTable.appendChild(notesBody);
   taskDetail.appendChild(notesTable);
+  taskDetail.appendChild(noteForm(task));
   const history = document.createElement("div");
   history.className = "history";
   history.appendChild(pagerButton("history", "history", ""));
   taskDetail.appendChild(history);
   taskDetail.hidden = false;
+  markWriting();
+}
+
+// The moves the operator API takes from the task's state, and what the last one came
+// to. Approve and send back are each a control of their own, as a refined task's two
+// answers; approve names what it approves.
+function movesBlock(task) {
+  const block = document.createElement("div");
+  const head = document.createElement("h3");
+  head.textContent = "Moves";
+  block.appendChild(head);
+  if (outcome && outcome.task === String(task.id)) block.appendChild(noticeLine(outcome));
+  const row = document.createElement("div");
+  row.className = "moves";
+  for (const move of movesFor(task)) {
+    const btn = writeButton(moveLabel(move, task), "move", move.state);
+    btn.dataset.verb = move.verb;
+    row.appendChild(btn);
+  }
+  if (task.claim) row.appendChild(writeButton(breakLabel(task.claim), "break", ""));
+  block.appendChild(row);
+  const hidden = task.state === "refined" ? approveHidden(task) : "";
+  if (hidden) block.appendChild(noticeLine({ text: hidden, warn: true }));
+  return block;
+}
+
+function writeButton(label, kind, value) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.dataset.write = kind;
+  btn.dataset.value = value;
+  btn.textContent = label;
+  return btn;
+}
+
+// A note to the task, as the operator: agents read it. Its text stays until it lands.
+function noteForm(task) {
+  const form = document.createElement("div");
+  form.className = "note-form";
+  const text = document.createElement("textarea");
+  text.rows = 3;
+  text.setAttribute("aria-label", "A note to this task");
+  text.placeholder = "a note to this task, which agents read";
+  text.value = noteDraft.task === String(task.id) ? noteDraft.text : "";
+  text.dataset.note = "1";
+  form.append(text, writeButton("add the note", "note", ""));
+  return form;
+}
+
+// Every write control in the detail, on only while no write is out and what is drawn
+// is the task the page names.
+function drawnIsOpen() {
+  return shownTask !== null && String(shownTask.id) === openTask;
+}
+function markWriting() {
+  for (const el of taskDetail.querySelectorAll("[data-write], textarea[data-note]")) {
+    el.disabled = writing !== null || !drawnIsOpen();
+  }
+}
+
+// One write, then the page as the registry has it after: the task read again, or for
+// a stale one drawn from the task the refusal carries, which is not read again
+// (task-registry/DESIGN.md, "The operator API"); the inbox and the list refreshed. A
+// write whose answer was lost is decided from the read (`checkWrite`), never sent again.
+async function runWrite(write) {
+  if (writing || !registryIsRunning()) return;
+  writing = write;
+  markWriting();
+  let answer = null;
+  try {
+    answer = await readAnswer(await sendWrite(write));
+  } catch (e) {
+    answer = null;
+  }
+  let result = writeOutcome(answer);
+  let drawn = null;
+  if (result === "not-running") {
+    setRunning(false);
+  } else if (result === "stale") {
+    drawn = { task: answer.body.current, notes: shownNotes };
+  } else {
+    drawn = await readTask(write.task).catch(() => null);
+    if (result === "unknown") result = checkWrite(write, drawn);
+  }
+  const landed = result === "landed" || result === "found";
+  if (write.kind === "note" && landed && noteDraft.task === write.task
+      && noteDraft.text === write.text) {
+    noteDraft = { task: null, text: "" };
+  }
+  writing = null;
+  if (openTask === write.task) {
+    const detail = answer && answer.body && typeof answer.body === "object"
+      ? answer.body.detail : answer && answer.text;
+    outcome = { task: write.task, ...outcomeText(write, result, detail) };
+    if (drawn) drawTask(drawn.task, drawn.notes);
+    else if (shownTask) drawTask(shownTask, shownNotes);
+  } else {
+    markWriting();
+  }
+  if (result !== "not-running") {
+    refreshInbox();
+    refreshTasks();
+  }
+}
+
+// The write a control in the detail asks for, as of the task the page shows.
+// Built from what is drawn, id and revision both, and only while that is the task the
+// page names: while another loads, the drawn one is not what a click is for.
+function writeFor(btn) {
+  if (!drawnIsOpen()) return null;
+  const base = { task: String(shownTask.id), revision: shownTask.revision,
+                 lastNote: lastNoteId(shownNotes) };
+  if (btn.dataset.write === "move") {
+    return { ...base, kind: "move", state: btn.dataset.value, verb: btn.dataset.verb };
+  }
+  if (btn.dataset.write === "break") return { ...base, kind: "break", verb: "break the claim" };
+  const text = noteDraft.task === base.task ? noteDraft.text : "";
+  return text.trim() ? { ...base, kind: "note", text, verb: "add the note" } : null;
 }
 
 function pagerButton(label, kind, before) {
@@ -788,6 +1002,9 @@ async function showPage(btn) {
 
 function closeTask() {
   openTask = null;
+  shownTask = null;
+  shownNotes = null;
+  outcome = null;
   panes.classList.remove("reading");
   taskDetail.hidden = true;
   taskDetail.replaceChildren();
@@ -885,6 +1102,14 @@ export function mountTasks() {
     }
     const page = ev.target.closest("button[data-page]");
     if (page) (page.dataset.page === "plans" ? showPlans : showPage)(page);
+    const btn = ev.target.closest("button[data-write]");
+    const write = btn ? writeFor(btn) : null;
+    if (write) runWrite(write);
+  });
+  taskDetail.addEventListener("input", ev => {
+    if (ev.target.matches("textarea[data-note]") && shownTask) {
+      noteDraft = { task: String(shownTask.id), text: ev.target.value };
+    }
   });
   window.addEventListener("hashchange", applyHash);
   applyHash();

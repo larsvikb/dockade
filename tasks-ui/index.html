@@ -97,6 +97,14 @@
   .plan > div { margin: 4px 0; }
   /* Kept in the record and out of every agent's read: shown, and shown as set aside. */
   tr.hidden-note { opacity: .55; }
+  /* The operator's moves on the task read, and a note to it. */
+  .moves { display: flex; gap: 6px; flex-wrap: wrap; margin: 4px 0 10px; }
+  .moves button, .note-form button { font-size: 12px; padding: 4px 10px; }
+  .note-form { display: flex; flex-direction: column; align-items: flex-start; gap: 6px;
+    margin: 8px 0; }
+  .note-form textarea { font: inherit; font-size: 13px; width: 100%;
+    background: #202632; color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 5px 8px; resize: vertical; }
 </style>
 </head>
 <body>
@@ -132,7 +140,7 @@
         <section id="all-view" hidden>
           <h2>Tasks <span class="note" id="taskcount"></span></h2>
           <!-- Plain controls, as the audit filter bar is: they narrow what is shown. The
-               state options are filled from TASK_STATES in tasks.js. -->
+               state options are filled from TASK_STATES in moves.js. -->
           <div class="filters" role="search">
             <select id="tasks-repo" aria-label="Repo"></select>
             <select id="tasks-state" aria-label="State"></select>

@@ -217,7 +217,7 @@ class HandledTests(_Store):
         self.assertEqual((last["author"], last["action"], last["detail"]),
                          (reg.taskdb.OPERATOR, "handle_note",
                           {"note_id": note, "handled": True, "reply": None,
-                           "reply_id": None}))
+                           "reply_id": None, "actor": None}))
 
     def test_a_reply_is_the_operators_note_in_the_same_write(self):
         note = self.flagged()

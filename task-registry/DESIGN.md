@@ -262,12 +262,15 @@ nowhere, and their size is what the operator has not yet done.
 
 ## Every write leaves a history row
 
-`taskdb.record` writes the author, the action and the values written, in the write's
-own transaction, so a write and its record land together or not at all. For a spec it
-is also the revision log: every body an agent proposed, under its author. That makes the
-history the operator's read (`operator_moves.history`): it keeps every text a task ever
-had, a hidden note's and a body triage replaced, so an implementer reading it could act
-on a version the operator never approved.
+`taskdb.record` writes the author, the action and the values written, in the write's own
+transaction, so a write and its record land together or not at all. An operator write's
+values carry `actor` too, who made it as the operator API saw and the tasks UI asserted
+(`operator_api.actor`; why, `tasks-ui/DESIGN.md`, "Where an operator write came from"),
+or null for a move called with no request; an agent's author is already its id. For a
+spec it is also the revision log: every body an agent proposed, under its author. That
+makes the history the operator's read (`operator_moves.history`): it keeps every text a
+task ever had, a hidden note's and a body triage replaced, so an implementer reading it
+could act on a version the operator never approved.
 
 ## Backups
 

@@ -13,12 +13,14 @@ import re
 import shutil
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from typing import ClassVar
 from unittest import mock
 
 import _surface
-from _loader import load_operator_api, load_task_registry
+from _loader import ROOT, load_operator_api, load_task_registry
 
 reg = load_task_registry()
 api = load_operator_api()
@@ -26,6 +28,21 @@ Refused, Missing, Stale = reg.taskdb.Refused, reg.taskdb.Missing, reg.taskdb.Sta
 agent, op, reads = reg.agent_moves, reg.operator_moves, reg.reads
 
 ALICE = "claude-0b6f3a52-91d4-4c1e-a7e2-5d0c8e2f4b19"
+
+
+class ThroughTheRelay:
+    """A request as the operator listener sees one the tasks UI relayed: from the UI's
+    address, with the browser's asserted, and what the browser sent of itself."""
+
+    SENT: ClassVar[dict] = {"x-dockade-actor": "172.24.0.1",
+                            "origin": "http://127.0.0.1:8091", "user-agent": "Mozilla/5.0"}
+    #: What ``operator_api.actor`` makes of ``SENT`` from the default peer.
+    ACTOR = ('peer=172.26.0.4 via-ui=172.24.0.1 origin=http://127.0.0.1:8091 '
+             'ua="Mozilla/5.0"')
+
+    def __init__(self, peer: str | None = "172.26.0.4", headers: dict | None = None):
+        self.client = types.SimpleNamespace(host=peer) if peer else None
+        self.headers = self.SENT if headers is None else headers
 
 
 class _Store(unittest.TestCase):
@@ -114,7 +131,8 @@ class BulkTests(_Store):
         last = op.history(self.task)["history"][-1]
         self.assertEqual((last["action"], last["detail"]),
                          ("handle_note", {"note_id": other, "handled": True,
-                                          "reply": None, "reply_id": None}))
+                                          "reply": None, "reply_id": None,
+                                          "actor": None}))
         op.handle_notes([flagged], handled=False)
         self.assertEqual(op.notes_for_operator()["total"], 1)
 
@@ -140,7 +158,8 @@ class ClearTests(_Store):
         self.assertEqual((got["severity"], got["kind"], got["revision"]),
                          (None, "finding", 2))
         self.assertEqual(op.history(task)["history"][-1]["detail"],
-                         {"revision": 2, "blocked_by": None, "severity": None})
+                         {"revision": 2, "blocked_by": None, "severity": None,
+                          "actor": None})
         op.edit(task, revision, title="T2", clear=("kind", "severity"))
         got = reads.get_task(task)
         self.assertEqual((got["title"], got["severity"], got["kind"]), ("T2", None, None))
@@ -209,7 +228,10 @@ class RouteTests(_Store):
         ("GET", "/api/inbox"),
     })
 
-    def call(self, route, *args):
+    def call(self, route, *args, request=None):
+        # A write takes the request, for whom to record; a read takes none.
+        if "request" in inspect.signature(route).parameters:
+            args = (*args, request or ThroughTheRelay())
         response = route(*args)
         json.dumps(response.body)
         return response.status_code, response.body
@@ -362,6 +384,91 @@ class RouteTests(_Store):
         self.assertEqual(stale["current"], reads.get_task(self.task))
         self.assertIn("revision 1", stale["detail"])
         self.assertEqual(self.revision(), 1)
+
+
+class ActorTests(_Store):
+    """Who made an operator write: recorded on its history row as ``actor``, as an
+    approval's is on its audit row (``control-plane/provenance.py``), while the author
+    stays the operator."""
+
+    call = RouteTests.call
+    WRITES = frozenset({"create", "edit", "move", "break_claim", "reparent", "note",
+                        "hide_note", "handle_note", "add_repo", "rename_repo",
+                        "set_remote", "retire_repo"})
+
+    def rows_since(self, first: int) -> list[dict]:
+        # Repo writes name no task, so the history read per task would miss them.
+        with reg.taskdb.reading() as conn:
+            return [{"author": r["author"], "action": r["action"],
+                     "detail": json.loads(r["detail"])}
+                    for r in conn.execute("SELECT * FROM history WHERE id > ? ORDER BY id",
+                                          (first,))]
+
+    def last_id(self) -> int:
+        with reg.taskdb.reading() as conn:
+            return conn.execute("SELECT MAX(id) FROM history").fetchone()[0]
+
+    def test_every_operator_write_records_who_made_it_through_the_page(self):
+        first = self.last_id()
+        _, made = self.call(api.create_task, api.CreateTask(
+            repo="widgets", title="T", body="B", state="open"))
+        task = made["task"]
+        self.call(api.edit_task, task, api.EditTask(revision=1, title="T2"))
+        agent.claim_work(ALICE, "widgets", task, "fix", ["."])
+        self.call(api.break_claim, task, api.AtRevision(revision=3))
+        self.call(api.reparent, task, api.Reparent(revision=4, parent=self.task))
+        self.call(api.move_task, task, api.MoveTask(revision=5, state="deferred"))
+        _, note = self.call(api.add_note, task, api.NoteText(text="Later."))
+        self.call(api.hide_notes, api.HideNotes(notes=(note["note"],)))
+        flagged = agent.add_note(ALICE, "widgets", task, "Q?", for_operator=True)["note"]
+        self.call(api.handle_note, flagged, api.HandleNote(reply="A."))
+        self.call(api.handle_notes, api.HandleNotes(notes=(flagged,), handled=False))
+        self.call(api.add_repo, api.AddRepo(name="gadgets"))
+        self.call(api.rename_repo, "gadgets", api.RenameRepo(new_name="gizmos"))
+        self.call(api.set_remote, "gizmos", api.SetRemote(remote="github.com/a/g"))
+        self.call(api.retire_repo, "gizmos", api.RetireRepo())
+        mine = [r for r in self.rows_since(first) if r["author"] == reg.taskdb.OPERATOR]
+        self.assertEqual({r["action"] for r in mine}, self.WRITES)
+        for row in mine:
+            with self.subTest(action=row["action"]):
+                self.assertEqual(row["detail"]["actor"], ThroughTheRelay.ACTOR)
+        # The agent's writes in between are its own, under its id, with no actor.
+        theirs = [r for r in self.rows_since(first) if r["author"] == ALICE]
+        self.assertEqual([r["action"] for r in theirs], ["claim_work", "note"])
+        self.assertNotIn("actor", theirs[0]["detail"])
+
+    def test_a_move_called_with_no_request_records_none(self):
+        # By hand in the registry's container, say: no request, so nobody to name.
+        first = self.last_id()
+        op.move(self.task, 1, "deferred")
+        op.add_note(self.task, "By hand.")
+        rows = self.rows_since(first)
+        self.assertEqual([(r["author"], r["action"]) for r in rows],
+                         [(reg.taskdb.OPERATOR, "move"), (reg.taskdb.OPERATOR, "note")])
+        for row in rows:
+            self.assertIn("actor", row["detail"])
+            self.assertIsNone(row["detail"]["actor"])
+
+    def test_the_actor_labels_each_field_by_how_far_it_is_trusted(self):
+        self.assertEqual(api.actor(ThroughTheRelay()), ThroughTheRelay.ACTOR)
+        # Straight to the registry, not through the page: no browser address asserted.
+        self.assertEqual(api.actor(ThroughTheRelay(headers={"user-agent": "curl/8"})),
+                         'peer=172.26.0.4 ua="curl/8"')
+        self.assertEqual(api.actor(ThroughTheRelay(peer=None, headers={})), "peer=?")
+
+    def test_what_the_caller_sent_is_cut_short(self):
+        long = "x" * 5000
+        got = api.actor(ThroughTheRelay(headers={api.ACTOR_HEADER: long, "origin": long,
+                                                 "user-agent": long}))
+        cut = "x" * api.ACTOR_FIELD_MAX
+        self.assertEqual(got, f'peer=172.26.0.4 via-ui={cut} origin={cut} ua="{cut}"')
+
+    def test_its_header_and_cap_are_the_control_planes_and_the_relays(self):
+        provenance = (ROOT / "control-plane" / "provenance.py").read_text()
+        relay = (ROOT / "tasks-ui" / "app.py").read_text()
+        for source in (provenance, relay):
+            self.assertIn(f'ACTOR_HEADER = "{api.ACTOR_HEADER}"\n', source)
+        self.assertIn(f"_ACTOR_UA_MAX = {api.ACTOR_FIELD_MAX}\n", provenance)
 
 
 # Each read route, and the read it serves.

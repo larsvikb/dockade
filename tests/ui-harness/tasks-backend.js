@@ -79,7 +79,7 @@ const HISTORY = {
   history: [
     { ts: NOW - 86400, author: "operator", action: "approve",
       detail: { body: `Approved ${RLO}text`, revision: 1 } },
-    { ts: NOW - 600, author: "claude-3f2a9c1e", action: "claim",
+    { ts: NOW - 600, author: "claude-3f2a9c1e", action: "claim_work",
       detail: { branch: "tasks-ui" } },
   ],
   total: 2,
@@ -118,7 +118,7 @@ const INBOX = {
         since: NOW - 20 * 86400, reasons: [{ why: "quiet", since: NOW - 20 * 86400 }] },
       { task: 1, repo: "dockade", title: "Plain one", state: "proposed",
         since: NOW - 4000, reasons: [{ why: "lapsed", since: NOW - 4000,
-                                       holder: `claude-${RLO}x`, branch: "plain" }] },
+                                       holder: `claude-${RLO}x`, branch: null }] },
     ],
     total: 7,
   },

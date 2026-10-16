@@ -9,6 +9,7 @@ import shutil
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
 from _loader import load_task_registry
 
@@ -18,6 +19,29 @@ agent, op, reads = reg.agent_moves, reg.operator_moves, reg.reads
 
 ALICE = "claude-0b6f3a52-91d4-4c1e-a7e2-5d0c8e2f4b19"
 BOB = "claude-7e21c9d0-3a5b-4f86-b0d4-c1e9a2f7d360"
+
+#: `claims` as v1 and v2 made it, when every claim named a branch.
+_V2_CLAIMS = """CREATE TABLE claims (
+    task_id INTEGER PRIMARY KEY REFERENCES tasks(id), holder TEXT NOT NULL,
+    branch TEXT NOT NULL, token_hash TEXT NOT NULL, footprint TEXT NOT NULL,
+    progress TEXT, claimed_at REAL NOT NULL, expires_at REAL NOT NULL);"""
+
+
+def as_version(path: str, version: int) -> None:
+    """Take the store at ``path`` back to ``version``, 2 or older: its claims in the
+    table as it was then, a claim to refine with the branch its refiner had to invent,
+    and below 2 no plan tables."""
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(
+            "ALTER TABLE claims RENAME TO claims_v3;" + _V2_CLAIMS  # noqa: S608 (fixed text)
+            + "INSERT INTO claims SELECT task_id, holder, COALESCE(branch, 'invented'), "
+              "token_hash, footprint, progress, claimed_at, expires_at FROM claims_v3;"
+              "DROP TABLE claims_v3;"
+            + ("DROP TABLE plan_paths; DROP TABLE plans;" if version < 2 else "")
+            + f"PRAGMA user_version = {version};")
+    finally:
+        conn.close()
 
 
 class _Store(unittest.TestCase):
@@ -408,15 +432,76 @@ class SchemaTests(_Store):
 
     def test_a_v1_store_is_taken_forward_by_adding_the_plan_tables(self):
         task = op.create("widgets", "A task", "B", "proposed")["task"]
-        conn = sqlite3.connect(reg.taskdb.DB_PATH)
-        conn.executescript("DROP TABLE plan_paths; DROP TABLE plans; "
-                           "PRAGMA user_version = 1;")
-        conn.close()
+        as_version(reg.taskdb.DB_PATH, 1)
         reg.taskdb.init()
         with reg.taskdb.reading() as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],
+                             reg.taskdb.SCHEMA_VERSION)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM plans").fetchone()[0], 0)
         self.assertEqual(reads.get_task(task)["plan"], None)
+
+    def old_store(self, version: int) -> tuple[int, int, int]:
+        """A store of its own at ``version``, holding a live claim to refine, an
+        expired one, and a claim to do the work: their tasks, in that order."""
+        reg.taskdb.DB_PATH = os.path.join(self.dir, f"v{version}.db")
+        reg.taskdb.init()
+        op.add_repo("widgets")
+        live, expired = self.propose("Live"), self.propose("Expired")
+        work = self.open_task("Work")
+        agent.claim_plan(ALICE, "widgets", live, ["a"])
+        agent.claim_plan(BOB, "widgets", expired, ["b"])
+        agent.claim_work(ALICE, "widgets", work, "fix-it", ["c"])
+        with reg.taskdb.writing() as conn:
+            conn.execute("UPDATE claims SET expires_at = 0 WHERE task_id = ?", (expired,))
+        as_version(reg.taskdb.DB_PATH, version)
+        return live, expired, work
+
+    def claims(self) -> list[tuple]:
+        with reg.taskdb.reading() as conn:
+            return [tuple(r) for r in conn.execute("SELECT * FROM claims ORDER BY task_id")]
+
+    def test_an_older_store_with_claims_opens_without_a_refiners_branch(self):
+        for version in (2, 1, 0):
+            with self.subTest(version=version):
+                live, expired, work = self.old_store(version)
+                before = self.claims()
+                self.assertEqual([c[2] for c in before], ["invented", "invented", "fix-it"])
+                reg.taskdb.init()
+                with reg.taskdb.reading() as conn:
+                    self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],
+                                     reg.taskdb.SCHEMA_VERSION)
+                    branch = [c for c in conn.execute("PRAGMA table_info(claims)")
+                              if c["name"] == "branch"]
+                self.assertEqual(branch[0]["notnull"], 0)
+                self.assertEqual(self.claims(), [
+                    (*c[:2], None if c[0] in (live, expired) else c[2], *c[3:])
+                    for c in before])
+                self.assertEqual(reads.get_task(live)["claim"]["branch"], None)
+                self.assertEqual(reads.get_task(work)["claim"]["branch"], "fix-it")
+
+    def test_a_step_that_fails_partway_leaves_the_store_as_it_was(self):
+        self.old_store(2)
+        with reg.taskdb.reading() as conn:
+            before = [tuple(r) for r in conn.execute(
+                "SELECT type, name, sql FROM sqlite_master ORDER BY name")]
+        claims = self.claims()
+        failing = reg.taskdb._TO_V3 + "SELECT no_such_function();"
+        with mock.patch.object(reg.taskdb, "_TO_V3", failing), \
+                self.assertRaises(sqlite3.OperationalError):
+            reg.taskdb.init()
+        with reg.taskdb.reading() as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual([tuple(r) for r in conn.execute(
+                "SELECT type, name, sql FROM sqlite_master ORDER BY name")], before)
+        self.assertEqual(self.claims(), claims)
+        reg.taskdb.init()
+        self.assertEqual([c[2] for c in self.claims()], [None, None, "fix-it"])
+
+    def test_a_new_store_is_at_the_current_version(self):
+        with reg.taskdb.reading() as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],
+                             reg.taskdb.SCHEMA_VERSION)
+        self.assertEqual(reg.taskdb.SCHEMA_VERSION, 3)
 
     def test_a_store_from_another_schema_version_is_refused(self):
         conn = sqlite3.connect(reg.taskdb.DB_PATH)

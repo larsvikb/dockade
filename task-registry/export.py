@@ -167,9 +167,12 @@ def _task(task: sqlite3.Row, states: dict[int, str], claims: dict[int, sqlite3.R
             for b in blockers[tid]))
     claim = claims.get(tid)
     if claim is not None:
-        lines.append(f"- claimed by {inline(claim['holder'])} on branch "
-                     f"{inline(claim['branch'])}, {when(claim['claimed_at'])}, "
-                     f"until {when(claim['expires_at'])}; footprint {_footprint(claim['footprint'])}")
+        # A claim to refine a task has no branch.
+        branch = ("" if claim["branch"] is None
+                  else f" on branch {inline(claim['branch'])}")
+        lines.append(f"- claimed by {inline(claim['holder'])}{branch}, "
+                     f"{when(claim['claimed_at'])}, until {when(claim['expires_at'])}; "
+                     f"footprint {_footprint(claim['footprint'])}")
         if claim["progress"] is not None:
             lines += ["", "Progress:", "", block(claim["progress"])]
     lines += ["", "Body:", "", block(task["body"])]

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Claims: one agent's hold on a task, to refine it while ``proposed`` or to do it while
-``open``, the token that proves it, its expiry, and the footprint it declares. The
-checks and plain writes here; the moves that take and end a claim are in
-``agent_moves`` and ``operator_moves``."""
+``open``, the token that proves it, its expiry, the footprint it declares, and for the
+work the branch it lands on. The checks and plain writes here; the moves that take and
+end a claim are in ``agent_moves`` and ``operator_moves``."""
 from __future__ import annotations
 
 import hashlib
@@ -41,17 +41,23 @@ PROGRESS_MAX = 500
 FOOTPRINT_MAX = 50
 PATH_MAX = 300
 
-#: The state a claim takes a task into, by the state it was in: a claim refines a
-#: ``proposed`` task or does an ``open`` one, and claiming a task past either takes it
-#: back for rework.
-CLAIMED_INTO = {"proposed": "proposed", "refined": "proposed", "open": "open",
-                "landing": "open"}
+#: The state each claim move takes a task into, by the state it was in: `claim_plan`
+#: refines a ``proposed`` task and `claim_work` does an ``open`` one, and each takes a
+#: task past its state back for rework. A state change ends a claim, so the task's
+#: state says which kind a claim is.
+CLAIMED_INTO = {"claim_plan": {"proposed": "proposed", "refined": "proposed"},
+                "claim_work": {"open": "open", "landing": "open"}}
 
 _BRANCH_RE = re.compile(r"[A-Za-z0-9._/-]+")
 
 
 def now() -> float:
     return time.time()
+
+
+def claimed_with(state: str) -> str | None:
+    """The move that claims a task in ``state``; ``None`` for a state none does."""
+    return next((move for move, into in CLAIMED_INTO.items() if state in into), None)
 
 
 # --- what a claim carries --------------------------------------------------------
@@ -109,7 +115,8 @@ def check_holder(conn: sqlite3.Connection, row: sqlite3.Row, agent: str,
     claim = conn.execute("SELECT * FROM claims WHERE task_id = ?", (row["id"],)).fetchone()
     if claim is None or claim["expires_at"] <= now():
         mine = claim is not None and claim["holder"] == agent
-        now_ = ("it is free to claim" if row["state"] in CLAIMED_INTO
+        move = claimed_with(row["state"])
+        now_ = (f"it is free to claim with {move}" if move is not None
                 else f"it is {row['state']}")
         raise Refused(
             f"your claim on task {row['id']} lapsed; {now_}" if mine
@@ -151,7 +158,7 @@ def open_blockers(conn: sqlite3.Connection, task: int) -> list[dict]:
 
 # --- plain writes: checked by the caller -----------------------------------------
 
-def take(conn: sqlite3.Connection, task: int, agent: str, branch: str,
+def take(conn: sqlite3.Connection, task: int, agent: str, branch: str | None,
          paths: list[str]) -> tuple[str, float]:
     """Insert the claim and return its token, which is kept nowhere, and expiry."""
     sweep(conn)
@@ -185,9 +192,11 @@ def end(conn: sqlite3.Connection, task: int) -> None:
 
 def ended(claim: sqlite3.Row) -> dict:
     """What a history row keeps of a claim that ends, so the branch to land survives
-    the claim."""
-    return {"holder": claim["holder"], "branch": claim["branch"],
-            "footprint": json.loads(claim["footprint"])}
+    the claim. A claim to refine a task has no branch, and the row no key for one."""
+    kept = {"holder": claim["holder"], "footprint": json.loads(claim["footprint"])}
+    if claim["branch"] is not None:
+        kept["branch"] = claim["branch"]
+    return kept
 
 
 def sweep(conn: sqlite3.Connection) -> None:

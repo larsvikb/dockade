@@ -46,8 +46,13 @@ class _Store(unittest.TestCase):
 
     def claim(self, task=None, who=ALICE, footprint=(".",)):
         task = self.task if task is None else task
-        return agent.claim(who, "widgets", task, "rotate-keys",
-                           None if footprint is None else list(footprint))["token"]
+        return agent.claim_plan(who, "widgets", task,
+                                None if footprint is None else list(footprint))["token"]
+
+    def work(self, task=None, who=ALICE, footprint=(".",)):
+        task = self.task if task is None else task
+        return agent.claim_work(who, "widgets", task, "rotate-keys",
+                                None if footprint is None else list(footprint))["token"]
 
     def plan(self, task=None, who=ALICE, **changes):
         task = self.task if task is None else task
@@ -114,7 +119,7 @@ class RefiningTests(_Store):
         self.refused(agent.submit_plan, BOB, "widgets", self.task, token, **PLAN)
         self.refused(agent.submit_plan, ALICE, "widgets", self.task, "not-it", **PLAN)
         self.clock += claims.CLAIM_SECONDS
-        self.assertIn("lapsed; it is free to claim", self.refused(
+        self.assertIn("lapsed; it is free to claim with claim_plan", self.refused(
             agent.submit_plan, ALICE, "widgets", self.task, token, **PLAN).reason)
         self.assertEqual(self.got()["state"], "proposed")
 
@@ -125,7 +130,7 @@ class RefiningTests(_Store):
         self.assertIn("release", self.refused(
             agent.send_back, ALICE, "widgets", self.task, token, "Unclear.").reason)
         opened = op.create("widgets", "Open", "B", "open")["task"]
-        other = self.claim(opened)
+        other = self.work(opened)
         self.assertIn("submit_work", self.refused(
             agent.submit_plan, ALICE, "widgets", opened, other, **PLAN).reason)
         self.assertEqual((self.got()["claim"]["holder"],
@@ -196,7 +201,7 @@ class SupersedingTests(_Store):
         self.assertIsNotNone(self.got()["plan"]["superseded_at"])
         self.plan()
         op.move(self.task, self.got()["revision"], "open")
-        token = self.claim(footprint=None)
+        token = self.work(footprint=None)
         agent.send_back(ALICE, "widgets", self.task, token, "Which keys?")
         self.assertIsNotNone(self.got()["plan"]["superseded_at"])
         self.assertTrue(all(p["superseded_at"] for p in reads.task_plans(self.task)))
@@ -236,23 +241,23 @@ class ApprovalTests(_Store):
         op.move(self.task, self.got()["revision"], "open")
         self.assertIsNone(self.got()["claim"])
         self.assertEqual(op.history(self.task)["history"][-1]["detail"]["ended_claim"],
-                         {"holder": ALICE, "branch": "rotate-keys", "footprint": ["."]})
+                         {"holder": ALICE, "footprint": ["."]})
 
     def test_the_work_claims_the_plans_footprint_when_it_names_none(self):
         self.plan()
         op.move(self.task, self.got()["revision"], "open")
-        self.claim(who=BOB, footprint=None)
+        self.work(who=BOB, footprint=None)
         self.assertEqual(self.got()["claim"]["footprint"], ["src/keys.py"])
 
     def test_a_claim_with_no_plan_to_take_from_names_a_footprint(self):
-        self.assertIn("names its own footprint",
+        self.assertIn("a footprint is a list",
                       self.refused(self.claim, footprint=None).reason)
         opened = op.create("widgets", "Open", "B", "open")["task"]
-        self.assertIn("no plan", self.refused(self.claim, opened, footprint=None).reason)
+        self.assertIn("no plan", self.refused(self.work, opened, footprint=None).reason)
         self.assertIsNone(self.got(opened)["claim"])
         # A refined task's plan is the one a re-refiner replaces, not one to work in.
         self.plan()
-        self.assertIn("names its own footprint",
+        self.assertIn("a footprint is a list",
                       self.refused(self.claim, footprint=None).reason)
         self.assertEqual(self.got()["state"], "refined")
 
@@ -262,7 +267,7 @@ class OverlapTests(_Store):
         planned = self.plan(footprint=["src"])["plan"]
         other = agent.propose(BOB, "widgets", "Audit keys", "Log each read.")["task"]
         working = op.create("widgets", "Fix src", "B", "open")["task"]
-        self.claim(working, who=BOB, footprint=["src/keys.py"])
+        self.work(working, who=BOB, footprint=["src/keys.py"])
         reply = self.plan(other, who=BOB, footprint=["src/keys.py", "docs"])
         self.assertEqual(reply["plan_overlaps"], [
             {"task": self.task, "title": "Rotate keys", "state": "refined",

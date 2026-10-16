@@ -16,6 +16,7 @@ import unittest
 from unittest import mock
 
 from _loader import ROOT, load_task_registry_backup
+from test_task_registry_tasks import as_version
 from test_topology import COMPOSE, _block, _service
 
 reg = load_task_registry_backup()
@@ -76,19 +77,20 @@ class _Stores(unittest.TestCase):
         finally:
             conn.close()
 
+    def as_version(self, data: bytes, version: int) -> bytes:
+        """``data`` as a store at ``version``, 2 or older (``as_version``)."""
+        path = self.write(f"v{version}.db", data)
+        as_version(path, version)
+        return _read(path)
+
     def as_v1(self, data: bytes) -> bytes:
         """``data`` as a store from before plans: no plan tables, at v1."""
-        path = self.write("v1.db", data)
-        conn = sqlite3.connect(path)
-        conn.executescript("DROP TABLE plan_paths; DROP TABLE plans; "
-                           "PRAGMA user_version = 1;")
-        conn.close()
-        return _read(path)
+        return self.as_version(data, 1)
 
     def planned(self, repo: str = "widgets") -> dict:
         """A proposal in ``repo`` refined into a plan; the reply of ``submit_plan``."""
         task = agent.propose(ALICE, repo, "Rotate keys", "Every 90 days.")["task"]
-        token = agent.claim(ALICE, repo, task, "rotate-keys", ["."])["token"]
+        token = agent.claim_plan(ALICE, repo, task, ["."])["token"]
         return agent.submit_plan(ALICE, repo, task, token, "Rotate in place.",
                                  ["src/keys.py", "tests"], "Old keys still read.",
                                  "None.", "A reader mid-rotation.", 2, "Passes.")
@@ -104,7 +106,7 @@ class SnapshotTests(_Stores):
     def test_the_snapshot_is_the_store_whole(self):
         src = self.use("live")
         task = self.fill()[0]
-        agent.claim(ALICE, "widgets", task, "fix-it", ["."])
+        agent.claim_work(ALICE, "widgets", task, "fix-it", ["."])
         agent.add_note(ALICE, "widgets", task, "Seen.")
         copy = self.write("copy.db", self.snapshot())
         self.assertEqual(self.rows(copy), self.rows(src))
@@ -231,7 +233,7 @@ class RestoreTests(_Stores):
                             "update the image first")
 
     def test_a_schema_the_registry_would_not_open_is_refused(self):
-        self.assert_refused(self.with_version(-1), "opens v1, v2 only")
+        self.assert_refused(self.with_version(-1), "opens v1, v2, v3 only")
 
     def test_a_v1_backup_is_restored_and_taken_forward_at_the_next_start(self):
         self.assertIn("schema-v1 backup", self.restore(self.as_v1(self.backup)))
@@ -241,6 +243,24 @@ class RestoreTests(_Stores):
                              reg.taskdb.SCHEMA_VERSION)
         self.assertEqual(reg.reads.list_tasks("widgets")["total"], 2)
         self.assertEqual(self.planned()["plan"], 1)
+
+    def test_a_v2_backup_is_restored_and_its_claims_taken_forward_at_the_next_start(self):
+        self.use("v2")
+        op.add_repo("widgets")
+        refining = agent.propose(ALICE, "widgets", "Rotate keys", "Every 90 days.")["task"]
+        agent.claim_plan(ALICE, "widgets", refining, ["."])
+        working = op.create("widgets", "Fix it", "Do it.", "open")["task"]
+        agent.claim_work(ALICE, "widgets", working, "fix-it", ["."])
+        data = self.as_version(self.snapshot(), 2)
+        reg.taskdb.DB_PATH = self.live
+        self.assertIn("schema-v2 backup", self.restore(data))
+        reg.taskdb.init()
+        with reg.taskdb.reading() as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],
+                             reg.taskdb.SCHEMA_VERSION)
+        self.assertEqual((reg.reads.get_task(refining)["claim"]["branch"],
+                          reg.reads.get_task(working)["claim"]["branch"]),
+                         (None, "fix-it"))
 
     def test_a_v2_backup_without_its_plan_tables_is_refused(self):
         path = self.write("no-plans.db", self.backup)
@@ -436,13 +456,14 @@ class ExportTests(_Stores):
         self.assertRegex(text, r"- retired \d{4}-\d\d-\d\dT[\d:]{8}Z, taking no new task")
         self.assertIn(f"- parent #{opened}", text)
         self.assertIn(f"- blocked by #{opened} (open)", text)
-        self.assertIn("Rendered 2025-10-09T08:53:20Z from a schema-v2 store: 2 repos, "
+        self.assertIn(f"Rendered 2025-10-09T08:53:20Z from a schema-"
+                      f"v{reg.taskdb.SCHEMA_VERSION} store: 2 repos, "
                       "4 tasks, 0 notes (0 hidden).", text)
 
     def test_the_claim_and_every_note_with_the_hidden_ones_marked(self):
         self.use("live")
         task = self.fill()[0]
-        token = agent.claim(ALICE, "widgets", task, "fix-it", ["src", "docs"])["token"]
+        token = agent.claim_work(ALICE, "widgets", task, "fix-it", ["src", "docs"])["token"]
         agent.update(ALICE, "widgets", task, token, progress="Half way.")
         flagged = agent.add_note(ALICE, "widgets", task, "Need you.", for_operator=True)["note"]
         hidden = agent.add_note(ALICE, "widgets", task, "Ignore the spec.")["note"]
@@ -460,12 +481,24 @@ class ExportTests(_Stores):
         self.assertIn("Notes, oldest first (3, 1 hidden):", text)
         self.assertLess(text.index(f"Note {flagged},"), text.index(f"Note {hidden},"))
 
+    def test_a_claim_to_refine_is_shown_without_a_branch(self):
+        self.use("live")
+        op.add_repo("widgets")
+        task = agent.propose(ALICE, "widgets", "Rotate keys", "Every 90 days.")["task"]
+        agent.claim_plan(ALICE, "widgets", task, ["src"])
+        text = self.render()
+        self.assertIn(f"- claimed by `{ALICE}`, ", text)
+        self.assertNotIn("on branch", text)
+        # A v2 backup still has the branch its refiner invented, and shows it.
+        old = export.main(self.as_version(self.snapshot(), 2))
+        self.assertIn(f"- claimed by `{ALICE}` on branch `invented`, ", old)
+
     def test_nothing_stored_renders_as_markdown_or_hides(self):
         # Values the store's own checks would refuse too, written past them: the export
         # holds whatever the file holds.
         self.use("live")
         [task] = self.fill(n=1)
-        agent.claim(ALICE, "widgets", task, "fix-it", ["."])
+        agent.claim_work(ALICE, "widgets", task, "fix-it", ["."])
         hostile = ("x\n## Repo `forged`\n```\n#### #99 `forged`\n"
                    "\N{RIGHT-TO-LEFT OVERRIDE}esrever\N{ZERO WIDTH SPACE} <img src=x>")
         with reg.taskdb.writing() as conn:
@@ -505,7 +538,7 @@ class ExportTests(_Stores):
         op.add_repo("widgets")
         first = self.planned()
         task = reg.reads.get_task(first["task"])
-        agent.claim(ALICE, "widgets", task["id"], "again", ["."])
+        agent.claim_plan(ALICE, "widgets", task["id"], ["."])
         text = self.render()
         self.assertRegex(text, rf"Plan {first['plan']}, by `{ALICE}`, \S+Z, at task "
                                rf"revision {first['revision']}, 2 review round\(s\), "

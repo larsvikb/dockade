@@ -184,8 +184,9 @@ export function reasonText(reason) {
               reviewRounds(reason.review_rounds)]
         .filter(Boolean).join(", ");
     case "lapsed":
-      return `claim by ${spellHidden(reason.holder).text} on `
-        + `${spellHidden(reason.branch).text} ran out ${since}`;
+      return `claim by ${spellHidden(reason.holder).text}`
+        + (reason.branch ? ` on ${spellHidden(reason.branch).text}` : "")
+        + ` ran out ${since}`;
     case "quiet":
       return `nothing written since ${since}`;
     default:

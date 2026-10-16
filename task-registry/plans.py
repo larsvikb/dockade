@@ -16,6 +16,12 @@ from taskdb import Refused
 # detailed, or more than one task (`task-registry/DESIGN.md`, "Plans").
 TEXTS = {"approach": 4000, "tests": 2000, "out_of_scope": 1500, "risks": 1500,
          "review_verdict": 1000}
+
+#: The most review rounds a refiner runs before handing a plan in: the operator's cap,
+#: which `claim_plan`'s description states. The store does not apply it: the count is
+#: the agent's own word, so a refusal would only push one that ran over into reporting
+#: a false number. `REVIEW_ROUNDS_MAX` is a bound on what the store keeps.
+REVIEW_ROUNDS_CAP = 5
 REVIEW_ROUNDS_MAX = 20
 
 

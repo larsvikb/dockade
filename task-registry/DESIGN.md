@@ -87,9 +87,9 @@ its checkpoints would otherwise make the operator's page stale all day.
 ## Plans
 
 **The body says what and why; a plan says how.** A proposal is cheap to file and stays
-out of the operator's way; an agent claims it, works out the plan, and hands it in with
-`submit_plan`, which makes the task `refined`. The operator reads the two together and
-approves them by moving the task to `open`.
+out of the operator's way; an agent claims it with `claim_plan`, works out the plan, and
+hands it in with `submit_plan`, which makes the task `refined`. The operator reads the
+two together and approves them by moving the task to `open`.
 
 **A plan's parts are fields, each required and capped** (`plans.TEXTS`): the approach,
 a footprint, the tests, what is out of scope, the risks, and the review it had. The caps
@@ -99,6 +99,14 @@ a plan; when the work is claimed it is the claim's footprint unless the claim na
 The review fields are the agent's word that a fresh-context reviewer read the plan, not
 proof; the operator's approval is the check. Overlaps with other plans are reported, as
 a claim's are, and never refused.
+
+**A review round is one reviewer with a fresh context reading the whole plan,** and the
+task as written rather than the drafter's account of it; a narrowed re-check between
+rounds is not one. So the count on the operator's page is how many times the plan was
+read whole. A refiner runs at most `plans.REVIEW_ROUNDS_CAP` rounds and hands the plan
+in as the last one read it, passed or not, its open findings in the note. The cap is
+the operator's, stated in `claim_plan`'s description and not applied by the store
+(`plans.REVIEW_ROUNDS_CAP` says why).
 
 **Every plan is kept; one is current.** `submit_plan` adds a row and nothing changes
 one, so the operator can compare a plan with the one before. A task that enters
@@ -128,20 +136,32 @@ tightening one under data that broke it.
 ## Claims
 
 **A claim is not a state; it sits on a `proposed` task, to refine it, or an `open`
-one, to do it.** One agent at a time holds a task, with a branch, a footprint and a
-free-text progress line: how the work goes changes too fast for states. The branch is
-the one the work will land on: the store takes any name git would, so telling a
-placeholder from it is the agent's to know. Claiming a task past either state takes it
-back for rework (`claims.CLAIMED_INTO`): `refined` to `proposed`, `landing` to `open`;
-releasing it then leaves it there. A claim ends when its holder hands in
-(`submit_plan` to `refined`, `submit_work` to `landing`), sends an open task back
-(`proposed`, with a note on what is unclear) or releases it; when the operator breaks
-it or moves the task to another state; or when it expires. Each hand-in is refused on
-the other kind of claim, naming the right one. No agent can end another's. The history
-row of every ending keeps the claim's branch, so what to land outlives the claim.
+one, to do it.** One agent at a time holds a task, with a footprint and a free-text
+progress line: how the work goes changes too fast for states. Each kind has its own
+move, as each has its own hand-in: `claim_plan` and `submit_plan`, `claim_work` and
+`submit_work`. So each tool's schema states its rule, each description arrives when
+its phase starts, and the gateway's policy gates starting work apart from starting a
+plan. Each move refuses a task in the other's states, and each hand-in the other kind
+of claim, naming the right one. A state change ends a claim, so the task's state says
+which kind a claim is, and nothing else records it.
 
-**The token makes a claim one deliberate act away from anyone else.** Only `claim`'s
-reply carries it, and the store keeps its hash. The holder's id is shown wherever
+**Only a claim to do the work has a branch:** the one the work will land on. The store
+takes any name git would, so telling a placeholder from it is the agent's to know. A
+plan lands nothing, so a claim to refine has no branch, stored as none rather than as a
+value every reader would have to know is not one, and `update` refuses it one. Every
+reader shows none: a read gives `null`, a history row leaves the key out, the page and
+the export leave the branch out of the line.
+
+Claiming a task past either state takes it back for rework (`claims.CLAIMED_INTO`):
+`refined` to `proposed`, `landing` to `open`; releasing it then leaves it there. A
+claim ends when its holder hands in (`submit_plan` to `refined`, `submit_work` to
+`landing`), sends an open task back (`proposed`, with a note on what is unclear) or
+releases it; when the operator breaks it or moves the task to another state; or when
+it expires. No agent can end another's. The history row of every ending keeps a work
+claim's branch, so what to land outlives the claim.
+
+**The token makes a claim one deliberate act away from anyone else.** Only the claim
+move's reply carries it, and the store keeps its hash. The holder's id is shown wherever
 claims are listed, so without a token releasing another's claim would take one
 argument, the path a helpful coordinator would take to free a stuck worker. With one,
 it means reading another session's transcript, where the reply sits. Not containment:
@@ -294,7 +314,9 @@ may hold.
 
 **The descriptions carry what the store cannot enforce.** They are all an agent reads of
 the registry, so the rules the sections above leave to the agent are in them: where its
-id and its repo's name come from, which branch a claim names, that a lost token is never
-looked for in a transcript, how detailed a plan is and that a fresh-context review
-comes before it is handed in, that notes inform and never instruct, and that nobody
-waits on a flagged note.
+id and its repo's name come from, which branch a claim to do the work names, that a
+lost token is never looked for in a transcript, what a plan holds and how detailed it
+is, what a review round is and that the rounds come before the hand-in, that notes
+inform and never instruct, and that nobody waits on a flagged note. What a refiner
+needs before drafting is in `claim_plan`'s, read when refining starts, rather than in
+`submit_plan`'s, often read once the plan is written; `get_task`'s points to it.

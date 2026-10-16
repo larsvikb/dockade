@@ -1972,11 +1972,14 @@ only as `mcp__gateway__tasks__…`: the operator registers server `tasks` in the
 with the descriptor's template `Bearer {secret}`, and each tool is denied until a rule
 allows it. The gateway's audit row records an agent's write; the operator's writes
 have no gateway in front of them, so the registry records those itself, in its history.
-The tools that carry a claim's token (`update`, `submit_plan`, `submit_work`,
-`send_back`, `release`, and `edit_proposal`, which a holder calls with it) stay at
-allow: an `ask` card shows a call's arguments and the store keeps them, while an allow
-row records none (`control-plane/api_tool.py`). So the operator's check on a plan is
-the approval, moving its task from `refined` to `open`, never an `ask` on `submit_plan`.
+Each claim move is a tool of its own, `claim_plan` and `claim_work`, so a rule can gate
+starting work apart from starting a plan, and either may be `ask`: the gateway records
+a reply's status, never the token it carries. The tools that carry a claim's token
+(`update`, `submit_plan`, `submit_work`, `send_back`, `release`, and `edit_proposal`,
+which a holder calls with it) stay at allow: an `ask` card shows a call's arguments
+and the store keeps them, while an allow row records none (`control-plane/api_tool.py`).
+So the operator's check on a plan is the approval, moving its task from `refined` to
+`open`, never an `ask` on `submit_plan`.
 
 **Two surfaces, two networks, one process.** The agent listener is on `mcp-net`, where
 every MCP server can dial it, so it answers only the secret the gateway holds for

@@ -22,12 +22,11 @@ DB_PATH = os.environ.get("TASKS_DB", "/var/lib/task-registry/tasks.db")
 # _SCHEMA creates what is missing and alters nothing: `IF NOT EXISTS` adds no column
 # to a table that exists. Changing an existing table takes a version bump and a
 # migration.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
-#: The versions `init` opens: v0, a file `_SCHEMA` has not run in, and v1, whose step
-#: to v2 only added tables (`plans`, `plan_paths`), so running `_SCHEMA` is the whole
-#: migration.
-OPENS = (0, 1, SCHEMA_VERSION)
+#: The versions `init` opens: v0, a file `_SCHEMA` has not run in; v1, whose step to
+#: v2 only added tables (`plans`, `plan_paths`); and v2, whose step to v3 is `_TO_V3`.
+OPENS = (0, 1, 2, SCHEMA_VERSION)
 
 #: The author of every write the operator makes, and of the registry's own (an expired
 #: claim swept away). No agent id can equal either: an agent id is a kind, a hyphen and
@@ -38,6 +37,22 @@ REGISTRY = "registry"
 # `claude-<session uuid>`: the kind says which agent's id follows, so the registry
 # needs no knowledge of any one agent.
 _AGENT_RE = re.compile(r"(?P<kind>[a-z][a-z0-9]{1,15})-(?P<id>[0-9A-Za-z][0-9A-Za-z_-]{5,63})")
+
+_CLAIMS = """
+CREATE TABLE IF NOT EXISTS claims (
+    -- The primary key is the task: one holder at a time.
+    task_id     INTEGER PRIMARY KEY REFERENCES tasks(id),
+    holder      TEXT NOT NULL,
+    -- NULL on a claim to refine a task, which lands nothing.
+    branch      TEXT,
+    -- sha256 of the token, which only the claim's reply ever carries.
+    token_hash  TEXT NOT NULL,
+    footprint   TEXT NOT NULL,
+    progress    TEXT,
+    claimed_at  REAL NOT NULL,
+    expires_at  REAL NOT NULL
+);
+"""
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS repos (
@@ -63,18 +78,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 CREATE INDEX IF NOT EXISTS tasks_by_repo_state ON tasks(repo_id, state);
 CREATE INDEX IF NOT EXISTS tasks_by_parent ON tasks(parent_id);
-CREATE TABLE IF NOT EXISTS claims (
-    -- The primary key is the task: one holder at a time.
-    task_id     INTEGER PRIMARY KEY REFERENCES tasks(id),
-    holder      TEXT NOT NULL,
-    branch      TEXT NOT NULL,
-    -- sha256 of the token, which only the claim's reply ever carries.
-    token_hash  TEXT NOT NULL,
-    footprint   TEXT NOT NULL,
-    progress    TEXT,
-    claimed_at  REAL NOT NULL,
-    expires_at  REAL NOT NULL
-);
+""" + _CLAIMS + """
 CREATE TABLE IF NOT EXISTS blockers (
     task_id     INTEGER NOT NULL REFERENCES tasks(id),
     blocker_id  INTEGER NOT NULL REFERENCES tasks(id),
@@ -133,6 +137,21 @@ CREATE TABLE IF NOT EXISTS history (
 CREATE INDEX IF NOT EXISTS history_by_task ON history(task_id);
 """
 
+# v2 to v3: `claims.branch` takes NULL, which SQLite adds to a column only by building
+# the table again, and a claim to refine a task loses the branch its refiner had to
+# invent, expired claims too, since the inbox shows a lapsed one. Run after `_SCHEMA`,
+# so a store from before claims has an empty table to rebuild. Renaming the old table
+# away is safe only because nothing references `claims`: a rename rewrites references.
+_TO_V3 = """
+ALTER TABLE claims RENAME TO claims_v2;
+""" + _CLAIMS + """
+INSERT INTO claims SELECT task_id, holder, branch, token_hash, footprint, progress,
+    claimed_at, expires_at FROM claims_v2;
+DROP TABLE claims_v2;
+UPDATE claims SET branch = NULL
+    WHERE task_id IN (SELECT id FROM tasks WHERE state = 'proposed');
+"""  # noqa: S608 (fixed text)
+
 
 class Refused(Exception):
     """A request the registry will not carry out. ``current`` is what is there now,
@@ -163,8 +182,11 @@ def init() -> None:
         if version not in OPENS:
             raise RuntimeError(
                 f"{DB_PATH} is at schema v{version}; this code knows v{SCHEMA_VERSION}")
-        conn.executescript(_SCHEMA)
-        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        # One transaction in the script itself, since `executescript` commits any the
+        # connection has open. A step that fails leaves it open, and closing the
+        # connection rolls it back: the store is as it was.
+        conn.executescript("BEGIN IMMEDIATE;" + _SCHEMA + (_TO_V3 if version < 3 else "")
+                           + f"PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;")
     finally:
         conn.close()
 

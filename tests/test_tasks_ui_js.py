@@ -118,6 +118,8 @@ console.log(JSON.stringify({
                              review_rounds: 3}),
       lapsed: t.reasonText({why: "lapsed", since: 1789466400, holder: "claude-x\u200b",
                             branch: "b"}),
+      lapsed_refining: t.reasonText({why: "lapsed", since: 1789466400,
+                                     holder: "claude-x", branch: null}),
       quiet: t.reasonText({why: "quiet", since: 1789466400}),
       unknown: t.reasonText({why: "new\u202e", since: 1789466400}),
       none: t.reasonText(null),
@@ -325,6 +327,8 @@ class TaskViewTests(unittest.TestCase):
         self.assertRegex(r["refined"], rf"^refined since {stamp}, plan 6, 3 review rounds$")
         self.assertRegex(r["lapsed"],
                          rf"^claim by claude-x\\u200b on b ran out {stamp}$")
+        # A claim to refine a task has no branch.
+        self.assertRegex(r["lapsed_refining"], rf"^claim by claude-x ran out {stamp}$")
         self.assertRegex(r["quiet"], rf"^nothing written since {stamp}$")
         self.assertEqual(r["unknown"], "new\\u202e")
         self.assertEqual(r["none"], "")

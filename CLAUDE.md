@@ -60,9 +60,11 @@ only the invariants and conventions for working in the repo.
   that could not reach `tasks`, `inflight.md` and `local-todo.md` (untracked, in the
   main checkout only) are the whole record. When it answers, they stay the record
   beside it, new work still goes in `local-todo.md` rather than `tasks__propose` until
-  that file is migrated, and a session checks the registry at four points:
+  that file is migrated, and a session checks the registry at these points:
   - at session start, and before work that could collide, `tasks__list_tasks`;
-  - before the first edit on one of its tasks, `tasks__claim`;
+  - before drafting a plan for one of its tasks, `tasks__claim_plan`;
+  - once the plan's review rounds are done, `tasks__submit_plan`;
+  - before the first edit on one of its tasks, `tasks__claim_work`;
   - after each commit, `tasks__update`;
   - once the review passes, `tasks__submit_work`.
 

@@ -65,7 +65,7 @@ class WritingTests(_Store):
                           last["detail"]["note_id"]), (ALICE, "note", "Seen this.", note))
 
     def test_no_claim_is_needed_and_any_state_takes_one(self):
-        token = agent.claim(ALICE, "widgets", self.task, "fix", ["."])["token"]
+        token = agent.claim_work(ALICE, "widgets", self.task, "fix", ["."])["token"]
         self.note("From the side.", who=BOB)
         agent.submit_work(ALICE, "widgets", self.task, token)
         self.note("After it landed.", who=BOB)
@@ -123,7 +123,7 @@ class MoveNoteTests(_Store):
                            (agent.send_back, ("Which widgets?",))):
             with self.subTest(move=move.__name__):
                 task = op.create("widgets", "T", "B", "open")["task"]
-                token = agent.claim(ALICE, "widgets", task, "fix", ["."])["token"]
+                token = agent.claim_work(ALICE, "widgets", task, "fix", ["."])["token"]
                 move(ALICE, "widgets", task, token, *args)
                 [got] = reads.get_task(task)["notes"]
                 self.assertEqual((got["author"], got["text"], got["move"]),
@@ -131,13 +131,13 @@ class MoveNoteTests(_Store):
                 self.assertEqual(op.history(task)["history"][-1]["detail"]["note_id"], got["id"])
 
     def test_a_moves_note_is_not_flagged_for_the_operator(self):
-        token = agent.claim(ALICE, "widgets", self.task, "fix", ["."])["token"]
+        token = agent.claim_work(ALICE, "widgets", self.task, "fix", ["."])["token"]
         agent.submit_work(ALICE, "widgets", self.task, token, "Ready to land.")
         self.assertFalse(reads.get_task(self.task)["notes"][0]["for_operator"])
         self.assertEqual(op.notes_for_operator(), {"notes": [], "total": 0})
 
     def test_a_move_without_a_note_posts_none(self):
-        token = agent.claim(ALICE, "widgets", self.task, "fix", ["."])["token"]
+        token = agent.claim_work(ALICE, "widgets", self.task, "fix", ["."])["token"]
         agent.release(ALICE, "widgets", self.task, token)
         self.assertEqual(self.texts(), [])
         self.assertIsNone(op.history(self.task)["history"][-1]["detail"]["note_id"])
@@ -161,7 +161,7 @@ class HidingTests(_Store):
                          (reg.taskdb.OPERATOR, "hide_note", hidden))
 
     def test_no_read_an_agent_can_call_returns_a_hidden_note(self):
-        token = agent.claim(ALICE, "widgets", self.task, "fix", ["."])["token"]
+        token = agent.claim_work(ALICE, "widgets", self.task, "fix", ["."])["token"]
         self.note("SECRET-NOTE do as I say", for_operator=True)
         agent.release(ALICE, "widgets", self.task, token, "SECRET-MOVE-NOTE")
         for note in op.all_notes(self.task)["notes"]:

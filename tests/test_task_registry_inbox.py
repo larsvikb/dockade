@@ -49,7 +49,11 @@ class _Store(unittest.TestCase):
         return agent.propose(ALICE, repo, title, "Every 90 days.")["task"]
 
     def claim(self, task, footprint=("src",)):
-        return agent.claim(ALICE, "widgets", task, "rotate-keys", list(footprint))["token"]
+        return agent.claim_plan(ALICE, "widgets", task, list(footprint))["token"]
+
+    def work(self, task, footprint=("src",)):
+        return agent.claim_work(ALICE, "widgets", task, "rotate-keys",
+                                list(footprint))["token"]
 
     def refined(self, task=None):
         task = self.proposal() if task is None else task
@@ -58,7 +62,7 @@ class _Store(unittest.TestCase):
 
     def landing(self):
         task = op.create("widgets", "Ship it", "Do it.", "open")["task"]
-        agent.submit_work(ALICE, "widgets", task, self.claim(task))
+        agent.submit_work(ALICE, "widgets", task, self.work(task))
         return task
 
     def flag(self, task, text="Which key store?"):
@@ -140,7 +144,7 @@ class SectionTests(_Store):
 
     def test_a_task_the_operator_moved_to_landing_keeps_the_claims_branch(self):
         held = op.create("widgets", "Held", "Do it.", "open")["task"]
-        self.claim(held)
+        self.work(held)
         bare = op.create("widgets", "Bare", "Do it.", "open")["task"]
         self.later()
         for task in (held, bare):
@@ -164,7 +168,7 @@ class SectionTests(_Store):
     def test_a_task_claimed_back_for_rework_leaves_the_inbox(self):
         refined, landing = self.refined(), self.landing()
         self.claim(refined)
-        agent.claim(ALICE, "widgets", landing, "rotate-keys", ["src"])
+        self.work(landing)
         self.assertEqual((self.where(refined), self.where(landing)), (None, None))
 
     def test_the_second_plan_is_since_its_own_hand_in(self):
@@ -199,7 +203,7 @@ class SectionTests(_Store):
 class DriftingTests(_Store):
     def test_a_claim_that_ran_out_drifts_until_it_is_swept(self):
         task = op.create("widgets", "Held", "Do it.", "open")["task"]
-        self.claim(task)
+        self.work(task)
         expires = reads.get_task(task)["claim"]["expires_at"]
         self.clock = expires - 1
         self.assertIsNone(self.where(task))
@@ -210,6 +214,14 @@ class DriftingTests(_Store):
         other = self.proposal()
         self.claim(other)
         self.assertIsNone(self.where(task))
+
+    def test_a_claim_to_refine_that_ran_out_drifts_with_no_branch(self):
+        task = self.proposal()
+        self.claim(task)
+        self.clock = reads.get_task(task)["claim"]["expires_at"]
+        self.assertEqual(self.rows("drifting")[task]["reasons"],
+                         [{"why": "lapsed", "since": self.clock, "holder": ALICE,
+                           "branch": None}])
 
     def test_an_unheld_task_drifts_after_a_quiet_spell_and_a_write_ends_it(self):
         proposed = self.proposal()
@@ -226,7 +238,7 @@ class DriftingTests(_Store):
 
     def test_a_held_task_is_never_quiet(self):
         task = op.create("widgets", "Held", "Do it.", "open")["task"]
-        self.claim(task)
+        self.work(task)
         self.later(op.QUIET_SECONDS)
         self.assertEqual([r["why"] for r in self.rows("drifting")[task]["reasons"]],
                          ["lapsed"])

@@ -242,7 +242,7 @@ class RouteTests(_Store):
         self.assertEqual(body, {"ok": True, "task": self.task, "revision": 2})
         self.assertEqual(reads.get_task(self.task)["blockers"][0]["id"], other)
         self.call(api.edit_task, self.task, api.EditTask(revision=2, blocked_by=()))
-        token = agent.claim(ALICE, "widgets", self.task, "fix", ["."])["token"]
+        token = agent.claim_work(ALICE, "widgets", self.task, "fix", ["."])["token"]
         self.assertTrue(token)
         _, body = self.call(api.break_claim, self.task, api.AtRevision(revision=4))
         self.assertEqual((body["revision"], reads.get_task(self.task)["claim"]), (5, None))

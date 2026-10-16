@@ -29,8 +29,8 @@ SECRET = "s3cret-" * 6
 EXPECTED = f"Bearer {SECRET}".encode()
 
 TOOL_NAMES = ["list_tasks", "get_task", "task_notes", "search_tasks", "repos", "propose",
-              "edit_proposal", "claim", "update", "submit_plan", "submit_work", "send_back",
-              "release", "add_note"]
+              "edit_proposal", "claim_plan", "claim_work", "update", "submit_plan",
+              "submit_work", "send_back", "release", "add_note"]
 
 PLAN = {"approach": "A rotate step in the key store.", "footprint": ["src/keys.py"],
         "tests": "A rotation keeps old keys readable.", "out_of_scope": "None.",
@@ -206,12 +206,62 @@ class ListingTests(unittest.TestCase):
                         # The one null that is not "not given": every state.
                         self.assertEqual((tool["name"], name), ("list_tasks", "state"))
 
+    def test_only_a_claim_to_do_the_work_takes_a_branch(self):
+        schemas = {t["name"]: t["inputSchema"] for t in tools.listing()}
+        self.assertNotIn("branch", schemas["claim_plan"]["properties"])
+        self.assertIn("footprint", schemas["claim_plan"]["required"])
+        self.assertIn("branch", schemas["claim_work"]["required"])
+        self.assertNotIn("footprint", schemas["claim_work"]["required"])
+
     def test_the_schema_says_the_stores_choices_and_lengths(self):
         propose = next(t for t in tools.listing() if t["name"] == "propose")
         properties = propose["inputSchema"]["properties"]
         self.assertEqual(properties["severity"]["enum"], [*reg.tasks.SEVERITIES, None])
         self.assertEqual(properties["title"]["maxLength"], reg.tasks.TITLE_MAX)
         self.assertEqual(properties["blocked_by"]["items"], {"type": "integer"})
+
+
+class DescriptionTests(unittest.TestCase):
+    """What the descriptions must say, from the registry's contract with a refiner
+    (``task-registry/DESIGN.md``, "Plans" and "The agent listener")."""
+
+    # Code spans in a description that name no tool, parameter or state.
+    LITERALS = frozenset({".", '["."]', "claude-", "ready", "worktree-…"})
+
+    def described(self, name: str) -> str:
+        return tools.TOOLS[name].description
+
+    def test_every_tool_a_description_names_is_served(self):
+        params = {p.name for tool in tools.TOOLS.values() for p in tool.params}
+        known = set(tools.TOOLS) | params | set(reg.tasks.STATES) | self.LITERALS
+        for name, tool in tools.TOOLS.items():
+            for text in (tool.description, *(p.description for p in tool.params)):
+                with self.subTest(tool=name):
+                    self.assertEqual(set(re.findall(r"`([^`]+)`", text)) - known, set())
+
+    def test_both_claim_tools_say_what_a_null_branch_in_an_overlap_is(self):
+        for name in ("claim_plan", "claim_work"):
+            with self.subTest(tool=name):
+                self.assertIn("a claim to refine a task has a null branch",
+                              " ".join(self.described(name).split()))
+
+    def test_refining_starts_from_claim_plan(self):
+        self.assertIn("`claim_plan`", self.described("get_task"))
+        self.assertIn("`claim_plan`", self.described("submit_plan"))
+
+    def test_claim_plan_names_every_part_with_its_cap_and_the_rounds(self):
+        said = self.described("claim_plan")
+        named = {"approach": "the approach", "tests": "the tests",
+                 "out_of_scope": "what is out of scope", "risks": "the risks",
+                 "review_verdict": "the last verdict"}
+        self.assertEqual(set(named), set(reg.plans.TEXTS))
+        for part, label in named.items():
+            with self.subTest(part=part):
+                self.assertIn(f"{label}, up to {reg.plans.TEXTS[part]} characters",
+                              " ".join(said.split()))
+        self.assertIn("the footprint", said)
+        self.assertIn(f"at most {reg.plans.REVIEW_ROUNDS_CAP} rounds", said)
+        self.assertIn("`get_task`", said)
 
 
 class SurfaceTests(unittest.TestCase):
@@ -276,7 +326,7 @@ class InstructionTests(unittest.TestCase):
 
 class CallTests(_Store):
     def test_a_task_worked_from_claim_to_landing(self):
-        claimed = self.ok("claim", agent=ALICE, repo="widgets", task=self.task,
+        claimed = self.ok("claim_work", agent=ALICE, repo="widgets", task=self.task,
                           branch="fix-widgets", footprint=["src"])
         token = claimed["token"]
         self.assertEqual(self.ok("list_tasks", repo="widgets", holder=ALICE)["total"], 1)
@@ -304,15 +354,16 @@ class CallTests(_Store):
     def test_a_proposal_planned_approved_and_done(self):
         task = self.ok("propose", agent=ALICE, repo="widgets", title="Rotate keys",
                        body="Every 90 days.")["task"]
-        token = self.ok("claim", agent=ALICE, repo="widgets", task=task,
-                        branch="rotate-keys", footprint=["src"])["token"]
+        token = self.ok("claim_plan", agent=ALICE, repo="widgets", task=task,
+                        footprint=["src"])["token"]
+        self.assertIsNone(self.ok("get_task", task=task)["claim"]["branch"])
         planned = self.ok("submit_plan", agent=ALICE, repo="widgets", task=task,
                           token=token, **PLAN)
         got = self.ok("get_task", task=task)
         self.assertEqual((got["state"], got["revision"]), ("refined", planned["revision"]))
         self.assertEqual({k: got["plan"][k] for k in PLAN}, PLAN)
         op.move(task, planned["revision"], "open")
-        claimed = self.ok("claim", agent=BOB, repo="widgets", task=task,
+        claimed = self.ok("claim_work", agent=BOB, repo="widgets", task=task,
                           branch="rotate-keys")
         self.assertEqual(reads.get_task(task)["claim"]["footprint"], ["src/keys.py"])
         self.ok("submit_work", agent=BOB, repo="widgets", task=task,
@@ -320,16 +371,29 @@ class CallTests(_Store):
         self.assertEqual(self.ok("get_task", task=task)["state"], "landing")
 
     def test_each_hand_in_names_the_other_on_the_wrong_state(self):
-        token = self.ok("claim", agent=ALICE, repo="widgets", task=self.task,
+        token = self.ok("claim_work", agent=ALICE, repo="widgets", task=self.task,
                         branch="b", footprint=["."])["token"]
         reason, _ = self.refused("submit_plan", {"agent": ALICE, "repo": "widgets",
                                                  "task": self.task, "token": token, **PLAN})
         self.assertIn("submit_work", reason)
 
+    def test_each_claim_tool_names_the_other_on_the_wrong_state(self):
+        reason, current = self.refused("claim_plan", {"agent": ALICE, "repo": "widgets",
+                                                      "task": self.task,
+                                                      "footprint": ["."]})
+        self.assertIn("claim_work", reason)
+        self.assertEqual(json.loads(current)["current"], {"state": "open"})
+
+    def test_a_call_to_the_old_claim_tool_is_told_the_tools(self):
+        [reason] = self.refused("claim", {"agent": ALICE, "repo": "widgets",
+                                          "task": self.task, "branch": "b"})
+        self.assertIn("no tool 'claim' here", reason)
+        self.assertIn("claim_plan, claim_work", reason)
+
     def test_a_refusal_says_why_first_and_what_is_there_now_after(self):
-        self.ok("claim", agent=ALICE, repo="widgets", task=self.task, branch="b",
+        self.ok("claim_work", agent=ALICE, repo="widgets", task=self.task, branch="b",
                 footprint=["."])
-        reason, current = self.refused("claim", {"agent": BOB, "repo": "widgets",
+        reason, current = self.refused("claim_work", {"agent": BOB, "repo": "widgets",
                                                  "task": self.task, "branch": "c",
                                                  "footprint": ["."]})
         self.assertIn(f"held by {ALICE}", reason)
@@ -363,13 +427,19 @@ class CallTests(_Store):
             "arguments not an object": ("get_task", [self.task], "an object"),
             "an unknown argument": ("get_task", {"task": self.task, "as": "operator"},
                                     "no argument 'as'"),
-            "a missing argument": ("claim", {"agent": ALICE, "repo": "widgets"},
+            "a missing argument": ("claim_work", {"agent": ALICE, "repo": "widgets"},
                                    "missing task, branch"),
+            "a missing footprint": ("claim_plan", {"agent": ALICE, "repo": "widgets",
+                                                   "task": self.task},
+                                    "missing footprint"),
+            "a branch on a claim to refine": ("claim_plan", {
+                "agent": ALICE, "repo": "widgets", "task": self.task,
+                "footprint": ["."], "branch": "b"}, "no argument 'branch'"),
             "true for an id": ("get_task", {"task": True}, "task is an integer"),
             "a string for an id": ("get_task", {"task": str(self.task)},
                                    "task is an integer"),
             "a float for an id": ("get_task", {"task": 1.0}, "task is an integer"),
-            "a list of the wrong items": ("claim", {"agent": ALICE, "repo": "widgets",
+            "a list of the wrong items": ("claim_work", {"agent": ALICE, "repo": "widgets",
                                                    "task": self.task, "branch": "b",
                                                    "footprint": [1]},
                                          "footprint is a list of strings"),
@@ -394,7 +464,9 @@ class OddArgumentTests(_Store):
         if name in ("update", "submit_plan", "submit_work", "send_back", "release"):
             state = "proposed" if name == "submit_plan" else "open"
             task = op.create("widgets", "T", "B", state)["task"]
-            agent_claim = reg.agent_moves.claim(ALICE, "widgets", task, "b", ["."])
+            agent_claim = (reg.agent_moves.claim_plan(ALICE, "widgets", task, ["."])
+                           if state == "proposed" else
+                           reg.agent_moves.claim_work(ALICE, "widgets", task, "b", ["."]))
             token = agent_claim["token"]
         values = {"agent": ALICE, "repo": "widgets", "task": self.task, "token": token,
                   "title": "T", "body": "B", "text": "x", "branch": "b",

@@ -4,8 +4,9 @@ in, and every write is recorded under that agent's id.
 
 An agent shapes a task only while it is ``proposed``: once the operator moves it to
 ``open``, its spec and blockers are the ones the operator approved. It refines a
-``proposed`` task into a plan, or does an ``open`` one, by claiming it, and every move
-on the claim carries the claim's token."""
+``proposed`` task into a plan by claiming it with ``claim_plan``, or does an ``open``
+one by claiming it with ``claim_work``, and every move on the claim carries the
+claim's token."""
 from __future__ import annotations
 
 import json
@@ -71,33 +72,42 @@ def edit_proposal(agent: str, repo: str, task: int, revision: int,
 # --- claims ----------------------------------------------------------------------
 
 
-def claim(agent: str, repo: str, task: int, branch: str,
-          footprint: list[str] | tuple[str, ...] | None = None) -> dict:
-    """Take a ``proposed`` task to refine it or an ``open`` one to do it; a ``refined``
-    or ``landing`` one goes back to ``proposed`` or ``open`` for rework. The footprint
-    may be left out on a task whose current plan names one, and is the plan's then.
-    The reply carries the token, which nothing else ever returns, and what the claim
-    runs into: other claims its footprint overlaps, and blockers not yet closed.
-    Neither is refused."""
+def claim_plan(agent: str, repo: str, task: int,
+               footprint: list[str] | tuple[str, ...]) -> dict:
+    """Take a ``proposed`` task to refine it, or a ``refined`` one back to ``proposed``
+    to rework its plan. A plan lands nothing, so the claim names no branch."""
+    taskdb.check_agent(agent)
+    return _claim(agent, repo, task, "claim_plan", None, claims.footprint(footprint))
+
+
+def claim_work(agent: str, repo: str, task: int, branch: str,
+               footprint: list[str] | tuple[str, ...] | None = None) -> dict:
+    """Take an ``open`` task to do it, or a ``landing`` one back to ``open`` for
+    rework, naming the branch the work lands on. The footprint may be left out on a
+    task whose current plan names one, and is the plan's then."""
     taskdb.check_agent(agent)
     claims.check_branch(branch)
     paths = None if footprint is None else claims.footprint(footprint)
+    return _claim(agent, repo, task, "claim_work", branch, paths)
+
+
+def _claim(agent: str, repo: str, task: int, action: str, branch: str | None,
+           paths: list[str] | None) -> dict:
+    """The step both claim moves share. The reply carries the token, which nothing else
+    ever returns, and what the claim runs into: other claims its footprint overlaps,
+    and blockers not yet closed. Neither is refused."""
     with taskdb.writing() as conn:
         row = tasks.task_row(conn, task)
         tasks.check_in_repo(row, repo)
-        into = claims.CLAIMED_INTO.get(row["state"])
+        into = claims.CLAIMED_INTO[action].get(row["state"])
         if into is None:
-            raise Refused(f"task {task} is {row['state']}; only a task in "
-                          f"{', '.join(claims.CLAIMED_INTO)} can be claimed",
+            raise Refused(_unclaimable(task, row["state"], action),
                           {"state": row["state"]})
         held = claims.live(conn, task)
         if held is not None:
             raise Refused(f"task {task} is held by {held['holder']}",
                           {"holder": held["holder"], "expires_at": held["expires_at"]})
         if paths is None:
-            if into != "open":
-                raise Refused(f"a claim that refines task {task} names its own "
-                              f"footprint, ['.'] while the paths are not known")
             plan = plans.current(conn, task)
             if plan is None:
                 raise Refused(f"task {task} has no plan whose footprint the claim could "
@@ -105,8 +115,8 @@ def claim(agent: str, repo: str, task: int, branch: str,
             paths = plans.paths(conn, plan["id"])
         token, expires_at = claims.take(conn, task, agent, branch, paths)
         revision = tasks.update(conn, task, {"state": into})
-        taskdb.record(conn, agent, "claim", task, revision=revision, before=row["state"],
-                      branch=branch, footprint=paths)
+        taskdb.record(conn, agent, action, task, revision=revision, before=row["state"],
+                      footprint=paths, **tasks.given(branch=branch))
         reply = {"task": task, "token": token, "expires_at": expires_at,
                  "revision": revision,
                  "overlaps": claims.overlaps(conn, row["repo_id"], task, paths),
@@ -114,11 +124,24 @@ def claim(agent: str, repo: str, task: int, branch: str,
     return reply
 
 
+def _unclaimable(task: int, state: str, action: str) -> str:
+    """Why ``action`` does not take a task in ``state``, naming the move that does."""
+    def takes(move: str) -> str:
+        return f"{move} takes a task that is {' or '.join(claims.CLAIMED_INTO[move])}"
+
+    other = claims.claimed_with(state)
+    if other is not None:
+        return f"task {task} is {state}: {takes(action)}, and {other} one that is {state}"
+    return (f"task {task} is {state}, which no claim takes: "
+            f"{'; '.join(takes(move) for move in claims.CLAIMED_INTO)}")
+
+
 def update(agent: str, repo: str, task: int, token: str, progress: str | None = None,
            branch: str | None = None,
            footprint: list[str] | tuple[str, ...] | None = None) -> dict:
-    """Say how the work goes, correct the branch or footprint, and renew the claim;
-    with nothing else given, only renew it."""
+    """Say how the work goes, correct the footprint or the work's branch, and renew the
+    claim; with nothing else given, only renew it. The history row keeps only what
+    changed."""
     taskdb.check_agent(agent)
     tasks.check_text(progress, claims.PROGRESS_MAX, "a progress line")
     if branch is not None:
@@ -128,9 +151,12 @@ def update(agent: str, repo: str, task: int, token: str, progress: str | None = 
         row = tasks.task_row(conn, task)
         tasks.check_in_repo(row, repo)
         held = claims.check_holder(conn, row, agent, token)
+        if branch is not None and row["state"] == "proposed":
+            raise Refused(f"a claim to refine task {task} has no branch: the work's "
+                          f"branch is named when it is claimed, with claim_work")
         expires_at = claims.renew(conn, task, progress, branch, paths)
-        taskdb.record(conn, agent, "update", task, progress=progress, branch=branch,
-                      footprint=paths)
+        taskdb.record(conn, agent, "update", task,
+                      **tasks.given(progress=progress, branch=branch, footprint=paths))
         current = paths if paths is not None else json.loads(held["footprint"])
         reply = {"task": task, "expires_at": expires_at, "revision": row["revision"],
                  "overlaps": claims.overlaps(conn, row["repo_id"], task, current)}

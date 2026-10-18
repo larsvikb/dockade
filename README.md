@@ -340,8 +340,8 @@ dockade/
     tasks.py                #   fields, states, parent and blockers; the plain writes
     claims.py               #   a claim's token, expiry and footprint; the plain claim writes
     notes.py                #   a note's bounds, the plain write, the shape a note is read in
-    plans.py                #   a plan's parts and caps, the plain writes, the shape a plan
-                            #   is read in, its overlaps
+    plans.py                #   a plan's parts and caps, its decisions and their answers,
+                            #   the plain writes, the shape each is read in, overlaps
     reads.py                #   what any surface may read; nothing here writes
     agent_moves.py          #   what an agent may do: propose, edit a proposal, work a
                             #   claim, hand in a plan or the work, add a note
@@ -349,7 +349,8 @@ dockade/
                             #   argument check
     agent_api.py            #   the agent listener: MCP for the gateway, behind its secret
     operator_moves.py       #   what only the operator may do or see: any edit, any move,
-                            #   break a claim, hide or handle a note, the repo list;
+                            #   approve a plan, answering its decisions, break a claim,
+                            #   hide or handle a note, the repo list;
                             #   the history
     operator_api.py         #   the operator API: those moves and the reads as JSON over
                             #   HTTP, for the UI to relay to

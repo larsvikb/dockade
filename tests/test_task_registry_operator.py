@@ -22,11 +22,26 @@ from unittest import mock
 
 import _surface
 from _loader import ROOT, load_operator_api, load_task_registry
+from test_task_registry_plans import DECISION, MULTI, PLAN
 
 reg = load_task_registry()
 api = load_operator_api()
 Refused, Missing, Stale = reg.taskdb.Refused, reg.taskdb.Missing, reg.taskdb.Stale
-agent, op, reads = reg.agent_moves, reg.operator_moves, reg.reads
+agent, op, reads, plans = reg.agent_moves, reg.operator_moves, reg.reads, reg.plans
+
+#: Answers to ``[DECISION, MULTI]`` that are the options the plan assumes.
+ASSUMED = [{"options": [0]}, {"options": [0, 1]}]
+#: Answers to ``[DECISION, MULTI]`` that are not, each with the state they lead to.
+NOT_ASSUMED = {
+    "another option": [{"options": [1]}, ASSUMED[1]],
+    "an other text alone": [{"other": "Hold, but only for the llm containers."},
+                            ASSUMED[1]],
+    "fewer of a multi-select": [ASSUMED[0], {"options": [0]}],
+    "more of a multi-select": [ASSUMED[0], {"options": [0, 1, 2]}],
+    "the assumed ones and an other text": [ASSUMED[0], {"options": [0, 1],
+                                                        "other": "And debug, weekly."}],
+    "an other text on a multi-select": [ASSUMED[0], {"other": "None of them."}],
+}
 
 ALICE = "claude-0b6f3a52-91d4-4c1e-a7e2-5d0c8e2f4b19"
 
@@ -106,12 +121,6 @@ class PagingTests(_Store):
         for bad in ("1", 0, True):
             with self.subTest(before=bad):
                 self.refused(op.history, self.task, before=bad)
-
-
-PLAN = {"approach": "A rotate step in the key store.", "footprint": ["src/keys.py"],
-        "tests": "A rotation keeps old keys readable.", "out_of_scope": "None.",
-        "risks": "A reader mid-rotation.", "review_rounds": 2,
-        "review_verdict": "Passes."}
 
 
 class TimelineTests(_Store):
@@ -326,6 +335,203 @@ class RefusalKindTests(_Store):
         self.assertEqual(reads.list_tasks("widgets", None)["total"], 1)
 
 
+class ApproveTests(_Store):
+    """``operator_moves.approve``: answering a plan's decisions is approving it, and
+    whether the answers are the ones the plan assumed decides where the task goes."""
+
+    def refined(self, decisions=(DECISION, MULTI), who=ALICE):
+        task = agent.propose(who, "widgets", "Rotate keys", "Every 90 days.")["task"]
+        self.replan(task, decisions, who)
+        return task
+
+    def replan(self, task, decisions=(DECISION, MULTI), who=ALICE):
+        token = agent.claim_plan(who, "widgets", task, ["."])["token"]
+        return agent.submit_plan(who, "widgets", task, token,
+                                 **(PLAN | {"decisions": list(decisions)}))["plan"]
+
+    def approve(self, task, answers, **kw):
+        return op.approve(task, self.revision(task), answers, **kw)
+
+    def test_every_answer_assumed_opens_the_task(self):
+        task = self.refined()
+        plan = reads.get_task(task)["plan"]["id"]
+        reply = self.approve(task, ASSUMED)
+        got = reads.get_task(task)
+        self.assertEqual((reply["state"], reply["plan"], reply["revision"]),
+                         ("open", plan, got["revision"]))
+        self.assertEqual((got["state"], got["plan"]["id"], got["plan"]["superseded_at"]),
+                         ("open", plan, None))
+        self.assertEqual([(a["plan"], a["decision"], a["question"], a["author"])
+                          for a in got["answers"]],
+                         [(plan, 0, DECISION["question"], reg.taskdb.OPERATOR),
+                          (plan, 1, MULTI["question"], reg.taskdb.OPERATOR)])
+        self.assertEqual([[o["label"] for o in a["options"]] for a in got["answers"]],
+                         [["Hold"], ["Audit", "Access"]])
+        self.assertEqual([a["other"] for a in got["answers"]], [None, None])
+        last = op.history(task)["history"][-1]
+        self.assertEqual((last["author"], last["action"], last["detail"]["state"],
+                          last["detail"]["before"], last["detail"]["plan"]),
+                         (reg.taskdb.OPERATOR, "approve", "open", "refined", plan))
+        self.assertEqual(last["detail"]["answers"], [
+            {"question": DECISION["question"], "options": [DECISION["options"][0]],
+             "other": None},
+            {"question": MULTI["question"], "options": MULTI["options"][:2],
+             "other": None}])
+
+    def test_any_other_answer_sends_it_back_with_its_plan_superseded(self):
+        for case, answers in NOT_ASSUMED.items():
+            with self.subTest(case):
+                task = self.refined()
+                plan = reads.get_task(task)["plan"]["id"]
+                self.assertEqual(self.approve(task, answers)["state"], "proposed")
+                got = reads.get_task(task)
+                self.assertEqual((got["state"], got["plan"]["id"]), ("proposed", plan))
+                self.assertIsNotNone(got["plan"]["superseded_at"])
+                self.assertEqual([([o["position"] for o in a["options"]], a["other"])
+                                  for a in got["answers"]],
+                                 [(sorted(a.get("options", [])), a.get("other"))
+                                  for a in answers])
+                detail = op.history(task)["history"][-1]["detail"]
+                self.assertEqual(detail["state"], "proposed")
+                self.assertEqual([a["other"] for a in detail["answers"]],
+                                 [a.get("other") for a in answers])
+
+    def test_the_outcome_is_a_rule_another_surface_can_run(self):
+        decisions = [plans.check_decisions([d])[0] for d in (DECISION, MULTI)]
+        self.assertEqual(plans.outcome(decisions, ASSUMED), "open")
+        for case, answers in NOT_ASSUMED.items():
+            with self.subTest(case):
+                self.assertEqual(plans.outcome(decisions, answers), "proposed")
+        self.assertEqual(plans.outcome([], []), "open")
+        self.refused(plans.outcome, decisions, ASSUMED[:1])
+
+    def test_each_rule_of_an_answer_is_refused_at_its_edge(self):
+        task = self.refined()
+        cases = {
+            "no answers": [],
+            "one too few": ASSUMED[:1],
+            "one too many": [*ASSUMED, ASSUMED[0]],
+            "not a list": ASSUMED[0],
+            "an answer not an object": [0, ASSUMED[1]],
+            "an unknown field": [{"options": [0], "why": "x"}, ASSUMED[1]],
+            "options not a list": [{"options": 0}, ASSUMED[1]],
+            "a position past the options": [{"options": [2]}, ASSUMED[1]],
+            "a negative position": [{"options": [-1]}, ASSUMED[1]],
+            "a flag for a position": [{"options": [True]}, ASSUMED[1]],
+            "a label for a position": [{"options": ["Hold"]}, ASSUMED[1]],
+            "an option twice": [ASSUMED[0], {"options": [0, 0, 1]}],
+            "a blank other": [{"other": "  "}, ASSUMED[1]],
+            "an other past its cap": [{"other": "x" * (plans.OTHER_MAX + 1)}, ASSUMED[1]],
+            "an option and an other on a single choice": [
+                {"options": [0], "other": "Hold, mostly."}, ASSUMED[1]],
+            "nothing on a single choice": [{}, ASSUMED[1]],
+            "nothing on a multi-select": [ASSUMED[0], {"options": []}],
+        }
+        for case, answers in cases.items():
+            with self.subTest(case):
+                self.refused(self.approve, task, answers)
+        got = reads.get_task(task)
+        self.assertEqual((got["state"], got["answers"]), ("refined", []))
+        self.assertIsInstance(self.refused(op.approve, task, got["revision"] - 1, ASSUMED),
+                              Stale)
+        reply = self.approve(task, [{"other": "x" * plans.OTHER_MAX}, ASSUMED[1]])
+        self.assertEqual(reply["state"], "proposed")
+
+    def test_only_a_refined_task_whose_plan_is_unanswered_is_approved(self):
+        proposed = agent.propose(ALICE, "widgets", "P", "B")["task"]
+        for task in (proposed, self.task):
+            with self.subTest(state=reads.get_task(task)["state"]):
+                self.assertIn("approve takes a refined task",
+                              self.refused(self.approve, task, []).reason)
+        task = self.refined()
+        self.approve(task, ASSUMED)
+        op.move(task, self.revision(task), "refined")
+        refusal = self.refused(self.approve, task, ASSUMED)
+        self.assertIn("answered already", refusal.reason)
+        # It reopens by a move, its answers standing.
+        op.move(task, self.revision(task), "open")
+        self.assertEqual(len(reads.get_task(task)["answers"]), 2)
+
+    def test_a_plan_without_decisions_opens_with_no_answers(self):
+        task = self.refined(decisions=())
+        self.refused(self.approve, task, ASSUMED[:1])
+        self.assertEqual(self.approve(task, [])["state"], "open")
+        self.assertEqual(reads.get_task(task)["answers"], [])
+        self.assertEqual(op.history(task)["history"][-1]["detail"]["answers"], [])
+        # Approved before and moved back: approved again, since it has no answers.
+        op.move(task, self.revision(task), "refined")
+        self.assertEqual(self.approve(task, [])["state"], "open")
+        # And re-refined after being moved back to proposed.
+        op.move(task, self.revision(task), "proposed")
+        self.replan(task, decisions=())
+        self.assertEqual(op.approve(task, self.revision(task))["state"], "open")
+
+    def test_the_answers_reach_the_next_refiner_and_the_implementer(self):
+        task = self.refined()
+        first = reads.get_task(task)["plan"]["id"]
+        sent = [{"other": "Deny, but log each one."}, ASSUMED[1]]
+        self.approve(task, sent)
+        second = self.replan(task, decisions=[MULTI],
+                             who="claude-7e21c9d0-3a5b-4f86-b0d4-c1e9a2f7d360")
+        got = reads.get_task(task)
+        self.assertEqual(got["plan"]["id"], second)
+        self.assertEqual([(a["plan"], a["other"]) for a in got["answers"]],
+                         [(first, "Deny, but log each one."), (first, None)])
+        self.approve(task, [ASSUMED[1]])
+        got = reads.get_task(task)
+        self.assertEqual(got["state"], "open")
+        self.assertEqual([(a["plan"], a["decision"], a["other"]) for a in got["answers"]],
+                         [(second, 0, None), (first, 0, "Deny, but log each one."),
+                          (first, 1, None)])
+        # The operator's read of the task is the same read.
+        self.assertEqual(RouteTests.call(self, api.get_task, task)[1], got)
+
+    def test_no_state_opens_a_task_with_unanswered_decisions_by_move(self):
+        task = self.refined()
+        refusal = self.refused(op.move, task, self.revision(task), "open")
+        self.assertIn("only the operator's approve opens it, from refined", refusal.reason)
+        self.assertEqual(refusal.current, {"state": "refined"})
+        for state in ("deferred", "landing", "closed"):
+            with self.subTest(state=state):
+                op.move(task, self.revision(task), state)
+                refusal = self.refused(op.move, task, self.revision(task), "open")
+                self.assertIn("the operator moves it back to refined first", refusal.reason)
+                self.assertEqual(reads.get_task(task)["state"], state)
+        op.move(task, self.revision(task), "refined")
+        self.approve(task, ASSUMED)
+        op.move(task, self.revision(task), "deferred")
+        op.move(task, self.revision(task), "open")
+        self.assertEqual(reads.get_task(task)["state"], "open")
+
+    def test_a_plan_without_decisions_still_opens_by_move(self):
+        task = self.refined(decisions=())
+        op.move(task, self.revision(task), "open")
+        self.assertEqual(reads.get_task(task)["state"], "open")
+
+    def test_the_route_records_the_actor_and_answers_the_state_reached(self):
+        task = self.refined()
+        answers = (api.Answer(options=(0,)), api.Answer(options=(0, 1)))
+        status, body = RouteTests.call(self, api.approve, task, api.Approve(
+            revision=self.revision(task), answers=answers))
+        self.assertEqual((status, body["ok"], body["state"]), (200, True, "open"))
+        self.assertEqual(op.history(task)["history"][-1]["detail"]["actor"],
+                         ThroughTheRelay.ACTOR)
+        other = self.refined()
+        status, body = RouteTests.call(self, api.approve, other, api.Approve(
+            revision=self.revision(other), answers=(api.Answer(other="Neither."),
+                                                    api.Answer(options=(2,)))))
+        self.assertEqual((status, body["state"]), (200, "proposed"))
+        third = self.refined()
+        for status, req in ((409, api.Approve(revision=1, answers=())),
+                            (400, api.Approve(revision=self.revision(third),
+                                              answers=(api.Answer(),)))):
+            with self.subTest(status=status):
+                got, body = RouteTests.call(self, api.approve, third, req)
+                self.assertEqual((got, body["ok"]), (status, False))
+        self.assertEqual(RouteTests.call(self, api.approve, 999, api.Approve(
+            revision=1))[0], 404)
+
+
 class RouteTests(_Store):
     ROUTES = frozenset({
         ("GET", "/api/repos"), ("POST", "/api/repos"),
@@ -333,7 +539,8 @@ class RouteTests(_Store):
         ("POST", "/api/repos/{name}/retire"),
         ("GET", "/api/tasks"), ("POST", "/api/tasks"), ("GET", "/api/search"),
         ("GET", "/api/tasks/{task}"), ("POST", "/api/tasks/{task}/edit"),
-        ("POST", "/api/tasks/{task}/move"), ("POST", "/api/tasks/{task}/break-claim"),
+        ("POST", "/api/tasks/{task}/move"), ("POST", "/api/tasks/{task}/approve"),
+        ("POST", "/api/tasks/{task}/break-claim"),
         ("POST", "/api/tasks/{task}/reparent"), ("GET", "/api/tasks/{task}/history"),
         ("GET", "/api/tasks/{task}/plans"),
         ("GET", "/api/tasks/{task}/notes"), ("POST", "/api/tasks/{task}/notes"),
@@ -506,8 +713,8 @@ class ActorTests(_Store):
     stays the operator."""
 
     call = RouteTests.call
-    WRITES = frozenset({"create", "edit", "move", "break_claim", "reparent", "note",
-                        "hide_note", "handle_note", "add_repo", "rename_repo",
+    WRITES = frozenset({"create", "edit", "move", "approve", "break_claim", "reparent",
+                        "note", "hide_note", "handle_note", "add_repo", "rename_repo",
                         "set_remote", "retire_repo"})
 
     def rows_since(self, first: int) -> list[dict]:
@@ -532,6 +739,10 @@ class ActorTests(_Store):
         self.call(api.break_claim, task, api.AtRevision(revision=3))
         self.call(api.reparent, task, api.Reparent(revision=4, parent=self.task))
         self.call(api.move_task, task, api.MoveTask(revision=5, state="deferred"))
+        planned = agent.propose(ALICE, "widgets", "P", "B")["task"]
+        token = agent.claim_plan(ALICE, "widgets", planned, ["."])["token"]
+        revision = agent.submit_plan(ALICE, "widgets", planned, token, **PLAN)["revision"]
+        self.call(api.approve, planned, api.Approve(revision=revision))
         _, note = self.call(api.add_note, task, api.NoteText(text="Later."))
         self.call(api.hide_notes, api.HideNotes(notes=(note["note"],)))
         flagged = agent.add_note(ALICE, "widgets", task, "Q?", for_operator=True)["note"]
@@ -548,7 +759,8 @@ class ActorTests(_Store):
                 self.assertEqual(row["detail"]["actor"], ThroughTheRelay.ACTOR)
         # The agent's writes in between are its own, under its id, with no actor.
         theirs = [r for r in self.rows_since(first) if r["author"] == ALICE]
-        self.assertEqual([r["action"] for r in theirs], ["claim_work", "note"])
+        self.assertEqual([r["action"] for r in theirs],
+                         ["claim_work", "propose", "claim_plan", "submit_plan", "note"])
         self.assertNotIn("actor", theirs[0]["detail"])
 
     def test_a_move_called_with_no_request_records_none(self):

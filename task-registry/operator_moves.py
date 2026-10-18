@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """What only the operator may do or see: create and edit any task, move any task to
-any state, re-parent, break a claim, note, hide and mark notes handled, keep the repo
-list; read the history, every note, the notes marked for the operator, and the inbox.
+any state, approve a refined one, answering its plan's decisions, re-parent, break a
+claim, note, hide and mark notes handled, keep the repo list; read the history, every
+note, the notes marked for the operator, and the inbox.
 Every write is recorded under ``taskdb.OPERATOR``, with the ``actor`` the operator API
 saw (``operator_api.actor``), or null for a move called with none; and every write to
 a task's spec, state or claim names the revision the operator read.
@@ -93,9 +94,11 @@ def _check_clear(clear: object, given: dict) -> list[str]:
 
 def move(task: int, revision: int, state: str, *, actor: str | None = None) -> dict:
     """Any state to any state: triage, deferring, reopening, closing; ``refined`` only
-    with a current plan. A claim works in the state it was taken in, so a move that
-    changes the state ends it. Moving a refined task to ``open`` approves its body and
-    plan as of ``revision``: the revision pins the plan."""
+    with a current plan, and ``open`` never while it has decisions unanswered
+    (``tasks.update``). A claim works in the state it was taken in, so a move that
+    changes the state ends it. Approving a refined task is ``approve``; a move to
+    ``open`` still opens one whose plan has no decision unanswered, as of
+    ``revision``, which pins the plan."""
     tasks.check_state(state)
     with taskdb.writing() as conn:
         row = tasks.task_row(conn, task)
@@ -113,6 +116,46 @@ def move(task: int, revision: int, state: str, *, actor: str | None = None) -> d
                       before=row["state"], state=state,
                       ended_claim=claims.ended(held) if ending else None)
     return {"task": task, "revision": new_revision}
+
+
+def approve(task: int, revision: int, answers: list[dict] | tuple[dict, ...] = (), *,
+            actor: str | None = None) -> dict:
+    """Approve a refined task's body and plan as of ``revision``, which pins the plan,
+    answering each of the plan's decisions (``plans.check_answers`` says how). Answers
+    that are each exactly the options the plan assumes, with no "other" text, open the
+    task; any others send it back to ``proposed``, its plan superseded, for the next
+    refiner to plan from them (``plans.outcome``). A plan with no decisions takes no answers and opens; one
+    already answered is refused, since its answers stand. The reply names the state
+    reached."""
+    with taskdb.writing() as conn:
+        row = tasks.task_row(conn, task)
+        tasks.check_revision(conn, row, revision)
+        if row["state"] != "refined":
+            raise Refused(f"task {task} is {row['state']}: approve takes a refined task, "
+                          f"whose plan waits for the operator", {"state": row["state"]})
+        plan = plans.current(conn, task)["id"]
+        if plans.answered(conn, plan):
+            raise Refused(f"plan {plan} of task {task} was answered already, and its "
+                          f"answers stand: a move to open reopens it",
+                          {"state": row["state"]})
+        decisions = plans.decisions(conn, plan)
+        given = plans.check_answers(decisions, answers)
+        state = plans.outcome(decisions, given)
+        plans.answer(conn, plan, given, OPERATOR)
+        new_revision = tasks.update(conn, task, {"state": state})
+        taskdb.record(conn, OPERATOR, "approve", task, actor=actor, revision=new_revision,
+                      before=row["state"], state=state, plan=plan,
+                      answers=[_answered(d, a) for d, a in zip(decisions, given,
+                                                               strict=True)])
+    return {"task": task, "revision": new_revision, "state": state, "plan": plan}
+
+
+def _answered(decision: dict, answer: dict) -> dict:
+    """An answer as its history row keeps it: in the text the operator saw."""
+    return {"question": decision["question"],
+            "options": [{k: decision["options"][j][k] for k in ("label", "meaning")}
+                        for j in answer["options"]],
+            "other": answer["other"]}
 
 
 def break_claim(task: int, revision: int, *, actor: str | None = None) -> dict:
@@ -356,7 +399,8 @@ def inbox() -> dict:
             else:
                 plan = plans.current(conn, r["id"])
                 reason = {"why": "refined", "since": since, "plan": plan["id"],
-                          "review_rounds": plan["review_rounds"]}
+                          "review_rounds": plan["review_rounds"],
+                          "decisions": len(plans.decisions(conn, plan["id"]))}
             found.setdefault(r["id"], []).append(reason)
         for r in conn.execute("SELECT task_id, holder, branch, expires_at FROM claims "
                               "WHERE expires_at <= ?", (now,)):

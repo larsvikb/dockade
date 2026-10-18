@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """What any surface may read, agents' included: a repo's tasks, one task in full with its
-latest notes and its plan, older notes page by page, every plan a task had, a search,
-and the repo list. Nothing here
+latest notes, its plan and the operator's answers to its plans' decisions, older notes
+page by page, every plan a task had, a search, and the repo list. Nothing here
 writes, and nothing here returns what the operator alone may see: a hidden note, or the
 history, which keeps every text a task ever had."""
 from __future__ import annotations
@@ -134,6 +134,7 @@ def detail(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
         summary["claim"] |= {"footprint": json.loads(held["footprint"]),
                              "claimed_at": held["claimed_at"]}
     return {**summary, "body": row["body"], "plan": plans.latest(conn, row["id"]),
+            "answers": plans.answers(conn, row["id"]),
             "notes": notes.visible(conn, row["id"]),
             "parent": parent[0] if parent else None,
             "children": brief("SELECT id, title, state FROM tasks "

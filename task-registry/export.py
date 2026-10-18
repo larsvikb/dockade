@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """A backup of the task registry as markdown, for reading without the server: per repo
 and state, each task's fields, body, claim, plans and notes, the superseded plans and
-hidden notes marked. One-way:
+hidden notes marked, and each plan's decisions with their answers. One-way:
 nothing reads it back, so the ``.db`` beside it stays the only backup format.
 
     python3 export.py < tasks.db > tasks.md
@@ -110,6 +110,7 @@ def render(conn: sqlite3.Connection, now: float) -> str:
     for n in conn.execute("SELECT * FROM notes ORDER BY id"):
         notes.setdefault(int(n["task_id"]), []).append(n)
     plans = _plans(conn)
+    decisions = _decisions(conn)
     hidden = sum(n["hidden_at"] is not None for ns in notes.values() for n in ns)
 
     out = [
@@ -122,7 +123,9 @@ def render(conn: sqlite3.Connection, now: float) -> str:
         "For reading without the server, and never read back: the `.db` beside this "
         "file is the backup. Stored text is shown as stored, one line in a code span "
         "and more in a fenced block, with control, format and separator characters "
-        "spelled out as `\\uXXXX`, so none of it renders as markdown.",
+        "spelled out as `\\uXXXX`, so none of it renders as markdown. A plan's "
+        "decisions and their options are numbered by position, from 0, as the operator "
+        "API's approve names them.",
     ]
     for repo in repos:
         facts = []
@@ -142,13 +145,14 @@ def render(conn: sqlite3.Connection, now: float) -> str:
             if group:
                 out += ["", f"### {_word(state, tasks.STATES)} ({len(group)})"]
                 for task in group:
-                    out += _task(task, states, claims, blockers, notes, plans)
+                    out += _task(task, states, claims, blockers, notes, plans, decisions)
     return "\n".join(out) + "\n"
 
 
 def _task(task: sqlite3.Row, states: dict[int, str], claims: dict[int, sqlite3.Row],
           blockers: dict[int, list[int]], notes: dict[int, list[sqlite3.Row]],
-          plans: dict[int, list[tuple[sqlite3.Row, list[str]]]]) -> list[str]:
+          plans: dict[int, list[tuple[sqlite3.Row, list[str]]]],
+          decisions: dict[int, list[dict]]) -> list[str]:
     tid = int(task["id"])
     facts = [f"state {_word(task['state'], tasks.STATES)}"]
     if task["severity"] is not None:
@@ -181,6 +185,8 @@ def _task(task: sqlite3.Row, states: dict[int, str], claims: dict[int, sqlite3.R
                   "- footprint " + (", ".join(inline(p) for p in paths) or "(none)")]
         for part in ("approach", "tests", "out_of_scope", "risks", "review_verdict"):
             lines += ["", f"{part.replace('_', ' ').capitalize()}:", "", block(plan[part])]
+        for decision in decisions.get(int(plan["id"]), []):
+            lines += _decision(decision)
     mine = notes.get(tid, [])
     if mine:
         hidden = sum(n["hidden_at"] is not None for n in mine)
@@ -218,6 +224,50 @@ def _plans(conn: sqlite3.Connection) -> dict[int, list[tuple[sqlite3.Row, list[s
         plans.setdefault(int(plan["task_id"]), []).append(
             (plan, paths.get(int(plan["id"]), [])))
     return plans
+
+
+def _decisions(conn: sqlite3.Connection) -> dict[int, list[dict]]:
+    """Every decision by plan, in order, with its options and the answer if it has one;
+    none from a store before v4, which has no decisions table."""
+    if _version(conn) < 4:
+        return {}
+    options: dict[int, list[sqlite3.Row]] = {}
+    for o in conn.execute("SELECT * FROM decision_options ORDER BY decision_id, position"):
+        options.setdefault(int(o["decision_id"]), []).append(o)
+    answers = {int(a["decision_id"]): a for a in conn.execute("SELECT * FROM answers")}
+    chosen: dict[int, set[int]] = {}
+    for c in conn.execute("SELECT * FROM answer_options"):
+        chosen.setdefault(int(c["decision_id"]), set()).add(int(c["position"]))
+    found: dict[int, list[dict]] = {}
+    for d in conn.execute("SELECT * FROM decisions ORDER BY plan_id, position"):
+        did = int(d["id"])
+        found.setdefault(int(d["plan_id"]), []).append(
+            {"row": d, "options": options.get(did, []), "answer": answers.get(did),
+             "chosen": chosen.get(did, set())})
+    return found
+
+
+def _decision(decision: dict) -> list[str]:
+    d, answer = decision["row"], decision["answer"]
+    kind = "multi-select" if d["multi_select"] else "single choice"
+    # Numbered by position, from 0, as `approve` names a decision and its options.
+    lines = ["", f"Decision at position {int(d['position'])}, {kind}:", "",
+             block(d["question"]),
+             "", "Why the refiner could not settle it:", "", block(d["why"])]
+    for o in decision["options"]:
+        marks = [m for m, on in (("assumed by the plan", o["assumed"]),
+                                 ("**CHOSEN**", int(o["position"]) in decision["chosen"]))
+                 if on]
+        lines += ["", f"Option at position {int(o['position'])} {inline(o['label'])}"
+                      + "".join(f", {m}" for m in marks) + ":", "", block(o["meaning"])]
+    if answer is None:
+        lines += ["", "Not answered."]
+    else:
+        lines += ["", f"Answered by {inline(answer['author'])} {when(answer['created_at'])}"
+                      + (", other:" if answer["other"] is not None else ".")]
+        if answer["other"] is not None:
+            lines += ["", block(answer["other"])]
+    return lines
 
 
 def _plan_line(plan: sqlite3.Row) -> str:

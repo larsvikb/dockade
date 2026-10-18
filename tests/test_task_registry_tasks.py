@@ -27,19 +27,26 @@ _V2_CLAIMS = """CREATE TABLE claims (
     progress TEXT, claimed_at REAL NOT NULL, expires_at REAL NOT NULL);"""
 
 
+#: The tables v4 added, in an order they can be dropped in.
+V4_TABLES = ("answer_options", "answers", "decision_options", "decisions")
+
+
 def as_version(path: str, version: int) -> None:
-    """Take the store at ``path`` back to ``version``, 2 or older: its claims in the
-    table as it was then, a claim to refine with the branch its refiner had to invent,
-    and below 2 no plan tables."""
+    """Take the store at ``path`` back to ``version``, 3 or older: no decision tables;
+    below 3 its claims in the table as it was then, a claim to refine with the branch
+    its refiner had to invent; and below 2 no plan tables."""
+    script = "".join(f"DROP TABLE {t};" for t in V4_TABLES)
+    if version < 3:
+        script += ("ALTER TABLE claims RENAME TO claims_v3;"  # noqa: S608 (fixed text)
+                   + _V2_CLAIMS
+                   + "INSERT INTO claims SELECT task_id, holder, "
+                     "COALESCE(branch, 'invented'), token_hash, footprint, progress, "
+                     "claimed_at, expires_at FROM claims_v3; DROP TABLE claims_v3;")
+    if version < 2:
+        script += "DROP TABLE plan_paths; DROP TABLE plans;"
     conn = sqlite3.connect(path)
     try:
-        conn.executescript(
-            "ALTER TABLE claims RENAME TO claims_v3;" + _V2_CLAIMS  # noqa: S608 (fixed text)
-            + "INSERT INTO claims SELECT task_id, holder, COALESCE(branch, 'invented'), "
-              "token_hash, footprint, progress, claimed_at, expires_at FROM claims_v3;"
-              "DROP TABLE claims_v3;"
-            + ("DROP TABLE plan_paths; DROP TABLE plans;" if version < 2 else "")
-            + f"PRAGMA user_version = {version};")
+        conn.executescript(script + f"PRAGMA user_version = {version};")
     finally:
         conn.close()
 
@@ -497,11 +504,53 @@ class SchemaTests(_Store):
         reg.taskdb.init()
         self.assertEqual([c[2] for c in self.claims()], [None, None, "fix-it"])
 
+    def tables(self) -> set[str]:
+        with reg.taskdb.reading() as conn:
+            return {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'")}
+
+    def test_each_older_store_and_an_unversioned_one_gain_the_decision_tables(self):
+        # 0 is a v1-shaped store whose user_version was never set, as the other
+        # migration tests build it, not a file `_SCHEMA` never ran in.
+        for version in (3, 2, 1, 0):
+            with self.subTest(version=version):
+                reg.taskdb.DB_PATH = os.path.join(self.dir, f"plans-v{version}.db")
+                reg.taskdb.init()
+                op.add_repo("widgets")
+                task = op.create("widgets", "A task", "B", "proposed")["task"]
+                as_version(reg.taskdb.DB_PATH, version)
+                self.assertEqual(self.tables() & set(V4_TABLES), set())
+                reg.taskdb.init()
+                with reg.taskdb.reading() as conn:
+                    self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],
+                                     reg.taskdb.SCHEMA_VERSION)
+                self.assertLessEqual(set(V4_TABLES), self.tables())
+                self.assertEqual(reads.get_task(task)["answers"], [])
+
+    def test_a_v3_stores_plans_open_with_no_decisions_and_take_them_after(self):
+        task = self.propose()
+        token = agent.claim_plan(ALICE, "widgets", task, ["."])["token"]
+        plan = dict(approach="A.", footprint=["src"], tests="T.", out_of_scope="None.",
+                    risks="R.", review_rounds=1, review_verdict="Passes.")
+        agent.submit_plan(ALICE, "widgets", task, token, **plan)
+        as_version(reg.taskdb.DB_PATH, 3)
+        reg.taskdb.init()
+        self.assertEqual(reads.get_task(task)["plan"]["decisions"], [])
+        op.approve(task, self.revision(task))
+        self.assertEqual(reads.get_task(task)["state"], "open")
+        other = self.propose("Another")
+        token = agent.claim_plan(ALICE, "widgets", other, ["."])["token"]
+        agent.submit_plan(ALICE, "widgets", other, token, **plan, decisions=[{
+            "question": "Q?", "why": "W.", "assumes": ["A"],
+            "options": [{"label": "A", "meaning": "a"}, {"label": "B", "meaning": "b"}]}])
+        self.assertEqual(len(reads.get_task(other)["plan"]["decisions"]), 1)
+
     def test_a_new_store_is_at_the_current_version(self):
         with reg.taskdb.reading() as conn:
             self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],
                              reg.taskdb.SCHEMA_VERSION)
-        self.assertEqual(reg.taskdb.SCHEMA_VERSION, 3)
+        self.assertEqual(reg.taskdb.SCHEMA_VERSION, 4)
+        self.assertEqual(reg.taskdb.OPENS, (0, 1, 2, 3, 4))
 
     def test_a_store_from_another_schema_version_is_refused(self):
         conn = sqlite3.connect(reg.taskdb.DB_PATH)

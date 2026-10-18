@@ -262,6 +262,117 @@ class ApprovalTests(_Store):
         self.assertEqual(self.got()["state"], "refined")
 
 
+DECISION = {"question": "Hold infra traffic, or deny it?",
+            "why": "The design names both and picks neither.",
+            "options": [{"label": "Hold", "meaning": "The operator answers each."},
+                        {"label": "Deny", "meaning": "Refused outright."}],
+            "assumes": ["Hold"]}
+MULTI = {"question": "Which logs keep a rotation?", "why": "A retention question.",
+         "options": [{"label": "Audit", "meaning": "The audit log."},
+                     {"label": "Access", "meaning": "The access log."},
+                     {"label": "Debug", "meaning": "The debug log."}],
+         "assumes": ["Audit", "Access"], "multi_select": True}
+
+
+def shown(decision: dict) -> dict:
+    """``decision`` as a read shows it."""
+    return {"question": decision["question"], "why": decision["why"],
+            "multi_select": decision.get("multi_select", False),
+            "options": [o | {"assumed": o["label"] in decision["assumes"]}
+                        for o in decision["options"]]}
+
+
+class DecisionTests(_Store):
+    def test_a_plans_decisions_read_back_as_handed_in(self):
+        reply = self.plan(decisions=[DECISION, MULTI])
+        self.assertEqual(self.got()["plan"]["decisions"], [shown(DECISION), shown(MULTI)])
+        self.assertEqual(reads.task_plans(self.task)[0]["decisions"],
+                         [shown(DECISION), shown(MULTI)])
+        last = op.history(self.task)["history"][-1]
+        self.assertEqual((last["detail"]["plan"], last["detail"]["decisions"]),
+                         (reply["plan"], [shown(DECISION), shown(MULTI)]))
+
+    def test_none_is_normal(self):
+        self.plan()
+        self.assertEqual(self.got()["plan"]["decisions"], [])
+        self.plan(who=BOB, decisions=())
+        self.assertEqual(self.got()["plan"]["decisions"], [])
+
+    def test_each_rule_of_a_decision_is_refused_at_its_edge(self):
+        token = self.claim()
+        five = [{"label": f"L{i}", "meaning": "m"} for i in range(plans.OPTIONS_MAX)]
+
+        def with_(**changes):
+            return DECISION | changes
+
+        good = {
+            "the most decisions": [DECISION] * plans.DECISIONS_MAX,
+            "the most options": [with_(options=five, assumes=["L0"])],
+            "every text at its cap": [with_(
+                question="q" * plans.DECISION_TEXTS["question"],
+                why="w" * plans.DECISION_TEXTS["why"],
+                options=[{"label": "l" * plans.OPTION_TEXTS["label"],
+                          "meaning": "m" * plans.OPTION_TEXTS["meaning"]},
+                         {"label": "Other", "meaning": "m"}],
+                assumes=["Other"])],
+            "a multi-select assuming every option": [MULTI | {
+                "assumes": ["Audit", "Access", "Debug"]}],
+            "multi_select false": [with_(multi_select=False)],
+        }
+        bad = {
+            "not a list": DECISION,
+            "one too many": [DECISION] * (plans.DECISIONS_MAX + 1),
+            "not an object": ["Hold or deny?"],
+            "an unknown field": [with_(answer=0)],
+            "a missing field": [{k: v for k, v in DECISION.items() if k != "why"}],
+            "a blank question": [with_(question=" ")],
+            "a question past its cap": [with_(
+                question="q" * (plans.DECISION_TEXTS["question"] + 1))],
+            "a why past its cap": [with_(why="w" * (plans.DECISION_TEXTS["why"] + 1))],
+            "one option": [with_(options=DECISION["options"][:1])],
+            "one option too many": [with_(options=[*five, {"label": "X", "meaning": "m"}],
+                                          assumes=["L0"])],
+            "an option not an object": [with_(options=["Hold", "Deny"])],
+            "an option with an unknown field": [with_(options=[
+                DECISION["options"][0] | {"assumed": True}, DECISION["options"][1]])],
+            "an option with no meaning": [with_(options=[{"label": "Hold"},
+                                                         DECISION["options"][1]])],
+            "a label past its cap": [with_(options=[
+                {"label": "l" * (plans.OPTION_TEXTS["label"] + 1), "meaning": "m"},
+                DECISION["options"][1]])],
+            "a meaning past its cap": [with_(options=[
+                {"label": "Hold", "meaning": "m" * (plans.OPTION_TEXTS["meaning"] + 1)},
+                DECISION["options"][1]])],
+            "two labels alike": [with_(options=[DECISION["options"][0],
+                                                {"label": " hold", "meaning": "m"}])],
+            "assuming none": [with_(assumes=[])],
+            "assuming two of a single choice": [with_(assumes=["Hold", "Deny"])],
+            "assuming an unknown label": [with_(assumes=["hold"])],
+            "assuming by position": [with_(assumes=[0])],
+            "assumes not a list": [with_(assumes="Hold")],
+            "a multi-select assuming none": [MULTI | {"assumes": []}],
+            "a multi-select assuming one twice": [MULTI | {"assumes": ["Audit", "Audit"]}],
+            "multi_select not a flag": [with_(multi_select=1)],
+        }
+        for case, decisions in bad.items():
+            with self.subTest(case):
+                self.refused(agent.submit_plan, ALICE, "widgets", self.task, token,
+                             **(PLAN | {"decisions": decisions}))
+        self.assertEqual(self.got()["state"], "proposed")
+        for case, decisions in good.items():
+            with self.subTest(case):
+                plans.check_decisions(decisions)
+        agent.submit_plan(ALICE, "widgets", self.task, token,
+                          **(PLAN | {"decisions": good["the most decisions"]}))
+
+    def test_a_superseded_plan_keeps_its_decisions(self):
+        first = self.plan(decisions=[DECISION])["plan"]
+        self.claim(who=BOB)
+        got = self.got()["plan"]
+        self.assertEqual((got["id"], got["decisions"]), (first, [shown(DECISION)]))
+        self.assertIsNotNone(got["superseded_at"])
+
+
 class OverlapTests(_Store):
     def test_a_plan_is_told_of_the_plans_and_claims_it_overlaps(self):
         planned = self.plan(footprint=["src"])["plan"]

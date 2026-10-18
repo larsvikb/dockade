@@ -25,8 +25,9 @@ import taskdb
 #: The registry's tables: a file without every one is not a registry store, but for
 #: the ones a later version added, which a store from before it lacks.
 TABLES = ("repos", "tasks", "claims", "blockers", "notes", "history", "plans",
-          "plan_paths")
-ADDED_IN = {"plans": 2, "plan_paths": 2}
+          "plan_paths", "decisions", "decision_options", "answers", "answer_options")
+ADDED_IN = {"plans": 2, "plan_paths": 2, "decisions": 4, "decision_options": 4,
+            "answers": 4, "answer_options": 4}
 
 #: What a snapshot and a restore report counting.
 COUNTED = ("repos", "tasks", "notes")

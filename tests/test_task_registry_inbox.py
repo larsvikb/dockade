@@ -12,6 +12,7 @@ import unittest
 from unittest import mock
 
 from _loader import load_task_registry
+from test_task_registry_plans import DECISION, MULTI
 
 reg = load_task_registry()
 agent, op, reads = reg.agent_moves, reg.operator_moves, reg.reads
@@ -162,8 +163,16 @@ class SectionTests(_Store):
         [row] = self.section("triage")["tasks"]
         plan = reads.get_task(task)["plan"]["id"]
         self.assertEqual(row["reasons"], [{"why": "refined", "since": refined_at,
-                                           "plan": plan, "review_rounds": 2}])
+                                           "plan": plan, "review_rounds": 2,
+                                           "decisions": 0}])
         self.assertEqual(row["title"], "Rotate the keys")
+
+    def test_a_refined_reason_counts_its_plans_decisions(self):
+        task = self.proposal()
+        agent.submit_plan(ALICE, "widgets", task, self.claim(task),
+                          **PLAN, decisions=[DECISION, MULTI])
+        [reason] = self.rows("triage")[task]["reasons"]
+        self.assertEqual(reason["decisions"], 2)
 
     def test_a_task_claimed_back_for_rework_leaves_the_inbox(self):
         refined, landing = self.refined(), self.landing()

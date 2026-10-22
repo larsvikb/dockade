@@ -47,10 +47,12 @@ eventually be wrong. The failure direction is the one that matters: an unreachab
 control plane refuses the call rather than running it, so an outage cannot become a
 default-allow wearing a disguise.
 
-**Every refusal reaches the agent as a RESULT, not a protocol error**, generalising what
-`DESIGN.md` already required of the pending answer. An agent can act on a result — read
-the reason, do something else, come back — where an error is something it records as a
-failed call, carrying nothing it can use. The corollary is that the text has to carry
+**Every decision reaches the agent as a RESULT, not a protocol error**, generalising what
+`DESIGN.md` already required of the pending answer. Only a malformed request — no tool
+name, or arguments that are not an object — gets a JSON-RPC error, since nothing decided
+it. An agent can act on a result — read the reason, do something else, come back —
+where an error is something it records as a failed call, carrying nothing it can use.
+The corollary is that the text has to carry
 the distinction the agent needs: a `deny` says retrying will not help, a pending ask
 says come back with the same id, and a `denied`/`expired`/`spent` approval says the
 matter is final. An agent that cannot tell a refusal from a delay retries one forever,

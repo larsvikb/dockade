@@ -1311,7 +1311,7 @@ running sandbox, the agent-facing one as a **positive control** so that a silent
 
 What the gateway shows the agent and what it runs — the two axes and the order they
 landed in, why nothing runs before the control plane has answered, and why every
-refusal reaches the agent as a result — is the gateway's own code, and is designed in
+decision reaches the agent as a result — is the gateway's own code, and is designed in
 `tool-gateway/DESIGN.md` → "What is shown, and what runs". How several servers share
 the agent's one namespace, and which of a server's fields cross into it, is beside it
 in "What the tool list carries".

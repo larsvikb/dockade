@@ -120,6 +120,14 @@ class DecisionTests(ExecutionTestCase):
         self.execute.call("mcp-github__get_issue", args, "172.30.0.5")
         self.assertEqual(self.asked[0][1]["args"], args)
 
+    def test_an_allowed_call_runs_with_the_arguments_that_were_decided(self):
+        # Below the protocol layer, which refuses `false` before it gets here. The
+        # executor substitutes nothing on its own: it used to run this as `{}`.
+        self.answer = {"decision": "allow", "reason": "ok"}
+        self.execute.call("mcp-github__get_issue", False, None)
+        self.assertIs(self.asked[0][1]["args"], False)
+        self.assertIs(self.called[0]["message"]["params"]["arguments"], False)
+
     def test_a_deny_dials_nothing(self):
         # The assertion that matters is the empty call list, not the sentence.
         self.answer = {"decision": "deny", "reason": "no rule for 'delete_repo'"}
@@ -253,6 +261,21 @@ class ResumeTests(ExecutionTestCase):
         self.resume({"approval_id": APPROVAL, "title": "smuggled"})
         self.assertEqual(self.called[0]["message"]["params"]["arguments"],
                          {"title": "approved"})
+
+    def test_approved_arguments_run_as_shown_even_when_falsy(self):
+        # The card showed `false`, so `false` is sent: no `{}` substituted on the way.
+        self.answer = {"ok": True, "status": "allowed", "server": "mcp-github",
+                       "tool": "create_pr", "args_json": "false"}
+        self.resume()
+        self.assertIs(self.called[0]["message"]["params"]["arguments"], False)
+
+    def test_approved_null_arguments_are_sent_as_null(self):
+        # Only an ask stored before the protocol layer made absent arguments `{}` can
+        # carry this. A `{}` fallback here would run what the card did not show.
+        self.answer = {"ok": True, "status": "allowed", "server": "mcp-github",
+                       "tool": "create_pr", "args_json": "null"}
+        self.resume()
+        self.assertIsNone(self.called[0]["message"]["params"]["arguments"])
 
     def test_a_pending_approval_is_not_an_error_and_runs_nothing(self):
         # The question the whole pending design turns on: still waiting is a delay,

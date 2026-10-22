@@ -80,9 +80,22 @@ them to the maintainer after triage, since a fix can change what the host must c
     symlinks the main checkout's `.env` and `models/` into the worktree, since the
     Makefile passes no `--env-file`;
   - before it starts the control plane, runs `make backup`, because the store's volume
-    is the live one; and ends by saying the live stack and store may now be the
-    branch's, and what puts them back from the main checkout: `make up`, and
-    `make restore FILE=…` from that backup if the check wrote to the store.
+    is the live one; and ends by saying the live stack may now be the branch's, and
+    what puts it back from the main checkout:
+    - always `make up`, and `make tasks-up` if the check started the registry, since
+      `make up` leaves it alone;
+    - the store is kept, so its rows stay the record: the audit since the backup
+      lists what the check changed, by script or by hand, to undo in the approval UI
+      (a revoked lease or pin comes back only by a new grant), and the check's
+      pending cards are denied rather than left;
+    - only when the branch changed what a store holds — a `SCHEMA_VERSION` bump, or a
+      value main would read differently — a restore, which drops that store's rows
+      since the backup. Main's images first, since a restore runs in the built image
+      and restarts without rebuilding: `make up`, which fails on the newer store but
+      builds them, then `make restore FILE=…` with the backup's
+      `dockade-control-<stamp>.db`; for the registry `make tasks-up` (failing the
+      same way), then `make restore-tasks FILE=…` with its `dockade-tasks-<stamp>.db`,
+      then `make tasks-up` again.
 
   It runs on the host with their privileges: keep it short enough to read, and doing
   nothing beyond the check.
@@ -97,14 +110,17 @@ them to the maintainer after triage, since a fix can change what the host must c
   git tracks, so check it by staging it: `git add -N` it, run
   `(cd tests && python3 -m unittest test_docs)`, then `git rm -q --cached` it.
 - Tell the maintainer the verdict and the findings in plain words, before the push.
+- Propose what is left over in the registry with `tasks__propose`, with a severity and
+  a kind; one already filed gets a note instead. With the registry out of reach, ask
+  the maintainer to start it (`make tasks-up`), and keep the report until they are
+  proposed.
 - Add one line to `local-review-log.md` — the PR, the reviewer and how long it took,
   the findings in the diff by severity and what became of them, anything outside the
-  diff — and move what is left over into the sections of `local-todo.md`. Both are
-  the maintainer's untracked files in the main checkout, and a worktree session cannot
-  write them: write an anchored script that makes the edits, dry-run it on a copy,
-  and hand it to the maintainer to run from the main checkout.
+  diff. It is the maintainer's untracked file in the main checkout, and a worktree
+  session cannot write it: write an anchored script that makes the edit, dry-run it
+  on a copy, and hand it to the maintainer to run from the main checkout.
 - When the log shows a pattern that changes the reviewer's brief or this skill, the
   commit that changes it states the evidence in its message: the log is untracked, and
   the reason for a committed change must not be. A finding about reviews that would
   hold in another repo is evidence for `NOTES.md` instead.
-- Delete the report once the branch is pushed.
+- Delete the report once the branch is pushed and its leftovers are proposed.

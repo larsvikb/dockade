@@ -2341,7 +2341,7 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | outcomes ingested — second stream, `status` column, `outcome` in the audit vocabulary | **done** — one approval id now selects the hold, the answer, the claim and the result |
 | — | task registry — the store, the agent listener (MCP, behind the gateway's secret), the operator API | **done** |
 | — | task registry as a service — `tasks` behind a profile on `mcp-net` + `tasks-operator-net`, one listener per leg | **done** |
-| — | task registry, agent side — where the id comes from in the image's instructions, dockade's repo name and checkpoints in `CLAUDE.md`, the id in the status line | **done** — `inflight.md` and `local-todo.md` stay the record beside it |
+| — | task registry, agent side — where the id comes from in the image's instructions, dockade's repo name and checkpoints in `CLAUDE.md`, the id in the status line | **done** — `inflight.md` stays the record of branches beside it; new work is proposed in it |
 | — | task registry backups — its store and a markdown export in `make backup`, `make restore-tasks` | **done** |
 | — | task registry view — the operator listener's one client | **done** — reads, and the operator's writes: moves, breaking a claim, notes and the moves on them |
 | — | the task registry's own UI — `tasks-ui`, on another origin and with no `control-net` leg; what both UIs share in `ui-common/` | **done** — the approval page links to it; the page opens on an inbox worked out from task state |

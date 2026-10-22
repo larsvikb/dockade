@@ -314,6 +314,9 @@ dockade/
     app.js                  #   the page's entry: mount, ask, poll while it answers
     tasks.js                #   the work list, its not-running state, agent prose with
                             #   hidden characters spelled out
+    moves.js                #   the page's writes: what each sends, which a task or note
+                            #   offers, and what a lost answer came to
+    diff.js                 #   what changed between two plans, word by word
     index.html              #   static shell + styles
     DESIGN.md               #   the relay's table, the not-running state, how prose is spelled
     requirements.txt        #   pinned deps, held equal to the approval UI's

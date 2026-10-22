@@ -12,9 +12,11 @@ front of it are the approval UI's, from `ui-common/guards.py`, and what each clo
 The relay's table is the operator's whole say in the registry, since its operator
 listener takes no token; `_RELAY_ROUTES` in `app.py` says what may be on it, and a test
 holds it and the page's fetches equal in both directions, the writes' method too. Its
-writes are the three the page makes: a move, breaking a claim, a note. The bind and the
-peer check are the approval UI's (`app.py`'s docstring); why each matters beside the
-registry is the root `DESIGN.md`'s "Task registry".
+writes are the ones the page makes: on a task, a move, breaking a claim and a note; on
+notes, hiding or showing one, handling one with or without a reply, and handling the
+flagged notes a page showed. The bind and the peer check are the approval UI's
+(`app.py`'s docstring); why each matters beside the registry is the root `DESIGN.md`'s
+"Task registry".
 
 **Where an operator write came from: asserted by the relay, recorded by the registry.**
 The relay drops a client's `x-dockade-actor` and sends the peer it saw, as the approval
@@ -51,23 +53,38 @@ again and decides from it (`checkWrite` in `moves.js`): a move or break whose re
 did not move has not landed yet and cannot land twice, since the revision would refuse a
 second; a note, which names no revision, has landed only if an operator note with its
 text is newer than any the page held, and is otherwise "not found yet", never "safe to
-send again", since it may still be committing.
+send again", since it may still be committing. A move on a note has landed if its own
+history entry, naming the note with the value sent, is newer than any the page held; the
+newest page of the timeline carries it wherever the note sits. Absent, a hide, show or
+handle is "not seen", harmless to send again since it sets the same flag, and a reply is
+"not found yet", as a note is; when even the oldest entry on a full page is newer than
+those held, its absence says nothing, and it is not checked. A bulk handle, all or none,
+is decided by the flagged list read from just past the highest note it named, so notes
+flagged since cannot push the named ones off the page: one still listed means none
+landed, and sending again only marks them.
 
 **A note names no revision.** A move and a break name the revision the page showed, so
 a task that changed since is refused, and the page draws the task the refusal carries
 rather than reading again (`task-registry/DESIGN.md`, "The operator API"). A note does
 not: the revision covers a task's spec, state and holder, and a note is none of them
 (`task-registry/DESIGN.md`, "One revision covers content, state, and who holds the
-task"). The lost-answer check above is what keeps one from being sent twice.
+task"). Nor does a move on a note: a hide or a handle changes none of them either, so
+two tabs replying to one note post two replies, which the timeline shows. The
+lost-answer check above is what keeps one from being sent twice.
 
 **The moves are in the detail, below the plan, one at a time.** Only the task read
 beside the list carries them, never an inbox row, so a move is made on what was read.
-Approve and send back are each a control of their own, as a refined task's two
-answers. Approve names the revision and plan it approves and says when what it approves
-hides a character, and a move that ends a claim names its holder. One write is out at a
-time, its controls off until its outcome is drawn, and the poll never redraws the
-detail, so no button moves under the pointer between two clicks. No move asks to be
-confirmed: each is recorded and undone by another move.
+The moves on a note sit under it in the timeline, on every page of it. The one write
+outside the detail is the flagged list's bulk handle (below), which names the notes a
+page drew rather than a task. Approve and send back are each a control of their own, as
+a refined task's two answers. Approve names the revision and plan it approves and says
+when what it approves hides a character, and a move that ends a claim names its holder.
+One write is out at a time, its controls off until its outcome is drawn, the flagged
+list's too, and the poll never redraws the detail, so no button moves under the pointer
+between two clicks. No move asks to be confirmed: each is recorded and undone by another
+move, but a reply, which can be hidden and never removed. A move on a note touches
+neither the task's spec nor its revision, so whatever holds the task's moves leaves it
+free, as it leaves adding a note.
 
 **The inbox: whose turn it is, worked out.** The page opens on what is the operator's
 turn rather than on the backlog, as Gerrit's attention set does. `operator_moves.inbox`
@@ -82,6 +99,38 @@ come whole, never a page of them. A deferred or closed task is out of it: deferr
 closing is the operator's own decision, so it is nobody's turn until reopened, and a
 flagged note on it waits with it and comes back when it is. Every
 task is a view away, under All tasks.
+
+**The flagged notes are listed above the inbox, for handling together.** A flagged note
+puts its task in the inbox with a count, unless the task is deferred or closed, but a
+bulk handle names the notes a page showed, never a filter (`task-registry/DESIGN.md`,
+"Notes"), and a count names none. So the inbox view opens on the notes themselves, the
+newest page of the flagged list. This partly reverses #226, which replaced a "For you"
+table of them with the inbox's rows and dropped the relayed read; those rows and the
+title's count stay as it made them. A row is a box to select it, its task to open, who
+wrote it and when, and the note spelled; "handle selected" sends the notes both selected
+and drawn, in the order drawn. Hide, show and reply are on the note in the timeline, not
+here. The list carries notes on a deferred or closed task too, each with its task's
+state: such a note waits with its task and comes back to the inbox when it is reopened,
+so handling it by accident would lose it for good. Its row says the state as of the
+draw, "select all shown" leaves it out when the draw or the last good read says its task
+is parked, and it is handled only when ticked on its own. A tick records whether its row
+is marked parked, the only informed choice of such a note, so a note whose task was
+parked since the draw, seen by a redraw or only by a poll, is never sent: a redraw
+un-ticks it, and the bulk and its count leave it out, named beside the handle and in the
+outcome. A task parked in another tab after the last poll and before the click is not
+seen, so its note can be sent: it takes two tabs and a click within one poll interval,
+and a registry guard that would close it is a follow-up task; the count line says how
+many such notes the read holds, so its total and the inbox's can be told apart. Rows are
+drawn only from a read the operator caused, or the first since the registry answered:
+one after a move on notes or on a task, which can park or reopen a drawn note's task,
+drawn while that write's controls are still off, one on coming back from All tasks, and
+"show them". Every other read, the poll's, rewrites only a count line whose space is
+kept: how many are not handled, how many are not shown, how many are gone since the draw
+and how many are on a task deferred, closed or reopened since, elsewhere, with "show
+them" when any is. The block sits above the sections the poll redraws, its rows in a box
+of fixed height, so neither moves the other. A note handled or hidden elsewhere stays
+drawn until a draw; handling it again only marks it again, a second entry in its
+history. A bulk's outcome stays over the list until the next bulk or All tasks.
 
 **The task is read beside the list, and the hash names it.** Opening a task, closing it
 or changing view sets the URL's hash (`parseHash`, `hashFor`), and the page follows the

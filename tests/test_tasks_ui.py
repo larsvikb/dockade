@@ -33,8 +33,10 @@ def _load(name: str = "dockade_tasks_ui") -> types.ModuleType:
 
 tui = _load()
 
-#: The writes the relay passes, each as the page posts it.
-WRITES = ("api/tasks/12/move", "api/tasks/12/break-claim", "api/tasks/12/notes")
+#: The writes the relay passes, each as the page posts it: the three on a task, and the
+#: three on notes, which name no task.
+WRITES = ("api/tasks/12/move", "api/tasks/12/break-claim", "api/tasks/12/notes",
+          "api/notes/hide", "api/notes/3/handle", "api/notes/handle")
 
 
 class RelayTests(unittest.TestCase):
@@ -48,14 +50,14 @@ class RelayTests(unittest.TestCase):
     def test_the_reads_reach_the_registry(self):
         for path in ("api/repos", "api/tasks", "api/tasks/12",
                      "api/tasks/12/history", "api/tasks/12/plans", "api/inbox",
-                     "api/search"):
+                     "api/notes/flagged", "api/search"):
             with self.subTest(path=path):
                 resp = self._proxy(path)
                 self.assertNotEqual(resp.status_code, 403)
                 self.assertEqual((sent["method"], sent["url"]),
                                  ("GET", f"{tui.REGISTRY_URL}/{path}"))
 
-    def test_the_three_writes_reach_it_as_posts(self):
+    def test_the_writes_reach_it_as_posts(self):
         for path in WRITES:
             with self.subTest(path=path):
                 resp = self._proxy(path, "POST")
@@ -64,7 +66,7 @@ class RelayTests(unittest.TestCase):
                                  ("POST", f"{tui.REGISTRY_URL}/{path}"))
 
     def test_nothing_else_reaches_it(self):
-        # Every other write, and the three by another method or with another id; an id
+        # Every other write, and the writes by another method or with another id; an id
         # that is not digits, or too long; the old prefix; the control plane's paths;
         # the agent listener's; the pages FastAPI would add.
         for path, method in (("api/tasks", "POST"), ("api/tasks/12/edit", "POST"),
@@ -76,11 +78,13 @@ class RelayTests(unittest.TestCase):
                              ("api/tasks/abc/move", "POST"),
                              ("api/tasks/12/move/x", "POST"),
                              ("api/tasks/12345678901234567890/notes", "POST"),
-                             ("api/notes/hide", "POST"), ("api/notes/handle", "POST"),
-                             ("api/notes/3/handle", "POST"),
+                             ("api/notes/hide", "GET"), ("api/notes/handle", "GET"),
+                             ("api/notes/3/handle", "GET"),
+                             ("api/notes/abc/handle", "POST"),
+                             ("api/notes/12345678901234567890/handle", "POST"),
+                             ("api/notes/3/hide", "POST"), ("api/notes/3", "GET"),
+                             ("api/notes/flagged", "POST"),
                              ("api/tasks/12/plans", "POST"), ("api/inbox", "POST"),
-                             # The flagged list the inbox replaced.
-                             ("api/notes/flagged", "GET"),
                              ("api/repos", "POST"), ("api/tasks/abc", "GET"),
                              ("api/tasks/1/../../../api/audit", "GET"),
                              ("api/tasks/12345678901234567890", "GET"),

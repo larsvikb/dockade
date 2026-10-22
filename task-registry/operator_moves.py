@@ -288,7 +288,9 @@ def notes_for_operator(repo: str | None = None, handled: bool = False,
                        before: int | None = None) -> dict:
     """Visible notes an agent marked for the operator, in one repo or all: those not
     yet handled, or with ``handled`` those that were. Newest first, a page at a time
-    with the total; ``before`` pages back past a note."""
+    with the total; ``before`` pages back past a note. Each carries its task's state as
+    ``task_state``: a note on a deferred or closed task is listed here though it waits
+    with its task, out of the inbox (``inbox``), so a reader can tell it apart."""
     tasks.check_flag(handled, "handled")
     if before is not None:
         tasks.check_id(before, "note")
@@ -302,9 +304,11 @@ def notes_for_operator(repo: str | None = None, handled: bool = False,
             args.append(tasks.repo_id(conn, repo))
         total = conn.execute("SELECT COUNT(*) " + where, args).fetchone()[0]
         page = conn.execute(
-            "SELECT n.* " + where + " AND (? IS NULL OR n.id < ?) ORDER BY n.id DESC "
-            "LIMIT ?", [*args, before, before, PAGE])
-        return {"notes": [notes.shown(r) for r in page], "total": total}
+            "SELECT n.*, t.state AS task_state " + where
+            + " AND (? IS NULL OR n.id < ?) ORDER BY n.id DESC LIMIT ?",
+            [*args, before, before, PAGE])
+        return {"notes": [{**notes.shown(r), "task_state": r["task_state"]} for r in page],
+                "total": total}
 
 
 def history(task: int, before: int | None = None) -> dict:

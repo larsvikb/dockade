@@ -263,7 +263,9 @@ waits on it. An agent that cannot go on without an answer sends the task back to
 `proposed` or releases it, and takes other work: nothing in the registry holds an agent,
 so the operator works through it at their own pace. The store cannot make an agent do
 that; the tool descriptions say it. `operator_moves.notes_for_operator` lists the
-flagged notes not yet handled, a page at a time with the total. The operator marks one
+flagged notes not yet handled, a page at a time with the total, each with its task's
+state, since a note on a deferred or closed task is listed there while it waits out of
+the inbox with its task. The operator marks one
 handled, posting a reply in the same write if there is one, which names the note it
 answers; agents see both, so the next session knows the note was seen to and which reply
 is its answer, and unlike hiding, marking it takes the note from no one.

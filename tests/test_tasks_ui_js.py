@@ -14,6 +14,7 @@ import re
 import subprocess
 import unittest
 
+from _loader import load_operator_api
 from test_control_plane_ui_js import (
     _NODE,
     _STRICT,
@@ -396,6 +397,9 @@ class TaskViewTests(unittest.TestCase):
         moves = (ROOT / "task-registry" / "operator_moves.py").read_text()
         self.assertIn(f"LIST_MAX = {self.probe['page_max']}\n", reads)
         self.assertIn(f"PAGE = {self.probe['page_max']}\n", moves)
+        # A bulk handle names the flagged notes a page drew, so a page must fit in one.
+        bulk_max = int(re.search(r"^BULK_MAX = (\d+)$", moves, re.M).group(1))
+        self.assertLessEqual(self.probe["page_max"], bulk_max)
 
     def test_the_poll_is_slower_than_the_policy_views(self):
         self.assertGreater(self.probe["poll_ms"], 4000)
@@ -633,6 +637,467 @@ class MoveTests(unittest.TestCase):
         self.assertEqual(texts["refused"]["text"], "Approve: refused. no\\u202e")
 
 
+_NOTE_MOVES_PROBE = r"""
+import { pathToFileURL } from "node:url";
+const t = await import(pathToFileURL(`${process.env.DOCKADE_UI_DIR}/tasks.js`).href);
+const m = await import(pathToFileURL(`${process.env.DOCKADE_UI_DIR}/moves.js`).href);
+// What each write puts on the wire, with fetch stubbed: its path, method and body.
+const sent = [];
+globalThis.fetch = (url, opts) => {
+  sent.push({url, method: opts.method, body: JSON.parse(opts.body)});
+  return Promise.resolve({status: 200, text: async () => '{"ok": true}'});
+};
+const base = {task: "7", revision: 4, lastNote: 12, lastEntry: 100};
+const writes = {
+  hide: {...base, kind: "hide", note: 10, hidden: true},
+  show: {...base, kind: "hide", note: 10, hidden: false},
+  handle: {...base, kind: "handle", note: 10, handled: true, reply: null},
+  reply: {...base, kind: "handle", note: 10, handled: true, reply: "Seen."},
+  unhandle: {...base, kind: "handle", note: 10, handled: false, reply: null},
+  handle_many: {kind: "handle-many", task: null, notes: [9, 5]},
+};
+const wire = {};
+for (const [key, w] of Object.entries(writes)) {
+  sent.length = 0;
+  await m.sendWrite(w);
+  wire[key] = sent[0];
+}
+sent.length = 0;
+let unknown_threw = false;
+try { m.sendWrite({...base, kind: "delete"}); } catch (e) { unknown_threw = true; }
+const unknown = {threw: unknown_threw, sent: sent.length};
+
+const note = (extra = {}) => ({id: 10, task: 7, author: "claude-a", text: "x",
+                               for_operator: false, handled: false, hidden: false,
+                               ...extra});
+const moves = n => m.noteMovesFor(n).map(mv => [mv.kind, mv.value, mv.verb,
+                                                Boolean(mv.reply)]);
+// A task read again after a lost note move: its newest timeline page.
+const entry = (id, action, detail) => ({id, action, detail, author: "operator"});
+const after = (history, total = history.length) => ({
+  task: {id: 7, revision: 4, notes: []}, held: {timeline: {history, total}, plans: []}});
+const full = Array.from({length: 50}, (_, i) => entry(200 + i, "update", {}));
+const named = {kind: "handle-many", task: null, notes: [9, 5], verb: "handle 2 notes"};
+const flagged = ids => ({flagged: {notes: ids.map(id => ({id})), total: ids.length}});
+const flood = Array.from({length: 60}, (_, i) => 1000 + i);
+console.log(JSON.stringify({
+  wire, unknown,
+  is_note_move: ["hide", "handle", "handle-many", "note", "move", "break"]
+    .map(kind => m.isNoteMove({kind})),
+  moves: {
+    plain: moves(note()),
+    hidden: moves(note({hidden: true})),
+    flagged: moves(note({for_operator: true})),
+    handled: moves(note({for_operator: true, handled: true})),
+    flagged_hidden: moves(note({for_operator: true, hidden: true})),
+    no_id: moves({text: "x"}),
+    none: moves(null),
+  },
+  bulk: {
+    drawn_order: m.bulkHandle(new Set([5, 3, 9]), [{id: 9}, {id: 4}, {id: 3}, {id: 5}]),
+    undrawn: m.bulkHandle(new Set([5, 77]), [{id: 9}, {id: 5}]),
+    none: m.bulkHandle(new Set(), [{id: 9}]),
+    from_list: m.bulkHandle([9], [{id: 9}]),
+    nothing_drawn: m.bulkHandle(new Set([9]), null),
+  },
+  check: {
+    hide_found: m.checkWrite(writes.hide, after([entry(101, "hide_note",
+                                                       {note_id: 10, hidden: true})])),
+    hide_held: m.checkWrite(writes.hide, after([entry(100, "hide_note",
+                                                      {note_id: 10, hidden: true})])),
+    hide_other_value: m.checkWrite(writes.hide, after([entry(101, "hide_note",
+                                                             {note_id: 10, hidden: false})])),
+    hide_other_note: m.checkWrite(writes.hide, after([entry(101, "hide_note",
+                                                            {note_id: 11, hidden: true})])),
+    show_found: m.checkWrite(writes.show, after([entry(101, "hide_note",
+                                                       {note_id: 10, hidden: false})])),
+    handle_found: m.checkWrite(writes.handle, after([entry(101, "handle_note",
+      {note_id: 10, handled: true, reply: null, reply_id: null})])),
+    handle_missing: m.checkWrite(writes.handle, after([])),
+    handle_as_hide: m.checkWrite(writes.handle, after([entry(101, "hide_note",
+                                                             {note_id: 10, hidden: true})])),
+    reply_found: m.checkWrite(writes.reply, after([entry(101, "handle_note",
+      {note_id: 10, handled: true, reply: "Seen.", reply_id: 30})])),
+    reply_bare_entry: m.checkWrite(writes.reply, after([entry(101, "handle_note",
+      {note_id: 10, handled: true, reply: null, reply_id: null})])),
+    reply_missing: m.checkWrite(writes.reply, after([])),
+    unhandle_found: m.checkWrite(writes.unhandle, after([entry(101, "handle_note",
+      {note_id: 10, handled: false, reply: null, reply_id: null})])),
+    off_the_page: m.checkWrite(writes.hide, after(full, 300)),
+    off_the_page_reply: m.checkWrite(writes.reply, after(full, 300)),
+    full_page_all_there: m.checkWrite(writes.hide, after(full, 50)),
+    failed_read: m.checkWrite(writes.hide, null),
+    no_timeline: m.checkWrite(writes.hide, {task: {id: 7}}),
+    bulk_listed: m.checkWrite(named, flagged([9, 2])),
+    bulk_one_listed: m.checkWrite(named, flagged([5])),
+    bulk_gone: m.checkWrite(named, flagged([2, 1])),
+    bulk_flood_beyond: m.checkWrite(named, flagged([...flood, 9])),
+    bulk_failed: m.checkWrite(named, {flagged: null}),
+    bulk_null: m.checkWrite(named, null),
+  },
+  last_entry: [m.lastEntryId({history: [{id: 3}, {id: 11}, {id: 9}]}),
+               m.lastEntryId({history: []}), m.lastEntryId(null)],
+  parked: {
+    states: m.PARKED_STATES,
+    on: ["open", "deferred", "closed", "landing", undefined]
+      .map(task_state => m.onParkedTask({id: 1, task_state})),
+    none: m.onParkedTask(null),
+    select_all: m.selectAll([{id: 9, task_state: "open"}, {id: 8, task_state: "deferred"},
+                             {id: 7, task_state: "closed"}, {id: 6, task_state: "landing"},
+                             {id: 5}]),
+    select_none: [m.selectAll(null), m.selectAll([{id: 4, task_state: "closed"}])],
+    // Drawn open, read since as deferred: parked by the newer read; and the other way.
+    select_newer: m.selectAll([{id: 9, task_state: "open"}, {id: 8, task_state: "open"},
+                               {id: 7, task_state: "deferred"}],
+                              [{id: 9, task_state: "open"}, {id: 8, task_state: "closed"},
+                               {id: 7, task_state: "open"}]),
+    // Ticks: 9 and 8 while open, 7 while closed, 6 gone from the redraw.
+    kept: [...m.keptSelection(new Map([[9, false], [8, false], [7, true], [6, false]]),
+      [{id: 9, task_state: "open"}, {id: 8, task_state: "deferred"},
+       {id: 7, task_state: "closed"}, {id: 5, task_state: "open"}])],
+    kept_none: [...m.keptSelection(null, [{id: 9}])],
+    tick_mark: [m.tickMark(9, [{id: 9, task_state: "open"}]),
+                m.tickMark(9, [{id: 9, task_state: "closed"}]),
+                m.tickMark(9, [{id: 9, task_state: "deferred"}]),
+                m.tickMark(9, [{id: 8, task_state: "closed"}]), m.tickMark(9, null)],
+    left_out_line: [t.leftOutLine([{id: 15, state: "deferred"}, {id: 3, state: "closed\u202e"}]),
+                    t.leftOutLine([]), t.leftOutLine(undefined)],
+    // Every ordering of tick, poll, redraw and click, as (ticked parked?, drawn copy,
+    // last good read's copy) when the click comes. Note 16 is the one whose task moves.
+    orders: Object.fromEntries(Object.entries({
+      tick_open_then_click: [false, "open", "open"],
+      tick_open_poll_parks_click: [false, "open", "deferred"],
+      tick_open_poll_parks_redraw_click: [false, "deferred", "deferred"],
+      // A poll learned of the park, but the row is still drawn open: not an informed
+      // choice, so its tick marks it open, and it is left out.
+      poll_parks_then_tick_click: [false, "open", "deferred"],
+      redraw_parked_then_tick_click: [true, "deferred", "deferred"],
+      tick_parked_poll_reopens_click: [true, "deferred", "open"],
+      tick_open_parks_then_reopens_click: [false, "open", "open"],
+      tick_open_closed_elsewhere_click: [false, "open", "closed"],
+      tick_open_off_the_read_click: [false, "open", null],
+      tick_open_drawn_parked_off_the_read: [false, "deferred", null],
+    }).map(([name, [mark, shown, read]]) => [name, m.bulkToSend(
+      new Map([[16, mark], [15, false]]),
+      [{id: 16, task_state: shown}, {id: 15, task_state: "open"}],
+      read === null ? [{id: 15, task_state: "open"}]
+        : [{id: 16, task_state: read}, {id: 15, task_state: "open"}])])),
+    send_none: m.bulkToSend(null, [{id: 1}], []),
+    send_undrawn: m.bulkToSend(new Map([[3, false]]), [{id: 1}], [{id: 3}]),
+    redraws: [["hide", "landed"], ["handle", "unknown"], ["handle-many", "refused"],
+              ["move", "landed"], ["move", "stale"], ["move", "not-running"],
+              ["hide", "not-running"], ["break", "landed"], ["note", "landed"]]
+      .map(([kind, result]) => m.redrawsFlagged({kind}, result)),
+    redraws_none: m.redrawsFlagged(null, "landed"),
+  },
+  texts: {
+    hide_flagged: t.outcomeText({...writes.hide, forYou: true, taskState: "open",
+                                 verb: "hide note #10"}, "landed").text,
+    hide_flagged_parked: t.outcomeText({...writes.hide, forYou: true, taskState: "deferred",
+                                        verb: "hide note #10"}, "landed").text,
+    hide_plain: t.outcomeText({...writes.hide, taskState: "open", verb: "hide note #10"},
+                              "landed").text,
+    show_flagged: t.outcomeText({...writes.show, forYou: true, taskState: "open",
+                                 verb: "show note #10"}, "landed").text,
+    show_flagged_parked: t.outcomeText({...writes.show, forYou: true, taskState: "closed",
+                                        verb: "show note #10"}, "landed").text,
+    show_plain: t.outcomeText({...writes.show, taskState: "open", verb: "show note #10"},
+                              "landed").text,
+    not_seen: t.outcomeText({...writes.hide, verb: "hide note #10"}, "not-seen"),
+    reply_not_found: t.outcomeText({...writes.reply, verb: "reply to note #10"},
+                                   "not-found-yet").text,
+    note_check: t.outcomeText({...writes.hide, verb: "hide note #10"},
+                              "could-not-check").text,
+    bulk_refused: t.outcomeText(named, "refused", "note 9 not found").text,
+    bulk_landed: t.outcomeText(named, "landed").text,
+    bulk_left_out: t.outcomeText({...named, notes: [15], verb: "handle 1 note",
+                                  leftOut: [{id: 16, state: "deferred"}]}, "landed").text,
+    bulk_left_out_refused: t.outcomeText({...named, verb: "handle 1 note",
+                                          leftOut: [{id: 16, state: "deferred"}]},
+                                         "refused", "no").text,
+    bulk_found: t.outcomeText(named, "found"),
+    bulk_not_landed: t.outcomeText(named, "not-landed"),
+    bulk_check: t.outcomeText(named, "could-not-check").text,
+    move_refused: t.outcomeText({kind: "move", verb: "approve"}, "refused", "no").text,
+  },
+  line: {
+    same: t.flaggedLine([9, 5], {notes: [{id: 9}, {id: 5}], total: 2}),
+    newer: t.flaggedLine([9, 5], {notes: [{id: 12}, {id: 9}, {id: 5}], total: 3}),
+    gone: t.flaggedLine([9, 5], {notes: [{id: 9}], total: 1}),
+    both: t.flaggedLine([9, 5], {notes: [{id: 12}, {id: 9}], total: 2}),
+    none_left: t.flaggedLine([9], {notes: [], total: 0}),
+    none_drawn_none_left: t.flaggedLine([], {notes: [], total: 0}),
+    failed: t.flaggedLine([9], null),
+    // A full page holds the newest only: a drawn note older than all of it may be
+    // there still, so it is not counted gone.
+    full_page: t.flaggedLine([3, 1000],
+      {notes: Array.from({length: 50}, (_, i) => ({id: 1049 - i})), total: 70}),
+    parked: t.flaggedLine([9, 5, 4], {notes: [{id: 9, task_state: "deferred"},
+      {id: 5, task_state: "open"}, {id: 4, task_state: "closed"}], total: 3}),
+    parked_page: t.flaggedLine([], {notes: Array.from({length: 50}, (_, i) =>
+      ({id: 1049 - i, task_state: i < 2 ? "deferred" : "open"})), total: 70}),
+    // The same notes, but a drawn one's task was deferred since, and another reopened;
+    // a move between two unparked states changes no mark.
+    moved: t.flaggedLine([{id: 9, task_state: "open"}, {id: 5, task_state: "closed"},
+                          {id: 4, task_state: "open"}],
+      {notes: [{id: 9, task_state: "deferred"}, {id: 5, task_state: "proposed"},
+               {id: 4, task_state: "landing"}], total: 3}),
+  },
+}));
+"""
+
+
+@unittest.skipIf(not _NODE and not _STRICT,
+                 "node is not installed — skipping app.js unit tests")
+class NoteMoveTests(unittest.TestCase):
+    """The moves on notes, pure halves under node: what each sends, held to the
+    registry's request bodies, which refuse a field they do not know; which moves a
+    note offers; what a bulk names; how a lost one is decided; what the flagged list's
+    count line says."""
+
+    probe: dict
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        proc = subprocess.run(  # noqa: S603 (absolute path, fixed args, as _probe)
+            [_NODE, "--input-type=module", "-e", _NOTE_MOVES_PROBE],
+            env={**os.environ, "DOCKADE_UI_DIR": str(_served_dir(TASKS_DIR)),
+                 "TZ": "Europe/Stockholm"},
+            capture_output=True, text=True, timeout=60, check=False)
+        if proc.returncode != 0:
+            raise AssertionError("importing moves.js under node failed:\n" + proc.stderr)
+        cls.probe = json.loads(proc.stdout)
+
+    def test_each_note_write_sends_what_its_route_takes(self):
+        # Path, method and body, each body held to the request model the registry's
+        # route reads: an unknown field is refused there (`Body`), and ids and flags
+        # are strict, so a string id or a missing flag would fail only on the host.
+        api = load_operator_api()
+        routes = {"hide": ("/api/notes/hide", api.HideNotes),
+                  "show": ("/api/notes/hide", api.HideNotes),
+                  "handle": ("/api/notes/10/handle", api.HandleNote),
+                  "reply": ("/api/notes/10/handle", api.HandleNote),
+                  "unhandle": ("/api/notes/10/handle", api.HandleNote),
+                  "handle_many": ("/api/notes/handle", api.HandleNotes)}
+        wire = self.probe["wire"]
+        for key, (path, model) in routes.items():
+            with self.subTest(write=key):
+                sent = wire[key]
+                self.assertEqual((sent["url"], sent["method"]), (path, "POST"))
+                self.assertEqual(set(sent["body"]), set(model.__annotations__))
+                for field, value in sent["body"].items():
+                    kind = str(model.__annotations__[field])
+                    if "StrictInt" in kind:
+                        self.assertTrue(all(type(v) is int for v in value), value)
+                    if "StrictBool" in kind:
+                        self.assertIs(type(value), bool)
+        self.assertEqual(wire["hide"]["body"], {"notes": [10], "hidden": True})
+        self.assertEqual(wire["show"]["body"], {"notes": [10], "hidden": False})
+        self.assertEqual(wire["handle"]["body"], {"handled": True, "reply": None})
+        self.assertEqual(wire["reply"]["body"], {"handled": True, "reply": "Seen."})
+        self.assertEqual(wire["unhandle"]["body"], {"handled": False, "reply": None})
+        self.assertEqual(wire["handle_many"]["body"], {"notes": [9, 5], "handled": True})
+        # Each path is one the registry serves, by the route the relay passes.
+        source = (ROOT / "task-registry" / "operator_api.py").read_text()
+        for route in ('@app.post("/api/notes/hide")', '@app.post("/api/notes/{note}/handle")',
+                      '@app.post("/api/notes/handle")'):
+            self.assertIn(route, source)
+
+    def test_an_unknown_write_sends_nothing(self):
+        self.assertEqual(self.probe["unknown"], {"threw": True, "sent": 0})
+
+    def test_the_moves_on_notes_are_told_apart_from_the_rest(self):
+        self.assertEqual(self.probe["is_note_move"],
+                         [True, True, True, False, False, False])
+
+    def test_a_note_offers_hide_or_show_and_handle_or_unhandle(self):
+        mv = self.probe["moves"]
+        self.assertEqual(mv["plain"], [["hide", True, "hide", False]])
+        self.assertEqual(mv["hidden"], [["hide", False, "show", False]])
+        # Handle opens the reply box; only a note flagged for the operator has one.
+        self.assertEqual(mv["flagged"], [["hide", True, "hide", False],
+                                         ["handle", True, "mark handled", True]])
+        self.assertEqual(mv["handled"], [["hide", True, "hide", False],
+                                         ["handle", False, "mark not handled", False]])
+        self.assertEqual(mv["flagged_hidden"], [["hide", False, "show", False],
+                                                ["handle", True, "mark handled", True]])
+        self.assertEqual((mv["no_id"], mv["none"]), ([], []))
+
+    def test_a_bulk_names_what_is_selected_and_drawn_in_drawn_order(self):
+        b = self.probe["bulk"]
+        self.assertEqual(b["drawn_order"], [9, 3, 5])
+        self.assertEqual(b["undrawn"], [5])
+        self.assertEqual((b["none"], b["nothing_drawn"]), ([], []))
+        self.assertEqual(b["from_list"], [9])
+
+    def test_a_lost_note_move_is_found_by_its_own_newer_entry(self):
+        c = self.probe["check"]
+        for key in ("hide_found", "show_found", "handle_found", "reply_found",
+                    "unhandle_found"):
+            with self.subTest(case=key):
+                self.assertEqual(c[key], "found")
+        # Not newer than the page held, another value, another note, another move.
+        for key in ("hide_held", "hide_other_value", "hide_other_note", "handle_missing",
+                    "handle_as_hide"):
+            with self.subTest(case=key):
+                self.assertEqual(c[key], "not-seen")
+
+    def test_a_lost_reply_is_never_safe_to_send_again(self):
+        c = self.probe["check"]
+        self.assertEqual((c["reply_missing"], c["reply_bare_entry"]),
+                         ("not-found-yet", "not-found-yet"))
+
+    def test_a_note_move_whose_entry_may_be_off_the_page_is_not_checked(self):
+        c = self.probe["check"]
+        self.assertEqual((c["off_the_page"], c["off_the_page_reply"]),
+                         ("could-not-check", "could-not-check"))
+        # A full page that is the whole timeline holds every entry newer than those held.
+        self.assertEqual(c["full_page_all_there"], "not-seen")
+        self.assertEqual((c["failed_read"], c["no_timeline"]),
+                         ("could-not-check", "could-not-check"))
+
+    def test_a_lost_bulk_is_decided_by_the_flagged_list_past_its_notes(self):
+        c = self.probe["check"]
+        # All or none: one named note still listed is none landed.
+        self.assertEqual((c["bulk_listed"], c["bulk_one_listed"]),
+                         ("not-landed", "not-landed"))
+        self.assertEqual(c["bulk_gone"], "found")
+        self.assertEqual(c["bulk_flood_beyond"], "not-landed")
+        self.assertEqual((c["bulk_failed"], c["bulk_null"]),
+                         ("could-not-check", "could-not-check"))
+
+    def test_a_note_moves_check_counts_from_the_newest_entry_held(self):
+        self.assertEqual(self.probe["last_entry"], [11, 0, 0])
+
+    def test_each_note_move_outcome_says_what_happened(self):
+        x = self.probe["texts"]
+        # Only what is true for the note's flags and its task's state.
+        self.assertEqual(x["hide_plain"], "Hide note #10: done. Agents no longer read it; "
+                                          "it stays on its task, marked hidden.")
+        self.assertEqual(x["hide_flagged"],
+                         "Hide note #10: done. Agents no longer read it; it stays on its "
+                         "task, marked hidden. It leaves the flagged list and the inbox's "
+                         "count.")
+        # A note on a parked task is in no inbox count to leave.
+        self.assertEqual(x["hide_flagged_parked"],
+                         "Hide note #10: done. Agents no longer read it; it stays on its "
+                         "task, marked hidden. It leaves the flagged list.")
+        self.assertEqual(x["show_plain"], "Show note #10: done. Agents read it again.")
+        self.assertEqual(x["show_flagged"],
+                         "Show note #10: done. Agents read it again. It is back in the "
+                         "flagged list and the inbox's count.")
+        self.assertEqual(x["show_flagged_parked"],
+                         "Show note #10: done. Agents read it again. It is back in the "
+                         "flagged list.")
+        self.assertIn("harmless", x["not_seen"]["text"])
+        self.assertTrue(x["not_seen"]["warn"])
+        self.assertIn("the reply is not on the task yet", x["reply_not_found"])
+        self.assertIn("timeline", x["note_check"])
+        self.assertIn("not known", x["note_check"])
+        self.assertEqual(x["bulk_refused"], "Handle 2 notes: refused, so none of them "
+                                            "was handled. note 9 not found")
+        self.assertEqual(x["bulk_landed"], "Handle 2 notes: done.")
+        self.assertFalse(x["bulk_found"]["warn"])
+        self.assertIn("none of them is flagged any more", x["bulk_found"]["text"])
+        self.assertIn("harmless", x["bulk_not_landed"]["text"])
+        self.assertNotIn("cannot apply it twice", x["bulk_not_landed"]["text"])
+        self.assertIn("flagged notes could not be read again", x["bulk_check"])
+        self.assertEqual(x["move_refused"], "Approve: refused. no")
+
+    def test_the_count_line_says_what_changed_since_the_rows_were_drawn(self):
+        line = self.probe["line"]
+        self.assertEqual(line["same"], {"text": "2 not handled", "warn": False,
+                                        "show": False})
+        self.assertEqual(line["newer"], {"text": "3 not handled · 1 not shown",
+                                         "warn": False, "show": True})
+        self.assertEqual(line["gone"], {"text": "1 not handled · 1 gone since",
+                                        "warn": False, "show": True})
+        self.assertEqual(line["both"]["text"], "2 not handled · 1 not shown · 1 gone since")
+        self.assertEqual(line["none_left"], {"text": "none left · 1 gone since",
+                                             "warn": False, "show": True})
+        self.assertEqual(line["none_drawn_none_left"],
+                         {"text": "none left", "warn": False, "show": False})
+        self.assertTrue(line["failed"]["warn"])
+        self.assertFalse(line["failed"]["show"])
+        self.assertIn("as last read", line["failed"]["text"])
+        self.assertEqual(line["full_page"]["text"], "70 not handled · 49 not shown")
+        # Notes waiting with a parked task are counted apart, so this total and the
+        # inbox's can be told apart; among a page, said so when the page is not all.
+        self.assertEqual(line["parked"]["text"],
+                         "3 not handled · 2 on a deferred or closed task")
+        self.assertEqual(line["parked_page"]["text"],
+                         "70 not handled · 2 on a deferred or closed task among the "
+                         "newest 50 · 50 not shown")
+
+    def test_a_task_parked_since_the_draw_is_told_and_never_swept_up(self):
+        k = self.probe["parked"]
+        # By either copy: a task deferred since the draw, or one the draw had parked.
+        self.assertEqual(k["select_newer"], [9])
+        # A redraw drops a ticked note whose task was parked since, and keeps one already
+        # parked when it was ticked, which the operator chose on its own, with its mark.
+        self.assertEqual(sorted(k["kept"]), [[7, True], [9, False]])
+        self.assertEqual(k["kept_none"], [])
+        # A tick is marked by its row as drawn, never by a park only a poll has seen.
+        self.assertEqual(k["tick_mark"], [False, True, True, False, False])
+        # Beside the handle, what it would leave out, spelled.
+        self.assertEqual(k["left_out_line"],
+                         ["#15 left out: its task was deferred; #3 left out: its task was "
+                          "closed\\u202e", "", ""])
+        # Rows follow a move on notes or on a task, whatever came of it, but not one the
+        # registry never got.
+        self.assertEqual(k["redraws"], [True, True, True, True, True, False, False,
+                                        False, False])
+        self.assertFalse(k["redraws_none"])
+        line = self.probe["line"]["moved"]
+        self.assertEqual(line, {"text": "3 not handled · 1 on a deferred or closed task · "
+                                        "2 whose task was deferred, closed or reopened "
+                                        "since", "warn": False, "show": True})
+
+    def test_a_note_parked_since_its_tick_is_never_sent_whatever_the_order(self):
+        k = self.probe["parked"]
+        o = k["orders"]
+        left = {"notes": [15], "leftOut": [{"id": 16, "state": "deferred"}]}
+        both = {"notes": [16, 15], "leftOut": []}
+        self.assertEqual(o["tick_open_then_click"], both)
+        # Seen only by a poll, or by a redraw too: left out, and said so.
+        self.assertEqual(o["tick_open_poll_parks_click"], left)
+        self.assertEqual(o["tick_open_poll_parks_redraw_click"], left)
+        self.assertEqual(o["tick_open_closed_elsewhere_click"],
+                         {"notes": [15], "leftOut": [{"id": 16, "state": "closed"}]})
+        # Ticked on a row drawn open after a poll learned of the park: left out.
+        self.assertEqual(o["poll_parks_then_tick_click"], left)
+        # Ticked on a row marked parked: chosen as it is, and sent.
+        self.assertEqual(o["redraw_parked_then_tick_click"], both)
+        self.assertEqual(o["tick_parked_poll_reopens_click"], both)
+        # Reopened again before the click: nothing to leave out.
+        self.assertEqual(o["tick_open_parks_then_reopens_click"], both)
+        # A note the read no longer carries is judged by its drawn copy.
+        self.assertEqual(o["tick_open_off_the_read_click"], both)
+        self.assertEqual(o["tick_open_drawn_parked_off_the_read"], left)
+        self.assertEqual(k["send_none"], {"notes": [], "leftOut": []})
+        self.assertEqual(k["send_undrawn"], {"notes": [], "leftOut": []})
+        # The outcome names each note left out, whatever the bulk came to.
+        self.assertEqual(self.probe["texts"]["bulk_left_out"],
+                         "Handle 1 note: done. Note #16 left out: its task was deferred "
+                         "since the list was drawn.")
+        self.assertTrue(self.probe["texts"]["bulk_left_out_refused"].endswith(
+            "Note #16 left out: its task was deferred since the list was drawn."))
+
+    def test_a_note_on_a_parked_task_is_never_swept_up_by_select_all(self):
+        k = self.probe["parked"]
+        self.assertEqual(k["states"], ["deferred", "closed"])
+        self.assertEqual(k["on"], [False, True, True, False, False])
+        self.assertFalse(k["none"])
+        self.assertEqual(k["select_all"], [9, 6, 5])
+        self.assertEqual(k["select_none"], [[], []])
+        # The parked states are the ones the inbox holds a flagged note back for.
+        moves = (ROOT / "task-registry" / "operator_moves.py").read_text()
+        held = re.search(r"t\.state NOT IN \(([^)]*)\)", moves).group(1)
+        self.assertEqual(re.findall(r"'([^']+)'", held), k["states"])
+        # And the field is the one the registry's flagged read gives each note.
+        self.assertIn('"task_state": r["task_state"]', moves)
+
+
 _CHANGES_PROBE = r"""
 import { pathToFileURL } from "node:url";
 const t = await import(pathToFileURL(`${process.env.DOCKADE_UI_DIR}/tasks.js`).href);
@@ -842,7 +1307,8 @@ class ChangeTests(unittest.TestCase):
     def test_a_note_is_shown_once_with_its_marks(self):
         e = self.probe["entry"]["note"]
         self.assertEqual(e["note"]["text"], "Land it?")
-        self.assertEqual(e["marks"], ["#4", "for you", "handled", "hidden"])
+        # Hidden is said as what it does: the operator still reads it, agents do not.
+        self.assertEqual(e["marks"], ["#4", "for you", "handled", "hidden from agents"])
         self.assertEqual(e["folded"], [["for_operator", True]])
         self.assertEqual(e["named"], "")
 
@@ -922,7 +1388,7 @@ class TaskTimelineSourceTests(unittest.TestCase):
         self.assertIn('outcome.result === "stale"', draw)
         self.assertIn("fillSlot(outcome);", draw)
         self.assertIn('outcome.result !== "stale"', _function(self.TASKS, "movesBlock"))
-        self.assertIn("outcome = { task: write.task, result, ",
+        self.assertIn("const said = { task: write.task, result, onNote: isNoteMove(write),",
                       _function(self.TASKS, "runWrite"))
         # Atop the detail, there whether it says anything or not, one fixed line high.
         self.assertLess(draw.index("taskDetail.appendChild(noticeSlot);"),
@@ -950,9 +1416,10 @@ class TaskTimelineSourceTests(unittest.TestCase):
         self.assertIn("renderTimeline(tbody, page.history);", page)
 
     def test_the_detail_reads_the_timeline_and_no_notes(self):
+        # A task's notes come with its timeline; the flagged list is not a task's.
         read = _function(self.TASKS, "readTask")
         self.assertIn("fetch(`/api/tasks/${path}/history`)", read)
-        self.assertNotIn("/notes", self.TASKS)
+        self.assertNotRegex(self.TASKS, r"/api/tasks/[^`\n]*/notes")
 
     def test_diff_js_imports_nothing_and_draws_nothing(self):
         src = (TASKS_DIR / "diff.js").read_text()
@@ -975,7 +1442,7 @@ class TaskWriteSourceTests(unittest.TestCase):
     def test_each_relayed_post_is_a_post_fetch_in_moves_js_and_back(self):
         # PageChecks matches paths, not methods: this holds the methods.
         posts = [re.sub(r"\$\{[^}]*\}", "1", p) for p in self.POST.findall(self.MOVES)]
-        self.assertEqual(len(posts), 3)
+        self.assertEqual(len(posts), 6)
         routes = [rx for method, rx in tui._RELAY_ROUTES if method == "POST"]
         for path in posts:
             with self.subTest(path=path):
@@ -984,7 +1451,7 @@ class TaskWriteSourceTests(unittest.TestCase):
             with self.subTest(route=rx.pattern):
                 self.assertTrue(any(rx.match(p) for p in posts), rx.pattern)
         # Every fetch in moves.js is one of them; tasks.js posts nothing.
-        self.assertEqual(len(re.findall(r"\bfetch\(", self.MOVES)), 3)
+        self.assertEqual(len(re.findall(r"\bfetch\(", self.MOVES)), 6)
         self.assertNotIn("method:", self.TASKS)
 
     def test_moves_js_imports_nothing_of_tasks_js(self):
@@ -1001,7 +1468,23 @@ class TaskWriteSourceTests(unittest.TestCase):
         self.assertLess(body.index("sendWrite(write)"), body.index("writing = null;"))
         mark = self._function(self.TASKS, "markWriting")
         self.assertIn("el.disabled = writing !== null || !drawnIsOpen();", mark)
+        self.assertIn("textarea[data-reply]", mark)
         self.assertIn("markWriting();", self._function(self.TASKS, "drawTask"))
+        # An earlier timeline page's note moves come in gated too.
+        self.assertIn("markWriting();", self._function(self.TASKS, "showPage"))
+        # The bulk is sent by the one runner too, and nothing else sends.
+        self.assertEqual(len(re.findall(r"\bsendWrite\(", _code(self.TASKS))), 1)
+        self.assertEqual(len(re.findall(r"\brunWrite\(", _code(self.TASKS))), 3,
+                         "defined once, called from the detail and the flagged block")
+        self.assertIn("const write = bulkWrite();\n      if (write) runWrite(write);",
+                      self.TASKS)
+        # The flagged controls are off while any write is out, whatever task is open.
+        self.assertIn("markFlagged();", mark)
+        flagged = self._function(self.TASKS, "markFlagged")
+        self.assertIn("el.disabled = writing !== null;", flagged)
+        self.assertIn("flaggedAll.disabled = writing !== null ||", flagged)
+        self.assertIn("flaggedHandle.disabled = writing !== null || !named.length;",
+                      flagged)
 
     def test_a_write_is_for_the_task_drawn_and_only_while_the_page_names_it(self):
         # While another task loads, the one still drawn is not what a click is for:
@@ -1023,7 +1506,7 @@ class TaskWriteSourceTests(unittest.TestCase):
     def test_a_stale_write_is_drawn_from_the_task_it_carries_and_not_read_again(self):
         body = self._function(self.TASKS, "runWrite")
         stale = body[body.index('} else if (result === "stale") {'):]
-        stale = stale[:stale.index("} else {")]
+        stale = stale[:stale.index("} else if (write.task !== null) {")]
         self.assertIn("answer.body.current", stale)
         self.assertNotIn("readTask(", stale)
         # The timeline and plans the page holds, not read again either.
@@ -1031,15 +1514,36 @@ class TaskWriteSourceTests(unittest.TestCase):
 
     def test_a_lost_answer_is_decided_from_a_read_and_never_resent(self):
         body = self._function(self.TASKS, "runWrite")
-        self.assertIn('if (result === "unknown") result = checkWrite(write, drawn);', body)
+        self.assertIn('if (result === "unknown") {\n    result = checkWrite(write, '
+                      'write.kind === "handle-many"\n'
+                      '      ? { flagged: await readFlaggedPast(write.notes).catch(() => '
+                      'null) } : drawn);', body)
         self.assertEqual(body.count("sendWrite("), 1)
+        # A lost bulk reads the list from just past the highest note it named, so a
+        # flood flagged since cannot push the named ones off the page read.
+        past = self._function(self.TASKS, "readFlaggedPast")
+        self.assertIn("before: String(Math.max(...notes) + 1)", past)
+        self.assertIn("fetch(`/api/notes/flagged?${q}`)", past)
 
     def test_its_outcome_is_drawn_only_while_its_task_is_open(self):
         body = self._function(self.TASKS, "runWrite")
-        self.assertIn("if (openTask === write.task) {", body)
-        self.assertLess(body.index("if (openTask === write.task) {"),
-                        body.index("drawTask("))
+        opened = "if (write.task !== null && openTask === write.task) {"
+        self.assertIn(opened, body)
+        self.assertLess(body.index(opened), body.index("drawTask("))
         self.assertIn("if (result !== \"not-running\") {", body)
+        # A bulk's outcome is the flagged block's, a note move's above the timeline.
+        self.assertIn('if (write.kind === "handle-many") flaggedOutcome = said;', body)
+        self.assertIn('outcome = write.kind === "handle-many" ? null : said;', body)
+        self.assertIn("flaggedOutcome.text", self._function(self.TASKS, "renderFlagged"))
+        draw = self._function(self.TASKS, "drawTask")
+        self.assertIn("outcome.onNote", draw)
+        self.assertLess(draw.index("outcome.onNote"), draw.index("timelineHead"))
+        self.assertIn("!outcome.onNote", self._function(self.TASKS, "movesBlock"))
+        # The slot tells a refusal by `kind` first: an outcome carries none of its own.
+        self.assertIn("noticeSlot.dataset.kind = notice.kind || notice.result;",
+                      _function(self.TASKS, "fillSlot"))
+        self.assertNotRegex(_function(self.TASKS, "runWrite"),
+                            r"const said = \{[^}]*\bkind:")
 
     def test_a_note_is_kept_until_it_lands(self):
         body = self._function(self.TASKS, "runWrite")
@@ -1047,15 +1551,85 @@ class TaskWriteSourceTests(unittest.TestCase):
         self.assertIn('write.kind === "note" && landed', body)
         form = self._function(self.TASKS, "noteForm")
         self.assertIn("noteDraft.task === String(task.id) ? noteDraft.text", form)
+        # A reply too, by its note, and its box stays open while the draft is kept.
+        self.assertIn('if (write.kind === "handle" && write.handled && landed) {\n'
+                      "    replyDrafts.delete(String(write.note));", body)
+        box = self._function(self.TASKS, "replyBox")
+        self.assertIn("box.hidden = !replyDrafts.has(id);", box)
+        self.assertIn('text.value = replyDrafts.get(id) ?? "";', box)
+        self.assertIn("replyDrafts.set(ev.target.dataset.reply, ev.target.value);",
+                      self.TASKS)
+        # A reply goes only with text in it.
+        self.assertIn("return reply.trim() ? {", self._function(self.TASKS, "noteWrite"))
 
     def test_no_move_is_drawn_in_an_inbox_row(self):
-        for name in ("inboxRow", "renderInbox", "renderTasks"):
+        # The bulk handle is the one write outside the detail, and its control is the
+        # flagged block's own, never a row's.
+        for name in ("inboxRow", "renderInbox", "renderTasks", "renderFlagged",
+                     "flaggedRow"):
             with self.subTest(function=name):
                 self.assertNotIn("writeButton(", self._function(self.TASKS, name))
-                self.assertNotIn("data-write", self._function(self.TASKS, name))
+                self.assertNotIn("dataset.write", self._function(self.TASKS, name))
         calls = re.findall(r"\bmovesBlock\(", self.TASKS)
         self.assertEqual(len(calls), 2, "defined once, called once, in drawTask")
         self.assertIn("movesBlock(task)", self._function(self.TASKS, "drawTask"))
+        self.assertEqual(len(re.findall(r"\bbulkWrite\(", self.TASKS)), 2,
+                         "defined once, called once, from the flagged block")
+        # A bulk re-reads the open task only when a note it names is on it.
+        bulk = self._function(self.TASKS, "bulkWrite")
+        self.assertIn("const onOpen = flaggedDrawn.some(n => notes.includes(n.id) && "
+                      "String(n.task) === openTask);", bulk)
+        self.assertIn("task: onOpen ? openTask : null,", bulk)
+        # "select all shown" ticks only what `selectAll` gives, and is off when that is
+        # nothing; a note on a parked task is ticked on its own.
+        self.assertIn("for (const id of selectAll(flaggedDrawn, newestFlagged())) "
+                      "flaggedSelected.set(id, false);", self.TASKS)
+        # A tick records whether its task was parked then, by the newest state known.
+        self.assertIn("if (box.checked) flaggedSelected.set(id, tickMark(id, flaggedDrawn));",
+                      self.TASKS)
+        # The last good read: a failed one forgets no park it had learned.
+        self.assertIn("return flaggedKnown;", self._function(self.TASKS, "newestFlagged"))
+        read = self._function(self.TASKS, "readFlagged")
+        self.assertIn("if (flaggedRead) flaggedKnown = flaggedRead.notes;", read)
+        self.assertEqual(re.findall(r"\bflaggedKnown = ([^;]*);", self.TASKS),
+                         ["[]", "flaggedRead.notes"])
+        # The bulk and the button's count are built by the same rule, and a poll's
+        # count line brings the controls up to date without moving a row.
+        self.assertIn("bulkToSend(flaggedSelected, flaggedDrawn, newestFlagged())",
+                      self._function(self.TASKS, "bulkWrite"))
+        mark = self._function(self.TASKS, "markFlagged")
+        self.assertIn("const { notes: named, leftOut } = bulkToSend(flaggedSelected, "
+                      "flaggedDrawn,\n                                               "
+                      "newestFlagged());", mark)
+        self.assertIn("flaggedLeftOut.textContent = leftOutLine(leftOut);", mark)
+        line = self._function(self.TASKS, "renderFlaggedLine")
+        self.assertTrue(line.rstrip("}\n ").endswith("markFlagged();"))
+        self.assertNotIn("flaggedBody", line)
+        self.assertIn("leftOut,", self._function(self.TASKS, "bulkWrite"))
+        self.assertIn("box.checked = flaggedSelected.has(Number(box.dataset.flaggedNote));",
+                      self.TASKS)
+        self.assertIn("flaggedAll.disabled = writing !== null || "
+                      "!selectAll(flaggedDrawn, newestFlagged()).length;",
+                      self._function(self.TASKS, "markFlagged"))
+        row = self._function(self.TASKS, "flaggedRow")
+        self.assertIn("if (onParkedTask(n)) {", row)
+        self.assertIn("spellHidden(String(n.task_state)).text", row)
+        # Only a note flagged and not handled is in the lists a hide takes it out of.
+        self.assertIn('if (note.for_operator && !note.handled) btn.dataset.forYou = "1";',
+                      self._function(self.TASKS, "noteControls"))
+        # A hide's outcome is told by the task's state as drawn when it was clicked.
+        self.assertIn("taskState: shownTask.state,", self._function(self.TASKS, "noteWrite"))
+        # A typed reply is not dropped by the wrong click.
+        mark = self._function(self.TASKS, "markReply")
+        self.assertIn('button[data-write="handle"][data-value="true"]', mark)
+        self.assertIn('if (plain && (replyDrafts.get(box.dataset.replyBox) ?? "").trim()) '
+                      "plain.disabled = true;", mark)
+        self.assertIn("for (const box of taskDetail.querySelectorAll(\"[data-reply-box]\")) "
+                      "markReply(box);", self._function(self.TASKS, "markWriting"))
+        # The note moves are on the timeline, on every page of it.
+        self.assertIn("td.appendChild(noteControls(entry.note));",
+                      self._function(self.TASKS, "renderTimeline"))
+        self.assertIn("noteMovesFor(note)", self._function(self.TASKS, "noteControls"))
 
 
 class TaskPollingSourceTests(unittest.TestCase):
@@ -1071,7 +1645,7 @@ class TaskPollingSourceTests(unittest.TestCase):
                          re.M | re.S).group(0)
 
     def test_every_registry_read_returns_early_unless_it_answers(self):
-        for name in ("refreshTasks", "refreshInbox"):
+        for name in ("refreshTasks", "refreshInbox", "readFlagged"):
             with self.subTest(function=name):
                 body = self._function(self.TASKS, name)
                 first = body.split("\n")[1].strip()
@@ -1106,6 +1680,78 @@ class TaskPollingSourceTests(unittest.TestCase):
         body = self._function(self.TASKS, "probeRegistry")
         self.assertIn("if (!probing) probing = probe()", body)
         self.assertIn("return probing;", body)
+
+    def test_the_flagged_rows_are_drawn_only_when_asked_for(self):
+        # Read after the inbox, gated again after its fetch, and an answer a later one
+        # overtook dropped, so a slow poll cannot put back an older count.
+        inbox = self._function(self.TASKS, "refreshInbox")
+        self.assertLess(inbox.index("renderInbox(lastInbox);"),
+                        inbox.index("await readFlagged(false);"))
+        read = self._function(self.TASKS, "readFlagged")
+        after = read[read.index('fetch("/api/notes/flagged")'):]
+        self.assertIn("if (!registryIsRunning() || asked < flaggedUsed) return;", after)
+        # Rows from a read asked to draw, or when none were drawn since the registry
+        # last answered; any other read rewrites the count line alone.
+        self.assertIn("const drawNow = wanted || flaggedDrawn === null;", read)
+        # A draw asked for is made only by an answer to a read asked with it or after:
+        # one asked before may predate the write that asked for the draw.
+        self.assertLess(read.index("const asked = ++flaggedAsks;"),
+                        read.index("if (draw) flaggedWanted = asked;"))
+        self.assertIn("const wanted = flaggedWanted !== 0 && asked >= flaggedWanted;", read)
+        self.assertIn("if (drawNow) renderFlagged();\n  else renderFlaggedLine();", read)
+        self.assertEqual(re.findall(r"\bflaggedDrawn = ([^;]*);", self.TASKS),
+                         ["null", "null", "flaggedRead.notes"])
+        self.assertIn("if (!up) flaggedDrawn = null;",
+                      self._function(self.TASKS, "setRunning"))
+        self.assertEqual(len(re.findall(r"\brenderFlagged\(\)", self.TASKS)), 2,
+                         "defined once, called once, from readFlagged")
+        # Asked to draw: by the runner after a move on notes or on a task, before its
+        # controls come back; on coming back from All tasks; on "show them". The poll
+        # never asks.
+        calls = sorted(ln.strip() for ln in re.findall(r"^.*\breadFlagged\(.*$",
+                                                        self.TASKS, re.M)
+                       if "function readFlagged" not in ln)
+        self.assertEqual(calls, [
+            "await readFlagged(false);",
+            "if (back) readFlagged(true);",
+            "if (redrawsFlagged(write, result)) await readFlagged(true);",
+            "readFlagged(true);"])
+        run = self._function(self.TASKS, "runWrite")
+        self.assertLess(run.index("await readFlagged(true);"), run.index("writing = null;"))
+        self.assertIn('if (btn.dataset.flagged === "show") {\n      readFlagged(true);',
+                      self.TASKS)
+        self.assertIn('const back = view === "all" && name === "inbox";',
+                      self._function(self.TASKS, "showView"))
+        # Selection is ids, kept for those still drawn but a note parked since.
+        self.assertIn("flaggedSelected = keptSelection(flaggedSelected, flaggedRead.notes);",
+                      read)
+        self.assertLess(read.index("keptSelection("),
+                        read.index("flaggedDrawn = flaggedRead.notes;"))
+        # The count line compares the notes drawn, task state and all, not their ids.
+        self.assertIn("flaggedLine(flaggedDrawn || [], flaggedRead)",
+                      self._function(self.TASKS, "renderFlaggedLine"))
+
+    def test_the_flagged_block_sits_above_what_the_poll_redraws(self):
+        html = (TASKS_DIR / "index.html").read_text()
+        self.assertLess(html.index('<div id="flagged">'), html.index('<div id="inbox">'))
+        self.assertLess(html.index('<section id="inbox-view">'),
+                        html.index('<div id="flagged">'))
+        # Its rows in a box of one height, its count line one line high, and the
+        # handle last in its row, wide enough for its count.
+        self.assertRegex(html, r"\.flagged-rows \{ height: \d+px; overflow: auto;")
+        self.assertRegex(html, r"\.flagged-line \{ height: \d+px;")
+        self.assertRegex(html, r"#flagged-handle \{ min-width: ")
+        # What the handle would leave out sits after it, one line of fixed width.
+        self.assertLess(html.index('id="flagged-handle"'), html.index('id="flagged-left-out"'))
+        rule = re.search(r"\.flagged-left-out \{([^}]*)\}", html).group(1)
+        for prop in (r"\bwidth: \d+em;", r"\bheight: [\d.]+em;", "overflow: hidden;",
+                     "white-space: nowrap;"):
+            self.assertRegex(rule, prop)
+        self.assertLess(html.index('id="flagged-all"'), html.index('id="flagged-handle"'))
+        # "show them" goes first in the line, so a count that changes moves no button.
+        line = self._function(self.TASKS, "renderFlaggedLine")
+        self.assertLess(line.index("flaggedLineEl.appendChild(show);"),
+                        line.index("flaggedLineEl.appendChild(text);"))
 
     def test_an_inbox_read_that_finds_it_gone_draws_nothing(self):
         # Checked again after the fetch: a 502 clears the count, and drawing the old
@@ -1243,6 +1889,15 @@ class TaskRenderingSourceTests(unittest.TestCase):
         html = (TASKS_DIR / "index.html").read_text()
         self.assertRegex(html, r"\bins \{ text-decoration: underline;")
         self.assertRegex(html, r"\bdel \{ text-decoration: line-through;")
+
+    def test_a_flagged_row_spells_what_an_agent_wrote(self):
+        row = _function(self.TASKS, "flaggedRow")
+        lines = [ln for ln in _code(row).splitlines() if self.FIELD.search(ln)]
+        self.assertGreaterEqual(len(lines), 2, "the field pattern found too little")
+        self.assertIn("authorCell(tr, n.author);", row)
+        self.assertIn("text.appendChild(proseBlock(n.text));", row)
+        # Its label names the note by id, never by its text.
+        self.assertIn('box.setAttribute("aria-label", `select note #${n.id}`);', row)
 
     def test_a_history_value_is_spelled_whatever_its_type(self):
         self.assertIn('typeof value === "string" ? proseBlock(value)', self.TASKS)

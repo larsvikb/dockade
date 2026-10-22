@@ -118,6 +118,27 @@
   .note-form textarea { font: inherit; font-size: 13px; width: 100%;
     background: #202632; color: var(--fg); border: 1px solid var(--line);
     border-radius: 6px; padding: 5px 8px; resize: vertical; }
+  /* The moves on a note, under it in the timeline. */
+  .note-moves .moves { margin: 4px 0 0; }
+  .note-moves button { font-size: 11px; padding: 2px 8px; }
+  /* The notes flagged for you: a count line one line high, rows in a box of one height,
+     and the handle last in its row and wide enough for its count, so nothing a poll or
+     a selection changes moves a control. */
+  .flagged-line { height: 24px; display: flex; align-items: center; gap: 8px;
+    white-space: nowrap; overflow: hidden; color: var(--dim); font-size: 12px; }
+  .flagged-line.warn { color: var(--hold); }
+  .flagged-rows { height: 220px; overflow: auto; border: 1px solid var(--line);
+    border-radius: 6px; }
+  .flagged-rows .prose { max-height: 6em; overflow: auto; }
+  .flagged-controls button { font-size: 12px; padding: 4px 10px; }
+  #flagged-handle { min-width: 15em; }
+  /* What the handle would leave out, after it and one line of fixed width, so it moves
+     no control when it changes. */
+  .flagged-left-out { width: 30em; height: 1.6em; overflow: hidden; white-space: nowrap;
+    text-overflow: ellipsis; color: var(--hold); font-size: 12px; align-self: center; }
+  /* A note on a deferred or closed task: said in words, and not swept by select all. */
+  .flagged-rows tr.parked .why { color: var(--hold); }
+  .flagged-outcome { min-height: 2.5em; }
 </style>
 </head>
 <body>
@@ -146,6 +167,26 @@
     <div class="panes" id="panes">
       <div class="list-pane">
         <section id="inbox-view">
+          <!-- The notes flagged for you, to handle together: above the sections the
+               poll redraws, its rows in a box of one height, and redrawn only on a
+               read you asked for or a write's (readFlagged), so neither moves the
+               other. The count line keeps its space whatever it says. -->
+          <div id="flagged">
+            <h2>Notes for you</h2>
+            <div class="flagged-line" id="flagged-line"></div>
+            <div class="flagged-rows">
+              <table><tbody id="flagged-notes"></tbody></table>
+              <div class="empty" id="flagged-empty"></div>
+            </div>
+            <div class="moves flagged-controls">
+              <button type="button" id="flagged-all"
+                      data-flagged="all">select all shown</button>
+              <button type="button" id="flagged-handle"
+                      data-flagged="handle">handle selected (0)</button>
+              <span class="flagged-left-out" id="flagged-left-out"></span>
+            </div>
+            <div class="flagged-outcome empty" id="flagged-outcome"></div>
+          </div>
           <!-- Filled from the registry's inbox, a section at a time (renderInbox). -->
           <div id="inbox"></div>
           <div class="empty" id="inbox-empty" hidden></div>

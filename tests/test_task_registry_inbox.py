@@ -215,10 +215,20 @@ class SectionTests(_Store):
                          {"waiting": 0, "triage": 0, "drifting": 0})
         for task in since:
             self.assertIsNone(self.where(task))
-        listed = {n["id"] for n in op.notes_for_operator()["notes"]}
-        self.assertEqual(listed, set(flags))
+        listed = op.notes_for_operator()["notes"]
+        self.assertEqual({n["id"] for n in listed}, set(flags))
+        # Each with the state its task waits in, so the page can tell it from a note
+        # that is the operator's turn now.
+        states = {n["task"]: n["task_state"] for n in listed}
+        self.assertEqual(set(states), set(since))
+        for task in since:
+            with self.subTest(task=task):
+                self.assertEqual(states[task], reads.get_task(task)["state"])
+        self.assertEqual(set(states.values()), {"deferred", "closed"})
         for task in since:
             op.move(task, self.revision(task), "proposed")
+        self.assertEqual({n["task_state"] for n in op.notes_for_operator()["notes"]},
+                         {"proposed"})
         waiting = self.section("waiting")
         self.assertEqual(waiting["total"], len(since))
         rows = self.rows("waiting")
@@ -229,7 +239,9 @@ class SectionTests(_Store):
 
     def test_a_flagged_note_on_an_open_or_landing_task_waits(self):
         opened = op.create("widgets", "Open", "Do it.", "open")["task"]
-        self.flag(opened)
+        note = self.flag(opened)
+        self.assertEqual([(n["id"], n["task_state"])
+                          for n in op.notes_for_operator()["notes"]], [(note, "open")])
         landing = self.landing()
         self.later()
         self.flag(landing)

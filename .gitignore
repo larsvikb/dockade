@@ -14,8 +14,6 @@ secrets/
 # one earns it". Useful to read, never to commit: host-specific, large, and stale within
 # minutes.
 *.log
-# Local review scratch pad (findings / todo). Working notes, not a repo artifact.
-local-todo.md
 # The maintainer's log of how each pre-push review went, kept to tune the reviewer's
 # brief. Workflow data, not a repo artifact: what it teaches reaches the repo the way
 # .claude/skills/review-before-push/SKILL.md, "Record it" says.

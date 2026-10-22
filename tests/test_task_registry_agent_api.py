@@ -404,9 +404,11 @@ class InstructionTests(unittest.TestCase):
         self.assertTrue(reg.tasks.REPO_NAME_RE.fullmatch(names[0]), names[0])
 
     def test_every_tool_the_instructions_name_is_served(self):
-        named = {path.name: re.findall(r"tasks__(\w+)", path.read_text())
-                 for path in (self.IMAGE, self.REPO)}
-        self.assertTrue(named[self.REPO.name])
+        # The skills too: `review-before-push` files its leftovers with a tool.
+        skills = sorted((ROOT / ".claude" / "skills").glob("*/SKILL.md"))
+        named = {str(path.relative_to(ROOT)): re.findall(r"tasks__(\w+)", path.read_text())
+                 for path in (self.IMAGE, self.REPO, *skills)}
+        self.assertTrue(named["CLAUDE.md"])
         for where, names in named.items():
             with self.subTest(file=where):
                 self.assertEqual(sorted(set(names) - set(tools.TOOLS)), [])

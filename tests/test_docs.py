@@ -44,7 +44,7 @@ COUNT_WORDS = {"single": 1, "dual": 2, "double": 2, "triple": 3, "quadruple": 4,
 
 def _tracked(root: Path = ROOT) -> list[str]:
     """Files git knows about. Read from the INDEX rather than the filesystem for two
-    reasons: an untracked scratch file (`local-todo.md` is gitignored and present)
+    reasons: an untracked scratch file (`inflight.md` is gitignored and present)
     must not fail the gate, and a new doc must be covered the moment it is staged.
     NUL-separated, so a name with a space or a non-ASCII byte arrives whole instead
     of split or C-quoted, and decoded as ``parse_ls_files`` in

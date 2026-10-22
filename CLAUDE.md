@@ -56,12 +56,13 @@ only the invariants and conventions for working in the repo.
   worktree session starts on a placeholder `worktree-…` one) or its state changes, and
   drop it when the branch merges. Before work that could collide, read every
   checkout's note; `git worktree list` gives their roots.
-- dockade's name in the task registry is `dockade`. With no `tasks__` tools, or a call
-  that could not reach `tasks`, `inflight.md` and `local-todo.md` (untracked, in the
-  main checkout only) are the whole record. When it answers, they stay the record
-  beside it, new work still goes in `local-todo.md` rather than `tasks__propose` until
-  that file is migrated, and a session checks the registry at these points:
+- dockade's name in the task registry is `dockade`, and the registry is where work is
+  tracked; `inflight.md` is the record of branches beside it. With no `tasks__` tools, or a call
+  that could not reach `tasks`, say so and ask the operator to start it (`make
+  tasks-up`); new work waits until it answers, never in a file of its own. A session
+  uses the registry at these points:
   - at session start, and before work that could collide, `tasks__list_tasks`;
+  - for new work, `tasks__propose`;
   - before drafting a plan for one of its tasks, `tasks__claim_plan`;
   - once the plan's review rounds are done, `tasks__submit_plan`;
   - before the first edit on one of its tasks, `tasks__claim_work`;

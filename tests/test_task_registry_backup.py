@@ -16,7 +16,8 @@ import unittest
 from unittest import mock
 
 from _loader import ROOT, load_task_registry_backup
-from test_task_registry_tasks import as_version
+from test_task_registry_plans import DECISION, MULTI
+from test_task_registry_tasks import V4_TABLES, as_version
 from test_topology import COMPOSE, _block, _service
 
 reg = load_task_registry_backup()
@@ -78,7 +79,7 @@ class _Stores(unittest.TestCase):
             conn.close()
 
     def as_version(self, data: bytes, version: int) -> bytes:
-        """``data`` as a store at ``version``, 2 or older (``as_version``)."""
+        """``data`` as a store at ``version``, 3 or older (``as_version``)."""
         path = self.write(f"v{version}.db", data)
         as_version(path, version)
         return _read(path)
@@ -87,13 +88,24 @@ class _Stores(unittest.TestCase):
         """``data`` as a store from before plans: no plan tables, at v1."""
         return self.as_version(data, 1)
 
-    def planned(self, repo: str = "widgets") -> dict:
+    def planned(self, repo: str = "widgets", decisions=()) -> dict:
         """A proposal in ``repo`` refined into a plan; the reply of ``submit_plan``."""
         task = agent.propose(ALICE, repo, "Rotate keys", "Every 90 days.")["task"]
         token = agent.claim_plan(ALICE, repo, task, ["."])["token"]
         return agent.submit_plan(ALICE, repo, task, token, "Rotate in place.",
                                  ["src/keys.py", "tests"], "Old keys still read.",
-                                 "None.", "A reader mid-rotation.", 2, "Passes.")
+                                 "None.", "A reader mid-rotation.", 2, "Passes.",
+                                 list(decisions))
+
+    def answered(self, repo: str = "widgets") -> dict:
+        """A plan with two decisions, sent back by answers that were not assumed, and
+        its successor with one, unanswered; the second plan's ``submit_plan`` reply."""
+        first = self.planned(repo, [DECISION, MULTI])
+        op.approve(first["task"], first["revision"],
+                   [{"other": "Deny, but log it."}, {"options": [0, 2]}])
+        token = agent.claim_plan(ALICE, repo, first["task"], ["."])["token"]
+        return agent.submit_plan(ALICE, repo, first["task"], token, "Deny and log.",
+                                 ["src"], "T.", "None.", "R.", 1, "Passes.", [DECISION])
 
     def write(self, name: str, data: bytes) -> str:
         path = os.path.join(self.dir, name)
@@ -110,6 +122,15 @@ class SnapshotTests(_Stores):
         agent.add_note(ALICE, "widgets", task, "Seen.")
         copy = self.write("copy.db", self.snapshot())
         self.assertEqual(self.rows(copy), self.rows(src))
+
+    def test_decisions_and_answers_are_in_it(self):
+        src = self.use("live")
+        op.add_repo("widgets")
+        self.answered()
+        copy = self.write("copy.db", self.snapshot())
+        rows = self.rows(copy)
+        self.assertEqual(rows, self.rows(src))
+        self.assertEqual([len(rows[t]) for t in reversed(V4_TABLES)], [3, 7, 2, 2])
 
     def test_it_takes_what_is_still_in_the_wal(self):
         # A connection left open keeps the last write in the -wal, unmerged, as a live
@@ -233,7 +254,7 @@ class RestoreTests(_Stores):
                             "update the image first")
 
     def test_a_schema_the_registry_would_not_open_is_refused(self):
-        self.assert_refused(self.with_version(-1), "opens v1, v2, v3 only")
+        self.assert_refused(self.with_version(-1), "opens v1, v2, v3, v4 only")
 
     def test_a_v1_backup_is_restored_and_taken_forward_at_the_next_start(self):
         self.assertIn("schema-v1 backup", self.restore(self.as_v1(self.backup)))
@@ -261,6 +282,22 @@ class RestoreTests(_Stores):
         self.assertEqual((reg.reads.get_task(refining)["claim"]["branch"],
                           reg.reads.get_task(working)["claim"]["branch"]),
                          (None, "fix-it"))
+
+    def test_a_v3_backup_is_restored_and_takes_decisions_after_the_next_start(self):
+        self.assertIn("schema-v3 backup", self.restore(self.as_version(self.backup, 3)))
+        reg.taskdb.init()
+        with reg.taskdb.reading() as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],
+                             reg.taskdb.SCHEMA_VERSION)
+        reply = self.planned(decisions=[DECISION])
+        self.assertEqual(len(reg.reads.get_task(reply["task"])["plan"]["decisions"]), 1)
+
+    def test_a_v4_backup_without_its_decision_tables_is_refused(self):
+        path = self.write("no-decisions.db", self.backup)
+        conn = sqlite3.connect(path)
+        conn.executescript("DROP TABLE answer_options; DROP TABLE answers;")
+        conn.close()
+        self.assert_refused(_read(path), "missing table(s): answer_options, answers")
 
     def test_a_v2_backup_without_its_plan_tables_is_refused(self):
         path = self.write("no-plans.db", self.backup)
@@ -549,6 +586,60 @@ class ExportTests(_Stores):
                             ("Review verdict", "Passes.")):
             self.assertIn(f"{part}:\n\n```text\n{value}\n```", text)
         self.assertLess(text.index("Body:"), text.index(f"Plan {first['plan']}"))
+
+    def test_each_decision_with_its_options_and_answer(self):
+        self.use("live")
+        op.add_repo("widgets")
+        second = self.answered()
+        text = self.render()
+        first = second["plan"] - 1
+        mine = text[text.index(f"Plan {first},"):text.index(f"Plan {second['plan']},")]
+        self.assertIn("numbered by position, from 0, as the operator API's approve", text)
+        self.assertIn("Decision at position 0, single choice:\n\n```text\n"
+                      f"{DECISION['question']}\n```", mine)
+        self.assertIn(f"Why the refiner could not settle it:\n\n```text\n"
+                      f"{DECISION['why']}\n```", mine)
+        self.assertIn("Option at position 0 `Hold`, assumed by the plan:\n\n```text\n"
+                      "The operator answers each.\n```", mine)
+        self.assertIn("Option at position 1 `Deny`:", mine)
+        self.assertRegex(mine, r"Answered by `operator` \S+Z, other:\n\n```text\n"
+                               r"Deny, but log it.\n```")
+        self.assertIn("Decision at position 1, multi-select:", mine)
+        self.assertIn("Option at position 0 `Audit`, assumed by the plan, **CHOSEN**:", mine)
+        self.assertIn("Option at position 1 `Access`, assumed by the plan:", mine)
+        self.assertIn("Option at position 2 `Debug`, **CHOSEN**:", mine)
+        self.assertRegex(mine, r"Answered by `operator` \S+Z\.")
+        later = text[text.index(f"Plan {second['plan']},"):]
+        self.assertIn("Decision at position 0, single choice:", later)
+        self.assertIn("Not answered.", later)
+        self.assertNotIn("Decision at position 1", later)
+
+    def test_decision_text_renders_as_nothing_but_text(self):
+        self.use("live")
+        op.add_repo("widgets")
+        self.answered()
+        hostile = "x\n## Repo `forged`\n```\n\N{RIGHT-TO-LEFT OVERRIDE}<img src=x>"
+        with reg.taskdb.writing() as conn:
+            conn.execute("UPDATE decisions SET question = ?, why = ?", (hostile, hostile))
+            conn.execute("UPDATE decision_options SET label = ?, meaning = ?",
+                         (hostile, hostile))
+            conn.execute("UPDATE answers SET author = ?, other = ?", (hostile, hostile))
+        text = self.render()
+        self.assertEqual([h for h in _headings(text) if "forged" in h], [])
+        self.assertEqual([c for c in text if c != "\n"
+                          and unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp")], [])
+        self.assertIn(f"Option at position 0 {export.inline(hostile)}", text)
+        self.assertIn(f"Answered by {export.inline(hostile)} ", text)
+        self.assertIn(export.block(hostile), text)
+
+    def test_a_v3_store_renders_its_plans_without_decisions(self):
+        self.use("live")
+        op.add_repo("widgets")
+        self.planned()
+        text = export.main(self.as_version(self.snapshot(), 3))
+        self.assertIn("from a schema-v3 store", text)
+        self.assertIn("Plan 1,", text)
+        self.assertNotIn("Decision at", text)
 
     def test_a_v1_store_renders_without_plans(self):
         self.use("live")

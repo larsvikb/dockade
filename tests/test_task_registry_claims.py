@@ -12,6 +12,7 @@ import unittest
 from unittest import mock
 
 from _loader import load_task_registry
+from test_task_registry_plans import DECISION, PLAN
 
 reg = load_task_registry()
 Refused = reg.taskdb.Refused
@@ -95,6 +96,19 @@ class TakingTests(_Store):
         self.assertEqual(reads.get_task(task)["state"], "landing")
         self.work(task, who=BOB)
         self.assertEqual(reads.get_task(task)["state"], "open")
+
+    def test_no_claim_reopens_a_task_whose_decisions_are_unanswered(self):
+        # Only the operator puts a refined task in landing; its plan's decisions still
+        # wait on the operator's approve, which no claim makes.
+        task = self.proposal()
+        token = self.refine(task)["token"]
+        agent.submit_plan(ALICE, "widgets", task, token, **PLAN, decisions=[DECISION])
+        op.move(task, self.revision(task), "landing")
+        refusal = self.refused(self.work, task, who=BOB)
+        self.assertIn("approve", refusal.reason)
+        self.assertIn("the operator moves it back to refined first", refusal.reason)
+        got = reads.get_task(task)
+        self.assertEqual((got["state"], got["claim"]), ("landing", None))
 
     def test_a_claim_to_do_the_work_names_a_branch_and_stays_in_its_repo(self):
         task = self.open_task()

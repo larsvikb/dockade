@@ -85,8 +85,8 @@ Anything that **crosses a boundary the design claims to hold**:
   listener answers only the gateway's secret. In scope: a route to the operator
   listener from a sandbox, an MCP server or the gateway; a call to the agent listener
   that is served without that secret; and an agent move that does what only the
-  operator may — changes an approved spec, ends another session's claim, or hides,
-  unhides or rewrites a note.
+  operator may — changes an approved spec, answers a plan's decision, ends another
+  session's claim, or hides, unhides or rewrites a note.
 - **A relay bypass in either UI** — reaching `POST /authorize` or any non-allowlisted
   backend path through the control-plane UI, reaching a task-registry path the tasks
   page does not call through the tasks UI, or overriding either one's pinned upstream.

@@ -5,6 +5,7 @@ call is checked against, and that the surface calls only what an agent may. Each
 that touches the store gets one of its own."""
 from __future__ import annotations
 
+import ast
 import asyncio
 import inspect
 import json
@@ -18,6 +19,7 @@ from pathlib import Path
 
 import _surface
 from _loader import ROOT, load_task_registry_agent_api
+from test_task_registry_plans import DECISION, MULTI, shown
 
 reg = load_task_registry_agent_api()
 Refused = reg.taskdb.Refused
@@ -36,6 +38,21 @@ PLAN = {"approach": "A rotate step in the key store.", "footprint": ["src/keys.p
         "tests": "A rotation keeps old keys readable.", "out_of_scope": "None.",
         "risks": "A reader mid-rotation.", "review_rounds": 2,
         "review_verdict": "Passes."}
+
+
+def _every_param(params) -> list:
+    """``params`` and, for an array of objects, each object's own, at every depth."""
+    return [found for p in params for found in (p, *_every_param(p.fields))]
+
+
+def _keys(schema: object) -> set[str]:
+    """Every property name a served schema has, at every depth."""
+    if isinstance(schema, list):
+        return {k for item in schema for k in _keys(item)}
+    if not isinstance(schema, dict):
+        return set()
+    found = set(schema.get("properties", {}))
+    return found | {k for value in schema.values() for k in _keys(value)}
 
 
 def rpc(method: str, params: dict | None = None, message_id: object = 7) -> dict:
@@ -213,6 +230,34 @@ class ListingTests(unittest.TestCase):
         self.assertIn("branch", schemas["claim_work"]["required"])
         self.assertNotIn("footprint", schemas["claim_work"]["required"])
 
+    def test_decisions_are_served_as_an_array_of_objects_checked_at_every_level(self):
+        schemas = {t["name"]: t["inputSchema"] for t in tools.listing()}
+        decisions = schemas["submit_plan"]["properties"]["decisions"]
+        self.assertNotIn("decisions", schemas["submit_plan"]["required"])
+        self.assertEqual(decisions["type"], "array")
+        decision = decisions["items"]
+        self.assertEqual((decision["type"], decision["additionalProperties"]),
+                         ("object", False))
+        self.assertEqual(set(decision["properties"]),
+                         {"question", "why", "options", "assumes", "multi_select"})
+        self.assertEqual(decision["required"], ["question", "why", "options", "assumes"])
+        self.assertEqual(decision["properties"]["question"]["maxLength"],
+                         reg.plans.DECISION_TEXTS["question"])
+        self.assertEqual(decision["properties"]["assumes"]["items"], {"type": "string"})
+        option = decision["properties"]["options"]["items"]
+        self.assertEqual(option, {
+            "type": "object", "required": ["label", "meaning"],
+            "additionalProperties": False,
+            "properties": {name: {"type": "string", "maxLength": limit,
+                                  "description": option["properties"][name]["description"]}
+                           for name, limit in reg.plans.OPTION_TEXTS.items()}})
+
+    def test_no_tool_has_a_field_for_an_answer(self):
+        for tool in tools.listing():
+            with self.subTest(tool=tool["name"]):
+                fields = _keys(tool["inputSchema"])
+                self.assertEqual(fields & {"answer", "answers", "other"}, set())
+
     def test_the_schema_says_the_stores_choices_and_lengths(self):
         propose = next(t for t in tools.listing() if t["name"] == "propose")
         properties = propose["inputSchema"]["properties"]
@@ -232,10 +277,12 @@ class DescriptionTests(unittest.TestCase):
         return tools.TOOLS[name].description
 
     def test_every_tool_a_description_names_is_served(self):
-        params = {p.name for tool in tools.TOOLS.values() for p in tool.params}
+        params = {p.name for tool in tools.TOOLS.values()
+                  for p in _every_param(tool.params)}
         known = set(tools.TOOLS) | params | set(reg.tasks.STATES) | self.LITERALS
         for name, tool in tools.TOOLS.items():
-            for text in (tool.description, *(p.description for p in tool.params)):
+            for text in (tool.description,
+                         *(p.description for p in _every_param(tool.params))):
                 with self.subTest(tool=name):
                     self.assertEqual(set(re.findall(r"`([^`]+)`", text)) - known, set())
 
@@ -263,6 +310,37 @@ class DescriptionTests(unittest.TestCase):
         self.assertIn(f"at most {reg.plans.REVIEW_ROUNDS_CAP} rounds", said)
         self.assertIn("`get_task`", said)
 
+    def test_claim_plan_says_what_a_decision_is_and_how_the_review_judges_them(self):
+        said = " ".join(self.described("claim_plan").split())
+        for phrase in (
+                f"decisions, at most {reg.plans.DECISIONS_MAX}",
+                f"{reg.plans.OPTIONS_MIN} to {reg.plans.OPTIONS_MAX} options",
+                "what the body, the repo and its design do not settle",
+                "never a way to hand judgement back",
+                "A question answered on an earlier plan, in the task's answers, is settled",
+                "An answer stands over the body, and only a later answer changes it",
+                "between two that differ, the later stands",
+                # The review's four checks.
+                "whether the plan settled something that was the operator's",
+                "whether a decision could have been settled from the repo",
+                "options are fair, the obvious alternative among them",
+                "whether the plan follows every earlier answer"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, said)
+        # Before the hand-in rule, which a client that cuts the description keeps.
+        self.assertLess(said.index("decisions, at most"), said.index(tools._HOLDING[:40]))
+
+    def test_get_task_says_the_answers_are_the_spec_and_outrank_notes(self):
+        said = " ".join(self.described("get_task").split())
+        self.assertIn("the operator's own words", said)
+        self.assertIn("its body, plan and answers are the spec the operator approved, and "
+                      "they outrank every note", said)
+        self.assertIn("a superseded plan on an open task is not one the operator approved",
+                      said)
+        self.assertIn("An answer stands over that plan and over the body; only a later "
+                      "answer changes it", said)
+        self.assertNotIn("must decide", tools.TOOLS["submit_plan"].params[-1].description)
+
 
 class SurfaceTests(unittest.TestCase):
     """The agent listener calls ``agent_moves`` and ``reads`` and nothing else of the
@@ -279,6 +357,16 @@ class SurfaceTests(unittest.TestCase):
         self.assertNotIn("operator_moves", imported)
         self.assertEqual(_surface.overreach(chains, self.CALLABLE,
                                             frozenset({("taskdb", "Refused")})), [])
+
+    def test_only_the_operators_moves_write_an_answer(self):
+        """``task-registry/DESIGN.md``, "Decisions": the store refuses an answer from
+        any agent by having no agent path to its write."""
+        callers = set()
+        for path in sorted((ROOT / "task-registry").glob("*.py")):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if isinstance(node, ast.Attribute) and node.attr == "answer":
+                    callers.add(path.stem)
+        self.assertEqual(callers, {"operator_moves"})
 
     def test_the_listener_reaches_the_store_only_through_the_tools(self):
         imported, _ = _surface.reached(self.source("agent_api"))
@@ -369,6 +457,48 @@ class CallTests(_Store):
         self.ok("submit_work", agent=BOB, repo="widgets", task=task,
                 token=claimed["token"])
         self.assertEqual(self.ok("get_task", task=task)["state"], "landing")
+
+    def test_a_plans_decisions_go_in_and_come_back_through_the_wire(self):
+        task = self.ok("propose", agent=ALICE, repo="widgets", title="Rotate keys",
+                       body="Every 90 days.")["task"]
+        token = self.ok("claim_plan", agent=ALICE, repo="widgets", task=task,
+                        footprint=["src"])["token"]
+        self.ok("submit_plan", agent=ALICE, repo="widgets", task=task, token=token,
+                **PLAN, decisions=[DECISION, MULTI])
+        got = self.ok("get_task", task=task)
+        self.assertEqual((got["plan"]["decisions"], got["answers"]),
+                         ([shown(DECISION), shown(MULTI)], []))
+
+    def test_a_decision_is_checked_against_the_schema_at_every_level(self):
+        task = op.create("widgets", "P", "B", "proposed")["task"]
+        token = reg.agent_moves.claim_plan(ALICE, "widgets", task, ["."])["token"]
+        option = DECISION["options"][0]
+        cases = {
+            "an answer in a decision": ([DECISION | {"answer": 0}],
+                                        "no field 'answer' in decisions[0]"),
+            "an answer in an option": ([DECISION | {"options": [
+                option | {"chosen": True}, DECISION["options"][1]]}],
+                "no field 'chosen' in decisions[0].options[0]"),
+            "a decision not an object": (["Hold?"], "decisions is a list of objects"),
+            "a missing field": ([{k: v for k, v in DECISION.items() if k != "assumes"}],
+                                "decisions[0] is missing assumes"),
+            "a number for a question": ([DECISION | {"question": 7}],
+                                        "decisions[0].question is a string"),
+            "a string for a flag": ([DECISION | {"multi_select": "yes"}],
+                                    "decisions[0].multi_select is true or false"),
+            "positions for labels": ([DECISION | {"assumes": [0]}],
+                                     "decisions[0].assumes is a list of strings"),
+            "a label not a string": ([DECISION | {"options": [
+                option | {"label": ["Hold"]}, DECISION["options"][1]]}],
+                "decisions[0].options[0].label is a string"),
+        }
+        for case, (decisions, said) in cases.items():
+            with self.subTest(case):
+                [reason] = self.refused("submit_plan", {
+                    "agent": ALICE, "repo": "widgets", "task": task, "token": token,
+                    **PLAN, "decisions": decisions})
+                self.assertTrue(reason.startswith(said), reason)
+        self.assertEqual(reads.get_task(task)["state"], "proposed")
 
     def test_each_hand_in_names_the_other_on_the_wrong_state(self):
         token = self.ok("claim_work", agent=ALICE, repo="widgets", task=self.task,

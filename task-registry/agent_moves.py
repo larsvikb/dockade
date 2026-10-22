@@ -2,8 +2,9 @@
 """What an agent may do to a task. Each move names the agent and the repo it works
 in, and every write is recorded under that agent's id.
 
-An agent shapes a task only while it is ``proposed``: once the operator moves it to
-``open``, its spec and blockers are the ones the operator approved. It refines a
+An agent shapes a task only while it is ``proposed``: once the operator approves it,
+its spec and blockers are the ones the operator approved. No agent move answers a
+plan's decisions: the operator's ``approve`` does. It refines a
 ``proposed`` task into a plan by claiming it with ``claim_plan``, or does an ``open``
 one by claiming it with ``claim_work``, and every move on the claim carries the
 claim's token."""
@@ -166,25 +167,28 @@ def update(agent: str, repo: str, task: int, token: str, progress: str | None = 
 def submit_plan(agent: str, repo: str, task: int, token: str, approach: str,
                 footprint: list[str] | tuple[str, ...], tests: str, out_of_scope: str,
                 risks: str, review_rounds: int, review_verdict: str,
+                decisions: list[dict] | tuple[dict, ...] = (),
                 note: str | None = None) -> dict:
-    """The proposal is refined: its plan is written, the task waits in ``refined`` for
-    the operator to approve the two together, and the claim ends. The reply names the
-    live claims and current plans the footprint overlaps; none is refused."""
+    """The proposal is refined: its plan is written with its decisions, the task waits
+    in ``refined`` for the operator to approve the two together, answering the
+    decisions, and the claim ends. The reply names the live claims and current plans
+    the footprint overlaps; none is refused."""
     taskdb.check_agent(agent)
     paths = plans.check(approach, footprint, tests, out_of_scope, risks, review_rounds,
                         review_verdict)
+    asked = plans.check_decisions(decisions)
     notes.check_note(note, required=False)
     fields = {"approach": approach, "tests": tests, "out_of_scope": out_of_scope,
               "risks": risks, "review_rounds": review_rounds,
               "review_verdict": review_verdict}
     with taskdb.writing() as conn:
         row, held, revision = _close(conn, agent, repo, task, token, "submit_plan")
-        plan = plans.insert(conn, task, revision, agent, fields, paths)
+        plan = plans.insert(conn, task, revision, agent, fields, paths, asked)
         note_id = (None if note is None
                    else notes.post(conn, task, agent, note, move="submit_plan"))
         taskdb.record(conn, agent, "submit_plan", task, revision=revision, note=note,
-                      note_id=note_id, plan=plan, plan_footprint=paths, **fields,
-                      **claims.ended(held))
+                      note_id=note_id, plan=plan, plan_footprint=paths, decisions=asked,
+                      **fields, **claims.ended(held))
         reply = {"task": task, "revision": revision, "plan": plan,
                  "overlaps": claims.overlaps(conn, row["repo_id"], task, paths),
                  "plan_overlaps": plans.overlaps(conn, row["repo_id"], task, paths)}

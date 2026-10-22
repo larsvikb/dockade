@@ -2,7 +2,8 @@
 """Tasks: their fields and states, how they relate, and the plain writes.
 
 The checks here hold for every writer. The writes (``insert``, ``update``,
-``set_blockers``) check nothing: ``agent_moves`` and ``operator_moves`` call them after
+``set_blockers``) check nothing but one invariant of state, that no task opens with
+its plan's decisions unanswered: ``agent_moves`` and ``operator_moves`` call them after
 their checks, and a surface for agents calls ``agent_moves`` and ``reads``, never
 these."""
 from __future__ import annotations
@@ -148,9 +149,13 @@ def update(conn: sqlite3.Connection, task: int, changes: dict) -> int:
     The revision counts every change to a task's content or state, so one number
     tells a writer whether the task is still the one it read. A task that enters
     ``proposed`` loses its current plan, whoever moves it there: the plan is kept,
-    superseded, and the next refiner writes another."""
+    superseded, and the next refiner writes another. And none enters ``open`` while its
+    current plan has a decision the operator has not answered, whoever moves it there:
+    the one refusal here."""
     if not changes.keys() <= _UPDATABLE:
         raise ValueError(f"not task columns: {sorted(changes.keys() - _UPDATABLE)}")
+    if changes.get("state") == "open":
+        _check_answered(conn, task)
     now = time.time()
     sets = "".join(f"{column} = ?, " for column in changes)
     conn.execute(
@@ -160,6 +165,19 @@ def update(conn: sqlite3.Connection, task: int, changes: dict) -> int:
         conn.execute("UPDATE plans SET superseded_at = ? WHERE task_id = ? "
                      "AND superseded_at IS NULL", (now, task))
     return conn.execute("SELECT revision FROM tasks WHERE id = ?", (task,)).fetchone()[0]
+
+
+def _check_answered(conn: sqlite3.Connection, task: int) -> None:
+    import plans  # here, not at the top: plans imports this module
+    plan = plans.current(conn, task)
+    if plan is None or not plans.unanswered(conn, plan["id"]):
+        return
+    state = conn.execute("SELECT state FROM tasks WHERE id = ?", (task,)).fetchone()[0]
+    back = ("" if state == "refined"
+            else f"; it is {state}, so the operator moves it back to refined first")
+    raise Refused(f"task {task}'s plan {plan['id']} has decisions the operator has not "
+                  f"answered: only the operator's approve opens it, from refined{back}",
+                  {"state": state})
 
 
 def insert(conn: sqlite3.Connection, repo_id: int, title: str, body: str, state: str,

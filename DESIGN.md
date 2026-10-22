@@ -1981,8 +1981,9 @@ a reply's status, never the token it carries. The tools that carry a claim's tok
 (`update`, `submit_plan`, `submit_work`, `send_back`, `release`, and `edit_proposal`,
 which a holder calls with it) stay at allow: an `ask` card shows a call's arguments
 and the store keeps them, while an allow row records none (`control-plane/api_tool.py`).
-So the operator's check on a plan is the approval, moving its task from `refined` to
-`open`, never an `ask` on `submit_plan`.
+So the operator's check on a plan is the approval, the operator's `approve` on a
+`refined` task, which also answers the plan's decisions, never an `ask` on
+`submit_plan`; no agent tool carries an answer.
 
 **Two surfaces, two networks, one process.** The agent listener is on `mcp-net`, where
 every MCP server can dial it, so it answers only the secret the gateway holds for
@@ -2345,6 +2346,7 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | task registry view — read-only, the operator listener's one client | **done** — reads only; the operator's moves next |
 | — | the task registry's own UI — `tasks-ui`, on another origin and with no `control-net` leg; what both UIs share in `ui-common/` | **done** — the approval page links to it; the page opens on an inbox worked out from task state |
 | — | task registry plans — `refined`, claims that refine a proposal, `submit_plan` and `submit_work`, every plan kept; the store's first migration | **done** — the tasks page shows a task's plans |
+| — | task registry decisions — a plan's questions for the operator in `submit_plan`, answered by the operator API's `approve`, which opens the task or sends it back | **done** — the tasks page neither shows nor answers them yet |
 
 The rationale for each shipped item lives under **Governance surfaces** above, not here
 — a status line goes stale, the reasoning does not. This section is deliberately the

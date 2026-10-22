@@ -22,11 +22,12 @@ DB_PATH = os.environ.get("TASKS_DB", "/var/lib/task-registry/tasks.db")
 # _SCHEMA creates what is missing and alters nothing: `IF NOT EXISTS` adds no column
 # to a table that exists. Changing an existing table takes a version bump and a
 # migration.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 #: The versions `init` opens: v0, a file `_SCHEMA` has not run in; v1, whose step to
-#: v2 only added tables (`plans`, `plan_paths`); and v2, whose step to v3 is `_TO_V3`.
-OPENS = (0, 1, 2, SCHEMA_VERSION)
+#: v2 only added tables (`plans`, `plan_paths`); v2, whose step to v3 is `_TO_V3`; and
+#: v3, whose step to v4 only added tables (`decisions` and the three beside it).
+OPENS = (0, 1, 2, 3, SCHEMA_VERSION)
 
 #: The author of every write the operator makes, and of the registry's own (an expired
 #: claim swept away). No agent id can equal either: an agent id is a kind, a hyphen and
@@ -125,6 +126,38 @@ CREATE TABLE IF NOT EXISTS plan_paths (
     plan_id     INTEGER NOT NULL REFERENCES plans(id),
     path        TEXT NOT NULL,
     PRIMARY KEY (plan_id, path)
+);
+-- A plan's questions for the operator, never changed, as their plan is not.
+CREATE TABLE IF NOT EXISTS decisions (
+    id            INTEGER PRIMARY KEY,
+    plan_id       INTEGER NOT NULL REFERENCES plans(id),
+    position      INTEGER NOT NULL,
+    question      TEXT NOT NULL,
+    why           TEXT NOT NULL,
+    multi_select  INTEGER NOT NULL,
+    UNIQUE (plan_id, position)
+);
+CREATE TABLE IF NOT EXISTS decision_options (
+    decision_id INTEGER NOT NULL REFERENCES decisions(id),
+    position    INTEGER NOT NULL,
+    label       TEXT NOT NULL,
+    meaning     TEXT NOT NULL,
+    -- Whether the plan as written assumes it: the refiner's recommendation.
+    assumed     INTEGER NOT NULL,
+    PRIMARY KEY (decision_id, position)
+);
+-- The operator's answer to a decision, written once, by the operator's approve.
+CREATE TABLE IF NOT EXISTS answers (
+    decision_id INTEGER PRIMARY KEY REFERENCES decisions(id),
+    author      TEXT NOT NULL,
+    created_at  REAL NOT NULL,
+    other       TEXT
+);
+CREATE TABLE IF NOT EXISTS answer_options (
+    decision_id INTEGER NOT NULL REFERENCES answers(decision_id),
+    position    INTEGER NOT NULL,
+    PRIMARY KEY (decision_id, position),
+    FOREIGN KEY (decision_id, position) REFERENCES decision_options(decision_id, position)
 );
 CREATE TABLE IF NOT EXISTS history (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,

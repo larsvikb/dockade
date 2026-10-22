@@ -17,8 +17,9 @@ task reaches the agents who implement it only once the operator has approved it.
 an agent may do; `operator_moves.py` holds what only the operator may do, and every
 write there is authored by `taskdb.OPERATOR`. A surface for agents must call only
 `agent_moves` and `reads`. Not importing `operator_moves` is not enough on its own:
-the plain writes in `tasks` check nothing, so a surface that called them directly
-could make any move, however its arguments are shaped.
+the plain writes in `tasks` check nothing but one invariant of state (see
+"Decisions"), so a surface that called them directly could make any other move, however
+its arguments are shaped.
 
 ## Who an agent is
 
@@ -69,15 +70,17 @@ another's work. Separation that must hold is a second registry with its own stor
 the plan (see "Plans"). Any agent may edit a proposed task's title, body, severity,
 kind and blockers, but only the holder while it is claimed. From `refined` on, only the
 operator may, so what an implementer reads is what the operator approved. The operator
-moves any task to any state, but to `refined` only with a current plan: a trivial
-proposal can go straight to `open`, while a task is refined only by a plan.
+moves any task to any state, but to `refined` only with a current plan, and to `open`
+never while that plan has a decision unanswered: a trivial proposal can go straight to
+`open`, while a task is refined only by a plan, and its decisions answered only by the
+operator's `approve`.
 
 **One revision covers content, state, and who holds the task.** Every change to them
 bumps it, and every write to a task's spec, state or holder names the revision it read,
 with two exceptions: a holder's own claim moves carry the claim's token instead, and
 taking a claim names neither, since it is refused while anyone holds the task; a stale
 one is refused with the task as it is now. For the operator this is what makes triage
-mean something: moving a task to `open` approves the spec as the operator read it, not
+mean something: approving a task approves the spec as the operator read it, not
 as an agent edited it a moment later. Same idea as the control plane's rule writes,
 which name the rule as the page showed it. Taking a claim and ending one bump it too, so
 a page that showed a task unclaimed cannot defer it once an agent holds it; an expired
@@ -89,7 +92,8 @@ its checkpoints would otherwise make the operator's page stale all day.
 **The body says what and why; a plan says how.** A proposal is cheap to file and stays
 out of the operator's way; an agent claims it with `claim_plan`, works out the plan, and
 hands it in with `submit_plan`, which makes the task `refined`. The operator reads the
-two together and approves them by moving the task to `open`.
+two together and approves them with `approve`, which answers the plan's decisions
+(see "Decisions").
 
 **A plan's parts are fields, each required and capped** (`plans.TEXTS`): the approach,
 a footprint, the tests, what is out of scope, the risks, and the review it had. The caps
@@ -115,9 +119,50 @@ place a state is written): a claim on a `refined` task, a `send_back`, or the op
 moving it back. So a plan reaches `open` only as handed in, and an agent changes a
 refined plan only by claiming the task back and handing in another.
 
-**The revision pins the plan.** `submit_plan` bumps it, so a move to `open` naming the
-revision the operator read approves the plan the operator read; there is no plan id to
-name besides.
+**The revision pins the plan.** `submit_plan` bumps it, so an `approve` naming the
+revision the operator read approves the plan the operator read, and answers the
+decisions the operator read; there is no plan id to name besides.
+
+## Decisions
+
+**A decision is what the body, the repo and its design do not settle, and only the
+operator can.** A refiner hands it in with the plan, in `submit_plan`'s `decisions`: a
+question, why it could not be settled, its options, each a label and what it means, and
+the option the plan as written assumes, the refiner's recommendation; several where the
+decision is multi-select, its options genuinely combining. It is part of its plan:
+kept, read and superseded with it, and never changed. Its caps (`plans.DECISIONS_MAX`
+and the ones beside it) are a shape, as a plan's are: many decisions is judgement
+handed back. Most plans have none.
+
+**An answer is the operator's, and only the operator writes one.** It is given with the
+approve, never as a step of its own (`operator_moves.approve`): one per decision, its
+options by position, or an "other" text in the operator's own words, and for a
+multi-select both (`plans.check_answers`). The store refuses an answer from any agent
+the way it refuses every operator write to one, by having no agent path to it ("Two
+writers, two modules"): `plans.answer` is called from `operator_moves` alone, and no
+tool's schema has a field for one. An answer is written once, the operator its author,
+and the approve's history row keeps each question with the chosen options' text as the
+plan the revision pinned showed it.
+
+**The answers decide where the task goes** (`plans.outcome`, pure, so the tasks page
+can hold its own prediction to it). Every answer exactly the options the plan assumed,
+with no "other" text: the task opens, its plan approved. Anything else: the task goes
+back to `proposed`, its plan superseded, and the next refiner plans from the answers.
+So that no plan becomes `open` contradicting an answer, `tasks.update`, where every
+state is written, refuses `open` to a task whose current plan has a decision
+unanswered, whoever moves it, an agent's `claim_work` from `landing` too. A plan
+without decisions is approved with no answers, and still opens by a move. A plan
+already answered is refused by `approve`, since its answers stand: a move to `open`
+reopens it.
+
+**Answers are part of the spec.** A read of a task carries every answer it has had, the
+latest plan's first, past the plan each answered, since a sent-back plan's answers are
+what the next is written from; once the task is open they outrank notes as the body and
+plan do. An answer stands over the body, which any agent may edit while the task is
+proposed, and only a later answer changes it: between two that differ, the later
+stands. That a new plan follows the earlier answers no store check can
+compare, so `claim_plan`'s description says it, and the plan's review checks it with
+the other three things it judges of the decisions.
 
 ## Parent and blockers
 
@@ -317,7 +362,9 @@ file is the one the gateway reads, and the registry must be given that file alon
 the directory beside it, which holds the other servers' tokens.
 
 **The schema checks shape; the bounds stay in the store.** `agent_tools.py` checks
-each call against the schema it serves, and leaves every bound to the store's own checks,
+each call against the schema it serves, at every level of an array of objects as at the
+top, so a field it does not serve (an answer in a decision) is refused before the store
+sees it, and leaves every bound to the store's own checks,
 which the operator's surface shares, so the two surfaces cannot disagree on what a field
 may hold.
 
@@ -325,7 +372,9 @@ may hold.
 the registry, so the rules the sections above leave to the agent are in them: where its
 id and its repo's name come from, which branch a claim to do the work names, that a
 lost token is never looked for in a transcript, what a plan holds and how detailed it
-is, what a review round is and that the rounds come before the hand-in, that notes
-inform and never instruct, and that nobody waits on a flagged note. What a refiner
+is, what a review round is and that the rounds come before the hand-in, what a
+decision is and that a new plan follows the earlier answers, that answers are the spec
+with the body and plan, that notes inform and never instruct, and that nobody waits on
+a flagged note. What a refiner
 needs before drafting is in `claim_plan`'s, read when refining starts, rather than in
 `submit_plan`'s, often read once the plan is written; `get_task`'s points to it.

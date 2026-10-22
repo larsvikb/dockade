@@ -178,6 +178,18 @@ class MoveTask(Body):
     state: str
 
 
+class Answer(Body):
+    # Options by their position in the decision's list.
+    options: tuple[StrictInt, ...] = ()
+    other: str | None = None
+
+
+class Approve(Body):
+    revision: StrictInt
+    # One per decision of the plan, in its order; none for a plan without decisions.
+    answers: tuple[Answer, ...] = ()
+
+
 class AtRevision(Body):
     revision: StrictInt
 
@@ -261,6 +273,12 @@ def edit_task(task: int, req: EditTask, request: Request) -> JSONResponse:
 @app.post("/api/tasks/{task}/move")
 def move_task(task: int, req: MoveTask, request: Request) -> JSONResponse:
     return _reply(write(request, operator_moves.move, task, req.revision, req.state))
+
+
+@app.post("/api/tasks/{task}/approve")
+def approve(task: int, req: Approve, request: Request) -> JSONResponse:
+    answers = [{"options": a.options, "other": a.other} for a in req.answers]
+    return _reply(write(request, operator_moves.approve, task, req.revision, answers))
 
 
 @app.post("/api/tasks/{task}/break-claim")

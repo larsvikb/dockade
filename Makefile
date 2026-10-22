@@ -262,7 +262,7 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	@echo "== bash -n (shell syntax) =="
 	for f in $(SCRIPTS); do bash -n "$$f"; echo "  ok $$f"; done
 	echo "== python compile =="
-	for f in $(PYFILES) $(TESTFILES); do python3 -m py_compile "$$f" && echo "  ok $$f"; done
+	for f in $(PYFILES) $(TESTFILES); do python3 -m py_compile "$$f"; echo "  ok $$f"; done
 	echo "== json validity =="
 	for f in $(JSONFILES); do
 	  python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$$f" && echo "  ok $$f" \

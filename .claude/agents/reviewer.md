@@ -57,8 +57,14 @@ production runs, what was tested where — check it.
 4. **What the commit makes false.** A doc, comment, test name or guard elsewhere that
    now says something untrue.
 5. **New tests, mutation-checked.** Remove the fix in your clone and confirm the new
-   tests fail, then restore it. Do not rerun the whole suite: the author runs it, and CI
-   runs the strict `make check` and the boundary check on every PR.
+   tests fail, then restore it. Then go past the mutations the commit body lists:
+   remove each guard, check or filter the commit adds or touches, one at a time, and
+   run the tests that cover it. On a large commit, take the guards on policy,
+   containment and audit first. A survivor the author did not list has turned up in
+   many code commits. Many mutants in quick succession can leave a stale `.pyc`:
+   NOTES.md, "A cached `.pyc` can stand in for a mutant, and `-B` alone does not stop
+   it". Do not rerun the whole suite: the author runs it, and CI runs the strict `make
+   check` and the boundary check on every PR.
 6. **The code against the invariants:** governance, containment, credentials,
    default-deny, audit.
 7. **Where this repo's defects cluster:** prose about migration, rollback and restore;
@@ -76,6 +82,10 @@ there did not need the host.
 Reproduce each finding before you list it. Drop what you cannot confirm, or mark it as
 a judgement call.
 
+- A new or changed HTTP route: run it on the real framework, at the versions in its
+  component's `requirements.txt`, installed from PyPI into a venv in D. The suite
+  stubs FastAPI, and what the stubs cannot show — a 500 on odd input, a 422 that
+  echoes it — has been found this way.
 - WebSearch works for Claude Code's docs. WebFetch to a host outside the egress
   allowlist, code.claude.com among them, waits for the operator to approve it; don't.
 - Don't run the `claude` CLI beyond `--help` and `--version`: a session spends the

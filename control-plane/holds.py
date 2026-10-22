@@ -415,8 +415,9 @@ TOOL_HOLD_TIMEOUT = float(os.environ.get("CONTROL_TOOL_HOLD_TIMEOUT", "3600"))
 #
 # Without it an unbounded grant is a standing authorization, redeemable a week later
 # by a session the operator has forgotten. Shorter than the ask window: a human
-# deciding is slow, and a gateway that already has its answer is not.
-TOOL_GRANT_TIMEOUT = float(os.environ.get("CONTROL_TOOL_GRANT_TIMEOUT", "900"))
+# deciding is slow, and a gateway that already has its answer is not. Read by the
+# grant parser, not as a bare float like the bounds beside it: a large value widens.
+TOOL_GRANT_TIMEOUT = policy._grant_seconds("CONTROL_TOOL_GRANT_TIMEOUT", "900")
 # The card caps, tool-side. Their own numbers, since the two surfaces share no pool
 # and a queue of asks costs no workers.
 MAX_TOOL_PENDING = int(os.environ.get("CONTROL_MAX_TOOL_PENDING", "12"))

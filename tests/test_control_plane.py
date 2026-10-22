@@ -492,13 +492,19 @@ class TimedPinDecisionTests(unittest.TestCase):
 
 
 class GrantSecondsTests(unittest.TestCase):
-    """A timed grant's duration is refused at startup unless finite and above zero:
-    a NaN deadline is stored as NULL, which a pin reads as permanent."""
+    """A timed grant's duration is refused at startup unless finite, above zero and at
+    most ``GRANT_CEILING_SECONDS``: a NaN deadline is stored as NULL, which a pin reads
+    as permanent, and an infinite or huge one is a standing grant."""
 
     def test_a_usable_duration_is_read(self):
         with mock.patch.dict(os.environ, {"CONTROL_X": "14400"}):
             self.assertEqual(cp.policy._grant_seconds("CONTROL_X", "1"), 14400.0)
         self.assertEqual(cp.policy._grant_seconds("CONTROL_UNSET_X", "1800"), 1800.0)
+
+    def test_the_ceiling_itself_is_read(self):
+        ceiling = cp.policy.GRANT_CEILING_SECONDS
+        with mock.patch.dict(os.environ, {"CONTROL_X": repr(ceiling)}):
+            self.assertEqual(cp.policy._grant_seconds("CONTROL_X", "1"), ceiling)
 
     def test_nan_infinity_and_nothing_are_refused(self):
         for value in ("nan", "inf", "-inf", "0", "-5"):
@@ -506,6 +512,34 @@ class GrantSecondsTests(unittest.TestCase):
                     mock.patch.dict(os.environ, {"CONTROL_X": value}), \
                     self.assertRaisesRegex(ValueError, "CONTROL_X"):
                 cp.policy._grant_seconds("CONTROL_X", "1")
+
+    def test_over_the_ceiling_is_refused_naming_it(self):
+        ceiling = cp.policy.GRANT_CEILING_SECONDS
+        for value in (repr(ceiling + 1), "1e300"):
+            with self.subTest(value=value), \
+                    mock.patch.dict(os.environ, {"CONTROL_X": value}):
+                with self.assertRaises(ValueError) as caught:
+                    cp.policy._grant_seconds("CONTROL_X", "1")
+                self.assertIn("CONTROL_X", str(caught.exception))
+                self.assertIn(f"{ceiling:g}", str(caught.exception))
+
+    def _import_fresh(self, module, env):
+        spec = importlib.util.spec_from_file_location(
+            f"dockade_{module}_grant", ROOT / f"control-plane/{module}.py")
+        with mock.patch.dict(os.environ, env):
+            spec.loader.exec_module(importlib.util.module_from_spec(spec))
+
+    def test_every_grant_setting_refuses_a_bad_value_at_import(self):
+        # The parser is only half of it: each module-level setting has to go through
+        # it, so the control plane stops before it serves a request.
+        over = repr(cp.policy.GRANT_CEILING_SECONDS + 1)
+        for module, var in (("holds", "CONTROL_TOOL_GRANT_TIMEOUT"),
+                            ("policy", "CONTROL_LEASE_SECONDS"),
+                            ("policy", "CONTROL_PIN_LEASE_SECONDS")):
+            for value in ("inf", "nan", over):
+                with self.subTest(var=var, value=value), \
+                        self.assertRaisesRegex(ValueError, var):
+                    self._import_fresh(module, {var: value})
 
 
 class ShortDurationTests(unittest.TestCase):

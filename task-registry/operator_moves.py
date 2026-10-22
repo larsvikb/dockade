@@ -383,10 +383,14 @@ def inbox() -> dict:
         conn.execute("BEGIN")
         now = claims.now()
         found: dict[int, list[dict]] = {}
+        # A parked or dropped task is nobody's turn, so its flagged notes wait with it
+        # (tasks-ui/DESIGN.md, "The inbox: whose turn it is, worked out").
         for r in conn.execute(
-                "SELECT task_id, COUNT(*) AS n, MIN(created_at) AS first FROM notes "
-                "WHERE for_operator = 1 AND hidden_at IS NULL AND handled_at IS NULL "
-                "GROUP BY task_id"):
+                "SELECT n.task_id, COUNT(*) AS n, MIN(n.created_at) AS first "
+                "FROM notes n JOIN tasks t ON t.id = n.task_id "
+                "WHERE n.for_operator = 1 AND n.hidden_at IS NULL "
+                "AND n.handled_at IS NULL AND t.state NOT IN ('deferred', 'closed') "
+                "GROUP BY n.task_id"):
             found.setdefault(r["task_id"], []).append(
                 {"why": "flagged", "since": r["first"], "notes": r["n"]})
         for r in conn.execute("SELECT id, state FROM tasks "

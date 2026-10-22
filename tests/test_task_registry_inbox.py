@@ -193,6 +193,51 @@ class SectionTests(_Store):
             with self.subTest(state=state):
                 self.assertIsNone(self.where(task))
 
+    def test_a_flagged_note_waits_with_its_parked_or_closed_task(self):
+        # Moved there by the operator with notes already flagged (#47's path), or made
+        # there and flagged after, since an agent may note a task in any state.
+        since, flags = {}, []
+        for state in ("deferred", "closed"):
+            moved = self.proposal(f"Moved {state}")
+            op.handle_note(self.flag(moved))
+            self.later()
+            flags.append(self.flag(moved))
+            since[moved] = (self.clock, 2)
+            self.later()
+            flags.append(self.flag(moved, "And another?"))
+            op.move(moved, self.revision(moved), state)
+            made = op.create("widgets", f"Made {state}", "B", state)["task"]
+            self.later()
+            flags.append(self.flag(made))
+            since[made] = (self.clock, 1)
+            self.later()
+        self.assertEqual({name: self.section(name)["total"] for name in op.SECTIONS},
+                         {"waiting": 0, "triage": 0, "drifting": 0})
+        for task in since:
+            self.assertIsNone(self.where(task))
+        listed = {n["id"] for n in op.notes_for_operator()["notes"]}
+        self.assertEqual(listed, set(flags))
+        for task in since:
+            op.move(task, self.revision(task), "proposed")
+        waiting = self.section("waiting")
+        self.assertEqual(waiting["total"], len(since))
+        rows = self.rows("waiting")
+        for task, (first, count) in since.items():
+            with self.subTest(task=task):
+                self.assertEqual(rows[task]["reasons"],
+                                 [{"why": "flagged", "since": first, "notes": count}])
+
+    def test_a_flagged_note_on_an_open_or_landing_task_waits(self):
+        opened = op.create("widgets", "Open", "Do it.", "open")["task"]
+        self.flag(opened)
+        landing = self.landing()
+        self.later()
+        self.flag(landing)
+        rows = self.rows("waiting")
+        self.assertEqual([r["why"] for r in rows[opened]["reasons"]], ["flagged"])
+        self.assertEqual([r["why"] for r in rows[landing]["reasons"]],
+                         ["flagged", "landing"])
+
     def test_a_task_is_in_its_highest_section_with_every_reason(self):
         task = self.refined()
         self.later()

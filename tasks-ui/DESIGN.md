@@ -78,8 +78,9 @@ and since when (`operator_moves.SECTIONS`). Only what the operator alone can act
 in it, a flagged note, work to land, a plan to triage, so a fresh claim or an open task
 is not; what goes wrong slowly, a claim that ran out or a task gone quiet, sits lower and
 a few at a time, so it shows without burying the rest. What waits and what is to triage
-come whole, never a page of them. A deferred task is out of it: deferring is the
-operator's own decision to take it up later, so it is nobody's turn until then. Every
+come whole, never a page of them. A deferred or closed task is out of it: deferring or
+closing is the operator's own decision, so it is nobody's turn until reopened, and a
+flagged note on it waits with it and comes back when it is. Every
 task is a view away, under All tasks.
 
 **The task is read beside the list, and the hash names it.** Opening a task, closing it

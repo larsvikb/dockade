@@ -48,6 +48,10 @@ the commit in its own clone, so your checkout may move.
   branch.
 - A fix larger than a line or two gets its own mutation check. A rewrite gets a second
   review.
+- When a finding is a hole in an earlier round's fix, ask whether the design is wrong
+  before patching again. A fix that must hold for every ordering of a race wants a
+  guard where the race is decided, such as a transaction or a conditional write, not
+  one more check beside it.
 
 ## 5. Host checks, when one earns it
 

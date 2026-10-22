@@ -1720,6 +1720,20 @@ class EveryServiceDropsEveryCapabilityTests(unittest.TestCase):
                 self.assertFalse([ln for ln in body
                                   if re.match(r"    privileged:\s*true", ln)])
 
+    def test_every_service_sets_no_new_privileges(self):
+        # Dropping every capability empties the bounding set, but a setuid or setgid
+        # binary still changes uid or gid on exec: a setuid-root one runs as euid 0,
+        # the owner of root's files. `no-new-privileges` stops that, and keeps an LSM
+        # from relaxing confinement on exec. Exact, as `cap_drop` is: a
+        # `no-new-privileges:false` beside it fails, and so does a new option until
+        # this list names it.
+        for svc in _service_names():
+            body = _service(svc)
+            with self.subTest(service=svc):
+                self.assertEqual([ln.strip() for ln in _block(body, "security_opt", 4)
+                                  if ln.strip() and not ln.strip().startswith("#")],
+                                 ["- no-new-privileges:true"])
+
 
 class EveryImageIsBuiltTests(unittest.TestCase):
     """`make verify-build` is the one check that a Dockerfile still builds, and compose

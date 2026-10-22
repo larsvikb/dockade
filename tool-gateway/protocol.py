@@ -146,6 +146,16 @@ def handle(message: object, listing: list[dict], execute=None) -> dict | None:
             return _error(message_id, INVALID_PARAMS,
                           "tools/call needs a tool name")
         arguments = params.get("arguments")
+        # Settled HERE, before anything decides the call: the value the executor gets is
+        # the one the approval card shows and the one the server is sent, so no later
+        # layer may substitute for it. MCP types it as an object, so absent or null is
+        # "no arguments" and anything else is a malformed request. Its shape is all
+        # that is checked; its content is the decision's.
+        if arguments is None:
+            arguments = {}
+        elif not isinstance(arguments, dict):
+            return _error(message_id, INVALID_PARAMS,
+                          "tools/call needs its arguments as an object")
         # A JSON-RPC error is reserved for a malformed REQUEST. Everything the executor
         # decides — a deny, an unknown tool, an unreachable server — comes back as a
         # result, because each carries a reason the agent can act on and an error

@@ -375,9 +375,9 @@ class ProtocolTests(unittest.TestCase):
         self.assertNotIn("result", answer)
 
     def test_a_call_is_handed_to_the_executor_verbatim(self):
-        # The name is not decoded here and the arguments are not inspected. This module
-        # has no policy in it, and a protocol layer that pre-judged either would be a
-        # second place where a call could be decided.
+        # The name is not decoded here, and of the arguments only their shape is checked,
+        # never their content. This module has no policy in it, and a protocol layer
+        # that pre-judged either would be a second place where a call could be decided.
         seen = []
 
         def execute(name, arguments):
@@ -413,6 +413,36 @@ class ProtocolTests(unittest.TestCase):
                     {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                      "params": params}, [], execute)
                 self.assertEqual(answer["error"]["code"], self.protocol.INVALID_PARAMS)
+
+    def test_arguments_that_are_not_an_object_never_reach_the_executor(self):
+        # Falsy ones especially: `false` used to be shown on the approval card as itself
+        # and run as `{}`. The resume tool's name is here because the executor routes it
+        # before anything else, so only a check ahead of the executor covers it.
+        def execute(name, arguments):  # pragma: no cover - must not run
+            raise AssertionError("the executor was reached")
+
+        for name in ("mcp-github__get_issue", load_surface().RESUME_TOOL):
+            for arguments in (False, 0, "", [], "abc", 7, [1]):
+                with self.subTest(name=name, arguments=arguments):
+                    answer = self.protocol.handle(
+                        {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                         "params": {"name": name, "arguments": arguments}}, [], execute)
+                    self.assertEqual(answer["error"]["code"],
+                                     self.protocol.INVALID_PARAMS)
+
+    def test_absent_or_null_arguments_reach_the_executor_as_an_empty_object(self):
+        # Settled before the decision, so the card shows the `{}` that runs, not `null`.
+        for params in ({"name": "x__y"}, {"name": "x__y", "arguments": None}):
+            with self.subTest(params=params):
+                seen = []
+
+                def execute(name, arguments):
+                    seen.append(arguments)
+                    return {"content": [], "isError": False}
+
+                self.protocol.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                      "params": params}, [], execute)
+                self.assertEqual(seen, [{}])
 
     def test_a_notification_is_never_answered(self):
         # Including one we do not recognize: replying to a notification is a protocol

@@ -242,9 +242,10 @@ def _run(server: str, tool: str, arguments: object, client: str | None = None,
     call itself reads them — and ``approval_id`` being present is exactly what marks a
     row as having come through a human.
 
-    The ARGUMENTS are the caller's to get right. On the resumption path they are the
-    ones the human read, handed back by the claim rather than replayed from anything
-    the agent sent."""
+    The ARGUMENTS are the caller's to get right, and are sent as given: a default
+    substituted here would run something other than what the approval card showed. On
+    the resumption path they are the ones the human read, handed back by the claim
+    rather than replayed from anything the agent sent."""
     def recorded(result: dict, status: str, reason: str | None = None) -> dict:
         outcomes.record(status, server, tool, reason=reason, approval_id=approval_id,
                      client=client)
@@ -270,7 +271,7 @@ def _run(server: str, tool: str, arguments: object, client: str | None = None,
         raw = discovery.post(
             entry,
             {"jsonrpc": "2.0", "id": discovery.REQUEST_ID, "method": "tools/call",
-             "params": {"name": tool, "arguments": arguments if arguments else {}}},
+             "params": {"name": tool, "arguments": arguments}},
             timeout=CALL_TIMEOUT)
         result, status = parse_call(raw)
     except discovery.DiscoveryError as exc:

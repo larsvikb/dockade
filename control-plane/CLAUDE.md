@@ -31,6 +31,8 @@ lives rather than restating it.
 - **A bound or cap:** an env var, because it fails closed — see "Hold bounds are
   fail-closed, so their values stay env vars" in
   `control-plane/DESIGN.md`.
+- **A grant duration** (how long an allow lasts): through `policy._grant_seconds`, never
+  a bare `float`, because it widens rather than fails closed — the same section.
 
 ## Testing
 

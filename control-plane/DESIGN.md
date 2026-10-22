@@ -376,6 +376,12 @@ gateway's hold window is a second constant with its own name, beside the tool po
 does get its own table (see "Tool policy gets its own table" below). What survives of
 2c-2 is rule **editing**, where the audit argument does apply, because a rule grants.
 
+Grant durations are the counter-case. `CONTROL_LEASE_SECONDS`,
+`CONTROL_PIN_LEASE_SECONDS` and `CONTROL_TOOL_GRANT_TIMEOUT` say how long an allow
+lasts, so a wrong value widens, and the argument above does not reach them. They stay
+env vars only because `policy._grant_seconds` holds them under a ceiling kept in code,
+which no override can raise.
+
 What none of this excuses is that both cross-value invariants here went unenforced at
 runtime. The four caps must each be able to fire, and the test asserting it covers only
 the defaults — an override could silence a cap with nothing to notice. And the egress

@@ -280,15 +280,24 @@ def _rule_error(pattern: str, action: str) -> str | None:
 
 
 # ── leases: an allow that expires ────────────────────────────────────────────
+# The longest any grant duration may be set to: one day, several times the longest
+# default (the pin lease). Past a day a grant outlasts the session it was given in. A code
+# constant, not an env var: it limits how much a setting can grant, and an override
+# would bring the standing grant back (control-plane/DESIGN.md, "Hold bounds are
+# fail-closed, so their values stay env vars").
+GRANT_CEILING_SECONDS = 86400.0
+
+
 def _grant_seconds(var: str, default: str) -> float:
-    """How long a timed grant lasts, from ``var``. Refused at startup unless finite and
-    above zero, because these numbers GRANT, where a hold bound can only deny: SQLite
-    stores a NaN deadline as NULL, which a pin reads as permanent, and an infinite one
-    never ends."""
+    """How long a timed grant lasts, from ``var``. Refused at startup unless finite,
+    above zero and at most ``GRANT_CEILING_SECONDS``, because these numbers GRANT,
+    where a hold bound can only deny: SQLite stores a NaN deadline as NULL, which a pin
+    reads as permanent, an infinite one never ends, and a huge finite one (``1e300``)
+    is a standing grant as surely."""
     seconds = float(os.environ.get(var, default))
-    if not math.isfinite(seconds) or seconds <= 0:
-        raise ValueError(f"{var} must be a finite number of seconds above zero, "
-                         f"not {seconds!r}")
+    if not math.isfinite(seconds) or not 0 < seconds <= GRANT_CEILING_SECONDS:
+        raise ValueError(f"{var} must be a finite number of seconds above zero and at "
+                         f"most {GRANT_CEILING_SECONDS:g}, not {seconds!r}")
     return seconds
 
 

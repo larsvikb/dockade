@@ -57,6 +57,17 @@ const HIDDEN = { id: 11, task: 3, author: "operator", at: NOW - 2000,
 const ANSWER = { id: 12, task: 3, author: "operator", at: NOW - 900, text: "Seen.",
                  for_operator: false, handled: false, hidden: false, move: null,
                  reply_to: 10 };
+// Notes flagged for the operator and not handled: two on task 3, one each on 6 and 8.
+function flaggedNote(id, task, at, text) {
+  return { id, task, author: "claude-3f2a9c1e", at, text, for_operator: true,
+           handled: false, hidden: false, move: null, reply_to: null };
+}
+const ASKED = flaggedNote(13, 3, NOW - 500, `Is the relay ${RLO}right?`);
+const BLOCKED = flaggedNote(14, 3, NOW - 400, `Blocked on the store${ZWSP}.`);
+const ON_REFINED = flaggedNote(15, 6, NOW - 300, "Plan 2 or plan 1?");
+const ON_SECOND = flaggedNote(16, 8, NOW - 200, "Ready when you are.");
+// And one on task 7, which the operator deferred: it waits with it, out of the inbox.
+const ON_PARKED = flaggedNote(17, 7, NOW - 100, "Still wanted later?");
 
 const TASK = {
   ...TASKS[0], repo: "dockade", revision: 4, created_at: NOW - 86400,
@@ -66,7 +77,7 @@ const TASK = {
   children: [{ id: 4, title: "Child", state: "closed" },
              { id: 5, title: "Other child", state: "landing" }],
   blockers: [{ id: 2, title: "Back up the store", state: "open" }],
-  plan: PLAN, notes: [STARTED, ANSWER],
+  plan: PLAN, notes: [STARTED, ANSWER, ASKED, BLOCKED],
 };
 
 // Task 1 went back to proposed: its plan is the superseded one. Task 2 was opened with
@@ -78,6 +89,9 @@ const SENT_BACK = { ...TASKS[2], state: "proposed", ready: false, repo: "dockade
 const UNPLANNED = { ...TASKS[1], repo: "dockade", revision: 1, created_at: NOW - 5000,
                     updated_at: NOW - 5000, body: "Back it up.", children: [],
                     blockers: [], plan: null, notes: [] };
+const PARKED = { ...UNPLANNED, id: 7, title: "Parked one", state: "deferred",
+                 ready: false, blocked: false, kind: null, revision: 3,
+                 notes: [ON_PARKED] };
 
 // Task 6 waits for triage with a plan that replaced another, and task 8 behind it with
 // its first; task 5 to land, its claim ended.
@@ -123,8 +137,15 @@ function claimedHistory() {
     entry("operator", "hide_note", NOW - 1000, { note_id: 11, hidden: true, actor: null }),
     entry("operator", "handle_note", ANSWER.at,
           { note_id: 10, handled: true, reply: ANSWER.text, reply_id: 12, actor: null },
-          ANSWER));
+          ANSWER),
+    noteEntry(ASKED), noteEntry(BLOCKED));
   return rows;
+}
+
+// The entry an agent's flagged note was posted with.
+function noteEntry(note) {
+  return entry(note.author, "note", note.at,
+               { note: note.text, note_id: note.id, for_operator: true }, note);
 }
 
 function refinedHistory(created) {
@@ -148,8 +169,10 @@ const HISTORIES = {
   3: claimedHistory(),
   5: [entry("claude-3f2a9c1e", "submit_work", NOW - 9000,
             { revision: 9, note: null, note_id: null, branch: `land${ZWSP}-it` })],
-  6: refinedHistory(NOW - 9000),
-  8: refinedHistory(NOW - 4000),
+  6: [...refinedHistory(NOW - 9000), noteEntry(ON_REFINED)],
+  8: [...refinedHistory(NOW - 4000), noteEntry(ON_SECOND)],
+  7: [entry("operator", "create", NOW - 6000, { title: "Parked one", state: "deferred" }),
+      noteEntry(ON_PARKED)],
 };
 
 function historyPage(id, params) {
@@ -208,9 +231,41 @@ const UNREACHABLE = { ok: false, current: null,
 // The tasks the steps write to: copies, moved as the operator API would move them
 // (task-registry/operator_moves.py), each write recorded in their history, so a read
 // after a write shows it.
-const WRITTEN = { 3: { ...TASK, notes: [...TASK.notes] }, 6: { ...REFINED, notes: [] },
-                  8: { ...SECOND, notes: [] } };
+const WRITTEN = { 3: { ...TASK, notes: [...TASK.notes] },
+                  6: { ...REFINED, notes: [ON_REFINED] },
+                  8: { ...SECOND, notes: [ON_SECOND] } };
 let nextNote = 20;
+
+// Every note a move can name, by id: the ones the timelines carry, so a hide or a
+// handle shows wherever the note is drawn.
+const NOTES = new Map([STARTED, HIDDEN, ANSWER, ASKED, BLOCKED, ON_REFINED, ON_SECOND,
+                       ON_PARKED].map(n => [n.id, n]));
+
+// The flagged list, as `operator_moves.notes_for_operator` reads it: visible notes for
+// the operator and not handled, newest first, a page at a time past `before`, each
+// with its task's state as it is now.
+function flaggedPage(params) {
+  const before = Number(params.get("before") || Infinity);
+  const all = [...NOTES.values()].filter(n => n.for_operator && !n.handled && !n.hidden)
+    .sort((a, b) => b.id - a.id);
+  return { notes: all.filter(n => n.id < before).slice(0, PAGE)
+             .map(n => ({ ...n, task_state: (WRITTEN[n.task] || READ[n.task]).state })),
+           total: all.length };
+}
+
+// A step changes the flagged list behind the page's back, as an agent and another tab
+// would: a note flagged on task 8, and task 8's other one handled.
+export function flagElsewhere() {
+  const id = nextNote++;
+  const note = flaggedNote(id, 8, NOW, "One more thing.");
+  NOTES.set(id, note);
+  WRITTEN[8].notes.push(note);
+  HISTORIES[8].push(noteEntry(note));
+  ON_SECOND.handled = true;
+  HISTORIES[8].push(entry("operator", "handle_note", NOW,
+                          { note_id: ON_SECOND.id, handled: true, reply: null,
+                            reply_id: null, actor: null }));
+}
 
 // A step changes a task behind the page's back, as another session would: the page's
 // next move on it names a revision that is no longer the task's.
@@ -221,6 +276,15 @@ export function editElsewhere(id) {
   HISTORIES[id].push(entry("operator", "edit", NOW, { revision: t.revision,
                                                       body: t.body, actor: null }));
 }
+// A step defers a task behind the page's back, as another tab would.
+export function deferElsewhere(id) {
+  const t = WRITTEN[id];
+  const before = t.state;
+  t.state = "deferred";
+  t.revision += 1;
+  HISTORIES[id].push(entry("operator", "move", NOW, { before, state: t.state,
+                                                      revision: t.revision, actor: null }));
+}
 // A step loses the next write's answer after the write lands: the relay's 504.
 let loseNext = false;
 export function loseNextAnswer() { loseNext = true; }
@@ -230,7 +294,48 @@ function changed(t) {
     detail: `task ${t.id} changed since it was read: it is at revision ${t.revision}` } };
 }
 
+// A move on notes, as `operator_moves` makes it: all of a bulk or none, each recorded
+// on its note's task. A handle with a reply posts the reply as the operator's note.
+function noteWrite(path, body) {
+  const one = path.match(/^\/api\/notes\/(\d+)\/handle$/);
+  const ids = one ? [Number(one[1])] : body.notes;
+  const notes = ids.map(id => NOTES.get(id));
+  if (notes.some(n => !n)) {
+    return { status: 404, json: { ok: false, current: null, detail: "no such note" } };
+  }
+  const hide = path === "/api/notes/hide";
+  if (!hide && notes.some(n => !n.for_operator)) {
+    return { status: 400, json: { ok: false, current: null,
+                                  detail: "a note not marked for the operator" } };
+  }
+  let reply = null;
+  for (const n of notes) {
+    const history = HISTORIES[n.task];
+    if (hide) {
+      n.hidden = body.hidden;
+      history.push(entry("operator", "hide_note", NOW,
+                         { note_id: n.id, hidden: body.hidden, actor: null }));
+      continue;
+    }
+    n.handled = body.handled;
+    if (one && body.reply !== null) {
+      reply = { id: nextNote++, task: n.task, author: "operator", text: body.reply,
+                at: NOW, for_operator: false, move: null, reply_to: n.id, handled: false,
+                hidden: false };
+      NOTES.set(reply.id, reply);
+      if (WRITTEN[n.task]) WRITTEN[n.task].notes.push(reply);
+    }
+    history.push(entry("operator", "handle_note", NOW,
+                       { note_id: n.id, handled: body.handled, reply: one ? body.reply : null,
+                         reply_id: reply && reply.id, actor: null }, reply));
+  }
+  return { status: 200, json: one
+    ? { ok: true, task: notes[0].task, note: notes[0].id, reply: reply && reply.id }
+    : { ok: true, notes: ids } };
+}
+
 function write(path, body) {
+  if (path.startsWith("/api/notes/")) return lost(noteWrite(path, body));
   const m = path.match(/^\/api\/tasks\/(\d+)\/(move|break-claim|notes)$/);
   const t = m && WRITTEN[m[1]];
   if (!t) return null;
@@ -267,16 +372,34 @@ function write(path, body) {
                                                   revision: t.revision, actor: null }));
     answer = { status: 200, json: { ok: true, task: t.id, revision: t.revision } };
   }
-  if (loseNext) {
-    loseNext = false;
-    return { status: 504, json: { ok: false, current: null,
-      detail: "the task registry did not answer a write it was sent (ReadTimeout): "
-              + "it may have landed" } };
-  }
-  return answer;
+  return lost(answer);
 }
 
-const READ = { 1: SENT_BACK, 2: UNPLANNED, 5: LANDING };
+// The answer, or the relay's 504 in its place when a step asked to lose it: the write
+// has landed either way.
+function lost(answer) {
+  if (!loseNext || answer.status !== 200) return answer;
+  loseNext = false;
+  return { status: 504, json: { ok: false, current: null,
+    detail: "the task registry did not answer a write it was sent (ReadTimeout): "
+            + "it may have landed" } };
+}
+
+const READ = { 1: SENT_BACK, 2: UNPLANNED, 5: LANDING, 7: PARKED };
+
+// The inbox as `operator_moves.inbox` has it after a step moved a task: a deferred or
+// closed task is nobody's turn, so it is in no section.
+function inboxNow() {
+  const out = {};
+  for (const [key, section] of Object.entries(INBOX)) {
+    const kept = section.tasks.filter(t => {
+      const now = WRITTEN[t.task] || READ[t.task];
+      return !now || !["deferred", "closed"].includes(now.state);
+    });
+    out[key] = { tasks: kept, total: section.total - (section.tasks.length - kept.length) };
+  }
+  return out;
+}
 
 export function respond(method, path, body, params) {
   if (method === "GET" && path === "/running") {
@@ -305,6 +428,7 @@ export function respond(method, path, body, params) {
       (params.get("text") || "").toLowerCase()));
     return { status: 200, json: { tasks: rows, total: rows.length } };
   }
-  if (path === "/api/inbox") return { status: 200, json: INBOX };
+  if (path === "/api/inbox") return { status: 200, json: inboxNow() };
+  if (path === "/api/notes/flagged") return { status: 200, json: flaggedPage(params) };
   return null;
 }

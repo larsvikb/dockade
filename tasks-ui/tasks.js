@@ -21,8 +21,10 @@ import { lineDiff, wordDiff } from "./diff.js";
 import { escapePayload } from "./escape.js";
 import { pollStatus, renderListStatus } from "./list-status.js";
 import {
-  TASK_STATES, NOT_RUNNING_STATUS, movesFor, sendWrite, readAnswer, writeOutcome,
-  checkWrite, lastNoteId,
+  TASK_STATES, NOT_RUNNING_STATUS, movesFor, noteMovesFor, isNoteMove,
+  onParkedTask, selectAll, tickMark, bulkToSend, keptSelection, redrawsFlagged,
+  sendWrite, readAnswer,
+  writeOutcome, checkWrite, lastNoteId, lastEntryId,
 } from "./moves.js";
 import { fmtStamp, fmtInstant } from "./time.js";
 
@@ -337,35 +339,75 @@ export function approveHidden(task) {
 }
 
 // What a write came to, in a line, and whether it warns: `writeOutcome`'s word, or for
-// an answer that was lost, `checkWrite`'s. `detail` is the refusal's own reason.
+// an answer that was lost, `checkWrite`'s. `detail` is the refusal's own reason. A bulk
+// is all or none, so a refused one says none was handled; a hide or a show says what it
+// changed for the note as it was (`noteLanded`).
 export function outcomeText(write, outcome, detail) {
+  const said = outcomeLine(write, outcome, detail);
+  return { ...said, text: said.text + leftOutText(write) };
+}
+
+// The notes a bulk left out because their task was parked since the list was drawn,
+// each with its task's state, after whatever the bulk came to.
+export function leftOutText(write) {
+  const out = write && Array.isArray(write.leftOut) ? write.leftOut : [];
+  return out.map(o => ` Note #${o.id} left out: its task was `
+    + `${spellHidden(String(o.state)).text} since the list was drawn.`).join("");
+}
+
+// Beside the handle, the ticked notes it would leave out, so a box ticked and not
+// counted is explained: in a span of fixed width, so nothing moves when it changes.
+export function leftOutLine(leftOut) {
+  return (Array.isArray(leftOut) ? leftOut : [])
+    .map(o => `#${o.id} left out: its task was ${spellHidden(String(o.state)).text}`)
+    .join("; ");
+}
+
+function outcomeLine(write, outcome, detail) {
   const what = write && write.kind === "note" ? "The note" : `${write && write.verb}`;
   const name = what.charAt(0).toUpperCase() + what.slice(1);
+  const kind = write && write.kind;
+  const bulk = kind === "handle-many";
   switch (outcome) {
     case "landed":
-      return { text: `${name}: done.`, warn: false };
+      return { text: `${name}: done.${kind === "hide" ? noteLanded(write) : ""}`,
+               warn: false };
     case "stale":
       return { text: `${name}: not done. The task changed since this page read it; `
                      + "this is the task as it is now.", warn: true };
     case "refused":
-      return { text: `${name}: refused. ${spellHidden(String(detail ?? "")).text}`.trim(),
-               warn: true };
+      return { text: (`${name}: refused${bulk ? ", so none of them was handled" : ""}. `
+                      + spellHidden(String(detail ?? "")).text).trim(), warn: true };
     case "not-running":
       return { text: `${name}: not sent. The task registry is not running.`, warn: true };
     case "found":
-      return { text: `${name}: no answer came, but the task shows it landed.`,
+      return { text: bulk
+                 ? `${name}: no answer came, but none of them is flagged any more, so it `
+                   + "landed."
+                 : `${name}: no answer came, but the task shows it landed.`,
                warn: false };
     case "not-landed":
-      return { text: `${name}: no answer came, and the task is unchanged, so it has not `
-                     + "landed yet. Sending it again cannot apply it twice.", warn: true };
+      return { text: bulk
+                 ? `${name}: no answer came, and they are still flagged, so it has not `
+                   + "landed yet. Sending it again is harmless: it only marks them."
+                 : `${name}: no answer came, and the task is unchanged, so it has not `
+                   + "landed yet. Sending it again cannot apply it twice.", warn: true };
+    case "not-seen":
+      return { text: `${name}: no answer came, and the task's timeline does not show it `
+                     + "yet. It may still land; sending it again is harmless, since it "
+                     + "sets the same flag.", warn: true };
     case "not-found-yet":
-      return { text: `${name}: no answer came, and the note is not on the task yet. It `
-                     + "may still land: look at the timeline before sending it again.",
-               warn: true };
+      return { text: `${name}: no answer came, and the ${kind === "handle" ? "reply" : "note"}`
+                     + " is not on the task yet. It may still land: look at the timeline "
+                     + "before sending it again.", warn: true };
     case "could-not-check":
-      return { text: `${name}: no answer came, and the task could not be read again, `
-                     + "so whether it landed is not known. Read the task before "
-                     + "trying again.", warn: true };
+      return { text: `${name}: no answer came, and `
+                     + (bulk ? "the flagged notes could not be read again"
+                       : isNoteMove(write) ? "the task's timeline could not be checked for it"
+                         : "the task could not be read again")
+                     + ", so whether it landed is not known. "
+                     + (bulk ? "Read them" : "Read the task") + " before trying again.",
+               warn: true };
     case "changed":
       return { text: `${name}: no answer came, and the task has changed, but not as `
                      + "this would have changed it. This is the task as it is now.",
@@ -376,12 +418,29 @@ export function outcomeText(write, outcome, detail) {
   }
 }
 
+// What a hide or a show changed, as far as it is true for this note: agents' reads
+// always; the flagged list only for a note flagged and not handled; the inbox's count
+// only for such a note whose task is not deferred or closed, since that one waits with
+// its task out of the inbox either way.
+function noteLanded(write) {
+  const counted = write.forYou && !onParkedTask({ task_state: write.taskState });
+  if (write.hidden) {
+    return " Agents no longer read it; it stays on its task, marked hidden."
+      + (counted ? " It leaves the flagged list and the inbox's count."
+        : write.forYou ? " It leaves the flagged list." : "");
+  }
+  return " Agents read it again."
+    + (counted ? " It is back in the flagged list and the inbox's count."
+      : write.forYou ? " It is back in the flagged list." : "");
+}
+
 // What marks a note: whom it is for, whether it was handled or hidden, the move it came
-// with, and the note it answers.
+// with, and the note it answers. Hidden is said as what it does: the operator still
+// reads the note, agents do not.
 export function noteMarks(n) {
   if (!n || typeof n !== "object") return [];
   return [`#${n.id}`, n.for_operator ? "for you" : "", n.handled ? "handled" : "",
-          n.hidden ? "hidden" : "", n.move || "",
+          n.hidden ? "hidden from agents" : "", n.move || "",
           n.reply_to ? `reply to #${n.reply_to}` : ""].filter(Boolean);
 }
 
@@ -427,6 +486,45 @@ export function taskUpdate(shown, polled) {
   return null;
 }
 
+// The flagged list's count line: how many flagged notes are not handled now, and how
+// the newest read differs from the rows drawn, which only a draw changes
+// (tasks-ui/DESIGN.md, "The flagged notes are listed above the inbox"). `drawn` is the
+// notes drawn, or their ids, `read` the newest read of the list, or null when it
+// failed. A full page holds only the newest, so a drawn note older than all of it is
+// not counted gone. A drawn note whose task was parked or reopened since is counted
+// too, since its row's mark is the draw's. `show` offers to draw the read.
+export function flaggedLine(drawn, read) {
+  if (!read || typeof read !== "object" || !Array.isArray(read.notes)) {
+    return { text: "Could not refresh the notes flagged for you: these are as last read.",
+             warn: true, show: false };
+  }
+  const drawnNotes = (Array.isArray(drawn) ? drawn : [])
+    .map(n => (n && typeof n === "object" ? n : { id: n }));
+  const shown = new Set(drawnNotes.map(n => n.id));
+  const readNotes = new Map(read.notes.filter(n => n && typeof n === "object")
+    .map(n => [n.id, n]));
+  const moved = drawnNotes.filter(n => "task_state" in n && readNotes.has(n.id)
+    && onParkedTask(n) !== onParkedTask(readNotes.get(n.id))).length;
+  const now = read.notes.map(n => (n && typeof n === "object" ? n.id : n));
+  const listed = new Set(now);
+  const oldest = now.length >= PAGE_MAX ? Math.min(...now) : null;
+  const newer = now.filter(id => !shown.has(id)).length;
+  const gone = [...shown]
+    .filter(id => !listed.has(id) && (oldest === null || id > oldest)).length;
+  const total = Number(read.total);
+  const parts = [total > 0 ? `${total} not handled` : "none left"];
+  // Those wait out of the inbox with their task, so this total is more than its count.
+  const parked = read.notes.filter(onParkedTask).length;
+  if (parked) {
+    parts.push(`${parked} on a deferred or closed task`
+               + (read.notes.length < total ? ` among the newest ${read.notes.length}` : ""));
+  }
+  if (newer) parts.push(`${newer} not shown`);
+  if (gone) parts.push(`${gone} gone since`);
+  if (moved) parts.push(`${moved} whose task was deferred, closed or reopened since`);
+  return { text: parts.join(" · "), warn: false, show: newer + gone + moved > 0 };
+}
+
 export const NO_REPOS_TEXT =
   "The registry has no repos yet. A repo is one the operator adds; until then no "
   + "agent can file a task.";
@@ -442,7 +540,8 @@ export const TASKS_POLL_MS = 15000;
 
 let tasksDown, tasksUp, tasksRepo, tasksState, tasksSearch, tasksBody, tasksEmpty,
   tasksOlder, tasksNewest, taskCountEl, taskDetail, panes, inboxEl, inboxEmpty,
-  inboxCountEl, viewInbox, viewAll, inboxView, allView;
+  inboxCountEl, viewInbox, viewAll, inboxView, allView, flaggedEl, flaggedLineEl,
+  flaggedBody, flaggedEmpty, flaggedAll, flaggedHandle, flaggedLeftOut, flaggedOutcomeEl;
 
 let running = null;        // null: not asked yet
 let probing = null;        // the ask in flight, if one is
@@ -466,6 +565,17 @@ let noticeSlot = null;     // the line atop the detail that says the task change
 let writing = null;        // the write in flight: one at a time
 let outcome = null;        // what the last write came to, while its task is open
 let noteDraft = { task: null, text: "" };   // kept until it lands
+let replyDrafts = new Map();  // a reply's text by its note's id: its box is open while kept
+// The flagged list. Rows are drawn only from a read the operator asked for, or a write's
+// (`readFlagged`); every other read rewrites the count line.
+let flaggedDrawn = null;   // the notes drawn as rows; null: no draw since it last answered
+let flaggedRead = null;    // the newest read, or null when it failed
+let flaggedAsks = 0;       // reads asked
+let flaggedUsed = 0;       // the last of them whose answer was used
+let flaggedWanted = 0;     // the read a draw was asked with, until an answer makes it
+let flaggedSelected = new Map();   // ticked ids, each to whether its task was parked then
+let flaggedKnown = [];     // the last good read's notes, which a failed read keeps
+let flaggedOutcome = null; // what the last bulk came to, until the next or All tasks
 
 export function registryIsRunning() { return running === true; }
 
@@ -486,6 +596,7 @@ function setRunning(up) {
   tasksDown.hidden = up;
   tasksUp.hidden = !up;
   if (!up) document.title = PAGE_TITLE;
+  if (!up) flaggedDrawn = null;
 }
 
 // Ask this container whether the registry answers, then load what the page shows.
@@ -616,6 +727,146 @@ export async function refreshInbox() {
   // Checked again: a 502 clears the count, and drawing the old inbox would set it back.
   if (!registryIsRunning()) return;
   renderInbox(lastInbox);
+  await readFlagged(false);
+}
+
+// The newest page of the notes flagged for the operator and not handled. Its rows are
+// drawn only when `draw` asks, or when none were drawn since the registry last
+// answered; any other read rewrites the count line alone, so a poll moves no row. An
+// answer a later one overtook is dropped, so a slow poll cannot put back an older
+// count; a draw asked for is made by the first answer used to a read asked with it or
+// after, never by one asked before it, which may predate the write that asked.
+async function readFlagged(draw) {
+  if (!registryIsRunning()) return;
+  const asked = ++flaggedAsks;
+  if (draw) flaggedWanted = asked;
+  let read = null;
+  try {
+    read = await registryJson(await fetch("/api/notes/flagged"));
+  } catch (e) {
+    read = null;
+  }
+  if (!registryIsRunning() || asked < flaggedUsed) return;
+  flaggedUsed = asked;
+  flaggedRead = read && Array.isArray(read.notes) ? read : null;
+  if (flaggedRead) flaggedKnown = flaggedRead.notes;
+  const wanted = flaggedWanted !== 0 && asked >= flaggedWanted;
+  if (wanted) flaggedWanted = 0;
+  const drawNow = wanted || flaggedDrawn === null;
+  if (flaggedRead && drawNow) {
+    flaggedSelected = keptSelection(flaggedSelected, flaggedRead.notes);
+    flaggedDrawn = flaggedRead.notes;
+  }
+  if (drawNow) renderFlagged();
+  else renderFlaggedLine();
+}
+
+// The last good read's notes, which can know a task parked since the rows were drawn.
+// A failed read leaves them, so a park once learned is not forgotten.
+function newestFlagged() {
+  return flaggedKnown;
+}
+
+// What a lost bulk is checked against: the flagged list from just past the highest note
+// it named, so notes flagged since cannot push the named ones off the page.
+async function readFlaggedPast(notes) {
+  const q = new URLSearchParams({ before: String(Math.max(...notes) + 1) });
+  return registryJson(await fetch(`/api/notes/flagged?${q}`));
+}
+
+// The flagged block's rows, as last drawn, with its count line and the last bulk's
+// outcome. Only `readFlagged` calls this, on a draw.
+function renderFlagged() {
+  flaggedBody.replaceChildren();
+  for (const n of flaggedDrawn || []) flaggedBody.appendChild(flaggedRow(n));
+  flaggedEmpty.textContent = flaggedDrawn && !flaggedDrawn.length
+    ? "No note is flagged for you." : "";
+  flaggedOutcomeEl.className = flaggedOutcome && flaggedOutcome.warn
+    ? "flagged-outcome empty warn" : "flagged-outcome empty";
+  flaggedOutcomeEl.textContent = flaggedOutcome ? flaggedOutcome.text : "";
+  renderFlaggedLine();
+  markOpen();
+}
+
+// The count line, whose space is kept whatever it says: "show them" first, so a count
+// that changes moves no button.
+function renderFlaggedLine() {
+  flaggedLineEl.replaceChildren();
+  if (flaggedDrawn === null && flaggedRead === null && flaggedUsed === 0) return;
+  const line = flaggedLine(flaggedDrawn || [], flaggedRead);
+  if (line.show) {
+    const show = document.createElement("button");
+    show.type = "button";
+    show.className = "group-toggle";
+    show.dataset.flagged = "show";
+    show.textContent = "show them";
+    flaggedLineEl.appendChild(show);
+  }
+  const text = document.createElement("span");
+  text.textContent = line.text;
+  flaggedLineEl.appendChild(text);
+  flaggedLineEl.className = line.warn ? "flagged-line warn" : "flagged-line";
+  // A read can park a ticked note's task: the controls and the handle's count follow it,
+  // and no row moves.
+  markFlagged();
+}
+
+// One flagged note: its box to select it, its task to open, who wrote it and when, and
+// what it says, spelled.
+function flaggedRow(n) {
+  const tr = document.createElement("tr");
+  const pick = document.createElement("td");
+  const box = document.createElement("input");
+  box.type = "checkbox";
+  box.dataset.flaggedNote = String(n.id);
+  box.checked = flaggedSelected.has(n.id);
+  box.setAttribute("aria-label", `select note #${n.id}`);
+  pick.appendChild(box);
+  tr.append(pick, openCell(n.task));
+  authorCell(tr, n.author);
+  const at = cell(tr, fmtStamp(n.at), "ts");
+  at.title = fmtInstant(n.at);
+  const text = document.createElement("td");
+  if (onParkedTask(n)) {
+    // Waits with its task, out of the inbox: said in words, and left out of "select
+    // all shown".
+    const parked = document.createElement("div");
+    parked.className = "why";
+    parked.textContent = `on a ${spellHidden(String(n.task_state)).text} task: it waits `
+      + "with it, out of the inbox, until it is reopened";
+    text.appendChild(parked);
+    tr.className = "parked";
+  }
+  text.appendChild(proseBlock(n.text));
+  tr.appendChild(text);
+  return tr;
+}
+
+// The flagged block's controls, off while any write is out, whatever task is open; the
+// handle names how many it would send, by the rule it is sent by.
+function markFlagged() {
+  const { notes: named, leftOut } = bulkToSend(flaggedSelected, flaggedDrawn,
+                                               newestFlagged());
+  for (const el of flaggedEl.querySelectorAll("input[data-flagged-note]")) {
+    el.disabled = writing !== null;
+  }
+  flaggedAll.disabled = writing !== null || !selectAll(flaggedDrawn, newestFlagged()).length;
+  flaggedHandle.disabled = writing !== null || !named.length;
+  flaggedHandle.textContent = `handle selected (${named.length})`;
+  flaggedLeftOut.textContent = leftOutLine(leftOut);
+  flaggedLeftOut.title = flaggedLeftOut.textContent;
+}
+
+// The bulk handle, naming exactly the notes selected among those drawn: never a
+// filter, so a note flagged since is not swept up unseen, and never one whose task was
+// parked since it was ticked, which its outcome names. The open task is read again with
+// it when a named note is on it.
+function bulkWrite() {
+  const { notes, leftOut } = bulkToSend(flaggedSelected, flaggedDrawn, newestFlagged());
+  if (!notes.length) return null;
+  const onOpen = flaggedDrawn.some(n => notes.includes(n.id) && String(n.task) === openTask);
+  return { kind: "handle-many", notes, leftOut, task: onOpen ? openTask : null,
+           verb: `handle ${notes.length} note${notes.length === 1 ? "" : "s"}` };
 }
 
 // Each section that has a task in it, highest first, one row per task with every
@@ -927,6 +1178,10 @@ function drawTask(task, held) {
   }
   // Below the plan, so what a move approves is read before it.
   taskDetail.appendChild(movesBlock(task));
+  // A move on a note says what it came to above the timeline it was made in.
+  if (outcome && outcome.task === String(task.id) && outcome.onNote) {
+    taskDetail.appendChild(noticeLine(outcome));
+  }
   const timeline = held.timeline;
   const timelineHead = document.createElement("h3");
   timelineHead.textContent = `Timeline · ${timeline.total}`;
@@ -986,7 +1241,8 @@ export async function refreshOpenTask() {
 }
 
 // The moves the operator API takes from the task's state, and what the last one came
-// to, but a refusal for a task that changed, which the slot atop the detail says.
+// to, but a refusal for a task that changed, which the slot atop the detail says, and a
+// move on a note, said above the timeline.
 // Approve and send back are each a control of their own, as a refined task's two
 // answers; approve names what it approves.
 function movesBlock(task) {
@@ -994,7 +1250,8 @@ function movesBlock(task) {
   const head = document.createElement("h3");
   head.textContent = "Moves";
   block.appendChild(head);
-  if (outcome && outcome.task === String(task.id) && outcome.result !== "stale") {
+  if (outcome && outcome.task === String(task.id) && outcome.result !== "stale"
+      && !outcome.onNote) {
     block.appendChild(noticeLine(outcome));
   }
   const row = document.createElement("div");
@@ -1035,20 +1292,32 @@ function noteForm(task) {
 }
 
 // Every write control in the detail, on only while no write is out and what is drawn
-// is the task the page names.
+// is the task the page names; and the flagged block's, on while no write is out.
 function drawnIsOpen() {
   return shownTask !== null && String(shownTask.id) === openTask;
 }
 function markWriting() {
-  for (const el of taskDetail.querySelectorAll("[data-write], textarea[data-note]")) {
+  for (const el of taskDetail.querySelectorAll(
+    "[data-write], textarea[data-note], textarea[data-reply]")) {
     el.disabled = writing !== null || !drawnIsOpen();
   }
+  for (const box of taskDetail.querySelectorAll("[data-reply-box]")) markReply(box);
+  markFlagged();
+}
+
+// "mark handled" in a reply box is off while the box holds a reply, so a typed reply is
+// not dropped by the wrong click: "reply and mark handled" sends it.
+function markReply(box) {
+  const plain = box.querySelector('button[data-write="handle"][data-value="true"]');
+  if (plain && (replyDrafts.get(box.dataset.replyBox) ?? "").trim()) plain.disabled = true;
 }
 
 // One write, then the page as the registry has it after: the task read again, or for
 // a stale one drawn from the task the refusal carries, which is not read again
 // (task-registry/DESIGN.md, "The operator API"); the inbox and the list refreshed. A
-// write whose answer was lost is decided from the read (`checkWrite`), never sent again.
+// write whose answer was lost is decided from a read (`checkWrite`), never sent again.
+// A write in the detail is on the task drawn; a bulk handle, from the flagged block, on
+// the open task only when a note it named is on it, and otherwise on none (`task` null).
 async function runWrite(write) {
   if (writing || !registryIsRunning()) return;
   writing = write;
@@ -1065,20 +1334,36 @@ async function runWrite(write) {
     setRunning(false);
   } else if (result === "stale") {
     drawn = { task: answer.body.current, held: shownHeld };
-  } else {
+  } else if (write.task !== null) {
     drawn = await readTask(write.task).catch(() => null);
-    if (result === "unknown") result = checkWrite(write, drawn);
+  }
+  if (result === "unknown") {
+    result = checkWrite(write, write.kind === "handle-many"
+      ? { flagged: await readFlaggedPast(write.notes).catch(() => null) } : drawn);
   }
   const landed = result === "landed" || result === "found";
   if (write.kind === "note" && landed && noteDraft.task === write.task
       && noteDraft.text === write.text) {
     noteDraft = { task: null, text: "" };
   }
+  if (write.kind === "handle" && write.handled && landed) {
+    replyDrafts.delete(String(write.note));
+  }
+  const detail = answer && answer.body && typeof answer.body === "object"
+    ? answer.body.detail : answer && answer.text;
+  // Not `kind`: the slot reads an outcome's `kind` before its `result` (`fillSlot`).
+  const said = { task: write.task, result, onNote: isNoteMove(write),
+                 ...outcomeText(write, result, detail) };
+  if (write.kind === "handle-many") flaggedOutcome = said;
+  // The flagged rows as the registry now has them, after a move on notes or on a task,
+  // which can park or reopen a drawn note's task: drawn while every control is still
+  // off, so none comes back on over a row that moved.
+  if (redrawsFlagged(write, result)) await readFlagged(true);
   writing = null;
-  if (openTask === write.task) {
-    const detail = answer && answer.body && typeof answer.body === "object"
-      ? answer.body.detail : answer && answer.text;
-    outcome = { task: write.task, result, ...outcomeText(write, result, detail) };
+  if (write.task !== null && openTask === write.task) {
+    // A bulk says what it came to in the flagged block; the detail it redraws says
+    // nothing of an earlier write's.
+    outcome = write.kind === "handle-many" ? null : said;
     if (drawn) drawTask(drawn.task, drawn.held);
     else if (shownTask) drawTask(shownTask, shownHeld);
   } else {
@@ -1101,8 +1386,31 @@ function writeFor(btn) {
     return { ...base, kind: "move", state: btn.dataset.value, verb: btn.dataset.verb };
   }
   if (btn.dataset.write === "break") return { ...base, kind: "break", verb: "break the claim" };
+  if (btn.dataset.write === "hide" || btn.dataset.write === "handle") {
+    return noteWrite(btn, base);
+  }
   const text = noteDraft.task === base.task ? noteDraft.text : "";
   return text.trim() ? { ...base, kind: "note", text, verb: "add the note" } : null;
+}
+
+// A move on a note in the timeline, as of the newest timeline entry the page holds:
+// what its check counts from if the answer is lost. A reply goes only with text in it.
+function noteWrite(btn, base) {
+  const note = btn.dataset.note;
+  const at = { ...base, note: Number(note), lastEntry: lastEntryId(shownHeld.timeline) };
+  if (btn.dataset.write === "hide") {
+    const hidden = btn.dataset.value === "true";
+    return { ...at, kind: "hide", hidden, forYou: btn.dataset.forYou === "1",
+             taskState: shownTask.state, verb: `${hidden ? "hide" : "show"} note #${note}` };
+  }
+  if (btn.dataset.value === "reply") {
+    const reply = replyDrafts.get(note) ?? "";
+    return reply.trim() ? { ...at, kind: "handle", handled: true, reply,
+                            verb: `reply to note #${note} and mark it handled` } : null;
+  }
+  const handled = btn.dataset.value === "true";
+  return { ...at, kind: "handle", handled, reply: null,
+           verb: `mark note #${note} ${handled ? "handled" : "not handled"}` };
 }
 
 function pagerButton(label, kind, before) {
@@ -1143,10 +1451,80 @@ function renderTimeline(tbody, history) {
       }
       td.appendChild(folded);
     }
+    if (entry.note) td.appendChild(noteControls(entry.note));
     tr.appendChild(td);
     if (entry.note && entry.note.hidden) tr.className = "hidden-note";
     tbody.appendChild(tr);
   }
+}
+
+// The moves on a note, under it on whichever page of the timeline it is drawn
+// (`noteMovesFor`). Marking one handled opens a box for a reply, open while its note
+// has a draft, an empty one too, so a redraw keeps it open; "mark handled" sends no
+// reply, "reply and mark handled" the text.
+function noteControls(note) {
+  const id = String(note.id);
+  const wrap = document.createElement("div");
+  wrap.className = "note-moves";
+  const row = document.createElement("div");
+  row.className = "moves";
+  wrap.appendChild(row);
+  for (const move of noteMovesFor(note)) {
+    if (move.reply) {
+      const open = document.createElement("button");
+      open.type = "button";
+      open.dataset.replyOpen = id;
+      open.textContent = "mark handled…";
+      open.hidden = replyDrafts.has(id);
+      row.appendChild(open);
+      wrap.appendChild(replyBox(id));
+      continue;
+    }
+    const btn = writeButton(move.verb, move.kind, String(move.value));
+    btn.dataset.note = id;
+    if (note.for_operator && !note.handled) btn.dataset.forYou = "1";
+    row.appendChild(btn);
+  }
+  return wrap;
+}
+
+function replyBox(id) {
+  const box = document.createElement("div");
+  box.className = "note-form";
+  box.dataset.replyBox = id;
+  box.hidden = !replyDrafts.has(id);
+  const text = document.createElement("textarea");
+  text.rows = 2;
+  text.setAttribute("aria-label", `A reply to note #${id}`);
+  text.placeholder = "a reply, which agents read with the note it answers (optional)";
+  text.value = replyDrafts.get(id) ?? "";
+  text.dataset.reply = id;
+  const row = document.createElement("div");
+  row.className = "moves";
+  const plain = writeButton("mark handled", "handle", "true");
+  plain.dataset.note = id;
+  const reply = writeButton("reply and mark handled", "handle", "reply");
+  reply.dataset.note = id;
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.dataset.replyCancel = id;
+  cancel.textContent = "cancel";
+  row.append(plain, reply, cancel);
+  box.append(text, row);
+  return box;
+}
+
+// The reply box of a note opened or closed where it is drawn, its draft kept or dropped.
+function toggleReply(id, open) {
+  if (open) replyDrafts.set(id, replyDrafts.get(id) ?? "");
+  else replyDrafts.delete(id);
+  for (const btn of taskDetail.querySelectorAll("button[data-reply-open]")) {
+    if (btn.dataset.replyOpen === id) btn.hidden = open;
+  }
+  for (const box of taskDetail.querySelectorAll("[data-reply-box]")) {
+    if (box.dataset.replyBox === id) box.hidden = !open;
+  }
+  markWriting();
 }
 
 // An older page of the timeline, under the button that asked.
@@ -1178,6 +1556,8 @@ async function showPage(btn) {
   }
   holder.appendChild(table);
   btn.replaceWith(holder);
+  // Its note moves are write controls like any other.
+  markWriting();
 }
 
 function closeTask() {
@@ -1191,12 +1571,17 @@ function closeTask() {
   markOpen();
 }
 
+// Back from All tasks, the flagged rows are drawn from a fresh read; a bulk's outcome
+// lasts until All tasks is opened.
 function showView(name) {
+  const back = view === "all" && name === "inbox";
   view = name;
   inboxView.hidden = name !== "inbox";
   allView.hidden = name !== "all";
   viewInbox.setAttribute("aria-pressed", String(name === "inbox"));
   viewAll.setAttribute("aria-pressed", String(name === "all"));
+  if (name === "all") flaggedOutcome = null;
+  if (back) readFlagged(true);
 }
 
 // The page as the hash names it: the view at once, the task once the registry answers
@@ -1246,6 +1631,14 @@ export function mountTasks() {
   viewAll = document.getElementById("view-all");
   inboxView = document.getElementById("inbox-view");
   allView = document.getElementById("all-view");
+  flaggedEl = document.getElementById("flagged");
+  flaggedLineEl = document.getElementById("flagged-line");
+  flaggedBody = document.getElementById("flagged-notes");
+  flaggedEmpty = document.getElementById("flagged-empty");
+  flaggedAll = document.getElementById("flagged-all");
+  flaggedHandle = document.getElementById("flagged-handle");
+  flaggedLeftOut = document.getElementById("flagged-left-out");
+  flaggedOutcomeEl = document.getElementById("flagged-outcome");
 
   tasksDown.textContent = NOT_RUNNING_TEXT;
   for (const s of [...TASK_STATES, EVERY_STATE]) {
@@ -1285,6 +1678,10 @@ export function mountTasks() {
       goTo(view, openTask);
       return;
     }
+    const replyOpen = ev.target.closest("button[data-reply-open]");
+    if (replyOpen) toggleReply(replyOpen.dataset.replyOpen, true);
+    const replyCancel = ev.target.closest("button[data-reply-cancel]");
+    if (replyCancel) toggleReply(replyCancel.dataset.replyCancel, false);
     const planView = ev.target.closest("button[data-plan-view]");
     if (planView) togglePlanView(planView);
     const page = ev.target.closest("button[data-page]");
@@ -1297,6 +1694,34 @@ export function mountTasks() {
     if (ev.target.matches("textarea[data-note]") && shownTask) {
       noteDraft = { task: String(shownTask.id), text: ev.target.value };
     }
+    if (ev.target.matches("textarea[data-reply]")) {
+      replyDrafts.set(ev.target.dataset.reply, ev.target.value);
+      markWriting();
+    }
+  });
+  flaggedEl.addEventListener("click", ev => {
+    const btn = ev.target.closest("button[data-flagged]");
+    if (!btn) return;
+    if (btn.dataset.flagged === "show") {
+      readFlagged(true);
+    } else if (btn.dataset.flagged === "all") {
+      for (const id of selectAll(flaggedDrawn, newestFlagged())) flaggedSelected.set(id, false);
+      for (const box of flaggedEl.querySelectorAll("input[data-flagged-note]")) {
+        box.checked = flaggedSelected.has(Number(box.dataset.flaggedNote));
+      }
+      markFlagged();
+    } else if (btn.dataset.flagged === "handle") {
+      const write = bulkWrite();
+      if (write) runWrite(write);
+    }
+  });
+  flaggedEl.addEventListener("change", ev => {
+    const box = ev.target.closest("input[data-flagged-note]");
+    if (!box) return;
+    const id = Number(box.dataset.flaggedNote);
+    if (box.checked) flaggedSelected.set(id, tickMark(id, flaggedDrawn));
+    else flaggedSelected.delete(id);
+    markFlagged();
   });
   window.addEventListener("hashchange", applyHash);
   applyHash();

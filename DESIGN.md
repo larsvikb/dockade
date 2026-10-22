@@ -2039,7 +2039,7 @@ The approval page links to it, an address and nothing else (`CONTROL_UI_TASKS_LI
 only, as the registry's listeners do theirs, so a registry compromised through a body
 or a note does not find its relay. In the other direction the relay is the operator
 listener's one client, so its table of registry routes (`tasks-ui/app.py`), the page's
-reads and its three writes, is the whole of what a browser on the loopback port can do
+reads and its writes, is the whole of what a browser on the loopback port can do
 there. Its own design, the page's not-running state, how it spells agent prose and
 what it makes of a write whose answer was lost, is `tasks-ui/DESIGN.md`.
 
@@ -2343,7 +2343,7 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | task registry as a service — `tasks` behind a profile on `mcp-net` + `tasks-operator-net`, one listener per leg | **done** |
 | — | task registry, agent side — where the id comes from in the image's instructions, dockade's repo name and checkpoints in `CLAUDE.md`, the id in the status line | **done** — `inflight.md` and `local-todo.md` stay the record beside it |
 | — | task registry backups — its store and a markdown export in `make backup`, `make restore-tasks` | **done** |
-| — | task registry view — read-only, the operator listener's one client | **done** — reads only; the operator's moves next |
+| — | task registry view — the operator listener's one client | **done** — reads, and the operator's writes: moves, breaking a claim, notes and the moves on them |
 | — | the task registry's own UI — `tasks-ui`, on another origin and with no `control-net` leg; what both UIs share in `ui-common/` | **done** — the approval page links to it; the page opens on an inbox worked out from task state |
 | — | task registry plans — `refined`, claims that refine a proposal, `submit_plan` and `submit_work`, every plan kept; the store's first migration | **done** — the tasks page shows a task's plans |
 | — | task registry decisions — a plan's questions for the operator in `submit_plan`, answered by the operator API's `approve`, which opens the task or sends it back | **done** — the tasks page neither shows nor answers them yet |

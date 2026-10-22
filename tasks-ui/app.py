@@ -11,9 +11,9 @@ registry's operator listener.
 
 It does two things:
   - serves the static page at `/`;
-  - relays the page's reads and its three writes to the registry's operator listener,
-    which takes no token, and answers `/running` itself, so a registry that is down is
-    a state of the page rather than a failed request in its console.
+  - relays the page's reads and its writes to the registry's operator listener, which
+    takes no token, and answers `/running` itself, so a registry that is down is a
+    state of the page rather than a failed request in its console.
 
 It serves one address, its `tasks-ui-net` one, and `guards.check_bind` refuses to start
 on any other: the relay is the operator's whole say in the registry, and its other leg's
@@ -80,13 +80,20 @@ _RELAY_ROUTES = (
     ("GET", re.compile(r"^/api/tasks/[0-9]{1,19}/plans$")),
     # Whose turn it is the operator's: the page opens on it.
     ("GET", re.compile(r"^/api/inbox$")),
+    # The notes flagged for the operator and not handled: what a bulk handle names.
+    ("GET", re.compile(r"^/api/notes/flagged$")),
     ("GET", re.compile(r"^/api/search$")),
     # The operator's triage, each naming the revision the page showed: a move to any
-    # state, breaking a claim. And a note, which names none (tasks-ui/DESIGN.md, "A note
-    # names no revision"). The rest of the operator API waits for a page that calls it.
+    # state, breaking a claim. And a note and the moves on notes, which name none
+    # (tasks-ui/DESIGN.md, "A note names no revision"): hide or show one, handle one
+    # with or without a reply, handle the flagged notes a page showed. The rest of the
+    # operator API waits for a page that calls it.
     ("POST", re.compile(r"^/api/tasks/[0-9]{1,19}/move$")),
     ("POST", re.compile(r"^/api/tasks/[0-9]{1,19}/break-claim$")),
     ("POST", re.compile(r"^/api/tasks/[0-9]{1,19}/notes$")),
+    ("POST", re.compile(r"^/api/notes/hide$")),
+    ("POST", re.compile(r"^/api/notes/[0-9]{1,19}/handle$")),
+    ("POST", re.compile(r"^/api/notes/handle$")),
 )
 
 # The registry records ACTOR_HEADER as this relay's word for the browser's address

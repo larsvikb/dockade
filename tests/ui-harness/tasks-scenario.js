@@ -4,7 +4,8 @@
 // same steps run against the base tree and the branch.
 
 import {
-  editElsewhere, loseNextAnswer, startRegistry, stopRegistry,
+  deferElsewhere, editElsewhere, flagElsewhere, loseNextAnswer, startRegistry,
+  stopRegistry,
 } from "./tasks-backend.js";
 
 export const STEPS = [
@@ -121,5 +122,97 @@ export const STEPS = [
   }],
   ["show it", async ({ page }) => {
     await page.click("#task-detail button[data-show]");
+  }],
+  // The moves on notes, made on a note in the timeline: each says what it came to above
+  // the timeline, and the flagged list above the inbox is drawn again after it. Task 3,
+  // closed above, is out of the inbox; its notes are marked so in the flagged list.
+  ["a closed task's flagged note opened", async ({ page }) => {
+    await page.click('#flagged button[data-task="3"]');
+  }],
+  // A task move redraws the flagged rows: reopened, its notes are no longer marked.
+  ["reopened", async ({ page }) => {
+    await page.click('#task-detail button[data-verb="reopen"]');
+  }],
+  ["a flagged note hidden", async ({ page }) => {
+    await page.click('#task-detail button[data-write="hide"][data-note="13"]');
+  }],
+  ["and shown again", async ({ page }) => {
+    await page.click('#task-detail button[data-write="hide"][data-note="13"]');
+  }],
+  // A flagged note already handled is in no list a hide takes it out of.
+  ["a handled flagged note hidden", async ({ page }) => {
+    await page.click('#task-detail button[data-write="hide"][data-note="10"]');
+  }],
+  ["a reply opened and written", async ({ page }) => {
+    await page.click('#task-detail button[data-reply-open="14"]');
+    await page.fill('#task-detail textarea[data-reply="14"]', "Unblocked: see #2.");
+  }],
+  ["handled with the reply", async ({ page }) => {
+    await page.click('#task-detail button[data-write="handle"][data-value="reply"]'
+                     + '[data-note="14"]');
+  }],
+  // A task deferred from the detail: the flagged rows are drawn again, its note marked.
+  ["another task opened from the flagged list", async ({ page }) => {
+    await page.click('#flagged button[data-task="8"]');
+  }],
+  ["deferred", async ({ page }) => {
+    await page.click('#task-detail button[data-verb="defer"]');
+  }],
+  ["task 3 again", async ({ page }) => {
+    await page.click('#flagged button[data-task="3"]');
+  }],
+  // "select all shown" leaves out the notes on deferred tasks 7 and 8. The bulk names
+  // exactly the notes selected among those drawn, and the open task, which one of them
+  // is on, is drawn again with it.
+  ["all shown selected, the parked ones left out", async ({ page }) => {
+    await page.click('#flagged button[data-flagged="all"]');
+  }],
+  // Task 6 is deferred in another tab, which only a poll sees: its note stays ticked
+  // and its row unmarked, but the count drops it, and the bulk leaves it out, saying so.
+  ["a ticked note's task deferred elsewhere, a poll passes", async ({ clock }) => {
+    deferElsewhere(6);
+    await clock(16000);
+  }],
+  // Unticked and ticked again on a row still drawn open: not an informed choice of a
+  // parked note, so it stays left out, and the line beside the handle says why.
+  ["the left-out note unticked and ticked again", async ({ page }) => {
+    await page.uncheck('#flagged input[data-flagged-note="15"]');
+    await page.check('#flagged input[data-flagged-note="15"]');
+  }],
+  ["handled together", async ({ page }) => {
+    await page.click('#flagged button[data-flagged="handle"]');
+  }],
+  // A note flagged and another handled elsewhere: the poll changes the count line and
+  // no row, until the operator asks for them.
+  ["the list changes elsewhere, a poll passes", async ({ clock }) => {
+    flagElsewhere();
+    await clock(16000);
+  }],
+  ["show them", async ({ page }) => {
+    await page.click('#flagged button[data-flagged="show"]');
+  }],
+  // Only notes on deferred tasks are left, so "select all shown" is off; each can still
+  // be ticked on its own.
+  ["the parked ones ticked on their own and handled, the last", async ({ page }) => {
+    await page.check('#flagged input[data-flagged-note="23"]');
+    await page.check('#flagged input[data-flagged-note="17"]');
+    await page.check('#flagged input[data-flagged-note="15"]');
+    await page.click('#flagged button[data-flagged="handle"]');
+  }],
+  // Un-handled, then replied to again with the answer lost: the page reads the task
+  // again and finds the reply's own entry.
+  ["a note marked not handled", async ({ page }) => {
+    await page.click('#task-detail button[data-write="handle"][data-value="false"]'
+                     + '[data-note="14"]');
+  }],
+  // With a reply typed, "mark handled" is off, so the reply is not dropped by it.
+  ["a reply typed", async ({ page }) => {
+    await page.click('#task-detail button[data-reply-open="14"]');
+    await page.fill('#task-detail textarea[data-reply="14"]', "Still unblocked.");
+  }],
+  ["its answer lost", async ({ page }) => {
+    loseNextAnswer();
+    await page.click('#task-detail button[data-write="handle"][data-value="reply"]'
+                     + '[data-note="14"]');
   }],
 ];

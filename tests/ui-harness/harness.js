@@ -73,8 +73,8 @@ function fakeEventSource() {
 }
 
 // The DOM as indented lines, one element or text run per line. Properties a script
-// sets without touching an attribute (a field's value, a checkbox) are read off the
-// element, since the attributes alone would not show them.
+// sets without touching an attribute (a field's value, a checkbox or a radio button)
+// are read off the element, since the attributes alone would not show them.
 function snapshot() {
   const lines = [`title: ${document.title}`,
                  `favicon: ${document.getElementById("favicon")?.href ?? "none"}`,
@@ -99,7 +99,9 @@ function snapshot() {
       if (["INPUT", "SELECT", "TEXTAREA"].includes(child.tagName)) {
         parts.push(`.value=${JSON.stringify(child.value)}`);
       }
-      if (child.type === "checkbox") parts.push(`.checked=${child.checked}`);
+      if (child.type === "checkbox" || child.type === "radio") {
+        parts.push(`.checked=${child.checked}`);
+      }
       lines.push(pad + [describe(child), ...parts].join(" "));
       walk(child, depth + 1);
     }

@@ -13,7 +13,8 @@ decisions, such as the prior art the inbox follows, is in `tasks-ui/NOTES.md`.
 The relay's table is the operator's whole say in the registry, since its operator
 listener takes no token; `_RELAY_ROUTES` in `app.py` says what may be on it, and a test
 holds it and the page's fetches equal in both directions, the writes' method too. Its
-writes are the ones the page makes: on a task, a move, breaking a claim and a note; on
+writes are the ones the page makes: on a task, a move, an approve with its answers,
+breaking a claim and a note; on
 notes, hiding or showing one, handling one with or without a reply, and handling the
 flagged notes a page showed. The bind and the peer check are the approval UI's
 (`app.py`'s docstring); why each matters beside the registry is the root `DESIGN.md`'s
@@ -50,9 +51,11 @@ two notes. So the relay answers 502 only for the errors raised before a request 
 the wire (`_NOT_SENT`, listed so an error it does not name counts as sent), and a 504
 for a write sent with no answer; a read keeps 502 for every error, since asking again
 is safe. On a 504, a fetch that rejected, or an answer cut off, the page reads the task
-again and decides from it (`checkWrite` in `moves.js`): a move or break whose revision
-did not move has not landed yet and cannot land twice, since the revision would refuse a
-second; a note, which names no revision, has landed only if an operator note with its
+again and decides from it (`checkWrite` in `moves.js`): a move, approve or break whose
+revision did not move has not landed yet and cannot land twice, since the revision would
+refuse a second; an approve whose revision moved has landed only if its plan now has
+exactly the answers sent, since another write could have moved the task to the state it
+predicted; a note, which names no revision, has landed only if an operator note with its
 text is newer than any the page held, and is otherwise "not found yet", never "safe to
 send again", since it may still be committing. A move on a note has landed if its own
 history entry, naming the note with the value sent, is newer than any the page held; the
@@ -78,14 +81,48 @@ beside the list carries them, never an inbox row, so a move is made on what was 
 The moves on a note sit under it in the timeline, on every page of it. The one write
 outside the detail is the flagged list's bulk handle (below), which names the notes a
 page drew rather than a task. Approve and send back are each a control of their own, as
-a refined task's two answers. Approve names the revision and plan it approves and says
-when what it approves hides a character, and a move that ends a claim names its holder.
-One write is out at a time, its controls off until its outcome is drawn, the flagged
-list's too, and the poll never redraws the detail, so no button moves under the pointer
-between two clicks. No move asks to be confirmed: each is recorded and undone by another
-move, but a reply, which can be hidden and never removed. A move on a note touches
-neither the task's spec nor its revision, so whatever holds the task's moves leaves it
-free, as it leaves adding a note.
+a refined task's two answers. Approve names the revision and plan it approves, and where
+its answers take the task, and says when what it approves hides a character; a move
+that ends a claim names its holder. One write is out at a time, its controls off until
+its outcome is drawn, the flagged list's too, and the poll never redraws the detail, so
+no button moves under the pointer between two clicks. No move asks to be confirmed: each
+is recorded and undone by another move, but a reply, which can be hidden and never
+removed, and an approve: its answers stand, and one that sends the task back supersedes
+its plan. Its label, which names the outcome before it is pressed, is the confirmation.
+A move on a note touches neither the task's spec nor its revision, so whatever holds the
+task's moves leaves it free, as it leaves adding a note.
+
+**A plan's decisions sit above it, answered with the approve.** A decision is the
+refiner's question for the operator (`task-registry/DESIGN.md`, "Decisions"), and it
+matters more to the operator than the plan, so the decisions of the plan drawn come
+between the body and the plan, each option's label and meaning whole and spelled as the
+body is, since this is agent text inside a control the operator acts on. Its inputs
+carry positions, never agent text. Choices start on the options the plan assumes, so a
+plan the operator accepts as written takes one click, and the label's outcome is what
+is read first. A single-choice decision takes an option or an "other" text, never both,
+so a qualified answer is an "other" and sends the task back. `approveOutcome` decides
+open, sent back or incomplete by `plans.outcome`'s rule, a blank "other" by
+`tasks.check_text`'s, and a test holds both to the registry's over every choice two
+decisions can hold. While an answer is incomplete no approve is built at all, only a
+line naming what is missing, so nothing can send a partial answer or show a label for
+an outcome the choices do not reach. Approve has a row of its own, one line high, above
+the other moves, so relabelling it, or send back as "send back without answering" once
+a choice differs from the assumed ones, moves neither. Only a refined task whose current
+plan has no answers draws choices; any other plan's decisions are text, with every
+answer the task has had.
+
+**Choices are kept by task and plan; another plan says so.** A redraw of the same plan,
+such as a stale revision's refusal, keeps the choices made on it. A draw that brings
+another plan than the one this task was last drawn with says so above the decisions,
+whatever the choices were, and shows any "other" text it reset: without it, a refusal or
+"show it" that brought a new plan while every choice was assumed would leave one click
+approving a plan nobody read. The first choice in the new plan spends that line, which
+keeps its space so nothing moves under the pointer, and a landed approve drops it. Open
+is offered from no state while the current plan has decisions unanswered, since the
+registry refuses it, and from refined only as a reopen of a plan answered before, since
+approving is `approve`. The inbox's count for a refined task is what its plan carries,
+answered decisions included (`operator_moves.inbox`), so the page says the count and
+never that decisions wait.
 
 **The inbox: whose turn it is, worked out.** The page opens on what is the operator's
 turn rather than on the backlog, as Gerrit's attention set does. `operator_moves.inbox`
@@ -209,8 +246,9 @@ own name, allowlist, address and network. `tests/test_tasks_ui_js.py` holds the 
 every structural check the approval page has (`PageChecks`: markup and script, the
 module list against the Dockerfile and the imports, fetches against the relay, free
 names), the writes' methods against the relay, the pure halves of `tasks.js`,
-`moves.js` and `diff.js` under node, and, from source, how the page gates the
-registry, sends its writes, draws agent text and fills the line atop the detail;
+`moves.js` and `diff.js` under node, the approve's rule and body against the
+registry's own (`ApproveRuleTests`), and, from source, how the page gates the registry,
+sends its writes, draws agent text and decisions, and fills the line atop the detail;
 `tests/test_task_registry_inbox.py` holds what the inbox counts, and
 `tests/test_task_registry_operator.py` that each note is on the history row that
 posted it.

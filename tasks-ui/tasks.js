@@ -25,6 +25,8 @@ import {
   onParkedTask, selectAll, tickMark, bulkToSend, keptSelection, redrawsFlagged,
   sendWrite, readAnswer,
   writeOutcome, checkWrite, lastNoteId, lastEntryId,
+  planDecisions, awaitsAnswers, approvable, assumedChoices, blankText, choiceAnswer,
+  unanswered, approveAnswers, choicesDiffer, approveOutcome,
 } from "./moves.js";
 import { fmtStamp, fmtInstant } from "./time.js";
 
@@ -51,6 +53,12 @@ export function spellHidden(text) {
   let hidden = 0;
   const shown = s.replace(HIDDEN_RE, ch => { hidden++; return escapePayload(ch); });
   return { text: shown, hidden };
+}
+
+// How many hidden characters the texts carry together: what a warning counts, not
+// what is drawn.
+export function hiddenIn(...texts) {
+  return texts.reduce((sum, text) => sum + spellHidden(text).hidden, 0);
 }
 
 // The note under a text that carried any.
@@ -213,6 +221,15 @@ export const INBOX_SECTIONS = [
    "A claim that ran out and nobody swept, or a task nobody holds that went quiet."],
 ];
 
+// "2 decisions", "no decisions", or nothing when the count is missing. The registry
+// counts every decision the plan carries, answered ones too (`operator_moves.inbox`),
+// so this says what the plan has, never what waits on the operator.
+function decisionCount(value) {
+  const n = Number(value);
+  if (value === null || value === undefined || !Number.isInteger(n)) return "";
+  return n === 0 ? "no decisions" : `${n} decision${n === 1 ? "" : "s"}`;
+}
+
 // One reason a task is in the inbox, and since when. A holder and a branch are an
 // agent's, so spelled.
 export function reasonText(reason) {
@@ -228,7 +245,7 @@ export function reasonText(reason) {
         + (reason.branch ? ` on ${spellHidden(reason.branch).text}` : "");
     case "refined":
       return [`refined since ${since}`, `plan ${reason.plan}`,
-              reviewRounds(reason.review_rounds)]
+              decisionCount(reason.decisions), reviewRounds(reason.review_rounds)]
         .filter(Boolean).join(", ");
     case "lapsed":
       return `claim by ${spellHidden(reason.holder).text}`
@@ -306,12 +323,20 @@ export function inboxStatus(rowCount, failed, loaded) {
   return pollStatus(INBOX_STATUS_TEXT, rowCount, failed, loaded);
 }
 
-// What a move's button says: its verb, approve's naming what it approves, and whose
-// claim it ends, since a move to another state ends the claim (`operator_moves.move`).
-// The holder is an agent's, so spelled.
-export function moveLabel(move, task) {
+// What a move's button says: its verb, and whose claim it ends, since a move to another
+// state ends the claim (`operator_moves.move`). A reopen from refined names the
+// revision and plan it opens, as approve does; a send back says it sends no answers
+// once `picked`, the choices made, differ from what the plan assumes. The holder is an
+// agent's, so spelled.
+export function moveLabel(move, task, picked = null) {
   if (!move || typeof move !== "object" || !task || typeof task !== "object") return "";
-  const verb = move.verb === "approve" ? approveLabel(task) : move.verb;
+  let verb = move.verb;
+  if (verb === "reopen" && task.state === "refined" && task.plan) {
+    verb = `reopen revision ${task.revision} and plan ${task.plan.id}`;
+  } else if (verb === "send back" && picked
+             && choicesDiffer(planDecisions(task.plan), picked)) {
+    verb = "send back without answering";
+  }
   return move.endsClaim && task.claim
     ? `${verb} (ends ${spellHidden(task.claim.holder).text}'s claim)` : verb;
 }
@@ -321,30 +346,86 @@ export function breakLabel(claim) {
 }
 
 // Approving a refined task approves its body and plan as the page shows them
-// (task-registry/DESIGN.md, "Plans"), so the button names the revision and the plan,
-// and says when the title, body or plan carry a character spelled out above it.
-export function approveLabel(task) {
+// (task-registry/DESIGN.md, "Plans") and answers its decisions, so the button names the
+// revision, the plan and where the answers take the task (`approveOutcome`): it is the
+// confirmation. A warning says when the title, body, plan, decisions or an "other" text
+// to be sent carry a character spelled out above it.
+export function approveLabel(task, outcome = "open") {
   if (!task || typeof task !== "object" || !task.plan) return "";
-  return `approve revision ${task.revision} and plan ${task.plan.id}`;
+  const what = `approve revision ${task.revision} and plan ${task.plan.id}`;
+  return outcome === "proposed"
+    ? `${what} with these answers: sends it back to proposed` : `${what}: opens it`;
 }
-export function approveHidden(task) {
+export function approveHidden(task, picked = null) {
   if (!task || typeof task !== "object") return "";
   const plan = planParts(task.plan).map(p => p.text);
-  const hidden = [task.title, task.body, ...plan].map(text => spellHidden(text).hidden)
-    .reduce((sum, n) => sum + n, 0);
+  const others = (Array.isArray(picked) ? picked : []).map(c => choiceAnswer(c).other);
+  const hidden = hiddenIn(task.title, task.body, ...plan, ...others)
+    + planDecisions(task.plan).reduce((sum, d) => sum + decisionHidden(d), 0);
   return hidden > 0
     ? `What this approves carries ${hidden} invisible or direction-changing `
       + `character${hidden === 1 ? "" : "s"}, spelled out above: read them first.`
     : "";
 }
+function decisionHidden(d) {
+  const options = Array.isArray(d.options) ? d.options : [];
+  return hiddenIn(d.question, d.why, ...options.flatMap(o => [o.label, o.meaning]));
+}
+
+// While an answer is incomplete no approve is drawn, only this, naming the decisions
+// (counted from 1, as drawn) still to answer.
+export function incompleteText(missing) {
+  const list = (Array.isArray(missing) ? missing : []).map(i => String(i + 1));
+  return `No approve until every decision is answered: ${list.length === 1 ? "decision"
+    : "decisions"} ${list.join(", ")} not yet. A picked "other" needs its text.`;
+}
+
+// Why no move opens a task whose current plan has decisions not answered, from any
+// state but refined, where approve is.
+export function openBlockedText(task) {
+  return awaitsAnswers(task) && task.state !== "refined"
+    ? `No move opens this task: plan ${task.plan.id} has decisions not answered. Move `
+      + "it back to refined, then approve it with the answers."
+    : "";
+}
+
+// The line a draw that brought another plan puts above the decisions, whatever the
+// choices were, with the "other" texts it reset (`notePlanDrawn`). The operator's own
+// words, spelled as any text is.
+export function resetText(reset) {
+  if (!reset || typeof reset !== "object") return "";
+  const others = (Array.isArray(reset.others) ? reset.others : [])
+    .map(text => `"${spellHidden(text).text}"`);
+  return `Another plan: this is plan ${reset.to}, and plan ${reset.from} was drawn `
+    + "before. Read it again; its choices are back on what it assumes."
+    + (others.length ? ` Reset with plan ${reset.from}: ${others.join(", ")}` : "");
+}
 
 // What a write came to, in a line, and whether it warns: `writeOutcome`'s word, or for
 // an answer that was lost, `checkWrite`'s. `detail` is the refusal's own reason. A bulk
 // is all or none, so a refused one says none was handled; a hide or a show says what it
-// changed for the note as it was (`noteLanded`).
-export function outcomeText(write, outcome, detail) {
+// changed for the note as it was (`noteLanded`); an approve, the state it `reached`.
+export function outcomeText(write, outcome, detail, reached) {
   const said = outcomeLine(write, outcome, detail);
-  return { ...said, text: said.text + leftOutText(write) };
+  const approved = approvedText(write, outcome, reached);
+  return { text: said.text + approved.text + leftOutText(write),
+           warn: said.warn || approved.warn };
+}
+
+// The state a landed approve reached, from its reply or the task read again, warning
+// when it is not the one its label said: another write may have moved the task since.
+export function approvedText(write, outcome, reached) {
+  if (!write || write.kind !== "approve" || !["landed", "found"].includes(outcome)
+      || typeof reached !== "string") return { text: "", warn: false };
+  const now = reached === "open" ? " The task is open."
+    : reached === "proposed"
+      ? " The task is back in proposed, its plan superseded, for a plan written from the "
+        + "answers."
+      : ` The task is ${spellHidden(reached).text}.`;
+  if (reached === write.predicted) return { text: now, warn: false };
+  return { text: `${now} That is not what this page said: it said the answers `
+                 + `${write.predicted === "open" ? "open it" : "send it back"}.`,
+           warn: true };
 }
 
 // The notes a bulk left out because their task was parked since the list was drawn,
@@ -566,6 +647,13 @@ let writing = null;        // the write in flight: one at a time
 let outcome = null;        // what the last write came to, while its task is open
 let noteDraft = { task: null, text: "" };   // kept until it lands
 let replyDrafts = new Map();  // a reply's text by its note's id: its box is open while kept
+// The choices made on a plan to approve, by task and plan (`choicesFor`), so a redraw
+// keeps them, a stale write's too; dropped when its approve lands or another plan is
+// drawn for the task (`notePlanDrawn`), which a line says until the first choice in
+// the new plan or a landed approve.
+let choices = new Map();
+let drawnPlans = new Map();   // by task: the plan it was last drawn with
+let planResets = new Map();   // by task: the line saying a draw brought another plan
 // The flagged list. Rows are drawn only from a read the operator asked for, or a write's
 // (`readFlagged`); every other read rewrites the count line.
 let flaggedDrawn = null;   // the notes drawn as rows; null: no draw since it last answered
@@ -990,6 +1078,10 @@ function planBlock(plan, state, previous = null) {
   for (const part of planParts(plan)) {
     whole.appendChild(line(part.label, proseBlock(part.text)));
   }
+  // An earlier plan's decisions, as text: the task's own are drawn above its plan.
+  if (state === null) {
+    planDecisions(plan).forEach((d, i) => whole.appendChild(decisionGroup(d, i, null)));
+  }
   if (!previous) {
     block.appendChild(whole);
     return block;
@@ -1007,6 +1099,167 @@ function planBlock(plan, state, previous = null) {
   about.append(`What changed from plan ${previous.id} `, toggle);
   block.append(about, changes, whole);
   return block;
+}
+
+// Above the plan, since they matter more to the operator than it: a line when this
+// draw brought another plan than the last, the decisions of the plan drawn, with
+// choices while it can be approved and as text otherwise, then every answer the task
+// has had, newest plan first.
+function decisionsBlock(task) {
+  const block = document.createElement("div");
+  block.className = "decisions";
+  const reset = planResets.get(String(task.id));
+  if (reset) {
+    const said = noticeLine({ text: resetText(reset), warn: true });
+    said.dataset.planReset = "1";
+    block.appendChild(said);
+  }
+  const decisions = planDecisions(task.plan);
+  if (decisions.length) {
+    const head = document.createElement("h3");
+    head.textContent = `Decisions of plan ${task.plan.id} · ${decisions.length}`;
+    block.appendChild(head);
+    const picked = approvable(task) ? choicesFor(task) : null;
+    decisions.forEach((d, i) => block.appendChild(decisionGroup(d, i, picked && picked[i])));
+  }
+  const answers = Array.isArray(task.answers) ? task.answers : [];
+  if (answers.length) {
+    const head = document.createElement("h3");
+    head.textContent = `Answers · ${answers.length}`;
+    block.appendChild(head);
+    for (const answer of answers) block.appendChild(answerBlock(answer));
+  }
+  return block;
+}
+
+// One decision: its question, why its refiner could not settle it, and each option
+// whole, the assumed ones said in words. With a `choice`, each option is an input that
+// carries its positions, never its text, and "other" a box for the operator's words.
+function decisionGroup(decision, i, choice) {
+  const group = document.createElement("fieldset");
+  group.className = "decision";
+  const legend = document.createElement("legend");
+  legend.textContent = `decision ${i + 1}: `
+    + (decision.multi_select ? "any of these" : "one of these")
+    + (choice ? ", or other" : "");
+  group.append(legend, proseBlock(decision.question), line("why", proseBlock(decision.why)));
+  const multi = Boolean(decision.multi_select);
+  (Array.isArray(decision.options) ? decision.options : []).forEach((option, j) => {
+    const row = document.createElement("div");
+    row.className = "option";
+    if (choice) {
+      const input = choiceInput(i, String(j), multi);
+      input.checked = choice.options.includes(j);
+      row.appendChild(input);
+    }
+    const text = document.createElement("div");
+    const label = proseBlock(option.label);
+    label.className = "option-label";
+    text.appendChild(label);
+    if (option.assumed) {
+      const mark = document.createElement("div");
+      mark.className = "qual";
+      mark.textContent = "the plan as written assumes this";
+      text.appendChild(mark);
+    }
+    text.appendChild(proseBlock(option.meaning));
+    row.appendChild(text);
+    group.appendChild(row);
+  });
+  if (choice) group.appendChild(otherRow(i, choice, multi));
+  return group;
+}
+
+function choiceInput(i, option, multi) {
+  const input = document.createElement("input");
+  input.type = multi ? "checkbox" : "radio";
+  input.name = `decision-${i}`;
+  input.dataset.decision = String(i);
+  input.dataset.option = option;
+  input.setAttribute("aria-label", option === "other" ? `decision ${i + 1}: other`
+    : `decision ${i + 1}: option ${Number(option) + 1}`);
+  return input;
+}
+
+// "Other": its input, and a box for the text, open once it is picked or holds text
+// (`markOther`).
+function otherRow(i, choice, multi) {
+  const row = document.createElement("div");
+  row.className = "option";
+  const input = choiceInput(i, "other", multi);
+  input.checked = choice.other;
+  const box = document.createElement("div");
+  box.className = "other";
+  box.dataset.otherBox = String(i);
+  const said = document.createElement("div");
+  said.textContent = "other: in your own words, which sends the task back";
+  const text = document.createElement("textarea");
+  text.rows = 2;
+  text.dataset.other = String(i);
+  text.setAttribute("aria-label", `decision ${i + 1}: other, in your own words`);
+  text.value = choice.text;
+  text.hidden = !choice.other && !choice.text;
+  const note = document.createElement("div");
+  note.dataset.otherNote = String(i);
+  box.append(said, text, note);
+  row.append(input, box);
+  return row;
+}
+
+// An "other" box as its choice is: open once picked, and kept open; under it, text
+// left there while another option is picked marked as not sent, and the text spelled
+// when it carries a hidden character.
+function markOther(box, choice) {
+  const text = box.querySelector("textarea[data-other]");
+  text.hidden = text.hidden && !choice.other && !choice.text;
+  const note = box.querySelector("[data-other-note]");
+  note.replaceChildren();
+  if (!choice.other && !blankText(choice.text)) {
+    note.appendChild(noticeLine({ text: "Not sent: \"other\" is not picked.", warn: true }));
+  }
+  if (spellHidden(choice.text).hidden) note.appendChild(proseBlock(choice.text));
+}
+
+// One answer the operator gave: its plan and decision, the question, and the options
+// chosen and "other" text as the registry keeps them, in the text the operator saw.
+function answerBlock(answer) {
+  const block = document.createElement("div");
+  block.className = "answer";
+  const head = document.createElement("div");
+  head.className = "qual";
+  head.textContent = [`plan ${answer.plan}`, `decision ${Number(answer.decision) + 1}`,
+                      `by ${spellHidden(answer.author).text}`, fmtStamp(answer.at)]
+    .filter(Boolean).join(" · ");
+  block.append(head, proseBlock(answer.question));
+  for (const option of Array.isArray(answer.options) ? answer.options : []) {
+    block.appendChild(line("chose", proseBlock(option.label)));
+  }
+  if (typeof answer.other === "string") {
+    block.appendChild(line("other", proseBlock(answer.other)));
+  }
+  return block;
+}
+
+// The choices kept for the task's plan, started on the options it assumes.
+function choicesFor(task) {
+  const key = `${task.id}:${task.plan.id}`;
+  if (!choices.has(key)) choices.set(key, assumedChoices(planDecisions(task.plan)));
+  return choices.get(key);
+}
+
+// A draw that brings another plan than the one this task was last drawn with says so,
+// whatever the choices were, and drops the old plan's, its "other" texts kept for the
+// line (`resetText`).
+function notePlanDrawn(task) {
+  const id = String(task.id);
+  const plan = task.plan ? task.plan.id : null;
+  const was = drawnPlans.get(id);
+  drawnPlans.set(id, plan);
+  if (was === undefined || was === null || plan === null || was === plan) return;
+  const key = `${id}:${was}`;
+  const others = (choices.get(key) || []).map(c => c.text).filter(text => !blankText(text));
+  choices.delete(key);
+  planResets.set(id, { from: was, to: plan, others });
 }
 
 // One part of a plan as what changed in it: a line when nothing did, else its runs,
@@ -1116,6 +1369,7 @@ function drawTask(task, held) {
   shownTask = task;
   shownHeld = held;
   draws += 1;
+  notePlanDrawn(task);
   taskDetail.replaceChildren();
   // Its space is kept whether or not it says anything, so filling it moves nothing.
   noticeSlot = document.createElement("div");
@@ -1162,6 +1416,7 @@ function drawTask(task, held) {
   const body = proseBlock(task.body);
   body.className = "task-body";
   taskDetail.appendChild(body);
+  taskDetail.appendChild(decisionsBlock(task));
   // The plan beside the body: approving a refined task approves the two together
   // (task-registry/DESIGN.md, "Plans").
   const planHead = document.createElement("h3");
@@ -1200,6 +1455,7 @@ function drawTask(task, held) {
   taskDetail.appendChild(timelineTable);
   taskDetail.appendChild(noteForm(task));
   taskDetail.hidden = false;
+  markAnswers();
   markWriting();
 }
 
@@ -1244,7 +1500,9 @@ export async function refreshOpenTask() {
 // to, but a refusal for a task that changed, which the slot atop the detail says, and a
 // move on a note, said above the timeline.
 // Approve and send back are each a control of their own, as a refined task's two
-// answers; approve names what it approves.
+// answers. Approve has a row of its own, above the rest and one line high, which
+// `markAnswers` fills as choices are made: neither its label nor the send back's
+// moves the other.
 function movesBlock(task) {
   const block = document.createElement("div");
   const head = document.createElement("h3");
@@ -1253,6 +1511,14 @@ function movesBlock(task) {
   if (outcome && outcome.task === String(task.id) && outcome.result !== "stale"
       && !outcome.onNote) {
     block.appendChild(noticeLine(outcome));
+  }
+  const blocked = openBlockedText(task);
+  if (blocked) block.appendChild(noticeLine({ text: blocked, warn: false }));
+  if (approvable(task)) {
+    const approve = document.createElement("div");
+    approve.className = "approve-row";
+    approve.dataset.approveRow = "1";
+    block.appendChild(approve);
   }
   const row = document.createElement("div");
   row.className = "moves";
@@ -1263,9 +1529,76 @@ function movesBlock(task) {
   }
   if (task.claim) row.appendChild(writeButton(breakLabel(task.claim), "break", ""));
   block.appendChild(row);
-  const hidden = task.state === "refined" ? approveHidden(task) : "";
-  if (hidden) block.appendChild(noticeLine({ text: hidden, warn: true }));
+  const hidden = noticeLine({ text: "", warn: true });
+  hidden.dataset.approveHidden = "1";
+  hidden.hidden = true;
+  block.appendChild(hidden);
   return block;
+}
+
+// What follows the choices, redrawn in place as the operator makes them, and once by
+// each draw: the approve, or while an answer is incomplete the line saying which,
+// since no approve is built then; the send back's label; each "other" box; and the
+// count of hidden characters in what the approve sends.
+function markAnswers() {
+  if (!drawnIsOpen()) return;
+  const task = shownTask;
+  const picked = approvable(task) ? choicesFor(task) : null;
+  const decisions = planDecisions(task.plan);
+  const row = taskDetail.querySelector("[data-approve-row]");
+  if (row && picked) {
+    const goes = approveOutcome(decisions, picked);
+    if (goes === "incomplete") {
+      const said = document.createElement("span");
+      said.className = "empty warn";
+      said.textContent = incompleteText(unanswered(decisions, picked));
+      row.replaceChildren(said);
+    } else {
+      const btn = writeButton(approveLabel(task, goes), "approve", "");
+      btn.dataset.verb = "approve";
+      row.replaceChildren(btn);
+    }
+  }
+  const back = movesFor(task).find(m => m.verb === "send back");
+  const backBtn = taskDetail.querySelector('button[data-write="move"][data-verb="send back"]');
+  if (back && backBtn) backBtn.textContent = moveLabel(back, task, picked);
+  for (const box of taskDetail.querySelectorAll("[data-other-box]")) {
+    if (picked) markOther(box, picked[Number(box.dataset.otherBox)]);
+  }
+  const hidden = taskDetail.querySelector("[data-approve-hidden]");
+  if (hidden) {
+    hidden.textContent = picked ? approveHidden(task, picked) : "";
+    hidden.hidden = !hidden.textContent;
+  }
+}
+
+// A choice made in a decision's group, kept by task and plan. The first one in a plan
+// that replaced another spends the line saying so, which keeps its space until the
+// next draw.
+function choose(input) {
+  if (!drawnIsOpen() || !approvable(shownTask)) return;
+  const i = Number(input.dataset.decision);
+  const choice = choicesFor(shownTask)[i];
+  const multi = Boolean(planDecisions(shownTask.plan)[i].multi_select);
+  if (input.dataset.option === "other") {
+    choice.other = multi ? input.checked : true;
+    if (!multi) choice.options = [];
+  } else {
+    const j = Number(input.dataset.option);
+    if (!multi) {
+      choice.options = [j];
+      choice.other = false;
+    } else {
+      choice.options = choice.options.filter(k => k !== j).concat(input.checked ? [j] : []);
+    }
+  }
+  if (planResets.delete(String(shownTask.id))) {
+    for (const said of taskDetail.querySelectorAll("[data-plan-reset]")) {
+      said.classList.add("spent");
+    }
+  }
+  markAnswers();
+  markWriting();
 }
 
 function writeButton(label, kind, value) {
@@ -1298,7 +1631,8 @@ function drawnIsOpen() {
 }
 function markWriting() {
   for (const el of taskDetail.querySelectorAll(
-    "[data-write], textarea[data-note], textarea[data-reply]")) {
+    "[data-write], textarea[data-note], textarea[data-reply], input[data-decision], "
+    + "textarea[data-other]")) {
     el.disabled = writing !== null || !drawnIsOpen();
   }
   for (const box of taskDetail.querySelectorAll("[data-reply-box]")) markReply(box);
@@ -1349,11 +1683,18 @@ async function runWrite(write) {
   if (write.kind === "handle" && write.handled && landed) {
     replyDrafts.delete(String(write.note));
   }
+  if (write.kind === "approve" && landed) {
+    choices.delete(`${write.task}:${write.plan}`);
+    planResets.delete(write.task);
+  }
   const detail = answer && answer.body && typeof answer.body === "object"
     ? answer.body.detail : answer && answer.text;
+  // The state an approve reached: as its answer names it, or as the task read again.
+  const reached = result === "landed" ? answer.body.state
+    : drawn && drawn.task && drawn.task.state;
   // Not `kind`: the slot reads an outcome's `kind` before its `result` (`fillSlot`).
   const said = { task: write.task, result, onNote: isNoteMove(write),
-                 ...outcomeText(write, result, detail) };
+                 ...outcomeText(write, result, detail, reached) };
   if (write.kind === "handle-many") flaggedOutcome = said;
   // The flagged rows as the registry now has them, after a move on notes or on a task,
   // which can park or reopen a drawn note's task: drawn while every control is still
@@ -1385,12 +1726,25 @@ function writeFor(btn) {
   if (btn.dataset.write === "move") {
     return { ...base, kind: "move", state: btn.dataset.value, verb: btn.dataset.verb };
   }
+  if (btn.dataset.write === "approve") return approveWrite(base);
   if (btn.dataset.write === "break") return { ...base, kind: "break", verb: "break the claim" };
   if (btn.dataset.write === "hide" || btn.dataset.write === "handle") {
     return noteWrite(btn, base);
   }
   const text = noteDraft.task === base.task ? noteDraft.text : "";
   return text.trim() ? { ...base, kind: "note", text, verb: "add the note" } : null;
+}
+
+// An approve of the plan drawn, with an answer per decision from the choices made on
+// it, and the state they take the task to, which the outcome checks; none while an
+// answer is incomplete.
+function approveWrite(base) {
+  if (!approvable(shownTask)) return null;
+  const decisions = planDecisions(shownTask.plan);
+  const picked = choicesFor(shownTask);
+  const answers = approveAnswers(decisions, picked);
+  return answers && { ...base, kind: "approve", plan: shownTask.plan.id, answers,
+                      predicted: approveOutcome(decisions, picked), verb: "approve" };
 }
 
 // A move on a note in the timeline, as of the newest timeline entry the page holds:
@@ -1696,6 +2050,13 @@ export function mountTasks() {
     }
     if (ev.target.matches("textarea[data-reply]")) {
       replyDrafts.set(ev.target.dataset.reply, ev.target.value);
+      markWriting();
+    }
+    if (ev.target.matches("input[data-decision]")) choose(ev.target);
+    if (ev.target.matches("textarea[data-other]") && drawnIsOpen()
+        && approvable(shownTask)) {
+      choicesFor(shownTask)[Number(ev.target.dataset.other)].text = ev.target.value;
+      markAnswers();
       markWriting();
     }
   });

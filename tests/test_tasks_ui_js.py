@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import unittest
+from typing import ClassVar
 
 from _loader import load_operator_api
 from test_control_plane_ui_js import (
@@ -24,9 +25,16 @@ from test_control_plane_ui_js import (
     _module_texts,
     _served_dir,
 )
+from test_task_registry_operator import ALICE, ThroughTheRelay
+from test_task_registry_operator import _Store as _OperatorStore
+from test_task_registry_operator import api as _api
+from test_task_registry_operator import reg as _reg
+from test_task_registry_plans import DECISION, MULTI, PLAN
 from test_tasks_ui import tui
 
 TASKS_DIR = ROOT / "tasks-ui"
+_agent, _plans, _reads, _Refused = (_reg.agent_moves, _reg.plans, _reg.reads,
+                                    _reg.taskdb.Refused)
 
 
 def _function(src: str, name: str) -> str:
@@ -125,6 +133,14 @@ console.log(JSON.stringify({
       landing_bare: t.reasonText({why: "landing", since: 1789466400, branch: null}),
       refined: t.reasonText({why: "refined", since: 1789466400, plan: 6,
                              review_rounds: 3}),
+      decisions: t.reasonText({why: "refined", since: 1789466400, plan: 6,
+                               decisions: 2, review_rounds: 3}),
+      one_decision: t.reasonText({why: "refined", since: 1789466400, plan: 6,
+                                  decisions: 1, review_rounds: 1}),
+      no_decisions: t.reasonText({why: "refined", since: 1789466400, plan: 6,
+                                  decisions: 0, review_rounds: 3}),
+      null_decisions: t.reasonText({why: "refined", since: 1789466400, plan: 6,
+                                    decisions: null, review_rounds: 3}),
       lapsed: t.reasonText({why: "lapsed", since: 1789466400, holder: "claude-x\u200b",
                             branch: "b"}),
       lapsed_refining: t.reasonText({why: "lapsed", since: 1789466400,
@@ -340,6 +356,17 @@ class TaskViewTests(unittest.TestCase):
         self.assertRegex(r["landing"], rf"^landing since {stamp} on fix\\u202e$")
         self.assertRegex(r["landing_bare"], rf"^landing since {stamp}$")
         self.assertRegex(r["refined"], rf"^refined since {stamp}, plan 6, 3 review rounds$")
+        # The plan's decisions, answered or not: a count of what it carries, never said
+        # as waiting, and nothing from a registry that sends none.
+        self.assertRegex(r["decisions"],
+                         rf"^refined since {stamp}, plan 6, 2 decisions, 3 review rounds$")
+        self.assertRegex(r["one_decision"],
+                         rf"^refined since {stamp}, plan 6, 1 decision, 1 review round$")
+        self.assertRegex(r["no_decisions"],
+                         rf"^refined since {stamp}, plan 6, no decisions, 3 review rounds$")
+        self.assertRegex(r["null_decisions"],
+                         rf"^refined since {stamp}, plan 6, 3 review rounds$")
+        self.assertNotRegex(r["decisions"], r"wait|answer")
         self.assertRegex(r["lapsed"],
                          rf"^claim by claude-x\\u200b on b ran out {stamp}$")
         # A claim to refine a task has no branch.
@@ -418,7 +445,7 @@ const task = (state, extra = {}) => ({id: 7, state, revision: 4, title: "T",
 const moves = tk => m.movesFor(tk).map(mv => [mv.state, mv.verb, mv.endsClaim]);
 const res = (status, text) => ({status, text: async () => text});
 const cut = status => ({status, text: async () => { throw new TypeError("cut"); }});
-const move = {kind: "move", task: "7", revision: 4, state: "open", verb: "approve",
+const move = {kind: "move", task: "7", revision: 4, state: "open", verb: "reopen",
               lastNote: 12};
 const brk = {kind: "break", task: "7", revision: 4, verb: "break the claim", lastNote: 12};
 const note = {kind: "note", task: "7", revision: 4, text: "Seen.", lastNote: 12,
@@ -426,10 +453,41 @@ const note = {kind: "note", task: "7", revision: 4, text: "Seen.", lastNote: 12,
 const after = (extra, notes = []) => ({task: task("open", {revision: 5, notes, ...extra}),
                                        held: {timeline: {history: [], total: 0},
                                               plans: []}});
+// A plan with a single-choice decision and a multi-select one, as a read carries them,
+// and the answers an approve of it as assumed leaves.
+const option = (label, assumed) => ({label, meaning: `${label}, meant.`, assumed});
+const decided = {...plan, decisions: [
+  {question: "Hold\u202e or deny?", why: "W.", multi_select: false,
+   options: [option("Hold", true), option("Deny", false)]},
+  {question: "Which logs?", why: "W.", multi_select: true,
+   options: [option("Audit", true), option("Access", true), option("Debug", false)]}]};
+const chose = (plan, decision, positions, other = null) => ({plan, decision, question: "Q",
+  options: positions.map(position => ({position, label: "L", meaning: "M"})), other,
+  author: "operator", at: 1789466400});
+const answered = [chose(6, 0, [0]), chose(6, 1, [0, 1])];
+const assumed = m.assumedChoices(decided.decisions);
+const denied = [{options: [1], other: false, text: ""}, assumed[1]];
+const sendBack = {state: "proposed", verb: "send back", endsClaim: false};
+const approveW = {kind: "approve", task: "7", revision: 4, plan: 6, verb: "approve",
+                  answers: [{options: [0], other: null}, {options: [0, 1], other: null}],
+                  predicted: "open", lastNote: 12};
+const bare = {...approveW, answers: []};
+const reread = extra => ({task: task("open", {revision: 5, plan: decided, answers: answered,
+                                              ...extra})});
 console.log(JSON.stringify({
   moves: {
     proposed: moves(task("proposed")),
     refined_with_plan: moves(task("refined", {plan})),
+    refined_decided: moves(task("refined", {plan: decided, answers: []})),
+    refined_answered: moves(task("refined", {plan: decided, answers: answered})),
+    re_refined: moves(task("refined", {plan: {...decided, id: 9}, answers: answered})),
+    deferred_re_refined: moves(task("deferred", {plan: {...decided, id: 9},
+                                                 answers: answered})),
+    deferred_decided: moves(task("deferred", {plan: decided})),
+    landing_decided: moves(task("landing", {plan: decided})),
+    closed_answered: moves(task("closed", {plan: decided, answers: answered})),
+    proposed_decided_superseded: moves(task("proposed", {plan: {...decided,
+                                                                superseded_at: 1}})),
     proposed_with_plan: moves(task("proposed", {plan})),
     proposed_superseded: moves(task("proposed", {plan: {...plan, superseded_at: 1}})),
     open_claimed: moves(task("open", {claim})),
@@ -467,6 +525,33 @@ console.log(JSON.stringify({
     note_missing: m.checkWrite(note, after({})),
     failed_read: m.checkWrite(move, null),
     failed_note_read: m.checkWrite(note, null),
+    approve_found: m.checkWrite(approveW, reread({})),
+    approve_found_moved_on: m.checkWrite(approveW, reread({state: "deferred"})),
+    approve_sent_back_found: m.checkWrite(
+      {...approveW, answers: [{options: [], other: "Only some."}, approveW.answers[1]],
+       predicted: "proposed"},
+      reread({state: "proposed", plan: {...decided, superseded_at: 2},
+              answers: [chose(6, 0, [], "Only some."), chose(6, 1, [0, 1])]})),
+    // Sent back, then planned again before the read: its answers are on plan 6 still.
+    approve_sent_back_replanned: m.checkWrite(
+      {...approveW, answers: [{options: [1], other: null}, approveW.answers[1]],
+       predicted: "proposed"},
+      reread({state: "refined", plan: {...decided, id: 9},
+              answers: [chose(6, 0, [1]), chose(6, 1, [0, 1])]})),
+    approve_other_answers: m.checkWrite(approveW, reread({state: "proposed",
+      answers: [chose(6, 0, [1]), chose(6, 1, [0, 1])]})),
+    approve_other_text: m.checkWrite(approveW, reread({state: "proposed",
+      answers: [chose(6, 0, [0], "x"), chose(6, 1, [0, 1])]})),
+    approve_one_answer: m.checkWrite(approveW, reread({answers: [chose(6, 0, [0])]})),
+    approve_other_plan: m.checkWrite(approveW, reread({plan: {...decided, id: 9},
+      answers: [chose(9, 0, [0]), chose(9, 1, [0, 1])]})),
+    approve_not_landed: m.checkWrite(approveW, reread({state: "refined", revision: 4,
+                                                       answers: []})),
+    approve_bare_found: m.checkWrite(bare, {task: task("open", {revision: 5, plan})}),
+    approve_bare_changed: m.checkWrite(bare, {task: task("deferred", {revision: 5, plan})}),
+    approve_bare_other_plan: m.checkWrite(bare, {task: task("open", {revision: 5,
+                                                                     plan: {...plan, id: 9}})}),
+    approve_failed_read: m.checkWrite(approveW, null),
   },
   answer: {
     json: await m.readAnswer(res(409, '{"ok": false, "current": {"id": 7}}')),
@@ -476,8 +561,23 @@ console.log(JSON.stringify({
   last_note: [m.lastNoteId({notes: [{id: 3}, {id: 11}, {id: 9}]}),
               m.lastNoteId({notes: []}), m.lastNoteId(null)],
   labels: {
-    approve: t.moveLabel({state: "open", verb: "approve", endsClaim: false},
-                         task("refined", {plan})),
+    approve: t.approveLabel(task("refined", {plan})),
+    approve_opens: t.approveLabel(task("refined", {plan: decided}), "open"),
+    approve_back: t.approveLabel(task("refined", {plan: decided}), "proposed"),
+    reopen: t.moveLabel({state: "open", verb: "reopen", endsClaim: false},
+                        task("refined", {plan: decided, answers: answered})),
+    reopen_claimed: t.moveLabel({state: "open", verb: "reopen", endsClaim: true},
+                                task("refined", {plan: decided, answers: answered,
+                                                 claim})),
+    reopen_closed: t.moveLabel({state: "open", verb: "reopen", endsClaim: false},
+                               task("closed", {plan})),
+    send_back: t.moveLabel(sendBack, task("refined", {plan: decided}), assumed),
+    send_back_differs: t.moveLabel(sendBack, task("refined", {plan: decided}), denied),
+    send_back_other: t.moveLabel(sendBack, task("refined", {plan: decided}),
+                                 [assumed[0], {options: [0, 1], other: true, text: "x"}]),
+    send_back_text_not_picked: t.moveLabel(sendBack, task("refined", {plan: decided}),
+                                           [{...assumed[0], text: "x"}, assumed[1]]),
+    send_back_no_choices: t.moveLabel(sendBack, task("refined", {plan: decided})),
     ends_claim: t.moveLabel({state: "closed", verb: "close", endsClaim: true},
                             task("open", {claim})),
     plain: t.moveLabel({state: "deferred", verb: "defer", endsClaim: false}, task("open")),
@@ -487,12 +587,57 @@ console.log(JSON.stringify({
     hidden: t.approveHidden(task("refined", {title: "T\u202e", body: "B\u2066", plan})),
     one_hidden: t.approveHidden(task("refined", {plan})),
     no_hidden: t.approveHidden(task("refined", {plan: {...plan, approach: "A."}})),
+    // The plan's one, and the first question's.
+    decisions_hidden: t.approveHidden(task("refined", {plan: decided}), assumed),
+    option_hidden: t.approveHidden(task("refined", {plan: {...decided, approach: "A.",
+      decisions: [{...decided.decisions[1], why: "W\u200b.",
+                   options: [option("Au\u2066dit", true), option("B", false)]}]}})),
+    // And an "other" text sent, but not one left while "other" is not picked.
+    other_hidden: t.approveHidden(task("refined", {plan: decided}),
+                                  [{options: [], other: true, text: "x\u200b"}, assumed[1]]),
+    other_not_sent: t.approveHidden(task("refined", {plan: decided}),
+                                    [{...assumed[0], text: "x\u200b"}, assumed[1]]),
+    incomplete: [t.incompleteText([1]), t.incompleteText([0, 1])],
+    // A choice for no decision, or none for one: no answers, whatever the rest.
+    one_too_many: [m.approveAnswers(decided.decisions, [...assumed, assumed[0]]),
+                   m.approveOutcome(decided.decisions, [...assumed, assumed[0]])],
+    one_too_few: [m.approveAnswers(decided.decisions, assumed.slice(0, 1)),
+                  m.approveOutcome(decided.decisions, assumed.slice(0, 1))],
+    no_choices: [m.approveAnswers(decided.decisions, null), m.approveAnswers([], [])],
+    approvable: {
+      unanswered: m.approvable(task("refined", {plan: decided, answers: []})),
+      no_decisions: m.approvable(task("refined", {plan})),
+      re_refined: m.approvable(task("refined", {plan: {...decided, id: 9},
+                                                answers: answered})),
+      answered: m.approvable(task("refined", {plan: decided, answers: answered})),
+      open: m.approvable(task("open", {plan: decided})),
+      superseded: m.approvable(task("refined", {plan: {...decided, superseded_at: 1}})),
+      no_plan: m.approvable(task("refined")),
+    },
+    open_blocked: t.openBlockedText(task("deferred", {plan: decided})),
+    open_blocked_refined: t.openBlockedText(task("refined", {plan: decided})),
+    open_blocked_answered: t.openBlockedText(task("deferred", {plan: decided,
+                                                               answers: answered})),
+    reset: t.resetText({from: 6, to: 9, others: ["Only \u202ethe llm ones."]}),
+    reset_bare: t.resetText({from: 6, to: 9, others: []}),
   },
   texts: Object.fromEntries(["landed", "found", "stale", "refused", "not-running",
                              "not-landed", "not-found-yet", "could-not-check", "changed",
                              "unknown"]
     .map(o => [o, t.outcomeText(o === "not-found-yet" ? note : move, o, "no\u202e")])),
   note_landed_text: t.outcomeText(note, "landed").text,
+  approved: {
+    opened: t.outcomeText(approveW, "landed", undefined, "open"),
+    sent_back: t.outcomeText({...approveW, predicted: "proposed"}, "landed", undefined,
+                             "proposed"),
+    found: t.outcomeText(approveW, "found", undefined, "open"),
+    not_predicted: t.outcomeText(approveW, "found", undefined, "proposed"),
+    moved_on: t.outcomeText({...approveW, predicted: "proposed"}, "found", undefined,
+                            "deferred\u202e"),
+    refused: t.outcomeText(approveW, "refused", "plan 6 was answered already", "open"),
+    not_landed: t.outcomeText(approveW, "not-landed", undefined, "refined"),
+    move_ignores_it: t.outcomeText(move, "landed", undefined, "proposed"),
+  },
 }));
 """
 
@@ -528,11 +673,33 @@ class MoveTests(unittest.TestCase):
         self.assertNotIn("refined", [s for s, _, _ in mv["proposed_superseded"]])
         self.assertEqual((mv["unknown_state"], mv["none"]), ([], []))
 
-    def test_a_refined_task_is_approved_or_sent_back(self):
-        refined = {s: verb for s, verb, _ in self.probe["moves"]["refined_with_plan"]}
-        self.assertEqual(refined, {"proposed": "send back", "open": "approve",
-                                   "landing": "move to landing", "deferred": "defer",
-                                   "closed": "close"})
+    def test_a_refined_task_is_sent_back_by_a_move_and_approved_by_none(self):
+        # Approving is `approve`, with or without decisions; open is a move from
+        # refined only to reopen a plan answered before, which `approve` refuses.
+        mv = self.probe["moves"]
+        expected = {"proposed": "send back", "landing": "move to landing",
+                    "deferred": "defer", "closed": "close"}
+        for key in ("refined_with_plan", "refined_decided", "re_refined"):
+            with self.subTest(case=key):
+                self.assertEqual({s: verb for s, verb, _ in mv[key]}, expected)
+        self.assertEqual({s: verb for s, verb, _ in mv["refined_answered"]},
+                         expected | {"open": "reopen"})
+
+    def test_open_is_offered_from_no_state_while_decisions_wait(self):
+        mv = self.probe["moves"]
+        for key in ("deferred_decided", "landing_decided", "deferred_re_refined"):
+            with self.subTest(case=key):
+                self.assertNotIn("open", [s for s, _, _ in mv[key]])
+                self.assertIn("refined", [s for s, _, _ in mv[key]])
+        self.assertIn(["open", "reopen", False], mv["closed_answered"])
+        # A superseded plan waits on nobody: the registry's guard reads the current one.
+        self.assertIn(["open", "move to open", False], mv["proposed_decided_superseded"])
+        labels = self.probe["labels"]
+        self.assertEqual(labels["open_blocked"],
+                         "No move opens this task: plan 6 has decisions not answered. "
+                         "Move it back to refined, then approve it with the answers.")
+        self.assertEqual((labels["open_blocked_refined"], labels["open_blocked_answered"]),
+                         ("", ""))
 
     def test_a_closed_or_deferred_task_is_reopened(self):
         for state in ("closed", "deferred"):
@@ -597,11 +764,99 @@ class MoveTests(unittest.TestCase):
     def test_a_notes_check_counts_from_the_newest_note_held(self):
         self.assertEqual(self.probe["last_note"], [11, 0, 0])
 
-    def test_approve_names_the_revision_and_plan_it_approves(self):
+    def test_approve_names_the_revision_plan_and_outcome(self):
         labels = self.probe["labels"]
-        self.assertEqual(labels["approve"], "approve revision 4 and plan 6")
+        self.assertEqual(labels["approve"], "approve revision 4 and plan 6: opens it")
+        self.assertEqual(labels["approve_opens"], "approve revision 4 and plan 6: opens it")
+        self.assertEqual(labels["approve_back"], "approve revision 4 and plan 6 with these "
+                                                 "answers: sends it back to proposed")
         self.assertEqual(labels["approve_none"], "")
         self.assertEqual(labels["plain"], "defer")
+
+    def test_a_reopen_from_refined_names_what_it_opens(self):
+        labels = self.probe["labels"]
+        self.assertEqual(labels["reopen"], "reopen revision 4 and plan 6")
+        self.assertEqual(labels["reopen_claimed"],
+                         "reopen revision 4 and plan 6 (ends claude-x\\u202e's claim)")
+        self.assertEqual(labels["reopen_closed"], "reopen")
+
+    def test_send_back_says_it_sends_no_answers_once_a_choice_differs(self):
+        labels = self.probe["labels"]
+        self.assertEqual(labels["send_back_differs"], "send back without answering")
+        self.assertEqual(labels["send_back_other"], "send back without answering")
+        for key in ("send_back", "send_back_text_not_picked", "send_back_no_choices"):
+            with self.subTest(case=key):
+                self.assertEqual(labels[key], "send back")
+
+    def test_approves_hidden_count_takes_the_decisions_and_the_other_text_sent(self):
+        labels = self.probe["labels"]
+        self.assertIn("carries 2 invisible", labels["decisions_hidden"])
+        # A why, and an option's label and its meaning, which repeats it.
+        self.assertIn("carries 3 invisible", labels["option_hidden"])
+        self.assertIn("carries 3 invisible", labels["other_hidden"])
+        self.assertIn("carries 2 invisible", labels["other_not_sent"])
+
+    def test_an_incomplete_answer_says_which_decisions_wait(self):
+        self.assertEqual(self.probe["labels"]["incomplete"], [
+            'No approve until every decision is answered: decision 2 not yet. A picked '
+            '"other" needs its text.',
+            'No approve until every decision is answered: decisions 1, 2 not yet. A '
+            'picked "other" needs its text.'])
+
+    def test_only_a_refined_current_plan_not_answered_is_approvable(self):
+        # A plan answered before is refused by `approve`: it reopens by a move.
+        self.assertEqual(self.probe["labels"]["approvable"], {
+            "unanswered": True, "no_decisions": True, "re_refined": True,
+            "answered": False, "open": False, "superseded": False, "no_plan": False})
+
+    def test_a_choice_per_decision_or_no_answers(self):
+        labels = self.probe["labels"]
+        for key in ("one_too_many", "one_too_few"):
+            with self.subTest(case=key):
+                self.assertEqual(labels[key], [None, "incomplete"])
+        # A plan without decisions is approved with no answers.
+        self.assertEqual(labels["no_choices"], [None, []])
+
+    def test_another_plan_is_said_with_the_other_text_it_reset(self):
+        labels = self.probe["labels"]
+        self.assertEqual(labels["reset_bare"],
+                         "Another plan: this is plan 9, and plan 6 was drawn before. Read "
+                         "it again; its choices are back on what it assumes.")
+        self.assertEqual(labels["reset"], labels["reset_bare"]
+                         + ' Reset with plan 6: "Only \\u202ethe llm ones."')
+
+    def test_a_lost_approve_is_found_by_the_answers_it_left(self):
+        c = self.probe["check"]
+        for key in ("approve_found", "approve_found_moved_on", "approve_sent_back_found",
+                    "approve_sent_back_replanned", "approve_bare_found"):
+            with self.subTest(case=key):
+                self.assertEqual(c[key], "found")
+        for key in ("approve_other_answers", "approve_other_text", "approve_one_answer",
+                    "approve_other_plan", "approve_bare_changed", "approve_bare_other_plan"):
+            with self.subTest(case=key):
+                self.assertEqual(c[key], "changed")
+        self.assertEqual(c["approve_not_landed"], "not-landed")
+        self.assertEqual(c["approve_failed_read"], "could-not-check")
+
+    def test_an_approve_says_the_state_it_reached_and_warns_when_not_predicted(self):
+        a = self.probe["approved"]
+        self.assertEqual(a["opened"], {"text": "Approve: done. The task is open.",
+                                       "warn": False})
+        self.assertEqual(a["sent_back"], {
+            "text": "Approve: done. The task is back in proposed, its plan superseded, "
+                    "for a plan written from the answers.", "warn": False})
+        self.assertEqual(a["found"]["warn"], False)
+        self.assertTrue(a["found"]["text"].endswith("landed. The task is open."))
+        self.assertTrue(a["not_predicted"]["warn"])
+        self.assertIn("That is not what this page said: it said the answers open it.",
+                      a["not_predicted"]["text"])
+        self.assertIn("The task is deferred\\u202e. That is not what this page said: it "
+                      "said the answers send it back.", a["moved_on"]["text"])
+        self.assertTrue(a["moved_on"]["warn"])
+        # Only a landing names a state; any other outcome says only its own.
+        self.assertEqual(a["refused"]["text"], "Approve: refused. plan 6 was answered already")
+        self.assertNotIn("The task is", a["not_landed"]["text"])
+        self.assertEqual(a["move_ignores_it"], {"text": "Reopen: done.", "warn": False})
 
     def test_a_claim_ending_move_and_a_break_name_the_holder_spelled(self):
         labels = self.probe["labels"]
@@ -620,7 +875,7 @@ class MoveTests(unittest.TestCase):
 
     def test_each_outcome_says_what_to_do_next(self):
         texts = self.probe["texts"]
-        self.assertEqual(texts["landed"], {"text": "Approve: done.", "warn": False})
+        self.assertEqual(texts["landed"], {"text": "Reopen: done.", "warn": False})
         self.assertEqual(self.probe["note_landed_text"], "The note: done.")
         for key, text in texts.items():
             with self.subTest(outcome=key):
@@ -628,13 +883,13 @@ class MoveTests(unittest.TestCase):
         self.assertIn("this is the task as it is now", texts["stale"]["text"])
         # Found after its answer was lost: said so, not passed off as a plain landing.
         self.assertEqual(texts["found"]["text"],
-                         "Approve: no answer came, but the task shows it landed.")
+                         "Reopen: no answer came, but the task shows it landed.")
         self.assertIn("cannot apply it twice", texts["not-landed"]["text"])
         self.assertIn("before sending it again", texts["not-found-yet"]["text"])
         self.assertNotIn("cannot apply it twice", texts["not-found-yet"]["text"])
         self.assertIn("not known", texts["could-not-check"]["text"])
         # A refusal's reason is the registry's, spelled like any other text.
-        self.assertEqual(texts["refused"]["text"], "Approve: refused. no\\u202e")
+        self.assertEqual(texts["refused"]["text"], "Reopen: refused. no\\u202e")
 
 
 _NOTE_MOVES_PROBE = r"""
@@ -818,7 +1073,7 @@ console.log(JSON.stringify({
     bulk_found: t.outcomeText(named, "found"),
     bulk_not_landed: t.outcomeText(named, "not-landed"),
     bulk_check: t.outcomeText(named, "could-not-check").text,
-    move_refused: t.outcomeText({kind: "move", verb: "approve"}, "refused", "no").text,
+    move_refused: t.outcomeText({kind: "move", verb: "reopen"}, "refused", "no").text,
   },
   line: {
     same: t.flaggedLine([9, 5], {notes: [{id: 9}, {id: 5}], total: 2}),
@@ -1002,7 +1257,7 @@ class NoteMoveTests(unittest.TestCase):
         self.assertIn("harmless", x["bulk_not_landed"]["text"])
         self.assertNotIn("cannot apply it twice", x["bulk_not_landed"]["text"])
         self.assertIn("flagged notes could not be read again", x["bulk_check"])
-        self.assertEqual(x["move_refused"], "Approve: refused. no")
+        self.assertEqual(x["move_refused"], "Reopen: refused. no")
 
     def test_the_count_line_says_what_changed_since_the_rows_were_drawn(self):
         line = self.probe["line"]
@@ -1442,7 +1697,7 @@ class TaskWriteSourceTests(unittest.TestCase):
     def test_each_relayed_post_is_a_post_fetch_in_moves_js_and_back(self):
         # PageChecks matches paths, not methods: this holds the methods.
         posts = [re.sub(r"\$\{[^}]*\}", "1", p) for p in self.POST.findall(self.MOVES)]
-        self.assertEqual(len(posts), 6)
+        self.assertEqual(len(posts), 7)
         routes = [rx for method, rx in tui._RELAY_ROUTES if method == "POST"]
         for path in posts:
             with self.subTest(path=path):
@@ -1451,7 +1706,7 @@ class TaskWriteSourceTests(unittest.TestCase):
             with self.subTest(route=rx.pattern):
                 self.assertTrue(any(rx.match(p) for p in posts), rx.pattern)
         # Every fetch in moves.js is one of them; tasks.js posts nothing.
-        self.assertEqual(len(re.findall(r"\bfetch\(", self.MOVES)), 6)
+        self.assertEqual(len(re.findall(r"\bfetch\(", self.MOVES)), 7)
         self.assertNotIn("method:", self.TASKS)
 
     def test_moves_js_imports_nothing_of_tasks_js(self):
@@ -1818,12 +2073,18 @@ class TaskRenderingSourceTests(unittest.TestCase):
 
     TASKS = (TASKS_DIR / "tasks.js").read_text()
     # A field an agent wrote, read off one of the registry's records.
-    # A timeline entry's note, and a diff's run, are agent text too.
+    # A timeline entry's note, and a diff's run, are agent text too, as are a plan's
+    # decisions and their options; an answer carries its question and options' text,
+    # and the operator's own "other" text, spelled as any.
     FIELD = re.compile(r"\b(?:t|n|h|task|claim|plan|part|reason|entry|run)"
                        r"(?:\.claim|\.note)?\."
                        r"(?:title|body|text|author|holder|branch|progress|footprint|"
-                       r"approach|tests|out_of_scope|risks|review_verdict)\b")
-    SPELT = ("spellHidden(", "proseBlock(", "authorCell(", "claimText(")
+                       r"approach|tests|out_of_scope|risks|review_verdict)\b"
+                       r"|\b(?:d|decision)\.(?:question|why)\b"
+                       r"|\b(?:o|option)\.(?:label|meaning)\b"
+                       r"|\banswer\.(?:question|other|author)\b")
+    # `hiddenIn` counts for a warning and draws nothing.
+    SPELT = ("spellHidden(", "proseBlock(", "authorCell(", "claimText(", "hiddenIn(")
 
     # Every module the page is made of, so a helper moving to another module does not
     # move out of these guards' sight.
@@ -1878,6 +2139,7 @@ class TaskRenderingSourceTests(unittest.TestCase):
                 self.assertIn("spellHidden(", body)
         prose = re.search(r"^function proseBlock\(.*?^\}", self.TASKS, re.M | re.S)
         self.assertIn("pre.textContent = shown.text", prose.group(0))
+        self.assertIn("spellHidden(text).hidden", _function(self.TASKS, "hiddenIn"))
 
     def test_a_diff_spells_every_run_and_marks_it_by_more_than_colour(self):
         body = _function(self.TASKS, "diffLine")
@@ -1902,6 +2164,302 @@ class TaskRenderingSourceTests(unittest.TestCase):
     def test_a_history_value_is_spelled_whatever_its_type(self):
         self.assertIn('typeof value === "string" ? proseBlock(value)', self.TASKS)
         self.assertIn("spellHidden(JSON.stringify(value)).text", self.TASKS)
+
+
+_APPROVE_PROBE = r"""
+import { pathToFileURL } from "node:url";
+const m = await import(pathToFileURL(`${process.env.DOCKADE_UI_DIR}/moves.js`).href);
+const decisions = JSON.parse(process.env.DOCKADE_DECISIONS);
+// Every choice a decision's group can hold, and some it cannot (an option and "other"
+// on a single choice), with "other" texts blank to both sides, blank to one only, and
+// words. Each set of options in every order it can be picked in, since the page keeps
+// them in click order.
+const orders = list => (list.length < 2 ? [list] : list.flatMap(
+  (j, k) => orders([...list.slice(0, k), ...list.slice(k + 1)]).map(rest => [j, ...rest])));
+const subsets = n => Array.from({length: 2 ** n},
+  (_, k) => [...Array(n).keys()].filter(j => k & (1 << j))).flatMap(orders);
+const TEXTS = ["", " \t", "\x1f", "\ufeff", "\u3000", "Only the llm containers."];
+const each = d => subsets(d.options.length).flatMap(
+  options => [false, true].flatMap(other => TEXTS.map(text => ({options, other, text}))));
+const cases = [];
+for (const a of each(decisions[0])) {
+  for (const b of each(decisions[1])) {
+    const choices = [a, b];
+    cases.push({outcome: m.approveOutcome(decisions, choices),
+                answers: m.approveAnswers(decisions, choices),
+                raw: choices.map(m.choiceAnswer)});
+  }
+}
+// What an approve puts on the wire, with fetch stubbed.
+const sent = [];
+globalThis.fetch = (url, opts) => {
+  sent.push({url, method: opts.method, body: JSON.parse(opts.body)});
+  return Promise.resolve({status: 200, text: async () => '{"ok": true}'});
+};
+const assumed = m.assumedChoices(decisions);
+const wire = {};
+for (const [key, choices] of Object.entries({
+    assumed,
+    other: [{options: [], other: true, text: "Deny, but log each one."}, assumed[1]],
+    fewer: [assumed[0], {options: [1], other: false, text: ""}]})) {
+  await m.sendWrite({kind: "approve", task: "7", revision: 4, plan: 6,
+                     answers: m.approveAnswers(decisions, choices)});
+  wire[key] = {...sent.pop(), predicted: m.approveOutcome(decisions, choices)};
+}
+await m.sendWrite({kind: "approve", task: "7", revision: 4, plan: 6, answers: []});
+wire.bare = sent.pop();
+// Every code point either side calls blank, lone surrogates aside.
+const blank = [];
+for (let cp = 0; cp <= 0x10ffff; cp++) {
+  if (cp >= 0xd800 && cp <= 0xdfff) continue;
+  if (m.blankText(String.fromCodePoint(cp))) blank.push(cp);
+}
+console.log(JSON.stringify({cases, wire, blank, assumed,
+                            empty: m.blankText(""), not_text: m.blankText(null)}));
+"""
+
+
+@unittest.skipIf(not _NODE and not _STRICT,
+                 "node is not installed — skipping app.js unit tests")
+class ApproveRuleTests(_OperatorStore):
+    """The page's approve against the registry's: every choice two decisions can hold
+    run through ``approveOutcome`` under node and ``plans.outcome`` here, which must
+    agree; one the page calls incomplete is one ``plans.check_answers`` refuses. And the
+    body the page posts, taken by the operator API's model and by ``approve`` on a
+    scratch store, reaching the state the page predicted."""
+
+    probe: dict
+    DECISIONS: ClassVar[list] = []
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.DECISIONS = _plans.check_decisions([DECISION, MULTI])
+        proc = subprocess.run(  # noqa: S603 (absolute path, fixed args, as _probe)
+            [_NODE, "--input-type=module", "-e", _APPROVE_PROBE],
+            env={**os.environ, "DOCKADE_UI_DIR": str(_served_dir(TASKS_DIR)),
+                 "DOCKADE_DECISIONS": json.dumps(cls.DECISIONS)},
+            capture_output=True, text=True, timeout=120, check=False)
+        if proc.returncode != 0:
+            raise AssertionError("importing moves.js under node failed:\n" + proc.stderr)
+        cls.probe = json.loads(proc.stdout)
+
+    def refined(self) -> int:
+        task = _agent.propose(ALICE, "widgets", "Rotate keys", "Every 90 days.")["task"]
+        token = _agent.claim_plan(ALICE, "widgets", task, ["."])["token"]
+        _agent.submit_plan(ALICE, "widgets", task, token,
+                           **(PLAN | {"decisions": [DECISION, MULTI]}))
+        return task
+
+    def test_the_page_decides_every_choice_as_the_registry_does(self):
+        cases = self.probe["cases"]
+        # Ordered sets of 2 options: 1 + 2 + 2; of 3: 1 + 3 + 6 + 6.
+        self.assertEqual(len(cases), (5 * 2 * 6) * (16 * 2 * 6))
+        seen = set()
+        for case in cases:
+            seen.add(case["outcome"])
+            if case["outcome"] == "incomplete":
+                self.assertIsNone(case["answers"])
+                with self.assertRaises(_Refused, msg=case["raw"]):
+                    _plans.check_answers(self.DECISIONS, case["raw"])
+            else:
+                self.assertEqual(case["answers"], case["raw"])
+                self.assertEqual(_plans.outcome(self.DECISIONS, case["answers"]),
+                                 case["outcome"], case["raw"])
+        self.assertEqual(seen, {"open", "proposed", "incomplete"})
+
+    def test_a_plan_starts_on_its_assumed_options(self):
+        self.assertEqual(self.probe["assumed"],
+                         [{"options": [0], "other": False, "text": ""},
+                          {"options": [0, 1], "other": False, "text": ""}])
+        self.assertEqual(self.probe["wire"]["assumed"]["predicted"], "open")
+
+    def test_blank_is_the_registrys_blank(self):
+        python = [cp for cp in range(0x110000)
+                  if not 0xD800 <= cp <= 0xDFFF and not chr(cp).strip()]
+        self.assertEqual(self.probe["blank"], python)
+        self.assertTrue(self.probe["empty"])
+        self.assertTrue(self.probe["not_text"])
+
+    def test_the_body_posted_is_the_one_the_operator_api_takes(self):
+        wire = self.probe["wire"]
+        for key in ("assumed", "other", "fewer", "bare"):
+            with self.subTest(write=key):
+                sent = wire[key]
+                self.assertEqual((sent["url"], sent["method"]),
+                                 ("/api/tasks/7/approve", "POST"))
+                self.assertEqual(set(sent["body"]), set(_api.Approve.__annotations__))
+                self.assertIs(type(sent["body"]["revision"]), int)
+                for answer in sent["body"]["answers"]:
+                    self.assertLessEqual(set(answer), set(_api.Answer.__annotations__))
+                    self.assertTrue(all(type(j) is int for j in answer["options"]))
+        self.assertEqual(wire["bare"]["body"], {"revision": 4, "answers": []})
+        source = (ROOT / "task-registry" / "operator_api.py").read_text()
+        self.assertIn('@app.post("/api/tasks/{task}/approve")', source)
+
+    def test_the_body_posted_reaches_the_state_the_page_predicted(self):
+        for key in ("assumed", "other", "fewer"):
+            with self.subTest(write=key):
+                task = self.refined()
+                sent = self.probe["wire"][key]
+                body = sent["body"]
+                req = _api.Approve(revision=_reads.get_task(task)["revision"],
+                                   answers=tuple(_api.Answer(**a) for a in body["answers"]))
+                reply = _api.approve(task, req, ThroughTheRelay())
+                self.assertEqual((reply.status_code, reply.body["state"]),
+                                 (200, sent["predicted"]))
+                got = _reads.get_task(task)
+                self.assertEqual(got["state"], sent["predicted"])
+                # And what a lost answer is read back by: the answers as sent.
+                self.assertEqual([([o["position"] for o in a["options"]], a["other"])
+                                  for a in got["answers"]],
+                                 [(a["options"], a["other"]) for a in body["answers"]])
+        self.assertEqual(_reads.get_task(self.refined())["plan"]["decisions"],
+                         self.DECISIONS)
+
+
+class TaskDecisionSourceTests(unittest.TestCase):
+    """How the page draws a plan's decisions and builds the approve that answers them,
+    from source: a browser is the only thing that runs it. The rule the approve follows
+    is held under node (``MoveTests``, ``ApproveRuleTests``)."""
+
+    TASKS = (TASKS_DIR / "tasks.js").read_text()
+    HTML = (TASKS_DIR / "index.html").read_text()
+
+    def test_a_decision_and_an_answer_are_spelled_and_drawn_whole(self):
+        group = _function(self.TASKS, "decisionGroup")
+        for drawn in ("proseBlock(decision.question)", "proseBlock(decision.why)",
+                      "proseBlock(option.label)", "proseBlock(option.meaning)"):
+            with self.subTest(field=drawn):
+                self.assertIn(drawn, group)
+        answer = _function(self.TASKS, "answerBlock")
+        for drawn in ("proseBlock(answer.question)", "proseBlock(option.label)",
+                      "proseBlock(answer.other)", "spellHidden(answer.author).text"):
+            with self.subTest(field=drawn):
+                self.assertIn(drawn, answer)
+        # An "other" text with a hidden character is spelled under its box.
+        self.assertIn("if (spellHidden(choice.text).hidden) "
+                      "note.appendChild(proseBlock(choice.text));",
+                      _function(self.TASKS, "markOther"))
+        # No rule cuts an option, a question or an answer short.
+        for rule in re.findall(r"(?:fieldset\.decision|\.decision|\.option-label|\.answer|"
+                               r"\.decisions)[^{]*\{([^}]*)\}", self.HTML):
+            with self.subTest(rule=rule.strip()):
+                self.assertNotRegex(rule, r"overflow|max-height|line-clamp|nowrap")
+
+    def test_an_input_carries_positions_never_text(self):
+        made = _function(self.TASKS, "choiceInput")
+        self.assertIn("input.dataset.decision = String(i);", made)
+        self.assertIn("input.dataset.option = option;", made)
+        self.assertIn("choiceInput(i, String(j), multi)",
+                      _function(self.TASKS, "decisionGroup"))
+        self.assertIn('choiceInput(i, "other", multi)', _function(self.TASKS, "otherRow"))
+        field = TaskRenderingSourceTests.FIELD
+        for name in ("choiceInput", "otherRow", "decisionGroup", "answerBlock"):
+            for ln in _code(_function(self.TASKS, name)).splitlines():
+                if "setAttribute(" in ln or ".dataset." in ln or ".name =" in ln:
+                    with self.subTest(function=name, line=ln.strip()):
+                        self.assertNotRegex(ln, field)
+
+    def test_only_a_plan_the_operator_can_approve_draws_choices(self):
+        block = _function(self.TASKS, "decisionsBlock")
+        self.assertIn("const picked = approvable(task) ? choicesFor(task) : null;", block)
+        self.assertIn("decisionGroup(d, i, picked && picked[i])", block)
+        # An earlier plan's decisions are text, as is an answered plan's.
+        plan = _function(self.TASKS, "planBlock")
+        self.assertIn("if (state === null) {\n"
+                      "    planDecisions(plan).forEach((d, i) => "
+                      "whole.appendChild(decisionGroup(d, i, null)));", plan)
+        group = _function(self.TASKS, "decisionGroup")
+        self.assertEqual(group.count("if (choice)"), 2)
+        self.assertEqual(len(re.findall(r"\bchoiceInput\(", group)), 1)
+
+    def test_the_decisions_and_answers_sit_above_the_plan(self):
+        draw = _function(self.TASKS, "drawTask")
+        self.assertLess(draw.index("taskDetail.appendChild(body);"),
+                        draw.index("taskDetail.appendChild(decisionsBlock(task));"))
+        self.assertLess(draw.index("decisionsBlock(task)"), draw.index("planHead"))
+        block = _function(self.TASKS, "decisionsBlock")
+        self.assertIn("  if (reset) {\n"
+                      "    const said = noticeLine({ text: resetText(reset), warn: true });\n"
+                      '    said.dataset.planReset = "1";\n'
+                      "    block.appendChild(said);", block)
+        self.assertLess(block.index("planResets.get("), block.index("planDecisions("))
+        self.assertLess(block.index("planDecisions("), block.index("task.answers"))
+
+    def test_the_choices_are_in_the_in_flight_gate(self):
+        mark = _function(self.TASKS, "markWriting")
+        self.assertIn("input[data-decision]", mark)
+        self.assertIn("textarea[data-other]", mark)
+        self.assertIn("el.disabled = writing !== null || !drawnIsOpen();", mark)
+        self.assertEqual(_function(self.TASKS, "choose").splitlines()[1].strip(),
+                         "if (!drawnIsOpen() || !approvable(shownTask)) return;")
+        self.assertIn('if (ev.target.matches("textarea[data-other]") && drawnIsOpen()\n'
+                      "        && approvable(shownTask)) {", self.TASKS)
+
+    def test_no_approve_is_built_while_an_answer_is_incomplete(self):
+        mark = _function(self.TASKS, "markAnswers")
+        incomplete = mark.index('if (goes === "incomplete") {')
+        otherwise = mark.index("} else {", incomplete)
+        self.assertLess(incomplete, mark.index("incompleteText("))
+        self.assertLess(mark.index("incompleteText("), otherwise)
+        self.assertLess(otherwise, mark.index('writeButton(approveLabel(task, goes), '
+                                              '"approve", "")'))
+        # That is the one approve the page draws, and the one write it builds.
+        self.assertEqual(len(re.findall(r'writeButton\([^;]*"approve"', self.TASKS)), 1)
+        self.assertIn('if (btn.dataset.write === "approve") return approveWrite(base);',
+                      _function(self.TASKS, "writeFor"))
+        write = _function(self.TASKS, "approveWrite")
+        self.assertEqual(write.splitlines()[1].strip(),
+                         "if (!approvable(shownTask)) return null;")
+        self.assertIn("const answers = approveAnswers(decisions, picked);", write)
+        self.assertIn("return answers && {", write)
+        self.assertIn("predicted: approveOutcome(decisions, picked)", write)
+
+    def test_approve_has_a_row_of_its_own_above_the_other_moves(self):
+        moves = _function(self.TASKS, "movesBlock")
+        self.assertLess(moves.index('approve.dataset.approveRow = "1";'),
+                        moves.index('row.className = "moves";'))
+        rule = re.search(r"\.approve-row \{([^}]*)\}", self.HTML).group(1)
+        self.assertRegex(rule, r"\bheight: \d+px;")
+        self.assertIn("white-space: nowrap;", rule)
+        # Each choice relabels both in place: nothing else in the detail is redrawn.
+        mark = _function(self.TASKS, "markAnswers")
+        self.assertIn('row.replaceChildren(', mark)
+        self.assertIn("backBtn.textContent = moveLabel(back, task, picked);", mark)
+        self.assertNotIn("drawTask(", mark)
+        self.assertNotIn("drawTask(", _function(self.TASKS, "choose"))
+
+    def test_choices_are_kept_by_task_and_plan_and_a_new_plan_is_said(self):
+        self.assertIn("const key = `${task.id}:${task.plan.id}`;",
+                      _function(self.TASKS, "choicesFor"))
+        self.assertEqual(re.findall(r"^\s*(?:let )?choices = ([^;]*);", self.TASKS, re.M),
+                         ["new Map()"])
+        draw = _function(self.TASKS, "drawTask")
+        self.assertLess(draw.index("notePlanDrawn(task);"), draw.index("decisionsBlock("))
+        noted = _function(self.TASKS, "notePlanDrawn")
+        self.assertIn("if (was === undefined || was === null || plan === null "
+                      "|| was === plan) return;", noted)
+        self.assertIn("planResets.set(id, { from: was, to: plan, others });", noted)
+        # Spent by the first choice, keeping its space, or by a landed approve; no poll
+        # touches it, nor the choices.
+        choose = _function(self.TASKS, "choose")
+        self.assertIn("if (planResets.delete(String(shownTask.id))) {", choose)
+        self.assertIn('said.classList.add("spent");', choose)
+        self.assertRegex(self.HTML, r"\.decisions \.spent \{ visibility: hidden; \}")
+        run = _function(self.TASKS, "runWrite")
+        self.assertIn('if (write.kind === "approve" && landed) {\n'
+                      "    choices.delete(`${write.task}:${write.plan}`);\n"
+                      "    planResets.delete(write.task);", run)
+        for name in ("refreshOpenTask", "refreshInbox", "refreshTasks", "readFlagged"):
+            with self.subTest(function=name):
+                self.assertNotRegex(_function(self.TASKS, name),
+                                    r"\bchoices\b|planResets|drawnPlans")
+
+    def test_an_approve_says_the_state_it_reached(self):
+        run = _function(self.TASKS, "runWrite")
+        self.assertIn('const reached = result === "landed" ? answer.body.state\n'
+                      "    : drawn && drawn.task && drawn.task.state;", run)
+        self.assertIn("...outcomeText(write, result, detail, reached) };", run)
 
 
 if __name__ == "__main__":

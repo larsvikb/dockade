@@ -33,10 +33,10 @@ def _load(name: str = "dockade_tasks_ui") -> types.ModuleType:
 
 tui = _load()
 
-#: The writes the relay passes, each as the page posts it: the three on a task, and the
+#: The writes the relay passes, each as the page posts it: the four on a task, and the
 #: three on notes, which name no task.
-WRITES = ("api/tasks/12/move", "api/tasks/12/break-claim", "api/tasks/12/notes",
-          "api/notes/hide", "api/notes/3/handle", "api/notes/handle")
+WRITES = ("api/tasks/12/move", "api/tasks/12/approve", "api/tasks/12/break-claim",
+          "api/tasks/12/notes", "api/notes/hide", "api/notes/3/handle", "api/notes/handle")
 
 
 class RelayTests(unittest.TestCase):
@@ -72,6 +72,9 @@ class RelayTests(unittest.TestCase):
         for path, method in (("api/tasks", "POST"), ("api/tasks/12/edit", "POST"),
                              ("api/tasks/12/reparent", "POST"),
                              ("api/tasks/12/move", "GET"),
+                             ("api/tasks/12/approve", "GET"),
+                             ("api/tasks/abc/approve", "POST"),
+                             ("api/tasks/12/approve/x", "POST"),
                              ("api/tasks/12/break-claim", "GET"),
                              # Every note: the history carries them.
                              ("api/tasks/12/notes", "GET"),

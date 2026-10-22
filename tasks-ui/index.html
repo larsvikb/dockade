@@ -110,7 +110,26 @@
   details > summary { cursor: pointer; }
   /* Kept in the record and out of every agent's read: shown, and shown as set aside. */
   tr.hidden-note { opacity: .55; }
-  /* The operator's moves on the task read, and a note to it. */
+  /* A plan's decisions, above it: each a group of its options, the operator's choice
+     among them, and "other". A line that a draw brought another plan, once spent by a
+     choice, keeps its space until the next draw. */
+  fieldset.decision { margin: 6px 0; padding: 6px 8px; border: 1px solid var(--line);
+    border-radius: 6px; background: var(--bg); }
+  fieldset.decision legend { color: var(--dim); font-size: 12px; padding: 0 4px; }
+  .decision .option { display: flex; gap: 8px; align-items: flex-start; margin: 6px 0; }
+  .decision .option > div { flex: 1; min-width: 0; }
+  .option-label { font-weight: 600; }
+  .decision .other textarea { font: inherit; font-size: 13px; width: 100%;
+    background: #202632; color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 5px 8px; resize: vertical; }
+  .answer { margin: 6px 0; padding: 6px 8px; border-left: 2px solid var(--line); }
+  .decisions .spent { visibility: hidden; }
+  /* The operator's moves on the task read, and a note to it. Approve has a row of its
+     own above them, one line high whatever it holds, so relabelling it or the send
+     back moves neither. */
+  .approve-row { height: 34px; display: flex; align-items: center; margin: 4px 0;
+    white-space: nowrap; }
+  .approve-row button { font-size: 12px; padding: 4px 10px; }
   .moves { display: flex; gap: 6px; flex-wrap: wrap; margin: 4px 0 10px; }
   .moves button, .note-form button { font-size: 12px; padding: 4px 10px; }
   .note-form { display: flex; flex-direction: column; align-items: flex-start; gap: 6px;

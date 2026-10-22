@@ -21,27 +21,138 @@ export const NOT_RUNNING_STATUS = 502;
 export const OUTCOME_UNKNOWN_STATUS = 504;
 
 // What each move is called, from the state it leaves to the one it reaches, where it
-// has a name of its own; any other is "move to <state>". Approve and send back are a
-// refined task's two answers, kept apart so each can grow its own (task 6's decisions).
+// has a name of its own; any other is "move to <state>". A refined task is approved by
+// a write of its own (`approveAnswers`), so a move from refined to open only reopens a
+// plan answered before (`movesFor`).
 export function moveVerb(from, to) {
-  if (from === "refined" && to === "open") return "approve";
   if (from === "refined" && to === "proposed") return "send back";
   if (to === "closed") return "close";
   if (to === "deferred") return "defer";
-  if (to === "open" && (from === "closed" || from === "deferred")) return "reopen";
+  if (to === "open" && ["closed", "deferred", "refined"].includes(from)) return "reopen";
   return `move to ${to}`;
 }
 
 // The moves the operator API takes from the task's state: every other state, refined
 // only with a current plan (`operator_moves.move`), each marked when it ends the claim,
 // which a move to another state does. A task's claim is shown only while it is live.
+// Open is left out wherever the registry refuses it, while the current plan has
+// decisions not answered (`tasks.update`), and from refined unless the plan was
+// answered before, since approving is `approve`.
 export function movesFor(task) {
   if (!task || typeof task !== "object" || !TASK_STATES.includes(task.state)) return [];
-  const current = task.plan && typeof task.plan === "object" && !task.plan.superseded_at;
+  const opens = !awaitsAnswers(task) && (task.state !== "refined" || planAnswered(task));
   return TASK_STATES
-    .filter(s => s !== task.state && (s !== "refined" || current))
+    .filter(s => s !== task.state && (s !== "refined" || currentPlan(task))
+            && (s !== "open" || opens))
     .map(s => ({ state: s, verb: moveVerb(task.state, s),
                  endsClaim: Boolean(task.claim) }));
+}
+
+// ── decisions ────────────────────────────────────────────────────────────────
+// A plan's decisions are its refiner's questions for the operator, answered with the
+// approve (task-registry/plans.py). The page keeps a choice per decision: the options
+// picked, by position, whether "other" is picked, and its text, which stays when an
+// option is picked instead and is then not sent.
+
+// The task's plan when it is current, else null: nothing approves a superseded one.
+export function currentPlan(task) {
+  const plan = task && typeof task === "object" ? task.plan : null;
+  return plan && typeof plan === "object" && !plan.superseded_at ? plan : null;
+}
+
+export function planDecisions(plan) {
+  return plan && Array.isArray(plan.decisions) ? plan.decisions : [];
+}
+
+// Whether the task's current plan has answers, which `approve` writes all at once.
+export function planAnswered(task) {
+  const plan = currentPlan(task);
+  return Boolean(plan) && Array.isArray(task.answers)
+    && task.answers.some(a => a && a.plan === plan.id);
+}
+
+// Whether the current plan has decisions nobody answered: no move opens the task then.
+export function awaitsAnswers(task) {
+  return planDecisions(currentPlan(task)).length > 0 && !planAnswered(task);
+}
+
+// Whether the operator can approve the task: refined, its plan current and not
+// answered before, which `operator_moves.approve` refuses.
+export function approvable(task) {
+  return Boolean(task) && task.state === "refined" && Boolean(currentPlan(task))
+    && !planAnswered(task);
+}
+
+function assumedOf(decision) {
+  const options = decision && Array.isArray(decision.options) ? decision.options : [];
+  return options.flatMap((o, j) => (o && o.assumed ? [j] : []));
+}
+
+// Where a plan's choices start: on the options it assumes.
+export function assumedChoices(decisions) {
+  return (Array.isArray(decisions) ? decisions : [])
+    .map(d => ({ options: assumedOf(d), other: false, text: "" }));
+}
+
+// Blank as the registry reads it (`tasks.check_text`): nothing but what Python's
+// `str.strip` takes, which is not JavaScript's `\s` (a test holds the two sets equal).
+export function blankText(text) {
+  return typeof text !== "string"
+    || /^[\t\n\v\f\r \x1c-\x1f\x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*$/u.test(text);
+}
+
+// A choice as an answer carries it, whether or not it is a whole one: the options by
+// position, in order, and the "other" text only while "other" is picked.
+export function choiceAnswer(choice) {
+  const picked = choice && Array.isArray(choice.options) ? choice.options : [];
+  return { options: [...picked].sort((a, b) => a - b),
+           other: choice && choice.other ? String(choice.text ?? "") : null };
+}
+
+// Whether a choice answers its decision, by `plans.check_answers`' rule: a single-choice
+// decision by one option or an "other" text, never both; a multi-select by any of its
+// options, an "other" text, or both, but not by nothing; and an "other" never blank.
+function answersIt(decision, choice) {
+  const { options, other } = choiceAnswer(choice);
+  const count = decision && Array.isArray(decision.options) ? decision.options.length : 0;
+  if (options.some(j => !Number.isInteger(j) || j < 0 || j >= count)
+      || new Set(options).size !== options.length) return false;
+  if (other !== null && blankText(other)) return false;
+  const chosen = options.length + (other === null ? 0 : 1);
+  return decision.multi_select ? chosen >= 1 : chosen === 1;
+}
+
+// The decisions, by position, that a choice does not answer yet.
+export function unanswered(decisions, choices) {
+  return (Array.isArray(decisions) ? decisions : []).flatMap(
+    (d, i) => (answersIt(d, Array.isArray(choices) ? choices[i] : null) ? [] : [i]));
+}
+
+// The answers an approve sends, one per decision in order, or null while any is
+// incomplete: then no approve is built at all.
+export function approveAnswers(decisions, choices) {
+  const list = Array.isArray(decisions) ? decisions : [];
+  if (!Array.isArray(choices) || choices.length !== list.length) return null;
+  return unanswered(list, choices).length ? null : choices.map(choiceAnswer);
+}
+
+// Whether any choice is not the plan's assumed one: "other" picked, or other options.
+export function choicesDiffer(decisions, choices) {
+  return (Array.isArray(decisions) ? decisions : []).some((d, i) => {
+    const { options, other } = choiceAnswer(Array.isArray(choices) ? choices[i] : null);
+    const assumed = assumedOf(d);
+    return other !== null || options.length !== assumed.length
+      || options.some((j, k) => j !== assumed[k]);
+  });
+}
+
+// The state an approve with these choices takes the task to, as `plans.outcome` decides
+// it: open when every answer is exactly the options the plan assumes, with no "other"
+// text, else proposed, for a plan written from the answers; or incomplete, when no
+// approve is built. A test holds the two rules to the same cases.
+export function approveOutcome(decisions, choices) {
+  if (!approveAnswers(decisions, choices)) return "incomplete";
+  return choicesDiffer(decisions, choices) ? "proposed" : "open";
 }
 
 // The moves on one note, as the timeline offers them: hide or show any note, mark one
@@ -160,6 +271,10 @@ export function sendWrite(write) {
     return fetch(`/api/tasks/${path}/move`, { method: "POST", headers: JSON_TYPE,
       body: JSON.stringify({ revision: write.revision, state: write.state }) });
   }
+  if (write.kind === "approve") {
+    return fetch(`/api/tasks/${path}/approve`, { method: "POST", headers: JSON_TYPE,
+      body: JSON.stringify({ revision: write.revision, answers: write.answers }) });
+  }
   if (write.kind === "break") {
     return fetch(`/api/tasks/${path}/break-claim`, { method: "POST", headers: JSON_TYPE,
       body: JSON.stringify({ revision: write.revision }) });
@@ -231,14 +346,16 @@ export function writeOutcome(answer) {
 // read again (`{ task, held }`), which carries its latest notes and the newest page of
 // its timeline:
 //   found           it shows it landed: a move's revision moved and its state is the
-//                   target; a break's moved and nobody holds it; a note of the
+//                   target; an approve's moved and its plan has the answers sent
+//                   (`approveLanded`); a break's moved and nobody holds it; a note of the
 //                   operator's with its text is newer than any the page held; a note
 //                   move's own entry, with the value sent, is newer than any the page
 //                   held; no note a bulk named is still listed, since all of one lands
 //                   or none;
-//   not-landed      a move or break whose revision did not move: sending it again
-//                   cannot apply it twice, since the revision would refuse it; or a
-//                   bulk whose notes are still listed, which sending again only marks;
+//   not-landed      a move, approve or break whose revision did not move: sending it
+//                   again cannot apply it twice, since the revision would refuse it;
+//                   or a bulk whose notes are still listed, which sending again only
+//                   marks;
 //   not-seen        a hide, show or handle without a reply whose entry is not there:
 //                   it may still land, and sending it again sets the same flag;
 //   not-found-yet   a note or a reply that is not there, which may still be committing:
@@ -268,7 +385,31 @@ export function checkWrite(write, reread) {
   if (task.revision === write.revision) return "not-landed";
   if (write.kind === "move" && task.state === write.state) return "found";
   if (write.kind === "break" && !task.claim) return "found";
+  if (write.kind === "approve" && approveLanded(write, task)) return "found";
   return "changed";
+}
+
+// An approve by what it leaves: its plan's answers, each the options and "other" text
+// sent, or for a plan without decisions, that plan current and open. Answers name
+// their plan and only `approve` writes them, once a plan, so they are found whatever
+// plan the task has now: one sent back may have been planned again since. The state
+// reached is said apart (`outcomeText` in tasks.js), since another write may have
+// moved it since.
+function approveLanded(write, task) {
+  if (!write.answers.length) {
+    const plan = task.plan && typeof task.plan === "object" ? task.plan : null;
+    return Boolean(plan) && plan.id === write.plan && !plan.superseded_at
+      && task.state === "open";
+  }
+  const got = (Array.isArray(task.answers) ? task.answers : [])
+    .filter(a => a && a.plan === write.plan);
+  return got.length === write.answers.length && write.answers.every((sent, i) => {
+    const mine = got.find(a => a.decision === i);
+    const options = mine && Array.isArray(mine.options) ? mine.options.map(o => o.position)
+      : null;
+    return Boolean(mine) && (mine.other ?? null) === sent.other
+      && JSON.stringify(options) === JSON.stringify(sent.options);
+  });
 }
 
 // A note move by its own history entry, on the newest page read again, wherever its

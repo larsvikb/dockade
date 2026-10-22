@@ -2343,10 +2343,10 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | task registry as a service — `tasks` behind a profile on `mcp-net` + `tasks-operator-net`, one listener per leg | **done** |
 | — | task registry, agent side — where the id comes from in the image's instructions, dockade's repo name and checkpoints in `CLAUDE.md`, the id in the status line | **done** — `inflight.md` stays the record of branches beside it; new work is proposed in it |
 | — | task registry backups — its store and a markdown export in `make backup`, `make restore-tasks` | **done** |
-| — | task registry view — the operator listener's one client | **done** — reads, and the operator's writes: moves, breaking a claim, notes and the moves on them |
+| — | task registry view — the operator listener's one client | **done** — reads, and the operator's writes: moves, approving with answers, breaking a claim, notes and the moves on them |
 | — | the task registry's own UI — `tasks-ui`, on another origin and with no `control-net` leg; what both UIs share in `ui-common/` | **done** — the approval page links to it; the page opens on an inbox worked out from task state |
 | — | task registry plans — `refined`, claims that refine a proposal, `submit_plan` and `submit_work`, every plan kept; the store's first migration | **done** — the tasks page shows a task's plans |
-| — | task registry decisions — a plan's questions for the operator in `submit_plan`, answered by the operator API's `approve`, which opens the task or sends it back | **done** — the tasks page neither shows nor answers them yet |
+| — | task registry decisions — a plan's questions for the operator in `submit_plan`, answered by the operator API's `approve`, which opens the task or sends it back | **done** — the tasks page draws them above the plan and answers them with the approve |
 
 The rationale for each shipped item lives under **Governance surfaces** above, not here
 — a status line goes stale, the reasoning does not. This section is deliberately the

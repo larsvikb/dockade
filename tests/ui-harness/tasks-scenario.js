@@ -4,8 +4,8 @@
 // same steps run against the base tree and the branch.
 
 import {
-  deferElsewhere, editElsewhere, flagElsewhere, loseNextAnswer, startRegistry,
-  stopRegistry,
+  deferElsewhere, editElsewhere, flagElsewhere, loseNextAnswer, replanElsewhere,
+  startRegistry, stopRegistry,
 } from "./tasks-backend.js";
 
 export const STEPS = [
@@ -214,5 +214,68 @@ export const STEPS = [
     loseNextAnswer();
     await page.click('#task-detail button[data-write="handle"][data-value="reply"]'
                      + '[data-note="14"]');
+  }],
+  // A plan's decisions, above it, start on the options it assumes: one click approves
+  // it as written, and the label said so before it.
+  ["a refined task with decisions", async ({ page }) => {
+    await page.click('#inbox button[data-task="9"]');
+  }],
+  ["approved as assumed", async ({ page }) => {
+    await page.click('#task-detail button[data-verb="approve"]');
+  }],
+  // Another option relabels the approve, which then sends the task back, and the send
+  // back, which sends no answers.
+  ["another task with decisions", async ({ page }) => {
+    await page.click('#inbox button[data-task="10"]');
+  }],
+  ["another option picked", async ({ page }) => {
+    await page.check('#task-detail input[data-decision="0"][data-option="1"]');
+  }],
+  // "Other" text left where another option is then picked stays, marked not sent.
+  ["an other text typed, then left", async ({ page }) => {
+    await page.check('#task-detail input[data-decision="1"][data-option="other"]');
+    await page.fill('#task-detail textarea[data-other="1"]', "Weekly\u200b only.");
+    await page.uncheck('#task-detail input[data-decision="1"][data-option="other"]');
+  }],
+  // A multi-select with nothing picked is no answer: no approve is drawn at all.
+  ["a multi-select emptied", async ({ page }) => {
+    await page.uncheck('#task-detail input[data-decision="1"][data-option="0"]');
+    await page.uncheck('#task-detail input[data-decision="1"][data-option="1"]');
+  }],
+  ["and answered again", async ({ page }) => {
+    await page.check('#task-detail input[data-decision="1"][data-option="2"]');
+  }],
+  // Refused for a revision another session moved: the choices survive the redraw.
+  ["approved after it changed elsewhere, the choices kept", async ({ page }) => {
+    editElsewhere(10);
+    await page.click('#task-detail button[data-verb="approve"]');
+  }],
+  // Sent back with its answers, and the answer lost: read back, and found by them.
+  ["approved with these answers, the answer lost", async ({ page }) => {
+    loseNextAnswer();
+    await page.click('#task-detail button[data-verb="approve"]');
+  }],
+  // Another plan, read through the inbox: the decisions say it is another.
+  ["a new plan handed in, the task read again", async ({ page }) => {
+    replanElsewhere(10, 7);
+    await page.click('#inbox button[data-task="10"]');
+  }],
+  // The first choice in it spends the line, which keeps its space.
+  ["other picked and written", async ({ page }) => {
+    await page.check('#task-detail input[data-decision="0"][data-option="other"]');
+    await page.fill('#task-detail textarea[data-other="0"]', "Hold, for the llm ones.");
+  }],
+  // A plan handed in while the page reads the task: the poll says it changed, and
+  // "show it" draws the new plan with the "other" text it reset.
+  ["another plan handed in, a poll passes", async ({ clock }) => {
+    replanElsewhere(10, 8);
+    await clock(16000);
+  }],
+  ["show it, the new plan", async ({ page }) => {
+    await page.click("#task-detail button[data-show]");
+  }],
+  // The plans it replaced, each with its decisions as text: no input on any.
+  ["its earlier plans, their decisions as text", async ({ page }) => {
+    await page.click('#task-detail button[data-page="plans"]');
   }],
 ];

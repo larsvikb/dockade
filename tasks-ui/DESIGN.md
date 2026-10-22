@@ -5,7 +5,8 @@ directory and its tests. Why it is a container of its own, on another origin and
 leg on `control-net`, is the root `DESIGN.md`'s "Task registry"; who writes what in the
 registry, and its states and notes, is `task-registry/DESIGN.md`. The browser guards in
 front of it are the approval UI's, from `ui-common/guards.py`, and what each closes is
-`control-plane-ui/DESIGN.md`, "The browser boundary".
+`control-plane-ui/DESIGN.md`, "The browser boundary". The evidence behind these
+decisions, such as the prior art the inbox follows, is in `tasks-ui/NOTES.md`.
 
 ## The boundary
 

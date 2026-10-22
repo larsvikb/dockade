@@ -38,8 +38,33 @@ const PLAN = {
   footprint: ["tasks-ui/app.py", `tasks-ui/tasks${ZWSP}.js`],
   tests: "The relay table; the page under node.", out_of_scope: "None.",
   risks: "A route the page calls and the relay refuses.", review_rounds: 2,
-  review_verdict: "Passes.", superseded_at: null,
+  review_verdict: "Passes.", decisions: [], superseded_at: null,
 };
+// Plans with decisions for the operator: a single-choice one and a multi-select one,
+// an option of which hides a character. Task 9's and task 10's; plan 7 replaces task
+// 10's once it is sent back, and plan 8 that.
+function option(label, meaning, assumed) { return { label, meaning, assumed }; }
+const HOLD = {
+  question: `Hold infra traffic, or ${RLO}deny it?`,
+  why: "The design names both and picks neither.", multi_select: false,
+  options: [option("Hold", "The operator answers each request.", true),
+            option("Deny", "Refused outright, nobody asked.", false)],
+};
+const LOGS = {
+  question: "Which logs keep a rotation?", why: "A retention question.",
+  multi_select: true,
+  options: [option("Audit", "The audit log.", true),
+            option("Access", "The access log.", true),
+            option(`Debug${ZWSP}`, "The debug log, which is large.", false)],
+};
+const decidedPlan = (id, at, decisions) => ({
+  ...PLAN, id, task_revision: 1, at, review_rounds: 3, decisions,
+  approach: `Rotate the keys in place.\nPlan ${id}.`,
+});
+const DECIDED_PLANS = { 4: decidedPlan(4, NOW - 5000, [HOLD, LOGS]),
+                        5: decidedPlan(5, NOW - 4500, [HOLD, LOGS]),
+                        7: decidedPlan(7, NOW, [HOLD]),
+                        8: decidedPlan(8, NOW, [LOGS]) };
 // What plan 2 replaced: another approach, one path fewer, the risks spaced otherwise.
 const OLDER_PLAN = {
   ...PLAN, id: 1, task_revision: 1, at: NOW - 80000, review_rounds: 1,
@@ -77,7 +102,7 @@ const TASK = {
   children: [{ id: 4, title: "Child", state: "closed" },
              { id: 5, title: "Other child", state: "landing" }],
   blockers: [{ id: 2, title: "Back up the store", state: "open" }],
-  plan: PLAN, notes: [STARTED, ANSWER, ASKED, BLOCKED],
+  plan: PLAN, answers: [], notes: [STARTED, ANSWER, ASKED, BLOCKED],
 };
 
 // Task 1 went back to proposed: its plan is the superseded one. Task 2 was opened with
@@ -101,9 +126,15 @@ const REFINED = { ...TASK, id: 6, title: "Refined one", state: "refined", ready:
 const LANDING = { ...REFINED, id: 5, title: `Landing ${RLO}one`, state: "landing",
                   revision: 9 };
 const SECOND = { ...REFINED, id: 8, title: "Second refined", revision: 2 };
+// Tasks 9 and 10 wait for triage with decisions to answer.
+const DECIDED = { ...REFINED, id: 9, title: "Decided one", revision: 3,
+                  plan: DECIDED_PLANS[4] };
+const SECOND_DECIDED = { ...REFINED, id: 10, title: "Second decided", revision: 3,
+                         plan: DECIDED_PLANS[5] };
 
 const PLANS = { 1: [OLDER_PLAN], 3: [PLAN, OLDER_PLAN], 5: [PLAN],
-                6: [PLAN, OLDER_PLAN], 8: [PLAN] };
+                6: [PLAN, OLDER_PLAN], 8: [PLAN], 9: [DECIDED_PLANS[4]],
+                10: [DECIDED_PLANS[5]] };
 
 // Each task's history, oldest first, as `operator_moves.history` reads it: every write,
 // with the note it posted as it is now.
@@ -148,14 +179,14 @@ function noteEntry(note) {
                { note: note.text, note_id: note.id, for_operator: true }, note);
 }
 
-function refinedHistory(created) {
-  const planned = { id: 30, author: PLAN.author, at: PLAN.at, text: "Planned.",
+function refinedHistory(created, plan = PLAN) {
+  const planned = { id: 30, author: plan.author, at: plan.at, text: "Planned.",
                     for_operator: false, handled: false, hidden: false,
                     move: "submit_plan", reply_to: null };
   return [
     entry("claude-3f2a9c1e", "propose", created, { title: "Refined one", body: "B" }),
-    entry("claude-3f2a9c1e", "submit_plan", PLAN.at,
-          { revision: 7, note: planned.text, note_id: planned.id, plan: PLAN.id,
+    entry("claude-3f2a9c1e", "submit_plan", plan.at,
+          { revision: 7, note: planned.text, note_id: planned.id, plan: plan.id,
             ...PLAN_DETAIL }, planned),
   ];
 }
@@ -173,6 +204,8 @@ const HISTORIES = {
   8: [...refinedHistory(NOW - 4000), noteEntry(ON_SECOND)],
   7: [entry("operator", "create", NOW - 6000, { title: "Parked one", state: "deferred" }),
       noteEntry(ON_PARKED)],
+  9: refinedHistory(NOW - 6000, DECIDED_PLANS[4]),
+  10: refinedHistory(NOW - 5500, DECIDED_PLANS[5]),
 };
 
 function historyPage(id, params) {
@@ -199,13 +232,21 @@ const INBOX = {
   triage: {
     tasks: [{ task: 6, repo: "old-repo", title: "Refined one", state: "refined",
               since: NOW - 7200,
-              reasons: [{ why: "refined", since: NOW - 7200, plan: 2,
+              reasons: [{ why: "refined", since: NOW - 7200, plan: 2, decisions: 0,
                           review_rounds: 2 }] },
+            { task: 9, repo: "dockade", title: "Decided one", state: "refined",
+              since: NOW - 5000,
+              reasons: [{ why: "refined", since: NOW - 5000, plan: 4, decisions: 2,
+                          review_rounds: 3 }] },
+            { task: 10, repo: "dockade", title: "Second decided", state: "refined",
+              since: NOW - 4500,
+              reasons: [{ why: "refined", since: NOW - 4500, plan: 5, decisions: 2,
+                          review_rounds: 3 }] },
             { task: 8, repo: "dockade", title: "Second refined", state: "refined",
               since: NOW - 3600,
-              reasons: [{ why: "refined", since: NOW - 3600, plan: 2,
+              reasons: [{ why: "refined", since: NOW - 3600, plan: 2, decisions: 0,
                           review_rounds: 2 }] }],
-    total: 2,
+    total: 4,
   },
   drifting: {
     tasks: [
@@ -233,7 +274,9 @@ const UNREACHABLE = { ok: false, current: null,
 // after a write shows it.
 const WRITTEN = { 3: { ...TASK, notes: [...TASK.notes] },
                   6: { ...REFINED, notes: [ON_REFINED] },
-                  8: { ...SECOND, notes: [ON_SECOND] } };
+                  8: { ...SECOND, notes: [ON_SECOND] },
+                  9: { ...DECIDED, notes: [] },
+                  10: { ...SECOND_DECIDED, notes: [] } };
 let nextNote = 20;
 
 // Every note a move can name, by id: the ones the timelines carry, so a hide or a
@@ -285,6 +328,19 @@ export function deferElsewhere(id) {
   HISTORIES[id].push(entry("operator", "move", NOW, { before, state: t.state,
                                                       revision: t.revision, actor: null }));
 }
+// A step has an agent hand in another plan for a task, as `submit_plan` would: the one
+// it had is superseded, and the task is refined at a new revision.
+export function replanElsewhere(id, plan) {
+  const t = WRITTEN[id];
+  const next = DECIDED_PLANS[plan];
+  PLANS[id] = [next, ...PLANS[id].map(p => ({ ...p,
+                                              superseded_at: p.superseded_at ?? NOW }))];
+  t.plan = next;
+  t.state = "refined";
+  t.revision += 1;
+  HISTORIES[id].push(entry("claude-3f2a9c1e", "submit_plan", NOW,
+                           { revision: t.revision, plan: next.id, ...PLAN_DETAIL }));
+}
 // A step loses the next write's answer after the write lands: the relay's 504.
 let loseNext = false;
 export function loseNextAnswer() { loseNext = true; }
@@ -334,9 +390,50 @@ function noteWrite(path, body) {
     : { ok: true, notes: ids } };
 }
 
+// An approve, as `operator_moves.approve` makes it: answers that are each exactly the
+// options the plan assumes open the task; any others send it back, its plan superseded.
+// Either way the answers are kept, newest plan first, in the text the operator saw.
+function approve(t, body, history) {
+  const refuse = detail => ({ status: 400, json: { ok: false, current: null, detail } });
+  const plan = t.plan;
+  if (t.state !== "refined") return refuse(`task ${t.id} is ${t.state}`);
+  if (t.answers.some(a => a.plan === plan.id)) {
+    return refuse(`plan ${plan.id} of task ${t.id} was answered already`);
+  }
+  const decisions = plan.decisions || [];
+  if (body.answers.length !== decisions.length) {
+    return refuse(`answers is a list of ${decisions.length}`);
+  }
+  const given = decisions.map((d, i) => {
+    const a = body.answers[i];
+    return { plan: plan.id, decision: i, question: d.question,
+             options: [...a.options].sort((x, y) => x - y)
+               .map(j => ({ position: j, ...d.options[j] }))
+               .map(({ assumed, ...o }) => o),
+             other: a.other ?? null, author: "operator", at: NOW };
+  });
+  const opens = given.every((a, i) => a.other === null
+    && a.options.map(o => o.position).join() === decisions[i].options
+      .flatMap((o, j) => (o.assumed ? [j] : [])).join());
+  const state = opens ? "open" : "proposed";
+  t.answers = [...given, ...t.answers];
+  t.state = state;
+  t.revision += 1;
+  if (!opens) {
+    t.plan = { ...plan, superseded_at: NOW };
+    PLANS[t.id] = PLANS[t.id].map(p => (p.id === plan.id ? t.plan : p));
+  }
+  history.push(entry("operator", "approve", NOW,
+                     { revision: t.revision, before: "refined", state, plan: plan.id,
+                       answers: given.map(({ question, options, other }) =>
+                         ({ question, options, other })), actor: null }));
+  return { status: 200, json: { ok: true, task: t.id, revision: t.revision, state,
+                                plan: plan.id } };
+}
+
 function write(path, body) {
   if (path.startsWith("/api/notes/")) return lost(noteWrite(path, body));
-  const m = path.match(/^\/api\/tasks\/(\d+)\/(move|break-claim|notes)$/);
+  const m = path.match(/^\/api\/tasks\/(\d+)\/(move|approve|break-claim|notes)$/);
   const t = m && WRITTEN[m[1]];
   if (!t) return null;
   const history = HISTORIES[m[1]];
@@ -353,6 +450,8 @@ function write(path, body) {
     answer = { status: 200, json: { ok: true, task: t.id, note: id } };
   } else if (body.revision !== t.revision) {
     return changed(t);
+  } else if (m[2] === "approve") {
+    answer = approve(t, body, history);
   } else if (m[2] === "break-claim") {
     if (!t.claim) {
       return { status: 400, json: { ok: false, current: null,

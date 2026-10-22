@@ -84,11 +84,13 @@ _RELAY_ROUTES = (
     ("GET", re.compile(r"^/api/notes/flagged$")),
     ("GET", re.compile(r"^/api/search$")),
     # The operator's triage, each naming the revision the page showed: a move to any
-    # state, breaking a claim. And a note and the moves on notes, which name none
-    # (tasks-ui/DESIGN.md, "A note names no revision"): hide or show one, handle one
-    # with or without a reply, handle the flagged notes a page showed. The rest of the
-    # operator API waits for a page that calls it.
+    # state, approving a refined task with its answers, breaking a claim. And a note
+    # and the moves on notes, which name none (tasks-ui/DESIGN.md, "A note names no
+    # revision"): hide or show one, handle one with or without a reply, handle the
+    # flagged notes a page showed. The rest of the operator API waits for a page that
+    # calls it.
     ("POST", re.compile(r"^/api/tasks/[0-9]{1,19}/move$")),
+    ("POST", re.compile(r"^/api/tasks/[0-9]{1,19}/approve$")),
     ("POST", re.compile(r"^/api/tasks/[0-9]{1,19}/break-claim$")),
     ("POST", re.compile(r"^/api/tasks/[0-9]{1,19}/notes$")),
     ("POST", re.compile(r"^/api/notes/hide$")),

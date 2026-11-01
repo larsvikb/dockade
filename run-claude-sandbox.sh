@@ -238,7 +238,7 @@ sc_host_timezone
 # nothing to do with them. Both are host-side reads with no egress involved; see
 # sandbox-lib.sh for why the mount is read-only and why the allowlist travels as
 # an env var rather than a second mount.
-sc_marketplaces
+sc_marketplaces "$WORKSPACE"
 sc_plugin_allowlist
 
 echo "Sandbox:   $SC_CONTAINER_NAME (tier 1 — Claude)"

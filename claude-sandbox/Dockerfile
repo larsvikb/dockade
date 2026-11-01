@@ -146,8 +146,9 @@ WORKDIR /workspace
 # by absolute path — belt-and-braces for a live docker exec.)
 #
 # `claude` is the ONE deliberate exception, and the ordering is what makes it work:
-# /usr/local/bin/claude is a root-owned wrapper that adds this sandbox's MCP flags,
-# and it shadows the real binary below precisely because this entry comes last.
+# /usr/local/bin/claude is a root-owned wrapper that adds this sandbox's MCP and
+# plugin flags, and it shadows the real binary below precisely because this entry
+# comes last.
 ENV PATH="$PATH:/home/$USERNAME/.local/bin"
 # Standardize on bash. The login shell is already /bin/bash (useradd -s above);
 # pinning SHELL makes tools that auto-detect a shell (e.g. Claude Code's

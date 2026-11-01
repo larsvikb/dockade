@@ -189,7 +189,7 @@ SANDBOX_REFS=docs-a=~/a/docs,docs-b=~/b/docs ./run-opencode-sandbox.sh
 ```
 
 Both tiers take the same variable, separated by commas or newlines. The paths
-`/marketplaces` refuses are refused here too: the filesystem root, your home or
+`/marketplaces` refuses as too broad are refused here too: the filesystem root, your home or
 anything holding it, a Windows profile, the dockade secrets directory, `/tmp`,
 `/run` and `$XDG_RUNTIME_DIR`, and any directory with a unix socket or FIFO near
 its top — read-only does not stop the agent using those. So is a credential
@@ -212,14 +212,32 @@ printf 'a-plugin@some-marketplace\n' >> ~/.config/dockade/plugins
 Claude Code takes a marketplace from a local **directory** and uses it in place —
 no clone, no copy, no egress, no credential — so the mount is **read-only**, and
 that is deliberate: a writable plugin tree is a channel for the agent to edit a
-skill or hook that lands in its own context, or executes, on the next boot.
+skill or hook that lands in its own context, or executes, on the next boot. For
+the same reason a marketplaces directory that is your workspace, lies inside it
+or holds it is refused: the workspace is mounted read-write.
 Updating a marketplace is a `git pull` on the host.
 
 Registration is **re-derived on every boot** from what is mounted, so deleting a
 checkout removes it with no stale state. Enabling is separate — a marketplace
-only makes plugins *installable* — and must be declared host-side too, because
-the sandbox's `settings.json` is re-materialized from the image on every boot: a
-`/plugin install` inside a session does not survive a restart.
+only makes plugins *installable* — and must be declared host-side too. Both are
+**this sandbox's own**: they go into a file in the container rather than the
+config volume its siblings share, so two sandboxes launched with different
+marketplaces each load their own. A `/plugin install` inside a session does not
+survive a restart. The file outranks every other settings scope, and the volume
+is still shared, so:
+
+- A host-enabled plugin **cannot be turned off from inside**: neither
+  `/plugin disable` nor `enabledPlugins: false` in
+  `/workspace/.claude/settings.json` or `settings.local.json` has any effect.
+  Change the allowlist and relaunch.
+- `claude --settings <yours>` inside the sandbox **replaces** the host's file,
+  so that session loads none of the host's plugins; `claude` says so on stderr.
+- `/plugin` and `claude plugin marketplace list` can still **show** a sibling's
+  marketplaces and plugins (disabled), through Claude Code's cache in the
+  shared config volume.
+- A `/plugin install` in a sibling's session lands in the shared settings, so
+  until the next boot of either it loads in this sandbox's new sessions too,
+  beside the host's plugins.
 
 | Path | Holds |
 |---|---|
@@ -377,7 +395,7 @@ dockade/
   claude-sandbox/           # TIER 1 image — Claude, governed egress
     Dockerfile
     tier-setup.sh           # tier hook: materialize Claude user settings
-    claude-wrapper.sh       # the `claude` on PATH: adds --mcp-config when a gateway was found
+    claude-wrapper.sh       # the `claude` on PATH: adds --mcp-config and this launch's --settings
     user-settings.json      # baked template, materialized to /config each boot
     user-CLAUDE.md          # the agent's user-scope instructions, installed the same way
     statusline.sh           # sandbox-indicator status line

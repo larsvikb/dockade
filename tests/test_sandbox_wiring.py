@@ -178,23 +178,7 @@ class WrapperTests(unittest.TestCase):
         self.assertIsNotNone(user, "the Dockerfile no longer names its sandbox user")
         self.assertIn(f'REAL="/home/{user.group(1)}/.local/bin/claude"', WRAPPER)
 
-    def test_strict_mode_is_unconditional(self):
-        # Both branches. With nothing supplied it yields zero MCP servers, so the
-        # gateway-absent case is a provably empty surface rather than whatever a
-        # workspace .mcp.json or the config volume has accumulated.
-        execs = re.findall(r"^\s*exec .*$", WRAPPER, re.M)
-        self.assertEqual(len(execs), 2, "the wrapper's two paths changed shape")
-        for line in execs:
-            with self.subTest(line=line):
-                self.assertIn("--strict-mcp-config", line)
-
-    def test_the_config_flag_is_followed_by_an_option_not_by_the_arguments(self):
-        # `--mcp-config` is variadic and greedy: `claude --mcp-config X mcp list`
-        # consumes `mcp` and `list` as further config paths (NOTES.md). The option
-        # immediately after it is what stops the greed before "$@" is swallowed.
-        line = next(line for line in re.findall(r"^\s*exec .*$", WRAPPER, re.M)
-                    if "--mcp-config" in line)
-        self.assertRegex(line, r'--mcp-config "\$MCP_CONFIG" --strict-mcp-config "\$@"')
+    # The flags it puts on, and their order, are run in tests/test_launch_settings.py.
 
     def test_the_yolo_alias_resolves_through_the_wrapper(self):
         # An alias that named an absolute path would bypass the flags, which is the
@@ -241,12 +225,50 @@ class TierHookPrivilegeTests(unittest.TestCase):
                 self.assertNotIn('chown -h "$USERNAME', src)
 
     def test_root_owned_artefacts_live_only_in_the_image_layer(self):
-        # Tier 1's gateway pointer and refs note are what root writes, and they must
-        # be written BEFORE the re-exec and OUTSIDE the volume.
+        # Tier 1's gateway pointer, launch settings and managed note are what root
+        # writes, and they must be written BEFORE the re-exec and OUTSIDE the volume.
         root_phase, user_phase = TIER_SETUP.split(self.REEXEC, 1)
         self.assertIn("MCP_GATEWAY_CONFIG=/etc/claude-code/", root_phase)
-        self.assertIn("REFS_NOTE=/etc/claude-code/", root_phase)
+        self.assertIn("LAUNCH_SETTINGS=/etc/claude-code/launch-settings.json", root_phase)
+        self.assertIn("MANAGED_NOTE=/etc/claude-code/", root_phase)
         self.assertIn("install -o root -g root -m 0644", root_phase)
         self.assertNotIn("install -o root", user_phase)
         self.assertNotIn("$CONFIG_DIR/", root_phase.split("CONFIG_DIR=", 1)[1])
 
+    @staticmethod
+    def _code(src: str) -> list[str]:
+        return [line for line in src.splitlines() if not line.lstrip().startswith("#")]
+
+    def test_root_opens_no_marketplace_and_renders_only_as_the_user(self):
+        # A sibling whose workspace holds this launch's marketplaces checkout can
+        # write it, so root reading a manifest is a root read through the sibling.
+        root_phase = TIER_SETUP.split(self.REEXEC, 1)[0]
+        self.assertNotIn("marketplace.json", root_phase)
+        self.assertNotIn("render_launch_settings", root_phase)
+        calls = [line for line in self._code(root_phase) if "--render-launch-settings" in line]
+        self.assertEqual(len(calls), 1, calls)
+        self.assertIn('gosu "$USERNAME" "$0" --render-launch-settings', calls[0])
+
+    def test_the_launch_settings_are_cleared_then_installed_root_owned(self):
+        root_phase = TIER_SETUP.split(self.REEXEC, 1)[0]
+        cleared = root_phase.index('rm -f "$LAUNCH_SETTINGS"')
+        rendered = root_phase.index('gosu "$USERNAME" "$0" --render-launch-settings')
+        written = root_phase.index(
+            'install -o root -g root -m 0644 /dev/stdin "$LAUNCH_SETTINGS"')
+        self.assertLess(cleared, rendered)
+        self.assertLess(rendered, written)
+
+    def test_the_user_phase_writes_no_launch_state_into_the_volume(self):
+        # settings.json and CLAUDE.md in the volume are the image's templates and
+        # nothing more; the launch's plugins and their note are root's, in /etc.
+        user_phase = TIER_SETUP.split(self.REEXEC, 1)[1]
+        code = self._code(user_phase)
+        self.assertEqual(
+            [line for line in code if "settings.json" in line and "launch-settings" not in line],
+            ['install -m 0644 /etc/claude-code/user-settings.json "$CONFIG_DIR/settings.json"'])
+        self.assertEqual(
+            [line for line in code if "CLAUDE.md" in line],
+            ['install -m 0644 /etc/claude-code/CLAUDE.md.template "$CONFIG_DIR/CLAUDE.md"'])
+        self.assertEqual([line for line in code if "launch-settings.json" in line],
+                         ["plugin_advisory /etc/claude-code/launch-settings.json \\"])
+        self.assertNotIn(">>", "\n".join(code))

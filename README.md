@@ -189,7 +189,7 @@ SANDBOX_REFS=docs-a=~/a/docs,docs-b=~/b/docs ./run-opencode-sandbox.sh
 ```
 
 Both tiers take the same variable, separated by commas or newlines. The paths
-`/marketplaces` refuses are refused here too: the filesystem root, your home or
+`/marketplaces` refuses as too broad are refused here too: the filesystem root, your home or
 anything holding it, a Windows profile, the dockade secrets directory, `/tmp`,
 `/run` and `$XDG_RUNTIME_DIR`, and any directory with a unix socket or FIFO near
 its top — read-only does not stop the agent using those. So is a credential
@@ -212,7 +212,9 @@ printf 'a-plugin@some-marketplace\n' >> ~/.config/dockade/plugins
 Claude Code takes a marketplace from a local **directory** and uses it in place —
 no clone, no copy, no egress, no credential — so the mount is **read-only**, and
 that is deliberate: a writable plugin tree is a channel for the agent to edit a
-skill or hook that lands in its own context, or executes, on the next boot.
+skill or hook that lands in its own context, or executes, on the next boot. For
+the same reason a marketplaces directory that is your workspace, lies inside it
+or holds it is refused: the workspace is mounted read-write.
 Updating a marketplace is a `git pull` on the host.
 
 Registration is **re-derived on every boot** from what is mounted, so deleting a

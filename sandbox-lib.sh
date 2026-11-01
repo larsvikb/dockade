@@ -284,7 +284,14 @@ _sc_ro_mount_reason() {
 # The container path is fixed at /marketplaces and is NOT the host path, because
 # Claude Code records the path it was given verbatim as the marketplace's
 # installLocation — it has to be the path as seen from inside.
+#
+# sc_marketplaces <canonical_workspace>: a directory that is the workspace, lies
+# inside it, or holds it is refused, because the workspace is mounted read-write
+# and the same files would be writable through /workspace whatever the :ro says.
+# Only this launch's workspace is known here; a sibling's that holds this
+# directory leaves the tree writable, and that stays open (DESIGN.md).
 sc_marketplaces() {
+    local workspace="${1:?sc_marketplaces needs the canonical workspace}"
     SC_MARKETPLACE_ARGS=()
     SC_MARKETPLACE_DESC="none"
 
@@ -310,6 +317,15 @@ sc_marketplaces() {
     local real reason
     real="$(cd "$dir" && pwd -P)"        # canonical, symlinks resolved
     reason="$(_sc_ro_mount_reason "$real")"
+    if [[ -z "$reason" ]]; then
+        if [[ "$real" == "$workspace" ]]; then
+            reason="that is the workspace, which is mounted read-write."
+        elif [[ "$workspace" == "/" || "$real" == "$workspace"/* ]]; then
+            reason="it is inside the workspace ($workspace), which is mounted read-write."
+        elif [[ "$workspace" == "$real"/* ]]; then
+            reason="the workspace ($workspace) is inside it, and is mounted read-write."
+        fi
+    fi
     if [[ -n "$reason" ]]; then
         echo "REFUSING to mount marketplaces: $real" >&2
         echo "  $reason" >&2

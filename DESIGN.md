@@ -405,7 +405,11 @@ Three decisions worth keeping:
   hook now, and it lands in its own context — or executes — on the next boot,
   outside the diff review that `/workspace` commits get. `:ro` costs nothing (a
   directory marketplace is never written to in normal use) and `make consistency`
-  asserts it, because the mitigation is one character wide.
+  asserts it, because the mitigation is one character wide. *Outside* is enforced
+  too: `sc_marketplaces` refuses a directory that is, lies inside, or holds the
+  launch's workspace, since the read-write `/workspace` would reach the same files.
+  A sibling sandbox whose workspace holds this launch's marketplaces can still
+  write them; one launch cannot see another's workspace.
 - **Generated, not `claude plugin marketplace add`.** The CLI's only effect is
   writing the same two settings keys, so shelling out to it would make it a second
   writer to the file the boot owns authoritatively — and it would need a `gosu` hop

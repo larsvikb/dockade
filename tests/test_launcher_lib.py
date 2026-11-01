@@ -161,7 +161,8 @@ class EnsureNetworkTests(unittest.TestCase):
 
 _GUARD_HARNESS = ('set -euo pipefail; source "$1"; sc_guard_workspace "$2"; '
                   'printf "%s\\n" "$SC_WORKSPACE"')
-_MARKETPLACE_HARNESS = 'set -euo pipefail; source "$1"; sc_marketplaces'
+_MARKETPLACE_HARNESS = ('set -euo pipefail; source "$1"; sc_marketplaces "$2"; '
+                        'printf "%s\\n" "${SC_MARKETPLACE_ARGS[@]}"')
 
 
 @unittest.skipUnless(_BASH or _STRICT, "bash is not installed")
@@ -282,11 +283,88 @@ class WorkspaceGuardTests(unittest.TestCase):
         env = dict(os.environ, HOME=str(self.home),
                    SANDBOX_MARKETPLACES_DIR=str(self.profile))
         proc = subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
-            [_BASH, "-c", _MARKETPLACE_HARNESS, "sc_marketplaces", str(LIB)],
+            [_BASH, "-c", _MARKETPLACE_HARNESS, "sc_marketplaces", str(LIB),
+             str(self.project)],
             capture_output=True, text=True, env=env, timeout=60)
         self.assertEqual(proc.returncode, 1, proc.stderr)
         self.assertIn("REFUSING to mount marketplaces", proc.stderr)
         self.assertIn("that is a Windows user profile", proc.stderr)
+
+
+@unittest.skipUnless(_BASH or _STRICT, "bash is not installed")
+class MarketplaceWorkspaceOverlapTests(unittest.TestCase):
+    """``sc_marketplaces`` against the workspace it is launched beside.
+
+    The workspace is mounted read-write, so a marketplaces directory that shares
+    files with it is writable through ``/workspace`` whatever its own ``:ro`` says."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name).resolve()
+        self.workspace = self.root / "work" / "app"
+        self.workspace.mkdir(parents=True)
+
+    def mount(self, marketplaces: Path, workspace: Path | None = None):
+        env = {k: v for k, v in os.environ.items() if k != "XDG_RUNTIME_DIR"}
+        env.update(HOME="/nonexistent-home", SANDBOX_MARKETPLACES_DIR=str(marketplaces))
+        return subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
+            [_BASH, "-c", _MARKETPLACE_HARNESS, "sc_marketplaces", str(LIB),
+             str(workspace or self.workspace)],
+            capture_output=True, text=True, env=env, timeout=60)
+
+    def test_the_workspace_itself_is_refused(self):
+        proc = self.mount(self.workspace)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("REFUSING to mount marketplaces", proc.stderr)
+        self.assertIn("that is the workspace", proc.stderr)
+        self.assertEqual(proc.stdout, "")
+
+    def test_a_directory_inside_the_workspace_is_refused(self):
+        inside = self.workspace / "vendor" / "marketplaces"
+        inside.mkdir(parents=True)
+        proc = self.mount(inside)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn(f"it is inside the workspace ({self.workspace})", proc.stderr)
+
+    def test_a_directory_holding_the_workspace_is_refused(self):
+        proc = self.mount(self.root / "work")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn(f"the workspace ({self.workspace}) is inside it", proc.stderr)
+
+    def test_a_symlink_into_the_workspace_is_refused_by_its_target(self):
+        link = self.root / "link"
+        link.symlink_to(self.workspace)
+        proc = self.mount(link)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("that is the workspace", proc.stderr)
+
+    def test_everything_is_inside_a_root_workspace(self):
+        # Only reachable with ALLOW_UNSAFE_WORKSPACE=1, which overrides the
+        # workspace guard and must not take this one with it.
+        mkt = self.root / "marketplaces"
+        mkt.mkdir()
+        proc = self.mount(mkt, Path("/"))
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("it is inside the workspace (/)", proc.stderr)
+
+    def test_a_sibling_directory_and_a_name_prefix_are_mounted(self):
+        # `app-marketplaces` shares a prefix with `app` and nothing else.
+        for name in ("marketplaces", "app-marketplaces"):
+            with self.subTest(name=name):
+                mkt = self.root / "work" / name
+                mkt.mkdir()
+                proc = self.mount(mkt)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout.split(), ["-v", f"{mkt}:/marketplaces:ro"])
+
+    def test_the_workspace_argument_is_required(self):
+        proc = subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
+            [_BASH, "-c", 'set -euo pipefail; source "$1"; sc_marketplaces',
+             "sc_marketplaces", str(LIB)],
+            capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("sc_marketplaces needs the canonical workspace", proc.stderr)
 
 
 _REFS_HARNESS = ('set -euo pipefail; source "$1"; sc_refs; '

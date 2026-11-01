@@ -350,6 +350,62 @@ same session without it, and triggered no fetch (nothing appeared in
 worse than an error: an unresolvable id that made Claude Code try to clone would
 hang on the proxy's hold-for-approval path at every boot.
 
+## `--settings` is command-line scope: it outranks a project's `enabledPlugins: false`
+
+Measured in-container on Claude Code 2.1.310, with the fixture marketplace of the
+section above (one plugin, one skill), a throwaway `CLAUDE_CONFIG_DIR` and a launch
+file holding `extraKnownMarketplaces` and `enabledPlugins`. Each run was `claude -p`
+with `--output-format stream-json --verbose`, reading the `init` event's `plugins`.
+That event is printed before the first API call, so a config dir with no
+credentials is enough: the run then ends "Not logged in", having loaded everything.
+
+**Loading.** A plugin enabled only in the file passed as `--settings <file>` loads,
+and without the flag it does not. The user `settings.json` is unchanged afterwards:
+the file is layered in, never written back.
+
+**Two `--settings`: the last replaces the first.** `--settings <file> --settings
+'{}'` loaded nothing, and `--settings '{}' --settings <file>` loaded the plugin.
+They are not merged.
+
+**Scope.** The file outranks every other settings scope:
+
+| `hello@demo-mkt` enabled by | turned off by | loaded? |
+| --- | --- | --- |
+| user `settings.json` | nothing | yes |
+| user `settings.json` | project `<repo>/.claude/settings.json` `false` | no |
+| user `settings.json` | project `<repo>/.claude/settings.local.json` `false` | no |
+| `--settings <file>` | project `<repo>/.claude/settings.json` `false` | **yes** |
+| `--settings <file>` | project `<repo>/.claude/settings.local.json` `false` | **yes** |
+| `--settings <file>` | user `settings.json` `false` | **yes** |
+
+The file only wins per plugin: `enabledPlugins` merges across scopes. With
+`hello@other-mkt: true` in user `settings.json` and `--settings` enabling
+`hello@demo-mkt`, both loaded, whether or not user scope also registered
+`other-mkt` (the cache already knew it).
+
+`claude --settings <file> plugin disable --scope user` (and `--scope project`) exits
+0 and writes `false` to that scope, saying "still enabled this session: --settings
+keeps it on", and the next session loads the plugin anyway. The interactive
+`/plugin` menu was not driven, but it writes the same scopes.
+
+**Behind the prepends.** With `--settings <file> --mcp-config <file>
+--strict-mcp-config` in front, `--version`, `plugin list`, `mcp list`, `plugin
+marketplace list`, `update --help` and `--help` all exit 0. Appended instead,
+`claude plugin list --settings <file>` fails with `unknown option '--settings'`.
+
+**The cache stays shared.** A session started with the launch file wrote its
+marketplace into the config dir's `plugins/known_marketplaces.json`, and `plugin
+list` behind the file wrote an `installed_plugins.json` entry with scope "user"
+(its `installPath` under `plugins/cache/` was never created; the plugin is read in
+place). Two launch files over one config dir, as two siblings would have, each
+session loaded only its own plugin, but afterwards `plugin marketplace list` showed
+both marketplaces, and `plugin list` showed the other's plugin as disabled. A
+launch file enabling `hello@other-mkt` without registering `other-mkt` loaded it,
+through the cache the other session had written. In the fixture both paths are
+visible to both sessions. Not measured: two real containers, where the cached
+`/marketplaces/...` path resolves in the reader's own mount, so it reads that
+container's checkout or nothing.
+
 ## An MCP server container really does honour `HTTPS_PROXY` — and how to tell
 
 Measured against `ghcr.io/github/github-mcp-server:v1.9.0` in `http` mode on an

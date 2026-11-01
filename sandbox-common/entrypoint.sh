@@ -32,9 +32,11 @@ chown -R "$USERNAME:$USERNAME" "$SANDBOX_CONFIG_DIR" 2>/dev/null || true
 # agent can be rearranging it while this boot runs; a root process writing there
 # follows whatever symlink it finds, and a check-then-act guard only narrows the
 # window. Writing as the user closes it: a symlink can then lead only to places the
-# agent could already write. The root-owned artefacts (tier 1's gateway pointer and
-# refs note) live in /etc for the life of the container and never in the volume —
-# where any fact about one launch belongs, since the volume is every sibling's.
+# agent could already write. The root-owned artefacts (tier 1's gateway pointer,
+# launch settings and managed note) live in /etc for the life of the container and
+# never in the volume — where any fact about one launch belongs, since the volume is
+# every sibling's. Reading the volume, or a mount a sibling can write, is the user's
+# half too: tier 1's root phase has the user render its launch settings.
 if [ -x /usr/local/bin/tier-setup.sh ]; then
     /usr/local/bin/tier-setup.sh
 fi

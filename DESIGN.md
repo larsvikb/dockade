@@ -389,8 +389,10 @@ capability, not review.
 ### Plugin marketplaces — host-curated, read-only, re-derived each boot
 
 `~/.config/dockade/marketplaces` is auto-mounted at `/marketplaces` **read-only**
-when it exists, and every marketplace in it is registered into `settings.json` at
-boot (`sc_marketplaces` in `sandbox-lib.sh`; `claude-sandbox/tier-setup.sh`).
+when it exists, and every marketplace in it is registered at boot in the
+container's own `/etc/claude-code/launch-settings.json`, which the wrapper hands to
+every `claude` call as `--settings` (`sc_marketplaces` in `sandbox-lib.sh`;
+`claude-sandbox/tier-setup.sh`; `claude-sandbox/claude-wrapper.sh`).
 
 This works at all because a Claude Code marketplace can be a local **directory**,
 and a directory source is used in place — no clone, no copy, no egress, no
@@ -398,7 +400,7 @@ credential (measured; `NOTES.md`). That makes it the right shape for a container
 with no governed git path: the human clones on the host, the sandbox reads. It
 needs no new capability, so it is enablement, not a widening of the boundary.
 
-Three decisions worth keeping:
+Five decisions worth keeping:
 
 - **Read-only, and outside `/workspace`.** A writable plugin tree is a
   cross-session channel rather than a convenience: the agent edits a skill or a
@@ -410,26 +412,57 @@ Three decisions worth keeping:
   launch's workspace, since the read-write `/workspace` would reach the same files.
   A sibling sandbox whose workspace holds this launch's marketplaces can still
   write them; one launch cannot see another's workspace.
+- **Per container, so outside the config volume.** Marketplaces and plugins are
+  per launch, and the volume is every concurrent sibling's, so in its
+  `settings.json` they would be whichever sibling booted last. The file lives in
+  `/etc`, beside the gateway pointer, and `--settings` is the only channel that
+  works under org auth (a local managed settings file is ignored). It is
+  command-line scope, which outranks project, local and user settings and is never
+  written back (measured; `NOTES.md`). So a host-enabled plugin cannot be turned off
+  from inside: an in-session `/plugin disable`, or `enabledPlugins: false` in a
+  `/workspace/.claude/settings.json` or `settings.local.json`, has no effect, and
+  the managed note says so. A repo is not meant to override the operator's
+  allowlist. A caller's own `--settings` replaces the file outright, since Claude
+  Code keeps only the last one given; the wrapper says so in one stderr line
+  instead of merging the two. The marketplace note moves with the file into the one
+  managed `CLAUDE.md`, derived from the file's own keys, so it cannot describe
+  plugins the file does not enable.
+- **Rendered by the user, installed by root.** Root opens no marketplace file:
+  `:ro` here does not stop a sibling whose workspace holds the checkout from
+  writing it. The sandbox user renders the JSON; root checks its shape (two keys,
+  marketplace names in `[A-Za-z0-9._-]`, since they become managed-note text) and
+  installs it root-owned. A render that fails costs the launch its plugins, never
+  its boot.
 - **Generated, not `claude plugin marketplace add`.** The CLI's only effect is
-  writing the same two settings keys, so shelling out to it would make it a second
-  writer to the file the boot owns authoritatively — and it would need a `gosu` hop
-  to avoid leaving root-owned files in `/config`. Deriving the whole set from what
-  is mounted, every boot, also means removing a checkout on the host removes it
-  here, with no stale state to clean up.
+  writing the same two settings keys, and none of the scopes it writes is
+  per-container: user scope is the shared volume, project scope the workspace.
+  Deriving the whole set from what is mounted, every boot, also means removing a
+  checkout on the host removes it here, with no stale state to clean up.
 - **Not a general host-supplied settings overlay**, tempting though one is (a
   single channel, a schema we do not own, room for every future user-scope knob).
-  It would reopen precisely what "user settings are image-owned" closes: the
-  effective configuration would become a two-file question, and a host file could
-  quietly undo a paved-road default. Two narrow keys instead —
-  `extraKnownMarketplaces` and `enabledPlugins`.
+  It would reopen precisely what "user settings are image-owned" closes: a host
+  file could quietly undo a paved-road default. The second file is root-installed
+  and holds two narrow keys, `extraKnownMarketplaces` and `enabledPlugins`,
+  derived only from what is mounted and allowlisted.
 
 Enabling is a **separate** decision from availability: a registered marketplace
 only makes plugins installable, and a plugin loads only if it is in
-`enabledPlugins`. It has to be declared host-side (`~/.config/dockade/plugins`)
-for the same reason the yolo disclaimer is baked into the template — settings are
-re-materialized every boot, so an in-session `/plugin install` does not survive a
-restart. The list travels as an env var rather than a second mount, keeping the
-sandbox free of host paths it does not need.
+`enabledPlugins`. It has to be declared host-side (`~/.config/dockade/plugins`),
+because an in-session `/plugin install` writes the shared `settings.json`, which is
+re-materialized every boot, so it does not survive a restart. The list travels as
+an env var rather than a second mount, keeping the sandbox free of host paths it
+does not need.
+
+**What stays shared.** Claude Code's own cache in the volume
+(`plugins/known_marketplaces.json`, `installed_plugins.json`) records every
+marketplace a sibling's session registered, so `/plugin` and `plugin marketplace
+list` can show a sibling's, its plugins disabled, and whether an id naming an
+unmounted marketplace resolves depends on which siblings ran first. And
+`enabledPlugins` merges per plugin across scopes (measured; `NOTES.md`), so a
+sibling's in-session `/plugin install`, written to the shared user `settings.json`,
+loads in this sandbox's new sessions too until a boot rewrites that file. Making
+the cache and user scope per-container would mean a per-container config dir, and
+the volume holds the credentials and history every sibling needs.
 
 **The trust framing:** a mounted marketplace is code the agent runs — skills,
 agents, hooks, MCP declarations. Mounting one is a trust decision on par with what

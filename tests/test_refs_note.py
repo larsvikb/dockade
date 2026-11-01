@@ -72,12 +72,13 @@ class RefsNotePlacementTests(unittest.TestCase):
     booted last. /etc is the container's own layer."""
 
     def test_tier_one_writes_it_as_root_into_its_own_layer(self):
+        # One managed note, shared with the plugins' bullet (tests/test_launch_settings.py).
         root_phase = TIER_ONE.split(REEXEC, 1)[0]
         defined = root_phase.index("\nrefs_note() {\n")
-        cleared = root_phase.index('rm -f "$REFS_NOTE"')
+        cleared = root_phase.index('rm -f "$MANAGED_NOTE"')
         rendered = root_phase.index('note="$(refs_note /refs)"')
-        written = root_phase.index('install -o root -g root -m 0644 /dev/stdin "$REFS_NOTE"')
-        self.assertIn("REFS_NOTE=/etc/claude-code/CLAUDE.md\n", root_phase)
+        written = root_phase.index('install -o root -g root -m 0644 /dev/stdin "$MANAGED_NOTE"')
+        self.assertIn("MANAGED_NOTE=/etc/claude-code/CLAUDE.md\n", root_phase)
         # Cleared first, as the gateway pointer is: the file's absence is the
         # statement that nothing is mounted.
         self.assertLess(defined, cleared)

@@ -449,9 +449,11 @@ sc_refs() {
 # also independent of the mount — an id may name a marketplace the config volume
 # already knows, with nothing mounted at all.
 #
-# It has to be declared host-side because the sandbox's settings.json is
-# rewritten from the image on every boot (see claude-sandbox/tier-setup.sh), so a
-# plugin enabled in-session does not survive a restart. Without this file the
+# It has to be declared host-side because the plugins a sandbox loads are this
+# launch's, rendered at boot into its own /etc and handed to every `claude` call
+# (see claude-sandbox/tier-setup.sh), while an in-session enable lands in the
+# shared settings.json, which is rewritten from the image on every boot and is
+# outranked by the launch's file anyway. Without this file the
 # feature would ship as "your marketplaces are mounted, now re-enable your
 # plugins every session".
 #

@@ -6218,7 +6218,9 @@ class SchemaVersionTests(_FreshStoreTestCase):
     def _v10_store(self, name, tool_rules_table=True):
         """A store at v10, with both policy tables as v10 left them or, where
         ``tool_rules_table`` is False, from before ``tool_rules`` existed. The ids have
-        gaps, as revokes leave them, so a copy that renumbered would be seen."""
+        gaps, as revokes leave them, so a copy that renumbered would be seen. One rule
+        is scoped to a class other than the column's default, so a copy that left
+        ``client_class`` out would be seen too."""
         self._old_store(name)
         cp.store._init_db()
         with cp.store._connect() as conn:
@@ -6227,7 +6229,8 @@ class SchemaVersionTests(_FreshStoreTestCase):
             conn.executemany(
                 "INSERT INTO rules(id, pattern, action, source, created_at, "
                 "client_class) VALUES (?, ?, ?, 'operator', 0, ?)",
-                [(2, "kept.test", "allow", CLASS), (5, "blocked.test", "block", CLASS)])
+                [(2, "kept.test", "allow", CLASS), (3, "tools.test", "allow", "mcp"),
+                 (5, "blocked.test", "block", CLASS)])
             conn.execute("DROP TABLE tool_rules")
             if tool_rules_table:
                 conn.execute(self._TOOL_RULES_V10)
@@ -6245,8 +6248,9 @@ class SchemaVersionTests(_FreshStoreTestCase):
         with cp.store._connect() as conn:
             self.assertEqual(
                 [tuple(r) for r in conn.execute(
-                    "SELECT id, pattern, action FROM rules ORDER BY id")],
-                [(2, "kept.test", "allow"), (5, "blocked.test", "block")])
+                    "SELECT id, pattern, action, client_class FROM rules ORDER BY id")],
+                [(2, "kept.test", "allow", CLASS), (3, "tools.test", "allow", "mcp"),
+                 (5, "blocked.test", "block", CLASS)])
             self.assertEqual(
                 [tuple(r) for r in conn.execute(
                     "SELECT id, tool, action FROM tool_rules ORDER BY id")],
@@ -6261,6 +6265,8 @@ class SchemaVersionTests(_FreshStoreTestCase):
         # Carried, so policy decides as it did.
         self.assertEqual(cp.policy._decide("kept.test", CLASS)[0], "allow")
         self.assertEqual(cp.policy._decide("blocked.test", CLASS)[0], "deny")
+        self.assertEqual(cp.policy._decide("tools.test", "mcp")[0], "allow")
+        self.assertEqual(cp.policy._decide("tools.test", CLASS)[0], "hold")
         _register()
         _enable()
         self.assertEqual(cp.policy._decide_tool("mcp-github", "get_me")[0], "allow")
@@ -6285,9 +6291,9 @@ class SchemaVersionTests(_FreshStoreTestCase):
             cp.store._init_db()
         self.assertEqual(self._version(), 10)
         with cp.store._connect() as conn:
-            for table in ("rules", "tool_rules"):
+            for table, ids in (("rules", [2, 3, 5]), ("tool_rules", [2, 5])):
                 self.assertEqual([r[0] for r in conn.execute(
-                    f"SELECT id FROM {table} ORDER BY id")], [2, 5])  # noqa: S608
+                    f"SELECT id FROM {table} ORDER BY id")], ids)  # noqa: S608
                 self.assertNotIn("AUTOINCREMENT", conn.execute(
                     "SELECT sql FROM sqlite_master WHERE name=?",
                     (table,)).fetchone()[0])

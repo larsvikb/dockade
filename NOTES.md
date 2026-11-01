@@ -733,7 +733,8 @@ Neither run approaches the JVM's default heap, a quarter of the container's limi
 no larger suite was measured.
 
 **The console jar bundles JUnit 4, not only JUnit 5.** Its
-`META-INF/shadowed-artifacts` lists:
+`META-INF/shadowed-artifacts` lists the same artifacts in 1.13.4 and 1.14.4, the Jupiter,
+Platform and Vintage ones each at its own release's version:
 - `junit:junit:4.13.2` and `org.hamcrest:hamcrest-core:1.3`;
 - of its release, the Jupiter api, engine and params; eight Platform artifacts
   (commons, console, engine, launcher, reporting, suite-api, suite-commons,

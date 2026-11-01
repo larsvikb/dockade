@@ -316,7 +316,7 @@ def script(name: str) -> Response:
 
 
 def _relay_allowed(method: str, path: str) -> bool:
-    return any(method == m and rx.match(path) for m, rx in _RELAY_ROUTES)
+    return any(method == m and rx.fullmatch(path) for m, rx in _RELAY_ROUTES)
 
 
 @app.get("/tasks-link")

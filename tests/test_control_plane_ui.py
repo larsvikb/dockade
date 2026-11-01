@@ -116,6 +116,16 @@ class RelayAllowlistTests(unittest.TestCase):
                                     "relayed path\n")
         self.assertEqual(_sent, {}, "must not reach the backend at all")
 
+    def test_a_relayed_path_with_a_trailing_newline_is_not_relayed(self):
+        # `$` matches before a final newline, so the table is held with `fullmatch`.
+        # Starlette's catch-all already drops one trailing newline before `proxy`
+        # sees it, so this changes nothing on the live stack: it keeps the allowlist
+        # meaning what it spells without leaning on the router. Called as a function,
+        # so it shows the allowlist, not the router.
+        resp = self._proxy("api/egress/rules\n")
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(_sent, {}, "must not reach the backend at all")
+
     def test_unknown_and_wrong_method_paths_are_not_relayed(self):
         for path, method in (("healthz", "GET"), ("api/secrets", "GET"),
                              ("approvals", "POST"), ("status", "POST"),

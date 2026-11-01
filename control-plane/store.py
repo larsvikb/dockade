@@ -84,9 +84,11 @@ def _step_1_client_class(conn: sqlite3.Connection) -> None:
     was made under.
 
     The rebuilt ``rules`` DDL here is the table as v1 shipped it, written out rather
-    than shared with ``_RULES_DDL``: a step keeps doing what it did when it shipped.
-    v11 rebuilds the table again from ``_RULES_DDL``, which is what makes a migrated
-    store and a fresh one agree, and a test compares the two.
+    than shared with ``_RULES_DDL``. This step builds the new table under a temporary
+    name and renames it into place, so a shared string would have had to be
+    parameterized by table name, which is how ``rules_migrating`` would end up in a
+    fresh store's schema. v11 rebuilds the table again from ``_RULES_DDL``, which is
+    what makes a migrated store and a fresh one agree, and a test compares the two.
 
     ``audit`` and ``approvals`` take the column NULLABLE and with no default. Those
     are records, not constraints, and a row written before classes existed genuinely

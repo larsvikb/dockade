@@ -203,12 +203,13 @@ USER root
 # sc_jdk_variant); empty, this layer does nothing. Below every toolchain layer, so a
 # variant shares them; above the COPYs, so a script edit does not refetch the JDK.
 # No Maven or Gradle, so no egress: dependencies come from the host build.
-# A jar bump is these two lines, the digest from the jar's published .sha256.
+# A jar bump is these two lines, the digest from the jar's published .sha256, its
+# .asc checked against JUnit's release key: the .sha256 shares the jar's host.
 # openjdk's postinst needs /usr/share/man/man1, which the slim image lacks.
 # tier-setup.sh's jdk_note reads the version file.
 ARG JDK=""
-ARG JUNIT_CONSOLE_VERSION=1.13.4
-ARG JUNIT_CONSOLE_SHA256=3fdfc37e29744a9a67dd5365e81467e26fbde0b7aa204e6f8bbe79eeaa7ae892
+ARG JUNIT_CONSOLE_VERSION=1.14.4
+ARG JUNIT_CONSOLE_SHA256=7c6968cbcaf4301c729f202b23b7d736c5d88be625fc7d27ad5d746146a8bc28
 RUN if [ -z "$JDK" ]; then exit 0; fi \
     && jar=/opt/junit/junit-platform-console-standalone.jar \
     && mkdir -p /usr/share/man/man1 \

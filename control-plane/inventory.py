@@ -72,7 +72,7 @@ def _clean_tools(raw: list) -> tuple[list[str], list[str], int]:
     unnameable = 0
     for tool in raw[:MAX_TOOLS_PER_SERVER]:
         name = (tool.get("name") or "").strip() if isinstance(tool, dict) else ""
-        if not policy._TOOL_RE.match(name):
+        if not policy._TOOL_RE.fullmatch(name):
             unnameable += 1
             continue
         if name in names:

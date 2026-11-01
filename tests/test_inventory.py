@@ -84,6 +84,13 @@ class RecordTests(unittest.TestCase):
                                      "ok-one": {"status": "ok", "tools": []}}})
         self.assertEqual(set(self.inv.snapshot()), {"ok-one"})
 
+    def test_a_server_name_with_a_trailing_newline_is_skipped(self):
+        # Pushed keys reach the check unstripped, so `ok-one\n` would otherwise be
+        # stored beside `ok-one` as a second entry naming no registered server.
+        self.inv.record({"servers": {"ok-one\n": {"status": "ok", "tools": []},
+                                     "ok-one": {"status": "ok", "tools": []}}})
+        self.assertEqual(set(self.inv.snapshot()), {"ok-one"})
+
     def test_a_status_carrying_a_novel_is_capped(self):
         # Server-adjacent text on a surface an operator reads. Bounded here rather
         # than at the renderer, because the cap belongs where the trust boundary is.

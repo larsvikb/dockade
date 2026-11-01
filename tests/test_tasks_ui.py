@@ -102,6 +102,16 @@ class RelayTests(unittest.TestCase):
                 self.assertTrue(resp.body.startswith("refused by tasks-ui: "))
                 self.assertEqual(sent, {})
 
+    def test_a_relayed_path_with_a_trailing_newline_is_refused(self):
+        # As the approval UI's: `$` matches before a final newline, so the table is
+        # held with `fullmatch`. Starlette's catch-all already drops one trailing
+        # newline before `proxy` sees it, so nothing changes on the live stack; the
+        # allowlist means what it spells without leaning on the router. Called as a
+        # function, so it shows the allowlist, not the router.
+        resp = self._proxy("api/repos\n")
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(sent, {})
+
     def test_the_upstream_stays_the_registry_whatever_the_table_lets_through(self):
         # As the approval UI's RelayHostPinningTests: with the table opened up, a
         # network-path reference is still an absolute path on the registry.

@@ -268,7 +268,7 @@ def _rule_error(pattern: str, action: str) -> str | None:
         return ("an IP address has no subdomains, so a leading dot cannot be a "
                 "wildcard over one") if wildcard else None
     labels = body.split(".")
-    if not all(_LABEL_RE.match(label) for label in labels):
+    if not all(_LABEL_RE.fullmatch(label) for label in labels):
         return (f"{pattern!r} is not a hostname pattern — expected labels of letters, "
                 f"digits, '-' or '_' separated by dots, optionally led by one dot for "
                 f"a subdomain wildcard")
@@ -445,7 +445,7 @@ def _server_name_error(server: str) -> str | None:
     that the server EXISTS."""
     if not server:
         return "server name is empty"
-    if not _SERVER_RE.match(server):
+    if not _SERVER_RE.fullmatch(server):
         return (f"{server!r} is not a server name — expected a DNS label: lowercase "
                 f"letters, digits and '-', not starting or ending with '-', at most "
                 f"63 characters")
@@ -470,7 +470,7 @@ def _auth_descriptor_error(auth_type: str, header: str, template: str) -> str | 
         return None
     if not header:
         return "a 'header' auth type needs the header name to set"
-    if not _HEADER_RE.match(header):
+    if not _HEADER_RE.fullmatch(header):
         return (f"{header!r} is not a header name — expected letters, digits and '-', "
                 f"at most 64 characters")
     if not template:
@@ -518,7 +518,7 @@ def _tool_rule_error(tool: str, action: str) -> str | None:
         return (f"action must be one of {', '.join(_TOOL_ACTIONS)}, not {action!r}")
     if not tool:
         return "tool name is empty"
-    if not _TOOL_RE.match(tool):
+    if not _TOOL_RE.fullmatch(tool):
         return (f"{tool!r} is not a tool name — expected letters, digits, '_', '-', "
                 f"'.' or ':', at most 128 characters")
     return None

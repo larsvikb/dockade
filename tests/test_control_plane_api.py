@@ -888,6 +888,17 @@ class PatternValidationTests(unittest.TestCase):
                     cp.policy._rule_error(cp.policy._normalize_pattern(pattern),
                                           "allow"))
 
+    def test_a_newline_ending_an_inner_label_is_refused(self):
+        # `$` matches before a final newline, and normalizing strips only the ends of
+        # the whole pattern, so a newline ending any label but the last reaches the
+        # label check. Stored, it is a rule that never matches.
+        for pattern in ("example\n.com", "a.b\n.com", ".example\n.com"):
+            for action in ("allow", "block"):
+                with self.subTest(pattern=pattern, action=action):
+                    self.assertIsNotNone(
+                        cp.policy._rule_error(cp.policy._normalize_pattern(pattern),
+                                              action))
+
     def test_an_ip_literal_is_a_valid_exact_pattern(self):
         self.assertIsNone(cp.policy._rule_error("10.0.0.7", "allow"))
 
@@ -1007,6 +1018,13 @@ class CreateRuleTests(_CPTestCase):
 
     def test_a_malformed_pattern_is_refused_rather_than_stored_inert(self):
         resp = _create("http://example.com", "allow")
+        self.assertEqual(resp.status_code, 400)
+        with cp.store._connect() as conn:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM rules").fetchone()[0], 0)
+
+    def test_a_newline_inside_a_label_is_refused_rather_than_stored_inert(self):
+        resp = _create("example\n.com", "allow")
         self.assertEqual(resp.status_code, 400)
         with cp.store._connect() as conn:
             self.assertEqual(
@@ -1248,6 +1266,12 @@ class EditRuleTests(_CPTestCase):
     def test_a_malformed_pattern_is_refused_and_changes_nothing(self):
         rid = self._rule("example.com", "allow")
         resp = self._edit(rid, "http://evil.example", "allow")
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(_rules(), {("example.com", "allow")})
+
+    def test_a_newline_inside_a_label_is_refused_and_changes_nothing(self):
+        rid = self._rule("example.com", "allow")
+        resp = self._edit(rid, "example\n.com", "allow")
         self.assertEqual(resp.status_code, 400)
         self.assertEqual(_rules(), {("example.com", "allow")})
 
@@ -3391,6 +3415,15 @@ class McpServerRegistrationTests(_CPTestCase):
             resp = _register(server=bad)
             self.assertEqual(resp.status_code, 400, bad)
 
+    def test_the_validators_refuse_a_trailing_newline_themselves(self):
+        # Asserted on the validators, not through the route, because the route strips
+        # first. `inventory.record` does not: it checks the gateway push's keys as
+        # sent, so the guarantee has to live here rather than in each caller.
+        self.assertIsNotNone(cp.policy._server_name_error("mcp-github\n"))
+        self.assertIsNotNone(
+            cp.policy._auth_descriptor_error("header", "Authorization\n",
+                                             "Bearer {secret}"))
+
     def test_a_name_is_normalized_rather_than_refused_for_its_case(self):
         # Lowercased on the way in, like an egress pattern, because DNS does not
         # distinguish the two spellings and the charset above only admits one of them.
@@ -3663,6 +3696,10 @@ class McpToolRuleTests(_CPTestCase):
     def test_a_tool_name_outside_the_charset_is_refused(self):
         for bad in ("get me", "get\nme", "x" * 129, "", "tool$"):
             self.assertEqual(_tool_rule(bad).status_code, 400, bad)
+
+    def test_the_validator_refuses_a_trailing_newline_itself(self):
+        # On the validator, because the route strips the name before it gets here.
+        self.assertIsNotNone(cp.policy._tool_rule_error("getMe\n", "allow"))
 
     def test_a_conflicting_action_is_a_conflict_and_the_same_one_is_a_non_write(self):
         _tool_rule("get_me", "allow")

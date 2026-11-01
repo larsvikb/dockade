@@ -193,6 +193,49 @@ RUN pipx install ruff \
     && ruff --version \
     && yamllint --version
 
+# Ends as root ON PURPOSE: the entrypoint needs root to arm the firewall
+# (NET_ADMIN) before dropping to the non-root sandbox user via gosu, so the
+# running agent is never root. See entrypoint.sh.
+# hadolint ignore=DL3002
+USER root
+
+# The JDK variant, OFF unless the launcher passes JDK=<major> (SANDBOX_JDK,
+# sc_jdk_variant); empty, this layer does nothing. Below every toolchain layer, so a
+# variant shares them; above the COPYs, so a script edit does not refetch the JDK.
+# No Maven or Gradle, so no egress: dependencies come from the host build.
+# A jar bump is these two lines, the digest from the jar's published .sha256.
+# openjdk's postinst needs /usr/share/man/man1, which the slim image lacks.
+# tier-setup.sh's jdk_note reads the version file.
+ARG JDK=""
+ARG JUNIT_CONSOLE_VERSION=1.13.4
+ARG JUNIT_CONSOLE_SHA256=3fdfc37e29744a9a67dd5365e81467e26fbde0b7aa204e6f8bbe79eeaa7ae892
+RUN if [ -z "$JDK" ]; then exit 0; fi \
+    && jar=/opt/junit/junit-platform-console-standalone.jar \
+    && mkdir -p /usr/share/man/man1 \
+    && apt-get update && apt-get install -y --no-install-recommends "openjdk-${JDK}-jdk-headless" \
+    && apt-get clean && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL \
+       "https://repo1.maven.org/maven2/org/junit/platform/junit-platform-console-standalone/${JUNIT_CONSOLE_VERSION}/junit-platform-console-standalone-${JUNIT_CONSOLE_VERSION}.jar" \
+       -o /tmp/junit.jar \
+    && echo "${JUNIT_CONSOLE_SHA256}  /tmp/junit.jar" | sha256sum -c - \
+    && install -D -m 0644 /tmp/junit.jar "$jar" \
+    && rm /tmp/junit.jar \
+    && java -version \
+    && t="$(mktemp -d)" && mkdir "$t/classes" \
+    && printf '%s\n' 'import org.junit.jupiter.api.Test;' \
+         'class SelfTest { @Test void runs() { org.junit.jupiter.api.Assertions.assertEquals(2, 1 + 1); } }' \
+         > "$t/SelfTest.java" \
+    && javac -d "$t/classes" -cp "$jar" "$t/SelfTest.java" \
+    && java -jar "$jar" execute --disable-banner --fail-if-no-tests \
+         --class-path "$t/classes" --scan-class-path \
+    && rm -rf "$t" \
+    && javac_version="$(javac -version 2>&1)" \
+    && launcher_version="$(java -jar "$jar" --version | sed -n '1{s/\x1b\[[0-9;]*m//g;p;}')" \
+    && mkdir -p /etc/claude-code \
+    && printf '%s\n' "$javac_version" "$launcher_version" > /etc/claude-code/jdk-version \
+    && chmod 0644 /etc/claude-code/jdk-version \
+    && cat /etc/claude-code/jdk-version
+
 # Dotfiles. The tier-agnostic ones are SHARED with tier 2 from sandbox-common/,
 # for the same reason the boundary scripts are: one implementation, no drift.
 # .bashrc.tier is this tier's own hook, sourced at the end of the shared .bashrc.
@@ -210,16 +253,10 @@ COPY claude-sandbox/dotfiles/.bashrc.tier /home/$USERNAME/.bashrc.tier
 # Enforcement is the firewall + capability containment; hard policy is the org
 # admin console.
 #
-# Ends as root ON PURPOSE: the entrypoint needs root to arm the firewall
-# (NET_ADMIN) before dropping to the non-root sandbox user via gosu, so the
-# running agent is never root. See entrypoint.sh.
-#
 # init-firewall.sh / entrypoint.sh / boundary-check.sh come from sandbox-common/
 # and are SHARED VERBATIM with the tier-2 (opencode) image — the boundary must
 # have exactly one implementation. Anything Claude-specific goes in the
 # tier-setup.sh hook the shared entrypoint invokes, not in the shared scripts.
-# hadolint ignore=DL3002
-USER root
 COPY claude-sandbox/user-settings.json /etc/claude-code/user-settings.json
 # NOT named CLAUDE.md at this path. /etc/claude-code is a MANAGED source, and
 # Claude Code discovers a CLAUDE.md there and loads it as managed memory — so the

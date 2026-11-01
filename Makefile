@@ -622,7 +622,7 @@ ui-diff: ## Run a page's scenario (UI_DIFF_PAGE=approval|tasks) on UI_DIFF_BASE 
 	  exit 1
 	fi
 
-verify-build: ## Assert every image still builds (skipped if docker unavailable)
+verify-build: ## Assert every default image still builds (skipped if docker unavailable)
 	@if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
 	  if [ -n "$(REQUIRE_TOOLS)" ]; then
 	    echo "  FAIL: docker is unavailable and DOCKADE_REQUIRE_TOOLS is set —"
@@ -639,11 +639,14 @@ verify-build: ## Assert every image still builds (skipped if docker unavailable)
 	# because compose builds only the services its active profiles enable, and the
 	# task registry and its page are the profile-gated services built here
 	# (tests/test_topology.py holds this to every such profile).
+	#
+	# SANDBOX_JDK is cleared because the JDK variant is never built here: a value
+	# exported for a Java project would build it in the default image's place.
 	echo "== docker compose build (the compose services) =="
 	$(COMPOSE) --profile tasks build
 	for launcher in $(LAUNCHERS); do
 	  echo "== sandbox image build ($$launcher --build-only) =="
-	  "./$$launcher" --build-only
+	  SANDBOX_JDK= "./$$launcher" --build-only
 	done
 
 # ── shared infrastructure (docker-compose.yml) ──────────────────────────────
@@ -1163,7 +1166,7 @@ restore-tasks: tasks-tool-preflight ## Replace the task registry's store from a 
 	fi
 	$(TASKS_TOOL) backup.py restore < "$(FILE)"
 
-rebuild: ## Rebuild every image from scratch — proxy, control plane, UI, gateway, task registry, both sandbox tiers — then recreate the infra
+rebuild: ## Rebuild every default image from scratch — proxy, control plane, UI, gateway, task registry, both sandbox tiers — then recreate the infra
 	# Deliberately does NOT `down` first. A build touches no running container, so
 	# taking the governance plane offline for the whole --no-cache build bought
 	# nothing and cost real downtime; the only unavoidable interruption is the
@@ -1179,8 +1182,11 @@ rebuild: ## Rebuild every image from scratch — proxy, control plane, UI, gatew
 	#
 	# The task registry's and its page's images too (see verify-build for the profile).
 	# The `up` below leaves them alone; `make tasks-up` recreates both on the new images.
+	#
+	# Default sandbox images only, SANDBOX_JDK cleared as in verify-build: a JDK
+	# variant is rebuilt by hand (README.md, "Java in the sandbox").
 	$(COMPOSE) --profile tasks build --no-cache
-	for launcher in $(LAUNCHERS); do "./$$launcher" --build-only --no-cache; done
+	for launcher in $(LAUNCHERS); do SANDBOX_JDK= "./$$launcher" --build-only --no-cache; done
 	$(COMPOSE) up -d --wait --wait-timeout 120
 
 logs-ep: ## Follow the egress-proxy log — the live per-connection audit stream

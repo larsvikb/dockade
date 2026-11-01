@@ -291,6 +291,11 @@ image is where **enablement** lives:
   steering the agent onto the paved road — *planned, not yet in the image*
 - non-root `sandbox` user, resource limits
 
+A toolchain only some workspaces need is an opt-in build arg on the one Dockerfile,
+under its own image tag, rather than a second Dockerfile that drifts or a default
+every session pays for. One without a build tool resolves nothing at run time, so it
+adds no egress: the JDK variant is the first (README.md, "Java in the sandbox").
+
 ### User settings — image-owned config, materialized each boot
 
 `/config/settings.json` is **declarative configuration owned by the image**, not
@@ -580,7 +585,8 @@ single-container image and launcher centered on this design. Notable properties:
   (shellcheck / hadolint / ruff / yamllint, all self-contained so they run under
   default-deny egress), and Chromium's headless shell, so a test can drive a web
   frontend in a real browser engine (why the shell, and when to switch to the full
-  browser: `claude-sandbox/Dockerfile`). Node tracks the latest LTS line (even
+  browser: `claude-sandbox/Dockerfile`), and an opt-in JDK with the JUnit 5
+  console launcher (`SANDBOX_JDK`). Node tracks the latest LTS line (even
   majors); bump the NodeSource `setup_NN.x` major to move it. Firewall allowlist
   trimmed to this design (Anthropic + GitHub + npm + PyPI).
 - **Own user-defined bridge `sandbox-net`** (owned by `docker-compose.yml`,

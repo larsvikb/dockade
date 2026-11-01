@@ -187,6 +187,86 @@ class WrapperTests(unittest.TestCase):
         self.assertIn("alias claude-yolo='claude ", bashrc)
 
 
+class JdkVariantWiringTests(unittest.TestCase):
+    """The opt-in JDK across the Dockerfile, the boot hook and the launcher.
+
+    No automated build runs the variant (neither `make verify-build` nor CI), so an
+    edit that breaks only it shows at its next manual build; these hold its shape."""
+
+    GUARD = 'RUN if [ -z "$JDK" ]; then exit 0; fi \\\n'
+    VERSION_FILE = "/etc/claude-code/jdk-version"
+    BUILD = ('sc_build_image "$IMAGE_NAME" "$IMAGE_DIR" "$CACHE_FLAG" '
+             '${SC_BUILD_ARGS[@]+"${SC_BUILD_ARGS[@]}"}')
+
+    def run_text(self) -> str:
+        start = DOCKERFILE.index(self.GUARD)
+        return DOCKERFILE[start:DOCKERFILE.index("\n\n", start)]
+
+    def test_the_layer_sits_below_the_toolchain_and_above_the_copies(self):
+        # Above the pipx RUN it would rebuild the toolchain per variant; below the
+        # COPYs every script edit would refetch the JDK.
+        order = [DOCKERFILE.index("RUN pipx install ruff"),
+                 DOCKERFILE.index("\nUSER root\n"),
+                 DOCKERFILE.index('\nARG JDK=""\n'),
+                 DOCKERFILE.index(self.GUARD),
+                 DOCKERFILE.index("COPY sandbox-common/dotfiles/")]
+        self.assertEqual(order, sorted(order))
+        self.assertEqual(re.findall(r"^USER .*", DOCKERFILE, re.M)[-1], "USER root")
+
+    def test_an_empty_arg_makes_the_layer_do_nothing(self):
+        self.assertEqual(len(re.findall(r"^ARG JDK=", DOCKERFILE, re.M)), 1)
+        self.assertEqual(DOCKERFILE.count('if [ -z "$JDK" ]'), 1)
+
+    def test_the_jar_is_checked_before_it_is_installed(self):
+        run = self.run_text()
+        fetched = run.index("-o /tmp/junit.jar")
+        # Adjacent lines, so nothing between them (an `|| true`) can make the digest
+        # advisory.
+        checked = run.index('echo "${JUNIT_CONSOLE_SHA256}  /tmp/junit.jar" | sha256sum -c - \\\n'
+                            '    && install -D -m 0644 /tmp/junit.jar "$jar" \\\n')
+        self.assertLess(fetched, checked)
+        self.assertRegex(DOCKERFILE, r"(?m)^ARG JUNIT_CONSOLE_SHA256=[0-9a-f]{64}$")
+
+    def test_the_layer_keeps_the_apt_hygiene_and_tests_itself(self):
+        run = self.run_text()
+        man = run.index("mkdir -p /usr/share/man/man1")
+        update = run.index("apt-get update")
+        install = run.index('apt-get install -y --no-install-recommends "openjdk-${JDK}-jdk-headless"')
+        clean = run.index("apt-get clean && rm -rf /var/lib/apt/lists/*")
+        self.assertEqual([man, update, install, clean], sorted([man, update, install, clean]))
+        for step in ("java -version", "javac -d", "--fail-if-no-tests", "--scan-class-path",
+                     "javac -version", '"$jar" --version | sed -n \'1{', "mkdir -p /etc/claude-code \\",
+                     f"> {self.VERSION_FILE} \\", "rm /tmp/junit.jar \\", 'rm -rf "$t" \\'):
+            with self.subTest(step=step):
+                self.assertIn(step, run)
+
+    def test_the_boot_note_reads_the_file_the_build_writes_as_root(self):
+        root_phase, user_phase = TIER_SETUP.split(TierHookPrivilegeTests.REEXEC, 1)
+        call = f"jdk_note {self.VERSION_FILE}"
+        self.assertEqual(root_phase.count(call), 1)
+        self.assertNotIn("jdk_note", user_phase)
+        joined = root_phase.index(call)
+        self.assertLess(root_phase.index('plugin_note="$(launch_note "$launch")"'), joined)
+        self.assertLess(joined, root_phase.index('"$MANAGED_NOTE" <<<"$note"'))
+
+    def test_the_launcher_uses_the_variant_tag_for_every_build_and_the_run(self):
+        variant = LAUNCHER.index('sc_jdk_variant "${SANDBOX_IMAGE:-claude-sandbox}"')
+        self.assertLess(variant, LAUNCHER.index('if [[ "$BUILD_ONLY" == "true" ]]'))
+        self.assertEqual(re.findall(r"^IMAGE_NAME=.*", LAUNCHER, re.M),
+                         ['IMAGE_NAME="$SC_IMAGE"'])
+        builds = [line.strip() for line in LAUNCHER.splitlines()
+                  if line.strip().startswith("sc_build_image")]
+        self.assertEqual(builds, [self.BUILD, self.BUILD])
+        self.assertIn('! docker image inspect "$IMAGE_NAME"', LAUNCHER)
+        self.assertIn('"$IMAGE_NAME" ${RUN_CMD_ARGS[@]+"${RUN_CMD_ARGS[@]}"}', LAUNCHER)
+        self.assertIn('echo "Image:     $IMAGE_NAME"', LAUNCHER)
+
+    def test_tier_two_never_takes_the_variant(self):
+        opencode = (ROOT / "run-opencode-sandbox.sh").read_text()
+        self.assertNotIn("sc_jdk_variant", opencode)
+        self.assertNotIn("SC_BUILD_ARGS", opencode)
+
+
 if __name__ == "__main__":
     unittest.main()
 

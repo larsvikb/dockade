@@ -601,5 +601,32 @@ class ShippedComponentTests(_NeedsGit):
                             f"(Status says {state!r}): /{phrase}/")
 
 
+class JdkVariantDocTests(unittest.TestCase):
+    """The JDK variant's variable and its jar, as the README tells the operator and
+    the boot note tells the agent. Read by name, so no index is needed: a wrong path
+    in either is a test command that fails inside the sandbox, which is where nobody
+    looks for a stale document."""
+
+    README: ClassVar[str] = (ROOT / "README.md").read_text()
+
+    def jar(self) -> str:
+        found = re.findall(r'^\s*&& jar=(/opt/junit/\S+\.jar) \\$',
+                           (ROOT / "claude-sandbox" / "Dockerfile").read_text(), re.M)
+        self.assertEqual(len(found), 1, "the Dockerfile no longer installs one jar")
+        return found[0]
+
+    def test_the_variable_the_library_reads_is_documented(self):
+        self.assertIn('"${SANDBOX_JDK:-}"', (ROOT / "sandbox-lib.sh").read_text())
+        self.assertIn("SANDBOX_JDK=21 ./run-claude-sandbox.sh", self.README)
+
+    def test_the_readme_and_the_note_run_the_jar_the_image_installs(self):
+        invocation = f"java -jar {self.jar()} execute"
+        note = (ROOT / "claude-sandbox" / "tier-setup.sh").read_text()
+        for name, text in (("README.md", self.README), ("tier-setup.sh", note)):
+            with self.subTest(file=name):
+                self.assertIn(invocation, text)
+                self.assertEqual(set(re.findall(r"/opt/junit/\S+?\.jar", text)), {self.jar()})
+
+
 if __name__ == "__main__":
     unittest.main()

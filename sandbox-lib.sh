@@ -24,7 +24,7 @@ SANDBOX_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ---------------------------------------------------------------------------
 # Image build
 # ---------------------------------------------------------------------------
-# sc_build_image <image_tag> <image_dir> [--no-cache]
+# sc_build_image <image_tag> <image_dir> [--no-cache] [build_arg...]
 #
 # Context is the REPO ROOT, not <image_dir>, so the Dockerfile can COPY the
 # shared sandbox-common/ scripts (a build context cannot reach outside itself).
@@ -35,15 +35,39 @@ SANDBOX_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # after switching hosts if the host uid differs.
 sc_build_image() {
     local image_tag="$1" image_dir="$2" no_cache="${3:-}"
-    local cache_args=()
+    local cache_args=() extra_args=("${@:4}")
     [[ "$no_cache" == "--no-cache" ]] && cache_args+=(--no-cache)
     echo "Building $image_tag (sandbox user uid/gid $(id -u)/$(id -g))..."
     docker build -t "$image_tag" \
         ${cache_args[@]+"${cache_args[@]}"} \
         --build-arg USER_UID="$(id -u)" \
         --build-arg USER_GID="$(id -g)" \
+        ${extra_args[@]+"${extra_args[@]}"} \
         -f "$SANDBOX_REPO_ROOT/$image_dir/Dockerfile" \
         "$SANDBOX_REPO_ROOT"
+}
+
+# ---------------------------------------------------------------------------
+# JDK variant  ->  sets SC_IMAGE, SC_BUILD_ARGS (array)
+# ---------------------------------------------------------------------------
+# sc_jdk_variant <base_tag>
+#
+# SANDBOX_JDK=<major> asks for tier 1's JDK variant: the Dockerfile's ARG JDK, built
+# and run under <base_tag>-jdk<major>, so it and the default image never overwrite
+# each other and a missing variant is built rather than the default reused. Unset
+# or empty, the tag and the build are the default's. Anything but a major version
+# is refused, since it becomes part of an apt package name.
+# shellcheck disable=SC2034  # both globals are consumed by the sourcing launcher
+sc_jdk_variant() {
+    SC_IMAGE="$1"
+    SC_BUILD_ARGS=()
+    [[ -n "${SANDBOX_JDK:-}" ]] || return 0
+    if [[ ! "$SANDBOX_JDK" =~ ^[1-9][0-9]*$ ]]; then
+        echo "REFUSING SANDBOX_JDK='$SANDBOX_JDK': it takes a JDK major version, such as 21." >&2
+        exit 1
+    fi
+    SC_IMAGE="$1-jdk$SANDBOX_JDK"
+    SC_BUILD_ARGS=(--build-arg "JDK=$SANDBOX_JDK")
 }
 
 # ---------------------------------------------------------------------------

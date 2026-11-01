@@ -301,7 +301,7 @@ class RootInstallTests(unittest.TestCase):
 
     def run_block(self, render: str = "{}", fail: bool = False):
         script = (_function("refs_note") + _shape() + _function("launch_note")
-                  + 'USERNAME=sandbox\n' + self.block)
+                  + _function("jdk_note") + 'USERNAME=sandbox\n' + self.block)
         proc = _bash(script, env={"PATH": self.path, "STUB_RENDER": render,
                                   "STUB_FAIL": "1" if fail else ""})
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -354,6 +354,56 @@ class RootInstallTests(unittest.TestCase):
         self.assertLess(note.index("Reference material"), note.index("Plugin marketplaces"))
         self.run_block("{}")
         self.assertNotIn("Plugin marketplaces", self.note.read_text())
+
+    def test_a_jdk_image_adds_its_bullet_after_the_refs_and_the_plugins(self):
+        (self.refs / "docs").mkdir()
+        (self.etc / "jdk-version").write_text("javac 21.0.8\n")
+        self.run_block('{"extraKnownMarketplaces":{"mkt":{}}}')
+        note = self.note.read_text()
+        self.assertLess(note.index("Reference material"), note.index("Plugin marketplaces"))
+        self.assertLess(note.index("Plugin marketplaces"), note.index("A JDK"))
+        self.assertIn("`javac 21.0.8`", note)
+
+    def test_a_jdk_image_alone_still_gets_a_note(self):
+        (self.etc / "jdk-version").write_text("javac 21.0.8\n")
+        self.run_block("{}")
+        self.assertTrue(self.note.read_text().startswith("- **A JDK"))
+
+    def test_without_a_version_file_the_note_is_as_before(self):
+        (self.refs / "docs").mkdir()
+        self.run_block('{"extraKnownMarketplaces":{"mkt":{}}}')
+        with_plugins = self.note.read_text()
+        self.assertNotIn("JDK", with_plugins)
+        self.assertTrue(with_plugins.rstrip().endswith("these plugins load in that session."))
+
+
+@unittest.skipUnless(_BASH or _STRICT, "bash is not installed")
+class JdkNoteTests(unittest.TestCase):
+    """``jdk_note``: the JDK variant's bullet, from the versions its build recorded."""
+
+    def note(self, version_file: Path) -> str:
+        proc = _bash(_function("jdk_note") + 'jdk_note "$1"', str(version_file))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout
+
+    def test_no_version_file_says_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self.note(Path(tmp) / "jdk-version"), "")
+
+    def test_a_version_file_gives_its_versions_the_jar_and_the_limits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            versions = Path(tmp) / "jdk-version"
+            versions.write_text("javac 21.0.8\nJUnit Platform Console Launcher 1.13.4\n")
+            note = self.note(versions)
+        first, rest = note.split("\n", 1)
+        self.assertTrue(first.startswith("- **"), first)
+        self.assertTrue(first.endswith(
+            ": `javac 21.0.8`, `JUnit Platform Console Launcher 1.13.4`."), first)
+        self.assertTrue(all(line.startswith("  ") for line in rest.splitlines()), rest)
+        flat = " ".join(note.split())
+        self.assertIn("`java -jar /opt/junit/junit-platform-console-standalone.jar execute", flat)
+        self.assertIn("no Maven or Gradle", flat)
+        self.assertIn("`-Xmx`", flat)
 
 
 @unittest.skipUnless(_SH or _STRICT, "sh is not installed")

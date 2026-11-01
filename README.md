@@ -123,6 +123,8 @@ the measured throughput behind those decisions.
   boot — see *Plugins and marketplaces* below.
 - **Mounts reference material** at `/refs/<name>` (**read-only**, both tiers)
   for each directory in `SANDBOX_REFS` — see *Reference material* below.
+- **Adds a JDK** when `SANDBOX_JDK` is set, under its own image tag — see
+  *Java in the sandbox* below.
 - **Forwards your host git identity** into the container (it is not baked into
   the image).
 - **Runs the agent** as non-root — the container starts as root only to arm the
@@ -196,6 +198,73 @@ its top — read-only does not stop the agent using those. So is a credential
 directory such as `~/.ssh`, a name with a leading dot, and an entry that is not
 a directory: every entry was named on purpose, so a bad one stops the launch
 rather than vanishing.
+
+## Java in the sandbox
+
+Tier 1 has an opt-in variant with a JDK and the JUnit 5 console launcher, so the
+agent can compile Java and run its tests in here while the build stays on the host:
+
+```bash
+SANDBOX_JDK=21 ./run-claude-sandbox.sh               # builds claude-sandbox-jdk21 if missing
+SANDBOX_JDK=21 ./run-claude-sandbox.sh --build-only  # build it and run its self-test, no launch
+```
+
+It adds Debian's `openjdk-21-jdk-headless` and the JUnit 5 line's
+`junit-platform-console-standalone`, at
+`/opt/junit/junit-platform-console-standalone.jar`, and nothing else: no Maven
+and no Gradle, so no new egress. Dependencies come from the host. With Maven, copy
+the test classpath into the workspace, leaving out what the launcher already
+bundles (Jupiter, Platform and Vintage, JUnit 4.13.2 and Hamcrest core 1.3), so the
+classpath holds one copy of it rather than two versions:
+
+```bash
+mvn dependency:copy-dependencies -DincludeScope=test -DoutputDirectory=target/deps \
+    -DexcludeGroupIds=org.junit.jupiter,org.junit.platform,org.junit.vintage,org.opentest4j,org.apiguardian \
+    -DexcludeArtifactIds=junit,hamcrest-core
+```
+
+The group filter also drops JUnit artifacts the launcher does not bundle, such as
+`junit-platform-testkit`; a project that uses one copies it separately. Hamcrest 2
+(`org.hamcrest:hamcrest`) is not bundled and stays in the copy.
+
+Then, inside the sandbox, from the module's directory (the sequence assumes one
+module with `src/main/java` and `src/test/java`, and a module without tests stops
+after the first `javac`. In a multi-module build, run it per module, each with its
+own `target/deps`. A module that depends on a sibling compiles against the
+sibling's jar from the host build, so to use edits to the sibling made in here,
+compile it first and put its `target/classes` ahead of `$deps`):
+
+```bash
+jar=/opt/junit/junit-platform-console-standalone.jar
+deps="$(find target/deps -name '*.jar' | paste -sd: -)"
+javac -d target/classes -cp "$deps" $(find src/main/java -name '*.java')
+javac -d target/test-classes -cp "target/classes:$deps:$jar" $(find src/test/java -name '*.java')
+java -jar /opt/junit/junit-platform-console-standalone.jar execute \
+    --class-path "target/classes:target/test-classes:$deps" --scan-class-path
+```
+
+The limits of building outside:
+
+- Annotation processors run only if they are on the processor path
+  (`-processorpath`), and generated sources must come from the host build.
+- Kotlin and Groovy are out of scope.
+- JUnit 4 tests run on the bundled Vintage engine against the bundled JUnit 4.13.2,
+  whatever 4.x the project declares.
+- Java ignores `HTTPS_PROXY`, so a test that opens a network connection fails rather
+  than being held for approval.
+
+A test JVM's default heap is a quarter of the container's memory, about 1 GB of
+the default `SANDBOX_MEMORY=4g`, so a suite that outgrows it fails with
+`OutOfMemoryError` rather than getting the whole container killed. Give it more
+with `java -Xmx2g -jar …`, and when the project needs more than the container
+holds, raise `SANDBOX_MEMORY` for the Java launch rather than for every session.
+
+`make rebuild` and `make verify-build` build only the default image, and CI never
+builds the variant. After pulling, rebuild it yourself with
+`SANDBOX_JDK=21 ./run-claude-sandbox.sh --build-only`, which rebuilds without
+launching; until then it keeps the
+firewall and boundary scripts it was built with. `SANDBOX_JDK=21 make
+check-boundary` asserts containment from inside the variant.
 
 ## Plugins and marketplaces
 

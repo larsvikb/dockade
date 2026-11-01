@@ -541,5 +541,72 @@ class RefsTests(unittest.TestCase):
         self.assertEqual(len(self.mounts(f"{self.src}/b/docs")), 1)
 
 
+# What run-claude-sandbox.sh does with them: pick the tag, then build it.
+_JDK_HARNESS = ('set -euo pipefail; source "$1"; sc_jdk_variant claude-sandbox; '
+                'sc_build_image "$SC_IMAGE" claude-sandbox "$2" '
+                '${SC_BUILD_ARGS[@]+"${SC_BUILD_ARGS[@]}"}')
+
+
+@unittest.skipUnless(_BASH or _STRICT, "bash is not installed")
+class JdkVariantTests(unittest.TestCase):
+    """``sc_jdk_variant`` and ``sc_build_image``: ``SANDBOX_JDK`` chooses the tag and
+    the build, and anything else is the default image exactly as before."""
+
+    def build(self, jdk: str | None, no_cache: str = "") -> _Run:
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = Path(tmp) / "docker"
+            stub.write_text(_DOCKER_STUB)
+            stub.chmod(0o755)
+            log = Path(tmp) / "calls.log"
+            log.touch()
+            env = {k: v for k, v in os.environ.items() if k != "SANDBOX_JDK"}
+            env.update(PATH=f"{tmp}{os.pathsep}{env['PATH']}", STUB_LOG=str(log))
+            if jdk is not None:
+                env["SANDBOX_JDK"] = jdk
+            proc = subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
+                [_BASH, "-c", _JDK_HARNESS, "sc_jdk_variant", str(LIB), no_cache],
+                capture_output=True, text=True, env=env, timeout=60)
+            return _Run(proc.returncode, proc.stderr, log.read_text().splitlines())
+
+    @staticmethod
+    def expected(tag: str, *, no_cache: bool = False, jdk: str | None = None) -> str:
+        parts = ["build", "-t", tag]
+        if no_cache:
+            parts.append("--no-cache")
+        parts += ["--build-arg", f"USER_UID={os.getuid()}",
+                  "--build-arg", f"USER_GID={os.getgid()}"]
+        if jdk:
+            parts += ["--build-arg", f"JDK={jdk}"]
+        parts += ["-f", f"{ROOT}/claude-sandbox/Dockerfile", str(ROOT)]
+        return " ".join(parts)
+
+    def test_unset_or_empty_builds_the_default_image_as_before(self):
+        for jdk in (None, ""):
+            with self.subTest(jdk=jdk):
+                run = self.build(jdk)
+                self.assertEqual(run.status, 0, run.stderr)
+                self.assertEqual(run.docker_calls, [self.expected("claude-sandbox")])
+
+    def test_a_major_version_adds_the_build_arg_and_suffixes_the_tag(self):
+        run = self.build("21")
+        self.assertEqual(run.status, 0, run.stderr)
+        self.assertEqual(run.docker_calls, [self.expected("claude-sandbox-jdk21", jdk="21")])
+
+    def test_no_cache_combines_with_the_variant(self):
+        run = self.build("21", "--no-cache")
+        self.assertEqual(run.status, 0, run.stderr)
+        self.assertEqual(run.docker_calls,
+                         [self.expected("claude-sandbox-jdk21", no_cache=True, jdk="21")])
+
+    def test_anything_but_a_major_version_is_refused_and_builds_nothing(self):
+        # It becomes part of an apt package name and an image tag.
+        for jdk in ("latest", "21.0", "021", "0", " 21", "21\n", "21;x", "-1"):
+            with self.subTest(jdk=jdk):
+                run = self.build(jdk)
+                self.assertEqual(run.status, 1, run.stderr)
+                self.assertIn("REFUSING SANDBOX_JDK=", run.stderr)
+                self.assertEqual(run.docker_calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()

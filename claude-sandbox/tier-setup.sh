@@ -44,6 +44,26 @@ refs_note() {
 REFS_NOTE
 }
 
+# The JDK variant's toolchain, as one instruction bullet naming the versions its
+# build recorded in <version_file> (claude-sandbox/Dockerfile); nothing in an image
+# built without it. Read from the file, so no JVM starts at boot.
+# shellcheck disable=SC2016  # the backticks are markdown, not command substitution
+jdk_note() {
+    local versions=() list
+    [[ -f "$1" ]] || return 0
+    mapfile -t versions < "$1"
+    list="$(printf '`%s`, ' "${versions[@]}")"
+    printf -- '- **A JDK and the JUnit 5 console launcher are installed**: %s.\n' "${list%, }"
+    cat <<'JDK_NOTE'
+  Compile with `javac`, then run the tests with
+  `java -jar /opt/junit/junit-platform-console-standalone.jar execute --class-path <classes>:<deps> --scan-class-path`.
+  There is no Maven or Gradle: dependencies come from the workspace, where the
+  host-side build copied them. A test JVM that runs out of heap takes `-Xmx`
+  before `-jar`; its default is a quarter of the container's memory. Java ignores
+  `HTTPS_PROXY`, so a test that opens a network connection fails.
+JDK_NOTE
+}
+
 # What launch settings rendered by the sandbox user may hold before root installs
 # them: the two keys and nothing else, each a non-empty object, every plugin set
 # to true, and marketplace names in the alphabet the render allows, since they
@@ -169,7 +189,7 @@ EOF
         install -o root -g root -m 0644 /dev/stdin "$LAUNCH_SETTINGS" <<<"$launch"
     fi
 
-    # The managed note, for the refs and the plugins. In /etc for the gateway
+    # The managed note, for the refs, the plugins and the JDK. In /etc for the gateway
     # pointer's reason and a sharper one: every concurrent tier-1 sandbox shares the
     # config volume, and each launch has its own SANDBOX_REFS and plugins, so a note
     # there would describe whichever sibling booted last. A CLAUDE.md in
@@ -181,6 +201,10 @@ EOF
     plugin_note="$(launch_note "$launch")"
     if [[ -n "$plugin_note" ]]; then
         note="${note:+$note$'\n'}$plugin_note"
+    fi
+    jdk="$(jdk_note /etc/claude-code/jdk-version)"
+    if [[ -n "$jdk" ]]; then
+        note="${note:+$note$'\n'}$jdk"
     fi
     if [[ -n "$note" ]]; then
         install -o root -g root -m 0644 /dev/stdin "$MANAGED_NOTE" <<<"$note"

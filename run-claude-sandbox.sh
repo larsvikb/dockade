@@ -44,7 +44,10 @@ source "$SCRIPT_DIR/sandbox-lib.sh"
 
 # Image tag to build/run. Override with SANDBOX_IMAGE to A/B-test a variant
 # (e.g. an alternate base image) without clobbering the default `claude-sandbox`.
-IMAGE_NAME="${SANDBOX_IMAGE:-claude-sandbox}"
+# SANDBOX_JDK=21 adds a JDK and suffixes the tag (`claude-sandbox-jdk21`); see
+# sc_jdk_variant and README.md, "Java in the sandbox".
+sc_jdk_variant "${SANDBOX_IMAGE:-claude-sandbox}"
+IMAGE_NAME="$SC_IMAGE"
 IMAGE_DIR="claude-sandbox"
 CONFIG_VOLUME="claude-sandbox-config"
 SANDBOX_NET="sandbox-net"
@@ -94,7 +97,7 @@ CACHE_FLAG=""
 # Deliberately ahead of the workspace guard below — a pure build neither mounts a
 # workspace nor needs one, so validating it (and possibly refusing) would be noise.
 if [[ "$BUILD_ONLY" == "true" ]]; then
-    sc_build_image "$IMAGE_NAME" "$IMAGE_DIR" "$CACHE_FLAG"
+    sc_build_image "$IMAGE_NAME" "$IMAGE_DIR" "$CACHE_FLAG" ${SC_BUILD_ARGS[@]+"${SC_BUILD_ARGS[@]}"}
     echo "Built $IMAGE_NAME; not launching (--build-only)."
     exit 0
 fi
@@ -104,7 +107,7 @@ WORKSPACE="$SC_WORKSPACE"
 sc_refs
 
 if [[ "$REBUILD" == "true" ]] || ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
-    sc_build_image "$IMAGE_NAME" "$IMAGE_DIR" "$CACHE_FLAG"
+    sc_build_image "$IMAGE_NAME" "$IMAGE_DIR" "$CACHE_FLAG" ${SC_BUILD_ARGS[@]+"${SC_BUILD_ARGS[@]}"}
 fi
 
 # Tier 1 permits the standalone fallback: with no compose infra, a plain
@@ -242,6 +245,7 @@ sc_marketplaces "$WORKSPACE"
 sc_plugin_allowlist
 
 echo "Sandbox:   $SC_CONTAINER_NAME (tier 1 — Claude)"
+echo "Image:     $IMAGE_NAME"
 echo "Workspace: $WORKSPACE -> /workspace"
 echo "Refs:      $SC_REFS_DESC"
 echo "Markets:   $SC_MARKETPLACE_DESC"

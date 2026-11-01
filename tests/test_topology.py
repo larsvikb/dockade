@@ -1756,6 +1756,19 @@ class EveryImageIsBuiltTests(unittest.TestCase):
                 with self.subTest(service=svc, profile=profile):
                     self.assertIn(f"--profile {profile} build", recipe)
 
+    def test_the_sandbox_builds_are_the_default_images(self):
+        # Neither target builds the JDK variant, so a SANDBOX_JDK exported for a Java
+        # project must not reach a launcher there and build it in the default's place.
+        makefile = (ROOT / "Makefile").read_text()
+        for target in ("verify-build", "rebuild"):
+            recipe = re.search(rf"^{target}:.*?(?=\n\S)", makefile, re.M | re.S).group(0)
+            runs = [line for line in recipe.splitlines()
+                    if '"./$$launcher"' in line and not line.lstrip().startswith("#")]
+            with self.subTest(target=target):
+                self.assertTrue(runs, f"{target} no longer runs the launchers")
+                for line in runs:
+                    self.assertIn('SANDBOX_JDK= "./$$launcher" --build-only', line)
+
 
 if __name__ == "__main__":
     unittest.main()

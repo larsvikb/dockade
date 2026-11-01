@@ -712,6 +712,38 @@ The package is a single one with no dependencies, 14 MB installed. Through one v
 of skew, 1.63 drives the 154 shell through the whole UI harness scenario; nothing was
 run on Playwright's own 153 to compare against.
 
+## The JDK variant: what it costs, and what its JUnit jar bundles
+
+Measured 2026-11-01 on the reference machine: `openjdk-21-jdk-headless` (`javac
+21.0.13`) and `junit-platform-console-standalone` 1.13.4.
+
+**Size.** `claude-sandbox-jdk21` came out 2012 MiB against the default image's
+1721 MiB: **291 MiB** for the JDK and the jar.
+
+**Memory stays small at the sizes measured.** Each run was a `docker run` of the
+variant with the launcher's resource flags (4 GiB with no swap, `--cpus` at most 4,
+512 pids) and `--network none`, not a launcher session.
+`memory.peak` is the container cgroup's peak, page cache included.
+- Compiling a 4-test JUnit 5 sample and running it with the console launcher peaked at
+  **108 MiB**.
+- Compiling a real libGDX `core` module (4 source files against 3 dependency jars,
+  copied by Gradle on the host; it had no tests) peaked at **85 MiB**.
+
+Neither run approaches the JVM's default heap, a quarter of the container's limit;
+no larger suite was measured.
+
+**The console jar bundles JUnit 4, not only JUnit 5.** Its
+`META-INF/shadowed-artifacts` lists:
+- `junit:junit:4.13.2` and `org.hamcrest:hamcrest-core:1.3`;
+- of its release, the Jupiter api, engine and params; eight Platform artifacts
+  (commons, console, engine, launcher, reporting, suite-api, suite-commons,
+  suite-engine); and the Vintage engine, but not `junit-platform-testkit`;
+- `opentest4j`, `apiguardian-api` and `open-test-reporting-tooling-spi`.
+
+A project's own copies of these would sit on the classpath beside the bundled ones,
+which is why the README's Maven copy excludes `junit` and `hamcrest-core` along with
+the JUnit 5 groups.
+
 ## Publishing a host port: the private range is the wrong instinct on WSL2
 
 Choosing a port for Docker to publish on the host, the principled-looking answer is

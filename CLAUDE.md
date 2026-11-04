@@ -67,7 +67,9 @@ only the invariants and conventions for working in the repo.
   - once the plan's review rounds are done, `tasks__submit_plan`;
   - before the first edit on one of its tasks, `tasks__claim_work`;
   - after each commit, `tasks__update`;
-  - once the review passes, `tasks__submit_work`.
+  - once the review passes, `tasks__submit_work`;
+  - once a review's triage and host checks are done, its record with `tasks__add_note`
+    (`.claude/skills/review-before-push/SKILL.md`, "Record it").
 
   A session that briefs a worker claims the task itself and puts the token in the
   brief; the worker updates after each commit, and the briefing session submits once

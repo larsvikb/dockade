@@ -13,7 +13,10 @@ This skill brings it what that context lacks, and deals with what comes back.
 The reviewer reads commits, in a clone of its own. Everything under review is
 committed on the branch, and the commit body is the PR description, reviewed with the
 diff: `## What` the change is and why, and `## Checked`, what was tested and what that
-showed, and what was not run. Never what the maintainer should run.
+showed, and what was not run. Never what the maintainer should run. It names its
+task in words, as `Registry task N.`: a squash merge drops the branch, a subject's
+`(#N)` reads as a PR number, which shares the task ids' range, and the review's record
+sits on that task (step 6).
 
 ## 2. Pick the tier
 
@@ -114,13 +117,35 @@ them to the maintainer after triage, since a fix can change what the host must c
   a kind; one already filed gets a note instead. With the registry out of reach, ask
   the maintainer to start it (`make tasks-up`), and keep the report until they are
   proposed.
-- Add one line to `local-review-log.md` — the PR, the reviewer and how long it took,
-  the findings in the diff by severity and what became of them, anything outside the
-  diff. It is the maintainer's untracked file in the main checkout, and a worktree
-  session cannot write it: write an anchored script that makes the edit, dry-run it
-  on a copy, and hand it to the maintainer to run from the main checkout.
-- When the log shows a pattern that changes the reviewer's brief or this skill, the
-  commit that changes it states the evidence in its message: the log is untracked, and
-  the reason for a committed change must not be. A finding about reviews that would
-  hold in another repo is evidence for `NOTES.md` instead.
-- Delete the report once the branch is pushed and its leftovers are proposed.
+- Post the review's record on its task with `tasks__add_note`, not flagged for the
+  operator, once triage and any host checks the review led to are done, from whichever
+  checkout you are in: it takes no token and works in any state, so a commit reviewed
+  after `submit_work` is recorded the same way, and the record stays apart from that
+  hand-in. One record per review of a commit, every pass in it, within a note's 4000
+  characters (the registry refuses a longer one; trim what is outside the diff first):
+  - first line exactly `Review record: YYYY-MM-DD, <branch>`, the session's local date;
+  - second line the tier and the reviewer's time per pass;
+  - then the findings in the diff by severity and what became of each, the host checks
+    and what they showed, and what was found outside the diff, by the task it went to.
+
+  Write it as a past-tense account that names tasks, never as instructions: search
+  carries notes to sessions on unrelated work. A commit covering several tasks carries
+  the record on one and `Reviewed with task N` on the others, so a review counts once.
+  Work with no task gets no record. With the registry out of reach, ask for `make tasks-up`
+  as for leftovers, and keep the report until the record is posted.
+- Read records side by side with `tasks__search_tasks` for the marker with a date
+  prefix, never bare, since a note quoting the template matches it: `Review record:
+  YYYY-MM` for a month, or a day once `total` passes 50, as a search keeps the 50
+  highest task ids. Note ids rise across tasks, so they give the reviews' order;
+  `tasks__task_notes` with an id plus one as `before` returns that record as the last
+  of up to 20 notes. A skipped record leaves no trace; the spot check is each
+  task's `submit_work` note, which `tasks__get_task` marks by its move, against its
+  record. Reviews
+  before records are in the main checkout's `local-review-log.md`, a frozen archive
+  whose header no longer applies.
+- When the records show a pattern that changes the reviewer's brief or this skill, the
+  commit that changes it states the evidence in its message: the records are not in
+  git, and the reason for a committed change must be. A finding about reviews that
+  would hold in another repo is evidence for `NOTES.md` instead.
+- Delete the report once the branch is pushed, its leftovers proposed and, if it has
+  a task, its record posted.

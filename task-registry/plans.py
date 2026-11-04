@@ -123,23 +123,25 @@ def check_answers(decisions: list[dict], answers: object) -> list[dict]:
                       f"plan, in its order")
     checked = []
     for i, (decision, answer) in enumerate(zip(decisions, answers, strict=True)):
-        where = f"answers[{i}]"
-        _check_fields(where, answer, _ANSWER_FIELDS, frozenset())
+        # From 1, as the tasks page numbers decisions: it shows a refusal as it came.
+        # Option positions stay the wire's, from 0, and the refusal naming them says so.
+        where = f"decision {i + 1}"
+        _check_fields(f"{where}'s answer", answer, _ANSWER_FIELDS, frozenset())
         options, other = answer.get("options", ()), answer.get("other")
         if (not isinstance(options, (list, tuple))
                 or any(type(o) is not int or not 0 <= o < len(decision["options"])
                        for o in options)
                 or len(set(options)) != len(options)):
-            raise Refused(f"{where}.options names options of decision {i} by position, "
+            raise Refused(f"{where}'s options are named by position, counted from 0: "
                           f"0 to {len(decision['options']) - 1}, each once")
-        tasks.check_text(other, OTHER_MAX, f"{where}.other")
+        tasks.check_text(other, OTHER_MAX, f"{where}'s other text")
         chosen = len(options) + (other is not None)
         if decision["multi_select"] and chosen == 0:
-            raise Refused(f"{where} answers a multi-select decision with at least one "
-                          f"of its options, an other text, or both")
+            raise Refused(f"{where} is a multi-select decision, answered with at least "
+                          f"one of its options, an other text, or both")
         if not decision["multi_select"] and chosen != 1:
-            raise Refused(f"{where} answers a single-choice decision with one option or "
-                          f"an other text, not both")
+            raise Refused(f"{where} is a single-choice decision, answered with exactly "
+                          f"one: an option or an other text")
         checked.append({"options": sorted(options), "other": other})
     return checked
 

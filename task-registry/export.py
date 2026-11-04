@@ -125,7 +125,7 @@ def render(conn: sqlite3.Connection, now: float) -> str:
         "and more in a fenced block, with control, format and separator characters "
         "spelled out as `\\uXXXX`, so none of it renders as markdown. A plan's "
         "decisions and their options are numbered by position, from 0, as the operator "
-        "API's approve names them.",
+        "API's approve takes them.",
     ]
     for repo in repos:
         facts = []
@@ -250,7 +250,7 @@ def _decisions(conn: sqlite3.Connection) -> dict[int, list[dict]]:
 def _decision(decision: dict) -> list[str]:
     d, answer = decision["row"], decision["answer"]
     kind = "multi-select" if d["multi_select"] else "single choice"
-    # Numbered by position, from 0, as `approve` names a decision and its options.
+    # Numbered by position, from 0, as `approve` takes a decision and its options.
     lines = ["", f"Decision at position {int(d['position'])}, {kind}:", "",
              block(d["question"]),
              "", "Why the refiner could not settle it:", "", block(d["why"])]

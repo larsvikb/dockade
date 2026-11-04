@@ -594,7 +594,8 @@ class ExportTests(_Stores):
         text = self.render()
         first = second["plan"] - 1
         mine = text[text.index(f"Plan {first},"):text.index(f"Plan {second['plan']},")]
-        self.assertIn("numbered by position, from 0, as the operator API's approve", text)
+        self.assertIn("numbered by position, from 0, as the operator API's approve takes them",
+                      text)
         self.assertIn("Decision at position 0, single choice:\n\n```text\n"
                       f"{DECISION['question']}\n```", mine)
         self.assertIn(f"Why the refiner could not settle it:\n\n```text\n"

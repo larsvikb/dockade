@@ -437,6 +437,37 @@ class ApproveTests(_Store):
         reply = self.approve(task, [{"other": "x" * plans.OTHER_MAX}, ASSUMED[1]])
         self.assertEqual(reply["state"], "proposed")
 
+    def test_a_refusal_names_its_decision_from_1_as_the_page_does(self):
+        # Each on the second decision, the single choice second in its own plan.
+        second = {
+            "an answer not an object": ((DECISION, MULTI), 0,
+                                        "decision 2's answer is an object of "),
+            "an unknown field": ((DECISION, MULTI), {"options": [0], "why": "x"},
+                                 "decision 2's answer has no field 'why'"),
+            "an other past its cap": ((DECISION, MULTI),
+                                      {"other": "x" * (plans.OTHER_MAX + 1)},
+                                      "decision 2's other text is 1 to "),
+            "nothing on a multi-select": (
+                (DECISION, MULTI), {"options": []},
+                "decision 2 is a multi-select decision, answered with at least one of "
+                "its options, an other text, or both"),
+            "nothing on a single choice": (
+                (MULTI, DECISION), {},
+                "decision 2 is a single-choice decision, answered with exactly one: an "
+                "option or an other text"),
+        }
+        for case, (decisions, answer, opening) in second.items():
+            with self.subTest(case):
+                task = self.refined(decisions)
+                first = {"options": [0]}
+                reason = self.refused(self.approve, task, [first, answer]).reason
+                self.assertTrue(reason.startswith(opening), reason)
+                self.assertNotIn("answers[", reason)
+        task = self.refined()
+        reason = self.refused(self.approve, task, [ASSUMED[0], {"options": [3]}]).reason
+        self.assertEqual(reason, "decision 2's options are named by position, counted "
+                                 "from 0: 0 to 2, each once")
+
     def test_only_a_refined_task_whose_plan_is_unanswered_is_approved(self):
         proposed = agent.propose(ALICE, "widgets", "P", "B")["task"]
         for task in (proposed, self.task):

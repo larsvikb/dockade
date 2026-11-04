@@ -2222,6 +2222,32 @@ console.log(JSON.stringify({cases, wire, blank, assumed,
                             empty: m.blankText(""), not_text: m.blankText(null)}));
 """
 
+# The approve the page builds with an "other" text on the second decision, which it
+# checks only for being blank, and how it numbers that decision when one is missing.
+_REFUSAL_PROBE = r"""
+import { pathToFileURL } from "node:url";
+const t = await import(pathToFileURL(`${process.env.DOCKADE_UI_DIR}/tasks.js`).href);
+const m = await import(pathToFileURL(`${process.env.DOCKADE_UI_DIR}/moves.js`).href);
+const decisions = JSON.parse(process.env.DOCKADE_DECISIONS);
+const assumed = m.assumedChoices(decisions);
+console.log(JSON.stringify({
+  answers: m.approveAnswers(decisions, [assumed[0], {...assumed[1], other: true,
+                                                     text: process.env.DOCKADE_TEXT}]),
+  incomplete: t.incompleteText([1]),
+}));
+"""
+
+# How the page draws the operator API's answer to that approve.
+_REFUSED_PROBE = r"""
+import { pathToFileURL } from "node:url";
+const t = await import(pathToFileURL(`${process.env.DOCKADE_UI_DIR}/tasks.js`).href);
+const m = await import(pathToFileURL(`${process.env.DOCKADE_UI_DIR}/moves.js`).href);
+const body = JSON.parse(process.env.DOCKADE_BODY);
+const outcome = m.writeOutcome({status: Number(process.env.DOCKADE_STATUS), body});
+console.log(JSON.stringify({outcome, text: t.outcomeText(
+  {kind: "approve", verb: "approve", predicted: "proposed"}, outcome, body.detail).text}));
+"""
+
 
 @unittest.skipIf(not _NODE and not _STRICT,
                  "node is not installed — skipping app.js unit tests")
@@ -2319,6 +2345,34 @@ class ApproveRuleTests(_OperatorStore):
                                  [(a["options"], a["other"]) for a in body["answers"]])
         self.assertEqual(_reads.get_task(self.refined())["plan"]["decisions"],
                          self.DECISIONS)
+
+    def test_a_refusal_names_the_decision_the_page_numbers(self):
+        long = "x" * (_plans.OTHER_MAX + 1)
+        page = self.node(_REFUSAL_PROBE, DOCKADE_DECISIONS=json.dumps(self.DECISIONS),
+                         DOCKADE_TEXT=long)
+        task = self.refined()
+        req = _api.Approve(revision=_reads.get_task(task)["revision"],
+                           answers=tuple(_api.Answer(**a) for a in page["answers"]))
+        reply = _api.approve(task, req, ThroughTheRelay())
+        self.assertEqual(page["answers"][1]["other"], long)
+        drawn = self.node(_REFUSED_PROBE, DOCKADE_STATUS=str(reply.status_code),
+                          DOCKADE_BODY=json.dumps(reply.body))
+        self.assertEqual(drawn["outcome"], "refused")
+        counted = re.fullmatch(r".*: decision (\d+) not yet\..*", page["incomplete"]).group(1)
+        self.assertIn(f"Approve: refused. decision {counted}'s other text is 1 to",
+                      drawn["text"])
+        self.assertNotIn("answers[", drawn["text"])
+        self.assertEqual(_reads.get_task(task)["state"], "refined")
+
+    @staticmethod
+    def node(script: str, **env: str) -> dict:
+        proc = subprocess.run(  # noqa: S603 (absolute path, fixed args, as _probe)
+            [_NODE, "--input-type=module", "-e", script],
+            env={**os.environ, "DOCKADE_UI_DIR": str(_served_dir(TASKS_DIR)), **env},
+            capture_output=True, text=True, timeout=120, check=False)
+        if proc.returncode != 0:
+            raise AssertionError("importing the page under node failed:\n" + proc.stderr)
+        return json.loads(proc.stdout)
 
 
 class TaskDecisionSourceTests(unittest.TestCase):

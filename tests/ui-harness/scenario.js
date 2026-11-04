@@ -7,7 +7,7 @@
 // A PR that moves a surface out of `start()` adds the steps that exercise it here,
 // in the PR that moves it.
 
-import { HOLDS } from "./backend.js";
+import { HOLDS, NOW_MS, RULES, abortConfig, failRules, setRules } from "./backend.js";
 
 const egressCard = page => page.locator("#pending .card:not(.tool)");
 const toolCard = page => page.locator("#pending .card.tool");
@@ -125,6 +125,27 @@ export const STEPS = [
     accept();
     await page.click('#rules button.revoke[data-rule="2"]');
   }],
+  ["rule edit opened and cancelled", async ({ page }) => {
+    await page.click('#rules button.edit[data-rule="2"]');
+    await page.click("#rule-cancel");
+  }],
+  // A create, each of the three ways the backend answers one (backend.js).
+  ["rule created", async ({ page, accept }) => {
+    await page.fill("#rule-pattern", "files.example.com");
+    accept();
+    await page.click("#rule-add");
+  }],
+  ["rule created, already there", async ({ page, accept }) => {
+    await page.fill("#rule-pattern", "already.example");
+    accept();
+    await page.click("#rule-add");
+  }],
+  ["rule create refused", async ({ page, accept }) => {
+    await page.fill("#rule-pattern", "refused.example");
+    await page.selectOption("#rule-action", "allow");
+    accept();
+    await page.click("#rule-add");
+  }],
 
   // The decisions view (audit.js): the filters, the switch to the record, its pager,
   // and a filter the backend refuses. A filter waits for its timer, and the page's
@@ -175,5 +196,44 @@ export const STEPS = [
   ["lease group closed", async ({ page }) => {
     await page.click("#leases button.group-toggle");
   }],
+
+  // The Policy badge's unseen mark (egress-rules.js), and the rules and config reads
+  // failing. What these change in backend.js stays changed, so they run last. The
+  // rules read changes behind a card's persist, whose refresh is what notices it.
+  ["rules change behind a persist", async ({ page, push }) => {
+    setRules([...RULES, {
+      id: 3, action: "allow", pattern: "registry.example.org", scope: "exact host",
+      client_class: "agent", source: "operator", created_at: NOW_MS / 1000 }]);
+    await push([{ ...HOLDS[0], id: "egress-2" }]);
+    await egressCard(page).locator('button[data-action="allow_persist"]').click();
+    await egressCard(page).locator(".confirm button.confirmgo").click();
+  }],
+  ["audit tab, the mark stays", async ({ page }) => { await page.click("#tab-audit"); }],
+  ["policy tab, the mark clears", async ({ page }) => {
+    await page.click("#tab-policy");
+  }],
+  // A change seen while the Policy tab is up is already seen: no mark after leaving.
+  ["rules change on the policy tab", async ({ clock }) => {
+    setRules([...RULES, {
+      id: 4, action: "block", pattern: "tracker.example", scope: "exact host",
+      client_class: "agent", source: "operator", created_at: NOW_MS / 1000 }]);
+    await clock(4000);
+  }],
+  ["audit tab, no mark", async ({ page }) => { await page.click("#tab-audit"); }],
+  ["policy tab, for the failures", async ({ page }) => { await page.click("#tab-policy"); }],
+  ["the rules poll fails", async ({ clock }) => {
+    failRules();
+    await clock(4000);
+  }],
+  // A config read that throws, after one that answered: the form keeps its classes.
+  ["the stream drops, and the config read aborts on reconnect", async ({ drop, clock }) => {
+    abortConfig();
+    await drop();
+    await clock(1000);
+  }],
+  ["the form is still usable", async ({ page }) => {
+    await page.fill("#rule-pattern", "after.example");
+  }],
+  ["reload, the config and rules reads failing", async ({ load }) => { await load(); }],
 
 ];

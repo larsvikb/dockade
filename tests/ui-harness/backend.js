@@ -30,7 +30,7 @@ const AUDIT = {
   total: 3, filtered: false, next: null,
 };
 
-const RULES = [
+export const RULES = [
   { id: 1, action: "allow", pattern: ".pypi.org", scope: "pypi.org and subdomains",
     client_class: "agent", source: "seed", created_at: NOW - 86400 },
   { id: 2, action: "block", pattern: "evil.example", scope: "exact host",
@@ -151,8 +151,15 @@ const MCP_WRITES = [
   [/^\/api\/mcp\/pins\/[^/]+\/revoke$/, () => ({ ok: true })],
 ];
 
-// A standing rule's edit and revoke, answered as ones that landed on the fixture's rule.
+// A standing rule's create, edit and revoke, answered as ones that landed on the
+// fixture's rule. A create's answer follows its pattern: one already there
+// (`created: false`), one refused because a rule appeared under the form (409), and any
+// other written.
 const RULE_WRITES = [
+  [/^\/api\/egress\/rules$/, body => (body.pattern === "refused.example"
+    ? { status: 409, json: { ok: false, detail: "a rule for refused.example already "
+                                                + "exists for agent" } }
+    : { ok: true, created: body.pattern !== "already.example", ...body })],
   [/^\/api\/egress\/rules\/[^/]+\/revoke$/, () => ({ ok: true })],
   [/^\/api\/egress\/rules\/([^/]+)\/edit$/, (body, [, id]) => {
     const rule = RULES.find(r => String(r.id) === decodeURIComponent(id));
@@ -162,10 +169,24 @@ const RULE_WRITES = [
   }],
 ];
 
-// `{status, json}` for a request, or null for one this backend does not know — which
-// the harness records, since a path the page asks for and no fixture answers is
-// either a fixture to add or a change in what the page asks.
+// What the scenario's last steps change: the rules read answering a new list or
+// failing, and the config read dropped by the network. Each stays in force for the rest
+// of the run once a step sets it, which is why those steps come last.
+let rulesFailing = false;
+let configAborted = false;
+export function setRules(rows) { GETS["/api/egress/rules"] = rows; }
+export function failRules() { rulesFailing = true; }
+export function abortConfig() { configAborted = true; }
+
+// `{status, json}` for a request, `{abort: true}` for one the network drops, or null for
+// one this backend does not know — which the harness records, since a path the page
+// asks for and no fixture answers is either a fixture to add or a change in what the
+// page asks.
 export function respond(method, path, body, query) {
+  if (path === "/api/config" && configAborted) return { abort: true };
+  if (method === "GET" && path === "/api/egress/rules" && rulesFailing) {
+    return { status: 503, json: { detail: "upstream unavailable" } };
+  }
   // A filter the backend refuses, said in its own words, as `_bad_filter` does.
   if (path.startsWith("/api/audit") && query.get("q") === "refuse me") {
     return { status: 400, json: { detail: "q: the search text is longer than allowed" } };
@@ -188,6 +209,9 @@ export function respond(method, path, body, query) {
   }
   const write = method === "POST"
     && [...MCP_WRITES, ...RULE_WRITES].find(([re]) => re.test(path));
-  if (write) return { status: 200, json: write[1](body, path.match(write[0])) };
+  if (write) {
+    const answer = write[1](body, path.match(write[0]));
+    return "status" in answer ? answer : { status: 200, json: answer };
+  }
   return null;
 }

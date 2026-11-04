@@ -127,6 +127,72 @@ class DecideTests(unittest.TestCase):
         self.assertEqual(cp.policy._decide("example.com.", CLASS)[0], "allow")
 
 
+class LandingTests(unittest.TestCase):
+    """``_landing``: where the hosts a stored pattern names land, in ``_decide``'s
+    own pairs. The audit reasons of a rule's create and revoke are built from it, so
+    a pair that disagrees with ``_decide`` is an audit row stating the wrong decision.
+    "fresh.example.com" stands for a subdomain no narrower rule or lease names."""
+
+    def setUp(self):
+        cp.store._init_db()
+        _set_rules([])
+        _set_leases([])
+
+    def _landing(self, pattern, client_class=CLASS):
+        with cp.store._connect() as conn:
+            return cp.policy._landing(conn, pattern, client_class)
+
+    def test_an_exact_pattern_lands_as_decide_says(self):
+        for rules, leases in (([], []), ([(".example.com", "allow")], []),
+                              ([(".example.com", "block")], []),
+                              ([], [("api.example.com", 300)])):
+            with self.subTest(rules=rules, leases=leases):
+                _set_rules(rules)
+                _set_leases(leases)
+                self.assertEqual(self._landing("api.example.com"),
+                                 (cp.policy._decide("api.example.com", CLASS), None))
+
+    def test_a_wildcard_reports_apex_and_subtree_apart(self):
+        # An exact rule and a live lease on the apex each land it apart from the
+        # subdomains; both answers are `_decide`'s, for the apex and for a fresh one.
+        for rules, leases in (([("example.com", "block")], []),
+                              ([], [("example.com", 300)])):
+            with self.subTest(rules=rules, leases=leases):
+                _set_rules(rules)
+                _set_leases(leases)
+                apex, subtree = self._landing(".example.com")
+                self.assertEqual(apex, cp.policy._decide("example.com", CLASS))
+                self.assertEqual(subtree,
+                                 cp.policy._decide("fresh.example.com", CLASS))
+                self.assertNotEqual(apex[0], subtree[0])
+
+    def test_apex_and_subtree_are_equal_when_one_wider_rule_decides_both(self):
+        _set_rules([(".com", "block")])
+        apex, subtree = self._landing(".example.com")
+        self.assertEqual(apex, subtree)
+
+    def test_the_subtree_ignores_narrower_rules_but_honours_a_wider_wildcard(self):
+        # `.api.example.com` and `www.example.com` name only part of the subtree, so
+        # they decide no fresh subdomain; `.example.com` covers all of `.a.example.com`.
+        _set_rules([(".api.example.com", "block"), ("www.example.com", "block")])
+        self.assertEqual(self._landing(".example.com")[1][0], "hold")
+        _set_rules([(".example.com", "allow")])
+        self.assertEqual(self._landing(".a.example.com")[1],
+                         cp.policy._decide("fresh.a.example.com", CLASS))
+        self.assertEqual(self._landing(".a.example.com")[1][0], "allow")
+
+    def test_a_block_beats_an_allow_in_the_subtree(self):
+        _set_rules([(".example.com", "allow"), (".com", "block")])
+        self.assertEqual(self._landing(".example.com")[1][0], "deny")
+
+    def test_other_classes_rules_are_ignored_but_named_in_the_hold(self):
+        _set_rules([(".example.com", "allow", "other")])
+        apex, subtree = self._landing(".example.com")
+        self.assertEqual(apex[0], "hold")
+        self.assertEqual(subtree, cp.policy._decide("fresh.example.com", CLASS))
+        self.assertIn("matched only for: other", subtree[1])
+
+
 def _set_tool_rules(rules, servers=()):
     """Replace the tool_rules table with (server, tool, action) tuples, and register
     every server they name — plus any in ``servers`` — as ENABLED.

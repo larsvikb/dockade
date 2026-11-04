@@ -684,12 +684,12 @@ class HealthProbeTests(unittest.TestCase):
 class RevokeRuleTests(_CPTestCase):
     """The other half of a governance plane that could grant but never take back.
 
-    The asymmetry is the point: revoking an ALLOW tightens (the host reverts to
-    unknown and is held), revoking a BLOCK loosens — an explicit operator denial
-    becomes a request that can be approved by someone who never knew it had been
-    refused. The backend treats both as the same operation and the UI carries the
-    distinction in its confirm; what the backend owes is that the operation is
-    recorded, attributed, and refused for seed rules."""
+    The asymmetry is the point: revoking an ALLOW tightens (with no other rule, the
+    host reverts to unknown and is held), revoking a BLOCK loosens — an explicit
+    operator denial becomes a request that can be approved by someone who never knew
+    it had been refused. The backend treats both as the same operation and the UI
+    carries the distinction in its confirm; what the backend owes is that the
+    operation is recorded, attributed, and refused for seed rules."""
 
     def _rule(self, pattern, action="allow", source="operator"):
         with cp.store._connect() as conn:
@@ -799,13 +799,102 @@ class RevokeRuleTests(_CPTestCase):
         self.assertIn("peer=172.31.0.9", kwargs["actor"])
         self.assertIn("allow rule revoked", kwargs["reason"])
 
-    def test_the_audit_reason_says_what_the_host_reverts_to(self):
-        # Both directions land on `hold`; the reason is the only thing that says the
-        # rule is gone rather than replaced.
-        rid = self._rule("evil.example", "block")
+    def test_the_audit_reason_says_where_the_hosts_land(self):
+        """Computed from `_decide` after the revoke, never assumed to be a hold: another
+        rule may still decide the host, and then "held" would record the opposite of
+        the decision in force. Each case: the rules left standing, the rule revoked,
+        and the hosts whose post-revoke `_decide` reason the audit row must carry.
+        `fresh.example.com` stands for a subdomain no narrower rule names."""
+        cases = (
+            ("block under a wider allow", [(".example.com", "allow")],
+             ("evil.example.com", "block"), ["evil.example.com"], "allow"),
+            ("allow under a wider allow", [(".example.com", "allow")],
+             ("api.example.com", "allow"), ["api.example.com"], "allow"),
+            ("wildcard over an exact apex allow", [("example.com", "allow")],
+             (".example.com", "allow"), ["example.com", "fresh.example.com"], None),
+            ("allow under a wider block", [(".example.com", "block")],
+             ("api.example.com", "allow"), ["api.example.com"], "deny"),
+            ("nothing else left", [], ("evil.example", "block"), ["evil.example"],
+             "hold"),
+        )
+        for name, standing, (pattern, action), hosts, decision in cases:
+            with self.subTest(case=name):
+                _set_rules(standing)
+                rid = self._rule(pattern, action)
+                with mock.patch.object(cp.store, "_audit") as audit:
+                    _revoke_rule(rid, _FakeRequest())
+                reason = audit.call_args.kwargs["reason"]
+                self.assertIn(f"{action} rule revoked", reason)
+                for host in hosts:
+                    self.assertIn(cp.policy._decide(host, CLASS)[1], reason)
+                if decision is not None:
+                    self.assertEqual(cp.policy._decide(hosts[0], CLASS)[0], decision)
+                if decision in ("allow", "deny"):
+                    self.assertNotIn("held for approval", reason)
+
+    def test_a_wildcard_whose_apex_and_subdomains_land_alike_reads_as_one_clause(self):
+        # Two clauses only when they differ, so the common case stays one line.
+        self._rule(".com", "block")
+        rid = self._rule(".example.com", "allow")
         with mock.patch.object(cp.store, "_audit") as audit:
             _revoke_rule(rid, _FakeRequest())
-        self.assertIn("held for approval", audit.call_args.kwargs["reason"])
+        reason = audit.call_args.kwargs["reason"]
+        self.assertIn("example.com and its subdomains that no narrower rule or lease "
+                      "names: blocked by rule (.com", reason)
+        self.assertEqual(reason.count("blocked by rule"), 1)
+
+    def test_the_one_clause_form_keeps_the_subdomains_qualified(self):
+        """A narrower rule under the wildcard lands its hosts elsewhere, so "and its
+        subdomains" unqualified would state the wrong decision for them: a revoked
+        block audited "held" while `api.example.com` is allowed."""
+        _set_rules([("api.example.com", "allow")])
+        rid = self._rule(".example.com", "block")
+        with mock.patch.object(cp.store, "_audit") as audit:
+            _revoke_rule(rid, _FakeRequest())
+        reason = audit.call_args.kwargs["reason"]
+        self.assertIn("example.com and its subdomains that no narrower rule or lease "
+                      "names: no matching rule", reason)
+        self.assertEqual(cp.policy._decide("api.example.com", CLASS)[0], "allow")
+
+    def test_a_wildcard_whose_apex_lands_apart_names_both(self):
+        self._rule("example.com", "allow")
+        rid = self._rule(".example.com", "allow")
+        with mock.patch.object(cp.store, "_audit") as audit:
+            _revoke_rule(rid, _FakeRequest())
+        reason = audit.call_args.kwargs["reason"]
+        self.assertIn("example.com: allowed by rule (example.com", reason)
+        self.assertIn("its subdomains that no narrower rule or lease names: no "
+                      "matching rule", reason)
+
+    def test_one_decision_for_two_reasons_is_still_two_clauses(self):
+        # Apex and subdomains are both allowed, by different rules; one clause would
+        # name the wrong rule for half of them.
+        _set_rules([("a.example.com", "allow"), (".example.com", "allow")])
+        rid = self._rule(".a.example.com", "block")
+        with mock.patch.object(cp.store, "_audit") as audit:
+            _revoke_rule(rid, _FakeRequest())
+        reason = audit.call_args.kwargs["reason"]
+        self.assertIn("a.example.com: allowed by rule (a.example.com", reason)
+        self.assertIn("its subdomains that no narrower rule or lease names: allowed "
+                      "by rule (.example.com", reason)
+
+    def test_a_revoke_reports_its_own_class_not_anothers(self):
+        # The same pattern is a separate rule in another class, and decides nothing
+        # for this one. Both ways round, so neither class can be the one assumed.
+        other = next(c for c in cp.policy._class_names() if c != CLASS)
+        for mine, theirs in ((CLASS, other), (other, CLASS)):
+            with self.subTest(revoked_in=mine):
+                _set_rules([("evil.example", "block", theirs),
+                            ("evil.example", "allow", mine)])
+                with cp.store._connect() as conn:
+                    rid = conn.execute("SELECT id FROM rules WHERE client_class=?",
+                                       (mine,)).fetchone()["id"]
+                with mock.patch.object(cp.store, "_audit") as audit:
+                    _revoke_rule(rid, _FakeRequest())
+                reason = audit.call_args.kwargs["reason"]
+                self.assertIn(cp.policy._decide("evil.example", mine)[1], reason)
+                self.assertIn(f"matched only for: {theirs}", reason)
+                self.assertNotIn("blocked by rule", reason)
 
     def test_a_revoked_allow_stops_deciding_requests(self):
         # The whole point, asserted end to end through _decide rather than by
@@ -817,7 +906,7 @@ class RevokeRuleTests(_CPTestCase):
 
     def test_a_revoked_block_reverts_to_hold_not_allow(self):
         # The loosening direction, and the reason the UI warns differently about it:
-        # it does NOT become allowed, it becomes decidable.
+        # with no other rule, it does NOT become allowed, it becomes decidable.
         rid = self._rule("bad.example", "block")
         self.assertEqual(cp.policy._decide("bad.example", CLASS)[0], "deny")
         _revoke_rule(rid, _FakeRequest())
@@ -1097,6 +1186,43 @@ class CreateRuleTests(_CPTestCase):
         # The scope, in words, because a leading dot is a wildcard that looks like a
         # hostname — the same thing the rules view spells out.
         self.assertIn("host + subdomains", kwargs["reason"])
+
+    def test_the_reason_and_the_response_say_where_the_host_lands(self):
+        """Computed from `_decide` after the write, not assumed from the action: an
+        allow under a wider block is still denied, and "now allows" would record the
+        opposite. The response carries the same words, for the page's notice."""
+        cases = (
+            ("decided by itself", [], "api.example.com", "allow"),
+            ("allow under a wider block", [(".example.com", "block")],
+             "api.example.com", "deny"),
+        )
+        for name, standing, host, decision in cases:
+            with self.subTest(case=name):
+                _set_rules(standing)
+                with mock.patch.object(cp.store, "_audit") as audit:
+                    resp = _create(host, "allow")
+                reason = audit.call_args.kwargs["reason"]
+                after = cp.policy._decide(host, CLASS)
+                self.assertEqual(after[0], decision)
+                self.assertIn(after[1], reason)
+                self.assertNotIn("without being held", reason)
+                self.assertEqual(resp.status_code, 201)
+                self.assertIn(resp.body["landing"], reason)
+                self.assertIn(after[1], resp.body["landing"])
+                # The decision itself too, so the page need not parse the words.
+                self.assertEqual(resp.body["landing_decisions"], [decision])
+
+    def test_a_wildcard_create_reports_apex_and_subtree_decisions(self):
+        # A narrower block under the new allow denies its own host; the reason keeps
+        # the subdomains qualified, and the decisions are the apex's and the subtree's.
+        _set_rules([("evil.example.com", "block"), ("example.com", "block")])
+        with mock.patch.object(cp.store, "_audit") as audit:
+            resp = _create(".example.com", "allow")
+        reason = audit.call_args.kwargs["reason"]
+        self.assertIn("its subdomains that no narrower rule or lease names: allowed "
+                      "by rule (.example.com", reason)
+        self.assertEqual(resp.body["landing_decisions"], ["deny", "allow"])
+        self.assertEqual(cp.policy._decide("evil.example.com", CLASS)[0], "deny")
 
     def test_a_refused_creation_is_not_audited(self):
         # A refusal changed nothing, and a `create` row for a rule that does not exist
@@ -2864,11 +2990,27 @@ class LeaseRevokeTests(_CPTestCase):
         self.assertIn("peer=172.31.0.9", kwargs["actor"])
         self.assertIn(f"client class {CLASS}", kwargs["reason"])
         self.assertIsNone(kwargs.get("client_class"))
-        # Held, not denied — the same distinction a rule revocation records, and only
-        # the reason line carries it. And how much time was cut short, which is the
-        # part a rule revocation has no equivalent of.
+        # With no other rule, held, not denied — the same distinction a rule
+        # revocation records, and only the reason line carries it. And how much time
+        # was cut short, which is the part a rule revocation has no equivalent of.
         self.assertIn("held for approval", kwargs["reason"])
         self.assertRegex(kwargs["reason"], r"\d+m\d\ds left")
+
+    def test_the_reason_says_where_the_host_lands_when_a_rule_still_decides_it(self):
+        # A rule written after the lease decides the host once the lease is gone: an
+        # allow allows and a block denies, and the reason says so rather than "held".
+        for action, decision in (("allow", "allow"), ("block", "deny")):
+            with self.subTest(action=action):
+                lease_id = self._insert("api.example.com", 900)
+                _set_rules([(".example.com", action)])
+                with mock.patch.object(cp.store, "_audit") as audit:
+                    cp.api_egress.revoke_lease(lease_id, _FakeRequest())
+                reason = audit.call_args.kwargs["reason"]
+                after = cp.policy._decide("api.example.com", CLASS)
+                self.assertEqual(after[0], decision)
+                self.assertIn(after[1], reason)
+                self.assertNotIn("held for approval", reason)
+                self.assertRegex(reason, r"\d+m\d\ds left")
 
     def test_revoking_an_already_expired_lease_says_so_rather_than_refusing(self):
         # A refusal would look like a bug. The honest answer — it had already ended,

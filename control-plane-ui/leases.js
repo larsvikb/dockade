@@ -278,10 +278,10 @@ export function mountLeases() {
   // seconds and lost in between.
   //
   // No `confirm()`, where revoking a RULE has one. The asymmetry is the point: that
-  // dialog guards an action with no undo, and this one has an obvious undo — the host
-  // goes back to being held, so the next request raises a card and the operator can
-  // grant it again. Making the reversible action as heavy as the irreversible one is
-  // how a confirmation stops being read.
+  // dialog guards an action with no undo, and this one has an obvious undo — unless a
+  // rule decides it, the host goes back to being held, so the next request raises a
+  // card and the operator can grant it again. Making the reversible action as heavy
+  // as the irreversible one is how a confirmation stops being read.
   document.getElementById("leases").addEventListener("click", async (ev) => {
     // Expanding a group changes nothing and reaches nothing, so it is handled before
     // the revoke path and takes none of its ceremony. The state lives OUTSIDE the

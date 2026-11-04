@@ -57,6 +57,27 @@ class RuleRevokeRequest(RuleExpectation):
     pass
 
 
+def _landing_words(conn, pattern: str, client_class: str) -> tuple[str, list[str]]:
+    """Where the hosts ``pattern`` names land now, in ``policy._decide``'s words for
+    an audit reason, and the decisions alone, one per host or subtree named. Asked
+    on the write's own connection before it commits, so it describes exactly the
+    store the write produced: another rule or a lease may still decide a host whose
+    rule just went (``policy._landing``).
+
+    The subdomains are always qualified, even in the one-clause form: a narrower rule
+    or lease under the wildcard can land a host there anywhere."""
+    host, subtree = policy._landing(conn, pattern, client_class)
+    if subtree is None:
+        return f"for client class {client_class}, {pattern}: {host[1]}", [host[0]]
+    apex = pattern[1:]
+    subdomains = "its subdomains that no narrower rule or lease names"
+    if subtree == host:
+        return (f"for client class {client_class}, {apex} and {subdomains}: "
+                f"{host[1]}"), [host[0], subtree[0]]
+    return (f"for client class {client_class}, {apex}: {host[1]}; {subdomains}: "
+            f"{subtree[1]}"), [host[0], subtree[0]]
+
+
 def _stale(rule_id: int, row, req: RuleExpectation) -> JSONResponse | None:
     """A 409 when ``row`` is not the rule the caller saw, else None.
 
@@ -189,6 +210,8 @@ def create_rule(req: RuleCreateRequest, request: Request) -> JSONResponse:
             "INSERT INTO rules(pattern, action, source, created_at, client_class) "
             "VALUES (?,?, 'operator', ?, ?)",
             (pattern, action, time.time(), client_class)).lastrowid
+        # Not "now {action}s": an allow under a wider block is still denied.
+        landing, decisions = _landing_words(conn, pattern, client_class)
         conn.commit()
 
     # Once written, this rule looks exactly like one approved at a card, so the record
@@ -196,11 +219,13 @@ def create_rule(req: RuleCreateRequest, request: Request) -> JSONResponse:
     # that is what was stored and what decides.
     store._audit("create", stage="policy", host=pattern, actor=actor,
                  reason=f"{action} rule created; {pattern} "
-                        f"({policy._pattern_scope(pattern)}) now {action}s for client "
-                        f"class {client_class} without being held for approval")
+                        f"({policy._pattern_scope(pattern)}); {landing}")
     return JSONResponse({"ok": True, "created": True, "already_present": False,
                          "id": rule_id, "pattern": pattern, "action": action,
-                         "source": "operator", "client_class": client_class},
+                         "source": "operator", "client_class": client_class,
+                         # The decisions too, so the page can tell an allow that
+                         # decides nothing without parsing the words.
+                         "landing": landing, "landing_decisions": decisions},
                         status_code=201)
 
 
@@ -326,15 +351,15 @@ def revoke_rule(rule_id: int, req: RuleRevokeRequest,
         if not conn.execute(f"DELETE FROM rules WHERE {_RULE_AS_CHECKED}",  # noqa: S608
                             _as_checked(rule_id, row)).rowcount:
             return _lost(conn, rule_id)
+        # The reason says where the hosts land, which is a hold only when nothing else
+        # decides them: a wider allow can still allow, a wider block still deny. The
+        # class is named too, since a revoke touches ONE population and two classes can
+        # each have a `.github.com` allow.
+        landing, _ = _landing_words(conn, row["pattern"], row["client_class"])
         conn.commit()
 
-    # The reason says where the host lands: held for approval, whichever action was
-    # revoked. The class is named too, since a revoke touches ONE population and two
-    # classes can each have a `.github.com` allow.
     store._audit("revoke", stage="policy", host=row["pattern"], actor=actor,
-                 reason=f"{row['action']} rule revoked; {row['pattern']} is "
-                        f"now unknown for client class {row['client_class']} and will "
-                        f"be held for approval")
+                 reason=f"{row['action']} rule revoked; {landing}")
     return JSONResponse({"ok": True, "pattern": row["pattern"],
                          "action": row["action"],
                          "client_class": row["client_class"]})
@@ -392,15 +417,17 @@ def revoke_lease(lease_id: int, request: Request) -> JSONResponse:
             return JSONResponse({"ok": False, "detail": "unknown lease"},
                                 status_code=404)
         conn.execute("DELETE FROM leases WHERE id=?", (lease_id,))
+        # As for a rule, the reason says where the host lands: held only if no rule
+        # decides it. A lease names one host, so it is asked about as a host, never
+        # read as a pattern.
+        decision = policy._decide_in(conn, row["host"], row["client_class"])
         conn.commit()
     was_live = row["expires_at"] > now
-    # As for a rule, the reason says where the host lands: held, not denied.
     store._audit(
         "revoke", stage="policy", host=row["host"], actor=actor,
         reason=(f"lease revoked with "
-                f"{policy._short_duration(row['expires_at'] - now)} left; "
-                f"{row['host']} is now unknown for client class "
-                f"{row['client_class']} and will be held for approval"
+                f"{policy._short_duration(row['expires_at'] - now)} left; for client "
+                f"class {row['client_class']}, {row['host']}: {decision[1]}"
                 if was_live else
                 f"expired lease removed; it had already stopped deciding "
                 f"requests for {row['host']} from client class "

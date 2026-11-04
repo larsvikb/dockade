@@ -550,19 +550,19 @@ sc_ensure_network() {
         echo "       internal, so adopting this one would hand it egress. A bridge" >&2
         echo "       left behind by a tier-1 standalone run looks exactly like this." >&2
         echo "       Remove it and start the infrastructure:" >&2
-        echo "         docker network rm $net && docker compose up -d" >&2
+        echo "         docker network rm $net && make -C \"$SANDBOX_REPO_ROOT\" up" >&2
         exit 1
     fi
 
     if [[ "$allow_fallback" != "true" ]]; then
         echo "ERROR: network '$net' not found." >&2
-        echo "       Start the infrastructure first:  docker compose up -d" >&2
+        echo "       Start the infrastructure first:  make -C \"$SANDBOX_REPO_ROOT\" up" >&2
         echo "       (This tier will not fall back to a non-internal bridge — that" >&2
         echo "        would grant egress its design forbids.)" >&2
         exit 1
     fi
     echo "NOTE: network '$net' not found — creating a plain bridge (no egress proxy)." >&2
-    echo "      For governed/audited egress, run 'docker compose up -d' first." >&2
+    echo "      For governed/audited egress, run 'make -C \"$SANDBOX_REPO_ROOT\" up' first." >&2
     docker network create "$net" >/dev/null
 }
 

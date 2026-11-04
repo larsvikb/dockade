@@ -1538,10 +1538,13 @@ explicitly: **a crown-jewel backup never contains a credential.**
 `secrets:`.** A `secrets:` entry whose `file:` source is absent fails at `up` time for
 the whole project — the same eager-validation trap as `${VAR:?}`, and this repo has
 paid for that lesson twice. A directory bind degrades instead: a missing file means
-*that* server fails closed while every other service is unaffected. `make up`,
-`make mcp-up` and `make tasks-up` warn on the mode of anything under `MCP_SECRETS`
-(`secrets-perm-check` in the `Makefile`). Only `make tasks-up` writes there: the task
-registry's secret, which no one issues, made once and never overwritten.
+*that* server fails closed while every other service is unaffected. A missing
+*directory* fails the gateway's start, on purpose (`create_host_path: false`): dockerd
+would make it as root, and `make` always makes it first. `make up`, `make mcp-up` and
+`make tasks-up` warn on the mode of anything under `MCP_SECRETS` (`secrets-perm-check`
+in the `Makefile`), each creating the directory first (`secrets/` at 0700, as the
+user; `secrets-dir`). Compose never does, and only `make tasks-up` writes a file in it: the
+task registry's secret, which no one issues, made once and never overwritten.
 
 **What the UI can say without ever seeing a value:** whether the secret *resolves*,
 per server. That is what makes a forced-injection server fail legibly — "configured,

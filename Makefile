@@ -214,7 +214,7 @@ REFFILES := $(SCRIPTS) \
 
 .PHONY: help check check-strict lint consistency test verify-build \
         up down destroy audit-prune control-tool-preflight backup restore \
-        tasks-tool-preflight restore-tasks secrets-perm-check \
+        tasks-tool-preflight restore-tasks secrets-dir secrets-perm-check \
         rebuild logs-ep logs-cp logs-tg tool-outcomes print-config-home \
         mcp-up mcp-down mcp-ps mcp-tools gateway-tools tasks-up tasks-down \
         claude opencode boundary check-boundary split-check ui-diff
@@ -660,7 +660,10 @@ verify-build: ## Assert every default image still builds (skipped if docker unav
 # silently chmod-ing another person's files from a build target is worse than saying
 # so. A warning, not a failure — the operator may have a reason, and a hard stop here
 # would take down infra that has nothing to do with the credential.
-secrets-perm-check:
+#
+# After `secrets-dir` in the graph rather than in a recipe, so `make -j` cannot check a
+# directory not yet made and `make -n` stays a dry run. So `mcp-up` makes it too.
+secrets-perm-check: secrets-dir
 	@if [ -d "$(MCP_SECRETS)" ]; then
 	  for f in "$(MCP_SECRETS)" "$(MCP_SECRETS)"/*.json; do
 	    [ -e "$$f" ] || continue
@@ -668,6 +671,42 @@ secrets-perm-check:
 	      echo "WARNING: $$f is group/world-readable — chmod 600 (700 for the dir)."
 	    fi
 	  done
+	fi
+
+# The one place MCP_SECRETS is made: as the invoking user, before any compose call
+# that can (re)create the gateway (directly, or through secrets-perm-check). Compose will not make it (`create_host_path:
+# false` on the gateway's mount, docker-compose.yml), so the gateway refuses to start
+# without it rather than have dockerd make it as root. `-p` makes the parents too, as
+# the user at the umask's mode; only `secrets/` itself is 0700.
+#
+# An existing directory the user cannot write (one root made before this target
+# existed) is a warning, for secrets-perm-check's reason: the gateway only reads it.
+# A parent that stops the directory being made at all fails, since compose would next.
+secrets-dir:
+	@# How to make a path writable again, by who owns it: chown needs that owner's (or
+	# root's) hand, while a directory that is merely read-only to its owner needs chmod.
+	advise() {
+	  if [ "$$(stat -c %u "$$1")" = "$$(id -u)" ]; then
+	    echo "  It is yours but not writable: chmod u+w \"$$1\" (700 for secrets/)."
+	  else
+	    echo "  It is owned by $$(stat -c %U "$$1"): have it chowned to you, mode 700"
+	    echo "  (sudo chown $$(id -u):$$(id -g) \"$$1\")."
+	  fi
+	}
+	if ! mkdir -p -m 700 "$(MCP_SECRETS)"; then
+	  at="$(MCP_SECRETS)"
+	  while [ ! -e "$$at" ]; do at=$$(dirname "$$at"); done
+	  if [ ! -d "$$at" ]; then
+	    echo "ERROR: cannot make $(MCP_SECRETS): $$at is not a directory."
+	  else
+	    echo "ERROR: cannot make $(MCP_SECRETS): $$at is not writable by you (owner: $$(stat -c %U "$$at"))."
+	    advise "$$at"
+	  fi
+	  exit 1
+	fi
+	if [ ! -w "$(MCP_SECRETS)" ]; then
+	  echo "WARNING: $(MCP_SECRETS) is not writable by you (owner: $$(stat -c %U "$(MCP_SECRETS)"))."
+	  advise "$(MCP_SECRETS)"
 	fi
 
 up: secrets-perm-check ## Bring up the shared infra (egress proxy + control plane + UI), building if needed
@@ -725,19 +764,16 @@ mcp-ps: ## Who is on mcp-net right now (should be the proxy plus enabled servers
 # read the same way (DESIGN.md, "The secret's path is derived from the server name"):
 # random, mode 0600, never overwritten. The registry reads it at start and the gateway
 # on every call, so rotation is deleting the file, then `make tasks-down tasks-up`.
-tasks-up: ## Start the task registry and its page (optional); writes its secret on the first start
+tasks-up: secrets-dir ## Start the task registry and its page (optional); writes its secret on the first start
 	@secret="$(MCP_SECRETS)/tasks.json"
 	if [ ! -e "$$secret" ]; then
 	  # Made before the file is opened, so a failure leaves no empty file behind for
 	  # the next run to keep. URL-safe, so it goes into the JSON as it is.
 	  token=$$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')
-	  mkdir -p -m 700 "$(MCP_SECRETS)"
-	  # Docker makes the directory, as root, if the gateway started before it existed
-	  # (a missing bind source becomes a directory); say so rather than fail on a
-	  # bare "Permission denied".
+	  # secrets-dir only warns on a directory you cannot write, since the gateway only
+	  # reads it; this writes a file there, so it stops before a bare "Permission denied".
 	  if [ ! -w "$(MCP_SECRETS)" ]; then
-	    echo "$(MCP_SECRETS) is not writable by you (owner: $$(stat -c %U "$(MCP_SECRETS)"));"
-	    echo "chown it to yourself, mode 700, and run this again."
+	    echo "tasks-up: cannot write $$secret; make $(MCP_SECRETS) writable as above, and run this again."
 	    exit 1
 	  fi
 	  (umask 077; set -C
@@ -1084,7 +1120,7 @@ backup: control-tool-preflight ## Snapshot the control-plane store (policy + app
 	mv "$$tasks_out.md.partial" "$$tasks_out.md"
 	echo "backup: wrote $$tasks_out.md"
 
-restore: control-tool-preflight ## Replace the control-plane store from a backup: make restore FILE=<BACKUP_DIR>/… (destructive)
+restore: control-tool-preflight secrets-dir ## Replace the control-plane store from a backup: make restore FILE=<BACKUP_DIR>/… (destructive)
 	@# The other half of `backup`, and the destructive one: it discards the CURRENT
 	@# rules, approvals and audit history. Deliberately manual, deliberately loud,
 	@# and it validates the incoming file in two passes — a cheap one before the
@@ -1166,7 +1202,7 @@ restore-tasks: tasks-tool-preflight ## Replace the task registry's store from a 
 	fi
 	$(TASKS_TOOL) backup.py restore < "$(FILE)"
 
-rebuild: ## Rebuild every default image from scratch — proxy, control plane, UI, gateway, task registry, both sandbox tiers — then recreate the infra
+rebuild: secrets-dir ## Rebuild every default image from scratch — proxy, control plane, UI, gateway, task registry, both sandbox tiers — then recreate the infra
 	# Deliberately does NOT `down` first. A build touches no running container, so
 	# taking the governance plane offline for the whole --no-cache build bought
 	# nothing and cost real downtime; the only unavoidable interruption is the

@@ -1264,7 +1264,7 @@ boundary: ## Run boundary-check.sh in a running sandbox (SANDBOX=claude-sandbox|
 check-boundary: ## Stand the infra up and assert containment from inside a throwaway tier-1 sandbox (what CI runs)
 	# The repo's only AUTOMATED evidence that the containment boundary holds.
 	# `make check` structurally cannot reach it: shellcheck reads init-firewall.sh
-	# as text and tests/test_topology.py reads docker-compose.yml as YAML, so
+	# as text and tests/test_topology.py reads the compose files as text, so
 	# between them they assert what the boundary is DECLARED to be. Nothing there
 	# arms a firewall or tries to leave a container. This does, as the agent.
 	#

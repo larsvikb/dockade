@@ -18,7 +18,7 @@ from unittest import mock
 from _loader import ROOT, load_task_registry_backup
 from test_task_registry_plans import DECISION, MULTI
 from test_task_registry_tasks import V4_TABLES, as_version
-from test_topology import COMPOSE, _block, _service
+from test_topology import COMPOSE, _block, _mount_spellings, _scalar, _service
 
 reg = load_task_registry_backup()
 backup, export, op, agent = reg.backup, reg.export, reg.operator_moves, reg.agent_moves
@@ -705,9 +705,7 @@ class MakefileTargetsAgreeTests(unittest.TestCase):
         return m.group(1)
 
     def test_the_image_is_the_one_compose_builds(self):
-        declared = [line.split(":", 1)[1].strip() for line in _service("tasks")
-                    if line.strip().startswith("image:")]
-        self.assertEqual(declared, [self.variable("TASKS_IMAGE")])
+        self.assertEqual(_scalar(_service("tasks"), "image"), self.variable("TASKS_IMAGE"))
 
     def test_the_volume_is_the_one_compose_names(self):
         names = [line.split(":", 1)[1].strip()
@@ -716,8 +714,7 @@ class MakefileTargetsAgreeTests(unittest.TestCase):
         self.assertEqual(names, [self.variable("TASKS_VOLUME")])
 
     def test_it_is_mounted_where_the_service_mounts_it(self):
-        [mount] = [line.strip().lstrip("- ") for line in _service("tasks")
-                   if line.strip().startswith("- tasks-state:")]
+        [mount] = [m for m in _mount_spellings("tasks") if m.startswith("tasks-state:")]
         path = mount.split(":", 1)[1]
         self.assertIn(f"-v $(TASKS_VOLUME):{path} ", self.variable("TASKS_TOOL"))
         self.assertEqual(os.path.dirname(reg.taskdb.DB_PATH), path)

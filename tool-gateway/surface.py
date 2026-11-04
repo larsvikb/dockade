@@ -285,6 +285,15 @@ def listing() -> list[dict]:
     return NATIVE_TOOLS + _LISTING
 
 
+def served_schema(server: str, tool: str) -> dict | None:
+    """The ``inputSchema`` the last enumeration of ``server`` gave ``tool``, as
+    ``curate`` serves it, or None if no enumeration has named the tool."""
+    for entry in _ENUMERATED.get(server) or ():
+        if entry.get("name") == tool:
+            return entry.get("inputSchema") or {"type": "object"}
+    return None
+
+
 def server_entry(server: str) -> dict | None:
     """The roster entry for ``server``, or None if it is not on the current roster.
 

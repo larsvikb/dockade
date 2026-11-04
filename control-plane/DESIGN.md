@@ -740,13 +740,20 @@ one because of who reads `rules`: every reader of standing policy would have had
 learn "except the expired ones" (`store._step_2_leases`). A timed pin is the same
 predicate under the same ceiling as a permanent one and differs only in how long it
 answers, and the readers that must know are few and name it: the decision
-(`policy._answering_pin`), the pins view, the rule revoke's pin check, and the write
-that widens a pin set already in place (`holds._resolve_tool_ask_pinned`). The cost is
-a reader that cannot learn: code from before v8 reads every timed pin as permanent,
-lapsed ones included, as code from before v1 applies a class-scoped rule to every
-client. Delete the timed pins before older code runs on the store. A pin is also the one
-policy row a migration may discard, which is why v8 could drop the pins rather than
-copy them: a pin only allows, so dropping one sends its calls back to a card.
+(`policy._pins_met`), the pins view, the rule revoke's pin check, and the write that
+extends or rebinds a pin set already in place (`holds._resolve_tool_ask_pinned`). The
+cost is a reader that cannot learn: code from before v8 reads every timed pin as
+permanent, lapsed ones included, as code from before v1 applies a class-scoped rule to
+every client. Delete the timed pins before older code runs on the store. A pin is also
+the one policy row a migration may discard, which is why v8 could drop the pins rather
+than copy them: a pin only allows, so dropping one sends its calls back to a card. v12
+drops them again, because a pin from before it was made under no recorded schema and
+nothing can bind it now.
+
+**Going back past v12 costs the pins twice.** Older code refuses a newer store
+(`store._migrate`), so a rollback is an older image plus `make restore` of a backup
+taken before the step. The restore brings the dropped pins back, and the next forward
+boot drops and audits them again, so the operator pins from cards a second time.
 
 **`approvals` splits the same way; the operator's queue does not.** The approvals
 table is egress-shaped exactly as `rules` is — `host`, `port`, `proto`, `client`,

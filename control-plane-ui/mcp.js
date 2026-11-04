@@ -444,17 +444,28 @@ export function pinLapsesDue(cells, asked, nowMs) {
 
 // Whether a pin decides anything now, and if not, which condition fails. `decides` is
 // the backend's (api_mcp.api_mcp_pins), so this only NAMES the reason, and the order
-// follows `policy._decide_tool`: a row that is not a pin set, then the rule, then the
-// server.
+// follows `policy._decide_tool`: a row that is not a pin set or is bound to no
+// arguments, then the rule, then the server. `schema_moved` is the inventory's word
+// that the tool's arguments changed after the pin was made, which the decision reads
+// per call: the gateway's next calls are made under the new ones.
 export function pinState(pin) {
   const tool = (pin && pin.tool) || "";
   const server = (pin && pin.server) || "";
+  if (pin && pin.decides && pin.schema_moved) {
+    return { live: false, text: `the arguments of ${tool} changed after this was `
+                              + "pinned, so its calls get a card until it is pinned "
+                              + "again from one" };
+  }
   if (pin && pin.decides) {
     return { live: true, text: "answers the calls that carry these values" };
   }
   if (!pin || !pin.pins) {
     return { live: false, text: "not a pin set this control plane can read, so it "
                               + "decides nothing" };
+  }
+  if (pin.bound === false) {
+    return { live: false, text: `made under no record of the arguments of ${tool}, `
+                              + "so it decides nothing" };
   }
   if (!pin.rule) {
     return { live: false, text: `${tool} has no rule, so it is denied and this `

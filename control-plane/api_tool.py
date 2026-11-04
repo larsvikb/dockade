@@ -52,6 +52,10 @@ class ToolCallRequest(BaseModel):
     # ``AuthorizeRequest.client``. The per-client ask cap counts it and an identical
     # retry joins on it, so the gateway's own address would pool every sandbox.
     client: str | None = None
+    # The digest of the tool's arguments the gateway served for this tool
+    # (discovery.schema_digest), or None when it has not enumerated it. A pin answers
+    # only a call made under the digest it was pinned under, so this can only narrow.
+    schema_digest: str | None = None
 
 
 class ToolResumeRequest(BaseModel):
@@ -90,8 +94,13 @@ def tool_authorize(req: ToolCallRequest) -> dict:
     # the ceiling rather than show it in part (``holds._register_tool_ask``), so the
     # pins are not offered one either.
     showable = len(holds._canonical_args(req.args)) <= holds.TOOL_ARGS_MAX
+    # Kept only in the inventory's digest shape, so what reaches a card and a pin is
+    # fixed-length; anything else is a call with no digest, which no pin answers.
+    digest = getattr(req, "schema_digest", None)
+    digest = (digest if isinstance(digest, str) and inventory._DIGEST_RE.fullmatch(digest)
+              else None)
     decision, reason = policy._decide_tool(server, tool,
-                                           req.args if showable else None)
+                                           req.args if showable else None, digest)
 
     if decision in ("allow", "deny"):
         store._audit(decision, stage="tool-call", client=req.client,
@@ -103,7 +112,7 @@ def tool_authorize(req: ToolCallRequest) -> dict:
     # ASK. Registered, not held: the gateway takes the id back at once. An identical
     # ask from the same client joins the pending one rather than raising a second
     # card, so a retrying agent cannot fill the queue with copies of one question.
-    ask = holds._register_tool_ask(server, tool, req.args, req.client)
+    ask = holds._register_tool_ask(server, tool, req.args, req.client, digest)
     if ask.refused is not None:
         # Over a cap, or too large to show a human in full: a deny, audited as one.
         # ``holds._refuse_tool`` has already counted a cap refusal for the saturation
@@ -115,8 +124,9 @@ def tool_authorize(req: ToolCallRequest) -> dict:
 
     # `hold`, not a new word: the vocabulary (audit.KINDS) is shared with the audit
     # filters and the page's <option> list, with no compiler between them. The reason
-    # line says what differs: nothing is blocked.
-    why = (f"{tool} on {server}: registered as tool ask {ask.approval_id}"
+    # line says what differs: nothing is blocked. It carries the policy reason as the
+    # allow and deny rows do, which names a pin the call met but that did not answer.
+    why = (f"{tool} on {server}: {reason}; registered as tool ask {ask.approval_id}"
            + (" (joined an identical ask already pending)" if ask.joined else "")
            + " — nothing is blocked; the agent resumes with the id")
     store._audit("hold", stage="tool-call", client=req.client,

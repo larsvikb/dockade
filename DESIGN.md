@@ -1706,14 +1706,27 @@ a duplicate key cannot show one value to policy and another to the server. What 
 parse cannot close is a server that matches keys more loosely than Python, as Go's
 `encoding/json` does; the key shape that closes it is `policy._PIN_FIELD_RE`.
 
+**A pin is bound to the arguments it was made under.** The gateway sends
+`/tool/authorize` the digest of the schema it served for the tool
+(`execute._served_digest`), the card keeps it, and a pin made from the card answers
+only calls made under the same digest (`policy._answering_pin`). An upgrade that adds
+a field which retargets the call, or a method to a dispatcher's enum, moves the
+digest, so the pinned calls get a card naming the pin instead of widening it. Pinning
+the same fields from that card rebinds the pin: a new grant under the new schema, for
+as long as that click says. So `_decide_tool` reads one input a sibling supplies, and
+it can only narrow, since a missing or wrong digest misses every pin. The inventory is
+still never an input; it holds the same digest only to show which pins' schemas
+moved. The binding lags the server: a call is bound to the schema the gateway last
+enumerated, so after a server restarts on a new image a pin can answer under the old
+digest until the gateway's next successful enumeration of that server, normally
+within `GATEWAY_DISCOVERY_INTERVAL`.
+
 **What a pin does not cover, stated so it is known rather than found.** It constrains
-the fields it names and nothing else. A server that also reads an alias field widens
-a pin with nothing to report it. An upgrade adding a field that retargets the call
-widens it too, and that change is audited as the tool's arguments changing. Binding a pin to the tool's schema would close that. The inventory holds each
-tool's schema digest, but the inventory is never an input to a decision, so a pin
-cannot be bound to it there. A pin also gives up the per-call read, and with it the rate
-limit a human is; every call it answers is audited, naming the pin. And as with a
-lease, a new pin does not release a matching card that is already pending.
+the fields it names and nothing else, so a server that also reads an alias field, or
+one it does not declare, widens a pin with nothing to report it. A pin also gives up
+the per-call read, and with it the rate limit a human is; every call it answers is
+audited, naming the pin. And as with a lease, a new pin does not release a matching
+card that is already pending.
 
 **An `ask` answers immediately.** The gateway never blocks the agent, and never blocks
 a control-plane worker either — two independent choices, both away from the egress

@@ -3921,12 +3921,20 @@ class McpToolRuleRevokeTests(_CPTestCase):
         self.assertEqual(cp.policy._decide_tool("mcp-github", "get_me")[0], "allow")
 
 
-def _tool_call(server="mcp-github", tool="get_me", args=None, client=CLASS_IP):
+#: The digest of a tool's arguments a call is made under unless a test says otherwise,
+#: and the digest of the same tool's arguments after an upgrade moved them.
+_SCHEMA = "5c" * 32
+_MOVED = "e1" * 32
+
+
+def _tool_call(server="mcp-github", tool="get_me", args=None, client=CLASS_IP,
+               schema_digest=_SCHEMA):
     """One tool call put to the bridge. ``client`` defaults to a real sandbox-net
     address for the reason ``_auth_req`` does: it is what the per-client cap counts
     and what an identical retry joins on."""
     return cp.api_tool.tool_authorize(
-        cp.api_tool.ToolCallRequest(server=server, tool=tool, args=args, client=client))
+        cp.api_tool.ToolCallRequest(server=server, tool=tool, args=args, client=client,
+                                    schema_digest=schema_digest))
 
 
 def _claim(approval_id, client=CLASS_IP):
@@ -4115,14 +4123,17 @@ class ToolAuthorizeDecisionTests(_ToolBridgeTestCase):
         self.assertLessEqual({"allow", "deny", "hold"}, set(cp.audit.KINDS))
 
 
-def _pin(pins, tool="create_pull_request", server="mcp-github", expires_at=None):
+def _pin(pins, tool="create_pull_request", server="mcp-github", expires_at=None,
+         schema_digest=_SCHEMA):
     """Write a pin as the card would, and return its id: a row in place before the
     card under test is answered."""
     with cp.store._connect() as conn:
         pin_id = conn.execute(
             "INSERT INTO tool_pins(server, tool, pins_json, approval_id, created_at, "
-            "granted_by, expires_at) VALUES (?,?,?, 'a1', 0, 'peer=172.31.0.3', ?)",
-            (server, tool, cp.policy._canonical_pins(pins), expires_at)).lastrowid
+            "granted_by, expires_at, schema_digest) "
+            "VALUES (?,?,?, 'a1', 0, 'peer=172.31.0.3', ?, ?)",
+            (server, tool, cp.policy._canonical_pins(pins), expires_at,
+             schema_digest)).lastrowid
         conn.commit()
     return pin_id
 
@@ -4318,7 +4329,7 @@ class McpPinTests(_CPTestCase):
         with mock.patch("time.time", return_value=deadline):
             self.assertEqual(cp.api_mcp.api_mcp_pins(), [])
             self.assertEqual(cp.policy._decide_tool(
-                "mcp-github", "create_pull_request", _PR_ARGS)[0], "ask")
+                "mcp-github", "create_pull_request", _PR_ARGS, _SCHEMA)[0], "ask")
 
     def test_a_live_timed_pin_answers_again_when_its_rule_asks_again(self):
         # Editing the rule keeps its pins, and a timed one keeps its deadline.
@@ -4480,7 +4491,8 @@ class PinFromCardTests(_ToolBridgeTestCase):
 class TimedPinFromCardTests(_ToolBridgeTestCase):
     """``allow_pinned_lease``: a pin from a card that answers for
     ``policy.PIN_LEASE_SECONDS``, and what a second grant of the same values does to
-    it. One row per pin set, so a second grant only ever widens the one in place."""
+    it. One row per pin set, so a second grant under the same digest only ever widens
+    the one in place (``SchemaBoundPinFromCardTests`` has the rebind)."""
 
     audits = True
 
@@ -4606,6 +4618,262 @@ class TimedPinFromCardTests(_ToolBridgeTestCase):
         self.assertTrue(resp.body["pin"]["created"])
         [row] = self._pins()
         self.assertGreater(row["id"], lapsed)
+
+
+class SchemaBoundPinBridgeTests(_ToolBridgeTestCase):
+    """``/tool/authorize`` with the digest of the tool's arguments the gateway served:
+    a pin answers only a call made under the digest it was pinned under, the hold row
+    names a pin the call met under another, and a card joins only its own digest."""
+
+    audits = True
+
+    def setUp(self):
+        super().setUp()
+        _tool_rule("create_pull_request", "ask")
+        self.pin_id = _pin(_PINNED)
+
+    def _hold_reason(self, approval_id):
+        with cp.store._connect() as conn:
+            return conn.execute(
+                "SELECT reason FROM audit WHERE kind='hold' AND approval_id=?",
+                (approval_id,)).fetchone()["reason"]
+
+    def test_a_call_under_the_pins_digest_is_answered(self):
+        self.assertEqual(_tool_call(tool="create_pull_request", args=_PR_ARGS)
+                         ["decision"], "allow")
+
+    def test_a_call_under_a_moved_digest_gets_a_card_naming_the_pin(self):
+        answer = _tool_call(tool="create_pull_request", args=_PR_ARGS,
+                            schema_digest=_MOVED)
+        self.assertEqual(answer["decision"], "ask")
+        reason = self._hold_reason(answer["approval_id"])
+        self.assertIn(f"pin {self.pin_id} on owner, repo matches the call's values but "
+                      f"was pinned under other arguments of the tool", reason)
+        self.assertIn(f"registered as tool ask {answer['approval_id']}", reason)
+
+    def test_a_call_with_no_digest_or_a_malformed_one_gets_a_card(self):
+        for digest in (None, "", "5C" * 32, "5c" * 31, _SCHEMA + "\n", 7):
+            with self.subTest(digest=digest):
+                answer = _tool_call(tool="create_pull_request", args=_PR_ARGS,
+                                    schema_digest=digest)
+                self.assertEqual(answer["decision"], "ask")
+                self.assertIn("the gateway sent no digest",
+                              self._hold_reason(answer["approval_id"]))
+                _resolve(answer["approval_id"], "deny")
+
+    def test_a_retry_under_a_new_digest_opens_a_new_card(self):
+        args = {**_PR_ARGS, "repo": "widgets"}
+        first = _tool_call(tool="create_pull_request", args=args)
+        same = _tool_call(tool="create_pull_request", args=args)
+        moved = _tool_call(tool="create_pull_request", args=args,
+                           schema_digest=_MOVED)
+        self.assertTrue(same["joined"])
+        self.assertEqual(same["approval_id"], first["approval_id"])
+        self.assertFalse(moved["joined"])
+        self.assertNotEqual(moved["approval_id"], first["approval_id"])
+        self.assertEqual(len(cp.holds._list_tool_asks()), 2)
+
+    def test_the_card_stores_the_digest_its_call_was_made_under(self):
+        answer = _tool_call(tool="create_pull_request", args=_PR_ARGS,
+                            schema_digest=_MOVED)
+        self.assertEqual(cp.holds._get_tool_ask(answer["approval_id"])["schema_digest"],
+                         _MOVED)
+
+
+class SchemaBoundPinFromCardTests(_ToolBridgeTestCase):
+    """Pinning from a card binds the pin to the card's digest, and pinning the same
+    fields from a card raised under another digest rebinds it: a new grant, for as
+    long as that click says."""
+
+    audits = True
+
+    def setUp(self):
+        super().setUp()
+        saved = cp.policy.PIN_LEASE_SECONDS
+        cp.policy.PIN_LEASE_SECONDS = 300.0
+        self.addCleanup(setattr, cp.policy, "PIN_LEASE_SECONDS", saved)
+        _tool_rule("create_pull_request", "ask")
+
+    def _card(self, digest=_SCHEMA, **changes):
+        return _tool_call(tool="create_pull_request", args={**_PR_ARGS, **changes},
+                          schema_digest=digest)["approval_id"]
+
+    def _pins(self):
+        with cp.store._connect() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT id, approval_id, granted_by, expires_at, schema_digest "
+                "FROM tool_pins ORDER BY id")]
+
+    def _options(self, approval_id):
+        [card] = [c for c in cp.holds._pending_payload()["holds"]
+                  if c["id"] == approval_id]
+        return card["pin_options"]
+
+    def _call(self, digest):
+        return _tool_call(tool="create_pull_request",
+                          args={**_PR_ARGS, "title": "another"},
+                          schema_digest=digest)["decision"]
+
+    def _policy_rows(self, approval_id):
+        with cp.store._connect() as conn:
+            return [(r["kind"], r["reason"]) for r in conn.execute(
+                "SELECT kind, reason FROM audit WHERE approval_id=? "
+                "AND stage='tool-policy' ORDER BY id", (approval_id,))]
+
+    def test_a_card_with_no_digest_offers_no_pin_and_refuses_one(self):
+        # A pin its call meets first, which a card with no digest names no rebind of.
+        pinned = self._card()
+        _resolve(pinned, "allow_pinned", pins=["owner", "repo"])
+        before = self._pins()
+        ask = self._card(digest=None)
+        options = self._options(ask)
+        self.assertEqual(options["fields"], [])
+        self.assertEqual(options["stale"], [])
+        self.assertIn("no digest of the tool's arguments", options["refused"])
+        resp = _resolve(ask, "allow_pinned", pins=["owner", "repo"])
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.body["detail"], options["refused"])
+        self.assertEqual(self._pins(), before)
+        self.assertEqual(_resolve(ask, "allow").status_code, 200)
+
+    def test_a_pin_is_bound_to_its_cards_digest(self):
+        ask = self._card(digest=_MOVED)
+        _resolve(ask, "allow_pinned", pins=["owner", "repo"])
+        [pin] = self._pins()
+        self.assertEqual((pin["approval_id"], pin["schema_digest"]), (ask, _MOVED))
+        self.assertEqual(self._call(_MOVED), "allow")
+        self.assertEqual(self._call(_SCHEMA), "ask")
+
+    def test_the_card_names_a_pin_its_call_met_under_another_digest(self):
+        first = self._card()
+        _resolve(first, "allow_pinned", pins=["owner", "repo"])
+        [pin] = self._pins()
+        moved = self._card(digest=_MOVED)
+        self.assertEqual(self._options(moved)["stale"],
+                         [{"id": pin["id"], "fields": ["owner", "repo"],
+                           "refused": None}])
+        # A card raised under the pin's own digest is not met by it but answered, so
+        # only a call that missed it on other values has a card, and names none.
+        other = self._card(repo="widgets")
+        self.assertEqual(self._options(other)["stale"], [])
+
+    def test_a_rebound_pin_answers_under_the_new_digest_and_asks_under_the_old(self):
+        first = self._card()
+        _resolve(first, "allow_pinned", pins=["owner", "repo"])
+        [before] = self._pins()
+        self.assertEqual(self._call(_MOVED), "ask")
+        moved = cp.holds._list_tool_asks()[-1]["id"]
+        resp = _resolve(moved, "allow_pinned", pins=["owner", "repo"],
+                        request=_FakeRequest(peer="172.31.0.9"))
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.body["pin"]["rebound"])
+        self.assertFalse(resp.body["pin"]["created"])
+        # The row names this card and the resolver who rebound it.
+        self.assertNotEqual(before["granted_by"], "peer=172.31.0.9")
+        self.assertEqual(self._pins(), [{**before, "approval_id": moved,
+                                         "granted_by": "peer=172.31.0.9",
+                                         "schema_digest": _MOVED}])
+        self.assertEqual(self._call(_MOVED), "allow")
+        self.assertEqual(self._call(_SCHEMA), "ask")
+        [(kind, reason)] = self._policy_rows(moved)
+        self.assertEqual(kind, "edit")
+        self.assertIn(f"pin {before['id']} rebound to the tool's current arguments "
+                      f"from this ask (no expiry before it)", reason)
+        self.assertIn("with no expiry, while its rule asks", reason)
+
+    def test_a_timed_rebind_of_a_permanent_pin_is_timed_and_audited_as_an_edit(self):
+        first = self._card()
+        _resolve(first, "allow_pinned", pins=["owner", "repo"])
+        moved = self._card(digest=_MOVED)
+        now = time.time()
+        resp = _resolve(moved, "allow_pinned_lease", pins=["owner", "repo"])
+        pin = resp.body["pin"]
+        self.assertTrue(pin["rebound"])
+        self.assertGreaterEqual(pin["expires_at"], now + 300)
+        self.assertLess(pin["expires_at"], now + 310)
+        self.assertEqual([p["expires_at"] for p in self._pins()], [pin["expires_at"]])
+        [(kind, reason)] = self._policy_rows(moved)
+        self.assertEqual(kind, "edit")
+        self.assertIn("for 5m00s while its rule asks", reason)
+
+    def test_a_rebind_of_a_timed_pin_says_how_long_it_had_left(self):
+        first = self._card()
+        _resolve(first, "allow_pinned_lease", pins=["owner", "repo"])
+        moved = self._card(digest=_MOVED)
+        _resolve(moved, "allow_pinned", pins=["owner", "repo"])
+        [(kind, reason)] = self._policy_rows(moved)
+        self.assertEqual(kind, "edit")
+        self.assertRegex(reason, r"from this ask \(\dm\d\ds left before it\)")
+        self.assertIn("with no expiry, while its rule asks", reason)
+        self.assertEqual([p["expires_at"] for p in self._pins()], [None])
+
+    def test_a_card_raised_before_the_one_a_pin_was_bound_from_cannot_rebind_it(self):
+        old = self._card()
+        later = self._card(digest=_MOVED)
+        with cp.store._connect() as conn:          # strictly earlier, whatever the clock
+            conn.execute("UPDATE tool_approvals SET ts = ts - 10 WHERE id=?", (old,))
+            conn.commit()
+        _resolve(later, "allow_pinned", pins=["owner", "repo"])
+        [pin] = self._pins()
+        [stale] = self._options(old)["stale"]
+        self.assertEqual(stale["id"], pin["id"])
+        self.assertIn("raised after this one", stale["refused"])
+        resp = _resolve(old, "allow_pinned_lease", pins=["owner", "repo"])
+        self.assertEqual(resp.status_code, 409)
+        self.assertTrue(resp.body["pin_refused"])
+        self.assertEqual(resp.body["detail"], stale["refused"])
+        self.assertEqual(self._pins(), [pin])
+        self.assertEqual(cp.holds._get_tool_ask(old)["status"], "pending")
+        # Other fields are a new pin, not a rebind, and the card can still be allowed.
+        self.assertEqual(_resolve(old, "allow_pinned", pins=["repo"]).status_code, 200)
+        self.assertEqual(len(self._pins()), 2)
+
+
+class SchemaBoundPinViewTests(_CPTestCase):
+    """``/api/mcp/pins`` with pins bound to a digest: a row bound to none decides
+    nothing, and a pin whose tool's arguments the inventory saw move says so."""
+
+    def setUp(self):
+        super().setUp()
+        _register()
+        _enable()
+        _tool_rule("create_pull_request", "ask")
+        self.pin_id = _pin(_PINNED)
+
+    def _observe(self, digest):
+        cp.inventory.record({"servers": {"mcp-github": {
+            "status": "ok", "tools": [{"name": "create_pull_request",
+                                       "digest": digest}]}}})
+
+    def test_a_pin_under_the_inventorys_digest_has_not_moved(self):
+        self._observe(_SCHEMA)
+        [served] = cp.api_mcp.api_mcp_pins()
+        self.assertEqual((served["decides"], served["bound"], served["schema_moved"]),
+                         (True, True, False))
+
+    def test_a_pin_under_an_older_digest_says_its_schema_moved(self):
+        # Display only: `decides` stays the rule's conditions, since which digest a
+        # call is made under is per call.
+        self._observe(_MOVED)
+        [served] = cp.api_mcp.api_mcp_pins()
+        self.assertEqual((served["decides"], served["schema_moved"]), (True, True))
+
+    def test_without_an_observed_digest_nothing_is_said_to_have_moved(self):
+        [served] = cp.api_mcp.api_mcp_pins()
+        self.assertFalse(served["schema_moved"])
+        cp.inventory.record({"servers": {"mcp-github": {
+            "status": "ok", "tools": [{"name": "create_pull_request"}]}}})
+        [served] = cp.api_mcp.api_mcp_pins()
+        self.assertFalse(served["schema_moved"])
+
+    def test_a_row_bound_to_no_digest_decides_nothing(self):
+        with cp.store._connect() as conn:
+            conn.execute("UPDATE tool_pins SET schema_digest=NULL")
+            conn.commit()
+        self._observe(_MOVED)
+        [served] = cp.api_mcp.api_mcp_pins()
+        self.assertEqual((served["decides"], served["bound"], served["schema_moved"]),
+                         (False, False, False))
 
 
 class ToolRosterTests(_ToolBridgeTestCase):
@@ -5590,7 +5858,8 @@ class FreshSchemaTests(_FreshStoreTestCase):
             with self.assertRaises(sqlite3.IntegrityError):
                 conn.execute(insert, ("a2",))     # the same pin set from another card
         self.assertEqual(cols, {"id", "server", "tool", "pins_json", "approval_id",
-                                "created_at", "granted_by", "expires_at"})
+                                "created_at", "granted_by", "expires_at",
+                                "schema_digest"})
 
     def test_a_fresh_store_lets_two_leases_hold_the_same_host(self):
         # The absent UNIQUE, asserted rather than assumed. Unreachable through the API
@@ -5620,7 +5889,8 @@ class FreshSchemaTests(_FreshStoreTestCase):
         # pending forever.
         self.assertEqual(cols, {"id", "ts", "server", "tool", "args_json",
                                 "args_digest", "client", "status", "deadline",
-                                "resolved_at", "resolved_by", "claimed_at"})
+                                "resolved_at", "resolved_by", "claimed_at",
+                                "schema_digest"})
 
     def test_new_store_has_the_mcp_server_table_and_no_secret_reference(self):
         # Asserted as an EXACT set, and the exactness is the assertion: a column
@@ -5862,12 +6132,14 @@ class MigrationTests(_FreshStoreTestCase):
                          "'operator',0), ('mcp-github','issue_write','ask',"
                          "'operator',0)")
             conn.execute("INSERT INTO tool_pins(server, tool, pins_json, approval_id, "
-                         "created_at, granted_by) VALUES ('mcp-github','issue_write',"
-                         "'{\"method\":\"create\"}','a1',0,'g')")
+                         "created_at, granted_by, schema_digest) VALUES ('mcp-github',"
+                         "'issue_write','{\"method\":\"create\"}','a1',0,'g',?)",
+                         (_SCHEMA,))
             conn.commit()
         self.assertEqual(cp.policy._decide_tool("mcp-github", "get_me")[0], "allow")
         self.assertEqual(cp.policy._decide_tool("mcp-github", "issue_write",
-                                                {"method": "create"})[0], "allow")
+                                                {"method": "create"}, _SCHEMA)[0],
+                         "allow")
 
     def test_migration_is_idempotent(self):
         self._old_store("migrate-twice.db")
@@ -6506,6 +6778,139 @@ class SchemaVersionTests(_FreshStoreTestCase):
         # exist, so it could never be added later.
         versions = [v for v, _, _ in cp.store._STEPS]
         self.assertEqual(versions, list(range(1, cp.store.SCHEMA_VERSION + 1)))
+
+
+class SchemaDigestMigrationTests(_FreshStoreTestCase):
+    """v12, which binds pins to the digest of the tool's arguments: every pin made
+    before it is dropped and audited (the operator's choice, over binding each to the
+    first call that meets it), and an ask from before it keeps no digest."""
+
+    # `tool_pins` and `tool_approvals` as v8 and the tool bridge left them, before v12.
+    _PINS_V11 = """CREATE TABLE tool_pins (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, server TEXT NOT NULL, tool TEXT NOT NULL,
+        pins_json TEXT NOT NULL, approval_id TEXT NOT NULL, created_at REAL NOT NULL,
+        granted_by TEXT NOT NULL,
+        expires_at REAL CHECK (expires_at IS NULL OR typeof(expires_at) = 'real'),
+        UNIQUE(server, tool, pins_json))"""
+    _ASKS_V11 = """CREATE TABLE tool_approvals (
+        id TEXT PRIMARY KEY, ts REAL NOT NULL, server TEXT NOT NULL, tool TEXT NOT NULL,
+        args_json TEXT NOT NULL, args_digest TEXT NOT NULL, client TEXT,
+        status TEXT NOT NULL, deadline REAL NOT NULL, resolved_at REAL,
+        resolved_by TEXT, claimed_at REAL)"""
+
+    def _v11_store(self, name):
+        """A store at v11 holding two pins, the higher one revoked already so the
+        sequence is past every row, and one pending ask."""
+        self._use_store(name)
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            conn.execute("DROP TABLE tool_pins")
+            conn.execute(self._PINS_V11)
+            conn.executemany(
+                "INSERT INTO tool_pins(id, server, tool, pins_json, approval_id, "
+                "created_at, granted_by, expires_at) VALUES (?, 'mcp-github', ?, ?, ?, "
+                "0, 'g', ?)",
+                [(4, "issue_read", '{"method":"get"}', "card-4", None),
+                 (7, "issue_write", '{"method":"create"}', "card-7", 4102444800.0),
+                 (9, "issue_write", '{"method":"update"}', "card-9", None)])
+            conn.execute("DELETE FROM tool_pins WHERE id=9")
+            conn.execute("DROP TABLE tool_approvals")
+            conn.execute(self._ASKS_V11)
+            conn.execute(
+                "INSERT INTO tool_approvals(id, ts, server, tool, args_json, "
+                "args_digest, client, status, deadline) VALUES ('old-ask', ?, "
+                "'mcp-github', 'issue_read', '{\"method\":\"get\"}', 'd', NULL, "
+                "'pending', ?)", (time.time(), time.time() + 3600))
+            conn.execute("PRAGMA user_version = 11")
+            conn.commit()
+
+    @staticmethod
+    def _version():
+        with cp.store._connect() as conn:
+            return conn.execute("PRAGMA user_version").fetchone()[0]
+
+    @staticmethod
+    def _table(name):
+        with cp.store._connect() as conn:
+            return [tuple(r) for r in conn.execute(f"PRAGMA table_info({name})")]
+
+    def test_v12_is_the_current_step(self):
+        self.assertEqual(cp.store.SCHEMA_VERSION, 12)
+        self.assertEqual(cp.store._STEPS[-1][:2],
+                         (12, "pins bound to the tool's arguments"))
+
+    def test_v12_drops_every_pin_audits_each_and_keeps_counting(self):
+        self._v11_store("schema-digest-pins.db")
+        cp.store._init_db()
+        self.assertEqual(self._version(), 12)
+        with cp.store._connect() as conn:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM tool_pins").fetchone()[0], 0)
+            rows = [dict(r) for r in conn.execute(
+                "SELECT kind, stage, server, tool, approval_id, reason FROM audit "
+                "WHERE stage='tool-policy' ORDER BY id")]
+            new_id = conn.execute(
+                "INSERT INTO tool_pins(server, tool, pins_json, approval_id, "
+                "created_at, granted_by, schema_digest) VALUES ('s', 't', "
+                "'{\"a\":1}', 'b', 0, 'g', ?)", (_SCHEMA,)).lastrowid
+        self.assertEqual(
+            [(r["kind"], r["server"], r["tool"], r["approval_id"]) for r in rows],
+            [("revoke", "mcp-github", "issue_read", "card-4"),
+             ("revoke", "mcp-github", "issue_write", "card-7")])
+        self.assertTrue(rows[0]["reason"].startswith("pin 4 dropped by schema v12"))
+        self.assertTrue(rows[1]["reason"].startswith("pin 7 dropped by schema v12"))
+        # Past the revoked pin 9 too, so no id a page or the audit named comes back.
+        self.assertEqual(new_id, 10)
+
+    def test_v12_keeps_a_pending_ask_which_cannot_then_be_pinned(self):
+        self._v11_store("schema-digest-asks.db")
+        cp.store._init_db()
+        [card] = cp.holds._list_tool_asks()
+        self.assertEqual((card["id"], card["schema_digest"]), ("old-ask", None))
+        self.assertIn("no digest", card["pin_options"]["refused"])
+
+    def test_a_store_below_v8_loses_its_pins_once_to_v8(self):
+        self._use_store("schema-digest-below-v8.db")
+        with cp.store._connect() as conn:
+            for ddl in MigrationTests._OLD_SCHEMA:
+                conn.execute(ddl)
+            conn.execute(SchemaVersionTests._PINS_V7)
+            conn.execute("INSERT INTO tool_pins(server, tool, pins_json, approval_id, "
+                         "created_at, granted_by) VALUES ('s', 't', "
+                         "'{\"repo\":\"dockade\"}', 'a', 0, 'g')")
+            conn.commit()
+        cp.store._init_db()
+        self.assertEqual(self._version(), 12)
+        with cp.store._connect() as conn:
+            reasons = [r["reason"] for r in conn.execute(
+                "SELECT reason FROM audit WHERE stage='tool-policy'")]
+            self.assertIn("schema_digest", cp.store._columns(conn, "tool_pins"))
+            self.assertIn("schema_digest", cp.store._columns(conn, "tool_approvals"))
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("dropped by schema v8", reasons[0])
+
+    def test_v12_skips_a_table_the_store_does_not_have(self):
+        # A store stamped before either table existed: the DDL after the steps
+        # creates both with the column.
+        self._use_store("schema-digest-no-tables.db")
+        with cp.store._connect() as conn:
+            for ddl in MigrationTests._OLD_SCHEMA:
+                conn.execute(ddl)
+            cp.store._step_12_schema_digest(conn)
+            self.assertEqual(cp.store._columns(conn, "tool_pins"), set())
+            self.assertEqual(cp.store._columns(conn, "tool_approvals"), set())
+
+    def test_a_migrated_and_a_fresh_store_agree_on_both_tables(self):
+        # Compared column by column, as v10's: v12 ALTERs the column in, so the stored
+        # SQL differs from the CREATE even where the schema agrees. The column is last
+        # in the DDL, so the order agrees too.
+        self._v11_store("schema-digest-agree-migrated.db")
+        cp.store._init_db()
+        migrated = {t: self._table(t) for t in ("tool_pins", "tool_approvals")}
+        self._use_store("schema-digest-agree-fresh.db")
+        cp.store._init_db()
+        self.assertEqual(migrated,
+                         {t: self._table(t) for t in ("tool_pins", "tool_approvals")})
 
 
 class LegacyClassNameTests(unittest.TestCase):

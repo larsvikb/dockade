@@ -331,7 +331,7 @@ def _allow_pinned(approval_id: str, ask: dict | None, fields: object,
     if ask is None:
         return JSONResponse({"ok": False, "detail": "not pending (unknown)",
                              "status": None}, status_code=409)
-    candidates = policy._pin_candidates(ask["args_json"])
+    candidates = policy._pin_candidates(ask["args_json"], ask["schema_digest"])
     if candidates["refused"]:
         return JSONResponse({"ok": False, "detail": candidates["refused"]},
                             status_code=400)
@@ -350,8 +350,8 @@ def _allow_pinned(approval_id: str, ask: dict | None, fields: object,
     answer = holds._resolve_tool_ask_pinned(
         approval_id, actor, pins_json, policy.PIN_LEASE_SECONDS if leased else None)
     if answer.refused:
-        # The rule moved while the card was pending. Not stale: the card can still be
-        # allowed without a pin, or denied.
+        # The rule moved while the card was pending, or a later card has rebound the
+        # pin. Not stale: the card can still be allowed without a pin, or denied.
         return JSONResponse({"ok": False, "detail": answer.refused,
                              "pin_refused": True}, status_code=409)
     if answer.status is None:
@@ -400,12 +400,21 @@ def _allow_pinned(approval_id: str, ask: dict | None, fields: object,
                             f"before it); {ask['tool']} on {ask['server']} pinned on "
                             f"{named} runs without a card"
                             f"{lasting or ', with no expiry,'} while its rule asks")
+    elif answer.change == "rebound":
+        had = ("no expiry" if answer.replaced is None
+               else f"{policy._short_duration(answer.replaced - now)} left")
+        store._audit("edit", stage="tool-policy", **where,
+                     reason=f"pin {answer.pin_id} rebound to the tool's current "
+                            f"arguments from this ask ({had} before it); {ask['tool']} "
+                            f"on {ask['server']} pinned on {named} runs without a card"
+                            f"{lasting or ', with no expiry,'} while its rule asks")
     return JSONResponse({"ok": True, "kind": "tool", "outcome": "allow",
                          "status": answer.status, "server": ask["server"],
                          "tool": ask["tool"],
                          "pin": {"id": answer.pin_id, "fields": sorted(chosen),
                                  "created": answer.change == "created",
                                  "extended": answer.change == "extended",
+                                 "rebound": answer.change == "rebound",
                                  "expires_at": answer.expires_at}})
 
 

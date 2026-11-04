@@ -484,10 +484,15 @@ def api_mcp_pins() -> list[dict]:
 
     ``decides`` is the conditions ``policy._decide_tool`` reads a pin under, so the
     view cannot call a pin live that the decision passes over: the tool's rule is
-    `ask`, its server is enabled, and the row holds a pin set. ``pins`` is None for a
-    row that does not (``policy._parse_pins``). An expired pin is left out rather
-    than listed as deciding nothing, as ``api_egress.api_leases`` leaves out an
-    expired lease: nothing will make it decide again.
+    `ask`, its server is enabled, and the row holds a pin set bound to a digest of the
+    tool's arguments. ``pins`` is None for a row that holds no pin set
+    (``policy._parse_pins``), and ``bound`` false for one with no digest. Which digest
+    a call is made under is per call, so it is not among them. ``schema_moved`` is
+    display only: the inventory's latest digest for the tool differs from the pin's,
+    so calls the gateway makes under it get a card until the pin is pinned again. An
+    expired pin is left out rather than listed as deciding nothing, as
+    ``api_egress.api_leases`` leaves out an expired lease: nothing will make it decide
+    again.
 
     ``pins_json`` is the row as stored, for the page to show without parsing: a
     browser's JSON.parse rounds an integer past 2^53, and a pin is compared exactly.
@@ -495,19 +500,26 @@ def api_mcp_pins() -> list[dict]:
     with store._connect() as conn:
         rows = conn.execute(
             "SELECT p.id, p.server, p.tool, p.pins_json, p.approval_id, "
-            "p.created_at, p.granted_by, p.expires_at, r.action, s.enabled "
+            "p.created_at, p.granted_by, p.expires_at, p.schema_digest, r.action, "
+            "s.enabled "
             "FROM tool_pins p "
             "LEFT JOIN tool_rules r ON r.server = p.server AND r.tool = p.tool "
             "LEFT JOIN mcp_servers s ON s.server = p.server "
             "WHERE p.expires_at IS NULL OR p.expires_at > ? "
             "ORDER BY p.server, p.tool, p.id", (time.time(),)).fetchall()
+    seen = inventory.snapshot()
     out = []
     for r in rows:
         pins = policy._parse_pins(r["pins_json"])
+        bound = r["schema_digest"] is not None
+        current = ((seen.get(r["server"]) or {}).get("digests") or {}).get(r["tool"])
         out.append({"id": r["id"], "server": r["server"], "tool": r["tool"],
                     "pins": pins, "pins_json": r["pins_json"], "rule": r["action"],
-                    "decides": (pins is not None and r["action"] == "ask"
+                    "decides": (pins is not None and bound and r["action"] == "ask"
                                 and bool(r["enabled"])),
+                    "bound": bound,
+                    "schema_moved": (bound and current is not None
+                                     and current != r["schema_digest"]),
                     "approval_id": r["approval_id"], "created_at": r["created_at"],
                     "granted_by": r["granted_by"], "expires_at": r["expires_at"]})
     return out

@@ -7,7 +7,7 @@
 // A PR that moves a surface out of `start()` adds the steps that exercise it here,
 // in the PR that moves it.
 
-import { HOLDS, NOW_MS, RULES, abortConfig, failRules, setRules } from "./backend.js";
+import { HOLDS, NOW_MS, RULES, STALE_HOLD, abortConfig, failRules, setRules } from "./backend.js";
 
 const egressCard = page => page.locator("#pending .card:not(.tool)");
 const toolCard = page => page.locator("#pending .card.tool");
@@ -54,6 +54,27 @@ export const STEPS = [
   // pointer is still over the list from the last click, and a card under it is not
   // swept, so moving it away is what lets the dwell decide.
   ["holds leave", async ({ page, push, clock }) => {
+    await push([]);
+    await page.mouse.move(0, 0);
+    await clock(10000);
+  }],
+
+  // A card whose call met pins made under other arguments of the tool: the panel
+  // names them, refuses the rebind the backend would, and says when one rebinds.
+  ["stale-pin hold arrives", async ({ push }) => { await push([STALE_HOLD]); }],
+  ["stale pin confirm opens", async ({ page }) => {
+    await toolCard(page).getByRole("button", { name: "Allow + pin…" }).click();
+  }],
+  ["stale pin confirm, owner ticked (refused rebind)", async ({ page }) => {
+    await toolCard(page).locator(".cpins input").first().check();
+  }],
+  ["stale pin confirm, owner and repo ticked (rebind)", async ({ page }) => {
+    await toolCard(page).locator(".cpins input").nth(1).check();
+  }],
+  ["stale pin rebound for good", async ({ page }) => {
+    await toolCard(page).locator(".cactions button.confirmgo").nth(1).click();
+  }],
+  ["stale-pin hold leaves", async ({ page, push, clock }) => {
     await push([]);
     await page.mouse.move(0, 0);
     await clock(10000);

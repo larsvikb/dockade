@@ -171,7 +171,7 @@ const owner = {
   "status.js": ["auditStatus", "rulesStatus", "toolRulesStatus", "toolPinsStatus",
                 "leasesStatus"],
   "list-status.js": ["pollStatus", "renderListStatus"],
-  "escape.js": ["escapePayload"],
+  "escape.js": ["escapePayload", "isHidden"],
   "holds.js": ["renderableHolds", "diffPending", "shouldSweep",
                "toolRemaining", "toolOutcomeMessage", "pinPreview",
                "holdRemaining", "countdownState", "departure", "persistPreview",
@@ -196,6 +196,11 @@ const _row = {server: "mcp-github", enabled: false,
                      template: "Bearer {secret}"},
               endpoint: {port: 3000, path: "/v1/mcp"}};
 const _at = m.serverEndpoint("8082", "/mcp");
+// Variation selectors, one per byte: the published way to smuggle data in a payload.
+// Mixed BMP and astral, U+FE0F among them but not first, more kinds than the tally
+// names, and an astral one frequent enough to be named.
+const _selectors =
+  "\uFE00\uFE01\uFE0F\uFE05\u{E0100}\u{E01EF}\u{E0100}\uFE0F";
 console.log(JSON.stringify({
   missing,
   duplicated,
@@ -422,6 +427,25 @@ console.log(JSON.stringify({
     hazards_many: m.payloadHazards('{"b":"\u00e1\u00e9\u00ed\u00f3\u00fa\u00fc"}'),
     // Astral: JSON writes a surrogate pair, and so must the escaped form.
     hazards_astral: m.payloadHazards('{"title":"\ud83d\ude00"}'),
+    selectors: _selectors,
+    hazards_smuggled: m.payloadHazards(`{"b":"a${_selectors}"}`),
+    // The same run after an astral emoji, opening with the U+FE0F an emoji takes.
+    hazards_smuggled_emoji: m.payloadHazards(`{"b":"\u{1F600}\uFE0F${_selectors}"}`),
+    hazards_emoji_two_selectors: m.payloadHazards('{"b":"\u2764\uFE0F\uFE0F"}'),
+    hazards_emoji_bmp: m.payloadHazards('{"body":"love \u2764\uFE0F it"}'),
+    hazards_emoji_astral: m.payloadHazards('{"body":"ok \u{1F44D}\uFE0F"}'),
+    hazards_selector_after_letter: m.payloadHazards('{"b":"a\uFE0F"}'),
+    // `#` is Emoji (a keycap's base) but not Extended_Pictographic.
+    hazards_selector_after_hash: m.payloadHazards('{"b":"#\uFE0F"}'),
+    hazards_cgj: m.payloadHazards('{"b":"a\u034Fb"}'),
+    hazards_hangul_filler: m.payloadHazards('{"b":"a\u3164b"}'),
+    hazards_mongolian_selector: m.payloadHazards('{"b":"a\u180Bb"}'),
+    // Only U+FE0F is exempt after an emoji, not whatever hidden character follows one.
+    hazards_emoji_then_override: m.payloadHazards('{"b":"\u{1F600}\u202Eevil"}'),
+    hazards_emoji_then_fe00: m.payloadHazards('{"b":"\u2764\uFE00"}'),
+    hazards_emoji_text_presentation: m.payloadHazards('{"b":"\u2764\uFE0E"}'),
+    // INTERLINEAR ANNOTATION TERMINATOR: `Cf`, but not default-ignorable.
+    hazards_format_not_ignorable: m.payloadHazards('{"b":"a\uFFFBb"}'),
     hazards_missing: m.payloadHazards(undefined),
     // Spelled the way holds._canonical_args writes a payload: sorted keys, no whitespace.
     indent_flat: m.indentPayload('{"owner":"octo","repo":"hello"}'),
@@ -5040,6 +5064,73 @@ class PayloadHazardTests(unittest.TestCase):
 
     def test_a_missing_payload_is_not_flagged(self):
         self.assertEqual(self.probe["tool"]["hazards_missing"]["level"], "none")
+
+    def _tally(self, hazards: dict) -> list[str]:
+        return hazards["note"].split("(")[1].split(")")[0].split(", ")
+
+    def test_a_selector_per_byte_payload_is_danger_and_spelled_in_the_tally(self):
+        run = self.probe["tool"]["selectors"]
+        h = self.probe["tool"]["hazards_smuggled"]
+        self.assertEqual(h["level"], "danger")
+        self.assertEqual(h["invisible"], len(run))
+        self.assertNotIn("nothing is hidden", h["note"])
+        for ch in run:
+            self.assertNotIn(ch, h["note"])
+        named = self._tally(h)
+        self.assertEqual(named[-1], "+2 more")
+        for item in named[:-1]:
+            self.assertRegex(item, r"^(\\u[0-9a-f]{4})+ x\d+$")
+        self.assertIn("\\udb40\\udd00 x2", named)
+
+    def test_a_selector_run_after_an_emoji_counts_all_but_the_emojis_own(self):
+        run = self.probe["tool"]["selectors"]
+        h = self.probe["tool"]["hazards_smuggled_emoji"]
+        self.assertEqual(h["level"], "danger")
+        self.assertEqual(h["invisible"], len(run))
+        self.assertEqual(h["nonAscii"], len(run) + 2)
+
+    def test_a_second_selector_after_an_emoji_is_danger(self):
+        h = self.probe["tool"]["hazards_emoji_two_selectors"]
+        self.assertEqual(h["level"], "danger")
+        self.assertEqual(h["invisible"], 1)
+
+    def test_an_ordinary_emoji_is_noted_with_its_selector_spelled(self):
+        for name in ("hazards_emoji_bmp", "hazards_emoji_astral"):
+            with self.subTest(name):
+                h = self.probe["tool"][name]
+                self.assertEqual(h["level"], "note")
+                self.assertEqual((h["invisible"], h["nonAscii"]), (0, 2))
+                self.assertIn("nothing is hidden", h["note"])
+                self.assertIn("\\ufe0f x1", self._tally(h))
+                self.assertNotIn("\ufe0f", h["note"])
+
+    def test_a_selector_after_a_base_that_is_not_pictographic_is_danger(self):
+        for name in ("hazards_selector_after_letter", "hazards_selector_after_hash"):
+            with self.subTest(name):
+                h = self.probe["tool"][name]
+                self.assertEqual(h["level"], "danger")
+                self.assertEqual(h["invisible"], 1)
+
+    def test_default_ignorables_outside_the_format_class_are_danger(self):
+        for name in ("hazards_cgj", "hazards_hangul_filler",
+                     "hazards_mongolian_selector"):
+            with self.subTest(name):
+                h = self.probe["tool"][name]
+                self.assertEqual(h["level"], "danger")
+                self.assertEqual(h["invisible"], 1)
+
+    def test_a_format_character_that_is_not_ignorable_is_danger(self):
+        h = self.probe["tool"]["hazards_format_not_ignorable"]
+        self.assertEqual(h["level"], "danger")
+        self.assertEqual(h["invisible"], 1)
+
+    def test_only_an_emojis_u_fe0f_is_exempt(self):
+        for name in ("hazards_emoji_then_override", "hazards_emoji_then_fe00",
+                     "hazards_emoji_text_presentation"):
+            with self.subTest(name):
+                h = self.probe["tool"][name]
+                self.assertEqual(h["level"], "danger")
+                self.assertEqual(h["invisible"], 1)
 
     def test_only_the_danger_tier_rewrites_the_card(self):
         # Source-level, like the other DOM assertions in this file: escaped-first is

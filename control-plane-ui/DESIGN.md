@@ -126,11 +126,12 @@ keeps a break inside a string from passing for one between fields, so a payload
 carrying its own `↵` is named in the note, and shows it in the string's colour rather
 than the mark's. Nothing else is unescaped, and the escaped
 view shows `\n` as written. The other change to content runs the opposite way: a
-payload carrying invisible or non-ASCII characters is shown *escaped* by default, `\u202e` spelled out where it
+payload carrying a hidden character (`isHidden` in `ui-common/escape.js`, bar a
+U+FE0F directly after a pictographic emoji) is shown *escaped* by default, `\u202e` spelled out where it
 sits, with the raw text one click away — because a bidi override lets the browser
 reorder what the operator reads while the bytes stay as they are, which is the
 reordering this rule forbids, performed by the renderer (`payloadHazards` in
-`control-plane-ui/payload.js`). The
+`control-plane-ui/payload.js`). Any other non-ASCII is only noted. The
 limit worth stating rather than engineering around: an operator cannot judge an
 opaque identifier, and resolving one would mean the control plane making its own MCP
 calls — new capability on the crown-jewel container and a fine SSRF surface.

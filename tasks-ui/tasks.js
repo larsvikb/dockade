@@ -18,7 +18,7 @@
  * (tests/test_tasks_ui_js.py).
  */
 import { lineDiff, wordDiff } from "./diff.js";
-import { escapePayload } from "./escape.js";
+import { escapePayload, isHidden, NON_ASCII_RE } from "./escape.js";
 import { pollStatus, renderListStatus } from "./list-status.js";
 import {
   TASK_STATES, NOT_RUNNING_STATUS, movesFor, noteMovesFor, isNoteMove,
@@ -34,24 +34,22 @@ import { fmtStamp, fmtInstant } from "./time.js";
 // states themselves (TASK_STATES, moves.js). A test holds it to the registry's.
 export const EVERY_STATE = "all";
 
-// Characters that render as nothing or reorder what is around them: the payload
-// view's set (control-plane-ui/payload.js), less the line break and the tab, since this
-// is prose, and with Unicode's default-ignorable code points, which include the
-// variation selectors a hidden payload can ride on to an agent. One U+202E in a body
-// draws the rest of its line backwards, and an approved body is what every later
-// session reads, so the operator must see what is in it rather than what the browser
-// makes of it. An emoji's U+FE0F is spelled too: the price of not guessing which
-// selector carries nothing.
+// `text` with each hidden character (`isHidden`, escape.js) spelled `\uXXXX` where it
+// sits, and how many there were, less the line break and the tab, since this is prose.
+// One U+202E in a body draws the rest of its line backwards, and an approved body is
+// what every later session reads, so the operator must see what is in it rather than
+// what the browser makes of it. An emoji's U+FE0F is spelled too: the price of not
+// guessing which selector carries nothing. Spelled, never dropped: dropping would show
+// a cleaned copy of what agents read.
 // The task registry's export spells the same set (task-registry/export.py).
-const HIDDEN_RE =
-  /(?![\n\t])[\p{Cf}\p{Cc}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}]/gu;
-
-// `text` with each hidden character spelled `\uXXXX` where it sits, and how many there
-// were. Spelled, never dropped: dropping would show a cleaned copy of what agents read.
 export function spellHidden(text) {
   const s = typeof text === "string" ? text : "";
   let hidden = 0;
-  const shown = s.replace(HIDDEN_RE, ch => { hidden++; return escapePayload(ch); });
+  const shown = s.replace(NON_ASCII_RE, ch => {
+    if (ch === "\n" || ch === "\t" || !isHidden(ch)) return ch;
+    hidden++;
+    return escapePayload(ch);
+  });
   return { text: shown, hidden };
 }
 

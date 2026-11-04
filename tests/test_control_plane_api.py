@@ -3836,6 +3836,91 @@ class McpToolRuleTests(_CPTestCase):
         self.assertEqual(served, {"mcp-github": 2})
 
 
+class McpToolRuleRevokeTests(_CPTestCase):
+    """Revoking a tool rule names, in its audit and its answer, the row it deleted."""
+
+    audits = True
+
+    def setUp(self):
+        super().setUp()
+        _register()
+        _enable()
+        self.rule_id = _tool_rule("get_me", "allow").body["id"]
+
+    def _revoke_with_an_edit_after_the_read(self):
+        """Revoke, with another writer's allow-to-deny edit tried right after the
+        revoke's own SELECT. Returns the response and whether the edit landed, or
+        None if the hook never fired."""
+        rule_id = self.rule_id
+        landed = []
+
+        class _EditsAfterTheRead:
+            """Wraps the connection rather than patching it: sqlite3.Connection.execute
+            is read-only, so the edit has to be injected from outside the object."""
+
+            def __init__(self, conn):
+                object.__setattr__(self, "_conn", conn)
+
+            def execute(self, sql, *a):
+                cur = self._conn.execute(sql, *a)
+                if not landed and sql.startswith("SELECT server, tool, action "
+                                                 "FROM tool_rules"):
+                    # No busy wait: against the revoke's lock this must fail now,
+                    # not stall for store._connect's timeout.
+                    other = sqlite3.connect(cp.store.DB_PATH, timeout=0)
+                    try:
+                        other.execute("UPDATE tool_rules SET action='deny' WHERE id=?",
+                                      (rule_id,))
+                        other.commit()
+                        landed.append(True)
+                    except sqlite3.OperationalError as e:
+                        # Only the lock counts: a renamed table or a moved
+                        # DB_PATH would otherwise pass without the fix.
+                        if e.sqlite_errorcode & 0xFF != sqlite3.SQLITE_BUSY:
+                            raise
+                        landed.append(False)
+                    finally:
+                        other.close()
+                return cur
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+            def __setattr__(self, name, value):
+                setattr(self._conn, name, value)
+
+            def __enter__(self):
+                self._conn.__enter__()
+                return self
+
+            def __exit__(self, *exc):
+                return self._conn.__exit__(*exc)
+
+        real_connect = cp.store._connect
+        with mock.patch.object(cp.store, "_connect",
+                               lambda: _EditsAfterTheRead(real_connect())):
+            resp = cp.api_mcp.revoke_mcp_rule(rule_id, _FakeRequest())
+        return resp, (landed[0] if landed else None)
+
+    def test_the_audit_names_the_action_of_the_row_deleted(self):
+        resp, landed = self._revoke_with_an_edit_after_the_read()
+        deleted = "deny" if landed else "allow"
+        self.assertEqual(resp.status_code, 200)
+        with cp.store._connect() as conn:
+            reason = conn.execute("SELECT reason FROM audit WHERE kind='revoke' "
+                                  "ORDER BY id DESC LIMIT 1").fetchone()["reason"]
+        self.assertIn(f"was {deleted},", reason)
+        self.assertEqual(resp.body["action"], deleted)
+        # And it was the lock that kept them in step, not the hook missing its moment.
+        self.assertIsNotNone(landed, "the hook never saw the revoke's SELECT")
+        self.assertFalse(landed, "the edit landed between the read and the delete")
+
+    def test_revoking_an_unknown_rule_is_a_404(self):
+        resp = cp.api_mcp.revoke_mcp_rule(self.rule_id + 1, _FakeRequest())
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(cp.policy._decide_tool("mcp-github", "get_me")[0], "allow")
+
+
 def _tool_call(server="mcp-github", tool="get_me", args=None, client=CLASS_IP):
     """One tool call put to the bridge. ``client`` defaults to a real sandbox-net
     address for the reason ``_auth_req`` does: it is what the per-client cap counts

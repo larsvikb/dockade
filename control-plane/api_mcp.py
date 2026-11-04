@@ -432,10 +432,14 @@ def revoke_mcp_rule(rule_id: int, request: Request) -> JSONResponse:
     actor = provenance._actor(request)
     now = time.time()
     with store._connect() as conn:
+        # One write transaction, so the row the audit describes is the row deleted: an
+        # edit in between could otherwise change its action.
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT server, tool, action FROM tool_rules WHERE id=?",
             (rule_id,)).fetchone()
         if row is None:
+            conn.rollback()
             return JSONResponse({"ok": False, "detail": "unknown rule"},
                                 status_code=404)
         # The pin check is IN the delete, so a pin written from a card between a count
@@ -450,6 +454,7 @@ def revoke_mcp_rule(rule_id: int, request: Request) -> JSONResponse:
                 "SELECT COUNT(*) FROM tool_pins WHERE server=? AND tool=? "
                 "AND (expires_at IS NULL OR expires_at > ?)",
                 (row["server"], row["tool"], now)).fetchone()[0]
+            conn.rollback()
             return JSONResponse(
                 {"ok": False,
                  "detail": f"{row['tool']} on {row['server']} still has {pins} "

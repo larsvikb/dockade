@@ -174,7 +174,7 @@ refresh while saying they may be stale, and stays silent before the first respon
 three-state logic is shared (`pollStatus`, in `ui-common/`) with per-view wording a test
 keeps distinct — a stale **policy** table is worse than a stale decisions one, since it
 misstates what is currently allowed before an operator decides a hold. Details in
-`audit.js` and `app.js`, the two polls.
+`audit.js` and `egress-rules.js`, the two polls.
 
 **The frontend's own tests.** `tests/test_control_plane_ui_js.py` runs the pure helpers
 under `node` (skipped when node is absent, the way `make lint` skips a missing linter)
@@ -200,9 +200,13 @@ A surface's DOM code sits in its own module below the pure half, and `start()` m
 it. Its `mount…()` functions look up its elements into module-level `let`s and wire
 its listeners, since a lookup at import would fail under node. Its state lives in the
 module that writes it, and what other modules call is a named export, so a misspelling
-stops the page at link time, where the import test sees it, not at a click. The one
-mistake this shape adds is a lookup left out of a mount, a name that resolves and holds
-`undefined`; `test_every_element_a_module_declares_is_looked_up_once_in_its_mount`
+stops the page at link time, where the import test sees it, not at a click. A module
+that needs to know whether its view is up reads its section's `hidden`, which
+`showView` sets before the first refresh or poll runs, rather than keeping its own copy of the
+current view or being handed one: the page keeps one source of truth for it, and
+`app.js` gains no export. The one mistake this shape adds is a lookup left out of a
+mount, a name that resolves and holds `undefined`;
+`test_every_element_a_module_declares_is_looked_up_once_in_its_mount`
 (`PageChecks`, run for this page and the tasks page) is its guard.
 
 Two cross-file couplings have no compiler between their ends, and a test stands in at

@@ -375,7 +375,8 @@ dockade/
                             #   — and the decisions view itself, which start() mounts
     dom.js                  #   what more than one surface needs to build markup: esc
     egress-rules.js         #   what creating, editing or revoking a standing rule is about
-                            #   to do, said before the click
+                            #   to do, said before the click — and the Policy view itself,
+                            #   which start() mounts
     holds.js                #   the pending queue's decisions: what a push changes, when a
                             #   card may go, how a countdown reads, how an arrival is announced
     leases.js               #   timed grants as shown: the button label, each lease's countdown,

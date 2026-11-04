@@ -70,6 +70,15 @@ function fakeEventSource() {
       es.dispatchEvent(new MessageEvent("pending", { data: JSON.stringify(data) }));
     }
   };
+  // The stream ending in CLOSED, as a 502 from the relay leaves it, which the page
+  // must reconnect from by itself.
+  window.__harnessDrop = () => {
+    for (const es of open) {
+      if (es.readyState !== FakeEventSource.OPEN) continue;
+      es.readyState = FakeEventSource.CLOSED;
+      if (es.onerror) es.onerror(new Event("error"));
+    }
+  };
 }
 
 // The DOM as indented lines, one element or text run per line. Properties a script
@@ -126,6 +135,8 @@ async function main() {
   // A step whose element is not there fails the run in seconds rather than in 30.
   page.setDefaultTimeout(5000);
   await page.coverage.startJSCoverage({ resetOnNavigation: false });
+  const coverage = [];
+  let loaded = false;
 
   let log = [];
   let inFlight = 0;
@@ -161,6 +172,8 @@ async function main() {
         log.push(`  ^ no fixture answers this; 404`);
         return await route.fulfill({ status: 404, json: { detail: "no fixture" } });
       }
+      // A request the network drops, so the page's `fetch` throws.
+      if (answer.abort) return await route.abort();
       await route.fulfill({ status: answer.status, json: answer.json });
     } finally {
       inFlight--;
@@ -185,8 +198,18 @@ async function main() {
   const helpers = {
     page,
     push: holds => page.evaluate(h => window.__harnessPush({ holds: h }), holds),
+    drop: () => page.evaluate(() => window.__harnessDrop()),
     clock: ms => page.clock.runFor(ms),
-    load: () => page.goto(ORIGIN + "/"),
+    // A reload replaces the page's scripts, and V8 forgets the counts of the ones it
+    // replaced, so what the page ran so far is taken first and merged at the end.
+    load: async () => {
+      if (loaded) {
+        coverage.push(...await page.coverage.stopJSCoverage());
+        await page.coverage.startJSCoverage({ resetOnNavigation: false });
+      }
+      loaded = true;
+      await page.goto(ORIGIN + "/");
+    },
     accept: () => { accepting = true; },
   };
 
@@ -209,7 +232,7 @@ async function main() {
     if (failed) break;
   }
   process.exitCode = failed ? 1 : 0;
-  const coverage = await page.coverage.stopJSCoverage();
+  coverage.push(...await page.coverage.stopJSCoverage());
   await browser.close();
   await writeFile(outFile, out.join("\n"));
   for (const line of coverageReport(coverage)) console.log(line);
@@ -218,19 +241,33 @@ async function main() {
 // Which of each module's functions the scenario called, and every one it never did,
 // by name and line: how much of the page the transcript can speak for. Function level,
 // from V8's precise coverage, where a function's first range carries its call count.
-// A script's first function is the module body itself, so it is skipped. V8 does not
+// The module body itself, the function at offset 0, is skipped. V8 does not
 // list a function nested in one that never ran, so the total is a floor and the
-// "never" list names only the outermost of each uncalled nest.
+// "never" list names only the outermost of each uncalled nest. A script loaded more
+// than once, across a reload, is one module: its functions' counts are summed.
 function coverageReport(entries) {
   const lines = [];
-  const ours = entries.filter(e => e.url.startsWith(ORIGIN) && e.url.endsWith(".js"))
-    .sort((a, b) => a.url.localeCompare(b.url));
+  const byUrl = new Map();
+  for (const e of entries) {
+    if (!e.url.startsWith(ORIGIN) || !e.url.endsWith(".js")) continue;
+    const merged = byUrl.get(e.url) || { url: e.url, source: e.source, fns: new Map() };
+    for (const f of e.functions) {
+      const start = f.ranges[0].startOffset;
+      if (start === 0) continue;
+      const key = `${start}:${f.ranges[0].endOffset}`;
+      const seen = merged.fns.get(key);
+      merged.fns.set(key, { functionName: f.functionName, start,
+                            count: (seen ? seen.count : 0) + f.ranges[0].count });
+    }
+    byUrl.set(e.url, merged);
+  }
+  const ours = [...byUrl.values()].sort((a, b) => a.url.localeCompare(b.url));
   for (const e of ours) {
     const lineAt = offset => e.source.slice(0, offset).split("\n").length;
-    const fns = e.functions.slice(1);
-    const called = fns.filter(f => f.ranges[0].count > 0);
-    const missed = fns.filter(f => !f.ranges[0].count)
-      .map(f => `${f.functionName || "(anonymous)"}:${lineAt(f.ranges[0].startOffset)}`);
+    const fns = [...e.fns.values()].sort((a, b) => a.start - b.start);
+    const called = fns.filter(f => f.count > 0);
+    const missed = fns.filter(f => !f.count)
+      .map(f => `${f.functionName || "(anonymous)"}:${lineAt(f.start)}`);
     lines.push(`${new URL(e.url).pathname.slice(1)}: ${called.length} of ${fns.length}`
                + " listed functions called" + (missed.length ? "; never:" : ""));
     for (let i = 0; i < missed.length; i += 6) {

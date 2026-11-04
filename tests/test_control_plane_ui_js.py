@@ -54,6 +54,7 @@ APP_JS = UI_DIR / "app.js"
 MCP_JS = UI_DIR / "mcp.js"
 AUDIT_JS = UI_DIR / "audit.js"
 LEASES_JS = UI_DIR / "leases.js"
+EGRESS_RULES_JS = UI_DIR / "egress-rules.js"
 PAYLOAD_JS = UI_DIR / "payload.js"
 INDEX_HTML = UI_DIR / "index.html"
 
@@ -3516,7 +3517,8 @@ class AuditTableSourceTests(unittest.TestCase):
         # The row template is built in `refreshRules`, and the `for` cell has to be
         # the fourth — between the wildcard scope and the source.
         body = re.search(r"document\.getElementById\(\"rules\"\)\.innerHTML"
-                         r".*?return `<tr>(.*?)</tr>`", APP_JS.read_text(), re.S)
+                         r".*?return `<tr>(.*?)</tr>`", EGRESS_RULES_JS.read_text(),
+                         re.S)
         self.assertIsNotNone(body, "the policy row template was restructured")
         cells = body.group(1).split("<td")[1:]
         self.assertEqual(len(cells), len(headers),
@@ -3861,20 +3863,18 @@ class LeaseTableSourceTests(unittest.TestCase):
 
 
 class PolicyTableSourceTests(unittest.TestCase):
-    """`refreshRules` lives in `start()` too, and its failure path was a bare
+    """`refreshRules`, in `egress-rules.js`, had a failure path that was a bare
     `catch (e) { /* transient */ }` — the same swallow the decisions table had, left
     in place after that one was fixed. Guarded at the source for the same reason."""
 
     def setUp(self):
-        self.src = APP_JS.read_text()
-        self.body = re.search(r"async function refreshRules\(\)\s*\{(.*?)\n  \}",
-                              self.src, re.S)
-        self.assertIsNotNone(self.body, "refreshRules not found — renamed?")
+        self.src = EGRESS_RULES_JS.read_text()
+        self.body = _fn_body(self.src, "refreshRules()", "")
 
     def test_a_failed_refresh_keeps_the_rules_and_reports_the_staleness(self):
-        body = self.body.group(1)
-        # Inside `start()`, so the catch closes at four spaces.
-        failure, _ = _poll_paths(body, "    ")
+        body = self.body
+        # At the module's top level, so the catch closes at two spaces.
+        failure, _ = _poll_paths(body, "  ")
         self.assertIn("rulesFailed = true", failure)
         self.assertIn("renderRulesStatus(", failure)
         self.assertNotRegex(body, r'catch[^}]*innerHTML\s*=\s*""',
@@ -3891,7 +3891,7 @@ class PolicyTableSourceTests(unittest.TestCase):
         # that reads as "no standing rules", which is the opposite of the truth.
         #
         # The STATEMENT, not the substring — see the decisions-table twin.
-        self.assertRegex(self.body.group(1), r"if\s*\(!res\.ok\)\s*throw")
+        self.assertRegex(self.body, r"if\s*\(!res\.ok\)\s*throw")
 
     def test_a_recovered_poll_clears_the_warning_and_re_renders(self):
         """Setting the failed flag is only half a fix, and both halves were mutants
@@ -3901,7 +3901,7 @@ class PolicyTableSourceTests(unittest.TestCase):
 
         Split at the catch, so these are asserted on the SUCCESS path specifically —
         both strings also occur in the failure path, where they prove nothing."""
-        _, success = _poll_paths(self.body.group(1), "    ")
+        _, success = _poll_paths(self.body, "  ")
         self.assertIn("rulesFailed = false", success)
         self.assertIn("renderRulesStatus(", success)
 
@@ -3909,7 +3909,7 @@ class PolicyTableSourceTests(unittest.TestCase):
         """`policySig` drives the "policy changed" badge. It must be assigned only on
         the success path: advancing it after a failure would silently swallow the next
         real change, because the comparison would be against a signature nobody saw."""
-        body = self.body.group(1)
+        body = self.body
         before, _, after = body.partition("rulesLoaded = true")
         self.assertNotIn("policySig =", before,
                          "the signature is updated before the poll is known to work")
@@ -3917,12 +3917,12 @@ class PolicyTableSourceTests(unittest.TestCase):
 
 
 class CreateRuleSourceTests(unittest.TestCase):
-    """The add-rule submit handler lives in `start()`, and three of its lines fail in
+    """The add-rule submit handler lives in `mountRules`, and three of its lines fail in
     ways nothing else here would catch: a form that appears broken, a rule that is not
     the one confirmed, and a picker offering classes that cannot be written to."""
 
     def setUp(self):
-        self.src = APP_JS.read_text()
+        self.src = EGRESS_RULES_JS.read_text()
         self.body = re.search(
             r"ruleFormEl\.addEventListener\(\"submit\".*?\n  \}\);", self.src, re.S)
         self.assertIsNotNone(self.body, "the add-rule submit handler moved — renamed?")
@@ -3954,24 +3954,38 @@ class CreateRuleSourceTests(unittest.TestCase):
         loaded: a class with no rules yet would be missing from the picker, and that is
         exactly the class an operator needs to write the FIRST rule for."""
         config = re.search(r"async function refreshConfig\(\)\s*\{(.*?)\n  \}",
-                           self.src, re.S)
+                           APP_JS.read_text(), re.S)
         self.assertIsNotNone(config, "refreshConfig not found — renamed?")
         self.assertIn("c.client_classes", config.group(1))
-        options = re.search(r"function renderClassOptions\(\)\s*\{(.*?)\n  \}",
-                            self.src, re.S)
-        self.assertIsNotNone(options, "renderClassOptions not found — renamed?")
-        self.assertIn("clientClasses.map", options.group(1))
-        self.assertNotIn("rulesById", options.group(1))
+        options = _fn_body(self.src, "renderClassOptions()", "")
+        self.assertIn("clientClasses.map", options)
+        self.assertNotIn("rulesById", options)
+
+    def test_a_failed_config_read_keeps_the_last_classes(self):
+        """`refreshConfig` hands the classes over in one call, and a read that threw
+        hands over only the failure, so the form keeps the classes of the last good
+        answer. Neither the call in its catch nor the module's failure branch may touch
+        them."""
+        config = _fn_body(APP_JS.read_text(), "refreshConfig()")
+        _, _, catch = config.partition("catch (e) {")
+        # Every hand-off in the catch, so a success call beside the failure one fails.
+        self.assertEqual(re.findall(r"receiveClientClasses\([^)]*\)", catch),
+                         ["receiveClientClasses(false)"])
+        handoff = _fn_body(self.src, "receiveClientClasses(answered, classes)", "")
+        _, sep, failed = handoff.partition("} else {")
+        self.assertTrue(sep, "the hand-off has no failure branch — restructured?")
+        self.assertIn('configState = "failed"', failed)
+        self.assertNotIn("clientClasses", failed)
 
 
 class EditRuleSourceTests(unittest.TestCase):
-    """The edit path lives in `start()` too, and it has three failure modes the pure
-    ``editPreview`` tests cannot reach — all of them the kind that leaves the page
+    """The edit path lives in `egress-rules.js` too, and it has three failure modes the
+    pure ``editPreview`` tests cannot reach — all of them the kind that leaves the page
     looking like it worked."""
 
     def setUp(self):
-        self.src = APP_JS.read_text()
-        self.body = re.search(r"async function submitEdit\(p\)\s*\{.*?\n  \}",
+        self.src = EGRESS_RULES_JS.read_text()
+        self.body = re.search(r"async function submitEdit\(p\)\s*\{.*?\n\}",
                               self.src, re.S)
         self.assertIsNotNone(self.body, "the edit submit handler moved — renamed?")
 
@@ -3997,7 +4011,7 @@ class EditRuleSourceTests(unittest.TestCase):
         # The body spreads `editingExpected` in, so its literal is part of what is
         # sent; there the class may appear only as the expectation.
         spread = re.search(r"editingExpected = \{(.*?)\};",
-                           _fn_body(self.src, "enterEditMode(row)"), re.S)
+                           _fn_body(self.src, "enterEditMode(row)", ""), re.S)
         self.assertIsNotNone(spread, "the expectation literal moved — restructured?")
         for literal in (sent.group(1), spread.group(1)):
             self.assertNotRegex(literal, r"(?<!expected_)client_class\s*:")
@@ -4013,10 +4027,10 @@ class EditRuleSourceTests(unittest.TestCase):
                          self.body.group(0), re.S)
         self.assertIsNotNone(sent, "the edit request body moved — restructured?")
         self.assertIn("...editingExpected", sent.group(1))
-        enter = _fn_body(self.src, "enterEditMode(row)")
+        enter = _fn_body(self.src, "enterEditMode(row)", "")
         for field in ("pattern", "action", "client_class"):
             self.assertRegex(enter, rf"expected_{field}:\s*row\.{field}\b")
-        self.assertIn("editingExpected = null;", _fn_body(self.src, "leaveEditMode()"))
+        self.assertIn("editingExpected = null;", _fn_body(self.src, "leaveEditMode()", ""))
 
     def test_a_stale_save_leaves_edit_mode(self):
         """The form's expectation is the one the backend refused, so staying in edit
@@ -4041,20 +4055,15 @@ class EditRuleSourceTests(unittest.TestCase):
         on a timer. Without the guard it re-enables the picker under an open edit, and
         the operator can select a class the edit will not apply — the form saying one
         thing while the request says another."""
-        options = re.search(r"function renderClassOptions\(\)\s*\{(.*?)\n  \}",
-                            self.src, re.S)
-        self.assertIsNotNone(options, "renderClassOptions not found — renamed?")
-        self.assertRegex(options.group(1),
+        self.assertRegex(_fn_body(self.src, "renderClassOptions()", ""),
                          r"editingRuleId !== null\)\s*ruleClassEl\.disabled = true")
 
     def test_the_row_is_re_read_on_every_preview_rather_than_captured(self):
         """The form holds an id, not a row. Capturing the row at entry would preview
         against a rule that may have been revoked or changed by a poll since — and then
         write over whatever replaced it."""
-        current = re.search(r"function currentPreview\(\)\s*\{(.*?)\n  \}",
-                            self.src, re.S)
-        self.assertIsNotNone(current, "currentPreview not found — renamed?")
-        self.assertIn("rulesById.get(editingRuleId)", current.group(1))
+        self.assertIn("rulesById.get(editingRuleId)",
+                      _fn_body(self.src, "currentPreview()", ""))
 
 
 class ServerAuthOptionTests(unittest.TestCase):

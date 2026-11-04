@@ -466,13 +466,18 @@ def _args_digest(server: str, tool: str, args_json: str) -> str:
 
 
 class ToolAsk(NamedTuple):
-    """Outcome of registering an ask. Exactly one of ``refused`` / ``approval_id`` is
-    set; ``joined`` means an identical ask was already pending and this attached to
-    it rather than raising a second card."""
+    """Outcome of registering an ask. Either ``refused`` is set, or ``approval_id`` and
+    ``resume_token`` both are; ``joined`` means an identical ask was already pending
+    and this attached to it rather than raising a second card.
+
+    Two handles on one ask, for two parties: ``approval_id`` is the operator's, and
+    never leaves the control plane; ``resume_token`` is the agent's, and is the only
+    one claim and withdraw accept (``_ask_by_token``)."""
     approval_id: str | None
     joined: bool
     refused: str | None
     deadline: float
+    resume_token: str | None = None
 
 
 def _expire_tool_asks() -> int:
@@ -578,7 +583,7 @@ def _register_tool_ask(server: str, tool: str, args: object,
     now = time.time()
     with _LOCK, store._connect() as conn:
         pending = conn.execute(
-            "SELECT id, client, deadline, args_digest, schema_digest "
+            "SELECT id, client, deadline, args_digest, schema_digest, resume_token "
             "FROM tool_approvals WHERE status='pending' ORDER BY ts").fetchall()
         # The client is in the join key for the reason it is in ``_group_key``: a card
         # names one caller, and answering one sandbox's question must not silently
@@ -586,7 +591,10 @@ def _register_tool_ask(server: str, tool: str, args: object,
         for row in pending:
             if (row["client"] == client and row["args_digest"] == digest
                     and row["schema_digest"] == schema_digest):
-                return ToolAsk(row["id"], True, None, row["deadline"])
+                # The pending row's OWN token, so every agent sharing an ask holds
+                # one handle on it.
+                return ToolAsk(row["id"], True, None, row["deadline"],
+                               row["resume_token"])
 
         if len(pending) >= MAX_TOOL_PENDING:
             return _refuse_tool("global tool asks")
@@ -614,15 +622,18 @@ def _register_tool_ask(server: str, tool: str, args: object,
                 return _refuse_tool(f"client {client} tool asks", detail)
 
         approval_id = uuid.uuid4().hex
+        # Minted apart from the id, never derived from it, so knowing one says
+        # nothing about the other.
+        resume_token = store._new_resume_token()
         deadline = now + TOOL_HOLD_TIMEOUT
         conn.execute(
             "INSERT INTO tool_approvals(id, ts, server, tool, args_json, "
-            "args_digest, client, status, deadline, schema_digest) "
-            "VALUES (?,?,?,?,?,?,?, 'pending', ?, ?)",
+            "args_digest, client, status, deadline, schema_digest, resume_token) "
+            "VALUES (?,?,?,?,?,?,?, 'pending', ?, ?, ?)",
             (approval_id, now, server, tool, args_json, digest, client, deadline,
-             schema_digest))
+             schema_digest, resume_token))
         conn.commit()
-        return ToolAsk(approval_id, False, None, deadline)
+        return ToolAsk(approval_id, False, None, deadline, resume_token)
 
 
 def _refuse_tool(scope: str, detail: str = "") -> ToolAsk:
@@ -641,7 +652,8 @@ def _refuse_tool(scope: str, detail: str = "") -> ToolAsk:
 
 
 def _get_tool_ask(approval_id: str) -> dict | None:
-    """One ask by id, expiry applied first. None if there is no such ask.
+    """One ask by id, expiry applied first. None if there is no such ask. The
+    operator's lookup: the agent's is ``_ask_by_token``.
 
     ONE at a time, and there is deliberately no listing counterpart for the agent:
     the gateway's agent-facing listener is on a network both tiers share, so a roster
@@ -653,6 +665,23 @@ def _get_tool_ask(approval_id: str) -> dict | None:
             "SELECT id, ts, server, tool, args_json, client, status, deadline, "
             "resolved_at, claimed_at, schema_digest FROM tool_approvals WHERE id=?",
             (approval_id,)).fetchone()
+    return dict(row) if row is not None else None
+
+
+def _ask_by_token(resume_token: str) -> dict | None:
+    """One ask by the agent's resume token, expiry applied first; None if no ask has
+    it. The lookup that resolves what an agent presents: claim and withdraw act on the
+    ask it returns, by that ask's id. ``_get_tool_ask`` is the operator's lookup, and
+    the agent path calls it only to tell a refusal apart (``api_tool._own_ask``).
+
+    Returns the same columns as ``_get_tool_ask``, so the token stays out of every
+    dict built from either, and so out of every answer and audit row built from one."""
+    _expire_tool_asks()
+    with store._connect() as conn:
+        row = conn.execute(
+            "SELECT id, ts, server, tool, args_json, client, status, deadline, "
+            "resolved_at, claimed_at, schema_digest FROM tool_approvals "
+            "WHERE resume_token=?", (resume_token,)).fetchone()
     return dict(row) if row is not None else None
 
 

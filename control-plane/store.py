@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import re
+import secrets
 import sqlite3
 import time
 from collections.abc import Callable
@@ -45,7 +46,7 @@ LEGACY_CLIENT_CLASS = "sandbox"
 # The schema this code expects. Every entry in ``_STEPS`` below adds exactly one,
 # and a store records the version it is at (see ``_migrate``), so "what has already
 # run here" is a number to compare rather than a schema to interrogate.
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 
 def _connect() -> sqlite3.Connection:
@@ -498,6 +499,57 @@ def _step_12_schema_digest(conn: sqlite3.Connection) -> None:
               "keep NULL, and no pin can be made from one)", flush=True)
 
 
+# UNIQUE, because a token is a lookup key: two rows under one would let a claim land
+# on an ask its agent never raised. SQLite counts NULLs as distinct, so the rows no
+# token was issued for do not collide. An index rather than a column constraint, since
+# ADD COLUMN cannot add one, so a fresh store and a migrated one get the same thing.
+_TOOL_APPROVALS_RESUME_INDEX = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS tool_approvals_resume_token "
+    "ON tool_approvals(resume_token)")
+
+
+def _new_resume_token() -> str:
+    """A fresh resume token: 32 random hex characters, the shape the gateway checks.
+
+    Stored PLAIN, not hashed, unlike the task registry's claim tokens: an agent that
+    joins a pending ask must be handed the same token again, which a hash cannot give
+    back. Hashing would also buy little, since redeeming one needs the gateway's
+    network and the raising client's address, and a store reader already holds the
+    ids the token stands in for."""
+    return secrets.token_hex(16)
+
+
+def _step_13_resume_token(conn: sqlite3.Connection) -> None:
+    """v13 — ``tool_approvals`` gains ``resume_token``, the agent's handle on an ask,
+    so the row's ``id`` stops leaving the control plane.
+
+    A row still PENDING gets a fresh token, so an identical retry joins its card and
+    leaves with a handle that works. Every other row keeps NULL: no token was ever
+    issued for it, and the handle its agent holds is the id, which claim and withdraw
+    no longer accept. So an ask approved and not yet claimed lapses at its grant
+    window, and a pre-upgrade handle is answered as unknown (the operator chose to
+    fail closed here rather than keep the id redeemable until those windows close).
+    An ask pending at the upgrade keeps an id its agent already holds until it
+    closes, since that id was handed out before this step ran: the id is blind only
+    for asks raised after it.
+
+    The table may be ABSENT, on a store stamped before it existed; ``_init_db``
+    creates it with the column."""
+    asks = _columns(conn, "tool_approvals")
+    if not asks or "resume_token" in asks:
+        return
+    conn.execute("ALTER TABLE tool_approvals ADD COLUMN resume_token TEXT")
+    pending = [r["id"] for r in conn.execute(
+        "SELECT id FROM tool_approvals WHERE status='pending'")]
+    for approval_id in pending:
+        conn.execute("UPDATE tool_approvals SET resume_token=? WHERE id=?",
+                     (_new_resume_token(), approval_id))
+    conn.execute(_TOOL_APPROVALS_RESUME_INDEX)
+    print(f"control-plane: added resume_token to tool_approvals ({len(pending)} "
+          f"pending ask(s) given one; every other ask keeps NULL, and a handle from "
+          f"before the upgrade is answered as unknown)", flush=True)
+
+
 # Ordered, and the order is the only thing that decides what runs: a step is applied
 # when its version exceeds the store's, so steps must be APPEND-ONLY and never
 # renumbered, reordered or edited once shipped — a store in the field has already run
@@ -516,6 +568,7 @@ _STEPS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = (
     (10, "per-server MCP endpoint", _step_10_server_endpoint),
     (11, "rule ids: rules and tool_rules rebuilt", _step_11_rule_ids),
     (12, "pins bound to the tool's arguments", _step_12_schema_digest),
+    (13, "resume tokens on tool asks", _step_13_resume_token),
 )
 
 
@@ -760,10 +813,16 @@ def _init_db() -> None:
                 -- was made (discovery.schema_digest), or NULL when it had none. A pin
                 -- made from this card is bound to it, and an identical retry joins
                 -- only under the same one.
-                schema_digest TEXT
+                schema_digest TEXT,
+                -- The AGENT's handle on this ask: what the pending result carries and
+                -- what claim and withdraw take. Independent of `id`, which is the
+                -- operator's and never leaves the control plane. NULL on a row no
+                -- token was issued for (one closed before v13).
+                resume_token  TEXT
             )""")
         conn.execute("CREATE INDEX IF NOT EXISTS tool_approvals_status "
                      "ON tool_approvals(status)")
+        conn.execute(_TOOL_APPROVALS_RESUME_INDEX)
         # Ingest cursors, one per audit file the control plane tails (``ingest._drain``:
         # the egress proxy's and the tool gateway's). `inode` tells a rotated file from
         # an appended one; without it a fresh file inherits the old offset and its

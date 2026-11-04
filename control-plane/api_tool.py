@@ -8,8 +8,11 @@ server, and drop an ask the agent no longer wants. All of it is on
 ``tool_app`` in app.py).
 
 The counterpart of ``/authorize``, and separate from it because the answers differ:
-that one resolves a hold by blocking a worker, this one answers `ask` with an id at
-once, because nothing waits (DESIGN.md, "An ``ask`` answers immediately").
+that one resolves a hold by blocking a worker, this one answers `ask` with a resume
+token at once, because nothing waits (DESIGN.md, "An ``ask`` answers immediately").
+
+Nothing here hands the agent side an ask's id. The id is the operator's, the one
+``resolve`` takes; the agent gets the resume token, the one claim and withdraw take.
 
 The gateway is trusted to report the sandbox address it observed, as the egress proxy
 is on ``/authorize``. One that lied could misattribute an ask and spend another
@@ -70,8 +73,8 @@ _CLOSED = ("denied", "expired", "withdrawn")
 
 @router.post("/tool/authorize")
 def tool_authorize(req: ToolCallRequest) -> dict:
-    """Decide one tool call: allow, deny, or ask (registered, with an id to return
-    with).
+    """Decide one tool call: allow, deny, or ask (registered, with a resume token to
+    return with).
 
     Always a 200 and always an answer, like ``authorize``. A malformed name, an
     unregistered or disabled server, an oversized payload and a saturated queue all
@@ -109,7 +112,7 @@ def tool_authorize(req: ToolCallRequest) -> dict:
                             f"{reason}")
         return {"decision": decision, "reason": reason}
 
-    # ASK. Registered, not held: the gateway takes the id back at once. An identical
+    # ASK. Registered, not held: the gateway takes the token back at once. An identical
     # ask from the same client joins the pending one rather than raising a second
     # card, so a retrying agent cannot fill the queue with copies of one question.
     ask = holds._register_tool_ask(server, tool, req.args, req.client, digest)
@@ -128,11 +131,11 @@ def tool_authorize(req: ToolCallRequest) -> dict:
     # allow and deny rows do, which names a pin the call met but that did not answer.
     why = (f"{tool} on {server}: {reason}; registered as tool ask {ask.approval_id}"
            + (" (joined an identical ask already pending)" if ask.joined else "")
-           + " — nothing is blocked; the agent resumes with the id")
+           + " — nothing is blocked; the agent resumes with its resume token")
     store._audit("hold", stage="tool-call", client=req.client,
                  client_class=client_class, server=server or None, tool=tool or None,
                  approval_id=ask.approval_id, reason=why)
-    return {"decision": "ask", "reason": reason, "approval_id": ask.approval_id,
+    return {"decision": "ask", "reason": reason, "resume_token": ask.resume_token,
             # ABSOLUTE, like every other time in a payload here: a remaining-seconds
             # field would tick, which turns the SSE change-detector into a 1 Hz
             # emitter and gives the gateway a number that is stale on arrival.
@@ -206,46 +209,62 @@ def tool_inventory(req: InventoryRequest, request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "changed": len(moved)})
 
 
-def _own_ask(approval_id: str, client: str | None, verb: str,
+def _own_ask(resume_token: str, client: str | None, verb: str,
              stage: str) -> dict | JSONResponse:
-    """The ask, if ``client`` raised it; otherwise the 404 to answer with.
+    """The ask ``resume_token`` names, if ``client`` raised it; otherwise the 404 to
+    answer with.
 
-    Unknown and foreign get the same 404: both tiers share `sandbox-net`, so an id
-    leaked between them must not confirm it exists. The operator gets two different
-    rows, because a foreign attempt is the one sign an id leaked, and it carries the
-    ask's server and tool so it joins that approval's history."""
-    ask = holds._get_tool_ask(approval_id)
+    Every refusal is the same 404: both tiers share `sandbox-net`, so a token leaked
+    between them must not confirm it exists. The operator gets a row per kind, because
+    each says something different. A FOREIGN token is the one sign a token leaked. An
+    OPERATOR ID presented here means the id reached the agent side, which nothing
+    should hand it, or is a handle from before the upgrade to resume tokens. Both rows
+    carry the ask's server, tool and id, so they join that approval's history. An
+    unknown value names no ask, so its row has no id."""
+    ask = holds._ask_by_token(resume_token)
     if ask is not None and (ask["client"] or None) == (client or None):
         return ask
-    if ask is None:
+    if ask is not None:
         store._audit("deny", stage=stage, client=client,
                      client_class=policy._client_class(client),
-                     approval_id=approval_id,
-                     reason=f"{verb} for unknown approval {approval_id} refused")
+                     server=ask["server"], tool=ask["tool"], approval_id=ask["id"],
+                     reason=f"{verb} for approval {ask['id']} refused: it was "
+                            f"raised by {ask['client'] or 'no client'}, not by "
+                            f"this caller — a leaked or guessed resume token; "
+                            f"answered as unknown")
+    elif (presented := holds._get_tool_ask(resume_token)) is not None:
+        # A by-id read on the agent path, and only to word this row: the answer is the
+        # unknown one whatever it finds, and nothing is resolved by the id.
+        store._audit("deny", stage=stage, client=client,
+                     client_class=policy._client_class(client),
+                     server=presented["server"], tool=presented["tool"],
+                     approval_id=presented["id"],
+                     reason=f"{verb} presented the operator's approval id "
+                            f"{presented['id']} instead of a resume token, refused "
+                            f"and answered as unknown — either the id reached the "
+                            f"agent side, which nothing should hand it, or this is a "
+                            f"handle from before the upgrade to resume tokens, which "
+                            f"is harmless")
     else:
         store._audit("deny", stage=stage, client=client,
                      client_class=policy._client_class(client),
-                     server=ask["server"], tool=ask["tool"],
-                     approval_id=approval_id,
-                     reason=f"{verb} for approval {approval_id} refused: it was "
-                            f"raised by {ask['client'] or 'no client'}, not by "
-                            f"this caller — a leaked or guessed id; answered "
-                            f"as unknown")
+                     reason=f"{verb} for unknown resume token {resume_token!r} refused")
     # ``terminal`` here too, so the gateway branches on one field for every refusal:
-    # an id unknown to this caller does not become known by asking again.
+    # a token unknown to this caller does not become known by asking again.
     return JSONResponse(
         {"ok": False, "detail": "unknown approval", "status": None,
          "spent": False, "terminal": True},
         status_code=404)
 
 
-@router.post("/tool/asks/{approval_id}/claim")
-def tool_claim(approval_id: str, req: ToolResumeRequest) -> JSONResponse:
+@router.post("/tool/asks/{resume_token}/claim")
+def tool_claim(resume_token: str, req: ToolResumeRequest) -> JSONResponse:
     """Take single-use ownership of an approved ask, and hand back what to run.
 
     The gateway executes only after this succeeds, not at the human's click, so an
-    approved call nobody comes back for never runs. One id per call and no listing
-    (DESIGN.md, "One id at a time").
+    approved call nobody comes back for never runs. One token per call and no listing
+    (DESIGN.md, "One id at a time"). The ask is found by its resume token and acted
+    on by its id, and only the id reaches the audit rows.
 
     The response carries the ARGUMENTS, in the canonical form the human read and the
     digest covers, so what executes is necessarily what was approved rather than the
@@ -257,9 +276,10 @@ def tool_claim(approval_id: str, req: ToolResumeRequest) -> JSONResponse:
     `tool_approvals`. Without this check the switch an operator reaches for would not
     reach the one surface that releases a side effect."""
     # A PENDING claim writes nothing; it is refused further down, and agents poll it.
-    ask = _own_ask(approval_id, req.client, "claim", "tool-resume")
+    ask = _own_ask(resume_token, req.client, "claim", "tool-resume")
     if isinstance(ask, JSONResponse):
         return ask
+    approval_id = ask["id"]
     # The check above holds ``ask["client"]`` equal to ``req.client``; the stored one
     # is what the card was raised under.
     client_class = policy._client_class(ask["client"])
@@ -322,21 +342,22 @@ def tool_claim(approval_id: str, req: ToolResumeRequest) -> JSONResponse:
                          "claimed_at": claimed["claimed_at"]})
 
 
-@router.post("/tool/asks/{approval_id}/withdraw")
-def tool_withdraw(approval_id: str, req: ToolResumeRequest) -> JSONResponse:
+@router.post("/tool/asks/{resume_token}/withdraw")
+def tool_withdraw(resume_token: str, req: ToolResumeRequest) -> JSONResponse:
     """Drop an ask the agent no longer wants, so it stops costing a human attention.
 
     The one write on this bridge an AGENT asks for, and it keeps the bridge's criterion
     that none of it grants: a withdrawal only removes a question or an unclaimed grant
-    (``holds._withdraw_tool_ask``). Scoped to one id and the client that raised it, as
+    (``holds._withdraw_tool_ask``). Scoped to one token and the client that raised it, as
     the claim is. A compromised gateway calling it can only drop asks, which it can
     already do by never resuming them.
 
     An ask already closed is a no-op that names its status. A spent one says so,
     because "its call may have run" is the answer an agent must not read as dropped."""
-    ask = _own_ask(approval_id, req.client, "withdrawal", "tool-withdraw")
+    ask = _own_ask(resume_token, req.client, "withdrawal", "tool-withdraw")
     if isinstance(ask, JSONResponse):
         return ask
+    approval_id = ask["id"]
     if not holds._withdraw_tool_ask(approval_id):
         current = holds._get_tool_ask(approval_id) or ask
         spent = current["status"] == "allowed" and current["claimed_at"] is not None

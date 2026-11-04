@@ -233,7 +233,7 @@ class PublicationTests(unittest.TestCase):
 
     def test_the_gateways_own_tools_are_listed_without_any_server(self):
         # Resumption has to be reachable before anything has been enumerated, because
-        # an agent can hold an approval id across a gateway restart — and it depends on
+        # an agent can hold a resume token across a gateway restart — and it depends on
         # no server, so there is nothing for a reconcile to contribute to it.
         self.assertIn(self.surface.RESUME_TOOL,
                       [tool["name"] for tool in self.surface.listing()])
@@ -297,8 +297,9 @@ class NativeToolTests(unittest.TestCase):
     def test_the_resume_tool_is_shaped_like_an_mcp_tool(self):
         resume = next(t for t in self.surface.NATIVE_TOOLS
                       if t["name"] == self.surface.RESUME_TOOL)
-        self.assertEqual(resume["inputSchema"]["required"], ["approval_id"])
-        self.assertIn("approval_id", resume["inputSchema"]["properties"])
+        self.assertEqual(resume["inputSchema"]["required"], ["resume_token"])
+        self.assertIn("resume_token", resume["inputSchema"]["properties"])
+        self.assertNotIn("approval_id", resume["inputSchema"]["properties"])
 
     def test_the_description_says_it_runs_the_call_and_runs_it_once(self):
         # The two things a model would otherwise get wrong, and the reason the tool is
@@ -309,11 +310,11 @@ class NativeToolTests(unittest.TestCase):
         self.assertIn("RUNS the call", resume["description"])
         self.assertIn("once", resume["description"])
 
-    def test_the_withdraw_tool_takes_only_the_id(self):
+    def test_the_withdraw_tool_takes_only_the_token(self):
         withdraw = next(t for t in self.surface.NATIVE_TOOLS
                         if t["name"] == self.surface.WITHDRAW_TOOL)
-        self.assertEqual(withdraw["inputSchema"]["required"], ["approval_id"])
-        self.assertEqual(list(withdraw["inputSchema"]["properties"]), ["approval_id"])
+        self.assertEqual(withdraw["inputSchema"]["required"], ["resume_token"])
+        self.assertEqual(list(withdraw["inputSchema"]["properties"]), ["resume_token"])
 
     def test_a_native_tool_is_not_produced_by_the_policy_join(self):
         # It is proxied from no server, so no roster and no enumeration can contribute

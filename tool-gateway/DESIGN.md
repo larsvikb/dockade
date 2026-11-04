@@ -13,7 +13,7 @@ in the root, and this file does not repeat it:
   should live as far from the agent as its server allows";
 - what it asks the control plane, and what it may cache, `DESIGN.md` → "The gateway
   pulls";
-- how a held call comes back — the pending result, resumption by id, and executing on
+- how a held call comes back — the pending result, resumption by token, and executing on
   resumption rather than on approval — `DESIGN.md` → "An `ask` answers immediately";
 - how the sandbox is told it exists, `DESIGN.md` → "Telling the sandbox it exists".
 
@@ -54,7 +54,7 @@ it. An agent can act on a result — read the reason, do something else, come ba
 where an error is something it records as a failed call, carrying nothing it can use.
 The corollary is that the text has to carry
 the distinction the agent needs: a `deny` says retrying will not help, a pending ask
-says come back with the same id, and a `denied`/`expired`/`spent` approval says the
+says come back with the same token, and a `denied`/`expired`/`spent` approval says the
 matter is final. An agent that cannot tell a refusal from a delay retries one forever,
 and that is a property of the wording rather than of the protocol.
 
@@ -82,7 +82,7 @@ are proxied from no MCP server; they are the gateway's own, permanently `allow`,
 therefore outside the per-tool policy governing everything else on the surface. The
 rule that keeps the category honest: **a native tool must not cause an ungoverned side
 effect.** Resume sits precisely on that line, because it does cause one — admissible
-only because the effect is bound to an id a human explicitly approved, with arguments
+only because the effect is bound to an ask a human explicitly approved, with arguments
 they read. Withdraw meets it from the other side: its only effect is to retire an ask
 the same client raised, which removes capability and never adds any. The next native
 tool will inherit neither property, which is why the criterion is written here rather

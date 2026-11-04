@@ -194,7 +194,7 @@ def _printable(value: object) -> str:
 
 
 def record(status: str, server: str, tool: str, reason: str | None = None,
-           approval_id: str | None = None, client: str | None = None) -> None:
+           resume_token: str | None = None, client: str | None = None) -> None:
     """Write one outcome. Returns nothing and RAISES NOTHING.
 
     The swallow is deliberate and is the one place in this file worth arguing about. By
@@ -213,7 +213,7 @@ def record(status: str, server: str, tool: str, reason: str | None = None,
     same discipline `_ingest_row` already applies to the proxy's file."""
     entry = {"ts": round(time.time(), 3), "stage": "tool-result",
              "status": status, "server": _field(server), "tool": _field(tool),
-             "approval_id": _field(approval_id), "client": _field(client),
+             "resume_token": _field(resume_token), "client": _field(client),
              "reason": _field(reason)}
     line = json.dumps(entry)
     try:
@@ -224,6 +224,6 @@ def record(status: str, server: str, tool: str, reason: str | None = None,
     # After the file, and unconditionally: if the write above failed this is the
     # remaining copy, and if it succeeded this is the live feed.
     print(f"OUTCOME {status} {_printable(server)}__{_printable(tool)}"
-          + (f" approval_id={_printable(approval_id)}" if approval_id else "")
+          + (f" resume_token={_printable(resume_token)}" if resume_token else "")
           + (f" client={_printable(client)}" if client else "")
           + (f" :: {_printable(reason)}" if reason else ""), flush=True)

@@ -1789,16 +1789,24 @@ purpose: a withdrawal is mostly an agent correcting itself, and the cooldown has
 cost that case little while still bounding the loop. It rides on the per-client cap,
 so an operator who turns that cap off unbounds this loop with it.
 
-**Resumption is a tool, keyed on the approval id.** The agent needs a way back to a
+**Resumption is a tool, keyed on a resume token.** The agent needs a way back to a
 pending ask, and the obvious one — retry the original call — is safe but fragile. Safe
 because the gateway re-checks policy before executing, so a still-pending ask returns
 pending again rather than running. Fragile because joining by payload hash requires the
 agent to reproduce the arguments *byte-identically*, and a model asked to retry
 commonly reformulates: a reformulated retry hashes differently and opens a **second**
 ask, so the flood the caps exist to bound arrives from ordinary model behaviour rather
-than from an adversary. An opaque id is a short token copied verbatim, which is the one
-thing a model will not quietly rewrite. Hash-joining stays as the backstop for an agent
-that retries the original call anyway; the id is the path the pending result names.
+than from an adversary. An opaque token is copied verbatim, which is the one thing a
+model will not quietly rewrite. Hash-joining stays as the backstop for an agent that
+retries the original call anyway; the token is the path the pending result names.
+
+The token is not the ask's approval id. That id is the operator's: `resolve` takes it,
+and it never leaves the control plane, so nothing the agent side receives — the
+pending result, a claim's answer, the gateway's outcome records and logs — can name
+it, and a request forged from that side has no real id to send to `resolve`. The
+token is minted beside the id, never derived from it, and only claim and withdraw
+accept it. Ingest maps an outcome's token back to the id, so one id still joins the
+hold, the click, the claim and the outcome in the audit trail.
 
 **The gateway executes on resumption, not on approval.** Lazily, when the agent comes
 back for the result — never at the instant the human clicks. This makes the

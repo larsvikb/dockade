@@ -1422,9 +1422,16 @@ if not rows:
 
 for r in rows[-show:]:
     when = time.strftime("%H:%M:%S", time.localtime(r.get("ts", 0)))
-    who = r.get("approval_id") or "-"
+    # The agent's resume token on a held call; a line from a gateway older than
+    # resume tokens names the approval id instead.
+    if r.get("resume_token"):
+        who = f"token={r['resume_token']}"
+    elif r.get("approval_id"):
+        who = f"approval={r['approval_id']}"
+    else:
+        who = "-"
     line = (f"{when}  {r.get('status','?'):<16} "
-            f"{r.get('server','?')}__{r.get('tool','?')}  approval={who}")
+            f"{r.get('server','?')}__{r.get('tool','?')}  {who}")
     if r.get("reason"):
         line += f"\n{' ' * 10}:: {r['reason']}"
     print(line)

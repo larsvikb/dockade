@@ -30,7 +30,8 @@ is ruled out outright: see "A record written after an irreversible act cannot fa
 closed" in DESIGN.md.
 
 What a stream must supply is in ``_Stream``: where its file is, which audit columns it
-fills, and how to turn one line into a row. Everything else here — rotation, the
+fills, how to turn one line into a row, and, if the row needs the store to finish, a
+pass that does it on the drain's own connection. Everything else here — rotation, the
 inode-keyed cursor, the bounded block, the partial-line rule — is shared, because none
 of it has anything to do with what the lines mean.
 """
@@ -93,13 +94,16 @@ class _Stream:
     added in the middle silently shifts every value after it. A dict cannot land a value
     in the wrong column."""
 
-    def __init__(self, name, path, columns, row, describe):
+    def __init__(self, name, path, columns, row, describe, settle=None):
         self.name = name              # what an operator sees in a failure line
         self.path = path
         self.columns = columns
         self.insert = _insert_for(columns)
         self.row = row                # (line: bytes) -> dict | None
         self.describe = describe      # (row: dict) -> str, for the stdout mirror
+        # (conn, row: dict) -> None, run on each mapped row before the insert. Apart
+        # from ``row`` so a mapper stays a pure function of its line.
+        self.settle = settle
 
 
 def _ingest_field(value: object) -> str | None:
@@ -185,7 +189,13 @@ def _tool_row(line: bytes) -> dict | None:
     into the audit trail — which would let a compromised gateway forge governance
     history rather than merely report a result. The word it gets is `outcome`, not
     `observe` (why is at ``audit.KINDS``), and `status` is where its own vocabulary
-    lives."""
+    lives.
+
+    The ask is named by its RESUME TOKEN, the only handle the gateway is given, and
+    ``_settle_tool_row`` turns it into the ask's id. A line with no token and an
+    ``approval_id`` is from a gateway older than resume tokens, which was handed the
+    id itself, so that value is taken as the id. That branch can go when the
+    gateway's ``approval_id`` alias does, once no line from before it is un-ingested."""
     rec = _parsed(line)
     if rec is None or rec.get("stage") != "tool-result":
         return None
@@ -195,13 +205,33 @@ def _tool_row(line: bytes) -> dict | None:
     if ts is None:
         return None
     client = _ingest_field(rec.get("client"))
+    # By the KEY, which the gateway writes on every line, null when policy allowed the
+    # call outright: a line that has it never names an ask by anything else.
+    token = rec.get("resume_token")
+    legacy = None if "resume_token" in rec else _ingest_field(rec.get("approval_id"))
+    # ``resume_token`` is not an audit column, so it is carried to ``_settle_tool_row``
+    # and never inserted.
     return {"ts": ts, "kind": "outcome", "stage": "tool-result",
             "client": client, "client_class": policy._client_class(client),
             "reason": _ingest_field(rec.get("reason")),
             "server": _ingest_field(rec.get("server")),
             "tool": _ingest_field(rec.get("tool")),
-            "approval_id": _ingest_field(rec.get("approval_id")),
+            "approval_id": legacy, "resume_token": _ingest_field(token),
             "status": _ingest_field(rec.get("status"))}
+
+
+def _settle_tool_row(conn, row: dict) -> None:
+    """Name the outcome's ask by its id, so ``audit.approval_id`` joins the outcome to
+    the hold, the click and the claim, and the token is kept out of the store.
+
+    A plain indexed read, NOT ``holds._get_tool_ask``: that runs the expiry pass, which
+    would make every outcome line an expiry write. A token no ask has maps to NULL."""
+    token = row.pop("resume_token", None)
+    if token is None:
+        return
+    found = conn.execute("SELECT id FROM tool_approvals WHERE resume_token=?",
+                         (token,)).fetchone()
+    row["approval_id"] = found["id"] if found is not None else None
 
 
 def _describe_egress(row: dict) -> str:
@@ -233,7 +263,8 @@ TOOL_STATUSES = ("ok", "tool-error", "rpc-error", "transport-error", "timeout")
 STREAMS = (
     _Stream("egress", EGRESS_AUDIT_LOG, _EGRESS_COLUMNS, _egress_row,
             _describe_egress),
-    _Stream("tool outcomes", TOOL_AUDIT_LOG, _TOOL_COLUMNS, _tool_row, _describe_tool),
+    _Stream("tool outcomes", TOOL_AUDIT_LOG, _TOOL_COLUMNS, _tool_row, _describe_tool,
+            _settle_tool_row),
 )
 
 
@@ -344,6 +375,9 @@ def _drain(stream: _Stream) -> int:
             rows = [r for r in (stream.row(ln)
                                 for ln in block[:consumed].split(b"\n") if ln.strip())
                     if r is not None]
+            if stream.settle is not None:
+                for r in rows:
+                    stream.settle(conn, r)
             if rows:
                 conn.executemany(
                     stream.insert,

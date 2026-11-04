@@ -101,14 +101,14 @@ def split_exposed(name: str) -> tuple[str, str] | None:
 #: noticing and not worth preventing: a tool that lies about needing approval gets
 #: approval anyway, and one that lies about not needing it is still refused at the
 #: call. The lie is cosmetic because the boundary is not here.
-ASK_NOTICE = ("Approval required: calling this returns a pending id rather than a "
-              "result, and you finish it with resume_tool_call. ")
+ASK_NOTICE = ("Approval required: calling this returns a resume token rather than "
+              "a result, and you finish it with resume_tool_call. ")
 
 #: The gateway's own tools, proxied from no server.
 #:
 #: A CATEGORY WITH ITS OWN RULE, and the rule is that a native tool must not cause an
 #: ungoverned side effect. Resumption sits precisely on that line — it does cause one —
-#: and is admissible only because the effect is bound to an id a human explicitly
+#: and is admissible only because the effect is bound to an ask a human explicitly
 #: approved, with arguments they read. Withdrawal meets it the other way: its only
 #: effect is to retire an ask, which takes capability away and never adds any. The
 #: next native tool will inherit neither property, which is why the criterion is
@@ -122,10 +122,12 @@ ASK_NOTICE = ("Approval required: calling this returns a pending id rather than 
 RESUME_TOOL = "resume_tool_call"
 WITHDRAW_TOOL = "withdraw_tool_call"
 
-#: Both native tools take the id the same way, and an agent copies it out of the same
-#: pending result for either.
-_APPROVAL_ID = {"type": "string",
-                "description": "The id from the pending result, copied verbatim."}
+#: Both native tools take the token the same way, and an agent copies it out of the
+#: same pending result for either. Advertised as ``resume_token`` only; the old name
+#: still works (``execute._resume_token``) for a client holding an older schema.
+_RESUME_TOKEN = {"type": "string",
+                 "description": "The resume_token from the pending result, copied "
+                                "verbatim."}
 
 NATIVE_TOOLS = [{
     "name": RESUME_TOOL,
@@ -139,8 +141,8 @@ NATIVE_TOOLS = [{
     # instruction file, which is why `wait_seconds` is described here and not only in
     # the sandbox's CLAUDE.md / AGENTS.md.
     "description": (
-        "Finish a tool call that was held for human approval. Pass the id from the "
-        "pending result. If the approval was granted this RUNS the call and returns "
+        "Finish a tool call that was held for human approval. Pass the resume_token "
+        "from the pending result. If the approval was granted this RUNS the call and returns "
         "its result, and it can only be done once. If it is still pending it says so "
         "and nothing runs; if it was denied, expired or withdrawn it says that, and "
         "retrying will not change it. Asking again while it is pending is free. Set "
@@ -150,7 +152,7 @@ NATIVE_TOOLS = [{
     "inputSchema": {
         "type": "object",
         "properties": {
-            "approval_id": _APPROVAL_ID,
+            "resume_token": _RESUME_TOKEN,
             # The cap is not stated as a number here: it is configurable, and a
             # description that named 45 would be a second copy of the value to keep
             # true. An over-large request is clamped rather than refused, so nothing
@@ -163,24 +165,25 @@ NATIVE_TOOLS = [{
                     "and capped well below any client's request timeout. Omit it (or "
                     "pass 0) to get the answer as it stands right now, which is the "
                     "right choice when you have other work to get on with.")}},
-        "required": ["approval_id"]}}, {
+        "required": ["resume_token"]}}, {
     "name": WITHDRAW_TOOL,
     # Says when to reach for it, because that moment is the whole value: a question
     # dropped as soon as the plan changes saves the human from answering it. The
     # joined-ask sentence is there because a sub-agent in the same sandbox shares the
-    # id, and should not be surprised when its own resume reads "withdrawn".
+    # token, and should not be surprised when its own resume reads "withdrawn".
     "description": (
         "Withdraw a tool call that is held for human approval, when you no longer "
         "want it: your plan changed, you spotted a mistake in the arguments, or you "
-        "were told to stop. Pass the id from the pending result. The human is no "
-        "longer asked, and the call will never run under that id — this works on an "
-        "approval that was granted but not yet resumed, too. It does nothing to a "
-        "call that has already run, and says so. An identical call made while the "
-        "first was pending shares its id, so withdrawing it withdraws both."),
+        "were told to stop. Pass the resume_token from the pending result. The "
+        "human is no longer asked, and the call will never run under that token — "
+        "this works on an approval that was granted but not yet resumed, too. It "
+        "does nothing to a call that has already run, and says so. An identical call "
+        "made while the first was pending shares its token, so withdrawing it "
+        "withdraws both."),
     "inputSchema": {
         "type": "object",
-        "properties": {"approval_id": _APPROVAL_ID},
-        "required": ["approval_id"]}}]
+        "properties": {"resume_token": _RESUME_TOKEN},
+        "required": ["resume_token"]}}]
 
 
 def curate(roster: list[dict], enumerated: dict[str, list[dict]]) -> list[dict]:

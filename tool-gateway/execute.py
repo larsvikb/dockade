@@ -16,7 +16,7 @@ is about to cross the internet.
 
 THREE ANSWERS, not two, and the third is what makes this different from the egress
 proxy. `allow` runs; `deny` refuses; `ask` registers a question with the control plane
-and answers the AGENT immediately with a pending id. Nothing is held open — not the
+and answers the AGENT immediately with a resume token. Nothing is held open — not the
 agent's call, not a control-plane worker — so the human's window is free to be an hour
 and there is no caller to strand (DESIGN.md, "An `ask` answers immediately").
 
@@ -46,14 +46,19 @@ import discovery
 import outcomes
 import surface
 
-#: The shape of an approval id, checked before it is ever put in a URL.
+#: The shape of a resume token, checked before it is ever put in a URL, and before
+#: one the control plane hands back is passed on to the agent.
 #:
-#: The id is the one thing on this path that comes from the AGENT, and it lands in a
-#: request path on the crown-jewel bridge. A percent-encode alone would be enough to
+#: The token is the one thing on this path that comes from the AGENT, and it lands in
+#: a request path on the crown-jewel bridge. A percent-encode alone would be enough to
 #: keep `../` from traversing, but a bounded charset is the check that does not depend
-#: on getting the encoding right — and the id is `uuid4().hex` in
-#: ``control-plane/holds.py``, so nothing legitimate is excluded by saying so.
-_APPROVAL_RE = re.compile(r"^[0-9a-f]{32}$")
+#: on getting the encoding right — and the token is 32 random hex characters
+#: (``store._new_resume_token`` in the control plane), so nothing legitimate is
+#: excluded by saying so.
+#:
+#: The gateway is never given an ask's approval id, which is the operator's: so no
+#: result, outcome record or log line of its can carry one.
+_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
 
 #: Prose for the terminal states the control plane names but does not narrate. Keyed on
 #: `status` rather than on the detail text, so a reworded message upstream cannot
@@ -220,7 +225,7 @@ def parse_call(raw: str) -> tuple[dict, str]:
 
 
 def _run(server: str, tool: str, arguments: object, client: str | None = None,
-         approval_id: str | None = None) -> dict:
+         resume_token: str | None = None) -> dict:
     """Dial the server, make the call, and RECORD HOW IT ENDED. The only side effect
     in this file.
 
@@ -238,17 +243,17 @@ def _run(server: str, tool: str, arguments: object, client: str | None = None,
     that goes unrecorded. (``resume`` records the third such path, where the claim
     succeeded and the approved arguments would not parse.)
 
-    ``client`` and ``approval_id`` are carried only for that record — nothing about the
-    call itself reads them — and ``approval_id`` being present is exactly what marks a
-    row as having come through a human.
+    ``client`` and ``resume_token`` are carried only for that record — nothing about
+    the call itself reads them — and ``resume_token`` being present is exactly what
+    marks a row as having come through a human.
 
     The ARGUMENTS are the caller's to get right, and are sent as given: a default
     substituted here would run something other than what the approval card showed. On
     the resumption path they are the ones the human read, handed back by the claim
     rather than replayed from anything the agent sent."""
     def recorded(result: dict, status: str, reason: str | None = None) -> dict:
-        outcomes.record(status, server, tool, reason=reason, approval_id=approval_id,
-                     client=client)
+        outcomes.record(status, server, tool, reason=reason, resume_token=resume_token,
+                        client=client)
         return result
 
     entry = surface.server_entry(server)
@@ -361,24 +366,32 @@ def call(name: str, arguments: object, client: str | None) -> dict:
 
     decision, why = answer.get("decision"), answer.get("reason") or "no reason given"
     if decision == "allow":
-        # No approval_id, and its absence is the signal: an outcome row without one is a
-        # call policy allowed outright. Those are the rows that grow with every tool an
+        # No resume token, and its absence is the signal: an outcome row without one is
+        # a call policy allowed outright. Those are the rows that grow with every tool an
         # operator enables, and they are the unaudited-intake half of the response side.
         return _run(server, tool, arguments, client=client)
     if decision == "ask":
-        approval_id = answer.get("approval_id")
+        # The token and nothing else: an answer's ``approval_id`` is never read, so a
+        # control plane older than resume tokens cannot hand the agent the operator's
+        # id through here. It gets this refusal instead, and nothing runs.
+        resume_token = answer.get("resume_token")
+        if not isinstance(resume_token, str) or not _TOKEN_RE.match(resume_token):
+            return text_result(
+                f"Held for human approval: {tool} on {server}, but governance gave "
+                f"no usable resume token for it, so it cannot be finished from here. "
+                f"Nothing has run.", is_error=True)
         # A RESULT, not an error, and the instruction travels inside it — where it
         # cannot be forgotten mid-session and cannot drift from the gateway that
         # emitted it.
         return text_result(
             f"Held for human approval: {tool} on {server}. Nothing has run.\n"
-            f"approval_id: {approval_id}\n"
-            f"Call {surface.RESUME_TOOL} with that id to finish this call. It is "
+            f"resume_token: {resume_token}\n"
+            f"Call {surface.RESUME_TOOL} with that token to finish this call. It is "
             f"waiting on a person, so do other work and come back rather than "
             f"retrying immediately; calling this tool again cannot finish it, and "
             f"with any change in the arguments it opens a second question for the "
             f"same human. If you no longer want the call, {surface.WITHDRAW_TOOL} "
-            f"with the same id takes the question back."
+            f"with the same token takes the question back."
             + ("\nAn identical request was already waiting, and this joined it."
                if answer.get("joined") else ""))
     # Every other answer is a deny, INCLUDING one this code does not recognise. The
@@ -387,29 +400,40 @@ def call(name: str, arguments: object, client: str | None) -> dict:
     return text_result(f"Denied: {why}. This will not succeed on retry.", is_error=True)
 
 
-def _approval_id(arguments: object) -> str | None:
-    """The id an agent passed to a native tool, or None if it is missing or malformed.
+def _resume_token(arguments: object) -> str | None:
+    """The token an agent passed to a native tool, or None if it is missing or
+    malformed.
+
+    Read from ``resume_token``, or from ``approval_id`` when that key is absent. The
+    second is an ALIAS for the same value under the parameter's old name, and it is
+    needed because a client keeps the schema it fetched at session start (protocol.py
+    says why `listChanged` is not advertised): a session that spans the upgrade sends
+    every token under the old key. When both keys are present, ``resume_token`` is
+    the one read. The alias can go once no client session predates the upgrade.
 
     STRIPPED before it is checked, and that is safe in a way a looser cleanup would not
-    be: the id is bounded hex, so removing surrounding whitespace cannot turn one valid
-    id into another and cannot make an invalid one valid. It is worth doing because the
-    failure it prevents is a real one — an id copied out of a pending result arrives
-    with a stray newline or trailing space often enough, and the cost is an approval a
-    human granted that can no longer be redeemed."""
-    approval_id = arguments.get("approval_id") if isinstance(arguments, dict) else None
-    if isinstance(approval_id, str):
-        approval_id = approval_id.strip()
-    if not isinstance(approval_id, str) or not _APPROVAL_RE.match(approval_id):
+    be: the token is bounded hex, so removing surrounding whitespace cannot turn one
+    valid token into another and cannot make an invalid one valid. It is worth doing
+    because the failure it prevents is a real one — a token copied out of a pending
+    result arrives with a stray newline or trailing space often enough, and the cost is
+    an approval a human granted that can no longer be redeemed."""
+    if not isinstance(arguments, dict):
         return None
-    return approval_id
+    key = "resume_token" if "resume_token" in arguments else "approval_id"
+    token = arguments.get(key)
+    if isinstance(token, str):
+        token = token.strip()
+    if not isinstance(token, str) or not _TOKEN_RE.match(token):
+        return None
+    return token
 
 
-def _bad_id(tool: str) -> dict:
+def _bad_token(tool: str) -> dict:
     """One message for "missing" and for "malformed", because the agent's next move is
-    the same either way and neither tells it anything about whether some other id
+    the same either way and neither tells it anything about whether some other token
     exists."""
     return text_result(
-        f"{tool} needs the approval_id from a pending result, copied verbatim.",
+        f"{tool} needs the resume_token from a pending result, copied verbatim.",
         is_error=True)
 
 
@@ -432,11 +456,11 @@ def _resume_wait(arguments: object) -> float:
     return max(0.0, min(float(raw), MAX_RESUME_WAIT))
 
 
-#: Approval ids whose claim was delivered and got no usable answer, in this process.
+#: Resume tokens whose claim was delivered and got no usable answer, in this process.
 #: Wording only: a later "already claimed" for one of these may be that lost claim, and
 #: the agent should hear so rather than assume its call ran. "May", because a
-#: concurrent resumption of the same id could have been the one that won. Each id
-#: leaves on its next settled answer; a restart forgets them and costs only the
+#: concurrent resumption of the same token could have been the one that won. Each
+#: token leaves on its next settled answer; a restart forgets them and costs only the
 #: sentence.
 _UNSETTLED: set[str] = set()
 
@@ -449,24 +473,24 @@ def _pending(answer: dict) -> bool:
             and answer.get("status") == "pending")
 
 
-def _unsettled(approval_id: str, client: str | None, why: str) -> dict:
+def _unsettled(resume_token: str, client: str | None, why: str) -> dict:
     """A claim the control plane received and did not usably answer. It may have
     landed — the claim is written before its answer is sent — so the grant may be
     spent with nothing run, and that is recorded as an outcome for the reason every
     spent grant is: an approval must not end in silence. Server and tool are the
-    claim's to supply and it supplied nothing; the id is what joins the row to the
+    claim's to supply and it supplied nothing; the token is what joins the row to the
     ask."""
-    _UNSETTLED.add(approval_id)
+    _UNSETTLED.add(resume_token)
     outcomes.record("transport-error", "(unknown)", "(unknown)",
                     reason=f"the claim reached the control plane but got no usable "
                            f"answer ({why}), so the call was never made; the approval "
                            f"may be spent",
-                    approval_id=approval_id, client=client)
+                    resume_token=resume_token, client=client)
     return text_result(
-        f"governance received the claim for {approval_id} but gave no usable answer "
+        f"governance received the claim for {resume_token} but gave no usable answer "
         f"({why}). Nothing ran. The claim may have gone through anyway, so try again "
-        f"with the same id; if that says it was already claimed, the call needs a new "
-        f"approval.", is_error=True)
+        f"with the same token; if that says it was already claimed, the call needs a "
+        f"new approval.", is_error=True)
 
 
 def resume(arguments: object, client: str | None) -> dict:
@@ -477,7 +501,7 @@ def resume(arguments: object, client: str | None) -> dict:
     effect, so a duplicate resumption is answered as spent rather than run twice.
 
     The arguments come back FROM the claim and are the ones the human read. Nothing the
-    agent sends here contributes to the call beyond the id, which is what closes the
+    agent sends here contributes to the call beyond the token, which is what closes the
     gap between what was approved and what runs.
 
     MAY WAIT, if the agent asks it to (``wait_seconds``). Re-asking is the whole
@@ -486,21 +510,21 @@ def resume(arguments: object, client: str | None) -> dict:
     the two happens is the AGENT'S call and deliberately not this module's: only the
     agent knows whether it has other work to do while a human decides. Zero is the
     default and is exactly today's behaviour."""
-    approval_id = _approval_id(arguments)
-    if approval_id is None:
-        return _bad_id(surface.RESUME_TOOL)
+    resume_token = _resume_token(arguments)
+    if resume_token is None:
+        return _bad_token(surface.RESUME_TOOL)
 
     wait = _resume_wait(arguments)
     deadline = time.monotonic() + wait
     while True:
         try:
-            answer = _ask_control(f"/tool/asks/{approval_id}/claim", {"client": client})
+            answer = _ask_control(f"/tool/asks/{resume_token}/claim", {"client": client})
         except Unanswered as exc:
-            return _unsettled(approval_id, client, str(exc))
+            return _unsettled(resume_token, client, str(exc))
         except discovery.DiscoveryError as exc:
             # Never delivered, so this one IS certain: the control plane did not see it.
             return text_result(
-                f"could not reach governance to claim {approval_id} ({exc}). Nothing "
+                f"could not reach governance to claim {resume_token} ({exc}). Nothing "
                 f"ran, and the approval is untouched — try again.", is_error=True)
         # Only PENDING is worth asking again. Re-asking it is the same free question the
         # agent would ask by calling again, which is what lets this loop exist without a
@@ -522,23 +546,23 @@ def resume(arguments: object, client: str | None) -> dict:
             # an agent that cannot tell a refusal from a delay retries one forever.
             lost = (" An earlier claim of it got no usable answer, so it may have been "
                     "spent by that claim without its call running."
-                    if answer.get("spent") and approval_id in _UNSETTLED else "")
-            _UNSETTLED.discard(approval_id)
+                    if answer.get("spent") and resume_token in _UNSETTLED else "")
+            _UNSETTLED.discard(resume_token)
             return text_result(
-                f"{detail}.{lost} This is final — {approval_id} will not become "
+                f"{detail}.{lost} This is final — {resume_token} will not become "
                 f"runnable, so do not retry it. Call the tool again if the work is "
                 f"still needed; that raises a new question for the human.",
                 is_error=True)
         if not _pending(answer):
             # Neither a verdict nor a delay. Reading it as pending would tell the agent
             # a human is still deciding; it is the same unknown as a lost answer.
-            return _unsettled(approval_id, client, "a reply with no verdict in it")
+            return _unsettled(resume_token, client, "a reply with no verdict in it")
         # STILL PENDING, and therefore not an error. Nobody has answered yet, nothing
-        # has run, and the id is still good.
+        # has run, and the token is still good.
         waited = (f" Waited {wait:g}s for it." if wait else "")
         return text_result(
-            f"Still waiting on a human for {approval_id}. Nothing has run.{waited} "
-            f"Come back with the same id later — do not call the tool again, which "
+            f"Still waiting on a human for {resume_token}. Nothing has run.{waited} "
+            f"Come back with the same token later — do not call the tool again, which "
             f"cannot finish this one and, with any change in the arguments, raises a "
             f"second question for the same person. Pass "
             f"wait_seconds to have this call block until the answer arrives, up to "
@@ -548,7 +572,7 @@ def resume(arguments: object, client: str | None) -> dict:
 
     # Claimed. From here the call is authorised and the arguments are the approved
     # ones, parsed from the canonical form the digest covers and the human was shown.
-    _UNSETTLED.discard(approval_id)
+    _UNSETTLED.discard(resume_token)
     try:
         approved_args = json.loads(answer.get("args_json") or "null")
     except ValueError:
@@ -562,15 +586,15 @@ def resume(arguments: object, client: str | None) -> dict:
                      answer.get("tool") or "(unknown)",
                      reason="the approved arguments could not be parsed, so the call "
                             "was never made",
-                     approval_id=approval_id, client=client)
+                     resume_token=resume_token, client=client)
         return text_result(
-            f"the approved arguments for {approval_id} could not be read, so nothing "
+            f"the approved arguments for {resume_token} could not be read, so nothing "
             f"ran. The approval is spent; raise the call again.", is_error=True)
     # The server and tool come from the CLAIM, so the outcome is filed under what the
-    # human approved rather than under anything the agent named — and the id ties this
+    # human approved rather than under anything the agent named — and the token ties this
     # row to the hold, the click and the release the control plane already recorded.
     return _run(answer["server"], answer["tool"], approved_args,
-                client=client, approval_id=approval_id)
+                client=client, resume_token=resume_token)
 
 
 def withdraw(arguments: object, client: str | None) -> dict:
@@ -580,31 +604,31 @@ def withdraw(arguments: object, client: str | None) -> dict:
     control plane retires the ask or answers that it was already closed. Repeating a
     withdrawal is harmless, which is why every failure to get an answer, delivered or
     not, says the same thing — try again."""
-    approval_id = _approval_id(arguments)
-    if approval_id is None:
-        return _bad_id(surface.WITHDRAW_TOOL)
+    resume_token = _resume_token(arguments)
+    if resume_token is None:
+        return _bad_token(surface.WITHDRAW_TOOL)
     try:
-        answer = _ask_control(f"/tool/asks/{approval_id}/withdraw", {"client": client})
+        answer = _ask_control(f"/tool/asks/{resume_token}/withdraw", {"client": client})
     except discovery.DiscoveryError as exc:
         return text_result(
-            f"could not get an answer from governance to withdraw {approval_id} "
+            f"could not get an answer from governance to withdraw {resume_token} "
             f"({exc}). Nothing ran; try again — withdrawing twice is harmless.",
             is_error=True)
     if answer.get("ok"):
         return text_result(
-            f"Withdrawn: {approval_id}. The human is no longer asked, and nothing will "
-            f"run under this id.")
+            f"Withdrawn: {resume_token}. The human is no longer asked, and nothing will "
+            f"run under this token.")
     status = answer.get("status")
     if answer.get("spent"):
         # The one answer that is not "it is gone": the claim is written before the call,
         # so the agent must find out from the result of that resume whether it ran.
         return text_result(
-            f"{approval_id} was already resumed, so its call may have run; withdrawing "
+            f"{resume_token} was already resumed, so its call may have run; withdrawing "
             f"it changed nothing.", is_error=True)
     if status in _TERMINAL_TEXT:
         # Closed already, which is what the agent wanted: not an error.
         return text_result(
             f"{_TERMINAL_TEXT[status]}, so there was nothing left to withdraw. "
-            f"Nothing will run under {approval_id}.")
+            f"Nothing will run under {resume_token}.")
     return text_result(
-        f"{answer.get('detail') or 'not withdrawable'}: {approval_id}.", is_error=True)
+        f"{answer.get('detail') or 'not withdrawable'}: {resume_token}.", is_error=True)

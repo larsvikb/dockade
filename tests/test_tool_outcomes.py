@@ -17,6 +17,10 @@ import io
 import json
 import logging
 import os
+import pathlib
+import re
+import subprocess
+import sys
 import tempfile
 import unittest
 from typing import ClassVar
@@ -87,13 +91,14 @@ class RecordShapeTests(OutcomeTestCase):
 
     def test_the_line_carries_what_the_ingest_keys_on(self):
         self.outcomes.record("tool-error", "mcp-github", "create_pull_request",
-                             reason="403", approval_id="a" * 32, client="172.30.0.5")
+                             reason="403", resume_token="a" * 32, client="172.30.0.5")
         row = self.lines()[0]
         self.assertEqual(row["stage"], "tool-result")
         self.assertEqual(row["status"], "tool-error")
         self.assertEqual(row["server"], "mcp-github")
         self.assertEqual(row["tool"], "create_pull_request")
-        self.assertEqual(row["approval_id"], "a" * 32)
+        self.assertEqual(row["resume_token"], "a" * 32)
+        self.assertNotIn("approval_id", row)
         self.assertEqual(row["client"], "172.30.0.5")
         self.assertEqual(row["reason"], "403")
         self.assertIsInstance(row["ts"], float)
@@ -105,14 +110,14 @@ class RecordShapeTests(OutcomeTestCase):
         self.outcomes.record("ok", "s", "t")
         self.assertEqual({row["stage"] for row in self.lines()}, {"tool-result"})
 
-    def test_an_absent_approval_is_null_rather_than_missing(self):
+    def test_an_absent_token_is_null_rather_than_missing(self):
         # A call policy allowed outright has no approval, and the KEY has to be there
         # anyway: absent, the ingest cannot tell "allowed outright" from a line written
         # by a version that did not carry the field.
         self.outcomes.record("ok", "mcp-github", "get_me")
         row = self.lines()[0]
-        self.assertIn("approval_id", row)
-        self.assertIsNone(row["approval_id"])
+        self.assertIn("resume_token", row)
+        self.assertIsNone(row["resume_token"])
 
     def test_every_status_the_module_names_survives_a_round_trip(self):
         # The vocabulary is shared with the control plane's ingest across a file and
@@ -128,7 +133,7 @@ class LiveFeedTests(OutcomeTestCase):
     """The stdout line is what a human reads in `make logs-tg`, and ``reason`` is a
     third party's text. One record has to be one line there."""
 
-    FORGED = "denied\nOUTCOME ok mcp-github__merge_pull_request approval_id=" + "a" * 32
+    FORGED = "denied\nOUTCOME ok mcp-github__merge_pull_request resume_token=" + "a" * 32
 
     def test_a_servers_error_text_cannot_add_a_line_to_the_feed(self):
         # Q10. With the newline kept, the forged half reads as its own record.
@@ -341,6 +346,42 @@ class TornRecordTests(unittest.TestCase):
                     outcomes.setup()
                 self.assertTrue(outcomes._to_file)
                 self.assertIn("No space left on device", out.getvalue())
+
+
+class ToolOutcomesTargetTests(unittest.TestCase):
+    """`make tool-outcomes`' script, run as the Makefile holds it, over a stream with
+    a line from each gateway: the one that writes the resume token and the one older
+    than tokens, which wrote the approval id. The container runs it from the gateway's
+    side of the volume, where lines from before an upgrade can still be."""
+
+    @staticmethod
+    def _script():
+        makefile = (pathlib.Path(__file__).resolve().parent.parent
+                    / "Makefile").read_text()
+        return re.search(r"^define TOOL_OUTCOMES_PY\n(.*?)^endef$", makefile,
+                         re.S | re.M).group(1)
+
+    def test_it_shows_a_token_line_and_a_legacy_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "audit.jsonl")
+            with open(path, "w") as f:
+                base = {"ts": 1000.0, "stage": "tool-result", "server": "mcp-github",
+                        "tool": "create_pr", "client": None, "reason": None}
+                f.write(json.dumps({**base, "status": "ok",
+                                    "resume_token": "c" * 32}) + "\n")
+                f.write(json.dumps({**base, "status": "tool-error",
+                                    "approval_id": "a" * 32}) + "\n")
+                f.write(json.dumps({**base, "status": "ok",
+                                    "resume_token": None}) + "\n")
+            shown = subprocess.run(  # noqa: S603 (this interpreter, the repo's own script)
+                [sys.executable, "-I", "-c", self._script()], capture_output=True,
+                text=True, check=True,
+                env={"GATEWAY_AUDIT_LOG": path, "OUTCOMES": "20"}).stdout
+        lines = shown.splitlines()
+        self.assertIn("token=" + "c" * 32, lines[0])
+        self.assertIn("approval=" + "a" * 32, lines[1])
+        self.assertTrue(lines[2].endswith("  -"), lines[2])
+        self.assertIn("3 of 3", lines[-1])
 
 
 if __name__ == "__main__":

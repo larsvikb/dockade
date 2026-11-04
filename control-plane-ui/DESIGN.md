@@ -20,9 +20,10 @@ the `uuid4` ids a blind attacker cannot guess) and resolve them. That is the vec
 that matters most here, but plain CSRF is not self-blocking either, as this once
 claimed: a JSON body does not force a preflight (a typeless `Blob` is sent with no
 `Content-Type`, which is CORS-safelisted, and FastAPI parses an untyped body as
-JSON), and the `resolve` id is not blind for a tool ask, because the agent is handed
-it in the pending result. Four structural guards sit in front: three that every UI
-installs from `ui-common/guards.py`, and the relay's own table in
+JSON). The `resolve` id is blind for a tool ask too: the agent is handed a resume
+token, never the id (DESIGN.md, "Resumption is a tool, keyed on a resume token").
+Four structural guards sit in front: three that every UI installs from
+`ui-common/guards.py`, and the relay's own table in
 `control-plane-ui/app.py`:
 
 - **Host allowlist** (`CONTROL_UI_ALLOWED_HOSTS`, default `127.0.0.1,localhost,::1`)

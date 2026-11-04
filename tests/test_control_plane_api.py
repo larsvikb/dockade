@@ -3937,14 +3937,43 @@ def _tool_call(server="mcp-github", tool="get_me", args=None, client=CLASS_IP,
                                     schema_digest=schema_digest))
 
 
-def _claim(approval_id, client=CLASS_IP):
-    return cp.api_tool.tool_claim(approval_id,
+def _ask_id(answer):
+    """The operator's id for the ask an `ask` answer raised. Read from the store by
+    the answer's resume token, because the answer itself carries no id."""
+    with cp.store._connect() as conn:
+        row = conn.execute("SELECT id FROM tool_approvals WHERE resume_token=?",
+                           (answer["resume_token"],)).fetchone()
+    return row["id"]
+
+
+def _token(approval_id):
+    """The resume token of the ask ``approval_id`` names: the agent's handle on it.
+    Raises if there is no such ask, so a test cannot pass an id where a token goes
+    by accident; ``_claim_with`` and ``_withdraw_with`` take a raw value."""
+    with cp.store._connect() as conn:
+        row = conn.execute("SELECT resume_token FROM tool_approvals WHERE id=?",
+                           (approval_id,)).fetchone()
+    return row["resume_token"]
+
+
+def _claim_with(handle, client=CLASS_IP):
+    return cp.api_tool.tool_claim(handle,
                                   cp.api_tool.ToolResumeRequest(client=client))
 
 
-def _withdraw(approval_id, client=CLASS_IP):
-    return cp.api_tool.tool_withdraw(approval_id,
+def _withdraw_with(handle, client=CLASS_IP):
+    return cp.api_tool.tool_withdraw(handle,
                                      cp.api_tool.ToolResumeRequest(client=client))
+
+
+def _claim(approval_id, client=CLASS_IP):
+    """Claim the ask ``approval_id`` names as its agent does: by its resume token."""
+    return _claim_with(_token(approval_id), client)
+
+
+def _withdraw(approval_id, client=CLASS_IP):
+    """Withdraw the ask ``approval_id`` names as its agent does: by its token."""
+    return _withdraw_with(_token(approval_id), client)
 
 
 class _ToolBridgeTestCase(_CPTestCase):
@@ -4012,7 +4041,7 @@ class ToolAuthorizeDecisionTests(_ToolBridgeTestCase):
         answer = _tool_call(tool="create_pull_request", args={"title": "x"})
         self.assertEqual(answer["decision"], "ask")
         self.assertFalse(answer["joined"])
-        ask = cp.holds._get_tool_ask(answer["approval_id"])
+        ask = cp.holds._get_tool_ask(_ask_id(answer))
         self.assertEqual(ask["status"], "pending")
         # Absolute, not a remaining-seconds count: a ticking field is stale on
         # arrival and would turn the SSE change-detector into a 1 Hz emitter.
@@ -4033,7 +4062,7 @@ class ToolAuthorizeDecisionTests(_ToolBridgeTestCase):
         _tool_rule("create_pull_request", "ask")
         first = _tool_call(tool="create_pull_request", args={"a": 1, "b": 2})
         again = _tool_call(tool="create_pull_request", args={"b": 2, "a": 1})
-        self.assertEqual(again["approval_id"], first["approval_id"])
+        self.assertEqual(again["resume_token"], first["resume_token"])
         self.assertTrue(again["joined"])
         self.assertEqual(len(cp.holds._list_tool_asks()), 1)
 
@@ -4043,14 +4072,14 @@ class ToolAuthorizeDecisionTests(_ToolBridgeTestCase):
         _tool_rule("create_pull_request", "ask")
         first = _tool_call(tool="create_pull_request", args={"title": "one"})
         other = _tool_call(tool="create_pull_request", args={"title": "two"})
-        self.assertNotEqual(other["approval_id"], first["approval_id"])
+        self.assertNotEqual(_ask_id(other), _ask_id(first))
 
     def test_one_sandbox_never_joins_another_sandboxs_ask(self):
         _tool_rule("create_pull_request", "ask")
         mine = _tool_call(tool="create_pull_request", args={"a": 1})
         theirs = _tool_call(tool="create_pull_request", args={"a": 1},
                             client="172.30.0.137")
-        self.assertNotEqual(theirs["approval_id"], mine["approval_id"])
+        self.assertNotEqual(_ask_id(theirs), _ask_id(mine))
 
     def test_an_oversized_payload_is_denied_rather_than_shown_in_part(self):
         # Refused, not truncated: this payload is what a human is shown as the thing
@@ -4113,7 +4142,7 @@ class ToolAuthorizeDecisionTests(_ToolBridgeTestCase):
         with mock.patch.object(cp.store, "_audit") as audited:
             answer = _tool_call(tool="create_pull_request", args={"n": 1})
         reason = audited.call_args[1]["reason"]
-        self.assertIn(answer["approval_id"], reason)
+        self.assertIn(_ask_id(answer), reason)
         self.assertIn("nothing is blocked", reason)
 
     def test_the_audit_words_this_endpoint_writes_are_all_filterable(self):
@@ -4390,7 +4419,7 @@ class PinFromCardTests(_ToolBridgeTestCase):
     def setUp(self):
         super().setUp()
         self.rule_id = _tool_rule("create_pull_request", "ask").body["id"]
-        self.ask = _tool_call(tool="create_pull_request", args=_PR_ARGS)["approval_id"]
+        self.ask = _ask_id(_tool_call(tool="create_pull_request", args=_PR_ARGS))
 
     def _pin_rows(self):
         with cp.store._connect() as conn:
@@ -4454,8 +4483,8 @@ class PinFromCardTests(_ToolBridgeTestCase):
 
     def test_a_pin_already_in_place_allows_the_call_and_writes_nothing(self):
         _resolve(self.ask, "allow_pinned", pins=["owner", "repo"])
-        second = _tool_call(tool="create_pull_request",
-                            args={**_PR_ARGS, "repo": "widgets"})["approval_id"]
+        second = _ask_id(_tool_call(tool="create_pull_request",
+                            args={**_PR_ARGS, "repo": "widgets"}))
         # The same values as the first pin, from a call it did not answer.
         with cp.store._connect() as conn:
             conn.execute("UPDATE tool_pins SET pins_json=?",
@@ -4502,7 +4531,7 @@ class TimedPinFromCardTests(_ToolBridgeTestCase):
         cp.policy.PIN_LEASE_SECONDS = 300.0
         self.addCleanup(setattr, cp.policy, "PIN_LEASE_SECONDS", saved)
         self.rule_id = _tool_rule("create_pull_request", "ask").body["id"]
-        self.ask = _tool_call(tool="create_pull_request", args=_PR_ARGS)["approval_id"]
+        self.ask = _ask_id(_tool_call(tool="create_pull_request", args=_PR_ARGS))
 
     def _pins(self):
         with cp.store._connect() as conn:
@@ -4646,10 +4675,10 @@ class SchemaBoundPinBridgeTests(_ToolBridgeTestCase):
         answer = _tool_call(tool="create_pull_request", args=_PR_ARGS,
                             schema_digest=_MOVED)
         self.assertEqual(answer["decision"], "ask")
-        reason = self._hold_reason(answer["approval_id"])
+        reason = self._hold_reason(_ask_id(answer))
         self.assertIn(f"pin {self.pin_id} on owner, repo matches the call's values but "
                       f"was pinned under other arguments of the tool", reason)
-        self.assertIn(f"registered as tool ask {answer['approval_id']}", reason)
+        self.assertIn(f"registered as tool ask {_ask_id(answer)}", reason)
 
     def test_a_call_with_no_digest_or_a_malformed_one_gets_a_card(self):
         for digest in (None, "", "5C" * 32, "5c" * 31, _SCHEMA + "\n", 7):
@@ -4658,8 +4687,8 @@ class SchemaBoundPinBridgeTests(_ToolBridgeTestCase):
                                     schema_digest=digest)
                 self.assertEqual(answer["decision"], "ask")
                 self.assertIn("the gateway sent no digest",
-                              self._hold_reason(answer["approval_id"]))
-                _resolve(answer["approval_id"], "deny")
+                              self._hold_reason(_ask_id(answer)))
+                _resolve(_ask_id(answer), "deny")
 
     def test_a_retry_under_a_new_digest_opens_a_new_card(self):
         args = {**_PR_ARGS, "repo": "widgets"}
@@ -4668,15 +4697,15 @@ class SchemaBoundPinBridgeTests(_ToolBridgeTestCase):
         moved = _tool_call(tool="create_pull_request", args=args,
                            schema_digest=_MOVED)
         self.assertTrue(same["joined"])
-        self.assertEqual(same["approval_id"], first["approval_id"])
+        self.assertEqual(_ask_id(same), _ask_id(first))
         self.assertFalse(moved["joined"])
-        self.assertNotEqual(moved["approval_id"], first["approval_id"])
+        self.assertNotEqual(_ask_id(moved), _ask_id(first))
         self.assertEqual(len(cp.holds._list_tool_asks()), 2)
 
     def test_the_card_stores_the_digest_its_call_was_made_under(self):
         answer = _tool_call(tool="create_pull_request", args=_PR_ARGS,
                             schema_digest=_MOVED)
-        self.assertEqual(cp.holds._get_tool_ask(answer["approval_id"])["schema_digest"],
+        self.assertEqual(cp.holds._get_tool_ask(_ask_id(answer))["schema_digest"],
                          _MOVED)
 
 
@@ -4695,8 +4724,8 @@ class SchemaBoundPinFromCardTests(_ToolBridgeTestCase):
         _tool_rule("create_pull_request", "ask")
 
     def _card(self, digest=_SCHEMA, **changes):
-        return _tool_call(tool="create_pull_request", args={**_PR_ARGS, **changes},
-                          schema_digest=digest)["approval_id"]
+        return _ask_id(_tool_call(tool="create_pull_request", args={**_PR_ARGS, **changes},
+                          schema_digest=digest))
 
     def _pins(self):
         with cp.store._connect() as conn:
@@ -4952,8 +4981,8 @@ class ToolRosterTests(_ToolBridgeTestCase):
 
 
 class ToolClaimTests(_ToolBridgeTestCase):
-    """``POST /tool/asks/{id}/claim`` — resumption, and the only place this bridge
-    releases anything.
+    """``POST /tool/asks/{resume_token}/claim`` — resumption, and the only place this
+    bridge releases anything.
 
     The gateway executes HERE rather than at the human's click, which is what makes
     the stranded-caller property structural: an approved call nobody comes back for
@@ -4961,9 +4990,9 @@ class ToolClaimTests(_ToolBridgeTestCase):
 
     def _ask(self, args=None, client=CLASS_IP):
         _tool_rule("create_pull_request", "ask")
-        return _tool_call(tool="create_pull_request",
+        return _ask_id(_tool_call(tool="create_pull_request",
                           args={"title": "x"} if args is None else args,
-                          client=client)["approval_id"]
+                          client=client))
 
     def test_an_approved_ask_hands_back_exactly_what_the_human_read(self):
         ask = self._ask(args={"b": 2, "a": 1})
@@ -5032,7 +5061,7 @@ class ToolClaimTests(_ToolBridgeTestCase):
     def test_an_unknown_id_is_a_terminal_404(self):
         # Terminal like the refusals above, so the gateway reads one field for every
         # answer: an id unknown to this caller does not become known by asking again.
-        resp = _claim("no-such-approval")
+        resp = _claim_with("no-such-approval")
         self.assertEqual(resp.status_code, 404)
         self.assertTrue(resp.body["terminal"])
 
@@ -5053,7 +5082,7 @@ class ToolClaimTests(_ToolBridgeTestCase):
         # and the response must not follow them apart.
         ask = self._ask()
         foreign = _claim(ask, client="172.30.0.137")
-        unknown = _claim("f" * 32, client="172.30.0.137")
+        unknown = _claim_with("f" * 32, client="172.30.0.137")
         self.assertEqual((foreign.status_code, foreign.body),
                          (unknown.status_code, unknown.body))
 
@@ -5103,8 +5132,8 @@ class ToolClaimTests(_ToolBridgeTestCase):
                      _flip_to_deny):
             with self.subTest(undo=undo):
                 rule_id = _tool_rule("create_pull_request", "ask").body["id"]
-                ask = _tool_call(tool="create_pull_request",
-                                 args={"title": "x"})["approval_id"]
+                ask = _ask_id(_tool_call(tool="create_pull_request",
+                                 args={"title": "x"}))
                 _resolve(ask, "allow")
                 undo(rule_id)
                 self.assertEqual(_claim(ask).status_code, 409)
@@ -5150,7 +5179,7 @@ class ToolClaimTests(_ToolBridgeTestCase):
 
 
 class ToolWithdrawTests(_ToolBridgeTestCase):
-    """``POST /tool/asks/{id}/withdraw`` — the agent taking back its own ask.
+    """``POST /tool/asks/{resume_token}/withdraw`` — the agent taking back its own ask.
 
     The property that makes it admissible on this bridge is that it only ever REDUCES:
     it retires a question or an unclaimed grant, and nothing it can be asked releases
@@ -5158,9 +5187,9 @@ class ToolWithdrawTests(_ToolBridgeTestCase):
 
     def _ask(self, args=None, client=CLASS_IP):
         _tool_rule("create_pull_request", "ask")
-        return _tool_call(tool="create_pull_request",
+        return _ask_id(_tool_call(tool="create_pull_request",
                           args={"title": "x"} if args is None else args,
-                          client=client)["approval_id"]
+                          client=client))
 
     def test_a_pending_ask_leaves_the_operators_queue(self):
         ask = self._ask()
@@ -5228,7 +5257,7 @@ class ToolWithdrawTests(_ToolBridgeTestCase):
     def test_another_sandboxs_id_is_unknown_and_its_ask_survives(self):
         ask = self._ask()
         foreign = _withdraw(ask, client="172.30.0.137")
-        unknown = _withdraw("f" * 32, client="172.30.0.137")
+        unknown = _withdraw_with("f" * 32, client="172.30.0.137")
         self.assertEqual(foreign.status_code, 404)
         self.assertEqual((foreign.status_code, foreign.body),
                          (unknown.status_code, unknown.body))
@@ -5260,7 +5289,7 @@ class WithdrawAuditTests(_ToolBridgeTestCase):
 
     def _ask(self):
         _tool_rule("create_pull_request", "ask")
-        return _tool_call(tool="create_pull_request", args={"title": "x"})["approval_id"]
+        return _ask_id(_tool_call(tool="create_pull_request", args={"title": "x"}))
 
     def _rows(self, approval_id):
         with cp.store._connect() as conn:
@@ -5302,7 +5331,7 @@ class RefusedClaimAuditTests(_ToolBridgeTestCase):
 
     def _ask(self):
         _tool_rule("create_pull_request", "ask")
-        return _tool_call(tool="create_pull_request", args={"title": "x"})["approval_id"]
+        return _ask_id(_tool_call(tool="create_pull_request", args={"title": "x"}))
 
     def _resume_rows(self, approval_id):
         with cp.store._connect() as conn:
@@ -5322,12 +5351,19 @@ class RefusedClaimAuditTests(_ToolBridgeTestCase):
         self.assertEqual((server, tool), ("mcp-github", "create_pull_request"))
         self.assertIn(CLASS_IP, reason)                     # whose id it was
 
-    def test_an_unknown_id_is_audited_with_the_id_it_named(self):
-        _claim("f" * 32, client="172.30.0.137")
-        [(kind, stage, client, server, tool, reason)] = self._resume_rows("f" * 32)
-        self.assertEqual((kind, stage, client), ("deny", "tool-resume", "172.30.0.137"))
-        self.assertEqual((server, tool), (None, None))
-        self.assertIn("unknown", reason)
+    def test_an_unknown_value_is_audited_with_no_id_and_the_value_in_the_reason(self):
+        # It names no ask, so the row joins none: a value written to `approval_id`
+        # would read as one in the column the trail is queried by.
+        _claim_with("f" * 32, client="172.30.0.137")
+        with cp.store._connect() as conn:
+            [row] = conn.execute(
+                "SELECT kind, client, server, tool, approval_id, reason FROM audit "
+                "WHERE stage='tool-resume'").fetchall()
+        self.assertEqual((row["kind"], row["client"]), ("deny", "172.30.0.137"))
+        self.assertEqual((row["server"], row["tool"], row["approval_id"]),
+                         (None, None, None))
+        self.assertIn("unknown", row["reason"])
+        self.assertIn("f" * 32, row["reason"])
 
     def test_polling_a_pending_ask_writes_nothing(self):
         # What keeps the new rows from becoming a flood: an agent waiting on a human
@@ -5336,6 +5372,129 @@ class RefusedClaimAuditTests(_ToolBridgeTestCase):
         for _ in range(3):
             _claim(ask)
         self.assertEqual(self._resume_rows(ask), [])
+
+
+class ResumeTokenSeparationTests(_ToolBridgeTestCase):
+    """Two handles on one ask: the agent's resume token, which claim and withdraw take,
+    and the operator's id, which ``resolve`` takes and which nothing the agent side
+    receives may carry. Asserted on every answer and every audit row an ask's life
+    writes, since one wide select or one f-string is all a leak takes."""
+
+    audits = True
+
+    def setUp(self):
+        super().setUp()
+        _tool_rule("create_pull_request", "ask")
+
+    @staticmethod
+    def _raise(n, client=CLASS_IP):
+        return _tool_call(tool="create_pull_request", args={"n": n}, client=client)
+
+    @staticmethod
+    def _text(resp):
+        return json.dumps(resp.body if hasattr(resp, "body") else resp)
+
+    def test_no_answer_the_agent_side_gets_carries_the_id(self):
+        fresh = self._raise(1)
+        joined = self._raise(1)
+        ask = _ask_id(fresh)
+        self.assertTrue(joined["joined"])
+        self.assertEqual(joined["resume_token"], fresh["resume_token"])
+        answers = {"ask": fresh, "joined ask": joined,
+                   "pending claim": _claim(ask),
+                   "foreign claim": _claim(ask, client="172.30.0.137"),
+                   "unknown claim": _claim_with("f" * 32),
+                   "id claim": _claim_with(ask)}
+        _resolve(ask, "allow")
+        answers["claim"] = _claim(ask)
+        answers["spent claim"] = _claim(ask)
+        answers["spent withdraw"] = _withdraw(ask)
+        other = _ask_id(self._raise(2))
+        answers["withdraw"] = _withdraw(other)
+        answers["closed withdraw"] = _withdraw(other)
+        refused = _ask_id(self._raise(3))
+        _resolve(refused, "allow")
+        cp.api_mcp.edit_mcp_server("mcp-github", _edit_request(enabled=False),
+                                   _FakeRequest())
+        answers["policy-refused claim"] = _claim(refused)
+        self.assertEqual(answers["claim"].status_code, 200)
+        for name, answer in answers.items():
+            with self.subTest(answer=name):
+                for approval_id in (ask, other, refused):
+                    self.assertNotIn(approval_id, self._text(answer))
+
+    def test_an_operator_id_is_unknown_to_claim_and_withdraw_and_says_so(self):
+        ask = _ask_id(self._raise(1))
+        _resolve(ask, "allow")
+        for presented in (_claim_with(ask), _withdraw_with(ask)):
+            self.assertEqual(presented.status_code, 404)
+            self.assertTrue(presented.body["terminal"])
+            self.assertEqual(presented.body, _claim_with("f" * 32).body)
+        with cp.store._connect() as conn:
+            rows = conn.execute(
+                "SELECT kind, stage, server, tool, reason FROM audit "
+                "WHERE approval_id=? AND stage IN ('tool-resume', 'tool-withdraw') "
+                "ORDER BY id", (ask,)).fetchall()
+        self.assertEqual([(r["kind"], r["stage"], r["server"], r["tool"]) for r in rows],
+                         [("deny", "tool-resume", "mcp-github", "create_pull_request"),
+                          ("deny", "tool-withdraw", "mcp-github",
+                           "create_pull_request")])
+        for row in rows:
+            self.assertIn("operator's approval id", row["reason"])
+        # Nothing was claimed or withdrawn by the id: the token still redeems it.
+        self.assertEqual(_claim(ask).status_code, 200)
+
+    def test_resolve_given_a_token_decides_nothing(self):
+        answer = self._raise(1)
+        resp = _resolve(answer["resume_token"], "allow")
+        self.assertNotEqual(resp.status_code, 200)
+        self.assertEqual(cp.holds._get_tool_ask(_ask_id(answer))["status"], "pending")
+        self.assertEqual(_claim(_ask_id(answer)).body["status"], "pending")
+
+    def test_the_token_reaches_no_operator_surface(self):
+        # Every row an ask's life writes, through each branch: the hold, a join, a
+        # pending poll, a foreign and an id-presented claim, the click, a
+        # policy-refused claim, the release, a withdrawal, and an expiry.
+        tokens = []
+        first = self._raise(1)
+        tokens.append(first["resume_token"])
+        ask = _ask_id(first)
+        self._raise(1)
+        _claim(ask)
+        _claim(ask, client="172.30.0.137")
+        _withdraw(ask, client="172.30.0.137")
+        _claim_with(ask)
+        payload = json.dumps(cp.holds._pending_payload())
+        resolved = _resolve(ask, "allow")
+        cp.api_mcp.edit_mcp_server("mcp-github", _edit_request(enabled=False),
+                                   _FakeRequest())
+        _claim(ask)
+        _enable()
+        _claim(ask)
+        dropped = self._raise(2)
+        tokens.append(dropped["resume_token"])
+        _withdraw(_ask_id(dropped))
+        lapsing = self._raise(3)
+        tokens.append(lapsing["resume_token"])
+        with cp.store._connect() as conn:
+            conn.execute("UPDATE tool_approvals SET deadline=? WHERE id=?",
+                         (time.time() - 1, _ask_id(lapsing)))
+            conn.commit()
+        cp.holds._expire_tool_asks()
+        with cp.store._connect() as conn:
+            audit = json.dumps([dict(r) for r in conn.execute("SELECT * FROM audit")])
+            kinds = {(r["kind"], r["stage"]) for r in conn.execute(
+                "SELECT kind, stage FROM audit")}
+        # The branches above did write their rows, so their absence below is evidence.
+        self.assertLessEqual({("hold", "tool-call"), ("deny", "tool-resume"),
+                              ("deny", "tool-withdraw"), ("allow", "tool-resume"),
+                              ("withdraw", "tool-withdraw"), ("deny", "tool-ask")},
+                             kinds)
+        for token in tokens:
+            with self.subTest(token=token):
+                self.assertNotIn(token, payload)
+                self.assertNotIn(token, self._text(resolved))
+                self.assertNotIn(token, audit)
 
 
 class ToolCorrelationColumnTests(_ToolBridgeTestCase):
@@ -5369,8 +5528,8 @@ class ToolCorrelationColumnTests(_ToolBridgeTestCase):
         # parsing a sentence. The stages are asserted as a set because what matters is
         # that none of the three is missing, not the order they were written in.
         _tool_rule("create_pull_request", "ask")
-        approval_id = _tool_call(tool="create_pull_request",
-                                 args={"title": "x"})["approval_id"]
+        approval_id = _ask_id(_tool_call(tool="create_pull_request",
+                                 args={"title": "x"}))
         _resolve(approval_id, "allow")
         _claim(approval_id)
         rows = self._rows_for(approval_id)
@@ -5385,8 +5544,8 @@ class ToolCorrelationColumnTests(_ToolBridgeTestCase):
         # Filtering the audit by class must not drop the human's decision: the hold
         # and the answer both belong to the one agent that asked.
         _tool_rule("create_pull_request", "ask")
-        approval_id = _tool_call(tool="create_pull_request",
-                                 args={"title": "x"})["approval_id"]
+        approval_id = _ask_id(_tool_call(tool="create_pull_request",
+                                 args={"title": "x"}))
         _resolve(approval_id, "deny")
         with cp.store._connect() as conn:
             rows = conn.execute("SELECT stage, client_class FROM audit "
@@ -5520,7 +5679,7 @@ class ActorColumnTests(_ToolBridgeTestCase):
 
     def test_a_human_answer_to_a_tool_ask_keeps_the_asker_and_names_the_answerer(self):
         _tool_rule("create_pull_request", "ask")
-        ask = _tool_call(tool="create_pull_request", args={"title": "x"})["approval_id"]
+        ask = _ask_id(_tool_call(tool="create_pull_request", args={"title": "x"}))
         _resolve(ask, "deny", self._operator())
         [row] = self._rows("stage='tool-ask' AND approval_id=?", ask)
         self.assertEqual((row["client"], row["client_class"]),
@@ -5890,7 +6049,7 @@ class FreshSchemaTests(_FreshStoreTestCase):
         self.assertEqual(cols, {"id", "ts", "server", "tool", "args_json",
                                 "args_digest", "client", "status", "deadline",
                                 "resolved_at", "resolved_by", "claimed_at",
-                                "schema_digest"})
+                                "schema_digest", "resume_token"})
 
     def test_new_store_has_the_mcp_server_table_and_no_secret_reference(self):
         # Asserted as an EXACT set, and the exactness is the assertion: a column
@@ -6834,15 +6993,14 @@ class SchemaDigestMigrationTests(_FreshStoreTestCase):
         with cp.store._connect() as conn:
             return [tuple(r) for r in conn.execute(f"PRAGMA table_info({name})")]
 
-    def test_v12_is_the_current_step(self):
-        self.assertEqual(cp.store.SCHEMA_VERSION, 12)
-        self.assertEqual(cp.store._STEPS[-1][:2],
+    def test_v12_is_the_pin_binding_step(self):
+        self.assertEqual(cp.store._STEPS[11][:2],
                          (12, "pins bound to the tool's arguments"))
 
     def test_v12_drops_every_pin_audits_each_and_keeps_counting(self):
         self._v11_store("schema-digest-pins.db")
         cp.store._init_db()
-        self.assertEqual(self._version(), 12)
+        self.assertEqual(self._version(), cp.store.SCHEMA_VERSION)
         with cp.store._connect() as conn:
             self.assertEqual(
                 conn.execute("SELECT COUNT(*) FROM tool_pins").fetchone()[0], 0)
@@ -6880,7 +7038,7 @@ class SchemaDigestMigrationTests(_FreshStoreTestCase):
                          "'{\"repo\":\"dockade\"}', 'a', 0, 'g')")
             conn.commit()
         cp.store._init_db()
-        self.assertEqual(self._version(), 12)
+        self.assertEqual(self._version(), cp.store.SCHEMA_VERSION)
         with cp.store._connect() as conn:
             reasons = [r["reason"] for r in conn.execute(
                 "SELECT reason FROM audit WHERE stage='tool-policy'")]
@@ -6911,6 +7069,118 @@ class SchemaDigestMigrationTests(_FreshStoreTestCase):
         cp.store._init_db()
         self.assertEqual(migrated,
                          {t: self._table(t) for t in ("tool_pins", "tool_approvals")})
+
+
+class ResumeTokenMigrationTests(_FreshStoreTestCase):
+    """v13, which gives each ask a resume token apart from its id. Only a PENDING row
+    gets one: no token was issued for any other, and the operator chose to fail closed
+    on the handles agents hold from before (task 138's decision)."""
+
+    _ASKS_V12 = SchemaDigestMigrationTests._ASKS_V11[:-1] + ", schema_digest TEXT)"
+
+    def _v12_store(self, name):
+        self._use_store(name)
+        cp.store._init_db()
+        now = time.time()
+        with cp.store._connect() as conn:
+            conn.execute("DROP INDEX IF EXISTS tool_approvals_resume_token")
+            conn.execute("DROP TABLE tool_approvals")
+            conn.execute(self._ASKS_V12)
+            conn.executemany(
+                "INSERT INTO tool_approvals(id, ts, server, tool, args_json, "
+                "args_digest, client, status, deadline, resolved_at) VALUES "
+                "(?, ?, 'mcp-github', 'issue_read', '{}', ?, ?, ?, ?, ?)",
+                [("p1", now, "d1", CLASS_IP, "pending", now + 3600, None),
+                 ("p2", now, "d2", CLASS_IP, "pending", now + 3600, None),
+                 ("a1", now, "d3", CLASS_IP, "allowed", now + 3600, now),
+                 ("x1", now, "d4", CLASS_IP, "denied", now + 3600, now)])
+            conn.execute("PRAGMA user_version = 12")
+            conn.commit()
+
+    @staticmethod
+    def _tokens():
+        with cp.store._connect() as conn:
+            return {r["id"]: r["resume_token"] for r in conn.execute(
+                "SELECT id, resume_token FROM tool_approvals")}
+
+    def test_v13_is_the_current_step(self):
+        self.assertEqual(cp.store.SCHEMA_VERSION, 13)
+        self.assertEqual(cp.store._STEPS[-1][:2], (13, "resume tokens on tool asks"))
+
+    def test_pending_rows_get_distinct_tokens_and_every_other_row_keeps_null(self):
+        self._v12_store("resume-token-mint.db")
+        cp.store._init_db()
+        tokens = self._tokens()
+        self.assertRegex(tokens["p1"], r"^[0-9a-f]{32}$")
+        self.assertRegex(tokens["p2"], r"^[0-9a-f]{32}$")
+        self.assertNotEqual(tokens["p1"], tokens["p2"])
+        self.assertNotIn(tokens["p1"], ("p1", "p2"))
+        self.assertEqual((tokens["a1"], tokens["x1"]), (None, None))
+
+    def test_an_identical_retry_joins_a_migrated_pending_ask_and_gets_its_token(self):
+        self._v12_store("resume-token-join.db")
+        cp.store._init_db()
+        _register()
+        _enable()
+        _tool_rule("issue_read", "ask")
+        with cp.store._connect() as conn:
+            conn.execute("UPDATE tool_approvals SET args_digest=? WHERE id='p1'",
+                         (cp.holds._args_digest("mcp-github", "issue_read", "{}"),))
+            conn.commit()
+        answer = _tool_call(tool="issue_read", args={}, schema_digest=None)
+        self.assertTrue(answer["joined"])
+        self.assertEqual(answer["resume_token"], self._tokens()["p1"])
+
+    def test_a_handle_from_before_the_upgrade_is_answered_as_unknown(self):
+        # Fail closed: the approved, unclaimed ask's agent holds its id, and the id is
+        # no longer a handle. It lapses at its grant window.
+        self._v12_store("resume-token-fail-closed.db")
+        cp.store._init_db()
+        _register()
+        _enable()
+        resp = _claim_with("a1")
+        self.assertEqual(resp.status_code, 404)
+        self.assertIsNone(cp.holds._get_tool_ask("a1")["claimed_at"])
+
+    def test_a_migrated_and_a_fresh_table_agree(self):
+        self._v12_store("resume-token-agree-migrated.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            migrated = ([tuple(r) for r in conn.execute(
+                "PRAGMA table_info(tool_approvals)")],
+                [tuple(r)[1:] for r in conn.execute(
+                    "PRAGMA index_list(tool_approvals)")])
+        self._use_store("resume-token-agree-fresh.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            fresh = ([tuple(r) for r in conn.execute(
+                "PRAGMA table_info(tool_approvals)")],
+                [tuple(r)[1:] for r in conn.execute(
+                    "PRAGMA index_list(tool_approvals)")])
+        self.assertEqual(sorted(migrated[1]), sorted(fresh[1]))
+        self.assertEqual(migrated[0], fresh[0])
+        self.assertIn(("tool_approvals_resume_token", 1, "c", 0), fresh[1])
+
+    def test_the_token_is_unique(self):
+        self._use_store("resume-token-unique.db")
+        cp.store._init_db()
+        insert = ("INSERT INTO tool_approvals(id, ts, server, tool, args_json, "
+                  "args_digest, status, deadline, resume_token) VALUES "
+                  "(?, 0, 's', 't', '{}', 'd', 'pending', 0, ?)")
+        with cp.store._connect() as conn:
+            conn.execute(insert, ("one", "ab" * 16))
+            conn.execute(insert, ("two", None))
+            conn.execute(insert, ("three", None))
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(insert, ("four", "ab" * 16))
+
+    def test_v13_skips_a_store_without_the_table(self):
+        self._use_store("resume-token-no-table.db")
+        with cp.store._connect() as conn:
+            for ddl in MigrationTests._OLD_SCHEMA:
+                conn.execute(ddl)
+            cp.store._step_13_resume_token(conn)
+            self.assertEqual(cp.store._columns(conn, "tool_approvals"), set())
 
 
 class LegacyClassNameTests(unittest.TestCase):
@@ -6994,8 +7264,8 @@ class ApiSurfaceSplitTests(unittest.TestCase):
     #: was before, until a human writes a rule naming it.
     TOOL_ROUTES: ClassVar[set] = {("POST", "/tool/authorize"),
                                   ("GET", "/tool/roster"),
-                                  ("POST", "/tool/asks/{approval_id}/claim"),
-                                  ("POST", "/tool/asks/{approval_id}/withdraw"),
+                                  ("POST", "/tool/asks/{resume_token}/claim"),
+                                  ("POST", "/tool/asks/{resume_token}/withdraw"),
                                   ("POST", "/tool/inventory"),
                                   ("GET", "/healthz")}
 

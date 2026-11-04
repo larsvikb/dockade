@@ -36,6 +36,7 @@ import io
 import json
 import os
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -473,7 +474,7 @@ class ToolOutcomeRowTests(unittest.TestCase):
     @staticmethod
     def line(**over):
         rec = {"ts": 1000.0, "stage": "tool-result", "status": "ok",
-               "server": "mcp-github", "tool": "get_me", "approval_id": None,
+               "server": "mcp-github", "tool": "get_me", "resume_token": None,
                "client": "172.30.0.130", "reason": None}
         rec.update(over)
         return (json.dumps(rec) + "\n").encode()
@@ -484,13 +485,26 @@ class ToolOutcomeRowTests(unittest.TestCase):
             {"ts": 1000.0, "kind": "outcome", "stage": "tool-result",
              "client": "172.30.0.130", "client_class": "sandbox", "reason": None,
              "server": "mcp-github", "tool": "get_me", "approval_id": None,
-             "status": "ok"})
+             "resume_token": None, "status": "ok"})
 
     def test_the_row_fills_exactly_the_columns_it_is_inserted_under(self):
         # A name the INSERT does not list is silently dropped by `r.get(c)`, so a field
-        # added to the mapper alone would vanish without failing anything.
-        self.assertEqual(set(cp.ingest._tool_row(self.line())),
-                         set(cp.ingest._TOOL_COLUMNS))
+        # added to the mapper alone would vanish without failing anything. The one
+        # extra key is the token, which the settle pass takes out before the insert.
+        row = cp.ingest._tool_row(self.line(resume_token="c" * 32))
+        self.assertEqual(set(row) - {"resume_token"}, set(cp.ingest._TOOL_COLUMNS))
+        with cp.store._connect() as conn:
+            cp.ingest._settle_tool_row(conn, row)
+        self.assertEqual(set(row), set(cp.ingest._TOOL_COLUMNS))
+
+    def test_a_line_with_the_token_key_ignores_its_approval_id(self):
+        # Only a gateway older than resume tokens writes an id, and it writes no token.
+        # A line with both is not one of those, so its id is not taken on its word.
+        for token in ("c" * 32, None):
+            with self.subTest(token=token):
+                row = cp.ingest._tool_row(self.line(resume_token=token,
+                                                    approval_id="a" * 32))
+                self.assertIsNone(row["approval_id"])
 
     def test_the_decision_word_is_a_constant_the_stream_cannot_choose(self):
         # THE ONE THAT MATTERS. A stream that could name its own decision word could
@@ -603,6 +617,61 @@ class ToolOutcomeDrainTests(IngestTestCase):
             {"kind": "outcome", "stage": "tool-result", "server": "mcp-github",
              "tool": "get_me", "approval_id": "a" * 32, "status": "tool-error",
              "reason": "Resource not accessible by personal access token"}])
+
+    def _ask(self, approval_id, token, deadline=None):
+        """A tool ask row, as the control plane holds it, for a token to map to."""
+        with cp.store._connect() as conn:
+            conn.execute(
+                "INSERT INTO tool_approvals(id, ts, server, tool, args_json, "
+                "args_digest, status, deadline, resume_token) VALUES "
+                "(?, 0, 'mcp-github', 'get_me', '{}', 'd', 'pending', ?, ?)",
+                (approval_id, time.time() + 3600 if deadline is None else deadline,
+                 token))
+            conn.commit()
+
+        def drop():
+            with cp.store._connect() as conn:
+                conn.execute("DELETE FROM tool_approvals WHERE id=?", (approval_id,))
+                conn.commit()
+        self.addCleanup(drop)
+
+    def test_a_known_token_is_stored_as_its_asks_id_and_never_itself(self):
+        # The join the trail is queried by: the outcome's row names the ask the hold,
+        # the click and the claim already name.
+        self._ask("op-id-known", "c" * 32)
+        self.write({"status": "ok", "resume_token": "c" * 32})
+        cp.ingest._drain(self.tool)
+        self.assertEqual(self.rows()[0]["approval_id"], "op-id-known")
+        with cp.store._connect() as conn:
+            stored = json.dumps([dict(r) for r in conn.execute("SELECT * FROM audit")])
+        self.assertNotIn("c" * 32, stored)
+        self.assertNotIn("c" * 32, self.out.getvalue())
+        self.assertIn("approval_id=op-id-known", self.out.getvalue())
+
+    def test_an_unknown_token_is_stored_as_no_id(self):
+        self.write({"status": "ok", "resume_token": "d" * 32})
+        cp.ingest._drain(self.tool)
+        self.assertIsNone(self.rows()[0]["approval_id"])
+
+    def test_a_line_from_before_resume_tokens_keeps_its_id(self):
+        # An old gateway was handed the operator's id, so its line already names it.
+        self.write({"status": "ok", "approval_id": "e" * 32})
+        cp.ingest._drain(self.tool)
+        self.assertEqual(self.rows()[0]["approval_id"], "e" * 32)
+
+    def test_mapping_a_token_writes_nothing_to_the_ask(self):
+        # A plain read, not ``holds._get_tool_ask``, whose expiry pass would turn every
+        # outcome line into a write: an ask already past its window stays as it was.
+        self._ask("op-id-due", "f" * 32, deadline=time.time() - 60)
+        self.write({"status": "ok", "resume_token": "f" * 32})
+        cp.ingest._drain(self.tool)
+        with cp.store._connect() as conn:
+            status = conn.execute("SELECT status FROM tool_approvals WHERE id=?",
+                                  ("op-id-due",)).fetchone()["status"]
+            changes = conn.execute("SELECT COUNT(*) FROM audit WHERE stage='tool-ask'"
+                                   ).fetchone()[0]
+        self.assertEqual((status, changes), ("pending", 0))
+        self.assertEqual(self.rows()[0]["approval_id"], "op-id-due")
 
     def test_a_reason_cannot_add_a_line_to_the_live_feed(self):
         # Q10, one hop later: the drain mirrors every ingested row to `make logs-cp`,

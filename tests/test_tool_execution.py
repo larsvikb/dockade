@@ -42,7 +42,12 @@ RESULT = {"server": "mcp-github", "status": "ok", "rules": 3, "exposed": 1,
                      "annotations": {"readOnlyHint": True}}],
           "ruled_but_absent": [], "exposed_but_unruled": []}
 
-APPROVAL = "0" * 32
+TOKEN = "0" * 32
+
+#: The operator's id for the same ask. The fake control plane puts it beside the token
+#: in its answers, as an old or a careless one might, so a gateway that read it or
+#: passed it on is caught: nothing the agent receives may carry it.
+DECOY_ID = "d" * 32
 
 
 def sse(result: dict) -> str:
@@ -255,7 +260,8 @@ class AskTests(ExecutionTestCase):
     def setUp(self):
         super().setUp()
         self.answer = {"decision": "ask", "reason": "'ask' by rule",
-                       "approval_id": APPROVAL, "deadline": 1.0, "joined": False}
+                       "resume_token": TOKEN, "approval_id": DECOY_ID,
+                       "deadline": 1.0, "joined": False}
 
     def test_an_ask_runs_nothing_and_is_not_an_error(self):
         # A result rather than an error, because an agent can act on a result and
@@ -269,7 +275,7 @@ class AskTests(ExecutionTestCase):
         # The instruction travels in the result, where it cannot be forgotten
         # mid-session and cannot drift from the gateway that emitted it.
         text = self.text(self.execute.call("mcp-github__create_pr", {}, None))
-        self.assertIn(APPROVAL, text)
+        self.assertIn(TOKEN, text)
         self.assertIn(self.execute.surface.RESUME_TOOL, text)
 
     def test_the_pending_result_steers_away_from_a_reformulated_retry(self):
@@ -281,6 +287,26 @@ class AskTests(ExecutionTestCase):
     def test_the_pending_result_names_the_way_to_take_it_back(self):
         text = self.text(self.execute.call("mcp-github__create_pr", {}, None))
         self.assertIn(self.execute.surface.WITHDRAW_TOOL, text)
+
+    def test_the_pending_result_never_carries_the_operators_id(self):
+        text = self.text(self.execute.call("mcp-github__create_pr", {}, None))
+        self.assertNotIn(DECOY_ID, text)
+
+    def test_an_answer_with_no_usable_token_fails_closed(self):
+        # A control plane older than resume tokens answers with only the id. The
+        # gateway must not fall back to it: that would hand the agent the operator's
+        # id, which is what the token exists to keep from it.
+        for answer in ({"decision": "ask", "reason": "r", "approval_id": DECOY_ID},
+                       {"decision": "ask", "reason": "r", "resume_token": None,
+                        "approval_id": DECOY_ID},
+                       {"decision": "ask", "reason": "r", "resume_token": "../x"}):
+            with self.subTest(answer=answer):
+                self.answer = answer
+                result = self.execute.call("mcp-github__create_pr", {}, None)
+                self.assertTrue(result["isError"])
+                self.assertNotIn(DECOY_ID, self.text(result))
+                self.assertIn("Nothing has run", self.text(result))
+                self.assertEqual(self.called, [])
 
     def test_joining_an_identical_ask_is_said_out_loud(self):
         self.answer = {**self.answer, "joined": True}
@@ -297,7 +323,7 @@ class ResumeTests(ExecutionTestCase):
     def resume(self, arguments=DEFAULT):
         return self.execute.call(
             self.execute.surface.RESUME_TOOL,
-            {"approval_id": APPROVAL} if arguments is self.DEFAULT else arguments,
+            {"resume_token": TOKEN} if arguments is self.DEFAULT else arguments,
             "172.30.0.5")
 
     def test_resumption_is_routed_without_being_split(self):
@@ -307,11 +333,12 @@ class ResumeTests(ExecutionTestCase):
             self.execute.surface.split_exposed(self.execute.surface.RESUME_TOOL))
 
     def test_a_granted_claim_runs_the_call(self):
-        self.answer = {"ok": True, "status": "allowed", "server": "mcp-github",
+        self.answer = {"ok": True, "status": "allowed", "approval_id": DECOY_ID,
+                       "server": "mcp-github",
                        "tool": "create_pr", "args_json": '{"title":"approved"}'}
         result = self.resume()
         self.assertEqual([path for path, _ in self.asked],
-                         [f"/tool/asks/{APPROVAL}/claim"])
+                         [f"/tool/asks/{TOKEN}/claim"])
         self.assertEqual(len(self.called), 1)
         self.assertFalse(result.get("isError"))
 
@@ -319,15 +346,17 @@ class ResumeTests(ExecutionTestCase):
         # The agent never re-sends the payload, so what executes is necessarily what
         # the human read. This is the test that would catch a "helpful" merge of the
         # agent's arguments into the approved ones.
-        self.answer = {"ok": True, "status": "allowed", "server": "mcp-github",
+        self.answer = {"ok": True, "status": "allowed", "approval_id": DECOY_ID,
+                       "server": "mcp-github",
                        "tool": "create_pr", "args_json": '{"title":"approved"}'}
-        self.resume({"approval_id": APPROVAL, "title": "smuggled"})
+        self.resume({"resume_token": TOKEN, "title": "smuggled"})
         self.assertEqual(self.called[0]["message"]["params"]["arguments"],
                          {"title": "approved"})
 
     def test_approved_arguments_run_as_shown_even_when_falsy(self):
         # The card showed `false`, so `false` is sent: no `{}` substituted on the way.
-        self.answer = {"ok": True, "status": "allowed", "server": "mcp-github",
+        self.answer = {"ok": True, "status": "allowed", "approval_id": DECOY_ID,
+                       "server": "mcp-github",
                        "tool": "create_pr", "args_json": "false"}
         self.resume()
         self.assertIs(self.called[0]["message"]["params"]["arguments"], False)
@@ -335,7 +364,8 @@ class ResumeTests(ExecutionTestCase):
     def test_approved_null_arguments_are_sent_as_null(self):
         # Only an ask stored before the protocol layer made absent arguments `{}` can
         # carry this. A `{}` fallback here would run what the card did not show.
-        self.answer = {"ok": True, "status": "allowed", "server": "mcp-github",
+        self.answer = {"ok": True, "status": "allowed", "approval_id": DECOY_ID,
+                       "server": "mcp-github",
                        "tool": "create_pr", "args_json": "null"}
         self.resume()
         self.assertIsNone(self.called[0]["message"]["params"]["arguments"])
@@ -350,12 +380,12 @@ class ResumeTests(ExecutionTestCase):
         self.assertFalse(result.get("isError"))
         self.assertIn("Still waiting", self.text(result))
 
-    def test_a_pending_approval_keeps_the_agent_on_the_same_id(self):
+    def test_a_pending_approval_keeps_the_agent_on_the_same_token(self):
         self.answer = {"ok": False, "detail": "not claimable (pending)",
                        "status": "pending", "spent": False, "terminal": False}
         text = self.text(self.resume())
-        self.assertIn(APPROVAL, text)
-        self.assertIn("same id", text)
+        self.assertIn(TOKEN, text)
+        self.assertIn("same token", text)
 
     def test_every_terminal_refusal_is_final_and_says_so(self):
         # `denied`, `expired` and `spent` are three different states and one answer:
@@ -405,10 +435,10 @@ class ResumeTests(ExecutionTestCase):
         # It is the only thing on this path that comes from the agent, and it lands in
         # a request path on the crown-jewel bridge.
         for bad in (None, "", "../../tool/roster", "0" * 31, "g" * 32, 7,
-                    {"approval_id": None}):
+                    {"resume_token": None}):
             with self.subTest(value=bad):
                 self.asked.clear()
-                result = self.resume({"approval_id": bad} if not isinstance(bad, dict)
+                result = self.resume({"resume_token": bad} if not isinstance(bad, dict)
                                      else bad)
                 self.assertTrue(result["isError"])
                 self.assertEqual(self.asked, [])
@@ -418,20 +448,21 @@ class ResumeTests(ExecutionTestCase):
         # often enough that refusing it costs a human's approval rather than catching
         # anything: the charset is bounded hex, so trimming cannot turn one valid id
         # into another.
-        self.answer = {"ok": True, "status": "allowed", "server": "mcp-github",
+        self.answer = {"ok": True, "status": "allowed", "approval_id": DECOY_ID,
+                       "server": "mcp-github",
                        "tool": "get_issue", "args_json": "{}"}
-        for spelling in (f"  {APPROVAL}  ", f"{APPROVAL}\n", f"\t{APPROVAL}"):
+        for spelling in (f"  {TOKEN}  ", f"{TOKEN}\n", f"\t{TOKEN}"):
             with self.subTest(spelling=spelling):
                 self.asked.clear()
-                self.resume({"approval_id": spelling})
+                self.resume({"resume_token": spelling})
                 self.assertEqual([path for path, _ in self.asked],
-                                 [f"/tool/asks/{APPROVAL}/claim"])
+                                 [f"/tool/asks/{TOKEN}/claim"])
 
     def test_whitespace_is_trimmed_rather_than_stripped_throughout(self):
         # Inner whitespace is not a formatting artifact, it is a different string —
         # and one that must never reach a URL path.
         self.asked.clear()
-        result = self.resume({"approval_id": APPROVAL[:16] + " " + APPROVAL[17:]})
+        result = self.resume({"resume_token": TOKEN[:16] + " " + TOKEN[17:]})
         self.assertTrue(result["isError"])
         self.assertEqual(self.asked, [])
 
@@ -465,7 +496,7 @@ class ResumeTests(ExecutionTestCase):
         self.assertTrue(result["isError"])
         self.assertNotIn("untouched", text)
         self.assertIn("may have gone through", text)
-        self.assertIn(APPROVAL, text)
+        self.assertIn(TOKEN, text)
 
     def test_an_answer_with_no_verdict_is_not_taken_for_a_wait(self):
         # S23. Neither ok, terminal nor pending — a validation 422, a JSON 5xx — used
@@ -504,21 +535,93 @@ class ResumeTests(ExecutionTestCase):
         self.assertNotIn("without its call running", self.text(self.resume()))
 
 
+class ResumeTokenTests(ExecutionTestCase):
+    """The native tools take the agent's resume token and nothing else of the ask's,
+    and no result they return names the operator's id, whatever the control plane's
+    answer carried beside it."""
+
+    def run_native(self, tool, arguments):
+        return self.execute.call(tool, arguments, "172.30.0.5")
+
+    def test_no_native_tool_result_carries_the_operators_id(self):
+        answers = {
+            "granted": {"ok": True, "status": "allowed", "server": "mcp-github",
+                        "tool": "get_issue", "args_json": "{}"},
+            "pending": {"ok": False, "status": "pending", "terminal": False},
+            "denied": {"ok": False, "status": "denied", "terminal": True},
+            "spent": {"ok": False, "status": "allowed", "spent": True,
+                      "terminal": True, "detail": "already claimed"},
+            "unknown": {"ok": False, "status": None, "terminal": True,
+                        "detail": "unknown approval"},
+            "withdrawn": {"ok": True, "status": "withdrawn", "terminal": True},
+            "no verdict": {"ok": False},
+        }
+        for tool in (self.execute.surface.RESUME_TOOL,
+                     self.execute.surface.WITHDRAW_TOOL):
+            for name, answer in answers.items():
+                if name == "withdrawn" and tool == self.execute.surface.RESUME_TOOL:
+                    continue            # a withdraw's answer; a claim never gives it
+                with self.subTest(tool=tool, answer=name):
+                    self.answer = {**answer, "approval_id": DECOY_ID}
+                    text = self.text(self.run_native(tool, {"resume_token": TOKEN}))
+                    self.assertNotIn(DECOY_ID, text)
+
+    def test_resume_and_withdraw_post_to_the_tokens_path(self):
+        self.answer = {"ok": False, "status": "pending", "terminal": False}
+        self.run_native(self.execute.surface.RESUME_TOOL, {"resume_token": TOKEN})
+        self.run_native(self.execute.surface.WITHDRAW_TOOL, {"resume_token": TOKEN})
+        self.assertEqual([path for path, _ in self.asked],
+                         [f"/tool/asks/{TOKEN}/claim", f"/tool/asks/{TOKEN}/withdraw"])
+
+    def test_the_old_parameter_name_still_carries_a_token(self):
+        # A client keeps the schema it fetched at session start, so a session that
+        # spans the upgrade sends the token under the old key.
+        self.answer = {"ok": False, "status": "pending", "terminal": False}
+        self.run_native(self.execute.surface.RESUME_TOOL, {"approval_id": TOKEN})
+        self.run_native(self.execute.surface.WITHDRAW_TOOL,
+                        {"approval_id": f" {TOKEN}\n"})
+        self.assertEqual([path for path, _ in self.asked],
+                         [f"/tool/asks/{TOKEN}/claim", f"/tool/asks/{TOKEN}/withdraw"])
+
+    def test_the_old_name_passes_the_same_check(self):
+        for bad in ("../../tool/roster", "0" * 31, 7, None):
+            with self.subTest(value=bad):
+                self.asked.clear()
+                result = self.run_native(self.execute.surface.RESUME_TOOL,
+                                         {"approval_id": bad})
+                self.assertTrue(result["isError"])
+                self.assertEqual(self.asked, [])
+
+    def test_when_both_names_are_given_the_token_is_read(self):
+        # The advertised name wins, even when the alias holds a valid value and the
+        # token does not: a malformed token is refused rather than replaced.
+        self.answer = {"ok": False, "status": "pending", "terminal": False}
+        other = "1" * 32
+        self.run_native(self.execute.surface.RESUME_TOOL,
+                        {"resume_token": TOKEN, "approval_id": other})
+        self.assertEqual(self.asked[-1][0], f"/tool/asks/{TOKEN}/claim")
+        self.asked.clear()
+        result = self.run_native(self.execute.surface.RESUME_TOOL,
+                                 {"resume_token": "bad", "approval_id": other})
+        self.assertTrue(result["isError"])
+        self.assertEqual(self.asked, [])
+
+
 class WithdrawTests(ExecutionTestCase):
     """``withdraw_tool_call``: nothing runs on any answer, and every answer says what
-    became of the id."""
+    became of the token."""
 
     def withdraw(self, arguments=None):
         return self.execute.call(
             self.execute.surface.WITHDRAW_TOOL,
-            {"approval_id": APPROVAL} if arguments is None else arguments,
+            {"resume_token": TOKEN} if arguments is None else arguments,
             "172.30.0.5")
 
-    def test_it_asks_the_withdraw_endpoint_for_the_sandboxs_own_id(self):
+    def test_it_asks_the_withdraw_endpoint_for_the_sandboxs_own_token(self):
         self.answer = {"ok": True, "status": "withdrawn", "spent": False,
                        "terminal": True}
         result = self.withdraw()
-        self.assertEqual(self.asked, [(f"/tool/asks/{APPROVAL}/withdraw",
+        self.assertEqual(self.asked, [(f"/tool/asks/{TOKEN}/withdraw",
                                        {"client": "172.30.0.5"})])
         self.assertEqual(self.called, [])
         self.assertFalse(result.get("isError"))
@@ -549,7 +652,7 @@ class WithdrawTests(ExecutionTestCase):
         self.assertIn("unknown approval", self.text(result))
 
     def test_a_bad_id_never_reaches_the_bridge(self):
-        for bad in ({}, {"approval_id": "../../tool/roster"}, {"approval_id": 7}):
+        for bad in ({}, {"resume_token": "../../tool/roster"}, {"resume_token": 7}):
             with self.subTest(value=bad):
                 self.asked.clear()
                 result = self.withdraw(bad)
@@ -559,8 +662,8 @@ class WithdrawTests(ExecutionTestCase):
 
     def test_a_copied_id_with_whitespace_is_still_the_id(self):
         self.answer = {"ok": True, "status": "withdrawn"}
-        self.withdraw({"approval_id": f" {APPROVAL}\n"})
-        self.assertEqual(self.asked[0][0], f"/tool/asks/{APPROVAL}/withdraw")
+        self.withdraw({"resume_token": f" {TOKEN}\n"})
+        self.assertEqual(self.asked[0][0], f"/tool/asks/{TOKEN}/withdraw")
 
     def test_no_answer_says_to_try_again(self):
         # Repeating a withdrawal is harmless, so delivered-or-not needs no distinction.
@@ -684,9 +787,9 @@ class OutcomeRecordTests(ExecutionTestCase):
         super().setUp()
         self.rows: list[dict] = []
 
-        def record(status, server, tool, reason=None, approval_id=None, client=None):
+        def record(status, server, tool, reason=None, resume_token=None, client=None):
             self.rows.append({"status": status, "server": server, "tool": tool,
-                              "reason": reason, "approval_id": approval_id,
+                              "reason": reason, "resume_token": resume_token,
                               "client": client})
 
         self.execute.outcomes.record = record
@@ -696,10 +799,11 @@ class OutcomeRecordTests(ExecutionTestCase):
         return self.execute.call(name, args or {}, "172.30.0.5")
 
     def granted(self, **over):
-        self.answer = {"ok": True, "status": "allowed", "server": "mcp-github",
+        self.answer = {"ok": True, "status": "allowed", "approval_id": DECOY_ID,
+                       "server": "mcp-github",
                        "tool": "create_pr", "args_json": '{"title":"approved"}', **over}
         return self.execute.call(self.execute.surface.RESUME_TOOL,
-                                 {"approval_id": APPROVAL}, "172.30.0.5")
+                                 {"resume_token": TOKEN}, "172.30.0.5")
 
     def test_an_allowed_call_that_worked_is_one_ok_row(self):
         self.allow()
@@ -714,14 +818,14 @@ class OutcomeRecordTests(ExecutionTestCase):
         # human answered. Those are the rows that grow with every tool an operator
         # enables, and they are the unaudited-intake half of the response side.
         self.allow()
-        self.assertIsNone(self.rows[0]["approval_id"])
+        self.assertIsNone(self.rows[0]["resume_token"])
 
     def test_a_resumed_call_is_filed_under_the_approval_it_spent(self):
         # The join. The control plane already wrote three rows carrying this id; this
         # is the fourth, and the only one that says what came of it.
         self.granted()
         self.assertEqual(len(self.rows), 1)
-        self.assertEqual(self.rows[0]["approval_id"], APPROVAL)
+        self.assertEqual(self.rows[0]["resume_token"], TOKEN)
         self.assertEqual(self.rows[0]["status"], "ok")
 
     def test_the_outcome_is_filed_under_what_the_human_approved(self):
@@ -743,7 +847,7 @@ class OutcomeRecordTests(ExecutionTestCase):
                           "isError": True})
         self.granted()
         self.assertEqual(self.rows[0]["status"], "tool-error")
-        self.assertEqual(self.rows[0]["approval_id"], APPROVAL)
+        self.assertEqual(self.rows[0]["resume_token"], TOKEN)
         self.assertIn("not accessible", self.rows[0]["reason"])
 
     def test_a_rejected_request_is_recorded_as_a_call_that_never_ran(self):
@@ -784,7 +888,7 @@ class OutcomeRecordTests(ExecutionTestCase):
                 self.execute.discovery.post = boom
                 self.granted()
                 self.assertEqual(self.rows[0]["status"], expected)
-                self.assertEqual(self.rows[0]["approval_id"], APPROVAL)
+                self.assertEqual(self.rows[0]["resume_token"], TOKEN)
 
     def test_a_grant_spent_on_a_server_that_left_the_roster_is_not_silent(self):
         # The claim succeeded, so the approval is gone, and nothing was dialled. A row
@@ -794,7 +898,7 @@ class OutcomeRecordTests(ExecutionTestCase):
         self.granted()
         self.assertEqual(len(self.rows), 1)
         self.assertEqual(self.rows[0]["status"], "transport-error")
-        self.assertEqual(self.rows[0]["approval_id"], APPROVAL)
+        self.assertEqual(self.rows[0]["resume_token"], TOKEN)
         self.assertEqual(self.called, [])
 
     def test_a_grant_answered_with_a_non_object_reply_is_not_silent(self):
@@ -808,7 +912,7 @@ class OutcomeRecordTests(ExecutionTestCase):
                 self.granted()
                 self.assertEqual(len(self.rows), 1)
                 self.assertEqual(self.rows[0]["status"], "transport-error")
-                self.assertEqual(self.rows[0]["approval_id"], APPROVAL)
+                self.assertEqual(self.rows[0]["resume_token"], TOKEN)
                 self.assertIn("expected a JSON object", self.rows[0]["reason"])
 
     def test_an_exception_the_gateway_did_not_foresee_still_leaves_a_row(self):
@@ -831,7 +935,7 @@ class OutcomeRecordTests(ExecutionTestCase):
         # unrecorded.
         self.granted(args_json="{not json")
         self.assertEqual(len(self.rows), 1)
-        self.assertEqual(self.rows[0]["approval_id"], APPROVAL)
+        self.assertEqual(self.rows[0]["resume_token"], TOKEN)
         self.assertEqual(self.called, [])
 
     def test_a_claim_that_may_have_spent_the_grant_is_not_silent(self):
@@ -848,11 +952,11 @@ class OutcomeRecordTests(ExecutionTestCase):
                 self.rows.clear()
                 arrange()
                 self.execute.call(self.execute.surface.RESUME_TOOL,
-                                  {"approval_id": APPROVAL}, "172.30.0.5")
+                                  {"resume_token": TOKEN}, "172.30.0.5")
                 self.assertEqual(len(self.rows), 1)
                 row = self.rows[0]
                 self.assertEqual(row["status"], "transport-error")
-                self.assertEqual(row["approval_id"], APPROVAL)
+                self.assertEqual(row["resume_token"], TOKEN)
                 self.assertEqual(row["client"], "172.30.0.5")
                 self.assertIn("never made", row["reason"])
                 self.assertIn("may be spent", row["reason"])
@@ -869,15 +973,15 @@ class OutcomeRecordTests(ExecutionTestCase):
                 {"decision": "deny", "reason": "no rule"},
                 "mcp-github__delete_repo"),
             "ask": lambda: self._with_answer(
-                {"decision": "ask", "reason": "ask", "approval_id": APPROVAL},
+                {"decision": "ask", "reason": "ask", "resume_token": TOKEN},
                 "mcp-github__create_pr"),
             "unknown name": lambda: self.execute.call("nonsense", {}, None),
             "still pending": lambda: self._with_answer(
                 {"ok": False, "status": "pending", "terminal": False},
-                self.execute.surface.RESUME_TOOL, {"approval_id": APPROVAL}),
+                self.execute.surface.RESUME_TOOL, {"resume_token": TOKEN}),
             "denied by a human": lambda: self._with_answer(
                 {"ok": False, "status": "denied", "terminal": True},
-                self.execute.surface.RESUME_TOOL, {"approval_id": APPROVAL}),
+                self.execute.surface.RESUME_TOOL, {"resume_token": TOKEN}),
             "claim never delivered": self._undelivered_claim,
         }
         for label, run in cases.items():
@@ -897,7 +1001,7 @@ class OutcomeRecordTests(ExecutionTestCase):
         real, self.execute._ask_control = self.execute._ask_control, refused
         try:
             return self.execute.call(self.execute.surface.RESUME_TOOL,
-                                     {"approval_id": APPROVAL}, "172.30.0.5")
+                                     {"resume_token": TOKEN}, "172.30.0.5")
         finally:
             self.execute._ask_control = real
 
@@ -940,7 +1044,7 @@ class ResumeWaitTests(ExecutionTestCase):
 
     def test_no_wait_asks_once_and_returns_what_it_found(self):
         self._answers({"ok": False, "status": "pending"})
-        result = self.execute.resume({"approval_id": self.ID}, "172.30.0.2")
+        result = self.execute.resume({"resume_token": self.ID}, "172.30.0.2")
         self.assertEqual(len(self.seen), 1)
         self.assertIn("Still waiting on a human", self.text(result))
 
@@ -950,7 +1054,7 @@ class ResumeWaitTests(ExecutionTestCase):
                       {"ok": True, "server": "mcp-github", "tool": "get_issue",
                        "args_json": '{"owner":"o"}'})
         result = self.execute.resume(
-            {"approval_id": self.ID, "wait_seconds": 5}, "172.30.0.2")
+            {"resume_token": self.ID, "wait_seconds": 5}, "172.30.0.2")
         # Ran, rather than reported — and it did not sit out the rest of the wait.
         self.assertEqual(len(self.called), 1)
         self.assertNotIn("Still waiting", self.text(result))
@@ -961,7 +1065,7 @@ class ResumeWaitTests(ExecutionTestCase):
         # one would be the loop spending a human's decision time on nothing.
         self._answers({"ok": False, "terminal": True, "status": "denied"})
         result = self.execute.resume(
-            {"approval_id": self.ID, "wait_seconds": 5}, "172.30.0.2")
+            {"resume_token": self.ID, "wait_seconds": 5}, "172.30.0.2")
         self.assertEqual(len(self.seen), 1)
         self.assertIn("A human refused this request", self.text(result))
 
@@ -971,21 +1075,21 @@ class ResumeWaitTests(ExecutionTestCase):
         self._answers({"ok": False, "terminal": True, "status": "pending",
                        "detail": "not releasable (server disabled)"})
         result = self.execute.resume(
-            {"approval_id": self.ID, "wait_seconds": 5}, "172.30.0.2")
+            {"resume_token": self.ID, "wait_seconds": 5}, "172.30.0.2")
         self.assertEqual(len(self.seen), 1)
         self.assertIn("final", self.text(result))
 
     def test_an_answer_with_no_verdict_ends_the_wait_immediately(self):
         self._answers({"detail": "Internal Server Error"})
         result = self.execute.resume(
-            {"approval_id": self.ID, "wait_seconds": 5}, "172.30.0.2")
+            {"resume_token": self.ID, "wait_seconds": 5}, "172.30.0.2")
         self.assertEqual(len(self.seen), 1)
         self.assertNotIn("Still waiting", self.text(result))
 
     def test_an_unanswered_wait_ends_in_exactly_the_no_wait_answer(self):
         self._answers({"ok": False, "status": "pending"})
         result = self.execute.resume(
-            {"approval_id": self.ID, "wait_seconds": 0.05}, "172.30.0.2")
+            {"resume_token": self.ID, "wait_seconds": 0.05}, "172.30.0.2")
         self.assertGreater(len(self.seen), 1)
         self.assertIn("Still waiting on a human", self.text(result))
         self.assertIn("Waited 0.05s", self.text(result))

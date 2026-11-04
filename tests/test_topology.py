@@ -702,6 +702,23 @@ class TasksUiBindTests(_UiServiceChecks, unittest.TestCase):
                          pins(ROOT / "control-plane-ui" / "requirements.txt"))
 
 
+class RootContextIgnoreTests(unittest.TestCase):
+    """Every root-context build, not only the UIs', reads ``.dockerignore``."""
+
+    IGNORED = tuple(ln.strip() for ln in (ROOT / ".dockerignore").read_text().splitlines()
+                    if not ln.startswith("#"))
+
+    def test_bytecode_is_ignored_at_any_depth(self):
+        self.assertIn("**/__pycache__", self.IGNORED)
+        self.assertIn("**/*.pyc", self.IGNORED)
+
+    def test_no_bytecode_pattern_is_anchored_to_the_root(self):
+        for line in self.IGNORED:
+            if "__pycache__" in line or line.endswith(".pyc"):
+                with self.subTest(line=line):
+                    self.assertTrue(line.startswith("**/"))
+
+
 def _raw_networks(service: str) -> set[str]:
     """``_networks_of`` for a service that may declare no networks at all (the
     profile-gated llm-* variants do declare some; a future one might not)."""

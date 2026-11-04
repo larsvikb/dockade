@@ -187,14 +187,15 @@ class WorkspaceGuardTests(unittest.TestCase):
         self.project.mkdir(parents=True)
         (self.profile / "NTUSER.DAT").touch()
 
-    def guard(self, workspace, **env_over):
+    def guard(self, workspace, cwd=None, **env_over):
         env = {k: v for k, v in os.environ.items()
-               if k not in ("ALLOW_UNSAFE_WORKSPACE", "XDG_RUNTIME_DIR")}
+               if k not in ("ALLOW_UNSAFE_WORKSPACE", "XDG_RUNTIME_DIR",
+                            "DOCKADE_CONFIG_HOME", "XDG_CONFIG_HOME")}
         env.update(HOME=str(self.home))
         env.update(env_over)
         return subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
             [_BASH, "-c", _GUARD_HARNESS, "sc_guard_workspace", str(LIB),
-             str(workspace)], capture_output=True, text=True, env=env, timeout=60)
+             str(workspace)], capture_output=True, text=True, env=env, cwd=cwd, timeout=60)
 
     def assertRefused(self, proc, why):
         self.assertEqual(proc.returncode, 1, proc.stderr)
@@ -276,6 +277,160 @@ class WorkspaceGuardTests(unittest.TestCase):
         proc = self.guard(scratch)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), str(scratch.resolve()))
+
+    # dockade's config home. A "holds" case is either the fixture's ~/.config, which
+    # does not hold $HOME, or sits in self.root / "cfgs", apart from it, so the home
+    # rule cannot refuse it first.
+    _CONFIG = "dockade's config home"
+
+    def assertAllowed(self, proc):
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("REFUSING", proc.stderr)
+
+    def test_the_config_home_itself_is_refused(self):
+        default = self.home / ".config" / "dockade"
+        explicit = self.root / "cfgs" / "dockade"
+        default.mkdir(parents=True)
+        explicit.mkdir(parents=True)
+        self.assertRefused(self.guard(default), f"that is {default}, part of {self._CONFIG}")
+        self.assertRefused(self.guard(explicit, DOCKADE_CONFIG_HOME=str(explicit)),
+                           f"that is {explicit}, part of {self._CONFIG}")
+
+    def test_a_directory_inside_the_config_home_is_refused(self):
+        inside = self.home / ".config" / "dockade" / "marketplaces" / "x"
+        inside.mkdir(parents=True)
+        self.assertRefused(self.guard(inside), f"it lies inside {inside.parent.parent}")
+
+    def test_a_directory_holding_the_config_home_is_refused_before_it_exists(self):
+        # The body's case: on a fresh host, a workspace of ~/.config could create
+        # dockade/plugins and dockade/marketplaces/ for the next launch to load.
+        config = self.home / ".config"
+        config.mkdir()
+        why = f"{config / 'dockade'} is inside it, and leads to {self._CONFIG}"
+        self.assertRefused(self.guard(config), why)
+        (config / "dockade").mkdir()
+        self.assertRefused(self.guard(config), why)
+
+    def test_the_config_home_follows_the_same_precedence_as_sc_config_home(self):
+        xdg = self.root / "cfgs" / "xdg"
+        explicit = self.root / "cfgs" / "explicit"
+        config = self.home / ".config"
+        for d in (xdg, explicit, config / "dockade"):
+            d.mkdir(parents=True)
+        self.assertRefused(self.guard(xdg, XDG_CONFIG_HOME=str(xdg)),
+                           f"{xdg / 'dockade'} is inside it")
+        self.assertAllowed(self.guard(config, XDG_CONFIG_HOME=str(xdg)))
+        both = {"XDG_CONFIG_HOME": str(xdg), "DOCKADE_CONFIG_HOME": str(explicit)}
+        self.assertRefused(self.guard(explicit, **both), f"that is {explicit}")
+        self.assertAllowed(self.guard(xdg, **both))
+        self.assertAllowed(self.guard(config, **both))
+
+    def test_a_linked_config_dir_refuses_its_target_before_the_home_exists(self):
+        dotfiles = self.root / "cfgs" / "dotfiles"
+        dotfiles.mkdir(parents=True)
+        (self.home / ".config").symlink_to(dotfiles)
+        self.assertRefused(self.guard(dotfiles), f"{dotfiles / 'dockade'} is inside it")
+
+    def test_a_linked_config_home_refuses_the_link_and_its_target(self):
+        cfgs = self.root / "cfgs"
+        config = self.home / ".config"
+        config.mkdir()
+        target = cfgs / "elsewhere" / "dockade"
+        target.parent.mkdir(parents=True)
+        (config / "dockade").symlink_to(target)
+        # Dangling: the link's holder, and the dir that would hold its target.
+        self.assertRefused(self.guard(config), f"{config / 'dockade'} is inside it")
+        self.assertRefused(self.guard(target.parent), f"{target} is inside it")
+        target.mkdir()
+        self.assertRefused(self.guard(config), f"{config / 'dockade'} is inside it")
+        self.assertRefused(self.guard(target), f"that is {target}")
+
+    def test_a_link_reached_through_another_link_counts(self):
+        cfgs = self.root / "cfgs"
+        dot_config = cfgs / "dotfiles" / "config"
+        far = cfgs / "far" / "dockade"
+        dot_config.mkdir(parents=True)
+        far.mkdir(parents=True)
+        (self.home / ".config").symlink_to(dot_config)
+        # Relative, as dotfiles managers write them: it resolves from the link's dir.
+        (dot_config / "dockade").symlink_to(Path("..") / ".." / "far" / "dockade")
+        self.assertRefused(self.guard(dot_config), f"{dot_config / 'dockade'} is inside it")
+        self.assertRefused(self.guard(far.parent), f"{far} is inside it")
+
+    def test_an_entry_linked_out_of_the_config_home_is_refused_where_it_lands(self):
+        home = self.home / ".config" / "dockade"
+        home.mkdir(parents=True)
+        for entry in ("plugins", "marketplaces", "secrets", "backups"):
+            with self.subTest(entry=entry):
+                lands = self.root / "cfgs" / f"{entry}-dir"
+                lands.mkdir(parents=True)
+                (home / entry).symlink_to(lands / entry)
+                self.assertRefused(self.guard(lands), f"{lands / entry} is inside it")
+
+    def test_a_relative_config_home_is_taken_from_the_launch_directory(self):
+        cfgs = self.root / "cfgs"
+        (cfgs / "rel").mkdir(parents=True)
+        self.assertRefused(self.guard(cfgs / "rel", cwd=cfgs,
+                                      DOCKADE_CONFIG_HOME="rel/dockade"),
+                           f"{cfgs / 'rel' / 'dockade'} is inside it")
+
+    def test_dot_components_in_the_config_home_are_resolved(self):
+        cfgs = self.root / "cfgs"
+        (cfgs / "kept").mkdir(parents=True)
+        # `.` on the walked part, and `..` after a missing component.
+        for written, workspace in ((f"{cfgs}/./kept", cfgs / "kept"),
+                                   (f"{cfgs}/gone/../kept/dockade", cfgs / "kept")):
+            with self.subTest(written=written):
+                self.assertRefused(self.guard(workspace, DOCKADE_CONFIG_HOME=written),
+                                   self._CONFIG)
+
+    def test_a_link_loop_on_the_way_ends_the_walk(self):
+        loop = self.root / "cfgs" / "loop"
+        loop.mkdir(parents=True)
+        (loop / "l1").symlink_to("l2")
+        (loop / "l2").symlink_to("l1")
+        env = {"DOCKADE_CONFIG_HOME": str(loop / "l1" / "dockade")}
+        self.assertRefused(self.guard(loop, **env), f"{loop / 'l1'} is inside it")
+        # A refusal stops reading the walk at its first link; an unrelated workspace
+        # reads it to the end, which only the hop cap brings.
+        other = self.root / "cfgs" / "other"
+        other.mkdir()
+        self.assertAllowed(self.guard(other, **env))
+
+    def test_the_override_lets_each_config_home_case_through(self):
+        cfgs = self.root / "cfgs"
+        home = self.home / ".config" / "dockade"
+        (home / "marketplaces" / "x").mkdir(parents=True)
+        (home / "secrets").mkdir()
+        dotfiles = cfgs / "dotfiles"
+        dotfiles.mkdir(parents=True)
+        for workspace, env in ((home, {}), (home / "marketplaces" / "x", {}),
+                               (self.home / ".config", {}),
+                               (dotfiles, {"XDG_CONFIG_HOME": str(dotfiles)})):
+            with self.subTest(workspace=workspace, env=env):
+                self.assertRefused(self.guard(workspace, **env), self._CONFIG)
+                self.assertAllowed(self.guard(workspace, ALLOW_UNSAFE_WORKSPACE="1", **env))
+        proc = self.guard(home, ALLOW_UNSAFE_WORKSPACE="1")
+        self.assertIn("WARNING: workspace contains 'secrets'", proc.stderr)
+
+    def test_a_sibling_or_a_name_prefix_of_the_config_home_is_allowed(self):
+        config = self.home / ".config"
+        (config / "dockade").mkdir(parents=True)
+        for name in ("dockade-old", "dock", "other"):
+            (config / name).mkdir()
+            with self.subTest(name=name):
+                self.assertAllowed(self.guard(config / name))
+
+    @unittest.skipIf(os.geteuid() == 0, "root enters a mode-000 directory anyway")
+    def test_an_ancestor_the_guard_cannot_enter_does_not_abort_it(self):
+        cfgs = self.root / "cfgs"
+        locked = cfgs / "locked"
+        (locked / "inner").mkdir(parents=True)
+        locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o755)
+        explicit = locked / "inner" / "dockade"
+        proc = self.guard(cfgs, DOCKADE_CONFIG_HOME=str(explicit))
+        self.assertRefused(proc, f"{explicit} is inside it, and leads to {self._CONFIG}")
 
     def test_the_marketplaces_mount_is_held_to_the_same_rule(self):
         # Its guard says it refuses what this one refuses; read-only stops the agent

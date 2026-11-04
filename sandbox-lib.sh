@@ -133,6 +133,82 @@ _sc_runtime_dir_reason() {
     done
 }
 
+# _sc_walk_path <absolute_path>
+# Resolves <path> physically, component by component, without needing it to exist.
+# Prints "link <location>" for each symlink met on the way (its canonical parent
+# plus its own name) and then "end <path>": the canonical prefix the walk reached,
+# plus whatever was left when it stopped, normalised by name alone. It stops at a
+# component that is missing, is not a directory or cannot be entered, and after 40
+# links (a loop); none of these is an error. A `..` after the stop does not resume
+# it, so a link past one is not seen until the missing component exists.
+_sc_walk_path() {
+    local cur="" next comp target hops=0
+    local -a todo more
+    IFS=/ read -ra todo <<< "$1"
+    while ((${#todo[@]})); do
+        comp="${todo[0]}"
+        todo=(${todo[@]+"${todo[@]:1}"})
+        case "$comp" in
+            ""|.) continue ;;
+            ..) cur="${cur%/*}"; continue ;;   # cur is canonical, so this is physical
+        esac
+        next="$cur/$comp"
+        if [[ -L "$next" ]] && ((hops < 40)) && target="$(readlink "$next")"; then
+            hops=$((hops + 1))
+            printf 'link %s\n' "$next"
+            [[ "$target" != /* ]] || cur=""
+            IFS=/ read -ra more <<< "$target"
+            todo=(${more[@]+"${more[@]}"} ${todo[@]+"${todo[@]}"})
+        elif [[ -d "$next" && -x "$next" && ! -L "$next" ]]; then
+            cur="$next"
+        else
+            cur="$next"
+            for comp in ${todo[@]+"${todo[@]}"}; do
+                case "$comp" in
+                    ""|.) ;;
+                    ..) cur="${cur%/*}" ;;
+                    *) cur="$cur/$comp" ;;
+                esac
+            done
+            break
+        fi
+    done
+    printf 'end %s\n' "${cur:-/}"
+}
+
+# dockade's config home holds what every later launch reads from the host: the
+# plugins allowlist and the marketplace checkouts, which load into the agent, and
+# the MCP secrets and backups. A workspace that can write any of them is a channel
+# out of its own session — even when they do not exist yet, because a workspace of
+# ~/.config can create dockade/plugins on a fresh host. So each of the five paths is
+# walked rather than resolved, and every link on the way counts too: a workspace
+# holding ~/.config/dockade -> ~/dotfiles/dockade can replace the link with a real
+# directory. Prints the reason to refuse, or nothing.
+# A link's location can only be held by a canonical workspace, never be it or lie
+# inside it. A workspace of / never matches "holds"; the root refusal covers it.
+_sc_config_home_reason() {
+    local real="$1" home what entry line kind path
+    home="$(sc_config_home)"
+    [[ "$home" == /* ]] || home="$PWD/$home"
+    what="dockade's config home ($home), where later launches read plugins, marketplaces and secrets"
+    for entry in "" /plugins /marketplaces /secrets /backups; do
+        while IFS= read -r line; do
+            kind="${line%% *}"
+            path="${line#* }"
+            if [[ "$path" == "$real"/* ]]; then
+                echo "$path is inside it, and leads to $what."
+                return 0
+            elif [[ "$kind" == end && "$path" == "$real" ]]; then
+                echo "that is $path, part of $what."
+                return 0
+            elif [[ "$kind" == end && "$real" == "$path"/* ]]; then
+                echo "it lies inside $path, part of $what."
+                return 0
+            fi
+        done < <(_sc_walk_path "$home$entry")
+    done
+}
+
 # _sc_warn_credentials <dir> <what> <access>
 # Non-fatal: credential material sitting inside a directory about to be mounted.
 # Legal (you may genuinely want to work there), but the agent will be able to read
@@ -176,8 +252,13 @@ sc_guard_workspace() {
         [[ -z "$reason" ]] || _sc_deny_workspace "$reason"
         reason="$(_sc_runtime_dir_reason "$real_workspace")"
         [[ -z "$reason" ]] || _sc_deny_workspace "$reason"
+        reason="$(_sc_config_home_reason "$real_workspace")"
+        [[ -z "$reason" ]] || _sc_deny_workspace "$reason"
     fi
 
+    # Under the override the config home earns only the content warnings below, so a
+    # workspace of ~/.config, which holds it a level down, launches silently: the
+    # override is the operator saying they know what the directory holds.
     _sc_warn_credentials "$real_workspace" "workspace" "RW"
     # dockade's own state, when dockade is the workspace. A control-plane backup is
     # the whole policy store in a file `make restore` will install after checking its
@@ -312,8 +393,9 @@ _sc_ro_mount_reason() {
 # sc_marketplaces <canonical_workspace>: a directory that is the workspace, lies
 # inside it, or holds it is refused, because the workspace is mounted read-write
 # and the same files would be writable through /workspace whatever the :ro says.
-# Only this launch's workspace is known here; a sibling's that holds this
-# directory leaves the tree writable, and that stays open (DESIGN.md).
+# Only this launch's workspace is known here. A sibling's cannot hold the default
+# directory, since sc_guard_workspace refuses what holds the config home, but the
+# cases that guard cannot see stay open (DESIGN.md, "Plugin marketplaces").
 sc_marketplaces() {
     local workspace="${1:?sc_marketplaces needs the canonical workspace}"
     SC_MARKETPLACE_ARGS=()

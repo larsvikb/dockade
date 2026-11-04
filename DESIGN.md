@@ -415,8 +415,17 @@ Five decisions worth keeping:
   asserts it, because the mitigation is one character wide. *Outside* is enforced
   too: `sc_marketplaces` refuses a directory that is, lies inside, or holds the
   launch's workspace, since the read-write `/workspace` would reach the same files.
-  A sibling sandbox whose workspace holds this launch's marketplaces can still
-  write them; one launch cannot see another's workspace.
+  One launch cannot see another's workspace, so the sibling's side is closed by
+  every launch's workspace guard instead: it refuses a workspace that is, holds or
+  lies inside the config home, or holds a link on the way to it or its entries
+  (`_sc_config_home_reason`). A sibling can still write this launch's marketplaces
+  when they are an explicit `SANDBOX_MARKETPLACES_DIR` outside the config home;
+  when its guard is not this one (launched with `ALLOW_UNSAFE_WORKSPACE`, from an
+  older checkout, or with another `DOCKADE_CONFIG_HOME` or `XDG_CONFIG_HOME`); when
+  the host's layout changed after it launched; past a directory the guard could
+  not enter, or a hand-written config home's `..` after a missing component; or
+  through a hard link or bind mount, since the guard compares paths, not files or
+  mounts.
 - **Per container, so outside the config volume.** Marketplaces and plugins are
   per launch, and the volume is every concurrent sibling's, so in its
   `settings.json` they would be whichever sibling booted last. The file lives in
@@ -433,8 +442,8 @@ Five decisions worth keeping:
   managed `CLAUDE.md`, derived from the file's own keys, so it cannot describe
   plugins the file does not enable.
 - **Rendered by the user, installed by root.** Root opens no marketplace file:
-  `:ro` here does not stop a sibling whose workspace holds the checkout from
-  writing it. The sandbox user renders the JSON; root checks its shape (two keys,
+  `:ro` here does not stop a sibling in one of the open cases above from writing
+  the checkout. The sandbox user renders the JSON; root checks its shape (two keys,
   marketplace names in `[A-Za-z0-9._-]`, since they become managed-note text) and
   installs it root-owned. A render that fails costs the launch its plugins, never
   its boot.

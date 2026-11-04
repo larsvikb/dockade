@@ -7,7 +7,7 @@
  * handed — so the unit tests can import this file under node
  * (tests/test_control_plane_ui_js.py).
  */
-import { escapePayload, NON_ASCII_RE } from "./escape.js";
+import { escapePayload, isHidden, NON_ASCII_RE } from "./escape.js";
 
 // The summary line above a tool ask's arguments. The payload always starts open: the
 // box's max-height (`.payload pre` in index.html) is what keeps a long one from
@@ -134,21 +134,23 @@ function isInlineArray(text, start, breaks) {
   return false;
 }
 
-// Characters that render as nothing, or as something else. `Cf` is the format class —
-// the bidi overrides and isolates (U+202E, U+2066..2069), zero-width joiners, the BOM —
-// and `Cc`/`Zl`/`Zp` are raw controls and line separators, none of which the canonical
-// JSON form ever contains legitimately (json.dumps escapes controls and uses no
-// whitespace). Any one of them in a payload means the text on screen is not the text
-// that runs: a single U+202E makes the browser draw the rest of the line backwards
-// while the bytes stay exactly as they are — the reordering control-plane-ui/DESIGN.md
-// warns a view must never do, performed by the renderer rather than by a prettifier.
-const INVISIBLE_RE = /[\p{Cf}\p{Cc}\p{Zl}\p{Zp}]/gu;
-// The same set for asking about ONE character. A `g` regex carries `lastIndex` across
-// calls, so `INVISIBLE_RE.test(ch)` alternates true and false on the same input — a
-// bug that would show up as a tally spelling half its overrides out and half of them
-// not.
-const INVISIBLE_ONE = /[\p{Cf}\p{Cc}\p{Zl}\p{Zp}]/u;
-// NON_ASCII_RE (escape.js) is everything outside printable ASCII, the invisible set
+// The hidden set (`isHidden`, escape.js) has no legitimate place in the canonical JSON
+// form (json.dumps escapes controls and uses no whitespace), bar one: the U+FE0F that
+// asks for an emoji's colour presentation, as in a warning sign or a heart in a PR
+// body. Only that position is exempt — the code point directly after an
+// Extended_Pictographic one, so astral emoji qualify — and only once, so a run of
+// selectors after an emoji still counts every one past the first.
+const PICTOGRAPHIC = /^\p{Extended_Pictographic}$/u;
+function hiddenCount(text) {
+  let count = 0;
+  let previous = "";
+  for (const ch of text) {
+    if (isHidden(ch) && !(ch === "\uFE0F" && PICTOGRAPHIC.test(previous))) count++;
+    previous = ch;
+  }
+  return count;
+}
+// NON_ASCII_RE (escape.js) is everything outside printable ASCII, the hidden set
 // included, which `payloadHazards` relies on when it counts the one apart from the
 // other. Counted rather than classified: U+0430 CYRILLIC SMALL LETTER A in an `owner`
 // field is indistinguishable from the Latin one on screen, and no confusables table is
@@ -163,9 +165,10 @@ const HAZARD_TALLY_MAX = 4;
 // from. Ordered by count so the dominant character leads, then by code point so two
 // payloads with the same characters read the same way.
 //
-// An invisible character is always spelled `\uXXXX` here, including in this note — a
-// raw U+202E in the warning would reorder the warning, which is precisely the trick
-// being reported.
+// A hidden character is always spelled `\uXXXX` here, including in this note and an
+// emoji's exempt U+FE0F — a raw U+202E in the warning would reorder the warning, which
+// is precisely the trick being reported. The level asks whether something is hidden;
+// the tally says what is there.
 //
 // The counts read `x3` in plain ASCII rather than `×3`, so the only character in the
 // parentheses that is not ASCII is the one being REPORTED. A multiplication sign here
@@ -180,7 +183,7 @@ function hazardTally(text) {
   const ranked = [...counts].sort(
     (a, b) => b[1] - a[1] || a[0].codePointAt(0) - b[0].codePointAt(0));
   const shown = ranked.slice(0, HAZARD_TALLY_MAX).map(
-    ([ch, n]) => `${INVISIBLE_ONE.test(ch) ? escapePayload(ch) : ch} x${n}`);
+    ([ch, n]) => `${isHidden(ch) ? escapePayload(ch) : ch} x${n}`);
   if (ranked.length > shown.length) {
     shown.push(`+${ranked.length - shown.length} more`);
   }
@@ -190,9 +193,10 @@ function hazardTally(text) {
 // What the card has to say before the operator reads the arguments, at one of TWO
 // levels — and the split is the point.
 //
-//   `danger`  an invisible or direction-changing character (`Cf`/`Cc`/`Zl`/`Zp`).
-//             None of these has a legitimate place in the canonical JSON form, and one
-//             of them makes the text on screen differ from the text that runs. The card
+//   `danger`  a hidden character (`isHidden`, escape.js), bar an emoji's U+FE0F
+//             (`hiddenCount`). Any one of them makes the text on screen differ from
+//             the text that runs — the reordering control-plane-ui/DESIGN.md warns a
+//             view must never do, performed by the renderer. The card
 //             opens itself and shows the ESCAPED form first, with raw one click away
 //             rather than the reverse — a bidi override in the raw form can hide the
 //             very thing the note is warning about.
@@ -214,7 +218,7 @@ function hazardTally(text) {
 // question (see the note's wording: this tier reports, it does not vouch).
 export function payloadHazards(argsJson) {
   const text = typeof argsJson === "string" ? argsJson : "";
-  const invisible = (text.match(INVISIBLE_RE) || []).length;
+  const invisible = hiddenCount(text);
   const nonAscii = (text.match(NON_ASCII_RE) || []).length;
   const level = invisible ? "danger" : nonAscii ? "note" : "none";
   const parts = [];

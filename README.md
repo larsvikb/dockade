@@ -410,7 +410,8 @@ dockade/
   ui-common/                # what every UI shares, copied in beside its own files
     guards.py               #   the browser guards, the security headers, the bind and
                             #   peer checks a UI starts with
-    escape.js               #   non-ASCII spelled `\uXXXX`, as JSON writes it
+    escape.js               #   non-ASCII spelled `\uXXXX`, as JSON writes it, and the
+                            #   hidden-character set both pages spell
     list-status.js          #   empty, stale or not yet loaded: one decision, one renderer
     time.js                 #   timestamps as the page shows them
   tool-gateway/             # MCP GATEWAY — governed tool capability; tier 1's `--mcp-config` points at it

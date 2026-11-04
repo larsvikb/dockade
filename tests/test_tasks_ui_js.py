@@ -65,6 +65,7 @@ console.log(JSON.stringify({
     controls: t.spellHidden("a\rb\u0007c\u2028d"),
     astral: t.spellHidden("tag\u{E0041}"),
     separators: t.spellHidden("a\u2029b"),
+    format_not_ignorable: t.spellHidden("a\uFFFBb"),
     ignorable: t.spellHidden("ok\u2705\ufe0f a\u034fb\u3164c\u{E0101}d"),
     visible: t.spellHidden("em \u2014 dash, caf\u00e9, \u0430"),
     missing: t.spellHidden(undefined),
@@ -237,6 +238,9 @@ class TaskViewTests(unittest.TestCase):
         # Outside the BMP, as the surrogate pair JSON would write.
         self.assertEqual(spell["astral"], {"text": "tag\\udb40\\udc41", "hidden": 1})
         self.assertEqual(spell["separators"], {"text": "a\\u2029b", "hidden": 1})
+        # `Cf` but not default-ignorable: the format class is in the set on its own.
+        self.assertEqual(spell["format_not_ignorable"],
+                         {"text": "a\\ufffbb", "hidden": 1})
 
     def test_default_ignorable_characters_are_spelled_too(self):
         # A variation selector can carry a payload no reader sees; an emoji's U+FE0F is

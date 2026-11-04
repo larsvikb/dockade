@@ -535,14 +535,16 @@ was permanent short of hand-editing SQLite in the volume. Four decisions worth
 recording, because none of them is the obvious one:
 
 - **The two directions are opposites, and the confirm carries the difference.**
-  Revoking an *allow* tightens: the host reverts to unknown and the next request is
-  held. Revoking a *block* loosens — an explicit operator denial becomes a request
-  that can then be approved, quite possibly by someone who never knew it had been
-  deliberately refused. Both land on `hold`, so nothing structural distinguishes
-  them; only wording can. `revokePreview` states the consequence rather than the row
-  ("requests to X will no longer be blocked… and can then be allowed"), the same
-  discipline the persist confirm uses, and an unrecognised action warns as the
-  dangerous direction rather than the safe one.
+  Revoking an *allow* tightens; revoking a *block* loosens — an explicit operator
+  denial becomes a request that can then be approved, quite possibly by someone who
+  never knew it had been deliberately refused. A revoked rule leaves its hosts to
+  whatever else decides them: usually a hold, but a wider rule or a live lease may
+  still allow or deny. So the direction comes from the revoked action, not from where
+  the hosts land, and only wording can carry it. The audit reason computes the
+  landing from the store the revoke produced (`policy._landing`); `revokePreview`
+  hedges it, since the page keeps no copy of `_decide`, and states the consequence
+  rather than the row, the same discipline the persist confirm uses. An unrecognised
+  action warns as the dangerous direction rather than the safe one.
 - **Seed rules cannot be revoked, and the refusal is in the BACKEND.** Their source
   of truth is `policies/egress-allowlist.txt`, a reviewed file under version control,
   and a click that left the file disagreeing with the store would make the file a

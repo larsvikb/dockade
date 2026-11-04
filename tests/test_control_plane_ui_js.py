@@ -1040,6 +1040,28 @@ console.log(JSON.stringify({
         // An unrecognised action must preview as the SAFER reading.
         unknown_action: m.createPreview("example.com", "", "sandbox", []),
       },
+      // The notice for a 201: with the backend's landing, with an allow every host of
+      // which a wider block still denies, a wildcard allow only its apex loses, and a
+      // body from before the landing fields.
+      added: (() => {
+        const created = { pattern: "api.example.com", action: "allow",
+                          client_class: "sandbox" };
+        return {
+          landed: m.addedNotice({ ...created,
+            landing: "for client class sandbox, api.example.com: allowed by rule "
+                   + "(api.example.com for sandbox)",
+            landing_decisions: ["allow"] }),
+          denied: m.addedNotice({ ...created,
+            landing: "for client class sandbox, api.example.com: blocked by rule "
+                   + "(.example.com for sandbox)",
+            landing_decisions: ["deny"] }),
+          apex_denied: m.addedNotice({ ...created, pattern: ".example.com",
+            landing: "…", landing_decisions: ["deny", "allow"] }),
+          denied_block: m.addedNotice({ ...created, action: "block",
+            landing: "…", landing_decisions: ["deny"] }),
+          bare: m.addedNotice(created),
+        };
+      })(),
       edit: (() => {
         const rule = { id: 7, pattern: ".example.com", action: "allow",
                        client_class: "sandbox", source: "operator" };
@@ -2550,11 +2572,11 @@ class PageScriptTests(unittest.TestCase):
         self.assertIs(self.probe["saturation"]["outage"]["row_plain"], False)
 
     def test_revoking_an_allow_and_a_block_do_not_read_alike(self):
-        """They are opposites. Revoking an allow TIGHTENS — the host reverts to
-        unknown and the next request is held. Revoking a block LOOSENS: an explicit
-        operator denial becomes a request that can then be approved, possibly by
-        someone who never knew it had been deliberately refused. A single "delete
-        this?" hides exactly that."""
+        """They are opposites. Revoking an allow TIGHTENS — with no other rule, the
+        host reverts to unknown and the next request is held. Revoking a block
+        LOOSENS: an explicit operator denial becomes a request that can then be
+        approved, possibly by someone who never knew it had been deliberately
+        refused. A single "delete this?" hides exactly that."""
         r = self.probe["saturation"]["revoke"]
         self.assertIn("no longer be allowed", r["allow_rule"]["text"])
         self.assertIn("no longer be blocked", r["block_rule"]["text"])
@@ -2575,6 +2597,61 @@ class PageScriptTests(unittest.TestCase):
         for case in ("allow_rule", "block_rule"):
             with self.subTest(case=case):
                 self.assertIn("held for approval", r[case]["text"])
+
+    def test_a_revoke_and_an_edit_hedge_where_the_hosts_land(self):
+        """Another rule or a live lease may still decide the hosts a revoked rule
+        named, and the page keeps no copy of `_decide` to say which, so the confirm
+        says "by this rule" and conditions the hold. The edit's leaving clause makes
+        the same claim and takes the same qualifier."""
+        r = self.probe["saturation"]["revoke"]
+        for case in ("allow_rule", "block_rule"):
+            with self.subTest(case=case):
+                self.assertIn("by this rule", r[case]["text"])
+                self.assertIn("Unless another rule or a live lease decides them",
+                              r[case]["text"])
+        edit = self.probe["saturation"]["edit"]
+        for case in ("narrowed", "narrowed_block"):
+            with self.subTest(case=case):
+                self.assertIn("by this rule", edit[case]["text"])
+
+    def test_the_added_notice_shows_the_backends_landing(self):
+        a = self.probe["saturation"]["added"]
+        self.assertIn("Added the allow rule api.example.com for sandbox.",
+                      a["landed"]["text"])
+        self.assertIn("Now, for client class sandbox, api.example.com: allowed by "
+                      "rule", a["landed"]["text"])
+        self.assertFalse(a["landed"]["bad"])
+
+    def test_an_allow_that_decides_nothing_is_a_bad_notice(self):
+        # A wider block still denies every host the allow names, so the rule just
+        # written changes nothing. Only when EVERY landing is a deny: a wildcard whose
+        # apex alone is blocked still allows its subdomains, and a block that lands as
+        # a deny is what was asked for.
+        a = self.probe["saturation"]["added"]
+        self.assertTrue(a["denied"]["bad"])
+        self.assertFalse(a["apex_denied"]["bad"])
+        self.assertFalse(a["denied_block"]["bad"])
+
+    def test_an_added_notice_without_a_landing_says_only_what_was_written(self):
+        bare = self.probe["saturation"]["added"]["bare"]
+        self.assertEqual(bare["text"],
+                         "Added the allow rule api.example.com for sandbox.")
+        self.assertFalse(bare["bad"])
+
+    def test_an_allow_preview_hedges_for_a_wider_block(self):
+        # A block covering the same hosts is decided first, so a promised allow is
+        # conditional; a promised denial is not, and stays as it was.
+        create, edit = self.probe["saturation"]["create"], \
+            self.probe["saturation"]["edit"]
+        for name, p in (("create", create["exact_allow"]),
+                        ("edit", edit["narrowed"])):
+            with self.subTest(preview=name):
+                self.assertIn("unless a block covering them denies them first",
+                              p["text"])
+        for name, p in (("create", create["exact_block"]),
+                        ("edit", edit["tightened"])):
+            with self.subTest(preview=name):
+                self.assertNotIn("unless a block", p["text"])
 
     def test_a_seed_rule_is_not_revocable_and_says_where_to_change_it(self):
         """Shown WITH the reason rather than as a missing control, so nobody wonders
@@ -2704,7 +2781,8 @@ class PageScriptTests(unittest.TestCase):
         e = self.probe["saturation"]["edit"]["flipped"]
         self.assertTrue(e["ok"])
         self.assertFalse(e["conflict"])
-        self.assertIn("currently block", e["text"])
+        # What the rule IS, not what the host decides to: another rule may decide it.
+        self.assertIn("is currently a standing block rule", e["text"])
 
     def test_both_loosening_directions_are_flagged_not_only_the_new_action(self):
         """What makes this different from createPreview, which only has a new action to
@@ -2720,6 +2798,7 @@ class PageScriptTests(unittest.TestCase):
         self.assertFalse(e["ok"])
         self.assertTrue(e["unchanged"])
         self.assertIn("Nothing to change", e["text"])
+        self.assertIn("is already a standing allow rule", e["text"])
 
     def test_the_edit_preview_quotes_the_pattern_that_will_be_stored(self):
         e = self.probe["saturation"]["edit"]["normalized"]

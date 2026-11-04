@@ -19,10 +19,14 @@ import { fmtStamp } from "./time.js";
 // safe direction or the dangerous one.
 //
 // The two are opposites and a single "delete this?" hides that. Revoking an ALLOW
-// tightens: the host reverts to unknown and the next request is held for a human.
-// Revoking a BLOCK loosens — an explicit operator denial becomes "unknown", which
-// can then be approved by someone who never knew it had been deliberately refused.
-// Both land on `hold`; only the direction differs, so only wording can carry it.
+// tightens: with no other rule, the next request is held for a human. Revoking a
+// BLOCK loosens — an explicit operator denial becomes, with no other rule,
+// "unknown", which can then be approved by someone who never knew it had been
+// deliberately refused. Only the direction differs, so only wording can carry it.
+//
+// Where the hosts land is hedged rather than computed: another rule or a live lease
+// may still decide them, and this page keeps no copy of `policy._decide`'s passes
+// (the header of `createPreview` says why). The backend's audit reason computes it.
 //
 // Says the CONSEQUENCE rather than the pattern alone, the same discipline
 // persistPreview uses. "Delete .github.com?" asks about a row. "Requests to
@@ -51,10 +55,11 @@ export function revokePreview(rule) {
     pattern,
     danger: loosening,
     text: loosening
-      ? `Requests to ${pattern} will no longer be blocked. They will be held for `
-        + `approval instead — and can then be allowed.`
-      : `Requests to ${pattern} will no longer be allowed. They will be held for `
-        + `approval instead.`,
+      ? `Requests to ${pattern} will no longer be blocked by this rule. Unless `
+        + `another rule or a live lease decides them, they will be held for approval `
+        + `— and can then be allowed.`
+      : `Requests to ${pattern} will no longer be allowed by this rule. Unless `
+        + `another rule or a live lease decides them, they will be held for approval.`,
   };
 }
 
@@ -76,6 +81,12 @@ export function normalizePattern(pattern) {
 // A wildcard must keep at least this many labels to be an ALLOW (policy._rule_error,
 // held equal by a test). `.com` allowed would end governance for a TLD in one click.
 export const WILDCARD_MIN_LABELS = 2;
+
+// The hedge on every allow a preview promises: a block covering the same hosts is
+// decided first (policy._decide), and this page does not check for one, for the
+// reason the header of `createPreview` gives.
+const UNLESS_BLOCKED = ", unless a block covering them denies them first (a block "
+                     + "outranks an allow)";
 
 // What "+ add rule" is about to write, for the live preview and the confirm.
 //
@@ -148,7 +159,7 @@ export function createPreview(pattern, action, clientClass, rules) {
            danger: verb === "allow",
            text: verb === "allow"
              ? `Requests from ${clientClass} to ${subject} will be allowed `
-               + `immediately, without being held for approval.`
+               + `immediately, without being held for approval${UNLESS_BLOCKED}.`
              : `Requests from ${clientClass} to ${subject} will be denied `
                + `immediately, without being held for approval.` };
 }
@@ -198,7 +209,8 @@ export function editPreview(rule, pattern, action, rules) {
   }
   if (p === was && verb === wasVerb) {
     return { ...base, unchanged: true,
-             text: `${p} already ${verb}s for ${clientClass}. Nothing to change.` };
+             text: `${p} is already a standing ${verb} rule for ${clientClass}. `
+                 + `Nothing to change.` };
   }
   const clash = (rules || []).find(
     r => r && String(r.id) !== String(rule.id) && r.pattern === p
@@ -219,16 +231,34 @@ export function editPreview(rule, pattern, action, rules) {
   // as much as the new one, which is what makes it different from createPreview.
   const danger = verb === "allow" || wasVerb === "block";
   const leaving = p === was
-    ? `${was} currently ${wasVerb}s. `
+    ? `${was} is currently a standing ${wasVerb} rule. `
     : (wasVerb === "allow"
-        ? `Requests to ${was} will no longer be allowed. `
-        : `Requests to ${was} will no longer be blocked. `);
+        ? `Requests to ${was} will no longer be allowed by this rule. `
+        : `Requests to ${was} will no longer be blocked by this rule. `);
   return { ...base, ok: true, danger,
            text: leaving + (verb === "allow"
              ? `Requests from ${clientClass} to ${subject} will be allowed `
-               + `immediately, without being held for approval.`
+               + `immediately, without being held for approval${UNLESS_BLOCKED}.`
              : `Requests from ${clientClass} to ${subject} will be denied `
                + `immediately, without being held for approval.`) };
+}
+
+// The notice for a 201 from `POST /api/egress/rules`.
+//
+// Where the hosts land is the backend's sentence (`landing`), computed from the store
+// the write produced: a wider block can still deny what this allow names. When it
+// denies every host the rule names (`landing_decisions`), the allow just written
+// decides nothing, and the notice is marked bad so that is seen. A body without
+// those fields says only what was written.
+export function addedNotice(body) {
+  const b = body || {};
+  const decisions = Array.isArray(b.landing_decisions) ? b.landing_decisions : [];
+  return {
+    bad: b.action === "allow" && decisions.length > 0
+         && decisions.every(d => d === "deny"),
+    text: `Added the ${b.action} rule ${b.pattern} for ${b.client_class}.`
+        + (b.landing ? ` Now, ${b.landing}.` : ""),
+  };
 }
 
 // ── the rules table ──────────────────────────────────────────────────────────
@@ -511,8 +541,8 @@ async function submitEdit(p) {
       if (res.status === 409 && body.current) leaveEditMode();
     } else if (body.changed === false) {
       ruleNotice = { bad: false,
-                     text: `${body.pattern} already ${body.action}s for `
-                         + `${body.client_class}; nothing was written.` };
+                     text: `${body.pattern} is already a standing ${body.action} `
+                         + `rule for ${body.client_class}; nothing was written.` };
       leaveEditMode();
     } else {
       // Names both states, as the audit row does — "saved" alone would not say which
@@ -649,9 +679,7 @@ export function mountRules() {
                        text: `${body.pattern} was already a standing ${body.action} `
                            + `rule for ${body.client_class}; nothing was written.` };
       } else {
-        ruleNotice = { bad: false,
-                       text: `Added: ${body.pattern} now ${body.action}s for `
-                           + `${body.client_class}.` };
+        ruleNotice = addedNotice(body);
         rulePatternEl.value = "";
       }
     } catch (e) {

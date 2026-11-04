@@ -352,35 +352,81 @@ def _decide(host: str, client_class: str) -> tuple[str, str]:
       - Leases come last because when both a rule and a lease cover a host, the
         STANDING rule is the more informative thing to record. Which of two allows
         answers a request cannot change the answer — only the audit line."""
-    host = _normalize_host(host)
     with store._connect() as conn:
-        rows = conn.execute(
-            "SELECT pattern, action, client_class FROM rules").fetchall()
-        # Filtered ONCE, before either pass, so block-wins-over-allow is decided
-        # within the class and cannot be influenced by a rule written for a
-        # different one.
-        mine = [r for r in rows if r["client_class"] == client_class]
-        for r in mine:
-            if r["action"] == "block" and _match(host, r["pattern"]):
-                return "deny", f"blocked by rule ({r['pattern']} for {client_class})"
-        for r in mine:
-            if r["action"] == "allow" and _match(host, r["pattern"]):
-                return "allow", f"allowed by rule ({r['pattern']} for {client_class})"
-        # Same connection as the rules read, and reached only when no rule decided, so
-        # an already-allowed request never pays for it.
-        now = time.time()
-        lease = _live_lease(conn, host, client_class, now)
+        return _decide_in(conn, _normalize_host(host), client_class)
+
+
+def _decide_in(conn, host: str, client_class: str) -> tuple[str, str]:
+    """``_decide`` on an open connection, for a host already in ``_normalize_host``
+    form: a write asks it inside its own transaction (``_landing``)."""
+    rows = conn.execute("SELECT pattern, action, client_class FROM rules").fetchall()
+    decided = _rule_pass(rows, client_class, lambda p: _match(host, p))
+    if decided is not None:
+        return decided
+    # Same connection as the rules read, and reached only when no rule decided, so an
+    # already-allowed request never pays for it.
+    now = time.time()
+    lease = _live_lease(conn, host, client_class, now)
     if lease is not None:
         # The remaining time goes IN THE REASON, so the trail explains a burst of
         # allows after one human approval without anyone reconstructing it.
         return "allow", (f"allowed by lease ({host} for {client_class}, "
                          f"{_short_duration(lease['expires_at'] - now)} left)")
+    return _held(rows, client_class, lambda p: _match(host, p))
+
+
+def _rule_pass(rows, client_class: str, covers) -> tuple[str, str] | None:
+    """The rule passes of ``_decide``: blocks, then allows, over ``client_class``'s
+    rules whose pattern ``covers`` the host; None when no rule decides.
+
+    Filtered to the class ONCE, before either pass, so block-wins-over-allow is
+    decided within the class and cannot be influenced by a rule written for a
+    different one."""
+    mine = [r for r in rows if r["client_class"] == client_class]
+    for r in mine:
+        if r["action"] == "block" and covers(r["pattern"]):
+            return "deny", f"blocked by rule ({r['pattern']} for {client_class})"
+    for r in mine:
+        if r["action"] == "allow" and covers(r["pattern"]):
+            return "allow", f"allowed by rule ({r['pattern']} for {client_class})"
+    return None
+
+
+def _held(rows, client_class: str, covers) -> tuple[str, str]:
+    """``_decide``'s hold, naming the other classes with a rule that ``covers`` the
+    host."""
     elsewhere = sorted({r["client_class"] for r in rows
-                        if r["client_class"] != client_class
-                        and _match(host, r["pattern"])})
+                        if r["client_class"] != client_class and covers(r["pattern"])})
     scope = (f" (matched only for: {', '.join(elsewhere)})" if elsewhere else "")
     return "hold", (f"no matching rule for client class {client_class}{scope} "
                     f"— held for approval")
+
+
+def _landing(conn, pattern: str, client_class: str
+             ) -> tuple[tuple[str, str], tuple[str, str] | None]:
+    """Where the hosts a stored ``pattern`` names land for ``client_class``, as
+    ``_decide``'s own (decision, reason) pairs: (that host, None) for an exact
+    pattern, (the apex, its subdomains) for a wildcard ``.x``.
+
+    "Its subdomains" are those no narrower rule or lease names, so their passes read
+    only the wildcard rules covering the WHOLE subtree, ``.y`` with ``x`` at or under
+    ``y``; a lease names one host and never a subtree. The apex is answered apart
+    because an exact rule or a lease on it can land it elsewhere.
+
+    Not ``_decide`` on ``.x`` as a host: that is right only by a quirk of ``_match``,
+    and reads a lease on a literal ``.x`` host. It takes the connection so a write
+    can ask inside its own transaction, about exactly the store it produced."""
+    if not pattern.startswith("."):
+        return _decide_in(conn, pattern, client_class), None
+    apex = pattern[1:]
+    rows = conn.execute("SELECT pattern, action, client_class FROM rules").fetchall()
+
+    def covers_subtree(p: str) -> bool:
+        return p.startswith(".") and _match(apex, p)
+
+    subtree = (_rule_pass(rows, client_class, covers_subtree)
+               or _held(rows, client_class, covers_subtree))
+    return _decide_in(conn, apex, client_class), subtree
 
 
 # ── tool policy: what a `tool_rules` row means ───────────────────────────────

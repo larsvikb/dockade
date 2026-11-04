@@ -87,12 +87,7 @@ iptables -A OUTPUT -o lo -j ACCEPT
 # channel means removing direct DNS entirely (the target design routes lookups
 # through the egress proxy). The original broad `--dport 53 ACCEPT` was worse
 # still: it let data be smuggled to *any* nameserver.
-# On Docker's *default* bridge the container inherits the
-# host's /etc/resolv.conf (the embedded 127.0.0.11 resolver is only used on
-# user-defined networks), so hardcoding 127.0.0.11 drops all lookups once the
-# default-deny policy goes live. 127.0.0.11 is kept as a fallback.
-#
-# On a *user-defined* network (sandbox-net) the only nameserver in resolv.conf
+# On sandbox-net, a user-defined network, the only nameserver in resolv.conf
 # is 127.0.0.11, and that embedded resolver does NOT answer external names
 # itself — it FORWARDS them to the host's real upstream resolvers, and that
 # forward egresses this OUTPUT chain. So allowing 127.0.0.11 alone lets the
@@ -124,10 +119,17 @@ else
     # Standalone: no proxy, so the embedded resolver MUST forward external lookups
     # upstream (for the direct allowlist to resolve, and for runtime DNS). Allow
     # the pinned upstreams too — narrowed to named resolvers, not "any nameserver".
+    # 127.0.0.11 is appended on purpose, as a fallback should resolv.conf ever
+    # not name it; on sandbox-net it does, and the de-duplication below absorbs it.
     DNS_ALLOW=("${DNS_SERVERS[@]}" "${UPSTREAM_ARR[@]}" 127.0.0.11)
 fi
+# One rule pair per address, first seen first: in standalone mode resolv.conf
+# already names 127.0.0.11, and UPSTREAM_DNS may repeat an address.
+declare -A DNS_SEEN=()
 for ns in "${DNS_ALLOW[@]}"; do
     [[ "$ns" =~ ^[0-9.]+$ ]] || continue   # IPv4 only; IPv6 DNS is blocked by ip6tables below
+    [[ -z "${DNS_SEEN[$ns]:-}" ]] || continue
+    DNS_SEEN[$ns]=1
     iptables -A OUTPUT -p udp --dport 53 -d "$ns" -j ACCEPT
     iptables -A OUTPUT -p tcp --dport 53 -d "$ns" -j ACCEPT
 done
@@ -176,6 +178,11 @@ else
     # whitelisted here only until that data plane exists.
     echo "Fetching GitHub IP ranges..."
     gh_ranges=$(curl -s https://api.github.com/meta || true)
+    # IPv4 ranges only, on purpose: the allowed-domains ipset is IPv4 (hash:net,
+    # family inet), and IPv6 egress is dropped in every mode (the IPv6 section
+    # below). `aggregate` would drop v6 prefixes silently anyway, and its fallback
+    # would report each as a suspicious CIDR, so neither path is handed one.
+    gh_v4='(.web + .api + .git)[] | select(tostring | contains(":") | not)'
     if [ -n "$gh_ranges" ] && echo "$gh_ranges" | jq -e '.web and .api and .git' >/dev/null 2>&1; then
         while read -r cidr; do
             if _sane_cidr "$cidr"; then
@@ -183,8 +190,8 @@ else
             else
                 echo "  skipping suspicious GitHub CIDR: $cidr"
             fi
-        done < <(echo "$gh_ranges" | jq -r '(.web + .api + .git)[]' | aggregate -q 2>/dev/null \
-                 || echo "$gh_ranges" | jq -r '(.web + .api + .git)[]')
+        done < <(echo "$gh_ranges" | jq -r "$gh_v4" | aggregate -q 2>/dev/null \
+                 || echo "$gh_ranges" | jq -r "$gh_v4")
     else
         echo "WARNING: could not fetch GitHub IP ranges"
     fi

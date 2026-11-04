@@ -14,14 +14,16 @@ relay-allowlist guard in ``test_control_plane_ui_js.py``.
 
 Text-parsed rather than YAML-parsed on purpose: the unit suite installs no
 packages (see ``tests/_loader.py``), and PyYAML is not in the stdlib. The reader
-below understands only nesting by indentation, which is all these assertions
-need — it never has to interpret a scalar, so the folded ``entrypoint`` blocks
-elsewhere in the file cannot confuse it.
+below, ``_block``, understands only nesting by indentation, which is all these
+assertions need — it never has to interpret a scalar, so the folded ``entrypoint``
+blocks elsewhere in the file cannot confuse it. The one reader that takes a scalar as a
+path, ``_host_sources``, refuses a value it cannot follow rather than passing it.
 """
 from __future__ import annotations
 
 import ast
 import ipaddress
+import posixpath
 import re
 import unittest
 from pathlib import Path
@@ -76,7 +78,7 @@ def _block(lines: list[str], key: str, indent: int) -> list[str]:
             break
         out.append(line)
     if not inside:
-        raise AssertionError(f"no {key!r} block at indent {indent} in docker-compose.yml")
+        raise AssertionError(f"no {key!r} block at indent {indent} in the compose files")
     return out
 
 
@@ -88,11 +90,19 @@ def _all_services() -> list[str]:
     only the first file's services. That failure mode is the dangerous direction:
     the rules below would pass by not seeing the services they exist to constrain.
     """
-    bodies = [_block(COMPOSE[i:], "services", 0)
-              for i, line in enumerate(COMPOSE) if line.rstrip() == "services:"]
-    if not bodies:
+    body = _top_level("services")
+    if not body:
         raise AssertionError("no services: block in either compose file")
-    return [line for body in bodies for line in body]
+    return body
+
+
+def _top_level(key: str) -> list[str]:
+    """Every top-level ``key:`` block across both compose files, as one body; empty
+    when neither file declares one."""
+    return [inner
+            for i, line in enumerate(COMPOSE)
+            if line.rstrip() == f"{key}:" or line.startswith(f"{key}: ")
+            for inner in _block(COMPOSE[i:], key, 0)]
 
 
 def _service(name: str) -> list[str]:
@@ -1680,6 +1690,130 @@ class NoServiceSharesANetworkNamespaceTests(unittest.TestCase):
                                   if re.match(r"\s+network_mode:", ln)])
 
 
+class NoServiceSharesAnotherNamespaceTests(unittest.TestCase):
+    """The other namespaces, and another container's mounts. Each key is refused
+    outright, as ``network_mode`` and ``cap_add`` are: the values that matter join the
+    host's or another container's, and a harmless one (``ipc: private``) is a test edit
+    with its reason.
+
+    ``pid: host`` shows a service the host's processes, and tool-gateway and tasks run
+    as the operator's uid and gid. With those matching, a service can read
+    ``/proc/<pid>/environ`` and ``/proc/<pid>/root`` of the operator's processes: the
+    host filesystem as the operator, with every capability dropped. Docker's AppArmor
+    profile blocks that where AppArmor runs, which WSL2 does not by default. Reasoned,
+    not run; and it assumes an engine sharing the operator's PID namespace, where
+    Docker Desktop's would show its VM's processes instead. ``volumes_from`` would hand
+    an MCP server the gateway's secrets mount, or a socket bound in a container outside
+    compose."""
+
+    KEYS = ("pid", "ipc", "userns_mode", "uts", "cgroup", "volumes_from")
+
+    def test_no_service_sets_a_namespace_or_takes_anothers_mounts(self):
+        keys = "|".join(self.KEYS)
+        for svc in _service_names():
+            with self.subTest(service=svc):
+                self.assertFalse([ln for ln in _service(svc)
+                                  if re.match(rf"    ({keys}):", ln)])
+
+
+def _host_path_refusal(source: str) -> str | None:
+    """Why a host path a container is given is refused, or None.
+
+    ``source`` is as ``_host_sources`` reads it, a variable as its default, so one
+    without a default cannot be judged, nor can a leading ``~``, which Compose reads
+    as the home directory."""
+    if not source or source[0] in ">|":
+        return "continues on a later line, which this reader does not follow"
+    if "$" in source or source.startswith("~"):
+        return "cannot be read without the environment"
+    path = posixpath.normpath(re.sub(r"/+", "/", source))
+    if path == ".." or path.startswith("../"):
+        return "climbs out of the repo"
+    if path in ("/", "/var") or any(path == top or path.startswith(top + "/")
+                                    for top in ("/run", "/var/run")):
+        return "is where a container runtime keeps its socket, or holds it"
+    return None
+
+
+def _uncommented(line: str) -> str:
+    return re.sub(r"\s+#.*$", "", line).strip()
+
+
+def _plain_value(value: str) -> str:
+    """One layer of matching quotes stripped, and ``${VAR:-d}`` or ``${VAR-d}`` read as
+    ``d``, which a short form must be before it is split, since ``:-`` is itself a
+    colon."""
+    if len(value) > 1 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+    return re.sub(r"\$\{[A-Za-z_][A-Za-z0-9_]*:?-([^}]*)\}", r"\1", value)
+
+
+def _host_sources() -> list[tuple[str, str]]:
+    """Every host path a container is given, with where it is given: a service
+    volume's short-form source (a one-field item is an anonymous volume's target) or
+    its long-form ``source:``; a top-level volume's ``device:``; a top-level secret's
+    or config's ``file:``, which Compose bind-mounts. A named volume reads as a
+    relative path inside the repo, which passes."""
+    found = []
+    for svc in _service_names():
+        body = _service(svc)
+        if not any(re.match(r"    volumes:", ln) for ln in body):
+            continue
+        for line in _block(body, "volumes", 4):
+            item = _uncommented(line)
+            short = re.match(r"-(\s|$)", item) is not None
+            item = re.sub(r"^-(\s+|$)", "", item)
+            if m := re.match(r"source:\s*(.*)", item):
+                found.append((svc, _plain_value(m.group(1))))
+            elif not short or re.match(r"[A-Za-z_]+:(\s|$)", item):
+                continue  # a long-form item's other keys
+            elif not item or item[0] in ">|":
+                found.append((svc, item))
+            elif len(fields := _plain_value(item).split(":")) > 1:
+                found.append((svc, fields[0]))
+    for key, field in (("volumes", "device"), ("secrets", "file"), ("configs", "file")):
+        for line in _top_level(key):
+            if m := re.match(rf"{field}:\s*(.*)", _uncommented(line)):
+                found.append((f"top-level {key}", _plain_value(m.group(1))))
+    return found
+
+
+class NoServiceHoldsTheRuntimeSocketTests(unittest.TestCase):
+    """The container runtime's socket is root on the host, and DESIGN.md's "MCP gateway
+    — governed tool capability" makes it what nothing in this design may hold. The
+    likeliest way it arrives is the one that section names: a stdio-only MCP server,
+    which would need it to be spawned.
+
+    Two rules, because neither covers the other. The paths are where Linux runtimes
+    keep their sockets, rootless ones included; Docker Desktop keeps its socket under
+    the home directory, which only the name scan sees, and only by name."""
+
+    SOCKETS = ("docker.sock", "containerd.sock", "podman.sock")
+
+    def test_no_line_names_a_runtime_socket(self):
+        self.assertFalse([line.strip() for line in COMPOSE
+                          if not line.strip().startswith("#")
+                          and any(s in line for s in self.SOCKETS)])
+
+    def test_no_host_path_is_a_runtime_socket_or_holds_one(self):
+        sources = _host_sources()
+        self.assertTrue(sources, "no host path read: the reader no longer parses")
+        for where, source in sources:
+            with self.subTest(given_to=where, source=source):
+                self.assertIsNone(_host_path_refusal(source))
+
+
+class EachServiceIsDeclaredOnceTests(unittest.TestCase):
+    """Compose merges every declaration of a name across the ``-f`` files, but every
+    per-service rule here reads its first, so a catalogue server also declared in
+    docker-compose.yml is read only from that copy, and its declaration in
+    mcp-servers.yml could weaken it unseen. Whole-file scans read every copy."""
+
+    def test_no_service_name_repeats_across_the_compose_files(self):
+        names = _service_names()
+        self.assertEqual(sorted({n for n in names if names.count(n) > 1}), [])
+
+
 class PublishedPortTests(unittest.TestCase):
     """DESIGN.md says the two UIs' pages are the only ports the stack publishes, and only
     on host loopback: every other listener is on a network the host does not join."""
@@ -1717,8 +1851,9 @@ class EveryServiceDropsEveryCapabilityTests(unittest.TestCase):
                                   if ln.strip() and not ln.strip().startswith("#")],
                                  ["- ALL"])
                 self.assertFalse([ln for ln in body if re.match(r"    cap_add:", ln)])
-                self.assertFalse([ln for ln in body
-                                  if re.match(r"    privileged:\s*true", ln)])
+                # The key, as cap_add's: a quoted "true" is refused without deciding
+                # how Compose reads it.
+                self.assertFalse([ln for ln in body if re.match(r"    privileged:", ln)])
 
     def test_every_service_sets_no_new_privileges(self):
         # Dropping every capability empties the bounding set, but a setuid or setgid

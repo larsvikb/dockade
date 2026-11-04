@@ -8,7 +8,7 @@
  * No DOM at import, so the unit tests import this file under node
  * (tests/test_control_plane_ui_js.py).
  */
-import { escapePayload } from "./escape.js";
+import { escapeNonAscii } from "./escape.js";
 import { leaseCountdown, leaseRemaining } from "./leases.js";
 import { renderListStatus } from "./list-status.js";
 import { toolPinsStatus, toolRulesStatus } from "./status.js";
@@ -411,7 +411,7 @@ export function toolRevokePreview(rule) {
 // screen.
 export function pinText(pinsJson) {
   const raw = typeof pinsJson === "string" ? pinsJson : "";
-  const text = escapePayload(raw);
+  const text = escapeNonAscii(raw);
   return { text, escaped: text !== raw };
 }
 

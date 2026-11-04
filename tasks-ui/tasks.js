@@ -18,7 +18,7 @@
  * (tests/test_tasks_ui_js.py).
  */
 import { lineDiff, wordDiff } from "./diff.js";
-import { escapePayload, isHidden, NON_ASCII_RE } from "./escape.js";
+import { escapeNonAscii, isHidden, NON_ASCII_RE } from "./escape.js";
 import { pollStatus, renderListStatus } from "./list-status.js";
 import {
   TASK_STATES, NOT_RUNNING_STATUS, movesFor, noteMovesFor, isNoteMove,
@@ -48,7 +48,7 @@ export function spellHidden(text) {
   const shown = s.replace(NON_ASCII_RE, ch => {
     if (ch === "\n" || ch === "\t" || !isHidden(ch)) return ch;
     hidden++;
-    return escapePayload(ch);
+    return escapeNonAscii(ch);
   });
   return { text: shown, hidden };
 }

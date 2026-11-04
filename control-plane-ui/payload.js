@@ -7,7 +7,7 @@
  * handed — so the unit tests can import this file under node
  * (tests/test_control_plane_ui_js.py).
  */
-import { escapePayload, isHidden, NON_ASCII_RE } from "./escape.js";
+import { escapeNonAscii, isHidden, NON_ASCII_RE } from "./escape.js";
 
 // The summary line above a tool ask's arguments. The payload always starts open: the
 // box's max-height (`.payload pre` in index.html) is what keeps a long one from
@@ -183,7 +183,7 @@ function hazardTally(text) {
   const ranked = [...counts].sort(
     (a, b) => b[1] - a[1] || a[0].codePointAt(0) - b[0].codePointAt(0));
   const shown = ranked.slice(0, HAZARD_TALLY_MAX).map(
-    ([ch, n]) => `${isHidden(ch) ? escapePayload(ch) : ch} x${n}`);
+    ([ch, n]) => `${isHidden(ch) ? escapeNonAscii(ch) : ch} x${n}`);
   if (ranked.length > shown.length) {
     shown.push(`+${ranked.length - shown.length} more`);
   }
@@ -235,7 +235,7 @@ export function payloadHazards(argsJson) {
     ? `${counted} — nothing is hidden; tick to see them escaped.`
     : "";
   return { level, invisible, nonAscii, note,
-           escaped: nonAscii ? escapePayload(text) : text };
+           escaped: nonAscii ? escapeNonAscii(text) : text };
 }
 
 // The payload's pieces as coloured spans, built with textContent like the rest of

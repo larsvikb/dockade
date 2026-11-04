@@ -39,7 +39,7 @@ export function isHidden(ch) {
 // of the unescaping the payload rule forbids. Nothing is dropped, summarized or
 // reordered; what changes is that an override is spelled out where it sits instead
 // of acting on the text around it.
-export function escapePayload(text) {
+export function escapeNonAscii(text) {
   return text.replace(NON_ASCII_RE, (ch) => {
     const code = ch.codePointAt(0);
     if (code <= 0xFFFF) return "\\u" + code.toString(16).padStart(4, "0");

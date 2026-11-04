@@ -289,7 +289,9 @@ no clone, no copy, no egress, no credential — so the mount is **read-only**, a
 that is deliberate: a writable plugin tree is a channel for the agent to edit a
 skill or hook that lands in its own context, or executes, on the next boot. For
 the same reason a marketplaces directory that is your workspace, lies inside it
-or holds it is refused: the workspace is mounted read-write.
+or holds it is refused: the workspace is mounted read-write. So is a workspace
+that is, holds or lies inside `~/.config/dockade` itself, which every later launch
+reads, unless `ALLOW_UNSAFE_WORKSPACE=1`.
 Updating a marketplace is a `git pull` on the host.
 
 Registration is **re-derived on every boot** from what is mounted, so deleting a

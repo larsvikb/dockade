@@ -227,5 +227,111 @@ class ChangeTests(unittest.TestCase):
         self.assertIn("merge_pr", self.inv.snapshot()["mcp-github"]["tools"])
 
 
+D1, D2, D3 = "a" * 64, "b" * 64, "c" * 64
+
+
+def _push(**digests):
+    """mcp-github exposing one tool per keyword, each with that digest (None: none)."""
+    return {"servers": {"mcp-github": {"status": "ok", "tools": [
+        {"name": name, **({} if digest is None else {"digest": digest})}
+        for name, digest in digests.items()]}}}
+
+
+class SchemaDigestTests(unittest.TestCase):
+    """A tool's arguments moving, which widens a plain `allow` on a dispatcher and is
+    audited the way a new tool is."""
+
+    def setUp(self):
+        self.inv = load_inventory()
+
+    def test_a_moved_digest_is_one_line_naming_the_tool(self):
+        self.inv.record(_push(get_issue=D1, issue_read=D1))
+        _, moved = self.inv.record(_push(get_issue=D1, issue_read=D2))
+        self.assertEqual(moved,
+                         [("mcp-github", "mcp-github changed the arguments of issue_read")])
+
+    def test_a_first_sighting_says_nothing_about_arguments(self):
+        _, moved = self.inv.record(_push(issue_read=D1))
+        self.assertEqual(moved, [("mcp-github", "mcp-github first seen exposing 1 tool(s)")])
+        self.assertEqual(self.inv.snapshot()["mcp-github"]["changed"], {})
+
+    def test_a_first_digest_is_quiet(self):
+        # A gateway older than digests, upgraded: nothing observed the arguments move.
+        self.inv.record(_push(issue_read=None))
+        _, moved = self.inv.record(_push(issue_read=D1))
+        self.assertEqual(moved, [])
+        self.assertEqual(self.inv.snapshot()["mcp-github"]["changed"], {})
+
+    def test_a_new_tool_reads_only_as_new(self):
+        self.inv.record(_push(get_issue=D1))
+        _, moved = self.inv.record(_push(get_issue=D1, issue_write=D2))
+        self.assertEqual(moved, [("mcp-github", "mcp-github now exposes issue_write")])
+
+    def test_two_moves_are_named_in_order(self):
+        self.inv.record(_push(pull_request_read=D1, issue_read=D1))
+        _, moved = self.inv.record(_push(pull_request_read=D2, issue_read=D2))
+        self.assertEqual(moved, [("mcp-github", "mcp-github changed the arguments of "
+                                                "issue_read, pull_request_read")])
+
+    def test_a_tool_that_leaves_and_returns_reads_only_as_new(self):
+        # Its digest leaves with it, so the return is a new tool's, not a move: the
+        # same gap a whole server leaving the roster has.
+        self.inv.record(_push(get_issue=D1, issue_read=D1))
+        self.inv.record(_push(get_issue=D1))
+        self.assertEqual(self.inv.snapshot()["mcp-github"]["digests"], {"get_issue": D1})
+        _, moved = self.inv.record(_push(get_issue=D1, issue_read=D2))
+        self.assertEqual(moved, [("mcp-github", "mcp-github now exposes issue_read")])
+
+    def test_a_move_across_a_push_that_could_not_enumerate_is_reported(self):
+        self.inv.record(_push(issue_read=D1))
+        self.inv.record({"servers": {"mcp-github": {"status": "unreachable"}}})
+        self.assertEqual(self.inv.snapshot()["mcp-github"]["digests"], {"issue_read": D1})
+        _, moved = self.inv.record(_push(issue_read=D2))
+        self.assertEqual(moved,
+                         [("mcp-github", "mcp-github changed the arguments of issue_read")])
+
+    def test_a_move_across_a_push_with_no_digest_is_reported(self):
+        self.inv.record(_push(issue_read=D1))
+        _, moved = self.inv.record(_push(issue_read=None))
+        self.assertEqual(moved, [])
+        _, moved = self.inv.record(_push(issue_read=D2))
+        self.assertEqual(moved,
+                         [("mcp-github", "mcp-github changed the arguments of issue_read")])
+
+    def test_a_malformed_digest_is_dropped(self):
+        for bad in (D1.upper(), D1[:-1], D1 + "0", D1 + "\n", 7, None, ["x"]):
+            with self.subTest(digest=bad):
+                inv = load_inventory()
+                inv.record({"servers": {"s": {"status": "ok", "tools": [
+                    {"name": "t", "digest": bad}]}}})
+                seen = inv.snapshot()["s"]
+                self.assertEqual(seen["tools"], ["t"])
+                self.assertEqual(seen["digests"], {})
+
+    def test_when_the_arguments_changed_is_kept_while_the_tool_is_exposed(self):
+        self.inv.record(_push(issue_read=D1))
+        self.inv.record(_push(issue_read=D2))
+        at = self.inv.snapshot()["mcp-github"]["changed"]["issue_read"]
+        self.assertGreater(at, 0)
+        self.inv.record(_push(issue_read=D2))
+        self.inv.record({"servers": {"mcp-github": {"status": "unreachable"}}})
+        self.assertEqual(self.inv.snapshot()["mcp-github"]["changed"], {"issue_read": at})
+        self.inv.record(_push(issue_read=D3))
+        self.assertGreaterEqual(
+            self.inv.snapshot()["mcp-github"]["changed"]["issue_read"], at)
+        self.inv.record(_push(get_issue=D1))
+        self.assertEqual(self.inv.snapshot()["mcp-github"]["changed"], {})
+
+    def test_a_snapshot_shares_no_per_tool_map(self):
+        self.inv.record(_push(issue_read=D1))
+        self.inv.record(_push(issue_read=D2))
+        seen = self.inv.snapshot()["mcp-github"]
+        seen["digests"]["issue_read"] = D3
+        seen["changed"].clear()
+        again = self.inv.snapshot()["mcp-github"]
+        self.assertEqual(again["digests"], {"issue_read": D2})
+        self.assertIn("issue_read", again["changed"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -5235,6 +5235,34 @@ class ActorColumnTests(_ToolBridgeTestCase):
         self.assertIn("peer=172.29.0.4", row["actor"])
 
 
+class ToolArgumentsChangedAuditTests(_ToolBridgeTestCase):
+    """A tool's arguments moving is an `observe` row on `mcp-tools`, as a new tool is:
+    a plain `allow` on a dispatcher widens when its enum grows, and the rule is not
+    bound to the schema, so this row is what records it."""
+
+    audits = True
+
+    def _push(self, digest: str) -> None:
+        cp.api_tool.tool_inventory(cp.api_tool.InventoryRequest(servers={
+            "mcp-github": {"status": "ok", "tools": [
+                {"name": "pull_request_read", "digest": digest}]}}), _FakeRequest())
+
+    def test_a_moved_digest_is_an_observe_row_naming_server_and_tool(self):
+        _tool_rule("pull_request_read", "allow")
+        self._push("a" * 64)
+        self._push("a" * 64)
+        self._push("b" * 64)
+        with cp.store._connect() as conn:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT kind, server, reason FROM audit WHERE stage='mcp-tools' "
+                "ORDER BY id")]
+        self.assertEqual([(r["kind"], r["server"]) for r in rows],
+                         [("observe", "mcp-github")] * 2)
+        self.assertEqual(rows[-1]["reason"],
+                         "mcp-github changed the arguments of pull_request_read")
+        self.assertNotIn("b" * 64, rows[-1]["reason"])
+
+
 class TwoServersOneToolNameTests(_ToolBridgeTestCase):
     """The reason ``server`` is a COLUMN and ``tool_rules`` is UNIQUE on the pair.
 

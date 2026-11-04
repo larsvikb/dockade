@@ -1618,6 +1618,20 @@ and never descriptions, which nothing bounds. Two distinctions are load-bearing
 enough to name: a server that could not be enumerated keeps its last known surface
 rather than reading as one that exposes nothing, and a tool whose name falls outside
 `_TOOL_RE` is dropped but counted, because no rule could ever be written for it.
+**A tool's arguments cross as a digest, and only as one.** `schema_digest` in
+`tool-gateway/discovery.py` hashes the `inputSchema` without its prose, and the claim
+carries the hash and none of the schema, so it adds no server-authored text to the
+crown jewel. It covers the schema as served, not anything a `$ref` in it points to
+elsewhere. A moved digest is audited as the tool's arguments changing, because a
+dispatcher's operations are an enum behind one tool name and a plain `allow` on it
+widens when the enum grows. The rule is not bound to the schema, so that row and a flag
+on the rules table and the picker are the whole response. Both rest on the in-memory
+inventory and share its gaps. The flag, and the digest the next push is compared
+with, clear when the control plane restarts, when the server leaves the roster, and
+when the tool misses an enumeration. A schema that moves across one of those (while
+the control plane is down, in the upgrade that restarts it, or while the server is
+disabled) arrives as a first sighting or a new tool, which reports nothing about a
+plain `allow`.
 
 **A server enters the store because an operator registered it, not
 because a file declared it.** Seeding from a file was considered and set
@@ -1693,11 +1707,11 @@ parse cannot close is a server that matches keys more loosely than Python, as Go
 `encoding/json` does; the key shape that closes it is `policy._PIN_FIELD_RE`.
 
 **What a pin does not cover, stated so it is known rather than found.** It constrains
-the fields it names and nothing else: a server that also reads an alias field, or an
-upgrade adding a field that retargets the call, widens a pin with nothing to report
-it. Binding a pin to the tool's schema would close that, and needs a schema digest
-the control plane does not hold (`_as_claim` in `tool-gateway/discovery.py` strips
-schemas at the push). A pin also gives up the per-call read, and with it the rate
+the fields it names and nothing else. A server that also reads an alias field widens
+a pin with nothing to report it. An upgrade adding a field that retargets the call
+widens it too, and that change is audited as the tool's arguments changing. Binding a pin to the tool's schema would close that. The inventory holds each
+tool's schema digest, but the inventory is never an input to a decision, so a pin
+cannot be bound to it there. A pin also gives up the per-call read, and with it the rate
 limit a human is; every call it answers is audited, naming the pin. And as with a
 lease, a new pin does not release a matching card that is already pending.
 

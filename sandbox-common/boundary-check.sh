@@ -7,7 +7,7 @@
 #     boundary-check.sh
 #
 # It complements the boot-time checks in init-firewall.sh / entrypoint.sh, which
-# (a) run as root BEFORE the privilege drop, (b) mostly only warn, and (c) scroll
+# (a) run as root BEFORE the privilege drop, (b) check only at boot, and (c) scroll
 # past at startup with no aggregate result. This runs on demand, from the agent's
 # own (capability-less) security context, and exits non-zero if any hard invariant
 # is violated — a regression baseline to run before and after the proxy work.

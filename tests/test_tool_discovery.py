@@ -19,12 +19,13 @@ import contextlib
 import http.server
 import json
 import socket
+import sys
 import threading
 import time
 import unittest
 from unittest import mock
 
-from _loader import load_control_plane, load_discovery
+from _loader import load_control_plane, load_discovery, load_inventory
 
 #: A roster entry as ``/tool/roster`` serves one, trimmed to what this module reads.
 #: Written out rather than imported from the control plane: these two are separate
@@ -483,14 +484,17 @@ class TrimTests(unittest.TestCase):
         self.assertEqual(self._listed({"name": "ping"})["inputSchema"],
                          {"type": "object"})
 
-    def test_the_push_carries_the_name_and_the_claim_and_nothing_else(self):
+    def test_the_push_carries_the_name_the_claim_and_a_digest_and_nothing_else(self):
         # What crosses to the control plane is what a person choosing a rule reads. A
-        # description is third-party text, and the crown jewel then holds it.
+        # description is third-party text, and the crown jewel then holds it; the
+        # schema crosses only as its fixed-length digest.
+        schema = {"type": "object", "properties": {"owner": {"type": "string"}}}
         claim = self.discovery._as_claim([
             {"name": "get_issue", "description": "Read an issue.",
-             "inputSchema": {"type": "object"}, "annotations": {"readOnlyHint": True}}])
+             "inputSchema": schema, "annotations": {"readOnlyHint": True}}])
         self.assertEqual(claim, [{"name": "get_issue",
-                                  "annotations": {"readOnlyHint": True}}])
+                                  "annotations": {"readOnlyHint": True},
+                                  "digest": self.discovery.schema_digest(schema)}])
 
 
 class AuthHeaderTests(unittest.TestCase):
@@ -690,6 +694,269 @@ class DigestTests(unittest.TestCase):
                      "endpoint": ENTRY["endpoint"], "server": ENTRY["server"]}
         self.assertEqual(self.discovery.roster_digest([ENTRY]),
                          self.discovery.roster_digest([reordered]))
+
+
+#: A dispatcher in miniature: one tool, a required `method` enum, nested schemas
+#: under each keyword the digest recurses through.
+_DISPATCHER = {
+    "type": "object",
+    "description": "Read a pull request.",
+    "title": "pull_request_read",
+    "properties": {
+        "method": {"type": "string", "enum": ["get", "get_diff"],
+                   "description": "Which read."},
+        "owner": {"type": "string", "description": "Repository owner.",
+                  "examples": ["octo"]},
+        "labels": {"type": "array",
+                   "items": {"type": "string", "enum": ["bug", "docs"],
+                             "description": "A label."}},
+        "target": {"anyOf": [{"type": "string", "enum": ["head", "base"],
+                              "description": "A ref."},
+                             {"$ref": "#/$defs/sha"}]},
+    },
+    "required": ["method", "owner"],
+    "$defs": {"sha": {"type": "string", "enum": ["HEAD"], "$comment": "short"}},
+}
+
+
+class SchemaDigestTests(unittest.TestCase):
+    """What moves a tool's schema digest, and what must not.
+
+    Two failure directions. A digest that misses a structural change lets a plain
+    `allow` on a dispatcher widen with nothing reported; one that moves on a rewording
+    raises a change row for every upstream copy edit, and a row nobody believes is a
+    row nobody reads."""
+
+    def setUp(self):
+        self.discovery = load_discovery()
+
+    def _digest(self, schema) -> str:
+        return self.discovery.schema_digest(schema)
+
+    def _with(self, edit) -> dict:
+        schema = json.loads(json.dumps(_DISPATCHER))
+        edit(schema)
+        return schema
+
+    def assertMoves(self, edit):
+        self.assertNotEqual(self._digest(_DISPATCHER), self._digest(self._with(edit)))
+
+    def assertStays(self, edit):
+        self.assertEqual(self._digest(_DISPATCHER), self._digest(self._with(edit)))
+
+    def test_it_is_a_sha256_in_hex(self):
+        # The shape `inventory._DIGEST_RE` keeps; anything else is dropped there.
+        self.assertRegex(self._digest(_DISPATCHER), r"\A[0-9a-f]{64}\Z")
+
+    def test_an_enum_gaining_a_value_moves_it(self):
+        # THE case: a dispatcher's new method, which a plain `allow` takes on silently.
+        self.assertMoves(lambda s: s["properties"]["method"]["enum"].append("merge"))
+
+    def test_a_changed_type_moves_it(self):
+        self.assertMoves(lambda s: s["properties"]["owner"].update(type="integer"))
+
+    def test_a_field_becoming_required_moves_it(self):
+        self.assertMoves(lambda s: s["required"].append("labels"))
+
+    def test_an_enum_value_added_in_a_nested_schema_moves_it(self):
+        for where, edit in (
+                ("items", lambda s: s["properties"]["labels"]["items"]["enum"]
+                 .append("security")),
+                ("anyOf", lambda s: s["properties"]["target"]["anyOf"][0]["enum"]
+                 .append("merge")),
+                ("$defs", lambda s: s["$defs"]["sha"]["enum"].append("ORIG_HEAD"))):
+            with self.subTest(where=where):
+                self.assertMoves(edit)
+
+    def test_an_x_keyword_is_structure(self):
+        # `x-mcp-header` routes an argument somewhere else entirely. An unknown keyword
+        # is kept whole, prose-named contents included, since nothing here knows what
+        # it means: erring toward drift, never toward silence.
+        self.assertMoves(lambda s: s["properties"]["owner"].update(
+            {"x-mcp-header": "X-Owner"}))
+        with_x = self._with(lambda s: s.update({"x-meta": {"description": "a"}}))
+        reworded = self._with(lambda s: s.update({"x-meta": {"description": "b"}}))
+        self.assertNotEqual(self._digest(with_x), self._digest(reworded))
+
+    def test_a_default_change_moves_it(self):
+        # A default is what the server does when the agent says nothing, so it is
+        # what the call does.
+        self.assertMoves(lambda s: s["properties"]["method"].update(default="get_diff"))
+        before = self._with(lambda s: s["properties"]["method"].update(default="get"))
+        after = self._with(lambda s: s["properties"]["method"].update(default="get_diff"))
+        self.assertNotEqual(self._digest(before), self._digest(after))
+
+    def test_a_description_key_inside_a_const_or_default_is_data(self):
+        # Object-valued data that happens to hold a `description` key. Stripping it
+        # there would hide a change to what the call sends.
+        for keyword in ("const", "default"):
+            with self.subTest(keyword=keyword):
+                before = self._with(lambda s, k=keyword: s["properties"].update(
+                    body={"type": "object", k: {"description": "draft"}}))
+                after = self._with(lambda s, k=keyword: s["properties"].update(
+                    body={"type": "object", k: {"description": "ready"}}))
+                self.assertNotEqual(self._digest(before), self._digest(after))
+
+    def test_the_dependency_maps_keep_their_names(self):
+        # `dependentRequired` and draft-07 `dependencies` key on a property NAME, which
+        # may well be `description`; the subschema form still loses its prose.
+        for keyword in ("dependentRequired", "dependencies"):
+            with self.subTest(keyword=keyword):
+                empty = self._with(lambda s, k=keyword: s.update({k: {}}))
+                named = self._with(lambda s, k=keyword: s.update(
+                    {k: {"description": ["title"]}}))
+                self.assertNotEqual(self._digest(empty), self._digest(named))
+        with_schema = self._with(lambda s: s.update(
+            {"dependencies": {"owner": {"description": "a", "required": ["labels"]}}}))
+        reworded = self._with(lambda s: s.update(
+            {"dependencies": {"owner": {"description": "b", "required": ["labels"]}}}))
+        self.assertEqual(self._digest(with_schema), self._digest(reworded))
+
+    def test_rewording_any_prose_does_not_move_it(self):
+        for where, edit in (
+                ("top", lambda s: s.update(description="Fetch a PR.", title="read")),
+                ("property", lambda s: s["properties"]["method"].update(
+                    description="The operation.")),
+                ("examples", lambda s: s["properties"]["owner"].update(
+                    examples=["someone"])),
+                ("items", lambda s: s["properties"]["labels"]["items"].update(
+                    description="Label name.")),
+                ("anyOf", lambda s: s["properties"]["target"]["anyOf"][0].update(
+                    description="Ref name.")),
+                ("$defs", lambda s: s["$defs"]["sha"].update({"$comment": "long"}))):
+            with self.subTest(where=where):
+                self.assertStays(edit)
+
+    def test_order_does_not_move_it(self):
+        reordered = {key: _DISPATCHER[key] for key in reversed(list(_DISPATCHER))}
+        self.assertEqual(self._digest(_DISPATCHER), self._digest(reordered))
+        self.assertStays(lambda s: s["required"].reverse())
+        self.assertStays(lambda s: s["properties"]["method"]["enum"].reverse())
+        typed = self._with(lambda s: s["properties"]["owner"].update(
+            type=["string", "null"]))
+        retyped = self._with(lambda s: s["properties"]["owner"].update(
+            type=["null", "string"]))
+        self.assertEqual(self._digest(typed), self._digest(retyped))
+
+    def test_prose_names_in_name_and_data_positions_are_kept(self):
+        # `description` and `title` are prose only as KEYWORDS. As a property, a
+        # `$defs` or a `patternProperties` name they are arguments, and as an enum or
+        # `const` value they are what the call sends.
+        for where, edit in (
+                ("properties", lambda s: s["properties"].update(
+                    description={"type": "string"})),
+                ("$defs", lambda s: s["$defs"].update(title={"type": "string"})),
+                ("patternProperties", lambda s: s.update(
+                    patternProperties={"description": {"type": "string"}})),
+                ("enum", lambda s: s["properties"]["method"]["enum"].append("title")),
+                ("const", lambda s: s["properties"]["owner"].update(
+                    const="description"))):
+            with self.subTest(where=where):
+                self.assertMoves(edit)
+        named = self._with(lambda s: s["properties"].update(
+            description={"type": "string", "description": "a"}))
+        reworded = self._with(lambda s: s["properties"].update(
+            description={"type": "string", "description": "b"}))
+        self.assertEqual(self._digest(named), self._digest(reworded))
+
+
+class DeepSchemaPushTests(unittest.TestCase):
+    """One server's schema must not cost every other server its audit rows. A schema
+    `json` parses can be nested past what a recursive walk or `json.dumps` will go;
+    raised, that ended the push, and with it the record of every other server's move.
+    Nested relative to the recursion limit, so no particular threshold is assumed."""
+
+    def setUp(self):
+        self.discovery = load_discovery()
+
+    @staticmethod
+    def _deep(levels: int = 0) -> dict:
+        schema: dict = {"type": "string"}
+        for _ in range(levels or sys.getrecursionlimit() * 2):
+            schema = {"type": "object", "properties": {"x": schema}}
+        return schema
+
+    def _pushed(self, results) -> dict:
+        sent = []
+
+        @contextlib.contextmanager
+        def urlopen(request, *_args, **_kwargs):
+            sent.append(json.loads(request.data))
+            yield mock.Mock(read=lambda: b'{"ok": true}')
+
+        with mock.patch("urllib.request.urlopen", urlopen):
+            self.assertEqual(self.discovery.push_inventory(results), "")
+        return sent[0]
+
+    @staticmethod
+    def _result(server, schema) -> dict:
+        return {"server": server, "status": "ok",
+                "tools": [{"name": "pull_request_read", "annotations": {},
+                           "inputSchema": schema}]}
+
+    def test_a_schema_too_deep_to_encode_gets_the_fixed_digest(self):
+        # The depth `json.dumps` gives up at is the interpreter's, so it is found
+        # rather than assumed.
+        levels = sys.getrecursionlimit()
+        while True:
+            schema = self._deep(levels)
+            try:
+                json.dumps(schema)
+            except RecursionError:
+                break
+            if levels >= 1 << 17:
+                self.skipTest(f"json.dumps encoded {levels} levels; nothing to test")
+            levels *= 2
+        self.assertEqual(self.discovery.schema_digest(schema),
+                         self.discovery.UNDIGESTIBLE)
+        self.assertRegex(self.discovery.UNDIGESTIBLE, r"\A[0-9a-f]{64}\Z")
+
+    def test_a_schema_too_deep_to_walk_is_still_hashed_whole(self):
+        # Between what `_structure` can walk and what `json.dumps` can encode, a deep
+        # schema is hashed with its prose, so a widening inside it still moves the
+        # digest. The recursion limit is lowered to just above this frame, which
+        # bounds the Python walk and not the C encoder, so the band exists whatever
+        # the interpreter's defaults.
+        depth, here = 200, 0
+        frame = sys._getframe()
+        while frame is not None:
+            here, frame = here + 1, frame.f_back
+
+        def deep(values):
+            schema: dict = {"type": "string", "enum": values}
+            for _ in range(depth):
+                schema = {"type": "object", "properties": {"x": schema}}
+            return schema
+
+        before, after = deep(["get"]), deep(["get", "merge"])
+        limit = sys.getrecursionlimit()
+        sys.setrecursionlimit(here + depth // 2)
+        try:
+            with self.assertRaises(RecursionError):
+                self.discovery._structure(before)
+            json.dumps(before, sort_keys=True)
+            digests = [self.discovery.schema_digest(s) for s in (before, after)]
+        finally:
+            sys.setrecursionlimit(limit)
+        self.assertNotIn(self.discovery.UNDIGESTIBLE, digests)
+        self.assertNotEqual(digests[0], digests[1])
+
+    def test_a_deep_schema_on_one_server_does_not_silence_another(self):
+        normal = {"type": "object", "properties": {"method": {"enum": ["get"]}}}
+        grown = {"type": "object", "properties": {"method": {"enum": ["get", "merge"]}}}
+        inv = load_inventory()
+        inv.record(self._pushed([self._result("mcp-hostile", {"type": "object"}),
+                                 self._result("mcp-github", normal)]))
+        _, moved = inv.record(self._pushed([self._result("mcp-hostile", self._deep()),
+                                            self._result("mcp-github", grown)]))
+        # Both moves are reported: the normal server's, and the deep one going into the
+        # undigestible state, which errs toward drift rather than silence.
+        self.assertEqual(sorted(moved), [
+            ("mcp-github", "mcp-github changed the arguments of pull_request_read"),
+            ("mcp-hostile", "mcp-hostile changed the arguments of pull_request_read")])
+        _, moved = inv.record(self._pushed([self._result("mcp-hostile", self._deep()),
+                                            self._result("mcp-github", grown)]))
+        self.assertEqual(moved, [])
 
 
 class PollTests(unittest.TestCase):

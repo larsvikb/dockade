@@ -39,6 +39,7 @@ hand"; `make mcp-tools` is the same request by hand):
 """
 from __future__ import annotations
 
+import hashlib
 import http.client
 import ipaddress
 import json
@@ -588,16 +589,97 @@ def reconcile_all(roster: list[dict]) -> list[dict]:
     return [reconcile(entry) for entry in roster]
 
 
+#: Keywords whose value is prose, dropped from a schema object before hashing, or every
+#: upstream rewording would read as drift.
+_PROSE = frozenset({"description", "title", "examples", "$comment"})
+#: Keywords whose value is a map from a NAME to a subschema. The names are kept, since
+#: they are the arguments; the values are schemas, so prose is dropped inside them.
+#: `dependentRequired`, and draft-07 `dependencies` in its array form, map a name to a
+#: list of names, and a name in a list passes through ``_structure`` unchanged.
+_NAME_MAPS = frozenset({"properties", "patternProperties", "$defs", "definitions",
+                        "dependentSchemas", "dependentRequired", "dependencies"})
+#: Keywords whose value is one subschema or a list of them.
+_SUBSCHEMAS = frozenset({"items", "prefixItems", "additionalItems", "contains",
+                         "additionalProperties", "unevaluatedProperties",
+                         "unevaluatedItems", "propertyNames", "not", "if", "then",
+                         "else", "anyOf", "allOf", "oneOf"})
+#: Keywords whose value is a set, so their order is not structure.
+_UNORDERED = frozenset({"required", "enum", "type"})
+
+
+#: The digest of a schema too deep to digest (``schema_digest``): hex-shaped, so the
+#: control plane keeps it like any other, and the hash of no canonical JSON.
+UNDIGESTIBLE = hashlib.sha256(b"undigestible schema").hexdigest()
+
+
+def _canonical(value) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _structure(schema):
+    """A schema with its prose dropped, for ``schema_digest``.
+
+    Recurses only through the keywords above. Everything else is kept verbatim: `enum`,
+    `const` and `default`, which are data, and every unknown or `x-` keyword, whose
+    contents this cannot know to be prose. Erring toward keeping is erring toward
+    reporting drift."""
+    if isinstance(schema, list):
+        return [_structure(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+    out = {}
+    for key, value in schema.items():
+        if key in _PROSE:
+            continue
+        if key in _NAME_MAPS and isinstance(value, dict):
+            value = {name: _structure(sub) for name, sub in value.items()}
+        elif key in _SUBSCHEMAS:
+            value = _structure(value)
+        if key in _UNORDERED and isinstance(value, list):
+            value = [item for _, item in
+                     sorted({_canonical(item): item for item in value}.items())]
+        out[key] = value
+    return out
+
+
+def schema_digest(schema) -> str:
+    """A SHA-256 of what a tool's arguments ARE: property names, types, enums, and
+    which are required, without the descriptions around them.
+
+    Fixed-length and server-text-free, which is what lets it cross to the control plane
+    under ``_as_claim``'s contract: a moved digest says a tool's arguments changed, and
+    the control plane audits that the way it audits a new tool.
+
+    A schema too deep for ``_structure``, which recurses in Python, is hashed whole,
+    prose included: for that tool a rewording then counts as drift, which is noise and
+    never silence. Only one too deep for ``json.dumps`` as well gets ``UNDIGESTIBLE``.
+    None of the three raises, since raising would end the whole push and every other
+    server's audit rows with it. A tool moving between them reads as its arguments
+    changing, and one never keeps its last digest, which would hide the move."""
+    try:
+        text = _canonical(_structure(schema))
+    except RecursionError:
+        try:
+            text = _canonical(schema)
+        except RecursionError:
+            return UNDIGESTIBLE
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
 def _as_claim(tools: list[dict]) -> list[dict]:
-    """What a person choosing a rule reads: the name, and the server's read-only claim.
+    """What a person choosing a rule reads: the name, the server's read-only claim,
+    and a digest of the arguments.
 
     Narrowed at the PUSH rather than at the read, because this narrowing is about the
     reader. A description and a schema are third-party text an operator does not need
     in order to pick a tool by name, and the control plane holds this in memory to
     render a picker — so every field that crosses is one the crown jewel then keeps.
     The agent-facing surface reads the same tools and needs the schema, which is why
-    the two trims are different sizes and neither can be the other's."""
-    return [{"name": tool["name"], "annotations": tool.get("annotations") or {}}
+    the two trims are different sizes and neither can be the other's. The digest is
+    the schema reduced to a fixed-length hash, so it carries none of the schema's
+    text."""
+    return [{"name": tool["name"], "annotations": tool.get("annotations") or {},
+             "digest": schema_digest(tool.get("inputSchema") or {"type": "object"})}
             for tool in tools]
 
 

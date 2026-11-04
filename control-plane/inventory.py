@@ -24,6 +24,7 @@ holds what a SERVER said and need only be bounded.
 """
 from __future__ import annotations
 
+import re
 import threading
 import time
 
@@ -37,6 +38,11 @@ import policy
 MAX_SERVERS = 64
 MAX_TOOLS_PER_SERVER = 256
 
+#: What a tool's schema digest must look like to be kept: the gateway's
+#: ``discovery.schema_digest``, a SHA-256 in hex. Anything else is dropped, so the
+#: only server-influenced value this holds per tool besides its name is fixed-length.
+_DIGEST_RE = re.compile(r"[0-9a-f]{64}")
+
 class InventoryError(ValueError):
     """A push the gateway must be TOLD about rather than have silently dropped.
 
@@ -49,12 +55,14 @@ class InventoryError(ValueError):
 
 _LOCK = threading.Lock()
 #: server -> {"tools": [name, ...], "read_only": [name, ...], "unnameable": int,
+#:            "digests": {name: hex}, "changed": {name: float},
 #:            "enumerated": bool, "status": str, "seen_at": float}
 _SEEN: dict[str, dict] = {}
 
 
-def _clean_tools(raw: list) -> tuple[list[str], list[str], int]:
-    """The tool names worth keeping, the read-only subset, and how many were dropped.
+def _clean_tools(raw: list) -> tuple[list[str], list[str], int, dict[str, str]]:
+    """The tool names worth keeping, the read-only subset, how many were dropped, and
+    each kept tool's schema digest where it has a well-formed one.
 
     A name outside ``policy._TOOL_RE`` is dropped rather than stored, because a rule
     cannot be written for it — ``_decide_tool`` compares byte-for-byte against a column
@@ -69,6 +77,7 @@ def _clean_tools(raw: list) -> tuple[list[str], list[str], int]:
     and never in `tool_rules`."""
     names: list[str] = []
     read_only: list[str] = []
+    digests: dict[str, str] = {}
     unnameable = 0
     for tool in raw[:MAX_TOOLS_PER_SERVER]:
         name = (tool.get("name") or "").strip() if isinstance(tool, dict) else ""
@@ -80,12 +89,27 @@ def _clean_tools(raw: list) -> tuple[list[str], list[str], int]:
         names.append(name)
         if (tool.get("annotations") or {}).get("readOnlyHint"):
             read_only.append(name)
+        digest = tool.get("digest")
+        if isinstance(digest, str) and _DIGEST_RE.fullmatch(digest):
+            digests[name] = digest
     unnameable += max(0, len(raw) - MAX_TOOLS_PER_SERVER)
-    return sorted(names), sorted(read_only), unnameable
+    return sorted(names), sorted(read_only), unnameable, digests
+
+
+def _reshaped(was: dict, now: dict) -> list[str]:
+    """The tools in both pictures whose schema digest moved, sorted.
+
+    A tool needs a digest on BOTH sides. One newly exposed is already named as new,
+    and one gaining its first digest (from a gateway older than digests) is not a
+    change to its arguments that anything observed."""
+    before, after = was.get("digests") or {}, now.get("digests") or {}
+    return sorted(tool for tool in set(before) & set(after)
+                  if before[tool] != after[tool])
 
 
 def changes(before: dict, after: dict) -> list[tuple[str, str]]:
-    """One ``(server, line)`` per server whose exposed tools moved, for the audit.
+    """One ``(server, line)`` per server whose tools or their arguments moved, for the
+    audit.
 
     The name is returned BESIDE the line rather than left to be read out of it. The
     line names the server too — it has to, being what a human reads — but the caller
@@ -96,7 +120,9 @@ def changes(before: dict, after: dict) -> list[tuple[str, str]]:
     description is unbounded text a third party wrote, and this is the one part of the
     inventory that becomes durable. Naming what appeared is the whole value — an image
     bump that starts exposing a destructive tool, with no human in the loop, is a
-    supply-chain event and the reason this is audited at all.
+    supply-chain event and the reason this is audited at all. A tool whose arguments
+    changed is the same event for a dispatcher: an enum gaining a method widens a plain
+    `allow` on it, so the move is named too, by tool and never by schema text.
 
     Only CHANGES. A push on every roster poll saying the same thing is not a record, it
     is a way to make the record unreadable."""
@@ -112,7 +138,8 @@ def changes(before: dict, after: dict) -> list[tuple[str, str]]:
             continue
         was = set(before.get(server, {}).get("tools", ()))
         now = set(after.get(server, {}).get("tools", ()))
-        if was == now:
+        reshaped = _reshaped(before.get(server, {}), after[server])
+        if was == now and not reshaped:
             # Also the case that keeps a never-enumerated server quiet. Enabling one
             # with a bad credential gives it an empty tool list and no previous entry,
             # so both sides are empty and it falls out here — rather than reaching the
@@ -136,6 +163,8 @@ def changes(before: dict, after: dict) -> list[tuple[str, str]]:
             parts.append(f"now exposes {', '.join(added)}")
         if gone:
             parts.append(f"no longer exposes {', '.join(gone)}")
+        if reshaped:
+            parts.append(f"changed the arguments of {', '.join(reshaped)}")
         lines.append((server, f"{server} {' and '.join(parts)}"))
     return lines
 
@@ -175,8 +204,17 @@ def record(payload: dict) -> tuple[dict, list[tuple[str, str]]]:
                     or not isinstance(body, dict)):
                 continue
             name = str(name)
+            was = previous.get(name, {})
             if "tools" in body:
-                tools, read_only, unnameable = _clean_tools(body.get("tools") or [])
+                tools, read_only, unnameable, digests = _clean_tools(
+                    body.get("tools") or [])
+                # A tool still exposed that arrived with no usable digest keeps its
+                # last one, as a server that could not be asked keeps its names:
+                # otherwise d1, then none, then d2 would read as a first digest and
+                # say nothing about the move.
+                digests = {**{tool: digest for tool, digest in
+                              (was.get("digests") or {}).items() if tool in tools},
+                           **digests}
             else:
                 # ABSENT IS NOT EMPTY, and the gateway takes trouble to keep them
                 # apart: it omits the list entirely when it could not ask. Reading
@@ -185,14 +223,22 @@ def record(payload: dict) -> tuple[dict, list[tuple[str, str]]]:
                 # whole surface, and would empty the picker while the operator is
                 # trying to work out why. So the last known surface stands, and
                 # `status` is what says it may be stale.
-                was = previous.get(name, {})
                 tools = list(was.get("tools", ()))
                 read_only = list(was.get("read_only", ()))
                 unnameable = was.get("unnameable", 0)
+                digests = dict(was.get("digests") or {})
+            # When each tool's arguments last changed, as this process saw it. Kept
+            # for as long as the tool is exposed, and lost with the rest of this map
+            # on a restart.
+            changed = {tool: at for tool, at in (was.get("changed") or {}).items()
+                       if tool in tools}
+            changed.update((tool, now) for tool in _reshaped(was, {"digests": digests}))
             fresh[name] = {
                 "tools": tools,
                 "read_only": read_only,
                 "unnameable": unnameable,
+                "digests": digests,
+                "changed": changed,
                 # Whether the tool list above is an OBSERVATION or merely the absence
                 # of one. A server registered with a bad credential has never been
                 # enumerated, and its empty list means "we could not ask" rather than
@@ -218,9 +264,10 @@ def snapshot() -> dict:
     A DEEP-ENOUGH copy, because the caller renders it while the gateway may be
     replacing it — and because a handle on the live map would let one reader mutate
     what every other reader sees. A shallow ``dict(body)`` is not enough: it shares
-    the tool LISTS, which are the part a caller is most likely to sort or filter in
-    place."""
+    the tool LISTS and the per-tool MAPS, which are the parts a caller is most likely
+    to sort, filter or edit in place."""
     with _LOCK:
-        return {server: {key: list(value) if isinstance(value, list) else value
+        return {server: {key: (list(value) if isinstance(value, list)
+                               else dict(value) if isinstance(value, dict) else value)
                          for key, value in body.items()}
                 for server, body in _SEEN.items()}

@@ -165,7 +165,8 @@ const owner = {
   "mcp.js": ["serverDescriptor", "serverEndpoint", "serverPreset", "serverPreview",
              "serverEditPreview", "serverEditBody", "serverSaveBody",
              "toolChoices", "toolRulePreview", "toolEditPreview", "toolRevokePreview",
-             "pinText", "pinState", "pinExpiry", "pinLapsesDue"],
+             "pinText", "pinState", "pinExpiry", "pinLapsesDue",
+             "toolArgsChanged"],
   "leases.js": ["leaseLabel", "leaseRemaining", "leaseCountdown", "leaseDomain",
                 "groupLeases"],
   "status.js": ["auditStatus", "rulesStatus", "toolRulesStatus", "toolPinsStatus",
@@ -3236,6 +3237,86 @@ def _poll_paths(body: str, indent: str = "  ") -> tuple[str, str]:
                              "path changed shape, and the guards that read it would "
                              "read the wrong code")
     return failure, success
+
+
+_ARGS_PROBE = r"""
+import { pathToFileURL } from "node:url";
+const m = await import(pathToFileURL(`${process.env.DOCKADE_UI_DIR}/mcp.js`).href);
+const t = await import(pathToFileURL(`${process.env.DOCKADE_UI_DIR}/time.js`).href);
+const at = 1767225600;
+const entry = { tools: ["issue_read", "issue_write", "get_me"], read_only: [],
+                unnameable: 0, enumerated: true, status: "", seen_at: at,
+                changed: { issue_read: at, issue_write: at } };
+const rules = [{ id: 1, server: "mcp-github", tool: "issue_read", action: "allow" },
+               { id: 2, server: "mcp-github", tool: "get_me", action: "allow" }];
+const choices = m.toolChoices("mcp-github", { "mcp-github": entry }, rules);
+console.log(JSON.stringify({
+  stamp: t.fmtStamp(at),
+  changed: m.toolArgsChanged(entry, "issue_read"),
+  unchanged: m.toolArgsChanged(entry, "get_me"),
+  inherited: m.toolArgsChanged(entry, "constructor"),
+  no_map: m.toolArgsChanged({ tools: ["issue_read"] }, "issue_read"),
+  no_entry: m.toolArgsChanged(undefined, "issue_read"),
+  ruled: choices.ruled,
+  unruled: choices.unruled,
+  note: choices.note,
+}));
+"""
+
+
+@unittest.skipIf(not _NODE and not _STRICT,
+                 "node is not installed — skipping the mcp.js argument-flag tests")
+class ToolArgsChangedTests(unittest.TestCase):
+    """The flag on a ruled tool whose arguments moved: a plain `allow` on a dispatcher
+    covers a method its enum gained, and the rule is not bound to the schema, so the
+    rules table and the picker say so."""
+
+    probe: dict
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if not _NODE:
+            raise AssertionError("node is not installed and DOCKADE_REQUIRE_TOOLS is set")
+        proc = subprocess.run(  # noqa: S603 (absolute path, fixed args)
+            [_NODE, "--input-type=module", "-e", _ARGS_PROBE],
+            env={**os.environ, "DOCKADE_UI_DIR": str(_served_dir()),
+                 "TZ": "Europe/Stockholm"},
+            capture_output=True, text=True, timeout=60, check=False)
+        if proc.returncode != 0:
+            raise AssertionError(f"node could not run the mcp.js probe:\n{proc.stderr}")
+        cls.probe = json.loads(proc.stdout)
+
+    def test_the_flag_names_when_the_arguments_changed(self):
+        self.assertEqual(self.probe["changed"],
+                         f"arguments changed {self.probe['stamp']}")
+        self.assertTrue(self.probe["stamp"])
+
+    def test_no_flag_without_a_recorded_change(self):
+        for key in ("unchanged", "inherited", "no_map", "no_entry"):
+            with self.subTest(case=key):
+                self.assertEqual(self.probe[key], "")
+
+    def test_the_picker_flags_only_a_ruled_tool(self):
+        # An unruled tool is denied whatever its arguments are; the flag is for the
+        # rule that now covers more.
+        ruled = {r["tool"]: r["argsChanged"] for r in self.probe["ruled"]}
+        self.assertEqual(ruled, {"issue_read": self.probe["changed"], "get_me": ""})
+        self.assertEqual([(r["tool"], r["argsChanged"]) for r in self.probe["unruled"]],
+                         [("issue_write", "")])
+
+    def test_the_note_names_the_ruled_tool_and_that_a_restart_clears_it(self):
+        note = self.probe["note"]
+        self.assertIn("The arguments of issue_read changed since the control plane "
+                      "started", note)
+        self.assertNotIn("issue_write changed", note)
+
+    def test_the_rules_table_and_the_picker_both_show_it(self):
+        src = MCP_JS.read_text()
+        rows = _fn_body(src, "renderToolRules(rows)", "")
+        picker = _fn_body(src, "renderToolPicker()", "")
+        self.assertIn("const reshaped = toolArgsChanged(entry, row.tool);", rows)
+        self.assertIn(": reshaped ? `yes — ${reshaped}` : \"yes\"", rows)
+        self.assertIn("+ `${item.argsChanged ? `, ${item.argsChanged}` : \"\"}`", picker)
 
 
 class AuditTableSourceTests(unittest.TestCase):

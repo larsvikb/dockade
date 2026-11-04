@@ -512,8 +512,10 @@ def _tool_rule_error(tool: str, action: str) -> str | None:
 
     There is no wildcard floor to enforce, which is the whole difference from
     ``_rule_error``. A host pattern can be broadened until it grants a TLD; a tool
-    name names one tool, so breadth is not expressible and an ``allow`` here is
-    exactly as wide as it reads."""
+    name names one tool, so breadth is not expressible in the rule. An ``allow`` is
+    as wide as the tool's arguments, which for a dispatcher is every value of its
+    enum. A schema change is audited when ``inventory`` observes it and flagged in the
+    UI, and widens the rule all the same."""
     if action not in _TOOL_ACTIONS:
         return (f"action must be one of {', '.join(_TOOL_ACTIONS)}, not {action!r}")
     if not tool:

@@ -213,6 +213,15 @@ const toolVerb = a => TOOL_VERB[a] || `${a}s`;
 const TOOL_UNDO = { allow: "be allowed", ask: "be asked about", deny: "be denied" };
 const toolUndo = a => TOOL_UNDO[a] || a;
 
+// The flag on a ruled tool whose arguments moved, or "". A rule decides a tool by name,
+// so for a dispatcher an enum gaining a method widens it; `inventory.py` audits the
+// move and keeps when it happened, in memory. It clears when the control plane
+// restarts, when the server leaves the roster, and when the tool misses an enumeration.
+export function toolArgsChanged(entry, tool) {
+  const at = Number(((entry && entry.changed) || {})[tool]);
+  return at ? `arguments changed ${fmtStamp(at)}` : "";
+}
+
 // What a server exposes, split by whether policy has anything to say about it — plus
 // one sentence explaining the state the picker is in.
 //
@@ -236,6 +245,7 @@ export function toolChoices(server, inventory, rules) {
   const ruled = [];
   for (const tool of exposed) {
     const row = { tool, readOnly: readOnly.has(tool), action: action.get(tool) || null };
+    row.argsChanged = row.action ? toolArgsChanged(entry, tool) : "";
     (row.action ? ruled : unruled).push(row);
   }
   // Ruled but NOT exposed — the gateway's `ruled_but_absent`, seen from the other end.
@@ -275,6 +285,11 @@ export function toolChoices(server, inventory, rules) {
     // list can say it is showing fewer tools than the server has.
     parts.push(`${unnameable} name${unnameable === 1 ? "" : "s"} could not be written `
              + `as a rule and ${unnameable === 1 ? "is" : "are"} not listed.`);
+  }
+  const reshaped = ruled.filter(r => r.argsChanged).map(r => r.tool);
+  if (reshaped.length) {
+    parts.push(`The arguments of ${reshaped.join(", ")} changed since the control `
+             + `plane started, and a rule covers whatever they now accept.`);
   }
   if (absent.length) {
     parts.push(`${absent.length} rule${absent.length === 1 ? "" : "s"} below `
@@ -809,6 +824,7 @@ function renderToolPicker() {
       // until someone edits it — this cannot be got wrong later.
       opt.textContent = item.action
         ? `${item.tool} — ${item.action}${item.readOnly ? ", read-only" : ""}`
+          + `${item.argsChanged ? `, ${item.argsChanged}` : ""}`
         : `${item.tool}${item.readOnly ? " — read-only" : ""}`;
       optgroup.appendChild(opt);
     }
@@ -884,10 +900,13 @@ function renderToolRules(rows) {
     // inert while reading here exactly like policy in force — the confusion the
     // gateway's `ruled_but_absent` report names, said next to the rule itself.
     // "unknown" and "no" are different facts: the first means nobody has asked.
+    // A "yes" whose arguments moved says so, since the rule now covers them too.
     const entry = inventory[row.server];
+    const reshaped = toolArgsChanged(entry, row.tool);
     cell(!entry || !entry.enumerated
            ? "unknown"
-           : (entry.tools || []).includes(row.tool) ? "yes" : "no", "ts");
+           : !(entry.tools || []).includes(row.tool) ? "no"
+           : reshaped ? `yes — ${reshaped}` : "yes", "ts");
     cell(row.created_at ? fmtStamp(row.created_at) : "", "ts");
     const actions = document.createElement("td");
     // The two actions this rule is NOT, rather than an edit mode: a tool rule's

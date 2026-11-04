@@ -168,8 +168,12 @@ It is **tier-aware**: tier 1 asserts Anthropic is reachable *via the proxy*, tie
 asserts it is unreachable and that the inference service is the one destination that
 answers. It exits non-zero on any violation, so it doubles as a regression baseline
 to run before and after changes — `make boundary` runs it in a live sandbox. This is
-separate from the boot-time checks, which run as root before the privilege drop and
-only warn.
+separate from the boot-time checks in `sandbox-common/entrypoint.sh` and
+`sandbox-common/init-firewall.sh`, which run as root before the privilege drop and
+fail closed: a failed step that sets up the boundary stops the container before the
+agent starts, and the explicit checks say why on a `FATAL` line in the boot output.
+The exception is the few firewall probes that print `WARNING` or `NOTE` and let the
+boot continue; which ones those are is in `init-firewall.sh`.
 
 ## Yolo mode
 

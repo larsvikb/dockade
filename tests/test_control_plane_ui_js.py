@@ -172,7 +172,7 @@ const owner = {
   "status.js": ["auditStatus", "rulesStatus", "toolRulesStatus", "toolPinsStatus",
                 "leasesStatus"],
   "list-status.js": ["pollStatus", "renderListStatus"],
-  "escape.js": ["escapePayload", "isHidden"],
+  "escape.js": ["escapeNonAscii", "isHidden"],
   "holds.js": ["renderableHolds", "diffPending", "shouldSweep",
                "toolRemaining", "toolOutcomeMessage", "pinPreview",
                "holdRemaining", "countdownState", "departure", "persistPreview",

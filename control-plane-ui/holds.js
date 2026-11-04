@@ -8,7 +8,7 @@
  * No DOM at import, so the unit tests import this file under node
  * (tests/test_control_plane_ui_js.py).
  */
-import { escapePayload } from "./escape.js";
+import { escapeNonAscii } from "./escape.js";
 import { durationWords, fmtStamp } from "./time.js";
 
 // What changed between the pending list on screen and the one just pushed, keyed by
@@ -99,7 +99,7 @@ export function pinPreview(options, chosen, tool, server, leaseSeconds) {
   }
   const free = [...offered.filter(f => !ticked.has(f.field)).map(f => f.field),
                 ...((options && options.unpinnable) || []).map(u => u.field)];
-  const conditions = picked.map(f => `${f.field} = ${escapePayload(f.value)}`)
+  const conditions = picked.map(f => `${f.field} = ${escapeNonAscii(f.value)}`)
     .join(" and ");
   const rest = free.length
     ? `Every other argument is free: ${free.join(", ")}, and any this call did not set.`

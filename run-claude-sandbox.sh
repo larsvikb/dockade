@@ -221,7 +221,7 @@ else
     # work — fail with guidance rather than launch a sandbox that reaches nothing.
     if [ "$(docker network inspect "$SANDBOX_NET" -f '{{.Internal}}' 2>/dev/null)" = "true" ]; then
         echo "ERROR: '$SANDBOX_NET' is internal but no egress proxy is running." >&2
-        echo "       Start the infrastructure first:  docker compose up -d" >&2
+        echo "       Start the infrastructure first:  make -C \"$SANDBOX_REPO_ROOT\" up" >&2
         exit 1
     fi
     EGRESS_DESC="DIRECT (no egress proxy on $SANDBOX_NET; firewall only, no audit)"

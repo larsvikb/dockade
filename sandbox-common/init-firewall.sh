@@ -152,7 +152,7 @@ else
         echo "FATAL: cannot create ipset ($(tr -d '\n' </tmp/ipset.err))." >&2
         echo "       The kernel lacks the ip_set module (common on stock WSL2)." >&2
         echo "       Start the egress proxy and run in governed mode instead" >&2
-        echo "       ('docker compose up -d' first) — it needs no ipset. See DESIGN.md." >&2
+        echo "       ('make up' in the dockade checkout first) — it needs no ipset. See DESIGN.md." >&2
         exit 1
     fi
     USE_IPSET=1

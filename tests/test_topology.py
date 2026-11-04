@@ -23,8 +23,13 @@ from __future__ import annotations
 
 import ast
 import ipaddress
+import os
 import posixpath
 import re
+import shutil
+import stat
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from typing import ClassVar
@@ -927,16 +932,26 @@ class GatewayPlacementTests(unittest.TestCase):
                          "the gateway has a leg on a control network, so it no longer "
                          "reaches the control plane over tool-authorize-net alone")
 
-    def test_the_secrets_mount_is_read_only(self):
+    def test_the_secrets_mount_is_read_only_and_never_made_by_docker(self):
         # The gateway only ever READS a token. Write access would let a compromised
         # gateway rewrite the credential every future call is made with, and would put
         # the agent one process-compromise away from editing what the broker spends —
         # which is the whole thing this container is between the agent and.
-        mount = [ln for ln in _service("tool-gateway")
-                 if "/run/dockade/secrets" in ln]
-        self.assertTrue(mount, "the gateway has no secrets mount")
-        self.assertTrue(mount[0].rstrip().endswith(":ro"),
-                        f"the gateway's secrets mount is not read-only: {mount[0]!r}")
+        mount = _long_mount("tool-gateway", "/run/dockade/secrets")
+        self.assertEqual(mount["source"], "${MCP_SECRETS:-./secrets}")
+        self.assertEqual(mount["read_only"], "true")
+        # A missing directory fails the start: made by dockerd it would be root's, and
+        # every later write there would need sudo. `make` makes it (SecretsDirTests).
+        self.assertEqual(mount["create_host_path"], "false")
+
+    def test_no_service_mounts_the_secrets_in_the_short_form(self):
+        # The short form makes a missing source, as root, whatever the long form beside
+        # it says.
+        for svc in _service_names():
+            with self.subTest(service=svc):
+                self.assertEqual([ln for ln in _service(svc)
+                                  if ln.strip().startswith("- ") and "MCP_SECRETS" in ln],
+                                 [])
 
     def test_the_gateway_runs_as_a_user_that_can_read_the_secrets_mount(self):
         # These two lines are one fact split across a file boundary, and getting it
@@ -1921,6 +1936,131 @@ class EveryImageIsBuiltTests(unittest.TestCase):
                 for line in runs:
                     self.assertIn('SANDBOX_JDK= "./$$launcher" --build-only', line)
 
+
+class SecretsDirTests(unittest.TestCase):
+    """``make secrets-dir`` makes ``MCP_SECRETS`` as the invoking user, since the
+    gateway's mount will not have dockerd make it (``create_host_path: false``).
+
+    Run, not parsed, which is new for this file: what matters is who owns what after
+    it. A temp ``DOCKADE_CONFIG_HOME`` and a cleared environment, so neither a
+    caller's ``MCP_SECRETS`` or ``XDG_CONFIG_HOME`` nor the ``make test`` it runs
+    under (``-n``, ``-j``) decides what this one does."""
+
+    CLEARED = ("MCP_SECRETS", "XDG_CONFIG_HOME", "DOCKADE_CONFIG_HOME", "MAKEFLAGS",
+               "MFLAGS", "GNUMAKEFLAGS", "MAKELEVEL", "MAKEOVERRIDES", "MAKEFILES")
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.use(self.tmp / "absent" / "dockade")
+
+    def use(self, config: Path) -> None:
+        self.config, self.secrets = config, config / "secrets"
+
+    def make(self, *args: str, path: str | None = None) -> subprocess.CompletedProcess[str]:
+        # Absolute, so not resolved through PATH; a failure without make, not a skip,
+        # since this suite runs under it.
+        make = shutil.which("make")
+        self.assertIsNotNone(make, "make is not installed")
+        env = {k: v for k, v in os.environ.items() if k not in self.CLEARED}
+        env["DOCKADE_CONFIG_HOME"] = str(self.config)
+        if path is not None:
+            env["PATH"] = path
+        return subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
+            [make, "-s", "-C", str(ROOT), *(args or ("secrets-dir",))], env=env,
+            capture_output=True, text=True, timeout=60, check=False)
+
+    def unwritable(self, path: Path) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("root writes past any mode")
+        path.chmod(0o500)
+        self.addCleanup(path.chmod, 0o700)
+
+    def test_a_fresh_host_gets_both_directories_as_its_user(self):
+        run = self.make()
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        for path in (self.config, self.secrets):
+            with self.subTest(path=path.name):
+                self.assertEqual(path.stat().st_uid, os.getuid())
+        self.assertEqual(stat.S_IMODE(self.secrets.stat().st_mode), 0o700)
+        again = self.make()
+        self.assertEqual((again.returncode, again.stdout + again.stderr), (0, ""))
+
+    def test_an_existing_directory_it_cannot_write_is_a_warning(self):
+        # The gateway only reads it. The advice is for its owner, here the user.
+        self.secrets.mkdir(parents=True)
+        self.unwritable(self.secrets)
+        run = self.make()
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn(f"WARNING: {self.secrets} is not writable by you", run.stdout)
+        self.assertIn(f'chmod u+w "{self.secrets}"', run.stdout)
+
+    def test_an_ancestor_it_cannot_write_fails_with_the_advice(self):
+        # Compose would fail next on the missing directory, so this fails first. Named
+        # from levels up, as the nearest directory that exists.
+        locked = self.tmp / "locked"
+        locked.mkdir()
+        self.use(locked / "absent" / "dockade")
+        self.unwritable(locked)
+        run = self.make()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn(f"cannot make {self.secrets}: {locked} is not writable", run.stdout)
+        self.assertIn(f'chmod u+w "{locked}"', run.stdout)
+        self.assertFalse((locked / "absent").exists())
+
+    def test_another_owners_ancestor_is_advice_to_chown(self):
+        # chmod cannot help with a directory someone else owns.
+        usr = Path("/usr")
+        if os.geteuid() == 0 or usr.stat().st_uid == os.getuid() or os.access(usr, os.W_OK):
+            self.skipTest("needs a directory owned by another user that this one cannot write")
+        self.use(usr / f"dockade-test-{os.getpid()}" / "dockade")
+        run = self.make()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn(f"cannot make {self.secrets}: {usr} is not writable", run.stdout)
+        self.assertIn(f'sudo chown {os.getuid()}:{os.getgid()} "{usr}"', run.stdout)
+        self.assertNotIn("chmod", run.stdout)
+
+    def test_a_file_in_its_place_is_named_as_one(self):
+        self.config.mkdir(parents=True)
+        self.secrets.write_text("")
+        run = self.make()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn(f"cannot make {self.secrets}: {self.secrets} is not a directory",
+                      run.stdout)
+
+    def test_a_dry_run_of_up_runs_nothing(self):
+        # `make -n` must stay a dry run. A recursive `$(MAKE)` line in a recipe makes
+        # GNU make run that whole recipe under -n, compose included, under .ONESHELL.
+        stub = self.tmp / "bin"
+        stub.mkdir()
+        calls = self.tmp / "docker-calls"
+        (stub / "docker").write_text(f'#!/bin/sh\necho "$*" >> "{calls}"\n')
+        (stub / "docker").chmod(0o755)
+        run = self.make("-n", "up", path=f"{stub}{os.pathsep}{os.environ['PATH']}")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertFalse(calls.exists(), calls.read_text() if calls.exists() else "")
+        self.assertFalse(self.config.exists())
+
+    def test_every_target_that_can_start_the_gateway_makes_it_first(self):
+        # A bare `$(COMPOSE) up` (re)creates the gateway, whose mount needs the
+        # directory; `tasks-up` writes its secret there. In the graph, not in a recipe
+        # (the dry-run test above says why), with the mode check after it.
+        makefile = (ROOT / "Makefile").read_text()
+
+        def prereqs(target: str) -> list[str]:
+            rule = re.search(rf"^{re.escape(target)}:(?!=)([^#\n]*)", makefile, re.M)
+            return rule.group(1).split() if rule else []
+
+        def reaches(target: str, seen: frozenset[str] = frozenset()) -> bool:
+            return any(dep == "secrets-dir" or (dep not in seen and
+                                                reaches(dep, seen | {target}))
+                       for dep in prereqs(target))
+        self.assertIn("secrets-dir", prereqs("secrets-perm-check"))
+        self.assertIn("secrets-perm-check", prereqs("up"))
+        for target in ("up", "rebuild", "restore", "tasks-up"):
+            with self.subTest(target=target):
+                self.assertTrue(reaches(target))
 
 if __name__ == "__main__":
     unittest.main()

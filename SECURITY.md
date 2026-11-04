@@ -32,7 +32,7 @@ substantive reply. If a report goes unanswered longer than that, a nudge on the 
 thread is welcome.
 
 **Testing is entirely local.** There is no hosted instance and no service to attack
-— you run the whole thing yourself with `docker compose up`, so no authorisation
+— you run the whole thing yourself with `make up`, so no authorisation
 question arises and nothing you do while testing affects anyone else.
 
 ## In scope

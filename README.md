@@ -35,8 +35,10 @@ inside the sandbox.
 ```bash
 # 1. Bring up the shared infrastructure once (egress proxy + control plane + UI).
 #    Sandboxes route their traffic through it and it audits every connection.
-cd /path/to/dockade && make up   # or: docker compose -f docker-compose.yml \
-                                 #       -f mcp-servers.yml up -d --build
+cd /path/to/dockade && make up   # or by hand, making the secrets directory first,
+                                 # as compose will not:
+#   s=${XDG_CONFIG_HOME:-$HOME/.config}/dockade/secrets; mkdir -p -m 700 "$s"
+#   MCP_SECRETS=$s docker compose -f docker-compose.yml -f mcp-servers.yml up -d --build
 
 # 2. From the directory you want the agent to work in, launch a sandbox:
 /path/to/dockade/run-claude-sandbox.sh

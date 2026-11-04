@@ -65,8 +65,11 @@ export function toolOutcomeMessage(d) {
   // A date and not only a time, since four hours from the evening is tomorrow.
   const pin = d.pin;
   const stamp = pin ? fmtStamp(pin.expires_at) : "";
+  // A rebind is a new grant under the tool's new arguments, for as long as this click
+  // said, so it can end a pin that was permanent.
   const what = !pin ? ""
     : pin.created ? "pinned"
+    : pin.rebound ? "pin rebound to the tool's current arguments,"
     : pin.extended ? (stamp ? "pin extended" : "pin made permanent")
     : "already pinned";
   const forGood = pin && !stamp && !pin.extended ? " for good" : "";
@@ -87,14 +90,28 @@ export function toolOutcomeMessage(d) {
 // Values are spelled with every non-ASCII character escaped, as the pins table shows
 // them (`pinText` in mcp.js): a pin value is an identifier, and this is the last look
 // at it before it becomes standing policy.
+//
+// `options.stale` are the pins this call met that were made under other arguments of
+// the tool, so did not answer it. Ticking exactly one's fields rebinds it, unless the
+// backend says this card may not (`refused`, holds._rebind_refusal).
 export function pinPreview(options, chosen, tool, server, leaseSeconds) {
   const offered = (options && options.fields) || [];
+  const stale = (options && options.stale) || [];
   const ticked = new Set(chosen || []);
   const picked = offered.filter(f => ticked.has(f.field));
   const lasting = `for ${durationWords(leaseSeconds) || "a while"}`;
+  const missed = stale.map(p => `Pin ${p.id} on ${(p.fields || []).join(", ")} matches `
+    + `this call but was made under other arguments of ${tool}, so it did not answer `
+    + "it. ").join("");
   if (!picked.length) {
     return { ok: false, fields: [],
-             text: "Tick the fields a later call must match exactly.",
+             text: `${missed}Tick the fields a later call must match exactly.`,
+             label: "Pin for good", timedLabel: `Pin ${lasting}` };
+  }
+  const key = picked.map(f => f.field).sort().join("\n");
+  const rebinds = stale.find(p => [...(p.fields || [])].sort().join("\n") === key);
+  if (rebinds && rebinds.refused) {
+    return { ok: false, fields: [], text: `Cannot pin these: ${rebinds.refused}.`,
              label: "Pin for good", timedLabel: `Pin ${lasting}` };
   }
   const free = [...offered.filter(f => !ticked.has(f.field)).map(f => f.field),
@@ -105,9 +122,14 @@ export function pinPreview(options, chosen, tool, server, leaseSeconds) {
     ? `Every other argument is free: ${free.join(", ")}, and any this call did not set.`
     : "Every argument this call carries is pinned; one it did not set is still free.";
   const names = picked.map(f => f.field).join(", ");
+  const rebound = rebinds
+    ? ` This rebinds pin ${rebinds.id} to the arguments this call was made under, for `
+      + "as long as the button you press says, even if it was pinned for good."
+    : "";
   return { ok: true, fields: picked.map(f => f.field),
            text: `Allows this call, and every later ${tool} call on ${server} `
-               + `with ${conditions} runs without a card while the pin lasts. ${rest}`,
+               + `with ${conditions} runs without a card while the pin lasts. ${rest}`
+               + rebound,
            label: `Confirm — allow and pin ${names} for good`,
            timedLabel: `Confirm — allow and pin ${names} ${lasting}` };
 }

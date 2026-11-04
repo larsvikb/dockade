@@ -67,11 +67,15 @@ const INVENTORY = {
                   read_only: ["get_me", "list_commits"], unnameable: 0 },
 };
 
+// The second pin was made under arguments the inventory has since seen move.
 const PINS = [
   { id: 4, server: "mcp-github", tool: "create_pull_request", rule: "ask",
     pins: { owner: "acme", repo: "widgets" },
     pins_json: '{"owner": "acme", "repo": "widgets"}', decides: true,
-    expires_at: NOW + 1800, created_at: NOW - 600 },
+    bound: true, schema_moved: false, expires_at: NOW + 1800, created_at: NOW - 600 },
+  { id: 6, server: "mcp-github", tool: "create_pull_request", rule: "ask",
+    pins: { owner: "acme" }, pins_json: '{"owner": "acme"}', decides: true,
+    bound: true, schema_moved: true, expires_at: null, created_at: NOW - 900 },
 ];
 
 // One hold of each kind the page draws a card for, both with something to confirm:
@@ -92,6 +96,22 @@ export const HOLDS = [
       unpinnable: [{ field: "title", why: "free text" }], refused: null,
     } },
 ];
+
+// A tool ask whose call met two pins made under other arguments of the tool: one a
+// later card has rebound, which this card may not rebind back, and one it may.
+export const STALE_HOLD = {
+  id: "tool-2", kind: "tool", server: "mcp-github", tool: "create_pull_request",
+  ts: NOW + 20, deadline: NOW + 135, client: "172.28.0.5",
+  args_json: '{"owner": "acme", "repo": "widgets", "title": "Bump"}',
+  pin_options: {
+    fields: [{ field: "owner", value: "acme" }, { field: "repo", value: "widgets" }],
+    unpinnable: [{ field: "title", why: "free text" }], refused: null,
+    stale: [{ id: 6, fields: ["owner"],
+              refused: "pin 6 was pinned again from a card raised after this one, so "
+                     + "this card cannot bind it back to the arguments it was made "
+                     + "under; allow this call without a pin instead" },
+            { id: 4, fields: ["owner", "repo"], refused: null }],
+  } };
 
 // The record view, two pages of it: the first says there is an older one, and the
 // second, asked for with that cursor, says there is not.
@@ -135,7 +155,9 @@ function resolved(id, body) {
     Object.assign(answer, { leased: true, lease_expires_at: NOW + 1800 });
   }
   if (body.pins) {
-    answer.pin = { id: 5, created: true, fields: body.pins,
+    // The stale card's pins rebind pin 4; any other card's make pin 5.
+    const rebound = id === STALE_HOLD.id;
+    answer.pin = { id: rebound ? 4 : 5, created: !rebound, rebound, fields: body.pins,
                    expires_at: body.action === "allow_pinned_lease" ? NOW + 3600 : null };
   }
   return answer;

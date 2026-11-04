@@ -625,7 +625,7 @@ def _why_unpinnable(value: object) -> str:
             f"a name")
 
 
-def _pin_candidates(args_json: str) -> dict:
+def _pin_candidates(args_json: str, schema_digest: str | None) -> dict:
     """What a pin may be made of for one held call, derived from the call as stored.
 
     ``fields`` are the ones an operator may tick, each with the value a pin would hold
@@ -633,9 +633,16 @@ def _pin_candidates(args_json: str) -> dict:
     subset of ``fields`` makes a pin that answers this very call, which is what keeps
     the choice bounded: nothing is offered that the call on the card does not carry.
 
-    ``refused`` says why no pin can be made at all. An ambiguous call is refused whole
-    rather than offered the fields that do parse, because a pin made from it would
-    never answer a call shaped like it."""
+    ``refused`` says why no pin can be made at all. A call the gateway sent with no
+    digest of the tool's arguments is refused, since a pin is bound to that digest and
+    one bound to none answers nothing. An ambiguous call is refused whole rather than
+    offered the fields that do parse, because a pin made from it would never answer a
+    call shaped like it."""
+    if schema_digest is None:
+        return {"fields": [], "unpinnable": [],
+                "refused": "the gateway sent no digest of the tool's arguments with "
+                           "this call, and a pin answers only calls made under the "
+                           "one it was pinned under"}
     try:
         args = json.loads(args_json)
     except (TypeError, ValueError):
@@ -658,10 +665,10 @@ def _pin_candidates(args_json: str) -> dict:
             "refused": None if fields else "none of this call's arguments can be pinned"}
 
 
-def _answering_pin(conn, server: str, tool: str, args: object,
-                   now: float) -> tuple[int, dict, float | None] | None:
-    """The live pin on (``server``, ``tool``) that ``args`` meets, as (id, pins,
-    expires_at), or None. The caller has found the tool's rule to be `ask`.
+def _pins_met(conn, server: str, tool: str, args: object, now: float) -> list:
+    """The live pins on (``server``, ``tool``) whose values ``args`` carries, under
+    whatever digest, in the order ``_answering_pin`` prefers them: rows with ``id``,
+    ``pins_json``, ``expires_at``, ``approval_id`` and ``schema_digest``.
 
     Expiry is enforced HERE, as ``_live_lease`` enforces it, so a pin that outlives its
     deadline cannot answer whatever did or did not sweep it.
@@ -670,19 +677,45 @@ def _answering_pin(conn, server: str, tool: str, args: object,
     standing rules before leases: which of two pins answers cannot change the answer,
     only the audit line, and the one that will still answer later explains more."""
     if not isinstance(args, dict):
+        return []
+    rows = conn.execute(
+        "SELECT id, pins_json, expires_at, approval_id, schema_digest FROM tool_pins "
+        "WHERE server = ? AND tool = ? AND (expires_at IS NULL OR expires_at > ?) "
+        "ORDER BY expires_at IS NOT NULL, expires_at DESC, id",
+        (server, tool, now)).fetchall()
+    return [row for row in rows if (pins := _parse_pins(row["pins_json"])) is not None
+            and _pin_matches(pins, args)]
+
+
+def _answering_pin(met: list, schema_digest: str | None):
+    """The pin of ``met`` (``_pins_met``) that answers a call made under
+    ``schema_digest``, or None. The caller has found the tool's rule to be `ask`.
+
+    Only a pin bound to the call's own digest answers. An upgrade that adds a field
+    which retargets the call moves the digest, so a pin made before it gets a card
+    rather than widening. A call with no digest, and a row with none, meet nothing."""
+    if schema_digest is None:
         return None
-    for row in conn.execute(
-            "SELECT id, pins_json, expires_at FROM tool_pins "
-            "WHERE server = ? AND tool = ? AND (expires_at IS NULL OR expires_at > ?) "
-            "ORDER BY expires_at IS NOT NULL, expires_at DESC, id",
-            (server, tool, now)):
-        pins = _parse_pins(row["pins_json"])
-        if pins is not None and _pin_matches(pins, args):
-            return row["id"], pins, row["expires_at"]
-    return None
+    return next((row for row in met if row["schema_digest"] == schema_digest), None)
 
 
-def _decide_tool(server: str, tool: str, args: object = None) -> tuple[str, str]:
+def _pin_fields(row) -> str:
+    """The field names of a pin row that ``_parse_pins`` accepted, for a reason."""
+    return ", ".join(sorted(_parse_pins(row["pins_json"])))
+
+
+def _skipped_words(skipped: list, schema_digest: str | None) -> str:
+    """Why the pins a call met did not answer it, for the `ask`'s reason."""
+    named = "; ".join(f"pin {row['id']} on {_pin_fields(row)}" for row in skipped)
+    if schema_digest is None:
+        return (f"{named} matches the call's values, but the gateway sent no digest "
+                f"of the tool's arguments, so no pin answers it")
+    return (f"{named} matches the call's values but was pinned under other arguments "
+            f"of the tool, so it does not answer until it is pinned again from a card")
+
+
+def _decide_tool(server: str, tool: str, args: object = None,
+                 schema_digest: str | None = None) -> tuple[str, str]:
     """(decision, reason) for calling ``tool`` on ``server``: allow, deny or ask.
 
     ``ask`` is not this path's ``hold``. An egress hold blocks the request inside the
@@ -704,10 +737,15 @@ def _decide_tool(server: str, tool: str, args: object = None) -> tuple[str, str]
     write — which is exactly why it is handled here: the store is a file on a volume,
     and the one thing a hand-edited or corrupted row must never do is grant.
 
-    Under an `ask` rule, a pin that ``args`` meets answers the call, and the decision
-    is `allow`. Under any other rule no pin is read: a pin cannot soften a `deny`, and
-    an `allow` has nothing to answer. The claim passes no ``args``, because a human
-    has already answered its call."""
+    Under an `ask` rule, a pin that ``args`` meets and that was made under
+    ``schema_digest`` answers the call, and the decision is `allow`; one it meets under
+    another digest is named in the `ask`'s reason. Under any other rule no pin is
+    read: a pin cannot soften a `deny`, and an `allow` has nothing to answer. The claim
+    passes no ``args``, because a human has already answered its call.
+
+    ``schema_digest`` is the gateway's word for the arguments it served, and the one
+    input here a sibling supplies. It can only narrow: a wrong one misses every pin and
+    gets a card."""
     server, tool = (server or "").strip(), (tool or "").strip()
     if not server or not tool:
         return "deny", "a tool call needs both a server and a tool name"
@@ -731,12 +769,13 @@ def _decide_tool(server: str, tool: str, args: object = None) -> tuple[str, str]
             return "deny", (f"the rule for {tool!r} on {server!r} carries an unknown "
                             f"action {action!r}")
         now = time.time()
-        pin = (_answering_pin(conn, server, tool, args, now) if action == "ask"
-               else None)
+        met = _pins_met(conn, server, tool, args, now) if action == "ask" else []
+    pin = _answering_pin(met, schema_digest)
     if pin is not None:
-        pin_id, pins, expires_at = pin
+        expires_at = pin["expires_at"]
         left = ("" if expires_at is None
                 else f", {_short_duration(expires_at - now)} left")
-        return "allow", (f"'allow' by pin {pin_id} ({tool} on {server}, pinned: "
-                         f"{', '.join(sorted(pins))}{left})")
-    return action, f"{action!r} by rule ({tool} on {server})"
+        return "allow", (f"'allow' by pin {pin['id']} ({tool} on {server}, pinned: "
+                         f"{_pin_fields(pin)}{left})")
+    reason = f"{action!r} by rule ({tool} on {server})"
+    return action, f"{reason}; {_skipped_words(met, schema_digest)}" if met else reason

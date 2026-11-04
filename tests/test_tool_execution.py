@@ -187,6 +187,69 @@ class DecisionTests(ExecutionTestCase):
         self.assertTrue(result["isError"])
 
 
+#: Two dispatchers whose arguments differ only in an enum value.
+_SCHEMAS = {
+    "issue_read": {"type": "object", "required": ["method"],
+                   "properties": {"method": {"type": "string",
+                                             "enum": ["get", "get_comments"]}}},
+    "issue_write": {"type": "object", "required": ["method"],
+                    "properties": {"method": {"type": "string",
+                                              "enum": ["get", "create"]}}},
+}
+
+
+class SchemaDigestTests(ExecutionTestCase):
+    """The digest of the arguments the gateway last enumerated, sent with each
+    decision, which a pin in the control plane is bound to. `get_me` is enumerated
+    with no schema, which `curate` serves as an empty object."""
+
+    def setUp(self):
+        super().setUp()
+        self.answer = {"decision": "deny", "reason": "not under test"}
+        tools = [{"name": name, "inputSchema": schema}
+                 for name, schema in _SCHEMAS.items()]
+        self.execute.surface.publish(ROSTER, [{**RESULT, "tools": [
+            *tools, {"name": "get_me"}]}])
+
+    def _sent(self, tool):
+        self.asked.clear()
+        self.execute.call(f"mcp-github__{tool}", {"method": "get"}, "172.30.0.5")
+        [(path, payload)] = self.asked
+        self.assertEqual(path, "/tool/authorize")
+        return payload["schema_digest"]
+
+    def test_each_tool_sends_the_digest_of_its_own_schema(self):
+        digest = self.execute.discovery.schema_digest
+        self.assertEqual(self._sent("issue_read"), digest(_SCHEMAS["issue_read"]))
+        self.assertEqual(self._sent("issue_write"), digest(_SCHEMAS["issue_write"]))
+        self.assertNotEqual(self._sent("issue_read"), self._sent("issue_write"))
+
+    def test_a_tool_served_without_a_schema_sends_what_the_inventory_carries(self):
+        # The inventory's `digest` and this must agree, or the pins view would call a
+        # pin moved that the decision answers.
+        [claim] = self.execute.discovery._as_claim([{"name": "get_me"}])
+        self.assertEqual(self._sent("get_me"), claim["digest"])
+
+    def test_a_tool_no_enumeration_named_sends_none(self):
+        self.assertIsNone(self._sent("create_pr"))
+
+    def test_an_undigestible_schema_sends_none(self):
+        # Its digest cannot move, so a pin bound to it could widen unseen.
+        with mock.patch.object(self.execute.discovery, "schema_digest",
+                               return_value=self.execute.discovery.UNDIGESTIBLE):
+            self.assertIsNone(self._sent("issue_read"))
+
+    def test_an_enum_gaining_a_value_moves_what_is_sent(self):
+        before = self._sent("issue_read")
+        grown = {**_SCHEMAS["issue_read"],
+                 "properties": {"method": {"type": "string",
+                                           "enum": ["get", "get_comments",
+                                                    "get_sub_issues"]}}}
+        self.execute.surface.publish(ROSTER, [{**RESULT, "tools": [
+            {"name": "issue_read", "inputSchema": grown}]}])
+        self.assertNotEqual(self._sent("issue_read"), before)
+
+
 class AskTests(ExecutionTestCase):
 
     def setUp(self):

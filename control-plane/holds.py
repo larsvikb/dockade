@@ -548,8 +548,14 @@ def _expire_tool_asks() -> int:
 
 
 def _register_tool_ask(server: str, tool: str, args: object,
-                       client: str | None = None) -> ToolAsk:
+                       client: str | None = None,
+                       schema_digest: str | None = None) -> ToolAsk:
     """Raise a card for a tool call, or attach to the identical one already pending.
+
+    ``schema_digest`` is the digest of the tool's arguments the gateway served, which
+    a pin from this card is bound to. It is in the join key, so a card raised under one
+    schema does not absorb a retry made under another: pinning from it would bind the
+    pin to the schema the retry was not made under.
 
     Under ``_LOCK`` for the same reason as ``_reserve_hold``: otherwise two concurrent
     asks both pass a cap with one slot left, or both open a card for one payload. A
@@ -572,13 +578,14 @@ def _register_tool_ask(server: str, tool: str, args: object,
     now = time.time()
     with _LOCK, store._connect() as conn:
         pending = conn.execute(
-            "SELECT id, client, deadline, args_digest FROM tool_approvals "
-            "WHERE status='pending' ORDER BY ts").fetchall()
+            "SELECT id, client, deadline, args_digest, schema_digest "
+            "FROM tool_approvals WHERE status='pending' ORDER BY ts").fetchall()
         # The client is in the join key for the reason it is in ``_group_key``: a card
         # names one caller, and answering one sandbox's question must not silently
         # answer another's.
         for row in pending:
-            if row["client"] == client and row["args_digest"] == digest:
+            if (row["client"] == client and row["args_digest"] == digest
+                    and row["schema_digest"] == schema_digest):
                 return ToolAsk(row["id"], True, None, row["deadline"])
 
         if len(pending) >= MAX_TOOL_PENDING:
@@ -610,9 +617,10 @@ def _register_tool_ask(server: str, tool: str, args: object,
         deadline = now + TOOL_HOLD_TIMEOUT
         conn.execute(
             "INSERT INTO tool_approvals(id, ts, server, tool, args_json, "
-            "args_digest, client, status, deadline) "
-            "VALUES (?,?,?,?,?,?,?, 'pending', ?)",
-            (approval_id, now, server, tool, args_json, digest, client, deadline))
+            "args_digest, client, status, deadline, schema_digest) "
+            "VALUES (?,?,?,?,?,?,?, 'pending', ?, ?)",
+            (approval_id, now, server, tool, args_json, digest, client, deadline,
+             schema_digest))
         conn.commit()
         return ToolAsk(approval_id, False, None, deadline)
 
@@ -643,7 +651,7 @@ def _get_tool_ask(approval_id: str) -> dict | None:
     with store._connect() as conn:
         row = conn.execute(
             "SELECT id, ts, server, tool, args_json, client, status, deadline, "
-            "resolved_at, claimed_at FROM tool_approvals WHERE id=?",
+            "resolved_at, claimed_at, schema_digest FROM tool_approvals WHERE id=?",
             (approval_id,)).fetchone()
     return dict(row) if row is not None else None
 
@@ -672,15 +680,51 @@ class PinnedAnswer(NamedTuple):
     is None if it is not pending at all.
 
     ``change`` is what the pin write did: "created", "extended" (a timed pin with the
-    same values now lasts longer, or for good), or None when the pin in place already
-    reached as far. ``expires_at`` is the pin's deadline as stored after the write,
-    None for a permanent pin, and ``replaced`` the deadline an extension moved."""
+    same values now lasts longer, or for good), "rebound" (the pin in place was made
+    under other arguments of the tool, and now answers under this card's), or None
+    when the pin in place already reached as far. ``expires_at`` is the pin's deadline
+    as stored after the write, None for a permanent pin, and ``replaced`` the deadline
+    an extension or a rebind moved."""
     status: str | None
     refused: str | None
     pin_id: int | None
-    change: Literal["created", "extended"] | None
+    change: Literal["created", "extended", "rebound"] | None
     expires_at: float | None
     replaced: float | None
+
+
+def _rebind_refusal(conn, pin, ask) -> str | None:
+    """Why the card ``ask`` cannot rebind ``pin``, a live pin it meets that was made
+    under another digest; None if it can.
+
+    A card raised before the one the pin was last bound from is refused, so a stale
+    card cannot bind a pin back to the schema it moved from. A bound card no longer in
+    the store says nothing about order, and does not refuse."""
+    bound = conn.execute("SELECT ts FROM tool_approvals WHERE id=?",
+                         (pin["approval_id"],)).fetchone()
+    if bound is None or ask["ts"] >= bound["ts"]:
+        return None
+    return (f"pin {pin['id']} was pinned again from a card raised after this one, so "
+            f"this card cannot bind it back to the arguments it was made under; allow "
+            f"this call without a pin instead")
+
+
+def _stale_pins(ask) -> list[dict]:
+    """The live pins the pending ``ask`` meets that were made under another digest of
+    the tool's arguments, so did not answer it: ``id``, ``fields`` and, where pinning
+    those same fields from this card would be refused, ``refused``
+    (``_rebind_refusal``). Empty for an ask with no digest, which pins nothing."""
+    if ask["schema_digest"] is None:
+        return []
+    try:
+        args = json.loads(ask["args_json"])
+    except (TypeError, ValueError):
+        return []
+    with store._connect() as conn:
+        met = policy._pins_met(conn, ask["server"], ask["tool"], args, time.time())
+        return [{"id": pin["id"], "fields": sorted(policy._parse_pins(pin["pins_json"])),
+                 "refused": _rebind_refusal(conn, pin, ask)}
+                for pin in met if pin["schema_digest"] != ask["schema_digest"]]
 
 
 def _resolve_tool_ask_pinned(approval_id: str, actor: str, pins_json: str,
@@ -695,17 +739,21 @@ def _resolve_tool_ask_pinned(approval_id: str, actor: str, pins_json: str,
     land between the check and the insert; ``api_mcp.revoke_mcp_rule`` closes the other
     direction in its DELETE.
 
-    One row per pin set (the UNIQUE on ``tool_pins``), so a pin set already in place
-    is only ever widened: no expiry beats any, and otherwise the later one wins.
-    Allowing a card never shortens a grant. A widened row names this card and this
-    resolver, who decided how far it now reaches; the audit keeps the first grant."""
+    One row per pin set (the UNIQUE on ``tool_pins``). Under the same digest a pin set
+    already in place is only ever widened: no expiry beats any, and otherwise the later
+    one wins. Under another digest it is REBOUND: the row takes this card's digest and
+    this click's expiry, whatever the two expiries were, so a rebind can shorten a
+    permanent pin. That is a new grant over a new schema, and the operator chose its
+    length now (``_rebind_refusal`` says which card may make it). A changed row names
+    this card and this resolver, who decided how far it now reaches; the audit keeps
+    each earlier grant."""
     now = time.time()
     expires_at = None if lasts is None else now + lasts
     with store._connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
             ask = conn.execute(
-                "SELECT server, tool FROM tool_approvals "
+                "SELECT ts, server, tool, schema_digest FROM tool_approvals "
                 "WHERE id=? AND status='pending'", (approval_id,)).fetchone()
             if ask is None:
                 conn.rollback()
@@ -721,27 +769,41 @@ def _resolve_tool_ask_pinned(approval_id: str, actor: str, pins_json: str,
                     None, f"{ask['tool']} on {ask['server']} {now_ruled} now, and a pin "
                           f"decides only under 'ask'; allow this call without a pin "
                           f"instead", None, None, None, None)
+            # Expired pins are swept here, the only place the table grows, as leases
+            # are on theirs. The sweep ends nothing (``policy._pins_met`` filters on
+            # the deadline); it clears the way for a pin set that lapsed to be granted
+            # again as a new pin.
+            conn.execute("DELETE FROM tool_pins WHERE expires_at <= ?", (now,))
+            existing = conn.execute(
+                "SELECT id, expires_at, approval_id, schema_digest FROM tool_pins "
+                "WHERE server=? AND tool=? AND pins_json=?",
+                (ask["server"], ask["tool"], pins_json)).fetchone()
+            rebind = (existing is not None
+                      and existing["schema_digest"] != ask["schema_digest"])
+            refused = _rebind_refusal(conn, existing, ask) if rebind else None
+            if refused:
+                conn.rollback()
+                return PinnedAnswer(None, refused, None, None, None, None)
             conn.execute(
                 "UPDATE tool_approvals SET status='allowed', resolved_at=?, "
                 "resolved_by=? WHERE id=? AND status='pending'",
                 (now, actor, approval_id))
-            # Expired pins are swept here, the only place the table grows, as leases
-            # are on theirs. The sweep ends nothing (``policy._answering_pin`` filters
-            # on the deadline); it clears the way for a pin set that lapsed to be
-            # granted again as a new pin.
-            conn.execute("DELETE FROM tool_pins WHERE expires_at <= ?", (now,))
-            existing = conn.execute(
-                "SELECT id, expires_at FROM tool_pins "
-                "WHERE server=? AND tool=? AND pins_json=?",
-                (ask["server"], ask["tool"], pins_json)).fetchone()
             replaced = None
             if existing is None:
                 pin_id = conn.execute(
                     "INSERT INTO tool_pins(server, tool, pins_json, approval_id, "
-                    "created_at, granted_by, expires_at) VALUES (?,?,?,?,?,?,?)",
+                    "created_at, granted_by, expires_at, schema_digest) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
                     (ask["server"], ask["tool"], pins_json, approval_id, now, actor,
-                     expires_at)).lastrowid
+                     expires_at, ask["schema_digest"])).lastrowid
                 change = "created"
+            elif rebind:
+                pin_id, replaced = existing["id"], existing["expires_at"]
+                conn.execute(
+                    "UPDATE tool_pins SET schema_digest=?, expires_at=?, approval_id=?, "
+                    "granted_by=? WHERE id=?",
+                    (ask["schema_digest"], expires_at, approval_id, actor, pin_id))
+                change = "rebound"
             elif existing["expires_at"] is not None and (
                     expires_at is None or expires_at > existing["expires_at"]):
                 pin_id, replaced = existing["id"], existing["expires_at"]
@@ -815,13 +877,18 @@ def _list_tool_asks() -> list[dict]:
     A separate builder feeding one list (``_pending_payload``). No ``requests``,
     because a joiner adds no waiter. ``pin_options`` is the tool side's
     ``persist_options``: what a pin may be made of, derived here so the card offers
-    exactly what ``resolve`` will accept (``policy._pin_candidates``)."""
+    exactly what ``resolve`` will accept (``policy._pin_candidates``), and the pins
+    the call met under another digest (``_stale_pins``), which pinning their fields
+    again rebinds."""
     _expire_tool_asks()
     with store._connect() as conn:
         rows = conn.execute(
-            "SELECT id, ts, server, tool, args_json, client, deadline "
+            "SELECT id, ts, server, tool, args_json, client, deadline, schema_digest "
             "FROM tool_approvals WHERE status='pending' ORDER BY ts").fetchall()
-    return [dict(r, kind="tool", pin_options=policy._pin_candidates(r["args_json"]))
+    return [dict(r, kind="tool",
+                 pin_options={**policy._pin_candidates(r["args_json"],
+                                                       r["schema_digest"]),
+                              "stale": _stale_pins(r)})
             for r in rows]
 
 

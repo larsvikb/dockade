@@ -303,6 +303,18 @@ def _run(server: str, tool: str, arguments: object, client: str | None = None,
                     None if status == "ok" else _first_text(result))
 
 
+def _served_digest(server: str, tool: str) -> str | None:
+    """The digest of the arguments the gateway last enumerated for ``tool``, which a
+    pin in the control plane is bound to, or None when there is none worth binding to.
+
+    None for a tool no enumeration named, and for an ``UNDIGESTIBLE`` schema, whose
+    digest stays put whatever changes inside it: a pin bound to that would widen with
+    nothing to stop it, where None only sends the call to a card."""
+    schema = surface.served_schema(server, tool)
+    digest = None if schema is None else discovery.schema_digest(schema)
+    return None if digest == discovery.UNDIGESTIBLE else digest
+
+
 def call(name: str, arguments: object, client: str | None) -> dict:
     """Decide and then run one tool call. The whole agent-facing path in one function.
 
@@ -338,7 +350,8 @@ def call(name: str, arguments: object, client: str | None) -> dict:
     try:
         answer = _ask_control("/tool/authorize",
                               {"server": server, "tool": tool,
-                               "args": arguments, "client": client})
+                               "args": arguments, "client": client,
+                               "schema_digest": _served_digest(server, tool)})
     except discovery.DiscoveryError as exc:
         # FAIL CLOSED, and loudly. A gateway that ran a call because it could not ask
         # would be a default-allow wearing an outage as a disguise.

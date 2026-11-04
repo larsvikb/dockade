@@ -256,19 +256,28 @@ class DecideToolTests(unittest.TestCase):
         self.assertEqual(cp.policy._decide_tool("mcp-github ", " get_me")[0], "allow")
 
 
-def _set_pins(pins):
+#: The digest of a tool's arguments the pins below are made under, and a call is made
+#: under unless a test says otherwise; and the digest of the same tool's arguments
+#: after an upgrade moved them.
+_SCHEMA = "5c" * 32
+_MOVED = "e1" * 32
+
+
+def _set_pins(pins, schema_digest=_SCHEMA):
     """Replace the tool_pins table with (server, tool, pins) tuples, or (server, tool,
     pins, seconds_from_now) for a timed pin, the offset relative as in ``_set_leases``.
     A dict is stored in its canonical form, as the writer will store it; a string is
-    stored verbatim, as a hand-edited row would be."""
+    stored verbatim, as a hand-edited row would be. Every pin is bound to
+    ``schema_digest``."""
     now = time.time()
     with cp.store._connect() as conn:
         conn.execute("DELETE FROM tool_pins")
         conn.executemany(
             "INSERT INTO tool_pins(server, tool, pins_json, approval_id, created_at, "
-            "granted_by, expires_at) VALUES (?,?,?, 'test', 0, 'test', ?)",
+            "granted_by, expires_at, schema_digest) "
+            "VALUES (?,?,?, 'test', 0, 'test', ?, ?)",
             [(server, tool, p if isinstance(p, str) else cp.policy._canonical_pins(p),
-              None if offset is None else now + offset)
+              None if offset is None else now + offset, schema_digest)
              for server, tool, p, offset in
              [(pin if len(pin) == 4 else (*pin, None)) for pin in pins]])
         conn.commit()
@@ -291,8 +300,9 @@ class PinnedAllowDecisionTests(unittest.TestCase):
         _set_pins([("mcp-github", "create_pull_request",
                     {"owner": "acme", "repo": "dockade"})])
 
-    def _decide(self, args, server="mcp-github", tool="create_pull_request"):
-        return cp.policy._decide_tool(server, tool, args)
+    def _decide(self, args, server="mcp-github", tool="create_pull_request",
+                schema_digest=_SCHEMA):
+        return cp.policy._decide_tool(server, tool, args, schema_digest)
 
     def test_a_call_carrying_the_pinned_values_is_allowed_and_names_the_pin(self):
         decision, reason = self._decide(_PR)
@@ -407,7 +417,7 @@ class PinCandidateTests(unittest.TestCase):
     """``_pin_candidates``: what a card may pin, derived from the call it is for."""
 
     def _candidates(self, args):
-        return cp.policy._pin_candidates(json.dumps(args))
+        return cp.policy._pin_candidates(json.dumps(args), _SCHEMA)
 
     def test_the_pinnable_fields_carry_the_values_a_pin_would_hold(self):
         c = self._candidates({**_PR, "draft": False, "reviewers": ["x"]})
@@ -448,7 +458,7 @@ class PinCandidateTests(unittest.TestCase):
     def test_a_call_with_nothing_pinnable_is_refused_in_words(self):
         for raw in ("[]", '"x"', "not json", "{}", '{"reviewers": ["x"]}'):
             with self.subTest(raw=raw):
-                c = cp.policy._pin_candidates(raw)
+                c = cp.policy._pin_candidates(raw, _SCHEMA)
                 self.assertEqual(c["fields"], [])
                 self.assertTrue(c["refused"])
 
@@ -462,7 +472,7 @@ class TimedPinDecisionTests(unittest.TestCase):
         _set_tool_rules([("mcp-github", "create_pull_request", "ask")])
 
     def _decide(self):
-        return cp.policy._decide_tool("mcp-github", "create_pull_request", _PR)
+        return cp.policy._decide_tool("mcp-github", "create_pull_request", _PR, _SCHEMA)
 
     def test_a_live_timed_pin_answers_and_names_its_remaining_time(self):
         _set_pins([("mcp-github", "create_pull_request", {"repo": "dockade"}, 7200)])
@@ -489,6 +499,68 @@ class TimedPinDecisionTests(unittest.TestCase):
         _set_pins([("mcp-github", "create_pull_request", {"repo": "dockade"}, 600),
                    ("mcp-github", "create_pull_request", {"owner": "acme"}, 7200)])
         self.assertIn("pinned: owner, 1h59m left", self._decide()[1])
+
+
+class SchemaBoundPinDecisionTests(unittest.TestCase):
+    """``_decide_tool`` with the digest of the tool's arguments: a pin answers only a
+    call made under the digest it was pinned under, so an upgrade that moves a
+    dispatcher's arguments sends its pinned calls to a card instead of widening."""
+
+    def setUp(self):
+        cp.store._init_db()
+        _set_tool_rules([("mcp-github", "issue_read", "ask")])
+        _set_pins([("mcp-github", "issue_read", {"method": "get"})])
+
+    def _decide(self, schema_digest, method="get"):
+        return cp.policy._decide_tool(
+            "mcp-github", "issue_read",
+            {"method": method, "owner": "acme", "repo": "dockade", "issue_number": 1},
+            schema_digest)
+
+    def test_an_equal_digest_answers(self):
+        self.assertEqual(self._decide(_SCHEMA)[0], "allow")
+
+    def test_a_pin_on_method_asks_once_the_enum_gains_a_value(self):
+        # The enum gaining `get_sub_issues` moves the digest; `get` is still `get`,
+        # but what else the call can now do was not what the pin was made under.
+        decision, reason = self._decide(_MOVED)
+        self.assertEqual(decision, "ask")
+        with cp.store._connect() as conn:
+            pin_id = conn.execute("SELECT id FROM tool_pins").fetchone()[0]
+        self.assertIn(f"pin {pin_id} on method matches the call's values but was "
+                      f"pinned under other arguments of the tool", reason)
+
+    def test_a_call_with_no_digest_asks(self):
+        decision, reason = self._decide(None)
+        self.assertEqual(decision, "ask")
+        self.assertIn("the gateway sent no digest of the tool's arguments", reason)
+
+    def test_a_row_with_no_digest_answers_nothing(self):
+        _set_pins([("mcp-github", "issue_read", {"method": "get"})],
+                  schema_digest=None)
+        self.assertEqual(self._decide(_SCHEMA)[0], "ask")
+        self.assertEqual(self._decide(None)[0], "ask")
+
+    def test_of_two_pins_on_the_same_values_the_one_under_the_calls_digest_answers(self):
+        # Two rows can meet one call only if their pin sets differ, as here.
+        with cp.store._connect() as conn:
+            conn.execute(
+                "INSERT INTO tool_pins(server, tool, pins_json, approval_id, "
+                "created_at, granted_by, schema_digest) VALUES ('mcp-github', "
+                "'issue_read', ?, 't', 0, 't', ?)",
+                (cp.policy._canonical_pins({"owner": "acme"}), _MOVED))
+            conn.commit()
+        self.assertIn("pinned: owner)", self._decide(_MOVED)[1])
+        self.assertIn("pinned: method)", self._decide(_SCHEMA)[1])
+
+    def test_a_pin_the_call_does_not_meet_is_not_named(self):
+        self.assertEqual(self._decide(_MOVED, method="list")[1],
+                         "'ask' by rule (issue_read on mcp-github)")
+
+    def test_a_card_with_no_digest_is_refused_a_pin(self):
+        c = cp.policy._pin_candidates(json.dumps({"method": "get"}), None)
+        self.assertEqual((c["fields"], c["unpinnable"]), ([], []))
+        self.assertIn("no digest of the tool's arguments", c["refused"])
 
 
 class GrantSecondsTests(unittest.TestCase):

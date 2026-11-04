@@ -45,7 +45,7 @@ LEGACY_CLIENT_CLASS = "sandbox"
 # The schema this code expects. Every entry in ``_STEPS`` below adds exactly one,
 # and a store records the version it is at (see ``_migrate``), so "what has already
 # run here" is a number to compare rather than a schema to interrogate.
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 
 def _connect() -> sqlite3.Connection:
@@ -278,6 +278,11 @@ _TOOL_PINS_DDL = """
         -- SQLite orders text above every number, so a text deadline would read as
         -- live in every query here.
         expires_at  REAL CHECK (expires_at IS NULL OR typeof(expires_at) = 'real'),
+        -- The digest of the tool's arguments the card was raised under
+        -- (`tool_approvals.schema_digest`). The pin answers only a call made under
+        -- the same one, and NULL answers nothing (policy._answering_pin). The last
+        -- column, where v12's ALTER puts it.
+        schema_digest TEXT,
         UNIQUE(server, tool, pins_json)
     )"""
 
@@ -453,6 +458,46 @@ def _step_11_rule_ids(conn: sqlite3.Connection) -> None:
               f"that are never reused", flush=True)
 
 
+def _step_12_schema_digest(conn: sqlite3.Connection) -> None:
+    """v12 — ``tool_pins`` and ``tool_approvals`` gain ``schema_digest``, and every
+    existing pin is dropped, each audited, as v8 dropped them.
+
+    A pin from before the column was made under no recorded arguments, and nothing can
+    bind it now: the digest of the first call to meet it may already be the widened
+    schema. Dropping it only sends its calls back to a card, where the operator pins
+    again (control-plane/DESIGN.md, "A timed pin is a column"). Deleted, not dropped
+    with its table, so the AUTOINCREMENT sequence keeps counting past the ids.
+
+    An asks row keeps NULL, which no pin can be made from.
+
+    Either table may be ABSENT (a store stamped before it existed), and a table may
+    already HAVE the column: v8 recreates ``tool_pins`` from ``_TOOL_PINS_DDL``, so a
+    store below v8 arrives here with the column and no pin made without it."""
+    pins = _columns(conn, "tool_pins")
+    if pins and "schema_digest" not in pins:
+        now = time.time()
+        dropped = conn.execute(
+            "SELECT id, server, tool, approval_id FROM tool_pins").fetchall()
+        for pin in dropped:
+            conn.execute(
+                "INSERT INTO audit(ts, kind, stage, server, tool, approval_id, reason) "
+                "VALUES (?, 'revoke', 'tool-policy', ?, ?, ?, ?)",
+                (now, pin["server"], pin["tool"], pin["approval_id"],
+                 f"pin {pin['id']} dropped by schema v12, which binds a pin to the "
+                 f"tool's arguments it was made under and has no record of this one's; "
+                 f"{pin['tool']} on {pin['server']} raises a card again until it is "
+                 f"pinned anew"))
+        conn.execute("DELETE FROM tool_pins")
+        conn.execute("ALTER TABLE tool_pins ADD COLUMN schema_digest TEXT")
+        print(f"control-plane: dropped {len(dropped)} pin(s), each audited as revoked, "
+              f"and bound tool_pins to the tool's arguments", flush=True)
+    asks = _columns(conn, "tool_approvals")
+    if asks and "schema_digest" not in asks:
+        conn.execute("ALTER TABLE tool_approvals ADD COLUMN schema_digest TEXT")
+        print("control-plane: added schema_digest to tool_approvals (existing asks "
+              "keep NULL, and no pin can be made from one)", flush=True)
+
+
 # Ordered, and the order is the only thing that decides what runs: a step is applied
 # when its version exceeds the store's, so steps must be APPEND-ONLY and never
 # renumbered, reordered or edited once shipped — a store in the field has already run
@@ -470,6 +515,7 @@ _STEPS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = (
     (9, "lease ids: leases rebuilt", _step_9_lease_ids),
     (10, "per-server MCP endpoint", _step_10_server_endpoint),
     (11, "rule ids: rules and tool_rules rebuilt", _step_11_rule_ids),
+    (12, "pins bound to the tool's arguments", _step_12_schema_digest),
 )
 
 
@@ -709,7 +755,12 @@ def _init_db() -> None:
                 -- rather than at the human's click. It is what makes an approval
                 -- single-use: the claim is a conditional UPDATE, so two resumptions
                 -- of one approved ask cannot both run the side effect.
-                claimed_at  REAL
+                claimed_at  REAL,
+                -- The digest of the tool's arguments the gateway served when the call
+                -- was made (discovery.schema_digest), or NULL when it had none. A pin
+                -- made from this card is bound to it, and an identical retry joins
+                -- only under the same one.
+                schema_digest TEXT
             )""")
         conn.execute("CREATE INDEX IF NOT EXISTS tool_approvals_status "
                      "ON tool_approvals(status)")

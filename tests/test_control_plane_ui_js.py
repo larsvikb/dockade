@@ -5079,6 +5079,113 @@ class PinPanelSourceTests(unittest.TestCase):
         self.assertEqual(parts.index("entry.confirm"), parts.index("actions") + 1)
 
 
+_SCHEMA_PIN_PROBE = r"""
+import { pathToFileURL } from "node:url";
+const load = name => import(pathToFileURL(`${process.env.DOCKADE_UI_DIR}/${name}`).href);
+const h = await load("holds.js");
+const m = await load("mcp.js");
+const options = { fields: [{ field: "method", value: '"get"' },
+                           { field: "owner", value: '"acme"' }],
+                  unpinnable: [], refused: null,
+                  stale: [{ id: 5, fields: ["method"], refused: null }] };
+const refused = { ...options,
+                  stale: [{ id: 5, fields: ["method"],
+                            refused: "pin 5 was pinned again from a card raised after "
+                                   + "this one" }] };
+const p = (o, chosen) => h.pinPreview(o, chosen, "issue_read", "mcp-github", 14400);
+const pin = fields => ({ server: "mcp-github", tool: "issue_read",
+                         pins: { method: "get" }, rule: "ask", decides: true,
+                         bound: true, schema_moved: false, ...fields });
+console.log(JSON.stringify({
+  rebound: h.toolOutcomeMessage({ outcome: "allow",
+                                  pin: { id: 5, fields: ["method"], created: false,
+                                         extended: false, rebound: true,
+                                         expires_at: null } }),
+  rebound_timed: h.toolOutcomeMessage({ outcome: "allow",
+                                        pin: { id: 5, fields: ["method"],
+                                               created: false, extended: false,
+                                               rebound: true,
+                                               expires_at: 1786055405 } }),
+  none: p(options, []),
+  rebinds: p(options, ["method"]),
+  wider: p(options, ["method", "owner"]),
+  refused: p(refused, ["method"]),
+  refused_other: p(refused, ["owner"]),
+  no_stale: p({ ...options, stale: undefined }, []),
+  moved: m.pinState(pin({ schema_moved: true })),
+  live: m.pinState(pin({})),
+  unbound: m.pinState(pin({ decides: false, bound: false })),
+  older_backend: m.pinState(pin({ decides: false, bound: undefined, rule: "deny" })),
+}));
+"""
+
+
+@unittest.skipIf(not _NODE and not _STRICT,
+                 "node is not installed — skipping the schema-bound pin UI tests")
+class SchemaBoundPinUiTests(unittest.TestCase):
+    """What the card and the pins table say about a pin bound to the tool's arguments:
+    a pin the call met under other arguments, a rebind, and a schema that moved."""
+
+    probe: dict
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if not _NODE:
+            raise AssertionError("node is not installed and DOCKADE_REQUIRE_TOOLS is set")
+        proc = subprocess.run(  # noqa: S603 (absolute path, fixed args)
+            [_NODE, "--input-type=module", "-e", _SCHEMA_PIN_PROBE],
+            env={**os.environ, "DOCKADE_UI_DIR": str(_served_dir()),
+                 "TZ": "Europe/Stockholm"},
+            capture_output=True, text=True, timeout=60, check=False)
+        if proc.returncode != 0:
+            raise AssertionError(f"node could not run the pin probe:\n{proc.stderr}")
+        cls.probe = json.loads(proc.stdout)
+
+    def test_a_rebind_says_so_and_how_long_it_now_lasts(self):
+        self.assertEqual(self.probe["rebound"]["text"],
+                         "✓ allowed · pin rebound to the tool's current arguments, for "
+                         "good on method (pin 5) · runs when the agent returns for it")
+        self.assertIn("pin rebound to the tool's current arguments, on method until ",
+                      self.probe["rebound_timed"]["text"])
+
+    def test_the_panel_names_a_pin_the_call_met_under_other_arguments(self):
+        self.assertTrue(self.probe["none"]["text"].startswith(
+            "Pin 5 on method matches this call but was made under other arguments of "
+            "issue_read, so it did not answer it. Tick the fields"))
+        self.assertEqual(self.probe["no_stale"]["text"],
+                         "Tick the fields a later call must match exactly.")
+
+    def test_ticking_exactly_its_fields_says_the_pin_is_rebound(self):
+        self.assertTrue(self.probe["rebinds"]["ok"])
+        self.assertIn("This rebinds pin 5 to the arguments this call was made under, "
+                      "for as long as the button you press says, even if it was pinned "
+                      "for good.", self.probe["rebinds"]["text"])
+        self.assertTrue(self.probe["wider"]["ok"])
+        self.assertNotIn("rebinds", self.probe["wider"]["text"])
+
+    def test_a_rebind_the_backend_refuses_is_not_offered(self):
+        refused = self.probe["refused"]
+        self.assertFalse(refused["ok"])
+        self.assertEqual(refused["fields"], [])
+        self.assertEqual(refused["text"], "Cannot pin these: pin 5 was pinned again "
+                                          "from a card raised after this one.")
+        self.assertTrue(self.probe["refused_other"]["ok"])
+
+    def test_the_pins_table_says_a_pin_whose_schema_moved_gets_a_card(self):
+        moved = self.probe["moved"]
+        self.assertFalse(moved["live"])
+        self.assertIn("the arguments of issue_read changed after this was pinned",
+                      moved["text"])
+        self.assertTrue(self.probe["live"]["live"])
+
+    def test_a_pin_bound_to_no_arguments_says_so(self):
+        self.assertFalse(self.probe["unbound"]["live"])
+        self.assertIn("no record of the arguments of issue_read",
+                      self.probe["unbound"]["text"])
+        # A backend without `bound` reads as before.
+        self.assertIn("the rule denies", self.probe["older_backend"]["text"])
+
+
 class PayloadHazardTests(unittest.TestCase):
     """A payload the eye cannot read correctly is flagged; one it can is only noted.
 

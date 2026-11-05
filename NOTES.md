@@ -985,6 +985,22 @@ line`) before any of this.
 Measured by installing the same version and parsing synthetic request heads through
 `mitmproxy.net.http.http1.read_request_head`, not by reading the changelog.
 
+## mitmproxy decodes a raw path byte to a lone surrogate
+
+Measured against `mitmproxy 12.2.3`, the version pinned in `proxies/egress/Dockerfile`,
+by parsing synthetic request heads through `read_request_head` in a venv.
+
+An origin-form request line with a raw `0xff` in its path, `GET /a<0xff>b HTTP/1.1`,
+parses. That is the form a request takes inside an intercepted CONNECT tunnel, so the
+agent can send it to any host it may reach. The path is decoded with
+`surrogateescape`, so `path` and `pretty_url` carry the lone surrogate U+DCFF where the
+byte was. `json.dumps` writes it as an ASCII escape, and `json.loads` turns the escape
+back into the surrogate, which UTF-8, and so SQLite, cannot encode. The proxy sends
+`pretty_url` to `/authorize` as `url` and writes it to its audit line.
+
+The absolute form, `GET http://example.com/a<0xff>b HTTP/1.1`, is refused at parse
+with `ValueError: Bad HTTP request line`.
+
 ## mitmproxy binds an IP-literal listener before any script loads, and swallows an exception from `load`
 
 Measured against `mitmproxy 12.2.3`, the version pinned in `proxies/egress/Dockerfile`,

@@ -77,7 +77,13 @@ def _answer(req: AuthorizeRequest) -> AuthorizeResponse:
     # rows, the approvals row, and through that row the rule a persist writes. So the
     # class that DECIDED the request is the one recorded, by construction.
     client_class = policy._client_class(req.client)
-    decision, reason = policy._decide(req.host, client_class)
+    # Before anything reads a field, and so before a hold slot is reserved: a field
+    # SQLite cannot bind would 500 the first query that took it, with no row written.
+    if store._unencodable(req.host, req.proto, req.client, req.method, req.url,
+                          req.stage):
+        decision, reason = "deny", store.UNENCODABLE
+    else:
+        decision, reason = policy._decide(req.host, client_class)
 
     if decision in ("allow", "deny"):
         store._audit(decision, stage=req.stage, host=req.host, port=req.port,

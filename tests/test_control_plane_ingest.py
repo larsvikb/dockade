@@ -252,6 +252,12 @@ class RowMappingTests(IngestTestCase):
         self.assertEqual(len(f["host"]), cp.store.DRAIN_MAX_FIELD)
         self.assertEqual(len(f["url"]), cp.store.DRAIN_MAX_FIELD)
 
+    def test_an_escaped_field_is_truncated_after_the_escape(self):
+        # Truncated first, a field of surrogates would be stored at six times the cap.
+        n = cp.store.DRAIN_MAX_FIELD
+        f = self._fields(_line(url=chr(0xDCFF) * n).encode())
+        self.assertEqual(f["url"], ((chr(92) + "udcff") * n)[:n])
+
     def test_malformed_lines_are_dropped_not_guessed_at(self):
         for raw in (b"{not json", b"[]", b'"a string"', b"null", b"42",
                     b"\xff\xfe\x00binary"):
@@ -460,6 +466,18 @@ class DrainTests(IngestTestCase):
             self.assertEqual(self.cursor()["offset"], os.path.getsize(self.path))
         finally:
             cp.ingest.DRAIN_BLOCK = 1 << 20
+
+    def test_a_lone_surrogate_is_stored_escaped_and_the_stream_moves_on(self):
+        # The proxy's url for a raw path byte carries one (NOTES.md, "mitmproxy
+        # decodes a raw path byte to a lone surrogate"). json.loads restores it from
+        # the escape, and a row SQLite cannot bind used to stop the stream there.
+        self.write(_line(host="a.example", url="https://a.example/" + chr(0xDCFF))
+                   + _line(host="b.example"))
+        self.assertEqual(cp.ingest._drain(self.stream), os.path.getsize(self.path))
+        self.assertEqual([(r["host"], r["url"]) for r in self.rows()],
+                         [("a.example", "https://a.example/" + chr(92) + "udcff"),
+                          ("b.example", None)])
+        self.assertEqual(self.cursor()["offset"], os.path.getsize(self.path))
 
 
 class ToolOutcomeRowTests(unittest.TestCase):
@@ -735,6 +753,14 @@ class ToolOutcomeDrainTests(IngestTestCase):
         self.assertIn("outcome (ingested) tool-error mcp-github__get_me", printed)
         self.assertIn("approval_id=" + "b" * 32, printed)
         self.assertIn(":: 403", printed)
+
+    def test_a_lone_surrogate_is_stored_escaped_and_the_stream_moves_on(self):
+        # A server's error text can echo an argument the agent sent.
+        self.write({"status": "tool-error", "reason": "bad " + chr(0xD800)},
+                   {"status": "ok"})
+        self.assertEqual(cp.ingest._drain(self.tool), os.path.getsize(self.tool_path))
+        self.assertEqual([(r["status"], r["reason"]) for r in self.rows()],
+                         [("tool-error", "bad " + chr(92) + "ud800"), ("ok", None)])
 
 
 class StalledStreamTests(IngestTestCase):

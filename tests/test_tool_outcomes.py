@@ -162,6 +162,23 @@ class LiveFeedTests(OutcomeTestCase):
             self.outcomes.record("tool-error", "mcp-github", "get_me", reason=self.FORGED)
         self.assertEqual(self.lines()[0]["reason"], self.FORGED)
 
+    def test_a_lone_surrogate_is_shown_escaped_and_raises_nothing(self):
+        # A server can echo one back from an argument the agent sent, and this print
+        # is after the call has run. A strict UTF-8 stdout, the stricter harness: the
+        # container's python opens stdout with surrogateescape, which writes U+DC80 to
+        # U+DCFF as raw bytes and raises on every other surrogate. A high and a low
+        # one, so neither half of the range can go unescaped.
+        reason = "bad " + chr(0xD800) + " and " + chr(0xDC80)
+        raw = io.BytesIO()
+        out = io.TextIOWrapper(raw, encoding="utf-8", errors="strict")
+        with mock.patch("sys.stdout", out):
+            self.outcomes.record("tool-error", "mcp-github", "get_me", reason=reason)
+        out.flush()
+        self.assertEqual(raw.getvalue().decode(),
+                         "OUTCOME tool-error mcp-github__get_me :: bad "
+                         + chr(92) + "ud800 and " + chr(92) + "udc80\n")
+        self.assertEqual(self.lines()[0]["reason"], reason)
+
 
 class FieldCapTests(OutcomeTestCase):
     env: ClassVar[dict[str, str]] = {"GATEWAY_AUDIT_FIELD_MAX": "32"}

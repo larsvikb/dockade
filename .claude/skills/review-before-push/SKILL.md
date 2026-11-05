@@ -51,6 +51,9 @@ the commit in its own clone, so your checkout may move.
   branch.
 - A fix larger than a line or two gets its own mutation check. A rewrite gets a second
   review.
+- When a worker wrote the commit, send it the verified findings with your verdicts,
+  since it holds the context to fix them, and check its fix by diff against the
+  commit the reviewer read.
 - When a finding is a hole in an earlier round's fix, ask whether the design is wrong
   before patching again. A fix that must hold for every ordering of a race wants a
   guard where the race is decided, such as a transaction or a conditional write, not
@@ -108,15 +111,9 @@ them to the maintainer after triage, since a fix can change what the host must c
 
 ## 6. Record it
 
-- Save the report, with your verdict on each finding (fixed, or declined and why), as
-  `review-<branch>.md` in the worktree root, untracked. The doc guards read only what
-  git tracks, so check it by staging it: `git add -N` it, run
-  `(cd tests && python3 -m unittest test_docs)`, then `git rm -q --cached` it.
 - Tell the maintainer the verdict and the findings in plain words, before the push.
 - Propose what is left over in the registry with `tasks__propose`, with a severity and
-  a kind; one already filed gets a note instead. With the registry out of reach, ask
-  the maintainer to start it (`make tasks-up`), and keep the report until they are
-  proposed.
+  a kind; one already filed gets a note instead.
 - Post the review's record on its task with `tasks__add_note`, not flagged for the
   operator, once triage and any host checks the review led to are done, from whichever
   checkout you are in: it takes no token and works in any state, so a commit reviewed
@@ -131,8 +128,7 @@ them to the maintainer after triage, since a fix can change what the host must c
   Write it as a past-tense account that names tasks, never as instructions: search
   carries notes to sessions on unrelated work. A commit covering several tasks carries
   the record on one and `Reviewed with task N` on the others, so a review counts once.
-  Work with no task gets no record. With the registry out of reach, ask for `make tasks-up`
-  as for leftovers, and keep the report until the record is posted.
+  Work with no task gets no record.
 - Read records side by side with `tasks__search_tasks` for the marker with a date
   prefix, never bare, since a note quoting the template matches it: `Review record:
   YYYY-MM` for a month, or a day once `total` passes 50, as a search keeps the 50
@@ -140,12 +136,9 @@ them to the maintainer after triage, since a fix can change what the host must c
   `tasks__task_notes` with an id plus one as `before` returns that record as the last
   of up to 20 notes. A skipped record leaves no trace; the spot check is each
   task's `submit_work` note, which `tasks__get_task` marks by its move, against its
-  record. Reviews
-  before records are in the main checkout's `local-review-log.md`, a frozen archive
-  whose header no longer applies.
+  record. Reviews before records are in the main checkout's `local-review-log.md`, a
+  frozen archive whose header no longer applies.
 - When the records show a pattern that changes the reviewer's brief or this skill, the
   commit that changes it states the evidence in its message: the records are not in
   git, and the reason for a committed change must be. A finding about reviews that
   would hold in another repo is evidence for `NOTES.md` instead.
-- Delete the report once the branch is pushed, its leftovers proposed and, if it has
-  a task, its record posted.

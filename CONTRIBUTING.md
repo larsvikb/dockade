@@ -77,14 +77,19 @@ deliberately, watch the suite go red, restore. Several tests exist *because* tha
 found a gap, including a payload that changed shape while the whole suite stayed green
 and a dismiss button that could silently send the wrong number.
 
+Breaking the whole behaviour is the coarse check. The finer one changes a single thing
+the change adds — a constant, an early exit, an entry in a list — and catches tests that
+only bound the output: a substring, a length ceiling, or a case that never reaches
+the line. Where the output is fixed, assert all of it.
+
 Three things learned the hard way if you script it. Restore from a **copy of the working
 tree**, never `git checkout --` — that reverts to `HEAD` and eats uncommitted work.
 Confirm each mutation actually applied; one that silently fails to match its
 pattern reports a reassuring "caught" while testing nothing. And **delete
 `__pycache__` before the first mutant and run each with `PYTHONDONTWRITEBYTECODE=1`**
 (unlike `-B`, it reaches the child interpreters the suite starts), since a cached
-`.pyc` can run in place of the mutant: NOTES.md, "A cached `.pyc` can stand in for a mutant, and `-B` alone does not
-stop it".
+`.pyc` can run in place of the mutant: NOTES.md, "A cached `.pyc` can stand in for a
+mutant, and `-B` alone does not stop it".
 
 Behaviour that touches the DOM — `start()` in `control-plane-ui/app.js`, and the DOM
 half of a surface's own module, which `start()` mounts — runs only in a browser

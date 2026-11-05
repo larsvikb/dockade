@@ -102,6 +102,3 @@ Your final message is the report; write no report file.
    Mark judgement calls.
 3. **Outside this diff:** defects found beyond the commit.
 4. **Suggestions:** improvements that are not defects.
-
-The author saves the report in the repo and checks it with `tests/test_docs.py`, so
-keep backticked paths real, with `:NN` outside the backticks.

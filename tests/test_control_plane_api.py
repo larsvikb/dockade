@@ -526,6 +526,130 @@ class DuplicateHoldTests(_CPTestCase):
         self.assertEqual([r[0] for r in rows], ["denied", "expired"])
 
 
+class HoldAuditApprovalIdTests(_CPTestCase):
+    """An egress hold's hold row and final row carry the card's approval id, so the
+    record view's search by id (``audit.EVENT_SEARCH``) finds the hold and how it
+    ended. Rows written before any card exists carry none."""
+
+    audits = True
+
+    def _hold_many(self, n, host, timeout):
+        """n concurrent authorize() calls for one (client, host): one card. Returns
+        the threads and a results list that fills in as each returns."""
+        results = [None] * n
+
+        def worker(i):
+            results[i] = cp.api_authorize.authorize(_auth_req(host, client=CLASS_IP))
+
+        saved = cp.holds.HOLD_TIMEOUT
+        cp.holds.HOLD_TIMEOUT = timeout
+        self.addCleanup(setattr, cp.holds, "HOLD_TIMEOUT", saved)
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        return threads, results
+
+    def _card(self, requests):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            pending = cp.holds._list_pending()
+            if len(pending) == 1 and pending[0]["requests"] == requests:
+                return pending[0]["id"]
+            time.sleep(0.01)
+        raise AssertionError(f"never saw one card with {requests} waiters")
+
+    def _rows(self, host):
+        with cp.store._connect() as conn:
+            return [tuple(r) for r in conn.execute(
+                "SELECT kind, approval_id FROM audit WHERE host=? ORDER BY id",
+                (host,)).fetchall()]
+
+    def _resolved(self, action, final):
+        threads, _ = self._hold_many(1, "held.example", 10)
+        card = self._card(1)
+        _resolve(card, action)
+        for t in threads:
+            t.join(5)
+        self.assertEqual(self._rows("held.example"), [("hold", card), (final, card)])
+
+    def test_an_allowed_hold_names_its_card_on_both_rows(self):
+        self._resolved("allow_once", "allow")
+
+    def test_a_denied_hold_names_its_card_on_both_rows(self):
+        self._resolved("deny_once", "deny")
+
+    def test_an_expired_hold_names_its_card_on_both_rows(self):
+        threads, results = self._hold_many(1, "held.example", 0.05)
+        for t in threads:
+            t.join(5)
+        self.assertIn("timeout", results[0].reason)
+        with cp.store._connect() as conn:
+            (card,), = conn.execute("SELECT id FROM approvals").fetchall()
+        self.assertEqual(self._rows("held.example"), [("hold", card), ("deny", card)])
+
+    def test_a_joiner_names_the_card_it_joined(self):
+        # Its reason names the card, and so does the column a search reads.
+        threads, _ = self._hold_many(2, "held.example", 10)
+        card = self._card(2)
+        _resolve(card, "deny_once")
+        for t in threads:
+            t.join(5)
+        self.assertEqual(sorted(self._rows("held.example")),
+                         sorted([("hold", card)] * 2 + [("deny", card)] * 2))
+
+    def test_a_decision_before_any_hold_names_no_card(self):
+        # No card exists for these, so there is no id to carry.
+        _set_rules([("allowed.example", "allow"), ("blocked.example", "block")])
+        cp.api_authorize.authorize(_auth_req("allowed.example"))
+        cp.api_authorize.authorize(_auth_req("blocked.example"))
+        saved = cp.holds.MAX_PENDING
+        cp.holds.MAX_PENDING = 0
+        try:
+            resp = cp.api_authorize.authorize(_auth_req("capped.example"))
+        finally:
+            cp.holds.MAX_PENDING = saved
+        self.assertIn("hold capacity exceeded", resp.reason)
+        self.assertEqual(self._rows("allowed.example"), [("allow", None)])
+        self.assertEqual(self._rows("blocked.example"), [("deny", None)])
+        self.assertEqual(self._rows("capped.example"), [("deny", None)])
+
+    def test_searching_a_card_id_finds_its_hold_and_how_it_ended(self):
+        threads, _ = self._hold_many(1, "held.example", 10)
+        card = self._card(1)
+        _resolve(card, "allow_once")
+        for t in threads:
+            t.join(5)
+        rows = cp.api_views.api_audit_events(q=card)["rows"]
+        self.assertEqual(sorted((r["kind"], r["host"], r["approval_id"]) for r in rows),
+                         [("allow", "held.example", card),
+                          ("hold", "held.example", card)])
+
+    def test_the_glance_folds_egress_holds_across_cards_and_splits_tool_asks(self):
+        """Five expired holds on one host are five cards and one hold line plus one
+        deny line in the glance: the id is for search, and a retrying agent is
+        repetition. Two tool asks that look alike stay two lines, one per grant."""
+        for _ in range(5):
+            threads, _ = self._hold_many(1, "held.example", 0.05)
+            for t in threads:
+                t.join(5)
+        with cp.store._connect() as conn:
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(DISTINCT approval_id) FROM audit "
+                "WHERE host='held.example'").fetchone()[0], 5)
+            for card in ("a" * 32, "b" * 32):
+                conn.execute(
+                    "INSERT INTO audit(ts, kind, stage, client, server, tool, "
+                    "approval_id) VALUES (?, 'hold', 'tool-call', ?, 'mcp-github', "
+                    "'create_pull_request', ?)", (time.time(), CLASS_IP, card))
+            conn.commit()
+            rows = cp.audit.grouped(conn, 50, cp.audit.parse(), 500)
+        self.assertEqual(sorted((r["kind"], r["n"]) for r in rows
+                                if r["host"] == "held.example"),
+                         [("deny", 5), ("hold", 5)])
+        self.assertEqual([r["n"] for r in rows if r["tool"] == "create_pull_request"],
+                         [1, 1])
+
+
 class ResolveTests(_CPTestCase):
     def test_bad_action_is_rejected(self):
         resp = _resolve("whatever", "nonsense")
@@ -2087,10 +2211,11 @@ class AuditRecordTests(_CPTestCase):
             set(row),
             {"id", "ts", "kind", "stage", "host", "port", "proto", "client",
              "client_class", "actor", "method", "url", "reason", "fail_closed",
-             # The tool columns. Egress rows carry NULL in all three — the identity of
-             # an egress decision is host/port/url — and they are here because this is
-             # the view that answers "which one was it" for a TOOL row, whose identity
-             # is in none of the columns above.
+             # The tool columns. Egress rows carry NULL in `server` and `tool` — the
+             # identity of an egress decision is host/port/url — and `approval_id` only
+             # on a held request's rows. They are here because this is the view that
+             # answers "which one was it" for a TOOL row, whose identity is in none of
+             # the columns above.
              "server", "tool", "approval_id",
              # And how it ended, for the tool rows the gateway's stream fills.
              "status"})

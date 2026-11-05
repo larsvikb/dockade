@@ -124,7 +124,7 @@ def _answer(req: AuthorizeRequest) -> AuthorizeResponse:
         # decision.
         store._audit("hold", stage=req.stage, host=req.host, port=req.port,
                      proto=req.proto, client=req.client, client_class=client_class,
-                     method=req.method, url=req.url,
+                     method=req.method, url=req.url, approval_id=approval_id,
                      reason=(f"joined hold {approval_id} — duplicate of a request "
                              "already awaiting approval"
                              if slot.joined else "held for approval"))
@@ -170,5 +170,6 @@ def _answer(req: AuthorizeRequest) -> AuthorizeResponse:
         final, why = "deny", f"human rejection ({scope})"
     store._audit(final, stage=req.stage, host=req.host, port=req.port,
                  proto=req.proto, client=req.client, client_class=client_class,
-                 actor=resolved_by, method=req.method, url=req.url, reason=why)
+                 actor=resolved_by, method=req.method, url=req.url,
+                 approval_id=approval_id, reason=why)
     return AuthorizeResponse(decision=final, reason=why)

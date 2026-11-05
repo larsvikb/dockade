@@ -18,7 +18,7 @@ from unittest import mock
 from _loader import ROOT, load_task_registry_backup
 from test_task_registry_plans import DECISION, MULTI
 from test_task_registry_tasks import V4_TABLES, as_version
-from test_topology import COMPOSE, _block, _mount_spellings, _scalar, _service
+from test_topology import _mount_spellings, _scalar, _service, _volume_name
 
 reg = load_task_registry_backup()
 backup, export, op, agent = reg.backup, reg.export, reg.operator_moves, reg.agent_moves
@@ -736,10 +736,7 @@ class MakefileTargetsAgreeTests(unittest.TestCase):
         self.assertEqual(_scalar(_service("tasks"), "image"), self.variable("TASKS_IMAGE"))
 
     def test_the_volume_is_the_one_compose_names(self):
-        names = [line.split(":", 1)[1].strip()
-                 for line in _block(_block(COMPOSE, "volumes", 0), "tasks-state", 2)
-                 if line.strip().startswith("name:")]
-        self.assertEqual(names, [self.variable("TASKS_VOLUME")])
+        self.assertEqual(_volume_name("tasks-state"), self.variable("TASKS_VOLUME"))
 
     def test_it_is_mounted_where_the_service_mounts_it(self):
         [mount] = [m for m in _mount_spellings("tasks") if m.startswith("tasks-state:")]

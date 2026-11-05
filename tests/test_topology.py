@@ -12,24 +12,27 @@ under, and compose cannot see which routes an app serves. So the coupling has no
 compiler between its ends and a test stands in, the same arrangement as the
 relay-allowlist guard in ``test_control_plane_ui_js.py``.
 
-Text-parsed rather than YAML-parsed on purpose: the unit suite installs no
-packages (see ``tests/_loader.py``), and PyYAML is not in the stdlib. The reader
-below, ``_block``, understands only nesting by indentation, which is all these
-assertions need — it never has to interpret a scalar, so the folded ``entrypoint``
-blocks elsewhere in the file cannot confuse it. Of the readers that take a scalar as a
-path, ``_host_sources`` refuses a value it cannot follow rather than passing it;
-``_mount_spellings`` and ``_long_mount`` read a value as written, one layer of quotes off.
-``ComposeFormTests`` holds both files to the subset of YAML where reading by
-indentation and Compose's reading agree, and names the readers shown to take a key at
-their own depth; the others are not yet anchored (task 240).
+Read as text rather than through PyYAML, on purpose: the unit suite installs no
+packages (see ``tests/_loader.py``), and PyYAML is not in the stdlib. ``ComposeFormTests``
+holds both files to a subset of YAML, and ``_compose_tree`` reads that subset into a
+tree, refusing anything outside it; ``ComposeTreeParityTests`` holds the tree equal to
+PyYAML's wherever PyYAML is installed. Every rule reads the tree, so a key is read at
+its own depth. A field Compose takes in more than one shape is read in each, or its
+reader raises ``ComposeShapeError`` rather than read it as absent. Of the readers that
+take a scalar as a path, ``_host_sources`` refuses a value it cannot follow rather than
+passing it; ``_mount_spellings`` and ``_long_mount`` read a value as written, a
+``${VAR:-d}`` included.
 """
 from __future__ import annotations
 
 import ast
+import functools
 import ipaddress
+import json
 import os
 import posixpath
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -45,17 +48,13 @@ ROOT = Path(__file__).resolve().parents[1]
 #: The files, in the Makefile's -f order. ComposeFormTests pins the Makefile to this
 #: tuple, so the reader and what runs cannot name different files.
 COMPOSE_FILES = ("docker-compose.yml", "mcp-servers.yml")
-# BOTH compose files, concatenated, because the Makefile's COMPOSE merges them with
-# -f and the merged model is what actually runs. docker-compose.yml owns the
-# topology; mcp-servers.yml owns the MCP server catalogue. Reading only the first
-# would leave every placement rule below asserted against the file where servers are
-# NOT declared — blind in exactly the place new services get added.
-COMPOSE = [line
-           for name in COMPOSE_FILES
-           for line in (ROOT / name).read_text().splitlines()]
-#: The catalogue alone, so the MCP placement rules below can be asserted over every
-#: server it declares rather than over a list someone has to remember to extend.
-MCP_COMPOSE = (ROOT / "mcp-servers.yml").read_text().splitlines()
+#: BOTH compose files' texts, by name, because the Makefile's COMPOSE merges them with
+#: -f and the merged model is what actually runs. docker-compose.yml owns the
+#: topology; mcp-servers.yml owns the MCP server catalogue. Reading only the first
+#: would leave every placement rule below asserted against the file where servers are
+#: NOT declared — blind in exactly the place new services get added. Every reader
+#: builds its tree from here, so a mutant harness patches this one mapping.
+COMPOSE_TEXTS = {name: (ROOT / name).read_text() for name in COMPOSE_FILES}
 ADDON = (ROOT / "proxies" / "egress" / "addon.py").read_text()
 HOLDS = (ROOT / "control-plane" / "holds.py").read_text()
 BOUNDARY = (ROOT / "sandbox-common" / "boundary-check.sh").read_text()
@@ -71,65 +70,308 @@ MANAGE_PORT = 8090
 TOOL_PORT = 8092
 
 
-def _block(lines: list[str], key: str, indent: int) -> list[str]:
-    """The lines nested under ``key`` at ``indent`` spaces, exclusive of the key.
+#: The top-level keys each compose file may declare, each once. A ``networks:`` in
+#: mcp-servers.yml would be merged over docker-compose.yml's and read by no rule; an
+#: ``x-`` key exists to hold an anchor.
+_TOP_LEVEL_KEYS = {"docker-compose.yml": ("name", "networks", "volumes", "services"),
+                   "mcp-servers.yml": ("services",)}
+_KEY_LINE = re.compile(r"(?P<key>[A-Za-z0-9_.-]+):(?: +(?P<value>.*))?")
+_QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"' r"|'(?:[^']|'')*'")
+_BLOCK_HEADER = re.compile(r"[|>]-?")
+_QUOTED_LIST = re.compile(r'\[ *"[^"\\]*"(?: *, *"[^"\\]*")* *\]')
+_TAG_ANCHOR_ALIAS = "a tag, anchor or alias"
+_NOT_A_KEY_LINE = "not a plain `key:` line"
 
-    Ends at the next line indented at or below ``indent`` that is not blank and
-    not a comment — so a commented-out sibling cannot truncate a block early.
-    """
-    want = " " * indent + key + ":"
+
+def _value_form(value: str, key: str | None) -> tuple[str | None, bool]:
+    """What is wrong with a key's or an item's value, if anything, and whether it
+    opens a block scalar."""
+    v = value.strip()
+    if v[0] in "!&*":
+        return _TAG_ANCHOR_ALIAS, False
+    if v[0] == "#":
+        return "a comment where a value belongs", False
+    if v[0] in "|>":
+        header, _, rest = v.partition(" ")
+        if not _BLOCK_HEADER.fullmatch(header) or rest.strip()[:1] not in ("", "#"):
+            return "a block scalar header", False
+        return None, True
+    if v[0] in "[{":
+        # mcp-github's `command:`, which `_walk` reads as a list.
+        if key in ("command", "entrypoint") and _QUOTED_LIST.fullmatch(v):
+            return None, False
+        return "a flow collection", False
+    if v[0] in "\"'":
+        m = _QUOTED.match(v)
+        if not m:
+            return "a quoted scalar not closed on its line", False
+        if "\\" in m.group(0) and v[0] == '"':
+            return "a backslash escape in a double-quoted scalar", False
+        rest = v[m.end():]
+        if rest and not re.fullmatch(r" +#.*", rest):
+            return "text after a quoted scalar", False
+        return None, False
+    if (v[0] in "-?:" and v[1:2] in ("", " ")) or v[0] in ",]}%@`":
+        return "a value starting with an indicator", False
+    plain = v.split(" #", 1)[0].rstrip()
+    if ": " in plain or plain.endswith(":"):
+        return "a mapping inside a plain scalar", False
+    return None, False
+
+
+def _block_scalar_allowed(key: str | None, parent: str | None) -> bool:
+    """Where a ``|``/``>`` block may stand: where the files have one today, as every
+    form here is (ComposeFormTests says how one widens)."""
+    return key in ("command", "entrypoint") or (key, parent) == ("test", "healthcheck")
+
+
+_BLOCK_SCALAR_ELSEWHERE = "a block scalar outside command, entrypoint or healthcheck test"
+_BLANK_IN_BLOCK_SCALAR = "a blank line inside a block scalar"
+_FOLDED_DEEPER = "a folded block scalar line deeper than its first"
+_KEY_TWICE = "a key twice in one mapping"
+
+
+class ComposeFormError(Exception):
+    """A compose file outside the form ``_compose_tree`` reads. Not an AssertionError,
+    so no handler that reads one as "the rule fails" or "absent" can swallow it."""
+
+
+class _BlockScalar:
+    """A ``|``/``>`` block being read: where it goes, and its lines so far."""
+
+    def __init__(self, parent: int, header: str, put: Callable[[str], None]) -> None:
+        self.parent = parent        # its key's or dash's column; its lines lie deeper
+        self.folded = header.startswith(">")
+        self.strip = header.endswith("-")
+        self.put = put
+        self.indent: int | None = None
+        self.lines: list[str] = []
+        self.last = 0                # the number of its last line
+        self.blanks: list[int] = []  # blank lines since the last line, by number
+
+    def close(self, broken: bool = True) -> None:
+        """``broken``: whether its last line ends in a line break, which `|` and `>`
+        keep."""
+        value = (" " if self.folded else "\n").join(self.lines)
+        self.put(value + ("\n" if self.lines and broken and not self.strip else ""))
+
+
+def _scalar_value(value: str) -> str:
+    """A one-line scalar as YAML reads it, every scalar a string: quotes off (``''`` is
+    ``'`` in single quotes; the gate refuses escapes in double ones), and a plain
+    one's trailing comment off."""
+    v = value.strip()
+    if v[0] == '"':
+        return _QUOTED.match(v).group(0)[1:-1]
+    if v[0] == "'":
+        return _QUOTED.match(v).group(0)[1:-1].replace("''", "'")
+    return v.split(" #", 1)[0].rstrip()
+
+
+def _walk(name: str, text: str) -> tuple[list[str], dict]:
+    """One compose file's lines outside the form read here, as ``file:line: form``,
+    and the tree of nested dicts, lists and strings the lines inside it make. The tree
+    is whole only when the list is empty. See ComposeFormTests."""
     out: list[str] = []
-    inside = False
-    for line in lines:
-        if not inside:
-            if line.rstrip() == want or line.startswith(want + " "):
-                inside = True
+    root: dict = {}
+    # Open blocks: (column, "map" or "seq", the key that opened it, its container).
+    stack: list[tuple[int, str, str | None, dict | list]] = [(0, "map", None, root)]
+    expect: int | None = None    # where the block under a key with no value opens
+    expect_key: str | None = None
+    expect_in: dict = root       # the mapping that key is in
+    scalar: _BlockScalar | None = None
+    top_seen: list[str] = []
+    n = 0
+
+    def key(col: int, k: str, value: str | None) -> None:
+        nonlocal expect, expect_key, expect_in, scalar
+        mapping = stack[-1][3]
+        if k in ("extends", "include"):
+            out.append(f"{name}:{n}: `{k}`")
+        if col == 0:
+            if k not in _TOP_LEVEL_KEYS[name]:
+                out.append(f"{name}:{n}: top-level `{k}`")
+            elif k in top_seen:
+                out.append(f"{name}:{n}: top-level `{k}` again")
+            top_seen.append(k)
+        elif k in mapping:
+            # PyYAML keeps the last; another reader may keep the first, or refuse.
+            out.append(f"{name}:{n}: {_KEY_TWICE}")
+        if not value or not value.strip():
+            expect, expect_key, expect_in = col + 2, k, mapping
+            return
+        form, block = _value_form(value, k)
+        if form:
+            out.append(f"{name}:{n}: {form}")
+        elif block:
+            if not _block_scalar_allowed(k, stack[-1][2]):
+                out.append(f"{name}:{n}: {_BLOCK_SCALAR_ELSEWHERE}")
+            scalar = _BlockScalar(col, value.split()[0], lambda v: mapping.__setitem__(k, v))
+        elif value.strip()[0] == "[":
+            mapping[k] = re.findall(r'"([^"]*)"', value)
+        else:
+            mapping[k] = _scalar_value(value)
+
+    for n, line in enumerate(text.splitlines(), 1):
+        indent = len(line) - len(line.lstrip(" "))
+        body = line[indent:]
+        if scalar is not None:
+            # A line of spaces past the block's indent is a line of it, as YAML reads it.
+            if not body.strip() and (scalar.indent is None or len(line) <= scalar.indent):
+                scalar.blanks.append(n)
+                continue
+            if indent > scalar.parent:
+                if scalar.indent is None:
+                    scalar.indent = indent
+                elif indent < scalar.indent:
+                    out.append(f"{name}:{n}: a block scalar line shallower than its first")
+                    continue
+                # A blank line there is a line break YAML keeps, even in a `>` block.
+                out.extend(f"{name}:{b}: {_BLANK_IN_BLOCK_SCALAR}" for b in scalar.blanks)
+                scalar.blanks = []
+                content = line[scalar.indent:]
+                if scalar.folded and content[:1] in (" ", "\t"):
+                    # Folding keeps a deeper line's breaks; the reader joins with spaces.
+                    out.append(f"{name}:{n}: {_FOLDED_DEEPER}")
+                scalar.lines.append(content)
+                scalar.last = n
+                continue
+            scalar.close()
+            scalar = None
+        if line.startswith(("---", "...")):
+            out.append(f"{name}:{n}: a document marker")
             continue
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            out.append(line)
+        if not body.strip() or body.lstrip().startswith("#"):
             continue
-        if len(line) - len(line.lstrip(" ")) <= indent:
-            break
-        out.append(line)
-    if not inside:
-        raise AssertionError(f"no {key!r} block at indent {indent} in the compose files")
-    return out
+        if "\t" in line:
+            out.append(f"{name}:{n}: a tab")
+            continue
+        if indent % 2:
+            out.append(f"{name}:{n}: an odd indent")
+            continue
+        item = body == "-" or body.startswith("- ")
+        if expect is not None:
+            if indent == expect:
+                block: dict | list = [] if item else {}
+                expect_in[expect_key] = block
+                stack.append((indent, "seq" if item else "map", expect_key, block))
+            else:
+                out.append(f"{name}:{n}: not at indent {expect}, under a key with no value")
+            expect = None
+        while stack[-1][0] > indent:
+            stack.pop()
+        if stack[-1][0] != indent:
+            out.append(f"{name}:{n}: an indent no open block has")
+            continue
+        if (stack[-1][1] == "seq") != item:
+            out.append(f"{name}:{n}: an item in a mapping, or a key in a sequence")
+            continue
+        if not item:
+            m = _KEY_LINE.fullmatch(body)
+            if not m:
+                out.append(f"{name}:{n}: {_NOT_A_KEY_LINE}")
+                continue
+            key(indent, m["key"], m["value"])
+            continue
+        rest = body[2:]
+        if not rest.strip() or rest.startswith(" "):
+            out.append(f"{name}:{n}: an item not one space after its dash")
+            continue
+        items = stack[-1][3]
+        m = _KEY_LINE.fullmatch(rest)
+        if m:
+            mapping: dict = {}
+            items.append(mapping)
+            stack.append((indent + 2, "map", None, mapping))
+            key(indent + 2, m["key"], m["value"])
+            continue
+        form, block_scalar = _value_form(rest, None)
+        if form:
+            out.append(f"{name}:{n}: {form}")
+        elif block_scalar:
+            if not _block_scalar_allowed(stack[-1][2], stack[-2][2]):
+                out.append(f"{name}:{n}: {_BLOCK_SCALAR_ELSEWHERE}")
+            items.append("")
+            at = len(items) - 1
+            scalar = _BlockScalar(indent, rest.split()[0],
+                                  lambda v, items=items, at=at: items.__setitem__(at, v))
+        else:
+            items.append(_scalar_value(rest))
+    if scalar is not None:
+        # At the end of the text: its last line has a break if a line or one follows.
+        scalar.close(scalar.last < n or text.endswith(("\n", "\r")))
+    if expect is not None:
+        out.append(f"{name}:{n}: a key with nothing under it")
+    return out, root
 
 
-def _all_services() -> list[str]:
-    """Every service declaration across BOTH compose files, as one body.
-
-    Needed because COMPOSE is a concatenation and each file has its own top-level
-    ``services:`` key — ``_block`` would stop at the second one and silently return
-    only the first file's services. That failure mode is the dangerous direction:
-    the rules below would pass by not seeing the services they exist to constrain.
-    """
-    body = _top_level("services")
-    if not body:
-        raise AssertionError("no services: block in either compose file")
-    return body
+def _form_violations(name: str, text: str) -> list[str]:
+    """Every line of one compose file outside the form the readers here read, as
+    ``file:line: form``. See ComposeFormTests."""
+    return _walk(name, text)[0]
 
 
-def _top_level(key: str) -> list[str]:
-    """Every top-level ``key:`` block across both compose files, as one body; empty
-    when neither file declares one."""
-    return [inner
-            for i, line in enumerate(COMPOSE)
-            if line.rstrip() == f"{key}:" or line.startswith(f"{key}: ")
-            for inner in _block(COMPOSE[i:], key, 0)]
+def _compose_tree(name: str, text: str) -> dict:
+    """One compose file as PyYAML's ``BaseLoader`` reads it (nested dicts and lists,
+    every scalar a string), or ComposeFormError naming every line outside the form."""
+    violations, tree = _walk(name, text)
+    if violations:
+        raise ComposeFormError("\n".join(violations))
+    return tree
 
 
-def _service(name: str) -> list[str]:
-    return _block(_all_services(), name, 2)
+class ComposeShapeError(Exception):
+    """A field in a shape Compose takes that its reader here does not read. Not an
+    AssertionError, for ComposeFormError's reason: a rule must not read it as absent."""
+
+
+@functools.cache
+def _cached_tree(name: str, text: str) -> dict:
+    return _compose_tree(name, text)
+
+
+def _tree(name: str) -> dict:
+    return _cached_tree(name, COMPOSE_TEXTS[name])
+
+
+def _mapping(node: object, where: str) -> dict:
+    if not isinstance(node, dict):
+        raise ComposeShapeError(f"{where} is not a mapping")
+    return node
+
+
+def _sequence(node: object, where: str) -> list:
+    if not isinstance(node, list):
+        raise ComposeShapeError(f"{where} is not a sequence")
+    return node
+
+
+def _string(node: object, where: str) -> str:
+    if not isinstance(node, str):
+        raise ComposeShapeError(f"{where} is not a scalar")
+    return node
+
+
+def _strings_of(node: object, where: str) -> list[str]:
+    """A sequence of scalars."""
+    return [_string(item, where) for item in _sequence(node, where)]
+
+
+def _file_services(name: str) -> dict[str, dict]:
+    return _mapping(_tree(name).get("services", {}), f"{name}'s services")
 
 
 def _service_names() -> list[str]:
     """Every service key, so a rule can be asserted across the whole file rather
-    than against a list that a new service silently escapes."""
-    return [m.group(1)
-            for line in _all_services()
-            if (m := re.match(r"  ([A-Za-z0-9._-]+):\s*$", line))]
+    than against a list that a new service silently escapes. Across BOTH files, so a
+    name both declare is here twice (``EachServiceIsDeclaredOnceTests``).
+
+    Raises on an empty result rather than returning one: the rules below would pass
+    by not seeing the services they exist to constrain."""
+    names = [svc for name in COMPOSE_FILES for svc in _file_services(name)]
+    if not names:
+        raise AssertionError("no services in either compose file")
+    return names
 
 
 def _mcp_service_names() -> list[str]:
@@ -146,122 +388,220 @@ def _mcp_service_names() -> list[str]:
     the LAUNCHERS and SPDX globs in the Makefile: a catalogue that stops parsing must
     not turn every test below into a silent pass.
     """
-    names = [m.group(1)
-             for line in _block(MCP_COMPOSE, "services", 0)
-             if (m := re.match(r"  ([A-Za-z0-9._-]+):\s*$", line))]
+    names = list(_file_services("mcp-servers.yml"))
     if not names:
         raise AssertionError(
-            "no services parsed out of mcp-servers.yml — the MCP placement rules "
-            "would check nothing. Did the file move, or its indentation change?")
+            "no services in mcp-servers.yml — the MCP placement rules would check "
+            "nothing. Did the file move?")
     return names
 
 
-def _scalar(body: list[str], key: str) -> str | None:
-    """A scalar key directly under a block, at its children's indent, or None if
-    absent. Never one nested deeper: a label or a long-form mount can spell any key."""
-    indents = [len(line) - len(line.lstrip(" ")) for line in body
-               if line.strip() and not line.strip().startswith("#")]
-    if not indents:
-        return None
-    child = " " * min(indents)
-    for line in body:
-        m = re.match(rf"{child}{re.escape(key)}:\s*(\S+)", line)
-        if m:
-            return m.group(1)
-    return None
+def _service(name: str) -> dict:
+    """A service's mapping, from the first file that declares it."""
+    for file in COMPOSE_FILES:
+        services = _file_services(file)
+        if name in services:
+            return _mapping(services[name], f"service {name}")
+    raise AssertionError(f"no service {name!r} in the compose files")
+
+
+def _top(key: str) -> dict[str, dict]:
+    """A top-level mapping (``networks``, ``volumes``) across both files, each entry
+    from the first file that declares it; empty when neither does."""
+    out: dict[str, dict] = {}
+    for file in COMPOSE_FILES:
+        for name, body in _mapping(_tree(file).get(key, {}), f"top-level {key}").items():
+            out.setdefault(name, _mapping(body, f"{key} {name}"))
+    return out
+
+
+def _scalar(mapping: dict, key: str) -> str | None:
+    """A scalar key of a mapping, or None if absent."""
+    return _string(mapping[key], key) if key in mapping else None
+
+
+def _key_values(node: object, where: str) -> dict[str, str]:
+    """A mapping of scalars, or the list of ``KEY=VALUE`` Compose takes in its place
+    (``environment``, ``sysctls``). A ``KEY`` alone takes its value from wherever
+    compose runs, which no rule here can read."""
+    if isinstance(node, dict):
+        return {k: _string(v, f"{where}.{k}") for k, v in node.items()}
+    out = {}
+    for item in _strings_of(node, where):
+        k, eq, v = item.partition("=")
+        if not eq:
+            raise ComposeShapeError(f"{where}: {item!r} takes its value from the host")
+        out[k] = v
+    return out
+
+
+def _strings(node: object) -> list[str]:
+    """Every key and scalar at or below a node, in order. For a rule refusing a value,
+    where reading too much is the safe side."""
+    if isinstance(node, str):
+        return [node]
+    if isinstance(node, dict):
+        return [s for k, v in node.items() for s in (k, *_strings(v))]
+    return [s for item in node for s in _strings(item)]
+
+
+def _list_items(node: object) -> list[str]:
+    """Every scalar item of every sequence at or below a node."""
+    if isinstance(node, dict):
+        return [s for v in node.values() for s in _list_items(v)]
+    if isinstance(node, list):
+        return [s for item in node
+                for s in ([item] if isinstance(item, str) else _list_items(item))]
+    return []
+
+
+def _pairs(node: object) -> list[tuple[str, object]]:
+    """Every key at or below a node, with its value."""
+    if isinstance(node, dict):
+        return [p for k, v in node.items() for p in ((k, v), *_pairs(v))]
+    if isinstance(node, list):
+        return [p for item in node for p in _pairs(item)]
+    return []
+
+
+def _network_legs(service: str) -> dict[str, dict]:
+    """A service's networks, each with its settings: the mapping, or the list of
+    names Compose takes in its place (each with none)."""
+    node = _service(service).get("networks", {})
+    if isinstance(node, list):
+        return {net: {} for net in _strings_of(node, f"{service}'s networks")}
+    return {net: _mapping(leg, f"{service}'s {net} leg")
+            for net, leg in _mapping(node, f"{service}'s networks").items()}
 
 
 def _networks_of(service: str) -> set[str]:
-    """Network names a service attaches to — the keys directly under its
-    ``networks:``, ignoring per-network settings like ``ipv4_address``."""
-    body = _block(_service(service), "networks", 4)
-    return {line.strip().rstrip(":") for line in body
-            if line.startswith(" " * 6) and len(line) - len(line.lstrip(" ")) == 6
-            and line.strip() and not line.strip().startswith("#")}
+    """Network names a service attaches to, ignoring per-network settings like
+    ``ipv4_address``."""
+    if "networks" not in _service(service):
+        raise AssertionError(f"{service} declares no networks")
+    return set(_network_legs(service))
+
+
+def _raw_networks(service: str) -> set[str]:
+    """``_networks_of`` for a service that may declare no networks at all (the
+    profile-gated llm-* variants do declare some; a future one might not)."""
+    return _networks_of(service) if "networks" in _service(service) else set()
 
 
 def _environment_of(service: str) -> dict[str, str]:
-    body = _block(_service(service), "environment", 4)
-    env = {}
-    for line in body:
-        stripped = _uncommented(line)
-        if not stripped or ":" not in stripped:
-            continue
-        k, _, v = stripped.partition(":")
-        env[k.strip()] = v.strip()
-    return env
+    return _key_values(_service(service).get("environment", {}),
+                       f"{service}'s environment")
+
+
+def _sysctls_of(service: str) -> dict[str, str]:
+    return _key_values(_service(service).get("sysctls", {}), f"{service}'s sysctls")
 
 
 def _pin(service: str, network: str) -> str | None:
     """The address a service pins on one of its networks, or None."""
-    return _scalar(_block(_block(_service(service), "networks", 4), network, 6),
-                   "ipv4_address")
+    legs = _network_legs(service)
+    if network not in legs:
+        raise AssertionError(f"{service} is not on {network}")
+    return _scalar(legs[network], "ipv4_address")
 
 
 def _probe(service: str) -> str:
-    """A service's healthcheck ``test``, its comments left out: a comment line, and a
-    `` # ...`` after an item. A ``|``/``>`` item's lines are text, ``#`` and all."""
-    test = _block(_block(_service(service), "healthcheck", 4), "test", 6)
-    out, in_text = [], False
-    for line in test:
-        if in_text and line.startswith(" " * 10):
-            out.append(line)
-            continue
-        in_text = re.match(r" {8}- [|>]", line) is not None
-        if in_text:
-            out.append(line)
-        elif not line.strip().startswith("#"):
-            out.append(_uncommented(line))
-    return "".join(out)
+    """A service's healthcheck ``test``: its items, a line each, or the string
+    Compose runs with a shell."""
+    check = _mapping(_service(service).get("healthcheck", {}), f"{service}'s healthcheck")
+    if "test" not in check:
+        raise AssertionError(f"{service} has no healthcheck test")
+    if isinstance(check["test"], str):
+        return check["test"]
+    return "\n".join(_strings_of(check["test"], f"{service}'s healthcheck test"))
 
 
-def _volume_items(service: str) -> list[list[str]]:
-    """Each item of a service's ``volumes:``, as its lines, comments left out."""
-    body = _service(service)
-    if not any(re.match(r"    volumes:", ln) for ln in body):
-        return []
-    items: list[list[str]] = []
-    for line in _block(body, "volumes", 4):
-        if not line.strip() or line.strip().startswith("#"):
+def _profiles_of(service: str) -> list[str]:
+    return _strings_of(_service(service).get("profiles", []), f"{service}'s profiles")
+
+
+def _depends_on(service: str) -> dict[str, str]:
+    """The services one waits on, each with its condition: the mapping, or the list
+    of names Compose takes in its place, each then ``service_started``."""
+    node = _service(service).get("depends_on", {})
+    if isinstance(node, list):
+        return {name: "service_started"
+                for name in _strings_of(node, f"{service}'s depends_on")}
+    return {name: _scalar(_mapping(wait, f"{service} on {name}"), "condition")
+            or "service_started"
+            for name, wait in _mapping(node, f"{service}'s depends_on").items()}
+
+
+def _ports_of(service: str) -> list[str]:
+    """What a service publishes, each in the short form's ``[ip:]host:container``: a
+    short-form item as written, a long-form one from its own keys."""
+    out = []
+    for item in _sequence(_service(service).get("ports", []), f"{service}'s ports"):
+        if isinstance(item, str):
+            out.append(item)
             continue
-        if line.startswith("      - "):
-            items.append([line.replace("- ", "  ", 1)])
-        elif items:
-            items[-1].append(line)
+        keys = _key_values(item, f"{service}'s port")
+        if not set(keys) <= {"target", "published", "host_ip"} or "target" not in keys:
+            raise ComposeShapeError(f"{service} publishes {keys}, which is not read here")
+        out.append(":".join(keys[k] for k in ("host_ip", "published", "target")
+                            if k in keys))
+    return out
+
+
+def _tmpfs_of(service: str) -> list[str]:
+    """A service's tmpfs mounts: the list, or the one string Compose takes in its
+    place."""
+    node = _service(service).get("tmpfs", [])
+    return [node] if isinstance(node, str) else _strings_of(node, f"{service}'s tmpfs")
+
+
+def _build_of(service: str) -> dict[str, str]:
+    """A service's ``build``: the mapping, or the context alone Compose takes in its
+    place."""
+    if "build" not in _service(service):
+        raise AssertionError(f"{service} builds nothing")
+    node = _service(service)["build"]
+    if isinstance(node, str):
+        return {"context": node}
+    return _key_values(node, f"{service}'s build")
+
+
+def _volumes_of(service: str) -> list[str | dict]:
+    """Each item of a service's ``volumes``: a short-form string or a long-form
+    mapping."""
+    items = _sequence(_service(service).get("volumes", []), f"{service}'s volumes")
+    for item in items:
+        if not isinstance(item, str | dict):
+            raise ComposeShapeError(f"{service} has a volume that is neither form")
     return items
-
-
-def _unquoted(value: str) -> str:
-    """One layer of matching quotes stripped, and nothing else: a ``${VAR:-d}`` stays
-    as written, unlike ``_plain_value``."""
-    if len(value) > 1 and value[0] == value[-1] and value[0] in "\"'":
-        return value[1:-1]
-    return value
-
-
-def _item_keys(item: list[str], indent: int) -> dict[str, str]:
-    """The keys of a mapping's lines at exactly ``indent``, values uncommented and
-    unquoted."""
-    return {m.group(1): _unquoted(_uncommented(m.group(2) or "")) for line in item
-            if (m := re.match(rf" {{{indent}}}([A-Za-z0-9_.-]+):(?:\s+(.*))?$", line))}
 
 
 def _mount_spellings(service: str) -> list[str]:
     """Every volume a service mounts, in the short form's ``source:target[:ro]``: a
     short-form item as written, a long-form one from its own keys."""
     out = []
-    for item in _volume_items(service):
-        keys = _item_keys(item, 8)
-        if not keys:
-            out.append(_unquoted(_uncommented(item[0])))
-        elif "source" in keys and "target" in keys:
-            ro = ":ro" if keys.get("read_only") == "true" else ""
-            out.append(f"{keys['source']}:{keys['target']}{ro}")
+    for item in _volumes_of(service):
+        if isinstance(item, str):
+            out.append(item)
+        elif "source" in item and "target" in item:
+            ro = ":ro" if _scalar(item, "read_only") == "true" else ""
+            out.append(f"{_scalar(item, 'source')}:{_scalar(item, 'target')}{ro}")
     return out
 
 
-def _network(name: str) -> list[str]:
-    return _block(_block(COMPOSE, "networks", 0), name, 2)
+def _volume_name(volume: str) -> str | None:
+    """The ``name:`` docker sees for a top-level volume, or None."""
+    volumes = _top("volumes")
+    if volume not in volumes:
+        raise AssertionError(f"no top-level volume {volume!r}")
+    return _scalar(volumes[volume], "name")
+
+
+def _network(name: str) -> dict:
+    networks = _top("networks")
+    if name not in networks:
+        raise AssertionError(f"no network {name!r} in the compose files")
+    return networks[name]
 
 
 def _is_internal(network: str) -> bool:
@@ -278,21 +618,14 @@ def _subnet_of(network: str) -> str:
 def _ipam_of(network: str, key: str) -> str | None:
     """A key (``subnet``, ``ip_range``, ``gateway``) of a network's first IPAM config
     entry, or None."""
-    config = _block(_block(_network(network), "ipam", 4), "config", 6)
-    entries = 0
-    for line in config:
-        entries += line.startswith("        - ")
-        if entries > 1:
-            break
-        m = re.match(rf"        (?:- |  ){re.escape(key)}:\s*(\S+)", line)
-        if m:
-            return m.group(1)
-    return None
+    ipam = _mapping(_network(network).get("ipam", {}), f"{network}'s ipam")
+    config = _sequence(ipam.get("config", []), f"{network}'s ipam config")
+    return _scalar(_mapping(config[0], f"{network}'s ipam config"), key) if config else None
 
 
 def _masquerade_off(network: str) -> bool:
-    opts = _block(_network(network), "driver_opts", 4)
-    return _scalar(opts, "com.docker.network.bridge.enable_ip_masquerade") == '"false"'
+    opts = _mapping(_network(network).get("driver_opts", {}), f"{network}'s driver_opts")
+    return _scalar(opts, "com.docker.network.bridge.enable_ip_masquerade") == "false"
 
 
 def _restart_of(service: str) -> str:
@@ -354,9 +687,13 @@ class McpServerPlacementTests(unittest.TestCase):
     hand the agent the credential directly and make the gateway's per-tool policy
     decorative, and every health check would stay green while it did."""
 
-    #: Every server the catalogue declares — derived, never listed, so adding one to
-    #: mcp-servers.yml is what subjects it to the rules below. See _mcp_service_names.
-    MCP_SERVERS: ClassVar[tuple[str, ...]] = tuple(_mcp_service_names())
+    @property
+    def MCP_SERVERS(self) -> tuple[str, ...]:
+        """Every server the catalogue declares — derived, never listed, so adding one
+        to mcp-servers.yml is what subjects it to the rules below. Read when a test
+        runs, not at import, so a file the gate refuses fails ComposeFormTests rather
+        than the import of every module that imports this one."""
+        return tuple(_mcp_service_names())
 
     def test_mcp_servers_never_join_the_agent_network(self):
         for svc in self.MCP_SERVERS:
@@ -393,7 +730,8 @@ class McpServerPlacementTests(unittest.TestCase):
         # before profiles select services. A `:?` in a profile nobody enabled takes
         # `build` and `up` down for the infra services. Prose did not stop it being
         # reintroduced, so this is the guard.
-        offenders = [ln.strip() for ln in COMPOSE if re.search(r"\$\{[^}]+:\?", ln)]
+        offenders = [value for name in COMPOSE_FILES for value in _strings(_tree(name))
+                     if re.search(r"\$\{[^}]+:\?", value)]
         self.assertEqual(offenders, [], "use ${VAR:-}, not ${VAR:?}")
 
     def test_a_memory_cap_always_disables_swap(self):
@@ -591,12 +929,8 @@ class ControlPlaneBindTests(unittest.TestCase):
         # The set is now CLOSED rather than pending, which is the state that makes
         # this guard bite: with one member it could only catch an arrival, and the
         # arrival it was waiting for was legitimate. From here every addition is one.
-        members = {name.strip().rstrip(":")
-                   for name in _block(COMPOSE, "services", 0)
-                   if len(name) - len(name.lstrip(" ")) == 2
-                   and name.strip().endswith(":")
-                   and "tool-authorize-net" in _raw_networks(
-                       name.strip().rstrip(":"))}
+        members = {svc for svc in _service_names()
+                   if "tool-authorize-net" in _raw_networks(svc)}
         self.assertEqual(members, {"control-plane", "tool-gateway"})
         self.assertNotIn("tool-authorize-net", _networks_of("egress-proxy"))
 
@@ -612,11 +946,8 @@ class ControlPlaneBindTests(unittest.TestCase):
         # be a component that can reach /authorize without anyone deciding it
         # should, so the roster is asserted rather than the absence of any
         # particular service.
-        members = {name.strip().rstrip(":")
-                   for name in _block(COMPOSE, "services", 0)
-                   if len(name) - len(name.lstrip(" ")) == 2
-                   and name.strip().endswith(":")
-                   and "authorize-net" in _raw_networks(name.strip().rstrip(":"))}
+        members = {svc for svc in _service_names()
+                   if "authorize-net" in _raw_networks(svc)}
         self.assertEqual(members, {"egress-proxy", "control-plane"})
 
 
@@ -674,19 +1005,17 @@ class _UiServiceChecks:
         self.assertEqual(_ui_default(f"{self.ENV}_NET", self.app), _subnet_of(self.NET))
         env = _environment_of(self.SERVICE)
         if f"{self.ENV}_NET" in env:
-            self.assertEqual(env[f"{self.ENV}_NET"].strip('"\''), _subnet_of(self.NET))
+            self.assertEqual(env[f"{self.ENV}_NET"], _subnet_of(self.NET))
 
     def test_its_network_is_apart_from_every_other(self):
         subnet = ipaddress.ip_network(_subnet_of(self.NET))
         # Inside the range the relay guard hard-blocks, so the proxy refuses it as a
         # CONNECT target too.
         self.assertTrue(subnet.subnet_of(ipaddress.ip_network("172.16.0.0/12")))
-        networks = [m.group(1) for ln in _block(COMPOSE, "networks", 0)
-                    if (m := re.match(r"  ([a-z0-9-]+):\s*$", ln))]
+        networks = list(_top("networks"))
         self.assertIn(self.NET, networks)
         for net in networks:
-            if net == self.NET or not any(
-                    "subnet:" in ln for ln in _block(_block(COMPOSE, "networks", 0), net, 2)):
+            if net == self.NET or _ipam_of(net, "subnet") is None:
                 continue
             with self.subTest(network=net):
                 self.assertFalse(subnet.overlaps(ipaddress.ip_network(_subnet_of(net))))
@@ -698,12 +1027,9 @@ class _UiServiceChecks:
         self.assertTrue(_masquerade_off(self.NET))
 
     def test_the_publish_and_the_healthcheck_reach_the_port_it_serves(self):
-        body = _service(self.SERVICE)
-        port = _environment_of(self.SERVICE)[f"{self.ENV}_PORT"].strip('"\'')
+        port = _environment_of(self.SERVICE)[f"{self.ENV}_PORT"]
         self.assertEqual(_ui_default(f"{self.ENV}_PORT", self.app), port)
-        publish = [ln.strip() for ln in _block(body, "ports", 4)
-                   if ln.strip() and not ln.strip().startswith("#")]
-        self.assertEqual(publish, [f'- "{self.PUBLISH}:{port}"'])
+        self.assertEqual(_ports_of(self.SERVICE), [f"{self.PUBLISH}:{port}"])
         self.assertIn(f'EXPOSE {port}\n',
                       (ROOT / self.SERVICE / "Dockerfile").read_text())
         # The page binds no loopback, so the probe dials the bound address, and names a
@@ -715,9 +1041,7 @@ class _UiServiceChecks:
         self.assertIn("/healthz", probe)
 
     def test_it_forwards_nothing_between_its_legs(self):
-        sysctls = [ln.strip() for ln in _block(_service(self.SERVICE), "sysctls", 4)
-                   if ln.strip() and not ln.strip().startswith("#")]
-        self.assertEqual(sysctls, ['net.ipv4.ip_forward: "0"'])
+        self.assertEqual(_sysctls_of(self.SERVICE), {"net.ipv4.ip_forward": "0"})
 
     def test_the_image_starts_the_entry_that_checks_the_bind(self):
         # uvicorn's own command line would take any --host and check nothing.
@@ -738,9 +1062,8 @@ class _UiServiceChecks:
                                  rf"(?m)^COPY ui-common/{name}\.py \./{name}\.py$")
 
     def test_the_image_is_built_from_the_root_to_reach_ui_common(self):
-        build = _block(_service(self.SERVICE), "build", 4)
-        self.assertEqual(_scalar(build, "context"), ".")
-        self.assertEqual(_scalar(build, "dockerfile"), f"{self.SERVICE}/Dockerfile")
+        self.assertEqual(_build_of(self.SERVICE),
+                         {"context": ".", "dockerfile": f"{self.SERVICE}/Dockerfile"})
         ignored = (ROOT / ".dockerignore").read_text().splitlines()
         for folder in (self.SERVICE, "ui-common"):
             self.assertNotIn(folder, ignored)
@@ -768,10 +1091,8 @@ class TasksUiBindTests(_UiServiceChecks, unittest.TestCase):
         self.assertEqual(_networks_of("tasks-ui"), {"tasks-ui-net", "tasks-operator-net"})
 
     def test_it_runs_with_the_registry_and_waits_for_it(self):
-        body = _service("tasks-ui")
-        self.assertEqual([ln.strip() for ln in _block(body, "profiles", 4)], ["- tasks"])
-        self.assertEqual(_scalar(_block(_block(body, "depends_on", 4), "tasks", 6),
-                                 "condition"), "service_healthy")
+        self.assertEqual(_profiles_of("tasks-ui"), ["tasks"])
+        self.assertEqual(_depends_on("tasks-ui"), {"tasks": "service_healthy"})
 
     def test_make_starts_and_stops_it_with_the_registry(self):
         # The page is the registry's: up together, down together, and back together
@@ -793,9 +1114,8 @@ class TasksUiBindTests(_UiServiceChecks, unittest.TestCase):
         self.assertNotEqual(mine, "172.26.0.3")
 
     def test_it_writes_nothing_but_a_tmpfs(self):
-        body = _service("tasks-ui")
-        self.assertEqual(_scalar(body, "read_only"), "true")
-        self.assertEqual([ln.strip() for ln in _block(body, "tmpfs", 4)], ["- /tmp"])
+        self.assertEqual(_scalar(_service("tasks-ui"), "read_only"), "true")
+        self.assertEqual(_tmpfs_of("tasks-ui"), ["/tmp"])  # noqa: S108 (compose's value, read)
 
     def test_its_pins_are_the_approval_uis(self):
         # Both run ui-common's guards, which were tested against these.
@@ -823,27 +1143,14 @@ class RootContextIgnoreTests(unittest.TestCase):
                     self.assertTrue(line.startswith("**/"))
 
 
-def _raw_networks(service: str) -> set[str]:
-    """``_networks_of`` for a service that may declare no networks at all (the
-    profile-gated llm-* variants do declare some; a future one might not)."""
-    try:
-        return _networks_of(service)
-    except AssertionError:
-        return set()
-
-
 GATEWAY_SRC = (ROOT / "tool-gateway" / "app.py").read_text()
+#: A ``user``'s uid as the invoking user's, by a variable whose default is not root.
+_INVOKING_UID = r"^\$\{DOCKADE_UID:-[1-9][0-9]*\}(:|$)"
 
 
 def _gateway_port() -> str:
-    """The agent-facing port as compose sets it, unquoted.
-
-    Compose quotes it — a bare 8100 would be a YAML int, and compose rejects a
-    non-string environment value — so the quotes are part of the scalar this file's
-    reader returns. Stripped here rather than at each use, because a probe compared
-    against `172.30.0.11:"8100"` fails for a reason that has nothing to do with the
-    property under test."""
-    return _environment_of("tool-gateway")["GATEWAY_AGENT_PORT"].strip('"\'')
+    """The agent-facing port as compose sets it."""
+    return _environment_of("tool-gateway")["GATEWAY_AGENT_PORT"]
 
 
 def _gateway_forbidden_default() -> set[str]:
@@ -895,7 +1202,7 @@ class GatewayPlacementTests(unittest.TestCase):
         self.assertEqual(_gateway_mcp_net_default(), _subnet_of("mcp-net"))
         override = _environment_of("tool-gateway").get("GATEWAY_MCP_NET")
         if override is not None:
-            self.assertEqual(override.strip('"\''), _subnet_of("mcp-net"))
+            self.assertEqual(override, _subnet_of("mcp-net"))
 
     def test_the_gateway_has_no_egress_of_its_own(self):
         # The whole point of the servers' egress going through the proxy is that a
@@ -1044,9 +1351,8 @@ class GatewayPlacementTests(unittest.TestCase):
         # it says.
         for svc in _service_names():
             with self.subTest(service=svc):
-                self.assertEqual([ln for ln in _service(svc)
-                                  if ln.strip().startswith("- ") and "MCP_SECRETS" in ln],
-                                 [])
+                self.assertEqual([item for item in _list_items(_service(svc))
+                                  if "MCP_SECRETS" in item], [])
 
     def test_the_gateway_runs_as_a_user_that_can_read_the_secrets_mount(self):
         # These two lines are one fact split across a file boundary, and getting it
@@ -1057,10 +1363,10 @@ class GatewayPlacementTests(unittest.TestCase):
         user = _scalar(_service("tool-gateway"), "user")
         self.assertTrue(user, "the gateway has a secrets mount but no user override, "
                               "so it runs as the image uid and can read none of it")
-        self.assertIn("DOCKADE_UID", user, f"{user} does not take the invoking user's id")
-        # Not root, which would read the mount by ignoring its mode — the one way to
-        # make this test pass while throwing away the reason it exists.
-        self.assertNotIn('"0:', user)
+        # The invoking user's id, defaulting to one that is not root, which would read
+        # the mount by ignoring its mode — the one way to make this test pass while
+        # throwing away the reason it exists.
+        self.assertRegex(user, _INVOKING_UID, f"{user} does not take the invoking user's id")
         self.assertNotIn("root", user)
 
     def test_the_gateway_image_uid_collides_with_no_other_infra_image(self):
@@ -1082,8 +1388,8 @@ class GatewayPlacementTests(unittest.TestCase):
         # registry is the one other service given anything from it: its own file, alone
         # (``TaskRegistryPlacementTests``).
         holders = {svc for svc in _service_names()
-                   if any("MCP_SECRETS" in ln or "/run/dockade/secrets" in ln
-                          for ln in _service(svc) if not ln.strip().startswith("#"))}
+                   if any("MCP_SECRETS" in s or "/run/dockade/secrets" in s
+                          for s in _strings(_service(svc)))}
         self.assertEqual(holders, {"tool-gateway", "tasks"},
                          f"more than the gateway is given the MCP credentials: {holders}")
 
@@ -1413,10 +1719,7 @@ class BackupToolTargetsAgreeTests(unittest.TestCase):
     def test_the_volume_is_the_one_compose_names(self):
         # The top-level volume's `name:`, not its key: `name:` is what docker sees,
         # and it is what `docker run -v` has to be given.
-        names = [line.split(":", 1)[1].strip()
-                 for line in _block(_block(COMPOSE, "volumes", 0), "control-state", 2)
-                 if line.strip().startswith("name:")]
-        self.assertEqual(names, [self._make_var("CONTROL_VOLUME")])
+        self.assertEqual(_volume_name("control-state"), self._make_var("CONTROL_VOLUME"))
 
     def test_the_mount_path_is_where_the_service_mounts_it(self):
         # Where the app looks for the store (store.DB_PATH's default is under it), so
@@ -1580,13 +1883,14 @@ def _registry_default(module: str, variable: str) -> str:
     return match.group(1)
 
 
-def _long_mount(service: str, target: str) -> dict[str, str]:
-    """The keys of a long-form bind entry, by its target: its own, and ``bind:``'s."""
-    for item in _volume_items(service):
-        keys = _item_keys(item, 8)
-        if keys.get("type") == "bind" and keys.get("target") == target:
-            bind = _block(item, "bind", 8) if "bind" in keys else []
-            return {**_item_keys(bind, 10), **keys}
+def _long_mount(service: str, target: str) -> dict[str, object]:
+    """The keys of a long-form bind entry, by its target: its own, and ``bind:``'s
+    under them."""
+    for item in _volumes_of(service):
+        if isinstance(item, dict) and (_scalar(item, "type"), _scalar(item, "target")) \
+                == ("bind", target):
+            bind = _mapping(item.get("bind", {}), f"{service}'s bind at {target}")
+            return {**bind, **{k: v for k, v in item.items() if k != "bind"}}
     raise AssertionError(f"{service} mounts nothing at {target} in the long form")
 
 
@@ -1621,7 +1925,7 @@ class TaskRegistryPlacementTests(unittest.TestCase):
         env = _environment_of("tasks")
         url = _environment_of("tasks-ui")["TASKS_UI_REGISTRY_URL"]
         self.assertEqual(url, f"http://{env['TASKS_OPERATOR_BIND']}:"
-                              f"{env['TASKS_OPERATOR_PORT'].strip(chr(34))}")
+                              f"{env['TASKS_OPERATOR_PORT']}")
         self.assertEqual(_ui_default("TASKS_UI_REGISTRY_URL", TASKS_UI_APP), url)
         mine = _pin("tasks-ui", "tasks-operator-net")
         self.assertIn(ipaddress.ip_address(mine),
@@ -1665,7 +1969,7 @@ class TaskRegistryPlacementTests(unittest.TestCase):
             with self.subTest(variable=var):
                 self.assertEqual(_registry_default("serve.py", var), _subnet_of(net))
                 if var in env:
-                    self.assertEqual(env[var].strip('"\''), _subnet_of(net))
+                    self.assertEqual(env[var], _subnet_of(net))
 
     def test_its_mcp_net_address_is_its_own(self):
         mine = _pin("tasks", "mcp-net")
@@ -1679,25 +1983,12 @@ class TaskRegistryPlacementTests(unittest.TestCase):
     def test_it_publishes_no_port_and_nothing_waits_on_it(self):
         # Optional everywhere: behind its own profile, and nothing outside that profile
         # depends on it, so `make up` never starts it. Its page waits on it, inside.
-        body = _service("tasks")
-        self.assertFalse([ln for ln in body if ln.strip().startswith("ports:")])
-        self.assertEqual(_block(body, "profiles", 4), ["      - tasks"])
-
-        def profiles(svc):
-            try:
-                return {ln.strip().lstrip("- ") for ln in _block(_service(svc), "profiles", 4)}
-            except AssertionError:
-                return set()
-        for svc in sorted(s for s in _service_names() if "tasks" not in profiles(s)):
-            # The block form alone: ComposeFormTests refuses the flow one.
-            try:
-                waits_on = _block(_service(svc), "depends_on", 4)
-            except AssertionError:
-                waits_on = []
+        self.assertNotIn("ports", _service("tasks"))
+        self.assertEqual(_profiles_of("tasks"), ["tasks"])
+        for svc in sorted(s for s in _service_names() if "tasks" not in _profiles_of(s)):
             for needed in ("tasks", "tasks-ui"):
                 with self.subTest(service=svc, needs=needed):
-                    self.assertNotIn(needed, {ln.strip().lstrip("- ").rstrip(":")
-                                              for ln in waits_on})
+                    self.assertNotIn(needed, _depends_on(svc))
 
     def test_the_gateway_dials_it_by_the_name_it_serves_under(self):
         # The gateway dials a server by its registered name, and keys its tools on it.
@@ -1717,9 +2008,9 @@ class TaskRegistryPlacementTests(unittest.TestCase):
         self.assertEqual(mount["source"], "${MCP_SECRETS:-./secrets}/tasks.json")
         self.assertEqual(mount["read_only"], "true")
         self.assertEqual(mount["create_host_path"], "false")
-        named = [ln.strip() for ln in _service("tasks") if not ln.strip().startswith("#")
-                 and ("MCP_SECRETS" in ln or "/run/dockade/secrets" in ln)]
-        self.assertEqual(named, [f"source: {mount['source']}", f"target: {target}"])
+        named = [s for s in _strings(_service("tasks"))
+                 if "MCP_SECRETS" in s or "/run/dockade/secrets" in s]
+        self.assertEqual(named, [mount["source"], target])
 
     def test_tasks_up_writes_the_file_compose_mounts(self):
         makefile = (ROOT / "Makefile").read_text()
@@ -1731,16 +2022,13 @@ class TaskRegistryPlacementTests(unittest.TestCase):
     def test_it_forwards_nothing_between_its_legs(self):
         # Its peer check guards its own listeners; this keeps it from carrying a
         # neighbour's packet across to the other network's members.
-        sysctls = [ln.strip() for ln in _block(_service("tasks"), "sysctls", 4)
-                   if ln.strip() and not ln.strip().startswith("#")]
-        self.assertEqual(sysctls, ['net.ipv4.ip_forward: "0"'])
+        self.assertEqual(_sysctls_of("tasks"), {"net.ipv4.ip_forward": "0"})
 
     def test_it_runs_as_a_user_that_can_read_its_secret(self):
         # For the gateway's reason (test_the_gateway_runs_as_a_user_that_can_read_...).
         user = _scalar(_service("tasks"), "user")
         self.assertIsNotNone(user)
-        self.assertIn("DOCKADE_UID", user)
-        self.assertNotIn('"0:', user)
+        self.assertRegex(user, _INVOKING_UID)
         self.assertNotIn("root", user)
 
     def test_its_store_is_a_volume_of_its_own_where_the_store_looks(self):
@@ -1786,8 +2074,7 @@ class NoServiceSharesANetworkNamespaceTests(unittest.TestCase):
     def test_no_service_sets_a_network_mode(self):
         for svc in _service_names():
             with self.subTest(service=svc):
-                self.assertFalse([ln for ln in _service(svc)
-                                  if re.match(r"\s+network_mode:", ln)])
+                self.assertNotIn("network_mode", _service(svc))
 
 
 class NoServiceSharesAnotherNamespaceTests(unittest.TestCase):
@@ -1809,11 +2096,9 @@ class NoServiceSharesAnotherNamespaceTests(unittest.TestCase):
     KEYS = ("pid", "ipc", "userns_mode", "uts", "cgroup", "volumes_from")
 
     def test_no_service_sets_a_namespace_or_takes_anothers_mounts(self):
-        keys = "|".join(self.KEYS)
         for svc in _service_names():
             with self.subTest(service=svc):
-                self.assertFalse([ln for ln in _service(svc)
-                                  if re.match(rf"    ({keys}):", ln)])
+                self.assertEqual([k for k in self.KEYS if k in _service(svc)], [])
 
 
 def _host_path_refusal(source: str) -> str | None:
@@ -1822,8 +2107,8 @@ def _host_path_refusal(source: str) -> str | None:
     ``source`` is as ``_host_sources`` reads it, a variable as its default, so one
     without a default cannot be judged, nor can a leading ``~``, which Compose reads
     as the home directory."""
-    if not source or source[0] in ">|":
-        return "continues on a later line, which this reader does not follow"
+    if not source:
+        return "is empty"
     if "$" in source or source.startswith("~"):
         return "cannot be read without the environment"
     path = posixpath.normpath(re.sub(r"/+", "/", source))
@@ -1835,46 +2120,30 @@ def _host_path_refusal(source: str) -> str | None:
     return None
 
 
-def _uncommented(line: str) -> str:
-    return re.sub(r"\s+#.*$", "", line).strip()
-
-
 def _plain_value(value: str) -> str:
-    """One layer of matching quotes stripped, and ``${VAR:-d}`` or ``${VAR-d}`` read as
-    ``d``, which a short form must be before it is split, since ``:-`` is itself a
-    colon."""
-    if len(value) > 1 and value[0] == value[-1] and value[0] in "\"'":
-        value = value[1:-1]
+    """``${VAR:-d}`` or ``${VAR-d}`` read as ``d``, which a short form must be before it
+    is split, since ``:-`` is itself a colon."""
     return re.sub(r"\$\{[A-Za-z_][A-Za-z0-9_]*:?-([^}]*)\}", r"\1", value)
 
 
 def _host_sources() -> list[tuple[str, str]]:
     """Every host path a container is given, with where it is given: a service
     volume's short-form source (a one-field item is an anonymous volume's target) or
-    its long-form ``source:``; a top-level volume's ``device:``; a top-level secret's
-    or config's ``file:``, which Compose bind-mounts. A named volume reads as a
-    relative path inside the repo, which passes."""
+    its long-form ``source``; a ``device`` anywhere below a top-level volume. A named
+    volume reads as a relative path inside the repo, which passes. Top-level
+    ``secrets`` and ``configs``, whose ``file`` Compose bind-mounts, the form gate
+    refuses (``_TOP_LEVEL_KEYS``)."""
     found = []
     for svc in _service_names():
-        body = _service(svc)
-        if not any(re.match(r"    volumes:", ln) for ln in body):
-            continue
-        for line in _block(body, "volumes", 4):
-            item = _uncommented(line)
-            short = re.match(r"-(\s|$)", item) is not None
-            item = re.sub(r"^-(\s+|$)", "", item)
-            if m := re.match(r"source:\s*(.*)", item):
-                found.append((svc, _plain_value(m.group(1))))
-            elif not short or re.match(r"[A-Za-z_]+:(\s|$)", item):
-                continue  # a long-form item's other keys
-            elif not item or item[0] in ">|":
-                found.append((svc, item))
+        for item in _volumes_of(svc):
+            if isinstance(item, dict):
+                if "source" in item:
+                    found.append((svc, _plain_value(_scalar(item, "source"))))
             elif len(fields := _plain_value(item).split(":")) > 1:
                 found.append((svc, fields[0]))
-    for key, field in (("volumes", "device"), ("secrets", "file"), ("configs", "file")):
-        for line in _top_level(key):
-            if m := re.match(rf"{field}:\s*(.*)", _uncommented(line)):
-                found.append((f"top-level {key}", _plain_value(m.group(1))))
+    for name, body in _top("volumes").items():
+        found.extend(("top-level volumes", _plain_value(_string(value, f"{name}'s device")))
+                     for key, value in _pairs(body) if key == "device")
     return found
 
 
@@ -1891,9 +2160,8 @@ class NoServiceHoldsTheRuntimeSocketTests(unittest.TestCase):
     SOCKETS = ("docker.sock", "containerd.sock", "podman.sock")
 
     def test_no_line_names_a_runtime_socket(self):
-        self.assertFalse([line.strip() for line in COMPOSE
-                          if not line.strip().startswith("#")
-                          and any(s in line for s in self.SOCKETS)])
+        self.assertEqual([value for name in COMPOSE_FILES for value in _strings(_tree(name))
+                          if any(s in value for s in self.SOCKETS)], [])
 
     def test_no_host_path_is_a_runtime_socket_or_holds_one(self):
         sources = _host_sources()
@@ -1919,18 +2187,14 @@ class PublishedPortTests(unittest.TestCase):
     on host loopback: every other listener is on a network the host does not join."""
 
     def test_only_the_two_uis_publish_and_only_on_loopback(self):
-        published = {}
-        for svc in _service_names():
-            body = _service(svc)
-            if any(re.match(r"    ports:", ln) for ln in body):
-                published[svc] = [ln.strip() for ln in _block(body, "ports", 4)
-                                  if ln.strip() and not ln.strip().startswith("#")]
+        published = {svc: _ports_of(svc) for svc in _service_names()
+                     if "ports" in _service(svc)}
         self.assertEqual(set(published), {"control-plane-ui", "tasks-ui"})
-        for svc, lines in published.items():
+        for svc, ports in published.items():
             with self.subTest(service=svc):
-                self.assertTrue(lines)
-                for ln in lines:
-                    self.assertTrue(ln.startswith('- "127.0.0.1:'), ln)
+                self.assertTrue(ports)
+                for port in ports:
+                    self.assertTrue(port.startswith("127.0.0.1:"), port)
 
 
 class EveryServiceDropsEveryCapabilityTests(unittest.TestCase):
@@ -1947,13 +2211,12 @@ class EveryServiceDropsEveryCapabilityTests(unittest.TestCase):
         for svc in _service_names():
             body = _service(svc)
             with self.subTest(service=svc):
-                self.assertEqual([ln.strip() for ln in _block(body, "cap_drop", 4)
-                                  if ln.strip() and not ln.strip().startswith("#")],
-                                 ["- ALL"])
-                self.assertFalse([ln for ln in body if re.match(r"    cap_add:", ln)])
-                # The key, as cap_add's: a quoted "true" is refused without deciding
+                self.assertEqual(_strings_of(body.get("cap_drop", []), "cap_drop"),
+                                 ["ALL"])
+                self.assertNotIn("cap_add", body)
+                # The key, as cap_add's: a "true" or a "yes" is refused without deciding
                 # how Compose reads it.
-                self.assertFalse([ln for ln in body if re.match(r"    privileged:", ln)])
+                self.assertNotIn("privileged", body)
 
     def test_every_service_sets_no_new_privileges(self):
         # Dropping every capability empties the bounding set, but a setuid or setgid
@@ -1965,9 +2228,8 @@ class EveryServiceDropsEveryCapabilityTests(unittest.TestCase):
         for svc in _service_names():
             body = _service(svc)
             with self.subTest(service=svc):
-                self.assertEqual([ln.strip() for ln in _block(body, "security_opt", 4)
-                                  if ln.strip() and not ln.strip().startswith("#")],
-                                 ["- no-new-privileges:true"])
+                self.assertEqual(_strings_of(body.get("security_opt", []), "security_opt"),
+                                 ["no-new-privileges:true"])
 
 
 class EveryImageIsBuiltTests(unittest.TestCase):
@@ -1980,11 +2242,8 @@ class EveryImageIsBuiltTests(unittest.TestCase):
         recipe = re.search(r"^verify-build:.*?(?=\n\S)", makefile, re.M | re.S).group(0)
         gated = {}
         for svc in _service_names():
-            body = _service(svc)
-            if any(re.match(r"    build:", ln) for ln in body) and \
-                    any(re.match(r"    profiles:", ln) for ln in body):
-                gated[svc] = [ln.strip().lstrip("- ") for ln in _block(body, "profiles", 4)
-                              if ln.strip().startswith("- ")]
+            if {"build", "profiles"} <= set(_service(svc)):
+                gated[svc] = _profiles_of(svc)
         self.assertEqual(set(gated), {"tasks", "tasks-ui"})
         for svc, profiles in gated.items():
             for profile in profiles:
@@ -2139,168 +2398,6 @@ class SecretsDirTests(_MakeRun):
                 self.assertTrue(reaches(target))
 
 
-#: The top-level keys each compose file may declare, each once. A ``networks:`` in
-#: mcp-servers.yml would be merged over docker-compose.yml's and read by no rule; an
-#: ``x-`` key exists to hold an anchor.
-_TOP_LEVEL_KEYS = {"docker-compose.yml": ("name", "networks", "volumes", "services"),
-                   "mcp-servers.yml": ("services",)}
-_KEY_LINE = re.compile(r"(?P<key>[A-Za-z0-9_.-]+):(?: +(?P<value>.*))?")
-_QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"' r"|'(?:[^']|'')*'")
-_BLOCK_HEADER = re.compile(r"[|>](?:[+-]?[1-9]?|[1-9][+-])")
-_QUOTED_LIST = re.compile(r'\[ *"[^"\\]*"(?: *, *"[^"\\]*")* *\]')
-_TAG_ANCHOR_ALIAS = "a tag, anchor or alias"
-_NOT_A_KEY_LINE = "not a plain `key:` line"
-
-
-def _value_form(value: str, key: str | None) -> tuple[str | None, bool]:
-    """What is wrong with a key's or an item's value, if anything, and whether it
-    opens a block scalar."""
-    v = value.strip()
-    if v[0] in "!&*":
-        return _TAG_ANCHOR_ALIAS, False
-    if v[0] == "#":
-        return "a comment where a value belongs", False
-    if v[0] in "|>":
-        header, _, rest = v.partition(" ")
-        if not _BLOCK_HEADER.fullmatch(header) or rest.strip()[:1] not in ("", "#"):
-            return "a block scalar header", False
-        return None, True
-    if v[0] in "[{":
-        # mcp-github's `command:`. On one line, so it holds no line a reader could
-        # take for a key.
-        if key in ("command", "entrypoint") and _QUOTED_LIST.fullmatch(v):
-            return None, False
-        return "a flow collection", False
-    if v[0] in "\"'":
-        m = _QUOTED.match(v)
-        if not m:
-            return "a quoted scalar not closed on its line", False
-        if "\\" in m.group(0) and v[0] == '"':
-            return "a backslash escape in a double-quoted scalar", False
-        rest = v[m.end():]
-        if rest and not re.fullmatch(r" +#.*", rest):
-            return "text after a quoted scalar", False
-        return None, False
-    if (v[0] in "-?:" and v[1:2] in ("", " ")) or v[0] in ",]}%@`":
-        return "a value starting with an indicator", False
-    plain = v.split(" #", 1)[0].rstrip()
-    if ": " in plain or plain.endswith(":"):
-        return "a mapping inside a plain scalar", False
-    return None, False
-
-
-def _block_scalar_allowed(key: str | None, parent: str | None) -> bool:
-    """Where a ``|``/``>`` block may stand: where the files have one today. Its lines
-    are text that a reader searching by indent takes for keys (a ``command: |`` line
-    at indent 6 is in reach of any indent-6 search), so it stands in as few places as
-    the files need."""
-    return key in ("command", "entrypoint") or (key, parent) == ("test", "healthcheck")
-
-
-_BLOCK_SCALAR_ELSEWHERE = "a block scalar outside command, entrypoint or healthcheck test"
-
-
-def _form_violations(name: str, text: str) -> list[str]:
-    """Every line of one compose file outside the form the readers here read, as
-    ``file:line: form``. See ComposeFormTests."""
-    out: list[str] = []
-    # Open blocks: (column, "map" or "seq", the key that opened it).
-    stack: list[tuple[int, str, str | None]] = [(0, "map", None)]
-    expect: int | None = None    # where the block under a key with no value opens
-    expect_key: str | None = None
-    scalar_parent: int | None = None  # in a block scalar, whose lines lie deeper
-    scalar_indent: int | None = None
-    top_seen: list[str] = []
-    n = 0
-
-    def key(col: int, k: str, value: str | None) -> None:
-        nonlocal expect, expect_key, scalar_parent
-        if k in ("extends", "include"):
-            out.append(f"{name}:{n}: `{k}`")
-        if col == 0:
-            if k not in _TOP_LEVEL_KEYS[name]:
-                out.append(f"{name}:{n}: top-level `{k}`")
-            elif k in top_seen:
-                out.append(f"{name}:{n}: top-level `{k}` again")
-            top_seen.append(k)
-        if not value or not value.strip():
-            expect, expect_key = col + 2, k
-            return
-        form, block = _value_form(value, k)
-        if form:
-            out.append(f"{name}:{n}: {form}")
-        if block:
-            if not _block_scalar_allowed(k, stack[-1][2]):
-                out.append(f"{name}:{n}: {_BLOCK_SCALAR_ELSEWHERE}")
-            scalar_parent = col
-
-    for n, line in enumerate(text.splitlines(), 1):
-        indent = len(line) - len(line.lstrip(" "))
-        body = line[indent:]
-        if scalar_parent is not None:
-            if not body.strip():
-                continue
-            if indent > scalar_parent:
-                if scalar_indent is None:
-                    scalar_indent = indent
-                elif indent < scalar_indent:
-                    out.append(f"{name}:{n}: a block scalar line shallower than its first")
-                continue
-            scalar_parent = scalar_indent = None
-        if line.startswith(("---", "...")):
-            out.append(f"{name}:{n}: a document marker")
-            continue
-        if not body.strip() or body.lstrip().startswith("#"):
-            continue
-        if "\t" in line:
-            out.append(f"{name}:{n}: a tab")
-            continue
-        if indent % 2:
-            out.append(f"{name}:{n}: an odd indent")
-            continue
-        item = body == "-" or body.startswith("- ")
-        if expect is not None:
-            if indent == expect:
-                stack.append((indent, "seq" if item else "map", expect_key))
-            else:
-                out.append(f"{name}:{n}: not at indent {expect}, under a key with no value")
-            expect = None
-        while stack[-1][0] > indent:
-            stack.pop()
-        if stack[-1][0] != indent:
-            out.append(f"{name}:{n}: an indent no open block has")
-            continue
-        if (stack[-1][1] == "seq") != item:
-            out.append(f"{name}:{n}: an item in a mapping, or a key in a sequence")
-            continue
-        if not item:
-            m = _KEY_LINE.fullmatch(body)
-            if not m:
-                out.append(f"{name}:{n}: {_NOT_A_KEY_LINE}")
-                continue
-            key(indent, m["key"], m["value"])
-            continue
-        rest = body[2:]
-        if not rest.strip() or rest.startswith(" "):
-            out.append(f"{name}:{n}: an item not one space after its dash")
-            continue
-        m = _KEY_LINE.fullmatch(rest)
-        if m:
-            stack.append((indent + 2, "map", None))
-            key(indent + 2, m["key"], m["value"])
-            continue
-        form, block = _value_form(rest, None)
-        if form:
-            out.append(f"{name}:{n}: {form}")
-        if block:
-            if not _block_scalar_allowed(stack[-1][2], stack[-2][2]):
-                out.append(f"{name}:{n}: {_BLOCK_SCALAR_ELSEWHERE}")
-            scalar_parent = indent
-    if expect is not None:
-        out.append(f"{name}:{n}: a key with nothing under it")
-    return out
-
-
 #: Any Makefile line that gives COMPOSE a value: every assignment operator, with
 #: `override`/`export`, as a target-specific variable, in `$(eval ...)`, or `define`.
 _MAKE_SETS_COMPOSE = re.compile(r"\bCOMPOSE\s*(?::{1,3}|[?+!])?=|\bdefine\s+COMPOSE\b")
@@ -2371,18 +2468,52 @@ def _probe_in_a_comment_after(item: str) -> Callable[[str], str]:
     return _swap(_TASKS_PROBE, broken.replace(f"{item}\n", f"{item}{was}\n", 1))
 
 
+#: The tasks probe's folded block, its header and first two lines.
+_TASKS_PROBE_HEAD = ("        - >-\n          import os, urllib.request as u;\n"
+                     "          u.urlopen('http://%s:%s/healthz' % (os.environ['TASKS_AGENT_BIND'],\n")
+
+
+def _in_tasks_probe(new_head: str) -> Callable[[str], str]:
+    return _swap(_TASKS_PROBE_HEAD, new_head)
+
+
+#: mcp-github's networks, as written.
+_GITHUB_NETWORKS = (
+    "    networks:\n      mcp-net:\n"
+    "        # First server address. See the allocation note in the file header for why\n"
+    "        # this is pinned rather than left to Docker.\n"
+    "        ipv4_address: 172.28.0.11\n")
+
+
+def _environment_as_list(text: str) -> str:
+    """mcp-github's environment as Compose's list of ``KEY=VALUE``."""
+    head, sep, rest = text.partition("    environment:\n")
+    if not sep or "    depends_on:\n" not in rest:
+        raise AssertionError("the mutant no longer applies: no environment block")
+    env, sep, tail = rest.partition("    depends_on:\n")
+    env = re.sub(r'(?m)^      ([A-Z_]+): "?([^"\n]*?)"?$', r"      - \1=\2", env)
+    return head + "    environment:\n" + env + sep + tail
+
+
+_tasks_probe_as_a_string = _swap(
+    "      test:\n        - CMD\n" + _TASKS_PROBE,
+    "      test: >-\n        python3 -c \"import os, urllib.request as u;\n"
+    "        u.urlopen('http://%s:%s/healthz' % (os.environ['TASKS_AGENT_BIND'],\n"
+    "        os.environ['TASKS_AGENT_PORT']), timeout=3)\"\n")
+
+
 _LABEL_BLOCK_SCALAR = _swap("    name: sandbox-net\n    driver: bridge\n    internal: true\n",
                             "    name: sandbox-net\n    driver: bridge\n    labels:\n"
                             "      note: |\n        internal: true\n")
 
 
 class ComposeFormTests(unittest.TestCase):
-    """The readers above take nesting from indentation and a key from ``key:`` at
-    the start of a line; Compose reads YAML. Where those differ a rule reads one
-    service and Compose runs another: ``networks: !reset`` makes Compose drop the
-    block every placement rule still reads, and ``"privileged": true`` is a key no
-    rule sees. So both files are held to the subset where the two agree, and a form
-    outside it fails here rather than every rule having to consider it:
+    """``_compose_tree`` reads a subset of YAML; Compose reads all of it. Where the
+    two would differ a rule reads one service and Compose runs another: ``networks:
+    !reset`` makes Compose drop the block every placement rule still reads, and
+    ``"privileged": true`` is a key a reader of plain keys does not see. So both files
+    are held to the subset, and a form outside it fails here rather than every rule
+    having to consider it:
 
     - one document, its top-level keys from ``_TOP_LEVEL_KEYS``, each once;
     - every key plain and unquoted, ``key:`` with no space before the colon, never
@@ -2392,23 +2523,24 @@ class ComposeFormTests(unittest.TestCase):
       ``command``/``entrypoint``; every scalar on one line, with no backslash escape
       in a double-quoted one (``"/\\x72un"`` is ``/run``);
     - a ``|``/``>`` block only under ``command``, ``entrypoint`` or a healthcheck's
-      ``test``, where the files have them today;
-    - a key with no value has nothing after its colon, not even a comment
-      (``_service_names`` matches the bare line);
+      ``test``, where the files have them today; its header with no indentation
+      indicator or ``+``, no blank line before or between its lines, and in a ``>``
+      one no line deeper than its first, since YAML keeps those line breaks;
+    - no key twice in one mapping, which YAML readers disagree on (PyYAML keeps the
+      last);
+    - a key with no value has a block under it, and nothing after its colon, not
+      even a comment;
     - the Makefile's COMPOSE merges exactly ``COMPOSE_FILES``, in order, is assigned
       once, and no makefile is included. A computed variable name (``$(X)SE +=``)
       is not looked for.
 
-    The gate fixes the form; it does not make a reader read at the right depth. A
-    label, a long-form mount or a block scalar's text can spell any key at a depth a
-    reader searching a block takes for its own. These readers take a key at its own
-    depth, each shown by a ``READER_MUTANTS`` decoy that the searching version reads
-    wrongly: ``_scalar`` (and ``_is_internal``, ``_masquerade_off``, ``_restart_of``
-    and the ``user`` and ``image`` checks, which go through it), ``_ipam_of`` and
-    ``_subnet_of``, ``_pin``, ``_probe``, ``_mount_spellings``, ``_long_mount``, and
-    ``_environment_of``'s cut of a trailing comment. The other readers are not yet
-    anchored and may still search a block at any depth; task 240 replaces the line
-    readers with one tree reader.
+    Every rule reads the tree, so it reads a key at its own depth, where Compose
+    does. Three tables hold the readers to that. ``READER_MUTANTS`` hides a key a rule
+    reads and leaves a decoy where a reader searching a block by its lines would find
+    it: in a label, an ``x-`` key, a long-form mount or a block scalar's text.
+    ``SHAPE_MUTANTS`` restates a field in another shape Compose takes, which its reader
+    reads alike or refuses. ``REACH_MUTANTS`` moves what a refusing rule looks for to
+    where only a scan of every key and scalar finds it, the reach those rules keep.
 
     A rule that needs a form outside this subset widens it here first, with a
     mutant showing the readers follow it.
@@ -2531,6 +2663,40 @@ class ComposeFormTests(unittest.TestCase):
          lambda t: t + "volumes:\n  x:\n    name: y\n", "top-level `volumes` again"),
         ("key with nothing under it", "mcp-servers.yml",
          lambda t: t + "    privileged:\n", "a key with nothing under it"),
+        ("keep chomping", "docker-compose.yml",
+         _swap("      - >\n        export LD", "      - >+\n        export LD"),
+         "a block scalar header"),
+        ("indentation indicator", "docker-compose.yml",
+         _swap("      - >\n        export LD", "      - >2\n        export LD"),
+         "a block scalar header"),
+        ("blank line between a block's lines", "docker-compose.yml",
+         _in_tasks_probe(_TASKS_PROBE_HEAD.replace(";\n", ";\n\n", 1)),
+         _BLANK_IN_BLOCK_SCALAR),
+        ("blank line before a block's first", "docker-compose.yml",
+         _in_tasks_probe(_TASKS_PROBE_HEAD.replace(">-\n", ">-\n\n", 1)),
+         _BLANK_IN_BLOCK_SCALAR),
+        ("folded line deeper than its first", "docker-compose.yml",
+         _in_tasks_probe(_TASKS_PROBE_HEAD.replace(";\n", ";\n            pass;\n", 1)),
+         _FOLDED_DEEPER),
+        ("key twice in a service", "mcp-servers.yml",
+         _swap("    read_only: true\n", "    read_only: true\n    read_only: false\n"),
+         _KEY_TWICE),
+        ("key twice in an environment", "mcp-servers.yml",
+         _swap("      HTTPS_PROXY: http://egress-proxy:8080\n",
+               "      HTTPS_PROXY: http://egress-proxy:8080\n"
+               "      HTTPS_PROXY: http://203.0.113.9:3128\n"),
+         _KEY_TWICE),
+    ]
+
+    #: (what, file, edit of the real text) the gate accepts, each a form at the edge
+    #: of the subset, so the parity tests read them too.
+    ACCEPTED: ClassVar[list[tuple[str, str, Callable[[str], str]]]] = [
+        ("blank line after a block's last", "docker-compose.yml",
+         _swap("          os.environ['TASKS_AGENT_PORT']), timeout=3)\n",
+               "          os.environ['TASKS_AGENT_PORT']), timeout=3)\n\n")),
+        ("blank line after a literal block's last, at the end", "mcp-servers.yml",
+         _swap('    command: ["http", "--listen-host", "0.0.0.0", "--port", "8082"]\n',
+               "    command: |\n      http\n        --port 8082\n\n")),
     ]
 
     #: (what, file, edit of the real text, a rule's reading that holds on the real
@@ -2660,6 +2826,198 @@ class ComposeFormTests(unittest.TestCase):
          _swap("      HTTPS_PROXY: http://egress-proxy:8080\n",
                "      HTTPS_PROXY: http://203.0.113.9:3128 # was egress-proxy\n"),
          _rule(McpServerPlacementTests, "test_mcp_servers_are_told_to_use_the_proxy")),
+        ("volume name in a label", "docker-compose.yml",
+         _swap("    name: dockade-control-state\n",
+               "    name: dockade-other\n    labels:\n      name: dockade-control-state\n"),
+         _rule(BackupToolTargetsAgreeTests, "test_the_volume_is_the_one_compose_names")),
+        # Root, unquoted, which a check for `"0:` passes.
+        ("gateway root, unquoted", "docker-compose.yml",
+         _swap('    # and write nothing.\n    user: "${DOCKADE_UID:-1000}:${DOCKADE_GID:-1000}"\n',
+               "    # and write nothing.\n    user: 0:${DOCKADE_UID:-1000}:${DOCKADE_GID:-1000}\n"),
+         _rule(GatewayPlacementTests,
+               "test_the_gateway_runs_as_a_user_that_can_read_the_secrets_mount")),
+        ("registry root, unquoted", "docker-compose.yml",
+         _swap('exports both.\n    user: "${DOCKADE_UID:-1000}:${DOCKADE_GID:-1000}"\n',
+               "exports both.\n    user: 0:${DOCKADE_UID:-1000}:${DOCKADE_GID:-1000}\n"),
+         _rule(TaskRegistryPlacementTests, "test_it_runs_as_a_user_that_can_read_its_secret")),
+        ("gateway root by default", "docker-compose.yml",
+         _swap('    # and write nothing.\n    user: "${DOCKADE_UID:-1000}:${DOCKADE_GID:-1000}"\n',
+               '    # and write nothing.\n    user: "${DOCKADE_UID:-0}:${DOCKADE_GID:-0}"\n'),
+         _rule(GatewayPlacementTests,
+               "test_the_gateway_runs_as_a_user_that_can_read_the_secrets_mount")),
+        ("registry root by default", "docker-compose.yml",
+         _swap('exports both.\n    user: "${DOCKADE_UID:-1000}:${DOCKADE_GID:-1000}"\n',
+               'exports both.\n    user: "${DOCKADE_UID:-0}:${DOCKADE_GID:-0}"\n'),
+         _rule(TaskRegistryPlacementTests, "test_it_runs_as_a_user_that_can_read_its_secret")),
+        ("cap_drop in an x- key", "mcp-servers.yml",
+         _swap("    cap_drop:\n      - ALL\n", "    x-was:\n      cap_drop:\n        - ALL\n"),
+         _rule(EveryServiceDropsEveryCapabilityTests,
+               "test_every_service_drops_all_and_adds_none")),
+        ("security_opt in an x- key", "mcp-servers.yml",
+         _swap("    security_opt:\n      - no-new-privileges:true\n",
+               "    x-was:\n      security_opt:\n        - no-new-privileges:true\n"),
+         _rule(EveryServiceDropsEveryCapabilityTests,
+               "test_every_service_sets_no_new_privileges")),
+        ("profiles in an x- key", "docker-compose.yml",
+         _swap("    profiles:\n      - tasks\n    build:\n      context: ./task-registry\n",
+               "    x-was:\n      profiles:\n        - tasks\n"
+               "    build:\n      context: ./task-registry\n"),
+         _rule(TaskRegistryPlacementTests,
+               "test_it_publishes_no_port_and_nothing_waits_on_it")),
+        ("depends_on in an x- key", "docker-compose.yml",
+         _swap("    depends_on:\n      tasks:\n        condition: service_healthy\n",
+               "    x-was:\n      depends_on:\n        tasks:\n"
+               "          condition: service_healthy\n"),
+         _rule(TasksUiBindTests, "test_it_runs_with_the_registry_and_waits_for_it")),
+        ("loopback publish in an x- key", "docker-compose.yml",
+         _swap('    ports:\n      - "127.0.0.1:${DOCKADE_UI_PORT:-28090}:8090"\n',
+               '    ports:\n      - "0.0.0.0:${DOCKADE_UI_PORT:-28090}:8090"\n'
+               '    x-was:\n      ports:\n        - "127.0.0.1:${DOCKADE_UI_PORT:-28090}:8090"\n'),
+         _rule(PublishedPortTests, "test_only_the_two_uis_publish_and_only_on_loopback")),
+        ("sysctls in an x- key", "docker-compose.yml",
+         _swap('    sysctls:\n      net.ipv4.ip_forward: "0"\n    healthcheck:',
+               '    sysctls:\n      net.ipv4.ip_forward: "1"\n'
+               '    x-was:\n      sysctls:\n        net.ipv4.ip_forward: "0"\n    healthcheck:'),
+         _rule(TaskRegistryPlacementTests, "test_it_forwards_nothing_between_its_legs")),
+        ("networks in an x- key", "mcp-servers.yml",
+         _swap(_GITHUB_NETWORKS,
+               "    networks:\n      sandbox-net:\n        ipv4_address: 172.30.0.12\n"
+               "    x-was:\n      networks:\n        mcp-net:\n"
+               "          ipv4_address: 172.28.0.11\n"),
+         _rule(McpServerPlacementTests, "test_mcp_servers_never_join_the_agent_network")),
+    ]
+
+    #: (what, file, edit of the real text, a rule's reading, what it must do on the
+    #: edit: ``holds``, ``fails`` or ``raises``). Each restates a field in another
+    #: shape Compose takes; a reader reads it alike, or raises ComposeShapeError.
+    SHAPE_MUTANTS: ClassVar[list[tuple[str, str, Callable[[str], str],
+                                       Callable[[], bool], str]]] = [
+        ("networks as a list, the agent's among them", "mcp-servers.yml",
+         _swap(_GITHUB_NETWORKS, "    networks:\n      - mcp-net\n      - sandbox-net\n"),
+         _rule(McpServerPlacementTests, "test_mcp_servers_never_join_the_agent_network"),
+         "fails"),
+        ("networks as a list, names alone read", "mcp-servers.yml",
+         _swap(_GITHUB_NETWORKS, "    networks:\n      - mcp-net\n"),
+         _rule(McpServerPlacementTests, "test_mcp_servers_never_join_the_agent_network"),
+         "holds"),
+        ("environment as a list", "mcp-servers.yml", _environment_as_list,
+         _rule(McpServerPlacementTests, "test_mcp_servers_are_told_to_use_the_proxy"),
+         "holds"),
+        ("environment as a list, a proxy from the host", "mcp-servers.yml",
+         _edits(_environment_as_list,
+                _swap("      - HTTPS_PROXY=http://egress-proxy:8080\n", "      - HTTPS_PROXY\n")),
+         _rule(McpServerPlacementTests, "test_mcp_servers_are_told_to_use_the_proxy"),
+         "raises"),
+        ("depends_on as a list", "docker-compose.yml",
+         _swap("      control-plane:\n        condition: service_healthy\n"
+               "    # The proxy resolves",
+               "      - control-plane\n    # The proxy resolves"),
+         _rule(TaskRegistryPlacementTests,
+               "test_it_publishes_no_port_and_nothing_waits_on_it"), "holds"),
+        ("depends_on as a list, on the registry", "mcp-servers.yml",
+         _swap("    depends_on:\n      egress-proxy:\n        condition: service_healthy\n",
+               "    depends_on:\n      - egress-proxy\n      - tasks\n"),
+         _rule(TaskRegistryPlacementTests,
+               "test_it_publishes_no_port_and_nothing_waits_on_it"), "fails"),
+        ("depends_on as a list, so only started", "docker-compose.yml",
+         _swap("    depends_on:\n      tasks:\n        condition: service_healthy\n",
+               "    depends_on:\n      - tasks\n"),
+         _rule(TasksUiBindTests, "test_it_runs_with_the_registry_and_waits_for_it"), "fails"),
+        ("depends_on with no condition, so only started", "docker-compose.yml",
+         _swap("    depends_on:\n      tasks:\n        condition: service_healthy\n",
+               "    depends_on:\n      tasks:\n        required: true\n"),
+         _rule(TasksUiBindTests, "test_it_runs_with_the_registry_and_waits_for_it"), "fails"),
+        ("a long-form port", "docker-compose.yml",
+         _swap('      - "127.0.0.1:${DOCKADE_UI_PORT:-28090}:8090"\n',
+               '      - target: "8090"\n        published: ${DOCKADE_UI_PORT:-28090}\n'
+               "        host_ip: 127.0.0.1\n"),
+         _rule(ControlPlaneUiBindTests,
+               "test_the_publish_and_the_healthcheck_reach_the_port_it_serves"), "holds"),
+        ("a long-form port on every address", "docker-compose.yml",
+         _swap('      - "127.0.0.1:${DOCKADE_UI_PORT:-28090}:8090"\n',
+               '      - target: "8090"\n        published: ${DOCKADE_UI_PORT:-28090}\n'),
+         _rule(PublishedPortTests, "test_only_the_two_uis_publish_and_only_on_loopback"),
+         "fails"),
+        ("a long-form port in host mode", "docker-compose.yml",
+         _swap('      - "127.0.0.1:${DOCKADE_UI_PORT:-28090}:8090"\n',
+               '      - target: "8090"\n        published: ${DOCKADE_UI_PORT:-28090}\n'
+               "        host_ip: 127.0.0.1\n        mode: host\n"),
+         _rule(PublishedPortTests, "test_only_the_two_uis_publish_and_only_on_loopback"),
+         "raises"),
+        ("a healthcheck test as a string", "docker-compose.yml", _tasks_probe_as_a_string,
+         _rule(TaskRegistryPlacementTests,
+               "test_the_healthcheck_dials_the_agent_listener_where_it_binds"), "holds"),
+        ("tmpfs as a string", "docker-compose.yml",
+         _swap("    read_only: true\n    tmpfs:\n      - /tmp\n    cap_drop:",
+               "    read_only: true\n    tmpfs: /tmp\n    cap_drop:"),
+         _rule(TasksUiBindTests, "test_it_writes_nothing_but_a_tmpfs"), "holds"),
+        ("build as a string", "docker-compose.yml",
+         _swap("    build:\n      # Repo root, to COPY ui-common/ beside the UI's own files.\n"
+               "      context: .\n      dockerfile: control-plane-ui/Dockerfile\n",
+               "    build: .\n"),
+         _rule(ControlPlaneUiBindTests,
+               "test_the_image_is_built_from_the_root_to_reach_ui_common"), "fails"),
+        # A shape no reader takes, read by a rule that reads absent networks as none.
+        ("networks as a scalar", "mcp-servers.yml",
+         _swap(_GITHUB_NETWORKS, "    networks: tasks-operator-net\n"),
+         _rule(TaskRegistryPlacementTests, "test_nothing_else_joins_the_operator_network"),
+         "raises"),
+        ("sysctls as a list", "docker-compose.yml",
+         _swap('    sysctls:\n      net.ipv4.ip_forward: "0"\n    healthcheck:',
+               "    sysctls:\n      - net.ipv4.ip_forward=0\n    healthcheck:"),
+         _rule(TaskRegistryPlacementTests, "test_it_forwards_nothing_between_its_legs"),
+         "holds"),
+    ]
+
+    #: (what, file, edit of the real text, a refusing rule's reading that holds on the
+    #: real files and must not on the edit). Each puts what the rule refuses where only
+    #: a scan of every key and scalar of the service or file finds it.
+    REACH_MUTANTS: ClassVar[list[tuple[str, str, Callable[[str], str],
+                                       Callable[[], bool]]]] = [
+        ("a socket in a label", "mcp-servers.yml",
+         _swap("    read_only: true\n",
+               "    labels:\n      note: /var/run/docker.sock\n    read_only: true\n"),
+         _rule(NoServiceHoldsTheRuntimeSocketTests, "test_no_line_names_a_runtime_socket")),
+        ("a socket as a label's key", "mcp-servers.yml",
+         _swap("    read_only: true\n",
+               "    labels:\n      docker.sock: mounted\n    read_only: true\n"),
+         _rule(NoServiceHoldsTheRuntimeSocketTests, "test_no_line_names_a_runtime_socket")),
+        ("the secrets in a label", "mcp-servers.yml",
+         _swap("    read_only: true\n",
+               "    labels:\n      note: ${MCP_SECRETS:-./secrets}\n    read_only: true\n"),
+         _rule(GatewayPlacementTests, "test_no_other_service_is_given_the_secrets")),
+        ("the secrets, short form, in a label list", "mcp-servers.yml",
+         _swap("    read_only: true\n",
+               "    labels:\n      - ${MCP_SECRETS:-./secrets}:/x\n    read_only: true\n"),
+         _rule(GatewayPlacementTests, "test_no_service_mounts_the_secrets_in_the_short_form")),
+        ("the secrets directory named to the registry in a label", "docker-compose.yml",
+         _swap("    container_name: tasks\n",
+               "    container_name: tasks\n    labels:\n      note: /run/dockade/secrets\n"),
+         _rule(TaskRegistryPlacementTests, "test_it_is_given_its_own_secret_file_alone_read_only")),
+        ("a required variable in a label", "mcp-servers.yml",
+         _swap("    read_only: true\n",
+               "    labels:\n      note: ${X:?}\n    read_only: true\n"),
+         _rule(McpServerPlacementTests, "test_no_variable_is_required_at_interpolation_time")),
+        ("a runtime path, short form", "mcp-servers.yml",
+         _swap("    read_only: true\n", "    volumes:\n      - /var/run:/x\n    read_only: true\n"),
+         _rule(NoServiceHoldsTheRuntimeSocketTests,
+               "test_no_host_path_is_a_runtime_socket_or_holds_one")),
+        ("a runtime path, long form", "mcp-servers.yml",
+         _swap("    read_only: true\n",
+               "    volumes:\n      - type: bind\n        source: /var/run\n"
+               "        target: /x\n    read_only: true\n"),
+         _rule(NoServiceHoldsTheRuntimeSocketTests,
+               "test_no_host_path_is_a_runtime_socket_or_holds_one")),
+        ("a path only the environment names", "mcp-servers.yml",
+         _swap("    read_only: true\n", "    volumes:\n      - ${SOCK}:/x:ro\n    read_only: true\n"),
+         _rule(NoServiceHoldsTheRuntimeSocketTests,
+               "test_no_host_path_is_a_runtime_socket_or_holds_one")),
+        ("a volume's device under driver_opts", "docker-compose.yml",
+         _swap("    name: dockade-egress-audit\n",
+               "    name: dockade-egress-audit\n    driver_opts:\n      type: none\n"
+               "      o: bind\n      device: /var/run\n"),
+         _rule(NoServiceHoldsTheRuntimeSocketTests,
+               "test_no_host_path_is_a_runtime_socket_or_holds_one")),
     ]
 
     #: (what, edit of the real Makefile)
@@ -2686,21 +3044,53 @@ class ComposeFormTests(unittest.TestCase):
                 found = _form_violations(name, edit((ROOT / name).read_text()))
                 self.assertTrue([v for v in found if form in v], found)
 
+    def test_a_refused_file_is_never_read_as_a_tree(self):
+        for what, name, edit, form in self.MUTANTS:
+            with self.subTest(mutant=what):
+                with self.assertRaises(ComposeFormError) as refused:
+                    _compose_tree(name, edit((ROOT / name).read_text()))
+                self.assertIn(form, str(refused.exception))
+
+    def test_each_accepted_edit_is_accepted(self):
+        for what, name, edit in self.ACCEPTED:
+            with self.subTest(edit=what):
+                self.assertEqual(_form_violations(name, edit((ROOT / name).read_text())), [])
+
+    def outcome(self, name: str, edit: Callable[[str], str],
+                reading: Callable[[], bool]) -> str:
+        """``holds``, ``fails`` or ``raises`` (ComposeShapeError): a reading on the
+        real files, then with one file edited, which the gate must accept."""
+        self.assertTrue(reading())
+        text = edit((ROOT / name).read_text())
+        self.assertEqual(_form_violations(name, text), [])
+        with mock.patch.dict(COMPOSE_TEXTS, {name: text}):
+            try:
+                return "holds" if reading() else "fails"
+            except AssertionError:  # the reader found no key: also a failing rule
+                return "fails"
+            except ComposeShapeError:
+                return "raises"
+
     def test_each_anchored_reader_reads_a_key_at_its_own_depth(self):
-        module = sys.modules[__name__]
         for what, name, edit, reading in self.READER_MUTANTS:
             with self.subTest(mutant=what):
-                self.assertTrue(reading())
-                mutated = edit((ROOT / name).read_text()).splitlines()
-                lines = [line for f in COMPOSE_FILES
-                         for line in (mutated if f == name
-                                      else (ROOT / f).read_text().splitlines())]
-                with mock.patch.object(module, "COMPOSE", lines):
-                    try:
-                        held = reading()
-                    except AssertionError:  # the reader found no key: also a failing rule
-                        held = False
-                self.assertFalse(held)
+                if edit is _LABEL_BLOCK_SCALAR:
+                    # Refused before any rule reads it: a MUTANTS row too.
+                    found = _form_violations(name, edit((ROOT / name).read_text()))
+                    self.assertTrue([v for v in found if _BLOCK_SCALAR_ELSEWHERE in v])
+                    continue
+                self.assertEqual(self.outcome(name, edit, reading), "fails")
+
+    def test_each_shape_compose_takes_is_read_alike_or_refused(self):
+        for what, name, edit, reading, want in self.SHAPE_MUTANTS:
+            with self.subTest(mutant=what):
+                self.assertEqual(self.outcome(name, edit, reading), want)
+        self.assertIn("raises", {want for *_, want in self.SHAPE_MUTANTS})
+
+    def test_each_refusing_rule_reads_every_key_and_scalar(self):
+        for what, name, edit, reading in self.REACH_MUTANTS:
+            with self.subTest(mutant=what):
+                self.assertEqual(self.outcome(name, edit, reading), "fails")
 
     def test_the_makefile_merges_exactly_the_files_read_here(self):
         self.assertEqual(_makefile_compose_violations((ROOT / "Makefile").read_text()), [])
@@ -2710,6 +3100,150 @@ class ComposeFormTests(unittest.TestCase):
         for what, edit in self.MAKEFILE_MUTANTS:
             with self.subTest(mutant=what):
                 self.assertNotEqual(_makefile_compose_violations(edit(makefile)), [])
+
+
+#: Same arrangement as ``test_control_plane_ui_js.py``: without PyYAML the parity
+#: tests skip, and DOCKADE_REQUIRE_TOOLS turns the skip into a failure.
+_STRICT = bool(os.environ.get("DOCKADE_REQUIRE_TOOLS"))
+#: Reads a JSON list of texts on stdin, writes their trees.
+_PYYAML_TREES = ("import json, sys, yaml\n"
+                 "json.dump([yaml.load(t, Loader=yaml.BaseLoader)"
+                 " for t in json.load(sys.stdin)], sys.stdout)\n")
+
+
+def _shebang_python(script: str) -> list[str] | None:
+    """The command a script's ``#!`` line names, if it runs a Python: an interpreter
+    named ``python...``, given or found by ``env``. Anything else, a ``/bin/sh``
+    wrapper say, would be run with Python's arguments."""
+    with open(script, encoding="utf-8", errors="replace") as text:
+        first = text.readline()
+    command = shlex.split(first[2:]) if first.startswith("#!") else []
+    if command and os.path.basename(command[0]) == "env":
+        interpreter = command[1] if len(command) > 1 else ""
+    else:
+        interpreter = command[0] if command else ""
+    return command if os.path.basename(interpreter).startswith("python") else None
+
+
+def _pyyaml_command() -> list[str] | None:
+    """A Python that imports PyYAML: this one, else the one yamllint's shebang names,
+    since yamllint needs PyYAML; or None. Run, not imported, so the unit suite itself
+    still needs no package."""
+    commands = [[sys.executable]]
+    yamllint = shutil.which("yamllint")
+    if yamllint is not None and (command := _shebang_python(yamllint)):
+        commands.append(command)
+    for command in commands:
+        try:
+            found = subprocess.run(  # noqa: S603 (an interpreter path, fixed arguments)
+                [*command, "-I", "-c", "import yaml"], stdin=subprocess.DEVNULL,
+                capture_output=True, timeout=60, check=False)
+        except OSError:
+            continue
+        if found.returncode == 0:
+            return command
+    return None
+
+
+class PyyamlLookupTests(unittest.TestCase):
+    """Which ``#!`` lines ``_pyyaml_command`` will run as a Python."""
+
+    CASES: ClassVar[list[tuple[str, list[str] | None]]] = [
+        ("#!/home/u/.local/share/pipx/venvs/yamllint/bin/python\n",
+         ["/home/u/.local/share/pipx/venvs/yamllint/bin/python"]),
+        ("#!/usr/bin/env python3\n", ["/usr/bin/env", "python3"]),
+        ("#!/bin/sh\n", None),
+        ("#!/usr/bin/env sh\n", None),
+        ("#!/usr/bin/env\n", None),
+        ("import yamllint\n", None),
+    ]
+
+    def test_only_a_python_shebang_is_taken(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for first, want in self.CASES:
+                with self.subTest(shebang=first):
+                    script = Path(tmp) / "yamllint"
+                    script.write_text(first + "rest\n")
+                    self.assertEqual(_shebang_python(str(script)), want)
+
+
+class ComposeTreeParityTests(unittest.TestCase):
+    """``_compose_tree`` reads what PyYAML's ``BaseLoader`` reads, on every file the
+    gate accepts that this suite has: the real ones, each table's edits, and the forms
+    the subset allows that the real files lack."""
+
+    #: (what, text), each read as mcp-servers.yml.
+    SYNTHETIC: ClassVar[list[tuple[str, str]]] = [
+        ("quoted scalars",
+         "services:\n  x:\n    image: 'it''s'\n    hostname: \"a 'b' # c\"\n"
+         "    environment:\n      A: 'x # not a comment'\n      B: plain # a comment\n"
+         "      C: \"1\"  # after a quote\n      D: a#b\n"),
+        ("literal and folded blocks",
+         "services:\n  x:\n    command: |\n      run  \n      # a line of text\n"
+         "        deeper\n    entrypoint: |-\n      one\n      two\n"
+         "    healthcheck:\n      test:\n        - CMD\n        - >\n"
+         "          folded  \n          text\n\n    restart: always\n"),
+        ("a line of spaces past a literal block's indent",
+         "services:\n  x:\n    command: |\n      a\n" + " " * 9 + "\n    restart: x\n"),
+        ("a block with no lines, and one at the end of the text",
+         "services:\n  x:\n    command: |\n    entrypoint: >\n      a\n      b"),
+        ("a block, then a line of spaces, at the end of the text",
+         "services:\n  x:\n    command: |\n      a\n  "),
+        ("a quoted list and a sequence of mappings",
+         "services:\n  x:\n    command: [\"a b\", \"c\"]\n    volumes:\n"
+         "      - type: bind\n        bind:\n          create_host_path: false\n"
+         "      - a:/b\n"),
+    ]
+
+    command: ClassVar[list[str]]
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        command = _pyyaml_command()
+        if command is not None:
+            cls.command = command
+            return
+        if _STRICT:
+            raise AssertionError(
+                "no Python here imports PyYAML and DOCKADE_REQUIRE_TOOLS is set — "
+                "refusing to report success for the compose tree's parity tests. "
+                "Install yamllint, or drop strict mode to skip them knowingly.")
+        raise unittest.SkipTest("no Python here imports PyYAML")
+
+    def assert_parity(self, docs: list[tuple[str, str, str]]) -> None:
+        """Each (what, file, text) read alike by the tree and by PyYAML."""
+        self.assertTrue(docs)
+        run = subprocess.run(  # noqa: S603 (an interpreter path, fixed arguments)
+            [*self.command, "-I", "-c", _PYYAML_TREES],
+            input=json.dumps([text for _, _, text in docs]),
+            capture_output=True, text=True, timeout=120, check=False)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        for (what, name, text), want in zip(docs, json.loads(run.stdout), strict=True):
+            with self.subTest(what=what):
+                self.assertEqual(_compose_tree(name, text), want)
+
+    def test_the_real_files(self):
+        self.assert_parity([(name, name, (ROOT / name).read_text())
+                            for name in COMPOSE_FILES])
+
+    def test_every_edit_the_gate_accepts(self):
+        tables = ComposeFormTests
+        edits = [(what, name, edit) for what, name, edit, *_ in
+                 (*tables.MUTANTS, *tables.READER_MUTANTS, *tables.ACCEPTED,
+                  *tables.SHAPE_MUTANTS, *tables.REACH_MUTANTS)]
+        docs = [(what, name, text) for what, name, edit in edits
+                if not _form_violations(name, text := edit((ROOT / name).read_text()))]
+        # Every MUTANTS edit is refused, and so is the one READER_MUTANTS row that is
+        # also a MUTANTS row.
+        self.assertEqual(len(docs), len(edits) - len(tables.MUTANTS) - 1)
+        self.assert_parity(docs)
+
+    def test_the_forms_the_files_lack(self):
+        docs = [(what, "mcp-servers.yml", text) for what, text in self.SYNTHETIC]
+        for what, name, text in docs:
+            with self.subTest(what=what):
+                self.assertEqual(_form_violations(name, text), [])
+        self.assert_parity(docs)
 
 
 class BackupRestoreRecipeTests(_MakeRun):

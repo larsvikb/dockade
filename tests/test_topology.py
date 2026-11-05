@@ -27,9 +27,11 @@ from __future__ import annotations
 
 import ast
 import ipaddress
+import json
 import os
 import posixpath
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -2146,7 +2148,7 @@ _TOP_LEVEL_KEYS = {"docker-compose.yml": ("name", "networks", "volumes", "servic
                    "mcp-servers.yml": ("services",)}
 _KEY_LINE = re.compile(r"(?P<key>[A-Za-z0-9_.-]+):(?: +(?P<value>.*))?")
 _QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"' r"|'(?:[^']|'')*'")
-_BLOCK_HEADER = re.compile(r"[|>](?:[+-]?[1-9]?|[1-9][+-])")
+_BLOCK_HEADER = re.compile(r"[|>]-?")
 _QUOTED_LIST = re.compile(r'\[ *"[^"\\]*"(?: *, *"[^"\\]*")* *\]')
 _TAG_ANCHOR_ALIAS = "a tag, anchor or alias"
 _NOT_A_KEY_LINE = "not a plain `key:` line"
@@ -2198,23 +2200,66 @@ def _block_scalar_allowed(key: str | None, parent: str | None) -> bool:
 
 
 _BLOCK_SCALAR_ELSEWHERE = "a block scalar outside command, entrypoint or healthcheck test"
+_BLANK_IN_BLOCK_SCALAR = "a blank line inside a block scalar"
+_FOLDED_DEEPER = "a folded block scalar line deeper than its first"
+_KEY_TWICE = "a key twice in one mapping"
 
 
-def _form_violations(name: str, text: str) -> list[str]:
-    """Every line of one compose file outside the form the readers here read, as
-    ``file:line: form``. See ComposeFormTests."""
+class ComposeFormError(Exception):
+    """A compose file outside the form ``_compose_tree`` reads. Not an AssertionError,
+    so no handler that reads one as "the rule fails" or "absent" can swallow it."""
+
+
+class _BlockScalar:
+    """A ``|``/``>`` block being read: where it goes, and its lines so far."""
+
+    def __init__(self, parent: int, header: str, put: Callable[[str], None]) -> None:
+        self.parent = parent        # its key's or dash's column; its lines lie deeper
+        self.folded = header.startswith(">")
+        self.strip = header.endswith("-")
+        self.put = put
+        self.indent: int | None = None
+        self.lines: list[str] = []
+        self.last = 0                # the number of its last line
+        self.blanks: list[int] = []  # blank lines since the last line, by number
+
+    def close(self, broken: bool = True) -> None:
+        """``broken``: whether its last line ends in a line break, which `|` and `>`
+        keep."""
+        value = (" " if self.folded else "\n").join(self.lines)
+        self.put(value + ("\n" if self.lines and broken and not self.strip else ""))
+
+
+def _scalar_value(value: str) -> str:
+    """A one-line scalar as YAML reads it, every scalar a string: quotes off (``''`` is
+    ``'`` in single quotes; the gate refuses escapes in double ones), and a plain
+    one's trailing comment off."""
+    v = value.strip()
+    if v[0] == '"':
+        return _QUOTED.match(v).group(0)[1:-1]
+    if v[0] == "'":
+        return _QUOTED.match(v).group(0)[1:-1].replace("''", "'")
+    return v.split(" #", 1)[0].rstrip()
+
+
+def _walk(name: str, text: str) -> tuple[list[str], dict]:
+    """One compose file's lines outside the form read here, as ``file:line: form``,
+    and the tree of nested dicts, lists and strings the lines inside it make. The tree
+    is whole only when the list is empty. See ComposeFormTests."""
     out: list[str] = []
-    # Open blocks: (column, "map" or "seq", the key that opened it).
-    stack: list[tuple[int, str, str | None]] = [(0, "map", None)]
+    root: dict = {}
+    # Open blocks: (column, "map" or "seq", the key that opened it, its container).
+    stack: list[tuple[int, str, str | None, dict | list]] = [(0, "map", None, root)]
     expect: int | None = None    # where the block under a key with no value opens
     expect_key: str | None = None
-    scalar_parent: int | None = None  # in a block scalar, whose lines lie deeper
-    scalar_indent: int | None = None
+    expect_in: dict = root       # the mapping that key is in
+    scalar: _BlockScalar | None = None
     top_seen: list[str] = []
     n = 0
 
     def key(col: int, k: str, value: str | None) -> None:
-        nonlocal expect, expect_key, scalar_parent
+        nonlocal expect, expect_key, expect_in, scalar
+        mapping = stack[-1][3]
         if k in ("extends", "include"):
             out.append(f"{name}:{n}: `{k}`")
         if col == 0:
@@ -2223,30 +2268,50 @@ def _form_violations(name: str, text: str) -> list[str]:
             elif k in top_seen:
                 out.append(f"{name}:{n}: top-level `{k}` again")
             top_seen.append(k)
+        elif k in mapping:
+            # PyYAML keeps the last, a reader the first: two readings of one file.
+            out.append(f"{name}:{n}: {_KEY_TWICE}")
         if not value or not value.strip():
-            expect, expect_key = col + 2, k
+            expect, expect_key, expect_in = col + 2, k, mapping
             return
         form, block = _value_form(value, k)
         if form:
             out.append(f"{name}:{n}: {form}")
-        if block:
+        elif block:
             if not _block_scalar_allowed(k, stack[-1][2]):
                 out.append(f"{name}:{n}: {_BLOCK_SCALAR_ELSEWHERE}")
-            scalar_parent = col
+            scalar = _BlockScalar(col, value.split()[0], lambda v: mapping.__setitem__(k, v))
+        elif value.strip()[0] == "[":
+            mapping[k] = re.findall(r'"([^"]*)"', value)
+        else:
+            mapping[k] = _scalar_value(value)
 
     for n, line in enumerate(text.splitlines(), 1):
         indent = len(line) - len(line.lstrip(" "))
         body = line[indent:]
-        if scalar_parent is not None:
-            if not body.strip():
+        if scalar is not None:
+            # A line of spaces past the block's indent is a line of it, as YAML reads it.
+            if not body.strip() and (scalar.indent is None or len(line) <= scalar.indent):
+                scalar.blanks.append(n)
                 continue
-            if indent > scalar_parent:
-                if scalar_indent is None:
-                    scalar_indent = indent
-                elif indent < scalar_indent:
+            if indent > scalar.parent:
+                if scalar.indent is None:
+                    scalar.indent = indent
+                elif indent < scalar.indent:
                     out.append(f"{name}:{n}: a block scalar line shallower than its first")
+                    continue
+                # A blank line there is a line break YAML keeps, even in a `>` block.
+                out.extend(f"{name}:{b}: {_BLANK_IN_BLOCK_SCALAR}" for b in scalar.blanks)
+                scalar.blanks = []
+                content = line[scalar.indent:]
+                if scalar.folded and content[:1] in (" ", "\t"):
+                    # Folding keeps a deeper line's breaks; the reader joins with spaces.
+                    out.append(f"{name}:{n}: {_FOLDED_DEEPER}")
+                scalar.lines.append(content)
+                scalar.last = n
                 continue
-            scalar_parent = scalar_indent = None
+            scalar.close()
+            scalar = None
         if line.startswith(("---", "...")):
             out.append(f"{name}:{n}: a document marker")
             continue
@@ -2261,7 +2326,9 @@ def _form_violations(name: str, text: str) -> list[str]:
         item = body == "-" or body.startswith("- ")
         if expect is not None:
             if indent == expect:
-                stack.append((indent, "seq" if item else "map", expect_key))
+                block: dict | list = [] if item else {}
+                expect_in[expect_key] = block
+                stack.append((indent, "seq" if item else "map", expect_key, block))
             else:
                 out.append(f"{name}:{n}: not at indent {expect}, under a key with no value")
             expect = None
@@ -2284,21 +2351,47 @@ def _form_violations(name: str, text: str) -> list[str]:
         if not rest.strip() or rest.startswith(" "):
             out.append(f"{name}:{n}: an item not one space after its dash")
             continue
+        items = stack[-1][3]
         m = _KEY_LINE.fullmatch(rest)
         if m:
-            stack.append((indent + 2, "map", None))
+            mapping: dict = {}
+            items.append(mapping)
+            stack.append((indent + 2, "map", None, mapping))
             key(indent + 2, m["key"], m["value"])
             continue
-        form, block = _value_form(rest, None)
+        form, block_scalar = _value_form(rest, None)
         if form:
             out.append(f"{name}:{n}: {form}")
-        if block:
+        elif block_scalar:
             if not _block_scalar_allowed(stack[-1][2], stack[-2][2]):
                 out.append(f"{name}:{n}: {_BLOCK_SCALAR_ELSEWHERE}")
-            scalar_parent = indent
+            items.append("")
+            at = len(items) - 1
+            scalar = _BlockScalar(indent, rest.split()[0],
+                                  lambda v, items=items, at=at: items.__setitem__(at, v))
+        else:
+            items.append(_scalar_value(rest))
+    if scalar is not None:
+        # At the end of the text: its last line has a break if a line or one follows.
+        scalar.close(scalar.last < n or text.endswith(("\n", "\r")))
     if expect is not None:
         out.append(f"{name}:{n}: a key with nothing under it")
-    return out
+    return out, root
+
+
+def _form_violations(name: str, text: str) -> list[str]:
+    """Every line of one compose file outside the form the readers here read, as
+    ``file:line: form``. See ComposeFormTests."""
+    return _walk(name, text)[0]
+
+
+def _compose_tree(name: str, text: str) -> dict:
+    """One compose file as PyYAML's ``BaseLoader`` reads it (nested dicts and lists,
+    every scalar a string), or ComposeFormError naming every line outside the form."""
+    violations, tree = _walk(name, text)
+    if violations:
+        raise ComposeFormError("\n".join(violations))
+    return tree
 
 
 #: Any Makefile line that gives COMPOSE a value: every assignment operator, with
@@ -2371,6 +2464,15 @@ def _probe_in_a_comment_after(item: str) -> Callable[[str], str]:
     return _swap(_TASKS_PROBE, broken.replace(f"{item}\n", f"{item}{was}\n", 1))
 
 
+#: The tasks probe's folded block, its header and first two lines.
+_TASKS_PROBE_HEAD = ("        - >-\n          import os, urllib.request as u;\n"
+                     "          u.urlopen('http://%s:%s/healthz' % (os.environ['TASKS_AGENT_BIND'],\n")
+
+
+def _in_tasks_probe(new_head: str) -> Callable[[str], str]:
+    return _swap(_TASKS_PROBE_HEAD, new_head)
+
+
 _LABEL_BLOCK_SCALAR = _swap("    name: sandbox-net\n    driver: bridge\n    internal: true\n",
                             "    name: sandbox-net\n    driver: bridge\n    labels:\n"
                             "      note: |\n        internal: true\n")
@@ -2392,7 +2494,11 @@ class ComposeFormTests(unittest.TestCase):
       ``command``/``entrypoint``; every scalar on one line, with no backslash escape
       in a double-quoted one (``"/\\x72un"`` is ``/run``);
     - a ``|``/``>`` block only under ``command``, ``entrypoint`` or a healthcheck's
-      ``test``, where the files have them today;
+      ``test``, where the files have them today; its header with no indentation
+      indicator or ``+``, no blank line before or between its lines, and in a ``>``
+      one no line deeper than its first, since YAML keeps those line breaks;
+    - no key twice in one mapping, which PyYAML reads as the last and a line reader
+      as the first;
     - a key with no value has nothing after its colon, not even a comment
       (``_service_names`` matches the bare line);
     - the Makefile's COMPOSE merges exactly ``COMPOSE_FILES``, in order, is assigned
@@ -2531,6 +2637,40 @@ class ComposeFormTests(unittest.TestCase):
          lambda t: t + "volumes:\n  x:\n    name: y\n", "top-level `volumes` again"),
         ("key with nothing under it", "mcp-servers.yml",
          lambda t: t + "    privileged:\n", "a key with nothing under it"),
+        ("keep chomping", "docker-compose.yml",
+         _swap("      - >\n        export LD", "      - >+\n        export LD"),
+         "a block scalar header"),
+        ("indentation indicator", "docker-compose.yml",
+         _swap("      - >\n        export LD", "      - >2\n        export LD"),
+         "a block scalar header"),
+        ("blank line between a block's lines", "docker-compose.yml",
+         _in_tasks_probe(_TASKS_PROBE_HEAD.replace(";\n", ";\n\n", 1)),
+         _BLANK_IN_BLOCK_SCALAR),
+        ("blank line before a block's first", "docker-compose.yml",
+         _in_tasks_probe(_TASKS_PROBE_HEAD.replace(">-\n", ">-\n\n", 1)),
+         _BLANK_IN_BLOCK_SCALAR),
+        ("folded line deeper than its first", "docker-compose.yml",
+         _in_tasks_probe(_TASKS_PROBE_HEAD.replace(";\n", ";\n            pass;\n", 1)),
+         _FOLDED_DEEPER),
+        ("key twice in a service", "mcp-servers.yml",
+         _swap("    read_only: true\n", "    read_only: true\n    read_only: false\n"),
+         _KEY_TWICE),
+        ("key twice in an environment", "mcp-servers.yml",
+         _swap("      HTTPS_PROXY: http://egress-proxy:8080\n",
+               "      HTTPS_PROXY: http://egress-proxy:8080\n"
+               "      HTTPS_PROXY: http://203.0.113.9:3128\n"),
+         _KEY_TWICE),
+    ]
+
+    #: (what, file, edit of the real text) the gate accepts, each a form at the edge
+    #: of the subset, so the parity tests read them too.
+    ACCEPTED: ClassVar[list[tuple[str, str, Callable[[str], str]]]] = [
+        ("blank line after a block's last", "docker-compose.yml",
+         _swap("          os.environ['TASKS_AGENT_PORT']), timeout=3)\n",
+               "          os.environ['TASKS_AGENT_PORT']), timeout=3)\n\n")),
+        ("blank line after a literal block's last, at the end", "mcp-servers.yml",
+         _swap('    command: ["http", "--listen-host", "0.0.0.0", "--port", "8082"]\n',
+               "    command: |\n      http\n        --port 8082\n\n")),
     ]
 
     #: (what, file, edit of the real text, a rule's reading that holds on the real
@@ -2686,6 +2826,18 @@ class ComposeFormTests(unittest.TestCase):
                 found = _form_violations(name, edit((ROOT / name).read_text()))
                 self.assertTrue([v for v in found if form in v], found)
 
+    def test_a_refused_file_is_never_read_as_a_tree(self):
+        for what, name, edit, form in self.MUTANTS:
+            with self.subTest(mutant=what):
+                with self.assertRaises(ComposeFormError) as refused:
+                    _compose_tree(name, edit((ROOT / name).read_text()))
+                self.assertIn(form, str(refused.exception))
+
+    def test_each_accepted_edit_is_accepted(self):
+        for what, name, edit in self.ACCEPTED:
+            with self.subTest(edit=what):
+                self.assertEqual(_form_violations(name, edit((ROOT / name).read_text())), [])
+
     def test_each_anchored_reader_reads_a_key_at_its_own_depth(self):
         module = sys.modules[__name__]
         for what, name, edit, reading in self.READER_MUTANTS:
@@ -2710,6 +2862,149 @@ class ComposeFormTests(unittest.TestCase):
         for what, edit in self.MAKEFILE_MUTANTS:
             with self.subTest(mutant=what):
                 self.assertNotEqual(_makefile_compose_violations(edit(makefile)), [])
+
+
+#: Same arrangement as ``test_control_plane_ui_js.py``: without PyYAML the parity
+#: tests skip, and DOCKADE_REQUIRE_TOOLS turns the skip into a failure.
+_STRICT = bool(os.environ.get("DOCKADE_REQUIRE_TOOLS"))
+#: Reads a JSON list of texts on stdin, writes their trees.
+_PYYAML_TREES = ("import json, sys, yaml\n"
+                 "json.dump([yaml.load(t, Loader=yaml.BaseLoader)"
+                 " for t in json.load(sys.stdin)], sys.stdout)\n")
+
+
+def _shebang_python(script: str) -> list[str] | None:
+    """The command a script's ``#!`` line names, if it runs a Python: an interpreter
+    named ``python...``, given or found by ``env``. Anything else, a ``/bin/sh``
+    wrapper say, would be run with Python's arguments."""
+    with open(script, encoding="utf-8", errors="replace") as text:
+        first = text.readline()
+    command = shlex.split(first[2:]) if first.startswith("#!") else []
+    if command and os.path.basename(command[0]) == "env":
+        interpreter = command[1] if len(command) > 1 else ""
+    else:
+        interpreter = command[0] if command else ""
+    return command if os.path.basename(interpreter).startswith("python") else None
+
+
+def _pyyaml_command() -> list[str] | None:
+    """A Python that imports PyYAML: this one, else the one yamllint's shebang names,
+    since yamllint needs PyYAML; or None. Run, not imported, so the unit suite itself
+    still needs no package."""
+    commands = [[sys.executable]]
+    yamllint = shutil.which("yamllint")
+    if yamllint is not None and (command := _shebang_python(yamllint)):
+        commands.append(command)
+    for command in commands:
+        try:
+            found = subprocess.run(  # noqa: S603 (an interpreter path, fixed arguments)
+                [*command, "-I", "-c", "import yaml"], stdin=subprocess.DEVNULL,
+                capture_output=True, timeout=60, check=False)
+        except OSError:
+            continue
+        if found.returncode == 0:
+            return command
+    return None
+
+
+class PyyamlLookupTests(unittest.TestCase):
+    """Which ``#!`` lines ``_pyyaml_command`` will run as a Python."""
+
+    CASES: ClassVar[list[tuple[str, list[str] | None]]] = [
+        ("#!/home/u/.local/share/pipx/venvs/yamllint/bin/python\n",
+         ["/home/u/.local/share/pipx/venvs/yamllint/bin/python"]),
+        ("#!/usr/bin/env python3\n", ["/usr/bin/env", "python3"]),
+        ("#!/bin/sh\n", None),
+        ("#!/usr/bin/env sh\n", None),
+        ("#!/usr/bin/env\n", None),
+        ("import yamllint\n", None),
+    ]
+
+    def test_only_a_python_shebang_is_taken(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for first, want in self.CASES:
+                with self.subTest(shebang=first):
+                    script = Path(tmp) / "yamllint"
+                    script.write_text(first + "rest\n")
+                    self.assertEqual(_shebang_python(str(script)), want)
+
+
+class ComposeTreeParityTests(unittest.TestCase):
+    """``_compose_tree`` reads what PyYAML's ``BaseLoader`` reads, on every file the
+    gate accepts that this suite has: the real ones, each table's edits, and the forms
+    the subset allows that the real files lack."""
+
+    #: (what, text), each read as mcp-servers.yml.
+    SYNTHETIC: ClassVar[list[tuple[str, str]]] = [
+        ("quoted scalars",
+         "services:\n  x:\n    image: 'it''s'\n    hostname: \"a 'b' # c\"\n"
+         "    environment:\n      A: 'x # not a comment'\n      B: plain # a comment\n"
+         "      C: \"1\"  # after a quote\n      D: a#b\n"),
+        ("literal and folded blocks",
+         "services:\n  x:\n    command: |\n      run  \n      # a line of text\n"
+         "        deeper\n    entrypoint: |-\n      one\n      two\n"
+         "    healthcheck:\n      test:\n        - CMD\n        - >\n"
+         "          folded  \n          text\n\n    restart: always\n"),
+        ("a line of spaces past a literal block's indent",
+         "services:\n  x:\n    command: |\n      a\n" + " " * 9 + "\n    restart: x\n"),
+        ("a block with no lines, and one at the end of the text",
+         "services:\n  x:\n    command: |\n    entrypoint: >\n      a\n      b"),
+        ("a block, then a line of spaces, at the end of the text",
+         "services:\n  x:\n    command: |\n      a\n  "),
+        ("a quoted list and a sequence of mappings",
+         "services:\n  x:\n    command: [\"a b\", \"c\"]\n    volumes:\n"
+         "      - type: bind\n        bind:\n          create_host_path: false\n"
+         "      - a:/b\n"),
+    ]
+
+    command: ClassVar[list[str]]
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        command = _pyyaml_command()
+        if command is not None:
+            cls.command = command
+            return
+        if _STRICT:
+            raise AssertionError(
+                "no Python here imports PyYAML and DOCKADE_REQUIRE_TOOLS is set — "
+                "refusing to report success for the compose tree's parity tests. "
+                "Install yamllint, or drop strict mode to skip them knowingly.")
+        raise unittest.SkipTest("no Python here imports PyYAML")
+
+    def assert_parity(self, docs: list[tuple[str, str, str]]) -> None:
+        """Each (what, file, text) read alike by the tree and by PyYAML."""
+        self.assertTrue(docs)
+        run = subprocess.run(  # noqa: S603 (an interpreter path, fixed arguments)
+            [*self.command, "-I", "-c", _PYYAML_TREES],
+            input=json.dumps([text for _, _, text in docs]),
+            capture_output=True, text=True, timeout=120, check=False)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        for (what, name, text), want in zip(docs, json.loads(run.stdout), strict=True):
+            with self.subTest(what=what):
+                self.assertEqual(_compose_tree(name, text), want)
+
+    def test_the_real_files(self):
+        self.assert_parity([(name, name, (ROOT / name).read_text())
+                            for name in COMPOSE_FILES])
+
+    def test_every_edit_the_gate_accepts(self):
+        tables = ComposeFormTests
+        edits = [(what, name, edit) for what, name, edit, *_ in
+                 (*tables.MUTANTS, *tables.READER_MUTANTS, *tables.ACCEPTED)]
+        docs = [(what, name, text) for what, name, edit in edits
+                if not _form_violations(name, text := edit((ROOT / name).read_text()))]
+        # Every MUTANTS edit is refused, and so is the one READER_MUTANTS row that is
+        # also a MUTANTS row.
+        self.assertEqual(len(docs), len(edits) - len(tables.MUTANTS) - 1)
+        self.assert_parity(docs)
+
+    def test_the_forms_the_files_lack(self):
+        docs = [(what, "mcp-servers.yml", text) for what, text in self.SYNTHETIC]
+        for what, name, text in docs:
+            with self.subTest(what=what):
+                self.assertEqual(_form_violations(name, text), [])
+        self.assert_parity(docs)
 
 
 class BackupRestoreRecipeTests(_MakeRun):

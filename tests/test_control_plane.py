@@ -16,11 +16,13 @@ Dependency-free: ``fastapi``/``pydantic`` are stubbed (see ``tests/_loader.py``)
 and the store is a throwaway SQLite file in a temp dir set before import."""
 from __future__ import annotations
 
+import atexit
 import contextlib
 import importlib.util
 import io
 import json
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -31,6 +33,7 @@ from unittest import mock
 # The module reads CONTROL_DB at import time — point it at a throwaway file and
 # suppress seeding (we drive the rules table directly) before loading.
 _TMP = tempfile.mkdtemp(prefix="dockade-cp-test-")
+atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
 os.environ["CONTROL_DB"] = os.path.join(_TMP, "control.db")
 os.environ["CONTROL_SEED"] = os.path.join(_TMP, "nonexistent-seed.txt")
 

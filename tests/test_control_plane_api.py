@@ -13,11 +13,13 @@ blocking the default 120s."""
 from __future__ import annotations
 
 import asyncio
+import atexit
 import contextlib
 import io
 import json
 import os
 import re
+import shutil
 import sqlite3
 import tempfile
 import threading
@@ -32,6 +34,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 
 _TMP = tempfile.mkdtemp(prefix="dockade-cp-api-test-")
+atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
 os.environ["CONTROL_DB"] = os.path.join(_TMP, "control.db")
 os.environ["CONTROL_SEED"] = os.path.join(_TMP, "nonexistent-seed.txt")
 

@@ -461,11 +461,12 @@ Three choices in it are less obvious than the feature:
   the live log disproved it: two periodic sources (the refused retry loop, the lifeline
   allows) interleave and chop each other's runs into singletons, so run-collapsing folds
   almost nothing on exactly the data that motivated it.
-- **The key is precisely the set of displayed fields.** That is what guarantees no two
-  rows in the list can look identical — rows that would look the same *are* the same
-  group — and it settles the edge cases by itself: `client` is in the key because one host
-  refused for two sandboxes is two facts, while `port`/`proto` are out because keying on
-  what is not shown splits a group into rows a reader cannot tell apart.
+- **The key is the set of displayed fields.** Rows that would look the same are then the
+  same group, and it settles the edge cases by itself: `client` is in the key because one
+  host refused for two sandboxes is two facts, while `port`/`proto` are out because keying
+  on what is not shown splits a group into rows a reader cannot tell apart. The one
+  exception is the approval id on rows without a host: two approved tool calls are two
+  human decisions and stay two lines though they look alike (`audit.grouped`).
 - **The scan is bounded by event count, not by a time window.** Cost then stays fixed as
   the table grows, and coverage adapts on its own — about a day when something is
   retrying every minute, months when nothing is. A time bound would go empty on a quiet

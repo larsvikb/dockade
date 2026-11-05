@@ -253,7 +253,8 @@ def total(conn, filt: Filter) -> int:
 def grouped(conn, limit: int, filt: Filter, scan: int) -> list:
     """The glance: rows folded by exactly the fields the UI displays, newest first.
 
-    The group key is the DISPLAYED fields, plus one that is not: ``approval_id``.
+    The group key is the DISPLAYED fields, plus one that is not: ``approval_id``, on
+    a row without a host.
 
     The displayed part is why the tool columns are in it — two `ok` outcomes for
     different tools are different facts, and folding them on `reason` alone (both NULL)
@@ -271,6 +272,10 @@ def grouped(conn, limit: int, filt: Filter, scan: int) -> list:
     both succeeded are two pull requests; shown as one line with a count, the count is
     the only trace that a second human decision ever happened. Outcomes with no approval
     still fold (NULLs group together), which keeps the high-volume read-only rows quiet.
+    Egress rows carry their card's id too, for the record view's search, and still
+    fold: the id is in the key only for a row without a host. A retried request raises
+    a fresh card per hold window, so splitting on it would turn one agent retrying one
+    host into a line per window — the repetition this view exists to fold.
 
     The cost is stated because it is real: two approved rows look identical on screen
     and nothing there explains why they did not merge. That is the confusion folding-by-
@@ -292,7 +297,8 @@ def grouped(conn, limit: int, filt: Filter, scan: int) -> list:
         "       COUNT(*) AS n, MAX(ts) AS ts, MIN(ts) AS first_ts "
         f"FROM (SELECT * FROM audit {filt.where} ORDER BY ts DESC LIMIT ?) "
         "GROUP BY kind, stage, host, client, client_class, actor, reason, "
-        "         server, tool, status, approval_id "
+        "         server, tool, status, "
+        "         CASE WHEN host IS NULL THEN approval_id END "
         "ORDER BY ts DESC LIMIT ?",
         [*filt.params, scan, limit]).fetchall()
 

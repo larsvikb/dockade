@@ -505,8 +505,9 @@
       <tbody id="audit"></tbody>
     </table>
     <!-- The record: one row per decision. Carries `request` — the method and URL, or
-         the port for a CONNECT tunnel — which is the whole reason to leave the folded
-         view, and the field the glance deliberately drops as unbounded. -->
+         an unusual tunnel port, then the approval id where the row has one — which is
+         the whole reason to leave the folded view, and the field the glance
+         deliberately drops as unbounded. -->
     <table id="audit-events-table" hidden>
       <thead><tr><th>time</th><th>kind</th><th>target</th><th>who</th>
         <th>request</th><th>detail</th></tr></thead>

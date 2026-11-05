@@ -33,6 +33,7 @@ silently reduce the Content-Security-Policy to decoration.
 """
 from __future__ import annotations
 
+import ast
 import atexit
 import functools
 import json
@@ -837,6 +838,10 @@ console.log(JSON.stringify({
         // a fixed vocabulary.
         future_stage: m.auditRow({ ts: 1e9, kind: "deny", stage: "tls",
                                    host: "a.example" }).stagePrefix,
+        // A stage the control plane writes, longer than 12 characters.
+        withdraw_stage: m.auditRow({ ts: 1e9, kind: "withdraw", stage: "tool-withdraw",
+                                     server: "mcp-github", tool: "create_pull_request" })
+                         .stagePrefix,
         // Case is not part of the bound: it does nothing to make a value blend into
         // the host, and suppressing a future `TLS` would be a silent surprise.
         uppercase_stage: m.auditRow({ ts: 1e9, stage: "TLS",
@@ -847,7 +852,7 @@ console.log(JSON.stringify({
         // mutations admitting whitespace, then dots, then colons each survived in turn
         // — the assertions could not say which rule was doing the work.
         rejected: [
-          "x".repeat(13),      // too long
+          "x".repeat(21),      // too long
           "http ",             // trailing space
           "ht tp",             // inner space
           "evil.example",      // a dot: reads as a hostname beside the real one
@@ -860,7 +865,7 @@ console.log(JSON.stringify({
           "",                  // empty
         ].map(s => [s, m.auditRow({ ts: 1e9, stage: s,
                                     host: "a.example" }).stagePrefix]),
-        at_the_length_limit: m.auditRow({ ts: 1e9, stage: "x".repeat(12),
+        at_the_length_limit: m.auditRow({ ts: 1e9, stage: "x".repeat(20),
                                           host: "a.example" }).stagePrefix,
         no_client: m.auditRow({ ts: 1e9, kind: "allow", host: "a.example" }),
         // WHO ACTED, beside who asked: a rule written has an actor and no client, and
@@ -977,6 +982,23 @@ console.log(JSON.stringify({
                                stage: "connect", port: 8443, proto: "connect" }),
         // Neither recorded — an empty cell rather than an invented one.
         bare: m.eventRow({ ts: 1e9, id: 9, host: "c.example" }),
+        // A row that names its card: the id follows whatever the request says, after
+        // its own separator, so every row the search finds by id shows it.
+        held_tunnel: m.eventRow({ ts: 1e9, id: 11, kind: "hold", host: "b.example",
+                                  stage: "connect", port: 443, proto: "connect",
+                                  approval_id: "c".repeat(32) }),
+        held_http: m.eventRow({ ts: 1e9, id: 12, kind: "hold", host: "a.example",
+                                stage: "http", method: "GET",
+                                url: "https://a.example/x", port: 80, proto: "http",
+                                approval_id: "c".repeat(32) }),
+        held_odd_port: m.eventRow({ ts: 1e9, id: 13, kind: "deny", host: "b.example",
+                                    stage: "connect", port: 8443, proto: "connect",
+                                    approval_id: "c".repeat(32) }),
+        // A withdrawal shows its stage prefix and the id of the ask it withdrew.
+        withdrawn: m.eventRow({ ts: 1e9, id: 14, kind: "withdraw",
+                                stage: "tool-withdraw", server: "mcp-github",
+                                tool: "create_pull_request",
+                                approval_id: "d".repeat(32) }),
         nothing: m.eventRow(null),
         // The shared columns must be IDENTICAL to the folded view's, which is the
         // whole reason eventRow builds on auditRow.
@@ -2532,7 +2554,7 @@ class PageScriptTests(unittest.TestCase):
 
     def test_the_record_view_answers_which_approval_for_an_outcome(self):
         """`request` is the "which one was it" cell. For an egress row that is the
-        method and URL; for an outcome it is the approval id, which ties the row to the
+        method and URL, then the approval id where the row has one; for an outcome it is the approval id, which ties the row to the
         hold, the human's answer and the claim the control plane recorded separately.
 
         Its ABSENCE is information too — a call policy allowed outright never had an
@@ -2555,7 +2577,8 @@ class PageScriptTests(unittest.TestCase):
         a = self.probe["saturation"]["audit"]
         self.assertEqual(a["future_stage"], "tls · ")
         self.assertEqual(a["uppercase_stage"], "TLS · ")
-        self.assertEqual(a["at_the_length_limit"], "x" * 12 + " · ")
+        self.assertEqual(a["at_the_length_limit"], "x" * 20 + " · ")
+        self.assertEqual(a["withdraw_stage"], "tool-withdraw · ")
         for value, prefix in a["rejected"]:
             self.assertEqual(prefix, "", f"stage {value!r} must not reach the cell")
 
@@ -3068,6 +3091,20 @@ class PageScriptTests(unittest.TestCase):
         self.assertEqual(e["bare"]["request"], "")
         self.assertEqual(e["nothing"]["request"], "")
 
+    def test_an_event_row_shows_the_approval_id_wherever_it_is_searchable(self):
+        """The record view displays what it searches (`audit.EVENT_SEARCH`): the id
+        follows the request parts, after a separator in the string, so a copied row
+        carries it."""
+        e = self.probe["saturation"]["event_row"]
+        card = "c" * 32
+        self.assertEqual(e["held_tunnel"]["request"], card)
+        self.assertEqual(e["held_http"]["request"], f"GET https://a.example/x · {card}")
+        self.assertEqual(e["held_odd_port"]["request"], f":8443 · {card}")
+        withdrawn = e["withdrawn"]
+        self.assertEqual(withdrawn["stagePrefix"], "tool-withdraw · ")
+        self.assertEqual(withdrawn["target"], "mcp-github__create_pull_request")
+        self.assertEqual(withdrawn["request"], "d" * 32)
+
     def test_both_views_shape_their_shared_columns_identically(self):
         """The reason `eventRow` is built ON `auditRow` rather than beside it. The two
         tables show the same five columns, and a second implementation of the stage
@@ -3447,6 +3484,182 @@ class ToolArgsChangedTests(unittest.TestCase):
         self.assertIn("const reshaped = toolArgsChanged(entry, row.tool);", rows)
         self.assertIn(": reshaped ? `yes — ${reshaped}` : \"yes\"", rows)
         self.assertIn("+ `${item.argsChanged ? `, ${item.argsChanged}` : \"\"}`", picker)
+
+
+#: Every file whose code puts a value in the audit table's `stage` column: the callers
+#: of ``store._audit`` and the store's own SQL, the proxy (its rows reach the column
+#: through `/authorize` or through ingest) and the gateway's outcome line (ingest).
+_STAGE_WRITERS = (*sorted((ROOT / "control-plane").glob("*.py")),
+                  ROOT / "proxies" / "egress" / "addon.py",
+                  ROOT / "tool-gateway" / "outcomes.py")
+
+#: The stage values that are not literals, by (file, top-level definition, source):
+#: each passes on a stage written elsewhere, whose literal the collector reads there.
+_STAGE_PASS_THROUGHS = frozenset({
+    ("api_authorize.py", "_answer", "req.stage"),           # the proxy's, via /authorize
+    ("api_tool.py", "_own_ask", "stage"),                   # its callers' literals
+    ("ingest.py", "_egress_row", "_ingest_field(rec.get('stage'))"),  # the proxy's
+    ("ingest.py", "_insert_for", "<f-string INSERT INTO audit>"),     # the rows' keys
+    ("store.py", "_audit", "?"),                            # its callers' keywords
+    ("addon.py", "_authorize", "stage"),                    # its callers' keywords
+    ("addon.py", "_fail_closed", "stage"),                  # its decorations' literals
+})
+
+_AUDIT_INSERT = re.compile(r"INSERT\s+INTO\s+audit\s*\(([^)]*)\)\s*VALUES\s*\(([^)]*)\)",
+                           re.IGNORECASE)
+_AUDIT_INSERT_START = re.compile(r"INSERT\s+INTO\s+audit\s*\(", re.IGNORECASE)
+
+
+def _stages_in(sources) -> tuple[set[str], list[tuple[str, str, str]]]:
+    """Every literal stage in ``sources`` ((file name, text) pairs), and every stage
+    value that is not a literal, as (file, top-level definition, source).
+
+    Read from the AST, by five routes: `stage=` keywords, `"stage"` dict keys, the
+    stage argument of ``api_tool._own_ask`` and of the proxy's ``_fail_closed``
+    decorator, and the `stage` column of an ``INSERT INTO audit`` written in SQL. An
+    INSERT built as an f-string cannot be read, so it counts as a non-literal."""
+    stages: set[str] = set()
+    other: list[tuple[str, str, str]] = []
+
+    def take(where, node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            stages.add(node.value)
+        else:
+            other.append((*where, ast.unparse(node)))
+
+    for name, text in sources:
+        for top in ast.parse(text).body:
+            where = (name, getattr(top, "name", "<module>"))
+            formatted = {id(v) for n in ast.walk(top) if isinstance(n, ast.JoinedStr)
+                         for v in n.values}
+            for node in ast.walk(top):
+                if isinstance(node, ast.keyword) and node.arg == "stage":
+                    take(where, node.value)
+                elif isinstance(node, ast.Dict):
+                    for key, value in zip(node.keys, node.values):
+                        if isinstance(key, ast.Constant) and key.value == "stage":
+                            take(where, value)
+                elif isinstance(node, ast.Call):
+                    called = getattr(node.func, "id", getattr(node.func, "attr", None))
+                    if called == "_own_ask" and len(node.args) == 4:
+                        take(where, node.args[3])
+                    elif called == "_fail_closed" and node.args:
+                        take(where, node.args[0])
+                elif isinstance(node, ast.JoinedStr) and any(
+                        isinstance(v, ast.Constant) and _AUDIT_INSERT_START.search(v.value)
+                        for v in node.values):
+                    other.append((*where, "<f-string INSERT INTO audit>"))
+                elif (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                      and _AUDIT_INSERT_START.search(node.value)
+                      and id(node) not in formatted):
+                    sql = _AUDIT_INSERT.search(node.value)
+                    columns = [c.strip() for c in sql.group(1).split(",")] if sql else []
+                    values = [v.strip() for v in sql.group(2).split(",")] if sql else []
+                    if len(columns) != len(values) or "stage" not in columns:
+                        other.append((*where, node.value))
+                        continue
+                    value = values[columns.index("stage")]
+                    if re.fullmatch(r"'[^']*'", value):
+                        stages.add(value[1:-1])
+                    else:
+                        other.append((*where, value))
+    return stages, other
+
+
+def _written_stages() -> tuple[set[str], list[tuple[str, str, str]]]:
+    """``_stages_in`` over the files that write the audit column."""
+    return _stages_in((p.name, p.read_text()) for p in _STAGE_WRITERS)
+
+
+_STAGE_PROBE = r"""
+import { pathToFileURL } from "node:url";
+const m = await import(pathToFileURL(`${process.env.DOCKADE_UI_DIR}/audit.js`).href);
+const stages = JSON.parse(process.env.DOCKADE_STAGES);
+console.log(JSON.stringify({
+  ordinary: m.AUDIT_ORDINARY_STAGE,
+  prefixes: stages.map(stage => [stage, m.auditRow({ ts: 1e9, kind: "deny", stage,
+                                                     host: "a.example" }).stagePrefix]),
+}));
+"""
+
+#: One source per collection route, and the stage only that route can find in it.
+_STAGE_ROUTES = {
+    "keyword": ('store._audit("deny", stage="by-keyword")', "by-keyword"),
+    "dict key": ('entry = {"ts": 0, "stage": "by-dict-key"}', "by-dict-key"),
+    "_own_ask": ('ask = _own_ask(token, client, "claim", "by-own-ask")', "by-own-ask"),
+    "_fail_closed": ('@_fail_closed("by-fail-closed", _deny)\ndef hook(flow): pass',
+                     "by-fail-closed"),
+    "SQL": ('conn.execute("INSERT INTO audit(ts, kind, stage) "\n'
+            '             "VALUES (?, \'revoke\', \'by-sql\')", (now,))', "by-sql"),
+    "SQL, other spelling": ('conn.execute("insert into audit (ts, stage) "\n'
+                            '             "values (?, \'by-sql-lower\')")', "by-sql-lower"),
+}
+
+
+class AuditStageGuardTests(unittest.TestCase):
+    """Every stage the control plane, the proxy and the gateway write renders as its
+    own prefix through `auditRow`, and the guard can see every stage written: each
+    collection route finds what it reads, and every value it cannot read is a named
+    pass-through."""
+
+    def test_each_route_collects_its_stage(self):
+        for route, (source, stage) in _STAGE_ROUTES.items():
+            with self.subTest(route=route):
+                self.assertEqual(_stages_in([("synthetic.py", source)]), ({stage}, []))
+
+    def test_a_value_the_collector_cannot_read_is_reported(self):
+        for source in ('store._audit("deny", stage=f"tool-{verb}")',
+                       'store._audit("deny", stage=STAGE)',
+                       'entry = {"stage": kind}',
+                       'conn.execute("INSERT INTO audit(ts, stage) VALUES (?, ?)")',
+                       'conn.execute(f"INSERT INTO audit(ts, stage) VALUES '
+                       '(?, \'{stage}\')")'):
+            with self.subTest(source=source):
+                stages, other = _stages_in([("synthetic.py", source)])
+                self.assertEqual(stages, set())
+                self.assertEqual(len(other), 1, other)
+
+    def test_the_collector_finds_the_stages_it_must(self):
+        stages, _ = _written_stages()
+        self.assertLessEqual({"connect", "http", "sni", "tool-call", "tool-withdraw",
+                              "tool-result", "boot-sweep", "tool-policy"}, stages)
+
+    def test_every_non_literal_stage_is_a_named_pass_through(self):
+        _, other = _written_stages()
+        self.assertEqual(sorted(set(other) - _STAGE_PASS_THROUGHS), [],
+                         "a stage reaches the audit column from a value the guard "
+                         "cannot read. Make it a literal, extend `_stages_in` to read "
+                         "the route it takes, or, if it only passes on a stage written "
+                         "elsewhere, name it in _STAGE_PASS_THROUGHS")
+        self.assertEqual(sorted(_STAGE_PASS_THROUGHS - set(other)), [],
+                         "these pass-throughs no longer exist: drop them")
+
+    def test_every_written_stage_renders_its_own_prefix(self):
+        if not _NODE:
+            if _STRICT:
+                raise AssertionError("node is not installed and DOCKADE_REQUIRE_TOOLS "
+                                     "is set")
+            self.skipTest("node is not installed")
+        stages, _ = _written_stages()
+        proc = subprocess.run(  # noqa: S603 (absolute path, fixed args)
+            [_NODE, "--input-type=module", "-e", _STAGE_PROBE],
+            env={**os.environ, "DOCKADE_UI_DIR": str(_served_dir()),
+                 "DOCKADE_STAGES": json.dumps(sorted(stages))},
+            capture_output=True, text=True, timeout=60, check=False)
+        if proc.returncode != 0:
+            raise AssertionError(f"node could not run the audit.js probe:\n{proc.stderr}")
+        probe = json.loads(proc.stdout)
+        # `connect` is suppressed by design, as the ordinary stage, so it is held to
+        # the shape alone: read from the source, since the module does not export it.
+        shape = re.search(r"const AUDIT_STAGE_SHAPE = /(.*)/;", AUDIT_JS.read_text())
+        self.assertIsNotNone(shape, "AUDIT_STAGE_SHAPE moved or changed form")
+        for stage, prefix in probe["prefixes"]:
+            with self.subTest(stage=stage):
+                if stage == probe["ordinary"]:
+                    self.assertRegex(stage, shape.group(1))
+                    self.assertEqual(prefix, "")
+                else:
+                    self.assertEqual(prefix, f"{stage} · ")
 
 
 class AuditTableSourceTests(unittest.TestCase):

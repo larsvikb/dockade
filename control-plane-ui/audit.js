@@ -28,10 +28,11 @@ export const AUDIT_ORDINARY_STAGE = "connect";
 // ports are reachable; this only decides what is worth printing.
 const ORDINARY_PORT = 443;
 
-// What may be rendered AS a stage prefix. The proxy sends one of two literals
-// (`connect`, `http`) and the field is unvalidated free text all the way to the
-// column, so this bounds the shape rather than the vocabulary — a stage a future
-// hook adds still shows, which is the point of displaying the unusual ones at all.
+// What may be rendered AS a stage prefix. The proxy, the gateway and the control plane
+// each write their own literals (`connect`, `sni`, `tool-withdraw`, …; a test collects
+// them all and renders each through this) and the field is unvalidated free text all
+// the way to the column, so this bounds the shape rather than the vocabulary — a stage
+// a future hook adds still shows, which is the point of displaying the unusual ones.
 //
 // A SHAPE bound, not a security control: `/authorize` is reachable only from
 // control-net, so the agent cannot reach it, and a compromised proxy could do far
@@ -39,15 +40,16 @@ const ORDINARY_PORT = 443;
 // the host and `.qual` does not wrap, so an unbounded value would run into the host
 // it precedes, or push it out of view. This makes "the host cell shows the host" a
 // structural property instead of an argued one.
-// Case is deliberately NOT constrained. Both current stages are lowercase, but
+// Case is deliberately NOT constrained. Every current stage is lowercase, but
 // silently suppressing a future `TLS` would be a confusing debug for no benefit —
 // case does nothing to make a value blend into the host beside it.
-const AUDIT_STAGE_SHAPE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,11}$/;
+// The bound is the status shape's 20 characters below, one bound for both prefixes.
+const AUDIT_STAGE_SHAPE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,19}$/;
 
 // An outcome row's own shape. `kind` says only that this is a result; the STATUS
 // is the information — `ok` against `tool-error` is the difference between "a human
 // approved a PR being opened" and "a PR was opened". Same bound and charset as the
-// stage shape above, widened because `transport-error` is fifteen characters.
+// stage shape above.
 const AUDIT_OUTCOME = "outcome";
 const AUDIT_STATUS_SHAPE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,19}$/;
 
@@ -291,6 +293,10 @@ export function eventRow(r) {
   const url = ((r && r.url) || "").trim();
   const port = Number(r && r.port);
   const proto = ((r && r.proto) || "").trim();
+  const approvalId = String((r && r.approval_id) || "").trim();
+  const asked = [method, url].filter(Boolean).join(" ")
+                || (Number.isFinite(port) && port > 0 && port !== ORDINARY_PORT
+                    ? `:${port}` : "");
   return {
     ...auditRow(r),
     id: r && r.id !== undefined && r.id !== null ? String(r.id) : "",
@@ -312,17 +318,18 @@ export function eventRow(r) {
     //                     agent-controlled unbounded string on the page — capped on
     //                     write (store.DRAIN_MAX_FIELD), escaped by the renderer, with
     //                     the CSP making an escaping mistake inert rather than fatal.
-    //   an approval id    the outcome row's answer to "which one was it": the key
-    //                     tying it to the hold, the human's answer and the claim.
+    //   an approval id    the answer to "which one was it": the key tying a row to
+    //                     its card, the human's answer, the claim and the outcome.
+    //                     Shown on every row that carries one, after the request
+    //                     parts and its own separator, because the record view
+    //                     searches it on every row (audit.EVENT_SEARCH).
     //   a non-standard port   a tunnel to :8443 is worth seeing where :443 is not.
     //
     // An outcome with no approval renders `—` rather than blank, because there the
     // absence is the information: policy allowed that call outright.
     request: r && r.kind === AUDIT_OUTCOME
-             ? (r.approval_id || "—")
-             : [method, url].filter(Boolean).join(" ")
-               || (Number.isFinite(port) && port > 0 && port !== ORDINARY_PORT
-                   ? `:${port}` : ""),
+             ? (approvalId || "—")
+             : [asked, approvalId].filter(Boolean).join(" · "),
   };
 }
 

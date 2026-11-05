@@ -1139,6 +1139,27 @@ class ToolAskRegistrationTests(_ToolAskTestCase):
         self.assertFalse(again.joined)
         self.assertNotEqual(again.approval_id, first.approval_id)
 
+    def test_a_payload_holding_a_lone_surrogate_is_refused_but_is_not_saturation(self):
+        # The row could not be written, and an escaped form could be read back as a
+        # different payload. Refused like an oversized one, for the same reasons.
+        for args in ({chr(0xD800): 1}, {"a": [{"b": "x" + chr(0xDC00)}]}):
+            with self.subTest(args=ascii(args)):
+                refused = cp.holds._register_tool_ask("mcp-github", "issue_write", args)
+                self.assertEqual(refused, cp.holds.ToolAsk(
+                    None, False, "tool arguments hold a lone surrogate, which has no "
+                                 "UTF-8 form", 0.0))
+        self.assertEqual(self._rows(), [])
+        self.assertEqual(cp.holds._saturation()["rejections"], 0)
+
+    def test_non_ascii_and_astral_payloads_still_register(self):
+        # A surrogate PAIR is one astral character, which UTF-8 encodes.
+        for args in ({"title": "Grüße"}, {"title": chr(0x1F600)}):
+            with self.subTest(args=ascii(args)):
+                ask = cp.holds._register_tool_ask("mcp-github", "issue_write", args)
+                self.assertIsNone(ask.refused)
+                (row,) = [r for r in self._rows() if r["id"] == ask.approval_id]
+                self.assertEqual(row["args_json"], cp.holds._canonical_args(args))
+
 
 class ToolAskCapTests(_ToolAskTestCase):
     """Two caps, both about ATTENTION — there is no worker to protect here. What they

@@ -790,6 +790,8 @@ class ResponseShapeTests(_CPTestCase):
 
 #: A lone surrogate: a JSON string can carry it, UTF-8 cannot.
 _SURROGATE = chr(0xD800)
+#: What the store writes for it: its backslash-u escape.
+_ESCAPED = chr(92) + "ud800"
 
 
 class InvalidRequestTests(unittest.TestCase):
@@ -6257,6 +6259,145 @@ class LiveFeedTests(_CPTestCase):
         self.assertEqual(len(lines), 1)
         self.assertIn("a.example\\nAUDIT allow b", lines[0])
         self.assertNotIn("\x1b", lines[0])
+
+    def test_a_lone_surrogate_is_printed_escaped(self):
+        # A strict UTF-8 stdout, the stricter harness: a StringIO prints a surrogate
+        # whole, while the container's python opens stdout with surrogateescape, which
+        # writes U+DC80 to U+DCFF as raw bytes and raises on every other surrogate. A
+        # high and a low one, so neither half of the range can go unescaped.
+        raw = io.BytesIO()
+        out = io.TextIOWrapper(raw, encoding="utf-8", errors="strict")
+        with contextlib.redirect_stdout(out):
+            cp.store._audit("deny", stage="http", host="a" + _SURROGATE + ".example",
+                            reason="r" + chr(0xDFFF))
+        out.flush()
+        self.assertEqual(raw.getvalue().decode(),
+                         f"AUDIT deny stage=http host=a{_ESCAPED}.example "
+                         f":: r{chr(92)}udfff\n")
+
+
+class LoneSurrogateTests(_ToolBridgeTestCase):
+    """A lone surrogate in a request that passes validation, on every enforcer route.
+    It has no UTF-8 form, so SQLite cannot bind it: each route answers rather than
+    500s, and the attempt is audited with the surrogate escaped."""
+
+    audits = True
+
+    def _audit_rows(self, *columns):
+        # The column names are this class's own literals.
+        with cp.store._connect() as conn:
+            return [tuple(r) for r in conn.execute(
+                f"SELECT {', '.join(('kind', *columns, 'reason'))} "  # noqa: S608
+                "FROM audit ORDER BY id")]
+
+    @staticmethod
+    def _forget_audit():
+        """Drop the rows setUp wrote, so a test reads only its own."""
+        with cp.store._connect() as conn:
+            conn.execute("DELETE FROM audit")
+            conn.commit()
+
+    def _count(self, table):
+        with cp.store._connect() as conn:
+            return conn.execute(
+                f"SELECT count(*) FROM {table}").fetchone()[0]  # noqa: S608
+
+    def test_an_escaped_field_is_capped_after_the_escape(self):
+        # Capped first, a field of surrogates would be stored at six times the cap.
+        n = cp.store.DRAIN_MAX_FIELD
+        self._forget_audit()
+        cp.store._audit("deny", stage="http", host=_SURROGATE * n)
+        with cp.store._connect() as conn:
+            (host,), = conn.execute("SELECT host FROM audit").fetchall()
+        self.assertEqual(host, (_ESCAPED * n)[:n])
+
+    def test_authorize_refuses_each_field_and_audits_it(self):
+        # The host is unmatched, so every field but `host` reaches the hold path if
+        # the guard does not stop it first: the empty registry is what shows the
+        # guard sits ahead of the slot.
+        fields = {"host": "unmatched.example", "proto": "https", "client": CLASS_IP,
+                  "method": "GET", "url": "https://unmatched.example/", "stage": "http"}
+        for name in fields:
+            with self.subTest(field=name):
+                self._forget_audit()
+                sent = {**fields, name: fields[name] + _SURROGATE}
+                resp = cp.api_authorize.authorize(cp.api_authorize.AuthorizeRequest(
+                    port=443, **sent))
+                self.assertEqual((resp.decision, resp.reason),
+                                 ("deny", cp.store.UNENCODABLE))
+                self.assertEqual(self._audit_rows(*fields), [
+                    ("deny", *[v.replace(_SURROGATE, _ESCAPED)
+                               for v in sent.values()], cp.store.UNENCODABLE)])
+                self.assertEqual(self._count("approvals"), 0)
+                self.assertEqual((cp.holds._GROUPS, cp.holds._PENDING_EVENTS,
+                                  cp.holds._PENDING_WAITERS), ({}, {}, {}))
+
+    def test_tool_authorize_refuses_each_name_and_audits_it(self):
+        _tool_rule("get_me", "allow")
+        fields = {"server": "mcp-github", "tool": "get_me", "client": CLASS_IP}
+        for name in fields:
+            with self.subTest(field=name):
+                self._forget_audit()
+                sent = {**fields, name: fields[name] + _SURROGATE}
+                self.assertEqual(_tool_call(**sent),
+                                 {"decision": "deny", "reason": cp.store.UNENCODABLE})
+                shown = {k: v.replace(_SURROGATE, _ESCAPED) for k, v in sent.items()}
+                self.assertEqual(self._audit_rows(*fields), [
+                    ("deny", *shown.values(),
+                     f"{shown['tool']} on {shown['server']}: {cp.store.UNENCODABLE}")])
+                self.assertEqual(self._count("tool_approvals"), 0)
+
+    def test_args_holding_one_are_refused_where_an_ask_would_store_them(self):
+        _tool_rule("create_pull_request", "ask")
+        why = "tool arguments hold a lone surrogate, which has no UTF-8 form"
+        for args in ({_SURROGATE: 1}, {"a": [{"b": _SURROGATE}]}):
+            with self.subTest(args=ascii(args)):
+                self._forget_audit()
+                self.assertEqual(_tool_call(tool="create_pull_request", args=args),
+                                 {"decision": "deny", "reason": why})
+                self.assertEqual(self._audit_rows("server", "tool"), [
+                    ("deny", "mcp-github", "create_pull_request",
+                     f"create_pull_request on mcp-github: {why}")])
+                self.assertEqual(self._count("tool_approvals"), 0)
+                self.assertEqual(cp.holds._saturation()["rejections"], 0)
+
+    def test_args_holding_one_still_run_under_allow_since_nothing_stores_them(self):
+        _tool_rule("get_me", "allow")
+        self._forget_audit()
+        self.assertEqual(_tool_call(args={"a": [{"b": _SURROGATE}]})["decision"],
+                         "allow")
+        self.assertEqual(self._audit_rows("tool"), [
+            ("allow", "get_me", "get_me on mcp-github: 'allow' by rule (get_me on "
+                                "mcp-github)")])
+
+    def test_a_pin_answers_args_holding_one_in_an_unpinned_field(self):
+        # Allowed with one row and no ask: nothing stores the args on this path. A
+        # change that did would have to refuse them, as the ask path does.
+        _tool_rule("create_pull_request", "ask")
+        pin_id = _pin(_PINNED)
+        self._forget_audit()
+        answer = _tool_call(tool="create_pull_request",
+                            args={**_PR_ARGS, "body": _SURROGATE})
+        self.assertEqual(answer["decision"], "allow")
+        (row,) = self._audit_rows("tool")
+        self.assertEqual(row[:2], ("allow", "create_pull_request"))
+        self.assertIn(f"by pin {pin_id}", row[2])
+        self.assertEqual(self._count("tool_approvals"), 0)
+
+    def test_claim_and_withdraw_answer_the_unknown_404_and_audit_it(self):
+        _tool_rule("create_pull_request", "ask")
+        answer = _tool_call(tool="create_pull_request", args={"n": 1})
+        approval_id = _ask_id(answer)
+        for verb, call in (("claim", _claim_with), ("withdrawal", _withdraw_with)):
+            with self.subTest(verb=verb):
+                self._forget_audit()
+                response = call(answer["resume_token"], CLASS_IP + _SURROGATE)
+                self.assertEqual(response.status_code, 404)
+                self.assertEqual(self._audit_rows("client", "approval_id"), [
+                    ("deny", CLASS_IP + _ESCAPED, approval_id,
+                     f"{verb} for approval {approval_id} refused: it was raised by "
+                     f"{CLASS_IP}, not by this caller — a leaked or guessed resume "
+                     f"token; answered as unknown")])
 
 
 class ToolFieldCapTests(_ToolBridgeTestCase):

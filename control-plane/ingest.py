@@ -107,9 +107,12 @@ class _Stream:
 
 
 def _ingest_field(value: object) -> str | None:
+    # Escaped before the cap, as ``store._audit`` does: json.loads turns an escaped
+    # lone surrogate back into one, and a row SQLite cannot bind would stop the
+    # stream at that line for good.
     if value is None:
         return None
-    return str(value)[:store.DRAIN_MAX_FIELD]
+    return store._escaped(str(value))[:store.DRAIN_MAX_FIELD]
 
 
 def _parsed(line: bytes) -> dict | None:

@@ -578,6 +578,11 @@ def _register_tool_ask(server: str, tool: str, args: object,
                        f"tool arguments are {len(args_json)} characters; the ceiling is "
                        f"{TOOL_ARGS_MAX} — an ask a human cannot be shown in full is "
                        f"refused rather than shown in part", 0.0)
+    if store._unencodable(args_json):
+        # Refused, not escaped: see control-plane/DESIGN.md, "A lone surrogate is
+        # refused where it is decided on". Not a cap rejection, for the reason above.
+        return ToolAsk(None, False, "tool arguments hold a lone surrogate, which has "
+                                    "no UTF-8 form", 0.0)
     _expire_tool_asks()
     digest = _args_digest(server, tool, args_json)
     now = time.time()

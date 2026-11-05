@@ -223,17 +223,13 @@ def invalid(errors: list[dict]) -> tuple[int, dict]:
               for e in errors[:FAULTS_SHOWN]]
     if len(errors) > FAULTS_SHOWN:
         faults.append(f"and {len(errors) - FAULTS_SHOWN} more")
-    return 422, {"ok": False, "detail": _encodable("; ".join(faults))}
+    return 422, {"ok": False, "detail": store._escaped("; ".join(faults))}
 
 
 def _field(loc: object) -> str:
     # Bounds each loc part in case a typed dict field is added, whose loc would carry
     # a key the request chose.
     return ".".join(str(part)[:100] for part in loc)
-
-
-def _encodable(text: str) -> str:
-    return text.encode("utf-8", "backslashreplace").decode()
 
 
 @app.exception_handler(RequestValidationError)

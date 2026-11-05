@@ -890,9 +890,28 @@ def _seed_if_empty() -> int:
         return len(patterns)
 
 
-#: What ends or rewrites a terminal line: C0 and C1 controls, DEL, and the Unicode
-#: line and paragraph separators. The gateway's outcome stream has the same guard.
-_UNPRINTABLE = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+def _escaped(text: str) -> str:
+    """``text`` with every lone surrogate written as its backslash-u escape, and
+    otherwise unchanged. A JSON string can carry a lone surrogate and UTF-8 cannot,
+    so SQLite cannot bind one: this is the form such text is stored in."""
+    return text.encode("utf-8", "backslashreplace").decode()
+
+
+def _unencodable(*values: object) -> bool:
+    """Whether any of ``values`` is a string ``_escaped`` would change."""
+    return any(isinstance(v, str) and _escaped(v) != v for v in values)
+
+
+#: The reason an enforcer route gives for refusing such a field: see
+#: control-plane/DESIGN.md, "A lone surrogate is refused where it is decided on".
+UNENCODABLE = "a request field holds a lone surrogate, which has no UTF-8 form"
+
+
+#: What ends or rewrites a terminal line: C0 and C1 controls, DEL, the Unicode line
+#: and paragraph separators, and the surrogates, which UTF-8 has no form for: printing
+#: one raises or, under surrogateescape, writes a raw byte. The gateway's outcome
+#: stream has the same guard.
+_UNPRINTABLE = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029\ud800-\udfff]")
 
 
 def _printable(value: object) -> str:
@@ -907,9 +926,10 @@ def _printable(value: object) -> str:
 
 
 def _audit(kind: str, **fields) -> None:
-    # String fields are capped at DRAIN_MAX_FIELD, as the ingest path caps them.
+    # String fields are escaped, so the row can always be written, then capped at
+    # DRAIN_MAX_FIELD. The ingest path does both too.
     def cap(v):
-        return v[:DRAIN_MAX_FIELD] if isinstance(v, str) else v
+        return _escaped(v)[:DRAIN_MAX_FIELD] if isinstance(v, str) else v
     with _connect() as conn:
         conn.execute(
             "INSERT INTO audit(ts, kind, stage, host, port, proto, client, "

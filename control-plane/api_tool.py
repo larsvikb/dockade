@@ -102,8 +102,14 @@ def tool_authorize(req: ToolCallRequest) -> dict:
     digest = getattr(req, "schema_digest", None)
     digest = (digest if isinstance(digest, str) and inventory._DIGEST_RE.fullmatch(digest)
               else None)
-    decision, reason = policy._decide_tool(server, tool,
-                                           req.args if showable else None, digest)
+    # Ahead of policy, which looks the names up. Why, and where ``args`` are refused
+    # instead: control-plane/DESIGN.md, "A lone surrogate is refused where it is
+    # decided on".
+    if store._unencodable(req.server, req.tool, req.client):
+        decision, reason = "deny", store.UNENCODABLE
+    else:
+        decision, reason = policy._decide_tool(server, tool,
+                                               req.args if showable else None, digest)
 
     if decision in ("allow", "deny"):
         store._audit(decision, stage="tool-call", client=req.client,

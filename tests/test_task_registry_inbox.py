@@ -266,6 +266,69 @@ class SectionTests(_Store):
         self.assertEqual(self.rows("waiting")[task]["repo"], "gadgets")
 
 
+class LapsedLandingTests(_Store):
+    """A work claim that lapsed before the operator moved its task to `landing`: the
+    move ended no claim, so the branch is the lapse's."""
+
+    def lapsed(self):
+        task = op.create("widgets", "Held", "Do it.", "open")["task"]
+        self.work(task)
+        self.clock = reads.get_task(task)["claim"]["expires_at"]
+        return task
+
+    def branch(self, task):
+        op.move(task, self.revision(task), "landing")
+        return self.rows("waiting")[task]["reasons"][0]["branch"]
+
+    def test_a_lapse_the_move_sweeps_gives_its_branch(self):
+        self.assertEqual(self.branch(self.lapsed()), "rotate-keys")
+
+    def test_a_lapse_swept_long_before_the_move_gives_its_branch(self):
+        task = self.lapsed()
+        self.claim(self.proposal())
+        self.later()
+        agent.add_note(ALICE, "widgets", task, "Still on it?")
+        self.later()
+        self.assertEqual(self.branch(task), "rotate-keys")
+
+    def test_a_lapse_before_a_move_that_kept_the_state_gives_its_branch(self):
+        task = self.lapsed()
+        op.move(task, self.revision(task), "open")
+        self.later()
+        self.assertEqual(self.branch(task), "rotate-keys")
+
+    def test_a_lapse_before_a_released_claim_gives_none(self):
+        task = self.lapsed()
+        agent.release(ALICE, "widgets", task, self.work(task))
+        self.assertIsNone(self.branch(task))
+
+    def test_a_lapse_before_a_broken_claim_gives_none(self):
+        task = self.lapsed()
+        self.work(task)
+        op.break_claim(task, self.revision(task))
+        self.assertIsNone(self.branch(task))
+
+    def test_a_lapse_before_the_task_was_deferred_and_reopened_gives_none(self):
+        task = self.lapsed()
+        for state in ("deferred", "open"):
+            op.move(task, self.revision(task), state)
+        self.assertIsNone(self.branch(task))
+
+    def test_a_refine_claims_lapse_with_a_branch_gives_none(self):
+        # An older store gave a refine claim a branch, kept on its ending, and history
+        # is never rewritten.
+        task = self.proposal()
+        self.claim(task)
+        self.clock = reads.get_task(task)["claim"]["expires_at"]
+        self.claim(self.proposal())
+        with reg.taskdb.writing() as conn:
+            stamped = conn.execute(
+                "UPDATE history SET detail = json_set(detail, '$.branch', "
+                "'rotate-keys') WHERE task_id = ? AND action = 'lapse'", (task,))
+            self.assertEqual(stamped.rowcount, 1)
+        self.assertIsNone(self.branch(task))
+
+
 class DriftingTests(_Store):
     def test_a_claim_that_ran_out_drifts_until_it_is_swept(self):
         task = op.create("widgets", "Held", "Do it.", "open")["task"]

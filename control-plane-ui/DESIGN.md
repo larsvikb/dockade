@@ -289,6 +289,18 @@ Each move PR adds the steps that exercise its surface to
 `tests/ui-harness/scenario.js`; the tasks page has its own
 (`tests/ui-harness/tasks-scenario.js`, `make ui-diff UI_DIFF_PAGE=tasks`).
 
+A comparison needs two runs of the same page to read the same, so the harness fixes
+what the network and the clock would otherwise decide: the page's API requests are
+answered one at a time in the order it made them, a step ends only once the page is
+quiet, and no answer arrives while time moves or the page navigates — a clock step
+waits for the answers asked for before it, runs its timers, and only then answers what
+they asked for. Settling between timers would be closer to a browser, but Playwright's
+clock has no next-timer call to stop at. The price is what the oracle cannot see: a
+page bug that depends on the order answers arrive in, or on an answer landing
+mid-countdown, reads the same on both sides — task 233 is the first such bug, found by
+the jittered runs that measured this (NOTES.md, "The UI harness had three races, all
+between it and the page").
+
 The comparison sees behaviour only where its scenario runs, and the commonest mistake a
 move makes needs no scenario: a `start()` local left behind, referenced from its new
 file, is a ReferenceError at the first click that reaches it.

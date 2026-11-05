@@ -2005,17 +2005,16 @@ class EveryImageIsBuiltTests(unittest.TestCase):
                     self.assertIn('SANDBOX_JDK= "./$$launcher" --build-only', line)
 
 
-class SecretsDirTests(unittest.TestCase):
-    """``make secrets-dir`` makes ``MCP_SECRETS`` as the invoking user, since the
-    gateway's mount will not have dockerd make it (``create_host_path: false``).
+class _MakeRun(unittest.TestCase):
+    """Runs a target of the Makefile, rather than parsing it, under a temp
+    ``DOCKADE_CONFIG_HOME`` and a cleared environment, so neither a caller's
+    ``MCP_SECRETS``, ``XDG_CONFIG_HOME`` or ``BACKUP_DIR`` nor the ``make test`` it runs
+    under (``-n``, ``-j``) decides what this one does. Stdin is closed."""
 
-    Run, not parsed, which is new for this file: what matters is who owns what after
-    it. A temp ``DOCKADE_CONFIG_HOME`` and a cleared environment, so neither a
-    caller's ``MCP_SECRETS`` or ``XDG_CONFIG_HOME`` nor the ``make test`` it runs
-    under (``-n``, ``-j``) decides what this one does."""
-
-    CLEARED = ("MCP_SECRETS", "XDG_CONFIG_HOME", "DOCKADE_CONFIG_HOME", "MAKEFLAGS",
-               "MFLAGS", "GNUMAKEFLAGS", "MAKELEVEL", "MAKEOVERRIDES", "MAKEFILES")
+    CLEARED = ("MCP_SECRETS", "XDG_CONFIG_HOME", "DOCKADE_CONFIG_HOME", "BACKUP_DIR",
+               "MAKEFLAGS", "MFLAGS", "GNUMAKEFLAGS", "MAKELEVEL", "MAKEOVERRIDES",
+               "MAKEFILES")
+    DEFAULT_TARGET = "secrets-dir"
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -2026,18 +2025,27 @@ class SecretsDirTests(unittest.TestCase):
     def use(self, config: Path) -> None:
         self.config, self.secrets = config, config / "secrets"
 
-    def make(self, *args: str, path: str | None = None) -> subprocess.CompletedProcess[str]:
+    def make(self, *args: str, path: str | None = None,
+             env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         # Absolute, so not resolved through PATH; a failure without make, not a skip,
         # since this suite runs under it.
         make = shutil.which("make")
         self.assertIsNotNone(make, "make is not installed")
-        env = {k: v for k, v in os.environ.items() if k not in self.CLEARED}
-        env["DOCKADE_CONFIG_HOME"] = str(self.config)
+        run_env = {k: v for k, v in os.environ.items() if k not in self.CLEARED}
+        run_env["DOCKADE_CONFIG_HOME"] = str(self.config)
         if path is not None:
-            env["PATH"] = path
+            run_env["PATH"] = path
+        run_env.update(env or {})
         return subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
-            [make, "-s", "-C", str(ROOT), *(args or ("secrets-dir",))], env=env,
-            capture_output=True, text=True, timeout=60, check=False)
+            [make, "-s", "-C", str(ROOT), *(args or (self.DEFAULT_TARGET,))], env=run_env,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60,
+            check=False)
+
+
+class SecretsDirTests(_MakeRun):
+    """``make secrets-dir`` makes ``MCP_SECRETS`` as the invoking user, since the
+    gateway's mount will not have dockerd make it (``create_host_path: false``).
+    What matters is who owns what after it, so it is run."""
 
     def unwritable(self, path: Path) -> None:
         if os.geteuid() == 0:
@@ -2702,6 +2710,101 @@ class ComposeFormTests(unittest.TestCase):
         for what, edit in self.MAKEFILE_MUTANTS:
             with self.subTest(mutant=what):
                 self.assertNotEqual(_makefile_compose_violations(edit(makefile)), [])
+
+
+class BackupRestoreRecipeTests(_MakeRun):
+    """``backup``, ``restore`` and ``restore-tasks`` run against a stub ``docker`` that
+    logs each call, answers every inspect, says the registry is running when asked, and
+    has the store's tool (the ``python3`` entrypoint, not the preflight's ``test``)
+    exit with the status a test sets. What is checked is which calls the recipe makes
+    after the tool: a restart on every status but the sidecar one."""
+
+    SIDECAR_LEFT = "3"
+
+    def setUp(self):
+        super().setUp()
+        self.backups = self.tmp / "backups"
+        self.calls = self.tmp / "docker-calls"
+        stub = self.tmp / "bin"
+        stub.mkdir()
+        (stub / "docker").write_text(f"""#!/bin/sh
+# One line a call: the inline programs are arguments, and span lines.
+printf '%s\\n' "$*" | tr '\\n' ' ' >> "{self.calls}"; echo >> "{self.calls}"
+case " $* " in
+  *" --entrypoint python3 "*) cat > /dev/null; exit "$TOOL_STATUS";;
+  " compose "*" ps "*) if [ -z "$STOPPED" ]; then echo 0123456789ab; fi;;
+esac
+""")
+        (stub / "docker").chmod(0o755)
+        self.path = f"{stub}{os.pathsep}{os.environ['PATH']}"
+
+    def run_target(self, *args: str, tool_status: str, stopped: bool = False,
+                   ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+        run = self.make(*args, path=self.path,
+                        env={"TOOL_STATUS": tool_status, "BACKUP_DIR": str(self.backups),
+                             "STOPPED": "1" if stopped else ""})
+        calls = self.calls.read_text().splitlines() if self.calls.exists() else []
+        return run, calls
+
+    def after_tool(self, calls: list[str]) -> list[str]:
+        tool = [i for i, c in enumerate(calls) if "--entrypoint python3" in c]
+        self.assertEqual(len(tool), 1, calls)
+        return calls[tool[0] + 1:]
+
+    def backup_file(self, name: str) -> str:
+        path = self.tmp / name
+        path.write_bytes(b"SQLite format 3\0" + b"\0" * 100)
+        return str(path)
+
+    def restore(self, target: str, prefix: str, tool_status: str, stopped: bool = False):
+        return self.run_target(target, f"FILE={self.backup_file(prefix + '-x.db')}",
+                               "FORCE=1", tool_status=tool_status, stopped=stopped)
+
+    def test_a_restore_that_left_a_sidecar_does_not_start_the_stack(self):
+        for target, prefix in (("restore", "dockade-control"),
+                               ("restore-tasks", "dockade-tasks")):
+            with self.subTest(target=target):
+                self.calls.unlink(missing_ok=True)
+                run, calls = self.restore(target, prefix, self.SIDECAR_LEFT)
+                self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+                self.assertIn(f"{target}: ", run.stdout)
+                self.assertIn("stopped while that file is there", run.stdout)
+                self.assertEqual(self.after_tool(calls), [])
+
+    def test_a_stopped_registry_left_with_a_sidecar_is_told_so(self):
+        run, calls = self.restore("restore-tasks", "dockade-tasks", self.SIDECAR_LEFT,
+                                  stopped=True)
+        self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("stays stopped while that file is there", run.stdout)
+        self.assertFalse([c for c in calls if " up " in f"{c} "], calls)
+
+    def test_a_refused_restore_starts_the_stack_again(self):
+        for target, prefix, started in (("restore", "dockade-control", " up "),
+                                        ("restore-tasks", "dockade-tasks",
+                                         " up -d --wait --wait-timeout 120 tasks tasks-ui")):
+            with self.subTest(target=target):
+                self.calls.unlink(missing_ok=True)
+                run, calls = self.restore(target, prefix, "1")
+                self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+                self.assertNotIn("stays stopped", run.stdout)
+                [after] = self.after_tool(calls)
+                self.assertTrue(after.startswith("compose "), after)
+                self.assertIn(started, f"{after} ")
+
+    def test_a_restore_that_ran_starts_the_stack_again(self):
+        run, calls = self.restore("restore", "dockade-control", "0")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        [after] = self.after_tool(calls)
+        self.assertIn(" up ", after)
+
+    def test_a_failed_control_plane_snapshot_says_so_and_leaves_no_partial(self):
+        run, calls = self.run_target("backup", tool_status="1")
+        self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+        self.assertIn("backup: FAILED — the control plane's snapshot did not run", run.stdout)
+        self.assertNotIn("Left at", run.stdout)
+        self.assertEqual(list(self.backups.iterdir()), [])
+        # It stops there: the task registry's half is not tried.
+        self.assertEqual(self.after_tool(calls), [])
 
 
 if __name__ == "__main__":

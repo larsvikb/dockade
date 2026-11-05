@@ -336,7 +336,8 @@ agent text back into approved bodies.
 **Restoring is a target of its own, `make restore-tasks FILE=…`,** since a destructive
 step names its store rather than guessing it from the file. It refuses a file the
 registry would not open before it replaces anything, and starts the registry again only
-if it was running. A backup from an older schema the registry takes forward
+if it was running, and never over a sidecar of the replaced store it could not remove
+(`backup.SIDECAR_LEFT`). A backup from an older schema the registry takes forward
 (`taskdb.OPENS`) is restored as it is, and migrated at the next start. The step is
 one-way: an image from before it refuses the migrated store, so going back takes that
 image and a restore of a backup from before the step. Ids carry on from

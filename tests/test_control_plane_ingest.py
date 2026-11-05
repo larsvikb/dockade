@@ -31,16 +31,19 @@ and the store is a throwaway SQLite file in a temp dir set before import."""
 from __future__ import annotations
 
 import asyncio
+import atexit
 import contextlib
 import io
 import json
 import os
+import shutil
 import tempfile
 import time
 import unittest
 from unittest import mock
 
 _TMP = tempfile.mkdtemp(prefix="dockade-cp-ingest-test-")
+atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
 os.environ["CONTROL_DB"] = os.path.join(_TMP, "control.db")
 os.environ["CONTROL_SEED"] = os.path.join(_TMP, "nonexistent-seed.txt")
 

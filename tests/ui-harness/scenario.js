@@ -80,6 +80,25 @@ export const STEPS = [
     await clock(10000);
   }],
 
+  // The agent withdraws an ask: the stream drops its card and names it in
+  // `withdrawn`, so the card says so rather than hedging.
+  ["a tool ask is withdrawn", async ({ page, push }) => {
+    await push([{ ...HOLDS[1], id: "tool-w" }]);
+    await page.evaluate(() => window.__harnessPush({ holds: [], withdrawn: ["tool-w"] }));
+  }],
+  // A deny that lost the race to a withdrawal: the backend's 409 names it.
+  // No clock advance: the snapshot must catch the card's message before its dwell
+  // ends. The next step sweeps it.
+  ["a deny meets a withdrawn ask", async ({ page, push }) => {
+    await push([{ ...HOLDS[1], id: "tool-409" }]);
+    // By id: the withdrawn card from the step above is still on screen, stale.
+    await page.locator('#pending .card.tool[data-id="tool-409"]')
+      .getByRole("button", { name: "Deny", exact: true }).click();
+    await page.mouse.move(0, 0);
+  }],
+  // Both stale cards go, so no later step carries them.
+  ["the departed asks are swept", async ({ clock }) => { await clock(10000); }],
+
   // The MCP tab (mcp.js): the servers form both ways, the tool policy form and
   // table, and the pins table. The lists are fixed, so a write changes what the page
   // sends and says, not what it lists next.

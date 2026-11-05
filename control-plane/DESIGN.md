@@ -260,14 +260,19 @@ silently. Those two lines are each other's safety net — drop the echo and the 
 for the first mistake goes with it — which is why a source-level guard asserts both.
 
 It rides the existing SSE payload rather than a new endpoint — `/approvals` and the
-stream now return `{holds, saturation}` — so a rejection reaches the banner within a
-second through the push the page already listens to, with no new relay-allowlist entry
-and no poll to lag behind the burst. That carries one constraint into the backend: the
-stream emits on *serialized payload change*, so every field must be stable while nothing
-happens. An `elapsed_seconds` convenience would defeat the change detection, silence the
-heartbeat, and make an idle page a 1 Hz firehose — hence absolute timestamps only, with
-the client doing the arithmetic exactly as the countdown already does. A test pins the
-field set for that reason rather than for tidiness.
+stream now return `{holds, saturation, withdrawn}` — so a rejection reaches the banner
+within a second through the push the page already listens to, with no new
+relay-allowlist entry and no poll to lag behind the burst. That carries one constraint
+into the backend: the stream emits on *serialized payload change*, so every field must
+be stable while nothing happens. An `elapsed_seconds` convenience would defeat the
+change detection, silence the heartbeat, and make an idle page a 1 Hz firehose — hence
+absolute timestamps only, with the client doing the arithmetic exactly as the countdown
+already does. A test pins the field set for that reason rather than for tidiness.
+
+`withdrawn`, the ids of tool asks the agent withdrew while pending, rides the same
+payload for the same reasons and meets the same constraint: it changes only when a
+withdrawal lands, and it lets a vanished tool card say *withdrawn by the agent* rather
+than hedge between resolved elsewhere and a restart.
 
 **Duplicate holds share one card — and that changes what a click grants.** A retrying
 agent asks the same question repeatedly, and each attempt used to become its own card

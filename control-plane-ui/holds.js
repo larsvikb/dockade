@@ -142,11 +142,11 @@ export function diffPending(shownIds, list) {
   };
 }
 
-// A card that has left the pending queue (its hold expired, or someone else resolved
-// it) is marked stale in place rather than yanked out, and swept only once removing
-// it cannot move a button under the pointer — i.e. when nothing in the list is
-// hovered or focused. The age cap keeps a cursor parked over the list from freezing
-// it permanently.
+// A card that has left the pending queue (its hold expired, someone else resolved it,
+// or the agent withdrew its ask) is marked stale in place rather than yanked out, and
+// swept only once removing it cannot move a button under the pointer — i.e. when
+// nothing in the list is hovered or focused. The age cap keeps a cursor parked over
+// the list from freezing it permanently.
 export const STALE_MAX_MS = 15000;
 
 // How long a departed card stays on screen REGARDLESS of where the pointer is, by why
@@ -205,11 +205,15 @@ export function countdownState(remainingS, holdTimeout) {
 // the message and how long it dwells (DWELL_MS above) cannot disagree about what
 // happened. Worth distinguishing rather than covering both cases with one hedge: an
 // EXPIRY is a governance outcome — the agent was denied because nobody looked in time —
-// whereas a card vanishing with time still on the clock means something else resolved
-// it. Falls back to the hedge when the window is unknown (/api/config unreachable),
-// because then we genuinely cannot tell, and a card we cannot classify must not claim
-// the expiry wording.
-export function departure(remainingS, holdTimeout) {
+// whereas a card vanishing with time still on the clock was resolved elsewhere, or the
+// control plane restarted. Falls back to the hedge when the window is unknown
+// (/api/config unreachable), because then we genuinely cannot tell, and a card we
+// cannot classify must not claim the expiry wording.
+//
+// `withdrawn` is the backend saying the agent took the ask back, so it is checked
+// before either clock reading: the backend's status outranks the browser's arithmetic.
+export function departure(remainingS, holdTimeout, withdrawn = false) {
+  if (withdrawn) return withdrawnDeparture();
   if (holdTimeout === null || holdTimeout === undefined) {
     return { kind: "gone", dwellMs: DWELL_MS.gone,
              text: "no longer pending — the hold expired (default-denied) or was " +
@@ -222,6 +226,26 @@ export function departure(remainingS, holdTimeout) {
   }
   return { kind: "gone", dwellMs: DWELL_MS.gone,
            text: "no longer pending — resolved elsewhere, or the control plane restarted" };
+}
+
+// Informational like any resolve-elsewhere, so it dwells as long as one.
+function withdrawnDeparture() {
+  return { kind: "withdrawn", dwellMs: DWELL_MS.gone,
+           text: "no longer pending — withdrawn by the agent" };
+}
+
+// The same shape for a resolve the backend refused with a 409 because the ask or hold
+// was no longer pending, from the `status` that body carries (a tool ask's row status;
+// an egress 409 carries none). Only `withdrawn` has words of its own so far.
+//
+// The 409 also says `withdrawn` for an ask approved in another tab and withdrawn
+// before its call was claimed, which the stream's `withdrawn` list leaves out because
+// that card left on the operator's resolve. Accepted: the words are still true, and
+// the window is the moment between the two resolves.
+export function conflictDeparture(status) {
+  if (status === "withdrawn") return withdrawnDeparture();
+  return { kind: "gone", dwellMs: DWELL_MS.gone,
+           text: "no longer pending — the hold expired or was already resolved" };
 }
 
 // What a `+ persist` click is about to write, for the confirm step. The pattern is

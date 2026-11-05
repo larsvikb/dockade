@@ -176,7 +176,8 @@ const owner = {
   "escape.js": ["escapeNonAscii", "isHidden"],
   "holds.js": ["renderableHolds", "diffPending", "shouldSweep",
                "toolRemaining", "toolOutcomeMessage", "pinPreview",
-               "holdRemaining", "countdownState", "departure", "persistPreview",
+               "holdRemaining", "countdownState", "departure",
+               "conflictDeparture", "persistPreview",
                "requestsLabel", "cardSubject", "pendingAnnouncement",
                "approvalNotices", "shouldNotify", "notifyButton"],
   "payload.js": ["payloadDisclosure", "payloadTokens", "indentPayload",
@@ -633,6 +634,23 @@ console.log(JSON.stringify({
     expired: m.departure(0, 120),
     time_left: m.departure(55, 120),
     window_unknown: m.departure(null, null),
+    // The backend's word that the agent withdrew it outranks both clock readings.
+    withdrawn_time_left: m.departure(55, 120, true),
+    withdrawn_at_zero: m.departure(0, 120, true),
+    withdrawn_window_unknown: m.departure(null, null, true),
+  },
+  // Not withdrawn, said explicitly: must read exactly as the two-argument calls do.
+  gone_not_withdrawn: {
+    expired: m.departure(0, 120, false),
+    time_left: m.departure(55, 120, false),
+    window_unknown: m.departure(null, null, false),
+  },
+  // The resolve 409 that says the ask or hold is no longer pending, by its `status`.
+  conflict: {
+    withdrawn: m.conflictDeparture("withdrawn"),
+    expired: m.conflictDeparture("expired"),
+    allowed: m.conflictDeparture("allowed"),
+    absent: m.conflictDeparture(undefined),
   },
   preview: {
     exact: m.persistPreview("allow_persist",
@@ -2032,6 +2050,38 @@ class PageScriptTests(unittest.TestCase):
         # A card we cannot classify must not claim the expiry wording OR its long dwell.
         self.assertEqual(gone["window_unknown"]["kind"], "gone")
         self.assertEqual(gone["window_unknown"]["dwellMs"], dwell["gone"])
+
+    def test_a_withdrawn_card_says_the_agent_withdrew_it_whatever_the_clock(self):
+        # The backend's status, not the browser's arithmetic: a card withdrawn at the
+        # last second must not claim the expiry, and an unknown window must not hedge.
+        gone = self.probe["gone"]
+        dwell = self.probe["dwell"]["values"]
+        for case in ("withdrawn_time_left", "withdrawn_at_zero",
+                     "withdrawn_window_unknown"):
+            with self.subTest(case=case):
+                self.assertIn("withdrawn by the agent", gone[case]["text"])
+                self.assertEqual(gone[case]["kind"], "withdrawn")
+                self.assertEqual(gone[case]["dwellMs"], dwell["gone"])
+
+    def test_a_card_not_withdrawn_reads_as_it_did(self):
+        # Also the other half of the cap's risk: a withdrawn id pushed out of the
+        # backend's list gets today's hedge, never a wrong claim.
+        self.assertEqual(self.probe["gone_not_withdrawn"],
+                         {k: self.probe["gone"][k]
+                          for k in ("expired", "time_left", "window_unknown")})
+        for text in (v["text"] for v in self.probe["gone_not_withdrawn"].values()):
+            self.assertNotIn("withdrawn", text)
+
+    def test_a_409_names_a_withdrawal_and_keeps_todays_text_otherwise(self):
+        conflict = self.probe["conflict"]
+        dwell = self.probe["dwell"]["values"]
+        self.assertEqual(conflict["withdrawn"], self.probe["gone"]["withdrawn_time_left"])
+        for status in ("expired", "allowed", "absent"):
+            with self.subTest(status=status):
+                self.assertEqual(conflict[status], {
+                    "kind": "gone", "dwellMs": dwell["gone"],
+                    "text": "no longer pending — the hold expired or was already "
+                            "resolved"})
 
     def test_an_expired_card_cannot_be_swept_before_it_can_be_read(self):
         # THE defect this fixes: the sweep fires as soon as removal cannot move a
@@ -3785,7 +3835,7 @@ class NotificationWiringSourceTests(unittest.TestCase):
 
     def setUp(self):
         self.src = APP_JS.read_text()
-        self.render = re.search(r"\n  function renderPending\(list\) \{[\s\S]*?\n  \}\n",
+        self.render = re.search(r"\n  function renderPending\(list, withdrawn\) \{[\s\S]*?\n  \}\n",
                                 self.src)
         self.assertIsNotNone(self.render, "renderPending is gone — renamed?")
 
@@ -4427,6 +4477,37 @@ class PersistConflictSourceTests(unittest.TestCase):
             r"d\.already_present\s*\?\s*` · standing rule already in place")
 
 
+class WithdrawnDepartureSourceTests(unittest.TestCase):
+    """Where the backend's word that an ask was withdrawn reaches a card. Both paths
+    live in `start()`, out of reach of the pure-helper probe, and each would fail
+    silently: the card would just keep today's hedge."""
+
+    def setUp(self):
+        self.src = APP_JS.read_text()
+
+    def test_the_no_longer_pending_409_reads_its_status(self):
+        branch = re.search(r"\} else if \(r\.status === 409\) \{(.*?)\n      \}",
+                           self.src, re.S)
+        self.assertIsNotNone(branch, "the general 409 branch is gone")
+        self.assertIn("markStale(entry, conflictDeparture(d.status))", branch.group(1))
+
+    def test_the_stream_hands_the_withdrawn_ids_to_the_render(self):
+        handler = re.search(r'es\.addEventListener\("pending"[\s\S]*?\n    \}\);',
+                            self.src)
+        self.assertIsNotNone(handler, "the pending handler is gone")
+        self.assertIn("renderPending(renderableHolds(d.holds), new Set(d.withdrawn || []))",
+                      handler.group(0))
+
+    def test_only_a_tool_card_consults_the_withdrawn_set(self):
+        # An egress hold cannot be withdrawn, so its departure takes no flag.
+        gone = re.search(r"for \(const id of gone\) \{[\s\S]*?\n    \}", self.src)
+        self.assertIsNotNone(gone, "the departure loop is gone")
+        tool, _, egress = gone.group(0).partition(": departure(")
+        self.assertRegex(tool, r'entry\.kind === "tool"\s*\?\s*departure\(')
+        self.assertIn("withdrawn.has(id)", tool)
+        self.assertNotIn("withdrawn", egress)
+
+
 class DuplicateBadgeSourceTests(unittest.TestCase):
     """The badge is only honest if it is LIVE, and the liveness lives in `start()`
     where no unit test can reach it — so it is asserted against the source, the same
@@ -4441,7 +4522,7 @@ class DuplicateBadgeSourceTests(unittest.TestCase):
         self.src = APP_JS.read_text()
 
     def test_the_count_is_refreshed_on_surviving_cards_not_only_new_ones(self):
-        body = re.search(r"function renderPending\(list\)\s*\{(.*?)\n  \}",
+        body = re.search(r"function renderPending\(list, withdrawn\)\s*\{(.*?)\n  \}",
                          self.src, re.S)
         self.assertIsNotNone(body, "renderPending not found — did it get renamed?")
         # Iterating the incoming list (not just `add`) is the whole point: `add` holds

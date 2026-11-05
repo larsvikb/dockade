@@ -226,6 +226,10 @@ export function respond(method, path, body, query) {
   }
   if (method === "GET" && path in GETS) return { status: 200, json: GETS[path] };
   const resolve = path.match(/^\/approvals\/([^/]+)\/resolve$/);
+  // The agent withdrew this ask before the click landed.
+  if (method === "POST" && resolve && resolve[1] === "tool-409") {
+    return { status: 409, json: { ok: false, status: "withdrawn" } };
+  }
   if (method === "POST" && resolve) {
     return { status: 200, json: resolved(decodeURIComponent(resolve[1]), body) };
   }

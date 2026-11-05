@@ -30,6 +30,7 @@ import {
 import {
   renderableHolds, diffPending, shouldSweep, DWELL_MS,
   toolRemaining, toolOutcomeMessage, holdRemaining, countdownState, departure,
+  conflictDeparture,
   COUNTDOWN_URGENT_S, persistPreview, pinPreview, requestsLabel,
   pendingAnnouncement, approvalNotices, shouldNotify, notifyButton,
 } from "./holds.js";
@@ -785,7 +786,8 @@ function start() {
   // Takes the whole `{text, dwellMs}` from `departure()` rather than the two
   // separately, so the message and how long it stays readable cannot be passed apart —
   // omitting the dwell would silently give an expiry the 5s treatment and undo the fix
-  // above, with nothing failing. The 409 caller below builds the same shape by hand.
+  // above, with nothing failing. The 409 caller below takes it from
+  // `conflictDeparture()` for the same reason.
   function markStale(entry, d) {
     entry.state = "stale";
     entry.staleAt = Date.now();
@@ -882,11 +884,9 @@ function start() {
         disableActions(entry, false);
         setMessage(entry, d.detail || "that rule already exists", "bad");
       } else if (r.status === 409) {
-        // Backend says it is no longer pending (expired, or resolved elsewhere).
+        // Backend says it is no longer pending, and for a tool ask says why.
         // Re-enabling the buttons would only invite a second failing click.
-        markStale(entry, {
-          dwellMs: DWELL_MS.gone,
-          text: "no longer pending — the hold expired or was already resolved" });
+        markStale(entry, conflictDeparture(d.status));
       } else {
         entry.state = "pending";
         entry.el.classList.remove("busy");
@@ -987,7 +987,8 @@ function start() {
     satDismiss.hidden = s.level === "load";
   }
 
-  function renderPending(list) {
+  // `withdrawn`: ids of tool asks the agent withdrew while pending, from the same push.
+  function renderPending(list, withdrawn) {
     pendingCount = list.length;
     const { add, gone } = diffPending([...cards.keys()], list);
     // Before the DOM work, so the announcement reflects what is arriving rather than
@@ -1024,13 +1025,15 @@ function start() {
           || entry.state === "resolving") {
         // Say WHICH way it went. An expiry is a decision the operator failed to make
         // in time and the agent was denied for it; a card leaving with time left is
-        // somebody or something else resolving it. Both used to read the same — and
-        // the expiry now also stays put long enough to be read (see DWELL_MS).
+        // somebody or something else resolving it, or the agent withdrawing its ask.
+        // These used to read the same — and the expiry now also stays put long enough
+        // to be read (see DWELL_MS).
         // A tool card knows its own window, so it can tell an expiry from a
         // resolved-elsewhere even when `/api/config` never answered — the egress card
-        // cannot, and passes null to say so.
+        // cannot, and passes null to say so. Only a tool ask can be withdrawn.
         const d = entry.kind === "tool"
-          ? departure(toolRemaining(entry.deadline, Date.now()), entry.window)
+          ? departure(toolRemaining(entry.deadline, Date.now()), entry.window,
+                      withdrawn.has(id))
           : departure(
             holdTimeout === null ? null
               : holdRemaining(entry.ts, holdTimeout, Date.now()),
@@ -1147,7 +1150,8 @@ function start() {
       const d = JSON.parse(e.data);
       lastSaturation = d.saturation || null;
       renderSaturation();
-      renderPending(renderableHolds(d.holds));
+      // Empty from a backend that predates the key: those cards keep the hedge.
+      renderPending(renderableHolds(d.holds), new Set(d.withdrawn || []));
     });
     es.onerror = () => {
       // The feed is the only thing that tells us about pending approvals, so losing

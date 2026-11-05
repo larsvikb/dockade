@@ -2326,7 +2326,7 @@ shellcheck typo is not queued behind an image build.
 **The build job then runs `make check-boundary`, which is the only automated evidence
 that containment still holds.** Everything else in the gate reads the boundary rather
 than crossing it: shellcheck reads `init-firewall.sh` as text, `tests/test_topology.py`
-reads `docker-compose.yml` as YAML. Between them they assert what the boundary is
+reads the compose files as text. Between them they assert what the boundary is
 *declared* to be, which leaves a firewall regression invisible to every other check here
 — the strongest containment evidence the repo has was a manual `make boundary`. So the
 job stands the stack up and runs `boundary-check.sh` inside a real tier-1 sandbox, from

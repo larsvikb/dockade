@@ -255,13 +255,28 @@ class SchemaDigestTests(ExecutionTestCase):
         self.assertNotEqual(self._sent("issue_read"), before)
 
 
+#: The gateway's clock in AskTests, pinned, and the deadline its fixture answers with:
+#: in the future of that clock, so the ordinary path is the one every test exercises.
+NOW = 1_800_000_000.0  # 2027-01-15 08:00:00 UTC
+DEADLINE = NOW + 3600
+
+
 class AskTests(ExecutionTestCase):
 
     def setUp(self):
         super().setUp()
         self.answer = {"decision": "ask", "reason": "'ask' by rule",
                        "resume_token": TOKEN, "approval_id": DECOY_ID,
-                       "deadline": 1.0, "joined": False}
+                       "deadline": DEADLINE, "joined": False}
+        clock = mock.patch.object(self.execute.time, "time", return_value=NOW)
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    def held(self, deadline: object) -> str:
+        self.answer = {**self.answer, "deadline": deadline}
+        result = self.execute.call("mcp-github__create_pr", {}, None)
+        self.assertFalse(result.get("isError"))
+        return self.text(result)
 
     def test_an_ask_runs_nothing_and_is_not_an_error(self):
         # A result rather than an error, because an agent can act on a result and
@@ -312,6 +327,53 @@ class AskTests(ExecutionTestCase):
         self.answer = {**self.answer, "joined": True}
         self.assertIn("joined",
                       self.text(self.execute.call("mcp-github__create_pr", {}, None)))
+
+    def test_the_pending_result_names_the_deadline_governance_returned(self):
+        # Both forms: the instant does not go stale in the agent's context, the time
+        # left needs no arithmetic.
+        text = self.held(DEADLINE)
+        self.assertIn("2027-01-15 09:00 UTC", text)
+        self.assertIn("(1 hour from now)", text)
+
+    def test_a_different_deadline_reads_differently(self):
+        text = self.held(NOW + 2 * 3600 + 25 * 60)
+        self.assertIn("2027-01-15 10:25 UTC", text)
+        self.assertIn("(2 hours 25 minutes from now)", text)
+        self.assertNotIn("09:00", text)
+
+    def test_neither_form_overstates_the_time_left(self):
+        # Truncated, both: 59 minutes and 59 seconds is not "1 hour", and an instant
+        # 59 seconds into a minute is that minute, not the next.
+        text = self.held(NOW + 3599)
+        self.assertIn("2027-01-15 08:59 UTC", text)
+        self.assertIn("(59 minutes from now)", text)
+        text = self.held(NOW + 61)
+        self.assertIn("2027-01-15 08:01 UTC", text)
+        self.assertIn("(1 minute from now)", text)
+        self.assertIn("(less than a minute from now)", self.held(NOW + 59.9))
+
+    def test_a_deadline_already_past_reads_as_now(self):
+        # The clocks' edge: the control plane's deadline can be behind the gateway's
+        # clock by the time the result is built. Never a negative duration.
+        for deadline in (NOW, NOW - 1, NOW - 7200):
+            with self.subTest(deadline=deadline):
+                sentence = self.held(deadline).split("A human can answer")[1]
+                self.assertIn("(now)", sentence)
+                self.assertNotIn("from now", sentence)
+
+    def test_an_unreadable_deadline_drops_only_its_sentence(self):
+        # Wording, not authority: the token is still good, so the ask is not an error.
+        for deadline in (None, "3600", True, float("nan"), float("inf"), 1e300, 1e18, []):
+            with self.subTest(deadline=deadline):
+                text = self.held(deadline)
+                self.assertIn(TOKEN, text)
+                self.assertIn(self.execute.surface.RESUME_TOOL, text)
+                self.assertNotIn("can answer until", text)
+        self.answer = {k: v for k, v in self.answer.items() if k != "deadline"}
+        result = self.execute.call("mcp-github__create_pr", {}, None)
+        self.assertFalse(result.get("isError"))
+        self.assertIn(TOKEN, self.text(result))
+        self.assertNotIn("can answer until", self.text(result))
 
 
 class ResumeTests(ExecutionTestCase):

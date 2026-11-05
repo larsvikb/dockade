@@ -666,6 +666,39 @@ class RouteTests(_Store):
         self.assertEqual([(r["remote"], r["retired"]) for r in reads.repos()],
                          [(None, False), ("github.com/a/w", False)])
 
+    def test_a_long_repo_name_or_remote_is_named_short(self):
+        long = 200_000
+
+        def cut(char):
+            return f"'{char * 79}... (a string of {long} characters)"
+
+        not_a_name = (f"{cut('n')} is not a repo name: lowercase letters, digits and "
+                      f"hyphens, starting with a letter or digit")
+        not_a_remote = (f"{cut('r')} is not a remote: host/owner/repo, as in "
+                        f"github.com/acme/widgets")
+        missing = (404, {"ok": False, "detail": f"no repo {cut('p')} in the registry",
+                         "current": {"repos": ["widgets"]}})
+        cases = {
+            "a name to add": (api.add_repo, (api.AddRepo(name="n" * long),),
+                              (400, {"ok": False, "detail": not_a_name, "current": None})),
+            "a remote to add": (api.add_repo, (api.AddRepo(name="g", remote="r" * long),),
+                                (400, {"ok": False, "detail": not_a_remote,
+                                       "current": None})),
+            "a new name": (api.rename_repo, ("widgets", api.RenameRepo(new_name="n" * long)),
+                           (400, {"ok": False, "detail": not_a_name, "current": None})),
+            "a remote to set": (api.set_remote, ("widgets", api.SetRemote(remote="r" * long)),
+                                (400, {"ok": False, "detail": not_a_remote,
+                                       "current": None})),
+            "a path to rename": (api.rename_repo, ("p" * long, api.RenameRepo(new_name="g")),
+                                 missing),
+            "a path to set a remote on": (api.set_remote,
+                                          ("p" * long, api.SetRemote(remote=None)), missing),
+            "a path to retire": (api.retire_repo, ("p" * long, api.RetireRepo()), missing),
+        }
+        for case, (route, args, answer) in cases.items():
+            with self.subTest(case):
+                self.assertEqual(self.call(route, *args), answer)
+
     def test_reads_pass_through_with_their_arguments(self):
         op.create("widgets", "Later", "B", "deferred")
         _, open_only = self.call(api.list_tasks, "widgets")
@@ -915,6 +948,19 @@ class InvalidRequestTests(unittest.TestCase):
         self.assertTrue(body["detail"].endswith("; and 5 more"))
         _, body = api.invalid(errors[:api.FAULTS_SHOWN])
         self.assertNotIn("more", body["detail"])
+
+    def test_a_422_and_a_refusal_list_the_same_count(self):
+        # By where the name comes from, not its value: a local 10 would equal it.
+        tree = ast.parse((ROOT / "task-registry" / "operator_api.py").read_text())
+        bound = [type(n).__name__ for n in ast.walk(tree)
+                 if (isinstance(n, ast.ImportFrom)
+                     and any(a.name == "FAULTS_SHOWN" for a in n.names))
+                 or (isinstance(n, ast.Name) and n.id == "FAULTS_SHOWN"
+                     and isinstance(n.ctx, ast.Store))]
+        self.assertEqual(bound, ["ImportFrom"])
+        self.assertEqual([n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
+                          and any(a.name == "FAULTS_SHOWN" for a in n.names)], ["taskdb"])
+        self.assertIs(api.FAULTS_SHOWN, reg.taskdb.FAULTS_SHOWN)
 
     def test_the_app_answers_a_malformed_request_itself(self):
         rejected = sys.modules["fastapi.exceptions"].RequestValidationError

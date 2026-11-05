@@ -20,7 +20,7 @@ import notes
 import plans
 import reads
 import tasks
-from taskdb import Refused
+from taskdb import Refused, quoted, quoted_names
 
 
 @dataclasses.dataclass(frozen=True)
@@ -403,7 +403,7 @@ def call(name: str, arguments: object) -> dict:
     tool = TOOLS.get(name)
     try:
         if tool is None:
-            raise Refused(f"no tool {name!r} here; the tools are {', '.join(TOOLS)}")
+            raise Refused(f"no tool {quoted(name)} here; the tools are {', '.join(TOOLS)}")
         result = tool.run(**_checked(tool, arguments))
     except Refused as refusal:
         content = [{"type": "text", "text": refusal.reason}]
@@ -434,7 +434,7 @@ def _checked(tool: Tool, arguments: object) -> dict:
     params = {p.name: p for p in tool.params}
     unknown = sorted(set(arguments) - set(params))
     if unknown:
-        raise Refused(f"no argument {', '.join(map(repr, unknown))} here; this tool takes "
+        raise Refused(f"no argument {quoted_names(unknown)} here; this tool takes "
                       f"{', '.join(params) or 'none'}")
     missing = [p.name for p in tool.params if p.required and p.name not in arguments]
     if missing:
@@ -462,7 +462,7 @@ def _check_object(where: str, fields: tuple[Param, ...], given: dict) -> None:
     params = {p.name: p for p in fields}
     unknown = sorted(set(given) - set(params))
     if unknown:
-        raise Refused(f"no field {', '.join(map(repr, unknown))} in {where}; it takes "
+        raise Refused(f"no field {quoted_names(unknown)} in {where}; it takes "
                       f"{', '.join(params)}")
     missing = [p.name for p in fields if p.required and p.name not in given]
     if missing:

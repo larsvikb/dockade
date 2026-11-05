@@ -496,7 +496,7 @@ def add_repo(name: str, remote: str | None = None, *, actor: str | None = None) 
     _check_remote(remote)
     with taskdb.writing() as conn:
         if conn.execute("SELECT 1 FROM repos WHERE name = ?", (name,)).fetchone():
-            raise Refused(f"repo {name!r} already exists")
+            raise Refused(f"repo {taskdb.quoted(name)} already exists")
         conn.execute("INSERT INTO repos(name, remote) VALUES (?, ?)", (name, remote))
         taskdb.record(conn, OPERATOR, "add_repo", None, actor=actor, name=name,
                       remote=remote)
@@ -509,7 +509,7 @@ def rename_repo(name: str, new_name: str, *, actor: str | None = None) -> None:
     with taskdb.writing() as conn:
         tasks.repo_id(conn, name)
         if conn.execute("SELECT 1 FROM repos WHERE name = ?", (new_name,)).fetchone():
-            raise Refused(f"repo {new_name!r} already exists")
+            raise Refused(f"repo {taskdb.quoted(new_name)} already exists")
         conn.execute("UPDATE repos SET name = ? WHERE name = ?", (new_name, name))
         taskdb.record(conn, OPERATOR, "rename_repo", None, actor=actor, name=name,
                       new_name=new_name)
@@ -537,8 +537,8 @@ def retire_repo(name: str, retired: bool = True, *, actor: str | None = None) ->
 
 def _check_repo_name(name: object) -> None:
     if not (isinstance(name, str) and tasks.REPO_NAME_RE.fullmatch(name)):
-        raise Refused(f"{name!r} is not a repo name: lowercase letters, digits and "
-                      f"hyphens, starting with a letter or digit")
+        raise Refused(f"{taskdb.quoted(name)} is not a repo name: lowercase letters, "
+                      f"digits and hyphens, starting with a letter or digit")
 
 
 def _check_remote(remote: object) -> None:
@@ -546,5 +546,5 @@ def _check_remote(remote: object) -> None:
         return
     if (not isinstance(remote, str) or not tasks.REMOTE_RE.fullmatch(remote)
             or any(part in (".", "..") for part in remote.split("/"))):
-        raise Refused(f"{remote!r} is not a remote: host/owner/repo, as in "
+        raise Refused(f"{taskdb.quoted(remote)} is not a remote: host/owner/repo, as in "
                       f"github.com/acme/widgets")

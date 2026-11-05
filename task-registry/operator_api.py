@@ -28,16 +28,13 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, StrictBool, StrictInt
 from starlette.exceptions import HTTPException
-from taskdb import Missing, Refused, Stale
+from taskdb import FAULTS_SHOWN, Missing, Refused, Stale
 
 app = FastAPI(title="dockade task registry (operator)",
               openapi_url=None, docs_url=None, redoc_url=None)
 
 #: What ``GET /api/tasks`` takes for "every state": the query string has no None.
 EVERY_STATE = "all"
-
-#: How many of a request's faults a 422 names; the rest are counted.
-FAULTS_SHOWN = 10
 
 #: The header the tasks UI's relay sets to the browser's address, after dropping any
 #: copy a client sent (``tasks-ui/app.py``), and how much of each header ``actor``

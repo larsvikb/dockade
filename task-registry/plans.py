@@ -13,7 +13,7 @@ import time
 import claims
 import notes
 import tasks
-from taskdb import Refused
+from taskdb import Refused, quoted_names
 
 # The caps are the plan's shape as much as storage: a plan that does not fit is over-
 # detailed, or more than one task (`task-registry/DESIGN.md`, "Plans").
@@ -106,7 +106,7 @@ def _check_fields(where: str, given: object, known: set | frozenset,
         raise Refused(f"{where} is an object of {', '.join(sorted(known))}")
     unknown = sorted(set(given) - known, key=str)
     if unknown:
-        raise Refused(f"{where} has no field {', '.join(repr(k)[:60] for k in unknown)}; "
+        raise Refused(f"{where} has no field {quoted_names(unknown)}; "
                       f"it takes {', '.join(sorted(known))}")
     missing = sorted(required - set(given))
     if missing:

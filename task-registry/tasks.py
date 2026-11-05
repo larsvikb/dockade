@@ -83,7 +83,7 @@ def check_id(value: object, what: str = "task") -> int:
     """An id, which must be an int: SQLite finds task 3 under ``"3"`` too, where the
     loop checks' ``==`` would not match it, and a loop would pass."""
     if type(value) is not int or not 0 < value <= ID_MAX:
-        raise Refused(f"{value!r} is not a {what} id")
+        raise Refused(f"{taskdb.quoted(value)} is not a {what} id")
     return value
 
 
@@ -94,9 +94,11 @@ def repo_id(conn: sqlite3.Connection, name: object, *, for_new_task: bool = Fals
     row = None if not (isinstance(name, str) and taskdb.storable(name)) else conn.execute(
         "SELECT id, retired_at FROM repos WHERE name = ?", (name,)).fetchone()
     if row is None:
-        raise Missing(f"no repo {name!r} in the registry", {"repos": active_repos(conn)})
+        raise Missing(f"no repo {taskdb.quoted(name)} in the registry",
+                      {"repos": active_repos(conn)})
     if for_new_task and row["retired_at"] is not None:
-        raise Refused(f"repo {name!r} is retired", {"repos": active_repos(conn)})
+        raise Refused(f"repo {taskdb.quoted(name)} is retired",
+                      {"repos": active_repos(conn)})
     return row["id"]
 
 
@@ -120,19 +122,21 @@ def task_row(conn: sqlite3.Connection, task: int) -> sqlite3.Row:
 def check_in_repo(row: sqlite3.Row, repo: str) -> None:
     """Refuse an agent's write on a task of a repo other than the one it works in."""
     if row["repo"] != repo:
-        raise Refused(f"task {row['id']} belongs to repo {row['repo']!r}, not {repo!r}",
+        raise Refused(f"task {row['id']} belongs to repo {taskdb.quoted(row['repo'])}, "
+                      f"not {taskdb.quoted(repo)}",
                       {"repo": row["repo"]})
 
 
 def check_revision(conn: sqlite3.Connection, row: sqlite3.Row, revision: int) -> None:
     """Refuse a write based on a task as it no longer is, with the task as it is."""
     if type(revision) is not int:
-        raise Refused(f"{revision!r} is not a revision")
+        raise Refused(f"{taskdb.quoted(revision)} is not a revision")
     if row["revision"] != revision:
         import reads  # here, not at the top: reads imports this module
         raise Stale(
-            f"task {row['id']} is at revision {row['revision']}, not {revision}: it "
-            f"changed since it was read", reads.detail(conn, row))
+            f"task {row['id']} is at revision {row['revision']}, not "
+            f"{taskdb.quoted(revision)}: it changed since it was read",
+            reads.detail(conn, row))
 
 
 _UPDATABLE = frozenset({"title", "body", "state", "severity", "kind", "parent_id"})

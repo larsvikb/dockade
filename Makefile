@@ -1025,6 +1025,10 @@ CONTROL_VOLUME := dockade-control-state
 CONTROL_TOOL = docker run --rm -i --network none \
   -v $(CONTROL_VOLUME):/var/lib/control-plane \
   --entrypoint python3 $(CONTROL_IMAGE)
+# The restore tools' exit status for a store replaced with a sidecar of the old one
+# left behind: `restore` and `restore-tasks` start nothing on it. RESTORE_PY's literal,
+# and backup.SIDECAR_LEFT.
+RESTORE_SIDECAR_LEFT := 3
 
 # Prerequisite of both targets. Without it a missing image sends `docker run` to a
 # registry for a name that was never pushed, and a missing volume is worse: docker
@@ -1079,7 +1083,11 @@ backup: control-tool-preflight ## Snapshot the control-plane store (policy + app
 	out="$(BACKUP_DIR)/dockade-control-$$stamp.db"
 	# Written to `.partial` and renamed only after the check below, so an interrupted
 	# transfer never leaves something that looks like a usable backup.
-	$(CONTROL_TOOL) -c "$$BACKUP_PY" > "$$out.partial"
+	if ! $(CONTROL_TOOL) -c "$$BACKUP_PY" > "$$out.partial"; then
+	  rm -f "$$out.partial"
+	  echo "backup: FAILED — the control plane's snapshot did not run"
+	  exit 1
+	fi
 	if [ "$$(head -c 15 "$$out.partial" 2>/dev/null)" != "SQLite format 3" ]; then
 	  echo "backup: FAILED — the stream is not a SQLite database. Left at $$out.partial"
 	  exit 1
@@ -1162,9 +1170,17 @@ restore: control-tool-preflight secrets-dir ## Replace the control-plane store f
 	# that is it working — and the first cut let the refusal abort the recipe, so the
 	# SAFE path was the one that left the governance plane and the proxy down until
 	# someone noticed. A restore that declines to run must cost nothing but the
-	# window. Observed, not theorised: `make restore FILE=README.md`.
+	# window. Observed, not theorised: `make restore FILE=README.md`. The one
+	# exception is a store replaced with a sidecar of the old one left beside it,
+	# which the control plane would apply over the restored store if started.
 	trap '$(COMPOSE) up -d --wait --wait-timeout 120' EXIT
-	$(CONTROL_TOOL) -c "$$RESTORE_PY" < "$(FILE)"
+	status=0
+	$(CONTROL_TOOL) -c "$$RESTORE_PY" < "$(FILE)" || status=$$?
+	if [ "$$status" -eq $(RESTORE_SIDECAR_LEFT) ]; then
+	  trap - EXIT
+	  echo "restore: the control plane and the proxy stay stopped while that file is there; remove it, then make up"
+	fi
+	exit "$$status"
 
 restore-tasks: tasks-tool-preflight ## Replace the task registry's store from a backup: make restore-tasks FILE=<BACKUP_DIR>/dockade-tasks-… (destructive)
 	@# `restore` for the registry's store, a target of its own (task-registry/DESIGN.md,
@@ -1189,10 +1205,11 @@ restore-tasks: tasks-tool-preflight ## Replace the task registry's store from a 
 	  case "$$reply" in y|Y|yes) ;; *) echo "restore-tasks: aborted"; exit 1;; esac
 	fi
 	@# Stopped first, since the store and its sidecars are replaced under it, and
-	# started again, whatever happens next, only if it was running: a restore the
-	# checks refuse must cost nothing but the window (`restore` says how that was
-	# learned). A registry that was stopped stays stopped. Its page is started with it,
-	# as `tasks-up` does, since compose may stop a dependent with the service it needs.
+	# started again, whatever happens next but a sidecar left behind (as `restore`),
+	# only if it was running: a restore the checks refuse must cost nothing but the
+	# window (`restore` says how that was learned). A registry that was stopped stays
+	# stopped. Its page is started with it, as `tasks-up` does, since compose may stop
+	# a dependent with the service it needs.
 	running=$$($(COMPOSE) --profile tasks ps -q --status running tasks)
 	$(COMPOSE) --profile tasks stop tasks
 	if [ -n "$$running" ]; then
@@ -1200,7 +1217,13 @@ restore-tasks: tasks-tool-preflight ## Replace the task registry's store from a 
 	else
 	  echo "restore-tasks: the registry was not running, and stays stopped (make tasks-up)"
 	fi
-	$(TASKS_TOOL) backup.py restore < "$(FILE)"
+	status=0
+	$(TASKS_TOOL) backup.py restore < "$(FILE)" || status=$$?
+	if [ "$$status" -eq $(RESTORE_SIDECAR_LEFT) ]; then
+	  trap - EXIT
+	  echo "restore-tasks: the registry stays stopped while that file is there; remove it, then make tasks-up"
+	fi
+	exit "$$status"
 
 rebuild: secrets-dir ## Rebuild every default image from scratch — proxy, control plane, UI, gateway, task registry, both sandbox tiers — then recreate the infra
 	# Deliberately does NOT `down` first. A build touches no running container, so
@@ -1612,8 +1635,9 @@ for side in ("-wal", "-shm"):
     except FileNotFoundError:
         pass
     except OSError as e:
-        sys.exit(f"restore: RESTORED but could not remove {dst + side} ({e}) — "
-                 f"remove it before starting the control plane")
+        print(f"restore: RESTORED but could not remove {dst + side} ({e}) — "
+              f"remove it before starting the control plane", file=sys.stderr)
+        sys.exit(3)  # RESTORE_SIDECAR_LEFT
 
 print(f"restore: store replaced from a schema-v{version} backup (" +
       ", ".join(f"{n} {t}" for t, n in counts.items()) + ")")

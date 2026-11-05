@@ -32,6 +32,12 @@ ADDED_IN = {"plans": 2, "plan_paths": 2, "decisions": 4, "decision_options": 4,
 #: What a snapshot and a restore report counting.
 COUNTED = ("repos", "tasks", "notes")
 
+#: A restore's exit status when the store was replaced and a sidecar of the old one
+#: could not be removed: ``make restore-tasks`` does not start the registry on it.
+#: Its own value, as a refusal and an uncaught error both exit 1. The Makefile's
+#: ``RESTORE_SIDECAR_LEFT`` and ``RESTORE_PY`` give the control plane's the same.
+SIDECAR_LEFT = 3
+
 
 def say(text: str) -> None:
     # stdout carries the store's bytes, so every line for a human goes to stderr.
@@ -127,8 +133,9 @@ def restore(inp: BinaryIO) -> None:
         except FileNotFoundError:
             pass
         except OSError as e:
-            sys.exit(f"restore-tasks: RESTORED but could not remove {dst + side} ({e}) "
-                     f"— remove it before starting the registry")
+            say(f"restore-tasks: RESTORED but could not remove {dst + side} ({e}) "
+                f"— remove it before starting the registry")
+            sys.exit(SIDECAR_LEFT)
     say(f"restore-tasks: store replaced from a schema-v{version} backup ({_counted(counts)})")
 
 

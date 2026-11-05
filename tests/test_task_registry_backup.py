@@ -68,6 +68,8 @@ class _Stores(unittest.TestCase):
         with self.assertRaises(SystemExit) as caught, \
                 contextlib.redirect_stderr(io.StringIO()):
             backup.restore(io.BytesIO(data))
+        # Not the status `make restore-tasks` leaves the registry stopped on.
+        self.assertNotEqual(caught.exception.code, backup.SIDECAR_LEFT)
         return str(caught.exception.code)
 
     def rows(self, path: str) -> dict[str, list[tuple]]:
@@ -330,6 +332,24 @@ class RestoreTests(_Stores):
     def test_a_store_it_cannot_replace_is_left_as_it_was(self):
         with mock.patch.object(backup.os, "replace", side_effect=PermissionError("sticky")):
             self.assert_refused(self.backup, "could not replace")
+
+    def test_a_sidecar_it_cannot_remove_is_its_own_exit_status(self):
+        wal = self.live + "-wal"
+        self.write(wal, b"left behind" * 100)
+        real_unlink = os.unlink
+
+        def unlink(path):
+            if path == wal:
+                raise PermissionError("another uid's")
+            real_unlink(path)
+        err = io.StringIO()
+        with mock.patch.object(backup.os, "unlink", side_effect=unlink), \
+                self.assertRaises(SystemExit) as caught, contextlib.redirect_stderr(err):
+            backup.restore(io.BytesIO(self.backup))
+        self.assertEqual(caught.exception.code, backup.SIDECAR_LEFT)
+        self.assertNotIn(backup.SIDECAR_LEFT, (0, 1, 2))
+        self.assertIn(f"RESTORED but could not remove {wal}", err.getvalue())
+        self.assertFalse(os.path.exists(self.live + ".restore-incoming"))
 
     def next_ids(self) -> tuple[int, int]:
         task = op.create("widgets", "Next", "After the restore.", "open")["task"]
@@ -703,6 +723,14 @@ class MakefileTargetsAgreeTests(unittest.TestCase):
         m = re.search(rf"^{target}:.*\n((?:\t.*\n|\n)*)", self.MAKEFILE, re.M)
         self.assertIsNotNone(m, f"no {target} target")
         return m.group(1)
+
+    def test_both_restores_leave_a_sidecar_with_the_status_the_recipes_hold_on(self):
+        self.assertEqual(self.variable("RESTORE_SIDECAR_LEFT").strip(),
+                         str(backup.SIDECAR_LEFT))
+        restore_py = re.search(r"^define RESTORE_PY\n(.*?)^endef", self.MAKEFILE,
+                               re.M | re.S).group(1)
+        self.assertEqual(re.findall(r"sys\.exit\((\d+)\)", restore_py),
+                         [str(backup.SIDECAR_LEFT)])
 
     def test_the_image_is_the_one_compose_builds(self):
         self.assertEqual(_scalar(_service("tasks"), "image"), self.variable("TASKS_IMAGE"))

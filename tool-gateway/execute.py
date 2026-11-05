@@ -392,12 +392,49 @@ def call(name: str, arguments: object, client: str | None) -> dict:
             f"with any change in the arguments it opens a second question for the "
             f"same human. If you no longer want the call, {surface.WITHDRAW_TOOL} "
             f"with the same token takes the question back."
+            + _answer_window(answer.get("deadline"), time.time())
             + ("\nAn identical request was already waiting, and this joined it."
                if answer.get("joined") else ""))
     # Every other answer is a deny, INCLUDING one this code does not recognise. The
     # control plane already refuses that way; repeating it here means a bridge that
     # answered something new could not turn into a grant on the way through.
     return text_result(f"Denied: {why}. This will not succeed on retry.", is_error=True)
+
+
+def _answer_window(deadline: object, now: float) -> str:
+    """The sentence saying until when a human may answer, or "" if ``deadline`` is
+    not an instant.
+
+    BOTH FORMS, because each covers the other's weakness: the UTC instant does not go
+    stale in the agent's context, and the time left needs no clock arithmetic. Both
+    are TRUNCATED, so neither overstates what is left. The time left is reckoned
+    against this gateway's clock and ``deadline`` against the control plane's; they
+    agree because both are containers on the same Docker host, which is a deployment
+    fact rather than a guarantee, and the instant is the authority either way.
+
+    Wording, not authority, as with ``_resume_wait``: a deadline that is missing or
+    unreadable drops the sentence and nothing else, because the token is still good."""
+    if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
+        return ""
+    try:
+        instant = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(deadline))
+    except (OverflowError, OSError, ValueError):  # NaN, infinite, or out of range
+        return ""
+    hours, minutes = divmod(int((deadline - now) // 60), 60)
+    parts = ([_count(hours, "hour")] if hours else []) \
+        + ([_count(minutes, "minute")] if minutes else [])
+    if deadline <= now:
+        left = "now"
+    elif not parts:
+        left = "less than a minute from now"
+    else:
+        left = " ".join(parts) + " from now"
+    return (f"\nA human can answer until {instant} ({left}); if none has by then, the "
+            f"question expires and the call is refused.")
+
+
+def _count(n: int, unit: str) -> str:
+    return f"{n} {unit}" if n == 1 else f"{n} {unit}s"
 
 
 def _resume_token(arguments: object) -> str | None:

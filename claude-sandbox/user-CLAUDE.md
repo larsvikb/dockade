@@ -20,12 +20,12 @@ here. It is written down so you spend no turns discovering it.
   pass `wait_seconds` and the call blocks until the human answers (capped, and well
   inside any timeout), or do other work and come back with a zero wait. Prefer the
   wait when you have nothing else to do and the zero wait when you have. Either way
-  give up after a few tries: the human's window is an hour, and a human who has
-  stepped away is not helped by spinning. Calling the TOOL again is the different
-  thing: unless its arguments are identical and the first is still pending, it raises
-  a **second** question for the same person. If you no longer want a held call,
-  `withdraw_tool_call` with the same id takes the question back — use it the moment
-  your plan changes. A tool whose description begins
+  give up after a few tries: the held result says when its question expires, and a
+  human who has stepped away is not helped by spinning. Calling the TOOL again is
+  the different thing: unless its arguments are identical and the first is still
+  pending, it raises a **second** question for the same person. If you no longer
+  want a held call, `withdraw_tool_call` with the same id takes the question back —
+  use it the moment your plan changes. A tool whose description begins
   "Approval required" is one of these, so you can plan around it rather than
   discover it. A refusal says retrying will not help, and means it.
 - **A task registry may be among those tools.** `mcp__gateway__tasks__…` is a work

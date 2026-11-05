@@ -5,9 +5,10 @@ hold-for-approval, on internal networks the sandbox is not attached to. The egre
 proxy and the MCP gateway ask it before acting, and what policy does not decide is
 held for a human, who answers in the UI.
 
-This file is the PROCESS — the three listeners, which surface each one serves, the
-boot, and the entry point. The routes live one module per surface, each on its own
-router, and are mounted on a listener here and nowhere else:
+This file is the PROCESS — the three listeners, which surface each one serves, their
+shared answer to a malformed request, the boot, and the entry point. The routes live
+one module per surface, each on its own router, and are mounted on a listener here
+and nowhere else:
 
   - ``api_authorize`` — ``POST /authorize``, the egress proxy's question.
   - ``api_tool``      — ``/tool/*``, the MCP gateway's bridge.
@@ -91,6 +92,7 @@ import holds
 import ingest
 import store
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 # ── the three listeners (see the module docstring) ──────────────────────────
@@ -150,6 +152,10 @@ _MANAGE_BIND_FORBIDDEN = os.environ.get(
 #: values stay env vars").
 AUTHORIZE_BODY_MAX = int(os.environ.get("CONTROL_AUTHORIZE_BODY_MAX", str(64 * 1024)))
 TOOL_BODY_MAX = int(os.environ.get("CONTROL_TOOL_BODY_MAX", str(2 * 1024 * 1024)))
+#: How many of a request's faults a 422 names; the rest are counted. A plain constant:
+#: it bounds a message and grants nothing, so the env-var rule for bounds does not
+#: reach it.
+FAULTS_SHOWN = 10
 
 
 # None of the three serves FastAPI's schema or docs pages (/openapi.json, /docs,
@@ -203,6 +209,39 @@ def _body_cap(cap: int):
 # what the sandbox can lean on.
 authorize_app.middleware("http")(_body_cap(AUTHORIZE_BODY_MAX))
 tool_app.middleware("http")(_body_cap(TOOL_BODY_MAX))
+
+
+def invalid(errors: list[dict]) -> tuple[int, dict]:
+    """A request not shaped as its route takes it: each field and what is wrong with
+    it, never the value, in the control plane's own refusal shape. FastAPI's own
+    answer echoes every rejected input, and one a JSON string can carry but UTF-8
+    cannot, a lone surrogate, then fails to encode and answers 500.
+
+    ``msg`` is pydantic's fixed text while no model here has a custom validator; one
+    that raised with the input in its message would leak it through here."""
+    faults = [f"{_field(e.get('loc', ()))}: {e.get('msg', 'invalid')}"
+              for e in errors[:FAULTS_SHOWN]]
+    if len(errors) > FAULTS_SHOWN:
+        faults.append(f"and {len(errors) - FAULTS_SHOWN} more")
+    return 422, {"ok": False, "detail": _encodable("; ".join(faults))}
+
+
+def _field(loc: object) -> str:
+    # Bounds each loc part in case a typed dict field is added, whose loc would carry
+    # a key the request chose.
+    return ".".join(str(part)[:100] for part in loc)
+
+
+def _encodable(text: str) -> str:
+    return text.encode("utf-8", "backslashreplace").decode()
+
+
+@app.exception_handler(RequestValidationError)
+@authorize_app.exception_handler(RequestValidationError)
+@tool_app.exception_handler(RequestValidationError)
+async def invalid_request(_request: Request, exc: RequestValidationError) -> JSONResponse:
+    status, body = invalid(exc.errors())
+    return JSONResponse(body, status_code=status)
 
 
 # ── what each listener serves ───────────────────────────────────────────────

@@ -4938,10 +4938,6 @@ class ApprovalPageTests(PageChecks, unittest.TestCase):
         return ids
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 @unittest.skipIf(not _NODE and not _STRICT,
                  "node is not installed — skipping app.js unit tests")
 class PinnedAllowViewTests(unittest.TestCase):
@@ -5656,3 +5652,7 @@ class PayloadColourTests(unittest.TestCase):
         for kind in ("key", "value", "escape", "punct", "mark"):
             with self.subTest(kind):
                 self.assertRegex(html, rf"\.j-{kind}\b[^{{]*\{{[^}}]*color:")
+
+
+if __name__ == "__main__":
+    unittest.main()

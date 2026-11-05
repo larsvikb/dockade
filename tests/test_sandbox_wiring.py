@@ -267,10 +267,6 @@ class JdkVariantWiringTests(unittest.TestCase):
         self.assertNotIn("SC_BUILD_ARGS", opencode)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TierHookPrivilegeTests(unittest.TestCase):
     """Root touches the image layer; the sandbox user touches the volume.
 
@@ -352,3 +348,7 @@ class TierHookPrivilegeTests(unittest.TestCase):
         self.assertEqual([line for line in code if "launch-settings.json" in line],
                          ["plugin_advisory /etc/claude-code/launch-settings.json \\"])
         self.assertNotIn(">>", "\n".join(code))
+
+
+if __name__ == "__main__":
+    unittest.main()

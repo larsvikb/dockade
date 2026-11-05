@@ -756,3 +756,7 @@ class MakefileTargetsAgreeTests(unittest.TestCase):
             with self.subTest(target=target):
                 recipe = self.recipe(target)
                 self.assertLess(recipe.index(other), recipe.index(" stop "))
+
+
+if __name__ == "__main__":
+    unittest.main()

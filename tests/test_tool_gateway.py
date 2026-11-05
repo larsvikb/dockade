@@ -227,10 +227,6 @@ class ReconcilePacingTests(unittest.TestCase):
         self.assertEqual(printed.count("report:"), 2)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ReconcileSurvivalTests(unittest.TestCase):
     """An exception inside one iteration costs one tick, not the thread.
 
@@ -354,3 +350,6 @@ class BodyCapTests(unittest.TestCase):
         with self.assertRaises(gateway.BodyTooLarge):
             asyncio.run(gateway.read_body(self._Request([b"x" * 11])))
 
+
+if __name__ == "__main__":
+    unittest.main()

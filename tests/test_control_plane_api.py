@@ -7616,10 +7616,6 @@ class ActorHeaderAgreementTests(unittest.TestCase):
         self.assertEqual(m.group(1), cp.provenance.ACTOR_HEADER)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class BodyCapTests(unittest.TestCase):
     """The enforcer-facing listeners refuse an oversized body before FastAPI reads it.
 
@@ -7667,3 +7663,6 @@ class BodyCapTests(unittest.TestCase):
         self.assertGreater(cp.TOOL_BODY_MAX, 1024 * 1024,
                            "the tool bridge must accept what the gateway lets through")
 
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1006,10 +1006,6 @@ class OutcomeRecordTests(ExecutionTestCase):
             self.execute._ask_control = real
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ResumeWaitTests(ExecutionTestCase):
     """`resume_tool_call` may wait for the human, and waiting changes nothing else.
 
@@ -1222,3 +1218,7 @@ class ControlAnswerTests(unittest.TestCase):
             b"HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\n"
             b"Content-Length: %d\r\nConnection: close\r\n\r\n%s" % (len(body), body)))
         self.assertEqual(self.ask()["status"], "pending")
+
+
+if __name__ == "__main__":
+    unittest.main()

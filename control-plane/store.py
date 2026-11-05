@@ -822,6 +822,11 @@ def _init_db() -> None:
             )""")
         conn.execute("CREATE INDEX IF NOT EXISTS tool_approvals_status "
                      "ON tool_approvals(status)")
+        # ``holds._list_withdrawn`` reads the newest withdrawals once per listener per
+        # second, and this table is never pruned: without the index that is a scan and
+        # a sort of every withdrawn row, growing with each one.
+        conn.execute("CREATE INDEX IF NOT EXISTS tool_approvals_status_resolved "
+                     "ON tool_approvals(status, resolved_at)")
         conn.execute(_TOOL_APPROVALS_RESUME_INDEX)
         # Ingest cursors, one per audit file the control plane tails (``ingest._drain``:
         # the egress proxy's and the tool gateway's). `inode` tells a rotated file from

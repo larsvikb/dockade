@@ -921,9 +921,27 @@ def _list_tool_asks() -> list[dict]:
             for r in rows]
 
 
+def _list_withdrawn() -> list[str]:
+    """Ids of the tool asks the agent withdrew WHILE PENDING, newest first: what tells
+    the page a card that left the queue was withdrawn rather than resolved elsewhere.
+
+    ``resolved_by`` NULL is ``_register_tool_ask``'s cooldown predicate: an approved
+    ask withdrawn later left the queue on the operator's own resolve. Capped at
+    ``MAX_TOOL_PENDING`` because only a card that was on screen needs naming, and
+    clamped at 0 because a negative SQLite LIMIT means no limit. The list changes only
+    when a withdrawal lands, so it keeps the stream quiet between events."""
+    with store._connect() as conn:
+        rows = conn.execute(
+            "SELECT id FROM tool_approvals "
+            "WHERE status='withdrawn' AND resolved_by IS NULL "
+            "ORDER BY resolved_at DESC LIMIT ?",
+            (max(MAX_TOOL_PENDING, 0),)).fetchall()
+    return [r["id"] for r in rows]
+
+
 def _pending_payload() -> dict:
-    """What the approvals view needs, in one object: the holds AND the hold-cap
-    pressure beside them.
+    """What the approvals view needs, in one object: the holds, the hold-cap pressure
+    beside them, and the tool asks withdrawn from the queue (``_list_withdrawn``).
 
     Not a second endpoint: the SSE stream already re-serializes this each second and
     emits on change, so a rejection reaches the banner within a second through the
@@ -938,4 +956,8 @@ def _pending_payload() -> dict:
     decision has waited longest, whichever subsystem raised it."""
     holds_and_asks = _list_pending() + _list_tool_asks()
     holds_and_asks.sort(key=lambda card: card["ts"])
-    return {"holds": holds_and_asks, "saturation": _saturation()}
+    # Read AFTER the queue: a withdrawal landing between the two reads then puts an id
+    # in both lists, which is harmless, rather than in neither, which would leave its
+    # card the vaguer wording for good.
+    return {"holds": holds_and_asks, "saturation": _saturation(),
+            "withdrawn": _list_withdrawn()}

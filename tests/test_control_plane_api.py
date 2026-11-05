@@ -3255,7 +3255,7 @@ class SaturationTests(_CPTestCase):
     def test_the_payload_carries_the_holds_and_the_pressure_together(self):
         _hold("a.example", "held-1")
         payload = cp.api_approvals.approvals()
-        self.assertEqual(set(payload), {"holds", "saturation"})
+        self.assertEqual(set(payload), {"holds", "saturation", "withdrawn"})
         self.assertEqual([h["id"] for h in payload["holds"]], ["held-1"])
         self.assertEqual(payload["saturation"]["in_flight"], 1)
         # Both global caps travel, because either can be the one about to fire and the
@@ -5475,6 +5475,100 @@ class ToolWithdrawTests(_ToolBridgeTestCase):
             self.assertEqual(
                 _tool_call(tool="create_pull_request", args={"n": 2})["decision"],
                 "ask")
+
+
+class WithdrawnPayloadTests(_ToolBridgeTestCase):
+    """The pending payload's ``withdrawn`` list: what lets a tool card that left the
+    queue say the agent withdrew it, rather than hedge (``holds._list_withdrawn``)."""
+
+    def _ask(self, n, client=CLASS_IP):
+        _tool_rule("create_pull_request", "ask")
+        return _ask_id(_tool_call(tool="create_pull_request", args={"n": n},
+                                  client=client))
+
+    def _withdrawn_at(self, approval_id, at):
+        with cp.store._connect() as conn:
+            conn.execute("UPDATE tool_approvals SET resolved_at=? WHERE id=?",
+                         (at, approval_id))
+            conn.commit()
+
+    def test_an_ask_withdrawn_while_pending_is_named_and_off_the_queue(self):
+        ask = self._ask(1)
+        _withdraw(ask)
+        payload = cp.holds._pending_payload()
+        self.assertEqual(payload["withdrawn"], [ask])
+        self.assertNotIn(ask, [c["id"] for c in payload["holds"]])
+
+    def test_only_a_withdrawal_while_pending_is_named(self):
+        # Approved then withdrawn: the card left on the operator's own resolve, so
+        # there is nothing to explain. Denied and expired asks were never withdrawn.
+        approved = self._ask(1)
+        _resolve(approved, "allow")
+        _withdraw(approved)
+        denied = self._ask(2)
+        _resolve(denied, "deny")
+        expired = self._ask(3)
+        with cp.store._connect() as conn:
+            conn.execute("UPDATE tool_approvals SET deadline=? WHERE id=?",
+                         (time.time() - 1, expired))
+            conn.commit()
+        self.assertEqual(cp.holds._get_tool_ask(approved)["status"], "withdrawn")
+        self.assertEqual(cp.holds._pending_payload()["withdrawn"], [])
+        self.assertEqual(cp.holds._get_tool_ask(expired)["status"], "expired")
+
+    def test_capped_at_the_tool_card_cap_newest_kept(self):
+        with mock.patch.object(cp.holds, "TOOL_WITHDRAW_COOLDOWN", 0):
+            asks = [self._ask(n) for n in range(3)]
+        for at, ask in enumerate(asks):
+            _withdraw(ask)
+            self._withdrawn_at(ask, 1000.0 + at)
+        with mock.patch.object(cp.holds, "MAX_TOOL_PENDING", 2):
+            self.assertEqual(cp.holds._list_withdrawn(), [asks[2], asks[1]])
+        # A negative SQLite LIMIT means no limit, so an unclamped cap would send every
+        # row the table has ever held.
+        with mock.patch.object(cp.holds, "MAX_TOOL_PENDING", -1):
+            self.assertEqual(cp.holds._list_withdrawn(), [])
+
+    def test_the_list_is_stable_while_nothing_happens(self):
+        # The stream emits on serialized change, so a field that moved on its own would
+        # make every idle page a 1 Hz emitter.
+        _withdraw(self._ask(1))
+        self._ask(2)
+        first = json.dumps(cp.holds._pending_payload(), sort_keys=True)
+        self.assertEqual(json.dumps(cp.holds._pending_payload(), sort_keys=True), first)
+
+    def test_the_read_rides_an_index_with_no_sort(self):
+        # The table is never pruned, so without the index each listener would scan and
+        # sort every withdrawn row ever written, once a second. The plan is of the
+        # statement `_list_withdrawn` actually runs, as SQLite expanded it.
+        statements = []
+        connect = cp.store._connect
+
+        def traced():
+            conn = connect()
+            conn.set_trace_callback(statements.append)
+            return conn
+
+        with mock.patch.object(cp.store, "_connect", traced):
+            cp.holds._list_withdrawn()
+        [query] = [q for q in statements if q.lstrip().upper().startswith("SELECT")]
+        with cp.store._connect() as conn:
+            plan = " | ".join(r["detail"] for r in conn.execute(
+                "EXPLAIN QUERY PLAN " + query))
+        self.assertIn("tool_approvals_status_resolved", plan)
+        self.assertNotIn("TEMP B-TREE", plan)
+
+    def test_the_withdrawn_list_is_read_after_the_queue(self):
+        # Read before, a withdrawal landing between the two reads would drop the card
+        # from the queue with its id missing from the list, and it would keep the
+        # vaguer wording for good. Read after, the worst case is an id in both.
+        calls = []
+        with mock.patch.object(cp.holds, "_list_tool_asks",
+                               lambda: calls.append("queue") or []), \
+                mock.patch.object(cp.holds, "_list_withdrawn",
+                                  lambda: calls.append("withdrawn") or []):
+            cp.holds._pending_payload()
+        self.assertEqual(calls, ["queue", "withdrawn"])
 
 
 class WithdrawAuditTests(_ToolBridgeTestCase):

@@ -365,6 +365,24 @@ class DecisionTests(_Store):
         agent.submit_plan(ALICE, "widgets", self.task, token,
                           **(PLAN | {"decisions": good["the most decisions"]}))
 
+    def test_unknown_fields_are_named_short_and_past_the_count_counted(self):
+        token = self.claim()
+        long = {"label": "Hold", "meaning": "m", "z" * 1000: 1}
+        refusal = self.refused(agent.submit_plan, ALICE, "widgets", self.task, token,
+                               **(PLAN | {"decisions": [DECISION | {
+                                   "options": [long, DECISION["options"][1]]}]}))
+        self.assertEqual(refusal.reason,
+                         f"decisions[0].options[0] has no field '{'z' * 79}... (a string "
+                         f"of 1000 characters); it takes label, meaning")
+        agent.submit_plan(ALICE, "widgets", self.task, token,
+                          **(PLAN | {"decisions": [DECISION]}))
+        many = {"options": [0]} | {f"x{i:02}": 1 for i in range(25)}
+        refusal = self.refused(op.approve, self.task, self.got()["revision"], [many])
+        self.assertEqual(refusal.reason,
+                         "decision 1's answer has no field 'x00', 'x01', 'x02', 'x03', "
+                         "'x04', 'x05', 'x06', 'x07', 'x08', 'x09', and 15 more; it takes "
+                         "options, other")
+
     def test_a_superseded_plan_keeps_its_decisions(self):
         first = self.plan(decisions=[DECISION])["plan"]
         self.claim(who=BOB)

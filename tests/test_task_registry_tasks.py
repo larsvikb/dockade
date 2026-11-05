@@ -4,14 +4,16 @@
 ``operator_moves.py``). Each test gets a store of its own in a temp dir."""
 from __future__ import annotations
 
+import ast
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
 import unittest
 from unittest import mock
 
-from _loader import load_task_registry
+from _loader import ROOT, load_task_registry
 
 reg = load_task_registry()
 Refused = reg.taskdb.Refused
@@ -558,6 +560,81 @@ class SchemaTests(_Store):
         conn.close()
         with self.assertRaises(RuntimeError):
             reg.taskdb.init()
+
+
+class QuotedTests(unittest.TestCase):
+    """``taskdb.quoted``: how a refusal names a value it was given."""
+
+    def test_a_short_value_is_its_repr(self):
+        quoted = reg.taskdb.quoted
+        self.assertEqual([quoted("main"), quoted(7), quoted(None), quoted(["a"])],
+                         ["'main'", "7", "None", "['a']"])
+        at_cap = "x" * (reg.taskdb.QUOTED_MAX - 2)
+        self.assertEqual(quoted(at_cap), f"'{at_cap}'")
+
+    def test_a_long_string_is_cut_to_the_cap_and_its_length(self):
+        self.assertEqual(reg.taskdb.quoted("x" * 200_000),
+                         f"'{'x' * 79}... (a string of 200000 characters)")
+        self.assertEqual(reg.taskdb.quoted("x" * (reg.taskdb.QUOTED_MAX - 1)),
+                         f"'{'x' * 79}... (a string of 79 characters)")
+
+    def test_a_lone_surrogate_is_escaped_before_the_cut(self):
+        got = reg.taskdb.quoted("\ud800" * 1000)
+        self.assertEqual(got, "'" + "\\ud800" * 13 + "\\... (a string of 1000 characters)")
+        got.encode()
+
+    def test_a_value_not_a_string_is_cut_by_its_repr(self):
+        self.assertEqual(reg.taskdb.quoted([0] * 100_000),
+                         f"[{'0, ' * 26}0... (300000 characters written out)")
+
+    def test_names_past_the_count_are_counted(self):
+        names = [f"n{i}" for i in range(reg.taskdb.FAULTS_SHOWN + 3)]
+        self.assertEqual(reg.taskdb.quoted_names(names),
+                         "'n0', 'n1', 'n2', 'n3', 'n4', 'n5', 'n6', 'n7', 'n8', 'n9', "
+                         "and 3 more")
+        self.assertEqual(reg.taskdb.quoted_names(names[:reg.taskdb.FAULTS_SHOWN]),
+                         "'n0', 'n1', 'n2', 'n3', 'n4', 'n5', 'n6', 'n7', 'n8', 'n9'")
+        self.assertEqual(reg.taskdb.quoted_names(["x" * 1000]),
+                         f"'{'x' * 79}... (a string of 1000 characters)")
+
+
+class RefusalTextTests(unittest.TestCase):
+    #: What builds a refusal's message: its exceptions, and the agent listener's
+    #: JSON-RPC error.
+    REFUSING = frozenset({"Refused", "Missing", "Stale", "_error"})
+
+    #: A repr asked for in a template ``.format`` or ``%`` fills: ``{!r}``, ``%r``.
+    TEMPLATE_REPR = re.compile(r"![ra]}|%[ra]")
+
+    @classmethod
+    def _repr_in(cls, node: ast.AST) -> list[ast.AST]:
+        return [n for n in ast.walk(node)
+                if (isinstance(n, ast.FormattedValue) and n.conversion in (ord("r"), ord("a")))
+                or (isinstance(n, ast.Name) and n.id in ("repr", "ascii"))
+                or (isinstance(n, ast.Constant) and isinstance(n.value, str)
+                    and cls.TEMPLATE_REPR.search(n.value))]
+
+    def test_no_refusal_formats_a_value_with_repr(self):
+        """A value a refusal names goes through ``taskdb.quoted``, which cuts it short;
+        ``!r``, ``%r`` and ``repr`` would hand it back whole. The guard reads only a
+        message built inside the call: one built elsewhere and passed in, as
+        ``agent_moves._unclaimable`` and an ending's ``refusal`` are, and a value
+        formatted as plain ``{}``, are beyond it."""
+        found, wrong = 0, []
+        for path in sorted((ROOT / "task-registry").glob("*.py")):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+                if name not in self.REFUSING:
+                    continue
+                found += 1
+                wrong += [f"{path.name}:{n.lineno}"
+                          for arg in (*node.args, *(k.value for k in node.keywords))
+                          for n in self._repr_in(arg)]
+        self.assertGreater(found, 50)
+        self.assertEqual(wrong, [])
 
 
 if __name__ == "__main__":

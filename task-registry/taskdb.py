@@ -205,6 +205,34 @@ class Stale(Refused):
     is the task as it is now."""
 
 
+#: How much of a value a refusal repeats, and how many of a request's faults or unknown
+#: names one lists before it counts the rest: a refusal's reason goes back into an
+#: agent's context and the gateway's record, and the value can be as long as the
+#: request that carried it.
+QUOTED_MAX = 80
+FAULTS_SHOWN = 10
+
+
+def quoted(value: object) -> str:
+    """``value`` as a refusal names it: its repr, escaped so it always encodes, and
+    when that is longer than ``QUOTED_MAX`` the start of it and a length: the value's
+    for a string, its repr's for anything else."""
+    text = repr(value)
+    if len(text) <= QUOTED_MAX:
+        return text
+    size = (f"a string of {len(value)} characters" if isinstance(value, str)
+            else f"{len(text)} characters written out")
+    return f"{text[:QUOTED_MAX]}... ({size})"
+
+
+def quoted_names(names: list) -> str:
+    """The first ``FAULTS_SHOWN`` of ``names``, each quoted, and how many more."""
+    shown = [quoted(name) for name in names[:FAULTS_SHOWN]]
+    if len(names) > FAULTS_SHOWN:
+        shown.append(f"and {len(names) - FAULTS_SHOWN} more")
+    return ", ".join(shown)
+
+
 def init() -> None:
     """Create the store, or open one at a version this code takes forward."""
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -281,6 +309,6 @@ def check_agent(agent: object) -> str:
     match = _AGENT_RE.fullmatch(agent) if isinstance(agent, str) else None
     if match is None or match["kind"] in (OPERATOR, REGISTRY):
         raise Refused(
-            f"{agent!r} is not an agent id: the agent's kind, a hyphen and its own "
+            f"{quoted(agent)} is not an agent id: the agent's kind, a hyphen and its own "
             f"session id, as in claude-<session id>")
     return agent

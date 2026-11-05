@@ -97,7 +97,9 @@ def handle(message: object) -> dict | None:
             return _error(message_id, INVALID_PARAMS, "tools/call needs a tool name")
         return _result(message_id,
                        agent_tools.call(params["name"], params.get("arguments")))
-    return _error(message_id, METHOD_NOT_FOUND, f"{method!r} is not served here")
+    # `quoted` through the tools, the listener's one way into the registry.
+    return _error(message_id, METHOD_NOT_FOUND,
+                  f"{agent_tools.quoted(method)} is not served here")
 
 
 def answer(body: bytes) -> tuple[int, dict | None]:

@@ -355,8 +355,9 @@ class SurfaceTests(unittest.TestCase):
     def test_the_tools_call_only_what_an_agent_may(self):
         imported, chains = _surface.reached(self.source("agent_tools"))
         self.assertNotIn("operator_moves", imported)
-        self.assertEqual(_surface.overreach(chains, self.CALLABLE,
-                                            frozenset({("taskdb", "Refused")})), [])
+        # `quoted` and `quoted_names` only format a value; they read nothing.
+        self.assertEqual(_surface.overreach(chains, self.CALLABLE, frozenset({
+            ("taskdb", "Refused"), ("taskdb", "quoted"), ("taskdb", "quoted_names")})), [])
 
     def test_only_the_operators_moves_write_an_answer(self):
         """``task-registry/DESIGN.md``, "Decisions": the store refuses an answer from
@@ -608,12 +609,17 @@ class OddArgumentTests(_Store):
         params = tools.TOOLS[name].params
         return {p.name: values[p.name] for p in params if p.required}
 
+    #: Longer than any refusal's reason, and far shorter than the longest odd value.
+    REASON_MAX = 1000
+
     def test_no_argument_name_raises(self):
         for name in tools.TOOLS:
             for odd in ("\ud800", "", " ", "a" * 1000, "agent\n", "__class__"):
                 with self.subTest(tool=name, argument=repr(odd)[:40]):
                     arguments = self.baseline(name) | {odd: 1}
-                    self.assertTrue(through_the_wire(name, arguments)["isError"])
+                    result = through_the_wire(name, arguments)
+                    self.assertTrue(result["isError"])
+                    self.assertLess(len(result["content"][0]["text"]), self.REASON_MAX)
 
     def test_no_argument_value_raises(self):
         for name, tool in tools.TOOLS.items():
@@ -623,6 +629,63 @@ class OddArgumentTests(_Store):
                         arguments = self.baseline(name) | {param.name: value}
                         result = through_the_wire(name, arguments)
                         self.assertIn(result["isError"], (True, False))
+                        if result["isError"]:
+                            self.assertLess(len(result["content"][0]["text"]),
+                                            self.REASON_MAX)
+
+
+def cut(char: str, length: int) -> str:
+    """How a refusal names a string of ``length`` times ``char``: the quote and the
+    first 79 characters of its repr, then its length."""
+    return f"'{char * 79}... (a string of {length} characters)"
+
+
+class OversizedValueTests(_Store):
+    """A refusal names a long value by its start and its length, never whole."""
+
+    LONG = 200_000
+
+    def test_an_unknown_method_or_tool_is_named_short(self):
+        reply = api.handle(rpc("m" * self.LONG))
+        self.assertEqual(reply["error"]["message"],
+                         f"{cut('m', self.LONG)} is not served here")
+        self.assertEqual(self.refused("t" * self.LONG, {}),
+                         [f"no tool {cut('t', self.LONG)} here; the tools are "
+                          f"{', '.join(TOOL_NAMES)}"])
+
+    def test_a_long_branch_path_agent_or_repo_is_named_short(self):
+        work = {"agent": ALICE, "repo": "widgets", "task": self.task, "branch": "b",
+                "footprint": ["."]}
+        cases = {
+            "branch": ("claim_work", work | {"branch": "b" * self.LONG},
+                       f"{cut('b', self.LONG)} is not a branch name"),
+            "footprint": ("claim_work", work | {"footprint": ["p" * self.LONG]},
+                          f"{cut('p', self.LONG)} is not a path in the repo"),
+            "agent": ("claim_work", work | {"agent": "c" * self.LONG},
+                      f"{cut('c', self.LONG)} is not an agent id: the agent's kind, a "
+                      f"hyphen and its own session id, as in claude-<session id>"),
+            "repo": ("list_tasks", {"repo": "r" * self.LONG},
+                     f"no repo {cut('r', self.LONG)} in the registry"),
+        }
+        for case, (name, arguments, said) in cases.items():
+            with self.subTest(case):
+                self.assertEqual(self.refused(name, arguments)[0], said)
+
+    def test_thousands_of_unknown_names_are_counted_not_listed(self):
+        unknown = {f"x{i:04}": 1 for i in range(5000)}
+        self.assertEqual(self.refused("get_task", {"task": self.task} | unknown),
+                         ["no argument 'x0000', 'x0001', 'x0002', 'x0003', 'x0004', "
+                          "'x0005', 'x0006', 'x0007', 'x0008', 'x0009', and 4990 more "
+                          "here; this tool takes task"])
+        task = self.ok("propose", agent=ALICE, repo="widgets", title="T", body="B")["task"]
+        token = self.ok("claim_plan", agent=ALICE, repo="widgets", task=task,
+                        footprint=["."])["token"]
+        self.assertEqual(self.refused("submit_plan", {
+            "agent": ALICE, "repo": "widgets", "task": task, "token": token, **PLAN,
+            "decisions": [DECISION | unknown]})[0],
+            "no field 'x0000', 'x0001', 'x0002', 'x0003', 'x0004', 'x0005', 'x0006', "
+            "'x0007', 'x0008', 'x0009', and 4990 more in decisions[0]; it takes "
+            "question, why, options, assumes, multi_select")
 
 
 if __name__ == "__main__":

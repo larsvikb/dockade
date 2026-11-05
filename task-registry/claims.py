@@ -68,7 +68,7 @@ def check_branch(branch: object) -> str:
     if (not isinstance(branch, str) or not 0 < len(branch) <= BRANCH_MAX
             or not _BRANCH_RE.fullmatch(branch) or branch.startswith(("-", "/", "."))
             or branch.endswith(("/", ".", ".lock")) or ".." in branch or "//" in branch):
-        raise Refused(f"{branch!r} is not a branch name")
+        raise Refused(f"{taskdb.quoted(branch)} is not a branch name")
     return branch
 
 
@@ -82,10 +82,10 @@ def footprint(paths: object) -> list[str]:
     for path in paths:
         if (not isinstance(path, str) or not 0 < len(path) <= PATH_MAX
                 or any(ord(c) < 32 for c in path) or not taskdb.storable(path)):
-            raise Refused(f"{path!r} is not a path in the repo")
+            raise Refused(f"{taskdb.quoted(path)} is not a path in the repo")
         norm = posixpath.normpath(path)
         if norm == ".." or norm.startswith(("/", "../")):
-            raise Refused(f"{path!r} is not a path in the repo")
+            raise Refused(f"{taskdb.quoted(path)} is not a path in the repo")
         out.append(norm)
     return list(dict.fromkeys(out))
 

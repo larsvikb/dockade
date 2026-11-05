@@ -661,6 +661,56 @@ class ResponseShapeTests(_CPTestCase):
                 self.assertIsInstance(result, typing.get_origin(declared) or declared)
 
 
+#: A lone surrogate: a JSON string can carry it, UTF-8 cannot.
+_SURROGATE = chr(0xD800)
+
+
+class InvalidRequestTests(unittest.TestCase):
+    """``cp.invalid`` and the handler that serves it; its docstring says why. The stub
+    cannot show FastAPI routing a validation failure here; a venv with the real one
+    does."""
+
+    def test_a_422_names_each_field_and_never_its_value(self):
+        status, body = cp.invalid([
+            {"loc": ("query", "limit"), "msg": "Input should be a valid integer",
+             "input": "SECRET-INPUT", "type": "int_parsing"},
+            {"loc": ("body", "pattern", 0), "msg": "Input should be a valid string",
+             "input": _SURROGATE},
+        ])
+        self.assertEqual((status, body["ok"]), (422, False))
+        self.assertEqual(body["detail"], "query.limit: Input should be a valid integer; "
+                                         "body.pattern.0: Input should be a valid string")
+        self.assertNotIn("SECRET", json.dumps(body))
+        self.assertNotIn(_SURROGATE, json.dumps(body, ensure_ascii=False))
+
+    def test_a_field_the_request_named_is_escaped_and_cut_short(self):
+        _, body = cp.invalid([{"loc": ("body", "args", _SURROGATE + "x" * 300),
+                               "msg": "Input should be a valid string"}])
+        body["detail"].encode("utf-8")
+        self.assertEqual(body["detail"], "body.args.\\ud800" + "x" * 99
+                                         + ": Input should be a valid string")
+
+    def test_only_the_first_faults_are_named_and_the_rest_counted(self):
+        errors = [{"loc": ("body", "pattern", i), "msg": "bad"}
+                  for i in range(cp.FAULTS_SHOWN + 5)]
+        _, body = cp.invalid(errors)
+        self.assertEqual(body["detail"].count("bad"), cp.FAULTS_SHOWN)
+        self.assertTrue(body["detail"].endswith("; and 5 more"))
+        _, body = cp.invalid(errors[:cp.FAULTS_SHOWN])
+        self.assertNotIn("more", body["detail"])
+
+    def test_every_listener_answers_a_malformed_request_itself(self):
+        rejected = cp.RequestValidationError
+        for name in ("app", "authorize_app", "tool_app"):
+            with self.subTest(listener=name):
+                handlers = getattr(cp, name).__dict__.get("exception_handlers", {})
+                self.assertIs(handlers.get(rejected), cp.invalid_request)
+        exc = rejected([{"loc": ("body", "pattern", 0), "msg": "bad",
+                         "input": _SURROGATE}])
+        response = asyncio.run(cp.invalid_request(None, exc))
+        self.assertEqual((response.status_code, response.body), cp.invalid(exc.errors()))
+
+
 class HealthProbeTests(unittest.TestCase):
     """The probe is answered on the event loop, for the reason the gateway's is.
 

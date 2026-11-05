@@ -200,8 +200,9 @@ def _install_fastapi_stub() -> None:
     fa.concurrency = concurrency
     sys.modules["fastapi.concurrency"] = concurrency
 
-    # The task registry's operator API answers FastAPI's validation failures itself;
-    # the handler is tested by calling it with one of these.
+    # The task registry's operator API and the control plane answer FastAPI's
+    # validation failures themselves; each handler is tested by calling it with one
+    # of these.
     exceptions = sys.modules.get("fastapi.exceptions")
     if exceptions is None:
         exceptions = types.ModuleType("fastapi.exceptions")

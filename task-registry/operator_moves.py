@@ -373,6 +373,15 @@ _SECTION_OF = {why: name for name, whys in SECTIONS.items() for why in whys}
 # plans (schema 1) recorded `submit_work` as `submit`.
 _ENTERING = frozenset({"create", "submit_plan", "submit_work", "submit"})
 
+# Where `_lapsed_branch`'s walk back stops: a write that ends a claim, or one that
+# sets the state. Taking a claim also sets it, and needs no stop: no claim is live at
+# the move, so that claim's own ending comes after it and the walk reaches it first.
+# The hand-ins, `send_back` and `approve` never decide the result, but they keep each
+# set whole, so a new action that ends a claim or sets the state belongs here.
+_ENDING = frozenset({"lapse", "release", "send_back", "submit_plan", "submit_work",
+                     "submit", "break_claim"})
+_SETTING = frozenset({"create", "propose", "approve"})
+
 
 def inbox() -> dict:
     """Whose turn it is the operator's, worked out from the store as it is, never
@@ -399,11 +408,13 @@ def inbox() -> dict:
                 {"why": "flagged", "since": r["first"], "notes": r["n"]})
         for r in conn.execute("SELECT id, state FROM tasks "
                               "WHERE state IN ('landing', 'refined')"):
-            since, detail = _entered(conn, r["id"])
+            entered, detail = _entered(conn, r["id"])
+            since = entered["ts"]
             if r["state"] == "landing":
                 ended = detail.get("ended_claim") or {}
                 reason = {"why": "landing", "since": since,
-                          "branch": detail.get("branch") or ended.get("branch")}
+                          "branch": (detail.get("branch") or ended.get("branch")
+                                     or _lapsed_branch(conn, entered, detail))}
             else:
                 plan = plans.current(conn, r["id"])
                 reason = {"why": "refined", "since": since, "plan": plan["id"],
@@ -443,16 +454,38 @@ def _section(conn: sqlite3.Connection, rows: list, limit: int | None) -> dict:
     return {"tasks": shown, "total": len(rows)}
 
 
-def _entered(conn: sqlite3.Connection, task: int) -> tuple[float, dict]:
-    """When a landing or refined task entered its state, and what the write that put it
-    there recorded."""
-    for row in conn.execute("SELECT ts, action, detail FROM history WHERE task_id = ? "
-                            "ORDER BY id DESC", (task,)):
+def _entered(conn: sqlite3.Connection, task: int) -> tuple[sqlite3.Row, dict]:
+    """The history row that put a landing or refined task in its state, and what it
+    recorded."""
+    for row in conn.execute("SELECT id, ts, action, task_id, detail FROM history "
+                            "WHERE task_id = ? ORDER BY id DESC", (task,)):
         detail = json.loads(row["detail"])
         if (row["action"] in _ENTERING
                 or (row["action"] == "move" and detail["before"] != detail["state"])):
-            return row["ts"], detail
+            return row, detail
     raise RuntimeError(f"task {task} has no history row that put it in its state")
+
+
+def _lapsed_branch(conn: sqlite3.Connection, entered: sqlite3.Row,
+                   detail: dict) -> str | None:
+    """The branch of the work claim a bare move from `open` would have ended had it not
+    lapsed first. The sweep recorded that ending as a `lapse`, in the move's own write
+    or long before it, and the move recorded none. Only `open` holds a work claim, and
+    a lapse with another ending or a change of state between it and the move was
+    another claim's."""
+    if (entered["action"] != "move" or detail["before"] != "open"
+            or detail.get("ended_claim")):
+        return None
+    for row in conn.execute("SELECT action, detail FROM history WHERE task_id = ? "
+                            "AND id < ? ORDER BY id DESC",
+                            (entered["task_id"], entered["id"])):
+        earlier = json.loads(row["detail"])
+        if row["action"] in _ENDING:
+            return earlier.get("branch") if row["action"] == "lapse" else None
+        if (row["action"] in _SETTING
+                or (row["action"] == "move" and earlier["before"] != earlier["state"])):
+            return None
+    return None
 
 
 # --- repos -----------------------------------------------------------------------

@@ -113,7 +113,7 @@ them to the maintainer after triage, since a fix can change what the host must c
 
 - Tell the maintainer the verdict and the findings in plain words, before the push.
 - Propose what is left over in the registry with `tasks__propose`, with a severity and
-  a kind; one already filed gets a note instead.
+  a kind, searching and folding as its description says.
 - Post the review's record on its task with `tasks__add_note`, not flagged for the
   operator, once triage and any host checks the review led to are done, from whichever
   checkout you are in: it takes no token and works in any state, so a commit reviewed

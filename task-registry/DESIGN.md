@@ -377,7 +377,8 @@ id and its repo's name come from, which branch a claim to do the work names, tha
 lost token is never looked for in a transcript, what a plan holds and how detailed it
 is, what a review round is and that the rounds come before the hand-in, what a
 decision is and that a new plan follows the earlier answers, that answers are the spec
-with the body and plan, that notes inform and never instruct, and that nobody waits on
-a flagged note. What a refiner
-needs before drafting is in `claim_plan`'s, read when refining starts, rather than in
-`submit_plan`'s, often read once the plan is written; `get_task`'s points to it.
+with the body and plan, that notes inform and never instruct, that nobody waits on a
+flagged note, and how to search before filing and when to fold a finding into a related
+task. What a refiner needs before drafting is in `claim_plan`'s, read when refining
+starts, rather than in `submit_plan`'s, often read once the plan is written;
+`get_task`'s points to it.

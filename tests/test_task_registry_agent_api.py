@@ -330,6 +330,20 @@ class DescriptionTests(unittest.TestCase):
         # Before the hand-in rule, which a client that cuts the description keeps.
         self.assertLess(said.index("decisions, at most"), said.index(tools._HOLDING[:40]))
 
+    def test_propose_routes_a_finding_before_its_mechanics(self):
+        said = " ".join(self.described("propose").split())
+        # Ahead of the mechanics, so a client that cuts the description drops them
+        # first. The closing branch's phrase is pinned for that order only.
+        rule = said[:said.index("The body says what and why")]
+        for span in ("`search_tasks`", "`add_note`", "`edit_proposal`", "`parent`",
+                     "small changes outrank tidiness"):
+            with self.subTest(span=span):
+                self.assertIn(span, rule)
+
+    def test_search_tasks_says_how_many_matching_notes_a_hit_carries(self):
+        self.assertIn(f"up to {reg.notes.IN_READ} matching notes",
+                      " ".join(self.described("search_tasks").split()))
+
     def test_get_task_says_the_answers_are_the_spec_and_outrank_notes(self):
         said = " ".join(self.described("get_task").split())
         self.assertIn("the operator's own words", said)

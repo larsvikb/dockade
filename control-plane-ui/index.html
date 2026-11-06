@@ -93,7 +93,7 @@
   tr.outage > td:first-child { border-left: 3px solid var(--hold); }
   /* The audit `stage`, prefixed to the HOST it describes — `http · example.com`, which
      reads as the scheme it effectively is. Rendered only when it is not the ordinary
-     CONNECT tunnel; see AUDIT_ORDINARY_STAGE in app.js. No margin: the separator is
+     CONNECT tunnel; see AUDIT_ORDINARY_STAGE in audit.js. No margin: the separator is
      part of the TEXT, so copying a row yields "http · example.com" rather than the
      "httpexample.com" a margin-only gap would produce. */
   .qual { color: var(--dim); font-size: 11px; white-space: pre; }
@@ -374,7 +374,7 @@
      title="The task registry's page, while `make tasks-up` has it running">Tasks &#8599;</a>
   <!-- Hidden until the script says otherwise: with no JS there is nothing to ask
        permission FOR, and the states this button can be in are decided by an API the
-       markup cannot see. app.js fills the label (see `notifyButton`). -->
+       markup cannot see. app.js fills the label from `notifyButton` in holds.js. -->
   <button type="button" id="notify" hidden></button>
   <span id="conn" class="down">connecting…</span>
 </header>
@@ -404,8 +404,8 @@
 <main>
   <section id="view-approvals" role="tabpanel" aria-labelledby="tab-approvals">
     <h2>Pending approvals</h2>
-    <!-- Cards are keyed by approval id and updated in place (see app.js
-         diffPending), so the empty notice is a sibling that hides rather than
+    <!-- Cards are keyed by approval id and updated in place (see diffPending
+         in holds.js), so the empty notice is a sibling that hides rather than
          markup the render replaces. -->
     <!-- Hold-cap saturation. Above the queue rather than in it, because what it
          reports is requests that never BECAME cards — an over-cap /authorize fails
@@ -424,7 +424,7 @@
          rewrites once a second, so the region would read a timer aloud continuously
          for the life of the hold instead of announcing the request. This element
          holds one sentence, written only when a card ARRIVES — see
-         pendingAnnouncement in app.js. `role=status` is implicitly polite, so it
+         pendingAnnouncement in holds.js. `role=status` is implicitly polite, so it
          waits for a pause rather than interrupting an operator mid-click. -->
     <div id="pending-live" class="sr-only" role="status"></div>
     <div id="pending"></div>
@@ -479,7 +479,7 @@
         <option value="withdraw">withdraw</option>
       </select>
       <!-- Relative windows, not date pickers: the question is "since when". Values
-           are the keys of AUDIT_WINDOWS in app.js, held equal by a test. -->
+           are the keys of AUDIT_WINDOWS in audit.js, held equal by a test. -->
       <select id="audit-window" aria-label="Filter by time">
         <option value="">any time</option>
         <option value="1h">last hour</option>
@@ -572,7 +572,7 @@
     <!-- What the button will do, in the world rather than in the table — the same
          discipline the revoke confirm and the persist preview follow. Also where the
          backend's refusal lands, because the checks this page mirrors are deliberately
-         only a subset (see createPreview in app.js).
+         only a subset (see createPreview in egress-rules.js).
 
          `aria-live`, because the text changes as a consequence of typing elsewhere: a
          sighted operator sees it appear, and without this nobody else would. Polite,

@@ -258,7 +258,10 @@ sc_guard_workspace() {
 
     # Under the override the config home earns only the content warnings below, so a
     # workspace of ~/.config, which holds it a level down, launches silently: the
-    # override is the operator saying they know what the directory holds.
+    # override is the operator saying they know what the directory holds. The one
+    # exception is the marketplaces mount, which does not yield to it: when the
+    # marketplaces directory exists, sc_marketplaces still refuses a workspace that
+    # holds it or a link on the way to it (a dotfiles-managed ~/.config/dockade).
     _sc_warn_credentials "$real_workspace" "workspace" "RW"
     # dockade's own state, when dockade is the workspace. A control-plane backup is
     # the whole policy store in a file `make restore` will install after checking its
@@ -391,8 +394,9 @@ _sc_ro_mount_reason() {
 # installLocation — it has to be the path as seen from inside.
 #
 # sc_marketplaces <canonical_workspace>: a directory that is the workspace, lies
-# inside it, or holds it is refused, because the workspace is mounted read-write
-# and the same files would be writable through /workspace whatever the :ro says.
+# inside it, holds it, or is reached through a link the workspace holds is refused,
+# because the workspace is mounted read-write and the same files would be writable
+# through /workspace whatever the :ro says.
 # Only this launch's workspace is known here. A sibling's cannot hold the default
 # directory, since sc_guard_workspace refuses what holds the config home, but the
 # cases that guard cannot see stay open (DESIGN.md, "Plugin marketplaces").
@@ -420,8 +424,10 @@ sc_marketplaces() {
         return 0
     fi
 
-    local real reason
-    real="$(cd "$dir" && pwd -P)"        # canonical, symlinks resolved
+    # Physical, like [[ -d ]] and the walk below, so a `..` after a link means the
+    # same directory to all three; CDPATH would send a relative name elsewhere.
+    local real reason line
+    real="$(CDPATH='' cd -P "$dir" && pwd -P)"
     reason="$(_sc_ro_mount_reason "$real")"
     if [[ -z "$reason" ]]; then
         if [[ "$real" == "$workspace" ]]; then
@@ -431,6 +437,18 @@ sc_marketplaces() {
         elif [[ "$workspace" == "$real"/* ]]; then
             reason="the workspace ($workspace) is inside it, and is mounted read-write."
         fi
+    fi
+    # A link on the way that the workspace holds can be replaced with a real
+    # directory, which a later launch with the same path mounts. Default path too:
+    # the workspace guard walks it, but yields to ALLOW_UNSAFE_WORKSPACE.
+    if [[ -z "$reason" ]]; then
+        [[ "$dir" == /* ]] || dir="$PWD/$dir"
+        while IFS= read -r line; do
+            if [[ "$line" == "link $workspace"/* ]]; then
+                reason="the link ${line#link } on the way to it is inside the workspace ($workspace), which is mounted read-write."
+                break
+            fi
+        done < <(_sc_walk_path "$dir")
     fi
     if [[ -n "$reason" ]]; then
         echo "REFUSING to mount marketplaces: $real" >&2

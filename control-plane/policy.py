@@ -327,7 +327,7 @@ def _live_lease(conn, host: str, client_class: str, now: float):
     ``store._LEASES_DDL``), so this is a defined answer to an undefined-by-construction
     case rather than a case being handled."""
     return conn.execute(
-        "SELECT id, expires_at FROM leases "
+        "SELECT id, expires_at, approval_id FROM leases "
         "WHERE host=? AND client_class=? AND expires_at > ? "
         "ORDER BY expires_at DESC LIMIT 1",
         (host, client_class, now)).fetchone()
@@ -352,17 +352,29 @@ def _decide(host: str, client_class: str) -> tuple[str, str]:
       - Leases come last because when both a rule and a lease cover a host, the
         STANDING rule is the more informative thing to record. Which of two allows
         answers a request cannot change the answer — only the audit line."""
+    return _ruling(host, client_class)[:2]
+
+
+def _ruling(host: str, client_class: str) -> tuple[str, str, str | None]:
+    """``_decide`` plus the approval id of the lease that decided, None when no lease
+    did: what ``/authorize`` records, so searching a card's id finds what rode it."""
     with store._connect() as conn:
-        return _decide_in(conn, _normalize_host(host), client_class)
+        return _ruling_in(conn, _normalize_host(host), client_class)
 
 
 def _decide_in(conn, host: str, client_class: str) -> tuple[str, str]:
     """``_decide`` on an open connection, for a host already in ``_normalize_host``
     form: a write asks it inside its own transaction (``_landing``)."""
+    return _ruling_in(conn, host, client_class)[:2]
+
+
+def _ruling_in(conn, host: str, client_class: str) -> tuple[str, str, str | None]:
+    """``_ruling`` on an open connection. The id comes from the same read as the
+    decision, so a lease that ends between two reads is never credited."""
     rows = conn.execute("SELECT pattern, action, client_class FROM rules").fetchall()
     decided = _rule_pass(rows, client_class, lambda p: _match(host, p))
     if decided is not None:
-        return decided
+        return *decided, None
     # Same connection as the rules read, and reached only when no rule decided, so an
     # already-allowed request never pays for it.
     now = time.time()
@@ -370,9 +382,10 @@ def _decide_in(conn, host: str, client_class: str) -> tuple[str, str]:
     if lease is not None:
         # The remaining time goes IN THE REASON, so the trail explains a burst of
         # allows after one human approval without anyone reconstructing it.
-        return "allow", (f"allowed by lease ({host} for {client_class}, "
-                         f"{_short_duration(lease['expires_at'] - now)} left)")
-    return _held(rows, client_class, lambda p: _match(host, p))
+        return ("allow", (f"allowed by lease ({host} for {client_class}, "
+                          f"{_short_duration(lease['expires_at'] - now)} left)"),
+                lease["approval_id"])
+    return *_held(rows, client_class, lambda p: _match(host, p)), None
 
 
 def _rule_pass(rows, client_class: str, covers) -> tuple[str, str] | None:

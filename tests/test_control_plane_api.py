@@ -529,10 +529,8 @@ class DuplicateHoldTests(_CPTestCase):
         self.assertEqual([r[0] for r in rows], ["denied", "expired"])
 
 
-class HoldAuditApprovalIdTests(_CPTestCase):
-    """An egress hold's hold row and final row carry the card's approval id, so the
-    record view's search by id (``audit.EVENT_SEARCH``) finds the hold and how it
-    ended. Rows written before any card exists carry none."""
+class _HoldAuditCase(_CPTestCase):
+    """Real audit rows, and real blocked ``authorize()`` calls to raise a card."""
 
     audits = True
 
@@ -566,6 +564,12 @@ class HoldAuditApprovalIdTests(_CPTestCase):
             return [tuple(r) for r in conn.execute(
                 "SELECT kind, approval_id FROM audit WHERE host=? ORDER BY id",
                 (host,)).fetchall()]
+
+
+class HoldAuditApprovalIdTests(_HoldAuditCase):
+    """An egress hold's hold row and final row carry the card's approval id, so the
+    record view's search by id (``audit.EVENT_SEARCH``) finds the hold and how it
+    ended. Rows written before any card exists carry none."""
 
     def _resolved(self, action, final):
         threads, _ = self._hold_many(1, "held.example", 10)
@@ -651,6 +655,73 @@ class HoldAuditApprovalIdTests(_CPTestCase):
                          [("deny", 5), ("hold", 5)])
         self.assertEqual([r["n"] for r in rows if r["tool"] == "create_pull_request"],
                          [1, 1])
+
+
+class LeaseAuditApprovalIdTests(_HoldAuditCase):
+    """What rode a lease, and the lease's revoke, carry the card the lease was granted
+    from, so searching that card's id finds them beside the hold that raised it."""
+
+    CARD = "c" * 32
+
+    def _leased(self, host):
+        """A live lease for ``host`` granted from ``CARD``; its lease id."""
+        _hold(host, approval_id=self.CARD)
+        _resolve(self.CARD, "allow_lease")
+        with cp.store._connect() as conn:
+            (lease_id,), = conn.execute("SELECT id FROM leases").fetchall()
+        return lease_id
+
+    def _found(self, card=CARD):
+        """What searching ``card`` finds, each reason cut to the words that say which
+        writer wrote it: a lease's remaining time is not stable enough to compare."""
+        return sorted((r["kind"], r["host"], r["approval_id"],
+                       " ".join(r["reason"].split()[:3]))
+                      for r in cp.api_views.api_audit_events(q=card)["rows"])
+
+    def test_searching_a_card_id_finds_the_requests_that_rode_its_lease(self):
+        threads, _ = self._hold_many(1, "leased.example", 10)
+        card = self._card(1)
+        _resolve(card, "allow_lease")
+        for t in threads:
+            t.join(5)
+        for _ in range(2):
+            self.assertEqual(cp.api_authorize.authorize(
+                _auth_req("leased.example")).decision, "allow")
+        self.assertEqual(self._found(card),
+                         [("allow", "leased.example", card, "allowed by lease")] * 2
+                         + [("allow", "leased.example", card, "human approval (lease"),
+                            ("hold", "leased.example", card, "held for approval")])
+
+    def test_a_rule_allow_for_a_leased_host_names_no_card(self):
+        # The rule decided, so the lease is not credited (``policy._ruling_in``).
+        self._leased("leased.example")
+        _set_rules([("leased.example", "allow")])
+        cp.api_authorize.authorize(_auth_req("leased.example"))
+        self.assertEqual(self._rows("leased.example"), [("allow", None)])
+
+    def test_revoking_a_live_lease_names_its_card(self):
+        lease_id = self._leased("leased.example")
+        cp.api_authorize.authorize(_auth_req("leased.example"))
+        cp.api_egress.revoke_lease(lease_id, _FakeRequest())
+        self.assertEqual(self._rows("leased.example"),
+                         [("allow", self.CARD), ("revoke", self.CARD)])
+        self.assertEqual(
+            self._found(),
+            [("allow", "leased.example", self.CARD, "allowed by lease"),
+             ("revoke", "leased.example", self.CARD, "lease revoked with")])
+
+    def test_removing_an_expired_lease_names_its_card(self):
+        now = time.time()
+        with cp.store._connect() as conn:
+            lease_id = conn.execute(
+                "INSERT INTO leases(host, client_class, approval_id, created_at, "
+                "expires_at, granted_by) VALUES ('leased.example', ?, ?, ?, ?, 'x')",
+                (CLASS, self.CARD, now - 100, now - 1)).lastrowid
+            conn.commit()
+        cp.api_egress.revoke_lease(lease_id, _FakeRequest())
+        self.assertEqual(
+            self._found(),
+            [("revoke", "leased.example", self.CARD, "expired lease removed;")])
 
 
 class ResolveTests(_CPTestCase):

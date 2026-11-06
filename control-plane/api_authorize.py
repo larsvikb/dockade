@@ -81,14 +81,15 @@ def _answer(req: AuthorizeRequest) -> AuthorizeResponse:
     # SQLite cannot bind would 500 the first query that took it, with no row written.
     if store._unencodable(req.host, req.proto, req.client, req.method, req.url,
                           req.stage):
-        decision, reason = "deny", store.UNENCODABLE
+        decision, reason, lease_card = "deny", store.UNENCODABLE, None
     else:
-        decision, reason = policy._decide(req.host, client_class)
+        decision, reason, lease_card = policy._ruling(req.host, client_class)
 
     if decision in ("allow", "deny"):
         store._audit(decision, stage=req.stage, host=req.host, port=req.port,
                      proto=req.proto, client=req.client, client_class=client_class,
-                     method=req.method, url=req.url, reason=reason)
+                     method=req.method, url=req.url, approval_id=lease_card,
+                     reason=reason)
         return AuthorizeResponse(decision=decision, reason=reason)
 
     # HOLD, bounded. The cap check and the reservation are one atomic step, so

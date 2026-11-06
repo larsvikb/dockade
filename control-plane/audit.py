@@ -80,7 +80,10 @@ EVENT_COLUMNS = ("id", "ts", "kind", "stage", "host", "port", "proto", "client",
                  # view that answers "which one was it", and the tool rows' identity —
                  # which server, which tool, which approval — is not in any of the
                  # columns above.
-                 "server", "tool", "approval_id")
+                 "server", "tool", "approval_id",
+                 # What a tool call returned, as the gateway measured it: the hash is
+                 # what finds its body in the gateway's own file.
+                 "result_bytes", "result_sha256", "duration")
 
 # Bound on the search needle. Not a security control — the store's own write cap
 # (``store.DRAIN_MAX_FIELD``) is what keeps the COLUMNS bounded — but a LIKE pattern

@@ -280,7 +280,8 @@ async def mcp(request: Request) -> Response:
         # A notification. Accepted with no body, which is what the transport asks for
         # and what keeps a client from waiting on a reply that is not coming.
         return Response(status_code=202)
-    return JSONResponse(answer)
+    # Serialized by `protocol.encode`, the bytes the outcome record's hash is over.
+    return Response(protocol.encode(answer), media_type="application/json")
 
 
 #: The BACKSTOP, not the cadence. A report is normally triggered by the roster

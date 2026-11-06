@@ -26,11 +26,12 @@ by the time one succeeds or fails the authority has already answered. Every path
 dials a server goes through `_run`, which writes to `outcomes.py`'s stream — so an
 approved call that failed upstream is a row rather than a silence.
 
-WHAT IS STILL NOT COVERED, stated because it is a gap rather than a decision: the
-response CONTENT. The gateway governs the request and now records the fate of the
-reply, but not what the reply carried — and an allowed read-only tool is unaudited
-intake of the same shape as WebSearch. DESIGN.md wants size and hash at minimum; the
-stream those belong in now exists, which is what made this the cheaper half.
+WHAT THE REPLY CARRIED is recorded in the same place. An allowed read-only tool is
+intake of the same shape as WebSearch, and the egress proxy sees where a server's
+traffic goes, not what it carries. So the result `_run` returns goes to
+`outcomes.record` whole: the outcome line gets its size and hash and the dial's
+duration, and the gateway's own content file gets the body (`outcomes.py` says where
+each goes and why).
 """
 from __future__ import annotations
 
@@ -251,9 +252,15 @@ def _run(server: str, tool: str, arguments: object, client: str | None = None,
     substituted here would run something other than what the approval card showed. On
     the resumption path they are the ones the human read, handed back by the claim
     rather than replayed from anything the agent sent."""
+    # The record describes the result returned, on every path: its size, hash and
+    # body. ``duration`` describes the dial, so it stays None until one starts.
+    started: float | None = None
+
     def recorded(result: dict, status: str, reason: str | None = None) -> dict:
         outcomes.record(status, server, tool, reason=reason, resume_token=resume_token,
-                        client=client)
+                        client=client, result=result,
+                        duration=None if started is None
+                        else time.monotonic() - started)
         return result
 
     entry = surface.server_entry(server)
@@ -272,6 +279,7 @@ def _run(server: str, tool: str, arguments: object, client: str | None = None,
                 f"dialled. It was disabled, revoked, or never registered.",
                 is_error=True),
             "transport-error", f"{server} left the roster before the call was made")
+    started = time.monotonic()
     try:
         raw = discovery.post(
             entry,

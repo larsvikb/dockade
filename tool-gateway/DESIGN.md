@@ -16,6 +16,18 @@ in the root, and this file does not repeat it:
 - how a held call comes back — the pending result, resumption by token, and executing on
   resumption rather than on approval — `DESIGN.md` → "An `ask` answers immediately";
 - how the sandbox is told it exists, `DESIGN.md` → "Telling the sandbox it exists".
+- why a call's outcome and what it returned are recorded here, and where each goes,
+  `DESIGN.md` → "Only the gateway can say how a call ended".
+
+## What a call returned
+
+**The content file's window is bytes, not time.** It rotates at a size
+(`outcomes.CONTENT_MAX_BYTES` and `CONTENT_BACKUPS`, the startup banner says them), so
+it holds the last so many bytes of responses however long ago they came, and a few
+large results shorten it for everything before them. Nothing prunes it by age, and it
+is outside `make backup`: the record that outlives it is the audit row's size and hash,
+which say what came back without keeping it. `make tool-content SHA=<hash>` reads it
+from inside this container, the one place it is mounted.
 
 ## What is shown, and what runs
 

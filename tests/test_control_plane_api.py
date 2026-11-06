@@ -2022,13 +2022,15 @@ def _write_audit(*rows):
             conn.execute(
                 "INSERT INTO audit(ts, kind, stage, host, port, proto, client, "
                 "client_class, actor, method, url, reason, server, tool, approval_id, "
-                "status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "status, result_bytes, result_sha256, duration) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (r.get("ts", 0.0), r.get("kind", "allow"), r.get("stage"),
                  r.get("host"), r.get("port"), r.get("proto"), r.get("client"),
                  r.get("client_class"), r.get("actor"), r.get("method"), r.get("url"),
                  r.get("reason"),
                  r.get("server"), r.get("tool"), r.get("approval_id"),
-                 r.get("status")))
+                 r.get("status"), r.get("result_bytes"), r.get("result_sha256"),
+                 r.get("duration")))
         conn.commit()
 
 
@@ -2343,9 +2345,18 @@ class AuditRecordTests(_CPTestCase):
              # answers "which one was it" for a TOOL row, whose identity is in none of
              # the columns above.
              "server", "tool", "approval_id",
-             # And how it ended, for the tool rows the gateway's stream fills.
-             "status"})
+             # And how it ended, for the tool rows the gateway's stream fills, with
+             # what it returned as the gateway measured it.
+             "status", "result_bytes", "result_sha256", "duration"})
         self.assertEqual(row["url"], "https://a.example/x")
+
+    def test_a_tool_outcome_serves_its_result_facts(self):
+        _write_audit({"kind": "outcome", "stage": "tool-result", "server": "mcp-github",
+                      "tool": "get_pr", "status": "ok", "result_bytes": 42,
+                      "result_sha256": "ab" * 32, "duration": 1.5, "ts": 1.0})
+        row = self._rows()[0]
+        self.assertEqual((row["result_bytes"], row["result_sha256"], row["duration"]),
+                         (42, "ab" * 32, 1.5))
 
     def test_nothing_is_folded(self):
         # The whole difference from the glance: identical decisions are separate
@@ -7729,9 +7740,8 @@ class ResumeTokenMigrationTests(_FreshStoreTestCase):
             return {r["id"]: r["resume_token"] for r in conn.execute(
                 "SELECT id, resume_token FROM tool_approvals")}
 
-    def test_v13_is_the_current_step(self):
-        self.assertEqual(cp.store.SCHEMA_VERSION, 13)
-        self.assertEqual(cp.store._STEPS[-1][:2], (13, "resume tokens on tool asks"))
+    def test_v13_is_the_thirteenth_step(self):
+        self.assertEqual(cp.store._STEPS[12][:2], (13, "resume tokens on tool asks"))
 
     def test_pending_rows_get_distinct_tokens_and_every_other_row_keeps_null(self):
         self._v12_store("resume-token-mint.db")
@@ -7807,6 +7817,75 @@ class ResumeTokenMigrationTests(_FreshStoreTestCase):
                 conn.execute(ddl)
             cp.store._step_13_resume_token(conn)
             self.assertEqual(cp.store._columns(conn, "tool_approvals"), set())
+
+
+class ResultFactsMigrationTests(_FreshStoreTestCase):
+    """v14, which gives ``audit`` what a tool call returned: ``result_bytes``,
+    ``result_sha256`` and ``duration``. Additive; every existing row keeps NULL."""
+
+    def _v13_store(self, name):
+        self._use_store(name)
+        cp.store._init_db()
+        # The table as v13's DDL made it: today's, cut after `status`. Rebuilt rather
+        # than DROP COLUMN, which cannot edit a definition holding comments.
+        with cp.store._connect() as conn:
+            ddl = conn.execute("SELECT sql FROM sqlite_master WHERE name='audit'"
+                               ).fetchone()[0]
+            v13 = re.sub(r"status(\s+)TEXT,.*\)\s*$", r"status\1TEXT\n            )",
+                         ddl, flags=re.S)
+            self.assertNotIn("result_bytes", v13)
+            conn.execute("DROP TABLE audit")
+            conn.execute(v13)
+            conn.execute("INSERT INTO audit(ts, kind, stage, server, tool, status) "
+                         "VALUES (1.0, 'outcome', 'tool-result', 'mcp-github', "
+                         "'get_pr', 'ok')")
+            conn.execute("INSERT INTO audit(ts, kind, host) "
+                         "VALUES (2.0, 'allow', 'a.example')")
+            conn.execute("PRAGMA user_version = 13")
+            conn.commit()
+
+    @staticmethod
+    def _audit_columns():
+        with cp.store._connect() as conn:
+            return [tuple(r) for r in conn.execute("PRAGMA table_info(audit)")]
+
+    def test_v14_is_the_current_step(self):
+        self.assertEqual(cp.store.SCHEMA_VERSION, 14)
+        self.assertEqual(cp.store._STEPS[-1][:2],
+                         (14, "tool result size, hash and duration"))
+
+    def test_the_columns_are_added_as_null_and_the_rows_kept(self):
+        self._v13_store("result-facts-migrate.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT ts, kind, status, result_bytes, result_sha256, duration "
+                "FROM audit ORDER BY ts")]
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+        self.assertEqual(version, 14)
+        self.assertEqual(rows, [
+            {"ts": 1.0, "kind": "outcome", "status": "ok", "result_bytes": None,
+             "result_sha256": None, "duration": None},
+            {"ts": 2.0, "kind": "allow", "status": None, "result_bytes": None,
+             "result_sha256": None, "duration": None}])
+
+    def test_a_migrated_and_a_fresh_table_agree(self):
+        self._v13_store("result-facts-agree-migrated.db")
+        cp.store._init_db()
+        migrated = self._audit_columns()
+        self._use_store("result-facts-agree-fresh.db")
+        cp.store._init_db()
+        self.assertEqual(migrated, self._audit_columns())
+        self.assertEqual([(c[1], c[2]) for c in migrated[-3:]],
+                         [("result_bytes", "INTEGER"), ("result_sha256", "TEXT"),
+                          ("duration", "REAL")])
+
+    def test_v14_leaves_a_store_that_has_the_columns_alone(self):
+        self._use_store("result-facts-again.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            cp.store._step_14_result_facts(conn)
+        self.assertEqual([c[1] for c in self._audit_columns()].count("duration"), 1)
 
 
 class LegacyClassNameTests(unittest.TestCase):

@@ -45,6 +45,9 @@ COPY surface.py ./surface.py
 # another's. The volume is shared with exactly one other container, which mounts it
 # read-only, so this is a private log directory rather than a shared writable surface.
 RUN mkdir -p /var/log/tool-gateway && chmod 1777 /var/log/tool-gateway
+# The response-content file's directory, for the same reason and in the same mode. It
+# is a volume no other container mounts (docker-compose.yml, `tool-content`).
+RUN mkdir -p /var/log/tool-content && chmod 1777 /var/log/tool-content
 
 USER gw
 # One listener: the agent-facing MCP endpoint. EXPOSE is documentation — the

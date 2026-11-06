@@ -406,6 +406,37 @@ visible to both sessions. Not measured: two real containers, where the cached
 `/marketplaces/...` path resolves in the reader's own mount, so it reads that
 container's checkout or nothing.
 
+## A backslash-u escape typed into a tool parameter arrives as the character
+
+Text meant to hold an escape as text (a backslash, `u` and four hex digits, as when a
+change about bidi overrides names U+202E) does not survive every path the same way:
+
+- **Claude Code's `Write` and `Edit`, and a Bash command**, a heredoc or a plain
+  argument, decode it: the file gets the real character. Seen 2026-09-26 (U+0430 in a
+  commit-message file written with `Write`), and three times on 2026-10-12, twice in a
+  commit body written through a heredoc and once as raw characters in a fixture
+  written with `Write`. Three 2026-09-19 cases, two commit messages and a PR body,
+  came through a tool parameter or a quoted heredoc; which one was not recorded.
+  Re-observed 2026-11-06 on Claude Code 2.1.319: an escape for U+0430 typed into
+  `Write`, and into a Bash call as the quoted argument of `echo` and of `printf '%s'`,
+  wrote the bytes `d0 b0`. Neither of those two decodes an escape in its argument
+  (Bash's `printf` does in its format string), so the call arrived decoded.
+- **The gateway's `create_pull_request` and `update_pull_request`** pass a single
+  backslash through literally and a doubled one as two backslashes (2026-09-26, PR
+  #160). So doubling fixes one path and breaks the other.
+- **The task registry's `tasks__propose`** decoded one once (2026-11-05, task 270
+  revision 1). A single observation, not a rule about the gateway.
+
+Nothing failed any of those times; the intent and the bytes differed silently. What
+works: spell a character as `U+XXXX` in prose, and where the escape itself must
+appear, build the text in Python with `chr(92)` for the backslash and read the result
+back. What caught every 2026-10-12 case was a scan of each changed file and of the
+commit body for characters of category Cf, Zl, Zp or Cc other than tab and newline,
+before anything was handed over. The body goes on stdin, the changed files as
+arguments:
+
+    git log -1 --format=%B | python3 -c 'import sys, unicodedata as u; texts = [("body", sys.stdin.buffer.read().decode("utf-8"))] + [(f, open(f, encoding="utf-8").read()) for f in sys.argv[1:]]; [print(n, i, hex(ord(c))) for n, t in texts for i, c in enumerate(t) if u.category(c) in ("Cf", "Zl", "Zp", "Cc") and c not in (chr(9), chr(10))]' <changed files>
+
 ## An MCP server container really does honour `HTTPS_PROXY` — and how to tell
 
 Measured against `ghcr.io/github/github-mcp-server:v1.9.0` in `http` mode on an
@@ -855,6 +886,47 @@ nothing and each fails its `checked > 0` assertion. Seen 2026-09-30.
 - The host has no node. Under strict mode (`DOCKADE_REQUIRE_TOOLS=1`) the `app.js`
   tests error there instead of skipping, which stops `make check` before
   `verify-build`; they run in the sandbox instead.
+
+## A worktree-isolated session refuses a command that might run git elsewhere
+
+In a session isolated to a worktree, Claude Code reads each Bash command before it
+runs and refuses one where it cannot show that git stays in that worktree, with a
+message naming the reason. Nothing runs. Which forms it refuses has differed between
+observations; see below.
+
+**2026-11-06, Claude Code 2.1.319**, a subagent launched with `isolation: "worktree"`
+(how this repo's workers run), in bypass-permissions mode, with git run only on
+throwaway repositories under `/tmp`:
+
+- Refused: setting `HOME` before git ("injecting git configuration"); `$(…)` around
+  `git worktree list`; a `for` loop whose body runs `git -C "$d"`; an unquoted
+  variable as a `sed` argument, with no git in the command; `bash -c '… source x'`; a
+  Python heredoc whose text contains the word git; `git status --short; echo $X`,
+  where `echo $X` alone was allowed.
+- Allowed: `git -C` on a repository under `/tmp`; `cd /tmp/… && git …`; `git init` and
+  `git clone` to a path under `/tmp`; two git commands chained with `&&`; `D=…; git
+  -C "$D" …`; a `for` loop whose body runs `git worktree list` with literal arguments;
+  a double-quoted variable as a `sed` argument; `git diff A B > /tmp/file`; `git log
+  … | python3 -c '…'` whose Python text does not name git; `head` and `sed` on another
+  checkout's files. Python tests that spawn git themselves (`make test`) are not
+  inspected.
+- Not re-checked: `git -C` on the shared repository or another checkout, and a
+  session moved into a worktree with the `EnterWorktree` tool, which a subagent
+  pinned to its own worktree can only use to switch into another existing one.
+
+**2026-10-01**, a session in a named worktree under the shared repo, most likely moved
+there with `EnterWorktree`; release and permission mode not recorded. Refused then:
+`git -C <other path>`, `cd <tmp> && git …`, setting `HOME` before git, a `for` loop or
+`$(…)` around `git worktree list`, a variable as a `sed` argument, `bash -c '… source
+x'`, and a Python heredoc naming git. Of those, `cd /tmp/… && git …`, `git -C` on a
+`/tmp` path, and a `for` loop around a literal `git worktree list` passed on
+2026-11-06 in a subagent; whether the change is the release or the setup is open.
+
+What held both times: one plain command per call, run from the worktree; literal
+paths in place of variables; `git diff A B > /tmp/file` for each side, then `diff`
+the files; reading another checkout's files with `cat` or `sed`. Outside Bash,
+the `Edit` tool made the edits a Python rewrite naming git would have been refused
+for; git in another checkout is left to the maintainer.
 
 ## Stock WSL2 kernels ship `ip_set` without the `xt_set` match
 

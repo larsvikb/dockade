@@ -16,6 +16,7 @@ one (server, tool) pair — rather than that it is a boundary.
 """
 from __future__ import annotations
 
+import json
 import unittest
 
 from _loader import load_control_plane, load_protocol, load_surface
@@ -470,6 +471,48 @@ class ProtocolTests(unittest.TestCase):
         # side effect.
         answer = self.protocol.handle([{"jsonrpc": "2.0", "id": 1, "method": "ping"}], [])
         self.assertEqual(answer["error"]["code"], self.protocol.INVALID_REQUEST)
+
+    #: Ids as `app.py`'s `json.loads` reads them: NaN, the infinities (`1e999` among
+    #: them, from strictly valid JSON) and a lone surrogate, bare or inside a list.
+    UNSENDABLE_IDS = ("NaN", "Infinity", "-Infinity", "1e999", '"a\\ud800"',
+                      '"\\udc00"', '["\\ud800"]', "[1, NaN]")
+
+    def test_an_id_the_reply_cannot_carry_is_refused_before_anything_runs(self):
+        # Echoed, it failed the reply with a 500 after the tool had run and been
+        # recorded `ok`. Refused ahead of the `jsonrpc` check too, which echoes it.
+        def execute(name, arguments):  # pragma: no cover - must not run
+            raise AssertionError("the executor was reached")
+
+        for raw_id in self.UNSENDABLE_IDS:
+            for jsonrpc in ('"jsonrpc": "2.0", ', ""):
+                with self.subTest(id=raw_id, jsonrpc=bool(jsonrpc)):
+                    message = json.loads(
+                        f'{{{jsonrpc}"id": {raw_id}, "method": "tools/call", '
+                        f'"params": {{"name": "x__y"}}}}')
+                    answer = self.protocol.handle(message, [], execute)
+                    self.assertEqual(answer["error"]["code"],
+                                     self.protocol.INVALID_REQUEST)
+                    self.assertIsNone(answer["id"])
+                    self.protocol.encode(answer)
+
+    def test_an_id_that_fails_to_encode_any_other_way_is_refused_too(self):
+        # Nested past the encoder's recursion limit: a RecursionError, not one of the
+        # two named failures, and still an answer rather than a 500.
+        deep: list = []
+        for _ in range(100_000):
+            deep = [deep]
+        answer = self.protocol.handle({"jsonrpc": "2.0", "id": deep, "method": "ping"},
+                                      [])
+        self.assertEqual(answer["error"]["code"], self.protocol.INVALID_REQUEST)
+        self.assertIsNone(answer["id"])
+
+    def test_an_id_the_reply_can_carry_is_echoed(self):
+        for message_id in ("abc", 7, 1.5, None, "räk \U0001f600"):
+            with self.subTest(id=message_id):
+                answer = self.protocol.handle(
+                    {"jsonrpc": "2.0", "id": message_id, "method": "ping"}, [])
+                self.assertEqual(answer, {"jsonrpc": "2.0", "id": message_id,
+                                          "result": {}})
 
     def test_a_message_that_is_not_one_is_refused(self):
         for message in ("ping", 7, None, {}, {"jsonrpc": "1.0", "id": 1, "method": "ping"},

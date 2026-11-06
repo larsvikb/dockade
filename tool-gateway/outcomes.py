@@ -101,7 +101,8 @@ CONTENT_RECORD_MAX = int(os.environ.get("GATEWAY_CONTENT_RECORD_MAX", str(256 <<
 #:                    recorded "did the HTTP call work" would have logged it as success.
 #:   rpc-error        a well-formed reply carrying a JSON-RPC `error` object: the
 #:                    request was rejected, as opposed to the tool having run and failed
-#:   transport-error  no MCP answer at all — refused, HTTP error, unparseable
+#:   transport-error  no MCP answer at all — refused, HTTP error, unparseable — or
+#:                    one the gateway could not pass on
 #:   timeout          no answer IN TIME, which is not the same thing: the call may have
 #:                    landed upstream. For an approved write that distinction is the
 #:                    whole question, and it is why the grant is spent either way.
@@ -264,7 +265,8 @@ def _printable(value: object) -> str:
 def _wire(result: dict | None) -> bytes | None:
     """``result`` as the agent received it, or None for no result or one that could
     not be sent: ``app.py`` fails the reply on the same error, so no bytes reached the
-    agent to describe."""
+    agent to describe. ``execute._run`` replaces such a result before it records one,
+    so the swallow is this function's own never-raise guard, not a path it takes."""
     if result is None:
         return None
     try:

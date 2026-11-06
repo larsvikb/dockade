@@ -540,7 +540,8 @@ def revoke_mcp_pin(pin_id: int, request: Request) -> JSONResponse:
         # pinned grant in between could otherwise extend it.
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT server, tool, pins_json, expires_at FROM tool_pins WHERE id=?",
+            "SELECT server, tool, pins_json, expires_at, approval_id FROM tool_pins "
+            "WHERE id=?",
             (pin_id,)).fetchone()
         if row is None:
             conn.rollback()
@@ -556,7 +557,7 @@ def revoke_mcp_pin(pin_id: int, request: Request) -> JSONResponse:
     left = ("" if expires_at is None or not was_live
             else f" with {policy._short_duration(expires_at - now)} left")
     store._audit("revoke", stage="tool-policy", server=row["server"], tool=row["tool"],
-                 actor=actor,
+                 actor=actor, approval_id=row["approval_id"],
                  reason=(f"pin {pin_id} revoked{left}; {row['tool']} on "
                          f"{row['server']} pinned on {fields} is decided by its rule "
                          f"again" if was_live else

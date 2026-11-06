@@ -335,21 +335,22 @@ _MOVED = "e1" * 32
 
 def _set_pins(pins, schema_digest=_SCHEMA):
     """Replace the tool_pins table with (server, tool, pins) tuples, or (server, tool,
-    pins, seconds_from_now) for a timed pin, the offset relative as in ``_set_leases``.
-    A dict is stored in its canonical form, as the writer will store it; a string is
-    stored verbatim, as a hand-edited row would be. Every pin is bound to
-    ``schema_digest``."""
+    pins, seconds_from_now) for a timed pin, the offset relative as in ``_set_leases``
+    and None for a permanent one. Two more parts may follow: the pin's approval id,
+    ``test`` by default, and its own digest. A dict is stored in its canonical form,
+    as the writer will store it; a string is stored verbatim, as a hand-edited row
+    would be. A pin with no digest of its own is bound to ``schema_digest``."""
     now = time.time()
     with cp.store._connect() as conn:
         conn.execute("DELETE FROM tool_pins")
         conn.executemany(
             "INSERT INTO tool_pins(server, tool, pins_json, approval_id, created_at, "
             "granted_by, expires_at, schema_digest) "
-            "VALUES (?,?,?, 'test', 0, 'test', ?, ?)",
+            "VALUES (?,?,?,?, 0, 'test', ?, ?)",
             [(server, tool, p if isinstance(p, str) else cp.policy._canonical_pins(p),
-              None if offset is None else now + offset, schema_digest)
-             for server, tool, p, offset in
-             [(pin if len(pin) == 4 else (*pin, None)) for pin in pins]])
+              card, None if offset is None else now + offset, digest)
+             for server, tool, p, offset, card, digest in
+             [(*pin, *(None, "test", schema_digest)[len(pin) - 3:]) for pin in pins]])
         conn.commit()
 
 
@@ -531,6 +532,81 @@ class PinCandidateTests(unittest.TestCase):
                 c = cp.policy._pin_candidates(raw, _SCHEMA)
                 self.assertEqual(c["fields"], [])
                 self.assertTrue(c["refused"])
+
+
+class ToolRulingTests(unittest.TestCase):
+    """``_tool_ruling`` credits a pin's card only when that pin answered the call, so a
+    search by the card's id finds the calls its pin let through and nothing a rule, a
+    refusal or another pin decided."""
+
+    def setUp(self):
+        cp.store._init_db()
+        _set_tool_rules([("mcp-github", "create_pull_request", "ask")])
+        _set_pins([])
+
+    def _ruling(self, args=_PR, schema_digest=_SCHEMA, server="mcp-github",
+                tool="create_pull_request"):
+        return cp.policy._tool_ruling(server, tool, args, schema_digest)
+
+    def test_an_answering_pin_carries_its_card(self):
+        _set_pins([("mcp-github", "create_pull_request", {"repo": "dockade"}, None,
+                    "card-pin")])
+        decision, reason, card = self._ruling()
+        self.assertEqual((decision, card), ("allow", "card-pin"))
+        self.assertIn("by pin", reason)
+
+    def test_of_two_met_pins_the_answering_ones_card_is_credited(self):
+        # The permanent pin comes first in ``_pins_met``'s order but was made under
+        # other arguments, so it does not answer: the timed pin under the call's
+        # digest does, and its card is the one the allow names.
+        _set_pins([("mcp-github", "create_pull_request", {"repo": "dockade"}, 600,
+                    "card-timed"),
+                   ("mcp-github", "create_pull_request", {"owner": "acme"}, None,
+                    "card-moved", _MOVED)])
+        with cp.store._connect() as conn:
+            met = cp.policy._pins_met(conn, "mcp-github", "create_pull_request", _PR,
+                                      time.time())
+        self.assertEqual([row["approval_id"] for row in met],
+                         ["card-moved", "card-timed"])
+        self.assertEqual(self._ruling()[::2], ("allow", "card-timed"))
+
+    def test_no_card_when_no_pin_answers(self):
+        pin = ("mcp-github", "create_pull_request", {"repo": "dockade"}, None,
+               "card-pin")
+        for name, rules, pins, call, want in (
+                ("rule allow", [("mcp-github", "create_pull_request", "allow")],
+                 [pin], {}, "allow"),
+                ("rule deny", [("mcp-github", "create_pull_request", "deny")],
+                 [pin], {}, "deny"),
+                ("unregistered server", "DELETE FROM mcp_servers", [pin], {}, "deny"),
+                ("disabled server", "UPDATE mcp_servers SET enabled=0", [pin], {},
+                 "deny"),
+                ("a call that misses the pin", None, [pin],
+                 {"args": {**_PR, "repo": "widgets"}}, "ask"),
+                ("met only under another digest", None,
+                 [(*pin, _MOVED)], {}, "ask"),
+                ("an expired pin", None, [(*pin[:3], -1, "card-pin")], {}, "ask"),
+                ("a call with no digest", None, [pin], {"schema_digest": None}, "ask"),
+                ("a pin on another tool", None,
+                 [("mcp-github", "merge_pull_request", *pin[2:])], {}, "ask")):
+            with self.subTest(name):
+                _set_tool_rules(rules if isinstance(rules, list) else
+                                [("mcp-github", "create_pull_request", "ask")])
+                if isinstance(rules, str):
+                    with cp.store._connect() as conn:
+                        conn.execute(rules)
+                        conn.commit()
+                _set_pins(pins)
+                decision, _, card = self._ruling(**call)
+                self.assertEqual((decision, card), (want, None))
+
+    def test_decide_tool_is_still_the_pair_the_ruling_starts_with(self):
+        _set_pins([("mcp-github", "create_pull_request", {"repo": "dockade"})])
+        pair = cp.policy._decide_tool("mcp-github", "create_pull_request", _PR,
+                                      _SCHEMA)
+        self.assertEqual(len(pair), 2)
+        self.assertEqual(pair, self._ruling()[:2])
+        self.assertEqual(pair[0], "allow")
 
 
 class TimedPinDecisionTests(unittest.TestCase):

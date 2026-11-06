@@ -4557,15 +4557,15 @@ class ToolAuthorizeDecisionTests(_ToolBridgeTestCase):
 
 
 def _pin(pins, tool="create_pull_request", server="mcp-github", expires_at=None,
-         schema_digest=_SCHEMA):
+         schema_digest=_SCHEMA, approval_id="a1"):
     """Write a pin as the card would, and return its id: a row in place before the
     card under test is answered."""
     with cp.store._connect() as conn:
         pin_id = conn.execute(
             "INSERT INTO tool_pins(server, tool, pins_json, approval_id, created_at, "
             "granted_by, expires_at, schema_digest) "
-            "VALUES (?,?,?, 'a1', 0, 'peer=172.31.0.3', ?, ?)",
-            (server, tool, cp.policy._canonical_pins(pins), expires_at,
+            "VALUES (?,?,?,?, 0, 'peer=172.31.0.3', ?, ?)",
+            (server, tool, cp.policy._canonical_pins(pins), approval_id, expires_at,
              schema_digest)).lastrowid
         conn.commit()
     return pin_id
@@ -4592,14 +4592,14 @@ class PinnedAllowBridgeTests(_ToolBridgeTestCase):
         self.assertNotIn("approval_id", answer)
         self.assertEqual(cp.holds._list_tool_asks(), [])
 
-    def test_the_record_names_the_pin_and_carries_no_approval(self):
+    def test_the_record_names_the_pin_and_carries_its_card(self):
         _tool_call(tool="create_pull_request", args=_PR_ARGS)
         with cp.store._connect() as conn:
             row = conn.execute("SELECT kind, stage, server, tool, approval_id, reason "
                                "FROM audit ORDER BY id DESC LIMIT 1").fetchone()
         self.assertEqual((row["kind"], row["stage"], row["server"], row["tool"]),
                          ("allow", "tool-call", "mcp-github", "create_pull_request"))
-        self.assertIsNone(row["approval_id"])
+        self.assertEqual(row["approval_id"], "a1")
         self.assertIn(f"by pin {self.pin_id}", row["reason"])
         # Field names, never values: the values are agent-authored.
         self.assertNotIn("dockade", row["reason"])
@@ -4624,6 +4624,89 @@ class PinnedAllowBridgeTests(_ToolBridgeTestCase):
         self.assertEqual(len(cp.holds._canonical_args(args)), cp.holds.TOOL_ARGS_MAX)
         self.assertEqual(_tool_call(tool="create_pull_request", args=args)["decision"],
                          "allow")
+
+
+class PinAuditApprovalIdTests(_ToolBridgeTestCase):
+    """What a pin allowed, and the pin's revoke, carry the card the pin was granted
+    from, so searching that card's id finds them beside the card's own rows."""
+
+    audits = True
+    CARD = "d" * 32
+    LATER = "e" * 32
+
+    def setUp(self):
+        super().setUp()
+        self.rule_id = _tool_rule("create_pull_request", "ask").body["id"]
+
+    def _found(self, card):
+        """What searching ``card`` finds, as (kind, stage, approval_id)."""
+        return sorted((r["kind"], r["stage"], r["approval_id"])
+                      for r in cp.api_views.api_audit_events(q=card)["rows"])
+
+    def _calls(self):
+        """The tool-call rows, oldest first, as (kind, approval_id)."""
+        with cp.store._connect() as conn:
+            return [tuple(r) for r in conn.execute(
+                "SELECT kind, approval_id FROM audit WHERE stage='tool-call' "
+                "ORDER BY id").fetchall()]
+
+    def test_searching_a_card_id_finds_the_calls_its_pin_allowed(self):
+        card = _ask_id(_tool_call(tool="create_pull_request", args=_PR_ARGS))
+        _resolve(card, "allow_pinned", pins=["owner", "repo"])
+        self.assertTrue(_claim(card).body["ok"])
+        for title in ("another", "a third"):
+            self.assertEqual(_tool_call(tool="create_pull_request",
+                                        args={**_PR_ARGS, "title": title})["decision"],
+                             "allow")
+        self.assertEqual(self._found(card),
+                         [("allow", "tool-ask", card), ("allow", "tool-call", card),
+                          ("allow", "tool-call", card), ("allow", "tool-resume", card),
+                          ("create", "tool-policy", card), ("hold", "tool-call", card)])
+
+    def test_a_call_the_pin_does_not_answer_is_not_credited_to_it(self):
+        _pin(_PINNED, approval_id=self.CARD)
+        missed = _ask_id(_tool_call(tool="create_pull_request",
+                                    args={**_PR_ARGS, "repo": "widgets"}))
+        _edit_tool_rule(self.rule_id, "allow")
+        _tool_call(tool="create_pull_request", args=_PR_ARGS)
+        # The miss raised its own card and names it; the rule decided the last call.
+        self.assertEqual(self._calls(), [("hold", missed), ("allow", None)])
+
+    def test_revoking_a_live_pin_names_its_card(self):
+        pin_id = _pin(_PINNED, approval_id=self.CARD)
+        _tool_call(tool="create_pull_request", args=_PR_ARGS)
+        cp.api_mcp.revoke_mcp_pin(pin_id, _FakeRequest())
+        self.assertEqual(self._found(self.CARD),
+                         [("allow", "tool-call", self.CARD),
+                          ("revoke", "tool-policy", self.CARD)])
+
+    def test_removing_an_expired_pin_names_its_card(self):
+        pin_id = _pin(_PINNED, expires_at=time.time() - 1, approval_id=self.CARD)
+        cp.api_mcp.revoke_mcp_pin(pin_id, _FakeRequest())
+        [row] = cp.api_views.api_audit_events(q=self.CARD)["rows"]
+        self.assertEqual((row["kind"], row["approval_id"]), ("revoke", self.CARD))
+        self.assertIn(f"expired pin {pin_id} removed", row["reason"])
+
+    def test_the_glance_folds_one_pins_allows_and_splits_on_a_new_card(self):
+        # A pin's allows are one human decision, so they fold; the pin rebound from
+        # a later card is a second decision, so its allows are a line of their own.
+        pin_id = _pin(_PINNED, approval_id=self.CARD)
+        for _ in range(2):
+            _tool_call(tool="create_pull_request", args=_PR_ARGS)
+
+        def allow_lines():
+            with cp.store._connect() as conn:
+                return sorted(r["n"] for r in cp.audit.grouped(
+                    conn, 50, cp.audit.parse(), 500)
+                    if r["kind"] == "allow" and r["stage"] == "tool-call")
+
+        self.assertEqual(allow_lines(), [2])
+        with cp.store._connect() as conn:
+            conn.execute("UPDATE tool_pins SET approval_id=? WHERE id=?",
+                         (self.LATER, pin_id))
+            conn.commit()
+        _tool_call(tool="create_pull_request", args=_PR_ARGS)
+        self.assertEqual(allow_lines(), [1, 2])
 
 
 class McpPinTests(_CPTestCase):

@@ -489,6 +489,54 @@ class SectionCitationTests(_NeedsGit):
                                        "patterns changed and this checks nothing")
 
 
+class NoPersonalNameTests(_NeedsGit):
+    """Committed text names roles, not people (CLAUDE.md's convention), and this holds
+    the part of that rule a machine can derive: the copyright holder from ``NOTICE``
+    and the owner's handle from the README badge, without this file naming either.
+    Those two lines are the exceptions, the license attribution and the repo's own
+    address; anywhere else in a tracked file, the handle or any word of the holder's
+    name is a failure, as a whole word in any case.
+
+    Over every tracked text file, code and fixtures too, not only the docs: the
+    names that reached a draft did so in a skill, an agent's prompt and a test
+    fixture's owner. It finds no other person or project, which no file names for it
+    to derive, and no commit or PR text, which is not tracked; the grep CLAUDE.md asks
+    for covers those. A ``NOTICE`` naming an organisation would make "any word" too
+    broad (its "Inc" in every file), so a change to that line means revisiting this."""
+
+    @staticmethod
+    def _source(name: str, pattern: str) -> tuple[str, str]:
+        """(the line, the name it holds), from the first line of ``name`` matching."""
+        for line in (ROOT / name).read_text(encoding="utf-8").splitlines():
+            if m := re.search(pattern, line):
+                return line, m.group(1)
+        raise AssertionError(f"{name} has no line matching /{pattern}/, so this "
+                             f"guard has no name to look for and checks nothing")
+
+    def test_no_tracked_file_names_the_holder_or_the_owner(self):
+        holder_line, holder = self._source("NOTICE", r"^Copyright [\d, -]+ (\S.*?)\s*$")
+        badge_line, owner = self._source("README.md", r"github\.com/([\w.-]+)/dockade/")
+        exempt = {("NOTICE", holder_line), ("README.md", badge_line)}
+        words = sorted({*holder.split(), owner})
+        pattern = re.compile(r"\b(?:" + "|".join(map(re.escape, words)) + r")\b", re.I)
+        for name in _tracked():
+            path = ROOT / name
+            if not path.is_file():
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            for i, line in enumerate(text.splitlines(), 1):
+                if (name, line) in exempt:
+                    continue
+                with self.subTest(file=name, line=i):
+                    self.assertIsNone(
+                        pattern.search(line),
+                        f"{name}:{i} names the copyright holder or the repo owner; "
+                        f"committed text names a role (CLAUDE.md, Conventions)")
+
+
 class CitedArtifactTests(_NeedsGit):
     """Test names and make targets cited in prose exist.
 

@@ -12,8 +12,10 @@ much as a missed one.
 ## First: your own copy of the commit
 
 Read and probe the commit in a scratch clone, never in the author's checkout, which
-may move while you work. One git command per call, with literal paths; the harness
-refuses compound git commands in a worktree session:
+may move while you work. One git command per call, with literal paths: in a worktree
+session the harness refuses a command it cannot prove keeps git in the worktree, and
+these steps passed in a worktree-isolated subagent (NOTES.md, "A worktree-isolated
+session refuses a command that might run git elsewhere"):
 
     git rev-parse --git-common-dir                  → the shared repository, R
     mktemp -d /tmp/review-<sha>.XXXXXX              → your directory, D
@@ -69,7 +71,12 @@ production runs, what was tested where — check it.
    default-deny, audit.
 7. **Where this repo's defects cluster:** prose about migration, rollback and restore;
    claims about what was tested and under which conditions; host-check steps; a doc claim
-   with a machine-checkable counterpart and no guard in `tests/test_docs.py`.
+   with a machine-checkable counterpart and no guard in `tests/test_docs.py`; and on a
+   change that names hidden characters (bidi, zero-width, control characters, escapes),
+   a character the change did not mean to contain. Scan every changed file in D and the
+   commit body (`git -C D log -1 --format=%B`) for category Cf, Zl, Zp or Cc other than
+   tab and newline: a typed escape can arrive as the real character (NOTES.md, "A
+   backslash-u escape typed into a tool parameter arrives as the character").
 8. **Writing:** placement per "Where writing goes"; a comment that narrates instead of
    recording a hard-won fact; the same reasoning in two places.
 

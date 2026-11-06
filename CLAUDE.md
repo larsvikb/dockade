@@ -49,6 +49,16 @@ only the invariants and conventions for working in the repo.
   clarity over cleverness.
 - New recurring workflow → make it a skill. Skills encode good practice, not
   just access.
+- Committed text names roles, not people, so the repo does not assume one person
+  works in it: the maintainer reviews, pushes and runs the host-only checks; the
+  operator, DESIGN.md's word, answers approvals; a host detail is described as "the
+  reference machine" in NOTES.md. A test fixture takes an invented name (`acme`,
+  `widgets`), never a real person's handle or another real project. The two
+  exceptions are `NOTICE`'s copyright line and the README badge's URL: the license
+  attribution and the repo's own address. Before committing a skill, agent, doc,
+  fixture, commit message or PR body, grep it for a personal name or a real
+  project; `NoPersonalNameTests` catches only the two names it can derive from those
+  lines.
 - Keep one line per open branch in `inflight.md` at your checkout's root (gitignored),
   starting with the branch name: what it is for and its state — not the files it
   touches, which `git diff --stat main...<branch>` gives. Write it before you start

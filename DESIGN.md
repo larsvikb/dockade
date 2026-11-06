@@ -2448,7 +2448,7 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | MCP gateway — per-tool allow/deny/ask on `tools/call`, the pending ask, `resume_tool_call` | **done** |
 | — | `withdraw_tool_call` — the agent retires its own pending or unclaimed ask; the bridge's fifth endpoint | **done** |
 | — | tell the sandbox it exists — firewall grant, proxy exemption, `--mcp-config` from a wrapper | **done** |
-| — | tool audit is joinable — `server`/`tool`/`approval_id` columns, filled by every writer | **done** |
+| — | tool audit is joinable — `server`/`tool`/`approval_id` columns; `approval_id` on a card's own rows, and on the calls a pin answered and the pin's revoke, credited to the card that last set the pin | **done** — not on a pinned call's outcome (task 276), nor on a rule revoke that removes expired pins with it |
 | — | the gateway records how a call ENDED — its own JSONL stream | **done** |
 | — | outcomes ingested — second stream, `status` column, `outcome` in the audit vocabulary | **done** — one approval id now selects the hold, the answer, the claim and the result |
 | — | what a call returned — the body to the gateway's own `tool-content` file, its size, hash and duration to the audit row | **done** — the card's outcome and the facts in the audit view are task 252 |

@@ -106,14 +106,15 @@ def tool_authorize(req: ToolCallRequest) -> dict:
     # instead: control-plane/DESIGN.md, "A lone surrogate is refused where it is
     # decided on".
     if store._unencodable(req.server, req.tool, req.client):
-        decision, reason = "deny", store.UNENCODABLE
+        decision, reason, pin_card = "deny", store.UNENCODABLE, None
     else:
-        decision, reason = policy._decide_tool(server, tool,
-                                               req.args if showable else None, digest)
+        decision, reason, pin_card = policy._tool_ruling(
+            server, tool, req.args if showable else None, digest)
 
     if decision in ("allow", "deny"):
         store._audit(decision, stage="tool-call", client=req.client,
                      client_class=client_class, server=server or None, tool=tool or None,
+                     approval_id=pin_card,
                      reason=f"{tool or '(no tool)'} on {server or '(no server)'}: "
                             f"{reason}")
         return {"decision": decision, "reason": reason}

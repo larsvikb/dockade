@@ -13,10 +13,11 @@ other allow.
 ``_client_class`` maps a peer address to the class a rule is scoped to. It lives
 beside the matcher that consumes it, not in the proxy that observed the address.
 
-``_decide_tool`` at the bottom does the same job for the MCP gateway's table and
-shares no code with the host matcher: it sits next to ``_decide`` because each way
-the two differ is a decision. Where a tool's rule is `ask`, a pin may answer the call
-in advance (``_answering_pin``).
+``_decide_tool`` and ``_tool_ruling`` at the bottom do the same job for the MCP
+gateway's table and share no code with the host matcher: they sit next to ``_decide``
+because each way the two differ is a decision. Where a tool's rule is `ask`, a pin
+may answer the call in advance (``_answering_pin``), and ``_tool_ruling`` names its
+card for the audit row.
 """
 from __future__ import annotations
 
@@ -805,28 +806,37 @@ def _decide_tool(server: str, tool: str, args: object = None,
     ``schema_digest`` is the gateway's word for the arguments it served, and the one
     input here a sibling supplies. It can only narrow: a wrong one misses every pin and
     gets a card."""
+    return _tool_ruling(server, tool, args, schema_digest)[:2]
+
+
+def _tool_ruling(server: str, tool: str, args: object = None,
+                 schema_digest: str | None = None) -> tuple[str, str, str | None]:
+    """``_decide_tool`` plus the approval id of the pin that answered, None when no pin
+    did: what ``/tool/authorize`` records, so searching a card's id finds the calls its
+    pin let through. The id comes from the answering pin's own row, read with the
+    decision, so a pin the call met but that did not answer is never credited."""
     server, tool = (server or "").strip(), (tool or "").strip()
     if not server or not tool:
-        return "deny", "a tool call needs both a server and a tool name"
+        return "deny", "a tool call needs both a server and a tool name", None
     with store._connect() as conn:
         registered = conn.execute(
             "SELECT enabled FROM mcp_servers WHERE server = ?", (server,)).fetchone()
         if registered is None:
             return "deny", (f"no MCP server named {server!r} is registered, so nothing "
-                            f"about its tools has been decided")
+                            f"about its tools has been decided"), None
         if not registered["enabled"]:
             return "deny", (f"MCP server {server!r} is registered but disabled — its "
-                            f"tool rules do not decide while it is switched off")
+                            f"tool rules do not decide while it is switched off"), None
         row = conn.execute(
             "SELECT action FROM tool_rules WHERE server = ? AND tool = ?",
             (server, tool)).fetchone()
         if row is None:
             return "deny", (f"no rule for {tool!r} on {server!r} — an unconfigured "
-                            f"tool is denied, not held")
+                            f"tool is denied, not held"), None
         action = row["action"]
         if action not in _TOOL_ACTIONS:
             return "deny", (f"the rule for {tool!r} on {server!r} carries an unknown "
-                            f"action {action!r}")
+                            f"action {action!r}"), None
         now = time.time()
         met = _pins_met(conn, server, tool, args, now) if action == "ask" else []
     pin = _answering_pin(met, schema_digest)
@@ -834,7 +844,9 @@ def _decide_tool(server: str, tool: str, args: object = None,
         expires_at = pin["expires_at"]
         left = ("" if expires_at is None
                 else f", {_short_duration(expires_at - now)} left")
-        return "allow", (f"'allow' by pin {pin['id']} ({tool} on {server}, pinned: "
-                         f"{_pin_fields(pin)}{left})")
+        return ("allow", (f"'allow' by pin {pin['id']} ({tool} on {server}, pinned: "
+                          f"{_pin_fields(pin)}{left})"),
+                pin["approval_id"])
     reason = f"{action!r} by rule ({tool} on {server})"
-    return action, f"{reason}; {_skipped_words(met, schema_digest)}" if met else reason
+    return (action, f"{reason}; {_skipped_words(met, schema_digest)}" if met else reason,
+            None)

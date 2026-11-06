@@ -268,13 +268,15 @@ def grouped(conn, limit: int, filt: Filter, scan: int) -> list:
     ``approval_id`` IS THE EXCEPTION TO THAT RULE, and it is deliberate. It is grouped
     BY and not selected — the glance serves what it displays, which is why `url` and
     `port` are absent too, and a 32-character id per row would be payload nothing on
-    screen could use. A grant is single-use by construction, so two approval ids are
-    two distinct human decisions —
-    and folding a row that stands for a SPENT GRANT hides exactly what the approval
-    machinery exists to record. Two separately approved `create_pull_request` calls that
-    both succeeded are two pull requests; shown as one line with a count, the count is
-    the only trace that a second human decision ever happened. Outcomes with no approval
-    still fold (NULLs group together), which keeps the high-volume read-only rows quiet.
+    screen could use. An approval id names one human decision, so two ids are two
+    distinct decisions — and folding a row that stands for a SPENT GRANT hides exactly
+    what the approval machinery exists to record. Two separately approved
+    `create_pull_request` calls that both succeeded are two pull requests; shown as one
+    line with a count, the count is the only trace that a second human decision ever
+    happened. A pin is the other side of the same rule: it answers many calls under the
+    one decision that made it, so its allows share an id and fold. Outcomes with no
+    approval still fold (NULLs group together), which keeps the high-volume read-only
+    rows quiet.
     Egress rows carry their card's id too, for the record view's search, and still
     fold: the id is in the key only for a row without a host. A retried request raises
     a fresh card per hold window, so splitting on it would turn one agent retrying one

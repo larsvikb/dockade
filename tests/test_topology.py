@@ -3251,7 +3251,11 @@ class BackupRestoreRecipeTests(_MakeRun):
     logs each call, answers every inspect, says the registry is running when asked, and
     has the store's tool (the ``python3`` entrypoint, not the preflight's ``test``)
     exit with the status a test sets. What is checked is which calls the recipe makes
-    after the tool: a restart on every status but the sidecar one."""
+    after the tool: a restart on every status but the sidecar one.
+
+    A test that sets an export status instead routes the tool's calls apart: both
+    snapshots stream a SQLite header and succeed, and only ``export.py`` exits with
+    that status, so ``backup`` reaches its export."""
 
     SIDECAR_LEFT = "3"
 
@@ -3265,7 +3269,13 @@ class BackupRestoreRecipeTests(_MakeRun):
 # One line a call: the inline programs are arguments, and span lines.
 printf '%s\\n' "$*" | tr '\\n' ' ' >> "{self.calls}"; echo >> "{self.calls}"
 case " $* " in
-  *" --entrypoint python3 "*) cat > /dev/null; exit "$TOOL_STATUS";;
+  *" --entrypoint python3 "*" export.py "*) if [ -n "$EXPORT_STATUS" ]; then
+      cat > /dev/null; echo "# Tasks"; exit "$EXPORT_STATUS"; fi;;
+esac
+case " $* " in
+  *" --entrypoint python3 "*) cat > /dev/null
+    if [ -n "$EXPORT_STATUS" ]; then printf 'SQLite format 3\\000rest'; exit 0; fi
+    exit "$TOOL_STATUS";;
   " compose "*" ps "*) if [ -z "$STOPPED" ]; then echo 0123456789ab; fi;;
 esac
 """)
@@ -3273,10 +3283,12 @@ esac
         self.path = f"{stub}{os.pathsep}{os.environ['PATH']}"
 
     def run_target(self, *args: str, tool_status: str, stopped: bool = False,
+                   export_status: str = "",
                    ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
         run = self.make(*args, path=self.path,
                         env={"TOOL_STATUS": tool_status, "BACKUP_DIR": str(self.backups),
-                             "STOPPED": "1" if stopped else ""})
+                             "STOPPED": "1" if stopped else "",
+                             "EXPORT_STATUS": export_status})
         calls = self.calls.read_text().splitlines() if self.calls.exists() else []
         return run, calls
 
@@ -3339,6 +3351,35 @@ esac
         self.assertEqual(list(self.backups.iterdir()), [])
         # It stops there: the task registry's half is not tried.
         self.assertEqual(self.after_tool(calls), [])
+
+    def backup_names(self) -> list[str]:
+        return sorted(p.name for p in self.backups.iterdir())
+
+    def test_a_failed_export_says_so_and_leaves_no_partial(self):
+        run, calls = self.run_target("backup", tool_status="0", export_status="1")
+        self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+        self.assertTrue([c for c in calls if " export.py" in c], calls)
+        names = self.backup_names()
+        self.assertEqual(len(names), 2, names)
+        control, tasks = names
+        self.assertRegex(control, r"^dockade-control-\d{8}T\d{6}Z\.db$")
+        self.assertRegex(tasks, r"^dockade-tasks-\d{8}T\d{6}Z\.db$")
+        self.assertEqual(run.stdout.splitlines()[-1],
+                         f"backup: FAILED — the task registry's export failed, and "
+                         f"{self.backups / tasks} is whole")
+        self.assertNotIn("Left at", run.stdout)
+        # Its own exit, not a `mv` of the removed partial stopping the recipe.
+        self.assertNotIn("mv:", run.stderr)
+
+    def test_an_export_that_ran_is_renamed(self):
+        run, calls = self.run_target("backup", tool_status="0", export_status="0")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertTrue([c for c in calls if " export.py" in c], calls)
+        names = self.backup_names()
+        self.assertEqual(len(names), 3, names)
+        self.assertRegex(names[0], r"^dockade-control-\d{8}T\d{6}Z\.db$")
+        self.assertRegex(names[1], r"^dockade-tasks-\d{8}T\d{6}Z\.db$")
+        self.assertEqual(names[2], names[1].removesuffix(".db") + ".md")
 
 
 if __name__ == "__main__":

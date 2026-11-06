@@ -1122,7 +1122,8 @@ backup: control-tool-preflight ## Snapshot the control-plane store (policy + app
 	echo "backup: wrote $$tasks_out.db ($$(du -h "$$tasks_out.db" | cut -f1))"
 	# Rendered from that file rather than the live store, so the two say the same.
 	if ! $(TASKS_EXPORT) export.py < "$$tasks_out.db" > "$$tasks_out.md.partial"; then
-	  echo "backup: the export FAILED, and $$tasks_out.db is whole. Left at $$tasks_out.md.partial"
+	  rm -f "$$tasks_out.md.partial"
+	  echo "backup: FAILED — the task registry's export failed, and $$tasks_out.db is whole"
 	  exit 1
 	fi
 	mv "$$tasks_out.md.partial" "$$tasks_out.md"

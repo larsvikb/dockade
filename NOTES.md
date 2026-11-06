@@ -968,6 +968,56 @@ peer with the same uid. This is why the read-only mount guard refuses the runtim
 directories and directories with sockets near the top (`_sc_ro_mount_reason` in
 `sandbox-lib.sh`).
 
+## An allowed read directory loads nothing from it
+
+Measured in-container on Claude Code 2.1.319, 2026-11-06. Each run was a nested
+`claude -p --permission-mode default --output-format stream-json --verbose
+--strict-mcp-config`, with real credentials copied into a scratch
+`CLAUDE_CONFIG_DIR` (deleted after the run), a scratch cwd, and the repo's
+`claude-sandbox/user-settings.json` as the scratch `settings.json`, its `/refs`
+rewritten to a scratch refs root. Unless a row says otherwise, a launch-shaped
+`--settings` file was in front: `extraKnownMarketplaces` and `enabledPlugins`, plus
+one `SessionStart` hook so its loading shows. The fixture ref `<root>/demo/` held
+`.claude/` with a canary skill, agent and command and a `settings.json` hooking
+`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse` and `Stop`, and a
+canary `CLAUDE.md` in `demo/` and `demo/src/`. Each run read `demo/x.txt` (and where
+it says so `demo/src/y.txt`), then was asked to list any canary skill, agent or
+command, so the answer comes after the reads. "Loaded" is the canaries in the
+`init` event and the final answer; "fired" is the files the hooks touched; the
+`CLAUDE.md` canary asked for a marker word that appeared only in the control.
+
+| run | the allow | reads | loaded | hooks fired |
+| --- | --- | --- | --- | --- |
+| no allow | none | refused: "Claude requested permissions to read from …, but you haven't granted it yet." | nothing | launch `SessionStart` |
+| user scope | the template's key naming `<root>` | both run | nothing | launch `SessionStart` |
+| user scope, naming `demo/` itself | the key naming `<root>/demo` | both run | nothing | launch `SessionStart` |
+| project scope, untrusted cwd | the key in `<cwd>/.claude/settings.json` | refused | nothing | launch `SessionStart` |
+| project scope, trusted cwd | the same | both run | nothing | launch `SessionStart` |
+| command-line flag on `demo/` | the flag, no key | runs | skill, agent, command; not `CLAUDE.md` | launch `SessionStart` |
+| control: cwd is `demo/` | none | runs | all, and `CLAUDE.md` | launch, and all five of the ref's |
+
+- **Untrusted, the project key is ignored aloud.** Stderr: "Ignoring 1
+  permissions.additionalDirectories entry from .claude/settings.json: this workspace
+  has not been trusted." Trusted, it works but is missing from the `init` event's
+  `additional_directories`, which lists user-scope and flag entries.
+- **An allowed directory that does not exist is dropped** from `additional_directories`
+  with nothing on stderr, under `-p`. Interactive startup in the real image with no
+  refs mounted showed no warning either (host check below).
+- **A caller's own `--settings` merges this key; it does not replace it.** With the
+  template's allow at user scope and a `--settings` file (no hook) allowing a second
+  root, `additional_directories` listed both and both reads ran; the launch hook did
+  not fire, since that file was not given. So "the last `--settings` replaces the
+  first" (above, "`--settings` is command-line scope") is between flag files: user
+  scope's allow survives a caller's file whatever it carries.
+- **Interactive, in the real images, on the host (2026-11-06).** Tier 1, Claude Code
+  2.1.319, plain `claude` behind the wrapper, with a canary ref of the same shape
+  mounted at `/refs/canary`: neither read asked, no ref hook fired, no canary skill,
+  agent or command was in the reply or the `/` menu, and the `CLAUDE.md` marker
+  never appeared. With no refs mounted, startup showed no warning. Tier 2, opencode
+  1.19.5, with the ref also holding a canary `AGENTS.md`: the config loaded without
+  error, listing `/refs` and both reads asked nothing, and neither the `AGENTS.md`
+  marker nor the canary skill loaded.
+
 ## `curl` reads `http_proxy` in lower case only
 
 Same host, same shell, curl 8.14.1. `example.com` carries a **block** rule, so reaching

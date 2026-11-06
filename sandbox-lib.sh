@@ -547,7 +547,12 @@ sc_refs() {
 
         [[ -n "$name" ]] || name="${real##*/}"
         # No leading dot: that would also allow `..`, and hide the ref from both
-        # `ls /refs` and boundary-check.sh's /refs/*/ probe.
+        # `ls /refs` and boundary-check.sh's /refs/*/ probe. It also keeps a ref
+        # named `.claude` from becoming /refs/.claude. Tier 1's user settings
+        # allow reads under /refs, and an extra directory given on the command
+        # line does load skills from its root's .claude; the settings allow was
+        # measured not to, so this rule is the margin should a release change
+        # that (DESIGN.md, "Reference mounts").
         if [[ ! "$name" =~ ^[A-Za-z0-9_-][A-Za-z0-9._-]*$ ]]; then
             _sc_deny_ref "'$name' is not a usable name under /refs; give one as name=path."
         fi

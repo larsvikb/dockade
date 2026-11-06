@@ -220,7 +220,13 @@ the measured result is at the end of this section.
   `agent`, `prompt`, `permission`, `disable`, `tools`. The internal v2 shape
   (`ConfigV2.Agent`) uses `agents`, `system`, `permissions`, `disabled`. A v2 key written
   into today's config is silently inert, which is the failure mode to expect from
-  reading the TypeScript instead of the schema.
+  reading the TypeScript instead of the schema. The schema itself marks top-level
+  `permission` deprecated in favour of v2's `permissions`, an ordered array of rules
+  rather than a map (checked 2026-11-06). Its `external_directory` takes an action
+  or a pattern→action map, which is the form `opencode.json` uses to allow reads
+  under `/refs`, and opencode 1.19.5 loads it and asks nothing there (measured on the
+  host, 2026-11-06; reading a file under a ref loaded no `AGENTS.md` beside it). When
+  the deprecated key stops loading, that allow is what goes.
 - **Instruction files: first match wins at each level, and they do not stack.** Global is
   `$XDG_CONFIG/opencode/AGENTS.md`, else `~/.claude/CLAUDE.md`. Project is `AGENTS.md`,
   else `CLAUDE.md`, else `CONTEXT.md`, walking up from the working directory. A global

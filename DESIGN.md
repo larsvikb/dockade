@@ -514,10 +514,27 @@ of the boundary — provided what is mounted is only files.
   the `:ro` in the source, and `boundary-check.sh` probes every `/refs/*` in the
   running container. A writable ref would let the agent edit a host checkout
   outside `/workspace`, so outside the review its commits get.
+- **Reading one asks nothing.** `/refs` is outside the working directory, so both
+  agents would ask before every read outside bypass mode. Each tier's image-owned
+  config takes the asking away. Tier 1's `permissions.additionalDirectories` in
+  `claude-sandbox/user-settings.json` makes `/refs` a working directory, with the
+  permissions `/workspace` has, edits included, so `:ro` is what keeps it read-only.
+  Tier 2's `permission.external_directory` in `opencode-sandbox/opencode.json`
+  allows that one permission under `/refs/**`. Both cover the whole of `/refs`,
+  statically, so it is the same for every sibling and needs no launch file. Tier
+  1's allow is at user scope rather than on the command line, because the flag form
+  loads skills, agents and commands from the named directory's `.claude/`, and the
+  settings form loads nothing from a ref — measured, with each run's hooks, in
+  `NOTES.md` → "An allowed read directory loads nothing from it".
 - **The trust framing differs from marketplaces:** a ref is data the agent reads,
-  not code it loads, so no hook or skill runs from it. Its content is still
-  untrusted input — a ref can steer the agent the way any file it reads can — and
-  is bounded by the same egress and tool governance as everything else.
+  not code it loads, so no hook or skill runs from it. In tier 1 that rests on the
+  measurement above and on there being no `/refs/.claude` to load from: a ref's name
+  may not start with a dot (`sc_refs`). `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD`
+  is what would turn the refs' `CLAUDE.md` files into instructions, and
+  `tests/test_refs_note.py` keeps it, the flag and any second allow out of the
+  tree. Its content is still untrusted input — a ref can steer the agent the way
+  any file it reads can — and is bounded by the same egress and tool governance as
+  everything else.
 
 ### Git identity — from the host at launch, not the tree
 
@@ -559,8 +576,8 @@ even where it ignores managed settings". What follows:
   `permissions.deny` there stops *accidents* and steers the agent onto the paved
   road, but the yolo agent can edit it or relaunch around it, so it never counts
   against *malicious* intent. Use it freely for ergonomics; never for containment.
-  (No deny ships in the baked template today — it carries only the status line
-  and the disclaimer flag.)
+  (No deny ships in the baked template today — it carries only the status line,
+  the disclaimer flag and the read allow for `/refs`.)
 - **A settings opt-out is not a containment control.** Hardening env flags
   (`DISABLE_TELEMETRY`, `DO_NOT_TRACK`,
   `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`) are set as real process

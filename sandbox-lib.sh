@@ -135,12 +135,16 @@ _sc_runtime_dir_reason() {
 
 # _sc_walk_path <absolute_path>
 # Resolves <path> physically, component by component, without needing it to exist.
-# Prints "link <location>" for each symlink met on the way (its canonical parent
-# plus its own name) and then "end <path>": the canonical prefix the walk reached,
-# plus whatever was left when it stopped, normalised by name alone. It stops at a
-# component that is missing, is not a directory or cannot be entered, and after 40
-# links (a loop); none of these is an error. A `..` after the stop does not resume
-# it, so a link past one is not seen until the missing component exists.
+# Prints a line for every location it reaches by name, each its canonical parent
+# plus its own name: "dir <location>" for a directory it enters, "link <location>"
+# for a symlink it follows, and "stop <location>" for the component it stops at,
+# which is missing, is not a directory, cannot be entered, or is the link past the
+# 40th (a loop); none of these is an error. Then "end <path>": the canonical prefix
+# the walk reached, plus whatever was left when it stopped, normalised by name
+# alone. A `..` after the stop does not resume it, so a link past one is not seen
+# until the missing component exists. A `..` only returns to a location already
+# printed, so the lines name every place on the route, up to the stop, that a
+# later swap could redirect.
 _sc_walk_path() {
     local cur="" next comp target hops=0
     local -a todo more
@@ -160,8 +164,10 @@ _sc_walk_path() {
             IFS=/ read -ra more <<< "$target"
             todo=(${more[@]+"${more[@]}"} ${todo[@]+"${todo[@]}"})
         elif [[ -d "$next" && -x "$next" && ! -L "$next" ]]; then
+            printf 'dir %s\n' "$next"
             cur="$next"
         else
+            printf 'stop %s\n' "$next"
             cur="$next"
             for comp in ${todo[@]+"${todo[@]}"}; do
                 case "$comp" in
@@ -181,11 +187,15 @@ _sc_walk_path() {
 # the MCP secrets and backups. A workspace that can write any of them is a channel
 # out of its own session — even when they do not exist yet, because a workspace of
 # ~/.config can create dockade/plugins on a fresh host. So each of the five paths is
-# walked rather than resolved, and every link on the way counts too: a workspace
-# holding ~/.config/dockade -> ~/dotfiles/dockade can replace the link with a real
-# directory. Prints the reason to refuse, or nothing.
-# A link's location can only be held by a canonical workspace, never be it or lie
-# inside it. A workspace of / never matches "holds"; the root refusal covers it.
+# walked rather than resolved, and every location on the way counts too: a
+# workspace holding ~/.config/dockade -> ~/dotfiles/dockade can replace the link
+# with a real directory, and one holding a directory or missing name that a `..`
+# leaves again can replace it with a link that sends the `..` elsewhere. Prints the
+# reason to refuse, or nothing.
+# Only a location strictly inside the workspace counts: "dir <workspace>" and "dir
+# <ancestor>" do occur, and pass, because the agent cannot swap its own mount point
+# or what holds it. Only "end" is checked for "is" and "holds". A workspace of /
+# never matches "holds"; the root refusal covers it.
 _sc_config_home_reason() {
     local real="$1" home what entry line kind path
     home="$(sc_config_home)"
@@ -261,7 +271,8 @@ sc_guard_workspace() {
     # override is the operator saying they know what the directory holds. The one
     # exception is the marketplaces mount, which does not yield to it: when the
     # marketplaces directory exists, sc_marketplaces still refuses a workspace that
-    # holds it or a link on the way to it (a dotfiles-managed ~/.config/dockade).
+    # holds it or a link or directory on the way to it (a dotfiles-managed
+    # ~/.config/dockade).
     _sc_warn_credentials "$real_workspace" "workspace" "RW"
     # dockade's own state, when dockade is the workspace. A control-plane backup is
     # the whole policy store in a file `make restore` will install after checking its
@@ -394,9 +405,9 @@ _sc_ro_mount_reason() {
 # installLocation — it has to be the path as seen from inside.
 #
 # sc_marketplaces <canonical_workspace>: a directory that is the workspace, lies
-# inside it, holds it, or is reached through a link the workspace holds is refused,
-# because the workspace is mounted read-write and the same files would be writable
-# through /workspace whatever the :ro says.
+# inside it, holds it, or is reached through a link or directory the workspace
+# holds is refused, because the workspace is mounted read-write and the same files
+# would be writable through /workspace whatever the :ro says.
 # Only this launch's workspace is known here. A sibling's cannot hold the default
 # directory, since sc_guard_workspace refuses what holds the config home, but the
 # cases that guard cannot see stay open (DESIGN.md, "Plugin marketplaces").
@@ -439,15 +450,21 @@ sc_marketplaces() {
         fi
     fi
     # A link on the way that the workspace holds can be replaced with a real
-    # directory, which a later launch with the same path mounts. Default path too:
-    # the workspace guard walks it, but yields to ALLOW_UNSAFE_WORKSPACE.
+    # directory, and a directory that a `..` leaves again with a link, either of
+    # which a later launch with the same path mounts. Default path too: the
+    # workspace guard walks it, but yields to ALLOW_UNSAFE_WORKSPACE. A "stop"
+    # needs the layout to change after cd -P entered every component.
     if [[ -z "$reason" ]]; then
         [[ "$dir" == /* ]] || dir="$PWD/$dir"
         while IFS= read -r line; do
-            if [[ "$line" == "link $workspace"/* ]]; then
-                reason="the link ${line#link } on the way to it is inside the workspace ($workspace), which is mounted read-write."
-                break
-            fi
+            case "$line" in
+                "link $workspace"/*) reason="the link ${line#link }" ;;
+                "dir $workspace"/*) reason="the directory ${line#dir }" ;;
+                "stop $workspace"/*) reason="the name ${line#stop }" ;;
+                *) continue ;;
+            esac
+            reason+=" on the way to it is inside the workspace ($workspace), which is mounted read-write."
+            break
         done < <(_sc_walk_path "$dir")
     fi
     if [[ -n "$reason" ]]; then

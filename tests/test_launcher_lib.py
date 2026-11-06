@@ -430,7 +430,31 @@ class WorkspaceGuardTests(unittest.TestCase):
         self.addCleanup(locked.chmod, 0o755)
         explicit = locked / "inner" / "dockade"
         proc = self.guard(cfgs, DOCKADE_CONFIG_HOME=str(explicit))
-        self.assertRefused(proc, f"{explicit} is inside it, and leads to {self._CONFIG}")
+        self.assertRefused(proc, f"{locked} is inside it, and leads to {self._CONFIG}")
+
+    def test_a_detour_through_a_directory_inside_the_workspace_is_refused(self):
+        # w/sub/../../cfg ends outside w, but the agent can swap w/sub for a link
+        # deeper into w and then create w/cfg, which a later launch would read.
+        cfgs = self.root / "cfgs"
+        workspace = cfgs / "w"
+        (workspace / "sub").mkdir(parents=True)
+        (cfgs / "other").mkdir()
+        env = {"DOCKADE_CONFIG_HOME": f"{workspace}/sub/../../cfg"}
+        self.assertRefused(self.guard(workspace, **env),
+                           f"{workspace / 'sub'} is inside it, and leads to {self._CONFIG}")
+        self.assertAllowed(self.guard(cfgs / "other", **env))
+
+    def test_a_detour_through_a_missing_name_inside_the_workspace_is_refused(self):
+        # The agent can create w/gone as a link, and the `..` after it then lands
+        # wherever the link points.
+        cfgs = self.root / "cfgs"
+        workspace = cfgs / "w"
+        workspace.mkdir(parents=True)
+        (cfgs / "other").mkdir()
+        env = {"DOCKADE_CONFIG_HOME": f"{workspace}/gone/../../cfg"}
+        self.assertRefused(self.guard(workspace, **env),
+                           f"{workspace / 'gone'} is inside it, and leads to {self._CONFIG}")
+        self.assertAllowed(self.guard(cfgs / "other", **env))
 
     def test_the_marketplaces_mount_is_held_to_the_same_rule(self):
         # Its guard says it refuses what this one refuses; read-only stops the agent
@@ -479,12 +503,18 @@ class MarketplaceWorkspaceOverlapTests(unittest.TestCase):
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    def assert_refused_for_link(self, proc, link: Path):
+    def assert_refused_on_the_way(self, proc, what: str):
         self.assertEqual(proc.returncode, 1, proc.stderr)
         self.assertEqual(proc.stdout, "")
         self.assertIn("REFUSING to mount marketplaces", proc.stderr)
-        self.assertIn(f"the link {link} on the way to it is inside the workspace "
+        self.assertIn(f"{what} on the way to it is inside the workspace "
                       f"({self.workspace}), which is mounted read-write.", proc.stderr)
+
+    def assert_refused_for_link(self, proc, link: Path):
+        self.assert_refused_on_the_way(proc, f"the link {link}")
+
+    def assert_refused_for_directory(self, proc, directory: Path):
+        self.assert_refused_on_the_way(proc, f"the directory {directory}")
 
     def test_the_workspace_itself_is_refused(self):
         proc = self.mount(self.workspace)
@@ -610,6 +640,37 @@ class MarketplaceWorkspaceOverlapTests(unittest.TestCase):
             proc = self.mount(out / "lnk2" / ".." / "mk")
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertEqual(proc.stdout.split(), ["-v", f"{target}:/marketplaces:ro"])
+
+    def test_a_detour_through_a_directory_inside_the_workspace_is_refused(self):
+        # app/sub/../../mk ends outside the workspace, but the agent can swap
+        # app/sub for a link deeper into it and then create app/mk.
+        (self.workspace / "sub").mkdir()
+        (self.root / "work" / "mk").mkdir()
+        proc = self.mount(f"{self.workspace}/sub/../../mk")
+        self.assert_refused_for_directory(proc, self.workspace / "sub")
+
+    def test_a_link_whose_target_detours_through_the_workspace_is_refused(self):
+        (self.workspace / "sub").mkdir()
+        (self.root / "work" / "mk").mkdir()
+        outer = self.root / "dotfiles-mk"
+        outer.symlink_to(Path("work", "app", "sub", "..", "..", "mk"))
+        self.assert_refused_for_directory(self.mount(outer), self.workspace / "sub")
+
+    def test_a_detour_the_agent_cannot_swap_still_mounts(self):
+        # Through a directory outside the workspace, through the workspace itself,
+        # whose mount point the agent cannot replace, and through `app-x`, which
+        # shares a prefix with `app` and nothing else.
+        target = self.root / "work" / "mk"
+        target.mkdir()
+        self.elsewhere("x")
+        (self.root / "work" / "app-x").mkdir()
+        for written in (f"{self.root}/elsewhere/x/../../work/mk",
+                        f"{self.workspace}/../mk",
+                        f"{self.root}/work/app-x/../mk"):
+            with self.subTest(written=written):
+                proc = self.mount(written)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout.split(), ["-v", f"{target}:/marketplaces:ro"])
 
     def test_links_outside_the_workspace_still_mount_their_target(self):
         # `app-link` shares a prefix with `app` and nothing else.

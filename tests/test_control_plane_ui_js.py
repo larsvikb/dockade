@@ -5596,7 +5596,7 @@ class PayloadHazardTests(unittest.TestCase):
         # A raw U+202E in the warning would reorder the warning.
         mixed = self.probe["tool"]["hazards_mixed"]
         self.assertIn("\\u202e", mixed["note"])
-        self.assertNotIn("‮", mixed["note"])
+        self.assertNotIn("\u202e", mixed["note"])
         self.assertEqual(mixed["level"], "danger")
         self.assertIn("1 invisible or direction-changing and 2 other non-ASCII",
                       mixed["note"])
@@ -5826,7 +5826,7 @@ class PayloadIndentTests(unittest.TestCase):
     def test_the_escaped_form_is_indented_without_decoding_it(self):
         shown = self.probe["tool"]["indent_escaped"]
         self.assertEqual(shown, '{\n  "repo": "safe\\u202eevil"\n}')
-        self.assertNotIn("‮", shown)
+        self.assertNotIn("\u202e", shown)
 
     def test_a_missing_payload_is_empty(self):
         self.assertEqual(self.probe["tool"]["indent_missing"], "")

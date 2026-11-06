@@ -185,10 +185,11 @@ TOOLS: dict[str, Tool] = {
     "search_tasks": Tool(reads.search_tasks, (
         f"Find tasks whose title, body or notes contain a phrase, ignoring case, in one "
         f"repo or all and in every state, newest first, up to {reads.SEARCH_MAX} with "
-        f"the total. Search before you `propose`, so as not to file a task that exists, "
-        f"and to find what earlier sessions said about the same problem. Each hit names "
-        f"the latest of its matching notes; read one with `task_notes`, passing its id "
-        f"plus one as `before`."), (
+        f"the total. Search before you `propose`, by more than one phrase since a phrase "
+        f"matches only as written, so as not to file a task that exists, and to find "
+        f"what earlier sessions said about the same problem. Each hit carries the ids of "
+        f"up to {notes.IN_READ} matching notes, the latest, with how many matched; read "
+        f"one with `task_notes`, passing its id plus one as `before`."), (
         Param("text", "string", "The phrase, matched as written apart from case; "
               "nothing in it is a wildcard.", required=True,
               max_length=reads.SEARCH_TEXT_MAX),
@@ -202,12 +203,21 @@ TOOLS: dict[str, Tool] = {
         read_only=True),
 
     "propose": Tool(agent_moves.propose, (
-        "File a task; it starts `proposed`. Search first (`search_tasks`): a task that "
-        "exists needs a note, not a twin. The body says what and why. A proposal is "
-        "cheap: before the operator sees it, an agent claims it with `claim_plan` and "
-        "hands in a plan with `submit_plan`. While it is proposed and unclaimed any "
-        "agent in the repo may edit it with `edit_proposal`; once it is refined, only "
-        "the operator changes it."), (
+        "File a task; it starts `proposed`. Search first with `search_tasks`, by more "
+        "than one phrase: the file, the function, and the symptom in plain words. If the "
+        "same defect is filed, add a note to it with `add_note` and file nothing. If a "
+        "related task is proposed and either unclaimed or claimed by you, widen it "
+        "with `edit_proposal` while it stays one small, independently verifiable change; "
+        "otherwise file this one with that task as `parent`. If a related task is "
+        "claimed by another agent, or refined or later, file this one and name in its "
+        "body that task and the paths folding in would add; whoever owns that spec "
+        "decides whether to fold. A finding that needs its own design or decision, or "
+        "crosses into another component, is filed on its own, as is one with nothing "
+        "related: small changes outrank tidiness.\n\n"
+        "The body says what and why. A proposal is cheap: before the operator sees it, "
+        "an agent claims it with `claim_plan` and hands in a plan with `submit_plan`. "
+        "While it is proposed and unclaimed any agent in the repo may edit it with "
+        "`edit_proposal`; once it is refined, only the operator changes it."), (
         AGENT, REPO, _required(TITLE), _required(BODY), SEVERITY, KIND,
         Param("parent", "integer", "The objective this task is part of, in the same "
               "repo.", nullable=True),

@@ -257,7 +257,7 @@ class PathTests(unittest.TestCase):
         for path in [
             ".claude/skills/review/SKILL.md",
             ".claude/skills/review/scripts/probe.sh",
-            ".claude/agents/reviewer.md",
+            ".claude/agents/commit-reviewer.md",
             "control-plane/.claude/skills/x/SKILL.md",
             "docs/settings.json",
             "tests/.claude-plugin/x.json",

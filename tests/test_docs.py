@@ -315,6 +315,48 @@ class InstructionFileTests(_NeedsGit):
                          "path; rename one that is not, or list one that is here")
 
 
+class AgentNameTests(_NeedsGit):
+    """An agent the instructions tell a session to launch exists by that name.
+
+    A launch by a name no agent has fails only when a session tries it, and the
+    instructions are where a session learns the name: the `CLAUDE.md` files, the
+    skills and the agents themselves, which launch each other. Claude Code finds an
+    agent by its `name:`, not its file, so the two are held equal as well. Read as a
+    backticked name then "agent" or "subagent", either plural; a name in plain prose is
+    out of reach."""
+
+    BUILT_IN: ClassVar[set] = {"Plan", "general-purpose", "Explore"}
+    NAMED = re.compile(r"`([^`\s]+)`\s+(?:sub)?agents?\b", re.I)
+
+    def test_every_agent_named_exists(self):
+        tracked = _tracked()
+        agents = [f for f in tracked
+                  if re.fullmatch(r"\.claude/agents/[^/]+\.md", f)]
+        names = set()
+        for f in agents:
+            name = re.search(r"^name:\s*(\S+)\s*$", (ROOT / f).read_text(), re.M)
+            with self.subTest(agent=f):
+                self.assertIsNotNone(name, f"{f} has no `name:`")
+                self.assertEqual(name.group(1), Path(f).stem,
+                                 f"{f} is launched by its `name:`, which must be its "
+                                 f"file's name")
+                names.add(name.group(1))
+        sources = agents + [
+            f for f in tracked if f.rsplit("/", 1)[-1] == "CLAUDE.md"
+            or re.fullmatch(r"\.claude/skills/[^/]+/SKILL\.md", f)]
+        checked = 0
+        for f in sources:
+            for m in self.NAMED.finditer((ROOT / f).read_text()):
+                checked += 1
+                with self.subTest(file=f, agent=m.group(1)):
+                    self.assertIn(m.group(1), names | self.BUILT_IN,
+                                  f"{f} names the `{m.group(1)}` agent, which no "
+                                  f".claude/agents/ file is and Claude Code does "
+                                  f"not build in")
+        self.assertGreater(checked, 0, "no agent named in any instructions — the "
+                                       "wording changed and this checks nothing")
+
+
 class MarkdownAnchorTests(_NeedsGit):
     """Every in-document link resolves to a heading in that document.
 

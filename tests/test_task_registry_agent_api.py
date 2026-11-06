@@ -18,7 +18,7 @@ import uuid
 from pathlib import Path
 
 import _surface
-from _loader import ROOT, load_task_registry_agent_api
+from _loader import ROOT, load_surface, load_task_registry_agent_api
 from test_task_registry_plans import DECISION, MULTI, shown
 
 reg = load_task_registry_agent_api()
@@ -419,14 +419,71 @@ class InstructionTests(unittest.TestCase):
         self.assertTrue(reg.tasks.REPO_NAME_RE.fullmatch(names[0]), names[0])
 
     def test_every_tool_the_instructions_name_is_served(self):
-        # The skills too: `review-before-push` files its leftovers with a tool.
+        # The skills and agents too: `review-before-push` files its leftovers with a
+        # tool, and the planner and its reviewer work through them.
         skills = sorted((ROOT / ".claude" / "skills").glob("*/SKILL.md"))
+        agents = sorted((ROOT / ".claude" / "agents").glob("*.md"))
         named = {str(path.relative_to(ROOT)): re.findall(r"tasks__(\w+)", path.read_text())
-                 for path in (self.IMAGE, self.REPO, *skills)}
+                 for path in (self.IMAGE, self.REPO, *skills, *agents)}
         self.assertTrue(named["CLAUDE.md"])
+        self.assertTrue(named[".claude/agents/planner.md"]
+                        + named[".claude/agents/plan-reviewer.md"])
         for where, names in named.items():
             with self.subTest(file=where):
                 self.assertEqual(sorted(set(names) - set(tools.TOOLS)), [])
+
+
+class PlanAgentToolTests(unittest.TestCase):
+    """The plan reviewer's registry tools are the ones that only read, and the planner
+    is denied the moves that are not a planner's but keeps Agent, which it launches its
+    reviewers with. Mistake prevention, not containment (CLAUDE.md, "`settings.json` is
+    mistake-prevention"): Bash stays with both."""
+
+    AGENTS = ROOT / ".claude" / "agents"
+    GATEWAY = "mcp__gateway__"
+    TASKS = f"{GATEWAY}{api.SERVER_NAME}__"
+    #: Agent under either of its names, `Task` being the older one, and with or without
+    #: a `(type, …)` suffix, which still names the tool. Open-ended after the bracket,
+    #: since splitting on commas cuts a suffix that lists two types.
+    AGENT = re.compile(r"(?:Agent|Task)(?:\(.*)?")
+
+    def _frontmatter(self, name: str) -> dict[str, list[str]]:
+        """Each frontmatter key's comma-separated values."""
+        head = (self.AGENTS / f"{name}.md").read_text().split("\n---\n", 1)[0]
+        keys = (line.partition(":") for line in head.splitlines()[1:])
+        return {k.strip(): [v.strip() for v in value.split(",")] for k, _, value in keys}
+
+    def test_the_plan_reviewers_registry_tools_are_read_only(self):
+        surface = load_surface()
+        native = {self.GATEWAY + surface.RESUME_TOOL, self.GATEWAY + surface.WITHDRAW_TOOL}
+        allowed = self._frontmatter("plan-reviewer").get("tools")
+        self.assertIsNotNone(allowed, "plan-reviewer.md has no `tools:` allowlist")
+        for entry in allowed:
+            if not entry.startswith("mcp__") or entry in native:
+                continue
+            with self.subTest(tool=entry):
+                name = entry.removeprefix(self.TASKS)
+                self.assertTrue(entry.startswith(self.TASKS) and name in tools.TOOLS
+                                and tools.TOOLS[name].read_only,
+                                f"{entry} is not a registry tool that only reads")
+        for read in ("get_task", "task_notes"):
+            self.assertIn(self.TASKS + read, allowed)
+        for writer in ("Edit", "Write", "NotebookEdit"):
+            self.assertNotIn(writer, allowed)
+        self.assertEqual([e for e in allowed if self.AGENT.fullmatch(e)], [])
+
+    def test_the_planner_is_denied_the_moves_that_are_not_its_own(self):
+        front = self._frontmatter("planner")
+        self.assertNotIn("tools", front, "an allowlist would have to keep Agent in step")
+        denied = front.get("disallowedTools", [])
+        github = f"{self.GATEWAY}mcp-github__"
+        for move in ("Edit", "Write", "NotebookEdit", "Skill",
+                     self.TASKS + "edit_proposal", self.TASKS + "claim_work",
+                     self.TASKS + "submit_work", self.TASKS + "send_back",
+                     github + "create_pull_request", github + "update_pull_request"):
+            self.assertIn(move, denied)
+        self.assertEqual([e for e in denied if self.AGENT.fullmatch(e)], [],
+                         "the planner launches its reviewers")
 
 
 class CallTests(_Store):

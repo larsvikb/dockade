@@ -1,12 +1,12 @@
 ---
 name: review-before-push
-description: Before telling the maintainer a dockade commit is ready to push, have the reviewer agent check it with a fresh context, then verify each finding, fix or decline it, and record the review. Use after committing, before the hand-off.
+description: Before telling the maintainer a dockade commit is ready to push, have the `commit-reviewer` agent check it with a fresh context, then verify each finding, fix or decline it, and record the review. Use after committing, before the hand-off.
 ---
 
 A review earns its time on what an author cannot see in their own work: claims that
 outrun the evidence, host checks that would not show what they say, the same defect
-elsewhere, docs the change made false. The `reviewer` agent brings a blank context.
-This skill brings it what that context lacks, and deals with what comes back.
+elsewhere, docs the change made false. The `commit-reviewer` agent brings a blank
+context. This skill brings it what that context lacks, and deals with what comes back.
 
 ## 1. Commit first
 
@@ -41,8 +41,8 @@ The reviewer knows only the repo and what you tell it. Give it:
 - your premises, marked as premises, so it can challenge them;
 - your doubts: the questions you could not settle.
 
-Launch the `reviewer` agent with it, in the background, and keep working: it reads
-the commit in its own clone, so your checkout may move.
+Launch the `commit-reviewer` agent with it, in the background, and keep working: it
+reads the commit in its own clone, so your checkout may move.
 
 ## 4. Triage what comes back
 
@@ -138,7 +138,7 @@ them to the maintainer after triage, since a fix can change what the host must c
   task's `submit_work` note, which `tasks__get_task` marks by its move, against its
   record. Reviews before records are in the main checkout's `local-review-log.md`, a
   frozen archive whose header no longer applies.
-- When the records show a pattern that changes the reviewer's brief or this skill, the
-  commit that changes it states the evidence in its message: the records are not in
-  git, and the reason for a committed change must be. A finding about reviews that
+- When the records show a pattern that changes the commit reviewer's brief or this
+  skill, the commit that changes it states the evidence in its message: the records are
+  not in git, and the reason for a committed change must be. A finding about reviews that
   would hold in another repo is evidence for `NOTES.md` instead.

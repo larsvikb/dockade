@@ -47,8 +47,8 @@ only the invariants and conventions for working in the repo.
 
 - Prefer simple, direct, auditable implementations. This is infrastructure —
   clarity over cleverness.
-- New recurring workflow → make it a skill. Skills encode good practice, not
-  just access.
+- New recurring workflow → make it a skill, or an agent, where it needs a fresh
+  context and its own tools. Skills encode good practice, not just access.
 - Committed text names roles, not people, so the repo does not assume one person
   works in it: the maintainer reviews, pushes and runs the host-only checks; the
   operator, DESIGN.md's word, answers approvals; a host detail is described as "the
@@ -75,6 +75,10 @@ only the invariants and conventions for working in the repo.
   - for new work, `tasks__propose`;
   - before drafting a plan for one of its tasks, `tasks__claim_plan`;
   - once the plan's review rounds are done, `tasks__submit_plan`;
+  - asked to refine a task, the `planner` agent, which drafts it with a fresh
+    `plan-reviewer` agent per round and, unlike a worker, may claim it itself;
+  - before telling the operator a plan is ready, `tasks__get_task`, to read it as
+    submitted;
   - before the first edit on one of its tasks, `tasks__claim_work`;
   - after each commit, `tasks__update`;
   - once the review passes, `tasks__submit_work`;

@@ -214,7 +214,14 @@ else
     )
 
     for domain in "${ALLOWED_DOMAINS[@]}"; do
-        ips=$(dig +noall +answer A "$domain" 2>/dev/null | awk '$4 == "A" {print $5}')
+        # A condition, not a bare assignment: dig exits non-zero mostly when no
+        # resolver replies (NOTES.md, "Docker's embedded resolver refuses to
+        # forward"), and set -e would end the boot there with no message. Its
+        # partial output is never used.
+        if ! ips=$(dig +noall +answer A "$domain" 2>/dev/null | awk '$4 == "A" {print $5}'); then
+            echo "WARNING: failed to resolve $domain (the lookup exited non-zero, usually no resolver replied)"
+            continue
+        fi
         [ -z "$ips" ] && { echo "WARNING: failed to resolve $domain"; continue; }
         while read -r ip; do
             if [[ "$ip" =~ ^[0-9.]+$ ]]; then

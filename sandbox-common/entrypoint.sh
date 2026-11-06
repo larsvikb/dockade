@@ -71,7 +71,20 @@ fi
 # CapEff/CapPrm/CapAmb are the sets that actually grant or preserve capability;
 # CapBnd (bounding) may legitimately still list the added caps and is not by
 # itself exploitable under no-new-privileges. Fail closed on any non-zero set.
-agent_caps="$(gosu "$USERNAME" grep -E '^Cap(Eff|Prm|Amb):' /proc/self/status | awk '{print $2}')"
+#
+# The probe is a condition, not a bare assignment: set -e would end the boot on a
+# failing probe without a word, and a probe that read nothing would leave the loop
+# below nothing to check. Both are FATAL here.
+if ! agent_caps="$(gosu "$USERNAME" grep -E '^Cap(Eff|Prm|Amb):' /proc/self/status | awk '{print $2}')"; then
+    echo "FATAL: could not read the sandbox user's Linux capabilities (the probe exited non-zero)." >&2
+    echo "       The containment model requires the agent to hold none — refusing to start." >&2
+    exit 1
+fi
+if [ -z "$agent_caps" ]; then
+    echo "FATAL: could not read the sandbox user's Linux capabilities (the probe read no Cap set)." >&2
+    echo "       The containment model requires the agent to hold none — refusing to start." >&2
+    exit 1
+fi
 for cap in $agent_caps; do
     if [ "$cap" != "0000000000000000" ]; then
         echo "FATAL: sandbox user would start with Linux capabilities (Eff/Prm/Amb: $agent_caps)." >&2

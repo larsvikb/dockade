@@ -18,12 +18,12 @@
 # The `build` job then STANDS THE STACK UP and runs boundary-check.sh in a real
 # sandbox, which is the only automated evidence this repo has that the containment
 # boundary still holds — init-firewall.sh is otherwise covered by shellcheck, a
-# manual `make boundary`, and tests/test_init_firewall.py for three lifted blocks
-# (the :53 rules, the GitHub ranges and the allowed-domains loop), i.e. a firewall
-# regression elsewhere in it is invisible to every other check here. It rides on
-# `build` rather than a third job because that job has already compiled the images
-# into this runner's daemon; a separate job shares no layer cache and would rebuild
-# every image from scratch to run a two-minute check.
+# manual `make boundary`, and the blocks tests/test_init_firewall.py lifts out and
+# runs (its docstring names them), i.e. a firewall regression elsewhere in it is
+# invisible to every other check here. It rides on `build` rather than a third
+# job because that job has already compiled the images into this runner's daemon;
+# a separate job shares no layer cache and would rebuild every image from scratch
+# to run a two-minute check.
 name: check
 
 on:
@@ -210,7 +210,7 @@ jobs:
       #   - tier 1 in GOVERNED mode only. Tier 2 needs an iGPU the runner does not
       #     have; standalone mode needs a host with no compose infra, which is
       #     also why the standalone firewall rules stay validated by hand, apart
-      #     from the three blocks tests/test_init_firewall.py runs lifted out.
+      #     from the blocks tests/test_init_firewall.py runs lifted out.
       #   - the IPv6 probe self-skips when the runner's container has no v6 stack.
       #   - the lifeline probe needs api.anthropic.com to answer (no credentials —
       #     any HTTP response counts), so a network blip there reads as a failure.

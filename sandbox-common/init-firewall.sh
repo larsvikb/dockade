@@ -242,11 +242,18 @@ fi
 # In GOVERNED and LOCAL modes drop it entirely: the sandbox reaches its one
 # sanctioned service by that service's own /32 (below) and needs nothing on the
 # host gateway, so this host-local surface is removed rather than pinned.
+#
+# The lookup is a condition, not a bare assignment: set -e would end the boot on a
+# failing `ip` with no message. Its partial output is never used. awk reads to the
+# end rather than `exit` at the first default row, so it cannot SIGPIPE `ip`.
 if [ "$DIRECT_EGRESS" -eq 1 ]; then
-    HOST_IP=$(ip route | awk '/default/ {print $3; exit}')
-    if [[ "$HOST_IP" =~ ^[0-9.]+$ ]]; then
+    if ! HOST_IP=$(ip route | awk '/default/ && !found {print $3; found = 1}'); then
+        echo "WARNING: host gateway not allowed (the route lookup exited non-zero)"
+    elif [[ "$HOST_IP" =~ ^[0-9.]+$ ]]; then
         iptables -A INPUT  -s "$HOST_IP" -j ACCEPT
         iptables -A OUTPUT -d "$HOST_IP" -j ACCEPT
+    else
+        echo "WARNING: host gateway not allowed (no IPv4 default route)"
     fi
 fi
 

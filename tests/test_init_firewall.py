@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Three blocks of ``init-firewall.sh``: the :53 allow rules, the GitHub ranges and
-the allowed-domains loop.
+"""Four blocks of ``init-firewall.sh``: the :53 allow rules, the GitHub ranges, the
+allowed-domains loop and the host gateway allow.
 
 Only the blocks run, lifted out of the script: the rest arms a firewall as root.
 bash and jq run for real (the GitHub block's jq filter is under test); iptables,
-ipset, curl, aggregate and dig are stubbed as shell functions that log what they
-are given or answer per domain. The CI image has no ``aggregate``, so it is stubbed
-both as a passthrough and as failing, which covers both arms of the script's ``||``
-fallback.
+ipset, curl, aggregate, dig and ip are stubbed as shell functions that log what
+they are given or answer per domain or per case. The CI image has no
+``aggregate``, so it is stubbed both as a passthrough and as failing, which covers
+both arms of the script's ``||`` fallback.
 """
 from __future__ import annotations
 
@@ -58,6 +58,11 @@ def _domain_loop() -> str:
     # Ends at the outer loop's `done` (4 spaces), past the inner `done <<< "$ips"`.
     return _lift(r'^    for domain in "\$\{ALLOWED_DOMAINS\[@\]\}"; do\n.*?^    done\n',
                  "allowed-domains loop")
+
+
+def _gateway_block() -> str:
+    return _lift(r'^if \[ "\$DIRECT_EGRESS" -eq 1 \]; then\n.*?^fi\n',
+                 "host gateway block")
 
 
 def _run(script: str, env: dict[str, str], cwd: str) -> subprocess.CompletedProcess:
@@ -182,6 +187,79 @@ class AllowedDomainsTests(unittest.TestCase):
             failed.format("partial.example"),
             "WARNING: failed to resolve empty.example",
         ])
+
+
+# Reached only when the block lets the boot go on: the script after it still runs
+# under set -e and pipefail.
+_STRICT_AFTER = ('[[ $- == *e* && -o pipefail ]] || '
+                 '{ echo "strict mode is off past the block" >&2; exit 97; }\n')
+_DEFAULT_ROW = "default via 192.0.2.1 dev eth0"
+_LOOKUP_FAILED = "WARNING: host gateway not allowed (the route lookup exited non-zero)"
+_NO_ROUTE = "WARNING: host gateway not allowed (no IPv4 default route)"
+
+
+@unittest.skipUnless(_BASH or _STRICT, "bash is not installed")
+class HostGatewayTests(unittest.TestCase):
+
+    def _run_block(self, rows: list[str], rc: int, direct_egress: int = 1):
+        """Run the block with ``ip`` printing ``rows`` and returning ``rc``.
+
+        Returns the iptables calls, stdout, and whether ``ip`` ran at all.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "iptables.log"
+            ran = Path(tmp) / "ip.ran"
+            # A file, not an environment variable: one string in the environment
+            # is capped at 128 KiB, below what the long-table case needs. A real
+            # `ip` dies of a SIGPIPE; the stub passes on cat's, since set -e is off
+            # inside the script's `if !`.
+            routes = Path(tmp) / "routes"
+            routes.write_text("".join(f"{row}\n" for row in rows))
+            stubs = (f'ip() {{ : > {ran}; cat {routes} || return; return "$IP_RC"; }}\n'
+                     f'iptables() {{ local IFS=" "; echo "$*" >> {log}; }}\n')
+            env = dict(os.environ, DIRECT_EGRESS=str(direct_egress), IP_RC=str(rc))
+            proc = _run(stubs + _gateway_block() + _STRICT_AFTER, env, tmp)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            calls = log.read_text().splitlines() if log.exists() else []
+            return calls, proc.stdout, ran.exists()
+
+    def test_a_failed_lookup_warns_and_allows_nothing(self):
+        for rows in ([], [_DEFAULT_ROW]):
+            with self.subTest(rows=rows):
+                calls, out, _ = self._run_block(rows, 2)
+                self.assertEqual(calls, [])
+                self.assertEqual(out.splitlines(), [_LOOKUP_FAILED])
+
+    def test_no_ipv4_default_route_warns_and_allows_nothing(self):
+        for rows in (["192.0.2.0/24 dev eth0 proto kernel scope link src 192.0.2.5"],
+                     ["default dev wg0 scope link"]):
+            with self.subTest(rows=rows):
+                calls, out, _ = self._run_block(rows, 0)
+                self.assertEqual(calls, [])
+                self.assertEqual(out.splitlines(), [_NO_ROUTE])
+
+    def test_the_first_default_route_is_allowed_both_ways(self):
+        calls, out, _ = self._run_block(
+            ["192.0.2.0/24 dev eth0 proto kernel scope link src 192.0.2.5",
+             _DEFAULT_ROW, "default via 198.51.100.1 dev eth1"], 0)
+        self.assertEqual(calls, ["-A INPUT -s 192.0.2.1 -j ACCEPT",
+                                 "-A OUTPUT -d 192.0.2.1 -j ACCEPT"])
+        self.assertEqual(out, "")
+
+    def test_a_long_route_table_after_the_default_row_is_read_to_the_end(self):
+        # About 490 KB, well past a pipe's buffer plus awk's read block: an awk that
+        # stopped at the default row would leave `ip` writing into a closed pipe,
+        # and pipefail would fail the lookup on its SIGPIPE.
+        filler = [f"198.51.100.{i % 256} dev eth0 proto kernel scope link src 192.0.2.5"
+                  for i in range(8000)]
+        calls, out, _ = self._run_block([_DEFAULT_ROW, *filler], 0)
+        self.assertEqual(calls, ["-A INPUT -s 192.0.2.1 -j ACCEPT",
+                                 "-A OUTPUT -d 192.0.2.1 -j ACCEPT"])
+        self.assertEqual(out, "")
+
+    def test_without_direct_egress_the_route_is_never_looked_up(self):
+        calls, out, ran = self._run_block([_DEFAULT_ROW], 0, direct_egress=0)
+        self.assertEqual((calls, out, ran), ([], "", False))
 
 
 if __name__ == "__main__":

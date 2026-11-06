@@ -1624,16 +1624,18 @@ conn.execute("PRAGMA busy_timeout=10000")
 conn.execute("VACUUM INTO ?", (snap,))
 conn.close()
 
-snapconn = sqlite3.connect(snap)
-counts = {t: snapconn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
-          for t in ("rules", "approvals", "audit")}
-version = snapconn.execute("PRAGMA user_version").fetchone()[0]
-snapconn.close()
+try:
+    snapconn = sqlite3.connect(snap)
+    counts = {t: snapconn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+              for t in ("rules", "approvals", "audit")}
+    version = snapconn.execute("PRAGMA user_version").fetchone()[0]
+    snapconn.close()
 
-with open(snap, "rb") as f:
-    shutil.copyfileobj(f, sys.stdout.buffer)
-sys.stdout.buffer.flush()
-os.unlink(snap)
+    with open(snap, "rb") as f:
+        shutil.copyfileobj(f, sys.stdout.buffer)
+    sys.stdout.buffer.flush()
+finally:
+    os.unlink(snap)
 
 print(f"backup: schema v{version}, " +
       ", ".join(f"{n} {t}" for t, n in counts.items()), file=sys.stderr)
@@ -1689,7 +1691,10 @@ if version > store.SCHEMA_VERSION:
     reject(f"backup is schema v{version}, this control plane understands "
            f"v{store.SCHEMA_VERSION} — update the image first")
 
-os.replace(tmp, dst)
+try:
+    os.replace(tmp, dst)
+except OSError as e:
+    reject(f"could not replace {dst} ({e})")
 # Stale sidecars from the store just replaced. A -wal left behind belongs to a
 # DIFFERENT database file and applying it over the restored one is how a good backup
 # becomes a corrupt store, so failing to remove it is fatal, not a warning. Safe

@@ -5,8 +5,9 @@ This is the crown-jewel state: the policy rules that decide egress, the timed
 leases that decide it for a while, the per-tool rules that decide the MCP
 gateway's surface and the pins that answer its asks in advance, the audit trail
 those decisions are written to, the durable approvals rows that are the single
-source of truth for a hold's outcome, and the ingest cursor. Everything else in
-this service reads and writes through here.
+source of truth for a hold's outcome, the call tokens that carry a pin's card to
+its calls' outcomes, and the ingest cursor. Everything else in this service reads
+and writes through here.
 
 Bottom of the dependency order: this module imports no other module of the
 control plane, so the schema and its migration constraint (the NOTE below
@@ -566,6 +567,51 @@ def _step_14_result_facts(conn: sqlite3.Connection) -> None:
               flush=True)
 
 
+# The handle that carries a pin's card from ``/tool/authorize`` to the call's outcome
+# line. A call a pin answered raises no ask and so has no resume token; without this its
+# outcome row could name no card. Rows are spent by ingest (``ingest._settle_tool_row``)
+# and pruned by `make audit-prune` when an outcome never came to spend them.
+_TOOL_CALL_TOKENS_DDL = """
+    CREATE TABLE IF NOT EXISTS tool_call_tokens (
+        -- What the gateway is handed with the allow and writes on the outcome line:
+        -- random, like a resume token, so it carries no id and names exactly one call.
+        token        TEXT PRIMARY KEY,
+        -- The card of the pin that answered, from the same read as the decision
+        -- (`policy._tool_ruling`), never a second lookup. The id never leaves here.
+        approval_id  TEXT NOT NULL,
+        -- The call the token was minted for, escaped and capped as ingest stores an
+        -- outcome line's fields (`ingest._ingest_field`). The gateway caps its line's
+        -- fields first, and tighter (`outcomes.FIELD_MAX`), so a value past that cap
+        -- no longer matches: a mismatch only ever loses the credit, never moves it.
+        -- A line naming another call spends the token and credits nothing.
+        server       TEXT NOT NULL,
+        tool         TEXT NOT NULL,
+        client       TEXT,
+        created_at   REAL NOT NULL
+        -- Its own table, not an `audit` column: the audit table keeps no agent-side
+        -- token, and a spent token is deleted, which an append-only trail must not do.
+    )"""
+
+
+def _mint_call_token(approval_id: str, server: str, tool: str,
+                     client: str | None) -> str:
+    """Record a call token for a call the pin from card ``approval_id`` answered, and
+    return it. Raises if the row cannot be written, as ``_audit`` does, so the bridge
+    answers with an error and the gateway refuses rather than run a call whose outcome
+    could not be credited."""
+    def field(v):
+        return None if v is None else _escaped(str(v))[:DRAIN_MAX_FIELD]
+    token = _new_resume_token()
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO tool_call_tokens(token, approval_id, server, tool, client, "
+            "created_at) VALUES (?,?,?,?,?,?)",
+            (token, approval_id, field(server), field(tool), field(client),
+             time.time()))
+        conn.commit()
+    return token
+
+
 # Ordered, and the order is the only thing that decides what runs: a step is applied
 # when its version exceeds the store's, so steps must be APPEND-ONLY and never
 # renumbered, reordered or edited once shipped — a store in the field has already run
@@ -854,6 +900,9 @@ def _init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS tool_approvals_status_resolved "
                      "ON tool_approvals(status, resolved_at)")
         conn.execute(_TOOL_APPROVALS_RESUME_INDEX)
+        # Call tokens (``_TOOL_CALL_TOKENS_DDL``). New as a table, so it needs no
+        # `_STEPS` entry: a store from before it gains it here, and its version stays.
+        conn.execute(_TOOL_CALL_TOKENS_DDL)
         # Ingest cursors, one per audit file the control plane tails (``ingest._drain``:
         # the egress proxy's and the tool gateway's). `inode` tells a rotated file from
         # an appended one; without it a fresh file inherits the old offset and its

@@ -980,8 +980,9 @@ destroy: ## Stop infra AND delete its volumes: egress audit, tool audit, tool re
 # one place the number lives (numbers in prose rot; CLAUDE.md).
 AUDIT_RETENTION_DAYS ?= 30
 
-audit-prune: ## Trim audit rows older than AUDIT_RETENTION_DAYS (default 30) and reclaim disk; leaves policy + approvals intact (operator-run)
-	# Retention for the audit table, and ONLY the audit table. This is NOT `make
+audit-prune: ## Trim audit rows and unspent call tokens older than AUDIT_RETENTION_DAYS (default 30) and reclaim disk; leaves policy + approvals intact (operator-run)
+	# Retention for the audit table, and for the call tokens a pinned call's outcome
+	# never came back to spend (store._TOOL_CALL_TOKENS_DDL). This is NOT `make
 	# destroy`: that deletes the whole volume — policy rules, approvals and the
 	# ingest cursor with it — and is the fresh-start. This trims old DECISIONS to a
 	# window and hands the freed disk back, leaving everything standing (rules,
@@ -1573,9 +1574,9 @@ export TOOL_CONTENT_PY
 define AUDIT_PRUNE_PY
 import os, sqlite3, time
 
-# Only the audit table is touched. Reads the same defaults app.py does, so an
-# operator override of CONTROL_DB is honoured; AUDIT_RETENTION_DAYS is passed in
-# by the Makefile (docker exec -e).
+# Only the audit table and tool_call_tokens are touched. Reads the same defaults
+# app.py does, so an operator override of CONTROL_DB is honoured;
+# AUDIT_RETENTION_DAYS is passed in by the Makefile (docker exec -e).
 days = int(os.environ.get("AUDIT_RETENTION_DAYS", "30"))
 db = os.environ.get("CONTROL_DB", "/var/lib/control-plane/control.db")
 cutoff = time.time() - days * 86400
@@ -1585,13 +1586,21 @@ conn = sqlite3.connect(db, timeout=10.0)
 # fail on a momentary lock. VACUUM below needs the write lock to itself.
 conn.execute("PRAGMA busy_timeout=10000")
 deleted = conn.execute("DELETE FROM audit WHERE ts < ?", (cutoff,)).rowcount
+# A token row is left when an outcome line never arrived to spend it. Absent on a
+# store a control plane older than the table last started.
+tokens = 0
+if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='tool_call_tokens'").fetchone():
+    tokens = conn.execute("DELETE FROM tool_call_tokens WHERE created_at < ?",
+                          (cutoff,)).rowcount
 conn.commit()
 # DELETE frees pages inside the file but does not shrink it; VACUUM rebuilds the
 # file compactly and returns the space to the OS. Must run outside a transaction,
 # hence the commit above.
 conn.execute("VACUUM")
 conn.close()
-print(f"audit-prune: deleted {deleted} audit row(s) older than {days}d, then VACUUM")
+print(f"audit-prune: deleted {deleted} audit row(s) and {tokens} unspent call "
+      f"token(s) older than {days}d, then VACUUM")
 endef
 export AUDIT_PRUNE_PY
 

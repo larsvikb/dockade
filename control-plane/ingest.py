@@ -196,11 +196,10 @@ def _tool_row(line: bytes) -> dict | None:
     `observe` (why is at ``audit.KINDS``), and `status` is where its own vocabulary
     lives.
 
-    The ask is named by its RESUME TOKEN, the only handle the gateway is given, and
-    ``_settle_tool_row`` turns it into the ask's id. A line with no token and an
-    ``approval_id`` is from a gateway older than resume tokens, which was handed the
-    id itself, so that value is taken as the id. That branch can go when the
-    gateway's ``approval_id`` alias does, once no line from before it is un-ingested."""
+    ``approval_id`` is never read off the line. A call is named by a handle the
+    control plane minted, its ask's RESUME TOKEN or, for a call a pin answered, its
+    CALL TOKEN, and ``_settle_tool_row`` turns that into an id. An id the line carried
+    would be the gateway crediting a card on its own word."""
     rec = _parsed(line)
     if rec is None or rec.get("stage") != "tool-result":
         return None
@@ -210,18 +209,16 @@ def _tool_row(line: bytes) -> dict | None:
     if ts is None:
         return None
     client = _ingest_field(rec.get("client"))
-    # By the KEY, which the gateway writes on every line, null when policy allowed the
-    # call outright: a line that has it never names an ask by anything else.
-    token = rec.get("resume_token")
-    legacy = None if "resume_token" in rec else _ingest_field(rec.get("approval_id"))
-    # ``resume_token`` is not an audit column, so it is carried to ``_settle_tool_row``
-    # and never inserted.
+    # Neither token is an audit column: both are carried to ``_settle_tool_row``, which
+    # takes them out before the insert.
     return {"ts": ts, "kind": "outcome", "stage": "tool-result",
             "client": client, "client_class": policy._client_class(client),
             "reason": _ingest_field(rec.get("reason")),
             "server": _ingest_field(rec.get("server")),
             "tool": _ingest_field(rec.get("tool")),
-            "approval_id": legacy, "resume_token": _ingest_field(token),
+            "approval_id": None,
+            "resume_token": _ingest_field(rec.get("resume_token")),
+            "call_token": _ingest_field(rec.get("call_token")),
             "status": _ingest_field(rec.get("status")),
             **_result_facts(rec)}
 
@@ -249,17 +246,40 @@ def _result_facts(rec: dict) -> dict:
 
 
 def _settle_tool_row(conn, row: dict) -> None:
-    """Name the outcome's ask by its id, so ``audit.approval_id`` joins the outcome to
-    the hold, the click and the claim, and the token is kept out of the store.
+    """Name the card the outcome's call ran under, so ``audit.approval_id`` joins the
+    outcome to that card's other rows, and keep both tokens out of the store.
 
-    A plain indexed read, NOT ``holds._get_tool_ask``: that runs the expiry pass, which
-    would make every outcome line an expiry write. A token no ask has maps to NULL."""
-    token = row.pop("resume_token", None)
-    if token is None:
-        return
-    found = conn.execute("SELECT id FROM tool_approvals WHERE resume_token=?",
-                         (token,)).fetchone()
-    row["approval_id"] = found["id"] if found is not None else None
+    A RESUME TOKEN names an ask: its id joins the hold, the click and the claim. A
+    plain indexed read, NOT ``holds._get_tool_ask``: that runs the expiry pass, which
+    would make every outcome line an expiry write.
+
+    A CALL TOKEN names a call a pin answered (``store._mint_call_token``), and is
+    SPENT here: its row is deleted on this connection, inside the drain's transaction,
+    so a token credits at most one outcome and a drain that rolls back keeps it. The
+    pin's card is credited only if the line names the call the token was minted for.
+
+    A token the store did not mint, a line with both, and a line with neither leave
+    the id NULL."""
+    resume_token = row.pop("resume_token", None)
+    call_token = row.pop("call_token", None)
+    if resume_token is not None and call_token is None:
+        found = conn.execute("SELECT id FROM tool_approvals WHERE resume_token=?",
+                             (resume_token,)).fetchone()
+        row["approval_id"] = found["id"] if found is not None else None
+    elif call_token is not None and resume_token is None:
+        found = conn.execute(
+            "SELECT approval_id, server, tool, client FROM tool_call_tokens "
+            "WHERE token=?", (call_token,)).fetchone()
+        if found is None:
+            return
+        conn.execute("DELETE FROM tool_call_tokens WHERE token=?", (call_token,))
+        # Guards against a BUGGY gateway, not a forged one: the gateway wrote the
+        # request this row was minted from and the line it is compared with, so a
+        # gateway that lies can make the two agree. What it cannot do is name a card:
+        # the id comes from this row, which only a pin's answer writes.
+        if (found["server"], found["tool"], found["client"]) == (
+                row["server"], row["tool"], row["client"]):
+            row["approval_id"] = found["approval_id"]
 
 
 def _describe_egress(row: dict) -> str:

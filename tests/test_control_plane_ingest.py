@@ -37,6 +37,7 @@ import io
 import json
 import os
 import shutil
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -104,6 +105,7 @@ class IngestTestCase(unittest.TestCase):
         with cp.store._connect() as conn:
             conn.execute("DELETE FROM audit")
             conn.execute("DELETE FROM audit_cursor")
+            conn.execute("DELETE FROM tool_call_tokens")
             conn.commit()
         self.path = os.path.join(_TMP, f"audit-{self.id()}.jsonl")
         # The STREAM's path, not the module constant: `STREAMS` is built at import and
@@ -506,7 +508,8 @@ class ToolOutcomeRowTests(unittest.TestCase):
             {"ts": 1000.0, "kind": "outcome", "stage": "tool-result",
              "client": "172.30.0.130", "client_class": "sandbox", "reason": None,
              "server": "mcp-github", "tool": "get_me", "approval_id": None,
-             "resume_token": None, "status": "ok", "result_bytes": None,
+             "resume_token": None, "call_token": None, "status": "ok",
+             "result_bytes": None,
              "result_sha256": None, "duration": None})
 
     SHA = "0123456789abcdef" * 4
@@ -553,22 +556,28 @@ class ToolOutcomeRowTests(unittest.TestCase):
 
     def test_the_row_fills_exactly_the_columns_it_is_inserted_under(self):
         # A name the INSERT does not list is silently dropped by `r.get(c)`, so a field
-        # added to the mapper alone would vanish without failing anything. The one
-        # extra key is the token, which the settle pass takes out before the insert.
+        # added to the mapper alone would vanish without failing anything. The extra
+        # keys are the tokens, which the settle pass takes out before the insert.
         row = cp.ingest._tool_row(self.line(resume_token="c" * 32))
-        self.assertEqual(set(row) - {"resume_token"}, set(cp.ingest._TOOL_COLUMNS))
+        self.assertEqual(set(row) - {"resume_token", "call_token"},
+                         set(cp.ingest._TOOL_COLUMNS))
         with cp.store._connect() as conn:
             cp.ingest._settle_tool_row(conn, row)
         self.assertEqual(set(row), set(cp.ingest._TOOL_COLUMNS))
 
-    def test_a_line_with_the_token_key_ignores_its_approval_id(self):
-        # Only a gateway older than resume tokens writes an id, and it writes no token.
-        # A line with both is not one of those, so its id is not taken on its word.
-        for token in ("c" * 32, None):
-            with self.subTest(token=token):
-                row = cp.ingest._tool_row(self.line(resume_token=token,
-                                                    approval_id="a" * 32))
-                self.assertIsNone(row["approval_id"])
+    def test_an_approval_id_on_the_line_is_never_taken(self):
+        # An id the gateway wrote would be the gateway crediting a card on its own
+        # word: with a token, with none, and with no token key at all, as a gateway
+        # older than resume tokens wrote it.
+        lines = {"resume token": self.line(resume_token="c" * 32, approval_id="a" * 32),
+                 "call token": self.line(call_token="c" * 32, approval_id="a" * 32),
+                 "null token": self.line(approval_id="a" * 32)}
+        rec = json.loads(lines["null token"])
+        del rec["resume_token"]
+        lines["no token key"] = (json.dumps(rec) + "\n").encode()
+        for name, line in lines.items():
+            with self.subTest(name):
+                self.assertIsNone(cp.ingest._tool_row(line)["approval_id"])
 
     def test_the_decision_word_is_a_constant_the_stream_cannot_choose(self):
         # THE ONE THAT MATTERS. A stream that could name its own decision word could
@@ -674,12 +683,12 @@ class ToolOutcomeDrainTests(IngestTestCase):
                 "FROM audit ORDER BY id")]
 
     def test_an_outcome_reaches_the_store(self):
-        self.write({"status": "tool-error", "approval_id": "a" * 32,
+        self.write({"status": "tool-error", "resume_token": None,
                     "reason": "Resource not accessible by personal access token"})
         cp.ingest._drain(self.tool)
         self.assertEqual(self.rows(), [
             {"kind": "outcome", "stage": "tool-result", "server": "mcp-github",
-             "tool": "get_me", "approval_id": "a" * 32, "status": "tool-error",
+             "tool": "get_me", "approval_id": None, "status": "tool-error",
              "reason": "Resource not accessible by personal access token"}])
 
     def test_the_result_facts_reach_the_store(self):
@@ -728,11 +737,80 @@ class ToolOutcomeDrainTests(IngestTestCase):
         cp.ingest._drain(self.tool)
         self.assertIsNone(self.rows()[0]["approval_id"])
 
-    def test_a_line_from_before_resume_tokens_keeps_its_id(self):
-        # An old gateway was handed the operator's id, so its line already names it.
-        self.write({"status": "ok", "approval_id": "e" * 32})
+    def test_a_line_from_before_resume_tokens_keeps_its_row_and_no_id(self):
+        # An old gateway was handed the operator's id and wrote it with no token key.
+        # Taken verbatim, any id a gateway wrote would credit a card, so it is not:
+        # the row and its status are kept, and the id is NULL.
+        self.write({"status": "tool-error", "approval_id": "e" * 32})
         cp.ingest._drain(self.tool)
-        self.assertEqual(self.rows()[0]["approval_id"], "e" * 32)
+        [row] = self.rows()
+        self.assertEqual((row["status"], row["approval_id"]), ("tool-error", None))
+
+    def _mint(self, card="op-id-pin", server="mcp-github", tool="get_me",
+              client="172.30.0.130"):
+        """A call token as ``/tool/authorize`` mints one for a call a pin answered."""
+        return cp.store._mint_call_token(card, server, tool, client)
+
+    @staticmethod
+    def _tokens():
+        with cp.store._connect() as conn:
+            return [r["token"] for r in conn.execute("SELECT token FROM tool_call_tokens")]
+
+    def test_a_call_token_credits_its_card_once_and_is_spent(self):
+        token = self._mint()
+        self.write({"call_token": token}, {"call_token": token, "status": "timeout"})
+        cp.ingest._drain(self.tool)
+        self.assertEqual([(r["status"], r["approval_id"]) for r in self.rows()],
+                         [("ok", "op-id-pin"), ("timeout", None)])
+        self.assertEqual(self._tokens(), [])
+        # Kept out of the store and the live feed, as a resume token is.
+        with cp.store._connect() as conn:
+            stored = json.dumps([dict(r) for r in conn.execute("SELECT * FROM audit")])
+        self.assertNotIn(token, stored)
+        self.assertNotIn(token, self.out.getvalue())
+
+    def test_a_call_token_on_another_call_credits_nothing_and_is_spent(self):
+        # A mismatched line is a buggy gateway's, and it spends the token anyway: the
+        # token was minted for one call and that call's line is not coming.
+        for field, value in (("server", "mcp-other"), ("tool", "merge"),
+                             ("client", "172.30.0.131"), ("client", None)):
+            with self.subTest(field=field, value=value):
+                token = self._mint()
+                self.write({"call_token": token, field: value})
+                cp.ingest._drain(self.tool)
+                self.assertIsNone(self.rows()[-1]["approval_id"])
+                self.assertEqual(self._tokens(), [])
+
+    def test_a_call_token_minted_with_no_client_matches_a_line_with_none(self):
+        token = self._mint(client=None)
+        self.write({"call_token": token, "client": None})
+        cp.ingest._drain(self.tool)
+        self.assertEqual(self.rows()[0]["approval_id"], "op-id-pin")
+
+    def test_an_unknown_call_token_or_both_handles_or_neither_give_no_id(self):
+        self._ask("op-id-ask", "a" * 32)
+        token = self._mint()
+        self.write({"call_token": "e" * 32},
+                   {"call_token": token, "resume_token": "a" * 32},
+                   {"call_token": None, "resume_token": None})
+        cp.ingest._drain(self.tool)
+        self.assertEqual([r["approval_id"] for r in self.rows()], [None, None, None])
+
+    def test_a_drain_that_rolls_back_leaves_the_token_unspent(self):
+        # Exactly-once with the drain: the spend is on its connection and inside its
+        # transaction, so an insert that fails takes the delete back with the rows.
+        token = self._mint()
+        self.write({"call_token": token})
+        insert = self.tool.insert
+        self.addCleanup(setattr, self.tool, "insert", insert)
+        self.tool.insert = "INSERT INTO no_such_table VALUES (?)"
+        with self.assertRaises(sqlite3.OperationalError):
+            cp.ingest._drain(self.tool)
+        self.assertEqual(self._tokens(), [token])
+        self.tool.insert = insert
+        cp.ingest._drain(self.tool)
+        self.assertEqual(self.rows()[0]["approval_id"], "op-id-pin")
+        self.assertEqual(self._tokens(), [])
 
     def test_mapping_a_token_writes_nothing_to_the_ask(self):
         # A plain read, not ``holds._get_tool_ask``, whose expiry pass would turn every
@@ -801,11 +879,12 @@ class ToolOutcomeDrainTests(IngestTestCase):
         # `make logs-cp` and `make logs-tg` should show the same call in the same
         # shape, because that is how a broken ingest is spotted: present in one, absent
         # in the other.
-        self.write({"status": "tool-error", "approval_id": "b" * 32, "reason": "403"})
+        self._ask("op-id-mirror", "b" * 32)
+        self.write({"status": "tool-error", "resume_token": "b" * 32, "reason": "403"})
         cp.ingest._drain(self.tool)
         printed = self.out.getvalue()
         self.assertIn("outcome (ingested) tool-error mcp-github__get_me", printed)
-        self.assertIn("approval_id=" + "b" * 32, printed)
+        self.assertIn("approval_id=op-id-mirror", printed)
         self.assertIn(":: 403", printed)
 
     def test_a_lone_surrogate_is_stored_escaped_and_the_stream_moves_on(self):

@@ -120,6 +120,26 @@ class RecordShapeTests(OutcomeTestCase):
         row = self.lines()[0]
         self.assertIn("resume_token", row)
         self.assertIsNone(row["resume_token"])
+        # The call token likewise, the handle of a call a pin answered.
+        self.assertIn("call_token", row)
+        self.assertIsNone(row["call_token"])
+
+    def test_a_call_token_is_written_on_the_line(self):
+        with _captured() as out:
+            self.outcomes.record("ok", "mcp-github", "create_pull_request",
+                                 call_token="c" * 32, client="172.30.0.5")
+        row = self.lines()[0]
+        self.assertEqual((row["call_token"], row["resume_token"]), ("c" * 32, None))
+        self.assertNotIn("approval_id", row)
+        self.assertIn(" call_token=" + "c" * 32 + " ", out.getvalue())
+
+    def test_a_resumed_line_carries_no_call_token(self):
+        # The two handles name different things: an ask's card, and a pin's answer.
+        # A resume token written into the call token's key would be spent there.
+        self.outcomes.record("ok", "mcp-github", "create_pull_request",
+                             resume_token="a" * 32, client="172.30.0.5")
+        row = self.lines()[0]
+        self.assertEqual((row["resume_token"], row["call_token"]), ("a" * 32, None))
 
     def test_every_status_the_module_names_survives_a_round_trip(self):
         # The vocabulary is shared with the control plane's ingest across a file and

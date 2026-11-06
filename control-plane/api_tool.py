@@ -112,12 +112,20 @@ def tool_authorize(req: ToolCallRequest) -> dict:
             server, tool, req.args if showable else None, digest)
 
     if decision in ("allow", "deny"):
+        # A pin answered: the gateway gets a call token to write on the outcome line,
+        # which ingest maps back to the pin's card, so the card's id joins how the call
+        # ended without the id leaving here. Before the audit row, so a failed mint
+        # fails the answer; an audit write failing after it leaves an unspent row,
+        # which `make audit-prune` removes.
+        call_token = (store._mint_call_token(pin_card, server, tool, req.client)
+                      if decision == "allow" and pin_card is not None else None)
         store._audit(decision, stage="tool-call", client=req.client,
                      client_class=client_class, server=server or None, tool=tool or None,
                      approval_id=pin_card,
                      reason=f"{tool or '(no tool)'} on {server or '(no server)'}: "
                             f"{reason}")
-        return {"decision": decision, "reason": reason}
+        answer = {"decision": decision, "reason": reason}
+        return answer if call_token is None else {**answer, "call_token": call_token}
 
     # ASK. Registered, not held: the gateway takes the token back at once. An identical
     # ask from the same client joins the pending one rather than raising a second

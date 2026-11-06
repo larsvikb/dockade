@@ -133,7 +133,13 @@ PYFILES := proxies/egress/addon.py control-plane-ui/app.py ui-common/guards.py \
 # Dependency-free unit tests for the governance-critical decision logic. Kept
 # separate from PYFILES so they can be linted with the app code but discovered
 # and run on their own (python -m unittest, no pip installs — see tests/).
-TESTFILES := $(shell git ls-files 'tests/*.py' 2>/dev/null)
+# A GLOB of the directory `make test` discovers from, untracked files included, so
+# lint and compile see every file test runs, from the moment it exists. Deliberately
+# not the SPDX gate's index: a scratch test*.py is already run by `make test`, a
+# helper beside it is what such a test imports, and a git list goes silently empty
+# where git cannot read the worktree. Top level only;
+# tests/test_suite_layout.py's docstring holds why, and fails a nested .py.
+TESTFILES := $(wildcard tests/*.py)
 
 # Files referenced by Dockerfile COPY / entrypoint — existence is asserted so a
 # rename can't silently break the build.

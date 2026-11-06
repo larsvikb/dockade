@@ -429,14 +429,22 @@ printf '%s== privilege ==%s\n' "$bold" "$reset"
 # run iptables (NET_ADMIN) to tear down the firewall or otherwise re-privilege.
 # Read from this process's own status — it runs as the agent, so this is the
 # agent's real cap set (Eff/Prm/Amb are the sets that grant or preserve caps).
-caps="$(grep -E '^Cap(Eff|Prm|Amb):' /proc/self/status | awk '{print $2}')"
-caps_held=0
-for c in $caps; do [ "$c" = "0000000000000000" ] || caps_held=1; done
-if [ "$caps_held" -eq 1 ]; then
-    # shellcheck disable=SC2086  # intentional word-split: flatten multiline $caps to one line
-    bad "agent holds capabilities (Eff/Prm/Amb: $(printf '%s ' $caps))"
+# The probe is the `if`'s condition so a failed read is a FAIL: without `set -e`
+# nothing reads a plain assignment's status, and an empty $caps loops over nothing
+# and PASSes.
+if ! caps="$(grep -E '^Cap(Eff|Prm|Amb):' /proc/self/status | awk '{print $2}')"; then
+    bad "agent capabilities unreadable (the probe of its status file failed or found no Cap line)"
+elif [ -z "$caps" ]; then
+    bad "agent capabilities unreadable (no Cap sets read)"
 else
-    ok "agent holds no capabilities (Eff/Prm/Amb all zero)"
+    caps_held=0
+    for c in $caps; do [ "$c" = "0000000000000000" ] || caps_held=1; done
+    if [ "$caps_held" -eq 1 ]; then
+        # shellcheck disable=SC2086  # intentional word-split: flatten multiline $caps to one line
+        bad "agent holds capabilities (Eff/Prm/Amb: $(printf '%s ' $caps))"
+    else
+        ok "agent holds no capabilities (Eff/Prm/Amb all zero)"
+    fi
 fi
 # no-new-privileges must be in effect, so any setuid-root binary can't
 # re-elevate around the missing caps. (The image also ships no sudo — see the

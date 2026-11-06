@@ -1,0 +1,112 @@
+# SPDX-License-Identifier: Apache-2.0
+"""The privilege-caps check of ``boundary-check.sh``: a probe that reads nothing FAILs.
+
+Only the block runs, lifted out of the script with the script's own ``ok``/``bad``
+helpers and counters: the rest probes egress, DNS and mounts of a live sandbox. bash,
+grep and awk run for real; the probe reads a fixture file in place of the process's
+own status, so the verdict does not depend on the machine running the test.
+"""
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = (ROOT / "sandbox-common" / "boundary-check.sh").read_text()
+
+_BASH = shutil.which("bash")
+# Missing tools SKIP on a dev machine and FAIL under DOCKADE_REQUIRE_TOOLS, which CI
+# sets — as in tests/test_launcher_lib.py.
+_STRICT = bool(os.environ.get("DOCKADE_REQUIRE_TOOLS"))
+
+_STATUS = "/proc/self/status"
+_ZERO = "0000000000000000"
+_THREE_ZERO = f"CapInh:\t{_ZERO}\nCapPrm:\t{_ZERO}\nCapEff:\t{_ZERO}\nCapBnd:\t000001ffffffffff\nCapAmb:\t{_ZERO}\n"
+
+_FAILED = "agent capabilities unreadable (the probe of its status file failed or found no Cap line)"
+_EMPTY = "agent capabilities unreadable (no Cap sets read)"
+
+
+def _lift(pattern: str, what: str) -> str:
+    match = re.search(pattern, SCRIPT, re.MULTILINE | re.DOTALL)
+    if match is None:
+        raise AssertionError(f"boundary-check.sh no longer has the {what}")
+    return match.group(0)
+
+
+def _prelude() -> str:
+    # The script's own options, lifted rather than restated: without pipefail a
+    # probe that fails after printing reads as a success, and the block's verdict
+    # rests on the script having no -e.
+    return _lift(r"^set -uo pipefail\n", "`set -uo pipefail` line")
+
+
+def _helpers() -> str:
+    return _lift(r"^pass=0; fail=0\n.*?^info\(\) [^\n]*\n", "ok/bad helpers")
+
+
+def _caps_block(status: Path) -> str:
+    block = _lift(r"^# THE load-bearing property.*?(?=^# no-new-privileges)", "privilege-caps block")
+    swapped = block.replace(_STATUS, str(status))
+    # Without the swap the result would depend on the machine running the test.
+    if block.count(_STATUS) != 1 or str(status) not in swapped:
+        raise AssertionError(f"the privilege-caps block no longer reads {_STATUS} once")
+    return swapped
+
+
+@unittest.skipUnless(_BASH or _STRICT, "bash is not installed")
+class CapsProbeTests(unittest.TestCase):
+
+    def _run(self, status: str | None, stub: str = "") -> tuple[list[str], str]:
+        """The block's PASS/FAIL lines and the counters after it, for a status file
+        holding ``status`` (None: no file at all)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "status"
+            if status is not None:
+                path.write_text(status)
+            script = (_prelude() + _helpers() + stub + _caps_block(path)
+                      + 'echo "pass=$pass fail=$fail"\n')
+            proc = subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
+                [_BASH, "-c", script], cwd=tmp, env=dict(os.environ),
+                capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        lines = proc.stdout.splitlines()
+        verdicts = [re.sub(r"\x1b\[[0-9;]*m", "", line).strip() for line in lines[:-1]]
+        return verdicts, lines[-1] if lines else ""
+
+    def test_a_missing_status_file_fails_as_a_failed_probe(self):
+        self.assertEqual(self._run(None), ([f"FAIL {_FAILED}"], "pass=0 fail=1"))
+
+    def test_no_cap_lines_fails_as_a_failed_probe(self):
+        self.assertEqual(self._run("Name:\tbash\nNoNewPrivs:\t1\n"),
+                         ([f"FAIL {_FAILED}"], "pass=0 fail=1"))
+
+    def test_cap_lines_with_no_value_fail_as_no_sets_read(self):
+        self.assertEqual(self._run("CapPrm:\nCapEff:\nCapAmb:\n"),
+                         ([f"FAIL {_EMPTY}"], "pass=0 fail=1"))
+
+    def test_a_probe_that_fails_after_its_output_fails(self):
+        # The real grep prints three zero sets, then the probe reports failure: what
+        # it printed must not count as a reading.
+        stub = 'grep() { command grep "$@"; return 3; }\n'
+        self.assertEqual(self._run(_THREE_ZERO, stub), ([f"FAIL {_FAILED}"], "pass=0 fail=1"))
+
+    def test_three_zero_sets_pass(self):
+        self.assertEqual(self._run(_THREE_ZERO),
+                         (["PASS agent holds no capabilities (Eff/Prm/Amb all zero)"],
+                          "pass=1 fail=0"))
+
+    def test_a_nonzero_set_fails_naming_the_sets(self):
+        status = _THREE_ZERO.replace(f"CapEff:\t{_ZERO}", "CapEff:\t0000000000001000")
+        self.assertEqual(self._run(status),
+                         ([f"FAIL agent holds capabilities (Eff/Prm/Amb: {_ZERO} 0000000000001000 {_ZERO} )"],
+                          "pass=0 fail=1"))
+
+
+if __name__ == "__main__":
+    unittest.main()

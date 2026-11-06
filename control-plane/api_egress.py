@@ -411,7 +411,8 @@ def revoke_lease(lease_id: int, request: Request) -> JSONResponse:
     now = time.time()
     with store._connect() as conn:
         row = conn.execute(
-            "SELECT host, client_class, expires_at FROM leases WHERE id=?",
+            "SELECT host, client_class, expires_at, approval_id FROM leases "
+            "WHERE id=?",
             (lease_id,)).fetchone()
         if row is None:
             return JSONResponse({"ok": False, "detail": "unknown lease"},
@@ -425,6 +426,7 @@ def revoke_lease(lease_id: int, request: Request) -> JSONResponse:
     was_live = row["expires_at"] > now
     store._audit(
         "revoke", stage="policy", host=row["host"], actor=actor,
+        approval_id=row["approval_id"],
         reason=(f"lease revoked with "
                 f"{policy._short_duration(row['expires_at'] - now)} left; for client "
                 f"class {row['client_class']}, {row['host']}: {decision[1]}"

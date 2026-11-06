@@ -59,8 +59,9 @@ def _set_rules(rules):
 
 
 def _set_leases(leases):
-    """Replace the leases table with (host, seconds_from_now) or
-    (host, seconds_from_now, class) tuples.
+    """Replace the leases table with (host, seconds_from_now),
+    (host, seconds_from_now, class) or (host, seconds_from_now, class, approval_id)
+    tuples. The approval id defaults to ``test-approval``.
 
     The offset is RELATIVE and applied here, so a test says "expired 5 seconds ago"
     (-5) or "half an hour left" (1800) rather than computing an absolute instant — the
@@ -71,10 +72,10 @@ def _set_leases(leases):
         conn.execute("DELETE FROM leases")
         conn.executemany(
             "INSERT INTO leases(host, client_class, approval_id, created_at, "
-            "expires_at, granted_by) VALUES (?,?, 'test-approval', ?, ?, 'test')",
-            [(host, cls, now, now + offset)
-             for host, offset, cls in
-             [(le if len(le) == 3 else (*le, CLASS)) for le in leases]])
+            "expires_at, granted_by) VALUES (?,?,?,?,?, 'test')",
+            [(host, cls, card, now, now + offset)
+             for host, offset, cls, card in
+             [(*le, *(CLASS, "test-approval")[len(le) - 2:]) for le in leases]])
         conn.commit()
 
 
@@ -827,6 +828,54 @@ class LeaseDecisionTests(unittest.TestCase):
         _set_leases([("api.example.com", 60), ("api.example.com", 900)])
         reason = cp.policy._decide("api.example.com", CLASS)[1]
         self.assertRegex(reason, r"1[45]m\d\ds left")
+
+
+class RulingTests(unittest.TestCase):
+    """``_ruling`` credits the lease's card only when the lease decided, so a search
+    by that card's id finds what rode it and nothing a rule or a hold answered."""
+
+    def setUp(self):
+        cp.store._init_db()
+        _set_rules([])
+        _set_leases([])
+
+    def test_a_lease_decision_carries_the_leases_card(self):
+        _set_leases([("api.example.com", 300)])
+        decision, reason, card = cp.policy._ruling("api.example.com", CLASS)
+        self.assertEqual((decision, card), ("allow", "test-approval"))
+        self.assertIn("allowed by lease", reason)
+
+    def test_no_card_when_something_other_than_a_live_lease_decides(self):
+        for rules, leases, want in (
+                ([("api.example.com", "allow")], [("api.example.com", 300)], "allow"),
+                ([("api.example.com", "block")], [("api.example.com", 300)], "deny"),
+                ([], [("api.example.com", 300, "mcp")], "hold"),
+                ([], [("api.example.com", -1)], "hold")):
+            with self.subTest(rules=rules, leases=leases):
+                _set_rules(rules)
+                _set_leases(leases)
+                decision, _, card = cp.policy._ruling("api.example.com", CLASS)
+                self.assertEqual((decision, card), (want, None))
+
+    def test_each_class_is_credited_its_own_leases_card(self):
+        # One host leased for two classes from two cards: the id must come from the
+        # row that decided, not from any lease that names the host.
+        _set_leases([("api.example.com", 300, "sandbox", "card-sandbox"),
+                     ("api.example.com", 300, "mcp", "card-mcp")])
+        for client_class in ("sandbox", "mcp"):
+            with self.subTest(client_class=client_class):
+                self.assertEqual(
+                    cp.policy._ruling("api.example.com", client_class)[2],
+                    f"card-{client_class}")
+
+    def test_decide_is_still_the_pair_ruling_starts_with(self):
+        _set_leases([("api.example.com", 300)])
+        with cp.store._connect() as conn:
+            inside = cp.policy._decide_in(conn, "api.example.com", CLASS)
+        for pair in (cp.policy._decide("api.example.com", CLASS), inside):
+            self.assertEqual(len(pair), 2)
+            self.assertEqual(pair[0], "allow")
+            self.assertIn("allowed by lease", pair[1])
 
 
 class ClientClassDecisionTests(unittest.TestCase):

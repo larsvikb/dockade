@@ -23,8 +23,8 @@ export const STEPS = [
     await page.click('#inbox button[data-task="6"]');
   }],
   // The hash names the task: a reload reads it again, and back goes to the one before.
-  ["reloaded", async ({ page }) => { await page.reload(); }],
-  ["back", async ({ page }) => { await page.goBack(); }],
+  ["reloaded", async ({ page, navigate }) => { await navigate(() => page.reload()); }],
+  ["back", async ({ page, navigate }) => { await navigate(() => page.goBack()); }],
   ["a landing task", async ({ page }) => {
     await page.click('#inbox button[data-task="5"]');
   }],

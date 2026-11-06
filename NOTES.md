@@ -712,6 +712,44 @@ The package is a single one with no dependencies, 14 MB installed. Through one v
 of skew, 1.63 drives the 154 shell through the whole UI harness scenario; nothing was
 run on Playwright's own 153 to compare against.
 
+## The UI harness had three races, all between it and the page
+
+Measured 2026-11-04 and again 2026-11-05 on `playwright-core` 1.63.0 and the Debian
+shell above, with the harness as it was before it queued answers. No page reads a time
+the clock does not fake: every read in `control-plane-ui/`, `tasks-ui/` and
+`ui-common/` is `Date.now()` or `new Date(n)`, which `page.clock` covers. The
+differences between runs came from three races, each made visible by delaying every
+answer at the route by a random 0–60 ms:
+
+- **A step could end between an answer and the request it causes.** A settle that
+  counts only requests open at the route sees nothing in the turns where the page is
+  reading a body or deciding what to send next, and the request then went into the
+  next step's events or, if it arrived while a snapshot was taken, nowhere. In 6 of
+  12 undelayed sequential tasks runs a read moved or went missing, mostly a
+  `GET /api/notes/flagged` after a write, and in one the read answered late changed
+  the title's count. Under the delay the approval page lost the refreshes after
+  "server enabled" (two steps before the one reported) or "tool rule widened", and the
+  tasks page lost reads at most of its steps.
+- **Concurrent reads are answered in the order the network gives.** The page's
+  module files arrive in any order, so of 20 undelayed sequential approval runs 6
+  differed only in the order the modules were listed. Under the delay the tool picker
+  was drawn from the servers and inventory before the tool rules arrived, chose
+  `get_me` as its first unruled option, and kept that choice when the rules came (2 of
+  10 runs): the state reported at "tool rule picked", there from the first step.
+- **`page.clock.runFor` is not atomic.** It yields a real task turn after each timer
+  it fires, so an answer that arrives during the run is handled at whatever fake time
+  the run has reached. A lease row drawn mid-run and one drawn after it floored a
+  second apart; under the delay every one of 10 approval runs read its countdowns a
+  second off the undelayed ones at the clock steps after the lease steps.
+
+Playwright's clock offers `runFor`, `fastForward` and `pauseAt`, and nothing that stops
+at the next timer. Holding every answer to quiet costs about 50 ms of real time per API
+request: an approval run went from about 7 s to about 15 s, a tasks run from about 8 s
+to about 21 s (10 sequential runs each, 2026-11-06).
+
+In 8-way parallel runs the harness failed or hung (task 236); 4 at once is the most
+these measurements used.
+
 ## The JDK variant: what it costs, and what its JUnit jar bundles
 
 Measured 2026-11-01 on the reference machine: `openjdk-21-jdk-headless` (`javac

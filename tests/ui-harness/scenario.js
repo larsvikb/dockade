@@ -130,10 +130,23 @@ export const STEPS = [
   ["server revoke declined", async ({ page }) => {
     await page.click('#servers button.revoke[data-server="mcp-notes"]');
   }],
-  ["tool rule picked", async ({ page }) => {
+  // Once seen on one side only: the tool select back on get_me and the add button
+  // disabled. The step fails by name if that recurs, read once the page is quiet so a
+  // refresh landing after the picks is counted.
+  ["tool rule picked", async ({ page, settle }) => {
     await page.selectOption("#toolrule-server", "mcp-github");
     await page.selectOption("#toolrule-tool", "list_commits");
     await page.selectOption("#toolrule-action", "ask");
+    await settle();
+    const held = await page.evaluate(() => [
+      document.getElementById("toolrule-server").value,
+      document.getElementById("toolrule-tool").value,
+      document.getElementById("toolrule-action").value,
+      document.getElementById("toolrule-add").disabled ? "add disabled" : "add enabled",
+    ].join(" "));
+    if (held !== "mcp-github list_commits ask add enabled") {
+      throw new Error(`the tool rule picked did not hold: ${held}`);
+    }
   }],
   ["tool rule added", async ({ page }) => { await page.click("#toolrule-add"); }],
   // Widening asks first; revoking never does.
@@ -276,4 +289,16 @@ export const STEPS = [
   }],
   ["reload, the config and rules reads failing", async ({ load }) => { await load(); }],
 
+  // The harness itself: reads asked for just before time moves are answered before it
+  // does, and reads asked for as the page navigates are listed as unanswered.
+  ["tools tab, then a second passes", async ({ page, clock }) => {
+    await page.click("#tab-tools");
+    await clock(1000);
+  }],
+  ["tools tab again, then a reload before its reads are answered", async ({ page, load }) => {
+    await load(async () => {
+      await page.click("#tab-approvals");
+      await page.click("#tab-tools");
+    });
+  }],
 ];

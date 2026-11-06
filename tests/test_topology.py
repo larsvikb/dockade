@@ -1475,6 +1475,58 @@ class OutcomeStreamWiringTests(unittest.TestCase):
         self.assertRegex(dockerfile, rf"chmod 1777 {self.MOUNT}")
 
 
+class ContentVolumeWiringTests(unittest.TestCase):
+    """The volume the gateway keeps response bodies on, which nothing else mounts.
+
+    The bodies are third-party text that entered the agent's context. The control plane
+    gets their size and hash through the outcome stream and must never be able to read
+    the text itself, so the property is the absence of every other mount, the control
+    plane's above all (DESIGN.md, "Only the gateway can say how a call ended")."""
+
+    MOUNT = "/var/log/tool-content"
+
+    def _mounts(self, service: str) -> list[str]:
+        return [m for m in _mount_spellings(service) if m.startswith("tool-content:")]
+
+    def test_the_gateway_mounts_it_writable(self):
+        self.assertEqual(self._mounts("tool-gateway"), [f"tool-content:{self.MOUNT}"])
+
+    def test_nothing_else_touches_it(self):
+        for service in _service_names():
+            if service == "tool-gateway":
+                continue
+            with self.subTest(service=service):
+                self.assertEqual(self._mounts(service), [])
+
+    def test_the_gateway_and_its_reader_name_a_file_on_it(self):
+        # A writer pointing outside the mount still works, onto the container's own
+        # filesystem, and every body is lost at the next restart with no error.
+        source = (ROOT / "tool-gateway" / "outcomes.py").read_text()
+        found = re.search(
+            r'^CONTENT_PATH = os\.environ\.get\(\s*"GATEWAY_CONTENT_LOG",\s*\n?\s*"([^"]+)"',
+            source, re.M)
+        self.assertIsNotNone(found, "outcomes.py no longer names CONTENT_PATH")
+        written = found.group(1)
+        self.assertTrue(written.startswith(self.MOUNT + "/"), written)
+        makefile = (ROOT / "Makefile").read_text()
+        script = re.search(r"^define TOOL_CONTENT_PY\n(.*?)^endef$", makefile,
+                           re.S | re.M).group(1)
+        read = re.search(r'"GATEWAY_CONTENT_LOG", "([^"]+)"', script)
+        self.assertIsNotNone(read, "`make tool-content` no longer names its file")
+        self.assertEqual(read.group(1), written)
+
+    def test_it_is_not_under_the_volume_the_control_plane_reads(self):
+        self.assertFalse(
+            (self.MOUNT + "/").startswith(OutcomeStreamWiringTests.MOUNT + "/"))
+        self.assertFalse(
+            (OutcomeStreamWiringTests.MOUNT + "/").startswith(self.MOUNT + "/"))
+
+    def test_the_gateways_image_creates_the_directory(self):
+        dockerfile = (ROOT / "tool-gateway" / "Dockerfile").read_text()
+        self.assertRegex(dockerfile, rf"mkdir -p {self.MOUNT}\b")
+        self.assertRegex(dockerfile, rf"chmod 1777 {self.MOUNT}\b")
+
+
 class RestartPolicyTests(unittest.TestCase):
     """`always` on the substrate, `unless-stopped` on the optional tier-2 model
     server. The line is not stylistic: the two policies differ in exactly one case
@@ -2765,6 +2817,17 @@ class ComposeFormTests(unittest.TestCase):
                "    volumes:\n      - type: volume\n        source: tool-audit\n"
                "        target: /x\n    read_only: true\n"),
          _rule(OutcomeStreamWiringTests, "test_nothing_else_touches_it")),
+        ("long-form tool-content on the control plane", "docker-compose.yml",
+         _swap("      - tool-audit:/var/log/tool-gateway:ro\n",
+               "      - tool-audit:/var/log/tool-gateway:ro\n"
+               "      - type: volume\n        source: tool-content\n"
+               "        target: /var/log/tool-content\n        read_only: true\n"),
+         _rule(ContentVolumeWiringTests, "test_nothing_else_touches_it")),
+        ("quoted tool-content on a server", "mcp-servers.yml",
+         _swap("    read_only: true\n",
+               '    volumes:\n      - type: volume\n        source: "tool-content"\n'
+               "        target: /x\n    read_only: true\n"),
+         _rule(ContentVolumeWiringTests, "test_nothing_else_touches_it")),
         ("tasks-state in a label, mounted elsewhere", "docker-compose.yml",
          _edits(_swap("      - tasks-state:/var/lib/task-registry\n",
                       "      - type: volume\n        source: tasks-state\n"

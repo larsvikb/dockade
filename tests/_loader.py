@@ -361,7 +361,11 @@ def load_outcomes(env: dict[str, str] | None = None) -> types.ModuleType:
     Fresh because the sink is module state: ``setup`` attaches a handler to a
     module-level logger, so a cached instance would keep writing to the previous
     test's file. ``env`` is applied at import because ``AUDIT_PATH`` and the caps
-    resolve at module scope, exactly as they do in the container."""
+    resolve at module scope, exactly as they do in the container.
+
+    The content file is OFF unless ``env`` names one: its default is the container's
+    path, which a test process cannot create."""
+    env = {"GATEWAY_CONTENT_LOG": "", **(env or {})}
     pkg_dir = str(ROOT / "tool-gateway")
     if pkg_dir not in sys.path:
         sys.path.insert(0, pkg_dir)

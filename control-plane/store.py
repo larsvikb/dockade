@@ -46,7 +46,7 @@ LEGACY_CLIENT_CLASS = "sandbox"
 # The schema this code expects. Every entry in ``_STEPS`` below adds exactly one,
 # and a store records the version it is at (see ``_migrate``), so "what has already
 # run here" is a number to compare rather than a schema to interrogate.
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 
 def _connect() -> sqlite3.Connection:
@@ -550,6 +550,22 @@ def _step_13_resume_token(conn: sqlite3.Connection) -> None:
           f"before the upgrade is answered as unknown)", flush=True)
 
 
+def _step_14_result_facts(conn: sqlite3.Connection) -> None:
+    """v14 — ``audit`` gains ``result_bytes``, ``result_sha256`` and ``duration``, what
+    a tool call returned as the gateway measured it (the DDL carries the reasoning).
+    Existing rows keep NULL: nothing measured them."""
+    added = [(column, kind) for column, kind in (("result_bytes", "INTEGER"),
+                                                 ("result_sha256", "TEXT"),
+                                                 ("duration", "REAL"))
+             if column not in _columns(conn, "audit")]
+    for column, kind in added:
+        conn.execute(f"ALTER TABLE audit ADD COLUMN {column} {kind}")
+    if added:
+        print(f"control-plane: added {', '.join(c for c, _ in added)} to audit "
+              f"(existing rows keep NULL — they predate the gateway measuring results)",
+              flush=True)
+
+
 # Ordered, and the order is the only thing that decides what runs: a step is applied
 # when its version exceeds the store's, so steps must be APPEND-ONLY and never
 # renumbered, reordered or edited once shipped — a store in the field has already run
@@ -569,6 +585,7 @@ _STEPS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = (
     (11, "rule ids: rules and tool_rules rebuilt", _step_11_rule_ids),
     (12, "pins bound to the tool's arguments", _step_12_schema_digest),
     (13, "resume tokens on tool asks", _step_13_resume_token),
+    (14, "tool result size, hash and duration", _step_14_result_facts),
 )
 
 
@@ -728,7 +745,16 @@ def _init_db() -> None:
                 -- vocabulary is `ingest.TOOL_STATUSES`, not `kind`'s: an outcome
                 -- answers a different question than allow/deny/hold. NULL on every
                 -- row that is not a tool outcome.
-                status       TEXT
+                status       TEXT,
+                -- What a tool call RETURNED, as the gateway measured it: the size and
+                -- SHA-256 of the result the agent was sent, and the seconds the dial
+                -- took. Facts and never the body, which stays in the gateway's own
+                -- file under this hash (tool-gateway/outcomes.py). NULL on every row
+                -- that is not a tool outcome, where a fact did not arrive well formed,
+                -- and `duration` where nothing was dialled.
+                result_bytes  INTEGER,
+                result_sha256 TEXT,
+                duration      REAL
             )""")
         conn.execute("CREATE INDEX IF NOT EXISTS audit_ts ON audit(ts)")
         # The audit table grows without bound on purpose: only the VIEW is windowed

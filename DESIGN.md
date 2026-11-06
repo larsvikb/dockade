@@ -1907,11 +1907,15 @@ identifier is left unresolved — is the page's own code, and is designed in
   answered and gone by the time the call succeeds or fails; an approved write that
   GitHub then refuses looks, in its trail, exactly like one that landed. The split
   that follows: **outcome** (a status and a reason — cheap, and the question an
-  incident actually asks) is separable from **content** (size and hash — what entered
-  the context), and they have different destinations. The body belongs in the
-  gateway's own rotating file, which is bounded and disposable; only the facts belong
-  in the crown-jewel store, which is neither. That is what keeps attacker-authored
-  text out of the store, and out of anything that renders it.
+  incident actually asks) is separable from **content** (what entered the context),
+  and they have different destinations. The body belongs in the gateway's own
+  rotating file, on the `tool-content` volume no other container mounts, which is
+  bounded and disposable; only the facts — size, hash and the dial's duration — ride
+  the outcome stream into the crown-jewel store, which is neither. That is what keeps
+  response bodies out of the control plane's container, out of the store, and out of
+  anything that renders it. The hash is over the bytes the agent was sent
+  (`protocol.encode` serializes both), so it finds the body, and proves it when the
+  record kept the body whole.
 
 **Which servers may be admitted: narrow, named tools.** The three states only have
 purchase when a tool is narrow and named. A tool whose payload is a **program** —
@@ -2430,6 +2434,7 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | tool audit is joinable — `server`/`tool`/`approval_id` columns, filled by every writer | **done** |
 | — | the gateway records how a call ENDED — its own JSONL stream | **done** |
 | — | outcomes ingested — second stream, `status` column, `outcome` in the audit vocabulary | **done** — one approval id now selects the hold, the answer, the claim and the result |
+| — | what a call returned — the body to the gateway's own `tool-content` file, its size, hash and duration to the audit row | **done** — the card's outcome and the facts in the audit view are task 252 |
 | — | task registry — the store, the agent listener (MCP, behind the gateway's secret), the operator API | **done** |
 | — | task registry as a service — `tasks` behind a profile on `mcp-net` + `tasks-operator-net`, one listener per leg | **done** |
 | — | task registry, agent side — where the id comes from in the image's instructions, dockade's repo name and checkpoints in `CLAUDE.md`, the id in the status line | **done** — `inflight.md` stays the record of branches beside it; new work is proposed in it |

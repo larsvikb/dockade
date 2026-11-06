@@ -189,6 +189,12 @@ volumes:
   # rotate on independent schedules.
   tool-audit:
     name: dockade-tool-audit
+  # What each tool call RETURNED, the bodies, written by the gateway and mounted by
+  # nothing else (tool-gateway/outcomes.py). Not `tool-audit`, which the control plane
+  # mounts: response bodies must not reach the crown jewel's container.
+  # Size-bounded, and outside `make backup`.
+  tool-content:
+    name: dockade-tool-content
   # The policy + audit SQLite store — the crown-jewel state (DESIGN.md). Kept in
   # its own named volume so it survives container/image churn and is backed up
   # independently.
@@ -665,6 +671,8 @@ services:
       # as the egress proxy's audit volume: the component that made the record owns it,
       # and the reader must not be able to rewrite the evidence it is reading.
       - tool-audit:/var/log/tool-gateway
+      # The response bodies, this service's alone: see `tool-content` under volumes.
+      - tool-content:/var/log/tool-content
     healthcheck:
       # Dials the PINNED ADDRESS, not loopback, because the listener binds one
       # address and loopback is not it. Read out of the environment rather than

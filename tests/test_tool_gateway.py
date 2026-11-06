@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import io
 import ipaddress
 import json
+import re
 import unittest
 from unittest import mock
 
@@ -349,6 +351,54 @@ class BodyCapTests(unittest.TestCase):
         self.assertEqual(gateway.BODY_MAX, 10)
         with self.assertRaises(gateway.BodyTooLarge):
             asyncio.run(gateway.read_body(self._Request([b"x" * 11])))
+
+
+class ResponseBodyTests(unittest.TestCase):
+    """The hash on an outcome line is of bytes the agent received.
+
+    `/mcp` sends its reply in `protocol.encode`, and `outcomes.record` hashes the result
+    in it, so the hashed text is a substring of the response body: JSON writes a nested
+    value as it would write it alone."""
+
+    class _Request:
+        client = type("Peer", (), {"host": "172.30.0.5"})()
+
+        def __init__(self, body: bytes):
+            self._body = body
+
+        async def stream(self):
+            yield self._body
+
+    def test_the_recorded_hash_is_of_bytes_inside_the_response_body(self):
+        gateway = load_tool_gateway(GOOD)
+        # Key order as a server might send it, non-ASCII, an astral character and the
+        # characters JSON escapes.
+        result = {"z": 1, "content": [{"type": "text",
+                                       "text": "räk \U0001f600 \"q\" \\ </x>\n"}],
+                  "isError": False}
+
+        def call(name, arguments, client):
+            gateway.outcomes.record("ok", "mcp-github", "get_pr", client=client,
+                                    result=result)
+            return result
+
+        request = self._Request(json.dumps(
+            {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+             "params": {"name": "mcp-github__get_pr", "arguments": {}}}).encode())
+        out = io.StringIO()
+        with mock.patch.object(gateway.execute, "call", call), \
+                contextlib.redirect_stdout(out):
+            response = asyncio.run(gateway.mcp(request))
+        sha = re.search(r"sha256=([0-9a-f]{64})", out.getvalue()).group(1)
+        body = response.body
+        self.assertIsInstance(body, bytes)
+        # A plain `Response` sends no Content-Type unless told one, where
+        # `JSONResponse` sent this.
+        self.assertEqual(response.kwargs.get("media_type"), "application/json")
+        self.assertEqual(json.loads(body)["result"], result)
+        hashed = gateway.protocol.encode(result)
+        self.assertEqual(hashlib.sha256(hashed).hexdigest(), sha)
+        self.assertIn(hashed, body)
 
 
 if __name__ == "__main__":

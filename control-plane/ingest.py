@@ -42,6 +42,7 @@ import glob
 import json
 import math
 import os
+import re
 import threading
 import time
 
@@ -74,7 +75,8 @@ DRAIN_BLOCK = int(os.environ.get("CONTROL_AUDIT_DRAIN_BLOCK", str(1 << 20)))
 _EGRESS_COLUMNS = ("ts", "kind", "stage", "host", "port", "proto", "client",
                    "client_class", "method", "url", "reason")
 _TOOL_COLUMNS = ("ts", "kind", "stage", "client", "client_class", "reason",
-                 "server", "tool", "approval_id", "status")
+                 "server", "tool", "approval_id", "status",
+                 "result_bytes", "result_sha256", "duration")
 
 
 def _insert_for(columns: tuple[str, ...]) -> str:
@@ -220,7 +222,30 @@ def _tool_row(line: bytes) -> dict | None:
             "server": _ingest_field(rec.get("server")),
             "tool": _ingest_field(rec.get("tool")),
             "approval_id": legacy, "resume_token": _ingest_field(token),
-            "status": _ingest_field(rec.get("status"))}
+            "status": _ingest_field(rec.get("status")),
+            **_result_facts(rec)}
+
+
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _result_facts(rec: dict) -> dict:
+    """What the call returned, as the gateway measured it: its size, its hash, and
+    how long the dial took (``outcomes.record``). Each is checked on its own, and one
+    that is absent or malformed is NULL with the row kept: the outcome is the half an
+    incident asks for first, and a bad fact is no reason to lose it."""
+    size, digest, duration = rec.get("bytes"), rec.get("sha256"), rec.get("duration")
+    # Bounded by SQLite's INTEGER, which would refuse the row, and so the stream.
+    if type(size) is not int or not 0 <= size < 1 << 63:
+        size = None
+    if not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest):
+        digest = None
+    try:
+        seconds = float(duration) if type(duration) in (int, float) else math.nan
+    except OverflowError:                            # an int no float can hold
+        seconds = math.nan
+    return {"result_bytes": size, "result_sha256": digest,
+            "duration": seconds if math.isfinite(seconds) and seconds >= 0 else None}
 
 
 def _settle_tool_row(conn, row: dict) -> None:

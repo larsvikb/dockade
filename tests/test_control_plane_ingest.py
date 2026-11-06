@@ -506,7 +506,50 @@ class ToolOutcomeRowTests(unittest.TestCase):
             {"ts": 1000.0, "kind": "outcome", "stage": "tool-result",
              "client": "172.30.0.130", "client_class": "sandbox", "reason": None,
              "server": "mcp-github", "tool": "get_me", "approval_id": None,
-             "resume_token": None, "status": "ok"})
+             "resume_token": None, "status": "ok", "result_bytes": None,
+             "result_sha256": None, "duration": None})
+
+    SHA = "0123456789abcdef" * 4
+
+    def test_the_result_facts_land_in_their_columns(self):
+        row = cp.ingest._tool_row(self.line(bytes=1234, sha256=self.SHA,
+                                            duration=0.25))
+        self.assertEqual((row["result_bytes"], row["result_sha256"], row["duration"]),
+                         (1234, self.SHA, 0.25))
+        self.assertEqual(cp.ingest._tool_row(self.line(bytes=0, duration=0))
+                         ["duration"], 0.0)
+
+    def test_a_malformed_fact_is_null_and_the_row_is_kept(self):
+        # The outcome is the half an incident asks for first; one bad fact, from a
+        # gateway gone wrong or a hand-edited line, must not cost it.
+        bad = {
+            "bytes": (-1, True, 1.5, "12", 1 << 63, None, [1]),
+            "sha256": ("A" * 64, "g" * 64, "a" * 63, "a" * 65, 12, None,
+                       self.SHA + "\n", " " + self.SHA),
+            "duration": (-0.1, True, float("nan"), float("inf"), "1", None, 10 ** 400),
+        }
+        column = {"bytes": "result_bytes", "sha256": "result_sha256",
+                  "duration": "duration"}
+        for key, values in bad.items():
+            for value in values:
+                with self.subTest(key=key, value=value):
+                    row = cp.ingest._tool_row(self.line(
+                        **{"bytes": 10, "sha256": self.SHA, "duration": 1.0,
+                           key: value}))
+                    self.assertIsNotNone(row)
+                    self.assertIsNone(row[column[key]])
+                    self.assertEqual(row["status"], "ok")
+                    # Only its own fact goes: the others are still read.
+                    others = {"bytes": 10, "sha256": self.SHA, "duration": 1.0}
+                    del others[key]
+                    for other, want in others.items():
+                        self.assertEqual(row[column[other]], want)
+
+    def test_a_line_without_facts_ingests_as_before(self):
+        row = cp.ingest._tool_row(self.line())
+        self.assertEqual(row["status"], "ok")
+        self.assertEqual((row["result_bytes"], row["result_sha256"], row["duration"]),
+                         (None, None, None))
 
     def test_the_row_fills_exactly_the_columns_it_is_inserted_under(self):
         # A name the INSERT does not list is silently dropped by `r.get(c)`, so a field
@@ -638,6 +681,17 @@ class ToolOutcomeDrainTests(IngestTestCase):
             {"kind": "outcome", "stage": "tool-result", "server": "mcp-github",
              "tool": "get_me", "approval_id": "a" * 32, "status": "tool-error",
              "reason": "Resource not accessible by personal access token"}])
+
+    def test_the_result_facts_reach_the_store(self):
+        sha = "ab" * 32
+        self.write({"bytes": 42, "sha256": sha, "duration": 1.5},
+                   {"bytes": "x", "sha256": "nope", "duration": float("nan")})
+        cp.ingest._drain(self.tool)
+        with cp.store._connect() as conn:
+            stored = [tuple(r) for r in conn.execute(
+                "SELECT status, result_bytes, result_sha256, duration FROM audit "
+                "ORDER BY id")]
+        self.assertEqual(stored, [("ok", 42, sha, 1.5), ("ok", None, None, None)])
 
     def _ask(self, approval_id, token, deadline=None):
         """A tool ask row, as the control plane holds it, for a token to map to."""

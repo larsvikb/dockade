@@ -26,6 +26,8 @@ anyway learns the same thing from the error.
 """
 from __future__ import annotations
 
+import json
+
 #: Protocol revisions this gateway will speak, newest first. Negotiation is: echo what
 #: the client asked for if it is one of these, otherwise answer with the newest and let
 #: the client decide whether it can live with that — which is what the spec asks a
@@ -52,6 +54,18 @@ INVALID_REQUEST = -32600
 METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
 INTERNAL_ERROR = -32603
+
+
+def encode(message: object) -> bytes:
+    """The bytes a message goes out as: compact, key order kept, non-ASCII as UTF-8.
+
+    The one serializer for the reply. ``app.py`` sends a response in it, and
+    ``outcomes.record`` hashes a result in it, so a recorded hash is of bytes the agent
+    received: JSON nests a value's own serialization unchanged, so the result's text is
+    a substring of the reply's. Raises ``ValueError`` on NaN or infinity, which JSON
+    cannot carry, and ``UnicodeEncodeError`` on a lone surrogate, which UTF-8 cannot."""
+    return json.dumps(message, ensure_ascii=False, allow_nan=False,
+                      separators=(",", ":")).encode("utf-8")
 
 
 def _result(message_id, result: dict) -> dict:

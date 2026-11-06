@@ -27,18 +27,32 @@ STDOUT TOO, always, for the reason the egress proxy mirrors its own: `make logs-
 should be a live feed of outcomes rather than of this service's internals. The file is
 the ingestible copy; the stdout line is the one a human watches.
 
+WHAT CAME BACK, as well as how it ended, and split by destination. The outcome line
+carries three facts about the result ``_run`` returned: its size and SHA-256 over the
+exact bytes the agent was sent (``protocol.encode``), and how long the dial took. The
+body itself goes to a second file, the CONTENT stream, on a volume only this
+container mounts: what entered the agent's context stays answerable for as long as
+the file holds it, while the control plane gets the facts and never the
+attacker-authored text (DESIGN.md, "Only the gateway can say how a call ended").
+That file's window is BYTES, not time: it rotates at a size, and how many calls it
+covers depends on how large their results were. It is not drained, not backed up,
+and never printed: `make tool-content SHA=<hash>` reads it, inside this container.
+
 Nothing here decides anything. It is called after the fact, by the one function that
 dials a server, and a failure to record must never turn into a failure to answer the
 agent — see ``record``.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import logging.handlers
 import os
 import re
 import time
+
+import protocol
 
 #: Where the JSONL lands, on a volume the control plane mounts read-only. Set to the
 #: EMPTY STRING to run with no file at all; anything else is a path that has to work.
@@ -59,6 +73,23 @@ AUDIT_BACKUPS = int(os.environ.get("GATEWAY_AUDIT_BACKUPS", "3"))
 #: which the other cannot do.
 FIELD_MAX = int(os.environ.get("GATEWAY_AUDIT_FIELD_MAX", "512"))
 
+#: Where the RESPONSE BODIES land: a volume of its own that the control plane never
+#: mounts, and deliberately outside ``AUDIT_PATH``'s directory, so no mount of that
+#: one can reach it. Empty means off, and the outcome line keeps its facts.
+CONTENT_PATH = os.environ.get("GATEWAY_CONTENT_LOG",
+                              "/var/log/tool-content/responses.jsonl")
+
+#: Its bounds, which are its retention: 16 MiB x 4 files, the operator's choice for
+#: task 163. A record past the file bound is written whole, alone in its file.
+CONTENT_MAX_BYTES = int(os.environ.get("GATEWAY_CONTENT_MAX_BYTES", str(16 << 20)))
+CONTENT_BACKUPS = int(os.environ.get("GATEWAY_CONTENT_BACKUPS", "3"))
+
+#: The most of one body a record keeps, in CHARACTERS of its text. The size and hash
+#: are always of the whole. The line is written ASCII-escaped, so a character takes
+#: up to 12 bytes on disk (an astral one as two ``\uXXXX`` escapes), and a record at
+#: the default cap up to 3 MiB.
+CONTENT_RECORD_MAX = int(os.environ.get("GATEWAY_CONTENT_RECORD_MAX", str(256 << 10)))
+
 #: The vocabulary of ``status``, and the whole reason this module reads the reply
 #: rather than just catching exceptions. MCP fails at three layers and only two of them
 #: look like failure:
@@ -77,6 +108,11 @@ FIELD_MAX = int(os.environ.get("GATEWAY_AUDIT_FIELD_MAX", "512"))
 STATUSES = ("ok", "tool-error", "rpc-error", "transport-error", "timeout")
 
 logger = logging.getLogger("tool-gateway.audit")
+content_logger = logging.getLogger("tool-gateway.content")
+# Never up to the root logger, should anything ever give root a handler: a body there
+# could reach stdout, which is `make logs-tg`, a feed a human reads, and the reason the
+# body has a file of its own.
+content_logger.propagate = False
 
 
 class _LoudFileHandler(logging.handlers.RotatingFileHandler):
@@ -92,9 +128,12 @@ class _LoudFileHandler(logging.handlers.RotatingFileHandler):
 
     Nothing is re-raised: see ``record``. The call has already happened."""
 
+    def __init__(self, filename: str, failure: str, **kwargs) -> None:
+        super().__init__(filename, **kwargs)
+        self._failure = failure
+
     def handleError(self, record: logging.LogRecord) -> None:
-        print(f"tool-gateway: OUTCOME AUDIT FAILED to write to {AUDIT_PATH} — the "
-              f"record below may be the only copy", flush=True)
+        print(self._failure, flush=True)
 
 
 def _end_torn_record(path: str) -> None:
@@ -119,17 +158,20 @@ def _end_torn_record(path: str) -> None:
             f.write(b"\n")
     except OSError as e:
         print(f"tool-gateway: could not check or end a half-written last record in "
-              f"{path} ({e}); if it has one, the next outcome will be merged into it "
-              f"and not ingested", flush=True)
+              f"{path} ({e}); if it has one, the next record will be merged into it "
+              f"and lost", flush=True)
         return
     print(f"tool-gateway: {path} ended mid-record (an earlier run stopped while "
-          f"writing it); ended it, so the next outcome is not merged into it",
+          f"writing it); ended it, so the next record is not merged into it",
           flush=True)
 
 
 #: Whether ``setup`` has attached a file handler. Read only by ``describe``, so the
 #: startup banner can say which of the two configured states this process is in.
 _to_file = False
+#: The same for the content file, which ``record`` also reads: with no file there is
+#: no body to cut and serialize.
+_content_to_file = False
 
 
 def setup() -> None:
@@ -143,31 +185,55 @@ def setup() -> None:
     The off switch is explicit and empty: ``GATEWAY_AUDIT_LOG=""`` runs with stdout
     only, for a hand-run container with no volume. Same idiom as the egress proxy's
     ``_assert_guard_configured`` — refuse a broken configuration, and make "off" a
-    thing someone has to write down."""
-    global _to_file
+    thing someone has to write down.
+
+    The content file follows the same two states, under ``GATEWAY_CONTENT_LOG``."""
+    global _to_file, _content_to_file
     if not AUDIT_PATH:
         print("tool-gateway: outcome audit is STDOUT ONLY (GATEWAY_AUDIT_LOG is "
               "empty) — nothing will reach the control plane's audit store",
               flush=True)
-        return
-    os.makedirs(os.path.dirname(AUDIT_PATH), exist_ok=True)
-    _end_torn_record(AUDIT_PATH)
-    handler = _LoudFileHandler(
-        AUDIT_PATH, maxBytes=AUDIT_MAX_BYTES, backupCount=AUDIT_BACKUPS)
+    else:
+        _attach(logger, AUDIT_PATH, AUDIT_MAX_BYTES, AUDIT_BACKUPS,
+                f"tool-gateway: OUTCOME AUDIT FAILED to write to {AUDIT_PATH} — the "
+                f"record below may be the only copy")
+        # Never up to the root logger, should anything ever give root a handler: a
+        # duplicate of every record could land in stdout twice and read as two calls.
+        logger.propagate = False
+        _to_file = True
+    if not CONTENT_PATH:
+        print("tool-gateway: response content is NOT KEPT (GATEWAY_CONTENT_LOG is "
+              "empty) — outcome lines still carry each result's size and hash",
+              flush=True)
+    else:
+        _attach(content_logger, CONTENT_PATH, CONTENT_MAX_BYTES, CONTENT_BACKUPS,
+                f"tool-gateway: RESPONSE CONTENT FAILED to write to {CONTENT_PATH} — "
+                f"that body is not kept; its size and hash are on its outcome line")
+        _content_to_file = True
+
+
+def _attach(to: logging.Logger, path: str, max_bytes: int, backups: int,
+            failure: str) -> None:
+    """One rotating file sink on ``to``. Raises if ``path`` cannot be opened."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _end_torn_record(path)
+    handler = _LoudFileHandler(path, failure, maxBytes=max_bytes, backupCount=backups)
     handler.setFormatter(logging.Formatter("%(message)s"))
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-    # Never up to the root logger: uvicorn configures that, and a duplicate of every
-    # record would land in stdout twice and read as two calls.
-    logger.propagate = False
-    _to_file = True
+    to.addHandler(handler)
+    to.setLevel(logging.INFO)
 
 
 def describe() -> str:
     """One line for the startup banner. The empty-string case is deliberate enough to
     be worth saying out loud on every boot rather than only at the moment it is set."""
-    return (f"outcomes -> {AUDIT_PATH} (rotating, {AUDIT_MAX_BYTES}B x "
-            f"{AUDIT_BACKUPS + 1})" if _to_file else "outcomes -> stdout only")
+    outcome = (f"outcomes -> {AUDIT_PATH} (rotating, {AUDIT_MAX_BYTES}B x "
+               f"{AUDIT_BACKUPS + 1})" if _to_file else "outcomes -> stdout only")
+    content = (f"responses -> {CONTENT_PATH} (rotating, {CONTENT_MAX_BYTES}B x "
+               f"{CONTENT_BACKUPS + 1}, up to {CONTENT_RECORD_MAX} characters of each; "
+               f"kept for the last {CONTENT_MAX_BYTES * (CONTENT_BACKUPS + 1)}B of "
+               f"responses, however long ago that was)"
+               if _content_to_file else "responses -> not kept")
+    return f"{outcome}; {content}"
 
 
 def _field(value: object) -> object:
@@ -195,8 +261,43 @@ def _printable(value: object) -> str:
                             str(_field(value)))
 
 
+def _wire(result: dict | None) -> bytes | None:
+    """``result`` as the agent received it, or None for no result or one that could
+    not be sent: ``app.py`` fails the reply on the same error, so no bytes reached the
+    agent to describe."""
+    if result is None:
+        return None
+    try:
+        return protocol.encode(result)
+    except Exception:  # noqa: BLE001 — ``record`` never raises
+        return None
+
+
+def _keep(ts: float, server: str, tool: str, client: str | None, body: bytes,
+          digest: str) -> None:
+    """Write one body to the content file. Never raises, for ``record``'s reason.
+
+    The cut is of the TEXT, so a kept prefix is still a prefix of what the agent read.
+    Decoding no more than the cap can need keeps a large body from being copied whole
+    once more."""
+    try:
+        # A character is at most 4 bytes of UTF-8, so the cap's worth of text is
+        # inside this many.
+        kept = body[:CONTENT_RECORD_MAX * 4].decode("utf-8", "ignore")
+        kept = kept[:CONTENT_RECORD_MAX]
+        content_logger.info(json.dumps(
+            {"ts": ts, "server": _field(server), "tool": _field(tool),
+             "client": _field(client), "bytes": len(body), "sha256": digest,
+             "truncated": len(kept.encode("utf-8")) < len(body), "body": kept}))
+    except Exception as exc:  # noqa: BLE001 — never fail the call
+        print(f"tool-gateway: RESPONSE CONTENT FAILED to write to {CONTENT_PATH} "
+              f"({exc!r}) — that body is not kept; its size and hash are on its "
+              f"outcome line", flush=True)
+
+
 def record(status: str, server: str, tool: str, reason: str | None = None,
-           resume_token: str | None = None, client: str | None = None) -> None:
+           resume_token: str | None = None, client: str | None = None,
+           result: dict | None = None, duration: float | None = None) -> None:
     """Write one outcome. Returns nothing and RAISES NOTHING.
 
     The swallow is deliberate and is the one place in this file worth arguing about. By
@@ -212,20 +313,34 @@ def record(status: str, server: str, tool: str, reason: str | None = None,
 
     `stage` is carried so the control plane's ingest can be INCURIOUS about everything
     else — a line it does not fully recognise is dropped rather than guessed at, the
-    same discipline `_ingest_row` already applies to the proxy's file."""
-    entry = {"ts": round(time.time(), 3), "stage": "tool-result",
+    same discipline `_ingest_row` already applies to the proxy's file.
+
+    ``result`` is the ``CallToolResult`` the agent is handed, and ``duration`` the
+    seconds the dial took, None where nothing was dialled. The line carries the
+    result's ``bytes`` and ``sha256`` and the content file its body; all three keys
+    are null without a result, so a line always has them."""
+    ts = round(time.time(), 3)
+    body = _wire(result)
+    digest = None if body is None else hashlib.sha256(body).hexdigest()
+    entry = {"ts": ts, "stage": "tool-result",
              "status": status, "server": _field(server), "tool": _field(tool),
              "resume_token": _field(resume_token), "client": _field(client),
-             "reason": _field(reason)}
+             "reason": _field(reason),
+             "bytes": None if body is None else len(body), "sha256": digest,
+             "duration": None if duration is None else round(duration, 3)}
     line = json.dumps(entry)
     try:
         logger.info(line)
     except Exception as exc:  # noqa: BLE001 — see the docstring: never fail the call
         print(f"tool-gateway: OUTCOME AUDIT FAILED to write ({exc!r}) — the record "
               f"below is the only copy", flush=True)
+    if body is not None and _content_to_file:
+        _keep(ts, server, tool, client, body, digest)
     # After the file, and unconditionally: if the write above failed this is the
-    # remaining copy, and if it succeeded this is the live feed.
+    # remaining copy, and if it succeeded this is the live feed. The hash and never
+    # the body: it is what `make tool-content` looks a body up by.
     print(f"OUTCOME {status} {_printable(server)}__{_printable(tool)}"
           + (f" resume_token={_printable(resume_token)}" if resume_token else "")
           + (f" client={_printable(client)}" if client else "")
+          + (f" sha256={digest}" if digest else "")
           + (f" :: {_printable(reason)}" if reason else ""), flush=True)

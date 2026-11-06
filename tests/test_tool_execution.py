@@ -849,12 +849,18 @@ class OutcomeRecordTests(ExecutionTestCase):
         super().setUp()
         self.rows: list[dict] = []
 
-        def record(status, server, tool, reason=None, resume_token=None, client=None):
+        def record(status, server, tool, reason=None, resume_token=None, client=None,
+                   result=None, duration=None):
             self.rows.append({"status": status, "server": server, "tool": tool,
                               "reason": reason, "resume_token": resume_token,
-                              "client": client})
+                              "client": client, "result": result,
+                              "duration": duration})
 
+        # `outcomes` is imported by plain name and therefore shared, as `discovery` is.
+        self.addCleanup(setattr, self.execute.outcomes, "record",
+                        self.execute.outcomes.record)
         self.execute.outcomes.record = record
+        self._stub_post = self.execute.discovery.post
 
     def allow(self, name="mcp-github__get_issue", args=None):
         self.answer = {"decision": "allow", "reason": "ok"}
@@ -1051,6 +1057,110 @@ class OutcomeRecordTests(ExecutionTestCase):
                 self.rows.clear()
                 run()
                 self.assertEqual(self.rows, [])
+
+    def _fresh(self) -> None:
+        """Back to the state ``setUp`` left, for the next subtest."""
+        self.rows.clear()
+        self.reply = sse({"content": [{"type": "text", "text": "the issue"}]})
+        self.execute.discovery.post = self._stub_post
+        self.execute.surface.publish(ROSTER, [RESULT])
+
+    def _returns(self) -> dict:
+        """One run of each way ``_run`` can return, by name, each returning the result
+        the agent got."""
+        def dial_fails(kind):
+            def boom(entry, message, timeout=None):
+                raise self.execute.discovery.DiscoveryError("no answer", kind=kind)
+
+            def run():
+                self.execute.discovery.post = boom
+                return self.allow()
+            return run
+
+        def unforeseen():
+            def boom(*_a, **_k):
+                raise TypeError("something new")
+            self.execute.discovery.post = boom
+            return self.allow()
+
+        def replying(text):
+            def run():
+                self.reply = text
+                return self.allow()
+            return run
+
+        def off_the_roster():
+            self.execute.surface.publish([], [])
+            return self.granted()
+
+        return {
+            "ok": self.allow,
+            "tool-error": replying(sse({"content": [{"type": "text", "text": "403"}],
+                                        "isError": True})),
+            "rpc-error": replying(json.dumps({"jsonrpc": "2.0", "id": 1, "error": {
+                "code": -32602, "message": "bad params"}})),
+            "unreachable": dial_fails("transport-error"),
+            "timeout": dial_fails("timeout"),
+            "not an object": replying("[]"),
+            "unforeseen": unforeseen,
+            "off the roster": off_the_roster,
+        }
+
+    def test_every_return_records_the_result_it_returned(self):
+        # The facts and the body describe what entered the agent's context, so they
+        # are of the very object handed back, on the path that dialled nothing too:
+        # a refusal's text is what the agent read.
+        for label, run in self._returns().items():
+            with self.subTest(path=label):
+                self._fresh()
+                returned = run()
+                self.assertEqual(len(self.rows), 1)
+                self.assertIs(self.rows[0]["result"], returned)
+
+    def test_duration_is_null_only_where_nothing_was_dialled(self):
+        for label, run in self._returns().items():
+            with self.subTest(path=label):
+                self._fresh()
+                run()
+                duration = self.rows[0]["duration"]
+                if label == "off the roster":
+                    self.assertIsNone(duration)
+                else:
+                    self.assertIsInstance(duration, float)
+                    self.assertGreaterEqual(duration, 0.0)
+
+    def test_the_duration_is_the_dials(self):
+        # The monotonic clock around the dial and its parse.
+        def slow(entry, message, timeout=None):
+            time.sleep(0.05)
+            return self.reply
+        self.execute.discovery.post = slow
+        self.allow()
+        self.assertGreaterEqual(self.rows[0]["duration"], 0.05)
+
+    def test_lines_written_outside_run_carry_no_result_and_no_duration(self):
+        # `_unsettled` and the unparseable-arguments branch: neither returns anything
+        # `_run` produced, and neither dialled.
+        def lost(path, payload):
+            raise self.execute.Unanswered("TimeoutError: timed out")
+
+        def unsettled():
+            real, self.execute._ask_control = self.execute._ask_control, lost
+            try:
+                self.execute.call(self.execute.surface.RESUME_TOOL,
+                                  {"resume_token": TOKEN}, "172.30.0.5")
+            finally:
+                self.execute._ask_control = real
+
+        cases = {"unsettled": unsettled,
+                 "unparseable arguments": lambda: self.granted(args_json="{not json")}
+        for label, run in cases.items():
+            with self.subTest(case=label):
+                self._fresh()
+                run()
+                self.assertEqual(len(self.rows), 1)
+                self.assertIsNone(self.rows[0]["result"])
+                self.assertIsNone(self.rows[0]["duration"])
 
     def _with_answer(self, answer, name, args=None):
         self.answer = answer

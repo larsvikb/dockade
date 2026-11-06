@@ -215,7 +215,8 @@ REFFILES := $(SCRIPTS) \
 .PHONY: help check check-strict lint consistency test verify-build \
         up down destroy audit-prune control-tool-preflight backup restore \
         tasks-tool-preflight restore-tasks secrets-dir secrets-perm-check \
-        rebuild logs-ep logs-cp logs-tg tool-outcomes print-config-home \
+        rebuild logs-ep logs-cp logs-tg tool-outcomes tool-content \
+        print-config-home \
         mcp-up mcp-down mcp-ps mcp-tools gateway-tools tasks-up tasks-down \
         claude opencode boundary check-boundary split-check ui-diff
 
@@ -964,7 +965,7 @@ gateway-tools: ## List what the gateway serves the AGENT: make gateway-tools [RA
 	  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
 	  | MCP_RAW='$(RAW)' python3 -c "$$GATEWAY_TOOLS_PY"
 
-destroy: ## Stop infra AND delete its volumes: egress audit, tool audit, control-plane store (destructive); leaves the task registry and its store
+destroy: ## Stop infra AND delete its volumes: egress audit, tool audit, tool response content, control-plane store (destructive); leaves the task registry and its store
 	$(COMPOSE) down -v
 
 # Retention window for `audit-prune`, in days. A variable, not a literal in the
@@ -1274,6 +1275,19 @@ tool-outcomes: ## Show the last $$OUTCOMES tool-call outcomes from the gateway's
 	# which is exactly the thing worth being able to tell apart.
 	docker exec -e OUTCOMES=$(OUTCOMES) tool-gateway python3 -c "$$TOOL_OUTCOMES_PY"
 
+# The sha256 `tool-content` looks for: the one an OUTCOME line in `make logs-tg`, a
+# line of `tool-outcomes`' file, or an audit row carries.
+SHA ?=
+
+tool-content: ## Print the response body recorded under SHA=<sha256>, from the gateway's own file
+	# What a tool call RETURNED, which the control plane never holds: it has the size
+	# and the hash, and the body is in a file only the gateway mounts. Records sharing
+	# a hash hold the same body; ts, server and tool tell the calls apart.
+	#
+	# Read inside the gateway, so it shares the gateway's memory limit: the script reads
+	# one line at a time, never a whole file.
+	docker exec -e SHA=$(SHA) tool-gateway python3 -c "$$TOOL_CONTENT_PY"
+
 # ── sandbox lifecycle (run-*-sandbox.sh) ────────────────────────────────────
 
 claude: ## Launch a tier-1 (Claude, governed egress) sandbox (WORKSPACE=/path, default $$PWD)
@@ -1499,6 +1513,56 @@ print(f"-- {len(rows[-show:])} of {len(rows)} recent record(s)"
       + (f", {bad} unparseable line(s) skipped" if bad else ""))
 endef
 export TOOL_OUTCOMES_PY
+
+# Body of `tool-content` (see the target above). Every record whose sha256 is SHA, from
+# the oldest rotated file to the active one, one JSON line each on stdout; the count on
+# stderr, so nothing on stdout means nothing found. A line is re-dumped rather than
+# echoed, so what reaches the terminal is ASCII with every control character escaped
+# (`json.dumps` escapes DEL and everything past it), whatever the file holds. A
+# matching line that does not parse (a record torn by a stop mid-write) is counted and
+# skipped. Only `.N` siblings are rotations; any other file beside it is not read.
+define TOOL_CONTENT_PY
+import glob, json, os, re, sys
+
+path = os.environ.get("GATEWAY_CONTENT_LOG", "/var/log/tool-content/responses.jsonl")
+sha = os.environ.get("SHA", "").strip().lower()
+if not re.fullmatch("[0-9a-f]{64}", sha):
+    raise SystemExit("tool-content: give SHA=<sha256>, the 64 hex characters an "
+                     "outcome carries")
+
+rotated = []
+for name in glob.glob(glob.escape(path) + ".*"):
+    suffix = name[len(path) + 1:]
+    if suffix.isdigit():
+        rotated.append((int(suffix), name))
+files = [name for _, name in sorted(rotated, reverse=True)] + [path]
+
+found, bad, needle = 0, 0, sha.encode()
+for name in files:
+    try:
+        f = open(name, "rb")
+    except FileNotFoundError:
+        continue
+    except OSError as e:
+        raise SystemExit(f"tool-content: cannot read {name} ({e})")
+    with f:
+        for line in f:
+            if needle not in line:
+                continue
+            try:
+                r = json.loads(line)
+            except ValueError:
+                bad += 1
+                continue
+            if not isinstance(r, dict) or r.get("sha256") != sha:
+                continue
+            print(json.dumps(r))
+            found += 1
+print(f"-- {found} record(s) under {sha} in {path} and its rotations"
+      + (f", {bad} unparseable line(s) carrying it skipped" if bad else ""),
+      file=sys.stderr)
+endef
+export TOOL_CONTENT_PY
 
 define AUDIT_PRUNE_PY
 import os, sqlite3, time

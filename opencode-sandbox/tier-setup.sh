@@ -36,6 +36,16 @@ set -euo pipefail
 # of those three can be disabled alone. And opencode itself parses this file as
 # JSONC, but `make consistency` reads it with Python's `json.load` — so it stays
 # comment-free JSON, which is why this rationale lives here.
+#
+# The `permission` entry for external directories lets the agent read the operator's
+# reference mounts (/refs/<name>, read-only) without an ask per file: they lie
+# outside the working directory, and opencode asks for every path there by
+# default. Ergonomics, not a widening: the mount's `:ro` is the write boundary, and
+# approving the ask reached the same files before. It is the deprecated top-level
+# `permission` and not v2's `permissions`, because the schema `$schema` pins
+# validates the first and a v2 key is silently inert (opencode-sandbox/NOTES.md).
+# Tier 1 grants the same read in its user settings template; the reasoning for both
+# is DESIGN.md's "Reference mounts" section.
 
 USERNAME=sandbox
 CONFIG_DIR="${SANDBOX_CONFIG_DIR:-/config}"

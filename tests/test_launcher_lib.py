@@ -755,11 +755,13 @@ class RefsTests(unittest.TestCase):
         ])
 
     def test_a_name_with_a_leading_dot_is_refused(self):
-        # Hidden from `ls /refs` and from boundary-check.sh's /refs/*/ probe.
+        # Hidden from `ls /refs` and from boundary-check.sh's /refs/*/ probe. And
+        # `.claude` would put a ref at /refs/.claude, at the root of tier 1's read
+        # allow, the place a release that loaded from it would look (sc_refs's comment).
         dotted = self.src / ".dotfiles"
         dotted.mkdir()
         for value in (str(dotted), f".x={self.src}/a/docs", f"..={self.src}/a/docs",
-                      f".={self.src}/a/docs"):
+                      f".={self.src}/a/docs", f".claude={self.src}/a/docs"):
             with self.subTest(value=value):
                 self.assertRefused(value, "not a usable name under /refs")
         self.assertEqual(self.mounts(f"dotfiles={dotted}"),

@@ -7,6 +7,7 @@ as the sandbox user, which needs the container.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -90,6 +91,58 @@ class RefsNotePlacementTests(unittest.TestCase):
             with self.subTest(tier=tier):
                 user_phase = src.split(REEXEC, 1)[1]
                 self.assertNotIn("/refs", user_phase)
+
+
+_GIT = shutil.which("git")
+
+
+class RefsReadAllowTests(unittest.TestCase):
+    """Both tiers may read /refs without asking, and nothing else about the refs
+    loads. The read allow is measured to load nothing from a ref; the command-line
+    flag loads a directory's skills, agents and commands (NOTES.md, "An allowed read
+    directory loads nothing from it"); the environment variable exists to load the
+    allowed directories' CLAUDE.md files. So each tier's allow is held to exactly
+    /refs, in the one file that carries it, and the other two to nowhere."""
+
+    def test_each_tier_allows_reads_under_refs_and_nothing_more(self):
+        user = json.loads((ROOT / "claude-sandbox" / "user-settings.json").read_text())
+        self.assertEqual(user["permissions"], {"additionalDirectories": ["/refs"]})
+        text = (ROOT / "opencode-sandbox" / "opencode.json").read_text()
+        self.assertEqual(json.loads(text)["permission"],
+                         {"external_directory": {"/refs/**": "allow"}})
+        # Once: an agent's own `permission` block could grant a second, wider one.
+        self.assertEqual(text.count("external_directory"), 1)
+
+    @unittest.skipUnless(_GIT or _STRICT, "git is not installed")
+    def test_no_other_way_to_load_a_ref_is_in_the_tree(self):
+        # Tracked files outside tests/ and the docs, which name these to explain them.
+        # COMMENTS COUNT: telling one from code needs a parser per file type, so a
+        # comment about any of these words its way around the literal string.
+        listing = subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
+            [_GIT, "-C", str(ROOT), "ls-files", "-z"],
+            capture_output=True, check=True).stdout.decode("utf-8", "surrogateescape")
+        files = [f for f in listing.split("\0")
+                 if f and not f.startswith("tests/") and not f.endswith(".md")]
+        self.assertIn("claude-sandbox/user-settings.json", files)
+        allowed = {"additionalDirectories": {"claude-sandbox/user-settings.json"},
+                   "external_directory": {"opencode-sandbox/opencode.json"},
+                   "--add-dir": set(),
+                   "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD": set()}
+        found: dict[str, set[str]] = {needle: set() for needle in allowed}
+        for name in files:
+            path = ROOT / name
+            if not path.is_file():
+                continue  # deleted in the worktree, not yet in the index
+            data = path.read_bytes()
+            for needle, holders in found.items():
+                if needle.encode() in data:
+                    holders.add(name)
+        for needle, holders in found.items():
+            with self.subTest(needle=needle):
+                self.assertEqual(
+                    holders, allowed[needle],
+                    f"{needle} would load a ref's skills or instructions, or allow a "
+                    "second root; word a comment around the literal string")
 
 
 if __name__ == "__main__":

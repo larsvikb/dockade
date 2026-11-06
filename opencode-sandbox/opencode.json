@@ -20,6 +20,11 @@
     }
   },
   "model": "local/local",
+  "permission": {
+    "external_directory": {
+      "/refs/**": "allow"
+    }
+  },
   "tools": {
     "webfetch": false,
     "websearch": false,

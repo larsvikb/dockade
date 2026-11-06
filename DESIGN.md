@@ -414,7 +414,8 @@ Five decisions worth keeping:
   directory marketplace is never written to in normal use) and `make consistency`
   asserts it, because the mitigation is one character wide. *Outside* is enforced
   too: `sc_marketplaces` refuses a directory that is, lies inside, or holds the
-  launch's workspace, since the read-write `/workspace` would reach the same files.
+  launch's workspace, or is reached through a link the workspace holds, since the
+  read-write `/workspace` would reach the same files or replace the link.
   One launch cannot see another's workspace, so the sibling's side is closed by
   every launch's workspace guard instead: it refuses a workspace that is, holds or
   lies inside the config home, or holds a link on the way to it or its entries

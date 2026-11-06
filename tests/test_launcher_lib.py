@@ -460,13 +460,31 @@ class MarketplaceWorkspaceOverlapTests(unittest.TestCase):
         self.workspace = self.root / "work" / "app"
         self.workspace.mkdir(parents=True)
 
-    def mount(self, marketplaces: Path, workspace: Path | None = None):
-        env = {k: v for k, v in os.environ.items() if k != "XDG_RUNTIME_DIR"}
-        env.update(HOME="/nonexistent-home", SANDBOX_MARKETPLACES_DIR=str(marketplaces))
+    def mount(self, marketplaces: Path | str | None, workspace: Path | None = None,
+              *, cwd: Path | None = None, **overrides: str):
+        """Runs ``sc_marketplaces``; ``marketplaces=None`` leaves the default path."""
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("XDG_RUNTIME_DIR", "SANDBOX_MARKETPLACES_DIR", "CDPATH")}
+        env.update(HOME="/nonexistent-home", **overrides)
+        if marketplaces is not None:
+            env["SANDBOX_MARKETPLACES_DIR"] = str(marketplaces)
         return subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
             [_BASH, "-c", _MARKETPLACE_HARNESS, "sc_marketplaces", str(LIB),
              str(workspace or self.workspace)],
-            capture_output=True, text=True, env=env, timeout=60)
+            capture_output=True, text=True, env=env, cwd=cwd, timeout=60)
+
+    def elsewhere(self, *parts: str) -> Path:
+        """A directory outside the workspace, created."""
+        path = self.root.joinpath("elsewhere", *parts)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def assert_refused_for_link(self, proc, link: Path):
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("REFUSING to mount marketplaces", proc.stderr)
+        self.assertIn(f"the link {link} on the way to it is inside the workspace "
+                      f"({self.workspace}), which is mounted read-write.", proc.stderr)
 
     def test_the_workspace_itself_is_refused(self):
         proc = self.mount(self.workspace)
@@ -512,6 +530,97 @@ class MarketplaceWorkspaceOverlapTests(unittest.TestCase):
                 proc = self.mount(mkt)
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertEqual(proc.stdout.split(), ["-v", f"{mkt}:/marketplaces:ro"])
+
+    def test_a_link_the_workspace_holds_to_a_directory_outside_it_is_refused(self):
+        # The agent could replace the link with a real directory, which a later
+        # launch from another workspace, with the same variable, would mount.
+        link = self.workspace / "mk"
+        link.symlink_to(self.elsewhere("mk"))
+        self.assert_refused_for_link(self.mount(link), link)
+
+    def test_a_link_reached_through_another_link_counts(self):
+        # A dotfiles-style relative link outside the workspace whose target runs
+        # through a link the workspace holds.
+        inner = self.workspace / "via"
+        inner.symlink_to(Path("..", "..", "elsewhere"))
+        self.elsewhere("mk")
+        outer = self.root / "dotfiles-mk"
+        outer.symlink_to(Path("work", "app", "via", "mk"))
+        self.assert_refused_for_link(self.mount(outer), inner)
+
+    def test_the_first_link_the_workspace_holds_is_named(self):
+        first = self.workspace / "first"
+        second = self.workspace / "second"
+        first.symlink_to("second")
+        second.symlink_to(self.elsewhere())
+        self.elsewhere("mk")
+        proc = self.mount(first / "mk")
+        self.assert_refused_for_link(proc, first)
+        self.assertNotIn(f"the link {second} ", proc.stderr)
+
+    def test_a_resolved_path_inside_the_workspace_reports_that_rather_than_the_link(self):
+        link = self.workspace / "mk"
+        link.symlink_to(self.workspace / "vendor")
+        (self.workspace / "vendor").mkdir()
+        proc = self.mount(link)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn(f"it is inside the workspace ({self.workspace})", proc.stderr)
+        self.assertNotIn("the link", proc.stderr)
+
+    def test_a_relative_directory_is_walked_from_the_launch_directory(self):
+        link = self.workspace / "mk"
+        link.symlink_to(self.elsewhere("mk"))
+        self.assert_refused_for_link(self.mount("app/mk", cwd=self.root / "work"), link)
+
+    def test_cdpath_does_not_steer_a_relative_directory(self):
+        # With CDPATH a plain `cd mk` would land in the decoy and print it, so
+        # the walk and the mount would disagree.
+        target = self.elsewhere("mk")
+        (self.root / "work" / "mk").symlink_to(target)
+        decoy = self.root / "decoy"
+        (decoy / "mk").mkdir(parents=True)
+        proc = self.mount("mk", cwd=self.root / "work", CDPATH=str(decoy))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.split(), ["-v", f"{target}:/marketplaces:ro"])
+
+    def test_the_default_directory_is_walked_too(self):
+        # The workspace guard walks it as well, but yields to ALLOW_UNSAFE_WORKSPACE;
+        # this rule does not.
+        home = self.workspace / "dockade"
+        home.symlink_to(self.elsewhere("dockade"))
+        self.elsewhere("dockade", "marketplaces")
+        proc = self.mount(None, DOCKADE_CONFIG_HOME=str(home))
+        self.assert_refused_for_link(proc, home)
+
+    def test_a_dotdot_after_a_link_is_taken_physically(self):
+        # lnk/../mk names out/mk; physically it is the link target's parent's mk.
+        out = self.root / "out"
+        (out / "mk").mkdir(parents=True)
+        with self.subTest("the physical route passes a link the workspace holds"):
+            hop = self.workspace / "hop"
+            hop.symlink_to(self.elsewhere("held"))
+            self.elsewhere("held", "sub")
+            self.elsewhere("held", "mk")
+            (out / "lnk").symlink_to(hop / "sub")
+            self.assert_refused_for_link(self.mount(out / "lnk" / ".." / "mk"), hop)
+        with self.subTest("the physical directory is the one mounted"):
+            self.elsewhere("free", "sub")
+            target = self.elsewhere("free", "mk")
+            (out / "lnk2").symlink_to(self.root / "elsewhere" / "free" / "sub")
+            proc = self.mount(out / "lnk2" / ".." / "mk")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.split(), ["-v", f"{target}:/marketplaces:ro"])
+
+    def test_links_outside_the_workspace_still_mount_their_target(self):
+        # `app-link` shares a prefix with `app` and nothing else.
+        target = self.elsewhere("mk")
+        for name in ("mk-link", "app-link"):
+            with self.subTest(name=name):
+                link = self.root / "work" / name
+                link.symlink_to(target)
+                proc = self.mount(link)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout.split(), ["-v", f"{target}:/marketplaces:ro"])
 
     def test_the_workspace_argument_is_required(self):
         proc = subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)

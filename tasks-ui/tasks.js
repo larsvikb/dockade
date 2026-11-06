@@ -26,7 +26,9 @@ import {
   sendWrite, readAnswer,
   writeOutcome, checkWrite, lastNoteId, lastEntryId,
   planDecisions, awaitsAnswers, approvable, assumedChoices, blankText, choiceAnswer,
-  unanswered, approveAnswers, choicesDiffer, approveOutcome,
+  unanswered, approveAnswers, choicesDiffer, approveOutcome, currentPlan,
+  SPEC_CONTROLS, asControl, controlChanges, specDraft, draftChanges, editRequest,
+  changedFields, rebaseDraft, parseBlockers,
 } from "./moves.js";
 import { fmtStamp, fmtInstant } from "./time.js";
 
@@ -138,20 +140,32 @@ export function planHeading(plan) {
   return parts.filter(Boolean).join(" · ");
 }
 
-// What the task's own plan, or its lack of one, means in the task's state: a line and
-// whether it warns, or null. Only a proposed task is refined by an agent
-// (`submit_plan` refuses any other), so only there is a missing plan the ordinary
-// case; the operator can move a task on with no plan, or past a superseded one, and
-// then nobody will hand one in.
-export function planNotice(plan, state) {
-  const proposed = state === "proposed";
+// What the task's own plan, or its lack of one, means for the task: a line and whether
+// it warns, or null, as for an earlier plan, drawn with no task. Only a proposed task
+// is refined by an agent (`submit_plan` refuses any other), so only there is a missing
+// plan the ordinary case; the operator can move a task on with no plan, or past a
+// superseded one, and then nobody will hand one in. A refined task whose revision is
+// past the one its plan was written against was written to since: a spec edit, or a
+// move away and back, which changes no spec but moves the revision all the same.
+// Approving approves it as it now is, with that plan; said only there, since every
+// approved task's revision passes its plan's.
+export function planNotice(plan, task) {
+  if (!task || typeof task !== "object") return null;
+  const proposed = task.state === "proposed";
   if (!plan) {
     return proposed
       ? { text: "No plan yet: an agent that claims the proposal hands one in.",
           warn: false }
       : { text: "No plan: this task was moved on without one.", warn: true };
   }
-  if (!plan.superseded_at) return null;
+  if (!plan.superseded_at) {
+    const lag = task.state === "refined" && Number(task.revision) > Number(plan.task_revision);
+    return lag
+      ? { text: `The task moved on since plan ${plan.id} was written (revision `
+                + `${plan.task_revision}, now ${task.revision}): approving approves the `
+                + "task as it now is, with this plan.", warn: true }
+      : null;
+  }
   return { text: proposed
              ? "Superseded: no plan is current until an agent refines the task again."
              : "Superseded: no plan is current.",
@@ -399,6 +413,87 @@ export function resetText(reset) {
     + (others.length ? ` Reset with plan ${reset.from}: ${others.join(", ")}` : "");
 }
 
+// ── the spec edit ────────────────────────────────────────────────────────────
+// What the form says around its controls (tasks-ui/DESIGN.md, "A spec edit sends what
+// changed, as it will be stored"). The values themselves are moves.js's.
+
+// What a field will be stored as, under its control: the text spelled, with its count
+// of hidden characters, and, when the edit sends the field, how many characters of the
+// stored text its control changed or dropped. A field the edit leaves alone is stored
+// as it is, whatever its control shows.
+export function specPreview(base, draft, field) {
+  const control = SPEC_CONTROLS[field];
+  const sent = draftChanges(base, draft).includes(field);
+  const stored = base && typeof base === "object" ? base[field] : "";
+  const shown = spellHidden(sent ? draft[field] : stored);
+  const lost = sent ? controlChanges(stored, control) : 0;
+  const what = control === "text" ? "dropped" : "turned into line feeds";
+  return { label: sent ? "will be stored" : "stored, and left as it is",
+           text: shown.text, hidden: shown.hidden,
+           lost: lost ? `${lost} line break${lost === 1 ? "" : "s"} of the stored ${field} `
+                        + `${what} by this control.` : "" };
+}
+
+// The save's label: it names the revision it edits, as approve does, and a live claim's
+// holder, whose claim an edit leaves as it is (`operator_moves.edit`). The holder is an
+// agent's, so spelled.
+export function saveLabel(base) {
+  if (!base || typeof base !== "object") return "";
+  const what = `save the edit to revision ${base.revision}`;
+  return base.claim
+    ? `${what} (${spellHidden(base.claim.holder).text} holds the task; the claim stays)`
+    : what;
+}
+
+// What an edit of a refined task does to the plan beside it, or nothing for another.
+export function specAmendText(task) {
+  const plan = currentPlan(task);
+  return task && task.state === "refined" && plan
+    ? `This task is refined: an edit amends the spec plan ${plan.id} was written `
+      + `against, at revision ${plan.task_revision}. Approving after it approves the `
+      + "edited task with that plan."
+    : "";
+}
+
+// A stored severity or kind no select offers, which the select shows as none: said, so
+// the operator knows it is there, and kept unless that select is changed.
+export function unknownSpecText(base) {
+  const stored = base && typeof base === "object" ? base : {};
+  return ["severity", "kind"]
+    .filter(field => typeof stored[field] === "string"
+            && asControl(stored[field], SPEC_CONTROLS[field]) === "")
+    .map(field => `The stored ${field} "${spellHidden(stored[field]).text}" is not one `
+         + "the form offers: it shows as none, and stays unless you change it.")
+    .join(" ");
+}
+
+// Why the blockers do not parse: the operator's word, spelled.
+export function blockersProblem(bad) {
+  return `"${spellHidden(String(bad)).text}" is not a task id: blockers are ids, such `
+    + "as #7, 12.";
+}
+
+// What a draw past the draft's base says: the revisions, the spec fields that moved,
+// those of them the operator's draft keeps, which saving writes over, and, when the
+// draft had changes before and has none now, that nothing is left to save.
+export function rebaseText(from, to, moved, kept, emptied) {
+  const taken = moved.filter(field => !kept.includes(field));
+  let text = `The task moved from revision ${from} to ${to} while you edited it.`;
+  if (!moved.length) text += " Its spec did not change.";
+  if (taken.length) text += ` Your edit takes the new ${taken.join(", ")}.`;
+  if (kept.length) {
+    text += ` It keeps your ${kept.join(", ")} over the new one${kept.length === 1 ? ""
+      : "s"}: saving writes over ${kept.length === 1 ? "that change" : "those changes"}.`;
+  }
+  if (emptied) text += " Nothing is left to save: the task reads as your edit did.";
+  return text;
+}
+
+// Beside the moves a draft with changes holds: approve, send back, every state move and
+// breaking the claim. A note, and the moves on notes, stay free.
+export const HELD_TEXT = "Save or discard the edit first: a move now would act on a "
+  + "spec other than the one on screen.";
+
 // What a write came to, in a line, and whether it warns: `writeOutcome`'s word, or for
 // an answer that was lost, `checkWrite`'s. `detail` is the refusal's own reason. A bulk
 // is all or none, so a refused one says none was handled; a hide or a show says what it
@@ -645,6 +740,11 @@ let writing = null;        // the write in flight: one at a time
 let outcome = null;        // what the last write came to, while its task is open
 let noteDraft = { task: null, text: "" };   // kept until it lands
 let replyDrafts = new Map();  // a reply's text by its note's id: its box is open while kept
+// The spec edit open on a task: its id, the read it is a draft of (`base`), the fields
+// as its controls hold them, and what its last rebase said. Kept across the task's
+// draws, each past its base rebasing it (`noteSpecDrawn`); dropped, with no confirm,
+// only when it lands, is discarded, or the task is closed or another opened.
+let specEdit = null;
 // The choices made on a plan to approve, by task and plan (`choicesFor`), so a redraw
 // keeps them, a stale write's too; dropped when its approve lands or another plan is
 // drawn for the task (`notePlanDrawn`), which a line says until the first choice in
@@ -1059,17 +1159,17 @@ function line(label, value) {
 }
 
 // One plan, its parts as the agent wrote them, and under its heading what it means for
-// a task in `state` (`planNotice`). Among the earlier plans `state` is null: a newer
-// plan is the task's, and the heading's "superseded" is enough. With the plan it
-// replaced, `previous`, it is drawn as what changed from it, the whole a toggle away.
-function planBlock(plan, state, previous = null) {
+// its task (`planNotice`). Among the earlier plans `task` is null: a newer plan is the
+// task's, and the heading's "superseded" is enough. With the plan it replaced,
+// `previous`, it is drawn as what changed from it, the whole a toggle away.
+function planBlock(plan, task, previous = null) {
   const block = document.createElement("div");
   block.className = "plan";
   const head = document.createElement("div");
   head.className = "qual";
   head.textContent = planHeading(plan);
   block.appendChild(head);
-  const notice = state === null ? null : planNotice(plan, state);
+  const notice = planNotice(plan, task);
   if (notice) block.appendChild(noticeLine(notice));
   const whole = document.createElement("div");
   whole.className = "plan-whole";
@@ -1077,7 +1177,7 @@ function planBlock(plan, state, previous = null) {
     whole.appendChild(line(part.label, proseBlock(part.text)));
   }
   // An earlier plan's decisions, as text: the task's own are drawn above its plan.
-  if (state === null) {
+  if (task === null) {
     planDecisions(plan).forEach((d, i) => whole.appendChild(decisionGroup(d, i, null)));
   }
   if (!previous) {
@@ -1334,6 +1434,7 @@ async function readTask(id) {
 
 // One task in full, read and drawn beside the list.
 async function showTask(id) {
+  if (specEdit && specEdit.task !== id) specEdit = null;
   openTask = id;
   outcome = null;
   panes.classList.add("reading");
@@ -1364,16 +1465,24 @@ async function showTask(id) {
 // the operator's moves on it, then its timeline, every note with the hidden ones marked
 // among the other writes, and a note to add.
 function drawTask(task, held) {
+  // A redraw of the read already drawn, as opening or discarding an edit makes, keeps
+  // what the line atop it says: the task is no newer than when it was filled.
+  const kept = task === shownTask ? noticeSlot : null;
   shownTask = task;
   shownHeld = held;
   draws += 1;
   notePlanDrawn(task);
+  noteSpecDrawn(task);
+  const editing = specEditOn(task);
   taskDetail.replaceChildren();
   // Its space is kept whether or not it says anything, so filling it moves nothing.
-  noticeSlot = document.createElement("div");
-  noticeSlot.className = "notice-slot";
+  if (!kept) {
+    noticeSlot = document.createElement("div");
+    noticeSlot.className = "notice-slot";
+  }
   taskDetail.appendChild(noticeSlot);
-  if (outcome && outcome.task === String(task.id) && outcome.result === "stale") {
+  // Refilled only when rebuilt: a kept line may say something newer since, a poll's.
+  if (!kept && outcome && outcome.task === String(task.id) && outcome.result === "stale") {
     fillSlot(outcome);
   }
   const head = document.createElement("h3");
@@ -1385,11 +1494,19 @@ function drawTask(task, held) {
   close.textContent = "close";
   close.title = "close this task (the list stays)";
   head.append(" ", close);
+  if (!editing) {
+    const edit = document.createElement("button");
+    edit.type = "button";
+    edit.className = "group-toggle";
+    edit.dataset.specOpen = "1";
+    edit.textContent = "edit spec";
+    head.append(" ", edit);
+  }
   taskDetail.appendChild(head);
   taskDetail.appendChild(line("state", `${task.state}${task.ready ? ", ready" : ""}`
     + `${task.blocked ? ", blocked" : ""} · revision ${task.revision} · ${task.repo}`));
   const sk = [task.severity, task.kind].filter(Boolean).join(" · ");
-  if (sk) taskDetail.appendChild(line("severity · kind", sk));
+  if (sk && !editing) taskDetail.appendChild(line("severity · kind", sk));
   taskDetail.appendChild(line("written", `${fmtStamp(task.created_at)}, last changed `
     + fmtStamp(task.updated_at)));
   if (task.parent) taskDetail.appendChild(line("parent", brief(task.parent)));
@@ -1398,7 +1515,7 @@ function drawTask(task, held) {
     taskDetail.appendChild(line("children", `${kids.text}: `
       + task.children.map(brief).join("; ")));
   }
-  if (task.blockers && task.blockers.length) {
+  if (task.blockers && task.blockers.length && !editing) {
     taskDetail.appendChild(line("blocked by", task.blockers.map(brief).join("; ")));
   }
   if (task.claim) {
@@ -1411,9 +1528,13 @@ function drawTask(task, held) {
       taskDetail.appendChild(line("progress", proseBlock(task.claim.progress)));
     }
   }
-  const body = proseBlock(task.body);
-  body.className = "task-body";
-  taskDetail.appendChild(body);
+  if (editing) {
+    taskDetail.appendChild(specForm(task));
+  } else {
+    const body = proseBlock(task.body);
+    body.className = "task-body";
+    taskDetail.appendChild(body);
+  }
   taskDetail.appendChild(decisionsBlock(task));
   // The plan beside the body: approving a refined task approves the two together
   // (task-registry/DESIGN.md, "Plans").
@@ -1421,13 +1542,13 @@ function drawTask(task, held) {
   planHead.textContent = "Plan";
   taskDetail.appendChild(planHead);
   if (task.plan) {
-    taskDetail.appendChild(planBlock(task.plan, task.state,
+    taskDetail.appendChild(planBlock(task.plan, task,
                                      planPredecessor(held.plans, task.plan.id)));
     const more = pagerButton("earlier plans", "plans", "");
     more.dataset.shown = String(task.plan.id);
     taskDetail.appendChild(more);
   } else {
-    taskDetail.appendChild(noticeLine(planNotice(null, task.state)));
+    taskDetail.appendChild(noticeLine(planNotice(null, task)));
   }
   // Below the plan, so what a move approves is read before it.
   taskDetail.appendChild(movesBlock(task));
@@ -1512,6 +1633,13 @@ function movesBlock(task) {
   }
   const blocked = openBlockedText(task);
   if (blocked) block.appendChild(noticeLine({ text: blocked, warn: false }));
+  // While the edit is open, a line one high that says when it holds the moves below.
+  if (specEditOn(task)) {
+    const held = document.createElement("div");
+    held.className = "held-line";
+    held.dataset.specHeld = "1";
+    block.appendChild(held);
+  }
   if (approvable(task)) {
     const approve = document.createElement("div");
     approve.className = "approve-row";
@@ -1622,6 +1750,157 @@ function noteForm(task) {
   return form;
 }
 
+// Whether the spec edit is open on `task`.
+function specEditOn(task) {
+  return specEdit !== null && Boolean(task) && specEdit.task === String(task.id);
+}
+
+// A draw of the task being edited past the read its draft was made from, whatever
+// brought it (a refusal's `current`, the read after a write, "show it"), moves the
+// draft onto it (`rebaseDraft`) and says what moved, and when a draft that had changes
+// has none left.
+function noteSpecDrawn(task) {
+  if (!specEditOn(task) || !(Number(task.revision) > Number(specEdit.base.revision))) return;
+  const { base, draft } = specEdit;
+  const mine = draftChanges(base, draft);
+  const moved = changedFields(base, task);
+  const rebased = rebaseDraft(base, draft, task);
+  specEdit = { task: specEdit.task, base: task, draft: rebased,
+               rebased: rebaseText(base.revision, task.revision, moved,
+                                   mine.filter(field => moved.includes(field)),
+                                   mine.length > 0 && !draftChanges(task, rebased).length) };
+}
+
+// The spec as a form, in place of the lines that show it: each field's control, set
+// as a property from the draft, and under the title and body what will be stored,
+// spelled (`markEdit` fills them as the operator types). A refined task says what an
+// edit does to its plan.
+function specForm(task) {
+  const form = document.createElement("div");
+  form.className = "spec-form";
+  form.dataset.specForm = "1";
+  const amend = specAmendText(task);
+  if (amend) form.appendChild(noticeLine({ text: amend, warn: true }));
+  if (specEdit.rebased) form.appendChild(noticeLine({ text: specEdit.rebased, warn: true }));
+  for (const field of ["title", "body"]) {
+    form.appendChild(line(field, specControl(field)));
+    const preview = document.createElement("div");
+    preview.className = field === "body" ? "spec-preview task-body" : "spec-preview";
+    preview.dataset.specPreview = field;
+    form.appendChild(preview);
+  }
+  const picks = document.createElement("div");
+  picks.className = "moves";
+  picks.append(line("severity", specControl("severity")), line("kind", specControl("kind")));
+  form.appendChild(picks);
+  const unknown = unknownSpecText(specEdit.base);
+  if (unknown) form.appendChild(noticeLine({ text: unknown, warn: true }));
+  form.appendChild(line("blocked by", specControl("blockers")));
+  const problem = document.createElement("div");
+  problem.dataset.specProblem = "1";
+  form.appendChild(problem);
+  const row = document.createElement("div");
+  row.className = "moves";
+  const save = writeButton(saveLabel(specEdit.base), "edit", "");
+  save.dataset.verb = "save the edit";
+  const discard = document.createElement("button");
+  discard.type = "button";
+  discard.dataset.specDiscard = "1";
+  discard.textContent = "discard the edit";
+  row.append(save, discard);
+  form.appendChild(row);
+  return form;
+}
+
+// One field's control, holding the draft's value. A select offers none and each value
+// the registry takes.
+function specControl(field) {
+  const control = SPEC_CONTROLS[field];
+  let el;
+  if (Array.isArray(control)) {
+    el = document.createElement("select");
+    for (const value of control) {
+      const opt = document.createElement("option");
+      opt.value = value;
+      opt.textContent = value || "none";
+      el.appendChild(opt);
+    }
+  } else if (control === "textarea") {
+    el = document.createElement("textarea");
+    el.rows = 10;
+  } else {
+    el = document.createElement("input");
+    el.type = "text";
+    if (field === "blockers") el.placeholder = "#7, 12";
+  }
+  el.dataset.spec = field;
+  el.setAttribute("aria-label", `the task's ${field}`);
+  el.value = specEdit.draft[field];
+  return el;
+}
+
+// The writes a draft with changes holds: each that moves the task or ends its claim.
+// A note, and the moves on notes, stay free.
+const HELD_KINDS = ["move", "approve", "break"];
+const HELD_MOVES = HELD_KINDS.map(kind => `button[data-write="${kind}"]`).join(", ");
+
+// Whether the edit holds the task's moves: open on the task drawn, with changes.
+function editHolds() {
+  return drawnIsOpen() && specEditOn(shownTask)
+    && draftChanges(specEdit.base, specEdit.draft).length > 0;
+}
+
+// What follows the draft, redrawn in place as the operator types, and once by each
+// draw: what title and body will be stored, why the blockers do not parse, the save,
+// off while it has nothing to send, and the moves a draft with changes holds.
+function markEdit() {
+  const held = editHolds();
+  for (const btn of taskDetail.querySelectorAll(HELD_MOVES)) {
+    if (held) btn.disabled = true;
+  }
+  const said = taskDetail.querySelector("[data-spec-held]");
+  if (said) {
+    said.textContent = held ? HELD_TEXT : "";
+    said.className = held ? "held-line warn" : "held-line";
+  }
+  if (!drawnIsOpen() || !specEditOn(shownTask)) return;
+  const { base, draft } = specEdit;
+  for (const el of taskDetail.querySelectorAll("[data-spec-preview]")) {
+    const preview = specPreview(base, draft, el.dataset.specPreview);
+    const text = document.createElement("div");
+    text.className = "prose";
+    text.textContent = preview.text;
+    el.replaceChildren(line(preview.label, text));
+    if (preview.hidden) el.appendChild(noticeLine({ text: hiddenNote(preview.hidden), warn: true }));
+    if (preview.lost) el.appendChild(noticeLine({ text: preview.lost, warn: true }));
+  }
+  const { bad } = parseBlockers(draft.blockers);
+  const problem = taskDetail.querySelector("[data-spec-problem]");
+  if (problem) {
+    problem.replaceChildren();
+    if (bad !== null) problem.appendChild(noticeLine({ text: blockersProblem(bad), warn: true }));
+  }
+  const save = taskDetail.querySelector('button[data-write="edit"]');
+  if (save && !editRequest(base, draft)) save.disabled = true;
+}
+
+// The edit as the draft makes it, on the read it is a draft of.
+function editWrite(base) {
+  if (!specEditOn(shownTask)) return null;
+  const send = editRequest(specEdit.base, specEdit.draft);
+  return send && { ...base, kind: "edit", revision: send.revision, send,
+                   verb: "save the edit" };
+}
+
+// The edit opened on the task drawn, or discarded: the detail drawn again from what the
+// page holds.
+function toggleSpecEdit(open) {
+  if (writing || !drawnIsOpen()) return;
+  specEdit = open ? { task: String(shownTask.id), base: shownTask,
+                      draft: specDraft(shownTask), rebased: null } : null;
+  drawTask(shownTask, shownHeld);
+}
+
 // Every write control in the detail, on only while no write is out and what is drawn
 // is the task the page names; and the flagged block's, on while no write is out.
 function drawnIsOpen() {
@@ -1630,10 +1909,12 @@ function drawnIsOpen() {
 function markWriting() {
   for (const el of taskDetail.querySelectorAll(
     "[data-write], textarea[data-note], textarea[data-reply], input[data-decision], "
-    + "textarea[data-other]")) {
+    + "textarea[data-other], [data-spec], button[data-spec-open], "
+    + "button[data-spec-discard]")) {
     el.disabled = writing !== null || !drawnIsOpen();
   }
   for (const box of taskDetail.querySelectorAll("[data-reply-box]")) markReply(box);
+  markEdit();
   markFlagged();
 }
 
@@ -1685,6 +1966,11 @@ async function runWrite(write) {
     choices.delete(`${write.task}:${write.plan}`);
     planResets.delete(write.task);
   }
+  // Only a landed edit drops its draft: any other outcome keeps it for the next draw,
+  // which rebases it when the task moved.
+  if (write.kind === "edit" && landed && specEdit && specEdit.task === write.task) {
+    specEdit = null;
+  }
   const detail = answer && answer.body && typeof answer.body === "object"
     ? answer.body.detail : answer && answer.text;
   // The state an approve reached: as its answer names it, or as the task read again.
@@ -1721,6 +2007,8 @@ function writeFor(btn) {
   if (!drawnIsOpen()) return null;
   const base = { task: String(shownTask.id), revision: shownTask.revision,
                  lastNote: lastNoteId(shownTask) };
+  if (HELD_KINDS.includes(btn.dataset.write) && editHolds()) return null;
+  if (btn.dataset.write === "edit") return editWrite(base);
   if (btn.dataset.write === "move") {
     return { ...base, kind: "move", state: btn.dataset.value, verb: btn.dataset.verb };
   }
@@ -1913,6 +2201,7 @@ async function showPage(btn) {
 }
 
 function closeTask() {
+  specEdit = null;
   openTask = null;
   shownTask = null;
   shownHeld = null;
@@ -2030,6 +2319,14 @@ export function mountTasks() {
       goTo(view, openTask);
       return;
     }
+    if (ev.target.closest("button[data-spec-open]")) {
+      toggleSpecEdit(true);
+      return;
+    }
+    if (ev.target.closest("button[data-spec-discard]")) {
+      toggleSpecEdit(false);
+      return;
+    }
     const replyOpen = ev.target.closest("button[data-reply-open]");
     if (replyOpen) toggleReply(replyOpen.dataset.replyOpen, true);
     const replyCancel = ev.target.closest("button[data-reply-cancel]");
@@ -2051,6 +2348,10 @@ export function mountTasks() {
       markWriting();
     }
     if (ev.target.matches("input[data-decision]")) choose(ev.target);
+    if (ev.target.matches("[data-spec]") && drawnIsOpen() && specEditOn(shownTask)) {
+      specEdit.draft = { ...specEdit.draft, [ev.target.dataset.spec]: ev.target.value };
+      markWriting();
+    }
     if (ev.target.matches("textarea[data-other]") && drawnIsOpen()
         && approvable(shownTask)) {
       choicesFor(shownTask)[Number(ev.target.dataset.other)].text = ev.target.value;

@@ -137,6 +137,22 @@
   .note-form textarea { font: inherit; font-size: 13px; width: 100%;
     background: #202632; color: var(--fg); border: 1px solid var(--line);
     border-radius: 6px; padding: 5px 8px; resize: vertical; }
+  /* A task's spec as a form, in place of the lines that show it: each control as wide
+     as the detail, and under the title and body what will be stored, spelled. While
+     it is open, a line one high above the moves says when the edit holds them, so
+     saying it moves no button. */
+  .spec-form { margin: 8px 0; padding: 8px; border: 1px solid var(--line);
+    border-radius: 6px; }
+  .spec-form input[type="text"], .spec-form textarea, .spec-form select { font: inherit;
+    font-size: 13px; background: #202632; color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 5px 8px; }
+  .spec-form input[type="text"], .spec-form textarea { width: 100%; }
+  .spec-form textarea { resize: vertical; }
+  .spec-form .moves button { font-size: 12px; padding: 4px 10px; }
+  .spec-preview { margin: 2px 0 8px; }
+  .held-line { height: 22px; white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; font-size: 12px; }
+  .held-line.warn { color: var(--hold); }
   /* The moves on a note, under it in the timeline. */
   .note-moves .moves { margin: 4px 0 0; }
   .note-moves button { font-size: 11px; padding: 2px 8px; }

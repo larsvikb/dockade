@@ -278,4 +278,74 @@ export const STEPS = [
   ["its earlier plans, their decisions as text", async ({ page }) => {
     await page.click('#task-detail button[data-page="plans"]');
   }],
+  // The spec edit. Task 11 is refined at its plan's revision, so no lag notice yet; the
+  // form opens with nothing to save.
+  ["a refined task at its plan's revision", async ({ page }) => {
+    await page.evaluate(() => { location.hash = "#task=11"; });
+  }],
+  ["its spec opened for editing", async ({ page }) => {
+    await page.click("#task-detail button[data-spec-open]");
+  }],
+  // A pasted zero-width space is spelled in what will be stored, and the moves wait on
+  // the edit: approve, clicked, sends nothing.
+  ["a zero-width space pasted into its body", async ({ page }) => {
+    await page.fill('#task-detail textarea[data-spec="body"]',
+                    "Rotate the keys\u200b in place.");
+  }],
+  ["approve clicked while the edit holds it", async ({ page }) => {
+    await page.click('#task-detail button[data-verb="approve"]', { force: true });
+  }],
+  ["the edit discarded", async ({ page }) => {
+    await page.click("#task-detail button[data-spec-discard]");
+  }],
+  // Saved, the plan lags the task, and the plan says so.
+  ["the body edited again and saved", async ({ page }) => {
+    await page.click("#task-detail button[data-spec-open]");
+    await page.fill('#task-detail textarea[data-spec="body"]',
+                    "Rotate the keys\u200b in place.");
+    await page.click('#task-detail button[data-write="edit"]');
+  }],
+  // Another session edits the body under a draft that changed the title: the save is
+  // refused, and the draft keeps its title and takes the new body.
+  ["the title edited while the body changes elsewhere", async ({ page }) => {
+    await page.click("#task-detail button[data-spec-open]");
+    await page.fill('#task-detail input[data-spec="title"]', "Rotate the keys in place");
+    editElsewhere(11);
+  }],
+  ["saved, and refused for the revision", async ({ page }) => {
+    await page.click('#task-detail button[data-write="edit"]');
+  }],
+  ["saved again: the title alone", async ({ page }) => {
+    await page.click('#task-detail button[data-write="edit"]');
+  }],
+  // A refusal's line, then a poll's newer one over it: discarding the form redraws the
+  // read already drawn, which keeps the poll's line rather than bring the refusal back.
+  ["the title edited again and refused for the revision", async ({ page }) => {
+    await page.click("#task-detail button[data-spec-open]");
+    await page.fill('#task-detail input[data-spec="title"]', "Rotate the keys, at last");
+    editElsewhere(11);
+    await page.click('#task-detail button[data-write="edit"]');
+  }],
+  ["it changes elsewhere again, a poll passes", async ({ clock }) => {
+    editElsewhere(11);
+    await clock(16000);
+  }],
+  ["the edit discarded: the poll's line stays", async ({ page }) => {
+    await page.click("#task-detail button[data-spec-discard]");
+  }],
+  // Task 12's body has CR LF line ends, which its textarea turns to LF: saved after the
+  // other fields change, the request carries no body. Its claim stays, as the save says.
+  ["a claimed task whose body has CR LF line ends", async ({ page }) => {
+    await page.evaluate(() => { location.hash = "#task=12"; });
+  }],
+  ["its title, severity and blockers changed, one blocker not an id", async ({ page }) => {
+    await page.click("#task-detail button[data-spec-open]");
+    await page.fill('#task-detail input[data-spec="title"]', "Line ends, kept");
+    await page.selectOption('#task-detail select[data-spec="severity"]', "");
+    await page.fill('#task-detail input[data-spec="blockers"]', "#2, x3");
+  }],
+  ["the blocker mended and saved, the body not sent", async ({ page }) => {
+    await page.fill('#task-detail input[data-spec="blockers"]', "#2, 3");
+    await page.click('#task-detail button[data-write="edit"]');
+  }],
 ];

@@ -33,10 +33,11 @@ def _load(name: str = "dockade_tasks_ui") -> types.ModuleType:
 
 tui = _load()
 
-#: The writes the relay passes, each as the page posts it: the four on a task, and the
+#: The writes the relay passes, each as the page posts it: the five on a task, and the
 #: three on notes, which name no task.
 WRITES = ("api/tasks/12/move", "api/tasks/12/approve", "api/tasks/12/break-claim",
-          "api/tasks/12/notes", "api/notes/hide", "api/notes/3/handle", "api/notes/handle")
+          "api/tasks/12/edit", "api/tasks/12/notes", "api/notes/hide",
+          "api/notes/3/handle", "api/notes/handle")
 
 
 class RelayTests(unittest.TestCase):
@@ -69,7 +70,9 @@ class RelayTests(unittest.TestCase):
         # Every other write, and the writes by another method or with another id; an id
         # that is not digits, or too long; the old prefix; the control plane's paths;
         # the agent listener's; the pages FastAPI would add.
-        for path, method in (("api/tasks", "POST"), ("api/tasks/12/edit", "POST"),
+        for path, method in (("api/tasks", "POST"), ("api/tasks/12/edit", "GET"),
+                             ("api/tasks/abc/edit", "POST"),
+                             ("api/tasks/12/edit/x", "POST"),
                              ("api/tasks/12/reparent", "POST"),
                              ("api/tasks/12/move", "GET"),
                              ("api/tasks/12/approve", "GET"),

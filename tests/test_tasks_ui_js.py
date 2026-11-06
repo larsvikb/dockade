@@ -110,12 +110,23 @@ console.log(JSON.stringify({
     no_heading: t.planHeading(undefined),
     no_rounds: t.planHeading({id: 9, author: "a", at: 1789466400, task_revision: 1}),
     notice: {
-      none_proposed: t.planNotice(null, "proposed"),
-      none_open: t.planNotice(null, "open"),
-      none_closed: t.planNotice(null, "closed"),
-      current: t.planNotice({id: 1, superseded_at: null}, "refined"),
-      superseded_proposed: t.planNotice({id: 1, superseded_at: 1789466400}, "proposed"),
-      superseded_open: t.planNotice({id: 1, superseded_at: 1789466400}, "open"),
+      none_proposed: t.planNotice(null, {state: "proposed"}),
+      none_open: t.planNotice(null, {state: "open"}),
+      none_closed: t.planNotice(null, {state: "closed"}),
+      current: t.planNotice({id: 1, task_revision: 3, superseded_at: null},
+                            {state: "refined", revision: 3}),
+      superseded_proposed: t.planNotice({id: 1, superseded_at: 1789466400},
+                                        {state: "proposed"}),
+      superseded_open: t.planNotice({id: 1, superseded_at: 1789466400}, {state: "open"}),
+      // A task edited since its plan was written: said only while it is refined, since
+      // an approved task's revision always passes its plan's.
+      lagging: t.planNotice({id: 1, task_revision: 3, superseded_at: null},
+                            {state: "refined", revision: 5}),
+      lagging_open: t.planNotice({id: 1, task_revision: 3, superseded_at: null},
+                                 {state: "open", revision: 5}),
+      // Among the earlier plans, drawn with no task.
+      earlier: t.planNotice({id: 1, task_revision: 3, superseded_at: 1789466400}, null),
+      earlier_none: t.planNotice(null, null),
     },
     earlier: {
       by_number: t.earlierPlans([{id: 3}, {id: 2}, {id: 1}], 2).map(p => p.id),
@@ -333,6 +344,16 @@ class TaskViewTests(unittest.TestCase):
         self.assertIn("until an agent refines", notice["superseded_proposed"]["text"])
         self.assertEqual(notice["superseded_open"],
                          {"text": "Superseded: no plan is current.", "warn": True})
+
+    def test_a_refined_task_edited_since_its_plan_says_what_approving_approves(self):
+        notice = self.probe["plan"]["notice"]
+        self.assertEqual(notice["lagging"], {
+            "text": "The task moved on since plan 1 was written (revision 3, now 5): "
+                    "approving approves the task as it now is, with this plan.",
+            "warn": True})
+        for key in ("current", "lagging_open", "earlier", "earlier_none"):
+            with self.subTest(case=key):
+                self.assertIsNone(notice[key])
 
     def test_the_earlier_plans_leave_out_the_one_shown_whatever_its_ids_type(self):
         earlier = self.probe["plan"]["earlier"]
@@ -1701,7 +1722,7 @@ class TaskWriteSourceTests(unittest.TestCase):
     def test_each_relayed_post_is_a_post_fetch_in_moves_js_and_back(self):
         # PageChecks matches paths, not methods: this holds the methods.
         posts = [re.sub(r"\$\{[^}]*\}", "1", p) for p in self.POST.findall(self.MOVES)]
-        self.assertEqual(len(posts), 7)
+        self.assertEqual(len(posts), 8)
         routes = [rx for method, rx in tui._RELAY_ROUTES if method == "POST"]
         for path in posts:
             with self.subTest(path=path):
@@ -1710,7 +1731,7 @@ class TaskWriteSourceTests(unittest.TestCase):
             with self.subTest(route=rx.pattern):
                 self.assertTrue(any(rx.match(p) for p in posts), rx.pattern)
         # Every fetch in moves.js is one of them; tasks.js posts nothing.
-        self.assertEqual(len(re.findall(r"\bfetch\(", self.MOVES)), 7)
+        self.assertEqual(len(re.findall(r"\bfetch\(", self.MOVES)), 8)
         self.assertNotIn("method:", self.TASKS)
 
     def test_moves_js_imports_nothing_of_tasks_js(self):
@@ -2117,11 +2138,13 @@ class TaskRenderingSourceTests(unittest.TestCase):
         # The task's own plan is read against its state and drawn as what changed from
         # the one before; an earlier plan against none, since a newer one is the
         # task's, and whole; the shown one stays out of the earlier list.
-        self.assertIn("planBlock(task.plan, task.state,\n"
+        self.assertIn("planBlock(task.plan, task,\n"
                       "                                     planPredecessor(held.plans, "
                       "task.plan.id))", self.TASKS)
         self.assertIn("planBlock(plan, null)", self.TASKS)
-        self.assertIn("planNotice(null, task.state)", self.TASKS)
+        self.assertIn("planNotice(null, task)", self.TASKS)
+        self.assertIn("const notice = planNotice(plan, task);",
+                      _function(self.TASKS, "planBlock"))
         self.assertIn("more.dataset.shown = String(task.plan.id);", self.TASKS)
         self.assertIn('page.dataset.page === "plans" ? showPlans : showPage', self.TASKS)
 
@@ -2424,7 +2447,7 @@ class TaskDecisionSourceTests(unittest.TestCase):
         self.assertIn("decisionGroup(d, i, picked && picked[i])", block)
         # An earlier plan's decisions are text, as is an answered plan's.
         plan = _function(self.TASKS, "planBlock")
-        self.assertIn("if (state === null) {\n"
+        self.assertIn("if (task === null) {\n"
                       "    planDecisions(plan).forEach((d, i) => "
                       "whole.appendChild(decisionGroup(d, i, null)));", plan)
         group = _function(self.TASKS, "decisionGroup")
@@ -2518,6 +2541,515 @@ class TaskDecisionSourceTests(unittest.TestCase):
         self.assertIn('const reached = result === "landed" ? answer.body.state\n'
                       "    : drawn && drawn.task && drawn.task.state;", run)
         self.assertIn("...outcomeText(write, result, detail, reached) };", run)
+
+
+_EDIT_PROBE = r"""
+import { pathToFileURL } from "node:url";
+const t = await import(pathToFileURL(`${process.env.DOCKADE_UI_DIR}/tasks.js`).href);
+const m = await import(pathToFileURL(`${process.env.DOCKADE_UI_DIR}/moves.js`).href);
+// A task as a read carries it: a title with a line break, a body with CR LF and a lone
+// CR, as a write straight to the registry could store them, and two blockers.
+const base = {id: 7, revision: 4, state: "open", title: "Keys\nrotated",
+              body: "One.\r\nTwo.\rThree.", severity: "low", kind: null, claim: null,
+              blockers: [{id: 2, title: "B", state: "open"}, {id: 5, title: "C",
+                                                              state: "closed"}]};
+const draft = m.specDraft(base);
+const req = changes => m.editRequest(base, {...draft, ...changes});
+const sel = m.SPEC_CONTROLS.severity;
+// What an edit puts on the wire, with fetch stubbed.
+const sent = [];
+globalThis.fetch = (url, opts) => {
+  sent.push({url, method: opts.method, body: JSON.parse(opts.body)});
+  return Promise.resolve({status: 200, text: async () => '{"ok": true}'});
+};
+const send = {revision: 4, title: "New", clear: ["severity"], blocked_by: [9]};
+await m.sendWrite({kind: "edit", task: "7", revision: 4, send, verb: "save the edit"});
+const edit = {kind: "edit", task: "7", revision: 4, send, verb: "save the edit",
+              lastNote: 0};
+const landed = {...base, revision: 5, title: "New", severity: null, blockers: [{id: 9}]};
+// Another writer changed the title; the operator only the body.
+const theirs = {...base, revision: 6, title: "Theirs"};
+const mine = {...draft, body: "Mine."};
+const rebased = m.rebaseDraft(base, mine, theirs);
+const refined = {...base, state: "refined", plan: {id: 3, task_revision: 2,
+                                                   superseded_at: null}};
+console.log(JSON.stringify({
+  severities: m.SEVERITIES, kinds: m.KINDS, fields: m.SPEC_FIELDS,
+  controls: m.SPEC_CONTROLS,
+  as_control: {
+    textarea: m.asControl("a\r\nb\rc\n\r\n", "textarea"),
+    text: m.asControl("a\r\nb\nc\rd", "text"),
+    select_known: m.asControl("low", sel),
+    select_unknown: m.asControl("critical", sel),
+    select_none: m.asControl(null, sel),
+    not_text: m.asControl(undefined, "textarea"),
+  },
+  control_changes: [m.controlChanges("a\r\nb\rc\n", "textarea"),
+                    m.controlChanges("a\r\nb\nc", "text"),
+                    m.controlChanges("critical", sel), m.controlChanges(null, "text")],
+  draft,
+  requests: {
+    none: req({}),
+    title: req({title: "Keys, rotated"}),
+    body: req({body: "One.\nTwo.\nThree, four."}),
+    severity: req({severity: "high"}),
+    severity_none: req({severity: ""}),
+    kind: req({kind: "finding"}),
+    kind_none_as_it_was: req({kind: ""}),
+    blockers_reordered: req({blockers: "5, #2, 2"}),
+    blockers_removed: req({blockers: ""}),
+    blockers_added: req({blockers: "#2 #5, 9, 9"}),
+    blockers_bad: req({blockers: "#2, two"}),
+    blockers_bad_and_title: req({title: "Keys", blockers: "#2, two"}),
+    all: req({title: "T", body: "B", severity: "", kind: "question", blockers: "#9"}),
+    // A stored kind no select offers reads as none, so it is not cleared unasked.
+    unknown_kind: m.editRequest({...base, kind: "chore"},
+                                {...m.specDraft({...base, kind: "chore"}), title: "T"}),
+  },
+  draft_changes: [m.draftChanges(base, draft), m.draftChanges(base, {...draft, title: "T",
+                                                                     blockers: "#2, x"})],
+  parse: ["", "#7, 12", " 7 ,, #12\n", "#7 #7", "#0", "-3", "7.5", "#", "x7",
+          "9007199254740993", "#9007199254740991"].map(m.parseBlockers),
+  blockers_text: [m.blockersText([7, 12]), m.blockersText([]), m.blockerIds(null)],
+  changed_fields: {
+    title: m.changedFields(base, theirs),
+    blockers_reordered: m.changedFields(base, {...base, blockers: [{id: 5}, {id: 2}]}),
+    severity_cleared: m.changedFields(base, {...base, severity: null, kind: undefined}),
+    body: m.changedFields(base, {...base, body: "One.\nTwo.\nThree."}),
+    blockers: m.changedFields(base, {...base, blockers: []}),
+  },
+  rebase: {
+    draft: rebased, request: m.editRequest(theirs, rebased),
+    // The other writer made the operator's own change: nothing is left to send.
+    emptied: m.editRequest({...base, revision: 6, body: "Mine."},
+                           m.rebaseDraft(base, mine, {...base, revision: 6, body: "Mine."})),
+    // Both changed the title: the operator's stays, and saving writes over theirs.
+    both: m.rebaseDraft(base, {...draft, title: "Ours"}, theirs).title,
+    // Blockers that do not parse are the operator's change, and stay.
+    bad_blockers: m.rebaseDraft(base, {...draft, blockers: "#2, x"},
+                                {...theirs, blockers: []}).blockers,
+  },
+  wire: sent[0],
+  check: {
+    found: m.checkWrite(edit, {task: landed}),
+    not_landed: m.checkWrite(edit, {task: {...landed, revision: 4}}),
+    other_title: m.checkWrite(edit, {task: {...landed, title: "Newer"}}),
+    not_cleared: m.checkWrite(edit, {task: {...landed, severity: "low"}}),
+    other_blockers: m.checkWrite(edit, {task: {...landed, blockers: [{id: 9}, {id: 2}]}}),
+    failed_read: m.checkWrite(edit, null),
+    body_left_alone: m.checkWrite({...edit, send: {revision: 4, title: "New"}},
+                                  {task: {...landed, body: "Changed elsewhere."}}),
+  },
+  texts: {
+    found: t.outcomeText(edit, "found").text,
+    landed: t.outcomeText(edit, "landed").text,
+    not_landed: t.outcomeText(edit, "not-landed").text,
+    changed: t.outcomeText(edit, "changed").text,
+  },
+  labels: {
+    save: t.saveLabel(base),
+    save_claimed: t.saveLabel({...base, claim: {holder: "claude-x\u202e"}}),
+    save_none: t.saveLabel(null),
+    amend: t.specAmendText(refined),
+    amend_open: t.specAmendText({...refined, state: "open"}),
+    amend_superseded: t.specAmendText({...refined, plan: {...refined.plan,
+                                                          superseded_at: 1}}),
+    problem: t.blockersProblem("x\u202e"),
+    unknown: [t.unknownSpecText({...base, severity: "critical", kind: "chore\u202e"}),
+              t.unknownSpecText(base), t.unknownSpecText(null)],
+    held: t.HELD_TEXT,
+  },
+  preview: {
+    untouched: t.specPreview(base, draft, "body"),
+    sent: t.specPreview(base, {...draft, body: "One.\nTwo.\nThree.\u200b"}, "body"),
+    title: t.specPreview(base, {...draft, title: "Keys, rotated"}, "title"),
+    one: t.specPreview({...base, body: "a\r\nb"}, {...draft, body: "x"}, "body"),
+  },
+  rebase_text: {
+    taken: t.rebaseText(4, 6, ["title"], [], false),
+    kept: t.rebaseText(4, 6, ["title", "body"], ["body"], false),
+    kept_two: t.rebaseText(4, 6, ["title", "body"], ["title", "body"], false),
+    state_only: t.rebaseText(4, 5, [], [], false),
+    emptied: t.rebaseText(4, 6, ["body"], ["body"], true),
+  },
+}));
+"""
+
+
+@unittest.skipIf(not _NODE and not _STRICT,
+                 "node is not installed — skipping app.js unit tests")
+class EditTests(unittest.TestCase):
+    """The spec edit's pure half (``moves.js``) and what ``tasks.js`` says around it:
+    a field compared as its control hands it back, only what changed sent, a draft moved
+    onto a newer read without reverting another writer, and a lost edit read back."""
+
+    probe: dict
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        proc = subprocess.run(  # noqa: S603 (absolute path, fixed args, as _probe)
+            [_NODE, "--input-type=module", "-e", _EDIT_PROBE],
+            env={**os.environ, "DOCKADE_UI_DIR": str(_served_dir(TASKS_DIR))},
+            capture_output=True, text=True, timeout=60, check=False)
+        if proc.returncode != 0:
+            raise AssertionError("importing moves.js under node failed:\n" + proc.stderr)
+        cls.probe = json.loads(proc.stdout)
+
+    def test_the_severities_and_kinds_are_the_registrys(self):
+        source = (ROOT / "task-registry" / "tasks.py").read_text()
+        for name, key in (("SEVERITIES", "severities"), ("KINDS", "kinds")):
+            with self.subTest(name=name):
+                values = re.search(rf"^{name} = \(([^)]*)\)", source, re.M).group(1)
+                self.assertEqual(self.probe[key], re.findall(r'"([^"]+)"', values))
+        controls = self.probe["controls"]
+        self.assertEqual(controls["severity"], ["", *self.probe["severities"]])
+        self.assertEqual(controls["kind"], ["", *self.probe["kinds"]])
+        # The fields are the ones `edit` takes, blockers as `blocked_by`.
+        fields = {"blocked_by" if f == "blockers" else f for f in self.probe["fields"]}
+        self.assertEqual(fields | {"revision", "clear"},
+                         set(_api.EditTask.__annotations__))
+
+    def test_a_value_is_compared_as_its_control_hands_it_back(self):
+        got = self.probe["as_control"]
+        self.assertEqual(got["textarea"], "a\nb\nc\n\n")
+        self.assertEqual(got["text"], "abcd")
+        self.assertEqual((got["select_known"], got["select_unknown"], got["select_none"]),
+                         ("low", "", ""))
+        self.assertEqual(got["not_text"], "")
+        self.assertEqual(self.probe["control_changes"], [2, 3, 0, 0])
+        self.assertEqual(self.probe["draft"], {
+            "title": "Keysrotated", "body": "One.\nTwo.\nThree.", "severity": "low",
+            "kind": "", "blockers": "#2, #5"})
+
+    def test_an_edit_sends_only_what_changed(self):
+        r = self.probe["requests"]
+        self.assertIsNone(r["none"])
+        self.assertEqual(r["title"], {"revision": 4, "title": "Keys, rotated"})
+        self.assertEqual(r["body"], {"revision": 4, "body": "One.\nTwo.\nThree, four."})
+        self.assertEqual(r["severity"], {"revision": 4, "severity": "high"})
+        self.assertEqual(r["severity_none"], {"revision": 4, "clear": ["severity"]})
+        self.assertEqual(r["kind"], {"revision": 4, "kind": "finding"})
+        self.assertIsNone(r["kind_none_as_it_was"])
+        self.assertEqual(r["all"], {"revision": 4, "title": "T", "body": "B",
+                                    "kind": "question", "blocked_by": [9],
+                                    "clear": ["severity"]})
+        # A stored value no control offers is not rewritten by an edit of another field.
+        self.assertEqual(r["unknown_kind"], {"revision": 4, "title": "T"})
+
+    def test_an_untouched_crlf_body_is_not_sent_and_an_edited_one_goes_as_lf(self):
+        r = self.probe["requests"]
+        self.assertNotIn("body", r["title"])
+        self.assertEqual(r["body"]["body"], "One.\nTwo.\nThree, four.")
+        self.assertNotIn("\r", json.dumps(r))
+
+    def test_blockers_go_whole_and_only_when_the_set_differs(self):
+        r = self.probe["requests"]
+        self.assertIsNone(r["blockers_reordered"])
+        self.assertEqual(r["blockers_removed"], {"revision": 4, "blocked_by": []})
+        self.assertEqual(r["blockers_added"], {"revision": 4, "blocked_by": [2, 5, 9]})
+        # Blockers that do not parse send nothing, whatever else changed.
+        self.assertIsNone(r["blockers_bad"])
+        self.assertIsNone(r["blockers_bad_and_title"])
+        self.assertEqual(self.probe["draft_changes"], [[], ["title", "blockers"]])
+
+    def test_blockers_parse_to_ids_or_name_the_word_that_is_not_one(self):
+        parsed = self.probe["parse"]
+        self.assertEqual([p["ids"] for p in parsed[:4]], [[], [7, 12], [7, 12], [7, 7]])
+        self.assertTrue(all(p["bad"] is None for p in parsed[:4]))
+        self.assertEqual([p["bad"] for p in parsed[4:10]],
+                         ["#0", "-3", "7.5", "#", "x7", "9007199254740993"])
+        self.assertTrue(all(p["ids"] is None for p in parsed[4:10]))
+        self.assertEqual(parsed[10], {"ids": [9007199254740991], "bad": None})
+        self.assertEqual(self.probe["blockers_text"], ["#7, #12", "", []])
+        self.assertEqual(self.probe["labels"]["problem"],
+                         '"x\\u202e" is not a task id: blockers are ids, such as #7, 12.')
+
+    def test_the_fields_that_moved_under_a_draft_are_named(self):
+        c = self.probe["changed_fields"]
+        self.assertEqual(c["title"], ["title"])
+        self.assertEqual(c["blockers_reordered"], [])
+        self.assertEqual(c["severity_cleared"], ["severity"])
+        self.assertEqual(c["body"], ["body"])
+        self.assertEqual(c["blockers"], ["blockers"])
+
+    def test_a_rebase_keeps_the_operators_fields_and_takes_the_rest(self):
+        rebase = self.probe["rebase"]
+        self.assertEqual(rebase["draft"]["title"], "Theirs")
+        self.assertEqual(rebase["draft"]["body"], "Mine.")
+        # The resend carries the body alone, at the newer revision: another writer's
+        # title is not reverted.
+        self.assertEqual(rebase["request"], {"revision": 6, "body": "Mine."})
+        self.assertIsNone(rebase["emptied"])
+        self.assertEqual(rebase["both"], "Ours")
+        self.assertEqual(rebase["bad_blockers"], "#2, x")
+
+    def test_an_edit_is_posted_as_the_route_takes_it(self):
+        self.assertEqual(self.probe["wire"], {
+            "url": "/api/tasks/7/edit", "method": "POST",
+            "body": {"revision": 4, "title": "New", "clear": ["severity"],
+                     "blocked_by": [9]}})
+
+    def test_a_lost_edit_is_decided_by_the_revision_and_every_field_it_sent(self):
+        c = self.probe["check"]
+        self.assertEqual(c["found"], "found")
+        self.assertEqual(c["not_landed"], "not-landed")
+        for key in ("other_title", "not_cleared", "other_blockers"):
+            with self.subTest(case=key):
+                self.assertEqual(c[key], "changed")
+        self.assertEqual(c["failed_read"], "could-not-check")
+        # A field it did not send may have moved since: that does not count against it.
+        self.assertEqual(c["body_left_alone"], "found")
+        texts = self.probe["texts"]
+        self.assertEqual(texts["landed"], "Save the edit: done.")
+        self.assertIn("the task shows it landed", texts["found"])
+        self.assertIn("cannot apply it twice", texts["not_landed"])
+        self.assertIn("not as this would have changed it", texts["changed"])
+
+    def test_the_save_names_the_revision_and_a_claim_it_leaves(self):
+        labels = self.probe["labels"]
+        self.assertEqual(labels["save"], "save the edit to revision 4")
+        self.assertEqual(labels["save_claimed"],
+                         "save the edit to revision 4 (claude-x\\u202e holds the task; "
+                         "the claim stays)")
+        self.assertEqual(labels["save_none"], "")
+
+    def test_a_refined_tasks_form_says_the_edit_amends_its_plans_spec(self):
+        labels = self.probe["labels"]
+        self.assertEqual(labels["amend"],
+                         "This task is refined: an edit amends the spec plan 3 was "
+                         "written against, at revision 2. Approving after it approves "
+                         "the edited task with that plan.")
+        self.assertEqual((labels["amend_open"], labels["amend_superseded"]), ("", ""))
+        self.assertIn("Save or discard the edit first", labels["held"])
+
+    def test_a_stored_value_no_select_offers_is_said_beside_it(self):
+        unknown = self.probe["labels"]["unknown"]
+        self.assertEqual(unknown[0],
+                         'The stored severity "critical" is not one the form offers: it '
+                         'shows as none, and stays unless you change it. The stored kind '
+                         '"chore\\u202e" is not one the form offers: it shows as none, '
+                         "and stays unless you change it.")
+        self.assertEqual(unknown[1:], ["", ""])
+        self.assertIn("unknownSpecText(specEdit.base)",
+                      _function((TASKS_DIR / "tasks.js").read_text(), "specForm"))
+
+    def test_the_preview_shows_what_will_be_stored_spelled(self):
+        p = self.probe["preview"]
+        # Left alone, a field is stored as it is: its CR spelled, as any hidden one.
+        self.assertEqual(p["untouched"], {
+            "label": "stored, and left as it is",
+            "text": "One.\\u000d\nTwo.\\u000dThree.", "hidden": 2, "lost": ""})
+        self.assertEqual(p["sent"], {
+            "label": "will be stored", "text": "One.\nTwo.\nThree.\\u200b", "hidden": 1,
+            "lost": "2 line breaks of the stored body turned into line feeds by this "
+                    "control."})
+        self.assertEqual(p["title"]["lost"],
+                         "1 line break of the stored title dropped by this control.")
+        self.assertEqual(p["one"]["lost"], "1 line break of the stored body turned into "
+                                           "line feeds by this control.")
+
+    def test_a_rebase_says_what_moved_and_what_saving_writes_over(self):
+        t = self.probe["rebase_text"]
+        self.assertEqual(t["taken"], "The task moved from revision 4 to 6 while you "
+                                     "edited it. Your edit takes the new title.")
+        self.assertEqual(t["kept"], "The task moved from revision 4 to 6 while you edited "
+                                    "it. Your edit takes the new title. It keeps your "
+                                    "body over the new one: saving writes over that "
+                                    "change.")
+        self.assertIn("It keeps your title, body over the new ones: saving writes over "
+                      "those changes.", t["kept_two"])
+        self.assertEqual(t["state_only"], "The task moved from revision 4 to 5 while you "
+                                          "edited it. Its spec did not change.")
+        self.assertTrue(t["emptied"].endswith(
+            " Nothing is left to save: the task reads as your edit did."))
+        self.assertNotIn("Nothing is left", t["kept"])
+
+
+# What the page sends for each change a draft makes to a task a scratch store holds,
+# and what it makes of the task read after.
+_EDIT_RULE_PROBE = r"""
+import { pathToFileURL } from "node:url";
+const m = await import(pathToFileURL(`${process.env.DOCKADE_UI_DIR}/moves.js`).href);
+const cases = JSON.parse(process.env.DOCKADE_CASES);
+const after = process.env.DOCKADE_AFTER ? JSON.parse(process.env.DOCKADE_AFTER) : null;
+const sent = cases.map(([base, changes]) =>
+  m.editRequest(base, {...m.specDraft(base), ...changes}));
+console.log(JSON.stringify({sent, checks: after && after.map((task, i) => m.checkWrite(
+  {kind: "edit", revision: cases[i][0].revision, send: sent[i]}, {task}))}));
+"""
+
+
+@unittest.skipIf(not _NODE and not _STRICT,
+                 "node is not installed — skipping app.js unit tests")
+class EditRuleTests(_OperatorStore):
+    """The edit the page builds against the registry's own: each body taken by the
+    operator API's model and by ``edit`` on a scratch store, which then reads back as
+    the page sent it, a field left alone as it was, and as landed by the page's check."""
+
+    CHANGES: ClassVar[list] = [
+        {"title": "Keys, rotated"},
+        {"body": "One.\nTwo.\nThree, four."},
+        {"severity": "", "kind": "finding"},
+        {"blockers": ""},
+        {"blockers": "#{other}, {other}"},
+        {"title": "All", "severity": "high", "kind": "", "blockers": "#{other}"},
+    ]
+
+    def node(self, **env: str) -> dict:
+        proc = subprocess.run(  # noqa: S603 (absolute path, fixed args, as _probe)
+            [_NODE, "--input-type=module", "-e", _EDIT_RULE_PROBE],
+            env={**os.environ, "DOCKADE_UI_DIR": str(_served_dir(TASKS_DIR)), **env},
+            capture_output=True, text=True, timeout=60, check=False)
+        if proc.returncode != 0:
+            raise AssertionError("importing moves.js under node failed:\n" + proc.stderr)
+        return json.loads(proc.stdout)
+
+    def test_each_edit_lands_as_sent_and_leaves_the_rest(self):
+        op = _reg.operator_moves
+        other = op.create("widgets", "Other", "B.", "open")["task"]
+        made = [op.create("widgets", "Keys\nrotated", "One.\r\nTwo.\rThree.", "open",
+                          severity="low", kind="question", blocked_by=[self.task])["task"]
+                for _ in self.CHANGES]
+        before = [_reads.get_task(task) for task in made]
+        changes = [{k: v.format(other=other) for k, v in c.items()} for c in self.CHANGES]
+        cases = list(zip(before, changes, strict=True))
+        sent = self.node(DOCKADE_CASES=json.dumps(cases))["sent"]
+        for task, body, was in zip(made, sent, before, strict=True):
+            with self.subTest(sent=body):
+                self.assertIsNotNone(body)
+                reply = _api.edit_task(task, _api.EditTask(**body), ThroughTheRelay())
+                self.assertEqual(reply.status_code, 200, reply.body)
+                now = _reads.get_task(task)
+                for field in ("title", "body", "severity", "kind"):
+                    expected = (None if field in body.get("clear", ())
+                                else body.get(field, was[field]))
+                    self.assertEqual(now[field], expected, field)
+                blockers = body.get("blocked_by", [b["id"] for b in was["blockers"]])
+                self.assertEqual(sorted(b["id"] for b in now["blockers"]),
+                                 sorted(set(blockers)))
+        # The CR LF body is sent only by the change that edits it, as LF.
+        self.assertEqual([("body" in b) for b in sent],
+                         [False, True, False, False, False, False])
+        after = [_reads.get_task(task) for task in made]
+        checks = self.node(DOCKADE_CASES=json.dumps(cases),
+                           DOCKADE_AFTER=json.dumps(after))["checks"]
+        self.assertEqual(checks, ["found"] * len(made))
+        # Read at the revision it was sent at, it has not landed yet.
+        stale = self.node(DOCKADE_CASES=json.dumps(cases),
+                          DOCKADE_AFTER=json.dumps(before))["checks"]
+        self.assertEqual(stale, ["not-landed"] * len(made))
+
+
+class TaskEditSourceTests(unittest.TestCase):
+    """How the page holds, draws and sends the spec edit, from source: a browser is the
+    only thing that runs it. What it sends is held under node (``EditTests``,
+    ``EditRuleTests``)."""
+
+    TASKS = (TASKS_DIR / "tasks.js").read_text()
+    HTML = (TASKS_DIR / "index.html").read_text()
+
+    def test_the_form_takes_its_values_as_properties(self):
+        control = _function(self.TASKS, "specControl")
+        self.assertIn("el.value = specEdit.draft[field];", control)
+        self.assertIn('opt.textContent = value || "none";', control)
+        for name in ("specControl", "specForm", "markEdit"):
+            with self.subTest(function=name):
+                body = _function(self.TASKS, name)
+                self.assertNotRegex(body, r'setAttribute\("(?:value|placeholder)"')
+                self.assertNotIn("innerHTML", body)
+        # The operator's text is read back from the control, never from markup.
+        self.assertIn("[ev.target.dataset.spec]: ev.target.value", self.TASKS)
+
+    def test_the_preview_is_spelled_and_set_as_text(self):
+        self.assertIn("const shown = spellHidden(sent ? draft[field] : stored);",
+                      _function(self.TASKS, "specPreview"))
+        mark = _function(self.TASKS, "markEdit")
+        self.assertIn("text.textContent = preview.text;", mark)
+        self.assertIn("hiddenNote(preview.hidden)", mark)
+        self.assertIn("blockersProblem(bad)", mark)
+        self.assertIn("spellHidden(String(bad)).text", _function(self.TASKS, "blockersProblem"))
+
+    def test_the_edit_is_in_the_in_flight_gate(self):
+        mark = _function(self.TASKS, "markWriting")
+        for control in ("[data-spec]", "button[data-spec-open]", "button[data-spec-discard]"):
+            with self.subTest(control=control):
+                self.assertIn(control, mark)
+        self.assertLess(mark.index("el.disabled = writing !== null || !drawnIsOpen();"),
+                        mark.index("markEdit();"))
+        self.assertEqual(_function(self.TASKS, "toggleSpecEdit").splitlines()[1].strip(),
+                         "if (writing || !drawnIsOpen()) return;")
+        self.assertIn('if (btn.dataset.write === "edit") return editWrite(base);',
+                      _function(self.TASKS, "writeFor"))
+        # A save with nothing to send is off, after the gate turned it on.
+        self.assertIn("if (save && !editRequest(base, draft)) save.disabled = true;",
+                      _function(self.TASKS, "markEdit"))
+
+    def test_a_draft_with_changes_holds_every_move_but_a_note(self):
+        self.assertIn('const HELD_KINDS = ["move", "approve", "break"];', self.TASKS)
+        write_for = _function(self.TASKS, "writeFor")
+        self.assertIn("if (HELD_KINDS.includes(btn.dataset.write) && editHolds()) "
+                      "return null;", write_for)
+        self.assertLess(write_for.index("editHolds()"), write_for.index("approveWrite("))
+        mark = _function(self.TASKS, "markEdit")
+        self.assertIn("for (const btn of taskDetail.querySelectorAll(HELD_MOVES)) {\n"
+                      "    if (held) btn.disabled = true;", mark)
+        self.assertIn("said.textContent = held ? HELD_TEXT : \"\";", mark)
+        self.assertIn("draftChanges(specEdit.base, specEdit.draft).length > 0",
+                      _function(self.TASKS, "editHolds"))
+        # Its line keeps its space above the moves, so saying it moves no button.
+        moves = _function(self.TASKS, "movesBlock")
+        self.assertLess(moves.index('held.dataset.specHeld = "1";'),
+                        moves.index('row.className = "moves";'))
+        rule = re.search(r"\.held-line \{([^}]*)\}", self.HTML).group(1)
+        self.assertRegex(rule, r"\bheight: \d+px;")
+
+    def test_only_a_landed_edit_discard_or_another_task_drops_the_draft(self):
+        # Declared, rebased, opened or discarded, and dropped by a landed edit, opening
+        # another task and closing it: nothing else writes it.
+        sets = re.findall(r"\bspecEdit = ([^;]*);", self.TASKS)
+        self.assertEqual(len(sets), 6, sets)
+        self.assertEqual(sets.count("null"), 4, sets)
+        run = _function(self.TASKS, "runWrite")
+        self.assertIn('if (write.kind === "edit" && landed && specEdit && '
+                      "specEdit.task === write.task) {\n    specEdit = null;", run)
+        self.assertIn('const landed = result === "landed" || result === "found";', run)
+        self.assertIn("if (specEdit && specEdit.task !== id) specEdit = null;",
+                      _function(self.TASKS, "showTask"))
+        self.assertIn("specEdit = null;", _function(self.TASKS, "closeTask"))
+        self.assertIn("specEdit = open ? {", _function(self.TASKS, "toggleSpecEdit"))
+        for name in ("refreshOpenTask", "refreshInbox", "refreshTasks", "readFlagged"):
+            with self.subTest(function=name):
+                self.assertNotIn("specEdit", _function(self.TASKS, name))
+
+    def test_every_draw_past_the_drafts_base_rebases_it(self):
+        draw = _function(self.TASKS, "drawTask")
+        self.assertLess(draw.index("noteSpecDrawn(task);"), draw.index("specForm(task)"))
+        noted = _function(self.TASKS, "noteSpecDrawn")
+        self.assertIn("!(Number(task.revision) > Number(specEdit.base.revision))", noted)
+        self.assertIn("const rebased = rebaseDraft(base, draft, task);", noted)
+        self.assertIn("specEdit = { task: specEdit.task, base: task, draft: rebased,", noted)
+        # "Nothing left to save" only when the draft had changes before.
+        self.assertIn("mine.length > 0 && !draftChanges(task, rebased).length", noted)
+
+    def test_a_redraw_of_the_read_drawn_keeps_the_line_atop_it(self):
+        draw = _function(self.TASKS, "drawTask")
+        self.assertIn("const kept = task === shownTask ? noticeSlot : null;", draw)
+        self.assertLess(draw.index("const kept ="), draw.index("shownTask = task;"))
+        self.assertIn("if (!kept) {\n    noticeSlot = document.createElement(\"div\");", draw)
+        # A refusal's notice is put back only in a line made new: a kept one may say
+        # something newer since, a poll's "changed".
+        self.assertIn('if (!kept && outcome && outcome.task === String(task.id) '
+                      '&& outcome.result === "stale") {\n    fillSlot(outcome);', draw)
+        self.assertIn("drawTask(shownTask, shownHeld);",
+                      _function(self.TASKS, "toggleSpecEdit"))
+
+    def test_the_form_replaces_the_lines_that_show_the_spec(self):
+        draw = _function(self.TASKS, "drawTask")
+        self.assertIn("if (sk && !editing)", draw)
+        self.assertIn("task.blockers.length && !editing", draw)
+        self.assertLess(draw.index("taskDetail.appendChild(specForm(task));"),
+                        draw.index("taskDetail.appendChild(body);"))
+        self.assertIn("specAmendText(task)", _function(self.TASKS, "specForm"))
 
 
 if __name__ == "__main__":

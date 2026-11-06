@@ -14,7 +14,7 @@ The relay's table is the operator's whole say in the registry, since its operato
 listener takes no token; `_RELAY_ROUTES` in `app.py` says what may be on it, and a test
 holds it and the page's fetches equal in both directions, the writes' method too. Its
 writes are the ones the page makes: on a task, a move, an approve with its answers,
-breaking a claim and a note; on
+breaking a claim, a spec edit and a note; on
 notes, hiding or showing one, handling one with or without a reply, and handling the
 flagged notes a page showed. The bind and the peer check are the approval UI's
 (`app.py`'s docstring); why each matters beside the registry is the root `DESIGN.md`'s
@@ -203,6 +203,31 @@ something to approve, so it carries a warning. Every plan the task had is read w
 and the earlier ones are drawn whole on request, newest first, so what a plan replaced
 can be read beside it.
 
+**A spec edit sends what changed, as it will be stored.** Editing the spec is how the
+operator records a decision with authority, since a note never outranks the body, so it
+is offered in every state. The form takes the place of the lines that show the spec, its
+values set as properties, and sends only the fields the operator changed, compared with
+the read it was drawn from as each control hands a value back (`asControl` in
+`moves.js`): a textarea turns CR LF into LF, a text input drops line breaks, and a select
+reads a value it has no option for as none. Compared raw, an untouched body stored with
+CR LF would be sent and rewritten. Severity or kind set to none goes in `clear`; blockers
+go whole, and only when the set differs, since `edit` replaces them. Under the title and
+body, what will be stored is shown spelled, with how many characters of the stored text
+the control changed. The draft is kept by task across draws, and a draw past the read it
+was made from, whatever brought it (a refusal's task, the read after a write, "show
+it"), moves it onto that read (`rebaseDraft`): the fields the operator changed keep the
+draft's values and the rest take the newer read's, so a save never reverts another
+writer's change to a field left alone; a field both changed keeps the operator's, after a
+line names it. Only a landed edit, discard, closing the task or opening another drops it,
+with no confirm, as no move asks one. While the draft has changes, approve, send back,
+every state move and breaking the claim are held, since each would act on a spec other
+than the one on screen; a note and the moves on notes stay free. An edit leaves a claim
+as it is (`operator_moves.edit`), and the save names its holder. A refined task's form
+says the edit amends the spec its plan was written against, and once the task's revision
+is past the plan's, `planNotice` says approving approves the task as it now is, with that
+plan: for a refined task only, since an approved task's revision always passes its
+plan's.
+
 **A revised plan is drawn as what changed.** A refiner's revision is mostly the plan it
 replaced, so a plan with a predecessor (`planPredecessor`: the next lower id, not the one
 the operator last read) opens on what changed from it, section by section in the same
@@ -235,9 +260,10 @@ whose space is kept whether it says anything or not, so filling it shifts nothin
 stays in view as the detail scrolls, and "show it" reads the task again through the
 hash. A refused move's "the task changed" notice is drawn in the same line, since the
 task it draws is the refusal's and the timeline is the one held; every other outcome
-stays under the moves, beside the controls it is about. When the poll may fill or
-replace the line, and why it never empties it, is `refreshOpenTask`'s comment. A move
-from a stale view still meets the revision's refusal.
+stays under the moves, beside the controls it is about. A redraw of the read already
+drawn, as opening or discarding an edit makes, keeps what the line says. When the poll
+may fill or replace the line, and why it never empties it, is `refreshOpenTask`'s
+comment. A move from a stale view still meets the revision's refusal.
 
 **Its tests.** `tests/test_tasks_ui.py` holds the server: the relay's table, the guard
 in front of its writes, which errors are not running and which an unknown outcome,
@@ -247,7 +273,8 @@ every structural check the approval page has (`PageChecks`: markup and script, t
 module list against the Dockerfile and the imports, fetches against the relay, free
 names), the writes' methods against the relay, the pure halves of `tasks.js`,
 `moves.js` and `diff.js` under node, the approve's rule and body against the
-registry's own (`ApproveRuleTests`), and, from source, how the page gates the registry,
+registry's own (`ApproveRuleTests`), the edit's bodies on a scratch store
+(`EditRuleTests`), and, from source, how the page gates the registry,
 sends its writes, draws agent text and decisions, and fills the line atop the detail;
 `tests/test_task_registry_inbox.py` holds what the inbox counts, and
 `tests/test_task_registry_operator.py` that each note is on the history row that

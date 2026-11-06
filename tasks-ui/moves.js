@@ -260,6 +260,137 @@ export function isNoteMove(write) {
   return Boolean(write) && typeof write === "object" && NOTE_MOVES.includes(write.kind);
 }
 
+// ── the spec edit ────────────────────────────────────────────────────────────
+// The operator edits a task's spec in any state (`operator_moves.edit`): its title,
+// body, severity, kind and blockers. A draft holds each as its control does, and an
+// edit sends only the fields it changed against the task it was drawn from, its base,
+// so a field left alone is never rewritten (tasks-ui/DESIGN.md, "A spec edit sends what
+// changed, as it will be stored").
+
+// What a severity and a kind may be (`tasks.SEVERITIES`, `tasks.KINDS`; a test holds
+// them to the registry's). Their selects offer each, and "" for none.
+export const SEVERITIES = ["high", "medium", "low"];
+export const KINDS = ["finding", "question", "improvement"];
+export const SPEC_FIELDS = ["title", "body", "severity", "kind", "blockers"];
+// Each text field's control: a select is the list of its options' values.
+export const SPEC_CONTROLS = { title: "text", body: "textarea",
+                               severity: ["", ...SEVERITIES], kind: ["", ...KINDS] };
+
+// A value as its control hands it back once set: a textarea turns CR LF and a lone CR
+// into LF, a text input drops CR and LF, and a select gives "" for a value it has no
+// option for, as for none.
+export function asControl(value, control) {
+  const s = typeof value === "string" ? value : "";
+  if (Array.isArray(control)) return control.includes(s) ? s : "";
+  return control === "text" ? s.replace(/[\r\n]/g, "") : s.replace(/\r\n?/g, "\n");
+}
+
+// How many characters of `value` its control changes or drops: what a field the edit
+// sends loses of the stored text besides what the operator typed.
+export function controlChanges(value, control) {
+  const s = typeof value === "string" ? value : "";
+  if (control === "text") return (s.match(/[\r\n]/g) || []).length;
+  return control === "textarea" ? (s.match(/\r\n?/g) || []).length : 0;
+}
+
+// A task's blockers by id, as a read carries them.
+export function blockerIds(spec) {
+  const list = spec && Array.isArray(spec.blockers) ? spec.blockers : [];
+  return list.map(b => (b && typeof b === "object" ? b.id : b)).filter(Number.isInteger);
+}
+
+// Blockers as the form writes them: "#7, #12".
+export function blockersText(ids) {
+  return (Array.isArray(ids) ? ids : []).map(id => `#${id}`).join(", ");
+}
+
+// "#7, 12" to ids, or the first word that is not one (`bad`). An id is a positive whole
+// number JSON carries exactly, so never past 2^53. Empty text is no blockers.
+export function parseBlockers(text) {
+  const ids = [];
+  for (const word of String(text ?? "").split(/[\s,]+/).filter(Boolean)) {
+    const digits = /^#?([0-9]+)$/.exec(word);
+    const id = digits ? Number(digits[1]) : NaN;
+    if (!Number.isSafeInteger(id) || id < 1) return { ids: null, bad: word };
+    ids.push(id);
+  }
+  return { ids, bad: null };
+}
+
+function sameIds(a, b) {
+  const x = new Set(a), y = new Set(b);
+  return x.size === y.size && [...x].every(id => y.has(id));
+}
+
+// A task's spec as its form's controls hold it: where a draft starts.
+export function specDraft(spec) {
+  const s = spec && typeof spec === "object" ? spec : {};
+  const draft = { blockers: blockersText(blockerIds(s)) };
+  for (const [field, control] of Object.entries(SPEC_CONTROLS)) {
+    draft[field] = asControl(s[field], control);
+  }
+  return draft;
+}
+
+// The fields in which two drafts differ: blockers by the set of ids, whatever their
+// order and repeats, and by text while either does not parse.
+function draftsDiffer(was, now) {
+  return SPEC_FIELDS.filter(field => {
+    if (field !== "blockers") return was[field] !== now[field];
+    const a = parseBlockers(was.blockers).ids, b = parseBlockers(now.blockers).ids;
+    return a && b ? !sameIds(a, b) : was.blockers !== now.blockers;
+  });
+}
+
+// The fields the operator changed in a draft of `base`.
+export function draftChanges(base, draft) {
+  return draftsDiffer(specDraft(base), draft);
+}
+
+// The body an edit of `base` sends, or null when nothing changed, or while the blockers
+// do not parse (`parseBlockers` says why). Severity or kind set to none goes in
+// `clear`; blockers go whole, since `edit` replaces them, each once.
+export function editRequest(base, draft) {
+  const ids = parseBlockers(draft.blockers).ids;
+  if (!ids) return null;
+  const out = { revision: base.revision };
+  const clear = [];
+  for (const field of draftChanges(base, draft)) {
+    if (field === "blockers") out.blocked_by = [...new Set(ids)];
+    else if (draft[field] === "" && Array.isArray(SPEC_CONTROLS[field])) clear.push(field);
+    else out[field] = draft[field];
+  }
+  if (clear.length) out.clear = clear;
+  return Object.keys(out).length > 1 ? out : null;
+}
+
+// The spec fields that differ between two reads of a task, as stored: what moved under
+// a draft.
+export function changedFields(base, current) {
+  const was = base && typeof base === "object" ? base : {};
+  const now = current && typeof current === "object" ? current : {};
+  return SPEC_FIELDS.filter(field => (field === "blockers"
+    ? !sameIds(blockerIds(was), blockerIds(now))
+    : (was[field] ?? null) !== (now[field] ?? null)));
+}
+
+// A draft of `base` moved onto `current`, a newer read: the fields the operator changed
+// keep the draft's values, the rest take `current`'s, which is the new base. So saving
+// never reverts another writer's change to a field the operator left alone.
+export function rebaseDraft(base, draft, current) {
+  const mine = new Set(draftChanges(base, draft));
+  const now = specDraft(current);
+  return Object.fromEntries(SPEC_FIELDS.map(f => [f, mine.has(f) ? draft[f] : now[f]]));
+}
+
+// Whether a task read again shows an edit's every field as it was sent.
+function editLanded(sent, current) {
+  return ["title", "body", "severity", "kind"]
+    .every(field => !(field in sent) || current[field] === sent[field])
+    && (sent.clear || []).every(field => (current[field] ?? null) === null)
+    && (!sent.blocked_by || sameIds(sent.blocked_by, blockerIds(current)));
+}
+
 const JSON_TYPE = { "content-type": "application/json" };
 
 // Send one write. Each names its path in its own `fetch`, as a POST, where the relay
@@ -278,6 +409,10 @@ export function sendWrite(write) {
   if (write.kind === "break") {
     return fetch(`/api/tasks/${path}/break-claim`, { method: "POST", headers: JSON_TYPE,
       body: JSON.stringify({ revision: write.revision }) });
+  }
+  if (write.kind === "edit") {
+    return fetch(`/api/tasks/${path}/edit`, { method: "POST", headers: JSON_TYPE,
+      body: JSON.stringify(write.send) });
   }
   if (write.kind === "note") {
     return fetch(`/api/tasks/${path}/notes`, { method: "POST", headers: JSON_TYPE,
@@ -347,13 +482,14 @@ export function writeOutcome(answer) {
 // its timeline:
 //   found           it shows it landed: a move's revision moved and its state is the
 //                   target; an approve's moved and its plan has the answers sent
-//                   (`approveLanded`); a break's moved and nobody holds it; a note of the
+//                   (`approveLanded`); a break's moved and nobody holds it; an edit's
+//                   moved and every field it sent reads back as sent; a note of the
 //                   operator's with its text is newer than any the page held; a note
 //                   move's own entry, with the value sent, is newer than any the page
 //                   held; no note a bulk named is still listed, since all of one lands
 //                   or none;
-//   not-landed      a move, approve or break whose revision did not move: sending it
-//                   again cannot apply it twice, since the revision would refuse it;
+//   not-landed      a move, approve, break or edit whose revision did not move: sending
+//                   it again cannot apply it twice, since the revision would refuse it;
 //                   or a bulk whose notes are still listed, which sending again only
 //                   marks;
 //   not-seen        a hide, show or handle without a reply whose entry is not there:
@@ -386,6 +522,7 @@ export function checkWrite(write, reread) {
   if (write.kind === "move" && task.state === write.state) return "found";
   if (write.kind === "break" && !task.claim) return "found";
   if (write.kind === "approve" && approveLanded(write, task)) return "found";
+  if (write.kind === "edit" && editLanded(write.send, task)) return "found";
   return "changed";
 }
 

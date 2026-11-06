@@ -26,8 +26,8 @@ const claim = {
 
 const TASKS = [
   { id: 3, title: `Split the UI ${RLO}gnp.exe`, state: "open", ready: true,
-    severity: "medium", kind: "feature", claim, notes_total: 2 },
-  { id: 2, title: "Back up the store", state: "open", blocked: true, kind: "chore",
+    severity: "medium", kind: "improvement", claim, notes_total: 2 },
+  { id: 2, title: "Back up the store", state: "open", blocked: true, kind: "finding",
     notes_total: 0 },
   { id: 1, title: "Plain one", state: "open", notes_total: 0 },
 ];
@@ -131,10 +131,20 @@ const DECIDED = { ...REFINED, id: 9, title: "Decided one", revision: 3,
                   plan: DECIDED_PLANS[4] };
 const SECOND_DECIDED = { ...REFINED, id: 10, title: "Second decided", revision: 3,
                          plan: DECIDED_PLANS[5] };
+// The spec edit's: task 11 refined at its plan's revision, so an edit is what makes the
+// plan lag; task 12 open and claimed, its body's line ends CR LF, as a write straight
+// to the registry could store them.
+const FRESH_PLAN = { ...PLAN, id: 9, task: 11, task_revision: 2, at: NOW - 1000 };
+const FRESH = { ...REFINED, id: 11, title: "Fresh refined", revision: 2,
+                severity: "low", kind: "question", body: "Rotate the keys.",
+                plan: FRESH_PLAN };
+const CRLF = { ...UNPLANNED, id: 12, title: "Line ends", state: "open", blocked: false,
+               severity: "medium", kind: "finding", revision: 5, claim,
+               body: "First line.\r\nSecond line.\r\n" };
 
 const PLANS = { 1: [OLDER_PLAN], 3: [PLAN, OLDER_PLAN], 5: [PLAN],
                 6: [PLAN, OLDER_PLAN], 8: [PLAN], 9: [DECIDED_PLANS[4]],
-                10: [DECIDED_PLANS[5]] };
+                10: [DECIDED_PLANS[5]], 11: [FRESH_PLAN] };
 
 // Each task's history, oldest first, as `operator_moves.history` reads it: every write,
 // with the note it posted as it is now.
@@ -206,6 +216,8 @@ const HISTORIES = {
       noteEntry(ON_PARKED)],
   9: refinedHistory(NOW - 6000, DECIDED_PLANS[4]),
   10: refinedHistory(NOW - 5500, DECIDED_PLANS[5]),
+  11: refinedHistory(NOW - 1500, FRESH_PLAN),
+  12: [entry("operator", "create", NOW - 5000, { title: "Line ends", state: "open" })],
 };
 
 function historyPage(id, params) {
@@ -276,7 +288,8 @@ const WRITTEN = { 3: { ...TASK, notes: [...TASK.notes] },
                   6: { ...REFINED, notes: [ON_REFINED] },
                   8: { ...SECOND, notes: [ON_SECOND] },
                   9: { ...DECIDED, notes: [] },
-                  10: { ...SECOND_DECIDED, notes: [] } };
+                  10: { ...SECOND_DECIDED, notes: [] },
+                  11: { ...FRESH, notes: [] }, 12: { ...CRLF, notes: [] } };
 let nextNote = 20;
 
 // Every note a move can name, by id: the ones the timelines carry, so a hide or a
@@ -329,15 +342,16 @@ export function deferElsewhere(id) {
                                                       revision: t.revision, actor: null }));
 }
 // A step has an agent hand in another plan for a task, as `submit_plan` would: the one
-// it had is superseded, and the task is refined at a new revision.
+// it had is superseded, and the task is refined at a new revision, which the plan
+// records as the one it was written against.
 export function replanElsewhere(id, plan) {
   const t = WRITTEN[id];
-  const next = DECIDED_PLANS[plan];
+  t.revision += 1;
+  const next = { ...DECIDED_PLANS[plan], task_revision: t.revision };
   PLANS[id] = [next, ...PLANS[id].map(p => ({ ...p,
                                               superseded_at: p.superseded_at ?? NOW }))];
   t.plan = next;
   t.state = "refined";
-  t.revision += 1;
   HISTORIES[id].push(entry("claude-3f2a9c1e", "submit_plan", NOW,
                            { revision: t.revision, plan: next.id, ...PLAN_DETAIL }));
 }
@@ -431,9 +445,36 @@ function approve(t, body, history) {
                                 plan: plan.id } };
 }
 
+// A spec edit, as `operator_moves.edit` makes it: each field given set, each named in
+// `clear` emptied, the blockers replaced, and the claim left as it is.
+function edit(t, body, history) {
+  const given = ["title", "body", "severity", "kind"]
+    .filter(f => body[f] !== undefined && body[f] !== null);
+  const clear = body.clear || [];
+  if (!given.length && !clear.length && !body.blocked_by) {
+    return { status: 400, json: { ok: false, current: null,
+                                  detail: `nothing to change on task ${t.id}` } };
+  }
+  const changes = {};
+  for (const f of given) changes[f] = body[f];
+  for (const f of clear) changes[f] = null;
+  Object.assign(t, changes);
+  if (body.blocked_by) {
+    t.blockers = body.blocked_by.map(id => {
+      const b = WRITTEN[id] || READ[id];
+      return { id, title: b ? b.title : `Task ${id}`, state: b ? b.state : "open" };
+    });
+  }
+  t.revision += 1;
+  history.push(entry("operator", "edit", NOW, { revision: t.revision, ...changes,
+                                                blocked_by: body.blocked_by ?? null,
+                                                actor: null }));
+  return { status: 200, json: { ok: true, task: t.id, revision: t.revision } };
+}
+
 function write(path, body) {
   if (path.startsWith("/api/notes/")) return lost(noteWrite(path, body));
-  const m = path.match(/^\/api\/tasks\/(\d+)\/(move|approve|break-claim|notes)$/);
+  const m = path.match(/^\/api\/tasks\/(\d+)\/(move|approve|break-claim|edit|notes)$/);
   const t = m && WRITTEN[m[1]];
   if (!t) return null;
   const history = HISTORIES[m[1]];
@@ -452,6 +493,8 @@ function write(path, body) {
     return changed(t);
   } else if (m[2] === "approve") {
     answer = approve(t, body, history);
+  } else if (m[2] === "edit") {
+    answer = edit(t, body, history);
   } else if (m[2] === "break-claim") {
     if (!t.claim) {
       return { status: 400, json: { ok: false, current: null,

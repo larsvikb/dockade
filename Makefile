@@ -598,7 +598,17 @@ ui-diff: ## Run a page's scenario (UI_DIFF_PAGE=approval|tasks) on UI_DIFF_BASE 
 	  echo "== installing playwright-core $$pinned from the harness's lockfile =="
 	  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci --prefix "$$harness" --no-audit --no-fund --ignore-scripts
 	fi
-	out=$$(mktemp -d)
+	# The transcripts are kept, pass or fail: a pass has an empty diff, so they are its
+	# only record, and comparing two runs' is how a scenario's determinism is checked.
+	# Each run gets its own directory because runs may be concurrent, and each start
+	# prunes this user's runs older than a day, so what piles up is bounded. A run that
+	# ends before it names its directory has nothing to read, and removes it.
+	tmp=$${TMPDIR:-/tmp}
+	find -H "$$tmp" -mindepth 1 -maxdepth 1 -type d -name 'dockade-ui-diff.*' \
+	  -user "$$(id -u)" -mmin +1440 -exec rm -rf {} + \
+	  || echo "== ui-diff: could not remove every run older than a day from $$tmp; going on =="
+	out=$$(mktemp -d "$$tmp/dockade-ui-diff.XXXXXX")
+	trap 'rm -rf "$$out"' EXIT
 	# Each page as its image serves it: the UI's files and ui-common/'s in one
 	# directory. A base from before ui-common/, or before the UI, has only what it had.
 	base_dirs=$$(git ls-tree -d --name-only "$(UI_DIFF_BASE)" "$$ui" ui-common)
@@ -620,6 +630,7 @@ ui-diff: ## Run a page's scenario (UI_DIFF_PAGE=approval|tasks) on UI_DIFF_BASE 
 	node "$$harness/harness.js" "$$out/tree" "$$out/tree.txt" "$(UI_DIFF_PAGE)" \
 	  || failed="$$failed this-tree"
 	[ -s "$$out/tree.txt" ] || exit 1
+	trap - EXIT   # from here every path names the directory
 	if diff -u --label "$(UI_DIFF_BASE)" --label "this tree" "$$out/base.txt" "$$out/tree.txt" \
 	   && [ -z "$$failed" ]; then
 	  echo "== the page behaves the same; transcripts in $$out =="

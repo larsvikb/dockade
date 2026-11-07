@@ -59,7 +59,8 @@ INTERNAL_ERROR = -32603
 def encode(message: object) -> bytes:
     """The bytes a message goes out as: compact, key order kept, non-ASCII as UTF-8.
 
-    The one serializer for the reply. ``app.py`` sends a response in it, and
+    The one serializer for the reply. ``app.py`` sends a response in it,
+    ``execute._run`` checks a result can be sent in it before recording it, and
     ``outcomes.record`` hashes a result in it, so a recorded hash is of bytes the agent
     received: JSON nests a value's own serialization unchanged, so the result's text is
     a substring of the reply's. Raises ``ValueError`` on NaN or infinity, which JSON
@@ -118,6 +119,18 @@ def handle(message: object, listing: list[dict], execute=None) -> dict | None:
         return _error(None, INVALID_REQUEST, "JSON-RPC batches are not accepted")
     if not isinstance(message, dict):
         return _error(None, INVALID_REQUEST, "a JSON-RPC message is an object")
+
+    if "id" in message:
+        # Checked before every branch that echoes it, the `jsonrpc` check below among
+        # them. An id `encode` refuses (NaN, an infinity, a lone surrogate, anywhere in it) would let a
+        # tool run and be recorded `ok`, then fail the reply with a 500. Any exception,
+        # so no id can 500. Only the id is checked because it is the one value echoed
+        # raw; a method or tool name goes back through repr.
+        try:
+            encode(message["id"])
+        except Exception:  # noqa: BLE001 — every refusal answers
+            return _error(None, INVALID_REQUEST,
+                          "a JSON-RPC id must encode as strict JSON in UTF-8")
 
     method = message.get("method")
     if message.get("jsonrpc") != "2.0" or not isinstance(method, str):

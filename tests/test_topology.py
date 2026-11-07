@@ -26,6 +26,7 @@ passing it; ``_mount_spellings`` and ``_long_mount`` read a value as written, a
 from __future__ import annotations
 
 import ast
+import contextlib
 import functools
 import ipaddress
 import json
@@ -34,15 +35,19 @@ import posixpath
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from collections.abc import Callable
 from pathlib import Path
 from typing import ClassVar
 from unittest import mock
+
+from test_docs import _NeedsGit
 
 ROOT = Path(__file__).resolve().parents[1]
 #: The files, in the Makefile's -f order. ComposeFormTests pins the Makefile to this
@@ -2336,8 +2341,8 @@ class _MakeRun(unittest.TestCase):
     def use(self, config: Path) -> None:
         self.config, self.secrets = config, config / "secrets"
 
-    def make(self, *args: str, path: str | None = None,
-             env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    def make_command(self, *args: str, path: str | None = None,
+                     env: dict[str, str] | None = None) -> tuple[list[str], dict[str, str]]:
         # Absolute, so not resolved through PATH; a failure without make, not a skip,
         # since this suite runs under it.
         make = shutil.which("make")
@@ -2347,10 +2352,14 @@ class _MakeRun(unittest.TestCase):
         if path is not None:
             run_env["PATH"] = path
         run_env.update(env or {})
+        return [make, "-s", "-C", str(ROOT), *(args or (self.DEFAULT_TARGET,))], run_env
+
+    def make(self, *args: str, path: str | None = None,
+             env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        command, run_env = self.make_command(*args, path=path, env=env)
         return subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
-            [make, "-s", "-C", str(ROOT), *(args or (self.DEFAULT_TARGET,))], env=run_env,
-            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60,
-            check=False)
+            command, env=run_env, stdin=subprocess.DEVNULL, capture_output=True,
+            text=True, timeout=60, check=False)
 
 
 class SecretsDirTests(_MakeRun):
@@ -3443,6 +3452,179 @@ esac
         self.assertRegex(names[0], r"^dockade-control-\d{8}T\d{6}Z\.db$")
         self.assertRegex(names[1], r"^dockade-tasks-\d{8}T\d{6}Z\.db$")
         self.assertEqual(names[2], names[1].removesuffix(".db") + ".md")
+
+
+class UiDiffRecipeTests(_NeedsGit, _MakeRun):
+    """``ui-diff`` runs against a stub ``node`` that answers both version reads with
+    one string, so nothing is installed, and as the harness writes the transcript a
+    test sets, or none. What is checked is which run directories are left in
+    ``TMPDIR``: a run that names its directory keeps it, one that ends before that
+    removes it, and each start prunes this user's runs older than a day.
+
+    The recipe archives ``UI_DIFF_BASE`` with git, so the base is ``HEAD``, which any
+    checkout has, and the class skips without git as the doc guards do."""
+
+    DEFAULT_TARGET = "ui-diff"
+    TWO_DAYS = 2 * 24 * 3600
+
+    def setUp(self):
+        super().setUp()
+        self.scratch = self.tmp / "tmp"
+        self.scratch.mkdir()
+        self.marker = self.tmp / "harness-started"
+        stub = self.tmp / "bin"
+        stub.mkdir()
+        # node harness.js <served directory> <transcript> <page>
+        (stub / "node").write_text("""#!/bin/sh
+if [ "$1" = -p ]; then echo 1.0.0; exit 0; fi
+case "$3" in */base.txt) text=$STUB_BASE;; *) text=$STUB_TREE;; esac
+if [ "${3##*/}" = "$STUB_HANG" ]; then : > "$STUB_MARKER"; sleep 30; fi
+if [ -n "$text" ]; then printf '%s\\n' "$text" > "$3"; fi
+""")
+        (stub / "node").chmod(0o755)
+        self.path = f"{stub}{os.pathsep}{os.environ['PATH']}"
+
+    def environment(self, base: str, tree: str, **extra: str) -> dict[str, str]:
+        return {"TMPDIR": str(self.scratch), "UI_DIFF_BASE": "HEAD",
+                "UI_DIFF_PAGE": "approval", "STUB_BASE": base, "STUB_TREE": tree,
+                "STUB_HANG": "", "STUB_MARKER": str(self.marker), **extra}
+
+    def run_diff(self, base: str, tree: str, **extra: str) -> subprocess.CompletedProcess[str]:
+        return self.make(path=self.path, env=self.environment(base, tree, **extra))
+
+    def runs(self) -> list[Path]:
+        return sorted(self.scratch.glob("dockade-ui-diff.*"))
+
+    def assert_kept(self, run: subprocess.CompletedProcess[str]) -> None:
+        named = re.findall(r"transcripts in (\S+) ==", run.stdout)
+        self.assertEqual(len(named), 1, run.stdout + run.stderr)
+        self.assertEqual(self.runs(), [Path(named[0])])
+        kept = Path(named[0])
+        self.assertTrue((kept / "base.txt").is_file())
+        self.assertTrue((kept / "tree.txt").is_file())
+
+    def test_a_run_that_behaves_the_same_keeps_its_transcripts(self):
+        run = self.run_diff("same", "same")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("the page behaves the same", run.stdout)
+        self.assert_kept(run)
+
+    def test_a_run_that_behaves_differently_keeps_its_transcripts(self):
+        run = self.run_diff("before", "after")
+        self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+        self.assertIn("the page behaves differently", run.stdout)
+        self.assert_kept(run)
+
+    def test_a_run_whose_harness_could_not_run_leaves_nothing(self):
+        for base, tree in (("", ""), ("same", "")):
+            with self.subTest(base=base, tree=tree):
+                run = self.run_diff(base, tree)
+                self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+                self.assertNotIn("transcripts in", run.stdout)
+                self.assertEqual(self.runs(), [])
+
+    def test_a_base_git_cannot_read_leaves_nothing(self):
+        run = self.run_diff("same", "same", UI_DIFF_BASE="no-such-ref-for-ui-diff")
+        self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(self.runs(), [])
+
+    def age(self, *paths: Path, seconds: int = TWO_DAYS) -> None:
+        # After every child is made, since making one updates its parent's mtime.
+        old = time.time() - seconds
+        for path in paths:
+            os.utime(path, (old, old))
+
+    def test_a_start_prunes_only_its_own_runs_older_than_a_day(self):
+        old, new = self.scratch / "dockade-ui-diff.old", self.scratch / "dockade-ui-diff.new"
+        recent = self.scratch / "dockade-ui-diff.recent"
+        other, deep = self.scratch / "other.old", self.scratch / "other.old/dockade-ui-diff.deep"
+        file = self.scratch / "dockade-ui-diff.file"
+        for directory in (old, new, recent, other, deep):
+            directory.mkdir()
+        file.write_text("")
+        self.age(old, deep, other, file)
+        self.age(recent, seconds=23 * 3600)
+        run = self.run_diff("same", "same")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertFalse(old.exists())
+        for kept in (new, recent, other, deep, file):
+            with self.subTest(kept=kept.name):
+                self.assertTrue(kept.exists())
+
+    def test_a_symlinked_tmpdir_is_pruned_through(self):
+        # Without -H, find does not descend a symlink it is given as its start.
+        link = self.tmp / "tmp-link"
+        link.symlink_to(self.scratch)
+        old = self.scratch / "dockade-ui-diff.old"
+        old.mkdir()
+        self.age(old)
+        run = self.run_diff("same", "same", TMPDIR=str(link))
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertFalse(old.exists())
+
+    def test_a_prune_that_fails_warns_and_the_diff_runs(self):
+        if os.geteuid() == 0:
+            self.skipTest("root removes past any mode")
+        stuck = self.scratch / "dockade-ui-diff.stuck"
+        stuck.mkdir()
+        (stuck / "base.txt").write_text("")
+        stuck.chmod(0o500)
+        self.addCleanup(stuck.chmod, 0o700)
+        self.age(stuck)
+        run = self.run_diff("same", "same")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn(f"ui-diff: could not remove every run older than a day from "
+                      f"{self.scratch}", run.stdout)
+        self.assertIn("the page behaves the same", run.stdout)
+
+    def interrupted(self, sig: signal.Signals, group: bool) -> None:
+        command, env = self.make_command(
+            path=self.path, env=self.environment("same", "same", STUB_HANG="tree.txt"))
+        make = subprocess.Popen(  # noqa: S603 (absolute path from shutil.which, fixed args)
+            command, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True,
+            # A suite started with INT ignored (a script's background job) would pass
+            # that on, and the interrupt would end nothing.
+            preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
+        # Whatever is left of the group goes, whether or not the test got that far.
+        self.addCleanup(self.end_group, make)
+        deadline = time.monotonic() + 30
+        while not self.marker.exists():
+            self.assertIsNone(make.poll(), "make ended before the harness hung")
+            self.assertLess(time.monotonic(), deadline, "the harness never started")
+            time.sleep(0.05)
+        self.assertEqual(len(self.runs()), 1)
+        if group:
+            os.killpg(make.pid, sig)
+        else:
+            make.send_signal(sig)
+        make.wait(timeout=20)
+        if group:
+            self.wait_for_group(make.pid)
+        self.assertEqual(self.runs(), [])
+
+    @staticmethod
+    def wait_for_group(pgid: int) -> None:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.05)
+        raise AssertionError(f"process group {pgid} outlived its interrupt")
+
+    def end_group(self, make: subprocess.Popen[bytes]) -> None:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(make.pid, signal.SIGKILL)
+        make.wait(timeout=20)
+
+    def test_a_ctrl_c_leaves_nothing(self):
+        self.interrupted(signal.SIGINT, group=True)
+
+    def test_a_term_to_make_leaves_nothing(self):
+        # `kill <make pid>`: make passes TERM on to the recipe's shell alone.
+        self.interrupted(signal.SIGTERM, group=False)
 
 
 if __name__ == "__main__":

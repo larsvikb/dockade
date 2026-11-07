@@ -426,7 +426,7 @@ is a human answering a sandbox's request. Kept apart because a search
 for one sandbox or one class must return what that population asked for, not the
 configuration written about it. `ActorColumnTests` holds every writer to this. On the
 page the two share one `who` cell, the actor on a labelled line of its own (`auditRow`
-in `control-plane-ui/app.js`): apart in the store, adjacent where a reader asks "who".
+in `control-plane-ui/audit.js`): apart in the store, adjacent where a reader asks "who".
 
 This is not a reversal of keeping client identity out of the saturation banner's
 headline. That banner is a glanceable alert where a bare IP is noise; this table is the
@@ -619,10 +619,11 @@ files is what does *not* carry over from the persist path:
   own (see "Changing a rule is one operation, not two") — the distinction being that an
   edit records what it displaced, where a create that silently overwrote would be the
   same act with nothing in the record saying so.
-- **The page mirrors three refusals and no more.** `createPreview` in `app.js` checks
-  the wildcard floor, a conflicting rule and an identical one — the floor because it is
-  the refusal that would otherwise arrive only *after* clicking a button labelled with a
-  grant the operator wanted, the other two because their fix is on screen already.
+- **The page mirrors three refusals and no more.** `createPreview` in
+  `control-plane-ui/egress-rules.js` checks the wildcard floor, a conflicting rule and
+  an identical one — the floor because it is the refusal that would otherwise arrive
+  only *after* clicking a button labelled with a grant the operator wanted, the other
+  two because their fix is on screen already.
   Everything else a pattern can be wrong about is left to the backend and rendered from
   its `detail`. That keeps the duplicated policy down to one constant instead of a
   second copy of the grammar, and the constant plus the normalizer are held equal across
@@ -663,16 +664,16 @@ Four things follow, and each is a consequence of *which* endpoint this resembles
   the honest shape for a re-scope.
 - **The conflict check must exclude the rule being edited.** A rule always holds its own
   pattern, so a naive uniqueness check refuses every action flip. The backend answers it
-  with an `id<>?` clause and `editPreview` in `app.js` mirrors it; both are tested,
-  because a page that previews a collision with itself makes the operation look broken
-  rather than refused.
+  with an `id<>?` clause and `editPreview` in `control-plane-ui/egress-rules.js`
+  mirrors it; both are tested, because a page that previews a collision with itself
+  makes the operation look broken rather than refused.
 
 **An id names a row, not the rule a page showed.** So the egress edit and revoke and
 the tool rule edit each carry the rule as the page showed it, and are refused on a
 mismatch; why each can widen is in `api_egress._stale`. The check holds only because
 each page sends the row its confirm described, which for the egress form is the row
-captured on entering edit mode (`editingExpected` in `app.js`), not the one its preview
-re-reads at save.
+captured on entering edit mode (`editingExpected` in
+`control-plane-ui/egress-rules.js`), not the one its preview re-reads at save.
 
 `audit.DECISIONS` gains `edit`, and the row carries **both** states. That is the whole
 difference from what it replaces: the record now says what a rule was, not only what it

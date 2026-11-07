@@ -64,7 +64,7 @@ KINDS = ("allow", "deny", "hold", "revoke", "create", "edit", "observe",
 # columns are in both because an outcome row displays itself as `status · server__tool`
 # where an egress row names a host. ``actor`` is in both as displayed: its cell shows
 # the peer and via-ui fields and holds the whole string in its title (``shortActor``
-# in control-plane-ui/app.js), so a match on the User-Agent is one hover away.
+# in control-plane-ui/provenance.js), so a match on the User-Agent is one hover away.
 GROUPED_SEARCH = ("host", "client", "client_class", "actor", "reason",
                   "server", "tool", "status")
 EVENT_SEARCH = ("host", "client", "client_class", "actor", "reason", "method",

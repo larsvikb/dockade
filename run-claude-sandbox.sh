@@ -38,7 +38,7 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(CDPATH='' cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=sandbox-lib.sh
 source "$SCRIPT_DIR/sandbox-lib.sh"
 
@@ -86,7 +86,7 @@ for arg in "$@"; do
         --no-cache)    NO_CACHE=true; REBUILD=true ;;
         --boundary-check) BOUNDARY_CHECK=true ;;
         -*)            echo "Unknown flag: $arg" >&2; exit 1 ;;
-        *)             WORKSPACE="$(cd "$arg" && pwd)" ;;
+        *)             WORKSPACE="$(CDPATH='' cd "$arg" && pwd)" ;;
     esac
 done
 

@@ -93,10 +93,11 @@ dereference that would otherwise appear only in a browser.
 
 ## The page
 
-**Frontend mechanics — the rationale lives in `control-plane-ui/app.js`.** A cluster of
-UI behaviours exists for one reason: the operator must never be *silently* blind, because
-an unseen hold default-denies after `CONTROL_HOLD_TIMEOUT`. Each is documented at its
-point of use in `app.js`; only the cross-cutting points are kept here.
+**Frontend mechanics — the rationale lives in `control-plane-ui/app.js` and the modules
+it imports.** A cluster of UI behaviours exists for one reason: the operator must never
+be *silently* blind, because an unseen hold default-denies after `CONTROL_HOLD_TIMEOUT`.
+Each is documented at its point of use, in `app.js` or one of those modules; only the
+cross-cutting points are kept here.
 
 - **Reconnect.** An `EventSource` retries itself only from `CONNECTING`; a non-200 (the
   relay's 502 during a backend restart) puts it in `CLOSED` for good. So the relay
@@ -327,6 +328,6 @@ needs a user gesture to ask, so a header button asks and the browser's own permi
 the setting. It notifies per ARRIVAL and only past the first push (a reload delivers the
 whole queue as arrivals), stays quiet while the approvals view is on screen, and closes
 a notice when its hold leaves the queue however it left. The rules are `approvalNotices`
-/ `shouldNotify` in `app.js`. Its one environmental dependency: a secure context, which
+/ `shouldNotify` in `holds.js`. Its one environmental dependency: a secure context, which
 `127.0.0.1` satisfies over plain HTTP and another origin would not — so the button says
 so rather than going quiet.

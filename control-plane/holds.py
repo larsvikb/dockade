@@ -254,7 +254,7 @@ def _saturation() -> dict:
     Two gauges, because either global cap can be the one about to fire.
     ``in_flight``/``max_waiters`` is blocked workers; ``cards``/``max_pending`` is
     questions on the operator's screen. The banner shows whichever is nearer its limit
-    (``saturationState`` in control-plane-ui/app.js).
+    (``saturationState`` in control-plane-ui/saturation.js).
 
     ``in_flight`` counts BLOCKED WAITERS, not visible cards: one card can hold several
     waiters, so "12/16 in flight" beside three cards is the true, alarming number.

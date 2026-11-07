@@ -1594,7 +1594,8 @@ withdraw — and the criterion that keeps that width honest is that none of them
 *grants*: the inventory push records a claim `_decide_tool` never reads, no rule is
 written there and no approval is decided there, which is why `resolve` stays off it,
 why the claim can only release what a human already approved, and why a withdrawal
-can only retire an ask.
+can only retire an ask. A claim refused by policy may retire a pending ask too, because
+its agent is told the ask is final; that only closes a question, as a withdrawal does.
 
 How the control plane keeps what the gateway brings it — tool policy in a table of its
 own rather than a scope on `rules`, tool asks in their own approvals table, and one

@@ -922,6 +922,27 @@ def _withdraw_tool_ask(approval_id: str) -> bool:
     return bool(changed)
 
 
+def _retire_tool_ask(approval_id: str) -> bool:
+    """Close a pending ask unanswered, because policy now denies the call it asks for.
+    True if this call closed it. Only ``api_tool.tool_claim`` calls it, once its own
+    agent has been told the ask is final.
+
+    `expired`, the status of an ask closed with nobody's answer, and ``resolved_by``
+    stays NULL, so ``_grant_lapsed`` reads false. `withdrawn` would charge the
+    withdraw cooldown and read as the agent's own act; `denied` would read as a
+    human's refusal.
+
+    Conditional on ``status='pending'`` inside the UPDATE, as ``_resolve_tool_ask`` is,
+    so a human answer landing first is kept and this changes nothing."""
+    with store._connect() as conn:
+        changed = conn.execute(
+            "UPDATE tool_approvals SET status='expired', resolved_at=? "
+            "WHERE id=? AND status='pending'",
+            (time.time(), approval_id)).rowcount
+        conn.commit()
+    return bool(changed)
+
+
 def _list_tool_asks() -> list[dict]:
     """Pending asks, oldest first — the tool half of the operator's queue.
 

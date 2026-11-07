@@ -683,6 +683,36 @@ class ResumeTests(ExecutionTestCase):
                 self.assertIn(expected, text)
                 self.assertNotIn("approval lapsed", text)
 
+    @staticmethod
+    def retired(**fields):
+        """A pending ask retired because policy now denies it: its row reads
+        `expired`, and the reason is the policy, not that nobody answered."""
+        return {"ok": False, "status": "expired", "lapsed": False, "spent": False,
+                "terminal": True, "by_policy": True,
+                "detail": "not releasable (server disabled); the human is no longer "
+                          "asked", **fields}
+
+    def test_a_policy_refusal_names_the_policy_not_the_status(self):
+        self.answer = self.retired()
+        result = self.execute.call(self.execute.surface.RESUME_TOOL,
+                                   {"resume_token": TOKEN, "wait_seconds": 5},
+                                   "172.30.0.5")
+        text = self.text(result)
+        self.assertEqual(len(self.asked), 1)
+        self.assertEqual(self.called, [])
+        self.assertTrue(result["isError"])
+        self.assertIn("not releasable (server disabled)", text)
+        self.assertIn("final", text)
+        self.assertNotIn("before anyone answered", text)
+
+    def test_only_a_true_by_policy_flag_replaces_the_status_text(self):
+        for flag in (1, "yes", False, None):
+            with self.subTest(by_policy=flag):
+                self.answer = self.retired(by_policy=flag)
+                text = self.text(self.resume())
+                self.assertIn("before anyone answered", text)
+                self.assertNotIn("not releasable", text)
+
 
 class ResumeTokenTests(ExecutionTestCase):
     """The native tools take the agent's resume token and nothing else of the ask's,
@@ -1468,8 +1498,7 @@ class ResumeWaitTests(ExecutionTestCase):
         self.assertIn("A human refused this request", self.text(result))
 
     def test_a_policy_refusal_ends_the_wait_while_the_ask_is_still_pending(self):
-        # The refusal carries the ask's OWN status, which is `pending` when the server
-        # was switched off before anyone answered. The status alone would keep polling.
+        # A terminal answer ends the wait whatever status it names, `pending` included.
         self._answers({"ok": False, "terminal": True, "status": "pending",
                        "detail": "not releasable (server disabled)"})
         result = self.execute.resume(

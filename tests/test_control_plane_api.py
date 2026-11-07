@@ -5745,8 +5745,8 @@ class ToolClaimTests(_ToolBridgeTestCase):
 
     def test_nothing_here_can_decide_an_ask(self):
         # The criterion for this whole bridge: a caller reaching it cannot GRANT.
-        # A claim releases only what a human already approved, so a pending ask
-        # stays pending no matter how often it is claimed.
+        # A claim releases only what a human already approved, so under a rule that
+        # still asks, a pending ask stays pending no matter how often it is claimed.
         ask = self._ask()
         for _ in range(3):
             _claim(ask)
@@ -5767,6 +5767,8 @@ class ToolClaimTests(_ToolBridgeTestCase):
         self.assertTrue(resp.body["terminal"])
         self.assertFalse(resp.body["spent"])
         self.assertIn("disabled", resp.body["detail"])
+        self.assertEqual(resp.body["status"], "allowed")
+        self.assertIs(resp.body["by_policy"], True)
 
     def test_revoking_or_denying_the_rule_stops_an_approved_call(self):
         # The same reasoning one level down: the approval was for a call the policy
@@ -5785,7 +5787,9 @@ class ToolClaimTests(_ToolBridgeTestCase):
                                  args={"title": "x"}))
                 _resolve(ask, "allow")
                 undo(rule_id)
-                self.assertEqual(_claim(ask).status_code, 409)
+                resp = _claim(ask)
+                self.assertEqual(resp.status_code, 409)
+                self.assertIs(resp.body["by_policy"], True)
 
     def test_a_policy_refusal_leaves_the_grant_to_be_redeemed_later(self):
         # Checked BEFORE the claim, so a refusal does not consume the approval: the
@@ -5880,9 +5884,9 @@ class ToolClaimTests(_ToolBridgeTestCase):
                 self.assertIs(resp.body["lapsed"], False)
                 self._assert_no_provenance(resp.body)
 
-    def test_a_lapsed_grant_refused_by_policy_still_reads_as_lapsed(self):
-        # The policy check comes before the claim and answers for any status, so a
-        # lapsed grant whose server was then disabled reaches the agent through it.
+    def test_a_lapsed_grant_answers_as_closed_and_lapsed_whatever_policy_says(self):
+        # A closed ask answers as closed whatever policy now says, so a lapsed grant
+        # whose server was then disabled still reaches the agent as lapsed.
         ask = self._ask()
         self._lapse(ask)
         cp.api_mcp.edit_mcp_server("mcp-github",
@@ -5890,10 +5894,154 @@ class ToolClaimTests(_ToolBridgeTestCase):
                                    _FakeRequest())
         resp = _claim(ask)
         self.assertEqual(resp.status_code, 409)
-        self.assertIn("not releasable", resp.body["detail"])
+        self.assertIn("not claimable", resp.body["detail"])
         self.assertEqual(resp.body["status"], "expired")
         self.assertIs(resp.body["lapsed"], True)
         self._assert_no_provenance(resp.body)
+
+    def _denies(self, how):
+        """Raise a pending ask under a fresh `ask` rule, then make policy deny it the
+        way ``how`` names. Returns the ask and a callable that restores the rule."""
+        rule_id = _tool_rule("create_pull_request", "ask").body["id"]
+        ask = _ask_id(_tool_call(tool="create_pull_request", args={"how": how}))
+        if how == "server disabled":
+            cp.api_mcp.edit_mcp_server("mcp-github", _edit_request(enabled=False),
+                                       _FakeRequest())
+            return ask, _enable
+        cp.api_mcp.revoke_mcp_rule(rule_id, _FakeRequest())
+        if how == "rule revoked":
+            return ask, lambda: _tool_rule("create_pull_request", "ask")
+        deny_id = _tool_rule("create_pull_request", "deny").body["id"]
+
+        def restore():
+            cp.api_mcp.revoke_mcp_rule(deny_id, _FakeRequest())
+            _tool_rule("create_pull_request", "ask")
+        return ask, restore
+
+    def test_a_pending_ask_under_a_deny_is_retired_rather_than_left_queued(self):
+        # Its agent is told the ask is final, so a card left in the queue would ask a
+        # human a question whose answer nobody will come back for.
+        for how in ("server disabled", "rule revoked", "rule flipped to deny"):
+            with self.subTest(how=how):
+                ask, restore = self._denies(how)
+                with mock.patch.object(cp.store, "_audit") as audited:
+                    resp = _claim(ask)
+                self.assertEqual(resp.status_code, 409)
+                self.assertEqual(resp.body["status"], "expired")
+                self.assertIs(resp.body["by_policy"], True)
+                self.assertIs(resp.body["lapsed"], False)
+                self.assertTrue(resp.body["terminal"])
+                self.assertFalse(resp.body["spent"])
+                self.assertIn("not releasable (", resp.body["detail"])
+                if how == "server disabled":
+                    self.assertIn("disabled", resp.body["detail"])
+                with cp.store._connect() as conn:
+                    row = conn.execute(
+                        "SELECT status, resolved_by FROM tool_approvals WHERE id=?",
+                        (ask,)).fetchone()
+                self.assertEqual((row["status"], row["resolved_by"]),
+                                 ("expired", None))
+                self.assertNotIn(ask, [a["id"] for a in cp.holds._list_tool_asks()])
+                [call] = audited.call_args_list
+                self.assertEqual(call[0][0], "deny")
+                self.assertEqual(call[1]["stage"], "tool-resume")
+                self.assertEqual(call[1]["approval_id"], ask)
+                self.assertIn(ask, call[1]["reason"])
+                self.assertNotIn("approved", call[1]["reason"])
+                self.assertNotIn("stands", call[1]["reason"])
+                # Closed for the operator too, and for good once policy relents.
+                self.assertEqual(_resolve(ask, "allow").body["status"], "expired")
+                restore()
+                resp = _claim(ask)
+                self.assertEqual(resp.status_code, 409)
+                self.assertEqual(resp.body["status"], "expired")
+                self.assertTrue(resp.body["terminal"])
+                self.assertNotIn("by_policy", resp.body)
+
+    def test_a_retired_ask_charges_no_withdraw_cooldown(self):
+        with mock.patch.object(cp.holds, "MAX_TOOL_PENDING_PER_CLIENT", 1), \
+                mock.patch.object(cp.holds, "TOOL_WITHDRAW_COOLDOWN", 60):
+            ask, restore = self._denies("server disabled")
+            _claim(ask)
+            restore()
+            self.assertEqual(
+                _tool_call(tool="create_pull_request", args={"n": 2})["decision"],
+                "ask")
+
+    def test_an_approval_landing_before_the_retire_is_kept_and_not_released(self):
+        # The human answers between the claim's policy read and its retire. The retire
+        # then changes nothing, and the deny already read still decides: the call must
+        # not run, and the approval is still there for when the server comes back.
+        ask, _ = self._denies("server disabled")
+        retire = cp.holds._retire_tool_ask
+
+        def approved_first(approval_id):
+            self.assertEqual(_resolve(approval_id, "allow").status_code, 200)
+            # Policy relents too, so only the deny already read can still refuse.
+            _enable()
+            return retire(approval_id)
+
+        with mock.patch.object(cp.holds, "_retire_tool_ask",
+                               side_effect=approved_first):
+            resp = _claim(ask)
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.body["status"], "allowed")
+        self.assertIs(resp.body["by_policy"], True)
+        self.assertTrue(resp.body["terminal"])
+        self.assertIn("not releasable (", resp.body["detail"])
+        self.assertIsNone(cp.holds._get_tool_ask(ask)["claimed_at"])
+        self.assertEqual(_claim(ask).status_code, 200)
+
+    def test_a_refusal_landing_before_the_retire_answers_as_the_refusal(self):
+        ask, _ = self._denies("server disabled")
+        retire = cp.holds._retire_tool_ask
+
+        def denied_first(approval_id):
+            self.assertEqual(_resolve(approval_id, "deny").status_code, 200)
+            return retire(approval_id)
+
+        with mock.patch.object(cp.holds, "_retire_tool_ask",
+                               side_effect=denied_first), \
+                mock.patch.object(cp.store, "_audit") as audited:
+            resp = _claim(ask)
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.body["status"], "denied")
+        self.assertTrue(resp.body["terminal"])
+        self.assertNotIn("by_policy", resp.body)
+        # The operator's deny writes its own row; the claim writes none.
+        self.assertEqual([c for c in audited.call_args_list
+                          if c[1].get("stage") == "tool-resume"], [])
+
+    def test_a_closed_or_spent_ask_answers_the_same_whatever_policy_says(self):
+        # Policy decides only whether an approval may still be redeemed; an ask with
+        # nothing left to redeem answers as what it is.
+        denied = self._ask(args={"n": 1})
+        _resolve(denied, "deny")
+        unanswered = self._ask(args={"n": 2})
+        with cp.store._connect() as conn:
+            conn.execute("UPDATE tool_approvals SET deadline=? WHERE id=?",
+                         (time.time() - 1, unanswered))
+            conn.commit()
+        withdrawn = self._ask(args={"n": 3})
+        _withdraw(withdrawn)
+        spent = self._ask(args={"n": 4})
+        _resolve(spent, "allow")
+        self.assertEqual(_claim(spent).status_code, 200)
+        asks = {"denied": denied, "expired": unanswered, "withdrawn": withdrawn,
+                "spent": spent}
+        enabled = {name: _claim(ask) for name, ask in asks.items()}
+        cp.api_mcp.edit_mcp_server("mcp-github", _edit_request(enabled=False),
+                                   _FakeRequest())
+        for name, ask in asks.items():
+            with self.subTest(ask=name):
+                with mock.patch.object(cp.store, "_audit") as audited:
+                    resp = _claim(ask)
+                self.assertEqual((resp.status_code, resp.body),
+                                 (enabled[name].status_code, enabled[name].body))
+                self.assertNotIn("by_policy", resp.body)
+                self.assertTrue(resp.body["terminal"])
+                self.assertIs(resp.body["spent"], name == "spent")
+                self.assertEqual(audited.call_count, 0)
 
 
 class ToolWithdrawTests(_ToolBridgeTestCase):
@@ -6239,13 +6387,16 @@ class ResumeTokenSeparationTests(_ToolBridgeTestCase):
         answers["closed withdraw"] = _withdraw(other)
         refused = _ask_id(self._raise(3))
         _resolve(refused, "allow")
+        retired = _ask_id(self._raise(4))
         cp.api_mcp.edit_mcp_server("mcp-github", _edit_request(enabled=False),
                                    _FakeRequest())
         answers["policy-refused claim"] = _claim(refused)
+        answers["policy-retired claim"] = _claim(retired)
         self.assertEqual(answers["claim"].status_code, 200)
+        self.assertEqual(answers["policy-retired claim"].body["status"], "expired")
         for name, answer in answers.items():
             with self.subTest(answer=name):
-                for approval_id in (ask, other, refused):
+                for approval_id in (ask, other, refused, retired):
                     self.assertNotIn(approval_id, self._text(answer))
 
     def test_an_operator_id_is_unknown_to_claim_and_withdraw_and_says_so(self):
@@ -6279,7 +6430,8 @@ class ResumeTokenSeparationTests(_ToolBridgeTestCase):
     def test_the_token_reaches_no_operator_surface(self):
         # Every row an ask's life writes, through each branch: the hold, a join, a
         # pending poll, a foreign and an id-presented claim, the click, a
-        # policy-refused claim, the release, a withdrawal, and an expiry.
+        # policy-refused claim, a policy-retired one, the release, a withdrawal, and an
+        # expiry.
         tokens = []
         first = self._raise(1)
         tokens.append(first["resume_token"])
@@ -6291,9 +6443,12 @@ class ResumeTokenSeparationTests(_ToolBridgeTestCase):
         _claim_with(ask)
         payload = json.dumps(cp.holds._pending_payload())
         resolved = _resolve(ask, "allow")
+        retired = self._raise(4)
+        tokens.append(retired["resume_token"])
         cp.api_mcp.edit_mcp_server("mcp-github", _edit_request(enabled=False),
                                    _FakeRequest())
         _claim(ask)
+        self.assertEqual(_claim(_ask_id(retired)).body["status"], "expired")
         _enable()
         _claim(ask)
         dropped = self._raise(2)

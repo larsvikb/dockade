@@ -123,9 +123,10 @@ DECIDE_TIMEOUT = float(os.environ.get("GATEWAY_DECIDE_TIMEOUT", "10"))
 #: the wait is latency, and an expired wait returns precisely what a zero wait
 #: returns today.
 MAX_RESUME_WAIT = float(os.environ.get("GATEWAY_MAX_RESUME_WAIT", "45"))
-#: Re-ask cadence while waiting. A pending claim is a read that changes nothing (the
-#: control plane answers "still pending" without touching the row), so this is a
-#: cheap indexed select against a sibling — a second is far below what a human's
+#: Re-ask cadence while waiting. A claim answered as pending is a read that changed
+#: nothing (the control plane answers "still pending" without touching the row; under
+#: a policy that now denies, it retires the ask and answers terminal instead), so this
+#: is a cheap indexed select against a sibling — a second is far below what a human's
 #: click latency makes worth optimising.
 RESUME_POLL_INTERVAL = float(os.environ.get("GATEWAY_RESUME_POLL_INTERVAL", "1"))
 
@@ -602,8 +603,8 @@ _UNSETTLED: set[str] = set()
 
 def _pending(answer: dict) -> bool:
     """A claim answer that means "a human has not decided yet", and nothing else.
-    ``terminal`` is checked as well as the status because a policy refusal carries the
-    ask's own status, which can itself be `pending`."""
+    ``terminal`` is checked as well as the status, so a terminal answer is never read
+    as a delay, whatever status it names."""
     return (not answer.get("ok") and not answer.get("terminal")
             and answer.get("status") == "pending")
 
@@ -640,11 +641,11 @@ def resume(arguments: object, client: str | None) -> dict:
     gap between what was approved and what runs.
 
     MAY WAIT, if the agent asks it to (``wait_seconds``). Re-asking is the whole
-    mechanism — a pending claim is free and changes nothing — so waiting here is the
-    same question the agent would ask by calling again, asked on its behalf. Which of
-    the two happens is the AGENT'S call and deliberately not this module's: only the
-    agent knows whether it has other work to do while a human decides. Zero is the
-    default and is exactly today's behaviour."""
+    mechanism — a claim answered as pending was free and changed nothing — so waiting
+    here is the same question the agent would ask by calling again, asked on its
+    behalf. Which of the two happens is the AGENT'S call and deliberately not this
+    module's: only the agent knows whether it has other work to do while a human
+    decides. Zero is the default and is exactly today's behaviour."""
     resume_token = _resume_token(arguments)
     if resume_token is None:
         return _bad_token(surface.RESUME_TOOL)
@@ -674,7 +675,11 @@ def resume(arguments: object, client: str | None) -> dict:
         # is the one an agent reads, so the machine spellings are rendered here and the
         # rest is passed through; a gateway that echoed every internal string would be
         # making the control plane responsible for wording it cannot see the reader of.
-        detail = (_closed_text(answer)
+        # A refusal BY POLICY carries its reason in the detail, and the status the
+        # ask was left in: for a retired one `expired`, whose text would say nobody
+        # answered rather than why.
+        by_policy = answer.get("by_policy") is True
+        detail = ((by_policy and answer.get("detail")) or _closed_text(answer)
                   or answer.get("detail") or "not claimable")
         if answer.get("terminal"):
             # `denied`, `expired`, or already spent. Said plainly and finally, because

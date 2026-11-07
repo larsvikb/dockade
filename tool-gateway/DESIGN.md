@@ -96,6 +96,8 @@ rule that keeps the category honest: **a native tool must not cause an ungoverne
 effect.** Resume sits precisely on that line, because it does cause one — admissible
 only because the effect is bound to an ask a human explicitly approved, with arguments
 they read. Withdraw meets it from the other side: its only effect is to retire an ask
-the same client raised, which removes capability and never adds any. The next native
+the same client raised, which removes capability and never adds any. Resume may retire
+a pending ask too, when policy now denies its call, admissible for withdraw's reason:
+it only takes capability away. The next native
 tool will inherit neither property, which is why the criterion is written here rather
 than left to be inferred from these two being safe.

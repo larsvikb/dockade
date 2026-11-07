@@ -293,7 +293,8 @@ def tool_claim(resume_token: str, req: ToolResumeRequest) -> JSONResponse:
     or the rule revoked or flipped to `deny`, and none of those touch
     `tool_approvals`. Without this check the switch an operator reaches for would not
     reach the one surface that releases a side effect."""
-    # A PENDING claim writes nothing; it is refused further down, and agents poll it.
+    # A PENDING claim under a rule that still asks writes nothing; it is refused
+    # further down, and agents poll it.
     ask = _own_ask(resume_token, req.client, "claim", "tool-resume")
     if isinstance(ask, JSONResponse):
         return ask
@@ -302,45 +303,24 @@ def tool_claim(resume_token: str, req: ToolResumeRequest) -> JSONResponse:
     # is what the card was raised under.
     client_class = policy._client_class(ask["client"])
 
-    # Policy BEFORE the claim, so a refusal does not consume the grant. A disable
-    # landing between this read and the UPDATE below is the same race a disable
-    # always has with a call already on the wire; closing it here would only move it.
-    decision, why = policy._decide_tool(ask["server"], ask["tool"])
-    if decision == "deny":
-        store._audit("deny", stage="tool-resume", client=ask["client"],
-                     client_class=client_class, server=ask["server"], tool=ask["tool"],
-                     approval_id=approval_id,
-                     reason=f"approved tool ask {approval_id} not released: {why} — "
-                            f"the approval stands, the server's state does not")
-        # TERMINAL, though the state is reversible: if the server comes back on, the
-        # right move is a fresh ``/tool/authorize`` under the new circumstances, not
-        # an agent retrying this one in a loop.
-        return JSONResponse(
-            {"ok": False, "detail": f"not releasable ({why})",
-             "status": ask["status"], "lapsed": holds._grant_lapsed(approval_id),
-             "spent": False, "terminal": True},
-            status_code=409)
+    # Policy only for an ask a claim could still release: one awaiting a human, or an
+    # approval nobody has claimed. Any other ask answers as what it is, whatever
+    # policy now says. BEFORE the claim, so a refusal does not consume the grant. A
+    # disable landing between this read and the UPDATE below is the same race a
+    # disable always has with a call already on the wire; closing it here would only
+    # move it.
+    if ask["status"] == "pending" or (ask["status"] == "allowed"
+                                      and ask["claimed_at"] is None):
+        decision, why = policy._decide_tool(ask["server"], ask["tool"])
+        if decision == "deny":
+            return _refused_by_policy(ask, client_class, why)
 
     # The claim is one conditional UPDATE (`status='allowed' AND claimed_at IS NULL`),
     # so exactly one resumption performs the side effect. Reading the status first
     # would let two concurrent resumptions both read 'allowed' and both proceed.
     claimed = holds._claim_tool_ask(approval_id)
     if claimed is None:
-        current = holds._get_tool_ask(approval_id) or ask
-        # `pending` means come back later; every `_CLOSED` status must read as
-        # terminal, or an agent retries it forever. An approval already claimed is
-        # SPENT, which is not "its call has run": the claim is written before the call,
-        # and a claim whose answer was lost spent the grant with nothing run.
-        spent = current["status"] == "allowed" and current["claimed_at"] is not None
-        return JSONResponse(
-            {"ok": False,
-             "detail": ("this approval has already been claimed, and a claim is "
-                        "single-use"
-                        if spent else
-                        f"not claimable ({current['status']})"),
-             "status": current["status"], "lapsed": holds._grant_lapsed(approval_id),
-             "spent": spent, "terminal": spent or current["status"] in _CLOSED},
-            status_code=409)
+        return _not_claimable(approval_id, holds._get_tool_ask(approval_id) or ask)
 
     # An ALLOW here, when capability is released, as well as the resolve row when a
     # human decided. The gap between the two rows is an approved call that never ran,
@@ -359,6 +339,65 @@ def tool_claim(resume_token: str, req: ToolResumeRequest) -> JSONResponse:
                          # payload that differs from the approved one.
                          "args_json": claimed["args_json"],
                          "claimed_at": claimed["claimed_at"]})
+
+
+def _refused_by_policy(ask: dict, client_class: str, why: str) -> JSONResponse:
+    """The claim's answer when policy now denies the call an ask is for.
+
+    TERMINAL, though the state is reversible: if the server comes back on, the right
+    move is a fresh ``/tool/authorize`` under the new circumstances, not an agent
+    retrying this one in a loop. So a PENDING ask is retired as well, rather than left
+    in the operator's queue as a question whose answer its agent will not come back
+    for. An unclaimed approval is kept: it costs no attention, and the grant window
+    bounds it.
+
+    ``by_policy`` tells the gateway the detail is the reason, not the status."""
+    approval_id = ask["id"]
+    audited = dict(client=ask["client"], client_class=client_class,
+                   server=ask["server"], tool=ask["tool"], approval_id=approval_id)
+    if ask["status"] == "pending":
+        if holds._retire_tool_ask(approval_id):
+            store._audit("deny", stage="tool-resume", **audited,
+                         reason=f"pending tool ask {approval_id} retired unanswered: "
+                                f"{why} — its call will not run under it")
+            return JSONResponse(
+                {"ok": False,
+                 "detail": f"not releasable ({why}); the human is no longer asked",
+                 "status": "expired", "lapsed": False, "spent": False,
+                 "terminal": True, "by_policy": True},
+                status_code=409)
+        # A human answered between the read and the retire. The deny already read
+        # still decides: reading policy again could find it allowing, and this path
+        # must never go on to the claim.
+        ask = holds._get_tool_ask(approval_id) or ask
+        if not (ask["status"] == "allowed" and ask["claimed_at"] is None):
+            return _not_claimable(approval_id, ask)
+    store._audit("deny", stage="tool-resume", **audited,
+                 reason=f"approved tool ask {approval_id} not released: {why} — "
+                        f"the approval stands, the server's state does not")
+    return JSONResponse(
+        {"ok": False, "detail": f"not releasable ({why})", "status": "allowed",
+         "lapsed": False, "spent": False, "terminal": True, "by_policy": True},
+        status_code=409)
+
+
+def _not_claimable(approval_id: str, current: dict) -> JSONResponse:
+    """The claim's answer for an ask it could not take: still pending, closed, or
+    spent."""
+    # `pending` means come back later; every `_CLOSED` status must read as terminal,
+    # or an agent retries it forever. An approval already claimed is SPENT, which is
+    # not "its call has run": the claim is written before the call, and a claim whose
+    # answer was lost spent the grant with nothing run.
+    spent = current["status"] == "allowed" and current["claimed_at"] is not None
+    return JSONResponse(
+        {"ok": False,
+         "detail": ("this approval has already been claimed, and a claim is "
+                    "single-use"
+                    if spent else
+                    f"not claimable ({current['status']})"),
+         "status": current["status"], "lapsed": holds._grant_lapsed(approval_id),
+         "spent": spent, "terminal": spent or current["status"] in _CLOSED},
+        status_code=409)
 
 
 @router.post("/tool/asks/{resume_token}/withdraw")

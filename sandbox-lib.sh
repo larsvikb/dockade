@@ -19,7 +19,7 @@
 # Every such global is named in the function's comment.
 
 # Repo root — the build context for sandbox images (see sc_build_image).
-SANDBOX_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SANDBOX_REPO_ROOT="$(CDPATH='' cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------------------------------------------------------------------------
 # Image build
@@ -122,7 +122,7 @@ _sc_runtime_dir_reason() {
     local real="$1" runtime
     for runtime in /tmp /run /var/run ${XDG_RUNTIME_DIR:+"$XDG_RUNTIME_DIR"}; do
         [[ -d "$runtime" ]] || continue
-        runtime="$(cd "$runtime" && pwd -P)"
+        runtime="$(CDPATH='' cd "$runtime" && pwd -P)"
         if [[ "$real" == "$runtime" || ( "$runtime" != /tmp && "$real" == "$runtime"/* ) ]]; then
             echo "that is $runtime, where host processes keep their sockets."
             return 0
@@ -235,8 +235,8 @@ _sc_warn_credentials() {
 
 sc_guard_workspace() {
     local real_workspace real_home reason
-    real_workspace="$(cd "$1" && pwd -P)"   # canonical, symlinks resolved
-    real_home="$(cd "$HOME" 2>/dev/null && pwd -P || echo "$HOME")"
+    real_workspace="$(CDPATH='' cd "$1" && pwd -P)"   # canonical, symlinks resolved
+    real_home="$(CDPATH='' cd "$HOME" 2>/dev/null && pwd -P || echo "$HOME")"
 
     _sc_deny_workspace() {
         echo "REFUSING to mount workspace: $real_workspace" >&2
@@ -336,9 +336,9 @@ sc_config_home() {
 # runtime directories, where those live, and a shallow scan for any elsewhere.
 _sc_ro_mount_reason() {
     local real="$1" real_home secrets reason hit
-    real_home="$(cd "$HOME" 2>/dev/null && pwd -P || echo "$HOME")"
+    real_home="$(CDPATH='' cd "$HOME" 2>/dev/null && pwd -P || echo "$HOME")"
     secrets="$(sc_config_home)/secrets"
-    [[ -d "$secrets" ]] && secrets="$(cd "$secrets" && pwd -P)"
+    [[ -d "$secrets" ]] && secrets="$(CDPATH='' cd "$secrets" && pwd -P)"
 
     if [[ "$real" == "/" ]]; then
         echo "that is the filesystem root."
@@ -549,7 +549,7 @@ sc_refs() {
         [[ "$path" == "~" || "$path" == "~/"* ]] && path="$HOME${path:1}"
 
         [[ -d "$path" ]] || _sc_deny_ref "'$path' is not a directory."
-        real="$(cd "$path" && pwd -P)"
+        real="$(CDPATH='' cd "$path" && pwd -P)"
         reason="$(_sc_ro_mount_reason "$real")"
         [[ -z "$reason" ]] || _sc_deny_ref "$real: $reason"
         # docker -v splits on ':', so a path holding one would mount something else.

@@ -20,10 +20,17 @@ running it tells you which branch a given host takes.
 The stub records every ``docker`` invocation, so "it refused" is asserted together with
 "it created nothing" — the halves are separable, and a refusal that has already created
 the bridge would be the worse bug.
+
+One class runs the launchers themselves, but only as far as the workspace guard's
+refusal: ``LauncherCdpathTests``. Before the guard they run at most ``sc_jdk_variant``
+and ``sc_clamp_cpus`` (``nproc``), a ``docker`` stub that fails every call comes first
+on ``PATH``, and its log is asserted empty, so a guard that stopped refusing would show
+as a failure rather than as a launch.
 """
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -237,6 +244,16 @@ class WorkspaceGuardTests(unittest.TestCase):
         proc = self.guard(link)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), str(plain))
+
+    def test_cdpath_does_not_steer_a_relative_workspace(self):
+        # With CDPATH a plain `cd app` lands in the decoy and prints it, so
+        # SC_WORKSPACE would be two lines naming the decoy.
+        (self.root / "work" / "app").mkdir(parents=True)
+        decoy = self.root / "decoy"
+        (decoy / "app").mkdir(parents=True)
+        proc = self.guard("app", cwd=self.root / "work", CDPATH=str(decoy))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, f"{self.root / 'work' / 'app'}\n")
 
     def test_a_backup_in_the_workspace_warns_without_refusing(self):
         # Each is a store a restore installs, or the operator's read of one.
@@ -716,14 +733,14 @@ class RefsTests(unittest.TestCase):
         for d in ("tools/dockade", "games/platformer", "a/docs", "b/docs"):
             (self.src / d).mkdir(parents=True)
 
-    def refs(self, value, **env_over):
-        env = {k: v for k, v in os.environ.items() if k != "XDG_RUNTIME_DIR"}
+    def refs(self, value, cwd=None, **env_over):
+        env = {k: v for k, v in os.environ.items() if k not in ("XDG_RUNTIME_DIR", "CDPATH")}
         env.update(HOME=str(self.home), SANDBOX_REFS=value,
                    DOCKADE_CONFIG_HOME=str(self.config))
         env.update(env_over)
         return subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
             [_BASH, "-c", _REFS_HARNESS, "sc_refs", str(LIB)],
-            capture_output=True, text=True, env=env, timeout=60)
+            capture_output=True, text=True, env=env, cwd=cwd, timeout=60)
 
     def mounts(self, value):
         """The ``-v`` operands, after asserting every other word is ``-v``."""
@@ -774,6 +791,35 @@ class RefsTests(unittest.TestCase):
 
     def test_a_missing_directory_is_refused(self):
         self.assertRefused(f"{self.src}/nope", "is not a directory")
+
+    def decoy(self, *names: str) -> str:
+        """A CDPATH entry holding each relative name the test uses, created."""
+        decoy = self.root / "decoy"
+        for name in names:
+            (decoy / name).mkdir(parents=True, exist_ok=True)
+        return str(decoy)
+
+    def test_cdpath_does_not_steer_a_relative_entry(self):
+        # With CDPATH a plain `cd alice` lands in the decoy and prints it, so the
+        # resolved path is two lines that name nothing, and every check passes it.
+        cdpath = self.decoy("alice", "tools/dockade")
+        proc = self.refs("alice", cwd=self.home.parent, CDPATH=cdpath)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("REFUSING to mount ref 'alice'", proc.stderr)
+        self.assertIn(f"  {self.home}: that is your home directory", proc.stderr)
+        proc = self.refs("tools/dockade", cwd=self.src, CDPATH=cdpath)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.splitlines(),
+                         ["-v", f"{self.src}/tools/dockade:/refs/dockade:ro"])
+
+    def test_cdpath_does_not_steer_a_relative_config_home(self):
+        # The secrets path would resolve to two lines, so a ref holding it matched
+        # neither and mounted with only the credentials warning.
+        proc = self.refs(str(self.config), cwd=self.root, DOCKADE_CONFIG_HOME="config",
+                         CDPATH=self.decoy("config/secrets"))
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn(f"the MCP secrets directory ({self.config / 'secrets'}) is inside it",
+                      proc.stderr)
 
     def test_the_read_only_mount_rules_hold(self):
         profile = self.root / "mnt" / "c" / "Users" / "Alice"
@@ -933,6 +979,91 @@ class JdkVariantTests(unittest.TestCase):
                 self.assertEqual(run.status, 1, run.stderr)
                 self.assertIn("REFUSING SANDBOX_JDK=", run.stderr)
                 self.assertEqual(run.docker_calls, [])
+
+
+_LAUNCHERS = ("run-claude-sandbox.sh", "run-opencode-sandbox.sh")
+
+# Logs and fails every call: the launchers below must never get as far as docker.
+_FAILING_DOCKER_STUB = '#!/bin/bash\nprintf \'%s\\n\' "$*" >> "$STUB_LOG"\nexit 1\n'
+
+
+@unittest.skipUnless(_BASH or _STRICT, "bash is not installed")
+class LauncherCdpathTests(unittest.TestCase):
+    """Both launchers, run up to the workspace guard with CDPATH exported.
+
+    The decoy holds every relative name the launch uses, so a plain ``cd`` anywhere on
+    the way lands in it and prints it: the guard then gets a two-line path, or the
+    launcher cannot find ``sandbox-lib.sh``, and either way never refuses ``$HOME``
+    by name."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name).resolve()
+        self.home = self.root / "home" / "alice"
+        self.home.mkdir(parents=True)
+        (self.home.parent / "dockade").symlink_to(ROOT)
+        self.decoy = self.root / "decoy"
+        for name in ("alice", "dockade"):
+            (self.decoy / name).mkdir(parents=True)
+        stubs = self.root / "bin"
+        stubs.mkdir()
+        (stubs / "docker").write_text(_FAILING_DOCKER_STUB)
+        (stubs / "docker").chmod(0o755)
+        self.log = self.root / "docker.log"
+        self.log.touch()
+        self.env = {k: v for k, v in os.environ.items()
+                    if k not in ("ALLOW_UNSAFE_WORKSPACE", "XDG_RUNTIME_DIR",
+                                 "DOCKADE_CONFIG_HOME", "XDG_CONFIG_HOME", "SANDBOX_JDK",
+                                 "SANDBOX_IMAGE", "SANDBOX_REFS")}
+        self.env.update(HOME=str(self.home), CDPATH=str(self.decoy), STUB_LOG=str(self.log),
+                        PATH=f"{stubs}{os.pathsep}{self.env['PATH']}")
+
+    def launch(self, script: str):
+        return subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
+            [_BASH, script, "alice"], capture_output=True, text=True,
+            env=self.env, cwd=self.home.parent, timeout=60)
+
+    def assertRefusedHome(self, proc):
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn(f"REFUSING to mount workspace: {self.home}\n", proc.stderr)
+        self.assertIn("that is your home directory", proc.stderr)
+        self.assertEqual(self.log.read_text(), "", "the launcher reached docker")
+
+    def test_a_relative_workspace_is_taken_from_the_launch_directory(self):
+        for launcher in _LAUNCHERS:
+            with self.subTest(launcher=launcher):
+                self.assertRefusedHome(self.launch(str(ROOT / launcher)))
+
+    def test_a_launcher_run_by_a_relative_path_finds_its_library(self):
+        for launcher in _LAUNCHERS:
+            with self.subTest(launcher=launcher):
+                self.assertRefusedHome(self.launch(f"dockade/{launcher}"))
+
+
+class CdpathStaticTests(unittest.TestCase):
+    """Every ``cd`` in the launchers and ``sandbox-lib.sh`` is ``CDPATH='' cd``.
+
+    An exported CDPATH sends a relative ``cd x`` to a CDPATH entry holding ``x`` before
+    ``$PWD``, and then ``cd`` prints the directory it chose, so ``$(cd x && pwd)`` is a
+    two-line string naming somewhere else and every check against it passes without a
+    word. ``cd ./x`` and absolute paths are immune, but nothing at these sites keeps
+    their arguments in that shape. The behavioural tests reach most sites; this pins the
+    ones they cannot (``SANDBOX_REPO_ROOT`` is reached only by a relative ``source``,
+    the runtime directory and ``real_home`` only by a relative ``XDG_RUNTIME_DIR`` or
+    ``HOME``) and any ``cd`` added later. ``pushd`` searches CDPATH the same way, so it
+    is held to the same form."""
+
+    def test_every_cd_clears_cdpath(self):
+        changes_dir = re.compile(r"(?<![\w-])(cd|pushd)(?=\s|$)")
+        for name in ("sandbox-lib.sh", *_LAUNCHERS):
+            for number, line in enumerate((ROOT / name).read_text().splitlines(), 1):
+                if line.lstrip().startswith("#"):
+                    continue
+                for match in changes_dir.finditer(line):
+                    with self.subTest(at=f"{name}:{number}"):
+                        self.assertTrue(line[:match.start()].endswith("CDPATH='' "),
+                                        f"{name}:{number}: {line.strip()}")
 
 
 if __name__ == "__main__":

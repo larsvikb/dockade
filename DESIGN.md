@@ -2347,7 +2347,9 @@ Deliberately untested surface is low-weight I/O: `_audit` sinks,
 (`.github/workflows/check.yml`), so there is one definition of "does this repo pass" and
 a CI failure reproduces locally with `make check-strict`. Two parallel jobs — lint +
 consistency + tests (about a minute) and the build verification of every image — so a
-shellcheck typo is not queued behind an image build.
+shellcheck typo is not queued behind an image build. A third, beside them, runs the
+approval page's browser tests (`make ui-test`), which `check` leaves out so that it stays
+browser-free (`control-plane-ui/DESIGN.md`).
 
 **The build job then runs `make check-boundary`, which is the only automated evidence
 that containment still holds.** Everything else in the gate reads the boundary rather
@@ -2357,7 +2359,7 @@ reads the compose files as text. Between them they assert what the boundary is
 — the strongest containment evidence the repo has was a manual `make boundary`. So the
 job stands the stack up and runs `boundary-check.sh` inside a real tier-1 sandbox, from
 the agent's own security context. It rides on the build job because that job has already
-compiled the images; a third job shares no layer cache and would rebuild every image
+compiled the images; a job of its own shares no layer cache and would rebuild every image
 to run a two-minute check. What CI cannot cover stays manual and is named in the
 workflow: tier 2 needs a GPU, standalone mode needs a host with no compose infra.
 

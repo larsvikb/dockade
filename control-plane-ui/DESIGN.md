@@ -240,14 +240,16 @@ alternative — making omission impossible — is what was done for `markStale` 
 `shouldSweep` keeps its primitive signature because that is what makes it cheap to
 assert at the boundaries.
 
-**`start()` has no test in the suite, and that is a decision rather than a gap.** Its
-DOM path is covered in the suite only by the guards above and the free-name check
-below; the card wiring (countdown, confirm panel, pattern select, dwell) was checked
-once against a throwaway stub DOM under node and not kept. The cost is real and measurable: mutation testing was run twice across this work,
-and every mutation inside a pure helper was caught while every mutation inside `start()`
-survived. So the position needs an argument, not a shrug.
+**`start()` has expected-value tests in a browser, and `make test` stays browser-free.**
+`tests/ui-harness/approval.test.js` drives the approval page's cards against values
+worked out by hand from the harness's fixture and this spec: each persist pattern's
+preview against the select's value and the pattern its confirm sends, the confirm
+panels' cancel and confirm, the pins sent, both kinds of countdown, and what a card says
+once its resolve is answered. In `make test` its DOM path has only the guards above and
+the free-name check below. Mutation testing is what showed the gap: every mutation in a
+pure helper was caught and every one inside `start()` survived.
 
-The argument is what a frontend bug can and cannot do here. It **cannot** produce an
+What those tests guard against is bounded by what a frontend bug can and cannot do here. It **cannot** produce an
 out-of-policy rule: `resolve` validates the action against a fixed set and the pattern
 against `_persist_candidates` re-derived from the *durable approval row*, never from
 anything the page sends, so no breakage in the UI reaches an outcome a hand-crafted curl
@@ -260,23 +262,25 @@ Three things already act on exactly that risk, and the load-bearing one is teste
 card's outcome message reports `d.pattern` **from the backend response**, not from the
 click, so a wrong send announces itself in words at the moment of the mistake, while the
 operator is still looking (`test_the_response_names_the_pattern_that_was_stored` asserts
-the backend echoes what it stored). The audit reason then says whether standing policy
+the backend echoes what it stored, and `approval.test.js` that the card says the pattern
+the response names when it differs from the one clicked). The audit reason then says whether standing policy
 was written, and the Policy view shows the rule with its scope named. That is the same
 **detection-where-prevention-is-not-available** pattern this repo already applies to
 host-local approval forgery — see "Approval provenance — detection where prevention is
 not available" in `DESIGN.md`.
 
-The alternatives were weighed and declined. A hand-rolled stub DOM would catch the
-value-flow class but largely asserts its own shape and needs editing on every markup
-change. A headless browser is the only thing that catches *layout-level* deception (a
-warning that renders invisible, a confirm button that lands under the pointer), but it
-does not merely add a dependency — it breaks the property that this suite runs
-identically on a host, in CI, **and inside the sandbox image**. The image now carries
-a headless browser (`claude-sandbox/Dockerfile`), so that third leg holds; the other two
-do not by themselves — a host without a browser skips such a test, and CI's strict mode
-(`DOCKADE_REQUIRE_TOOLS`) fails it, which is the "silently checks nothing" failure that
-mode exists to prevent. Revisit if the UI ever gains a control whose mistake the backend
-cannot refuse and the response cannot report.
+**Why the browser tests are a target of their own, `make ui-test`.** A hand-rolled stub
+DOM would catch the value-flow class but largely asserts its own shape and needs editing
+on every markup change; a headless browser runs the page itself. In `make test` it would
+break the property that this suite runs identically on a host, in CI **and inside the
+sandbox image**: the image carries a headless browser (`claude-sandbox/Dockerfile`), but
+a host without one would skip such a test, and CI's strict mode (`DOCKADE_REQUIRE_TOOLS`)
+would fail it, which is the "silently checks nothing" failure that mode exists to
+prevent. So `make ui-test` SKIPs without node or a browser, FAILs under strict mode, and
+CI runs it in a job of its own on the browser build the pinned `playwright-core` names.
+The tests assert on DOM, text and requests, never pixels, so layout-level deception (a
+warning that renders invisible, a confirm button that lands under the pointer) is still
+theirs to miss.
 
 **Moving `start()`'s code is checked twice: by comparison, outside the suite, and by
 name, inside it.** The `app.js` split moves exactly that code, so it does get a
@@ -284,7 +288,9 @@ browser, as `make ui-diff` rather than a test in `make test`. `tests/ui-harness/
 against this one, with the backend faked and the clock frozen, and diffs what each page
 did: its DOM after every step, every request it sent, everything on its console. The
 oracle is the previous page, so there are no expected values to keep up, and the
-question only has an answer on a branch — which is what keeps it out of `check`.
+question only has an answer on a branch — which is what keeps it out of `check`. The
+page's expected values are `make ui-test`'s, above; the two share the harness's page
+setup (`tests/ui-harness/page.js`).
 Neither the host nor CI runs it; a move PR runs it in the tier-1 image.
 Each move PR adds the steps that exercise its surface to
 `tests/ui-harness/scenario.js`; the tasks page has its own

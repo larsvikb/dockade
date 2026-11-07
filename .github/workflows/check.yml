@@ -10,18 +10,20 @@
 # DOCKADE_REQUIRE_TOOLS=1 is set for every job, turning a missing tool into a
 # failure. See the REQUIRE_TOOLS comment in the Makefile.
 #
-# Split into two jobs on purpose. `checks` finishes in about a minute; `build`
+# Split into three jobs on purpose. `checks` finishes in about a minute; `build`
 # compiles every image, two of which are Debian-based sandbox tiers that apt-install
 # a whole toolchain. Running them in parallel means a shellcheck typo is not queued
-# behind a ten-minute image build.
+# behind a ten-minute image build. `ui-e2e` runs the approval page in a headless
+# browser against expected values (`make ui-test`), which `checks` leaves out because
+# `make test` is browser-free by decision (control-plane-ui/DESIGN.md).
 #
 # The `build` job then STANDS THE STACK UP and runs boundary-check.sh in a real
 # sandbox, which is the only automated evidence this repo has that the containment
 # boundary still holds — init-firewall.sh is otherwise covered by shellcheck, a
 # manual `make boundary`, and the blocks tests/test_init_firewall.py lifts out and
 # runs (its docstring names them), i.e. a firewall regression elsewhere in it is
-# invisible to every other check here. It rides on `build` rather than a third
-# job because that job has already compiled the images into this runner's daemon;
+# invisible to every other check here. It rides on `build` rather than a job of
+# its own because that job has already compiled the images into this runner's daemon;
 # a separate job shares no layer cache and would rebuild every image from scratch
 # to run a two-minute check.
 name: check
@@ -243,3 +245,58 @@ jobs:
       - name: Governance-plane logs on failure
         if: failure()
         run: docker compose logs --no-color --tail=200 || true
+
+  ui-e2e:
+    name: the approval page in a browser, against expected values
+    runs-on: ubuntu-latest
+    # A wedged browser hangs rather than fails; each test has its own timeout, and this
+    # is the runaway guard over the install and the run together.
+    timeout-minutes: 15
+    env:
+      DOCKADE_REQUIRE_TOOLS: 1
+    steps:
+      # Credentials not persisted, as in the jobs above: nothing here needs git auth.
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # The browser is the Chrome for Testing build the pinned playwright-core names,
+      # downloaded through Playwright's CDN, so it moves only when the harness's
+      # lockfile does, as hadolint moves only with claude-sandbox/Dockerfile. The
+      # revision is pinned by the lockfile's integrity hash on playwright-core; the
+      # binary's own hash is not, since none is published beside it and pinning the one
+      # a run prints would make every lockfile bump a hash edit too. It is printed, so
+      # a run's verdict can be traced to the bytes that produced it. --with-deps apt-installs the libraries the shell links
+      # against, which the runner image does not promise to keep.
+      #
+      # Into a directory of this job's own, so exactly one shell is found there.
+      - name: Install playwright-core and its headless shell (pinned by the harness's lockfile)
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/ms-playwright
+        run: |
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci --prefix tests/ui-harness \
+            --no-audit --no-fund --ignore-scripts
+          node tests/ui-harness/node_modules/playwright-core/cli.js \
+            install --with-deps --only-shell chromium
+          found=$(find "$PLAYWRIGHT_BROWSERS_PATH" -type f -name chrome-headless-shell)
+          if [ "$(printf '%s\n' "$found" | grep -c .)" != 1 ]; then
+            echo "expected one chrome-headless-shell under $PLAYWRIGHT_BROWSERS_PATH," >&2
+            echo "found: ${found:-none}" >&2
+            exit 1
+          fi
+          sha256sum "$found"
+          echo "UI_HARNESS_BROWSER=$found" >> "$GITHUB_ENV"
+
+      # The container runs the same tests on Debian's shell, a different version
+      # from this one. The tests assert on DOM, text and requests, never pixels, so a
+      # split verdict between the two is a finding against a test; these lines are
+      # what tells the two runs apart.
+      - name: Toolchain versions
+        run: |
+          node --version
+          pkg=./tests/ui-harness/node_modules/playwright-core/package.json
+          echo "playwright-core $(node -p "require('$pkg').version")"
+          "$UI_HARNESS_BROWSER" --version
+
+      - name: make ui-test
+        run: make ui-test

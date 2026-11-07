@@ -1,5 +1,5 @@
 ---
-name: reviewer
+name: commit-reviewer
 description: Briefed by the review-before-push skill. Fresh-context review of one dockade commit before it is pushed; returns its findings in its final message.
 disallowedTools: Edit, Write, NotebookEdit, Agent, Skill
 ---

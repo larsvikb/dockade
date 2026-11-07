@@ -410,11 +410,16 @@ def revoke_lease(lease_id: int, request: Request) -> JSONResponse:
     actor = provenance._actor(request)
     now = time.time()
     with store._connect() as conn:
+        # One write transaction, so the row the audit describes is the row deleted: a
+        # second tab's revoke or the grant path's expired-lease sweep
+        # (api_approvals.resolve) could otherwise delete it in between.
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT host, client_class, expires_at, approval_id FROM leases "
             "WHERE id=?",
             (lease_id,)).fetchone()
         if row is None:
+            conn.rollback()
             return JSONResponse({"ok": False, "detail": "unknown lease"},
                                 status_code=404)
         conn.execute("DELETE FROM leases WHERE id=?", (lease_id,))

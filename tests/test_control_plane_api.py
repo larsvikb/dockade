@@ -3218,6 +3218,8 @@ class LeaseRevokeTests(_CPTestCase):
     than a safety floor — without it a lease can only be waited out, and the default
     could not have been half an hour."""
 
+    audits = True
+
     def _insert(self, host, offset, client_class=CLASS):
         now = time.time()
         with cp.store._connect() as conn:
@@ -3302,6 +3304,83 @@ class LeaseRevokeTests(_CPTestCase):
         self.assertEqual(
             [r["host"] for r in cp.api_egress.api_leases()], ["keep.example.com"])
         self.assertTrue(keep)
+
+    def _revoke_with_a_delete_after_the_read(self, lease_id, interloper, params):
+        """Revoke, with another writer's ``interloper`` DELETE tried right after the
+        revoke's own SELECT. Returns the response and whether the delete landed, or
+        None if the hook never fired. The wrapper is McpToolRuleRevokeTests's."""
+        landed = []
+
+        class _DeletesAfterTheRead:
+            def __init__(self, conn):
+                object.__setattr__(self, "_conn", conn)
+
+            def execute(self, sql, *a):
+                cur = self._conn.execute(sql, *a)
+                if not landed and sql.startswith("SELECT host, client_class, "
+                                                 "expires_at, approval_id FROM leases"):
+                    other = sqlite3.connect(cp.store.DB_PATH, timeout=0)
+                    try:
+                        other.execute(interloper, params)
+                        other.commit()
+                        landed.append(True)
+                    except sqlite3.OperationalError as e:
+                        if e.sqlite_errorcode & 0xFF != sqlite3.SQLITE_BUSY:
+                            raise
+                        landed.append(False)
+                    finally:
+                        other.close()
+                return cur
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+            def __setattr__(self, name, value):
+                setattr(self._conn, name, value)
+
+            def __enter__(self):
+                self._conn.__enter__()
+                return self
+
+            def __exit__(self, *exc):
+                return self._conn.__exit__(*exc)
+
+        real_connect = cp.store._connect
+        with mock.patch.object(cp.store, "_connect",
+                               lambda: _DeletesAfterTheRead(real_connect())):
+            resp = cp.api_egress.revoke_lease(lease_id, _FakeRequest())
+        return resp, (landed[0] if landed else None)
+
+    def _revokes_audited(self, host):
+        with cp.store._connect() as conn:
+            return conn.execute("SELECT COUNT(*) FROM audit WHERE kind='revoke' "
+                                "AND host=?", (host,)).fetchone()[0]
+
+    def test_a_delete_between_the_read_and_the_delete_cannot_land(self):
+        # The two other writers that delete leases: a second tab's revoke, and the
+        # grant path's sweep of expired ones, which only an expired lease meets.
+        for name, host, offset, interloper in (
+                ("revoke", "race.example.com", 900, "DELETE FROM leases WHERE id=?"),
+                ("sweep", "swept.example.com", -5,
+                 "DELETE FROM leases WHERE expires_at <= ?")):
+            with self.subTest(interloper=name):
+                lease_id = self._insert(host, offset)
+                params = (lease_id,) if name == "revoke" else (time.time(),)
+                resp, landed = self._revoke_with_a_delete_after_the_read(
+                    lease_id, interloper, params)
+                self.assertIsNotNone(landed, "the hook never saw the revoke's SELECT")
+                self.assertFalse(landed,
+                                 "the delete landed between the read and the delete")
+                self.assertEqual(resp.status_code, 200)
+                self.assertEqual(self._revokes_audited(host), 1)
+
+    def test_the_second_revoke_of_a_lease_is_a_404_and_audits_nothing(self):
+        lease_id = self._insert("twice.example.com", 900)
+        self.assertEqual(
+            cp.api_egress.revoke_lease(lease_id, _FakeRequest()).status_code, 200)
+        resp = cp.api_egress.revoke_lease(lease_id, _FakeRequest())
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(self._revokes_audited("twice.example.com"), 1)
 
 
 class ConfigViewTests(_CPTestCase):

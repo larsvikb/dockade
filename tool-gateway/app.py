@@ -366,7 +366,14 @@ def _reconcile_once(enumerated, reachable, deadline):
             # listing is the one consumer served from this process's own memory,
             # so it is the one that must not be left a reconcile behind by a
             # failure in the reporting below.
-            surface.publish(roster, results)
+            #
+            # What it withheld is told before the report, so a report that raises
+            # cannot swallow it.
+            for server, tool, why in surface.publish(roster, results):
+                print(f"tool-gateway: {surface.exposed_name(server, tool)} is not in "
+                      f"the agent's tool list: its description or input schema holds "
+                      f"{why}, which the reply cannot carry. Calls to it are still "
+                      f"decided by its rule.", flush=True)
             for line in discovery.format_report(results):
                 print(line, flush=True)
             # Pushed on the same trigger as the report, because they are the same

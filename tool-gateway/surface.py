@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import re
 
+import protocol
+
 #: What joins a server name to a tool name in what the agent sees. The agent talks to
 #: ONE MCP server — this gateway — so names from several backing servers land in one
 #: namespace and `pull_request_read` on two servers would be one name serving two
@@ -186,8 +188,10 @@ NATIVE_TOOLS = [{
         "required": ["resume_token"]}}]
 
 
-def curate(roster: list[dict], enumerated: dict[str, list[dict]]) -> list[dict]:
-    """The `tools/list` payload: every ruled-and-present tool, under its exposed name.
+def curate(roster: list[dict], enumerated: dict[str, list[dict]]
+           ) -> tuple[list[dict], list[tuple[str, str, str]]]:
+    """The `tools/list` payload: every ruled-and-present tool, under its exposed name;
+    and ``(server, tool, why)`` for each such tool withheld as unsendable.
 
     ``roster`` is the control plane's answer — enabled servers and their rules.
     ``enumerated`` is what each server said when the gateway dialled it. BOTH are
@@ -205,8 +209,20 @@ def curate(roster: list[dict], enumerated: dict[str, list[dict]]) -> list[dict]:
 
     Sorted by exposed name so the list is stable across reconciles. An order that
     followed enumeration would churn a session's tool list for no reason an operator
-    changed."""
-    listing = []
+    changed.
+
+    SHOWN ONLY IF SENDABLE. Each entry is test-encoded with ``protocol.encode``, the
+    serializer `/mcp` sends the reply in, and one it refuses is withheld: a NaN, an
+    infinity (``1e999`` reads as one) or a lone surrogate that ``json.loads`` let
+    through from a server. Otherwise one server's metadata fails the whole reply and
+    the agent loses every server's tools. The rule is encode's own, so it cannot drift
+    from what the reply refuses. The tool, not its server, and dropped, not repaired:
+    withholding grants and removes nothing (tool-gateway/DESIGN.md, "Two axes, not
+    one"), so taking a server's sendable tools with it buys no safety, and a repaired
+    schema would be one the server never published. Execution reads the unfiltered
+    enumeration, so a withheld tool keeps its schema and a call to it is decided by
+    its rule."""
+    listing, withheld = [], []
     for entry in roster:
         server = entry.get("server") or ""
         actions = {rule["tool"]: rule["action"] for rule in entry.get("tools") or []}
@@ -215,11 +231,25 @@ def curate(roster: list[dict], enumerated: dict[str, list[dict]]) -> list[dict]:
             if action not in ("allow", "ask"):
                 continue
             description = tool.get("description") or ""
-            listing.append({"name": exposed_name(server, tool["name"]),
-                            "description": (ASK_NOTICE + description
-                                            if action == "ask" else description),
-                            "inputSchema": tool.get("inputSchema") or {"type": "object"}})
-    return sorted(listing, key=lambda tool: tool["name"])
+            served = {"name": exposed_name(server, tool["name"]),
+                      "description": (ASK_NOTICE + description
+                                      if action == "ask" else description),
+                      "inputSchema": tool.get("inputSchema") or {"type": "object"}}
+            try:
+                protocol.encode(served)
+            except ValueError as exc:
+                withheld.append((server, tool["name"], _unsendable(exc)))
+                continue
+            listing.append(served)
+    return sorted(listing, key=lambda tool: tool["name"]), sorted(withheld)
+
+
+def _unsendable(exc: ValueError) -> str:
+    """Why ``protocol.encode`` refused an entry, in fixed words that quote none of it."""
+    # `UnicodeEncodeError` is a `ValueError`, so it is asked about first.
+    if isinstance(exc, UnicodeEncodeError):
+        return "a lone surrogate"
+    return "NaN or infinity"
 
 
 #: The last thing each server said it exposes, whether or not this round reached it,
@@ -239,8 +269,9 @@ _LISTING: list[dict] = []
 _SERVERS: dict[str, dict] = {}
 
 
-def publish(roster: list[dict], results: list[dict]) -> None:
-    """Record what this reconcile saw and rebuild the listing from it.
+def publish(roster: list[dict], results: list[dict]) -> list[tuple[str, str, str]]:
+    """Record what this reconcile saw and rebuild the listing from it. Returns what
+    ``curate`` withheld as unsendable, for the caller to tell the operator.
 
     A server that could not be enumerated KEEPS its previous tools. The alternative —
     an unreachable server emptying out of the listing — would make a restarting
@@ -262,14 +293,17 @@ def publish(roster: list[dict], results: list[dict]) -> None:
         # than sending an empty list, precisely so this can tell the two apart.
         if "tools" in result:
             enumerated[result["server"]] = result["tools"]
+    # Built before either name is rebound, so a raise cannot leave the two out of step.
+    listing, withheld = curate(roster, enumerated)
     _ENUMERATED = enumerated
-    _LISTING = curate(roster, enumerated)
+    _LISTING = listing
     # The roster itself, kept because EXECUTION needs the auth descriptor and the
     # endpoint, and the listing carries neither. Rebuilt outright rather than merged:
     # unlike the enumeration above, a server missing here is missing because the
     # authority said so, and holding a descriptor for a server an operator disabled
     # would be keeping the means to dial something we have been told not to.
     _SERVERS = {entry["server"]: entry for entry in roster if entry.get("server")}
+    return withheld
 
 
 def listing() -> list[dict]:

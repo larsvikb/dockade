@@ -146,7 +146,10 @@ def tool_authorize(req: ToolCallRequest) -> dict:
             # ABSOLUTE, like every other time in a payload here: a remaining-seconds
             # field would tick, which turns the SSE change-detector into a 1 Hz
             # emitter and gives the gateway a number that is stale on arrival.
-            "deadline": ask.deadline, "joined": ask.joined}
+            "deadline": ask.deadline, "joined": ask.joined,
+            # How long an approval stays redeemable once given. A duration, which is
+            # fine here because it does not tick: the same number on every answer.
+            "grant_window": holds.TOOL_GRANT_TIMEOUT}
 
 
 @router.get("/tool/roster")
@@ -306,7 +309,8 @@ def tool_claim(resume_token: str, req: ToolResumeRequest) -> JSONResponse:
         # an agent retrying this one in a loop.
         return JSONResponse(
             {"ok": False, "detail": f"not releasable ({why})",
-             "status": ask["status"], "spent": False, "terminal": True},
+             "status": ask["status"], "lapsed": holds._grant_lapsed(approval_id),
+             "spent": False, "terminal": True},
             status_code=409)
 
     # The claim is one conditional UPDATE (`status='allowed' AND claimed_at IS NULL`),
@@ -326,8 +330,8 @@ def tool_claim(resume_token: str, req: ToolResumeRequest) -> JSONResponse:
                         "single-use"
                         if spent else
                         f"not claimable ({current['status']})"),
-             "status": current["status"], "spent": spent,
-             "terminal": spent or current["status"] in _CLOSED},
+             "status": current["status"], "lapsed": holds._grant_lapsed(approval_id),
+             "spent": spent, "terminal": spent or current["status"] in _CLOSED},
             status_code=409)
 
     # An ALLOW here, when capability is released, as well as the resolve row when a
@@ -372,7 +376,8 @@ def tool_withdraw(resume_token: str, req: ToolResumeRequest) -> JSONResponse:
             {"ok": False,
              "detail": ("this approval was already claimed, so its call may have run"
                         if spent else f"not withdrawable ({current['status']})"),
-             "status": current["status"], "spent": spent, "terminal": True},
+             "status": current["status"], "lapsed": holds._grant_lapsed(approval_id),
+             "spent": spent, "terminal": True},
             status_code=409)
     # Its own word rather than `revoke`, which takes back a standing rule: this is the
     # agent taking back its own question.
@@ -382,5 +387,7 @@ def tool_withdraw(resume_token: str, req: ToolResumeRequest) -> JSONResponse:
                  reason=f"tool ask {approval_id} withdrawn by the agent while "
                         f"{ask['status']}; {ask['tool']} on {ask['server']} will not "
                         f"run under it")
-    return JSONResponse({"ok": True, "status": "withdrawn", "spent": False,
-                         "terminal": True})
+    # ``was`` is the status the audit row above prints, so the agent and the operator
+    # are told the same thing: whether a human had already approved what was dropped.
+    return JSONResponse({"ok": True, "status": "withdrawn", "was": ask["status"],
+                         "spent": False, "terminal": True})

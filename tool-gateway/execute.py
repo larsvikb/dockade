@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import math
 import os
 import re
 import time
@@ -75,6 +76,11 @@ _TERMINAL_TEXT = {
     "expired": "This request expired before anyone answered it",
     "withdrawn": "This request was withdrawn",
 }
+
+#: An ``expired`` ask a human had approved: the grant lapsed unclaimed. Its own
+#: constant rather than a key above, because ``_TERMINAL_TEXT`` is keyed on real
+#: statuses and the row's status is still ``expired``; ``_closed_text`` picks it.
+_LAPSED_TEXT = "A human approved this request, but the approval lapsed before it was resumed"
 
 #: How long a tool call may take. Its own number, an order of magnitude above
 #: ``discovery.TIMEOUT``, because the two wait for different things: enumeration is a
@@ -442,6 +448,7 @@ def call(name: str, arguments: object, client: str | None) -> dict:
             f"same human. If you no longer want the call, {surface.WITHDRAW_TOOL} "
             f"with the same token takes the question back."
             + _answer_window(answer.get("deadline"), time.time())
+            + _grant_window(answer.get("grant_window"))
             + ("\nAn identical request was already waiting, and this joined it."
                if answer.get("joined") else ""))
     # Every other answer is a deny, INCLUDING one this code does not recognise. The
@@ -480,6 +487,40 @@ def _answer_window(deadline: object, now: float) -> str:
         left = " ".join(parts) + " from now"
     return (f"\nA human can answer until {instant} ({left}); if none has by then, the "
             f"question expires and the call is refused.")
+
+
+def _grant_window(seconds: object) -> str:
+    """The sentence saying how long an approval stays redeemable, or "" if ``seconds``
+    is not a usable duration.
+
+    Worded as ``_answer_window``'s time left, truncated, with seconds under a minute.
+    It promises no new question once the approval lapses: a pinned approval leaves
+    its pin, which may let the same call through again without one.
+
+    Wording, not authority: a missing or malformed value drops the sentence only."""
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) \
+            or not math.isfinite(seconds) or seconds < 1:
+        return ""
+    hours, minutes = divmod(int(seconds // 60), 60)
+    parts = ([_count(hours, "hour")] if hours else []) \
+        + ([_count(minutes, "minute")] if minutes else [])
+    within = " ".join(parts) if parts else _count(int(seconds), "second")
+    return (f"\nOnce a human approves, resume within {within}; an approval not "
+            f"resumed by then lapses, and nothing runs under it.")
+
+
+def _lapsed(answer: dict) -> bool:
+    """True if a refusal is a lapsed grant: approved, then not resumed in time.
+
+    Both it and an unanswered ask are ``expired``, and only the control plane's
+    ``lapsed`` flag differs. The flag counts only beside ``expired`` and only as
+    ``True``, so a malformed one reads as the status alone."""
+    return answer.get("status") == "expired" and answer.get("lapsed") is True
+
+
+def _closed_text(answer: dict) -> str | None:
+    """The prose for a closed ask's answer, or None if its status has none here."""
+    return _LAPSED_TEXT if _lapsed(answer) else _TERMINAL_TEXT.get(answer.get("status"))
 
 
 def _count(n: int, unit: str) -> str:
@@ -625,7 +666,7 @@ def resume(arguments: object, client: str | None) -> dict:
         # is the one an agent reads, so the machine spellings are rendered here and the
         # rest is passed through; a gateway that echoed every internal string would be
         # making the control plane responsible for wording it cannot see the reader of.
-        detail = (_TERMINAL_TEXT.get(answer.get("status"))
+        detail = (_closed_text(answer)
                   or answer.get("detail") or "not claimable")
         if answer.get("terminal"):
             # `denied`, `expired`, or already spent. Said plainly and finally, because
@@ -634,10 +675,14 @@ def resume(arguments: object, client: str | None) -> dict:
                     "spent by that claim without its call running."
                     if answer.get("spent") and resume_token in _UNSETTLED else "")
             _UNSETTLED.discard(resume_token)
+            # A lapsed approval may have left a pin, which lets the same call through
+            # again with no question: the tail must not promise one.
+            again = ("policy decides it afresh, and it may need a new approval"
+                     if _lapsed(answer) else "that raises a new question for the human")
             return text_result(
                 f"{detail}.{lost} This is final — {resume_token} will not become "
                 f"runnable, so do not retry it. Call the tool again if the work is "
-                f"still needed; that raises a new question for the human.",
+                f"still needed; {again}.",
                 is_error=True)
         if not _pending(answer):
             # Neither a verdict nor a delay. Reading it as pending would tell the agent
@@ -701,20 +746,25 @@ def withdraw(arguments: object, client: str | None) -> dict:
             f"({exc}). Nothing ran; try again — withdrawing twice is harmless.",
             is_error=True)
     if answer.get("ok"):
+        if answer.get("was") == "allowed":
+            # The human had already answered: what was dropped is their approval.
+            return text_result(
+                f"Withdrawn: {resume_token}. The approval a human gave is dropped, and "
+                f"nothing will run under this token.")
         return text_result(
             f"Withdrawn: {resume_token}. The human is no longer asked, and nothing will "
             f"run under this token.")
-    status = answer.get("status")
     if answer.get("spent"):
         # The one answer that is not "it is gone": the claim is written before the call,
         # so the agent must find out from the result of that resume whether it ran.
         return text_result(
             f"{resume_token} was already resumed, so its call may have run; withdrawing "
             f"it changed nothing.", is_error=True)
-    if status in _TERMINAL_TEXT:
+    closed = _closed_text(answer)
+    if closed:
         # Closed already, which is what the agent wanted: not an error.
         return text_result(
-            f"{_TERMINAL_TEXT[status]}, so there was nothing left to withdraw. "
+            f"{closed}, so there was nothing left to withdraw. "
             f"Nothing will run under {resume_token}.")
     return text_result(
         f"{answer.get('detail') or 'not withdrawable'}: {resume_token}.", is_error=True)

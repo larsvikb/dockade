@@ -330,6 +330,9 @@ def load_surface() -> types.ModuleType:
     Fresh for the reason ``load_inventory`` is: the published listing is module-level
     state because one thread writes it and another serves from it, so a shared instance
     would let one test's roster answer another's ``listing()``."""
+    pkg_dir = str(ROOT / "tool-gateway")
+    if pkg_dir not in sys.path:
+        sys.path.insert(0, pkg_dir)
     return _load(f"dockade_surface_{len(sys.modules)}", "tool-gateway/surface.py")
 
 

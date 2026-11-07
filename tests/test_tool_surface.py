@@ -77,7 +77,7 @@ class NameTests(unittest.TestCase):
     def test_every_name_the_listing_produces_decodes_back_to_its_pair(self):
         # The property, asserted over the real curated output rather than over hand-
         # written strings: whatever curation can emit, the call path can resolve.
-        listing = self.surface.curate(ROSTER, {"mcp-github": EXPOSED})
+        listing, _withheld = self.surface.curate(ROSTER, {"mcp-github": EXPOSED})
         self.assertTrue(listing)  # a vacuous pass here would hide everything below
         for tool in listing:
             server, name = self.surface.split_exposed(tool["name"])
@@ -136,7 +136,7 @@ class NameTests(unittest.TestCase):
         # was enumerated last would silently decide the other's policy.
         roster = [{"server": "mcp-github", "tools": [{"tool": "search", "action": "allow"}]},
                   {"server": "mcp-jira", "tools": [{"tool": "search", "action": "deny"}]}]
-        listing = self.surface.curate(
+        listing, _withheld = self.surface.curate(
             roster, {"mcp-github": [{"name": "search", "inputSchema": {}}],
                      "mcp-jira": [{"name": "search", "inputSchema": {}}]})
         self.assertEqual([t["name"] for t in listing], ["mcp-github__search"])
@@ -146,7 +146,7 @@ class CurationTests(unittest.TestCase):
 
     def setUp(self):
         self.surface = load_surface()
-        self.listing = self.surface.curate(ROSTER, {"mcp-github": EXPOSED})
+        self.listing, _withheld = self.surface.curate(ROSTER, {"mcp-github": EXPOSED})
         self.names = [tool["name"] for tool in self.listing]
 
     def test_allow_and_ask_are_both_shown(self):
@@ -202,14 +202,14 @@ class CurationTests(unittest.TestCase):
     def test_the_order_is_stable_rather_than_enumeration_order(self):
         # A list that churned with enumeration order would move a session's tool set
         # for no reason an operator changed.
-        reversed_listing = self.surface.curate(ROSTER,
-                                               {"mcp-github": list(reversed(EXPOSED))})
+        reversed_listing, _withheld = self.surface.curate(
+            ROSTER, {"mcp-github": list(reversed(EXPOSED))})
         self.assertEqual([t["name"] for t in reversed_listing], self.names)
 
     def test_a_server_absent_from_the_roster_contributes_nothing(self):
         # The roster is the authority on which servers are enabled. Tools remembered
         # for a server an operator switched off must not be shown.
-        listing = self.surface.curate([], {"mcp-github": EXPOSED})
+        listing, _withheld = self.surface.curate([], {"mcp-github": EXPOSED})
         self.assertEqual(listing, [])
 
 
@@ -276,6 +276,135 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(self.proxied(), ["mcp-github__create_pr"])
 
 
+#: Values ``json.loads`` reads without complaint and ``protocol.encode`` refuses: NaN
+#: and infinity (``1e999`` is strictly valid JSON and reads as inf) have no JSON
+#: spelling, and a lone surrogate has no UTF-8 one.
+UNSENDABLE = {"NaN": json.loads("NaN"), "1e999": json.loads("1e999"),
+              "lone surrogate": json.loads('"\\ud800"')}
+
+
+class WithholdingTests(unittest.TestCase):
+    """One server's unsendable tool metadata costs that tool, not the listing.
+
+    `/mcp` sends every reply through ``protocol.encode``, so a single entry it refuses
+    used to make the whole `tools/list` reply a 500: one third party denying the agent
+    every server's tools. The NaN and infinity descriptions are raw floats, a shape
+    ``discovery.list_tools`` never produces (it stringifies a description), so those
+    cases guard ``curate`` itself rather than a path production takes."""
+
+    def setUp(self):
+        self.surface = load_surface()
+        self.protocol = load_protocol()
+
+    @staticmethod
+    def roster(action: str | None = "allow") -> list[dict]:
+        rules = [{"tool": "fine", "action": "allow"}]
+        if action is not None:
+            rules.append({"tool": "bad", "action": action})
+        return [{"server": "mcp-github", "auth": {"type": "none"}, "tools": rules},
+                {"server": "mcp-jira", "auth": {"type": "none"},
+                 "tools": [{"tool": "search", "action": "allow"}]}]
+
+    @staticmethod
+    def results(bad: dict) -> list[dict]:
+        return [result(tools=[{"name": "fine", "description": "Fine.",
+                               "inputSchema": {"type": "object"}},
+                              {"name": "bad", **bad}]),
+                result("mcp-jira", [{"name": "search", "description": "Search.",
+                                     "inputSchema": {"type": "object"}}])]
+
+    @staticmethod
+    def cases():
+        """Each unsendable value once in a description, once deep in an inputSchema."""
+        for label, value in UNSENDABLE.items():
+            yield f"description {label}", {"description": value,
+                                           "inputSchema": {"type": "object"}}, label
+            yield f"inputSchema {label}", {
+                "description": "Bad.",
+                "inputSchema": {"type": "object", "properties": {
+                    "n": {"type": "number", "maximum": value}}}}, label
+
+    def proxied(self) -> list[str]:
+        native = {tool["name"] for tool in self.surface.NATIVE_TOOLS}
+        return [tool["name"] for tool in self.surface.listing()
+                if tool["name"] not in native]
+
+    def test_the_unsendable_tool_is_withheld_and_every_other_tool_listed(self):
+        for case, bad, _label in self.cases():
+            with self.subTest(case):
+                self.surface.publish(self.roster(), self.results(bad))
+                self.assertEqual(self.proxied(),
+                                 ["mcp-github__fine", "mcp-jira__search"])
+
+    def test_tools_list_still_answers_and_its_reply_encodes(self):
+        # The 500 was exactly this encode raising.
+        for case, bad, _label in self.cases():
+            with self.subTest(case):
+                self.surface.publish(self.roster(), self.results(bad))
+                reply = self.protocol.handle(
+                    {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                    self.surface.listing())
+                sent = json.loads(self.protocol.encode(reply))
+                names = [tool["name"] for tool in sent["result"]["tools"]]
+                self.assertIn("mcp-github__fine", names)
+                self.assertIn("mcp-jira__search", names)
+                self.assertNotIn("mcp-github__bad", names)
+
+    def test_publish_reports_what_it_withheld_and_why(self):
+        reasons = {"NaN": "NaN or infinity", "1e999": "NaN or infinity",
+                   "lone surrogate": "a lone surrogate"}
+        for case, bad, label in self.cases():
+            with self.subTest(case):
+                self.assertEqual(self.surface.publish(self.roster(), self.results(bad)),
+                                 [("mcp-github", "bad", reasons[label])])
+
+    def test_what_is_withheld_is_reported_in_a_stable_order(self):
+        # Enumerated in reverse, so the report follows the names, not discovery.
+        roster = [{"server": "mcp-github", "auth": {"type": "none"},
+                   "tools": [{"tool": "zeta", "action": "allow"},
+                             {"tool": "alpha", "action": "allow"}]}]
+        bad = {"description": UNSENDABLE["lone surrogate"],
+               "inputSchema": {"type": "object"}}
+        withheld = self.surface.publish(
+            roster, [result(tools=[{"name": "zeta", **bad}, {"name": "alpha", **bad}])])
+        self.assertEqual([entry[:2] for entry in withheld],
+                         [("mcp-github", "alpha"), ("mcp-github", "zeta")])
+
+    def test_a_clean_roster_reports_nothing(self):
+        self.assertEqual(self.surface.publish(ROSTER, [result()]), [])
+
+    def test_a_withheld_tool_keeps_its_schema_for_execution(self):
+        # Execution digests the schema it pins against; withholding is presentation
+        # and must not change what a call is checked against.
+        for case, bad, _label in self.cases():
+            with self.subTest(case):
+                self.surface.publish(self.roster(), self.results(bad))
+                self.assertIs(self.surface.served_schema("mcp-github", "bad"),
+                              bad["inputSchema"])
+
+    def test_an_ask_tool_is_checked_with_its_notice_and_withheld_too(self):
+        # A float description cannot take the notice at all, and production never
+        # sends one, so the ask cases are the surrogate description and the schemas.
+        for case, bad, label in self.cases():
+            if case.startswith("description") and label != "lone surrogate":
+                continue
+            with self.subTest(case):
+                withheld = self.surface.publish(self.roster("ask"), self.results(bad))
+                self.assertEqual([entry[:2] for entry in withheld],
+                                 [("mcp-github", "bad")])
+                self.assertNotIn("mcp-github__bad", self.proxied())
+
+    def test_a_denied_or_unruled_bad_tool_is_neither_listed_nor_reported(self):
+        for action in ("deny", None):
+            for case, bad, _label in self.cases():
+                with self.subTest(case, action=action):
+                    self.assertEqual(
+                        self.surface.publish(self.roster(action), self.results(bad)),
+                        [])
+                    self.assertEqual(self.proxied(),
+                                     ["mcp-github__fine", "mcp-jira__search"])
+
+
 class NativeToolTests(unittest.TestCase):
     """The gateway's own tools — a category with its own rule.
 
@@ -321,8 +450,8 @@ class NativeToolTests(unittest.TestCase):
     def test_a_native_tool_is_not_produced_by_the_policy_join(self):
         # It is proxied from no server, so no roster and no enumeration can contribute
         # it — and no rule can withdraw it either.
-        listed = {tool["name"] for tool in self.surface.curate(ROSTER,
-                                                              {"mcp-github": EXPOSED})}
+        listing, _withheld = self.surface.curate(ROSTER, {"mcp-github": EXPOSED})
+        listed = {tool["name"] for tool in listing}
         for tool in self.surface.NATIVE_TOOLS:
             self.assertNotIn(tool["name"], listed)
 

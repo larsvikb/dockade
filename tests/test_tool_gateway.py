@@ -24,7 +24,7 @@ import re
 import unittest
 from unittest import mock
 
-from _loader import load_tool_gateway
+from _loader import load_surface, load_tool_gateway
 
 #: The configuration compose actually deploys. Written out rather than read from
 #: compose: test_topology.py already holds those two equal, and re-deriving it here
@@ -283,6 +283,80 @@ class ReconcileSurvivalTests(unittest.TestCase):
         self.assertEqual(len(calls), 2, "the loop did not come back for a second try")
         self.assertIn("reconcile failed (AttributeError", printed)
         self.assertIn("report:1", printed)
+
+
+class WithheldToolReportTests(unittest.TestCase):
+    """A tool the reply cannot carry is withheld from the agent, and the operator is
+    told on the reconcile report's cadence, ahead of the report itself."""
+
+    def setUp(self):
+        self.out = io.StringIO()
+
+    def run_once(self, format_report=None, extra=()):
+        """``extra``: more tools, enumerated after the others and ruled allow."""
+        gateway = load_tool_gateway(GOOD)
+        # A fresh surface: app.py's plain-name `surface` is shared module state.
+        gateway.surface = load_surface()
+        pushed = []
+        roster = [{"server": "mcp-github", "auth": {}, "tools": [
+            {"tool": name, "action": "allow"}
+            for name in ["bad", "fine", *(tool["name"] for tool in extra)]]}]
+
+        class FakeDiscovery:
+            @staticmethod
+            def poll():
+                return roster, ""
+
+            @staticmethod
+            def roster_digest(_roster):
+                return "digest"
+
+            @staticmethod
+            def reconcile_all(_roster):
+                return [{"server": "mcp-github", "status": "ok", "tools": [
+                    {"name": "bad", "description": json.loads('"\\ud800"'),
+                     "inputSchema": {"type": "object"}},
+                    {"name": "fine", "description": "Fine.",
+                     "inputSchema": {"type": "object"}}, *extra]}]
+
+            @staticmethod
+            def push_inventory(results):
+                pushed.append(results)
+                return ""
+
+        FakeDiscovery.format_report = staticmethod(
+            format_report or (lambda results: ["report"]))
+        gateway.discovery = FakeDiscovery
+        with contextlib.redirect_stdout(self.out):
+            gateway._reconcile_once(None, None, 0.0)
+        return pushed
+
+    def test_the_withheld_tool_is_named_and_the_inventory_still_pushed(self):
+        pushed = self.run_once()
+        printed = self.out.getvalue()
+        withheld = [line for line in printed.splitlines()
+                    if "mcp-github__bad" in line]
+        self.assertEqual(len(withheld), 1, printed)
+        self.assertIn("lone surrogate", withheld[0])
+        self.assertNotIn("mcp-github__fine", printed)
+        self.assertEqual(len(pushed), 1)
+        printed.encode("utf-8")  # strict: the line carries none of the server's text
+
+    def test_the_line_prints_even_when_the_report_raises(self):
+        def raising(_results):
+            raise RuntimeError("format_report failed")
+
+        with self.assertRaises(RuntimeError):
+            self.run_once(raising)
+        self.assertIn("mcp-github__bad", self.out.getvalue())
+
+    def test_several_withheld_tools_print_in_name_order(self):
+        # `abad` is enumerated after `bad`; the lines follow the names, not discovery.
+        self.run_once(extra=[{"name": "abad", "description": "Bad.",
+                              "inputSchema": {"maximum": json.loads("NaN")}}])
+        named = [line.split()[1] for line in self.out.getvalue().splitlines()
+                 if "not in the agent's tool list" in line]
+        self.assertEqual(named, ["mcp-github__abad", "mcp-github__bad"])
 
 
 class HealthProbeTests(unittest.TestCase):

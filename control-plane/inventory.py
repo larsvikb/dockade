@@ -29,6 +29,7 @@ import threading
 import time
 
 import policy
+import store
 
 #: Bounds, enforced HERE rather than trusted from the sender. The gateway is a sibling
 #: we wrote, but it relays what a third-party container answered, and "the gateway
@@ -245,11 +246,14 @@ def record(payload: dict) -> tuple[dict, list[tuple[str, str]]]:
                 # "it offers nothing" — a distinction the audit and the picker both
                 # need.
                 "enumerated": "tools" in body or bool(was.get("enumerated")),
-                # Carried verbatim from the gateway, capped: "secret missing" and
-                # "unreachable" are the states an operator most needs, and they are
-                # the ones that otherwise surface as a 401 that reads like a policy
-                # problem.
-                "status": str(body.get("status") or "")[:200],
+                # Carried from the gateway, escaped and then capped: "secret missing"
+                # and "unreachable" are the states an operator most needs, and they
+                # are the ones that otherwise surface as a 401 that reads like a
+                # policy problem. It can hold a server's error text, so a lone
+                # surrogate is escaped before the cap, or the GET that serves it
+                # fails: control-plane/DESIGN.md, "A lone surrogate is refused where
+                # it is decided on".
+                "status": store._escaped(str(body.get("status") or ""))[:200],
                 "seen_at": now,
             }
         moved = changes(previous, fresh)

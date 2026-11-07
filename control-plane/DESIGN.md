@@ -842,11 +842,13 @@ and the agent can put one in a tool call's arguments or, through a raw path byte
 the proxy's url (NOTES.md, "mitmproxy decodes a raw path byte to a lone surrogate").
 Every write of caller text to the audit table goes through `store._escaped`, in
 `store._audit` and in ingest's `_ingest_field`, so the attempt is always recorded and
-a poisoned line cannot stop a stream. `/authorize` and `/tool/authorize` refuse such a
-field before any query or decision takes it, as an audited `deny`: an escaped host or
-url is not what the caller asked about, and a decision about it would be about a
-different request. A tool call's arguments are not checked on the route but in
-`holds._register_tool_ask`, the only place they are stored, and refused there rather
-than escaped: the escapes of an unpaired high and low surrogate read back as one
-astral character, so the card would bind to a different call. Under `allow` or a pin
-the arguments are stored nowhere, so the call runs as sent.
+a poisoned line cannot stop a stream. The management API's JSON is UTF-8 too, so caller
+text held in memory and served is escaped as it is recorded: the inventory's `status`,
+in `inventory.record`. `/authorize` and `/tool/authorize` refuse such a field before any
+query or decision takes it, as an audited `deny`: an escaped host or url is not what the
+caller asked about, and a decision about it would be about a different request. A tool
+call's arguments are not checked on the route but in `holds._register_tool_ask`, the
+only place they are stored, and refused there rather than escaped: the escapes of an
+unpaired high and low surrogate read back as one astral character, so the card would
+bind to a different call. Under `allow` or a pin the arguments are stored nowhere, so
+the call runs as sent.

@@ -690,6 +690,23 @@ def _ask_by_token(resume_token: str) -> dict | None:
     return dict(row) if row is not None else None
 
 
+def _grant_lapsed(approval_id: str) -> bool:
+    """True if this ask was approved and then expired unclaimed: a lapsed grant, not
+    an unanswered question. Both keep ``status='expired'``; ``resolved_by`` tells them
+    apart, because only a human resolve writes it (``_resolve_tool_ask``,
+    ``_resolve_tool_ask_pinned``) and the pending branch of ``_expire_tool_asks``
+    leaves it NULL.
+
+    A bool, never the column: ``resolved_by`` is the operator's provenance, and the
+    answer this feeds goes to the agent."""
+    with store._connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM tool_approvals "
+            "WHERE id=? AND status='expired' AND resolved_by IS NOT NULL",
+            (approval_id,)).fetchone()
+    return row is not None
+
+
 def _resolve_tool_ask(approval_id: str, decision: str, actor: str) -> str | None:
     """Record the human's answer. Returns the new status, or None if the ask was not
     pending — already decided, expired, or never existed.

@@ -4558,6 +4558,20 @@ class ToolAuthorizeDecisionTests(_ToolBridgeTestCase):
         # decision word would be recorded, rendered, and quietly unfilterable.
         self.assertLessEqual({"allow", "deny", "hold"}, set(cp.audit.KINDS))
 
+    def test_an_ask_answer_carries_the_grant_window_and_nothing_else_does(self):
+        # The held result is where the agent plans its return, so the window an
+        # approval stays redeemable travels with the ask. Allow and deny release or
+        # refuse at once: there is no grant to wait on.
+        _tool_rule("create_pull_request", "ask")
+        answer = _tool_call(tool="create_pull_request", args={"title": "x"})
+        self.assertEqual(answer["decision"], "ask")
+        self.assertEqual(answer["grant_window"], cp.holds.TOOL_GRANT_TIMEOUT)
+        _tool_rule("get_me", "allow")
+        _tool_rule("delete_file", "deny")
+        for tool in ("get_me", "delete_file"):
+            with self.subTest(tool=tool):
+                self.assertNotIn("grant_window", _tool_call(tool=tool))
+
 
 def _pin(pins, tool="create_pull_request", server="mcp-github", expires_at=None,
          schema_digest=_SCHEMA, approval_id="a1"):
@@ -5812,6 +5826,75 @@ class ToolClaimTests(_ToolBridgeTestCase):
         self.assertEqual(audited.call_args[1]["client_class"],
                          cp.policy._client_class(CLASS_IP))
 
+    def _lapse(self, ask):
+        """Approve ``ask`` and let the grant window pass, as expiry reads it."""
+        _resolve(ask, "allow")
+        with cp.store._connect() as conn:
+            conn.execute("UPDATE tool_approvals SET resolved_at=? WHERE id=?",
+                         (time.time() - cp.holds.TOOL_GRANT_TIMEOUT - 1, ask))
+            conn.commit()
+
+    def _assert_no_provenance(self, body):
+        # ``resolved_by`` is the operator's peer and UA; the flag is all of it the
+        # agent gets.
+        self.assertNotIn("resolved_by", body)
+        self.assertNotIn("peer=", json.dumps(body))
+
+    def test_a_lapsed_grant_is_told_apart_from_an_unanswered_ask(self):
+        # Both rows read `expired`; only one had a human answer it, and the agent
+        # must not be told nobody did.
+        lapsed = self._ask(args={"n": 1})
+        self._lapse(lapsed)
+        resp = _claim(lapsed)
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.body["status"], "expired")
+        self.assertTrue(resp.body["terminal"])
+        self.assertIs(resp.body["lapsed"], True)
+        self._assert_no_provenance(resp.body)
+
+        unanswered = self._ask(args={"n": 2})
+        with cp.store._connect() as conn:
+            conn.execute("UPDATE tool_approvals SET deadline=? WHERE id=?",
+                         (time.time() - 1, unanswered))
+            conn.commit()
+        resp = _claim(unanswered)
+        self.assertEqual(resp.body["status"], "expired")
+        self.assertIs(resp.body["lapsed"], False)
+        self._assert_no_provenance(resp.body)
+
+    def test_only_an_expired_grant_reads_as_lapsed(self):
+        # A human answered each of these too, so ``resolved_by`` alone is not the
+        # predicate: an approved-then-withdrawn ask is not a lapse.
+        denied = self._ask(args={"n": 1})
+        _resolve(denied, "deny")
+        withdrawn = self._ask(args={"n": 2})
+        _withdraw(withdrawn)
+        dropped = self._ask(args={"n": 3})
+        _resolve(dropped, "allow")
+        _withdraw(dropped)
+        for ask, status in ((denied, "denied"), (withdrawn, "withdrawn"),
+                            (dropped, "withdrawn")):
+            with self.subTest(status=status):
+                resp = _claim(ask)
+                self.assertEqual(resp.body["status"], status)
+                self.assertIs(resp.body["lapsed"], False)
+                self._assert_no_provenance(resp.body)
+
+    def test_a_lapsed_grant_refused_by_policy_still_reads_as_lapsed(self):
+        # The policy check comes before the claim and answers for any status, so a
+        # lapsed grant whose server was then disabled reaches the agent through it.
+        ask = self._ask()
+        self._lapse(ask)
+        cp.api_mcp.edit_mcp_server("mcp-github",
+                                   _edit_request(enabled=False),
+                                   _FakeRequest())
+        resp = _claim(ask)
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn("not releasable", resp.body["detail"])
+        self.assertEqual(resp.body["status"], "expired")
+        self.assertIs(resp.body["lapsed"], True)
+        self._assert_no_provenance(resp.body)
+
 
 class ToolWithdrawTests(_ToolBridgeTestCase):
     """``POST /tool/asks/{resume_token}/withdraw`` — the agent taking back its own ask.
@@ -5888,6 +5971,7 @@ class ToolWithdrawTests(_ToolBridgeTestCase):
             resp = _withdraw(ask)
         self.assertEqual(resp.status_code, 409)
         self.assertEqual(resp.body["status"], "expired")
+        self.assertIs(resp.body["lapsed"], True)
 
     def test_another_sandboxs_id_is_unknown_and_its_ask_survives(self):
         ask = self._ask()
@@ -5915,6 +5999,18 @@ class ToolWithdrawTests(_ToolBridgeTestCase):
             self.assertEqual(
                 _tool_call(tool="create_pull_request", args={"n": 2})["decision"],
                 "ask")
+
+    def test_withdrawing_says_whether_a_human_had_approved(self):
+        # The audit row prints the status it withdrew from; the agent is told the
+        # same, so a dropped approval is not described as a question still asked.
+        approved = self._ask(args={"n": 1})
+        _resolve(approved, "allow")
+        pending = self._ask(args={"n": 2})
+        for ask, was in ((approved, "allowed"), (pending, "pending")):
+            with self.subTest(was=was):
+                resp = _withdraw(ask)
+                self.assertEqual(resp.status_code, 200)
+                self.assertEqual(resp.body["was"], was)
 
 
 class WithdrawnPayloadTests(_ToolBridgeTestCase):

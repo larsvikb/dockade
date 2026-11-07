@@ -378,6 +378,49 @@ class AskTests(ExecutionTestCase):
         self.assertIn(TOKEN, self.text(result))
         self.assertNotIn("can answer until", self.text(result))
 
+    def granted(self, window: object) -> str:
+        self.answer = {**self.answer, "grant_window": window}
+        result = self.execute.call("mcp-github__create_pr", {}, None)
+        self.assertFalse(result.get("isError"))
+        return self.text(result)
+
+    def test_the_held_result_names_the_grant_window_truncated(self):
+        # An approval opens a second, shorter window; an agent planning its return
+        # around the answer deadline alone can land after the grant lapsed.
+        for window, within in ((900, "15 minutes"), (959, "15 minutes"),
+                               (5400, "1 hour 30 minutes"), (3600, "1 hour"),
+                               (30, "30 seconds")):
+            with self.subTest(window=window):
+                self.assertIn(f"Once a human approves, resume within {within};",
+                              self.granted(window))
+
+    def test_the_grant_sentence_does_not_promise_a_new_question(self):
+        # A pinned approval leaves its pin when it lapses, so calling again may run
+        # with no question asked.
+        sentence = self.granted(900).split("Once a human approves")[1]
+        self.assertNotIn("question", sentence.split("\n")[0])
+
+    def test_an_unusable_grant_window_drops_only_its_sentence(self):
+        # 0.5 cannot come from a real configuration (``policy._grant_seconds``
+        # validates the constant); it stands for a malformed bridge answer.
+        for window in (None, True, "900", [], float("nan"), float("inf"), 0.5, 0,
+                       -900):
+            with self.subTest(window=window):
+                text = self.granted(window)
+                self.assertIn(TOKEN, text)
+                self.assertIn("can answer until", text)
+                self.assertNotIn("Once a human approves", text)
+
+    def test_the_grant_sentence_follows_the_deadline_and_changes_nothing_else(self):
+        self.answer = {**self.answer, "joined": True}
+        without = self.text(self.execute.call("mcp-github__create_pr", {}, None))
+        sentence = ("\nOnce a human approves, resume within 15 minutes; an approval "
+                    "not resumed by then lapses, and nothing runs under it.")
+        expected = without.replace("\nAn identical request", sentence
+                                   + "\nAn identical request")
+        self.assertNotEqual(expected, without)
+        self.assertEqual(self.granted(900), expected)
+
 
 class ResumeTests(ExecutionTestCase):
 
@@ -599,6 +642,47 @@ class ResumeTests(ExecutionTestCase):
                        "terminal": True, "detail": "already claimed"}
         self.assertNotIn("without its call running", self.text(self.resume()))
 
+    def test_a_lapsed_grant_says_a_human_approved_it(self):
+        # `expired` covers both an ask nobody answered and an approval nobody resumed;
+        # telling the agent nobody answered is false for the second.
+        self.answer = {"ok": False, "detail": "not claimable (expired)",
+                       "status": "expired", "lapsed": True, "spent": False,
+                       "terminal": True}
+        result = self.resume()
+        text = self.text(result)
+        self.assertEqual(self.called, [])
+        self.assertTrue(result["isError"])
+        self.assertIn("A human approved this request, but the approval lapsed", text)
+        self.assertNotIn("before anyone answered", text)
+        self.assertIn("final", text)
+
+    def test_a_lapsed_grant_does_not_promise_a_new_question(self):
+        # A lapsed pinned approval leaves its pin, so calling again may be allowed
+        # with nobody asked. An unanswered ask has no pin behind it and keeps the tail.
+        base = {"ok": False, "detail": "not claimable (expired)", "status": "expired",
+                "spent": False, "terminal": True}
+        self.answer = {**base, "lapsed": True}
+        text = self.text(self.resume())
+        self.assertNotIn("raises a new question", text)
+        self.assertIn("Call the tool again if the work is still needed", text)
+        self.answer = base
+        self.assertIn("raises a new question", self.text(self.resume()))
+
+    def test_only_a_true_lapsed_flag_on_an_expired_ask_changes_the_text(self):
+        for status, lapsed, expected in (("expired", None, "before anyone answered"),
+                                         ("expired", False, "before anyone answered"),
+                                         ("expired", "true", "before anyone answered"),
+                                         ("expired", 1, "before anyone answered"),
+                                         ("denied", True, "refused")):
+            with self.subTest(status=status, lapsed=lapsed):
+                self.answer = {"ok": False, "detail": f"not claimable ({status})",
+                               "status": status, "spent": False, "terminal": True}
+                if lapsed is not None:
+                    self.answer["lapsed"] = lapsed
+                text = self.text(self.resume())
+                self.assertIn(expected, text)
+                self.assertNotIn("approval lapsed", text)
+
 
 class ResumeTokenTests(ExecutionTestCase):
     """The native tools take the agent's resume token and nothing else of the ask's,
@@ -741,6 +825,34 @@ class WithdrawTests(ExecutionTestCase):
                 result = self.withdraw()
                 self.assertTrue(result["isError"])
                 self.assertIn("try again", self.text(result))
+
+    def test_a_lapsed_grant_has_nothing_left_to_withdraw_and_says_why(self):
+        self.answer = {"ok": False, "detail": "not withdrawable (expired)",
+                       "status": "expired", "lapsed": True, "spent": False,
+                       "terminal": True}
+        result = self.withdraw()
+        text = self.text(result)
+        self.assertFalse(result.get("isError"))
+        self.assertIn("A human approved this request, but the approval lapsed", text)
+        self.assertIn("nothing left to withdraw", text)
+        self.assertNotIn("before anyone answered", text)
+
+    def test_withdrawing_an_approval_says_a_human_had_given_it(self):
+        # "The human is no longer asked" is false once the human has answered.
+        self.answer = {"ok": True, "status": "withdrawn", "was": "allowed",
+                       "spent": False, "terminal": True}
+        text = self.text(self.withdraw())
+        self.assertIn("The approval a human gave is dropped", text)
+        self.assertNotIn("no longer asked", text)
+        for was in ("pending", None):
+            with self.subTest(was=was):
+                self.answer = {"ok": True, "status": "withdrawn", "spent": False,
+                               "terminal": True}
+                if was is not None:
+                    self.answer["was"] = was
+                text = self.text(self.withdraw())
+                self.assertIn("The human is no longer asked", text)
+                self.assertNotIn("approval a human gave", text)
 
 
 class UpstreamReplyTests(ExecutionTestCase):

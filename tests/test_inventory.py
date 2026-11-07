@@ -12,6 +12,7 @@ tool in this map is denied exactly as it was before it appeared.
 """
 from __future__ import annotations
 
+import json
 import threading
 import unittest
 
@@ -96,6 +97,32 @@ class RecordTests(unittest.TestCase):
         # than at the renderer, because the cap belongs where the trust boundary is.
         self.inv.record({"servers": {"s": {"status": "x" * 5000, "tools": []}}})
         self.assertLessEqual(len(self.inv.snapshot()["s"]["status"]), 200)
+
+    def _served(self, status):
+        # The route serves snapshot() through pydantic-core, which a stubbed FastAPI
+        # does not run; json.dumps to UTF-8 rejects a lone surrogate and accepts its
+        # escape the same way.
+        self.inv.record({"servers": {"s": {"status": status, "tools": []}}})
+        snap = self.inv.snapshot()
+        json.dumps(snap, ensure_ascii=False).encode("utf-8")
+        return snap["s"]["status"]
+
+    def test_a_status_holding_a_lone_surrogate_is_stored_escaped(self):
+        # A server's error text can carry one, and stored raw it would make every
+        # GET of the inventory fail until the next push replaced it.
+        for code in (0xD800, 0xDFFF):
+            with self.subTest(code=hex(code)):
+                self.assertEqual(self._served("boom " + chr(code)),
+                                 "boom \\u%04x" % code)
+
+    def test_a_status_of_surrogates_is_escaped_before_it_is_capped(self):
+        # Capped first, 200 surrogates would escape to some 1200 characters.
+        self.assertLessEqual(len(self._served(chr(0xDC80) * 250)), 200)
+
+    def test_a_status_utf8_can_carry_is_stored_unchanged(self):
+        for status in ("Grüße", "ok " + chr(0x1F600)):
+            with self.subTest(status=status):
+                self.assertEqual(self._served(status), status)
 
     def test_a_malformed_payload_is_refused_rather_than_ignored(self):
         for bad in ({}, {"servers": []}, {"servers": "nope"}):

@@ -25,9 +25,9 @@ lives rather than restating it.
 - **An audit word** (the first argument to `store._audit`): add it to `audit.KINDS`,
   which the filters and the UI share; `test_every_word_the_control_plane_writes_is_filterable`
   fails otherwise.
-- **A store write of caller text:** through `store._audit` or `store._escaped`, or
-  refused before it — see "A lone surrogate is refused where it is decided on" in
-  `control-plane/DESIGN.md`.
+- **A store write of caller text,** or caller text held in memory and served: through
+  `store._audit` or `store._escaped`, or refused before it — see "A lone surrogate is
+  refused where it is decided on" in `control-plane/DESIGN.md`.
 - **An error message served to a caller:** only through a typed exception whose message
   holds the caller's own input and module constants (`audit.FilterError`,
   `inventory.InventoryError`); `test_an_exception_reaches_a_response_only_through_a_named_type`.

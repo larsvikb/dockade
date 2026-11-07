@@ -59,19 +59,14 @@ only the invariants and conventions for working in the repo.
   fixture, commit message or PR body, grep it for a personal name or a real
   project; `NoPersonalNameTests` catches only the two names it can derive from those
   lines.
-- Keep one line per open branch in `inflight.md` at your checkout's root (gitignored),
-  starting with the branch name: what it is for and its state — not the files it
-  touches, which `git diff --stat main...<branch>` gives. Write it before you start
-  reading code ("investigating …" is a state). Rewrite it when you switch branch (a
-  worktree session starts on a placeholder `worktree-…` one) or its state changes, and
-  drop it when the branch merges. Before work that could collide, read every
-  checkout's note; `git worktree list` gives their roots.
-- dockade's name in the task registry is `dockade`, and the registry is where work is
-  tracked; `inflight.md` is the record of branches beside it. With no `tasks__` tools, or a call
-  that could not reach `tasks`, say so and ask the operator to start it (`make
-  tasks-up`); new work waits until it answers, never in a file of its own. A session
-  uses the registry at these points:
-  - at session start, and before work that could collide, `tasks__list_tasks`;
+- dockade's name in the task registry is `dockade`, and the registry is where work and
+  its branches are tracked. With no `tasks__` tools, or a call that could not reach
+  `tasks`, say so and ask the operator to start it (`make tasks-up`); new work waits
+  until it answers, never in a file of its own. A session uses the registry at these
+  points:
+  - at session start, and before work that could collide, `tasks__list_tasks`, then
+    the overlaps each claim, update and plan submission reports, and `git worktree
+    list` for the checkouts on disk;
   - for new work, `tasks__propose`;
   - before drafting a plan for one of its tasks, `tasks__claim_plan`;
   - once the plan's review rounds are done, `tasks__submit_plan`;
@@ -79,7 +74,10 @@ only the invariants and conventions for working in the repo.
   - after each commit, `tasks__update`;
   - once the review passes, `tasks__submit_work`;
   - once a review's triage and host checks are done, its record with `tasks__add_note`
-    (`.claude/skills/review-before-push/SKILL.md`, "Record it").
+    (`.claude/skills/review-before-push/SKILL.md`, "Record it");
+  - once the PR for a commit it handed over exists, the PR's number on each task the
+    commit lands, with `tasks__add_note`: the claim ended at `submit_work`, before
+    the push.
 
   A session that briefs a worker claims the task itself and puts in the brief the
   token and the commit's shape (`.claude/skills/review-before-push/SKILL.md`, "Commit

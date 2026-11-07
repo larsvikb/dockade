@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from unittest import mock
 
 from _loader import load_control_plane, load_protocol, load_surface
 
@@ -496,13 +497,17 @@ class ProtocolTests(unittest.TestCase):
                     self.protocol.encode(answer)
 
     def test_an_id_that_fails_to_encode_any_other_way_is_refused_too(self):
-        # Nested past the encoder's recursion limit: a RecursionError, not one of the
-        # two named failures, and still an answer rather than a 500.
-        deep: list = []
-        for _ in range(100_000):
-            deep = [deep]
-        answer = self.protocol.handle({"jsonrpc": "2.0", "id": deep, "method": "ping"},
-                                      [])
+        # Any exception from the encode is answered, not only the two named: one that
+        # escaped would be a 500. Raised directly rather than by nesting an id past a
+        # recursion limit, which depends on the interpreter.
+        def execute(name, arguments):  # pragma: no cover - must not run
+            raise AssertionError("the executor was reached")
+
+        with mock.patch.object(self.protocol, "encode",
+                               side_effect=RecursionError("too deep")):
+            answer = self.protocol.handle(
+                {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                 "params": {"name": "x__y"}}, [], execute)
         self.assertEqual(answer["error"]["code"], self.protocol.INVALID_REQUEST)
         self.assertIsNone(answer["id"])
 

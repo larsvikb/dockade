@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Every test module ends with its ``__main__`` guard, and the suite's files are
-where test, lint and compile all see them.
+"""Every test module ends with its ``__main__`` guard, and every Python file make
+lint and make consistency read is where they see it.
 
 ``python3 tests/test_x.py`` runs ``unittest.main()`` when the guard is reached, so
 anything defined after it does not exist yet: those tests are skipped, and the run
@@ -16,6 +16,13 @@ The Makefile's ``TESTFILES``, which ``make lint`` and ``make consistency`` read,
 the same rule: ``$(wildcard tests/*.py)``, tracked or not. That glob does not descend,
 so a ``.py`` file below the top level of ``tests/`` would go unlinted; it fails here
 instead.
+
+``PYFILES`` applies the same rule to component code: a glob per component directory.
+``PyfilesTests`` is the one check here that asks git rather than globbing, because it
+holds that directory list complete: every tracked module outside ``tests/`` must be
+in it. The index is the set of modules the repo ships; a disk walk would sweep in
+gitignored directories such as ``models/`` and ``.claude/worktrees/``, whole copies
+of the repo inside the checkout.
 """
 from __future__ import annotations
 
@@ -30,6 +37,62 @@ from pathlib import Path
 TESTS = Path(__file__).resolve().parent
 ROOT = TESTS.parent
 PATTERN = "test*.py"  # unittest discovery's default, which make test uses
+# A missing tool skips on a dev machine and fails in CI: test_docs.py's _NeedsGit.
+_STRICT = bool(os.environ.get("DOCKADE_REQUIRE_TOOLS"))
+COMPONENTS = ("proxies/egress", "control-plane", "control-plane-ui", "ui-common",
+              "tasks-ui", "tool-gateway", "task-registry")
+
+# A hook's GIT_DIR/GIT_INDEX_FILE would stage a fixture into the real repo or read
+# another repo's index, and the make variables of the ``make test`` this runs under
+# would steer the make below.
+_CLEARED = ("MAKEFLAGS", "MFLAGS", "GNUMAKEFLAGS", "MAKELEVEL", "MAKEOVERRIDES",
+            "MAKEFILES")
+
+
+def _env() -> dict[str, str]:
+    return {k: v for k, v in os.environ.items()
+            if not k.startswith("GIT_") and k not in _CLEARED}
+
+
+def _make_variable(test: unittest.TestCase, name: str, directory: Path | str) -> list[str]:
+    """``$(name)`` as the repo's Makefile expands it, run in ``directory``."""
+    make = shutil.which("make")
+    test.assertIsNotNone(make, "make is not installed")
+    run = subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
+        [make, "-s", "--no-print-directory", "-f", str(ROOT / "Makefile"), "-C", str(directory),
+         "--eval", f"print-var: ; @echo $({name})", "print-var"],
+        env=_env(), stdin=subprocess.DEVNULL, capture_output=True, text=True,
+        timeout=60, check=False)
+    test.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+    return run.stdout.split()
+
+
+def _git(test: unittest.TestCase) -> str:
+    git = shutil.which("git")
+    if not git:
+        if _STRICT:
+            test.fail("git is not installed and DOCKADE_REQUIRE_TOOLS is set: refusing "
+                      "to pass without reading the index")
+        test.skipTest("git is not installed: cannot read the index")
+    return git
+
+
+def tracked_modules(git: str, root: Path) -> set[str]:
+    """Every ``.py`` in ``root``'s index outside ``tests/`` and still on disk, so a
+    deletion not yet staged is not reported. Fails, saying which, when git cannot
+    list the index or lists no such module."""
+    run = subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
+        [git, "-C", str(root), "ls-files", "-z", "--", "*.py"],
+        env=_env(), stdin=subprocess.DEVNULL, capture_output=True, timeout=60, check=False)
+    if run.returncode != 0:
+        raise AssertionError("git could not list the index: "
+                             + run.stderr.decode("utf-8", errors="replace"))
+    names = run.stdout.decode("utf-8", errors="surrogateescape").split("\0")
+    modules = {name for name in names
+               if name and not name.startswith("tests/") and (root / name).is_file()}
+    if not modules:
+        raise AssertionError("git listed no module outside tests/")
+    return modules
 
 
 def _is_main_guard(node: ast.stmt) -> bool:
@@ -79,18 +142,9 @@ class GuardIsLastTests(unittest.TestCase):
 class TestfilesTests(unittest.TestCase):
     """``TESTFILES`` lists every file in ``tests/`` that test runs, tracked or not."""
 
-    # A hook's GIT_DIR/GIT_INDEX_FILE would stage the fixture into the real repo, and
-    # the make variables of the ``make test`` this runs under would steer this make.
-    CLEARED = ("MAKEFLAGS", "MFLAGS", "GNUMAKEFLAGS", "MAKELEVEL", "MAKEOVERRIDES",
-               "MAKEFILES")
-
     def test_an_untracked_test_file_and_helper_are_listed(self):
         # Run make rather than parse it. An index-only TESTFILES lists only the tracked
         # file, and nothing without git, so the set tells the two apart either way.
-        make = shutil.which("make")
-        self.assertIsNotNone(make, "make is not installed")
-        env = {k: v for k, v in os.environ.items()
-               if not k.startswith("GIT_") and k not in self.CLEARED}
         names = {"tests/test_tracked.py", "tests/test_new.py", "tests/_helper.py"}
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "tests").mkdir()
@@ -99,15 +153,10 @@ class TestfilesTests(unittest.TestCase):
             git = shutil.which("git")
             if git:
                 for args in (["init", "-q"], ["add", "-f", "--", "tests/test_tracked.py"]):
-                    subprocess.run([git, "-C", tmp, *args], env=env, check=True,  # noqa: S603 (absolute path from shutil.which, fixed args)
+                    subprocess.run([git, "-C", tmp, *args], env=_env(), check=True,  # noqa: S603 (absolute path from shutil.which, fixed args)
                                    stdin=subprocess.DEVNULL, capture_output=True)
-            run = subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
-                [make, "-s", "--no-print-directory", "-f", str(ROOT / "Makefile"), "-C", tmp,
-                 "--eval", "print-testfiles: ; @echo $(TESTFILES)", "print-testfiles"],
-                env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                timeout=60, check=False)
-        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-        self.assertEqual(set(run.stdout.split()), names,
+            listed = _make_variable(self, "TESTFILES", tmp)
+        self.assertEqual(set(listed), names,
                          "TESTFILES must list every tests/*.py, untracked included: "
                          "see the comment above it in the Makefile")
 
@@ -130,6 +179,64 @@ class TestfilesTests(unittest.TestCase):
                          "TESTFILES globs tests/*.py only, so make lint and make "
                          "consistency skip these: move them up to tests/ (see the "
                          "comment above TESTFILES in the Makefile)")
+
+
+class PyfilesTests(unittest.TestCase):
+    """``PYFILES`` lists every module outside ``tests/``, tracked or not."""
+
+    def test_every_tracked_module_outside_tests_is_listed(self):
+        pyfiles = set(_make_variable(self, "PYFILES", ROOT))  # before git: no make fails, not skips
+        self.assertTrue(pyfiles, "PYFILES expands to nothing in the repo: see the "
+                                 "comment above it in the Makefile")
+        tracked = tracked_modules(_git(self), ROOT)
+        self.assertEqual(sorted(tracked - pyfiles), [],
+                         "tracked but not in PYFILES, so make lint and make consistency "
+                         "skip them: add their directory to the glob (see the comment "
+                         "above PYFILES in the Makefile)")
+
+    def test_an_untracked_module_in_each_component_is_listed(self):
+        names = {f"{component}/scratch.py" for component in COMPONENTS}
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in names:
+                (Path(tmp) / name).parent.mkdir(parents=True)
+                (Path(tmp) / name).touch()
+            listed = _make_variable(self, "PYFILES", tmp)
+        self.assertEqual(set(listed), names,
+                         "PYFILES must glob every component directory, untracked files "
+                         "included: see the comment above it in the Makefile")
+
+
+class TrackedModulesTests(unittest.TestCase):
+    """``tracked_modules`` itself: it cannot hand PyfilesTests an empty set."""
+
+    def _repo(self, tmp: str, git: str, names: list[str]) -> None:
+        subprocess.run([git, "-C", tmp, "init", "-q"], env=_env(), check=True,  # noqa: S603 (absolute path from shutil.which, fixed args)
+                       stdin=subprocess.DEVNULL, capture_output=True)
+        for name in names:
+            (Path(tmp) / name).parent.mkdir(parents=True, exist_ok=True)
+            (Path(tmp) / name).touch()
+        subprocess.run([git, "-C", tmp, "add", "-f", "--", *names], env=_env(), check=True,  # noqa: S603 (absolute path from shutil.which, fixed args)
+                       stdin=subprocess.DEVNULL, capture_output=True)
+
+    def test_a_directory_git_cannot_read_fails(self):
+        git = _git(self)
+        with tempfile.TemporaryDirectory() as tmp, \
+                self.assertRaisesRegex(AssertionError, "git could not list the index"):
+            tracked_modules(git, Path(tmp))
+
+    def test_an_index_with_no_module_outside_tests_fails(self):
+        git = _git(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            self._repo(tmp, git, ["tests/test_x.py"])
+            with self.assertRaisesRegex(AssertionError, "git listed no module outside tests/"):
+                tracked_modules(git, Path(tmp))
+
+    def test_tests_and_a_module_deleted_but_not_staged_are_left_out(self):
+        git = _git(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            self._repo(tmp, git, ["comp/kept.py", "comp/gone.py", "tests/test_x.py"])
+            (Path(tmp) / "comp/gone.py").unlink()
+            self.assertEqual(tracked_modules(git, Path(tmp)), {"comp/kept.py"})
 
 
 GUARD = 'if __name__ == "__main__":\n    unittest.main()\n'

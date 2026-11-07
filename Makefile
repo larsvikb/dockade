@@ -114,22 +114,13 @@ DOCKERFILES := claude-sandbox/Dockerfile opencode-sandbox/Dockerfile \
 YAMLFILES := docker-compose.yml mcp-servers.yml .hadolint.yaml .yamllint \
              $(wildcard .github/workflows/*.yml)
 JSONFILES := $(shell git ls-files '*.json' 2>/dev/null)
-PYFILES := proxies/egress/addon.py control-plane-ui/app.py ui-common/guards.py \
-           tasks-ui/app.py \
-           control-plane/app.py control-plane/store.py control-plane/policy.py \
-           control-plane/holds.py control-plane/ingest.py control-plane/audit.py \
-           control-plane/inventory.py control-plane/provenance.py \
-           control-plane/api_authorize.py control-plane/api_tool.py \
-           control-plane/api_approvals.py control-plane/api_egress.py \
-           control-plane/api_mcp.py control-plane/api_views.py \
-           tool-gateway/app.py tool-gateway/outcomes.py tool-gateway/discovery.py \
-           tool-gateway/protocol.py tool-gateway/surface.py tool-gateway/execute.py \
-           task-registry/taskdb.py task-registry/tasks.py task-registry/reads.py \
-           task-registry/claims.py task-registry/notes.py task-registry/plans.py \
-           task-registry/agent_moves.py task-registry/operator_moves.py \
-           task-registry/agent_tools.py task-registry/agent_api.py \
-           task-registry/operator_api.py task-registry/serve.py \
-           task-registry/backup.py task-registry/export.py
+# Every non-test module, for make lint and make consistency. A GLOB per directory,
+# untracked files included, as LAUNCHERS, YAMLFILES and TESTFILES: a new module is
+# linted and compiled from the moment it exists. A new directory (a component, or
+# one such as scripts/) is added here by hand: once a module in a directory missing
+# here is tracked, PyfilesTests in tests/test_suite_layout.py fails naming it.
+PYFILES := $(wildcard proxies/egress/*.py control-plane/*.py control-plane-ui/*.py \
+                      ui-common/*.py tasks-ui/*.py tool-gateway/*.py task-registry/*.py)
 # Dependency-free unit tests for the governance-critical decision logic. Kept
 # separate from PYFILES so they can be linted with the app code but discovered
 # and run on their own (python -m unittest, no pip installs — see tests/).

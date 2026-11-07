@@ -9,8 +9,8 @@ lives rather than restating it.
 ## Adding things
 
 - **A module:** a `COPY` line in `control-plane/Dockerfile`
-  (`ControlPlaneModulesAreShippedTests` fails without it), the `PYFILES` and
-  `REFFILES` lists in the `Makefile`, the layout block in `README.md`, and the module
+  (`ControlPlaneModulesAreShippedTests` fails without it), the `REFFILES` list
+  in the `Makefile`, the layout block in `README.md`, and the module
   list in the `app.py` docstring. The `api_*` modules never import each other.
 - **A route:** in the `api_*` module for its surface. The "what each listener serves"
   block in `app.py` mounts it, and the comment above each `FastAPI(...)` call asks the

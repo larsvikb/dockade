@@ -343,8 +343,8 @@ class ContentRecordTests(ContentTestCase):
         self.assertEqual(self.bodies(), [])
 
     def test_a_result_that_cannot_be_sent_has_no_facts_and_raises_nothing(self):
-        # NaN and a lone surrogate fail the reply in `app.py` too, so no bytes reached
-        # the agent and there is nothing to describe. The outcome is still written.
+        # `execute._run` replaces such a result before recording it; this is
+        # `record`'s own never-raise guard. The outcome is still written.
         for result in ({"x": float("nan")}, {"x": "\ud800"}):
             with self.subTest(result=repr(result)):
                 self.outcomes.record("ok", "s", "t", result=result, duration=1.0)

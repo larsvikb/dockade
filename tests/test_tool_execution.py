@@ -1162,6 +1162,86 @@ class OutcomeRecordTests(ExecutionTestCase):
                 self.assertIsNone(self.rows[0]["result"])
                 self.assertIsNone(self.rows[0]["duration"])
 
+    #: Results `protocol.encode` refuses, as a server's raw reply text so each passes
+    #: through `discovery.response_message`'s real parse, and the reason's words for
+    #: each. `1e999` is strictly valid JSON that `json.loads` reads as an infinity.
+    NON_FINITE = "it held NaN or an infinity"
+    SURROGATE = "it held a lone surrogate"
+    UNSENDABLE = (
+        ("NaN", '{"content": [{"type": "text", "text": "n"}], "n": NaN}', NON_FINITE),
+        ("Infinity", '{"content": [], "n": Infinity}', NON_FINITE),
+        ("-Infinity", '{"content": [], "n": -Infinity}', NON_FINITE),
+        ("1e999", '{"content": [], "n": 1e999}', NON_FINITE),
+        ("lone high surrogate", '{"content": [{"type": "text", "text": "a\\ud800b"}]}',
+         SURROGATE),
+        ("lone low surrogate", '{"content": [{"type": "text", "text": "\\udc00"}]}',
+         SURROGATE),
+        ("surrogate in a key", '{"content": [], "\\ud800": 1}', SURROGATE),
+    )
+
+    def _reply(self, result_text: str) -> str:
+        return f'data: {{"jsonrpc": "2.0", "id": 1, "result": {result_text}}}\n\n'
+
+    def _assert_substituted(self, returned: dict, why: str, server_status: str) -> None:
+        self.assertEqual(len(self.rows), 1)
+        row = self.rows[0]
+        self.assertEqual(row["status"], "transport-error")
+        self.assertIn(why, row["reason"])
+        self.assertIn("ran on the server", row["reason"])
+        self.assertIn(f"its {server_status} result", row["reason"])
+        self.assertIs(row["result"], returned)
+        self.assertTrue(returned["isError"])
+        self.assertIn("ran on the server", self.text(returned))
+        self.assertIn(why, self.text(returned))
+        self.execute.protocol.encode(returned)
+
+    def test_a_result_the_reply_cannot_carry_is_replaced_and_recorded_so(self):
+        # The defect: `ok` was recorded, then `app.py`'s encode raised and the agent got
+        # a 500. Now the agent gets a result saying the call ran, and the row is that.
+        for label, result_text, why in self.UNSENDABLE:
+            for path, run in (("allow", self.allow), ("resume", self.granted)):
+                with self.subTest(case=label, path=path):
+                    self._fresh()
+                    self.reply = self._reply(result_text)
+                    self._assert_substituted(run(), why, "ok")
+
+    def test_a_tool_error_the_reply_cannot_carry_is_replaced_the_same_way(self):
+        self.reply = self._reply('{"content": [], "isError": true, "n": NaN}')
+        self._assert_substituted(self.allow(), self.NON_FINITE, "tool-error")
+
+    def test_an_rpc_error_quoting_an_unsendable_string_is_replaced_without_ran(self):
+        # The rejection's text quotes the server's string error, so it can fail to
+        # encode too; the call never ran, and the substitute must not say it did.
+        self.reply = '{"jsonrpc": "2.0", "id": 1, "error": "x\\ud800"}'
+        returned = self.allow()
+        self.assertEqual(len(self.rows), 1)
+        row = self.rows[0]
+        self.assertEqual(row["status"], "transport-error")
+        self.assertIn("the rpc-error result", row["reason"])
+        self.assertIn(self.SURROGATE, row["reason"])
+        self.assertNotIn("ran on the server", row["reason"])
+        self.assertNotIn("ran on the server", self.text(returned))
+        self.assertIs(row["result"], returned)
+        self.execute.protocol.encode(returned)
+
+    def test_any_other_encode_failure_is_replaced_and_never_raises(self):
+        # Escaping `recorded`, it would skip the record and leave a 500 with no row.
+        with mock.patch.object(self.execute.protocol, "encode",
+                               side_effect=RecursionError("too deep")):
+            returned = self.allow()
+        self._assert_substituted(returned, "the gateway failed while encoding it", "ok")
+        self.assertNotIn("too deep", self.rows[0]["reason"])
+
+    def test_a_result_the_reply_can_carry_is_left_alone(self):
+        # No over-refusal: non-ASCII and a valid surrogate PAIR are ordinary text.
+        self.reply = self._reply(
+            '{"content": [{"type": "text", "text": "r\\u00e4k \\ud83d\\ude00"}]}')
+        returned = self.allow()
+        self.assertEqual(self.rows[0]["status"], "ok")
+        self.assertEqual(returned, {"content": [{"type": "text",
+                                                 "text": "räk \U0001f600"}]})
+        self.assertIs(self.rows[0]["result"], returned)
+
     def _with_answer(self, answer, name, args=None):
         self.answer = answer
         return self.execute.call(name, args or {}, "172.30.0.5")

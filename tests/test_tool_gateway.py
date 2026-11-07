@@ -400,6 +400,42 @@ class ResponseBodyTests(unittest.TestCase):
         self.assertEqual(hashlib.sha256(hashed).hexdigest(), sha)
         self.assertIn(hashed, body)
 
+    def test_a_result_holding_nan_is_answered_and_recorded_as_what_was_sent(self):
+        # Only the control plane's answer and the dial are stubbed; `execute`,
+        # `outcomes.record` and the encode are real. The defect was an `ok` line with
+        # null facts and a 500; now a 200 whose result the line's hash is of.
+        gateway = load_tool_gateway(GOOD)
+        gateway.execute.surface.publish(
+            [{"server": "mcp-github", "auth": {"type": "none"},
+              "endpoint": {"port": 8082, "path": "/mcp"},
+              "tools": [{"tool": "get_pr", "action": "allow"}]}],
+            [{"server": "mcp-github", "status": "ok", "rules": 1, "exposed": 1,
+              "tools": [{"name": "get_pr", "description": "", "inputSchema": {
+                  "type": "object"}}], "ruled_but_absent": [],
+              "exposed_but_unruled": []}])
+        reply = 'data: {"jsonrpc": "2.0", "id": 1, "result": {"content": [], "n": NaN}}\n\n'
+        request = self._Request(json.dumps(
+            {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+             "params": {"name": "mcp-github__get_pr", "arguments": {}}}).encode())
+        out = io.StringIO()
+        with mock.patch.object(gateway.execute, "_ask_control",
+                               lambda path, payload: {"decision": "allow",
+                                                      "reason": "ok"}), \
+                mock.patch.object(gateway.execute.discovery, "post",
+                                  lambda entry, message, timeout=None: reply), \
+                contextlib.redirect_stdout(out):
+            response = asyncio.run(gateway.mcp(request))
+        self.assertEqual(response.status_code, 200)
+        body = response.body
+        result = json.loads(body, parse_constant=self.fail)["result"]
+        self.assertTrue(result["isError"])
+        line = next(ln for ln in out.getvalue().splitlines() if ln.startswith("OUTCOME"))
+        self.assertTrue(line.startswith("OUTCOME transport-error mcp-github__get_pr"))
+        sha = re.search(r"sha256=([0-9a-f]{64})", line).group(1)
+        hashed = gateway.protocol.encode(result)
+        self.assertEqual(hashlib.sha256(hashed).hexdigest(), sha)
+        self.assertIn(hashed, body)
+
 
 if __name__ == "__main__":
     unittest.main()

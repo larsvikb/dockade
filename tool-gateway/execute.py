@@ -45,6 +45,7 @@ import urllib.request
 
 import discovery
 import outcomes
+import protocol
 import surface
 
 #: The shape of a resume token, checked before it is ever put in a URL, and before
@@ -225,6 +226,35 @@ def parse_call(raw: str) -> tuple[dict, str]:
     return result, "tool-error" if result.get("isError") is True else "ok"
 
 
+def _unsendable(status: str, exc: Exception) -> tuple[dict, str]:
+    """What the agent gets, and the record's reason, in place of a result the gateway
+    cannot send: ``exc`` is what ``protocol.encode`` raised on it.
+
+    Fixed sentences that never quote the result, so the substitute is encodable by
+    construction. Not repaired and delivered instead: escaping or nulling the bad
+    values would hand the agent content the server did not send. Two results can fail
+    to encode: a server's own, and an rpc-error text quoting a server's string error
+    (every other result's text is fixed or carries no server-supplied string). Only
+    the first RAN, which the agent must hear: an approved write that landed is
+    otherwise taken for one that did not."""
+    # `UnicodeEncodeError` first: it is a `ValueError`.
+    if isinstance(exc, UnicodeEncodeError):
+        why = "it held a lone surrogate, which UTF-8 cannot carry"
+    elif isinstance(exc, ValueError):
+        why = "it held NaN or an infinity, which JSON cannot carry"
+    else:
+        why = "the gateway failed while encoding it"
+    if status in ("ok", "tool-error"):
+        text = (f"The call ran on the server, but its result could not be passed on: "
+                f"{why}. Do not assume the call did not happen.")
+        reason = (f"the call ran on the server; its {status} result could not be "
+                  f"passed on: {why}")
+    else:
+        text = f"The result of this call could not be passed on: {why}."
+        reason = f"the {status} result could not be passed on: {why}"
+    return text_result(text, is_error=True), reason
+
+
 def _run(server: str, tool: str, arguments: object, client: str | None = None,
          resume_token: str | None = None) -> dict:
     """Dial the server, make the call, and RECORD HOW IT ENDED. The only side effect
@@ -257,6 +287,17 @@ def _run(server: str, tool: str, arguments: object, client: str | None = None,
     started: float | None = None
 
     def recorded(result: dict, status: str, reason: str | None = None) -> dict:
+        # DECIDED HERE, before anything is written: unchecked, a result `app.py` cannot
+        # send would get a 500 there after an `ok` row here, and the record would hide
+        # the failure it exists to show. Encoded with the reply's own serializer, and on failure
+        # the substitute is both what is recorded and what is returned, so the row
+        # describes what the agent received. Any exception, not only the two named:
+        # one that escaped here would skip the record and leave a 500 with no row.
+        try:
+            protocol.encode(result)
+        except Exception as exc:  # noqa: BLE001 — must reach the record below
+            result, reason = _unsendable(status, exc)
+            status = "transport-error"
         outcomes.record(status, server, tool, reason=reason, resume_token=resume_token,
                         client=client, result=result,
                         duration=None if started is None

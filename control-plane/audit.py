@@ -274,9 +274,9 @@ def grouped(conn, limit: int, filt: Filter, scan: int) -> list:
     `create_pull_request` calls that both succeeded are two pull requests; shown as one
     line with a count, the count is the only trace that a second human decision ever
     happened. A pin is the other side of the same rule: it answers many calls under the
-    one decision that made it, so its allows share an id and fold. Outcomes with no
-    approval still fold (NULLs group together), which keeps the high-volume read-only
-    rows quiet.
+    one decision that made it, so its allows and their outcomes share an id and fold.
+    Outcomes with no approval still fold (NULLs group together), which keeps the
+    high-volume read-only rows quiet.
     Egress rows carry their card's id too, for the record view's search, and still
     fold: the id is in the key only for a row without a host. A retried request raises
     a fresh card per hold window, so splitting on it would turn one agent retrying one

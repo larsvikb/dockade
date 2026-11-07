@@ -49,7 +49,8 @@ import protocol
 import surface
 
 #: The shape of a resume token, checked before it is ever put in a URL, and before
-#: one the control plane hands back is passed on to the agent.
+#: one the control plane hands back is passed on to the agent. A call token, minted
+#: the same way, is checked against it before it is written on an outcome line.
 #:
 #: The token is the one thing on this path that comes from the AGENT, and it lands in
 #: a request path on the crown-jewel bridge. A percent-encode alone would be enough to
@@ -256,7 +257,7 @@ def _unsendable(status: str, exc: Exception) -> tuple[dict, str]:
 
 
 def _run(server: str, tool: str, arguments: object, client: str | None = None,
-         resume_token: str | None = None) -> dict:
+         resume_token: str | None = None, call_token: str | None = None) -> dict:
     """Dial the server, make the call, and RECORD HOW IT ENDED. The only side effect
     in this file.
 
@@ -274,9 +275,10 @@ def _run(server: str, tool: str, arguments: object, client: str | None = None,
     that goes unrecorded. (``resume`` records the third such path, where the claim
     succeeded and the approved arguments would not parse.)
 
-    ``client`` and ``resume_token`` are carried only for that record — nothing about
-    the call itself reads them — and ``resume_token`` being present is exactly what
-    marks a row as having come through a human.
+    ``client``, ``resume_token`` and ``call_token`` are carried only for that record —
+    nothing about the call itself reads them. A ``resume_token`` marks a row as having
+    come through a human's card, and a ``call_token`` as answered by a pin a human
+    made from one; a row with neither is a call policy allowed outright.
 
     The ARGUMENTS are the caller's to get right, and are sent as given: a default
     substituted here would run something other than what the approval card showed. On
@@ -299,7 +301,7 @@ def _run(server: str, tool: str, arguments: object, client: str | None = None,
             result, reason = _unsendable(status, exc)
             status = "transport-error"
         outcomes.record(status, server, tool, reason=reason, resume_token=resume_token,
-                        client=client, result=result,
+                        call_token=call_token, client=client, result=result,
                         duration=None if started is None
                         else time.monotonic() - started)
         return result
@@ -415,10 +417,16 @@ def call(name: str, arguments: object, client: str | None) -> dict:
 
     decision, why = answer.get("decision"), answer.get("reason") or "no reason given"
     if decision == "allow":
-        # No resume token, and its absence is the signal: an outcome row without one is
-        # a call policy allowed outright. Those are the rows that grow with every tool an
-        # operator enables, and they are the unaudited-intake half of the response side.
-        return _run(server, tool, arguments, client=client)
+        # No resume token. A call token comes back only when a pin answered, and is
+        # kept for the outcome line alone, never shown to the agent; one not in the
+        # shape the control plane mints is dropped, and the outcome names no card. An
+        # outcome with neither token is a call policy allowed outright: the rows that
+        # grow with every tool an operator enables, the unaudited-intake half of the
+        # response side.
+        call_token = answer.get("call_token")
+        if not isinstance(call_token, str) or not _TOKEN_RE.match(call_token):
+            call_token = None
+        return _run(server, tool, arguments, client=client, call_token=call_token)
     if decision == "ask":
         # The token and nothing else: an answer's ``approval_id`` is never read, so a
         # control plane older than resume tokens cannot hand the agent the operator's

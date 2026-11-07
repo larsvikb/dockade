@@ -1837,7 +1837,10 @@ pending result, a claim's answer, the gateway's outcome records and logs — can
 it, and a request forged from that side has no real id to send to `resolve`. The
 token is minted beside the id, never derived from it, and only claim and withdraw
 accept it. Ingest maps an outcome's token back to the id, so one id still joins the
-hold, the click, the claim and the outcome in the audit trail.
+hold, the click, the claim and the outcome in the audit trail. A call a pin answered
+has no ask and no resume token, so its allow hands the gateway a call token, minted
+the same way, which ingest maps to the pin's card and spends: the card's id joins the
+outcomes of the calls its pin let through, and still never leaves the control plane.
 
 **The gateway executes on resumption, not on approval.** Lazily, when the agent comes
 back for the result — never at the instant the human clicks. This makes the
@@ -2449,7 +2452,7 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | MCP gateway — per-tool allow/deny/ask on `tools/call`, the pending ask, `resume_tool_call` | **done** |
 | — | `withdraw_tool_call` — the agent retires its own pending or unclaimed ask; the bridge's fifth endpoint | **done** |
 | — | tell the sandbox it exists — firewall grant, proxy exemption, `--mcp-config` from a wrapper | **done** |
-| — | tool audit is joinable — `server`/`tool`/`approval_id` columns; `approval_id` on a card's own rows, and on the calls a pin answered and the pin's revoke, credited to the card that last set the pin | **done** — not on a pinned call's outcome (task 276), nor on a rule revoke that removes expired pins with it |
+| — | tool audit is joinable — `server`/`tool`/`approval_id` columns; `approval_id` on a card's own rows, and on the calls a pin answered, their outcomes and the pin's revoke, credited to the card that last set the pin | **done** — not on a rule revoke that removes expired pins with it |
 | — | the gateway records how a call ENDED — its own JSONL stream | **done** |
 | — | outcomes ingested — second stream, `status` column, `outcome` in the audit vocabulary | **done** — one approval id now selects the hold, the answer, the claim and the result |
 | — | what a call returned — the body to the gateway's own `tool-content` file, its size, hash and duration to the audit row | **done** — the card's outcome and the facts in the audit view are task 252 |

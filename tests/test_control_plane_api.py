@@ -21,6 +21,8 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -38,7 +40,7 @@ atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
 os.environ["CONTROL_DB"] = os.path.join(_TMP, "control.db")
 os.environ["CONTROL_SEED"] = os.path.join(_TMP, "nonexistent-seed.txt")
 
-from _loader import load_control_plane  # noqa: E402 (must set env first)
+from _loader import load_control_plane, load_outcomes  # noqa: E402 (must set env first)
 
 cp = load_control_plane()
 
@@ -79,6 +81,7 @@ def _clear_all():
         conn.execute("DELETE FROM mcp_servers")
         conn.execute("DELETE FROM approvals")
         conn.execute("DELETE FROM tool_approvals")
+        conn.execute("DELETE FROM tool_call_tokens")
         conn.execute("DELETE FROM audit")
         conn.commit()
     cp.holds._PENDING_EVENTS.clear()
@@ -4709,6 +4712,151 @@ class PinAuditApprovalIdTests(_ToolBridgeTestCase):
         self.assertEqual(allow_lines(), [1, 2])
 
 
+class PinCallTokenTests(_ToolBridgeTestCase):
+    """A call a pin answered gets a call token, the handle the gateway writes on its
+    outcome line and ingest maps back to the pin's card: so searching a card's id
+    finds how its pin's calls ended as well as that they were allowed."""
+
+    audits = True
+    CARD = "d" * 32
+
+    def setUp(self):
+        super().setUp()
+        _tool_rule("create_pull_request", "ask")
+
+    @staticmethod
+    def _tokens():
+        with cp.store._connect() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT token, approval_id, server, tool, client FROM tool_call_tokens "
+                "ORDER BY created_at")]
+
+    def test_a_pinned_allow_returns_a_fresh_call_token_per_call(self):
+        _pin(_PINNED, approval_id=self.CARD)
+        answers = [_tool_call(tool="create_pull_request", args=_PR_ARGS)
+                   for _ in range(2)]
+        tokens = [a["call_token"] for a in answers]
+        for token in tokens:
+            self.assertRegex(token, r"\A[0-9a-f]{32}\Z")
+        self.assertNotEqual(tokens[0], tokens[1])
+        self.assertEqual(self._tokens(), [
+            {"token": t, "approval_id": self.CARD, "server": "mcp-github",
+             "tool": "create_pull_request", "client": CLASS_IP} for t in tokens])
+        # The card's id stays here: neither the answer nor the audit trail has it
+        # beside the token, nor the token at all.
+        self.assertNotIn(self.CARD, json.dumps(answers))
+        with cp.store._connect() as conn:
+            stored = json.dumps([dict(r) for r in conn.execute("SELECT * FROM audit")])
+        for token in tokens:
+            self.assertNotIn(token, stored)
+
+    def test_of_two_met_pins_the_answering_ones_card_is_minted(self):
+        # The permanent pin comes first but was made under another digest, so it does
+        # not answer; the timed one does, and the token names its card.
+        _pin({"owner": "acme"}, approval_id="e" * 32, schema_digest="6d" * 32)
+        _pin(_PINNED, approval_id=self.CARD, expires_at=time.time() + 600)
+        answer = _tool_call(tool="create_pull_request", args=_PR_ARGS)
+        self.assertEqual(answer["decision"], "allow")
+        self.assertEqual([r["approval_id"] for r in self._tokens()], [self.CARD])
+
+    def test_nothing_but_a_pin_mints_one(self):
+        _pin(_PINNED, approval_id=self.CARD)
+        _tool_rule("get_me", "allow")
+        _tool_rule("delete_repo", "deny")
+        cases = {
+            "rule allow": lambda: _tool_call(tool="get_me"),
+            "rule deny": lambda: _tool_call(tool="delete_repo"),
+            "ask": lambda: _tool_call(tool="create_pull_request",
+                                      args={**_PR_ARGS, "repo": "widgets"}),
+            "unencodable deny": lambda: _tool_call(tool="create_pull_request",
+                                                   args=_PR_ARGS,
+                                                   client=CLASS_IP + "\ud800"),
+            "oversized deny": lambda: _tool_call(
+                tool="create_pull_request",
+                args={**_PR_ARGS, "body": "x" * cp.holds.TOOL_ARGS_MAX}),
+            "cap-refusal deny": self._over_cap,
+        }
+        for name, ask in cases.items():
+            with self.subTest(name):
+                with cp.store._connect() as conn:
+                    conn.execute("DELETE FROM tool_call_tokens")
+                    conn.commit()
+                answer = ask()
+                self.assertNotIn("call_token", answer)
+                self.assertEqual(self._tokens(), [])
+
+    def _over_cap(self):
+        with mock.patch.object(cp.holds, "MAX_TOOL_PENDING", 0):
+            answer = _tool_call(tool="create_pull_request",
+                                args={**_PR_ARGS, "repo": "elsewhere"})
+        self.assertEqual(answer["decision"], "deny")
+        return answer
+
+    def test_a_failed_mint_fails_the_answer_and_audits_no_allow(self):
+        # As a failed audit write does: the gateway gets an error, and refuses.
+        _pin(_PINNED, approval_id=self.CARD)
+        failing = mock.patch.object(
+            cp.store, "_mint_call_token",
+            side_effect=sqlite3.OperationalError("disk I/O error"))
+        with failing, self.assertRaises(sqlite3.OperationalError):
+            _tool_call(tool="create_pull_request", args=_PR_ARGS)
+        with cp.store._connect() as conn:
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM audit WHERE kind='allow'").fetchone()[0], 0)
+
+    def _drain_outcomes(self, *calls):
+        """Write an outcome line per ``(status, call_token)`` through the gateway's own
+        ``outcomes.record``, as the gateway would for a call to create_pull_request
+        from ``CLASS_IP``, and drain them into the store."""
+        path = os.path.join(_TMP, f"outcomes-{self.id()}.jsonl")
+        outcomes = load_outcomes({"GATEWAY_AUDIT_LOG": path})
+        with contextlib.redirect_stdout(io.StringIO()):
+            outcomes.setup()
+            try:
+                for status, call_token in calls:
+                    outcomes.record(status, "mcp-github", "create_pull_request",
+                                    call_token=call_token, client=CLASS_IP)
+            finally:
+                for handler in list(outcomes.logger.handlers):
+                    outcomes.logger.removeHandler(handler)
+                    handler.close()
+            stream = next(s for s in cp.ingest.STREAMS if s.name == "tool outcomes")
+            self.addCleanup(setattr, stream, "path", stream.path)
+            stream.path = path
+            cp.ingest._drain(stream)
+
+    def test_a_cards_search_finds_its_pins_calls_and_how_they_ended(self):
+        card = _ask_id(_tool_call(tool="create_pull_request", args=_PR_ARGS))
+        _resolve(card, "allow_pinned", pins=["owner", "repo"])
+        answers = [_tool_call(tool="create_pull_request",
+                              args={**_PR_ARGS, "title": title})
+                   for title in ("another", "a third")]
+        self.assertEqual([a["decision"] for a in answers], ["allow", "allow"])
+        self._drain_outcomes(*[(status, a["call_token"]) for status, a in
+                               zip(("ok", "tool-error"), answers)])
+        found = sorted((r["kind"], r["stage"], r["status"], r["approval_id"])
+                       for r in cp.api_views.api_audit_events(q=card)["rows"])
+        self.assertEqual(found, [
+            ("allow", "tool-ask", None, card), ("allow", "tool-call", None, card),
+            ("allow", "tool-call", None, card), ("create", "tool-policy", None, card),
+            ("hold", "tool-call", None, card),
+            ("outcome", "tool-result", "ok", card),
+            ("outcome", "tool-result", "tool-error", card)])
+        self.assertEqual(self._tokens(), [])
+
+    def test_the_glance_folds_a_pins_outcomes_apart_from_rule_allowed_ones(self):
+        # A pin's outcomes are one human decision and fold under its card's id; the
+        # same tool allowed by a rule folds on its own, under none.
+        _pin(_PINNED, approval_id=self.CARD)
+        tokens = [_tool_call(tool="create_pull_request", args=_PR_ARGS)["call_token"]
+                  for _ in range(2)]
+        self._drain_outcomes(("ok", tokens[0]), ("ok", tokens[1]), ("ok", None))
+        with cp.store._connect() as conn:
+            lines = sorted(r["n"] for r in cp.audit.grouped(
+                conn, 50, cp.audit.parse(), 500) if r["kind"] == "outcome")
+        self.assertEqual(lines, [1, 2])
+
+
 class McpPinTests(_CPTestCase):
     """``/api/mcp/pins`` and taking a pin back, and what a pin does to its rule's
     verbs."""
@@ -7969,6 +8117,79 @@ class ResultFactsMigrationTests(_FreshStoreTestCase):
         with cp.store._connect() as conn:
             cp.store._step_14_result_facts(conn)
         self.assertEqual([c[1] for c in self._audit_columns()].count("duration"), 1)
+
+
+class CallTokenTableTests(_FreshStoreTestCase):
+    """``tool_call_tokens`` is a new table, so ``_init_db`` creates it on a store from
+    before it and no step does: the store keeps its rows and its version, and an older
+    image can still open it."""
+
+    def test_a_v14_store_without_it_gains_it_empty_and_stays_at_v14(self):
+        self._use_store("call-tokens-v14.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            fresh = conn.execute("SELECT sql FROM sqlite_master "
+                                 "WHERE name='tool_call_tokens'").fetchone()[0]
+            conn.execute("DROP TABLE tool_call_tokens")
+            conn.execute("INSERT INTO audit(ts, kind, stage, server, tool, status) "
+                         "VALUES (1.0, 'outcome', 'tool-result', 'mcp-github', "
+                         "'get_pr', 'ok')")
+            conn.execute("PRAGMA user_version = 14")
+            conn.commit()
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            ddl = conn.execute("SELECT sql FROM sqlite_master "
+                               "WHERE name='tool_call_tokens'").fetchone()
+            tokens = conn.execute("SELECT COUNT(*) FROM tool_call_tokens").fetchone()[0]
+            audit = [tuple(r) for r in conn.execute("SELECT ts, kind, status FROM audit")]
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+        self.assertEqual((ddl[0] if ddl else None, tokens, audit, version),
+                         (fresh, 0, [(1.0, "outcome", "ok")], 14))
+
+
+class AuditPruneTargetTests(_FreshStoreTestCase):
+    """`make audit-prune`'s script, run as the Makefile holds it, on a temp store: it
+    drops audit rows and unspent call tokens past the window, and keeps the rest."""
+
+    @staticmethod
+    def _script():
+        makefile = (ROOT / "Makefile").read_text()
+        return re.search(r"^define AUDIT_PRUNE_PY\n(.*?)^endef$", makefile,
+                         re.S | re.M).group(1)
+
+    def _prune(self, path):
+        return subprocess.run(  # noqa: S603 (this interpreter, the repo's own script)
+            [sys.executable, "-I", "-c", self._script()], capture_output=True,
+            text=True, check=True,
+            env={"CONTROL_DB": path, "AUDIT_RETENTION_DAYS": "30"}).stdout
+
+    def test_it_drops_old_call_tokens_and_keeps_recent_ones(self):
+        path = self._use_store("audit-prune.db")
+        cp.store._init_db()
+        old, now = time.time() - 31 * 86400, time.time()
+        with cp.store._connect() as conn:
+            for token, at in (("a" * 32, old), ("b" * 32, now)):
+                conn.execute("INSERT INTO tool_call_tokens(token, approval_id, server, "
+                             "tool, client, created_at) VALUES (?, 'card', 'mcp-github', "
+                             "'get_me', NULL, ?)", (token, at))
+                conn.execute("INSERT INTO audit(ts, kind) VALUES (?, 'allow')", (at,))
+            conn.commit()
+        printed = self._prune(path)
+        with cp.store._connect() as conn:
+            tokens = [r[0] for r in conn.execute("SELECT token FROM tool_call_tokens")]
+            audit = conn.execute("SELECT COUNT(*) FROM audit").fetchone()[0]
+        self.assertEqual((tokens, audit), (["b" * 32], 1))
+        self.assertIn("1 audit row(s) and 1 unspent call token(s)", printed)
+
+    def test_a_store_without_the_table_is_still_pruned(self):
+        # A control plane older than the table, met by a newer Makefile.
+        path = self._use_store("audit-prune-v14.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            conn.execute("DROP TABLE tool_call_tokens")
+            conn.execute("INSERT INTO audit(ts, kind) VALUES (1.0, 'allow')")
+            conn.commit()
+        self.assertIn("1 audit row(s) and 0 unspent", self._prune(path))
 
 
 class LegacyClassNameTests(unittest.TestCase):

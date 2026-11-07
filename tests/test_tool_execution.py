@@ -49,6 +49,9 @@ TOKEN = "0" * 32
 #: passed it on is caught: nothing the agent receives may carry it.
 DECOY_ID = "d" * 32
 
+#: A call token, as the control plane mints one for a call a pin answered.
+CALL_TOKEN = "c" * 32
+
 
 def sse(result: dict) -> str:
     """A server's reply in the shape it actually sends."""
@@ -850,11 +853,11 @@ class OutcomeRecordTests(ExecutionTestCase):
         self.rows: list[dict] = []
 
         def record(status, server, tool, reason=None, resume_token=None, client=None,
-                   result=None, duration=None):
+                   result=None, duration=None, call_token=None):
             self.rows.append({"status": status, "server": server, "tool": tool,
                               "reason": reason, "resume_token": resume_token,
                               "client": client, "result": result,
-                              "duration": duration})
+                              "duration": duration, "call_token": call_token})
 
         # `outcomes` is imported by plain name and therefore shared, as `discovery` is.
         self.addCleanup(setattr, self.execute.outcomes, "record",
@@ -887,6 +890,41 @@ class OutcomeRecordTests(ExecutionTestCase):
         # enables, and they are the unaudited-intake half of the response side.
         self.allow()
         self.assertIsNone(self.rows[0]["resume_token"])
+
+    def test_an_allowed_call_records_no_call_token_without_one(self):
+        # A rule allow: the control plane hands back no call token, and none is made up.
+        self.allow()
+        self.assertIsNone(self.rows[0]["call_token"])
+
+    def test_a_pinned_allow_records_its_call_token_and_never_shows_it(self):
+        # The handle the control plane maps back to the pin's card. The answer also
+        # carries a decoy id, which must reach neither the record nor the agent: only
+        # the token the control plane minted names the card.
+        self.answer = {"decision": "allow", "reason": "ok", "call_token": CALL_TOKEN,
+                       "approval_id": DECOY_ID}
+        result = self.execute.call("mcp-github__get_issue", {}, "172.30.0.5")
+        self.assertEqual([(r["call_token"], r["resume_token"]) for r in self.rows],
+                         [(CALL_TOKEN, None)])
+        self.assertNotIn(DECOY_ID, json.dumps(self.rows, default=str))
+        self.assertNotIn(CALL_TOKEN, json.dumps(result))
+        self.assertNotIn(DECOY_ID, json.dumps(result))
+
+    def test_a_malformed_call_token_is_recorded_as_none(self):
+        for token in ("C" * 32, "c" * 31, "c" * 33, "../" + "c" * 29, 12, None,
+                      ["c" * 32]):
+            with self.subTest(token=token):
+                self.rows.clear()
+                self.answer = {"decision": "allow", "reason": "ok", "call_token": token}
+                self.execute.call("mcp-github__get_issue", {}, "172.30.0.5")
+                self.assertEqual(len(self.rows), 1)
+                self.assertIsNone(self.rows[0]["call_token"])
+
+    def test_a_resumed_call_never_records_a_call_token(self):
+        # A claim's answer that carried one anyway names nothing: a resumed call is
+        # filed under its ask's resume token alone.
+        self.granted(call_token=CALL_TOKEN)
+        self.assertEqual([(r["call_token"], r["resume_token"]) for r in self.rows],
+                         [(None, TOKEN)])
 
     def test_a_resumed_call_is_filed_under_the_approval_it_spent(self):
         # The join. The control plane already wrote three rows carrying this id; this

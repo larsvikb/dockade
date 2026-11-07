@@ -299,7 +299,8 @@ def _keep(ts: float, server: str, tool: str, client: str | None, body: bytes,
 
 def record(status: str, server: str, tool: str, reason: str | None = None,
            resume_token: str | None = None, client: str | None = None,
-           result: dict | None = None, duration: float | None = None) -> None:
+           result: dict | None = None, duration: float | None = None,
+           call_token: str | None = None) -> None:
     """Write one outcome. Returns nothing and RAISES NOTHING.
 
     The swallow is deliberate and is the one place in this file worth arguing about. By
@@ -320,13 +321,19 @@ def record(status: str, server: str, tool: str, reason: str | None = None,
     ``result`` is the ``CallToolResult`` the agent is handed, and ``duration`` the
     seconds the dial took, None where nothing was dialled. The line carries the
     result's ``bytes`` and ``sha256`` and the content file its body; all three keys
-    are null without a result, so a line always has them."""
+    are null without a result, so a line always has them.
+
+    ``resume_token`` names the ask a resumed call spent, and ``call_token`` the pin's
+    answer to an allowed one; the control plane maps either to its card. Both keys are
+    on every line, null when absent, so the ingest never has to tell "none" from a
+    line written before the key existed."""
     ts = round(time.time(), 3)
     body = _wire(result)
     digest = None if body is None else hashlib.sha256(body).hexdigest()
     entry = {"ts": ts, "stage": "tool-result",
              "status": status, "server": _field(server), "tool": _field(tool),
-             "resume_token": _field(resume_token), "client": _field(client),
+             "resume_token": _field(resume_token), "call_token": _field(call_token),
+             "client": _field(client),
              "reason": _field(reason),
              "bytes": None if body is None else len(body), "sha256": digest,
              "duration": None if duration is None else round(duration, 3)}
@@ -343,6 +350,7 @@ def record(status: str, server: str, tool: str, reason: str | None = None,
     # the body: it is what `make tool-content` looks a body up by.
     print(f"OUTCOME {status} {_printable(server)}__{_printable(tool)}"
           + (f" resume_token={_printable(resume_token)}" if resume_token else "")
+          + (f" call_token={_printable(call_token)}" if call_token else "")
           + (f" client={_printable(client)}" if client else "")
           + (f" sha256={digest}" if digest else "")
           + (f" :: {_printable(reason)}" if reason else ""), flush=True)

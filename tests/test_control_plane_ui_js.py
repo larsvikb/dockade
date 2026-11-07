@@ -168,7 +168,7 @@ const owner = {
              "serverEditPreview", "serverEditBody", "serverSaveBody",
              "toolChoices", "toolRulePreview", "toolEditPreview", "toolRevokePreview",
              "pinText", "pinState", "pinExpiry", "pinLapsesDue",
-             "toolArgsChanged"],
+             "toolArgsChanged", "toolPick", "toolPreviewShown"],
   "leases.js": ["leaseLabel", "leaseRemaining", "leaseCountdown", "leaseDomain",
                 "groupLeases"],
   "status.js": ["auditStatus", "rulesStatus", "toolRulesStatus", "toolPinsStatus",
@@ -333,6 +333,88 @@ console.log(JSON.stringify({
       status_cold: m.toolRulesStatus(0, true, false),
       status_quiet: m.toolRulesStatus(2, false, true),
       rank: m.TOOL_ACTION_RANK,
+    };
+  })(),
+  // The tool picker's value folded through renders the way `renderToolPicker` draws
+  // them: each event re-renders, the server select keeps its value while it is offered
+  // and otherwise falls to the first server, and the rules read as [] until they load.
+  // The harness's mcp-github (get_me allowed, create_pull_request on ask, list_commits
+  // and list_issues unruled) plus mcp-other, which has ruled list_commits.
+  toolpick: (() => {
+    const SERVERS = ["mcp-github", "mcp-other"];
+    const INVENTORY = {
+      "mcp-github": { enumerated: true, read_only: [],
+                      tools: ["get_me", "create_pull_request", "list_commits",
+                              "list_issues"] },
+      "mcp-other": { enumerated: true, read_only: [],
+                     tools: ["list_commits", "get_me", "search"] },
+    };
+    const RULES = [
+      { id: 1, server: "mcp-github", tool: "get_me", action: "allow" },
+      { id: 2, server: "mcp-github", tool: "create_pull_request", action: "ask" },
+      { id: 3, server: "mcp-other", tool: "list_commits", action: "deny" },
+    ];
+    const rule = (id, server, tool) => ({ id, server, tool, action: "deny" });
+    const fold = events => {
+      const s = { servers: [], server: "", inventory: {}, rules: [], rulesKnown: false,
+                  tool: "", origin: "provisional" };
+      for (const [kind, arg] of events) {
+        if (kind === "servers") s.servers = arg;
+        if (kind === "inventory") s.inventory = arg;
+        if (kind === "rules") { s.rules = arg; s.rulesKnown = true; }
+        if (kind === "server") s.server = arg;
+        if (kind === "tool") { s.tool = arg; s.origin = "operator"; }
+        if (!s.servers.includes(s.server)) s.server = s.servers[0] || "";
+        const choices = m.toolChoices(s.server, s.inventory, s.rules);
+        Object.assign(s, m.toolPick(choices, s.tool, s.origin, s.rulesKnown));
+      }
+      return { server: s.server, tool: s.tool, origin: s.origin };
+    };
+    const reads = [["servers", SERVERS], ["inventory", INVENTORY], ["rules", RULES]];
+    const orders = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+    // The cases below start from a load whose rules come before the inventory, the
+    // order a keep-whatever-is-offered picker also got right, so each tests only itself.
+    const loaded = [reads[0], reads[2], reads[1]];
+    const added = tools => ["rules", [...RULES, ...tools.map(
+      (t, i) => rule(10 + i, "mcp-github", t))]];
+    return {
+      orders: Object.fromEntries(orders.map(o => [o.join(""), fold(o.map(i => reads[i]))])),
+      operator_kept: fold([...loaded, ["tool", "get_me"], ["rules", RULES],
+                           ["inventory", INVENTORY], ["server", "mcp-other"]]),
+      operator_not_offered: fold([...loaded, ["tool", "create_pull_request"],
+                                  ["server", "mcp-other"]]),
+      page_new_tool_first: fold([...loaded, ["inventory", { ...INVENTORY,
+        "mcp-github": { ...INVENTORY["mcp-github"],
+                        tools: ["new_tool", ...INVENTORY["mcp-github"].tools] } }]]),
+      page_revoke: fold([...loaded, ["rules", RULES.filter(r => r.id !== 1)]]),
+      page_added: fold([...loaded, added(["list_commits"])]),
+      page_added_none_unruled: fold([...loaded, added(["list_commits", "list_issues"])]),
+      page_switch_event: fold([...loaded, ["server", "mcp-other"]]),
+      page_switch_option_gone: fold([...loaded, ["servers", ["mcp-other"]]]),
+      before_rules: fold([reads[0], reads[1]]),
+      // A provisional default that is still unruled once the rules arrive is replaced
+      // all the same: it was drawn from an inventory order the rules never saw.
+      provisional_still_unruled: fold([reads[0],
+        ["inventory", { ...INVENTORY, "mcp-github": { ...INVENTORY["mcp-github"],
+          tools: ["list_issues", "get_me", "create_pull_request", "list_commits"] } }],
+        ["inventory", { ...INVENTORY, "mcp-github": { ...INVENTORY["mcp-github"],
+          tools: ["get_me", "create_pull_request", "list_commits", "list_issues"] } }],
+        reads[2]]),
+      // What the line under the add form shows, with and without a standing notice.
+      shown: (() => {
+        const added = { bad: false, text: "Added: list_commits on mcp-github now asks." };
+        const refused = { bad: true, text: "Not added: unreachable." };
+        const allow = m.toolRulePreview("mcp-github", "list_issues", "allow", RULES);
+        const deny = m.toolRulePreview("mcp-github", "list_issues", "deny", RULES);
+        const none = m.toolRulePreview("mcp-github", "", "deny", RULES);
+        return {
+          allow_text: allow.text, deny_text: deny.text,
+          added_then_allow: m.toolPreviewShown(added, allow),
+          refused_then_deny: m.toolPreviewShown(refused, deny),
+          no_notice: m.toolPreviewShown(null, deny),
+          notice_alone: m.toolPreviewShown(added, none),
+        };
+      })(),
     };
   })(),
   // A pin as the MCP tab shows it, and which of the decision's conditions it fails.
@@ -1606,6 +1688,75 @@ class PageScriptTests(unittest.TestCase):
         # a write — so it is refused here rather than sent.
         self.assertFalse(tp["create_redundant"]["ok"])
         self.assertTrue(tp["create_redundant"]["redundant"])
+
+    def test_the_order_the_load_is_answered_in_does_not_pick_the_tool(self):
+        # A default drawn before the rules are known looks unruled whatever they say;
+        # kept as if chosen, it left the picker on an allowed tool, the add disabled.
+        for order, got in self.probe["toolpick"]["orders"].items():
+            with self.subTest(servers_inventory_rules=order):
+                self.assertEqual(got, {"server": "mcp-github", "tool": "list_commits",
+                                       "origin": "page"})
+
+    def test_a_default_drawn_before_the_rules_is_provisional(self):
+        self.assertEqual(self.probe["toolpick"]["before_rules"],
+                         {"server": "mcp-github", "tool": "get_me",
+                          "origin": "provisional"})
+        # Replaced once the rules arrive even when it is still unruled then.
+        self.assertEqual(self.probe["toolpick"]["provisional_still_unruled"],
+                         {"server": "mcp-github", "tool": "list_commits",
+                          "origin": "page"})
+
+    def test_a_standing_notice_never_hides_what_the_button_would_write(self):
+        # After an add the picker may move on to another tool, and the add has no
+        # confirm because its sentence is on screen before the click: the notice
+        # comes first, the sentence for what is selected now always with it.
+        s = self.probe["toolpick"]["shown"]
+        self.assertEqual(s["added_then_allow"]["text"],
+                         "Added: list_commits on mcp-github now asks. " + s["allow_text"])
+        self.assertTrue(s["added_then_allow"]["wild"], "an allow is flagged under a notice")
+        self.assertEqual(s["refused_then_deny"]["text"],
+                         "Not added: unreachable. " + s["deny_text"])
+        self.assertTrue(s["refused_then_deny"]["wild"], "a refusal is flagged")
+        self.assertEqual(s["no_notice"], {"text": s["deny_text"], "wild": False})
+        self.assertEqual(s["notice_alone"],
+                         {"text": "Added: list_commits on mcp-github now asks.",
+                          "wild": False})
+
+    def test_the_operators_pick_is_kept_while_the_server_offers_it(self):
+        tp = self.probe["toolpick"]
+        # Through rules and inventory refreshes, and a switch to a server offering it.
+        self.assertEqual(tp["operator_kept"],
+                         {"server": "mcp-other", "tool": "get_me", "origin": "operator"})
+        # A server that does not offer it falls back to its first unruled tool.
+        self.assertEqual(tp["operator_not_offered"],
+                         {"server": "mcp-other", "tool": "get_me", "origin": "page"})
+
+    def test_a_page_default_stays_put_while_it_is_unruled(self):
+        # Neither a new unruled tool ahead of it nor a revoke freeing an earlier one
+        # moves the selection under an operator reading its preview.
+        tp = self.probe["toolpick"]
+        for case in ("page_new_tool_first", "page_revoke"):
+            with self.subTest(case=case):
+                self.assertEqual(tp[case], {"server": "mcp-github",
+                                            "tool": "list_commits", "origin": "page"})
+
+    def test_a_page_default_moves_on_once_a_rule_is_added_for_it(self):
+        self.assertEqual(self.probe["toolpick"]["page_added"],
+                         {"server": "mcp-github", "tool": "list_issues", "origin": "page"})
+
+    def test_a_page_default_moves_on_a_switch_to_a_server_that_ruled_it(self):
+        tp = self.probe["toolpick"]
+        # By a change event on the server select, or by its option going.
+        for case in ("page_switch_event", "page_switch_option_gone"):
+            with self.subTest(case=case):
+                self.assertEqual(tp[case], {"server": "mcp-other", "tool": "get_me",
+                                            "origin": "page"})
+
+    def test_a_page_default_falls_to_a_ruled_tool_only_with_no_unruled_one_left(self):
+        # The qualifier on "never sits on a ruled tool": with every tool ruled, the
+        # first ruled one is all there is.
+        self.assertEqual(self.probe["toolpick"]["page_added_none_unruled"],
+                         {"server": "mcp-github", "tool": "get_me", "origin": "page"})
 
     def test_nothing_selected_yet_is_not_an_error(self):
         # Reachable without any typing: a server that has reported no tools leaves the
@@ -4634,6 +4785,36 @@ class ToolPolicySourceTests(unittest.TestCase):
             found = re.search(handler, self.src)
             self.assertIsNotNone(found, f"{handler} no longer matches")
             self.assertIn("refreshServers()", found.group(0))
+
+    def test_the_picker_takes_its_tool_and_origin_from_toolPick(self):
+        """Keeping whatever value is still offered kept a default the page drew before
+        the rules arrived as if the operator had chosen it. `toolPick` knows who chose
+        it; this asserts the picker asks it and does what it says."""
+        self.assertRegex(
+            self.picker,
+            r"const (\w+) = toolPick\(choices, chosen, toolOrigin, toolRulesLoaded\);"
+            r"\s*toolRuleTool\.value = \1\.tool;\s*toolOrigin = \1\.origin;")
+        self.assertNotIn("if (choices.names.includes(chosen)) toolRuleTool.value = chosen;",
+                         self.src, "main's keep-if-present rule is back")
+
+    def test_the_preview_line_is_drawn_from_toolPreviewShown(self):
+        # A notice drawn on its own would hide the sentence for a tool the picker moved
+        # on to after an add, with the button live (toolPreviewShown).
+        self.assertRegex(
+            self.preview,
+            r"const (\w+) = toolPreviewShown\(toolNotice, p\);[\s\S]*"
+            r"toolRulePreviewEl\.hidden = !\1\.text;[\s\S]*"
+            r'toolRulePreviewEl\.className = "empty" \+ \(\1\.wild \? " wild" : ""\);'
+            r"[\s\S]*toolRulePreviewEl\.textContent = \1\.text;")
+        self.assertNotIn("toolNotice.text", self.preview)
+
+    def test_only_the_tool_selects_own_change_makes_the_pick_the_operators(self):
+        handler = re.search(r'toolRuleTool\.addEventListener\("change"[\s\S]*?\n  \}\);',
+                            self.src)
+        self.assertIsNotNone(handler, "the tool select's change handler is gone")
+        self.assertIn('toolOrigin = "operator"', handler.group(0))
+        self.assertEqual(self.src.count('toolOrigin = "operator"'), 1,
+                         "only a change on the tool select is the operator's pick")
 
 
 class PersistConflictSourceTests(unittest.TestCase):

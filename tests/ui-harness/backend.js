@@ -192,19 +192,33 @@ const RULE_WRITES = [
 ];
 
 // What the scenario's last steps change: the rules read answering a new list or
-// failing, and the config read dropped by the network. Each stays in force for the rest
-// of the run once a step sets it, which is why those steps come last.
+// failing, the config read dropped by the network, and the tool rules read answered
+// after every other. Each stays in force for the rest of the run once a step sets it,
+// which is why those steps come last.
 let rulesFailing = false;
 let configAborted = false;
+let toolRulesLast = false;
 export function setRules(rows) { GETS["/api/egress/rules"] = rows; }
 export function failRules() { rulesFailing = true; }
 export function abortConfig() { configAborted = true; }
+export function answerToolRulesLast() { toolRulesLast = true; }
+
+// Which requests the harness answers after every other one it holds (answerQueue). A
+// GET only: a write to the same path keeps its place.
+export function answeredLast(method, path) {
+  return toolRulesLast && method === "GET" && path === "/api/mcp/rules";
+}
+// The order requests were answered in once that is in force, so the step can check
+// the deferral happened: both sides of ui-diff would otherwise read alike without it.
+const answered = [];
+export function answerOrder() { return answered.slice(); }
 
 // `{status, json}` for a request, `{abort: true}` for one the network drops, or null for
 // one this backend does not know — which the harness records, since a path the page
 // asks for and no fixture answers is either a fixture to add or a change in what the
 // page asks.
 export function respond(method, path, body, query) {
+  if (toolRulesLast) answered.push(`${method} ${path}`);
   if (path === "/api/config" && configAborted) return { abort: true };
   if (method === "GET" && path === "/api/egress/rules" && rulesFailing) {
     return { status: 503, json: { detail: "upstream unavailable" } };

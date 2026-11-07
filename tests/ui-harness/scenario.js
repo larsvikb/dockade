@@ -7,7 +7,8 @@
 // A PR that moves a surface out of `start()` adds the steps that exercise it here,
 // in the PR that moves it.
 
-import { HOLDS, NOW_MS, RULES, STALE_HOLD, abortConfig, failRules, setRules } from "./backend.js";
+import { HOLDS, NOW_MS, RULES, STALE_HOLD, abortConfig, answerOrder, answerToolRulesLast,
+         failRules, setRules } from "./backend.js";
 
 const egressCard = page => page.locator("#pending .card:not(.tool)");
 const toolCard = page => page.locator("#pending .card.tool");
@@ -132,7 +133,7 @@ export const STEPS = [
   }],
   // Once seen on one side only: the tool select back on get_me and the add button
   // disabled. The step fails by name if that recurs, read once the page is quiet so a
-  // refresh landing after the picks is counted.
+  // refresh landing after the picks is counted. The last step reproduces that load.
   ["tool rule picked", async ({ page, settle }) => {
     await page.selectOption("#toolrule-server", "mcp-github");
     await page.selectOption("#toolrule-tool", "list_commits");
@@ -300,5 +301,20 @@ export const STEPS = [
       await page.click("#tab-approvals");
       await page.click("#tab-tools");
     });
+  }],
+
+  // A load whose tool rules arrive after the servers and the inventory: the picker's
+  // default, drawn before the rules were known, must not stand as if chosen.
+  ["reload, the tool rules answered last", async ({ load, settle }) => {
+    answerToolRulesLast();
+    await load();
+    await settle();
+    const order = answerOrder();
+    const at = p => order.indexOf(`GET ${p}`);
+    const rules = at("/api/mcp/rules");
+    if (!(at("/api/mcp/servers") >= 0 && at("/api/mcp/inventory") >= 0
+          && rules > at("/api/mcp/servers") && rules > at("/api/mcp/inventory"))) {
+      throw new Error(`the tool rules were not answered last: ${order.join(", ")}`);
+    }
   }],
 ];

@@ -29,6 +29,7 @@ import ast
 import contextlib
 import functools
 import ipaddress
+import itertools
 import json
 import os
 import posixpath
@@ -2360,6 +2361,177 @@ class _MakeRun(unittest.TestCase):
         return subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
             command, env=run_env, stdin=subprocess.DEVNULL, capture_output=True,
             text=True, timeout=60, check=False)
+
+
+class CopyFormError(Exception):
+    """A COPY or ADD line ``_copy_sources`` cannot resolve to repo files."""
+
+
+def _dockerfile_instructions(text: str) -> list[tuple[int, str]]:
+    """Each instruction with the number of its first line, its continuation lines
+    joined and the comment lines among them dropped, as the builder reads them."""
+    instructions: list[tuple[int, str]] = []
+    start, parts = 0, []
+    for number, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if not parts:
+            start = number
+        continued = stripped.endswith("\\")
+        parts.append(stripped[:-1].strip() if continued else stripped)
+        if not continued:
+            instructions.append((start, " ".join(parts)))
+            parts = []
+    if parts:
+        instructions.append((start, " ".join(parts)))
+    return instructions
+
+
+def _copy_sources(text: str, where: str, context: str) -> list[str]:
+    """Every repo file a Dockerfile's COPY lines read, as a path from the repo root:
+    each source joined to ``context``, the build context's path from the root.
+
+    A ``--from=`` copy reads a stage, not the context, and yields nothing. Raises
+    ``CopyFormError`` naming the line on any form it cannot resolve to files, rather
+    than reading it as nothing."""
+    for number, raw in enumerate(text.splitlines(), 1):
+        if raw.strip() and not raw.lstrip().startswith("#"):
+            break
+        if re.match(r"(?i)\s*#\s*escape\s*=", raw):
+            raise CopyFormError(f"an escape directive: {where}:{number}: {raw.strip()}")
+    sources: list[str] = []
+    for number, instruction in _dockerfile_instructions(text):
+        keyword, _, rest = instruction.partition(" ")
+        line = f"{where}:{number}: {instruction}"
+        if "<<" in instruction:
+            raise CopyFormError(f"a heredoc: {line}")
+        if keyword.upper() == "ADD":
+            raise CopyFormError(f"ADD, not read: {line}")
+        if keyword.upper() != "COPY":
+            continue
+        words = rest.split()
+        flags = list(itertools.takewhile(lambda w: w.startswith("--"), words))
+        words = words[len(flags):]
+        if any(f.startswith("--from=") for f in flags):
+            continue
+        if len(words) < 2:
+            raise CopyFormError(f"no source and destination: {line}")
+        if any(w.startswith("--") for w in words):
+            raise CopyFormError(f"a flag after a source: {line}")
+        for source in words[:-1]:
+            if any(c in source for c in "*?[$\"'"):
+                raise CopyFormError(f"a wildcard, variable or quote in source "
+                                    f"{source!r}: {line}")
+            if source.startswith("/"):
+                raise CopyFormError(f"an absolute source {source!r}: {line}")
+            path = posixpath.normpath(posixpath.join(context, source))
+            if path == ".." or path.startswith("../"):
+                raise CopyFormError(f"outside the repo, source {source!r}: {line}")
+            if source.endswith("/") or (ROOT / path).is_dir():
+                raise CopyFormError(f"a directory source {source!r}: {line}")
+            sources.append(path)
+    return sources
+
+
+class ReffilesCoverCopySourcesTests(_MakeRun):
+    """The Makefile's ``REFFILES`` holds every file an image build COPYs.
+
+    ``make consistency`` asserts each REFFILES path exists so a rename cannot silently
+    break the build; a COPY source missing from the list escapes that, and the rename
+    then breaks only the image build, a host check. The list stays hand-kept and this
+    holds it complete, one direction only: it also holds the launchers, which no image
+    COPYs.
+
+    A COPY source is relative to the build context, which is not always the repo root,
+    so each Dockerfile is read with the context of what builds it: compose for the
+    services, ``sc_build_image`` for the sandbox tiers. That function's context, the
+    repo root, is held by ``JdkVariantTests`` in tests/test_launcher_lib.py; here only
+    that each launcher builds through it, with its ``IMAGE_DIR``."""
+
+    def reffiles(self) -> set[str]:
+        run = self.make("--no-print-directory",
+                        "--eval", "print-reffiles: ; @echo $(REFFILES)", "print-reffiles")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        return set(run.stdout.split())
+
+    def compose_builds(self) -> list[tuple[str, str]]:
+        """(Dockerfile, context) of each compose service that builds, as compose
+        resolves them: the Dockerfile from the context, ``Dockerfile`` if unnamed."""
+        builds = []
+        for service in dict.fromkeys(_service_names()):
+            if "build" not in _service(service):
+                continue
+            build = _build_of(service)
+            context = posixpath.normpath(build["context"])
+            builds.append((posixpath.normpath(posixpath.join(
+                context, build.get("dockerfile", "Dockerfile"))), context))
+        self.assertTrue(builds, "no compose service builds an image")
+        return builds
+
+    def launcher_builds(self) -> list[tuple[str, str]]:
+        """(Dockerfile, context) of each sandbox tier: its IMAGE_DIR's Dockerfile,
+        from the repo root."""
+        builds = []
+        launchers = sorted(ROOT.glob("run-*-sandbox.sh"))
+        self.assertTrue(launchers, "no run-*-sandbox.sh launcher found")
+        for launcher in launchers:
+            text = launcher.read_text()
+            image_dir = re.search(r'(?m)^IMAGE_DIR="([^"$]+)"$', text)
+            self.assertIsNotNone(image_dir, f"{launcher.name} sets no IMAGE_DIR")
+            calls = re.findall(r"(?m)^\s*sc_build_image (.*)$", text)
+            self.assertTrue(calls, f"{launcher.name} never calls sc_build_image")
+            for call in calls:
+                self.assertEqual(shlex.split(call)[1:2], ["$IMAGE_DIR"],
+                                 f"{launcher.name} builds other than its IMAGE_DIR: {call}")
+            self.assertNotRegex(text, r"docker\s+(buildx\s+)?build",
+                                f"{launcher.name} builds other than through sc_build_image")
+            builds.append((f"{image_dir.group(1)}/Dockerfile", "."))
+        return builds
+
+    def test_every_copy_source_is_in_reffiles(self):
+        reffiles = self.reffiles()
+        missing = []
+        for dockerfile, context in sorted(set(self.compose_builds() + self.launcher_builds())):
+            sources = _copy_sources((ROOT / dockerfile).read_text(), dockerfile, context)
+            self.assertTrue(sources, f"{dockerfile} yields no COPY source")
+            missing += [f"{source} (COPYed by {dockerfile})"
+                        for source in sources if source not in reffiles]
+        self.assertEqual(missing, [], "add each to REFFILES in the Makefile, so make "
+                                      "consistency asserts it exists")
+
+    def test_the_copy_reader_resolves_what_it_can_and_refuses_the_rest(self):
+        text = ("# a comment\n"
+                "FROM python:3 AS base\n"
+                "COPY --chown=1000:1000 a.py \\\n"
+                "     # dropped, as the builder drops it\n"
+                "     b.py /home/$USERNAME/\n"
+                "COPY --from=base /src /dst\n"
+                "RUN true\n")
+        self.assertEqual(_copy_sources(text, "fixture", "tool-gateway"),
+                         ["tool-gateway/a.py", "tool-gateway/b.py"])
+        wildcard = "a wildcard, variable or quote in source"
+        refused = {'COPY ["a.py", "/dst/"]': wildcard,
+                   "COPY *.py /dst/": wildcard,
+                   "COPY $FILE /dst/": wildcard,
+                   'COPY "a.py" /d/': wildcard,
+                   "COPY a.py": "no source and destination",
+                   "COPY a.py --chmod=644 /d/": "a flag after a source",
+                   "COPY /a.py /d/": "an absolute source",
+                   "COPY sandbox-common /dst/": "a directory source",
+                   "COPY dotfiles/ /dst/": "a directory source",
+                   "COPY ../x /dst/": "outside the repo",
+                   "COPY <<EOF /dst/x": "a heredoc",
+                   "RUN <<EOF": "a heredoc",
+                   "ADD a.py /dst/": "ADD, not read"}
+        for line, reason in refused.items():
+            with self.subTest(line=line), self.assertRaisesRegex(
+                    CopyFormError, rf"^{re.escape(reason)}.*: fixture:2: {re.escape(line)}$"):
+                _copy_sources(f"FROM scratch\n{line}\n", "fixture", ".")
+        with self.assertRaisesRegex(CopyFormError,
+                                    r"^an escape directive: fixture:2: # escape=`$"):
+            _copy_sources("# syntax=docker/dockerfile:1\n# escape=`\nFROM scratch\n",
+                          "fixture", ".")
 
 
 class SecretsDirTests(_MakeRun):

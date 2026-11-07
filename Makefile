@@ -133,7 +133,8 @@ PYFILES := $(wildcard proxies/egress/*.py control-plane/*.py control-plane-ui/*.
 TESTFILES := $(wildcard tests/*.py)
 
 # Files referenced by Dockerfile COPY / entrypoint — existence is asserted so a
-# rename can't silently break the build.
+# rename can't silently break the build. A COPY source missing here fails
+# ReffilesCoverCopySourcesTests in tests/test_topology.py, naming it.
 REFFILES := $(SCRIPTS) \
             claude-sandbox/user-settings.json \
             claude-sandbox/user-CLAUDE.md \
@@ -148,6 +149,7 @@ REFFILES := $(SCRIPTS) \
             proxies/egress/addon.py \
             control-plane/app.py \
             control-plane/store.py \
+            control-plane/audit.py \
             control-plane/policy.py \
             control-plane/holds.py \
             control-plane/ingest.py \

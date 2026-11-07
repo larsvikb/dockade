@@ -302,6 +302,28 @@ export function toolChoices(server, inventory, rules) {
            note: parts.join(" ") };
 }
 
+// Which tool the picker shows, and who chose it: `{ tool, origin }`. The origin is
+// "operator" (a change event on the tool select), "page" (a default drawn with the
+// rules known) or "provisional" (one drawn before they were, when every tool looks
+// unruled whatever the rules say, so it must not count as a default at all).
+//
+// An operator's pick is kept while the server offers it. A page default is kept while
+// it is still unruled, so an inventory push or a revoke never moves it between denied
+// tools under an operator reading the preview; once it is ruled it moves on. A
+// provisional one is replaced by the first render that has the rules, which is what
+// keeps the order the load's reads answer in from deciding the tool. Otherwise the
+// first unruled tool, the one the grouping puts first; with none, the first ruled one,
+// so a page default sits on a ruled tool only when the server has no unruled tool left.
+export function toolPick(choices, current, origin, rulesKnown) {
+  const unruled = choices.unruled.map(r => r.tool);
+  if (origin === "operator" && choices.names.includes(current)) {
+    return { tool: current, origin };
+  }
+  if (origin === "page" && unruled.includes(current)) return { tool: current, origin };
+  const fallback = unruled[0] ?? (choices.ruled[0] ? choices.ruled[0].tool : "");
+  return { tool: fallback, origin: rulesKnown ? "page" : "provisional" };
+}
+
 // What "add rule" is about to write. A deliberately partial mirror of the backend's
 // validation, the same division of labour createPreview follows: this EXPLAINS, the
 // backend REFUSES. Only the conflict and the no-op are mirrored — both because the fix
@@ -346,6 +368,18 @@ export function toolRulePreview(server, tool, action, rules) {
            // rule did not already withhold.
            danger: verb === "allow",
            text: consequence };
+}
+
+// What the line under the add form shows: the last submit's notice while it stands,
+// and with it, always, the sentence the button would write now. The add has no confirm
+// because that sentence is on screen before the click; after an add the picker can move
+// on to another tool, so a notice standing alone would leave the button writing a rule
+// nobody was shown. Flagged if either half is.
+export function toolPreviewShown(notice, preview) {
+  return {
+    text: [notice ? notice.text : "", preview.text].filter(Boolean).join(" "),
+    wild: Boolean((notice && notice.bad) || preview.danger),
+  };
 }
 
 // What moving a rule between deny, ask and allow is about to do.
@@ -795,10 +829,13 @@ let toolRulesFailed = false;
 let toolRulesLoaded = false;
 let inventory = {};
 let inventoryFailed = false;
-// What the last submit came back with, outranking the preview while it stands — the
-// same split the egress form draws between "what this click would do" and "what the
-// last one did", including the refusals this page deliberately does not mirror.
+// What the last submit came back with, while it stands — the split the egress form
+// draws between "what this click would do" and "what the last one did", including the
+// refusals this page deliberately does not mirror. Shown beside the preview rather
+// than over it, since this form has no confirm (toolPreviewShown).
 let toolNotice = null;
+// Who chose the tool the picker shows: see toolPick.
+let toolOrigin = "provisional";
 
 function renderToolServerOptions() {
   const chosen = toolRuleServer.value;
@@ -847,8 +884,11 @@ function renderToolPicker() {
   group("no rule yet — denied", choices.unruled);
   group("already ruled", choices.ruled);
   // Keep the operator's choice across a refresh; otherwise an inventory push landing
-  // mid-edit silently re-points the rule they are composing at a different tool.
-  if (choices.names.includes(chosen)) toolRuleTool.value = chosen;
+  // mid-edit silently re-points the rule they are composing at a different tool. A
+  // default the page chose is not kept the same way (toolPick).
+  const pick = toolPick(choices, chosen, toolOrigin, toolRulesLoaded);
+  toolRuleTool.value = pick.tool;
+  toolOrigin = pick.origin;
   // Empty because nothing has been reported, which is a state this form cannot write
   // its way out of — there is no free-text path, deliberately (see index.html). The
   // control is disabled rather than left as an empty box that looks clickable.
@@ -878,12 +918,11 @@ function renderToolRulePreview() {
   // button is off and the note above says why. The same goes for a server that has
   // reported no tools: there is nothing the picker could have selected.
   toolRuleAdd.disabled = !p.ok || serversByName.size === 0 || toolRuleTool.disabled;
-  const text = toolNotice ? toolNotice.text : p.text;
-  toolRulePreviewEl.hidden = !text;
+  const shown = toolPreviewShown(toolNotice, p);
+  toolRulePreviewEl.hidden = !shown.text;
   // Colour is never the only cue here either; the wording carries the direction.
-  toolRulePreviewEl.className =
-    "empty" + ((toolNotice ? toolNotice.bad : p.danger) ? " wild" : "");
-  toolRulePreviewEl.textContent = text;
+  toolRulePreviewEl.className = "empty" + (shown.wild ? " wild" : "");
+  toolRulePreviewEl.textContent = shown.text;
 }
 
 function renderToolRules(rows) {
@@ -1000,11 +1039,17 @@ function mountToolPolicy() {
   toolRulePreviewEl = document.getElementById("toolrule-preview");
   toolRuleCountEl = document.getElementById("toolrulecount");
 
-  for (const el of [toolRuleServer, toolRuleTool, toolRuleAction]) {
-    // Any edit invalidates the last submit's verdict — leaving it up would attach a
-    // refusal to a rule that is no longer the one on screen.
+  // Any edit invalidates the last submit's verdict — leaving it up would attach a
+  // refusal to a rule that is no longer the one on screen.
+  for (const el of [toolRuleServer, toolRuleAction]) {
     el.addEventListener("change", () => { toolNotice = null; renderToolPicker(); });
   }
+  // The one change that makes the tool the operator's choice.
+  toolRuleTool.addEventListener("change", () => {
+    toolNotice = null;
+    toolOrigin = "operator";
+    renderToolPicker();
+  });
 
   toolRuleForm.addEventListener("submit", async ev => {
     // Always, for the reason the egress form gives: `form-action 'none'` in the CSP

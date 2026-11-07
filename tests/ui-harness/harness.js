@@ -4,8 +4,9 @@
 // and its DOM. There are no expected values. `make ui-diff` runs this on the base tree
 // and on the branch and diffs the two transcripts, so the oracle is the previous
 // version of the page. For two runs of one page to read the same, the page's API
-// requests are answered one at a time in the order it made them, never while the
-// clock moves, and a step ends only once the page is quiet (answerQueue).
+// requests are answered one at a time in the order it made them, except a read the
+// backend names to answer last, never while the clock moves, and a step ends only once
+// the page is quiet (answerQueue).
 //
 //   node harness.js <served dir> <transcript out> [approval|tasks]
 //
@@ -35,7 +36,7 @@ if (!uiDir || !outFile || !PAGES[which]) {
   console.error("usage: node harness.js <served dir> <transcript out> [approval|tasks]");
   process.exit(2);
 }
-const { respond } = await import(PAGES[which][0]);
+const { respond, answeredLast = () => false } = await import(PAGES[which][0]);
 const { STEPS } = await import(PAGES[which][1]);
 if (!existsSync(BROWSER)) {
   console.error(`no browser at ${BROWSER}. The tier-1 sandbox image has one; elsewhere, `
@@ -125,13 +126,18 @@ function stampFetches() {
 // an answer to, whose moment depends on the network. A step that cannot go quiet within
 // `boundMs` fails.
 //
+// Request order alone hides a page bug that depends on the order answers arrive in, so
+// `last(method, path)` names requests to answer after every other one held: the backend's
+// `answeredLast`. Among those, lowest stamp first again.
+//
 // Quiet is every fetch the page has pending held here and no body read pending, at two
 // looks LOOK_MS apart: the page's timers are frozen, so the only work it can still be
 // doing is handling an answer, and the second look covers the turns between a body read
-// and the fetch the handler sends next. The pump answers the lowest stamp each time the
-// page is quiet, and `idle()` waits for quiet with nothing it may answer.
+// and the fetch the handler sends next. The pump answers the lowest (last, stamp) each
+// time the page is quiet, and `idle()` waits for quiet with nothing it may answer.
 const LOOK_MS = 25;
-function answerQueue(page, answer, logLine, logAside, { boundMs = 20000 } = {}) {
+function answerQueue(page, answer, logLine, logAside,
+                     { boundMs = 20000, last = () => false } = {}) {
   const held = new Map();
   const retired = new Set();
   let doc = null;
@@ -173,14 +179,16 @@ function answerQueue(page, answer, logLine, logAside, { boundMs = 20000 } = {}) 
       // `idle()` turns it into a failed step that names it, rather than a guess at
       // where in the order it belongs.
       const key = `unstamped ${unstamped++}`;
-      held.set(key, { key, doc: null, seq: Infinity, route, line });
+      held.set(key, { key, doc: null, seq: Infinity, last: false, route, line });
       return;
     }
     const [from, seq] = stamp.split(" ");
     if (retired.has(from)) return dropRetired(route, line);
     adopt(from);
     const key = `${from} ${seq}`;
-    held.set(key, { key, doc: from, seq: Number(seq), route, line });
+    const req = route.request();
+    const isLast = Boolean(last(req.method(), new URL(req.url()).pathname));
+    held.set(key, { key, doc: from, seq: Number(seq), last: isLast, route, line });
   }
 
   async function look() {
@@ -212,7 +220,8 @@ function answerQueue(page, answer, logLine, logAside, { boundMs = 20000 } = {}) 
       quietRun = await look() ? quietRun + 1 : 0;
       if (quietRun < 2) continue;
       const next = paused > 0 ? null
-        : [...held.values()].filter(h => h.doc === doc).sort((a, b) => a.seq - b.seq)[0];
+        : [...held.values()].filter(h => h.doc === doc)
+          .sort((a, b) => (a.last - b.last) || (a.seq - b.seq))[0];
       if (next) {
         quietRun = 0;
         await release(next);
@@ -376,7 +385,7 @@ async function main() {
     // A request the network drops, so the page's `fetch` throws.
     if (answer.abort) return await route.abort();
     await route.fulfill({ status: answer.status, json: answer.json });
-  }, line => log.push(line), line => unanswered.push(line));
+  }, line => log.push(line), line => unanswered.push(line), { last: answeredLast });
 
   await page.route("**/*", async route => {
     const req = route.request();

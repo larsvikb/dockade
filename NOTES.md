@@ -740,8 +740,17 @@ proxy settings.
 `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` set, with `--no-sandbox` (its reason is in
 `claude-sandbox/Dockerfile`) and the two flags above, and loaded a page in about 0.3 s.
 The package is a single one with no dependencies, 14 MB installed. Through one version
-of skew, 1.63 drives the 154 shell through the whole UI harness scenario; nothing was
-run on Playwright's own 153 to compare against.
+of skew, 1.63 drives the 154 shell through the whole UI harness scenario.
+
+**The browser the pinned version names agrees with Debian's on the expected-value tests.**
+Measured 2026-11-08, on the first `ui-e2e` run in CI (`make ui-test` on
+`ubuntu-latest`, node 24.22.2): `playwright-core` 1.63.0's own install fetched Google
+Chrome for Testing's headless shell 153.0.8010.12, a 114.3 MiB download, plus a 2.3 MiB
+FFmpeg the tests do not use. The whole install step, its apt libraries included, took
+15 s. The 19 tests in `tests/ui-harness/approval.test.js` passed in 20.2 s. The same
+tests pass on the tier-1 image's Debian shell, since moved to 156.0.8078.79, so three
+versions of skew changed no verdict. The tests assert on DOM, text and requests, never
+pixels.
 
 ## The UI harness had three races, all between it and the page
 

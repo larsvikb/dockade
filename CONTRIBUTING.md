@@ -87,10 +87,11 @@ pattern reports a reassuring "caught" while testing nothing. And **delete
 mutant, and `-B` alone does not stop it".
 
 Behaviour that touches the DOM — `start()` in `control-plane-ui/app.js`, and the DOM
-half of a surface's own module, which `start()` mounts — runs only in a browser
-and is deliberately not unit-tested. Where a mistake there would be silent, the
-convention is a **source-level guard** — a test that reads that module and asserts the
-call site looks right. There are several to copy from.
+half of a surface's own module, which `start()` mounts — runs only in a browser, so it
+is not in `make test`. The approval page's cards have expected-value tests in a browser,
+`make ui-test` (`tests/ui-harness/approval.test.js`). Elsewhere, where a mistake would
+be silent, the convention is a **source-level guard** — a test that reads that module
+and asserts the call site looks right. There are several to copy from.
 
 ## Commits
 

@@ -217,7 +217,7 @@ REFFILES := $(SCRIPTS) \
         rebuild logs-ep logs-cp logs-tg tool-outcomes tool-content \
         print-config-home \
         mcp-up mcp-down mcp-ps mcp-tools gateway-tools tasks-up tasks-down \
-        claude opencode boundary check-boundary split-check ui-diff
+        claude opencode boundary check-boundary split-check ui-diff ui-test
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -572,6 +572,26 @@ test: ## Run the governance unit tests (dependency-free; python -m unittest)
 	DOCKADE_REQUIRE_TOOLS=$(REQUIRE_TOOLS) \
 	  python3 -W ignore::ResourceWarning -m unittest discover -s tests -t tests -v
 
+# The two browser targets' shared steps, as shell functions. `harness_install` puts the
+# pinned playwright-core in place from the harness's lockfile unless it is there
+# already; `serve_page <ui> <dir>` lays a page out in <dir> as its image serves it, the
+# UI's files and ui-common/'s in one directory.
+define UI_HARNESS_SH
+harness=tests/ui-harness
+harness_install() {
+  pinned=$$(node -p 'require("./'$$harness'/package.json").dependencies["playwright-core"]')
+  installed=$$(node -p 'try { require("./'$$harness'/node_modules/playwright-core/package.json").version } catch { "" }')
+  if [ "$$installed" != "$$pinned" ]; then
+    echo "== installing playwright-core $$pinned from the harness's lockfile =="
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci --prefix "$$harness" --no-audit --no-fund --ignore-scripts
+  fi
+}
+serve_page() {
+  for d in "$$1" ui-common; do cp "$$d"/*.js "$$2/"; done
+  cp "$$1/index.html" "$$2/"
+}
+endef
+
 # Not part of `check`: it needs a browser and an npm install, and its question — does
 # the page still do what it did on the base — only has an answer on a branch. Both runs
 # use THIS tree's harness and scenario, so steps a branch adds run against the base too.
@@ -579,18 +599,13 @@ test: ## Run the governance unit tests (dependency-free; python -m unittest)
 UI_DIFF_BASE ?= main
 UI_DIFF_PAGE ?= approval
 ui-diff: ## Run a page's scenario (UI_DIFF_PAGE=approval|tasks) on UI_DIFF_BASE (default main) and on this tree in a headless browser, and diff the two
-	@harness=tests/ui-harness
+	@$(UI_HARNESS_SH)
 	case "$(UI_DIFF_PAGE)" in
 	  approval) ui=control-plane-ui;;
 	  tasks) ui=tasks-ui;;
 	  *) echo "UI_DIFF_PAGE is approval or tasks, not $(UI_DIFF_PAGE)"; exit 2;;
 	esac
-	pinned=$$(node -p 'require("./'$$harness'/package.json").dependencies["playwright-core"]')
-	installed=$$(node -p 'try { require("./'$$harness'/node_modules/playwright-core/package.json").version } catch { "" }')
-	if [ "$$installed" != "$$pinned" ]; then
-	  echo "== installing playwright-core $$pinned from the harness's lockfile =="
-	  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci --prefix "$$harness" --no-audit --no-fund --ignore-scripts
-	fi
+	harness_install
 	# The transcripts are kept, pass or fail: a pass has an empty diff, so they are its
 	# only record, and comparing two runs' is how a scenario's determinism is checked.
 	# Each run gets its own directory because runs may be concurrent, and each start
@@ -602,8 +617,8 @@ ui-diff: ## Run a page's scenario (UI_DIFF_PAGE=approval|tasks) on UI_DIFF_BASE 
 	  || echo "== ui-diff: could not remove every run older than a day from $$tmp; going on =="
 	out=$$(mktemp -d "$$tmp/dockade-ui-diff.XXXXXX")
 	trap 'rm -rf "$$out"' EXIT
-	# Each page as its image serves it: the UI's files and ui-common/'s in one
-	# directory. A base from before ui-common/, or before the UI, has only what it had.
+	# Each page as its image serves it. A base from before ui-common/, or before the UI,
+	# has only what it had.
 	base_dirs=$$(git ls-tree -d --name-only "$(UI_DIFF_BASE)" "$$ui" ui-common)
 	mkdir "$$out/base" "$$out/tree"
 	if [ -n "$$base_dirs" ]; then
@@ -611,8 +626,7 @@ ui-diff: ## Run a page's scenario (UI_DIFF_PAGE=approval|tasks) on UI_DIFF_BASE 
 	  for d in $$base_dirs; do cp "$$out/$$d"/*.js "$$out/base/"; done
 	  cp "$$out/$$ui/index.html" "$$out/base/" 2>/dev/null || true
 	fi
-	for d in "$$ui" ui-common; do cp "$$d"/*.js "$$out/tree/"; done
-	cp "$$ui/index.html" "$$out/tree/"
+	serve_page "$$ui" "$$out/tree"
 	# A run whose step failed still writes its transcript, so the diff runs either way.
 	failed=""
 	echo "== $(UI_DIFF_BASE) =="
@@ -632,6 +646,33 @@ ui-diff: ## Run a page's scenario (UI_DIFF_PAGE=approval|tasks) on UI_DIFF_BASE 
 	       "transcripts in $$out =="
 	  exit 1
 	fi
+
+# The approval page against expected values (tests/ui-harness/approval.test.js). Not part
+# of `check` or `test`, which stay browser-free: control-plane-ui/DESIGN.md says why. CI
+# runs it in its own job; `make ui-test DOCKADE_REQUIRE_TOOLS=1` is that job's command.
+# A missing node or browser SKIPs, and FAILs under DOCKADE_REQUIRE_TOOLS. An npm install
+# that fails, offline say, fails in either mode: the tools were there and the run was not.
+ui-test: ## Run the approval page's browser tests with expected values (needs node and a headless Chromium)
+	@$(UI_HARNESS_SH)
+	miss() {
+	  if [ -n "$(REQUIRE_TOOLS)" ]; then
+	    echo "  FAIL: $$1, and DOCKADE_REQUIRE_TOOLS is set —"
+	    echo "        refusing to report success for a check that never ran."
+	    exit 1
+	  fi
+	  echo "SKIP ui-test ($$1)"
+	  exit 0
+	}
+	command -v node >/dev/null 2>&1 || miss "node is not installed"
+	browser=$$(cd "$$harness" && node --input-type=module \
+	  -e 'import { BROWSER } from "./page.js"; console.log(BROWSER)')
+	[ -x "$$browser" ] || miss "no browser at $$browser (UI_HARNESS_BROWSER names one)"
+	harness_install
+	out=$$(mktemp -d "$${TMPDIR:-/tmp}/dockade-ui-test.XXXXXX")
+	trap 'rm -rf "$$out"' EXIT
+	serve_page control-plane-ui "$$out"
+	echo "== ui-test: the approval page, $$("$$browser" --version 2>/dev/null || echo "$$browser") =="
+	node "$$harness/approval.test.js" "$$out"
 
 verify-build: ## Assert every default image still builds (skipped if docker unavailable)
 	@if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then

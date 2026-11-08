@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // The control plane the page talks to, faked. Nothing here has to be what the real
-// backend would answer: both runs get the same answers, so only a difference in what
-// the PAGE does with them shows up in the diff. Each fixture only has to reach the
-// rendering branch it exists for.
+// backend would answer: both of ui-diff's runs get the same answers, so only a
+// difference in what the PAGE does with them shows up in the diff, and
+// approval.test.js works its expected values out from the values here. Each fixture
+// only has to reach the rendering branch it exists for.
 
-// Every run sees the same instant (see the clock in harness.js), so a stamp here
+// Every run sees the same instant (see the clock in page.js), so a stamp here
 // renders the same text in both runs.
 export const NOW_MS = Date.UTC(2026, 8, 15, 10, 0, 0);
 const NOW = NOW_MS / 1000;
@@ -203,6 +204,19 @@ export function failRules() { rulesFailing = true; }
 export function abortConfig() { configAborted = true; }
 export function answerToolRulesLast() { toolRulesLast = true; }
 
+// approval.test.js's, never the scenario's: each test starts from `reset()`, and one
+// changes what the backend says it resolved, so the test can tell a card that reports
+// the response from one that reports the click. ui-diff never calls either, so the
+// switches above still carry from step to step there.
+let resolveOverride = null;
+export function overrideResolve(change) { resolveOverride = change; }
+export function reset() {
+  GETS["/api/egress/rules"] = RULES;
+  rulesFailing = configAborted = toolRulesLast = false;
+  answered.length = 0;
+  resolveOverride = null;
+}
+
 // Which requests the harness answers after every other one it holds (answerQueue). A
 // GET only: a write to the same path keeps its place.
 export function answeredLast(method, path) {
@@ -245,7 +259,8 @@ export function respond(method, path, body, query) {
     return { status: 409, json: { ok: false, status: "withdrawn" } };
   }
   if (method === "POST" && resolve) {
-    return { status: 200, json: resolved(decodeURIComponent(resolve[1]), body) };
+    const answer = resolved(decodeURIComponent(resolve[1]), body);
+    return { status: 200, json: resolveOverride ? resolveOverride(answer) : answer };
   }
   const write = method === "POST"
     && [...MCP_WRITES, ...RULE_WRITES].find(([re]) => re.test(path));

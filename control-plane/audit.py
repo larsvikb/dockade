@@ -98,6 +98,13 @@ Q_MAX = 200
 EVENTS_LIMIT_MAX = 200
 EVENTS_LIMIT_DEFAULT = 100
 
+# The ids a page cursor may carry: the integers SQLite can bind, the same fact as
+# ``store.SQLITE_INTEGERS`` (this module imports nothing; a test holds the two equal).
+# ``encode_cursor`` writes a stored row id, which always fits, so an id outside it
+# did not come from a previous page, and binding it would raise OverflowError.
+# Compared against its ends, as ``store._bindable`` explains.
+_CURSOR_IDS = range(-2**63, 2**63)
+
 
 class FilterError(ValueError):
     """A filter the caller must be TOLD about rather than have ignored.
@@ -341,7 +348,8 @@ def decode_cursor(cursor: str) -> tuple[float, int]:
         # a store that is full. An infinity compares true against every row, so it
         # serves page 1 while the pager believes it is deeper. Both are the "looks like
         # data, not like an error" outcome this refusal exists to prevent.
-        ok = _finite(at)
+        ok = (_finite(at)
+              and _CURSOR_IDS.start <= row_id < _CURSOR_IDS.stop)
     except ValueError:
         ok = False
     if not ok:

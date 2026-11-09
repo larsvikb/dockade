@@ -494,7 +494,8 @@ fi
 #              exits non-zero when a name does not resolve.
 #   liveness — `dig`, to tell a resolver that REFUSES from one that is not there.
 #              Without it a container with no DNS at all would pass, which is the
-#              vacuous pass this check exists to avoid.
+#              vacuous pass this check exists to avoid. With no dig installed,
+#              liveness cannot be shown, so that too is inconclusive.
 # Never `if dig ...` for the leak: the embedded resolver answers SERVFAIL
 # ("recursion requested but not available") and dig EXITS 0 for it, so the exit
 # status reads a working refusal as a leak. Assert on the answer, not the status.
@@ -504,8 +505,9 @@ if [ "${SANDBOX_MODE:-}" = "local" ] || [ -n "${HTTPS_PROXY:-}" ]; then
     # resolve an external name itself.
     if getent hosts example.com >/dev/null 2>&1; then
         bad "external name resolved via the default resolver — embedded DNS is forwarding off an internal network (exfil channel)"
-    elif command -v dig >/dev/null 2>&1 &&
-         ! dig +time=3 +tries=1 example.com 2>/dev/null | grep -q 'status: '; then
+    elif ! command -v dig >/dev/null 2>&1; then
+        info "external names unresolvable, but dig is not installed to show the embedded resolver answering — inconclusive, not asserted"
+    elif ! dig +time=3 +tries=1 example.com 2>/dev/null | grep -q 'status: '; then
         info "external names unresolvable, but the embedded resolver did not answer either — inconclusive, not asserted"
     else
         ok "embedded resolver refuses external names (no DNS forwarding off an internal network)"

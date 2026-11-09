@@ -310,7 +310,10 @@ def load_discovery(env: dict[str, str] | None = None) -> types.ModuleType:
     Separate from ``load_tool_gateway`` because the two read different environments
     and a test that varies one must not have to satisfy the other's bind guard. Same
     fresh-name-per-call rule, and for the same reason: these constants resolve at
-    module scope."""
+    module scope. Its sibling ``outcomes`` resolves by plain name, as in the container."""
+    pkg_dir = str(ROOT / "tool-gateway")
+    if pkg_dir not in sys.path:
+        sys.path.insert(0, pkg_dir)
     previous = {k: os.environ.get(k) for k in (env or {})}
     os.environ.update(env or {})
     try:

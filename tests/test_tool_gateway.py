@@ -285,6 +285,44 @@ class ReconcileSurvivalTests(unittest.TestCase):
         self.assertIn("report:1", printed)
 
 
+class ServerTextInTheReportTests(unittest.TestCase):
+    """A server's own text in the roster report must not fail the print, which sits
+    between publishing the listing and pushing the inventory."""
+
+    def test_a_surrogate_in_a_servers_error_still_reaches_the_push(self):
+        gateway = load_tool_gateway(GOOD)
+        gateway.surface = load_surface()
+        real = gateway.discovery
+        roster = [{"server": "mcp-github", "auth": {}, "tools": []}]
+        # As `json.loads` hands it over: a server can send an escaped lone surrogate.
+        results = [{"server": "mcp-github", "rules": 0,
+                    "status": "server returned an error: " + json.loads('"\\ud800"')}]
+        pushed = []
+
+        class FakeDiscovery:
+            poll = staticmethod(lambda: (roster, ""))
+            roster_digest = staticmethod(real.roster_digest)
+            reconcile_all = staticmethod(lambda _roster: results)
+            format_report = staticmethod(real.format_report)
+
+            @staticmethod
+            def push_inventory(sent):
+                pushed.append(sent)
+                return ""
+
+        gateway.discovery = FakeDiscovery
+        # Strict UTF-8: the container's surrogateescape stdout raises on U+D800 too.
+        raw = io.BytesIO()
+        out = io.TextIOWrapper(raw, encoding="utf-8", errors="strict")
+        with mock.patch("sys.stdout", out):
+            enumerated, _reachable, _deadline = gateway._reconcile_once(None, None, 0.0)
+        out.flush()
+        self.assertEqual(pushed, [results])
+        self.assertEqual(enumerated, real.roster_digest(roster))
+        self.assertIn("NOT ENUMERATED — server returned an error: " + chr(92) + "ud800",
+                      raw.getvalue().decode())
+
+
 class WithheldToolReportTests(unittest.TestCase):
     """A tool the reply cannot carry is withheld from the agent, and the operator is
     told on the reconcile report's cadence, ahead of the report itself."""

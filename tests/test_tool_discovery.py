@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import http.server
+import io
 import json
 import socket
 import sys
@@ -654,6 +655,87 @@ class ReconcileTests(unittest.TestCase):
         # value of this module is that a reader can tell the difference.
         self.assertIn("no enabled servers",
                       "\n".join(self.discovery.format_report([])))
+
+
+#: A backslash, written so that no expected line below relies on a Python escape
+#: meaning what the printer's does.
+BS = chr(92)
+
+
+class ReportPrintTests(unittest.TestCase):
+    """The report on the gateway's stdout, where a server's own text lands: its error
+    as a status, its tool names. Every assertion is a whole line, so a different
+    escaping, or a cap, fails it rather than slipping past a substring."""
+
+    def setUp(self):
+        self.discovery = load_discovery()
+
+    def _print(self, results: list[dict]) -> str:
+        # Strict UTF-8, which is stricter than the container's surrogateescape stdout:
+        # that one writes U+DC80 to U+DCFF as raw bytes and raises on the rest, so
+        # anything this harness accepts, the gateway's stdout accepts too.
+        raw = io.BytesIO()
+        out = io.TextIOWrapper(raw, encoding="utf-8", errors="strict")
+        with mock.patch("sys.stdout", out):
+            for line in self.discovery.format_report(results):
+                print(line)
+        out.flush()
+        return raw.getvalue().decode()
+
+    def test_plain_text_prints_as_it_is_and_uncapped(self):
+        # The cap is the outcome stream's, sized for its file; a status on the report
+        # is shown whole. Fixed well above that cap's default of 512, so the pin holds
+        # on code that never imported outcomes, as well as on code that does.
+        status = "unreachable: " + "x" * 4096
+        results = [{"server": "mcp-github", "status": "ok", "rules": 2, "exposed": 2,
+                    "ruled_but_absent": ["create_pr"],
+                    "exposed_but_unruled": ["merge_pull_request", "push"]},
+                   {"server": "mcp-widgets", "status": status, "rules": 1}]
+        self.assertEqual(self.discovery.format_report(results), [
+            "tool-gateway: mcp-github: 2 tools exposed, 2 rules",
+            "tool-gateway:   rules for tools the server does not expose (dead policy): "
+            "create_pr",
+            "tool-gateway:   tools with no rule (denied by default): "
+            "merge_pull_request, push",
+            f"tool-gateway: mcp-widgets: NOT ENUMERATED — {status}"])
+
+    def test_a_servers_error_text_prints_escaped_and_cannot_fail_the_print(self):
+        # A high surrogate, a low one outside surrogateescape's range, an ESC and a
+        # newline: the first two would raise on the container's stdout, the last two
+        # would rewrite the operator's terminal. The name is the roster's raw value,
+        # which check_name's refusal keeps on a NOT ENUMERATED result.
+        result = {"server": "bad" + chr(0xDC00),
+                  "status": ("server returned an error: " + chr(0xD800) + chr(0xDD00)
+                             + chr(0x1B) + "[2J" + "\nforged"),
+                  "rules": 0}
+        self.assertEqual(self._print([result]),
+                         f"tool-gateway: bad{BS}udc00: NOT ENUMERATED — server returned "
+                         f"an error: {BS}ud800{BS}udd00{BS}x1b[2J{BS}nforged\n")
+
+    def test_a_servers_tool_names_print_escaped_on_both_lists(self):
+        result = {"server": "mcp-github", "status": "ok", "rules": 2, "exposed": 2,
+                  "ruled_but_absent": ["dead" + chr(0xD801), "gone\r"],
+                  "exposed_but_unruled": ["new" + chr(0xDE00), "x" + chr(0x9B) + "y"]}
+        self.assertEqual(self._print([result]),
+                         "tool-gateway: mcp-github: 2 tools exposed, 2 rules\n"
+                         "tool-gateway:   rules for tools the server does not expose "
+                         f"(dead policy): dead{BS}ud801, gone{BS}r\n"
+                         "tool-gateway:   tools with no rule (denied by default): "
+                         f"new{BS}ude00, x{BS}x9by\n")
+
+    def test_each_name_is_printed_on_its_own_so_a_non_string_one_still_prints(self):
+        # Escaped per name, before the join: a join over a name that is not a string
+        # raises, and the push after the report never happens.
+        result = {"server": "mcp-github", "status": "ok", "rules": 0, "exposed": 1,
+                  "ruled_but_absent": [], "exposed_but_unruled": [5]}
+        self.assertEqual(self.discovery.format_report([result])[1],
+                         "tool-gateway:   tools with no rule (denied by default): 5")
+
+    def test_a_result_with_no_server_name_prints_none(self):
+        result = {"server": None, "status": "a roster entry with no name", "rules": 0}
+        self.assertEqual(self.discovery.format_report([result]),
+                         ["tool-gateway: None: NOT ENUMERATED — a roster entry with "
+                          "no name"])
 
 
 class DigestTests(unittest.TestCase):

@@ -252,14 +252,22 @@ def _field(value: object) -> object:
 _UNPRINTABLE = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029\ud800-\udfff]")
 
 
+def printable(value: object) -> str:
+    """``value`` as text the gateway's stdout can carry: on one line, and writable
+    there whatever its encoding. The gateway's one definition of that, so the next
+    thing that prints a server's text uses this rather than a copy. Escaped rather
+    than stripped, so what was sent stays visible. Uncapped: the cap is the outcome
+    stream's, in ``_printable``."""
+    return _UNPRINTABLE.sub(lambda m: m.group().encode("unicode_escape").decode("ascii"),
+                            str(value))
+
+
 def _printable(value: object) -> str:
-    """One field of the stdout line: capped like the file's, and kept on one line.
+    """One field of the outcome line: capped like the file's, and kept on one line.
     ``reason`` is a third party's text, and with its newlines intact a server could
     append a whole forged ``OUTCOME ok …`` line to `make logs-tg` — the feed a human
-    reads to see what ran. Escaped rather than stripped, so what was sent stays
-    visible."""
-    return _UNPRINTABLE.sub(lambda m: m.group().encode("unicode_escape").decode("ascii"),
-                            str(_field(value)))
+    reads to see what ran."""
+    return printable(_field(value))
 
 
 def _wire(result: dict | None) -> bytes | None:

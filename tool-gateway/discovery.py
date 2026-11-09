@@ -49,13 +49,15 @@ import socket
 import urllib.error
 import urllib.request
 
-#: A DNS label, the same shape `policy._server_name_error` holds registration to. The
-#: name is used as a hostname and as a filename, so both uses want exactly this.
+import outcomes
+
 #: The id every request to a server carries. One call per connection, so one id is
 #: enough — and it is a name rather than a literal because the parser has to pick the
 #: reply that answers it out of whatever else the stream carries.
 REQUEST_ID = 1
 
+#: A DNS label, the same shape `policy._server_name_error` holds registration to. The
+#: name is used as a hostname and as a filename, so both uses want exactly this.
 _SERVER_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 
 #: The control plane's TOOL bridge, by ADDRESS rather than by name — the one place
@@ -513,20 +515,31 @@ def _count(n: int, noun: str) -> str:
     return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
 
 
+def _names(names: list) -> str:
+    """Tool names from a server or the roster, each escaped before the join, so one
+    that is not a string prints rather than failing the join."""
+    return ", ".join(outcomes.printable(name) for name in names)
+
+
 def format_report(results: list[dict]) -> list[str]:
     """The report as lines, so the caller owns where it goes.
 
     Stdout, deliberately, even now that the gateway has an audit path
     (``outcomes.py``): this grants nothing and records no capability, so the audit
     invariant — which exists to record capability GRANTED — does not reach it, and
-    the outcome stream records how CALLS ended, which a roster report is not."""
+    the outcome stream records how CALLS ended, which a roster report is not. It does
+    use that module's stdout guard: every value here that a server or the roster
+    wrote goes through ``outcomes.printable``, so a control character in one cannot
+    rewrite the line, and a lone surrogate cannot fail the print and with it the
+    inventory push that follows."""
     if not results:
         return ["tool-gateway: no enabled servers on the roster — nothing to reconcile"]
     lines = []
     for result in results:
-        server = result["server"]
+        server = outcomes.printable(result["server"])
         if result["status"] != "ok":
-            lines.append(f"tool-gateway: {server}: NOT ENUMERATED — {result['status']}")
+            lines.append(f"tool-gateway: {server}: NOT ENUMERATED — "
+                         f"{outcomes.printable(result['status'])}")
             continue
         # Counted nouns, because both of these are routinely 1 — a server with one
         # tool, and the first rule anyone writes. "1 rules" in the line an operator
@@ -536,10 +549,10 @@ def format_report(results: list[dict]) -> list[str]:
                      f"exposed, {_count(result['rules'], 'rule')}")
         if result["ruled_but_absent"]:
             lines.append(f"tool-gateway:   rules for tools the server does not expose "
-                         f"(dead policy): {', '.join(result['ruled_but_absent'])}")
+                         f"(dead policy): {_names(result['ruled_but_absent'])}")
         if result["exposed_but_unruled"]:
             lines.append(f"tool-gateway:   tools with no rule (denied by default): "
-                         f"{', '.join(result['exposed_but_unruled'])}")
+                         f"{_names(result['exposed_but_unruled'])}")
         if not result["ruled_but_absent"] and not result["exposed_but_unruled"]:
             lines.append("tool-gateway:   policy and server agree")
     return lines

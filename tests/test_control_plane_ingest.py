@@ -620,6 +620,13 @@ class ToolOutcomeRowTests(unittest.TestCase):
         outcomes = load_outcomes()
         self.assertEqual(set(cp.ingest.TOOL_STATUSES), set(outcomes.STATUSES))
 
+    def test_the_stdout_guard_matches_the_gateways(self):
+        # The same text reaches both live feeds, and store.py's comment says they
+        # escape it alike; two copies of one pattern, held equal here for that reason.
+        outcomes = load_outcomes()
+        self.assertEqual((cp.store._UNPRINTABLE.pattern, cp.store._UNPRINTABLE.flags),
+                         (outcomes._UNPRINTABLE.pattern, outcomes._UNPRINTABLE.flags))
+
     def test_a_malformed_line_is_dropped_not_guessed_at(self):
         for raw in (b"{not json", b"", b"null", b"[]", b'"tool-result"', b"3"):
             with self.subTest(raw=raw):

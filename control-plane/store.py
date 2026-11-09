@@ -985,7 +985,7 @@ UNENCODABLE = "a request field holds a lone surrogate, which has no UTF-8 form"
 #: What ends or rewrites a terminal line: C0 and C1 controls, DEL, the Unicode line
 #: and paragraph separators, and the surrogates, which UTF-8 has no form for: printing
 #: one raises or, under surrogateescape, writes a raw byte. The gateway's outcome
-#: stream has the same guard.
+#: stream and roster report have the same guard.
 _UNPRINTABLE = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029\ud800-\udfff]")
 
 

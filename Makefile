@@ -19,6 +19,11 @@
 
 SHELL := bash
 .SHELLFLAGS := -eu -o pipefail -c
+# One shell per recipe, so a recipe's lines share variables and `set -e`. The cost:
+# GNU make runs a recipe line that names $(MAKE) even under `make -n`, and here that
+# line is the whole recipe. So $(MAKE) appears in a recipe only as the recipe's one
+# command (check-strict); an order between targets goes in the graph, as a
+# prerequisite. tests/test_topology.py, MakeDryRunTests, holds both.
 .ONESHELL:
 .DEFAULT_GOAL := help
 
@@ -258,6 +263,13 @@ lint: ## Run linters (shellcheck, hadolint, ruff, yamllint) — skipped if not i
 	else miss yamllint || fail=1; fi
 	exit $$fail
 
+# The config-home drift guard below asks a child make for its answer, so it cannot be
+# a prerequisite, and naming $(MAKE) in the recipe would run all of it under `make -n`
+# (see .ONESHELL). Reached through another variable, MAKE does not mark the line
+# recursive (GNU make manual, "How the MAKE Variable Works"), so -n prints it. The
+# child runs with MAKEFLAGS cleared, so a command-line variable no longer overrides
+# the probe's own environment: its answer comes from that, as sandbox-lib.sh's does.
+consistency: PROBE_MAKE := $(MAKE)
 consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	@echo "== bash -n (shell syntax) =="
 	for f in $(SCRIPTS); do bash -n "$$f"; echo "  ok $$f"; done
@@ -405,7 +417,7 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	# default $$HOME never exercises — the two implementations could agree on the
 	# fallback and disagree on the spec-mandated override.
 	lib=$$(XDG_CONFIG_HOME=/tmp/xdg-probe bash -c '. ./sandbox-lib.sh && sc_config_home')
-	mk=$$(XDG_CONFIG_HOME=/tmp/xdg-probe $(MAKE) --no-print-directory print-config-home)
+	mk=$$(XDG_CONFIG_HOME=/tmp/xdg-probe MAKEFLAGS= $(PROBE_MAKE) --no-print-directory print-config-home)
 	if [ "$$lib" != "$$mk" ]; then
 	  echo "  FAIL: with XDG_CONFIG_HOME set, sandbox-lib.sh says '$$lib' but the"
 	  echo "        Makefile says '$$mk'. One of them ignores XDG_CONFIG_HOME."
@@ -784,7 +796,7 @@ down: ## Stop the shared infra (keeps the named volumes)
 # "no such service" because it never reads mcp-servers.yml. These targets exist so
 # the -f pair has exactly one definition (COMPOSE, above) rather than living in
 # anyone's shell history.
-mcp-up: ## Start one catalogue MCP server: make mcp-up SERVER=github
+mcp-up: secrets-perm-check ## Start one catalogue MCP server: make mcp-up SERVER=github
 	@if [ -z "$(SERVER)" ]; then
 	  echo "usage: make mcp-up SERVER=github   (profiles: $$(grep -oE '^ +- mcp-[^ ]+' mcp-servers.yml | sed 's/.*- //' | tr '\n' ' '))"
 	  exit 2
@@ -794,7 +806,6 @@ mcp-up: ## Start one catalogue MCP server: make mcp-up SERVER=github
 	# target has nothing secret to plumb. See mcp-servers.yml. A server that DOES take
 	# an env credential reads it from $(MCP_SECRETS) — never from a repo `.env`.
 	#
-	@$(MAKE) --no-print-directory secrets-perm-check
 	# --wait returns when the container is running and its dependencies are
 	# healthy, so a failure here is real rather than a race. If it exits
 	# immediately, read its log before re-running.
@@ -816,7 +827,7 @@ mcp-ps: ## Who is on mcp-net right now (should be the proxy plus enabled servers
 # read the same way (DESIGN.md, "The secret's path is derived from the server name"):
 # random, mode 0600, never overwritten. The registry reads it at start and the gateway
 # on every call, so rotation is deleting the file, then `make tasks-down tasks-up`.
-tasks-up: secrets-dir ## Start the task registry and its page (optional); writes its secret on the first start
+tasks-up: secrets-perm-check ## Start the task registry and its page (optional); writes its secret on the first start
 	@secret="$(MCP_SECRETS)/tasks.json"
 	if [ ! -e "$$secret" ]; then
 	  # Made before the file is opened, so a failure leaves no empty file behind for
@@ -832,7 +843,6 @@ tasks-up: secrets-dir ## Start the task registry and its page (optional); writes
 	   printf '{"token": "%s", "note": "written by make tasks-up"}\n' "$$token" > "$$secret")
 	  echo "wrote $$secret"
 	fi
-	$(MAKE) --no-print-directory secrets-perm-check
 	$(COMPOSE) --profile tasks up -d --build --wait --wait-timeout 120 tasks tasks-ui
 	# Asked of compose rather than spelled here, so a port set in .env is the one shown.
 	echo "The work list: http://$$($(COMPOSE) --profile tasks port tasks-ui 8091)/"
@@ -1351,7 +1361,7 @@ opencode: ## Launch a tier-2 (opencode + local LLM, no egress) sandbox (WORKSPAC
 boundary: ## Run boundary-check.sh in a running sandbox (SANDBOX=claude-sandbox|opencode-sandbox)
 	docker exec -it --user sandbox "$(SANDBOX)" /usr/local/bin/boundary-check.sh
 
-check-boundary: ## Stand the infra up and assert containment from inside a throwaway tier-1 sandbox (what CI runs)
+check-boundary: up ## Stand the infra up and assert containment from inside a throwaway tier-1 sandbox (what CI runs)
 	# The repo's only AUTOMATED evidence that the containment boundary holds.
 	# `make check` structurally cannot reach it: shellcheck reads init-firewall.sh
 	# as text and tests/test_topology.py reads the compose files as text, so
@@ -1372,12 +1382,11 @@ check-boundary: ## Stand the infra up and assert containment from inside a throw
 	# model server up). This one owns the whole lifecycle instead, which is what
 	# makes it usable from a runner with no TTY and nothing running.
 	#
-	# Two lines because the launcher does the work: --boundary-check runs the check
-	# as the container's command, so the container's exit status IS the verdict and
-	# there is no container left to clean up, inspect or name-manage. See the
-	# launch-mode comment in run-claude-sandbox.sh for why that beats exec'ing into
-	# a long-running one.
-	$(MAKE) --no-print-directory up
+	# `up` as a prerequisite, then one line, because the launcher does the work:
+	# --boundary-check runs the check as the container's command, so the container's
+	# exit status IS the verdict and there is no container left to clean up, inspect
+	# or name-manage. See the launch-mode comment in run-claude-sandbox.sh for why
+	# that beats exec'ing into a long-running one.
 	SANDBOX_NAME="$(BOUNDARY_SANDBOX)" ./run-claude-sandbox.sh "$(WORKSPACE)" --boundary-check
 
 split-check: ## Assert the running proxy reaches /authorize and NOT the management API or the gateway's bridge

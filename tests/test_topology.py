@@ -2343,7 +2343,8 @@ class _MakeRun(unittest.TestCase):
         self.config, self.secrets = config, config / "secrets"
 
     def make_command(self, *args: str, path: str | None = None,
-                     env: dict[str, str] | None = None) -> tuple[list[str], dict[str, str]]:
+                     env: dict[str, str] | None = None,
+                     unset: tuple[str, ...] = ()) -> tuple[list[str], dict[str, str]]:
         # Absolute, so not resolved through PATH; a failure without make, not a skip,
         # since this suite runs under it.
         make = shutil.which("make")
@@ -2353,11 +2354,14 @@ class _MakeRun(unittest.TestCase):
         if path is not None:
             run_env["PATH"] = path
         run_env.update(env or {})
+        for name in unset:
+            run_env.pop(name, None)
         return [make, "-s", "-C", str(ROOT), *(args or (self.DEFAULT_TARGET,))], run_env
 
     def make(self, *args: str, path: str | None = None,
-             env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-        command, run_env = self.make_command(*args, path=path, env=env)
+             env: dict[str, str] | None = None,
+             unset: tuple[str, ...] = ()) -> subprocess.CompletedProcess[str]:
+        command, run_env = self.make_command(*args, path=path, env=env, unset=unset)
         return subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
             command, env=run_env, stdin=subprocess.DEVNULL, capture_output=True,
             text=True, timeout=60, check=False)
@@ -2613,22 +2617,134 @@ class SecretsDirTests(_MakeRun):
     def test_every_target_that_can_start_the_gateway_makes_it_first(self):
         # A bare `$(COMPOSE) up` (re)creates the gateway, whose mount needs the
         # directory; `tasks-up` writes its secret there. In the graph, not in a recipe
-        # (the dry-run test above says why), with the mode check after it.
+        # (MakeDryRunTests says why), with the mode check after it.
         makefile = (ROOT / "Makefile").read_text()
 
         def prereqs(target: str) -> list[str]:
-            rule = re.search(rf"^{re.escape(target)}:(?!=)([^#\n]*)", makefile, re.M)
+            # Not a target-specific variable's line, `target: VAR := value`.
+            rule = re.search(rf"^{re.escape(target)}:(?![^#\n]*=)([^#\n]*)", makefile,
+                             re.M)
             return rule.group(1).split() if rule else []
 
-        def reaches(target: str, seen: frozenset[str] = frozenset()) -> bool:
-            return any(dep == "secrets-dir" or (dep not in seen and
-                                                reaches(dep, seen | {target}))
+        def reaches(target: str, goal: str, seen: frozenset[str] = frozenset()) -> bool:
+            return any(dep == goal or (dep not in seen and
+                                       reaches(dep, goal, seen | {target}))
                        for dep in prereqs(target))
         self.assertIn("secrets-dir", prereqs("secrets-perm-check"))
-        self.assertIn("secrets-perm-check", prereqs("up"))
-        for target in ("up", "rebuild", "restore", "tasks-up"):
+        self.assertIn("up", prereqs("check-boundary"))
+        # consistency's first line is its PROBE_MAKE variable, not its rule.
+        self.assertEqual(prereqs("consistency"), [])
+        for target in ("up", "rebuild", "restore", "tasks-up", "mcp-up", "check-boundary"):
             with self.subTest(target=target):
-                self.assertTrue(reaches(target))
+                self.assertTrue(reaches(target, "secrets-dir"))
+        # Every start of a server that reads the directory checks its mode, too.
+        for target in ("up", "tasks-up", "mcp-up"):
+            with self.subTest(target=target, goal="secrets-perm-check"):
+                self.assertTrue(reaches(target, "secrets-perm-check"))
+
+
+#: A recipe that names MAKE directly. GNU make runs such a line even under `make -n`,
+#: and under .ONESHELL the line is the whole recipe. `$(MAKEFILE_LIST)` is not one.
+_RECURSIVE_MAKE = re.compile(r"\$(?:\(MAKE\)|\{MAKE\})")
+#: A rule's line in make's database, not a target-specific variable's
+#: (`target: VAR := value`), which prints above it.
+_DATABASE_RULE = re.compile(r"([^\s:#=]+):([^=]*)")
+
+
+class MakeDryRunTests(_MakeRun):
+    """``make -n`` is a dry run for every target: it calls no docker and writes
+    nothing. The Makefile's .ONESHELL makes that a rule about recipes (its comment
+    there): MAKE named in a recipe only as the recipe's one command, and an order
+    between targets in the graph."""
+
+    #: The targets whose recipes named MAKE, or reach one that did; a database that
+    #: lacks them is being read wrong.
+    EXPECTED = ("tasks-up", "mcp-up", "check-boundary", "consistency", "check-strict")
+    #: A goal with no recipe, so asking make for its database builds nothing.
+    PROBE_GOAL = "dockade-database"
+
+    def rules(self) -> dict[str, tuple[list[str], list[str]]]:
+        """Each plain target's prerequisites and recipe lines, from make's own
+        database rather than the Makefile's text: its file section only, since a
+        `define` body elsewhere in it has lines that look like rules."""
+        run = self.make("-r", "-p", "-n", "--eval", f"{self.PROBE_GOAL}:", self.PROBE_GOAL)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        # Both markers or a failure, so a make that renamed one cannot widen the parse.
+        start, end = "\n# Files\n", "\n# files hash-table stats"
+        self.assertIn(start, run.stdout)
+        files = run.stdout.split(start, 1)[1]
+        self.assertIn(end, files)
+        files = files.split(end, 1)[0]
+        rules = {}
+        for block in files.split("\n\n"):
+            lines = block.splitlines()
+            if not lines or lines[0] == "# Not a target:":
+                continue
+            heads = [m for line in lines if (m := _DATABASE_RULE.fullmatch(line))]
+            if not heads:
+                continue
+            target = heads[-1].group(1)
+            if target.startswith(".") or "%" in target or target == self.PROBE_GOAL:
+                continue
+            rules[target] = (heads[-1].group(2).split(),
+                             [line[1:] for line in lines if line.startswith("\t")])
+        for target in self.EXPECTED:
+            self.assertIn(target, rules)
+        return rules
+
+    def test_no_target_runs_anything_under_a_dry_run(self):
+        # Each target under conditions that let its write path run: SERVER set past
+        # mcp-up's usage guard, an existing secrets dir for tasks-up to write in, and
+        # home, temp and bytecode moved into the test's directory so a write shows.
+        # The repo tree is not watched, being a live checkout; under -n only a line
+        # that names MAKE, or a `+` one, can run, and the test below holds those.
+        for target in sorted(self.rules()):
+            with self.subTest(target=target):
+                tmp = self.tmp / target
+                stub = tmp / "bin"
+                stub.mkdir(parents=True)
+                calls = self.tmp / f"{target}.docker-calls"
+                (stub / "docker").write_text(f'#!/bin/sh\necho "$*" >> "{calls}"\n')
+                (stub / "docker").chmod(0o755)
+                self.use(tmp / "config")
+                self.secrets.mkdir(parents=True)
+                for name in ("home", "tmp"):
+                    (tmp / name).mkdir()
+                before = sorted(tmp.rglob("*"))
+                run = self.make(
+                    "-n", target, path=f"{stub}{os.pathsep}{os.environ['PATH']}",
+                    env={"SERVER": "github", "HOME": str(tmp / "home"),
+                         "TMPDIR": str(tmp / "tmp"),
+                         "PYTHONPYCACHEPREFIX": str(tmp / "pycache")},
+                    unset=("PYTHONDONTWRITEBYTECODE",))
+                self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+                self.assertFalse(calls.exists(),
+                                 calls.read_text() if calls.exists() else "")
+                self.assertEqual(sorted(tmp.rglob("*")), before)
+
+    def test_a_recipe_names_make_only_as_its_one_command(self):
+        # What the sweep's conditions cannot reach: a branch it does not take still
+        # runs under -n once its recipe names MAKE. So does a recipe whose first line
+        # has a `+` prefix, which .ONESHELL applies to the whole recipe.
+        for target, (_, recipe) in self.rules().items():
+            with self.subTest(target=target):
+                if any(_RECURSIVE_MAKE.search(line) for line in recipe):
+                    self.assertEqual(len(recipe), 1, "\n".join(recipe))
+                if recipe:
+                    self.assertNotIn("+", re.match(r"[@+-]*", recipe[0]).group())
+
+    def test_the_config_home_probe_ignores_this_makes_variables(self):
+        # The drift guard's child make answers from its environment, as sandbox-lib.sh
+        # does, so a command-line XDG_CONFIG_HOME passed down to it would fail the
+        # guard falsely.
+        xdg = self.tmp / "xdg"
+        run = self.make("consistency", f"XDG_CONFIG_HOME={xdg}",
+                        env={"HOME": str(self.tmp / "home"),
+                             "PYTHONPYCACHEPREFIX": str(self.tmp / "pycache")},
+                        unset=("DOCKADE_CONFIG_HOME",))
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn(f"  ok — both resolve to {xdg}/dockade (and honour XDG_CONFIG_HOME)",
+                      run.stdout)
 
 
 #: Any Makefile line that gives COMPOSE a value: every assignment operator, with

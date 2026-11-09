@@ -255,6 +255,9 @@ def edit_rule(rule_id: int, req: RuleEditRequest, request: Request) -> JSONRespo
     error = policy._rule_error(pattern, action)
     if error is not None:
         return JSONResponse({"ok": False, "detail": error}, status_code=400)
+    if not store._bindable(rule_id):
+        return JSONResponse({"ok": False, "detail": "unknown rule"},
+                            status_code=404)
 
     with store._connect() as conn:
         row = conn.execute(
@@ -332,6 +335,9 @@ def revoke_rule(rule_id: int, req: RuleRevokeRequest,
     to be filtered by every reader, ``policy._decide`` included. A stale revoke is
     refused (``_stale``)."""
     actor = provenance._actor(request)
+    if not store._bindable(rule_id):
+        return JSONResponse({"ok": False, "detail": "unknown rule"},
+                            status_code=404)
     with store._connect() as conn:
         row = conn.execute(
             "SELECT pattern, action, source, client_class FROM rules WHERE id=?",
@@ -409,6 +415,9 @@ def revoke_lease(lease_id: int, request: Request) -> JSONResponse:
     Revoking stops the next connection, not this one."""
     actor = provenance._actor(request)
     now = time.time()
+    if not store._bindable(lease_id):
+        return JSONResponse({"ok": False, "detail": "unknown lease"},
+                            status_code=404)
     with store._connect() as conn:
         # One write transaction, so the row the audit describes is the row deleted: a
         # second tab's revoke or the grant path's expired-lease sweep

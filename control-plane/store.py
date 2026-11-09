@@ -49,6 +49,24 @@ LEGACY_CLIENT_CLASS = "sandbox"
 # run here" is a number to compare rather than a schema to interrogate.
 SCHEMA_VERSION = 14
 
+# The integers sqlite3 can bind: SQLite's INTEGER is 64-bit signed, and binding a
+# value outside it raises OverflowError, which a route would answer as a 500. A fact
+# of SQLite rather than a tunable cap, so not an env var. task-registry/tasks.py holds
+# the same fact as ID_MAX, and ``audit._CURSOR_IDS`` its own copy, since audit.py
+# imports nothing; a test holds audit's copy equal to this one.
+SQLITE_INTEGERS = range(-2**63, 2**63)
+
+
+def _bindable(value: int) -> bool:
+    """Whether ``value`` is an int that fits ``SQLITE_INTEGERS``. FastAPI hands a
+    path id over as any int, and one that does not fit names no row, so a handler
+    answers it as its unknown id before the query would raise.
+
+    Compared against the ends, not with ``in``: for anything but an int, a range's
+    ``in`` walks every member, which for this range does not finish."""
+    return (type(value) is int
+            and SQLITE_INTEGERS.start <= value < SQLITE_INTEGERS.stop)
+
 
 def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=5.0)

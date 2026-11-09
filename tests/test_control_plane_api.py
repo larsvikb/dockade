@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import contextlib
+import inspect
 import io
 import json
 import os
@@ -994,6 +995,18 @@ class RevokeRuleTests(_CPTestCase):
         self.assertEqual(
             _revoke_rule(999999, _FakeRequest()).status_code, 404)
 
+    def test_an_id_sqlite_cannot_hold_is_a_404_and_changes_nothing(self):
+        rid = self._rule("evil.example", "block")
+        for bad in (*_OUT_OF_RANGE, *_RANGE_ENDS):
+            with self.subTest(rule_id=bad):
+                resp = cp.api_egress.revoke_rule(
+                    bad, cp.api_egress.RuleRevokeRequest(**_unseen_rule()),
+                    _FakeRequest())
+                self.assertEqual(resp.status_code, 404)
+                self.assertEqual(resp.body, {"ok": False, "detail": "unknown rule"})
+        self.assertEqual(_rules(), {("evil.example", "block")})
+        self.assertEqual(_revoke_rule(rid).status_code, 200)
+
     def test_a_stale_revoke_does_not_uncover_a_wider_allow(self):
         # The page shows old.test; the id now holds a block on evil.example.com, under
         # an allow on .example.com. Revoking that block would let it through.
@@ -1292,6 +1305,23 @@ def _revoke_rule(rule_id, request=None, seen=None):
         request if request is not None else _FakeRequest())
 
 
+#: Path ids SQLite cannot bind (``store.SQLITE_INTEGERS``): the first past each end,
+#: and one far out. FastAPI hands any of them to a handler as an int, and before the
+#: guard each raised OverflowError in the query, a 500.
+_OUT_OF_RANGE = (2**63, -2**63 - 1, 10**23)
+
+#: The ends of that range, which do bind: an id at either names no row, and is
+#: answered by the lookup as any unknown id is.
+_RANGE_ENDS = (2**63 - 1, -2**63)
+
+
+def _unseen_rule():
+    """The expectation fields of a page that shows no rule. ``_shown_rule`` reads the
+    row first, which an out-of-range id cannot do."""
+    return {"expected_pattern": None, "expected_action": None,
+            "expected_client_class": None}
+
+
 class CreateRuleTests(_CPTestCase):
     """``create_rule`` — the config-first half of policy.
 
@@ -1578,6 +1608,30 @@ class EditRuleTests(_CPTestCase):
 
     def test_an_unknown_id_is_a_404_not_a_silent_success(self):
         self.assertEqual(self._edit(999999, "example.com", "allow").status_code, 404)
+
+    def _edit_unseen(self, rule_id, pattern, action):
+        return cp.api_egress.edit_rule(
+            rule_id, cp.api_egress.RuleEditRequest(pattern=pattern, action=action,
+                                                   **_unseen_rule()),
+            _FakeRequest())
+
+    def test_an_id_sqlite_cannot_hold_is_a_404_and_changes_nothing(self):
+        self._rule("example.com", "block")
+        for bad in (*_OUT_OF_RANGE, *_RANGE_ENDS):
+            with self.subTest(rule_id=bad):
+                resp = self._edit_unseen(bad, "example.com", "allow")
+                self.assertEqual(resp.status_code, 404)
+                self.assertEqual(resp.body, {"ok": False, "detail": "unknown rule"})
+        self.assertEqual(_rules(), {("example.com", "block")})
+
+    def test_a_bad_pattern_is_a_400_whatever_the_id(self):
+        # The pattern is checked before the row is looked up, so an id SQLite cannot
+        # hold meets the same refusal an unknown one does.
+        for rid in (999999, *_OUT_OF_RANGE):
+            with self.subTest(rule_id=rid):
+                self.assertEqual(
+                    self._edit_unseen(rid, "http://evil.example", "allow").status_code,
+                    400)
 
     def test_a_stale_edit_does_not_land_on_the_rule_created_after_a_revoke(self):
         # The edit writes the typed pattern and action, so landing on another rule
@@ -2441,13 +2495,22 @@ class AuditRecordTests(_CPTestCase):
         # reach the SQL and compare wrongly instead — NaN as an empty page reporting
         # itself as the end of the record, inf as page 1. See audit._finite.
         for bad in ("nonsense", "", ":", "abc:def", "1.0:x",
-                    "nan:1", "inf:1", "-inf:1", "1e400:1"):
+                    "nan:1", "inf:1", "-inf:1", "1e400:1",
+                    # Ids SQLite cannot bind: no previous page wrote one.
+                    f"1.0:{2**63}", f"1.0:{-2**63 - 1}"):
             with self.subTest(cursor=bad):
                 resp = cp.api_views.api_audit_events(before=bad)
                 if bad == "":                      # absent, not malformed
                     self.assertIn("rows", resp)
                 else:
                     self.assertEqual(resp.status_code, 400)
+
+    def test_a_cursor_at_either_end_of_sqlites_range_is_a_page(self):
+        _write_audit({"host": "a.example", "ts": 1.0})
+        for rid in _RANGE_ENDS:
+            with self.subTest(id=rid):
+                resp = cp.api_views.api_audit_events(before=f"5.0:{rid}")
+                self.assertIn("rows", resp)
 
     def test_the_page_size_is_clamped_at_both_ends(self):
         _write_audit(*[{"host": f"h{i}.example", "ts": float(i)} for i in range(5)])
@@ -3296,6 +3359,15 @@ class LeaseRevokeTests(_CPTestCase):
         resp = cp.api_egress.revoke_lease(999999, _FakeRequest())
         self.assertEqual(resp.status_code, 404)
         self.assertFalse(resp.args[0]["ok"])
+
+    def test_an_id_sqlite_cannot_hold_is_a_404_and_changes_nothing(self):
+        self._insert("api.example.com", 900)
+        for bad in (*_OUT_OF_RANGE, *_RANGE_ENDS):
+            with self.subTest(lease_id=bad):
+                resp = cp.api_egress.revoke_lease(bad, _FakeRequest())
+                self.assertEqual(resp.status_code, 404)
+                self.assertEqual(resp.body, {"ok": False, "detail": "unknown lease"})
+        self.assertEqual(cp.policy._decide("api.example.com", CLASS)[0], "allow")
 
     def test_revoking_one_lease_leaves_the_others(self):
         keep = self._insert("keep.example.com", 900)
@@ -4227,6 +4299,19 @@ class McpToolRuleTests(_CPTestCase):
         self.assertEqual(_edit_tool_rule(rule_id, "block").status_code, 400)
         self.assertEqual(_edit_tool_rule(9999, "allow").status_code, 404)
 
+    def test_an_edit_to_an_id_sqlite_cannot_hold_is_a_404(self):
+        _tool_rule("get_me", "deny")
+        for bad in (*_OUT_OF_RANGE, *_RANGE_ENDS):
+            with self.subTest(rule_id=bad):
+                resp = cp.api_mcp.edit_mcp_rule(
+                    bad, cp.api_mcp.ToolRuleEditRequest(
+                        action="allow", expected_server=None, expected_tool=None,
+                        expected_action=None),
+                    _FakeRequest())
+                self.assertEqual(resp.status_code, 404)
+                self.assertEqual(resp.body, {"ok": False, "detail": "unknown rule"})
+        self.assertEqual(cp.policy._decide_tool("mcp-github", "get_me")[0], "deny")
+
     def test_an_edit_from_a_stale_table_is_refused(self):
         # Another tab moved the tool to deny; this one, still showing allow, asks.
         # Without the expectation the ask would undo the deny unseen.
@@ -4405,6 +4490,15 @@ class McpToolRuleRevokeTests(_CPTestCase):
         resp = cp.api_mcp.revoke_mcp_rule(self.rule_id + 1, _FakeRequest())
         self.assertEqual(resp.status_code, 404)
         self.assertEqual(cp.policy._decide_tool("mcp-github", "get_me")[0], "allow")
+
+    def test_revoking_an_id_sqlite_cannot_hold_is_a_404(self):
+        for bad in (*_OUT_OF_RANGE, *_RANGE_ENDS):
+            with self.subTest(rule_id=bad):
+                resp = cp.api_mcp.revoke_mcp_rule(bad, _FakeRequest())
+                self.assertEqual(resp.status_code, 404)
+                self.assertEqual(resp.body, {"ok": False, "detail": "unknown rule"})
+                self.assertEqual(
+                    cp.policy._decide_tool("mcp-github", "get_me")[0], "allow")
 
 
 #: The digest of a tool's arguments a call is made under unless a test says otherwise,
@@ -5029,6 +5123,14 @@ class McpPinTests(_CPTestCase):
     def test_revoking_an_unknown_pin_is_a_404(self):
         self.assertEqual(
             cp.api_mcp.revoke_mcp_pin(self.pin_id + 1, _FakeRequest()).status_code, 404)
+
+    def test_revoking_an_id_sqlite_cannot_hold_is_a_404(self):
+        for bad in (*_OUT_OF_RANGE, *_RANGE_ENDS):
+            with self.subTest(pin_id=bad):
+                resp = cp.api_mcp.revoke_mcp_pin(bad, _FakeRequest())
+                self.assertEqual(resp.status_code, 404)
+                self.assertEqual(resp.body, {"ok": False, "detail": "unknown pin"})
+        self.assertEqual([p["id"] for p in cp.api_mcp.api_mcp_pins()], [self.pin_id])
 
     def _expire(self, pin_id, offset):
         with cp.store._connect() as conn:
@@ -8573,6 +8675,86 @@ def _routes(fastapi_app) -> set:
             "the FastAPI stub recorded no routes — route recording is broken, so "
             "the API-surface split below is not actually being asserted")
     return set(recorded)
+
+
+class SqliteIntegerRangeTests(unittest.TestCase):
+    """An integer a handler binds must fit SQLite's, or the bind raises OverflowError
+    and the route answers 500 (``store.SQLITE_INTEGERS``)."""
+
+    def test_the_range_is_sqlites_64_bit_integer(self):
+        bindable = cp.store._bindable
+        for value in (2**63 - 1, -2**63, 0, 1):
+            with self.subTest(value=value):
+                self.assertTrue(bindable(value))
+        for value in _OUT_OF_RANGE:
+            with self.subTest(value=value):
+                self.assertFalse(bindable(value))
+        # The same fact as sqlite3's, not a guess at it.
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        conn.execute("SELECT ?", (2**63 - 1,))
+        conn.execute("SELECT ?", (-2**63,))
+        for value in (2**63, -2**63 - 1):
+            with self.subTest(value=value), self.assertRaises(OverflowError):
+                conn.execute("SELECT ?", (value,))
+
+    def test_only_an_int_is_bindable_and_the_answer_is_prompt(self):
+        # A range's `in` walks every member for a non-int, which for this range never
+        # finishes, in C, where neither a thread switch nor a signal handler can
+        # interrupt it. So the check runs in a child process with a timeout, and one
+        # that has gone back to `in` fails here instead of hanging the suite.
+        values = (2.0, 0.5, True, False, "1", None)
+        try:
+            child = subprocess.run(  # noqa: S603 (this interpreter, the repo's own module)
+                [sys.executable, "-I", "-c",
+                 "import sys; sys.path.insert(0, sys.argv[1]); import store; "
+                 f"print([store._bindable(v) for v in {values!r}])",
+                 str(ROOT / "control-plane")],
+                capture_output=True, text=True, timeout=30,
+                env={**os.environ, "CONTROL_DB": os.path.join(_TMP, "child.db")})
+        except subprocess.TimeoutExpired:
+            self.fail("store._bindable did not return for a non-int")
+        self.assertEqual(child.returncode, 0, child.stderr)
+        self.assertEqual(child.stdout.strip(), str([False] * len(values)))
+
+    def test_the_cursor_bound_is_the_stores(self):
+        # audit.py imports nothing, so it holds its own copy.
+        self.assertEqual(cp.audit._CURSOR_IDS, cp.store.SQLITE_INTEGERS)
+
+    def test_every_int_a_handler_takes_is_classed(self):
+        """The route handlers' int parameters, each with what keeps it inside SQLite's
+        range. A new one fails here until it is guarded and classed. Read as strings,
+        since the modules use ``from __future__ import annotations``; any annotation
+        naming int counts, ``int | None`` included."""
+        classed = {
+            ("api_egress", "edit_rule", "rule_id"): "guarded",
+            ("api_egress", "revoke_rule", "rule_id"): "guarded",
+            ("api_egress", "revoke_lease", "lease_id"): "guarded",
+            ("api_mcp", "edit_mcp_rule", "rule_id"): "guarded",
+            ("api_mcp", "revoke_mcp_rule", "rule_id"): "guarded",
+            ("api_mcp", "revoke_mcp_pin", "pin_id"): "guarded",
+            # audit.clamp bounds it before any bind.
+            ("api_views", "api_audit", "limit"): "clamped",
+            ("api_views", "api_audit_events", "limit"): "clamped",
+        }
+        found = set()
+        for path in sorted((ROOT / "control-plane").glob("api_*.py")):
+            module = getattr(cp, path.stem)
+            for name, fn in vars(module).items():
+                if (name.startswith("_") or not callable(fn)
+                        or getattr(fn, "__module__", None) != module.__name__
+                        or isinstance(fn, type)):
+                    continue
+                for param, ann in fn.__annotations__.items():
+                    if param != "return" and re.search(r"\bint\b", str(ann)):
+                        found.add((path.stem, name, param))
+        self.assertEqual(found, set(classed))
+        # And each label is true of the handler's source, so none can be wrong.
+        marks = {"guarded": "store._bindable(", "clamped": "audit.clamp("}
+        for (module, name, param), how in classed.items():
+            with self.subTest(handler=name, param=param):
+                source = inspect.getsource(getattr(getattr(cp, module), name))
+                self.assertIn(f"{marks[how]}{param}", source)
 
 
 class ApiSurfaceSplitTests(unittest.TestCase):

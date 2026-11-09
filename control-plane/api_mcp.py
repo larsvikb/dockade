@@ -375,6 +375,9 @@ def edit_mcp_rule(rule_id: int, req: ToolRuleEditRequest,
     ``api_egress.edit_rule`` refuses one."""
     actor = provenance._actor(request)
     action = (getattr(req, "action", "") or "").strip().lower()
+    if not store._bindable(rule_id):
+        return JSONResponse({"ok": False, "detail": "unknown rule"},
+                            status_code=404)
 
     with store._connect() as conn:
         row = conn.execute(
@@ -431,6 +434,9 @@ def revoke_mcp_rule(rule_id: int, request: Request) -> JSONResponse:
     decide again, so it holds nothing back, and it goes with the rule."""
     actor = provenance._actor(request)
     now = time.time()
+    if not store._bindable(rule_id):
+        return JSONResponse({"ok": False, "detail": "unknown rule"},
+                            status_code=404)
     with store._connect() as conn:
         # One write transaction, so the row the audit describes is the row deleted: an
         # edit in between could otherwise change its action.
@@ -535,6 +541,9 @@ def revoke_mcp_pin(pin_id: int, request: Request) -> JSONResponse:
     last loaded, and a refusal would look like a bug."""
     actor = provenance._actor(request)
     now = time.time()
+    if not store._bindable(pin_id):
+        return JSONResponse({"ok": False, "detail": "unknown pin"},
+                            status_code=404)
     with store._connect() as conn:
         # One write transaction, so the row the audit describes is the row deleted: a
         # pinned grant in between could otherwise extend it.

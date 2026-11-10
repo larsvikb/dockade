@@ -67,7 +67,7 @@ Anything that **crosses a boundary the design claims to hold**:
 - **Privilege escalation or escape inside a sandbox** — regaining dropped
   capabilities, defeating `no-new-privileges`, becoming root, or escaping the
   container.
-- **Credential exposure** — anything that puts the Anthropic session credential, or
+- **Credential exposure** — anything that puts a tier's vendor session credential, or
   any credential the design says stays *outside* the sandbox, somewhere it should not
   be.
 - **A tool call that evades the MCP gateway's policy.** The gateway is the only
@@ -166,13 +166,15 @@ report.
   acknowledged cost of the one deliberate writable host coupling.
 - **`WebSearch` being unauditable.** It executes server-side on Anthropic
   infrastructure, so no local firewall or proxy can see it. It is read-only and left
-  enabled as a standing, revisitable decision. See "Server-side execution: accepted
-  governance blind spots" in `DESIGN.md`.
-- **Any Claude Code settings file being bypassable**, including a
+  enabled as a standing, revisitable decision, as is another tier's hosted search with
+  the same property: queries only, no URL the agent chose. See "Server-side
+  execution: accepted governance blind spots" in `DESIGN.md`.
+- **Any agent CLI's settings file being bypassable**, including Claude Code's
   `permissions.deny` and a local `managed-settings.json`. No client settings file is
-  a containment boundary here, and under organisation authentication the local
-  managed file is not even loaded. Hard policy belongs in the org admin console. See
-  *Managed settings are NOT an enforcement lever here*.
+  a containment boundary here, and under organisation authentication Claude Code does
+  not even load the local managed file. Hard policy belongs in the vendor's admin
+  console, where it has one. See *Managed settings are NOT an enforcement lever
+  here*.
 - **Resource limits not containing anything.** They bound blast radius so the wrong
   container is not OOM-killed; nothing in the threat model rests on them. See
   *Resource limits — blast radius, not boundary*.

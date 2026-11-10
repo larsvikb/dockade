@@ -11,7 +11,7 @@
 #
 # Grouped by target-state disposition, mirroring init-firewall.sh.
 
-# PERMANENT — the agent's own API / auth lifeline.
+# PERMANENT — Anthropic's API / auth lifeline, for every tier in the agent class.
 api.anthropic.com
 claude.ai
 platform.claude.com

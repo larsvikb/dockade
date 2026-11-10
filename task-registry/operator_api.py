@@ -249,8 +249,9 @@ def search_tasks(text: str, repo: str | None = None) -> JSONResponse:
 
 
 @app.get("/api/tasks/{task}")
-def get_task(task: int) -> JSONResponse:
-    return _reply(read(reads.get_task, task))
+def get_task(task: int, known_revision: int | None = None,
+             known_notes_mark: str | None = None) -> JSONResponse:
+    return _reply(read(reads.get_task, task, known_revision, known_notes_mark))
 
 
 @app.post("/api/tasks")

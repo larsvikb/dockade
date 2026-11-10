@@ -272,8 +272,17 @@ is its answer, and unlike hiding, marking it takes the note from no one.
 
 A note does not move the task's revision: it is not the spec, and the operator's page
 would otherwise go stale with every note. A note's length is capped (`notes.NOTE_MAX`), a
-read of a task carries its latest few (`notes.IN_READ`) and the total, and
-`reads.task_notes` pages back.
+full read of a task carries its latest few (`notes.IN_READ`) and the total, an unchanged
+read only the notes since, and `reads.task_notes` pages back.
+
+**A conditional read is exact, or it is a full one.** An agent re-reading a task passes
+back the revision and notes mark of its last read, and `reads.get_task` leaves out the
+body, plan, answers and notes only when both still hold. The revision covers the spec,
+the state and the holder; the mark covers the notes, and is worked out from their state
+(`notes.mark`) because hiding, showing and the handled mark move no revision, so no
+writer has to remember to bump it. Everything else in the reply is read afresh. A part
+added to a read must be one of the three: moved by the revision, covered by the mark, or
+live; one the caller keeps a copy of that neither moves would make "unchanged" a lie.
 
 **Search carries a note past its task.** `reads.search_tasks` matches titles, bodies and
 visible notes in every state and repo, so an agent finds an existing task before

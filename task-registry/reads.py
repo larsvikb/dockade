@@ -60,9 +60,51 @@ def list_tasks(repo: str, state: str | None = "open", holder: str | None = None,
         return {"tasks": [_summary(conn, row) for row in page], "total": total}
 
 
-def get_task(task: int) -> dict:
+#: What an unchanged read leaves out: the caller's copy of these is current.
+_HELD = ("body", "plan", "answers", "notes")
+
+
+def get_task(task: int, known_revision: int | None = None,
+             known_notes_mark: str | None = None) -> dict:
+    """The task in full; or, given the ``revision`` and ``notes_mark`` of the caller's
+    last read and both still holding, the full read without its body, plan, answers
+    and notes, marked ``unchanged``, with the notes since as ``new_notes``: the full
+    read again when there are more of those than ``notes.IN_READ``.
+    ``task-registry/DESIGN.md``, "Notes", says why that is exact."""
+    known = _known(known_revision, known_notes_mark)
     with taskdb.reading() as conn:
-        return detail(conn, tasks.task_row(conn, task))
+        # One snapshot, so a note posted mid-read cannot be in the mark and not the reply.
+        conn.execute("BEGIN")
+        row = tasks.task_row(conn, task)
+        full = detail(conn, row)
+        if known is None:
+            return full
+        latest, digest = known
+        if (row["revision"] != known_revision
+                or notes.digest(conn, task, latest) != digest):
+            return full
+        new = [n for n in notes.visible(conn, task, limit=notes.IN_READ + 1)
+               if n["id"] > latest]
+        if len(new) > notes.IN_READ:
+            return full
+        kept = {key: value for key, value in full.items() if key not in _HELD}
+        return kept | {"unchanged": True, "new_notes": new}
+
+
+def _known(revision: object, mark: object) -> tuple[int, str] | None:
+    """The latest note id and digest ``mark`` names, if the two were given."""
+    if revision is None and mark is None:
+        return None
+    if revision is None or mark is None:
+        raise taskdb.Refused("known_revision and known_notes_mark come together: the "
+                             "revision and notes_mark of one read")
+    if type(revision) is not int or revision < 1:
+        raise taskdb.Refused(f"{taskdb.quoted(revision)} is not a revision")
+    found = notes.MARK_RE.fullmatch(mark) if isinstance(mark, str) else None
+    if found is None or int(found["latest"]) > tasks.ID_MAX:
+        raise taskdb.Refused(f"{taskdb.quoted(mark)} is not a notes mark: pass back the "
+                             f"notes_mark of a read")
+    return int(found["latest"]), found["digest"]
 
 
 def search_tasks(text: str, repo: str | None = None) -> dict:
@@ -136,6 +178,7 @@ def detail(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
     return {**summary, "body": row["body"], "plan": plans.latest(conn, row["id"]),
             "answers": plans.answers(conn, row["id"]),
             "notes": notes.visible(conn, row["id"]),
+            "notes_mark": notes.mark(conn, row["id"]),
             "parent": parent[0] if parent else None,
             "children": brief("SELECT id, title, state FROM tasks "
                               "WHERE parent_id = ? ORDER BY id"),

@@ -171,7 +171,17 @@ TOOLS: dict[str, Tool] = {
         f"should change is a reason to `send_back` the task, not a change to it. "
         f"Refining a proposed task into a plan "
         f"starts with `claim_plan`, whose description says what a plan needs: claim "
-        f"before you draft."), (TASK,), read_only=True),
+        f"before you draft. To read a task you read already, pass `known_revision` and "
+        f"`known_notes_mark`, the revision and notes_mark of your latest read of it. A "
+        f"reply with unchanged true means your copy of the body, plan, answers and notes "
+        f"is current, so it leaves them out; new_notes are the notes since, to add to "
+        f"your copy; the rest of the reply is live and replaces yours. Any other reply "
+        f"is the full read, and replaces your copy."), (
+        TASK,
+        Param("known_revision", "integer", "The revision of your latest read of the "
+              "task, given with `known_notes_mark`.", nullable=True),
+        Param("known_notes_mark", "string", "The notes_mark of your latest read of the "
+              "task, given with `known_revision`.", nullable=True)), read_only=True),
 
     "task_notes": Tool(reads.task_notes, (
         f"Page back through a task's notes: up to {notes.IN_READ} older than note "

@@ -10,6 +10,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 from _loader import load_task_registry
 
@@ -337,6 +338,260 @@ class ReadingTests(_Store):
         self.assertEqual([n["id"] for n in op.notes_for_operator("widgets")["notes"]],
                          [first])
         self.refused(op.notes_for_operator, "gizmos")
+
+
+class ConditionalReadTests(_Store):
+    """``reads.get_task`` given the revision and notes mark of an earlier read: unchanged
+    only while the body, plan, answers and notes are as that read had them, and the
+    rest of the reply live either way."""
+
+    HELD = frozenset({"body", "plan", "answers", "notes"})
+
+    def known(self, task=None):
+        got = reads.get_task(task or self.task)
+        return got["revision"], got["notes_mark"]
+
+    def again(self, known, task=None):
+        return reads.get_task(task or self.task, *known)
+
+    def assertFull(self, got, task=None):
+        self.assertNotIn("unchanged", got)
+        self.assertEqual(got, reads.get_task(task or self.task))
+
+    def assertUnchanged(self, got, new_notes=()):
+        self.assertIs(got.get("unchanged"), True, got)
+        self.assertEqual(self.HELD & set(got), set())
+        self.assertEqual([n["text"] for n in got["new_notes"]], list(new_notes))
+
+    def test_given_neither_it_is_the_full_read(self):
+        self.note()
+        full = reads.get_task(self.task)
+        self.assertEqual(set(full), {
+            "id", "repo", "title", "state", "severity", "kind", "parent", "blocked",
+            "claim", "ready", "notes_total", "revision", "body", "plan", "answers",
+            "notes", "notes_mark", "children", "blockers", "created_at", "updated_at"})
+        self.assertEqual(reads.get_task(self.task, None, None), full)
+        self.assertEqual(self.detail(), full)
+
+    def test_unchanged_leaves_out_what_the_caller_holds(self):
+        self.note()
+        known = self.known()
+        got = self.again(known)
+        self.assertUnchanged(got)
+        full = reads.get_task(self.task)
+        self.assertEqual(got, {k: v for k, v in full.items() if k not in self.HELD}
+                         | {"unchanged": True, "new_notes": []})
+        self.assertEqual(got["notes_mark"], known[1])
+
+    def test_new_notes_come_alone_with_the_new_mark(self):
+        self.note("Old.")
+        known = self.known()
+        self.note("New.")
+        self.note("Newer.")
+        got = self.again(known)
+        self.assertUnchanged(got, ["New.", "Newer."])
+        self.assertEqual((got["notes_mark"], got["notes_total"]),
+                         (reads.get_task(self.task)["notes_mark"], 3))
+        self.assertUnchanged(self.again((got["revision"], got["notes_mark"])))
+
+    def test_as_many_new_notes_as_a_read_carries_and_no_more(self):
+        known = self.known()
+        for i in range(notes.IN_READ):
+            self.note(f"Note {i}")
+        self.assertUnchanged(self.again(known), [f"Note {i}" for i in range(notes.IN_READ)])
+        self.note("One more.")
+        self.assertFull(self.again(known))
+
+    def test_a_moved_revision_is_the_full_read(self):
+        known = self.known()
+        op.edit(self.task, known[0], body="Do it otherwise.")
+        got = self.again(known)
+        self.assertFull(got)
+        self.assertEqual(got["body"], "Do it otherwise.")
+
+    def test_a_claim_taken_is_the_full_read(self):
+        known = self.known()
+        agent.claim_work(ALICE, "widgets", self.task, "fix", ["."])
+        self.assertFull(self.again(known))
+
+    def test_an_expired_claim_swept_is_the_full_read(self):
+        clock = [reg.claims.now()]
+        patched = mock.patch.object(reg.claims, "now", lambda: clock[0])
+        patched.start()
+        self.addCleanup(patched.stop)
+        agent.claim_work(ALICE, "widgets", self.task, "fix", ["."])
+        known = self.known()
+        clock[0] += reg.claims.CLAIM_SECONDS + 1
+        self.assertUnchanged(self.again(known))
+        other = op.create("widgets", "Other", "B", "open")["task"]
+        agent.claim_work(BOB, "widgets", other, "other", ["."])  # sweeps every claim
+        self.assertFull(self.again(known))
+
+    def test_what_moves_no_revision_is_read_live_on_an_unchanged_reply(self):
+        clock = [reg.claims.now()]
+        patched = mock.patch.object(reg.claims, "now", lambda: clock[0])
+        patched.start()
+        self.addCleanup(patched.stop)
+        parent = op.create("widgets", "Parent", "B", "open")["task"]
+        blocker = op.create("widgets", "Blocker", "B", "open")["task"]
+        task = op.create("widgets", "T", "B", "open", parent=parent,
+                         blocked_by=[blocker])["task"]
+        token = agent.claim_work(ALICE, "widgets", task, "fix", ["src"])["token"]
+        known = self.known(task)
+
+        def live(change, see):
+            change()
+            got = self.again(known, task)
+            self.assertUnchanged(got)
+            self.assertEqual(see(got), see(reads.get_task(task)))
+            return see(got)
+
+        cases = {
+            "progress": (lambda: agent.update(ALICE, "widgets", task, token,
+                                              progress="Halfway."),
+                         lambda got: got["claim"]["progress"], "Halfway."),
+            "branch": (lambda: agent.update(ALICE, "widgets", task, token, branch="fix-2"),
+                       lambda got: got["claim"]["branch"], "fix-2"),
+            "footprint": (lambda: agent.update(ALICE, "widgets", task, token,
+                                               footprint=["docs"]),
+                          lambda got: got["claim"]["footprint"], ["docs"]),
+            "a blocker closing": (
+                lambda: op.move(blocker, reads.get_task(blocker)["revision"], "closed"),
+                lambda got: (got["blocked"], got["blockers"][0]["state"]),
+                (False, "closed")),
+            "a child added": (lambda: op.create("widgets", "Child", "B", "open",
+                                                parent=task),
+                              lambda got: [c["title"] for c in got["children"]], ["Child"]),
+            "the parent's state": (
+                lambda: op.move(parent, reads.get_task(parent)["revision"], "deferred"),
+                lambda got: got["parent"]["state"], "deferred"),
+            # The blocker closed above, so a lapsed claim leaves the task ready.
+            "a claim expiring unswept": (
+                lambda: clock.__setitem__(0, clock[0] + reg.claims.CLAIM_SECONDS + 1),
+                lambda got: (got["claim"], got["ready"]), (None, True)),
+            "the repo renamed": (lambda: op.rename_repo("widgets", "gizmos"),
+                                 lambda got: got["repo"], "gizmos"),
+        }
+        for case, (change, see, expected) in cases.items():
+            with self.subTest(case):
+                self.assertEqual(live(change, see), expected)
+
+    def test_a_note_hidden_or_shown_is_the_full_read(self):
+        # (which notes start hidden, the change, whether the count stays)
+        cases = {
+            "hide one, add another": (
+                (False, False),
+                lambda task, made: (op.hide_note(made[0]), self.note("Added.", task=task)),
+                True),
+            "hide an old one, show another": (
+                (False, True, False),
+                lambda task, made: (op.hide_note(made[0]),
+                                    op.hide_note(made[1], hidden=False)),
+                True),
+            "show an old hidden one": (
+                (True, False), lambda task, made: op.hide_note(made[0], hidden=False),
+                False),
+            "hide the latest": (
+                (False, False), lambda task, made: op.hide_note(made[1]), False),
+        }
+        for case, (hidden, change, same_count) in cases.items():
+            with self.subTest(case):
+                task = op.create("widgets", case, "B", "open")["task"]
+                made = [self.note(f"Note {i}", task=task) for i in range(len(hidden))]
+                for note, hide in zip(made, hidden):
+                    if hide:
+                        op.hide_note(note)
+                before = reads.get_task(task)
+                change(task, made)
+                after = reads.get_task(task)
+                self.assertEqual(after["revision"], before["revision"])
+                if same_count:
+                    self.assertEqual(after["notes_total"], before["notes_total"])
+                self.assertFull(self.again((before["revision"], before["notes_mark"]),
+                                           task), task)
+
+    def test_a_note_marked_handled_or_not_is_the_full_read(self):
+        note = self.note("Need a decision.", for_operator=True)
+        known = self.known()
+        op.handle_note(note)
+        self.assertFull(self.again(known))
+        known = self.known()
+        op.handle_note(note, handled=False)
+        self.assertFull(self.again(known))
+
+    def test_a_hidden_note_past_the_mark_is_never_a_new_one(self):
+        known = self.known()
+        op.hide_note(self.note("Hidden."))
+        # Nor does the mark name it: a hidden note is in no agent's read.
+        self.assertEqual(reads.get_task(self.task)["notes_mark"], known[1])
+        self.note("Shown.")
+        self.assertUnchanged(self.again(known), ["Shown."])
+
+    def test_a_mark_from_another_task_never_matches(self):
+        other = op.create("widgets", "Other", "B", "open")["task"]
+        mine, theirs = self.known(), self.known(other)
+        self.assertEqual((mine[0], mine[1].split(".")[0]), (theirs[0], theirs[1].split(".")[0]))
+        self.assertFull(self.again(theirs))
+        self.assertFull(self.again(mine, other), other)
+
+    def test_the_digest_tells_each_note_from_its_flag(self):
+        # Written without separators, note 1 handled and note 2 not would read "1120",
+        # as note 112 not handled alone does.
+        first = self.note("Need a decision.", for_operator=True)
+        self.assertEqual(first, 1)
+        op.handle_note(first)
+        self.assertEqual(self.note(), 2)
+
+        def digest(latest):
+            with reg.taskdb.reading() as conn:
+                return notes.digest(conn, self.task, latest)
+
+        handled_one_and_two = digest(2)
+        made = [self.note(f"Note {i}") for i in range(3, 113)]
+        self.assertEqual(made[-1], 112)
+        op.hide_notes([first, 2, *made[:-1]])
+        self.assertEqual([n["id"] for n in reads.get_task(self.task)["notes"]], [112])
+        self.assertNotEqual(digest(112), handled_one_and_two)
+
+    def test_a_bad_known_value_is_refused(self):
+        revision, mark = self.known()
+        for bad in (True, "1", 0, -1, 1.0):
+            with self.subTest(revision=bad):
+                self.assertIn("is not a revision",
+                              self.refused(reads.get_task, self.task, bad, mark).reason)
+        too_far = f"{reg.tasks.ID_MAX + 1}.{'0' * 16}"
+        for bad in (5, ["0." + "0" * 16], "", "abc", "0.xyz", f"0.{'0' * 15}",
+                    f"0.{'0' * 17}", f"01.{'0' * 16}", f"0.{'A' * 16}", too_far,
+                    f"{'1' * 5000}.{'0' * 16}", f"\u0661.{'0' * 16}"):
+            with self.subTest(mark=bad):
+                self.assertIn("is not a notes mark",
+                              self.refused(reads.get_task, self.task, revision, bad).reason)
+        self.assertEqual(reads.get_task(self.task, revision,
+                                        f"{reg.tasks.ID_MAX}.{'0' * 16}")["revision"],
+                         revision)
+        for given in ((revision, None), (None, mark)):
+            with self.subTest(given=given):
+                self.assertIn("come together",
+                              self.refused(reads.get_task, self.task, *given).reason)
+
+    def test_a_note_posted_mid_read_is_in_the_reply_or_past_its_mark(self):
+        self.note("Before.")
+        visible, posted = notes.visible, []
+
+        def then_post(*args, **kw):
+            found = visible(*args, **kw)
+            if not posted:
+                posted.append(self.note("Mid-read."))
+            return found
+
+        with mock.patch.object(notes, "visible", then_post):
+            got = reads.get_task(self.task)
+        latest = int(got["notes_mark"].split(".")[0])
+        self.assertEqual(([n["text"] for n in got["notes"]], got["notes_total"]),
+                         (["Before."], 1))
+        self.assertLess(latest, posted[0])
+        self.assertUnchanged(self.again((got["revision"], got["notes_mark"])),
+                             ["Mid-read."])
 
 
 if __name__ == "__main__":

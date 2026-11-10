@@ -20,9 +20,9 @@ only the invariants and conventions for working in the repo.
   outbound route.
 - **Default-deny for governed capabilities.** Unknown → held for human approval.
 - **Sandbox holds only credentials it must, scoped to read-only/self-use.**
-  Anthropic session credentials (from Claude subscription login, persisted in the
-  config volume — not an injected API key) and low-risk read-only tokens may live
-  in the sandbox.
+  The tier's vendor session credential (from its CLI's session login — Claude
+  subscription login for Claude — persisted in the tier's own config volume, never an
+  injected API key) and low-risk read-only tokens may live in the sandbox.
   Write-capable / high-impact creds (e.g. git push token) stay governed behind
   a proxy — never in the sandbox.
 - **The boundary is capability, not configuration.** Enforcement lives in what the

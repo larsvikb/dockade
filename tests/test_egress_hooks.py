@@ -83,12 +83,12 @@ class AuthorizeTests(unittest.TestCase):
     def test_the_lifeline_is_the_sandbox_s_and_not_the_mcp_servers(self):
         """THE assertion behind ``_is_lifeline``. The lifeline is the one allow this
         proxy makes without asking the policy authority, and its whole justification
-        is that a control-plane outage must not sever *the agent's* API. An MCP
-        server container is on the other side of this proxy for a different reason
-        entirely — it is a third-party image holding a credential — and it never
-        talks to Anthropic, so inheriting the short-circuit would hand exactly the
-        component this topology plans for the one egress path nothing holds or
-        centrally records."""
+        is that a control-plane outage must not sever *the agent class's* lifeline
+        to Anthropic. An MCP server container is on the other side of this proxy for
+        a different reason entirely — it is a third-party image holding a credential
+        — and it never talks to Anthropic, so inheriting the short-circuit would
+        hand exactly the component this topology plans for the one egress path
+        nothing holds or centrally records."""
         with mock.patch.object(addon, "_post_authorize",
                                return_value={"decision": "deny", "reason": "nope"}):
             v = run(addon._authorize("api.anthropic.com", stage="connect",
@@ -251,7 +251,7 @@ class HttpConnectTests(unittest.TestCase):
 
     def test_the_sandbox_keeps_its_lifeline_through_the_hook(self):
         # The other half: the same host from sandbox-net is still decided locally,
-        # so a control-plane outage cannot sever the agent's own API.
+        # so a control-plane outage cannot sever Anthropic's lifeline.
         flow = _connect_flow("api.anthropic.com", cid="c6")
         with mock.patch.object(addon.socket, "getaddrinfo",
                                return_value=[(2, 1, 6, "", ("160.79.104.10", 0))]), \

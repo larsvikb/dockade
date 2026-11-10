@@ -25,10 +25,11 @@ audited.**
   destination, and the gateway serves the agent on one address and dials the control
   plane only to ask about a tool call, so there is no relay in it to turn.
 
-Two agent **tiers**: **tier 1** is Claude with governed egress through the proxy; **tier
-2** is a local-LLM agent (opencode) with *no egress and no credentials at all*. Three
-egress **modes** in the firewall: **governed** (via the proxy), **local** (tier 2, only
-the inference service), **standalone** (proxy-less fallback with a direct allowlist).
+Two agent **tiers**: **tier 1** is a cloud agent with governed egress through the proxy,
+one launcher per vendor's CLI (Claude's is built); **tier 2** is a local-LLM agent
+(opencode) with *no egress and no credentials at all*. Three egress **modes** in the
+firewall: **governed** (via the proxy), **local** (tier 2, only the inference service),
+**standalone** (Claude's proxy-less fallback with a direct allowlist).
 
 The rest of this document is the *why* behind each of those pieces. Everything else in
 the repo follows from "containment is by **capability**, not configuration."
@@ -109,7 +110,7 @@ anything behind it.
      SANDBOXES ─────► UNGOVERNED tools (sandbox-net only, NO egress;
                       e.g. the local-LLM inference service)
 
-     tier 1: Claude (yolo) — governed egress through the proxy
+     tier 1: a cloud agent (Claude, yolo) — governed egress through the proxy
      tier 2: opencode + local LLM — NO egress, NO credentials
 
      No sandbox tier has a route to control-net / the control plane.
@@ -588,6 +589,13 @@ even where it ignores managed settings". What follows:
   the default-deny firewall, like everything else. Trust the firewall for
   containment, not the env flag; don't claim telemetry is off until export behavior
   is actually checked.
+- **Every tier's CLI is in the same position.** Whatever settings files another
+  vendor's agent CLI reads, they are mistake-prevention, for the same reason a
+  `settings.json` is: the agent can edit them or relaunch around them. The boundary
+  rests on no vendor's console, Anthropic's included. A console does one thing the
+  container cannot: it is the only hard off-switch for a server-side tool whose
+  transport the proxy cannot close. So each tier's registry under "Server-side
+  execution: accepted governance blind spots" says whether its vendor has one.
 
 ### What the image ships today
 
@@ -680,21 +688,60 @@ Consequences:
 
 ## Server-side execution: accepted governance blind spots
 
-Some tools execute **server-side** (on Anthropic infra, within the API turn)
-rather than from the container. Their effects never traverse the container's
+Some tools execute **server-side** (on the tier's provider's infra, within the API
+turn) rather than from the container. Their effects never traverse the container's
 network boundary, so **the firewall/proxy cannot see, audit, or block them —
-governance of those actions is lost.** We accept this initially, but enumerate
-it explicitly so it is a conscious tradeoff, revisited as the setup matures.
+governance of those actions is lost.** We accept some of this, but enumerate it
+explicitly so each is a conscious tradeoff, revisited as the setup matures.
 
-**Why the list is complete, not a sample:** a tool can only escape governance if
+The registry is **per tier-1 CLI**, since each vendor offers its own hosted tools, and
+each tier's table is complete against its own CLI's tools. A tier is not built without
+its table: the change that adds a launcher to the tier table under "Tier 2, and what it
+shares with tier 1" adds its rows here, each tested client- vs server-side.
+
+**Why each list is complete, not a sample:** a tool can only escape governance if
 it causes effects *outside* the container. File/process tools (Bash, Read, Edit,
 Write, Glob, Grep, Task, NotebookEdit) are inherently local — the firewall
-already governs anything they spawn. The tools that reach external networks are
-the two web tools, both tested in this sandbox — plus **hosted MCP connectors**,
-whose calls originate on Anthropic infra rather than here, which is why the
-transport carrying them is blocked rather than accepted.
+already governs anything they spawn. For Claude, the tools that reach external
+networks are the two web tools, both tested in this sandbox — plus **hosted MCP
+connectors**, whose calls originate on Anthropic infra rather than here, which is why
+the transport carrying them is blocked rather than accepted — and Claude Code's
+**cloud and remote sessions**, which are not yet measured.
 
-Registry (re-test when Claude Code adds/changes tools):
+**The kinds a tier's rows fall into**, and the decision each kind takes:
+
+- **Hosted search with WebSearch's property** — the provider runs queries the agent
+  writes, and fetches no URL the agent chose. Accepted as WebSearch is, by the
+  standing decision below.
+- **Server-side fetch of agent-chosen URLs** — its own kind, not accepted on
+  WebSearch's terms: the agent picks the destination, so it is an ungoverned egress
+  path rather than an unaudited intake. The tier that finds one writes its row and its
+  decision.
+- **Provider-run connectors, remote MCP, agents or cloud tasks** — closed at the
+  transport where they ride a host of their own, as claude.ai's connectors are.
+  Otherwise the tier writes a row with their reach and its decision.
+
+Scope: this concerns governing *actions on external systems*. The conversation itself
+always goes to the tier's provider — that is the model, not a tool action — and is out
+of scope for network governance. Everything the agent reads goes with it: the
+workspace, `/refs`, and every gateway result, under the terms of the account the
+operator logged the tier in with. Choosing an account or plan whose terms suit the
+work is the operator's job, as it is for Anthropic's today; dockade adds no banner,
+acknowledgement or launcher check, and records no vendor's terms. One consequence is
+dockade's own: an allow rule, a lease, a tool rule or a pin is shared by every cloud
+tier (see "Policy is scoped to a client class"), so one made while working with one
+tier answers another tier's call, and its result goes to that tier's provider. A
+single approval stays with the sandbox whose request it answered.
+
+**Maintenance rule:** for any new tool, ask "can it cause effects that don't
+originate from the container?" If yes, test client vs server-side and add a row to its
+tier's table. If no, it is local by construction.
+
+### Claude (`run-claude-sandbox.sh`)
+
+Re-test when Claude Code adds/changes tools. Vendor console: Anthropic's org admin
+console, through the org's remote managed settings (see "Managed settings are NOT an
+enforcement lever here").
 
 | Tool | Executes | Governed? | If allowed, governance lost over… |
 |------|----------|-----------|-----------------------------------|
@@ -703,14 +750,7 @@ Registry (re-test when Claude Code adds/changes tools):
 | Bash / file / Task / Notebook tools | client-side | Yes | — (local, firewall-governed) |
 | MCP tools via the gateway | client-side | Yes | — (the gateway is the choke point; see "MCP gateway") |
 | claude.ai MCP connectors (hosted) | server-side | **No** | everything a connector does — which is why this one is **closed at the transport** rather than accepted as WebSearch is |
-
-Scope: this concerns governing *actions on external systems*. The conversation
-itself always goes to Anthropic (that is the model, not a tool action) and is
-out of scope for network governance.
-
-**Maintenance rule:** for any new tool, ask "can it cause effects that don't
-originate from the container?" If yes, test client vs server-side and add a row.
-If no, it is local by construction.
+| Claude Code cloud and remote sessions (e.g. `--cloud`, `--environment`, `--remote-control`, `ultrareview`) | unmeasured | **Open** | **not accepted**: this row is an open question under an "accepted" heading, pending a measurement of what they reach and whether their transport can be closed |
 
 **Decision (standing):** WebSearch runs server-side and is left enabled. It is
 read-only (no upload/POST), its risk is narrow (see Web access section), and its
@@ -771,14 +811,21 @@ host-bind-mounted workspace. Dependencies: pull-through cache.
   permitted destination. See "Local inference".
 
 **Credentials:**
-- In the sandbox: Anthropic session credentials (must, self-use) — established by
-  interactive **Claude subscription login** on first run (any subscription works,
-  personal or org) and persisted as `.credentials.json` in the config volume, *not*
-  an injected `ANTHROPIC_API_KEY`. When the account is **org-governed**, that login
-  is also what places the sandbox under the org's remote server-managed settings —
-  a personal-subscription login would not carry those (see "Managed settings are
-  NOT an enforcement lever here"). Low-risk
-  read-only tokens (e.g. a search API key) are also acceptable here.
+- In the sandbox: the tier's vendor session credential (must, self-use) —
+  established by that CLI's interactive **session login** on first run, never an
+  injected API key, and persisted in a config volume of the tier's own that no other
+  tier mounts. The agent must authenticate to its model, so this is the credential the
+  invariant's "must" names. There is no scope test on top: whatever the token can
+  reach over the network goes through the egress proxy like any other request, and
+  whatever it can run on the vendor's side is a row in that tier's registry under
+  "Server-side execution: accepted governance blind spots". For Claude that is
+  **Claude subscription login** (any subscription works, personal or org), persisted
+  as `.credentials.json` in `claude-sandbox-config`, *not* an injected
+  `ANTHROPIC_API_KEY`. When the account is **org-governed**, that login is also what
+  places the sandbox under the org's remote server-managed settings — a
+  personal-subscription login would not carry those (see "Managed settings are NOT an
+  enforcement lever here"). Low-risk read-only tokens (e.g. a search API key) are
+  also acceptable here.
 - Governed / not in sandbox: git push token, MCP server credentials (held by the
   gateway), any write-capable / high-impact key.
 
@@ -852,8 +899,8 @@ as selective MITM on credentialed hosts, where it would buy true brokering.
 off-box, so reaching the API is a deliberate path, and it is this one: the CLI honours
 `HTTPS_PROXY` for its own API calls, and the proxy always-allows `api.anthropic.com`
 by a local check before the control plane is asked — the permanent lifeline, "A
-control-plane client" in `proxies/egress/DESIGN.md`. That keeps the agent's own API
-traffic in the same audit as everything else, and it is why there is no transparent
+control-plane client" in `proxies/egress/DESIGN.md`. That keeps traffic on Anthropic's
+lifeline in the same audit as everything else, and it is why there is no transparent
 redirect of port 443 and no per-domain hole in the firewall for the API: a
 network-layer allowlist survives only as the standalone fallback below. What the CLI
 reads, what else it reaches, and the probe that confirmed both in this sandbox are in
@@ -1119,6 +1166,30 @@ below the pool, so their traffic through the proxy is unclassified (held, never 
 standing grant, attributed to its own address) and never takes the lifeline. The pool
 is still a topology fact compose declares, and it also keeps Docker from handing a
 sandbox an infra address while that service is down.
+
+**Every cloud agent tier shares the agent class.** A Codex or Antigravity sandbox on
+sandbox-net lands in the same pool as Claude's, and that is the decision, not an
+accident of addressing. The tiers are one population: one operator, one workspace,
+one gateway answering for all of them. A pool per tier would guard little, since a
+model API approved for any tier accepts an attacker's key from any tier, so the
+approval is the exposure and not which tier holds it. What sharing means, stated so
+nobody has to derive it:
+
+- A standing grant made for one tier is made for every tier: an allow rule, a lease,
+  a tool rule or a pin. A single approval stays with the sandbox whose request it
+  answered, since holds group by client address (`_group_key` in
+  `control-plane/holds.py`). A held host does not say which tier asked.
+- Every tier reaches Anthropic's lifeline unheld, since the lifeline is scoped to the
+  class (`proxies/egress/DESIGN.md` → "The lifeline is scoped by client"). It stays
+  Anthropic's alone: another vendor's model and auth hosts are held on first use and
+  allow-persisted as the exact hosts, not as wildcards, which means such a tier has no
+  model access through a control-plane outage, and on a fresh store waits on its first
+  hold.
+
+A pool per tier becomes necessary once a tier differs in trust from the others, needs
+a host or an audit of its own, or the proxy starts brokering a vendor's credential.
+Undoing the shared class then means re-scoping every rule written under it, which is
+why these triggers are written here.
 
 **The classification is the control plane's, not the proxy's**, which is the one
 placement decision here worth arguing. The proxy observes the peer address and
@@ -2262,14 +2333,23 @@ until a consumer justifies it.
 
 ### Tier 2, and what it shares with tier 1
 
-The concrete motivation for the wiring above is not tier-1 Claude but a **second
-agent tier driven by the local model**, which is a genuinely different containment
-posture:
+The concrete motivation for the wiring above is not a tier-1 cloud agent but a
+**second agent tier driven by the local model**, which is a genuinely different
+containment posture. One row per launcher, built or planned:
 
-| | Brain | Egress | Credentials | Governed by |
-| --- | --- | --- | --- | --- |
-| Tier 1 | Claude (API) | proxy → allowlist | Anthropic session | egress proxy + control plane |
-| Tier 2 | local LLM | **none** | **none** | nothing to govern — no egress exists |
+| Launcher | Tier | Brain | Egress | Credentials | Governed by |
+| --- | --- | --- | --- | --- | --- |
+| `run-claude-sandbox.sh` | 1 | Claude (Anthropic API) | proxy → allowlist; Anthropic's lifeline unheld | Anthropic session login, in `claude-sandbox-config` | egress proxy + control plane |
+| `run-codex-sandbox.sh` (planned) | 1 | Codex (OpenAI) | proxy → allowlist; its model host held on first use | OpenAI session login, in a config volume of its own | egress proxy + control plane |
+| `run-antigravity-sandbox.sh` (planned) | 1 | Antigravity, `agy` (Google) | proxy → allowlist; its model host held on first use | Google session login, in a config volume of its own | egress proxy + control plane |
+| `run-opencode-sandbox.sh` | 2 | local LLM | **none** | **none** | nothing to govern — no egress exists |
+
+Every tier-1 row is a cloud agent, and what a new one needs is already decided: its
+vendor's session login and never an API key ("Capability inventory (v1)"), the shared
+agent class with the standing grants that come with it ("Policy is scoped to a
+client class"), and its own table of server-side tools ("Server-side execution:
+accepted governance blind spots"). Where its registry agent id comes from is in
+`task-registry/DESIGN.md` → "Who an agent is".
 
 Tier 2 holds **no credentials at all** — the credential invariant's "only what it
 must" reduces to nothing. Built as `opencode-sandbox/` + `run-opencode-sandbox.sh`;
@@ -2289,7 +2369,7 @@ unnoticed. `init-firewall.sh` has a **third mode** alongside GOVERNED and STANDA
 | --- | --- | --- |
 | GOVERNED | `EGRESS_PROXY_IP` set | loopback, embedded DNS, established, `/32` → egress proxy, `/32` → tool gateway (tier 1, when found) |
 | LOCAL | `SANDBOX_MODE=local` | loopback, embedded DNS, established, `/32` → `llm:8080` |
-| STANDALONE | neither | direct `ipset` IP-allowlist (proxy-less fallback, tier 1 only) |
+| STANDALONE | neither | direct `ipset` IP-allowlist (proxy-less fallback, Claude's tier only; the allowlist's permanent hosts are Anthropic's) |
 
 LOCAL **fails closed**: if `SANDBOX_MODE=local` and `LLM_IP` is unset or not an
 IPv4 address, the firewall aborts rather than booting an agent whose one intended
@@ -2422,6 +2502,8 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | Step | What | State |
 |------|------|-------|
 | — | sandbox image + launcher, both tiers | **done** |
+| — | tier-1 Codex sandbox — `run-codex-sandbox.sh` | planned |
+| — | tier-1 Antigravity sandbox — `run-antigravity-sandbox.sh` | planned |
 | 0 | egress proxy, compose infra | **done** |
 | 1 | proxy is the sole egress (`sandbox-net` internal) | **done** |
 | 2a | control plane: policy store + audit | **done** |

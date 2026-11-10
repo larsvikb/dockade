@@ -37,9 +37,10 @@ governed request. See ``_drain_egress_audit`` in control-plane/ingest.py.
 Fail-closed, with one deliberate exception:
   - The **permanent lifeline** hosts (``EGRESS_PERMANENT_HOSTS`` — the Anthropic
     API/auth endpoints) are allowed by a LOCAL check *before* the control plane
-    is consulted, so a control-plane outage never bricks the agent's own API.
+    is consulted, so a control-plane outage never bricks Anthropic's lifeline.
     Scoped to clients on ``EGRESS_LIFELINE_CIDRS`` (sandbox-net's sandbox pool),
-    because that sentence names the only client it is for — see ``_is_lifeline``.
+    the agent class and the only client it is for — every cloud agent tier, so
+    wider than Claude's alone, which DESIGN.md accepts. See ``_is_lifeline``.
   - Every other host depends on the control plane. If it is unreachable or slow
     (timeout), the request is DENIED and audited locally — governed egress fails
     closed when the policy authority is down, which is the intended posture.
@@ -165,7 +166,7 @@ CONTROL_TIMEOUT = _number("EGRESS_CONTROL_TIMEOUT", "130", _seconds,
                           f"{threading.TIMEOUT_MAX:.0f}")
 
 # Permanent lifeline — allowed locally, BEFORE the control plane is consulted,
-# so an outage of the control plane can never sever the agent's own API/auth.
+# so an outage of the control plane can never sever Anthropic's API/auth lifeline.
 # Mirrors the PERMANENT block of policies/egress-allowlist.txt. Same match
 # semantics as the control plane: a leading dot matches subdomains.
 #

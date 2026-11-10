@@ -691,6 +691,51 @@ class ShippedComponentTests(_NeedsGit):
                             f"(Status says {state!r}): /{phrase}/")
 
 
+class LauncherRowTests(_NeedsGit):
+    """Every tracked ``run-*-sandbox.sh`` has a row in DESIGN.md's tier table.
+
+    That table, under "Tier 2, and what it shares with tier 1", is what a new tier's
+    launcher is built to: its credential, its egress and what governs it. A launcher
+    landed under another name than its row, or a later one added with no row, leaves
+    the design describing tiers the repo does not have. One direction only, launcher
+    to row: a row may be planned before its launcher exists.
+
+    The table is found by its ``Launcher`` header (the section's Mode table has none)
+    and only that column is read, so prose naming a launcher does not count as a row.
+    No section, no such table or no launcher fails rather than passing on nothing."""
+
+    SECTION = "### Tier 2, and what it shares with tier 1"
+
+    def _launcher_cells(self) -> set[str]:
+        design = (ROOT / "DESIGN.md").read_text()
+        self.assertIn(f"\n{self.SECTION}\n", design, "the tier section is gone")
+        section = design.split(f"\n{self.SECTION}\n", 1)[1].split("\n#", 1)[0]
+        lines = section.splitlines()
+        cells = [[c.strip() for c in line.strip().strip("|").split("|")] for line in lines]
+        at = next((i for i, line in enumerate(lines)
+                   if line.lstrip().startswith("|") and "Launcher" in cells[i]), None)
+        self.assertIsNotNone(at, "no table with a Launcher column in the section")
+        col = cells[at].index("Launcher")
+        named = set()
+        # Past the header and its --- row, to the first line that is not the table's.
+        for line, row in zip(lines[at + 2:], cells[at + 2:]):
+            if not line.lstrip().startswith("|"):
+                break
+            named |= set(re.findall(r"`(run-[\w-]+-sandbox\.sh)`", row[col]))
+        self.assertTrue(named, "the Launcher column names no launcher")
+        return named
+
+    def test_every_launcher_has_a_row(self):
+        launchers = {f for f in _tracked() if re.fullmatch(r"run-[\w-]+-sandbox\.sh", f)}
+        self.assertTrue(launchers, "no run-*-sandbox.sh is tracked")
+        named = self._launcher_cells()
+        for launcher in sorted(launchers):
+            with self.subTest(launcher=launcher):
+                self.assertIn(launcher, named,
+                              f"{launcher} has no row in DESIGN.md's tier table, under "
+                              f'"Tier 2, and what it shares with tier 1"')
+
+
 class JdkVariantDocTests(unittest.TestCase):
     """The JDK variant's variable and its jar, as the README tells the operator and
     the boot note tells the agent. Read by name, so no index is needed: a wrong path

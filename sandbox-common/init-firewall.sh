@@ -22,8 +22,9 @@ unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY no_proxy
 #                local inference service (LLM_IP), plus loopback / embedded DNS /
 #                established. Deliberately NOT the egress proxy — a tier-2 agent
 #                must not reach it even when it is running on the same network.
-#   STANDALONE — tier 1 with no infra. Keeps the fuller direct-egress ipset
-#                allowlist; the only mode with any direct outbound allowance.
+#   STANDALONE — Claude's tier with no infra. Keeps the fuller direct-egress ipset
+#                allowlist, whose permanent hosts are Anthropic's; the only mode
+#                with any direct outbound allowance.
 #
 # STANDALONE is the sole mode with a direct IP allowlist, so several branches
 # below key off exactly that.
@@ -198,9 +199,9 @@ else
 
     # Whitelisted domains, grouped by target-state disposition.
     ALLOWED_DOMAINS=(
-        # PERMANENT — the agent's own API/auth lifeline. In the target design this
-        # is the only egress the sandbox keeps (routed through the egress proxy as
-        # an always-allow so it is audited; direct for now).
+        # PERMANENT — Anthropic's API/auth lifeline. STANDALONE is Claude's mode
+        # alone, and in the target design this is the only egress it keeps; governed,
+        # the egress proxy always-allows it so it is audited.
         "api.anthropic.com"
         "claude.ai"
         "platform.claude.com"

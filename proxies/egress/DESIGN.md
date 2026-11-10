@@ -143,7 +143,7 @@ dependency. The canonical allow policy now lives at `policies/egress-allowlist.t
 no longer bakes or reads an allowlist file. Two deliberate properties: (1) the
 **permanent lifeline** (Anthropic API/auth) is allowed by a *local* check in the
 proxy *before* the control plane is consulted, so a control-plane outage never
-bricks the agent's own API; (2) everything else **fails closed** — if the control
+bricks Anthropic's lifeline; (2) everything else **fails closed** — if the control
 plane is unreachable or times out, the request is denied and audited locally. That
 second property has to include the proxy's own errors: mitmproxy answers an
 exception in an addon hook by logging it and letting the flow proceed, so an
@@ -155,8 +155,11 @@ any exception (`_fail_closed` in `proxies/egress/addon.py`).
 Everywhere else this proxy is deliberately client-agnostic: it asks the policy
 authority and the authority decides on the host. The lifeline is the one allow that
 skips that call, so who is asking has to be part of it — its justification names its
-own scope, *the agent's* own API, and only sandbox-net's sandbox pool runs the
-agent — the tool gateway and the llm share the network, pinned below the pool. Since
+own scope, *the agent class*, and only sandbox-net's sandbox pool runs agents — the
+tool gateway and the llm share the network, pinned below the pool. That class is every
+cloud agent tier, so the lifeline is wider than the one tier whose model it serves:
+another tier reaches Anthropic's hosts unheld too, a consequence `DESIGN.md` → "Every
+cloud agent tier shares the agent class" accepts. Since
 `mcp-net`, this proxy also serves MCP server containers, which hold credentials and
 never talk to Anthropic; a host-only check would hand them the sole egress path
 nothing holds and the control plane never records. Enforced by `_is_lifeline` in

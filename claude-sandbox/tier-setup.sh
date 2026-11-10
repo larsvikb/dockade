@@ -14,7 +14,7 @@ set -euo pipefail
 # contract). Root writes the gateway pointer, the launch settings and the managed
 # note into /etc, image layer, and nothing else. Then `exec gosu` re-runs this
 # script as the sandbox user for everything that lands in $CONFIG_DIR — a volume
-# the agent owns and every concurrent tier-1 sandbox shares, so a sibling's agent
+# the agent owns and every concurrent Claude sandbox shares, so a sibling's agent
 # can be rearranging it while this boot runs.
 # Written as root, a settings.json that had become a symlink was a root write (and
 # a root READ, through jq) wherever the link pointed; written as the user, a
@@ -190,7 +190,7 @@ EOF
     fi
 
     # The managed note, for the refs, the plugins and the JDK. In /etc for the gateway
-    # pointer's reason and a sharper one: every concurrent tier-1 sandbox shares the
+    # pointer's reason and a sharper one: every concurrent Claude sandbox shares the
     # config volume, and each launch has its own SANDBOX_REFS and plugins, so a note
     # there would describe whichever sibling booted last. A CLAUDE.md in
     # /etc/claude-code loads as managed memory beside the user-scope one (measured —

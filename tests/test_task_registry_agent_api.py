@@ -18,7 +18,12 @@ import uuid
 from pathlib import Path
 
 import _surface
-from _loader import ROOT, load_surface, load_task_registry_agent_api
+from _loader import (
+    ROOT,
+    load_instructions_renderer,
+    load_surface,
+    load_task_registry_agent_api,
+)
 from test_task_registry_plans import DECISION, MULTI, shown
 
 reg = load_task_registry_agent_api()
@@ -421,10 +426,17 @@ class InstructionTests(unittest.TestCase):
     def test_every_tool_the_instructions_name_is_served(self):
         # The skills and agents too: `review-before-push` files its leftovers with a
         # tool, and the planner and its reviewer work through them.
+        # Every tier's source and output too, so a tool a future tier names in its own
+        # text is held, and the fragments the sources share.
         skills = sorted((ROOT / ".claude" / "skills").glob("*/SKILL.md"))
         agents = sorted((ROOT / ".claude" / "agents").glob("*.md"))
+        render = load_instructions_renderer()
+        sources = render.sources()
+        tiers = [*sources, *(ROOT / render.parse(path).output for path in sources),
+                 *sorted((ROOT / render.FRAGMENTS).glob("*/*.md"))]
+        self.assertIn(self.IMAGE, tiers)
         named = {str(path.relative_to(ROOT)): re.findall(r"tasks__(\w+)", path.read_text())
-                 for path in (self.IMAGE, self.REPO, *skills, *agents)}
+                 for path in (self.IMAGE, self.REPO, *skills, *agents, *tiers)}
         self.assertTrue(named["CLAUDE.md"])
         self.assertTrue(named[".claude/agents/planner.md"]
                         + named[".claude/agents/plan-reviewer.md"])

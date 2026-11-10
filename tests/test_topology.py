@@ -1148,6 +1148,59 @@ class RootContextIgnoreTests(unittest.TestCase):
                 with self.subTest(line=line):
                     self.assertTrue(line.startswith("**/"))
 
+    def test_no_pattern_excludes_a_file_a_root_context_build_copies(self):
+        # The builds as ReffilesCoverCopySourcesTests reads them; its two readers use
+        # nothing of their class but the assertions every TestCase has.
+        builds = (ReffilesCoverCopySourcesTests.compose_builds(self)
+                  + ReffilesCoverCopySourcesTests.launcher_builds(self))
+        roots = sorted({dockerfile for dockerfile, context in builds if context == "."})
+        self.assertIn("claude-sandbox/Dockerfile", roots)
+        for dockerfile in roots:
+            for source in _copy_sources((ROOT / dockerfile).read_text(), dockerfile, "."):
+                with self.subTest(dockerfile=dockerfile, source=source):
+                    self.assertFalse(_dockerignored(source, self.IGNORED),
+                                     f".dockerignore excludes {source}, which "
+                                     f"{dockerfile} COPYs: the build would fail")
+
+    def test_the_matcher_reads_patterns_as_the_builder_does(self):
+        patterns = ("tests", "*.md", "**/__pycache__", "*-sandbox/instructions.md",
+                    "secrets", "!secrets/keep")
+        for path, ignored in (("tests/test_x.py", True), ("README.md", True),
+                              ("claude-sandbox/user-CLAUDE.md", False),
+                              ("__pycache__/a.pyc", True), ("a/b/__pycache__/c.pyc", True),
+                              ("claude-sandbox/instructions.md", True),
+                              ("secrets/x", True), ("secrets/keep", False),
+                              ("testsuite/x", False)):
+            with self.subTest(path=path):
+                self.assertEqual(_dockerignored(path, patterns), ignored)
+
+
+def _dockerignored(path: str, patterns: tuple[str, ...]) -> bool:
+    """Whether ``.dockerignore`` patterns exclude ``path`` from a root build context.
+
+    As the builder reads them: the last matching pattern wins, ``!`` re-includes, a
+    pattern matching a directory excludes all below it, ``*`` and ``?`` stay within a
+    path segment and ``**`` spans any number of them, none included."""
+    def regex(pattern: str) -> re.Pattern[str]:
+        out, i = "", 0
+        while i < len(pattern):
+            if pattern.startswith("**/", i):
+                out, i = out + "(?:.*/)?", i + 3
+            elif pattern.startswith("**", i):
+                out, i = out + ".*", i + 2
+            else:
+                out += {"*": "[^/]*", "?": "[^/]"}.get(pattern[i], re.escape(pattern[i]))
+                i += 1
+        return re.compile(out + "(?:/.*)?")
+
+    ignored = False
+    for raw in patterns:
+        negate = raw.startswith("!")
+        pattern = posixpath.normpath(raw.removeprefix("!").strip().lstrip("/"))
+        if pattern != "." and regex(pattern).fullmatch(path):
+            ignored = not negate
+    return ignored
+
 
 GATEWAY_SRC = (ROOT / "tool-gateway" / "app.py").read_text()
 #: A ``user``'s uid as the invoking user's, by a variable whose default is not root.

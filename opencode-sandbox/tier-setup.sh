@@ -22,7 +22,7 @@ set -euo pipefail
 # entry becomes a deny rule that `Permission.visibleTools` applies before the
 # request is built, so the tool's schema never reaches the model — the saving is
 # prompt tokens, not privilege. That matters on a 24k window whose base prompt
-# already takes a quarter of it, and where tool descriptions are the largest
+# already takes over a third of it, and where tool descriptions are the largest
 # single part of it. The five disabled tools are the ones with no capability
 # behind them: webfetch and websearch need egress this tier does not have, lsp
 # needs a language server the image does not install and cannot fetch, and task
@@ -84,11 +84,13 @@ install -m 0644 /etc/opencode/opencode.json "$CONFIG_DIR/opencode/opencode.json"
 # and can rewrite opencode.json, and an instruction file that only loads while a
 # config key survives is the weaker of the two. Neither is a control either way.
 #
-# Content is this tier's CAPABILITY facts, and deliberately NOT a copy of tier 1's
-# CLAUDE.md: that file's longest bullet describes the governed proxy, and this tier
-# has neither a proxy nor egress. Shorter, too, and for a reason beyond taste — the
-# window here is 32k with a base prompt already taking a quarter of it, so
-# instructions cost roughly thirty times what they cost in tier 1.
+# Content is this tier's CAPABILITY facts. It shares with tier 1's CLAUDE.md only
+# the facts every tier shares (/workspace live, not root, rm -I), which come from
+# one source; the rest of tier 1's text, its longest bullet the governed proxy's,
+# is false here, where there is neither a proxy nor egress. Shorter, too, and for a
+# reason beyond taste — the window here is 24k (opencode.json) with a base prompt
+# already taking over a third of it, so every line here is paid for out of what is
+# left. Edited in opencode-sandbox/instructions.md and rendered (make instructions).
 install -m 0644 /etc/opencode/AGENTS.md.template "$CONFIG_DIR/opencode/AGENTS.md"
 
 # opencode reads its user-scope config from ~/.config/opencode (the XDG default;

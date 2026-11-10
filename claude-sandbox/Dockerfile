@@ -269,6 +269,7 @@ COPY claude-sandbox/user-settings.json /etc/claude-code/user-settings.json
 # The SOURCE is not named CLAUDE.md either, for the same reason one level up: a
 # subdirectory's CLAUDE.md is loaded as project instructions whenever a session
 # reads a file beside it, which on the host would tell that session it is in here.
+# Rendered from claude-sandbox/instructions.md by `make instructions`.
 COPY claude-sandbox/user-CLAUDE.md /etc/claude-code/CLAUDE.md.template
 COPY claude-sandbox/statusline.sh /etc/claude-code/statusline.sh
 COPY claude-sandbox/tier-setup.sh /usr/local/bin/tier-setup.sh

@@ -125,7 +125,8 @@ JSONFILES := $(shell git ls-files '*.json' 2>/dev/null)
 # one such as scripts/) is added here by hand: once a module in a directory missing
 # here is tracked, PyfilesTests in tests/test_suite_layout.py fails naming it.
 PYFILES := $(wildcard proxies/egress/*.py control-plane/*.py control-plane-ui/*.py \
-                      ui-common/*.py tasks-ui/*.py tool-gateway/*.py task-registry/*.py)
+                      ui-common/*.py tasks-ui/*.py tool-gateway/*.py task-registry/*.py \
+                      sandbox-common/instructions/*.py)
 # Dependency-free unit tests for the governance-critical decision logic. Kept
 # separate from PYFILES so they can be linted with the app code but discovered
 # and run on their own (python -m unittest, no pip installs — see tests/).
@@ -222,7 +223,8 @@ REFFILES := $(SCRIPTS) \
         rebuild logs-ep logs-cp logs-tg tool-outcomes tool-content \
         print-config-home \
         mcp-up mcp-down mcp-ps mcp-tools gateway-tools tasks-up tasks-down \
-        claude opencode boundary check-boundary split-check ui-diff ui-test
+        claude opencode boundary check-boundary split-check ui-diff ui-test \
+        instructions
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -587,6 +589,11 @@ test: ## Run the governance unit tests (dependency-free; python -m unittest)
 	# the Python side, so the default stays "skip".
 	DOCKADE_REQUIRE_TOOLS=$(REQUIRE_TOOLS) \
 	  python3 -W ignore::ResourceWarning -m unittest discover -s tests -t tests -v
+
+# The agent instructions each sandbox image ships are rendered, and the renders are
+# committed: tests/test_instructions.py fails when one is not a fresh render.
+instructions: ## Render each tier's agent instructions from <tier>/instructions.md and sandbox-common/instructions/
+	@python3 sandbox-common/instructions/render.py
 
 # The two browser targets' shared steps, as shell functions. `harness_install` puts the
 # pinned playwright-core in place from the harness's lockfile unless it is there

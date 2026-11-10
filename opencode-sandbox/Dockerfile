@@ -144,6 +144,7 @@ COPY opencode-sandbox/opencode.json /etc/opencode/opencode.json
 # coding agents read, and the convention scopes one to the directory holding it, so
 # on the host this one would tell an agent working in opencode-sandbox/ that it has
 # no network.
+# Rendered from opencode-sandbox/instructions.md by `make instructions`.
 COPY opencode-sandbox/user-AGENTS.md /etc/opencode/AGENTS.md.template
 COPY sandbox-common/init-firewall.sh /usr/local/bin/init-firewall.sh
 COPY sandbox-common/entrypoint.sh /usr/local/bin/entrypoint.sh

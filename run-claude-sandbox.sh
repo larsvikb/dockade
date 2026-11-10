@@ -28,8 +28,9 @@
 # therefore CI) asserts containment; see .github/workflows/check.yml.
 #
 # Shared plumbing (workspace guard, image build, naming, git identity, DNS) lives
-# in sandbox-lib.sh and is identical for every tier. THIS file owns only tier 1's
-# capability profile — which is deliberately the whole point of the split:
+# in sandbox-lib.sh and is identical for every tier, as does the wiring a governed
+# tier reaches the data plane through (sc_governed_egress). THIS file owns only
+# tier 1's capability profile — which is deliberately the whole point of the split:
 #
 #   TIER 1 GRANT: Anthropic session credentials (in the config volume) and
 #   governed egress through the egress proxy (standalone fallback: direct
@@ -115,121 +116,8 @@ fi
 # which is a degraded but useful mode for this tier.
 sc_ensure_network "$SANDBOX_NET" true
 
-# Discover the egress proxy on sandbox-net (started by compose). Present ->
-# governed egress: route the sandbox's HTTP(S) through it (HTTPS_PROXY) and
-# allowlist it in the firewall (EGRESS_PROXY_IP). Absent -> direct egress via the
-# firewall only, with a warning.
-EGRESS_PROXY_NAME="${EGRESS_PROXY_NAME:-egress-proxy}"
-EGRESS_PROXY_PORT="${EGRESS_PROXY_PORT:-8080}"
-EGRESS_PROXY_IP="$(sc_service_ip "$EGRESS_PROXY_NAME" "$SANDBOX_NET")"
-
-PROXY_ENV_ARGS=()
-if [[ "$EGRESS_PROXY_IP" =~ ^[0-9.]+$ ]]; then
-    # The proxy exists, but until the control plane answers /authorize the addon
-    # fails CLOSED — so launching now would not stall the agent's first requests,
-    # it would DENY them and write those denials to the audit log as if they were
-    # policy. Wait for the proxy's healthcheck (which compose in turn gates on the
-    # control plane being healthy) so the log stays a record of decisions.
-    sc_wait_healthy "$EGRESS_PROXY_NAME" \
-        "Governed egress is unavailable, and this tier's traffic all flows through it."
-
-    # The MCP gateway, discovered the same way and GOVERNED MODE ONLY — this whole
-    # branch is the governed one, which is what mode-gates the grant below (DESIGN.md:
-    # tier 2 must not acquire a governed tool path by sharing a network).
-    #
-    # BY ADDRESS, not by name — and not because the name would resolve wrongly.
-    # Docker's embedded DNS answers a querier only with the legs it SHARES with the
-    # target, and this sandbox shares exactly one with the triple-homed gateway, so
-    # the name would give the same answer. The address is used because it is needed
-    # here regardless: the in-container firewall grants a /32, which means the leg
-    # has to be resolved before the container starts. Handing that one resolution to
-    # both the grant and the client config is what keeps them naming one address
-    # rather than two that agree by luck.
-    TOOL_GATEWAY_NAME="${TOOL_GATEWAY_NAME:-tool-gateway}"
-    TOOL_GATEWAY_PORT="${TOOL_GATEWAY_PORT:-8100}"
-    TOOL_GATEWAY_IP="$(sc_service_ip "$TOOL_GATEWAY_NAME" "$SANDBOX_NET")"
-
-    PROXY_URL="http://${EGRESS_PROXY_NAME}:${EGRESS_PROXY_PORT}"
-    NO_PROXY_LIST="localhost,127.0.0.1,::1,${EGRESS_PROXY_NAME}"
-    if [[ "$TOOL_GATEWAY_IP" =~ ^[0-9.]+$ ]]; then
-        # THE GATEWAY MUST NOT BE PROXIED, and leaving it out of this list is not a
-        # missing optimisation — it is a broken tool surface with a misleading error.
-        # A client that honours the proxy environment (Claude Code's MCP transport
-        # does) would send every MCP request to the egress proxy, which hard-blocks
-        # private ranges by design; the agent would get "egress denied by policy",
-        # naming the wrong component entirely and describing a refusal that governance
-        # never made. Measured from inside a sandbox before this line existed.
-        #
-        # Both spellings, because the URL is built from the address and a client that
-        # resolved the name would otherwise miss the exemption.
-        NO_PROXY_LIST="${NO_PROXY_LIST},${TOOL_GATEWAY_NAME},${TOOL_GATEWAY_IP}"
-    fi
-    # BOTH CASES of each, and the lowercase ones are not redundant styling.
-    #
-    # curl reads `http_proxy` in LOWER CASE ONLY, while honouring HTTPS_PROXY and
-    # NO_PROXY in either case. That is deliberate, not an oversight: under CGI a
-    # client-supplied `Proxy:` request header arrives in the environment as
-    # HTTP_PROXY, so honouring it would let a remote caller redirect a server's
-    # outbound HTTP through a proxy of their choosing (httpoxy, CVE-2016-5385).
-    #
-    # With only the uppercase set, `curl http://...` in the sandbox did not reach the
-    # governed proxy at all: it resolved the target itself and died at DNS in about a
-    # millisecond. Containment held — sandbox-net is internal, so there was nowhere
-    # to go — but the agent got "Could not resolve host" instead of a hold it could
-    # have had approved, and the attempt reached no audit log, because it never
-    # reached the control plane. HTTPS was unaffected, which is why it went unnoticed
-    # until a decisions-table row showed a plaintext request that had never arrived.
-    #
-    # Setting both cases is the conventional pairing and covers other tools with the
-    # same rule. `make consistency` asserts the pairing so it cannot drift back.
-    PROXY_ENV_ARGS=(
-        -e "HTTPS_PROXY=$PROXY_URL"
-        -e "HTTP_PROXY=$PROXY_URL"
-        -e "NO_PROXY=$NO_PROXY_LIST"
-        -e "https_proxy=$PROXY_URL"
-        -e "http_proxy=$PROXY_URL"
-        -e "no_proxy=$NO_PROXY_LIST"
-        -e "EGRESS_PROXY_IP=$EGRESS_PROXY_IP"
-        -e "EGRESS_PROXY_PORT=$EGRESS_PROXY_PORT"
-    )
-    EGRESS_DESC="governed via $EGRESS_PROXY_NAME ($EGRESS_PROXY_IP:$EGRESS_PROXY_PORT)"
-
-    if [[ "$TOOL_GATEWAY_IP" =~ ^[0-9.]+$ ]]; then
-        # Waited on for the reason the proxy is: a container that exists is not one
-        # that serves, and an MCP server that fails to connect at session start is a
-        # startup error the agent then reasons around. Its healthcheck is liveness on
-        # the agent leg, so this is short — and unlike the proxy, the gateway has no
-        # `depends_on` to satisfy first.
-        sc_wait_healthy "$TOOL_GATEWAY_NAME" \
-            "The governed tool surface would be absent from this session."
-        PROXY_ENV_ARGS+=(
-            -e "TOOL_GATEWAY_IP=$TOOL_GATEWAY_IP"
-            -e "TOOL_GATEWAY_PORT=$TOOL_GATEWAY_PORT"
-        )
-        TOOLS_DESC="governed via $TOOL_GATEWAY_NAME ($TOOL_GATEWAY_IP:$TOOL_GATEWAY_PORT)"
-    else
-        # NOT a failure, and the sandbox still launches. `--strict-mcp-config` goes on
-        # unconditionally in the wrapper, so "no gateway" yields a provably empty tool
-        # surface rather than whatever the config volume has accumulated — which is
-        # the whole reason those two flags are separable (DESIGN.md, "Telling the
-        # sandbox it exists").
-        TOOLS_DESC="NONE (no $TOOL_GATEWAY_NAME on $SANDBOX_NET; MCP surface is empty)"
-    fi
-else
-    # No proxy found. If sandbox-net is internal (the compose infra defines it
-    # that way), there is NO egress route at all, so standalone/direct mode can't
-    # work — fail with guidance rather than launch a sandbox that reaches nothing.
-    if [ "$(docker network inspect "$SANDBOX_NET" -f '{{.Internal}}' 2>/dev/null)" = "true" ]; then
-        echo "ERROR: '$SANDBOX_NET' is internal but no egress proxy is running." >&2
-        echo "       Start the infrastructure first:  make -C \"$SANDBOX_REPO_ROOT\" up" >&2
-        exit 1
-    fi
-    EGRESS_DESC="DIRECT (no egress proxy on $SANDBOX_NET; firewall only, no audit)"
-    # Standalone: no governed tool path either, and deliberately not a fallback. The
-    # gateway brokers credentials, so a mode with no audited egress is the last place
-    # to hand one out.
-    TOOLS_DESC="NONE (standalone mode has no governed tool path)"
-fi
+# Governed egress and, in governed mode, the tool gateway: see sandbox-lib.sh.
+sc_governed_egress "$SANDBOX_NET"
 
 sc_alloc_container_name "${SANDBOX_NAME:-claude-sandbox}"
 sc_git_identity
@@ -252,8 +140,8 @@ echo "Markets:   $SC_MARKETPLACE_DESC"
 echo "Plugins:   $SC_PLUGINS_DESC"
 echo "Git ident: ${SC_GIT_NAME:-<none>} <${SC_GIT_EMAIL:-none}>"
 echo "DNS upstreams: $SC_UPSTREAM_DNS (pinned via --dns; whitelisted on :53 in standalone mode only)"
-echo "Egress:    $EGRESS_DESC"
-echo "Tools:     $TOOLS_DESC"
+echo "Egress:    $SC_EGRESS_DESC"
+echo "Tools:     $SC_TOOLS_DESC"
 echo ""
 
 # Launch mode. Everything below this — network, capabilities, mounts, firewall,
@@ -339,7 +227,7 @@ docker run "${RUN_MODE_ARGS[@]}" \
     -e "TZ=$SC_TZ" \
     -e "UPSTREAM_DNS=$SC_UPSTREAM_DNS" \
     ${SC_PLUGIN_ARGS[@]+"${SC_PLUGIN_ARGS[@]}"} \
-    ${PROXY_ENV_ARGS[@]+"${PROXY_ENV_ARGS[@]}"} \
+    ${SC_PROXY_ENV_ARGS[@]+"${SC_PROXY_ENV_ARGS[@]}"} \
     ${SC_GIT_ID_ARGS[@]+"${SC_GIT_ID_ARGS[@]}"} \
     \
     "$IMAGE_NAME" ${RUN_CMD_ARGS[@]+"${RUN_CMD_ARGS[@]}"}

@@ -21,8 +21,14 @@ The stub records every ``docker`` invocation, so "it refused" is asserted togeth
 "it created nothing" — the halves are separable, and a refusal that has already created
 the bridge would be the worse bug.
 
-One class runs the launchers themselves, but only as far as the workspace guard's
-refusal: ``LauncherCdpathTests``. Before the guard they run at most ``sc_jdk_variant``
+``sc_governed_egress`` earns the same machinery for the mode gate: whether the tool
+gateway is even looked up depends on whether a proxy answers on the network, so only
+running it in each host state shows that standalone mode never inspects the gateway.
+
+``LauncherProxyEnvTests`` runs ``run-claude-sandbox.sh`` through to ``docker run``,
+with every ``docker`` call answered by the stub, to show the function's output
+reaches the container. One other class runs the launchers themselves, but only as
+far as the workspace guard's refusal: ``LauncherCdpathTests``. Before the guard they run at most ``sc_jdk_variant``
 and ``sc_clamp_cpus`` (``nproc``), a ``docker`` stub that fails every call comes first
 on ``PATH``, and its log is asserted empty, so a guard that stopped refusing would show
 as a failure rather than as a launch.
@@ -163,6 +169,242 @@ class EnsureNetworkTests(unittest.TestCase):
     def test_tier_one_accepts_the_compose_owned_internal_network(self):
         run = _ensure_network(exists=True, internal=True, allow_fallback=True)
         self.assertEqual(run.status, 0, run.stderr)
+
+
+# Answers what sc_governed_egress asks, for the one network named STUB_NET and no
+# other: a container's address on it (from STUB_IP_<name>, `-` mapped to `_`; unset
+# means not on it), its health, and the network's Internal flag. Everything else
+# (`image inspect`, `ps`, `run`) succeeds silently, which is what a whole launch needs;
+# `run` also writes its argv one per line to STUB_RUN_ARGV when that is set. Logs like
+# _DOCKER_STUB, and not `set -u` for its reason.
+_EGRESS_STUB = r"""#!/bin/bash
+printf '%s\n' "$*" >> "$STUB_LOG"
+if [ "$1 $2" = "network inspect" ]; then
+    [ "$3" = "$STUB_NET" ] || exit 1
+    for arg in "$@"; do
+        if [ "$arg" = "{{.Internal}}" ]; then
+            printf '%s\n' "$STUB_NET_INTERNAL"
+            exit 0
+        fi
+    done
+    printf '[]\n'
+    exit 0
+fi
+if [ "$1" = "inspect" ]; then
+    name="${*: -1}"
+    case "$3" in
+        *"Networks \"$STUB_NET\""*)
+            var="STUB_IP_${name//-/_}"
+            printf '%s' "${!var}"
+            ;;
+        *Health*) printf 'healthy\n' ;;
+    esac
+fi
+if [ "$1" = "run" ] && [ -n "$STUB_RUN_ARGV" ]; then
+    printf '%s\n' "$@" > "$STUB_RUN_ARGV"
+fi
+exit 0
+"""
+
+_EGRESS_HARNESS = (
+    'set -euo pipefail; source "$1"; sc_governed_egress "$2"; '
+    'for a in ${SC_PROXY_ENV_ARGS[@]+"${SC_PROXY_ENV_ARGS[@]}"}; do '
+    'printf "ARG %s\\n" "$a"; done; '
+    'printf "EGRESS %s\\nTOOLS %s\\n" "$SC_EGRESS_DESC" "$SC_TOOLS_DESC"')
+
+
+class _EgressRun(NamedTuple):
+    status: int
+    stdout: str
+    stderr: str
+    docker_calls: list[str]
+
+    def env(self) -> dict[str, str]:
+        """The ``-e NAME=value`` pairs SC_PROXY_ENV_ARGS carries."""
+        args = [line[4:] for line in self.stdout.splitlines() if line.startswith("ARG ")]
+        flags, pairs = args[0::2], args[1::2]
+        if set(flags) - {"-e"}:
+            raise AssertionError(f"not a list of -e pairs: {args}")
+        return dict(a.split("=", 1) for a in pairs)
+
+    def line(self, key: str) -> str:
+        return next(ln[len(key) + 1:] for ln in self.stdout.splitlines()
+                    if ln.startswith(key + " "))
+
+    def inspected(self, name: str) -> bool:
+        return any(c.startswith("inspect ") and c.endswith(" " + name)
+                   for c in self.docker_calls)
+
+    def health_checked(self, name: str) -> bool:
+        return any("State.Health" in c and c.endswith(" " + name)
+                   for c in self.docker_calls)
+
+
+# Not `sandbox-net`: the stub answers for this network only, so a function that
+# ignored its argument and asked about `sandbox-net` would find nothing on it.
+_NET = "widgets-net"
+
+
+def _governed_egress(*, ips: dict[str, str], internal: bool,
+                     overrides: dict[str, str] | None = None) -> _EgressRun:
+    """Run ``sc_governed_egress`` on _NET with these containers on it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        stub = Path(tmp) / "docker"
+        stub.write_text(_EGRESS_STUB)
+        stub.chmod(0o755)
+        log = Path(tmp) / "calls.log"
+        log.touch()
+
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("EGRESS_PROXY_", "TOOL_GATEWAY_", "STUB_"))}
+        env.update(
+            PATH=f"{tmp}{os.pathsep}{env['PATH']}",
+            STUB_LOG=str(log),
+            STUB_NET=_NET,
+            STUB_NET_INTERNAL="true" if internal else "false",
+        )
+        env.update({f"STUB_IP_{name.replace('-', '_')}": ip for name, ip in ips.items()})
+        env.update(overrides or {})
+        proc = subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
+            [_BASH, "-c", _EGRESS_HARNESS, "sc_governed_egress", str(LIB), _NET],
+            capture_output=True, text=True, env=env, timeout=60)
+        return _EgressRun(proc.returncode, proc.stdout, proc.stderr,
+                          log.read_text().splitlines())
+
+
+_PROXY, _GATEWAY = "172.30.0.2", "172.30.0.5"
+
+
+@unittest.skipUnless(_BASH or _STRICT, "bash is not installed")
+class GovernedEgressTests(unittest.TestCase):
+    """The four host states a governed tier can launch into, and the mode gate."""
+
+    def test_proxy_and_gateway_both_reach_the_container(self):
+        run = _governed_egress(
+            ips={"egress-proxy": _PROXY, "tool-gateway": _GATEWAY}, internal=True)
+        self.assertEqual(run.status, 0, run.stderr)
+        env = run.env()
+        url = "http://egress-proxy:8080"
+        no_proxy = f"localhost,127.0.0.1,::1,egress-proxy,tool-gateway,{_GATEWAY}"
+        for var in ("HTTPS_PROXY", "HTTP_PROXY"):
+            with self.subTest(variable=var):
+                self.assertEqual(env[var], url)
+                self.assertEqual(env[var.lower()], url)
+        self.assertEqual(env["NO_PROXY"], no_proxy)
+        self.assertEqual(env["no_proxy"], no_proxy)
+        self.assertEqual(env["EGRESS_PROXY_IP"], _PROXY)
+        self.assertEqual(env["EGRESS_PROXY_PORT"], "8080")
+        self.assertEqual(env["TOOL_GATEWAY_IP"], _GATEWAY)
+        self.assertEqual(env["TOOL_GATEWAY_PORT"], "8100")
+        self.assertTrue(run.health_checked("egress-proxy"))
+        self.assertTrue(run.health_checked("tool-gateway"))
+        self.assertEqual(run.line("EGRESS"), f"governed via egress-proxy ({_PROXY}:8080)")
+        self.assertEqual(run.line("TOOLS"), f"governed via tool-gateway ({_GATEWAY}:8100)")
+
+    def test_a_proxy_with_no_gateway_launches_with_an_empty_tool_surface(self):
+        run = _governed_egress(ips={"egress-proxy": _PROXY}, internal=True)
+        self.assertEqual(run.status, 0, run.stderr)
+        env = run.env()
+        self.assertEqual(env["NO_PROXY"], "localhost,127.0.0.1,::1,egress-proxy")
+        self.assertEqual(env["no_proxy"], env["NO_PROXY"])
+        self.assertNotIn("TOOL_GATEWAY_IP", env)
+        self.assertNotIn("TOOL_GATEWAY_PORT", env)
+        self.assertFalse(run.health_checked("tool-gateway"))
+        self.assertEqual(
+            run.line("TOOLS"), f"NONE (no tool-gateway on {_NET}; MCP surface is empty)")
+
+    def test_no_proxy_on_an_internal_network_refuses_with_guidance(self):
+        # An internal network with no proxy has no route at all; launching would give
+        # a sandbox that reaches nothing.
+        run = _governed_egress(ips={"tool-gateway": _GATEWAY}, internal=True)
+        self.assertEqual(run.status, 1)
+        self.assertIn(f"'{_NET}' is internal but no egress proxy is running", run.stderr)
+        self.assertIn(f'make -C "{ROOT}" up', run.stderr)
+        self.assertFalse(run.inspected("tool-gateway"))
+
+    def test_no_proxy_on_a_plain_bridge_is_standalone_with_no_tool_path(self):
+        # The mode gate: a gateway on the network is still never looked up, because
+        # standalone mode has no audited egress and the gateway brokers credentials.
+        # A stale SC_PROXY_ENV_ARGS from the environment must not survive into the
+        # launch either: the function resets the array before deciding.
+        run = _governed_egress(
+            ips={"tool-gateway": _GATEWAY}, internal=False,
+            overrides={"SC_PROXY_ENV_ARGS": "HTTPS_PROXY=http://stale:1"})
+        self.assertEqual(run.status, 0, run.stderr)
+        self.assertEqual(
+            [ln for ln in run.stdout.splitlines() if ln.startswith("ARG ")], [])
+        self.assertFalse(run.inspected("tool-gateway"))
+        self.assertEqual(
+            run.line("EGRESS"),
+            f"DIRECT (no egress proxy on {_NET}; firewall only, no audit)")
+        self.assertEqual(run.line("TOOLS"), "NONE (standalone mode has no governed tool path)")
+
+    def test_the_name_and_port_overrides_are_honoured(self):
+        run = _governed_egress(
+            ips={"ep2": _PROXY, "tg2": _GATEWAY}, internal=True,
+            overrides={"EGRESS_PROXY_NAME": "ep2", "EGRESS_PROXY_PORT": "9090",
+                       "TOOL_GATEWAY_NAME": "tg2", "TOOL_GATEWAY_PORT": "9100"})
+        self.assertEqual(run.status, 0, run.stderr)
+        env = run.env()
+        self.assertEqual(env["HTTPS_PROXY"], "http://ep2:9090")
+        self.assertEqual(env["NO_PROXY"], f"localhost,127.0.0.1,::1,ep2,tg2,{_GATEWAY}")
+        self.assertEqual(env["EGRESS_PROXY_PORT"], "9090")
+        self.assertEqual(env["TOOL_GATEWAY_PORT"], "9100")
+        self.assertFalse(run.inspected("egress-proxy"))
+        self.assertFalse(run.inspected("tool-gateway"))
+
+
+@unittest.skipUnless(_BASH or _STRICT, "bash is not installed")
+class LauncherProxyEnvTests(unittest.TestCase):
+    """run-claude-sandbox.sh, run through to ``docker run`` with the stub answering.
+
+    GovernedEgressTests prove what the function computes; this proves the launcher
+    delivers it. A launcher that called it in a subshell, or reset the array after
+    the call, would launch with no proxy env and no EGRESS_PROXY_IP — the standalone
+    posture, unaudited — and still pass every test that reads the function alone."""
+
+    def test_the_proxy_env_reaches_docker_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            (root / "home").mkdir()
+            (root / "ws").mkdir()
+            (root / "bin").mkdir()
+            stub = root / "bin" / "docker"
+            stub.write_text(_EGRESS_STUB)
+            stub.chmod(0o755)
+            argv_file = root / "run.argv"
+            env = {k: v for k, v in os.environ.items()
+                   if not k.startswith(("EGRESS_PROXY_", "TOOL_GATEWAY_", "STUB_",
+                                        "SANDBOX_", "SC_", "XDG_", "DOCKADE_"))
+                   and k != "ALLOW_UNSAFE_WORKSPACE"}
+            env.update(
+                PATH=f"{root / 'bin'}{os.pathsep}{env['PATH']}",
+                HOME=str(root / "home"),
+                STUB_LOG=str(root / "calls.log"),
+                STUB_RUN_ARGV=str(argv_file),
+                STUB_NET="sandbox-net",
+                STUB_NET_INTERNAL="true",
+                STUB_IP_egress_proxy=_PROXY,
+                STUB_IP_tool_gateway=_GATEWAY,
+            )
+            proc = subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
+                [_BASH, str(ROOT / "run-claude-sandbox.sh"), str(root / "ws")],
+                capture_output=True, text=True, env=env, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertTrue(argv_file.exists(), "the launcher never reached docker run")
+            argv = argv_file.read_text().splitlines()
+
+        passed = [argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == "-e"]
+        url = "http://egress-proxy:8080"
+        no_proxy = f"localhost,127.0.0.1,::1,egress-proxy,tool-gateway,{_GATEWAY}"
+        for pair in (f"HTTPS_PROXY={url}", f"HTTP_PROXY={url}", f"NO_PROXY={no_proxy}",
+                     f"https_proxy={url}", f"http_proxy={url}", f"no_proxy={no_proxy}",
+                     f"EGRESS_PROXY_IP={_PROXY}", "EGRESS_PROXY_PORT=8080",
+                     f"TOOL_GATEWAY_IP={_GATEWAY}", "TOOL_GATEWAY_PORT=8100"):
+            with self.subTest(pair=pair):
+                self.assertIn(pair, passed)
+        self.assertIn(f"Egress:    governed via egress-proxy ({_PROXY}:8080)", proc.stdout)
+        self.assertIn(f"Tools:     governed via tool-gateway ({_GATEWAY}:8100)", proc.stdout)
 
 
 

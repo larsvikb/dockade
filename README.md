@@ -466,24 +466,28 @@ dockade/
       Dockerfile            #   mitmproxy + the policy/audit addon
       addon.py              #   per-connection /authorize + local audit stream
       DESIGN.md             #   the relay guard and the proxy's side of /authorize
-  sandbox-common/           # ONE boundary implementation, shared by every tier
+  sandbox-common/           # shared by every tier: ONE boundary implementation, dotfiles, instructions
     entrypoint.sh           # root: firewall + config, then drops to non-root
     init-firewall.sh        # default-deny egress firewall (governed/local/standalone)
     boundary-check.sh       # on-demand smoke test of the containment boundary
     dotfiles/               # shared .bashrc / .gitconfig / .inputrc / .vimrc, baked into both tiers
+    instructions/           # the agent instructions' shared fragments (every-tier/, cloud-tier/), in no image
+      render.py             #   make instructions: each <tier>/instructions.md to the file it names
   claude-sandbox/           # TIER 1 image — Claude, governed egress
     Dockerfile
     tier-setup.sh           # tier hook: materialize Claude user settings
     claude-wrapper.sh       # the `claude` on PATH: adds --mcp-config and this launch's --settings
     user-settings.json      # baked template, materialized to /config each boot
-    user-CLAUDE.md          # the agent's user-scope instructions, installed the same way
+    instructions.md         # source of user-CLAUDE.md: its header, includes and vocabulary
+    user-CLAUDE.md          # the agent's user-scope instructions, rendered; installed the same way
     statusline.sh           # sandbox-indicator status line
     dotfiles/               # .bashrc.tier — tier-1 shell hook (claude-yolo alias)
   opencode-sandbox/         # TIER 2 image — opencode + local LLM, no egress
     Dockerfile
     tier-setup.sh           # tier hook: materialize the opencode provider config
     opencode.json           # points opencode at the local `llm` service
-    user-AGENTS.md          # tier-2 capability facts, materialized to the config dir
+    instructions.md         # source of user-AGENTS.md
+    user-AGENTS.md          # tier-2 capability facts, rendered; materialized to the config dir
     DESIGN.md, NOTES.md     # tier 2 and the local LLM service: rationale, evidence
     dotfiles/               # .bashrc.tier — tier-2 shell hook (oc alias, distinct prompt)
   tests/                    # dependency-free unit tests for the governance logic (make check)

@@ -275,6 +275,10 @@ def load_egress_addon() -> types.ModuleType:
     return _load("dockade_egress_addon", "proxies/egress/addon.py")
 
 
+def load_instructions_renderer() -> types.ModuleType:
+    return _load("dockade_render_instructions", "sandbox-common/instructions/render.py")
+
+
 def load_control_plane() -> types.ModuleType:
     _install_fastapi_stub()
     # app.py imports its siblings by plain name, so its own directory has to be

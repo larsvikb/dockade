@@ -375,6 +375,8 @@ install -m 0644 /etc/claude-code/user-settings.json "$CONFIG_DIR/settings.json"
 # an agent that ignores the file is stopped by the firewall exactly as before.
 # Deliberately says nothing about how to work in the repo; that is the repo's own
 # CLAUDE.md, which travels with the checkout and is loaded alongside this.
+# The text is edited in claude-sandbox/instructions.md and the fragments it
+# includes from sandbox-common/instructions/, then rendered (make instructions).
 #
 # The source is `.template` on purpose — /etc/claude-code is a managed source and
 # a CLAUDE.md sitting there is loaded as managed memory in its own right, which

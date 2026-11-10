@@ -2376,6 +2376,9 @@ IPv4 address, the firewall aborts rather than booting an agent whose one intende
 destination is unreachable. The egress-proxy allow is explicitly gated off in this
 mode, so the proxy is not merely unused but unreachable.
 
+The agent instructions are shared where true for both: one source, rendered per tier
+(`sandbox-common/instructions/render.py`).
+
 **Open — the unattended worker tier, deliberately undesigned:**
 
 - **Is the scheduled worker tier 2 in a different mode, or a tier 3?** What is

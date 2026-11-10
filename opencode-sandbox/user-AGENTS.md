@@ -11,13 +11,15 @@ from in here.
 - **Everything you need is already installed**: python3, git, jq, ripgrep, vim.
   Nothing can be added at runtime, so solve the task with what is here.
 - **No git remote.** Commit locally; pushing is the human's step.
-- **`/workspace` is the human's checkout, live.** Your edits and branch switches
-  appear outside this container immediately. Say so when you switch branches.
+- **`/workspace` is the human's checkout, live.** Commits, branch switches and
+  edits appear outside the container immediately; switching branches moves their
+  working tree too. Say so when you do it.
 - **`/refs/<name>`, when present, is reference material.** Host directories the
   human mounted read-only for you to read. Changes belong in `/workspace`.
 - **`rm` is aliased to `-I`.** One prompt for a recursive delete or three or more
-  files, none for a single file. A non-interactive caller cannot answer that prompt,
-  so a bulk remove does nothing and still exits 0. Use `rm -f` when deleting many at
-  once, and confirm a destructive step by its result rather than its exit status.
-- **You are not root and cannot become root.** No sudo. A permission error here is
-  the design working, not a problem to route around.
+  files, none for a single file — so ordinary removes work, and a bulk one from a
+  non-interactive caller does nothing while **still exiting 0**. Use `rm -f` or
+  `command rm` when deleting many at once, and confirm a destructive step by its
+  result rather than by its exit status.
+- **You are not root and cannot become root.** No sudo, capabilities dropped.
+  A permission error here is the design working, not a problem to route around.

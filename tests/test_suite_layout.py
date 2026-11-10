@@ -40,7 +40,7 @@ PATTERN = "test*.py"  # unittest discovery's default, which make test uses
 # A missing tool skips on a dev machine and fails in CI: test_docs.py's _NeedsGit.
 _STRICT = bool(os.environ.get("DOCKADE_REQUIRE_TOOLS"))
 COMPONENTS = ("proxies/egress", "control-plane", "control-plane-ui", "ui-common",
-              "tasks-ui", "tool-gateway", "task-registry")
+              "tasks-ui", "tool-gateway", "task-registry", "sandbox-common/instructions")
 
 # A hook's GIT_DIR/GIT_INDEX_FILE would stage a fixture into the real repo or read
 # another repo's index, and the make variables of the ``make test`` this runs under

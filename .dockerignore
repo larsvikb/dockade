@@ -20,6 +20,10 @@ sandbox-lib.sh
 Makefile
 # Root only, on purpose: the sandbox Dockerfiles COPY their user-*.md files.
 *.md
+# The instruction sources and their renderer: repo-side only, since the images COPY
+# the rendered user-*.md files (sandbox-common/instructions/render.py).
+*-sandbox/instructions.md
+sandbox-common/instructions
 .env
 .hadolint.yaml
 .shellcheckrc

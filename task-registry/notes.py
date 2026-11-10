@@ -4,6 +4,8 @@ changed. The checks, the plain write and the shape a note is read in; who may wr
 one is in ``agent_moves`` and ``operator_moves``."""
 from __future__ import annotations
 
+import hashlib
+import re
 import sqlite3
 import time
 
@@ -12,8 +14,15 @@ from taskdb import Missing
 
 NOTE_MAX = 4000
 
-#: How many of a task's latest notes a read of the task carries, beside the total.
+#: How many of a task's latest notes a read of the task carries, beside the total, and
+#: how many new ones an unchanged read carries before it is a full read instead.
 IN_READ = 20
+
+#: A notes mark, as ``mark`` makes one: the task's latest visible note id, a dot, and a
+#: digest of every visible note up to it. The pattern caps the id at the 19 digits of
+#: ``tasks.ID_MAX``, so ``int`` never meets one too long to convert; ``reads._known``
+#: bounds it by ``tasks.ID_MAX`` itself.
+MARK_RE = re.compile(r"(?P<latest>0|[1-9][0-9]{0,18})\.(?P<digest>[0-9a-f]{16})")
 
 
 def check_note(text: object, *, required: bool = True) -> None:
@@ -64,3 +73,23 @@ def visible(conn: sqlite3.Connection, task: int, before: int | None = None,
 def count(conn: sqlite3.Connection, task: int) -> int:
     return conn.execute("SELECT COUNT(*) FROM notes WHERE task_id = ? AND "
                         "hidden_at IS NULL", (task,)).fetchone()[0]
+
+
+def mark(conn: sqlite3.Connection, task: int) -> str:
+    """What an agent's copy of the task's notes is, so a later read can tell it is
+    still current: hiding, showing and the handled mark move no revision. A note's text
+    never changes, so a note's id and handled flag stand for all of it."""
+    latest = conn.execute("SELECT MAX(id) FROM notes WHERE task_id = ? AND "
+                          "hidden_at IS NULL", (task,)).fetchone()[0] or 0
+    return f"{latest}.{digest(conn, task, latest)}"
+
+
+def digest(conn: sqlite3.Connection, task: int, latest: int) -> str:
+    """A digest of the task's visible notes up to note ``latest``; the task's id is in
+    it, so no other task's mark can match."""
+    found = hashlib.sha256(str(task).encode())
+    for row in conn.execute(
+            "SELECT id, handled_at IS NOT NULL AS handled FROM notes WHERE task_id = ? "
+            "AND hidden_at IS NULL AND id <= ? ORDER BY id", (task, latest)):
+        found.update(f",{row['id']}:{row['handled']}".encode())
+    return found.hexdigest()[:16]

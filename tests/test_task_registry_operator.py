@@ -874,6 +874,28 @@ READS = {
 MAPPED = {("list_tasks", "state"): {api.EVERY_STATE: None}}
 
 
+class ConditionalReadRouteTests(_Store):
+    """The task route answers a conditional read as ``reads.get_task`` does; the tasks UI
+    passes neither value, and a stale refusal's ``current`` stays the full read."""
+
+    def test_the_route_answers_unchanged_and_refuses_a_lone_value(self):
+        first = reads.get_task(self.task)
+        known = (first["revision"], first["notes_mark"])
+        got = api.get_task(self.task, *known)
+        self.assertEqual((got.status_code, got.body), (200, reads.get_task(self.task, *known)))
+        self.assertIs(got.body["unchanged"], True)
+        lone = api.get_task(self.task, first["revision"])
+        self.assertEqual((lone.status_code, lone.body["ok"]), (400, False))
+        self.assertIn("come together", lone.body["detail"])
+
+    def test_a_stale_refusal_carries_the_full_read_with_its_mark(self):
+        self.note()
+        with self.assertRaises(Stale) as caught:
+            op.move(self.task, 99, "closed")
+        self.assertEqual(caught.exception.current, reads.get_task(self.task))
+        self.assertIn("notes_mark", caught.exception.current)
+
+
 class ReadRouteTests(unittest.TestCase):
     """Each read route takes every parameter of the read it serves, by the same name and
     in the same order, and passes it on: a parameter the read gains, a page cursor

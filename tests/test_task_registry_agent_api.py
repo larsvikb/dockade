@@ -789,7 +789,8 @@ class OversizedValueTests(_Store):
         self.assertEqual(self.refused("get_task", {"task": self.task} | unknown),
                          ["no argument 'x0000', 'x0001', 'x0002', 'x0003', 'x0004', "
                           "'x0005', 'x0006', 'x0007', 'x0008', 'x0009', and 4990 more "
-                          "here; this tool takes task"])
+                          "here; this tool takes task, known_revision, "
+                          "known_notes_mark"])
         task = self.ok("propose", agent=ALICE, repo="widgets", title="T", body="B")["task"]
         token = self.ok("claim_plan", agent=ALICE, repo="widgets", task=task,
                         footprint=["."])["token"]
@@ -799,6 +800,52 @@ class OversizedValueTests(_Store):
             "no field 'x0000', 'x0001', 'x0002', 'x0003', 'x0004', 'x0005', 'x0006', "
             "'x0007', 'x0008', 'x0009', and 4990 more in decisions[0]; it takes "
             "question, why, options, assumes, multi_select")
+
+
+class ConditionalGetTaskTests(_Store):
+    """``get_task``'s conditional read as an agent sees it: the two arguments in the
+    schema and the description, and checked on the wire."""
+
+    def test_both_known_values_are_served_nullable_and_described(self):
+        [served] = [t for t in api.handle(rpc("tools/list"))["result"]["tools"]
+                    if t["name"] == "get_task"]
+        properties = served["inputSchema"]["properties"]
+        self.assertEqual(properties["known_revision"]["type"], ["integer", "null"])
+        self.assertEqual(properties["known_notes_mark"]["type"], ["string", "null"])
+        self.assertEqual(served["inputSchema"]["required"], ["task"])
+        said = " ".join(tools.TOOLS["get_task"].description.split())
+        for name in ("`known_revision`", "`known_notes_mark`", "notes_mark",
+                     "unchanged true", "new_notes"):
+            with self.subTest(name=name):
+                self.assertIn(name, said)
+
+    def test_a_second_read_passing_the_first_ones_values_is_unchanged(self):
+        first = self.ok("get_task", task=self.task)
+        self.ok("add_note", agent=BOB, repo="widgets", task=self.task, text="Since.")
+        again = self.ok("get_task", task=self.task, known_revision=first["revision"],
+                        known_notes_mark=first["notes_mark"])
+        self.assertIs(again["unchanged"], True)
+        self.assertNotIn("body", again)
+        self.assertEqual([n["text"] for n in again["new_notes"]], ["Since."])
+        self.assertEqual(self.ok("get_task", task=self.task, known_revision=None,
+                                 known_notes_mark=None), reads.get_task(self.task))
+
+    def test_a_bad_or_lone_known_value_is_refused(self):
+        first = self.ok("get_task", task=self.task)
+        revision, mark = first["revision"], first["notes_mark"]
+        cases = {
+            "a zero revision": ({"known_revision": 0, "known_notes_mark": mark},
+                                "0 is not a revision"),
+            "a malformed mark": ({"known_revision": revision, "known_notes_mark": "1.x"},
+                                 "'1.x' is not a notes mark"),
+            "a revision alone": ({"known_revision": revision}, "come together"),
+            "a mark alone": ({"known_notes_mark": mark}, "come together"),
+            "a string revision": ({"known_revision": "1", "known_notes_mark": mark},
+                                  "known_revision is an integer or null"),
+        }
+        for case, (given, said) in cases.items():
+            with self.subTest(case):
+                self.assertIn(said, self.refused("get_task", {"task": self.task, **given})[0])
 
 
 if __name__ == "__main__":

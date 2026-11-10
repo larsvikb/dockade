@@ -51,9 +51,9 @@ reads the commit in its own clone, so your checkout may move.
   branch.
 - A fix larger than a line or two gets its own mutation check. A rewrite gets a second
   review.
-- When a worker wrote the commit, send it the verified findings with your verdicts,
-  since it holds the context to fix them, and check its fix by diff against the
-  commit the reviewer read.
+- When a worker, the `implementer` agent, wrote the commit, send it the verified
+  findings with your verdicts, since it holds the context to fix them, and check its
+  fix by diff against the commit the reviewer read.
 - When a finding is a hole in an earlier round's fix, ask whether the design is wrong
   before patching again. A fix that must hold for every ordering of a race wants a
   guard where the race is decided, such as a transaction or a conditional write, not

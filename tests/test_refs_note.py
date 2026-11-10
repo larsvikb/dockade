@@ -153,7 +153,7 @@ class RefsReadAllowTests(unittest.TestCase):
                         "claude-sandbox/user-CLAUDE.md", "opencode-sandbox/user-AGENTS.md",
                         ".claude/skills/review-before-push/SKILL.md",
                         ".claude/agents/commit-reviewer.md", ".claude/agents/planner.md",
-                        ".claude/agents/plan-reviewer.md"}
+                        ".claude/agents/plan-reviewer.md", ".claude/agents/implementer.md"}
         self.assertEqual(instructions - set(files), set(),
                          "instruction files the guard no longer scans")
         allowed = {"additionalDirectories": {"claude-sandbox/user-settings.json"},

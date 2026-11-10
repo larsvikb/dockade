@@ -486,6 +486,48 @@ class PlanAgentToolTests(unittest.TestCase):
                          "the planner launches its reviewers")
 
 
+class ImplementerAgentToolTests(unittest.TestCase):
+    """The implementer is denied the moves that are the briefing session's: launching
+    the review, the claim's other moves, and the GitHub writes that would open a PR or
+    build a commit past "Never push". It keeps what the work needs, and runs in a
+    worktree of its own. Mistake prevention, not containment, as above."""
+
+    AGENT = PlanAgentToolTests.AGENT
+    AGENTS = PlanAgentToolTests.AGENTS
+    TASKS = PlanAgentToolTests.TASKS
+    GITHUB = f"{PlanAgentToolTests.GATEWAY}mcp-github__"
+    _frontmatter = PlanAgentToolTests._frontmatter
+
+    def test_the_implementer_is_denied_the_briefing_sessions_moves(self):
+        front = self._frontmatter("implementer")
+        self.assertNotIn("tools", front, "an allowlist would have to track every tool")
+        denied = front.get("disallowedTools", [])
+        self.assertNotEqual([e for e in denied if self.AGENT.fullmatch(e)], [],
+                            "the review is the briefing session's")
+        moves = ["Skill"]
+        moves += [self.TASKS + move for move in (
+            "claim_work", "submit_work", "send_back", "edit_proposal",
+            "claim_plan", "submit_plan", "release")]
+        moves += [self.GITHUB + write for write in (
+            "create_pull_request", "update_pull_request", "push_files",
+            "create_or_update_file", "delete_file", "create_branch",
+            "update_pull_request_branch", "merge_pull_request")]
+        for move in moves:
+            with self.subTest(move=move):
+                self.assertIn(move, denied)
+        for kept in ("Edit", "Write", "Bash", self.TASKS + "update",
+                     self.TASKS + "add_note", self.TASKS + "propose"):
+            with self.subTest(kept=kept):
+                # An entry with a `(…)` specifier still removes the whole tool, and a
+                # server's name, or a wildcard, removes each tool under it.
+                self.assertEqual([e for e in denied if e == kept or "*" in e
+                                  or e.startswith(f"{kept}(")
+                                  or kept.startswith(f"{e}__")], [])
+
+    def test_the_implementer_runs_in_a_worktree_of_its_own(self):
+        self.assertEqual(self._frontmatter("implementer").get("isolation"), ["worktree"])
+
+
 class CallTests(_Store):
     def test_a_task_worked_from_claim_to_landing(self):
         claimed = self.ok("claim_work", agent=ALICE, repo="widgets", task=self.task,

@@ -83,10 +83,10 @@ only the invariants and conventions for working in the repo.
     commit lands, with `tasks__add_note`: the claim ended at `submit_work`, before
     the push.
 
-  A session that briefs a worker claims the task itself and puts in the brief the
-  token and the commit's shape (`.claude/skills/review-before-push/SKILL.md`, "Commit
-  first"); the worker updates after each commit, and the briefing session submits once
-  the review passes.
+  A session that briefs a worker claims the task itself, then launches the
+  `implementer` agent with the task id, the token and the branch the claim names; the
+  worker updates after each commit, and the briefing session submits once the review
+  passes.
 - Don't commit or push unless asked.
 - In the main session, before handing a commit over for push, run the
   `review-before-push` skill.

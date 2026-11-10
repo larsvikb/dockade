@@ -363,39 +363,43 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	# agent bypassed the governed proxy entirely and died at DNS: no hold, and no
 	# audit record, because it never reached the control plane.
 	#
-	# Checked per LAUNCHER via the glob, and only for launchers that set any proxy
-	# env at all — tier 2 deliberately sets none (it has no egress to govern).
+	# The -e lines live in sandbox-lib.sh (sc_governed_egress), shared by every
+	# governed tier. The launchers are checked too, so one that sets proxy env
+	# itself is held to the same pairing; a file that sets none is skipped — tier 2
+	# deliberately sets none (it has no egress to govern), and a governed launcher
+	# gets its lines from the library.
 	# `[^"]` after the `=`: an empty `-e "http_proxy="` would satisfy a bare-prefix
 	# match while meaning NO PROXY, which is the very state being guarded against.
 	checked=0
-	for launcher in $(LAUNCHERS); do
-	  if ! grep -qE '^\s+-e "HTTPS_PROXY=[^"]' "$$launcher"; then
-	    echo "  skip $$launcher (sets no proxy env — tier with no governed egress)"
+	for file in $(LAUNCHERS) sandbox-lib.sh; do
+	  if ! grep -qE '^\s+-e "HTTPS_PROXY=[^"]' "$$file"; then
+	    echo "  skip $$file (sets no proxy env itself)"
 	    continue
 	  fi
 	  for var in http_proxy https_proxy no_proxy; do
 	    upper=$$(echo "$$var" | tr a-z A-Z)
-	    if ! grep -qE "^\s+-e \"$$var=[^\"]" "$$launcher"; then
-	      echo "  FAIL: $$launcher sets $$upper but not a non-empty $$var."
+	    if ! grep -qE "^\s+-e \"$$var=[^\"]" "$$file"; then
+	      echo "  FAIL: $$file sets $$upper but not a non-empty $$var."
 	      echo "        curl reads http_proxy in lower case ONLY, so plaintext HTTP"
 	      echo "        would bypass the governed proxy and be audited nowhere."
 	      exit 1
 	    fi
-	    if ! grep -qE "^\s+-e \"$$upper=[^\"]" "$$launcher"; then
-	      echo "  FAIL: $$launcher sets $$var but not a non-empty $$upper — both cases."
+	    if ! grep -qE "^\s+-e \"$$upper=[^\"]" "$$file"; then
+	      echo "  FAIL: $$file sets $$var but not a non-empty $$upper — both cases."
 	      exit 1
 	    fi
 	  done
 	  checked=$$((checked + 1))
-	  echo "  ok $$launcher (both cases of http/https/no_proxy)"
+	  echo "  ok $$file (both cases of http/https/no_proxy)"
 	done
 	# Fail closed on a vacuous pass, like the LAUNCHERS and SPDX globs above. At least
-	# one tier has governed egress by definition, so "every launcher skipped" means the
+	# one tier has governed egress by definition, so "every file skipped" means the
 	# detection above stopped matching — and this guard would report success having
 	# checked nothing at all.
 	if [ "$$checked" -eq 0 ]; then
-	  echo "  FAIL: no launcher was found to set proxy env, so this guard checked"
-	  echo "        nothing. Tier 1 has governed egress — did the -e lines change shape?"
+	  echo "  FAIL: neither sandbox-lib.sh nor any launcher was found to set proxy env,"
+	  echo "        so this guard checked nothing. Tier 1 has governed egress, wired in"
+	  echo "        sandbox-lib.sh (sc_governed_egress) — did the -e lines change shape?"
 	  exit 1
 	fi
 	echo "== host config home: Makefile and sandbox-lib.sh agree =="

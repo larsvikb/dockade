@@ -144,8 +144,8 @@ if [ "$(id -u)" -eq 0 ]; then
     if [[ "${TOOL_GATEWAY_IP:-}" =~ ^[0-9.]+$ ]]; then
         # BY ADDRESS, and not because a name would resolve wrongly: the launcher had
         # to resolve this leg anyway to arm the firewall's /32 grant, and reusing that
-        # value is what keeps the config and the grant on one address (the launcher
-        # says why).
+        # value is what keeps the config and the grant on one address
+        # (sandbox-lib.sh's sc_governed_egress says why).
         install -o root -g root -m 0644 /dev/stdin "$MCP_GATEWAY_CONFIG" <<EOF
 {
   "mcpServers": {

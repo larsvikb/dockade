@@ -5,7 +5,8 @@ The wiring is deliberately spread across three files that cannot see each other,
 this is where they are held together:
 
   init-firewall.sh       grants the route, governed mode only
-  run-claude-sandbox.sh  discovers the gateway, exempts it from the proxy, passes it on
+  sandbox-lib.sh         discovers the gateway, exempts it from the proxy, passes it on
+                         (sc_governed_egress, which run-claude-sandbox.sh calls)
   tier-setup.sh          writes the file the wrapper points `--mcp-config` at
   claude-wrapper.sh      puts the flags on every invocation
 
@@ -34,6 +35,7 @@ from test_topology import _environment_of
 ROOT = Path(__file__).resolve().parents[1]
 FIREWALL = (ROOT / "sandbox-common" / "init-firewall.sh").read_text()
 LAUNCHER = (ROOT / "run-claude-sandbox.sh").read_text()
+LIB = (ROOT / "sandbox-lib.sh").read_text()
 TIER_SETUP = (ROOT / "claude-sandbox" / "tier-setup.sh").read_text()
 WRAPPER = (ROOT / "claude-sandbox" / "claude-wrapper.sh").read_text()
 DOCKERFILE = (ROOT / "claude-sandbox" / "Dockerfile").read_text()
@@ -69,8 +71,7 @@ class LauncherTests(unittest.TestCase):
     """Discovery, the proxy exemption, and what reaches the container."""
 
     def test_the_gateway_is_discovered_on_the_sandbox_network(self):
-        self.assertIn('TOOL_GATEWAY_IP="$(sc_service_ip "$TOOL_GATEWAY_NAME" '
-                      '"$SANDBOX_NET")"', LAUNCHER)
+        self.assertIn('gateway_ip="$(sc_service_ip "$gateway_name" "$net")"', LIB)
 
     def test_the_gateway_is_exempt_from_the_proxy(self):
         # THE ONE THAT FAILS MOST CONFUSINGLY. Claude Code's MCP transport honours the
@@ -79,38 +80,53 @@ class LauncherTests(unittest.TestCase):
         # gateway, an error naming the wrong component and a refusal governance never
         # made. Measured from inside a sandbox before the line existed.
         self.assertIn(
-            'NO_PROXY_LIST="${NO_PROXY_LIST},${TOOL_GATEWAY_NAME},${TOOL_GATEWAY_IP}"',
-            LAUNCHER)
+            'no_proxy_list="${no_proxy_list},${gateway_name},${gateway_ip}"', LIB)
 
     def test_both_cases_of_no_proxy_carry_the_same_list(self):
         # curl reads `http_proxy` in lower case only and NO_PROXY in either; the
         # pairing exists for that asymmetry, and a new entry added to one spelling
         # would be absent from whichever tools read the other.
-        self.assertIn('-e "NO_PROXY=$NO_PROXY_LIST"', LAUNCHER)
-        self.assertIn('-e "no_proxy=$NO_PROXY_LIST"', LAUNCHER)
+        self.assertIn('-e "NO_PROXY=$no_proxy_list"', LIB)
+        self.assertIn('-e "no_proxy=$no_proxy_list"', LIB)
 
     def test_the_address_and_port_reach_the_container(self):
-        for var in ("TOOL_GATEWAY_IP", "TOOL_GATEWAY_PORT"):
+        for var, local in (("TOOL_GATEWAY_IP", "gateway_ip"),
+                           ("TOOL_GATEWAY_PORT", "gateway_port")):
             with self.subTest(variable=var):
-                self.assertIn(f'-e "{var}=${var}"', LAUNCHER)
+                self.assertIn(f'-e "{var}=${local}"', LIB)
 
     def test_the_default_port_is_the_one_compose_deploys(self):
         # Two ends, no compiler. A drift here points the sandbox at a port nothing
         # serves, and the symptom is an MCP server that fails to connect.
         deployed = _environment_of("tool-gateway")["GATEWAY_AGENT_PORT"].strip("\"'")
-        self.assertIn(f'TOOL_GATEWAY_PORT="${{TOOL_GATEWAY_PORT:-{deployed}}}"',
-                      LAUNCHER)
+        self.assertIn(f'gateway_port="${{TOOL_GATEWAY_PORT:-{deployed}}}"', LIB)
 
     def test_the_default_name_is_the_container_compose_runs(self):
-        self.assertIn('TOOL_GATEWAY_NAME="${TOOL_GATEWAY_NAME:-tool-gateway}"',
-                      LAUNCHER)
+        self.assertIn('gateway_name="${TOOL_GATEWAY_NAME:-tool-gateway}"', LIB)
         self.assertIn("container_name: tool-gateway",
                       (ROOT / "docker-compose.yml").read_text())
 
     def test_a_missing_gateway_is_reported_rather_than_fatal(self):
         # The sandbox still launches: `--strict-mcp-config` goes on unconditionally, so
         # no gateway means a provably empty tool surface rather than a failed start.
-        self.assertIn("MCP surface is empty", LAUNCHER)
+        self.assertIn("MCP surface is empty", LIB)
+
+    def test_the_launcher_wires_governed_egress_after_choosing_its_network(self):
+        # sc_ensure_network decides whether the network may be the standalone bridge;
+        # sc_governed_egress then asks what is on it, so the order matters.
+        ensure = LAUNCHER.index('sc_ensure_network "$SANDBOX_NET" true')
+        self.assertLess(ensure, LAUNCHER.index('sc_governed_egress "$SANDBOX_NET"'))
+
+    def test_the_launcher_passes_the_proxy_env_to_docker_run(self):
+        # The silent failure: a launcher that computes the env and drops it launches
+        # with no proxy variables and no EGRESS_PROXY_IP, which the firewall reads as
+        # the standalone posture — direct egress, nothing audited.
+        run = LAUNCHER[LAUNCHER.index('docker run "${RUN_MODE_ARGS[@]}"'):]
+        self.assertIn('${SC_PROXY_ENV_ARGS[@]+"${SC_PROXY_ENV_ARGS[@]}"}', run)
+
+    def test_the_launcher_prints_both_descriptions(self):
+        self.assertIn('echo "Egress:    $SC_EGRESS_DESC"', LAUNCHER)
+        self.assertIn('echo "Tools:     $SC_TOOLS_DESC"', LAUNCHER)
 
 
 class GatewayConfigTests(unittest.TestCase):

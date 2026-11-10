@@ -12,7 +12,8 @@
 # credentials, which egress, which sibling services it may reach). Those stay in
 # the per-tier launcher, short and adjacent, so a reviewer can read the whole
 # grant in one place. Shared plumbing, divergent capability — that split is the
-# point.
+# point. The wiring a governed tier uses to reach the data plane is plumbing and
+# lives here (sc_governed_egress); the decision to use it stays in the launcher.
 #
 # Functions set well-known globals rather than echoing, because several return
 # bash ARRAYS (docker run flags) which cannot survive command substitution.
@@ -645,13 +646,15 @@ sc_plugin_allowlist() {
 # only on user-defined networks — the firewall already expects it), name
 # resolution for data-plane services, and isolation from default-bridge containers.
 #
-# allow_fallback=true (tier 1): if the network is absent, create a plain
+# allow_fallback=true (Claude's tier): if the network is absent, create a plain
 # NON-internal bridge so the sandbox still runs standalone with direct egress via
-# its own firewall allowlist. allow_fallback=false (tier 2): a tier with no egress
-# has nothing to fall back TO, and silently creating a non-internal bridge would
-# hand it the egress its design says it must not have — so refuse instead.
+# its own firewall allowlist. That allowlist is Anthropic's, so the fallback is
+# Claude's, not every governed tier's. allow_fallback=false (tier 2): a tier with
+# no egress has nothing to fall back TO, and silently creating a non-internal
+# bridge would hand it the egress its design says it must not have — so refuse
+# instead.
 #
-# Which is why, for tier 2, existence is not the question. A tier-1 standalone run
+# Which is why, for tier 2, existence is not the question. A Claude standalone run
 # creates sandbox-net as exactly that plain non-internal bridge, and the network
 # outlives the container that prompted it. A later tier-2 launch asking only "does
 # it exist?" would adopt it and get the egress the refusal above exists to prevent,
@@ -763,6 +766,139 @@ sc_wait_healthy() {
 
     if [[ "$announced" == "true" ]]; then
         echo "  '$name' is healthy." >&2
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Governed egress  ->  sets SC_PROXY_ENV_ARGS (array), SC_EGRESS_DESC, SC_TOOLS_DESC
+# ---------------------------------------------------------------------------
+# sc_governed_egress <net>
+#
+# How a governed tier reaches the data plane on <net>: the egress proxy, and in
+# governed mode the tool gateway. Run it after sc_ensure_network, which decides
+# whether <net> may be the standalone fallback; whether a tier calls this at all
+# stays in its launcher.
+#
+# Discover the egress proxy on <net> (started by compose). Present -> governed
+# egress: route the sandbox's HTTP(S) through it (HTTPS_PROXY) and allowlist it in
+# the firewall (EGRESS_PROXY_IP). Absent -> direct egress via the firewall only;
+# SC_EGRESS_DESC says so.
+#
+# The gateway is discovered only on the governed branch, so no caller can ask for
+# it without the proxy: that branch is what mode-gates the grant (DESIGN.md, "MCP
+# gateway": firewall grants are mode-gated).
+#
+# EGRESS_PROXY_NAME/PORT and TOOL_GATEWAY_NAME/PORT are environment overrides.
+# shellcheck disable=SC2034  # the descriptions are consumed by the sourcing launcher
+sc_governed_egress() {
+    local net="$1"
+    local proxy_name="${EGRESS_PROXY_NAME:-egress-proxy}"
+    local proxy_port="${EGRESS_PROXY_PORT:-8080}"
+    local proxy_ip gateway_name gateway_port gateway_ip proxy_url no_proxy_list
+    proxy_ip="$(sc_service_ip "$proxy_name" "$net")"
+
+    SC_PROXY_ENV_ARGS=()
+    if [[ "$proxy_ip" =~ ^[0-9.]+$ ]]; then
+        # The proxy exists, but until the control plane answers /authorize the addon
+        # fails CLOSED — so launching now would not stall the agent's first requests,
+        # it would DENY them and write those denials to the audit log as if they were
+        # policy. Wait for the proxy's healthcheck (which compose in turn gates on the
+        # control plane being healthy) so the log stays a record of decisions.
+        sc_wait_healthy "$proxy_name" \
+            "Governed egress is unavailable, and this tier's traffic all flows through it."
+
+        # BY ADDRESS, not by name — and not because the name would resolve wrongly.
+        # Docker's embedded DNS answers a querier only with the legs it SHARES with the
+        # target, and this sandbox shares exactly one with the triple-homed gateway, so
+        # the name would give the same answer. The address is used because it is needed
+        # here regardless: the in-container firewall grants a /32, which means the leg
+        # has to be resolved before the container starts. Handing that one resolution to
+        # both the grant and the client config is what keeps them naming one address
+        # rather than two that agree by luck.
+        gateway_name="${TOOL_GATEWAY_NAME:-tool-gateway}"
+        gateway_port="${TOOL_GATEWAY_PORT:-8100}"
+        gateway_ip="$(sc_service_ip "$gateway_name" "$net")"
+
+        proxy_url="http://${proxy_name}:${proxy_port}"
+        no_proxy_list="localhost,127.0.0.1,::1,${proxy_name}"
+        if [[ "$gateway_ip" =~ ^[0-9.]+$ ]]; then
+            # THE GATEWAY MUST NOT BE PROXIED, and leaving it out of this list is not a
+            # missing optimisation — it is a broken tool surface with a misleading error.
+            # A client that honours the proxy environment (Claude Code's MCP transport
+            # does) would send every MCP request to the egress proxy, which hard-blocks
+            # private ranges by design; the agent would get "egress denied by policy",
+            # naming the wrong component entirely and describing a refusal that governance
+            # never made. Measured from inside a sandbox before this line existed.
+            #
+            # Both spellings, because the URL is built from the address and a client that
+            # resolved the name would otherwise miss the exemption.
+            no_proxy_list="${no_proxy_list},${gateway_name},${gateway_ip}"
+        fi
+        # BOTH CASES of each, and the lowercase ones are not redundant styling.
+        #
+        # curl reads `http_proxy` in LOWER CASE ONLY, while honouring HTTPS_PROXY and
+        # NO_PROXY in either case. That is deliberate, not an oversight: under CGI a
+        # client-supplied `Proxy:` request header arrives in the environment as
+        # HTTP_PROXY, so honouring it would let a remote caller redirect a server's
+        # outbound HTTP through a proxy of their choosing (httpoxy, CVE-2016-5385).
+        #
+        # With only the uppercase set, `curl http://...` in the sandbox did not reach the
+        # governed proxy at all: it resolved the target itself and died at DNS in about a
+        # millisecond. Containment held — sandbox-net is internal, so there was nowhere
+        # to go — but the agent got "Could not resolve host" instead of a hold it could
+        # have had approved, and the attempt reached no audit log, because it never
+        # reached the control plane. HTTPS was unaffected, which is why it went unnoticed
+        # until a decisions-table row showed a plaintext request that had never arrived.
+        #
+        # Setting both cases is the conventional pairing and covers other tools with the
+        # same rule. `make consistency` asserts the pairing so it cannot drift back.
+        SC_PROXY_ENV_ARGS=(
+            -e "HTTPS_PROXY=$proxy_url"
+            -e "HTTP_PROXY=$proxy_url"
+            -e "NO_PROXY=$no_proxy_list"
+            -e "https_proxy=$proxy_url"
+            -e "http_proxy=$proxy_url"
+            -e "no_proxy=$no_proxy_list"
+            -e "EGRESS_PROXY_IP=$proxy_ip"
+            -e "EGRESS_PROXY_PORT=$proxy_port"
+        )
+        SC_EGRESS_DESC="governed via $proxy_name ($proxy_ip:$proxy_port)"
+
+        if [[ "$gateway_ip" =~ ^[0-9.]+$ ]]; then
+            # Waited on for the reason the proxy is: a container that exists is not one
+            # that serves, and an MCP server that fails to connect at session start is a
+            # startup error the agent then reasons around. Its healthcheck is liveness on
+            # the agent leg, so this is short — and unlike the proxy, the gateway has no
+            # `depends_on` to satisfy first.
+            sc_wait_healthy "$gateway_name" \
+                "The governed tool surface would be absent from this session."
+            SC_PROXY_ENV_ARGS+=(
+                -e "TOOL_GATEWAY_IP=$gateway_ip"
+                -e "TOOL_GATEWAY_PORT=$gateway_port"
+            )
+            SC_TOOLS_DESC="governed via $gateway_name ($gateway_ip:$gateway_port)"
+        else
+            # NOT a failure, and the sandbox still launches. `--strict-mcp-config` goes on
+            # unconditionally in the wrapper, so "no gateway" yields a provably empty tool
+            # surface rather than whatever the config volume has accumulated — which is
+            # the whole reason those two flags are separable (DESIGN.md, "Telling the
+            # sandbox it exists").
+            SC_TOOLS_DESC="NONE (no $gateway_name on $net; MCP surface is empty)"
+        fi
+    else
+        # No proxy found. If <net> is internal (the compose infra defines sandbox-net
+        # that way), there is NO egress route at all, so standalone/direct mode can't
+        # work — fail with guidance rather than launch a sandbox that reaches nothing.
+        if [ "$(docker network inspect "$net" -f '{{.Internal}}' 2>/dev/null)" = "true" ]; then
+            echo "ERROR: '$net' is internal but no egress proxy is running." >&2
+            echo "       Start the infrastructure first:  make -C \"$SANDBOX_REPO_ROOT\" up" >&2
+            exit 1
+        fi
+        SC_EGRESS_DESC="DIRECT (no egress proxy on $net; firewall only, no audit)"
+        # Standalone: no governed tool path either, and deliberately not a fallback. The
+        # gateway brokers credentials, so a mode with no audited egress is the last place
+        # to hand one out.
+        SC_TOOLS_DESC="NONE (standalone mode has no governed tool path)"
     fi
 }
 

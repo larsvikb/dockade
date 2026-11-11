@@ -184,13 +184,20 @@ and named (see "Changing a rule is one operation, not two"), which is what keeps
 refusal honest rather than merely restrictive — replacing a rule is available, as an act
 the operator asks for by name and that records what it displaced.
 
-Two supporting changes make the refusal legible rather than surprising. `persisted` now
-reports **whether a row was written**, read from the insert's `rowcount` instead of from
-what was asked for, with `already_present` carrying the harmless same-action case — so a
-card stops claiming a write it did not make. And each offered pattern travels with any
-rule already holding it, so the confirm panel says so *before* the click. Both halves are
-required: the panel is prevention, and the backend check covers the race that is the only
-way the conflict arises at all.
+The check and the write share one `BEGIN IMMEDIATE` transaction, so no rule can be
+created, edited or revoked between them: the race ends in the refusal, and the rule the
+check found is the one in force at commit. The insert is a plain `INSERT`, not `OR
+IGNORE`, so a write the check did not foresee rolls the whole resolve back rather than
+recording a rule that is not there.
+
+Two supporting changes make the refusal legible rather than surprising. `persisted`
+reports **whether a row was written**, decided by that locked read instead of by what was
+asked for, with `already_present` carrying the harmless same-action case — so a card
+stops claiming a write it did not make. That case is stored with mode `present` and
+audited as "standing rule already in place", not as written. And each offered pattern
+travels with any rule already holding it, so the confirm panel says so *before* the
+click. Both halves are required: the panel is prevention, and the backend check covers
+the race that is the only way the conflict arises at all.
 
 ## Holds under load: the banner, grouping and the caps
 

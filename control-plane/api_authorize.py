@@ -57,6 +57,10 @@ def _decision_scope(status_row) -> str:
         # column; a row that predates it says only that a rule was written.
         pattern = status_row["pattern"]
         return f"standing rule written: {pattern}" if pattern else "standing rule written"
+    if mode == "present":
+        # A persist that found the same rule in force and wrote nothing. The words the
+        # card shows for it (``already_present`` in control-plane-ui/app.js).
+        return f"standing rule already in place: {status_row['pattern']}"
     if mode == "lease":
         return f"lease written, {policy._short_duration(policy.LEASE_SECONDS)}"
     return "this request only"

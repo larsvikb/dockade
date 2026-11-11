@@ -853,7 +853,7 @@ function start() {
         // rather than what was clicked — and it is the exact string an operator would
         // have to go and delete.
         //
-        // `persisted` now means A ROW WAS WRITTEN, read from the insert's rowcount.
+        // `persisted` now means A ROW WAS WRITTEN, set from the locked read.
         // The comment that used to sit here reasoned that "standing rule" was true
         // even when nothing was written, "because that only happens when the identical
         // rule was already there". That was the bug: it also happened when the

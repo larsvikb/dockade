@@ -34,6 +34,9 @@ reader can see which one is being asked:
 They import in that order and never back. The ``api_*`` modules import them and
 ``provenance`` but never each other, and nothing imports this file.
 
+``store_backup`` is not part of the process: nothing imports it, and the image ships it
+for ``make backup`` and ``make restore`` to run in a container of their own.
+
 THREE LISTENERS, on three networks, because the dangerous surface is the management
 API, not the questions the enforcers ask it. Every way of granting lives on the
 management one (`resolve` and every policy write), so anything that reaches it can

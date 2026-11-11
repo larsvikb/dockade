@@ -724,13 +724,10 @@ class MakefileTargetsAgreeTests(unittest.TestCase):
         self.assertIsNotNone(m, f"no {target} target")
         return m.group(1)
 
-    def test_both_restores_leave_a_sidecar_with_the_status_the_recipes_hold_on(self):
+    def test_a_restore_leaves_a_sidecar_with_the_status_the_recipe_holds_on(self):
+        # The control plane's half is in tests/test_control_plane_backup.py.
         self.assertEqual(self.variable("RESTORE_SIDECAR_LEFT").strip(),
                          str(backup.SIDECAR_LEFT))
-        restore_py = re.search(r"^define RESTORE_PY\n(.*?)^endef", self.MAKEFILE,
-                               re.M | re.S).group(1)
-        self.assertEqual(re.findall(r"sys\.exit\((\d+)\)", restore_py),
-                         [str(backup.SIDECAR_LEFT)])
 
     def test_the_image_is_the_one_compose_builds(self):
         self.assertEqual(_scalar(_service("tasks"), "image"), self.variable("TASKS_IMAGE"))

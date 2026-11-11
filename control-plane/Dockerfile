@@ -38,6 +38,8 @@ COPY control-plane/api_approvals.py ./api_approvals.py
 COPY control-plane/api_egress.py ./api_egress.py
 COPY control-plane/api_mcp.py ./api_mcp.py
 COPY control-plane/api_views.py ./api_views.py
+# Not served: run by `make backup` and `make restore` in a throwaway container.
+COPY control-plane/store_backup.py ./store_backup.py
 COPY policies/egress-allowlist.txt /etc/control-plane/egress-allowlist.txt
 
 # The SQLite store lives here; a named volume mounts over it for persistence

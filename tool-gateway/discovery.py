@@ -60,6 +60,11 @@ REQUEST_ID = 1
 #: name is used as a hostname and as a filename, so both uses want exactly this.
 _SERVER_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 
+#: A token ``post`` can send: printable ASCII, no whitespace. The task registry's
+#: ``agent_api.load_secret`` rule without its minimum length, for a file the gateway
+#: also reads. Past latin-1, or with a line break, http.client raises while sending.
+_TOKEN_RE = re.compile(r"[!-~]+")
+
 #: The control plane's TOOL bridge, by ADDRESS rather than by name — the one place
 #: here that does not dial a name. The control plane has three legs and only its
 #: tool-authorize-net one may be spoken to. The name would pick that one today, since
@@ -209,7 +214,8 @@ def read_secret(server: str) -> str | None:
     it otherwise surfaces as an upstream 401 that reads like a policy problem
     (DESIGN.md, "What the UI can say without ever seeing a value"). An unreadable one
     and a file of the wrong SHAPE are both errors, and they name different fixes:
-    permissions on the one hand, file contents on the other.
+    permissions on the one hand, file contents on the other. A token that cannot be
+    sent in a header is the wrong shape too: refused here, naming the file.
 
     Collapsing the third into the second is what this function did first, and it sent
     its reader looking for a file that was sitting right there."""
@@ -228,6 +234,12 @@ def read_secret(server: str) -> str | None:
             f'{{"token": "...", "note": "..."}} — because the header name and template '
             f"are the DESCRIPTOR, and that is registered in the control plane rather "
             f"than kept beside the credential")
+    # Refused here, naming the file, rather than left to fail inside http.client as a
+    # bare UnicodeEncodeError or ValueError. The token itself is never quoted.
+    if not isinstance(token, str) or not _TOKEN_RE.fullmatch(token):
+        raise DiscoveryError(
+            f"{path} holds a 'token' that cannot be sent in a header: it must be "
+            f"printable ASCII with no spaces or line breaks")
     return token
 
 
@@ -247,7 +259,25 @@ def auth_header(auth: dict, secret: str | None, where: str = "") -> dict[str, st
             f"{where or SECRETS_DIR}")
     name = auth.get("header") or "Authorization"
     template = auth.get("template") or "{secret}"
-    return {name: template.replace("{secret}", secret)}
+    value = template.replace("{secret}", secret)
+    # Refused here because http.client's own refusal quotes the whole value, secret
+    # included, and that message would reach the inventory, the audit and the agent.
+    # This one quotes neither the template nor the secret.
+    if "\r" in value or "\n" in value or not _latin1(value):
+        raise DiscoveryError(
+            f"auth descriptor's template for {name!r} builds a header value that cannot "
+            f"be sent (a line break, or a character outside latin-1) for the "
+            f"credential at {where or SECRETS_DIR}")
+    return {name: value}
+
+
+def _latin1(text: str) -> bool:
+    """Whether http.client can encode ``text`` as a header value."""
+    try:
+        text.encode("latin-1")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def _sse_events(raw: str) -> list[str]:
@@ -442,8 +472,9 @@ def _placed(server: str, port: int) -> str:
         f"it on mcp-net ({MCP_NET}), and its credential goes nowhere else")
 
 
-def list_tools(entry: dict) -> list[dict]:
-    """The tools a server exposes, TRIMMED, by asking it.
+def list_tools(entry: dict) -> tuple[list[dict], dict[str, int]]:
+    """The tools a server exposes, TRIMMED, by asking it, and how many of its entries
+    were malformed: ``{"entries": n, "dropped": m}``.
 
     One POST, no handshake — see the module docstring for why that is enough, and for
     where it was measured.
@@ -466,15 +497,34 @@ def list_tools(entry: dict) -> list[dict]:
     # is required of an MCP tool, so a server that omits one is malformed — but the
     # honest reading of a malformed entry is "takes no arguments we know of", and
     # serving it lets policy decide the tool instead of this parser silently deleting it.
-    return [{"name": tool["name"],
-             "description": str(tool.get("description") or ""),
-             "inputSchema": (tool.get("inputSchema")
-                             if isinstance(tool.get("inputSchema"), dict)
-                             else {"type": "object"}),
-             "annotations": {"readOnlyHint":
-                             bool((tool.get("annotations") or {}).get("readOnlyHint"))}}
-            for tool in parse_tools(raw)
-            if isinstance(tool, dict) and tool.get("name")]
+    #
+    # An entry with no usable name is dropped: there is nothing to rule, serve or list
+    # it by. Annotations that are not an object read as no read-only claim, the
+    # conservative reading, and the tool is kept for the schema's reason above. Both
+    # are counted, so the report says the server sent something this could not read.
+    # Names are not held to TOOL_RE here: the control plane drops and counts those.
+    tools, malformed, dropped = [], 0, 0
+    for tool in parse_tools(raw):
+        name = tool.get("name") if isinstance(tool, dict) else None
+        if not isinstance(name, str) or not name:
+            malformed += 1
+            dropped += 1
+            continue
+        # Absent and null both mean no annotations, as they did before this check.
+        annotations = tool.get("annotations")
+        if annotations is None:
+            annotations = {}
+        elif not isinstance(annotations, dict):
+            malformed += 1
+            annotations = {}
+        tools.append({"name": name,
+                      "description": str(tool.get("description") or ""),
+                      "inputSchema": (tool.get("inputSchema")
+                                      if isinstance(tool.get("inputSchema"), dict)
+                                      else {"type": "object"}),
+                      "annotations": {"readOnlyHint":
+                                      bool(annotations.get("readOnlyHint"))}})
+    return tools, {"entries": malformed, "dropped": dropped}
 
 
 def reconcile(entry: dict) -> dict:
@@ -494,7 +544,7 @@ def reconcile(entry: dict) -> dict:
     server = entry["server"]
     rules = {rule["tool"]: rule["action"] for rule in entry.get("tools", [])}
     try:
-        tools = list_tools(entry)
+        tools, malformed = list_tools(entry)
     except DiscoveryError as exc:
         # `tools` stays absent rather than empty. An empty list is a CLAIM that the
         # server exposes nothing, and pushing that on a failed dial would erase a good
@@ -506,6 +556,7 @@ def reconcile(entry: dict) -> dict:
             "rules": len(rules),
             "exposed": len(exposed),
             "tools": tools,
+            "malformed": malformed,
             "ruled_but_absent": sorted(set(rules) - set(exposed)),
             "exposed_but_unruled": sorted(set(exposed) - set(rules))}
 
@@ -547,6 +598,12 @@ def format_report(results: list[dict]) -> list[str]:
         # of small that makes the rest of the sentence look unreviewed.
         lines.append(f"tool-gateway: {server}: {_count(result['exposed'], 'tool')} "
                      f"exposed, {_count(result['rules'], 'rule')}")
+        malformed = result.get("malformed") or {}
+        if malformed.get("entries"):
+            # Counts only: an entry dropped for its name has no name to print.
+            noun = "entry" if malformed["entries"] == 1 else "entries"
+            lines.append(f"tool-gateway:   {malformed['entries']} malformed tool {noun} "
+                         f"in the reply, {malformed.get('dropped', 0)} of them dropped")
         if result["ruled_but_absent"]:
             lines.append(f"tool-gateway:   rules for tools the server does not expose "
                          f"(dead policy): {_names(result['ruled_but_absent'])}")
@@ -598,8 +655,28 @@ def reconcile_all(roster: list[dict]) -> list[dict]:
 
     The expensive half. Each entry is one request to a container holding a
     write-capable credential, which is why the caller runs this on change rather than
-    on a short timer."""
-    return [reconcile(entry) for entry in roster]
+    on a short timer.
+
+    Each server under its own guard, so one that raises something ``reconcile`` did
+    not foresee reads NOT ENUMERATED, as a failed dial does, and the rest are still
+    published and pushed. Broad because it backstops inputs nobody has listed, such as
+    the RecursionError ``json.loads`` can raise on a deeply nested reply, at a depth
+    that depends on the Python build. Never silent, since the exception's
+    type is in the status every report prints and every push carries — and so is its
+    message, which is why an input whose exception would quote a secret (a header
+    value http.client refuses) is refused before the dial instead (``auth_header``).
+
+    No ``rules`` count, unlike a failed dial's result: nothing reads one on a server
+    that was not enumerated."""
+    results = []
+    for entry in roster:
+        try:
+            results.append(reconcile(entry))
+        except Exception as exc:  # noqa: BLE001 — one server must not stop the round
+            results.append({"server": entry.get("server"),
+                            "status": f"gateway failed reconciling it "
+                                      f"({type(exc).__name__}: {exc})"})
+    return results
 
 
 #: Keywords whose value is prose, dropped from a schema object before hashing, or every

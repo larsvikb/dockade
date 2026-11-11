@@ -129,6 +129,40 @@ class RecordTests(unittest.TestCase):
             with self.subTest(payload=bad), self.assertRaises(self.inv.InventoryError):
                 self.inv.record(bad)
 
+    def test_a_name_that_is_not_a_string_is_counted_unnameable(self):
+        # On main `.strip()` raised on these, so the push was a 500, retried.
+        for bad in (5, ["x"], {"x": 1}):
+            with self.subTest(name=bad):
+                self.inv.record({"servers": {"s": {"status": "ok", "tools": [
+                    {"name": "fine"}, {"name": bad}]}}})
+                seen = self.inv.snapshot()["s"]
+                self.assertEqual(seen["tools"], ["fine"])
+                self.assertEqual(seen["unnameable"], 1)
+
+    def test_annotations_that_are_not_an_object_are_no_read_only_claim(self):
+        # Kept, not read-only, and not counted: only a broken gateway sends this.
+        self.inv.record({"servers": {"s": {"status": "ok", "tools": [
+            {"name": "fine", "annotations": "ro"}]}}})
+        seen = self.inv.snapshot()["s"]
+        self.assertEqual(seen["tools"], ["fine"])
+        self.assertEqual(seen["read_only"], [])
+        self.assertEqual(seen["unnameable"], 0)
+
+    def test_a_tool_list_that_is_not_a_list_is_refused(self):
+        # A dict or an int raised past InventoryError on main, so the route said 500.
+        for bad in ({"name": "fine"}, 7, None, "fine"):
+            with self.subTest(tools=bad):
+                with self.assertRaises(self.inv.InventoryError) as caught:
+                    self.inv.record({"servers": {"s": {"status": "ok", "tools": bad}}})
+                self.assertIn("not a list", str(caught.exception))
+
+    def test_a_server_name_is_checked_before_its_tool_list(self):
+        # The refusal is served as written, so it may only name a server the name
+        # check passed: an invalid one is skipped, its tool list unread.
+        self.inv.record({"servers": {"../etc\n": {"status": "ok", "tools": 7},
+                                     "ok-one": {"status": "ok", "tools": []}}})
+        self.assertEqual(set(self.inv.snapshot()), {"ok-one"})
+
     def test_a_snapshot_is_a_copy(self):
         # Callers render it while the gateway may be replacing it, and a handle on the
         # live map would let one reader mutate what every other reader sees.

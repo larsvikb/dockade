@@ -310,9 +310,11 @@ def _reconcile_forever(stop: threading.Event) -> None:
 
     A DAEMON loop that cannot fail the process, and — since the process would carry
     on without it — cannot be allowed to die either: ``discovery.poll`` swallows its
-    own errors and returns them as text, the rest of an iteration is guarded below so
-    an exception from any one server's reply costs one tick rather than every future
-    one, and the sleep is on an Event so a shutdown is not held for the interval.
+    own errors and returns them as text, ``discovery.reconcile_all`` guards each
+    server so one server's reply cannot stop the round, the rest of an iteration
+    (publish, report, push) is guarded below so an exception there costs one tick
+    rather than every future one, and the sleep is on an Event so a shutdown is not
+    held for the interval.
 
     POLLING AND SPEAKING ARE DIFFERENT RATES, and the split is the design. The roster
     is re-read every ROSTER_INTERVAL; the servers are dialled — and a report printed —

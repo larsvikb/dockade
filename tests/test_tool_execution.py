@@ -1176,6 +1176,59 @@ class OutcomeRecordTests(ExecutionTestCase):
         self.assertEqual(self.rows[0]["status"], "transport-error")
         self.assertIn("TypeError: something new", self.rows[0]["reason"])
 
+    def test_a_token_that_cannot_be_sent_names_its_file_and_dials_nothing(self):
+        # On main the token read fine and http.client raised while sending it, which
+        # reached the catch-all above as "gateway failed handling the reply".
+        import tempfile
+        roster = [{**ROSTER[0], "auth": {"type": "header", "header": "Authorization",
+                                         "template": "Bearer {secret}"}}]
+        self.execute.surface.publish(roster, [RESULT])
+        self.execute.discovery.post = self._real_post
+        opened = []
+        with tempfile.TemporaryDirectory() as secrets:
+            with open(f"{secrets}/mcp-github.json", "w", encoding="utf-8") as handle:
+                json.dump({"token": "tok\nX-Injected: 1"}, handle)
+            with mock.patch.object(self.execute.discovery, "SECRETS_DIR", secrets), \
+                    mock.patch.object(self.execute.discovery._OPENER, "open",
+                                      lambda *a, **k: opened.append(a)), \
+                    mock.patch("socket.getaddrinfo",
+                               lambda host, port, *_a, **_k:
+                               [(2, 1, 6, "", ("172.28.0.11", port))]):
+                result = self.allow()
+        self.assertTrue(result["isError"])
+        self.assertEqual(opened, [])
+        self.assertEqual(len(self.rows), 1)
+        self.assertEqual(self.rows[0]["status"], "transport-error")
+        self.assertIn(f"{secrets}/mcp-github.json", self.rows[0]["reason"])
+        self.assertNotIn("failed handling the reply", self.rows[0]["reason"])
+
+    def test_a_template_that_cannot_be_sent_leaks_no_secret_and_dials_nothing(self):
+        # http.client's refusal of a header value with a line break quotes the value,
+        # and through the catch-all above it reached the agent and the audit reason.
+        import tempfile
+        secret = "ghp_" + "S" * 36
+        roster = [{**ROSTER[0], "auth": {"type": "header", "header": "Authorization",
+                                         "template": "Bearer\n{secret}"}}]
+        self.execute.surface.publish(roster, [RESULT])
+        self.execute.discovery.post = self._real_post
+        opened = []
+        with tempfile.TemporaryDirectory() as secrets:
+            with open(f"{secrets}/mcp-github.json", "w", encoding="utf-8") as handle:
+                json.dump({"token": secret}, handle)
+            with mock.patch.object(self.execute.discovery, "SECRETS_DIR", secrets), \
+                    mock.patch.object(self.execute.discovery._OPENER, "open",
+                                      lambda *a, **k: opened.append(a)), \
+                    mock.patch("socket.getaddrinfo",
+                               lambda host, port, *_a, **_k:
+                               [(2, 1, 6, "", ("172.28.0.11", port))]):
+                result = self.allow()
+        self.assertTrue(result["isError"])
+        self.assertEqual(opened, [])
+        self.assertEqual(len(self.rows), 1)
+        self.assertNotIn(secret, self.rows[0]["reason"])
+        self.assertNotIn(secret, json.dumps(result))
+        self.assertIn("cannot be sent", self.rows[0]["reason"])
+
     def test_a_grant_spent_on_unparseable_arguments_is_not_silent_either(self):
         # The third path where a claim succeeds and no call happens. Should be
         # unreachable — the control plane stores the canonical form it serialized

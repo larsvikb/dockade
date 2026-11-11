@@ -435,6 +435,72 @@ class RedirectTests(unittest.TestCase):
         self.assertIn("not an HTTP reply", self._post_to(listener.getsockname()[1]))
 
 
+def _list_tools_of(discovery, entries: list):
+    """``list_tools`` against a server whose tool list is exactly ``entries``."""
+    @contextlib.contextmanager
+    def urlopen(*_args, **_kwargs):
+        yield mock.Mock(read=lambda: sse({"tools": entries}).encode())
+
+    with mock.patch.object(discovery._OPENER, "open", urlopen), \
+            mock.patch("socket.getaddrinfo", _resolves_to("172.28.0.11")):
+        return discovery.list_tools({**ENTRY, "auth": {"type": "none"}})
+
+
+class MalformedEntryTests(unittest.TestCase):
+    """A tool entry of the wrong shape is dropped or read conservatively, and counted,
+    at the read: on main a non-string name or non-object annotations raised past
+    ``reconcile`` and stopped the round for every server."""
+
+    def setUp(self):
+        self.discovery = load_discovery()
+
+    def test_an_entry_with_no_usable_name_is_dropped_and_counted(self):
+        good = {"name": "get_issue"}
+        for bad in ({"name": ["x"]}, {"name": 5}, "get_issue", {"description": "x"},
+                    {"name": ""}):
+            with self.subTest(entry=bad):
+                tools, malformed = _list_tools_of(self.discovery, [good, bad, good])
+                self.assertEqual([tool["name"] for tool in tools],
+                                 ["get_issue", "get_issue"])
+                self.assertEqual(malformed, {"entries": 1, "dropped": 1})
+
+    def test_annotations_that_are_not_an_object_keep_the_tool_with_no_claim(self):
+        # The operator's answer on the task: keep and count. Not read-only, so it is
+        # denied unless a rule says otherwise.
+        tools, malformed = _list_tools_of(
+            self.discovery, [{"name": "get_issue", "annotations": "ro"},
+                             {"name": "list_issues",
+                              "annotations": {"readOnlyHint": True}}])
+        self.assertEqual([(tool["name"], tool["annotations"]) for tool in tools],
+                         [("get_issue", {"readOnlyHint": False}),
+                          ("list_issues", {"readOnlyHint": True})])
+        self.assertEqual(malformed, {"entries": 1, "dropped": 0})
+
+    def test_absent_or_null_annotations_are_not_malformed(self):
+        _tools, malformed = _list_tools_of(
+            self.discovery, [{"name": "a"}, {"name": "b", "annotations": None}])
+        self.assertEqual(malformed, {"entries": 0, "dropped": 0})
+
+    def test_the_report_gives_both_counts_and_no_server_text(self):
+        entries = [{"name": "get_issue"}, {"name": ["evil\nline"]},
+                   {"name": "create_pr", "annotations": "evil-text"}]
+        self.discovery.post = lambda *_a, **_k: sse({"tools": entries})
+        result = self.discovery.reconcile(ENTRY)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["exposed"], 2)
+        lines = [line for line in self.discovery.format_report([result])
+                 if "malformed" in line]
+        self.assertEqual(lines,
+                         ["tool-gateway:   2 malformed tool entries in the reply, "
+                          "1 of them dropped"])
+
+    def test_a_well_formed_reply_prints_no_malformed_line(self):
+        self.discovery.post = lambda *_a, **_k: sse({"tools": [{"name": "get_issue"}]})
+        report = "\n".join(self.discovery.format_report(
+            [self.discovery.reconcile(ENTRY)]))
+        self.assertNotIn("malformed", report)
+
+
 class TrimTests(unittest.TestCase):
     """What survives a server's reply, and where each narrowing happens.
 
@@ -450,13 +516,7 @@ class TrimTests(unittest.TestCase):
 
     def _listed(self, tool: dict) -> dict:
         """``list_tools`` against a server that answers with exactly ``tool``."""
-        @contextlib.contextmanager
-        def urlopen(*_args, **_kwargs):
-            yield mock.Mock(read=lambda: sse({"tools": [tool]}).encode())
-
-        with mock.patch.object(self.discovery._OPENER, "open", urlopen), \
-                mock.patch("socket.getaddrinfo", _resolves_to("172.28.0.11")):
-            tools = self.discovery.list_tools({**ENTRY, "auth": {"type": "none"}})
+        tools, _malformed = _list_tools_of(self.discovery, [tool])
         return tools[0]
 
     def test_the_schema_survives_the_read(self):
@@ -583,6 +643,33 @@ class SecretPathTests(unittest.TestCase):
         # Names the file, so the fix is obvious from the line alone.
         self.assertIn("mcp-github.json", said)
 
+    def test_a_token_that_cannot_be_sent_is_refused_naming_the_file(self):
+        # Each of these read as a token on main and then raised inside http.client
+        # (or auth_header, for the non-string), outside DiscoveryError.
+        import json as _json
+        import tempfile
+        # "tök" is latin-1, which http.client could send: pins the ASCII half.
+        for token in ("tök", "tök-ābc", "tok\nabc", "tok abc", 12345, ["tok"]):
+            with self.subTest(token=token), tempfile.TemporaryDirectory() as secrets:
+                with open(f"{secrets}/mcp-github.json", "w", encoding="utf-8") as handle:
+                    _json.dump({"token": token}, handle)
+                discovery = load_discovery({"GATEWAY_SECRETS_DIR": secrets})
+                with self.assertRaises(discovery.DiscoveryError) as caught:
+                    discovery.read_secret("mcp-github")
+                said = str(caught.exception)
+                self.assertIn(f"{secrets}/mcp-github.json", said)
+                self.assertIn("cannot be sent", said)
+                self.assertNotIn(str(token), said)
+
+    def test_a_printable_token_still_reads(self):
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as secrets:
+            with open(f"{secrets}/mcp-github.json", "w", encoding="utf-8") as handle:
+                _json.dump({"token": "github_pat_A1b2~!$"}, handle)
+            discovery = load_discovery({"GATEWAY_SECRETS_DIR": secrets})
+            self.assertEqual(discovery.read_secret("mcp-github"), "github_pat_A1b2~!$")
+
     def test_a_missing_file_still_names_the_path_it_looked_at(self):
         # The placeholder this printed before — a literal "<server>.json" — was
         # unresolvable by the person reading it, which is the one thing an error must
@@ -612,8 +699,9 @@ class ReconcileTests(unittest.TestCase):
         # Shaped like what list_tools now returns — trimmed tool objects, not bare
         # names — because the inventory push carries the server's read-only claim
         # alongside each name.
-        self.discovery.list_tools = lambda *_a, **_k: [
-            {"name": n, "annotations": {"readOnlyHint": False}} for n in exposed]
+        self.discovery.list_tools = lambda *_a, **_k: (
+            [{"name": n, "annotations": {"readOnlyHint": False}} for n in exposed],
+            {"entries": 0, "dropped": 0})
         return self.discovery.reconcile(ENTRY)
 
     def test_the_two_directions_are_separate_findings(self):
@@ -633,8 +721,8 @@ class ReconcileTests(unittest.TestCase):
         # Presentation and enforcement are separate axes: a `deny` row is a decision
         # an operator made, so the tool is not "unruled" and must not be reported as
         # needing a rule. Every rule ships on the roster, deny rows included.
-        self.discovery.list_tools = lambda *_a, **_k: [
-            {"name": "dangerous", "annotations": {}}]
+        self.discovery.list_tools = lambda *_a, **_k: (
+            [{"name": "dangerous", "annotations": {}}], {"entries": 0, "dropped": 0})
         result = self.discovery.reconcile(
             {"server": "s", "auth": {}, "tools": [{"tool": "dangerous",
                                                    "action": "deny"}]})
@@ -649,6 +737,65 @@ class ReconcileTests(unittest.TestCase):
         report = "\n".join(self.discovery.format_report([self.discovery.reconcile(ENTRY)]))
         self.assertIn("NOT ENUMERATED", report)
         self.assertIn("connection refused", report)
+
+    def test_one_server_raising_leaves_the_others_enumerated(self):
+        # On main reconcile_all was a list comprehension with no per-server catch, so
+        # either of these ended the round and nothing was published or pushed.
+        good = {**ENTRY, "server": "mcp-good"}
+        raising = {**ENTRY, "server": "mcp-raises"}
+        deep = {**ENTRY, "server": "mcp-deep"}
+        def post(entry, *_a, **_k):
+            if entry["server"] == "mcp-raises":
+                raise RuntimeError("something nobody listed")
+            if entry["server"] == "mcp-deep":
+                # What json.loads raises on a reply nested too deep for it. Raised
+                # here rather than provoked, because the depth at which json.loads
+                # raises depends on the Python build, and the guard's job is to catch
+                # it whatever raises it.
+                raise RecursionError("maximum recursion depth exceeded")
+            return sse({"tools": [{"name": "get_issue"}]})
+        self.discovery.post = post
+        results = self.discovery.reconcile_all([raising, good, deep])
+        by_server = {result["server"]: result for result in results}
+        self.assertEqual([r["server"] for r in results],
+                         ["mcp-raises", "mcp-good", "mcp-deep"])
+        self.assertEqual(by_server["mcp-good"]["status"], "ok")
+        self.assertEqual([t["name"] for t in by_server["mcp-good"]["tools"]],
+                         ["get_issue"])
+        for server, kind in (("mcp-raises", "RuntimeError"),
+                             ("mcp-deep", "RecursionError")):
+            with self.subTest(server=server):
+                self.assertNotIn("tools", by_server[server])
+                self.assertIn(kind, by_server[server]["status"])
+        report = "\n".join(self.discovery.format_report(results))
+        self.assertIn("mcp-raises: NOT ENUMERATED", report)
+        self.assertIn("mcp-deep: NOT ENUMERATED", report)
+        self.assertIn("mcp-good: 1 tool exposed", report)
+
+    def test_a_template_that_cannot_be_sent_is_refused_without_the_secret(self):
+        # http.client's own refusal quotes the whole header value, token included, and
+        # the status is pushed to the control plane and served from it.
+        import tempfile
+        secret = "ghp_" + "S" * 36
+        opened = []
+        for template in ("Bearer\n{secret}", "Bearer\r{secret}", "Bearer ✓{secret}"):
+            with self.subTest(template=template), \
+                    tempfile.TemporaryDirectory() as secrets:
+                with open(f"{secrets}/mcp-github.json", "w", encoding="utf-8") as handle:
+                    json.dump({"token": secret}, handle)
+                discovery = load_discovery({"GATEWAY_SECRETS_DIR": secrets})
+                entry = {**ENTRY, "auth": {"type": "header", "header": "Authorization",
+                                           "template": template}}
+                with mock.patch.object(discovery._OPENER, "open",
+                                       lambda *a, **k: opened.append(a)), \
+                        mock.patch("socket.getaddrinfo", _resolves_to("172.28.0.11")):
+                    [result] = discovery.reconcile_all([entry])
+                self.assertNotIn("tools", result)
+                self.assertNotIn(secret, result["status"])
+                self.assertNotIn("Bearer", result["status"])
+                self.assertIn("cannot be sent", result["status"])
+                self.assertIn(f"{secrets}/mcp-github.json", result["status"])
+        self.assertEqual(opened, [])
 
     def test_an_empty_roster_says_so_rather_than_printing_nothing(self):
         # Silence is ambiguous: it reads the same as a broken reporter. The whole

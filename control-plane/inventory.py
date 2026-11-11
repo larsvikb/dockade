@@ -81,14 +81,18 @@ def _clean_tools(raw: list) -> tuple[list[str], list[str], int, dict[str, str]]:
     digests: dict[str, str] = {}
     unnameable = 0
     for tool in raw[:MAX_TOOLS_PER_SERVER]:
-        name = (tool.get("name") or "").strip() if isinstance(tool, dict) else ""
+        name = tool.get("name") if isinstance(tool, dict) else None
+        name = name.strip() if isinstance(name, str) else ""
         if not policy._TOOL_RE.fullmatch(name):
             unnameable += 1
             continue
         if name in names:
             continue
         names.append(name)
-        if (tool.get("annotations") or {}).get("readOnlyHint"):
+        # Annotations that are not an object are no read-only claim, and not counted:
+        # the gateway always sends an object, so only a broken one sends anything else.
+        annotations = tool.get("annotations")
+        if isinstance(annotations, dict) and annotations.get("readOnlyHint"):
             read_only.append(name)
         digest = tool.get("digest")
         if isinstance(digest, str) and _DIGEST_RE.fullmatch(digest):
@@ -207,8 +211,13 @@ def record(payload: dict) -> tuple[dict, list[tuple[str, str]]]:
             name = str(name)
             was = previous.get(name, {})
             if "tools" in body:
-                tools, read_only, unnameable, digests = _clean_tools(
-                    body.get("tools") or [])
+                # After the name check, so the name this message carries is one
+                # `_server_name_error` passed: the message is served as written.
+                if not isinstance(body["tools"], list):
+                    raise InventoryError(
+                        f"server {name}: 'tools' is {type(body['tools']).__name__}, "
+                        f"not a list")
+                tools, read_only, unnameable, digests = _clean_tools(body["tools"])
                 # A tool still exposed that arrived with no usable digest keeps its
                 # last one, as a server that could not be asked keeps its names:
                 # otherwise d1, then none, then d2 would read as a first digest and

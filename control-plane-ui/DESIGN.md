@@ -103,6 +103,8 @@ cross-cutting points are kept here.
   relay's 502 during a backend restart) puts it in `CLOSED` for good. So the relay
   returns a clean 502 and `app.js` reconnects by hand with bounded backoff, instead of
   sitting on "reconnecting…" while blind — the exact failure the traffic light exists for.
+  Silence past the watchdog's threshold, measured on the server's heartbeat interval,
+  also reconnects, because a half-open socket behind the relay never errors.
 - **Keyed, non-jumping list + minimum dwell.** Cards are keyed by id and updated in place
   (`diffPending`) so a row of egress-granting buttons never shifts under the pointer; a
   departed card is marked stale in place and swept only after a per-reason dwell
@@ -322,8 +324,9 @@ the hazard tabs introduce — a hidden view drifting unnoticed — is answered b
 that keep polling even the hidden views: a live pending count, and a policy **unseen**
 marker keyed on pattern+action (a flipped rule leaves the count unchanged). The favicon
 is an inline SVG data URI (never a CDN — a governance UI must not fetch its own control
-logic or icons per page load) whose lit lamp means **red = blind** (SSE down; an unseen
-hold default-denies after `CONTROL_HOLD_TIMEOUT`) rather than red = denied, with the
+logic or icons per page load) whose lit lamp means **red = blind** (SSE down or silent
+past the watchdog; an unseen hold default-denies after `CONTROL_HOLD_TIMEOUT`) rather
+than red = denied, with the
 pre-JS fallback amber ("unknown", not "all clear") and a `(n)` title prefix so the
 background tab nobody watches still shows the count. Rendering specifics (lamp opacity,
 `href`-reassignment throttling) are in `app.js`. Past the tab strip, **an opt-in desktop

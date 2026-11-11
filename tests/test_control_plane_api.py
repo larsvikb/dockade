@@ -3986,6 +3986,48 @@ class ApprovalStreamTests(_CPTestCase):
         self.assertEqual(asyncio.run(drain()), [])
 
 
+class ApprovalStreamHeartbeatTests(_CPTestCase):
+    """What the stream sends while nothing changes: the page's watchdog turns the lamp
+    red on silence, so a quiet tick has to reach the page as an event it can see."""
+
+    def _ticks(self, n, tick_s=None):
+        """The first `n` chunks over an unchanging payload, and what each sleep was
+        asked for, with no real wait."""
+        slept = []
+
+        async def no_wait(seconds):
+            slept.append(seconds)
+
+        async def take():
+            response = await cp.api_approvals.approvals_stream(_FakeRequest())
+            chunks = [await response.body.__anext__() for _ in range(n)]
+            await response.body.aclose()
+            return chunks
+
+        tick = cp.api_approvals.STREAM_TICK_S if tick_s is None else tick_s
+        with mock.patch.object(cp.holds, "_pending_payload",
+                               lambda: {"holds": [], "saturation": {}}), \
+                mock.patch.object(cp.api_approvals.asyncio, "sleep", no_wait), \
+                mock.patch.object(cp.api_approvals, "STREAM_TICK_S", tick):
+            return asyncio.run(take()), slept
+
+    def test_the_first_tick_sends_the_payload(self):
+        chunks, _ = self._ticks(1)
+        self.assertTrue(chunks[0].startswith("event: pending\ndata: {"), chunks[0])
+
+    def test_an_unchanged_tick_sends_a_heartbeat_event_with_a_data_line(self):
+        # A comment (`: heartbeat`) never reaches the page, and an event with no data
+        # line is not dispatched either: either way the watchdog would hear nothing.
+        chunks, _ = self._ticks(3)
+        self.assertEqual(chunks[1:], ["event: heartbeat\ndata:\n\n"] * 2)
+
+    def test_the_tick_waits_the_named_interval(self):
+        # The page's watchdog threshold is a multiple of this constant (a test in
+        # test_control_plane_ui_js.py holds the two equal), so the loop must use it.
+        _, slept = self._ticks(3, tick_s=0.25)
+        self.assertEqual(slept, [0.25, 0.25])
+
+
 class ResolveToolAskTests(_CPTestCase):
     """``resolve``, tool side. Dispatched on which table holds the id — the queue is
     merged, so the client sends back only that, and an approval id belongs to exactly

@@ -3,6 +3,7 @@ output: claude-sandbox/user-CLAUDE.md
 gateway_prefix: mcp__gateway__
 web_fetch_tool: WebFetch
 shell_tool: Bash
+agent_kind: claude
 session_id_var: $CLAUDE_CODE_SESSION_ID
 repo_instructions: CLAUDE.md
 id_shared_clause: , and your subagents share it

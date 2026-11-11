@@ -25,11 +25,39 @@ its arguments are shaped.
 
 **An agent names itself: its kind, a hyphen and its own session id**
 (`claude-<uuid>`). The kind keeps the registry agent-agnostic; the tool descriptions
-and each agent's instructions say where its id comes from (for the sandbox's Claude
-Code, `claude-sandbox/user-CLAUDE.md`). For Claude Code it is the session id, which
-also names the session's transcript, so a write leads back to what the session said
-(`NOTES.md` → "Claude Code puts its session id in every Bash call's environment"), and
-the status line shows its first eight characters (`claude-sandbox/statusline.sh`).
+give the rule with Claude Code as their one example, and each tier's instructions,
+rendered from `<tier>/instructions.md`, give its own kind and variable. For Claude Code
+it is the session id, which also names the session's transcript, so a write leads back
+to what the session said (`NOTES.md` → "Claude Code puts its session id in every Bash
+call's environment"), and the status line shows its first eight characters
+(`claude-sandbox/statusline.sh`).
+
+**Every CLI takes its id by one rule.** The kind is the CLI's command name: `claude`,
+`codex`, `agy`. The id is the CLI's own session variable, exported to the commands it
+runs, when that is unique per session, the same in the session's subagents, and in
+`check_agent`'s shape; kept across a resume is wanted too, since a resumed session then
+keeps its claims. The CLI's own variable is preferred because it also names the CLI's
+record of the session, as Claude's names its transcript, so one that fails only on
+resume is still taken over the fallback, which keeps nothing across a new process
+either.
+
+The fallback: the tier's image starts the CLI through a wrapper that exports a fresh
+UUID as `DOCKADE_SESSION_ID` each time the CLI process starts, one name for every tier
+that needs it, so the second reuses the first's wrapper. That id is per launch, not per
+session: every command the launch runs has it, subagents' included; a new chat started
+in place shares it; a resume inside the same process keeps it and one in a new process
+does not. Sharing within a launch is accepted as subagents' sharing is: the id keeps
+cooperating sessions apart, and moving a claim also takes its token, which a new chat
+does not have. The tier's instructions say how far its id reaches.
+
+A claim is held by the id (`claims.check_holder`), so a session that comes back under a
+new id, as a Claude Code session does after `/clear` (`NOTES.md` → "Claude Code puts its
+session id in every Bash call's environment"), cannot move its old claims: they lapse
+as every claim does (see "Claims"), or the operator breaks them.
+
+Each tier with the registry records its answer in its instruction source's front
+matter, `agent_kind` and `session_id_var`, and the evidence in a `NOTES.md` entry of
+its own.
 
 The alternatives each fail at uniqueness or at lasting as long as the work: a branch
 (one session works several tasks), the container (its name comes back after `--rm`,
@@ -38,7 +66,8 @@ carry it through compaction).
 
 **Self-declared, so it authenticates nothing.** It keeps cooperating sessions apart.
 `taskdb.check_agent` refuses anything without the shape, and any id whose kind is
-`operator`, so an agent cannot record a write as the operator's by accident.
+`operator` or `registry`, the two names the store writes under itself, so an agent
+cannot record a write as the operator's or the registry's by accident.
 
 ## Repos are a list the operator keeps
 

@@ -310,5 +310,6 @@ def check_agent(agent: object) -> str:
     if match is None or match["kind"] in (OPERATOR, REGISTRY):
         raise Refused(
             f"{quoted(agent)} is not an agent id: the agent's kind, a hyphen and its own "
-            f"session id, as in claude-<session id>")
+            "session id, as the agent's instructions or the registry's tool "
+            "descriptions give it")
     return agent

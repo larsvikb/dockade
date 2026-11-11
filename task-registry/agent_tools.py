@@ -55,12 +55,13 @@ def _duration(seconds: int) -> str:
 _CLAIM_LIFE = _duration(claims.CLAIM_SECONDS)
 
 AGENT = Param("agent", "string", (
-    "Your agent id: your kind, a hyphen and your session id. In Claude Code that is "
-    "`claude-` followed by the value of $CLAUDE_CODE_SESSION_ID. Use the same id on "
-    "every call in a session: the registry tells sessions apart by it and records "
-    "every write under it."), required=True)
+    "Your agent id: your kind, a hyphen and your session id, as your instructions "
+    "give them. In Claude Code that is `claude-` followed by the value of "
+    "$CLAUDE_CODE_SESSION_ID. Use the same id on every call in a session: the "
+    "registry tells sessions apart by it and records every write under it."),
+    required=True)
 REPO = Param("repo", "string", (
-    "The repo you work in, by the name your repo's CLAUDE.md gives for the task "
+    "The repo you work in, by the name your repo's instructions give for the task "
     "registry (`repos` lists them). A write on another repo's task is refused."),
     required=True)
 TASK = Param("task", "integer", "The task's id.", required=True)
@@ -208,7 +209,7 @@ TOOLS: dict[str, Tool] = {
 
     "repos": Tool(reads.repos, (
         "The repos the registry keeps, each with its remote and whether it is retired (a "
-        "retired repo takes no new task). Your repo's CLAUDE.md says which name is "
+        "retired repo takes no new task). Your repo's instructions say which name is "
         "yours; if it names none, ask the operator rather than guessing."),
         read_only=True),
 

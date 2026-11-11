@@ -398,27 +398,57 @@ class SurfaceTests(unittest.TestCase):
 
 
 class InstructionTests(unittest.TestCase):
-    """The descriptions name the variable an agent's id is made from and leave its
-    repo's name to the repo's ``CLAUDE.md``; the instructions say where that variable is
-    and give the name (``task-registry/DESIGN.md``, "Who an agent is" and "Repos are a
-    list the operator keeps"), and name tools by name. Each must still match what the
-    registry serves, or a session meets the mismatch at its first call."""
+    """The descriptions say what an agent's id and its repo's name are and leave where
+    each comes from to the agent's instructions, keeping one Claude Code example; the
+    instructions say where the variable is and give the name (``task-registry/DESIGN.md``,
+    "Who an agent is" and "Repos are a list the operator keeps"), and name tools by name.
+    Each must still match what the registry serves, or a session meets the mismatch at
+    its first call."""
 
     IMAGE = ROOT / "claude-sandbox" / "user-CLAUDE.md"
+    TIER_1 = ROOT / "claude-sandbox" / "instructions.md"
     REPO = ROOT / "CLAUDE.md"
     # Any whitespace between the words, so a reflowed paragraph still matches.
     REPO_NAME = re.compile(r"name\s+in\s+the\s+task\s+registry\s+is\s+`([^`]*)`")
+    # One CLI's name, file or variable: the known CLIs' names (GEMINI.md and
+    # CLAUDE.md among them), AGENTS.md, an environment variable.
+    ONE_CLI = re.compile(r"claude|codex|agy|gemini|AGENTS\.md|\$[A-Z]", re.IGNORECASE)
 
     def test_the_image_names_the_variable_the_id_description_names(self):
+        vocabulary = load_instructions_renderer().parse(self.TIER_1).vocabulary
         variables = re.findall(r"\$([A-Z][A-Z0-9_]*)", tools.AGENT.description)
         self.assertEqual(len(variables), 1, variables)
-        self.assertIn(f"`${variables[0]}`", self.IMAGE.read_text())
-        # A session id is a UUID, and `claude-` and one is an id the store takes.
-        agent = f"claude-{uuid.uuid4()}"
-        self.assertEqual(reg.taskdb.check_agent(agent), agent)
+        self.assertEqual(f"${variables[0]}", vocabulary["session_id_var"])
+        kinds = re.findall(r"`([a-z][a-z0-9]*)-`", tools.AGENT.description)
+        self.assertEqual(kinds, [vocabulary["agent_kind"]])
+
+    def test_each_tiers_kind_and_a_session_uuid_make_an_id_the_store_takes(self):
+        render = load_instructions_renderer()
+        kinds = {path: render.parse(path).vocabulary.get("agent_kind")
+                 for path in render.sources()}
+        self.assertIn("claude", kinds.values())
+        for kind in filter(None, kinds.values()):
+            with self.subTest(kind=kind):
+                agent = f"{kind}-{uuid.uuid4()}"
+                self.assertEqual(reg.taskdb.check_agent(agent), agent)
+
+    def test_no_description_names_one_cli_but_the_agent_ids_example(self):
+        example = [sentence for sentence in re.split(r"(?<=\.)\s+", tools.AGENT.description)
+                   if self.ONE_CLI.search(sentence)]
+        self.assertEqual(len(example), 1, example)
+
+        def described(params):
+            for param in params:
+                yield param.name, param.description
+                yield from described(param.fields)
+
+        for name, tool in tools.TOOLS.items():
+            for where, text in [(name, tool.description), *described(tool.params)]:
+                with self.subTest(tool=name, param=where):
+                    self.assertIsNone(
+                        self.ONE_CLI.search(text.replace(example[0], "")), text)
 
     def test_this_repo_gives_one_name_the_store_would_take(self):
-        self.assertIn("CLAUDE.md", tools.REPO.description)
         names = self.REPO_NAME.findall(self.REPO.read_text())
         self.assertEqual(len(names), 1, names)
         self.assertTrue(reg.tasks.REPO_NAME_RE.fullmatch(names[0]), names[0])
@@ -788,7 +818,8 @@ class OversizedValueTests(_Store):
                           f"{cut('p', self.LONG)} is not a path in the repo"),
             "agent": ("claim_work", work | {"agent": "c" * self.LONG},
                       f"{cut('c', self.LONG)} is not an agent id: the agent's kind, a "
-                      f"hyphen and its own session id, as in claude-<session id>"),
+                      "hyphen and its own session id, as the agent's instructions or "
+                      "the registry's tool descriptions give it"),
             "repo": ("list_tasks", {"repo": "r" * self.LONG},
                      f"no repo {cut('r', self.LONG)} in the registry"),
         }

@@ -97,7 +97,8 @@ class VocabularyTests(unittest.TestCase):
     the names tier 1 fills today, not of every Claude Code name: a new one is added
     here when tier 1 gains a key for it."""
 
-    DENIED = ("mcp__", "WebFetch", "Bash", "CLAUDE_CODE_", "CLAUDE.md", "subagent")
+    DENIED = ("mcp__", "WebFetch", "Bash", "CLAUDE_CODE_", "CLAUDE.md", "subagent",
+              "claude")
 
     def test_each_denied_name_is_one_tier_one_fills(self):
         values = render.parse(ROOT / "claude-sandbox" / "instructions.md").vocabulary.values()

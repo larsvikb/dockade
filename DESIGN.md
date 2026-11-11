@@ -227,6 +227,16 @@ over (`NOTES.md` has the allocator behaviour and the misleading error). Asserted
 `AddressAllocationTests` in `tests/test_topology.py`, which is also why the sandboxes
 may stay dynamic: they are launched after the substrate already holds its pins.
 
+**A service on more than one network forwards nothing between them.** A container's
+kernel forwards by default, so a multi-homed service is a router for any neighbour that
+can add a route through it: the proxy would carry a `sandbox-net` packet onto
+`egress-net`, ungoverned. Dropped capabilities keep the compose services from adding
+one, but not a sandbox that got root back, since its launchers keep `NET_ADMIN` for the
+firewall; `net.ipv4.ip_forward: "0"` is a layer independent of capabilities. IPv4 only,
+which holds while no network enables IPv6. Asserted, with that condition, by
+`EveryMultiHomedServiceForwardsNothingTests` in `tests/test_topology.py`, over every
+service compose attaches to a second network.
+
 ### DNS on `sandbox-net` (a non-obvious gotcha — read before touching DNS/firewall)
 
 Putting the sandbox on a *user-defined* network (which we do, and must — it's how

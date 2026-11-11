@@ -1046,9 +1046,6 @@ class _UiServiceChecks:
         self.assertIn("headers={'Host': '127.0.0.1'}", probe)
         self.assertIn("/healthz", probe)
 
-    def test_it_forwards_nothing_between_its_legs(self):
-        self.assertEqual(_sysctls_of(self.SERVICE), {"net.ipv4.ip_forward": "0"})
-
     def test_the_image_starts_the_entry_that_checks_the_bind(self):
         # uvicorn's own command line would take any --host and check nothing.
         dockerfile = (ROOT / self.SERVICE / "Dockerfile").read_text()
@@ -2130,11 +2127,6 @@ class TaskRegistryPlacementTests(unittest.TestCase):
         self.assertIn('secret="$(MCP_SECRETS)/tasks.json"', recipe.group(0))
         self.assertIn("--profile tasks", recipe.group(0))
 
-    def test_it_forwards_nothing_between_its_legs(self):
-        # Its peer check guards its own listeners; this keeps it from carrying a
-        # neighbour's packet across to the other network's members.
-        self.assertEqual(_sysctls_of("tasks"), {"net.ipv4.ip_forward": "0"})
-
     def test_it_runs_as_a_user_that_can_read_its_secret(self):
         # For the gateway's reason (test_the_gateway_runs_as_a_user_that_can_read_...).
         user = _scalar(_service("tasks"), "user")
@@ -2341,6 +2333,65 @@ class EveryServiceDropsEveryCapabilityTests(unittest.TestCase):
             with self.subTest(service=svc):
                 self.assertEqual(_strings_of(body.get("security_opt", []), "security_opt"),
                                  ["no-new-privileges:true"])
+
+
+class EveryMultiHomedServiceForwardsNothingTests(unittest.TestCase):
+    """Every service compose attaches to more than one network turns IPv4 forwarding
+    off, and no network enables IPv6. Why: DESIGN.md, ``## Networks``."""
+
+    SYSCTLS: ClassVar[dict[str, str]] = {"net.ipv4.ip_forward": "0"}
+
+    def test_every_multi_homed_service_turns_forwarding_off(self):
+        multi_homed = [svc for svc in _service_names() if len(_raw_networks(svc)) > 1]
+        if not multi_homed:
+            raise AssertionError("no service is on two networks: the reader saw nothing")
+        for svc in multi_homed:
+            with self.subTest(service=svc):
+                # Exact: a per-interface key beside it (net.ipv4.conf.eth1.forwarding)
+                # turns forwarding back on for one leg.
+                self.assertEqual(_sysctls_of(svc), self.SYSCTLS)
+
+    def test_no_network_enables_ipv6(self):
+        # The key, as `privileged`'s: refused without deciding how Compose reads it.
+        for name in COMPOSE_FILES:
+            networks = _mapping(_tree(name).get("networks", {}), f"{name}'s networks")
+            for net, body in networks.items():
+                with self.subTest(file=name, network=net):
+                    self.assertNotIn("enable_ipv6",
+                                     _mapping(body, f"network {net}"))
+
+    def holds_with(self, name: str, edit: Callable[[str], str], method: str) -> bool:
+        text = edit((ROOT / name).read_text())
+        self.assertEqual(_form_violations(name, text), [])
+        with mock.patch.dict(COMPOSE_TEXTS, {name: text}):
+            return _rule(type(self), method)()
+
+    def test_the_rule_is_derived_from_the_legs_not_a_list(self):
+        second_leg = _swap(_GITHUB_NETWORKS,
+                           _GITHUB_NETWORKS + "      tasks-operator-net:\n"
+                           "        ipv4_address: 172.26.0.9\n")
+        self.assertFalse(self.holds_with(
+            "mcp-servers.yml", second_leg,
+            "test_every_multi_homed_service_turns_forwarding_off"))
+
+    def test_a_per_interface_key_beside_it_fails(self):
+        extra = _swap('    sysctls:\n      net.ipv4.ip_forward: "0"\n    healthcheck:',
+                      '    sysctls:\n      net.ipv4.ip_forward: "0"\n'
+                      '      net.ipv4.conf.all.forwarding: "1"\n    healthcheck:')
+        self.assertFalse(self.holds_with(
+            "docker-compose.yml", extra,
+            "test_every_multi_homed_service_turns_forwarding_off"))
+
+    def test_a_network_enabling_ipv6_fails(self):
+        ipv6 = _swap("    name: sandbox-net\n    driver: bridge\n",
+                     "    name: sandbox-net\n    driver: bridge\n    enable_ipv6: true\n")
+        self.assertFalse(self.holds_with("docker-compose.yml", ipv6,
+                                         "test_no_network_enables_ipv6"))
+
+    def test_a_reader_that_sees_no_multi_homed_service_raises(self):
+        with mock.patch(f"{__name__}._raw_networks", return_value=set()), \
+                self.assertRaisesRegex(AssertionError, "the reader saw nothing"):
+            self.test_every_multi_homed_service_turns_forwarding_off()
 
 
 class EveryImageIsBuiltTests(unittest.TestCase):
@@ -3291,7 +3342,8 @@ class ComposeFormTests(unittest.TestCase):
          _swap('    sysctls:\n      net.ipv4.ip_forward: "0"\n    healthcheck:',
                '    sysctls:\n      net.ipv4.ip_forward: "1"\n'
                '    x-was:\n      sysctls:\n        net.ipv4.ip_forward: "0"\n    healthcheck:'),
-         _rule(TaskRegistryPlacementTests, "test_it_forwards_nothing_between_its_legs")),
+         _rule(EveryMultiHomedServiceForwardsNothingTests,
+               "test_every_multi_homed_service_turns_forwarding_off")),
         ("networks in an x- key", "mcp-servers.yml",
          _swap(_GITHUB_NETWORKS,
                "    networks:\n      sandbox-net:\n        ipv4_address: 172.30.0.12\n"
@@ -3378,7 +3430,8 @@ class ComposeFormTests(unittest.TestCase):
         ("sysctls as a list", "docker-compose.yml",
          _swap('    sysctls:\n      net.ipv4.ip_forward: "0"\n    healthcheck:',
                "    sysctls:\n      - net.ipv4.ip_forward=0\n    healthcheck:"),
-         _rule(TaskRegistryPlacementTests, "test_it_forwards_nothing_between_its_legs"),
+         _rule(EveryMultiHomedServiceForwardsNothingTests,
+               "test_every_multi_homed_service_turns_forwarding_off"),
          "holds"),
     ]
 

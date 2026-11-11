@@ -6936,6 +6936,32 @@ class ToolArgumentsChangedAuditTests(_ToolBridgeTestCase):
         self.assertNotIn("b" * 64, rows[-1]["reason"])
 
 
+class InventoryShapeTests(_ToolBridgeTestCase):
+    """A push of the wrong shape is a 400 the gateway logs, not a 500. On main each of
+    these raised past ``InventoryError`` out of ``inventory.record``."""
+
+    def _push(self, server_body: dict):
+        return cp.api_tool.tool_inventory(cp.api_tool.InventoryRequest(servers={
+            "mcp-github": server_body}), _FakeRequest())
+
+    def test_a_tool_list_that_is_not_a_list_is_a_400(self):
+        for bad in ({"name": "get_me"}, 7):
+            with self.subTest(tools=bad):
+                resp = self._push({"status": "ok", "tools": bad})
+                self.assertEqual(resp.kwargs.get("status_code"), 400)
+                self.assertFalse(resp.body["ok"])
+                self.assertIn("not a list", resp.body["detail"])
+
+    def test_a_malformed_entry_is_dropped_and_the_push_accepted(self):
+        resp = self._push({"status": "ok", "tools": [
+            {"name": 5}, {"name": ["x"]},
+            {"name": "get_me", "annotations": "ro"}]})
+        self.assertTrue(resp.body["ok"])
+        seen = cp.inventory.snapshot()["mcp-github"]
+        self.assertEqual((seen["tools"], seen["read_only"], seen["unnameable"]),
+                         (["get_me"], [], 2))
+
+
 class TwoServersOneToolNameTests(_ToolBridgeTestCase):
     """The reason ``server`` is a COLUMN and ``tool_rules`` is UNIQUE on the pair.
 

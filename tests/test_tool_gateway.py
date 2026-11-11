@@ -24,7 +24,7 @@ import re
 import unittest
 from unittest import mock
 
-from _loader import load_surface, load_tool_gateway
+from _loader import load_discovery, load_surface, load_tool_gateway
 
 #: The configuration compose actually deploys. Written out rather than read from
 #: compose: test_topology.py already holds those two equal, and re-deriving it here
@@ -283,6 +283,54 @@ class ReconcileSurvivalTests(unittest.TestCase):
         self.assertEqual(len(calls), 2, "the loop did not come back for a second try")
         self.assertIn("reconcile failed (AttributeError", printed)
         self.assertIn("report:1", printed)
+
+
+class OneBadServerTests(unittest.TestCase):
+    """One server whose reply raises something ``reconcile`` did not foresee costs that
+    server's enumeration and nothing else. On main it ended ``reconcile_all``, so the
+    round published nothing, pushed nothing and left ``enumerated`` where it was."""
+
+    def test_the_good_server_is_published_and_both_are_pushed(self):
+        gateway = load_tool_gateway(GOOD)
+        gateway.surface = load_surface()
+        discovery = load_discovery()
+        roster = [{"server": "mcp-good", "auth": {},
+                   "tools": [{"tool": "get_issue", "action": "allow"}]},
+                  {"server": "mcp-bad", "auth": {}, "tools": []}]
+        def post(entry, *_a, **_k):
+            if entry["server"] == "mcp-bad":
+                raise RuntimeError("something nobody listed")
+            return ('data: {"jsonrpc": "2.0", "id": 1, "result": {"tools": '
+                    '[{"name": "get_issue"}]}}\n\n')
+        discovery.poll = lambda: (roster, "")
+        discovery.post = post
+        pushed = []
+        discovery.push_inventory = lambda results: pushed.append(results) or ""
+        gateway.discovery = discovery
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            enumerated, reachable, _deadline = gateway._reconcile_once(None, None, 0.0)
+        self.assertEqual(enumerated, discovery.roster_digest(roster))
+        self.assertTrue(reachable)
+        self.assertEqual(len(pushed), 1)
+        self.assertEqual([r["server"] for r in pushed[0]], ["mcp-good", "mcp-bad"])
+        self.assertNotIn("tools", pushed[0][1])
+        self.assertIn("RuntimeError", pushed[0][1]["status"])
+        self.assertIn("mcp-good__get_issue",
+                      [tool["name"] for tool in gateway.surface.listing()])
+        self.assertIn("mcp-bad: NOT ENUMERATED", out.getvalue())
+
+    def test_a_malformed_entry_no_longer_needs_the_guard(self):
+        discovery = load_discovery()
+        discovery.post = lambda *_a, **_k: (
+            'data: {"jsonrpc": "2.0", "id": 1, "result": {"tools": '
+            '[{"name": ["x"]}, {"name": "ok", "annotations": "ro"}]}}\n\n')
+        result = discovery.reconcile_all([{"server": "mcp-odd", "auth": {},
+                                           "tools": []}])[0]
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual([tool["name"] for tool in result["tools"]], ["ok"])
+        self.assertEqual(result["malformed"], {"entries": 2, "dropped": 1})
 
 
 class ServerTextInTheReportTests(unittest.TestCase):

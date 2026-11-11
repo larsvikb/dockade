@@ -58,6 +58,22 @@ function backoffDelay(attempt) {
   return Math.min(RECONNECT_MIN_MS * 2 ** Math.max(0, attempt), RECONNECT_MAX_MS);
 }
 
+// The server's heartbeat interval: STREAM_TICK_S in api_approvals.py, held equal by a
+// test. A healthy stream sends an event at least this often.
+const HEARTBEAT_MS = 1000;
+// How long the stream may be silent before the watchdog retires the connection. A
+// slow legitimate tick is the sleep plus a payload build that takes holds._LOCK twice,
+// each able to wait out the store's 5 s busy timeout: 11 s. Past this, holds are
+// stalled too, so red is honest.
+const STREAM_SILENT_MS = 15 * HEARTBEAT_MS;
+// Whether the watchdog retires the current connection: one is outstanding (open, or
+// the browser's own retry) and nothing was heard from it, or since connecting, for
+// STREAM_SILENT_MS. With no connection outstanding a retry is already pending, and
+// acting would postpone it. Times are monotonic milliseconds.
+function shouldRetire(lastHeard, now, outstanding) {
+  return outstanding && now - lastHeard >= STREAM_SILENT_MS;
+}
+
 // ── the page ────────────────────────────────────────────────────────────────
 
 function start() {
@@ -1130,23 +1146,54 @@ function start() {
   let es = null;
   let attempt = 0;
   let retryTimer = null;
+  // When the stream was last heard from, or when it was opened if not since: what the
+  // watchdog measures silence from. performance.now(), not Date.now(), so a wall-clock
+  // step cannot fake or hide a silence.
+  let lastHeard = 0;
 
   function setConn(text, cls) { conn.textContent = text; conn.className = cls; }
 
-  function connect() {
-    clearTimeout(retryTimer);
-    es = new EventSource("/approvals/stream");
-    es.onopen = () => {
-      attempt = 0;
+  // An event arrived, a heartbeat or a pending payload. Green means delivering, not
+  // open: a payload build stuck in its worker thread sends the headers and then
+  // nothing. So the lamp, the "live" text and the backoff reset are here rather than in
+  // onopen, and only on the edge, so a heartbeat a second does not redraw the page.
+  function heard() {
+    lastHeard = performance.now();
+    if (!streamUp) {
       streamUp = true;
+      attempt = 0;
       setConn("live", "up");
       updateIndicators();
+    }
+  }
+
+  // Close the connection and try again after the backoff: from CLOSED after an error,
+  // and from a silence the watchdog caught.
+  function retry(why) {
+    es.close();
+    // Defensive: connect() clears it too, and nothing arms one while one is pending.
+    clearTimeout(retryTimer);
+    const delay = backoffDelay(attempt++);
+    setConn(`${why} — retrying in ${Math.round(delay / 1000)}s`, "down");
+    retryTimer = setTimeout(connect, delay);
+  }
+
+  function connect() {
+    clearTimeout(retryTimer);
+    // Defensive: its callers find es null (first load) or closed (the retry).
+    if (es) es.close();
+    es = new EventSource("/approvals/stream");
+    lastHeard = performance.now();
+    es.onopen = () => {
+      setConn("connecting…", "down");
       // Re-read the config on every (re)connect rather than once at load: a card can
       // only exist because this stream delivered it, so this is the earliest useful
       // moment — and a reconnect may be a restarted backend with a different window.
       refreshConfig();
     };
+    es.addEventListener("heartbeat", heard);
     es.addEventListener("pending", e => {
+      heard();
       const d = JSON.parse(e.data);
       lastSaturation = d.saturation || null;
       renderSaturation();
@@ -1168,12 +1215,22 @@ function start() {
         setConn("reconnecting…", "down");
         return;
       }
-      es.close();
-      const delay = backoffDelay(attempt++);
-      setConn(`stream closed — retrying in ${Math.round(delay / 1000)}s`, "down");
-      retryTimer = setTimeout(connect, delay);
+      retry("stream closed");
     };
   }
+
+  // The watchdog. A half-open socket behind the relay never fires onerror, and a stuck
+  // payload build sends nothing at all, so silence is the only sign of either; it gets
+  // the same reconnect as an error. Not gated on visibility, as the stream is not.
+  // Only a connection still outstanding is retired: a closed one has its retry
+  // pending already.
+  setInterval(() => {
+    const outstanding = es !== null && es.readyState !== EventSource.CLOSED;
+    if (!shouldRetire(lastHeard, performance.now(), outstanding)) return;
+    streamUp = false;
+    updateIndicators();
+    retry("stream silent");
+  }, HEARTBEAT_MS);
 
   // ── MCP servers, tool policy and pinned allows: mcp.js ────────────────────
   mountMcp();
@@ -1264,4 +1321,5 @@ function start() {
 // Browser: run the page. Node (the unit tests): import the pure helpers and touch
 // nothing — see the header comment on why importing this file must be side-effect free.
 if (typeof document !== "undefined") { start(); }
-export { lampState, backoffDelay, RECONNECT_MIN_MS, RECONNECT_MAX_MS };
+export { lampState, backoffDelay, RECONNECT_MIN_MS, RECONNECT_MAX_MS, shouldRetire,
+         HEARTBEAT_MS, STREAM_SILENT_MS };

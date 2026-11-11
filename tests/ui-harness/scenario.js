@@ -317,4 +317,37 @@ export const STEPS = [
       throw new Error(`the tool rules were not answered last: ${order.join(", ")}`);
     }
   }],
+
+  // A stream that stays open and says nothing (harness.js silences its heartbeats):
+  // the watchdog retires it after 15 s of silence and reconnects on the backoff. Each
+  // connection is retired on the first watchdog tick 15 s after it was last heard
+  // from, so 15 to 16 s on, and the backoffs between are 1, 2, 4 and 8 s: the fifth
+  // retire is 89 to 95 s in. Its backoff, 16 s, outlasts the silence a retire waits
+  // for, so the fifth stream is the last until that backoff ends, at 105 s or later:
+  // just short of it, five streams, and the sixth once it passes. Where the fifth
+  // retire fell is read back, so the wait short of it is exact. Last in the run, since
+  // its clock moves far.
+  ["the stream goes silent, retired five times", async ({ page, clock }) => {
+    // After the reloads above the page clock runs at wall-clock pace (the stamps of
+    // their requests move), and these steps count the watchdog's ticks, so it is
+    // paused again first.
+    await page.clock.pauseAt(await page.evaluate(() => Date.now() + 1));
+    await page.evaluate(() => window.__harnessSilence(true));
+    await clock(95000);
+  }],
+  ["just short of the 16 s backoff", async ({ page, clock }) => {
+    const since = await page.evaluate(() => window.__harnessSinceClose());
+    await clock(15900 - (since ?? 0));
+  }],
+  // The sixth sends the heartbeat it opens with, and nothing after: the stream is
+  // silenced again at the instant it opened, before the fake's next tick.
+  ["the sixth stream speaks once", async ({ page, clock }) => {
+    const since = await page.evaluate(() => window.__harnessSinceClose());
+    await page.evaluate(() => window.__harnessSilence(false));
+    await clock(16000 - (since ?? 0));
+    await page.evaluate(() => window.__harnessSilence(true));
+  }],
+  // It opened on a watchdog tick, as the retry that made it was armed on one, so the
+  // tick 15 s on retires it.
+  ["a second silence", async ({ clock }) => { await clock(15500); }],
 ];

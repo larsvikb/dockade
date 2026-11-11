@@ -37,12 +37,50 @@ if (!existsSync(BROWSER)) {
   process.exit(2);
 }
 
+// Installed after page.js's fake EventSource, and wrapping it: each fake sends a
+// heartbeat once open and then once a second of the page clock, as the server sends
+// one on every tick that changed nothing, so a page that waits for an event before it
+// shows the stream live reads live after every load and step. `__harnessSilence(true)`
+// stops every heartbeat, the on-open one included, until `__harnessSilence(false)`:
+// a stream that is open and says nothing. `__harnessStreams()` counts the fakes made,
+// for the snapshot, and `__harnessSinceClose()` is how long ago the page last closed
+// one (null if it has not), for a step that has to stop just short of a backoff.
+function heartbeats() {
+  const Fake = window.EventSource;
+  const made = [];
+  let silent = false;
+  const beat = es => {
+    if (!silent && es.readyState === Fake.OPEN) {
+      es.dispatchEvent(new MessageEvent("heartbeat", { data: "" }));
+    }
+  };
+  class Heartbeating extends Fake {
+    constructor(url) {
+      super(url);
+      made.push(this);
+      // Queued after the fake's own open, so it lands on an open stream.
+      queueMicrotask(() => beat(this));
+    }
+    close() {
+      super.close();
+      closedAt = performance.now();
+    }
+  }
+  let closedAt = null;
+  window.EventSource = Heartbeating;
+  setInterval(() => made.forEach(beat), 1000);
+  window.__harnessSilence = on => { silent = on; };
+  window.__harnessStreams = () => made.length;
+  window.__harnessSinceClose = () => closedAt === null ? null : performance.now() - closedAt;
+}
+
 // The DOM as indented lines, one element or text run per line. Properties a script
 // sets without touching an attribute (a field's value, a checkbox or a radio button)
 // are read off the element, since the attributes alone would not show them.
 function snapshot() {
   const lines = [`title: ${document.title}`,
                  `favicon: ${document.getElementById("favicon")?.href ?? "none"}`,
+                 `streams opened: ${window.__harnessStreams?.() ?? "none"}`,
                  `focus: ${describe(document.activeElement)}`];
   function describe(el) {
     if (!el) return "none";
@@ -89,6 +127,7 @@ async function main() {
     },
   });
   ({ page } = run);
+  await page.addInitScript(heartbeats);
   await page.coverage.startJSCoverage({ resetOnNavigation: false });
 
   // A failed step ends the run but still writes what it saw: the page error that broke

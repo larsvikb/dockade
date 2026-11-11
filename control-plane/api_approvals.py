@@ -74,6 +74,11 @@ EGRESS_ACTIONS = ("allow_once", "allow_lease", "allow_persist",
 TOOL_ACTIONS = ("allow", "allow_pinned", "allow_pinned_lease", "deny")
 PIN_ACTIONS = ("allow_pinned", "allow_pinned_lease")
 
+#: Seconds between the approvals stream's polls, which is also its heartbeat interval:
+#: a tick that finds nothing changed sends a heartbeat. The page's watchdog
+#: (``HEARTBEAT_MS`` in ``control-plane-ui/app.js``) is held equal to it by a test.
+STREAM_TICK_S = 1.0
+
 
 @router.post("/approvals/{approval_id}/resolve")
 def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResponse:
@@ -433,8 +438,9 @@ def _allow_pinned(approval_id: str, ask: dict | None, fields: object,
 
 @router.get("/approvals/stream")
 async def approvals_stream(request: Request) -> StreamingResponse:
-    """Server-sent events: the pending payload whenever it changes, polled once a
-    second, with a heartbeat otherwise so a client can detect a dead stream.
+    """Server-sent events: the pending payload whenever it changes, polled every
+    ``STREAM_TICK_S``, and a ``heartbeat`` event on every tick that changed nothing,
+    so the page can tell a silent stream from a quiet one.
 
     The payload is built in a WORKER THREAD. Every listener shares one event loop
     (``main`` in app.py), so blocking here blocks ``/authorize``. And building it can
@@ -456,6 +462,9 @@ async def approvals_stream(request: Request) -> StreamingResponse:
                 last = payload
                 yield f"event: pending\ndata: {payload}\n\n"
             else:
-                yield ": heartbeat\n\n"
-            await asyncio.sleep(1.0)
+                # A named event, not an SSE comment: EventSource never shows a page a
+                # comment. And with a data line, empty as it is: an event with no
+                # data field is not dispatched either.
+                yield "event: heartbeat\ndata:\n\n"
+            await asyncio.sleep(STREAM_TICK_S)
     return StreamingResponse(gen(), media_type="text/event-stream")

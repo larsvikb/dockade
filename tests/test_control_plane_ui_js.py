@@ -4310,6 +4310,177 @@ class PollGatingSourceTests(unittest.TestCase):
             self.src, r'visible = \(\) => document\.visibilityState !== "hidden"')
 
 
+_WATCHDOG_PROBE = r"""
+import { pathToFileURL } from "node:url";
+const m = await import(pathToFileURL(`${process.env.DOCKADE_UI_DIR}/app.js`).href);
+const N = m.STREAM_SILENT_MS;
+console.log(JSON.stringify({
+  helper: typeof m.shouldRetire,
+  heartbeat_ms: m.HEARTBEAT_MS,
+  silent_ms: N,
+  // Nothing heard since connecting at 1000: timed from the connect.
+  unheard_short: m.shouldRetire(1000, 1000 + N - 1, true),
+  unheard_at: m.shouldRetire(1000, 1000 + N, true),
+  // An event at 50000.
+  heard_just_under: m.shouldRetire(50000, 50000 + N - 1, true),
+  heard_at: m.shouldRetire(50000, 50000 + N, true),
+  // Closed, its retry pending: never, however long the silence.
+  not_outstanding: [0, N - 1, N, 10 * N].map(t => m.shouldRetire(0, t, false)),
+}));
+"""
+
+
+@unittest.skipIf(not _NODE and not _STRICT,
+                 "node is not installed — skipping the stream watchdog tests")
+class StreamWatchdogTests(unittest.TestCase):
+    """`shouldRetire`, the watchdog's decision: a connection still outstanding that
+    has been silent for `STREAM_SILENT_MS` is retired and reconnected. A stalled
+    stream fires no error, so this is what turns the lamp red for it."""
+
+    probe: dict
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if not _NODE:
+            raise AssertionError("node is not installed and DOCKADE_REQUIRE_TOOLS is set")
+        proc = subprocess.run(  # noqa: S603 (absolute path, fixed args)
+            [_NODE, "--input-type=module", "-e", _WATCHDOG_PROBE],
+            env={**os.environ, "DOCKADE_UI_DIR": str(_served_dir())},
+            capture_output=True, text=True, timeout=60, check=False)
+        if proc.returncode != 0:
+            raise AssertionError(f"node could not run the watchdog probe:\n{proc.stderr}")
+        cls.probe = json.loads(proc.stdout)
+
+    def test_the_helper_is_exported(self):
+        self.assertEqual(self.probe["helper"], "function")
+
+    def test_a_connection_never_heard_from_is_timed_from_its_connect(self):
+        self.assertFalse(self.probe["unheard_short"])
+        self.assertTrue(self.probe["unheard_at"])
+
+    def test_an_event_restarts_the_silence(self):
+        self.assertFalse(self.probe["heard_just_under"])
+        self.assertTrue(self.probe["heard_at"])
+
+    def test_nothing_outstanding_is_never_retired(self):
+        # Acting with a retry pending would clear it and arm a longer one, on every
+        # tick of a backoff past the threshold: a reconnect postponed forever.
+        self.assertEqual(self.probe["not_outstanding"], [False] * 4)
+
+    def test_the_threshold_is_fifteen_heartbeats(self):
+        self.assertEqual(self.probe["silent_ms"], 15 * self.probe["heartbeat_ms"])
+
+    def test_the_heartbeat_is_the_servers_tick(self):
+        # The JS is in milliseconds, the Python in seconds.
+        self.assertEqual(self.probe["heartbeat_ms"],
+                         1000 * _module_constant(_API_APPROVALS, "STREAM_TICK_S"))
+
+    def test_the_threshold_clears_a_slow_legitimate_tick(self):
+        # The sleep, plus a payload build that takes holds._LOCK twice, each able to
+        # wait out the store's busy timeout: slower than that, holds are stalled too.
+        tick = _module_constant(_API_APPROVALS, "STREAM_TICK_S")
+        busy = _connect_timeout(_STORE)
+        self.assertGreater(self.probe["silent_ms"], 1000 * (tick + 2 * busy))
+
+
+_API_APPROVALS = ROOT / "control-plane" / "api_approvals.py"
+_STORE = ROOT / "control-plane" / "store.py"
+
+
+def _module_constant(path: Path, name: str):
+    """A module-level `name = <literal>` in `path`, read without importing it."""
+    for node in ast.parse(path.read_text()).body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name) and node.targets[0].id == name):
+            return ast.literal_eval(node.value)
+    raise AssertionError(f"{path.name} has no module-level {name}")
+
+
+def _connect_timeout(path: Path) -> float:
+    """The `timeout=` of the one `sqlite3.connect` call in `path`."""
+    timeouts = [kw.value for node in ast.walk(ast.parse(path.read_text()))
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "connect"
+                and isinstance(node.func.value, ast.Name) and node.func.value.id == "sqlite3"
+                for kw in node.keywords if kw.arg == "timeout"]
+    if len(timeouts) != 1:
+        raise AssertionError(f"expected one sqlite3.connect(timeout=…) in {path.name}, "
+                             f"found {len(timeouts)}")
+    return ast.literal_eval(timeouts[0])
+
+
+class StreamWatchdogSourceTests(unittest.TestCase):
+    """The watchdog's wiring lives in `start()`, so what would fail silently is
+    asserted on the source: a gated watchdog stops in a hidden tab, which is where a
+    hold is most likely to burn unseen; a green lamp on open shows a stream that sends
+    headers and nothing else as live; and a backoff reset on open retries a backend
+    that accepts and never delivers every 16 s forever."""
+
+    def setUp(self):
+        self.src = _code(APP_JS.read_text())
+
+    def _watchdog(self) -> str:
+        m = re.search(r"setInterval\(\(\) => \{((?:(?!setInterval)[\s\S])*?shouldRetire"
+                      r"[\s\S]*?)\}, (\w+)\);", self.src)
+        self.assertIsNotNone(m, "the watchdog interval is gone")
+        self.assertEqual(m.group(2), "HEARTBEAT_MS")
+        return m.group(1)
+
+    def test_the_watchdog_is_not_gated_on_visibility(self):
+        self.assertNotIn("visible()", self._watchdog())
+
+    def test_outstanding_is_read_from_the_connection(self):
+        body = self._watchdog()
+        self.assertRegex(body, r"const outstanding = es !== null && "
+                               r"es\.readyState !== EventSource\.CLOSED;")
+        self.assertRegex(body, r"shouldRetire\(lastHeard, performance\.now\(\), "
+                               r"outstanding\)")
+        self.assertNotIn("retryTimer", body)
+
+    def test_open_is_not_delivery(self):
+        onopen = re.search(r"es\.onopen = \(\) => \{([\s\S]*?)\n    \};", self.src)
+        self.assertIsNotNone(onopen, "es.onopen is gone")
+        self.assertNotRegex(onopen.group(1), r"streamUp\s*=")
+        self.assertNotRegex(onopen.group(1), r"\battempt\b")
+
+    def test_the_lamp_goes_green_only_on_the_edge(self):
+        # Not once a second: a heartbeat on a live stream redraws nothing.
+        sets = re.findall(r"streamUp = true", self.src)
+        guarded = re.findall(r"if \(!streamUp\) \{\s*streamUp = true;", self.src)
+        self.assertEqual(len(sets), 1)
+        self.assertEqual(len(guarded), 1)
+
+    def test_a_retry_closes_the_connection_first(self):
+        # Left open, a retired stream stays outstanding: every tick retires it again
+        # and clears the pending retry, so it never reconnects.
+        retry = re.search(r"function retry\(why\) \{([\s\S]*?)\n  \}", self.src)
+        self.assertIsNotNone(retry, "retry() is gone")
+        self.assertRegex(retry.group(1), r"^\s*es\.close\(\);")
+
+    def test_delivery_resets_the_backoff(self):
+        # On the edge with the lamp: a stream that came back retries from 1 s the next
+        # time, not from wherever the last outage left the backoff.
+        heard = re.search(r"function heard\(\) \{([\s\S]*?)\n  \}", self.src)
+        self.assertIsNotNone(heard, "heard() is gone")
+        self.assertRegex(heard.group(1),
+                         r"if \(!streamUp\) \{\s*streamUp = true;\s*attempt = 0;")
+
+    def test_every_event_records_liveness(self):
+        self.assertRegex(self.src, r'es\.addEventListener\("heartbeat", heard\);')
+        self.assertRegex(self.src,
+                         r'es\.addEventListener\("pending", e => \{\s*heard\(\);')
+        heard = re.search(r"function heard\(\) \{([\s\S]*?)\n  \}", self.src)
+        self.assertIsNotNone(heard, "heard() is gone")
+        self.assertRegex(heard.group(1), r"^\s*lastHeard = performance\.now\(\);")
+
+    def test_a_connection_is_timed_from_its_connect(self):
+        connect = re.search(r"function connect\(\) \{([\s\S]*?)\n  \}", self.src)
+        self.assertIsNotNone(connect, "connect() is gone")
+        self.assertRegex(connect.group(1),
+                         r'es = new EventSource\("/approvals/stream"\);\s*'
+                         r"lastHeard = performance\.now\(\);")
+
+
 class NotificationWiringSourceTests(unittest.TestCase):
     """The notification plumbing lives inside `start()`, so what the pure helpers
     cannot cover is asserted against the source.
@@ -5195,7 +5366,7 @@ _BROWSER_GLOBALS = frozenset({
     "Array", "Boolean", "Date", "Error", "EventSource", "JSON", "Map", "Math", "NaN",
     "Notification", "Number", "Object", "Set", "String", "URLSearchParams",
     "clearTimeout", "document", "encodeURIComponent", "fetch", "location",
-    "setInterval", "setTimeout", "window",
+    "performance", "setInterval", "setTimeout", "window",
 })
 
 # The bytecodes V8 emits for a name it resolved to no local, closure slot or import.

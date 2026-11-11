@@ -201,6 +201,66 @@ def _rules():
                 conn.execute("SELECT pattern, action FROM rules")}
 
 
+class _WritesAfterTheRead:
+    """A real connection that, right after the first statement starting with
+    ``after``, runs ``statement`` from a second connection: another writer trying to
+    land between a handler's read and its write. Appends to ``landed`` whether it did.
+
+    Wraps the connection rather than patching it: sqlite3.Connection.execute is
+    read-only, so the write has to be injected from outside the object."""
+
+    def __init__(self, conn, after, statement, params, landed):
+        object.__setattr__(self, "_conn", conn)
+        object.__setattr__(self, "_hook", (after, statement, params, landed))
+
+    def execute(self, sql, *a):
+        cur = self._conn.execute(sql, *a)
+        after, statement, params, landed = self._hook
+        if not landed and sql.startswith(after):
+            # No busy wait: against the handler's lock this must fail now, not stall
+            # for store._connect's timeout.
+            other = sqlite3.connect(cp.store.DB_PATH, timeout=0)
+            try:
+                other.execute(statement, params)
+                other.commit()
+                landed.append(True)
+            except sqlite3.OperationalError as e:
+                # Only the lock counts: a renamed table or a moved DB_PATH would
+                # otherwise pass without the fix.
+                if e.sqlite_errorcode & 0xFF != sqlite3.SQLITE_BUSY:
+                    raise
+                landed.append(False)
+            finally:
+                other.close()
+        return cur
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._conn, name, value)
+
+    def __enter__(self):
+        self._conn.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self._conn.__exit__(*exc)
+
+
+@contextlib.contextmanager
+def _write_after_the_read(after, statement, params=()):
+    """While open, every ``store._connect`` is a ``_WritesAfterTheRead``. Yields the
+    list the hook appends to: empty if it never fired, else ``[landed]``."""
+    landed = []
+    real_connect = cp.store._connect
+    with mock.patch.object(
+            cp.store, "_connect",
+            lambda: _WritesAfterTheRead(real_connect(), after, statement, params,
+                                        landed)):
+        yield landed
+
+
 class _CPTestCase(unittest.TestCase):
     """Fresh schema + empty tables per test, and ``_audit`` muted by default — it
     prints the ``make logs-cp`` live feed to stdout, which is noise for a test about
@@ -742,11 +802,12 @@ class ResolveTests(_CPTestCase):
 class PersistConflictTests(_CPTestCase):
     """A `*_persist` cannot write over a rule that already holds its pattern.
 
-    The insert is `INSERT OR IGNORE` against `UNIQUE(pattern)`, so before this it
-    silently wrote NOTHING while the endpoint reported `persisted: true` and the card
-    confirmed a standing rule. Deny-over-allow was the dangerous direction: the
-    operator believed a subtree was permanently blocked and every later request to it
-    was allowed without even raising a hold."""
+    The insert was `INSERT OR IGNORE` against `UNIQUE(pattern)`, so it silently wrote
+    NOTHING while the endpoint reported `persisted: true` and the card confirmed a
+    standing rule. Deny-over-allow was the dangerous direction: the operator believed a
+    subtree was permanently blocked and every later request to it was allowed without
+    even raising a hold. Now the check reads under `BEGIN IMMEDIATE`, so what it finds
+    is the table the write commits to."""
 
     def test_a_persist_that_contradicts_an_existing_rule_is_refused(self):
         _set_rules([(".example.com", "allow")])
@@ -794,6 +855,69 @@ class PersistConflictTests(_CPTestCase):
         self.assertTrue(body["ok"])
         self.assertFalse(body["persisted"], "no row was written; do not claim one")
         self.assertTrue(body["already_present"])
+
+    def test_a_same_action_persist_is_stored_as_present_not_written(self):
+        _set_rules([(".example.com", "allow")])
+        approval = _hold("b.example.com")
+        _resolve(approval, "allow_persist", pattern=".example.com")
+        with cp.store._connect() as conn:
+            row = conn.execute("SELECT mode, pattern FROM approvals WHERE id=?",
+                               (approval,)).fetchone()
+        self.assertEqual((row["mode"], row["pattern"]), ("present", ".example.com"))
+
+    def test_no_rule_can_land_between_the_check_and_the_write(self):
+        # Each interloper writes from a second connection right after resolve's
+        # opposite-rule SELECT. Unlocked, every one landed: the opposite insert and the
+        # edit to `block` left an allow_persist audited as written, or confirmed as
+        # already in place, over a block rule.
+        pattern = ".example.com"
+        insert = ("INSERT INTO rules(pattern, action, source, created_at, "
+                  "client_class) VALUES (?, ?, 'interloper', 0, ?)")
+        cases = {
+            # name: (rules before, interloper, its params, whether resolve writes)
+            "opposite insert": ([], insert, (pattern, "block", CLASS), True),
+            "same-action insert": ([], insert, (pattern, "allow", CLASS), True),
+            "edit to the opposite": (
+                [(pattern, "allow")],
+                "UPDATE rules SET action='block' WHERE pattern=?", (pattern,), False),
+            # Guards the reliance on the read: unlocked, a `present` would be
+            # recorded over no rule at all.
+            "delete": ([(pattern, "allow")], "DELETE FROM rules WHERE pattern=?",
+                       (pattern,), False),
+        }
+        for name, (before, statement, params, writes) in cases.items():
+            with self.subTest(name):
+                _clear_all()
+                _set_rules(before)
+                approval = _hold("b.example.com")
+                with _write_after_the_read("SELECT action FROM rules", statement,
+                                           params) as landed:
+                    body = _resolve(approval, "allow_persist",
+                                    pattern=pattern).args[0]
+                self.assertEqual(landed, [False], "the interloper landed, or the "
+                                 "hook never saw resolve's SELECT")
+                with cp.store._connect() as conn:
+                    rules = {tuple(r) for r in conn.execute(
+                        "SELECT pattern, action, source FROM rules")}
+                    mode = conn.execute("SELECT mode FROM approvals WHERE id=?",
+                                        (approval,)).fetchone()["mode"]
+                self.assertEqual(
+                    rules, {(pattern, "allow", "operator" if writes else "test")})
+                self.assertEqual(mode, "persist" if writes else "present")
+                self.assertEqual((body["persisted"], body["already_present"]),
+                                 (writes, not writes))
+
+    def test_an_expired_card_does_not_leave_a_standing_rule_behind(self):
+        # The persist twin of the lease test: the waiter's timeout expired the card and
+        # default-denied its request, so a click in the window before the slot is
+        # released matches no row, and must write no rule either.
+        _hold("api.example.com")
+        with cp.store._connect() as conn:
+            conn.execute("UPDATE approvals SET status='expired' WHERE id='hold-1'")
+            conn.commit()
+        resp = _resolve("hold-1", "allow_persist")
+        self.assertEqual(resp.kwargs.get("status_code"), 409)
+        self.assertEqual(_rules(), set())
 
     def test_persisted_reports_a_write_not_an_intention(self):
         resp = _resolve(_hold("fresh.example"), "allow_persist",
@@ -2771,6 +2895,38 @@ class ProvenanceTests(_CPTestCase):
         self.assertTrue(any("standing rule written" in r for r in reasons),
                         f"persist not distinguishable in audit reasons: {reasons}")
 
+    def test_audit_reason_says_a_rule_already_in_place_was_not_written(self):
+        # A persist that found its rule already in force wrote nothing, and the
+        # released waiter's row used to say "standing rule written" all the same. The
+        # rule is created while the hold is pending, the only way it can precede the
+        # click.
+        saved = cp.holds.HOLD_TIMEOUT
+        cp.holds.HOLD_TIMEOUT = 5
+        try:
+            t, result, approval_id = HoldHandshakeTests._authorize_in_thread(
+                self, "present.example.com")
+            _set_rules([("present.example.com", "allow")])
+            _resolve(approval_id, "allow_persist")
+            t.join(2)
+        finally:
+            cp.holds.HOLD_TIMEOUT = saved
+        self.assertEqual(result["resp"].decision, "allow")
+        reasons = [c.kwargs.get("reason", "") for c in cp.store._audit.call_args_list]
+        self.assertTrue(
+            any("standing rule already in place: present.example.com" in r
+                for r in reasons), reasons)
+        self.assertFalse(any("standing rule written" in r for r in reasons), reasons)
+
+    def test_decision_scope_reads_present_as_already_in_place(self):
+        self.assertEqual(
+            cp.api_authorize._decision_scope({"mode": "present",
+                                              "pattern": ".example.com"}),
+            "standing rule already in place: .example.com")
+        self.assertEqual(
+            cp.api_authorize._decision_scope({"mode": "persist",
+                                              "pattern": ".example.com"}),
+            "standing rule written: .example.com")
+
     def test_audit_reason_names_the_pattern_a_persist_wrote(self):
         # "allow api.example.co.uk" and "allow .co.uk" are the same click and very
         # different policy. The released waiter's row carried the HOST and the words
@@ -4422,55 +4578,11 @@ class McpToolRuleRevokeTests(_CPTestCase):
         """Revoke, with another writer's allow-to-deny edit tried right after the
         revoke's own SELECT. Returns the response and whether the edit landed, or
         None if the hook never fired."""
-        rule_id = self.rule_id
-        landed = []
-
-        class _EditsAfterTheRead:
-            """Wraps the connection rather than patching it: sqlite3.Connection.execute
-            is read-only, so the edit has to be injected from outside the object."""
-
-            def __init__(self, conn):
-                object.__setattr__(self, "_conn", conn)
-
-            def execute(self, sql, *a):
-                cur = self._conn.execute(sql, *a)
-                if not landed and sql.startswith("SELECT server, tool, action "
-                                                 "FROM tool_rules"):
-                    # No busy wait: against the revoke's lock this must fail now,
-                    # not stall for store._connect's timeout.
-                    other = sqlite3.connect(cp.store.DB_PATH, timeout=0)
-                    try:
-                        other.execute("UPDATE tool_rules SET action='deny' WHERE id=?",
-                                      (rule_id,))
-                        other.commit()
-                        landed.append(True)
-                    except sqlite3.OperationalError as e:
-                        # Only the lock counts: a renamed table or a moved
-                        # DB_PATH would otherwise pass without the fix.
-                        if e.sqlite_errorcode & 0xFF != sqlite3.SQLITE_BUSY:
-                            raise
-                        landed.append(False)
-                    finally:
-                        other.close()
-                return cur
-
-            def __getattr__(self, name):
-                return getattr(self._conn, name)
-
-            def __setattr__(self, name, value):
-                setattr(self._conn, name, value)
-
-            def __enter__(self):
-                self._conn.__enter__()
-                return self
-
-            def __exit__(self, *exc):
-                return self._conn.__exit__(*exc)
-
-        real_connect = cp.store._connect
-        with mock.patch.object(cp.store, "_connect",
-                               lambda: _EditsAfterTheRead(real_connect())):
-            resp = cp.api_mcp.revoke_mcp_rule(rule_id, _FakeRequest())
+        with _write_after_the_read(
+                "SELECT server, tool, action FROM tool_rules",
+                "UPDATE tool_rules SET action='deny' WHERE id=?",
+                (self.rule_id,)) as landed:
+            resp = cp.api_mcp.revoke_mcp_rule(self.rule_id, _FakeRequest())
         return resp, (landed[0] if landed else None)
 
     def test_the_audit_names_the_action_of_the_row_deleted(self):
@@ -7426,8 +7538,8 @@ class FreshSchemaTests(_FreshStoreTestCase):
             conn.commit()
             self.assertEqual(
                 conn.execute("SELECT COUNT(*) FROM rules").fetchone()[0], 2)
-            # Same pattern AND class is still one rule — the constraint `resolve`
-            # relies on for INSERT OR IGNORE to mean "already in force".
+            # Same pattern AND class is still one rule — the constraint that makes
+            # `resolve`'s plain INSERT raise rather than duplicate a rule.
             with self.assertRaises(Exception):
                 conn.execute("INSERT INTO rules(pattern, action, source, "
                              "created_at, client_class) "
@@ -7510,9 +7622,9 @@ class MigrationTests(_FreshStoreTestCase):
     def test_the_old_unique_pattern_constraint_is_gone(self):
         # The reason this is a REBUILD and not an ADD COLUMN. Under the old
         # constraint a second class could never have a rule for a host the first
-        # already covered: `resolve`'s INSERT OR IGNORE would write nothing and report
-        # the rule already present, leaving that client held forever on a host the
-        # operator believed they had just approved.
+        # already covered: `resolve`'s insert (then INSERT OR IGNORE) wrote nothing and
+        # reported the rule already present, leaving that client held forever on a
+        # host the operator believed they had just approved.
         self._old_store("migrate-unique.db")
         cp.store._init_db()
         with cp.store._connect() as conn:

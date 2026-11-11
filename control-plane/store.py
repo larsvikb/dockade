@@ -116,8 +116,8 @@ def _step_1_client_class(conn: sqlite3.Connection) -> None:
     audit trail that nothing observed."""
     # A REBUILD rather than an ADD COLUMN, because uniqueness becomes (pattern,
     # client_class). Under the old UNIQUE(pattern), one class's rule would block
-    # another's: `INSERT OR IGNORE` in ``api_approvals.resolve`` would write nothing and
-    # leave the second client held forever. SQLite cannot drop a column-level
+    # another's: the insert in ``api_approvals.resolve`` (then `INSERT OR IGNORE`) wrote
+    # nothing and left the second client held forever. SQLite cannot drop a column-level
     # constraint in place, so this is the twelve-step procedure, minus the steps for
     # foreign keys, triggers and views (this schema has none).
     conn.execute("DROP TABLE IF EXISTS rules_migrating")
@@ -843,15 +843,18 @@ def _init_db() -> None:
                 -- standing policy. A plain TEXT column, which is why the lease needed
                 -- no step of its own here — a third value costs nothing where a third
                 -- column would have cost a migration.
-                mode        TEXT,             -- once | lease | persist
+                -- `present` is a persist that found the same rule in force and wrote
+                -- nothing.
+                mode        TEXT,             -- once | lease | persist | present
                 resolved_at REAL,
                 resolved_by TEXT,             -- provenance of the resolver (provenance._actor)
                 -- WHAT a `persist` decision wrote: the rule pattern the operator chose
                 -- from the breadth ladder. Without it the record of a click that
                 -- changed standing policy said only which HOST was allowed, and a
                 -- `.co.uk` chosen from the ladder left a trail reading
-                -- "allow api.example.co.uk". NULL for once/lease and for every row
-                -- that predates the column.
+                -- "allow api.example.co.uk". On a `present` row, the rule that was
+                -- already in force, which this decision did not write. NULL for
+                -- once/lease and for every row that predates the column.
                 pattern     TEXT
             )""")
         conn.execute(

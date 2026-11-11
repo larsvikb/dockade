@@ -106,10 +106,15 @@ def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResp
             status_code=409)
 
     with store._connect() as conn:
+        # One write transaction, so the opposite-rule check below and the rule write
+        # are one step: a rule created, edited or revoked from another tab cannot land
+        # between them. Each refusal rolls it back.
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT host, client_class FROM approvals WHERE id=?",
             (approval_id,)).fetchone()
         if row is None:
+            conn.rollback()
             return JSONResponse({"ok": False, "detail": "unknown"}, status_code=404)
         # The class the request was DECIDED under, from the durable row, like the host
         # below. The rule this writes is scoped to the population the card was raised
@@ -126,6 +131,7 @@ def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResp
         # action still decides it.
         if (persist or lease) and (
                 not client_class or client_class == policy.UNCLASSIFIED):
+            conn.rollback()
             return JSONResponse(
                 {"ok": False,
                  "detail": f"this request came from an unclassified client "
@@ -140,6 +146,7 @@ def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResp
         if persist:
             allowed = policy._persist_candidates(row["host"])
             if not allowed:
+                conn.rollback()
                 return JSONResponse(
                     {"ok": False,
                      "detail": f"no rule pattern can be derived from host "
@@ -149,17 +156,19 @@ def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResp
                 # Refused BEFORE the UPDATE, so the card stays pending and the operator
                 # can choose again, rather than half-applying: decision recorded, rule
                 # not.
+                conn.rollback()
                 return JSONResponse(
                     {"ok": False,
                      "detail": f"pattern {pattern!r} is not one this approval may "
                                f"persist (allowed: {', '.join(allowed)})"},
                     status_code=400)
-            # A rule for this pattern may already exist with the OPPOSITE action. The
-            # insert below is INSERT OR IGNORE on UNIQUE(pattern, client_class), so it
-            # would write nothing while the card confirmed a standing rule. Deny over
-            # allow is the dangerous direction: the operator believes a subtree is
-            # blocked, and every later request to it is allowed without a hold.
-            # Refused before the UPDATE, as above.
+            # A rule for this pattern may already exist with the OPPOSITE action, and
+            # nothing here replaces a rule, so writing this one would leave the card
+            # confirming a standing rule that is not in force. Deny over allow is the
+            # dangerous direction: the operator believes a subtree is blocked, and
+            # every later request to it is allowed without a hold. Refused before the
+            # UPDATE, as above. Read under the transaction's lock, so what it finds is
+            # still the table at commit.
             #
             # Reachable only through a rule written WHILE this hold was pending, since
             # every candidate matches the held host and an older rule would have
@@ -171,6 +180,7 @@ def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResp
                 (pattern, client_class)).fetchone()
             wanted = "allow" if outcome == "allow" else "block"
             if existing is not None and existing["action"] != wanted:
+                conn.rollback()
                 return JSONResponse(
                     {"ok": False,
                      "detail": f"a standing rule for {pattern!r} already exists for "
@@ -182,16 +192,20 @@ def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResp
                      "conflict": {"pattern": pattern, "action": existing["action"],
                                   "client_class": client_class}},
                     status_code=409)
-            # The same action already present is no conflict: proceed, and report
-            # below that this call wrote nothing.
-        wrote_rule = False
+            # The same action already present is no conflict: proceed, write
+            # nothing, and record the approval as `present`, so its audit row says
+            # the rule was already in place rather than written.
+            wrote_rule = existing is None
+        else:
+            wrote_rule = False
         lease_expires_at = None
         now = time.time()
         updated = conn.execute(
             "UPDATE approvals SET status=?, mode=?, resolved_at=?, resolved_by=?, "
             "pattern=? WHERE id=? AND status='pending'",
             ("allowed" if outcome == "allow" else "denied",
-             "persist" if persist else "lease" if lease else "once", now, actor,
+             ("persist" if wrote_rule else "present") if persist
+             else "lease" if lease else "once", now, actor,
              pattern if persist else None, approval_id)).rowcount
         if updated and lease:
             # INSIDE the `updated` guard: the conditional UPDATE makes exactly one of
@@ -210,15 +224,14 @@ def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResp
                 "expires_at, granted_by) VALUES (?,?,?,?,?,?)",
                 (policy._normalize_host(row["host"]), client_class, approval_id,
                  now, lease_expires_at, actor))
-        if updated and persist:
-            # OR IGNORE still, because the check above and this insert are not atomic
-            # and a rule could appear between them. The rowcount says whether a row was
-            # actually written.
-            wrote_rule = conn.execute(
-                "INSERT OR IGNORE INTO rules(pattern, action, source, created_at, "
+        if updated and wrote_rule:
+            # A plain INSERT: under the lock no rule can have appeared since the check.
+            # Were one there anyway, the UNIQUE raises and the whole transaction rolls
+            # back, leaving the card pending rather than auditing a write.
+            conn.execute(
+                "INSERT INTO rules(pattern, action, source, created_at, "
                 "client_class) VALUES (?,?, 'operator', ?, ?)",
-                (pattern, "allow" if outcome == "allow" else "block",
-                 time.time(), client_class)).rowcount > 0
+                (pattern, wanted, time.time(), client_class))
         conn.commit()
 
     if not updated:
@@ -240,8 +253,8 @@ def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResp
             event.set()
     # What was STORED, not what was clicked, so the card confirms what happened:
     #   - ``pattern`` as written (the default is the exact host);
-    #   - ``persisted`` from the insert's rowcount, and ``already_present`` when the
-    #     same rule was in place;
+    #   - ``persisted`` when the insert ran, and ``already_present`` when the locked
+    #     read found the same rule in place;
     #   - ``client_class``, since pattern and class together are the rule;
     #   - ``lease_expires_at`` as the deadline granted, so a stale `/api/config` or an
     #     off clock in the page cannot show a different one.

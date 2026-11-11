@@ -363,6 +363,10 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    # Not a router between its legs: with forwarding on, a sandbox-net neighbour that
+    # could add a route would cross to egress-net, mcp-net or authorize-net through it.
+    sysctls:
+      net.ipv4.ip_forward: "0"
 
   # Control plane BACKEND — the governance authority (policy + audit), the
   # crown-jewel state. Fully internal: no sandbox-net (the agent has no route to
@@ -468,6 +472,10 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    # Not a router between its legs: with forwarding on, a neighbour that could add a
+    # route would cross between control-net, authorize-net and tool-authorize-net.
+    sysctls:
+      net.ipv4.ip_forward: "0"
 
   # Control plane UI FRONTEND — a distinct, stateless service (own lifecycle)
   # that serves the approval UI and reverse-proxies the API/SSE to the backend.
@@ -700,6 +708,10 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    # Not a router between its legs: with forwarding on, a sandbox-net neighbour that
+    # could add a route would cross to mcp-net or tool-authorize-net through it.
+    sysctls:
+      net.ipv4.ip_forward: "0"
 
   # ── Task registry (an MCP server with an operator side) ─────────────────────
   # The work list agent sessions and the operator share; task-registry/DESIGN.md has

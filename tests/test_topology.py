@@ -3715,9 +3715,10 @@ class ComposeTreeParityTests(unittest.TestCase):
 class BackupRestoreRecipeTests(_MakeRun):
     """``backup``, ``restore`` and ``restore-tasks`` run against a stub ``docker`` that
     logs each call, answers every inspect, says the registry is running when asked, and
-    has the store's tool (the ``python3`` entrypoint, not the preflight's ``test``)
-    exit with the status a test sets. What is checked is which calls the recipe makes
-    after the tool: a restart on every status but the sidecar one.
+    has the store's tool (the ``python3`` entrypoint) exit with the status a test sets,
+    as it does the preflights' ``test`` that the image has the tool's file. What is
+    checked is which calls the recipe makes after the tool: a restart on every status
+    but the sidecar one.
 
     A test that sets an export status instead routes the tool's calls apart: both
     snapshots stream a SQLite header and succeed, and only ``export.py`` exits with
@@ -3732,11 +3733,12 @@ class BackupRestoreRecipeTests(_MakeRun):
         stub = self.tmp / "bin"
         stub.mkdir()
         (stub / "docker").write_text(f"""#!/bin/sh
-# One line a call: the inline programs are arguments, and span lines.
+# One line a call, whatever newlines an argument holds.
 printf '%s\\n' "$*" | tr '\\n' ' ' >> "{self.calls}"; echo >> "{self.calls}"
 case " $* " in
   *" --entrypoint python3 "*" export.py "*) if [ -n "$EXPORT_STATUS" ]; then
       cat > /dev/null; echo "# Tasks"; exit "$EXPORT_STATUS"; fi;;
+  *" --entrypoint test "*) exit "${{PREFLIGHT_STATUS:-0}}";;
 esac
 case " $* " in
   *" --entrypoint python3 "*) cat > /dev/null
@@ -3749,12 +3751,13 @@ esac
         self.path = f"{stub}{os.pathsep}{os.environ['PATH']}"
 
     def run_target(self, *args: str, tool_status: str, stopped: bool = False,
-                   export_status: str = "",
+                   export_status: str = "", preflight_status: str = "0",
                    ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
         run = self.make(*args, path=self.path,
                         env={"TOOL_STATUS": tool_status, "BACKUP_DIR": str(self.backups),
                              "STOPPED": "1" if stopped else "",
-                             "EXPORT_STATUS": export_status})
+                             "EXPORT_STATUS": export_status,
+                             "PREFLIGHT_STATUS": preflight_status})
         calls = self.calls.read_text().splitlines() if self.calls.exists() else []
         return run, calls
 
@@ -3771,6 +3774,21 @@ esac
     def restore(self, target: str, prefix: str, tool_status: str, stopped: bool = False):
         return self.run_target(target, f"FILE={self.backup_file(prefix + '-x.db')}",
                                "FORCE=1", tool_status=tool_status, stopped=stopped)
+
+    def test_an_image_without_the_store_tool_stops_both_before_anything_runs(self):
+        for args in (("backup",),
+                     ("restore", f"FILE={self.backup_file('dockade-control-x.db')}",
+                      "FORCE=1")):
+            with self.subTest(target=args[0]):
+                self.calls.unlink(missing_ok=True)
+                run, calls = self.run_target(*args, tool_status="0", preflight_status="1")
+                self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+                self.assertIn("image predates store_backup.py — make up rebuilds it",
+                              run.stdout)
+                self.assertTrue([c for c in calls if "--entrypoint test " in c
+                                 and " -f store_backup.py " in f"{c} "], calls)
+                self.assertFalse([c for c in calls if "--entrypoint python3" in c
+                                  or c.startswith("compose ")], calls)
 
     def test_a_restore_that_left_a_sidecar_does_not_start_the_stack(self):
         for target, prefix in (("restore", "dockade-control"),

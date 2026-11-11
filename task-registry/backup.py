@@ -4,10 +4,10 @@
 store's volume mounted (the Makefile's ``TASKS_TOOL``), never through the service, so
 it works with the registry stopped.
 
-The control plane's twins are ``BACKUP_PY`` and ``RESTORE_PY`` in the Makefile, and
-the reasoning beside them holds here: ``VACUUM INTO`` for a consistent single file from
-a live store, stdout and stdin as the transport, every check before the replace. What
-differs is said where it differs.
+The control plane's twin is ``control-plane/store_backup.py``, and the reasoning in it
+holds here: ``VACUUM INTO`` for a consistent single file from a live store, stdout and
+stdin as the transport, every check before the replace. What differs is said where it
+differs.
 
     python3 backup.py snapshot  > tasks.db     # the store, on stdout
     python3 backup.py restore   < tasks.db     # replace the store with it
@@ -35,7 +35,8 @@ COUNTED = ("repos", "tasks", "notes")
 #: A restore's exit status when the store was replaced and a sidecar of the old one
 #: could not be removed: ``make restore-tasks`` does not start the registry on it.
 #: Its own value, as a refusal and an uncaught error both exit 1. The Makefile's
-#: ``RESTORE_SIDECAR_LEFT`` and ``RESTORE_PY`` give the control plane's the same.
+#: ``RESTORE_SIDECAR_LEFT`` and ``store_backup.SIDECAR_LEFT`` give the control plane's
+#: the same.
 SIDECAR_LEFT = 3
 
 
@@ -125,7 +126,7 @@ def restore(inp: BinaryIO) -> None:
         # The store's directory is sticky, so a store another uid owns cannot be
         # replaced by this one.
         reject(f"could not replace {dst} ({e})")
-    # As RESTORE_PY: a -wal left behind belongs to the store just replaced, and applied
+    # As store_backup.py: a -wal left behind belongs to the store just replaced, and applied
     # over this one corrupts it.
     for side in ("-wal", "-shm"):
         try:

@@ -191,10 +191,15 @@ Measured on Claude Code 2.1.296: `CLAUDE_CODE_SESSION_ID` holds the session's UU
 the session's transcript is named by it, `<id>.jsonl` beside a directory `<id>/` under
 `$CLAUDE_CONFIG_DIR/projects/<workspace slug>/`. A subagent's Bash call sees the same
 value and the same `CLAUDE_PID`, and the subagent's transcript sits under the parent's
-`<id>/subagents/`, so a session and the subagents it starts share one id. `claude
---help` describes `--fork-session` as "When resuming, create a new session ID instead
-of reusing the original", so a plain `--resume` is documented to keep the id. Not
-measured: that resume, or whether `/clear` starts a new id.
+`<id>/subagents/`, so a session and the subagents it starts share one id.
+
+Measured by the operator on 2026-11-11 in the tier-1 sandbox, whose image runs Claude
+Code 2.1.322:
+`/clear` gives the session a new `CLAUDE_CODE_SESSION_ID`, and `--resume <id>` keeps
+it — `echo $CLAUDE_CODE_SESSION_ID` printed the same id before an `/exit` and after
+resuming. That matches `claude --help`, which describes `--fork-session` as "When
+resuming, create a new session ID instead of reusing the original". Not measured:
+`--continue` and the picker form of `--resume`.
 
 ## An MCP server can be declared four ways, and `settings.json` is not one of them
 

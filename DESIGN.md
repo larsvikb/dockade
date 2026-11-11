@@ -2553,7 +2553,7 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | tool audit is joinable — `server`/`tool`/`approval_id` columns; `approval_id` on a card's own rows, and on the calls a pin answered, their outcomes and the pin's revoke, credited to the card that last set the pin | **done** — not on a rule revoke that removes expired pins with it |
 | — | the gateway records how a call ENDED — its own JSONL stream | **done** |
 | — | outcomes ingested — second stream, `status` column, `outcome` in the audit vocabulary | **done** — one approval id now selects the hold, the answer, the claim and the result |
-| — | what a call returned — the body to the gateway's own `tool-content` file, its size, hash and duration to the audit row | **done** — the card's outcome and the facts in the audit view are task 252 |
+| — | what a call returned — the body to the gateway's own `tool-content` file, its size, hash and duration to the audit row | **done** — the card's outcome is task 252 |
 | — | task registry — the store, the agent listener (MCP, behind the gateway's secret), the operator API | **done** |
 | — | task registry as a service — `tasks` behind a profile on `mcp-net` + `tasks-operator-net`, one listener per leg | **done** |
 | — | task registry, agent side — where the id comes from in the image's instructions, dockade's repo name and checkpoints in `CLAUDE.md`, the id in the status line | **done** |

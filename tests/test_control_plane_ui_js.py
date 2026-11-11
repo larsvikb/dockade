@@ -161,7 +161,7 @@ const owner = {
   "app.js": ["lampState", "backoffDelay"],
   "saturation.js": ["capScope", "saturationState", "ackCount"],
   "audit.js": ["auditRow", "repeatCount", "timeWindow", "filterActive", "auditQuery",
-               "eventRow", "historyPager"],
+               "eventRow", "resultFacts", "historyPager"],
   "egress-rules.js": ["revokePreview", "normalizePattern", "createPreview",
                       "editPreview"],
   "mcp.js": ["serverDescriptor", "serverEndpoint", "serverPreset", "serverPreview",
@@ -1082,6 +1082,51 @@ console.log(JSON.stringify({
                                 tool: "create_pull_request",
                                 approval_id: "d".repeat(32) }),
         nothing: m.eventRow(null),
+        // What a tool call returned: size, duration and the whole hash, after the
+        // approval id, or after the `—` of a call policy allowed outright.
+        outcome_facts: m.eventRow({ ts: 1e9, id: 15, kind: "outcome",
+                                    stage: "tool-result", server: "mcp-github",
+                                    tool: "get_me", status: "ok",
+                                    approval_id: "a".repeat(32),
+                                    result_bytes: 1234567, duration: 1.234,
+                                    result_sha256: "e".repeat(64) }),
+        outcome_facts_unapproved: m.eventRow({ ts: 1e9, id: 16, kind: "outcome",
+                                               stage: "tool-result", server: "s",
+                                               tool: "t", status: "ok",
+                                               result_bytes: 0, duration: 0,
+                                               result_sha256: "f".repeat(64) }),
+        // Ingested before the facts existed, or a call that never dialled.
+        outcome_no_facts: m.eventRow({ ts: 1e9, id: 17, kind: "outcome",
+                                       stage: "tool-result", server: "s", tool: "t",
+                                       status: "unreachable",
+                                       approval_id: "a".repeat(32) }),
+        // The search reads the hash on every row, so any row carrying facts shows them.
+        held_facts: m.eventRow({ ts: 1e9, id: 18, kind: "hold", host: "b.example",
+                                 stage: "connect", port: 8443, proto: "connect",
+                                 approval_id: "c".repeat(32), result_bytes: 1,
+                                 duration: 0.004, result_sha256: "9".repeat(64) }),
+        result_facts: {
+          zero: m.resultFacts({ result_bytes: 0 }),
+          one: m.resultFacts({ result_bytes: 1 }),
+          grouped: m.resultFacts({ result_bytes: 1234567 }),
+          // Beyond 2^53 a size is no longer exact, and String() writes 1e+21.
+          unsafe: m.resultFacts({ result_bytes: 2 ** 53 }),
+          huge: m.resultFacts({ result_bytes: 1e21 }),
+          fraction: m.resultFacts({ result_bytes: 1.5 }),
+          tiny: m.resultFacts({ duration: 0.004 }),
+          threshold: m.resultFacts({ duration: 0.01 }),
+          seconds: m.resultFacts({ duration: 12.5 }),
+          none: m.resultFacts({}),
+          nothing: m.resultFacts(null),
+          // Each malformed value, for the size and the duration separately, beside a
+          // good value of the other so a dropped row is not mistaken for a skipped fact.
+          bad_size: [null, "12", NaN, -1, Infinity].map(v =>
+            m.resultFacts({ result_bytes: v, duration: 1 })),
+          bad_duration: [null, "12", NaN, -1, Infinity].map(v =>
+            m.resultFacts({ result_bytes: 5, duration: v })),
+          bad_hash: ["", "   ", 12, null, {}].map(v =>
+            m.resultFacts({ result_bytes: 5, result_sha256: v })),
+        },
         // The shared columns must be IDENTICAL to the folded view's, which is the
         // whole reason eventRow builds on auditRow.
         shares_shaping: (() => {
@@ -1401,6 +1446,31 @@ def _probe() -> dict:
             "importable with NO side effects — everything that touches the DOM runs "
             "from start(), which only a browser calls. node said:\n"
             + proc.stderr)
+    return json.loads(proc.stdout)
+
+
+# `resultFacts` alone, under a locale the caller names: the main probe's other counts
+# (the pager's `4,301`) follow the process locale on purpose, so this runs apart.
+_FACTS_LOCALE_PROBE = r"""
+import { pathToFileURL } from "node:url";
+const m = await import(pathToFileURL(`${process.env.DOCKADE_UI_DIR}/audit.js`).href);
+console.log(JSON.stringify({
+  control: (1234567).toLocaleString(),
+  facts: m.resultFacts({ result_bytes: 1234567 }),
+}));
+"""
+
+
+def _facts_under_locale(locale: str) -> dict:
+    # Only called from PageScriptTests, which already skips (or, strict, fails)
+    # without node.
+    proc = subprocess.run(  # noqa: S603 (absolute path, fixed args)
+        [_NODE, "--input-type=module", "-e", _FACTS_LOCALE_PROBE],
+        # LC_ALL, not LANG: it overrides every other locale variable.
+        env={**os.environ, "DOCKADE_UI_DIR": str(_served_dir()), "LC_ALL": locale},
+        capture_output=True, text=True, timeout=60, check=False)
+    if proc.returncode != 0:
+        raise AssertionError(f"node could not run the audit.js probe:\n{proc.stderr}")
     return json.loads(proc.stdout)
 
 
@@ -3242,10 +3312,10 @@ class PageScriptTests(unittest.TestCase):
         self.assertEqual(e["bare"]["request"], "")
         self.assertEqual(e["nothing"]["request"], "")
 
-    def test_an_event_row_shows_the_approval_id_wherever_it_is_searchable(self):
+    def test_an_event_row_shows_what_it_searches_wherever_it_is_searchable(self):
         """The record view displays what it searches (`audit.EVENT_SEARCH`): the id
-        follows the request parts, after a separator in the string, so a copied row
-        carries it."""
+        and the hash follow the request parts, after a separator in the string, so a
+        copied row carries them."""
         e = self.probe["saturation"]["event_row"]
         card = "c" * 32
         self.assertEqual(e["held_tunnel"]["request"], card)
@@ -3255,6 +3325,60 @@ class PageScriptTests(unittest.TestCase):
         self.assertEqual(withdrawn["stagePrefix"], "tool-withdraw · ")
         self.assertEqual(withdrawn["target"], "mcp-github__create_pull_request")
         self.assertEqual(withdrawn["request"], "d" * 32)
+        # The hash, searched on every row, is shown on every row that carries it.
+        self.assertEqual(e["held_facts"]["request"],
+                         f":8443 · {card} · 1 byte · <0.01 s · sha256 {'9' * 64}")
+
+    def test_an_outcome_row_shows_what_the_call_returned(self):
+        """Size, duration and the WHOLE hash, after the approval id: the hash is the
+        key `make tool-content` reads, so what the search matched is on screen and a
+        copied row carries it."""
+        e = self.probe["saturation"]["event_row"]
+        self.assertEqual(
+            e["outcome_facts"]["request"],
+            f"{'a' * 32} · 1,234,567 bytes · 1.23 s · sha256 {'e' * 64}")
+        # Allowed outright: the `—` still says so, and the facts follow it. Zero is a
+        # size and a duration, not an absence.
+        self.assertEqual(e["outcome_facts_unapproved"]["request"],
+                         f"— · 0 bytes · <0.01 s · sha256 {'f' * 64}")
+        # No facts: the cell is what it was before they existed.
+        self.assertEqual(e["outcome_no_facts"]["request"], "a" * 32)
+
+    def test_result_facts_show_only_values_they_can_show_right(self):
+        """A malformed fact is left out rather than shown wrong: ingest NULLs them
+        already, and this is the second guard."""
+        f = self.probe["saturation"]["event_row"]["result_facts"]
+        self.assertEqual(f["zero"], ["0 bytes"])
+        self.assertEqual(f["one"], ["1 byte"])
+        self.assertEqual(f["grouped"], ["1,234,567 bytes"])
+        # Beyond 2^53 a size is no longer exact, and String() writes `1e+21`.
+        self.assertEqual(f["unsafe"], [])
+        self.assertEqual(f["huge"], [])
+        self.assertEqual(f["fraction"], [])
+        # A threshold, not rounding: toFixed(2) would print `0.00 s`.
+        self.assertEqual(f["tiny"], ["<0.01 s"])
+        self.assertEqual(f["threshold"], ["0.01 s"])
+        self.assertEqual(f["seconds"], ["12.50 s"])
+        self.assertEqual(f["none"], [])
+        self.assertEqual(f["nothing"], [])
+        for i, got in enumerate(f["bad_size"]):
+            with self.subTest(size=i):
+                self.assertEqual(got, ["1.00 s"])
+        for i, got in enumerate(f["bad_duration"]):
+            with self.subTest(duration=i):
+                self.assertEqual(got, ["5 bytes"])
+        for i, got in enumerate(f["bad_hash"]):
+            with self.subTest(hash=i):
+                self.assertEqual(got, ["5 bytes"])
+
+    def test_result_facts_group_the_size_the_same_in_every_locale(self):
+        """Beside `1.23 s`, a German `1.234.567 bytes` would read as a decimal, so the
+        size is grouped with a fixed comma rather than the viewer's locale. Run under
+        de-DE, with the locale's own grouping as the control that it took effect."""
+        got = _facts_under_locale("de_DE.UTF-8")
+        self.assertEqual(got["control"], "1.234.567",
+                         "node did not take the de-DE locale; the test proves nothing")
+        self.assertEqual(got["facts"], ["1,234,567 bytes"])
 
     def test_both_views_shape_their_shared_columns_identically(self):
         """The reason `eventRow` is built ON `auditRow` rather than beside it. The two

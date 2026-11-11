@@ -65,10 +65,13 @@ KINDS = ("allow", "deny", "hold", "revoke", "create", "edit", "observe",
 # where an egress row names a host. ``actor`` is in both as displayed: its cell shows
 # the peer and via-ui fields and holds the whole string in its title (``shortActor``
 # in control-plane-ui/provenance.js), so a match on the User-Agent is one hover away.
+# ``result_sha256`` is in the record view alone, because only its request cell shows
+# the whole hash (``resultFacts`` in control-plane-ui/audit.js): an operator holding
+# the key to a tool call's content file finds the row it came from.
 GROUPED_SEARCH = ("host", "client", "client_class", "actor", "reason",
                   "server", "tool", "status")
 EVENT_SEARCH = ("host", "client", "client_class", "actor", "reason", "method",
-                "url", "server", "tool", "status", "approval_id")
+                "url", "server", "tool", "status", "approval_id", "result_sha256")
 
 # Columns the record view serves. Deliberately the whole row: this is the view the
 # glance defers to, so the fields it drops as noise or as unbounded (``url`` above

@@ -324,13 +324,50 @@ export function eventRow(r) {
     //                     parts and its own separator, because the record view
     //                     searches it on every row (audit.EVENT_SEARCH).
     //   a non-standard port   a tunnel to :8443 is worth seeing where :443 is not.
+    //   what a call returned  its size, duration and whole hash (resultFacts), last
+    //                     and on any row that carries them, for the approval id's
+    //                     reason: the record view searches the hash on every row
+    //                     (audit.EVENT_SEARCH), and it shows what it searches.
     //
     // An outcome with no approval renders `—` rather than blank, because there the
     // absence is the information: policy allowed that call outright.
     request: r && r.kind === AUDIT_OUTCOME
-             ? (approvalId || "—")
-             : [asked, approvalId].filter(Boolean).join(" · "),
+             ? [approvalId || "—", ...resultFacts(r)].join(" · ")
+             : [asked, approvalId, ...resultFacts(r)].filter(Boolean).join(" · "),
   };
+}
+
+// What a tool call returned, as the gateway measured it: size, duration and the
+// whole hash, each only where the row holds a usable value. Anything else is left out
+// rather than shown wrong; ingest already stores a malformed fact as NULL, so this is
+// the second guard, not the first.
+//
+// The hash is whole, not abbreviated, so what the search matched is on screen and a
+// copied row carries the key `make tool-content` finds the body by.
+//
+// The size is grouped with a fixed comma, NOT the viewer's locale as the counts in
+// coverageSummary and historyPager are. Those stand alone in a sentence; this sits
+// beside a duration such as `1.23 s`, where a German `1.234.567 bytes` would read as
+// a decimal. The same reasoning as the dates in ui-common/time.js: a fact in the
+// record must not mean two things depending on who opened the page. Safe integers
+// only, because above 2^53 the number is no longer exact and String() turns it into
+// exponent notation.
+export function resultFacts(r) {
+  const facts = [];
+  const size = r ? r.result_bytes : null;
+  if (Number.isSafeInteger(size) && size >= 0) {
+    const grouped = String(size).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+    facts.push(`${grouped} byte${size === 1 ? "" : "s"}`);
+  }
+  const duration = r ? r.duration : null;
+  if (Number.isFinite(duration) && duration >= 0) {
+    // A threshold, not formatting: toFixed(2) would print 0.004 as `0.00 s`, which
+    // reads as no time at all.
+    facts.push(duration < 0.01 ? "<0.01 s" : `${duration.toFixed(2)} s`);
+  }
+  const hash = r && typeof r.result_sha256 === "string" ? r.result_sha256.trim() : "";
+  if (hash) facts.push(`sha256 ${hash}`);
+  return facts;
 }
 
 // What the record's pager says and which of its buttons work.

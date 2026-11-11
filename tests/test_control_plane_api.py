@@ -2296,6 +2296,22 @@ class AuditFilterTests(_CPTestCase):
                          ["d2e24cc51df24451bbed5591d99e33c1"])
         self.assertEqual(cp.api_views.api_audit(q="d2e24cc5")["rows"], [])
 
+    def test_the_record_finds_an_outcome_by_the_hash_it_shows(self):
+        # The hash is the key to the gateway's content file, so an operator holding one
+        # must be able to find the call it came from. The record view shows it whole;
+        # the glance shows no hash, so there it must not match.
+        found, other = "7f3a91c0" + "1" * 56, "b40e2d58" + "2" * 56
+        _write_audit(
+            {"kind": "outcome", "stage": "tool-result", "server": "mcp-github",
+             "tool": "get_me", "status": "ok", "result_bytes": 120,
+             "result_sha256": found, "duration": 0.4, "ts": 1.0},
+            {"kind": "outcome", "stage": "tool-result", "server": "mcp-github",
+             "tool": "get_me", "status": "ok", "result_bytes": 98,
+             "result_sha256": other, "duration": 0.3, "ts": 2.0})
+        rows = cp.api_views.api_audit_events(q="7f3a91c0")["rows"]
+        self.assertEqual([r["result_sha256"] for r in rows], [found])
+        self.assertEqual(cp.api_views.api_audit(q="7f3a91c0")["rows"], [])
+
     def test_search_is_a_literal_substring_not_a_like_pattern(self):
         # Unescaped, `%` matches every row and `_` matches any character — so the
         # search box would stop meaning "contains this text" for exactly the inputs an

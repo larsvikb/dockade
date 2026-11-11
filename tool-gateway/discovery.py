@@ -660,7 +660,8 @@ def reconcile_all(roster: list[dict]) -> list[dict]:
     Each server under its own guard, so one that raises something ``reconcile`` did
     not foresee reads NOT ENUMERATED, as a failed dial does, and the rest are still
     published and pushed. Broad because it backstops inputs nobody has listed, such as
-    a reply too deeply nested for ``json.loads``. Never silent, since the exception's
+    the RecursionError ``json.loads`` can raise on a deeply nested reply, at a depth
+    that depends on the Python build. Never silent, since the exception's
     type is in the status every report prints and every push carries — and so is its
     message, which is why an input whose exception would quote a secret (a header
     value http.client refuses) is refused before the dial instead (``auth_header``).

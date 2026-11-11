@@ -744,16 +744,16 @@ class ReconcileTests(unittest.TestCase):
         good = {**ENTRY, "server": "mcp-good"}
         raising = {**ENTRY, "server": "mcp-raises"}
         deep = {**ENTRY, "server": "mcp-deep"}
-        replies = {
-            "mcp-good": sse({"tools": [{"name": "get_issue"}]}),
-            # Too deep for json.loads, which raises RecursionError, not ValueError.
-            "mcp-deep": "[" * 100_000 + "]" * 100_000,
-        }
-
         def post(entry, *_a, **_k):
             if entry["server"] == "mcp-raises":
                 raise RuntimeError("something nobody listed")
-            return replies[entry["server"]]
+            if entry["server"] == "mcp-deep":
+                # What json.loads raises on a reply nested too deep for it. Raised
+                # here rather than provoked, because the depth at which json.loads
+                # raises depends on the Python build, and the guard's job is to catch
+                # it whatever raises it.
+                raise RecursionError("maximum recursion depth exceeded")
+            return sse({"tools": [{"name": "get_issue"}]})
         self.discovery.post = post
         results = self.discovery.reconcile_all([raising, good, deep])
         by_server = {result["server"]: result for result in results}

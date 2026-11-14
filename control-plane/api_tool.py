@@ -24,6 +24,7 @@ from __future__ import annotations
 from typing import Any
 
 import holds
+import ingest
 import inventory
 import policy
 import provenance
@@ -124,6 +125,11 @@ def tool_authorize(req: ToolCallRequest) -> dict:
                      approval_id=pin_card,
                      reason=f"{tool or '(no tool)'} on {server or '(no server)'}: "
                             f"{reason}")
+        if decision == "allow":
+            # The gateway writes how an allowed call ended, so its stream owes a line
+            # (``ingest._check_growth``). After the row, not in a ``finally``: a 500
+            # is an answer the gateway never acts on, and so never records.
+            ingest._expect_line(ingest.TOOL_STREAM.name)
         answer = {"decision": decision, "reason": reason}
         return answer if call_token is None else {**answer, "call_token": call_token}
 
@@ -331,6 +337,8 @@ def tool_claim(resume_token: str, req: ToolResumeRequest) -> JSONResponse:
                  reason=f"approved tool ask {approval_id} claimed for execution; "
                         f"{claimed['tool']} on {claimed['server']} — single-use, this "
                         f"claim is the only one that can run it")
+    # The call this releases ends in an outcome line, as an allowed one does.
+    ingest._expect_line(ingest.TOOL_STREAM.name)
     return JSONResponse({"ok": True, "status": claimed["status"],
                          "server": claimed["server"], "tool": claimed["tool"],
                          # The canonical string, not re-parsed JSON: it is what the

@@ -1521,6 +1521,33 @@ class OutcomeStreamWiringTests(unittest.TestCase):
                         f"{written} is outside the mounted volume, so records would "
                         f"not survive the container")
 
+    def test_the_tool_stall_grace_outlasts_the_longest_call(self):
+        # A tool line is written when the call ENDS, and a call may run for the
+        # gateway's call timeout: a grace shorter than that reports a slow call as a
+        # stalled file. Two images, no compiler, so the timeout is read from the
+        # gateway's default and compose's override, and the grace from ingest's source.
+        source = (ROOT / "tool-gateway" / "execute.py").read_text()
+        found = re.search(r'^CALL_TIMEOUT = float\(os\.environ\.get\("GATEWAY_CALL_TIMEOUT"'
+                          r', "([0-9.]+)"\)\)', source, re.M)
+        self.assertIsNotNone(found, "execute.CALL_TIMEOUT moved or changed form")
+        timeout = float(found.group(1))
+        override = _environment_of("tool-gateway").get("GATEWAY_CALL_TIMEOUT")
+        if override is not None:
+            default = re.fullmatch(r"\$\{[A-Z_]+:-([^}]*)\}", override)
+            timeout = float(default.group(1) if default else override)
+        namespace: dict = {}
+        for node in ast.parse((ROOT / "control-plane" / "ingest.py").read_text()).body:
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                    and getattr(node.targets[0], "id", None) in ("STALL_GRACE",
+                                                                 "TOOL_STALL_GRACE")):
+                exec(compile(ast.Module([node], []), "ingest.py", "exec"),  # noqa: S102
+                     namespace)
+        namespace.pop("__builtins__", None)
+        self.assertEqual(set(namespace), {"STALL_GRACE", "TOOL_STALL_GRACE"},
+                         "ingest's stall graces moved or changed form")
+        self.assertGreaterEqual(namespace["TOOL_STALL_GRACE"],
+                                timeout + namespace["STALL_GRACE"])
+
     def test_the_gateways_image_creates_the_directory(self):
         # A fresh named volume inherits ownership and mode from the image path it
         # covers. Without this the volume is root-owned, and compose runs this service

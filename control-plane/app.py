@@ -28,7 +28,8 @@ reader can see which one is being asked:
   - ``policy``  — what a rule pattern matches, and what a host decides to.
   - ``holds``   — the in-process registry a blocked request waits on, its caps
     and its duplicate grouping.
-  - ``ingest``  — draining the egress proxy's own audit file into the store.
+  - ``ingest``  — draining the egress proxy's and the MCP gateway's own audit files
+    into the store, and watching both for a writer that stopped.
   - ``inventory`` — what each MCP server last said it exposes, held in memory.
 
 They import in that order and never back. The ``api_*`` modules import them and
@@ -443,15 +444,16 @@ async def main() -> None:
           f"management on {MANAGE_BIND}:{MANAGE_PORT}", flush=True)
 
     # A task on this loop, not a lifespan hook, as with _bootstrap: it belongs to the
-    # PROCESS. The reference is held because asyncio keeps only a weak one, and an
-    # unreferenced task can be collected mid-flight, stopping ingest with no error.
+    # PROCESS. The supervisor holds it and restarts it if it dies.
     drain = None
     if ingest.DRAIN_INTERVAL > 0:
-        drain = asyncio.create_task(ingest._audit_drain_loop())
+        drain = ingest._DrainSupervisor()
+        drain.start()
     else:
         print("control-plane: audit ingest DISABLED "
               "(CONTROL_AUDIT_DRAIN_INTERVAL=0); locally-decided egress will "
-              "appear only in the proxy's own log", flush=True)
+              "appear only in the proxy's own log, and how tool calls ended only in "
+              "the gateway's", flush=True)
 
     # One process means one set of signal handlers, and SIGTERM must stop ALL the
     # servers, or `docker compose down` waits out the grace period and SIGKILLs the
@@ -477,7 +479,7 @@ async def main() -> None:
         await asyncio.gather(*(s.serve() for s in servers))
     finally:
         if drain is not None:
-            drain.cancel()
+            drain.stop()
 
 
 if __name__ == "__main__":

@@ -772,12 +772,24 @@ sc_wait_healthy() {
 # ---------------------------------------------------------------------------
 # Governed egress  ->  sets SC_PROXY_ENV_ARGS (array), SC_EGRESS_DESC, SC_TOOLS_DESC
 # ---------------------------------------------------------------------------
-# sc_governed_egress <net>
+# sc_governed_egress <net> [model-host ...]
 #
 # How a governed tier reaches the data plane on <net>: the egress proxy, and in
 # governed mode the tool gateway. Run it after sc_ensure_network, which decides
 # whether <net> may be the standalone fallback; whether a tier calls this at all
 # stays in its launcher.
+#
+# The model hosts are the tier's own inference endpoints, each a plain DNS name
+# with at least one dot (no scheme, port, IP literal or wildcard: what the proxy is
+# CONNECTed to on 443). A dotless name is refused too: localhost and the proxy's own
+# name are in NO_PROXY, so a probe of one would go direct and never test the proxy.
+# On the governed branch a non-empty list reaches the container as one
+# SANDBOX_MODEL_HOSTS, space-separated, and boundary-check.sh asserts each answers
+# through the proxy; standalone mode has no proxy to assert it through, so passes
+# nothing. A tier names its hosts here, as a value, rather than forking the check.
+# Claude's launcher names none: api.anthropic.com is the lifeline boundary-check.sh
+# already probes for every cloud tier. Any other shape is refused before docker is
+# asked anything, in either mode.
 #
 # Discover the egress proxy on <net> (started by compose). Present -> governed
 # egress: route the sandbox's HTTP(S) through it (HTTPS_PROXY) and allowlist it in
@@ -792,9 +804,21 @@ sc_wait_healthy() {
 # shellcheck disable=SC2034  # the descriptions are consumed by the sourcing launcher
 sc_governed_egress() {
     local net="$1"
+    shift
     local proxy_name="${EGRESS_PROXY_NAME:-egress-proxy}"
     local proxy_port="${EGRESS_PROXY_PORT:-8080}"
     local proxy_ip gateway_name gateway_port gateway_ip proxy_url no_proxy_list
+    local label='[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?' model_host model_hosts=""
+    for model_host in "$@"; do
+        # The second test refuses a dotted quad, which the first reads as labels:
+        # no top-level domain is all digits.
+        if ! [[ "$model_host" =~ ^($label\.)+$label$ ]] || [[ "$model_host" =~ (^|\.)[0-9]+$ ]]; then
+            echo "ERROR: model host '$model_host' is not a plain DNS name." >&2
+            echo "       Name the host alone, with its domain: no scheme, port, IP literal or wildcard." >&2
+            exit 1
+        fi
+        model_hosts="${model_hosts:+$model_hosts }$model_host"
+    done
     proxy_ip="$(sc_service_ip "$proxy_name" "$net")"
 
     SC_PROXY_ENV_ARGS=()
@@ -862,6 +886,9 @@ sc_governed_egress() {
             -e "EGRESS_PROXY_IP=$proxy_ip"
             -e "EGRESS_PROXY_PORT=$proxy_port"
         )
+        if [ -n "$model_hosts" ]; then
+            SC_PROXY_ENV_ARGS+=(-e "SANDBOX_MODEL_HOSTS=$model_hosts")
+        fi
         SC_EGRESS_DESC="governed via $proxy_name ($proxy_ip:$proxy_port)"
 
         if [[ "$gateway_ip" =~ ^[0-9.]+$ ]]; then

@@ -45,6 +45,8 @@ import unittest
 from pathlib import Path
 from typing import NamedTuple
 
+from test_launcher_run_flags import launchers
+
 ROOT = Path(__file__).resolve().parents[1]
 LIB = ROOT / "sandbox-lib.sh"
 
@@ -207,7 +209,7 @@ exit 0
 """
 
 _EGRESS_HARNESS = (
-    'set -euo pipefail; source "$1"; sc_governed_egress "$2"; '
+    'set -euo pipefail; source "$1"; shift; sc_governed_egress "$@"; '
     'for a in ${SC_PROXY_ENV_ARGS[@]+"${SC_PROXY_ENV_ARGS[@]}"}; do '
     'printf "ARG %s\\n" "$a"; done; '
     'printf "EGRESS %s\\nTOOLS %s\\n" "$SC_EGRESS_DESC" "$SC_TOOLS_DESC"')
@@ -246,8 +248,10 @@ _NET = "widgets-net"
 
 
 def _governed_egress(*, ips: dict[str, str], internal: bool,
-                     overrides: dict[str, str] | None = None) -> _EgressRun:
-    """Run ``sc_governed_egress`` on _NET with these containers on it."""
+                     overrides: dict[str, str] | None = None,
+                     hosts: tuple[str, ...] = ()) -> _EgressRun:
+    """Run ``sc_governed_egress`` on _NET with these containers on it, naming
+    ``hosts`` as the tier's model hosts."""
     with tempfile.TemporaryDirectory() as tmp:
         stub = Path(tmp) / "docker"
         stub.write_text(_EGRESS_STUB)
@@ -266,7 +270,7 @@ def _governed_egress(*, ips: dict[str, str], internal: bool,
         env.update({f"STUB_IP_{name.replace('-', '_')}": ip for name, ip in ips.items()})
         env.update(overrides or {})
         proc = subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
-            [_BASH, "-c", _EGRESS_HARNESS, "sc_governed_egress", str(LIB), _NET],
+            [_BASH, "-c", _EGRESS_HARNESS, "sc_governed_egress", str(LIB), _NET, *hosts],
             capture_output=True, text=True, env=env, timeout=60)
         return _EgressRun(proc.returncode, proc.stdout, proc.stderr,
                           log.read_text().splitlines())
@@ -339,6 +343,43 @@ class GovernedEgressTests(unittest.TestCase):
             f"DIRECT (no egress proxy on {_NET}; firewall only, no audit)")
         self.assertEqual(run.line("TOOLS"), "NONE (standalone mode has no governed tool path)")
 
+    def test_model_hosts_reach_the_container_as_one_space_joined_variable(self):
+        ips = {"egress-proxy": _PROXY, "tool-gateway": _GATEWAY}
+        run = _governed_egress(ips=ips, internal=True,
+                               hosts=("api.widgets.example", "auth.widgets.example"))
+        self.assertEqual(run.status, 0, run.stderr)
+        args = [ln[4:] for ln in run.stdout.splitlines() if ln.startswith("ARG ")]
+        self.assertEqual([a for a in args if a.startswith("SANDBOX_MODEL_HOSTS=")],
+                         ["SANDBOX_MODEL_HOSTS=api.widgets.example auth.widgets.example"])
+        # Everything else is what a launch naming no hosts gets.
+        bare = _governed_egress(ips=ips, internal=True)
+        self.assertNotIn("SANDBOX_MODEL_HOSTS", bare.env())
+        with_hosts = run.env()
+        del with_hosts["SANDBOX_MODEL_HOSTS"]
+        self.assertEqual(with_hosts, bare.env())
+        self.assertEqual(run.docker_calls, bare.docker_calls)
+
+    def test_standalone_mode_passes_no_model_hosts(self):
+        # No proxy to probe them through, so nothing to hand boundary-check.sh.
+        run = _governed_egress(ips={}, internal=False, hosts=("api.widgets.example",))
+        self.assertEqual(run.status, 0, run.stderr)
+        self.assertEqual(
+            [ln for ln in run.stdout.splitlines() if ln.startswith("ARG ")], [])
+
+    def test_a_model_host_that_is_not_a_plain_dns_name_is_refused_before_docker(self):
+        modes = {"governed": ({"egress-proxy": _PROXY}, True), "standalone": ({}, False)}
+        for bad in ("https://api.widgets.example", "api.widgets.example:443",
+                    "*.widgets.example", "192.0.2.10", "[2001:db8::1]",
+                    "api.widgets.example/v1", "-api.widgets.example", "",
+                    "localhost", "egress-proxy"):
+            for mode, (ips, internal) in modes.items():
+                with self.subTest(host=bad, mode=mode):
+                    run = _governed_egress(ips=ips, internal=internal,
+                                           hosts=("api.widgets.example", bad))
+                    self.assertEqual(run.status, 1, run.stderr)
+                    self.assertIn(f"model host '{bad}' is not a plain DNS name", run.stderr)
+                    self.assertEqual(run.docker_calls, [])
+
     def test_the_name_and_port_overrides_are_honoured(self):
         run = _governed_egress(
             ips={"ep2": _PROXY, "tg2": _GATEWAY}, internal=True,
@@ -403,6 +444,8 @@ class LauncherProxyEnvTests(unittest.TestCase):
                      f"TOOL_GATEWAY_IP={_GATEWAY}", "TOOL_GATEWAY_PORT=8100"):
             with self.subTest(pair=pair):
                 self.assertIn(pair, passed)
+        # Claude's model host is the lifeline boundary-check.sh already probes.
+        self.assertFalse([p for p in passed if p.startswith("SANDBOX_MODEL_HOSTS=")])
         self.assertIn(f"Egress:    governed via egress-proxy ({_PROXY}:8080)", proc.stdout)
         self.assertIn(f"Tools:     governed via tool-gateway ({_GATEWAY}:8100)", proc.stdout)
 
@@ -1223,7 +1266,7 @@ class JdkVariantTests(unittest.TestCase):
                 self.assertEqual(run.docker_calls, [])
 
 
-_LAUNCHERS = ("run-claude-sandbox.sh", "run-opencode-sandbox.sh")
+_LAUNCHERS = tuple(p.name for p in launchers(ROOT))
 
 # Logs and fails every call: the launchers below must never get as far as docker.
 _FAILING_DOCKER_STUB = '#!/bin/bash\nprintf \'%s\\n\' "$*" >> "$STUB_LOG"\nexit 1\n'
@@ -1231,7 +1274,7 @@ _FAILING_DOCKER_STUB = '#!/bin/bash\nprintf \'%s\\n\' "$*" >> "$STUB_LOG"\nexit 
 
 @unittest.skipUnless(_BASH or _STRICT, "bash is not installed")
 class LauncherCdpathTests(unittest.TestCase):
-    """Both launchers, run up to the workspace guard with CDPATH exported.
+    """Every launcher, run up to the workspace guard with CDPATH exported.
 
     The decoy holds every relative name the launch uses, so a plain ``cd`` anywhere on
     the way lands in it and prints it: the guard then gets a two-line path, or the

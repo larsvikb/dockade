@@ -45,6 +45,8 @@ import unittest
 from pathlib import Path
 from typing import NamedTuple
 
+from test_launcher_run_flags import launchers
+
 ROOT = Path(__file__).resolve().parents[1]
 LIB = ROOT / "sandbox-lib.sh"
 
@@ -1264,7 +1266,7 @@ class JdkVariantTests(unittest.TestCase):
                 self.assertEqual(run.docker_calls, [])
 
 
-_LAUNCHERS = ("run-claude-sandbox.sh", "run-opencode-sandbox.sh")
+_LAUNCHERS = tuple(p.name for p in launchers(ROOT))
 
 # Logs and fails every call: the launchers below must never get as far as docker.
 _FAILING_DOCKER_STUB = '#!/bin/bash\nprintf \'%s\\n\' "$*" >> "$STUB_LOG"\nexit 1\n'
@@ -1272,7 +1274,7 @@ _FAILING_DOCKER_STUB = '#!/bin/bash\nprintf \'%s\\n\' "$*" >> "$STUB_LOG"\nexit 
 
 @unittest.skipUnless(_BASH or _STRICT, "bash is not installed")
 class LauncherCdpathTests(unittest.TestCase):
-    """Both launchers, run up to the workspace guard with CDPATH exported.
+    """Every launcher, run up to the workspace guard with CDPATH exported.
 
     The decoy holds every relative name the launch uses, so a plain ``cd`` anywhere on
     the way lands in it and prints it: the guard then gets a two-line path, or the

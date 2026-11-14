@@ -15,7 +15,7 @@ export function start() {
   mountTasks();
   // `visibilityState` is absent in some non-browser hosts; unknown counts as visible.
   const visible = () => document.visibilityState !== "hidden";
-  // The inbox, the task list and the task read beside it, in turn, so a registry that
+  // The inbox, the task list and the open task, in turn, so a registry that
   // stopped meanwhile costs one failed call, not three.
   const readRegistry = () =>
     refreshInbox().then(() => refreshTasks()).then(() => refreshOpenTask());

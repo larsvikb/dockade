@@ -142,7 +142,7 @@ const CRLF = { ...UNPLANNED, id: 12, title: "Line ends", state: "open", blocked:
                severity: "medium", kind: "finding", revision: 5, claim,
                body: "First line.\r\nSecond line.\r\n" };
 
-const PLANS = { 1: [OLDER_PLAN], 3: [PLAN, OLDER_PLAN], 5: [PLAN],
+let PLANS = { 1: [OLDER_PLAN], 3: [PLAN, OLDER_PLAN], 5: [PLAN],
                 6: [PLAN, OLDER_PLAN], 8: [PLAN], 9: [DECIDED_PLANS[4]],
                 10: [DECIDED_PLANS[5]], 11: [FRESH_PLAN] };
 
@@ -201,7 +201,7 @@ function refinedHistory(created, plan = PLAN) {
   ];
 }
 
-const HISTORIES = {
+let HISTORIES = {
   1: [entry("operator", "create", NOW - 90000, { title: "Plain one", state: "proposed" }),
       entry("claude-3f2a9c1e", "send_back", NOW - 76000,
             { revision: 6, note: null, note_id: null })],
@@ -284,7 +284,7 @@ const UNREACHABLE = { ok: false, current: null,
 // The tasks the steps write to: copies, moved as the operator API would move them
 // (task-registry/operator_moves.py), each write recorded in their history, so a read
 // after a write shows it.
-const WRITTEN = { 3: { ...TASK, notes: [...TASK.notes] },
+let WRITTEN = { 3: { ...TASK, notes: [...TASK.notes] },
                   6: { ...REFINED, notes: [ON_REFINED] },
                   8: { ...SECOND, notes: [ON_SECOND] },
                   9: { ...DECIDED, notes: [] },
@@ -294,7 +294,7 @@ let nextNote = 20;
 
 // Every note a move can name, by id: the ones the timelines carry, so a hide or a
 // handle shows wherever the note is drawn.
-const NOTES = new Map([STARTED, HIDDEN, ANSWER, ASKED, BLOCKED, ON_REFINED, ON_SECOND,
+let NOTES = new Map([STARTED, HIDDEN, ANSWER, ASKED, BLOCKED, ON_REFINED, ON_SECOND,
                        ON_PARKED].map(n => [n.id, n]));
 
 // The flagged list, as `operator_moves.notes_for_operator` reads it: visible notes for
@@ -317,7 +317,7 @@ export function flagElsewhere() {
   NOTES.set(id, note);
   WRITTEN[8].notes.push(note);
   HISTORIES[8].push(noteEntry(note));
-  ON_SECOND.handled = true;
+  NOTES.get(ON_SECOND.id).handled = true;
   HISTORIES[8].push(entry("operator", "handle_note", NOW,
                           { note_id: ON_SECOND.id, handled: true, reply: null,
                             reply_id: null, actor: null }));
@@ -527,7 +527,9 @@ function lost(answer) {
             + "it may have landed" } };
 }
 
-const READ = { 1: SENT_BACK, 2: UNPLANNED, 5: LANDING, 7: PARKED };
+let READ = { 1: SENT_BACK, 2: UNPLANNED, 5: LANDING, 7: PARKED };
+// A task whose read the registry fails, as an error it did not mean would.
+const FAILING = "13";
 
 // The inbox as `operator_moves.inbox` has it after a step moved a task: a deferred or
 // closed task is nobody's turn, so it is in no section.
@@ -552,8 +554,15 @@ export function respond(method, path, body, params) {
   if (method === "POST") return write(path, body);
   if (method !== "GET") return null;
   const [, id, what] = path.match(/^\/api\/tasks\/(\d+)(?:\/(history|plans))?$/) || [];
+  if (id === FAILING && !what) {
+    return { status: 500, json: { ok: false, current: null, detail: "internal error" } };
+  }
   if (id && !what && (WRITTEN[id] || READ[id])) {
     return { status: 200, json: WRITTEN[id] || READ[id] };
+  }
+  // A task the registry has not got, in the operator API's shape for it.
+  if (id && !what) {
+    return { status: 404, json: { ok: false, current: null, detail: `no task ${id}` } };
   }
   if (what === "history" && HISTORIES[id]) {
     return { status: 200, json: historyPage(id, params) };
@@ -573,4 +582,17 @@ export function respond(method, path, body, params) {
   if (path === "/api/inbox") return { status: 200, json: inboxNow() };
   if (path === "/api/notes/flagged") return { status: 200, json: flaggedPage(params) };
   return null;
+}
+
+// tasks.test.js's, never the scenario's: each test starts from `reset()`, the tasks,
+// histories, notes and plans as this module first built them, the registry up and no
+// answer to lose. One clone of them all, so a note a task, a history and the flagged
+// list share stays one note. ui-diff never calls it, so a step's writes still carry to
+// the next there.
+const START = structuredClone({ WRITTEN, HISTORIES, NOTES, PLANS, READ, nextNote,
+                                nextEntry });
+export function reset() {
+  ({ WRITTEN, HISTORIES, NOTES, PLANS, READ, nextNote, nextEntry } = structuredClone(START));
+  registryUp = true;
+  loseNext = false;
 }

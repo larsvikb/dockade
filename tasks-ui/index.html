@@ -23,7 +23,10 @@
     display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
   header h1 { font-size: 16px; margin: 0; font-weight: 600; }
   header .sub { color: var(--dim); font-size: 12px; }
-  main { padding: 20px; max-width: 1440px; margin: 0 auto; }
+  /* The list is capped and centred; an open task takes the window's width, less
+     main's margin. */
+  main { padding: 20px; }
+  #tasks-down, #list-view { max-width: 1400px; margin: 0 auto; }
   h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
     color: var(--dim); margin: 4px 0 10px; }
   h2 .note { text-transform: none; letter-spacing: 0; font-weight: 400; }
@@ -71,17 +74,21 @@
   .prose { white-space: pre-wrap; word-break: break-word; }
   .task-body { margin: 10px 0; padding: 8px; background: var(--bg);
     border: 1px solid var(--line); border-radius: 6px; max-height: 50vh; overflow: auto; }
-  /* The list, and the task read beside it once one is open: the detail keeps its
-     place while the list scrolls. One column on a narrow window, the task below. */
-  .panes { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px;
-    align-items: start; }
-  .panes.reading { grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); }
-  @media (max-width: 960px) {
-    .panes.reading { grid-template-columns: minmax(0, 1fr); }
-  }
+  /* The list or one task, never both; the page scrolls, not a pane. Atop the task a
+     strip kept in view at any scroll, its back control first, with room for more; the
+     line that says the task changed sticks under it. */
+  .task-strip { position: sticky; top: 0; z-index: 2; height: 44px; display: flex;
+    align-items: center; gap: 8px; background: var(--bg); }
+  #task-back { font-size: 13px; padding: 4px 12px; }
   #task-detail { padding: 10px 12px; background: var(--panel);
-    border: 1px solid var(--line); border-radius: 8px;
-    position: sticky; top: 12px; max-height: calc(100vh - 24px); overflow: auto; }
+    border: 1px solid var(--line); border-radius: 8px; }
+  /* A row opens its task on a click anywhere but its controls. */
+  #list-view tbody tr:has(button[data-task]) { cursor: pointer; }
+  #list-view td.pick { cursor: default; }
+  /* The line saying the hash named no task the page could open: in view on a list
+     that came back scrolled. */
+  #list-notice { word-break: break-word; position: sticky; top: 0; z-index: 1;
+    background: var(--bg); }
   .views { display: flex; gap: 6px; margin: 4px 0 14px; }
   .views button[aria-pressed="true"] { border-color: var(--accent); }
   .views .note { font-size: 12px; }
@@ -99,12 +106,12 @@
   ins { text-decoration: underline; background: rgba(46, 160, 67, .2); }
   del { text-decoration: line-through; background: rgba(209, 36, 47, .2); }
   /* The line atop the task read that says it changed since: one line high whether it
-     says anything or not, so filling it moves nothing, and kept in view, opaque, once
-     it does. */
+     says anything or not, so filling it moves nothing, and kept in view, opaque, under
+     the strip once it does. */
   .notice-slot { height: 28px; display: flex; align-items: center; gap: 8px;
     white-space: nowrap; overflow: hidden; }
   .notice-slot > span { overflow: hidden; text-overflow: ellipsis; }
-  .notice-slot:not(:empty) { position: sticky; top: 0; z-index: 1;
+  .notice-slot:not(:empty) { position: sticky; top: 44px; z-index: 1;
     background: var(--panel); border-bottom: 1px solid var(--line); }
   .notice-slot.warn { color: var(--hold); }
   details > summary { cursor: pointer; }
@@ -187,69 +194,78 @@
        rather than an error: tasks.js fills this line, and the poll asks again. -->
   <div class="empty" id="tasks-down" hidden></div>
   <div id="tasks-up" hidden>
-    <div class="empty">
-      The work list agent sessions and you share, read from the task registry. Every
-      title, body and note here was written by an agent or for one; a character that
-      would render as nothing, or reorder the text around it, is spelled out.
-    </div>
-    <!-- Two views of one list pane; the task read beside it stays as the view changes.
-         The URL's hash names both (parseHash in tasks.js). -->
-    <nav class="views" aria-label="Views">
-      <button type="button" id="view-inbox" aria-pressed="true">Inbox
-        <span class="note" id="inboxcount"></span></button>
-      <button type="button" id="view-all" aria-pressed="false">All tasks</button>
-    </nav>
-    <div class="panes" id="panes">
-      <div class="list-pane">
-        <section id="inbox-view">
-          <!-- The notes flagged for you, to handle together: above the sections the
-               poll redraws, its rows in a box of one height, and redrawn only on a
-               read you asked for or a write's (readFlagged), so neither moves the
-               other. The count line keeps its space whatever it says. -->
-          <div id="flagged">
-            <h2>Notes for you</h2>
-            <div class="flagged-line" id="flagged-line"></div>
-            <div class="flagged-rows">
-              <table><tbody id="flagged-notes"></tbody></table>
-              <div class="empty" id="flagged-empty"></div>
-            </div>
-            <div class="moves flagged-controls">
-              <button type="button" id="flagged-all"
-                      data-flagged="all">select all shown</button>
-              <button type="button" id="flagged-handle"
-                      data-flagged="handle">handle selected (0)</button>
-              <span class="flagged-left-out" id="flagged-left-out"></span>
-            </div>
-            <div class="flagged-outcome empty" id="flagged-outcome"></div>
-          </div>
-          <!-- Filled from the registry's inbox, a section at a time (renderInbox). -->
-          <div id="inbox"></div>
-          <div class="empty" id="inbox-empty" hidden></div>
-        </section>
-        <section id="all-view" hidden>
-          <h2>Tasks <span class="note" id="taskcount"></span></h2>
-          <!-- Plain controls, as the audit filter bar is: they narrow what is shown. The
-               state options are filled from TASK_STATES in moves.js. -->
-          <div class="filters" role="search">
-            <select id="tasks-repo" aria-label="Repo"></select>
-            <select id="tasks-state" aria-label="State"></select>
-            <input type="search" id="tasks-search" autocomplete="off" spellcheck="false"
-                   placeholder="search titles, bodies and notes in every state"
-                   aria-label="Search tasks">
-          </div>
-          <table>
-            <thead><tr><th>task</th><th>title</th><th>state</th><th>severity · kind</th>
-              <th>held by</th><th>notes</th></tr></thead>
-            <tbody id="tasks"></tbody>
-          </table>
-          <div class="empty" id="tasks-empty" hidden></div>
-          <div class="pager">
-            <button type="button" id="tasks-newest" hidden>&larr; newest</button>
-            <button type="button" id="tasks-older" hidden>older &rarr;</button>
-          </div>
-        </section>
+    <!-- The list or one task, never both, at every width: the list stays in the DOM
+         while a task is open, hidden, so it comes back as it was left. The URL's hash
+         names the view and the task (parseHash in tasks.js). -->
+    <div id="list-view">
+      <div class="empty">
+        The work list agent sessions and you share, read from the task registry. Every
+        title, body and note here was written by an agent or for one; a character that
+        would render as nothing, or reorder the text around it, is spelled out.
       </div>
-      <div id="task-detail" hidden></div>
+      <!-- Says when the hash named a task the page could not open (sayOnList). -->
+      <div class="empty warn" id="list-notice" hidden></div>
+      <nav class="views" aria-label="Views">
+        <button type="button" id="view-inbox" aria-pressed="true">Inbox
+          <span class="note" id="inboxcount"></span></button>
+        <button type="button" id="view-all" aria-pressed="false">All tasks</button>
+      </nav>
+      <section id="inbox-view">
+        <!-- The notes flagged for you, to handle together: above the sections the
+             poll redraws, its rows in a box of one height, and redrawn only on a
+             read you asked for or a write's (readFlagged), so neither moves the
+             other. The count line keeps its space whatever it says. -->
+        <div id="flagged">
+          <h2>Notes for you</h2>
+          <div class="flagged-line" id="flagged-line"></div>
+          <div class="flagged-rows">
+            <table><tbody id="flagged-notes"></tbody></table>
+            <div class="empty" id="flagged-empty"></div>
+          </div>
+          <div class="moves flagged-controls">
+            <button type="button" id="flagged-all"
+                    data-flagged="all">select all shown</button>
+            <button type="button" id="flagged-handle"
+                    data-flagged="handle">handle selected (0)</button>
+            <span class="flagged-left-out" id="flagged-left-out"></span>
+          </div>
+          <div class="flagged-outcome empty" id="flagged-outcome"></div>
+        </div>
+        <!-- Filled from the registry's inbox, a section at a time (renderInbox). -->
+        <div id="inbox"></div>
+        <div class="empty" id="inbox-empty" hidden></div>
+      </section>
+      <section id="all-view" hidden>
+        <h2>Tasks <span class="note" id="taskcount"></span></h2>
+        <!-- Plain controls, as the audit filter bar is: they narrow what is shown. The
+             state options are filled from TASK_STATES in moves.js. -->
+        <div class="filters" role="search">
+          <select id="tasks-repo" aria-label="Repo"></select>
+          <select id="tasks-state" aria-label="State"></select>
+          <input type="search" id="tasks-search" autocomplete="off" spellcheck="false"
+                 placeholder="search titles, bodies and notes in every state"
+                 aria-label="Search tasks">
+        </div>
+        <table>
+          <thead><tr><th>task</th><th>title</th><th>state</th><th>severity · kind</th>
+            <th>held by</th><th>notes</th></tr></thead>
+          <tbody id="tasks"></tbody>
+        </table>
+        <div class="empty" id="tasks-empty" hidden></div>
+        <div class="pager">
+          <button type="button" id="tasks-newest" hidden>&larr; newest</button>
+          <button type="button" id="tasks-older" hidden>older &rarr;</button>
+        </div>
+      </section>
+    </div>
+    <!-- An open task, the window's width. The strip and its back control are markup,
+         not drawn, so the way back is there when a read fails. -->
+    <div id="task-view" hidden>
+      <div class="task-strip">
+        <button type="button" id="task-back"
+                title="back to the list, where it was (Esc)">&larr; Inbox</button>
+      </div>
+      <div id="task-detail"></div>
     </div>
   </div>
 </main>

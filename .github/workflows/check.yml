@@ -13,9 +13,11 @@
 # Split into three jobs on purpose. `checks` finishes in about a minute; `build`
 # compiles every image, two of which are Debian-based sandbox tiers that apt-install
 # a whole toolchain. Running them in parallel means a shellcheck typo is not queued
-# behind a ten-minute image build. `ui-e2e` runs the approval page in a headless
-# browser against expected values (`make ui-test`), which `checks` leaves out because
-# `make test` is browser-free by decision (control-plane-ui/DESIGN.md).
+# behind a ten-minute image build. `ui-e2e` runs the approval page and the tasks page
+# in a headless browser against expected values (`make ui-test`), which `checks` leaves
+# out because `make test` is browser-free by decision (control-plane-ui/DESIGN.md). Its
+# name still says the approval page alone, because a branch ruleset may require the
+# check by that name.
 #
 # The `build` job then STANDS THE STACK UP and runs boundary-check.sh in a real
 # sandbox, which is the only automated evidence this repo has that the containment
@@ -288,9 +290,10 @@ jobs:
           echo "UI_HARNESS_BROWSER=$found" >> "$GITHUB_ENV"
 
       # The container runs the same tests on Debian's shell, a different version
-      # from this one. The tests assert on DOM, text and requests, never pixels, so a
-      # split verdict between the two is a finding against a test; these lines are
-      # what tells the two runs apart.
+      # from this one. The approval page's tests assert on DOM, text and requests, never
+      # pixels; the tasks page's read layout boxes and scroll offsets too, which depend
+      # on the window and the shell. A split verdict between the two is a finding
+      # against a test; these lines are what tells the two runs apart.
       - name: Toolchain versions
         run: |
           node --version

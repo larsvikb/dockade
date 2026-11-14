@@ -76,8 +76,8 @@ task"). Nor does a move on a note: a hide or a handle changes none of them eithe
 two tabs replying to one note post two replies, which the timeline shows. The
 lost-answer check above is what keeps one from being sent twice.
 
-**The moves are in the detail, below the plan, one at a time.** Only the task read
-beside the list carries them, never an inbox row, so a move is made on what was read.
+**The moves are in the detail, below the plan, one at a time.** Only the open task
+carries them, never an inbox row, so a move is made on what was read.
 The moves on a note sit under it in the timeline, on every page of it. The one write
 outside the detail is the flagged list's bulk handle (below), which names the notes a
 page drew rather than a task. Approve and send back are each a control of their own, as
@@ -170,10 +170,25 @@ of fixed height, so neither moves the other. A note handled or hidden elsewhere 
 drawn until a draw; handling it again only marks it again, a second entry in its
 history. A bulk's outcome stays over the list until the next bulk or All tasks.
 
-**The task is read beside the list, and the hash names it.** Opening a task, closing it
-or changing view sets the URL's hash (`parseHash`, `hashFor`), and the page follows the
-hash, so a reload, a link and the browser's back agree with what was clicked. The task
-it names is read once the registry answers, never before.
+**The list or one task, on the whole page, and the hash names which.** Long bodies,
+plans with decisions, timelines and the spec form do not fit a pane beside the list, so
+at every width the page shows the list or the open task, never both, and the task takes
+the window's width. A click on a row opens its task, but on the row's own controls, a
+flagged note's box or its cell, or a drag that selected text; the `#id` button is the
+keyboard's way. Back is a control in a strip kept atop the task at any scroll, Esc
+outside a text field, or the browser's back, and the list comes back as it was left:
+it stays in the DOM, hidden, with its filters, search and page, and its row last read
+marked. Opening a task, going back or changing view sets the URL's hash (`parseHash`,
+`hashFor`), and the page follows the hash, so a reload, a link and the browser's back
+agree with what was clicked. The task it names is read once the registry answers, never
+before. The page places every scroll itself (`enterTask` in `tasks.js` says how), since
+a browser restoring the list's offset on back would apply it to a task first; so a
+reload of a scrolled list opens at its top, the price of placing scroll by hand. A hash
+naming no task the registry could have, or one it has not got, shows the list with a
+line saying so, under the list's URL, so back and a reload pass over it. The back
+control sets the list's hash rather than going back in history, since the entry before
+a linked or reloaded task is not the list; so the browser's back after it reopens the
+task, as after following any link.
 
 **The count is in the title, and quiet.** The page's title carries the number of tasks
 waiting on the operator, the inbox's first section, ahead of its name, as the approval
@@ -218,12 +233,19 @@ was made from, whatever brought it (a refusal's task, the read after a write, "s
 it"), moves it onto that read (`rebaseDraft`): the fields the operator changed keep the
 draft's values and the rest take the newer read's, so a save never reverts another
 writer's change to a field left alone; a field both changed keeps the operator's, after a
-line names it. Only a landed edit, discard, closing the task or opening another drops it,
-with no confirm, as no move asks one. While the draft has changes, approve, send back,
-every state move and breaking the claim are held, since each would act on a spec other
-than the one on screen; a note and the moves on notes stay free. An edit leaves a claim
-as it is (`operator_moves.edit`), and the save names its holder. A refined task's form
-says the edit amends the spec its plan was written against, and once the task's revision
+line names it. Only a landed edit, discard, or leaving the task for the list or another
+task drops it. Leaving a draft with changes, by any change of the hash, asks once first,
+and closing or reloading the page asks too. Declined, the task stays as it was, its
+scroll included, and the move is undone in history, never written over; each entry the
+page follows carries its index, which is how the undo knows where to go (`undoLeave`).
+Entries made before the page stamped them, in a tab left open on an older page and
+reloaded after the upgrade, can be undone in the wrong direction once; no draft is lost
+by it, so nothing handles it. That confirm guards text not yet sent, not a write, so
+"no move asks to be confirmed" above stands; a draft with no changes drops unasked,
+since nothing is lost. While the draft has changes, approve, send back, every state
+move and breaking the claim are held, since each would act on a spec other than the
+one on screen; a note and the moves on notes stay free. An edit leaves a claim as it is
+(`operator_moves.edit`), and the save names its holder. A refined task's form says the edit amends the spec its plan was written against, and once the task's revision
 is past the plan's, `planNotice` says approving approves the task as it now is, with that
 plan: for a refined task only, since an approved task's revision always passes its
 plan's.
@@ -252,13 +274,13 @@ other values are folded; the note a hide or a handle acts on stays in the open, 
 match it with the entry that posted it.
 
 **A task that changed while it is read says so, and moves nothing.** The poll reads
-the task open beside the list (`refreshOpenTask`) and compares it with the one drawn
-(`taskUpdate`): a newer revision is a change, and a newer note alone is one too,
-though no revision moves for a note, because a note saying "don't approve this" that
-arrives while the operator reads is worth a line. Either fills one line atop the detail
-whose space is kept whether it says anything or not, so filling it shifts nothing; it
-stays in view as the detail scrolls, and "show it" reads the task again through the
-hash. A refused move's "the task changed" notice is drawn in the same line, since the
+the open task (`refreshOpenTask`) and compares it with the one drawn (`taskUpdate`): a
+newer revision is a change, and a newer note alone is one too, though no revision moves
+for a note, because a note saying "don't approve this" that arrives while the operator
+reads is worth a line. Either fills one line atop the detail whose space is kept whether
+it says anything or not, so filling it shifts nothing; it stays in view under the strip
+as the page scrolls, and "show it" reads the task again through the hash, keeping the
+scroll. A refused move's "the task changed" notice is drawn in the same line, since the
 task it draws is the refusal's and the timeline is the one held; every other outcome
 stays under the moves, beside the controls it is about. A redraw of the read already
 drawn, as opening or discarding an edit makes, keeps what the line says. When the poll
@@ -278,6 +300,10 @@ registry's own (`ApproveRuleTests`), the edit's bodies on a scratch store
 sends its writes, draws agent text and decisions, and fills the line atop the detail;
 `tests/test_task_registry_inbox.py` holds what the inbox counts, and
 `tests/test_task_registry_operator.py` that each note is on the history row that
-posted it.
+posted it. `make ui-test` runs `tests/ui-harness/tasks.test.js` in a browser against
+expected values, beside the approval page's: opening a task, each way back, a task URL
+loaded or reloaded, a hash naming no task, and leaving with an edit open. Unlike the
+approval page's, these read layout boxes and scroll offsets, since where the list and
+the task are is what they hold; still never pixels.
 `make ui-diff UI_DIFF_PAGE=tasks` runs `tests/ui-harness/tasks-scenario.js` on the base
 and on the branch.

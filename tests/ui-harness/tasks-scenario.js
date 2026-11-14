@@ -8,6 +8,18 @@ import {
   startRegistry, stopRegistry,
 } from "./tasks-backend.js";
 
+// The list's own hash, set as a link would set it, once the page has followed it. A
+// task open takes the whole page, so a step that acts on the list with one open goes
+// back to the list first; on a base that drew the task beside the list, the same hash
+// closes it, so both trees take the step from the same place.
+async function toList(page, hash = "") {
+  await page.evaluate(h => new Promise(done => {
+    if (location.hash === h) return done();
+    window.addEventListener("hashchange", () => done(), { once: true });
+    location.hash = h;
+  }), hash);
+}
+
 export const STEPS = [
   ["load", async ({ load }) => { await load(); }],
   ["opened from the inbox", async ({ page }) => {
@@ -20,15 +32,20 @@ export const STEPS = [
     await page.click('#task-detail button[data-page="history"]');
   }],
   ["a refined task from triage", async ({ page }) => {
+    await toList(page);
     await page.click('#inbox button[data-task="6"]');
   }],
   // The hash names the task: a reload reads it again, and back goes to the one before.
   ["reloaded", async ({ page, navigate }) => { await navigate(() => page.reload()); }],
   ["back", async ({ page, navigate }) => { await navigate(() => page.goBack()); }],
   ["a landing task", async ({ page }) => {
+    await toList(page);
     await page.click('#inbox button[data-task="5"]');
   }],
-  ["all tasks", async ({ page }) => { await page.click("#view-all"); }],
+  ["all tasks", async ({ page }) => {
+    await toList(page);
+    await page.click("#view-all");
+  }],
   ["repo picked", async ({ page }) => {
     await page.selectOption("#tasks-repo", "dockade");
   }],
@@ -39,14 +56,14 @@ export const STEPS = [
     await page.click('#tasks button[data-task="3"]');
   }],
   ["a task whose plan was superseded", async ({ page }) => {
+    await toList(page, "#view=all");
     await page.click('#tasks button[data-task="1"]');
   }],
   ["a task with no plan", async ({ page }) => {
+    await toList(page, "#view=all");
     await page.click('#tasks button[data-task="2"]');
   }],
-  ["task closed", async ({ page }) => {
-    await page.click("#task-detail button[data-close]");
-  }],
+  ["task closed", async ({ page }) => { await toList(page, "#view=all"); }],
   ["search", async ({ page }) => {
     await page.fill("#tasks-search", "back up");
     await page.press("#tasks-search", "Enter");
@@ -79,6 +96,7 @@ export const STEPS = [
   // Another session moves task 8 after the page read it: approving the revision shown
   // is refused, and the page draws the task the refusal carries, saying so.
   ["another refined task", async ({ page }) => {
+    await toList(page);
     await page.click('#inbox button[data-task="8"]');
   }],
   ["approved after it changed elsewhere", async ({ page }) => {
@@ -89,6 +107,7 @@ export const STEPS = [
     await page.click('#task-detail button[data-verb="send back"]');
   }],
   ["a claimed task", async ({ page }) => {
+    await toList(page);
     await page.click('#inbox button[data-task="3"]');
   }],
   ["its claim broken", async ({ page }) => {
@@ -109,6 +128,7 @@ export const STEPS = [
   }],
   // A plan that replaced another opens on what changed, the whole one toggle away.
   ["a re-refined task, on what changed", async ({ page }) => {
+    await toList(page);
     await page.click('#inbox button[data-task="6"]');
   }],
   ["the whole plan", async ({ page }) => {
@@ -127,6 +147,7 @@ export const STEPS = [
   // the timeline, and the flagged list above the inbox is drawn again after it. Task 3,
   // closed above, is out of the inbox; its notes are marked so in the flagged list.
   ["a closed task's flagged note opened", async ({ page }) => {
+    await toList(page);
     await page.click('#flagged button[data-task="3"]');
   }],
   // A task move redraws the flagged rows: reopened, its notes are no longer marked.
@@ -153,18 +174,17 @@ export const STEPS = [
   }],
   // A task deferred from the detail: the flagged rows are drawn again, its note marked.
   ["another task opened from the flagged list", async ({ page }) => {
+    await toList(page);
     await page.click('#flagged button[data-task="8"]');
   }],
   ["deferred", async ({ page }) => {
     await page.click('#task-detail button[data-verb="defer"]');
   }],
-  ["task 3 again", async ({ page }) => {
-    await page.click('#flagged button[data-task="3"]');
-  }],
   // "select all shown" leaves out the notes on deferred tasks 7 and 8. The bulk names
-  // exactly the notes selected among those drawn, and the open task, which one of them
-  // is on, is drawn again with it.
+  // exactly the notes selected among those drawn, with no task open: the flagged block
+  // is part of the list.
   ["all shown selected, the parked ones left out", async ({ page }) => {
+    await toList(page);
     await page.click('#flagged button[data-flagged="all"]');
   }],
   // Task 6 is deferred in another tab, which only a poll sees: its note stays ticked
@@ -201,6 +221,9 @@ export const STEPS = [
   }],
   // Un-handled, then replied to again with the answer lost: the page reads the task
   // again and finds the reply's own entry.
+  ["task 3 again, from the inbox", async ({ page }) => {
+    await page.click('#inbox button[data-task="3"]');
+  }],
   ["a note marked not handled", async ({ page }) => {
     await page.click('#task-detail button[data-write="handle"][data-value="false"]'
                      + '[data-note="14"]');
@@ -218,6 +241,7 @@ export const STEPS = [
   // A plan's decisions, above it, start on the options it assumes: one click approves
   // it as written, and the label said so before it.
   ["a refined task with decisions", async ({ page }) => {
+    await toList(page);
     await page.click('#inbox button[data-task="9"]');
   }],
   ["approved as assumed", async ({ page }) => {
@@ -226,6 +250,7 @@ export const STEPS = [
   // Another option relabels the approve, which then sends the task back, and the send
   // back, which sends no answers.
   ["another task with decisions", async ({ page }) => {
+    await toList(page);
     await page.click('#inbox button[data-task="10"]');
   }],
   ["another option picked", async ({ page }) => {
@@ -258,6 +283,7 @@ export const STEPS = [
   // Another plan, read through the inbox: the decisions say it is another.
   ["a new plan handed in, the task read again", async ({ page }) => {
     replanElsewhere(10, 7);
+    await toList(page);
     await page.click('#inbox button[data-task="10"]');
   }],
   // The first choice in it spends the line, which keeps its space.

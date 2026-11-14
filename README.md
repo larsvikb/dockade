@@ -166,9 +166,11 @@ to a control network by name, by IP and by IPv4-mapped IPv6, relaying to the
 metadata IP, and plaintext HTTP going through the proxy rather than around it). It
 prints a pass/fail line each and an aggregate; run it rather than counting them
 here.
-It is **tier-aware**: tier 1 asserts Anthropic is reachable *via the proxy*, tier 2
-asserts it is unreachable and that the inference service is the one destination that
-answers. It exits non-zero on any violation, so it doubles as a regression baseline
+It is **tier-aware**: a cloud tier asserts Anthropic, the lifeline every cloud tier
+reaches, and its own model hosts are reachable *via the proxy*, a model host still
+held for approval failing until it is approved with a persisted rule; local mode
+asserts Anthropic is unreachable and that the inference service is the one destination
+that answers. It exits non-zero on any violation, so it doubles as a regression baseline
 to run before and after changes — `make boundary` runs it in a live sandbox. This is
 separate from the boot-time checks in `sandbox-common/entrypoint.sh` and
 `sandbox-common/init-firewall.sh`, which run as root before the privilege drop and

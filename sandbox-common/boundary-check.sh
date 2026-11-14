@@ -44,12 +44,16 @@ if curl --noproxy '*' --connect-timeout 5 -s -o /dev/null https://1.1.1.1 2>/dev
 else
     ok "direct egress to raw IP (1.1.1.1) blocked"
 fi
-# The Anthropic lifeline. Its expected state is INVERTED between tiers, so branch
-# on the mode rather than asserting one of them universally:
-#   tier 1 — reachable via whatever path the agent uses (proxy if governed, direct
-#            otherwise), so DON'T set --noproxy here: use the ambient env. Any HTTP
-#            response (even 4xx) means the connection succeeded, which is all we assert.
-#   tier 2 — LOCAL mode holds no Anthropic credentials and has no egress, so
+# The Anthropic lifeline. Its expected state is INVERTED between local mode and
+# every other, so branch on the mode rather than asserting one of them universally:
+#   cloud tiers — every one shares the agent client class, so every one reaches
+#            api.anthropic.com unheld (DESIGN.md, "Policy is scoped to a client
+#            class"), whatever its own model host; the proxy-abuse probes below use
+#            it for that reason. Reachable via whatever path the agent uses (proxy if
+#            governed, direct otherwise), so DON'T set --noproxy here: use the
+#            ambient env. Any HTTP response (even 4xx) means the connection
+#            succeeded, which is all we assert.
+#   local mode — holds no Anthropic credentials and has no egress, so
 #            reachability would be a boundary FAILURE, not a healthy lifeline.
 if [ "${SANDBOX_MODE:-}" = "local" ]; then
     if curl --connect-timeout 5 -s -o /dev/null https://api.anthropic.com 2>/dev/null; then
@@ -94,19 +98,67 @@ if [ "${SANDBOX_MODE:-}" = "local" ]; then
             *)             bad "inference service gave an unrecognised reply to /v1/chat/completions: $(printf '%s' "$llm_reply" | tr -d '\n' | cut -c1-160)" ;;
         esac
     else
-        bad "inference service NOT reachable (${LLM_IP:-llm}:${LLM_PORT:-8080}) — tier 2 has no other capability"
+        bad "inference service NOT reachable (${LLM_IP:-llm}:${LLM_PORT:-8080}) — local mode has no other capability"
     fi
 else
     if [ -n "${HTTPS_PROXY:-}" ]; then lifeline_path="via proxy $HTTPS_PROXY"; else lifeline_path="direct"; fi
     if curl --connect-timeout 5 -s -o /dev/null https://api.anthropic.com 2>/dev/null; then
-        ok "api.anthropic.com reachable ($lifeline_path)"
+        ok "api.anthropic.com reachable ($lifeline_path) — the lifeline every cloud tier reaches unheld"
     else
-        bad "api.anthropic.com NOT reachable ($lifeline_path) — lifeline down"
+        bad "api.anthropic.com NOT reachable ($lifeline_path) — the lifeline every cloud tier reaches is down"
     fi
 fi
-# Governed mode: when routed through the egress proxy, a non-allowlisted domain
-# must be refused BY THE PROXY (a 403 on the CONNECT), not merely by the firewall.
-# This asserts the proxy's default-deny policy is actually enforcing.
+# A cloud tier's OWN model hosts, which its launcher names in SANDBOX_MODEL_HOSTS
+# (sandbox-lib.sh, sc_governed_egress). The lifeline above is not one of them for any
+# tier but Claude's, so without this a tier's check would never touch the host it
+# actually depends on. Each must answer through the proxy, so "held for approval" is
+# a FAILURE here: a tier whose model host is held cannot work, however healthy the
+# rest of the boundary is.
+#
+# BEFORE the governed section, so none of this run's own probes there (example.com
+# holds) counts against the control plane's pending-card caps when these ask.
+#
+# The four outcomes are told apart by curl's exit status and the CONNECT code, since
+# the proxy decides in http_connect, before it dials anything:
+#   CONNECT 403        — refused outright: a deny rule, the control plane failing
+#                        closed, a hold cap (per client or global) already reached,
+#                        or a destination the relay guard forbids;
+#   any HTTP response  — reached, even a 404, and even when the body then stalls
+#                        past --max-time: the connection is what is asserted;
+#   timeout, no CONNECT reply — held: the proxy is waiting on a human, and the
+#                        5 s connect timeout ends the wait first;
+#   anything else      — unreachable (no proxy, DNS, TLS, the upstream).
+# `read -a` splits on whitespace without globbing, so a `*` stays a `*`. An empty or
+# unset list probes and prints nothing: Claude's launcher passes none.
+read -r -a model_hosts <<< "${SANDBOX_MODEL_HOSTS:-}"
+if [ "${#model_hosts[@]}" -gt 0 ]; then
+    if [ -z "${HTTPS_PROXY:-}" ]; then
+        # Named hosts that nothing probes must never read as a pass.
+        bad "SANDBOX_MODEL_HOSTS names ${model_hosts[*]}, but no egress proxy is set to probe them through (governed mode only)"
+    else
+        for model_host in "${model_hosts[@]}"; do
+            model_codes="$(curl -sS -o /dev/null --connect-timeout 5 --max-time 8 \
+                -w '%{http_connect} %{http_code}' "https://${model_host}/" 2>/dev/null)"
+            model_rc=$?
+            read -r model_connect model_http <<< "$model_codes"
+            if [ "${model_connect:-000}" = "403" ]; then
+                bad "model host $model_host refused by the egress proxy (CONNECT 403): a deny rule, the control plane failing closed, a pending-hold cap reached (rerun once pending cards clear), or a destination the relay guard forbids"
+            elif [ "${model_http:-000}" != "000" ]; then
+                ok "model host $model_host reachable via proxy $HTTPS_PROXY (HTTP ${model_http:-000})"
+            elif [ "$model_rc" -eq 28 ] && [ "${model_connect:-000}" = "000" ]; then
+                bad "model host $model_host held for approval (no CONNECT reply): approve it with a persisted rule, since once or a lease passes only for now, and rerun"
+            else
+                bad "model host $model_host unreachable through the egress proxy (curl exit $model_rc, CONNECT ${model_connect:-000})"
+            fi
+        done
+    fi
+fi
+# Governed mode, the cloud tiers routed through the egress proxy: a non-allowlisted
+# domain must be refused BY THE PROXY (a 403 on the CONNECT), not merely by the
+# firewall. This asserts the proxy's default-deny policy is actually enforcing. Every
+# probe from here on targets api.anthropic.com, a host no rule allows, or an address
+# the relay guard refuses, never a tier's model host, so the section holds the same
+# for every cloud tier.
 if [ -n "${HTTPS_PROXY:-}" ]; then
     # Since 2b an unknown host is HELD for approval — it blocks pending a human,
     # then default-denies on timeout — rather than being refused outright. So it
@@ -500,9 +552,9 @@ fi
 # ("recursion requested but not available") and dig EXITS 0 for it, so the exit
 # status reads a working refusal as a leak. Assert on the answer, not the status.
 if [ "${SANDBOX_MODE:-}" = "local" ] || [ -n "${HTTPS_PROXY:-}" ]; then
-    # Both tiers that sit on an internal network: tier 2 has no egress at all, and
-    # governed tier 1 has the proxy resolve on its behalf. Neither should be able to
-    # resolve an external name itself.
+    # Every mode that sits on an internal network: local mode has no egress at all,
+    # and a governed cloud tier has the proxy resolve on its behalf. Neither should
+    # be able to resolve an external name itself.
     if getent hosts example.com >/dev/null 2>&1; then
         bad "external name resolved via the default resolver — embedded DNS is forwarding off an internal network (exfil channel)"
     elif ! command -v dig >/dev/null 2>&1; then

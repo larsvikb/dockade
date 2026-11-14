@@ -3,7 +3,7 @@
 // same way every time: its API requests answered by a fake backend one at a time in
 // the order it made them, its clock frozen until a step moves it, and its approvals
 // feed faked inside the page. harness.js runs a scenario on it and writes a transcript;
-// approval.test.js asserts on it. Neither repeats any of this.
+// approval.test.js and tasks.test.js assert on it. None repeats any of this.
 //
 //   const browser = await launch();
 //   const p = await openPage(browser, servedDir, { respond, answeredLast });
@@ -280,18 +280,22 @@ export async function launch() {
 // A new context on `browser` with the page in it, served from `uiDir` and answered by
 // `backend`: `respond(method, path, body, query)` and optionally `answeredLast(method,
 // path)`, as backend.js exports them. `beforeNavigate` runs at the start of every
-// navigation but the first, before anything of it happens.
+// navigation but the first, before anything of it happens. `viewport` sizes the window
+// (1280 by 900 unless given), and `hash` is what `load` opens the page at ("" unless
+// given), so a test can load on a URL a link or a reload would.
 //
 // What the page did, since the last `take()`: `log` the events in order, `files` what
 // it loaded outside the queue and `unanswered` what it asked for and never got, both in
 // the network's order.
 export async function openPage(browser, uiDir, { respond, answeredLast = () => false },
-                               { beforeNavigate = async () => {} } = {}) {
+                               { beforeNavigate = async () => {},
+                                 viewport = { width: 1280, height: 900 },
+                                 hash = "" } = {}) {
   // A zone with an offset, and a half-hour one with no DST: in UTC, local time and UTC
   // read the same, so a move that mixed them up would diff clean (NOTES.md,
   // "`toLocaleString()` renders one instant six ways").
   const context = await browser.newContext({
-    timezoneId: "Asia/Kolkata", locale: "en-GB", viewport: { width: 1280, height: 900 },
+    timezoneId: "Asia/Kolkata", locale: "en-GB", viewport,
   });
   const page = await context.newPage();
   // A step whose element is not there fails the run in seconds rather than in 30.
@@ -381,15 +385,16 @@ export async function openPage(browser, uiDir, { respond, answeredLast = () => f
       loaded = true;
       await queue.navigate(go);
     },
-    // The page from the top; `before` acts on the old document inside the navigation.
-    // Answers are paused there, so `before` must not call `clock` or `settle`: either
-    // waits for an empty queue, and fails at the bound if `before` left anything held.
+    // The page from the top, at `hash`; `before` acts on the old document inside the
+    // navigation. Answers are paused there, so `before` must not call `clock` or
+    // `settle`: either waits for an empty queue, and fails at the bound if `before`
+    // left anything held.
     load: before => helpers.navigate(async () => {
       if (before) {
         await before();
         await queue.allHeld();
       }
-      await page.goto(ORIGIN + "/");
+      await page.goto(ORIGIN + "/" + hash);
     }),
     accept: () => { accepting = true; },
   };

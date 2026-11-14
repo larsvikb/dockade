@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 /* The tasks page: the task registry's work list, read through this UI's relay to the
  * registry's operator listener (`/api/…`, tasks-ui/app.py). It opens on the inbox,
- * what is the operator's turn, with the task read beside it; every task is a view
- * away. A backlog nobody waits on, so nothing here alerts the way a hold does: the
- * page's title carries a quiet count of what waits on the operator.
+ * what is the operator's turn; every task is a view away, and an open task takes the
+ * whole page until the operator goes back to the list. A backlog nobody waits on, so
+ * nothing here alerts the way a hold does: the page's title carries a quiet count of
+ * what waits on the operator.
  *
  * The registry can stop on its own. The page asks `/running` first, which this
  * container answers itself, so a registry that is not running is one line on the page
@@ -291,16 +292,41 @@ export function pageTitle(total) {
   return (count ? `(${count}) ` : "") + PAGE_TITLE;
 }
 
-// The URL's hash names the view and the task read beside it, so a reload or a link
-// keeps both, and the browser's back goes to the task read before. A task id is
-// digits, as the relay takes one, without leading zeros, as a row names it; anything
-// else names none. Not through Number: an id may pass 2^53.
+// The largest task id the registry gives (`ID_MAX` in task-registry/tasks.py), as
+// digits: it is past 2^53, so an id never goes through Number. A test holds it to the
+// registry's.
+export const ID_MAX = "9223372036854775807";
+
+// Whether `digits`, with no leading zero, names an id from 1 to ID_MAX: compared as
+// strings, by length first.
+function inIdRange(digits) {
+  return digits !== "0" && (digits.length < ID_MAX.length
+    || (digits.length === ID_MAX.length && digits <= ID_MAX));
+}
+
+// The URL's hash names the view and the task open on the page, so a reload or a link
+// keeps both, and the browser's back goes to what was read before. A task id is
+// digits, as the relay takes one, without leading zeros, as a row names it, from 1 to
+// ID_MAX. A task parameter that is anything else names none, and `bad` carries it, so
+// the page says the link named no task rather than show the list as if it were asked.
 export function parseHash(hash) {
   const q = new URLSearchParams(String(hash ?? "").replace(/^#/, ""));
-  const task = q.get("task");
-  return { view: q.get("view") === "all" ? "all" : "inbox",
-           task: task !== null && /^[0-9]{1,19}$/.test(task)
-             ? task.replace(/^0+(?=[0-9])/, "") : null };
+  const given = q.get("task");
+  const digits = given !== null && /^[0-9]+$/.test(given)
+    ? given.replace(/^0+(?=[0-9])/, "") : null;
+  const task = digits !== null && inIdRange(digits) ? digits : null;
+  return { view: q.get("view") === "all" ? "all" : "inbox", task,
+           bad: given !== null && task === null ? given : null };
+}
+
+// What the list says in place of a task the hash named and the page could not open:
+// one no id can be, or one the registry has not got. The hash is anyone's link, so
+// it is spelled as agent text is.
+export function badTaskText(given) {
+  return `The link names no task: "${spellHidden(given).text}" is not a task id.`;
+}
+export function unknownTaskText(id) {
+  return `The registry has no task #${id}.`;
 }
 export function hashFor(view, task) {
   const q = new URLSearchParams();
@@ -713,7 +739,8 @@ export const NOT_RUNNING_TEXT =
 export const TASKS_POLL_MS = 15000;
 
 let tasksDown, tasksUp, tasksRepo, tasksState, tasksSearch, tasksBody, tasksEmpty,
-  tasksOlder, tasksNewest, taskCountEl, taskDetail, panes, inboxEl, inboxEmpty,
+  tasksOlder, tasksNewest, taskCountEl, taskDetail, listView, taskView, taskBack,
+  listNotice, inboxEl, inboxEmpty,
   inboxCountEl, viewInbox, viewAll, inboxView, allView, flaggedEl, flaggedLineEl,
   flaggedBody, flaggedEmpty, flaggedAll, flaggedHandle, flaggedLeftOut, flaggedOutcomeEl;
 
@@ -732,7 +759,10 @@ let inboxLoaded = false;
 let lastInbox = null;
 let view = "inbox";
 let openTask = null;       // the id whose detail is shown, as the hash names it
-let shownTask = null;      // the task drawn beside the list
+let lastRead = null;       // the id last drawn, whose row stays marked back on the list
+let listScroll = 0;        // the list's scroll offset when a task was opened from it
+let appliedIndex = 0;      // the index stamped on the history entry the page last followed
+let shownTask = null;      // the task drawn on the page
 let shownHeld = null;      // and what the page holds with it: its timeline and plans
 let draws = 0;             // how many times a task was drawn: what a poll's answer checks
 let noticeSlot = null;     // the line atop the detail that says the task changed
@@ -742,8 +772,9 @@ let noteDraft = { task: null, text: "" };   // kept until it lands
 let replyDrafts = new Map();  // a reply's text by its note's id: its box is open while kept
 // The spec edit open on a task: its id, the read it is a draft of (`base`), the fields
 // as its controls hold them, and what its last rebase said. Kept across the task's
-// draws, each past its base rebasing it (`noteSpecDrawn`); dropped, with no confirm,
-// only when it lands, is discarded, or the task is closed or another opened.
+// draws, each past its base rebasing it (`noteSpecDrawn`); dropped only when it lands,
+// is discarded, or the task is left, for the list or another task. Leaving a draft
+// with changes asks first (`mayLeave`): the confirm guards unsent text, not a write.
 let specEdit = null;
 // The choices made on a plan to approve, by task and plan (`choicesFor`), so a redraw
 // keeps them, a stale write's too; dropped when its approve lands or another plan is
@@ -1002,6 +1033,7 @@ function renderFlaggedLine() {
 function flaggedRow(n) {
   const tr = document.createElement("tr");
   const pick = document.createElement("td");
+  pick.className = "pick";
   const box = document.createElement("input");
   box.type = "checkbox";
   box.dataset.flaggedNote = String(n.id);
@@ -1045,13 +1077,12 @@ function markFlagged() {
 
 // The bulk handle, naming exactly the notes selected among those drawn: never a
 // filter, so a note flagged since is not swept up unseen, and never one whose task was
-// parked since it was ticked, which its outcome names. The open task is read again with
-// it when a named note is on it.
+// parked since it was ticked, which its outcome names. It is on no task: the flagged
+// block is part of the list, never on screen with a task open.
 function bulkWrite() {
   const { notes, leftOut } = bulkToSend(flaggedSelected, flaggedDrawn, newestFlagged());
   if (!notes.length) return null;
-  const onOpen = flaggedDrawn.some(n => notes.includes(n.id) && String(n.task) === openTask);
-  return { kind: "handle-many", notes, leftOut, task: onOpen ? openTask : null,
+  return { kind: "handle-many", notes, leftOut, task: null,
            verb: `handle ${notes.length} note${notes.length === 1 ? "" : "s"}` };
 }
 
@@ -1104,7 +1135,8 @@ function inboxRow(t) {
   return tr;
 }
 
-// The cell that opens a task beside the list, by naming it in the hash.
+// The cell that opens a task, by naming it in the hash: the keyboard's way in, and what
+// a click elsewhere on its row opens (`rowOpens`).
 function openCell(id) {
   const td = document.createElement("td");
   const open = document.createElement("button");
@@ -1116,13 +1148,28 @@ function openCell(id) {
   return td;
 }
 
-// The row of the task read beside the list, in either view, marked as the one.
+// The row of the task open, or back on the list the one last read, in every list
+// marked as the one. The list's rows only: a task named in the detail has no row.
 function markOpen() {
-  for (const btn of panes.querySelectorAll("button[data-task]")) {
+  const marked = openTask ?? lastRead;
+  for (const btn of listView.querySelectorAll("tr button[data-task]")) {
     const row = btn.closest("tr");
-    if (btn.dataset.task === openTask) row.setAttribute("aria-current", "true");
+    if (btn.dataset.task === marked) row.setAttribute("aria-current", "true");
     else row.removeAttribute("aria-current");
   }
+}
+
+// The task a click on a list row opens: its row's, unless the click was on a control
+// of its own, in the flagged row's pick cell, or ended a drag that selected text.
+function rowOpens(ev) {
+  const row = ev.target.closest("tr");
+  if (!row || ev.target.closest("button, input, select, textarea, a, label, td.pick")) {
+    return null;
+  }
+  const selected = window.getSelection();
+  if (selected && !selected.isCollapsed) return null;
+  const open = row.querySelector("button[data-task]");
+  return open ? open.dataset.task : null;
 }
 
 // An author, cut to the cell as `td.actor` cuts it, whole on hover.
@@ -1432,12 +1479,15 @@ async function readTask(id) {
   return { task, held: { timeline, plans } };
 }
 
-// One task in full, read and drawn beside the list.
+// One task in full, read and drawn on the whole page. Another task than the one open
+// starts at the top; the one open read again keeps its scroll.
 async function showTask(id) {
   if (specEdit && specEdit.task !== id) specEdit = null;
+  const another = id !== openTask;
   openTask = id;
   outcome = null;
-  panes.classList.add("reading");
+  sayOnList(null);
+  if (another) enterTask();
   markOpen();
   // The detail still drawn is another task's until this one is read: its controls go
   // off now, so no click on it is sent while the page loads another.
@@ -1447,6 +1497,14 @@ async function showTask(id) {
     ({ task, held } = await readTask(id));
   } catch (e) {
     if (openTask !== id) return;
+    // A task the registry has not got: back to the list, which says so, under the
+    // list's URL in place of this one, so back and a reload pass over it.
+    if (e.message === "404") {
+      window.history.replaceState(window.history.state, "", urlFor(hashFor(view, null)));
+      closeTask();
+      sayOnList(unknownTaskText(id));
+      return;
+    }
     // A registry that stopped is read again when it answers: applyHash reads a task
     // only when it is not the one open.
     if (!registryIsRunning()) openTask = null;
@@ -1454,10 +1512,10 @@ async function showTask(id) {
     failed.className = "empty warn";
     failed.textContent = `Could not load task #${id}.`;
     taskDetail.replaceChildren(failed);
-    taskDetail.hidden = false;
     return;
   }
   if (openTask !== id) return;
+  lastRead = id;
   drawTask(task, held);
 }
 
@@ -1487,13 +1545,6 @@ function drawTask(task, held) {
   }
   const head = document.createElement("h3");
   head.textContent = `#${task.id} ${spellHidden(task.title).text}`;
-  const close = document.createElement("button");
-  close.type = "button";
-  close.className = "group-toggle";
-  close.dataset.close = "1";
-  close.textContent = "close";
-  close.title = "close this task (the list stays)";
-  head.append(" ", close);
   if (!editing) {
     const edit = document.createElement("button");
     edit.type = "button";
@@ -1573,7 +1624,6 @@ function drawTask(task, held) {
   timelineTable.appendChild(timelineBody);
   taskDetail.appendChild(timelineTable);
   taskDetail.appendChild(noteForm(task));
-  taskDetail.hidden = false;
   markAnswers();
   markWriting();
 }
@@ -1929,8 +1979,8 @@ function markReply(box) {
 // a stale one drawn from the task the refusal carries, which is not read again
 // (task-registry/DESIGN.md, "The operator API"); the inbox and the list refreshed. A
 // write whose answer was lost is decided from a read (`checkWrite`), never sent again.
-// A write in the detail is on the task drawn; a bulk handle, from the flagged block, on
-// the open task only when a note it named is on it, and otherwise on none (`task` null).
+// A write in the detail is on the task drawn; a bulk handle, from the flagged block on
+// the list, on none (`task` null).
 async function runWrite(write) {
   if (writing || !registryIsRunning()) return;
   writing = write;
@@ -1986,9 +2036,7 @@ async function runWrite(write) {
   if (redrawsFlagged(write, result)) await readFlagged(true);
   writing = null;
   if (write.task !== null && openTask === write.task) {
-    // A bulk says what it came to in the flagged block; the detail it redraws says
-    // nothing of an earlier write's.
-    outcome = write.kind === "handle-many" ? null : said;
+    outcome = said;
     if (drawn) drawTask(drawn.task, drawn.held);
     else if (shownTask) drawTask(shownTask, shownHeld);
   } else {
@@ -2206,33 +2254,126 @@ function closeTask() {
   shownTask = null;
   shownHeld = null;
   outcome = null;
-  panes.classList.remove("reading");
-  taskDetail.hidden = true;
   taskDetail.replaceChildren();
+  enterList();
   markOpen();
 }
 
+// The list or one task, never both. The list stays in the DOM while hidden, so its
+// filters, search and page are as they were; the page places every scroll itself
+// (`history.scrollRestoration` is "manual"): a task opened starts at the top, and the
+// list comes back at the offset it had when it was left. Left for a task only: going
+// from one task to another keeps the list's.
+function enterTask() {
+  if (!listView.hidden) listScroll = window.scrollY;
+  listView.hidden = true;
+  taskView.hidden = false;
+  window.scrollTo(0, 0);
+}
+function enterList() {
+  if (taskView.hidden) return;
+  taskView.hidden = true;
+  listView.hidden = false;
+  window.scrollTo(0, listScroll);
+}
+
+// The line atop the list that says the hash named a task the page could not open,
+// kept until the next open or change of view; null empties it.
+function sayOnList(text) {
+  listNotice.textContent = text ?? "";
+  listNotice.hidden = text === null;
+}
+
+// The page's URL with `hash` in place of its own, for history.replaceState, which
+// changes the URL without a hashchange: no read, and no entry of its own.
+function urlFor(hash) {
+  return location.pathname + location.search + hash;
+}
+
+export const LEAVE_TEXT = "Leave this task? The spec edit's changes have not been saved, "
+  + "and leaving discards them.";
+
+// Whether a spec edit with changes is open on the task open: what leaving would lose.
+function draftChanged() {
+  return specEdit !== null && specEdit.task === openTask
+    && draftChanges(specEdit.base, specEdit.draft).length > 0;
+}
+
+// Whether the page may leave the open task, for the list or another: asked once, only
+// while a draft with changes would be lost. Accepted, the draft goes here, so the hash
+// change that follows asks nothing more. A draft with no changes drops unasked, with
+// the task. No write is behind this: it guards unsent text, so no move's guard changes.
+function mayLeave() {
+  if (!draftChanged()) return true;
+  if (!window.confirm(LEAVE_TEXT)) return false;
+  specEdit = null;
+  return true;
+}
+
+// Every history entry the page follows carries its place in history.state, so a
+// declined leave can tell a back or forward to an entry it knows from a new entry, and
+// undo either without rewriting one.
+function entryIndex() {
+  const state = window.history.state;
+  return state && Number.isInteger(state.tasksPage) ? state.tasksPage : null;
+}
+function stampEntry(index) {
+  window.history.replaceState({ tasksPage: index }, "", location.href);
+}
+
+// A declined leave, undone: a back or forward by going as far the other way, a new
+// entry, a link's or a typed hash, by going back from it, which leaves it ahead, as a
+// back always does. The hashchange the undo fires names the task still open, so
+// `applyHash` finds nothing to leave and nothing to read: no flag has to skip it, and
+// none can be left set by an undo whose hashchange never comes.
+function undoLeave(index) {
+  if (index !== null) window.history.go(appliedIndex - index);
+  else window.history.back();
+}
+
 // Back from All tasks, the flagged rows are drawn from a fresh read; a bulk's outcome
-// lasts until All tasks is opened.
+// lasts until All tasks is opened. The back control names the view it goes back to.
 function showView(name) {
   const back = view === "all" && name === "inbox";
+  if (name !== view) sayOnList(null);
   view = name;
   inboxView.hidden = name !== "inbox";
   allView.hidden = name !== "all";
   viewInbox.setAttribute("aria-pressed", String(name === "inbox"));
   viewAll.setAttribute("aria-pressed", String(name === "all"));
+  taskBack.textContent = name === "all" ? "← All tasks" : "← Inbox";
   if (name === "all") flaggedOutcome = null;
   if (back) readFlagged(true);
 }
 
 // The page as the hash names it: the view at once, the task once the registry answers
-// (probe calls this again when it does).
+// (probe calls this again when it does). Leaving the open task by any change of the
+// hash, the back control's, Esc's, the browser's back or forward, a link's, asks first
+// when an edit would be lost (`mayLeave`). Declined, the move is undone in history,
+// never rewritten over (`undoLeave`), and nothing is read. A task parameter no id can
+// be is not read: the list says so, under the list's URL, so back and a reload pass
+// over it.
 function applyHash() {
   const named = parseHash(location.hash);
+  const index = entryIndex();
+  if (openTask !== null && named.task !== openTask && !mayLeave()) {
+    undoLeave(index);
+    return;
+  }
+  // An entry the page has not stamped is a new one, pushed past the one it followed.
+  appliedIndex = index ?? appliedIndex + 1;
+  if (index === null) stampEntry(appliedIndex);
   showView(named.view);
+  if (named.bad !== null) {
+    window.history.replaceState(window.history.state, "",
+                                urlFor(hashFor(named.view, null)));
+    if (openTask !== null) closeTask();
+    sayOnList(badTaskText(named.bad));
+  }
   if (!registryIsRunning()) return;
   if (named.task === null) {
-    if (openTask !== null) closeTask();
+    // The task view can be up with no task open: a read the stopped registry failed.
+    if (openTask !== null || !taskView.hidden) closeTask();
   } else if (named.task !== openTask) {
     showTask(named.task);
   }
@@ -2242,6 +2383,7 @@ function applyHash() {
 // with what was clicked. A click naming what the hash already names reads the task
 // again, or closes it.
 function goTo(nextView, task) {
+  if (openTask !== null && task !== openTask && !mayLeave()) return;
   const next = hashFor(nextView, task);
   if (next !== location.hash) {
     location.hash = next;
@@ -2250,6 +2392,18 @@ function goTo(nextView, task) {
   } else if (registryIsRunning()) {
     showTask(task);
   }
+}
+
+// Back to the list, by the control atop the task, or by Esc outside a text field: from
+// whatever the task view shows, a read that failed included.
+function backToList() {
+  if (!taskView.hidden) goTo(view, null);
+}
+function escGoesBack(ev) {
+  if (ev.key !== "Escape" || ev.defaultPrevented || taskView.hidden) return false;
+  const el = ev.target;
+  return !(el && typeof el.closest === "function"
+           && el.closest("input, textarea, select, [contenteditable]"));
 }
 
 export function mountTasks() {
@@ -2264,7 +2418,10 @@ export function mountTasks() {
   tasksNewest = document.getElementById("tasks-newest");
   taskCountEl = document.getElementById("taskcount");
   taskDetail = document.getElementById("task-detail");
-  panes = document.getElementById("panes");
+  listView = document.getElementById("list-view");
+  taskView = document.getElementById("task-view");
+  taskBack = document.getElementById("task-back");
+  listNotice = document.getElementById("list-notice");
   inboxEl = document.getElementById("inbox");
   inboxEmpty = document.getElementById("inbox-empty");
   inboxCountEl = document.getElementById("inboxcount");
@@ -2303,15 +2460,31 @@ export function mountTasks() {
     refreshTasks();
   });
   tasksNewest.addEventListener("click", () => { resetList(); refreshTasks(); });
-  viewInbox.addEventListener("click", () => goTo("inbox", openTask));
-  viewAll.addEventListener("click", () => goTo("all", openTask));
-  panes.addEventListener("click", ev => {
+  // The views are on the list, never on screen with a task open, so they name none.
+  viewInbox.addEventListener("click", () => goTo("inbox", null));
+  viewAll.addEventListener("click", () => goTo("all", null));
+  // A task opens from its #id button, the keyboard's way, or a click elsewhere on its row.
+  listView.addEventListener("click", ev => {
     const btn = ev.target.closest("button[data-task]");
-    if (btn) goTo(view, btn.dataset.task);
+    const task = btn ? btn.dataset.task : rowOpens(ev);
+    if (task !== null) goTo(view, task);
+  });
+  taskBack.addEventListener("click", backToList);
+  document.addEventListener("keydown", ev => {
+    if (escGoesBack(ev)) backToList();
+  });
+  // Closing or reloading the page with an edit's changes unsaved asks, as leaving does.
+  window.addEventListener("beforeunload", ev => {
+    if (!draftChanged()) return;
+    ev.preventDefault();
+    ev.returnValue = "";
   });
   taskDetail.addEventListener("click", ev => {
-    if (ev.target.closest("button[data-close]")) {
-      goTo(view, null);
+    // A task the detail names opens through the hash, as one from the list does, so
+    // the browser's back returns to the task it was opened from.
+    const named = ev.target.closest("button[data-task]");
+    if (named) {
+      goTo(view, named.dataset.task);
       return;
     }
     // The task read again, through the hash as every open is.
@@ -2383,6 +2556,11 @@ export function mountTasks() {
     else flaggedSelected.delete(id);
     markFlagged();
   });
+  // The page places every scroll itself (`enterTask`): a browser restoring one on back
+  // would apply the list's offset to a task, a declined leave's included, before
+  // hashchange fires, and clamp it on a task too short to hold it.
+  window.history.scrollRestoration = "manual";
+  // The first applyHash stamps the entry loaded on; a reload's keeps the index it had.
   window.addEventListener("hashchange", applyHash);
   applyHash();
 }

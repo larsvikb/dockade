@@ -171,6 +171,13 @@ console.log(JSON.stringify({
       zeros: t.parseHash("#task=006"),
       zero: t.parseHash("#task=0"),
       long_id: t.parseHash("#task=9223372036854775807"),
+      padded_max: t.parseHash("#task=0009223372036854775807"),
+      short: t.parseHash("#task=922337203685477580"),
+      zeros_only: t.parseHash("#task=000"),
+      past_max: t.parseHash("#task=9223372036854775808"),
+      longer: t.parseHash("#task=10000000000000000000"),
+      empty_task: t.parseHash("#task="),
+      bad_all: t.parseHash("#view=all&task=abc"),
       missing: t.parseHash(undefined),
       inbox_none: t.hashFor("inbox", null),
       inbox_task: t.hashFor("inbox", "14"),
@@ -178,6 +185,8 @@ console.log(JSON.stringify({
       all_task: t.hashFor("all", 7),
       round_trip: t.parseHash(t.hashFor("all", "9")),
     },
+    id_max: t.ID_MAX,
+    no_task: [t.badTaskText("a\u202eb"), t.unknownTaskText("999")],
   },
   status: {
     empty: t.tasksStatus(0, false, true, false),
@@ -405,22 +414,44 @@ class TaskViewTests(unittest.TestCase):
 
     def test_the_hash_names_a_view_and_a_task_and_nothing_else(self):
         h = self.probe["inbox"]["hash"]
-        inbox = {"view": "inbox", "task": None}
+        inbox = {"view": "inbox", "task": None, "bad": None}
         self.assertEqual(h["empty"], inbox)
         self.assertEqual(h["missing"], inbox)
-        self.assertEqual(h["task"], {"view": "inbox", "task": "14"})
-        self.assertEqual(h["all"], {"view": "all", "task": "7"})
+        self.assertEqual(h["task"], {"view": "inbox", "task": "14", "bad": None})
+        self.assertEqual(h["all"], {"view": "all", "task": "7", "bad": None})
         # Only digits name a task, as the relay takes one, and only a known view.
-        self.assertEqual(h["bad_task"], inbox)
+        self.assertEqual(h["bad_task"]["task"], None)
         self.assertEqual(h["bad_view"], inbox)
         self.assertEqual((h["inbox_none"], h["inbox_task"], h["all_none"], h["all_task"]),
                          ("", "#task=14", "#view=all", "#view=all&task=7"))
-        self.assertEqual(h["round_trip"], {"view": "all", "task": "9"})
+        self.assertEqual(h["round_trip"], {"view": "all", "task": "9", "bad": None})
         # As a row names it, so the row is marked and not read twice; never through a
         # Number, which would round an id past 2^53.
         self.assertEqual(h["zeros"]["task"], "6")
-        self.assertEqual(h["zero"]["task"], "0")
         self.assertEqual(h["long_id"]["task"], "9223372036854775807")
+        self.assertEqual(h["padded_max"]["task"], "9223372036854775807")
+        self.assertEqual(h["short"]["task"], "922337203685477580")
+        # A task parameter that names no task is reported, so the page says so: outside
+        # 1 to ID_MAX, or not digits. One past ID_MAX in the last digit, and a digit
+        # longer: a Number could tell neither from ID_MAX.
+        for key, given in (("zero", "0"), ("zeros_only", "000"),
+                           ("past_max", "9223372036854775808"),
+                           ("longer", "10000000000000000000"), ("bad_task", "../api"),
+                           ("empty_task", "")):
+            with self.subTest(hash=key):
+                self.assertEqual(h[key], {"view": "inbox", "task": None, "bad": given})
+        self.assertEqual(h["bad_all"], {"view": "all", "task": None, "bad": "abc"})
+        for key in ("empty", "missing", "task", "all", "bad_view", "round_trip"):
+            with self.subTest(hash=key):
+                self.assertIsNone(h[key]["bad"])
+
+    def test_the_id_bound_is_the_registrys(self):
+        self.assertEqual(self.probe["inbox"]["id_max"], str(_reg.tasks.ID_MAX))
+
+    def test_a_task_the_page_could_not_open_is_named_spelled(self):
+        self.assertEqual(self.probe["inbox"]["no_task"],
+                         ['The link names no task: "a\\u202eb" is not a task id.',
+                          "The registry has no task #999."])
 
     def test_the_count_is_a_number_or_nothing(self):
         self.assertEqual(self.probe["badge"], ["", "1", "12", "", "", "3", "", ""])
@@ -1677,7 +1708,13 @@ class TaskTimelineSourceTests(unittest.TestCase):
         self.assertRegex(rule, r"\bheight: \d+px;")
         self.assertIn("overflow: hidden;", rule)
         self.assertIn("white-space: nowrap;", rule)
-        self.assertRegex(self.HTML, r"\.notice-slot:not\(:empty\) \{ position: sticky; top: 0;")
+        # Kept in view under the task's strip, which is kept in view at the top: as far
+        # down as the strip is high.
+        top = re.search(r"\.notice-slot:not\(:empty\) \{ position: sticky; top: (\d+)px;",
+                        self.HTML).group(1)
+        strip = re.search(r"\.task-strip \{([^}]*)\}", self.HTML).group(1)
+        self.assertIn("position: sticky; top: 0;", strip)
+        self.assertEqual(re.search(r"\bheight: (\d+)px;", strip).group(1), top)
 
     def test_show_it_reads_the_task_again_through_the_hash(self):
         self.assertIn('if (ev.target.closest("button[data-show]")) {\n'
@@ -1813,7 +1850,8 @@ class TaskWriteSourceTests(unittest.TestCase):
         self.assertIn("if (result !== \"not-running\") {", body)
         # A bulk's outcome is the flagged block's, a note move's above the timeline.
         self.assertIn('if (write.kind === "handle-many") flaggedOutcome = said;', body)
-        self.assertIn('outcome = write.kind === "handle-many" ? null : said;', body)
+        # A bulk is on no task (`task: null`), so the detail never draws its outcome.
+        self.assertIn("    outcome = said;\n", body)
         self.assertIn("flaggedOutcome.text", self._function(self.TASKS, "renderFlagged"))
         draw = self._function(self.TASKS, "drawTask")
         self.assertIn("outcome.onNote", draw)
@@ -1855,11 +1893,11 @@ class TaskWriteSourceTests(unittest.TestCase):
         self.assertIn("movesBlock(task)", self._function(self.TASKS, "drawTask"))
         self.assertEqual(len(re.findall(r"\bbulkWrite\(", self.TASKS)), 2,
                          "defined once, called once, from the flagged block")
-        # A bulk re-reads the open task only when a note it names is on it.
+        # A bulk is on no task: the flagged block is part of the list, never on screen
+        # with a task open, so there is no open task for it to read again.
         bulk = self._function(self.TASKS, "bulkWrite")
-        self.assertIn("const onOpen = flaggedDrawn.some(n => notes.includes(n.id) && "
-                      "String(n.task) === openTask);", bulk)
-        self.assertIn("task: onOpen ? openTask : null,", bulk)
+        self.assertIn('return { kind: "handle-many", notes, leftOut, task: null,', bulk)
+        self.assertNotIn("openTask", bulk)
         # "select all shown" ticks only what `selectAll` gives, and is off when that is
         # nothing; a note on a parked task is ticked on its own.
         self.assertIn("for (const id of selectAll(flaggedDrawn, newestFlagged())) "
@@ -2075,6 +2113,81 @@ class TaskPollingSourceTests(unittest.TestCase):
         callers = [ln.strip() for ln in calls if "function showTask" not in ln]
         self.assertEqual(sorted(callers), ["showTask(named.task);", "showTask(task);"])
         self.assertIn('window.addEventListener("hashchange", applyHash);', self.TASKS)
+        # A task named in the detail opens through the hash too, so back returns to
+        # the task it was opened from.
+        self.assertIn("goTo(view, named.dataset.task);", self.TASKS)
+
+    def test_leaving_the_task_by_any_hash_change_asks_before_an_edit_is_lost(self):
+        # Every way off the task changes the hash, and the hash's handler asks, so the
+        # browser's back and forward and a link ask as the back control and Esc do;
+        # goTo asks before it sets the hash, so the hashchange after asks nothing more.
+        leave = "if (openTask !== null && named.task !== openTask && !mayLeave()) {"
+        apply = self._function(self.TASKS, "applyHash")
+        self.assertIn(leave, apply)
+        self.assertLess(apply.index(leave), apply.index("showView(named.view);"))
+        # Declined, the move is undone in history, never rewritten over; every entry
+        # the page follows carries its index, a new one the next.
+        self.assertIn("    undoLeave(index);\n    return;", apply)
+        self.assertIn("appliedIndex = index ?? appliedIndex + 1;\n"
+                      "  if (index === null) stampEntry(appliedIndex);", apply)
+        undo = self._function(self.TASKS, "undoLeave")
+        # A traversal reaches another entry: the same one fires no hashchange.
+        self.assertIn("if (index !== null) window.history.go(appliedIndex - index);", undo)
+        self.assertIn("else window.history.back();", undo)
+        # The URL is only ever replaced keeping the entry's index.
+        self.assertEqual(len(re.findall(r"replaceState\(null\b", self.TASKS)), 0)
+        go = self._function(self.TASKS, "goTo")
+        self.assertIn("if (openTask !== null && task !== openTask && !mayLeave()) return;",
+                      go)
+        may = self._function(self.TASKS, "mayLeave")
+        self.assertIn("if (!draftChanged()) return true;", may)
+        self.assertIn("if (!window.confirm(LEAVE_TEXT)) return false;", may)
+        self.assertIn("draftChanges(specEdit.base, specEdit.draft).length > 0",
+                      self._function(self.TASKS, "draftChanged"))
+        # Closing or reloading the page asks by the same rule.
+        self.assertIn('window.addEventListener("beforeunload", ev => {\n'
+                      "    if (!draftChanged()) return;", self.TASKS)
+        # The confirm is the only one on the page: no move asks one.
+        self.assertEqual(self.TASKS.count("confirm("), 1)
+
+    def test_the_list_and_a_task_are_never_on_screen_together(self):
+        enter_task = self._function(self.TASKS, "enterTask")
+        self.assertIn("listView.hidden = true;\n  taskView.hidden = false;", enter_task)
+        # The list's offset is kept only when the list is what is left.
+        self.assertIn("if (!listView.hidden) listScroll = window.scrollY;", enter_task)
+        self.assertIn("window.scrollTo(0, 0);", enter_task)
+        self.assertIn("window.scrollTo(0, listScroll);", self._function(self.TASKS, "enterList"))
+        self.assertIn("enterList();", self._function(self.TASKS, "closeTask"))
+        # Only another task starts at the top: the one open read again keeps its scroll.
+        show = self._function(self.TASKS, "showTask")
+        self.assertIn("const another = id !== openTask;", show)
+        self.assertIn("if (another) enterTask();", show)
+        self.assertIn('window.history.scrollRestoration = "manual";', self.TASKS)
+        # Back on the list, the row last read stays marked; a list row only.
+        mark = self._function(self.TASKS, "markOpen")
+        self.assertIn("const marked = openTask ?? lastRead;", mark)
+        self.assertIn('listView.querySelectorAll("tr button[data-task]")', mark)
+        self.assertNotIn("lastRead", self._function(self.TASKS, "closeTask"))
+
+    def test_a_task_the_page_cannot_open_leaves_the_list_and_its_url(self):
+        # Not read at all when no id can be what the hash names; a 404 once read. Either
+        # puts the list's URL in place of the task's, so back and a reload pass over it.
+        apply = self._function(self.TASKS, "applyHash")
+        bad = apply[apply.index("if (named.bad !== null) {"):]
+        self.assertLess(bad.index("sayOnList(badTaskText(named.bad));"),
+                        bad.index("if (!registryIsRunning()) return;"))
+        self.assertIn("window.history.replaceState(window.history.state, \"\",\n"
+                      "                                urlFor(hashFor(named.view, null)));",
+                      bad)
+        show = self._function(self.TASKS, "showTask")
+        missing = show[show.index('if (e.message === "404") {'):]
+        self.assertIn("window.history.replaceState(window.history.state, \"\", "
+                      "urlFor(hashFor(view, null)));", missing)
+        self.assertIn("sayOnList(unknownTaskText(id));", missing)
+        # The notice lasts until the next open or change of view.
+        self.assertIn("sayOnList(null);", show)
+        self.assertIn("if (name !== view) sayOnList(null);",
+                      self._function(self.TASKS, "showView"))
 
     def test_a_502_stops_the_polls(self):
         body = self._function(self.TASKS, "registryJson")
@@ -3005,10 +3118,10 @@ class TaskEditSourceTests(unittest.TestCase):
 
     def test_only_a_landed_edit_discard_or_another_task_drops_the_draft(self):
         # Declared, rebased, opened or discarded, and dropped by a landed edit, opening
-        # another task and closing it: nothing else writes it.
+        # another task, closing it and a leave confirmed: nothing else writes it.
         sets = re.findall(r"\bspecEdit = ([^;]*);", self.TASKS)
-        self.assertEqual(len(sets), 6, sets)
-        self.assertEqual(sets.count("null"), 4, sets)
+        self.assertEqual(len(sets), 7, sets)
+        self.assertEqual(sets.count("null"), 5, sets)
         run = _function(self.TASKS, "runWrite")
         self.assertIn('if (write.kind === "edit" && landed && specEdit && '
                       "specEdit.task === write.task) {\n    specEdit = null;", run)

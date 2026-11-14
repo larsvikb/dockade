@@ -3,11 +3,11 @@
 // transcript: after every step, the requests the page sent, what reached its console,
 // and its DOM. There are no expected values here. `make ui-diff` runs this on the base
 // tree and on the branch and diffs the two transcripts, so the oracle is the previous
-// version of the page; approval.test.js, under `make ui-test`, is the one with expected
-// values. For two runs of one page to read the same, the page's API requests are
-// answered one at a time in the order it made them, except a read the backend names to
-// answer last, never while the clock moves, and a step ends only once the page is quiet
-// (answerQueue, in page.js).
+// version of the page; approval.test.js and tasks.test.js, under `make ui-test`, are the
+// ones with expected values. For two runs of one page to read the same, the page's API
+// requests are answered one at a time in the order it made them, except a read the
+// backend names to answer last, never while the clock moves, and a step ends only once
+// the page is quiet (answerQueue, in page.js).
 //
 //   node harness.js <served dir> <transcript out> [approval|tasks]
 //

@@ -671,12 +671,14 @@ ui-diff: ## Run a page's scenario (UI_DIFF_PAGE=approval|tasks) on UI_DIFF_BASE 
 	  exit 1
 	fi
 
-# The approval page against expected values (tests/ui-harness/approval.test.js). Not part
-# of `check` or `test`, which stay browser-free: control-plane-ui/DESIGN.md says why. CI
+# The approval page and the tasks page against expected values
+# (tests/ui-harness/approval.test.js, tests/ui-harness/tasks.test.js). Not part of
+# `check` or `test`, which stay browser-free: control-plane-ui/DESIGN.md says why. CI
 # runs it in its own job; `make ui-test DOCKADE_REQUIRE_TOOLS=1` is that job's command.
 # A missing node or browser SKIPs, and FAILs under DOCKADE_REQUIRE_TOOLS. An npm install
 # that fails, offline say, fails in either mode: the tools were there and the run was not.
-ui-test: ## Run the approval page's browser tests with expected values (needs node and a headless Chromium)
+# Both pages run whatever the first came to, and the target fails if either did.
+ui-test: ## Run the approval and tasks pages' browser tests with expected values (needs node and a headless Chromium)
 	@$(UI_HARNESS_SH)
 	miss() {
 	  if [ -n "$(REQUIRE_TOOLS)" ]; then
@@ -694,9 +696,19 @@ ui-test: ## Run the approval page's browser tests with expected values (needs no
 	harness_install
 	out=$$(mktemp -d "$${TMPDIR:-/tmp}/dockade-ui-test.XXXXXX")
 	trap 'rm -rf "$$out"' EXIT
-	serve_page control-plane-ui "$$out"
-	echo "== ui-test: the approval page, $$("$$browser" --version 2>/dev/null || echo "$$browser") =="
-	node "$$harness/approval.test.js" "$$out"
+	mkdir "$$out/approval" "$$out/tasks"
+	serve_page control-plane-ui "$$out/approval"
+	serve_page tasks-ui "$$out/tasks"
+	version=$$("$$browser" --version 2>/dev/null || echo "$$browser")
+	failed=""
+	echo "== ui-test: the approval page, $$version =="
+	node "$$harness/approval.test.js" "$$out/approval" || failed="$$failed approval"
+	echo "== ui-test: the tasks page, $$version =="
+	node "$$harness/tasks.test.js" "$$out/tasks" || failed="$$failed tasks"
+	if [ -n "$$failed" ]; then
+	  echo "== ui-test: failed on:$$failed =="
+	  exit 1
+	fi
 
 verify-build: ## Assert every default image still builds (skipped if docker unavailable)
 	@if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then

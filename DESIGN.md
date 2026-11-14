@@ -2452,8 +2452,8 @@ Deliberately untested surface is low-weight I/O: `_audit` sinks,
 a CI failure reproduces locally with `make check-strict`. Two parallel jobs — lint +
 consistency + tests (about a minute) and the build verification of every image — so a
 shellcheck typo is not queued behind an image build. A third, beside them, runs the
-approval page's browser tests (`make ui-test`), which `check` leaves out so that it stays
-browser-free (`control-plane-ui/DESIGN.md`).
+approval and tasks pages' browser tests (`make ui-test`), which `check` leaves out so
+that it stays browser-free (`control-plane-ui/DESIGN.md`).
 
 **The build job then runs `make check-boundary`, which is the only automated evidence
 that containment still holds.** Everything else in the gate reads the boundary rather

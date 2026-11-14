@@ -280,9 +280,10 @@ a host without one would skip such a test, and CI's strict mode (`DOCKADE_REQUIR
 would fail it, which is the "silently checks nothing" failure that mode exists to
 prevent. So `make ui-test` SKIPs without node or a browser, FAILs under strict mode, and
 CI runs it in a job of its own on the browser build the pinned `playwright-core` names.
-The tests assert on DOM, text and requests, never pixels, so layout-level deception (a
-warning that renders invisible, a confirm button that lands under the pointer) is still
-theirs to miss.
+It runs the tasks page's tests too (`tasks-ui/DESIGN.md`, "Its tests"). This page's
+assert on DOM, text and requests, never pixels, so layout-level deception (a warning
+that renders invisible, a confirm button that lands under the pointer) is still theirs
+to miss.
 
 **Moving `start()`'s code is checked twice: by comparison, outside the suite, and by
 name, inside it.** The `app.js` split moves exactly that code, so it does get a

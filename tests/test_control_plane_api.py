@@ -2347,14 +2347,18 @@ class AuditFilterTests(_CPTestCase):
         """The vocabulary and the writers are in different files with no compiler
         between them: a new decision word would be recorded, rendered, and quietly
         unfilterable — its facet a 400. Read from the SOURCE rather than exercised,
-        because the point is the set of literals that ship."""
+        because the point is the set of literals that ship: the handlers', and those
+        of ingest, which reports its own failures as rows."""
+        ingest_source = (ROOT / "control-plane" / "ingest.py").read_text()
         written = set(re.findall(r'store\._audit\(\s*"([a-z]+)"', _HANDLER_SOURCE))
         self.assertTrue(written, "no literal audit decisions found in the handlers")
-        self.assertLessEqual(written, set(cp.audit.KINDS))
+        reported = set(re.findall(r'store\._audit\(\s*"([a-z]+)"', ingest_source))
+        self.assertTrue(reported, "no literal audit kind found in ingest")
+        self.assertLessEqual(written | reported, set(cp.audit.KINDS))
         # The ingest is the other writer, and it validates against its own tuple —
         # so that tuple is the second half of the vocabulary.
         ingested = re.search(r'rec\.get\("decision"\) not in \(([^)]*)\)',
-                             (ROOT / "control-plane" / "ingest.py").read_text())
+                             ingest_source)
         self.assertIsNotNone(ingested, "the ingest's decision guard moved")
         self.assertLessEqual(set(re.findall(r'"([a-z]+)"', ingested.group(1))),
                              set(cp.audit.KINDS))
@@ -6828,6 +6832,79 @@ class ResumeTokenSeparationTests(_ToolBridgeTestCase):
                 self.assertNotIn(token, audit)
 
 
+class ToolOwedLineTests(_ToolBridgeTestCase):
+    """The answers after which the gateway writes an outcome line, and so the ones the
+    tool stream owes a line for (``ingest._check_growth``): an allowed call and a
+    granted claim. A deny, an ask and a refused claim run nothing, so owe nothing."""
+
+    def setUp(self):
+        super().setUp()
+        # Found by its file, not by name, so a handler counting under any other key
+        # than the stream's own is caught.
+        self.stream = next(s for s in cp.ingest.STREAMS
+                           if s.path == cp.ingest.TOOL_AUDIT_LOG)
+
+    def owed(self):
+        return cp.ingest._owed.get(self.stream.name, 0)
+
+    def _approved(self):
+        _tool_rule("create_pull_request", "ask")
+        ask = _ask_id(_tool_call(tool="create_pull_request", args={"title": "x"}))
+        _resolve(ask, "allow")
+        return ask
+
+    def test_an_allowed_call_owes_one_line(self):
+        _tool_rule("get_me", "allow")
+        before = self.owed()
+        self.assertEqual(_tool_call()["decision"], "allow")
+        self.assertEqual(self.owed(), before + 1)
+
+    def test_a_granted_claim_owes_one_line(self):
+        ask = self._approved()
+        before = self.owed()
+        self.assertEqual(_claim(ask).status_code, 200)
+        self.assertEqual(self.owed(), before + 1)
+
+    def test_a_deny_or_an_ask_owes_nothing(self):
+        _tool_rule("delete_file", "deny")
+        _tool_rule("create_pull_request", "ask")
+        before = self.owed()
+        self.assertEqual(_tool_call(tool="delete_file")["decision"], "deny")
+        self.assertEqual(
+            _tool_call(tool="create_pull_request", args={"n": 1})["decision"], "ask")
+        with mock.patch.object(cp.holds, "MAX_TOOL_PENDING", 0):
+            self.assertEqual(
+                _tool_call(tool="create_pull_request", args={"n": 2})["decision"],
+                "deny")
+        self.assertEqual(self.owed(), before)
+
+    def test_a_refused_claim_owes_nothing(self):
+        _tool_rule("create_pull_request", "ask")
+        pending = _ask_id(_tool_call(tool="create_pull_request", args={"n": 1}))
+        disabled = self._approved()
+        before = self.owed()
+        self.assertEqual(_claim(pending).status_code, 409)
+        self.assertEqual(_claim(disabled, client="172.30.0.137").status_code, 404)
+        cp.api_mcp.edit_mcp_server("mcp-github", _edit_request(enabled=False),
+                                   _FakeRequest())
+        resp = _claim(disabled)
+        self.assertEqual(resp.status_code, 409)
+        self.assertIs(resp.body["by_policy"], True)
+        self.assertEqual(self.owed(), before)
+
+    def test_an_answer_whose_audit_row_fails_owes_nothing(self):
+        # A 500 is an answer the gateway never acts on, so it never writes a line.
+        _tool_rule("get_me", "allow")
+        ask = self._approved()
+        before = self.owed()
+        with mock.patch.object(cp.store, "_audit", side_effect=RuntimeError("locked")):
+            with self.assertRaises(RuntimeError):
+                _tool_call()
+            with self.assertRaises(RuntimeError):
+                _claim(ask)
+        self.assertEqual(self.owed(), before)
+
+
 class ToolCorrelationColumnTests(_ToolBridgeTestCase):
     """``audit.server`` / ``audit.tool`` / ``audit.approval_id`` — the trail as
     something to QUERY rather than to grep.
@@ -9237,6 +9314,65 @@ class BodyCapTests(unittest.TestCase):
         self.assertEqual(cp.TOOL_BODY_MAX, 2 * 1024 * 1024)
         self.assertGreater(cp.TOOL_BODY_MAX, 1024 * 1024,
                            "the tool bridge must accept what the gateway lets through")
+
+
+class MainSupervisesIngestTests(unittest.TestCase):
+    """``app.main`` starts the drain supervisor before serving and stops it however
+    serving ends, and starts none when ingest is disabled. uvicorn is a stub: only the
+    order of the calls is under test."""
+
+    def run_main(self, serve, interval=2.0):
+        events = []
+
+        class Supervisor:
+            def start(self):
+                events.append("start")
+
+            def stop(self):
+                events.append("stop")
+
+        class Server:
+            def __init__(self, config):
+                pass
+
+            async def serve(self):
+                events.append("serve")
+                await serve()
+
+        uvicorn = types.ModuleType("uvicorn")
+        uvicorn.Server = Server
+        uvicorn.Config = lambda *args, **kwargs: None
+        with mock.patch.dict(sys.modules, {"uvicorn": uvicorn}), \
+                mock.patch.object(cp, "_assert_listeners_separated"), \
+                mock.patch.object(cp, "_bootstrap"), \
+                mock.patch.object(cp.ingest, "_DrainSupervisor", Supervisor), \
+                mock.patch.object(cp.ingest, "DRAIN_INTERVAL", interval), \
+                contextlib.redirect_stdout(io.StringIO()):
+            try:
+                asyncio.run(cp.main())
+            finally:
+                self.events = events
+
+    async def _returns(self):
+        return None
+
+    async def _raises(self):
+        raise OSError("address in use")
+
+    def test_the_supervisor_runs_while_the_listeners_serve(self):
+        self.run_main(self._returns)
+        self.assertEqual(self.events, ["start", "serve", "serve", "serve", "stop"])
+
+    def test_the_supervisor_is_stopped_when_serving_fails(self):
+        with self.assertRaises(OSError):
+            self.run_main(self._raises)
+        self.assertEqual(self.events[0], "start")
+        self.assertEqual(self.events[-1], "stop")
+        self.assertEqual(self.events.count("stop"), 1)
+
+    def test_a_disabled_ingest_starts_no_supervisor(self):
+        self.run_main(self._returns, interval=0)
+        self.assertEqual(self.events, ["serve", "serve", "serve"])
 
 
 if __name__ == "__main__":

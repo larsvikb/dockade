@@ -30,10 +30,12 @@ is ruled out outright: see "A record written after an irreversible act cannot fa
 closed" in DESIGN.md.
 
 What a stream must supply is in ``_Stream``: where its file is, which audit columns it
-fills, how to turn one line into a row, and, if the row needs the store to finish, a
-pass that does it on the drain's own connection. Everything else here — rotation, the
-inode-keyed cursor, the bounded block, the partial-line rule — is shared, because none
-of it has anything to do with what the lines mean.
+fills, how to turn one line into a row, if the row needs the store to finish, a pass
+that does it on the drain's own connection, and how long a line this process knows is
+owed may take to arrive before the file is called stalled. Everything else here —
+rotation, the inode-keyed cursor, the bounded block, the partial-line rule, the stall
+watch and the supervisor that restarts the loop — is shared, because none of it has
+anything to do with what the lines mean.
 """
 from __future__ import annotations
 
@@ -67,6 +69,22 @@ DRAIN_INTERVAL = float(os.environ.get("CONTROL_AUDIT_DRAIN_INTERVAL", "2"))
 # write lock, so a large backlog (first run against an existing volume) drains over
 # several passes instead of stalling startup in a single giant commit.
 DRAIN_BLOCK = int(os.environ.get("CONTROL_AUDIT_DRAIN_BLOCK", str(1 << 20)))
+# How long a line this process knows is owed may take to reach its file before the file
+# is reported STALLED (``_check_growth``), per stream. Constants, not env vars: each
+# bounds a REPORT, never a hold, so a wrong value is a late or a false line, not a
+# widened grant.
+#
+# Egress lines are written as the proxy acts on an answer, so the grace is only slack
+# for a slow disk and the drain interval. A tool line is written when the CALL ends,
+# so its grace is the gateway's GATEWAY_CALL_TIMEOUT plus the same slack. That timeout
+# bounds each socket read, not the whole call (urllib's `timeout=`, in
+# ``discovery.post``), so a server that keeps trickling bytes can outrun this grace
+# and be reported as a stall (#63). The 60 is the gateway's default
+# (`tool-gateway/execute.py`), restated because that module is in another image;
+# tests/test_topology.py holds this at or above the effective timeout, compose's
+# included.
+STALL_GRACE = 30.0
+TOOL_STALL_GRACE = 60.0 + STALL_GRACE
 
 
 # The audit columns each stream fills. Two streams describe different events, so
@@ -96,7 +114,7 @@ class _Stream:
     added in the middle silently shifts every value after it. A dict cannot land a value
     in the wrong column."""
 
-    def __init__(self, name, path, columns, row, describe, settle=None):
+    def __init__(self, name, path, columns, row, describe, grace, owed, settle=None):
         self.name = name              # what an operator sees in a failure line
         self.path = path
         self.columns = columns
@@ -106,6 +124,10 @@ class _Stream:
         # (conn, row: dict) -> None, run on each mapped row before the insert. Apart
         # from ``row`` so a mapper stays a pure function of its line.
         self.settle = settle
+        # Seconds an owed line may take before the file is reported stalled, and the
+        # noun the owed lines are counted in in that report (``_check_growth``).
+        self.grace = grace
+        self.owed = owed
 
 
 def _ingest_field(value: object) -> str | None:
@@ -306,14 +328,17 @@ def _describe_tool(row: dict) -> str:
 #: a gap worth a test rather than a habit.
 TOOL_STATUSES = ("ok", "tool-error", "rpc-error", "transport-error", "timeout")
 
+#: The two streams, by name for the handlers that owe them lines
+#: (``api_authorize.authorize``, ``api_tool.tool_authorize`` and ``tool_claim``).
+EGRESS_STREAM = _Stream("egress", EGRESS_AUDIT_LOG, _EGRESS_COLUMNS, _egress_row,
+                        _describe_egress, STALL_GRACE, "answered request(s)")
+TOOL_STREAM = _Stream("tool outcomes", TOOL_AUDIT_LOG, _TOOL_COLUMNS, _tool_row,
+                      _describe_tool, TOOL_STALL_GRACE,
+                      "allowed or claimed tool call(s)", _settle_tool_row)
+
 #: Every stream this process drains. Adding one is this tuple plus a mapper; nothing
 #: below knows how many there are.
-STREAMS = (
-    _Stream("egress", EGRESS_AUDIT_LOG, _EGRESS_COLUMNS, _egress_row,
-            _describe_egress),
-    _Stream("tool outcomes", TOOL_AUDIT_LOG, _TOOL_COLUMNS, _tool_row, _describe_tool,
-            _settle_tool_row),
-)
+STREAMS = (EGRESS_STREAM, TOOL_STREAM)
 
 
 def _audit_log_files(base: str) -> list[tuple[str, os.stat_result]]:
@@ -446,16 +471,54 @@ def _drain(stream: _Stream) -> int:
     return consumed
 
 
-# Whether each stream's last drain attempt failed, so the loop can report a transition
-# instead of the same line every DRAIN_INTERVAL. A missing file is the NORMAL state
-# before its writer first writes, and a permanently silent ingest is exactly the failure
-# this whole mechanism exists to remove — so it is reported once on the way in and once
-# on the way out, and never in between.
+# ── what goes wrong with ingest, and how it is reported ──────────────────────────────
+#
+# Four things can stop part of the trail filling: a stream that will not drain, a file
+# that stops growing, the watch for that failing, and the loop itself dying. Each is
+# reported on its TRANSITIONS, once on the way in and once on the way out, never every
+# DRAIN_INTERVAL in between, and each transition is a row of the `ingest` kind
+# (``_report``): it marks a gap in the trail, in the trail itself, where an operator
+# reading the record will meet it. The state below is what makes a transition one.
+
+#: The stage each report is written under, by what failed. Literals in a dict rather
+#: than built from the stream's name, so the stage guard in
+#: tests/test_control_plane_ui_js.py can read every one, and the page names what failed
+#: from the stage (``auditTarget`` in control-plane-ui/audit.js).
+_INGEST_STAGES = {
+    "egress": {"stage": "ingest-egress"},
+    "tool outcomes": {"stage": "ingest-tool"},
+    "loop": {"stage": "ingest-loop"},
+}
+
+
+def _report(about: str, reason: str) -> None:
+    """One ingest transition, as an `ingest` audit row whose reason says what changed;
+    ``store._audit`` mirrors it to stdout. ``about`` is a stream's name, or "loop".
+
+    Blocking, so never called on the event loop: a locked store holds a write for up to
+    its busy timeout, and the loop serves all three listeners. Never raises: the store
+    this reports on may be the thing failing, and then the plain line on stdout is all
+    that is left (the recovery row's "since" marks the gap afterwards)."""
+    try:
+        store._audit("ingest", **_INGEST_STAGES[about], reason=reason)
+    except Exception:  # noqa: BLE001 — the report must never take the loop down
+        print(f"control-plane: {reason}", flush=True)
+
+
+def _when(since: float) -> str:
+    """A wall-clock time for a recovery row, which may be read long after the opening
+    row, or with that row missing."""
+    return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(since))
+
+
+# Since when each stream's drain has been failing, by stream; absent while it drains. A
+# missing file is the NORMAL state before its writer first writes, and a permanently
+# silent ingest is exactly the failure this whole mechanism exists to remove.
 #
 # PER STREAM, not one flag for all of them: a broken egress ingest and a broken tool
 # ingest lose different evidence, and one failing must not mute the other's recovery
 # line or make its own look already-reported.
-_drain_failing: dict[str, bool] = {}
+_drain_failing: dict[str, float] = {}
 
 #: What is lost while a stream is not draining, named per stream because the operator's
 #: next move differs. Vague here would be worse than silent: this line is the only
@@ -471,16 +534,17 @@ _STREAM_STAKES = {
 # cannot see that: a writer whose volume is full keeps serving, its file just stays
 # the same size, and "nothing new" is also what a quiet writer looks like. What tells
 # them apart is a line this process KNOWS is owed: every /authorize answer is one the
-# proxy records (``api_authorize.authorize``). So a file whose inode and size have not
-# moved for STALL_GRACE seconds since an answer was given is reported, once on the way
-# in and once on the way out, as with ``_drain_failing``.
+# proxy records (``api_authorize.authorize``), and every allowed /tool/authorize and
+# granted claim is a call whose end the gateway records (``api_tool``). So a file whose
+# inode and size have not moved for its stream's ``grace`` since a line became owed is
+# reported STALLED.
 #
-# Only streams something here expects lines for can be reported. The tool stream owes
-# lines too (an allowed call, a granted claim), but each follows a call that can run
-# for GATEWAY_CALL_TIMEOUT, longer than this grace, so it is not wired yet. A writer
-# failing only SOME of its writes still grows the file and is not caught.
-STALL_GRACE = 30.0
-
+# A writer failing only SOME of its writes still grows the file and is not caught.
+#
+# Known false positives, each cleared by the writer's next line: an allow the gateway
+# never received owes a line it will never write. That happens when this handler
+# answers after the gateway's DECIDE_TIMEOUT, which the gateway refuses without an
+# outcome line (``execute.call``), or when the answer is lost on the way back.
 _owed: dict[str, int] = {}
 _owed_lock = threading.Lock()
 
@@ -503,13 +567,16 @@ class _Growth:
 
 
 _growth: dict[str, _Growth] = {}
-_stalled: dict[str, bool] = {}
+# Since when (wall clock) each stream has been reported stalled; absent while it grows.
+_stalled: dict[str, float] = {}
+# Since when ``_check_growth`` has been raising for each stream; absent while it runs.
+_watch_failing: dict[str, float] = {}
 
 
 def _check_growth(stream: _Stream, now: float) -> None:
-    # Zero before the first answer, so the baseline is taken before anything is owed
-    # and one answer is enough. A stream nothing expects lines for stays at zero and
-    # is never reported.
+    # Zero before the first owed line, so the baseline is taken before anything is owed
+    # and one is enough. A stream nothing expects lines for stays at zero and is never
+    # reported.
     owed = _owed.get(stream.name, 0)
     try:
         st = os.stat(stream.path)
@@ -518,11 +585,12 @@ def _check_growth(stream: _Stream, now: float) -> None:
     sig = (st.st_ino, st.st_size)
     last = _growth.get(stream.name)
     if last is None or sig != last.sig:
-        if _stalled.get(stream.name):
-            print(f"control-plane: {stream.name} audit file growing again "
-                  f"({stream.path}) — lines written while it was stalled may be "
-                  f"missing from /api/audit", flush=True)
-            _stalled[stream.name] = False
+        since = _stalled.pop(stream.name, None)
+        if since is not None:
+            _report(stream.name,
+                    f"{stream.name} audit file growing again ({stream.path}), stalled "
+                    f"since {_when(since)} — lines written while it was stalled may "
+                    f"be missing from /api/audit")
         _growth[stream.name] = _Growth(sig, owed)
         return
     if owed == last.owed:
@@ -530,20 +598,48 @@ def _check_growth(stream: _Stream, now: float) -> None:
     if last.owed_since is None:
         last.owed_since = now
         return
-    if now - last.owed_since >= STALL_GRACE and not _stalled.get(stream.name):
-        print(f"control-plane: {stream.name} audit file STALLED ({stream.path}): "
-              f"{owed - last.owed} answered request(s) and no new line in "
-              f"{now - last.owed_since:.0f}s — its writer's volume may be full or "
-              f"read-only; lines written during the stall may never reach "
-              f"/api/audit, and its writer's stdout has every one", flush=True)
-        _stalled[stream.name] = True
+    if now - last.owed_since >= stream.grace and stream.name not in _stalled:
+        _stalled[stream.name] = time.time()
+        _report(stream.name,
+                f"{stream.name} audit file STALLED ({stream.path}): "
+                f"{owed - last.owed} {stream.owed} and no new line in "
+                f"{now - last.owed_since:.0f}s — its writer's volume may be full or "
+                f"read-only; lines written during the stall may never reach "
+                f"/api/audit, and its writer's stdout has every one")
 
 
-async def _audit_drain_loop() -> None:
+def _watch_growth(stream: _Stream, now: float) -> None:
+    """``_check_growth``, with its own failure reported once in and once out.
+
+    In its own words, not the drain's FAILING: rows may be arriving the whole time, so
+    the drain's stakes would be false, and what is actually lost is the stall report."""
+    try:
+        _check_growth(stream, now)
+    except Exception as e:  # noqa: BLE001 — a dead watch must never be silent
+        if stream.name not in _watch_failing:
+            _watch_failing[stream.name] = time.time()
+            _report(stream.name,
+                    f"stall watch FAILING for {stream.name} ({stream.path}): {e!r} — "
+                    f"a writer that stops would go unreported until this clears")
+        return
+    since = _watch_failing.pop(stream.name, None)
+    if since is not None:
+        _report(stream.name, f"stall watch for {stream.name} recovered ({stream.path}), "
+                             f"failing since {_when(since)}")
+
+
+async def _audit_drain_loop(supervisor: _DrainSupervisor | None = None) -> None:
+    """Drain and watch every stream, every DRAIN_INTERVAL. Each step is guarded on its
+    own, so one stream failing, or its watch, stops neither the other stream nor the
+    other step. ``supervisor``, when there is one, is told of each completed pass."""
     while True:
         for stream in STREAMS:
             await _drain_stream(stream)
-            _check_growth(stream, time.monotonic())
+            # Every pass, whatever the drain did: a stream that will not drain can
+            # still be one whose writer has stopped.
+            await asyncio.to_thread(_watch_growth, stream, time.monotonic())
+        if supervisor is not None:
+            await supervisor.passed()
         await asyncio.sleep(DRAIN_INTERVAL)
 
 
@@ -565,15 +661,89 @@ async def _drain_stream(stream: _Stream) -> None:
         for _ in range(64):
             if await asyncio.to_thread(_drain, stream) == 0:
                 break
-        if _drain_failing.get(stream.name):
-            print(f"control-plane: {stream.name} ingest recovered ({stream.path})",
-                  flush=True)
-            _drain_failing[stream.name] = False
     except asyncio.CancelledError:
         raise
     except Exception as e:  # noqa: BLE001 — a dead loop must never be silent
-        if not _drain_failing.get(stream.name):
-            print(f"control-plane: {stream.name} ingest FAILING ({stream.path}): "
-                  f"{e!r} — {_STREAM_STAKES[stream.name]} until this clears",
-                  flush=True)
-            _drain_failing[stream.name] = True
+        if stream.name not in _drain_failing:
+            _drain_failing[stream.name] = time.time()
+            await asyncio.to_thread(
+                _report, stream.name,
+                f"{stream.name} ingest FAILING ({stream.path}): {e!r} — "
+                f"{_STREAM_STAKES[stream.name]} until this clears")
+        return
+    since = _drain_failing.pop(stream.name, None)
+    if since is not None:
+        await asyncio.to_thread(_report, stream.name,
+                                f"{stream.name} ingest recovered ({stream.path}), "
+                                f"failing since {_when(since)}")
+
+
+class _DrainSupervisor:
+    """Owns the drain loop's task, and restarts the loop when it dies.
+
+    Every step in the loop is guarded, so nothing realistic kills it; this is for the
+    bug nobody has found. RESTART, never exit: compose runs this service under
+    `restart: always`, so a deterministic bug that exited would crash-loop the
+    governance authority and fail every sandbox closed, while a stopped drain loses
+    nothing until the outage outlasts the writers' rotated backups.
+
+    The task is held here because asyncio keeps only a weak reference to it, and an
+    unreferenced task can be collected mid-flight, stopping ingest with no error. The
+    pending restart is held for the same reason, and so ``stop`` can cancel it."""
+
+    def __init__(self):
+        self.stopped = False
+        self.task: asyncio.Task | None = None
+        self.restart: asyncio.Task | None = None
+        self.down_since: float | None = None   # wall clock of the first death
+        self.deaths = 0                         # since the loop last completed a pass
+
+    def start(self) -> None:
+        self.task = asyncio.create_task(_audit_drain_loop(self))
+        self.task.add_done_callback(self._ended)
+
+    def stop(self) -> None:
+        self.stopped = True
+        for task in (self.task, self.restart):
+            if task is not None:
+                task.cancel()
+
+    def _ended(self, task: asyncio.Task) -> None:
+        # A done-callback, run on the event loop: no I/O here.
+        if task.cancelled():
+            return
+        # Read on EVERY path: an exception nobody retrieves is logged as "never
+        # retrieved" when the task is collected. On the stopped path ``stop``'s cancel
+        # has already silenced it; reading it anyway leans on nothing.
+        error = task.exception()
+        if self.stopped:
+            return
+        self.deaths += 1
+        first = self.down_since is None
+        if first:
+            self.down_since = time.time()
+        self.restart = asyncio.get_running_loop().create_task(
+            self._restart(error, first))
+
+    async def _restart(self, error: BaseException | None, first: bool) -> None:
+        # Deaths while already down are counted, not reported: a deterministic bug
+        # would otherwise write a row every DRAIN_INTERVAL.
+        if first:
+            await asyncio.to_thread(
+                _report, "loop",
+                f"ingest loop DIED: {error!r} — no stream is drained or watched until "
+                f"it runs again; restarting it every {DRAIN_INTERVAL:g}s")
+        # No `stopped` check: ``stop`` cancels this task, at whichever await it is.
+        await asyncio.sleep(DRAIN_INTERVAL)
+        self.start()
+
+    async def passed(self) -> None:
+        """The loop completed a pass: if it had died, say it is running again. Awaited
+        in the loop's own task, so the report is written by the loop it is about."""
+        if self.down_since is None:
+            return
+        since, deaths = self.down_since, self.deaths
+        self.down_since, self.deaths = None, 0
+        await asyncio.to_thread(_report, "loop",
+                                f"ingest loop running again after {deaths} death(s), "
+                                f"down since {_when(since)}")

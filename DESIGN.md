@@ -1260,6 +1260,16 @@ what it can see. The proxy names every failed write on its own stdout
 `/authorize` answer is followed by at least one line, so ingest reports a file that
 stays still after answers (`_check_growth` in `control-plane/ingest.py`). Decisions
 the proxy makes alone, while nothing asks `/authorize`, are seen only by the first.
+The MCP gateway's outcome stream is watched the same way: every allowed
+`/tool/authorize` and every granted claim is a call whose end it records. Each stream
+has its own grace, because a tool line follows the call rather than the answer. The
+gateway's call timeout bounds each read rather than the whole call, so a server that
+keeps trickling bytes can outrun the grace and read as a stall (#63).
+
+Each transition into or out of a failure (a stream that will not drain, a stalled
+file, the watch itself raising, the drain loop dying) writes one `ingest` row, so the
+gap is marked in the trail it is a gap in. A dead drain loop is restarted rather than
+exiting the process (`_DrainSupervisor` in `control-plane/ingest.py`).
 
 **Telling an outage denial from a policy denial.** Those `control-plane unreachable`
 rows carry the same red `deny` tag as a rule refusing a host, against the same host

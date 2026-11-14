@@ -33,12 +33,15 @@ from __future__ import annotations
 import asyncio
 import atexit
 import contextlib
+import gc
 import io
 import json
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -342,8 +345,8 @@ class DrainTests(IngestTestCase):
 
     def test_missing_file_raises_so_the_loop_can_report_it(self):
         """Swallowed here it would be a permanently silent ingest — the exact
-        failure shape this change exists to remove. _audit_drain_loop owns the
-        once-per-transition reporting."""
+        failure shape this change exists to remove. _drain_stream, the loop's guarded
+        step, owns the once-per-transition reporting."""
         with self.assertRaises(OSError):
             cp.ingest._drain(self.stream)
 
@@ -1023,6 +1026,335 @@ class StalledStreamTests(IngestTestCase):
         with mock.patch.object(cp.api_authorize, "_answer", return_value="ok"):
             cp.api_authorize.authorize(object())
         self.assertEqual(cp.ingest._owed["egress"], before + 2)
+
+
+
+class ToolStalledStreamTests(IngestTestCase):
+    """The tool stream is watched as egress is, with its own grace: its owed line
+    follows the call, which may run for the gateway's whole call timeout."""
+
+    #: The gateway's default call timeout (`tool-gateway/execute.py`), which
+    #: tests/test_topology.py holds ``TOOL_STALL_GRACE`` above.
+    CALL_TIMEOUT = 60.0
+
+    def setUp(self):
+        super().setUp()
+        _reset_ingest_state(self)
+        self.tool = _stream("tool outcomes")
+        self.addCleanup(setattr, self.tool, "path", self.tool.path)
+        self.tool.path = self.path
+        self.write(json.dumps({"ts": 1000.0, "stage": "tool-result", "status": "ok"})
+                   + "\n")
+
+    def owe(self, n=1):
+        for _ in range(n):
+            cp.ingest._expect_line(self.tool.name)
+
+    def check(self, now):
+        cp.ingest._check_growth(self.tool, now)
+
+    def reports(self, word):
+        return [ln for ln in self.out.getvalue().splitlines() if word in ln]
+
+    def test_a_call_still_running_is_not_a_stall(self):
+        self.check(0)
+        self.owe()
+        self.check(1)
+        self.check(1 + cp.ingest.STALL_GRACE)
+        self.check(1 + self.CALL_TIMEOUT)
+        self.assertEqual(self.reports("STALLED"), [])
+
+    def test_past_its_grace_it_is_reported_once_counting_tool_calls(self):
+        self.check(0)
+        self.owe(2)
+        self.check(1)
+        self.check(1 + cp.ingest.TOOL_STALL_GRACE)
+        self.check(2 + cp.ingest.TOOL_STALL_GRACE)
+        stalled = self.reports("STALLED")
+        self.assertEqual(len(stalled), 1)
+        self.assertIn("tool outcomes audit file STALLED", stalled[0])
+        self.assertIn("2 allowed or claimed tool call(s)", stalled[0])
+
+
+def _reset_ingest_state(test):
+    """Clear the module's transition state for every stream, now and after the test, so
+    one test's failure cannot read as the next one's transition."""
+    names = [s.name for s in cp.ingest.STREAMS]
+    states = (cp.ingest._owed, cp.ingest._growth, cp.ingest._stalled,
+              cp.ingest._drain_failing, cp.ingest._watch_failing)
+
+    def clear():
+        for state in states:
+            for name in names:
+                state.pop(name, None)
+
+    clear()
+    test.addCleanup(clear)
+
+
+class _LoopTestCase(IngestTestCase):
+    """The real loop, over the egress stream alone, pointed at the test's file."""
+
+    def setUp(self):
+        super().setUp()
+        _reset_ingest_state(self)
+        streams = mock.patch.object(cp.ingest, "STREAMS", (self.stream,))
+        streams.start()
+        self.addCleanup(streams.stop)
+        self.write(_line())
+
+    def passes(self, n, between=None):
+        """Run ``n`` passes of the loop; ``between(i)`` runs after pass ``i``."""
+        done = 0
+
+        async def sleep(_seconds):
+            nonlocal done
+            done += 1
+            if between is not None:
+                between(done)
+            if done >= n:
+                raise asyncio.CancelledError
+
+        with mock.patch.object(cp.ingest.asyncio, "sleep", side_effect=sleep), \
+                self.assertRaises(asyncio.CancelledError):
+            asyncio.run(cp.ingest._audit_drain_loop())
+
+    def lines(self, word):
+        return [ln for ln in self.out.getvalue().splitlines() if word in ln]
+
+    def ingest_rows(self):
+        with cp.store._connect() as conn:
+            return [(r["stage"], r["reason"]) for r in conn.execute(
+                "SELECT stage, reason FROM audit WHERE kind='ingest' ORDER BY id")]
+
+
+def _raising_first(n, real, error=RuntimeError):
+    """A stand-in for ``real`` that raises ``error`` on its first ``n`` calls."""
+    calls = 0
+
+    def stand_in(*args):
+        nonlocal calls
+        calls += 1
+        if calls <= n:
+            raise error(f"call {calls}")
+        return real(*args)
+
+    return stand_in
+
+
+class StallWatchTests(_LoopTestCase):
+    """``_check_growth`` is its own guarded step, beside the drain rather than inside
+    it, so neither failing stops the other."""
+
+    def test_a_watch_that_raises_is_reported_once_in_its_own_words(self):
+        self.write(_line(host="second.example"))
+        with mock.patch.object(cp.ingest, "_check_growth",
+                               side_effect=_raising_first(2, cp.ingest._check_growth)):
+            self.passes(6)                    # three passes past the recovery
+        self.assertEqual(len(self.lines("stall watch FAILING for egress")), 1)
+        # Not the drain's words: rows arrived the whole time, so its stakes are false.
+        self.assertEqual(self.lines("ingest FAILING"), [])
+        self.assertEqual([r["host"] for r in self.rows() if r["kind"] != "ingest"],
+                         ["evil.com", "second.example"])
+        self.assertEqual(len(self.lines("stall watch for egress recovered")), 1)
+
+    def test_a_stall_is_reported_while_the_drain_fails(self):
+        self.addCleanup(setattr, self.stream, "grace", self.stream.grace)
+        self.stream.grace = 0
+        with mock.patch.object(cp.ingest, "_drain", side_effect=OSError("gone")):
+            self.passes(3, between=lambda i: i == 1 and cp.ingest._expect_line("egress"))
+        self.assertEqual(len(self.lines("ingest FAILING")), 1)
+        self.assertEqual(len(self.lines("STALLED")), 1)
+
+
+class TransitionRowTests(_LoopTestCase):
+    """Every transition into or out of a failure is one `ingest` row, written off the
+    event loop, and a store that cannot take it leaves the plain line on stdout."""
+
+    def test_each_transition_is_one_row_and_a_recovery_names_when_it_began(self):
+        with mock.patch.object(cp.ingest, "_drain",
+                               side_effect=_raising_first(2, cp.ingest._drain, OSError)), \
+                mock.patch.object(cp.ingest.time, "time", return_value=1e9):
+            self.passes(4)
+        self.assertEqual(
+            self.ingest_rows(),
+            [("ingest-egress", f"egress ingest FAILING ({self.path}): "
+                               f"OSError('call 1') — "
+                               f"{cp.ingest._STREAM_STAKES['egress']} until this clears"),
+             ("ingest-egress", f"egress ingest recovered ({self.path}), failing since "
+                               f"2001-09-09 01:46:40 UTC")])
+        # The row's mirror is the stdout line now, not a second print beside it.
+        self.assertEqual(len(self.lines("AUDIT ingest stage=ingest-egress")), 2)
+        self.assertEqual(self.lines("control-plane: egress ingest"), [])
+
+    def test_a_growing_again_row_names_when_the_stall_began(self):
+        self.addCleanup(setattr, self.stream, "grace", self.stream.grace)
+        self.stream.grace = 0
+
+        def between(i):
+            if i == 1:
+                cp.ingest._expect_line("egress")
+            if i == 3:
+                self.write(_line(host="late.example"))
+
+        with mock.patch.object(cp.ingest.time, "time", return_value=1e9):
+            self.passes(4, between)
+        self.assertEqual([stage for stage, _ in self.ingest_rows()],
+                         ["ingest-egress", "ingest-egress"])
+        self.assertIn("STALLED", self.ingest_rows()[0][1])
+        self.assertIn("growing again", self.ingest_rows()[1][1])
+        self.assertIn("stalled since 2001-09-09 01:46:40 UTC", self.ingest_rows()[1][1])
+
+    def test_a_report_the_store_refuses_is_printed_plain_and_the_loop_goes_on(self):
+        with mock.patch.object(cp.ingest, "_drain", side_effect=OSError("gone")), \
+                mock.patch.object(cp.store, "_audit",
+                                  side_effect=sqlite3.OperationalError("locked")):
+            self.passes(3)
+        failing = self.lines("control-plane: egress ingest FAILING")
+        self.assertEqual(len(failing), 1)
+        self.assertIn(cp.ingest._STREAM_STAKES["egress"], failing[0])
+
+    def test_no_transition_is_written_on_the_event_loop_thread(self):
+        on_loop = []
+        real = cp.ingest._report
+
+        def spy(about, reason):
+            on_loop.append(threading.current_thread() is threading.main_thread())
+            real(about, reason)
+
+        with mock.patch.object(cp.ingest, "_report", side_effect=spy), \
+                mock.patch.object(cp.ingest, "_drain",
+                                  side_effect=_raising_first(1, cp.ingest._drain, OSError)), \
+                mock.patch.object(cp.ingest, "_check_growth",
+                                  side_effect=_raising_first(1, cp.ingest._check_growth)):
+            self.passes(2)
+        self.assertEqual(on_loop, [False] * 4)
+
+
+class DrainSupervisorTests(IngestTestCase):
+    """``_DrainSupervisor`` restarts a loop that died, reports the death once and the
+    recovery once, and leaves nothing running once stopped."""
+
+    def setUp(self):
+        super().setUp()
+        _reset_ingest_state(self)
+        for name, value in (("STREAMS", (self.stream,)), ("DRAIN_INTERVAL", 0.01)):
+            patch = mock.patch.object(cp.ingest, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.write(_line())
+
+    def loop_rows(self):
+        with cp.store._connect() as conn:
+            return [r["reason"] for r in conn.execute(
+                "SELECT reason FROM audit WHERE kind='ingest' AND stage='ingest-loop' "
+                "ORDER BY id")]
+
+    @staticmethod
+    async def until(condition, limit=5.0):
+        deadline = time.monotonic() + limit
+        while not condition():
+            if time.monotonic() > deadline:
+                raise AssertionError("the condition never held")
+            await asyncio.sleep(0.005)
+
+    @staticmethod
+    def others():
+        return asyncio.all_tasks() - {asyncio.current_task()}
+
+    def test_a_dead_loop_is_reported_once_restarted_and_its_recovery_counted(self):
+        drain = mock.AsyncMock(side_effect=RuntimeError("bug"))
+        on_loop = []
+        real = cp.ingest._report
+
+        def spy(about, reason):
+            on_loop.append(threading.current_thread() is threading.main_thread())
+            real(about, reason)
+
+        async def scenario():
+            supervisor = cp.ingest._DrainSupervisor()
+            supervisor.start()
+            first = supervisor.task
+            await self.until(lambda: supervisor.deaths >= 2)
+            self.assertIsNot(supervisor.task, first)
+            self.assertEqual(len(self.loop_rows()), 1)
+            drain.side_effect = None
+            await self.until(lambda: len(self.loop_rows()) == 2)
+            # Many more passes at a 0.01 s interval: the recovery is reported once.
+            passes = drain.await_count
+            await self.until(lambda: drain.await_count >= passes + 5)
+            self.assertEqual(len(self.loop_rows()), 2)
+            supervisor.stop()
+            await asyncio.sleep(0)
+            await self.until(lambda: not self.others())
+
+        with mock.patch.object(cp.ingest, "_drain_stream", drain), \
+                mock.patch.object(cp.ingest, "_report", side_effect=spy):
+            asyncio.run(scenario())
+        died, again = self.loop_rows()
+        self.assertIn("ingest loop DIED: RuntimeError('bug')", died)
+        found = re.search(r"running again after (\d+) death\(s\), down since ", again)
+        self.assertIsNotNone(found, again)
+        self.assertGreaterEqual(int(found.group(1)), 2)
+        self.assertEqual(on_loop, [False, False])
+
+    def test_a_cancelled_loop_is_not_restarted(self):
+        async def scenario():
+            supervisor = cp.ingest._DrainSupervisor()
+            supervisor.start()
+            await asyncio.sleep(0)
+            supervisor.task.cancel()
+            await asyncio.sleep(0.05)
+            self.assertIsNone(supervisor.restart)
+            self.assertEqual(self.others(), set())
+
+        # A cancelled task has no exception to read: asking for one raises in the
+        # callback, which asyncio logs.
+        with self.assertNoLogs("asyncio", "ERROR"):
+            asyncio.run(scenario())
+        self.assertEqual(self.loop_rows(), [])
+
+    def test_stop_during_the_restart_delay_leaves_nothing_running(self):
+        async def scenario():
+            supervisor = cp.ingest._DrainSupervisor()
+            supervisor.start()
+            first = supervisor.task
+            await self.until(lambda: len(self.loop_rows()) == 1)
+            # Inside the 30 s delay nothing restarts, so nothing dies again: without
+            # the delay a deterministic bug would spin the loop.
+            await asyncio.sleep(0.1)
+            self.assertEqual(supervisor.deaths, 1)
+            self.assertIs(supervisor.task, first)
+            supervisor.stop()
+            await self.until(lambda: not self.others())
+            self.assertTrue(supervisor.restart.cancelled())
+            self.assertTrue(supervisor.task.done())
+
+        with mock.patch.object(cp.ingest, "DRAIN_INTERVAL", 30.0), \
+                mock.patch.object(cp.ingest, "_drain_stream",
+                                  mock.AsyncMock(side_effect=RuntimeError)):
+            asyncio.run(scenario())
+
+    def test_stop_before_a_dead_loops_callback_leaves_nothing_running_or_unretrieved(self):
+        async def scenario():
+            supervisor = cp.ingest._DrainSupervisor()
+            supervisor.start()
+            task = supervisor.task
+            await asyncio.sleep(0)            # the loop's first step raises
+            self.assertTrue(task.done())
+            supervisor.stop()                 # before its done-callback has run
+            await asyncio.sleep(0)            # the callback runs, stopped
+            self.assertIsNone(supervisor.restart)
+            self.assertEqual(self.others(), set())
+            # Unreferenced and collected: an exception nobody retrieved is logged now.
+            supervisor.task = task = None
+            gc.collect()
+
+        with mock.patch.object(cp.ingest, "_drain_stream",
+                               mock.AsyncMock(side_effect=RuntimeError)), \
+                self.assertNoLogs("asyncio", "ERROR"):
+            asyncio.run(scenario())
+        self.assertEqual(self.loop_rows(), [])
 
 
 if __name__ == "__main__":

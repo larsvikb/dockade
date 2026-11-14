@@ -56,17 +56,33 @@ const AUDIT_STATUS_SHAPE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,19}$/;
 // WHAT THE ROW IS ABOUT, for the `target` column.
 //
 // Every kind of row has one, and before this several did not use it: an egress row
-// names a host, a policy row names the pattern it wrote, and every tool-shaped row —
-// the call, the ask, the resumption, the outcome, the rule that governs it — names the
-// tool. Those last ones left the cell EMPTY while still rendering their stage prefix,
-// so the column read `tool-call · ` with nothing after the separator. The fix is not to
-// drop the separator but to fill the cell: the columns to fill it from have existed
-// since the audit trail became joinable.
+// names a host, a policy row names the pattern it wrote, every tool-shaped row — the
+// call, the ask, the resumption, the outcome, the rule that governs it — names the
+// tool, and an ingest row names the stream or the loop that failed. The tool-shaped
+// rows left the cell EMPTY while still rendering their stage prefix, so the column
+// read `tool-call · ` with nothing after the separator. The fix is not to drop the
+// separator but to fill the cell: the columns to fill it from have existed since the
+// audit trail became joinable, and an ingest row fills it from its stage (below).
+//
+// An `ingest` row is about the part of the trail that stopped or started filling, and
+// names it only in its stage: `ingest-egress`, `ingest-tool`, `ingest-loop`. The cell
+// takes what follows the `ingest-`, so the row reads `ingest-egress · egress`.
 //
 // `host` wins where both are present, because a row that has one is an egress decision
 // and the host IS its identity. Nothing sets both today.
 function auditTarget(r) {
-  return (r && r.host) || toolSubject(r) || "";
+  return (r && r.host) || toolSubject(r) || ingestSubject(r);
+}
+
+const AUDIT_INGEST = "ingest";
+const INGEST_STAGE = /^ingest-(.+)$/;
+
+// Held to the stage shape, as the prefix beside it is, so the cell is bounded too.
+function ingestSubject(r) {
+  if (!r || r.kind !== AUDIT_INGEST) return "";
+  const stage = r.stage || "";
+  const found = AUDIT_STAGE_SHAPE.test(stage) && INGEST_STAGE.exec(stage);
+  return found ? found[1] : "";
 }
 
 // The qualifier in front of the target — `http · example.com`, `tool-call ·

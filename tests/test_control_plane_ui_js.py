@@ -885,6 +885,16 @@ console.log(JSON.stringify({
         outcome_ok: m.auditRow({ ts: 1e9, kind: "outcome", stage: "tool-result",
                                  server: "mcp-github", tool: "get_me", status: "ok",
                                  client: "172.30.0.2" }),
+        // INGEST rows name what stopped filling in their stage alone.
+        ingest_egress: m.auditRow({ ts: 1e9, kind: "ingest", stage: "ingest-egress",
+                                    reason: "egress ingest FAILING" }),
+        ingest_other_kind: m.auditRow({ ts: 1e9, kind: "deny",
+                                        stage: "ingest-egress" }).target,
+        // A stage outside the shape names nothing, as it takes no prefix.
+        ingest_long: m.auditRow({ ts: 1e9, kind: "ingest",
+                                  stage: "ingest-" + "x".repeat(20) }).target,
+        ingest_malformed: m.auditRow({ ts: 1e9, kind: "ingest",
+                                       stage: "ingest-<b>egress</b>" }).target,
         outcome_failed: m.auditRow({ ts: 1e9, kind: "outcome",
                                      stage: "tool-result", server: "mcp-github",
                                      tool: "create_pull_request",
@@ -2718,6 +2728,19 @@ class PageScriptTests(unittest.TestCase):
         self.assertEqual(a["outcome_failed"]["target"],
                          "mcp-github__create_pull_request")
 
+    def test_an_ingest_row_names_what_stopped_filling(self):
+        """An `ingest` row has no host and no tool; what failed is in its stage, so the
+        cell reads it from there rather than staying empty and taking the prefix with
+        it. Only for that kind: a stage is not what any other row is about."""
+        a = self.probe["saturation"]["audit"]
+        self.assertEqual(a["ingest_egress"]["target"], "egress")
+        self.assertEqual(a["ingest_egress"]["stagePrefix"], "ingest-egress · ")
+        self.assertEqual(a["ingest_other_kind"], "")
+        # The cell is held to the stage shape as the prefix is: a stage outside it
+        # leaves the cell empty rather than putting unbounded text beside the tag.
+        self.assertEqual(a["ingest_long"], "")
+        self.assertEqual(a["ingest_malformed"], "")
+
     def test_every_kind_of_row_names_what_it_is_about(self):
         """`target` was empty for four of the seven row kinds, which is how the column
         ended up rendering `tool-call · ` — a separator with nothing after it.
@@ -3854,6 +3877,9 @@ console.log(JSON.stringify({
   ordinary: m.AUDIT_ORDINARY_STAGE,
   prefixes: stages.map(stage => [stage, m.auditRow({ ts: 1e9, kind: "deny", stage,
                                                      host: "a.example" }).stagePrefix]),
+  ingest: stages.filter(stage => stage.startsWith("ingest-"))
+                .map(stage => [stage, m.auditRow({ ts: 1e9, kind: "ingest",
+                                                   stage }).target]),
 }));
 """
 
@@ -3897,7 +3923,8 @@ class AuditStageGuardTests(unittest.TestCase):
     def test_the_collector_finds_the_stages_it_must(self):
         stages, _ = _written_stages()
         self.assertLessEqual({"connect", "http", "sni", "tool-call", "tool-withdraw",
-                              "tool-result", "boot-sweep", "tool-policy"}, stages)
+                              "tool-result", "boot-sweep", "tool-policy",
+                              "ingest-egress", "ingest-tool", "ingest-loop"}, stages)
 
     def test_every_non_literal_stage_is_a_named_pass_through(self):
         _, other = _written_stages()
@@ -3935,6 +3962,12 @@ class AuditStageGuardTests(unittest.TestCase):
                     self.assertEqual(prefix, "")
                 else:
                     self.assertEqual(prefix, f"{stage} · ")
+        # An ingest row has nothing but its stage to name what failed, so each stage
+        # ingest writes must give the cell something.
+        self.assertTrue(probe["ingest"], "no ingest- stage was collected")
+        for stage, target in probe["ingest"]:
+            with self.subTest(stage=stage):
+                self.assertNotEqual(target, "")
 
 
 class AuditTableSourceTests(unittest.TestCase):

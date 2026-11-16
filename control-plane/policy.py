@@ -496,6 +496,24 @@ DEFAULT_PORT = 8082
 DEFAULT_PATH = "/mcp"
 
 
+def _unsendable_char(value: str) -> tuple[int, str] | None:
+    """The first character of ``value`` that cannot be in a header value the gateway
+    sends, with its position counted from 1, or None.
+
+    Printable latin-1 only, by ``str.isprintable``: no control character (C0, tab
+    included though RFC 9110 allows it, DEL, C1), no NBSP or soft hyphen, which look
+    like a space or nothing and earn a 401, and nothing above U+00FF, which also
+    catches a lone surrogate. A bare CR or LF, or anything past latin-1, makes
+    ``http.client`` raise with the whole built value, secret included
+    (``discovery.auth_header`` in the tool gateway is the runtime guard); one before
+    a space or tab it sends as a folded line, and NUL it sends as is, so the store
+    is the one place those are caught before an upstream sees them."""
+    for i, ch in enumerate(value, 1):
+        if ch > "\u00ff" or not ch.isprintable():
+            return i, ch
+    return None
+
+
 def _server_name_error(server: str) -> str | None:
     """Why ``server`` cannot be a server name, or None if it can.
 
@@ -515,10 +533,13 @@ def _server_name_error(server: str) -> str | None:
 def _auth_descriptor_error(auth_type: str, header: str, template: str) -> str | None:
     """Why an auth descriptor cannot be stored, or None if it can.
 
-    Two refusals carry real weight. A ``header`` descriptor with no
+    Three refusals carry real weight. A ``header`` descriptor with no
     ``{secret}`` placeholder builds a header with no credential in it, and the
     upstream answer to that is a 401 — indistinguishable, from the UI, from a policy
-    problem or an expired token. And a ``none`` descriptor carrying header fields is
+    problem or an expired token. A template with a character no header value may
+    hold (``_unsendable_char``) is refused naming only its code point and position,
+    before any message that quotes the template: a token pasted into it would
+    otherwise be echoed back. And a ``none`` descriptor carrying header fields is
     configuration that says two things at once, so neither is the source of truth."""
     if auth_type not in AUTH_TYPES:
         return (f"auth type must be one of {', '.join(AUTH_TYPES)}, "
@@ -539,6 +560,13 @@ def _auth_descriptor_error(auth_type: str, header: str, template: str) -> str | 
     if len(template) > _TEMPLATE_MAX_LEN:
         return (f"the template is {len(template)} characters; the ceiling is "
                 f"{_TEMPLATE_MAX_LEN}")
+    bad = _unsendable_char(template)
+    if bad is not None:
+        position, ch = bad
+        # Counted on the template as stored, which the route has stripped: Python's
+        # strip also takes U+001C-U+001F and U+0085, which a browser's trim leaves.
+        return (f"the template has U+{ord(ch):04X} at character {position} of the "
+                f"trimmed template; a header value takes printable latin-1 only")
     if template.count(SECRET_PLACEHOLDER) != 1:
         return (f"the template must contain {SECRET_PLACEHOLDER} exactly once, so the "
                 f"gateway has one place to put the secret — {template!r} has "

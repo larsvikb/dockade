@@ -181,12 +181,6 @@ def edit_mcp_server(server: str, req: ServerEditRequest,
     auth_type, header, template = _descriptor(req)
     port, path = _endpoint(req)
 
-    error = policy._auth_descriptor_error(auth_type, header, template)
-    if error is None:
-        error = policy._endpoint_error(port, path)
-    if error is not None:
-        return JSONResponse({"ok": False, "detail": error}, status_code=400)
-
     with store._connect() as conn:
         row = conn.execute(
             "SELECT server, enabled, auth_type, auth_header, auth_template, "
@@ -195,10 +189,22 @@ def edit_mcp_server(server: str, req: ServerEditRequest,
         if row is None:
             return JSONResponse({"ok": False, "detail": "unknown server"},
                                 status_code=404)
+        same_descriptor = (row["auth_type"] == auth_type
+                           and (row["auth_header"] or "") == header
+                           and (row["auth_template"] or "") == template)
+        # Disabling stays possible with a descriptor stored before a check refused it:
+        # the UI's toggle echoes the stored one back, and a server that cannot be
+        # switched off has lost the blunt way back. Only that echo skips the check; a
+        # changed descriptor is validated whatever ``enabled`` says.
+        error = None
+        if enabled or not same_descriptor:
+            error = policy._auth_descriptor_error(auth_type, header, template)
+        if error is None:
+            error = policy._endpoint_error(port, path)
+        if error is not None:
+            return JSONResponse({"ok": False, "detail": error}, status_code=400)
         before = _server_view(row)
-        if (before["enabled"] == enabled and row["auth_type"] == auth_type
-                and (row["auth_header"] or "") == header
-                and (row["auth_template"] or "") == template
+        if (before["enabled"] == enabled and same_descriptor
                 and row["port"] == port and row["path"] == path):
             # Asked for what is already configured — a non-write, reported as one, so
             # the audit trail does not claim the surface moved when it did not.

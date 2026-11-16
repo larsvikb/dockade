@@ -530,7 +530,68 @@ const approveW = {kind: "approve", task: "7", revision: 4, plan: 6, verb: "appro
 const bare = {...approveW, answers: []};
 const reread = extra => ({task: task("open", {revision: 5, plan: decided, answers: answered,
                                               ...extra})});
+// The label table: each move a task offers as [state, main, second, caution], its
+// break last, over the timeline page read with it. Plan 6 has no decisions in
+// `approvedHistory`'s and `earlierHistory`'s cases: approved by an entry naming it, or
+// only handed in after an approve of plan 5.
+const approvedHistory = [{action: "submit_plan", detail: {plan: 6}},
+                         {action: "approve", detail: {plan: 6, state: "open"}}];
+const earlierHistory = [{action: "approve", detail: {plan: 5, state: "open"}},
+                        {action: "submit_plan", detail: {plan: 6}}];
+const row = l => [l.main, l.second, l.caution];
+const labelled = (tk, history = null, picked = null) => [
+  ...m.movesFor(tk).map(mv => [mv.state, ...row(t.moveLabel(mv, tk, picked, history))]),
+  ...(tk.claim ? [["break", ...row(t.breakLabel(tk.claim))]] : [])];
+// Every state, by what its plan is: none, a superseded one, one answered, one with no
+// decisions found approved, one not found approved, and each claimed.
+const kinds = {
+  none: [{}, null], superseded: [{plan: {...plan, superseded_at: 1}}, null],
+  answered: [{plan: decided, answers: answered}, null],
+  approved: [{plan}, approvedHistory], unapproved: [{plan}, earlierHistory],
+};
+const matrix = {};
+for (const state of m.TASK_STATES) {
+  for (const [kind, [extra, history]] of Object.entries(kinds)) {
+    matrix[`${state}/${kind}`] = labelled(task(state, extra), history);
+    matrix[`${state}/${kind}/claimed`] = labelled(task(state, {...extra, claim}), history);
+  }
+}
+const primaries = Object.fromEntries(m.TASK_STATES.flatMap(state => [
+  [`${state}/none`, t.primaryMove(task(state))],
+  [`${state}/plan`, t.primaryMove(task(state, {plan}))],
+  [`${state}/answered`, t.primaryMove(task(state, {plan: decided, answers: answered}))],
+]));
 console.log(JSON.stringify({
+  matrix, primaries, primary_none: t.primaryMove(null),
+  table: {
+    open_claimed: labelled(task("open", {plan: decided, answers: answered, claim})),
+    open_none: labelled(task("open")),
+    refined: labelled(task("refined", {plan})),
+    refined_answered: labelled(task("refined", {plan: decided, answers: answered})),
+    landing: labelled(task("landing", {plan})),
+    deferred_none: labelled(task("deferred")),
+    deferred_approved: labelled(task("deferred", {plan}), approvedHistory),
+    deferred_unapproved: labelled(task("deferred", {plan}), earlierHistory),
+    closed_answered: labelled(task("closed", {plan: decided, answers: answered})),
+    proposed_superseded: labelled(task("proposed", {plan: {...plan, superseded_at: 1}})),
+  },
+  approved_in: {
+    answered: m.planApprovedIn(task("closed", {plan: decided, answers: answered}), []),
+    history: m.planApprovedIn(task("closed", {plan}), approvedHistory),
+    earlier: m.planApprovedIn(task("closed", {plan}), earlierHistory),
+    no_history: m.planApprovedIn(task("closed", {plan}), null),
+    // Decisions not answered: an approve naming the plan would have answered them.
+    decided: m.planApprovedIn(task("closed", {plan: decided}),
+                              [{action: "approve", detail: {plan: 6}}]),
+    superseded: m.planApprovedIn(task("closed", {plan: {...plan, superseded_at: 1}}),
+                                 approvedHistory),
+    no_plan: m.planApprovedIn(task("closed"), approvedHistory),
+  },
+  holder: [t.holderText(claim), t.holderText(null)],
+  note_labels: [t.noteMoveLabel({kind: "hide", value: false, verb: "unhide"}),
+                t.noteMoveLabel({kind: "hide", value: true, verb: "hide"}),
+                t.noteMoveLabel({kind: "handle", value: false, verb: "mark not handled"}),
+                t.NOTE_SECOND],
   moves: {
     proposed: moves(task("proposed")),
     refined_with_plan: moves(task("refined", {plan})),
@@ -620,13 +681,6 @@ console.log(JSON.stringify({
     approve: t.approveLabel(task("refined", {plan})),
     approve_opens: t.approveLabel(task("refined", {plan: decided}), "open"),
     approve_back: t.approveLabel(task("refined", {plan: decided}), "proposed"),
-    reopen: t.moveLabel({state: "open", verb: "reopen", endsClaim: false},
-                        task("refined", {plan: decided, answers: answered})),
-    reopen_claimed: t.moveLabel({state: "open", verb: "reopen", endsClaim: true},
-                                task("refined", {plan: decided, answers: answered,
-                                                 claim})),
-    reopen_closed: t.moveLabel({state: "open", verb: "reopen", endsClaim: false},
-                               task("closed", {plan})),
     send_back: t.moveLabel(sendBack, task("refined", {plan: decided}), assumed),
     send_back_differs: t.moveLabel(sendBack, task("refined", {plan: decided}), denied),
     send_back_other: t.moveLabel(sendBack, task("refined", {plan: decided}),
@@ -634,11 +688,14 @@ console.log(JSON.stringify({
     send_back_text_not_picked: t.moveLabel(sendBack, task("refined", {plan: decided}),
                                            [{...assumed[0], text: "x"}, assumed[1]]),
     send_back_no_choices: t.moveLabel(sendBack, task("refined", {plan: decided})),
-    ends_claim: t.moveLabel({state: "closed", verb: "close", endsClaim: true},
-                            task("open", {claim})),
-    plain: t.moveLabel({state: "deferred", verb: "defer", endsClaim: false}, task("open")),
+    // An incomplete answer differs from what the plan assumes, so it sends none.
+    send_back_incomplete: t.moveLabel(sendBack, task("refined", {plan: decided}),
+                                      [assumed[0], {options: [], other: false, text: ""}]),
+    send_back_claimed: t.moveLabel({...sendBack, endsClaim: true},
+                                   task("refined", {plan: decided, claim}), assumed),
     break: t.breakLabel(claim),
     no_break: t.breakLabel(null),
+    no_move: [t.moveLabel(null, task("open")), t.moveLabel(sendBack, null)],
     approve_none: t.approveLabel(task("proposed")),
     hidden: t.approveHidden(task("refined", {title: "T\u202e", body: "B\u2066", plan})),
     one_hidden: t.approveHidden(task("refined", {plan})),
@@ -820,29 +877,153 @@ class MoveTests(unittest.TestCase):
     def test_a_notes_check_counts_from_the_newest_note_held(self):
         self.assertEqual(self.probe["last_note"], [11, 0, 0])
 
-    def test_approve_names_the_revision_plan_and_outcome(self):
+    def test_approve_says_its_outcome_and_names_the_revision_and_plan_under_it(self):
+        # Never a caution: its outcome is its main text, and one sending the task back
+        # stays primary, its answers being the point.
         labels = self.probe["labels"]
-        self.assertEqual(labels["approve"], "approve revision 4 and plan 6: opens it")
-        self.assertEqual(labels["approve_opens"], "approve revision 4 and plan 6: opens it")
-        self.assertEqual(labels["approve_back"], "approve revision 4 and plan 6 with these "
-                                                 "answers: sends it back to proposed")
-        self.assertEqual(labels["approve_none"], "")
-        self.assertEqual(labels["plain"], "defer")
-
-    def test_a_reopen_from_refined_names_what_it_opens(self):
-        labels = self.probe["labels"]
-        self.assertEqual(labels["reopen"], "reopen revision 4 and plan 6")
-        self.assertEqual(labels["reopen_claimed"],
-                         "reopen revision 4 and plan 6 (ends claude-x\\u202e's claim)")
-        self.assertEqual(labels["reopen_closed"], "reopen")
+        opens = {"main": "approve and open", "second": "revision 4 · plan 6",
+                 "caution": False}
+        self.assertEqual(labels["approve"], opens)
+        self.assertEqual(labels["approve_opens"], opens)
+        self.assertEqual(labels["approve_back"], {
+            "main": "approve with these answers, sending it back",
+            "second": "revision 4 · supersedes plan 6; no move restores it",
+            "caution": False})
+        self.assertIsNone(labels["approve_none"])
 
     def test_send_back_says_it_sends_no_answers_once_a_choice_differs(self):
         labels = self.probe["labels"]
-        self.assertEqual(labels["send_back_differs"], "send back without answering")
-        self.assertEqual(labels["send_back_other"], "send back without answering")
+        cost = "supersedes plan 6; no move restores it"
+        for key in ("send_back_differs", "send_back_other", "send_back_incomplete"):
+            with self.subTest(case=key):
+                self.assertEqual(labels[key], {"main": "send back without answering",
+                                               "second": cost, "caution": True})
         for key in ("send_back", "send_back_text_not_picked", "send_back_no_choices"):
             with self.subTest(case=key):
-                self.assertEqual(labels[key], "send back")
+                self.assertEqual(labels[key], {"main": "send back for a new plan",
+                                               "second": cost, "caution": True})
+        self.assertEqual(labels["send_back_claimed"]["second"],
+                         f"{cost} · ends the claim")
+
+    # Each state's moves as [state, main, second, caution], worked out by hand from the
+    # scheme (tasks-ui/DESIGN.md, "One scheme of labels"), the break last.
+    TABLE: ClassVar[dict] = {
+        "open_claimed": [
+            ["proposed", "move to proposed",
+             "supersedes plan 6; no move restores it · ends the claim", True],
+            ["refined", "move to refined", "ends the claim", True],
+            ["landing", "mark ready to land", "ends the claim", True],
+            ["deferred", "defer", "ends the claim", True],
+            ["closed", "close the task", "ends the claim", True],
+            ["break", "break the claim", "ends the claim", True]],
+        "open_none": [
+            ["proposed", "move to proposed", "", False],
+            ["landing", "mark ready to land", "", False],
+            ["deferred", "defer", "", False],
+            ["closed", "close the task", "", False]],
+        "refined": [
+            ["proposed", "send back for a new plan",
+             "supersedes plan 6; no move restores it", True],
+            ["landing", "mark ready to land", "", False],
+            ["deferred", "defer", "", False],
+            ["closed", "close the task", "", False]],
+        "refined_answered": [
+            ["proposed", "send back for a new plan",
+             "supersedes plan 6; no move restores it", True],
+            ["open", "reopen", "plan 6 as approved · revision 4", False],
+            ["landing", "mark ready to land", "", False],
+            ["deferred", "defer", "", False],
+            ["closed", "close the task", "", False]],
+        "landing": [
+            ["proposed", "move to proposed", "supersedes plan 6; no move restores it", True],
+            ["refined", "move to refined", "", False],
+            ["open", "move to open", "", False],
+            ["deferred", "defer", "", False],
+            ["closed", "close the task", "", False]],
+        "deferred_none": [
+            ["proposed", "move to proposed", "", False],
+            ["open", "open without a plan", "", False],
+            ["landing", "mark ready to land", "", False],
+            ["closed", "close the task", "", False]],
+        "deferred_approved": [
+            ["proposed", "move to proposed", "supersedes plan 6; no move restores it", True],
+            ["refined", "move to refined", "", False],
+            ["open", "reopen", "plan 6 as approved · revision 4", False],
+            ["landing", "mark ready to land", "", False],
+            ["closed", "close the task", "", False]],
+        "deferred_unapproved": [
+            ["proposed", "move to proposed", "supersedes plan 6; no move restores it", True],
+            ["refined", "move to refined", "", False],
+            ["open", "open with plan 6",
+             "no approve of plan 6 found: move it to refined to approve it", False],
+            ["landing", "mark ready to land", "", False],
+            ["closed", "close the task", "", False]],
+        "closed_answered": [
+            ["proposed", "move to proposed", "supersedes plan 6; no move restores it", True],
+            ["refined", "move to refined", "", False],
+            ["open", "reopen", "plan 6 as approved · revision 4", False],
+            ["landing", "mark ready to land", "", False],
+            ["deferred", "defer", "", False]],
+        "proposed_superseded": [
+            ["open", "open without a plan", "", False],
+            ["landing", "mark ready to land", "", False],
+            ["deferred", "defer", "", False],
+            ["closed", "close the task", "", False]],
+    }
+
+    def test_each_states_moves_follow_the_scheme(self):
+        for key, expected in self.TABLE.items():
+            with self.subTest(case=key):
+                self.assertEqual(self.probe["table"][key], expected)
+
+    def test_every_move_to_proposed_with_a_current_plan_says_it_supersedes_it(self):
+        # And none without one: a superseded plan has nothing left to lose.
+        for key, rows in self.probe["matrix"].items():
+            for state, _, second, caution in rows:
+                if state != "proposed":
+                    continue
+                with self.subTest(case=key):
+                    current = "/none" not in key and "/superseded" not in key
+                    self.assertEqual("supersedes plan 6; no move restores it" in second,
+                                     current)
+                    self.assertTrue(caution or not current)
+
+    def test_every_move_ending_a_claim_says_so_and_only_those_are_cautions(self):
+        for key, rows in self.probe["matrix"].items():
+            claimed = key.endswith("/claimed")
+            for state, _, second, caution in rows:
+                with self.subTest(case=key, state=state):
+                    self.assertEqual(second.endswith("ends the claim"), claimed)
+                    supersedes = "supersedes" in second
+                    self.assertEqual(caution, claimed or supersedes)
+
+    def test_the_move_to_open_follows_the_plan_and_no_label_is_a_bare_close(self):
+        opens = {"none": "open without a plan", "superseded": "open without a plan",
+                 "answered": "reopen", "approved": "reopen", "unapproved": "open with plan 6"}
+        for key, rows in self.probe["matrix"].items():
+            state, kind = key.split("/")[:2]
+            for to, main, _, _ in rows:
+                with self.subTest(case=key, to=to):
+                    self.assertNotEqual(main, "close")
+                    if to == "open":
+                        self.assertEqual(main, "move to open" if state == "landing"
+                                         else opens[kind])
+
+    def test_a_plan_is_found_approved_by_its_answers_or_an_approve_naming_it(self):
+        self.assertEqual(self.probe["approved_in"], {
+            "answered": True, "history": True, "earlier": False, "no_history": False,
+            "decided": False, "superseded": False, "no_plan": False})
+
+    def test_one_primary_at_most_and_none_on_a_parked_or_finished_task(self):
+        # Approve on a refined task the operator can approve, reopen on one whose plan
+        # was answered, and closing on landing; nothing elsewhere.
+        p = self.probe["primaries"]
+        expected = dict.fromkeys(p)
+        expected |= {"refined/plan": "approve", "refined/answered": "open",
+                     "landing/none": "closed", "landing/plan": "closed",
+                     "landing/answered": "closed"}
+        self.assertEqual(p, expected)
+        self.assertIsNone(self.probe["primary_none"])
 
     def test_approves_hidden_count_takes_the_decisions_and_the_other_text_sent(self):
         labels = self.probe["labels"]
@@ -914,11 +1095,23 @@ class MoveTests(unittest.TestCase):
         self.assertNotIn("The task is", a["not_landed"]["text"])
         self.assertEqual(a["move_ignores_it"], {"text": "Reopen: done.", "warn": False})
 
-    def test_a_claim_ending_move_and_a_break_name_the_holder_spelled(self):
+    def test_a_claimed_tasks_moves_name_the_holder_spelled_once_above_them(self):
+        self.assertEqual(self.probe["holder"], [
+            "claude-x\\u202e holds this task: a state move or a break ends the claim; an "
+            "edit or a note leaves it.", ""])
         labels = self.probe["labels"]
-        self.assertEqual(labels["ends_claim"], "close (ends claude-x\\u202e's claim)")
-        self.assertEqual(labels["break"], "break claude-x\\u202e's claim")
-        self.assertEqual(labels["no_break"], "")
+        self.assertEqual(labels["break"], {"main": "break the claim",
+                                           "second": "ends the claim", "caution": True})
+        self.assertIsNone(labels["no_break"])
+        self.assertEqual(labels["no_move"], [None, None])
+
+    def test_a_note_move_unhides_and_a_note_says_it_stays(self):
+        unhide, hide, unhandle, stays = self.probe["note_labels"]
+        self.assertEqual(unhide, {"main": "unhide", "second": "agents read it again",
+                                  "caution": False})
+        self.assertEqual(hide, {"main": "hide", "second": "", "caution": False})
+        self.assertEqual(unhandle["main"], "mark not handled")
+        self.assertEqual(stays, "agents read it; it can be hidden, never removed")
 
     def test_approve_says_when_what_it_approves_hides_a_character(self):
         labels = self.probe["labels"]
@@ -1221,16 +1414,16 @@ class NoteMoveTests(unittest.TestCase):
         self.assertEqual(self.probe["is_note_move"],
                          [True, True, True, False, False, False])
 
-    def test_a_note_offers_hide_or_show_and_handle_or_unhandle(self):
+    def test_a_note_offers_hide_or_unhide_and_handle_or_unhandle(self):
         mv = self.probe["moves"]
         self.assertEqual(mv["plain"], [["hide", True, "hide", False]])
-        self.assertEqual(mv["hidden"], [["hide", False, "show", False]])
+        self.assertEqual(mv["hidden"], [["hide", False, "unhide", False]])
         # Handle opens the reply box; only a note flagged for the operator has one.
         self.assertEqual(mv["flagged"], [["hide", True, "hide", False],
                                          ["handle", True, "mark handled", True]])
         self.assertEqual(mv["handled"], [["hide", True, "hide", False],
                                          ["handle", False, "mark not handled", False]])
-        self.assertEqual(mv["flagged_hidden"], [["hide", False, "show", False],
+        self.assertEqual(mv["flagged_hidden"], [["hide", False, "unhide", False],
                                                 ["handle", True, "mark handled", True]])
         self.assertEqual((mv["no_id"], mv["none"]), ([], []))
 
@@ -1716,7 +1909,7 @@ class TaskTimelineSourceTests(unittest.TestCase):
         self.assertIn("position: sticky; top: 0;", strip)
         self.assertEqual(re.search(r"\bheight: (\d+)px;", strip).group(1), top)
 
-    def test_show_it_reads_the_task_again_through_the_hash(self):
+    def test_read_it_again_reads_the_task_again_through_the_hash(self):
         self.assertIn('if (ev.target.closest("button[data-show]")) {\n'
                       "      goTo(view, openTask);", self.TASKS)
         self.assertIn('show.dataset.show = "1";', _function(self.TASKS, "fillSlot"))
@@ -1890,7 +2083,8 @@ class TaskWriteSourceTests(unittest.TestCase):
                 self.assertNotIn("dataset.write", self._function(self.TASKS, name))
         calls = re.findall(r"\bmovesBlock\(", self.TASKS)
         self.assertEqual(len(calls), 2, "defined once, called once, in drawTask")
-        self.assertIn("movesBlock(task)", self._function(self.TASKS, "drawTask"))
+        self.assertIn("movesBlock(task, held.timeline)",
+                      self._function(self.TASKS, "drawTask"))
         self.assertEqual(len(re.findall(r"\bbulkWrite\(", self.TASKS)), 2,
                          "defined once, called once, from the flagged block")
         # A bulk is on no task: the flagged block is part of the list, never on screen
@@ -2607,7 +2801,9 @@ class TaskDecisionSourceTests(unittest.TestCase):
                          "if (!approvable(shownTask)) return null;")
         self.assertIn("const answers = approveAnswers(decisions, picked);", write)
         self.assertIn("return answers && {", write)
-        self.assertIn("predicted: approveOutcome(decisions, picked)", write)
+        self.assertIn("const predicted = approveOutcome(decisions, picked);", write)
+        # The outcome names the approve by what its button said.
+        self.assertIn("predicted, verb: approveLabel(shownTask, predicted).main };", write)
 
     def test_approve_has_a_row_of_its_own_above_the_other_moves(self):
         moves = _function(self.TASKS, "movesBlock")
@@ -2619,7 +2815,7 @@ class TaskDecisionSourceTests(unittest.TestCase):
         # Each choice relabels both in place: nothing else in the detail is redrawn.
         mark = _function(self.TASKS, "markAnswers")
         self.assertIn('row.replaceChildren(', mark)
-        self.assertIn("backBtn.textContent = moveLabel(back, task, picked);", mark)
+        self.assertIn("setLabel(backBtn, moveLabel(back, task, picked));", mark)
         self.assertNotIn("drawTask(", mark)
         self.assertNotIn("drawTask(", _function(self.TASKS, "choose"))
 
@@ -2920,11 +3116,13 @@ class EditTests(unittest.TestCase):
 
     def test_the_save_names_the_revision_and_a_claim_it_leaves(self):
         labels = self.probe["labels"]
-        self.assertEqual(labels["save"], "save the edit to revision 4")
-        self.assertEqual(labels["save_claimed"],
-                         "save the edit to revision 4 (claude-x\\u202e holds the task; "
-                         "the claim stays)")
-        self.assertEqual(labels["save_none"], "")
+        # The holder is named once, above the moves (`holderText`), not here.
+        self.assertEqual(labels["save"], {"main": "save the edit", "second": "revision 4",
+                                          "caution": False})
+        self.assertEqual(labels["save_claimed"], {
+            "main": "save the edit", "second": "revision 4 · the claim stays",
+            "caution": False})
+        self.assertIsNone(labels["save_none"])
 
     def test_a_refined_tasks_form_says_the_edit_amends_its_plans_spec(self):
         labels = self.probe["labels"]
@@ -3118,7 +3316,8 @@ class TaskEditSourceTests(unittest.TestCase):
 
     def test_only_a_landed_edit_discard_or_another_task_drops_the_draft(self):
         # Declared, rebased, opened or discarded, and dropped by a landed edit, opening
-        # another task, closing it and a leave confirmed: nothing else writes it.
+        # another task, going back to the list and a leave confirmed: nothing else
+        # writes it.
         sets = re.findall(r"\bspecEdit = ([^;]*);", self.TASKS)
         self.assertEqual(len(sets), 7, sets)
         self.assertEqual(sets.count("null"), 5, sets)

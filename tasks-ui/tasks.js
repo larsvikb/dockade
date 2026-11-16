@@ -26,7 +26,8 @@ import {
   onParkedTask, selectAll, tickMark, bulkToSend, keptSelection, redrawsFlagged,
   sendWrite, readAnswer,
   writeOutcome, checkWrite, lastNoteId, lastEntryId,
-  planDecisions, awaitsAnswers, approvable, assumedChoices, blankText, choiceAnswer,
+  planDecisions, awaitsAnswers, approvable, planAnswered, planApprovedIn,
+  assumedChoices, blankText, choiceAnswer,
   unanswered, approveAnswers, choicesDiffer, approveOutcome, currentPlan,
   SPEC_CONTROLS, asControl, controlChanges, specDraft, draftChanges, editRequest,
   changedFields, rebaseDraft, parseBlockers,
@@ -361,38 +362,103 @@ export function inboxStatus(rowCount, failed, loaded) {
   return pollStatus(INBOX_STATUS_TEXT, rowCount, failed, loaded);
 }
 
-// What a move's button says: its verb, and whose claim it ends, since a move to another
-// state ends the claim (`operator_moves.move`). A reopen from refined names the
-// revision and plan it opens, as approve does; a send back says it sends no answers
-// once `picked`, the choices made, differ from what the plan assumes. The holder is an
-// agent's, so spelled.
-export function moveLabel(move, task, picked = null) {
-  if (!move || typeof move !== "object" || !task || typeof task !== "object") return "";
-  let verb = move.verb;
-  if (verb === "reopen" && task.state === "refined" && task.plan) {
-    verb = `reopen revision ${task.revision} and plan ${task.plan.id}`;
-  } else if (verb === "send back" && picked
-             && choicesDiffer(planDecisions(task.plan), picked)) {
-    verb = "send back without answering";
+// ── the controls' words ─────────────────────────────────────────────────────
+// Every action control on the task page says one thing the one way
+// (tasks-ui/DESIGN.md, "One scheme of labels"): `main`, the action and its outcome in
+// the operator's words; `second`, where needed, the mechanism and its cost, smaller
+// under it; `caution`, a move that takes away what no move gives back.
+
+// What ending a claim, and superseding a plan, cost: said in a second line.
+const ENDS_CLAIM = "ends the claim";
+function supersedes(plan) {
+  return `supersedes plan ${plan.id}; no move restores it`;
+}
+function joined(...parts) {
+  return parts.filter(Boolean).join(" · ");
+}
+
+// A move's label, by the state it reaches. A move to proposed supersedes the current
+// plan (`tasks.update`), an approved one too, so with one it is a caution; so is every
+// move that ends a live claim, which a move to another state does
+// (`operator_moves.move`). A move to open says which plan it opens and whether the page
+// found it approved (`planApprovedIn`, over `history`, the timeline page read with the
+// task): opening a plan nobody approved must not read as approving it. A send back says
+// it sends no answers once `picked`, the choices made, differ from what the plan
+// assumes.
+export function moveLabel(move, task, picked = null, history = null) {
+  if (!move || typeof move !== "object" || !task || typeof task !== "object") return null;
+  const plan = currentPlan(task);
+  let main, second = "", caution = false;
+  if (move.state === "proposed") {
+    main = task.state !== "refined" ? "move to proposed"
+      : picked && choicesDiffer(planDecisions(task.plan), picked)
+        ? "send back without answering" : "send back for a new plan";
+    if (plan) {
+      second = supersedes(plan);
+      caution = true;
+    }
+  } else if (move.state === "open" && task.state === "landing") {
+    main = "move to open";
+  } else if (move.state === "open" && !plan) {
+    main = "open without a plan";
+  } else if (move.state === "open" && planApprovedIn(task, history)) {
+    main = "reopen";
+    second = `plan ${plan.id} as approved · revision ${task.revision}`;
+  } else if (move.state === "open") {
+    main = `open with plan ${plan.id}`;
+    second = `no approve of plan ${plan.id} found: move it to refined to approve it`;
+  } else {
+    main = { refined: "move to refined", landing: "mark ready to land",
+             deferred: "defer", closed: "close the task" }[move.state]
+      || `move to ${move.state}`;
   }
-  return move.endsClaim && task.claim
-    ? `${verb} (ends ${spellHidden(task.claim.holder).text}'s claim)` : verb;
+  if (move.endsClaim && task.claim) {
+    second = joined(second, ENDS_CLAIM);
+    caution = true;
+  }
+  return { main, second, caution };
 }
 
 export function breakLabel(claim) {
-  return claim ? `break ${spellHidden(claim.holder).text}'s claim` : "";
+  return claim ? { main: "break the claim", second: ENDS_CLAIM, caution: true } : null;
+}
+
+// Above a claimed task's moves: whose claim it is, and which moves end it. The holder
+// is an agent's, so spelled.
+export function holderText(claim) {
+  return claim && typeof claim === "object"
+    ? `${spellHidden(claim.holder).text} holds this task: a state move or a break ends `
+      + "the claim; an edit or a note leaves it."
+    : "";
+}
+
+// The one move drawn accent-filled, or null: approve on a refined task the operator can
+// approve, reopen on a refined task whose plan was answered, and closing a landing task.
+// Proposed, open, deferred and closed have none: leaving a parked or finished task is a
+// choice among several, and a deferred plan nobody approved must draw nothing that
+// reads as approving it. "approve", or the state the move reaches.
+export function primaryMove(task) {
+  if (!task || typeof task !== "object") return null;
+  if (approvable(task)) return "approve";
+  if (task.state === "refined" && planAnswered(task)) return "open";
+  if (task.state === "landing") return "closed";
+  return null;
 }
 
 // Approving a refined task approves its body and plan as the page shows them
-// (task-registry/DESIGN.md, "Plans") and answers its decisions, so the button names the
-// revision, the plan and where the answers take the task (`approveOutcome`): it is the
-// confirmation. A warning says when the title, body, plan, decisions or an "other" text
-// to be sent carry a character spelled out above it.
+// (task-registry/DESIGN.md, "Plans") and answers its decisions, so the button says
+// where the answers take the task (`approveOutcome`), and its second line the revision
+// and the plan: it is the confirmation. One that sends the task back supersedes its
+// plan, said, but stays primary and unbordered, its answers being the point. A warning
+// says when the title, body, plan, decisions or an "other" text to be sent carry a
+// character spelled out above it.
 export function approveLabel(task, outcome = "open") {
-  if (!task || typeof task !== "object" || !task.plan) return "";
-  const what = `approve revision ${task.revision} and plan ${task.plan.id}`;
+  if (!task || typeof task !== "object" || !task.plan) return null;
   return outcome === "proposed"
-    ? `${what} with these answers: sends it back to proposed` : `${what}: opens it`;
+    ? { main: "approve with these answers, sending it back",
+        second: `revision ${task.revision} · ${supersedes(task.plan)}`, caution: false }
+    : { main: "approve and open", second: `revision ${task.revision} · plan ${task.plan.id}`,
+        caution: false };
 }
 export function approveHidden(task, picked = null) {
   if (!task || typeof task !== "object") return "";
@@ -460,15 +526,22 @@ export function specPreview(base, draft, field) {
                         + `${what} by this control.` : "" };
 }
 
-// The save's label: it names the revision it edits, as approve does, and a live claim's
-// holder, whose claim an edit leaves as it is (`operator_moves.edit`). The holder is an
-// agent's, so spelled.
+// The save's label: the revision it edits, as approve names it, and when the task is
+// claimed that the claim stays, as an edit leaves it (`operator_moves.edit`).
 export function saveLabel(base) {
-  if (!base || typeof base !== "object") return "";
-  const what = `save the edit to revision ${base.revision}`;
-  return base.claim
-    ? `${what} (${spellHidden(base.claim.holder).text} holds the task; the claim stays)`
-    : what;
+  if (!base || typeof base !== "object") return null;
+  return { main: "save the edit",
+           second: joined(`revision ${base.revision}`, base.claim ? "the claim stays" : ""),
+           caution: false };
+}
+
+// A note's writes: one added, or a reply, stays on the task, which agents read.
+export const NOTE_SECOND = "agents read it; it can be hidden, never removed";
+// A note move's label: an unhide says what it gives back.
+export function noteMoveLabel(move) {
+  if (!move || typeof move !== "object") return null;
+  return { main: move.verb, second: move.verb === "unhide" ? "agents read it again" : "",
+           caution: false };
 }
 
 // What an edit of a refined task does to the plan beside it, or nothing for another.
@@ -522,8 +595,8 @@ export const HELD_TEXT = "Save or discard the edit first: a move now would act o
 
 // What a write came to, in a line, and whether it warns: `writeOutcome`'s word, or for
 // an answer that was lost, `checkWrite`'s. `detail` is the refusal's own reason. A bulk
-// is all or none, so a refused one says none was handled; a hide or a show says what it
-// changed for the note as it was (`noteLanded`); an approve, the state it `reached`.
+// is all or none, so a refused one says none was handled; a hide or an unhide says what
+// it changed for the note as it was (`noteLanded`); an approve, the state it `reached`.
 export function outcomeText(write, outcome, detail, reached) {
   const said = outcomeLine(write, outcome, detail);
   const approved = approvedText(write, outcome, reached);
@@ -618,7 +691,7 @@ function outcomeLine(write, outcome, detail) {
   }
 }
 
-// What a hide or a show changed, as far as it is true for this note: agents' reads
+// What a hide or an unhide changed, as far as it is true for this note: agents' reads
 // always; the flagged list only for a note flagged and not handled; the inbox's count
 // only for such a note whose task is not deferred or closed, since that one waits with
 // its task out of the inbox either way.
@@ -1602,7 +1675,7 @@ function drawTask(task, held) {
     taskDetail.appendChild(noticeLine(planNotice(null, task)));
   }
   // Below the plan, so what a move approves is read before it.
-  taskDetail.appendChild(movesBlock(task));
+  taskDetail.appendChild(movesBlock(task, held.timeline));
   // A move on a note says what it came to above the timeline it was made in.
   if (outcome && outcome.task === String(task.id) && outcome.onNote) {
     taskDetail.appendChild(noticeLine(outcome));
@@ -1635,7 +1708,7 @@ function fillSlot(notice) {
   show.type = "button";
   show.className = "group-toggle";
   show.dataset.show = "1";
-  show.textContent = "show it";
+  show.textContent = "read it again";
   const text = document.createElement("span");
   text.textContent = notice.text;
   text.title = notice.text;
@@ -1669,14 +1742,23 @@ export async function refreshOpenTask() {
 // to, but a refusal for a task that changed, which the slot atop the detail says, and a
 // move on a note, said above the timeline.
 // Approve and send back are each a control of their own, as a refined task's two
-// answers. Approve has a row of its own, above the rest and one line high, which
+// answers. Approve has a row of its own, above the rest and two lines high, which
 // `markAnswers` fills as choices are made: neither its label nor the send back's
-// moves the other.
-function movesBlock(task) {
+// moves the other. A claimed task's moves open with whose claim it is. The primary,
+// when the task has one, is marked here, or on approve by `markAnswers`. `timeline` is
+// the page of it read with the task, where a move to open looks for an approve.
+function movesBlock(task, timeline) {
   const block = document.createElement("div");
   const head = document.createElement("h3");
   head.textContent = "Moves";
   block.appendChild(head);
+  if (task.claim) {
+    const holder = document.createElement("div");
+    holder.className = "holder-line";
+    holder.dataset.holder = "1";
+    holder.textContent = holderText(task.claim);
+    block.appendChild(holder);
+  }
   if (outcome && outcome.task === String(task.id) && outcome.result !== "stale"
       && !outcome.onNote) {
     block.appendChild(noticeLine(outcome));
@@ -1698,9 +1780,12 @@ function movesBlock(task) {
   }
   const row = document.createElement("div");
   row.className = "moves";
+  const history = timeline ? timeline.history : null;
+  const primary = primaryMove(task);
   for (const move of movesFor(task)) {
-    const btn = writeButton(moveLabel(move, task), "move", move.state);
+    const btn = writeButton(moveLabel(move, task, null, history), "move", move.state);
     btn.dataset.verb = move.verb;
+    if (move.state === primary) btn.classList.add("primary");
     row.appendChild(btn);
   }
   if (task.claim) row.appendChild(writeButton(breakLabel(task.claim), "break", ""));
@@ -1732,12 +1817,13 @@ function markAnswers() {
     } else {
       const btn = writeButton(approveLabel(task, goes), "approve", "");
       btn.dataset.verb = "approve";
+      if (primaryMove(task) === "approve") btn.classList.add("primary");
       row.replaceChildren(btn);
     }
   }
   const back = movesFor(task).find(m => m.verb === "send back");
   const backBtn = taskDetail.querySelector('button[data-write="move"][data-verb="send back"]');
-  if (back && backBtn) backBtn.textContent = moveLabel(back, task, picked);
+  if (back && backBtn) setLabel(backBtn, moveLabel(back, task, picked));
   for (const box of taskDetail.querySelectorAll("[data-other-box]")) {
     if (picked) markOther(box, picked[Number(box.dataset.otherBox)]);
   }
@@ -1777,13 +1863,33 @@ function choose(input) {
   markWriting();
 }
 
+// A write's control, its label a string or the scheme's lines (`moveLabel`).
 function writeButton(label, kind, value) {
   const btn = document.createElement("button");
   btn.type = "button";
   btn.dataset.write = kind;
   btn.dataset.value = value;
-  btn.textContent = label;
+  setLabel(btn, label);
   return btn;
+}
+
+// A control's words: the main line, the second under it, smaller, and the caution
+// border. `data-name` keeps the main line, which the outcome names the write by.
+function setLabel(btn, label) {
+  const said = typeof label === "string" ? { main: label, second: "", caution: false }
+    : label || { main: "", second: "", caution: false };
+  const main = document.createElement("span");
+  main.className = "main";
+  main.textContent = said.main;
+  btn.replaceChildren(main);
+  if (said.second) {
+    const second = document.createElement("span");
+    second.className = "second";
+    second.textContent = said.second;
+    btn.appendChild(second);
+  }
+  btn.classList.toggle("caution", Boolean(said.caution));
+  btn.dataset.name = said.main;
 }
 
 // A note to the task, as the operator: agents read it. Its text stays until it lands.
@@ -1796,7 +1902,8 @@ function noteForm(task) {
   text.placeholder = "a note to this task, which agents read";
   text.value = noteDraft.task === String(task.id) ? noteDraft.text : "";
   text.dataset.note = "1";
-  form.append(text, writeButton("add the note", "note", ""));
+  form.append(text, writeButton({ main: "add the note", second: NOTE_SECOND,
+                                   caution: false }, "note", ""));
   return form;
 }
 
@@ -1806,7 +1913,7 @@ function specEditOn(task) {
 }
 
 // A draw of the task being edited past the read its draft was made from, whatever
-// brought it (a refusal's `current`, the read after a write, "show it"), moves the
+// brought it (a refusal's `current`, the read after a write, "read it again"), moves the
 // draft onto it (`rebaseDraft`) and says what moved, and when a draft that had changes
 // has none left.
 function noteSpecDrawn(task) {
@@ -2058,7 +2165,7 @@ function writeFor(btn) {
   if (HELD_KINDS.includes(btn.dataset.write) && editHolds()) return null;
   if (btn.dataset.write === "edit") return editWrite(base);
   if (btn.dataset.write === "move") {
-    return { ...base, kind: "move", state: btn.dataset.value, verb: btn.dataset.verb };
+    return { ...base, kind: "move", state: btn.dataset.value, verb: btn.dataset.name };
   }
   if (btn.dataset.write === "approve") return approveWrite(base);
   if (btn.dataset.write === "break") return { ...base, kind: "break", verb: "break the claim" };
@@ -2077,8 +2184,9 @@ function approveWrite(base) {
   const decisions = planDecisions(shownTask.plan);
   const picked = choicesFor(shownTask);
   const answers = approveAnswers(decisions, picked);
+  const predicted = approveOutcome(decisions, picked);
   return answers && { ...base, kind: "approve", plan: shownTask.plan.id, answers,
-                      predicted: approveOutcome(decisions, picked), verb: "approve" };
+                      predicted, verb: approveLabel(shownTask, predicted).main };
 }
 
 // A move on a note in the timeline, as of the newest timeline entry the page holds:
@@ -2089,7 +2197,7 @@ function noteWrite(btn, base) {
   if (btn.dataset.write === "hide") {
     const hidden = btn.dataset.value === "true";
     return { ...at, kind: "hide", hidden, forYou: btn.dataset.forYou === "1",
-             taskState: shownTask.state, verb: `${hidden ? "hide" : "show"} note #${note}` };
+             taskState: shownTask.state, verb: `${hidden ? "hide" : "unhide"} note #${note}` };
   }
   if (btn.dataset.value === "reply") {
     const reply = replyDrafts.get(note) ?? "";
@@ -2168,7 +2276,7 @@ function noteControls(note) {
       wrap.appendChild(replyBox(id));
       continue;
     }
-    const btn = writeButton(move.verb, move.kind, String(move.value));
+    const btn = writeButton(noteMoveLabel(move), move.kind, String(move.value));
     btn.dataset.note = id;
     if (note.for_operator && !note.handled) btn.dataset.forYou = "1";
     row.appendChild(btn);
@@ -2191,7 +2299,8 @@ function replyBox(id) {
   row.className = "moves";
   const plain = writeButton("mark handled", "handle", "true");
   plain.dataset.note = id;
-  const reply = writeButton("reply and mark handled", "handle", "reply");
+  const reply = writeButton({ main: "reply and mark handled", second: NOTE_SECOND,
+                              caution: false }, "handle", "reply");
   reply.dataset.note = id;
   const cancel = document.createElement("button");
   cancel.type = "button";

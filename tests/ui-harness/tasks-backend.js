@@ -64,7 +64,9 @@ const decidedPlan = (id, at, decisions) => ({
 const DECIDED_PLANS = { 4: decidedPlan(4, NOW - 5000, [HOLD, LOGS]),
                         5: decidedPlan(5, NOW - 4500, [HOLD, LOGS]),
                         7: decidedPlan(7, NOW, [HOLD]),
-                        8: decidedPlan(8, NOW, [LOGS]) };
+                        8: decidedPlan(8, NOW, [LOGS]),
+                        10: decidedPlan(10, NOW - 8000, [HOLD]),
+                        11: decidedPlan(11, NOW - 8000, [HOLD]) };
 // What plan 2 replaced: another approach, one path fewer, the risks spaced otherwise.
 const OLDER_PLAN = {
   ...PLAN, id: 1, task_revision: 1, at: NOW - 80000, review_rounds: 1,
@@ -142,9 +144,33 @@ const CRLF = { ...UNPLANNED, id: 12, title: "Line ends", state: "open", blocked:
                severity: "medium", kind: "finding", revision: 5, claim,
                body: "First line.\r\nSecond line.\r\n" };
 
+// The task page's controls in the states the tasks above leave out, each opened only
+// by its URL, in no list: task 14 closed and task 15 refined, each with a plan answered
+// as assumed; tasks 16 and 17 deferred with a plan of no decisions, plan 12 approved and
+// plan 13 handed in after an approve of plan 3 and never approved itself.
+const answeredAsAssumed = plan => [{ plan: plan.id, decision: 0, question: HOLD.question,
+                                     options: [{ position: 0, label: "Hold",
+                                                 meaning: HOLD.options[0].meaning }],
+                                     other: null, author: "operator", at: plan.at + 100 }];
+const CLOSED_ANSWERED = { ...REFINED, id: 14, title: "Closed answered", state: "closed",
+                          revision: 6, plan: DECIDED_PLANS[10],
+                          answers: answeredAsAssumed(DECIDED_PLANS[10]), notes: [] };
+const REFINED_ANSWERED = { ...REFINED, id: 15, title: "Refined answered", revision: 5,
+                           plan: DECIDED_PLANS[11],
+                           answers: answeredAsAssumed(DECIDED_PLANS[11]), notes: [] };
+const APPROVED_PLAN = { ...PLAN, id: 12, task: 16, task_revision: 2, at: NOW - 7000 };
+const UNAPPROVED_PLAN = { ...PLAN, id: 13, task: 17, task_revision: 5, at: NOW - 6000 };
+const SHELVED_APPROVED = { ...REFINED, id: 16, title: "Shelved approved",
+                           state: "deferred", revision: 4, plan: APPROVED_PLAN, notes: [] };
+const SHELVED_UNAPPROVED = { ...REFINED, id: 17, title: "Shelved unapproved",
+                             state: "deferred", revision: 7, plan: UNAPPROVED_PLAN,
+                             notes: [] };
+
 let PLANS = { 1: [OLDER_PLAN], 3: [PLAN, OLDER_PLAN], 5: [PLAN],
                 6: [PLAN, OLDER_PLAN], 8: [PLAN], 9: [DECIDED_PLANS[4]],
-                10: [DECIDED_PLANS[5]], 11: [FRESH_PLAN] };
+                10: [DECIDED_PLANS[5]], 11: [FRESH_PLAN], 14: [DECIDED_PLANS[10]],
+                15: [DECIDED_PLANS[11]], 16: [APPROVED_PLAN],
+                17: [UNAPPROVED_PLAN, { ...PLAN, id: 3, task: 17, superseded_at: NOW - 6500 }] };
 
 // Each task's history, oldest first, as `operator_moves.history` reads it: every write,
 // with the note it posted as it is now.
@@ -218,6 +244,26 @@ let HISTORIES = {
   10: refinedHistory(NOW - 5500, DECIDED_PLANS[5]),
   11: refinedHistory(NOW - 1500, FRESH_PLAN),
   12: [entry("operator", "create", NOW - 5000, { title: "Line ends", state: "open" })],
+  14: [...refinedHistory(NOW - 9000, DECIDED_PLANS[10]),
+       entry("operator", "approve", NOW - 7800, { revision: 4, before: "refined",
+                                                  state: "open", plan: 10, actor: null }),
+       entry("operator", "move", NOW - 7000, { before: "open", state: "closed",
+                                               revision: 6, actor: null })],
+  15: [...refinedHistory(NOW - 9000, DECIDED_PLANS[11]),
+       entry("operator", "approve", NOW - 7800, { revision: 4, before: "refined",
+                                                  state: "open", plan: 11, actor: null }),
+       entry("operator", "move", NOW - 7000, { before: "open", state: "refined",
+                                               revision: 5, actor: null })],
+  16: [...refinedHistory(NOW - 8000, APPROVED_PLAN),
+       entry("operator", "approve", NOW - 6800, { revision: 3, before: "refined",
+                                                  state: "open", plan: 12, actor: null }),
+       entry("operator", "move", NOW - 6000, { before: "open", state: "deferred",
+                                               revision: 4, actor: null })],
+  17: [entry("operator", "approve", NOW - 6600, { revision: 3, before: "refined",
+                                                  state: "open", plan: 3, actor: null }),
+       ...refinedHistory(NOW - 8000, UNAPPROVED_PLAN).slice(1),
+       entry("operator", "move", NOW - 5000, { before: "refined", state: "deferred",
+                                               revision: 7, actor: null })],
 };
 
 function historyPage(id, params) {
@@ -289,7 +335,8 @@ let WRITTEN = { 3: { ...TASK, notes: [...TASK.notes] },
                   8: { ...SECOND, notes: [ON_SECOND] },
                   9: { ...DECIDED, notes: [] },
                   10: { ...SECOND_DECIDED, notes: [] },
-                  11: { ...FRESH, notes: [] }, 12: { ...CRLF, notes: [] } };
+                  11: { ...FRESH, notes: [] }, 12: { ...CRLF, notes: [] },
+                  7: { ...PARKED, notes: [...PARKED.notes] } };
 let nextNote = 20;
 
 // Every note a move can name, by id: the ones the timelines carry, so a hide or a
@@ -527,7 +574,8 @@ function lost(answer) {
             + "it may have landed" } };
 }
 
-let READ = { 1: SENT_BACK, 2: UNPLANNED, 5: LANDING, 7: PARKED };
+let READ = { 1: SENT_BACK, 2: UNPLANNED, 5: LANDING, 7: PARKED, 14: CLOSED_ANSWERED,
+               15: REFINED_ANSWERED, 16: SHELVED_APPROVED, 17: SHELVED_UNAPPROVED };
 // A task whose read the registry fails, as an error it did not mean would.
 const FAILING = "13";
 

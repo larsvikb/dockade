@@ -20,10 +20,11 @@ export const TASK_STATES = ["proposed", "refined", "open", "landing", "deferred"
 export const NOT_RUNNING_STATUS = 502;
 export const OUTCOME_UNKNOWN_STATUS = 504;
 
-// What each move is called, from the state it leaves to the one it reaches, where it
-// has a name of its own; any other is "move to <state>". A refined task is approved by
-// a write of its own (`approveAnswers`), so a move from refined to open only reopens a
-// plan answered before (`movesFor`).
+// Each move's identifier, from the state it leaves to the one it reaches, where it has
+// a name of its own; any other is "move to <state>". It marks the control and the
+// write, never what the button says, which is `moveLabel`'s. A refined task is approved
+// by a write of its own (`approveAnswers`), so a move from refined to open only reopens
+// a plan answered before (`movesFor`).
 export function moveVerb(from, to) {
   if (from === "refined" && to === "proposed") return "send back";
   if (to === "closed") return "close";
@@ -69,6 +70,20 @@ export function planAnswered(task) {
   const plan = currentPlan(task);
   return Boolean(plan) && Array.isArray(task.answers)
     && task.answers.some(a => a && a.plan === plan.id);
+}
+
+// Whether the current plan was approved, as far as the page can tell: answered, or,
+// with no decisions and so no answers, approved by an entry of `history`, the timeline
+// page read with the task. An approve that sends the task back supersedes its plan, so
+// a current plan with answers was approved to open. An approve older than that page is
+// not found, and the plan reads as never approved.
+export function planApprovedIn(task, history) {
+  const plan = currentPlan(task);
+  if (!plan) return false;
+  if (planAnswered(task)) return true;
+  return planDecisions(plan).length === 0 && Array.isArray(history)
+    && history.some(h => h && h.action === "approve" && h.detail
+                    && h.detail.plan === plan.id);
 }
 
 // Whether the current plan has decisions nobody answered: no move opens the task then.
@@ -155,13 +170,13 @@ export function approveOutcome(decisions, choices) {
   return choicesDiffer(decisions, choices) ? "proposed" : "open";
 }
 
-// The moves on one note, as the timeline offers them: hide or show any note, mark one
+// The moves on one note, as the timeline offers them: hide or unhide any note, mark one
 // flagged for the operator handled, or a handled one not. Marking handled opens a box
 // for a reply rather than sending at once, so `reply` says the control opens it.
 export function noteMovesFor(note) {
   if (!note || typeof note !== "object" || !Number.isInteger(note.id)) return [];
   const moves = [note.hidden
-    ? { kind: "hide", value: false, verb: "show" }
+    ? { kind: "hide", value: false, verb: "unhide" }
     : { kind: "hide", value: true, verb: "hide" }];
   if (note.handled) moves.push({ kind: "handle", value: false, verb: "mark not handled" });
   else if (note.for_operator) moves.push({ kind: "handle", value: true, reply: true,

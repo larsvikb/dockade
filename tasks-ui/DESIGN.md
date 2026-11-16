@@ -81,16 +81,38 @@ carries them, never an inbox row, so a move is made on what was read.
 The moves on a note sit under it in the timeline, on every page of it. The one write
 outside the detail is the flagged list's bulk handle (below), which names the notes a
 page drew rather than a task. Approve and send back are each a control of their own, as
-a refined task's two answers. Approve names the revision and plan it approves, and where
-its answers take the task, and says when what it approves hides a character; a move
-that ends a claim names its holder. One write is out at a time, its controls off until
-its outcome is drawn, the flagged list's too, and the poll never redraws the detail, so
-no button moves under the pointer between two clicks. No move asks to be confirmed: each
-is recorded and undone by another move, but a reply, which can be hidden and never
-removed, and an approve: its answers stand, and one that sends the task back supersedes
-its plan. Its label, which names the outcome before it is pressed, is the confirmation.
-A move on a note touches neither the task's spec nor its revision, so whatever holds the
-task's moves leaves it free, as it leaves adding a note.
+a refined task's two answers. Approve says when what it approves hides a character. One
+write is out at a time, its controls off until its outcome is drawn, the flagged list's
+too, and the poll never redraws the detail, so no button moves under the pointer between
+two clicks. No move asks to be confirmed: its label, which names the outcome before it
+is pressed, is the confirmation. Most moves are recorded and undone by another move, but
+not all: a note or a reply can be hidden and never removed; an approve's answers stand;
+a break, or any state move of a claimed task, ends the live claim, which no operator move
+gives back (`operator_moves.move`); and a move to proposed, a send back or from any other
+state, supersedes the current plan, an approved one too, and no move makes a superseded
+plan current again (`tasks.update`). A move on a note touches neither the task's spec nor its revision, so
+whatever holds the task's moves leaves it free, as it leaves adding a note.
+
+**One scheme of labels.** Every action control on the task page says what it does, and
+is marked primary or caution, by one rule (`moveLabel` and the functions beside it): a main
+line names the action and its outcome in the operator's words, and a smaller second
+line, where needed, the mechanism and its cost, such as the revision and plan an approve
+names. Each word means one thing: "close the task" moves it to closed, and the way to
+the list is the strip's control. A move that takes away what no move gives back is
+bordered in the warning colour, which hover keeps, and says what in its second line: a
+move to proposed while a plan is current, and every move that ends a live claim. A write
+that adds a record that stays is told by its words instead, since the record is its
+point: approve's outcome is its main line, and a note's add says it can be hidden, never
+removed. A claimed task's moves open with one line naming the holder. At most one
+control is filled as primary (`primaryMove`): approve where the operator can approve,
+reopen on a refined task whose plan was answered, and closing a landing task. Proposed,
+open, deferred and closed tasks have none, since leaving them is a choice among several.
+A move to open names the plan it opens, and reads "reopen" only for one the page finds
+approved, by its answers or, for a plan with no decisions, by an approve naming it in
+the timeline page read with the task (`planApprovedIn`); otherwise "open with plan N",
+or "open without a plan", so opening a deferred plan nobody approved never reads as
+approving it. An approve older than that page is not found, and its plan reads as never
+approved, the cautious side.
 
 **A plan's decisions sit above it, answered with the approve.** A decision is the
 refiner's question for the operator (`task-registry/DESIGN.md`, "Decisions"), and it
@@ -105,9 +127,10 @@ open, sent back or incomplete by `plans.outcome`'s rule, a blank "other" by
 `tasks.check_text`'s, and a test holds both to the registry's over every choice two
 decisions can hold. While an answer is incomplete no approve is built at all, only a
 line naming what is missing, so nothing can send a partial answer or show a label for
-an outcome the choices do not reach. Approve has a row of its own, one line high, above
+an outcome the choices do not reach. Approve has a row of its own, two lines high, above
 the other moves, so relabelling it, or send back as "send back without answering" once
-a choice differs from the assumed ones, moves neither. Only a refined task whose current
+a choice differs from the assumed ones, moves neither: send back's second line is wider
+than either of its main lines. Only a refined task whose current
 plan has no answers draws choices; any other plan's decisions are text, with every
 answer the task has had.
 
@@ -115,7 +138,7 @@ answer the task has had.
 such as a stale revision's refusal, keeps the choices made on it. A draw that brings
 another plan than the one this task was last drawn with says so above the decisions,
 whatever the choices were, and shows any "other" text it reset: without it, a refusal or
-"show it" that brought a new plan while every choice was assumed would leave one click
+"read it again" that brought a new plan while every choice was assumed would leave one click
 approving a plan nobody read. The first choice in the new plan spends that line, which
 keeps its space so nothing moves under the pointer, and a landed approve drops it. Open
 is offered from no state while the current plan has decisions unanswered, since the
@@ -229,8 +252,8 @@ CR LF would be sent and rewritten. Severity or kind set to none goes in `clear`;
 go whole, and only when the set differs, since `edit` replaces them. Under the title and
 body, what will be stored is shown spelled, with how many characters of the stored text
 the control changed. The draft is kept by task across draws, and a draw past the read it
-was made from, whatever brought it (a refusal's task, the read after a write, "show
-it"), moves it onto that read (`rebaseDraft`): the fields the operator changed keep the
+was made from, whatever brought it (a refusal's task, the read after a write, "read
+it again"), moves it onto that read (`rebaseDraft`): the fields the operator changed keep the
 draft's values and the rest take the newer read's, so a save never reverts another
 writer's change to a field left alone; a field both changed keeps the operator's, after a
 line names it. Only a landed edit, discard, or leaving the task for the list or another
@@ -245,7 +268,7 @@ by it, so nothing handles it. That confirm guards text not yet sent, not a write
 since nothing is lost. While the draft has changes, approve, send back, every state
 move and breaking the claim are held, since each would act on a spec other than the
 one on screen; a note and the moves on notes stay free. An edit leaves a claim as it is
-(`operator_moves.edit`), and the save names its holder. A refined task's form says the edit amends the spec its plan was written against, and once the task's revision
+(`operator_moves.edit`), and the save says the claim stays. A refined task's form says the edit amends the spec its plan was written against, and once the task's revision
 is past the plan's, `planNotice` says approving approves the task as it now is, with that
 plan: for a refined task only, since an approved task's revision always passes its
 plan's.
@@ -279,7 +302,7 @@ newer revision is a change, and a newer note alone is one too, though no revisio
 for a note, because a note saying "don't approve this" that arrives while the operator
 reads is worth a line. Either fills one line atop the detail whose space is kept whether
 it says anything or not, so filling it shifts nothing; it stays in view under the strip
-as the page scrolls, and "show it" reads the task again through the hash, keeping the
+as the page scrolls, and "read it again" reads the task through the hash, keeping the
 scroll. A refused move's "the task changed" notice is drawn in the same line, since the
 task it draws is the refusal's and the timeline is the one held; every other outcome
 stays under the moves, beside the controls it is about. A redraw of the read already

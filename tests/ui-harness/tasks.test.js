@@ -202,7 +202,7 @@ test("a click on a flagged note's box, on its cell's padding, or ending a drag t
 
 for (const [name, viewport] of [["desktop", DESKTOP], ["narrow", PHONE]]) {
   test(`${name}: the strip and the changed line stay in view on a scrolled task, and `
-       + "show it keeps the scroll", TIMEOUT, async t => {
+       + "read it again keeps the scroll", TIMEOUT, async t => {
     const p = await tasksPage(t, { viewport, hash: "#task=3" });
     const y = await p.scrollTo(1500);
     assert.equal(y, 1500);
@@ -217,7 +217,7 @@ for (const [name, viewport] of [["desktop", DESKTOP], ["narrow", PHONE]]) {
     assert.ok(at.back.top >= 0 && at.back.bottom <= at.strip.bottom);
     assert.ok(at.slot.top >= at.strip.bottom, "the line sits under the strip");
     assert.ok(at.slot.bottom <= at.height);
-    assert.match(await text(p.page.locator(".notice-slot")), /^show it/);
+    assert.match(await text(p.page.locator(".notice-slot")), /^read it again/);
     await p.click("#task-detail button[data-show]");
     assert.equal((await p.state()).y, y);
     assert.deepEqual(p.reads, ["3", "3", "3"]);
@@ -525,5 +525,302 @@ test("closing the page with no edit, or one with no changes, asks nothing", TIME
     await p.page.close({ runBeforeUnload: true });
     await closed;
     assert.deepEqual(p.dialogs, []);
+  }
+});
+
+// ── the moves' labels, primary and caution ─────────────────────────────────
+
+// The detail's action controls, in order: approve's row, then the moves and the break,
+// each as [main, second, marks], its marks "primary" and "caution" as drawn; with the
+// line naming the holder above them and the line approve's row holds without one.
+async function controls(page) {
+  return page.evaluate(() => {
+    const text = el => (el ? el.textContent.trim() : "");
+    const buttons = [...document.querySelectorAll(
+      '#task-detail button[data-write="approve"], #task-detail button[data-write="move"], '
+      + '#task-detail button[data-write="break"]')];
+    return {
+      holder: text(document.querySelector("#task-detail [data-holder]")),
+      incomplete: text(document.querySelector("#task-detail [data-approve-row] > span")),
+      buttons: buttons.map(b => [text(b.querySelector(".main")),
+                                 text(b.querySelector(".second")),
+                                 ["primary", "caution"].filter(c => b.classList.contains(c))
+                                   .join(" ")]),
+    };
+  });
+}
+
+const HOLDER = "claude-3f2a9c1e-0000-4000-8000-000000000001 holds this task: a state "
+  + "move or a break ends the claim; an edit or a note leaves it.";
+const SUPERSEDES = n => `supersedes plan ${n}; no move restores it`;
+const ENDS = "ends the claim";
+// The moves every state shares, by the state they reach.
+const TO = {
+  landing: ["mark ready to land", "", ""],
+  deferred: ["defer", "", ""],
+  closed: ["close the task", "", ""],
+  refined: ["move to refined", "", ""],
+};
+
+// Each state's controls, worked out by hand from tasks-backend.js's tasks and the
+// scheme (tasks-ui/DESIGN.md, "One scheme of labels"). `act` brings the choices to the
+// case named.
+const STATES = [
+  ["proposed, its plan superseded", 1, null, {
+    holder: "", incomplete: "", buttons: [
+      ["open without a plan", "", ""], TO.landing, TO.deferred, TO.closed] }],
+  ["refined with no decisions", 6, null, {
+    holder: "", incomplete: "", buttons: [
+      ["approve and open", "revision 7 · plan 2", "primary"],
+      ["send back for a new plan", SUPERSEDES(2), "caution"],
+      TO.landing, TO.deferred, TO.closed] }],
+  ["refined with its decisions as assumed", 9, null, {
+    holder: "", incomplete: "", buttons: [
+      ["approve and open", "revision 3 · plan 4", "primary"],
+      ["send back for a new plan", SUPERSEDES(4), "caution"],
+      TO.landing, TO.deferred, TO.closed] }],
+  ["refined with a choice that differs", 10,
+   p => p.page.check('#task-detail input[data-decision="0"][data-option="1"]'), {
+     holder: "", incomplete: "", buttons: [
+       ["approve with these answers, sending it back",
+        `revision 3 · ${SUPERSEDES(5)}`, "primary"],
+       ["send back without answering", SUPERSEDES(5), "caution"],
+       TO.landing, TO.deferred, TO.closed] }],
+  ["refined with an answer incomplete", 10, async p => {
+    await p.page.uncheck('#task-detail input[data-decision="1"][data-option="0"]');
+    await p.page.uncheck('#task-detail input[data-decision="1"][data-option="1"]');
+  }, {
+    holder: "",
+    incomplete: "No approve until every decision is answered: decision 2 not yet. A "
+      + 'picked "other" needs its text.',
+    buttons: [["send back without answering", SUPERSEDES(5), "caution"],
+              TO.landing, TO.deferred, TO.closed] }],
+  ["refined with its plan answered", 15, null, {
+    holder: "", incomplete: "", buttons: [
+      ["send back for a new plan", SUPERSEDES(11), "caution"],
+      ["reopen", "plan 11 as approved · revision 5", "primary"],
+      TO.landing, TO.deferred, TO.closed] }],
+  ["open and claimed", 3, null, {
+    holder: HOLDER, incomplete: "", buttons: [
+      ["move to proposed", `${SUPERSEDES(2)} · ${ENDS}`, "caution"],
+      ["move to refined", ENDS, "caution"], ["mark ready to land", ENDS, "caution"],
+      ["defer", ENDS, "caution"], ["close the task", ENDS, "caution"],
+      ["break the claim", ENDS, "caution"]] }],
+  ["open, not claimed, with no plan", 2, null, {
+    holder: "", incomplete: "", buttons: [
+      ["move to proposed", "", ""], TO.landing, TO.deferred, TO.closed] }],
+  ["landing", 5, null, {
+    holder: "", incomplete: "", buttons: [
+      ["move to proposed", SUPERSEDES(2), "caution"], TO.refined,
+      ["move to open", "", ""], TO.deferred, ["close the task", "", "primary"]] }],
+  ["deferred with no plan", 7, null, {
+    holder: "", incomplete: "", buttons: [
+      ["move to proposed", "", ""], ["open without a plan", "", ""], TO.landing,
+      TO.closed] }],
+  ["deferred with a plan approved", 16, null, {
+    holder: "", incomplete: "", buttons: [
+      ["move to proposed", SUPERSEDES(12), "caution"], TO.refined,
+      ["reopen", "plan 12 as approved · revision 4", ""], TO.landing, TO.closed] }],
+  ["deferred with a plan no approve names", 17, null, {
+    holder: "", incomplete: "", buttons: [
+      ["move to proposed", SUPERSEDES(13), "caution"], TO.refined,
+      ["open with plan 13",
+       "no approve of plan 13 found: move it to refined to approve it", ""],
+      TO.landing, TO.closed] }],
+  ["closed with its plan answered", 14, null, {
+    holder: "", incomplete: "", buttons: [
+      ["move to proposed", SUPERSEDES(10), "caution"], TO.refined,
+      ["reopen", "plan 10 as approved · revision 6", ""], TO.landing, TO.deferred] }],
+];
+
+for (const [name, id, act, expected] of STATES) {
+  test(`${name}: each control's words, primary and caution`, TIMEOUT, async t => {
+    const p = await tasksPage(t, { hash: `#task=${id}` });
+    if (act) {
+      await act(p);
+      await p.settle();
+    }
+    assert.deepEqual(await controls(p.page), expected);
+  });
+}
+
+// What the classes draw, as the browser computes it: the warning colour's border on a
+// caution, as drawn and under the pointer, and the accent's fill on the primary. Task 5,
+// landing, has both.
+test("a caution is bordered in the warning colour, hovered too, and the primary filled",
+     TIMEOUT, async t => {
+  const p = await tasksPage(t, { hash: "#task=5" });
+  const HOLD = "rgb(210, 153, 34)";
+  const ACCENT = "rgb(59, 130, 246)";
+  const caution = p.page.locator('#task-detail button.caution[data-value="proposed"]');
+  const primary = p.page.locator('#task-detail button.primary[data-value="closed"]');
+  const style = (loc, prop) => loc.evaluate((el, name) => getComputedStyle(el)[name], prop);
+  assert.equal(await style(caution, "borderTopColor"), HOLD);
+  await caution.hover();
+  assert.equal(await style(caution, "borderTopColor"), HOLD, "hovered");
+  assert.equal(await style(primary, "backgroundColor"), ACCENT);
+});
+
+test("no control on any task reads a bare close", TIMEOUT, async t => {
+  const p = await tasksPage(t);
+  for (const [, id] of STATES) {
+    await p.setHash(`#task=${id}`);
+    const words = await p.page.locator("#task-detail button").evaluateAll(
+      bs => bs.map(b => (b.querySelector(".main") || b).textContent.trim()));
+    assert.ok(words.length > 0);
+    assert.ok(!words.includes("close"), `task ${id}: ${words.join(", ")}`);
+  }
+});
+
+// A move or an approve whose words are not its verb is named in its outcome as its
+// button named it.
+test("an outcome names its write by the words on its button", TIMEOUT, async t => {
+  const p = await tasksPage(t, { hash: "#task=7" });
+  await p.click('#task-detail button[data-write="move"][data-value="open"]');
+  const outcome = () => p.page.evaluate(() => {
+    const head = [...document.querySelectorAll("#task-detail h3")]
+      .find(h => h.textContent === "Moves");
+    return head.nextElementSibling.textContent.trim();
+  });
+  assert.equal(await outcome(), "Open without a plan: done.");
+  await p.setHash("#task=6");
+  await p.click('#task-detail button[data-verb="approve"]');
+  assert.equal(await outcome(), "Approve and open: done. The task is open.");
+});
+
+test("a hidden note is unhidden, and a note's writes say they stay", TIMEOUT, async t => {
+  const p = await tasksPage(t, { hash: "#task=3" });
+  // Note 11 is hidden on the timeline's first page.
+  const unhide = p.page.locator('#task-detail button[data-write="hide"][data-note="11"]');
+  assert.equal(await text(unhide.locator(".main")), "unhide");
+  assert.equal(await text(unhide.locator(".second")), "agents read it again");
+  const stays = "agents read it; it can be hidden, never removed";
+  assert.equal(await text(p.page.locator(
+    '#task-detail button[data-write="note"] .second')), stays);
+  await p.click('#task-detail button[data-reply-open="14"]');
+  assert.equal(await text(p.page.locator(
+    '#task-detail button[data-write="handle"][data-value="reply"][data-note="14"] .second')),
+               stays);
+  await p.click('#task-detail button[data-write="hide"][data-note="11"]');
+  const said = await p.page.evaluate(() => {
+    const timeline = [...document.querySelectorAll("#task-detail h3")]
+      .find(h => h.textContent.startsWith("Timeline"));
+    return timeline.previousElementSibling.textContent.trim();
+  });
+  assert.match(said, /^Unhide note #11: done\./);
+});
+
+test("the slot's way to the newer read says read it again", TIMEOUT, async t => {
+  const p = await tasksPage(t, { hash: "#task=6" });
+  backend.editElsewhere(6);
+  await p.poll();
+  assert.equal(await text(p.page.locator("#task-detail button[data-show]")),
+               "read it again");
+});
+
+test("the save says the revision, and that the claim stays on a claimed task", TIMEOUT,
+     async t => {
+  const p = await tasksPage(t, { hash: "#task=12" });
+  await p.click("#task-detail button[data-spec-open]");
+  const save = p.page.locator('#task-detail button[data-write="edit"]');
+  assert.equal(await text(save.locator(".main")), "save the edit");
+  assert.equal(await text(save.locator(".second")), "revision 5 · the claim stays");
+  assert.equal(await text(p.page.locator("#task-detail button[data-spec-discard]")),
+               "discard the edit");
+  await p.setHash("#task=11");
+  await p.click("#task-detail button[data-spec-open]");
+  assert.equal(await text(save.locator(".second")), "revision 2");
+});
+
+// Every state's moves, and the note's add, inside the window, and no write control in
+// the detail clipping its words, at a desktop width and a phone's. The timeline's own
+// note controls are left out of the first: at 390 px its table is wider than the window
+// whatever they say.
+for (const [name, viewport] of [["1280", { width: 1280, height: 900 }], ["390", PHONE]]) {
+  test(`${name} px: every move lies in the window and no control clips its label`,
+       TIMEOUT, async t => {
+    const p = await tasksPage(t, { viewport });
+    for (const [state, id, act] of STATES) {
+      await p.setHash(`#task=${id}`);
+      if (act) {
+        await act(p);
+        await p.settle();
+      }
+      const bad = await p.page.evaluate(() => {
+        const width = document.documentElement.clientWidth;
+        const outside = [...document.querySelectorAll(
+          '#task-detail button[data-write="approve"], #task-detail button[data-write="move"], '
+          + '#task-detail button[data-write="break"], #task-detail button[data-write="note"]')]
+          .filter(b => {
+            const r = b.getBoundingClientRect();
+            return r.left < 0 || r.right > width;
+          });
+        const clipped = [...document.querySelectorAll("#task-detail button[data-write]")]
+          .filter(b => b.getClientRects().length)
+          .filter(b => b.scrollWidth > b.clientWidth
+                  || [...b.children].some(c => c.scrollWidth > c.clientWidth));
+        // Approve's two lines inside its row, whose height is fixed.
+        const row = document.querySelector("#task-detail [data-approve-row]");
+        const approve = row && row.querySelector("button");
+        const spills = approve && (approve.getBoundingClientRect().top
+                                   < row.getBoundingClientRect().top
+                                   || approve.getBoundingClientRect().bottom
+                                   > row.getBoundingClientRect().bottom);
+        return [...outside.map(b => `outside: ${b.textContent.trim()}`),
+                ...clipped.map(b => `clipped: ${b.textContent.trim()}`),
+                ...(spills ? [`spills from its row: ${approve.textContent.trim()}`] : [])];
+      });
+      assert.deepEqual(bad, [], `${state}, task ${id}`);
+    }
+  });
+}
+
+// The boxes of every move, the break and every heading in the detail, in the page's
+// coordinates, so a scroll that brings a choice into view moves none: what must stay
+// put while approve is relabelled.
+async function stillBoxes(page) {
+  return page.evaluate(() => {
+    const els = [...document.querySelectorAll(
+      '#task-detail button[data-write="move"], #task-detail button[data-write="break"], '
+      + "#task-detail h3")];
+    return els.map(el => {
+      const r = el.getBoundingClientRect();
+      return [el.textContent.startsWith("Timeline") ? "Timeline" : el.dataset.value ?? "",
+              r.left + window.scrollX, r.top + window.scrollY,
+              el.matches("h3") ? 0 : r.width, r.height];
+    });
+  });
+}
+
+test("relabelling approve and send back, or an answer going incomplete and back, moves "
+     + "no other box", TIMEOUT, async t => {
+  for (const viewport of [DESKTOP, PHONE]) {
+    const p = await tasksPage(t, { viewport, hash: "#task=10" });
+    const before = await stillBoxes(p.page);
+    const steps = [
+      () => p.page.check('#task-detail input[data-decision="0"][data-option="1"]'),
+      () => p.page.uncheck('#task-detail input[data-decision="1"][data-option="0"]'),
+      () => p.page.uncheck('#task-detail input[data-decision="1"][data-option="1"]'),
+      () => p.page.check('#task-detail input[data-decision="1"][data-option="0"]'),
+      () => p.page.check('#task-detail input[data-decision="0"][data-option="0"]'),
+    ];
+    for (const [i, step] of steps.entries()) {
+      await step();
+      await p.settle();
+      assert.deepEqual(await stillBoxes(p.page), before, `${viewport.width} px, step ${i}`);
+    }
+  }
+});
+
+test("the edit holding the moves moves no box", TIMEOUT, async t => {
+  for (const viewport of [DESKTOP, PHONE]) {
+    const p = await tasksPage(t, { viewport, hash: "#task=11" });
+    await p.click("#task-detail button[data-spec-open]");
+    const before = await stillBoxes(p.page);
+    await p.page.fill('#task-detail input[data-spec="title"]', "Rotate");
+    await p.settle();
+    assert.equal(await p.page.locator('#task-detail button[data-verb="approve"]')
+      .isDisabled(), true);
+    assert.deepEqual(await stillBoxes(p.page), before, `${viewport.width} px`);
   }
 });

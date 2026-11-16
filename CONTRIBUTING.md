@@ -35,8 +35,8 @@ make claude        # launch a tier-1 sandbox in the current directory
 ## The gate
 
 **`make check` is the whole verdict.** CI runs the same targets rather than
-reimplementing them, so a red run reproduces locally — with one difference that
-matters:
+reimplementing them, so a red run reproduces locally — with two differences that
+matter. The first is strictness:
 
 ```bash
 make check-strict   # the same targets CI runs, with a MISSING TOOL a failure not a skip
@@ -45,6 +45,10 @@ make check-strict   # the same targets CI runs, with a MISSING TOOL a failure no
 Use `check-strict` before opening a pull request if you have the full toolchain. The
 strictness exists because a runner without `hadolint` would print `SKIP hadolint` and
 pass green, verifying less than the badge claims with nothing saying so.
+
+The second is the interpreter. CI runs the tests on the Python minor the service images
+are built on (the `checks` job's `PYTHON_VERSION`), so a test that depends on the minor
+can fail there and pass on a local `python3` of another one.
 
 Two stages are worth knowing about in advance, because they fail for reasons that are
 not about your code being wrong:

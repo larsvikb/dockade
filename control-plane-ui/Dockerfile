@@ -6,7 +6,7 @@
 # because it also copies ui-common/: the browser guards and modules every UI shares,
 # one implementation rather than a copy per UI. Everything lands in one directory,
 # where app.py and the page import by plain name.
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 # Non-root runtime user. The frontend needs no privileges; it only serves HTTP
 # on control-ui-net and relays to the backend on control-net.

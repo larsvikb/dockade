@@ -5,7 +5,7 @@
 #
 # Build context is the REPO ROOT (see docker-compose.yml) so this can COPY the
 # top-level policies/ seed. See .dockerignore for what that context excludes.
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 # Non-root runtime user. The control plane needs no privileges — it only serves
 # HTTP on control-net and writes its SQLite store on a mounted volume.

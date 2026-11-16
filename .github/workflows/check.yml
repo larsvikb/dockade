@@ -2,9 +2,13 @@
 #
 # CI gate. Runs the SAME targets as `make check` rather than reimplementing them, so
 # there is one definition of "does this repo pass" and a contributor can reproduce a
-# CI failure locally with `make check-strict`.
+# CI failure locally with `make check-strict`, on the same Python minor.
 #
-# The one thing this file adds is STRICTNESS. Every stage of the gate degrades to a
+# This file adds two things. The first is the INTERPRETER: the `checks` job runs on
+# the Python minor the service images are built FROM, set once as PYTHON_VERSION
+# below and held equal to their tags by tests/test_python_pin.py, so CI tests on
+# production's Python. A local `python3` of another minor can pass a test that fails
+# here. The second is STRICTNESS. Every stage of the gate degrades to a
 # SKIP when its tool is missing, which is correct on a dev machine and a trap in CI:
 # a runner without hadolint would print `SKIP hadolint` and pass green. So
 # DOCKADE_REQUIRE_TOOLS=1 is set for every job, turning a missing tool into a
@@ -37,7 +41,7 @@ on:
   # Weekly, because this repo floats its tooling ON PURPOSE: ruff.toml pins the rule
   # SELECTION and lets the binary drift ("rebuild-to-update"), and base images are
   # pinned by tag, not digest. The consequence is that a green commit can go red with
-  # no code change — a new ruff rule family, a rebuilt python:3.12-slim. A scheduled
+  # no code change — a new ruff rule family, a rebuilt python base image. A scheduled
   # run is how that surfaces on its own schedule instead of ambushing whoever happens
   # to open the next pull request.
   schedule:
@@ -60,6 +64,11 @@ jobs:
     runs-on: ubuntu-latest
     env:
       DOCKADE_REQUIRE_TOOLS: 1
+      # The service images' Python minor: every python-based */Dockerfile is FROM
+      # python:<this>-slim. Restated, not derived as hadolint's version is,
+      # so that tests/test_python_pin.py fails on a mismatch before the push
+      # instead of this job reading a wrong value after it.
+      PYTHON_VERSION: "3.14"
     steps:
       # v5 targets Node 24. v4 targets Node 20, which GitHub has deprecated and is
       # already force-running on 24 — a warning on every run and a future failure.
@@ -70,6 +79,13 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+
+      # Before anything runs python3, so the tests below run on the images' minor and
+      # not on whatever the runner image ships. Its `token` input defaults to the
+      # job's github.token, read-only under the `permissions` above.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
 
       # ruff and yamllint via pipx, which is how claude-sandbox/Dockerfile installs
       # them too — CI and the agent image get the linters the same way. Unpinned, per
@@ -124,8 +140,11 @@ jobs:
 
       # Recorded in the log so a run's verdict can be traced to the exact tool
       # versions that produced it — the necessary counterpart to floating them.
-      # shellcheck, python3 and node come with the runner image; strict mode fails
-      # loudly rather than skipping if a future image drops one.
+      # shellcheck and node come with the runner image; strict mode fails loudly
+      # rather than skipping if a future image drops one. python3 is setup-python's.
+      # A setup-python step that went missing or moved after the tests would leave
+      # them on the runner's default; this fails the job once that default is not
+      # PYTHON_VERSION (while it matches, only tests/test_python_pin.py notices).
       #
       # The PATHS are printed for the two we install ourselves, because "which yamllint
       # is this?" is precisely the question the pipx-home failure above raised, and the
@@ -138,6 +157,12 @@ jobs:
           ruff --version
           yamllint --version
           python3 --version
+          minor=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+          if [ "$minor" != "$PYTHON_VERSION" ]; then
+            echo "python3 is $minor, not PYTHON_VERSION $PYTHON_VERSION: the tests" >&2
+            echo "would run on another Python than the service images'." >&2
+            exit 1
+          fi
           node --version
           echo "installed by this job: $(command -v ruff), $(command -v yamllint)"
 
@@ -173,7 +198,7 @@ jobs:
       # read-only scope, and nothing else here needs it. Plain `docker login` rather
       # than an action, so no tag-pinned action's code runs with the token. It stays
       # logged in for the whole job: the boundary step's `make up` builds again, and
-      # BuildKit re-resolves the `python:3.12-slim` tag at the registry when it does.
+      # BuildKit re-resolves the python base image's tag at the registry when it does.
       # Without the secrets (a fork's pull request gets none) the step says so and
       # the job pulls anonymously.
       - name: Log in to Docker Hub (read-only token)

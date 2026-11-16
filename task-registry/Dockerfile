@@ -2,7 +2,7 @@
 # Task registry — the work list agent sessions and the operator share
 # (task-registry/DESIGN.md). Not an egress choke point, so the base is pinned by tag
 # like the gateway's and the control plane's. Build context is this directory.
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 # Non-root runtime user, and mostly a FALLBACK, as in tool-gateway/Dockerfile: compose
 # runs this service as the invoking user so it can read its secret file, which is the

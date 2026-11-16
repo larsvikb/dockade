@@ -489,13 +489,34 @@ class ApproveTests(_Store):
         self.assertEqual(self.approve(task, [])["state"], "open")
         self.assertEqual(reads.get_task(task)["answers"], [])
         self.assertEqual(op.history(task)["history"][-1]["detail"]["answers"], [])
-        # Approved before and moved back: approved again, since it has no answers.
+        first = reads.get_task(task)["plan"]
+        self.assertEqual(first["approved_at"], op.history(task)["history"][-1]["ts"])
+        # Approved before and moved back: refused, though it has no answers.
         op.move(task, self.revision(task), "refined")
-        self.assertEqual(self.approve(task, [])["state"], "open")
-        # And re-refined after being moved back to proposed.
+        refusal = self.refused(self.approve, task, [])
+        self.assertIn("approved already: a move to open reopens it", refusal.reason)
+        self.assertEqual(refusal.current, {"state": "refined"})
+        self.assertEqual([e["action"] for e in op.history(task)["history"]].count("approve"),
+                         1)
+        op.move(task, self.revision(task), "open")
+        self.assertEqual(reads.get_task(task)["plan"]["approved_at"], first["approved_at"])
+        # Re-refined after being moved back to proposed: a new plan, approved anew.
         op.move(task, self.revision(task), "proposed")
-        self.replan(task, decisions=())
+        second = self.replan(task, decisions=())
+        self.assertIsNone(reads.get_task(task)["plan"]["approved_at"])
         self.assertEqual(op.approve(task, self.revision(task))["state"], "open")
+        every = {p["id"]: p["approved_at"] for p in reads.task_plans(task)}
+        self.assertEqual(every[first["id"]], first["approved_at"])
+        self.assertGreater(every[second], first["approved_at"])
+
+    def test_an_approve_that_opens_approves_its_plan_and_one_sending_back_does_not(self):
+        opened = self.refined()
+        self.assertIsNone(reads.get_task(opened)["plan"]["approved_at"])
+        self.approve(opened, ASSUMED)
+        self.assertIsNotNone(reads.get_task(opened)["plan"]["approved_at"])
+        sent = self.refined()
+        self.approve(sent, [{"other": "Deny, but log each one."}, ASSUMED[1]])
+        self.assertIsNone(reads.get_task(sent)["plan"]["approved_at"])
 
     def test_the_answers_reach_the_next_refiner_and_the_implementer(self):
         task = self.refined()

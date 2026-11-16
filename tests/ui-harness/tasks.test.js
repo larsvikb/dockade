@@ -688,6 +688,27 @@ test("an outcome names its write by the words on its button", TIMEOUT, async t =
   assert.equal(await outcome(), "Approve and open: done. The task is open.");
 });
 
+// An approve that opens leaves its plan approved (`approved_at`), so moved back to
+// refined it is reopened, never approved again, and the registry refuses a second one.
+test("a plan approved and moved back to refined offers reopen, not approve", TIMEOUT,
+     async t => {
+  const p = await tasksPage(t, { hash: "#task=8" });
+  await p.click('#task-detail button[data-verb="approve"]');
+  await p.click('#task-detail button[data-write="move"][data-value="refined"]');
+  assert.deepEqual(await controls(p.page), {
+    holder: "", incomplete: "", buttons: [
+      ["send back for a new plan", SUPERSEDES(2), "caution"],
+      ["reopen", "plan 2 as approved · revision 4", ""],
+      TO.landing, TO.deferred, TO.closed] });
+  assert.equal(await p.page.locator("#task-detail [data-approve-row]").count(), 0);
+  assert.match(await text(p.page.locator("#task-detail div.plan > div.qual")),
+               / · approved \d{4}-\d\d-\d\d \d\d:\d\d:\d\d$/);
+  const again = backend.respond("POST", "/api/tasks/8/approve",
+                                { revision: 4, answers: [] });
+  assert.equal(again.status, 400);
+  assert.match(again.json.detail, /approved already/);
+});
+
 test("a hidden note is unhidden, and a note's writes say they stay", TIMEOUT, async t => {
   const p = await tasksPage(t, { hash: "#task=3" });
   // Note 11 is hidden on the timeline's first page.

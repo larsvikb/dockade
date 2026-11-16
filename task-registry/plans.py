@@ -218,7 +218,21 @@ def shown(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
             "risks": row["risks"], "review_rounds": row["review_rounds"],
             "review_verdict": row["review_verdict"],
             "decisions": decisions(conn, row["id"]),
+            "approved_at": approved_at(conn, row["id"]),
             "superseded_at": row["superseded_at"]}
+
+
+def approved_at(conn: sqlite3.Connection, plan: int) -> float | None:
+    """When the operator's approve opened the plan's task with it, the earliest time if
+    more than one did, or ``None``. Derived from the approve's history row, which has
+    named its plan and the state reached since approve existed, so no table keeps it;
+    an approve that sent the task back is not one. Only the time leaves this: the
+    history read is the operator's ("Every write leaves a history row")."""
+    return conn.execute(
+        "SELECT MIN(h.ts) FROM history h JOIN plans p ON p.task_id = h.task_id "
+        "WHERE p.id = ? AND h.action = 'approve' "
+        "AND json_extract(h.detail, '$.plan') = p.id "
+        "AND json_extract(h.detail, '$.state') = 'open'", (plan,)).fetchone()[0]
 
 
 def decisions(conn: sqlite3.Connection, plan: int) -> list[dict]:

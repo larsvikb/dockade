@@ -24,7 +24,7 @@ export const OUTCOME_UNKNOWN_STATUS = 504;
 // a name of its own; any other is "move to <state>". It marks the control and the
 // write, never what the button says, which is `moveLabel`'s. A refined task is approved
 // by a write of its own (`approveAnswers`), so a move from refined to open only reopens
-// a plan answered before (`movesFor`).
+// a plan approved before (`movesFor`).
 export function moveVerb(from, to) {
   if (from === "refined" && to === "proposed") return "send back";
   if (to === "closed") return "close";
@@ -38,10 +38,11 @@ export function moveVerb(from, to) {
 // which a move to another state does. A task's claim is shown only while it is live.
 // Open is left out wherever the registry refuses it, while the current plan has
 // decisions not answered (`tasks.update`), and from refined unless the plan was
-// answered before, since approving is `approve`.
+// approved before, since approving is `approve`.
 export function movesFor(task) {
   if (!task || typeof task !== "object" || !TASK_STATES.includes(task.state)) return [];
-  const opens = !awaitsAnswers(task) && (task.state !== "refined" || planAnswered(task));
+  const opens = !awaitsAnswers(task)
+    && (task.state !== "refined" || planAnswered(task) || planApproved(task));
   return TASK_STATES
     .filter(s => s !== task.state && (s !== "refined" || currentPlan(task))
             && (s !== "open" || opens))
@@ -72,18 +73,14 @@ export function planAnswered(task) {
     && task.answers.some(a => a && a.plan === plan.id);
 }
 
-// Whether the current plan was approved, as far as the page can tell: answered, or,
-// with no decisions and so no answers, approved by an entry of `history`, the timeline
-// page read with the task. An approve that sends the task back supersedes its plan, so
-// a current plan with answers was approved to open. An approve older than that page is
-// not found, and the plan reads as never approved.
-export function planApprovedIn(task, history) {
+// Whether the current plan was approved: an approve opened the task with it, which the
+// registry derives from history as `approved_at` (`plans.approved_at`), a plan without
+// decisions too. Beside `planAnswered`, which a registry or fixture without the field
+// still answers: an approve that sends the task back supersedes its plan, so a current
+// plan with answers was approved to open.
+export function planApproved(task) {
   const plan = currentPlan(task);
-  if (!plan) return false;
-  if (planAnswered(task)) return true;
-  return planDecisions(plan).length === 0 && Array.isArray(history)
-    && history.some(h => h && h.action === "approve" && h.detail
-                    && h.detail.plan === plan.id);
+  return Boolean(plan) && Boolean(plan.approved_at);
 }
 
 // Whether the current plan has decisions nobody answered: no move opens the task then.
@@ -92,10 +89,10 @@ export function awaitsAnswers(task) {
 }
 
 // Whether the operator can approve the task: refined, its plan current and not
-// answered before, which `operator_moves.approve` refuses.
+// approved before, which `operator_moves.approve` refuses.
 export function approvable(task) {
   return Boolean(task) && task.state === "refined" && Boolean(currentPlan(task))
-    && !planAnswered(task);
+    && !planAnswered(task) && !planApproved(task);
 }
 
 function assumedOf(decision) {

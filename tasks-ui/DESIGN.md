@@ -107,12 +107,11 @@ removed. A claimed task's moves open with one line naming the holder. At most on
 control is filled as primary (`primaryMove`): approve where the operator can approve,
 reopen on a refined task whose plan was answered, and closing a landing task. Proposed,
 open, deferred and closed tasks have none, since leaving them is a choice among several.
-A move to open names the plan it opens, and reads "reopen" only for one the page finds
-approved, by its answers or, for a plan with no decisions, by an approve naming it in
-the timeline page read with the task (`planApprovedIn`); otherwise "open with plan N",
-or "open without a plan", so opening a deferred plan nobody approved never reads as
-approving it. An approve older than that page is not found, and its plan reads as never
-approved, the cautious side.
+A move to open names the plan it opens, and reads "reopen" only for one approved, by
+its answers or by the `approved_at` the registry derives from its approve
+(`planApproved`), a plan with no decisions too; otherwise "open with plan N", or "open
+without a plan", so opening a deferred plan nobody approved never reads as approving
+it.
 
 **A plan's decisions sit above it, answered with the approve.** A decision is the
 refiner's question for the operator (`task-registry/DESIGN.md`, "Decisions"), and it
@@ -142,10 +141,10 @@ whatever the choices were, and shows any "other" text it reset: without it, a re
 approving a plan nobody read. The first choice in the new plan spends that line, which
 keeps its space so nothing moves under the pointer, and a landed approve drops it. Open
 is offered from no state while the current plan has decisions unanswered, since the
-registry refuses it, and from refined only as a reopen of a plan answered before, since
-approving is `approve`. The inbox's count for a refined task is what its plan carries,
-answered decisions included (`operator_moves.inbox`), so the page says the count and
-never that decisions wait.
+registry refuses it, and from refined only as a reopen of a plan approved before, since
+approving is `approve`, which refuses that plan. The inbox's count for a refined task is
+what its plan carries, answered decisions included (`operator_moves.inbox`), so the page
+says the count and never that decisions wait.
 
 **The inbox: whose turn it is, worked out.** The page opens on what is the operator's
 turn rather than on the backlog, as Gerrit's attention set does. `operator_moves.inbox`
@@ -270,8 +269,8 @@ move and breaking the claim are held, since each would act on a spec other than 
 one on screen; a note and the moves on notes stay free. An edit leaves a claim as it is
 (`operator_moves.edit`), and the save says the claim stays. A refined task's form says the edit amends the spec its plan was written against, and once the task's revision
 is past the plan's, `planNotice` says approving approves the task as it now is, with that
-plan: for a refined task only, since an approved task's revision always passes its
-plan's.
+plan, or for a plan approved before, that reopening opens it so: for a refined task
+only, since an approved task's revision always passes its plan's.
 
 **A revised plan is drawn as what changed.** A refiner's revision is mostly the plan it
 replaced, so a plan with a predecessor (`planPredecessor`: the next lower id, not the one

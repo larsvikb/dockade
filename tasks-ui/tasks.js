@@ -26,7 +26,7 @@ import {
   onParkedTask, selectAll, tickMark, bulkToSend, keptSelection, redrawsFlagged,
   sendWrite, readAnswer,
   writeOutcome, checkWrite, lastNoteId, lastEntryId,
-  planDecisions, awaitsAnswers, approvable, planAnswered, planApprovedIn,
+  planDecisions, awaitsAnswers, approvable, planAnswered, planApproved,
   assumedChoices, blankText, choiceAnswer,
   unanswered, approveAnswers, choicesDiffer, approveOutcome, currentPlan,
   SPEC_CONTROLS, asControl, controlChanges, specDraft, draftChanges, editRequest,
@@ -132,12 +132,13 @@ function reviewRounds(value) {
 }
 
 // What a plan says about itself: which one, whose, when, against which revision of the
-// task, after how many reviews, and whether it was superseded.
+// task, after how many reviews, when it was approved, and whether it was superseded.
 export function planHeading(plan) {
   if (!plan || typeof plan !== "object") return "";
   const parts = [`plan ${plan.id}`, `by ${spellHidden(plan.author).text}`,
                  fmtStamp(plan.at), `at revision ${plan.task_revision}`,
                  reviewRounds(plan.review_rounds)];
+  if (plan.approved_at) parts.push(`approved ${fmtStamp(plan.approved_at)}`);
   if (plan.superseded_at) parts.push(`superseded ${fmtStamp(plan.superseded_at)}`);
   return parts.filter(Boolean).join(" · ");
 }
@@ -149,7 +150,8 @@ export function planHeading(plan) {
 // superseded one, and then nobody will hand one in. A refined task whose revision is
 // past the one its plan was written against was written to since: a spec edit, or a
 // move away and back, which changes no spec but moves the revision all the same.
-// Approving approves it as it now is, with that plan; said only there, since every
+// Approving approves it as it now is, with that plan, or for a plan approved before,
+// which only a reopen opens, reopening opens it so; said only there, since every
 // approved task's revision passes its plan's.
 export function planNotice(plan, task) {
   if (!task || typeof task !== "object") return null;
@@ -164,14 +166,24 @@ export function planNotice(plan, task) {
     const lag = task.state === "refined" && Number(task.revision) > Number(plan.task_revision);
     return lag
       ? { text: `The task moved on since plan ${plan.id} was written (revision `
-                + `${plan.task_revision}, now ${task.revision}): approving approves the `
-                + "task as it now is, with this plan.", warn: true }
+                + `${plan.task_revision}, now ${task.revision}): `
+                + (wasApproved(plan, task)
+                  ? "reopening opens the task as it now is, with this plan."
+                  : "approving approves the task as it now is, with this plan."),
+          warn: true }
       : null;
   }
   return { text: proposed
              ? "Superseded: no plan is current until an agent refines the task again."
              : "Superseded: no plan is current.",
            warn: true };
+}
+
+// Whether `plan` was approved, as `planAnswered` and `planApproved` tell it of the
+// current plan, but of the plan given.
+function wasApproved(plan, task) {
+  return Boolean(plan.approved_at)
+    || (Array.isArray(task.answers) && task.answers.some(a => a && a.plan === plan.id));
 }
 
 // Every plan but the one shown above, in the order the registry sent them (newest
@@ -380,12 +392,11 @@ function joined(...parts) {
 // A move's label, by the state it reaches. A move to proposed supersedes the current
 // plan (`tasks.update`), an approved one too, so with one it is a caution; so is every
 // move that ends a live claim, which a move to another state does
-// (`operator_moves.move`). A move to open says which plan it opens and whether the page
-// found it approved (`planApprovedIn`, over `history`, the timeline page read with the
-// task): opening a plan nobody approved must not read as approving it. A send back says
-// it sends no answers once `picked`, the choices made, differ from what the plan
-// assumes.
-export function moveLabel(move, task, picked = null, history = null) {
+// (`operator_moves.move`). A move to open says which plan it opens and whether it was
+// approved (`planAnswered`, `planApproved`): opening a plan nobody approved must not
+// read as approving it. A send back says it sends no answers once `picked`, the choices
+// made, differ from what the plan assumes.
+export function moveLabel(move, task, picked = null) {
   if (!move || typeof move !== "object" || !task || typeof task !== "object") return null;
   const plan = currentPlan(task);
   let main, second = "", caution = false;
@@ -401,7 +412,7 @@ export function moveLabel(move, task, picked = null, history = null) {
     main = "move to open";
   } else if (move.state === "open" && !plan) {
     main = "open without a plan";
-  } else if (move.state === "open" && planApprovedIn(task, history)) {
+  } else if (move.state === "open" && (planAnswered(task) || planApproved(task))) {
     main = "reopen";
     second = `plan ${plan.id} as approved · revision ${task.revision}`;
   } else if (move.state === "open") {
@@ -547,11 +558,13 @@ export function noteMoveLabel(move) {
 // What an edit of a refined task does to the plan beside it, or nothing for another.
 export function specAmendText(task) {
   const plan = currentPlan(task);
-  return task && task.state === "refined" && plan
-    ? `This task is refined: an edit amends the spec plan ${plan.id} was written `
-      + `against, at revision ${plan.task_revision}. Approving after it approves the `
-      + "edited task with that plan."
-    : "";
+  if (!(task && task.state === "refined" && plan)) return "";
+  return `This task is refined: an edit amends the spec plan ${plan.id} was written `
+    + `against, at revision ${plan.task_revision}. `
+    + (wasApproved(plan, task)
+      ? `Plan ${plan.id} was approved before: a reopen after the edit opens the edited `
+        + "task with that plan."
+      : "Approving after it approves the edited task with that plan.");
 }
 
 // A stored severity or kind no select offers, which the select shows as none: said, so
@@ -1675,7 +1688,7 @@ function drawTask(task, held) {
     taskDetail.appendChild(noticeLine(planNotice(null, task)));
   }
   // Below the plan, so what a move approves is read before it.
-  taskDetail.appendChild(movesBlock(task, held.timeline));
+  taskDetail.appendChild(movesBlock(task));
   // A move on a note says what it came to above the timeline it was made in.
   if (outcome && outcome.task === String(task.id) && outcome.onNote) {
     taskDetail.appendChild(noticeLine(outcome));
@@ -1745,9 +1758,8 @@ export async function refreshOpenTask() {
 // answers. Approve has a row of its own, above the rest and two lines high, which
 // `markAnswers` fills as choices are made: neither its label nor the send back's
 // moves the other. A claimed task's moves open with whose claim it is. The primary,
-// when the task has one, is marked here, or on approve by `markAnswers`. `timeline` is
-// the page of it read with the task, where a move to open looks for an approve.
-function movesBlock(task, timeline) {
+// when the task has one, is marked here, or on approve by `markAnswers`.
+function movesBlock(task) {
   const block = document.createElement("div");
   const head = document.createElement("h3");
   head.textContent = "Moves";
@@ -1780,10 +1792,9 @@ function movesBlock(task, timeline) {
   }
   const row = document.createElement("div");
   row.className = "moves";
-  const history = timeline ? timeline.history : null;
   const primary = primaryMove(task);
   for (const move of movesFor(task)) {
-    const btn = writeButton(moveLabel(move, task, null, history), "move", move.state);
+    const btn = writeButton(moveLabel(move, task), "move", move.state);
     btn.dataset.verb = move.verb;
     if (move.state === primary) btn.classList.add("primary");
     row.appendChild(btn);

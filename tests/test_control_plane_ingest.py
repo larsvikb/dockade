@@ -96,6 +96,29 @@ class _FailsOn:
         return self._conn.execute(sql, *a, **kw)
 
 
+def _loads_recursing_on(marker: bytes, real=json.loads):
+    """``json.loads`` that raises RecursionError on a line holding ``marker`` and
+    parses every other. The depth at which the real parser gives up is the
+    interpreter's, so a test proving the catch raises the error rather than nesting."""
+    def loads(s, *a, **kw):
+        if isinstance(s, bytes) and marker in s:
+            raise RecursionError("maximum recursion depth exceeded")
+        return real(s, *a, **kw)
+    return loads
+
+
+class _DeepStr:
+    """A value whose ``str()`` recurses, as a parsed value too deep to convert would."""
+
+    def __str__(self):
+        raise RecursionError("maximum recursion depth exceeded")
+
+
+# Never closed, so it cannot parse: json.loads raises RecursionError on it on 3.13,
+# and a ValueError on an interpreter that does not recurse. Well under DRAIN_BLOCK.
+_DEEP_LINE = "[" * 200000 + "\n"
+
+
 def _stream(name):
     """One ingest stream by name. The suite points a stream at a temp file, so it has
     to reach the object rather than the module constant it was built from."""
@@ -123,6 +146,13 @@ class IngestTestCase(unittest.TestCase):
         ctx = contextlib.redirect_stdout(self.out)
         ctx.__enter__()
         self.addCleanup(ctx.__exit__, None, None, None)
+
+    def _forget(self):
+        """Start a subtest over: no rows and no cursor, so its file is read afresh."""
+        with cp.store._connect() as conn:
+            conn.execute("DELETE FROM audit")
+            conn.execute("DELETE FROM audit_cursor")
+            conn.commit()
 
     def write(self, text, mode="a"):
         with open(self.path, mode) as f:
@@ -268,6 +298,21 @@ class RowMappingTests(IngestTestCase):
                     b"\xff\xfe\x00binary"):
             with self.subTest(raw=raw):
                 self.assertIsNone(cp.ingest._egress_row(raw))
+
+    def test_a_line_too_deep_to_parse_is_dropped(self):
+        # RecursionError is a RuntimeError, not a ValueError: uncaught, it wedged the
+        # stream at that line for good.
+        with mock.patch.object(cp.ingest.json, "loads", _loads_recursing_on(b"deep")):
+            self.assertIsNone(cp.ingest._egress_row(_line(host="deep").encode()))
+            self.assertIsNotNone(cp.ingest._egress_row(_line().encode()))
+
+    def test_a_field_too_deep_to_convert_is_null_and_the_row_kept(self):
+        self.assertIsNone(cp.ingest._ingest_field(_DeepStr()))
+        rec = json.loads(_line(url="https://evil.com/"))
+        rec["url"] = _DeepStr()
+        with mock.patch.object(cp.ingest.json, "loads", return_value=rec):
+            row = cp.ingest._egress_row(b"{}")
+        self.assertEqual((row["host"], row["url"]), ("evil.com", None))
 
 
 class DrainTests(IngestTestCase):
@@ -434,6 +479,31 @@ class DrainTests(IngestTestCase):
         cp.ingest._drain(self.stream)
         self.assertEqual([r["host"] for r in self.rows()], ["after.example"])
         self.assertEqual(self.cursor()["offset"], os.path.getsize(self.path))
+
+    def test_a_line_too_deep_to_parse_does_not_wedge_the_cursor(self):
+        # An interpreter that does not recurse on the genuine depth drops it as
+        # unparsable, since it never closes; the stand-in parser holds the case on any.
+        for deep, parser in ((_DEEP_LINE, json.loads),
+                             (_line(host="deep.example"),
+                              _loads_recursing_on(b"deep.example"))):
+            with self.subTest(deep=deep[:20]):
+                self._forget()
+                with mock.patch.object(cp.ingest.json, "loads", parser):
+                    self.write(deep + _line(host="after.example"), mode="w")
+                    cp.ingest._drain(self.stream)
+                self.assertEqual([r["host"] for r in self.rows()], ["after.example"])
+                self.assertEqual(self.cursor()["offset"], os.path.getsize(self.path))
+
+    def test_a_line_too_deep_to_parse_is_not_reported_as_a_failing_stream(self):
+        _reset_ingest_state(self)
+        self.write(_DEEP_LINE + _line(host="after.example"))
+        with mock.patch.object(cp.ingest.json, "loads", _loads_recursing_on(b"[[[")):
+            asyncio.run(cp.ingest._drain_stream(self.stream))
+        self.assertEqual([r["host"] for r in self.rows()], ["after.example"])
+        self.assertNotIn("ingest FAILING", self.out.getvalue())
+        with cp.store._connect() as conn:
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM audit WHERE kind='ingest'").fetchone()[0], 0)
 
     def test_oversized_line_is_skipped_rather_than_stalling_the_tail(self):
         """One unbounded record must not stop every later decision from arriving."""
@@ -635,6 +705,48 @@ class ToolOutcomeRowTests(unittest.TestCase):
             with self.subTest(raw=raw):
                 self.assertIsNone(cp.ingest._tool_row(raw))
 
+    def test_a_line_too_deep_to_parse_is_dropped(self):
+        with mock.patch.object(cp.ingest.json, "loads", _loads_recursing_on(b"deep")):
+            self.assertIsNone(cp.ingest._tool_row(self.line(tool="deep")))
+            self.assertIsNotNone(cp.ingest._tool_row(self.line()))
+
+    def _mapped(self, **over):
+        """The row for a line whose named fields hold a value ``str()`` cannot take."""
+        rec = json.loads(self.line())
+        rec.update(over)
+        with mock.patch.object(cp.ingest.json, "loads", return_value=rec):
+            return cp.ingest._tool_row(b"{}")
+
+    def test_a_field_too_deep_to_convert_is_null_and_the_row_kept(self):
+        row = self._mapped(reason=_DeepStr())
+        self.assertEqual((row["tool"], row["reason"]), ("get_me", None))
+
+    def test_a_settled_field_too_deep_to_convert_drops_the_line(self):
+        # NULLed instead, a line carrying both tokens would read as carrying one, and
+        # ``_settle_tool_row`` would credit a card that a line with both never does;
+        # on a call token's line, a NULLed client, server or tool would be compared as
+        # if the line said none.
+        for field in ("resume_token", "call_token"):
+            with self.subTest(field=field):
+                tokens = {"resume_token": "a" * 32, "call_token": "b" * 32}
+                tokens[field] = _DeepStr()
+                self.assertIsNone(self._mapped(**tokens))
+        for field in ("client", "server", "tool"):
+            with self.subTest(field=field):
+                self.assertIsNone(self._mapped(call_token="b" * 32,
+                                               **{field: _DeepStr()}))
+
+    def test_without_a_call_token_a_compared_field_too_deep_is_null_and_kept(self):
+        # Only the call token's path compares client, server and tool, so a line that
+        # will not take it has no reason to lose its row.
+        for tokens in ({}, {"resume_token": "a" * 32}):
+            for field in ("client", "server", "tool"):
+                with self.subTest(tokens=tokens, field=field):
+                    row = self._mapped(**tokens, **{field: _DeepStr()})
+                    self.assertIsNotNone(row)
+                    self.assertIsNone(row[field])
+                    self.assertEqual(row["status"], "ok")
+
     def test_an_unusable_timestamp_is_dropped(self):
         # The gateway's own clock, not our receipt time — so a backlog sorts where it
         # happened. NaN and infinity parse as floats and would sort absurdly.
@@ -791,6 +903,24 @@ class ToolOutcomeDrainTests(IngestTestCase):
                 self.assertIsNone(self.rows()[-1]["approval_id"])
                 self.assertEqual(self._tokens(), [])
 
+    def test_a_client_too_deep_to_convert_does_not_settle_a_no_client_token(self):
+        # NULLed, the client would match a token minted with none, spend it and
+        # credit the pin's card on a line that named some other client.
+        token = self._mint(client=None)
+        self.write({"call_token": token, "client": "deep.example"})
+        real = json.loads
+
+        def loads(s, *a, **kw):
+            rec = real(s, *a, **kw)
+            if isinstance(s, bytes) and b"deep.example" in s:
+                rec["client"] = _DeepStr()
+            return rec
+
+        with mock.patch.object(cp.ingest.json, "loads", loads):
+            cp.ingest._drain(self.tool)
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(self._tokens(), [token])
+
     def test_a_call_token_minted_with_no_client_matches_a_line_with_none(self):
         token = self._mint(client=None)
         self.write({"call_token": token, "client": None})
@@ -884,6 +1014,25 @@ class ToolOutcomeDrainTests(IngestTestCase):
         cp.ingest._drain(self.tool)
         self.assertEqual([r["status"] for r in self.rows()], ["ok", "timeout"])
         self.assertEqual(cp.ingest._drain(self.tool), 0)
+
+    def test_a_line_too_deep_to_parse_does_not_wedge_the_cursor(self):
+        for deep, parser in ((_DEEP_LINE, json.loads),
+                             ('{"tool": "deep.example"}\n',
+                              _loads_recursing_on(b"deep.example"))):
+            with self.subTest(deep=deep[:20]):
+                self._forget()
+                with mock.patch.object(cp.ingest.json, "loads", parser):
+                    with open(self.tool_path, "w") as f:
+                        f.write(deep)
+                    self.write({"status": "timeout"})
+                    cp.ingest._drain(self.tool)
+                self.assertEqual([r["status"] for r in self.rows()], ["timeout"])
+                self.assertEqual(self.cursor_offset(), os.path.getsize(self.tool_path))
+
+    def cursor_offset(self):
+        with cp.store._connect() as conn:
+            return conn.execute("SELECT offset FROM audit_cursor WHERE path=?",
+                                (self.tool_path,)).fetchone()["offset"]
 
     def test_the_mirror_reads_like_the_gateways_own_line(self):
         # `make logs-cp` and `make logs-tg` should show the same call in the same

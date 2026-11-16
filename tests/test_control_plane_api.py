@@ -3968,7 +3968,7 @@ class ApprovalStreamTests(_CPTestCase):
     synchronous payload build here is time not spent answering ``/authorize``."""
 
     def test_the_payload_is_built_off_the_event_loop(self):
-        # Asserted on the THREAD rather than on the presence of `to_thread`, because
+        # Asserted on the THREAD rather than on the presence of `run_in_executor`, because
         # what matters is where the work lands: the build takes `holds._LOCK`, which
         # `_register_tool_ask` holds across a SQLite write that waits out the 5 s busy
         # timeout when another writer has the store. On the loop, that wait is every
@@ -4000,6 +4000,87 @@ class ApprovalStreamTests(_CPTestCase):
             return [chunk async for chunk in response.body]
 
         self.assertEqual(asyncio.run(drain()), [])
+
+    def _stuck_ticks(self, n, body, default_threads=None):
+        """Await `body(ticks, entered, release)` with `n` stream first-ticks open as
+        tasks, every payload build blocked on `release`, and `entered` listing the
+        builds begun. `default_threads` shrinks the loop's default executor.
+
+        The builds are released in a `finally` INSIDE the coroutine: released after
+        `asyncio.run` instead, a failing run would wait out the executor shutdown, and
+        the stream executor's thread would outlive the test."""
+        release = threading.Event()
+        entered = []
+
+        def stuck():
+            entered.append(threading.get_ident())
+            release.wait(30)
+            return {"holds": [], "saturation": {}}
+
+        async def run():
+            if default_threads is not None:
+                from concurrent.futures import ThreadPoolExecutor
+                asyncio.get_running_loop().set_default_executor(
+                    ThreadPoolExecutor(max_workers=default_threads))
+            ticks = []
+            try:
+                for _ in range(n):
+                    response = await cp.api_approvals.approvals_stream(_FakeRequest())
+                    ticks.append(asyncio.ensure_future(response.body.__anext__()))
+                for _ in range(200):
+                    if entered:
+                        break
+                    await asyncio.sleep(0.01)
+                await asyncio.sleep(0.05)          # every tick reaches its await
+                return await body(ticks, entered, release)
+            finally:
+                release.set()
+                for tick in ticks:
+                    tick.cancel()
+                await asyncio.gather(*ticks, return_exceptions=True)
+
+        with mock.patch.object(cp.holds, "_pending_payload", stuck):
+            return asyncio.run(run())
+
+    def test_ingest_still_runs_while_stream_builds_are_stuck(self):
+        # Why ingest could starve: `_STREAM_EXECUTOR`'s comment in api_approvals.py.
+        # The default executor is shrunk to 2, which 4 stuck ticks would fill if they
+        # still built there.
+        audit = os.path.join(_TMP, "stream-executor-egress.jsonl")
+        open(audit, "w").close()
+
+        async def drain():
+            await asyncio.wait_for(
+                cp.ingest._drain_stream(cp.ingest.EGRESS_STREAM), 2)
+
+        async def ingest_runs(ticks, entered, release):
+            await drain()
+            self.assertFalse(any(t.done() for t in ticks), "a stuck tick finished")
+            self.assertEqual(len(entered), 1, "builds began beside the stuck one")
+            for tick in ticks:                     # as a disconnect does
+                tick.cancel()
+            await asyncio.gather(*ticks, return_exceptions=True)
+            await drain()
+
+        with mock.patch.object(cp.ingest.EGRESS_STREAM, "path", audit):
+            self._stuck_ticks(4, ingest_runs, default_threads=2)
+        self.assertNotIn("egress", cp.ingest._drain_failing)
+
+    def test_a_cancelled_tick_never_builds(self):
+        # Behind a stuck build, each reconnect's tick waits in the stream executor's
+        # queue. Cancelled by the disconnect, it must never run: otherwise every
+        # reconnect is a build owed for when the stuck one returns.
+        async def cancel_then_release(ticks, entered, release):
+            for tick in ticks:
+                tick.cancel()
+            await asyncio.gather(*ticks, return_exceptions=True)
+            release.set()
+            # One worker, so the cancelled items are discarded before this runs.
+            await asyncio.wait_for(asyncio.get_running_loop().run_in_executor(
+                cp.api_approvals._STREAM_EXECUTOR, lambda: None), 5)
+            return len(entered)
+
+        self.assertEqual(self._stuck_ticks(5, cancel_then_release), 1)
 
 
 class ApprovalStreamHeartbeatTests(_CPTestCase):

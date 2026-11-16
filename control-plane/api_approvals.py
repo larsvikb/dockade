@@ -21,6 +21,7 @@ pinned values (for good, or for ``policy.PIN_LEASE_SECONDS``), or refused:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import time
 
@@ -78,6 +79,33 @@ PIN_ACTIONS = ("allow_pinned", "allow_pinned_lease")
 #: a tick that finds nothing changed sends a heartbeat. The page's watchdog
 #: (``HEARTBEAT_MS`` in ``control-plane-ui/app.js``) is held equal to it by a test.
 STREAM_TICK_S = 1.0
+
+#: Where ``approvals_stream`` builds its payload, instead of the loop's default
+#: executor. The build can block (the ``approvals_stream`` docstring says on what), and
+#: a client that disconnects does not stop a thread already running it. In the default
+#: executor each stuck build would pin a thread per reconnect, and ingest's
+#: ``to_thread`` calls (``ingest._drain_stream``, on the one loop ``app.main`` runs)
+#: share that executor, so audit ingest would queue behind a page. Here a stuck build
+#: pins this one thread and nothing else.
+#:
+#: ONE worker is structural, not a fail-closed bound, so it is not an env var: every
+#: build calls the same ``holds._pending_payload``, and the likely cause of a stuck
+#: build, ``holds._LOCK``, would stick a second worker's build too. Builds rarely
+#: overlap anyway, because each takes milliseconds; one worker runs N tabs' ticks one
+#: after another.
+#:
+#: While a build is stuck, a reconnect costs no thread and runs no build ONLY because
+#: the disconnect cancels the tick's await, and cancelling a ``run_in_executor`` future
+#: cancels its queued work. The cancelled item stays in this executor's queue, inert,
+#: until the stuck build returns. That cancel rests on three things: uvicorn reporting
+#: an ASGI spec below 2.4, Starlette's spec-gated ``StreamingResponse`` path that then
+#: watches for ``http.disconnect`` (Starlette is not pinned, so it can change with no
+#: diff here), and the ``control-plane-ui`` relay noticing the browser left by that
+#: same path and closing its upstream. If any changes, a gone page's tick waits in the
+#: queue and builds once the stuck build returns: still no ingest thread, but live
+#: queued work per reconnect.
+_STREAM_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="approvals-stream")
 
 
 @router.post("/approvals/{approval_id}/resolve")
@@ -442,7 +470,8 @@ async def approvals_stream(request: Request) -> StreamingResponse:
     ``STREAM_TICK_S``, and a ``heartbeat`` event on every tick that changed nothing,
     so the page can tell a silent stream from a quiet one.
 
-    The payload is built in a WORKER THREAD. Every listener shares one event loop
+    The payload is built in a WORKER THREAD, ``_STREAM_EXECUTOR``'s, not the loop's
+    default executor (why: its comment). Every listener shares one event loop
     (``main`` in app.py), so blocking here blocks ``/authorize``. And building it can
     block: it takes ``holds._LOCK`` twice (``_list_pending``, ``_saturation``), which
     ``_register_tool_ask`` holds across a SQLite write that can wait out the store's
@@ -456,8 +485,8 @@ async def approvals_stream(request: Request) -> StreamingResponse:
         while True:
             if await request.is_disconnected():
                 break
-            payload = await asyncio.to_thread(
-                lambda: json.dumps(holds._pending_payload()))
+            payload = await asyncio.get_running_loop().run_in_executor(
+                _STREAM_EXECUTOR, lambda: json.dumps(holds._pending_payload()))
             if payload != last:
                 last = payload
                 yield f"event: pending\ndata: {payload}\n\n"

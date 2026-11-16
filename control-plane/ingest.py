@@ -136,16 +136,27 @@ def _ingest_field(value: object) -> str | None:
     # stream at that line for good.
     if value is None:
         return None
-    return store._escaped(str(value))[:store.DRAIN_MAX_FIELD]
+    try:
+        text = str(value)
+    except RecursionError:
+        # A value nested as deep as the parser allows may still be too deep to
+        # convert, on an interpreter whose limits differ for the two. Raised here, it
+        # would stop the stream as one raised by the parse would (``_parsed``).
+        return None
+    return store._escaped(text)[:store.DRAIN_MAX_FIELD]
 
 
 def _parsed(line: bytes) -> dict | None:
     """One line as a dict, or None. Shared by both mappers, and deliberately incurious:
     these are files written by components that face the sandbox, so a line that does not
-    parse as a JSON object is dropped rather than guessed at."""
+    parse as a JSON object, or is too deep to parse, is dropped rather than guessed at."""
     try:
         rec = json.loads(line)
-    except (ValueError, UnicodeDecodeError):
+    # RecursionError is a RuntimeError, not a ValueError, and the depth at which the
+    # parser raises it is the interpreter's: any depth DRAIN_BLOCK admits may. Escaping
+    # here, it raises in the drain on every pass, so that stream's cursor never passes
+    # the line. Anything that walks a line's depth again belongs inside such a catch.
+    except (ValueError, UnicodeDecodeError, RecursionError):
         return None
     return rec if isinstance(rec, dict) else None
 
@@ -230,17 +241,29 @@ def _tool_row(line: bytes) -> dict | None:
     ts = _timestamp(rec)
     if ts is None:
         return None
-    client = _ingest_field(rec.get("client"))
+    settled = {name: _ingest_field(rec.get(name))
+               for name in ("resume_token", "call_token", "client", "server", "tool")}
+    # A field the line carries but ``_ingest_field`` could not convert is NULL with the
+    # row kept, except where ``_settle_tool_row`` would read the NULL as the line's
+    # word. A lost token drops the line: one with both would settle as one with a call
+    # token alone. A lost client, server or tool drops a line with a call token, whose
+    # path compares them: a NULL client matches a token minted with no client. Either
+    # would spend the token and credit a card.
+    lost = {name for name in settled
+            if settled[name] is None and rec.get(name) is not None}
+    if lost & {"resume_token", "call_token"} or (lost and rec.get("call_token")
+                                                 is not None):
+        return None
+    client = settled["client"]
     # Neither token is an audit column: both are carried to ``_settle_tool_row``, which
     # takes them out before the insert.
     return {"ts": ts, "kind": "outcome", "stage": "tool-result",
             "client": client, "client_class": policy._client_class(client),
             "reason": _ingest_field(rec.get("reason")),
-            "server": _ingest_field(rec.get("server")),
-            "tool": _ingest_field(rec.get("tool")),
+            "server": settled["server"], "tool": settled["tool"],
             "approval_id": None,
-            "resume_token": _ingest_field(rec.get("resume_token")),
-            "call_token": _ingest_field(rec.get("call_token")),
+            "resume_token": settled["resume_token"],
+            "call_token": settled["call_token"],
             "status": _ingest_field(rec.get("status")),
             **_result_facts(rec)}
 

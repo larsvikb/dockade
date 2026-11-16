@@ -4281,6 +4281,68 @@ class McpServerRegistrationTests(_CPTestCase):
             with self.subTest(path=path):
                 self.assertIsNone(cp.policy._endpoint_error(8082, path))
 
+    # A character no header value may hold. A bare CR or LF, or anything past
+    # latin-1, makes http.client raise with the built value, secret included, in its
+    # message; NUL it sends. Tab and C1 are refused for one rule the message can
+    # state; NBSP and the soft hyphen because they pass for a space or nothing.
+    _UNSENDABLE = ("\r", "\n", "\x00", "\t", "\x7f", "\x85", "\xa0", "\xad",
+                   "\u2028", "\U0001f511", "\ud800")
+
+    def test_a_template_with_an_unsendable_character_is_refused_quoting_nothing(self):
+        # MARKER stands for a token pasted beside the placeholder: the refusal must
+        # not echo it back. The position counts from 1, so it lands on the character.
+        prefix = "Bearer MARKER"
+        for ch in self._UNSENDABLE:
+            with self.subTest(char=f"U+{ord(ch):04X}"):
+                resp = _register(server="mcp-x", auth_type="header",
+                                 auth_header="Authorization",
+                                 auth_template=f"{prefix}{ch}{{secret}}")
+                self.assertEqual(resp.status_code, 400)
+                detail = resp.body["detail"]
+                self.assertIn("template", detail)
+                self.assertIn(f"U+{ord(ch):04X} at character {len(prefix) + 1}",
+                              detail)
+                self.assertNotIn("MARKER", detail)
+                self.assertIsNone(self._row("mcp-x"))
+
+    def test_the_character_check_runs_before_the_one_that_quotes_the_template(self):
+        # The placeholder-count message quotes the template, so a template wrong both
+        # ways must meet the character check first.
+        for template in ("Bearer MARKER\nx", "{secret} MARKER\x00 {secret}"):
+            with self.subTest(template=template):
+                resp = _register(server="mcp-x", auth_type="header",
+                                 auth_header="Authorization", auth_template=template)
+                self.assertEqual(resp.status_code, 400)
+                self.assertNotIn("MARKER", resp.body["detail"])
+
+    def test_a_printable_latin1_template_still_saves(self):
+        # The ceiling is latin-1, not ASCII: http.client encodes a value as latin-1.
+        for i, template in enumerate(("Bearer {secret}", "token {secret}",
+                                      "Clé {secret}")):
+            with self.subTest(template=template):
+                resp = _register(server=f"mcp-{i}", auth_type="header",
+                                 auth_header="Authorization", auth_template=template)
+                self.assertEqual(resp.status_code, 201)
+                self.assertEqual(self._row(f"mcp-{i}")["auth_template"], template)
+
+    def test_a_header_name_with_an_unsendable_character_is_refused(self):
+        # No new code holds this: _HEADER_RE admits only ASCII letters, digits and
+        # '-'. Pinned so a widening of it cannot reopen the hole.
+        resp = _register(auth_type="header", auth_header="Author\rization",
+                         auth_template="Bearer {secret}")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("header name", resp.body["detail"])
+        self.assertIsNone(self._row())
+        for ch in ("\r", "\n", "\x00", "Ł"):
+            with self.subTest(char=f"U+{ord(ch):04X}"):
+                self.assertIsNotNone(cp.policy._auth_descriptor_error(
+                    "header", f"X-To{ch}ken", "Bearer {secret}"))
+
+    def test_the_validator_refuses_a_template_ending_in_a_newline_itself(self):
+        # The route strips the ends; the validator holds the guarantee without that.
+        self.assertIsNotNone(cp.policy._auth_descriptor_error(
+            "header", "Authorization", "Bearer {secret}\n"))
+
 
 class McpServerEditTests(_CPTestCase):
     def setUp(self):
@@ -4363,6 +4425,74 @@ class McpServerEditTests(_CPTestCase):
             _FakeRequest())
         self.assertEqual(resp.status_code, 400)
         self.assertFalse(cp.api_mcp.api_mcp_servers()[0]["enabled"])
+
+    _HEADER: ClassVar[dict] = {"auth_type": "header", "auth_header": "Authorization"}
+
+    def _row(self):
+        with cp.store._connect() as conn:
+            return dict(conn.execute("SELECT * FROM mcp_servers WHERE server=?",
+                                     ("mcp-github",)).fetchone())
+
+    def _store_bad_template(self, enabled):
+        # A row stored before the character check existed: written past the route.
+        with cp.store._connect() as conn:
+            conn.execute(
+                "UPDATE mcp_servers SET enabled=?, auth_type='header', "
+                "auth_header='Authorization', auth_template=? WHERE server=?",
+                (1 if enabled else 0, "Bearer\t{secret}", "mcp-github"))
+            conn.commit()
+
+    def test_a_changed_template_with_a_bad_character_is_refused_even_disabling(self):
+        # The edit form's ordinary save on a disabled server sends enabled=false, so
+        # the echo exception must not let a CHANGED descriptor through.
+        cp.api_mcp.edit_mcp_server(
+            "mcp-github", _edit_request(enabled=False, auth_template="Bearer {secret}",
+                                        **self._HEADER), _FakeRequest())
+        before = self._row()
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                resp = cp.api_mcp.edit_mcp_server(
+                    "mcp-github",
+                    _edit_request(enabled=enabled, auth_template="Bearer\x00{secret}",
+                                  **self._HEADER), _FakeRequest())
+                self.assertEqual(resp.status_code, 400)
+                self.assertEqual(self._row(), before)
+
+    def test_disabling_with_a_stored_bad_template_echoed_still_works(self):
+        # The UI's toggle echoes the stored descriptor; refusing it would take away
+        # the blunt way back from exactly the server that needs it.
+        self._store_bad_template(enabled=True)
+        echoed = dict(self._HEADER, auth_template="Bearer\t{secret}")
+        resp = cp.api_mcp.edit_mcp_server(
+            "mcp-github", _edit_request(enabled=False, **echoed), _FakeRequest())
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.body["changed"])
+        self.assertEqual(self._row()["enabled"], 0)
+        resp = cp.api_mcp.edit_mcp_server(
+            "mcp-github", _edit_request(enabled=True, **echoed), _FakeRequest())
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(self._row()["enabled"], 0)
+
+    def test_the_echo_exception_compares_the_whole_descriptor(self):
+        # The stored template unchanged but its type or header changed is an edit, not
+        # an echo, so it is validated: a comparison of the template alone fails here.
+        self._store_bad_template(enabled=False)
+        before = self._row()
+        for changed in ({"auth_type": "header", "auth_header": "X-Token"},
+                        {"auth_type": "none", "auth_header": "Authorization"}):
+            with self.subTest(**changed):
+                resp = cp.api_mcp.edit_mcp_server(
+                    "mcp-github",
+                    _edit_request(enabled=False, auth_template="Bearer\t{secret}",
+                                  **changed), _FakeRequest())
+                self.assertEqual(resp.status_code, 400)
+                self.assertEqual(self._row(), before)
+
+    def test_an_invalid_edit_of_an_unknown_server_is_a_404(self):
+        resp = cp.api_mcp.edit_mcp_server(
+            "mcp-nope", _edit_request(enabled=True, auth_template="Bearer\n{secret}",
+                                      **self._HEADER), _FakeRequest())
+        self.assertEqual(resp.status_code, 404)
 
 
 class McpServerRevokeTests(_CPTestCase):

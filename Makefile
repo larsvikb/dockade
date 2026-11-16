@@ -1665,7 +1665,7 @@ days = int(os.environ.get("AUDIT_RETENTION_DAYS", "30"))
 db = os.environ.get("CONTROL_DB", "/var/lib/control-plane/control.db")
 cutoff = time.time() - days * 86400
 
-conn = sqlite3.connect(db, timeout=10.0)
+conn = sqlite3.connect(db, timeout=10.0, autocommit=sqlite3.LEGACY_TRANSACTION_CONTROL)
 # The app runs in WAL and the drain loop writes in short bursts; wait rather than
 # fail on a momentary lock. VACUUM below needs the write lock to itself.
 conn.execute("PRAGMA busy_timeout=10000")

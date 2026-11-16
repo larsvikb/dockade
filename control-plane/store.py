@@ -69,7 +69,10 @@ def _bindable(value: int) -> bool:
 
 
 def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=5.0)
+    # Spelled out: the default is announced to become False, under which `_init_db`'s
+    # switch to WAL and every explicit BEGIN IMMEDIATE here fail. NOTES.md, "Python's
+    # `sqlite3` leaves DDL outside its implicit transaction".
+    conn = sqlite3.connect(DB_PATH, timeout=5.0, autocommit=sqlite3.LEGACY_TRANSACTION_CONTROL)
     conn.row_factory = sqlite3.Row
     return conn
 

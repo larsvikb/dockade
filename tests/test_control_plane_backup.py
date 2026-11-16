@@ -275,5 +275,31 @@ class CommandLineTests(unittest.TestCase):
         self.assertIn("$(CONTROL_TOOL) store_backup.py restore <", recipe("restore"))
 
 
+from test_sqlite_transaction_control import under_the_announced_default  # noqa: E402 (beside its one user)
+
+
+class AnnouncedAutocommitDefaultTests(unittest.TestCase):
+    """The snapshot under the ``autocommit`` default Python's docs announce, ``False``,
+    under which ``VACUUM INTO`` refuses to run. In process, as ``_run``'s subprocess
+    would escape the patch; the store is built before it, as today."""
+
+    def test_a_wal_store_is_snapshotted(self):
+        db = os.path.join(self.enterContext(tempfile.TemporaryDirectory()), "control.db")
+        self.addCleanup(setattr, cp.store, "DB_PATH", cp.store.DB_PATH)
+        cp.store.DB_PATH = db
+        _store(db, TABLES, rows=2)
+        conn = sqlite3.connect(db)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.close()
+        out = io.BytesIO()
+        with mock.patch.object(cp.store_backup, "say"), under_the_announced_default():
+            cp.store_backup.snapshot(out)
+        snap = os.path.join(os.path.dirname(db), "snap.db")
+        with open(snap, "wb") as f:
+            f.write(out.getvalue())
+        self.assertEqual(_counts(snap), {"rules": 2, "approvals": 2, "audit": 2})
+        self.assertFalse(os.path.exists(db + ".backup-snapshot"))
+
+
 if __name__ == "__main__":
     unittest.main()

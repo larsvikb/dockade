@@ -562,6 +562,44 @@ class SchemaTests(_Store):
             reg.taskdb.init()
 
 
+from test_sqlite_transaction_control import under_the_announced_default  # noqa: E402 (beside its one user)
+
+
+class AnnouncedAutocommitDefaultTests(_Store):
+    """The store under the ``autocommit`` default Python's docs announce, ``False``:
+    ``taskdb._connect`` states legacy transaction control, so its explicit transactions
+    and ``foreign_keys`` work as they do today. Each fixture is built before the patch,
+    as today."""
+
+    def test_a_fresh_store_is_created(self):
+        reg.taskdb.DB_PATH = os.path.join(self.dir, "announced.db")
+        with under_the_announced_default():
+            reg.taskdb.init()
+        with reg.taskdb.reading() as conn:
+            self.assertEqual(conn.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],
+                             reg.taskdb.SCHEMA_VERSION)
+
+    def test_an_older_store_is_taken_forward(self):
+        as_version(reg.taskdb.DB_PATH, 1)
+        with under_the_announced_default():
+            reg.taskdb.init()
+        with reg.taskdb.reading() as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],
+                             reg.taskdb.SCHEMA_VERSION)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM plans").fetchone()[0], 0)
+
+    def test_a_write_and_a_snapshot_read(self):
+        with under_the_announced_default():
+            task = self.propose("Announced")
+            self.assertEqual(reads.get_task(task)["title"], "Announced")
+        self.assertEqual(reads.get_task(task)["title"], "Announced")
+
+    def test_foreign_keys_are_on(self):
+        with under_the_announced_default(), reg.taskdb.reading() as conn:
+            self.assertEqual(conn.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+
+
 class QuotedTests(unittest.TestCase):
     """``taskdb.quoted``: how a refusal names a value it was given."""
 

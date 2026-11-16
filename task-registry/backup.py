@@ -57,7 +57,7 @@ def snapshot(out: BinaryIO) -> bool:
     snap = src + ".backup-snapshot"
     if os.path.exists(snap):
         os.unlink(snap)
-    conn = sqlite3.connect(src, timeout=10.0)
+    conn = sqlite3.connect(src, timeout=10.0, autocommit=sqlite3.LEGACY_TRANSACTION_CONTROL)
     try:
         conn.execute("PRAGMA busy_timeout=10000")
         conn.execute("VACUUM INTO ?", (snap,))
@@ -89,7 +89,7 @@ def restore(inp: BinaryIO) -> None:
         sys.exit(f"restore-tasks: REFUSED, store untouched — {why}")
 
     try:
-        conn = sqlite3.connect(tmp)
+        conn = sqlite3.connect(tmp, autocommit=sqlite3.LEGACY_TRANSACTION_CONTROL)
         try:
             integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
             version = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -149,7 +149,7 @@ def _keep_ids_moving(dst: str, incoming: str) -> None:
     if not os.path.exists(dst):
         return
     try:
-        old = sqlite3.connect(dst)
+        old = sqlite3.connect(dst, autocommit=sqlite3.LEGACY_TRANSACTION_CONTROL)
         try:
             counters = old.execute("SELECT name, seq FROM sqlite_sequence").fetchall()
         finally:
@@ -159,7 +159,7 @@ def _keep_ids_moving(dst: str, incoming: str) -> None:
         say(f"restore-tasks: could not read the current store's id counters ({e}); "
             f"ids continue from the backup's")
         return
-    conn = sqlite3.connect(incoming)
+    conn = sqlite3.connect(incoming, autocommit=sqlite3.LEGACY_TRANSACTION_CONTROL)
     try:
         with conn:
             for name, seq in counters:
@@ -174,7 +174,8 @@ def _keep_ids_moving(dst: str, incoming: str) -> None:
 
 
 def _describe(path: str) -> tuple[int, dict[str, int]]:
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True,
+                           autocommit=sqlite3.LEGACY_TRANSACTION_CONTROL)
     try:
         version = conn.execute("PRAGMA user_version").fetchone()[0]
         counts = {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]  # noqa: S608 (fixed names)

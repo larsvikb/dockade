@@ -54,11 +54,11 @@ review on Python 3.13, where a mutant reported caught in fact survived.
 SQLite itself has transactional DDL — a `DROP TABLE` inside a transaction is undone by
 a rollback. Python's driver in legacy mode does not put it in one: it opens an implicit
 transaction before `INSERT`/`UPDATE`/`DELETE`/`REPLACE` and nothing else, so a `DROP`
-issued on a default connection runs in autocommit and is already permanent by the time
-anything can roll it back.
+issued on a legacy-mode connection runs in autocommit and is already permanent by the
+time anything can roll it back.
 
 ```python
-c = sqlite3.connect(":memory:")
+c = sqlite3.connect(":memory:", autocommit=sqlite3.LEGACY_TRANSACTION_CONTROL)
 c.execute("CREATE TABLE t(x)"); c.execute("INSERT INTO t VALUES (1)"); c.commit()
 c.execute("DROP TABLE t")
 c.in_transaction        # -> False        (no transaction was ever opened)
@@ -69,6 +69,7 @@ c.execute("SELECT * FROM t")               # -> OperationalError: no such table:
 Take control explicitly and the engine behaves as advertised:
 
 ```python
+c.execute("CREATE TABLE t(x)"); c.execute("INSERT INTO t VALUES (1)"); c.commit()
 c.isolation_level = None                   # autocommit; we issue the statements
 c.execute("BEGIN IMMEDIATE")
 c.execute("DROP TABLE t")
@@ -79,14 +80,15 @@ c.execute("SELECT * FROM t").fetchall()     # -> [(1,)]   the table is back
 
 Measured on CPython 3.13.5 / SQLite 3.46.1. This is the documented legacy
 `isolation_level` behaviour rather than a version quirk, so it applies to the
-control-plane image's Python, while sqlite3's `autocommit` defaults to
-`LEGACY_TRANSACTION_CONTROL` — but only the 3.13 figure above was actually run.
+control-plane image's Python, on a connection in legacy transaction control — but
+only the 3.13 figure above was actually run.
 
 The consequence is entirely about **table-rebuild migrations**, which are the only
 shape here that mixes DML and DDL in one operation: copy the rows aside, drop the
-original, rename. On a default connection those three are three separate autocommits,
-so a failure between the copy and the drop is not undone — on a long-lived store that
-is the policy rules gone. Nothing warns; the code reads as if it were atomic.
+original, rename. On a legacy-mode connection those three are three separate
+autocommits, so a failure between the copy and the drop is not undone — on a
+long-lived store that is the policy rules gone. Nothing warns; the code reads as if it
+were atomic.
 
 An additive `ALTER TABLE ADD COLUMN` needs none of this, which is why the distinction
 is worth writing down rather than "always wrap migrations": the cheap shape is safe on

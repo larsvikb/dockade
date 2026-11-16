@@ -9120,6 +9120,54 @@ class AuditPruneTargetTests(_FreshStoreTestCase):
         self.assertIn("1 audit row(s) and 0 unspent", self._prune(path))
 
 
+from test_sqlite_transaction_control import under_the_announced_default  # noqa: E402 (beside its one user)
+
+
+class AnnouncedAutocommitDefaultTests(_FreshStoreTestCase):
+    """The store under the ``autocommit`` default Python's docs announce, ``False``:
+    its connections state legacy transaction control, so its explicit transactions,
+    its migrations and WAL on a fresh store work as they do today. Each fixture is built
+    before the patch, as today."""
+
+    _OLD_SCHEMA = MigrationTests._OLD_SCHEMA
+    _old_store = MigrationTests._old_store
+
+    def test_a_fresh_store_is_created_in_wal(self):
+        self._use_store("announced-fresh.db")
+        with under_the_announced_default():
+            cp.store._init_db()
+        with cp.store._connect() as conn:
+            self.assertEqual(conn.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],
+                             cp.store.SCHEMA_VERSION)
+
+    def test_an_old_store_is_migrated(self):
+        self._old_store("announced-migrate.db")
+        with under_the_announced_default():
+            cp.store._init_db()
+        with cp.store._connect() as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],
+                             cp.store.SCHEMA_VERSION)
+            self.assertEqual(
+                [tuple(r) for r in conn.execute("SELECT pattern, client_class FROM rules")],
+                [("example.com", cp.store.LEGACY_CLIENT_CLASS)])
+
+    def test_a_resolve_writes_in_its_explicit_transaction(self):
+        self._use_store("announced-resolve.db")
+        cp.store._init_db()
+        approval = _hold("announced.example")
+        with mock.patch.object(cp.store, "_audit"), under_the_announced_default():
+            resp = _resolve(approval, "allow_persist")
+        self.assertTrue(resp.args[0]["ok"])
+        with cp.store._connect() as conn:
+            self.assertEqual(
+                conn.execute("SELECT action, client_class FROM rules "
+                             "WHERE pattern = 'announced.example'").fetchone()[:],
+                ("allow", CLASS))
+            self.assertEqual(conn.execute("SELECT status FROM approvals WHERE id = ?",
+                                          (approval,)).fetchone()[0], "allowed")
+
+
 class LegacyClassNameTests(unittest.TestCase):
     """``store.LEGACY_CLIENT_CLASS`` and the class names in ``policy`` are two
     spellings of one thing, and nothing in the code ties them: ``store`` is the bottom

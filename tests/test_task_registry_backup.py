@@ -407,6 +407,32 @@ class RestoreTests(_Stores):
         self.assertEqual(self.next_ids()[0], 9)
 
 
+from test_sqlite_transaction_control import under_the_announced_default  # noqa: E402 (beside its one user)
+
+
+class AnnouncedAutocommitDefaultTests(_Stores):
+    """The snapshot and the restore under the ``autocommit`` default Python's docs
+    announce, ``False``, under which ``VACUUM INTO`` and a ``journal_mode`` change out
+    of WAL refuse to run. Each store is built before the patch, as today."""
+
+    def test_the_snapshot_is_the_store_whole(self):
+        src = self.use("live")
+        self.fill()
+        with under_the_announced_default():
+            data = self.snapshot()
+        self.assertEqual(self.rows(self.write("copy.db", data)), self.rows(src))
+
+    def test_a_copy_of_a_wal_store_is_restored_leaving_no_sidecar(self):
+        self.use("old")
+        self.fill()
+        wal_copy = _read(reg.taskdb.DB_PATH)
+        live = self.use("live")
+        with under_the_announced_default():
+            self.restore(wal_copy)
+        self.assertEqual(os.listdir(os.path.dirname(live)), ["tasks.db"])
+        self.assertEqual(reg.reads.list_tasks("widgets")["total"], 2)
+
+
 class InlineTests(unittest.TestCase):
     def unspan(self, span: str) -> str:
         fence = re.match(r"`+", span).group(0)

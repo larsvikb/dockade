@@ -58,7 +58,7 @@ def snapshot(out: BinaryIO) -> None:
     if os.path.exists(snap):
         os.unlink(snap)
 
-    conn = sqlite3.connect(src, timeout=10.0)
+    conn = sqlite3.connect(src, timeout=10.0, autocommit=sqlite3.LEGACY_TRANSACTION_CONTROL)
     try:
         # The app is (or may be) live and writing in short bursts; wait rather than fail.
         conn.execute("PRAGMA busy_timeout=10000")
@@ -72,7 +72,7 @@ def snapshot(out: BinaryIO) -> None:
         conn.close()
 
     try:
-        snapconn = sqlite3.connect(snap)
+        snapconn = sqlite3.connect(snap, autocommit=sqlite3.LEGACY_TRANSACTION_CONTROL)
         counts = {t: snapconn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]  # noqa: S608 (fixed names)
                   for t in COUNTED}
         version = snapconn.execute("PRAGMA user_version").fetchone()[0]
@@ -107,7 +107,7 @@ def restore(inp: BinaryIO) -> None:
         sys.exit(f"restore: REFUSED, store untouched — {why}")
 
     try:
-        conn = sqlite3.connect(tmp)
+        conn = sqlite3.connect(tmp, autocommit=sqlite3.LEGACY_TRANSACTION_CONTROL)
         # Closed before any refusal unlinks the file: SQLite still holding a file with
         # a WAL-mode header open leaves its -wal and -shm behind the unlink.
         try:

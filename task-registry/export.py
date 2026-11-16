@@ -304,7 +304,7 @@ def main(data: bytes) -> str:
     # WAL: read as rollback whatever the file says, so no SQLite's VACUUM INTO header
     # decides whether the export runs.
     data = data[:18] + b"\x01\x01" + data[20:]
-    conn = sqlite3.connect(":memory:")
+    conn = sqlite3.connect(":memory:", autocommit=sqlite3.LEGACY_TRANSACTION_CONTROL)
     try:
         conn.deserialize(data)
         version = conn.execute("PRAGMA user_version").fetchone()[0]

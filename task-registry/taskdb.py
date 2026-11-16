@@ -253,7 +253,11 @@ def init() -> None:
 
 
 def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=5.0, isolation_level=None)
+    # Spelled out: the default is announced to become False, under which every
+    # explicit BEGIN here fails and `foreign_keys` silently stays off. NOTES.md,
+    # "Python's `sqlite3` leaves DDL outside its implicit transaction".
+    conn = sqlite3.connect(DB_PATH, timeout=5.0, isolation_level=None,
+                           autocommit=sqlite3.LEGACY_TRANSACTION_CONTROL)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn

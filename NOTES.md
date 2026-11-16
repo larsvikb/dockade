@@ -1131,6 +1131,50 @@ both cases is the conventional pairing, since other tools split the other way.
 No man page ships in the sandbox image, so the above is the measurement rather than a
 quote from the documentation.
 
+## What a client shows of the proxy's two refusals
+
+Measured 2026-11-16 in the tier-1 sandbox, against a stub proxy on loopback that
+answers exactly as `_deny` in `proxies/egress/addon.py` does: the policy 403 (`egress
+denied by policy`, `x-proxy-error: blocked-by-allowlist`) and the not-decided 503
+(`egress not decided: … - retry later`, `Retry-After: 60`), each with a
+`content-length` and the connection left open, as mitmproxy leaves it. Every proxy
+variable, both cases, pointed at the stub; the stub counted the requests, which is
+the "tries" column.
+
+| client | refused CONNECT, 403 / 503 | plain-HTTP 403 / 503 | tries (CONNECT; plain HTTP) |
+|---|---|---|---|
+| curl 8.14.1 | `CONNECT tunnel failed, response 403` (or `503`), exit 56; no body | the body, exit 0 (no `-f`) | 1; 1 |
+| GNU Wget 1.25.0 | `Proxy tunneling failed: Forbidden` (or `Service Unavailable`), exit 4 | `ERROR 403: Forbidden.` (or `503: Service Unavailable.`), exit 8; no body | 1; 1 |
+| git 2.47.3 | `CONNECT tunnel failed, response 403` (or `503`) | `remote: <the body>`, then `The requested URL returned error: 403` (or `503`) | 1; 1 |
+| pip 25.1.1 | `ProxyError('Cannot connect to proxy.', OSError('Tunnel connection failed: 403 Forbidden'))` (or `503 Service Unavailable`), then `No matching distribution` | `No matching distribution` alone, for either status (needs `--trusted-host`) | 6 over ~8-11 s for either status; 403: 1, 503: 6 over ~319 s, a minute apart as `Retry-After` asks |
+| npm 11.19.1 | `E403 403 Forbidden - GET https://…` (or `E503 503 Service Unavailable`): it reports the CONNECT status as the server's | the same words | 403: 2 at once, no retry; 503: 3 over ~75 s. Plain HTTP: 403: 1; 503: 3 over ~76 s |
+| Python 3.13.5 `urllib` | `URLError: Tunnel connection failed: 403 Forbidden` (or `503 Service Unavailable`); no headers, no body | `HTTPError` with the status, the headers and the body | 1; 1 |
+| Node 24.22.3 `fetch` | never reaches the proxy: it ignores `HTTPS_PROXY` (#341) and fails `getaddrinfo EAI_AGAIN` | the same | 0; 0 |
+| Chromium headless shell 156.0.8078.79 | `net::ERR_TUNNEL_CONNECTION_FAILED` for either status | renders the body as the page | 1; 1 |
+| WebFetch, Claude Code 2.1.325 | 403 with the header: `Access to <host> is blocked by the network egress proxy.` (`error_type` `EGRESS_BLOCKED`); 403 without it, and 503: `proxy refused the connection` | upgrades `http://` to `https://`, so the CONNECT column | 1; 1 |
+
+So only a plain-HTTP response shows the body, and over HTTPS, which is nearly
+everything, the status is what a client has: curl, wget, git, pip, npm and urllib
+print it, Chromium and WebFetch do not. WebFetch is the one client that reads the
+header, and it reads only the header: the pre-change 403, which had none, and the 503
+both reach it as `proxy refused the connection`. Its domain preflight goes to
+`api.anthropic.com`, which the proxy passes on the lifeline. WebFetch's own 60 s
+timeout is inside the control plane's default hold window, so a fresh hold reaches it as
+a timeout and never as the 503; only a request that joins a card late in its window
+can see the 503. That was not measured here, as no stub holds.
+
+Retrying by itself: pip's urllib3 retries a refused CONNECT whatever the status, so
+over HTTPS the 503 changes nothing for it; over plain HTTP it retries the 503 five
+times, waiting the `Retry-After` minute each time. npm retries a 503, over either
+transport, twice with backoff, and never a 403. Nothing else retried. On a real proxy
+each retry after an expiry is a new request, so it raises a new card.
+
+A site's own 403 is a third shape, and it is not the proxy's: the CONNECT succeeds and
+the 403 comes over TLS. Seen 2026-11-10 on a site behind a Cloudflare bot
+challenge (`server: cloudflare`, `cf-mitigated: challenge`): WebFetch showed `The
+server returned HTTP 403 Forbidden`, and `curl -D -` showed the `200 Connection
+established` and then the origin's `403`. Neither carries `x-proxy-error`.
+
 ## mitmproxy decodes IDNA on the authority it parses, but not on the Host header or SNI
 
 Measured against `mitmproxy 12.2.3` — the version pinned by digest in

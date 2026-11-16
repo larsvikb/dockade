@@ -151,6 +151,33 @@ unhandled error anywhere in a hook is a request dialled ungoverned and unaudited
 Every hook is therefore wrapped to refuse the flow and write a local deny row on
 any exception (`_fail_closed` in `proxies/egress/addon.py`).
 
+**Two refusal shapes: an answer, or nobody decided.** A deny from `/authorize` carries
+`refusal`: `policy` for a rule, a human rejection or a field the store cannot record,
+`unanswered` for a hold that expired (every waiter on the card, not only the one that
+won the expiry), `busy` for a hold the caps refused; the proxy adds `unavailable` when
+it cannot reach or read the control plane. `_deny` answers `policy` with the 403 and
+body it always had, and the other three with a 503, `Retry-After: 60` and a body
+naming which and ending "retry later". Every refusal the proxy makes alone (the relay
+guard, the port gate, a resolve into a forbidden range, a crashed hook) is `policy`:
+a bug is not a wait. A deny with no `refusal`, or one the proxy does not know, is read
+as `policy`, so a control plane that names none refuses as it always did and nothing
+is told to retry on a guess; the price is that a missing kind hides a wait as an
+answer, which is why the tests in `tests/test_egress_hooks.py` pin each path. No body
+carries the control plane's reason or the rule; the audit row is the record.
+
+The 403 also carries `x-proxy-error: blocked-by-allowlist`, which Claude Code's
+WebFetch turns into "Access to <host> is blocked by the network egress proxy". That
+is undocumented behaviour (`NOTES.md` → "What a client shows of the proxy's two
+refusals" names the version); a release that drops it falls back to the generic
+message every other refusal gets, which the agent's instructions already treat as
+retry-once. Only the 403 carries it, so a site's own 403 never reads as the proxy's.
+What the 503 costs: a client that retries it by itself after an expiry raises a new
+card per retry, each holding its full window up to the hold caps, so the operator can
+see repeated cards for one host. Which clients retry, and how often, is in the same
+`NOTES.md` section. WebFetch times out inside the hold window and never sees the 503
+for a fresh hold, so the instructions' retry after a minute lands near the card's
+expiry and may raise one more card.
+
 **The lifeline is scoped by client, and it is the only decision here that is.**
 Everywhere else this proxy is deliberately client-agnostic: it asks the policy
 authority and the authority decides on the host. The lifeline is the one allow that

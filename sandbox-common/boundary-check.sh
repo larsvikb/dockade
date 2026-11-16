@@ -118,11 +118,13 @@ fi
 # BEFORE the governed section, so none of this run's own probes there (example.com
 # holds) counts against the control plane's pending-card caps when these ask.
 #
-# The four outcomes are told apart by curl's exit status and the CONNECT code, since
+# The five outcomes are told apart by curl's exit status and the CONNECT code, since
 # the proxy decides in http_connect, before it dials anything:
-#   CONNECT 403        — refused outright: a deny rule, the control plane failing
-#                        closed, a hold cap (per client or global) already reached,
-#                        or a destination the relay guard forbids;
+#   CONNECT 403        — refused, an answer: a deny rule, a human rejection, or a
+#                        destination the relay guard forbids;
+#   CONNECT 503        — not decided: a hold cap (per client or global) already
+#                        reached, the control plane unreachable, or a rerun that
+#                        joined a card which then expired; a rerun later can pass;
 #   any HTTP response  — reached, even a 404, and even when the body then stalls
 #                        past --max-time: the connection is what is asserted;
 #   timeout, no CONNECT reply — held: the proxy is waiting on a human, and the
@@ -142,7 +144,9 @@ if [ "${#model_hosts[@]}" -gt 0 ]; then
             model_rc=$?
             read -r model_connect model_http <<< "$model_codes"
             if [ "${model_connect:-000}" = "403" ]; then
-                bad "model host $model_host refused by the egress proxy (CONNECT 403): a deny rule, the control plane failing closed, a pending-hold cap reached (rerun once pending cards clear), or a destination the relay guard forbids"
+                bad "model host $model_host refused by the egress proxy (CONNECT 403): a deny rule, a human rejection, or a destination the relay guard forbids"
+            elif [ "${model_connect:-000}" = "503" ]; then
+                bad "model host $model_host not decided by the egress proxy (CONNECT 503): a hold cap reached, the control plane unreachable, or an approval nobody answered; rerun later"
             elif [ "${model_http:-000}" != "000" ]; then
                 ok "model host $model_host reachable via proxy $HTTPS_PROXY (HTTP ${model_http:-000})"
             elif [ "$model_rc" -eq 28 ] && [ "${model_connect:-000}" = "000" ]; then
@@ -154,18 +158,18 @@ if [ "${#model_hosts[@]}" -gt 0 ]; then
     fi
 fi
 # Governed mode, the cloud tiers routed through the egress proxy: a non-allowlisted
-# domain must be refused BY THE PROXY (a 403 on the CONNECT), not merely by the
-# firewall. This asserts the proxy's default-deny policy is actually enforcing. Every
-# probe from here on targets api.anthropic.com, a host no rule allows, or an address
-# the relay guard refuses, never a tier's model host, so the section holds the same
-# for every cloud tier.
+# domain must be refused BY THE PROXY (on the CONNECT, a 403 for an answer or a 503
+# for a request nobody decided), not merely by the firewall. This asserts the proxy's
+# default-deny policy is actually enforcing. Every probe from here on targets
+# api.anthropic.com, a host no rule allows, or an address the relay guard refuses,
+# never a tier's model host, so the section holds the same for every cloud tier.
 if [ -n "${HTTPS_PROXY:-}" ]; then
     # Since 2b an unknown host is HELD for approval — it blocks pending a human,
-    # then default-denies on timeout — rather than being refused outright. So it
-    # must NOT succeed from here. Bound the wait (--max-time) so we don't sit on
-    # the full hold window; treat held/denied/timeout as pass, and only a real
-    # success (the proxy allowing a non-allowlisted host with no rule and no
-    # approval) as a policy-enforcement leak.
+    # then default-denies on timeout with a 503 "egress not decided" — rather than
+    # being refused outright. So it must NOT succeed from here. Bound the wait
+    # (--max-time) so we don't sit on the full hold window; treat held/denied/timeout
+    # as pass, and only a real success (the proxy allowing a non-allowlisted host
+    # with no rule and no approval) as a policy-enforcement leak.
     if curl --connect-timeout 5 --max-time 8 -s -o /dev/null https://example.com 2>/dev/null; then
         bad "egress proxy allowed non-allowlisted example.com — policy not enforcing"
     else
@@ -193,10 +197,13 @@ if [ -n "${HTTPS_PROXY:-}" ]; then
     #   -k: if the proxy wrongly tunnelled it, we'd get the real fronted response
     #       rather than a curl cert error masking the leak.
     # Enforced outcomes (all acceptable): the proxy declines to tunnel and MITM-
-    # re-gates at the HTTP layer -> 403 "egress denied by policy"; OR the handshake
-    # fails closed (no trusted CA) -> curl errors; OR the re-gate holds and we stop
-    # waiting (see --max-time below) -> curl errors. Leak: a normal passthrough
-    # response from the fronted host (curl succeeds, body is not the policy denial).
+    # re-gates at the HTTP layer -> 403 "egress denied by policy", or a 503 "egress
+    # not decided" when a hold cap or a control-plane outage refuses the re-gate (no
+    # -f, so either is curl exit 0 and only the body tells it from a leak); OR the
+    # handshake fails closed (no trusted CA) -> curl errors; OR the re-gate holds and
+    # we stop waiting (see --max-time below) -> curl errors. Leak: a normal
+    # passthrough response from the fronted host (curl succeeds, body is neither
+    # refusal).
     #
     # --max-time for the same reason as the example.com probe above, and it is the
     # dominant cost of this whole script without it. After the SNI refusal the proxy
@@ -224,6 +231,8 @@ if [ -n "${HTTPS_PROXY:-}" ]; then
         ok "SNI fronting blocked (no passthrough)"
     elif printf '%s' "$front" | grep -qi 'egress denied by policy'; then
         ok "SNI fronting refused by proxy (deny-sni)"
+    elif printf '%s' "$front" | grep -qi 'egress not decided'; then
+        ok "SNI fronting refused by proxy (re-gate not decided)"
     else
         bad "SNI fronting NOT refused — got a passthrough response (domain-fronting leak)"
     fi

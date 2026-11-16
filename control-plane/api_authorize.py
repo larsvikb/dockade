@@ -6,7 +6,8 @@ listener and nowhere else (see app.py).
 ingress network the caller reached the proxy on), so a rule written for one population
 decides nothing for another. Allow and deny are audited and returned. A hold BLOCKS the
 request until a human resolves it or CONTROL_HOLD_TIMEOUT elapses and default-denies;
-the proxy only ever sees allow or deny. A request identical to one already held JOINS
+the proxy only ever sees allow or deny, and with a deny, the ``refusal`` that says
+whether anyone decided it. A request identical to one already held JOINS
 it (``holds._group_key``), so a retrying agent raises one card, and one click can
 release several waiting requests.
 """
@@ -39,6 +40,12 @@ class AuthorizeRequest(BaseModel):
 class AuthorizeResponse(BaseModel):
     decision: str                  # allow | deny  (hold is resolved internally)
     reason: str
+    # What a deny tells the requester, which the proxy turns into the response the
+    # client sees: ``policy`` is an answer (a rule, a human rejection, a field that
+    # cannot be recorded), ``unanswered`` a hold nobody decided in its window,
+    # ``busy`` a hold the caps refused to register. The last two are "ask again
+    # later", the first is not. None on an allow. The reason stays the full record.
+    refusal: str | None
 
 
 def _decision_scope(status_row) -> str:
@@ -94,7 +101,8 @@ def _answer(req: AuthorizeRequest) -> AuthorizeResponse:
                      proto=req.proto, client=req.client, client_class=client_class,
                      method=req.method, url=req.url, approval_id=lease_card,
                      reason=reason)
-        return AuthorizeResponse(decision=decision, reason=reason)
+        return AuthorizeResponse(decision=decision, reason=reason,
+                                 refusal="policy" if decision == "deny" else None)
 
     # HOLD, bounded. The cap check and the reservation are one atomic step, so
     # concurrent holds cannot race past a cap; over the global or per-client cap this
@@ -105,7 +113,7 @@ def _answer(req: AuthorizeRequest) -> AuthorizeResponse:
         store._audit("deny", stage=req.stage, host=req.host, port=req.port,
                      proto=req.proto, client=req.client, client_class=client_class,
                      method=req.method, url=req.url, reason=slot.refused)
-        return AuthorizeResponse(decision="deny", reason=slot.refused)
+        return AuthorizeResponse(decision="deny", reason=slot.refused, refusal="busy")
     approval_id, event = slot.approval_id, slot.event
 
     # The slot is RESERVED from here, and the `finally` is what gives it back. A leaked
@@ -174,13 +182,14 @@ def _answer(req: AuthorizeRequest) -> AuthorizeResponse:
     # rejected their request.
     status = "expired" if expired or status_row is None else status_row["status"]
     if status == "expired":
-        final, why = "deny", "no decision within hold timeout — default-deny"
+        final, why, refusal = ("deny", "no decision within hold timeout — default-deny",
+                               "unanswered")
     elif status == "allowed":
-        final, why = "allow", f"human approval ({scope})"
+        final, why, refusal = "allow", f"human approval ({scope})", None
     else:  # 'denied' (or any non-allowed terminal state) — default-deny
-        final, why = "deny", f"human rejection ({scope})"
+        final, why, refusal = "deny", f"human rejection ({scope})", "policy"
     store._audit(final, stage=req.stage, host=req.host, port=req.port,
                  proto=req.proto, client=req.client, client_class=client_class,
                  actor=resolved_by, method=req.method, url=req.url,
                  approval_id=approval_id, reason=why)
-    return AuthorizeResponse(decision=final, reason=why)
+    return AuthorizeResponse(decision=final, reason=why, refusal=refusal)

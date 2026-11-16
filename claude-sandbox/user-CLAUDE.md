@@ -9,7 +9,12 @@ here. It is written down so you spend no turns discovering it.
   work normally. An unknown host is not refused outright — it is **held for a
   human decision**, so a request can hang until someone approves it or a timeout
   fires. Prefer `WebFetch` over raw sockets, and expect a first request to a new
-  host to be slow rather than to fail.
+  host to be slow rather than to fail. A refusal is either an answer or a wait. A
+  403 from the proxy, with or without its `egress denied by policy` body, or a
+  fetch the client calls blocked, is the answer: do not retry it. A 503 from the
+  proxy, with or without its `egress not decided` body, a refusal shown only as
+  refused, or a timeout on a new host is not a no: **retry once after a minute**,
+  then say so rather than retry on.
 - **MCP tools are governed per tool, and one may be held for a human.** The tools
   under `mcp__gateway__` are brokered by a gateway that asks policy before every
   call. Three answers: it runs, it is refused, or it is **held for approval** — and

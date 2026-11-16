@@ -5,8 +5,8 @@ Each block runs alone, lifted out of the script with the script's own ``ok``/``b
 helpers and counters: the rest probes egress, DNS and mounts of a live sandbox. bash,
 grep and awk run for real. The privilege-caps probe reads a fixture file in place of
 the process's own status, the embedded-resolver check meets stubbed ``getent`` and
-``dig`` on a PATH of grep alone, and the model-host probe meets a stubbed ``curl`` on
-an empty PATH, so no verdict depends on the machine running the test.
+``dig`` on a PATH of grep alone, and the model-host probe and the SNI-fronting branch
+meet a stubbed ``curl``, so no verdict depends on the machine running the test.
 """
 from __future__ import annotations
 
@@ -214,12 +214,14 @@ _HOST_MODES = {"governed": {"HTTPS_PROXY": _PROXY},
 _REACHED = ("200", "404", 0)
 _HELD = ("000", "000", 28)
 _REFUSED = ("403", "000", 56)
+_NOT_DECIDED = ("503", "000", 56)
 
 _HELD_MSG = ("held for approval (no CONNECT reply): approve it with a persisted rule,"
              " since once or a lease passes only for now, and rerun")
-_REFUSED_MSG = ("refused by the egress proxy (CONNECT 403): a deny rule, the control plane"
-                " failing closed, a pending-hold cap reached (rerun once pending cards clear),"
+_REFUSED_MSG = ("refused by the egress proxy (CONNECT 403): a deny rule, a human rejection,"
                 " or a destination the relay guard forbids")
+_NOT_DECIDED_MSG = ("not decided by the egress proxy (CONNECT 503): a hold cap reached, the"
+                    " control plane unreachable, or an approval nobody answered; rerun later")
 
 
 def _curl_stub(answers: dict[str, tuple[str, str, int]]) -> str:
@@ -309,9 +311,17 @@ class ModelHostProbeTests(unittest.TestCase):
         self.assertEqual(run.verdicts, [f"FAIL model host api.widgets.example {_HELD_MSG}"])
         self.assertEqual(run.counters, "pass=0 fail=1")
 
-    def test_a_connect_403_is_refused_naming_the_caps(self):
+    def test_a_connect_403_is_a_policy_refusal(self):
         run = self._run("api.widgets.example", {"api.widgets.example": _REFUSED})
         self.assertEqual(run.verdicts, [f"FAIL model host api.widgets.example {_REFUSED_MSG}"])
+        self.assertEqual(run.counters, "pass=0 fail=1")
+
+    def test_a_connect_503_is_not_decided_and_says_rerun(self):
+        # The proxy's refusal for a cap, an outage or an expired card: still a
+        # failure, but one a rerun can clear, unlike the 403.
+        run = self._run("api.widgets.example", {"api.widgets.example": _NOT_DECIDED})
+        self.assertEqual(run.verdicts,
+                         [f"FAIL model host api.widgets.example {_NOT_DECIDED_MSG}"])
         self.assertEqual(run.counters, "pass=0 fail=1")
 
     def test_failures_past_the_hold_decision_are_unreachable(self):
@@ -359,6 +369,55 @@ class ModelHostProbeTests(unittest.TestCase):
         self.assertEqual(run.verdicts, [
             f"PASS model host * reachable via proxy {_PROXY} (HTTP 404)"])
         self.assertEqual(run.curl_calls[0].split(_SEP)[-1], "https://*/")
+
+
+def _sni_branch() -> str:
+    return _lift(r'^    front="\$\(curl .*?domain-fronting leak\)"\n    fi\n',
+                 "SNI-fronting branch")
+
+
+@unittest.skipUnless((_BASH and _GREP) or _STRICT, "bash or grep is not installed")
+class SniFrontingBranchTests(unittest.TestCase):
+    """The fronting probe runs curl with -k and no -f, so a refusal at the re-gate is
+    curl exit 0 and only the body tells it from a leak. A cap or an outage there is
+    the proxy's 503, which must read as refused, and a widened match must not let a
+    passthrough body through."""
+
+    def _run(self, body: str, rc: int) -> tuple[list[str], str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = Path(tmp) / "bin"
+            bin_dir.mkdir()
+            os.symlink(_GREP, bin_dir / "grep")
+            stub = f"curl() {{ printf '%s' {shlex.quote(body)}; return {rc}; }}\n"
+            script = (_prelude() + _helpers() + stub + _sni_branch()
+                      + 'echo "pass=$pass fail=$fail"\n')
+            proc = subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
+                [_BASH, "-c", script], cwd=tmp, env={"PATH": str(bin_dir)},
+                capture_output=True, text=True, encoding="utf-8", timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        lines = proc.stdout.splitlines()
+        verdicts = [re.sub(r"\x1b\[[0-9;]*m", "", line).strip() for line in lines[:-1]]
+        return verdicts, lines[-1] if lines else ""
+
+    def test_the_policy_body_passes(self):
+        self.assertEqual(self._run("egress denied by policy\n", 0),
+                         (["PASS SNI fronting refused by proxy (deny-sni)"], "pass=1 fail=0"))
+
+    def test_the_not_decided_body_passes(self):
+        body = "egress not decided: no one answered the approval in time - retry later\n"
+        self.assertEqual(self._run(body, 0), (
+            ["PASS SNI fronting refused by proxy (re-gate not decided)"], "pass=1 fail=0"))
+
+    def test_any_other_body_is_a_leak(self):
+        for body in ("<html>example</html>", "egress", "not decided", ""):
+            with self.subTest(body=body):
+                self.assertEqual(self._run(body, 0), (
+                    ["FAIL SNI fronting NOT refused — got a passthrough response"
+                     " (domain-fronting leak)"], "pass=0 fail=1"))
+
+    def test_a_curl_failure_passes(self):
+        self.assertEqual(self._run("curl: (35) TLS connect error", 35),
+                         (["PASS SNI fronting blocked (no passthrough)"], "pass=1 fail=0"))
 
 
 if __name__ == "__main__":

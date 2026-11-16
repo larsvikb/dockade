@@ -124,9 +124,10 @@ def approve(task: int, revision: int, answers: list[dict] | tuple[dict, ...] = (
     answering each of the plan's decisions (``plans.check_answers`` says how). Answers
     that are each exactly the options the plan assumes, with no "other" text, open the
     task; any others send it back to ``proposed``, its plan superseded, for the next
-    refiner to plan from them (``plans.outcome``). A plan with no decisions takes no answers and opens; one
-    already answered is refused, since its answers stand. The reply names the state
-    reached."""
+    refiner to plan from them (``plans.outcome``). A plan with no decisions takes no
+    answers and opens. A plan already answered is refused, since its answers stand, and so
+    is one approved already, answered or not (``plans.approved_at``): a move to open
+    reopens either. The reply names the state reached."""
     with taskdb.writing() as conn:
         row = tasks.task_row(conn, task)
         tasks.check_revision(conn, row, revision)
@@ -138,6 +139,9 @@ def approve(task: int, revision: int, answers: list[dict] | tuple[dict, ...] = (
             raise Refused(f"plan {plan} of task {task} was answered already, and its "
                           f"answers stand: a move to open reopens it",
                           {"state": row["state"]})
+        if plans.approved_at(conn, plan) is not None:
+            raise Refused(f"plan {plan} of task {task} was approved already: a move to "
+                          f"open reopens it", {"state": row["state"]})
         decisions = plans.decisions(conn, plan)
         given = plans.check_answers(decisions, answers)
         state = plans.outcome(decisions, given)

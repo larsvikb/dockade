@@ -354,8 +354,10 @@ class DescriptionTests(unittest.TestCase):
         self.assertIn("the operator's own words", said)
         self.assertIn("its body, plan and answers are the spec the operator approved, and "
                       "they outrank every note", said)
-        self.assertIn("a superseded plan on an open task is not one the operator approved",
+        self.assertIn("a superseded plan on an open task is not the spec, approved or not",
                       said)
+        self.assertIn("A plan's approved_at is when the operator's approve opened the task "
+                      "with it, null if none did", said)
         self.assertIn("An answer stands over that plan and over the body; only a later "
                       "answer changes it", said)
         self.assertNotIn("must decide", tools.TOOLS["submit_plan"].params[-1].description)

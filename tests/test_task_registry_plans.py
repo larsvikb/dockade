@@ -262,6 +262,45 @@ class ApprovalTests(_Store):
         self.assertEqual(self.got()["state"], "refined")
 
 
+class ApprovedAtTests(_Store):
+    """``plans.approved_at`` derives from the approve history rows alone."""
+
+    def approve_row(self, plan, state, ts, action="approve"):
+        with reg.taskdb.writing() as conn:
+            reg.taskdb.record(conn, reg.taskdb.OPERATOR, action, self.task,
+                              plan=plan, state=state, before="refined")
+            conn.execute("UPDATE history SET ts = ? WHERE id = "
+                         "(SELECT MAX(id) FROM history)", (ts,))
+
+    def test_only_an_opening_approve_naming_the_plan_counts(self):
+        first = self.plan()["plan"]
+        second = self.plan(who=BOB)["plan"]
+        self.approve_row(first, "proposed", START)
+        self.approve_row(second + 1, "open", START + 1)
+        self.approve_row(first, "open", START + 1, action="move")
+        self.assertEqual([p["approved_at"] for p in reads.task_plans(self.task)],
+                         [None, None])
+        self.approve_row(first, "open", START + 3)
+        self.approve_row(first, "open", START + 2)
+        self.assertEqual({p["id"]: p["approved_at"] for p in reads.task_plans(self.task)},
+                         {first: START + 2, second: None})
+
+    def test_another_tasks_approve_does_not_count(self):
+        plan = self.plan()["plan"]
+        other = agent.propose(ALICE, "widgets", "Other", "B")["task"]
+        with reg.taskdb.writing() as conn:
+            reg.taskdb.record(conn, reg.taskdb.OPERATOR, "approve", other, plan=plan,
+                              state="open", before="refined")
+        self.assertIsNone(self.got()["plan"]["approved_at"])
+
+    def test_the_read_carries_a_time_and_no_history_text(self):
+        self.plan()
+        op.approve(self.task, self.got()["revision"])
+        approved = self.got()["plan"]["approved_at"]
+        self.assertIs(type(approved), float)
+        self.assertEqual(approved, op.history(self.task)["history"][-1]["ts"])
+
+
 DECISION = {"question": "Hold infra traffic, or deny it?",
             "why": "The design names both and picks neither.",
             "options": [{"label": "Hold", "meaning": "The operator answers each."},

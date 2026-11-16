@@ -180,8 +180,10 @@ back to `proposed`, its plan superseded, and the next refiner plans from the ans
 So that no plan becomes `open` contradicting an answer, `tasks.update`, where every
 state is written, refuses `open` to a task whose current plan has a decision
 unanswered, whoever moves it, an agent's `claim_work` from `landing` too. A plan
-without decisions is approved with no answers, and still opens by a move. A plan
-already answered is refused by `approve`, since its answers stand: a move to `open`
+without decisions is approved with no answers, and still opens by a move. An approve
+that opens its task leaves its plan approved, whatever its decisions, which every read
+shows as `approved_at`, derived from that approve's history row (`plans.approved_at`).
+A plan approved already, answered or not, is refused by `approve`: a move to `open`
 reopens it.
 
 **Answers are part of the spec.** A read of a task carries every answer it has had, the
@@ -355,7 +357,8 @@ or null for a move called with no request; an agent's author is already its id. 
 spec it is also the revision log: every body an agent proposed, under its author. That
 makes the history the operator's read (`operator_moves.history`): it keeps every text a
 task ever had, a hidden note's and a body triage replaced, so an implementer reading it
-could act on a version the operator never approved.
+could act on a version the operator never approved. `approved_at` is the one fact an
+agent's read derives from history, and it carries no history text: a time.
 
 **Every note has the one row that posted it,** which names its id: a note is posted
 only beside its record (a test holds every `notes.post` to it). So the history read

@@ -65,9 +65,15 @@ const DECIDED_PLANS = { 4: decidedPlan(4, NOW - 5000, [HOLD, LOGS]),
                         5: decidedPlan(5, NOW - 4500, [HOLD, LOGS]),
                         7: decidedPlan(7, NOW, [HOLD]),
                         8: decidedPlan(8, NOW, [LOGS]),
-                        10: decidedPlan(10, NOW - 8000, [HOLD]),
-                        11: decidedPlan(11, NOW - 8000, [HOLD]) };
+                        10: { ...decidedPlan(10, NOW - 8000, [HOLD]),
+                              approved_at: NOW - 7800 },
+                        11: { ...decidedPlan(11, NOW - 8000, [HOLD]),
+                              approved_at: NOW - 7800 } };
 // What plan 2 replaced: another approach, one path fewer, the risks spaced otherwise.
+// Plan 2 as the open and landing tasks' reads show it, handed in and approved before
+// task 3 opened; the refined tasks sharing it read it unapproved and later, so the
+// scenario approves them.
+const APPROVED = { ...PLAN, at: NOW - 86200, approved_at: NOW - 86000 };
 const OLDER_PLAN = {
   ...PLAN, id: 1, task_revision: 1, at: NOW - 80000, review_rounds: 1,
   approach: "Everything in one change.", footprint: ["tasks-ui/app.py"],
@@ -104,7 +110,7 @@ const TASK = {
   children: [{ id: 4, title: "Child", state: "closed" },
              { id: 5, title: "Other child", state: "landing" }],
   blockers: [{ id: 2, title: "Back up the store", state: "open" }],
-  plan: PLAN, answers: [], notes: [STARTED, ANSWER, ASKED, BLOCKED],
+  plan: APPROVED, answers: [], notes: [STARTED, ANSWER, ASKED, BLOCKED],
 };
 
 // Task 1 went back to proposed: its plan is the superseded one. Task 2 was opened with
@@ -124,9 +130,9 @@ const PARKED = { ...UNPLANNED, id: 7, title: "Parked one", state: "deferred",
 // its first; task 5 to land, its claim ended.
 const REFINED = { ...TASK, id: 6, title: "Refined one", state: "refined", ready: false,
                   claim: null, revision: 7, parent: null, children: [], blockers: [],
-                  notes: [] };
+                  plan: PLAN, notes: [] };
 const LANDING = { ...REFINED, id: 5, title: `Landing ${RLO}one`, state: "landing",
-                  revision: 9 };
+                  revision: 9, plan: APPROVED };
 const SECOND = { ...REFINED, id: 8, title: "Second refined", revision: 2 };
 // Tasks 9 and 10 wait for triage with decisions to answer.
 const DECIDED = { ...REFINED, id: 9, title: "Decided one", revision: 3,
@@ -158,7 +164,8 @@ const CLOSED_ANSWERED = { ...REFINED, id: 14, title: "Closed answered", state: "
 const REFINED_ANSWERED = { ...REFINED, id: 15, title: "Refined answered", revision: 5,
                            plan: DECIDED_PLANS[11],
                            answers: answeredAsAssumed(DECIDED_PLANS[11]), notes: [] };
-const APPROVED_PLAN = { ...PLAN, id: 12, task: 16, task_revision: 2, at: NOW - 7000 };
+const APPROVED_PLAN = { ...PLAN, id: 12, task: 16, task_revision: 2, at: NOW - 7000,
+                        approved_at: NOW - 6800 };
 const UNAPPROVED_PLAN = { ...PLAN, id: 13, task: 17, task_revision: 5, at: NOW - 6000 };
 const SHELVED_APPROVED = { ...REFINED, id: 16, title: "Shelved approved",
                            state: "deferred", revision: 4, plan: APPROVED_PLAN, notes: [] };
@@ -166,11 +173,12 @@ const SHELVED_UNAPPROVED = { ...REFINED, id: 17, title: "Shelved unapproved",
                              state: "deferred", revision: 7, plan: UNAPPROVED_PLAN,
                              notes: [] };
 
-let PLANS = { 1: [OLDER_PLAN], 3: [PLAN, OLDER_PLAN], 5: [PLAN],
+let PLANS = { 1: [OLDER_PLAN], 3: [APPROVED, OLDER_PLAN], 5: [APPROVED],
                 6: [PLAN, OLDER_PLAN], 8: [PLAN], 9: [DECIDED_PLANS[4]],
                 10: [DECIDED_PLANS[5]], 11: [FRESH_PLAN], 14: [DECIDED_PLANS[10]],
                 15: [DECIDED_PLANS[11]], 16: [APPROVED_PLAN],
-                17: [UNAPPROVED_PLAN, { ...PLAN, id: 3, task: 17, superseded_at: NOW - 6500 }] };
+                17: [UNAPPROVED_PLAN, { ...PLAN, id: 3, task: 17, approved_at: NOW - 6600,
+                                        superseded_at: NOW - 6500 }] };
 
 // Each task's history, oldest first, as `operator_moves.history` reads it: every write,
 // with the note it posted as it is now.
@@ -187,8 +195,9 @@ function claimedHistory() {
   const rows = [
     entry("operator", "create", NOW - 86400, { title: TASKS[0].title, body: TASK.body,
                                                state: "proposed", actor: null }),
-    entry("operator", "move", NOW - 86000, { before: "refined", state: "open",
-                                             revision: 3, ended_claim: null, actor: null }),
+    entry("operator", "approve", NOW - 86000, { before: "refined", state: "open",
+                                                revision: 3, plan: PLAN.id, answers: [],
+                                                actor: null }),
     entry(claim.holder, "claim_work", NOW - 80000, { branch: "tasks-ui",
                                                      footprint: claim.footprint }),
   ];
@@ -453,13 +462,17 @@ function noteWrite(path, body) {
 
 // An approve, as `operator_moves.approve` makes it: answers that are each exactly the
 // options the plan assumes open the task; any others send it back, its plan superseded.
-// Either way the answers are kept, newest plan first, in the text the operator saw.
+// Either way the answers are kept, newest plan first, in the text the operator saw, and
+// one that opens leaves its plan approved, which a second approve is refused.
 function approve(t, body, history) {
   const refuse = detail => ({ status: 400, json: { ok: false, current: null, detail } });
   const plan = t.plan;
   if (t.state !== "refined") return refuse(`task ${t.id} is ${t.state}`);
   if (t.answers.some(a => a.plan === plan.id)) {
     return refuse(`plan ${plan.id} of task ${t.id} was answered already`);
+  }
+  if (plan.approved_at) {
+    return refuse(`plan ${plan.id} of task ${t.id} was approved already`);
   }
   const decisions = plan.decisions || [];
   if (body.answers.length !== decisions.length) {
@@ -480,10 +493,8 @@ function approve(t, body, history) {
   t.answers = [...given, ...t.answers];
   t.state = state;
   t.revision += 1;
-  if (!opens) {
-    t.plan = { ...plan, superseded_at: NOW };
-    PLANS[t.id] = PLANS[t.id].map(p => (p.id === plan.id ? t.plan : p));
-  }
+  t.plan = opens ? { ...plan, approved_at: NOW } : { ...plan, superseded_at: NOW };
+  PLANS[t.id] = PLANS[t.id].map(p => (p.id === plan.id ? t.plan : p));
   history.push(entry("operator", "approve", NOW,
                      { revision: t.revision, before: "refined", state, plan: plan.id,
                        answers: given.map(({ question, options, other }) =>

@@ -109,6 +109,11 @@ console.log(JSON.stringify({
                               review_rounds: 1, superseded_at: 1789470000}),
     no_heading: t.planHeading(undefined),
     no_rounds: t.planHeading({id: 9, author: "a", at: 1789466400, task_revision: 1}),
+    approved: t.planHeading({id: 9, author: "a", at: 1789466400, task_revision: 1,
+                             review_rounds: 1, approved_at: 1789470000,
+                             superseded_at: 1789480000}),
+    not_approved: t.planHeading({id: 9, author: "a", at: 1789466400, task_revision: 1,
+                                 review_rounds: 1, approved_at: null}),
     notice: {
       none_proposed: t.planNotice(null, {state: "proposed"}),
       none_open: t.planNotice(null, {state: "open"}),
@@ -122,6 +127,13 @@ console.log(JSON.stringify({
       // an approved task's revision always passes its plan's.
       lagging: t.planNotice({id: 1, task_revision: 3, superseded_at: null},
                             {state: "refined", revision: 5}),
+      // Approved before, by its approve or its answers: only a reopen opens it.
+      lagging_approved: t.planNotice({id: 1, task_revision: 3, superseded_at: null,
+                                      approved_at: 1789466400},
+                                     {state: "refined", revision: 5}),
+      lagging_answered: t.planNotice({id: 1, task_revision: 3, superseded_at: null},
+                                     {state: "refined", revision: 5,
+                                      answers: [{plan: 1}]}),
       lagging_open: t.planNotice({id: 1, task_revision: 3, superseded_at: null},
                                  {state: "open", revision: 5}),
       // Among the earlier plans, drawn with no task.
@@ -338,6 +350,9 @@ class TaskViewTests(unittest.TestCase):
         self.assertEqual(plan["no_heading"], "")
         self.assertNotIn("NaN", plan["no_rounds"])
         self.assertTrue(plan["no_rounds"].endswith("at revision 1"))
+        self.assertRegex(plan["approved"], r"· 1 review round · approved \d{4}-\d\d-\d\d "
+                                           r"\d\d:\d\d:\d\d · superseded \d{4}-")
+        self.assertTrue(plan["not_approved"].endswith("· 1 review round"))
 
     def test_a_missing_or_superseded_plan_is_read_against_the_tasks_state(self):
         # Only a proposed task is refined by an agent; past it, nobody will hand a plan
@@ -363,6 +378,15 @@ class TaskViewTests(unittest.TestCase):
         for key in ("current", "lagging_open", "earlier", "earlier_none"):
             with self.subTest(case=key):
                 self.assertIsNone(notice[key])
+
+    def test_a_refined_task_edited_since_its_approved_plan_says_reopening_opens_it(self):
+        notice = self.probe["plan"]["notice"]
+        for key in ("lagging_approved", "lagging_answered"):
+            with self.subTest(case=key):
+                self.assertEqual(notice[key], {
+                    "text": "The task moved on since plan 1 was written (revision 3, now "
+                            "5): reopening opens the task as it now is, with this plan.",
+                    "warn": True})
 
     def test_the_earlier_plans_leave_out_the_one_shown_whatever_its_ids_type(self):
         earlier = self.probe["plan"]["earlier"]
@@ -531,29 +555,25 @@ const bare = {...approveW, answers: []};
 const reread = extra => ({task: task("open", {revision: 5, plan: decided, answers: answered,
                                               ...extra})});
 // The label table: each move a task offers as [state, main, second, caution], its
-// break last, over the timeline page read with it. Plan 6 has no decisions in
-// `approvedHistory`'s and `earlierHistory`'s cases: approved by an entry naming it, or
-// only handed in after an approve of plan 5.
-const approvedHistory = [{action: "submit_plan", detail: {plan: 6}},
-                         {action: "approve", detail: {plan: 6, state: "open"}}];
-const earlierHistory = [{action: "approve", detail: {plan: 5, state: "open"}},
-                        {action: "submit_plan", detail: {plan: 6}}];
+// break last. Plan 6 has no decisions in `approved`'s case, approved all the same, as a
+// read's `approved_at` says.
+const approved = {...plan, approved_at: 1789470000};
 const row = l => [l.main, l.second, l.caution];
-const labelled = (tk, history = null, picked = null) => [
-  ...m.movesFor(tk).map(mv => [mv.state, ...row(t.moveLabel(mv, tk, picked, history))]),
+const labelled = (tk, picked = null) => [
+  ...m.movesFor(tk).map(mv => [mv.state, ...row(t.moveLabel(mv, tk, picked))]),
   ...(tk.claim ? [["break", ...row(t.breakLabel(tk.claim))]] : [])];
 // Every state, by what its plan is: none, a superseded one, one answered, one with no
-// decisions found approved, one not found approved, and each claimed.
+// decisions approved, one never approved, and each claimed.
 const kinds = {
-  none: [{}, null], superseded: [{plan: {...plan, superseded_at: 1}}, null],
-  answered: [{plan: decided, answers: answered}, null],
-  approved: [{plan}, approvedHistory], unapproved: [{plan}, earlierHistory],
+  none: {}, superseded: {plan: {...plan, superseded_at: 1}},
+  answered: {plan: decided, answers: answered},
+  approved: {plan: approved}, unapproved: {plan},
 };
 const matrix = {};
 for (const state of m.TASK_STATES) {
-  for (const [kind, [extra, history]] of Object.entries(kinds)) {
-    matrix[`${state}/${kind}`] = labelled(task(state, extra), history);
-    matrix[`${state}/${kind}/claimed`] = labelled(task(state, {...extra, claim}), history);
+  for (const [kind, extra] of Object.entries(kinds)) {
+    matrix[`${state}/${kind}`] = labelled(task(state, extra));
+    matrix[`${state}/${kind}/claimed`] = labelled(task(state, {...extra, claim}));
   }
 }
 const primaries = Object.fromEntries(m.TASK_STATES.flatMap(state => [
@@ -568,24 +588,25 @@ console.log(JSON.stringify({
     open_none: labelled(task("open")),
     refined: labelled(task("refined", {plan})),
     refined_answered: labelled(task("refined", {plan: decided, answers: answered})),
+    refined_approved: labelled(task("refined", {plan: approved})),
     landing: labelled(task("landing", {plan})),
     deferred_none: labelled(task("deferred")),
-    deferred_approved: labelled(task("deferred", {plan}), approvedHistory),
-    deferred_unapproved: labelled(task("deferred", {plan}), earlierHistory),
+    deferred_approved: labelled(task("deferred", {plan: approved})),
+    deferred_unapproved: labelled(task("deferred", {plan})),
     closed_answered: labelled(task("closed", {plan: decided, answers: answered})),
     proposed_superseded: labelled(task("proposed", {plan: {...plan, superseded_at: 1}})),
   },
-  approved_in: {
-    answered: m.planApprovedIn(task("closed", {plan: decided, answers: answered}), []),
-    history: m.planApprovedIn(task("closed", {plan}), approvedHistory),
-    earlier: m.planApprovedIn(task("closed", {plan}), earlierHistory),
-    no_history: m.planApprovedIn(task("closed", {plan}), null),
-    // Decisions not answered: an approve naming the plan would have answered them.
-    decided: m.planApprovedIn(task("closed", {plan: decided}),
-                              [{action: "approve", detail: {plan: 6}}]),
-    superseded: m.planApprovedIn(task("closed", {plan: {...plan, superseded_at: 1}}),
-                                 approvedHistory),
-    no_plan: m.planApprovedIn(task("closed"), approvedHistory),
+  approved_plan: {
+    approved: m.planApproved(task("closed", {plan: approved})),
+    answered_approved: m.planApproved(task("closed", {plan: {...decided,
+                                                             approved_at: 1789470000},
+                                                      answers: answered})),
+    // Answers alone are `planAnswered`'s, beside it.
+    answered: m.planApproved(task("closed", {plan: decided, answers: answered})),
+    never: m.planApproved(task("closed", {plan})),
+    null_time: m.planApproved(task("closed", {plan: {...plan, approved_at: null}})),
+    superseded: m.planApproved(task("closed", {plan: {...approved, superseded_at: 1}})),
+    no_plan: m.planApproved(task("closed")),
   },
   holder: [t.holderText(claim), t.holderText(null)],
   note_labels: [t.noteMoveLabel({kind: "hide", value: false, verb: "unhide"}),
@@ -597,6 +618,10 @@ console.log(JSON.stringify({
     refined_with_plan: moves(task("refined", {plan})),
     refined_decided: moves(task("refined", {plan: decided, answers: []})),
     refined_answered: moves(task("refined", {plan: decided, answers: answered})),
+    refined_approved: moves(task("refined", {plan: approved})),
+    refined_answered_approved: moves(task("refined", {plan: {...decided,
+                                                             approved_at: 1789470000},
+                                                      answers: answered})),
     re_refined: moves(task("refined", {plan: {...decided, id: 9}, answers: answered})),
     deferred_re_refined: moves(task("deferred", {plan: {...decided, id: 9},
                                                  answers: answered})),
@@ -723,6 +748,10 @@ console.log(JSON.stringify({
       re_refined: m.approvable(task("refined", {plan: {...decided, id: 9},
                                                 answers: answered})),
       answered: m.approvable(task("refined", {plan: decided, answers: answered})),
+      approved: m.approvable(task("refined", {plan: approved})),
+      answered_approved: m.approvable(task("refined", {plan: {...decided,
+                                                              approved_at: 1789470000},
+                                                       answers: answered})),
       open: m.approvable(task("open", {plan: decided})),
       superseded: m.approvable(task("refined", {plan: {...decided, superseded_at: 1}})),
       no_plan: m.approvable(task("refined")),
@@ -788,15 +817,17 @@ class MoveTests(unittest.TestCase):
 
     def test_a_refined_task_is_sent_back_by_a_move_and_approved_by_none(self):
         # Approving is `approve`, with or without decisions; open is a move from
-        # refined only to reopen a plan answered before, which `approve` refuses.
+        # refined only to reopen a plan approved before, which `approve` refuses.
         mv = self.probe["moves"]
         expected = {"proposed": "send back", "landing": "move to landing",
                     "deferred": "defer", "closed": "close"}
         for key in ("refined_with_plan", "refined_decided", "re_refined"):
             with self.subTest(case=key):
                 self.assertEqual({s: verb for s, verb, _ in mv[key]}, expected)
-        self.assertEqual({s: verb for s, verb, _ in mv["refined_answered"]},
-                         expected | {"open": "reopen"})
+        for key in ("refined_answered", "refined_approved", "refined_answered_approved"):
+            with self.subTest(case=key):
+                self.assertEqual({s: verb for s, verb, _ in mv[key]},
+                                 expected | {"open": "reopen"})
 
     def test_open_is_offered_from_no_state_while_decisions_wait(self):
         mv = self.probe["moves"]
@@ -934,6 +965,13 @@ class MoveTests(unittest.TestCase):
             ["landing", "mark ready to land", "", False],
             ["deferred", "defer", "", False],
             ["closed", "close the task", "", False]],
+        "refined_approved": [
+            ["proposed", "send back for a new plan",
+             "supersedes plan 6; no move restores it", True],
+            ["open", "reopen", "plan 6 as approved · revision 4", False],
+            ["landing", "mark ready to land", "", False],
+            ["deferred", "defer", "", False],
+            ["closed", "close the task", "", False]],
         "landing": [
             ["proposed", "move to proposed", "supersedes plan 6; no move restores it", True],
             ["refined", "move to refined", "", False],
@@ -1009,10 +1047,10 @@ class MoveTests(unittest.TestCase):
                         self.assertEqual(main, "move to open" if state == "landing"
                                          else opens[kind])
 
-    def test_a_plan_is_found_approved_by_its_answers_or_an_approve_naming_it(self):
-        self.assertEqual(self.probe["approved_in"], {
-            "answered": True, "history": True, "earlier": False, "no_history": False,
-            "decided": False, "superseded": False, "no_plan": False})
+    def test_a_current_plan_is_approved_by_the_approved_at_its_read_carries(self):
+        self.assertEqual(self.probe["approved_plan"], {
+            "approved": True, "answered_approved": True, "answered": False,
+            "never": False, "null_time": False, "superseded": False, "no_plan": False})
 
     def test_one_primary_at_most_and_none_on_a_parked_or_finished_task(self):
         # Approve on a refined task the operator can approve, reopen on one whose plan
@@ -1040,11 +1078,13 @@ class MoveTests(unittest.TestCase):
             'No approve until every decision is answered: decisions 1, 2 not yet. A '
             'picked "other" needs its text.'])
 
-    def test_only_a_refined_current_plan_not_answered_is_approvable(self):
-        # A plan answered before is refused by `approve`: it reopens by a move.
+    def test_only_a_refined_current_plan_never_approved_is_approvable(self):
+        # A plan approved before, answered or not, is refused by `approve`: it reopens
+        # by a move.
         self.assertEqual(self.probe["labels"]["approvable"], {
             "unanswered": True, "no_decisions": True, "re_refined": True,
-            "answered": False, "open": False, "superseded": False, "no_plan": False})
+            "answered": False, "approved": False, "answered_approved": False,
+            "open": False, "superseded": False, "no_plan": False})
 
     def test_a_choice_per_decision_or_no_answers(self):
         labels = self.probe["labels"]
@@ -2083,7 +2123,7 @@ class TaskWriteSourceTests(unittest.TestCase):
                 self.assertNotIn("dataset.write", self._function(self.TASKS, name))
         calls = re.findall(r"\bmovesBlock\(", self.TASKS)
         self.assertEqual(len(calls), 2, "defined once, called once, in drawTask")
-        self.assertIn("movesBlock(task, held.timeline)",
+        self.assertIn("movesBlock(task)",
                       self._function(self.TASKS, "drawTask"))
         self.assertEqual(len(re.findall(r"\bbulkWrite\(", self.TASKS)), 2,
                          "defined once, called once, from the flagged block")
@@ -2960,6 +3000,9 @@ console.log(JSON.stringify({
     save_claimed: t.saveLabel({...base, claim: {holder: "claude-x\u202e"}}),
     save_none: t.saveLabel(null),
     amend: t.specAmendText(refined),
+    amend_approved: t.specAmendText({...refined, plan: {...refined.plan,
+                                                        approved_at: 1789466400}}),
+    amend_answered: t.specAmendText({...refined, answers: [{plan: refined.plan.id}]}),
     amend_open: t.specAmendText({...refined, state: "open"}),
     amend_superseded: t.specAmendText({...refined, plan: {...refined.plan,
                                                           superseded_at: 1}}),
@@ -3130,6 +3173,14 @@ class EditTests(unittest.TestCase):
                          "This task is refined: an edit amends the spec plan 3 was "
                          "written against, at revision 2. Approving after it approves "
                          "the edited task with that plan.")
+        for key in ("amend_approved", "amend_answered"):
+            with self.subTest(case=key):
+                self.assertEqual(labels[key],
+                                 "This task is refined: an edit amends the spec plan 3 was "
+                                 "written against, at revision 2. Plan 3 was approved "
+                                 "before: a reopen after the edit opens the edited task "
+                                 "with that plan.")
+                self.assertNotIn("Approving", labels[key])
         self.assertEqual((labels["amend_open"], labels["amend_superseded"]), ("", ""))
         self.assertIn("Save or discard the edit first", labels["held"])
 

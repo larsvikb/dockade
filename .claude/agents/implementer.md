@@ -34,16 +34,26 @@ session's; they are not containment.
    back are the briefing session's.
 4. **Work** under `CLAUDE.md`'s conventions: testing what the container can, naming
    roles, not people, and "Where writing goes".
-5. **Commit** in the shape `.claude/skills/review-before-push/SKILL.md` gives in step
+5. **Before each commit and each amend,** check the two things reviews most often find
+   left undone; on a fix's amend, what the fix touches:
+   - **Text the change made false.** `git grep` the whole repo by the old behaviour's
+     key phrases, not only the files the plan names, for a doc, comment, docstring or
+     test name that no longer holds. Correct one in the footprint; report one outside.
+   - **Guard branches no test holds.** Mutate each branch of guard code the change adds
+     or touches, one at a time (each condition and bound of a validator, each check of
+     a source guard, each style rule it adds, read by a test yet or not), and give any
+     survivor a test. How: `CONTRIBUTING.md`, "Tests". Under `## Checked`, the mutants
+     can be listed grouped by guard, with any survivor and the test it got.
+6. **Commit** in the shape `.claude/skills/review-before-push/SKILL.md` gives in step
    1, "Commit first". Never push.
-6. **After each commit,** `tasks__update` with the token and a one-line progress
+7. **After each commit,** `tasks__update` with the token and a one-line progress
    message.
-7. **File what lies outside the task.** For each such finding, `tasks__search_tasks`;
+8. **File what lies outside the task.** For each such finding, `tasks__search_tasks`;
    then `tasks__add_note` on the task it belongs to, or `tasks__propose` a new one. A
    finding only mentioned in your report is lost.
 
 Review findings may come back by `SendMessage` (`review-before-push`, step 4): fix them,
-amend while the commit is unpushed, and `tasks__update` again.
+run step 5 over the fix, amend while the commit is unpushed, and `tasks__update` again.
 
 ## The report
 

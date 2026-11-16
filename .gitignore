@@ -14,6 +14,11 @@ secrets/
 # one earns it". Useful to read, never to commit: host-specific, large, and stale within
 # minutes.
 *.log
+# The host-check scripts themselves: .claude/skills/review-before-push/SKILL.md, "Host
+# checks, when one earns it", has the coordinating session write one untracked at a
+# worktree's root for the maintainer to run, and a worker still amending in that
+# worktree would sweep it into its commit.
+/host-check-*.sh
 # The maintainer's log of how each pre-push review went, frozen: reviews are
 # recorded on their tasks in the registry, as .claude/skills/review-before-push/SKILL.md,
 # "Record it" says. Kept, unmigrated, as the read-only record of the reviews before.

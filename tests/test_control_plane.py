@@ -8,9 +8,9 @@ the hold registry (``_reserve_hold`` / ``_release_hold``: the two caps, and dupl
 grouping).
 
 The hold cap is exactly what ``boundary-check.sh`` cannot assert: an over-cap
-request returns the same opaque 403 to the agent as any other deny, so the cap's
-concurrency/availability behavior is invisible from the sandbox's vantage point
-(see DESIGN.md). Here we test the reservation function directly.
+request reaches the agent as the proxy's not-decided 503, but which cap refused it,
+and the cap's concurrency/availability behavior, are invisible from the sandbox's
+vantage point (see DESIGN.md). Here we test the reservation function directly.
 
 Dependency-free: ``fastapi``/``pydantic`` are stubbed (see ``tests/_loader.py``),
 and the store is a throwaway SQLite file in a temp dir set before import."""

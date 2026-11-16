@@ -1296,9 +1296,13 @@ the safe direction.
 outright: `_decide` returns **`hold`**, and `/authorize` records a pending
 approval and **blocks** the request until a human resolves it or
 `CONTROL_HOLD_TIMEOUT` elapses (its default is beside it in `control-plane/holds.py`)
-→ default-deny. The proxy is
-unchanged except for a longer authorize timeout to cover the wait — it still
-sees only allow/deny (the hold is internal to the control plane). A human
+→ default-deny. The proxy gains only a longer authorize timeout to cover the
+wait: it sees allow or deny (the hold is internal to the control plane), and with
+a deny whether anyone decided it. **A refusal reaches the client as an answer or
+as a wait**, the tool gateway's refused and held in HTTP: a policy refusal is a
+403, a request nobody decided (an expired hold, a capped one, an unreachable
+control plane) a 503 that says to retry later. How the proxy shapes them is "Two
+refusal shapes" in `proxies/egress/DESIGN.md`. A human
 resolves holds in a **live SSE UI** served at `/`, and the vocabulary is a ladder
 of how far the click reaches: **allow-once / deny-once** (this request only),
 **allow-lease** (that host, that client class, until `CONTROL_LEASE_SECONDS`
@@ -1311,7 +1315,8 @@ UI's source of truth; stale `pending` rows are expired on startup. **Holds are
 bounded**: since each hold pins a threadpool worker and this control plane is
 **shared across all sandboxes**, an unbounded queue would let one agent exhaust the
 pool and stall every sandbox's governed egress. Over any cap, `/authorize` fails
-**closed** (deny) immediately instead of registering another blocking hold — the
+**closed** immediately, a deny nobody decided (the proxy's 503), instead of
+registering another blocking hold — the
 worker caps stay comfortably under the pool so fast allow/deny decisions always have
 free workers, and the permanent lifeline is unaffected (it never reaches the control
 plane). There are **four** caps, because there are two things to protect and two
@@ -2443,7 +2448,7 @@ reservation was extracted** out of the `authorize` handler into `_reserve_hold` 
 `_release_hold` (behaviour-preserving) purely so the cap logic could be asserted without
 the FastAPI machinery. And these are properties `boundary-check.sh` structurally cannot
 reach: it observes reachability from the sandbox's vantage point, so a hold-cap rejection
-— which returns the agent the same opaque `403` as any other deny — is invisible there.
+shows there only as the proxy's not-decided `503`, and its concurrency behaviour not at all.
 Deliberately untested surface is low-weight I/O: `_audit` sinks,
 `_post_authorize` / `_setup_audit_file`, and the SSE `approvals_stream`.
 

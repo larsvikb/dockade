@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -184,6 +186,193 @@ class AuthorizeTests(unittest.TestCase):
         self.assertFalse(v.allowed)
         # The call still REACHED the control plane, which audits what it returned.
         self.assertTrue(v.central)
+
+
+class RefusalKindTests(unittest.TestCase):
+    """``Verdict.refusal``: what ``_deny`` shapes the response by. Only the kinds that
+    mean nobody decided are believed from the reply; anything else that is not an
+    allow is a policy refusal, so an outage the proxy saw itself cannot be told as an
+    answer, and a control plane that names no kind cannot be read as "retry"."""
+
+    def _verdict(self, reply=None, error=None):
+        with mock.patch.object(addon, "_post_authorize", return_value=reply,
+                               side_effect=error):
+            return run(addon._authorize("example.com", stage="connect"))
+
+    def test_an_unreachable_control_plane_is_unavailable(self):
+        v = self._verdict(error=OSError("connection refused"))
+        self.assertEqual((v.allowed, v.refusal), (False, "unavailable"))
+
+    def test_a_malformed_reply_is_unavailable(self):
+        for reply in (["allow"], None, 7):
+            with self.subTest(reply=reply):
+                self.assertEqual(self._verdict(reply).refusal, "unavailable")
+
+    def test_unanswered_and_busy_pass_through(self):
+        for kind in ("unanswered", "busy"):
+            with self.subTest(kind=kind):
+                v = self._verdict({"decision": "deny", "reason": "r", "refusal": kind})
+                self.assertEqual((v.allowed, v.refusal, v.central), (False, kind, True))
+
+    def test_a_deny_with_no_or_an_unknown_kind_is_policy(self):
+        for extra in ({}, {"refusal": None}, {"refusal": "later"},
+                      {"refusal": "unavailable"}, {"refusal": 503}):
+            with self.subTest(extra=extra):
+                v = self._verdict({"decision": "deny", "reason": "r", **extra})
+                self.assertEqual(v.refusal, "policy")
+
+    def test_an_allow_carries_no_kind(self):
+        # Even one the reply names: an allow is never a refusal.
+        v = self._verdict({"decision": "allow", "reason": "ok", "refusal": "busy"})
+        self.assertEqual((v.allowed, v.refusal), (True, None))
+        lifeline = run(addon._authorize("api.anthropic.com", stage="connect",
+                                        client=SANDBOX_PEER))
+        self.assertIsNone(lifeline.refusal)
+
+
+_POLICY_403 = (403, b"egress denied by policy\n",
+               {"Content-Type": "text/plain", "x-proxy-error": "blocked-by-allowlist"})
+
+
+def _not_decided(why):
+    return (503, f"egress not decided: {why} - retry later\n".encode(),
+            {"Content-Type": "text/plain", "Retry-After": "60"})
+
+
+# Each way /authorize can end in a refusal, and the response the client then sees.
+# The reason is one no client may be shown: a rule's pattern stands in for it.
+_RULE_REASON = "blocked by rule (.hidden.example for sandbox)"
+_SHAPES = {
+    "rule": ({"decision": "deny", "reason": _RULE_REASON, "refusal": "policy"}, None,
+             _POLICY_403),
+    "no kind": ({"decision": "deny", "reason": _RULE_REASON}, None, _POLICY_403),
+    "unanswered": ({"decision": "deny", "reason": _RULE_REASON, "refusal": "unanswered"},
+                   None, _not_decided("no one answered the approval in time")),
+    "busy": ({"decision": "deny", "reason": _RULE_REASON, "refusal": "busy"}, None,
+             _not_decided("too many requests are already waiting for approval")),
+    "unreachable": (None, OSError(_RULE_REASON), _not_decided(
+        "the policy service could not be reached")),
+    "malformed": ([_RULE_REASON], None, _not_decided(
+        "the policy service could not be reached")),
+}
+
+
+class RefusalShapeTests(unittest.TestCase):
+    """The response each refusal reaches the client as, read through a patched
+    ``http.Response.make``: a 403 is an answer, a 503 says nobody decided. What
+    each client then shows of either is in NOTES.md, "What a client shows of the
+    proxy's two refusals"."""
+
+    def setUp(self):
+        addon._conn_authority.clear()
+
+    def _made(self, hook, flow, reply=None, error=None, resolve=None):
+        """The (status, body, headers) of the one response ``hook`` made."""
+        with mock.patch.object(addon.http.Response, "make") as make, \
+             mock.patch.object(addon.socket, "getaddrinfo", side_effect=resolve,
+                               return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]), \
+             mock.patch.object(addon, "_post_authorize", return_value=reply,
+                               side_effect=error):
+            run(hook(flow))
+        make.assert_called_once()
+        self.assertIs(flow.response, make.return_value)
+        return make.call_args.args
+
+    def _each_shape(self, flow_for):
+        for name, (reply, error, expected) in _SHAPES.items():
+            for hook_name, hook in (("http_connect", addon.http_connect),
+                                    ("request", addon.request)):
+                with self.subTest(shape=name, hook=hook_name):
+                    made = self._made(hook, flow_for(hook_name), reply, error)
+                    self.assertEqual(made, expected)
+                    yield made
+
+    @staticmethod
+    def _flow(hook_name):
+        if hook_name == "http_connect":
+            return _connect_flow("held.example")
+        return _http_flow("held.example", "held.example", scheme="http", port=80)
+
+    def test_each_refusal_has_its_status_body_and_headers(self):
+        list(self._each_shape(self._flow))
+
+    def test_no_body_carries_the_control_plane_s_reason(self):
+        for _status, body, headers in self._each_shape(self._flow):
+            self.assertNotIn(b"hidden", body)
+            self.assertNotIn("hidden", " ".join(headers.values()))
+
+    def test_only_the_403_carries_the_webfetch_header(self):
+        for status, _body, headers in self._each_shape(self._flow):
+            self.assertEqual("x-proxy-error" in headers, status == 403)
+            self.assertEqual("Retry-After" in headers, status == 503)
+
+    def test_a_fronted_request_takes_the_refused_name_s_kind(self):
+        # The transport name is allowed, the Host header's card expired: the kind
+        # comes from the name that failed.
+        def reply(payload):
+            if payload["host"] == "allowed.example":
+                return {"decision": "allow", "reason": "ok"}
+            return {"decision": "deny", "reason": _RULE_REASON, "refusal": "unanswered"}
+
+        flow = _http_flow("allowed.example", "held.example", scheme="http", port=80)
+        with mock.patch.object(addon.http.Response, "make") as make, \
+             mock.patch.object(addon, "_post_authorize", side_effect=reply):
+            run(addon.request(flow))
+        self.assertEqual(make.call_args.args,
+                         _not_decided("no one answered the approval in time"))
+
+    def test_every_not_decided_body_carries_the_marker_the_others_quote(self):
+        """boundary-check.sh's fronting probe greps the 503's body for it, and the
+        agent's instructions quote it: reworded in ``_deny`` alone, the probe would
+        report a refusal at the re-gate as a fronting leak."""
+        root = Path(__file__).resolve().parents[1]
+        check = (root / "sandbox-common" / "boundary-check.sh").read_text()
+        rules = (root / "sandbox-common" / "instructions" / "cloud-tier"
+                 / "egress.md").read_text()
+        grepped = re.findall(r"grep -qi '(egress not decided[^']*)'", check)
+        quoted = re.findall(r"`(egress not decided[^`]*)`", rules)
+        self.assertEqual((grepped, quoted), (["egress not decided"],) * 2)
+        for kind in addon.NOT_DECIDED:
+            with self.subTest(kind=kind):
+                flow = _connect_flow("held.example")
+                with mock.patch.object(addon.http.Response, "make") as make:
+                    addon._deny(flow, kind)
+                status, body, _headers = make.call_args.args
+                self.assertEqual(status, 503)
+                self.assertTrue(body.decode().startswith(grepped[0]), body)
+
+    def test_the_relay_guard_is_the_policy_403(self):
+        self.assertEqual(self._made(addon.http_connect, _connect_flow("control-plane")),
+                         _POLICY_403)
+        self.assertEqual(self._made(addon.request, _http_flow(
+            "control-plane", "control-plane", scheme="http", port=80)), _POLICY_403)
+
+    def test_a_forbidden_resolve_after_an_allow_is_the_policy_403(self):
+        allow = {"decision": "allow", "reason": "ok"}
+        for hook, flow in ((addon.http_connect, _connect_flow("rebound.example")),
+                           (addon.request, _http_flow("rebound.example", "rebound.example",
+                                                      scheme="http", port=80))):
+            with self.subTest(hook=hook.__name__):
+                self.assertEqual(self._made(hook, flow, allow, resolve=lambda *_a, **_k: [
+                    (2, 1, 6, "", ("10.0.0.5", 0))]), _POLICY_403)
+
+    def test_the_port_gate_is_the_policy_403(self):
+        self.assertEqual(self._made(addon.http_connect,
+                                    _connect_flow("example.com", port=22)), _POLICY_403)
+        self.assertEqual(self._made(addon.request, _http_flow(
+            "example.com", "example.com", scheme="http", port=8080)), _POLICY_403)
+
+    def test_a_hook_error_is_the_policy_403(self):
+        # A crashed hook is a bug, not a wait: telling the agent to retry would have
+        # it wait on something nobody is deciding.
+        for hook, flow in ((addon.http_connect, _connect_flow("example.com")),
+                           (addon.request, _http_flow("example.com", "example.com",
+                                                      scheme="http", port=80))):
+            with self.subTest(hook=hook.__name__), \
+                 mock.patch.object(addon, "_authorize",
+                                   side_effect=RuntimeError("boom")), \
+                 mock.patch.object(addon, "_audit"):
+                self.assertEqual(self._made(hook, flow), _POLICY_403)
 
 
 class HttpConnectTests(unittest.TestCase):

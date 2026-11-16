@@ -289,6 +289,7 @@ class AuthorizeDecisionTests(_CPTestCase):
         _set_rules([("example.com", "allow")])
         resp = cp.api_authorize.authorize(_auth_req("example.com"))
         self.assertEqual(resp.decision, "allow")
+        self.assertIsNone(resp.refusal)
         # An allow decision must not create an approval row.
         self.assertEqual(cp.holds._list_pending(), [])
 
@@ -296,6 +297,8 @@ class AuthorizeDecisionTests(_CPTestCase):
         _set_rules([("blocked.com", "block")])
         resp = cp.api_authorize.authorize(_auth_req("blocked.com"))
         self.assertEqual(resp.decision, "deny")
+        # An answer: the proxy's 403, which tells the agent to stop.
+        self.assertEqual(resp.refusal, "policy")
 
     def test_over_cap_hold_fails_closed_immediately(self):
         # With no hold slots, an unmatched host must deny at once (not block).
@@ -310,6 +313,8 @@ class AuthorizeDecisionTests(_CPTestCase):
         self.assertEqual(resp.decision, "deny")
         self.assertIn("hold capacity exceeded", resp.reason)
         self.assertLess(elapsed, 1.0)                      # did not block
+        # Nobody decided it, so not an answer: the proxy's 503, ask again later.
+        self.assertEqual(resp.refusal, "busy")
 
     def test_a_failed_store_write_does_not_leak_the_hold_slot(self):
         # The slot is reserved BEFORE the approvals row is written, so a store failure
@@ -370,6 +375,7 @@ class AuthorizeDecisionTests(_CPTestCase):
             cp.holds.HOLD_TIMEOUT = saved
         self.assertEqual(resp.decision, "deny")
         self.assertIn("timeout", resp.reason)
+        self.assertEqual(resp.refusal, "unanswered")
         # The approval row is left as 'expired', not stuck 'pending'.
         with cp.store._connect() as conn:
             statuses = [r[0] for r in conn.execute(
@@ -409,6 +415,7 @@ class HoldHandshakeTests(_CPTestCase):
             cp.holds.HOLD_TIMEOUT = saved
         self.assertFalse(t.is_alive())
         self.assertEqual(result["resp"].decision, "allow")
+        self.assertIsNone(result["resp"].refusal)
         self.assertTrue(resolve_resp.args[0]["ok"])
         # persist wrote an operator allow rule, so a re-decide skips the hold.
         self.assertEqual(cp.policy._decide("newsite.com", CLASS)[0], "allow")
@@ -424,6 +431,8 @@ class HoldHandshakeTests(_CPTestCase):
             cp.holds.HOLD_TIMEOUT = saved
         self.assertFalse(t.is_alive())
         self.assertEqual(result["resp"].decision, "deny")
+        # A human's no is an answer, as a rule's is.
+        self.assertEqual(result["resp"].refusal, "policy")
         # deny_once must NOT persist a rule — the host stays held next time.
         self.assertEqual(cp.policy._decide("nope.com", CLASS)[0], "hold")
 
@@ -496,6 +505,9 @@ class DuplicateHoldTests(_CPTestCase):
         for r in results:
             self.assertIn("timeout", r.reason)
             self.assertNotIn("rejection", r.reason)
+        # From the status read, not the expiry UPDATE: a loser told "policy" would get
+        # the 403 that says stop, for a card nobody answered.
+        self.assertEqual([r.refusal for r in results], ["unanswered"] * 3)
         with cp.store._connect() as conn:
             statuses = [r[0] for r in conn.execute(
                 "SELECT status FROM approvals").fetchall()]
@@ -7471,8 +7483,8 @@ class LoneSurrogateTests(_ToolBridgeTestCase):
                 sent = {**fields, name: fields[name] + _SURROGATE}
                 resp = cp.api_authorize.authorize(cp.api_authorize.AuthorizeRequest(
                     port=443, **sent))
-                self.assertEqual((resp.decision, resp.reason),
-                                 ("deny", cp.store.UNENCODABLE))
+                self.assertEqual((resp.decision, resp.reason, resp.refusal),
+                                 ("deny", cp.store.UNENCODABLE, "policy"))
                 self.assertEqual(self._audit_rows(*fields), [
                     ("deny", *[v.replace(_SURROGATE, _ESCAPED)
                                for v in sent.values()], cp.store.UNENCODABLE)])

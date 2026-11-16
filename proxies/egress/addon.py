@@ -78,8 +78,9 @@ under a spelling no v4 blocklist recognizes (see ``_embedded_ipv4``).
 
 An unknown host is HELD (2b): the control plane blocks the /authorize response
 until a human approves/rejects it or its hold window elapses. To the proxy this
-is just a slow allow/deny — the connection waits, then proceeds or gets a 403.
+is just a slow allow/deny — the connection waits, then proceeds or is refused.
 That is why CONTROL_TIMEOUT is long (see below); it does not weaken fail-closed.
+A refusal takes one of two shapes, by whether anyone decided it (``_deny``).
 
 The call runs in a worker thread (``asyncio.to_thread`` + stdlib ``urllib``), so
 it never blocks mitmproxy's event loop and the egress image needs no extra
@@ -678,6 +679,9 @@ class Verdict(NamedTuple):
     # control plane ingests this file. Never inferred at the call site: whether a
     # given host short-circuits as a lifeline is knowable only here.
     central: bool
+    # On a deny, the kind ``_deny`` shapes the response by: ``policy``, or one of
+    # ``NOT_DECIDED``'s. None on an allow.
+    refusal: str | None = None
 
 
 async def _authorize(host: str, *, stage: str, client: str | None = None,
@@ -698,12 +702,20 @@ async def _authorize(host: str, *, stage: str, client: str | None = None,
     try:
         resp = await asyncio.to_thread(_post_authorize, payload)
     except Exception as e:  # noqa: BLE001 — any failure must fail closed
-        return Verdict(False, f"control-plane unreachable, fail-closed ({e})", False)
+        return Verdict(False, f"control-plane unreachable, fail-closed ({e})", False,
+                       "unavailable")
     if not isinstance(resp, dict):
         # Valid JSON that is not an object: ``.get`` on it would raise out of the
         # hook, and a raised hook is a forwarded flow (see ``_fail_closed``).
-        return Verdict(False, "control-plane reply malformed, fail-closed", False)
-    return Verdict(resp.get("decision") == "allow", resp.get("reason", ""), True)
+        return Verdict(False, "control-plane reply malformed, fail-closed", False,
+                       "unavailable")
+    if resp.get("decision") == "allow":
+        return Verdict(True, resp.get("reason", ""), True)
+    # Only the kinds that mean "nobody decided" are taken from the reply; a missing
+    # or unknown one is a policy refusal, the answer that sends no client back.
+    refusal = resp.get("refusal")
+    return Verdict(False, resp.get("reason", ""), True,
+                   refusal if refusal in ("unanswered", "busy") else "policy")
 
 
 def _audit(decision: str, **fields) -> None:
@@ -754,12 +766,33 @@ def _probe_metadata_reachable() -> None:
         "DNS-rebind gap reaches no metadata endpoint on this host", METADATA_IP)
 
 
-def _deny(flow: http.HTTPFlow) -> None:
+# The refusals that are not an answer, and what the client is told of each. No body
+# carries the control plane's reason or the rule: the audit row is the full record.
+NOT_DECIDED = {
+    "unanswered": "no one answered the approval in time",
+    "busy": "too many requests are already waiting for approval",
+    "unavailable": "the policy service could not be reached",
+}
+
+
+def _deny(flow: http.HTTPFlow, refusal: str | None = "policy") -> None:
     """Refuse an HTTP-layer flow. Setting a response is how an addon stops
-    mitmproxy from dialling the destination; this is the one shape every refusal in
-    this file takes."""
-    flow.response = http.Response.make(
-        403, b"egress denied by policy\n", {"Content-Type": "text/plain"})
+    mitmproxy from dialling the destination.
+
+    Two shapes, as the tool gateway's refused and held: a 403 is an answer, so the
+    client should stop; a 503 is a request nobody decided, so asking again later
+    can work. Anything not in ``NOT_DECIDED`` is the 403, the relay guard, the port
+    gate and a crashed hook included. ``x-proxy-error: blocked-by-allowlist`` is the
+    header Claude Code's WebFetch names an egress-proxy block by (undocumented; see
+    proxies/egress/DESIGN.md); no 503 carries it."""
+    if refusal in NOT_DECIDED:
+        flow.response = http.Response.make(
+            503, f"egress not decided: {NOT_DECIDED[refusal]} - retry later\n".encode(),
+            {"Content-Type": "text/plain", "Retry-After": "60"})
+    else:
+        flow.response = http.Response.make(
+            403, b"egress denied by policy\n",
+            {"Content-Type": "text/plain", "x-proxy-error": "blocked-by-allowlist"})
 
 
 def _refuse_tunnel(data: tls.ClientHelloData) -> None:
@@ -864,7 +897,7 @@ def load(loader) -> None:  # mitmproxy lifecycle hook
 @_fail_closed("connect", _deny)
 async def http_connect(flow: http.HTTPFlow) -> None:
     """All HTTPS via a forward proxy arrives as CONNECT host:port. Decide here,
-    before any TLS — rejecting with a 403 needs no CA. Port-gate LOCALLY first
+    before any TLS — refusing with a response needs no CA. Port-gate LOCALLY first
     (the tunnel is opaque TCP via ``ignore_connection`` below, so an allowed host
     on an unrestricted port would carry any protocol), then ask the control plane
     about the host."""
@@ -908,7 +941,7 @@ async def http_connect(flow: http.HTTPFlow) -> None:
     else:
         _audit("deny", stage="connect", proto="connect", host=host, port=port,
                client=client, reason=v.reason, central=v.central)
-        _deny(flow)
+        _deny(flow, v.refusal)
 
 
 @_fail_closed("sni", _refuse_tunnel)
@@ -1019,7 +1052,7 @@ async def request(flow: http.HTTPFlow) -> None:
                       f"({sorted(allowed_ports)})")
         _deny(flow)
         return
-    bad_name, bad_reason, central = None, "", True
+    bad_name, bad_reason, bad_refusal, central = None, "", None, True
     for name in names:
         v = await _authorize(
             name, stage="http", proto=proto, port=port, client=client,
@@ -1030,7 +1063,7 @@ async def request(flow: http.HTTPFlow) -> None:
         # fail-safe fold: it ingests a possible duplicate rather than dropping a row.
         central = central and v.central
         if not v.allowed:
-            bad_name, bad_reason = name, v.reason
+            bad_name, bad_reason, bad_refusal = name, v.reason, v.refusal
             break
     if bad_name is None:
         for name in names:
@@ -1049,7 +1082,7 @@ async def request(flow: http.HTTPFlow) -> None:
                method=flow.request.method, client=client,
                url=flow.request.pretty_url, central=central,
                reason=f"host not authorized ({bad_name}): {bad_reason}")
-        _deny(flow)
+        _deny(flow, bad_refusal)
 
 
 def client_disconnected(client) -> None:  # mitmproxy lifecycle hook

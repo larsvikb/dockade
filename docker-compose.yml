@@ -224,8 +224,8 @@ services:
     # came back without it.
     #
     # That specific combination is the worst one available: egress fails closed, so
-    # nothing unsafe happens, but every request returns a 403 indistinguishable from
-    # a policy denial while `docker compose ps` shows green. See the audit view's
+    # nothing unsafe happens, but every request is refused (the proxy's 503, "not
+    # decided") while `docker compose ps` shows green. See the audit view's
     # handling of `control-plane unreachable, fail-closed`, which is the detection
     # half — this is only the recovery half.
     #

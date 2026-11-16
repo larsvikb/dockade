@@ -2449,11 +2449,12 @@ Deliberately untested surface is low-weight I/O: `_audit` sinks,
 
 **The CI gate runs the same `make` targets rather than reimplementing them**
 (`.github/workflows/check.yml`), so there is one definition of "does this repo pass" and
-a CI failure reproduces locally with `make check-strict`. Two parallel jobs — lint +
-consistency + tests (about a minute) and the build verification of every image — so a
-shellcheck typo is not queued behind an image build. A third, beside them, runs the
-approval and tasks pages' browser tests (`make ui-test`), which `check` leaves out so
-that it stays browser-free (`control-plane-ui/DESIGN.md`).
+a CI failure reproduces locally with `make check-strict` on the same Python minor (the
+divergence bullet below). Two parallel jobs — lint + consistency + tests (about a minute)
+and the build verification of every image — so a shellcheck typo is not queued behind an
+image build. A third, beside them, runs the approval and tasks pages' browser tests
+(`make ui-test`), which `check` leaves out so that it stays browser-free
+(`control-plane-ui/DESIGN.md`).
 
 **The build job then runs `make check-boundary`, which is the only automated evidence
 that containment still holds.** Everything else in the gate reads the boundary rather
@@ -2495,8 +2496,15 @@ consequences that are load-bearing rather than incidental:
 - **A divergence is harmful when it produces surprise *after* a push** — not "CI should
   be stricter". hadolint was harmful because CI was the stricter side, so the failure
   could only appear post-push. shellcheck is the reverse (the local gate is newer, so it
-  catches first) and needs no pin. The interpreter gap is a positive: the services run
-  on `python:3.12-slim`, so CI tests closer to production than a dev machine on 3.13.
+  catches first) and needs no pin. The interpreter is pinned for the same reason: the
+  service images and CI's tests run one Python minor, the images' base tag and the
+  `checks` job's `PYTHON_VERSION`, moved together and held equal by
+  `tests/test_python_pin.py`, so CI tests on production's Python. The workflow restates
+  the minor rather than deriving it from a Dockerfile as it does hadolint's version: a
+  restated value with its guard in `make test` fails before the push, while a derived
+  one is first read in CI. The sandbox's Debian `python3` is the divergence left: a test
+  that depends on the minor can pass there and fail on CI. It is accepted because
+  matching it costs a second interpreter in the sandbox image.
 
 **The build job earns its minutes.** Its first run found a bug unobservable locally:
 `run-opencode-sandbox.sh` was `100644` in the git index while `755` on disk, so it

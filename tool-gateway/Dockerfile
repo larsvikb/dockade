@@ -7,7 +7,7 @@
 # Build context is this directory, not the repo root: unlike the control plane there
 # is no top-level seed to COPY, so the narrower context is both sufficient and the
 # smaller thing to get wrong.
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 # Non-root runtime user. The gateway needs no privileges — it serves HTTP on one
 # sandbox-net address and dials siblings. It holds credentials in memory, which is

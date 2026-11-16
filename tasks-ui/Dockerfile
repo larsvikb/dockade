@@ -5,7 +5,7 @@
 # root, to copy ui-common/ (the browser guards and modules both UIs share) beside its
 # own files; everything lands in one directory, where app.py and the page import by
 # plain name.
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 # Non-root runtime user. The UI needs no privileges.
 RUN useradd --system --create-home --home-dir /home/tasksui --uid 10005 tasksui

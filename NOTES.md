@@ -79,8 +79,8 @@ c.execute("SELECT * FROM t").fetchall()     # -> [(1,)]   the table is back
 
 Measured on CPython 3.13.5 / SQLite 3.46.1. This is the documented legacy
 `isolation_level` behaviour rather than a version quirk, so it applies to the
-`python:3.12-slim` the control-plane image is built on — but only the 3.13 figure above
-was actually run.
+control-plane image's Python, while sqlite3's `autocommit` defaults to
+`LEGACY_TRANSACTION_CONTROL` — but only the 3.13 figure above was actually run.
 
 The consequence is entirely about **table-rebuild migrations**, which are the only
 shape here that mixes DML and DDL in one operation: copy the rows aside, drop the

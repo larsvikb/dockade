@@ -132,13 +132,28 @@
   .answer { margin: 6px 0; padding: 6px 8px; border-left: 2px solid var(--line); }
   .decisions .spent { visibility: hidden; }
   /* The operator's moves on the task read, and a note to it. Approve has a row of its
-     own above them, one line high whatever it holds, so relabelling it or the send
+     own above them, two lines high whatever it holds, so relabelling it or the send
      back moves neither. */
-  .approve-row { height: 34px; display: flex; align-items: center; margin: 4px 0;
+  .approve-row { height: 48px; display: flex; align-items: center; margin: 4px 0;
     white-space: nowrap; }
   .approve-row button { font-size: 12px; padding: 4px 10px; }
   .moves { display: flex; gap: 6px; flex-wrap: wrap; margin: 4px 0 10px; }
   .moves button, .note-form button { font-size: 12px; padding: 4px 10px; }
+  /* One scheme for every action control (tasks-ui/DESIGN.md, "One scheme of labels"):
+     the action in words, the mechanism and its cost on a smaller line under it; the
+     state's one primary move filled; a move no other undoes bordered in the warning
+     colour, which hover keeps. The second line wraps before a button leaves the window. */
+  button[data-write] { text-align: left; max-width: 100%; }
+  button[data-write] .main, button[data-write] .second { display: block; }
+  button[data-write] .second { font-size: 11px; color: var(--dim);
+    overflow-wrap: anywhere; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary .second { color: rgba(255, 255, 255, .8); }
+  /* As heavy as `button:hover` and after it, so hover keeps the warning border. */
+  button.caution { border-color: var(--hold); }
+  /* Whose claim it is, above a claimed task's moves. */
+  .holder-line { font-size: 12px; color: var(--dim); margin: 2px 0 4px;
+    overflow-wrap: anywhere; }
   .note-form { display: flex; flex-direction: column; align-items: flex-start; gap: 6px;
     margin: 8px 0; }
   .note-form textarea { font: inherit; font-size: 13px; width: 100%;

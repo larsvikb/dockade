@@ -11,7 +11,7 @@ import {
 // The list's own hash, set as a link would set it, once the page has followed it. A
 // task open takes the whole page, so a step that acts on the list with one open goes
 // back to the list first; on a base that drew the task beside the list, the same hash
-// closes it, so both trees take the step from the same place.
+// leaves it, so both trees take the step from the same place.
 async function toList(page, hash = "") {
   await page.evaluate(h => new Promise(done => {
     if (location.hash === h) return done();
@@ -63,7 +63,7 @@ export const STEPS = [
     await toList(page, "#view=all");
     await page.click('#tasks button[data-task="2"]');
   }],
-  ["task closed", async ({ page }) => { await toList(page, "#view=all"); }],
+  ["back to All tasks", async ({ page }) => { await toList(page, "#view=all"); }],
   ["search", async ({ page }) => {
     await page.fill("#tasks-search", "back up");
     await page.press("#tasks-search", "Enter");
@@ -123,7 +123,7 @@ export const STEPS = [
     await page.fill("#task-detail textarea[data-note]", "And this.");
     await page.click('#task-detail button[data-write="note"]');
   }],
-  ["closed", async ({ page }) => {
+  ["the task closed", async ({ page }) => {
     await page.click('#task-detail button[data-verb="close"]');
   }],
   // A plan that replaced another opens on what changed, the whole one toggle away.
@@ -140,7 +140,7 @@ export const STEPS = [
     editElsewhere(6);
     await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
   }],
-  ["show it", async ({ page }) => {
+  ["read it again", async ({ page }) => {
     await page.click("#task-detail button[data-show]");
   }],
   // The moves on notes, made on a note in the timeline: each says what it came to above
@@ -157,7 +157,7 @@ export const STEPS = [
   ["a flagged note hidden", async ({ page }) => {
     await page.click('#task-detail button[data-write="hide"][data-note="13"]');
   }],
-  ["and shown again", async ({ page }) => {
+  ["and unhidden", async ({ page }) => {
     await page.click('#task-detail button[data-write="hide"][data-note="13"]');
   }],
   // A flagged note already handled is in no list a hide takes it out of.
@@ -292,12 +292,12 @@ export const STEPS = [
     await page.fill('#task-detail textarea[data-other="0"]', "Hold, for the llm ones.");
   }],
   // A plan handed in while the page reads the task: the poll says it changed, and
-  // "show it" draws the new plan with the "other" text it reset.
+  // "read it again" draws the new plan with the "other" text it reset.
   ["another plan handed in, a poll passes", async ({ clock }) => {
     replanElsewhere(10, 8);
     await clock(16000);
   }],
-  ["show it, the new plan", async ({ page }) => {
+  ["read it again, the new plan", async ({ page }) => {
     await page.click("#task-detail button[data-show]");
   }],
   // The plans it replaced, each with its decisions as text: no input on any.

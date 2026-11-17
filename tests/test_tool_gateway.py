@@ -597,5 +597,46 @@ class ResponseBodyTests(unittest.TestCase):
         self.assertIn(hashed, body)
 
 
+class DeepBodyTests(unittest.TestCase):
+    """A body nested too deep to parse is answered like any other unparseable one.
+
+    The parse raises RecursionError there, a RuntimeError rather than a ValueError,
+    and uncaught it was a 500 and a traceback in the gateway's log."""
+
+    class _Request(ResponseBodyTests._Request):
+        pass
+
+    def _post(self, gateway, body):
+        def call(name, arguments, client):  # pragma: no cover - must not run
+            raise AssertionError("the executor was reached")
+
+        with mock.patch.object(gateway.execute, "call", call):
+            return asyncio.run(gateway.mcp(self._Request(body)))
+
+    def test_a_parse_that_recurses_too_deep_is_a_parse_error(self):
+        # Raised directly, on a marker body only, so the proof does not depend on the
+        # depth at which this interpreter gives up.
+        gateway = load_tool_gateway(GOOD)
+        marker, loads = b'"too-deep"', json.loads
+
+        def parse(body, *args, **kwargs):
+            if body == marker:
+                raise RecursionError("too deep")
+            return loads(body, *args, **kwargs)
+
+        with mock.patch.object(gateway.json, "loads", parse):
+            response = self._post(gateway, marker)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.body, gateway.protocol.parse_error())
+
+    def test_a_genuinely_deep_body_is_a_parse_error(self):
+        gateway = load_tool_gateway(GOOD)
+        body = b"[" * 200000
+        self.assertLess(len(body), gateway.BODY_MAX)
+        response = self._post(gateway, body)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.body, gateway.protocol.parse_error())
+
+
 if __name__ == "__main__":
     unittest.main()

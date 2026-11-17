@@ -259,9 +259,11 @@ async def mcp(request: Request) -> Response:
         return JSONResponse(
             {"error": f"request body exceeds {BODY_MAX} bytes and was not read"},
             status_code=413)
-    except ValueError:
+    except (ValueError, RecursionError):
         # The other case answered with a non-200: an unparseable body is a transport
-        # failure rather than a protocol answer, and there is no id to reply under.
+        # failure rather than a protocol answer, and there is no id to reply under. A
+        # body nested too deep to parse is one: RecursionError is a RuntimeError, not a
+        # ValueError, and the depth that raises it is the interpreter's.
         return JSONResponse(protocol.parse_error(), status_code=400)
     # The peer this listener observed, relayed to the control plane as the calling
     # SANDBOX — the same arrangement the egress proxy has on `/authorize`, and the same

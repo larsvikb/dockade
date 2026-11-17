@@ -174,13 +174,24 @@ def _ask_control(path: str, payload: dict) -> dict:
     urllib's own: it wraps a failure to connect or to SEND in ``URLError``, and lets
     everything after the request is out — a read timeout, a reset, an unreadable body —
     through unwrapped. Messages are fit to print, which is the contract that matters.
+    One undelivered case is drawn before urllib: a payload too deeply nested to encode
+    is never sent, so it is a plain ``DiscoveryError``.
 
     A NON-200 IS STILL AN ANSWER on this bridge. ``/tool/authorize`` always returns 200
     because a policy question has a policy answer, but the claim endpoint uses 404 and
     409 to distinguish refusals the gateway must tell apart, so the body is read on
     every status and the status itself decides nothing here."""
+    try:
+        data = json.dumps(payload).encode()
+    except RecursionError as exc:
+        # The agent's arguments ride in an authorize payload, and the depth this encode
+        # allows is this thread's, not that of the event loop that parsed them.
+        # RecursionError is a RuntimeError, not a ValueError.
+        raise discovery.DiscoveryError(
+            f"the request was nested too deeply to encode, so it was never sent, and "
+            f"sending the same arguments again will fail the same way ({exc})") from exc
     request = urllib.request.Request(  # noqa: S310 - fixed http:// scheme, not user input
-        f"{CONTROL_URL}{path}", data=json.dumps(payload).encode(),
+        f"{CONTROL_URL}{path}", data=data,
         headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(request, timeout=DECIDE_TIMEOUT) as response:  # noqa: S310
@@ -188,12 +199,16 @@ def _ask_control(path: str, payload: dict) -> dict:
     except urllib.error.HTTPError as exc:
         try:
             answer = json.loads(exc.read() or b"{}")
-        except (OSError, http.client.HTTPException, ValueError) as parse_failure:
+        # RecursionError: a body too deep to parse, a RuntimeError, not a ValueError.
+        except (OSError, http.client.HTTPException, ValueError,
+                RecursionError) as parse_failure:
             raise Unanswered(f"HTTP {exc.code} with no readable body") from parse_failure
     except urllib.error.URLError as exc:
         raise discovery.DiscoveryError(
             f"the control plane could not be reached ({exc.reason})") from exc
-    except (OSError, http.client.HTTPException, ValueError) as exc:
+    # RecursionError as above. This try holds urlopen and the read too, and that is by
+    # design: anything unusable once the request is out is Unanswered.
+    except (OSError, http.client.HTTPException, ValueError, RecursionError) as exc:
         raise Unanswered(f"{type(exc).__name__}: {exc}") from exc
     if not isinstance(answer, dict):
         raise Unanswered(f"a {type(answer).__name__} where an object was expected")
@@ -719,13 +734,14 @@ def resume(arguments: object, client: str | None) -> dict:
     _UNSETTLED.discard(resume_token)
     try:
         approved_args = json.loads(answer.get("args_json") or "null")
-    except ValueError:
+    except (ValueError, RecursionError):
         # The CLAIM ALREADY SUCCEEDED, so the grant is spent and the call never
         # happened — the exact shape of gap this audit exists for, and the reason it is
         # recorded here rather than left to `_run`. It keeps the property whole: every
         # spent grant produces an outcome row, so a human's approval can never end in
-        # silence. (It should be unreachable — the control plane stores the canonical
-        # form it serialized itself — which is precisely why it must not be silent.)
+        # silence. (The control plane stores the canonical form it serialized itself,
+        # so what reaches here is a depth this thread's parse refuses: RecursionError,
+        # a RuntimeError, not a ValueError. Rare is precisely why it must not be silent.)
         outcomes.record("transport-error", answer.get("server") or "(unknown)",
                      answer.get("tool") or "(unknown)",
                      reason="the approved arguments could not be parsed, so the call "

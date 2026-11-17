@@ -106,7 +106,9 @@ def answer(body: bytes) -> tuple[int, dict | None]:
     """The HTTP status and JSON for one request body; None for a notification."""
     try:
         message = json.loads(body)
-    except ValueError:
+    except (ValueError, RecursionError):
+        # RecursionError too: a body nested past the interpreter's depth is as
+        # unparseable as any other, though it is a RuntimeError, not a ValueError.
         return 400, _error(None, PARSE_ERROR, "request body is not valid JSON")
     reply = handle(message)
     return (202, None) if reply is None else (200, reply)

@@ -38,12 +38,25 @@ ROOT = Path(__file__).resolve().parents[1]
 
 _TMP = tempfile.mkdtemp(prefix="dockade-cp-api-test-")
 atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
-os.environ["CONTROL_DB"] = os.path.join(_TMP, "control.db")
-os.environ["CONTROL_SEED"] = os.path.join(_TMP, "nonexistent-seed.txt")
+_DB = os.path.join(_TMP, "control.db")
+_SEED = os.path.join(_TMP, "nonexistent-seed.txt")
+# The import-time default for the control plane's store; ``setUpModule`` binds the
+# store to these paths while this module's tests run, since another module may
+# have loaded it first.
+os.environ["CONTROL_DB"] = _DB
+os.environ["CONTROL_SEED"] = _SEED
 
-from _loader import load_control_plane, load_outcomes  # noqa: E402 (must set env first)
+from _loader import (  # noqa: E402 (the env above is the import-time default)
+    load_control_plane,
+    load_outcomes,
+    use_control_store,
+)
 
 cp = load_control_plane()
+
+
+def setUpModule():
+    use_control_store(cp, _DB, _SEED)
 
 
 # The client class these tests decide as, and an address that maps to it under the
@@ -9599,6 +9612,15 @@ class MainSupervisesIngestTests(unittest.TestCase):
     def test_a_disabled_ingest_starts_no_supervisor(self):
         self.run_main(self._returns, interval=0)
         self.assertEqual(self.events, ["serve", "serve", "serve"])
+
+
+class OwnStoreTests(unittest.TestCase):
+    """While this module's tests run, the store is this module's own, in the suite as
+    when run alone (tests/test_control_plane_store_isolation.py runs it beside the others)."""
+
+    def test_the_store_is_this_modules_own(self):
+        self.assertEqual(cp.store.DB_PATH, _DB)
+        self.assertEqual(cp.store.SEED_PATH, _SEED)
 
 
 if __name__ == "__main__":

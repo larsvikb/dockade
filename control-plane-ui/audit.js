@@ -10,7 +10,7 @@
  * (tests/test_control_plane_ui_js.py).
  */
 
-import { esc } from "./dom.js";
+import { html, setHtml } from "./dom.js";
 import { renderListStatus } from "./list-status.js";
 import { shortActor } from "./provenance.js";
 import { auditStatus, AUDIT_REFUSED_FALLBACK } from "./status.js";
@@ -527,46 +527,46 @@ function renderGrouped(rows) {
   // them read as out of order at exactly the moment ordering matters. The `title`
   // carries the UTC instant, because the visible stamp is local and states no offset
   // — see fmtInstant.
-  document.getElementById("audit").innerHTML = rows.map(r => {
+  setHtml(document.getElementById("audit"), html`${rows.map(r => {
     const a = auditRow(r);
-    return `
-        <tr${a.failClosed ? ' class="outage"' : ""}>
-          <td class="ts" title="${esc(fmtInstant(a.ts))}">${esc(fmtStamp(a.ts))}</td>
-          <td><span class="tag ${esc(a.kind)}">${esc(a.kind)}</span></td>
-          <td>${a.stagePrefix ? `<span class="qual">${esc(a.stagePrefix)}</span>` : ""
-            }${esc(a.target)}${a.repeat
-              ? `<span class="rep">${esc(" " + a.repeat)}</span>` : ""}</td>
+    return html`
+        <tr${a.failClosed ? html` class="outage"` : ""}>
+          <td class="ts" title="${fmtInstant(a.ts)}">${fmtStamp(a.ts)}</td>
+          <td><span class="tag ${a.kind}">${a.kind}</span></td>
+          <td>${a.stagePrefix ? html`<span class="qual">${a.stagePrefix}</span>` : ""
+            }${a.target}${a.repeat
+              ? html`<span class="rep">${" " + a.repeat}</span>` : ""}</td>
           <td class="ts">${a.clientClassPrefix
-            ? `<span class="qual">${esc(a.clientClassPrefix)}</span>` : ""
-            }${esc(a.client)}${a.actor
-              ? `<span class="by" title="${esc(a.actorTitle)}">${esc(a.actor)}</span>`
+            ? html`<span class="qual">${a.clientClassPrefix}</span>` : ""
+            }${a.client}${a.actor
+              ? html`<span class="by" title="${a.actorTitle}">${a.actor}</span>`
               : ""}</td>
-          <td>${esc(a.reason)}${a.firstTs
-            ? esc(`${a.reason ? " · " : ""}first seen ${fmtStamp(a.firstTs)}`)
+          <td>${a.reason}${a.firstTs
+            ? `${a.reason ? " · " : ""}first seen ${fmtStamp(a.firstTs)}`
             : ""}</td></tr>`;
-  }).join("");
+  })}`);
 }
 
 // The record view. Same five columns as the glance, rendered from the same shaping
 // (see eventRow), plus the request itself — which is the column this view exists for
 // and the one the glance cannot carry.
 function renderEvents(rows) {
-  document.getElementById("audit-events").innerHTML = rows.map(r => {
+  setHtml(document.getElementById("audit-events"), html`${rows.map(r => {
     const a = eventRow(r);
-    return `
-        <tr${a.failClosed ? ' class="outage"' : ""}>
-          <td class="ts" title="${esc(fmtInstant(a.ts))}">${esc(fmtStamp(a.ts))}</td>
-          <td><span class="tag ${esc(a.kind)}">${esc(a.kind)}</span></td>
-          <td>${a.stagePrefix ? `<span class="qual">${esc(a.stagePrefix)}</span>` : ""
-            }${esc(a.target)}</td>
+    return html`
+        <tr${a.failClosed ? html` class="outage"` : ""}>
+          <td class="ts" title="${fmtInstant(a.ts)}">${fmtStamp(a.ts)}</td>
+          <td><span class="tag ${a.kind}">${a.kind}</span></td>
+          <td>${a.stagePrefix ? html`<span class="qual">${a.stagePrefix}</span>` : ""
+            }${a.target}</td>
           <td class="ts">${a.clientClassPrefix
-            ? `<span class="qual">${esc(a.clientClassPrefix)}</span>` : ""
-            }${esc(a.client)}${a.actor
-              ? `<span class="by" title="${esc(a.actorTitle)}">${esc(a.actor)}</span>`
+            ? html`<span class="qual">${a.clientClassPrefix}</span>` : ""
+            }${a.client}${a.actor
+              ? html`<span class="by" title="${a.actorTitle}">${a.actor}</span>`
               : ""}</td>
-          <td class="req"><code>${esc(a.request)}</code></td>
-          <td>${esc(a.reason)}</td></tr>`;
-  }).join("");
+          <td class="req"><code>${a.request}</code></td>
+          <td>${a.reason}</td></tr>`;
+  })}`);
 }
 
 export async function refreshAudit() {
@@ -579,7 +579,7 @@ export async function refreshAudit() {
     // filter change (which resets paging) return to the newest rows.
     before: events ? auditCursors[auditPage - 1] : "",
   });
-  let body;
+  let rows, total, filtered, next;
   try {
     // Two calls rather than one with a computed path: the relay allowlist is
     // matched against the literal each `fetch` starts with (see the guard in
@@ -602,7 +602,29 @@ export async function refreshAudit() {
       return;
     }
     if (!res.ok) throw new Error(String(res.status));
-    body = await res.json();
+    const body = await res.json();
+    // {rows, total, filtered, next}. Tolerates a bare array from an older backend, in
+    // which case `total` is undefined and coverageSummary stays silent rather than
+    // guessing — and `filtered` is false, because a backend that ignored the
+    // parameters served an unfiltered list whatever the controls on screen say.
+    rows = Array.isArray(body) ? body : (body && body.rows) || [];
+    total = Array.isArray(body) ? undefined : body && body.total;
+    filtered = !Array.isArray(body) && !!(body && body.filtered);
+    next = Array.isArray(body) ? null : (body && body.next) || null;
+
+    // A page that fell off the end of the record. Reachable without anyone doing
+    // anything wrong: `make audit-prune` deletes rows a cursor still points at. Snap
+    // back to the newest page rather than render an empty table, which would read as
+    // "nothing here" for a record that is not empty. Cannot loop — the retry is at
+    // page 0, where an empty result is the honest answer.
+    if (events && !rows.length && auditPage > 0) {
+      resetPaging();
+      return refreshAudit();
+    }
+    // Inside the try, and before anything below the catch: a render that throws
+    // (`html` refusing a value) is a failed refresh, which keeps the old rows and says
+    // so, rather than an unhandled rejection under rows still shown as current.
+    if (events) renderEvents(rows); else renderGrouped(rows);
   } catch (e) {
     // A failed refresh leaves the previous rows in place and SAYS SO. Silently
     // swallowing this is what let the list sit indefinitely stale while the header
@@ -615,30 +637,10 @@ export async function refreshAudit() {
   auditFailed = false;
   auditRefused = null;
   auditLoaded = true;
-  // {rows, total, filtered, next}. Tolerates a bare array from an older backend, in
-  // which case `total` is undefined and coverageSummary stays silent rather than
-  // guessing — and `filtered` is false, because a backend that ignored the
-  // parameters served an unfiltered list whatever the controls on screen say.
-  const rows = Array.isArray(body) ? body : (body && body.rows) || [];
-  const total = Array.isArray(body) ? undefined : body && body.total;
-  const filtered = !Array.isArray(body) && !!(body && body.filtered);
-  const next = Array.isArray(body) ? null : (body && body.next) || null;
-
-  // A page that fell off the end of the record. Reachable without anyone doing
-  // anything wrong: `make audit-prune` deletes rows a cursor still points at. Snap
-  // back to the newest page rather than render an empty table, which would read as
-  // "nothing here" for a record that is not empty. Cannot loop — the retry is at
-  // page 0, where an empty result is the honest answer.
-  if (events && !rows.length && auditPage > 0) {
-    resetPaging();
-    return refreshAudit();
-  }
-
   auditGroupedTable.hidden = events;
   auditEventsTable.hidden = !events;
   auditModeNote.textContent = events
     ? "· every event, newest first" : "· identical events folded";
-  if (events) renderEvents(rows); else renderGrouped(rows);
 
   renderOutage(outageSummary(rows));
   // The two views answer "was there more?" differently, so only one of them speaks:

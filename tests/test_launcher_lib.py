@@ -296,6 +296,8 @@ class GovernedEgressTests(unittest.TestCase):
                 self.assertEqual(env[var.lower()], url)
         self.assertEqual(env["NO_PROXY"], no_proxy)
         self.assertEqual(env["no_proxy"], no_proxy)
+        # Node's fetch and http/https agents read the proxy variables only with it.
+        self.assertEqual(env["NODE_USE_ENV_PROXY"], "1")
         self.assertEqual(env["EGRESS_PROXY_IP"], _PROXY)
         self.assertEqual(env["EGRESS_PROXY_PORT"], "8080")
         self.assertEqual(env["TOOL_GATEWAY_IP"], _GATEWAY)
@@ -311,6 +313,7 @@ class GovernedEgressTests(unittest.TestCase):
         env = run.env()
         self.assertEqual(env["NO_PROXY"], "localhost,127.0.0.1,::1,egress-proxy")
         self.assertEqual(env["no_proxy"], env["NO_PROXY"])
+        self.assertEqual(env["NODE_USE_ENV_PROXY"], "1")
         self.assertNotIn("TOOL_GATEWAY_IP", env)
         self.assertNotIn("TOOL_GATEWAY_PORT", env)
         self.assertFalse(run.health_checked("tool-gateway"))
@@ -440,7 +443,7 @@ class LauncherProxyEnvTests(unittest.TestCase):
         no_proxy = f"localhost,127.0.0.1,::1,egress-proxy,tool-gateway,{_GATEWAY}"
         for pair in (f"HTTPS_PROXY={url}", f"HTTP_PROXY={url}", f"NO_PROXY={no_proxy}",
                      f"https_proxy={url}", f"http_proxy={url}", f"no_proxy={no_proxy}",
-                     f"EGRESS_PROXY_IP={_PROXY}", "EGRESS_PROXY_PORT=8080",
+                     "NODE_USE_ENV_PROXY=1", f"EGRESS_PROXY_IP={_PROXY}", "EGRESS_PROXY_PORT=8080",
                      f"TOOL_GATEWAY_IP={_GATEWAY}", "TOOL_GATEWAY_PORT=8100"):
             with self.subTest(pair=pair):
                 self.assertIn(pair, passed)

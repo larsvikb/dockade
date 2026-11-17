@@ -784,15 +784,24 @@ def _deny(flow: http.HTTPFlow, refusal: str | None = "policy") -> None:
     can work. Anything not in ``NOT_DECIDED`` is the 403, the relay guard, the port
     gate and a crashed hook included. ``x-proxy-error: blocked-by-allowlist`` is the
     header Claude Code's WebFetch names an egress-proxy block by (undocumented; see
-    proxies/egress/DESIGN.md); no 503 carries it."""
+    proxies/egress/DESIGN.md); no 503 carries it.
+
+    Both shapes carry ``Connection: close``, on which mitmproxy closes the client
+    connection after the response. No client needs a refused connection again, and
+    Node 24's http/https agents need it closed: after a non-200 CONNECT they leave
+    their socket to the proxy open (``lib/https.js`` destroys it only for an error
+    without a status code), so a script that printed the refusal would never exit
+    while mitmproxy kept the connection waiting for a next request (NOTES.md,
+    "Node's fetch reads the proxy variables only with NODE_USE_ENV_PROXY")."""
     if refusal in NOT_DECIDED:
         flow.response = http.Response.make(
             503, f"egress not decided: {NOT_DECIDED[refusal]} - retry later\n".encode(),
-            {"Content-Type": "text/plain", "Retry-After": "60"})
+            {"Content-Type": "text/plain", "Retry-After": "60", "Connection": "close"})
     else:
         flow.response = http.Response.make(
             403, b"egress denied by policy\n",
-            {"Content-Type": "text/plain", "x-proxy-error": "blocked-by-allowlist"})
+            {"Content-Type": "text/plain", "x-proxy-error": "blocked-by-allowlist",
+             "Connection": "close"})
 
 
 def _refuse_tunnel(data: tls.ClientHelloData) -> None:

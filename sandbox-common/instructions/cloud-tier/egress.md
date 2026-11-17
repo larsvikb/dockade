@@ -8,3 +8,7 @@
   proxy, with or without its `egress not decided` body, a refusal shown only as
   refused, or a timeout on a new host is not a no: **retry once after a minute**,
   then say so rather than retry on.
+  Node's `fetch` tunnels an `http://` URL, which the proxy refuses on any external
+  host, so use `https://` or curl. Reach a server of your own at `localhost` or
+  `127.0.0.1`: by the container's hostname or `0.0.0.0`, every client that honours
+  the proxy variables asks the proxy for it, and is refused.

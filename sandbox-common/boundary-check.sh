@@ -182,11 +182,21 @@ if [ -n "${HTTPS_PROXY:-}" ]; then
     # raw tunnel. We require the 403 specifically (not just any failure): if the
     # port gate regressed, the proxy would tunnel to :8443 and curl would fail on
     # the unreachable upstream instead — no 403 — which this correctly flags.
-    portresp="$(curl -sS --connect-timeout 5 -o /dev/null https://api.anthropic.com:8443/ 2>&1 || true)"
-    if printf '%s' "$portresp" | grep -q '403'; then
-        ok "egress proxy refuses non-443 CONNECT (api.anthropic.com:8443 -> 403)"
+    #
+    # The refusal must also carry `Connection: close`, as every refusal from `_deny`
+    # in proxies/egress/addon.py does: without the close, a Node script whose
+    # https.get the proxy refused never exits. This probe needs no rule or card, so
+    # it is where a running proxy shows the header. Only curl's `< ` lines are the
+    # proxy's response (`> ` lines are curl's request); a header's name is matched
+    # in any case, and curl keeps each line's CR.
+    portresp="$(curl -v -sS --connect-timeout 5 -o /dev/null https://api.anthropic.com:8443/ 2>&1 || true)"
+    portlines="$(printf '%s\n' "$portresp" | grep '^< ' || true)"
+    if ! printf '%s\n' "$portlines" | grep -q '^< HTTP/[0-9.]* 403'; then
+        bad "egress proxy did NOT 403 a non-443 CONNECT to api.anthropic.com:8443 (got: $(printf '%s\n' "$portresp" | tail -n 3 | tr -d '\r' | tr '\n' ' '))"
+    elif ! printf '%s\n' "$portlines" | grep -qiE '^< connection:[[:space:]]*close[[:space:]]*$'; then
+        bad "egress proxy 403'd a non-443 CONNECT without Connection: close (got: $(printf '%s\n' "$portlines" | head -n 6 | tr -d '\r' | tr '\n' ' '))"
     else
-        bad "egress proxy did NOT 403 a non-443 CONNECT to api.anthropic.com:8443 (got: ${portresp:-<none>})"
+        ok "egress proxy refuses non-443 CONNECT (api.anthropic.com:8443 -> 403, Connection: close)"
     fi
 
     # SNI / domain-fronting governance: CONNECT an allowlisted host but present a

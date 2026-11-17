@@ -876,6 +876,11 @@ sc_governed_egress() {
         #
         # Setting both cases is the conventional pairing and covers other tools with the
         # same rule. `make consistency` asserts the pairing so it cannot drift back.
+        #
+        # NODE_USE_ENV_PROXY=1 because Node's built-in fetch and http/https agents read
+        # none of these unless it is set: without it a Node fetch resolves the host
+        # itself and dies at DNS, like curl above. It is set here rather than in the
+        # image because it means something only beside the proxy variables.
         SC_PROXY_ENV_ARGS=(
             -e "HTTPS_PROXY=$proxy_url"
             -e "HTTP_PROXY=$proxy_url"
@@ -883,6 +888,7 @@ sc_governed_egress() {
             -e "https_proxy=$proxy_url"
             -e "http_proxy=$proxy_url"
             -e "no_proxy=$no_proxy_list"
+            -e "NODE_USE_ENV_PROXY=1"
             -e "EGRESS_PROXY_IP=$proxy_ip"
             -e "EGRESS_PROXY_PORT=$proxy_port"
         )

@@ -220,7 +220,8 @@ page's carries its pending count, so a background tab shows it in the tab strip.
 
 **Agent prose is spelled where it hides, and only there.** A task's title, body,
 notes and claim are prose, so they keep their line breaks and tabs and show visible
-non-ASCII as written; a dash or an accent is ordinary there, and spelling it would
+non-ASCII as written. The body, the plan, the decisions and the notes are drawn as
+markdown too (below). A dash or an accent is ordinary in prose, and spelling it would
 bury the one that matters. A character that renders as nothing or reorders the text
 around it (`Cf`, `Cc` but the line break and tab, `Zl`, `Zp`, and Unicode's
 default-ignorable code points, variation selectors among them) is spelled `\uXXXX`
@@ -230,10 +231,36 @@ what is in it rather than what the browser draws. Between the approval page's tw
 the payload's, which notes non-ASCII, and the pin's, which spells it all
 (`control-plane-ui/DESIGN.md`), for that reason.
 
+**Agent markdown is drawn, never hidden.** Agents write markdown, so the detail draws
+the body, the plan's parts but its footprint, each decision's question, why and option
+meanings, an answer's question, an option's label inline only, and the notes in the
+timeline as a subset: ATX headings, paragraphs, bullet and numbered items, emphasis,
+code spans and fenced blocks (`markdown.js`). Only that subset, because the operator
+approves what they read: a link or an image can show one thing and point at another, or
+fetch a URL; raw HTML and its comments can hide text or draw markup; so these and every
+other construct are drawn as typed, never dropped, and the page builds each element
+itself from text (`markdownBlock` in `tasks.js`), every run spelled as above. What the
+drawn form leaves out is only ASCII delimiters, a heading's hashes, a bullet, emphasis
+and backticks, a fence's run: line ends, indentation and a numbered item's number stay,
+no list draws a browser marker, a bullet item shows a disc where its bullet was, and
+emphasis opens and closes only beside space or punctuation, stricter than CommonMark: a
+run that could both open and close does neither, and none opens before a `.` or a `/` or
+closes after a `/`, so a quoted `"*"`, a path or a glob outside backticks stays as
+written. What a session reads is the source, and a copy from the drawn form lacks the
+delimiters, so one switch atop the detail shows every such field as typed and back; each
+field holds both forms and a class on the detail picks one, so the switch redraws
+nothing. The title, the footprint, a claim's progress, history values, the operator's
+own "other" text, the spec form's preview, a plan's diff view and the flagged list stay
+as typed, as does the export (`task-registry/export.py`). The tokenizer is lossless and
+draws nothing, so the spec editor's highlighter can share it, and linear, since an
+agent's text is its input; it nests spans `NEST_MAX` deep at most, since the browser's
+layout costs the square of the depth.
+
 **The plan sits under the body, part by part.** Approving a refined task approves its
 body and plan together (`task-registry/DESIGN.md`, "Plans"), so the detail shows both,
 the plan in the order `submit_plan` takes its parts, each as prose spelled like the
-body. A missing or superseded plan is read against the task's state (`planNotice`):
+body, its parts but the footprint as markdown. A missing or superseded plan is read
+against the task's state (`planNotice`):
 only a proposed task is refined by an agent, so only there does the page say a plan is
 coming; past it, the operator moved the task on without one. A superseded plan is never
 something to approve, so it carries a warning. Every plan the task had is read with it,
@@ -316,16 +343,17 @@ own name, allowlist, address and network. `tests/test_tasks_ui_js.py` holds the 
 every structural check the approval page has (`PageChecks`: markup and script, the
 module list against the Dockerfile and the imports, fetches against the relay, free
 names), the writes' methods against the relay, the pure halves of `tasks.js`,
-`moves.js` and `diff.js` under node, the approve's rule and body against the
-registry's own (`ApproveRuleTests`), the edit's bodies on a scratch store
+`moves.js`, `diff.js` and `markdown.js` under node, the approve's rule and body against
+the registry's own (`ApproveRuleTests`), the edit's bodies on a scratch store
 (`EditRuleTests`), and, from source, how the page gates the registry,
 sends its writes, draws agent text and decisions, and fills the line atop the detail;
 `tests/test_task_registry_inbox.py` holds what the inbox counts, and
 `tests/test_task_registry_operator.py` that each note is on the history row that
 posted it. `make ui-test` runs `tests/ui-harness/tasks.test.js` in a browser against
 expected values, beside the approval page's: opening a task, each way back, a task URL
-loaded or reloaded, a hash naming no task, and leaving with an edit open. Unlike the
-approval page's, these read layout boxes and scroll offsets, since where the list and
-the task are is what they hold; still never pixels.
+loaded or reloaded, a hash naming no task, leaving with an edit open, and agent
+markdown drawn and shown as typed. Unlike the approval page's, these read layout boxes
+and scroll offsets, since where the list and the task are is what they hold; still never
+pixels.
 `make ui-diff UI_DIFF_PAGE=tasks` runs `tests/ui-harness/tasks-scenario.js` on the base
 and on the branch.

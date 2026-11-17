@@ -417,6 +417,8 @@ dockade/
     moves.js                #   the page's writes: what each sends, which a task or note
                             #   offers, and what a lost answer came to
     diff.js                 #   what changed between two plans, word by word
+    markdown.js             #   agent markdown as tokens: the subset the page draws, the
+                            #   rest kept as typed
     index.html              #   static shell + styles
     DESIGN.md               #   the relay's table, the not-running state, how prose is spelled
     requirements.txt        #   pinned deps, held equal to the approval UI's

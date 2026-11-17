@@ -1888,6 +1888,418 @@ class ChangeTests(unittest.TestCase):
                 self.assertIsNone(u[key])
 
 
+_MARKDOWN_PROBE = r"""
+import { pathToFileURL } from "node:url";
+const md = await import(pathToFileURL(`${process.env.DOCKADE_UI_DIR}/markdown.js`).href);
+const cases = JSON.parse(process.env.DOCKADE_MD_CASES);
+const parsed = s => md.tokenize(s).map(b => [b.kind, b.level ?? b.ordered ?? null,
+                                             b.tokens.map(t => [t.kind, t.text])]);
+const joined = s => md.tokenize(s).flatMap(b => b.tokens).map(t => t.text).join("");
+// Whether every emphasis and code span a block opens it closes, innermost first, in it:
+// what the page's renderer counts on to nest its elements.
+const nests = s => md.tokenize(s).every(b => {
+  const open = [];
+  for (const t of b.tokens) {
+    if (t.kind.endsWith("-open")) open.push(t.kind.slice(0, -5));
+    else if (t.kind.endsWith("-close") && open.pop() !== t.kind.slice(0, -6)) return false;
+  }
+  return open.length === 0;
+});
+// Strings of the characters the tokenizer acts on, from a fixed seed, so a run is the
+// same run every time.
+let seed = 171;
+const next = () => (seed = (seed * 1103515245 + 12345) % 2147483648);
+const ALPHABET = ["*", "_", "**", "`", "``", "\\", "#", " ", "\t", "\n", "\r\n", "\r",
+                  "-", "1.", "~~~", "```", "<", ">", "[", "](", ")", "!", "&", ";",
+                  "a", "b", "(", "\u202e", "\u2028", "<!--", "-->", ".", "|"];
+const fuzz = Array.from({length: 3000}, () => Array.from({length: next() % 40},
+  () => ALPHABET[next() % ALPHABET.length]).join(""));
+// Pathological shapes, each 10^5 characters or so: what a hostile body could hold.
+const N = 100000;
+const rep = (s, n) => s.repeat(Math.ceil(n / s.length)).slice(0, n);
+const shapes = {
+  openers_then_other_closers: rep("(*", N / 2) + rep("_)", N / 2),
+  alternating: rep("*a _a ", N),
+  strong_runs: rep("a**b", N),
+  rising_backticks: Array.from({length: 446}, (_, k) => "`".repeat(k + 1)).join(" "),
+  deep_nesting: rep("*a ", N / 2) + rep("a* ", N / 2),
+  unclosed_comments: "x " + rep("<!-- ", N),
+  unclosed_tags: "x " + rep("<a ", N),
+  unclosed_links: rep("[a](b \"", N),
+  items: rep("- a\n", N),
+};
+const timing = {};
+for (const [name, s] of Object.entries(shapes)) {
+  const start = performance.now();
+  const ok = joined(s) === s;
+  timing[name] = { ms: performance.now() - start, lossless: ok, length: s.length };
+}
+console.log(JSON.stringify({
+  parsed: Object.fromEntries(Object.entries(cases).map(([k, s]) => [k, parsed(s)])),
+  lossless: Object.values(cases).concat(fuzz).filter(s => joined(s) !== s),
+  nested: Object.values(cases).concat(fuzz).filter(s => !nests(s)),
+  fuzzed: fuzz.length,
+  missing: [md.tokenize(undefined), md.tokenize(null), md.tokenize(7)],
+  deepest: md.tokenize(shapes.deep_nesting)[0].tokens.filter(t => t.kind === "em-open")
+    .length,
+  timing,
+}));
+"""
+
+# Texts the tokenizer reads, by name; each case's expected blocks are in the test that
+# names it, as [kind, level or ordered, tokens], each token [kind, text].
+_MD = {
+    "heading": "# Title\n",
+    "heading_six": "###### Six ##\n",
+    "heading_tab": "##\tTab",
+    "heading_empty": "#",
+    "heading_crlf": "a\r\n# h\r\n",
+    "heading_hidden": "## T\u202ex\u200b\n",
+    "not_heading_hashtag": "#hashtag",
+    "not_heading_seven": "####### seven",
+    "not_heading_lone_cr": "x\r# no",
+    "not_heading_u2028": "x\u2028# no",
+    "paragraphs": "a\nb\n\nc",
+    "bullets": "- a\n* b\n+ c\n",
+    "bullet_tab": "-\tx",
+    "nested": "- a\n  - b\n    - c",
+    "numbered": "1. a\n2) b\n5. c\n",
+    "item_continued": "- a\n  more",
+    "emphasis": "*a* _b_ **c** __d__",
+    "code_span": "`a` ``b`c`` `\u2066`",
+    "lone_backtick": "a ` b",
+    "fence": "```py x\u200b\ncode *a*\n```\nafter",
+    "fence_tilde": "~~~\nx\n~~~~\n",
+    "fence_unclosed": "```\nx\n\n# y\n",
+    "fence_crlf": "```\r\nx\r\n```\r\n",
+    "fence_backtick_info": "``` a`b",
+    # Left as source: each is one token holding its text.
+    "src_link": "a [l](http://x)",
+    "src_image": "a ![i](http://y)",
+    "src_html": "a <img src=x>",
+    "src_close_tag": "a </div>",
+    "src_comment": "a <!-- *c* -->",
+    "src_comment_lines": "a <!--\n*b*\n--> c",
+    "src_entity": "&amp; &#x41;",
+    "src_escape": "a \\*",
+    "src_autolink": "a <http://a.b/*x*>",
+    "src_email": "a <1a@b.c>",
+    "src_comment_gt": "a <!-- x > *y* -->",
+    "src_processing": "a <?x *y* ?>",
+    "src_reference": "a [a][b]",
+    "src_quote": "> q",
+    "src_table": "| t |",
+    "src_rule": "---",
+    "src_rule_stars": "* * *",
+    "src_setext": "===",
+    "src_indented": "    code",
+    "src_indented_tab": "\tcode",
+    "src_html_block": "<div>",
+    # Emphasis that renders, and text that stays as written.
+    "em_parens": "(**x**)",
+    "em_period": "**x**.",
+    "em_init": "the __init__ file",
+    "em_quotes": "\"*q*\"",
+    "text_task_notes": "task_notes",
+    "text_init_py": "__init__.py",
+    "text_glob_path": "src/*/x*",
+    "text_product": "2*3*4",
+    "text_glob": "*.py",
+    "text_two_globs": "*.py and *.js",
+    "text_spaced": "a * b * c",
+    # A run that could both open and close does neither; a glob's or a path's run
+    # neither opens before a `.` or `/` nor closes after a `/`.
+    "text_quoted_globs": "the '**' glob and the '*' one",
+    "text_quoted_runs": "matches \"*\" and \"**\" here",
+    "text_quoted_pair": "a \"*\" b \"*\" c",
+    "text_bracketed": "(*) and [*]",
+    "text_glob_dir": "Edit the *.py files under src/*",
+    "text_glob_list": "lint *.sh and scripts/*, not tests/*",
+    # Each of those rules alone, beside a run that would pair with it.
+    "text_both_then_closer": "'*' and b*",
+    "text_opener_then_both": "*a and '*'",
+    "text_dot_then_closer": "*.py and x*",
+    "text_slash_then_closer": "*/x and y*",
+    "text_opener_then_slash": "*a in src/*",
+    "em_slash_inside": "*a/b*",
+    "text_escaped_closer": "*a\\*",
+    # Each character a run opens after, or closes before.
+    "em_open_after": "[*a*] '*b*' \"*c*\" (*d*)",
+    "em_close_before": "*a*, *b*; *c*: *d*! *e*? (*f*) [*g*] \"*h*\" '*i*' *j*.",
+    "em_period_space": "**x**. y",
+    "text_period_word": "**x**.y",
+    "text_open_before_space": "x * a*",
+    "text_close_after_space": "*a * b",
+    "text_trailing_backslash": "a\\",
+    "text_backslash_letter": "a \\q",
+    # A closer takes the nearest opener of its own character, and what lies between
+    # drops out; a run that opens twice opens the outer first.
+    "em_other_between": "*a _b c*",
+    "em_crossed": "*a _b* c_",
+    "em_strong_em": "***a***",
+    # An item: a bullet indented four columns opens one only in a list.
+    "indented_bullet": "    - x",
+    "list_left": "- a\n\nb\n\n    - c",
+    "list_kept": "- a\n\n  b\n\n    - c",
+    "list_paragraph": "- a\n\n    more",
+    "fence_kept_open": "````\nx\n~~~\n```\n```` y\n````\nz",
+    "fence_other_char": "```\n~~~\n```",
+    # Nested as deep as markdown.js draws, and one deeper.
+    "nest_16": "*a " * 16 + "a* " * 16,
+    "nest_17": "*a " * 17 + "a* " * 17,
+}
+
+
+@unittest.skipIf(not _NODE and not _STRICT,
+                 "node is not installed — skipping app.js unit tests")
+class MarkdownTests(unittest.TestCase):
+    """``markdown.js``, the tokenizer the detail draws agent markdown from and the spec
+    editor's highlighter may share: lossless, the subset and no more, emphasis stricter
+    than CommonMark's so paths and globs stay as written, and linear on hostile text."""
+
+    probe: dict
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        proc = subprocess.run(  # noqa: S603 (absolute path, fixed args, as _probe)
+            [_NODE, "--input-type=module", "-e", _MARKDOWN_PROBE],
+            env={**os.environ, "DOCKADE_UI_DIR": str(_served_dir(TASKS_DIR)),
+                 "DOCKADE_MD_CASES": json.dumps(_MD)},
+            capture_output=True, text=True, timeout=120, check=False)
+        if proc.returncode != 0:
+            raise AssertionError("importing markdown.js under node failed:\n" + proc.stderr)
+        cls.probe = json.loads(proc.stdout)
+
+    def blocks(self, name: str) -> list:
+        return self.probe["parsed"][name]
+
+    def test_the_tokens_joined_are_the_text_exactly(self):
+        self.assertGreater(self.probe["fuzzed"], 1000)
+        self.assertEqual(self.probe["lossless"], [])
+        self.assertEqual(self.probe["missing"], [[], [], []])
+
+    def test_every_span_opened_is_closed_in_its_block_innermost_first(self):
+        self.assertEqual(self.probe["nested"], [])
+
+    def test_an_atx_heading_drops_its_hashes_and_one_space_or_tab(self):
+        self.assertEqual(self.blocks("heading"), [
+            ["heading", 1, [["heading-marker", "# "], ["text", "Title"], ["eol", "\n"]]]])
+        # Closing hashes are text.
+        self.assertEqual(self.blocks("heading_six"), [
+            ["heading", 6, [["heading-marker", "###### "], ["text", "Six ##"],
+                            ["eol", "\n"]]]])
+        self.assertEqual(self.blocks("heading_tab"), [
+            ["heading", 2, [["heading-marker", "##\t"], ["text", "Tab"]]]])
+        self.assertEqual(self.blocks("heading_empty"), [
+            ["heading", 1, [["heading-marker", "#"]]]])
+        self.assertEqual(self.blocks("heading_crlf"), [
+            ["paragraph", None, [["text", "a"], ["eol", "\r\n"]]],
+            ["heading", 1, [["heading-marker", "# "], ["text", "h"], ["eol", "\r\n"]]]])
+        self.assertEqual(self.blocks("heading_hidden"), [
+            ["heading", 2, [["heading-marker", "## "], ["text", "T\u202ex\u200b"],
+                            ["eol", "\n"]]]])
+
+    def test_only_lf_or_crlf_ends_a_line(self):
+        for name in ("not_heading_hashtag", "not_heading_seven", "not_heading_lone_cr",
+                     "not_heading_u2028"):
+            with self.subTest(case=name):
+                self.assertEqual(self.blocks(name),
+                                 [["paragraph", None, [["text", _MD[name]]]]])
+
+    def test_paragraphs_split_at_blank_lines(self):
+        self.assertEqual(self.blocks("paragraphs"), [
+            ["paragraph", None, [["text", "a"], ["eol", "\n"], ["text", "b"],
+                                 ["eol", "\n"]]],
+            ["blank", None, [["eol", "\n"]]],
+            ["paragraph", None, [["text", "c"]]]])
+
+    def test_items_drop_a_bullet_and_one_space_and_keep_a_number(self):
+        self.assertEqual(self.blocks("bullets"), [
+            ["item", False, [["bullet", "- "], ["text", "a"], ["eol", "\n"]]],
+            ["item", False, [["bullet", "* "], ["text", "b"], ["eol", "\n"]]],
+            ["item", False, [["bullet", "+ "], ["text", "c"], ["eol", "\n"]]]])
+        self.assertEqual(self.blocks("bullet_tab"), [
+            ["item", False, [["bullet", "-\t"], ["text", "x"]]]])
+        self.assertEqual(self.blocks("numbered"), [
+            ["item", True, [["number", "1."], ["text", " a"], ["eol", "\n"]]],
+            ["item", True, [["number", "2)"], ["text", " b"], ["eol", "\n"]]],
+            ["item", True, [["number", "5."], ["text", " c"], ["eol", "\n"]]]])
+        self.assertEqual(self.blocks("item_continued"), [
+            ["item", False, [["bullet", "- "], ["text", "a"], ["eol", "\n"],
+                             ["text", "  more"]]]])
+
+    def test_items_nest_by_their_indentation_which_is_kept(self):
+        self.assertEqual(self.blocks("nested"), [
+            ["item", False, [["bullet", "- "], ["text", "a"], ["eol", "\n"]]],
+            ["item", False, [["indent", "  "], ["bullet", "- "], ["text", "b"],
+                             ["eol", "\n"]]],
+            ["item", False, [["indent", "    "], ["bullet", "- "], ["text", "c"]]]])
+
+    def test_emphasis_strong_and_code_spans(self):
+        self.assertEqual(self.blocks("emphasis"), [["paragraph", None, [
+            ["em-open", "*"], ["text", "a"], ["em-close", "*"], ["text", " "],
+            ["em-open", "_"], ["text", "b"], ["em-close", "_"], ["text", " "],
+            ["strong-open", "**"], ["text", "c"], ["strong-close", "**"], ["text", " "],
+            ["strong-open", "__"], ["text", "d"], ["strong-close", "__"]]]])
+        # A span closes on a run of its own length only, and a hidden character in it
+        # is kept for the page to spell.
+        self.assertEqual(self.blocks("code_span"), [["paragraph", None, [
+            ["code-open", "`"], ["code", "a"], ["code-close", "`"], ["text", " "],
+            ["code-open", "``"], ["code", "b`c"], ["code-close", "``"], ["text", " "],
+            ["code-open", "`"], ["code", "\u2066"], ["code-close", "`"]]]])
+        self.assertEqual(self.blocks("lone_backtick"),
+                         [["paragraph", None, [["text", "a ` b"]]]])
+
+    def test_a_fenced_block_keeps_its_info_string_and_runs_to_its_close(self):
+        self.assertEqual(self.blocks("fence"), [
+            ["code", None, [["fence", "```"], ["info", "py x\u200b"], ["eol", "\n"],
+                            ["code", "code *a*"], ["eol", "\n"], ["fence", "```"],
+                            ["eol", "\n"]]],
+            ["paragraph", None, [["text", "after"]]]])
+        # Closed by a run as long or longer, of its own character.
+        self.assertEqual(self.blocks("fence_tilde"), [
+            ["code", None, [["fence", "~~~"], ["eol", "\n"], ["code", "x"], ["eol", "\n"],
+                            ["fence", "~~~~"], ["eol", "\n"]]]])
+        # Unclosed, it runs to the end, a blank line and a heading included.
+        self.assertEqual(self.blocks("fence_unclosed"), [
+            ["code", None, [["fence", "```"], ["eol", "\n"], ["code", "x"], ["eol", "\n"],
+                            ["eol", "\n"], ["code", "# y"], ["eol", "\n"]]]])
+        self.assertEqual(self.blocks("fence_crlf"), [
+            ["code", None, [["fence", "```"], ["eol", "\r\n"], ["code", "x"],
+                            ["eol", "\r\n"], ["fence", "```"], ["eol", "\r\n"]]]])
+        # A backtick fence whose info string holds a backtick is no fence.
+        self.assertEqual(self.blocks("fence_backtick_info")[0][0], "paragraph")
+
+    def test_every_construct_outside_the_subset_is_source_holding_its_text(self):
+        for name in ("src_link", "src_image", "src_html", "src_escape", "src_autolink",
+                     "src_email", "src_reference", "src_comment_gt", "src_processing"):
+            with self.subTest(case=name):
+                self.assertEqual(self.blocks(name), [["paragraph", None, [
+                    ["text", "a "], ["source", _MD[name][2:]]]]])
+        self.assertEqual(self.blocks("src_entity"), [["paragraph", None, [
+            ["source", "&amp;"], ["text", " "], ["source", "&#x41;"]]]])
+        # Nothing inside an HTML comment or an autolink is read, over lines too.
+        self.assertEqual(self.blocks("src_comment"), [["paragraph", None, [
+            ["text", "a "], ["source", "<!-- *c* -->"]]]])
+        self.assertEqual(self.blocks("src_comment_lines"), [["paragraph", None, [
+            ["text", "a "], ["source", "<!--\n*b*\n-->"], ["text", " c"]]]])
+        self.assertEqual(self.blocks("src_close_tag"), [["paragraph", None, [
+            ["text", "a "], ["source", "</div>"]]]])
+        for name in ("src_quote", "src_table", "src_rule", "src_rule_stars", "src_setext",
+                     "src_indented", "src_indented_tab", "src_html_block"):
+            with self.subTest(case=name):
+                self.assertEqual(self.blocks(name),
+                                 [["source", None, [["source", _MD[name]]]]])
+
+    def test_emphasis_opens_and_closes_only_beside_space_or_punctuation(self):
+        self.assertEqual(self.blocks("em_parens"), [["paragraph", None, [
+            ["text", "("], ["strong-open", "**"], ["text", "x"], ["strong-close", "**"],
+            ["text", ")"]]]])
+        self.assertEqual(self.blocks("em_period"), [["paragraph", None, [
+            ["strong-open", "**"], ["text", "x"], ["strong-close", "**"], ["text", "."]]]])
+        # As CommonMark reads it too: a word in the open is a word.
+        self.assertEqual(self.blocks("em_init"), [["paragraph", None, [
+            ["text", "the "], ["strong-open", "__"], ["text", "init"],
+            ["strong-close", "__"], ["text", " file"]]]])
+        # A slash inside a span is no path's end.
+        self.assertEqual(self.blocks("em_slash_inside"), [["paragraph", None, [
+            ["em-open", "*"], ["text", "a/b"], ["em-close", "*"]]]])
+        self.assertEqual(self.blocks("em_quotes"), [["paragraph", None, [
+            ["text", "\""], ["em-open", "*"], ["text", "q"], ["em-close", "*"],
+            ["text", "\""]]]])
+
+    def test_each_character_beside_a_run_is_one_it_opens_after_or_closes_before(self):
+        def pairs(name):
+            kinds = [k for k, _ in self.blocks(name)[0][2]]
+            return kinds.count("em-open"), kinds.count("em-close")
+        self.assertEqual(pairs("em_open_after"), (4, 4))
+        self.assertEqual(pairs("em_close_before"), (10, 10))
+        self.assertEqual(self.blocks("em_period_space"), [["paragraph", None, [
+            ["strong-open", "**"], ["text", "x"], ["strong-close", "**"], ["text", ". y"]]]])
+        for name in ("text_period_word", "text_open_before_space", "text_close_after_space",
+                     "text_trailing_backslash", "text_backslash_letter"):
+            with self.subTest(case=name):
+                self.assertEqual(self.blocks(name),
+                                 [["paragraph", None, [["text", _MD[name]]]]])
+
+    def test_a_closer_takes_its_own_characters_nearest_opener_nested(self):
+        self.assertEqual(self.blocks("em_other_between"), [["paragraph", None, [
+            ["em-open", "*"], ["text", "a _b c"], ["em-close", "*"]]]])
+        self.assertEqual(self.blocks("em_crossed"), [["paragraph", None, [
+            ["em-open", "*"], ["text", "a _b"], ["em-close", "*"], ["text", " c_"]]]])
+        self.assertEqual(self.blocks("em_strong_em"), [["paragraph", None, [
+            ["em-open", "*"], ["strong-open", "**"], ["text", "a"], ["strong-close", "**"],
+            ["em-close", "*"]]]])
+
+    def test_an_indented_bullet_is_an_item_only_in_a_list(self):
+        self.assertEqual(self.blocks("indented_bullet"),
+                         [["source", None, [["source", "    - x"]]]])
+        # A paragraph at the margin leaves the list; one indented stays in it.
+        self.assertEqual([b[0] for b in self.blocks("list_left")],
+                         ["item", "blank", "paragraph", "blank", "source"])
+        self.assertEqual([b[0] for b in self.blocks("list_kept")],
+                         ["item", "blank", "paragraph", "blank", "item"])
+        self.assertEqual(self.blocks("list_paragraph"), [
+            ["item", False, [["bullet", "- "], ["text", "a"], ["eol", "\n"]]],
+            ["blank", None, [["eol", "\n"]]],
+            ["paragraph", None, [["text", "    more"]]]])
+
+    def test_a_fence_closes_on_its_own_character_as_long_or_longer_and_alone(self):
+        self.assertEqual(self.blocks("fence_kept_open"), [
+            ["code", None, [["fence", "````"], ["eol", "\n"], ["code", "x"], ["eol", "\n"],
+                            ["code", "~~~"], ["eol", "\n"], ["code", "```"], ["eol", "\n"],
+                            ["code", "```` y"], ["eol", "\n"], ["fence", "````"],
+                            ["eol", "\n"]]],
+            ["paragraph", None, [["text", "z"]]]])
+        self.assertEqual(self.blocks("fence_other_char"), [
+            ["code", None, [["fence", "```"], ["eol", "\n"], ["code", "~~~"], ["eol", "\n"],
+                            ["fence", "```"]]]])
+
+    def test_paths_globs_and_arithmetic_stay_as_written(self):
+        for name in ("text_task_notes", "text_init_py", "text_glob_path", "text_product",
+                     "text_glob", "text_two_globs", "text_spaced", "text_quoted_globs",
+                     "text_quoted_runs", "text_quoted_pair", "text_bracketed",
+                     "text_glob_dir", "text_glob_list", "text_both_then_closer",
+                     "text_opener_then_both", "text_dot_then_closer",
+                     "text_slash_then_closer", "text_opener_then_slash"):
+            with self.subTest(case=name):
+                self.assertEqual(self.blocks(name),
+                                 [["paragraph", None, [["text", _MD[name]]]]])
+        # An escaped delimiter is source, and closes nothing.
+        self.assertEqual(self.blocks("text_escaped_closer"), [["paragraph", None, [
+            ["text", "*a"], ["source", "\\*"]]]])
+
+    def test_hostile_shapes_take_linear_time(self):
+        # Linear is a tenth of a second or so; a search for an opener with no floor
+        # takes seconds on the first shape.
+        for name, t in self.probe["timing"].items():
+            with self.subTest(shape=name):
+                self.assertTrue(t["lossless"])
+                self.assertGreater(t["length"], 99_000)
+                self.assertLess(t["ms"], 1000)
+        # Deep nesting is matched, and drawn NEST_MAX deep.
+        self.assertEqual(self.probe["deepest"], 16)
+
+    def test_spans_nest_sixteen_deep_and_the_ones_inside_are_text(self):
+        # A body at the registry's cap nests about 8000 deep, which Chromium took 0.8 s
+        # to lay out (tasks-ui/NOTES.md, "Nested spans cost the square of their depth").
+        for name, depth in (("nest_16", 16), ("nest_17", 17)):
+            with self.subTest(case=name):
+                tokens = self.blocks(name)[0][2]
+                kinds = [k for k, _ in tokens]
+                self.assertEqual((kinds.count("em-open"), kinds.count("em-close")), (16, 16))
+                stars = "".join(t for k, t in tokens if k == "text").count("*")
+                self.assertEqual(stars, 2 * (depth - 16))
+                # The outermost are the ones kept.
+                self.assertEqual(tokens[0], ["em-open", "*"])
+                self.assertEqual(tokens[-2], ["em-close", "*"])
+
+    def test_markdown_js_imports_nothing_and_draws_nothing(self):
+        src = (TASKS_DIR / "markdown.js").read_text()
+        self.assertNotRegex(src, r"^\s*import\b")
+        self.assertNotRegex(_code(src), r"\b(?:document|window)\b")
+
+
 class TaskTimelineSourceTests(unittest.TestCase):
     """The detail's timeline and the line atop it that says the task changed, from
     source: a browser is the only thing that runs them."""
@@ -2456,7 +2868,8 @@ class TaskRenderingSourceTests(unittest.TestCase):
                        r"|\b(?:o|option)\.(?:label|meaning)\b"
                        r"|\banswer\.(?:question|other|author)\b")
     # `hiddenIn` counts for a warning and draws nothing.
-    SPELT = ("spellHidden(", "proseBlock(", "authorCell(", "claimText(", "hiddenIn(")
+    SPELT = ("spellHidden(", "proseBlock(", "markdownBlock(", "authorCell(", "claimText(",
+             "hiddenIn(")
 
     # Every module the page is made of, so a helper moving to another module does not
     # move out of these guards' sight.
@@ -2538,6 +2951,74 @@ class TaskRenderingSourceTests(unittest.TestCase):
     def test_a_history_value_is_spelled_whatever_its_type(self):
         self.assertIn('typeof value === "string" ? proseBlock(value)', self.TASKS)
         self.assertIn("spellHidden(JSON.stringify(value)).text", self.TASKS)
+
+    def test_markdown_is_drawn_as_spelled_text_beside_its_source(self):
+        block = _function(self.TASKS, "markdownBlock")
+        # The source form and the note counting hidden characters are proseBlock's.
+        self.assertIn("const wrap = proseBlock(text);", block)
+        self.assertIn('for (const block of tokenize(typeof text === "string" ? text : ""))',
+                      block)
+        self.assertIn("typed.textContent = spellHidden(block.tokens.map(t => t.text)"
+                      '.join("")).text;', block)
+        self.assertIn("wrap.insertBefore(rendered, source);", block)
+        runs = _function(self.TASKS, "markdownRuns")
+        self.assertIn("top.appendChild(document.createTextNode("
+                      "spellHidden(token.text).text));", runs)
+        self.assertIn("info.textContent = spellHidden(token.text).text;", runs)
+        # Every element either builds is one it names, never one from the text.
+        made = re.findall(r"document\.createElement\(([^)]*)\)", block + runs)
+        self.assertEqual(sorted(set(made)), sorted({
+            "tag", '"li"', 'inline ? "span" : "div"', '"div"',
+            "OPENS[token.kind]", '"span"'}))
+        self.assertIn('const OPENS = { "em-open": "em", "strong-open": "strong", '
+                      '"code-open": "code" };', self.TASKS)
+        self.assertIn('const BLOCK_TAGS = { paragraph: "p", code: "pre", blank: "div", '
+                      'source: "div" };', self.TASKS)
+        self.assertIn('const INLINE_TAGS = { paragraph: "span", blank: "span" };',
+                      self.TASKS)
+        self.assertIn("const tag = block.kind === \"heading\" && !inline "
+                      "? `h${block.level}` : tags[block.kind];", block)
+        # It drops only the ASCII delimiters the plan lists.
+        dropped = re.search(r"const DROPPED = new Set\(\[(.*?)\]\);", self.TASKS, re.S)
+        self.assertEqual(sorted(re.findall(r'"([^"]+)"', dropped.group(1))), sorted([
+            "heading-marker", "bullet", "em-open", "em-close", "strong-open",
+            "strong-close", "code-open", "code-close", "fence"]))
+
+    def test_the_detail_draws_its_agent_prose_as_markdown(self):
+        self.assertIn("const body = markdownBlock(task.body);",
+                      _function(self.TASKS, "drawTask"))
+        self.assertIn('part.key === "footprint" ? proseBlock(part.text)\n'
+                      "      : markdownBlock(part.text)", _function(self.TASKS, "planBlock"))
+        self.assertIn("td.appendChild(markdownBlock(entry.note.text));",
+                      _function(self.TASKS, "renderTimeline"))
+
+    def test_what_is_kept_as_drawn_before_has_no_markdown(self):
+        # Outside the detail, or not an agent's prose: the flagged list, a plan's diff,
+        # the operator's "other" text, the spec form and its preview.
+        for name in ("flaggedRow", "diffLine", "markOther", "specForm", "specControl"):
+            with self.subTest(function=name):
+                self.assertNotIn("markdownBlock(", _function(self.TASKS, name))
+        draw = _function(self.TASKS, "drawTask")
+        self.assertIn('line("progress", proseBlock(task.claim.progress))', draw)
+        self.assertIn("line(\"other\", proseBlock(answer.other))",
+                      _function(self.TASKS, "answerBlock"))
+        self.assertIn('typeof value === "string" ? proseBlock(value)',
+                      _function(self.TASKS, "renderTimeline"))
+        self.assertEqual(self.TASKS.count("markdownBlock("), 10)
+
+    def test_one_switch_shows_the_source_and_redraws_nothing(self):
+        toggle = _function(self.TASKS, "toggleSource")
+        self.assertIn('taskDetail.classList.toggle("source-shown", showSource);', toggle)
+        self.assertNotIn("drawTask(", toggle)
+        # In the title's row, before the edit's control, which comes and goes.
+        draw = _function(self.TASKS, "drawTask")
+        self.assertLess(draw.index('head.append(" ", sourceToggle());'),
+                        draw.index("if (!editing) {\n    const edit"))
+        html = (TASKS_DIR / "index.html").read_text()
+        self.assertIn("#task-detail:not(.source-shown) .md-source,\n"
+                      "  #task-detail.source-shown .md { display: none; }", html)
+        self.assertRegex(html, r"button\.source-toggle \{ width: [0-9.]+em; "
+                               r"white-space: nowrap;")
 
 
 _APPROVE_PROBE = r"""
@@ -2755,12 +3236,16 @@ class TaskDecisionSourceTests(unittest.TestCase):
 
     def test_a_decision_and_an_answer_are_spelled_and_drawn_whole(self):
         group = _function(self.TASKS, "decisionGroup")
-        for drawn in ("proseBlock(decision.question)", "proseBlock(decision.why)",
-                      "proseBlock(option.label)", "proseBlock(option.meaning)"):
+        # Drawn as markdown, a label inline only, beside its source form
+        # (`markdownBlock`); the operator's own "other" text as written.
+        for drawn in ("markdownBlock(decision.question)", "markdownBlock(decision.why)",
+                      "markdownBlock(option.label, { inline: true })",
+                      "markdownBlock(option.meaning)"):
             with self.subTest(field=drawn):
                 self.assertIn(drawn, group)
         answer = _function(self.TASKS, "answerBlock")
-        for drawn in ("proseBlock(answer.question)", "proseBlock(option.label)",
+        for drawn in ("markdownBlock(answer.question)",
+                      "markdownBlock(option.label, { inline: true })",
                       "proseBlock(answer.other)", "spellHidden(answer.author).text"):
             with self.subTest(field=drawn):
                 self.assertIn(drawn, answer)

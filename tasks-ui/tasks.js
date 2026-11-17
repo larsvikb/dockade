@@ -13,13 +13,16 @@
  *
  * Every string a task carries was written by an agent, or by the operator for agents
  * to read, so it is set as textContent, and a character that renders as nothing or
- * reorders the text around it is spelled out where it sits (`spellHidden`).
+ * reorders the text around it is spelled out where it sits (`spellHidden`). Agent
+ * markdown is drawn as elements built here from markdown.js's tokens (`markdownBlock`),
+ * never parsed as markup.
  *
  * No DOM at import, so the unit tests import this file under node
  * (tests/test_tasks_ui_js.py).
  */
 import { lineDiff, wordDiff } from "./diff.js";
 import { escapeNonAscii, isHidden, NON_ASCII_RE } from "./escape.js";
+import { tokenize } from "./markdown.js";
 import { pollStatus, renderListStatus } from "./list-status.js";
 import {
   TASK_STATES, NOT_RUNNING_STATUS, movesFor, noteMovesFor, isNoteMove,
@@ -1282,6 +1285,100 @@ function proseBlock(text) {
   return wrap;
 }
 
+// The tokens markdownBlock drops, all ASCII: a heading's opening hashes and the space or
+// tab after them, a bullet and the one after it, the emphasis and backtick delimiters,
+// and a fence's backticks or tildes. Every other token is drawn and spelled.
+const DROPPED = new Set(["heading-marker", "bullet", "em-open", "em-close", "strong-open",
+                         "strong-close", "code-open", "code-close", "fence"]);
+// The element a block is drawn as, and as `inline`, as an option's label is drawn: a
+// kind not here, or past "paragraph" inline, is drawn as typed.
+const BLOCK_TAGS = { paragraph: "p", code: "pre", blank: "div", source: "div" };
+const INLINE_TAGS = { paragraph: "span", blank: "span" };
+
+// Agent markdown (markdown.js): the subset drawn as elements built here, never as
+// markup, each run spelled; beside it the text as proseBlock draws it, and the detail's
+// class shows one (`toggleSource`). The note counts the hidden characters of the text,
+// which both forms spell where they sit: the tokens dropped are ASCII.
+function markdownBlock(text, { inline = false } = {}) {
+  const wrap = proseBlock(text);
+  wrap.classList.add("md-field");
+  const source = wrap.firstChild;
+  source.classList.add("md-source");
+  const rendered = document.createElement("div");
+  rendered.className = "md";
+  let list = null;
+  for (const block of tokenize(typeof text === "string" ? text : "")) {
+    if (block.kind === "item" && !inline) {
+      const tag = block.ordered ? "ol" : "ul";
+      if (!list || list.localName !== tag) {
+        list = document.createElement(tag);
+        rendered.appendChild(list);
+      }
+      list.appendChild(markdownRuns(document.createElement("li"), block.tokens));
+      continue;
+    }
+    list = null;
+    const tags = inline ? INLINE_TAGS : BLOCK_TAGS;
+    const tag = block.kind === "heading" && !inline ? `h${block.level}` : tags[block.kind];
+    if (tag) {
+      rendered.appendChild(markdownRuns(document.createElement(tag), block.tokens));
+    } else {
+      const typed = document.createElement(inline ? "span" : "div");
+      typed.textContent = spellHidden(block.tokens.map(t => t.text).join("")).text;
+      rendered.appendChild(typed);
+    }
+  }
+  wrap.insertBefore(rendered, source);
+  return wrap;
+}
+
+// A block's tokens drawn into `el`: each kept run spelled and set as text, emphasis and
+// code spans as elements nested as the tokens open and close them, a bullet as a mark
+// the stylesheet draws, and a fence's info string dimmed.
+const OPENS = { "em-open": "em", "strong-open": "strong", "code-open": "code" };
+const CLOSES = new Set(["em-close", "strong-close", "code-close"]);
+function markdownRuns(el, tokens) {
+  const open = [el];
+  for (const token of tokens) {
+    const top = open[open.length - 1];
+    if (OPENS[token.kind]) {
+      open.push(top.appendChild(document.createElement(OPENS[token.kind])));
+    } else if (CLOSES.has(token.kind)) {
+      open.pop();
+    } else if (token.kind === "bullet") {
+      const mark = document.createElement("span");
+      mark.className = "md-bullet";
+      top.appendChild(mark);
+    } else if (token.kind === "info") {
+      const info = document.createElement("span");
+      info.className = "md-info";
+      info.textContent = spellHidden(token.text).text;
+      top.appendChild(info);
+    } else if (!DROPPED.has(token.kind)) {
+      top.appendChild(document.createTextNode(spellHidden(token.text).text));
+    }
+  }
+  return el;
+}
+
+// The detail's fields as drawn, or as their source: one switch for them all, kept until
+// the page reloads. It hides one form of each by a class on the detail, which outlives
+// every draw, so it redraws nothing: typed text, the plan's view and loaded pages stay.
+let showSource = false;
+function sourceToggle() {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "group-toggle source-toggle";
+  btn.dataset.sourceToggle = "1";
+  btn.textContent = showSource ? "show rendered" : "show source";
+  return btn;
+}
+function toggleSource(btn) {
+  showSource = !showSource;
+  taskDetail.classList.toggle("source-shown", showSource);
+  btn.textContent = showSource ? "show rendered" : "show source";
+}
+
 function line(label, value) {
   const div = document.createElement("div");
   const b = document.createElement("span");
@@ -1306,8 +1403,10 @@ function planBlock(plan, task, previous = null) {
   if (notice) block.appendChild(noticeLine(notice));
   const whole = document.createElement("div");
   whole.className = "plan-whole";
+  // The footprint is paths, one a line, never markdown.
   for (const part of planParts(plan)) {
-    whole.appendChild(line(part.label, proseBlock(part.text)));
+    whole.appendChild(line(part.label, part.key === "footprint" ? proseBlock(part.text)
+      : markdownBlock(part.text)));
   }
   // An earlier plan's decisions, as text: the task's own are drawn above its plan.
   if (task === null) {
@@ -1373,7 +1472,8 @@ function decisionGroup(decision, i, choice) {
   legend.textContent = `decision ${i + 1}: `
     + (decision.multi_select ? "any of these" : "one of these")
     + (choice ? ", or other" : "");
-  group.append(legend, proseBlock(decision.question), line("why", proseBlock(decision.why)));
+  group.append(legend, markdownBlock(decision.question),
+               line("why", markdownBlock(decision.why)));
   const multi = Boolean(decision.multi_select);
   (Array.isArray(decision.options) ? decision.options : []).forEach((option, j) => {
     const row = document.createElement("div");
@@ -1384,8 +1484,8 @@ function decisionGroup(decision, i, choice) {
       row.appendChild(input);
     }
     const text = document.createElement("div");
-    const label = proseBlock(option.label);
-    label.className = "option-label";
+    const label = markdownBlock(option.label, { inline: true });
+    label.classList.add("option-label");
     text.appendChild(label);
     if (option.assumed) {
       const mark = document.createElement("div");
@@ -1393,7 +1493,7 @@ function decisionGroup(decision, i, choice) {
       mark.textContent = "the plan as written assumes this";
       text.appendChild(mark);
     }
-    text.appendChild(proseBlock(option.meaning));
+    text.appendChild(markdownBlock(option.meaning));
     row.appendChild(text);
     group.appendChild(row);
   });
@@ -1461,9 +1561,9 @@ function answerBlock(answer) {
   head.textContent = [`plan ${answer.plan}`, `decision ${Number(answer.decision) + 1}`,
                       `by ${spellHidden(answer.author).text}`, fmtStamp(answer.at)]
     .filter(Boolean).join(" · ");
-  block.append(head, proseBlock(answer.question));
+  block.append(head, markdownBlock(answer.question));
   for (const option of Array.isArray(answer.options) ? answer.options : []) {
-    block.appendChild(line("chose", proseBlock(option.label)));
+    block.appendChild(line("chose", markdownBlock(option.label, { inline: true })));
   }
   if (typeof answer.other === "string") {
     block.appendChild(line("other", proseBlock(answer.other)));
@@ -1631,6 +1731,9 @@ function drawTask(task, held) {
   }
   const head = document.createElement("h3");
   head.textContent = `#${task.id} ${spellHidden(task.title).text}`;
+  // After what is always drawn and before what comes and goes, at a width of its own,
+  // so neither its own clicks nor opening an edit moves it.
+  head.append(" ", sourceToggle());
   if (!editing) {
     const edit = document.createElement("button");
     edit.type = "button";
@@ -1668,8 +1771,8 @@ function drawTask(task, held) {
   if (editing) {
     taskDetail.appendChild(specForm(task));
   } else {
-    const body = proseBlock(task.body);
-    body.className = "task-body";
+    const body = markdownBlock(task.body);
+    body.classList.add("task-body");
     taskDetail.appendChild(body);
   }
   taskDetail.appendChild(decisionsBlock(task));
@@ -2243,7 +2346,7 @@ function renderTimeline(tbody, history) {
     cell(tr, [h.action, ...entry.marks].join(" · "), "qual");
     const td = document.createElement("td");
     if (entry.note) {
-      td.appendChild(proseBlock(entry.note.text));
+      td.appendChild(markdownBlock(entry.note.text));
     }
     if (entry.named) td.appendChild(line("note", entry.named));
     if (entry.folded.length) {
@@ -2610,6 +2713,11 @@ export function mountTasks() {
     // The task read again, through the hash as every open is.
     if (ev.target.closest("button[data-show]")) {
       goTo(view, openTask);
+      return;
+    }
+    const source = ev.target.closest("button[data-source-toggle]");
+    if (source) {
+      toggleSource(source);
       return;
     }
     if (ev.target.closest("button[data-spec-open]")) {

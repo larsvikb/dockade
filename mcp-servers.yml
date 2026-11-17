@@ -115,9 +115,20 @@ services:
       # read-only, a best-effort filter and not the boundary.
       GITHUB_LOCKDOWN_MODE: "1"
       # Real process env, not a shell export (same rule as the sandbox's proxy
-      # vars). Go's net/http honours these; a Node-based server would not without
-      # an explicit dispatcher — verify by looking for the connection in the
-      # proxy's audit log, since the failure mode is a timeout, not an error.
+      # vars). Go's net/http honours these. A Node-based server does too, NO_PROXY
+      # included, with NODE_USE_ENV_PROXY=1 in its service environment: built-in
+      # fetch from Node 24.0 or 22.21, and the http/https global agents as well
+      # from 24.5 or 22.21. An older Node, or a library that brings its own agent
+      # or dispatcher, still needs one set explicitly. Set the variable, not the
+      # --use-env-proxy flag: the flag exists only from 24.5/22.21, and an unknown
+      # flag in NODE_OPTIONS stops Node from starting. Node's fetch sends an
+      # http:// URL as a CONNECT to port 80, which the proxy's port gate
+      # (EGRESS_CONNECT_PORTS) refuses, so such a server reaches its upstreams over
+      # https; Node's http agent sends an ordinary forward request and is not
+      # affected. Verify a new server by looking for its connections in the
+      # proxy's audit log: one that ignores these variables fails by a timeout,
+      # not an error, and a refused http:// fetch shows there as a CONNECT deny on
+      # port 80.
       HTTP_PROXY: http://egress-proxy:8080
       HTTPS_PROXY: http://egress-proxy:8080
       NO_PROXY: localhost,127.0.0.1

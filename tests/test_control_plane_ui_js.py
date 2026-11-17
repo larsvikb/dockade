@@ -47,6 +47,7 @@ import types
 import unittest
 from pathlib import Path
 from typing import ClassVar
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 UI_DIR = ROOT / "control-plane-ui"
@@ -5423,11 +5424,17 @@ def _free_names(paths: list[Path]) -> dict[str, set[str]]:
             "report success for the free-name check. Install node, or drop strict mode "
             "to skip it knowingly.")
     entry = "".join(f'import "{p.as_uri()}";\n' for p in paths)
+    # A governed sandbox sets NODE_USE_ENV_PROXY beside a proxy variable, and with
+    # both Node compiles its own proxy internals into the dump, whose globals are not
+    # the page's. Removed rather than overridden with --no-use-env-proxy, which Node
+    # before 24.5 and 22.21 rejects; NODE_OPTIONS can carry --use-env-proxy too.
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("NODE_USE_ENV_PROXY", "NODE_OPTIONS")}
     # _NODE is absolute (shutil.which), no shell, and the script names repo or
     # temporary paths only.
     proc = subprocess.run(  # noqa: S603
         [_NODE, "--no-lazy", "--print-bytecode", "--input-type=module", "-e", entry],
-        capture_output=True, text=True, timeout=60, check=False)
+        capture_output=True, text=True, timeout=60, check=False, env=env)
     if proc.returncode != 0:
         raise AssertionError(f"node could not import the modules:\n{proc.stderr}")
     found: dict[str, set[str]] = {}
@@ -5466,6 +5473,19 @@ class FreeNameTests(unittest.TestCase):
             planted.write_text(f"export function start(o) {{\n{calls}  return cards;\n}}\n")
             found = _free_names([planted])
         self.assertEqual(found.get("cards"), {"start"})
+
+    def test_a_governed_session_s_node_proxy_settings_add_no_names(self):
+        # With NODE_USE_ENV_PROXY (or --use-env-proxy) and a proxy variable both set,
+        # as in every governed session, Node's proxy internals would be in the dump.
+        planted_env = {"NODE_USE_ENV_PROXY": "1", "NODE_OPTIONS": "--use-env-proxy",
+                       "HTTPS_PROXY": "http://egress-proxy.invalid:8080",
+                       "HTTP_PROXY": "http://egress-proxy.invalid:8080"}
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.dict(os.environ, planted_env):
+            planted = Path(tmp) / "planted.js"
+            planted.write_text("export function mount(el) { return cards.get(el.id); }\n")
+            found = _free_names([planted])
+        self.assertEqual(set(found), {"cards"})
 
 
 class PageChecks:

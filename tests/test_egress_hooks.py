@@ -231,12 +231,13 @@ class RefusalKindTests(unittest.TestCase):
 
 
 _POLICY_403 = (403, b"egress denied by policy\n",
-               {"Content-Type": "text/plain", "x-proxy-error": "blocked-by-allowlist"})
+               {"Content-Type": "text/plain", "x-proxy-error": "blocked-by-allowlist",
+                "Connection": "close"})
 
 
 def _not_decided(why):
     return (503, f"egress not decided: {why} - retry later\n".encode(),
-            {"Content-Type": "text/plain", "Retry-After": "60"})
+            {"Content-Type": "text/plain", "Retry-After": "60", "Connection": "close"})
 
 
 # Each way /authorize can end in a refusal, and the response the client then sees.
@@ -305,6 +306,12 @@ class RefusalShapeTests(unittest.TestCase):
         for status, _body, headers in self._each_shape(self._flow):
             self.assertEqual("x-proxy-error" in headers, status == 403)
             self.assertEqual("Retry-After" in headers, status == 503)
+
+    def test_every_refusal_closes_the_client_connection(self):
+        # mitmproxy closes the client connection after a response that says so; left
+        # open, Node's https.get never exits after a refused CONNECT (``_deny``).
+        for _status, _body, headers in self._each_shape(self._flow):
+            self.assertEqual(headers.get("Connection"), "close")
 
     def test_a_fronted_request_takes_the_refused_name_s_kind(self):
         # The transport name is allowed, the Host header's card expired: the kind

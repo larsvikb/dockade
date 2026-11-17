@@ -1133,15 +1133,64 @@ both cases is the conventional pairing, since other tools split the other way.
 No man page ships in the sandbox image, so the above is the measurement rather than a
 quote from the documentation.
 
+## Node's fetch reads the proxy variables only with `NODE_USE_ENV_PROXY`
+
+Measured 2026-11-17 in the tier-1 sandbox, Node 24.22.3 (the image's nodesource
+`setup_24.x`), against the governed proxy (mitmproxy 12.2.3) and against a stub proxy
+on loopback. Without `NODE_USE_ENV_PROXY=1` (or `--use-env-proxy`, also through
+`NODE_OPTIONS`), Node's `fetch` and its `http`/`https` agents read none of the proxy
+variables: a fetch of allowlisted `api.anthropic.com` resolves the name itself and
+fails `getaddrinfo EAI_AGAIN`, with no hold and no audit row. With it, the same fetch
+gets the origin's 404 through the proxy; `sc_governed_egress` in `sandbox-lib.sh` sets
+it. Both cases of the variables work, and `NO_PROXY` is honoured.
+
+- **Plain `http://` with `fetch` is tunnelled**, as `CONNECT host:80`, so the port
+  gate refuses it even for an allowed host (#348). `http.get` sends an absolute-form
+  `GET`, governed as curl's is.
+- **A local server** answers at `localhost` and `127.0.0.1`, which are in `NO_PROXY`.
+  At the container's hostname or `0.0.0.0`, fetch and curl both go to the proxy and
+  get its 403 (#350).
+- **A refused `https.get` never exited**, though its error printed at once; `fetch`
+  exits either way, and `https.get` to an allowed host exits. Two halves: after a
+  non-200 CONNECT Node keeps its socket to the proxy open (`lib/https.js` destroys it
+  only for an error without a status code; the same on Node's main branch, read; no
+  upstream issue found), and mitmproxy keeps a refused CONNECT's connection open for a
+  next request. Against the stub, a 403 or 503 left open held `https.get` until a 15 s
+  `timeout` killed it; the same response with `Connection: close` and a close let it
+  exit at once. No Node variable or option changes it. mitmproxy closes the client
+  connection after a response carrying `Connection: close`, which every refusal from
+  `_deny` in `proxies/egress/addon.py` now does.
+- **The close, run against the governed proxy** with a raw socket: `CONNECT
+  api.anthropic.com:8443` (the port gate's local 403, needing no rule or card) with
+  `Connection: close` on the request got the 403 and EOF at once, by the same
+  mitmproxy rule; without it the connection was still open 15 s later.
+  `boundary-check.sh`'s port-gate probe requires the header on the refusal.
+- **The close, run against the addon itself**: mitmproxy 12.2.3 from PyPI (the
+  image's version, not its digest) running `mitmdump -s proxies/egress/addon.py` on
+  loopback, as the image's entrypoint does, with the control plane unreachable. The
+  port gate's 403 (`CONNECT api.anthropic.com:8443`), the relay guard's 403
+  (`CONNECT control-plane:443`), the 503 for an unreachable control plane and a
+  plain-HTTP port-gate 403 each came back with `Connection: close` and then EOF
+  within 0.02 s, with no header on the request. Node's `https.get` with the variable
+  printed the 403 or 503 and exited 0, and the port-gate probe passed. The same run
+  against the addon before the header: no EOF in 5 s, `https.get` killed by a 10 s
+  `timeout`, and the probe failed.
+- **Claude Code under the variable**: `claude -p` (2.1.325) with
+  `NODE_USE_ENV_PROXY=1` showed the `gateway` MCP server `connected` and answered.
+
+What Node shows of a held host was not measured: it costs the operator a card.
+
 ## What a client shows of the proxy's two refusals
 
 Measured 2026-11-16 in the tier-1 sandbox, against a stub proxy on loopback that
 answers exactly as `_deny` in `proxies/egress/addon.py` does: the policy 403 (`egress
 denied by policy`, `x-proxy-error: blocked-by-allowlist`) and the not-decided 503
 (`egress not decided: … - retry later`, `Retry-After: 60`), each with a
-`content-length` and the connection left open, as mitmproxy leaves it. Every proxy
-variable, both cases, pointed at the stub; the stub counted the requests, which is
-the "tries" column.
+`content-length` and the connection left open, as mitmproxy left it before every
+refusal carried `Connection: close`. Every proxy variable, both cases, pointed at the
+stub; the stub counted the requests, which is the "tries" column. The Node rows were
+measured 2026-11-17 with `NODE_USE_ENV_PROXY=1`, both with the connection left open
+and with the close.
 
 | client | refused CONNECT, 403 / 503 | plain-HTTP 403 / 503 | tries (CONNECT; plain HTTP) |
 |---|---|---|---|
@@ -1151,13 +1200,16 @@ the "tries" column.
 | pip 25.1.1 | `ProxyError('Cannot connect to proxy.', OSError('Tunnel connection failed: 403 Forbidden'))` (or `503 Service Unavailable`), then `No matching distribution` | `No matching distribution` alone, for either status (needs `--trusted-host`) | 6 over ~8-11 s for either status; 403: 1, 503: 6 over ~319 s, a minute apart as `Retry-After` asks |
 | npm 11.19.1 | `E403 403 Forbidden - GET https://…` (or `E503 503 Service Unavailable`): it reports the CONNECT status as the server's | the same words | 403: 2 at once, no retry; 503: 3 over ~75 s. Plain HTTP: 403: 1; 503: 3 over ~76 s |
 | Python 3.13.5 `urllib` | `URLError: Tunnel connection failed: 403 Forbidden` (or `503 Service Unavailable`); no headers, no body | `HTTPError` with the status, the headers and the body | 1; 1 |
-| Node 24.22.3 `fetch` | never reaches the proxy: it ignores `HTTPS_PROXY` (#341) and fails `getaddrinfo EAI_AGAIN` | the same | 0; 0 |
+| Node 24.22.3 `fetch` | `fetch failed`, cause `Request was cancelled.`, its cause `Proxy response (403) !== 200 when HTTP Tunneling` (or `503`) | tunnelled as `CONNECT host:80`, so the CONNECT column | 1; 1 |
+| Node 24.22.3 `https.get` | `Failed to establish tunnel to <host>:443 via <proxy>: HTTP/1.1 403 Forbidden` (or `503 Service Unavailable`); left open, the process never exits | (sends no plain HTTP) | 1; - |
+| Node 24.22.3 `http.get` | (sends no CONNECT) | the response, with its status; exits either way | -; 1 |
 | Chromium headless shell 156.0.8078.79 | `net::ERR_TUNNEL_CONNECTION_FAILED` for either status | renders the body as the page | 1; 1 |
 | WebFetch, Claude Code 2.1.325 | 403 with the header: `Access to <host> is blocked by the network egress proxy.` (`error_type` `EGRESS_BLOCKED`); 403 without it, and 503: `proxy refused the connection` | upgrades `http://` to `https://`, so the CONNECT column | 1; 1 |
 
-So only a plain-HTTP response shows the body, and over HTTPS, which is nearly
-everything, the status is what a client has: curl, wget, git, pip, npm and urllib
-print it, Chromium and WebFetch do not. WebFetch is the one client that reads the
+So only a plain-HTTP response shows the body (a Node `fetch` has none, since it
+tunnels plain HTTP too), and over HTTPS, which is nearly everything, the status is
+what a client has: curl, wget, git, pip, npm, urllib and Node print it, Chromium and
+WebFetch do not. WebFetch is the one client that reads the
 header, and it reads only the header: the pre-change 403, which had none, and the 503
 both reach it as `proxy refused the connection`. Its domain preflight goes to
 `api.anthropic.com`, which the proxy passes on the lifeline. WebFetch's own 60 s

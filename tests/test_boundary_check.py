@@ -5,8 +5,8 @@ Each block runs alone, lifted out of the script with the script's own ``ok``/``b
 helpers and counters: the rest probes egress, DNS and mounts of a live sandbox. bash,
 grep and awk run for real. The privilege-caps probe reads a fixture file in place of
 the process's own status, the embedded-resolver check meets stubbed ``getent`` and
-``dig`` on a PATH of grep alone, and the model-host probe and the SNI-fronting branch
-meet a stubbed ``curl``, so no verdict depends on the machine running the test.
+``dig`` on a PATH of grep alone, and the model-host probe, the SNI-fronting branch
+and the port-gate probe meet a stubbed ``curl``, so no verdict depends on the machine running the test.
 """
 from __future__ import annotations
 
@@ -418,6 +418,136 @@ class SniFrontingBranchTests(unittest.TestCase):
     def test_a_curl_failure_passes(self):
         self.assertEqual(self._run("curl: (35) TLS connect error", 35),
                          (["PASS SNI fronting blocked (no passthrough)"], "pass=1 fail=0"))
+
+
+def _port_gate_block() -> str:
+    return _lift(r'^    portresp="\$\(curl .*?^    fi\n', "port-gate probe")
+
+
+# curl -v's report of a refused CONNECT, as a governed sandbox prints it (CRs kept):
+# `>` lines are curl's request, `<` lines the proxy's response.
+_VERBOSE_HEAD = (
+    "* Uses proxy env variable https_proxy == 'http://egress-proxy:8080'\n"
+    "*   Trying 172.30.0.10:8080...\n"
+    "* Establish HTTP proxy tunnel to api.anthropic.com:8443\n"
+    "> CONNECT api.anthropic.com:8443 HTTP/1.1\r\n"
+    "> Host: api.anthropic.com:8443\r\n"
+    "> User-Agent: curl/8.14.1\r\n"
+    "> Proxy-Connection: Keep-Alive\r\n"
+    ">\r\n")
+_VERBOSE_TAIL = (
+    "<\r\n"
+    "* CONNECT tunnel failed, response 403\n"
+    "* closing connection #0\n"
+    "curl: (56) CONNECT tunnel failed, response 403\n")
+
+
+def _refused(*headers: str, status: str = "403 Forbidden") -> str:
+    lines = [f"HTTP/1.1 {status}", "Content-Type: text/plain",
+             "x-proxy-error: blocked-by-allowlist", *headers, "content-length: 24"]
+    return _VERBOSE_HEAD + "".join(f"< {line}\r\n" for line in lines) + _VERBOSE_TAIL
+
+
+_PORT_REFUSED_OK = ("PASS egress proxy refuses non-443 CONNECT (api.anthropic.com:8443 -> 403,"
+              " Connection: close)")
+_PORT_NO_403 = "FAIL egress proxy did NOT 403 a non-443 CONNECT to api.anthropic.com:8443"
+_PORT_NO_CLOSE = "FAIL egress proxy 403'd a non-443 CONNECT without Connection: close"
+
+
+@unittest.skipUnless(_BASH or _STRICT, "bash is not installed")
+class PortGateProbeTests(unittest.TestCase):
+    """The port gate's 403 must carry ``Connection: close``: it is the refusal a
+    running proxy shows without a rule or a card, and without the close a Node
+    script whose https.get the proxy refused never exits. Read from curl -v, whose
+    request lines can say ``Connection`` too."""
+
+    @staticmethod
+    def _curl(output: str, rc: int) -> str:
+        """A ``curl`` that prints ``output`` only when asked for the verbose report of
+        the port-gate target, and otherwise what ``curl -sS`` prints of a refused
+        CONNECT, which has no response lines: a probe that dropped ``-v`` or asked
+        another port would then read no 403."""
+        return (
+            'curl() {\n'
+            '    local arg verbose="" target=""\n'
+            '    for arg in "$@"; do\n'
+            '        case "$arg" in\n'
+            '            -v) verbose=1 ;;\n'
+            '            https://api.anthropic.com:8443/) target=1 ;;\n'
+            '        esac\n'
+            '    done\n'
+            '    if [ -n "$verbose" ] && [ -n "$target" ]; then\n'
+            f'        printf %s {shlex.quote(output)} >&2\n'
+            '    else\n'
+            "        echo 'curl: (56) CONNECT tunnel failed, response 403' >&2\n"
+            '    fi\n'
+            f'    return {rc}\n'
+            '}\n')
+
+    def _run(self, output: str, rc: int = 56) -> tuple[list[str], str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = Path(tmp) / "bin"
+            bin_dir.mkdir()
+            for tool in ("grep", "head", "tail", "tr"):
+                found = shutil.which(tool)
+                if found is None:
+                    if _STRICT:
+                        self.fail(f"{tool} is not installed")
+                    self.skipTest(f"{tool} is not installed")
+                os.symlink(found, bin_dir / tool)
+            script = (_prelude() + _helpers() + self._curl(output, rc) + _port_gate_block()
+                      + 'echo "pass=$pass fail=$fail"\n')
+            proc = subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
+                [_BASH, "-c", script], cwd=tmp, env={"PATH": str(bin_dir)},
+                capture_output=True, text=True, encoding="utf-8", timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        lines = proc.stdout.splitlines()
+        verdicts = [re.sub(r"\x1b\[[0-9;]*m", "", line).strip() for line in lines[:-1]]
+        return verdicts, lines[-1] if lines else ""
+
+    def _fails(self, output: str, verdict: str, rc: int = 56) -> str:
+        verdicts, counts = self._run(output, rc)
+        self.assertEqual(counts, "pass=0 fail=1")
+        self.assertEqual(len(verdicts), 1, verdicts)
+        self.assertTrue(verdicts[0].startswith(verdict), verdicts)
+        return verdicts[0]
+
+    def test_a_403_with_connection_close_passes(self):
+        for header in ("Connection: close", "connection: close", "CONNECTION:close"):
+            with self.subTest(header=header):
+                self.assertEqual(self._run(_refused(header)),
+                                 ([_PORT_REFUSED_OK], "pass=1 fail=0"))
+
+    def test_a_403_without_connection_close_fails_and_shows_the_response(self):
+        for headers in ((), ("Connection: keep-alive",), ("X-Connection: close",),
+                        ("Connection: closed",)):
+            with self.subTest(headers=headers):
+                verdict = self._fails(_refused(*headers), _PORT_NO_CLOSE)
+                self.assertIn("< HTTP/1.1 403 Forbidden", verdict)
+                self.assertNotIn("\r", verdict)
+                self.assertNotIn("> CONNECT", verdict)
+
+    def test_the_request_s_own_connection_header_does_not_count(self):
+        # curl's request lines can name Connection: close; only the response's count.
+        output = _refused().replace("> Proxy-Connection: Keep-Alive\r\n",
+                                    "> Connection: close\r\n")
+        self._fails(output, _PORT_NO_CLOSE)
+
+    def test_no_403_status_fails_whatever_the_headers(self):
+        cases = {
+            "another status": _refused("Connection: close", status="502 Bad Gateway"),
+            "403 only in curl's own lines": _VERBOSE_HEAD.replace(
+                "HTTP/1.1\r\n", "HTTP/1.1 403\r\n")
+            + "* CONNECT tunnel failed, response 403\n",
+            "403 in a response header": _refused("Connection: close", status="200 OK")
+            .replace("content-length: 24", "x-note: HTTP/1.1 403"),
+            "no output": "",
+        }
+        for name, output in cases.items():
+            with self.subTest(case=name):
+                verdict = self._fails(output, _PORT_NO_403, rc=7)
+                if output:
+                    self.assertIn("got: ", verdict)
 
 
 if __name__ == "__main__":

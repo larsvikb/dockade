@@ -126,6 +126,104 @@ def _code(js: str) -> str:
     code = re.sub(r"/\*.*?\*/", "", code, flags=re.S)
     return re.sub(r'import \{.*?\}\s*from\s+"[^"]+";', "", code, flags=re.S)
 
+
+#: Every way a page can have the browser parse a string as markup: the element
+#: properties and methods, `insertHTML` through `execCommand`, the document's writer,
+#: the parsers, an iframe's `srcdoc`, and the sanitizer API's setter and parser with
+#: their `…Unsafe` forms.
+_MARKUP_SINKS = re.compile(
+    r"innerHTML|outerHTML|insertAdjacentHTML|insertHTML|document\.write|DOMParser|"
+    r"createContextualFragment|srcdoc|setHTML|parseHTML")
+
+#: What may come before a `/` that opens a regex literal rather than divides.
+_REGEX_AFTER = frozenset("(,=:[!&|?{};+-*%<>~^")
+
+
+def _skip_string(js: str, i: int) -> int:
+    quote = js[i]
+    i += 1
+    while js[i] != quote:
+        i += 2 if js[i] == "\\" else 1
+    return i + 1
+
+
+def _skip_regex(js: str, i: int) -> int:
+    i += 1
+    in_class = False
+    while in_class or js[i] != "/":
+        if js[i] == "\\":
+            i += 1
+        elif js[i] == "[":
+            in_class = True
+        elif js[i] == "]":
+            in_class = False
+        elif js[i] == "\n":
+            raise AssertionError(f"a regex literal at {i} runs off its line: the "
+                                 f"template scan lost its place")
+        i += 1
+    return i + 1
+
+
+def _scan_code(js: str, i: int, out: list[tuple[str, str]], nested: bool) -> int:
+    depth, last = 0, ""
+    while i < len(js):
+        c = js[i]
+        if js.startswith("//", i):
+            end = js.find("\n", i)
+            i = len(js) if end < 0 else end
+            continue
+        if js.startswith("/*", i):
+            i = js.index("*/", i) + 2
+            continue
+        if c in "\"'":
+            i, last = _skip_string(js, i), c
+            continue
+        if c == "/" and (last == "" or last in _REGEX_AFTER):
+            i, last = _skip_regex(js, i), "/"
+            continue
+        if c == "`":
+            tag = re.search(r"[\w$.]*$", js[:i]).group(0)
+            i, last = _scan_template(js, i + 1, out, tag), "`"
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            if nested and depth == 0:
+                return i + 1
+            depth -= 1
+        if not c.isspace():
+            last = c
+        i += 1
+    if nested or depth:
+        raise AssertionError("unbalanced braces: the template scan lost its place")
+    return i
+
+
+def _scan_template(js: str, i: int, out: list[tuple[str, str]], tag: str) -> int:
+    text = []
+    while js[i] != "`":
+        if js[i] == "\\":
+            text.append(js[i:i + 2])
+            i += 2
+        elif js.startswith("${", i):
+            i = _scan_code(js, i + 2, out, True)
+            text.append("${}")
+        else:
+            text.append(js[i])
+            i += 1
+    out.append((tag, "".join(text)))
+    return i + 1
+
+
+def _templates(js: str) -> list[tuple[str, str]]:
+    """Each template literal in `js`, nested ones too, as the name it is tagged with
+    ("" for none) and its literal text, each `${…}` reduced to `${}`. Strings, comments
+    and regex literals are stepped over, a regex told from a division by the character
+    before it; a scan that loses its place fails rather than reads the wrong text."""
+    out: list[tuple[str, str]] = []
+    _scan_code(js, 0, out, False)
+    return out
+
 # `make test` runs discovery with `-t tests`, so sibling modules import by bare name;
 # this keeps the file runnable on its own too. Imported for the CSP and `_directives`:
 # the policy and its parser live with the guards, so this module does not restate them.
@@ -4005,7 +4103,7 @@ class AuditTableSourceTests(unittest.TestCase):
         # `make logs-cp` or pasted into an advisory.
         for view, body in (("folded", self.rows), ("record", self.events)):
             with self.subTest(view=view):
-                self.assertRegex(body, r'title="\$\{esc\(fmtInstant\(')
+                self.assertIn('title="${fmtInstant(a.ts)}"', body)
 
     def test_a_failed_refresh_keeps_the_rows_and_reports_the_staleness(self):
         # Both halves matter. Clearing on failure would throw away the only data the
@@ -4016,10 +4114,24 @@ class AuditTableSourceTests(unittest.TestCase):
         # A refusal outranks every other status line, so a failure that kept the last
         # one would show the refusal instead of saying the refresh failed.
         self.assertIn("auditRefused = null", failure)
-        self.assertNotRegex(
-            self.body.group(1),
-            r'catch[^}]*innerHTML\s*=\s*""',
-            "a failed poll must not blank the table")
+        self.assertNotIn("setHtml(", failure, "a failed poll must not touch the table")
+        for call in ("renderEvents(", "renderGrouped("):
+            self.assertNotIn(call, failure)
+
+    def test_the_render_is_inside_the_try_ahead_of_the_success_path(self):
+        """A render that throws (`html` refusing a value) has to land in the catch, so
+        it reads as a failed refresh over the old rows, not as an unhandled rejection
+        under rows shown as current. So the render is the try's, and nothing that
+        records a success comes before it."""
+        attempt, _, _ = self.body.group(1).partition("catch (e) {")
+        _, success = _poll_paths(self.body.group(1))
+        self.assertIn("if (events) renderEvents(rows); else renderGrouped(rows);", attempt)
+        for call in ("renderEvents(", "renderGrouped("):
+            with self.subTest(call=call):
+                self.assertNotIn(call, success)
+        for name in ("auditFailed = false", "auditLoaded = true", "auditGroupedTable"):
+            with self.subTest(name=name):
+                self.assertNotIn(name, attempt.split("if (!res.ok)", 1)[1])
 
     def test_a_recovered_poll_clears_the_warning_and_re_renders(self):
         # The recovery half, which was asserted for neither table until a mutation of
@@ -4052,11 +4164,14 @@ class AuditTableSourceTests(unittest.TestCase):
         # `<tr[^>]*>` rather than `<tr>`: the row carries a conditional `outage`
         # class now. The attribute region is asserted separately just below, so
         # loosening this does not let arbitrary markup onto the row unnoticed.
-        row = re.search(r"return `\s*<tr([^>]*)>(.*?)</tr>`", self.rows, re.S)
+        row = re.search(r"return html`\s*<tr([^>]*)>(.*?)</tr>`", self.rows, re.S)
         self.assertIsNotNone(row, "the row template was restructured")
+        # A fragment, not a string: `html` refuses a string inside a tag, so a plain
+        # ' class="outage"' would fail the whole render on exactly the rows an outage
+        # makes, and no fixture draws one.
         self.assertRegex(
             row.group(1),
-            r"""^\$\{a\.failClosed \? ' class="outage"' : ""\}$""",
+            r"""^\$\{a\.failClosed \? html` class="outage"` : ""\}$""",
             "the only thing on the row element itself is the outage marker")
         cells = row.group(2).split("<td")[1:]
         self.assertEqual(len(cells), 5, "expected five cells, one per header")
@@ -4071,14 +4186,14 @@ class AuditTableSourceTests(unittest.TestCase):
         self.assertNotIn("stagePrefix", kind)
         # The stage prefixes the TARGET, reading as the scheme it effectively is.
         self.assertIn("a.stagePrefix", target)
-        self.assertIn("esc(a.target)", target)
-        self.assertIn("esc(a.client)", client)
+        self.assertIn("${a.target}", target)
+        self.assertIn("${a.client}", client)
         # The class qualifies the CLIENT, the same way the stage qualifies the host —
         # it is not a sixth column (asserted above) and it must not drift onto the
         # decision cell, which stays uniform for vertical scanning.
         self.assertIn("a.clientClassPrefix", client)
         self.assertNotIn("clientClassPrefix", kind)
-        self.assertIn("esc(a.reason)", detail)
+        self.assertIn("${a.reason}", detail)
         # Grouping annotates two cells and must not add a sixth (asserted above): the
         # repeat count sits beside the target it repeats, the span beside the detail,
         # which is the column that already carries explanatory text.
@@ -4091,7 +4206,7 @@ class AuditTableSourceTests(unittest.TestCase):
         right pixels and the wrong `textContent`, so a row copied into a ticket read as
         one word. A decisions table exists to be quotable evidence, so the space and
         the separator are part of the escaped VALUE, never styling."""
-        self.assertIn('esc(" " + a.repeat)', self.rows)
+        self.assertIn('${" " + a.repeat}', self.rows)
         self.assertIn('first seen ${fmtStamp(a.firstTs)}', self.rows)
 
     def test_the_first_seen_separator_appears_only_when_it_separates(self):
@@ -4117,8 +4232,8 @@ class AuditTableSourceTests(unittest.TestCase):
         # self-reported fields and all, so it is escaped like everything else here.
         for view, body in (("folded", self.rows), ("record", self.events)):
             with self.subTest(view=view):
-                self.assertIn("esc(a.client)", body)
-                self.assertIn('title="${esc(a.actorTitle)}">${esc(a.actor)}', body)
+                self.assertIn("${a.client}", body)
+                self.assertIn('title="${a.actorTitle}">${a.actor}', body)
         # Scoped to the decisions SECTION, not the first <thead> in the file — the
         # policy table also has one, and a reordering of the two sections would
         # otherwise silently point this assertion at the wrong table.
@@ -4139,14 +4254,17 @@ class AuditTableSourceTests(unittest.TestCase):
         headers = [h.strip() for h in re.findall(r"<th>(.*?)</th>", section.group(0))]
         self.assertEqual(headers, ["time", "kind", "target", "who", "request",
                                    "detail"])
-        row = re.search(r"return `\s*<tr([^>]*)>(.*?)</tr>`", self.events, re.S)
+        row = re.search(r"return html`\s*<tr([^>]*)>(.*?)</tr>`", self.events, re.S)
         self.assertIsNotNone(row, "the record row template was restructured")
+        # A fragment, as on the folded table's row.
+        self.assertRegex(row.group(1),
+                         r"""^\$\{a\.failClosed \? html` class="outage"` : ""\}$""")
         cells = row.group(2).split("<td")[1:]
         self.assertEqual(len(cells), len(headers),
                          "the record table body and header disagree on cell count")
         # The request cell is the fifth, and it is escaped — this is the one
         # agent-controlled unbounded string the page renders outside an approval card.
-        self.assertIn("esc(a.request)", cells[4])
+        self.assertIn("<code>${a.request}</code>", cells[4])
         self.assertIn("a.stagePrefix", cells[2])
         self.assertIn("a.clientClassPrefix", cells[3])
 
@@ -4166,15 +4284,20 @@ class AuditTableSourceTests(unittest.TestCase):
                           ""])
         # The row template is built in `refreshRules`, and the `for` cell has to be
         # the fourth — between the wildcard scope and the source.
-        body = re.search(r"document\.getElementById\(\"rules\"\)\.innerHTML"
-                         r".*?return `<tr>(.*?)</tr>`", EGRESS_RULES_JS.read_text(),
+        body = re.search(r"setHtml\(document\.getElementById\(\"rules\"\)"
+                         r".*?return html`<tr>(.*?)</tr>`", EGRESS_RULES_JS.read_text(),
                          re.S)
         self.assertIsNotNone(body, "the policy row template was restructured")
         cells = body.group(1).split("<td")[1:]
         self.assertEqual(len(cells), len(headers),
                          "the policy table body and header disagree on cell count")
+        self.assertIn("${r.action}</span>", cells[0])
+        self.assertIn("<code>${r.pattern}</code>", cells[1])
+        self.assertIn("${r.scope}", cells[2])
         self.assertIn("r.client_class", cells[3])
-        self.assertIn("esc(r.source)", cells[4])
+        self.assertIn("${r.source}", cells[4])
+        self.assertIn("fmtStamp(r.created_at)", cells[5])
+        self.assertIn("${control}", cells[6])
 
 
 class RecordViewWiringSourceTests(unittest.TestCase):
@@ -4587,14 +4710,48 @@ class LeaseTableSourceTests(unittest.TestCase):
         failure, _ = _poll_paths(body)
         self.assertIn("leasesFailed = true", failure)
         self.assertIn("renderLeasesStatus(", failure)
-        self.assertNotRegex(body, r'catch[^}]*innerHTML\s*=\s*""',
-                            "a failed poll must not blank the leases table")
+        self.assertNotIn("setHtml(", failure, "a failed poll must not touch the table")
         self.assertNotRegex(
             body, r"catch\s*\([^)]*\)\s*\{\s*/\*[^*]*\*/\s*\}",
             "the failure path is a comment, not a reported state")
 
     def test_a_non_ok_response_is_a_failure_not_a_row_of_json(self):
         self.assertRegex(self.body, r"if\s*\(!res\.ok\)\s*throw")
+
+    def test_the_render_is_inside_the_try_ahead_of_the_success_path(self):
+        # As the decisions table's twin: a render that throws is a failed refresh.
+        attempt, _, _ = self.body.partition("catch (e) {")
+        _, success = _poll_paths(self.body)
+        self.assertIn("setHtml(leasesEl, html`", attempt)
+        self.assertNotIn("setHtml(", success)
+        for name in ("leasesFailed = false", "leasesById =", "leasesCountEl"):
+            with self.subTest(name=name):
+                self.assertNotIn(name, attempt)
+
+    def test_each_cell_renders_the_field_its_header_promises(self):
+        summary = re.search(r'const summary = html`<tr class="lease-group">(.*?)`;',
+                            self.body, re.S)
+        self.assertIsNotNone(summary, "the group summary row is gone — renamed?")
+        cells = summary.group(1).split("<td")[1:]
+        self.assertEqual(len(cells), 5)
+        self.assertIn("<code>${g.domain}</code>", cells[0])
+        self.assertIn("${g.clientClass}", cells[1])
+        self.assertIn("${cd.text}", cells[2])
+        row = re.search(r"return html`<tr([^>]*)>(.*?)</tr>`", self.row, re.S)
+        self.assertIsNotNone(row, "the lease row template was restructured")
+        # Fragments, not strings: `html` refuses a string inside a tag, so either would
+        # fail the whole render, the first on exactly the rows a group draws.
+        self.assertRegex(
+            row.group(1),
+            r'^\$\{member \? html` class="lease-member" data-group="\$\{groupKey\}"` : ""\}'
+            r'\s+\$\{member && !open \? html`hidden` : ""\}$')
+        cells = row.group(2).split("<td")[1:]
+        self.assertEqual(len(cells), 5)
+        self.assertIn("<code>${r.host}</code>", cells[0])
+        self.assertIn("${r.client_class", cells[1])
+        self.assertIn("${cd.text}", cells[2])
+        self.assertIn("${shortActor(r.granted_by)}", cells[3])
+        self.assertIn('data-lease="${String(r.id)}"', cells[4])
 
     def test_a_recovered_poll_clears_the_warning_and_re_renders(self):
         _, success = _poll_paths(self.body)
@@ -4609,6 +4766,7 @@ class LeaseTableSourceTests(unittest.TestCase):
         body = _fn_body(self.src, "updateLeaseCountdowns()", "")
         self.assertIn("dataset.expires", body)
         self.assertNotIn("innerHTML", body)
+        self.assertNotIn("setHtml(", body)
         self.assertNotIn("fetch(", body)
         # And the tick calls it, now from the other side of an import.
         self.assertIn("updateLeaseCountdowns();", APP_JS.read_text()
@@ -4627,7 +4785,7 @@ class LeaseTableSourceTests(unittest.TestCase):
                             "members must be rendered and hidden, not conditionally "
                             "rendered")
         self.assertIn("lease-member", self.row)
-        self.assertRegex(self.row, r'!open\s*\?\s*"hidden"')
+        self.assertRegex(self.row, r'!open\s*\?\s*html`hidden`')
 
     def test_expansion_survives_the_poll(self):
         """The table is replaced wholesale every four seconds, so expansion state held
@@ -4652,17 +4810,17 @@ class LeaseTableSourceTests(unittest.TestCase):
         whole in the store, in the audit reason, and in this cell's tooltip — so
         nothing an operator might need to quote is only in the abbreviated form."""
         body = self.row
-        self.assertRegex(body, r'title="\$\{esc\(r\.granted_by')
+        self.assertRegex(body, r'title="\$\{r\.granted_by')
         self.assertIn("shortActor(r.granted_by)", body)
         # And it is NOT in a `.ts` cell — that class is `white-space: nowrap` with no
         # width cap, which is what let the string widen the whole table.
-        self.assertNotRegex(body, r'<td class="ts">\$\{esc\(r\.granted_by')
+        self.assertNotRegex(body, r'<td class="ts">\$\{r\.granted_by')
 
     def test_a_group_summary_offers_no_bulk_revoke(self):
         """Ending four grants with one click is a sharper action than the per-lease
         revoke and would need the confirm step this table deliberately does not have.
         Revocation stays on the row that names the thing being revoked."""
-        summary = re.search(r'const summary = `<tr class="lease-group">(.*?)`;',
+        summary = re.search(r'const summary = html`<tr class="lease-group">(.*?)`;',
                             self.src, re.S)
         self.assertIsNotNone(summary, "the group summary row is gone — renamed?")
         self.assertNotIn("class=\"revoke\"", summary.group(1))
@@ -4698,8 +4856,7 @@ class PolicyTableSourceTests(unittest.TestCase):
         failure, _ = _poll_paths(body, "  ")
         self.assertIn("rulesFailed = true", failure)
         self.assertIn("renderRulesStatus(", failure)
-        self.assertNotRegex(body, r'catch[^}]*innerHTML\s*=\s*""',
-                            "a failed poll must not blank the policy table")
+        self.assertNotIn("setHtml(", failure, "a failed poll must not touch the table")
         # The specific regression: a catch that discards the error and says nothing.
         self.assertNotRegex(
             body, r"catch\s*\([^)]*\)\s*\{\s*/\*[^*]*\*/\s*\}",
@@ -4735,6 +4892,17 @@ class PolicyTableSourceTests(unittest.TestCase):
         self.assertNotIn("policySig =", before,
                          "the signature is updated before the poll is known to work")
         self.assertIn("policySig = sig", after)
+
+    def test_the_render_is_inside_the_try_ahead_of_the_success_path(self):
+        # As the decisions table's twin: a render that throws is a failed refresh, and
+        # leaves the signature, the counts and `rulesById` as the old rows had them.
+        attempt, _, _ = self.body.partition("catch (e) {")
+        _, success = _poll_paths(self.body, "  ")
+        self.assertIn('setHtml(document.getElementById("rules"), html`', attempt)
+        self.assertNotIn("setHtml(", success)
+        for name in ("rulesFailed = false", "policySig =", "rulesById =", "badge-policy"):
+            with self.subTest(name=name):
+                self.assertNotIn(name, attempt)
 
 
 class CreateRuleSourceTests(unittest.TestCase):
@@ -4779,8 +4947,13 @@ class CreateRuleSourceTests(unittest.TestCase):
         self.assertIsNotNone(config, "refreshConfig not found — renamed?")
         self.assertIn("c.client_classes", config.group(1))
         options = _fn_body(self.src, "renderClassOptions()", "")
-        self.assertIn("clientClasses.map", options)
+        self.assertIn("ruleClassEl.replaceChildren(...clientClasses.map(", options)
         self.assertNotIn("rulesById", options)
+        # Built with the DOM: refreshConfig's catch calls this too, where a throw from
+        # `html` would go uncaught.
+        self.assertIn('document.createElement("option")', options)
+        self.assertIn("option.textContent = c", options)
+        self.assertNotIn("setHtml(", options)
 
     def test_a_failed_config_read_keeps_the_last_classes(self):
         """`refreshConfig` hands the classes over in one call, and a read that threw
@@ -5023,11 +5196,13 @@ class ToolPolicySourceTests(unittest.TestCase):
 
         An escaped template would be correct today and one careless edit from not
         being; `textContent` cannot be got wrong later. Asserted rather than trusted
-        because the neighbouring egress table does use `innerHTML`, so the safe
-        pattern here is the local exception and reads like an oversight."""
+        because the neighbouring egress table is an `html` template put in place with
+        `setHtml`, so the safe pattern here is the local exception and reads like an
+        oversight."""
         for name, body in (("table", self.rows), ("picker", self.picker)):
             with self.subTest(render=name):
                 self.assertNotIn("innerHTML", body)
+                self.assertNotIn("setHtml(", body)
                 self.assertIn("textContent", body)
 
     def test_a_failed_refresh_keeps_the_rules_and_reports_the_staleness(self):
@@ -5314,36 +5489,340 @@ def _requested_paths(js: str) -> list[list[str]]:
              for stand in _ID_STANDINS] for r in raw]
 
 
+#: Every case `HtmlTagTests` reads, under one import of dom.js. A refusal is reported
+#: as its class and message, so a TypeError from a missing check reads differently from
+#: the module's own.
+_HTML_PROBE = r"""
+import { pathToFileURL } from "node:url";
+const dom = await import(pathToFileURL(`${process.env.DOCKADE_UI_DIR}/dom.js`).href);
+const { html, setHtml } = dom;
+const bad = `<img src=x onerror="a('b')"> & c`;
+const put = f => { const el = {}; setHtml(el, f); return el.innerHTML; };
+const v = "src=x onerror=alert(1)";
+const tpl = (strings, ...values) =>
+  html(Object.freeze(Object.assign([...strings], { raw: [...strings] })), ...values);
+const err = f => {
+  try { f(); return null; } catch (e) { return [e.constructor.name, e.message]; }
+};
+console.log(JSON.stringify({
+  exports: Object.keys(dom).sort(),
+  text: put(html`<td>${bad}</td>`),
+  dq: put(html`<td title="${bad}">x</td>`),
+  sq: put(html`<td title='${bad}'>x</td>`),
+  missing: put(html`${null}|${undefined}|${0}|${false}|${42}`),
+  nested: put(html`<b>${html`<i>${bad}</i>`}</b>`),
+  array: put(html`${[html`<i>1</i>`, "<b>", 2, null]}`),
+  untagged: put(html`${`<b>${bad}</b>`}`),
+  in_tag: put(html`<tr${html` class="o"`}${""}${[html` id="a"`, ""]}>`),
+  in_tag_value: err(() => html`<tr ${"x"}>`),
+  in_tag_array: err(() => html`<tr ${["x"]}>`),
+  in_tag_null: err(() => html`<tr ${null}>`),
+  unquoted: err(() => html`<td a=${"x"}>`),
+  after_quoted: err(() => html`<td a="1" ${"x"}>`),
+  after_quoted_sq: err(() => html`<td a='1' ${"x"}>`),
+  tag_name: err(() => html`<${"img"} src=x>`),
+  end_tag: err(() => html`</${"td"}>`),
+  fragment_in_dq: err(() => html`<td title="${html`<b>`}">`),
+  fragment_in_sq: err(() => html`<td title='${html`<b>`}'>`),
+  comment: err(() => html`<!-- ${"x"} -->`),
+  declaration: err(() => html`<?x ${"x"}>`),
+  string: err(() => html("<b>")),
+  array_arg: err(() => html(["<b>"])),
+  raw_array: err(() => html(Object.assign(["<b>"], { raw: ["<b>"] }))),
+  frozen_array: err(() => html(Object.freeze(["<b>"]))),
+  array_like: err(() => html(Object.freeze({ 0: "<b>", length: 1, raw: ["<b>"] }))),
+  mint: err(() => new (html``.constructor)({}, "<b>")),
+  set_string: err(() => setHtml({}, "<b>")),
+  set_object: err(() => setHtml({}, {})),
+  set_null: err(() => setHtml({}, null)),
+  set_proto: err(() => setHtml({}, Object.create(Object.getPrototypeOf(html``)))),
+  // Where a fragment ends, and a fragment read again where it is placed.
+  open_fragment: err(() => html`${html`<td `}${"x onmouseover=alert(1)"}>`),
+  open_fragment_alone: err(() => html`${html`<td `}>`),
+  fragment_into_quote: err(() => html`${html`<td title="`}${"x"}">`),
+  set_open: err(() => setHtml({}, html`<td `)),
+  set_open_quote: err(() => setHtml({}, html`<td title="`)),
+  retracked: err(() => html`<td ${html` a=${"x"}`}>`),
+  retracked_quoted: put(html`<td${html` title="${bad}"`}>`),
+  fragment_after_eq: err(() => html`<td a=${html`"x"`}>`),
+  fragment_opens_value: err(() => html`<td a=${html`"x`}">`),
+  fragment_in_attr_name: err(() => html`<td hidden${html` a="1"`}>`),
+  // A quote opens a value only after `=`.
+  quote_in_name: err(() => html`<td foo"${"x"}">`),
+  quote_in_allowed_name: err(() => html`<td title"${"x"}">`),
+  quote_in_unquoted: err(() => html`<td a=b"${"x"}">`),
+  spaced_eq: put(html`<td title = "${bad}" b>x</td>`),
+  bare_attr: put(html`<td hidden>${bad}</td>`),
+  empty_eq: put(html`<td a=>${bad}</td>`),
+  unquoted_constant: put(html`<td a=b title="${bad}" c=d>${bad}</td>`),
+  // Hand-built template objects: the runtime check lets them by (the source guard
+  // stops them), which is what lets a name be varied here.
+  hand_built: put(tpl(["<b>", "</b>"], "x")),
+  raw: Object.fromEntries(["script", "SCRIPT", "/script", "script/", "script x=1",
+    "style", "textarea", "title",
+    "iframe", "noscript", "noembed", "noframes", "xmp", "plaintext"].map(
+    n => [n, err(() => tpl([`<${n}>`]))])),
+  raw_split: err(() => html`<${""}script>`),
+  // Default-deny: every attribute but title, class, data-* and aria-* refuses a value.
+  refused_attr: Object.fromEntries([["a", "onclick"], ["a", "ONMOUSEOVER"], ["a", "href"],
+    ["img", "src"], ["img", "srcset"], ["form", "action"], ["button", "formaction"],
+    ["a", "style"], ["a", "srcdoc"], ["a", "xlink:href"], ["object", "data"],
+    ["animate", "values"], ["meta", "content"], ["a", "ping"], ["td", "id"], ["td", "a"],
+    ["td", "titles"], ["td", "xtitle"], ["td", "data-"], ["td", "data-x_y"],
+    ["td", "aria-"], ["td", "aria-x1"]].map(
+    ([t, n]) => [`${t} ${n}`, [err(() => tpl([`<${t} ${n}="`, `">`], "x")),
+                               err(() => tpl([`<${t} ${n}='`, `'>`], "x"))]])),
+  allowed_attr: Object.fromEntries(["title", "TITLE", "class", "data-group", "DATA-X",
+    "data-x-1", "aria-expanded"].map(n => [n, put(tpl([`<td ${n}="`, `">`], "x"))])),
+  // The browser ends a name at `/` or a space and starts the next attribute after it.
+  unsafe_after: Object.fromEntries(["a/href", "a /href", "a x/href", "a x /href",
+    "a x href"].map(t => [t, err(() => tpl([`<${t}="`, `">`], "x"))])),
+  unsafe_constant: put(html`<a href="#x" style="color: red">x</a>`),
+  // The second review's shapes: a `<` that starts no tag name, which the browser reads
+  // as text or a comment, so the rest was read as a tag that was not there.
+  no_tag_name: Object.fromEntries([
+    ["<${''}", () => html`<td>a<${""} t="><img ${v}">b</td>`],
+    ["<${html`1`}", () => html`<td>a<${html`1`} t="><img ${v}">b</td>`],
+    ["</!x", () => html`<td>a</!x t="><img ${v}">b</td>`],
+    ["</ x", () => html`<td>a</ x t="><img ${v}">b</td>`],
+    ["<//x", () => html`<td>a<//x t="><img ${v}">b</td>`],
+    ["< before a value", () => html`<td>a<${"b"}>`],
+    ["1 < 2", () => html`<td>1 < 2</td>`],
+    ["<1", () => html`<td>1 <1</td>`],
+  ].map(([k, f]) => [k, err(f)])),
+  // Every space the browser ends a name at, before the next attribute.
+  spaces: Object.fromEntries(["\t", "\n", "\f", "\r", " "].map(w => [JSON.stringify(w), [
+    put(tpl([`<td title="a"${w}data-x="`, `">`], "x")),
+    err(() => tpl([`<td title="a"${w}onclick="`, `">`], "x"))]])),
+  eq_starts_name: err(() => html`<td title="a" ="${"x"}">`),
+  after_bare_attr: put(html`<td hidden ${html`class="a"`}>`),
+  fragment_ends_bare: put(html`<td ${html`hidden`}>`),
+}));
+"""
+
+
 @unittest.skipIf(not _NODE and not _STRICT,
                  "node is not installed — skipping the dom.js unit tests")
-class EscapeTests(unittest.TestCase):
-    """`esc` is what stands between an agent-chosen string and the tables the page
-    builds from HTML strings (the rules, the leases, the audit rows). The source guards
-    check that it is called at the cells they name; this checks that it escapes."""
+class HtmlTagTests(unittest.TestCase):
+    """`html` and `setHtml` are the only way markup reaches the approval page
+    (`PageChecks`' sink guard), and what stands between an agent-chosen string and the
+    tables built from templates (the rules, the leases, the audit rows). Each case goes
+    through `setHtml` onto a stand-in element, as the page's do."""
 
     @classmethod
     def setUpClass(cls) -> None:
         if not _NODE:
             raise AssertionError("node is not installed and DOCKADE_REQUIRE_TOOLS is set")
-        script = ('import { esc } from "' + (UI_DIR / "dom.js").as_uri() + '";\n'
-                  'console.log(JSON.stringify([`<img src=x onerror="a(\'b\')"> & c`, '
-                  'null, undefined, 0, 42].map(esc)));')
-        # _NODE is absolute (shutil.which), no shell; the script names a repo path.
+        env = {**os.environ, "DOCKADE_UI_DIR": str(_served_dir())}
+        # _NODE is absolute (shutil.which), no shell; the script names a temp copy.
         proc = subprocess.run(  # noqa: S603
-            [_NODE, "--input-type=module", "-e", script],
-            capture_output=True, text=True, timeout=60, check=False)
+            [_NODE, "--input-type=module", "-e", _HTML_PROBE],
+            capture_output=True, text=True, timeout=60, check=False, env=env)
         if proc.returncode != 0:
-            raise AssertionError(f"node could not import dom.js:\n{proc.stderr}")
+            raise AssertionError(f"node could not run the dom.js probe:\n{proc.stderr}")
         cls.out = json.loads(proc.stdout)
 
-    def test_every_character_that_ends_text_or_an_attribute_is_escaped(self):
-        self.assertEqual(self.out[0], "&lt;img src=x onerror=&quot;a(&#39;b&#39;)&quot;&gt;"
-                                      " &amp; c")
+    ESCAPED = "&lt;img src=x onerror=&quot;a(&#39;b&#39;)&quot;&gt; &amp; c"
 
-    def test_a_missing_value_is_empty_and_a_number_is_its_digits(self):
-        # A null or undefined cell renders blank, never "null"; 0 is a value, not
-        # missing.
-        self.assertEqual(self.out[1:], ["", "", "0", "42"])
+    def refused(self, case: str, by: str) -> None:
+        self.assertIsNotNone(self.out[case], f"{case}: nothing was refused")
+        self.assertEqual(self.out[case][0], "Error", f"{case}: not the module's refusal")
+        self.assertTrue(self.out[case][1].startswith(by + ": "), self.out[case])
+
+    def test_the_module_exports_the_tag_and_the_sink_and_nothing_else(self):
+        # `esc` exported would be a second way to build markup, a string the sink then
+        # refuses; a `raw` would be the way round the tag.
+        self.assertEqual(self.out["exports"], ["html", "setHtml"])
+
+    def test_every_character_that_ends_text_or_an_attribute_is_escaped(self):
+        self.assertEqual(self.out["text"], f"<td>{self.ESCAPED}</td>")
+        self.assertEqual(self.out["dq"], f'<td title="{self.ESCAPED}">x</td>')
+        self.assertEqual(self.out["sq"], f"<td title='{self.ESCAPED}'>x</td>")
+
+    def assert_refusal(self, result, by: str = "html") -> None:
+        self.assertIsNotNone(result, "nothing was refused")
+        self.assertEqual(result[0], "Error", "not the module's refusal")
+        self.assertTrue(result[1].startswith(by + ": "), result)
+
+    def test_a_less_than_sign_that_starts_no_tag_name_is_refused(self):
+        """The browser reads `<` before anything but a letter, or `</` before anything
+        but a letter, as text or a comment. Modelling each reading is what two reviews
+        found holes in, so a template may not have one: in each of the first four the
+        tracker took ` t="` as opening a value and let `<img ${v}>` through as text."""
+        for shape, result in self.out["no_tag_name"].items():
+            with self.subTest(shape=shape):
+                self.assert_refusal(result)
+                # Before a plain value the in-tag rule refuses first: `put` sees the
+                # value in the name state.
+                if shape == "< before a value":
+                    self.assertEqual(result[1], 'html: only a fragment or "" may sit '
+                                                "inside a tag outside quotes")
+                else:
+                    self.assertIn("must start a tag name", result[1])
+
+    def test_a_missing_value_is_empty_and_any_other_is_its_text(self):
+        # A null or undefined cell renders blank, never "null"; 0 and false are values.
+        self.assertEqual(self.out["missing"], "||0|false|42")
+
+    def test_a_fragment_goes_in_once_as_markup_and_a_string_never_does(self):
+        self.assertEqual(self.out["nested"], f"<b><i>{self.ESCAPED}</i></b>")
+        self.assertEqual(self.out["array"], "<i>1</i>&lt;b&gt;2")
+        # An untagged template is a string like any other, however it looks.
+        self.assertEqual(self.out["untagged"], f"&lt;b&gt;{self.ESCAPED}&lt;/b&gt;")
+
+    def test_inside_a_tag_only_a_fragment_or_nothing_may_go(self):
+        self.assertEqual(self.out["in_tag"], '<tr class="o" id="a">')
+        for case in ("in_tag_value", "in_tag_array", "in_tag_null", "unquoted",
+                     "after_quoted", "after_quoted_sq", "tag_name", "end_tag"):
+            with self.subTest(case=case):
+                self.refused(case, "html")
+
+    def test_a_fragment_never_goes_inside_an_attribute_value(self):
+        for case in ("fragment_in_dq", "fragment_in_sq"):
+            with self.subTest(case=case):
+                self.refused(case, "html")
+
+    def test_a_template_with_a_comment_or_declaration_is_refused(self):
+        for case in ("comment", "declaration"):
+            with self.subTest(case=case):
+                self.refused(case, "html")
+
+    def test_only_a_tagged_template_makes_a_fragment(self):
+        # Each is refused by a different one of the checks: a template object is an
+        # array, frozen, with a `raw` array beside it.
+        for case in ("string", "array_arg", "raw_array", "frozen_array", "array_like",
+                     "mint"):
+            with self.subTest(case=case):
+                self.refused(case, "html")
+
+    def test_the_sink_takes_a_fragment_and_nothing_that_looks_like_one(self):
+        for case in ("set_string", "set_object", "set_null", "set_proto"):
+            with self.subTest(case=case):
+                self.refused(case, "setHtml")
+
+    def test_the_sink_refuses_markup_that_ends_inside_a_tag(self):
+        for case in ("set_open", "set_open_quote"):
+            with self.subTest(case=case):
+                self.refused(case, "setHtml")
+
+    def test_a_fragment_ends_where_it_was_placed(self):
+        # The first is the shape that let `x onmouseover=…` in as attributes: the
+        # fragment left the tag open, and the value after it was read as text.
+        for case in ("open_fragment", "open_fragment_alone", "fragment_into_quote"):
+            with self.subTest(case=case):
+                self.refused(case, "html")
+
+    def test_a_fragment_is_read_again_where_it_is_placed(self):
+        # ` a=${x}` is harmless text where it was written and an unquoted value where it
+        # lands; a quoted value stays a quoted value.
+        self.refused("retracked", "html")
+        self.assertEqual(self.out["retracked_quoted"], f'<td title="{self.ESCAPED}">')
+
+    def test_a_fragment_goes_only_between_tags_or_attributes(self):
+        for case in ("fragment_after_eq", "fragment_opens_value", "fragment_in_attr_name"):
+            with self.subTest(case=case):
+                self.refused(case, "html")
+
+    def test_a_quote_opens_a_value_only_after_an_equals_sign(self):
+        # The browser reads `foo"` as an attribute's name and `b"` as part of an
+        # unquoted value, so what follows is in the tag.
+        for case in ("quote_in_name", "quote_in_allowed_name", "quote_in_unquoted"):
+            with self.subTest(case=case):
+                self.refused(case, "html")
+        self.assertEqual(self.out["spaced_eq"], f'<td title = "{self.ESCAPED}" b>x</td>')
+
+    def test_a_tag_closes_after_any_kind_of_attribute(self):
+        self.assertEqual(self.out["bare_attr"], f"<td hidden>{self.ESCAPED}</td>")
+        self.assertEqual(self.out["empty_eq"], f"<td a=>{self.ESCAPED}</td>")
+        self.assertEqual(self.out["unquoted_constant"],
+                         f'<td a=b title="{self.ESCAPED}" c=d>{self.ESCAPED}</td>')
+
+    def test_an_element_whose_content_is_not_markup_is_refused(self):
+        for name, result in self.out["raw"].items():
+            with self.subTest(element=name):
+                self.assertIsNotNone(result)
+                self.assertEqual(result[0], "Error")
+                self.assertTrue(result[1].startswith("html: "), result)
+        self.refused("raw_split", "html")
+
+    def test_a_value_goes_only_in_title_class_data_or_aria(self):
+        """Default-deny: a URL, script or style attribute takes a value harmlessly
+        quoted and harmful anyway, and so do others nobody listed (`<object data=`,
+        `<animate values=`, `<meta content=`). The names match whole, in any case."""
+        for name, results in self.out["refused_attr"].items():
+            for quote, result in zip(("double", "single"), results):
+                with self.subTest(attribute=name, quote=quote):
+                    self.assert_refusal(result)
+                    self.assertIn("no value in", result[1])
+        for name, result in self.out["allowed_attr"].items():
+            with self.subTest(attribute=name):
+                self.assertEqual(result, f'<td {name}="x">')
+        for shape, result in self.out["unsafe_after"].items():
+            with self.subTest(shape=shape):
+                self.assertIsNotNone(result)
+                self.assertTrue(result[1].startswith("html: no value in href="), result)
+        # A constant there is the template's own text.
+        self.assertEqual(self.out["unsafe_constant"],
+                         '<a href="#x" style="color: red">x</a>')
+
+    def test_every_space_ends_an_attribute_name(self):
+        # Read as `data-x` after each, and as `onclick`, refused.
+        for space, (allowed, refused) in self.out["spaces"].items():
+            with self.subTest(space=space):
+                self.assertEqual(allowed, '<td title="a"' + json.loads(space)
+                                 + 'data-x="x">')
+                self.assert_refusal(refused)
+
+    def test_an_equals_sign_after_a_value_starts_a_name_not_a_value(self):
+        # `="…"` after a quoted value is an attribute named `="…"`, not a second value
+        # for `title`.
+        self.refused("eq_starts_name", "html")
+
+    def test_a_fragment_may_follow_a_bare_attribute(self):
+        self.assertEqual(self.out["after_bare_attr"], '<td hidden class="a">')
+        # And end on one: `hidden` on a lease member is that.
+        self.assertEqual(self.out["fragment_ends_bare"], "<td hidden>")
+
+    def test_a_hand_built_template_object_gets_past_the_runtime_check(self):
+        # Documented, not wanted: the check stops accidents, and the source guard
+        # (`PageChecks.test_html_is_only_ever_a_tag_on_a_template`) stops this.
+        self.assertEqual(self.out["hand_built"], "<b>x</b>")
+
+
+class MarkupTemplateSourceTests(unittest.TestCase):
+    """A template that builds markup without the `html` tag in front is a string: put
+    into an `html` template it shows as escaped text, which only a browser shows, and
+    only on a branch some fixture draws. The modules that build their tables with
+    `html` keep every markup-looking literal tagged."""
+
+    def test_every_template_with_markup_in_the_table_modules_is_tagged(self):
+        for path in (AUDIT_JS, EGRESS_RULES_JS, LEASES_JS):
+            with self.subTest(module=path.name):
+                found = _templates(path.read_text())
+                self.assertTrue(any(tag == "html" for tag, _ in found),
+                                "no html`…` found — did the scan go blind?")
+                self.assertEqual([text for tag, text in found
+                                  if "<" in text and tag != "html"], [])
+
+    def test_the_scan_finds_an_untagged_template_where_one_hides(self):
+        # Nested in a tagged one, past a regex literal, strings and comments holding a
+        # backtick, an escaped backtick, and a division.
+        js = ('const r = /[`"/]\\/`/g, q = "`\\"", s = \'`\'; // a ` here\n'
+              "/* and ` here */ const n = a / b / c;\n"
+              'const t = html`<td>\\`${x ? `<b>${{y}.y}</b>` : ""}</td>`;\n')
+        self.assertEqual(_templates(js), [("", "<b>${}</b>"),
+                                          ("html", "<td>\\`${}</td>")])
+
+    def test_the_sink_pattern_knows_every_parser(self):
+        for use in ('el.innerHTML = s', 'el.outerHTML = s',
+                    'el.insertAdjacentHTML("beforeend", s)',
+                    'document.execCommand("insertHTML", false, s)', 'document.write(s)',
+                    'document.writeln(s)', 'new DOMParser()',
+                    'range.createContextualFragment(s)', 'frame.srcdoc = s',
+                    'el.setHTML(s)', 'el.setHTMLUnsafe(s)', 'Document.parseHTML(s)',
+                    'Document.parseHTMLUnsafe(s)'):
+            with self.subTest(use=use):
+                self.assertTrue(_MARKUP_SINKS.search(use))
 
 
 class CallSiteSourceTests(unittest.TestCase):
@@ -5483,6 +5962,9 @@ class PageChecks:
     #: Fewer fetch/EventSource calls found than this is the scan going blind, not the
     #: page calling less: each page's count today, less a margin.
     MIN_CALLS: ClassVar[int]
+    #: The one module that hands markup to the browser, through `setHtml`, or None for
+    #: a page that builds all of its elements with the DOM.
+    MARKUP_MODULE: ClassVar[str | None]
 
     @property
     def index(self) -> str:
@@ -5714,12 +6196,51 @@ class PageChecks:
         # The pattern is in use, so a regex that stopped matching it would pass empty.
         self.assertTrue(declared_anywhere, "no bare `let` found; did the shape change?")
 
+    def test_markup_reaches_the_page_only_through_the_declared_module(self):
+        """A string parsed as markup is where an agent-chosen value can become an
+        element, so each page has at most one place that does it: `setHtml` on the
+        approval page, which takes only what the escaping `html` tag built, and none on
+        the tasks page. Any other module naming a parser fails here, whether or not
+        what it parses could carry such a value. The declared module must still name
+        `innerHTML`, or this would pass while guarding nothing."""
+        texts = self.texts()
+        if self.MARKUP_MODULE is not None:
+            self.assertIn(self.MARKUP_MODULE, texts)
+        for name, js in texts.items():
+            with self.subTest(module=name):
+                found = sorted(set(_MARKUP_SINKS.findall(_code(js))))
+                self.assertEqual(found,
+                                 ["innerHTML"] if name == self.MARKUP_MODULE else [])
+
+    def test_html_is_only_ever_a_tag_on_a_template(self):
+        """Called with a string or an array, `html` throws, but only when that line
+        runs, and a hand-built template object (a frozen array with a `raw`) gets past
+        that check: this guard is what stops one. A module aliasing `html` or importing
+        its module whole is one a reader of this guard can no longer follow. So outside
+        its own module `html` is always directly followed by a backtick, and the module
+        is imported by name for `html` and `setHtml` alone."""
+        for name, js in self.texts().items():
+            if name == self.MARKUP_MODULE:
+                continue
+            with self.subTest(module=name):
+                # Strings are not stripped, so a literal such as "text/html" trips this;
+                # one that is ever needed means stripping strings from `code` first.
+                self.assertEqual(re.findall(r"(?<![\w$.])html\b(?!`).{0,12}", _code(js)),
+                                 [], "`html` used other than as html`…`")
+                module = re.escape(self.MARKUP_MODULE or "")
+                every = re.findall(rf'from\s+"\./{module}"', js)
+                named = re.findall(rf'import \{{[^}}]*\}}\s*from\s+"\./{module}"', js)
+                self.assertEqual(len(every), len(named), "imported other than by name")
+                self.assertLessEqual(
+                    _named_imports(js).get(self.MARKUP_MODULE, set()), {"html", "setHtml"})
+
 
 class ApprovalPageTests(PageChecks, unittest.TestCase):
     UI_DIR = UI_DIR
     APP = ui
     LOCAL = frozenset({"/", "/healthz", "/tasks-link"})
     MIN_CALLS = 20
+    MARKUP_MODULE = "dom.js"
 
     def test_the_link_to_the_tasks_ui_opens_apart_from_this_page(self):
         # A new tab with no `window.opener` handle back on this one, and no referrer:
@@ -5832,6 +6353,7 @@ class PinnedAllowTableSourceTests(unittest.TestCase):
         # Agent-authored values, so never markup, and never a parsed-and-restringified
         # copy of them.
         self.assertNotIn("innerHTML", self.rows)
+        self.assertNotIn("setHtml(", self.rows)
         self.assertIn("pinText(row.pins_json)", self.rows)
         self.assertNotIn("JSON.stringify", self.rows)
 
@@ -5933,6 +6455,7 @@ class PinPanelSourceTests(unittest.TestCase):
 
     def test_values_are_text_and_spelled_out(self):
         self.assertNotIn("innerHTML", self.panel)
+        self.assertNotIn("setHtml(", self.panel)
         self.assertIn("code.textContent = pinText(f.value).text", self.panel)
 
     def test_nothing_starts_ticked(self):
@@ -6448,6 +6971,7 @@ class PayloadColourTests(unittest.TestCase):
         self.assertIn("createTextNode(piece)", body.group(1))
         self.assertNotIn("innerHTML", body.group(1))
         self.assertNotIn("insertAdjacentHTML", body.group(1))
+        self.assertNotIn("setHtml(", body.group(1))
 
     def test_every_kind_but_space_and_string_has_a_colour(self):
         # A string keeps the payload's default colour; the rest need a rule.

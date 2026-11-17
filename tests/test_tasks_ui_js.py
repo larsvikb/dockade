@@ -47,6 +47,8 @@ class TasksPageTests(PageChecks, unittest.TestCase):
     APP = tui
     LOCAL = frozenset({"/", "/healthz", "/running"})
     MIN_CALLS = 8
+    # Nothing on this page is parsed as markup (`PageChecks`' sink guard).
+    MARKUP_MODULE = None
 
 
 _TASKS_PROBE = r"""
@@ -2464,12 +2466,6 @@ class TaskRenderingSourceTests(unittest.TestCase):
 
     def test_the_guards_read_every_module_the_page_serves(self):
         self.assertEqual(set(self.MODULES), set(tui.UI_MODULES))
-
-    def test_nothing_is_parsed_as_markup(self):
-        for name, src in self.MODULES.items():
-            with self.subTest(module=name):
-                self.assertNotRegex(src, r"innerHTML|outerHTML|insertAdjacentHTML|"
-                                         r"document\.write|DOMParser")
 
     def test_every_agent_field_goes_through_the_spelling(self):
         code = "\n".join(_code(src) for src in self.MODULES.values())

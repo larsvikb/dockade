@@ -111,6 +111,22 @@ cross-cutting points are kept here.
   (`DWELL_MS`), so an expiry — the one departure that reports a governance failure —
   stays on screen long enough to read. Cards are built with `createElement`/`textContent`,
   so the agent-controlled host/url/client render as text with no escaping question.
+- **Markup reaches the page only through `html` and `setHtml`** (`dom.js`). The tables
+  built from templates (decisions, rules, leases) carry agent-chosen hosts and server
+  text, and a per-cell `esc()` was a duty one forgotten call broke with every test
+  green. `html` escapes every value that is not a fragment it made, and is default-deny
+  about where one goes: in text, or in the quoted value of `title`, `class`, `data-*` or
+  `aria-*`, and nowhere else. Where the browser has more than one reading of a template
+  (a `<` that starts no tag name, a comment, a script or other raw-text element) it
+  refuses the template rather than model the reading. A fragment is read again where it
+  is placed and has to end where it began. `setHtml` accepts only fragments, and only
+  ones that end outside a tag. An unescaped value then takes an edit to `dom.js`, whose
+  tests read it.
+  `PageChecks` holds both pages to it: no module but the declared one names a markup
+  parser (none on the tasks page), `html` is only ever a tag, and
+  `MarkupTemplateSourceTests` keeps every markup literal in the table modules tagged.
+  Each poll renders inside its `try`, so a render the tag refuses reads as a failed
+  refresh over the old rows.
 - **The card reports its own outcome and deadline.** A resolve shows its result inline,
   the pattern echoed from the *backend* so it names what was stored; the hold countdown
   comes from `GET /api/config` (`{"hold_timeout"}`, on the relay allowlist — the one

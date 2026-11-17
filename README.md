@@ -385,7 +385,8 @@ dockade/
     audit.js                #   the record as browsed: what a row says, how rows fold, the
                             #   filters and their query, the pager, coverage and outage summaries
                             #   — and the decisions view itself, which start() mounts
-    dom.js                  #   what more than one surface needs to build markup: esc
+    dom.js                  #   the one way markup reaches the page: html, a template tag
+                            #   that escapes every value, and setHtml, its only sink
     egress-rules.js         #   what creating, editing or revoking a standing rule is about
                             #   to do, said before the click — and the Policy view itself,
                             #   which start() mounts

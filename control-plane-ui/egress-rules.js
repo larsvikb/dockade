@@ -10,7 +10,7 @@
  * (tests/test_control_plane_ui_js.py).
  */
 
-import { esc } from "./dom.js";
+import { html, setHtml } from "./dom.js";
 import { renderListStatus } from "./list-status.js";
 import { rulesStatus } from "./status.js";
 import { fmtStamp } from "./time.js";
@@ -296,6 +296,37 @@ export async function refreshRules() {
     // into something that renders as an empty but SUCCESSFUL policy.
     if (!res.ok) throw new Error(String(res.status));
     rows = await res.json();
+    // Inside the try, and before anything below the catch: a render that throws
+    // (`html` refusing a value) is a failed refresh like any other, and leaves the
+    // signature, the counts and `rulesById` describing the rows still on screen.
+    setHtml(document.getElementById("rules"), html`${rows.map(r => {
+      const wild = (r.pattern || "").startsWith(".");
+      const p = revokePreview(r);
+      // A seed rule shows WHY it has no control rather than an empty cell, so
+      // nobody has to wonder whether the button failed to render. The id is on the
+      // button because revocation keys on it, never on the pattern.
+      // Edit before revoke, in the order the operator should reach for them: changing
+      // a rule is the recoverable action and taking it away is not, so the
+      // destructive one is not the first button under the pointer.
+      const control = p.allowed
+        ? html`<button type="button" class="edit" data-rule="${String(r.id)}"
+               >edit</button>
+             <button type="button" class="revoke" data-rule="${String(r.id)}"
+               >revoke</button>`
+        : html`<span class="ts" title="${p.text}">from seed</span>`;
+      // The fourth cell says WHICH client population this rule decides for.
+      // Load-bearing rather than informational: the same pattern can appear twice with
+      // different actions, one row per class, and without this column those two rows
+      // look like a contradiction instead of two scoped rules.
+      return html`<tr>
+          <td><span class="tag ${r.action}">${r.action}</span></td>
+          <td><code>${r.pattern}</code></td>
+          <td class="${wild ? "wild" : "ts"}">${r.scope}</td>
+          <td class="ts">${r.client_class || ""}</td>
+          <td class="ts">${r.source}</td>
+          <td class="ts">${r.created_at ? fmtStamp(r.created_at) : ""}</td>
+          <td>${control}</td></tr>`;
+    })}`);
   } catch (e) {
     // A failed refresh keeps the rows and SAYS SO, rather than swallowing it as
     // "transient; next poll retries" — which it is, right up until it is not.
@@ -327,34 +358,6 @@ export async function refreshRules() {
   document.getElementById("badge-policy").textContent = String(rows.length);
   document.getElementById("rulecount").textContent =
     rows.length ? `· ${rows.length} rule${rows.length === 1 ? "" : "s"}` : "· none";
-  document.getElementById("rules").innerHTML = rows.map(r => {
-    const wild = (r.pattern || "").startsWith(".");
-    const p = revokePreview(r);
-    // A seed rule shows WHY it has no control rather than an empty cell, so
-    // nobody has to wonder whether the button failed to render. The id is on the
-    // button because revocation keys on it, never on the pattern.
-    // Edit before revoke, in the order the operator should reach for them: changing a
-    // rule is the recoverable action and taking it away is not, so the destructive one
-    // is not the first button under the pointer.
-    const control = p.allowed
-      ? `<button type="button" class="edit" data-rule="${esc(String(r.id))}"
-             >edit</button>
-           <button type="button" class="revoke" data-rule="${esc(String(r.id))}"
-             >revoke</button>`
-      : `<span class="ts" title="${esc(p.text)}">from seed</span>`;
-    return `<tr>
-        <td><span class="tag ${esc(r.action)}">${esc(r.action)}</span></td>
-        <td><code>${esc(r.pattern)}</code></td>
-        <td class="${wild ? "wild" : "ts"}">${esc(r.scope)}</td>
-        <!-- WHICH client population this rule decides for. Load-bearing rather than
-             informational: the same pattern can appear twice with different actions,
-             one row per class, and without this column those two rows look like a
-             contradiction instead of two scoped rules. -->
-        <td class="ts">${esc(r.client_class || "")}</td>
-        <td class="ts">${esc(r.source)}</td>
-        <td class="ts">${r.created_at ? fmtStamp(r.created_at) : ""}</td>
-        <td>${control}</td></tr>`;
-  }).join("");
   renderRulesStatus(rows.length);
   // The preview's conflict check reads these rows, so a rule that appeared elsewhere
   // shows up in the form rather than waiting to surface as a 409 on click.
@@ -404,8 +407,14 @@ let ruleNotice = null;
 
 function renderClassOptions() {
   const chosen = ruleClassEl.value;
-  ruleClassEl.innerHTML = clientClasses.map(
-    c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
+  // Built with the DOM rather than `html`: refreshConfig's catch calls this too, where
+  // a throw from the tag would go uncaught.
+  ruleClassEl.replaceChildren(...clientClasses.map(c => {
+    const option = document.createElement("option");
+    option.value = c;
+    option.textContent = c;
+    return option;
+  }));
   // Keep the operator's choice across a refresh; otherwise a poll landing mid-type
   // silently re-scopes the rule they are composing.
   if (chosen && clientClasses.includes(chosen)) ruleClassEl.value = chosen;

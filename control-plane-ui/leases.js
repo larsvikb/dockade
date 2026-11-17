@@ -10,7 +10,7 @@
  */
 
 import { refreshAudit } from "./audit.js";
-import { esc } from "./dom.js";
+import { html, setHtml } from "./dom.js";
 import { COUNTDOWN_URGENT_S } from "./holds.js";
 import { renderListStatus } from "./list-status.js";
 import { shortActor } from "./provenance.js";
@@ -171,7 +171,7 @@ function renderLeasesStatus(rowCount) {
 }
 
 export async function refreshLeases() {
-  let rows;
+  let rows, groups;
   try {
     const res = await fetch("/api/egress/leases");
     // Checked like the rules poll: a 4xx body reaching .json() either throws
@@ -179,6 +179,35 @@ export async function refreshLeases() {
     // leased", which is the reassuring reading and the wrong one.
     if (!res.ok) throw new Error(String(res.status));
     rows = await res.json();
+    groups = groupLeases(rows);
+    // Inside the try, and before anything below the catch: a render that throws
+    // (`html` refusing a value) is a failed refresh like any other, and leaves the
+    // count and `leasesById` describing the rows still on screen.
+    setHtml(leasesEl, html`${groups.map(g => {
+      if (!g.grouped) return leaseRow(g.leases[0], false);
+      const open = expandedLeaseGroups.has(g.key);
+      const cd = leaseCountdown(leaseRemaining(g.soonest, Date.now()));
+      // The summary counts down by the group's SOONEST expiry, which is the next thing
+      // about it that will change — and it carries `data-expires` like any other
+      // countdown cell, so the one-second tick moves it with no special case.
+      //
+      // No revoke on this row. A button that ended four grants at once is a different
+      // and much sharper action than the per-lease one, and it would need the confirm
+      // step this table deliberately does not have; revocation stays where the thing
+      // being revoked is named.
+      const summary = html`<tr class="lease-group">
+          <td><button type="button" class="group-toggle"
+                data-group="${g.key}" aria-expanded="${open}"
+              >${open ? "▾" : "▸"}</button>
+            <code>${g.domain}</code>
+            <span class="ts">${g.count} hosts</span></td>
+          <td class="ts">${g.clientClass}</td>
+          <td class="lease-left${cd.urgent ? " urgent" : ""}"
+              data-expires="${String(g.soonest)}">${cd.text}</td>
+          <td class="ts">first to lapse</td>
+          <td></td></tr>`;
+      return html`${summary}${g.leases.map(r => leaseRow(r, true, g.key, open))}`;
+    })}`);
   } catch (e) {
     // Keeps the rows and says so, rather than blanking a table whose whole subject
     // is what is in force at this moment — an empty one would read as "nothing is
@@ -195,7 +224,6 @@ export async function refreshLeases() {
   // would be answering a question about the table instead.
   leasesCountEl.textContent = rows.length ? `· ${rows.length} live` : "";
   leasesTableEl.hidden = rows.length === 0;
-  const groups = groupLeases(rows);
   // Groups that no longer exist are dropped from the expanded set here rather than
   // left to accumulate: the key is (class, domain), so a group whose last lease
   // lapsed would otherwise keep its expansion and silently re-expand if the same
@@ -204,31 +232,6 @@ export async function refreshLeases() {
   for (const key of [...expandedLeaseGroups]) {
     if (!live.has(key)) expandedLeaseGroups.delete(key);
   }
-  leasesEl.innerHTML = groups.map(g => {
-    if (!g.grouped) return leaseRow(g.leases[0], false);
-    const open = expandedLeaseGroups.has(g.key);
-    const cd = leaseCountdown(leaseRemaining(g.soonest, Date.now()));
-    // The summary counts down by the group's SOONEST expiry, which is the next thing
-    // about it that will change — and it carries `data-expires` like any other
-    // countdown cell, so the one-second tick moves it with no special case.
-    //
-    // No revoke on this row. A button that ended four grants at once is a different
-    // and much sharper action than the per-lease one, and it would need the confirm
-    // step this table deliberately does not have; revocation stays where the thing
-    // being revoked is named.
-    const summary = `<tr class="lease-group">
-        <td><button type="button" class="group-toggle"
-              data-group="${esc(g.key)}" aria-expanded="${open}"
-            >${open ? "▾" : "▸"}</button>
-          <code>${esc(g.domain)}</code>
-          <span class="ts">${g.count} hosts</span></td>
-        <td class="ts">${esc(g.clientClass)}</td>
-        <td class="lease-left${cd.urgent ? " urgent" : ""}"
-            data-expires="${esc(String(g.soonest))}">${esc(cd.text)}</td>
-        <td class="ts">first to lapse</td>
-        <td></td></tr>`;
-    return summary + g.leases.map(r => leaseRow(r, true, g.key, open)).join("");
-  }).join("");
   renderLeasesStatus(rows.length);
 }
 
@@ -243,16 +246,16 @@ export async function refreshLeases() {
 // sending a remaining-seconds field at all.
 function leaseRow(r, member, groupKey, open) {
   const cd = leaseCountdown(leaseRemaining(r.expires_at, Date.now()));
-  return `<tr${member ? ` class="lease-member" data-group="${esc(groupKey)}"` : ""}
-        ${member && !open ? "hidden" : ""}>
-      <td><code>${esc(r.host)}</code></td>
-      <td class="ts">${esc(r.client_class || "")}</td>
+  return html`<tr${member ? html` class="lease-member" data-group="${groupKey}"` : ""}
+        ${member && !open ? html`hidden` : ""}>
+      <td><code>${r.host}</code></td>
+      <td class="ts">${r.client_class || ""}</td>
       <td class="lease-left${cd.urgent ? " urgent" : ""}"
-          data-expires="${esc(String(r.expires_at))}">${esc(cd.text)}</td>
-      <td class="actor" title="${esc(r.granted_by || "")}"
-        >${esc(shortActor(r.granted_by))}</td>
+          data-expires="${String(r.expires_at)}">${cd.text}</td>
+      <td class="actor" title="${r.granted_by || ""}"
+        >${shortActor(r.granted_by)}</td>
       <td><button type="button" class="revoke"
-            data-lease="${esc(String(r.id))}">revoke</button></td></tr>`;
+            data-lease="${String(r.id)}">revoke</button></td></tr>`;
 }
 
 // Only the countdown cells, and only their text and urgency — never the row. Rebuilding

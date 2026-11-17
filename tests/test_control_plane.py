@@ -13,7 +13,8 @@ and the cap's concurrency/availability behavior, are invisible from the sandbox'
 vantage point (see DESIGN.md). Here we test the reservation function directly.
 
 Dependency-free: ``fastapi``/``pydantic`` are stubbed (see ``tests/_loader.py``),
-and the store is a throwaway SQLite file in a temp dir set before import."""
+and the store is a throwaway SQLite file in this module's own temp dir, bound in
+``setUpModule`` (``use_control_store`` in ``tests/_loader.py``)."""
 from __future__ import annotations
 
 import atexit
@@ -30,16 +31,28 @@ import unittest
 from typing import ClassVar
 from unittest import mock
 
-# The module reads CONTROL_DB at import time — point it at a throwaway file and
-# suppress seeding (we drive the rules table directly) before loading.
+# A throwaway store, with seeding suppressed (we drive the rules table directly).
 _TMP = tempfile.mkdtemp(prefix="dockade-cp-test-")
 atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
-os.environ["CONTROL_DB"] = os.path.join(_TMP, "control.db")
-os.environ["CONTROL_SEED"] = os.path.join(_TMP, "nonexistent-seed.txt")
+_DB = os.path.join(_TMP, "control.db")
+_SEED = os.path.join(_TMP, "nonexistent-seed.txt")
+# The import-time default for the control plane's store; ``setUpModule`` binds the
+# store to these paths while this module's tests run, since another module may
+# have loaded it first.
+os.environ["CONTROL_DB"] = _DB
+os.environ["CONTROL_SEED"] = _SEED
 
-from _loader import ROOT, load_control_plane  # noqa: E402 (must set env first)
+from _loader import (  # noqa: E402 (the env above is the import-time default)
+    ROOT,
+    load_control_plane,
+    use_control_store,
+)
 
 cp = load_control_plane()
+
+
+def setUpModule():
+    use_control_store(cp, _DB, _SEED)
 
 
 CLASS = cp.store.LEGACY_CLIENT_CLASS          # the class these tests decide as
@@ -2082,6 +2095,15 @@ class DuplicateGroupingTests(_HoldRegistryTestCase):
         self.assertNotIn("b", cp.holds._PENDING_EVENTS)
         self.assertNotIn("b", cp.holds._PENDING_WAITERS)
         self.assertEqual(sum(cp.holds._PENDING_WAITERS.values()), 1)
+
+
+class OwnStoreTests(unittest.TestCase):
+    """While this module's tests run, the store is this module's own, in the suite as
+    when run alone (tests/test_control_plane_store_isolation.py runs it beside the others)."""
+
+    def test_the_store_is_this_modules_own(self):
+        self.assertEqual(cp.store.DB_PATH, _DB)
+        self.assertEqual(cp.store.SEED_PATH, _SEED)
 
 
 if __name__ == "__main__":

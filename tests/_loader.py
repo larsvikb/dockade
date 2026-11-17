@@ -296,6 +296,24 @@ def load_control_plane() -> types.ModuleType:
     return module
 
 
+def use_control_store(cp: types.ModuleType, db_path: str, seed_path: str) -> None:
+    """Point the control plane's store at a test module's own database and seed file.
+
+    ``store`` is imported by plain name, so one process has one, and the
+    ``CONTROL_DB``/``CONTROL_SEED`` it read at import are those of whichever test
+    module loaded the control plane first. Discovery imports every module before it
+    runs any test, so a module calls this from ``setUpModule``, which unittest runs
+    before that module's first test, in the suite and run alone.
+
+    It rebinds the two paths rather than reloading ``store``: a reload re-reads the
+    environment, which holds the last-imported module's values unless they are set
+    back first, and it re-executes all of store.py where only these two paths need
+    changing. Nothing restores them afterwards: no later module depends on them, since
+    the others that read the store rebind its path per test."""
+    cp.store.DB_PATH = db_path
+    cp.store.SEED_PATH = seed_path
+
+
 def load_inventory() -> types.ModuleType:
     """The control plane's in-memory tool inventory, fresh per call.
 

@@ -231,8 +231,8 @@ def _templates(js: str) -> list[tuple[str, str]]:
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 # ``cp`` is the loaded control plane, for the two places this page duplicates a backend
 # rule and has to be held equal to it: `normalizePattern` and the wildcard floor.
-# Imported from the sibling test module rather than loaded again — that module already
-# owns the temp-store setup, and loading twice would give two modules with two databases.
+# Borrowed from the sibling test module rather than loaded a second time: this module
+# uses only ``cp.policy``, never the store.
 from test_control_plane_api import cp  # noqa: E402 (path set above)
 from test_control_plane_ui import ui  # noqa: E402 (path set above)
 from test_ui_guards import _directives  # noqa: E402 (path set above)

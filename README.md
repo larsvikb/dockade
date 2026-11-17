@@ -365,6 +365,8 @@ dockade/
     store.py                #   SQLite — schema, the audit write, the policy seed
     store_backup.py         #   the store copied out and put back, for make backup and
                             #   make restore
+    audit_prune.py          #   old audit rows and call tokens deleted, for make
+                            #   audit-prune
     audit.py                #   the read side: the folded glance, the paged record,
                             #   and the filters both share
     policy.py               #   what a rule pattern matches; peer address -> client

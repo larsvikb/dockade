@@ -564,8 +564,14 @@ class ToolOutcomeRowTests(unittest.TestCase):
     whitelist: recognised stage, recognised status, usable timestamp, and every other
     line dropped rather than interpreted.
 
-    No fixture beyond a line builder — the mapper is pure, and the drain around it is
-    the same one the egress tests already exercise."""
+    The mapper is pure, and the drain around it is the same one the egress tests
+    already exercise. The one exception is the column test, which drives the settle
+    pass on a real connection and so needs the store's schema: ``setUpClass`` creates
+    it, so the class passes when run on its own and not only after another class has."""
+
+    @classmethod
+    def setUpClass(cls):
+        cp.store._init_db()
 
     @staticmethod
     def line(**over):
@@ -779,9 +785,9 @@ class ToolOutcomeRowTests(unittest.TestCase):
 class ToolOutcomeDrainTests(IngestTestCase):
     """The outcome stream through the REAL drain and into the store.
 
-    The mapper tests above are pure; this is the one that proves the generalisation
-    actually wired a second stream up — that it has its own cursor row, its own
-    columns, and does not collide with the egress one."""
+    The mapper tests above stop at the mapper; this is the one that proves the
+    generalisation actually wired a second stream up — that it has its own cursor row,
+    its own columns, and does not collide with the egress one."""
 
     def setUp(self):
         super().setUp()

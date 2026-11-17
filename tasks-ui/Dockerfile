@@ -24,6 +24,7 @@ COPY tasks-ui/app.js ./app.js
 COPY tasks-ui/diff.js ./diff.js
 COPY ui-common/escape.js ./escape.js
 COPY ui-common/list-status.js ./list-status.js
+COPY tasks-ui/markdown.js ./markdown.js
 COPY tasks-ui/moves.js ./moves.js
 COPY tasks-ui/tasks.js ./tasks.js
 COPY ui-common/time.js ./time.js

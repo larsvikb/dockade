@@ -173,12 +173,60 @@ const SHELVED_UNAPPROVED = { ...REFINED, id: 17, title: "Shelved unapproved",
                              state: "deferred", revision: 7, plan: UNAPPROVED_PLAN,
                              notes: [] };
 
+// Task 18, refined and opened only by its URL, is written in markdown in every field the
+// detail draws as markdown: each construct of the subset carries a hidden character,
+// beside a link, an image, an HTML tag and comment, an ASCII info string, closing
+// hashes, a list numbered 1, 2, 5 and a CR LF, which are drawn as typed. Its plan 21
+// replaced plan 20, so its plan opens on what changed; its note's headings are an h2 the
+// page's own rule would capitalise and an h3 reading as the detail's "Plan", and its two
+// items, a blank line apart, are two lists. An option's label holds a heading and an
+// item, which a label, drawn inline, draws as typed.
+export const MD_BODY = [
+  `## Head${RLO}ing ##`,
+  "",
+  `A *em${ZWSP}* and **strong** and \`co${RLO}de\`, a [link](https://example.invalid/x).`,
+  "![img](https://example.invalid/i.png) <img src=\"https://example.invalid/j.png\"> "
+    + `<!-- a ${ZWSP}comment -->`,
+  "",
+  `- bul${ZWSP}let`,
+  "  - nested",
+  "1. one",
+  "2. two",
+  `5. five${RLO}`,
+  "",
+  `\`\`\`sh${ZWSP}`,
+  `echo ${RLO}hi`,
+  "```",
+  "~~~ ascii-info",
+  "plain",
+  "~~~",
+  "Line with CR LF\r",
+  "end",
+].join("\n");
+const MD_DECISION = {
+  question: `**Which** store${RLO}?`, why: "Because `x`.", multi_select: false,
+  options: [option("`sqlite`", "*Small*.", true),
+            option("# not a heading\n- nor a list", "- a\n- b", false)],
+};
+const MD_PLAN = {
+  ...PLAN, id: 21, task: 18, task_revision: 2, at: NOW - 2500, review_rounds: 1,
+  approach: `### Plan\nKeep \`x${ZWSP}\` and *y*.`, footprint: ["tasks-ui/*.js"],
+  tests: "- one\n- two", out_of_scope: "None.", risks: "**None** known.",
+  review_verdict: "Passes.", decisions: [MD_DECISION],
+};
+const MD_EARLIER = { ...MD_PLAN, id: 20, at: NOW - 2800, approach: "Keep it.",
+                     superseded_at: NOW - 2500 };
+export const MD_NOTE = "## lower_case\n### Plan\nSee *this*.\n- x\n\n- y";
+const MD_TASK = { ...REFINED, id: 18, title: "Markdown one", revision: 2, body: MD_BODY,
+                  plan: MD_PLAN, notes: [] };
+
 let PLANS = { 1: [OLDER_PLAN], 3: [APPROVED, OLDER_PLAN], 5: [APPROVED],
                 6: [PLAN, OLDER_PLAN], 8: [PLAN], 9: [DECIDED_PLANS[4]],
                 10: [DECIDED_PLANS[5]], 11: [FRESH_PLAN], 14: [DECIDED_PLANS[10]],
                 15: [DECIDED_PLANS[11]], 16: [APPROVED_PLAN],
                 17: [UNAPPROVED_PLAN, { ...PLAN, id: 3, task: 17, approved_at: NOW - 6600,
-                                        superseded_at: NOW - 6500 }] };
+                                        superseded_at: NOW - 6500 }],
+                18: [MD_PLAN, MD_EARLIER] };
 
 // Each task's history, oldest first, as `operator_moves.history` reads it: every write,
 // with the note it posted as it is now.
@@ -273,6 +321,12 @@ let HISTORIES = {
        ...refinedHistory(NOW - 8000, UNAPPROVED_PLAN).slice(1),
        entry("operator", "move", NOW - 5000, { before: "refined", state: "deferred",
                                                revision: 7, actor: null })],
+  18: [...refinedHistory(NOW - 3000, MD_PLAN),
+       entry("claude-3f2a9c1e", "note", NOW - 2000,
+             { note: MD_NOTE, note_id: 40, for_operator: false },
+             { id: 40, task: 18, author: "claude-3f2a9c1e", at: NOW - 2000, text: MD_NOTE,
+               for_operator: false, handled: false, hidden: false, move: null,
+               reply_to: null })],
 };
 
 function historyPage(id, params) {
@@ -586,7 +640,8 @@ function lost(answer) {
 }
 
 let READ = { 1: SENT_BACK, 2: UNPLANNED, 5: LANDING, 7: PARKED, 14: CLOSED_ANSWERED,
-               15: REFINED_ANSWERED, 16: SHELVED_APPROVED, 17: SHELVED_UNAPPROVED };
+               15: REFINED_ANSWERED, 16: SHELVED_APPROVED, 17: SHELVED_UNAPPROVED,
+               18: MD_TASK };
 // A task whose read the registry fails, as an error it did not mean would.
 const FAILING = "13";
 

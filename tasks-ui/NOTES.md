@@ -42,3 +42,20 @@ the bottleneck the agents wait on. Guards against the counter-arguments:
 
 **Not taken:** stored notifications or read/unread state, drag to change state, opaque
 auto-priority, and snooze as new stored state.
+
+## Nested spans cost the square of their depth
+
+Behind `NEST_MAX` in `tasks-ui/markdown.js`. Measured 2026-11-17 in headless Chromium
+156 in the sandbox: a `div` holding N nested `em` elements, built with
+`createElement`, then a `getBoundingClientRect` to force layout.
+
+| depth | build and layout |
+|---|---|
+| 4000 | 168 ms |
+| 8000 | 797 ms |
+| 16000 | the renderer crashed ("Target crashed") |
+
+The cost about quadruples each time the depth doubles. Under the registry's
+32,000-character body cap the deepest text is about 8000 spans (`*` × 15999, a letter,
+`*` × 15999, or `(*` … `*)`); the `*a ` … `a* ` shape reaches 5333. No agent's text
+nests more than a few.

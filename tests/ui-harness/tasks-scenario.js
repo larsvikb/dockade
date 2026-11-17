@@ -374,4 +374,16 @@ export const STEPS = [
     await page.fill('#task-detail input[data-spec="blockers"]', "#2, 3");
     await page.click('#task-detail button[data-write="edit"]');
   }],
+  // Task 18 is written in markdown, drawn as such and then as typed. A tree that draws
+  // no switch takes the two steps as doing nothing, so the rest still compares.
+  ["a task written in markdown", async ({ page }) => {
+    await page.evaluate(() => { location.hash = "#task=18"; });
+  }],
+  ["its source shown", async ({ page }) => { await toggleSource(page); }],
+  ["drawn again", async ({ page }) => { await toggleSource(page); }],
 ];
+
+async function toggleSource(page) {
+  const toggle = await page.$("#task-detail button[data-source-toggle]");
+  if (toggle) await toggle.click();
+}

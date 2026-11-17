@@ -72,6 +72,30 @@
      Agent prose: kept as written, line breaks included, and wrapped anywhere so a long
      unbroken string cannot push the table off screen. */
   .prose { white-space: pre-wrap; word-break: break-word; }
+  /* Agent markdown (markdownBlock in tasks.js): kept line ends space it, so no element
+     adds a margin, and each rule is scoped to it, so no rule of the page's own applies
+     and an agent's heading never looks like the detail's. The detail shows the drawn
+     form or the source (`toggleSource`), and the switch keeps one width. */
+  .md { white-space: pre-wrap; word-break: break-word; }
+  #task-detail .md :is(h1, h2, h3, h4, h5, h6, p, ul, ol, li, pre) { margin: 0;
+    padding: 0; }
+  #task-detail .md :is(h1, h2, h3, h4, h5, h6) { color: inherit; text-transform: none;
+    letter-spacing: normal; font-weight: 700; line-height: 1.4; }
+  #task-detail .md h1 { font-size: 19px; }
+  #task-detail .md h2 { font-size: 17px; }
+  #task-detail .md :is(h3, h4, h5, h6) { font-size: 15px; }
+  /* No browser marker: a numbered item shows the number written, and a bullet item a
+     disc where its bullet was. */
+  .md :is(ul, ol) { list-style: none; }
+  .md-bullet::before { content: "\2022  "; }
+  .md :is(code, pre) { font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas,
+    monospace; background: #202632; border-radius: 4px; }
+  #task-detail .md pre { white-space: pre-wrap; padding: 4px 6px;
+    border: 1px solid var(--line); }
+  .md-info { color: var(--dim); }
+  #task-detail:not(.source-shown) .md-source,
+  #task-detail.source-shown .md { display: none; }
+  button.source-toggle { width: 10em; white-space: nowrap; overflow: hidden; }
   .task-body { margin: 10px 0; padding: 8px; background: var(--bg);
     border: 1px solid var(--line); border-radius: 6px; max-height: 50vh; overflow: auto; }
   /* The list or one task, never both; the page scrolls, not a pane. Atop the task a

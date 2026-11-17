@@ -141,7 +141,7 @@ for (const [name, viewport] of [["desktop", DESKTOP], ["narrow", PHONE]]) {
     assert.equal((await p.state()).hash, "#task=6");
     assert.deepEqual(p.reads, ["6"]);
     assert.equal(await text(p.page.locator("#task-detail h3").first()),
-                 "#6 Refined one edit spec");
+                 "#6 Refined one show source edit spec");
   });
 
   test(`${name}: a click on a row opens the task alone, in All tasks`, TIMEOUT,
@@ -845,3 +845,210 @@ test("the edit holding the moves moves no box", TIMEOUT, async t => {
     assert.deepEqual(await stillBoxes(p.page), before, `${viewport.width} px`);
   }
 });
+
+// ── agent markdown ──────────────────────────────────────────────────────────
+
+// Task 18's fields drawn as markdown, in the order the detail draws them, each as its
+// drawn form's textContent and its count of hidden characters: the spelled source less
+// exactly the delimiters markdownBlock drops (a heading's hashes and the space after
+// them, a bullet and the space after it, emphasis and backtick delimiters, a fence's
+// backticks or tildes), worked out by hand from tasks-backend.js.
+const DRAWN = [
+  ["the body", "Head\\u202eing ##\n"
+    + "\n"
+    + "A em\\u200b and strong and co\\u202ede, a [link](https://example.invalid/x).\n"
+    + "![img](https://example.invalid/i.png) <img src=\"https://example.invalid/j.png\"> "
+    + "<!-- a \\u200bcomment -->\n"
+    + "\n"
+    + "bul\\u200blet\n"
+    + "  nested\n"
+    + "1. one\n2. two\n5. five\\u202e\n"
+    + "\n"
+    + "sh\\u200b\n"
+    + "echo \\u202ehi\n"
+    + "\n"
+    + " ascii-info\n"
+    + "plain\n"
+    + "\n"
+    + "Line with CR LF\\u000d\n"
+    + "end", 9],
+  ["the question", "Which store\\u202e?", 1],
+  ["why", "Because x.", 0],
+  ["option 1", "sqlite", 0],
+  ["its meaning", "Small.", 0],
+  // A label is drawn inline only: a heading or an item in it is drawn as typed.
+  ["option 2", "# not a heading\n- nor a list", 0],
+  ["its meaning", "a\nb", 0],
+  ["approach", "Plan\nKeep x\\u200b and y.", 1],
+  ["tests", "one\ntwo", 0],
+  ["out of scope", "None.", 0],
+  ["risks", "None known.", 0],
+  ["review verdict", "Passes.", 0],
+  ["the plan's note", "Planned.", 0],
+  ["the note", "lower_case\nPlan\nSee this.\nx\n\ny", 0],
+];
+
+// Every markdown field in the detail, read on its drawn form's own element, not the
+// field's, which holds the source form and the note too: its textContent, its innerText
+// with runs of line breaks made one (innerText adds breaks around blocks, and is what
+// CSS shows, a text-transform included), the count its note gives, and whether the
+// field and each form are drawn.
+async function mdFields(page) {
+  return page.evaluate(() => [...document.querySelectorAll("#task-detail .md-field")]
+    .map(field => {
+      const drawn = field.querySelector(":scope > .md");
+      const source = field.querySelector(":scope > .md-source");
+      const note = field.querySelector(":scope > .empty.warn");
+      return { text: drawn.textContent,
+               inner: drawn.innerText.replace(/\n+/g, "\n").replace(/^\n|\n$/g, ""),
+               hidden: note ? Number(note.textContent.split(" ")[0]) : 0,
+               shown: field.getClientRects().length > 0,
+               drawn: drawn.getClientRects().length > 0,
+               source: source.getClientRects().length > 0 };
+    }));
+}
+
+test("each markdown field draws its spelled source less exactly its delimiters, "
+     + "and counts what it spells", TIMEOUT, async t => {
+  const offOrigin = [];
+  const p = await tasksPage(t, { hash: "#task=18" });
+  p.page.on("request", r => {
+    if (!r.url().startsWith(ORIGIN) && !r.url().startsWith("data:")) offOrigin.push(r.url());
+  });
+  await p.click('#task-detail button[data-plan-view="whole"]');
+  const fields = await mdFields(p.page);
+  assert.deepEqual(fields.map(f => [f.text, f.hidden]),
+                   DRAWN.map(([, drawn, hidden]) => [drawn, hidden]));
+  assert.deepEqual(fields.map(f => f.inner),
+                   DRAWN.map(([, drawn]) => drawn.replace(/\n+/g, "\n").replace(/\n$/, "")));
+  assert.ok(fields.every(f => f.drawn && !f.source), "the drawn form shows, the source not");
+  // Built of the subset's elements, and of nothing that shows or fetches anything else.
+  const made = await p.page.evaluate(() => {
+    const detail = document.getElementById("task-detail");
+    const body = detail.querySelector(".task-body > .md");
+    const comments = document.createTreeWalker(detail, NodeFilter.SHOW_COMMENT);
+    return {
+      missing: ["h2", "p", "ul", "ol", "li", "em", "strong", "code", "pre"]
+        .filter(tag => !body.querySelector(tag)),
+      foreign: [...detail.querySelectorAll("a, img, script, iframe, object, embed")]
+        .map(el => el.localName),
+      comment: comments.nextNode() !== null,
+      markers: [...detail.querySelectorAll(".md li")]
+        .map(li => getComputedStyle(li).listStyleType),
+      lists: [...detail.querySelectorAll(".md :is(ul, ol)")]
+        .map(l => [l.localName, l.children.length, getComputedStyle(l).paddingLeft,
+                   getComputedStyle(l).marginTop]),
+      labels: detail.querySelectorAll(".option-label :is(h1, li)").length,
+      pre: [...body.querySelectorAll("pre")].map(el => getComputedStyle(el).whiteSpace),
+      // Every drawn element's text in a colour of its own, over its background, and at
+      // a size: text no colour or size can hide.
+      faint: [...detail.querySelectorAll(".md, .md *")]
+        .filter(el => el.getClientRects().length > 0)
+        .filter(el => {
+          const style = getComputedStyle(el);
+          let under = "rgb(15, 17, 21)";
+          for (let up = el; up; up = up.parentElement) {
+            const fill = getComputedStyle(up).backgroundColor;
+            if (fill !== "rgba(0, 0, 0, 0)") {
+              under = fill;
+              break;
+            }
+          }
+          return style.color === under || /, 0\)$/.test(style.color)
+            || !(parseFloat(style.fontSize) > 0);
+        })
+        .map(el => `${el.localName}.${el.className}`),
+      // A bullet item shows a disc where its bullet was, which the stylesheet draws.
+      discs: [...body.querySelectorAll("ul > li > .md-bullet")]
+        .map(b => getComputedStyle(b, "::before").content),
+    };
+  });
+  assert.deepEqual(made.missing, [], "every element of the subset is drawn");
+  assert.deepEqual(made.foreign, []);
+  assert.equal(made.comment, false);
+  assert.deepEqual(made.markers, Array(11).fill("none"), "no browser marker on any item");
+  // The body's bullets, then its numbers; an option's meaning; the plan's tests; the
+  // note's two items, a blank line apart. None indented or spaced by the browser.
+  assert.deepEqual(made.lists, [["ul", 2, "0px", "0px"], ["ol", 3, "0px", "0px"],
+                                ["ul", 2, "0px", "0px"], ["ul", 2, "0px", "0px"],
+                                ["ul", 1, "0px", "0px"], ["ul", 1, "0px", "0px"]]);
+  assert.equal(made.labels, 0, "a label draws no heading and no list");
+  assert.deepEqual(made.pre, ["pre-wrap", "pre-wrap"]);
+  assert.deepEqual(made.faint, [], "no drawn text is hidden by its colour or size");
+  assert.deepEqual(made.discs, ['"• "', '"• "']);
+  await p.poll();
+  assert.deepEqual(offOrigin, []);
+});
+
+test("an agent's heading never looks like the detail's own", TIMEOUT, async t => {
+  const p = await tasksPage(t, { hash: "#task=18" });
+  const sizes = await p.page.evaluate(() => {
+    const own = getComputedStyle(document.querySelector("#task-detail > h3")).fontSize;
+    const agents = [...document.querySelectorAll(
+      "#task-detail .md-field :is(h1, h2, h3, h4, h5, h6)")];
+    const text = getComputedStyle(document.querySelector("#task-detail .md p"));
+    // A size of its own, apart from the detail's 14px; nothing else of the page's heading
+    // rules: no capitals, spacing, dimming or margin.
+    return { own, agents: agents.map(h => {
+      const style = getComputedStyle(h);
+      return [h.localName, h.textContent, style.fontSize, style.textTransform,
+              style.letterSpacing, style.color === text.color, style.marginTop,
+              style.marginBottom];
+    }) };
+  });
+  assert.equal(sizes.own, "14px");
+  assert.deepEqual(sizes.agents, [
+    ["h2", "Head\\u202eing ##\n", "17px", "none", "normal", true, "0px", "0px"],
+    ["h3", "Plan\n", "15px", "none", "normal", true, "0px", "0px"],
+    ["h2", "lower_case\n", "17px", "none", "normal", true, "0px", "0px"],
+    ["h3", "Plan\n", "15px", "none", "normal", true, "0px", "0px"],
+  ]);
+});
+
+for (const [name, viewport] of [["desktop", DESKTOP], ["narrow", PHONE]]) {
+  test(`${name}: show source shows every field as typed and back, keeping what was typed `
+       + "and the plan's view, and its box stays put", TIMEOUT, async t => {
+    const p = await tasksPage(t, { viewport, hash: "#task=18" });
+    const toggle = "#task-detail button[data-source-toggle]";
+    // In the page's coordinates: a click scrolls what it clicks into view.
+    const box = () => p.page.locator(toggle).evaluate(el => {
+      const r = el.getBoundingClientRect();
+      return [r.left + window.scrollX, r.top + window.scrollY, r.width, r.height];
+    });
+    await p.click('#task-detail button[data-plan-view="whole"]');
+    await p.click('#task-detail input[data-decision="0"][data-option="other"]');
+    await p.page.fill('#task-detail textarea[data-other="0"]', "Neither: *both*.");
+    await p.settle();
+    const at = await box();
+    await p.click(toggle);
+    assert.deepEqual(await box(), at);
+    assert.equal(await text(p.page.locator(toggle)), "show rendered");
+    assert.ok((await mdFields(p.page)).every(f => !f.drawn && f.source),
+              "the source shows, the drawn form not");
+    assert.equal(await p.page.locator("#task-detail .task-body > .md-source").textContent(),
+                 "## Head\\u202eing ##\n\nA *em\\u200b* and **strong** and `co\\u202ede`, a "
+                 + "[link](https://example.invalid/x).\n![img](https://example.invalid/i.png) "
+                 + "<img src=\"https://example.invalid/j.png\"> <!-- a \\u200bcomment -->\n\n"
+                 + "- bul\\u200blet\n  - nested\n1. one\n2. two\n5. five\\u202e\n\n"
+                 + "```sh\\u200b\necho \\u202ehi\n```\n~~~ ascii-info\nplain\n~~~\n"
+                 + "Line with CR LF\\u000d\nend");
+    await p.click(toggle);
+    assert.deepEqual(await box(), at);
+    assert.equal(await text(p.page.locator(toggle)), "show source");
+    assert.ok((await mdFields(p.page)).every(f => f.drawn && !f.source));
+    // Nothing was redrawn: the other text and the whole plan are as they were left.
+    assert.equal(await p.page.inputValue('#task-detail textarea[data-other="0"]'),
+                 "Neither: *both*.");
+    assert.equal(await text(p.page.locator("#task-detail button[data-plan-view]")),
+                 "show what changed");
+    // Shown as source, it stays so through opening an edit, which redraws the detail.
+    await p.click(toggle);
+    await p.click("#task-detail button[data-spec-open]");
+    assert.deepEqual(await box(), at);
+    assert.equal(await text(p.page.locator(toggle)), "show rendered");
+    // The plan is redrawn on what changed, so its whole view's fields are not shown.
+    const redrawn = (await mdFields(p.page)).filter(f => f.shown);
+    assert.equal(redrawn.length, 8);
+    assert.ok(redrawn.every(f => !f.drawn && f.source));
+  });
+}

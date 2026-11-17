@@ -53,8 +53,8 @@ UI_INDEX = os.environ.get("TASKS_UI_INDEX", "/opt/tasks-ui/index.html")
 # is the whole of what the script route hands out; a test holds it equal to the files
 # the image copies and to what the modules import from each other.
 UI_DIR = os.environ.get("TASKS_UI_DIR", "/opt/tasks-ui")
-UI_MODULES = frozenset({"app.js", "diff.js", "escape.js", "list-status.js", "moves.js",
-                        "tasks.js", "time.js"})
+UI_MODULES = frozenset({"app.js", "diff.js", "escape.js", "list-status.js", "markdown.js",
+                        "moves.js", "tasks.js", "time.js"})
 # Built from the list, never from a request: the name off the URL only picks an entry.
 _UI_MODULE_PATHS = {name: os.path.join(UI_DIR, name) for name in UI_MODULES}
 

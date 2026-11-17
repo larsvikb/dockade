@@ -307,6 +307,16 @@ under its own image tag, rather than a second Dockerfile that drifts or a defaul
 every session pays for. One without a build tool resolves nothing at run time, so it
 adds no egress: the JDK variant is the first (README.md, "Java in the sandbox").
 
+**The checkout mounts at `/workspace/<folder-name>`, and the session starts there.**
+Claude Code keys a project's memory, transcripts and trust by the working directory's
+path, and every sandbox of a tier shares one config volume, so at one fixed path every
+project would share them. The folder's name is predictable and shows nothing else of
+the host's layout, which the host's own path would; two checkouts in folders of one
+name share a path and so that state, which for two clones of one repo is wanted. A
+name that cannot be a path segment is refused, not rewritten (`sc_workspace_mount`,
+`sandbox-lib.sh`). `/workspace` itself is the image's, so anything written beside the
+checkout is lost at exit.
+
 ### User settings — image-owned config, materialized each boot
 
 `/config/settings.json` is **declarative configuration owned by the image**, not
@@ -333,7 +343,8 @@ non-root agent can toggle the pointer but not tamper with the code it runs — a
 acceptable trade-off for a cosmetic feature. User-scope delivery (not managed
 settings) is *required*, not just pragmatic: a managed-scope command status line
 is gated behind an interactive approval dialog the yolo launch flow suppresses,
-so it would never apply. User scope needs only workspace trust (already granted).
+so it would never apply. User scope needs only workspace trust, which Claude Code
+records per path, so each `/workspace/<folder-name>` is trusted on its own.
 
 The **yolo disclaimer acceptance ships this way too** —
 `skipDangerousModePermissionPrompt: true` in the template. This is a consequence of
@@ -393,14 +404,14 @@ list, with its reasons, in `tests/test_claude_config.py`. Only per-checkout stat
 ignored: agent worktrees and `settings.local.json`. A skill that serves every project
 rather than this repo still belongs in the image.
 
-**That covers commits, not the live checkout.** The host's own checkout *is*
-`/workspace`, and a host session reads its working tree — reloading settings
-mid-session — before any commit or test sees a change. There an agent-written skill,
-agent or settings file is SECURITY.md's accepted delayed path to host execution, and
-two things stay out of `git status` altogether: `settings.local.json`, whose allow rules
-skip workspace trust precisely because it is untracked, and the agent worktrees, each a
-full agent-written checkout the host cannot run git in. Closing that channel would take
-capability, not review.
+**That covers commits, not the live checkout.** The host's own checkout *is* the
+sandbox's `/workspace/<folder-name>`, and a host session reads its working tree —
+reloading settings mid-session — before any commit or test sees a change. There an
+agent-written skill, agent or settings file is SECURITY.md's accepted delayed path to
+host execution, and two things stay out of `git status` altogether:
+`settings.local.json`, whose allow rules skip workspace trust precisely because it is
+untracked, and the agent worktrees, each a full agent-written checkout the host cannot
+run git in. Closing that channel would take capability, not review.
 
 ### Plugin marketplaces — host-curated, read-only, re-derived each boot
 
@@ -447,8 +458,8 @@ Five decisions worth keeping:
   command-line scope, which outranks project, local and user settings and is never
   written back (measured; `NOTES.md`). So a host-enabled plugin cannot be turned off
   from inside: an in-session `/plugin disable`, or `enabledPlugins: false` in a
-  `/workspace/.claude/settings.json` or `settings.local.json`, has no effect, and
-  the managed note says so. A repo is not meant to override the operator's
+  `/workspace/<folder-name>/.claude/settings.json` or `settings.local.json`, has no
+  effect, and the managed note says so. A repo is not meant to override the operator's
   allowlist. A caller's own `--settings` replaces the file outright, since Claude
   Code keeps only the last one given; the wrapper says so in one stderr line
   instead of merging the two. The marketplace note moves with the file into the one
@@ -530,7 +541,7 @@ of the boundary — provided what is mounted is only files.
   agents would ask before every read outside bypass mode. Each tier's image-owned
   config takes the asking away. Tier 1's `permissions.additionalDirectories` in
   `claude-sandbox/user-settings.json` makes `/refs` a working directory, with the
-  permissions `/workspace` has, edits included, so `:ro` is what keeps it read-only.
+  permissions the workspace has, edits included, so `:ro` is what keeps it read-only.
   Tier 2's `permission.external_directory` in `opencode-sandbox/opencode.json`
   allows that one permission under `/refs/**`. Both cover the whole of `/refs`,
   statically, so it is the same for every sibling and needs no launch file. Tier
@@ -2133,7 +2144,7 @@ where `--mcp-config` alone is merely additive (both measured).
 
 `.mcp.json` is disqualified twice over, and the second reason is what makes strict
 mode load-bearing rather than tidy. Writing one would put config into the human's
-live checkout — but the sharper problem is *reading* one: `/workspace` is a checkout
+live checkout — but the sharper problem is *reading* one: the workspace is a checkout
 the agent clones into, so a repo can ship an MCP server with itself, and in `-p` mode
 that server starts with no approval gate at all (measured — see NOTES.md). What
 arrives is not capability, since a repo-supplied server inherits the same nothing

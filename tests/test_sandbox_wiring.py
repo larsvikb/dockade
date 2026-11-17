@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import ClassVar
 
 from _loader import load_protocol
+from test_launcher_run_flags import launchers
 from test_topology import _environment_of
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -127,6 +128,32 @@ class LauncherTests(unittest.TestCase):
     def test_the_launcher_prints_both_descriptions(self):
         self.assertIn('echo "Egress:    $SC_EGRESS_DESC"', LAUNCHER)
         self.assertIn('echo "Tools:     $SC_TOOLS_DESC"', LAUNCHER)
+
+
+class WorkspaceMountWiringTests(unittest.TestCase):
+    """Both launchers mount, start in and print the path ``sc_workspace_mount`` names.
+
+    tests/test_launcher_lib.py runs the function and a launcher's refusal; a launcher
+    that computed the path and still mounted at ``/workspace`` would pass both, and
+    give every project the one memory folder again."""
+
+    MOUNT = '    -v "$WORKSPACE":"$SC_WORKSPACE_MOUNT" \\\n    -w "$SC_WORKSPACE_MOUNT" \\\n'
+
+    def test_each_launcher_mounts_and_starts_in_the_named_path(self):
+        for path in launchers(ROOT):
+            text = path.read_text()
+            with self.subTest(launcher=path.name):
+                guard = text.index('sc_guard_workspace "$WORKSPACE"\n'
+                                   'WORKSPACE="$SC_WORKSPACE"\n'
+                                   'sc_workspace_mount "$WORKSPACE"\n')
+                run = text.index("\ndocker run ")
+                self.assertLess(guard, run)
+                self.assertEqual(text.count(self.MOUNT), 1)
+                self.assertGreater(text.index(self.MOUNT), run)
+                self.assertEqual(re.findall(r"^\s*-w\b.*", text, re.M),
+                                 ['    -w "$SC_WORKSPACE_MOUNT" \\'])
+                self.assertIn('echo "Workspace: $WORKSPACE -> $SC_WORKSPACE_MOUNT"', text)
+                self.assertNotRegex(text, r":/workspace\b")
 
 
 class GatewayConfigTests(unittest.TestCase):

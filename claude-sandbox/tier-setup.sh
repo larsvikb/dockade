@@ -39,8 +39,8 @@ refs_note() {
     printf -- '- **Reference material is mounted read-only**: %s.\n' "${list%, }"
     cat <<'REFS_NOTE'
   Host directories the human mounted for you to read — another checkout, docs, a
-  library's source. Look there when the task points outside `/workspace`;
-  changes belong in `/workspace`, never there.
+  library's source. Look there when the task points outside the checkout;
+  changes belong in the checkout, never there.
 REFS_NOTE
 }
 
@@ -370,7 +370,7 @@ install -m 0644 /etc/claude-code/user-settings.json "$CONFIG_DIR/settings.json"
 # User-scope CLAUDE.md, on the same terms and for the same reasons as the
 # settings above: baked in the image, overwritten every boot, transient if the
 # agent edits it. Its content is the container's CAPABILITY facts — no egress but
-# the proxy, no push, no docker, /workspace shared with the host — which the agent
+# the proxy, no push, no docker, the checkout shared with the host — which the agent
 # otherwise rediscovers one failed command at a time. Enablement, not enforcement:
 # an agent that ignores the file is stopped by the firewall exactly as before.
 # Deliberately says nothing about how to work in the repo; that is the repo's own

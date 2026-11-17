@@ -46,8 +46,9 @@ fi
 # Materialize it into the sandbox user's global git config each boot, alongside the
 # shared, non-personal defaults baked in ~/.gitconfig (init.defaultBranch, pull.rebase).
 # Absent -> skip; git errors only at commit time. See DESIGN.md.
-# From /, not the working directory /workspace: even `--global` looks for a repo
-# first, and a host-made worktree's .git file names a host path, which is fatal.
+# From /, not the working directory /workspace/<folder-name>: even `--global` looks
+# for a repo first, and a host-made worktree's .git file names a host path, which is
+# fatal.
 if [ -n "${GIT_USER_NAME:-}" ] && [ -n "${GIT_USER_EMAIL:-}" ]; then
     gosu "$USERNAME" git -C / config --global user.name "$GIT_USER_NAME"
     gosu "$USERNAME" git -C / config --global user.email "$GIT_USER_EMAIL"

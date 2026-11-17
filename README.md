@@ -118,8 +118,12 @@ the measured throughput behind those decisions.
   `HTTPS_PROXY` at it and allowlisting it in the firewall. If the infra isn't up
   it falls back to creating a plain bridge for standalone use. You can run
   **several sandboxes** against one proxy (unique names; override `SANDBOX_NAME`).
-- **Mounts your workspace** at `/workspace` (read-write) and a named config
-  volume at `/config` (isolated from the host's `~/.claude`).
+- **Mounts your workspace** at `/workspace/<folder-name>` (read-write), where
+  the session starts, and a named config volume at `/config` (isolated from the
+  host's `~/.claude`). Claude Code keeps each project's memory and sessions by
+  that path, so a project keeps its own, and two checkouts in folders of one name
+  share them. A folder name that starts with `-` or `.`, or holds anything but
+  ASCII letters, digits, `.`, `_` and `-`, is refused; rename or clone it.
 - **Mounts your plugin marketplaces** at `/marketplaces` (**read-only**) when
   `~/.config/dockade/marketplaces` exists, and registers every one of them at
   boot — see *Plugins and marketplaces* below.
@@ -143,7 +147,7 @@ open egress is exactly the state this sandbox exists to prevent.
 |-------|-----------|
 | **Network egress** | With the infra up, `sandbox-net` is `internal: true` — the sandbox has **no route to the internet at all**; the only path off-box is the **egress proxy**, which reaches the internet on a separate `egress-net`. The proxy enforces a **domain**-level allowlist with per-connection audit (closing the shared-CDN/fronting gap that an IP-level rule can't). The in-container firewall (`init-firewall.sh`) is now **defense-in-depth**: in governed mode it permits only the proxy, the tool gateway and embedded DNS, so even if it failed there's no route out. IPv6 fully denied. Without the infra, the launcher falls back to **standalone** mode (non-internal net, direct `ipset` IP-allowlist) for proxy-less use. |
 | **Privilege** | Non-root `sandbox` user; `--cap-drop=ALL` + minimal adds; `no-new-privileges`; no host Docker socket. |
-| **Filesystem** | Only the bind-mounted `/workspace` and the `/config` volume are *persistent* writable state (the rest of the container filesystem is writable but ephemeral). |
+| **Filesystem** | Only the bind-mounted `/workspace/<folder-name>` and the `/config` volume are *persistent* writable state (the rest of the container filesystem is writable but ephemeral). |
 | **Config** | `CLAUDE_CONFIG_DIR=/config`; user settings are re-materialized from a baked template on every boot, so config always matches the repo and volume wipes lose only credentials/runtime state. |
 
 **Not a containment boundary:** no Claude Code settings file. Under
@@ -307,8 +311,8 @@ is still shared, so:
 
 - A host-enabled plugin **cannot be turned off from inside**: neither
   `/plugin disable` nor `enabledPlugins: false` in
-  `/workspace/.claude/settings.json` or `settings.local.json` has any effect.
-  Change the allowlist and relaunch.
+  `/workspace/<folder-name>/.claude/settings.json` or `settings.local.json` has any
+  effect. Change the allowlist and relaunch.
 - `claude --settings <yours>` inside the sandbox **replaces** the host's file,
   so that session loads none of the host's plugins; `claude` says so on stderr.
 - `/plugin` and `claude plugin marketplace list` can still **show** a sibling's

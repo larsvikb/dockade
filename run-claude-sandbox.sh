@@ -4,7 +4,8 @@
 # Usage: ./run-claude-sandbox.sh [workspace_path] [--rebuild] [--build-only]
 #                                [--no-cache] [--boundary-check]
 #
-# Mounts the given workspace (default: current dir) at /workspace.
+# Mounts the given workspace (default: current dir) at /workspace/<folder-name>,
+# and starts there (sandbox-lib.sh, sc_workspace_mount).
 # Claude config/auth persists in the named volume `claude-sandbox-config`,
 # isolated from the host's ~/.claude. Authenticate once on first run.
 #
@@ -105,6 +106,7 @@ fi
 
 sc_guard_workspace "$WORKSPACE"
 WORKSPACE="$SC_WORKSPACE"
+sc_workspace_mount "$WORKSPACE"
 sc_refs
 
 if [[ "$REBUILD" == "true" ]] || ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
@@ -134,7 +136,7 @@ sc_plugin_allowlist
 
 echo "Sandbox:   $SC_CONTAINER_NAME (tier 1 — Claude)"
 echo "Image:     $IMAGE_NAME"
-echo "Workspace: $WORKSPACE -> /workspace"
+echo "Workspace: $WORKSPACE -> $SC_WORKSPACE_MOUNT"
 echo "Refs:      $SC_REFS_DESC"
 echo "Markets:   $SC_MARKETPLACE_DESC"
 echo "Plugins:   $SC_PLUGINS_DESC"
@@ -218,7 +220,8 @@ docker run "${RUN_MODE_ARGS[@]}" \
     --cpus="$SC_CPUS" \
     --pids-limit=512 \
     \
-    -v "$WORKSPACE":/workspace \
+    -v "$WORKSPACE":"$SC_WORKSPACE_MOUNT" \
+    -w "$SC_WORKSPACE_MOUNT" \
     -v "$CONFIG_VOLUME":/config \
     ${SC_MARKETPLACE_ARGS[@]+"${SC_MARKETPLACE_ARGS[@]}"} \
     ${SC_REFS_ARGS[@]+"${SC_REFS_ARGS[@]}"} \

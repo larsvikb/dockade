@@ -867,15 +867,16 @@ distro's loopback, so this concerns tests and tools run on the host distro.
 
 ## A worktree made in the sandbox is unreadable to git on the host
 
-The sandbox sees the checkout at `/workspace`; the development host has it on a
-case-insensitive `/mnt/c`. A `git worktree add` in the sandbox writes absolute paths
-both ways (the worktree's `.git` says `gitdir: /workspace/.git/worktrees/<name>`), and
+The sandbox sees the checkout at `/workspace/<folder-name>`; the development host has
+it on a case-insensitive `/mnt/c`. A `git worktree add` in the sandbox writes absolute
+paths both ways (the worktree's `.git` says
+`gitdir: /workspace/<folder-name>/.git/worktrees/<name>`), and
 container git (2.47.3) predates `worktree add --relative-paths` (2.48). On the host,
 every git command inside such a worktree fails, so the doc guards' `_tracked()` returns
 nothing and each fails its `checked > 0` assertion. Seen 2026-09-30.
 
 - **Host git can delete them.** It lists the sandbox's worktrees as `prunable`, since
-  their `/workspace` paths do not exist there, and `git worktree prune` deletes their
+  their `/workspace/...` paths do not exist there, and `git worktree prune` deletes their
   `.git/worktrees/<name>` entries, which breaks them inside the sandbox. Reproduced
   2026-10-01 in a throwaway repo with a gitdir pointed at a missing path: `prune -v`
   printed `Removing worktrees/wt: gitdir file points to non-existent location`. `git
@@ -887,6 +888,15 @@ nothing and each fails its `checked > 0` assertion. Seen 2026-09-30.
   container does not have, so every git command run inside it fails in the sandbox.
   Seen 2026-10-01, when such a launch died at boot in the entrypoint's git identity
   block; that block now runs from `/` (see its comment).
+- **A move of the mount breaks them, and `git worktree repair` mends them.** Probed
+  2026-11-09 with git 2.47.3, while planning the move from `/workspace` to
+  `/workspace/<folder-name>`, and re-run 2026-11-17: once the checkout is at its new
+  path, `git worktree repair` run in it, given each worktree's *new* path, exits 0 and
+  repairs it, and the worktree no longer shows `prunable`. Given the old path, the one
+  `git worktree list` still shows, it fails with "Invalid path" and exit 128. A locked
+  worktree needs no unlock first, and stays locked. A worktree made on the host keeps
+  showing `prunable` from inside the container whatever is repaired, for the reason
+  above.
 - **A worktree carries only tracked files.** The main checkout's `.env` (the LLM
   model, the GitHub server's toolsets and read-only flag) and `models/` are not in it.
   The Makefile's compose reads `.env` from the directory it runs in, so compose run

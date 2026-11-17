@@ -73,6 +73,7 @@ fi
 
 sc_guard_workspace "$WORKSPACE"
 WORKSPACE="$SC_WORKSPACE"
+sc_workspace_mount "$WORKSPACE"
 sc_refs
 
 if [[ "$REBUILD" == "true" ]] || ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
@@ -123,7 +124,7 @@ sc_git_identity
 sc_host_timezone
 
 echo "Sandbox:   $SC_CONTAINER_NAME (tier 2 — opencode, local model)"
-echo "Workspace: $WORKSPACE -> /workspace"
+echo "Workspace: $WORKSPACE -> $SC_WORKSPACE_MOUNT"
 echo "Refs:      $SC_REFS_DESC"
 echo "Git ident: ${SC_GIT_NAME:-<none>} <${SC_GIT_EMAIL:-none}>"
 echo "Inference: $LLM_NAME ($LLM_IP:$LLM_PORT) — the ONLY permitted destination"
@@ -163,7 +164,8 @@ docker run -it --rm \
     --cpus="$SC_CPUS" \
     --pids-limit=512 \
     \
-    -v "$WORKSPACE":/workspace \
+    -v "$WORKSPACE":"$SC_WORKSPACE_MOUNT" \
+    -w "$SC_WORKSPACE_MOUNT" \
     -v "$CONFIG_VOLUME":/config \
     ${SC_REFS_ARGS[@]+"${SC_REFS_ARGS[@]}"} \
     \

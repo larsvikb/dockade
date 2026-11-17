@@ -27,11 +27,13 @@ running it in each host state shows that standalone mode never inspects the gate
 
 ``LauncherProxyEnvTests`` runs ``run-claude-sandbox.sh`` through to ``docker run``,
 with every ``docker`` call answered by the stub, to show the function's output
-reaches the container. One other class runs the launchers themselves, but only as
-far as the workspace guard's refusal: ``LauncherCdpathTests``. Before the guard they run at most ``sc_jdk_variant``
-and ``sc_clamp_cpus`` (``nproc``), a ``docker`` stub that fails every call comes first
-on ``PATH``, and its log is asserted empty, so a guard that stopped refusing would show
-as a failure rather than as a launch.
+reaches the container. Two other classes run the launchers themselves, but only as
+far as a refusal: ``LauncherCdpathTests``, the workspace guard's, and
+``LauncherMountNameTests``, ``sc_workspace_mount``'s. Before them the launchers run at
+most ``sc_jdk_variant`` and ``sc_clamp_cpus`` (``nproc``), a ``docker`` stub that fails
+every call comes first on ``PATH``, and its log is asserted empty, so a check that
+stopped refusing, or came after a ``docker`` call, would show as a failure rather than
+as a launch.
 """
 from __future__ import annotations
 
@@ -456,6 +458,8 @@ class LauncherProxyEnvTests(unittest.TestCase):
 
 _GUARD_HARNESS = ('set -euo pipefail; source "$1"; sc_guard_workspace "$2"; '
                   'printf "%s\\n" "$SC_WORKSPACE"')
+_MOUNT_HARNESS = ('set -euo pipefail; source "$1"; sc_guard_workspace "$2"; '
+                  'sc_workspace_mount "$SC_WORKSPACE"; printf "%s\\n" "$SC_WORKSPACE_MOUNT"')
 _MARKETPLACE_HARNESS = ('set -euo pipefail; source "$1"; sc_marketplaces "$2"; '
                         'printf "%s\\n" "${SC_MARKETPLACE_ARGS[@]}"')
 
@@ -776,6 +780,84 @@ class WorkspaceGuardTests(unittest.TestCase):
 
 
 @unittest.skipUnless(_BASH or _STRICT, "bash is not installed")
+class WorkspaceMountTests(unittest.TestCase):
+    """``sc_workspace_mount`` naming ``/workspace/<folder-name>`` from the guard's path.
+
+    Run after ``sc_guard_workspace``, as the launchers run it, so the name is taken
+    from the canonical path the guard resolved."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name).resolve()
+        self.home = self.root / "home" / "alice"
+        self.home.mkdir(parents=True)
+
+    def mount(self, workspace: Path, **env_over: str):
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("ALLOW_UNSAFE_WORKSPACE", "XDG_RUNTIME_DIR", "CDPATH",
+                            "DOCKADE_CONFIG_HOME", "XDG_CONFIG_HOME")}
+        env.update(HOME=str(self.home), **env_over)
+        return subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
+            [_BASH, "-c", _MOUNT_HARNESS, "sc_workspace_mount", str(LIB), str(workspace)],
+            capture_output=True, text=True, env=env, timeout=60)
+
+    def folder(self, name: str) -> Path:
+        path = self.root / "src" / name
+        path.mkdir(parents=True)
+        return path
+
+    def assertRefused(self, proc, workspace: Path | str, name: str):
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn(f"REFUSING to mount workspace: {workspace}\n", proc.stderr)
+        self.assertIn(f"Its folder name '{name}' cannot be its path in the sandbox",
+                      proc.stderr)
+        self.assertIn("a usable name starts with an ASCII letter, a digit\n"
+                      "  or '_', and holds only those, '.' and '-'. Rename the folder",
+                      proc.stderr)
+
+    def test_a_usable_name_mounts_under_workspace(self):
+        for name in ("dockade", "my_repo", "a.b", "_x", "x-", "Acme9"):
+            with self.subTest(name=name):
+                proc = self.mount(self.folder(name))
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout, f"/workspace/{name}\n")
+
+    def test_a_symlink_is_named_by_its_target(self):
+        link = self.root / "link-name"
+        link.symlink_to(self.folder("target-name"))
+        proc = self.mount(link)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "/workspace/target-name\n")
+
+    def test_a_name_docker_or_the_agent_cannot_use_is_refused(self):
+        # Each is outside the rule at a different place: the first character ('-',
+        # '.', a non-ASCII letter), a later one (a space, ':', a non-ASCII letter),
+        # and the whole name ('.', '..' are never folder names on disk).
+        for name in ("-x", ".dotfiles", "acme widgets", "a:b", "\u00e9t\u00e9",
+                     "caf\u00e9", "x\ty"):
+            with self.subTest(name=name):
+                workspace = self.folder(name)
+                self.assertRefused(self.mount(workspace), workspace, name)
+
+    def test_the_override_does_not_reach_the_rule(self):
+        workspace = self.folder(".dotfiles")
+        self.assertRefused(self.mount(workspace, ALLOW_UNSAFE_WORKSPACE="1"),
+                           workspace, ".dotfiles")
+        # `/` passes the guard under the override, and has no folder name at all.
+        self.assertRefused(self.mount(Path("/"), ALLOW_UNSAFE_WORKSPACE="1"), "/", "")
+
+    def test_the_workspace_argument_is_required(self):
+        proc = subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
+            [_BASH, "-c", 'set -euo pipefail; source "$1"; sc_workspace_mount',
+             "sc_workspace_mount", str(LIB)],
+            capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("sc_workspace_mount needs the canonical workspace", proc.stderr)
+
+
+@unittest.skipUnless(_BASH or _STRICT, "bash is not installed")
 class MarketplaceWorkspaceOverlapTests(unittest.TestCase):
     """``sc_marketplaces`` against the workspace it is launched beside.
 
@@ -848,8 +930,10 @@ class MarketplaceWorkspaceOverlapTests(unittest.TestCase):
         self.assertIn("that is the workspace", proc.stderr)
 
     def test_everything_is_inside_a_root_workspace(self):
-        # Only reachable with ALLOW_UNSAFE_WORKSPACE=1, which overrides the
-        # workspace guard and must not take this one with it.
+        # No launcher reaches this: ALLOW_UNSAFE_WORKSPACE=1 lets `/` past the
+        # workspace guard, but sc_workspace_mount still refuses it, having no folder
+        # name. Kept should that change, since the override must not take this rule
+        # with it.
         mkt = self.root / "marketplaces"
         mkt.mkdir()
         proc = self.mount(mkt, Path("/"))
@@ -1327,6 +1411,40 @@ class LauncherCdpathTests(unittest.TestCase):
         for launcher in _LAUNCHERS:
             with self.subTest(launcher=launcher):
                 self.assertRefusedHome(self.launch(f"dockade/{launcher}"))
+
+
+@unittest.skipUnless(_BASH or _STRICT, "bash is not installed")
+class LauncherMountNameTests(unittest.TestCase):
+    """Every launcher refuses a folder it cannot name before any ``docker`` call."""
+
+    def test_a_folder_named_with_a_space_is_refused_before_docker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            (root / "home").mkdir()
+            workspace = root / "acme widgets"
+            workspace.mkdir()
+            stubs = root / "bin"
+            stubs.mkdir()
+            (stubs / "docker").write_text(_FAILING_DOCKER_STUB)
+            (stubs / "docker").chmod(0o755)
+            log = root / "docker.log"
+            env = {k: v for k, v in os.environ.items()
+                   if k not in ("ALLOW_UNSAFE_WORKSPACE", "XDG_RUNTIME_DIR", "CDPATH",
+                                "DOCKADE_CONFIG_HOME", "XDG_CONFIG_HOME", "SANDBOX_JDK",
+                                "SANDBOX_IMAGE", "SANDBOX_REFS")}
+            env.update(HOME=str(root / "home"), STUB_LOG=str(log),
+                       PATH=f"{stubs}{os.pathsep}{env['PATH']}")
+            for launcher in _LAUNCHERS:
+                with self.subTest(launcher=launcher):
+                    log.write_text("")
+                    proc = subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
+                        [_BASH, str(ROOT / launcher), str(workspace)],
+                        capture_output=True, text=True, env=env, timeout=60)
+                    self.assertEqual(proc.returncode, 1, proc.stderr)
+                    self.assertIn(f"REFUSING to mount workspace: {workspace}\n", proc.stderr)
+                    self.assertIn("Its folder name 'acme widgets' cannot be its path",
+                                  proc.stderr)
+                    self.assertEqual(log.read_text(), "", "the launcher reached docker")
 
 
 class CdpathStaticTests(unittest.TestCase):

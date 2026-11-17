@@ -16,6 +16,6 @@ from in here.
 - **No git remote.** Commit locally; pushing is the human's step.
 {{include every-tier/workspace}}
 - **`/refs/<name>`, when present, is reference material.** Host directories the
-  human mounted read-only for you to read. Changes belong in `/workspace`.
+  human mounted read-only for you to read. Changes belong in the checkout.
 {{include every-tier/rm}}
 {{include every-tier/not-root}}

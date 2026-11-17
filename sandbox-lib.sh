@@ -86,6 +86,8 @@ sc_jdk_variant() {
 # credential material lives inside the chosen workspace. Override the hard
 # refusal with ALLOW_UNSAFE_WORKSPACE=1 for the rare deliberate case — a
 # conscious, visible choice, in keeping with the "no silent unsafe defaults" ethos.
+# The override passes this guard only: the folder must still be one
+# sc_workspace_mount can name, which `/` never is.
 #
 # This applies to EVERY tier. A tier-2 agent has no egress, but it still writes to
 # the host filesystem, and host-side execution of what it writes is the risk here.
@@ -246,7 +248,8 @@ sc_guard_workspace() {
         echo "  host sockets, and anything it writes there runs on the host later (git hooks," >&2
         echo "  build scripts)." >&2
         echo "  Re-run from a dedicated project directory, or set ALLOW_UNSAFE_WORKSPACE=1" >&2
-        echo "  to override deliberately." >&2
+        echo "  to override this check deliberately; the folder name must still be usable" >&2
+        echo "  as /workspace/<folder-name>, which the override does not change." >&2
         exit 1
     }
 
@@ -268,8 +271,9 @@ sc_guard_workspace() {
     fi
 
     # Under the override the config home earns only the content warnings below, so a
-    # workspace of ~/.config, which holds it a level down, launches silently: the
-    # override is the operator saying they know what the directory holds. The one
+    # workspace of ~/.config, which holds it a level down, passes this guard silently:
+    # the override is the operator saying they know what the directory holds.
+    # (sc_workspace_mount then refuses that one by its folder name, `.config`.) The one
     # exception is the marketplaces mount, which does not yield to it: when the
     # marketplaces directory exists, sc_marketplaces still refuses a workspace that
     # holds it or a link or directory on the way to it (a dotfiles-managed
@@ -293,6 +297,40 @@ sc_guard_workspace() {
 
     # shellcheck disable=SC2034  # consumed by the sourcing launcher, not here
     SC_WORKSPACE="$real_workspace"
+}
+
+# ---------------------------------------------------------------------------
+# Workspace mount path  ->  sets SC_WORKSPACE_MOUNT
+# ---------------------------------------------------------------------------
+# sc_workspace_mount <canonical_workspace>
+#
+# The checkout mounts at /workspace/<folder-name>, and the launch starts there, so
+# each project gets its own Claude Code state in the shared config volume (DESIGN.md,
+# "The sandbox image"). The name is the canonical path's basename, so a symlinked
+# checkout is named by its target, as a ref is in sc_refs.
+#
+# A name outside the rule is refused, never rewritten into one the operator did not
+# choose, and ALLOW_UNSAFE_WORKSPACE does not reach it: that override is about what
+# may be mounted, this is about where. The rule is sc_refs' less its leading '-',
+# which no workspace folder may have: no leading dot (`.`, `..`, a hidden mount),
+# no space, no ':' (docker -v splits on it), ASCII only. `/` has no name at all.
+sc_workspace_mount() {
+    # In another locale `=~` may let A-Z match an accented letter; bash restores it on
+    # return.
+    local LC_ALL=C
+    local workspace="${1:?sc_workspace_mount needs the canonical workspace}" name
+    name="${workspace##*/}"
+    # sc_refs' name rule, less its leading '-'.
+    if [[ ! "$name" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]]; then
+        echo "REFUSING to mount workspace: $workspace" >&2
+        echo "  Its folder name '$name' cannot be its path in the sandbox," >&2
+        echo "  /workspace/<folder-name>: a usable name starts with an ASCII letter, a digit" >&2
+        echo "  or '_', and holds only those, '.' and '-'. Rename the folder, or clone the" >&2
+        echo "  repo into one whose name is usable; ALLOW_UNSAFE_WORKSPACE does not change this." >&2
+        exit 1
+    fi
+    # shellcheck disable=SC2034  # consumed by the sourcing launcher, not here
+    SC_WORKSPACE_MOUNT="/workspace/$name"
 }
 
 # ---------------------------------------------------------------------------
@@ -570,7 +608,8 @@ sc_refs() {
         # allow reads under /refs, and an extra directory given on the command
         # line does load skills from its root's .claude; the settings allow was
         # measured not to, so this rule is the margin should a release change
-        # that (DESIGN.md, "Reference mounts").
+        # that (DESIGN.md, "Reference mounts"). sc_workspace_mount's rule is this
+        # one less the leading '-', which a ref may have.
         if [[ ! "$name" =~ ^[A-Za-z0-9_-][A-Za-z0-9._-]*$ ]]; then
             _sc_deny_ref "'$name' is not a usable name under /refs; give one as name=path."
         fi

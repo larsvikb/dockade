@@ -72,11 +72,12 @@ cannot record a write as the operator's or the registry's by accident.
 ## Repos are a list the operator keeps
 
 Every task belongs to one repo, named from a list the operator maintains. Not a git
-remote: a repo needs none, and inside the sandbox every workspace is `/workspace`, so
-the path says nothing either. A repo's agents learn its name from the repo's
-instructions file, a committed one because a worktree carries only tracked files. An
-unknown name is refused with the known ones, so a typo cannot start a repo. A retired
-repo keeps its tasks and takes no new one. A repo may record its remote
+remote: a repo needs none, and inside the sandbox a workspace's path is
+`/workspace/<folder-name>`, which two clones of one repo need not share and two
+unrelated repos may, so the path says nothing either. A repo's agents learn its name
+from the repo's instructions file, a committed one because a worktree carries only
+tracked files. An unknown name is refused with the known ones, so a typo cannot start a
+repo. A retired repo keeps its tasks and takes no new one. A repo may record its remote
 (`host/owner/repo`, never an owner alone), so anything later scoped to a repo is scoped
 by the operator's data rather than an agent's.
 

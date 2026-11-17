@@ -54,9 +54,11 @@ here. It is written down so you spend no turns discovering it.
 - **No Docker.** `make lint`, `make consistency` and `make test` all work here.
   `make verify-build`, `make check-boundary` and anything driving `docker
   compose` do not — they need the host, so ask rather than working around them.
-- **`/workspace` is the human's checkout, live.** Commits, branch switches and
+- **`/workspace/<folder-name>` is the human's checkout, live.** It is mounted under
+  its host folder's name, and the session starts in it. Commits, branch switches and
   edits appear outside the container immediately; switching branches moves their
-  working tree too. Say so when you do it.
+  working tree too. Say so when you do it. Anything written beside it, in
+  `/workspace` itself, is lost when the container exits.
 - **The control plane is unreachable by design.** It is on a network this
   container has no route to. Read its source to reason about it; do not try to
   query it.

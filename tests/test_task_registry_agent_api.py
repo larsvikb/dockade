@@ -16,6 +16,7 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 import _surface
 from _loader import (
@@ -131,6 +132,25 @@ class WireTests(unittest.TestCase):
         for body in (b"not json", b"\xff\xfe", b""):
             with self.subTest(body=body):
                 status, reply = api.answer(body)
+                self.assertEqual((status, reply["id"], reply["error"]["code"]),
+                                 (400, None, api.PARSE_ERROR))
+
+    def test_a_body_too_deep_to_parse_is_a_parse_error(self):
+        # RecursionError is a RuntimeError, not a ValueError; uncaught it was a 500.
+        # The stand-in raises it on a marker body only, so the proof does not depend
+        # on the interpreter's depth; the deep body exercises the real parser.
+        marker, loads = b'"too-deep"', json.loads
+
+        def parse(body, *args, **kwargs):
+            if body == marker:
+                raise RecursionError("too deep")
+            return loads(body, *args, **kwargs)
+
+        with mock.patch.object(api.json, "loads", parse):
+            recursing = api.answer(marker)
+        for label, (status, reply) in (("stand-in", recursing),
+                                       ("deep", api.answer(b"[" * 200000))):
+            with self.subTest(case=label):
                 self.assertEqual((status, reply["id"], reply["error"]["code"]),
                                  (400, None, api.PARSE_ERROR))
 

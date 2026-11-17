@@ -53,6 +53,17 @@ DECOY_ID = "d" * 32
 CALL_TOKEN = "c" * 32
 
 
+def _recursing_on(marker: object, real):
+    """A stand-in for a json call that raises RecursionError on ``marker`` alone and is
+    ``real`` on anything else, so a too-deep value is proved without depending on the
+    depth at which this interpreter gives up."""
+    def stand_in(value, *args, **kwargs):
+        if value == marker:
+            raise RecursionError("too deep")
+        return real(value, *args, **kwargs)
+    return stand_in
+
+
 def sse(result: dict) -> str:
     """A server's reply in the shape it actually sends."""
     return f"data: {json.dumps({'jsonrpc': '2.0', 'id': 1, 'result': result})}\n\n"
@@ -1230,12 +1241,24 @@ class OutcomeRecordTests(ExecutionTestCase):
         self.assertIn("cannot be sent", self.rows[0]["reason"])
 
     def test_a_grant_spent_on_unparseable_arguments_is_not_silent_either(self):
-        # The third path where a claim succeeds and no call happens. Should be
-        # unreachable — the control plane stores the canonical form it serialized
-        # itself — which is precisely why it must not be the one case that goes
-        # unrecorded.
+        # The third path where a claim succeeds and no call happens. Rare — the control
+        # plane stores the canonical form it serialized itself, so only a depth this
+        # thread's parse refuses (the next test) reaches it in earnest — which is
+        # precisely why it must not be the one case that goes unrecorded.
         self.granted(args_json="{not json")
         self.assertEqual(len(self.rows), 1)
+        self.assertEqual(self.rows[0]["resume_token"], TOKEN)
+        self.assertEqual(self.called, [])
+
+    def test_a_grant_spent_on_arguments_too_deep_to_parse_is_not_silent(self):
+        # RecursionError is a RuntimeError, not a ValueError. Raised by a stand-in on
+        # a marker only, so the proof does not depend on the interpreter's depth.
+        with mock.patch.object(self.execute.json, "loads",
+                               _recursing_on('"too-deep"', json.loads)):
+            result = self.granted(args_json='"too-deep"')
+        self.assertTrue(result["isError"])
+        self.assertEqual(len(self.rows), 1)
+        self.assertEqual(self.rows[0]["status"], "transport-error")
         self.assertEqual(self.rows[0]["resume_token"], TOKEN)
         self.assertEqual(self.called, [])
 
@@ -1702,6 +1725,41 @@ class ControlAnswerTests(unittest.TestCase):
             b"HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\n"
             b"Content-Length: %d\r\nConnection: close\r\n\r\n%s" % (len(body), body)))
         self.assertEqual(self.ask()["status"], "pending")
+
+    def test_an_answer_too_deep_to_parse_is_unanswered(self):
+        # RecursionError is a RuntimeError, not a ValueError; escaped, it was a 500,
+        # and in `resume` a claim that may have spent the grant left no outcome row.
+        body = b'"too-deep"'
+        for status in (b"200 OK", b"500 Internal Server Error"):
+            with self.subTest(status=status):
+                self._serve(lambda conn, status=status: conn.sendall(
+                    b"HTTP/1.1 %s\r\nContent-Type: application/json\r\n"
+                    b"Content-Length: %d\r\nConnection: close\r\n\r\n%s"
+                    % (status, len(body), body)))
+                with mock.patch.object(self.execute.json, "loads",
+                                       _recursing_on(body, json.loads)), \
+                        self.assertRaises(self.execute.Unanswered):
+                    self.ask()
+
+
+class UnencodableRequestTests(unittest.TestCase):
+    """A request too deep to encode was never sent, so it is not ``Unanswered``.
+
+    Apart from ControlAnswerTests because the line is drawn before urllib: the encode
+    runs on a worker thread whose depth limit need not be the event loop's, which
+    parsed the arguments it carries."""
+
+    def test_a_payload_too_deep_to_encode_is_not_delivered(self):
+        execute = load_execute()
+        marker = {"client": "too-deep"}
+        with mock.patch.object(execute.json, "dumps",
+                               _recursing_on(marker, json.dumps)), \
+                mock.patch.object(execute.urllib.request, "urlopen",
+                                  side_effect=AssertionError("the request was sent")), \
+                self.assertRaises(execute.discovery.DiscoveryError) as caught:
+            execute._ask_control("/tool/authorize", marker)
+        self.assertNotIsInstance(caught.exception, execute.Unanswered)
+        self.assertIn("will fail the same way", str(caught.exception))
 
 
 if __name__ == "__main__":

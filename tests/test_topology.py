@@ -3893,6 +3893,61 @@ esac
         self.assertEqual(names[2], names[1].removesuffix(".db") + ".md")
 
 
+class AuditPruneRecipeTests(_MakeRun):
+    """``audit-prune`` against a stub ``docker`` that logs each call and has the
+    preflight's ``test`` and the program each exit with the status a test sets. The
+    preflight checks the running container, since exec runs its filesystem rather than
+    the image's."""
+
+    PREFLIGHT = "exec control-plane test -f audit_prune.py"
+
+    def setUp(self):
+        super().setUp()
+        self.calls = self.tmp / "docker-calls"
+        stub = self.tmp / "bin"
+        stub.mkdir()
+        (stub / "docker").write_text(f"""#!/bin/sh
+printf '%s\\n' "$*" >> "{self.calls}"
+case " $* " in
+  *" test -f "*) exit "$PREFLIGHT_STATUS";;
+  *" python3 audit_prune.py "*) exit "$PRUNE_STATUS";;
+esac
+""")
+        (stub / "docker").chmod(0o755)
+        self.path = f"{stub}{os.pathsep}{os.environ['PATH']}"
+
+    def prune(self, *args: str, preflight_status: str, prune_status: str = "0"
+              ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+        run = self.make("audit-prune", *args, path=self.path,
+                        env={"PREFLIGHT_STATUS": preflight_status,
+                             "PRUNE_STATUS": prune_status},
+                        unset=("AUDIT_RETENTION_DAYS",))
+        calls = self.calls.read_text().splitlines() if self.calls.exists() else []
+        return run, calls
+
+    def test_a_container_without_the_program_stops_before_it_runs(self):
+        run, calls = self.prune(preflight_status="1")
+        self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+        self.assertIn("control-plane is not running, or runs an image that predates "
+                      "audit_prune.py — make up starts or recreates it", run.stdout)
+        self.assertEqual(calls, [self.PREFLIGHT])
+
+    def test_the_program_runs_in_the_service_with_the_window(self):
+        for args, days in (((), "30"), (("AUDIT_RETENTION_DAYS=90",), "90")):
+            with self.subTest(args=args):
+                self.calls.unlink(missing_ok=True)
+                run, calls = self.prune(*args, preflight_status="0")
+                self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+                self.assertEqual(calls, [self.PREFLIGHT,
+                                         f"exec -e AUDIT_RETENTION_DAYS={days} "
+                                         f"control-plane python3 audit_prune.py"])
+
+    def test_a_program_that_fails_fails_the_target(self):
+        run, calls = self.prune(preflight_status="0", prune_status="1")
+        self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+        self.assertEqual(len(calls), 2, calls)
+
+
 class UiDiffRecipeTests(_NeedsGit, _MakeRun):
     """``ui-diff`` runs against a stub ``node`` that answers both version reads with
     one string, so nothing is installed, and as the harness writes the transcript a

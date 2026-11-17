@@ -9075,51 +9075,6 @@ class CallTokenTableTests(_FreshStoreTestCase):
                          (fresh, 0, [(1.0, "outcome", "ok")], 14))
 
 
-class AuditPruneTargetTests(_FreshStoreTestCase):
-    """`make audit-prune`'s script, run as the Makefile holds it, on a temp store: it
-    drops audit rows and unspent call tokens past the window, and keeps the rest."""
-
-    @staticmethod
-    def _script():
-        makefile = (ROOT / "Makefile").read_text()
-        return re.search(r"^define AUDIT_PRUNE_PY\n(.*?)^endef$", makefile,
-                         re.S | re.M).group(1)
-
-    def _prune(self, path):
-        return subprocess.run(  # noqa: S603 (this interpreter, the repo's own script)
-            [sys.executable, "-I", "-c", self._script()], capture_output=True,
-            text=True, check=True,
-            env={"CONTROL_DB": path, "AUDIT_RETENTION_DAYS": "30"}).stdout
-
-    def test_it_drops_old_call_tokens_and_keeps_recent_ones(self):
-        path = self._use_store("audit-prune.db")
-        cp.store._init_db()
-        old, now = time.time() - 31 * 86400, time.time()
-        with cp.store._connect() as conn:
-            for token, at in (("a" * 32, old), ("b" * 32, now)):
-                conn.execute("INSERT INTO tool_call_tokens(token, approval_id, server, "
-                             "tool, client, created_at) VALUES (?, 'card', 'mcp-github', "
-                             "'get_me', NULL, ?)", (token, at))
-                conn.execute("INSERT INTO audit(ts, kind) VALUES (?, 'allow')", (at,))
-            conn.commit()
-        printed = self._prune(path)
-        with cp.store._connect() as conn:
-            tokens = [r[0] for r in conn.execute("SELECT token FROM tool_call_tokens")]
-            audit = conn.execute("SELECT COUNT(*) FROM audit").fetchone()[0]
-        self.assertEqual((tokens, audit), (["b" * 32], 1))
-        self.assertIn("1 audit row(s) and 1 unspent call token(s)", printed)
-
-    def test_a_store_without_the_table_is_still_pruned(self):
-        # A control plane older than the table, met by a newer Makefile.
-        path = self._use_store("audit-prune-v14.db")
-        cp.store._init_db()
-        with cp.store._connect() as conn:
-            conn.execute("DROP TABLE tool_call_tokens")
-            conn.execute("INSERT INTO audit(ts, kind) VALUES (1.0, 'allow')")
-            conn.commit()
-        self.assertIn("1 audit row(s) and 0 unspent", self._prune(path))
-
-
 from test_sqlite_transaction_control import under_the_announced_default  # noqa: E402 (beside its one user)
 
 

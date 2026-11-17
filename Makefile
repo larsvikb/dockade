@@ -156,6 +156,7 @@ REFFILES := $(SCRIPTS) \
             control-plane/app.py \
             control-plane/store.py \
             control-plane/store_backup.py \
+            control-plane/audit_prune.py \
             control-plane/audit.py \
             control-plane/policy.py \
             control-plane/holds.py \
@@ -1060,21 +1061,29 @@ destroy: ## Stop infra AND delete its volumes: egress audit, tool audit, tool re
 AUDIT_RETENTION_DAYS ?= 30
 
 audit-prune: ## Trim audit rows and unspent call tokens older than AUDIT_RETENTION_DAYS (default 30) and reclaim disk; leaves policy + approvals intact (operator-run)
-	# Retention for the audit table, and for the call tokens a pinned call's outcome
-	# never came back to spend (store._TOOL_CALL_TOKENS_DDL). This is NOT `make
-	# destroy`: that deletes the whole volume — policy rules, approvals and the
-	# ingest cursor with it — and is the fresh-start. This trims old DECISIONS to a
-	# window and hands the freed disk back, leaving everything standing (rules,
-	# pending/resolved approvals, the ingest offset) untouched. Deliberately manual:
-	# the audit trail is what this design exists to keep trustworthy, so thinning it
-	# is an operator's decision, never a timer's.
-	#
-	# Runs against the LIVE control plane over docker exec, using its own python3 +
-	# stdlib sqlite3 — no tooling added to the choke-point-adjacent image, same
-	# reasoning as split-check. VACUUM is why disk is actually returned: a bare
-	# DELETE frees pages inside the file without shrinking it.
+	@# Retention for the audit table, and for the call tokens a pinned call's outcome
+	@# never came back to spend (store._TOOL_CALL_TOKENS_DDL). This is NOT `make
+	@# destroy`: that deletes the whole volume — policy rules, approvals and the
+	@# ingest cursor with it — and is the fresh-start. This trims old DECISIONS to a
+	@# window and hands the freed disk back, leaving everything standing (rules,
+	@# pending/resolved approvals, the ingest offset) untouched. Deliberately manual:
+	@# the audit trail is what this design exists to keep trustworthy, so thinning it
+	@# is an operator's decision, never a timer's.
+	@#
+	@# Runs against the LIVE control plane over docker exec, using the image's own
+	@# python3 and stdlib sqlite3, plus one file it ships only to be run
+	@# (control-plane/audit_prune.py, which says why it VACUUMs). exec starts in the
+	@# image's WORKDIR, where the file and the store module it imports are.
+	@#
+	@# exec runs the CONTAINER's filesystem, not the image's, so the check is of the
+	@# running container: a rebuilt image under an old container would pass an image
+	@# check, then fail with python's "can't open file".
+	@if ! docker exec control-plane test -f audit_prune.py; then
+	  echo "control-plane is not running, or runs an image that predates audit_prune.py — make up starts or recreates it"
+	  exit 1
+	fi
 	docker exec -e AUDIT_RETENTION_DAYS=$(AUDIT_RETENTION_DAYS) control-plane \
-	  python3 -c "$$AUDIT_PRUNE_PY"
+	  python3 audit_prune.py
 
 # Where `make backup` writes: OUTSIDE this repo, beside MCP_SECRETS and for the same
 # reason. A backup is the crown-jewel state — every host the agent has ever asked
@@ -1551,8 +1560,6 @@ sys.exit(0 if ok else 1)
 endef
 export SPLIT_CHECK_PY
 
-# Body of `audit-prune` (see the target above). Runs inside the control-plane
-# container so it shares the app's view of the store (CONTROL_DB, WAL mode).
 # Body of `tool-outcomes` (see the target above). Reads the gateway's own JSONL
 # stream and prints it one line per record, newest last.
 #
@@ -1654,36 +1661,3 @@ print(f"-- {found} record(s) under {sha} in {path} and its rotations"
       file=sys.stderr)
 endef
 export TOOL_CONTENT_PY
-
-define AUDIT_PRUNE_PY
-import os, sqlite3, time
-
-# Only the audit table and tool_call_tokens are touched. Reads the same defaults
-# app.py does, so an operator override of CONTROL_DB is honoured;
-# AUDIT_RETENTION_DAYS is passed in by the Makefile (docker exec -e).
-days = int(os.environ.get("AUDIT_RETENTION_DAYS", "30"))
-db = os.environ.get("CONTROL_DB", "/var/lib/control-plane/control.db")
-cutoff = time.time() - days * 86400
-
-conn = sqlite3.connect(db, timeout=10.0, autocommit=sqlite3.LEGACY_TRANSACTION_CONTROL)
-# The app runs in WAL and the drain loop writes in short bursts; wait rather than
-# fail on a momentary lock. VACUUM below needs the write lock to itself.
-conn.execute("PRAGMA busy_timeout=10000")
-deleted = conn.execute("DELETE FROM audit WHERE ts < ?", (cutoff,)).rowcount
-# A token row is left when an outcome line never arrived to spend it. Absent on a
-# store a control plane older than the table last started.
-tokens = 0
-if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
-                "AND name='tool_call_tokens'").fetchone():
-    tokens = conn.execute("DELETE FROM tool_call_tokens WHERE created_at < ?",
-                          (cutoff,)).rowcount
-conn.commit()
-# DELETE frees pages inside the file but does not shrink it; VACUUM rebuilds the
-# file compactly and returns the space to the OS. Must run outside a transaction,
-# hence the commit above.
-conn.execute("VACUUM")
-conn.close()
-print(f"audit-prune: deleted {deleted} audit row(s) and {tokens} unspent call "
-      f"token(s) older than {days}d, then VACUUM")
-endef
-export AUDIT_PRUNE_PY

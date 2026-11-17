@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Every ``sqlite3.connect`` in the control plane, the task registry and ``make
-audit-prune``'s program passes ``autocommit=sqlite3.LEGACY_TRANSACTION_CONTROL``.
+"""Every ``sqlite3.connect`` in the control plane and the task registry passes
+``autocommit=sqlite3.LEGACY_TRANSACTION_CONTROL``.
 
 Python's docs say ``autocommit``'s default, legacy today, will become ``False``. Under
 ``False`` a connection is always inside a transaction: an explicit ``BEGIN`` and
@@ -21,15 +21,14 @@ assignment to any ``.autocommit``, ``setattr``'s included. What stays open is re
 ``Connection`` some other way, by an alias of it, ``type(…)`` of a connection, or a
 ``factory=`` subclass built through either; ``factory=`` itself is allowed.
 
-Each source is counted, and each component and audit-prune's program must hold a
-call: a walk that found nothing, or a component directory renamed, checked nothing.
+Each source is counted, and each component must hold a call: a walk that found
+nothing, or a component directory renamed, checked nothing.
 The tests' own connections are left on the default: on a Python with the new one they
 fail loudly."""
 from __future__ import annotations
 
 import ast
 import contextlib
-import re
 import sqlite3
 import unittest
 from collections.abc import Iterator
@@ -55,20 +54,8 @@ def under_the_announced_default() -> Iterator[None]:
         yield
 
 
-def audit_prune_program() -> str:
-    """The Makefile's ``AUDIT_PRUNE_PY``, as ``AuditPruneTargetTests._script`` reads it.
-    Required rather than skipped when missing: a reworded ``define`` line would
-    otherwise turn this check off without a word."""
-    found = re.search(r"^define AUDIT_PRUNE_PY\n(.*?)^endef$",
-                      (ROOT / "Makefile").read_text(), re.S | re.M)
-    if found is None:
-        raise AssertionError("the Makefile has no `define AUDIT_PRUNE_PY` block")
-    return found.group(1)
-
-
-AUDIT_PRUNE = "Makefile (AUDIT_PRUNE_PY)"
 #: Each group ``_sources`` yields; every one must hold a ``sqlite3.connect`` call.
-GROUPS = (*COMPONENTS, AUDIT_PRUNE)
+GROUPS = COMPONENTS
 #: What ``from sqlite3 import`` may not bring in: each opens a connection, or a module
 #: that does, under a name this check does not follow.
 HIDING_IMPORTS = ("connect", "Connection", "dbapi2", "*")
@@ -159,7 +146,6 @@ def _sources() -> Iterator[tuple[str, str, str]]:
     for component in COMPONENTS:
         for path in sorted((ROOT / component).rglob("*.py")):
             yield component, str(path.relative_to(ROOT)), path.read_text()
-    yield AUDIT_PRUNE, AUDIT_PRUNE, audit_prune_program()
 
 
 def empty_groups(calls: dict[str, int]) -> list[str]:
@@ -185,13 +171,8 @@ class TransactionControlTests(unittest.TestCase):
         self.assertEqual(empty_groups(calls), [])
         calls["task-registry"] = 0
         self.assertEqual(empty_groups(calls), ["task-registry"])
-        del calls[AUDIT_PRUNE]
-        self.assertEqual(empty_groups(calls), ["task-registry", AUDIT_PRUNE])
-
-    def test_audit_prunes_program_is_among_the_sources(self):
-        programs = [source for group, _, source in _sources() if group == AUDIT_PRUNE]
-        self.assertEqual(programs, [audit_prune_program()])
-        self.assertEqual(problems(programs[0], AUDIT_PRUNE), ([], 1))
+        del calls["control-plane"]
+        self.assertEqual(empty_groups(calls), ["control-plane", "task-registry"])
 
     def test_the_stated_keyword_passes(self):
         self.assertEqual(problems(
@@ -253,11 +234,6 @@ class TransactionControlTests(unittest.TestCase):
             "    conn.row_factory = sqlite3.Row\n"
             "    print(conn.autocommit, getattr(conn, 'autocommit'))\n"
             "    return conn\n", "ok"), ([], 0))
-
-    def test_a_missing_audit_prune_block_fails_rather_than_skips(self):
-        with mock.patch.object(Path, "read_text", return_value="all:\n"), \
-                self.assertRaisesRegex(AssertionError, "AUDIT_PRUNE_PY"):
-            audit_prune_program()
 
 
 class AnnouncedDefaultTests(unittest.TestCase):

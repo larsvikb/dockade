@@ -37,6 +37,8 @@ They import in that order and never back. The ``api_*`` modules import them and
 
 ``store_backup`` is not part of the process: nothing imports it, and the image ships it
 for ``make backup`` and ``make restore`` to run in a container of their own.
+``audit_prune`` is not part of the process either: the image ships it for ``make
+audit-prune`` to run by exec in the live service.
 
 THREE LISTENERS, on three networks, because the dangerous surface is the management
 API, not the questions the enforcers ask it. Every way of granting lives on the

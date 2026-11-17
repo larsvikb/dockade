@@ -164,12 +164,16 @@ def _parsed(line: bytes) -> dict | None:
 def _timestamp(rec: dict) -> float | None:
     """The WRITER's own timestamp, not our receipt time: these are historical rows, and
     stamping them on arrival would sort a backlog as if it had all just happened. NaN
-    and infinity are refused here rather than left to sort strangely later."""
+    and infinity are refused here rather than left to sort strangely later, and so is
+    an int no float can hold, whose conversion would raise in the drain on every pass."""
     ts = rec.get("ts")
-    if (not isinstance(ts, (int, float)) or isinstance(ts, bool)
-            or not math.isfinite(ts)):
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool):
         return None
-    return float(ts)
+    try:
+        ts = float(ts)
+    except OverflowError:
+        return None
+    return ts if math.isfinite(ts) else None
 
 
 def _egress_row(line: bytes) -> dict | None:
@@ -189,7 +193,10 @@ def _egress_row(line: bytes) -> dict | None:
     if ts is None:
         return None
     port = rec.get("port")
-    if not isinstance(port, int) or isinstance(port, bool):
+    # A TCP port, as the proxy writes one: outside 0..65535 the writer has gone wrong
+    # and there is no port. The range also keeps it inside SQLite's INTEGER, which
+    # would refuse the row, and so the stream: a mapper returns only bindable values.
+    if type(port) is not int or not 0 <= port <= 65535:
         port = None
     client = _ingest_field(rec.get("client"))
     # Classified HERE rather than read off the line: the proxy does not send a class

@@ -262,9 +262,21 @@ class RowMappingTests(IngestTestCase):
         # A row with no usable instant cannot be placed in a time-ordered view.
         # `True` is here because bool is an int subclass, so a naive isinstance
         # check would silently file a decision at 1970-01-01T00:00:01.
-        for ts in (None, "1000", float("nan"), float("inf"), True, [1000]):
+        # 10 ** 400 parses as an int no float can hold: converting it raised, and
+        # wedged the stream at that line.
+        for ts in (None, "1000", float("nan"), float("inf"), True, [1000], 10 ** 400):
             with self.subTest(ts=ts):
                 self.assertIsNone(cp.ingest._egress_row(_line(ts=ts).encode()))
+
+    def test_an_int_timestamp_a_float_can_hold_is_kept(self):
+        # 1 << 63 is past SQLite's INTEGER but well inside a float's range, so it
+        # must come out a float: equal is not enough, since 1 << 63 == float(1 << 63)
+        # and the raw int would fail the bind.
+        for ts in (1000, 1 << 63):
+            with self.subTest(ts=ts):
+                mapped = cp.ingest._egress_row(_line(ts=ts).encode())["ts"]
+                self.assertIs(type(mapped), float)
+                self.assertEqual(mapped, float(ts))
 
     @staticmethod
     def _fields(line):
@@ -279,6 +291,17 @@ class RowMappingTests(IngestTestCase):
             with self.subTest(port=port):
                 self.assertIsNone(self._fields(_line(port=port).encode())["port"])
         self.assertEqual(self._fields(_line(port=443).encode())["port"], 443)
+
+    def test_a_port_outside_the_tcp_range_becomes_null(self):
+        # Past SQLite's INTEGER (either sign) the INSERT raised, and wedged the stream.
+        for port in (65536, -1, 1 << 63, -(1 << 63) - 1):
+            with self.subTest(port=port):
+                row = self._fields(_line(port=port).encode())
+                self.assertIsNone(row["port"])
+                self.assertEqual(row["host"], "evil.com")
+        for port in (0, 65535):
+            with self.subTest(port=port):
+                self.assertEqual(self._fields(_line(port=port).encode())["port"], port)
 
     def test_agent_influenced_fields_are_truncated(self):
         """host/url come from what the sandbox asked for. The proxy records them
@@ -504,6 +527,27 @@ class DrainTests(IngestTestCase):
         with cp.store._connect() as conn:
             self.assertEqual(conn.execute(
                 "SELECT COUNT(*) FROM audit WHERE kind='ingest'").fetchone()[0], 0)
+
+    def test_a_port_past_sqlites_integer_does_not_wedge_the_cursor(self):
+        self.write(_line(host="a.example", port=1 << 63)
+                   + _line(host="b.example", port=443))
+        self.assertEqual(cp.ingest._drain(self.stream), os.path.getsize(self.path))
+        self.assertEqual([(r["host"], r["port"]) for r in self.rows()],
+                         [("a.example", None), ("b.example", 443)])
+        self.assertEqual(self.cursor()["offset"], os.path.getsize(self.path))
+
+    def test_a_timestamp_past_sqlites_integer_is_stored_as_real(self):
+        self.write(_line(host="a.example", ts=1 << 63) + _line(host="b.example"))
+        self.assertEqual(cp.ingest._drain(self.stream), os.path.getsize(self.path))
+        self.assertEqual([(r["host"], r["ts"]) for r in self.rows()],
+                         [("a.example", float(1 << 63)), ("b.example", 1000.0)])
+        self.assertEqual(self.cursor()["offset"], os.path.getsize(self.path))
+
+    def test_a_timestamp_no_float_holds_does_not_wedge_the_cursor(self):
+        self.write(_line(host="a.example", ts=10 ** 400) + _line(host="b.example"))
+        self.assertEqual(cp.ingest._drain(self.stream), os.path.getsize(self.path))
+        self.assertEqual([r["host"] for r in self.rows()], ["b.example"])
+        self.assertEqual(self.cursor()["offset"], os.path.getsize(self.path))
 
     def test_oversized_line_is_skipped_rather_than_stalling_the_tail(self):
         """One unbounded record must not stop every later decision from arriving."""
@@ -750,7 +794,7 @@ class ToolOutcomeRowTests(unittest.TestCase):
     def test_an_unusable_timestamp_is_dropped(self):
         # The gateway's own clock, not our receipt time — so a backlog sorts where it
         # happened. NaN and infinity parse as floats and would sort absurdly.
-        for ts in ("1000", None, float("nan"), float("inf"), True, [1]):
+        for ts in ("1000", None, float("nan"), float("inf"), True, [1], 10 ** 400):
             with self.subTest(ts=ts):
                 self.assertIsNone(cp.ingest._tool_row(self.line(ts=ts)))
 
@@ -1028,6 +1072,12 @@ class ToolOutcomeDrainTests(IngestTestCase):
                     cp.ingest._drain(self.tool)
                 self.assertEqual([r["status"] for r in self.rows()], ["timeout"])
                 self.assertEqual(self.cursor_offset(), os.path.getsize(self.tool_path))
+
+    def test_a_timestamp_no_float_holds_does_not_wedge_the_cursor(self):
+        self.write({"status": "tool-error", "ts": 10 ** 400}, {"status": "timeout"})
+        self.assertEqual(cp.ingest._drain(self.tool), os.path.getsize(self.tool_path))
+        self.assertEqual([r["status"] for r in self.rows()], ["timeout"])
+        self.assertEqual(self.cursor_offset(), os.path.getsize(self.tool_path))
 
     def cursor_offset(self):
         with cp.store._connect() as conn:

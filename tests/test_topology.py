@@ -74,6 +74,12 @@ POLICY = (ROOT / "control-plane" / "policy.py").read_text()
 AUTHORIZE_PORT = 8091
 MANAGE_PORT = 8090
 TOOL_PORT = 8092
+#: The listener each control network carries, by network. Its keys are held equal to
+#: ``_control_networks()``, so a control network added in compose fails until its
+#: listener's port is written here.
+CONTROL_NETWORK_PORTS = {"control-net": MANAGE_PORT,
+                         "authorize-net": AUTHORIZE_PORT,
+                         "tool-authorize-net": TOOL_PORT}
 
 
 #: The top-level keys each compose file may declare, each once. A ``networks:`` in
@@ -488,6 +494,21 @@ def _networks_of(service: str) -> set[str]:
     return set(_network_legs(service))
 
 
+def _control_networks() -> set[str]:
+    """The control networks: every network the control plane is attached to.
+
+    Its legs are the control networks by definition (DESIGN.md, ``## Networks``: one
+    shared management path plus one single-conversation bridge per enforcer), so the
+    guard tests read the set from here and a network added in compose joins them
+    unlisted. Every leg counts, internal or not: a non-internal leg must reach
+    ``test_the_networks_the_guard_blocks_are_internal`` rather than drop out of it."""
+    networks = _networks_of("control-plane")
+    if "control-net" not in networks:
+        raise AssertionError("the control plane has no control-net leg: the reader "
+                             "saw no control networks")
+    return networks
+
+
 def _raw_networks(service: str) -> set[str]:
     """``_networks_of`` for a service that may declare no networks at all (the
     profile-gated llm-* variants do declare some; a future one might not)."""
@@ -899,11 +920,12 @@ class ControlPlaneBindTests(unittest.TestCase):
         # because a listener is really there: a pin that moves, or a port that
         # changes, leaves the probe passing against nothing — the same drift
         # ``test_the_probed_mcp_address_is_the_one_compose_pins`` exists for, and the
-        # two files still cannot see each other. All three surfaces, because the
+        # two files still cannot see each other. Every control network, because the
         # newest is the one a reader is most likely to leave unasserted.
-        for net, port in (("control-net", MANAGE_PORT),
-                          ("authorize-net", AUTHORIZE_PORT),
-                          ("tool-authorize-net", TOOL_PORT)):
+        self.assertEqual(set(CONTROL_NETWORK_PORTS), _control_networks(),
+                         "CONTROL_NETWORK_PORTS does not name each control network's "
+                         "listener port")
+        for net, port in CONTROL_NETWORK_PORTS.items():
             with self.subTest(network=net):
                 pinned = _pin("control-plane", net)
                 self.assertIsNotNone(
@@ -918,12 +940,12 @@ class ControlPlaneBindTests(unittest.TestCase):
         # and the dotted-quad probes passed throughout. So the mapped list is the only
         # one that can catch a regression of it, and a new control subnet added to
         # the dotted list alone leaves the bypass unprobed for exactly that subnet.
-        for net in ("control-net", "authorize-net", "tool-authorize-net"):
+        for net in sorted(_control_networks()):
             with self.subTest(network=net):
                 pinned = _pin("control-plane", net)
                 self.assertIn(f"[::ffff:{pinned}]", BOUNDARY,
-                              f"boundary-check.sh probes {pinned} as a dotted quad "
-                              f"but not as IPv4-mapped IPv6, which is the only "
+                              f"boundary-check.sh probes {net} at {pinned} as a "
+                              f"dotted quad but not as IPv4-mapped IPv6, which is the only "
                               f"spelling that catches an address-family bypass")
 
     def test_nothing_else_joins_the_tool_bridge(self):
@@ -1283,7 +1305,7 @@ class GatewayPlacementTests(unittest.TestCase):
         # entry that matters is mcp-net — a server container reaching the agent-facing
         # endpoint is the lateral move this whole placement exists to prevent.
         forbidden = _gateway_forbidden_default()
-        for net in ("mcp-net", "tool-authorize-net", "authorize-net", "control-net"):
+        for net in sorted(_control_networks() | {"mcp-net"}):
             with self.subTest(network=net):
                 self.assertIn(_subnet_of(net), forbidden,
                               f"{net} is absent from GATEWAY_BIND_FORBIDDEN, so a "
@@ -1646,39 +1668,43 @@ class RelayGuardAgreesWithComposeTests(unittest.TestCase):
             r'FORBIDDEN_CIDRS_DEFAULT = "([^"]+)"', ADDON)
         self.assertIsNotNone(default, "could not find the FORBIDDEN_CIDRS default")
         listed = {c.strip() for c in default.group(1).split(",")}
-        for network in ("control-net", "authorize-net", "tool-authorize-net"):
-            self.assertIn(_subnet_of(network), listed,
-                          f"{network}'s subnet is not in the relay guard's default")
+        for network in sorted(_control_networks()):
+            with self.subTest(network=network):
+                self.assertIn(_subnet_of(network), listed,
+                              f"{network}'s subnet is not in the relay guard's default")
 
     def test_the_tool_bind_guard_names_every_other_enforcers_network(self):
         # The app-side half of the same two-ends problem, and it has to be checked
         # from compose for the same reason: a default pointed at a range nothing
         # uses passes every wildcard test while leaving the claim endpoint bindable
-        # on authorize-net. The tool bridge's OWN subnet must not be listed — that
-        # is the address the listener is required to bind.
+        # on authorize-net. Every other control network is listed; the tool bridge's
+        # OWN subnet must not be — that is the address the listener is required to
+        # bind.
         default = re.search(
             r'"CONTROL_TOOL_BIND_FORBIDDEN", "([^"]+)"', APP)
         self.assertIsNotNone(default, "could not find the tool bind guard's default")
         listed = {c.strip() for c in default.group(1).split(",")}
-        for network in ("control-net", "authorize-net"):
-            self.assertIn(_subnet_of(network), listed,
-                          f"{network}'s subnet is not in the tool bind guard")
+        for network in sorted(_control_networks() - {"tool-authorize-net"}):
+            with self.subTest(network=network):
+                self.assertIn(_subnet_of(network), listed,
+                              f"{network}'s subnet is not in the tool bind guard")
         self.assertNotIn(_subnet_of("tool-authorize-net"), listed,
                          "the tool bridge's own subnet is forbidden to the listener "
                          "that is required to bind it")
 
     def test_the_management_bind_guard_names_every_enforcers_network(self):
-        # Same shape for the listener that grants. Both enforcers' networks must be
-        # listed — the proxy's authorize-net and the gateway's tool-authorize-net —
-        # and control-net must not be, because that is the address the management
-        # listener is required to bind.
+        # Same shape for the listener that grants. Every enforcer's network must be
+        # listed — the proxy's authorize-net, the gateway's tool-authorize-net, any
+        # bridge after them — and control-net must not be, because that is the address
+        # the management listener is required to bind.
         default = re.search(
             r'"CONTROL_MANAGE_BIND_FORBIDDEN", "([^"]+)"', APP)
         self.assertIsNotNone(default, "could not find the management bind guard's default")
         listed = {c.strip() for c in default.group(1).split(",")}
-        for network in ("authorize-net", "tool-authorize-net"):
-            self.assertIn(_subnet_of(network), listed,
-                          f"{network}'s subnet is not in the management bind guard")
+        for network in sorted(_control_networks() - {"control-net"}):
+            with self.subTest(network=network):
+                self.assertIn(_subnet_of(network), listed,
+                              f"{network}'s subnet is not in the management bind guard")
         self.assertNotIn(_subnet_of("control-net"), listed,
                          "control-net is forbidden to the listener that is required "
                          "to bind it")
@@ -1730,8 +1756,7 @@ class RelayGuardAgreesWithComposeTests(unittest.TestCase):
         default = re.search(r'"EGRESS_LIFELINE_CIDRS",\s*\n?\s*"([^"]+)"', ADDON)
         lifeline = [ipaddress.ip_network(c.strip())
                     for c in default.group(1).split(",")]
-        for network in ("mcp-net", "control-net", "authorize-net",
-                        "tool-authorize-net"):
+        for network in sorted(_control_networks() | {"mcp-net"}):
             subnet = ipaddress.ip_network(_subnet_of(network))
             for granted in lifeline:
                 self.assertFalse(
@@ -1790,16 +1815,197 @@ class RelayGuardAgreesWithComposeTests(unittest.TestCase):
         self.assertEqual({agent_range}, {c.strip() for c in lifeline.split(",")})
 
     def test_the_networks_the_guard_blocks_are_internal(self):
-        # An internal bridge has no route off-box. Both control networks must be one,
+        # An internal bridge has no route off-box. Every control network must be one,
         # or the control plane itself would gain egress. mcp-net is here for the same
         # reason wearing a different hat: its internal-ness is what makes the egress
         # proxy the only thing an MCP server container can reach, so a server that
         # ignores HTTPS_PROXY fails loudly instead of quietly going direct — from a
         # container holding a write-capable credential. Placement is that boundary;
         # nothing inside those containers enforces it.
-        for network in ("control-net", "authorize-net", "tool-authorize-net",
-                        "sandbox-net", "mcp-net"):
-            self.assertTrue(_is_internal(network), f"network {network} is not internal: true")
+        control = _control_networks()
+        for network in sorted(control | {"sandbox-net", "mcp-net"}):
+            with self.subTest(network=network):
+                leg = " (a leg of the control plane)" if network in control else ""
+                self.assertTrue(_is_internal(network),
+                                f"network {network}{leg} is not internal: true")
+
+
+class ControlNetworksAreDerivedTests(unittest.TestCase):
+    """The guard tests above read the control networks from compose
+    (``_control_networks``), so a network added there fails each guard's test until
+    the guard lists it. Held here by mutating compose alone: a guard test that went
+    back to a written list would pass the mutant. Each existing control network is
+    then moved, and made non-internal, one at a time: a loop that leaves one out
+    passes the added network but not those. The networks those tests check beside the
+    derived set (sandbox-net, mcp-net) are held by mutating one at a time."""
+
+    #: An invented fourth control network, on a subnet no network uses, with the
+    #: control plane pinned on it.
+    NETWORK = "widgets-authorize-net"
+    TOOL_LEG = "      tool-authorize-net:\n        ipv4_address: 172.27.0.2\n"
+    TOOL_SUBNET = "        - subnet: 172.27.0.0/24\n"
+    #: The tests that must fail on a control network their guard misses, each by its
+    #: class, with the one network the test leaves out, if any.
+    GUARDS: ClassVar[tuple[tuple[type[unittest.TestCase], str, str | None], ...]] = (
+        (RelayGuardAgreesWithComposeTests,
+         "test_the_guard_default_covers_every_control_subnet", None),
+        (RelayGuardAgreesWithComposeTests,
+         "test_the_tool_bind_guard_names_every_other_enforcers_network",
+         "tool-authorize-net"),
+        (RelayGuardAgreesWithComposeTests,
+         "test_the_management_bind_guard_names_every_enforcers_network", "control-net"),
+        (GatewayPlacementTests,
+         "test_the_bind_guard_names_every_network_the_agent_surface_must_not_reach", None),
+        (ControlPlaneBindTests,
+         "test_every_probed_control_plane_address_is_one_compose_pins", None),
+        (ControlPlaneBindTests, "test_every_relay_probe_has_an_ipv4_mapped_twin", None),
+    )
+    #: Where ``renumbered`` moves a control network: a range no network uses, inside
+    #: the lifeline's client range (sandbox-net's pool), so the lifeline-range test
+    #: fails on it too.
+    SPARE_SUBNET, SPARE_BASE = "172.30.0.192/26", "172.30.0.192"
+
+    def mutant(self, subnet: str = "172.23.0.0/24",
+               pin: str = "172.23.0.2") -> Callable[[str], str]:
+        return _edits(
+            _swap(self.TOOL_SUBNET,
+                  f"{self.TOOL_SUBNET}  {self.NETWORK}:\n    name: {self.NETWORK}\n"
+                  "    driver: bridge\n    internal: true\n"
+                  f"    ipam:\n      config:\n        - subnet: {subnet}\n"),
+            _swap(self.TOOL_LEG,
+                  f"{self.TOOL_LEG}      {self.NETWORK}:\n        ipv4_address: {pin}\n"))
+
+    def renumbered(self, network: str) -> Callable[[str], str]:
+        """An edit moving a /24 control network to the spare range: its subnet, and
+        every address in it (pins, binds, URLs), each keeping its host offset."""
+        subnet = _subnet_of(network)
+        if not subnet.endswith(".0/24"):
+            raise AssertionError(f"the mutant no longer applies: {network} is {subnet}")
+        prefix = subnet.removesuffix(".0/24")
+        base = ipaddress.ip_address(self.SPARE_BASE)
+
+        def edit(text: str) -> str:
+            text = _swap(f"        - subnet: {subnet}\n",
+                         f"        - subnet: {self.SPARE_SUBNET}\n")(text)
+            moved, count = re.subn(rf"(?<![\d.]){re.escape(prefix)}\.(\d+)(?![\d.])",
+                                   lambda m: str(base + int(m[1])), text)
+            if not count:
+                raise AssertionError(f"the mutant no longer applies: no {prefix}.x address")
+            return moved
+        return edit
+
+    def failure_with(self, edit: Callable[[str], str], cls: type[unittest.TestCase],
+                     method: str) -> str | None:
+        """The failure message of a test run against an edited docker-compose.yml,
+        or None if it passes."""
+        name = "docker-compose.yml"
+        text = edit((ROOT / name).read_text())
+        self.assertEqual(_form_violations(name, text), [])
+        with mock.patch.dict(COMPOSE_TEXTS, {name: text}):
+            return _failure(cls, method)
+
+    def test_a_new_control_network_fails_every_guard_until_listed(self):
+        for cls, method, _excluded in self.GUARDS:
+            with self.subTest(test=method):
+                failure = self.failure_with(self.mutant(), cls, method)
+                self.assertIsNotNone(failure, f"{method} passes a control network "
+                                              f"no guard lists")
+                self.assertIn(self.NETWORK, failure)
+
+    def test_a_new_control_network_in_the_lifeline_range_fails_it(self):
+        # The lifeline-range test, apart: only a network inside the range can fail
+        # it, and the one above is placed where no network is.
+        spare = ipaddress.ip_address(self.SPARE_BASE) + 2
+        failure = self.failure_with(self.mutant(self.SPARE_SUBNET, str(spare)),
+                                    RelayGuardAgreesWithComposeTests,
+                                    "test_no_other_network_is_inside_the_lifeline_range")
+        self.assertIsNotNone(failure, "a control network in the lifeline range passes")
+        self.assertIn(self.NETWORK, failure)
+
+    def test_each_moved_control_network_fails_every_guard_but_its_exclusion(self):
+        lifeline = (RelayGuardAgreesWithComposeTests,
+                    "test_no_other_network_is_inside_the_lifeline_range", None)
+        for network in sorted(_control_networks()):
+            for cls, method, excluded in (*self.GUARDS, lifeline):
+                with self.subTest(network=network, test=method):
+                    failure = self.failure_with(self.renumbered(network), cls, method)
+                    if network == excluded:
+                        self.assertIsNone(failure, f"{method} fails on the network "
+                                                   f"it leaves out")
+                    else:
+                        self.assertIsNotNone(failure, f"{method} passes {network} moved "
+                                                      f"where no guard lists it")
+                        self.assertIn(network, failure)
+
+    def test_each_control_network_made_non_internal_fails_the_internal_test(self):
+        for network in sorted(_control_networks()):
+            with self.subTest(network=network):
+                external = _swap(f"    name: {network}\n    driver: bridge\n"
+                                 "    internal: true\n",
+                                 f"    name: {network}\n    driver: bridge\n")
+                failure = self.failure_with(
+                    external, RelayGuardAgreesWithComposeTests,
+                    "test_the_networks_the_guard_blocks_are_internal")
+                self.assertIsNotNone(failure, f"a non-internal {network} passes")
+                self.assertIn(f"{network} (a leg of the control plane) is not internal",
+                              failure)
+
+    def test_a_listed_port_does_not_stand_in_for_a_probe(self):
+        # With the port written in, the network is still unprobed: the probe loop
+        # must run over the derived networks, not stop at the port map's equality.
+        with mock.patch.dict(CONTROL_NETWORK_PORTS, {self.NETWORK: TOOL_PORT + 1}):
+            failure = self.failure_with(
+                self.mutant(), ControlPlaneBindTests,
+                "test_every_probed_control_plane_address_is_one_compose_pins")
+        self.assertIsNotNone(failure, "a control network with a port and no probe passes")
+        self.assertIn(f"probe {self.NETWORK}", failure)
+
+    def test_a_non_internal_control_plane_leg_fails_the_internal_test(self):
+        egress_leg = _swap(self.TOOL_LEG,
+                           f"{self.TOOL_LEG}      egress-net:\n        priority: 100\n")
+        failure = self.failure_with(egress_leg, RelayGuardAgreesWithComposeTests,
+                                    "test_the_networks_the_guard_blocks_are_internal")
+        self.assertIsNotNone(failure, "a control-plane leg off an internal network passes")
+        self.assertIn("egress-net (a leg of the control plane) is not internal", failure)
+
+    def test_a_non_internal_agent_network_fails_without_naming_the_control_plane(self):
+        # The other half of the message: sandbox-net is checked beside the control
+        # networks, and is not one.
+        external = _swap("    name: sandbox-net\n    driver: bridge\n    internal: true\n",
+                         "    name: sandbox-net\n    driver: bridge\n")
+        failure = self.failure_with(external, RelayGuardAgreesWithComposeTests,
+                                    "test_the_networks_the_guard_blocks_are_internal")
+        self.assertIsNotNone(failure, "a non-internal sandbox-net passes")
+        self.assertIn("network sandbox-net is not internal", failure)
+
+    def failure_in_source(self, source: str, old: str, new: str,
+                          cls: type[unittest.TestCase], method: str) -> str | None:
+        """The failure message of a test run against a guard's source with ``old``
+        replaced, or None if it passes."""
+        text = _swap(old, new)(globals()[source])
+        with mock.patch.dict(globals(), {source: text}):
+            return _failure(cls, method)
+
+    def test_mcp_net_stays_beside_the_control_networks(self):
+        # The two tests that check mcp-net with the derived set: dropping it from
+        # their loops would pass every compose mutant above.
+        for source, old, new, cls, method in (
+                ("GATEWAY_SRC", '"172.28.0.0/24,', '"', GatewayPlacementTests,
+                 "test_the_bind_guard_names_every_network_the_agent_surface_must_not_reach"),
+                ("ADDON", '"172.30.0.128/25")', '"172.30.0.128/25,172.28.0.0/24")',
+                 RelayGuardAgreesWithComposeTests,
+                 "test_no_other_network_is_inside_the_lifeline_range")):
+            with self.subTest(test=method):
+                failure = self.failure_in_source(source, old, new, cls, method)
+                self.assertIsNotNone(failure, f"{method} no longer checks mcp-net")
+                self.assertIn("mcp-net", failure)
+
+    def test_a_reader_that_sees_no_control_net_raises(self):
+        for legs in (set(), {"authorize-net", "tool-authorize-net"}):
+            with self.subTest(legs=sorted(legs)), \
+                    mock.patch(f"{__name__}._networks_of", return_value=legs), \
+                    self.assertRaisesRegex(AssertionError, "no control-net leg"):
+                _control_networks()
 
 
 class ControlPlaneModulesAreShippedTests(unittest.TestCase):
@@ -2919,6 +3125,16 @@ def _edits(*edits: Callable[[str], str]) -> Callable[[str], str]:
             text = one(text)
         return text
     return edit
+
+
+def _failure(cls: type[unittest.TestCase], method: str) -> str | None:
+    """A rule's own test run as ``_rule`` runs it: its failure message, or None if it
+    passes."""
+    try:
+        getattr(cls(method), method)()
+    except AssertionError as failure:
+        return str(failure)
+    return None
 
 
 def _rule(cls: type[unittest.TestCase], method: str) -> Callable[[], bool]:

@@ -393,7 +393,8 @@ def _served_digest(server: str, tool: str) -> str | None:
     return None if digest == discovery.UNDIGESTIBLE else digest
 
 
-def call(name: str, arguments: object, client: str | None) -> dict:
+def call(name: str, arguments: object, client: str | None,
+         sandbox: str | None = None) -> dict:
     """Decide and then run one tool call. The whole agent-facing path in one function.
 
     ``name`` is the flattened name the agent was shown. It is resolved back to a
@@ -410,7 +411,11 @@ def call(name: str, arguments: object, client: str | None) -> dict:
     written for a human and names configuration — that a server is disabled, that no
     rule exists — which tells the agent a little about policy shape. Worth it: a
     refusal an agent cannot understand is one it retries, and everything named is
-    already discoverable by reading the tool list it was served."""
+    already discoverable by reading the tool list it was served.
+
+    ``sandbox`` is the id the calling sandbox sent (``app.sandbox_id``), relayed on
+    the decision alone: an ask records it. Resume and withdraw do not carry it, since
+    the resume token and the client address stay the ownership check there."""
     # Routed before the split, because a native tool has no server to decide against.
     # See NATIVE_TOOLS for why the category needs its own rule.
     if name == surface.RESUME_TOOL:
@@ -429,6 +434,7 @@ def call(name: str, arguments: object, client: str | None) -> dict:
         answer = _ask_control("/tool/authorize",
                               {"server": server, "tool": tool,
                                "args": arguments, "client": client,
+                               "sandbox": sandbox,
                                "schema_digest": _served_digest(server, tool)})
     except discovery.DiscoveryError as exc:
         # FAIL CLOSED, and loudly. A gateway that ran a call because it could not ask

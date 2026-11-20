@@ -51,6 +51,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import re
 import threading
 import time
 
@@ -206,6 +207,19 @@ MCP_PATH = os.environ.get("GATEWAY_MCP_SERVE_PATH", "/mcp")
 #: fail-closed").
 BODY_MAX = int(os.environ.get("GATEWAY_BODY_MAX", str(1024 * 1024)))
 
+#: The header a Claude sandbox names itself in, and the one shape forwarded:
+#: claude-sandbox/tier-setup.sh mints 32 lowercase hex per boot. Anything else is
+#: forwarded as no id rather than refused (DESIGN.md, "A card names its sandbox by an
+#: id the sandbox mints").
+SANDBOX_HEADER = "x-dockade-sandbox"
+_SANDBOX_RE = re.compile(r"[0-9a-f]{32}")
+
+
+def sandbox_id(request: Request) -> str | None:
+    """The sandbox id ``request`` carries, or None when it has none in the shape."""
+    value = request.headers.get(SANDBOX_HEADER)
+    return value if isinstance(value, str) and _SANDBOX_RE.fullmatch(value) else None
+
 
 class BodyTooLarge(Exception):
     """The request body passed ``BODY_MAX``. Raised from ``read_body`` so the endpoint
@@ -270,6 +284,9 @@ async def mcp(request: Request) -> Response:
     # trust: a gateway that reported its own address instead would make one shared
     # bucket of every sandbox's ask cap and let one agent's asks answer another's.
     client = request.client.host if request.client else None
+    # Beside the address, which is dynamic and so cannot say which sandbox raised an
+    # ask (``sandbox_id``). Relayed on `/tool/authorize`, where an ask records it.
+    sandbox = sandbox_id(request)
     # OFF THE EVENT LOOP. A tool call is blocking stdlib HTTP to the control plane and
     # then to a server, and a server call crosses the internet through the egress proxy
     # — which may itself be holding it for a human. Run inline, one slow call would
@@ -277,7 +294,7 @@ async def mcp(request: Request) -> Response:
     # symptom would be an unhealthy gateway rather than a slow tool.
     answer = await run_in_threadpool(
         protocol.handle, message, surface.listing(),
-        lambda name, arguments: execute.call(name, arguments, client))
+        lambda name, arguments: execute.call(name, arguments, client, sandbox))
     if answer is None:
         # A notification. Accepted with no body, which is what the transport asks for
         # and what keeps a client from waiting on a reply that is not coming.

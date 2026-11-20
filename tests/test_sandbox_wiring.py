@@ -25,11 +25,13 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import subprocess
 import unittest
 from pathlib import Path
 from typing import ClassVar
 
-from _loader import load_protocol
+from _loader import load_protocol, load_tool_gateway
 from test_launcher_run_flags import launchers
 from test_topology import _environment_of
 
@@ -176,8 +178,22 @@ class GatewayConfigTests(unittest.TestCase):
         self.assertIsNotNone(body, "tier-setup.sh no longer writes the gateway config")
         rendered = (body.group(1)
                     .replace("${TOOL_GATEWAY_IP}", ip)
-                    .replace("${TOOL_GATEWAY_PORT:-8100}", port))
+                    .replace("${TOOL_GATEWAY_PORT:-8100}", port)
+                    .replace("${SANDBOX_ID}", self.SANDBOX_ID))
         return json.loads(rendered)
+
+    SANDBOX_ID = "0123456789abcdef" * 2
+
+    def mint(self) -> str:
+        """The line that mints the sandbox id, run alone. Only the pipeline runs, not
+        the boot script around it."""
+        line = re.search(r'^\s*SANDBOX_ID="\$\((.*)\)"$', TIER_SETUP, re.M)
+        self.assertIsNotNone(line, "tier-setup.sh no longer mints a sandbox id")
+        bash = shutil.which("bash")
+        self.assertIsNotNone(bash)
+        return subprocess.run(  # noqa: S603 (absolute path from shutil.which; the line is this repo's)
+            [bash, "-c", line.group(1)], capture_output=True, text=True,
+            check=True).stdout
 
     def test_the_document_is_valid_json_with_one_server(self):
         self.assertEqual(list(self.config()["mcpServers"]), ["gateway"])
@@ -191,6 +207,39 @@ class GatewayConfigTests(unittest.TestCase):
         entry = self.config()["mcpServers"]["gateway"]
         self.assertEqual(entry["type"], "http")
         self.assertEqual(entry["url"], "http://172.30.0.11:8100/mcp")
+
+    def test_the_sandbox_id_is_sent_literally_in_the_header_the_gateway_reads(self):
+        # Literal: the id is minted in the root phase, in no environment the agent's
+        # Claude Code inherits, and expansion can blank a credential-looking value
+        # (NOTES.md). Either would send every sandbox as one with no id.
+        entry = self.config()["mcpServers"]["gateway"]
+        self.assertEqual(entry["headers"], {"X-Dockade-Sandbox": self.SANDBOX_ID})
+        self.assertEqual(load_tool_gateway({"GATEWAY_AGENT_BIND": "172.30.0.11"})
+                         .SANDBOX_HEADER, "X-Dockade-Sandbox".lower())
+
+    def test_the_id_is_minted_in_the_shape_the_gateway_forwards(self):
+        gateway = load_tool_gateway({"GATEWAY_AGENT_BIND": "172.30.0.11"})
+        first, second = self.mint(), self.mint()
+        self.assertRegex(first, r"\A[0-9a-f]{32}\Z")
+        self.assertTrue(gateway._SANDBOX_RE.fullmatch(first))
+        self.assertNotEqual(first, second)
+
+    def test_the_id_is_minted_on_every_boot_beside_the_file_it_is_written_to(self):
+        # In the root phase, after the stale file is removed and before the new one is
+        # written: a fresh id per boot, never one carried over in the config volume.
+        mint = TIER_SETUP.index('SANDBOX_ID="$(')
+        self.assertLess(TIER_SETUP.index('rm -f "$MCP_GATEWAY_CONFIG"'), mint)
+        self.assertLess(mint, TIER_SETUP.index('"$MCP_GATEWAY_CONFIG" <<EOF'))
+        self.assertLess(mint, TIER_SETUP.index('exec gosu "$USERNAME" "$0" "$@"'))
+        self.assertEqual(TIER_SETUP.count("SANDBOX_ID="), 1)
+
+    def test_the_boot_prints_the_prefix_a_card_shows(self):
+        # The prefix and never more: the boot log is not where the whole id belongs.
+        printed = [m for line in TIER_SETUP.splitlines()
+                   if re.match(r"\s*(echo|printf)\b", line)
+                   for m in re.findall(r"\$(?:\{SANDBOX_ID\b[^}]*\}|SANDBOX_ID\b)",
+                                       line)]
+        self.assertEqual(printed, ["${SANDBOX_ID:0:8}"])
 
     def test_a_stale_entry_is_removed_before_it_can_be_reused(self):
         # Its ABSENCE is what tells the wrapper there is no gateway, so a file left by

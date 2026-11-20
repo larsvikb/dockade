@@ -60,6 +60,12 @@ class ToolCallRequest(BaseModel):
     # (discovery.schema_digest), or None when it has not enumerated it. A pin answers
     # only a call made under the digest it was pinned under, so this can only narrow.
     schema_digest: str | None = None
+    # The id the sandbox sent in its header (the gateway's ``app.sandbox_id``), or
+    # None. Checked again in ``tool_authorize`` against ``holds.SANDBOX_RE``, as the
+    # digest is against its shape, so the store and a card hold only that shape
+    # whatever arrives: anything else is a call with no id. An ask records it and
+    # joins on it; no pin reads it.
+    sandbox: str | None = None
 
 
 class ToolResumeRequest(BaseModel):
@@ -103,6 +109,9 @@ def tool_authorize(req: ToolCallRequest) -> dict:
     digest = getattr(req, "schema_digest", None)
     digest = (digest if isinstance(digest, str) and inventory._DIGEST_RE.fullmatch(digest)
               else None)
+    sandbox = getattr(req, "sandbox", None)
+    sandbox = (sandbox if isinstance(sandbox, str) and holds.SANDBOX_RE.fullmatch(sandbox)
+               else None)
     # Ahead of policy, which looks the names up. Why, and where ``args`` are refused
     # instead: control-plane/DESIGN.md, "A lone surrogate is refused where it is
     # decided on".
@@ -134,9 +143,9 @@ def tool_authorize(req: ToolCallRequest) -> dict:
         return answer if call_token is None else {**answer, "call_token": call_token}
 
     # ASK. Registered, not held: the gateway takes the token back at once. An identical
-    # ask from the same client joins the pending one rather than raising a second
-    # card, so a retrying agent cannot fill the queue with copies of one question.
-    ask = holds._register_tool_ask(server, tool, req.args, req.client, digest)
+    # ask from the same client and sandbox joins the pending one rather than raising a
+    # second card, so a retrying agent cannot fill the queue with copies of one question.
+    ask = holds._register_tool_ask(server, tool, req.args, req.client, digest, sandbox)
     if ask.refused is not None:
         # Over a cap, or too large to show a human in full: a deny, audited as one.
         # ``holds._refuse_tool`` has already counted a cap refusal for the saturation
@@ -150,7 +159,9 @@ def tool_authorize(req: ToolCallRequest) -> dict:
     # filters and the page's <option> list, with no compiler between them. The reason
     # line says what differs: nothing is blocked. It carries the policy reason as the
     # allow and deny rows do, which names a pin the call met but that did not answer.
+    # It names the sandbox by the prefix the card shows, never the whole id.
     why = (f"{tool} on {server}: {reason}; registered as tool ask {ask.approval_id}"
+           + (f" from sandbox {sandbox[:holds.SANDBOX_PREFIX]}" if sandbox else "")
            + (" (joined an identical ask already pending)" if ask.joined else "")
            + " — nothing is blocked; the agent resumes with its resume token")
     store._audit("hold", stage="tool-call", client=req.client,

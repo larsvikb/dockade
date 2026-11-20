@@ -23,6 +23,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import threading
 import time
 import uuid
@@ -465,6 +466,14 @@ def _args_digest(server: str, tool: str, args_json: str) -> str:
         f"{server}\x00{tool}\x00{args_json}".encode()).hexdigest()
 
 
+#: The shape of a sandbox id (claude-sandbox/tier-setup.sh mints it, the gateway
+#: forwards only this shape and ``api_tool.tool_authorize`` checks it again), and how
+#: much of one an operator is shown: the prefix the sandbox prints at boot. The whole
+#: id stays in the store, so no view hands a reader an id to send as another sandbox.
+SANDBOX_RE = re.compile(r"[0-9a-f]{32}")
+SANDBOX_PREFIX = 8
+
+
 class ToolAsk(NamedTuple):
     """Outcome of registering an ask. Either ``refused`` is set, or ``approval_id`` and
     ``resume_token`` both are; ``joined`` means an identical ask was already pending
@@ -554,13 +563,19 @@ def _expire_tool_asks() -> int:
 
 def _register_tool_ask(server: str, tool: str, args: object,
                        client: str | None = None,
-                       schema_digest: str | None = None) -> ToolAsk:
+                       schema_digest: str | None = None,
+                       sandbox: str | None = None) -> ToolAsk:
     """Raise a card for a tool call, or attach to the identical one already pending.
 
     ``schema_digest`` is the digest of the tool's arguments the gateway served, which
     a pin from this card is bound to. It is in the join key, so a card raised under one
     schema does not absorb a retry made under another: pinning from it would bind the
     pin to the schema the retry was not made under.
+
+    ``sandbox`` is the id the calling sandbox sent, already checked against
+    ``SANDBOX_RE`` by the caller, or None. It is in the join key too, so two sandboxes
+    behind one address (one replacing another) raise two cards: each card names the
+    sandbox it came from.
 
     Under ``_LOCK`` for the same reason as ``_reserve_hold``: otherwise two concurrent
     asks both pass a cap with one slot left, or both open a card for one payload. A
@@ -588,14 +603,15 @@ def _register_tool_ask(server: str, tool: str, args: object,
     now = time.time()
     with _LOCK, store._connect() as conn:
         pending = conn.execute(
-            "SELECT id, client, deadline, args_digest, schema_digest, resume_token "
-            "FROM tool_approvals WHERE status='pending' ORDER BY ts").fetchall()
+            "SELECT id, client, deadline, args_digest, schema_digest, resume_token, "
+            "sandbox FROM tool_approvals WHERE status='pending' ORDER BY ts").fetchall()
         # The client is in the join key for the reason it is in ``_group_key``: a card
         # names one caller, and answering one sandbox's question must not silently
         # answer another's.
         for row in pending:
             if (row["client"] == client and row["args_digest"] == digest
-                    and row["schema_digest"] == schema_digest):
+                    and row["schema_digest"] == schema_digest
+                    and row["sandbox"] == sandbox):
                 # The pending row's OWN token, so every agent sharing an ask holds
                 # one handle on it.
                 return ToolAsk(row["id"], True, None, row["deadline"],
@@ -633,10 +649,10 @@ def _register_tool_ask(server: str, tool: str, args: object,
         deadline = now + TOOL_HOLD_TIMEOUT
         conn.execute(
             "INSERT INTO tool_approvals(id, ts, server, tool, args_json, "
-            "args_digest, client, status, deadline, schema_digest, resume_token) "
-            "VALUES (?,?,?,?,?,?,?, 'pending', ?, ?, ?)",
+            "args_digest, client, status, deadline, schema_digest, resume_token, "
+            "sandbox) VALUES (?,?,?,?,?,?,?, 'pending', ?, ?, ?, ?)",
             (approval_id, now, server, tool, args_json, digest, client, deadline,
-             schema_digest, resume_token))
+             schema_digest, resume_token, sandbox))
         conn.commit()
         return ToolAsk(approval_id, False, None, deadline, resume_token)
 
@@ -951,12 +967,18 @@ def _list_tool_asks() -> list[dict]:
     ``persist_options``: what a pin may be made of, derived here so the card offers
     exactly what ``resolve`` will accept (``policy._pin_candidates``), and the pins
     the call met under another digest (``_stale_pins``), which pinning their fields
-    again rebinds."""
+    again rebinds.
+
+    ``sandbox_prefix`` is the first ``SANDBOX_PREFIX`` characters of the id the ask
+    came from, or None: cut in the query, so the whole id never reaches the operator's
+    queue. Named for what it holds, so nothing mistakes it for the id itself."""
     _expire_tool_asks()
     with store._connect() as conn:
         rows = conn.execute(
-            "SELECT id, ts, server, tool, args_json, client, deadline, schema_digest "
-            "FROM tool_approvals WHERE status='pending' ORDER BY ts").fetchall()
+            "SELECT id, ts, server, tool, args_json, client, deadline, schema_digest, "
+            "substr(sandbox, 1, ?) AS sandbox_prefix "
+            "FROM tool_approvals WHERE status='pending' ORDER BY ts",
+            (SANDBOX_PREFIX,)).fetchall()
     return [dict(r, kind="tool",
                  pin_options={**policy._pin_candidates(r["args_json"],
                                                        r["schema_digest"]),

@@ -488,6 +488,10 @@ which an ungrouped row (one instant) never did. A real fix needs stable per-sand
 identity, and the only sources are the Docker socket (which the egress proxy must never
 hold) or a launcher-to-control-plane path that does not exist; neither is worth
 inventing for a label, so `first_ts` stands as the cue that a long span is involved.
+The id a sandbox mints at boot is no such source: it travels only on the tool path, has
+no audit column of its own (the `hold` row's reason text carries its 8-character
+prefix), and is the agent's own word (root DESIGN.md, "A card names its
+sandbox by an id the sandbox mints").
 
 **Browsing it: two views, not one view with a page parameter (2c-1).** The trail was
 the artifact the whole design exists to keep trustworthy and the only way to read it

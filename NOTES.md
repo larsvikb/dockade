@@ -1510,17 +1510,250 @@ agent's own shell tool:
   `shell` set to `Shell.acceptable(cfg.shell)`, which is `$SHELL` (`/bin/bash` in
   the image), so it runs `/bin/bash -c <command>`.
 
-The model-free debug command is the probe for opencode. Asking the model to run
-`type rm` is not: on the reference machine the image's local model, given that
-request, ran a different and destructive command through its shell tool, so that
-probe gave no result.
+  The model-free debug command is the probe for opencode. Asking the model to run
+  `type rm` is not: on the reference machine the image's local model, given that
+  request, ran a different and destructive command through its shell tool, so that
+  probe gave no result.
+- **agy (Antigravity CLI, no tier yet): not seen.** Measured 2026-11-20 on agy 1.5.13
+  in the tier-1 sandbox, with a scratch HOME holding copies of the shared `.bashrc`
+  and the image's `.profile` (the setup is in "agy behind dockade's proxy, measured
+  before its tier"). No model-free way to call a tool was found in agy's CLI, so
+  the model was asked, in print mode, to run the probe through `run_command`, with
+  the output sent to a file:
+
+      { type rm; echo $-; shopt expand_aliases; } > <file> 2>&1
+
+  The model's reply was not the evidence. The stream-json events show the
+  `run_command` call with that exact command line. The file was written by that
+  command, and the same command's environment carried
+  `ANTIGRAVITY_SOURCE_METADATA` naming that call. In each of two sessions the file
+  read `rm is /usr/bin/rm`, flags `hBc` and `expand_aliases off`.
 
 So the instructions' `rm` bullet holds for tier 1 and is false for tier 2, where a
-bulk `rm` deletes. The bullet is the `sandbox-common/instructions/bashrc-shell/rm.md`
-fragment, and the rule for which tiers include it is in
-`sandbox-common/instructions/render.py`'s docstring. The image installs opencode
-`latest`: a re-run on a later release that prints "aliased" means tier 2 needs the
-include again.
+bulk `rm` deletes. It would be false for an agy tier too. The bullet is the
+`sandbox-common/instructions/bashrc-shell/rm.md` fragment, and the rule for which
+tiers include it is in `sandbox-common/instructions/render.py`'s docstring. The
+image installs opencode `latest`: a re-run on a later release that prints "aliased"
+means tier 2 needs the include again.
+
+## agy behind dockade's proxy, measured before its tier
+
+Google's Antigravity CLI (`agy`), measured on 2026-11-20 on agy 1.5.13 (linux_amd64)
+in the tier-1 sandbox, before any agy tier exists. Everything agy touched sat in one
+scratch dir under `/tmp`: its HOME, its install, a fixture dir that was its cwd, and a
+logging relay. Each run was `env -i` with only the scratch HOME, `PATH`, `SHELL`,
+`TERM`, `LANG`, `TZ`, `USER`, `AGY_CLI_DISABLE_AUTO_UPDATE` and the proxy variables in
+both cases. The proxy variables pointed at the relay, a small Python forward proxy on
+`127.0.0.1` that logged every request line (CONNECT and absolute-form HTTP) and passed
+it on to `egress-proxy`. `NO_PROXY` named the gateway as `sandbox-lib.sh` sets it.
+The operator did the login and answered the hold cards; a session drove everything
+else from Bash. A re-run on a later version repeats the commands below.
+
+**Install.** `https://antigravity.google/cli/install.sh` (`/install.sh` on the same host
+is a 404 page). Read, then run under `bash -x` with HOME in the scratch dir:
+
+- It fetches a per-platform manifest,
+  `antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/linux_amd64.json`,
+  holding `version`, `url` and `sha512` and no signature. The `url` was a tarball on
+  `storage.googleapis.com/antigravity-public/antigravity-cli/1.5.13-…/linux-x64/`.
+  It checks the sha512 and nothing else.
+- It extracts one binary, about 270 MB, to `$HOME/.local/bin/agy` (`--dir` moves it),
+  then runs `agy install`, which here wrote nothing. No root is needed.
+- Auto-update: every run spawns a background check against the same Cloud Run host,
+  skipped if the last one was under 15 minutes ago.
+  With `AGY_CLI_DISABLE_AUTO_UPDATE=true` and the last-check stamp deleted, a
+  print-mode run made no request to that host, where the same run with the value
+  `1` did. That is the evidence that `true` turns the check off and `1` does not.
+  The log line ("Auto-update disabled via environment variable") only agrees with
+  it. Every later run had the variable set. About twenty were print mode and four
+  were interactive: the login, `--remote-agent`, `/new` and `--remote-control`. Only
+  the last asked the update host, once (below). With the binary's directory
+  read-only the updater logs that it is skipping, and the run goes on.
+- On 2026-11-11 a plain `curl` of the installer from tier 1 got a 403 at the proxy. That
+  was a hold nobody answered in time, not a rule. The operator granted
+  `.antigravity.google` as a standing allow that day and has since removed it. On
+  this run the host answered within the second, with no hold seen; which rule or
+  lease let it through cannot be seen from inside the sandbox.
+
+**Login (H1).**
+
+- *Headless:* it works with no browser in the container. agy prints an
+  `accounts.google.com` URL (PKCE, `redirect_uri`
+  `https://antigravity.google/oauth-callback`) and takes the code pasted back. In
+  print mode it waits 60 s for the code and then fails; the interactive CLI is the
+  way to log in.
+- *Where the token lands:* in a file, with no D-Bus or Secret Service in the
+  container. The log says `Using file-based token storage because container
+  environment detected`. The token is
+  `~/.gemini/antigravity-cli/antigravity-oauth-token`, mode 600, JSON with
+  `token.access_token`, `token.refresh_token`, `token.token_type`, `token.expiry`,
+  `token.expires_in`, `auth_method` (`consumer`) and `id_token_email`. The login also
+  wrote `~/.config/antigravity/credential-user-scope` (mode 600, a short identifier).
+  agy's own log names `~/.config/antigravity/plugin-secrets.json` as its "file-based
+  secret storage" for plugins. No such file was written here. The login also wrote
+  `history.jsonl` (mode 600) and `conversation_summaries.db` under
+  `~/.gemini/antigravity-cli/`, and every conversation leaves a `brain/<id>/`
+  transcript and `conversations/<id>.db` beside them. A tier volume holding that
+  directory keeps all of it. No keyring was needed, so the user-space keyring
+  (Decision 2) never ran.
+- *Restart:* a fresh agy on the same HOME path, with no agy process left running,
+  ran a prompt with no new login. That is a stand-in for a container restart with
+  HOME on a volume: a new container keeps the fixed hostname and has no machine-id,
+  but gets a new IP and MAC, which this did not test. Both `~/.gemini` and
+  `~/.config/antigravity` were written; whether the second is needed was not tested.
+- *Scopes:* the URL asks for, and Google's `tokeninfo` reports granted,
+  `cloud-platform`, `aicode`, `cclog`, `experimentsandconfigs`, `userinfo.email`,
+  `userinfo.profile` and `openid`.
+- *Account tier:* an individual Google account landed on "Antigravity Starter Quota".
+  `/usage` showed separate weekly limits for Gemini models and for "Claude and GPT
+  models".
+- *Telemetry:* not measured, because the CLI shows no telemetry setting: its
+  settings list (`agy -p /settings`) has no such key, `/help` lists no command for
+  it, and no file in the scratch HOME holds one. Google's settings docs say "Enable
+  Telemetry" is saved with the account, not locally, so it could be read from the
+  account's settings in another Antigravity client. `play.googleapis.com` was
+  contacted on every run, before login too.
+- agy writes the signed-in account's email in plain text into its own log under
+  `~/.gemini/antigravity-cli/log/`.
+
+**Hosts (H2).** All traffic arrived at the relay as CONNECTs, so agy honours
+`HTTPS_PROXY`; sandbox-net has no other route. Before login:
+`antigravity-cli-auto-updater-974169037036.us-central1.run.app` (update check) and
+`play.googleapis.com`. Login: `oauth2.googleapis.com` (the code exchange). Signed in,
+each run reached:
+
+- `daily-cloudcode-pa.googleapis.com`: `loadCodeAssist`, `fetchAvailableModels`, and
+  inference itself (`streamGenerateContent`)
+- `aicode.googleapis.com`: config (`FetchConfig`; the log says the account is routed
+  to it)
+- `www.googleapis.com`: user info
+- `lh3.googleusercontent.com`: the profile picture
+- `play.googleapis.com`
+
+`www.gstatic.com` served the plugin marketplace caches
+(`/antigravity/plugins/marketplace.json` and `/antigravity/plugins-partners/…`), and
+`storage.googleapis.com` the install. Remote control adds
+`jetski-webchannel.googleapis.com` (under Server-side reach). No plain-HTTP request
+was seen. agy's internal
+language server listens on `localhost` only.
+
+**Tools (H4).** The stream-json `init` event lists 60 tools, including
+`read_url_content`, `search_web`, `open_browser_url`, `read_browser_page` and about
+twenty more `browser_*` tools, `generate_image`, `call_mcp_tool`, `run_command`,
+`invoke_subagent`, `schedule` and `send_message`. Asked to name the tools it could
+call, the model listed fourteen: `ask_question`, `define_subagent`, `edit_file`,
+`invoke_subagent`, `manage_subagents`, `manage_task`, `read_file`, `run_command`,
+`run_workflow`, `schedule`, `search_web`, `send_message`, `swarm`, `write_file`. Asked
+to use `read_url_content` or the browser tools, it said they were not available.
+That list is the model's own report, not the request.
+
+- `--sandbox` (agy's terminal sandbox) cannot start under the sandbox's dropped
+  capabilities and `no-new-privileges`. Each command fails with `fork/exec
+  …/agy: operation not permitted`. The sandbox is also the default for commands
+  without `--dangerously-skip-permissions`, so plain print-mode commands fail the
+  same way. In one run with `enableTerminalSandbox: false` in `--settings`, a retry
+  ran the command with no prompt shown; the reason is not known.
+- `--mode auto`: "not available for this account; continuing in the default mode",
+  though `/settings` shows `agentMode auto` and the interactive CLI says "Auto is now
+  the default agent mode".
+- `/browser`: not driven, and the browser tools were not offered to the model.
+
+**Server-side reach (H5).** Nothing tried here fetched a never-approved host
+(`httpbin.org`, which the operator refused) client-side. No CONNECT to it ever
+reached the relay.
+
+- `read_url_content` and the browser: not offered to the model, as above, so not
+  measured.
+- `search_web` runs on Google's side as search grounding ("Vertex AI Search
+  Grounding"; sources come back as `vertexaisearch.cloud.google.com` redirects). Given
+  `https://httpbin.org/anything/<fresh marker>`, it returned a general description of
+  httpbin's `/anything` endpoint with the marker only where it echoed the URL, and no
+  origin IP, headers or other live fields: no sign that it fetched the page. Given
+  `https://httpbin.org/base64/<base64 of a fresh marker>`, its summary contained the
+  decoded marker. That does not prove a fetch, because the marker could be decoded
+  from the URL, so it is inconclusive. Either way, a query reaches Google with no
+  hold at the proxy.
+- Remote agents (`--remote-agent`): not available on this account. The interactive
+  CLI answered `cloud conversations are not enabled for this user`, through hosts
+  already listed. In print mode the flag is refused (`--remote-agent does not
+  support --print yet`).
+- Remote control has a host of its own, `jetski-webchannel.googleapis.com:443`.
+  `agy --remote-control`, run interactively for 90 s, logged "Remote control on for
+  this session". Remote control first stays disconnected because a server-side flag
+  is off. Once the account's flags arrive from `aicode.googleapis.com`
+  (`remote-control-setting-enabled=true`,
+  `remote-control-proxy-server-url="jetski-webchannel.googleapis.com:443"`), agy
+  connects to that host. It was the only new host in the run. Whether refusing it
+  disables remote control, or agy falls back to another host, was not measured: the
+  plan was to refuse every new hold in that window, but the operator approved this
+  one, and the CONNECT was answered `200` four seconds after it was asked. So no
+  refusal happened. `agy remote-control status`
+  afterwards said the daemon was inactive. The same run also asked the update host,
+  though the log said auto-update was disabled by the variable. No other run with
+  the variable set asked it.
+- A `command(...)` deny given with `--settings` holds under
+  `--dangerously-skip-permissions`. With `--settings
+  '{"permissions":{"deny":["command(touch)"]}}'`, `touch` was refused with and
+  without the flag ("Matches user-configured deny rule"), and the file was not
+  created. Not tested: a deny in the user settings file, and a deny on `read_url` or
+  any fetch tool, which was not offered to the model.
+
+**Session id (H6).** agy exports `ANTIGRAVITY_CONVERSATION_ID` (a UUID) to the
+commands it runs, beside `ANTIGRAVITY_TRAJECTORY_ID`, `ANTIGRAVITY_AGENT=1`,
+`ANTIGRAVITY_PROJECT_ID`, `ANTIGRAVITY_LS_ADDRESS`, `ANTIGRAVITY_LS_VERSION`,
+`ANTIGRAVITY_APP_DATA_DIR`, `ANTIGRAVITY_AGENTAPI_EXE`, `ANTIGRAVITY_SOURCE_METADATA`
+(the tool call as JSON) and `ANTIGRAVITY_CSRF_TOKEN`.
+`ANTIGRAVITY_CONVERSATION_ID`:
+
+- differed between two sessions;
+- was kept on `--conversation <id>` and on `-c`;
+- changed after `/new` in the same process;
+- was a different id in a subagent (`invoke_subagent`) than in its parent, so it is
+  not shared by subagents.
+
+`agy-<uuid>` fits the registry's `_AGENT_RE`. No `CLAUDE_*` variable reached agy's
+commands.
+
+**Shell (H7).** Not seen; see "An agent CLI's shell tool sees the shared `.bashrc`'s
+aliases only if its shell reads it".
+
+**Workspace config (H8).** Markers in files, with `--add-dir` naming a second dir made
+read-only with `chmod -R a-w`; agy reports which markers its context carries. Loaded:
+`AGENTS.md`, `GEMINI.md` and skills under `.agents/skills/`, from the cwd and from the
+added dir alike. Not loaded: `.agents/rules/*.md` in either. A run without
+`--add-dir` loaded the cwd's three only. Compared with Claude Code's command-line
+flag on a directory (the table in "An allowed read directory loads nothing from it"),
+both load skills from it, but only agy loads instruction files from it (`AGENTS.md`,
+`GEMINI.md`); Claude loads no `CLAUDE.md` there. `chmod` is weaker than a read-only
+mount, but loading does not depend on write access.
+
+Plan 148 asked for the other case too: a directory reachable only through a settings
+read rule, which is how tier 1 wires `/refs`. Not measured, because the scratch
+dir was deleted before the gap was seen. agy's documented settings form is a
+`read_file(<dir>)` allow rule under `permissions` in `settings.json`.
+
+**MCP.** `~/.gemini/config/mcp_config.json` with one server, `"url":
+"http://172.30.0.11:8100/mcp"` (the gateway, without the `X-Dockade-Sandbox` header):
+`agy mcp list` showed it enabled, and the model listed the gateway's tools
+(`tasks__…`, `mcp-github__…`, `resume_tool_call`, `withdraw_tool_call`). None was
+called. No request for it reached the relay, so `NO_PROXY` was honoured.
+
+**Containment.** A stamp before the install, then `find -newer` over every path the
+sandbox user can write (`/home/sandbox`, `/config`, `/workspace`, `/tmp`, `/var/tmp`,
+`/dev/shm`, `/run/lock`, `/dev/mqueue`). Outside the scratch dir it found Claude's
+own files in `/config`, other sessions' files in `/tmp`, git activity under
+`/workspace`, and `/home/sandbox/.bash_history` from the operator's login shell.
+`/config/CLAUDE.md` and `/config/settings.json` were rewritten once, in the same
+second. That second is also when an interactive agy run ended, the `--remote-agent`
+probe, which had no checksums around it. Both files match the image's own copies
+(`/etc/claude-code/CLAUDE.md.template` and `user-settings.json`) byte for byte, and
+`tier-setup.sh` installs exactly those two files at boot. agy's HOME was the scratch
+dir, and no other agy write reached `/config`. So the rewrite is put down to a
+sibling container's boot, by inference, not proof. Checksums of
+`/config/settings.json` before and after every other agy run were unchanged, and at
+the end of the run both files still matched the image's copies.
+`/config/.claude.json` changed, but Claude Code rewrites it throughout a session, so
+the checksums cannot tell agy's writes from Claude's there.
 
 ## Local inference and the accelerator survey: in `opencode-sandbox/NOTES.md`
 

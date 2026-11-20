@@ -1650,8 +1650,53 @@ function noticeLine(notice) {
   return div;
 }
 
-function brief(t) {
-  return t ? `#${t.id} ${spellHidden(t.title).text} (${t.state})` : "";
+// A task the open one names, its parent, a child or a blocker: its `#id` opens it
+// through the hash, as a list row's does (`openCell`), so the browser's back returns
+// here; its title and state follow, as text.
+function relatedRow(t) {
+  const span = document.createElement("span");
+  const open = document.createElement("button");
+  open.type = "button";
+  open.className = "group-toggle";
+  open.dataset.task = String(t.id);
+  open.textContent = `#${t.id}`;
+  const title = document.createElement("span");
+  title.textContent = ` ${spellHidden(t.title).text} `;
+  const state = document.createElement("span");
+  state.className = "qual";
+  state.textContent = `(${t.state})`;
+  span.append(open, title, state);
+  return span;
+}
+
+// The tasks `list` names, one per row under `head`, the label or the summary atop them.
+function relatedRows(holder, head, list) {
+  head.className = "qual";
+  holder.appendChild(head);
+  for (const t of list) {
+    const row = document.createElement("div");
+    row.className = "related";
+    row.appendChild(relatedRow(t));
+    holder.appendChild(row);
+  }
+  return holder;
+}
+
+// Whether a task's children are shown or only counted: the operator's last choice on
+// any task, until a reload expands them again.
+let childrenOpen = true;
+
+// A parent's children, one per row, in a list that collapses to how many are left. The
+// choice is kept from the list's own `toggle`, which does not bubble, so the detail's
+// delegation never sees the folded history's.
+function childrenList(children) {
+  const list = document.createElement("details");
+  const summary = document.createElement("summary");
+  summary.textContent = `children ${childrenLeft(children).text}`;
+  relatedRows(list, summary, children);
+  list.open = childrenOpen;
+  list.addEventListener("toggle", () => { childrenOpen = list.open; });
+  return list;
 }
 
 // A task, the newest page of its timeline, and for a task with a plan every plan it
@@ -1749,14 +1794,15 @@ function drawTask(task, held) {
   if (sk && !editing) taskDetail.appendChild(line("severity · kind", sk));
   taskDetail.appendChild(line("written", `${fmtStamp(task.created_at)}, last changed `
     + fmtStamp(task.updated_at)));
-  if (task.parent) taskDetail.appendChild(line("parent", brief(task.parent)));
-  const kids = childrenLeft(task.children);
-  if (kids.total) {
-    taskDetail.appendChild(line("children", `${kids.text}: `
-      + task.children.map(brief).join("; ")));
+  if (task.parent) taskDetail.appendChild(line("parent", relatedRow(task.parent)));
+  if (childrenLeft(task.children).total) {
+    taskDetail.appendChild(childrenList(task.children));
   }
   if (task.blockers && task.blockers.length && !editing) {
-    taskDetail.appendChild(line("blocked by", task.blockers.map(brief).join("; ")));
+    const head = document.createElement("div");
+    head.textContent = "blocked by";
+    taskDetail.appendChild(relatedRows(document.createElement("div"), head,
+                                       task.blockers));
   }
   if (task.claim) {
     taskDetail.appendChild(line("claim", claimText(task.claim)));
@@ -2704,10 +2750,11 @@ export function mountTasks() {
   });
   taskDetail.addEventListener("click", ev => {
     // A task the detail names opens through the hash, as one from the list does, so
-    // the browser's back returns to the task it was opened from.
+    // the browser's back returns to the task it was opened from. A double-click's second
+    // click lands on the task the first opened, so it opens nothing.
     const named = ev.target.closest("button[data-task]");
     if (named) {
-      goTo(view, named.dataset.task);
+      if (ev.detail <= 1) goTo(view, named.dataset.task);
       return;
     }
     // The task read again, through the hash as every open is.
@@ -2737,7 +2784,10 @@ export function mountTasks() {
     const page = ev.target.closest("button[data-page]");
     if (page) (page.dataset.page === "plans" ? showPlans : showPage)(page);
     const btn = ev.target.closest("button[data-write]");
-    const write = btn ? writeFor(btn) : null;
+    // A double-click's second click is no move: one that opened a task, by its parent,
+    // a child or a blocker, would otherwise land on whatever move the task drew there.
+    if (!btn || ev.detail > 1) return;
+    const write = writeFor(btn);
     if (write) runWrite(write);
   });
   taskDetail.addEventListener("input", ev => {

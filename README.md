@@ -422,8 +422,10 @@ dockade/
     app.js                  #   the page's entry: mount, ask, poll while it answers
     tasks.js                #   the work list, its not-running state, agent prose with
                             #   hidden characters spelled out
-    moves.js                #   the page's writes: what each sends, which a task or note
-                            #   offers, and what a lost answer came to
+    moves.js                #   the page's writes on tasks and notes: what each sends,
+                            #   which a task or note offers, and what a lost answer came to
+    repos.js                #   the Repos view: the repo list's writes, what each sends,
+                            #   and what a lost answer came to
     diff.js                 #   what changed between two plans, word by word
     markdown.js             #   agent markdown as tokens: the subset the page draws, the
                             #   rest kept as typed

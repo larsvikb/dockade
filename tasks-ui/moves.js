@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-/* The tasks page's writes: the ones the relay passes (tasks-ui/app.py), which moves a
- * task or a note offers, a new task, and what the page makes of each answer. Nothing
- * here draws:
+/* The tasks page's writes on tasks and notes: the ones the relay passes
+ * (tasks-ui/app.py), which moves a task or a note offers, a new task, and what the page
+ * makes of each answer; the repo list's are repos.js's, which judges its answers by
+ * `readAnswer` and `writeOutcome` here. Nothing here draws:
  * tasks.js draws, and imports this, which imports nothing of it. Why a move names a
  * revision and a note and a move on one none, and why a lost answer is read back rather
  * than sent again, is tasks-ui/DESIGN.md, "A note names no revision" and "A write whose

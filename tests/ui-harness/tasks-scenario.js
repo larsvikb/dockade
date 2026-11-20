@@ -473,8 +473,83 @@ export const STEPS = [
       await page.click('#task-detail button[data-write="reparent"]');
     });
   }],
+  // The Repos view, last: a tree without it takes these steps as doing nothing, as it
+  // does the create's, and the steps before still compare. Reloaded on its URL, the
+  // page asks /running before it reads the list.
+  ["Repos, by its URL, reloaded", async ({ page, navigate }) => {
+    await page.evaluate(() => { location.hash = "#view=repos"; });
+    await navigate(() => page.reload());
+  }],
+  ["a repo added", async ({ page }) => {
+    await ifRepos(page, async () => {
+      await page.fill("#repo-add-name", "widgets");
+      await page.click("#repo-add");
+    });
+  }],
+  ["the same name added again, refused", async ({ page }) => {
+    await ifRepos(page, async () => {
+      await page.fill("#repo-add-name", "widgets");
+      await page.click("#repo-add");
+    });
+  }],
+  // The label names the outcome, and the line under it what a rename asks of the
+  // operator; once landed, the outcome says it again.
+  ["renamed", async ({ page }) => {
+    await ifRepos(page, async () => {
+      await page.fill('#repos input[data-repo-rename="widgets"]', "gadgets");
+      await page.click('#repos button[data-repo-write="rename"][data-repo="widgets"]');
+    });
+  }],
+  ["its remote set", async ({ page }) => {
+    await ifRepos(page, async () => {
+      await page.fill('#repos input[data-repo-remote="gadgets"]', "github.com/acme/gadgets");
+      await page.click('#repos button[data-repo-write="remote"][data-repo="gadgets"]');
+    });
+  }],
+  ["and removed", async ({ page }) => {
+    await ifRepos(page, async () => {
+      await page.click('#repos button[data-repo-write="remove"][data-repo="gadgets"]');
+    });
+  }],
+  ["retired", async ({ page }) => {
+    await ifRepos(page, async () => {
+      await page.click('#repos button[data-repo-write="retire"][data-repo="gadgets"]');
+    });
+  }],
+  ["and brought back", async ({ page }) => {
+    await ifRepos(page, async () => {
+      await page.click('#repos button[data-repo-write="retire"][data-repo="gadgets"]');
+    });
+  }],
+  // It lands and its answer is lost: the list read again shows it, so it is found.
+  ["an add whose answer is lost, found", async ({ page }) => {
+    await ifRepos(page, async () => {
+      await page.fill("#repo-add-name", "sprockets");
+      loseNextAnswer();
+      await page.click("#repo-add");
+    });
+  }],
+  ["All tasks, its open tasks", async ({ page }) => {
+    await page.click("#view-all");
+    await page.selectOption("#tasks-state", "open");
+  }],
+  // The repo All tasks shows, renamed to a name that sorts after the others: the select
+  // follows it, rather than falling to the first repo, and its tasks are the same.
+  ["that repo renamed in Repos", async ({ page }) => {
+    await ifRepos(page, async () => {
+      await page.click("#view-repos");
+      await page.fill('#repos input[data-repo-rename="dockade"]', "tools");
+      await page.click('#repos button[data-repo-write="rename"][data-repo="dockade"]');
+    });
+  }],
+  ["All tasks: the new name chosen, the same tasks", async ({ page }) => {
+    await page.click("#view-all");
+  }],
 ];
 
+async function ifRepos(page, act) {
+  if (await page.$("#view-repos")) await act();
+}
 async function ifCreate(page, act) {
   if (await page.$("#create-open")) await act();
 }

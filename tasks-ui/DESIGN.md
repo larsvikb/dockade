@@ -13,10 +13,14 @@ decisions, such as the prior art the inbox follows, is in `tasks-ui/NOTES.md`.
 The relay's table is the operator's whole say in the registry, since its operator
 listener takes no token; `_RELAY_ROUTES` in `app.py` says what may be on it, and a test
 holds it and the page's fetches equal in both directions, the writes' method too. Its
-writes are the ones the page makes: on a task, a move, an approve with its answers,
-breaking a claim, a spec edit and a note; on
+writes are the ones the page makes: a new task; on a task, a move, an approve with its
+answers, breaking a claim, a spec edit, a reparent and a note; on
 notes, hiding or showing one, handling one with or without a reply, and handling the
-flagged notes a page showed. The bind and the peer check are the approval UI's
+flagged notes a page showed; on the repo list, adding a repo, renaming one, setting or
+removing its remote, and retiring one or bringing it back. A task or note is named in
+the path by bounded digits, a repo by the registry's own pattern for a name, held equal
+to `tasks.REPO_NAME_RE` by a test, since the relay cannot import it; a new repo's name
+rides in the body. The bind and the peer check are the approval UI's
 (`app.py`'s docstring); why each matters beside the registry is the root `DESIGN.md`'s
 "Task registry".
 
@@ -80,7 +84,12 @@ task that landed. Found, the task opens, a draft edited since stays, and the lin
 the task was created as sent. Until then the create reads "send anyway — may make a
 second task", and only one that lands or is lost again replaces the kept write: a
 refused one leaves it, since the first may still land. A reload loses both, as it loses
-a note's draft.
+a note's draft. Repos carry no revision, so a lost repo write is settled by the repo list
+read again (`checkRepoWrite` in `repos.js`), by the named repo's entry alone, both names
+for a rename, so a repo added elsewhere meanwhile changes nothing: as sent is found; as
+drawn is "not seen", safe to send again, since a landed add or rename refuses a second
+and a remote or a retire sets a value; anything else "changed"; and a read that failed
+"could not check".
 
 **A note names no revision.** A move and a break name the revision the page showed, so
 a task that changed since is refused, and the page draws the task the refusal carries
@@ -94,27 +103,41 @@ lost-answer check above is what keeps one from being sent twice.
 **The moves are in the detail, below the plan, one at a time.** Only the open task
 carries them, never an inbox row, so a move is made on what was read.
 The moves on a note sit under it in the timeline, on every page of it, and a reparent,
-the parent typed as an id as blockers are, under the moves. Two writes are outside the
-detail: the flagged list's bulk handle (below), which names the notes a page drew rather
-than a task, and a new task, from a form above All tasks, in an active repo and any
-state but refined, kept across views until it lands or is discarded, its outcome a line
-of its own under it and the task, once it lands, opened through the hash. Approve and
-send back are each a control of their own, as a refined task's two answers. Approve says
-when what it approves hides a character. One write is out at a time, its controls off
-until its outcome is drawn, the flagged list's and the create form's too, and the poll
-never redraws the detail, so no button moves under the pointer between two clicks.
-Opening a task from another replaces what is under the pointer, so the second click of a
-double-click is neither a move nor an open of a related task. No
-move asks to be confirmed: its label, which names the outcome before it is pressed, is
-the confirmation, as approve's names the revision and plan, a reparent's the parent and
-revision, and a create's the repo and state, since a task can be closed but never
-removed. Most moves are recorded and undone by another move, but
-not all: a note or a reply can be hidden and never removed; an approve's answers stand;
-a break, or any state move of a claimed task, ends the live claim, which no operator move
-gives back (`operator_moves.move`); and a move to proposed, a send back or from any other
-state, supersedes the current plan, an approved one too, and no move makes a superseded
-plan current again (`tasks.update`). A move on a note touches neither the task's spec
-nor its revision, so whatever holds the task's moves leaves it free, as it leaves adding a note.
+the parent typed as an id as blockers are, under the moves. Three kinds of write are
+outside the detail: the flagged list's bulk handle (below), which names the notes a page
+drew rather than a task; a new task, from a form above All tasks, in an active repo and
+any state but refined, kept across views until it lands or is discarded, its outcome a
+line of its own under it and the task, once it lands, opened through the hash; and the
+repo list's, from the Repos view, a view of their own since the list is the operator's
+and no task's. Each repo's row keeps what is typed in it across draws until its write
+lands, and nothing redraws the rows while the registry answers but a read the operator
+caused, entering Repos or a repo write's own. A read answered after a newer one was
+drawn draws nothing, though a write is still settled from its own read, and a rename's
+follow (below) is made by whichever read draws first; a poll reads the list only when it
+finds the registry back, while the view is hidden. A refusal's reason is spelled as
+agent text is. A rename says, before it is pressed and once it lands, that the repo's
+instructions file must name the new name before its agents can write again
+(`operator_moves.rename_repo`), and a rename of the repo All tasks shows, once the list
+shows it landed, takes All tasks' select with it. Approve and send back are each a
+control of their own, as a refined task's two answers. Approve says when what it
+approves hides a character. One write is out at a time, page-wide: a repo write goes
+through the same gate (`beginRepoWrite` in `tasks.js`), and every control is off until
+its outcome is drawn, the flagged list's, the create form's and the Repos view's too,
+and the poll never redraws the detail, so no button moves under the pointer between two
+clicks. Opening a task from another replaces what is under the pointer, so the second
+click of a double-click is neither a move nor an open of a related task. No move asks to
+be confirmed: its label, which names the outcome before it is pressed, is the
+confirmation, as approve's names the revision and plan, a reparent's the parent and
+revision, a create's the repo and state, since a task can be closed but never removed,
+and each repo write's what it does to which repo. Most moves are recorded and undone by
+another move, but not all: a new task or repo stays, since neither is ever removed,
+though a task can be closed and a repo renamed or retired; a note or a reply can be
+hidden and never removed; an approve's answers stand; a break, or any state move of a
+claimed task, ends the live claim, which no operator move gives back
+(`operator_moves.move`); and a move to proposed, a send back or from any other state,
+supersedes the current plan, an approved one too, and no move makes a superseded plan
+current again (`tasks.update`). A move on a note touches neither the task's spec nor its
+revision, so whatever holds the task's moves leaves it free, as it leaves adding a note.
 
 **One scheme of labels.** Every action control on the task page says what it does, and
 is marked primary or caution, by one rule (`moveLabel` and the functions beside it): a main
@@ -213,12 +236,14 @@ and how many are on a task deferred, closed or reopened since, elsewhere, with "
 them" when any is. The block sits above the sections the poll redraws, its rows in a box
 of fixed height, so neither moves the other. A note handled or hidden elsewhere stays
 drawn until a draw; handling it again only marks it again, a second entry in its
-history. A bulk's outcome stays over the list until the next bulk or All tasks.
+history. A bulk's outcome stays over the list until the next bulk or another view; back
+from All tasks or Repos, the rows are drawn from a fresh read.
 
 **The list or one task, on the whole page, and the hash names which.** Long bodies,
 plans with decisions, timelines and the spec form do not fit a pane beside the list, so
 at every width the page shows the list or the open task, never both, and the task takes
-the window's width. A click on a row opens its task, but on the row's own controls, a
+the window's width. The list has three views, the Inbox, All tasks and Repos, which the
+hash names too. A click on a row opens its task, but on the row's own controls, a
 flagged note's box or its cell, or a drag that selected text; the `#id` button is the
 keyboard's way. Back is a control in a strip kept atop the task at any scroll, Esc
 outside a text field, or the browser's back, and the list comes back as it was left: it
@@ -370,9 +395,10 @@ own name, allowlist, address and network. `tests/test_tasks_ui_js.py` holds the 
 every structural check the approval page has (`PageChecks`: markup and script, the
 module list against the Dockerfile and the imports, fetches against the relay, free
 names), the writes' methods against the relay, the pure halves of `tasks.js`,
-`moves.js`, `diff.js` and `markdown.js` under node, the approve's rule and body against
-the registry's own (`ApproveRuleTests`), the edit's, the create's and the reparent's
-bodies on a scratch store (`EditRuleTests`, `CreateRuleTests`, `ReparentRuleTests`),
+`moves.js`, `repos.js`, `diff.js` and `markdown.js` under node, the approve's rule and
+body against the registry's own (`ApproveRuleTests`), the edit's, the create's, the
+reparent's and the repo writes' bodies on a scratch store (`EditRuleTests`,
+`CreateRuleTests`, `ReparentRuleTests`, `RepoRuleTests`),
 and, from source, how the page gates the registry,
 sends its writes, draws agent text and decisions, and fills the line atop the detail;
 `tests/test_task_registry_inbox.py` holds what the inbox counts, and

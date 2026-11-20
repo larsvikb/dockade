@@ -54,7 +54,7 @@ UI_INDEX = os.environ.get("TASKS_UI_INDEX", "/opt/tasks-ui/index.html")
 # the image copies and to what the modules import from each other.
 UI_DIR = os.environ.get("TASKS_UI_DIR", "/opt/tasks-ui")
 UI_MODULES = frozenset({"app.js", "diff.js", "escape.js", "list-status.js", "markdown.js",
-                        "moves.js", "tasks.js", "time.js"})
+                        "moves.js", "repos.js", "tasks.js", "time.js"})
 # Built from the list, never from a request: the name off the URL only picks an entry.
 _UI_MODULE_PATHS = {name: os.path.join(UI_DIR, name) for name in UI_MODULES}
 
@@ -64,11 +64,16 @@ _UI_MODULE_PATHS = {name: os.path.join(UI_DIR, name) for name in UI_MODULES}
 ALLOWED_HOSTNAMES = guards.allowed_hostnames("TASKS_UI_ALLOWED_HOSTS",
                                              "127.0.0.1,localhost,::1")
 
+# A repo's name as the registry takes one (`tasks.REPO_NAME_RE`). The relay cannot import
+# the registry, so a test holds the two equal.
+_REPO_NAME = r"[a-z0-9][a-z0-9-]{0,62}"
+
 # The registry's operator API (task-registry/operator_api.py), exactly the routes the
 # page calls and nothing else: that listener takes no token, so this table is the whole
 # of what a page can do there. Ids are digits, bounded, so no path-shaped segment can be
-# smuggled through one. Add a route when a fetch needs it, never in anticipation; a test
-# holds this table and the page's fetches equal in both directions, method and all.
+# smuggled through one; a repo's name is held to the registry's own pattern for one,
+# `_REPO_NAME`. Add a route when a fetch needs it, never in anticipation; a test holds
+# this table and the page's fetches equal in both directions, method and all.
 _RELAY_ROUTES = (
     ("GET", re.compile(r"^/api/repos$")),
     ("GET", re.compile(r"^/api/tasks$")),
@@ -89,7 +94,7 @@ _RELAY_ROUTES = (
     # parent or none. And a new task, a note and the moves on notes, which name none
     # (tasks-ui/DESIGN.md, "A note names no revision", "A write whose answer was
     # lost"): hide or show one, handle one with or without a reply, handle the flagged
-    # notes a page showed. The rest of the operator API waits for a page that calls it.
+    # notes a page showed.
     ("POST", re.compile(r"^/api/tasks$")),
     ("POST", re.compile(r"^/api/tasks/[0-9]{1,19}/move$")),
     ("POST", re.compile(r"^/api/tasks/[0-9]{1,19}/approve$")),
@@ -100,6 +105,14 @@ _RELAY_ROUTES = (
     ("POST", re.compile(r"^/api/notes/hide$")),
     ("POST", re.compile(r"^/api/notes/[0-9]{1,19}/handle$")),
     ("POST", re.compile(r"^/api/notes/handle$")),
+    # The repo list's writes, from the Repos view: a new repo, its name in the body,
+    # then renaming one, setting or removing its remote, retiring it or bringing it back.
+    # Repos carry no revision. The rest of the operator API waits for a page that calls
+    # it.
+    ("POST", re.compile(r"^/api/repos$")),
+    ("POST", re.compile(rf"^/api/repos/{_REPO_NAME}/rename$")),
+    ("POST", re.compile(rf"^/api/repos/{_REPO_NAME}/remote$")),
+    ("POST", re.compile(rf"^/api/repos/{_REPO_NAME}/retire$")),
 )
 
 # The registry records ACTOR_HEADER as this relay's word for the browser's address
@@ -230,7 +243,7 @@ _NOT_SENT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 def _outcome_unknown(exc: Exception) -> JSONResponse:
     """A write was sent and no answer came back: it may have landed or not. In the
     operator API's shape, and a status nothing else here sends, so the page reads the
-    task again to learn which rather than offer to send it again."""
+    task, or the repo list, again to learn which rather than offer to send it again."""
     return JSONResponse({"ok": False, "current": None,
                          "detail": f"the task registry did not answer a write it was "
                                    f"sent ({type(exc).__name__}): it may have landed"},

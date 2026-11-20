@@ -34,6 +34,8 @@ import {
   unanswered, approveAnswers, choicesDiffer, approveOutcome, currentPlan,
   SPEC_CONTROLS, asControl, controlChanges, specDraft, draftChanges, editRequest,
   changedFields, rebaseDraft, parseBlockers,
+  SEVERITIES, KINDS, CREATE_STATES, createRequest, createdTask, parseParent, parentId,
+  reparentRequest,
 } from "./moves.js";
 import { fmtStamp, fmtInstant } from "./time.js";
 
@@ -588,6 +590,87 @@ export function blockersProblem(bad) {
     + "as #7, 12.";
 }
 
+// Why a parent does not parse: the operator's word, spelled.
+export function parentProblem(bad) {
+  return `"${spellHidden(String(bad)).text}" is not a parent: a parent is one task id, `
+    + "such as #7, or nothing for none.";
+}
+
+// ── a parent, and a new task ─────────────────────────────────────────────────
+// What the reparent and the create form say around their controls. The values are
+// moves.js's.
+
+// The reparent's label, for the body `reparentRequest` built: the parent it sets or that
+// it removes one, and the revision it names, as the save does; a claim stays.
+export function reparentLabel(task, send) {
+  if (!task || typeof task !== "object" || !send || typeof send !== "object") return null;
+  const main = send.parent === null ? "remove the parent"
+    : `make #${send.parent} the parent`;
+  return { main,
+           second: joined(`revision ${task.revision}`, task.claim ? "the claim stays" : ""),
+           caution: false };
+}
+
+// The create's label names the repo and state, which is the confirmation: a task can be
+// closed, never removed. Sent while an earlier create's answer is lost and not found,
+// it says that it may make a second task.
+export const CREATE_SECOND = "a task can be closed, never removed";
+export function createLabel(draft, lost) {
+  if (!draft || typeof draft !== "object") return null;
+  const where = `in ${spellHidden(String(draft.repo)).text} as ${draft.state}`;
+  return lost
+    ? { main: "send anyway — may make a second task",
+        second: `${where} · ${CREATE_SECOND}`, caution: true }
+    : { main: `create the task ${where}`, second: CREATE_SECOND, caution: false };
+}
+
+// What a new task's title or body will be stored as: the text spelled, with its count
+// of hidden characters.
+export function createPreview(text) {
+  const shown = spellHidden(text);
+  return { label: "will be stored", text: shown.text, hidden: shown.hidden };
+}
+
+// What a create came to, in a line, and whether it warns: `writeOutcome`'s word, or for
+// an answer that was lost, `checkWrite`'s, or "no-bound" when the repo could not be
+// read before it, so nothing was sent. `created` is the task's id, landed or found;
+// `edited`, that the form's draft was edited since the send and is kept.
+export function createOutcomeText(write, outcome, detail, created, edited = false) {
+  const asSent = edited ? " The task was created as sent; your edits since are kept "
+    + "in the form." : "";
+  const repo = spellHidden(String(write && write.send ? write.send.repo : "")).text;
+  const bound = Number(write && write.bound);
+  const past = bound > 0 ? ` past task #${bound}` : "";
+  switch (outcome) {
+    case "landed":
+      return { text: `Created task #${created}.${asSent}`, warn: false };
+    case "found":
+      return { text: `No answer came, but ${repo} has task #${created}${past} with the `
+                     + `title and body sent, so it landed.${asSent}`, warn: false };
+    case "no-bound":
+      return { text: "Could not read the repo; nothing sent.", warn: true };
+    case "refused":
+      return { text: (`Create the task: refused. ${spellHidden(String(detail ?? "")).text}`)
+                 .trim(), warn: true };
+    case "not-running":
+      return { text: "Create the task: not sent. The task registry is not running.",
+               warn: true };
+    case "not-found-yet":
+      return { text: `No answer came, and no task in ${repo}${past} has the title `
+                     + "and body sent yet. It may still land: look again before sending "
+                     + "it again, which may make a second task.", warn: true };
+    case "could-not-check":
+      return { text: `No answer came, and ${repo} could not be read back, or more tasks `
+                     + "landed in it since than its newest page holds, so whether it "
+                     + "landed is not known. Look again before sending it again, which "
+                     + "may make a second task.", warn: true };
+    default:
+      return { text: "No answer came, so whether it landed is not known. Look again "
+                     + "before sending it again, which may make a second task.",
+               warn: true };
+  }
+}
+
 // What a draw past the draft's base says: the revisions, the spec fields that moved,
 // those of them the operator's draft keeps, which saving writes over, and, when the
 // draft had changes before and has none now, that nothing is left to save.
@@ -605,7 +688,7 @@ export function rebaseText(from, to, moved, kept, emptied) {
 }
 
 // Beside the moves a draft with changes holds: approve, send back, every state move and
-// breaking the claim. A note, and the moves on notes, stay free.
+// breaking the claim. A note, the moves on notes and a reparent stay free.
 export const HELD_TEXT = "Save or discard the edit first: a move now would act on a "
   + "spec other than the one on screen.";
 
@@ -831,7 +914,8 @@ let tasksDown, tasksUp, tasksRepo, tasksState, tasksSearch, tasksBody, tasksEmpt
   tasksOlder, tasksNewest, taskCountEl, taskDetail, listView, taskView, taskBack,
   listNotice, inboxEl, inboxEmpty,
   inboxCountEl, viewInbox, viewAll, inboxView, allView, flaggedEl, flaggedLineEl,
-  flaggedBody, flaggedEmpty, flaggedAll, flaggedHandle, flaggedLeftOut, flaggedOutcomeEl;
+  flaggedBody, flaggedEmpty, flaggedAll, flaggedHandle, flaggedLeftOut, flaggedOutcomeEl,
+  createOpen, createForm, createOutcomeEl;
 
 let running = null;        // null: not asked yet
 let probing = null;        // the ask in flight, if one is
@@ -882,6 +966,17 @@ let flaggedWanted = 0;     // the read a draw was asked with, until an answer ma
 let flaggedSelected = new Map();   // ticked ids, each to whether its task was parked then
 let flaggedKnown = [];     // the last good read's notes, which a failed read keeps
 let flaggedOutcome = null; // what the last bulk came to, until the next or All tasks
+// A new task. Its draft is the form's controls, kept across views and draws while the
+// form is open; only discard, or a create it still equals landing or found, drops it
+// (`finishCreate`). A create whose answer was lost and not found is kept as sent, with
+// its bound, for "look again" to check: never the draft, which may be edited since and
+// would miss the task that landed. A reload loses both, as it loses a note's draft.
+let createDraft = null;
+let lostCreate = null;
+let createOutcome = null;  // what the last create came to, under the form
+// A reparent's text by task, kept until one lands or is found: the input shows the
+// task's parent until it is typed in.
+let parentDrafts = new Map();
 
 export function registryIsRunning() { return running === true; }
 
@@ -948,6 +1043,8 @@ async function refreshRepos() {
     tasksRepo.appendChild(opt);
   }
   if (repos.some(r => r.name === chosen)) tasksRepo.value = chosen;
+  // A repo retired since is offered no more.
+  if (createDraft !== null) renderCreate();
 }
 
 function cell(tr, value, cls) {
@@ -1173,6 +1270,236 @@ function bulkWrite() {
   if (!notes.length) return null;
   return { kind: "handle-many", notes, leftOut, task: null,
            verb: `handle ${notes.length} note${notes.length === 1 ? "" : "s"}` };
+}
+
+// ── a new task ──────────────────────────────────────────────────────────────
+// The second write outside the detail, from All tasks: a form above the list, which no
+// task's detail is on screen with. Its outcome line is the form's own, since `runWrite`
+// draws an outcome only for the task open.
+
+// The repos a task can be created in: the active ones (`reads.repos` marks the rest).
+function activeRepos() {
+  return repos.filter(r => r && !r.retired).map(r => r.name);
+}
+
+// Where a draft starts: on the list's repo when it is active, proposed, nothing else.
+function newCreateDraft() {
+  const active = activeRepos();
+  return { repo: active.includes(tasksRepo.value) ? tasksRepo.value : (active[0] ?? ""),
+           state: "proposed", title: "", body: "", severity: "", kind: "", parent: "",
+           blockers: "" };
+}
+
+// Each field's control, by its draft's key: a select is the list of its options' values.
+function createControls() {
+  return { repo: activeRepos(), state: CREATE_STATES, title: "text", body: "textarea",
+           severity: ["", ...SEVERITIES], kind: ["", ...KINDS], parent: "text",
+           blockers: "text" };
+}
+
+// The form, drawn from the draft, its values set as properties; or nothing while no
+// draft is open. Under the title and body what will be stored, spelled, and under the
+// parent and blockers why they do not parse (`markCreate` fills both as it is typed).
+function renderCreate() {
+  createOpen.hidden = createDraft !== null;
+  createForm.replaceChildren();
+  createForm.hidden = createDraft === null;
+  if (createDraft !== null) {
+    const controls = createControls();
+    const picks = document.createElement("div");
+    picks.className = "moves";
+    for (const field of ["repo", "state"]) {
+      picks.appendChild(line(field, createControl(field, controls[field])));
+    }
+    createForm.appendChild(picks);
+    for (const field of ["title", "body"]) {
+      createForm.appendChild(line(field, createControl(field, controls[field])));
+      const preview = document.createElement("div");
+      preview.className = field === "body" ? "spec-preview task-body" : "spec-preview";
+      preview.dataset.createPreview = field;
+      createForm.appendChild(preview);
+    }
+    const kinds = document.createElement("div");
+    kinds.className = "moves";
+    for (const field of ["severity", "kind"]) {
+      kinds.appendChild(line(field, createControl(field, controls[field])));
+    }
+    createForm.appendChild(kinds);
+    for (const field of ["parent", "blockers"]) {
+      createForm.appendChild(line(field === "blockers" ? "blocked by" : field,
+                                  createControl(field, controls[field])));
+      const problem = document.createElement("div");
+      problem.dataset.createProblem = field;
+      createForm.appendChild(problem);
+    }
+    const row = document.createElement("div");
+    row.className = "moves";
+    const send = writeButton(createLabel(createDraft, lostCreate), "create", "");
+    const again = document.createElement("button");
+    again.type = "button";
+    again.dataset.create = "look-again";
+    again.textContent = "look again";
+    again.hidden = lostCreate === null;
+    const discard = document.createElement("button");
+    discard.type = "button";
+    discard.dataset.create = "discard";
+    discard.textContent = "discard";
+    row.append(send, again, discard);
+    createForm.appendChild(row);
+  }
+  createOutcomeEl.className = createOutcome && createOutcome.warn
+    ? "create-outcome empty warn" : "create-outcome empty";
+  createOutcomeEl.textContent = createOutcome ? createOutcome.text : "";
+  markCreate();
+}
+
+// One field's control, holding the draft's value.
+function createControl(field, control) {
+  let el;
+  if (Array.isArray(control)) {
+    el = document.createElement("select");
+    for (const value of control) {
+      const opt = document.createElement("option");
+      opt.value = value;
+      opt.textContent = value || "none";
+      el.appendChild(opt);
+    }
+  } else if (control === "textarea") {
+    el = document.createElement("textarea");
+    el.rows = 8;
+  } else {
+    el = document.createElement("input");
+    el.type = "text";
+    if (field === "parent") el.placeholder = "#7, or nothing for none";
+    if (field === "blockers") el.placeholder = "#7, 12";
+  }
+  el.dataset.createField = field;
+  el.setAttribute("aria-label", `the new task's ${field}`);
+  el.value = createDraft[field];
+  // A value its select no longer offers, a repo retired since, is none, as shown.
+  if (Array.isArray(control)) createDraft[field] = el.value;
+  return el;
+}
+
+// What follows the draft, redrawn in place as the operator types: what title and body
+// will be stored, why the parent or blockers do not parse, and the create, its label
+// naming the repo and state, off while it has nothing to send. Every control is off
+// while any write is out.
+function markCreate() {
+  if (!createForm || createDraft === null) {
+    if (createOpen) createOpen.disabled = writing !== null;
+    return;
+  }
+  for (const el of createForm.querySelectorAll("[data-create-field], button")) {
+    el.disabled = writing !== null;
+  }
+  for (const el of createForm.querySelectorAll("[data-create-preview]")) {
+    const preview = createPreview(createDraft[el.dataset.createPreview]);
+    const text = document.createElement("div");
+    text.className = "prose";
+    text.textContent = preview.text;
+    el.replaceChildren(line(preview.label, text));
+    if (preview.hidden) {
+      el.appendChild(noticeLine({ text: hiddenNote(preview.hidden), warn: true }));
+    }
+  }
+  const bad = { parent: parseParent(createDraft.parent).bad,
+                blockers: parseBlockers(createDraft.blockers).bad };
+  for (const el of createForm.querySelectorAll("[data-create-problem]")) {
+    const field = el.dataset.createProblem;
+    el.replaceChildren();
+    if (bad[field] !== null) {
+      el.appendChild(noticeLine({ text: field === "parent" ? parentProblem(bad[field])
+        : blockersProblem(bad[field]), warn: true }));
+    }
+  }
+  const send = createForm.querySelector('button[data-write="create"]');
+  if (send) {
+    setLabel(send, createLabel(createDraft, lostCreate));
+    if (!createRequest(createDraft)) send.disabled = true;
+  }
+}
+
+// The create as the draft makes it; its bound is read by `runWrite`, inside the gate.
+function createWrite() {
+  const send = createRequest(createDraft);
+  return send && { kind: "create", task: null, send, bound: null,
+                   verb: "create the task" };
+}
+
+// The newest id in a repo, every state, or 0 for an empty one: what a lost create is
+// looked for past. Ids are never reused and a task never changes repo.
+async function readBound(repo) {
+  const q = new URLSearchParams({ repo, state: EVERY_STATE });
+  const page = await registryJson(await fetch(`/api/tasks?${q}`));
+  return (Array.isArray(page.tasks) ? page.tasks : [])
+    .reduce((top, t) => (t && Number(t.id) > top ? Number(t.id) : top), 0);
+}
+
+// What a lost create is checked against (`checkWrite`): its repo's newest page, every
+// state, and in full each task on it past the bound with the title sent, since a list
+// row carries no body. A failed read is null in its place, never thrown: a candidate
+// that could not be read may be the one, so none read stands for all of them. Exported
+// for its node test; it draws nothing unless the registry answers 502.
+export async function readCreated(write) {
+  let list;
+  try {
+    const q = new URLSearchParams({ repo: write.send.repo, state: EVERY_STATE });
+    list = await registryJson(await fetch(`/api/tasks?${q}`));
+  } catch (e) {
+    return { list: null, candidates: null };
+  }
+  const named = (Array.isArray(list.tasks) ? list.tasks : [])
+    .filter(row => row && Number(row.id) > Number(write.bound)
+            && row.title === write.send.title);
+  const candidates = [];
+  try {
+    for (const row of named) {
+      const path = encodeURIComponent(row.id);
+      candidates.push(await registryJson(await fetch(`/api/tasks/${path}`)));
+    }
+  } catch (e) {
+    return { list, candidates: null };
+  }
+  return { list, candidates };
+}
+
+// What a create came to, kept for the form: landed or found, the kept lost write goes,
+// and the draft too while it still makes what was sent; edited since, it stays and the
+// line says the task was created as sent. Lost and not found, the write is kept, as
+// sent, for "look again", replacing any earlier one: a refused or unsent "send anyway"
+// keeps the one before, which may still have landed. A refusal reads the repos again,
+// since a repo retired since is one. Returns the task to open, or null.
+function finishCreate(write, result, detail, created) {
+  const landed = (result === "landed" || result === "found") && created !== null;
+  const draft = createDraft === null ? null : createRequest(createDraft);
+  const asSent = JSON.stringify(draft) === JSON.stringify(write.send);
+  if (landed) {
+    lostCreate = null;
+    if (asSent) createDraft = null;
+  } else if (result === "not-found-yet" || result === "could-not-check") {
+    lostCreate = write;
+  }
+  createOutcome = createOutcomeText(write, result, detail, created,
+                                    landed && createDraft !== null);
+  if (result === "refused") refreshRepos();
+  renderCreate();
+  return landed ? created : null;
+}
+
+// "look again": the kept lost create checked again, as sent, never the draft. It sends
+// nothing, and holds the gate while it reads, so "send anyway" is off meanwhile.
+async function lookAgain() {
+  if (writing || lostCreate === null || !registryIsRunning()) return;
+  const write = lostCreate;
+  writing = write;
+  markWriting();
+  const reread = await readCreated(write);
+  const result = checkWrite(write, reread);
+  writing = null;
+  const opens = finishCreate(write, result, null, createdTask(write, reread));
+  markWriting();
+  if (opens !== null) goTo(view, String(opens));
 }
 
 // Each section that has a task in it, highest first, one row per task with every
@@ -1954,7 +2281,46 @@ function movesBlock(task) {
   hidden.dataset.approveHidden = "1";
   hidden.hidden = true;
   block.appendChild(hidden);
+  // The parent, typed as an id, and after it what `markParent` draws as it is typed: the
+  // reparent, while the text builds one, or why the text does not.
+  const parent = document.createElement("div");
+  parent.className = "moves parent-row";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.dataset.parent = String(task.id);
+  input.placeholder = "#7, or nothing for none";
+  input.setAttribute("aria-label", "the task's parent");
+  input.value = parentText(task);
+  const slot = document.createElement("div");
+  slot.dataset.parentSlot = "1";
+  parent.append(line("parent", input), slot);
+  block.appendChild(parent);
   return block;
+}
+
+// What the parent's input holds: the text typed on this task, kept until a reparent of
+// it lands, or the task's parent as read.
+function parentText(task) {
+  const id = parentId(task);
+  return parentDrafts.get(String(task.id)) ?? (id === null ? "" : `#${id}`);
+}
+
+// The reparent the text makes of the task drawn, or why it makes none: a button only
+// while `reparentRequest` builds a body, so none is offered for the parent it has.
+function markParent() {
+  const slot = taskDetail.querySelector("[data-parent-slot]");
+  if (!slot || !drawnIsOpen()) return;
+  const text = parentText(shownTask);
+  const send = reparentRequest(shownTask, text);
+  const { bad } = parseParent(text);
+  slot.replaceChildren();
+  if (send) {
+    const btn = writeButton(reparentLabel(shownTask, send), "reparent", "");
+    btn.dataset.verb = "reparent";
+    slot.appendChild(btn);
+  } else if (bad !== null) {
+    slot.appendChild(noticeLine({ text: parentProblem(bad), warn: true }));
+  }
 }
 
 // What follows the choices, redrawn in place as the operator makes them, and once by
@@ -2157,7 +2523,8 @@ function specControl(field) {
 }
 
 // The writes a draft with changes holds: each that moves the task or ends its claim.
-// A note, and the moves on notes, stay free.
+// A note, the moves on notes and a reparent stay free: a reparent changes no spec field,
+// so a draft only rebases onto the read after it.
 const HELD_KINDS = ["move", "approve", "break"];
 const HELD_MOVES = HELD_KINDS.map(kind => `button[data-write="${kind}"]`).join(", ");
 
@@ -2219,20 +2586,23 @@ function toggleSpecEdit(open) {
 }
 
 // Every write control in the detail, on only while no write is out and what is drawn
-// is the task the page names; and the flagged block's, on while no write is out.
+// is the task the page names; and the flagged block's and the create form's, on while
+// no write is out. The reparent is drawn first, so its button comes in gated.
 function drawnIsOpen() {
   return shownTask !== null && String(shownTask.id) === openTask;
 }
 function markWriting() {
+  markParent();
   for (const el of taskDetail.querySelectorAll(
     "[data-write], textarea[data-note], textarea[data-reply], input[data-decision], "
     + "textarea[data-other], [data-spec], button[data-spec-open], "
-    + "button[data-spec-discard]")) {
+    + "button[data-spec-discard], input[data-parent]")) {
     el.disabled = writing !== null || !drawnIsOpen();
   }
   for (const box of taskDetail.querySelectorAll("[data-reply-box]")) markReply(box);
   markEdit();
   markFlagged();
+  markCreate();
 }
 
 // "mark handled" in a reply box is off while the box holds a reply, so a typed reply is
@@ -2247,18 +2617,24 @@ function markReply(box) {
 // (task-registry/DESIGN.md, "The operator API"); the inbox and the list refreshed. A
 // write whose answer was lost is decided from a read (`checkWrite`), never sent again.
 // A write in the detail is on the task drawn; a bulk handle, from the flagged block on
-// the list, on none (`task` null).
+// the list, and a create, from the form there, on none (`task` null). A create first
+// reads its bound, inside the gate, so a second click cannot send while it is out: one
+// that fails sends nothing.
 async function runWrite(write) {
   if (writing || !registryIsRunning()) return;
   writing = write;
   markWriting();
+  if (write.kind === "create") {
+    write.bound = await readBound(write.send.repo).catch(() => null);
+  }
+  const unsent = write.kind === "create" && write.bound === null;
   let answer = null;
   try {
-    answer = await readAnswer(await sendWrite(write));
+    if (!unsent) answer = await readAnswer(await sendWrite(write));
   } catch (e) {
     answer = null;
   }
-  let result = writeOutcome(answer);
+  let result = unsent ? "no-bound" : writeOutcome(answer);
   let drawn = null;
   if (result === "not-running") {
     setRunning(false);
@@ -2267,9 +2643,13 @@ async function runWrite(write) {
   } else if (write.task !== null) {
     drawn = await readTask(write.task).catch(() => null);
   }
+  let created = result === "landed" && write.kind === "create" ? answer.body.task : null;
   if (result === "unknown") {
-    result = checkWrite(write, write.kind === "handle-many"
-      ? { flagged: await readFlaggedPast(write.notes).catch(() => null) } : drawn);
+    const reread = write.kind === "handle-many"
+      ? { flagged: await readFlaggedPast(write.notes).catch(() => null) }
+      : write.kind === "create" ? await readCreated(write) : drawn;
+    result = checkWrite(write, reread);
+    if (write.kind === "create") created = createdTask(write, reread);
   }
   const landed = result === "landed" || result === "found";
   if (write.kind === "note" && landed && noteDraft.task === write.task
@@ -2288,6 +2668,7 @@ async function runWrite(write) {
   if (write.kind === "edit" && landed && specEdit && specEdit.task === write.task) {
     specEdit = null;
   }
+  if (write.kind === "reparent" && landed) parentDrafts.delete(write.task);
   const detail = answer && answer.body && typeof answer.body === "object"
     ? answer.body.detail : answer && answer.text;
   // The state an approve reached: as its answer names it, or as the task read again.
@@ -2302,6 +2683,8 @@ async function runWrite(write) {
   // off, so none comes back on over a row that moved.
   if (redrawsFlagged(write, result)) await readFlagged(true);
   writing = null;
+  const opens = write.kind === "create" ? finishCreate(write, result, detail, created)
+    : null;
   if (write.task !== null && openTask === write.task) {
     outcome = said;
     if (drawn) drawTask(drawn.task, drawn.held);
@@ -2313,6 +2696,8 @@ async function runWrite(write) {
     refreshInbox();
     refreshTasks();
   }
+  // A create that landed, or was found, opens its task, as a click on its row would.
+  if (opens !== null) goTo(view, String(opens));
 }
 
 // The write a control in the detail asks for, as of the task the page shows.
@@ -2329,11 +2714,19 @@ function writeFor(btn) {
   }
   if (btn.dataset.write === "approve") return approveWrite(base);
   if (btn.dataset.write === "break") return { ...base, kind: "break", verb: "break the claim" };
+  if (btn.dataset.write === "reparent") return reparentWrite(base);
   if (btn.dataset.write === "hide" || btn.dataset.write === "handle") {
     return noteWrite(btn, base);
   }
   const text = noteDraft.task === base.task ? noteDraft.text : "";
   return text.trim() ? { ...base, kind: "note", text, verb: "add the note" } : null;
+}
+
+// A reparent of the task drawn, as its parent's text makes it, naming the revision drawn.
+function reparentWrite(base) {
+  const send = reparentRequest(shownTask, parentText(shownTask));
+  return send && { ...base, kind: "reparent", revision: send.revision, send,
+                   verb: reparentLabel(shownTask, send).main };
 }
 
 // An approve of the plan drawn, with an answer per decision from the choices made on
@@ -2706,6 +3099,9 @@ export function mountTasks() {
   flaggedHandle = document.getElementById("flagged-handle");
   flaggedLeftOut = document.getElementById("flagged-left-out");
   flaggedOutcomeEl = document.getElementById("flagged-outcome");
+  createOpen = document.getElementById("create-open");
+  createForm = document.getElementById("create-form");
+  createOutcomeEl = document.getElementById("create-outcome");
 
   tasksDown.textContent = NOT_RUNNING_TEXT;
   for (const s of [...TASK_STATES, EVERY_STATE]) {
@@ -2729,6 +3125,34 @@ export function mountTasks() {
     refreshTasks();
   });
   tasksNewest.addEventListener("click", () => { resetList(); refreshTasks(); });
+  // A new task, from All tasks: the form opens on a fresh draft, or the one kept.
+  createOpen.addEventListener("click", () => {
+    if (writing || createDraft !== null) return;
+    createDraft = newCreateDraft();
+    renderCreate();
+  });
+  createForm.addEventListener("input", ev => {
+    const field = ev.target.dataset.createField;
+    if (!field || createDraft === null) return;
+    createDraft = { ...createDraft, [field]: ev.target.value };
+    markCreate();
+  });
+  createForm.addEventListener("click", ev => {
+    const btn = ev.target.closest("button");
+    if (!btn || writing) return;
+    if (btn.dataset.write === "create") {
+      const write = createWrite();
+      if (write) runWrite(write);
+    } else if (btn.dataset.create === "look-again") {
+      lookAgain();
+    } else if (btn.dataset.create === "discard") {
+      createDraft = null;
+      lostCreate = null;
+      createOutcome = null;
+      renderCreate();
+    }
+  });
+  renderCreate();
   // The views are on the list, never on screen with a task open, so they name none.
   viewInbox.addEventListener("click", () => goTo("inbox", null));
   viewAll.addEventListener("click", () => goTo("all", null));
@@ -2799,6 +3223,10 @@ export function mountTasks() {
       markWriting();
     }
     if (ev.target.matches("input[data-decision]")) choose(ev.target);
+    if (ev.target.matches("input[data-parent]") && drawnIsOpen()) {
+      parentDrafts.set(String(shownTask.id), ev.target.value);
+      markWriting();
+    }
     if (ev.target.matches("[data-spec]") && drawnIsOpen() && specEditOn(shownTask)) {
       specEdit.draft = { ...specEdit.draft, [ev.target.dataset.spec]: ev.target.value };
       markWriting();

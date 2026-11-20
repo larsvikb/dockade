@@ -222,6 +222,20 @@
   /* A note on a deferred or closed task: said in words, and not swept by select all. */
   .flagged-rows tr.parked .why { color: var(--hold); }
   .flagged-outcome { min-height: 2.5em; }
+  /* The create form, above the list, as the spec form is drawn; the parent row under a
+     task's moves. */
+  .create { margin: 0 0 10px; }
+  #create-open { font-size: 12px; padding: 4px 10px; }
+  .create-form { margin: 8px 0; padding: 8px; border: 1px solid var(--line);
+    border-radius: 6px; }
+  .create-form input[type="text"], .create-form textarea, .create-form select,
+  .parent-row input[type="text"] { font: inherit; font-size: 13px; background: #202632;
+    color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+  .create-form input[type="text"], .create-form textarea { width: 100%; }
+  .create-form textarea { resize: vertical; }
+  .create-form .moves button { font-size: 12px; padding: 4px 10px; }
+  .parent-row { align-items: center; }
+  .parent-row input[type="text"] { width: 14em; max-width: 100%; }
 </style>
 </head>
 <body>
@@ -278,6 +292,14 @@
       </section>
       <section id="all-view" hidden>
         <h2>Tasks <span class="note" id="taskcount"></span></h2>
+        <!-- A new task: a form above the list, drawn from its draft (renderCreate in
+             tasks.js), which stays while the operator moves between views. Its outcome
+             line is its own, outside it, so it outlives the form a create closes. -->
+        <div class="create">
+          <button type="button" id="create-open">new task</button>
+          <div class="create-form" id="create-form" hidden></div>
+          <div class="create-outcome empty" id="create-outcome"></div>
+        </div>
         <!-- Plain controls, as the audit filter bar is: they narrow what is shown. The
              state options are filled from TASK_STATES in moves.js. -->
         <div class="filters" role="search">

@@ -2407,7 +2407,7 @@ class TaskWriteSourceTests(unittest.TestCase):
     def test_each_relayed_post_is_a_post_fetch_in_moves_js_and_back(self):
         # PageChecks matches paths, not methods: this holds the methods.
         posts = [re.sub(r"\$\{[^}]*\}", "1", p) for p in self.POST.findall(self.MOVES)]
-        self.assertEqual(len(posts), 8)
+        self.assertEqual(len(posts), 10)
         routes = [rx for method, rx in tui._RELAY_ROUTES if method == "POST"]
         for path in posts:
             with self.subTest(path=path):
@@ -2416,7 +2416,7 @@ class TaskWriteSourceTests(unittest.TestCase):
             with self.subTest(route=rx.pattern):
                 self.assertTrue(any(rx.match(p) for p in posts), rx.pattern)
         # Every fetch in moves.js is one of them; tasks.js posts nothing.
-        self.assertEqual(len(re.findall(r"\bfetch\(", self.MOVES)), 8)
+        self.assertEqual(len(re.findall(r"\bfetch\(", self.MOVES)), 10)
         self.assertNotIn("method:", self.TASKS)
 
     def test_moves_js_imports_nothing_of_tasks_js(self):
@@ -2439,8 +2439,9 @@ class TaskWriteSourceTests(unittest.TestCase):
         self.assertIn("markWriting();", self._function(self.TASKS, "showPage"))
         # The bulk is sent by the one runner too, and nothing else sends.
         self.assertEqual(len(re.findall(r"\bsendWrite\(", _code(self.TASKS))), 1)
-        self.assertEqual(len(re.findall(r"\brunWrite\(", _code(self.TASKS))), 3,
-                         "defined once, called from the detail and the flagged block")
+        self.assertEqual(len(re.findall(r"\brunWrite\(", _code(self.TASKS))), 4,
+                         "defined once, called from the detail, the flagged block and "
+                         "the create form")
         self.assertIn("const write = bulkWrite();\n      if (write) runWrite(write);",
                       self.TASKS)
         # The flagged controls are off while any write is out, whatever task is open.
@@ -2479,10 +2480,12 @@ class TaskWriteSourceTests(unittest.TestCase):
 
     def test_a_lost_answer_is_decided_from_a_read_and_never_resent(self):
         body = self._function(self.TASKS, "runWrite")
-        self.assertIn('if (result === "unknown") {\n    result = checkWrite(write, '
+        self.assertIn('if (result === "unknown") {\n    const reread = '
                       'write.kind === "handle-many"\n'
                       '      ? { flagged: await readFlaggedPast(write.notes).catch(() => '
-                      'null) } : drawn);', body)
+                      'null) }\n'
+                      '      : write.kind === "create" ? await readCreated(write) : drawn;\n'
+                      '    result = checkWrite(write, reread);', body)
         self.assertEqual(body.count("sendWrite("), 1)
         # A lost bulk reads the list from just past the highest note it named, so a
         # flood flagged since cannot push the named ones off the page read.
@@ -2529,8 +2532,8 @@ class TaskWriteSourceTests(unittest.TestCase):
         self.assertIn("return reply.trim() ? {", self._function(self.TASKS, "noteWrite"))
 
     def test_no_move_is_drawn_in_an_inbox_row(self):
-        # The bulk handle is the one write outside the detail, and its control is the
-        # flagged block's own, never a row's.
+        # The bulk handle and the create are the writes outside the detail, and each
+        # control is the flagged block's or the form's own, never a row's.
         for name in ("inboxRow", "renderInbox", "renderTasks", "renderFlagged",
                      "flaggedRow"):
             with self.subTest(function=name):
@@ -3980,6 +3983,595 @@ class TaskEditSourceTests(unittest.TestCase):
         self.assertLess(draw.index("taskDetail.appendChild(specForm(task));"),
                         draw.index("taskDetail.appendChild(body);"))
         self.assertIn("specAmendText(task)", _function(self.TASKS, "specForm"))
+
+
+# The create and the reparent: what each sends, what a lost one's read back decides, and
+# what the page says around them.
+_CREATE_PROBE = r"""
+import { pathToFileURL } from "node:url";
+const t = await import(pathToFileURL(`${process.env.DOCKADE_UI_DIR}/tasks.js`).href);
+const m = await import(pathToFileURL(`${process.env.DOCKADE_UI_DIR}/moves.js`).href);
+const draft = {repo: "widgets", state: "proposed", title: "Rotate keys", body: "In place.",
+               severity: "", kind: "", parent: "", blockers: ""};
+const req = changes => m.createRequest({...draft, ...changes});
+// What each puts on the wire, with fetch stubbed.
+const sent = [];
+globalThis.fetch = (url, opts) => {
+  sent.push({url, method: opts.method, body: JSON.parse(opts.body)});
+  return Promise.resolve({status: 200, text: async () => '{"ok": true}'});
+};
+await m.sendWrite({kind: "create", task: null, send: req({}), bound: 7,
+                   verb: "create the task"});
+await m.sendWrite({kind: "reparent", task: "7", revision: 4,
+                   send: {revision: 4, parent: null}, verb: "remove the parent"});
+const task = {id: 7, revision: 4, parent: {id: 3, title: "P", state: "open"}, claim: null};
+const orphan = {...task, parent: null};
+const reparent = parent => ({kind: "reparent", task: "7", revision: 4,
+                             send: {revision: 4, parent}, verb: "make it so"});
+// A create sent past task 10, and what reading its repo back may find.
+const create = {kind: "create", task: null, send: req({}), bound: 10,
+                verb: "create the task"};
+const first = {...create, bound: 0};
+const row = (id, title = "Rotate keys") => ({id, title});
+const full = (id, body = "In place.", title = "Rotate keys") => ({id, title, body});
+const others = (top, n) => Array.from({length: n}, (_, i) => row(top - i, "Other"));
+const lists = {
+  found: {list: {tasks: [row(11), row(10)], total: 12}, candidates: [full(11)]},
+  second: {list: {tasks: [row(12), row(11), row(9)], total: 30},
+           candidates: [full(12, "Another body."), full(11)]},
+  other_body: {list: {tasks: [row(11), row(10)], total: 30},
+               candidates: [full(11, "In place, but not.")]},
+  other_title: {list: {tasks: [row(11), row(10)], total: 30},
+                candidates: [full(11, "In place.", "Rotate keys!")]},
+  at_bound: {list: {tasks: [row(10), row(9)], total: 30}, candidates: [full(10)]},
+  full_page_past: {list: {tasks: others(60, 50), total: 80}, candidates: []},
+  failed_candidate: {list: {tasks: [row(11), row(10)], total: 30}, candidates: null},
+  failed_read: {list: null, candidates: null},
+};
+const created = Object.fromEntries(Object.entries(lists)
+  .map(([k, v]) => [k, m.createdTask(create, v)]));
+// The repo read back through `readCreated`, fetch stubbed: tasks 12 and 11 past the
+// bound have the title sent, 12 with another body; 11's full read fails or not.
+const readBack = async failing => {
+  const asked = [];
+  globalThis.fetch = async url => {
+    asked.push(url);
+    const json = body => ({status: 200, ok: true, json: async () => body});
+    if (url.startsWith("/api/tasks?")) {
+      return json({tasks: [row(12), row(11), row(10)], total: 30});
+    }
+    if (url === "/api/tasks/12") return json(full(12, "Another body."));
+    if (url === "/api/tasks/11" && !failing) return json(full(11));
+    return {status: 500, ok: false, json: async () => ({ok: false})};
+  };
+  const reread = await t.readCreated(create);
+  return {asked, candidates: reread.candidates && reread.candidates.map(c => c.id),
+          check: m.checkWrite(create, reread)};
+};
+const read_back = {whole: await readBack(false), failed: await readBack(true)};
+console.log(JSON.stringify({
+  states: m.CREATE_STATES,
+  requests: {
+    plain: req({}),
+    blank_title: req({title: " \u3000\t"}),
+    empty_body: req({body: ""}),
+    all: req({state: "open", severity: "high", kind: "finding", parent: "#3",
+              blockers: "#2, 5 2"}),
+    bad_parent: req({parent: "x3"}),
+    second_parent: req({parent: "#3 #4"}),
+    bad_blockers: req({blockers: "#2, y"}),
+    refined: req({state: "refined"}),
+    no_repo: req({repo: ""}),
+    repo_not_text: req({repo: 5}),
+    no_body: req({body: undefined}),
+    unknown_values: req({severity: "critical", kind: "chore"}),
+    none: m.createRequest(null),
+  },
+  parse_parent: ["", "#7", "7", " #7 ", "#7, #8", "x", "#0"].map(m.parseParent),
+  parent_ids: [m.parentId(task), m.parentId(orphan), m.parentId(null),
+               m.parentId({parent: {id: "3"}})],
+  reparent_requests: {
+    same: m.reparentRequest(task, "#3"), same_bare: m.reparentRequest(task, " 3 "),
+    none: m.reparentRequest(task, ""), other: m.reparentRequest(task, "#5"),
+    bad: m.reparentRequest(task, "#5 #6"), not_an_id: m.reparentRequest(task, "x"),
+    none_from_none: m.reparentRequest(orphan, ""),
+    set_from_none: m.reparentRequest(orphan, "#5"), no_task: m.reparentRequest(null, "#5"),
+  },
+  reparent_checks: {
+    set: m.checkWrite(reparent(5), {task: {...task, revision: 5, parent: {id: 5}}}),
+    removed: m.checkWrite(reparent(null), {task: {...orphan, revision: 5}}),
+    not_landed: m.checkWrite(reparent(5), {task}),
+    changed: m.checkWrite(reparent(5), {task: {...task, revision: 5}}),
+    changed_removed: m.checkWrite(reparent(null), {task: {...task, revision: 5}}),
+    failed: m.checkWrite(reparent(5), null),
+  },
+  create_checks: {
+    ...Object.fromEntries(Object.entries(lists)
+      .map(([k, v]) => [k, m.checkWrite(create, v)])),
+    nothing_read: m.checkWrite(create, null),
+    empty_repo: m.checkWrite(first, {list: {tasks: [], total: 0}, candidates: []}),
+    first_found: m.checkWrite(first, {list: {tasks: [row(1)], total: 1},
+                                      candidates: [full(1)]}),
+    whole_total: m.checkWrite(first, {list: {tasks: others(50, 50), total: 50},
+                                      candidates: []}),
+    past_whole_page: m.checkWrite(first, {list: {tasks: others(50, 50), total: 51},
+                                          candidates: []}),
+  },
+  created,
+  read_back,
+  texts: {
+    landed: t.createOutcomeText(create, "landed", null, 12),
+    landed_edited: t.createOutcomeText(create, "landed", null, 12, true),
+    found: t.createOutcomeText(create, "found", null, 11),
+    found_first: t.createOutcomeText(first, "found", null, 1),
+    found_edited: t.createOutcomeText(create, "found", null, 11, true),
+    no_bound: t.createOutcomeText({...create, bound: null}, "no-bound", null, null),
+    refused: t.createOutcomeText(create, "refused", "no task 19 in this repo\u202e", null),
+    not_running: t.createOutcomeText(create, "not-running", null, null),
+    not_found_yet: t.createOutcomeText(create, "not-found-yet", null, null),
+    not_found_first: t.createOutcomeText(first, "not-found-yet", null, null),
+    could_not_check: t.createOutcomeText(create, "could-not-check", null, null),
+    other: t.createOutcomeText(create, "unknown", null, null),
+    reparent_found: t.outcomeText(reparent(5), "found").text,
+    reparent_not_landed: t.outcomeText(reparent(5), "not-landed").text,
+    reparent_landed: t.outcomeText({...reparent(5), verb: "make #5 the parent"},
+                                   "landed").text,
+  },
+  labels: {
+    create: t.createLabel(draft, false),
+    send_anyway: t.createLabel({...draft, state: "open"}, true),
+    create_spelled: t.createLabel({...draft, repo: "a\u202eb"}, false).main,
+    create_none: t.createLabel(null, false),
+    reparent: t.reparentLabel(task, {revision: 4, parent: 5}),
+    reparent_none: t.reparentLabel({...task, claim: {holder: "x"}},
+                                   {revision: 4, parent: null}),
+    reparent_nothing: t.reparentLabel(task, null),
+    preview: t.createPreview("Rotate\u200b keys"),
+    preview_none: t.createPreview(undefined),
+    problem: t.parentProblem("x\u202e"),
+  },
+  wire: sent,
+}));
+"""
+
+
+@unittest.skipIf(not _NODE and not _STRICT,
+                 "node is not installed — skipping app.js unit tests")
+class CreateTests(unittest.TestCase):
+    """The create's and the reparent's pure halves (``moves.js``) and what ``tasks.js``
+    says around them: only a whole create is sent, a parent is one id or none, and a
+    lost create is found only past its bound, by the title and body it sent."""
+
+    probe: dict
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        proc = subprocess.run(  # noqa: S603 (absolute path, fixed args, as _probe)
+            [_NODE, "--input-type=module", "-e", _CREATE_PROBE],
+            env={**os.environ, "DOCKADE_UI_DIR": str(_served_dir(TASKS_DIR))},
+            capture_output=True, text=True, timeout=60, check=False)
+        if proc.returncode != 0:
+            raise AssertionError("importing moves.js under node failed:\n" + proc.stderr)
+        cls.probe = json.loads(proc.stdout)
+
+    def test_a_create_is_sent_whole_or_not_at_all(self):
+        r = self.probe["requests"]
+        self.assertEqual(r["plain"], {
+            "repo": "widgets", "title": "Rotate keys", "body": "In place.",
+            "state": "proposed", "severity": None, "kind": None, "parent": None,
+            "blocked_by": []})
+        # Every field the operator API's model takes, and only those.
+        self.assertEqual(set(r["plain"]), set(_api.CreateTask.__annotations__))
+        self.assertEqual(r["empty_body"]["body"], "")
+        self.assertEqual(r["all"], {
+            "repo": "widgets", "title": "Rotate keys", "body": "In place.",
+            "state": "open", "severity": "high", "kind": "finding", "parent": 3,
+            "blocked_by": [2, 5]})
+        # A value no select offers goes as none, never as typed.
+        self.assertEqual((r["unknown_values"]["severity"], r["unknown_values"]["kind"]),
+                         (None, None))
+        for key in ("blank_title", "bad_parent", "second_parent", "bad_blockers",
+                    "refined", "no_repo", "repo_not_text", "no_body", "none"):
+            with self.subTest(case=key):
+                self.assertIsNone(r[key])
+
+    def test_the_states_are_every_one_but_refined(self):
+        states = [s for s in self.probe["states"]]
+        self.assertEqual(states, ["proposed", "open", "landing", "deferred", "closed"])
+
+    def test_a_parent_is_one_id_or_none(self):
+        self.assertEqual(self.probe["parse_parent"], [
+            {"id": None, "bad": None}, {"id": 7, "bad": None}, {"id": 7, "bad": None},
+            {"id": 7, "bad": None}, {"id": None, "bad": "#8"}, {"id": None, "bad": "x"},
+            {"id": None, "bad": "#0"}])
+        self.assertEqual(self.probe["parent_ids"], [3, None, None, None])
+        self.assertEqual(self.probe["labels"]["problem"],
+                         '"x\\u202e" is not a parent: a parent is one task id, such as '
+                         "#7, or nothing for none.")
+
+    def test_a_reparent_names_the_revision_and_only_another_parent(self):
+        r = self.probe["reparent_requests"]
+        for key in ("same", "same_bare", "bad", "not_an_id", "none_from_none", "no_task"):
+            with self.subTest(case=key):
+                self.assertIsNone(r[key])
+        self.assertEqual(r["none"], {"revision": 4, "parent": None})
+        self.assertEqual(r["other"], {"revision": 4, "parent": 5})
+        self.assertEqual(r["set_from_none"], {"revision": 4, "parent": 5})
+
+    def test_each_is_posted_as_its_route_takes_it(self):
+        self.assertEqual(self.probe["wire"], [
+            {"url": "/api/tasks", "method": "POST",
+             "body": self.probe["requests"]["plain"]},
+            {"url": "/api/tasks/7/reparent", "method": "POST",
+             "body": {"revision": 4, "parent": None}}])
+        # Required, and null for none: an absent parent would not read as "none".
+        self.assertEqual(set(_api.Reparent.__annotations__), {"revision", "parent"})
+
+    def test_a_lost_reparent_is_decided_by_the_revision_and_the_parent(self):
+        self.assertEqual(self.probe["reparent_checks"], {
+            "set": "found", "removed": "found", "not_landed": "not-landed",
+            "changed": "changed", "changed_removed": "changed",
+            "failed": "could-not-check"})
+        texts = self.probe["texts"]
+        self.assertEqual(texts["reparent_landed"], "Make #5 the parent: done.")
+        self.assertIn("the task shows it landed", texts["reparent_found"])
+        self.assertIn("cannot apply it twice", texts["reparent_not_landed"])
+
+    def test_a_lost_create_is_found_only_past_its_bound_by_title_and_body(self):
+        c = self.probe["create_checks"]
+        self.assertEqual(c, {
+            "found": "found", "second": "found",
+            # Not there: the page reaches the bound, so it is not found yet.
+            "other_body": "not-found-yet", "other_title": "not-found-yet",
+            "at_bound": "not-found-yet",
+            # A full page all past it may have pushed it off.
+            "full_page_past": "could-not-check",
+            "failed_candidate": "could-not-check", "failed_read": "could-not-check",
+            "nothing_read": "could-not-check",
+            "empty_repo": "not-found-yet", "first_found": "found",
+            # A page holding the repo's whole total reaches any bound.
+            "whole_total": "not-found-yet", "past_whole_page": "could-not-check"})
+        self.assertEqual(self.probe["created"], {
+            "found": 11, "second": 11, "other_body": None, "other_title": None,
+            "at_bound": None, "full_page_past": None, "failed_candidate": None,
+            "failed_read": None})
+
+    def test_a_candidate_that_could_not_be_read_leaves_it_unknown(self):
+        # Read whole, the one with the body sent is found; one read failing stands for
+        # all of them, since it may be the one: never "not found yet" on what was read.
+        back = self.probe["read_back"]
+        self.assertEqual(back["whole"], {
+            "asked": ["/api/tasks?repo=widgets&state=all", "/api/tasks/12",
+                      "/api/tasks/11"],
+            "candidates": [12, 11], "check": "found"})
+        self.assertEqual(back["failed"], {
+            "asked": ["/api/tasks?repo=widgets&state=all", "/api/tasks/12",
+                      "/api/tasks/11"],
+            "candidates": None, "check": "could-not-check"})
+
+    def test_no_outcome_of_a_lost_create_calls_sending_it_again_safe(self):
+        t = self.probe["texts"]
+        self.assertEqual(t["landed"], {"text": "Created task #12.", "warn": False})
+        self.assertEqual(t["landed_edited"], {
+            "text": "Created task #12. The task was created as sent; your edits since "
+                    "are kept in the form.", "warn": False})
+        self.assertEqual(t["found"], {
+            "text": "No answer came, but widgets has task #11 past task #10 with the "
+                    "title and body sent, so it landed.", "warn": False})
+        self.assertEqual(t["found_first"]["text"],
+                         "No answer came, but widgets has task #1 with the title and body "
+                         "sent, so it landed.")
+        self.assertTrue(t["found_edited"]["text"].endswith(
+            " The task was created as sent; your edits since are kept in the form."))
+        self.assertEqual(t["no_bound"], {"text": "Could not read the repo; nothing sent.",
+                                         "warn": True})
+        self.assertEqual(t["refused"], {
+            "text": "Create the task: refused. no task 19 in this repo\\u202e",
+            "warn": True})
+        self.assertEqual(t["not_running"]["text"],
+                         "Create the task: not sent. The task registry is not running.")
+        self.assertEqual(t["not_found_yet"]["text"],
+                         "No answer came, and no task in widgets past task #10 has the "
+                         "title and body sent yet. It may still land: look again before "
+                         "sending it again, which may make a second task.")
+        self.assertIn("no task in widgets has the title", t["not_found_first"]["text"])
+        self.assertIn("whether it landed is not known", t["could_not_check"]["text"])
+        for key in ("not_found_yet", "could_not_check", "other"):
+            with self.subTest(case=key):
+                self.assertTrue(t[key]["warn"])
+                self.assertIn("which may make a second task", t[key]["text"])
+                self.assertNotIn("harmless", t[key]["text"])
+                self.assertNotIn("safe", t[key]["text"])
+
+    def test_the_create_names_its_repo_and_state_and_a_resend_warns(self):
+        labels = self.probe["labels"]
+        self.assertEqual(labels["create"], {
+            "main": "create the task in widgets as proposed",
+            "second": "a task can be closed, never removed", "caution": False})
+        self.assertEqual(labels["send_anyway"], {
+            "main": "send anyway — may make a second task",
+            "second": "in widgets as open · a task can be closed, never removed",
+            "caution": True})
+        self.assertEqual(labels["create_spelled"],
+                         "create the task in a\\u202eb as proposed")
+        self.assertIsNone(labels["create_none"])
+
+    def test_the_reparent_names_the_parent_and_the_revision(self):
+        labels = self.probe["labels"]
+        self.assertEqual(labels["reparent"], {"main": "make #5 the parent",
+                                              "second": "revision 4", "caution": False})
+        self.assertEqual(labels["reparent_none"], {
+            "main": "remove the parent", "second": "revision 4 · the claim stays",
+            "caution": False})
+        self.assertIsNone(labels["reparent_nothing"])
+
+    def test_the_preview_says_what_will_be_stored_spelled(self):
+        labels = self.probe["labels"]
+        self.assertEqual(labels["preview"], {"label": "will be stored",
+                                             "text": "Rotate\\u200b keys", "hidden": 1})
+        self.assertEqual(labels["preview_none"], {"label": "will be stored", "text": "",
+                                                  "hidden": 0})
+
+
+# The bodies the page builds for drafts and reparents a scratch store holds, and what
+# its check makes of the reads after: `DOCKADE_IN` is `{drafts, reparents, checks}`.
+_CREATE_RULE_PROBE = r"""
+import { pathToFileURL } from "node:url";
+const m = await import(pathToFileURL(`${process.env.DOCKADE_UI_DIR}/moves.js`).href);
+const given = JSON.parse(process.env.DOCKADE_IN);
+console.log(JSON.stringify({
+  states: m.CREATE_STATES,
+  sent: (given.drafts || []).map(m.createRequest),
+  reparents: (given.reparents || []).map(([task, text]) => m.reparentRequest(task, text)),
+  checks: (given.checks || []).map(([write, reread]) => m.checkWrite(write, reread)),
+}));
+"""
+
+
+def _rule_probe(given: dict) -> dict:
+    proc = subprocess.run(  # noqa: S603 (absolute path, fixed args, as _probe)
+        [_NODE, "--input-type=module", "-e", _CREATE_RULE_PROBE],
+        env={**os.environ, "DOCKADE_UI_DIR": str(_served_dir(TASKS_DIR)),
+             "DOCKADE_IN": json.dumps(given)},
+        capture_output=True, text=True, timeout=60, check=False)
+    if proc.returncode != 0:
+        raise AssertionError("importing moves.js under node failed:\n" + proc.stderr)
+    return json.loads(proc.stdout)
+
+
+@unittest.skipIf(not _NODE and not _STRICT,
+                 "node is not installed — skipping app.js unit tests")
+class CreateRuleTests(_OperatorStore):
+    """The create the page builds against the registry's own: each body taken by the
+    operator API's model and by ``create`` on a scratch store, read back as sent, and
+    found by the page's check past the bound read before it, but not with the bound at
+    its own id."""
+
+    def _draft(self, **changes: str) -> dict:
+        return {"repo": "widgets", "state": "proposed", "title": "Rotate keys",
+                "body": "In place.", "severity": "", "kind": "", "parent": "",
+                "blockers": "", **changes}
+
+    def _bound(self) -> int:
+        page = _reads.list_tasks("widgets", None)
+        return max((t["id"] for t in page["tasks"]), default=0)
+
+    def _reread(self, title: str) -> dict:
+        page = _reads.list_tasks("widgets", None)
+        return {"list": page, "candidates": [_reads.get_task(t["id"]) for t in page["tasks"]
+                                             if t["title"] == title]}
+
+    def test_each_create_lands_as_sent_and_is_found_past_its_bound(self):
+        other = _reg.operator_moves.create("widgets", "Other", "B.", "open")["task"]
+        drafts = [self._draft(),
+                  self._draft(body="", state="open"),
+                  self._draft(title="With all", severity="low", kind="question",
+                              parent=f"#{self.task}", blockers=f"{other}, #{other}",
+                              state="deferred"),
+                  self._draft(title="Closed at once", body="Done.\nAlready.",
+                              state="closed", blockers=f"#{self.task}")]
+        sent = _rule_probe({"drafts": drafts})["sent"]
+        for body in sent:
+            with self.subTest(sent=body):
+                self.assertIsNotNone(body)
+                bound = self._bound()
+                reply = _api.create_task(_api.CreateTask(**body), ThroughTheRelay())
+                self.assertEqual(reply.status_code, 200, reply.body)
+                made = reply.body["task"]
+                now = _reads.get_task(made)
+                for field in ("title", "body", "state", "severity", "kind"):
+                    self.assertEqual(now[field], body[field], field)
+                self.assertEqual(now["parent"] and now["parent"]["id"], body["parent"])
+                self.assertEqual(sorted(b["id"] for b in now["blockers"]),
+                                 sorted(body["blocked_by"]))
+                write = {"kind": "create", "task": None, "send": body, "bound": bound}
+                at_it = {**write, "bound": made}
+                reread = self._reread(body["title"])
+                checks = _rule_probe({"checks": [[write, reread], [at_it, reread]]})
+                self.assertEqual(checks["checks"], ["found", "not-found-yet"])
+
+    def test_the_states_offered_are_the_ones_create_takes(self):
+        took = []
+        for state in _reg.tasks.STATES:
+            try:
+                _reg.operator_moves.create("widgets", f"In {state}", "B.", state)
+            except _Refused:
+                continue
+            took.append(state)
+        self.assertEqual(_rule_probe({})["states"], took)
+
+
+@unittest.skipIf(not _NODE and not _STRICT,
+                 "node is not installed — skipping app.js unit tests")
+class ReparentRuleTests(_OperatorStore):
+    """The reparent the page builds against the registry's own: setting, changing and
+    removing a parent each land on a scratch store and are found by the page's check;
+    read at the revision sent, none has landed."""
+
+    def test_set_change_and_remove_land_and_are_found(self):
+        op = _reg.operator_moves
+        a = op.create("widgets", "A", "B.", "open")["task"]
+        b = op.create("widgets", "B", "B.", "open")["task"]
+        child = op.create("widgets", "Child", "B.", "open")["task"]
+        for text, expected in ((f"#{a}", a), (f"{b}", b), ("", None)):
+            with self.subTest(text=text):
+                before = _reads.get_task(child)
+                body = _rule_probe({"reparents": [[before, text]]})["reparents"][0]
+                self.assertEqual(body, {"revision": before["revision"], "parent": expected})
+                reply = _api.reparent(child, _api.Reparent(**body), ThroughTheRelay())
+                self.assertEqual(reply.status_code, 200, reply.body)
+                after = _reads.get_task(child)
+                self.assertEqual(after["parent"] and after["parent"]["id"], expected)
+                write = {"kind": "reparent", "task": str(child),
+                         "revision": body["revision"], "send": body}
+                checks = _rule_probe({"checks": [[write, {"task": after}],
+                                                 [write, {"task": before}]]})["checks"]
+                self.assertEqual(checks, ["found", "not-landed"])
+        # The parent it has now is no reparent at all.
+        none = _rule_probe({"reparents": [[_reads.get_task(child), ""]]})["reparents"]
+        self.assertEqual(none, [None])
+
+
+class TaskCreateSourceTests(unittest.TestCase):
+    """How the page holds, draws and sends a create and a reparent, from source: a
+    browser is the only thing that runs it. What each sends is held under node
+    (``CreateTests``, ``CreateRuleTests``, ``ReparentRuleTests``)."""
+
+    TASKS = (TASKS_DIR / "tasks.js").read_text()
+    HTML = (TASKS_DIR / "index.html").read_text()
+
+    def test_the_bound_is_read_inside_the_gate_and_before_the_send(self):
+        run = _function(self.TASKS, "runWrite")
+        order = ["writing = write;", "markWriting();",
+                 'if (write.kind === "create") {\n    write.bound = await '
+                 "readBound(write.send.repo).catch(() => null);",
+                 'const unsent = write.kind === "create" && write.bound === null;',
+                 "if (!unsent) answer = await readAnswer(await sendWrite(write));",
+                 'let result = unsent ? "no-bound" : writeOutcome(answer);',
+                 "writing = null;"]
+        at = [run.index(step) for step in order]
+        self.assertEqual(at, sorted(at), order)
+        bound = _function(self.TASKS, "readBound")
+        self.assertIn("const q = new URLSearchParams({ repo, state: EVERY_STATE });", bound)
+        self.assertIn("fetch(`/api/tasks?${q}`)", bound)
+        # 0 for an empty repo: the newest id, never the list's length.
+        self.assertIn(".reduce((top, t) => (t && Number(t.id) > top ? Number(t.id) : top), "
+                      "0)", bound)
+
+    def test_look_again_checks_the_write_kept_as_sent_never_the_draft(self):
+        look = _function(self.TASKS, "lookAgain")
+        lines = [ln.strip() for ln in look.splitlines()[1:6]]
+        self.assertEqual(lines, [
+            "if (writing || lostCreate === null || !registryIsRunning()) return;",
+            "const write = lostCreate;", "writing = write;", "markWriting();",
+            "const reread = await readCreated(write);"])
+        self.assertIn("checkWrite(write, reread)", look)
+        self.assertIn("createdTask(write, reread)", look)
+        self.assertNotIn("createDraft", look)
+        self.assertNotIn("createRequest", look)
+        self.assertNotRegex(look, r"\b(?:sendWrite|runWrite)\(")
+        self.assertLess(look.index("checkWrite("), look.index("writing = null;"))
+        # And what it reads with is the kept write's own title, body and bound.
+        read = _function(self.TASKS, "readCreated")
+        self.assertIn("Number(row.id) > Number(write.bound)", read)
+        self.assertIn("row.title === write.send.title", read)
+        self.assertNotIn("createDraft", read)
+
+    def test_the_lost_write_is_kept_until_found_discarded_or_replaced(self):
+        sets = re.findall(r"\blostCreate = ([^;]*);", self.TASKS)
+        self.assertEqual(sets, ["null", "null", "write", "null"], sets)
+        finish = _function(self.TASKS, "finishCreate")
+        self.assertIn("  if (landed) {\n    lostCreate = null;\n"
+                      "    if (asSent) createDraft = null;\n"
+                      '  } else if (result === "not-found-yet" || result === '
+                      '"could-not-check") {\n    lostCreate = write;\n  }', finish)
+        self.assertIn('const landed = (result === "landed" || result === "found") '
+                      "&& created !== null;", finish)
+        self.assertIn("const asSent = JSON.stringify(draft) === "
+                      "JSON.stringify(write.send);", finish)
+        self.assertIn('if (result === "refused") refreshRepos();', finish)
+        # The draft: opened, typed in, synced to a select, and dropped by a create that
+        # still equals it or by discard.
+        drafts = re.findall(r"\bcreateDraft(?:\[field\])? = ([^;]*);", self.TASKS)
+        self.assertEqual(drafts, ["null", "el.value", "null", "newCreateDraft()",
+                                  "{ ...createDraft, [field]: ev.target.value }", "null"],
+                         drafts)
+
+    def test_a_create_found_or_landed_opens_its_task_through_the_hash(self):
+        run = _function(self.TASKS, "runWrite")
+        self.assertIn('const opens = write.kind === "create" ? '
+                      "finishCreate(write, result, detail, created)\n    : null;", run)
+        self.assertTrue(run.rstrip("}\n ").endswith(
+            "if (opens !== null) goTo(view, String(opens));"))
+        self.assertIn('let created = result === "landed" && write.kind === "create" '
+                      "? answer.body.task : null;", run)
+        self.assertIn('if (write.kind === "create") created = createdTask(write, reread);',
+                      run)
+        self.assertIn("if (opens !== null) goTo(view, String(opens));",
+                      _function(self.TASKS, "lookAgain"))
+
+    def test_the_form_and_the_parent_are_in_the_in_flight_gate(self):
+        mark = _function(self.TASKS, "markWriting")
+        self.assertIn("input[data-parent]", mark)
+        self.assertEqual(mark.splitlines()[1].strip(), "markParent();")
+        self.assertTrue(mark.rstrip("}\n ").endswith("markCreate();"))
+        create = _function(self.TASKS, "markCreate")
+        self.assertIn('for (const el of createForm.querySelectorAll("[data-create-field], '
+                      'button")) {\n    el.disabled = writing !== null;', create)
+        self.assertIn("if (createOpen) createOpen.disabled = writing !== null;", create)
+        self.assertIn("if (!createRequest(createDraft)) send.disabled = true;", create)
+        self.assertIn("setLabel(send, createLabel(createDraft, lostCreate));", create)
+        # The handlers ask the gate too.
+        self.assertIn("if (writing || createDraft !== null) return;", self.TASKS)
+        self.assertIn('const btn = ev.target.closest("button");\n    if (!btn || writing) '
+                      "return;", self.TASKS)
+
+    def test_values_are_set_as_properties_and_previews_spelled(self):
+        self.assertIn("el.value = createDraft[field];",
+                      _function(self.TASKS, "createControl"))
+        self.assertIn("input.value = parentText(task);",
+                      _function(self.TASKS, "movesBlock"))
+        for name in ("createControl", "renderCreate", "markCreate", "markParent",
+                     "movesBlock"):
+            with self.subTest(function=name):
+                body = _function(self.TASKS, name)
+                self.assertNotRegex(body, r'setAttribute\("(?:value|placeholder)"')
+                self.assertNotIn("innerHTML", body)
+        self.assertIn("const shown = spellHidden(text);",
+                      _function(self.TASKS, "createPreview"))
+        mark = _function(self.TASKS, "markCreate")
+        self.assertIn("text.textContent = preview.text;", mark)
+        self.assertIn("hiddenNote(preview.hidden)", mark)
+        self.assertIn("parentProblem(bad[field])", mark)
+        self.assertIn("blockersProblem(bad[field])", mark)
+        self.assertIn("spellHidden(String(bad)).text",
+                      _function(self.TASKS, "parentProblem"))
+
+    def test_a_reparent_is_offered_only_while_it_builds_a_body(self):
+        mark = _function(self.TASKS, "markParent")
+        self.assertIn("const send = reparentRequest(shownTask, text);", mark)
+        self.assertIn("  if (send) {\n", mark)
+        self.assertIn("} else if (bad !== null) {\n    slot.appendChild(noticeLine({ text: "
+                      "parentProblem(bad), warn: true }));", mark)
+        self.assertIn('if (btn.dataset.write === "reparent") return reparentWrite(base);',
+                      _function(self.TASKS, "writeFor"))
+        self.assertIn("reparentRequest(shownTask, parentText(shownTask))",
+                      _function(self.TASKS, "reparentWrite"))
+        # Its text is kept per task until one lands, and it holds nothing.
+        self.assertIn('if (write.kind === "reparent" && landed) '
+                      "parentDrafts.delete(write.task);", _function(self.TASKS, "runWrite"))
+        self.assertIn("parentDrafts.set(String(shownTask.id), ev.target.value);",
+                      self.TASKS)
+        self.assertIn('const HELD_KINDS = ["move", "approve", "break"];', self.TASKS)
+
+    def test_the_form_is_on_all_tasks_above_the_list(self):
+        view = self.HTML[self.HTML.index('<section id="all-view"'):]
+        view = view[:view.index("</section>")]
+        self.assertLess(view.index('id="create-open"'), view.index('id="tasks"'))
+        self.assertLess(view.index('id="create-form"'), view.index('id="tasks"'))
+        # Its outcome is outside the form, which a create that lands closes.
+        self.assertLess(view.index('id="create-form" hidden></div>'),
+                        view.index('id="create-outcome"'))
 
 
 if __name__ == "__main__":

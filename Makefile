@@ -202,6 +202,7 @@ REFFILES := $(SCRIPTS) \
             tasks-ui/diff.js \
             tasks-ui/markdown.js \
             tasks-ui/moves.js \
+            tasks-ui/repos.js \
             tasks-ui/tasks.js \
             task-registry/serve.py \
             task-registry/taskdb.py \

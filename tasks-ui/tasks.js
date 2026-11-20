@@ -37,6 +37,7 @@ import {
   SEVERITIES, KINDS, CREATE_STATES, createRequest, createdTask, parseParent, parentId,
   reparentRequest,
 } from "./moves.js";
+import { followedRepo, markRepos, mountRepos, renderRepos, repoHooks } from "./repos.js";
 import { fmtStamp, fmtInstant } from "./time.js";
 
 // What `GET /api/tasks` takes for every state (operator_api.EVERY_STATE), beside the
@@ -327,13 +328,15 @@ function inIdRange(digits) {
 // digits, as the relay takes one, without leading zeros, as a row names it, from 1 to
 // ID_MAX. A task parameter that is anything else names none, and `bad` carries it, so
 // the page says the link named no task rather than show the list as if it were asked.
+export const VIEWS = ["inbox", "all", "repos"];
 export function parseHash(hash) {
   const q = new URLSearchParams(String(hash ?? "").replace(/^#/, ""));
+  const named = q.get("view");
   const given = q.get("task");
   const digits = given !== null && /^[0-9]+$/.test(given)
     ? given.replace(/^0+(?=[0-9])/, "") : null;
   const task = digits !== null && inIdRange(digits) ? digits : null;
-  return { view: q.get("view") === "all" ? "all" : "inbox", task,
+  return { view: VIEWS.includes(named) ? named : "inbox", task,
            bad: given !== null && task === null ? given : null };
 }
 
@@ -348,7 +351,7 @@ export function unknownTaskText(id) {
 }
 export function hashFor(view, task) {
   const q = new URLSearchParams();
-  if (view === "all") q.set("view", "all");
+  if (view !== "inbox" && VIEWS.includes(view)) q.set("view", view);
   if (task !== null && task !== undefined && task !== "") q.set("task", String(task));
   const s = q.toString();
   return s ? `#${s}` : "";
@@ -898,8 +901,8 @@ export function flaggedLine(drawn, read) {
 }
 
 export const NO_REPOS_TEXT =
-  "The registry has no repos yet. A repo is one the operator adds; until then no "
-  + "agent can file a task.";
+  "The registry has no repos yet. Add one under Repos; until then no agent can file a "
+  + "task.";
 export const NOT_RUNNING_TEXT =
   "The task registry is not running, or this page cannot reach it. make tasks-up "
   + "starts it; this page picks it up again when it answers.";
@@ -913,13 +916,17 @@ export const TASKS_POLL_MS = 15000;
 let tasksDown, tasksUp, tasksRepo, tasksState, tasksSearch, tasksBody, tasksEmpty,
   tasksOlder, tasksNewest, taskCountEl, taskDetail, listView, taskView, taskBack,
   listNotice, inboxEl, inboxEmpty,
-  inboxCountEl, viewInbox, viewAll, inboxView, allView, flaggedEl, flaggedLineEl,
+  inboxCountEl, viewInbox, viewAll, viewRepos, inboxView, allView, reposSection,
+  flaggedEl, flaggedLineEl,
   flaggedBody, flaggedEmpty, flaggedAll, flaggedHandle, flaggedLeftOut, flaggedOutcomeEl,
   createOpen, createForm, createOutcomeEl;
 
 let running = null;        // null: not asked yet
 let probing = null;        // the ask in flight, if one is
 let repos = [];
+let reposAsks = 0;         // reads of the repo list asked
+let reposDrawn = 0;        // the last of them drawn
+let following = null;      // a rename the page made, while its write's read is out
 let listPages = [];        // the `before` cursor of each page shown, newest first
 let listSeen = 0;          // tasks on the pages before this one
 let listFailed = false;
@@ -965,7 +972,7 @@ let flaggedUsed = 0;       // the last of them whose answer was used
 let flaggedWanted = 0;     // the read a draw was asked with, until an answer makes it
 let flaggedSelected = new Map();   // ticked ids, each to whether its task was parked then
 let flaggedKnown = [];     // the last good read's notes, which a failed read keeps
-let flaggedOutcome = null; // what the last bulk came to, until the next or All tasks
+let flaggedOutcome = null; // what the last bulk came to, until the next or another view
 // A new task. Its draft is the form's controls, kept across views and draws while the
 // form is open; only discard, or a create it still equals landing or found, drops it
 // (`finishCreate`). A create whose answer was lost and not found is kept as sent, with
@@ -1025,12 +1032,38 @@ async function probe() {
   }
 }
 
-async function refreshRepos() {
+// The one read of the repo list, which draws both the Repos view and All tasks' select,
+// and returns what it read, or null when it failed. No poll reads it while the registry
+// answers, so nothing in the view moves under the pointer: on the page's start and when a
+// poll finds the registry back (`probe`), on entering Repos, and after a repo write or a
+// refused create. `renamed`, a rename the page made (`{ from, to }`), takes the select,
+// and a new task's draft, with it once the list shows it landed; a repo gone otherwise
+// starts the list again (`followedRepo`).
+async function refreshRepos(renamed = null) {
+  if (!registryIsRunning()) return null;
+  const asked = ++reposAsks;
+  // Followed by whichever read draws first from now: one asked on entering Repos while
+  // the write's own read is out may answer, and draw, before it.
+  if (renamed) following = renamed;
+  let list = null;
   try {
-    repos = await registryJson(await fetch("/api/repos"));
+    list = await registryJson(await fetch("/api/repos"));
   } catch (e) {
-    return;
+    list = null;
   }
+  // A read answered after a newer one was drawn draws nothing, since its list is older,
+  // but still returns it: a write is settled from its own read.
+  if (list !== null && asked > reposDrawn) {
+    reposDrawn = asked;
+    drawRepos(list, following);
+  }
+  if (renamed) following = null;
+  return list;
+}
+
+// The repo list as read, in the Repos view and All tasks' select, following `renamed`.
+function drawRepos(list, renamed) {
+  repos = list;
   if (!repos.length) {
     renderListStatus(tasksEmpty, { show: true, level: "none", text: NO_REPOS_TEXT });
   }
@@ -1042,9 +1075,16 @@ async function refreshRepos() {
     opt.textContent = r.retired ? `${r.name} (retired)` : r.name;
     tasksRepo.appendChild(opt);
   }
-  if (repos.some(r => r.name === chosen)) tasksRepo.value = chosen;
+  const kept = followedRepo(chosen, renamed, repos);
+  if (kept !== null) tasksRepo.value = kept;
+  else if (chosen) resetList();
+  renderRepos(repos);
   // A repo retired since is offered no more.
-  if (createDraft !== null) renderCreate();
+  if (createDraft !== null) {
+    const repo = followedRepo(createDraft.repo, renamed, repos);
+    if (repo !== null) createDraft = { ...createDraft, repo };
+    renderCreate();
+  }
 }
 
 function cell(tr, value, cls) {
@@ -2603,6 +2643,7 @@ function markWriting() {
   markEdit();
   markFlagged();
   markCreate();
+  markRepos();
 }
 
 // "mark handled" in a reply box is off while the box holds a reply, so a typed reply is
@@ -2610,6 +2651,20 @@ function markWriting() {
 function markReply(box) {
   const plain = box.querySelector('button[data-write="handle"][data-value="true"]');
   if (plain && (replyDrafts.get(box.dataset.replyBox) ?? "").trim()) plain.disabled = true;
+}
+
+// A repo write (repos.js) goes through the gate every write here does: none while
+// another is out or the registry is not known to answer, and every control off until
+// its outcome is drawn.
+function beginRepoWrite(write) {
+  if (writing || !registryIsRunning()) return false;
+  writing = write;
+  markWriting();
+  return true;
+}
+function endRepoWrite() {
+  writing = null;
+  markWriting();
 }
 
 // One write, then the page as the registry has it after: the task read again, or for
@@ -2993,19 +3048,26 @@ function undoLeave(index) {
   else window.history.back();
 }
 
-// Back from All tasks, the flagged rows are drawn from a fresh read; a bulk's outcome
-// lasts until All tasks is opened. The back control names the view it goes back to.
+// The three views, each on the list: the Inbox, All tasks and Repos. Back from either
+// of the other two, the flagged rows are drawn from a fresh read; a bulk's outcome lasts
+// until another view is opened. Entering Repos reads the repo list, once, never on a
+// hash change that keeps the view. The back control names the view it goes back to.
+const BACK_TEXT = { inbox: "← Inbox", all: "← All tasks", repos: "← Repos" };
 function showView(name) {
-  const back = view === "all" && name === "inbox";
+  const back = view !== "inbox" && name === "inbox";
+  const entering = view !== "repos" && name === "repos";
   if (name !== view) sayOnList(null);
   view = name;
   inboxView.hidden = name !== "inbox";
   allView.hidden = name !== "all";
+  reposSection.hidden = name !== "repos";
   viewInbox.setAttribute("aria-pressed", String(name === "inbox"));
   viewAll.setAttribute("aria-pressed", String(name === "all"));
-  taskBack.textContent = name === "all" ? "← All tasks" : "← Inbox";
-  if (name === "all") flaggedOutcome = null;
+  viewRepos.setAttribute("aria-pressed", String(name === "repos"));
+  taskBack.textContent = BACK_TEXT[name];
+  if (name !== "inbox") flaggedOutcome = null;
   if (back) readFlagged(true);
+  if (entering) refreshRepos();
 }
 
 // The page as the hash names it: the view at once, the task once the registry answers
@@ -3089,8 +3151,10 @@ export function mountTasks() {
   inboxCountEl = document.getElementById("inboxcount");
   viewInbox = document.getElementById("view-inbox");
   viewAll = document.getElementById("view-all");
+  viewRepos = document.getElementById("view-repos");
   inboxView = document.getElementById("inbox-view");
   allView = document.getElementById("all-view");
+  reposSection = document.getElementById("repos-view");
   flaggedEl = document.getElementById("flagged");
   flaggedLineEl = document.getElementById("flagged-line");
   flaggedBody = document.getElementById("flagged-notes");
@@ -3156,6 +3220,13 @@ export function mountTasks() {
   // The views are on the list, never on screen with a task open, so they name none.
   viewInbox.addEventListener("click", () => goTo("inbox", null));
   viewAll.addEventListener("click", () => goTo("all", null));
+  viewRepos.addEventListener("click", () => goTo("repos", null));
+  // The Repos view, its writes under this page's one gate.
+  mountRepos();
+  repoHooks({ begin: beginRepoWrite, end: endRepoWrite, busy: () => writing !== null,
+              notRunning: () => setRunning(false), read: refreshRepos,
+              after: () => { refreshInbox(); refreshTasks(); },
+              spell: text => spellHidden(text).text });
   // A task opens from its #id button, the keyboard's way, or a click elsewhere on its row.
   listView.addEventListener("click", ev => {
     const btn = ev.target.closest("button[data-task]");

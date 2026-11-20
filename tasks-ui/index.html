@@ -236,6 +236,24 @@
   .create-form .moves button { font-size: 12px; padding: 4px 10px; }
   .parent-row { align-items: center; }
   .parent-row input[type="text"] { width: 14em; max-width: 100%; }
+  /* The Repos view: the add form above the list, as the create form is drawn. */
+  .repo-add, .repos .moves { align-items: center; }
+  .repo-add input[type="text"], .repos input[type="text"] { font: inherit; font-size: 13px;
+    background: #202632; color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 5px 8px; width: 14em; max-width: 100%; }
+  .repo-add button, .repos button { font-size: 12px; padding: 4px 10px; }
+  .repos td { vertical-align: top; }
+  .repos td.remote { color: var(--dim); white-space: nowrap; }
+  /* Narrow, a row is a block of its cells, one under another, rather than five columns
+     wider than the window. */
+  @media (max-width: 760px) {
+    .repos thead { display: none; }
+    .repos tr, .repos td { display: block; }
+    .repos tr { padding: 6px 0; border-bottom: 1px solid var(--line); }
+    .repos td { border-bottom: none; padding: 2px 0; }
+  }
+  .repo-outcome { min-height: 2.5em; }
+  .repo-warn { padding: 2px 0 0; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -264,6 +282,7 @@
         <button type="button" id="view-inbox" aria-pressed="true">Inbox
           <span class="note" id="inboxcount"></span></button>
         <button type="button" id="view-all" aria-pressed="false">All tasks</button>
+        <button type="button" id="view-repos" aria-pressed="false">Repos</button>
       </nav>
       <section id="inbox-view">
         <!-- The notes flagged for you, to handle together: above the sections the
@@ -319,6 +338,32 @@
           <button type="button" id="tasks-newest" hidden>&larr; newest</button>
           <button type="button" id="tasks-older" hidden>older &rarr;</button>
         </div>
+      </section>
+      <!-- The repo list you keep, and its writes (repos.js): the add form is markup, so
+           what is typed in it outlives every draw; the rows are drawn from the list's
+           one read (refreshRepos in tasks.js), each keeping what was typed in it. -->
+      <section id="repos-view" hidden>
+        <h2>Repos</h2>
+        <div class="empty">
+          The repos agents file tasks in. A repo's agents learn its name from the repo's
+          instructions file. None is ever removed: a retired one keeps its tasks and
+          takes no new ones until it is brought back.
+        </div>
+        <div class="moves repo-add">
+          <input type="text" id="repo-add-name" autocomplete="off" spellcheck="false"
+                 placeholder="name" aria-label="the new repo's name">
+          <input type="text" id="repo-add-remote" autocomplete="off" spellcheck="false"
+                 placeholder="remote, if any: host/owner/repo"
+                 aria-label="the new repo's remote">
+          <button type="button" id="repo-add" data-repo-write="add">add a repo</button>
+        </div>
+        <div class="repo-outcome empty" id="repos-outcome"></div>
+        <table class="repos">
+          <thead><tr><th>repo</th><th>remote</th><th>rename</th><th>set the remote</th>
+            <th>retire</th></tr></thead>
+          <tbody id="repos"></tbody>
+        </table>
+        <div class="empty" id="repos-empty" hidden>No repos yet: add one above.</div>
       </section>
     </div>
     <!-- An open task, the window's width. The strip and its back control are markup,

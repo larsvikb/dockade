@@ -21,6 +21,7 @@ from typing import ClassVar
 from unittest import mock
 from urllib.parse import urlsplit
 
+from _loader import load_task_registry
 from _ui import load_ui, ok_host, sent
 from test_control_plane_ui import ui as approval_ui
 
@@ -34,11 +35,15 @@ def _load(name: str = "dockade_tasks_ui") -> types.ModuleType:
 tui = _load()
 
 #: The writes the relay passes, each as the page posts it: a new task, the six on a
-#: task, and the three on notes, which name no task.
+#: task, the three on notes, which name no task, and the four on the repo list: a new
+#: repo, its name in the body, and the three that name one in the path.
 WRITES = ("api/tasks", "api/tasks/12/move", "api/tasks/12/approve",
           "api/tasks/12/break-claim", "api/tasks/12/edit", "api/tasks/12/reparent",
           "api/tasks/12/notes", "api/notes/hide", "api/notes/3/handle",
-          "api/notes/handle")
+          "api/notes/handle", "api/repos", "api/repos/acme/rename",
+          "api/repos/acme/remote", "api/repos/acme/retire")
+#: The repo writes that name a repo in the path.
+REPO_ROUTES = ("rename", "remote", "retire")
 
 
 class RelayTests(unittest.TestCase):
@@ -94,7 +99,13 @@ class RelayTests(unittest.TestCase):
                              ("api/notes/3/hide", "POST"), ("api/notes/3", "GET"),
                              ("api/notes/flagged", "POST"),
                              ("api/tasks/12/plans", "POST"), ("api/inbox", "POST"),
-                             ("api/repos", "POST"), ("api/tasks/abc", "GET"),
+                             # A repo's writes by GET; add's path by GET is the list.
+                             ("api/repos/acme/rename", "GET"),
+                             ("api/repos/acme/remote", "GET"),
+                             ("api/repos/acme/retire", "GET"),
+                             ("api/repos/acme", "GET"), ("api/repos/acme", "POST"),
+                             ("api/repos/acme/delete", "POST"),
+                             ("api/tasks/abc", "GET"),
                              ("api/tasks/1/../../../api/audit", "GET"),
                              ("api/tasks/12345678901234567890", "GET"),
                              ("tasks/api/repos", "GET"), ("api/audit", "GET"),
@@ -107,6 +118,33 @@ class RelayTests(unittest.TestCase):
                 self.assertEqual(resp.status_code, 403)
                 self.assertTrue(resp.body.startswith("refused by tasks-ui: "))
                 self.assertEqual(sent, {})
+
+    def test_a_repo_in_the_path_is_held_to_the_registrys_name(self):
+        # As an id is held to bounded digits: a name the registry could not have, or one
+        # shaped as a path, reaches nothing, on each route that names one. The longest
+        # name it takes reaches it.
+        for route in REPO_ROUTES:
+            for name in ("Acme", "acmE", "-acme", "a" * 64, "", "..", ".", "a%2Fb",
+                         "a/b", "acme/x/..", "acme_1", "acme ", "\u0430cme"):
+                path = f"api/repos/{name}/{route}"
+                with self.subTest(path=path):
+                    resp = self._proxy(path, "POST")
+                    self.assertEqual(resp.status_code, 403)
+                    self.assertEqual(sent, {})
+            with self.subTest(route=route, extra="segment"):
+                self.assertEqual(self._proxy(f"api/repos/acme/{route}/x", "POST")
+                                 .status_code, 403)
+                self.assertEqual(sent, {})
+            for name in ("a" * 63, "0", "a-", "0-widgets-9"):
+                path = f"api/repos/{name}/{route}"
+                with self.subTest(path=path):
+                    self.assertNotEqual(self._proxy(path, "POST").status_code, 403)
+                    self.assertEqual((sent["method"], sent["url"]),
+                                     ("POST", f"{tui.REGISTRY_URL}/{path}"))
+
+    def test_the_repo_name_is_the_registrys_own(self):
+        # The relay cannot import the registry, so its copy is held here.
+        self.assertEqual(tui._REPO_NAME, load_task_registry().tasks.REPO_NAME_RE.pattern)
 
     def test_a_relayed_path_with_a_trailing_newline_is_refused(self):
         # As the approval UI's: `$` matches before a final newline, so the table is

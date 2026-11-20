@@ -13,10 +13,14 @@ const ZWSP = "\u200B";
 // As `operator_moves.PAGE`: how many entries a page of a task's history holds.
 const PAGE = 50;
 
-const REPOS = [
-  { name: "dockade", retired: false },
-  { name: "old-repo", retired: true },
+// The repo list, sorted by name as `reads.repos` reads it, which the Repos view's writes
+// change. The open tasks below are listed under whatever the first of them is named now
+// (`home`), so a rename of it keeps its tasks.
+let REPOS = [
+  { name: "dockade", remote: null, retired: false },
+  { name: "old-repo", remote: null, retired: true },
 ];
+let home = "dockade";
 
 const claim = {
   holder: "claude-3f2a9c1e-0000-4000-8000-000000000001", branch: "tasks-ui",
@@ -686,7 +690,42 @@ function everyState(repo) {
            total: all.length };
 }
 
+// A repo write, as `operator_moves` makes it: an add, a rename, a remote set or removed,
+// a retire or a bring-back, each refused as the registry refuses it where a step needs.
+function repoWrite(path, body) {
+  const done = { status: 200, json: { ok: true } };
+  if (path === "/api/repos") {
+    if (REPOS.some(r => r.name === body.name)) {
+      return refused(`repo '${body.name}' already exists`);
+    }
+    REPOS = [...REPOS, { name: body.name, remote: body.remote ?? null, retired: false }]
+      .sort((a, b) => (a.name < b.name ? -1 : 1));
+    return lost(done);
+  }
+  const [, name, what] = path.match(/^\/api\/repos\/([^/]+)\/(rename|remote|retire)$/)
+    || [];
+  if (!name) return null;
+  const repo = REPOS.find(r => r.name === name);
+  if (!repo) {
+    return { status: 404, json: { ok: false, current: null, detail: `no repo '${name}'` } };
+  }
+  if (what === "rename") {
+    if (REPOS.some(r => r.name === body.new_name)) {
+      return refused(`repo '${body.new_name}' already exists`);
+    }
+    if (home === repo.name) home = body.new_name;
+    repo.name = body.new_name;
+    REPOS.sort((a, b) => (a.name < b.name ? -1 : 1));
+  } else if (what === "remote") {
+    repo.remote = body.remote;
+  } else {
+    repo.retired = body.retired;
+  }
+  return lost(done);
+}
+
 function write(path, body) {
+  if (path.startsWith("/api/repos")) return repoWrite(path, body);
   if (path.startsWith("/api/notes/")) return lost(noteWrite(path, body));
   if (path === "/api/tasks") return createWrite(body);
   const m = path
@@ -795,7 +834,7 @@ export function respond(method, path, body, params) {
     return { status: 200, json: everyState(params.get("repo")) };
   }
   if (path === "/api/tasks") {
-    const rows = params.get("repo") === "dockade" && params.get("state") === "open"
+    const rows = params.get("repo") === home && params.get("state") === "open"
       ? TASKS : [];
     return { status: 200, json: { tasks: rows, total: rows.length } };
   }
@@ -810,14 +849,14 @@ export function respond(method, path, body, params) {
 }
 
 // tasks.test.js's, never the scenario's: each test starts from `reset()`, the tasks,
-// histories, notes and plans as this module first built them, the registry up and no
+// histories, notes, plans and repos as this module first built them, the registry up and no
 // answer to lose. One clone of them all, so a note a task, a history and the flagged
 // list share stays one note. ui-diff never calls it, so a step's writes still carry to
 // the next there.
-const START = structuredClone({ WRITTEN, HISTORIES, NOTES, PLANS, READ, nextNote,
-                                nextEntry, nextTask });
+const START = structuredClone({ WRITTEN, HISTORIES, NOTES, PLANS, READ, REPOS, home,
+                                nextNote, nextEntry, nextTask });
 export function reset() {
-  ({ WRITTEN, HISTORIES, NOTES, PLANS, READ, nextNote, nextEntry, nextTask }
+  ({ WRITTEN, HISTORIES, NOTES, PLANS, READ, REPOS, home, nextNote, nextEntry, nextTask }
     = structuredClone(START));
   registryUp = true;
   loseNext = false;

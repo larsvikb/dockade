@@ -199,6 +199,12 @@ console.log(JSON.stringify({
       all_none: t.hashFor("all", null),
       all_task: t.hashFor("all", 7),
       round_trip: t.parseHash(t.hashFor("all", "9")),
+      repos: t.parseHash("#view=repos"),
+      repos_task: t.parseHash("#view=repos&task=4"),
+      repos_none: t.hashFor("repos", null),
+      repos_round_trip: t.parseHash(t.hashFor("repos", "4")),
+      unknown_view: t.hashFor("audit", "4"),
+      views: t.VIEWS,
     },
     id_max: t.ID_MAX,
     no_task: [t.badTaskText("a\u202eb"), t.unknownTaskText("999")],
@@ -452,6 +458,13 @@ class TaskViewTests(unittest.TestCase):
         self.assertEqual((h["inbox_none"], h["inbox_task"], h["all_none"], h["all_task"]),
                          ("", "#task=14", "#view=all", "#view=all&task=7"))
         self.assertEqual(h["round_trip"], {"view": "all", "task": "9", "bad": None})
+        # Repos is a view of its own, kept with a task as the others are.
+        self.assertEqual(h["repos"], {"view": "repos", "task": None, "bad": None})
+        self.assertEqual(h["repos_task"], {"view": "repos", "task": "4", "bad": None})
+        self.assertEqual(h["repos_none"], "#view=repos")
+        self.assertEqual(h["repos_round_trip"], {"view": "repos", "task": "4", "bad": None})
+        self.assertEqual(h["unknown_view"], "#task=4")
+        self.assertEqual(h["views"], ["inbox", "all", "repos"])
         # As a row names it, so the row is marked and not read twice; never through a
         # Number, which would round an id past 2^53.
         self.assertEqual(h["zeros"]["task"], "6")
@@ -2398,16 +2411,19 @@ class TaskWriteSourceTests(unittest.TestCase):
 
     TASKS = (TASKS_DIR / "tasks.js").read_text()
     MOVES = (TASKS_DIR / "moves.js").read_text()
+    REPOS = (TASKS_DIR / "repos.js").read_text()
     POST = re.compile(r'fetch\(`([^`]+)`,\s*\{\s*method: "POST"')
 
     def _function(self, src: str, name: str) -> str:
         return re.search(rf"^(?:export )?(?:async )?function {name}\(.*?^\}}", src,
                          re.M | re.S).group(0)
 
-    def test_each_relayed_post_is_a_post_fetch_in_moves_js_and_back(self):
-        # PageChecks matches paths, not methods: this holds the methods.
-        posts = [re.sub(r"\$\{[^}]*\}", "1", p) for p in self.POST.findall(self.MOVES)]
-        self.assertEqual(len(posts), 10)
+    def test_each_relayed_post_is_a_post_fetch_in_moves_js_or_repos_js_and_back(self):
+        # PageChecks matches paths, not methods: this holds the methods. The task and
+        # note writes are moves.js's, the repo list's repos.js's.
+        posts = [re.sub(r"\$\{[^}]*\}", "1", p)
+                 for p in self.POST.findall(self.MOVES) + self.POST.findall(self.REPOS)]
+        self.assertEqual(len(posts), 14)
         routes = [rx for method, rx in tui._RELAY_ROUTES if method == "POST"]
         for path in posts:
             with self.subTest(path=path):
@@ -2415,13 +2431,107 @@ class TaskWriteSourceTests(unittest.TestCase):
         for rx in routes:
             with self.subTest(route=rx.pattern):
                 self.assertTrue(any(rx.match(p) for p in posts), rx.pattern)
-        # Every fetch in moves.js is one of them; tasks.js posts nothing.
+        # Every fetch in moves.js and repos.js is one of them; tasks.js posts nothing.
         self.assertEqual(len(re.findall(r"\bfetch\(", self.MOVES)), 10)
+        self.assertEqual(len(re.findall(r"\bfetch\(", self.REPOS)), 4)
         self.assertNotIn("method:", self.TASKS)
 
     def test_moves_js_imports_nothing_of_tasks_js(self):
         self.assertNotRegex(self.MOVES, r'from\s+"\./tasks\.js"')
         self.assertNotIn("document", _code(self.MOVES))
+
+    def test_repos_js_imports_nothing_of_tasks_js_and_no_document_at_import(self):
+        self.assertNotRegex(self.REPOS, r'from\s+"\./tasks\.js"')
+        self.assertEqual(re.findall(r'^import .* from "(\./[^"]+)";$', self.REPOS, re.M),
+                         ["./moves.js"])
+        # The document only inside its functions: no top-level line reaches it, so
+        # `RepoTests` imports it under node.
+        top = [ln for ln in _code(self.REPOS).splitlines()
+               if ln and not ln[0].isspace() and "document" in ln]
+        self.assertEqual(top, [])
+
+    def test_a_repo_write_goes_through_the_one_gate(self):
+        # The page's own `writing`, so one write is out page-wide; the view's controls
+        # among those markWriting turns off.
+        begin = self._function(self.TASKS, "beginRepoWrite")
+        self.assertEqual([ln.strip() for ln in begin.splitlines()[1:5]],
+                         ["if (writing || !registryIsRunning()) return false;",
+                          "writing = write;", "markWriting();", "return true;"])
+        self.assertEqual([ln.strip() for ln in
+                          self._function(self.TASKS, "endRepoWrite").splitlines()[1:3]],
+                         ["writing = null;", "markWriting();"])
+        self.assertIn("markRepos();", self._function(self.TASKS, "markWriting"))
+        self.assertIn("repoHooks({ begin: beginRepoWrite, end: endRepoWrite, "
+                      "busy: () => writing !== null,", self.TASKS)
+        run = self._function(self.REPOS, "runRepoWrite")
+        self.assertEqual(run.splitlines()[1].strip(),
+                         "if (!hooks || !hooks.begin(write)) return;")
+        # The list read again inside the gate, before it opens; the lost answer decided
+        # from that read, and the write sent once.
+        self.assertLess(run.index("sendRepoWrite(write)"), run.index("await hooks.read("))
+        self.assertLess(run.index("await hooks.read("),
+                        run.index("result = checkRepoWrite(write, read);"))
+        self.assertLess(run.index("result = checkRepoWrite(write, read);"),
+                        run.index("hooks.end();"))
+        self.assertEqual(run.count("sendRepoWrite("), 1)
+        self.assertEqual(len(re.findall(r"\brunRepoWrite\(", _code(self.REPOS))), 2,
+                         "defined once, called from the view's click")
+        mark = self._function(self.REPOS, "markRepos")
+        self.assertIn("const out = busy();", mark)
+        self.assertIn('for (const el of reposView.querySelectorAll("input")) '
+                      "el.disabled = out;", mark)
+        self.assertIn("repoAdd.disabled = out || !add;", mark)
+        self.assertIn("btn.disabled = out || !write;", mark)
+        self.assertIn("if (!btn || busy() || ev.detail > 1) return;", self.REPOS)
+        self.assertIn("return Boolean(hooks) && hooks.busy();",
+                      self._function(self.REPOS, "busy"))
+        # A 502 says not running, and the page's other reads wait for it to answer.
+        self.assertIn('if (result === "not-running") hooks.notRunning();', run)
+        self.assertIn('if (result !== "not-running") hooks.after();', run)
+        self.assertTrue(run.rstrip("}\n ").endswith(
+            'if (result !== "not-running") hooks.after();\n  return repoOutcome;'))
+        # The rename warning's line, and the remove control, only where they apply.
+        self.assertIn("el.hidden = !shown;", mark)
+        self.assertIn('if (typeof repo.remote === "string") remoteRow.appendChild('
+                      'repoButton("remove", repo.name));',
+                      self._function(self.REPOS, "repoRow"))
+        # The empty line shows with an empty list, and only then.
+        self.assertIn("reposEmpty.hidden = drawnRepos.length > 0;",
+                      self._function(self.REPOS, "renderRepos"))
+        # A refusal's reason is spelled as the page spells agent text.
+        self.assertIn("spell: text => spellHidden(text).text });", self.TASKS)
+        # The view is shown as the others are, by its own name.
+        self.assertIn('reposSection.hidden = name !== "repos";',
+                      self._function(self.TASKS, "showView"))
+
+    def test_a_rename_of_the_lists_repo_takes_the_select_with_it(self):
+        # A rename, landed or found, is read with what it renamed; the select follows it
+        # by the list read, and a repo gone otherwise starts the list again.
+        run = self._function(self.REPOS, "runRepoWrite")
+        self.assertIn('const renamed = write.kind === "rename" ? { from: write.repo, '
+                      "to: write.send.new_name }\n    : null;", run)
+        self.assertIn('const read = result === "not-running" ? null : '
+                      "await hooks.read(renamed);", run)
+        draw = self._function(self.TASKS, "drawRepos")
+        self.assertIn("const kept = followedRepo(chosen, renamed, repos);\n"
+                      "  if (kept !== null) tasksRepo.value = kept;\n"
+                      "  else if (chosen) resetList();", draw)
+        self.assertIn("renderRepos(repos);", draw)
+        self.assertTrue(self._function(self.TASKS, "refreshRepos").rstrip("}\n ")
+                        .endswith("return list;"))
+        self.assertIn("read: refreshRepos,", self.TASKS)
+        # A write's other reads after it, as runWrite's.
+        self.assertIn("after: () => { refreshInbox(); refreshTasks(); },", self.TASKS)
+
+    def test_a_landed_repo_write_drops_only_its_own_typed_text(self):
+        run = self._function(self.REPOS, "runRepoWrite")
+        self.assertIn('if (result === "landed" || result === "found") dropTyped(write);',
+                      run)
+        drop = self._function(self.REPOS, "dropTyped")
+        self.assertIn("drafts.delete(write.repo);", drop)
+        self.assertIn('} else if (write.kind === "remote" && write.send.remote !== null) {\n'
+                      '    draftOf(write.repo).remote = "";', drop)
+        self.assertEqual(re.findall(r"\bdrafts\.delete\(", self.REPOS), ["drafts.delete("])
 
     def test_one_write_at_a_time(self):
         body = self._function(self.TASKS, "runWrite")
@@ -2615,7 +2725,7 @@ class TaskPollingSourceTests(unittest.TestCase):
                          re.M | re.S).group(0)
 
     def test_every_registry_read_returns_early_unless_it_answers(self):
-        for name in ("refreshTasks", "refreshInbox", "readFlagged"):
+        for name in ("refreshTasks", "refreshInbox", "readFlagged", "refreshRepos"):
             with self.subTest(function=name):
                 body = self._function(self.TASKS, name)
                 first = body.split("\n")[1].strip()
@@ -2633,6 +2743,62 @@ class TaskPollingSourceTests(unittest.TestCase):
         # In turn, so a registry that stopped costs one failed call.
         self.assertIn("refreshInbox().then(() => refreshTasks()).then(() => "
                       "refreshOpenTask());", self.APP)
+
+    def test_no_poll_reads_the_repo_list_while_the_registry_answers(self):
+        # Its rows hold what is typed, so nothing redraws them unasked: the poll's
+        # chain never reads the list, and only these do. A poll that finds the registry
+        # back reads it through `probe`, while the view is hidden behind the line that
+        # says it is down.
+        for name in ("refreshInbox", "refreshTasks", "refreshOpenTask", "readFlagged"):
+            with self.subTest(function=name):
+                body = self._function(self.TASKS, name)
+                self.assertNotIn("/api/repos", body)
+                self.assertNotIn("refreshRepos(", body)
+        self.assertNotIn("refreshRepos", self.APP)
+        calls = sorted(ln.strip() for ln in re.findall(r"^.*\brefreshRepos\b.*$",
+                                                        self.TASKS, re.M)
+                       if "function refreshRepos" not in ln)
+        self.assertEqual(calls, [
+            "await refreshRepos();",
+            "if (entering) refreshRepos();",
+            'if (result === "refused") refreshRepos();',
+            "notRunning: () => setRunning(false), read: refreshRepos,"])
+        # Entering Repos, not a hash change that keeps the view.
+        view = self._function(self.TASKS, "showView")
+        self.assertIn('const entering = view !== "repos" && name === "repos";', view)
+        self.assertLess(view.index("const entering"), view.index("view = name;"))
+        # One read draws the view and the select both.
+        self.assertEqual(re.findall(r'fetch\("/api/repos"\)', self.TASKS),
+                         ['fetch("/api/repos")'])
+        probe = self._function(self.TASKS, "probe")
+        self.assertLess(probe.index("if (up) {"), probe.index("await refreshRepos();"))
+
+    def test_a_repo_list_read_overtaken_by_a_newer_one_draws_nothing(self):
+        # A read answered after a newer one was drawn has the older list: it draws
+        # nothing, but returns what it read, so a write whose read it is is settled
+        # from it rather than "could not check".
+        refresh = self._function(self.TASKS, "refreshRepos")
+        self.assertLess(refresh.index("const asked = ++reposAsks;"),
+                        refresh.index('fetch("/api/repos")'))
+        self.assertIn("  if (list !== null && asked > reposDrawn) {\n"
+                      "    reposDrawn = asked;\n    drawRepos(list, following);\n  }",
+                      refresh)
+        self.assertTrue(refresh.rstrip("}\n ").endswith(
+            "if (renamed) following = null;\n  return list;"))
+        self.assertEqual(refresh.count("return "), 2,
+                         "the early return unless the registry answers, and the list")
+        self.assertEqual(re.findall(r"\breposDrawn = ([^;]*);", self.TASKS), ["0", "asked"])
+        self.assertEqual(re.findall(r"\brepos = ([^;]*);", self.TASKS), ["[]", "list"])
+        self.assertIn("repos = list;", self._function(self.TASKS, "drawRepos"))
+        # A rename is followed by whichever read draws first once it is asked, so a
+        # read asked on entering Repos that overtakes the write's own follows it too;
+        # the write's read, done, stops it.
+        self.assertLess(refresh.index("if (renamed) following = renamed;"),
+                        refresh.index('fetch("/api/repos")'))
+        self.assertEqual(re.findall(r"\bfollowing = ([^;]*);", self.TASKS),
+                         ["null", "renamed", "null"])
+        draw = self._function(self.TASKS, "drawRepos")
+        self.assertIn("const kept = followedRepo(chosen, renamed, repos);", draw)
 
     def test_startup_asks_its_server_and_not_the_registry(self):
         start = self._function(self.APP, "start")
@@ -2690,8 +2856,11 @@ class TaskPollingSourceTests(unittest.TestCase):
         self.assertLess(run.index("await readFlagged(true);"), run.index("writing = null;"))
         self.assertIn('if (btn.dataset.flagged === "show") {\n      readFlagged(true);',
                       self.TASKS)
-        self.assertIn('const back = view === "all" && name === "inbox";',
-                      self._function(self.TASKS, "showView"))
+        # Back from All tasks or Repos; and a bulk's outcome lasts until another view.
+        view = self._function(self.TASKS, "showView")
+        self.assertIn('const back = view !== "inbox" && name === "inbox";', view)
+        self.assertIn('if (name !== "inbox") flaggedOutcome = null;', view)
+        self.assertLess(view.index("const back"), view.index("view = name;"))
         # Selection is ids, kept for those still drawn but a note parked since.
         self.assertIn("flaggedSelected = keptSelection(flaggedSelected, flaggedRead.notes);",
                       read)
@@ -4432,6 +4601,469 @@ class ReparentRuleTests(_OperatorStore):
         self.assertEqual(none, [None])
 
 
+_REPOS_PROBE = r"""
+import { pathToFileURL } from "node:url";
+const r = await import(pathToFileURL(`${process.env.DOCKADE_UI_DIR}/repos.js`).href);
+const t = await import(pathToFileURL(`${process.env.DOCKADE_UI_DIR}/tasks.js`).href);
+const acme = {name: "acme", remote: "github.com/acme/acme", retired: false};
+const bare = {name: "bare", remote: null, retired: false};
+const old = {name: "old", remote: null, retired: true};
+// What each puts on the wire, with fetch stubbed.
+const sent = [];
+globalThis.fetch = (url, opts) => {
+  sent.push({url, method: opts.method, body: JSON.parse(opts.body)});
+  return Promise.resolve({status: 200, text: async () => '{"ok": true}'});
+};
+const add = {kind: "add", repo: null, send: {name: "widgets", remote: null}};
+const addRemote = {kind: "add", repo: null,
+                   send: {name: "widgets", remote: "github.com/acme/widgets"}};
+const rename = {kind: "rename", repo: "acme", send: {new_name: "widgets"}};
+const setRemote = {kind: "remote", repo: "bare", send: {remote: "github.com/acme/bare"},
+                   was: null};
+const remove = {kind: "remote", repo: "acme", send: {remote: null},
+                was: "github.com/acme/acme"};
+const retire = {kind: "retire", repo: "acme", send: {retired: true}};
+const back = {kind: "retire", repo: "old", send: {retired: false}};
+// A name is encoded into its path, though the registry's never needs it.
+const odd = {kind: "rename", repo: "a/b?c", send: {new_name: "x"}};
+for (const w of [add, addRemote, rename, setRemote, remove, retire, back, odd]) {
+  await r.sendRepoWrite(w);
+}
+let unknown = null;
+try { r.sendRepoWrite({kind: "delete", repo: "acme", send: {}}); }
+catch (e) { unknown = e.message; }
+// The runner, with fetch and the page's hooks stubbed: what each answer comes to.
+async function runWith(answer, write, listed, open = true) {
+  const calls = [];
+  let posts = 0;
+  globalThis.fetch = () => { posts += 1; return Promise.resolve(answer); };
+  r.repoHooks({
+    begin: () => { calls.push("begin"); return open; },
+    end: () => calls.push("end"), busy: () => false,
+    notRunning: () => calls.push("notRunning"),
+    read: async renamed => { calls.push(`read:${JSON.stringify(renamed)}`); return listed; },
+    after: () => calls.push("after"),
+    spell: text => { calls.push("spell"); return `<${text}>`; },
+  });
+  const out = await r.runRepoWrite({...write, verb: write.verb});
+  return {out: out ?? null, calls, sent: posts};
+}
+const reply = (status, text) => ({status, text: async () => text});
+const addW = {kind: "add", repo: null, send: {name: "widgets", remote: null},
+              verb: "add widgets, no remote"};
+const renameW = {kind: "rename", repo: "acme", send: {new_name: "widgets"},
+                 verb: "rename acme to widgets"};
+const runs = {
+  refused: await runWith(reply(400,
+    JSON.stringify({ok: false, current: null, detail: "repo 'w\u034fidgets' exists"})),
+    addW, []),
+  guard: await runWith(reply(403, "refused by tasks-ui: no"), addW, []),
+  lost: await runWith(reply(504, JSON.stringify({ok: false, current: null, detail: "x"})),
+    renameW, [{name: "widgets", remote: null, retired: false}]),
+  down: await runWith(reply(502, JSON.stringify({ok: false, current: null, detail: "x"})),
+    addW, null),
+  shut: await runWith(reply(200, '{"ok": true}'), addW, [], false),
+};
+delete runs.refused.sent; delete runs.guard.sent; delete runs.lost.sent;
+delete runs.down.sent;
+globalThis.fetch = (url, opts) => {
+  sent.push({url, method: opts.method, body: JSON.parse(opts.body)});
+  return Promise.resolve({status: 200, text: async () => '{"ok": true}'});
+};
+// An unrelated repo added between the draw and the read again changes nothing.
+const extra = {name: "zzz", remote: null, retired: false};
+const list = (...repos) => [...repos, extra];
+const check = (w, ...repos) => r.checkRepoWrite(w, list(...repos));
+const failed = w => [null, undefined, {repos: []}].map(read => r.checkRepoWrite(w, read));
+console.log(JSON.stringify({
+  requests: {
+    add: r.addRequest("widgets", ""),
+    add_remote: r.addRequest("widgets", "github.com/acme/widgets"),
+    add_no_remote: r.addRequest("widgets", undefined),
+    add_nothing: r.addRequest("", "github.com/acme/widgets"),
+    add_not_text: r.addRequest(null, ""),
+    add_number: r.addRequest(5, ""),
+    add_number_remote: r.addRequest("widgets", 5),
+    // Sent as typed: the registry says what is wrong with it.
+    add_as_typed: r.addRequest(" Acme", " x"),
+    rename: r.renameRequest(acme, "widgets"),
+    rename_same: r.renameRequest(acme, "acme"),
+    rename_nothing: r.renameRequest(acme, ""),
+    rename_not_text: r.renameRequest(acme, null),
+    rename_number: r.renameRequest(acme, 7),
+    rename_no_repo: r.renameRequest(null, "widgets"),
+    remote: r.remoteRequest(bare, "github.com/acme/bare"),
+    remote_other: r.remoteRequest(acme, "github.com/acme/other"),
+    remote_same: r.remoteRequest(acme, "github.com/acme/acme"),
+    remote_nothing: r.remoteRequest(acme, ""),
+    remote_not_text: r.remoteRequest(acme, undefined),
+    remote_number: r.remoteRequest(acme, 7),
+    remote_no_repo: r.remoteRequest(null, "github.com/acme/bare"),
+    remove: r.removeRemoteRequest(acme),
+    remove_none: r.removeRemoteRequest(bare),
+    remove_no_repo: r.removeRemoteRequest(undefined),
+    retire: r.retireRequest(acme),
+    back: r.retireRequest(old),
+    retire_no_repo: r.retireRequest(null),
+  },
+  wire: sent,
+  unknown,
+  checks: {
+    add: {
+      found: check(add, {name: "widgets", remote: null, retired: false}),
+      found_remote: check(addRemote, {name: "widgets", remote: "github.com/acme/widgets",
+                                      retired: false}),
+      not_seen: check(add, acme),
+      other_remote: check(add, {name: "widgets", remote: "github.com/acme/other",
+                                retired: false}),
+      retired: check(add, {name: "widgets", remote: null, retired: true}),
+      failed: failed(add),
+    },
+    rename: {
+      found: check(rename, {...acme, name: "widgets"}),
+      not_seen: check(rename, acme),
+      both: check(rename, acme, {...acme, name: "widgets"}),
+      neither: check(rename, bare),
+      failed: failed(rename),
+    },
+    remote: {
+      found: check(setRemote, {...bare, remote: "github.com/acme/bare"}),
+      not_seen: check(setRemote, bare),
+      third: check(setRemote, {...bare, remote: "github.com/acme/third"}),
+      gone: check(setRemote, acme),
+      removed: check(remove, {...acme, remote: null}),
+      not_removed: check(remove, acme),
+      removed_third: check(remove, {...acme, remote: "github.com/acme/third"}),
+      // An entry with no remote field reads as none.
+      removed_absent: check(remove, {name: "acme", retired: false}),
+      // A hole in the list is passed over.
+      hole: r.checkRepoWrite(setRemote, [null, {...bare, remote: "github.com/acme/bare"}]),
+      failed: failed(setRemote),
+    },
+    retire: {
+      found: check(retire, {...acme, retired: true}),
+      not_seen: check(retire, acme),
+      back: check(back, {...old, retired: false}),
+      not_back: check(back, old),
+      // An entry with no retired field reads as active.
+      back_absent: check(back, {name: "old", remote: null}),
+      gone: check(retire, bare),
+      failed: failed(retire),
+    },
+    unknown_kind: r.checkRepoWrite({kind: "delete", repo: "acme", send: {}}, [acme]),
+  },
+  followed: {
+    kept: r.followedRepo("acme", null, [acme, bare]),
+    renamed: r.followedRepo("acme", {from: "acme", to: "widgets"}, [bare, {name: "widgets"}]),
+    // Not yet landed: the old name is still listed, and stays chosen.
+    not_landed: r.followedRepo("acme", {from: "acme", to: "widgets"}, [acme, bare]),
+    // Another repo's rename leaves the choice where it is.
+    other: r.followedRepo("bare", {from: "acme", to: "widgets"}, [bare, {name: "widgets"}]),
+    // A chosen repo gone is not taken to another repo's new name.
+    other_gone: r.followedRepo("bare", {from: "acme", to: "widgets"}, [{name: "widgets"}]),
+    // Gone, renamed elsewhere or never landed: none.
+    gone: r.followedRepo("acme", null, [bare]),
+    gone_renamed_away: r.followedRepo("acme", {from: "acme", to: "widgets"}, [bare]),
+    nothing_chosen: r.followedRepo("", null, [acme]),
+    failed: r.followedRepo("acme", null, null),
+  },
+  labels: {
+    add: r.addLabel({name: "widgets", remote: null}),
+    add_remote: r.addLabel({name: "widgets", remote: "github.com/acme/widgets"}),
+    add_nothing: r.addLabel(null),
+    rename: r.renameLabel(acme, {new_name: "widgets"}),
+    rename_nothing: r.renameLabel(acme, null),
+    remote: r.remoteLabel(bare, {remote: "github.com/acme/bare"}),
+    remote_nothing: r.remoteLabel(bare, null),
+    remove: r.removeRemoteLabel(acme),
+    retire: r.retireLabel(acme),
+    back: r.retireLabel(old),
+  },
+  warning: [r.renameWarning("widgets"), r.renameWarning(""), r.renameWarning(null)],
+  texts: Object.fromEntries([
+    ["landed", "landed"], ["found", "found"], ["refused", "refused"],
+    ["not_running", "not-running"], ["not_seen", "not-seen"], ["changed", "changed"],
+    ["could_not_check", "could-not-check"], ["other", "unknown"],
+  ].flatMap(([key, outcome]) => [
+    [`add_${key}`, r.repoOutcomeText({...add, verb: "add widgets, no remote"}, outcome,
+                                     "repo 'widgets' already exists")],
+    [`rename_${key}`, r.repoOutcomeText({...rename, verb: "rename acme to widgets"},
+                                        outcome, "repo 'widgets' already exists")],
+    [`retire_${key}`, r.repoOutcomeText({...retire, verb: "retire acme: no new tasks"},
+                                        outcome, null)],
+  ])),
+  no_repos: t.NO_REPOS_TEXT,
+  runs,
+}));
+"""
+
+
+@unittest.skipIf(not _NODE and not _STRICT,
+                 "node is not installed — skipping app.js unit tests")
+class RepoTests(unittest.TestCase):
+    """The Repos view's pure half (``repos.js``): each write's body and path, and how a
+    lost one is settled from the repo list read again, since repos carry no revision."""
+
+    probe: dict
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        proc = subprocess.run(  # noqa: S603 (absolute path, fixed args, as _probe)
+            [_NODE, "--input-type=module", "-e", _REPOS_PROBE],
+            env={**os.environ, "DOCKADE_UI_DIR": str(_served_dir(TASKS_DIR))},
+            capture_output=True, text=True, timeout=60, check=False)
+        if proc.returncode != 0:
+            raise AssertionError("importing repos.js under node failed:\\n" + proc.stderr)
+        cls.probe = json.loads(proc.stdout)
+
+    def test_each_request_is_the_body_its_route_takes_or_nothing(self):
+        r = self.probe["requests"]
+        self.assertEqual(r["add"], {"name": "widgets", "remote": None})
+        self.assertEqual(r["add_remote"], {"name": "widgets",
+                                           "remote": "github.com/acme/widgets"})
+        self.assertEqual(r["add_no_remote"], {"name": "widgets", "remote": None})
+        self.assertEqual(r["add_as_typed"], {"name": " Acme", "remote": " x"})
+        self.assertEqual(r["rename"], {"new_name": "widgets"})
+        self.assertEqual(r["remote"], {"remote": "github.com/acme/bare"})
+        self.assertEqual(r["remote_other"], {"remote": "github.com/acme/other"})
+        # A removal sends null, never an absent remote, which would not read as "none".
+        self.assertEqual(r["remove"], {"remote": None})
+        self.assertEqual(r["retire"], {"retired": True})
+        self.assertEqual(r["back"], {"retired": False})
+        self.assertEqual(r["add_number_remote"], {"name": "widgets", "remote": None})
+        for key in ("add_nothing", "add_not_text", "add_number", "rename_same",
+                    "rename_nothing", "rename_not_text", "rename_number", "rename_no_repo",
+                    "remote_same", "remote_nothing", "remote_not_text", "remote_number",
+                    "remote_no_repo", "remove_none", "remove_no_repo", "retire_no_repo"):
+            with self.subTest(case=key):
+                self.assertIsNone(r[key])
+        # Each field the registry's model names, and no other.
+        for model, key in ((_api.AddRepo, "add_remote"), (_api.RenameRepo, "rename"),
+                           (_api.SetRemote, "remove"), (_api.RetireRepo, "retire")):
+            with self.subTest(model=model.__name__):
+                self.assertEqual(set(r[key]), set(model.__annotations__))
+
+    def test_each_is_posted_to_its_route_naming_its_repo(self):
+        def post(url, body):
+            return {"url": url, "method": "POST", "body": body}
+        self.assertEqual(self.probe["wire"], [
+            post("/api/repos", {"name": "widgets", "remote": None}),
+            post("/api/repos", {"name": "widgets", "remote": "github.com/acme/widgets"}),
+            post("/api/repos/acme/rename", {"new_name": "widgets"}),
+            post("/api/repos/bare/remote", {"remote": "github.com/acme/bare"}),
+            post("/api/repos/acme/remote", {"remote": None}),
+            post("/api/repos/acme/retire", {"retired": True}),
+            post("/api/repos/old/retire", {"retired": False}),
+            post("/api/repos/a%2Fb%3Fc/rename", {"new_name": "x"})])
+        for call in self.probe["wire"][:-1]:
+            with self.subTest(url=call["url"]):
+                self.assertTrue(tui._relay_allowed("POST", call["url"]))
+        self.assertEqual(self.probe["unknown"], "no such write: delete")
+
+    def test_a_lost_write_is_settled_by_the_named_repo_alone(self):
+        c = self.probe["checks"]
+        failed = ["could-not-check"] * 3
+        self.assertEqual(c["add"], {
+            "found": "found", "found_remote": "found", "not_seen": "not-seen",
+            "other_remote": "changed", "retired": "changed", "failed": failed})
+        self.assertEqual(c["rename"], {
+            "found": "found", "not_seen": "not-seen", "both": "changed",
+            "neither": "changed", "failed": failed})
+        self.assertEqual(c["remote"], {
+            "found": "found", "not_seen": "not-seen", "third": "changed",
+            "gone": "changed", "removed": "found", "not_removed": "not-seen",
+            "removed_third": "changed", "removed_absent": "found", "hole": "found",
+            "failed": failed})
+        self.assertEqual(c["retire"], {
+            "found": "found", "not_seen": "not-seen", "back": "found",
+            "not_back": "not-seen", "back_absent": "found", "gone": "changed",
+            "failed": failed})
+        self.assertEqual(c["unknown_kind"], "changed")
+
+    def test_the_select_follows_a_rename_once_listed_and_lets_a_gone_repo_go(self):
+        self.assertEqual(self.probe["followed"], {
+            "kept": "acme", "renamed": "widgets", "not_landed": "acme", "other": "bare",
+            "other_gone": None,
+            "gone": None, "gone_renamed_away": None, "nothing_chosen": None,
+            "failed": None})
+
+    def test_each_label_names_its_outcome(self):
+        self.assertEqual(self.probe["labels"], {
+            "add": "add widgets, no remote",
+            "add_remote": "add widgets, remote github.com/acme/widgets",
+            "add_nothing": "add a repo",
+            "rename": "rename acme to widgets", "rename_nothing": "rename acme",
+            "remote": "set bare's remote to github.com/acme/bare",
+            "remote_nothing": "set bare's remote",
+            "remove": "remove acme's remote github.com/acme/acme",
+            "retire": "retire acme: no new tasks", "back": "bring old back"})
+
+    def test_a_rename_says_the_instructions_file_must_name_it(self):
+        self.assertEqual(self.probe["warning"], [
+            "The repo's instructions file must name widgets before its agents can write "
+            "again.",
+            "The repo's instructions file must name the new name before its agents can "
+            "write again.",
+            "The repo's instructions file must name the new name before its agents can "
+            "write again."])
+        t = self.probe["texts"]
+        warning = self.probe["warning"][0]
+        self.assertEqual(t["rename_landed"], {
+            "text": f"Rename acme to widgets: done. {warning}", "warn": True})
+        self.assertEqual(t["rename_found"], {
+            "text": "Rename acme to widgets: no answer came, but the repo list shows it "
+                    f"landed. {warning}", "warn": True})
+        # Only a rename that landed says so.
+        for key, said in t.items():
+            if key not in ("rename_landed", "rename_found"):
+                with self.subTest(case=key):
+                    self.assertNotIn("instructions file", said["text"])
+        # And the view points at it beside the add form, before any rename.
+        html = (TASKS_DIR / "index.html").read_text()
+        view = html[html.index('<section id="repos-view"'):]
+        self.assertIn("instructions file", view[:view.index("</section>")])
+
+    def test_each_outcome_says_what_happened(self):
+        t = self.probe["texts"]
+        self.assertEqual(t["add_landed"], {"text": "Add widgets, no remote: done.",
+                                           "warn": False})
+        self.assertEqual(t["retire_landed"], {"text": "Retire acme: no new tasks: done.",
+                                              "warn": False})
+        self.assertEqual(t["add_found"], {
+            "text": "Add widgets, no remote: no answer came, but the repo list shows it "
+                    "landed.", "warn": False})
+        self.assertEqual(t["add_refused"], {
+            "text": "Add widgets, no remote: refused. repo 'widgets' already exists",
+            "warn": True})
+        self.assertEqual(t["retire_refused"]["text"], "Retire acme: no new tasks: refused.")
+        self.assertEqual(t["retire_not_running"]["text"],
+                         "Retire acme: no new tasks: not sent. The task registry is not "
+                         "running.")
+        # Not seen is safe to send again, and says why, by the write.
+        self.assertTrue(t["add_not_seen"]["text"].endswith(
+            "sending it again is safe, since a second would be refused."))
+        self.assertTrue(t["rename_not_seen"]["text"].endswith(
+            "sending it again is safe, since a second would be refused."))
+        self.assertTrue(t["retire_not_seen"]["text"].endswith(
+            "sending it again is safe, since it sets the same value."))
+        self.assertIn("the repo list has changed, but not as this would have",
+                      t["add_changed"]["text"])
+        self.assertIn("could not be read again, so whether it landed is not known",
+                      t["add_could_not_check"]["text"])
+        for key in ("changed", "could_not_check", "other"):
+            for write in ("add", "rename", "retire"):
+                with self.subTest(case=f"{write}_{key}"):
+                    self.assertTrue(t[f"{write}_{key}"]["warn"])
+                    self.assertNotIn("safe", t[f"{write}_{key}"]["text"])
+        for write in ("add", "rename", "retire"):
+            for key in ("refused", "not_running", "not_seen"):
+                with self.subTest(case=f"{write}_{key}"):
+                    self.assertTrue(t[f"{write}_{key}"]["warn"])
+
+    def test_the_runner_draws_the_reason_spelled_and_reads_the_list_after(self):
+        runs = self.probe["runs"]
+        # A refusal shows the registry's reason, spelled, never its JSON; the relay's
+        # own refusal is plain text, shown as said.
+        self.assertEqual(runs["refused"]["out"], {
+            "text": "Add widgets, no remote: refused. <repo 'w\u034fidgets' exists>",
+            "warn": True})
+        self.assertEqual(runs["refused"]["calls"],
+                         ["begin", "read:null", "spell", "end", "after"])
+        self.assertEqual(runs["guard"]["out"]["text"],
+                         "Add widgets, no remote: refused. <refused by tasks-ui: no>")
+        # A lost rename is settled from the list read after it, the rename passed on.
+        self.assertEqual(runs["lost"]["out"]["text"].split(" The repo's")[0],
+                         "Rename acme to widgets: no answer came, but the repo list shows "
+                         "it landed.")
+        self.assertIn('read:{"from":"acme","to":"widgets"}', runs["lost"]["calls"])
+        # Not running: no read, no other reads after; the page told.
+        self.assertEqual(runs["down"]["calls"], ["begin", "notRunning", "spell", "end"])
+        # The gate shut: nothing sent, nothing read.
+        self.assertEqual(runs["shut"], {"out": None, "calls": ["begin"], "sent": 0})
+
+    def test_no_repos_points_at_the_repos_view(self):
+        self.assertIn("Add one under Repos", self.probe["no_repos"])
+
+
+_REPO_RULE_PROBE = r"""
+import { pathToFileURL } from "node:url";
+const r = await import(pathToFileURL(`${process.env.DOCKADE_UI_DIR}/repos.js`).href);
+const given = JSON.parse(process.env.DOCKADE_IN);
+console.log(JSON.stringify({
+  add: r.addRequest(...given.add),
+  rename: r.renameRequest(...given.rename),
+  remote: r.remoteRequest(...given.remote),
+  remove: r.removeRemoteRequest(given.remove),
+  retire: r.retireRequest(given.retire),
+  checks: (given.checks || []).map(([write, listed]) => r.checkRepoWrite(write, listed)),
+}));
+"""
+
+
+def _repo_probe(given: dict) -> dict:
+    full = {"add": ["", ""], "rename": [None, ""], "remote": [None, ""], "remove": None,
+            "retire": None, **given}
+    proc = subprocess.run(  # noqa: S603 (absolute path, fixed args, as _probe)
+        [_NODE, "--input-type=module", "-e", _REPO_RULE_PROBE],
+        env={**os.environ, "DOCKADE_UI_DIR": str(_served_dir(TASKS_DIR)),
+             "DOCKADE_IN": json.dumps(full)},
+        capture_output=True, text=True, timeout=60, check=False)
+    if proc.returncode != 0:
+        raise AssertionError("importing repos.js under node failed:\\n" + proc.stderr)
+    return json.loads(proc.stdout)
+
+
+@unittest.skipIf(not _NODE and not _STRICT,
+                 "node is not installed — skipping app.js unit tests")
+class RepoRuleTests(_OperatorStore):
+    """The repo writes the page builds against the registry's own: each body taken by
+    the operator API's model and route on a scratch store, and the list ``reads.repos``
+    gives after it found by the page's check, the one before it not seen."""
+
+    def _repo(self, name: str) -> dict:
+        return next(r for r in _reads.repos() if r["name"] == name)
+
+    def _lands(self, write: dict, route, model) -> None:
+        before = _reads.repos()
+        reply = route(model(**write["send"]), ThroughTheRelay()) if write["repo"] is None \
+            else route(write["repo"], model(**write["send"]), ThroughTheRelay())
+        self.assertEqual(reply.status_code, 200, reply.body)
+        after = _reads.repos()
+        checks = _repo_probe({"checks": [[write, after], [write, before]]})["checks"]
+        self.assertEqual(checks, ["found", "not-seen"])
+
+    def test_each_write_lands_as_sent_and_is_found(self):
+        steps = (
+            ("add", ["acme", ""], _api.add_repo, _api.AddRepo, None),
+            ("add", ["acme-2", "github.com/acme/two"], _api.add_repo, _api.AddRepo, None),
+            ("rename", ["acme", "acme-1"], _api.rename_repo, _api.RenameRepo, "acme"),
+            ("remote", ["acme-1", "github.com/acme/one"], _api.set_remote, _api.SetRemote,
+             "acme-1"),
+            ("remove", "acme-1", _api.set_remote, _api.SetRemote, "acme-1"),
+            ("retire", "acme-1", _api.retire_repo, _api.RetireRepo, "acme-1"),
+            ("retire", "acme-1", _api.retire_repo, _api.RetireRepo, "acme-1"),
+        )
+        for kind, given, route, model, name in steps:
+            with self.subTest(kind=kind, given=given):
+                if kind == "add":
+                    send = _repo_probe({"add": given})["add"]
+                elif kind in ("rename", "remote"):
+                    send = _repo_probe({kind: [self._repo(given[0]), given[1]]})[kind]
+                else:
+                    send = _repo_probe({kind: self._repo(given)})[kind]
+                self.assertIsNotNone(send)
+                write = {"kind": "remote" if kind == "remove" else kind, "repo": name,
+                         "send": send}
+                if write["kind"] == "remote":
+                    write["was"] = self._repo(name)["remote"]
+                self._lands(write, route, model)
+        # Retired and brought back, each by the flag the list read before it did not
+        # have.
+        self.assertFalse(self._repo("acme-1")["retired"])
+        self.assertEqual(self._repo("acme-2")["remote"], "github.com/acme/two")
+        self.assertIsNone(self._repo("acme-1")["remote"])
+
+
 class TaskCreateSourceTests(unittest.TestCase):
     """How the page holds, draws and sends a create and a reparent, from source: a
     browser is the only thing that runs it. What each sends is held under node
@@ -4493,9 +5125,13 @@ class TaskCreateSourceTests(unittest.TestCase):
         # The draft: opened, typed in, synced to a select, and dropped by a create that
         # still equals it or by discard.
         drafts = re.findall(r"\bcreateDraft(?:\[field\])? = ([^;]*);", self.TASKS)
-        self.assertEqual(drafts, ["null", "el.value", "null", "newCreateDraft()",
+        self.assertEqual(drafts, ["null", "{ ...createDraft, repo }", "el.value", "null",
+                                  "newCreateDraft()",
                                   "{ ...createDraft, [field]: ev.target.value }", "null"],
                          drafts)
+        # A rename the page made of the draft's repo, once listed, takes the draft too.
+        self.assertIn("const repo = followedRepo(createDraft.repo, renamed, repos);",
+                      _function(self.TASKS, "drawRepos"))
 
     def test_a_create_found_or_landed_opens_its_task_through_the_hash(self):
         run = _function(self.TASKS, "runWrite")
@@ -4514,7 +5150,7 @@ class TaskCreateSourceTests(unittest.TestCase):
         mark = _function(self.TASKS, "markWriting")
         self.assertIn("input[data-parent]", mark)
         self.assertEqual(mark.splitlines()[1].strip(), "markParent();")
-        self.assertTrue(mark.rstrip("}\n ").endswith("markCreate();"))
+        self.assertTrue(mark.rstrip("}\n ").endswith("markCreate();\n  markRepos();"))
         create = _function(self.TASKS, "markCreate")
         self.assertIn('for (const el of createForm.querySelectorAll("[data-create-field], '
                       'button")) {\n    el.disabled = writing !== null;', create)

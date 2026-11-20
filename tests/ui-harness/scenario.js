@@ -318,7 +318,7 @@ export const STEPS = [
     }
   }],
 
-  // A stream that stays open and says nothing (harness.js silences its heartbeats):
+  // A stream that stays open and says nothing (page.js's heartbeats, silenced):
   // the watchdog retires it after 15 s of silence and reconnects on the backoff. Each
   // connection is retired on the first watchdog tick 15 s after it was last heard
   // from, so 15 to 16 s on, and the backoffs between are 1, 2, 4 and 8 s: the fifth

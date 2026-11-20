@@ -263,8 +263,11 @@ assert at the boundaries.
 worked out by hand from the harness's fixture and this spec: each persist pattern's
 preview against the select's value and the pattern its confirm sends, the confirm
 panels' cancel and confirm, the pins sent, both kinds of countdown, and what a card says
-once its resolve is answered. In `make test` its DOM path has only the guards above and
-the free-name check below. Mutation testing is what showed the gap: every mutation in a
+once its resolve is answered. `tests/ui-harness/failing-state.test.js` drives the
+signals that something is wrong the same way: the approvals stream dropping, erring and
+going silent and the reconnect after each, the favicon lamp and conn text that follow
+it, and the title and tab badges. In `make test` `start()`'s DOM path has only the
+guards above and the free-name check below. Mutation testing is what showed the gap: every mutation in a
 pure helper was caught and every one inside `start()` survived.
 
 What those tests guard against is bounded by what a frontend bug can and cannot do here. It **cannot** produce an
@@ -339,11 +342,11 @@ browser's.
 Approvals / Audit / Policy / Tools are tabs (via `location.hash`, with arrow-key nav), and
 the hazard tabs introduce — a hidden view drifting unnoticed — is answered by badges
 that keep polling even the hidden views: a live pending count, and a policy **unseen**
-marker keyed on pattern+action (a flipped rule leaves the count unchanged). The favicon
-is an inline SVG data URI (never a CDN — a governance UI must not fetch its own control
-logic or icons per page load) whose lit lamp means **red = blind** (SSE down or silent
-past the watchdog; an unseen hold default-denies after `CONTROL_HOLD_TIMEOUT`) rather
-than red = denied, with the
+marker keyed on each rule's pattern, action and client class (a flipped rule leaves the
+count unchanged). The favicon is an inline SVG data URI (never a CDN — a governance UI
+must not fetch its own control logic or icons per page load) whose lit lamp means
+**red = blind** (SSE down or silent past the watchdog; an unseen hold default-denies
+after `CONTROL_HOLD_TIMEOUT`) rather than red = denied, with the
 pre-JS fallback amber ("unknown", not "all clear") and a `(n)` title prefix so the
 background tab nobody watches still shows the count. Rendering specifics (lamp opacity,
 `href`-reassignment throttling) are in `app.js`. Past the tab strip, **an opt-in desktop

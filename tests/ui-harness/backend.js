@@ -68,15 +68,21 @@ const INVENTORY = {
                   read_only: ["get_me", "list_commits"], unnameable: 0 },
 };
 
-// The second pin was made under arguments the inventory has since seen move.
+// The sandbox every tool card here came from, as the prefix it printed at boot.
+const SANDBOX = "a1b2c3d4";
+
+// The first pin is timed, so it answers only the sandbox its card came from. The second
+// was made under arguments the inventory has since seen move.
 const PINS = [
   { id: 4, server: "mcp-github", tool: "create_pull_request", rule: "ask",
     pins: { owner: "acme", repo: "widgets" },
     pins_json: '{"owner": "acme", "repo": "widgets"}', decides: true,
-    bound: true, schema_moved: false, expires_at: NOW + 1800, created_at: NOW - 600 },
+    bound: true, schema_moved: false, expires_at: NOW + 1800, created_at: NOW - 600,
+    sandbox_prefix: SANDBOX },
   { id: 6, server: "mcp-github", tool: "create_pull_request", rule: "ask",
     pins: { owner: "acme" }, pins_json: '{"owner": "acme"}', decides: true,
-    bound: true, schema_moved: true, expires_at: null, created_at: NOW - 900 },
+    bound: true, schema_moved: true, expires_at: null, created_at: NOW - 900,
+    sandbox_prefix: null },
 ];
 
 // One hold of each kind the page draws a card for, both with something to confirm:
@@ -90,28 +96,35 @@ export const HOLDS = [
       { pattern: ".example.org", scope: "example.org and subdomains" },
     ] },
   { id: "tool-1", kind: "tool", server: "mcp-github", tool: "create_pull_request",
-    ts: NOW - 5, deadline: NOW + 115, client: "172.28.0.5",
+    ts: NOW - 5, deadline: NOW + 115, client: "172.28.0.5", sandbox_prefix: SANDBOX,
     args_json: '{"owner": "acme", "repo": "gadgets", "title": "Fix the build"}',
     pin_options: {
       fields: [{ field: "owner", value: "acme" }, { field: "repo", value: "gadgets" }],
       unpinnable: [{ field: "title", why: "free text" }], refused: null,
+      stale: [], timed_refused: null,
     } },
 ];
 
-// A tool ask whose call met two pins made under other arguments of the tool: one a
-// later card has rebound, which this card may not rebind back, and one it may.
+// A tool ask whose call met two pins made under other arguments of the tool: a
+// permanent one a later card has rebound, which this card may neither rebind back nor
+// revoke, and its own sandbox's timed one, which it may rebind.
 export const STALE_HOLD = {
   id: "tool-2", kind: "tool", server: "mcp-github", tool: "create_pull_request",
-  ts: NOW + 20, deadline: NOW + 135, client: "172.28.0.5",
+  ts: NOW + 20, deadline: NOW + 135, client: "172.28.0.5", sandbox_prefix: SANDBOX,
   args_json: '{"owner": "acme", "repo": "widgets", "title": "Bump"}',
   pin_options: {
     fields: [{ field: "owner", value: "acme" }, { field: "repo", value: "widgets" }],
     unpinnable: [{ field: "title", why: "free text" }], refused: null,
-    stale: [{ id: 6, fields: ["owner"],
+    timed_refused: null,
+    stale: [{ id: 6, fields: ["owner"], sandbox_prefix: null,
               refused: "pin 6 was pinned again from a card raised after this one, so "
                      + "this card cannot bind it back to the arguments it was made "
-                     + "under; allow this call without a pin instead" },
-            { id: 4, fields: ["owner", "repo"], refused: null }],
+                     + "under; allow this call without a pin instead",
+              revoke_refused: "pin 6 was pinned again from a card raised after this "
+                            + "one, so this card cannot revoke it as made under older "
+                            + "arguments; allow this call without a pin instead" },
+            { id: 4, fields: ["owner", "repo"], sandbox_prefix: SANDBOX, refused: null,
+              revoke_refused: null }],
   } };
 
 // The record view, two pages of it: the first says there is an older one, and the
@@ -156,10 +169,14 @@ function resolved(id, body) {
     Object.assign(answer, { leased: true, lease_expires_at: NOW + 1800 });
   }
   if (body.pins) {
-    // The stale card's pins rebind pin 4; any other card's make pin 5.
+    // The stale card's pins rebind pin 4, its sandbox's timed pin, which a pin for
+    // good also makes permanent; any other card's make pin 5.
     const rebound = id === STALE_HOLD.id;
+    const timed = body.action === "allow_pinned_lease";
     answer.pin = { id: rebound ? 4 : 5, created: !rebound, rebound, fields: body.pins,
-                   expires_at: body.action === "allow_pinned_lease" ? NOW + 3600 : null };
+                   expires_at: timed ? NOW + 3600 : null,
+                   sandbox_prefix: timed ? SANDBOX : null,
+                   promoted: rebound && !timed, revoked: null };
   }
   return answer;
 }

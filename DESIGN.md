@@ -749,10 +749,11 @@ workspace, `/refs`, and every gateway result, under the terms of the account the
 operator logged the tier in with. Choosing an account or plan whose terms suit the
 work is the operator's job, as it is for Anthropic's today; dockade adds no banner,
 acknowledgement or launcher check, and records no vendor's terms. One consequence is
-dockade's own: an allow rule, a lease, a tool rule or a pin is shared by every cloud
-tier (see "Policy is scoped to a client class"), so one made while working with one
-tier answers another tier's call, and its result goes to that tier's provider. A
-single approval stays with the sandbox whose request it answered.
+dockade's own: an allow rule, a lease, a tool rule or a pin for good is shared by every
+cloud tier (see "Policy is scoped to a client class"), so one made while working with
+one tier answers another tier's call, and its result goes to that tier's provider. A
+single approval stays with the sandbox whose request it answered, and a timed pin with
+the sandbox whose card it was made from.
 
 **Maintenance rule:** for any new tool, ask "can it cause effects that don't
 originate from the container?" If yes, test client vs server-side and add a row to its
@@ -1197,9 +1198,10 @@ approval is the exposure and not which tier holds it. What sharing means, stated
 nobody has to derive it:
 
 - A standing grant made for one tier is made for every tier: an allow rule, a lease,
-  a tool rule or a pin. A single approval stays with the sandbox whose request it
-  answered, since holds group by client address (`_group_key` in
-  `control-plane/holds.py`). A held host does not say which tier asked.
+  a tool rule or a pin for good. A single approval stays with the sandbox whose request
+  it answered, since holds group by client address (`_group_key` in
+  `control-plane/holds.py`), and a timed pin with the sandbox whose card it was made
+  from. A held host does not say which tier asked.
 - Every tier reaches Anthropic's lifeline unheld, since the lifeline is scoped to the
   class (`proxies/egress/DESIGN.md` → "The lifeline is scoped by client"). It stays
   Anthropic's alone: another vendor's model and auth hosts are held on first use and
@@ -1813,9 +1815,10 @@ every other field is free. It is read only while the tool's rule is `ask`, and t
 is the whole safety argument: everything a pin can release, a human could already
 have released by clicking Allow on a card. It cannot reach a denied or unruled tool
 or a disabled server, and a payload too large for a card to show is not offered to
-the pins either. A pin answers for good (`allow_pinned`) or for
-`CONTROL_PIN_LEASE_SECONDS` (`allow_pinned_lease`); the expiry bounds how long it
-answers and never what, so nothing below depends on it.
+the pins either. A pin answers for good and every sandbox (`allow_pinned`), or for
+`CONTROL_PIN_LEASE_SECONDS` and only the sandbox whose card it was made from
+(`allow_pinned_lease`); the expiry and the sandbox bound how long and for whom it
+answers and never what, so nothing below depends on them.
 
 **A pin only allows, because a server's notion of equal is unknown here.** GitHub
 reads `Dockade` and `dockade` as one repository. Against an unknown equivalence an
@@ -1851,9 +1854,17 @@ parse cannot close is a server that matches keys more loosely than Python, as Go
 only calls made under the same digest (`policy._answering_pin`). An upgrade that adds
 a field which retargets the call, or a method to a dispatcher's enum, moves the
 digest, so the pinned calls get a card naming the pin instead of widening it. Pinning
-the same fields from that card rebinds the pin: a new grant under the new schema, for
-as long as that click says. So `_decide_tool` reads one input a sibling supplies, and
-it can only narrow, since a missing or wrong digest misses every pin. The inventory is
+the same fields from that card rebinds the pin: a new grant under the new schema. A
+pin for good rebinds the permanent pin, or makes the card's sandbox's timed pin
+permanent; a timed pin rebinds only that sandbox's, and revokes a permanent pin under
+the old digest, which answers no sandbox now, so nothing is left dormant. That delete
+is a side effect the operator did not pick directly, so the panel says it first and
+the answer and a `revoke` audit row say it after
+(`holds._resolve_tool_ask_pinned`). So `_decide_tool` reads one input a sibling
+supplies, and it can only narrow, since a missing or wrong digest misses every pin.
+The sandbox id is a second input, and the agent's own word rather than a sibling's:
+it narrows unless another sandbox's id is known, and is no credential (below). The
+inventory is
 still never an input; it holds the same digest only to show which pins' schemas
 moved. The binding lags the server: a call is bound to the schema the gateway last
 enumerated, so after a server restarts on a new image a pin can answer under the old
@@ -1877,10 +1888,14 @@ literally). The gateway relays it only in its minted shape (`app.sandbox_id`), t
 bridge checks that shape again, and the ask records the id and joins on it, so asks
 with two ids never share a card. A tier or an older image that sends no id records
 none, and its asks join only other asks with none. An operator sees only the first 8
-characters, which the sandbox prints at boot: on the card and in the `hold` row's
-reason, never the whole id. The id is the agent's word, not a credential: the agent
-can read its own and send any header, so the id may only narrow what a call meets,
-and no pin reads it yet.
+characters, which the sandbox prints at boot: on the card, in the `hold` row's reason,
+in the pin panel and in the audit of a timed pin, never the whole id. The id is the
+agent's word, not a credential: the agent can read its own and send any header, so the
+id may only narrow what a call meets. A timed pin reads it: one made from a card
+answers only calls carrying that card's id (`policy._pins_met`), so a call with none,
+or another, meets permanent pins only. Leaving the id out loses a sandbox only its own
+timed pins, and using another's means sending an id it cannot read; a sandbox
+restarted mints a new id, and its timed pins stop answering it.
 
 **An `ask` answers immediately.** The gateway never blocks the agent, and never blocks
 a control-plane worker either — two independent choices, both away from the egress

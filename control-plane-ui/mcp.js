@@ -476,6 +476,14 @@ export function pinLapsesDue(cells, asked, nowMs) {
     .filter(key => !asked.has(key) || nowMs - asked.get(key) >= PIN_LAPSE_RETRY_MS);
 }
 
+// Which sandboxes a pin answers, as its row says it: a timed pin only the one whose card
+// it was made from, by the prefix that sandbox printed at boot (`sandbox_prefix`, which
+// is all of the id api_mcp.api_mcp_pins serves), and a permanent one every sandbox.
+export function pinReach(pin) {
+  return pin && pin.sandbox_prefix ? `sandbox ${pin.sandbox_prefix} only`
+    : "every sandbox";
+}
+
 // Whether a pin decides anything now, and if not, which condition fails. `decides` is
 // the backend's (api_mcp.api_mcp_pins), so this only NAMES the reason, and the order
 // follows `policy._decide_tool`: a row that is not a pin set or is bound to no
@@ -1205,6 +1213,10 @@ function renderToolPins(rows) {
       note.textContent = "non-ASCII spelled out";
       pinnedCell.appendChild(note);
     }
+    const reach = document.createElement("div");
+    reach.className = "note";
+    reach.textContent = `answers ${pinReach(row)}`;
+    pinnedCell.appendChild(reach);
     tr.appendChild(pinnedCell);
     const state = pinState(row);
     const stateCell = document.createElement("td");

@@ -186,7 +186,9 @@ test("the pin panel's preview follows the boxes, and the ticked ones are the pin
   assert.equal(await text(panel.locator(".cwhat")),
                "Allows this call, and every later create_pull_request call on mcp-github "
                + "with owner = acme runs without a card while the pin lasts. Every other "
-               + "argument is free: repo, title, and any this call did not set.");
+               + "argument is free: repo, title, and any this call did not set. "
+               + "Pinned for good it answers every sandbox; for 1 h it answers only "
+               + "sandbox a1b2c3d4, the one this call came from.");
   assert.equal(await text(forGood), "Confirm — allow and pin owner for good");
   assert.equal(await text(timed), "Confirm — allow and pin owner for 1 h");
 
@@ -195,7 +197,9 @@ test("the pin panel's preview follows the boxes, and the ticked ones are the pin
                "Allows this call, and every later create_pull_request call on mcp-github "
                + "with owner = acme and repo = gadgets runs without a card while the pin "
                + "lasts. Every other argument is free: title, and any this call did not "
-               + "set.");
+               + "set. "
+               + "Pinned for good it answers every sandbox; for 1 h it answers only "
+               + "sandbox a1b2c3d4, the one this call came from.");
   assert.equal(await text(forGood), "Confirm — allow and pin owner, repo for good");
 
   // Ending on a box unticked, so what is sent is the boxes ticked rather than every
@@ -204,7 +208,9 @@ test("the pin panel's preview follows the boxes, and the ticked ones are the pin
   assert.equal(await text(panel.locator(".cwhat")),
                "Allows this call, and every later create_pull_request call on mcp-github "
                + "with repo = gadgets runs without a card while the pin lasts. Every other "
-               + "argument is free: owner, title, and any this call did not set.");
+               + "argument is free: owner, title, and any this call did not set. "
+               + "Pinned for good it answers every sandbox; for 1 h it answers only "
+               + "sandbox a1b2c3d4, the one this call came from.");
   assert.equal(await text(forGood), "Confirm — allow and pin repo for good");
   assert.deepEqual(sent, []);
 

@@ -266,7 +266,7 @@ const owner = {
   "mcp.js": ["serverDescriptor", "serverEndpoint", "serverPreset", "serverPreview",
              "serverEditPreview", "serverEditBody", "serverSaveBody",
              "toolChoices", "toolRulePreview", "toolEditPreview", "toolRevokePreview",
-             "pinText", "pinState", "pinExpiry", "pinLapsesDue",
+             "pinText", "pinState", "pinReach", "pinExpiry", "pinLapsesDue",
              "toolArgsChanged", "toolPick", "toolPreviewShown"],
   "leases.js": ["leaseLabel", "leaseRemaining", "leaseCountdown", "leaseDomain",
                 "groupLeases"],
@@ -6499,9 +6499,22 @@ class PinPanelSourceTests(unittest.TestCase):
         self.assertNotIn("checked = true", self.panel)
 
     def test_confirm_sends_only_what_the_preview_confirmed(self):
-        self.assertIn('if (p.ok) resolve(a, "allow_pinned", null, p.fields)', self.panel)
-        self.assertIn('if (p.ok) resolve(a, "allow_pinned_lease", null, p.fields)',
+        # Each button by its own half: the two touch different rows of a pin set.
+        self.assertIn('if (p.permanentOk) resolve(a, "allow_pinned", null, p.fields)',
                       self.panel)
+        self.assertIn('if (p.timedOk) resolve(a, "allow_pinned_lease", null, p.fields)',
+                      self.panel)
+
+    def test_each_button_is_enabled_by_its_own_half_of_the_preview(self):
+        render = re.search(r"function renderPinPreview\(entry, a\) \{(.*?)\n  \}",
+                           self.src, re.S).group(1)
+        self.assertIn("entry.confirmBtn.disabled = !p.permanentOk;", render)
+        self.assertIn("entry.timedBtn.disabled = !p.timedOk;", render)
+        # And the card's sandbox, which the timed text names, reaches every call.
+        calls = re.findall(r"pinPreview\(([^;]*)\);", self.src)
+        self.assertEqual(len(calls), 3)
+        for call in calls:
+            self.assertTrue(call.rstrip().endswith("a.sandbox_prefix"), call)
 
     def test_the_shorter_grant_comes_first(self):
         # As the egress card orders its lease before its persist.
@@ -6522,13 +6535,15 @@ const h = await load("holds.js");
 const m = await load("mcp.js");
 const options = { fields: [{ field: "method", value: '"get"' },
                            { field: "owner", value: '"acme"' }],
-                  unpinnable: [], refused: null,
-                  stale: [{ id: 5, fields: ["method"], refused: null }] };
+                  unpinnable: [], refused: null, timed_refused: null,
+                  stale: [{ id: 5, fields: ["method"], sandbox_prefix: null,
+                            refused: null, revoke_refused: null }] };
+const later = "pin 5 was pinned again from a card raised after this one";
 const refused = { ...options,
-                  stale: [{ id: 5, fields: ["method"],
-                            refused: "pin 5 was pinned again from a card raised after "
-                                   + "this one" }] };
-const p = (o, chosen) => h.pinPreview(o, chosen, "issue_read", "mcp-github", 14400);
+                  stale: [{ id: 5, fields: ["method"], sandbox_prefix: null,
+                            refused: later, revoke_refused: later }] };
+const p = (o, chosen) => h.pinPreview(o, chosen, "issue_read", "mcp-github", 14400,
+                                      "a1b2c3d4");
 const pin = fields => ({ server: "mcp-github", tool: "issue_read",
                          pins: { method: "get" }, rule: "ask", decides: true,
                          bound: true, schema_moved: false, ...fields });
@@ -6591,13 +6606,18 @@ class SchemaBoundPinUiTests(unittest.TestCase):
         self.assertEqual(self.probe["no_stale"]["text"],
                          "Tick the fields a later call must match exactly.")
 
-    def test_ticking_exactly_its_fields_says_the_pin_is_rebound(self):
-        self.assertTrue(self.probe["rebinds"]["ok"])
-        self.assertIn("This rebinds pin 5 to the arguments this call was made under, "
-                      "for as long as the button you press says, even if it was pinned "
-                      "for good.", self.probe["rebinds"]["text"])
+    def test_ticking_exactly_its_fields_says_what_each_button_does_to_the_pin(self):
+        # A permanent pin under other arguments: for good rebinds it, and a timed pin
+        # revokes it (the operator's answer on plan 112).
+        rebinds = self.probe["rebinds"]
+        self.assertTrue(rebinds["ok"])
+        self.assertTrue(rebinds["text"].endswith(
+            " Pinning for good rebinds pin 5 to the arguments this call was made under. "
+            "A timed pin revokes pin 5, which answers every sandbox but under older "
+            "arguments."), rebinds["text"])
         self.assertTrue(self.probe["wider"]["ok"])
         self.assertNotIn("rebinds", self.probe["wider"]["text"])
+        self.assertNotIn("revokes", self.probe["wider"]["text"])
 
     def test_a_rebind_the_backend_refuses_is_not_offered(self):
         refused = self.probe["refused"]
@@ -6620,6 +6640,180 @@ class SchemaBoundPinUiTests(unittest.TestCase):
                       self.probe["unbound"]["text"])
         # A backend without `bound` reads as before.
         self.assertIn("the rule denies", self.probe["older_backend"]["text"])
+
+
+_SANDBOX_PIN_PROBE = r"""
+import { pathToFileURL } from "node:url";
+const load = name => import(pathToFileURL(`${process.env.DOCKADE_UI_DIR}/${name}`).href);
+const h = await load("holds.js");
+const m = await load("mcp.js");
+const fields = [{ field: "method", value: '"get"' }, { field: "owner", value: '"acme"' }];
+const why = what => `pin ${what} was pinned again from a card raised after this one`;
+const shared = (refused = null) => ({ id: 5, fields: ["method"], sandbox_prefix: null,
+                                      refused, revoke_refused: refused && `${refused}!` });
+const own = (refused = null) => ({ id: 7, fields: ["method"], sandbox_prefix: "a1b2c3d4",
+                                   refused, revoke_refused: null });
+const options = (stale, timed_refused = null) =>
+  ({ fields, unpinnable: [], refused: null, stale, timed_refused });
+const p = (o, chosen = ["method"], prefix = "a1b2c3d4") =>
+  h.pinPreview(o, chosen, "issue_read", "mcp-github", 14400, prefix);
+const pin = extra => ({ id: 4, fields: ["method"], created: false, extended: false,
+                        rebound: false, ...extra });
+console.log(JSON.stringify({
+  plain: p(options([])),
+  no_prefix: p(options([]), ["method"], null),
+  no_id: p(options([], "this call came with no sandbox id"), ["method"], null),
+  no_id_none: p(options([], "this call came with no sandbox id"), [], null),
+  both_rows: p(options([shared(), own()])),
+  own_only: p(options([own()])),
+  // One pin set, two stale rows, each refused for a different button.
+  own_refused: p(options([shared(), own(why(7))])),
+  shared_refused: p(options([shared(why(5)), own()])),
+  both_refused: p(options([shared(why(5)), own(why(7))])),
+  own_alone_refused: p(options([own(why(7))])),
+  // Shapes the backend does not send today, held so each button keeps its own guard:
+  // a permanent row refused to a rebind but not to a revoke, and a timed pin refused
+  // on a card that does name a sandbox.
+  permanent_only_refused: p(options([{ ...shared(why(5)), revoke_refused: null }])),
+  timed_refused_with_prefix: p(options([], "timed pins are off")),
+  listed: p(options([shared(), own()]), []),
+  timed: h.toolOutcomeMessage({ outcome: "allow",
+                                pin: pin({ created: true, expires_at: 1786055405,
+                                           sandbox_prefix: "a1b2c3d4" }) }),
+  promoted: h.toolOutcomeMessage({ outcome: "allow",
+                                   pin: pin({ extended: true, expires_at: null,
+                                              sandbox_prefix: null, promoted: true }) }),
+  revoked: h.toolOutcomeMessage({ outcome: "allow",
+                                  pin: pin({ created: true, expires_at: 1786055405,
+                                             sandbox_prefix: "a1b2c3d4",
+                                             revoked: { id: 5 } }) }),
+  for_good: h.toolOutcomeMessage({ outcome: "allow",
+                                   pin: pin({ created: true, expires_at: null,
+                                              sandbox_prefix: null, promoted: false,
+                                              revoked: null }) }),
+  reach_timed: m.pinReach({ sandbox_prefix: "a1b2c3d4" }),
+  reach_permanent: m.pinReach({ sandbox_prefix: null }),
+  reach_older_backend: m.pinReach({}),
+}));
+"""
+
+
+@unittest.skipIf(not _NODE and not _STRICT,
+                 "node is not installed — skipping the sandbox-scoped pin UI tests")
+class SandboxScopedPinUiTests(unittest.TestCase):
+    """What the card and the pins table say now that a timed pin answers only the
+    sandbox whose card it was made from: the preview words each button from the rows
+    it touches, and the answer names a revoked pin."""
+
+    probe: dict
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if not _NODE:
+            raise AssertionError("node is not installed and DOCKADE_REQUIRE_TOOLS is set")
+        proc = subprocess.run(  # noqa: S603 (absolute path, fixed args)
+            [_NODE, "--input-type=module", "-e", _SANDBOX_PIN_PROBE],
+            env={**os.environ, "DOCKADE_UI_DIR": str(_served_dir()),
+                 "TZ": "Europe/Stockholm"},
+            capture_output=True, text=True, timeout=60, check=False)
+        if proc.returncode != 0:
+            raise AssertionError(f"node could not run the pin probe:\n{proc.stderr}")
+        cls.probe = json.loads(proc.stdout)
+
+    def _buttons(self, name):
+        got = self.probe[name]
+        return (got["ok"], got["permanentOk"], got["timedOk"])
+
+    def test_the_timed_text_says_it_answers_only_this_sandbox(self):
+        plain = self.probe["plain"]
+        self.assertEqual(self._buttons("plain"), (True, True, True))
+        self.assertTrue(plain["text"].endswith(
+            "Pinned for good it answers every sandbox; for 4 h it answers only sandbox "
+            "a1b2c3d4, the one this call came from."), plain["text"])
+        self.assertNotIn("sandbox", self.probe["no_prefix"]["text"])
+
+    def test_a_card_with_no_id_offers_a_pin_for_good_only(self):
+        self.assertEqual(self._buttons("no_id"), (True, True, False))
+        no_id = self.probe["no_id"]
+        self.assertIn("It cannot be pinned for 4 h: this call came with no sandbox id.",
+                      no_id["text"])
+        self.assertNotIn("answers only sandbox", no_id["text"])
+        self.assertEqual(no_id["timedLabel"], "No timed pin")
+        self.assertEqual(no_id["label"], "Confirm — allow and pin method for good")
+        self.assertTrue(self.probe["no_id_none"]["text"].startswith(
+            "No timed pin: this call came with no sandbox id. Tick the fields"))
+        self.assertEqual(self.probe["no_id_none"]["timedLabel"], "No timed pin")
+
+    def test_the_list_of_stale_pins_says_whose_each_is(self):
+        self.assertTrue(self.probe["listed"]["text"].startswith(
+            "Pin 5 on method matches this call but was made under other arguments of "
+            "issue_read, so it did not answer it. Pin 7 on method (sandbox a1b2c3d4 "
+            "only) matches this call"), self.probe["listed"]["text"])
+
+    def test_each_button_says_what_it_does_to_the_rows_it_touches(self):
+        self.assertTrue(self.probe["both_rows"]["text"].endswith(
+            " Pinning for good rebinds pin 5 to the arguments this call was made under. "
+            "A timed pin rebinds pin 7 and revokes pin 5, which answers every sandbox "
+            "but under older arguments."), self.probe["both_rows"]["text"])
+        self.assertTrue(self.probe["own_only"]["text"].endswith(
+            " Pinning for good rebinds pin 7 to the arguments this call was made under, "
+            "and makes it answer every sandbox. A timed pin rebinds pin 7 to the "
+            "arguments this call was made under."), self.probe["own_only"]["text"])
+
+    def test_a_row_refused_to_one_button_leaves_the_other(self):
+        # The permanent row is the for-good button's, this sandbox's timed row the
+        # timed button's, so each is refused only by its own.
+        self.assertEqual(self._buttons("own_refused"), (True, True, False))
+        own = self.probe["own_refused"]
+        self.assertIn("It cannot be pinned for 4 h: pin 7 was pinned again from a card "
+                      "raised after this one.", own["text"])
+        self.assertEqual(own["timedLabel"], "Pin for 4 h")
+        self.assertEqual(own["label"], "Confirm — allow and pin method for good")
+        # A timed click would also revoke the permanent row, so its refusal to revoke
+        # closes the timed button, in its own words.
+        self.assertEqual(self._buttons("shared_refused"), (False, False, False))
+        self.assertEqual(self.probe["shared_refused"]["text"],
+                         "Cannot pin these: pin 5 was pinned again from a card raised "
+                         "after this one. Nor for a while: pin 5 was pinned again from a "
+                         "card raised after this one!.")
+
+    def test_each_button_keeps_its_own_guard(self):
+        self.assertEqual(self._buttons("permanent_only_refused"), (True, False, True))
+        self.assertEqual(self.probe["permanent_only_refused"]["label"], "Pin for good")
+        refused = self.probe["timed_refused_with_prefix"]
+        self.assertEqual(self._buttons("timed_refused_with_prefix"), (True, True, False))
+        self.assertNotIn("answers only sandbox", refused["text"])
+
+    def test_both_refused_offers_neither(self):
+        for name in ("both_refused", "own_alone_refused"):
+            with self.subTest(name):
+                self.assertEqual(self._buttons(name), (False, False, False))
+                self.assertEqual(self.probe[name]["fields"], [])
+        self.assertTrue(self.probe["both_refused"]["text"].startswith(
+            "Cannot pin these: pin 5 was pinned again"))
+        self.assertEqual(self.probe["own_alone_refused"]["text"],
+                         "Cannot pin these: pin 7 was pinned again from a card raised "
+                         "after this one.")
+
+    def test_the_answer_says_whose_pin_it_is_and_names_a_revoked_one(self):
+        self.assertIn("pinned on method until 2026-08-07 00:30:05 for sandbox a1b2c3d4 "
+                      "only (pin 4)", self.probe["timed"]["text"])
+        self.assertIn("pin made permanent on method for every sandbox (pin 4)",
+                      self.probe["promoted"]["text"])
+        self.assertIn("(pin 4) · pin 5 revoked: it answered every sandbox, under older "
+                      "arguments of the tool · runs when", self.probe["revoked"]["text"])
+        self.assertEqual(self.probe["for_good"]["text"],
+                         "✓ allowed · pinned for good on method (pin 4) · runs when the "
+                         "agent returns for it")
+
+    def test_the_pins_table_says_which_sandboxes_a_pin_answers(self):
+        self.assertEqual(self.probe["reach_timed"], "sandbox a1b2c3d4 only")
+        self.assertEqual(self.probe["reach_permanent"], "every sandbox")
+        self.assertEqual(self.probe["reach_older_backend"], "every sandbox")
+
+    def test_the_pins_table_shows_it_on_each_row(self):
+        self.assertIn('reach.textContent = `answers ${pinReach(row)}`;',
+                      APP_JS.with_name("mcp.js").read_text())
 
 
 class PayloadHazardTests(unittest.TestCase):

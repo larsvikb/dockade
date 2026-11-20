@@ -77,21 +77,23 @@ two tabs replying to one note post two replies, which the timeline shows. The
 lost-answer check above is what keeps one from being sent twice.
 
 **The moves are in the detail, below the plan, one at a time.** Only the open task
-carries them, never an inbox row, so a move is made on what was read.
-The moves on a note sit under it in the timeline, on every page of it. The one write
-outside the detail is the flagged list's bulk handle (below), which names the notes a
-page drew rather than a task. Approve and send back are each a control of their own, as
-a refined task's two answers. Approve says when what it approves hides a character. One
-write is out at a time, its controls off until its outcome is drawn, the flagged list's
-too, and the poll never redraws the detail, so no button moves under the pointer between
-two clicks. No move asks to be confirmed: its label, which names the outcome before it
-is pressed, is the confirmation. Most moves are recorded and undone by another move, but
-not all: a note or a reply can be hidden and never removed; an approve's answers stand;
-a break, or any state move of a claimed task, ends the live claim, which no operator move
-gives back (`operator_moves.move`); and a move to proposed, a send back or from any other
-state, supersedes the current plan, an approved one too, and no move makes a superseded
-plan current again (`tasks.update`). A move on a note touches neither the task's spec nor its revision, so
-whatever holds the task's moves leaves it free, as it leaves adding a note.
+carries them, never an inbox row, so a move is made on what was read. The moves on a
+note sit under it in the timeline, on every page of it. The one write outside the detail
+is the flagged list's bulk handle (below), which names the notes a page drew rather than
+a task. Approve and send back are each a control of their own, as a refined task's two
+answers. Approve says when what it approves hides a character. One write is out at a
+time, its controls off until its outcome is drawn, the flagged list's too, and the poll
+never redraws the detail, so no button moves under the pointer between two clicks.
+Opening a task from another replaces what is under the pointer, so the second click of a
+double-click is neither a move nor an open of a related task. No move asks to be
+confirmed: its label, which names the outcome before it is pressed, is the confirmation.
+Most moves are recorded and undone by another move, but not all: a note or a reply can
+be hidden and never removed; an approve's answers stand; a break, or any state move of a
+claimed task, ends the live claim, which no operator move gives back
+(`operator_moves.move`); and a move to proposed, a send back or from any other state,
+supersedes the current plan, an approved one too, and no move makes a superseded plan
+current again (`tasks.update`). A move on a note touches neither the task's spec nor its
+revision, so whatever holds the task's moves leaves it free, as it leaves adding a note.
 
 **One scheme of labels.** Every action control on the task page says what it does, and
 is marked primary or caution, by one rule (`moveLabel` and the functions beside it): a main
@@ -198,19 +200,20 @@ at every width the page shows the list or the open task, never both, and the tas
 the window's width. A click on a row opens its task, but on the row's own controls, a
 flagged note's box or its cell, or a drag that selected text; the `#id` button is the
 keyboard's way. Back is a control in a strip kept atop the task at any scroll, Esc
-outside a text field, or the browser's back, and the list comes back as it was left:
-it stays in the DOM, hidden, with its filters, search and page, and its row last read
+outside a text field, or the browser's back, and the list comes back as it was left: it
+stays in the DOM, hidden, with its filters, search and page, and its row last read
 marked. Opening a task, going back or changing view sets the URL's hash (`parseHash`,
 `hashFor`), and the page follows the hash, so a reload, a link and the browser's back
-agree with what was clicked. The task it names is read once the registry answers, never
-before. The page places every scroll itself (`enterTask` in `tasks.js` says how), since
-a browser restoring the list's offset on back would apply it to a task first; so a
-reload of a scrolled list opens at its top, the price of placing scroll by hand. A hash
-naming no task the registry could have, or one it has not got, shows the list with a
-line saying so, under the list's URL, so back and a reload pass over it. The back
-control sets the list's hash rather than going back in history, since the entry before
-a linked or reloaded task is not the list; so the browser's back after it reopens the
-task, as after following any link.
+agree with what was clicked. A task's parent, children and blockers open through the
+hash too, so the browser's back returns to the task they were opened from. The task it
+names is read once the registry answers, never before. The page places every scroll
+itself (`enterTask` in `tasks.js` says how), since a browser restoring the list's offset
+on back would apply it to a task first; so a reload of a scrolled list opens at its top,
+the price of placing scroll by hand. A hash naming no task the registry could have, or
+one it has not got, shows the list with a line saying so, under the list's URL, so back
+and a reload pass over it. The back control sets the list's hash rather than going back
+in history, since the entry before a linked or reloaded task is not the list; so the
+browser's back after it reopens the task, as after following any link.
 
 **The count is in the title, and quiet.** The page's title carries the number of tasks
 waiting on the operator, the inbox's first section, ahead of its name, as the approval

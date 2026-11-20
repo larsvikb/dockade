@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import unittest
+from html.parser import HTMLParser
 from typing import ClassVar
 
 from _loader import load_operator_api
@@ -2849,6 +2850,91 @@ class TaskPollingSourceTests(unittest.TestCase):
         self.assertIn("if (inboxLoaded) document.title = pageTitle(waiting);", self.TASKS)
         self.assertIn("inbox.waiting.total", self.TASKS)
         self.assertIn("if (!up) document.title = PAGE_TITLE;", self.TASKS)
+
+
+class TaskRelationSourceTests(unittest.TestCase):
+    """A task's parent, children and blockers, each a row whose ``#id`` opens its task
+    through the hash, the children in a list that collapses. Read from the source, as
+    the other detail guards are; the UI harness clicks them."""
+
+    TASKS = (TASKS_DIR / "tasks.js").read_text()
+    HTML = (TASKS_DIR / "index.html").read_text()
+
+    def test_each_relation_opens_its_task_its_title_spelled_as_text(self):
+        row = _function(self.TASKS, "relatedRow")
+        self.assertIn("open.dataset.task = String(t.id);", row)
+        self.assertIn("title.textContent = ` ${spellHidden(t.title).text} `;", row)
+        self.assertIn("state.textContent = `(${t.state})`;", row)
+        self.assertNotIn("innerHTML", row)
+        self.assertIn("row.appendChild(relatedRow(t));", _function(self.TASKS, "relatedRows"))
+        draw = _function(self.TASKS, "drawTask")
+        self.assertIn('line("parent", relatedRow(task.parent))', draw)
+        self.assertIn("if (task.blockers && task.blockers.length && !editing) {", draw)
+        self.assertIn("task.blockers));", draw)
+        # A detail button opens as a list row's `#id` does: through the hash.
+        self.assertIn("goTo(view, named.dataset.task);", self.TASKS)
+
+    def test_the_children_are_a_list_open_unless_the_operator_closed_it(self):
+        draw = _function(self.TASKS, "drawTask")
+        self.assertIn("if (childrenLeft(task.children).total) {\n"
+                      "    taskDetail.appendChild(childrenList(task.children));", draw)
+        kids = _function(self.TASKS, "childrenList")
+        self.assertIn('document.createElement("details")', kids)
+        self.assertIn("summary.textContent = `children ${childrenLeft(children).text}`;",
+                      kids)
+        self.assertIn("list.open = childrenOpen;", kids)
+        # Expanded on every load: no storage keeps the choice.
+        self.assertIn("\nlet childrenOpen = true;\n", self.TASKS)
+        self.assertNotRegex(self.TASKS, r"localStorage|sessionStorage")
+
+    def test_the_choice_is_kept_from_the_lists_own_toggle(self):
+        # `toggle` does not bubble: on the detail it would hear nothing, or in the capture
+        # phase the folded history's too.
+        self.assertIn('list.addEventListener("toggle", () => { childrenOpen = list.open; });',
+                      _function(self.TASKS, "childrenList"))
+        self.assertEqual(self.TASKS.count('"toggle"'), 1)
+
+    def test_a_button_in_the_detail_is_no_list_row_to_mark(self):
+        # markOpen reads the list's rows alone, and the detail is outside the list, so a
+        # relation's button, which has no row, is never asked for one.
+        self.assertIn('listView.querySelectorAll("tr button[data-task]")',
+                      _function(self.TASKS, "markOpen"))
+        ancestors = {}
+
+        class Ids(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.stack = []
+
+            def handle_starttag(self, tag, attrs):
+                attr = dict(attrs)
+                if "id" in attr:
+                    ancestors[attr["id"]] = [i for _, i in self.stack if i]
+                if tag not in ("br", "input", "meta", "link", "img"):
+                    self.stack.append((tag, attr.get("id")))
+
+            def handle_endtag(self, tag):
+                while self.stack and self.stack.pop()[0] != tag:
+                    pass
+
+        Ids().feed(self.HTML)
+        self.assertIn("task-view", ancestors["task-detail"])
+        self.assertNotIn("list-view", ancestors["task-detail"])
+
+    def test_a_double_clicks_second_click_opens_no_related_task(self):
+        # Keyboard activation's detail is 0, so the keyboard still opens.
+        self.assertIn('const named = ev.target.closest("button[data-task]");\n'
+                      "    if (named) {\n"
+                      "      if (ev.detail <= 1) goTo(view, named.dataset.task);\n"
+                      "      return;\n"
+                      "    }", self.TASKS)
+
+    def test_a_double_clicks_second_click_sends_no_move(self):
+        self.assertIn('const btn = ev.target.closest("button[data-write]");\n'
+                      "    // A double-click's", self.TASKS)
+        self.assertIn("    if (!btn || ev.detail > 1) return;\n"
+                      "    const write = writeFor(btn);\n"
+                      "    if (write) runWrite(write);", self.TASKS)
 
 
 class TaskRenderingSourceTests(unittest.TestCase):

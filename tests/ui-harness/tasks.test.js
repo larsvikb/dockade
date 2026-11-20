@@ -47,16 +47,19 @@ after(async () => { await browser?.close(); });
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 // The page loaded at `hash` on a reset backend and settled. `reads` is the id of every
-// task read it sent (`GET /api/tasks/<id>`), `dialogs` the type of every dialog it
-// raised, `errors` every uncaught error, all in order. Dialogs are dismissed unless
+// task read it sent (`GET /api/tasks/<id>`), `writes` the path of every write it sent,
+// `dialogs` the type of every dialog it raised, `errors` every uncaught error, all in
+// order. Dialogs are dismissed unless
 // `helpers.accept()` was called (page.js).
 async function tasksPage(t, { viewport = DESKTOP, hash = "" } = {}) {
   backend.reset();
   const reads = [];
+  const writes = [];
   const run = await openPage(browser, uiDir, {
     respond: (method, path, body, query) => {
       const read = method === "GET" && path.match(/^\/api\/tasks\/(\d+)$/);
       if (read) reads.push(read[1]);
+      if (method === "POST") writes.push(path);
       return backend.respond(method, path, body, query);
     },
   }, { viewport, hash });
@@ -102,7 +105,7 @@ async function tasksPage(t, { viewport = DESKTOP, hash = "" } = {}) {
   }));
   // A task's row in a list, by the cell named: a cell with no control in it.
   const row = (list, id) => `${list} tr:has(button[data-task="${id}"])`;
-  return { page, helpers, reads, dialogs, errors, settle, click, press, go, poll, setHash,
+  return { page, helpers, reads, writes, dialogs, errors, settle, click, press, go, poll, setHash,
            scrollTo, state, row };
 }
 
@@ -1052,3 +1055,119 @@ for (const [name, viewport] of [["desktop", DESKTOP], ["narrow", PHONE]]) {
     assert.ok(redrawn.every(f => !f.drawn && f.source));
   });
 }
+
+// ── a task's parent, children and blockers ─────────────────────────────────
+
+// Task 3's parent is task 1, its children tasks 4, closed, and 5, landing, and its
+// blocker task 2; task 1's child is task 3, and task 5's parent. Each is named with its
+// own record's title and state, spelled.
+const SPLIT = "Split the UI \\u202egnp.exe";
+const children = p => p.page.locator("#task-detail > details");
+const parentLine = p => p.page.locator("#task-detail > div", { hasText: /^parent / });
+const relationRows = loc => loc.locator(".related").evaluateAll(
+  rows => rows.map(r => r.textContent.trim()));
+const heading = p => text(p.page.locator("#task-detail h3").first());
+
+test("a task's children are a row each, and a child opens through the hash, back "
+     + "returning to its parent", TIMEOUT, async t => {
+  const p = await tasksPage(t, { hash: "#task=3" });
+  const kids = children(p);
+  assert.equal(await kids.count(), 1);
+  assert.equal(await kids.evaluate(d => d.open), true, "expanded by default");
+  assert.equal(await text(kids.locator("summary")), "children 1 of 2 not closed");
+  assert.deepEqual(await relationRows(kids),
+                   ["#4 Child (closed)", "#5 Landing \\u202eone (landing)"]);
+  // Each row's text starts in from the summary's, a level under it.
+  const left = loc => loc.evaluate(el => el.getBoundingClientRect().left
+    + parseFloat(getComputedStyle(el).paddingLeft));
+  assert.ok(await left(kids.locator(".related").first())
+            > await left(kids.locator("summary")));
+  await p.click('#task-detail details button[data-task="5"]');
+  assert.equal((await p.state()).hash, "#task=5");
+  assert.equal(await heading(p), "#5 Landing \\u202eone show source edit spec");
+  assert.equal(await text(parentLine(p)), `parent #3 ${SPLIT} (open)`);
+  await p.go("back");
+  assert.equal((await p.state()).hash, "#task=3");
+  assert.equal(await heading(p), `#3 ${SPLIT} show source edit spec`);
+  assert.deepEqual(p.reads, ["3", "5", "3"]);
+  assert.deepEqual(p.errors, []);
+});
+
+test("the parent and each blocker open their tasks too", TIMEOUT, async t => {
+  const p = await tasksPage(t, { hash: "#task=3" });
+  assert.equal(await text(parentLine(p)), "parent #1 Plain one (proposed)");
+  const blockers = p.page.locator("#task-detail > div:has(> .related)");
+  assert.equal(await text(blockers.locator("> .qual")), "blocked by");
+  assert.deepEqual(await relationRows(blockers), ["#2 Back up the store (open)"]);
+  await p.click('#task-detail button[data-task="1"]');
+  assert.equal((await p.state()).hash, "#task=1");
+  assert.equal(await heading(p), "#1 Plain one show source edit spec");
+  assert.deepEqual(await relationRows(children(p)), [`#3 ${SPLIT} (open)`]);
+  await p.go("back");
+  await p.click('#task-detail button[data-task="2"]');
+  assert.equal((await p.state()).hash, "#task=2");
+  assert.equal(await heading(p), "#2 Back up the store show source edit spec");
+  assert.equal(await children(p).count(), 0, "a task with no children has no list");
+  assert.deepEqual(p.reads, ["3", "1", "3", "2"]);
+  assert.deepEqual(p.errors, []);
+});
+
+test("collapsed, the children are only counted, the summary where it was, and stay so "
+     + "on another task and a read again, until a reload", TIMEOUT, async t => {
+  const p = await tasksPage(t, { hash: "#task=3" });
+  const open = () => children(p).evaluate(d => d.open);
+  const summary = () => children(p).locator("summary").boundingBox();
+  const at = await summary();
+  await p.click("#task-detail > details > summary");
+  assert.equal(await open(), false);
+  assert.deepEqual(await summary(), at);
+  assert.equal(await p.page.locator("#task-detail .related:visible").count(), 1,
+               "only the blocker's row shows");
+  // Task 1's children, which a choice kept per task would show.
+  await p.setHash("#task=1");
+  assert.equal(await text(children(p).locator("summary")), "children 1 of 1 not closed");
+  assert.equal(await open(), false, "on another task");
+  await p.setHash("#task=3");
+  backend.editElsewhere(3);
+  await p.poll();
+  await p.click("#task-detail button[data-show]");
+  assert.deepEqual(p.reads, ["3", "1", "3", "3", "3"]);
+  assert.equal(await open(), false, "read again");
+  await p.helpers.navigate(() => p.page.reload());
+  await p.settle();
+  assert.equal(await open(), true, "a reload expands them");
+  assert.deepEqual(p.errors, []);
+});
+
+// A double-click on a child opens it with the first click; the second lands on whatever
+// the child drew there, and sends no move.
+test("a double-click's second click sends no move", TIMEOUT, async t => {
+  const p = await tasksPage(t, { hash: "#task=3" });
+  await p.click('#task-detail details button[data-task="5"]');
+  const move = '#task-detail button[data-write="move"][data-value="open"]';
+  const clickWith = detail => p.page.locator(move).evaluate(
+    (b, n) => b.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: n })), detail);
+  await clickWith(2);
+  await p.settle();
+  assert.deepEqual(p.writes, []);
+  await clickWith(1);
+  await p.settle();
+  assert.deepEqual(p.writes, ["/api/tasks/5/move"]);
+});
+
+// The same for an open: on task 3 the parent's `#1` opens task 1, whose child row `#3`
+// can lie where the second click lands, which would open task 3 again.
+test("a double-click's second click opens no related task", TIMEOUT, async t => {
+  const p = await tasksPage(t, { hash: "#task=3" });
+  const parent = '#task-detail button[data-task="1"]';
+  const clickWith = detail => p.page.locator(parent).evaluate(
+    (b, n) => b.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: n })), detail);
+  await clickWith(2);
+  await p.settle();
+  assert.equal((await p.state()).hash, "#task=3");
+  assert.deepEqual(p.reads, ["3"]);
+  await clickWith(1);
+  await p.settle();
+  assert.equal((await p.state()).hash, "#task=1");
+  assert.deepEqual(p.reads, ["3", "1"]);
+});

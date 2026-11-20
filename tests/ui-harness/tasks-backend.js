@@ -106,19 +106,21 @@ const TASK = {
   ...TASKS[0], repo: "dockade", revision: 4, created_at: NOW - 86400,
   updated_at: NOW - 600,
   body: `Build the page.\nThen ${RLO}the rest${ZWSP}.\nAn emoji: \u2764\uFE0F`,
-  parent: { id: 1, title: "Plain one", state: "open" },
+  parent: { id: 1, title: "Plain one", state: "proposed" },
   children: [{ id: 4, title: "Child", state: "closed" },
-             { id: 5, title: "Other child", state: "landing" }],
+             { id: 5, title: `Landing ${RLO}one`, state: "landing" }],
   blockers: [{ id: 2, title: "Back up the store", state: "open" }],
   plan: APPROVED, answers: [], notes: [STARTED, ANSWER, ASKED, BLOCKED],
 };
 
-// Task 1 went back to proposed: its plan is the superseded one. Task 2 was opened with
-// no plan.
+// Task 1 went back to proposed: its plan is the superseded one, and task 3 its child.
+// Task 2 was opened with no plan. A parent, a child or a blocker is named with the title
+// and state of its own record; task 4, a child of task 3, has none.
 const SENT_BACK = { ...TASKS[2], state: "proposed", ready: false, repo: "dockade",
                     revision: 6, created_at: NOW - 90000,
-                    updated_at: NOW - 76000, body: "Plain.", children: [], blockers: [],
-                    plan: OLDER_PLAN, notes: [] };
+                    updated_at: NOW - 76000, body: "Plain.",
+                    children: [{ id: 3, title: TASKS[0].title, state: "open" }],
+                    blockers: [], plan: OLDER_PLAN, notes: [] };
 const UNPLANNED = { ...TASKS[1], repo: "dockade", revision: 1, created_at: NOW - 5000,
                     updated_at: NOW - 5000, body: "Back it up.", children: [],
                     blockers: [], plan: null, notes: [] };
@@ -132,7 +134,8 @@ const REFINED = { ...TASK, id: 6, title: "Refined one", state: "refined", ready:
                   claim: null, revision: 7, parent: null, children: [], blockers: [],
                   plan: PLAN, notes: [] };
 const LANDING = { ...REFINED, id: 5, title: `Landing ${RLO}one`, state: "landing",
-                  revision: 9, plan: APPROVED };
+                  revision: 9, plan: APPROVED,
+                  parent: { id: 3, title: TASKS[0].title, state: "open" } };
 const SECOND = { ...REFINED, id: 8, title: "Second refined", revision: 2 };
 // Tasks 9 and 10 wait for triage with decisions to answer.
 const DECIDED = { ...REFINED, id: 9, title: "Decided one", revision: 3,
@@ -399,6 +402,7 @@ let WRITTEN = { 3: { ...TASK, notes: [...TASK.notes] },
                   9: { ...DECIDED, notes: [] },
                   10: { ...SECOND_DECIDED, notes: [] },
                   11: { ...FRESH, notes: [] }, 12: { ...CRLF, notes: [] },
+                  5: { ...LANDING, notes: [] },
                   7: { ...PARKED, notes: [...PARKED.notes] } };
 let nextNote = 20;
 
@@ -639,7 +643,7 @@ function lost(answer) {
             + "it may have landed" } };
 }
 
-let READ = { 1: SENT_BACK, 2: UNPLANNED, 5: LANDING, 7: PARKED, 14: CLOSED_ANSWERED,
+let READ = { 1: SENT_BACK, 2: UNPLANNED, 7: PARKED, 14: CLOSED_ANSWERED,
                15: REFINED_ANSWERED, 16: SHELVED_APPROVED, 17: SHELVED_UNAPPROVED,
                18: MD_TASK };
 // A task whose read the registry fails, as an error it did not mean would.

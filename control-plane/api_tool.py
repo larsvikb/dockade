@@ -61,10 +61,10 @@ class ToolCallRequest(BaseModel):
     # only a call made under the digest it was pinned under, so this can only narrow.
     schema_digest: str | None = None
     # The id the sandbox sent in its header (the gateway's ``app.sandbox_id``), or
-    # None. Checked again in ``tool_authorize`` against ``holds.SANDBOX_RE``, as the
+    # None. Checked again in ``tool_authorize`` against ``policy.SANDBOX_RE``, as the
     # digest is against its shape, so the store and a card hold only that shape
     # whatever arrives: anything else is a call with no id. An ask records it and
-    # joins on it; no pin reads it.
+    # joins on it, and a timed pin answers only the id its card recorded.
     sandbox: str | None = None
 
 
@@ -110,7 +110,8 @@ def tool_authorize(req: ToolCallRequest) -> dict:
     digest = (digest if isinstance(digest, str) and inventory._DIGEST_RE.fullmatch(digest)
               else None)
     sandbox = getattr(req, "sandbox", None)
-    sandbox = (sandbox if isinstance(sandbox, str) and holds.SANDBOX_RE.fullmatch(sandbox)
+    sandbox = (sandbox
+               if isinstance(sandbox, str) and policy.SANDBOX_RE.fullmatch(sandbox)
                else None)
     # Ahead of policy, which looks the names up. Why, and where ``args`` are refused
     # instead: control-plane/DESIGN.md, "A lone surrogate is refused where it is
@@ -119,7 +120,7 @@ def tool_authorize(req: ToolCallRequest) -> dict:
         decision, reason, pin_card = "deny", store.UNENCODABLE, None
     else:
         decision, reason, pin_card = policy._tool_ruling(
-            server, tool, req.args if showable else None, digest)
+            server, tool, req.args if showable else None, digest, sandbox)
 
     if decision in ("allow", "deny"):
         # A pin answered: the gateway gets a call token to write on the outcome line,
@@ -161,7 +162,7 @@ def tool_authorize(req: ToolCallRequest) -> dict:
     # allow and deny rows do, which names a pin the call met but that did not answer.
     # It names the sandbox by the prefix the card shows, never the whole id.
     why = (f"{tool} on {server}: {reason}; registered as tool ask {ask.approval_id}"
-           + (f" from sandbox {sandbox[:holds.SANDBOX_PREFIX]}" if sandbox else "")
+           + (f" from sandbox {sandbox[:policy.SANDBOX_PREFIX]}" if sandbox else "")
            + (" (joined an identical ask already pending)" if ask.joined else "")
            + " — nothing is blocked; the agent resumes with its resume token")
     store._audit("hold", stage="tool-call", client=req.client,

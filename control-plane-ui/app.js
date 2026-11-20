@@ -337,7 +337,7 @@ function start() {
                         `asked ${fmtTime(a.ts)}`,
                         a.client ? `from ${a.client}` : null,
                         // The prefix the sandbox printed at boot, which is all of its
-                        // id the backend serves (holds.SANDBOX_PREFIX).
+                        // id the backend serves (policy.SANDBOX_PREFIX).
                         a.sandbox_prefix ? `sandbox ${a.sandbox_prefix}` : null]
       .filter(Boolean).join(" · ");
 

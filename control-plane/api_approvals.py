@@ -368,18 +368,24 @@ def _resolve_tool_ask_request(approval_id: str, req: ResolveRequest,
 def _allow_pinned(approval_id: str, ask: dict | None, fields: object,
                   actor: str, leased: bool) -> JSONResponse:
     """Allow this call, and pin the chosen fields so that later calls carrying the same
-    values run without a card: for good, or ``leased`` for ``policy.PIN_LEASE_SECONDS``.
+    values run without a card: for good and for every sandbox, or ``leased`` for
+    ``policy.PIN_LEASE_SECONDS`` and only for the sandbox the card came from.
 
     Only the field NAMES come from the request. Each must be one the ask offers
     (``policy._pin_candidates``), and every value is copied from the ask as stored,
-    the move ``resolve`` makes for a persist pattern. A refusal writes nothing, so the
-    card stays pending and the operator can choose again."""
+    the move ``resolve`` makes for a persist pattern. So is the sandbox a timed pin
+    answers: the id the ask recorded, never anything the request carries, and a card
+    that recorded none is refused a timed pin. A refusal writes nothing, so the card
+    stays pending and the operator can choose again."""
     if ask is None:
         return JSONResponse({"ok": False, "detail": "not pending (unknown)",
                              "status": None}, status_code=409)
     candidates = policy._pin_candidates(ask["args_json"], ask["schema_digest"])
     if candidates["refused"]:
         return JSONResponse({"ok": False, "detail": candidates["refused"]},
+                            status_code=400)
+    if leased and not ask["has_sandbox"]:
+        return JSONResponse({"ok": False, "detail": policy.NO_SANDBOX_TIMED},
                             status_code=400)
     offered = {c["field"] for c in candidates["fields"]}
     chosen = fields if isinstance(fields, list) else []
@@ -409,6 +415,8 @@ def _allow_pinned(approval_id: str, ask: dict | None, fields: object,
 
     named = ", ".join(sorted(chosen))
     now = time.time()
+    # Which sandboxes the pin answers now, by prefix, never the whole id.
+    reach = policy._sandbox_words(answer.sandbox)
     # From the configured duration, as the egress lease's reason is
     # (``api_authorize._decision_scope``). Read only where this click wrote the
     # deadline.
@@ -433,27 +441,40 @@ def _allow_pinned(approval_id: str, ask: dict | None, fields: object,
                         f"— the call runs only if the agent returns for it")
     # Standing policy, recorded as policy is: a new pin gets the word a rule's creation
     # gets, a pin that now lasts longer the word a rule's edit gets, and the pin's
-    # revoke is the counterpart of both.
+    # revoke is the counterpart of both. Each says which sandboxes the pin answers.
+    answers = (f"{ask['tool']} on {ask['server']} pinned on {named} runs without a "
+               f"card{lasting or ', with no expiry,'} in {reach} while its rule asks")
+    # A timed pin made permanent says so: it answered one sandbox, and now every one.
+    promoted = (", and now answers every sandbox where it answered one"
+                if answer.promoted else "")
     if answer.change == "created":
         store._audit("create", stage="tool-policy", **where,
-                     reason=f"pin {answer.pin_id} created from this ask; {ask['tool']} "
-                            f"on {ask['server']} pinned on {named} runs without a card"
-                            f"{lasting} while its rule asks")
+                     reason=f"pin {answer.pin_id} created from this ask; {answers}")
     elif answer.change == "extended":
         had = policy._short_duration(answer.replaced - now)
         store._audit("edit", stage="tool-policy", **where,
                      reason=f"pin {answer.pin_id} extended from this ask ({had} left "
-                            f"before it); {ask['tool']} on {ask['server']} pinned on "
-                            f"{named} runs without a card"
-                            f"{lasting or ', with no expiry,'} while its rule asks")
+                            f"before it{promoted}); {answers}")
     elif answer.change == "rebound":
         had = ("no expiry" if answer.replaced is None
                else f"{policy._short_duration(answer.replaced - now)} left")
         store._audit("edit", stage="tool-policy", **where,
                      reason=f"pin {answer.pin_id} rebound to the tool's current "
-                            f"arguments from this ask ({had} before it); {ask['tool']} "
-                            f"on {ask['server']} pinned on {named} runs without a card"
-                            f"{lasting or ', with no expiry,'} while its rule asks")
+                            f"arguments from this ask ({had} before it{promoted}); "
+                            f"{answers}")
+    revoked = answer.revoked
+    if revoked is not None:
+        # Once the write has landed, as ``api_mcp.revoke_mcp_pin`` audits, and naming
+        # the revoked pin's own card as that does. The operator chose a timed pin, not
+        # this delete, so the reason says why the click made it.
+        store._audit("revoke", stage="tool-policy", server=ask["server"],
+                     tool=ask["tool"], actor=actor, approval_id=revoked["approval_id"],
+                     reason=f"pin {revoked['id']} revoked by a timed pin from card "
+                            f"{approval_id}: it answered every sandbox, under older "
+                            f"arguments of the tool than that card's, so it answered "
+                            f"none now; {ask['tool']} on {ask['server']} pinned on "
+                            f"{named} answers {reach} through pin {answer.pin_id} "
+                            f"instead")
     return JSONResponse({"ok": True, "kind": "tool", "outcome": "allow",
                          "status": answer.status, "server": ask["server"],
                          "tool": ask["tool"],
@@ -461,7 +482,15 @@ def _allow_pinned(approval_id: str, ask: dict | None, fields: object,
                                  "created": answer.change == "created",
                                  "extended": answer.change == "extended",
                                  "rebound": answer.change == "rebound",
-                                 "expires_at": answer.expires_at}})
+                                 "expires_at": answer.expires_at,
+                                 # Whose pin it is, by prefix; None answers every
+                                 # sandbox.
+                                 "sandbox_prefix": (
+                                     answer.sandbox[:policy.SANDBOX_PREFIX]
+                                     if answer.sandbox else None),
+                                 "promoted": answer.promoted,
+                                 "revoked": (None if revoked is None
+                                             else {"id": revoked["id"]})}})
 
 
 @router.get("/approvals/stream")

@@ -23,7 +23,6 @@ import hashlib
 import json
 import math
 import os
-import re
 import threading
 import time
 import uuid
@@ -466,14 +465,6 @@ def _args_digest(server: str, tool: str, args_json: str) -> str:
         f"{server}\x00{tool}\x00{args_json}".encode()).hexdigest()
 
 
-#: The shape of a sandbox id (claude-sandbox/tier-setup.sh mints it, the gateway
-#: forwards only this shape and ``api_tool.tool_authorize`` checks it again), and how
-#: much of one an operator is shown: the prefix the sandbox prints at boot. The whole
-#: id stays in the store, so no view hands a reader an id to send as another sandbox.
-SANDBOX_RE = re.compile(r"[0-9a-f]{32}")
-SANDBOX_PREFIX = 8
-
-
 class ToolAsk(NamedTuple):
     """Outcome of registering an ask. Either ``refused`` is set, or ``approval_id`` and
     ``resume_token`` both are; ``joined`` means an identical ask was already pending
@@ -573,8 +564,8 @@ def _register_tool_ask(server: str, tool: str, args: object,
     pin to the schema the retry was not made under.
 
     ``sandbox`` is the id the calling sandbox sent, already checked against
-    ``SANDBOX_RE`` by the caller, or None. It is in the join key too, so two sandboxes
-    behind one address (one replacing another) raise two cards: each card names the
+    ``policy.SANDBOX_RE`` by the caller, or None. It is in the join key too, so two
+    sandboxes behind one address (one replacing another) raise two cards: each card names the
     sandbox it came from.
 
     Under ``_LOCK`` for the same reason as ``_reserve_hold``: otherwise two concurrent
@@ -672,6 +663,14 @@ def _refuse_tool(scope: str, detail: str = "") -> ToolAsk:
                    f"tool ask capacity exceeded ({scope}{detail}) — fail-closed", 0.0)
 
 
+# What either ask lookup returns. Of the sandbox id only whether there is one, which a
+# timed pin needs (``api_approvals._allow_pinned``), so the id is in no dict built from
+# a lookup.
+_ASK_COLUMNS = ("id, ts, server, tool, args_json, client, status, deadline, "
+                "resolved_at, claimed_at, schema_digest, "
+                "sandbox IS NOT NULL AS has_sandbox")
+
+
 def _get_tool_ask(approval_id: str) -> dict | None:
     """One ask by id, expiry applied first. None if there is no such ask. The
     operator's lookup: the agent's is ``_ask_by_token``.
@@ -683,8 +682,7 @@ def _get_tool_ask(approval_id: str) -> dict | None:
     _expire_tool_asks()
     with store._connect() as conn:
         row = conn.execute(
-            "SELECT id, ts, server, tool, args_json, client, status, deadline, "
-            "resolved_at, claimed_at, schema_digest FROM tool_approvals WHERE id=?",
+            f"SELECT {_ASK_COLUMNS} FROM tool_approvals WHERE id=?",  # noqa: S608
             (approval_id,)).fetchone()
     return dict(row) if row is not None else None
 
@@ -700,8 +698,7 @@ def _ask_by_token(resume_token: str) -> dict | None:
     _expire_tool_asks()
     with store._connect() as conn:
         row = conn.execute(
-            "SELECT id, ts, server, tool, args_json, client, status, deadline, "
-            "resolved_at, claimed_at, schema_digest FROM tool_approvals "
+            f"SELECT {_ASK_COLUMNS} FROM tool_approvals "  # noqa: S608
             "WHERE resume_token=?", (resume_token,)).fetchone()
     return dict(row) if row is not None else None
 
@@ -751,36 +748,52 @@ class PinnedAnswer(NamedTuple):
     under other arguments of the tool, and now answers under this card's), or None
     when the pin in place already reached as far. ``expires_at`` is the pin's deadline
     as stored after the write, None for a permanent pin, and ``replaced`` the deadline
-    an extension or a rebind moved."""
+    an extension or a rebind moved.
+
+    ``sandbox`` is the id the pin answers after the write, None for a permanent pin,
+    which answers every sandbox. ``promoted`` says a timed pin of this card's sandbox
+    became that permanent pin. ``revoked`` is the permanent pin a timed click deleted
+    because it was made under other arguments of the tool, as its ``id`` and the
+    ``approval_id`` of its card, or None."""
     status: str | None
     refused: str | None
     pin_id: int | None
     change: Literal["created", "extended", "rebound"] | None
     expires_at: float | None
     replaced: float | None
+    sandbox: str | None = None
+    promoted: bool = False
+    revoked: dict | None = None
 
 
-def _rebind_refusal(conn, pin, ask) -> str | None:
+def _rebind_refusal(conn, pin, ask, revoke: bool = False) -> str | None:
     """Why the card ``ask`` cannot rebind ``pin``, a live pin it meets that was made
-    under another digest; None if it can.
+    under another digest, or with ``revoke`` cannot delete it; None if it can.
 
     A card raised before the one the pin was last bound from is refused, so a stale
-    card cannot bind a pin back to the schema it moved from. A bound card no longer in
-    the store says nothing about order, and does not refuse."""
+    card cannot bind a pin back to the schema it moved from, nor delete a pin a newer
+    card bound. A bound card no longer in the store says nothing about order, and does
+    not refuse."""
     bound = conn.execute("SELECT ts FROM tool_approvals WHERE id=?",
                          (pin["approval_id"],)).fetchone()
     if bound is None or ask["ts"] >= bound["ts"]:
         return None
+    undo = ("revoke it as made under older arguments" if revoke
+            else "bind it back to the arguments it was made under")
     return (f"pin {pin['id']} was pinned again from a card raised after this one, so "
-            f"this card cannot bind it back to the arguments it was made under; allow "
-            f"this call without a pin instead")
+            f"this card cannot {undo}; allow this call without a pin instead")
 
 
 def _stale_pins(ask) -> list[dict]:
     """The live pins the pending ``ask`` meets that were made under another digest of
-    the tool's arguments, so did not answer it: ``id``, ``fields`` and, where pinning
-    those same fields from this card would be refused, ``refused``
-    (``_rebind_refusal``). Empty for an ask with no digest, which pins nothing."""
+    the tool's arguments, so did not answer it. Only pins that answer the ask's
+    sandbox: a permanent one, or a timed one of its own (``policy._pins_met``).
+
+    Each is ``id``, ``fields``, ``sandbox_prefix`` (whose timed pin it is, None for a
+    permanent pin) and ``refused``, why pinning those same fields from this card cannot
+    rebind it (``_rebind_refusal``). A permanent pin also carries ``revoke_refused``,
+    why a timed pin from this card cannot delete it; None on a timed pin, which no
+    click deletes. Empty for an ask with no digest, which pins nothing."""
     if ask["schema_digest"] is None:
         return []
     try:
@@ -788,9 +801,13 @@ def _stale_pins(ask) -> list[dict]:
     except (TypeError, ValueError):
         return []
     with store._connect() as conn:
-        met = policy._pins_met(conn, ask["server"], ask["tool"], args, time.time())
+        met = policy._pins_met(conn, ask["server"], ask["tool"], args, time.time(),
+                               ask["sandbox"])
         return [{"id": pin["id"], "fields": sorted(policy._parse_pins(pin["pins_json"])),
-                 "refused": _rebind_refusal(conn, pin, ask)}
+                 "sandbox_prefix": pin["sandbox"][:policy.SANDBOX_PREFIX] or None,
+                 "refused": _rebind_refusal(conn, pin, ask),
+                 "revoke_refused": (None if pin["sandbox"]
+                                    else _rebind_refusal(conn, pin, ask, revoke=True))}
                 for pin in met if pin["schema_digest"] != ask["schema_digest"]]
 
 
@@ -806,21 +823,40 @@ def _resolve_tool_ask_pinned(approval_id: str, actor: str, pins_json: str,
     land between the check and the insert; ``api_mcp.revoke_mcp_rule`` closes the other
     direction in its DELETE.
 
-    One row per pin set (the UNIQUE on ``tool_pins``). Under the same digest a pin set
-    already in place is only ever widened: no expiry beats any, and otherwise the later
-    one wins. Under another digest it is REBOUND: the row takes this card's digest and
-    this click's expiry, whatever the two expiries were, so a rebind can shorten a
-    permanent pin. That is a new grant over a new schema, and the operator chose its
-    length now (``_rebind_refusal`` says which card may make it). A changed row names
-    this card and this resolver, who decided how far it now reaches; the audit keeps
-    each earlier grant."""
+    A pin set has one permanent row, which answers every sandbox (``sandbox`` ''), and
+    one timed row per sandbox (the UNIQUE on ``tool_pins``). A click reads the
+    permanent row and its own sandbox's timed row, never another sandbox's: B's card
+    neither extends, rebinds nor deletes A's timed pin.
+
+    - A permanent click acts on the permanent row if there is one, by the rules below,
+      and leaves its sandbox's timed row to lapse. With none, it PROMOTES its
+      sandbox's timed row to permanent, so one row answers every sandbox, or creates
+      one.
+    - A timed click writes nothing over a permanent row made under this card's digest,
+      which answers its sandbox already. Otherwise it acts on its sandbox's timed row,
+      and DELETES a permanent row made under another digest, which answers no sandbox
+      now: the operator's answer on the plan, so that nothing stays dormant. The
+      deleted row comes back as ``revoked`` for the caller to audit.
+
+    On the row it acts on, under the same digest a pin set already in place is only
+    ever widened: no expiry beats any, and otherwise the later one wins. Under another
+    digest it is REBOUND: the row takes this card's digest and this click's expiry, a
+    new grant over a new schema whose length the operator chose now. A permanent click
+    acts on a permanent row or promotes a timed one, and a timed click on a timed row,
+    so a rebind never shortens a permanent pin. ``_rebind_refusal`` says which card may
+    rebind or delete a row, and is checked on both before anything is written. A
+    changed row names this card and this resolver, who decided how far it now reaches;
+    the audit keeps each earlier grant.
+
+    A timed click needs the card's sandbox id. ``api_approvals._allow_pinned`` refuses
+    one without it first; past that, the NOT NULL on ``tool_pins.sandbox`` would."""
     now = time.time()
     expires_at = None if lasts is None else now + lasts
     with store._connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
             ask = conn.execute(
-                "SELECT ts, server, tool, schema_digest FROM tool_approvals "
+                "SELECT ts, server, tool, schema_digest, sandbox FROM tool_approvals "
                 "WHERE id=? AND status='pending'", (approval_id,)).fetchone()
             if ask is None:
                 conn.rollback()
@@ -841,13 +877,27 @@ def _resolve_tool_ask_pinned(approval_id: str, actor: str, pins_json: str,
             # the deadline); it clears the way for a pin set that lapsed to be granted
             # again as a new pin.
             conn.execute("DELETE FROM tool_pins WHERE expires_at <= ?", (now,))
-            existing = conn.execute(
-                "SELECT id, expires_at, approval_id, schema_digest FROM tool_pins "
-                "WHERE server=? AND tool=? AND pins_json=?",
-                (ask["server"], ask["tool"], pins_json)).fetchone()
-            rebind = (existing is not None
-                      and existing["schema_digest"] != ask["schema_digest"])
-            refused = _rebind_refusal(conn, existing, ask) if rebind else None
+
+            def row(sandbox):
+                return conn.execute(
+                    "SELECT id, expires_at, approval_id, schema_digest, sandbox "
+                    "FROM tool_pins WHERE server=? AND tool=? AND pins_json=? "
+                    "AND sandbox=?",
+                    (ask["server"], ask["tool"], pins_json, sandbox)).fetchone()
+            shared = row("")
+            own = row(ask["sandbox"]) if ask["sandbox"] else None
+            digest = ask["schema_digest"]
+            revoke = None
+            if expires_at is None:
+                existing = shared if shared is not None else own
+            elif shared is not None and shared["schema_digest"] == digest:
+                existing = shared
+            else:
+                existing, revoke = own, shared
+            rebind = existing is not None and existing["schema_digest"] != digest
+            refused = ((_rebind_refusal(conn, revoke, ask, revoke=True)
+                        if revoke is not None else None)
+                       or (_rebind_refusal(conn, existing, ask) if rebind else None))
             if refused:
                 conn.rollback()
                 return PinnedAnswer(None, refused, None, None, None, None)
@@ -855,37 +905,48 @@ def _resolve_tool_ask_pinned(approval_id: str, actor: str, pins_json: str,
                 "UPDATE tool_approvals SET status='allowed', resolved_at=?, "
                 "resolved_by=? WHERE id=? AND status='pending'",
                 (now, actor, approval_id))
+            if revoke is not None:
+                conn.execute("DELETE FROM tool_pins WHERE id=?", (revoke["id"],))
+            # What a written row answers: every sandbox for good, this card's for a
+            # while.
+            scope = "" if expires_at is None else ask["sandbox"]
             replaced = None
             if existing is None:
                 pin_id = conn.execute(
                     "INSERT INTO tool_pins(server, tool, pins_json, approval_id, "
-                    "created_at, granted_by, expires_at, schema_digest) "
-                    "VALUES (?,?,?,?,?,?,?,?)",
+                    "created_at, granted_by, expires_at, schema_digest, sandbox) "
+                    "VALUES (?,?,?,?,?,?,?,?,?)",
                     (ask["server"], ask["tool"], pins_json, approval_id, now, actor,
-                     expires_at, ask["schema_digest"])).lastrowid
+                     expires_at, digest, scope)).lastrowid
                 change = "created"
             elif rebind:
                 pin_id, replaced = existing["id"], existing["expires_at"]
                 conn.execute(
-                    "UPDATE tool_pins SET schema_digest=?, expires_at=?, approval_id=?, "
-                    "granted_by=? WHERE id=?",
-                    (ask["schema_digest"], expires_at, approval_id, actor, pin_id))
+                    "UPDATE tool_pins SET schema_digest=?, expires_at=?, sandbox=?, "
+                    "approval_id=?, granted_by=? WHERE id=?",
+                    (digest, expires_at, scope, approval_id, actor, pin_id))
                 change = "rebound"
             elif existing["expires_at"] is not None and (
                     expires_at is None or expires_at > existing["expires_at"]):
                 pin_id, replaced = existing["id"], existing["expires_at"]
                 conn.execute(
-                    "UPDATE tool_pins SET expires_at=?, approval_id=?, granted_by=? "
-                    "WHERE id=?", (expires_at, approval_id, actor, pin_id))
+                    "UPDATE tool_pins SET expires_at=?, sandbox=?, approval_id=?, "
+                    "granted_by=? WHERE id=?",
+                    (expires_at, scope, approval_id, actor, pin_id))
                 change = "extended"
             else:
                 pin_id, expires_at = existing["id"], existing["expires_at"]
+                scope = existing["sandbox"]
                 change = None
             conn.commit()
         except Exception:
             conn.rollback()
             raise
-    return PinnedAnswer("allowed", None, pin_id, change, expires_at, replaced)
+    return PinnedAnswer(
+        "allowed", None, pin_id, change, expires_at, replaced, sandbox=scope or None,
+        promoted=existing is not None and existing["sandbox"] != scope,
+        revoked=(None if revoke is None
+                 else {"id": revoke["id"], "approval_id": revoke["approval_id"]}))
 
 
 def _claim_tool_ask(approval_id: str) -> dict | None:
@@ -969,21 +1030,27 @@ def _list_tool_asks() -> list[dict]:
     the call met under another digest (``_stale_pins``), which pinning their fields
     again rebinds.
 
-    ``sandbox_prefix`` is the first ``SANDBOX_PREFIX`` characters of the id the ask
-    came from, or None: cut in the query, so the whole id never reaches the operator's
-    queue. Named for what it holds, so nothing mistakes it for the id itself."""
+    ``sandbox_prefix`` is the first ``policy.SANDBOX_PREFIX`` characters of the id the
+    ask came from, or None. Named for what it holds, so nothing mistakes it for the id
+    itself. The whole id is read only to find the pins that answer its sandbox, and
+    never reaches the operator's queue. ``timed_refused`` says why the card offers no
+    timed pin, None when it does: ``api_approvals._allow_pinned`` refuses the same."""
     _expire_tool_asks()
     with store._connect() as conn:
         rows = conn.execute(
             "SELECT id, ts, server, tool, args_json, client, deadline, schema_digest, "
-            "substr(sandbox, 1, ?) AS sandbox_prefix "
-            "FROM tool_approvals WHERE status='pending' ORDER BY ts",
-            (SANDBOX_PREFIX,)).fetchall()
-    return [dict(r, kind="tool",
-                 pin_options={**policy._pin_candidates(r["args_json"],
-                                                       r["schema_digest"]),
-                              "stale": _stale_pins(r)})
-            for r in rows]
+            "sandbox FROM tool_approvals WHERE status='pending' ORDER BY ts").fetchall()
+    cards = []
+    for r in rows:
+        card = dict(r)
+        sandbox = card.pop("sandbox")
+        cards.append(dict(
+            card, kind="tool",
+            sandbox_prefix=sandbox[:policy.SANDBOX_PREFIX] if sandbox else None,
+            pin_options={**policy._pin_candidates(r["args_json"], r["schema_digest"]),
+                         "stale": _stale_pins(r),
+                         "timed_refused": None if sandbox else policy.NO_SANDBOX_TIMED}))
+    return cards
 
 
 def _list_withdrawn() -> list[str]:

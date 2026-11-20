@@ -65,7 +65,22 @@ handle is "not seen", harmless to send again since it sets the same flag, and a 
 those held, its absence says nothing, and it is not checked. A bulk handle, all or none,
 is decided by the flagged list read from just past the highest note it named, so notes
 flagged since cannot push the named ones off the page: one still listed means none
-landed, and sending again only marks them.
+landed, and sending again only marks them. A reparent is decided as an edit is, by its
+revision and then the parent it sent. A create names no revision and is not idempotent,
+and the page's list is filtered while ids are global, so the newest id it holds says
+nothing; instead it reads its repo's newest id in every state, inside the gate, before
+the send (`readBound`), and sends nothing when that read fails. Ids are never reused and
+a task never changes repo, so on a lost answer a task past that bound with the title and
+body sent, read in full, is the one it made (`createdTask`); none on a page that reaches
+the bound is "not found yet", a full page all past it "could not check", and neither is
+"safe to send again". A note's task is drawn, so its timeline can be read again by hand;
+a lost create has nothing drawn, so the write is kept as sent, with its bound, and "look
+again" reruns the check on it, never on the draft as edited since, which would miss the
+task that landed. Found, the task opens, a draft edited since stays, and the line says
+the task was created as sent. Until then the create reads "send anyway — may make a
+second task", and only one that lands or is lost again replaces the kept write: a
+refused one leaves it, since the first may still land. A reload loses both, as it loses
+a note's draft.
 
 **A note names no revision.** A move and a break name the revision the page showed, so
 a task that changed since is refused, and the page draws the task the refusal carries
@@ -77,23 +92,29 @@ two tabs replying to one note post two replies, which the timeline shows. The
 lost-answer check above is what keeps one from being sent twice.
 
 **The moves are in the detail, below the plan, one at a time.** Only the open task
-carries them, never an inbox row, so a move is made on what was read. The moves on a
-note sit under it in the timeline, on every page of it. The one write outside the detail
-is the flagged list's bulk handle (below), which names the notes a page drew rather than
-a task. Approve and send back are each a control of their own, as a refined task's two
-answers. Approve says when what it approves hides a character. One write is out at a
-time, its controls off until its outcome is drawn, the flagged list's too, and the poll
+carries them, never an inbox row, so a move is made on what was read.
+The moves on a note sit under it in the timeline, on every page of it, and a reparent,
+the parent typed as an id as blockers are, under the moves. Two writes are outside the
+detail: the flagged list's bulk handle (below), which names the notes a page drew rather
+than a task, and a new task, from a form above All tasks, in an active repo and any
+state but refined, kept across views until it lands or is discarded, its outcome a line
+of its own under it and the task, once it lands, opened through the hash. Approve and
+send back are each a control of their own, as a refined task's two answers. Approve says
+when what it approves hides a character. One write is out at a time, its controls off
+until its outcome is drawn, the flagged list's and the create form's too, and the poll
 never redraws the detail, so no button moves under the pointer between two clicks.
 Opening a task from another replaces what is under the pointer, so the second click of a
-double-click is neither a move nor an open of a related task. No move asks to be
-confirmed: its label, which names the outcome before it is pressed, is the confirmation.
-Most moves are recorded and undone by another move, but not all: a note or a reply can
-be hidden and never removed; an approve's answers stand; a break, or any state move of a
-claimed task, ends the live claim, which no operator move gives back
-(`operator_moves.move`); and a move to proposed, a send back or from any other state,
-supersedes the current plan, an approved one too, and no move makes a superseded plan
-current again (`tasks.update`). A move on a note touches neither the task's spec nor its
-revision, so whatever holds the task's moves leaves it free, as it leaves adding a note.
+double-click is neither a move nor an open of a related task. No
+move asks to be confirmed: its label, which names the outcome before it is pressed, is
+the confirmation, as approve's names the revision and plan, a reparent's the parent and
+revision, and a create's the repo and state, since a task can be closed but never
+removed. Most moves are recorded and undone by another move, but
+not all: a note or a reply can be hidden and never removed; an approve's answers stand;
+a break, or any state move of a claimed task, ends the live claim, which no operator move
+gives back (`operator_moves.move`); and a move to proposed, a send back or from any other
+state, supersedes the current plan, an approved one too, and no move makes a superseded
+plan current again (`tasks.update`). A move on a note touches neither the task's spec
+nor its revision, so whatever holds the task's moves leaves it free, as it leaves adding a note.
 
 **One scheme of labels.** Every action control on the task page says what it does, and
 is marked primary or caution, by one rule (`moveLabel` and the functions beside it): a main
@@ -296,11 +317,14 @@ by it, so nothing handles it. That confirm guards text not yet sent, not a write
 "no move asks to be confirmed" above stands; a draft with no changes drops unasked,
 since nothing is lost. While the draft has changes, approve, send back, every state
 move and breaking the claim are held, since each would act on a spec other than the
-one on screen; a note and the moves on notes stay free. An edit leaves a claim as it is
-(`operator_moves.edit`), and the save says the claim stays. A refined task's form says the edit amends the spec its plan was written against, and once the task's revision
-is past the plan's, `planNotice` says approving approves the task as it now is, with that
-plan, or for a plan approved before, that reopening opens it so: for a refined task
-only, since an approved task's revision always passes its plan's.
+one on screen; a note, the moves on notes and a reparent stay free, a reparent since
+it changes no spec field, so the draft only rebases onto the read after it. An edit
+leaves a claim as it is (`operator_moves.edit`), and the save says the claim stays. A
+refined task's form says the edit amends the spec its plan was written against, and
+once the task's revision is past the plan's, `planNotice` says approving approves the
+task as it now is, with that plan, or for a plan approved before, that reopening opens
+it so: for a refined task only, since an approved task's revision always passes its
+plan's.
 
 **A revised plan is drawn as what changed.** A refiner's revision is mostly the plan it
 replaced, so a plan with a predecessor (`planPredecessor`: the next lower id, not the one
@@ -347,8 +371,9 @@ every structural check the approval page has (`PageChecks`: markup and script, t
 module list against the Dockerfile and the imports, fetches against the relay, free
 names), the writes' methods against the relay, the pure halves of `tasks.js`,
 `moves.js`, `diff.js` and `markdown.js` under node, the approve's rule and body against
-the registry's own (`ApproveRuleTests`), the edit's bodies on a scratch store
-(`EditRuleTests`), and, from source, how the page gates the registry,
+the registry's own (`ApproveRuleTests`), the edit's, the create's and the reparent's
+bodies on a scratch store (`EditRuleTests`, `CreateRuleTests`, `ReparentRuleTests`),
+and, from source, how the page gates the registry,
 sends its writes, draws agent text and decisions, and fills the line atop the detail;
 `tests/test_task_registry_inbox.py` holds what the inbox counts, and
 `tests/test_task_registry_operator.py` that each note is on the history row that

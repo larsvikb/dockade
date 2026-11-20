@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 /* The tasks page's writes: the ones the relay passes (tasks-ui/app.py), which moves a
- * task or a note offers, and what the page makes of each answer. Nothing here draws:
+ * task or a note offers, a new task, and what the page makes of each answer. Nothing
+ * here draws:
  * tasks.js draws, and imports this, which imports nothing of it. Why a move names a
  * revision and a note and a move on one none, and why a lost answer is read back rather
  * than sent again, is tasks-ui/DESIGN.md, "A note names no revision" and "A write whose
@@ -403,6 +404,57 @@ function editLanded(sent, current) {
     && (!sent.blocked_by || sameIds(sent.blocked_by, blockerIds(current)));
 }
 
+// ── a parent, and a new task ─────────────────────────────────────────────────
+// Typed as the blockers are (`parseBlockers`): ids, never picked from a list.
+
+// "#7" to one id, empty to none (`id` null), or the word that is not one id (`bad`): a
+// word that is not an id, or a second id, since a task has one parent.
+export function parseParent(text) {
+  const { ids, bad } = parseBlockers(text);
+  if (!ids) return { id: null, bad };
+  if (ids.length > 1) {
+    return { id: null, bad: String(text).split(/[\s,]+/).filter(Boolean)[1] };
+  }
+  return { id: ids.length ? ids[0] : null, bad: null };
+}
+
+// The parent a read of the task names, or null for none.
+export function parentId(task) {
+  const parent = task && typeof task === "object" ? task.parent : null;
+  return parent && Number.isInteger(parent.id) ? parent.id : null;
+}
+
+// The body a reparent of `task` sends, naming the revision shown, or null while the text
+// does not parse or names the parent the task has: there is nothing to send then. Empty
+// text is no parent, sent as null, which `reparent` takes as "remove it".
+export function reparentRequest(task, text) {
+  if (!task || typeof task !== "object") return null;
+  const { id, bad } = parseParent(text);
+  if (bad !== null || id === parentId(task)) return null;
+  return { revision: task.revision, parent: id };
+}
+
+// The states a task can be created in: every one but refined, since a new task has no
+// plan (`operator_moves.create`).
+export const CREATE_STATES = TASK_STATES.filter(s => s !== "refined");
+
+// The body a create sends, from the form's draft, or null while the repo or state is not
+// one it can take, the title is blank, or the parent or blockers do not parse. Every
+// field goes, none as null and blockers each once, so the request reads as what was
+// asked; an empty body goes too, since `create` takes one.
+export function createRequest(draft) {
+  const d = draft && typeof draft === "object" ? draft : {};
+  const parent = parseParent(d.parent);
+  const blockers = parseBlockers(d.blockers).ids;
+  if (typeof d.repo !== "string" || !d.repo || !CREATE_STATES.includes(d.state)
+      || blankText(d.title) || typeof d.body !== "string" || parent.bad !== null
+      || !blockers) return null;
+  return { repo: d.repo, title: d.title, body: d.body, state: d.state,
+           severity: SEVERITIES.includes(d.severity) ? d.severity : null,
+           kind: KINDS.includes(d.kind) ? d.kind : null,
+           parent: parent.id, blocked_by: [...new Set(blockers)] };
+}
+
 const JSON_TYPE = { "content-type": "application/json" };
 
 // Send one write. Each names its path in its own `fetch`, as a POST, where the relay
@@ -424,6 +476,14 @@ export function sendWrite(write) {
   }
   if (write.kind === "edit") {
     return fetch(`/api/tasks/${path}/edit`, { method: "POST", headers: JSON_TYPE,
+      body: JSON.stringify(write.send) });
+  }
+  if (write.kind === "reparent") {
+    return fetch(`/api/tasks/${path}/reparent`, { method: "POST", headers: JSON_TYPE,
+      body: JSON.stringify(write.send) });
+  }
+  if (write.kind === "create") {
+    return fetch(`/api/tasks`, { method: "POST", headers: JSON_TYPE,
       body: JSON.stringify(write.send) });
   }
   if (write.kind === "note") {
@@ -489,28 +549,32 @@ export function writeOutcome(answer) {
 
 // Whether a write whose answer was lost landed, from what was read after it, or `null`
 // when that read failed. A bulk handle is checked against the flagged notes read from
-// just past the highest it named (`{ flagged }`); every other write against its task
-// read again (`{ task, held }`), which carries its latest notes and the newest page of
-// its timeline:
+// just past the highest it named (`{ flagged }`); a create against its repo's newest
+// page, every state, and the tasks on it past its bound with the title sent, each read
+// in full (`{ list, candidates }`); every other write against its task read again
+// (`{ task, held }`), which carries its latest notes and the newest page of its
+// timeline:
 //   found           it shows it landed: a move's revision moved and its state is the
 //                   target; an approve's moved and its plan has the answers sent
 //                   (`approveLanded`); a break's moved and nobody holds it; an edit's
-//                   moved and every field it sent reads back as sent; a note of the
-//                   operator's with its text is newer than any the page held; a note
-//                   move's own entry, with the value sent, is newer than any the page
-//                   held; no note a bulk named is still listed, since all of one lands
-//                   or none;
-//   not-landed      a move, approve, break or edit whose revision did not move: sending
-//                   it again cannot apply it twice, since the revision would refuse it;
-//                   or a bulk whose notes are still listed, which sending again only
-//                   marks;
+//                   moved and every field it sent reads back as sent; a reparent's moved
+//                   and its parent is the one sent; a note of the operator's with its
+//                   text is newer than any the page held; a note move's own entry, with
+//                   the value sent, is newer than any the page held; no note a bulk
+//                   named is still listed, since all of one lands or none; a task past a
+//                   create's bound with the title and body sent (`createdTask`);
+//   not-landed      a move, approve, break, edit or reparent whose revision did not
+//                   move: sending it again cannot apply it twice, since the revision
+//                   would refuse it; or a bulk whose notes are still listed, which
+//                   sending again only marks;
 //   not-seen        a hide, show or handle without a reply whose entry is not there:
 //                   it may still land, and sending it again sets the same flag;
-//   not-found-yet   a note or a reply that is not there, which may still be committing:
-//                   never "safe to send again";
+//   not-found-yet   a note, a reply or a create that is not there, which may still be
+//                   committing: never "safe to send again";
 //   could-not-check the read failed, or more landed since than its newest page holds;
 //   changed         the task changed, but not as this write would have.
 export function checkWrite(write, reread) {
+  if (write.kind === "create") return checkCreate(write, reread);
   if (write.kind === "handle-many") {
     const listed = reread && reread.flagged && Array.isArray(reread.flagged.notes)
       ? new Set(reread.flagged.notes.map(n => n && n.id)) : null;
@@ -535,7 +599,33 @@ export function checkWrite(write, reread) {
   if (write.kind === "break" && !task.claim) return "found";
   if (write.kind === "approve" && approveLanded(write, task)) return "found";
   if (write.kind === "edit" && editLanded(write.send, task)) return "found";
+  if (write.kind === "reparent" && parentId(task) === write.send.parent) return "found";
   return "changed";
+}
+
+// The id of the task a lost create made, or null: one read in full, past the bound, with
+// the title and body sent. Ids are never reused and a task never changes repo, so one
+// past the newest id its repo had before the send was made since, and one with this
+// title and body is taken for this one. The first such on the newest page.
+export function createdTask(write, reread) {
+  const found = (reread && Array.isArray(reread.candidates) ? reread.candidates : [])
+    .find(c => c && typeof c === "object" && Number(c.id) > Number(write.bound)
+          && c.title === write.send.title && c.body === write.send.body);
+  return found ? found.id : null;
+}
+
+// A lost create, by its repo's newest page. Not found, it is "not found yet" only when
+// that page reaches the bound, holding a task at or below it or the repo's whole total;
+// a full page all past the bound may have pushed the task off it, so nothing is known.
+function checkCreate(write, reread) {
+  const page = reread && reread.list && typeof reread.list === "object" ? reread.list
+    : null;
+  const rows = page && Array.isArray(page.tasks) ? page.tasks : null;
+  if (!rows || !Array.isArray(reread.candidates)) return "could-not-check";
+  if (createdTask(write, reread) !== null) return "found";
+  const reached = rows.length >= Number(page.total)
+    || rows.some(t => t && Number(t.id) <= Number(write.bound));
+  return reached ? "not-found-yet" : "could-not-check";
 }
 
 // An approve by what it leaves: its plan's answers, each the options and "other" text

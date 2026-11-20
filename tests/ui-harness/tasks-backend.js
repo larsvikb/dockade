@@ -588,9 +588,109 @@ function edit(t, body, history) {
   return { status: 200, json: { ok: true, task: t.id, revision: t.revision } };
 }
 
+// A step holds the next create: its answer is the relay's 504 and it lands only when
+// another step says, so the page's check after the send does not find it.
+let holdNext = false;
+let heldCreate = null;
+export function holdNextCreate() { holdNext = true; }
+export function landHeldCreate() {
+  const body = heldCreate;
+  heldCreate = null;
+  if (body) create(body);
+}
+
+function refused(detail) {
+  return { status: 400, json: { ok: false, current: null, detail } };
+}
+
+// A task by id, as the store has it, in whichever map holds it.
+function known(id) {
+  return WRITTEN[id] || READ[id] || null;
+}
+function brief(t) {
+  return { id: t.id, title: t.title, state: t.state };
+}
+
+// A parent's check, as `tasks.check_parent`: a task in the same repo, never `task`
+// itself nor one below it.
+function parentRefusal(repo, parent, task = null) {
+  if (parent === null) return null;
+  const p = known(parent);
+  if (!p || p.repo !== repo) return `no task ${parent} in this repo to be a parent`;
+  for (let up = p; up; up = up.parent ? known(up.parent.id) : null) {
+    if (task !== null && up.id === task) {
+      return `task ${parent} descends from task ${task}, so cannot be its parent`;
+    }
+  }
+  return null;
+}
+
+// A new task, as `operator_moves.create` makes it, at the next id, in the store and with
+// a history of its own.
+let nextTask = 40;
+function create(body) {
+  const id = nextTask++;
+  const blockers = body.blocked_by.map(b => brief(known(b) || { id: b, title: `Task ${b}`,
+                                                                  state: "open" }));
+  WRITTEN[id] = {
+    id, repo: body.repo, title: body.title, body: body.body, state: body.state,
+    severity: body.severity, kind: body.kind, revision: 1, created_at: NOW,
+    updated_at: NOW, ready: false, blocked: blockers.length > 0, claim: null,
+    notes_total: 0, parent: body.parent === null ? null : brief(known(body.parent)),
+    children: [], blockers, plan: null, answers: [], notes: [],
+  };
+  HISTORIES[id] = [entry("operator", "create", NOW, { ...body, actor: null })];
+  return { status: 200, json: { ok: true, task: id, revision: 1 } };
+}
+
+function createWrite(body) {
+  if (!REPOS.some(r => r.name === body.repo && !r.retired)) {
+    return refused(`no repo ${body.repo} to file a task in`);
+  }
+  if (body.state === "refined") {
+    return refused("a new task has no plan, so cannot start refined");
+  }
+  const problem = parentRefusal(body.repo, body.parent);
+  if (problem) return refused(problem);
+  if (holdNext) {
+    holdNext = false;
+    heldCreate = body;
+    return { status: 504, json: { ok: false, current: null,
+      detail: "the task registry did not answer a write it was sent (ReadTimeout): "
+              + "it may have landed" } };
+  }
+  return lost(create(body));
+}
+
+// A reparent, as `operator_moves.reparent` makes it.
+function reparent(t, body, history) {
+  const problem = parentRefusal(t.repo, body.parent, t.id);
+  if (problem) return refused(problem);
+  const before = t.parent ? t.parent.id : null;
+  t.parent = body.parent === null ? null : brief(known(body.parent));
+  t.revision += 1;
+  history.push(entry("operator", "reparent", NOW, { revision: t.revision, before,
+                                                    parent: body.parent, actor: null }));
+  return { status: 200, json: { ok: true, task: t.id, revision: t.revision } };
+}
+
+// A repo's tasks in every state, newest first, a page of them, as `reads.list_tasks`.
+function everyState(repo) {
+  const all = Object.values({ ...READ, ...WRITTEN }).filter(t => t.repo === repo)
+    .sort((a, b) => b.id - a.id);
+  return { tasks: all.slice(0, PAGE).map(t => ({
+             id: t.id, repo: t.repo, title: t.title, state: t.state,
+             severity: t.severity ?? null, kind: t.kind ?? null, claim: t.claim ?? null,
+             ready: Boolean(t.ready), blocked: Boolean(t.blocked),
+             notes_total: t.notes_total ?? 0 })),
+           total: all.length };
+}
+
 function write(path, body) {
   if (path.startsWith("/api/notes/")) return lost(noteWrite(path, body));
-  const m = path.match(/^\/api\/tasks\/(\d+)\/(move|approve|break-claim|edit|notes)$/);
+  if (path === "/api/tasks") return createWrite(body);
+  const m = path
+    .match(/^\/api\/tasks\/(\d+)\/(move|approve|break-claim|edit|reparent|notes)$/);
   const t = m && WRITTEN[m[1]];
   if (!t) return null;
   const history = HISTORIES[m[1]];
@@ -611,6 +711,8 @@ function write(path, body) {
     answer = approve(t, body, history);
   } else if (m[2] === "edit") {
     answer = edit(t, body, history);
+  } else if (m[2] === "reparent") {
+    answer = reparent(t, body, history);
   } else if (m[2] === "break-claim") {
     if (!t.claim) {
       return { status: 400, json: { ok: false, current: null,
@@ -645,7 +747,9 @@ function lost(answer) {
 
 let READ = { 1: SENT_BACK, 2: UNPLANNED, 7: PARKED, 14: CLOSED_ANSWERED,
                15: REFINED_ANSWERED, 16: SHELVED_APPROVED, 17: SHELVED_UNAPPROVED,
-               18: MD_TASK };
+               18: MD_TASK,
+               // In another repo: a parent no dockade task can take.
+               19: { ...UNPLANNED, id: 19, repo: "old-repo", title: "Elsewhere" } };
 // A task whose read the registry fails, as an error it did not mean would.
 const FAILING = "13";
 
@@ -687,6 +791,9 @@ export function respond(method, path, body, params) {
   }
   if (what === "plans" && PLANS[id]) return { status: 200, json: PLANS[id] };
   if (path === "/api/repos") return { status: 200, json: REPOS };
+  if (path === "/api/tasks" && params.get("state") === "all") {
+    return { status: 200, json: everyState(params.get("repo")) };
+  }
   if (path === "/api/tasks") {
     const rows = params.get("repo") === "dockade" && params.get("state") === "open"
       ? TASKS : [];
@@ -708,9 +815,12 @@ export function respond(method, path, body, params) {
 // list share stays one note. ui-diff never calls it, so a step's writes still carry to
 // the next there.
 const START = structuredClone({ WRITTEN, HISTORIES, NOTES, PLANS, READ, nextNote,
-                                nextEntry });
+                                nextEntry, nextTask });
 export function reset() {
-  ({ WRITTEN, HISTORIES, NOTES, PLANS, READ, nextNote, nextEntry } = structuredClone(START));
+  ({ WRITTEN, HISTORIES, NOTES, PLANS, READ, nextNote, nextEntry, nextTask }
+    = structuredClone(START));
   registryUp = true;
   loseNext = false;
+  holdNext = false;
+  heldCreate = null;
 }

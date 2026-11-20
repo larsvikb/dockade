@@ -4,8 +4,8 @@
 // same steps run against the base tree and the branch.
 
 import {
-  deferElsewhere, editElsewhere, flagElsewhere, loseNextAnswer, replanElsewhere,
-  startRegistry, stopRegistry,
+  deferElsewhere, editElsewhere, flagElsewhere, holdNextCreate, landHeldCreate,
+  loseNextAnswer, replanElsewhere, startRegistry, stopRegistry,
 } from "./tasks-backend.js";
 
 // The list's own hash, set as a link would set it, once the page has followed it. A
@@ -381,7 +381,106 @@ export const STEPS = [
   }],
   ["its source shown", async ({ page }) => { await toggleSource(page); }],
   ["drawn again", async ({ page }) => { await toggleSource(page); }],
+  // A new task, from All tasks. A tree with no create form takes these steps as doing
+  // nothing, as it does the markdown switch, so the rest still compares.
+  ["a new task's form, a zero-width space in its title", async ({ page }) => {
+    await toList(page, "#view=all");
+    await ifCreate(page, async () => {
+      await page.click("#create-open");
+      await page.fill('#create-form input[data-create-field="title"]', "Rotate\u200b keys");
+    });
+  }],
+  ["All tasks left and come back to, the draft kept", async ({ page }) => {
+    await page.click("#view-inbox");
+    await page.click("#view-all");
+  }],
+  // Task 19 is in another repo, so the registry refuses it as a parent; the draft stays.
+  ["a parent in another repo, refused", async ({ page }) => {
+    await ifCreate(page, async () => {
+      await page.fill('#create-form textarea[data-create-field="body"]', "In place.");
+      await page.fill('#create-form input[data-create-field="parent"]', "#19");
+      await page.click('#create-form button[data-write="create"]');
+    });
+  }],
+  // Landed: the page opens it, task 40, as its row would.
+  ["with a parent and a blocker, created and opened", async ({ page }) => {
+    await ifCreate(page, async () => {
+      await page.fill('#create-form input[data-create-field="parent"]', "#3");
+      await page.fill('#create-form input[data-create-field="blockers"]', "#2");
+      await page.click('#create-form button[data-write="create"]');
+    });
+  }],
+  // It lands and its answer is lost: the repo read back past the bound finds task 41.
+  ["a create whose answer is lost, found and opened", async ({ page }) => {
+    await toList(page, "#view=all");
+    await ifCreate(page, async () => {
+      await page.click("#create-open");
+      await page.fill('#create-form input[data-create-field="title"]', "Lost one");
+      loseNextAnswer();
+      await page.click('#create-form button[data-write="create"]');
+    });
+  }],
+  // Lost before it lands: not found, and the create now says it may make a second.
+  ["a create not found yet", async ({ page }) => {
+    await toList(page, "#view=all");
+    await ifCreate(page, async () => {
+      await page.click("#create-open");
+      await page.fill('#create-form input[data-create-field="title"]', "Held one");
+      holdNextCreate();
+      await page.click('#create-form button[data-write="create"]');
+    });
+  }],
+  // It lands, and the title is edited after the send: "look again" checks what was
+  // sent, finds task 42 and opens it, and the edited draft stays.
+  ["it lands, its title is edited, and it is looked for again", async ({ page }) => {
+    await ifCreate(page, async () => {
+      landHeldCreate();
+      await page.fill('#create-form input[data-create-field="title"]', "Held one, edited");
+      await page.click('#create-form button[data-create="look-again"]');
+    });
+  }],
+  ["back to All tasks: the edited draft and what it came to", async ({ page }) => {
+    await toList(page, "#view=all");
+  }],
+  // A reparent names the revision shown; none removes the parent.
+  ["task 3, by its URL", async ({ page }) => {
+    await page.evaluate(() => { location.hash = "#task=3"; });
+  }],
+  ["its parent set to #2", async ({ page }) => {
+    await ifParent(page, async () => {
+      await page.fill("#task-detail input[data-parent]", "#2");
+      await page.click('#task-detail button[data-write="reparent"]');
+    });
+  }],
+  ["and removed", async ({ page }) => {
+    await ifParent(page, async () => {
+      await page.fill("#task-detail input[data-parent]", "");
+      await page.click('#task-detail button[data-write="reparent"]');
+    });
+  }],
+  // Task 40 is task 3's child, so making it task 3's parent would loop: refused.
+  ["a parent below it, refused", async ({ page }) => {
+    await ifParent(page, async () => {
+      await page.fill("#task-detail input[data-parent]", "#40");
+      await page.click('#task-detail button[data-write="reparent"]');
+    });
+  }],
+  // Changed elsewhere since it was read: refused for the revision, and drawn as it is.
+  ["a reparent after it changed elsewhere", async ({ page }) => {
+    await ifParent(page, async () => {
+      editElsewhere(3);
+      await page.fill("#task-detail input[data-parent]", "#1");
+      await page.click('#task-detail button[data-write="reparent"]');
+    });
+  }],
 ];
+
+async function ifCreate(page, act) {
+  if (await page.$("#create-open")) await act();
+}
+async function ifParent(page, act) {
+  if (await page.$("#task-detail input[data-parent]")) await act();
+}
 
 async function toggleSource(page) {
   const toggle = await page.$("#task-detail button[data-source-toggle]");

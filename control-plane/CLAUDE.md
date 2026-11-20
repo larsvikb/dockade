@@ -45,6 +45,8 @@ lives rather than restating it.
   on the module that READS it.
 - The stubs record only the routes this code declares. Anything FastAPI does by itself
   (its docs routes, #93; how an included router resolves) is checked in a venv with
-  `control-plane/requirements.txt`, using `fastapi.testclient`.
+  `control-plane/requirements.txt`, using `fastapi.testclient`. Starlette's TestClient
+  needs httpx2, which that file does not install:
+  `pip install -r control-plane/requirements.txt httpx2`.
 - One uvicorn worker, by design: the hold registry is in-process (the concurrency
   paragraph of the `app.py` docstring), so nothing here may assume a second process.

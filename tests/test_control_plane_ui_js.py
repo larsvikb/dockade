@@ -5465,6 +5465,21 @@ class DuplicateBadgeSourceTests(unittest.TestCase):
         # And no duplicate badge, because nothing joins a tool card by waiting on it.
         self.assertNotIn("dup", parts)
 
+    def test_a_tool_card_names_the_sandbox_by_the_prefix_it_printed(self):
+        # Which sandbox raised the ask, as the prefix claude-sandbox/tier-setup.sh
+        # prints at boot: the backend serves no more of the id than that
+        # (holds._list_tool_asks). A source guard, as the card's DOM is not run here.
+        body = re.search(r"function buildToolCard\(a\) \{(.*?)\n  \}", self.src,
+                         re.S).group(1)
+        meta = re.search(r"meta\.textContent = \[(.*?)\]\s*\.filter\(Boolean\)",
+                         body, re.S)
+        self.assertIsNotNone(meta, "the tool card's meta line moved")
+        self.assertIn("a.sandbox_prefix ? `sandbox ${a.sandbox_prefix}` : null",
+                      meta.group(1))
+        parts = self._appended("buildToolCard")
+        self.assertIn("meta", parts)
+        self.assertLess(parts.index("meta"), parts.index("actions"))
+
     def test_the_count_stops_moving_once_the_card_is_being_decided(self):
         # Rewriting the number under a click already in flight is the same lie in the
         # other direction: by then it is history, not what the button will do.

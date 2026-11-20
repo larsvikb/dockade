@@ -1867,6 +1867,21 @@ the per-call read, and with it the rate limit a human is; every call it answers 
 audited, naming the pin. And as with a lease, a new pin does not release a matching
 card that is already pending.
 
+**A card names its sandbox by an id the sandbox mints.** Sandboxes of one class share
+it, and their addresses are reassigned, so neither the class nor the address says
+which sandbox raised an ask. Claude's tier mints a random id each boot
+(`claude-sandbox/tier-setup.sh`) and writes it literally into the gateway entry as the
+`X-Dockade-Sandbox` header, which Claude Code sends on every request (NOTES.md, "An
+`http` MCP server's `headers` reach the server on every request", also on why
+literally). The gateway relays it only in its minted shape (`app.sandbox_id`), the
+bridge checks that shape again, and the ask records the id and joins on it, so asks
+with two ids never share a card. A tier or an older image that sends no id records
+none, and its asks join only other asks with none. An operator sees only the first 8
+characters, which the sandbox prints at boot: on the card and in the `hold` row's
+reason, never the whole id. The id is the agent's word, not a credential: the agent
+can read its own and send any header, so the id may only narrow what a call meets,
+and no pin reads it yet.
+
 **An `ask` answers immediately.** The gateway never blocks the agent, and never blocks
 a control-plane worker either — two independent choices, both away from the egress
 shape. It *registers* the ask with the control plane and takes an id back at
@@ -1899,9 +1914,10 @@ Three properties make the pending answer safe rather than merely non-blocking:
   different route.
 - **A grant is bound to the payload, not to the tool.** The approval is keyed by a
   hash of the arguments the human actually read, so a retry with *different*
-  arguments cannot ride an approval given for different ones. The same hash is the
-  join key: an identical retry attaches to the pending ask instead of raising a
-  second card, which is what `_GROUPS` does for egress duplicates.
+  arguments cannot ride an approval given for different ones. The same hash is in the
+  join key, beside the client, the schema digest and the sandbox id
+  (`holds._register_tool_ask`): an identical retry attaches to the pending ask instead
+  of raising a second card, which is what `_GROUPS` does for egress duplicates.
 - **A decided ask is terminal and says so.** `denied`, `expired` and `withdrawn` must
   be unmistakably distinct from `pending`, and unmistakably final, or an agent retries
   a refusal forever.

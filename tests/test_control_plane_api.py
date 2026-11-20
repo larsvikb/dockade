@@ -4918,13 +4918,13 @@ _MOVED = "e1" * 32
 
 
 def _tool_call(server="mcp-github", tool="get_me", args=None, client=CLASS_IP,
-               schema_digest=_SCHEMA):
+               schema_digest=_SCHEMA, sandbox=None):
     """One tool call put to the bridge. ``client`` defaults to a real sandbox-net
     address for the reason ``_auth_req`` does: it is what the per-client cap counts
     and what an identical retry joins on."""
     return cp.api_tool.tool_authorize(
         cp.api_tool.ToolCallRequest(server=server, tool=tool, args=args, client=client,
-                                    schema_digest=schema_digest))
+                                    schema_digest=schema_digest, sandbox=sandbox))
 
 
 def _ask_id(answer):
@@ -5173,6 +5173,84 @@ def _pin(pins, tool="create_pull_request", server="mcp-github", expires_at=None,
 
 _PINNED = {"owner": "acme", "repo": "dockade"}
 _PR_ARGS = {**_PINNED, "title": "t", "body": "b", "head": "topic", "base": "main"}
+
+
+class SandboxIdAskTests(_ToolBridgeTestCase):
+    """The id a sandbox sends (claude-sandbox/tier-setup.sh mints it, the gateway
+    relays it): recorded on the ask, in its join key, and shown to the operator as
+    its first 8 characters only. No pin's answer reads it."""
+
+    audits = True
+    # No 8 characters repeat at another offset, so a prefix cut from anywhere but the
+    # start is a different string.
+    A = "0123456789abcdeffedcba9876543210"
+    B = "13579bdf02468aceeca86420fdb97531"
+
+    def setUp(self):
+        super().setUp()
+        _tool_rule("create_pull_request", "ask")
+
+    @staticmethod
+    def _stored(answer):
+        with cp.store._connect() as conn:
+            return conn.execute("SELECT sandbox FROM tool_approvals WHERE id=?",
+                                (_ask_id(answer),)).fetchone()["sandbox"]
+
+    @staticmethod
+    def _hold_reason(answer):
+        with cp.store._connect() as conn:
+            return conn.execute(
+                "SELECT reason FROM audit WHERE kind='hold' AND approval_id=? "
+                "ORDER BY id DESC", (_ask_id(answer),)).fetchone()["reason"]
+
+    def _call(self, sandbox):
+        return _tool_call(tool="create_pull_request", args=_PR_ARGS, sandbox=sandbox)
+
+    def test_two_ids_on_one_client_and_the_same_arguments_raise_two_cards(self):
+        a, b = self._call(self.A), self._call(self.B)
+        self.assertFalse(b["joined"])
+        self.assertNotEqual(_ask_id(a), _ask_id(b))
+        self.assertEqual((self._stored(a), self._stored(b)), (self.A, self.B))
+        self.assertEqual([c["sandbox_prefix"] for c in cp.holds._list_tool_asks()],
+                         [self.A[:8], self.B[:8]])
+
+    def test_the_same_id_joins_and_no_id_does_not(self):
+        first = self._call(self.A)
+        again = self._call(self.A)
+        self.assertTrue(again["joined"])
+        self.assertEqual(_ask_id(again), _ask_id(first))
+        self.assertFalse(self._call(None)["joined"])
+
+    def test_an_id_not_in_the_shape_is_no_id(self):
+        none = self._call(None)
+        self.assertIsNone(self._stored(none))
+        for bad in (self.A.upper(), self.A[:-1], self.A + "0", self.A[:-1] + "g",
+                    self.A + "\n", "", 7):
+            with self.subTest(bad=bad):
+                answer = self._call(bad)
+                # Joins the card with no id, so it was stored as none.
+                self.assertEqual(_ask_id(answer), _ask_id(none))
+                self.assertNotIn("from sandbox", self._hold_reason(answer))
+
+    def test_the_hold_audit_names_the_prefix_and_never_the_whole_id(self):
+        reason = self._hold_reason(self._call(self.A))
+        self.assertIn(f"from sandbox {self.A[:8]}", reason)
+        self.assertNotIn(self.A[:9], reason)
+        self.assertNotIn("from sandbox", self._hold_reason(self._call(None)))
+
+    def test_the_operators_queue_carries_the_prefix_and_never_the_whole_id(self):
+        self._call(self.A)
+        self._call(None)
+        payload = json.dumps(cp.holds._pending_payload())
+        self.assertNotIn(self.A[:9], payload)
+        self.assertEqual([c["sandbox_prefix"] for c in cp.holds._list_tool_asks()],
+                         [self.A[:8], None])
+
+    def test_a_pin_still_answers_every_sandbox(self):
+        _pin(_PINNED)
+        for sandbox in (self.A, self.B, None):
+            with self.subTest(sandbox=sandbox):
+                self.assertEqual(self._call(sandbox)["decision"], "allow")
 
 
 class PinnedAllowBridgeTests(_ToolBridgeTestCase):
@@ -7858,7 +7936,7 @@ class FreshSchemaTests(_FreshStoreTestCase):
         self.assertEqual(cols, {"id", "ts", "server", "tool", "args_json",
                                 "args_digest", "client", "status", "deadline",
                                 "resolved_at", "resolved_by", "claimed_at",
-                                "schema_digest", "resume_token"})
+                                "schema_digest", "resume_token", "sandbox"})
 
     def test_new_store_has_the_mcp_server_table_and_no_secret_reference(self):
         # Asserted as an EXACT set, and the exactness is the assertion: a column
@@ -9021,9 +9099,8 @@ class ResultFactsMigrationTests(_FreshStoreTestCase):
         with cp.store._connect() as conn:
             return [tuple(r) for r in conn.execute("PRAGMA table_info(audit)")]
 
-    def test_v14_is_the_current_step(self):
-        self.assertEqual(cp.store.SCHEMA_VERSION, 14)
-        self.assertEqual(cp.store._STEPS[-1][:2],
+    def test_v14_is_the_fourteenth_step(self):
+        self.assertEqual(cp.store._STEPS[13][:2],
                          (14, "tool result size, hash and duration"))
 
     def test_the_columns_are_added_as_null_and_the_rows_kept(self):
@@ -9034,7 +9111,7 @@ class ResultFactsMigrationTests(_FreshStoreTestCase):
                 "SELECT ts, kind, status, result_bytes, result_sha256, duration "
                 "FROM audit ORDER BY ts")]
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-        self.assertEqual(version, 14)
+        self.assertEqual(version, cp.store.SCHEMA_VERSION)
         self.assertEqual(rows, [
             {"ts": 1.0, "kind": "outcome", "status": "ok", "result_bytes": None,
              "result_sha256": None, "duration": None},
@@ -9060,12 +9137,82 @@ class ResultFactsMigrationTests(_FreshStoreTestCase):
         self.assertEqual([c[1] for c in self._audit_columns()].count("duration"), 1)
 
 
+class AskSandboxMigrationTests(_FreshStoreTestCase):
+    """v15, which gives ``tool_approvals`` the id of the sandbox that raised an ask.
+    Additive; every existing ask keeps NULL, which is an ask with no id."""
+
+    _ASKS_V14 = ResumeTokenMigrationTests._ASKS_V12[:-1] + ", resume_token TEXT)"
+
+    def _v14_store(self, name):
+        self._use_store(name)
+        cp.store._init_db()
+        now = time.time()
+        with cp.store._connect() as conn:
+            conn.execute("DROP INDEX IF EXISTS tool_approvals_resume_token")
+            conn.execute("DROP TABLE tool_approvals")
+            conn.execute(self._ASKS_V14)
+            conn.execute(
+                "INSERT INTO tool_approvals(id, ts, server, tool, args_json, "
+                "args_digest, client, status, deadline, resume_token) VALUES "
+                "('p1', ?, 'mcp-github', 'issue_read', '{}', 'd1', ?, 'pending', ?, ?)",
+                (now, CLASS_IP, now + 3600, "cd" * 16))
+            conn.execute("PRAGMA user_version = 14")
+            conn.commit()
+
+    @staticmethod
+    def _shape():
+        with cp.store._connect() as conn:
+            return ([tuple(r) for r in conn.execute("PRAGMA table_info(tool_approvals)")],
+                    sorted(tuple(r)[1:] for r in conn.execute(
+                        "PRAGMA index_list(tool_approvals)")))
+
+    def test_v15_is_the_current_step(self):
+        self.assertEqual(cp.store.SCHEMA_VERSION, 15)
+        self.assertEqual(cp.store._STEPS[-1][:2], (15, "sandbox id on tool asks"))
+
+    def test_the_column_is_added_as_null_and_the_ask_kept(self):
+        self._v14_store("ask-sandbox-migrate.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            row = dict(conn.execute(
+                "SELECT id, status, resume_token, sandbox FROM tool_approvals"
+            ).fetchone())
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+        self.assertEqual(version, 15)
+        self.assertEqual(row, {"id": "p1", "status": "pending",
+                               "resume_token": "cd" * 16, "sandbox": None})
+
+    def test_a_migrated_and_a_fresh_table_agree(self):
+        self._v14_store("ask-sandbox-agree-migrated.db")
+        cp.store._init_db()
+        migrated = self._shape()
+        self._use_store("ask-sandbox-agree-fresh.db")
+        cp.store._init_db()
+        self.assertEqual(migrated, self._shape())
+        self.assertEqual(migrated[0][-1][1:3], ("sandbox", "TEXT"))
+
+    def test_v15_leaves_a_store_that_has_the_column_alone(self):
+        self._use_store("ask-sandbox-again.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            cp.store._step_15_ask_sandbox(conn)
+        self.assertEqual([c[1] for c in self._shape()[0]].count("sandbox"), 1)
+
+    def test_v15_skips_a_store_without_the_table(self):
+        self._use_store("ask-sandbox-no-table.db")
+        with cp.store._connect() as conn:
+            for ddl in MigrationTests._OLD_SCHEMA:
+                conn.execute(ddl)
+            cp.store._step_15_ask_sandbox(conn)
+            self.assertEqual(cp.store._columns(conn, "tool_approvals"), set())
+
+
 class CallTokenTableTests(_FreshStoreTestCase):
     """``tool_call_tokens`` is a new table, so ``_init_db`` creates it on a store from
     before it and no step does: the store keeps its rows and its version, and an older
     image can still open it."""
 
-    def test_a_v14_store_without_it_gains_it_empty_and_stays_at_v14(self):
+    def test_a_current_store_without_it_gains_it_empty_and_keeps_its_version(self):
         self._use_store("call-tokens-v14.db")
         cp.store._init_db()
         with cp.store._connect() as conn:
@@ -9075,7 +9222,7 @@ class CallTokenTableTests(_FreshStoreTestCase):
             conn.execute("INSERT INTO audit(ts, kind, stage, server, tool, status) "
                          "VALUES (1.0, 'outcome', 'tool-result', 'mcp-github', "
                          "'get_pr', 'ok')")
-            conn.execute("PRAGMA user_version = 14")
+            conn.execute(f"PRAGMA user_version = {cp.store.SCHEMA_VERSION}")
             conn.commit()
         cp.store._init_db()
         with cp.store._connect() as conn:
@@ -9085,7 +9232,7 @@ class CallTokenTableTests(_FreshStoreTestCase):
             audit = [tuple(r) for r in conn.execute("SELECT ts, kind, status FROM audit")]
             version = conn.execute("PRAGMA user_version").fetchone()[0]
         self.assertEqual((ddl[0] if ddl else None, tokens, audit, version),
-                         (fresh, 0, [(1.0, "outcome", "ok")], 14))
+                         (fresh, 0, [(1.0, "outcome", "ok")], cp.store.SCHEMA_VERSION))
 
 
 from test_sqlite_transaction_control import under_the_announced_default  # noqa: E402 (beside its one user)

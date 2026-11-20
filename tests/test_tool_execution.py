@@ -269,6 +269,38 @@ class SchemaDigestTests(ExecutionTestCase):
         self.assertNotEqual(self._sent("issue_read"), before)
 
 
+class SandboxIdTests(ExecutionTestCase):
+    """The sandbox id ``app.sandbox_id`` read, relayed on the decision and nowhere
+    else: claim and withdraw keep the resume token and the address as their check."""
+
+    SANDBOX = "0123456789abcdef" * 2
+
+    def test_the_decision_carries_the_id(self):
+        self.answer = {"decision": "deny", "reason": "not under test"}
+        self.execute.call("mcp-github__get_issue", {"id": 1}, "172.30.0.5",
+                          self.SANDBOX)
+        [(path, payload)] = self.asked
+        self.assertEqual((path, payload["sandbox"]), ("/tool/authorize", self.SANDBOX))
+
+    def test_a_call_with_no_id_sends_none(self):
+        self.answer = {"decision": "deny", "reason": "not under test"}
+        self.execute.call("mcp-github__get_issue", {"id": 1}, "172.30.0.5")
+        [(_, payload)] = self.asked
+        self.assertIn("sandbox", payload)
+        self.assertIsNone(payload["sandbox"])
+
+    def test_resume_and_withdraw_do_not_carry_it(self):
+        self.answer = {"decision": "deny", "reason": "not under test"}
+        token = "ab" * 16
+        for tool in (self.execute.surface.RESUME_TOOL,
+                     self.execute.surface.WITHDRAW_TOOL):
+            self.execute.call(tool, {"resume_token": token}, "172.30.0.5",
+                              self.SANDBOX)
+        self.assertTrue(self.asked)
+        for _, payload in self.asked:
+            self.assertNotIn("sandbox", payload)
+
+
 #: The gateway's clock in AskTests, pinned, and the deadline its fixture answers with:
 #: in the future of that clock, so the ordinary path is the one every test exercises.
 NOW = 1_800_000_000.0  # 2027-01-15 08:00:00 UTC

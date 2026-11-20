@@ -311,6 +311,41 @@ What follows, in the order it matters:
 - **Resumable Streamable HTTP (`Last-Event-ID`) is not documented for this client.**
   Nothing to build on.
 
+## An `http` MCP server's `headers` reach the server on every request
+
+Measured in a tier-1 container on 2026-11-20, Claude Code 2.1.329. A Python listener on
+`127.0.0.1:18765` logged each request's headers, and then:
+
+```
+claude --mcp-config '{"mcpServers":{"probe":{"type":"http",
+    "url":"http://127.0.0.1:18765/mcp",
+    "headers":{"X-Dockade-Sandbox":"0123456789abcdef0123456789abcdef"}}}}' \
+  -p 'reply with: ok'
+```
+
+Every request carried the header with its literal value: four POSTs and one GET to
+`/mcp`. `claude-wrapper.sh` hands `/etc/claude-code/mcp-gateway.json` to the same
+`--mcp-config` flag, so this is the path the sandbox id takes
+(`claude-sandbox/tier-setup.sh` writes `X-Dockade-Sandbox` into that entry).
+
+Why the value is written literally rather than as a `${VAR}` for Claude Code to expand:
+the id is minted in tier-setup.sh's root phase and is in no environment the agent's
+Claude Code inherits; and expansion has a blanking rule of its own. The docs list
+specific credential variable names that read as empty in an MCP config (Claude Code's
+own, the cloud providers', `HTTPS_PROXY`, `NPM_TOKEN`:
+`https://code.claude.com/docs/en/mcp#credential-variables-that-read-as-empty`), and
+anthropics/claude-code issue #100930 reports `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`
+blanking values that look like credentials, as a 32-hex id may.
+
+The probe shows the client half only. The whole chain (tier-setup mints an id, the
+gateway relays it, a card shows the prefix that boot printed, and two sandboxes show
+two) held on the reference machine on 2026-11-20, at commit 4f1db3d: two Claude
+sandboxes from that commit's image printed `Sandbox id  -> c52e5e04` and `-> 6ede8175`,
+each called a tool that held, and each card showed `sandbox <prefix>` with its own
+sandbox's prefix. Whether the
+id also reaches the shared config volume (a transcript, a debug log), where a sibling
+could read it, is to be noted here when seen.
+
 ## A directory marketplace is used in place, and `settings.json` is the whole declaration
 
 Measured in-container on Claude Code 2.1.236, with a fixture marketplace

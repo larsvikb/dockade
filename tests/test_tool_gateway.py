@@ -525,6 +525,7 @@ class ResponseBodyTests(unittest.TestCase):
 
         def __init__(self, body: bytes):
             self._body = body
+            self.headers: dict = {}
 
         async def stream(self):
             yield self._body
@@ -537,7 +538,7 @@ class ResponseBodyTests(unittest.TestCase):
                                        "text": "räk \U0001f600 \"q\" \\ </x>\n"}],
                   "isError": False}
 
-        def call(name, arguments, client):
+        def call(name, arguments, client, sandbox=None):
             gateway.outcomes.record("ok", "mcp-github", "get_pr", client=client,
                                     result=result)
             return result
@@ -595,6 +596,55 @@ class ResponseBodyTests(unittest.TestCase):
         hashed = gateway.protocol.encode(result)
         self.assertEqual(hashlib.sha256(hashed).hexdigest(), sha)
         self.assertIn(hashed, body)
+
+
+class SandboxHeaderTests(unittest.TestCase):
+    """The id a sandbox sends in ``X-Dockade-Sandbox``, read by ``/mcp`` and relayed
+    to ``execute.call``: in the shape claude-sandbox/tier-setup.sh mints, or None.
+    That the header name is the one tier-setup.sh writes is held in
+    tests/test_sandbox_wiring.py."""
+
+    GOOD_ID = "0123456789abcdef" * 2
+
+    class _Request:
+        client = type("Peer", (), {"host": "172.30.0.5"})()
+
+        def __init__(self, headers: dict):
+            # Lower-cased as Starlette stores them; its lookup ignores case.
+            self.headers = {k.lower(): v for k, v in headers.items()}
+
+        async def stream(self):
+            yield json.dumps({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                              "params": {"name": "mcp-github__get_pr",
+                                         "arguments": {}}}).encode()
+
+    def _relayed(self, headers: dict):
+        gateway = load_tool_gateway(GOOD)
+        seen = []
+
+        def call(name, arguments, client, sandbox=None):
+            seen.append((client, sandbox))
+            return {"content": [], "isError": False}
+
+        with mock.patch.object(gateway.execute, "call", call):
+            asyncio.run(gateway.mcp(self._Request(headers)))
+        [(client, sandbox)] = seen
+        self.assertEqual(client, "172.30.0.5")
+        return sandbox
+
+    def test_the_header_is_relayed(self):
+        self.assertEqual(self._relayed({"X-Dockade-Sandbox": self.GOOD_ID}),
+                         self.GOOD_ID)
+
+    def test_no_header_is_no_id(self):
+        self.assertIsNone(self._relayed({}))
+
+    def test_a_malformed_header_is_no_id(self):
+        for bad in (self.GOOD_ID.upper(), self.GOOD_ID[:-1], self.GOOD_ID + "0",
+                    self.GOOD_ID[:-1] + "g", f" {self.GOOD_ID}", f"{self.GOOD_ID}\n",
+                    ""):
+            with self.subTest(bad=bad):
+                self.assertIsNone(self._relayed({"X-Dockade-Sandbox": bad}))
 
 
 class DeepBodyTests(unittest.TestCase):

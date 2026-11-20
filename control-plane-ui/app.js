@@ -335,7 +335,10 @@ function start() {
     meta.className = "meta";
     meta.textContent = [a.server ? `on ${a.server}` : null,
                         `asked ${fmtTime(a.ts)}`,
-                        a.client ? `from ${a.client}` : null]
+                        a.client ? `from ${a.client}` : null,
+                        // The prefix the sandbox printed at boot, which is all of its
+                        // id the backend serves (holds.SANDBOX_PREFIX).
+                        a.sandbox_prefix ? `sandbox ${a.sandbox_prefix}` : null]
       .filter(Boolean).join(" · ");
 
     // The payload, verbatim, one click away at worst. This is the thing being

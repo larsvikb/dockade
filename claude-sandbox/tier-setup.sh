@@ -146,17 +146,32 @@ if [ "$(id -u)" -eq 0 ]; then
         # to resolve this leg anyway to arm the firewall's /32 grant, and reusing that
         # value is what keeps the config and the grant on one address
         # (sandbox-lib.sh's sc_governed_egress says why).
+        #
+        # THE SANDBOX ID: minted on every boot and sent on every request to the
+        # gateway as `X-Dockade-Sandbox`. A tool ask records it and its card shows the
+        # first 8, which are printed below; what it is and is not: DESIGN.md, "A card
+        # names its sandbox by an id the sandbox mints". Written LITERALLY, not as a
+        # `${VAR}` for Claude Code to expand: it is minted here, in the root phase, so
+        # it is in no environment the agent's Claude Code inherits, and expansion can
+        # blank a value that looks like a credential (NOTES.md, "An `http` MCP
+        # server's `headers` reach the server on every request"). 32 lowercase hex is
+        # the one shape the gateway forwards.
+        SANDBOX_ID="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
         install -o root -g root -m 0644 /dev/stdin "$MCP_GATEWAY_CONFIG" <<EOF
 {
   "mcpServers": {
     "gateway": {
       "type": "http",
-      "url": "http://${TOOL_GATEWAY_IP}:${TOOL_GATEWAY_PORT:-8100}/mcp"
+      "url": "http://${TOOL_GATEWAY_IP}:${TOOL_GATEWAY_PORT:-8100}/mcp",
+      "headers": {
+        "X-Dockade-Sandbox": "${SANDBOX_ID}"
+      }
     }
   }
 }
 EOF
         echo "  MCP gateway -> http://${TOOL_GATEWAY_IP}:${TOOL_GATEWAY_PORT:-8100}/mcp"
+        echo "  Sandbox id  -> ${SANDBOX_ID:0:8} (the prefix this sandbox's approval cards show)"
     fi
 
     # ---------------------------------------------------------------------------

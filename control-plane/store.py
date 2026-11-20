@@ -47,7 +47,7 @@ LEGACY_CLIENT_CLASS = "sandbox"
 # The schema this code expects. Every entry in ``_STEPS`` below adds exactly one,
 # and a store records the version it is at (see ``_migrate``), so "what has already
 # run here" is a number to compare rather than a schema to interrogate.
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 # The integers sqlite3 can bind: SQLite's INTEGER is 64-bit signed, and binding a
 # value outside it raises OverflowError, which a route would answer as a 500. A fact
@@ -588,6 +588,20 @@ def _step_14_result_facts(conn: sqlite3.Connection) -> None:
               flush=True)
 
 
+def _step_15_ask_sandbox(conn: sqlite3.Connection) -> None:
+    """v15 — ``tool_approvals`` gains ``sandbox``, the id the calling sandbox sent.
+    Existing asks keep NULL: none was sent before the gateway relayed one.
+
+    The table may be ABSENT, on a store stamped before it existed; ``_init_db``
+    creates it with the column."""
+    asks = _columns(conn, "tool_approvals")
+    if not asks or "sandbox" in asks:
+        return
+    conn.execute("ALTER TABLE tool_approvals ADD COLUMN sandbox TEXT")
+    print("control-plane: added sandbox to tool_approvals (existing asks keep NULL — "
+          "they were raised before the gateway relayed one)", flush=True)
+
+
 # The handle that carries a pin's card from ``/tool/authorize`` to the call's outcome
 # line. A call a pin answered raises no ask and so has no resume token; without this its
 # outcome row could name no card. Rows are spent by ingest (``ingest._settle_tool_row``)
@@ -653,6 +667,7 @@ _STEPS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = (
     (12, "pins bound to the tool's arguments", _step_12_schema_digest),
     (13, "resume tokens on tool asks", _step_13_resume_token),
     (14, "tool result size, hash and duration", _step_14_result_facts),
+    (15, "sandbox id on tool asks", _step_15_ask_sandbox),
 )
 
 
@@ -914,7 +929,13 @@ def _init_db() -> None:
                 -- what claim and withdraw take. Independent of `id`, which is the
                 -- operator's and never leaves the control plane. NULL on a row no
                 -- token was issued for (one closed before v13).
-                resume_token  TEXT
+                resume_token  TEXT,
+                -- The id the calling sandbox sent (claude-sandbox/tier-setup.sh mints
+                -- it per boot), or NULL when it sent none in the shape. Part of the
+                -- join key; an operator view shows only its first 8 characters
+                -- (holds.SANDBOX_PREFIX). DESIGN.md, "A card names its sandbox by an
+                -- id the sandbox mints".
+                sandbox       TEXT
             )""")
         conn.execute("CREATE INDEX IF NOT EXISTS tool_approvals_status "
                      "ON tool_approvals(status)")

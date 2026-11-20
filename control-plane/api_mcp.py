@@ -508,17 +508,21 @@ def api_mcp_pins() -> list[dict]:
 
     ``pins_json`` is the row as stored, for the page to show without parsing: a
     browser's JSON.parse rounds an integer past 2^53, and a pin is compared exactly.
-    ``expires_at`` is absolute, None for a permanent pin."""
+    ``expires_at`` is absolute, None for a permanent pin. ``sandbox_prefix`` is which
+    sandbox a timed pin answers, as the prefix that sandbox printed at boot, cut in
+    the query so the whole id never leaves the store; None for a permanent pin, which
+    answers every sandbox."""
     with store._connect() as conn:
         rows = conn.execute(
             "SELECT p.id, p.server, p.tool, p.pins_json, p.approval_id, "
             "p.created_at, p.granted_by, p.expires_at, p.schema_digest, r.action, "
-            "s.enabled "
+            "s.enabled, NULLIF(substr(p.sandbox, 1, ?), '') AS sandbox_prefix "
             "FROM tool_pins p "
             "LEFT JOIN tool_rules r ON r.server = p.server AND r.tool = p.tool "
             "LEFT JOIN mcp_servers s ON s.server = p.server "
             "WHERE p.expires_at IS NULL OR p.expires_at > ? "
-            "ORDER BY p.server, p.tool, p.id", (time.time(),)).fetchall()
+            "ORDER BY p.server, p.tool, p.id",
+            (policy.SANDBOX_PREFIX, time.time())).fetchall()
     seen = inventory.snapshot()
     out = []
     for r in rows:
@@ -533,7 +537,8 @@ def api_mcp_pins() -> list[dict]:
                     "schema_moved": (bound and current is not None
                                      and current != r["schema_digest"]),
                     "approval_id": r["approval_id"], "created_at": r["created_at"],
-                    "granted_by": r["granted_by"], "expires_at": r["expires_at"]})
+                    "granted_by": r["granted_by"], "expires_at": r["expires_at"],
+                    "sandbox_prefix": r["sandbox_prefix"]})
     return out
 
 
@@ -555,8 +560,8 @@ def revoke_mcp_pin(pin_id: int, request: Request) -> JSONResponse:
         # pinned grant in between could otherwise extend it.
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT server, tool, pins_json, expires_at, approval_id FROM tool_pins "
-            "WHERE id=?",
+            "SELECT server, tool, pins_json, expires_at, approval_id, sandbox "
+            "FROM tool_pins WHERE id=?",
             (pin_id,)).fetchone()
         if row is None:
             conn.rollback()
@@ -569,8 +574,10 @@ def revoke_mcp_pin(pin_id: int, request: Request) -> JSONResponse:
     fields = ", ".join(sorted(pins)) if pins else "an unreadable pin set"
     expires_at = row["expires_at"]
     was_live = expires_at is None or expires_at > now
+    # Which sandboxes it answered, by prefix, as its create, extend and rebind say.
     left = ("" if expires_at is None or not was_live
-            else f" with {policy._short_duration(expires_at - now)} left")
+            else f" with {policy._short_duration(expires_at - now)} left, "
+                 f"{policy._sandbox_words(row['sandbox'])}")
     store._audit("revoke", stage="tool-policy", server=row["server"], tool=row["tool"],
                  actor=actor, approval_id=row["approval_id"],
                  reason=(f"pin {pin_id} revoked{left}; {row['tool']} on "

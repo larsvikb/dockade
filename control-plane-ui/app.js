@@ -337,7 +337,7 @@ function start() {
                         `asked ${fmtTime(a.ts)}`,
                         a.client ? `from ${a.client}` : null,
                         // The prefix the sandbox printed at boot, which is all of its
-                        // id the backend serves (holds.SANDBOX_PREFIX).
+                        // id the backend serves (policy.SANDBOX_PREFIX).
                         a.sandbox_prefix ? `sandbox ${a.sandbox_prefix}` : null]
       .filter(Boolean).join(" · ");
 
@@ -480,13 +480,17 @@ function start() {
     const cancel = document.createElement("button");
     cancel.textContent = "Cancel";
     cancel.addEventListener("click", () => cancelConfirm(entry));
+    // Each button checks its own half of the preview: the two touch different rows,
+    // so one can be refused while the other is not.
     goTimed.addEventListener("click", () => {
-      const p = pinPreview(options, entry.pinned(), a.tool, a.server, pinLeaseSeconds);
-      if (p.ok) resolve(a, "allow_pinned_lease", null, p.fields);
+      const p = pinPreview(options, entry.pinned(), a.tool, a.server, pinLeaseSeconds,
+                           a.sandbox_prefix);
+      if (p.timedOk) resolve(a, "allow_pinned_lease", null, p.fields);
     });
     go.addEventListener("click", () => {
-      const p = pinPreview(options, entry.pinned(), a.tool, a.server, pinLeaseSeconds);
-      if (p.ok) resolve(a, "allow_pinned", null, p.fields);
+      const p = pinPreview(options, entry.pinned(), a.tool, a.server, pinLeaseSeconds,
+                           a.sandbox_prefix);
+      if (p.permanentOk) resolve(a, "allow_pinned", null, p.fields);
     });
     cactions.append(goTimed, go, cancel);
 
@@ -504,9 +508,10 @@ function start() {
 
   function renderPinPreview(entry, a) {
     const p = pinPreview(entry.pinOptions, entry.pinned(), a.tool, a.server,
-                         pinLeaseSeconds);
+                         pinLeaseSeconds, a.sandbox_prefix);
     entry.cwhat.textContent = p.text;
-    entry.confirmBtn.disabled = entry.timedBtn.disabled = !p.ok;
+    entry.confirmBtn.disabled = !p.permanentOk;
+    entry.timedBtn.disabled = !p.timedOk;
     entry.confirmBtn.textContent = p.label;
     entry.timedBtn.textContent = p.timedLabel;
   }

@@ -635,6 +635,29 @@ _PIN_FIELD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
 #: channel — and a longer string is content, which a pin is not for.
 _PIN_VALUE_MAX = 200
 
+#: The shape of a sandbox id (claude-sandbox/tier-setup.sh mints it, the gateway
+#: forwards only this shape and ``api_tool.tool_authorize`` checks it again), and how
+#: much of one an operator is shown: the prefix the sandbox prints at boot. The whole
+#: id stays in the store, so no view hands a reader an id to send as another sandbox.
+#: Here rather than in holds.py because a pin's reach is policy: ``_pins_met`` reads a
+#: timed pin only for its own sandbox, and an allow by one names the prefix.
+SANDBOX_RE = re.compile(r"[0-9a-f]{32}")
+SANDBOX_PREFIX = 8
+
+#: Why a card with no sandbox id is offered no timed pin: such a pin answers only the
+#: sandbox it was made from, and this card names none.
+NO_SANDBOX_TIMED = ("this call came with no sandbox id, and a timed pin answers only "
+                    "the sandbox its card came from; pin it for good, or allow it "
+                    "without a pin")
+
+
+def _sandbox_words(sandbox: str | None) -> str:
+    """Which sandboxes a pin with ``sandbox`` answers, for a reason: every one for a
+    permanent pin, else the one, by prefix and never the whole id."""
+    return (f"sandbox {sandbox[:SANDBOX_PREFIX]} only" if sandbox
+            else "every sandbox")
+
+
 # How long an `allow_pinned_lease` pin answers for. Longer than ``LEASE_SECONDS``
 # because the two cover different stretches of work: an egress lease the hosts behind
 # one page load, a pin the calls of a working session. An ergonomics number for the
@@ -657,7 +680,8 @@ def _pin_value(value: object) -> str | None:
 
 def _canonical_pins(pins: dict) -> str:
     """The stored form of a pin set, one canonical JSON object, so that two equal pin
-    sets are one string and ``UNIQUE(server, tool, pins_json)`` means what it says."""
+    sets are one string and ``UNIQUE(server, tool, pins_json, sandbox)`` means what it
+    says."""
     return json.dumps(pins, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
@@ -753,13 +777,18 @@ def _pin_candidates(args_json: str, schema_digest: str | None) -> dict:
             "refused": None if fields else "none of this call's arguments can be pinned"}
 
 
-def _pins_met(conn, server: str, tool: str, args: object, now: float) -> list:
-    """The live pins on (``server``, ``tool``) whose values ``args`` carries, under
-    whatever digest, in the order ``_answering_pin`` prefers them: rows with ``id``,
-    ``pins_json``, ``expires_at``, ``approval_id`` and ``schema_digest``.
+def _pins_met(conn, server: str, tool: str, args: object, now: float,
+              sandbox: str | None) -> list:
+    """The live pins on (``server``, ``tool``) that answer ``sandbox`` and whose values
+    ``args`` carries, under whatever digest, in the order ``_answering_pin`` prefers
+    them: rows with ``id``, ``pins_json``, ``expires_at``, ``approval_id``,
+    ``schema_digest`` and ``sandbox``.
 
     Expiry is enforced HERE, as ``_live_lease`` enforces it, so a pin that outlives its
-    deadline cannot answer whatever did or did not sweep it.
+    deadline cannot answer whatever did or did not sweep it. So is a timed pin's
+    sandbox: one made from another sandbox's card is not met at all, before any digest
+    is compared, so no reason and no card's list of stale pins names it. A call with no
+    id (None) meets permanent pins only.
 
     Permanent pins first, then the longest-lived, for the reason ``_decide`` reads
     standing rules before leases: which of two pins answers cannot change the answer,
@@ -767,10 +796,11 @@ def _pins_met(conn, server: str, tool: str, args: object, now: float) -> list:
     if not isinstance(args, dict):
         return []
     rows = conn.execute(
-        "SELECT id, pins_json, expires_at, approval_id, schema_digest FROM tool_pins "
-        "WHERE server = ? AND tool = ? AND (expires_at IS NULL OR expires_at > ?) "
+        "SELECT id, pins_json, expires_at, approval_id, schema_digest, sandbox "
+        "FROM tool_pins WHERE server = ? AND tool = ? "
+        "AND (expires_at IS NULL OR expires_at > ?) AND sandbox IN ('', ?) "
         "ORDER BY expires_at IS NOT NULL, expires_at DESC, id",
-        (server, tool, now)).fetchall()
+        (server, tool, now, sandbox or "")).fetchall()
     return [row for row in rows if (pins := _parse_pins(row["pins_json"])) is not None
             and _pin_matches(pins, args)]
 
@@ -803,7 +833,8 @@ def _skipped_words(skipped: list, schema_digest: str | None) -> str:
 
 
 def _decide_tool(server: str, tool: str, args: object = None,
-                 schema_digest: str | None = None) -> tuple[str, str]:
+                 schema_digest: str | None = None,
+                 sandbox: str | None = None) -> tuple[str, str]:
     """(decision, reason) for calling ``tool`` on ``server``: allow, deny or ask.
 
     ``ask`` is not this path's ``hold``. An egress hold blocks the request inside the
@@ -825,20 +856,26 @@ def _decide_tool(server: str, tool: str, args: object = None,
     write — which is exactly why it is handled here: the store is a file on a volume,
     and the one thing a hand-edited or corrupted row must never do is grant.
 
-    Under an `ask` rule, a pin that ``args`` meets and that was made under
-    ``schema_digest`` answers the call, and the decision is `allow`; one it meets under
-    another digest is named in the `ask`'s reason. Under any other rule no pin is
+    Under an `ask` rule, a pin that ``args`` meets, that was made under
+    ``schema_digest`` and that is permanent or was made from ``sandbox``'s card
+    answers the call, and the decision is `allow`; one it meets under another digest
+    is named in the `ask`'s reason. Under any other rule no pin is
     read: a pin cannot soften a `deny`, and an `allow` has nothing to answer. The claim
     passes no ``args``, because a human has already answered its call.
 
-    ``schema_digest`` is the gateway's word for the arguments it served, and the one
-    input here a sibling supplies. It can only narrow: a wrong one misses every pin and
-    gets a card."""
-    return _tool_ruling(server, tool, args, schema_digest)[:2]
+    ``schema_digest`` is the gateway's word for the arguments it served. It can only
+    narrow: a wrong one misses every pin and gets a card. ``sandbox`` is the id the
+    calling sandbox sent, which a timed pin must have been made from to answer
+    (``_pins_met``), and unlike the digest it is the agent's own word. It narrows
+    too: leaving it out loses the sandbox its own timed pins, and another sandbox's
+    are met only by sending that sandbox's id, which the agent cannot read. It is no
+    credential, so a timed pin is no wider for it than a permanent one."""
+    return _tool_ruling(server, tool, args, schema_digest, sandbox)[:2]
 
 
 def _tool_ruling(server: str, tool: str, args: object = None,
-                 schema_digest: str | None = None) -> tuple[str, str, str | None]:
+                 schema_digest: str | None = None,
+                 sandbox: str | None = None) -> tuple[str, str, str | None]:
     """``_decide_tool`` plus the approval id of the pin that answered, None when no pin
     did: what ``/tool/authorize`` records, so searching a card's id finds the calls its
     pin let through. The id comes from the answering pin's own row, read with the
@@ -866,12 +903,16 @@ def _tool_ruling(server: str, tool: str, args: object = None,
             return "deny", (f"the rule for {tool!r} on {server!r} carries an unknown "
                             f"action {action!r}"), None
         now = time.time()
-        met = _pins_met(conn, server, tool, args, now) if action == "ask" else []
+        met = (_pins_met(conn, server, tool, args, now, sandbox) if action == "ask"
+               else [])
     pin = _answering_pin(met, schema_digest)
     if pin is not None:
         expires_at = pin["expires_at"]
+        # A timed pin names whose it is, by prefix: what lets the trail tell one
+        # sandbox's timed grant from another's on the same values.
         left = ("" if expires_at is None
-                else f", {_short_duration(expires_at - now)} left")
+                else f", {_short_duration(expires_at - now)} left, "
+                     f"{_sandbox_words(pin['sandbox'])}")
         return ("allow", (f"'allow' by pin {pin['id']} ({tool} on {server}, pinned: "
                           f"{_pin_fields(pin)}{left})"),
                 pin["approval_id"])

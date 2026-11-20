@@ -47,7 +47,7 @@ LEGACY_CLIENT_CLASS = "sandbox"
 # The schema this code expects. Every entry in ``_STEPS`` below adds exactly one,
 # and a store records the version it is at (see ``_migrate``), so "what has already
 # run here" is a number to compare rather than a schema to interrogate.
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 # The integers sqlite3 can bind: SQLite's INTEGER is 64-bit signed, and binding a
 # value outside it raises OverflowError, which a route would answer as a 500. A fact
@@ -157,10 +157,10 @@ def _step_1_client_class(conn: sqlite3.Connection) -> None:
 # `*_persist` (standing policy) — see control-plane/DESIGN.md, "A lease is the third
 # grant duration".
 #
-# ONE definition, shared by the v2 step, the v9 rebuild and the fresh-store DDL, so a
-# migrated store and a fresh one cannot diverge. v9 copies rows into whatever this
-# says, so a column added later needs a default, and its step must skip a table that
-# already has it.
+# ONE definition, shared by the v2 step, the v9 and v16 rebuilds and the fresh-store
+# DDL, so a migrated store and a fresh one cannot diverge. v9 and v16 copy rows into
+# whatever this says, so a column added later needs a default, and its step must skip
+# a table that already has it.
 _LEASES_DDL = """
     CREATE TABLE IF NOT EXISTS leases (
         -- Never reused: a revoke from an open page names a lease by it.
@@ -182,7 +182,10 @@ _LEASES_DDL = """
         -- rows say what rode it.
         approval_id  TEXT NOT NULL,
         created_at   REAL NOT NULL,
-        expires_at   REAL NOT NULL,
+        -- A number and nothing else, as `tool_pins.expires_at` is and for its reason:
+        -- SQLite orders text above every number, so a text deadline would be live
+        -- forever in `policy._live_lease`.
+        expires_at   REAL NOT NULL CHECK (typeof(expires_at) = 'real'),
         granted_by   TEXT NOT NULL   -- provenance of the resolver (provenance._actor)
         -- NO UNIQUE constraint, and that is a consequence rather than an omission. A
         -- second lease for a host already covered by a live one is UNREACHABLE: the
@@ -281,7 +284,8 @@ def _step_7_audit_actor(conn: sqlite3.Connection) -> None:
 # PINNED ALLOWS: an `ask` answered in advance, for the calls whose arguments carry
 # these exact values (DESIGN.md, "A pinned allow is an ask answered in advance").
 #
-# ONE definition, shared by the v8 step and the fresh-store DDL, as `_LEASES_DDL` is.
+# ONE definition, shared by the v8 step, the v16 rebuild and the fresh-store DDL, as
+# `_LEASES_DDL` is.
 _TOOL_PINS_DDL = """
     CREATE TABLE IF NOT EXISTS tool_pins (
         -- Never reused: the audit and a revoke name a pin by it.
@@ -303,10 +307,17 @@ _TOOL_PINS_DDL = """
         expires_at  REAL CHECK (expires_at IS NULL OR typeof(expires_at) = 'real'),
         -- The digest of the tool's arguments the card was raised under
         -- (`tool_approvals.schema_digest`). The pin answers only a call made under
-        -- the same one, and NULL answers nothing (policy._answering_pin). The last
-        -- column, where v12's ALTER puts it.
+        -- the same one, and NULL answers nothing (policy._answering_pin).
         schema_digest TEXT,
-        UNIQUE(server, tool, pins_json)
+        -- WHICH sandbox a timed pin answers: the id its card recorded
+        -- (`tool_approvals.sandbox`). '' on a permanent pin, which answers every
+        -- sandbox, and only there: the CHECK pairs it with `expires_at`. '' rather
+        -- than NULL, because SQLite counts NULLs as distinct under the UNIQUE, so
+        -- two equal permanent pins would both insert.
+        sandbox     TEXT NOT NULL DEFAULT '',
+        CHECK ((expires_at IS NULL) = (sandbox = '')),
+        -- One permanent row per pin set, and one timed row per sandbox beside it.
+        UNIQUE(server, tool, pins_json, sandbox)
     )"""
 
 
@@ -521,6 +532,69 @@ def _step_12_schema_digest(conn: sqlite3.Connection) -> None:
               "keep NULL, and no pin can be made from one)", flush=True)
 
 
+# The tool surface's approvals, which split from `approvals` for the reason the rules
+# did: the rows are egress-shaped there — host, port, proto, method, url — against a
+# server, a tool and a payload here (control-plane/DESIGN.md, "``approvals`` splits
+# the same way"). What does NOT split is the operator's pending queue; these rows and
+# those are two builders behind one list.
+#
+# ONE definition, shared by the v16 rebuild and the fresh-store DDL, as `_LEASES_DDL`
+# is and with its rule for a column added later.
+_TOOL_APPROVALS_DDL = """
+    CREATE TABLE IF NOT EXISTS tool_approvals (
+        id          TEXT PRIMARY KEY,
+        ts          REAL NOT NULL,
+        server      TEXT NOT NULL,
+        tool        TEXT NOT NULL,
+        -- The complete arguments, in the ONE canonical form that is also what
+        -- `args_digest` covers and what the human is shown
+        -- (holds._canonical_args). Nothing is dropped, summarized or
+        -- truncated: this is what someone reads to decide, so a payload
+        -- trimmed on the way in would hide exactly the part worth hiding. An
+        -- oversized one is refused instead (holds.TOOL_ARGS_MAX).
+        args_json   TEXT NOT NULL,
+        -- What the grant is BOUND to, and the key an identical retry joins on.
+        -- Over the canonical form of the arguments, so a payload that differs
+        -- only in key order is the same ask, while one that differs in any
+        -- VALUE is a different ask and cannot ride this approval.
+        args_digest TEXT NOT NULL,
+        client      TEXT,
+        status      TEXT NOT NULL,   -- pending | allowed | denied | expired | withdrawn
+        -- Durable, where the egress deadline lives only in
+        -- `holds._PENDING_DEADLINE`. Nothing blocks on a tool ask, so expiry is
+        -- decided by reading this column (`holds._expire_tool_asks`), and a
+        -- restart cannot resurrect an ask as pending forever. A number and nothing
+        -- else, for the reason `leases.expires_at` is: a text deadline would never
+        -- fall due.
+        deadline    REAL NOT NULL CHECK (typeof(deadline) = 'real'),
+        -- A deadline too, for an approved ask nobody has claimed: its grant lapses
+        -- `holds.TOOL_GRANT_TIMEOUT` after this. A number or NULL, for the reason
+        -- `deadline` is: a text value would leave the grant claimable forever.
+        resolved_at REAL CHECK (resolved_at IS NULL OR typeof(resolved_at) = 'real'),
+        resolved_by TEXT,            -- provenance of the resolver (provenance._actor)
+        -- Set when the gateway EXECUTES this ask, which happens on resumption
+        -- rather than at the human's click. It is what makes an approval
+        -- single-use: the claim is a conditional UPDATE, so two resumptions
+        -- of one approved ask cannot both run the side effect.
+        claimed_at  REAL,
+        -- The digest of the tool's arguments the gateway served when the call
+        -- was made (discovery.schema_digest), or NULL when it had none. A pin
+        -- made from this card is bound to it, and an identical retry joins
+        -- only under the same one.
+        schema_digest TEXT,
+        -- The AGENT's handle on this ask: what the pending result carries and
+        -- what claim and withdraw take. Independent of `id`, which is the
+        -- operator's and never leaves the control plane. NULL on a row no
+        -- token was issued for (one closed before v13).
+        resume_token  TEXT,
+        -- The id the calling sandbox sent (claude-sandbox/tier-setup.sh mints
+        -- it per boot), or NULL when it sent none in the shape. Part of the
+        -- join key; an operator view shows only its first 8 characters
+        -- (policy.SANDBOX_PREFIX). DESIGN.md, "A card names its sandbox by an
+        -- id the sandbox mints".
+        sandbox       TEXT
+    )"""
+
 # UNIQUE, because a token is a lookup key: two rows under one would let a claim land
 # on an ask its agent never raised. SQLite counts NULLs as distinct, so the rows no
 # token was issued for do not collide. An index rather than a column constraint, since
@@ -528,6 +602,18 @@ def _step_12_schema_digest(conn: sqlite3.Connection) -> None:
 _TOOL_APPROVALS_RESUME_INDEX = (
     "CREATE UNIQUE INDEX IF NOT EXISTS tool_approvals_resume_token "
     "ON tool_approvals(resume_token)")
+
+# Every index on `tool_approvals`, created by the fresh-store DDL and again by the v16
+# rebuild, whose aside table takes the old ones with it.
+_TOOL_APPROVALS_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS tool_approvals_status ON tool_approvals(status)",
+    # ``holds._list_withdrawn`` reads the newest withdrawals once per listener per
+    # second, and this table is never pruned: without the index that is a scan and a
+    # sort of every withdrawn row, growing with each one.
+    "CREATE INDEX IF NOT EXISTS tool_approvals_status_resolved "
+    "ON tool_approvals(status, resolved_at)",
+    _TOOL_APPROVALS_RESUME_INDEX,
+)
 
 
 def _new_resume_token() -> str:
@@ -602,6 +688,140 @@ def _step_15_ask_sandbox(conn: sqlite3.Connection) -> None:
           "they were raised before the gateway relayed one)", flush=True)
 
 
+def _carry_sequence(conn: sqlite3.Connection, table: str, aside: str) -> None:
+    """Continue ``table``'s AUTOINCREMENT numbering past every id its ``aside`` copy
+    used, before the aside is dropped and takes its ``sqlite_sequence`` row with it.
+
+    Copying rows with their ids sets the new table's row only to the largest id
+    copied. The old sequence may be past that (the highest row was revoked or
+    swept), and a rebuild may copy fewer rows than it read, so the row is raised to
+    the larger of the two. The copy made one row unless it copied nothing, and then
+    one is inserted: one row per table, never two."""
+    old = conn.execute("SELECT seq FROM sqlite_sequence WHERE name=?",
+                       (aside,)).fetchone()
+    top = max(old[0] if old is not None else 0,
+              conn.execute(f"SELECT COALESCE(MAX(id), 0) FROM {aside}"  # noqa: S608
+                           ).fetchone()[0])                # a literal of the caller's
+    if not top:
+        return
+    if not conn.execute("UPDATE sqlite_sequence SET seq=? WHERE name=?",
+                        (top, table)).rowcount:
+        conn.execute("INSERT INTO sqlite_sequence(name, seq) VALUES (?, ?)",
+                     (table, top))
+
+
+def _deadline_or_zero(column: str) -> str:
+    """``column`` as copied by v16 into a table that refuses a text deadline: as it is
+    when it is a number or NULL, else 0.0, which is long past. Not CAST, which reads a
+    numeric prefix, so '9999999999abc' would become a live deadline."""
+    return (f"CASE WHEN {column} IS NULL OR typeof({column}) = 'real' THEN {column} "
+            f"ELSE 0.0 END")
+
+
+def _step_16_scoped_pins(conn: sqlite3.Connection) -> None:
+    """v16 — a timed pin answers only the sandbox whose card it was made from:
+    ``tool_pins`` gains ``sandbox`` and its UNIQUE widens to include it, so the table
+    is rebuilt. ``leases`` and ``tool_approvals`` are rebuilt too, for task 182's
+    ``typeof = 'real'`` CHECK on their deadlines. 182 asked for "the next migration";
+    that was v15, which stayed a plain ALTER so the change that first carried the
+    sandbox id had no rebuild in it, so the CHECKs land here instead. 182 named
+    ``leases.expires_at`` and ``tool_approvals.deadline``; ``tool_approvals.resolved_at``
+    is a third, since an approved ask's grant lapses from it, and it takes the CHECK
+    with NULL still allowed. A text deadline is copied as 0.0 (``_deadline_or_zero``):
+    a lease lapses, an ask falls due, a grant lapses.
+
+    Each rebuild has v9's rename-aside shape, so the new table comes from the shared
+    DDL, and ``_carry_sequence`` keeps an AUTOINCREMENT id from coming back.
+    ``tool_pins`` goes first, so its copy reads each pin's card in ``tool_approvals``
+    before that is renamed aside. The ``tool_approvals`` indexes leave with its aside
+    table and are made again after it is dropped.
+
+    A pin is copied with its id, ``pins_json`` and ``schema_digest``:
+
+    - a permanent pin with ``sandbox`` '', still answering every sandbox;
+    - a live timed pin scoped to the sandbox its card recorded. One whose card
+      recorded none, or is not in the store, answers nobody now: it is dropped with a
+      `revoke` audit row in this transaction, as v8 and v12 drop pins;
+    - a lapsed timed pin is dropped unaudited, as the sweep would have dropped it.
+
+    Any of the three tables may be ABSENT, on a store stamped before it existed or a
+    damaged one, and the DDL after ``_migrate`` creates it. ``tool_pins`` may already
+    have ``sandbox``: a store below v8 reaches here with the table v8 just made from
+    ``_TOOL_PINS_DDL``, empty, and it is left alone. A ``leases`` that v9 has just
+    rebuilt with the CHECK is rebuilt again, which changes nothing."""
+    now = time.time()
+    pins = _columns(conn, "tool_pins")
+    if pins and "sandbox" not in pins:
+        cards = bool(_columns(conn, "tool_approvals"))
+        conn.execute("ALTER TABLE tool_pins RENAME TO tool_pins_v15")
+        conn.execute(_TOOL_PINS_DDL)
+        copied = dropped = 0
+        for pin in conn.execute(
+                "SELECT id, server, tool, pins_json, approval_id, created_at, "
+                "granted_by, expires_at, schema_digest FROM tool_pins_v15 "
+                "ORDER BY id").fetchall():
+            if pin["expires_at"] is None:
+                sandbox = ""
+            elif pin["expires_at"] <= now:
+                continue
+            else:
+                card = (conn.execute("SELECT sandbox FROM tool_approvals WHERE id=?",
+                                     (pin["approval_id"],)).fetchone()
+                        if cards else None)
+                sandbox = card["sandbox"] if card is not None else None
+                if not sandbox:
+                    conn.execute(
+                        "INSERT INTO audit(ts, kind, stage, server, tool, approval_id, "
+                        "reason) VALUES (?, 'revoke', 'tool-policy', ?, ?, ?, ?)",
+                        (now, pin["server"], pin["tool"], pin["approval_id"],
+                         f"pin {pin['id']} dropped by schema v16, which scopes a timed "
+                         f"pin to the sandbox its card came from, and its card recorded "
+                         f"none; {pin['tool']} on {pin['server']} raises a card again "
+                         f"until it is pinned anew"))
+                    dropped += 1
+                    continue
+            conn.execute(
+                "INSERT INTO tool_pins(id, server, tool, pins_json, approval_id, "
+                "created_at, granted_by, expires_at, schema_digest, sandbox) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (*tuple(pin), sandbox))
+            copied += 1
+        _carry_sequence(conn, "tool_pins", "tool_pins_v15")
+        conn.execute("DROP TABLE tool_pins_v15")
+        print(f"control-plane: rebuilt tool_pins scoped by sandbox ({copied} pin(s) "
+              f"copied, {dropped} timed pin(s) with no sandbox dropped, each audited "
+              f"as revoked)", flush=True)
+    if _columns(conn, "tool_approvals"):
+        columns = ("id, ts, server, tool, args_json, args_digest, client, status, "
+                   "deadline, resolved_at, resolved_by, claimed_at, schema_digest, "
+                   "resume_token, sandbox")
+        conn.execute("ALTER TABLE tool_approvals RENAME TO tool_approvals_v15")
+        conn.execute(_TOOL_APPROVALS_DDL)
+        conn.execute(
+            f"INSERT INTO tool_approvals({columns}) "  # noqa: S608 (literals here)
+            f"SELECT id, ts, server, tool, args_json, args_digest, client, status, "
+            f"{_deadline_or_zero('deadline')}, {_deadline_or_zero('resolved_at')}, "
+            f"resolved_by, claimed_at, "
+            f"schema_digest, resume_token, sandbox FROM tool_approvals_v15")
+        conn.execute("DROP TABLE tool_approvals_v15")
+        for index in _TOOL_APPROVALS_INDEXES:
+            conn.execute(index)
+        print("control-plane: rebuilt tool_approvals, refusing a deadline that is "
+              "not a number", flush=True)
+    if _columns(conn, "leases"):
+        columns = "id, host, client_class, approval_id, created_at, expires_at, granted_by"
+        conn.execute("ALTER TABLE leases RENAME TO leases_v15")
+        conn.execute(_LEASES_DDL)
+        conn.execute(
+            f"INSERT INTO leases({columns}) "  # noqa: S608 (literals here)
+            f"SELECT id, host, client_class, approval_id, created_at, "
+            f"{_deadline_or_zero('expires_at')}, granted_by FROM leases_v15")
+        _carry_sequence(conn, "leases", "leases_v15")
+        conn.execute("DROP TABLE leases_v15")
+        print("control-plane: rebuilt leases, refusing a deadline that is not a "
+              "number", flush=True)
+
+
 # The handle that carries a pin's card from ``/tool/authorize`` to the call's outcome
 # line. A call a pin answered raises no ask and so has no resume token; without this its
 # outcome row could name no card. Rows are spent by ingest (``ingest._settle_tool_row``)
@@ -668,6 +888,7 @@ _STEPS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = (
     (13, "resume tokens on tool asks", _step_13_resume_token),
     (14, "tool result size, hash and duration", _step_14_result_facts),
     (15, "sandbox id on tool asks", _step_15_ask_sandbox),
+    (16, "timed pins scoped to a sandbox", _step_16_scoped_pins),
 )
 
 
@@ -881,70 +1102,10 @@ def _init_db() -> None:
         # decided, and it holds a handful of rows, swept on the grant path
         # (``api_approvals.resolve``'s lease branch).
         conn.execute(_LEASES_DDL)
-        # The tool surface's approvals, which split from the table above for the
-        # reason the rules did: the rows are egress-shaped there — host, port, proto,
-        # method, url — against a server, a tool and a payload here
-        # (control-plane/DESIGN.md, "``approvals`` splits the same way").
-        #
-        # What does NOT split is the operator's pending queue; these rows and those
-        # are two builders behind one list.
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS tool_approvals (
-                id          TEXT PRIMARY KEY,
-                ts          REAL NOT NULL,
-                server      TEXT NOT NULL,
-                tool        TEXT NOT NULL,
-                -- The complete arguments, in the ONE canonical form that is also what
-                -- `args_digest` covers and what the human is shown
-                -- (holds._canonical_args). Nothing is dropped, summarized or
-                -- truncated: this is what someone reads to decide, so a payload
-                -- trimmed on the way in would hide exactly the part worth hiding. An
-                -- oversized one is refused instead (holds.TOOL_ARGS_MAX).
-                args_json   TEXT NOT NULL,
-                -- What the grant is BOUND to, and the key an identical retry joins on.
-                -- Over the canonical form of the arguments, so a payload that differs
-                -- only in key order is the same ask, while one that differs in any
-                -- VALUE is a different ask and cannot ride this approval.
-                args_digest TEXT NOT NULL,
-                client      TEXT,
-                status      TEXT NOT NULL,   -- pending | allowed | denied | expired | withdrawn
-                -- Durable, where the egress deadline lives only in
-                -- `holds._PENDING_DEADLINE`. Nothing blocks on a tool ask, so expiry is
-                -- decided by reading this column (`holds._expire_tool_asks`), and a
-                -- restart cannot resurrect an ask as pending forever.
-                deadline    REAL NOT NULL,
-                resolved_at REAL,
-                resolved_by TEXT,            -- provenance of the resolver (provenance._actor)
-                -- Set when the gateway EXECUTES this ask, which happens on resumption
-                -- rather than at the human's click. It is what makes an approval
-                -- single-use: the claim is a conditional UPDATE, so two resumptions
-                -- of one approved ask cannot both run the side effect.
-                claimed_at  REAL,
-                -- The digest of the tool's arguments the gateway served when the call
-                -- was made (discovery.schema_digest), or NULL when it had none. A pin
-                -- made from this card is bound to it, and an identical retry joins
-                -- only under the same one.
-                schema_digest TEXT,
-                -- The AGENT's handle on this ask: what the pending result carries and
-                -- what claim and withdraw take. Independent of `id`, which is the
-                -- operator's and never leaves the control plane. NULL on a row no
-                -- token was issued for (one closed before v13).
-                resume_token  TEXT,
-                -- The id the calling sandbox sent (claude-sandbox/tier-setup.sh mints
-                -- it per boot), or NULL when it sent none in the shape. Part of the
-                -- join key; an operator view shows only its first 8 characters
-                -- (holds.SANDBOX_PREFIX). DESIGN.md, "A card names its sandbox by an
-                -- id the sandbox mints".
-                sandbox       TEXT
-            )""")
-        conn.execute("CREATE INDEX IF NOT EXISTS tool_approvals_status "
-                     "ON tool_approvals(status)")
-        # ``holds._list_withdrawn`` reads the newest withdrawals once per listener per
-        # second, and this table is never pruned: without the index that is a scan and
-        # a sort of every withdrawn row, growing with each one.
-        conn.execute("CREATE INDEX IF NOT EXISTS tool_approvals_status_resolved "
-                     "ON tool_approvals(status, resolved_at)")
-        conn.execute(_TOOL_APPROVALS_RESUME_INDEX)
+        # The tool surface's approvals (``_TOOL_APPROVALS_DDL``) and their indexes.
+        conn.execute(_TOOL_APPROVALS_DDL)
+        for index in _TOOL_APPROVALS_INDEXES:
+            conn.execute(index)
         # Call tokens (``_TOOL_CALL_TOKENS_DDL``). New as a table, so it needs no
         # `_STEPS` entry: a store from before it gains it here, and its version stays.
         conn.execute(_TOOL_CALL_TOKENS_DDL)
@@ -966,8 +1127,8 @@ def _init_db() -> None:
 #   2. a new `_step_N` above, which is what every store already in the field gets;
 #   3. `SCHEMA_VERSION` and `_STEPS`, bumped and appended by one.
 # A table defined by a shared `_*_DDL` string is also what an earlier rebuild step
-# creates (v8, v9, v11), so on a store below that step the column already exists when
-# the new step runs: give it a default, and skip a table that has it.
+# creates (v8, v9, v11, v16), so on a store below that step the column already exists
+# when the new step runs: give it a default, and skip a table that has it.
 # `CREATE TABLE IF NOT EXISTS` is a NO-OP on an existing table — it silently does not
 # add columns — and this store is a long-lived named volume that deliberately outlives
 # container and image churn, so a column added at (1) alone is MISSING on any store

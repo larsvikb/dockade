@@ -66,7 +66,7 @@ export function toolOutcomeMessage(d) {
   const pin = d.pin;
   const stamp = pin ? fmtStamp(pin.expires_at) : "";
   // A rebind is a new grant under the tool's new arguments, for as long as this click
-  // said, so it can end a pin that was permanent.
+  // said.
   const what = !pin ? ""
     : pin.created ? "pinned"
     : pin.rebound ? "pin rebound to the tool's current arguments,"
@@ -74,8 +74,21 @@ export function toolOutcomeMessage(d) {
     : "already pinned";
   const forGood = pin && !stamp && !pin.extended ? " for good" : "";
   const until = stamp ? ` until ${stamp}` : "";
+  // Which sandboxes the pin answers now: a timed one only the card's, by the prefix
+  // that sandbox printed at boot, and a timed one made permanent every one.
+  const reach = !pin ? ""
+    : pin.sandbox_prefix ? ` for sandbox ${pin.sandbox_prefix} only`
+    : pin.promoted ? " for every sandbox"
+    : "";
+  // The permanent pin a timed click deleted (holds._resolve_tool_ask_pinned): a side
+  // effect the operator did not pick directly, so the card says it happened.
+  const revoked = pin && pin.revoked
+    ? ` · pin ${pin.revoked.id} revoked: it answered every sandbox, under older `
+      + "arguments of the tool"
+    : "";
   const pinned = !pin ? ""
-    : ` · ${what}${forGood} on ${(pin.fields || []).join(", ")}${until} (pin ${pin.id})`;
+    : ` · ${what}${forGood} on ${(pin.fields || []).join(", ")}${until}${reach} `
+      + `(pin ${pin.id})${revoked}`;
   return { text: `✓ allowed${pinned} · runs when the agent returns for it`,
            tone: "ok" };
 }
@@ -86,33 +99,52 @@ export function toolOutcomeMessage(d) {
 // is one the backend offered for this call; `chosen` is the field names ticked.
 // `leaseSeconds` is `/api/config`'s `pin_lease_seconds`, for the timed button's label
 // only: the backend owns the duration, so an unknown one still pins, "for a while".
+// `sandboxPrefix` is the card's, which is all a timed pin will answer.
 //
 // Values are spelled with every non-ASCII character escaped, as the pins table shows
 // them (`pinText` in mcp.js): a pin value is an identifier, and this is the last look
 // at it before it becomes standing policy.
 //
 // `options.stale` are the pins this call met that were made under other arguments of
-// the tool, so did not answer it. Ticking exactly one's fields rebinds it, unless the
-// backend says this card may not (`refused`, holds._rebind_refusal).
-export function pinPreview(options, chosen, tool, server, leaseSeconds) {
+// the tool, so did not answer it: a permanent one (no `sandbox_prefix`), and this
+// card's sandbox's timed one. The two buttons touch different rows of the same fields
+// (holds._resolve_tool_ask_pinned), so each is offered, refused and worded from its
+// own: "for good" acts on the permanent row, or else makes this sandbox's timed row
+// permanent; "timed" acts on this sandbox's row and revokes a stale permanent one.
+// `refused` says why a click may not rebind a row, and `revoke_refused` why a timed
+// click may not revoke the permanent one (holds._rebind_refusal).
+// `options.timed_refused` says why this card offers no timed pin at all.
+//
+// `ok` is whether either button may be pressed; `permanentOk` and `timedOk` say which.
+export function pinPreview(options, chosen, tool, server, leaseSeconds, sandboxPrefix) {
   const offered = (options && options.fields) || [];
   const stale = (options && options.stale) || [];
+  const noTimed = (options && options.timed_refused) || null;
   const ticked = new Set(chosen || []);
   const picked = offered.filter(f => ticked.has(f.field));
   const lasting = `for ${durationWords(leaseSeconds) || "a while"}`;
-  const missed = stale.map(p => `Pin ${p.id} on ${(p.fields || []).join(", ")} matches `
-    + `this call but was made under other arguments of ${tool}, so it did not answer `
-    + "it. ").join("");
+  const whose = p => (p.sandbox_prefix ? ` (sandbox ${p.sandbox_prefix} only)` : "");
+  const missed = stale.map(p => `Pin ${p.id} on ${(p.fields || []).join(", ")}`
+    + `${whose(p)} matches this call but was made under other arguments of ${tool}, `
+    + "so it did not answer it. ").join("");
+  const untimed = noTimed ? `No timed pin: ${noTimed}. ` : "";
+  const closed = { ok: false, permanentOk: false, timedOk: false, fields: [],
+                   label: "Pin for good",
+                   timedLabel: noTimed ? "No timed pin" : `Pin ${lasting}` };
   if (!picked.length) {
-    return { ok: false, fields: [],
-             text: `${missed}Tick the fields a later call must match exactly.`,
-             label: "Pin for good", timedLabel: `Pin ${lasting}` };
+    return { ...closed,
+             text: `${missed}${untimed}Tick the fields a later call must match exactly.` };
   }
   const key = picked.map(f => f.field).sort().join("\n");
-  const rebinds = stale.find(p => [...(p.fields || [])].sort().join("\n") === key);
-  if (rebinds && rebinds.refused) {
-    return { ok: false, fields: [], text: `Cannot pin these: ${rebinds.refused}.`,
-             label: "Pin for good", timedLabel: `Pin ${lasting}` };
+  const same = p => [...(p.fields || [])].sort().join("\n") === key;
+  const shared = stale.find(p => same(p) && !p.sandbox_prefix);
+  const own = stale.find(p => same(p) && p.sandbox_prefix);
+  const permanentWhy = shared ? shared.refused : own ? own.refused : null;
+  const timedWhy = noTimed || (own && own.refused) || (shared && shared.revoke_refused)
+    || null;
+  if (permanentWhy && timedWhy) {
+    const nor = timedWhy === permanentWhy ? "" : ` Nor for a while: ${timedWhy}.`;
+    return { ...closed, text: `Cannot pin these: ${permanentWhy}.${nor}` };
   }
   const free = [...offered.filter(f => !ticked.has(f.field)).map(f => f.field),
                 ...((options && options.unpinnable) || []).map(u => u.field)];
@@ -122,16 +154,29 @@ export function pinPreview(options, chosen, tool, server, leaseSeconds) {
     ? `Every other argument is free: ${free.join(", ")}, and any this call did not set.`
     : "Every argument this call carries is pinned; one it did not set is still free.";
   const names = picked.map(f => f.field).join(", ");
-  const rebound = rebinds
-    ? ` This rebinds pin ${rebinds.id} to the arguments this call was made under, for `
-      + "as long as the button you press says, even if it was pinned for good."
+  const reach = noTimed || !sandboxPrefix ? ""
+    : ` Pinned for good it answers every sandbox; ${lasting} it answers only sandbox `
+      + `${sandboxPrefix}, the one this call came from.`;
+  const forGood = permanentWhy ? ` It cannot be pinned for good: ${permanentWhy}.`
+    : shared ? ` Pinning for good rebinds pin ${shared.id} to the arguments this call `
+               + "was made under."
+    : own ? ` Pinning for good rebinds pin ${own.id} to the arguments this call was `
+            + "made under, and makes it answer every sandbox."
     : "";
-  return { ok: true, fields: picked.map(f => f.field),
+  const timed = timedWhy ? ` It cannot be pinned ${lasting}: ${timedWhy}.`
+    : shared ? ` A timed pin ${own ? `rebinds pin ${own.id} and ` : ""}revokes pin `
+               + `${shared.id}, which answers every sandbox but under older arguments.`
+    : own ? ` A timed pin rebinds pin ${own.id} to the arguments this call was made `
+            + "under."
+    : "";
+  return { ok: true, permanentOk: !permanentWhy, timedOk: !timedWhy,
+           fields: picked.map(f => f.field),
            text: `Allows this call, and every later ${tool} call on ${server} `
                + `with ${conditions} runs without a card while the pin lasts. ${rest}`
-               + rebound,
-           label: `Confirm — allow and pin ${names} for good`,
-           timedLabel: `Confirm — allow and pin ${names} ${lasting}` };
+               + reach + forGood + timed,
+           label: permanentWhy ? "Pin for good" : `Confirm — allow and pin ${names} for good`,
+           timedLabel: timedWhy ? (noTimed ? "No timed pin" : `Pin ${lasting}`)
+             : `Confirm — allow and pin ${names} ${lasting}` };
 }
 
 export function diffPending(shownIds, list) {

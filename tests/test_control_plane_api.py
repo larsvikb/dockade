@@ -4915,13 +4915,19 @@ class McpToolRuleRevokeTests(_CPTestCase):
 #: and the digest of the same tool's arguments after an upgrade moved them.
 _SCHEMA = "5c" * 32
 _MOVED = "e1" * 32
+#: The sandbox a call comes from unless a test says otherwise, and a sibling. Neither
+#: repeats within its first 8 characters, so a prefix cut at the wrong offset reads
+#: differently.
+_SBX = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+_SBX_B = "0f9e8d7c6b5a49382716f5e4d3c2b1a0"
 
 
 def _tool_call(server="mcp-github", tool="get_me", args=None, client=CLASS_IP,
-               schema_digest=_SCHEMA, sandbox=None):
+               schema_digest=_SCHEMA, sandbox=_SBX):
     """One tool call put to the bridge. ``client`` defaults to a real sandbox-net
     address for the reason ``_auth_req`` does: it is what the per-client cap counts
-    and what an identical retry joins on."""
+    and what an identical retry joins on. ``sandbox`` defaults to an id, as every
+    sandbox since the gateway relayed one sends."""
     return cp.api_tool.tool_authorize(
         cp.api_tool.ToolCallRequest(server=server, tool=tool, args=args, client=client,
                                     schema_digest=schema_digest, sandbox=sandbox))
@@ -5157,16 +5163,17 @@ class ToolAuthorizeDecisionTests(_ToolBridgeTestCase):
 
 
 def _pin(pins, tool="create_pull_request", server="mcp-github", expires_at=None,
-         schema_digest=_SCHEMA, approval_id="a1"):
+         schema_digest=_SCHEMA, approval_id="a1", sandbox=_SBX):
     """Write a pin as the card would, and return its id: a row in place before the
-    card under test is answered."""
+    card under test is answered. A timed one answers ``sandbox``, a permanent one
+    every sandbox."""
     with cp.store._connect() as conn:
         pin_id = conn.execute(
             "INSERT INTO tool_pins(server, tool, pins_json, approval_id, created_at, "
-            "granted_by, expires_at, schema_digest) "
-            "VALUES (?,?,?,?, 0, 'peer=172.31.0.3', ?, ?)",
+            "granted_by, expires_at, schema_digest, sandbox) "
+            "VALUES (?,?,?,?, 0, 'peer=172.31.0.3', ?, ?, ?)",
             (server, tool, cp.policy._canonical_pins(pins), approval_id, expires_at,
-             schema_digest)).lastrowid
+             schema_digest, "" if expires_at is None else sandbox)).lastrowid
         conn.commit()
     return pin_id
 
@@ -5178,7 +5185,8 @@ _PR_ARGS = {**_PINNED, "title": "t", "body": "b", "head": "topic", "base": "main
 class SandboxIdAskTests(_ToolBridgeTestCase):
     """The id a sandbox sends (claude-sandbox/tier-setup.sh mints it, the gateway
     relays it): recorded on the ask, in its join key, and shown to the operator as
-    its first 8 characters only. No pin's answer reads it."""
+    its first 8 characters only. A permanent pin's answer does not read it
+    (``SandboxScopedPinFromCardTests`` has the timed pins, which do)."""
 
     audits = True
     # No 8 characters repeat at another offset, so a prefix cut from anywhere but the
@@ -5246,7 +5254,7 @@ class SandboxIdAskTests(_ToolBridgeTestCase):
         self.assertEqual([c["sandbox_prefix"] for c in cp.holds._list_tool_asks()],
                          [self.A[:8], None])
 
-    def test_a_pin_still_answers_every_sandbox(self):
+    def test_a_permanent_pin_answers_every_sandbox(self):
         _pin(_PINNED)
         for sandbox in (self.A, self.B, None):
             with self.subTest(sandbox=sandbox):
@@ -5621,9 +5629,11 @@ class McpPinTests(_CPTestCase):
         self.assertEqual([p["id"] for p in cp.api_mcp.api_mcp_pins()], [self.pin_id])
 
     def _expire(self, pin_id, offset):
+        """Make the pin timed, ``offset`` seconds from now, and so scoped to a
+        sandbox, as the CHECK pairing the two requires."""
         with cp.store._connect() as conn:
-            conn.execute("UPDATE tool_pins SET expires_at=? WHERE id=?",
-                         (time.time() + offset, pin_id))
+            conn.execute("UPDATE tool_pins SET expires_at=?, sandbox=? WHERE id=?",
+                         (time.time() + offset, _SBX, pin_id))
             conn.commit()
 
     def _revoke_reason(self):
@@ -5643,7 +5653,10 @@ class McpPinTests(_CPTestCase):
         self._expire(self.pin_id, 7200)
         resp = cp.api_mcp.revoke_mcp_pin(self.pin_id, _FakeRequest())
         self.assertTrue(resp.body["was_live"])
-        self.assertIn("revoked with 1h59m left", self._revoke_reason())
+        # And which sandbox it answered, by prefix only, as its creation said.
+        self.assertIn(f"revoked with 1h59m left, sandbox {_SBX[:8]} only; ",
+                      self._revoke_reason())
+        self.assertNotIn(_SBX[:9], self._revoke_reason())
 
     def test_revoking_an_expired_pin_says_it_had_already_stopped(self):
         # The page listed it before it lapsed; the click still removes it.
@@ -5693,9 +5706,11 @@ class McpPinTests(_CPTestCase):
         # in every query on this table. The column refuses it, hand edits included.
         with cp.store._connect() as conn:
             with self.assertRaisesRegex(sqlite3.IntegrityError, "CHECK"):
-                conn.execute("UPDATE tool_pins SET expires_at='2099-01-01'")
+                conn.execute("UPDATE tool_pins SET expires_at='2099-01-01', "
+                             "sandbox=?", (_SBX,))
             # A number written as text is a number: the column's REAL affinity.
-            conn.execute("UPDATE tool_pins SET expires_at='4102444800'")
+            conn.execute("UPDATE tool_pins SET expires_at='4102444800', sandbox=?",
+                         (_SBX,))
             self.assertEqual(conn.execute(
                 "SELECT typeof(expires_at) FROM tool_pins").fetchone()[0], "real")
 
@@ -5838,8 +5853,10 @@ class PinFromCardTests(_ToolBridgeTestCase):
 class TimedPinFromCardTests(_ToolBridgeTestCase):
     """``allow_pinned_lease``: a pin from a card that answers for
     ``policy.PIN_LEASE_SECONDS``, and what a second grant of the same values does to
-    it. One row per pin set, so a second grant under the same digest only ever widens
-    the one in place (``SchemaBoundPinFromCardTests`` has the rebind)."""
+    it. One timed row per pin set and sandbox, so a second grant from the same sandbox
+    under the same digest only ever widens the one in place
+    (``SchemaBoundPinFromCardTests`` has the rebind, ``SandboxScopedPinFromCardTests``
+    other sandboxes)."""
 
     audits = True
 
@@ -5893,7 +5910,8 @@ class TimedPinFromCardTests(_ToolBridgeTestCase):
         _resolve(self.ask, "allow_pinned_lease", pins=["owner", "repo"])
         [(kind, reason)] = self._policy_rows()
         self.assertEqual(kind, "create")
-        self.assertIn("for 5m00s while its rule asks", reason)
+        self.assertIn(f"for 5m00s in sandbox {_SBX[:8]} only while its rule asks",
+                      reason)
 
     def test_a_timed_pin_is_refused_where_a_permanent_one_is(self):
         for pins in ([], ["reviewers"], None):
@@ -6098,7 +6116,8 @@ class SchemaBoundPinFromCardTests(_ToolBridgeTestCase):
         moved = self._card(digest=_MOVED)
         self.assertEqual(self._options(moved)["stale"],
                          [{"id": pin["id"], "fields": ["owner", "repo"],
-                           "refused": None}])
+                           "sandbox_prefix": None, "refused": None,
+                           "revoke_refused": None}])
         # A card raised under the pin's own digest is not met by it but answered, so
         # only a call that missed it on other values has a card, and names none.
         other = self._card(repo="widgets")
@@ -6126,22 +6145,43 @@ class SchemaBoundPinFromCardTests(_ToolBridgeTestCase):
         self.assertEqual(kind, "edit")
         self.assertIn(f"pin {before['id']} rebound to the tool's current arguments "
                       f"from this ask (no expiry before it)", reason)
-        self.assertIn("with no expiry, while its rule asks", reason)
+        self.assertIn("with no expiry, in every sandbox while its rule asks", reason)
 
-    def test_a_timed_rebind_of_a_permanent_pin_is_timed_and_audited_as_an_edit(self):
+    def test_a_timed_pin_over_a_stale_permanent_one_revokes_it(self):
+        # The operator's answer on plan 112: the timed click writes this sandbox's own
+        # row, and the permanent pin, which answers no sandbox under the moved
+        # arguments, goes, audited. No row moves across scopes.
         first = self._card()
         _resolve(first, "allow_pinned", pins=["owner", "repo"])
+        [permanent] = self._pins()
         moved = self._card(digest=_MOVED)
         now = time.time()
         resp = _resolve(moved, "allow_pinned_lease", pins=["owner", "repo"])
         pin = resp.body["pin"]
-        self.assertTrue(pin["rebound"])
+        self.assertTrue(pin["created"])
+        self.assertFalse(pin["rebound"])
+        self.assertEqual(pin["revoked"], {"id": permanent["id"]})
+        self.assertEqual(pin["sandbox_prefix"], _SBX[:8])
         self.assertGreaterEqual(pin["expires_at"], now + 300)
         self.assertLess(pin["expires_at"], now + 310)
-        self.assertEqual([p["expires_at"] for p in self._pins()], [pin["expires_at"]])
+        [row] = self._pins()
+        self.assertNotEqual(row["id"], permanent["id"])
+        self.assertEqual((row["expires_at"], row["schema_digest"]),
+                         (pin["expires_at"], _MOVED))
         [(kind, reason)] = self._policy_rows(moved)
-        self.assertEqual(kind, "edit")
-        self.assertIn("for 5m00s while its rule asks", reason)
+        self.assertEqual(kind, "create")
+        self.assertIn(f"for 5m00s in sandbox {_SBX[:8]} only while its rule asks",
+                      reason)
+        # The revoke names the revoked pin's own card, as a revoke from the panel does.
+        [(kind, reason)] = self._policy_rows(first)[-1:]
+        self.assertEqual(kind, "revoke")
+        self.assertTrue(reason.startswith(
+            f"pin {permanent['id']} revoked by a timed pin from card {moved}: it "
+            f"answered every sandbox, under older arguments"), reason)
+        self.assertIn(f"answers sandbox {_SBX[:8]} only through pin {pin['id']}",
+                      reason)
+        self.assertEqual(self._call(_MOVED), "allow")
+        self.assertEqual(self._call(_SCHEMA), "ask")
 
     def test_a_rebind_of_a_timed_pin_says_how_long_it_had_left(self):
         first = self._card()
@@ -6150,8 +6190,9 @@ class SchemaBoundPinFromCardTests(_ToolBridgeTestCase):
         _resolve(moved, "allow_pinned", pins=["owner", "repo"])
         [(kind, reason)] = self._policy_rows(moved)
         self.assertEqual(kind, "edit")
-        self.assertRegex(reason, r"from this ask \(\dm\d\ds left before it\)")
-        self.assertIn("with no expiry, while its rule asks", reason)
+        self.assertRegex(reason, r"from this ask \(\dm\d\ds left before it, and now "
+                                 r"answers every sandbox where it answered one\)")
+        self.assertIn("with no expiry, in every sandbox while its rule asks", reason)
         self.assertEqual([p["expires_at"] for p in self._pins()], [None])
 
     def test_a_card_raised_before_the_one_a_pin_was_bound_from_cannot_rebind_it(self):
@@ -6165,15 +6206,268 @@ class SchemaBoundPinFromCardTests(_ToolBridgeTestCase):
         [stale] = self._options(old)["stale"]
         self.assertEqual(stale["id"], pin["id"])
         self.assertIn("raised after this one", stale["refused"])
-        resp = _resolve(old, "allow_pinned_lease", pins=["owner", "repo"])
-        self.assertEqual(resp.status_code, 409)
-        self.assertTrue(resp.body["pin_refused"])
-        self.assertEqual(resp.body["detail"], stale["refused"])
-        self.assertEqual(self._pins(), [pin])
+        self.assertIn("cannot bind it back", stale["refused"])
+        self.assertIn("cannot revoke it", stale["revoke_refused"])
+        # A permanent click would rebind the pin, and a timed one revoke it: each is
+        # refused in its own words.
+        for action, why in (("allow_pinned", stale["refused"]),
+                            ("allow_pinned_lease", stale["revoke_refused"])):
+            with self.subTest(action=action):
+                resp = _resolve(old, action, pins=["owner", "repo"])
+                self.assertEqual(resp.status_code, 409)
+                self.assertTrue(resp.body["pin_refused"])
+                self.assertEqual(resp.body["detail"], why)
+                self.assertEqual(self._pins(), [pin])
         self.assertEqual(cp.holds._get_tool_ask(old)["status"], "pending")
         # Other fields are a new pin, not a rebind, and the card can still be allowed.
         self.assertEqual(_resolve(old, "allow_pinned", pins=["repo"]).status_code, 200)
         self.assertEqual(len(self._pins()), 2)
+
+
+class SandboxScopedPinFromCardTests(_ToolBridgeTestCase):
+    """What a pin click writes now that a timed pin answers only its card's sandbox: a
+    pin set has one permanent row and one timed row per sandbox, a click reads only
+    the permanent row and its own sandbox's, and a timed click revokes a permanent row
+    made under other arguments (the operator's answer on plan 112)."""
+
+    audits = True
+
+    def setUp(self):
+        super().setUp()
+        saved = cp.policy.PIN_LEASE_SECONDS
+        cp.policy.PIN_LEASE_SECONDS = 300.0
+        self.addCleanup(setattr, cp.policy, "PIN_LEASE_SECONDS", saved)
+        _tool_rule("create_pull_request", "ask")
+        self._titles = iter(range(1000))
+
+    def _card(self, sandbox=_SBX, digest=_SCHEMA, ago=0):
+        """A new card from ``sandbox``, raised ``ago`` seconds before now."""
+        approval_id = _ask_id(_tool_call(
+            tool="create_pull_request",
+            args={**_PR_ARGS, "title": f"t{next(self._titles)}"},
+            schema_digest=digest, sandbox=sandbox))
+        if ago:
+            with cp.store._connect() as conn:
+                conn.execute("UPDATE tool_approvals SET ts = ts - ? WHERE id=?",
+                             (ago, approval_id))
+                conn.commit()
+        return approval_id
+
+    def _pins(self):
+        with cp.store._connect() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT id, approval_id, expires_at IS NULL AS permanent, "
+                "schema_digest, sandbox FROM tool_pins ORDER BY id")]
+
+    def _call(self, sandbox, digest=_SCHEMA):
+        return _tool_call(tool="create_pull_request",
+                          args={**_PR_ARGS, "title": "later"}, schema_digest=digest,
+                          sandbox=sandbox)["decision"]
+
+    def _policy_rows(self, approval_id):
+        with cp.store._connect() as conn:
+            return [(r["kind"], r["reason"]) for r in conn.execute(
+                "SELECT kind, reason FROM audit WHERE approval_id=? "
+                "AND stage='tool-policy' ORDER BY id", (approval_id,))]
+
+    def _options(self, approval_id):
+        [card] = [c for c in cp.holds._pending_payload()["holds"]
+                  if c["id"] == approval_id]
+        return card["pin_options"]
+
+    def _pin_both(self, action, approval_id):
+        return _resolve(approval_id, action, pins=["owner", "repo"])
+
+    # ── reads ────────────────────────────────────────────────────────────────
+
+    def test_a_timed_pin_from_a_card_answers_only_that_cards_sandbox(self):
+        resp = self._pin_both("allow_pinned_lease", self._card())
+        self.assertEqual(resp.body["pin"]["sandbox_prefix"], _SBX[:8])
+        self.assertEqual(self._call(_SBX), "allow")
+        self.assertEqual(self._call(_SBX_B), "ask")
+        self.assertEqual(self._call(None), "ask")
+
+    def test_another_sandboxs_stale_pin_is_on_no_card(self):
+        mine, theirs = self._card(), self._card(sandbox=_SBX_B)
+        _pin(_PINNED, expires_at=time.time() + 600, schema_digest=_MOVED,
+             approval_id=self._card(digest=_MOVED))
+        [stale] = self._options(mine)["stale"]
+        self.assertEqual((stale["sandbox_prefix"], stale["revoke_refused"]),
+                         (_SBX[:8], None))
+        self.assertEqual(self._options(theirs)["stale"], [])
+
+    # ── writes across sandboxes ──────────────────────────────────────────────
+
+    def test_another_sandboxs_timed_click_makes_its_own_row(self):
+        a = self._pin_both("allow_pinned_lease", self._card()).body["pin"]
+        before = self._pins()
+        b = self._pin_both("allow_pinned_lease", self._card(sandbox=_SBX_B)).body["pin"]
+        self.assertTrue(b["created"])
+        self.assertNotEqual(a["id"], b["id"])
+        self.assertEqual(self._pins()[:-1], before)
+        self.assertEqual({k: v for k, v in self._pins()[-1].items()
+                          if k != "approval_id"},
+                         {"id": b["id"], "permanent": 0, "schema_digest": _SCHEMA,
+                          "sandbox": _SBX_B})
+        self.assertEqual((self._call(_SBX), self._call(_SBX_B)), ("allow", "allow"))
+
+    def test_another_sandboxs_permanent_click_makes_a_permanent_row_beside_it(self):
+        self._pin_both("allow_pinned_lease", self._card())
+        [a] = self._pins()
+        b = self._pin_both("allow_pinned", self._card(sandbox=_SBX_B)).body["pin"]
+        self.assertTrue(b["created"])
+        self.assertFalse(b["promoted"])
+        self.assertIsNone(b["sandbox_prefix"])
+        self.assertEqual(self._pins()[0], a)
+        self.assertEqual([(p["permanent"], p["sandbox"]) for p in self._pins()],
+                         [(0, _SBX), (1, "")])
+
+    # ── a timed click ────────────────────────────────────────────────────────
+
+    def test_a_timed_click_over_a_permanent_pin_under_its_digest_writes_nothing(self):
+        # Raised before the pin, which answers every later call like it.
+        first, ask = self._card(), self._card()
+        self._pin_both("allow_pinned", first)
+        before = self._pins()
+        resp = self._pin_both("allow_pinned_lease", ask)
+        self.assertEqual(resp.status_code, 200)
+        pin = resp.body["pin"]
+        self.assertEqual((pin["created"], pin["extended"], pin["rebound"],
+                          pin["expires_at"], pin["sandbox_prefix"], pin["revoked"]),
+                         (False, False, False, None, None, None))
+        self.assertEqual(self._pins(), before)
+        self.assertEqual(self._policy_rows(ask), [])
+
+    def test_a_timed_click_beside_its_own_timed_row_rebinds_it_and_revokes_the_stale_one(
+            self):
+        first = self._card()
+        own = self._pin_both("allow_pinned_lease", first).body["pin"]
+        shared = self._pin_both("allow_pinned", self._card(sandbox=_SBX_B)).body["pin"]
+        moved = self._card(digest=_MOVED)
+        resp = self._pin_both("allow_pinned_lease", moved)
+        pin = resp.body["pin"]
+        self.assertEqual((pin["id"], pin["rebound"], pin["revoked"]),
+                         (own["id"], True, {"id": shared["id"]}))
+        self.assertEqual([(p["id"], p["schema_digest"], p["sandbox"])
+                          for p in self._pins()], [(own["id"], _MOVED, _SBX)])
+        self.assertEqual([kind for kind, _ in self._policy_rows(moved)], ["edit"])
+        with cp.store._connect() as conn:
+            revokes = conn.execute(
+                "SELECT COUNT(*) FROM audit WHERE kind='revoke' AND reason LIKE ?",
+                (f"pin {shared['id']} revoked by a timed pin%",)).fetchone()[0]
+        self.assertEqual(revokes, 1)
+        self.assertEqual(self._call(_SBX, _MOVED), "allow")
+        self.assertEqual(self._call(_SBX_B), "ask")
+
+    def test_a_timed_click_refused_on_either_row_writes_nothing(self):
+        # A newer card bound the permanent row: the old card cannot revoke it.
+        old = self._card(digest=_SCHEMA, ago=10)
+        shared_card, own_card = self._card(digest=_MOVED), self._card(digest=_MOVED)
+        shared = _pin(_PINNED, schema_digest=_MOVED, approval_id=shared_card)
+        before = self._pins()
+        resp = self._pin_both("allow_pinned_lease", old)
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn("cannot revoke it", resp.body["detail"])
+        self.assertEqual(self._pins(), before)
+        # Now the permanent row is older than the card, and the card's own timed row
+        # newer: the rebind is refused, and the permanent row is not deleted either.
+        with cp.store._connect() as conn:
+            conn.execute("UPDATE tool_approvals SET ts = ts - 20 WHERE id=?",
+                         (shared_card,))
+            conn.commit()
+        _pin(_PINNED, expires_at=time.time() + 600, schema_digest=_MOVED,
+             approval_id=own_card)
+        before = self._pins()
+        # The card lists both, and only the permanent one as one a timed click
+        # would revoke.
+        stale = {p["id"]: p for p in self._options(old)["stale"]}
+        own = next(p["id"] for p in before if p["sandbox"])
+        self.assertIn("cannot bind it back", stale[own]["refused"])
+        self.assertIsNone(stale[own]["revoke_refused"])
+        self.assertIsNone(stale[shared]["revoke_refused"])
+        resp = self._pin_both("allow_pinned_lease", old)
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn("cannot bind it back", resp.body["detail"])
+        self.assertEqual(self._pins(), before)
+        self.assertIn(shared, [p["id"] for p in before])
+        self.assertEqual(cp.holds._get_tool_ask(old)["status"], "pending")
+
+    # ── a permanent click ────────────────────────────────────────────────────
+
+    def test_a_permanent_click_promotes_its_own_timed_row(self):
+        first, ask = self._card(), self._card()
+        own = self._pin_both("allow_pinned_lease", first).body["pin"]
+        pin = self._pin_both("allow_pinned", ask).body["pin"]
+        self.assertEqual((pin["id"], pin["extended"], pin["promoted"],
+                          pin["expires_at"], pin["sandbox_prefix"]),
+                         (own["id"], True, True, None, None))
+        self.assertEqual([(p["id"], p["permanent"], p["sandbox"]) for p in self._pins()],
+                         [(own["id"], 1, "")])
+        [(kind, reason)] = self._policy_rows(ask)
+        self.assertEqual(kind, "edit")
+        self.assertIn("and now answers every sandbox where it answered one", reason)
+        self.assertEqual(self._call(_SBX_B), "allow")
+
+    def test_a_newer_cards_promotion_across_a_digest_rebinds_and_an_older_ones_is_refused(
+            self):
+        old = self._card(ago=10)
+        own = self._pin_both("allow_pinned_lease", self._card(ago=5)).body["pin"]
+        moved = self._card(digest=_MOVED)
+        pin = self._pin_both("allow_pinned", moved).body["pin"]
+        self.assertEqual((pin["id"], pin["rebound"], pin["promoted"]),
+                         (own["id"], True, True))
+        self.assertEqual([(p["schema_digest"], p["sandbox"], p["permanent"])
+                          for p in self._pins()], [(_MOVED, "", 1)])
+        self.assertEqual(self._call(_SBX_B, _MOVED), "allow")
+        resp = self._pin_both("allow_pinned", old)
+        self.assertEqual(resp.status_code, 409)
+        self.assertTrue(resp.body["pin_refused"])
+        self.assertEqual([p["schema_digest"] for p in self._pins()], [_MOVED])
+
+    def test_a_permanent_click_beside_a_permanent_row_leaves_its_timed_row(self):
+        timed, ask = self._card(), self._card()
+        self._pin_both("allow_pinned_lease", timed)
+        self._pin_both("allow_pinned", self._card(sandbox=_SBX_B))
+        before = self._pins()
+        resp = self._pin_both("allow_pinned", ask)
+        self.assertEqual(resp.status_code, 200)
+        pin = resp.body["pin"]
+        self.assertEqual((pin["id"], pin["promoted"], pin["extended"]),
+                         (before[1]["id"], False, False))
+        self.assertEqual(self._pins(), before)
+
+    # ── a card with no id ────────────────────────────────────────────────────
+
+    def test_a_card_with_no_id_offers_and_takes_a_permanent_pin_only(self):
+        ask = self._card(sandbox=None)
+        self.assertEqual(self._options(ask)["timed_refused"], cp.policy.NO_SANDBOX_TIMED)
+        self.assertIsNone(self._options(self._card())["timed_refused"])
+        resp = self._pin_both("allow_pinned_lease", ask)
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.body["detail"], cp.policy.NO_SANDBOX_TIMED)
+        self.assertEqual(self._pins(), [])
+        self.assertEqual(self._pin_both("allow_pinned", ask).status_code, 200)
+        self.assertEqual(self._call(None), "allow")
+
+    # ── what an operator view carries ────────────────────────────────────────
+
+    def test_operator_views_carry_the_prefix_and_never_the_whole_id(self):
+        ask = self._card()
+        self._card(sandbox=_SBX_B)
+        payload = json.dumps(cp.holds._pending_payload())
+        self.assertNotIn(_SBX[:9], payload)
+        self.assertNotIn(_SBX_B[:9], payload)
+        self._pin_both("allow_pinned_lease", ask)
+        self._pin_both("allow_pinned", self._card(sandbox=_SBX_B))
+        pins = cp.api_mcp.api_mcp_pins()
+        self.assertEqual([(p["expires_at"] is None, p["sandbox_prefix"]) for p in pins],
+                         [(False, _SBX[:8]), (True, None)])
+        self.assertNotIn(_SBX[:9], json.dumps(pins))
+        with cp.store._connect() as conn:
+            reasons = " ".join(r[0] for r in conn.execute("SELECT reason FROM audit"))
+        self.assertIn(_SBX[:8], reasons)
+        self.assertNotIn(_SBX[:9], reasons)
+        self.assertNotIn(_SBX_B[:9], reasons)
 
 
 class SchemaBoundPinViewTests(_CPTestCase):
@@ -7905,7 +8199,65 @@ class FreshSchemaTests(_FreshStoreTestCase):
                 conn.execute(insert, ("a2",))     # the same pin set from another card
         self.assertEqual(cols, {"id", "server", "tool", "pins_json", "approval_id",
                                 "created_at", "granted_by", "expires_at",
-                                "schema_digest"})
+                                "schema_digest", "sandbox"})
+
+    def test_a_pins_sandbox_is_set_exactly_when_it_is_timed(self):
+        # The CHECK pairing `sandbox` with `expires_at`, both ways, and the UNIQUE
+        # that holds one permanent row per pin set and one timed row per sandbox.
+        self._use_store("fresh-pins-sandbox.db")
+        cp.store._init_db()
+        insert = ("INSERT INTO tool_pins(server, tool, pins_json, approval_id, "
+                  "created_at, granted_by, expires_at, sandbox) "
+                  "VALUES ('s', 't', '{\"a\":1}', 'c', 0, 'g', ?, ?)")
+        with cp.store._connect() as conn:
+            for expires_at, sandbox in ((4102444800.0, ""), (None, _SBX)):
+                with self.subTest(expires_at=expires_at, sandbox=sandbox), \
+                        self.assertRaisesRegex(sqlite3.IntegrityError, "CHECK"):
+                    conn.execute(insert, (expires_at, sandbox))
+            # NULL would pass the CHECK, which a NULL comparison does not fail.
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "NOT NULL"):
+                conn.execute(insert, (4102444800.0, None))
+            conn.execute(insert, (None, ""))
+            conn.execute(insert, (4102444800.0, _SBX))
+            conn.execute(insert, (4102444800.0, _SBX_B))
+            for expires_at, sandbox in ((None, ""), (4102444800.0, _SBX)):
+                with self.subTest(again=sandbox), \
+                        self.assertRaisesRegex(sqlite3.IntegrityError, "UNIQUE"):
+                    conn.execute(insert, (expires_at, sandbox))
+            # Left out, the column is '': a permanent pin, and only that.
+            conn.execute("INSERT INTO tool_pins(server, tool, pins_json, approval_id, "
+                         "created_at, granted_by) VALUES ('s', 't', '{\"b\":1}', "
+                         "'c', 0, 'g')")
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "CHECK"):
+                conn.execute("INSERT INTO tool_pins(server, tool, pins_json, "
+                             "approval_id, created_at, granted_by, expires_at) VALUES "
+                             "('s', 't', '{\"c\":1}', 'c', 0, 'g', 4102444800.0)")
+
+    def test_a_lease_or_ask_deadline_that_is_not_a_number_cannot_be_stored(self):
+        # Task 182: SQLite orders text above every number, so a text deadline would
+        # make a lease live forever and an ask never fall due.
+        self._use_store("fresh-deadlines.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            for statement in (
+                    "INSERT INTO leases(host, client_class, approval_id, created_at, "
+                    "expires_at, granted_by) VALUES ('x.example','a','c',0,?,'t')",
+                    "INSERT INTO tool_approvals(id, ts, server, tool, args_json, "
+                    "args_digest, status, deadline) VALUES "
+                    "('t', 0, 's', 't', '{}', 'd', 'pending', ?)",
+                    # An approved ask's grant lapses from `resolved_at`.
+                    "INSERT INTO tool_approvals(id, ts, server, tool, args_json, "
+                    "args_digest, status, deadline, resolved_at) VALUES "
+                    "('r', 0, 's', 't', '{}', 'd', 'allowed', 0, ?)"):
+                with self.subTest(statement=statement.split("(")[0]):
+                    with self.assertRaisesRegex(sqlite3.IntegrityError, "CHECK"):
+                        conn.execute(statement, ("9999999999abc",))
+                    # A number written as text is a number: REAL affinity.
+                    conn.execute(statement, ("4102444800",))
+            # NULL is an ask nobody has answered, and stays allowed.
+            conn.execute("INSERT INTO tool_approvals(id, ts, server, tool, args_json, "
+                         "args_digest, status, deadline, resolved_at) VALUES "
+                         "('n', 0, 's', 't', '{}', 'd', 'pending', 0, NULL)")
 
     def test_a_fresh_store_lets_two_leases_hold_the_same_host(self):
         # The absent UNIQUE, asserted rather than assumed. Unreachable through the API
@@ -9013,7 +9365,9 @@ class ResumeTokenMigrationTests(_FreshStoreTestCase):
             conn.execute("UPDATE tool_approvals SET args_digest=? WHERE id='p1'",
                          (cp.holds._args_digest("mcp-github", "issue_read", "{}"),))
             conn.commit()
-        answer = _tool_call(tool="issue_read", args={}, schema_digest=None)
+        # With no sandbox id, as the pending ask was raised before one was relayed.
+        answer = _tool_call(tool="issue_read", args={}, schema_digest=None,
+                            sandbox=None)
         self.assertTrue(answer["joined"])
         self.assertEqual(answer["resume_token"], self._tokens()["p1"])
 
@@ -9166,9 +9520,8 @@ class AskSandboxMigrationTests(_FreshStoreTestCase):
                     sorted(tuple(r)[1:] for r in conn.execute(
                         "PRAGMA index_list(tool_approvals)")))
 
-    def test_v15_is_the_current_step(self):
-        self.assertEqual(cp.store.SCHEMA_VERSION, 15)
-        self.assertEqual(cp.store._STEPS[-1][:2], (15, "sandbox id on tool asks"))
+    def test_v15_is_the_fifteenth_step(self):
+        self.assertEqual(cp.store._STEPS[14][:2], (15, "sandbox id on tool asks"))
 
     def test_the_column_is_added_as_null_and_the_ask_kept(self):
         self._v14_store("ask-sandbox-migrate.db")
@@ -9178,7 +9531,7 @@ class AskSandboxMigrationTests(_FreshStoreTestCase):
                 "SELECT id, status, resume_token, sandbox FROM tool_approvals"
             ).fetchone())
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-        self.assertEqual(version, 15)
+        self.assertEqual(version, cp.store.SCHEMA_VERSION)
         self.assertEqual(row, {"id": "p1", "status": "pending",
                                "resume_token": "cd" * 16, "sandbox": None})
 
@@ -9205,6 +9558,287 @@ class AskSandboxMigrationTests(_FreshStoreTestCase):
                 conn.execute(ddl)
             cp.store._step_15_ask_sandbox(conn)
             self.assertEqual(cp.store._columns(conn, "tool_approvals"), set())
+
+
+class ScopedPinMigrationTests(_FreshStoreTestCase):
+    """v16, which scopes a timed pin to the sandbox its card came from by rebuilding
+    ``tool_pins``, and rebuilds ``leases`` and ``tool_approvals`` for task 182's
+    CHECK on their deadlines."""
+
+    # The three tables as v15 left them: no `sandbox` on the pins and no CHECK on
+    # either deadline.
+    _PINS_V15 = SchemaDigestMigrationTests._PINS_V11.replace(
+        "UNIQUE(", "schema_digest TEXT, UNIQUE(")
+    _LEASES_V15 = """CREATE TABLE leases (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, host TEXT NOT NULL,
+        client_class TEXT NOT NULL, approval_id TEXT NOT NULL,
+        created_at REAL NOT NULL, expires_at REAL NOT NULL, granted_by TEXT NOT NULL)"""
+    _ASKS_V15 = AskSandboxMigrationTests._ASKS_V14[:-1] + ", sandbox TEXT)"
+    _PINS_V7 = SchemaVersionTests._PINS_V7
+    _old_store = SchemaVersionTests._old_store
+    _v7_store = SchemaVersionTests._v7_store
+    _ASK_INDEXES_V15 = (
+        "CREATE INDEX tool_approvals_status ON tool_approvals(status)",
+        "CREATE INDEX tool_approvals_status_resolved "
+        "ON tool_approvals(status, resolved_at)",
+        "CREATE UNIQUE INDEX tool_approvals_resume_token "
+        "ON tool_approvals(resume_token)")
+
+    # Each pin: (id, pins_json, card, seconds from now or None, digest). Ids have gaps
+    # and the highest of each table is deleted after, so the sequence is past every
+    # row and a copy that took only the largest id copied would be seen.
+    _PINS = ((2, '{"method":"get"}', "card-permanent", None, _SCHEMA),
+             (3, '{"method":"create"}', "card-a", 3600, _MOVED),
+             (5, '{"method":"update"}', "card-no-id", 3600, _SCHEMA),
+             (6, '{"method":"close"}', "card-gone", 3600, _SCHEMA),
+             (7, '{"method":"lock"}', "card-a", -60, _SCHEMA),
+             (9, '{"method":"top"}', "card-a", None, _SCHEMA))
+
+    def _v15_store(self, name, asks=True, pins=_PINS):
+        self._use_store(name)
+        cp.store._init_db()
+        now = time.time()
+        with cp.store._connect() as conn:
+            for table in ("tool_pins", "leases", "tool_approvals"):
+                conn.execute(f"DROP TABLE {table}")
+            conn.execute(self._PINS_V15)
+            conn.execute(self._LEASES_V15)
+            conn.executemany(
+                "INSERT INTO tool_pins(id, server, tool, pins_json, approval_id, "
+                "created_at, granted_by, expires_at, schema_digest) "
+                "VALUES (?, 'mcp-github', 'issue_write', ?, ?, 0, 'g', ?, ?)",
+                [(i, p, card, None if offset is None else now + offset, digest)
+                 for i, p, card, offset, digest in pins])
+            conn.execute("DELETE FROM tool_pins WHERE id=9")
+            conn.executemany(
+                "INSERT INTO leases(id, host, client_class, approval_id, created_at, "
+                "expires_at, granted_by) VALUES (?, ?, ?, 'c', 0, ?, 'g')",
+                [(1, "live.test", CLASS, now + 900),
+                 (2, "prefix.test", CLASS, "9999999999abc"),
+                 (3, "text.test", CLASS, "soon"),
+                 (4, "top.test", CLASS, now + 900)])
+            conn.execute("DELETE FROM leases WHERE id=4")
+            if asks:
+                conn.execute(self._ASKS_V15)
+                for index in self._ASK_INDEXES_V15:
+                    conn.execute(index)
+                conn.executemany(
+                    "INSERT INTO tool_approvals(id, ts, server, tool, args_json, "
+                    "args_digest, client, status, deadline, sandbox, resolved_at) "
+                    "VALUES (?, ?, 'mcp-github', 'issue_write', '{}', ?, ?, ?, ?, ?, ?)",
+                    [("card-a", now, "d1", CLASS_IP, "allowed", now + 60, _SBX, now),
+                     ("card-no-id", now, "d2", CLASS_IP, "allowed", now + 60, None,
+                      now),
+                     ("card-permanent", now, "d3", CLASS_IP, "allowed", now + 60,
+                      _SBX_B, "2026-11-20"),
+                     ("text-deadline", now, "d4", CLASS_IP, "pending",
+                      "9999999999abc", _SBX, None)])
+            conn.execute("PRAGMA user_version = 15")
+            conn.commit()
+
+    @staticmethod
+    def _rows(sql):
+        with cp.store._connect() as conn:
+            return [tuple(r) for r in conn.execute(sql)]
+
+    @staticmethod
+    def _schema():
+        """Every table and index of the three, as the store records them."""
+        with cp.store._connect() as conn:
+            return sorted(tuple(r) for r in conn.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE tbl_name "
+                "IN ('tool_pins', 'leases', 'tool_approvals')"))
+
+    def test_v16_is_the_current_step(self):
+        self.assertEqual(cp.store.SCHEMA_VERSION, 16)
+        self.assertEqual(cp.store._STEPS[-1][:2], (16, "timed pins scoped to a sandbox"))
+
+    def test_each_pin_is_copied_scoped_or_dropped(self):
+        self._v15_store("scoped-pins-copy.db")
+        cp.store._init_db()
+        self.assertEqual(self._rows("PRAGMA user_version"), [(16,)])
+        self.assertEqual(
+            self._rows("SELECT id, pins_json, approval_id, schema_digest, sandbox, "
+                       "expires_at IS NULL FROM tool_pins ORDER BY id"),
+            [(2, '{"method":"get"}', "card-permanent", _SCHEMA, "", 1),
+             (3, '{"method":"create"}', "card-a", _MOVED, _SBX, 0)])
+        # The card with no id and the one no longer in the store: dropped, audited
+        # under their own cards. The lapsed pin goes unaudited.
+        rows = self._rows("SELECT kind, stage, server, tool, approval_id, reason "
+                          "FROM audit WHERE stage='tool-policy' ORDER BY id")
+        self.assertEqual([r[:5] for r in rows],
+                         [("revoke", "tool-policy", "mcp-github", "issue_write",
+                           "card-no-id"),
+                          ("revoke", "tool-policy", "mcp-github", "issue_write",
+                           "card-gone")])
+        self.assertTrue(rows[0][5].startswith("pin 5 dropped by schema v16"))
+        self.assertTrue(rows[1][5].startswith("pin 6 dropped by schema v16"))
+        self.assertEqual(self._rows(
+            "SELECT name FROM sqlite_master WHERE name GLOB '*_v15'"), [])
+
+    def test_a_copied_timed_pin_answers_only_its_cards_sandbox(self):
+        self._v15_store("scoped-pins-answer.db")
+        cp.store._init_db()
+        _register()
+        _enable()
+        _tool_rule("issue_write", "ask")
+        args = {"method": "create"}
+        self.assertEqual(_tool_call(tool="issue_write", args=args,
+                                    schema_digest=_MOVED)["decision"], "allow")
+        self.assertEqual(_tool_call(tool="issue_write", args=args, schema_digest=_MOVED,
+                                    sandbox=_SBX_B)["decision"], "ask")
+
+    def test_text_deadlines_are_copied_as_long_past(self):
+        # 0.0, not CAST: CAST would read '9999999999abc' as a live deadline.
+        self._v15_store("scoped-pins-deadlines.db")
+        cp.store._init_db()
+        self.assertEqual(
+            self._rows("SELECT id, host, expires_at, typeof(expires_at) FROM leases "
+                       "ORDER BY id")[1:],
+            [(2, "prefix.test", 0.0, "real"), (3, "text.test", 0.0, "real")])
+        self.assertEqual(self._rows("SELECT expires_at FROM leases WHERE id=1")[0][0]
+                         > time.time(), True)
+        self.assertEqual(
+            self._rows("SELECT deadline, typeof(deadline), sandbox, args_digest "
+                       "FROM tool_approvals WHERE id='text-deadline'"),
+            [(0.0, "real", _SBX, "d4")])
+        # A text `resolved_at` would leave an approved grant claimable forever: it
+        # becomes 0.0, lapsed. NULL, an ask nobody answered, stays NULL, and a number
+        # is kept.
+        self.assertEqual(
+            self._rows("SELECT id, resolved_at, typeof(resolved_at) FROM "
+                       "tool_approvals WHERE id IN ('card-permanent', 'text-deadline') "
+                       "ORDER BY id"),
+            [("card-permanent", 0.0, "real"), ("text-deadline", None, "null")])
+        self.assertEqual(self._rows("SELECT typeof(resolved_at) FROM tool_approvals "
+                                    "WHERE id='card-a'"), [("real",)])
+        self.assertEqual(cp.policy._decide("prefix.test", CLASS)[0], "hold")
+        self.assertEqual(cp.policy._decide("live.test", CLASS)[0], "allow")
+
+    def test_new_ids_top_every_old_one_with_one_sequence_row_each(self):
+        self._v15_store("scoped-pins-ids.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            pin = conn.execute(
+                "INSERT INTO tool_pins(server, tool, pins_json, approval_id, "
+                "created_at, granted_by) VALUES ('s', 't', '{\"a\":1}', 'b', 0, 'g')"
+            ).lastrowid
+            lease = conn.execute(
+                "INSERT INTO leases(host, client_class, approval_id, created_at, "
+                "expires_at, granted_by) VALUES ('n.test', ?, 'c', 0, 0, 'g')",
+                (CLASS,)).lastrowid
+            sequence = sorted(tuple(r) for r in conn.execute(
+                "SELECT name, COUNT(*) FROM sqlite_sequence GROUP BY name"))
+        # Past pin 9 and lease 4, deleted before the step; past the dropped pins 5-7.
+        self.assertEqual((pin, lease), (10, 5))
+        self.assertEqual([n for n, count in sequence if count != 1], [])
+        self.assertIn(("tool_pins", 1), sequence)
+        self.assertIn(("leases", 1), sequence)
+
+    def test_with_nothing_copied_a_new_pin_tops_the_dropped_ones(self):
+        # Every pin dropped, so the copy made no sequence row and the step inserts one.
+        self._v15_store("scoped-pins-none-copied.db",
+                        pins=[p for p in self._PINS if p[3] is not None
+                              and p[2] != "card-a"])
+        cp.store._init_db()
+        self.assertEqual(self._rows("SELECT COUNT(*) FROM tool_pins"), [(0,)])
+        self.assertEqual(self._rows(
+            "SELECT seq FROM sqlite_sequence WHERE name='tool_pins'"), [(6,)])
+        with cp.store._connect() as conn:
+            pin = conn.execute(
+                "INSERT INTO tool_pins(server, tool, pins_json, approval_id, "
+                "created_at, granted_by) VALUES ('s', 't', '{\"a\":1}', 'b', 0, 'g')"
+            ).lastrowid
+        self.assertEqual(pin, 7)
+
+    def test_an_empty_table_with_no_sequence_stays_without_one(self):
+        self._v15_store("scoped-pins-empty.db", pins=())
+        with cp.store._connect() as conn:
+            conn.execute("DELETE FROM sqlite_sequence WHERE name='tool_pins'")
+            conn.commit()
+        cp.store._init_db()
+        self.assertEqual(self._rows(
+            "SELECT COUNT(*) FROM sqlite_sequence WHERE name='tool_pins'"), [(0,)])
+
+    def test_without_the_asks_table_every_timed_pin_is_dropped(self):
+        self._v15_store("scoped-pins-no-asks.db", asks=False)
+        with cp.store._connect() as conn:
+            cp.store._step_16_scoped_pins(conn)
+            self.assertEqual(cp.store._columns(conn, "tool_approvals"), set())
+            conn.commit()
+        self.assertEqual(self._rows("SELECT id, sandbox FROM tool_pins ORDER BY id"),
+                         [(2, "")])
+        self.assertEqual(self._rows(
+            "SELECT approval_id FROM audit WHERE reason LIKE "
+            "'%dropped by schema v16%' ORDER BY id"),
+            [("card-a",), ("card-no-id",), ("card-gone",)])
+
+    def test_without_the_asks_table_the_store_boots(self):
+        self._v15_store("scoped-pins-no-asks-boot.db", asks=False)
+        cp.store._init_db()
+        self.assertEqual(self._rows("PRAGMA user_version"), [(16,)])
+        self.assertEqual(self._rows("SELECT id FROM tool_pins"), [(2,)])
+
+    def test_a_missing_sequence_row_is_made_from_the_largest_id(self):
+        # A sequence behind the rows, as a hand edit could leave it: the step still
+        # numbers past every id the old table held.
+        self._v15_store("scoped-pins-no-sequence.db")
+        with cp.store._connect() as conn:
+            conn.execute("DELETE FROM sqlite_sequence WHERE name='tool_pins'")
+            conn.commit()
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            pin = conn.execute(
+                "INSERT INTO tool_pins(server, tool, pins_json, approval_id, "
+                "created_at, granted_by) VALUES ('s', 't', '{\"a\":1}', 'b', 0, 'g')"
+            ).lastrowid
+        self.assertEqual(pin, 8)
+
+    def test_the_step_skips_every_table_the_store_does_not_have(self):
+        self._use_store("scoped-pins-no-tables.db")
+        with cp.store._connect() as conn:
+            for ddl in MigrationTests._OLD_SCHEMA:
+                conn.execute(ddl)
+            cp.store._step_16_scoped_pins(conn)
+            for table in ("tool_pins", "leases", "tool_approvals"):
+                self.assertEqual(cp.store._columns(conn, table), set(), table)
+
+    def test_a_pins_table_that_has_the_column_is_left_alone(self):
+        # What a store below v8 brings: the table v8 made from today's DDL.
+        self._use_store("scoped-pins-has-column.db")
+        cp.store._init_db()
+        # Timed, from a card not in the store, so a rebuild would drop it.
+        _pin({"method": "get"}, tool="issue_write", expires_at=time.time() + 600)
+        before = self._schema()
+        with cp.store._connect() as conn:
+            cp.store._step_16_scoped_pins(conn)
+            conn.commit()
+        self.assertEqual(self._rows("SELECT COUNT(*) FROM tool_pins"), [(1,)])
+        self.assertEqual(self._schema(), before)
+
+    def test_the_indexes_exist_after_the_steps_alone(self):
+        # Not left to the DDL after `_migrate`, which would make them anyway: the step
+        # makes them again, since its aside table took the old ones with it.
+        self._v15_store("scoped-pins-indexes.db")
+        cp.store._migrate()
+        self.assertEqual(
+            sorted(r[0] for r in self._rows(
+                "SELECT name FROM sqlite_master WHERE type='index' "
+                "AND tbl_name='tool_approvals' AND sql IS NOT NULL")),
+            ["tool_approvals_resume_token", "tool_approvals_status",
+             "tool_approvals_status_resolved"])
+
+    def test_a_migrated_store_agrees_with_a_fresh_one_from_v15_and_from_v7(self):
+        self._use_store("scoped-pins-fresh.db")
+        cp.store._init_db()
+        fresh = self._schema()
+        self._v15_store("scoped-pins-from-v15.db")
+        cp.store._init_db()
+        self.assertEqual(self._schema(), fresh)
+        self._v7_store("scoped-pins-from-v7.db", pins_table=True)
+        cp.store._init_db()
+        self.assertEqual(self._schema(), fresh)
+        self.assertEqual(self._rows("PRAGMA user_version"), [(16,)])
 
 
 class CallTokenTableTests(_FreshStoreTestCase):

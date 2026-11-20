@@ -485,8 +485,11 @@ whichever container starts first, so a group spanning days covers every sandbox 
 held that address. Concurrently the column still does its job — two live sandboxes are
 two rows — but folding a fortnight into one line makes an address look like an identity,
 which an ungrouped row (one instant) never did. A real fix needs stable per-sandbox
-identity, and the only sources are the Docker socket (which the egress proxy must never
-hold) or a launcher-to-control-plane path that does not exist; neither is worth
+identity on every row. The tool path now has one, the id a sandbox mints at boot, which
+a card and a timed pin read (`DESIGN.md`, "A card names its sandbox by an id the
+sandbox mints"), but it is the agent's word and no audit column carries it; the egress
+path has none, and its only sources are the Docker socket (which the egress proxy must
+never hold) or a launcher-to-control-plane path that does not exist. Neither is worth
 inventing for a label, so `first_ts` stands as the cue that a long span is involved.
 The id a sandbox mints at boot is no such source: it travels only on the tool path, has
 no audit column of its own (the `hold` row's reason text carries its 8-character
@@ -735,8 +738,10 @@ argument-shaped.
 **Pins get a table of their own, and a rule with pins cannot be revoked.** A rule is
 one row per (server, tool); a pin set is a predicate over the payload, and a tool can
 have several, so `tool_pins` sits beside `tool_rules` rather than in it.
-`UNIQUE(server, tool, pins_json)` means what it says because a pin set is stored in
-one canonical form (`policy._canonical_pins`). Revoking a rule that still has pins is
+`UNIQUE(server, tool, pins_json, sandbox)` means what it says because a pin set is
+stored in one canonical form (`policy._canonical_pins`) and a permanent pin's `sandbox`
+is `''`, never NULL, which SQLite would count as distinct: one permanent row per pin
+set, and one timed row per sandbox beside it. Revoking a rule that still has pins is
 refused rather than cascading, as revoking a server that still has rules is. The
 reason is specific: a pin outliving its rule decides nothing until a rule for the
 same tool returns as `ask`, and then the pin returns with it, with nobody having
@@ -758,21 +763,24 @@ other side to land in between.
 **A timed pin is a column on `tool_pins`, where a lease got a table.** A lease needed
 one because of who reads `rules`: every reader of standing policy would have had to
 learn "except the expired ones" (`store._step_2_leases`). A timed pin is the same
-predicate under the same ceiling as a permanent one and differs only in how long it
-answers, and the readers that must know are few and name it: the decision
-(`policy._pins_met`), the pins view, the rule revoke's pin check, and the write that
-extends or rebinds a pin set already in place (`holds._resolve_tool_ask_pinned`). The
+predicate under the same ceiling as a permanent one and differs only in how long and
+for which sandbox it answers (its `sandbox`, set exactly when it is timed), and the
+readers that must know are few and name it: the decision (`policy._pins_met`), the
+pins view, the rule revoke's pin check, and the write that extends, rebinds, promotes
+or revokes a pin set's rows (`holds._resolve_tool_ask_pinned`). The
 cost is a reader that cannot learn: code from before v8 reads every timed pin as
 permanent, lapsed ones included, as code from before v1 applies a class-scoped rule to
 every client. Delete the timed pins before older code runs on the store. A pin is also
 the one policy row a migration may discard, which is why v8 could drop the pins rather
 than copy them: a pin only allows, so dropping one sends its calls back to a card. v12
 drops them again, because a pin from before it was made under no recorded schema and
-nothing can bind it now.
+nothing can bind it now. v16 drops a live timed pin whose card recorded no sandbox,
+since it would answer nobody, and copies every other with its id.
 
-**Going back past v12 costs the pins twice.** Older code refuses a newer store
+**Going back past v12 or v16 costs the pins twice.** Older code refuses a newer store
 (`store._migrate`), so a rollback is an older image plus `make restore` of a backup
-taken before the step. The restore brings the dropped pins back, and the next forward
+taken before the step. The restore brings the dropped pins back (every pin before
+v12; before v16, the timed pins whose card recorded no sandbox), and the next forward
 boot drops and audits them again, so the operator pins from cards a second time.
 
 **`approvals` splits the same way; the operator's queue does not.** The approvals

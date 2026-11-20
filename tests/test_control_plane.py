@@ -346,24 +346,33 @@ _SCHEMA = "5c" * 32
 _MOVED = "e1" * 32
 
 
+#: The sandbox the calls here come from, and a sibling's. Neither repeats within its
+#: first 8 characters, so a prefix cut at the wrong offset reads differently.
+_SANDBOX = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+_OTHER_SANDBOX = "0f9e8d7c6b5a49382716f5e4d3c2b1a0"
+
+
 def _set_pins(pins, schema_digest=_SCHEMA):
     """Replace the tool_pins table with (server, tool, pins) tuples, or (server, tool,
     pins, seconds_from_now) for a timed pin, the offset relative as in ``_set_leases``
-    and None for a permanent one. Two more parts may follow: the pin's approval id,
-    ``test`` by default, and its own digest. A dict is stored in its canonical form,
-    as the writer will store it; a string is stored verbatim, as a hand-edited row
-    would be. A pin with no digest of its own is bound to ``schema_digest``."""
+    and None for a permanent one. Three more parts may follow: the pin's approval id,
+    ``test`` by default, its own digest, and the sandbox a timed pin answers,
+    ``_SANDBOX`` by default. A dict is stored in its canonical form, as the writer will
+    store it; a string is stored verbatim, as a hand-edited row would be. A pin with no
+    digest of its own is bound to ``schema_digest``."""
     now = time.time()
     with cp.store._connect() as conn:
         conn.execute("DELETE FROM tool_pins")
         conn.executemany(
             "INSERT INTO tool_pins(server, tool, pins_json, approval_id, created_at, "
-            "granted_by, expires_at, schema_digest) "
-            "VALUES (?,?,?,?, 0, 'test', ?, ?)",
+            "granted_by, expires_at, schema_digest, sandbox) "
+            "VALUES (?,?,?,?, 0, 'test', ?, ?, ?)",
             [(server, tool, p if isinstance(p, str) else cp.policy._canonical_pins(p),
-              card, None if offset is None else now + offset, digest)
-             for server, tool, p, offset, card, digest in
-             [(*pin, *(None, "test", schema_digest)[len(pin) - 3:]) for pin in pins]])
+              card, None if offset is None else now + offset, digest,
+              "" if offset is None else sandbox)
+             for server, tool, p, offset, card, digest, sandbox in
+             [(*pin, *(None, "test", schema_digest, _SANDBOX)[len(pin) - 3:])
+              for pin in pins]])
         conn.commit()
 
 
@@ -492,7 +501,7 @@ class PinnedAllowDecisionTests(unittest.TestCase):
                 self.assertEqual(self._decide({**_PR, "repo": "dockade"})[0], "ask")
 
     def test_equal_pin_sets_are_one_stored_string(self):
-        # What makes UNIQUE(server, tool, pins_json) mean what it says.
+        # What makes UNIQUE(server, tool, pins_json, sandbox) mean what it says.
         self.assertEqual(cp.policy._canonical_pins({"repo": "dockade", "owner": "l"}),
                          cp.policy._canonical_pins({"owner": "l", "repo": "dockade"}))
 
@@ -558,8 +567,8 @@ class ToolRulingTests(unittest.TestCase):
         _set_pins([])
 
     def _ruling(self, args=_PR, schema_digest=_SCHEMA, server="mcp-github",
-                tool="create_pull_request"):
-        return cp.policy._tool_ruling(server, tool, args, schema_digest)
+                tool="create_pull_request", sandbox=_SANDBOX):
+        return cp.policy._tool_ruling(server, tool, args, schema_digest, sandbox)
 
     def test_an_answering_pin_carries_its_card(self):
         _set_pins([("mcp-github", "create_pull_request", {"repo": "dockade"}, None,
@@ -578,7 +587,7 @@ class ToolRulingTests(unittest.TestCase):
                     "card-moved", _MOVED)])
         with cp.store._connect() as conn:
             met = cp.policy._pins_met(conn, "mcp-github", "create_pull_request", _PR,
-                                      time.time())
+                                      time.time(), _SANDBOX)
         self.assertEqual([row["approval_id"] for row in met],
                          ["card-moved", "card-timed"])
         self.assertEqual(self._ruling()[::2], ("allow", "card-timed"))
@@ -630,14 +639,15 @@ class TimedPinDecisionTests(unittest.TestCase):
         cp.store._init_db()
         _set_tool_rules([("mcp-github", "create_pull_request", "ask")])
 
-    def _decide(self):
-        return cp.policy._decide_tool("mcp-github", "create_pull_request", _PR, _SCHEMA)
+    def _decide(self, sandbox=_SANDBOX):
+        return cp.policy._decide_tool("mcp-github", "create_pull_request", _PR, _SCHEMA,
+                                      sandbox)
 
     def test_a_live_timed_pin_answers_and_names_its_remaining_time(self):
         _set_pins([("mcp-github", "create_pull_request", {"repo": "dockade"}, 7200)])
         decision, reason = self._decide()
         self.assertEqual(decision, "allow")
-        self.assertIn("pinned: repo, 1h59m left", reason)
+        self.assertIn("pinned: repo, 1h59m left, sandbox a1b2c3d4 only)", reason)
 
     def test_an_expired_pin_asks_and_is_still_in_the_table(self):
         # Present and inert: the read enforces the deadline, not a sweep.
@@ -658,6 +668,48 @@ class TimedPinDecisionTests(unittest.TestCase):
         _set_pins([("mcp-github", "create_pull_request", {"repo": "dockade"}, 600),
                    ("mcp-github", "create_pull_request", {"owner": "acme"}, 7200)])
         self.assertIn("pinned: owner, 1h59m left", self._decide()[1])
+
+
+class SandboxScopedPinDecisionTests(unittest.TestCase):
+    """A timed pin answers only the sandbox whose card it was made from; a permanent
+    pin answers every sandbox, and a call with no id."""
+
+    def setUp(self):
+        cp.store._init_db()
+        _set_tool_rules([("mcp-github", "create_pull_request", "ask")])
+
+    def _decide(self, sandbox):
+        return cp.policy._decide_tool("mcp-github", "create_pull_request", _PR, _SCHEMA,
+                                      sandbox)
+
+    def test_a_timed_pin_answers_only_its_own_sandbox(self):
+        _set_pins([("mcp-github", "create_pull_request", {"repo": "dockade"}, 600)])
+        self.assertEqual(self._decide(_SANDBOX)[0], "allow")
+        for sandbox in (_OTHER_SANDBOX, None):
+            with self.subTest(sandbox=sandbox):
+                self.assertEqual(self._decide(sandbox),
+                                 ("ask", "'ask' by rule (create_pull_request on "
+                                         "mcp-github)"))
+
+    def test_a_permanent_pin_answers_every_sandbox_and_a_call_with_no_id(self):
+        _set_pins([("mcp-github", "create_pull_request", {"repo": "dockade"})])
+        for sandbox in (_SANDBOX, _OTHER_SANDBOX, None):
+            with self.subTest(sandbox=sandbox):
+                decision, reason = self._decide(sandbox)
+                self.assertEqual(decision, "allow")
+                self.assertNotIn("sandbox", reason)
+
+    def test_another_sandboxs_pin_is_out_before_the_digest_test(self):
+        # Under another digest, a pin the call met is named in the reason; one made
+        # for another sandbox is not met at all, so nothing names it.
+        _set_pins([("mcp-github", "create_pull_request", {"repo": "dockade"}, 600,
+                    "card-a", _MOVED)])
+        self.assertIn("pinned under other arguments", self._decide(_SANDBOX)[1])
+        self.assertNotIn("pin", self._decide(_OTHER_SANDBOX)[1])
+        with cp.store._connect() as conn:
+            self.assertEqual(cp.policy._pins_met(
+                conn, "mcp-github", "create_pull_request", _PR, time.time(),
+                _OTHER_SANDBOX), [])
 
 
 class SchemaBoundPinDecisionTests(unittest.TestCase):

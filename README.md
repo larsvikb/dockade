@@ -380,7 +380,7 @@ dockade/
     inventory.py            #   what each server exposes, as the gateway last reported it
     ingest.py               #   drains the proxy's and the gateway's audit streams into
                             #   the store — rows and cursor advance in one transaction
-    requirements.txt        #   pinned deps (fastapi, uvicorn)
+    requirements.txt        #   pinned deps (fastapi, uvicorn, starlette) and their resolved closure
     CLAUDE.md, DESIGN.md    #   how to work here; the approval flow's design
   control-plane-ui/         # UI FRONTEND — serves the UI + reverse-proxies the API
     Dockerfile              #   FastAPI + httpx; control-ui-net (loopback) + control-net;
@@ -413,7 +413,7 @@ dockade/
                             #   empty, stale, or not yet loaded
     index.html              #   static shell + styles for the SSE approval console
     DESIGN.md               #   the browser boundary and the page's mechanics
-    requirements.txt        #   pinned deps (fastapi, uvicorn, httpx)
+    requirements.txt        #   pinned deps (fastapi, uvicorn, httpx, starlette) and their resolved closure
   tasks-ui/                 # TASKS UI — the operator's page onto the task registry, its own origin
     Dockerfile              #   FastAPI + httpx; tasks-ui-net (loopback) + tasks-operator-net,
                             #   behind the registry's profile; built from the root, for ui-common/
@@ -429,7 +429,7 @@ dockade/
                             #   rest kept as typed
     index.html              #   static shell + styles
     DESIGN.md               #   the relay's table, the not-running state, how prose is spelled
-    requirements.txt        #   pinned deps, held equal to the approval UI's
+    requirements.txt        #   pinned deps and their resolved closure, held equal to the approval UI's
   ui-common/                # what every UI shares, copied in beside its own files
     guards.py               #   the browser guards, the security headers, the bind and
                             #   peer checks a UI starts with
@@ -446,7 +446,7 @@ dockade/
     discovery.py            #   dials each server, reconciles against policy, pushes the inventory
     outcomes.py             #   how each call ended — the gateway's own audit stream
     DESIGN.md               #   what the agent is shown, and what runs
-    requirements.txt        #   pinned deps, held equal to the control plane's
+    requirements.txt        #   pinned deps and their resolved closure, held equal to the control plane's
   task-registry/            # TASK REGISTRY — the work list agent sessions and the operator share
     Dockerfile              #   FastAPI + uvicorn; mcp-net + tasks-operator-net, behind a profile
     serve.py                #   the bind check, then both listeners in one process
@@ -472,7 +472,7 @@ dockade/
                             #   make restore-tasks
     export.py               #   a backup as markdown, for reading without the server
     DESIGN.md               #   who writes what, and why
-    requirements.txt        #   pinned deps; fastapi and uvicorn held equal to the control plane's
+    requirements.txt        #   pinned deps and their resolved closure, every pin held equal to the control plane's
   policies/                 # seed policy config (loaded into the control plane)
     egress-allowlist.txt    #   default-deny seed for the control plane's egress policy store
   proxies/                  # governed data-plane services (one dir per proxy)

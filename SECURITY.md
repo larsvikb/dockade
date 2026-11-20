@@ -192,9 +192,11 @@ report.
   it would matter: the egress proxy is the security choke point and its base *is*
   digest-pinned, so a repointed tag cannot change the component that enforces egress.
   Elsewhere this is a deliberate rebuild-to-update choice. Python dependencies are
-  pinned by version in each `requirements.txt` but not by hash, and their transitive
-  dependencies are not pinned at all — the same choice one layer down, and a real
-  supply-chain path into the control plane if you disagree with it.
+  pinned by version in each `requirements.txt` but not by hash, their transitive
+  dependencies included — the same choice one layer down, and a real supply-chain
+  path into the control plane if you disagree with it. Pinning the transitives has a
+  cost too: a security fix in one of them arrives only with a reviewed bump, not
+  with a rebuild.
 - **Infra containers reaching the egress proxy.** The tool gateway and
   the llm share sandbox-net with the agent, and the proxy accepts on it. Their
   requests are not the agent's: they fall outside the sandbox pool, so they are

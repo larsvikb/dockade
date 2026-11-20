@@ -2538,6 +2538,12 @@ consequences that are load-bearing rather than incidental:
   that depends on the minor can pass there and fail on CI. It is accepted because
   matching it costs a second interpreter in the sandbox image.
 
+The services' Python dependencies do the opposite of the tooling: each FastAPI
+service's `requirements.txt` is locked to its full resolved closure, installed with
+`--no-deps` and `pip check` so an incomplete lock fails the build, and held together
+by `tests/test_service_pins.py`. Their behaviour is the services' behaviour, so a
+change to any of them is a reviewed diff rather than whatever a rebuild resolves.
+
 **The build job earns its minutes.** Its first run found a bug unobservable locally:
 `run-opencode-sandbox.sh` was `100644` in the git index while `755` on disk, so it
 worked on the machine that wrote it and *any fresh clone* got exit 126. `core.fileMode=false`

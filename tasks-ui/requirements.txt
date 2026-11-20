@@ -1,6 +1,25 @@
 # Tasks UI deps. Pinned for reproducible builds, and held equal to
 # control-plane-ui/requirements.txt (tests/test_topology.py): both run ui-common's
-# guards, which were tested against these.
+# guards, which were tested against these. starlette is pinned for the reasons
+# control-plane/requirements.txt gives.
 fastapi==0.141.1
 uvicorn==0.53.0
 httpx==0.28.1
+starlette==1.10.0
+
+# Everything else the pins above resolve to, for the Python of this service's
+# Dockerfile FROM. The Dockerfile installs with --no-deps and runs pip check, so
+# this is exactly what ships and an incomplete list fails the build. A bump
+# re-resolves the whole closure in a scratch venv; the diff here is the review.
+annotated-doc==0.0.7
+annotated-types==0.8.0
+anyio==4.16.0
+certifi==2026.10.23
+click==8.5.1
+h11==0.16.0
+httpcore==1.0.9
+idna==3.20
+pydantic==2.14.3
+pydantic_core==2.50.4
+typing-inspection==0.4.5
+typing_extensions==4.16.0

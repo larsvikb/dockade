@@ -15,7 +15,10 @@ RUN useradd --system --create-home --home-dir /home/cpui --uid 10002 cpui
 WORKDIR /opt/control-plane-ui
 
 COPY control-plane-ui/requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+# --no-deps installs exactly the file, and pip check fails the build when it is not
+# a complete, consistent closure (a fastapi bump needing a newer starlette, a new
+# transitive). Without them a missing package would quietly resolve here again.
+RUN pip install --no-cache-dir --no-deps -r requirements.txt && pip check
 
 COPY control-plane-ui/app.py ./app.py
 COPY ui-common/guards.py ./guards.py

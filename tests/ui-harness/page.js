@@ -2,8 +2,9 @@
 // A page of the UI in a headless browser, set up so that what it does can be read the
 // same way every time: its API requests answered by a fake backend one at a time in
 // the order it made them, its clock frozen until a step moves it, and its approvals
-// feed faked inside the page. harness.js runs a scenario on it and writes a transcript;
-// approval.test.js and tasks.test.js assert on it. None repeats any of this.
+// feed faked inside the page, with the heartbeats a run can install over it.
+// harness.js runs a scenario on it and writes a transcript; approval.test.js,
+// failing-state.test.js and tasks.test.js assert on it. None repeats any of this.
 //
 //   const browser = await launch();
 //   const p = await openPage(browser, servedDir, { respond, answeredLast });
@@ -59,6 +60,61 @@ function fakeEventSource() {
       if (es.onerror) es.onerror(new Event("error"));
     }
   };
+  // A transient error: the connection lost and the browser's own retry under way, which
+  // leaves the stream CONNECTING, as a network error does. `__harnessReopen` is that
+  // retry landing: the same stream open again, with no new one made.
+  window.__harnessFault = () => {
+    for (const es of open) {
+      if (es.readyState !== FakeEventSource.OPEN) continue;
+      es.readyState = FakeEventSource.CONNECTING;
+      if (es.onerror) es.onerror(new Event("error"));
+    }
+  };
+  window.__harnessReopen = () => {
+    for (const es of open) {
+      if (es.readyState !== FakeEventSource.CONNECTING) continue;
+      es.readyState = FakeEventSource.OPEN;
+      if (es.onopen) es.onopen(new Event("open"));
+    }
+  };
+}
+
+// Installed after fakeEventSource, and wrapping it, by a run that wants the stream to
+// speak: harness.js on every run, failing-state.test.js on each of its tests. Each fake
+// sends a heartbeat once open and then once a second of the page clock, as the server
+// sends one on every tick that changed nothing, so a page that waits for an event
+// before it shows the stream live reads live after every load and step. `__harnessSilence(true)`
+// stops every heartbeat, the on-open one included, until `__harnessSilence(false)`:
+// a stream that is open and says nothing. `__harnessStreams()` counts the fakes made,
+// for the snapshot, and `__harnessSinceClose()` is how long ago the page last closed
+// one (null if it has not), for a step that has to stop just short of a backoff.
+export function heartbeats() {
+  const Fake = window.EventSource;
+  const made = [];
+  let silent = false;
+  const beat = es => {
+    if (!silent && es.readyState === Fake.OPEN) {
+      es.dispatchEvent(new MessageEvent("heartbeat", { data: "" }));
+    }
+  };
+  class Heartbeating extends Fake {
+    constructor(url) {
+      super(url);
+      made.push(this);
+      // Queued after the fake's own open, so it lands on an open stream.
+      queueMicrotask(() => beat(this));
+    }
+    close() {
+      super.close();
+      closedAt = performance.now();
+    }
+  }
+  let closedAt = null;
+  window.EventSource = Heartbeating;
+  setInterval(() => made.forEach(beat), 1000);
+  window.__harnessSilence = on => { silent = on; };
+  window.__harnessStreams = () => made.length;
+  window.__harnessSinceClose = () => closedAt === null ? null : performance.now() - closedAt;
 }
 
 // Installed in every document before its modules load, beside fakeEventSource. Each
@@ -375,6 +431,8 @@ export async function openPage(browser, uiDir, { respond, answeredLast = () => f
     page,
     push: holds => page.evaluate(h => window.__harnessPush({ holds: h }), holds),
     drop: () => page.evaluate(() => window.__harnessDrop()),
+    fault: () => page.evaluate(() => window.__harnessFault()),
+    reopen: () => page.evaluate(() => window.__harnessReopen()),
     clock: ms => queue.moveTime(() => page.clock.runFor(ms)),
     // For a step that checks what the page did with its answers before it ends.
     settle: () => queue.settle(),

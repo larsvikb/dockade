@@ -3,11 +3,11 @@
 // transcript: after every step, the requests the page sent, what reached its console,
 // and its DOM. There are no expected values here. `make ui-diff` runs this on the base
 // tree and on the branch and diffs the two transcripts, so the oracle is the previous
-// version of the page; approval.test.js and tasks.test.js, under `make ui-test`, are the
-// ones with expected values. For two runs of one page to read the same, the page's API
-// requests are answered one at a time in the order it made them, except a read the
-// backend names to answer last, never while the clock moves, and a step ends only once
-// the page is quiet (answerQueue, in page.js).
+// version of the page; approval.test.js, failing-state.test.js and tasks.test.js, under
+// `make ui-test`, are the ones with expected values. For two runs of one page to read
+// the same, the page's API requests are answered one at a time in the order it made
+// them, except a read the backend names to answer last, never while the clock moves,
+// and a step ends only once the page is quiet (answerQueue, in page.js).
 //
 //   node harness.js <served dir> <transcript out> [approval|tasks]
 //
@@ -18,7 +18,7 @@
 
 import { writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { BROWSER, ORIGIN, launch, openPage } from "./page.js";
+import { BROWSER, ORIGIN, heartbeats, launch, openPage } from "./page.js";
 
 const PAGES = {
   approval: ["./backend.js", "./scenario.js"],
@@ -35,43 +35,6 @@ if (!existsSync(BROWSER)) {
   console.error(`no browser at ${BROWSER}. The tier-1 sandbox image has one; elsewhere, `
                 + "point UI_HARNESS_BROWSER at a Chromium or headless-shell binary.");
   process.exit(2);
-}
-
-// Installed after page.js's fake EventSource, and wrapping it: each fake sends a
-// heartbeat once open and then once a second of the page clock, as the server sends
-// one on every tick that changed nothing, so a page that waits for an event before it
-// shows the stream live reads live after every load and step. `__harnessSilence(true)`
-// stops every heartbeat, the on-open one included, until `__harnessSilence(false)`:
-// a stream that is open and says nothing. `__harnessStreams()` counts the fakes made,
-// for the snapshot, and `__harnessSinceClose()` is how long ago the page last closed
-// one (null if it has not), for a step that has to stop just short of a backoff.
-function heartbeats() {
-  const Fake = window.EventSource;
-  const made = [];
-  let silent = false;
-  const beat = es => {
-    if (!silent && es.readyState === Fake.OPEN) {
-      es.dispatchEvent(new MessageEvent("heartbeat", { data: "" }));
-    }
-  };
-  class Heartbeating extends Fake {
-    constructor(url) {
-      super(url);
-      made.push(this);
-      // Queued after the fake's own open, so it lands on an open stream.
-      queueMicrotask(() => beat(this));
-    }
-    close() {
-      super.close();
-      closedAt = performance.now();
-    }
-  }
-  let closedAt = null;
-  window.EventSource = Heartbeating;
-  setInterval(() => made.forEach(beat), 1000);
-  window.__harnessSilence = on => { silent = on; };
-  window.__harnessStreams = () => made.length;
-  window.__harnessSinceClose = () => closedAt === null ? null : performance.now() - closedAt;
 }
 
 // The DOM as indented lines, one element or text run per line. Properties a script
@@ -127,6 +90,7 @@ async function main() {
     },
   });
   ({ page } = run);
+  // Every stream speaks, so the page reads live after each load (heartbeats, in page.js).
   await page.addInitScript(heartbeats);
   await page.coverage.startJSCoverage({ resetOnNavigation: false });
 

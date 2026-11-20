@@ -674,12 +674,13 @@ ui-diff: ## Run a page's scenario (UI_DIFF_PAGE=approval|tasks) on UI_DIFF_BASE 
 	fi
 
 # The approval page and the tasks page against expected values
-# (tests/ui-harness/approval.test.js, tests/ui-harness/tasks.test.js). Not part of
+# (tests/ui-harness/approval.test.js and failing-state.test.js, which share the approval
+# page's served dir, and tests/ui-harness/tasks.test.js). Not part of
 # `check` or `test`, which stay browser-free: control-plane-ui/DESIGN.md says why. CI
 # runs it in its own job; `make ui-test DOCKADE_REQUIRE_TOOLS=1` is that job's command.
 # A missing node or browser SKIPs, and FAILs under DOCKADE_REQUIRE_TOOLS. An npm install
 # that fails, offline say, fails in either mode: the tools were there and the run was not.
-# Both pages run whatever the first came to, and the target fails if either did.
+# Each file runs whatever the ones before it came to, and the target fails if any did.
 ui-test: ## Run the approval and tasks pages' browser tests with expected values (needs node and a headless Chromium)
 	@$(UI_HARNESS_SH)
 	miss() {
@@ -705,6 +706,8 @@ ui-test: ## Run the approval and tasks pages' browser tests with expected values
 	failed=""
 	echo "== ui-test: the approval page, $$version =="
 	node "$$harness/approval.test.js" "$$out/approval" || failed="$$failed approval"
+	echo "== ui-test: the approval page's failing states, $$version =="
+	node "$$harness/failing-state.test.js" "$$out/approval" || failed="$$failed failing-state"
 	echo "== ui-test: the tasks page, $$version =="
 	node "$$harness/tasks.test.js" "$$out/tasks" || failed="$$failed tasks"
 	if [ -n "$$failed" ]; then

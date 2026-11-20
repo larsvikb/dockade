@@ -1181,6 +1181,13 @@ class RootContextIgnoreTests(unittest.TestCase):
                                      f".dockerignore excludes {source}, which "
                                      f"{dockerfile} COPYs: the build would fail")
 
+    def test_every_launcher_is_outside_the_build_context(self):
+        launchers = sorted(p.name for p in ROOT.glob("run-*-sandbox.sh"))
+        self.assertIn("run-claude-sandbox.sh", launchers)
+        for name in launchers:
+            with self.subTest(launcher=name):
+                self.assertTrue(_dockerignored(name, self.IGNORED))
+
     def test_the_matcher_reads_patterns_as_the_builder_does(self):
         patterns = ("tests", "*.md", "**/__pycache__", "*-sandbox/instructions.md",
                     "secrets", "!secrets/keep")

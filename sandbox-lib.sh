@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Shared launcher plumbing for every sandbox tier.
 #
-# Sourced by run-claude-sandbox.sh (tier 1, Claude + governed egress) and
-# run-opencode-sandbox.sh (tier 2, local LLM, no egress). This file owns the
+# Sourced by each run-*-sandbox.sh launcher (DESIGN.md's tier table, under
+# "Tier 2, and what it shares with tier 1", has one row each). This file owns the
 # mechanics that MUST NOT differ between tiers — above all the workspace safety
 # guard, which is the single deliberate writable host coupling and the place where a
 # copy-paste divergence would do the most damage.
@@ -53,11 +53,11 @@ sc_build_image() {
 # ---------------------------------------------------------------------------
 # sc_jdk_variant <base_tag>
 #
-# SANDBOX_JDK=<major> asks for tier 1's JDK variant: the Dockerfile's ARG JDK, built
-# and run under <base_tag>-jdk<major>, so it and the default image never overwrite
-# each other and a missing variant is built rather than the default reused. Unset
-# or empty, the tag and the build are the default's. Anything but a major version
-# is refused, since it becomes part of an apt package name.
+# SANDBOX_JDK=<major> asks for Claude's image's JDK variant: the Dockerfile's ARG
+# JDK, built and run under <base_tag>-jdk<major>, so it and the default image never
+# overwrite each other and a missing variant is built rather than the default
+# reused. Unset or empty, the tag and the build are the default's. Anything but a
+# major version is refused, since it becomes part of an apt package name.
 # shellcheck disable=SC2034  # both globals are consumed by the sourcing launcher
 sc_jdk_variant() {
     SC_IMAGE="$1"
@@ -604,7 +604,7 @@ sc_refs() {
         [[ -n "$name" ]] || name="${real##*/}"
         # No leading dot: that would also allow `..`, and hide the ref from both
         # `ls /refs` and boundary-check.sh's /refs/*/ probe. It also keeps a ref
-        # named `.claude` from becoming /refs/.claude. Tier 1's user settings
+        # named `.claude` from becoming /refs/.claude. Claude's user settings
         # allow reads under /refs, and an extra directory given on the command
         # line does load skills from its root's .claude; the settings allow was
         # measured not to, so this rule is the margin should a release change
@@ -688,17 +688,18 @@ sc_plugin_allowlist() {
 # allow_fallback=true (Claude's tier): if the network is absent, create a plain
 # NON-internal bridge so the sandbox still runs standalone with direct egress via
 # its own firewall allowlist. That allowlist is Anthropic's, so the fallback is
-# Claude's, not every governed tier's. allow_fallback=false (tier 2): a tier with
-# no egress has nothing to fall back TO, and silently creating a non-internal
-# bridge would hand it the egress its design says it must not have — so refuse
-# instead.
+# Claude's, not every governed tier's. allow_fallback=false (every other tier): a
+# tier that reaches nothing outside except through the data plane has nothing to
+# fall back TO, and silently creating a non-internal bridge would hand it the
+# direct egress its design says it must not have — so refuse instead.
 #
-# Which is why, for tier 2, existence is not the question. A Claude standalone run
-# creates sandbox-net as exactly that plain non-internal bridge, and the network
-# outlives the container that prompted it. A later tier-2 launch asking only "does
-# it exist?" would adopt it and get the egress the refusal above exists to prevent,
-# with nothing to see: same name, same DNS, same subnet shape. So assert the
-# property the tier depends on rather than the name it travels under.
+# Which is why, without the fallback, existence is not the question. A Claude
+# standalone run creates sandbox-net as exactly that plain non-internal bridge, and
+# the network outlives the container that prompted it. A later launch of any other
+# tier asking only "does it exist?" would adopt it and get the egress the refusal
+# above exists to prevent, with nothing to see: same name, same DNS, same subnet
+# shape. So assert the property the tier depends on rather than the name it travels
+# under.
 sc_ensure_network() {
     local net="$1" allow_fallback="$2"
 
@@ -710,9 +711,10 @@ sc_ensure_network() {
             return 0
         fi
         echo "ERROR: network '$net' exists but is NOT internal." >&2
-        echo "       This tier's 'no egress' is enforced by the network being" >&2
-        echo "       internal, so adopting this one would hand it egress. A bridge" >&2
-        echo "       left behind by a tier-1 standalone run looks exactly like this." >&2
+        echo "       This tier reaches nothing outside except through the data" >&2
+        echo "       plane, which the network being internal enforces, so adopting" >&2
+        echo "       this one would hand it direct egress. A bridge left behind by" >&2
+        echo "       a Claude standalone run looks exactly like this." >&2
         echo "       Remove it and start the infrastructure:" >&2
         echo "         docker network rm $net && make -C \"$SANDBOX_REPO_ROOT\" up" >&2
         exit 1
@@ -743,7 +745,7 @@ sc_service_ip() {
 # Service readiness
 # ---------------------------------------------------------------------------
 # Discovering a service's IP proves a container EXISTS, not that it can serve.
-# The gap is not cosmetic for either tier:
+# The gap is not cosmetic for any tier; for example:
 #   - tier 1: the egress proxy fails CLOSED while the control plane is not yet
 #     answering /authorize, so a sandbox launched into the boot window gets real
 #     denials written to the audit log — noise that reads exactly like policy.
@@ -751,7 +753,7 @@ sc_service_ip() {
 #     GGUF is loaded and offloaded, which takes minutes; opencode's first turn
 #     would simply fail.
 # Both are the same bug — acting on "container up" when we mean "service ready" —
-# so both tiers gate through the one helper below.
+# so every tier gates through the one helper below.
 
 # sc_health_status <container> — echoes healthy|unhealthy|starting, or NOTHING
 # when the container declares no healthcheck (or does not exist).
@@ -809,7 +811,8 @@ sc_wait_healthy() {
 }
 
 # ---------------------------------------------------------------------------
-# Governed egress  ->  sets SC_PROXY_ENV_ARGS (array), SC_EGRESS_DESC, SC_TOOLS_DESC
+# Governed egress  ->  sets SC_PROXY_ENV_ARGS (array), SC_EGRESS_DESC, SC_TOOLS_DESC,
+#                      SC_NO_GATEWAY
 # ---------------------------------------------------------------------------
 # sc_governed_egress <net> [model-host ...]
 #
@@ -839,6 +842,11 @@ sc_wait_healthy() {
 # it without the proxy: that branch is what mode-gates the grant (DESIGN.md, "MCP
 # gateway": firewall grants are mode-gated).
 #
+# SC_NO_GATEWAY is "true" only when the proxy is present and the gateway is not,
+# and empty otherwise. SC_TOOLS_DESC states only that fact; what it means for the
+# tier's tool surface is the launcher's to say, since it depends on how its CLI
+# loads MCP servers.
+#
 # EGRESS_PROXY_NAME/PORT and TOOL_GATEWAY_NAME/PORT are environment overrides.
 # shellcheck disable=SC2034  # the descriptions are consumed by the sourcing launcher
 sc_governed_egress() {
@@ -861,6 +869,7 @@ sc_governed_egress() {
     proxy_ip="$(sc_service_ip "$proxy_name" "$net")"
 
     SC_PROXY_ENV_ARGS=()
+    SC_NO_GATEWAY=""
     if [[ "$proxy_ip" =~ ^[0-9.]+$ ]]; then
         # The proxy exists, but until the control plane answers /authorize the addon
         # fails CLOSED — so launching now would not stall the agent's first requests,
@@ -950,12 +959,9 @@ sc_governed_egress() {
             )
             SC_TOOLS_DESC="governed via $gateway_name ($gateway_ip:$gateway_port)"
         else
-            # NOT a failure, and the sandbox still launches. `--strict-mcp-config` goes on
-            # unconditionally in the wrapper, so "no gateway" yields a provably empty tool
-            # surface rather than whatever the config volume has accumulated — which is
-            # the whole reason those two flags are separable (DESIGN.md, "Telling the
-            # sandbox it exists").
-            SC_TOOLS_DESC="NONE (no $gateway_name on $net; MCP surface is empty)"
+            # NOT a failure, and the sandbox still launches.
+            SC_TOOLS_DESC="NONE (no $gateway_name on $net)"
+            SC_NO_GATEWAY="true"
         fi
     else
         # No proxy found. If <net> is internal (the compose infra defines sandbox-net
@@ -1040,8 +1046,10 @@ sc_git_identity() {
 #   3. Docker's public fallback 8.8.8.8/8.8.4.4 — what Docker itself uses when the
 #      host has no usable non-loopback resolver (e.g. WSL2 / Docker Desktop).
 #
-# Tiers with NO egress do not call this: they resolve only sibling names, which
-# the embedded resolver answers locally with no upstream forward at all.
+# The upstreams matter only where the firewall lets that forward out, which is
+# standalone mode: elsewhere a tier resolves only sibling names, which the embedded
+# resolver answers locally. So a tier with no standalone mode need not call this;
+# Claude's launcher calls it in every mode.
 sc_upstream_dns() {
     local resolv ns
     if [[ -n "${SANDBOX_DNS:-}" ]]; then
@@ -1111,7 +1119,7 @@ sc_clamp_cpus() {
 # ---------------------------------------------------------------------------
 # sc_host_timezone   -> sets SC_TZ
 #
-# Both launchers pass -e TZ so a timestamp inside the container means what the
+# Each launcher passes -e TZ so a timestamp inside the container means what the
 # human reading it expects. They used to pass `${TZ:-UTC}`, which is correct on a
 # host that exports TZ and wrong on the one this repo is developed on: WSL2 never
 # exports it. It carries the zone in /etc/localtime instead — a symlink into

@@ -155,8 +155,8 @@ egress** — sandbox-net only. These make good practices cheap and fast. Example
 - language servers, linters, formatters
 - local scratch DB, cache, docs mirror
 - headless browser **only if** its egress is forced through the governed proxy
-  (otherwise it is an ungoverned egress hole — treat as governed). The one in the
-  tier-1 image qualifies without being a service: it runs inside the sandbox, so its
+  (otherwise it is an ungoverned egress hole — treat as governed). The one in
+  Claude's image qualifies without being a service: it runs inside the sandbox, so its
   egress is the sandbox's — the proxy in governed mode, and in the standalone fallback
   the same direct allowlist as every other process there.
 
@@ -296,7 +296,7 @@ image is where **enablement** lives:
   (e.g. format/test on write, block known-bad patterns) — *hooks: planned, not
   yet in the image (see Status)*
 - a default **status line** (`claude-sandbox/statusline.sh`, seeded into user
-  settings by the tier-1 setup hook the entrypoint runs — see below)
+  settings by Claude's setup hook the entrypoint runs — see below)
 - the **skills** that are the sanctioned interface to every capability, doing
   double duty: the capability interface **and** the right *way* to do a task,
   steering the agent onto the paved road — *planned, not yet in the image*
@@ -514,7 +514,7 @@ boot-derived is the whole mitigation; the trust decision itself stays the human'
 
 Host directories the operator lists in `SANDBOX_REFS` are mounted read-only at
 `/refs/<name>` (`sc_refs` in `sandbox-lib.sh`). Reading a file needs no
-capability, so both tiers get them, and it is enablement rather than a widening
+capability, so every tier gets them, and it is enablement rather than a widening
 of the boundary — provided what is mounted is only files.
 
 - **One guard for every read-only mount.** `/refs` and `/marketplaces` refuse the
@@ -537,20 +537,20 @@ of the boundary — provided what is mounted is only files.
   the `:ro` in the source, and `boundary-check.sh` probes every `/refs/*` in the
   running container. A writable ref would let the agent edit a host checkout
   outside `/workspace`, so outside the review its commits get.
-- **Reading one asks nothing.** `/refs` is outside the working directory, so both
-  agents would ask before every read outside bypass mode. Each tier's image-owned
-  config takes the asking away. Tier 1's `permissions.additionalDirectories` in
+- **Reading one asks nothing.** `/refs` is outside the working directory, so each
+  tier's agent would ask before every read outside bypass mode. Each tier's image-owned
+  config takes the asking away. Claude's `permissions.additionalDirectories` in
   `claude-sandbox/user-settings.json` makes `/refs` a working directory, with the
   permissions the workspace has, edits included, so `:ro` is what keeps it read-only.
-  Tier 2's `permission.external_directory` in `opencode-sandbox/opencode.json`
-  allows that one permission under `/refs/**`. Both cover the whole of `/refs`,
-  statically, so it is the same for every sibling and needs no launch file. Tier
-  1's allow is at user scope rather than on the command line, because the flag form
+  opencode's `permission.external_directory` in `opencode-sandbox/opencode.json`
+  allows that one permission under `/refs/**`. Each covers the whole of `/refs`,
+  statically, so it is the same for every sibling and needs no launch file.
+  Claude's allow is at user scope rather than on the command line, because the flag form
   loads skills, agents and commands from the named directory's `.claude/`, and the
   settings form loads nothing from a ref — measured, with each run's hooks, in
   `NOTES.md` → "An allowed read directory loads nothing from it".
 - **The trust framing differs from marketplaces:** a ref is data the agent reads,
-  not code it loads, so no hook or skill runs from it. In tier 1 that rests on the
+  not code it loads, so no hook or skill runs from it. In Claude's tier that rests on the
   measurement above and on there being no `/refs/.claude` to load from: a ref's name
   may not start with a dot (`sc_refs`). `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD`
   is what would turn the refs' `CLAUDE.md` files into instructions, and
@@ -564,7 +564,7 @@ of the boundary — provided what is mounted is only files.
 Git **conventions** are shared and safe to ship, so the baked `~/.gitconfig`
 carries only non-personal defaults (`init.defaultBranch = main`, `pull.rebase =
 true`). Git **identity** is per-person and would make the image host-specific, so
-it is *not* committed. The launcher (`sandbox-lib.sh`, shared by both tiers) reads
+it is *not* committed. The launcher (`sandbox-lib.sh`, shared by every tier) reads
 `user.name`/`user.email` from the **host's** git config at launch and forwards
 them as `GIT_USER_NAME` /
 `GIT_USER_EMAIL`; the entrypoint materializes them into the sandbox user's global
@@ -964,7 +964,7 @@ a crafted name can no longer reach a recursive resolver; sibling names like
 drops the upstream forward, but the resolver the firewall still permits declines to
 recurse on its own — the **engine's** behaviour for a container whose only network
 is `internal`, not this repo's. `boundary-check.sh` therefore asserts it rather than
-inheriting it, in both tiers that sit on such a network. Also dropped: the
+inheriting it, in every tier that sits on such a network. Also dropped: the
 **gateway `/32`** (host-local
 surface). Without a proxy the firewall keeps the fuller **standalone** allowlist
 (ipset + upstreams + gateway). Net effect: with the proxy up, the sandbox's only
@@ -1975,7 +1975,7 @@ default-allow this whole path is built to avoid.
 **One id at a time, and no roster of pending work.** A lookup scoped to a single
 approval is all resumption needs. Listing what is pending is a different capability and
 is deliberately not offered: the gateway's agent-facing listener binds `sandbox-net`,
-which both tiers share, so a roster would leak approvals the caller never raised — and
+which every tier shares, so a roster would leak approvals the caller never raised — and
 past the leak it hands the agent a read on the operator's queue, a nudge surface kept
 away from it everywhere else here.
 
@@ -2269,7 +2269,7 @@ what it makes of a write whose answer was lost, is `tasks-ui/DESIGN.md`.
 
 ## Startup ordering — "running" is not "ready"
 
-Every infrastructure service declares a `healthcheck`, and both launchers gate on it via
+Every infrastructure service declares a `healthcheck`, and each launcher gates on it via
 `sc_wait_healthy` in `sandbox-lib.sh`. This is an **audit-integrity** measure
 before it is an ergonomic one.
 
@@ -2280,7 +2280,7 @@ requests — it **denies them and writes those denials to the audit log**, where
 they are indistinguishable from policy decisions. The audit log is the artifact
 this whole design exists to keep trustworthy, so boot ordering must not be able to
 forge entries in it. Two gates close the window: `depends_on: condition:
-service_healthy` (proxy and UI both wait for the backend), and the tier-1 launcher
+service_healthy` (proxy and UI both wait for the backend), and each governed launcher
 waiting on the proxy's own health before starting a sandbox.
 
 The probes are deliberately shallow — a TCP connect for the proxy, a static
@@ -2301,20 +2301,20 @@ absence of a probe is not evidence of a problem.
 
 ## Resource limits — blast radius, not boundary
 
-Both sandbox tiers are capped by their launcher — memory, CPUs and pids, tier 2
-lower — and both are overridable per launch via `SANDBOX_MEMORY` / `SANDBOX_CPUS`;
-the defaults sit at the top of each `run-*-sandbox.sh`. The infra services are capped
-per service (`mem_limit` in `docker-compose.yml` and `mcp-servers.yml`). Everywhere,
-swap is disabled by setting the swap ceiling equal to the memory ceiling
-(`--memory-swap` / `memswap_limit`, which `tests/test_topology.py` holds equal for
-every capped service): Docker otherwise defaults swap to 2x memory, so a bare cap
-really means that much RAM plus as much again in swap — on a host with less than
-twice the cap, a ceiling above what exists is no ceiling at all. These are **not** a
-containment boundary and nothing about the threat model rests on them — the
-boundary is capability (network segmentation, dropped caps, non-root, no
-control-plane route).
+Every sandbox tier is capped by its launcher — memory, CPUs and pids, with tier 2's
+memory lower — and memory and CPUs are overridable per launch via `SANDBOX_MEMORY` /
+`SANDBOX_CPUS`; the defaults sit at the top of each `run-*-sandbox.sh`. The infra
+services are capped per service (`mem_limit` in `docker-compose.yml` and
+`mcp-servers.yml`). Everywhere, swap is disabled by setting the swap ceiling equal to
+the memory ceiling (`--memory-swap` / `memswap_limit`, which `tests/test_topology.py`
+holds equal for every capped service): Docker otherwise defaults swap to 2x memory, so
+a bare cap really means that much RAM plus as much again in swap — on a host with less
+than twice the cap, a ceiling above what exists is no ceiling at all. These are
+**not** a containment boundary and nothing about the threat model rests on them — the
+boundary is capability (network segmentation, dropped caps, non-root, no control-plane
+route).
 
-The sandbox numbers are sized for the **workload, not the agent**: a measured tier-1
+The sandbox numbers are sized for the **workload, not the agent**: a measured Claude
 session peaked well under the cap (figures in `NOTES.md`), so the agent process is
 never what needs the headroom — `tsc`, `jest`, `cargo` or a language server on a
 large tree is. Hence a modest default plus a per-workspace
@@ -2345,7 +2345,7 @@ local-model sandbox that is its only consumer, are designed in
 `opencode-sandbox/DESIGN.md`, with the evidence in `opencode-sandbox/NOTES.md`: why the
 service is ungoverned, the accelerator profiles, the tuning, what the model is for, and
 how the tier is built. What stays here is where tier 2 meets the rest of the system:
-why tier 1 cannot reach the service, and the firewall both tiers run.
+why tier 1 cannot reach the service, and the firewall every tier runs.
 
 ### Why tier-1 Claude cannot reach it — deliberately
 
@@ -2396,9 +2396,9 @@ the tier-2 local-model sandbox". What it shares with tier 1:
 
 **One boundary implementation, two grants.** The extraction into `sandbox-common/`
 (`init-firewall.sh`, `entrypoint.sh`, `boundary-check.sh`) plus `sandbox-lib.sh` for
-launcher plumbing means both tiers run *byte-identical* enforcement; each image
+launcher plumbing means every tier runs *byte-identical* enforcement; each image
 supplies only a `tier-setup.sh` hook for its own declarative config. A firewall fix
-lands in both tiers at once, and neither tier can drift into a weaker posture
+lands in every tier at once, and no tier can drift into a weaker posture
 unnoticed. `init-firewall.sh` has a **third mode** alongside GOVERNED and STANDALONE:
 
 | Mode | Selected by | Permits |
@@ -2478,7 +2478,7 @@ than crossing it: shellcheck reads `init-firewall.sh` as text, `tests/test_topol
 reads the compose files as text. Between them they assert what the boundary is
 *declared* to be, which leaves a firewall regression invisible to every other check here
 — the strongest containment evidence the repo has was a manual `make boundary`. So the
-job stands the stack up and runs `boundary-check.sh` inside a real tier-1 sandbox, from
+job stands the stack up and runs `boundary-check.sh` inside a real Claude sandbox, from
 the agent's own security context. It rides on the build job because that job has already
 compiled the images; a job of its own shares no layer cache and would rebuild every image
 to run a two-minute check. What CI cannot cover stays manual and is named in the

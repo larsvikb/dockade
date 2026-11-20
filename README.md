@@ -72,10 +72,10 @@ claude          # normal, permission-prompting mode
 claude-yolo     # bypass-permissions mode — a conscious opt-in (see below)
 ```
 
-## Two sandbox tiers
+## Sandbox tiers
 
-Both tiers run the **same** boundary implementation (`sandbox-common/`) and differ
-only in the capability granted:
+Every tier runs the **same** boundary implementation (`sandbox-common/`), and the
+tiers differ only in the capability granted:
 
 | | Brain | Egress | Credentials | Launch |
 |---|---|---|---|---|
@@ -127,7 +127,7 @@ the measured throughput behind those decisions.
 - **Mounts your plugin marketplaces** at `/marketplaces` (**read-only**) when
   `~/.config/dockade/marketplaces` exists, and registers every one of them at
   boot — see *Plugins and marketplaces* below.
-- **Mounts reference material** at `/refs/<name>` (**read-only**, both tiers)
+- **Mounts reference material** at `/refs/<name>` (**read-only**, every tier)
   for each directory in `SANDBOX_REFS` — see *Reference material* below.
 - **Adds a JDK** when `SANDBOX_JDK` is set, under its own image tag — see
   *Java in the sandbox* below.
@@ -202,7 +202,7 @@ SANDBOX_REFS=docs-a=~/a/docs,docs-b=~/b/docs ./run-opencode-sandbox.sh
 #   -> name=path picks the name; two entries with one name are refused
 ```
 
-Both tiers take the same variable, separated by commas or newlines. The paths
+Every launcher takes the same variable, separated by commas or newlines. The paths
 `/marketplaces` refuses as too broad are refused here too: the filesystem root, your home or
 anything holding it, a Windows profile, the dockade secrets directory, `/tmp`,
 `/run` and `$XDG_RUNTIME_DIR`, and any directory with a unix socket or FIFO near
@@ -213,8 +213,9 @@ rather than vanishing.
 
 ## Java in the sandbox
 
-Tier 1 has an opt-in variant with a JDK and the JUnit 5 console launcher, so the
-agent can compile Java and run its tests in here while the build stays on the host:
+Claude's tier has an opt-in variant with a JDK and the JUnit 5 console launcher, so
+the agent can compile Java and run its tests in here while the build stays on the
+host:
 
 ```bash
 SANDBOX_JDK=21 ./run-claude-sandbox.sh               # builds claude-sandbox-jdk21 if missing
@@ -347,14 +348,14 @@ dockade/
   NOTES.md                  # lab notebook: measurements, hardware behaviour, dead ends
   SECURITY.md               # how to report a boundary bypass; the accepted-risk ceiling
   LICENSE, NOTICE           # Apache-2.0
-  Makefile                  # task entry points (make claude / make opencode / make check)
+  Makefile                  # task entry points (a launch target per tier, make check)
   ruff.toml, .yamllint, .hadolint.yaml, .shellcheckrc   # pinned linter configs (make check)
   .github/workflows/        # CI: lint + consistency + tests + image builds (make check)
   docker-compose.yml        # shared infra: egress proxy + control plane + UI + local LLM
   mcp-servers.yml           # MCP server catalogue (one container + profile per server)
   run-claude-sandbox.sh     # tier 1: build + launch a Claude sandbox (one or many)
   run-opencode-sandbox.sh   # tier 2: build + launch an opencode/local-LLM sandbox
-  sandbox-lib.sh            # launcher plumbing shared by both tiers
+  sandbox-lib.sh            # launcher plumbing shared by every tier
   control-plane/            # governance authority BACKEND (agent cannot reach it)
     Dockerfile              #   FastAPI over SQLite; internal nets only, fully internal
     app.py                  #   the process: three listeners, which surface each
@@ -436,7 +437,7 @@ dockade/
                             #   hidden-character set both pages spell
     list-status.js          #   empty, stale or not yet loaded: one decision, one renderer
     time.js                 #   timestamps as the page shows them
-  tool-gateway/             # MCP GATEWAY — governed tool capability; tier 1's `--mcp-config` points at it
+  tool-gateway/             # MCP GATEWAY — governed tool capability; Claude's `--mcp-config` points at it
     Dockerfile              #   FastAPI + uvicorn; triple-homed, no egress leg
     app.py                  #   the bind guard, liveness, and the agent's MCP endpoint
     protocol.py             #   the MCP wire: JSON-RPC in, JSON-RPC out, no I/O
@@ -483,7 +484,7 @@ dockade/
     entrypoint.sh           # root: firewall + config, then drops to non-root
     init-firewall.sh        # default-deny egress firewall (governed/local/standalone)
     boundary-check.sh       # on-demand smoke test of the containment boundary
-    dotfiles/               # shared .bashrc / .gitconfig / .inputrc / .vimrc, baked into both tiers
+    dotfiles/               # shared .bashrc / .gitconfig / .inputrc / .vimrc, baked into every tier
     instructions/           # the agent instructions' shared fragments (every-tier/, cloud-tier/), in no image
       render.py             #   make instructions: each <tier>/instructions.md to the file it names
   claude-sandbox/           # TIER 1 image — Claude, governed egress

@@ -5,7 +5,7 @@ set -euo pipefail
 # Runs as root. Sets up the network boundary, then drops to the non-root
 # sandbox user for everything else.
 #
-# SHARED BY EVERY SANDBOX TIER (claude-sandbox, opencode-sandbox). Everything here
+# SHARED BY EVERY SANDBOX TIER (each *-sandbox/ image). Everything here
 # is tier-agnostic: config ownership, git identity, the firewall, the capability
 # assertion, and the privilege drop. Anything specific to one agent belongs in
 # that image's /usr/local/bin/tier-setup.sh hook (invoked below), NOT here.
@@ -14,15 +14,15 @@ USERNAME=sandbox
 export HOME=/home/$USERNAME
 export USER=$USERNAME
 
-# The config dir is a mounted volume; ensure the sandbox user owns it. Tier 1
-# names it via CLAUDE_CONFIG_DIR; SANDBOX_CONFIG_DIR is the tier-agnostic name.
+# The config dir is a mounted volume; ensure the sandbox user owns it. Claude's
+# tier names it via CLAUDE_CONFIG_DIR; SANDBOX_CONFIG_DIR is the tier-agnostic name.
 SANDBOX_CONFIG_DIR="${SANDBOX_CONFIG_DIR:-${CLAUDE_CONFIG_DIR:-/config}}"
 export SANDBOX_CONFIG_DIR
 chown -R "$USERNAME:$USERNAME" "$SANDBOX_CONFIG_DIR" 2>/dev/null || true
 
 # Per-tier setup hook: baked root-owned by each image, invoked as root BEFORE the
 # firewall and the privilege drop. This is where agent-specific declarative config
-# is materialized (tier 1: Claude user settings; tier 2: the opencode provider
+# is materialized (for example Claude's user settings, or opencode's provider
 # config). Optional — a tier that needs nothing simply ships no hook.
 #
 # THE HOOK'S CONTRACT: root touches only the image layer (/etc), and everything
@@ -32,11 +32,11 @@ chown -R "$USERNAME:$USERNAME" "$SANDBOX_CONFIG_DIR" 2>/dev/null || true
 # agent can be rearranging it while this boot runs; a root process writing there
 # follows whatever symlink it finds, and a check-then-act guard only narrows the
 # window. Writing as the user closes it: a symlink can then lead only to places the
-# agent could already write. The root-owned artefacts (tier 1's gateway pointer,
+# agent could already write. The root-owned artefacts (Claude's gateway pointer,
 # launch settings and managed note) live in /etc for the life of the container and
 # never in the volume — where any fact about one launch belongs, since the volume is
 # every sibling's. Reading the volume, or a mount a sibling can write, is the user's
-# half too: tier 1's root phase has the user render its launch settings.
+# half too: Claude's hook's root phase has the user render its launch settings.
 if [ -x /usr/local/bin/tier-setup.sh ]; then
     /usr/local/bin/tier-setup.sh
 fi

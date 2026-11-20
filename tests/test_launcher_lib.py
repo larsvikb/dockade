@@ -10,12 +10,13 @@ the decision can be exercised directly with a stub on ``PATH``, and a stub is th
 way to reach the branch that matters: the answer depends on the *state of the host's
 networks*, which no amount of reading the source can vary.
 
-Why that is worth the machinery. ``sc_ensure_network`` is where tier 2's "no egress"
-stops being a claim and becomes a check, and both of its failure modes are silent —
-adopting a network that should have been refused launches a sandbox that looks correct
-and has an egress route, and a refusal that fires when it should not simply means the
-launcher never runs. Reading the function tells you which branch was written; only
-running it tells you which branch a given host takes.
+Why that is worth the machinery. ``sc_ensure_network`` is where a no-fallback tier's
+"nothing outside except through the data plane" stops being a claim and becomes a
+check, and both of its failure modes are silent — adopting a network that should have
+been refused launches a sandbox that looks correct and has an egress route, and a
+refusal that fires when it should not simply means the launcher never runs. Reading
+the function tells you which branch was written; only running it tells you which
+branch a given host takes.
 
 The stub records every ``docker`` invocation, so "it refused" is asserted together with
 "it created nothing" — the halves are separable, and a refusal that has already created
@@ -27,13 +28,13 @@ running it in each host state shows that standalone mode never inspects the gate
 
 ``LauncherProxyEnvTests`` runs ``run-claude-sandbox.sh`` through to ``docker run``,
 with every ``docker`` call answered by the stub, to show the function's output
-reaches the container. Two other classes run the launchers themselves, but only as
-far as a refusal: ``LauncherCdpathTests``, the workspace guard's, and
-``LauncherMountNameTests``, ``sc_workspace_mount``'s. Before them the launchers run at
-most ``sc_jdk_variant`` and ``sc_clamp_cpus`` (``nproc``), a ``docker`` stub that fails
-every call comes first on ``PATH``, and its log is asserted empty, so a check that
-stopped refusing, or came after a ``docker`` call, would show as a failure rather than
-as a launch.
+reaches the container and its Tools line says what Claude's tool surface is. Two
+other classes run the launchers themselves, but only as far as a refusal:
+``LauncherCdpathTests``, the workspace guard's, and ``LauncherMountNameTests``,
+``sc_workspace_mount``'s. Before them the launchers run at most ``sc_jdk_variant``
+and ``sc_clamp_cpus`` (``nproc``), a ``docker`` stub that fails every call comes first
+on ``PATH``, and its log is asserted empty, so a check that stopped refusing, or came
+after a ``docker`` call, would show as a failure rather than as a launch.
 """
 from __future__ import annotations
 
@@ -77,7 +78,7 @@ fi
 exit 0
 """
 
-# `set -euo pipefail` is what both launchers set before sourcing the library, and it is
+# `set -euo pipefail` is what each launcher sets before sourcing the library, and it is
 # load-bearing for this function: under `set -e` a bare `[[ cond ]] && return 0` that
 # takes the false branch fails the whole list and kills the launcher outright. Running
 # the tests under anything laxer would pass while the real thing exits 1.
@@ -115,13 +116,15 @@ def _ensure_network(*, exists: bool, internal: bool, allow_fallback: bool) -> _R
 
 @unittest.skipUnless(_BASH or _STRICT, "bash is not installed")
 class EnsureNetworkTests(unittest.TestCase):
-    """What tier 2 accepts, and what tier 1 is still allowed to do."""
+    """What a tier with no fallback accepts, and what Claude's tier, with the
+    fallback, is still allowed to do."""
 
     def test_a_non_internal_network_is_refused_for_a_tier_with_no_fallback(self):
-        # The finding this exists for. A tier-1 standalone run leaves `sandbox-net`
+        # The finding this exists for. A Claude standalone run leaves `sandbox-net`
         # behind as a plain bridge with real egress; it is indistinguishable by name
-        # from the compose-owned internal one, so a tier-2 launch that checked only
-        # existence would adopt it and quietly gain the egress its design forbids.
+        # from the compose-owned internal one, so a launch without the fallback that
+        # checked only existence would adopt it and quietly gain the egress its design
+        # forbids.
         run = _ensure_network(exists=True, internal=False, allow_fallback=False)
         self.assertNotEqual(run.status, 0, f"adopted a non-internal network\n{run.stderr}")
         self.assertIn("NOT internal", run.stderr)
@@ -154,23 +157,23 @@ class EnsureNetworkTests(unittest.TestCase):
                     [c for c in run.docker_calls if c.startswith("network create")],
                     "refused, but created the network anyway")
 
-    def test_tier_one_still_creates_the_bridge_when_there_is_none(self):
+    def test_the_fallback_still_creates_the_bridge_when_there_is_none(self):
         # The standalone mode the fallback exists for: degraded, direct, firewall-only
-        # egress is a supported tier-1 configuration and must keep working.
+        # egress is a supported configuration of Claude's tier and must keep working.
         run = _ensure_network(exists=False, internal=False, allow_fallback=True)
         self.assertEqual(run.status, 0, run.stderr)
         self.assertIn("network create sandbox-net", run.docker_calls)
 
-    def test_tier_one_accepts_a_non_internal_network_it_left_behind(self):
-        # The same leftover bridge tier 2 refuses is tier 1 reattaching to its own
-        # standalone mode. The check is asymmetric on purpose, so assert the half that
-        # would be easy to over-tighten.
+    def test_the_fallback_accepts_a_non_internal_network_it_left_behind(self):
+        # The same leftover bridge a tier with no fallback refuses is Claude's tier
+        # reattaching to its own standalone mode. The check is asymmetric on purpose,
+        # so assert the half that would be easy to over-tighten.
         run = _ensure_network(exists=True, internal=False, allow_fallback=True)
         self.assertEqual(run.status, 0, run.stderr)
         self.assertFalse(
             [c for c in run.docker_calls if c.startswith("network create")])
 
-    def test_tier_one_accepts_the_compose_owned_internal_network(self):
+    def test_the_fallback_accepts_the_compose_owned_internal_network(self):
         run = _ensure_network(exists=True, internal=True, allow_fallback=True)
         self.assertEqual(run.status, 0, run.stderr)
 
@@ -214,7 +217,8 @@ _EGRESS_HARNESS = (
     'set -euo pipefail; source "$1"; shift; sc_governed_egress "$@"; '
     'for a in ${SC_PROXY_ENV_ARGS[@]+"${SC_PROXY_ENV_ARGS[@]}"}; do '
     'printf "ARG %s\\n" "$a"; done; '
-    'printf "EGRESS %s\\nTOOLS %s\\n" "$SC_EGRESS_DESC" "$SC_TOOLS_DESC"')
+    'printf "EGRESS %s\\nTOOLS %s\\nNOGW %s\\n" '
+    '"$SC_EGRESS_DESC" "$SC_TOOLS_DESC" "${SC_NO_GATEWAY:-}"')
 
 
 class _EgressRun(NamedTuple):
@@ -232,6 +236,7 @@ class _EgressRun(NamedTuple):
         return dict(a.split("=", 1) for a in pairs)
 
     def line(self, key: str) -> str:
+        # `NOGW ` with an empty value still carries its trailing space.
         return next(ln[len(key) + 1:] for ln in self.stdout.splitlines()
                     if ln.startswith(key + " "))
 
@@ -308,8 +313,11 @@ class GovernedEgressTests(unittest.TestCase):
         self.assertTrue(run.health_checked("tool-gateway"))
         self.assertEqual(run.line("EGRESS"), f"governed via egress-proxy ({_PROXY}:8080)")
         self.assertEqual(run.line("TOOLS"), f"governed via tool-gateway ({_GATEWAY}:8100)")
+        self.assertEqual(run.line("NOGW"), "")
 
-    def test_a_proxy_with_no_gateway_launches_with_an_empty_tool_surface(self):
+    def test_a_proxy_with_no_gateway_launches_and_says_there_is_none(self):
+        # What that means for the tool surface is the launcher's to say, as it depends
+        # on how the tier's CLI loads MCP servers: LauncherProxyEnvTests holds Claude's.
         run = _governed_egress(ips={"egress-proxy": _PROXY}, internal=True)
         self.assertEqual(run.status, 0, run.stderr)
         env = run.env()
@@ -319,8 +327,8 @@ class GovernedEgressTests(unittest.TestCase):
         self.assertNotIn("TOOL_GATEWAY_IP", env)
         self.assertNotIn("TOOL_GATEWAY_PORT", env)
         self.assertFalse(run.health_checked("tool-gateway"))
-        self.assertEqual(
-            run.line("TOOLS"), f"NONE (no tool-gateway on {_NET}; MCP surface is empty)")
+        self.assertEqual(run.line("TOOLS"), f"NONE (no tool-gateway on {_NET})")
+        self.assertEqual(run.line("NOGW"), "true")
 
     def test_no_proxy_on_an_internal_network_refuses_with_guidance(self):
         # An internal network with no proxy has no route at all; launching would give
@@ -334,11 +342,12 @@ class GovernedEgressTests(unittest.TestCase):
     def test_no_proxy_on_a_plain_bridge_is_standalone_with_no_tool_path(self):
         # The mode gate: a gateway on the network is still never looked up, because
         # standalone mode has no audited egress and the gateway brokers credentials.
-        # A stale SC_PROXY_ENV_ARGS from the environment must not survive into the
-        # launch either: the function resets the array before deciding.
+        # A stale SC_PROXY_ENV_ARGS or SC_NO_GATEWAY from the environment must not
+        # survive into the launch either: the function resets both before deciding.
         run = _governed_egress(
             ips={"tool-gateway": _GATEWAY}, internal=False,
-            overrides={"SC_PROXY_ENV_ARGS": "HTTPS_PROXY=http://stale:1"})
+            overrides={"SC_PROXY_ENV_ARGS": "HTTPS_PROXY=http://stale:1",
+                       "SC_NO_GATEWAY": "true"})
         self.assertEqual(run.status, 0, run.stderr)
         self.assertEqual(
             [ln for ln in run.stdout.splitlines() if ln.startswith("ARG ")], [])
@@ -347,6 +356,7 @@ class GovernedEgressTests(unittest.TestCase):
             run.line("EGRESS"),
             f"DIRECT (no egress proxy on {_NET}; firewall only, no audit)")
         self.assertEqual(run.line("TOOLS"), "NONE (standalone mode has no governed tool path)")
+        self.assertEqual(run.line("NOGW"), "")
 
     def test_model_hosts_reach_the_container_as_one_space_joined_variable(self):
         ips = {"egress-proxy": _PROXY, "tool-gateway": _GATEWAY}
@@ -407,9 +417,15 @@ class LauncherProxyEnvTests(unittest.TestCase):
     GovernedEgressTests prove what the function computes; this proves the launcher
     delivers it. A launcher that called it in a subshell, or reset the array after
     the call, would launch with no proxy env and no EGRESS_PROXY_IP — the standalone
-    posture, unaudited — and still pass every test that reads the function alone."""
+    posture, unaudited — and still pass every test that reads the function alone.
 
-    def test_the_proxy_env_reaches_docker_run(self):
+    It also holds the banner's Tools line, whole, in each of the three modes: only
+    with no gateway does Claude's launcher add that the MCP surface is empty, which
+    is true of it because its wrapper passes ``--strict-mcp-config``. That it reads
+    SC_NO_GATEWAY rather than matching the description no output can show."""
+
+    def _launch(self, *, ips: dict[str, str], internal: bool) -> tuple[str, list[str]]:
+        """Run the launcher to ``docker run``: its stdout, and the run's argv."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
             (root / "home").mkdir()
@@ -429,17 +445,37 @@ class LauncherProxyEnvTests(unittest.TestCase):
                 STUB_LOG=str(root / "calls.log"),
                 STUB_RUN_ARGV=str(argv_file),
                 STUB_NET="sandbox-net",
-                STUB_NET_INTERNAL="true",
-                STUB_IP_egress_proxy=_PROXY,
-                STUB_IP_tool_gateway=_GATEWAY,
+                STUB_NET_INTERNAL="true" if internal else "false",
             )
+            env.update({f"STUB_IP_{name.replace('-', '_')}": ip for name, ip in ips.items()})
             proc = subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
                 [_BASH, str(ROOT / "run-claude-sandbox.sh"), str(root / "ws")],
                 capture_output=True, text=True, env=env, timeout=60)
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertTrue(argv_file.exists(), "the launcher never reached docker run")
-            argv = argv_file.read_text().splitlines()
+            return proc.stdout, argv_file.read_text().splitlines()
 
+    @staticmethod
+    def _tools_line(stdout: str) -> str:
+        lines = [ln for ln in stdout.splitlines() if ln.startswith("Tools:")]
+        if len(lines) != 1:
+            raise AssertionError(f"not one Tools line: {lines}")
+        return lines[0]
+
+    def test_with_no_gateway_the_tools_line_says_the_mcp_surface_is_empty(self):
+        stdout, _ = self._launch(ips={"egress-proxy": _PROXY}, internal=True)
+        self.assertEqual(
+            self._tools_line(stdout),
+            "Tools:     NONE (no tool-gateway on sandbox-net); MCP surface is empty")
+
+    def test_in_standalone_mode_the_tools_line_has_no_suffix(self):
+        stdout, _ = self._launch(ips={"tool-gateway": _GATEWAY}, internal=False)
+        self.assertEqual(self._tools_line(stdout),
+                         "Tools:     NONE (standalone mode has no governed tool path)")
+
+    def test_the_proxy_env_reaches_docker_run(self):
+        stdout, argv = self._launch(
+            ips={"egress-proxy": _PROXY, "tool-gateway": _GATEWAY}, internal=True)
         passed = [argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == "-e"]
         url = "http://egress-proxy:8080"
         no_proxy = f"localhost,127.0.0.1,::1,egress-proxy,tool-gateway,{_GATEWAY}"
@@ -451,8 +487,9 @@ class LauncherProxyEnvTests(unittest.TestCase):
                 self.assertIn(pair, passed)
         # Claude's model host is the lifeline boundary-check.sh already probes.
         self.assertFalse([p for p in passed if p.startswith("SANDBOX_MODEL_HOSTS=")])
-        self.assertIn(f"Egress:    governed via egress-proxy ({_PROXY}:8080)", proc.stdout)
-        self.assertIn(f"Tools:     governed via tool-gateway ({_GATEWAY}:8100)", proc.stdout)
+        self.assertIn(f"Egress:    governed via egress-proxy ({_PROXY}:8080)", stdout)
+        self.assertEqual(self._tools_line(stdout),
+                         f"Tools:     governed via tool-gateway ({_GATEWAY}:8100)")
 
 
 
@@ -1235,7 +1272,7 @@ class RefsTests(unittest.TestCase):
 
     def test_a_name_with_a_leading_dot_is_refused(self):
         # Hidden from `ls /refs` and from boundary-check.sh's /refs/*/ probe. And
-        # `.claude` would put a ref at /refs/.claude, at the root of tier 1's read
+        # `.claude` would put a ref at /refs/.claude, at the root of Claude's read
         # allow, the place a release that loaded from it would look (sc_refs's comment).
         dotted = self.src / ".dotfiles"
         dotted.mkdir()

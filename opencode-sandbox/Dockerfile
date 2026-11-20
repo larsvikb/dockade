@@ -122,7 +122,7 @@ RUN npm install -g "opencode-ai@${OPENCODE_VERSION}" \
 # shim resolves. Lazy runtime fetching fails at first TOOL USE, not at startup,
 # so the version print was never the check that settled this.
 
-# Shared boundary + entrypoint, byte-identical to tier 1. The build context is the
+# Shared boundary + entrypoint, byte-identical in every tier. The build context is the
 # REPO ROOT so these are reachable; a context cannot COPY from outside itself.
 # tier-setup.sh is this image's own hook, invoked by the shared entrypoint.
 #
@@ -149,8 +149,8 @@ COPY opencode-sandbox/user-AGENTS.md /etc/opencode/AGENTS.md.template
 COPY sandbox-common/init-firewall.sh /usr/local/bin/init-firewall.sh
 COPY sandbox-common/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY sandbox-common/boundary-check.sh /usr/local/bin/boundary-check.sh
-# Dotfiles: the tier-agnostic ones shared with tier 1, plus this tier's hook
-# (the `oc` alias and a prompt that distinguishes the two sandboxes).
+# Dotfiles: the tier-agnostic ones shared with every tier, plus this tier's hook
+# (the `oc` alias and a prompt that tells this tier's sandbox from the others).
 COPY sandbox-common/dotfiles/.bashrc sandbox-common/dotfiles/.vimrc \
      sandbox-common/dotfiles/.inputrc sandbox-common/dotfiles/.gitconfig /home/$USERNAME/
 COPY opencode-sandbox/dotfiles/.bashrc.tier /home/$USERNAME/.bashrc.tier

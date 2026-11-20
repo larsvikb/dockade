@@ -54,9 +54,10 @@ class FirewallGrantTests(unittest.TestCase):
             r'\s*--dport "\$\{TOOL_GATEWAY_PORT:-8100\}" -j ACCEPT')
 
     def test_the_grant_is_governed_mode_only(self):
-        # Tier 2 has no governed tool path and must not acquire one by sharing a
-        # network. Asserted on the guard rather than on the launcher never regressing,
-        # which is the same belt-and-braces the egress-proxy allow carries.
+        # A tier with no governed egress (opencode's) has no governed tool path and
+        # must not acquire one by sharing a network. Asserted on the guard rather than
+        # on the launcher never regressing, which is the same belt-and-braces the
+        # egress-proxy allow carries.
         guard = re.search(r'if \[\[ "\$MODE" = "governed" && "\$\{TOOL_GATEWAY_IP:-\}"',
                           FIREWALL)
         self.assertIsNotNone(
@@ -110,7 +111,9 @@ class LauncherTests(unittest.TestCase):
     def test_a_missing_gateway_is_reported_rather_than_fatal(self):
         # The sandbox still launches: `--strict-mcp-config` goes on unconditionally, so
         # no gateway means a provably empty tool surface rather than a failed start.
-        self.assertIn("MCP surface is empty", LIB)
+        # That is Claude Code's flag, so Claude's launcher says it, not the library.
+        self.assertIn("MCP surface is empty", LAUNCHER)
+        self.assertNotIn("MCP surface is empty", LIB)
 
     def test_the_launcher_wires_governed_egress_after_choosing_its_network(self):
         # sc_ensure_network decides whether the network may be the standalone bridge;
@@ -127,11 +130,12 @@ class LauncherTests(unittest.TestCase):
 
     def test_the_launcher_prints_both_descriptions(self):
         self.assertIn('echo "Egress:    $SC_EGRESS_DESC"', LAUNCHER)
+        self.assertIn('echo "Tools:     $SC_TOOLS_DESC; MCP surface is empty"', LAUNCHER)
         self.assertIn('echo "Tools:     $SC_TOOLS_DESC"', LAUNCHER)
 
 
 class WorkspaceMountWiringTests(unittest.TestCase):
-    """Both launchers mount, start in and print the path ``sc_workspace_mount`` names.
+    """Each launcher mounts, starts in and prints the path ``sc_workspace_mount`` names.
 
     tests/test_launcher_lib.py runs the function and a launcher's refusal; a launcher
     that computed the path and still mounted at ``/workspace`` would pass both, and
@@ -304,7 +308,7 @@ class JdkVariantWiringTests(unittest.TestCase):
         self.assertIn('"$IMAGE_NAME" ${RUN_CMD_ARGS[@]+"${RUN_CMD_ARGS[@]}"}', LAUNCHER)
         self.assertIn('echo "Image:     $IMAGE_NAME"', LAUNCHER)
 
-    def test_tier_two_never_takes_the_variant(self):
+    def test_opencode_never_takes_the_variant(self):
         opencode = (ROOT / "run-opencode-sandbox.sh").read_text()
         self.assertNotIn("sc_jdk_variant", opencode)
         self.assertNotIn("SC_BUILD_ARGS", opencode)
@@ -344,7 +348,7 @@ class TierHookPrivilegeTests(unittest.TestCase):
                 self.assertNotIn('chown -h "$USERNAME', src)
 
     def test_root_owned_artefacts_live_only_in_the_image_layer(self):
-        # Tier 1's gateway pointer, launch settings and managed note are what root
+        # Claude's gateway pointer, launch settings and managed note are what root
         # writes, and they must be written BEFORE the re-exec and OUTSIDE the volume.
         root_phase, user_phase = TIER_SETUP.split(self.REEXEC, 1)
         self.assertIn("MCP_GATEWAY_CONFIG=/etc/claude-code/", root_phase)

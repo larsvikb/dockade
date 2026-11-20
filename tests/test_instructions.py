@@ -20,7 +20,7 @@ from _loader import ROOT, load_instructions_renderer
 render = load_instructions_renderer()
 
 FRAGMENTS = ROOT / render.FRAGMENTS
-EVERY_TIER, CLOUD_TIER = "every-tier", "cloud-tier"
+EVERY_TIER, CLOUD_TIER, BASHRC_SHELL = "every-tier", "cloud-tier", "bashrc-shell"
 #: The mode the firewall and the boundary check key on: a launcher passing it starts a
 #: tier with no egress, no gateway and no registry.
 LOCAL = "SANDBOX_MODE=local"
@@ -28,6 +28,11 @@ LOCAL = "SANDBOX_MODE=local"
 
 def _fragments(group: str) -> set[str]:
     return {f"{group}/{p.stem}" for p in (FRAGMENTS / group).glob("*.md")}
+
+
+def _all_fragments() -> set[str]:
+    """Every fragment in every group directory, so a new group needs no edit here."""
+    return {f"{p.parent.name}/{p.stem}" for p in FRAGMENTS.glob("*/*.md")}
 
 
 class DriftTests(unittest.TestCase):
@@ -89,7 +94,28 @@ class CoverageTests(unittest.TestCase):
 
     def test_every_fragment_is_included_by_some_tier(self):
         included = set().union(*(set(render.parse(p).includes) for p in render.sources()))
-        self.assertEqual(_fragments(EVERY_TIER) | _fragments(CLOUD_TIER), included)
+        self.assertTrue(_fragments(BASHRC_SHELL))
+        self.assertEqual(_all_fragments(), included)
+
+
+class BashrcShellTests(unittest.TestCase):
+    """The ``bashrc-shell/rm`` fragment describes the shared ``.bashrc``'s ``rm`` alias,
+    so it fails here when the alias changes and the text still names the old flag.
+    Which tiers include it is not tested: render.py's docstring gives the rule, and
+    the evidence for it cannot be derived from the repo."""
+
+    BASHRC = ROOT / "sandbox-common" / "dotfiles" / ".bashrc"
+    #: The flag the fragment's lead names, as in "`rm` is aliased to `-I`".
+    FLAG = re.compile(r"`rm` is aliased to `(-[A-Za-z]+)`")
+
+    def test_the_shared_bashrc_aliases_rm_to_the_flag_it_names(self):
+        text = (FRAGMENTS / BASHRC_SHELL / "rm.md").read_text()
+        match = self.FLAG.search(text)
+        self.assertIsNotNone(match, "bashrc-shell/rm.md no longer names a flag")
+        self.assertRegex(self.BASHRC.read_text(),
+                         rf"(?m)^alias rm='rm {re.escape(match.group(1))}'$",
+                         f"bashrc-shell/rm.md says rm is aliased to {match.group(1)}, "
+                         f"and {self.BASHRC.relative_to(ROOT)} no longer says so")
 
 
 class VocabularyTests(unittest.TestCase):

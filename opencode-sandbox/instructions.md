@@ -17,5 +17,4 @@ from in here.
 {{include every-tier/workspace}}
 - **`/refs/<name>`, when present, is reference material.** Host directories the
   human mounted read-only for you to read. Changes belong in the checkout.
-{{include every-tier/rm}}
 {{include every-tier/not-root}}

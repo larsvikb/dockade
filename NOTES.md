@@ -1479,6 +1479,49 @@ Two facts that decide how much the persistence is worth on Windows:
 Found by using it: the Close button is invisible in code review and obvious in the
 first toast.
 
+## An agent CLI's shell tool sees the shared `.bashrc`'s aliases only if its shell reads it
+
+The shared `.bashrc` aliases `rm` to `rm -I`, and the alias reaches a command only
+through a shell that reads `.bashrc` and expands aliases. A non-interactive
+`bash -c` does neither. The probe, the same for every tier, is one command through the
+agent's own shell tool:
+
+    type rm; echo $-; shopt expand_aliases
+
+- **Claude Code (tier 1): seen.** Measured 2026-11-20 on Claude Code 2.1.329 in the
+  tier-1 sandbox, from both the main session's Bash tool and a subagent's. Each
+  printed ``rm is aliased to `rm -I'`` (bash 5.2.37 opens the quote with a
+  backtick), flags `hmBc` and `expand_aliases on`. The Bash tool runs each command
+  in a shell built from its shell snapshot, which carries the aliases.
+- **opencode (tier 2): not seen.** Measured 2026-11-20 with `opencode-linux-x64@1.19.6`,
+  npm `latest` that day, which is what the image's `OPENCODE_VERSION=latest`
+  installs. It ran in a scratch dir, with the XDG dirs under `/tmp` and `~/.bashrc`
+  the shared one, and no model is needed:
+
+      opencode debug agent build --pure --tool bash --params '{"command":"type rm; echo $-; shopt expand_aliases","description":"probe"}'
+
+  It printed `rm is /usr/bin/rm`, flags `hBc` and `expand_aliases off`. Through the
+  same tool, `rm a b c; echo exit=$?` printed `exit=0`, and all three files were
+  deleted. The run without `--pure`, with `opencode-sandbox/opencode.json` as its
+  config, gave the same. On the reference machine the same day, in a `make opencode`
+  session on 1.19.6 with the image's own config, the command without `--pure`
+  printed the same three lines. 1.19.5, on 2026-11-11, gave the same. The source
+  says why: `cmd()` in `packages/opencode/src/tool/shell.ts` spawns the command with
+  `shell` set to `Shell.acceptable(cfg.shell)`, which is `$SHELL` (`/bin/bash` in
+  the image), so it runs `/bin/bash -c <command>`.
+
+The model-free debug command is the probe for opencode. Asking the model to run
+`type rm` is not: on the reference machine the image's local model, given that
+request, ran a different and destructive command through its shell tool, so that
+probe gave no result.
+
+So the instructions' `rm` bullet holds for tier 1 and is false for tier 2, where a
+bulk `rm` deletes. The bullet is the `sandbox-common/instructions/bashrc-shell/rm.md`
+fragment, and the rule for which tiers include it is in
+`sandbox-common/instructions/render.py`'s docstring. The image installs opencode
+`latest`: a re-run on a later release that prints "aliased" means tier 2 needs the
+include again.
+
 ## Local inference and the accelerator survey: in `opencode-sandbox/NOTES.md`
 
 Tier 2 is the only consumer of the local model, so its evidence sits beside it: the

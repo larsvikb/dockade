@@ -24,4 +24,4 @@ here. It is written down so you spend no turns discovering it.
 {{include every-tier/workspace}}
 {{include cloud-tier/control-plane}}
 {{include every-tier/not-root}}
-{{include every-tier/rm}}
+{{include bashrc-shell/rm}}

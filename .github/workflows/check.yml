@@ -70,8 +70,6 @@ jobs:
       # instead of this job reading a wrong value after it.
       PYTHON_VERSION: "3.14"
     steps:
-      # v5 targets Node 24. v4 targets Node 20, which GitHub has deprecated and is
-      # already force-running on 24 — a warning on every run and a future failure.
       # Credentials are NOT persisted: nothing after checkout needs git auth (the
       # consistency guards use `git ls-files`/`rev-parse`, both local; verify-build
       # touches git not at all), so leaving the token in .git/config for the job's
@@ -182,8 +180,6 @@ jobs:
     env:
       DOCKADE_REQUIRE_TOOLS: 1
     steps:
-      # v5 targets Node 24. v4 targets Node 20, which GitHub has deprecated and is
-      # already force-running on 24 — a warning on every run and a future failure.
       # Credentials are NOT persisted: nothing after checkout needs git auth (the
       # consistency guards use `git ls-files`/`rev-parse`, both local; verify-build
       # touches git not at all), so leaving the token in .git/config for the job's

@@ -7,10 +7,14 @@ Each tier keeps a source beside its Dockerfile, ``<tier>/instructions.md``: a fr
 matter naming the file it renders to (``output``, repo-relative) and its vocabulary,
 then its own text, with ``{{include <group>/<name>}}`` lines where a shared fragment
 from this directory goes. ``every-tier/`` holds what is true in every tier: the
-shared ``.bashrc``'s ``rm`` alias, the shared entrypoint's drop to a non-root user,
-and ``/workspace``, which each launcher mounts the same way. ``cloud-tier/`` holds
-what every governed cloud tier shares: a tier whose launcher does not pass
-``SANDBOX_MODE=local``. A fragment names no CLI's tool, file or variable: it writes ``{{key}}``, and
+shared entrypoint's drop to a non-root user, and ``/workspace``, which each launcher
+mounts the same way. ``cloud-tier/`` holds what every governed cloud tier shares: a
+tier whose launcher does not pass ``SANDBOX_MODE=local``. ``bashrc-shell/`` holds
+what is true only where the agent's shell tool reads the shared ``.bashrc``: its
+``rm`` alias. A tier includes it only on the evidence of the probe in NOTES.md,
+"An agent CLI's shell tool sees the shared `.bashrc`'s aliases only if its shell
+reads it": whether a CLI's tool reads the file cannot be derived from this repo. A
+fragment names no CLI's tool, file or variable: it writes ``{{key}}``, and
 each tier's front matter gives the key its value, which may be empty.
 
 The rendered files are committed, as the Dockerfiles' COPY sources, and
@@ -53,7 +57,7 @@ class Source:
 
     @property
     def includes(self) -> list[str]:
-        """The fragments the source names, in order: ``every-tier/rm`` and the like."""
+        """The fragments the source names, in order: ``every-tier/workspace`` and the like."""
         return INCLUDE.findall(self.body)
 
 

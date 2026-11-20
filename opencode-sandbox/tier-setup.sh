@@ -85,7 +85,7 @@ install -m 0644 /etc/opencode/opencode.json "$CONFIG_DIR/opencode/opencode.json"
 # config key survives is the weaker of the two. Neither is a control either way.
 #
 # Content is this tier's CAPABILITY facts. It shares with tier 1's CLAUDE.md only
-# the facts every tier shares (/workspace live, not root, rm -I), which come from
+# the facts every tier shares (/workspace live, not root), which come from
 # one source; the rest of tier 1's text, its longest bullet the governed proxy's,
 # is false here, where there is neither a proxy nor egress. Shorter, too, and for a
 # reason beyond taste — the window here is 24k (opencode.json) with a base prompt

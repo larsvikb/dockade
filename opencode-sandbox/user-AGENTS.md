@@ -18,10 +18,5 @@ from in here.
   `/workspace` itself, is lost when the container exits.
 - **`/refs/<name>`, when present, is reference material.** Host directories the
   human mounted read-only for you to read. Changes belong in the checkout.
-- **`rm` is aliased to `-I`.** One prompt for a recursive delete or three or more
-  files, none for a single file — so ordinary removes work, and a bulk one from a
-  non-interactive caller does nothing while **still exiting 0**. Use `rm -f` or
-  `command rm` when deleting many at once, and confirm a destructive step by its
-  result rather than by its exit status.
 - **You are not root and cannot become root.** No sudo, capabilities dropped.
   A permission error here is the design working, not a problem to route around.

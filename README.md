@@ -485,7 +485,7 @@ dockade/
     init-firewall.sh        # default-deny egress firewall (governed/local/standalone)
     boundary-check.sh       # on-demand smoke test of the containment boundary
     dotfiles/               # shared .bashrc / .gitconfig / .inputrc / .vimrc, baked into every tier
-    instructions/           # the agent instructions' shared fragments (every-tier/, cloud-tier/), in no image
+    instructions/           # the agent instructions' shared fragments (every-tier/, cloud-tier/, bashrc-shell/), in no image
       render.py             #   make instructions: each <tier>/instructions.md to the file it names
   claude-sandbox/           # TIER 1 image — Claude, governed egress
     Dockerfile

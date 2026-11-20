@@ -1516,8 +1516,11 @@ request, ran a different and destructive command through its shell tool, so that
 probe gave no result.
 
 So the instructions' `rm` bullet holds for tier 1 and is false for tier 2, where a
-bulk `rm` deletes. The bullet is the `sandbox-common/instructions/every-tier/rm.md`
-fragment, which every tier includes today.
+bulk `rm` deletes. The bullet is the `sandbox-common/instructions/bashrc-shell/rm.md`
+fragment, and the rule for which tiers include it is in
+`sandbox-common/instructions/render.py`'s docstring. The image installs opencode
+`latest`: a re-run on a later release that prints "aliased" means tier 2 needs the
+include again.
 
 ## Local inference and the accelerator survey: in `opencode-sandbox/NOTES.md`
 

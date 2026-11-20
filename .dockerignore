@@ -1,6 +1,6 @@
 # Applies to every build whose context is the repo root: the control-plane (needs
-# control-plane/ + the top-level policies/ seed), BOTH sandbox tiers (claude-sandbox/
-# and opencode-sandbox/, each of which also needs the shared sandbox-common/ scripts),
+# control-plane/ + the top-level policies/ seed), EVERY sandbox tier (each *-sandbox/,
+# which also needs the shared sandbox-common/ scripts),
 # and both UIs, the control-plane UI and the tasks UI (each its own directory + the
 # shared ui-common/). The sandbox images use a root context precisely so they can COPY
 # sandbox-common/ — a build context cannot reach outside itself, and the firewall must
@@ -14,8 +14,7 @@
 proxies
 tests
 models
-run-claude-sandbox.sh
-run-opencode-sandbox.sh
+run-*-sandbox.sh
 sandbox-lib.sh
 Makefile
 # Root only, on purpose: the sandbox Dockerfiles COPY their user-*.md files.

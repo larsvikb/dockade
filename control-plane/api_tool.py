@@ -238,9 +238,9 @@ def _own_ask(resume_token: str, client: str | None, verb: str,
     """The ask ``resume_token`` names, if ``client`` raised it; otherwise the 404 to
     answer with.
 
-    Every refusal is the same 404: both tiers share `sandbox-net`, so a token leaked
-    between them must not confirm it exists. The operator gets a row per kind, because
-    each says something different. A FOREIGN token is the one sign a token leaked. An
+    Every refusal is the same 404: every tier shares `sandbox-net`, so a token leaked
+    between sandboxes must not confirm it exists. The operator gets a row per kind,
+    because each says something different. A FOREIGN token is the one sign a token leaked. An
     OPERATOR ID presented here means the id reached the agent side, which nothing
     should hand it, or is a handle from before the upgrade to resume tokens. Both rows
     carry the ask's server, tool and id, so they join that approval's history. An

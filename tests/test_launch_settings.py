@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tier 1's per-container plugin settings: rendered, installed, noted, and passed on.
+"""Claude's per-container plugin settings: rendered, installed, noted, and passed on.
 
 Each launch has its own marketplaces and plugins, so they live in the container's own
 ``/etc/claude-code/launch-settings.json`` rather than in the config volume every

@@ -15,7 +15,7 @@
 # failure. See the REQUIRE_TOOLS comment in the Makefile.
 #
 # Split into three jobs on purpose. `checks` finishes in about a minute; `build`
-# compiles every image, two of which are Debian-based sandbox tiers that apt-install
+# compiles every image, among them the Debian-based sandbox tiers that apt-install
 # a whole toolchain. Running them in parallel means a shellcheck typo is not queued
 # behind a ten-minute image build. `ui-e2e` runs the approval page and the tasks page
 # in a headless browser against expected values (`make ui-test`), which `checks` leaves
@@ -213,8 +213,8 @@ jobs:
           printf '%s' "$DOCKERHUB_TOKEN" \
             | docker login --username "$DOCKERHUB_USERNAME" --password-stdin
 
-      # Covers every Dockerfile: the compose services, plus BOTH sandbox
-      # tiers via each launcher's --build-only (which builds and exits — no workspace
+      # Covers every Dockerfile: the compose services, plus EVERY sandbox
+      # tier via its launcher's --build-only (which builds and exits — no workspace
       # mount, no network, no credentials, so it needs nothing from the runner).
       # No layer cache: see the note in the pull request that added this file.
       - name: make verify-build
@@ -227,17 +227,17 @@ jobs:
         if: success()
         run: |
           docker images --format '{{.Repository}}:{{.Tag}}\t{{.Size}}' \
-            | grep -E '^(dockade-|claude-sandbox|opencode-sandbox)' | sort
+            | grep -E '^(dockade-|[^:/]+-sandbox:)' | sort
 
       # `make check-boundary` owns the whole lifecycle (compose up, launch a
-      # throwaway tier-1 sandbox, run boundary-check.sh inside it as the agent),
+      # throwaway Claude sandbox, run boundary-check.sh inside it as the agent),
       # so this stays a make target for the same reason every other stage does:
       # one definition of the check, reproducible locally with the same command.
       # The images it needs were just built into this runner's daemon above.
       #
       # Known limits of this run, so a green tick is not read as more than it is:
-      #   - tier 1 in GOVERNED mode only. Tier 2 needs an iGPU the runner does not
-      #     have; standalone mode needs a host with no compose infra, which is
+      #   - Claude's tier in GOVERNED mode only. opencode's needs an iGPU the runner
+      #     does not have; standalone mode needs a host with no compose infra, which is
       #     also why the standalone firewall rules stay validated by hand, apart
       #     from the blocks tests/test_init_firewall.py runs lifted out.
       #   - the IPv6 probe self-skips when the runner's container has no v6 stack.
@@ -260,7 +260,7 @@ jobs:
         run: |
           git config --global user.name "dockade CI"
           git config --global user.email "ci@example.invalid"
-      - name: Boundary check (tier 1, governed)
+      - name: Boundary check (Claude, governed)
         run: make check-boundary
 
       # The sandbox side needs no diagnostics step: the check runs as the

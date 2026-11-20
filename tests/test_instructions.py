@@ -4,7 +4,7 @@
 ``sandbox-common/instructions/render.py`` (``make instructions``) renders every
 ``*-sandbox/instructions.md`` into the file its image COPYs. Those outputs are tracked,
 so two copies of the text exist and one can be edited alone: the drift tests fail
-then. Tier 1's output carries no "generated from" header, because a byte-identical
+then. Claude's output carries no "generated from" header, because a byte-identical
 render was the proof that moving its text into a source changed nothing; the failure
 message is what points an editor at the source instead.
 """
@@ -93,14 +93,14 @@ class CoverageTests(unittest.TestCase):
 
 
 class VocabularyTests(unittest.TestCase):
-    """No fragment hard-codes a name tier 1 fills from its front matter. A deny-list of
-    the names tier 1 fills today, not of every Claude Code name: a new one is added
-    here when tier 1 gains a key for it."""
+    """No fragment hard-codes a name Claude's source fills from its front matter. A
+    deny-list of the names Claude's source fills today, not of every Claude Code name:
+    a new one is added here when Claude's source gains a key for it."""
 
     DENIED = ("mcp__", "WebFetch", "Bash", "CLAUDE_CODE_", "CLAUDE.md", "subagent",
               "claude")
 
-    def test_each_denied_name_is_one_tier_one_fills(self):
+    def test_each_denied_name_is_one_claudes_source_fills(self):
         values = render.parse(ROOT / "claude-sandbox" / "instructions.md").vocabulary.values()
         for name in self.DENIED:
             with self.subTest(name=name):

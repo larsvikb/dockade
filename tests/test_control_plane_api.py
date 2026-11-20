@@ -6288,7 +6288,7 @@ class ToolClaimTests(_ToolBridgeTestCase):
         self.assertNotIn("has run", resp.body["detail"])
 
     def test_another_sandboxs_id_is_unknown_rather_than_forbidden(self):
-        # Both tiers share sandbox-net, so an id that leaked between them must not
+        # Every tier shares sandbox-net, so an id that leaked between sandboxes must not
         # confirm that it exists: a guessed id and a real one answer identically.
         ask = self._ask()
         _resolve(ask, "allow")

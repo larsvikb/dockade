@@ -113,7 +113,7 @@ if [[ "$REBUILD" == "true" ]] || ! docker image inspect "$IMAGE_NAME" >/dev/null
     sc_build_image "$IMAGE_NAME" "$IMAGE_DIR" "$CACHE_FLAG" ${SC_BUILD_ARGS[@]+"${SC_BUILD_ARGS[@]}"}
 fi
 
-# Tier 1 permits the standalone fallback: with no compose infra, a plain
+# Claude's tier permits the standalone fallback: with no compose infra, a plain
 # non-internal bridge still gives direct (firewall-allowlisted, unaudited) egress,
 # which is a degraded but useful mode for this tier.
 sc_ensure_network "$SANDBOX_NET" true
@@ -126,9 +126,9 @@ sc_git_identity
 sc_upstream_dns
 sc_host_timezone
 
-# Plugin marketplaces and the enabled-plugin allowlist: tier 1 only, because
-# Claude Code plugins are Claude Code's mechanism — tier 2 runs opencode and has
-# nothing to do with them. Both are host-side reads with no egress involved; see
+# Plugin marketplaces and the enabled-plugin allowlist: Claude's tier only, because
+# Claude Code plugins are Claude Code's mechanism — no other tier's CLI has anything
+# to do with them. Both are host-side reads with no egress involved; see
 # sandbox-lib.sh for why the mount is read-only and why the allowlist travels as
 # an env var rather than a second mount.
 sc_marketplaces "$WORKSPACE"
@@ -143,7 +143,17 @@ echo "Plugins:   $SC_PLUGINS_DESC"
 echo "Git ident: ${SC_GIT_NAME:-<none>} <${SC_GIT_EMAIL:-none}>"
 echo "DNS upstreams: $SC_UPSTREAM_DNS (pinned via --dns; whitelisted on :53 in standalone mode only)"
 echo "Egress:    $SC_EGRESS_DESC"
-echo "Tools:     $SC_TOOLS_DESC"
+# With no gateway the sandbox still launches. `--strict-mcp-config` goes on
+# unconditionally in the wrapper, so "no gateway" yields a provably empty tool
+# surface rather than whatever the config volume has accumulated — which is the
+# whole reason those two flags are separable (DESIGN.md, "Telling the sandbox it
+# exists"). That is Claude Code's flag, so this launcher, not sandbox-lib.sh, says
+# so: read from SC_NO_GATEWAY, never by matching the description.
+if [[ "$SC_NO_GATEWAY" == "true" ]]; then
+    echo "Tools:     $SC_TOOLS_DESC; MCP surface is empty"
+else
+    echo "Tools:     $SC_TOOLS_DESC"
+fi
 echo ""
 
 # Launch mode. Everything below this — network, capabilities, mounts, firewall,

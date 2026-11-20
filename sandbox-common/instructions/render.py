@@ -8,7 +8,7 @@ matter naming the file it renders to (``output``, repo-relative) and its vocabul
 then its own text, with ``{{include <group>/<name>}}`` lines where a shared fragment
 from this directory goes. ``every-tier/`` holds what is true in every tier: the
 shared ``.bashrc``'s ``rm`` alias, the shared entrypoint's drop to a non-root user,
-and ``/workspace``, which both launchers mount the same way. ``cloud-tier/`` holds
+and ``/workspace``, which each launcher mounts the same way. ``cloud-tier/`` holds
 what every governed cloud tier shares: a tier whose launcher does not pass
 ``SANDBOX_MODE=local``. A fragment names no CLI's tool, file or variable: it writes ``{{key}}``, and
 each tier's front matter gives the key its value, which may be empty.
@@ -16,8 +16,7 @@ each tier's front matter gives the key its value, which may be empty.
 The rendered files are committed, as the Dockerfiles' COPY sources, and
 tests/test_instructions.py holds them equal to a fresh render. This directory is
 repo-side only: no image ships it, and ``.dockerignore`` keeps it out of the build
-context, so it is not part of what "sandbox-common/ is byte-identical in both tiers"
-counts.
+context, so it is not part of the sandbox-common/ every tier runs byte-identical.
 
 Strict, so a mistake fails here and not in an agent's context: an unknown include, a
 placeholder with no key, a key nothing uses, a marker left over, or two tiers naming

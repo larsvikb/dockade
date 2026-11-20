@@ -8,7 +8,7 @@ set -euo pipefail
 #
 # Only Claude-specific materialization belongs here. Everything tier-agnostic —
 # config ownership, git identity, the firewall, the capability assertion, the
-# gosu drop — lives in sandbox-common/entrypoint.sh and is shared with tier 2.
+# gosu drop — lives in sandbox-common/entrypoint.sh and is shared with every tier.
 #
 # TWO PHASES, split by privilege rather than by topic (the entrypoint states the
 # contract). Root writes the gateway pointer, the launch settings and the managed

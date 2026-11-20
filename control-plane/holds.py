@@ -661,7 +661,7 @@ def _get_tool_ask(approval_id: str) -> dict | None:
     operator's lookup: the agent's is ``_ask_by_token``.
 
     ONE at a time, and there is deliberately no listing counterpart for the agent:
-    the gateway's agent-facing listener is on a network both tiers share, so a roster
+    the gateway's agent-facing listener is on a network every tier shares, so a roster
     would leak approvals the caller never raised — and past the leak it hands the
     agent a read on the operator's queue (DESIGN.md, "One id at a time")."""
     _expire_tool_asks()

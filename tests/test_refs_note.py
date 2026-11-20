@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The note tier 1's hook writes for the mounted refs, and where it writes it.
+"""The note Claude's hook writes for the mounted refs, and where it writes it.
 
 Only the ``refs_note`` function is run, lifted out of ``tier-setup.sh`` and pointed
 at a temp directory: the rest of the hook writes /etc as root and the config volume
@@ -19,7 +19,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 HOOKS = {tier: (ROOT / tier / "tier-setup.sh").read_text()
          for tier in ("claude-sandbox", "opencode-sandbox")}
-TIER_ONE = HOOKS["claude-sandbox"]
+CLAUDE_HOOK = HOOKS["claude-sandbox"]
 REEXEC = 'exec gosu "$USERNAME" "$0" "$@"'
 
 _BASH = shutil.which("bash")
@@ -45,7 +45,8 @@ class RefsNoteTests(unittest.TestCase):
 
     def note(self, refs: Path) -> str:
         proc = subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
-            [_BASH, "-c", 'set -euo pipefail; ' + _function(TIER_ONE) + 'refs_note "$1"',
+            [_BASH, "-c",
+             'set -euo pipefail; ' + _function(CLAUDE_HOOK) + 'refs_note "$1"',
              "refs_note", str(refs)],
             capture_output=True, text=True, timeout=60)
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -72,9 +73,9 @@ class RefsNotePlacementTests(unittest.TestCase):
     launch has its own SANDBOX_REFS, so a note written there names whichever sibling
     booted last. /etc is the container's own layer."""
 
-    def test_tier_one_writes_it_as_root_into_its_own_layer(self):
+    def test_claude_writes_it_as_root_into_its_own_layer(self):
         # One managed note, shared with the plugins' bullet (tests/test_launch_settings.py).
-        root_phase = TIER_ONE.split(REEXEC, 1)[0]
+        root_phase = CLAUDE_HOOK.split(REEXEC, 1)[0]
         defined = root_phase.index("\nrefs_note() {\n")
         cleared = root_phase.index('rm -f "$MANAGED_NOTE"')
         rendered = root_phase.index('note="$(refs_note /refs)"')
@@ -105,13 +106,13 @@ def _is_doc(name: str) -> bool:
 
 
 class RefsReadAllowTests(unittest.TestCase):
-    """Both tiers may read /refs without asking, and nothing else about the refs
-    loads. The read allow is measured to load nothing from a ref; the command-line
-    flag loads a directory's skills, agents and commands (NOTES.md, "An allowed read
-    directory loads nothing from it"); the environment variable exists to load the
-    allowed directories' CLAUDE.md files. So each tier's allow is held to exactly
-    /refs, in the one file that carries it, and the other two to nowhere. Every
-    tracked file outside tests/ is scanned for them but a DESIGN.md, NOTES.md or
+    """Each tier tested below may read /refs without asking, and nothing else about
+    the refs loads. The read allow is measured to load nothing from a ref; the
+    command-line flag loads a directory's skills, agents and commands (NOTES.md, "An
+    allowed read directory loads nothing from it"); the environment variable exists to
+    load the allowed directories' CLAUDE.md files. So each tier's allow is held to
+    exactly /refs, in the one file that carries it, and the other two to nowhere.
+    Every tracked file outside tests/ is scanned for them but a DESIGN.md, NOTES.md or
     README.md outside any dot directory."""
 
     def test_only_docs_outside_a_dot_directory_are_skipped(self):
@@ -155,7 +156,7 @@ class RefsReadAllowTests(unittest.TestCase):
                         ".claude/agents/commit-reviewer.md", ".claude/agents/planner.md",
                         ".claude/agents/plan-reviewer.md", ".claude/agents/implementer.md",
                         "claude-sandbox/instructions.md", "opencode-sandbox/instructions.md"}
-        # The fragments both sources include: globbed, and held non-empty.
+        # The fragments the tiers' sources include: globbed, and held non-empty.
         fragments = {p.relative_to(ROOT).as_posix()
                      for p in (ROOT / "sandbox-common" / "instructions").glob("*/*.md")}
         self.assertTrue(fragments)

@@ -11,7 +11,7 @@
 #                   profiles and task registry) in
 #                   docker-compose.yml. Sandboxes themselves are NOT compose
 #                   services (they are ephemeral + plural); launch them with
-#                   `make claude` / `make opencode`, one per agent tier.
+#                   one `make` target per agent tier (`make help` lists them).
 #
 # The linters (shellcheck, hadolint, ruff, yamllint) run wherever `make check`
 # runs — host, CI, or inside the sandbox image, which bakes them; missing ones
@@ -335,7 +335,7 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	  print('        the tier pays KV cache for a window the client will never fill.'), sys.exit(1))"
 	echo "  ok — server $$srv, client $$oc ($$(python3 -c "print(f'{$$srv/$$oc:.2f}')")x headroom)"
 	echo "== launchers are executable IN THE GIT INDEX =="
-	# `make claude` / `make opencode` / verify-build all invoke these as
+	# Each tier's `make` target and verify-build invoke these as
 	# ./run-*-sandbox.sh, so the exec bit is load-bearing for anyone who CLONES.
 	#
 	# It must be read from the INDEX, not from disk, and that is the whole point of
@@ -439,8 +439,8 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	# on the next boot, outside the review that /workspace commits get. `:ro` is the
 	# whole mitigation, and it is one character from being absent, so assert it
 	# rather than trusting the comment next to it.
-	# sandbox-lib.sh is in the file set, not just the launchers: tier 1 builds the
-	# mount in sc_marketplaces, and a future tier might inline one instead. Both
+	# sandbox-lib.sh is in the file set, not just the launchers: Claude's tier builds
+	# the mount in sc_marketplaces, and a future tier might inline one instead. Both
 	# places must obey the rule, so both are searched.
 	mounted=0
 	for f in $(LAUNCHERS) sandbox-lib.sh; do
@@ -456,7 +456,7 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	done
 	if [ "$$mounted" -eq 0 ]; then
 	  echo "  FAIL: nothing constructs a /marketplaces mount, so this guard checked"
-	  echo "        nothing. Tier 1 does (sc_marketplaces) — did the mount change shape?"
+	  echo "        nothing. Claude's tier does (sc_marketplaces) — did the mount change shape?"
 	  echo "        If the feature was removed deliberately, remove this guard too."
 	  exit 1
 	fi
@@ -725,7 +725,7 @@ verify-build: ## Assert every default image still builds (skipped if docker unav
 	fi
 	# Cache-respecting builds: the first run is slow, repeats are near-instant when
 	# nothing changed. Covers every Dockerfile — the compose services here, and
-	# BOTH sandbox tiers (not compose services) via their launchers. `--profile tasks`
+	# EVERY sandbox tier (not compose services) via its launcher. `--profile tasks`
 	# because compose builds only the services its active profiles enable, and the
 	# task registry and its page are the profile-gated services built here
 	# (tests/test_topology.py holds this to every such profile).
@@ -1329,7 +1329,7 @@ restore-tasks: tasks-tool-preflight ## Replace the task registry's store from a 
 	fi
 	exit "$$status"
 
-rebuild: secrets-dir ## Rebuild every default image from scratch — proxy, control plane, UI, gateway, task registry, both sandbox tiers — then recreate the infra
+rebuild: secrets-dir ## Rebuild every default image from scratch — proxy, control plane, UI, gateway, task registry, every sandbox tier — then recreate the infra
 	# Deliberately does NOT `down` first. A build touches no running container, so
 	# taking the governance plane offline for the whole --no-cache build bought
 	# nothing and cost real downtime; the only unavoidable interruption is the
@@ -1340,8 +1340,8 @@ rebuild: secrets-dir ## Rebuild every default image from scratch — proxy, cont
 	#
 	# Sandbox images are rebuilt but not relaunched — they are ephemeral
 	# (`docker run --rm`) and per-workspace, so a running session keeps the image
-	# it started with and the next `make claude` / `make opencode` picks up the new
-	# one. Nothing to recreate.
+	# it started with and the next launch of its tier picks up the new one. Nothing
+	# to recreate.
 	#
 	# The task registry's and its page's images too (see verify-build for the profile).
 	# The `up` below leaves them alone; `make tasks-up` recreates both on the new images.
@@ -1398,7 +1398,7 @@ claude: ## Launch a tier-1 (Claude, governed egress) sandbox (WORKSPACE=/path, d
 opencode: ## Launch a tier-2 (opencode + local LLM, no egress) sandbox (WORKSPACE=/path)
 	./run-opencode-sandbox.sh "$(WORKSPACE)"
 
-boundary: ## Run boundary-check.sh in a running sandbox (SANDBOX=claude-sandbox|opencode-sandbox)
+boundary: ## Run boundary-check.sh in a running sandbox (SANDBOX=<container name>, default claude-sandbox)
 	docker exec -it --user sandbox "$(SANDBOX)" /usr/local/bin/boundary-check.sh
 
 check-boundary: up ## Stand the infra up and assert containment from inside a throwaway tier-1 sandbox (what CI runs)

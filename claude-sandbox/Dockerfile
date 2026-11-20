@@ -237,7 +237,7 @@ RUN if [ -z "$JDK" ]; then exit 0; fi \
     && chmod 0644 /etc/claude-code/jdk-version \
     && cat /etc/claude-code/jdk-version
 
-# Dotfiles. The tier-agnostic ones are SHARED with tier 2 from sandbox-common/,
+# Dotfiles. The tier-agnostic ones are SHARED with every tier from sandbox-common/,
 # for the same reason the boundary scripts are: one implementation, no drift.
 # .bashrc.tier is this tier's own hook, sourced at the end of the shared .bashrc.
 # NB: the build context is the REPO ROOT (not claude-sandbox/), so that the
@@ -255,7 +255,7 @@ COPY claude-sandbox/dotfiles/.bashrc.tier /home/$USERNAME/.bashrc.tier
 # admin console.
 #
 # init-firewall.sh / entrypoint.sh / boundary-check.sh come from sandbox-common/
-# and are SHARED VERBATIM with the tier-2 (opencode) image — the boundary must
+# and are SHARED VERBATIM with every other sandbox image — the boundary must
 # have exactly one implementation. Anything Claude-specific goes in the
 # tier-setup.sh hook the shared entrypoint invokes, not in the shared scripts.
 COPY claude-sandbox/user-settings.json /etc/claude-code/user-settings.json

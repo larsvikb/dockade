@@ -19,9 +19,7 @@
 # a whole toolchain. Running them in parallel means a shellcheck typo is not queued
 # behind a ten-minute image build. `ui-e2e` runs the approval page and the tasks page
 # in a headless browser against expected values (`make ui-test`), which `checks` leaves
-# out because `make test` is browser-free by decision (control-plane-ui/DESIGN.md). Its
-# name still says the approval page alone, because a branch ruleset may require the
-# check by that name.
+# out because `make test` is browser-free by decision (control-plane-ui/DESIGN.md).
 #
 # The `build` job then STANDS THE STACK UP and runs boundary-check.sh in a real
 # sandbox, which is the only automated evidence this repo has that the containment
@@ -274,7 +272,7 @@ jobs:
         run: docker compose logs --no-color --tail=200 || true
 
   ui-e2e:
-    name: the approval page in a browser, against expected values
+    name: the approval and tasks pages in a browser, against expected values
     runs-on: ubuntu-latest
     # A wedged browser hangs rather than fails; each test has its own timeout, and this
     # is the runaway guard over the install and the run together.
@@ -293,8 +291,9 @@ jobs:
       # revision is pinned by the lockfile's integrity hash on playwright-core; the
       # binary's own hash is not, since none is published beside it and pinning the one
       # a run prints would make every lockfile bump a hash edit too. It is printed, so
-      # a run's verdict can be traced to the bytes that produced it. --with-deps apt-installs the libraries the shell links
-      # against, which the runner image does not promise to keep.
+      # a run's verdict can be traced to the bytes that produced it. --with-deps
+      # apt-installs the libraries the shell links against, which the runner image does
+      # not promise to keep.
       #
       # Into a directory of this job's own, so exactly one shell is found there.
       - name: Install playwright-core and its headless shell (pinned by the harness's lockfile)

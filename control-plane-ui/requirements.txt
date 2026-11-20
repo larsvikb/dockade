@@ -2,8 +2,8 @@
 # reverse proxy + static server, not a security boundary, so the pinning bar
 # matches the backend (no digest required) but is still deliberate. starlette is
 # pinned for the reasons control-plane/requirements.txt gives.
-fastapi==0.141.1
-uvicorn==0.53.0
+fastapi==0.165.0
+uvicorn==0.54.0
 httpx==0.28.1
 starlette==1.10.0
 
@@ -19,7 +19,8 @@ click==8.5.1
 h11==0.16.0
 httpcore==1.0.9
 idna==3.20
-pydantic==2.14.3
-pydantic_core==2.50.4
+opentelemetry-api==1.45.2
+pydantic==2.14.4
+pydantic_core==2.50.5
 typing-inspection==0.4.5
 typing_extensions==4.16.0

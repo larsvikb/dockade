@@ -1417,6 +1417,12 @@ control plane's real three listeners, run from a venv rather than the image: thr
 between the two versions — restore, then `signal.raise_signal` LIFO — so the chain
 nests one level per `serve()` rather than pairwise.
 
+Re-measured on uvicorn **0.54.0** (2026-11-21, the bump from 0.53.0), the same way,
+five runs against five on 0.53.0 in the same session: three `Finished server
+process` lines every run, and timings indistinguishable between the two: both land
+in the same band of about 565 to 616 ms, on the same ~50 ms steps.
+`capture_signals` is identical between the two; 0.54.0's changes are HTTP/2-only.
+
 The corollary is the part worth writing down: hand-rolled handlers added "to be
 safe" do nothing here. `loop.add_signal_handler` installs through asyncio's own
 `signal.signal` hook, which `capture_signals` then displaces, so a handler

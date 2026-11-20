@@ -91,9 +91,9 @@ def _record_exception_handler(self, exc_class):
 
 def _include_router(self, router, *_args, **_kwargs) -> None:
     """Copy a router's recorded routes into the app, so the app's ``routes`` is what
-    that listener serves. FastAPI 0.141 resolves an included router lazily instead;
-    copying gives the same answer because every route is registered at import,
-    before app.py includes the router."""
+    that listener serves. The pinned FastAPI (control-plane/requirements.txt)
+    resolves an included router lazily instead; copying gives the same answer
+    because every route is registered at import, before app.py includes the router."""
     self.__dict__.setdefault("routes", []).extend(getattr(router, "routes", []))
 
 

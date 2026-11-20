@@ -8,8 +8,8 @@
 # reimplementing it — one definition of "the Python service shape we ship", so a
 # FastAPI upgrade is one decision instead of a drift between two services.
 # starlette is pinned for the reasons control-plane/requirements.txt gives.
-fastapi==0.141.1
-uvicorn==0.53.0
+fastapi==0.165.0
+uvicorn==0.54.0
 starlette==1.10.0
 
 # Everything else the pins above resolve to, for the Python of this service's
@@ -22,7 +22,8 @@ anyio==4.16.0
 click==8.5.1
 h11==0.16.0
 idna==3.20
-pydantic==2.14.3
-pydantic_core==2.50.4
+opentelemetry-api==1.45.2
+pydantic==2.14.4
+pydantic_core==2.50.5
 typing-inspection==0.4.5
 typing_extensions==4.16.0

@@ -2476,8 +2476,8 @@ reservation was extracted** out of the `authorize` handler into `_reserve_hold` 
 the FastAPI machinery. And these are properties `boundary-check.sh` structurally cannot
 reach: it observes reachability from the sandbox's vantage point, so a hold-cap rejection
 shows there only as the proxy's not-decided `503`, and its concurrency behaviour not at all.
-Deliberately untested surface is low-weight I/O: `_audit` sinks,
-`_post_authorize` / `_setup_audit_file`, and the SSE `approvals_stream`.
+Deliberately untested surface is the egress addon's two thinnest I/O calls, whose
+output no test asserts: `_post_authorize`'s urllib POST and `_audit`'s one log line.
 
 **The CI gate runs the same `make` targets rather than reimplementing them**
 (`.github/workflows/check.yml`), so there is one definition of "does this repo pass" and

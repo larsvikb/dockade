@@ -7,5 +7,22 @@
 # run the same stack for the same reason CI runs `make check` rather than
 # reimplementing it — one definition of "the Python service shape we ship", so a
 # FastAPI upgrade is one decision instead of a drift between two services.
+# starlette is pinned for the reasons control-plane/requirements.txt gives.
 fastapi==0.141.1
 uvicorn==0.53.0
+starlette==1.10.0
+
+# Everything else the pins above resolve to, for the Python of this service's
+# Dockerfile FROM. The Dockerfile installs with --no-deps and runs pip check, so
+# this is exactly what ships and an incomplete list fails the build. A bump
+# re-resolves the whole closure in a scratch venv; the diff here is the review.
+annotated-doc==0.0.7
+annotated-types==0.8.0
+anyio==4.16.0
+click==8.5.1
+h11==0.16.0
+idna==3.20
+pydantic==2.14.3
+pydantic_core==2.50.4
+typing-inspection==0.4.5
+typing_extensions==4.16.0

@@ -99,11 +99,11 @@ STREAM_TICK_S = 1.0
 #: cancels its queued work. The cancelled item stays in this executor's queue, inert,
 #: until the stuck build returns. That cancel rests on three things: uvicorn reporting
 #: an ASGI spec below 2.4, Starlette's spec-gated ``StreamingResponse`` path that then
-#: watches for ``http.disconnect`` (Starlette is not pinned, so it can change with no
-#: diff here), and the ``control-plane-ui`` relay noticing the browser left by that
-#: same path and closing its upstream. If any changes, a gone page's tick waits in the
-#: queue and builds once the stuck build returns: still no ingest thread, but live
-#: queued work per reconnect.
+#: watches for ``http.disconnect`` (uvicorn and Starlette are pinned in requirements.txt,
+#: so either changes only by a reviewed bump), and the ``control-plane-ui`` relay
+#: noticing the browser left by that same path and closing its upstream. If any
+#: changes, a gone page's tick waits in the queue and builds once the stuck build
+#: returns: still no ingest thread, but live queued work per reconnect.
 _STREAM_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=1, thread_name_prefix="approvals-stream")
 

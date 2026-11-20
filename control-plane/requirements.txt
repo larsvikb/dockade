@@ -1,5 +1,28 @@
 # Control-plane runtime deps. Pinned for reproducible builds. This is the
 # management plane, not the egress security choke point, so the pinning bar is a
 # notch below proxies/egress (no digest required) — but still deliberate.
+#
+# starlette is pinned with fastapi, which only bounds it, because code here and in
+# the UIs relies on its behaviour: StreamingResponse's disconnect watch, gated on
+# the ASGI spec version the server reports, which cancels approvals_stream's tick
+# (api_approvals.py) and closes the UI relays' upstream when the browser leaves;
+# the `{path:path}` converter dropping one trailing newline before the relays'
+# allowlists see the path; and the exception paths behind the 422 answers.
 fastapi==0.141.1
 uvicorn==0.53.0
+starlette==1.10.0
+
+# Everything else the pins above resolve to, for the Python of this service's
+# Dockerfile FROM. The Dockerfile installs with --no-deps and runs pip check, so
+# this is exactly what ships and an incomplete list fails the build. A bump
+# re-resolves the whole closure in a scratch venv; the diff here is the review.
+annotated-doc==0.0.7
+annotated-types==0.8.0
+anyio==4.16.0
+click==8.5.1
+h11==0.16.0
+idna==3.20
+pydantic==2.14.3
+pydantic_core==2.50.4
+typing-inspection==0.4.5
+typing_extensions==4.16.0

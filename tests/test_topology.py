@@ -2381,14 +2381,17 @@ class TaskRegistryPlacementTests(unittest.TestCase):
             self.assertIn(f"os.environ['{var}']", probe)
         self.assertIn("/healthz", probe)
 
-    def test_it_runs_the_control_planes_stack_and_pins_pydantic(self):
+    def test_its_pins_are_the_control_planes(self):
+        # One Python service shape, as the gateway's: pydantic is a direct pin here for
+        # operator_api.Body, and in the control plane's closure at the same version.
         pins = lambda path: {  # noqa: E731
             line.strip() for line in path.read_text().splitlines()
             if line.strip() and not line.startswith("#")}
-        mine = pins(REGISTRY / "requirements.txt")
-        self.assertLessEqual(pins(ROOT / "control-plane" / "requirements.txt"), mine)
-        self.assertEqual({p.split("==")[0] for p in mine}, {"fastapi", "uvicorn", "pydantic"})
-        self.assertTrue(all("==" in p for p in mine), mine)
+        self.assertEqual(pins(REGISTRY / "requirements.txt"),
+                         pins(ROOT / "control-plane" / "requirements.txt"))
+        self.assertTrue(any(p.startswith("pydantic==")
+                            for p in pins(REGISTRY / "requirements.txt")),
+                        "the registry does not pin pydantic, which operator_api.Body relies on")
 
     def test_every_module_is_shipped_and_the_entry_is_serve(self):
         # As ControlPlaneModulesAreShippedTests: a module with no COPY line passes every

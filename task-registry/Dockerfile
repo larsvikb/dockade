@@ -13,7 +13,10 @@ WORKDIR /opt/task-registry
 
 # Deps first for layer caching; pinned in requirements.txt.
 COPY requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+# --no-deps installs exactly the file, and pip check fails the build when it is not
+# a complete, consistent closure (a fastapi bump needing a newer starlette, a new
+# transitive). Without them a missing package would quietly resolve here again.
+RUN pip install --no-cache-dir --no-deps -r requirements.txt && pip check
 
 # One line per module, as in control-plane/Dockerfile: an added module is a deliberate
 # line here (tests/test_topology.py fails without it).

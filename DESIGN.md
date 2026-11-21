@@ -1440,8 +1440,11 @@ keeps the networks.
 Four constraints follow, each closing a different hole:
 
 - **The servers' egress goes through the egress proxy** — set by env, *enforced* by
-  placement: `mcp-net` is internal, so the proxy is the only thing reachable and a
-  server that ignores `HTTPS_PROXY` fails loudly instead of going direct. This is
+  placement: `mcp-net` is internal, so the proxy is the only way off the machine (the
+  gateway serves nothing there, as the third constraint says, and the task registry's
+  agent port takes only the gateway's secret: `task-registry/DESIGN.md`, "The agent
+  listener"), and a server that ignores `HTTPS_PROXY` gets an error instead of going
+  direct (NOTES.md, "An MCP server container really does honour `HTTPS_PROXY`"). This is
   the point the containers-per-server model does not remove but relocates: the
   gateway itself needs no egress, since it only ever dials siblings, while the
   servers need real internet — from a container holding a write-capable credential,

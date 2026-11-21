@@ -28,9 +28,13 @@
 #   - `mcp-net` only. No `sandbox-net` leg, so the agent has no route to the
 #     container and no route to the credential it holds. This is the whole boundary
 #     — nothing inside the container enforces it.
-#   - No `egress-net` leg. The network is internal, so the only reachable thing is
-#     the egress proxy: a server that ignores the proxy env fails loudly instead of
-#     quietly going direct. Capability, not configuration.
+#   - No `egress-net` leg. The network is internal, so the egress proxy is the only
+#     way off the machine. The tool gateway is on it too but serves nothing there
+#     (see below), and so is the task registry, whose agent port takes only the
+#     gateway's secret (task-registry/DESIGN.md, "The agent listener"); neither is a
+#     route out. A server that ignores the proxy env gets an error instead of
+#     quietly going direct: NOTES.md, "An MCP server container really does honour
+#     `HTTPS_PROXY`". Capability, not configuration.
 #   - No published ports. Nothing on the host reaches these either.
 #
 # Governance happens at two altitudes and neither substitutes for the other: the
@@ -126,9 +130,11 @@ services:
       # (EGRESS_CONNECT_PORTS) refuses, so such a server reaches its upstreams over
       # https; Node's http agent sends an ordinary forward request and is not
       # affected. Verify a new server by looking for its connections in the
-      # proxy's audit log: one that ignores these variables fails by a timeout,
-      # not an error, and a refused http:// fetch shows there as a CONNECT deny on
-      # port 80.
+      # proxy's audit log. One that ignores these variables gets an error rather
+      # than a route out, and can swallow it, so a row after a real tool call is
+      # the proof (NOTES.md, "An MCP server container really does honour
+      # `HTTPS_PROXY`"). A refused http:// fetch shows in the log as a CONNECT
+      # deny on port 80.
       HTTP_PROXY: http://egress-proxy:8080
       HTTPS_PROXY: http://egress-proxy:8080
       NO_PROXY: localhost,127.0.0.1

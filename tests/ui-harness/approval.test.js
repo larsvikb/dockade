@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // The approval page's cards, against values written down in advance: what a confirm
 // panel says it will write and what the click then sends, the countdowns, and what a
-// card says once its resolve is answered. ui-diff's oracle is the previous version of
-// the page; this one's is the fixture in backend.js and the spec in the page's comments,
-// so every expected value below is worked out from those by hand and none is copied
-// from a run.
+// card says once its resolve is answered; and the MCP view's tool rules table, which
+// shows the rules of the server picked in its form. ui-diff's oracle is the previous
+// version of the page; this one's is the fixture in backend.js and the spec in the
+// page's comments, so every expected value below is worked out from those by hand and
+// none is copied from a run.
 //
 //   node approval.test.js <served dir>
 //
@@ -425,3 +426,112 @@ for (const [how, status] of [
     assert.equal(await text(page.locator("#mcp-export-status")), "");
   });
 }
+
+// ── the MCP view: the tool rules table follows the form's server ────────────
+
+// backend.js's tool rules, mcp-github's two, with two for mcp-notes after them in the
+// order `/api/mcp/rules` gives (server, then allow/ask/deny, then tool), and the
+// servers list counting them. Read through `respond` so the fixture stays backend.js's.
+const fixture = path => backend.respond("GET", path, null, new URLSearchParams()).json;
+function bothServers() {
+  const at = backend.NOW_MS / 1000 - 3600;
+  const rules = [...fixture("/api/mcp/rules"),
+                 { id: 3, server: "mcp-notes", tool: "read_note", action: "allow",
+                   created_at: at },
+                 { id: 4, server: "mcp-notes", tool: "delete_note", action: "deny",
+                   created_at: at }];
+  const servers = fixture("/api/mcp/servers").map(s =>
+    ({ ...s, tool_rules: rules.filter(r => r.server === s.server).length }));
+  return { "/api/mcp/rules": rules, "/api/mcp/servers": servers };
+}
+
+// The page loaded at the MCP view on a reset backend, its GETs for the paths in `gets`
+// answered from there, every POST under /api/mcp/rules recorded in `sent`, and every
+// GET's path in `answered` in the order it was answered. `last` names the GET answered
+// after every other one held.
+async function mcpView(t, { gets = {}, last = null } = {}) {
+  backend.reset();
+  const sent = [];
+  const answered = [];
+  const run = await openPage(browser, uiDir, {
+    respond: (method, path, body, query) => {
+      if (method === "GET") answered.push(path);
+      if (method === "POST" && path.startsWith("/api/mcp/rules")) sent.push({ path, body });
+      if (method === "GET" && path in gets) return { status: 200, json: gets[path] };
+      return backend.respond(method, path, body, query);
+    },
+    answeredLast: (method, path) => method === "GET" && path === last,
+  }, { hash: "#tools" });
+  t.after(() => run.close());
+  const { page, helpers } = run;
+  await helpers.load();
+  await helpers.settle();
+  assert.equal(await page.locator("#view-tools").isHidden(), false);
+  // Each row's server, tool and action cells.
+  const rows = () => page.locator("#toolrules tr").evaluateAll(trs => trs.map(tr =>
+    [...tr.querySelectorAll("td")].slice(0, 3).map(td => td.textContent)));
+  const ruleIds = () => page.locator("#toolrules button[data-rule]").evaluateAll(bs =>
+    [...new Set(bs.map(b => b.dataset.rule))]);
+  const pick = async server => {
+    await page.selectOption("#toolrule-server", server);
+    await helpers.settle();
+  };
+  return { page, helpers, sent, answered, rows, ruleIds, pick };
+}
+
+const GITHUB_ROWS = [["mcp-github", "get_me", "allow"],
+                     ["mcp-github", "create_pull_request", "ask"]];
+const NOTES_ROWS = [["mcp-notes", "read_note", "allow"],
+                    ["mcp-notes", "delete_note", "deny"]];
+
+test("the tool rules table shows only the picked server's rules", TIMEOUT, async t => {
+  const { page, helpers, sent, rows, ruleIds, pick } =
+    await mcpView(t, { gets: bothServers() });
+  // mcp-github is the first server `/api/mcp/servers` lists, so the form opens on it.
+  assert.equal(await page.locator("#toolrule-server").inputValue(), "mcp-github");
+  assert.deepEqual(await rows(), GITHUB_ROWS);
+  assert.equal(await text(page.locator("#toolrulecount")), "· 2 rules of 4");
+  assert.equal(await page.locator("#toolrules-empty").isHidden(), true);
+
+  await pick("mcp-notes");
+  assert.deepEqual(await rows(), NOTES_ROWS);
+  assert.deepEqual(await ruleIds(), ["3", "4"]);
+  assert.equal(await text(page.locator("#toolrulecount")), "· 2 rules of 4");
+  await page.click('#toolrules button.revoke[data-rule="4"]');
+  await helpers.settle();
+  assert.deepEqual(sent, [{ path: "/api/mcp/rules/4/revoke", body: null }]);
+
+  await pick("mcp-github");
+  assert.deepEqual(await rows(), GITHUB_ROWS);
+  assert.deepEqual(await ruleIds(), ["1", "2"]);
+});
+
+test("a server with no rules says so, and not that there are none at all", TIMEOUT,
+     async t => {
+  const { page, rows, pick } = await mcpView(t);
+  await pick("mcp-notes");
+  assert.deepEqual(await rows(), []);
+  assert.equal(await text(page.locator("#toolrulecount")), "· 0 rules of 2");
+  const empty = page.locator("#toolrules-empty");
+  assert.equal(await empty.isHidden(), false);
+  assert.equal(await text(empty),
+               "No tool rules for mcp-notes, so every call to its tools is denied. "
+               + "Other servers have rules: pick one above to see them.");
+});
+
+// The servers answered after the rules and the inventory: the table is drawn before
+// any server can be picked, and has to be drawn again, after the options are rebuilt,
+// by the servers' own answer, with no tab switch or later read to do it instead.
+test("rules that arrive before the servers show once the servers do", TIMEOUT,
+     async t => {
+  const { page, answered, rows } = await mcpView(t, { gets: bothServers(),
+                                                      last: "/api/mcp/servers" });
+  const servers = answered.lastIndexOf("/api/mcp/servers");
+  assert.ok(answered.includes("/api/mcp/rules") && answered.includes("/api/mcp/inventory")
+            && servers > answered.lastIndexOf("/api/mcp/rules")
+            && servers > answered.lastIndexOf("/api/mcp/inventory"),
+            `the servers were not answered after the rules and the inventory: `
+            + answered.join(", "));
+  assert.deepEqual(await rows(), GITHUB_ROWS);
+  assert.equal(await text(page.locator("#toolrulecount")), "· 2 rules of 4");
+});

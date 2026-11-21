@@ -642,6 +642,7 @@ class ToolOutcomeRowTests(unittest.TestCase):
             {"ts": 1000.0, "kind": "outcome", "stage": "tool-result",
              "client": "172.30.0.130", "client_class": "sandbox", "reason": None,
              "server": "mcp-github", "tool": "get_me", "approval_id": None,
+             "settled_by": None,
              "resume_token": None, "call_token": None, "status": "ok",
              "result_bytes": None,
              "result_sha256": None, "duration": None})
@@ -996,6 +997,22 @@ class ToolOutcomeDrainTests(IngestTestCase):
                    {"call_token": None, "resume_token": None})
         cp.ingest._drain(self.tool)
         self.assertEqual([r["approval_id"] for r in self.rows()], [None, None, None])
+
+    def test_only_an_id_from_a_resume_token_is_marked_as_settled_by_it(self):
+        # The mark is what tells a card's own call from the calls its pin answered,
+        # which name the same card (holds._list_granted): every other path leaves it
+        # NULL, a call token that credits the card included.
+        self._ask("op-id-own", "a" * 32)
+        token = self._mint(card="op-id-own")
+        self.write({"resume_token": "a" * 32}, {"call_token": token},
+                   {"resume_token": "f" * 32}, {"resume_token": None},
+                   {"resume_token": "a" * 32, "call_token": self._mint()})
+        cp.ingest._drain(self.tool)
+        with cp.store._connect() as conn:
+            marked = [tuple(r) for r in conn.execute(
+                "SELECT approval_id, settled_by FROM audit ORDER BY id")]
+        self.assertEqual(marked, [("op-id-own", "resume"), ("op-id-own", None),
+                                  (None, None), (None, None), (None, None)])
 
     def test_a_drain_that_rolls_back_leaves_the_token_unspent(self):
         # Exactly-once with the drain: the spend is on its connection and inside its

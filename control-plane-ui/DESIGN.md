@@ -132,6 +132,15 @@ cross-cutting points are kept here.
   comes from `GET /api/config` (`{"hold_timeout"}`, on the relay allowlist — the one
   cross-component piece) with a two-clock clamp so skew makes it wrong, not absurd. Fails
   soft: no config, no countdown, page otherwise unaffected.
+- **An allowed tool card waits for its call.** The call runs when the agent resumes,
+  not at the click, so an allow is not a result. The card stays, without buttons or a
+  countdown, for `/api/config`'s `tool_outcome_wait`, and says what the stream's
+  `granted` entry says of the call (`grantedStep` in `holds.js`): its status, reason
+  and facts once it ends, or why it will not run. Each of those dwells as an expiry
+  does; with none by the deadline it points at the record under the card's id, and
+  goes after a resolve's dwell. Only a live stream's entry may name when the grant
+  lapses. Fails soft as the countdown does: with no wait known, an allow reads and
+  goes as it did.
 
 **Presenting a payload for approval.** A schema-driven view gets most of the way —
 the tool's JSON Schema gives a field tree with each field's description beside it —

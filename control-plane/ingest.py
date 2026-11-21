@@ -94,7 +94,7 @@ _EGRESS_COLUMNS = ("ts", "kind", "stage", "host", "port", "proto", "client",
                    "client_class", "method", "url", "reason")
 _TOOL_COLUMNS = ("ts", "kind", "stage", "client", "client_class", "reason",
                  "server", "tool", "approval_id", "status",
-                 "result_bytes", "result_sha256", "duration")
+                 "result_bytes", "result_sha256", "duration", "settled_by")
 
 
 def _insert_for(columns: tuple[str, ...]) -> str:
@@ -268,7 +268,7 @@ def _tool_row(line: bytes) -> dict | None:
             "client": client, "client_class": policy._client_class(client),
             "reason": _ingest_field(rec.get("reason")),
             "server": settled["server"], "tool": settled["tool"],
-            "approval_id": None,
+            "approval_id": None, "settled_by": None,
             "resume_token": settled["resume_token"],
             "call_token": settled["call_token"],
             "status": _ingest_field(rec.get("status")),
@@ -311,13 +311,17 @@ def _settle_tool_row(conn, row: dict) -> None:
     pin's card is credited only if the line names the call the token was minted for.
 
     A token the store did not mint, a line with both, and a line with neither leave
-    the id NULL."""
+    the id NULL.
+
+    ``settled_by`` is `resume` for an id from the resume token and NULL otherwise;
+    why, at its DDL in ``store._init_db``."""
     resume_token = row.pop("resume_token", None)
     call_token = row.pop("call_token", None)
     if resume_token is not None and call_token is None:
         found = conn.execute("SELECT id FROM tool_approvals WHERE resume_token=?",
                              (resume_token,)).fetchone()
-        row["approval_id"] = found["id"] if found is not None else None
+        if found is not None:
+            row["approval_id"], row["settled_by"] = found["id"], "resume"
     elif call_token is not None and resume_token is None:
         found = conn.execute(
             "SELECT approval_id, server, tool, client FROM tool_call_tokens "

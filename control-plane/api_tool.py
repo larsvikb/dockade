@@ -392,6 +392,9 @@ def _refused_by_policy(ask: dict, client_class: str, why: str) -> JSONResponse:
         ask = holds._get_tool_ask(approval_id) or ask
         if not (ask["status"] == "allowed" and ask["claimed_at"] is None):
             return _not_claimable(approval_id, ask)
+    # For the operator's card, which would otherwise wait on a call its agent has just
+    # been told will not run.
+    holds._mark_refused(approval_id)
     store._audit("deny", stage="tool-resume", **audited,
                  reason=f"approved tool ask {approval_id} not released: {why} — "
                         f"the approval stands, the server's state does not")

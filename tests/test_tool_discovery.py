@@ -16,6 +16,7 @@ vanishes on error is worse than one that was never written.
 from __future__ import annotations
 
 import contextlib
+import http.client
 import http.server
 import io
 import json
@@ -43,6 +44,63 @@ ENTRY = {"server": "mcp-github",
 def sse(result: dict) -> str:
     """An MCP reply in the shape the server actually sends — SSE, not a JSON body."""
     return f"data: {json.dumps({'jsonrpc': '2.0', 'id': 1, 'result': result})}\n\n"
+
+
+#: A reply body the swapped-in ``json.loads`` refuses as too deep: a marker rather than
+#: a real nesting, so the proof does not depend on the depth at which this interpreter
+#: gives up.
+TOO_DEEP = b'"too-deep"'
+
+
+def _loads_recursing_on_marker(real=json.loads):
+    def stand_in(value, *args, **kwargs):
+        if value == TOO_DEEP:
+            raise RecursionError("too deep")
+        return real(value, *args, **kwargs)
+    return stand_in
+
+
+def _parse_error(body: bytes) -> str:
+    try:
+        json.loads(body)
+    except ValueError as exc:
+        return str(exc)
+    raise AssertionError(f"{body!r} parsed")
+
+
+#: Each way the control plane can answer badly, by where real code raises it: urlopen
+#: for a status line that is not HTTP, the response's read for a connection reset or
+#: a body cut short, and the parse of the reply for one that is not JSON or is nested
+#: too deeply. Each with the text the reason quotes.
+CONTROL_FAULTS = {
+    "BadStatusLine": (dict(on_open=http.client.BadStatusLine("garbage")), "garbage"),
+    "ConnectionResetError": (dict(on_read=ConnectionResetError("reset")), "reset"),
+    "IncompleteRead": (dict(on_read=http.client.IncompleteRead(b"par", 10)),
+                       "IncompleteRead(3 bytes read, 10 more expected)"),
+    "ValueError": (dict(reply=b"{not json"), _parse_error(b"{not json")),
+    "RecursionError": (dict(reply=TOO_DEEP), "too deep"),
+}
+
+
+@contextlib.contextmanager
+def control_plane_answering(discovery, *, reply=b"{}", on_open=None, on_read=None):
+    """``urllib.request.urlopen`` stood in for, answering ``reply`` or raising
+    ``on_open`` or ``on_read`` where real code would. It parses nothing itself, so a
+    RecursionError can only come from the code under test."""
+    @contextlib.contextmanager
+    def urlopen(_request, *_args, **_kwargs):
+        if on_open is not None:
+            raise on_open
+
+        def read():
+            if on_read is not None:
+                raise on_read
+            return reply
+        yield mock.Mock(read=read)
+
+    with mock.patch("urllib.request.urlopen", urlopen), \
+            mock.patch.object(discovery.json, "loads", _loads_recursing_on_marker()):
+        yield
 
 
 class ParseTests(unittest.TestCase):
@@ -1214,6 +1272,80 @@ class PollTests(unittest.TestCase):
         roster, failure = discovery.poll()
         self.assertEqual(failure, "")
         self.assertEqual(len(roster), 1)
+
+    def test_a_control_plane_answering_badly_is_reported_and_not_raised(self):
+        # Escaped, these reached the reconcile loop's guard: "reconcile failed" every
+        # tick, and the flip into failure never announced as one.
+        for name, (fault, detail) in CONTROL_FAULTS.items():
+            with self.subTest(name):
+                discovery = load_discovery()
+                with control_plane_answering(discovery, **fault):
+                    roster, failure = discovery.poll()
+                self.assertIsNone(roster)
+                self.assertEqual(failure, f"tool-gateway: roster unavailable from "
+                                          f"{discovery.CONTROL_URL} — {detail}")
+
+    def test_a_bug_in_fetching_the_roster_still_raises(self):
+        # The catch names what the control plane can do wrong, so a bug here reaches
+        # the loop guard under its own class rather than reading as an outage.
+        discovery = load_discovery()
+
+        def fetch_roster():
+            raise TypeError("a bug")
+        discovery.fetch_roster = fetch_roster
+        with self.assertRaises(TypeError):
+            discovery.poll()
+
+
+#: One server's round, as ``push_inventory`` is handed it.
+RESULTS = [{"server": "mcp-github", "status": "ok", "tools": []}]
+
+
+class PushInventoryReplyTests(unittest.TestCase):
+    """``push_inventory`` returns "" or a reason, whatever the control plane answers."""
+
+    def test_a_control_plane_answering_badly_is_a_reason(self):
+        for name, (fault, detail) in CONTROL_FAULTS.items():
+            with self.subTest(name):
+                discovery = load_discovery()
+                with control_plane_answering(discovery, **fault):
+                    failure = discovery.push_inventory(RESULTS)
+                self.assertEqual(failure, f"tool-gateway: inventory not accepted by "
+                                          f"{discovery.CONTROL_URL} — {detail}")
+
+    def test_a_reply_that_is_not_an_object_is_a_reason(self):
+        for reply, kind in ((b"[]", "list"), (b'"ok"', "str"), (b"null", "NoneType")):
+            with self.subTest(reply):
+                discovery = load_discovery()
+                with control_plane_answering(discovery, reply=reply):
+                    failure = discovery.push_inventory(RESULTS)
+                self.assertEqual(failure, f"tool-gateway: inventory not accepted by "
+                                          f"{discovery.CONTROL_URL} — a {kind} where an "
+                                          f"object was expected")
+
+    def test_an_accepted_push_is_no_reason(self):
+        discovery = load_discovery()
+        with control_plane_answering(discovery, reply=b'{"ok": true}'):
+            self.assertEqual(discovery.push_inventory(RESULTS), "")
+
+    def test_a_refused_push_is_the_refusal(self):
+        discovery = load_discovery()
+        with control_plane_answering(discovery, reply=b'{"ok": false, "detail": "x"}'):
+            self.assertEqual(discovery.push_inventory(RESULTS),
+                             "tool-gateway: inventory refused — x")
+
+    def test_an_empty_reply_is_a_refusal_with_no_reason(self):
+        # An empty body reads as `{}`, not as a body that will not parse.
+        discovery = load_discovery()
+        with control_plane_answering(discovery, reply=b""):
+            self.assertEqual(discovery.push_inventory(RESULTS),
+                             "tool-gateway: inventory refused — no reason given")
+
+    def test_a_bug_in_pushing_still_raises(self):
+        discovery = load_discovery()
+        with control_plane_answering(discovery, on_open=TypeError("a bug")), \
+                self.assertRaises(TypeError):
+            discovery.push_inventory(RESULTS)
 
 
 if __name__ == "__main__":

@@ -143,6 +143,14 @@ class DiscoveryError(Exception):
         self.kind = kind
 
 
+#: What the control plane can do wrong on a call this module makes: no answer
+#: (``URLError`` is an ``OSError``), a reply that is not HTTP or is cut short, and a
+#: body that will not parse, too deep included (a ``RuntimeError``, not a
+#: ``ValueError``). The same tuple as ``execute._ask_control``'s; anything outside it is
+#: a bug, and raises.
+_CONTROL_FAILURES = (OSError, http.client.HTTPException, ValueError, RecursionError)
+
+
 def fetch_roster() -> list[dict]:
     """The enabled servers and their rules, from the control plane's tool bridge.
 
@@ -616,7 +624,12 @@ def format_report(results: list[dict]) -> list[str]:
 
 
 def poll() -> tuple[list[dict] | None, str]:
-    """The roster, or None and a reason. Never raises.
+    """The roster, or None and a reason.
+
+    A reason is returned for no answer, a reply that is not HTTP, and a body cut
+    short or that will not parse. Any other exception is a bug, and is left to raise
+    into ``_reconcile_forever``'s guard under its own class rather than read as an
+    outage.
 
     Split from ``report`` because the two have different costs and therefore
     different cadences. This is one HTTP call to a sibling answering two indexed
@@ -632,7 +645,7 @@ def poll() -> tuple[list[dict] | None, str]:
     a message is reworded."""
     try:
         return fetch_roster(), ""
-    except (urllib.error.URLError, OSError, ValueError) as exc:
+    except _CONTROL_FAILURES as exc:
         return None, f"tool-gateway: roster unavailable from {CONTROL_URL} — {exc}"
 
 
@@ -796,8 +809,11 @@ def push_inventory(results: list[dict]) -> str:
     try:
         with urllib.request.urlopen(request, timeout=TIMEOUT) as response:  # noqa: S310
             answer = json.loads(response.read() or b"{}")
-    except (urllib.error.URLError, OSError, ValueError) as exc:
+    except _CONTROL_FAILURES as exc:
         return f"tool-gateway: inventory not accepted by {CONTROL_URL} — {exc}"
+    if not isinstance(answer, dict):
+        return (f"tool-gateway: inventory not accepted by {CONTROL_URL} — "
+                f"a {type(answer).__name__} where an object was expected")
     if not answer.get("ok"):
         return (f"tool-gateway: inventory refused — "
                 f"{answer.get('detail') or 'no reason given'}")

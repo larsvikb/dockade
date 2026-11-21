@@ -446,6 +446,71 @@ def _list_tools_of(discovery, entries: list):
         return discovery.list_tools({**ENTRY, "auth": {"type": "none"}})
 
 
+def _refusing_arguments(marker: object, real, error: type = RecursionError):
+    """A stand-in for ``json.dumps`` that raises ``error`` on a message whose
+    ``params.arguments`` is ``marker`` and is ``real`` on anything else, so a message
+    too deep to encode is proved without depending on the depth at which this
+    interpreter gives up. It matches on the arguments, not the whole message, so a
+    change to the envelope cannot silently stop it matching."""
+    def stand_in(value, *args, **kwargs):
+        params = value.get("params") if isinstance(value, dict) else None
+        if isinstance(params, dict) and params.get("arguments") == marker:
+            raise error("refused")
+        return real(value, *args, **kwargs)
+    return stand_in
+
+
+class UnencodableMessageTests(unittest.TestCase):
+    """A message too deep to encode was never sent, and nothing was spent on it: the
+    encode comes before the lookup, the credential read and the dial."""
+
+    def test_a_message_too_deep_to_encode_is_never_sent(self):
+        discovery = load_discovery()
+        resolved, read, dialled = [], [], []
+        marker = {"too-deep": True}
+        message = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "get_issue", "arguments": marker}}
+
+        def getaddrinfo(host, *args, **kwargs):
+            resolved.append(host)
+            return [(2, 1, 6, "", ("172.28.0.11", 8082))]
+
+        def read_secret(server):
+            read.append(server)
+            return "the-token"
+
+        def urlopen(request, *args, **kwargs):
+            dialled.append(request)
+            raise AssertionError("the request was sent")
+
+        discovery.read_secret = read_secret
+        with mock.patch.object(discovery.json, "dumps",
+                               _refusing_arguments(marker, json.dumps)), \
+                mock.patch("socket.getaddrinfo", getaddrinfo), \
+                mock.patch.object(discovery._OPENER, "open", urlopen), \
+                self.assertRaises(discovery.DiscoveryError) as caught:
+            discovery.post(ENTRY, message)
+        self.assertEqual(caught.exception.kind, "transport-error")
+        self.assertIn("so it was never sent", str(caught.exception))
+        self.assertIn("will fail the same way", str(caught.exception))
+        self.assertEqual((resolved, read, dialled), ([], [], []))
+
+    def test_an_encoder_failure_other_than_depth_is_not_called_never_sent(self):
+        # A TypeError or ValueError from the encoder is a gateway bug, not a property
+        # of the agent's arguments, so it is not dressed up as one: it escapes `post`.
+        discovery = load_discovery()
+        marker = {"unencodable": True}
+        message = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "get_issue", "arguments": marker}}
+        with mock.patch.object(discovery.json, "dumps",
+                               _refusing_arguments(marker, json.dumps, TypeError)), \
+                mock.patch.object(discovery._OPENER, "open",
+                                  side_effect=AssertionError("the request was sent")), \
+                self.assertRaises(TypeError) as caught:
+            discovery.post(ENTRY, message)
+        self.assertNotIsInstance(caught.exception, discovery.DiscoveryError)
+
+
 class MalformedEntryTests(unittest.TestCase):
     """A tool entry of the wrong shape is dropped or read conservatively, and counted,
     at the read: on main a non-string name or non-object annotations raised past
@@ -604,6 +669,24 @@ class SecretPathTests(unittest.TestCase):
                 _json.dump({"token": "tok-abc"}, handle)
             discovery = load_discovery({"GATEWAY_SECRETS_DIR": secrets})
             self.assertEqual(discovery.read_secret("mcp-github"), "tok-abc")
+
+    def test_a_file_too_deep_to_parse_is_unreadable_not_an_escape(self):
+        # RecursionError is a RuntimeError, not a ValueError. On main it escaped
+        # `read_secret`, and through `post` reached `_run`'s catch-all as a call that
+        # may have run. Raised by a stand-in, so the proof does not depend on the
+        # interpreter's depth.
+        import tempfile
+        with tempfile.TemporaryDirectory() as secrets:
+            with open(f"{secrets}/mcp-github.json", "w", encoding="utf-8") as handle:
+                json.dump({"token": "tok-abc"}, handle)
+            discovery = load_discovery({"GATEWAY_SECRETS_DIR": secrets})
+            with mock.patch.object(discovery.json, "load",
+                                   side_effect=RecursionError("too deep")), \
+                    self.assertRaises(discovery.DiscoveryError) as caught:
+                discovery.read_secret("mcp-github")
+        self.assertIn(f"secret file {secrets}/mcp-github.json is unreadable",
+                      str(caught.exception))
+        self.assertEqual(caught.exception.kind, "transport-error")
 
     def test_a_name_that_is_not_a_dns_label_is_refused_before_it_becomes_a_path(self):
         # Validated at the point of USE, not only at registration. The control plane

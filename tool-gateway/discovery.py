@@ -225,7 +225,8 @@ def read_secret(server: str) -> str | None:
             data = json.load(handle)
     except FileNotFoundError:
         return None
-    except (OSError, ValueError) as exc:
+    # RecursionError: a file nested too deep to parse, a RuntimeError, not a ValueError.
+    except (OSError, ValueError, RecursionError) as exc:
         raise DiscoveryError(f"secret file {path} is unreadable: {exc}") from exc
     token = isinstance(data, dict) and data.get("token")
     if not token:
@@ -379,6 +380,27 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
 
 
+def _body(message: dict) -> bytes:
+    """THE ONE PLACE a JSON-RPC message for an upstream server becomes request bytes.
+
+    Every message the gateway sends upstream (``tools/list``, ``tools/call``, and any
+    handshake message) is encoded here before anything for it is dialled, and a call's
+    own message before any session handshake its path performs: a call too deep to
+    encode then opens nothing and dials nothing, and is a ``DiscoveryError`` (kind
+    ``transport-error``), recorded as never sent rather than as a call that may have
+    run.
+
+    RecursionError only, a RuntimeError rather than a ValueError: the messages are
+    built from parsed JSON, so a TypeError or ValueError here would be a gateway bug,
+    left to ``execute._run``'s catch-all."""
+    try:
+        return json.dumps(message).encode()
+    except RecursionError as exc:
+        raise DiscoveryError(
+            f"the message was nested too deeply to encode, so it was never sent, and "
+            f"sending the same arguments again will fail the same way ({exc})") from exc
+
+
 def post(entry: dict, message: dict, timeout: float | None = None) -> str:
     """One MCP request to the server a roster entry names, returning its raw reply body.
 
@@ -392,7 +414,9 @@ def post(entry: dict, message: dict, timeout: float | None = None) -> str:
     run on every call, so neither the name nor the endpoint can move the host —
     checked at this choke point rather than trusted from the roster that supplied them.
     The address it dials is decided here too, before the credential is read
-    (``_placed``)."""
+    (``_placed``). The message is encoded before anything is resolved or dialled
+    (``_body``), and one too deep to encode is a ``DiscoveryError``, never sent."""
+    data = _body(message)
     server = entry.get("server")
     port, path = check_endpoint(entry.get("endpoint"))
     address = _placed(server, port)
@@ -408,7 +432,7 @@ def post(entry: dict, message: dict, timeout: float | None = None) -> str:
     host = f"[{address}]" if ":" in address else address
     request = urllib.request.Request(
         f"http://{host}:{port}{path}",
-        data=json.dumps(message).encode(), headers=headers)
+        data=data, headers=headers)
     # Resolved once, because the timeout REFUSAL names it: a record saying "no answer
     # within None" would be worse than one that said nothing.
     deadline = TIMEOUT if timeout is None else timeout

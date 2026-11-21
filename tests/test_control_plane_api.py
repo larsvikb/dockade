@@ -4257,6 +4257,14 @@ def _edit_tool_rule(rule_id, action, request=None, seen=None):
         request if request is not None else _FakeRequest())
 
 
+# Invented token-shaped fixtures: a 24-character run of letters and digits, a
+# 40-hex key, and a `ghp_`-shaped token of GitHub's length.
+_RUN = "Zq7Wm2Kd9Rt4Lp8Vs3Nb6Hc5"
+_ALNUM = "acme0widgets1acme2widget"
+_HEX40 = "0123456789abcdef0123456789abcdef01234567"
+_GHP = "ghp_" + "acme" * 9
+
+
 class McpServerRegistrationTests(_CPTestCase):
     """``/api/mcp/servers`` — the half of server configuration the control plane owns.
 
@@ -4411,15 +4419,137 @@ class McpServerRegistrationTests(_CPTestCase):
                 self.assertNotIn("MARKER", detail)
                 self.assertIsNone(self._row("mcp-x"))
 
-    def test_the_character_check_runs_before_the_one_that_quotes_the_template(self):
-        # The placeholder-count message quotes the template, so a template wrong both
-        # ways must meet the character check first.
-        for template in ("Bearer MARKER\nx", "{secret} MARKER\x00 {secret}"):
+    def test_no_refusal_quotes_the_header_name_or_the_template(self):
+        # MARKER stands for a token pasted into the wrong field: one value per refusal
+        # that sees the header name or the template, and none of them may echo it
+        # back. The template over its ceiling matters most: a pasted JWT meets that
+        # check first.
+        cases = (("oauth", "X-MARKER", "Bearer MARKER {secret}"),
+                 ("none", "X-MARKER", ""),
+                 ("none", "", "Bearer MARKER {secret}"),
+                 ("header", "X-MARKER_Key", "Bearer {secret}"),
+                 ("header", "MARKER-" + "a-" * 29, "Bearer {secret}"),
+                 ("header", "X-MARKER" + "0" * 18, "Bearer {secret}"),
+                 ("header", "X-MARKER", ""),
+                 ("header", "Authorization", "Bearer MARKER " + "x " * 100 + "{secret}"),
+                 ("header", "Authorization", "Bearer MARKER\nx"),
+                 ("header", "Authorization", f"Bearer MARKER {_RUN} {{secret}}"),
+                 ("header", "Authorization", "Bearer MARKER"),
+                 ("header", "Authorization", "{secret} MARKER {secret}"))
+        for auth_type, header, template in cases:
+            with self.subTest(auth_type=auth_type, header=header, template=template):
+                resp = _register(server="mcp-x", auth_type=auth_type,
+                                 auth_header=header, auth_template=template)
+                self.assertEqual(resp.status_code, 400)
+                self.assertNotIn("MARKER", resp.body["detail"])
+
+    def test_a_template_holding_a_token_run_is_refused_naming_only_its_place(self):
+        # Before the placeholder, after it, and with none: that one proves this
+        # refusal fired, not the placeholder count's. Of two runs, the first is named.
+        for template, position in ((f"Bearer {_RUN} {{secret}}", 8),
+                                   (f"{{secret}} {_RUN}", 10),
+                                   (f"Bearer {_RUN}", 8),
+                                   (f"Bearer {_RUN} {'b' * 30} {{secret}}", 8)):
             with self.subTest(template=template):
                 resp = _register(server="mcp-x", auth_type="header",
                                  auth_header="Authorization", auth_template=template)
                 self.assertEqual(resp.status_code, 400)
-                self.assertNotIn("MARKER", resp.body["detail"])
+                detail = resp.body["detail"]
+                self.assertIn(f"a run of 24 credential characters at character "
+                              f"{position} of the trimmed template", detail)
+                self.assertIn("MCP_SECRETS", detail)
+                self.assertNotIn(_RUN, detail)
+                self.assertIsNone(self._row("mcp-x"))
+
+    def test_each_credential_punctuation_character_continues_a_run(self):
+        # The run reaches 24 only if the character in its middle counts.
+        for ch in "+/=_-.~":
+            with self.subTest(char=ch):
+                self.assertEqual(
+                    cp.policy._auth_descriptor_error(
+                        "header", "Authorization",
+                        "a" * 12 + ch + "b" * 11 + " {secret}"),
+                    "the template has a run of 24 credential characters at character "
+                    "1 of the trimmed template, a credential's shape and not a "
+                    "scheme's; the secret goes in the server's file under MCP_SECRETS, "
+                    "and the template takes {secret} where it goes")
+
+    def test_a_template_short_of_a_token_run_saves(self):
+        # 23 is under the bound; the braces end a run, so 20 either side of the
+        # placeholder are two runs; and the alphabet is ASCII, so a latin-1 letter
+        # ends a run where `\w` would continue it.
+        for template in ("a" * 23 + " {secret}", "Bearer {secret}", "Basic {secret}",
+                         "token {secret}", "SharedAccessSignature {secret}",
+                         "{secret}", "a" * 20 + "{secret}" + "b" * 20,
+                         "a" * 12 + "\u00e9" + "b" * 11 + " {secret}"):
+            with self.subTest(template=template):
+                self.assertIsNone(cp.policy._auth_descriptor_error(
+                    "header", "Authorization", template))
+
+    def test_a_header_name_holding_a_token_run_is_refused_naming_only_its_place(self):
+        # At its start, between hyphens, at its end, and the whole name.
+        for header, position, length in (("0123456789abcdef" * 2 + "-Key", 1, 32),
+                                         (f"X-{_ALNUM}-Key", 3, 24),
+                                         (f"X-{_ALNUM}", 3, 24),
+                                         (_HEX40, 1, 40)):
+            with self.subTest(header=header):
+                detail = cp.policy._auth_descriptor_error("header", header,
+                                                          "Bearer {secret}")
+                self.assertEqual(
+                    detail,
+                    f"the header name has a run of {length} letters and digits at "
+                    f"character {position} of the trimmed name, a credential's shape "
+                    f"and not a header name's; the secret goes in the server's file "
+                    f"under MCP_SECRETS")
+
+    def test_a_header_name_short_of_a_token_run_saves(self):
+        # `-` ends a run in a name: under the template's alphabet
+        # Ocp-Apim-Subscription-Key is one run of 25.
+        for header in ("a" * 23, "Authorization", "X-Api-Key", "X-Shopify-Access-Token",
+                       "Ocp-Apim-Subscription-Key", "a" * 23 + "-" + "b" * 23):
+            with self.subTest(header=header):
+                self.assertIsNone(cp.policy._auth_descriptor_error(
+                    "header", header, "Bearer {secret}"))
+
+    def test_a_header_name_of_the_wrong_shape_is_refused_quoting_nothing(self):
+        for ch in ("_", " ", ".", "+", "/", "=", "\r"):
+            with self.subTest(char=f"U+{ord(ch):04X}"):
+                self.assertEqual(
+                    cp.policy._auth_descriptor_error(
+                        "header", f"X-MARKER{ch}Key", "Bearer {secret}"),
+                    f"the header name has U+{ord(ch):04X} at character 9 of the "
+                    f"trimmed name; a header name takes ASCII letters, digits and "
+                    f"'-', at most 64 characters")
+        # 64 is the bound, so 64 saves and 65 is refused by its length.
+        self.assertIsNone(cp.policy._auth_descriptor_error(
+            "header", "MARKER" + "-a" * 29, "Bearer {secret}"))
+        self.assertEqual(
+            cp.policy._auth_descriptor_error("header", "MARKER-" + "a-" * 29,
+                                             "Bearer {secret}"),
+            "the header name is 65 characters; a header name takes ASCII letters, "
+            "digits and '-', at most 64 characters")
+        # Both faults: the character is the one reported.
+        self.assertIn("U+005F at character 7", cp.policy._auth_descriptor_error(
+            "header", "MARKER_" + "a-" * 30, "Bearer {secret}"))
+
+    def test_a_token_pasted_into_either_field_is_neither_stored_nor_audited(self):
+        # The `ghp_` name meets the format refusal, by its `_`, before the run check
+        # sees it; the hex name meets the run refusal.
+        cases = ((_GHP, "Bearer {secret}", "U+005F at character 4"),
+                 (_HEX40, "Bearer {secret}", "a run of 40 letters and digits"),
+                 ("Authorization", f"Bearer {_GHP} {{secret}}",
+                  "a run of 40 credential characters"))
+        for header, template, said in cases:
+            with self.subTest(header=header, template=template), \
+                    mock.patch.object(cp.store, "_audit") as audited:
+                resp = _register(auth_type="header", auth_header=header,
+                                 auth_template=template)
+                self.assertEqual(resp.status_code, 400)
+                self.assertIn(said, resp.body["detail"])
+                self.assertNotIn(_GHP, resp.body["detail"])
+                self.assertNotIn(_HEX40, resp.body["detail"])
+                self.assertIsNone(self._row())
+                audited.assert_not_called()
 
     def test_a_printable_latin1_template_still_saves(self):
         # The ceiling is latin-1, not ASCII: http.client encodes a value as latin-1.
@@ -4432,8 +4562,8 @@ class McpServerRegistrationTests(_CPTestCase):
                 self.assertEqual(self._row(f"mcp-{i}")["auth_template"], template)
 
     def test_a_header_name_with_an_unsendable_character_is_refused(self):
-        # No new code holds this: _HEADER_RE admits only ASCII letters, digits and
-        # '-'. Pinned so a widening of it cannot reopen the hole.
+        # No new code holds this: _HEADER_CHARS admits only ASCII letters, digits
+        # and '-'. Pinned so a widening of it cannot reopen the hole.
         resp = _register(auth_type="header", auth_header="Author\rization",
                          auth_template="Bearer {secret}")
         self.assertEqual(resp.status_code, 400)
@@ -4593,6 +4723,79 @@ class McpServerEditTests(_CPTestCase):
                                   **changed), _FakeRequest())
                 self.assertEqual(resp.status_code, 400)
                 self.assertEqual(self._row(), before)
+
+    def test_a_token_in_either_field_is_refused_even_disabling(self):
+        for enabled in (False, True):
+            for header, template in ((_GHP, "Bearer {secret}"),
+                                     (_HEX40, "Bearer {secret}"),
+                                     ("Authorization", f"Bearer {_GHP} {{secret}}")):
+                with self.subTest(enabled=enabled, header=header, template=template), \
+                        mock.patch.object(cp.store, "_audit") as audited:
+                    before = self._row()
+                    resp = cp.api_mcp.edit_mcp_server(
+                        "mcp-github",
+                        _edit_request(enabled=enabled, auth_type="header",
+                                      auth_header=header, auth_template=template),
+                        _FakeRequest())
+                    self.assertEqual(resp.status_code, 400)
+                    self.assertNotIn(_GHP, resp.body["detail"])
+                    self.assertNotIn(_HEX40, resp.body["detail"])
+                    self.assertEqual(self._row(), before)
+                    audited.assert_not_called()
+
+    def test_a_stored_token_can_still_be_disabled_and_is_not_audited(self):
+        # Rows stored before the run check: the echo still switches them off, and the
+        # audit row records that the fields stayed, not what they hold.
+        for header, template in ((_HEX40, "Bearer {secret}"),
+                                 ("Authorization", f"Bearer {_GHP} {{secret}}")):
+            with self.subTest(header=header, template=template):
+                with cp.store._connect() as conn:
+                    conn.execute(
+                        "UPDATE mcp_servers SET enabled=1, auth_type='header', "
+                        "auth_header=?, auth_template=? WHERE server=?",
+                        (header, template, "mcp-github"))
+                    conn.commit()
+                with mock.patch.object(cp.store, "_audit") as audited:
+                    resp = cp.api_mcp.edit_mcp_server(
+                        "mcp-github",
+                        _edit_request(enabled=False, auth_type="header",
+                                      auth_header=header, auth_template=template),
+                        _FakeRequest())
+                self.assertEqual(resp.status_code, 200)
+                self.assertEqual(self._row()["enabled"], 0)
+                reason = audited.call_args[1]["reason"]
+                self.assertIn("(header unchanged, template unchanged)", reason)
+                self.assertNotIn(_HEX40, reason)
+                self.assertNotIn(_GHP, reason)
+
+    def test_the_audit_says_which_descriptor_field_changed(self):
+        # A `none` server stores NULL for both fields and the request sends "", which
+        # is no change.
+        with mock.patch.object(cp.store, "_audit") as audited:
+            resp = cp.api_mcp.edit_mcp_server("mcp-github", _edit_request(enabled=True),
+                                              _FakeRequest())
+        self.assertTrue(resp.body["changed"])
+        self.assertIn("(header unchanged, template unchanged)",
+                      audited.call_args[1]["reason"])
+        cp.api_mcp.edit_mcp_server(
+            "mcp-github", _edit_request(enabled=False, auth_template="Bearer {secret}",
+                                        **self._HEADER), _FakeRequest())
+        for edit, said in (
+                ({"auth_template": "token {secret}", **self._HEADER},
+                 "(header unchanged, template changed)"),
+                ({"auth_type": "header", "auth_header": "X-Token",
+                  "auth_template": "token {secret}"},
+                 "(header changed, template unchanged)"),
+                ({"auth_type": "header", "auth_header": "X-Token",
+                  "auth_template": "token {secret}", "enabled": True},
+                 "(header unchanged, template unchanged)")):
+            with self.subTest(said=said), \
+                    mock.patch.object(cp.store, "_audit") as audited:
+                resp = cp.api_mcp.edit_mcp_server(
+                    "mcp-github", _edit_request(**{"enabled": False, **edit}),
+                    _FakeRequest())
+                self.assertTrue(resp.body["changed"])
+                self.assertIn(said, audited.call_args[1]["reason"])
 
     def test_an_invalid_edit_of_an_unknown_server_is_a_404(self):
         resp = cp.api_mcp.edit_mcp_server(

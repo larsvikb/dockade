@@ -26,6 +26,7 @@ import json
 import math
 import os
 import re
+import string
 import time
 
 import store
@@ -478,8 +479,21 @@ _SERVER_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 _TOOL_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 # An HTTP field name, narrower than the RFC's token: the characters a header an
 # operator would actually configure is spelled with.
-_HEADER_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+_HEADER_CHARS = string.ascii_letters + string.digits + "-"
+_HEADER_MAX_LEN = 64
 _TEMPLATE_MAX_LEN = 200
+# A run this long of the characters a credential is written in is a pasted token, not
+# a scheme or a header name: above the longest scheme names in practice (Azure's
+# `SharedAccessSignature`, 21; Zoho's `Zoho-oauthtoken` and Klaviyo's
+# `Klaviyo-API-Key`, 15) and the longest word of a header name (`Authorization`, 13),
+# and at or below common credentials (a 32-hex key, a UUID, GitHub's 40, a JWT).
+_TOKEN_RUN_MIN = 24
+# Spelled out in ASCII, never `\w` or `isalnum`, which count the latin-1 letters a
+# template may hold. A template's alphabet is base64, base64url, hex and JWT's; a
+# header name's is letters and digits only, because '-' joins a header's words, and
+# `Ocp-Apim-Subscription-Key` is one run of 25 if it counts.
+_TEMPLATE_TOKEN_CHARS = string.ascii_letters + string.digits + "+/=_-.~"
+_HEADER_TOKEN_CHARS = string.ascii_letters + string.digits
 # Where a server listens. The gateway appends the path straight after the port, so a
 # path is held to segments of unreserved characters: nothing in it can end the
 # authority ('@', '?', '#', '\'), and nothing can be decoded into something that does
@@ -514,6 +528,15 @@ def _unsendable_char(value: str) -> tuple[int, str] | None:
     return None
 
 
+def _token_run(value: str, alphabet: str) -> tuple[int, int] | None:
+    """The first run of at least ``_TOKEN_RUN_MIN`` characters of ``alphabet`` in
+    ``value``, as its position counted from 1 and its length, or None."""
+    run = re.search(f"[{re.escape(alphabet)}]{{{_TOKEN_RUN_MIN},}}", value)
+    if run is None:
+        return None
+    return run.start() + 1, len(run.group())
+
+
 def _server_name_error(server: str) -> str | None:
     """Why ``server`` cannot be a server name, or None if it can.
 
@@ -533,14 +556,21 @@ def _server_name_error(server: str) -> str | None:
 def _auth_descriptor_error(auth_type: str, header: str, template: str) -> str | None:
     """Why an auth descriptor cannot be stored, or None if it can.
 
-    Three refusals carry real weight. A ``header`` descriptor with no
+    Four refusals carry real weight. A ``header`` descriptor with no
     ``{secret}`` placeholder builds a header with no credential in it, and the
     upstream answer to that is a 401 — indistinguishable, from the UI, from a policy
     problem or an expired token. A template with a character no header value may
-    hold (``_unsendable_char``) is refused naming only its code point and position,
-    before any message that quotes the template: a token pasted into it would
-    otherwise be echoed back. And a ``none`` descriptor carrying header fields is
-    configuration that says two things at once, so neither is the source of truth."""
+    hold (``_unsendable_char``) is refused naming only its code point and position.
+    A header name or template holding a run shaped like a token (``_token_run``) is
+    refused naming only the run's position and length, so a credential pasted into
+    the wrong field is not stored, audited and backed up. And a ``none`` descriptor
+    carrying header fields is configuration that says two things at once, so neither
+    is the source of truth.
+
+    No refusal quotes the header name or the template: a token pasted into either
+    would otherwise be echoed back. Positions are counted on the values as stored,
+    which the route has stripped: Python's strip also takes U+001C-U+001F and U+0085,
+    which a browser's trim leaves."""
     if auth_type not in AUTH_TYPES:
         return (f"auth type must be one of {', '.join(AUTH_TYPES)}, "
                 f"not {auth_type!r}")
@@ -551,9 +581,21 @@ def _auth_descriptor_error(auth_type: str, header: str, template: str) -> str | 
         return None
     if not header:
         return "a 'header' auth type needs the header name to set"
-    if not _HEADER_RE.fullmatch(header):
-        return (f"{header!r} is not a header name — expected letters, digits and '-', "
-                f"at most 64 characters")
+    header_shape = (f"a header name takes ASCII letters, digits and '-', at most "
+                    f"{_HEADER_MAX_LEN} characters")
+    for position, ch in enumerate(header, 1):
+        if ch not in _HEADER_CHARS:
+            return (f"the header name has U+{ord(ch):04X} at character {position} of "
+                    f"the trimmed name; {header_shape}")
+    if len(header) > _HEADER_MAX_LEN:
+        return f"the header name is {len(header)} characters; {header_shape}"
+    run = _token_run(header, _HEADER_TOKEN_CHARS)
+    if run is not None:
+        position, length = run
+        return (f"the header name has a run of {length} letters and digits at "
+                f"character {position} of the trimmed name, a credential's shape "
+                f"and not a header name's; the secret goes in the server's file "
+                f"under MCP_SECRETS")
     if not template:
         return (f"a 'header' auth type needs a template containing "
                 f"{SECRET_PLACEHOLDER}")
@@ -563,13 +605,19 @@ def _auth_descriptor_error(auth_type: str, header: str, template: str) -> str | 
     bad = _unsendable_char(template)
     if bad is not None:
         position, ch = bad
-        # Counted on the template as stored, which the route has stripped: Python's
-        # strip also takes U+001C-U+001F and U+0085, which a browser's trim leaves.
         return (f"the template has U+{ord(ch):04X} at character {position} of the "
                 f"trimmed template; a header value takes printable latin-1 only")
+    run = _token_run(template, _TEMPLATE_TOKEN_CHARS)
+    if run is not None:
+        position, length = run
+        return (f"the template has a run of {length} credential characters at "
+                f"character {position} of the trimmed template, a credential's "
+                f"shape and not a scheme's; the secret goes in the server's file "
+                f"under MCP_SECRETS, and the template takes {SECRET_PLACEHOLDER} "
+                f"where it goes")
     if template.count(SECRET_PLACEHOLDER) != 1:
         return (f"the template must contain {SECRET_PLACEHOLDER} exactly once, so the "
-                f"gateway has one place to put the secret — {template!r} has "
+                f"gateway has one place to put the secret — it has "
                 f"{template.count(SECRET_PLACEHOLDER)}")
     return None
 

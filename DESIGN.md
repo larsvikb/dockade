@@ -1669,7 +1669,11 @@ neither is the source of truth.
 **Where the material lives:** one file per server on the host, outside this repo,
 `~/.config/dockade/secrets/` at 0700 with files at 0600 — not in a Docker volume, not
 in the policy store, not in the image, not in git. Hence a property worth having
-explicitly: **a crown-jewel backup never contains a credential.**
+explicitly: **a crown-jewel backup never contains a credential.** That does not rest
+on the operator never pasting a token into the descriptor: the store refuses a header
+name or template holding a run shaped like one (`policy._token_run`), and none of the
+control plane's refusals or audit rows quotes either field. A token short of the run
+length is still stored, but no refusal or audit row of the control plane repeats it.
 
 **Delivered as a read-only bind mount of the directory, deliberately not compose
 `secrets:`.** A `secrets:` entry whose `file:` source is absent fails at `up` time for

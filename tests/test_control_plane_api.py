@@ -2572,8 +2572,9 @@ class AuditRecordTests(_CPTestCase):
              # the columns above.
              "server", "tool", "approval_id",
              # And how it ended, for the tool rows the gateway's stream fills, with
-             # what it returned as the gateway measured it.
-             "status", "result_bytes", "result_sha256", "duration"})
+             # what it returned as the gateway measured it, and which handle named
+             # its card.
+             "status", "result_bytes", "result_sha256", "duration", "settled_by"})
         self.assertEqual(row["url"], "https://a.example/x")
 
     def test_a_tool_outcome_serves_its_result_facts(self):
@@ -3714,7 +3715,7 @@ class ConfigViewTests(_CPTestCase):
         # stay here.
         self.assertEqual(set(cp.api_views.api_config()),
                          {"hold_timeout", "lease_seconds", "pin_lease_seconds",
-                          "client_classes"})
+                          "tool_outcome_wait", "client_classes"})
 
 
 class SaturationTests(_CPTestCase):
@@ -3819,7 +3820,7 @@ class SaturationTests(_CPTestCase):
     def test_the_payload_carries_the_holds_and_the_pressure_together(self):
         _hold("a.example", "held-1")
         payload = cp.api_approvals.approvals()
-        self.assertEqual(set(payload), {"holds", "saturation", "withdrawn"})
+        self.assertEqual(set(payload), {"holds", "saturation", "withdrawn", "granted"})
         self.assertEqual([h["id"] for h in payload["holds"]], ["held-1"])
         self.assertEqual(payload["saturation"]["in_flight"], 1)
         # Both global caps travel, because either can be the one about to fire and the
@@ -7218,6 +7219,282 @@ class WithdrawnPayloadTests(_ToolBridgeTestCase):
         self.assertEqual(calls, ["queue", "withdrawn"])
 
 
+def _outcome(approval_id, status="ok", server="mcp-github", settled_by="resume",
+             reason=None, result_bytes=None, duration=None):
+    """An outcome row as ingest stores one, named to ``approval_id`` by the handle
+    ``settled_by`` says (``ingest._settle_tool_row``; that marking has its own tests
+    in test_control_plane_ingest.py)."""
+    with cp.store._connect() as conn:
+        conn.execute(
+            "INSERT INTO audit(ts, kind, stage, server, tool, approval_id, status, "
+            "reason, result_bytes, duration, settled_by) "
+            "VALUES (?, 'outcome', 'tool-result', ?, 'create_pull_request', ?, ?, ?, "
+            "?, ?, ?)",
+            (time.time(), server, approval_id, status, reason, result_bytes, duration,
+             settled_by))
+        conn.commit()
+
+
+class GrantedPayloadTests(_ToolBridgeTestCase):
+    """The pending payload's ``granted`` list: how each tool ask a human allowed lately
+    stands, which its card on the page waits on (``holds._list_granted``)."""
+
+    def setUp(self):
+        super().setUp()
+        self.rule_id = _tool_rule("create_pull_request", "ask").body["id"]
+        self.n = 0
+
+    def _ask(self, client=CLASS_IP):
+        self.n += 1
+        return _ask_id(_tool_call(tool="create_pull_request",
+                                  args={"owner": "acme", "n": self.n}, client=client))
+
+    def _allowed(self, action="allow", **fields):
+        ask = self._ask()
+        self.assertEqual(_resolve(ask, action, **fields).status_code, 200)
+        return ask
+
+    @staticmethod
+    def _set(approval_id, **columns):
+        with cp.store._connect() as conn:
+            for column, value in columns.items():
+                conn.execute(f"UPDATE tool_approvals SET {column}=? WHERE id=?",  # noqa: S608
+                             (value, approval_id))                # a test's own name
+            conn.commit()
+
+    @staticmethod
+    def _column(approval_id, column):
+        with cp.store._connect() as conn:
+            return conn.execute(f"SELECT {column} FROM tool_approvals WHERE id=?",  # noqa: S608
+                                (approval_id,)).fetchone()[0]     # a test's own name
+
+    @staticmethod
+    def _granted():
+        return cp.holds._pending_payload()["granted"]
+
+    def _entry(self, approval_id):
+        [entry] = [e for e in self._granted() if e["id"] == approval_id]
+        return entry
+
+    def _deny_by_policy(self):
+        cp.api_mcp.revoke_mcp_rule(self.rule_id, _FakeRequest())
+        self.rule_id = _tool_rule("create_pull_request", "deny").body["id"]
+
+    # ── each state, with exactly its keys ─────────────────────────────────────
+
+    def test_waiting_until_the_grant_lapses(self):
+        ask = self._allowed()
+        self.assertEqual(self._entry(ask), {
+            "id": ask, "pinned": False, "state": "waiting",
+            "ends_at": self._column(ask, "resolved_at") + cp.holds.TOOL_GRANT_TIMEOUT})
+
+    def test_running_once_claimed(self):
+        ask = self._allowed()
+        self.assertTrue(_claim(ask).body["ok"])
+        self.assertEqual(self._entry(ask), {
+            "id": ask, "pinned": False, "state": "running",
+            "claimed_at": self._column(ask, "claimed_at")})
+
+    def test_ended_with_the_rows_store_fields(self):
+        ask = self._allowed()
+        _claim(ask)
+        _outcome(ask, status="tool-error", reason="<b>x</b>", result_bytes=12,
+                 duration=0.5)
+        self.assertEqual(self._entry(ask), {
+            "id": ask, "pinned": False, "state": "ended", "status": "tool-error",
+            "reason": "<b>x</b>", "result_bytes": 12, "duration": 0.5})
+
+    def test_withdrawn_after_the_allow(self):
+        ask = self._allowed()
+        self.assertEqual(_withdraw(ask).status_code, 200)
+        self.assertEqual(self._entry(ask),
+                         {"id": ask, "pinned": False, "state": "withdrawn"})
+
+    def test_lapsed_with_no_earlier_expiry_pass(self):
+        # Nothing reads the ask between the lapse and the payload, so only the queue's
+        # own expiry pass, run before this list is built, can make it read as lapsed.
+        ask = self._allowed()
+        with mock.patch.object(cp.holds, "TOOL_GRANT_TIMEOUT", 10.0):
+            self._set(ask, resolved_at=time.time() - 11)
+            self.assertEqual(self._entry(ask),
+                             {"id": ask, "pinned": False, "state": "lapsed"})
+
+    def test_refused_once_a_claim_is_refused_by_policy_then_running_once_one_lands(self):
+        ask = self._allowed()
+        self._deny_by_policy()
+        self.assertIs(_claim(ask).body["by_policy"], True)
+        self.assertEqual(self._entry(ask),
+                         {"id": ask, "pinned": False, "state": "refused"})
+        # The first refusal's time is the one kept.
+        first = self._column(ask, "refused_at")
+        with mock.patch.object(cp.holds.time, "time", return_value=first + 5):
+            _claim(ask)
+        self.assertEqual(self._column(ask, "refused_at"), first)
+        # Policy allows again and the agent's next claim lands: the call runs.
+        cp.api_mcp.revoke_mcp_rule(self.rule_id, _FakeRequest())
+        _tool_rule("create_pull_request", "ask")
+        self.assertTrue(_claim(ask).body["ok"])
+        self.assertEqual(self._entry(ask)["state"], "running")
+
+    def test_a_refusal_that_leaves_the_ask_claimable_is_not_a_refusal(self):
+        # A foreign caller's claim, and the operator's id presented as a handle, are
+        # refused with a `deny` row too, but the agent can still claim.
+        ask = self._allowed()
+        self.assertEqual(_claim(ask, client="172.30.0.137").status_code, 404)
+        self.assertEqual(_claim_with(ask).status_code, 404)
+        self.assertEqual(self._entry(ask)["state"], "waiting")
+        self.assertIsNone(self._column(ask, "refused_at"))
+
+    def test_a_refusal_is_not_stamped_on_a_claimed_or_closed_ask(self):
+        # The stamp is conditional as the claim is, so a claim that landed after the
+        # refusal's read keeps its card running, and an ask closed since keeps its own
+        # word in the record.
+        claimed = self._allowed()
+        _claim(claimed)
+        withdrawn = self._allowed()
+        _withdraw(withdrawn)
+        for ask in (claimed, withdrawn):
+            cp.holds._mark_refused(ask)
+            self.assertIsNone(self._column(ask, "refused_at"))
+        self.assertEqual(self._entry(claimed)["state"], "running")
+
+    # ── which outcome row is the card's ───────────────────────────────────────
+
+    def test_an_unsettled_row_alone_leaves_it_running_until_the_call_row(self):
+        ask = self._allowed()
+        _claim(ask)
+        _outcome(ask, status="transport-error", server=cp.holds.UNSETTLED_SERVER)
+        self.assertEqual(self._entry(ask)["state"], "running")
+        _outcome(ask, status="timeout")
+        self.assertEqual(self._entry(ask)["status"], "timeout")
+        # A later unsettled row, a second resume's, does not undo the call's.
+        _outcome(ask, status="transport-error", server=cp.holds.UNSETTLED_SERVER)
+        self.assertEqual(self._entry(ask)["status"], "timeout")
+
+    def test_a_pins_call_row_is_not_the_cards(self):
+        ask = self._allowed()
+        _outcome(ask, status="rpc-error", settled_by=None)
+        self.assertEqual(self._entry(ask)["state"], "waiting")
+
+    def test_the_latest_call_row_is_the_one(self):
+        ask = self._allowed()
+        _claim(ask)
+        _outcome(ask, status="rpc-error")
+        _outcome(ask, status="ok")
+        self.assertEqual(self._entry(ask)["status"], "ok")
+
+    def test_an_outcome_of_another_card_is_not_this_ones(self):
+        ask, other = self._allowed(), self._allowed()
+        _outcome(other, status="ok")
+        self.assertEqual(self._entry(ask)["state"], "waiting")
+
+    # ── which asks are listed ────────────────────────────────────────────────
+
+    def test_absent_unless_a_human_allowed_it(self):
+        denied = self._ask()
+        _resolve(denied, "deny")
+        unanswered = self._ask()
+        self._set(unanswered, deadline=time.time() - 1)
+        withdrawn = self._ask()
+        _withdraw(withdrawn)
+        retired = self._ask()
+        pending = self._ask()
+        self._deny_by_policy()
+        self.assertIs(_claim(retired).body["by_policy"], True)
+        self.assertEqual(
+            [self._column(a, "status") for a in (denied, unanswered, withdrawn, retired,
+                                                 pending)],
+            ["denied", "expired", "withdrawn", "expired", "pending"])
+        self.assertEqual(self._granted(), [])
+
+    def test_listed_within_twice_the_wait(self):
+        ask = self._allowed()
+        wait = cp.holds.TOOL_OUTCOME_WAIT
+        # Inside: past one wait, so a page that saw the allow late still finds it.
+        self._set(ask, resolved_at=time.time() - 1.5 * wait)
+        with mock.patch.object(cp.holds, "TOOL_GRANT_TIMEOUT", 3 * wait):
+            self.assertEqual([e["id"] for e in self._granted()], [ask])
+            self._set(ask, resolved_at=time.time() - 2.5 * wait)
+            self.assertEqual(self._granted(), [])
+
+    def test_newest_first_and_capped_at_the_tool_card_cap(self):
+        asks = [self._allowed() for _ in range(3)]
+        now = time.time()
+        for age, ask in zip((30, 20, 10), asks):
+            self._set(ask, resolved_at=now - age)
+        self.assertEqual([e["id"] for e in self._granted()], asks[::-1])
+        with mock.patch.object(cp.holds, "MAX_TOOL_PENDING", 2):
+            self.assertEqual([e["id"] for e in self._granted()], [asks[2], asks[1]])
+        # A negative SQLite LIMIT means no limit.
+        with mock.patch.object(cp.holds, "MAX_TOOL_PENDING", -1):
+            self.assertEqual(self._granted(), [])
+
+    def test_pinned_while_a_live_pin_from_the_card_stands(self):
+        # Pinned on `n`, which differs per ask, so neither pin answers the next ask.
+        plain = self._allowed()
+        pinned = self._allowed("allow_pinned_lease", pins=["n"])
+        for_good = self._allowed("allow_pinned", pins=["n"])
+        self.assertEqual({e["id"]: e["pinned"] for e in self._granted()},
+                         {plain: False, pinned: True, for_good: True})
+        # Lapsed, a timed pin answers nothing, though the sweep has not taken it yet.
+        with cp.store._connect() as conn:
+            conn.execute("UPDATE tool_pins SET expires_at=? WHERE approval_id=?",
+                         (time.time() - 1, pinned))
+            conn.commit()
+        self.assertFalse(self._entry(pinned)["pinned"])
+
+    def test_idle_entries_are_unchanged_as_the_clock_moves(self):
+        # The stream emits on serialized change, so an entry that moved on its own
+        # would make every idle page a 1 Hz emitter.
+        self._allowed()
+        running, ended = self._allowed(), self._allowed()
+        _claim(running)
+        _claim(ended)
+        _outcome(ended)
+        first = json.dumps(self._granted(), sort_keys=True)
+        later = time.time() + 30
+        with mock.patch.object(cp.holds.time, "time", return_value=later):
+            self.assertEqual(json.dumps(self._granted(), sort_keys=True), first)
+        self.assertEqual({e["state"] for e in json.loads(first)},
+                         {"waiting", "running", "ended"})
+
+    def test_the_granted_list_is_read_after_the_queue(self):
+        calls = []
+        with mock.patch.object(cp.holds, "_list_tool_asks",
+                               lambda: calls.append("queue") or []), \
+                mock.patch.object(cp.holds, "_list_granted",
+                                  lambda: calls.append("granted") or []):
+            cp.holds._pending_payload()
+        self.assertEqual(calls, ["queue", "granted"])
+
+    def test_each_read_uses_its_index(self):
+        # Both tables are never pruned by default, and this runs once a second per
+        # listener. By index name only: the ORDER BY may add a temp B-tree.
+        ask = self._allowed("allow_pinned", pins=["owner"])
+        _outcome(ask)
+        statements = []
+        connect = cp.store._connect
+
+        def traced():
+            conn = connect()
+            conn.set_trace_callback(statements.append)
+            return conn
+
+        with mock.patch.object(cp.store, "_connect", traced):
+            cp.holds._list_granted()
+        reads = [q for q in statements if q.lstrip().upper().startswith("SELECT")]
+        self.assertEqual(len(reads), 3)
+        with cp.store._connect() as conn:
+            plans = [" | ".join(r["detail"] for r in conn.execute(
+                "EXPLAIN QUERY PLAN " + q)) for q in reads]
+        self.assertIn("tool_approvals_status_resolved", plans[0])
+        self.assertIn("audit_settled", plans[1])
+
+    def test_config_serves_the_wait(self):
+        with mock.patch.object(cp.holds, "TOOL_OUTCOME_WAIT", 75.0):
+            self.assertEqual(cp.api_views.api_config()["tool_outcome_wait"], 75.0)
+
+
 class WithdrawAuditTests(_ToolBridgeTestCase):
     """What a withdrawal leaves in the trail, asserted through the table."""
 
@@ -8288,7 +8565,8 @@ class FreshSchemaTests(_FreshStoreTestCase):
         self.assertEqual(cols, {"id", "ts", "server", "tool", "args_json",
                                 "args_digest", "client", "status", "deadline",
                                 "resolved_at", "resolved_by", "claimed_at",
-                                "schema_digest", "resume_token", "sandbox"})
+                                "schema_digest", "resume_token", "sandbox",
+                            "refused_at"})
 
     def test_new_store_has_the_mcp_server_table_and_no_secret_reference(self):
         # Asserted as an EXACT set, and the exactness is the assertion: a column
@@ -9479,7 +9757,8 @@ class ResultFactsMigrationTests(_FreshStoreTestCase):
         self._use_store("result-facts-agree-fresh.db")
         cp.store._init_db()
         self.assertEqual(migrated, self._audit_columns())
-        self.assertEqual([(c[1], c[2]) for c in migrated[-3:]],
+        self.assertEqual([(c[1], c[2]) for c in migrated
+                          if c[1] in ("result_bytes", "result_sha256", "duration")],
                          [("result_bytes", "INTEGER"), ("result_sha256", "TEXT"),
                           ("duration", "REAL")])
 
@@ -9542,7 +9821,7 @@ class AskSandboxMigrationTests(_FreshStoreTestCase):
         self._use_store("ask-sandbox-agree-fresh.db")
         cp.store._init_db()
         self.assertEqual(migrated, self._shape())
-        self.assertEqual(migrated[0][-1][1:3], ("sandbox", "TEXT"))
+        self.assertIn(("sandbox", "TEXT"), [c[1:3] for c in migrated[0]])
 
     def test_v15_leaves_a_store_that_has_the_column_alone(self):
         self._use_store("ask-sandbox-again.db")
@@ -9649,14 +9928,13 @@ class ScopedPinMigrationTests(_FreshStoreTestCase):
                 "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE tbl_name "
                 "IN ('tool_pins', 'leases', 'tool_approvals')"))
 
-    def test_v16_is_the_current_step(self):
-        self.assertEqual(cp.store.SCHEMA_VERSION, 16)
-        self.assertEqual(cp.store._STEPS[-1][:2], (16, "timed pins scoped to a sandbox"))
+    def test_v16_is_the_sixteenth_step(self):
+        self.assertEqual(cp.store._STEPS[15][:2], (16, "timed pins scoped to a sandbox"))
 
     def test_each_pin_is_copied_scoped_or_dropped(self):
         self._v15_store("scoped-pins-copy.db")
         cp.store._init_db()
-        self.assertEqual(self._rows("PRAGMA user_version"), [(16,)])
+        self.assertEqual(self._rows("PRAGMA user_version"), [(cp.store.SCHEMA_VERSION,)])
         self.assertEqual(
             self._rows("SELECT id, pins_json, approval_id, schema_digest, sandbox, "
                        "expires_at IS NULL FROM tool_pins ORDER BY id"),
@@ -9776,7 +10054,7 @@ class ScopedPinMigrationTests(_FreshStoreTestCase):
     def test_without_the_asks_table_the_store_boots(self):
         self._v15_store("scoped-pins-no-asks-boot.db", asks=False)
         cp.store._init_db()
-        self.assertEqual(self._rows("PRAGMA user_version"), [(16,)])
+        self.assertEqual(self._rows("PRAGMA user_version"), [(cp.store.SCHEMA_VERSION,)])
         self.assertEqual(self._rows("SELECT id FROM tool_pins"), [(2,)])
 
     def test_a_missing_sequence_row_is_made_from_the_largest_id(self):
@@ -9838,7 +10116,98 @@ class ScopedPinMigrationTests(_FreshStoreTestCase):
         self._v7_store("scoped-pins-from-v7.db", pins_table=True)
         cp.store._init_db()
         self.assertEqual(self._schema(), fresh)
-        self.assertEqual(self._rows("PRAGMA user_version"), [(16,)])
+        self.assertEqual(self._rows("PRAGMA user_version"), [(cp.store.SCHEMA_VERSION,)])
+
+
+class CardOutcomeMigrationTests(_FreshStoreTestCase):
+    """v17, what a tool card reads its call's ending from: ``audit.settled_by`` and
+    ``tool_approvals.refused_at``. Additive; every existing row keeps NULL."""
+
+    def _v16_store(self, name):
+        self._use_store(name)
+        cp.store._init_db()
+        # Each table as v16's DDL made it: today's, cut after its last v16 column.
+        # Rebuilt rather than DROP COLUMN, which cannot edit a definition holding
+        # comments.
+        with cp.store._connect() as conn:
+            for table, last in (("audit", r"duration(\s+)REAL"),
+                                ("tool_approvals", r"sandbox(\s+)TEXT")):
+                ddl = conn.execute("SELECT sql FROM sqlite_master WHERE name=?",
+                                   (table,)).fetchone()[0]
+                v16 = re.sub(last + r",.*\)\s*$",
+                             last.replace(r"(\s+)", r"\1") + "\n            )",
+                             ddl, flags=re.S)
+                self.assertNotRegex(v16, "settled_by|refused_at")
+                conn.execute(f"DROP TABLE {table}")
+                conn.execute(v16)
+            conn.execute("CREATE INDEX audit_ts ON audit(ts)")
+            for index in cp.store._TOOL_APPROVALS_INDEXES:
+                conn.execute(index)
+            conn.execute(
+                "INSERT INTO tool_approvals(id, ts, server, tool, args_json, "
+                "args_digest, status, deadline, resolved_at, resolved_by) VALUES "
+                "('a1', 0, 'mcp-github', 'get_me', '{}', 'd', 'allowed', 0.0, 1.0, "
+                "'operator')")
+            conn.execute("INSERT INTO audit(ts, kind, stage, server, tool, approval_id, "
+                         "status) VALUES (2.0, 'outcome', 'tool-result', 'mcp-github', "
+                         "'get_me', 'a1', 'ok')")
+            conn.execute("PRAGMA user_version = 16")
+            conn.commit()
+
+    @staticmethod
+    def _shape():
+        with cp.store._connect() as conn:
+            return {table: ([tuple(r) for r in conn.execute(f"PRAGMA table_info({table})")],
+                            sorted(tuple(r)[1:] for r in conn.execute(
+                                f"PRAGMA index_list({table})")))
+                    for table in ("audit", "tool_approvals")}
+
+    def test_v17_is_the_current_step(self):
+        self.assertEqual(cp.store.SCHEMA_VERSION, 17)
+        self.assertEqual(cp.store._STEPS[-1][:2],
+                         (17, "a tool card's outcome: settled_by and refused_at"))
+
+    def test_the_columns_are_added_as_null_and_the_rows_kept(self):
+        self._v16_store("card-outcome-migrate.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            outcome = tuple(conn.execute(
+                "SELECT approval_id, status, settled_by FROM audit").fetchone())
+            ask = tuple(conn.execute(
+                "SELECT id, status, refused_at FROM tool_approvals").fetchone())
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+        self.assertEqual((outcome, ask, version),
+                         (("a1", "ok", None), ("a1", "allowed", None), 17))
+
+    def test_a_migrated_and_a_fresh_store_agree(self):
+        self._v16_store("card-outcome-agree-migrated.db")
+        cp.store._init_db()
+        migrated = self._shape()
+        self._use_store("card-outcome-agree-fresh.db")
+        cp.store._init_db()
+        self.assertEqual(migrated, self._shape())
+        self.assertEqual(migrated["audit"][0][-1][1:3], ("settled_by", "TEXT"))
+        self.assertEqual(migrated["tool_approvals"][0][-1][1:3], ("refused_at", "REAL"))
+        self.assertIn(("audit_settled", 0, "c", 1), migrated["audit"][1])
+
+    def test_v17_leaves_a_store_that_has_the_columns_alone(self):
+        self._use_store("card-outcome-again.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            cp.store._step_17_card_outcome(conn)
+        shape = self._shape()
+        self.assertEqual([c[1] for c in shape["audit"][0]].count("settled_by"), 1)
+        self.assertEqual([c[1] for c in shape["tool_approvals"][0]].count("refused_at"),
+                         1)
+
+    def test_v17_skips_a_store_without_the_asks_table(self):
+        self._use_store("card-outcome-no-table.db")
+        with cp.store._connect() as conn:
+            for ddl in MigrationTests._OLD_SCHEMA:
+                conn.execute(ddl)
+            cp.store._step_17_card_outcome(conn)
+            self.assertEqual(cp.store._columns(conn, "tool_approvals"), set())
+            self.assertIn("settled_by", cp.store._columns(conn, "audit"))
 
 
 class CallTokenTableTests(_FreshStoreTestCase):

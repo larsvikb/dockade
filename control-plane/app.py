@@ -295,7 +295,8 @@ def _bootstrap() -> None:
           f"{holds.MAX_TOOL_PENDING_PER_CLIENT} per client (an ask withdrawn while "
           f"pending counts for {holds.TOOL_WITHDRAW_COOLDOWN:g}s more), ask window "
           f"{holds.TOOL_HOLD_TIMEOUT:g}s, grant window "
-          f"{holds.TOOL_GRANT_TIMEOUT:g}s, payload ceiling {holds.TOOL_ARGS_MAX}B",
+          f"{holds.TOOL_GRANT_TIMEOUT:g}s, payload ceiling {holds.TOOL_ARGS_MAX}B, "
+          f"an approved card waits {holds.TOOL_OUTCOME_WAIT:g}s for its outcome",
           flush=True)
     _warn_on_dead_caps()
 

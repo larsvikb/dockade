@@ -427,6 +427,16 @@ MAX_TOOL_PENDING_PER_CLIENT = int(
 # cap (DESIGN.md, "Retry pressure is contained by the caps"). 0 turns it off, and it
 # does nothing while the per-client cap is off.
 TOOL_WITHDRAW_COOLDOWN = float(os.environ.get("CONTROL_TOOL_WITHDRAW_COOLDOWN", "60"))
+# How long an approved tool card waits on the operator's page for its call's outcome
+# before it says the result will be in the record and goes (``_list_granted``). An env
+# var like the bounds above, and checked by its own test rather than
+# ``policy._grant_seconds``: it grants nothing, so a large value only keeps a card up
+# longer, and there is no ceiling to apply. Zero, a negative, NaN or infinity is refused
+# at import all the same, since a card with no usable wait has no deadline.
+TOOL_OUTCOME_WAIT = float(os.environ.get("CONTROL_TOOL_OUTCOME_WAIT", "120"))
+if not math.isfinite(TOOL_OUTCOME_WAIT) or TOOL_OUTCOME_WAIT <= 0:
+    raise ValueError(f"CONTROL_TOOL_OUTCOME_WAIT must be a finite number of seconds "
+                     f"above zero, not {TOOL_OUTCOME_WAIT!r}")
 # Ceiling on a payload this will store. REFUSED over it, not truncated as
 # ``store.DRAIN_MAX_FIELD`` truncates a URL: a truncated payload is shown to a human
 # as the thing they are approving, and the hidden tail is where anything worth hiding
@@ -1020,6 +1030,20 @@ def _retire_tool_ask(approval_id: str) -> bool:
     return bool(changed)
 
 
+def _mark_refused(approval_id: str) -> None:
+    """Record that a claim of this approved, unclaimed ask was refused by policy, so
+    its agent was told the call will not run (``api_tool._refused_by_policy``). The
+    first refusal's time is kept. Conditional on the ask still being approved and
+    unclaimed, as the claim's own predicate is, so a claim that has landed since is
+    not overwritten into a refusal on the operator's card."""
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE tool_approvals SET refused_at=COALESCE(refused_at, ?) "
+            "WHERE id=? AND status='allowed' AND claimed_at IS NULL",
+            (time.time(), approval_id))
+        conn.commit()
+
+
 def _list_tool_asks() -> list[dict]:
     """Pending asks, oldest first — the tool half of the operator's queue.
 
@@ -1071,9 +1095,86 @@ def _list_withdrawn() -> list[str]:
     return [r["id"] for r in rows]
 
 
+# The server an outcome row names when the gateway's claim got no usable answer
+# (tool-gateway/execute.py, ``_unsettled``), restated since that module is in another
+# image. Such a row is no call's ending: the claim may have landed, and the call it
+# released may still end in a row of its own.
+UNSETTLED_SERVER = "(unknown)"
+
+
+def _list_granted() -> list[dict]:
+    """How each tool ask a human ALLOWED lately stands, for its card on the page: the
+    card waits ``TOOL_OUTCOME_WAIT`` for its call's outcome (control-plane-ui/holds.js,
+    ``grantedStep``).
+
+    Allowed by a human is ``resolved_by`` set on a row not denied: still `allowed`,
+    `withdrawn` after the allow, or `expired` once its grant lapsed. Resolved within
+    twice the wait, so an entry outlives the deadline of a page that saw the allow
+    late; newest first, and capped at ``MAX_TOOL_PENDING`` as ``_list_withdrawn`` is.
+
+    Each entry is ``id``, ``pinned`` (a live pin was made from the card) and the first
+    state that applies, with its fields:
+
+    - ``ended``: the latest outcome row ingest named by the card's resume token
+      (``store`` ``audit.settled_by``) from a call that was dialled, so not one of
+      ``UNSETTLED_SERVER``; ``status``, ``reason``, ``result_bytes``, ``duration``;
+    - ``running``: claimed, ``claimed_at``;
+    - ``withdrawn``; ``lapsed``, the grant expired unclaimed;
+    - ``refused``: a claim was refused by policy (``_mark_refused``);
+    - ``waiting``: ``ends_at``, when the grant lapses.
+
+    Absolute values only, never an age, so the payload is byte-identical between
+    events and the stream stays quiet. Store fields only: the gateway's content file
+    and the result's hash stay off the page.
+
+    Expiry is NOT applied here: ``_pending_payload`` calls this after
+    ``_list_tool_asks``, whose pass has run."""
+    now = time.time()
+    with store._connect() as conn:
+        asks = conn.execute(
+            "SELECT id, status, resolved_at, claimed_at, refused_at FROM tool_approvals "
+            "WHERE status IN ('allowed', 'withdrawn', 'expired') "
+            "AND resolved_by IS NOT NULL AND resolved_at > ? "
+            "ORDER BY resolved_at DESC LIMIT ?",
+            (now - 2 * TOOL_OUTCOME_WAIT, max(MAX_TOOL_PENDING, 0))).fetchall()
+        if not asks:
+            return []
+        ids = [a["id"] for a in asks]
+        marks = ", ".join("?" * len(ids))
+        # Oldest first, so the latest row for a card is the one left in the dict.
+        ended = {r["approval_id"]: r for r in conn.execute(
+            f"SELECT approval_id, status, reason, result_bytes, duration "  # noqa: S608
+            f"FROM audit WHERE settled_by='resume' AND approval_id IN ({marks}) "
+            f"AND server IS NOT ? ORDER BY id", (*ids, UNSETTLED_SERVER))}
+        pinned = {r["approval_id"] for r in conn.execute(
+            f"SELECT approval_id FROM tool_pins WHERE approval_id IN ({marks}) "  # noqa: S608
+            f"AND (expires_at IS NULL OR expires_at > ?)", (*ids, now))}
+    entries = []
+    for ask in asks:
+        entry = {"id": ask["id"], "pinned": ask["id"] in pinned}
+        row = ended.get(ask["id"])
+        if row is not None:
+            entry.update(state="ended", status=row["status"], reason=row["reason"],
+                         result_bytes=row["result_bytes"], duration=row["duration"])
+        elif ask["claimed_at"] is not None:
+            entry.update(state="running", claimed_at=ask["claimed_at"])
+        elif ask["status"] == "withdrawn":
+            entry.update(state="withdrawn")
+        elif ask["status"] == "expired":
+            entry.update(state="lapsed")
+        elif ask["refused_at"] is not None:
+            entry.update(state="refused")
+        else:
+            entry.update(state="waiting",
+                         ends_at=ask["resolved_at"] + TOOL_GRANT_TIMEOUT)
+        entries.append(entry)
+    return entries
+
+
 def _pending_payload() -> dict:
     """What the approvals view needs, in one object: the holds, the hold-cap pressure
-    beside them, and the tool asks withdrawn from the queue (``_list_withdrawn``).
+    beside them, the tool asks withdrawn from the queue (``_list_withdrawn``), and how
+    the tool asks a human allowed lately stand (``_list_granted``).
 
     Not a second endpoint: the SSE stream already re-serializes this each second and
     emits on change, so a rejection reaches the banner within a second through the
@@ -1090,6 +1191,7 @@ def _pending_payload() -> dict:
     holds_and_asks.sort(key=lambda card: card["ts"])
     # Read AFTER the queue: a withdrawal landing between the two reads then puts an id
     # in both lists, which is harmless, rather than in neither, which would leave its
-    # card the vaguer wording for good.
+    # card the vaguer wording for good. The grants likewise, and after the queue's
+    # expiry pass, so a lapsed grant reads as lapsed rather than as waiting.
     return {"holds": holds_and_asks, "saturation": _saturation(),
-            "withdrawn": _list_withdrawn()}
+            "withdrawn": _list_withdrawn(), "granted": _list_granted()}

@@ -267,8 +267,8 @@ silently. Those two lines are each other's safety net — drop the echo and the 
 for the first mistake goes with it — which is why a source-level guard asserts both.
 
 It rides the existing SSE payload rather than a new endpoint — `/approvals` and the
-stream now return `{holds, saturation, withdrawn}` — so a rejection reaches the banner
-within a second through the push the page already listens to, with no new
+stream now return `{holds, saturation, withdrawn, granted}` — so a rejection reaches
+the banner within a second through the push the page already listens to, with no new
 relay-allowlist entry and no poll to lag behind the burst. That carries one constraint
 into the backend: the stream emits on *serialized payload change*, so every field must
 be stable while nothing happens. An `elapsed_seconds` convenience would defeat the
@@ -280,6 +280,17 @@ already does. A test pins the field set for that reason rather than for tidiness
 payload for the same reasons and meets the same constraint: it changes only when a
 withdrawal lands, and it lets a vanished tool card say *withdrawn by the agent* rather
 than hedge between resolved elsewhere and a restart.
+
+`granted` says how each tool ask a human allowed lately stands, so its card can wait
+on screen for the call it released, which runs later, when the agent resumes
+(`holds._list_granted`). Absolute fields only, for the same constraint. Which outcome
+row is the card's is decided at ingest, not read off the id: a pin made from the card
+credits its calls to the same id, so ingest marks the row whose id came from the
+card's resume token (`audit.settled_by`), and a claim refused by policy, which tells
+the agent the call will not run, is stamped on the ask (`tool_approvals.refused_at`),
+since the audit's `deny` rows on a claim also cover refusals that leave it claimable.
+How long the card waits is `CONTROL_TOOL_OUTCOME_WAIT`, served on `/api/config`; after
+it the card points at the record under its id.
 
 **Duplicate holds share one card — and that changes what a click grants.** A retrying
 agent asks the same question repeatedly, and each attempt used to become its own card

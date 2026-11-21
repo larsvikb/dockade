@@ -824,6 +824,15 @@ class GrantSecondsTests(unittest.TestCase):
                         self.assertRaisesRegex(ValueError, var):
                     self._import_fresh(module, {var: value})
 
+    def test_the_outcome_wait_refuses_a_value_with_no_deadline_at_import(self):
+        # Not a grant, so not the grant parser: no ceiling, since a long wait only keeps
+        # a card up. But a card needs a deadline, and none of these gives one.
+        for value in ("0", "-1", "nan", "inf"):
+            with self.subTest(value=value), \
+                    self.assertRaisesRegex(ValueError, "CONTROL_TOOL_OUTCOME_WAIT"):
+                self._import_fresh("holds", {"CONTROL_TOOL_OUTCOME_WAIT": value})
+        self._import_fresh("holds", {"CONTROL_TOOL_OUTCOME_WAIT": "0.5"})
+
 
 class ShortDurationTests(unittest.TestCase):
     """``_short_duration`` reads in hours from an hour up, where a timed pin runs."""

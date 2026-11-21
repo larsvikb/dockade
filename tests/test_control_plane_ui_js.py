@@ -274,7 +274,7 @@ const owner = {
                 "leasesStatus"],
   "list-status.js": ["pollStatus", "renderListStatus"],
   "escape.js": ["escapeNonAscii", "isHidden"],
-  "holds.js": ["renderableHolds", "diffPending", "shouldSweep",
+  "holds.js": ["renderableHolds", "diffPending", "shouldSweep", "grantedStep",
                "toolRemaining", "toolOutcomeMessage", "pinPreview",
                "holdRemaining", "countdownState", "departure",
                "conflictDeparture", "persistPreview",
@@ -4651,8 +4651,9 @@ class NotificationWiringSourceTests(unittest.TestCase):
 
     def setUp(self):
         self.src = APP_JS.read_text()
-        self.render = re.search(r"\n  function renderPending\(list, withdrawn\) \{[\s\S]*?\n  \}\n",
-                                self.src)
+        self.render = re.search(
+            r"\n  function renderPending\(list, withdrawn, grants\) \{[\s\S]*?\n  \}\n",
+            self.src)
         self.assertIsNotNone(self.render, "renderPending is gone — renamed?")
 
     def test_permission_is_requested_only_from_a_click(self):
@@ -5393,7 +5394,7 @@ class WithdrawnDepartureSourceTests(unittest.TestCase):
         handler = re.search(r'es\.addEventListener\("pending"[\s\S]*?\n    \}\);',
                             self.src)
         self.assertIsNotNone(handler, "the pending handler is gone")
-        self.assertIn("renderPending(renderableHolds(d.holds), new Set(d.withdrawn || []))",
+        self.assertIn("renderPending(renderableHolds(d.holds), new Set(d.withdrawn || []),",
                       handler.group(0))
 
     def test_only_a_tool_card_consults_the_withdrawn_set(self):
@@ -5420,8 +5421,9 @@ class DuplicateBadgeSourceTests(unittest.TestCase):
         self.src = APP_JS.read_text()
 
     def test_the_count_is_refreshed_on_surviving_cards_not_only_new_ones(self):
-        body = re.search(r"function renderPending\(list, withdrawn\)\s*\{(.*?)\n  \}",
-                         self.src, re.S)
+        body = re.search(
+            r"function renderPending\(list, withdrawn, grants\)\s*\{(.*?)\n  \}",
+            self.src, re.S)
         self.assertIsNotNone(body, "renderPending not found — did it get renamed?")
         # Iterating the incoming list (not just `add`) is the whole point: `add` holds
         # only ids that were not already on screen.
@@ -7208,6 +7210,157 @@ class PayloadColourTests(unittest.TestCase):
         for kind in ("key", "value", "escape", "punct", "mark"):
             with self.subTest(kind):
                 self.assertRegex(html, rf"\.j-{kind}\b[^{{]*\{{[^}}]*color:")
+
+
+# 1786055405 is 2026-08-07 00:30:05 in Stockholm, as in the probes above.
+_GRANTED_PROBE = r"""
+import { pathToFileURL } from "node:url";
+const load = name => import(pathToFileURL(`${process.env.DOCKADE_UI_DIR}/${name}`).href);
+const h = await load("holds.js");
+const card = { id: "tool-1", pin: null };
+const T = 1786055405;
+const ended = (status, extra = {}) => ({ id: "tool-1", pinned: false, state: "ended",
+  status, reason: null, result_bytes: null, duration: null, ...extra });
+const waiting = { id: "tool-1", pinned: false, state: "waiting", ends_at: T };
+const running = { id: "tool-1", pinned: false, state: "running", claimed_at: T };
+const other = state => ({ id: "tool-1", pinned: false, state });
+const step = (g, left = 60, live = true, c = card, prev = null) =>
+  h.grantedStep(prev, g, left, live, c);
+const finalOk = step(ended("ok"));
+const pinnedWaiting = step({ ...waiting, pinned: true });
+console.log(JSON.stringify({
+  statuses: Object.fromEntries(
+    ["ok", "tool-error", "rpc-error", "transport-error", "timeout"].map(s =>
+      [s, step(ended(s, { reason: "why", result_bytes: 1234, duration: 0.5 }))])),
+  null_facts: step(ended("tool-error")),
+  markup: step(ended("tool-error", { reason: "<b>x</b>" })),
+  withdrawn: step(other("withdrawn")),
+  lapsed: step(other("lapsed")),
+  refused: step(other("refused")),
+  waiting: step(waiting),
+  running: step(running),
+  none: step(undefined),
+  just_before: step(waiting, 0.001),
+  waiting_at_live: step(waiting, 0),
+  waiting_at_silent: step(waiting, 0, false),
+  running_at: step(running, -3),
+  none_at: step(undefined, 0),
+  final_kept: step(waiting, 60, true, card, finalOk) === finalOk,
+  final_after_the_deadline: step(ended("ok"), -5),
+  final_after_a_deadline_state: step(other("lapsed"), -5, true, card,
+                                     step(waiting, 0)),
+  pin_answer: step(waiting, 60, true,
+                   { id: "tool-1", pin: { id: 5, fields: ["owner"], created: true,
+                                          expires_at: null } }),
+  pin_stream: pinnedWaiting,
+  pin_stream_ended: step(ended("ok", { pinned: true })),
+  pin_stream_withdrawn: step({ ...other("withdrawn"), pinned: true }),
+  pin_carried: step(undefined, 0, true, card, pinnedWaiting),
+}));
+"""
+
+
+@unittest.skipIf(not _NODE and not _STRICT,
+                 "node is not installed — skipping the granted card's step tests")
+class GrantedStepTests(unittest.TestCase):
+    """``grantedStep``: what an approved tool card says while it follows its call, and
+    when it may go. Every message is held whole, since a substring would pass a card
+    that also said something false."""
+
+    probe: dict
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if not _NODE:
+            raise AssertionError("node is not installed and DOCKADE_REQUIRE_TOOLS is set")
+        proc = subprocess.run(  # noqa: S603 (absolute path, fixed args)
+            [_NODE, "--input-type=module", "-e", _GRANTED_PROBE],
+            env={**os.environ, "DOCKADE_UI_DIR": str(_served_dir()),
+                 "TZ": "Europe/Stockholm"},
+            capture_output=True, text=True, timeout=60, check=False)
+        if proc.returncode != 0:
+            raise AssertionError(f"node could not run the granted probe:\n{proc.stderr}")
+        cls.probe = json.loads(proc.stdout)
+
+    def said(self, name):
+        got = self.probe[name]
+        return (got["state"], got["final"], got["text"], got["tone"], got["dwellMs"])
+
+    def test_each_status_is_said_with_its_reason_and_facts_and_only_ok_is_good(self):
+        for status, got in self.probe["statuses"].items():
+            with self.subTest(status=status):
+                self.assertEqual(
+                    (got["state"], got["final"], got["text"], got["tone"],
+                     got["dwellMs"]),
+                    ("ended", True, f"✓ allowed · {status} · why · 1,234 bytes · 0.50 s",
+                     "ok" if status == "ok" else "bad", 60000))
+
+    def test_null_facts_add_nothing_and_no_verb(self):
+        self.assertEqual(self.said("null_facts"),
+                         ("ended", True, "✓ allowed · tool-error", "bad", 60000))
+
+    def test_a_reason_is_carried_verbatim_for_the_page_to_set_as_text(self):
+        self.assertEqual(self.probe["markup"]["text"], "✓ allowed · tool-error · <b>x</b>")
+
+    def test_the_other_final_states(self):
+        self.assertEqual(self.said("withdrawn"),
+                         ("withdrawn", True, "✓ allowed · withdrawn by the agent", "",
+                          60000))
+        self.assertEqual(self.said("lapsed"),
+                         ("lapsed", True,
+                          "✓ allowed · not claimed in time; it will not run", "bad", 60000))
+        self.assertEqual(self.said("refused"),
+                         ("refused", True, "✓ allowed · claim refused by policy · see the "
+                          "record under tool-1", "bad", 60000))
+
+    def test_before_the_deadline_it_stays_and_says_what_it_waits_for(self):
+        self.assertEqual(self.said("waiting"),
+                         ("waiting", False, "✓ allowed · waiting for the agent", "ok",
+                          None))
+        self.assertEqual(self.said("running"),
+                         ("running", False,
+                          "✓ allowed · claimed 00:30:05 · waiting for its result", "ok",
+                          None))
+        self.assertEqual(self.said("none"),
+                         ("unknown", False, "✓ allowed · waiting for its result", "ok",
+                          None))
+        self.assertEqual(self.said("just_before"), self.said("waiting"))
+
+    def test_at_the_deadline_only_a_live_waiting_entry_names_when_the_grant_lapses(self):
+        self.assertEqual(self.said("waiting_at_live"),
+                         ("unclaimed", False,
+                          "✓ allowed · not claimed yet · the agent has until 00:30:05 · "
+                          "the result will be in the record under tool-1", "", 8000))
+        record = ("no-result", False,
+                  "✓ allowed · no result on this card · see the record under tool-1", "",
+                  8000)
+        for name in ("waiting_at_silent", "running_at", "none_at"):
+            with self.subTest(name):
+                self.assertEqual(self.said(name), record)
+
+    def test_a_final_state_is_kept_and_reached_after_the_deadline_too(self):
+        self.assertTrue(self.probe["final_kept"])
+        self.assertEqual(self.said("final_after_the_deadline"),
+                         ("ended", True, "✓ allowed · ok", "ok", 60000))
+        self.assertEqual(self.said("final_after_a_deadline_state")[:2], ("lapsed", True))
+
+    def test_the_pin_clause_comes_from_the_answer_or_else_the_stream(self):
+        self.assertEqual(self.probe["pin_answer"]["text"],
+                         "✓ allowed · pinned for good on owner (pin 5) · waiting for the "
+                         "agent · its pin may answer other calls")
+        self.assertEqual(self.probe["pin_stream"]["text"],
+                         "✓ allowed · pinned · see the MCP tab · waiting for the agent · "
+                         "its pin may answer other calls")
+        # Its own result needs no warning about the pin's other calls.
+        self.assertEqual(self.probe["pin_stream_ended"]["text"],
+                         "✓ allowed · pinned · see the MCP tab · ok")
+        self.assertEqual(self.probe["pin_stream_withdrawn"]["text"],
+                         "✓ allowed · pinned · see the MCP tab · withdrawn by the agent · "
+                         "its pin may answer other calls")
+        # An entry that dropped out of the push still came from a pinned card.
+        self.assertEqual(self.probe["pin_carried"]["text"],
+                         "✓ allowed · pinned · see the MCP tab · no result on this card · "
+                         "see the record under tool-1 · its pin may answer other calls")
 
 
 if __name__ == "__main__":

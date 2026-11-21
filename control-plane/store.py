@@ -47,7 +47,7 @@ LEGACY_CLIENT_CLASS = "sandbox"
 # The schema this code expects. Every entry in ``_STEPS`` below adds exactly one,
 # and a store records the version it is at (see ``_migrate``), so "what has already
 # run here" is a number to compare rather than a schema to interrogate.
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 # The integers sqlite3 can bind: SQLite's INTEGER is 64-bit signed, and binding a
 # value outside it raises OverflowError, which a route would answer as a 500. A fact
@@ -592,7 +592,14 @@ _TOOL_APPROVALS_DDL = """
         -- join key; an operator view shows only its first 8 characters
         -- (policy.SANDBOX_PREFIX). DESIGN.md, "A card names its sandbox by an
         -- id the sandbox mints".
-        sandbox       TEXT
+        sandbox       TEXT,
+        -- When a claim of this ask, approved and unclaimed, was refused because
+        -- policy now denies its call (api_tool._refused_by_policy), so its agent
+        -- was told it will not run; NULL if none was. The first such refusal only.
+        -- Not the audit's `deny` rows, which `_own_ask` writes too, for claims
+        -- that leave the ask claimable. Read by the operator's card
+        -- (holds._list_granted).
+        refused_at    REAL
     )"""
 
 # UNIQUE, because a token is a lookup key: two rows under one would let a claim land
@@ -867,6 +874,32 @@ def _mint_call_token(approval_id: str, server: str, tool: str,
     return token
 
 
+# The rows a card reads its outcome from, by card (holds._list_granted). Partial, so
+# the egress rows, most of a table that is never pruned by default, cost it nothing.
+_AUDIT_SETTLED_INDEX = ("CREATE INDEX IF NOT EXISTS audit_settled ON audit(approval_id) "
+                        "WHERE settled_by IS NOT NULL")
+
+
+def _step_17_card_outcome(conn: sqlite3.Connection) -> None:
+    """v17 — what a tool card reads its call's ending from: ``audit`` gains
+    ``settled_by`` and ``tool_approvals`` gains ``refused_at`` (each DDL carries its
+    rule). Existing rows keep NULL: no card on screen can wait on one written before
+    them. The index on ``settled_by`` is ``_init_db``'s, as ``audit_ts`` is.
+
+    ``tool_approvals`` may be ABSENT, on a store stamped before it existed, or already
+    have the column, on a store below v16, whose rebuild made it from the shared DDL;
+    either is left to that DDL."""
+    if "settled_by" not in _columns(conn, "audit"):
+        conn.execute("ALTER TABLE audit ADD COLUMN settled_by TEXT")
+        print("control-plane: added settled_by to audit (existing rows keep NULL)",
+              flush=True)
+    asks = _columns(conn, "tool_approvals")
+    if asks and "refused_at" not in asks:
+        conn.execute("ALTER TABLE tool_approvals ADD COLUMN refused_at REAL")
+        print("control-plane: added refused_at to tool_approvals (existing asks keep "
+              "NULL)", flush=True)
+
+
 # Ordered, and the order is the only thing that decides what runs: a step is applied
 # when its version exceeds the store's, so steps must be APPEND-ONLY and never
 # renumbered, reordered or edited once shipped — a store in the field has already run
@@ -889,6 +922,7 @@ _STEPS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = (
     (14, "tool result size, hash and duration", _step_14_result_facts),
     (15, "sandbox id on tool asks", _step_15_ask_sandbox),
     (16, "timed pins scoped to a sandbox", _step_16_scoped_pins),
+    (17, "a tool card's outcome: settled_by and refused_at", _step_17_card_outcome),
 )
 
 
@@ -1057,9 +1091,16 @@ def _init_db() -> None:
                 -- and `duration` where nothing was dialled.
                 result_bytes  INTEGER,
                 result_sha256 TEXT,
-                duration      REAL
+                duration      REAL,
+                -- How ingest named this outcome's card: 'resume' when it took
+                -- `approval_id` from the ask's resume token, so the row is the
+                -- card's own call; NULL on every other row, a call a pin answered
+                -- under the same id included (ingest._settle_tool_row). Read by
+                -- the operator's card (holds._list_granted).
+                settled_by    TEXT
             )""")
         conn.execute("CREATE INDEX IF NOT EXISTS audit_ts ON audit(ts)")
+        conn.execute(_AUDIT_SETTLED_INDEX)
         # The audit table grows without bound on purpose: only the VIEW is windowed
         # (``api_views.api_audit``), never the record. An operator thins it with
         # `make audit-prune`, which the `audit_ts` index above keeps cheap.

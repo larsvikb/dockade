@@ -736,7 +736,7 @@ class McpServerPlacementTests(unittest.TestCase):
                 self.assertNotIn("egress-net", _networks_of(svc))
 
     def test_mcp_servers_are_told_to_use_the_proxy(self):
-        # The placement above makes the proxy the only reachable destination; this
+        # The placement above makes the proxy the only way off-box; this
         # is what makes the server actually use it rather than merely fail.
         for svc in self.MCP_SERVERS:
             with self.subTest(service=svc):
@@ -1825,9 +1825,10 @@ class RelayGuardAgreesWithComposeTests(unittest.TestCase):
         # An internal bridge has no route off-box. Every control network must be one,
         # or the control plane itself would gain egress. mcp-net is here for the same
         # reason wearing a different hat: its internal-ness is what makes the egress
-        # proxy the only thing an MCP server container can reach, so a server that
-        # ignores HTTPS_PROXY fails loudly instead of quietly going direct — from a
-        # container holding a write-capable credential. Placement is that boundary;
+        # proxy an MCP server container's only way off-box, so a server that ignores
+        # HTTPS_PROXY gets an error instead of quietly going direct (NOTES.md, "An MCP
+        # server container really does honour `HTTPS_PROXY`") — from a container
+        # holding a write-capable credential. Placement is that boundary;
         # nothing inside those containers enforces it.
         control = _control_networks()
         for network in sorted(control | {"sandbox-net", "mcp-net"}):

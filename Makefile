@@ -550,7 +550,7 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	# enforcer bridges, authorize-net (the proxy's route to /authorize) and
 	# tool-authorize-net (the MCP gateway's), each of which reaches the control
 	# plane just as directly — and mcp-net, whose internal-ness is what leaves the
-	# egress proxy as the only thing an MCP server container can reach, from a
+	# egress proxy as the only way an MCP server container gets off the machine, from a
 	# container holding a write-capable credential — and tasks-operator-net, where the
 	# task registry's operator listener answers with no token. Check each BY NAME — a bare count of 'internal:
 	# true' can't tell that the RIGHT nets are the internal ones (a future edit

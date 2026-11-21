@@ -32,7 +32,7 @@ lives rather than restating it.
 - **An error message served to a caller:** only through a typed exception whose message
   holds the caller's own input and module constants (`audit.FilterError`,
   `inventory.InventoryError`); `test_an_exception_reaches_a_response_only_through_a_named_type`.
-- **A bound or cap:** an env var, because it fails closed — see "Hold bounds are
+- **A hold bound or cap:** an env var, because it fails closed — see "Hold bounds are
   fail-closed, so their values stay env vars" in
   `control-plane/DESIGN.md`.
 - **A grant duration** (how long an allow lasts): through `policy._grant_seconds`, never

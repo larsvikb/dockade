@@ -64,6 +64,19 @@ def _recursing_on(marker: object, real):
     return stand_in
 
 
+def _refusing_arguments(marker: object, real):
+    """A stand-in for ``json.dumps`` that raises RecursionError on a message whose
+    ``params.arguments`` is ``marker`` and is ``real`` on anything else: the upstream
+    message a call builds, matched on its arguments so a change to the envelope cannot
+    silently stop it matching."""
+    def stand_in(value, *args, **kwargs):
+        params = value.get("params") if isinstance(value, dict) else None
+        if isinstance(params, dict) and params.get("arguments") == marker:
+            raise RecursionError("too deep")
+        return real(value, *args, **kwargs)
+    return stand_in
+
+
 def sse(result: dict) -> str:
     """A server's reply in the shape it actually sends."""
     return f"data: {json.dumps({'jsonrpc': '2.0', 'id': 1, 'result': result})}\n\n"
@@ -1293,6 +1306,41 @@ class OutcomeRecordTests(ExecutionTestCase):
         self.assertEqual(self.rows[0]["status"], "transport-error")
         self.assertEqual(self.rows[0]["resume_token"], TOKEN)
         self.assertEqual(self.called, [])
+
+    def test_a_call_too_deep_to_encode_is_recorded_as_never_sent(self):
+        # On main the encode raised inside `post`, outside its catches, and reached
+        # `_run`'s catch-all: "gateway failed handling the reply", a call that may have
+        # run, for one that was never sent. The stand-in refuses the upstream message
+        # alone, through the real `post`, so the proof does not depend on the
+        # interpreter's depth.
+        marker = {"too-deep": True}
+        for label, run, token in (
+                ("granted", lambda: self.granted(args_json='{"too-deep":true}'), TOKEN),
+                ("allowed", lambda: self.allow(args=marker), None)):
+            with self.subTest(case=label):
+                self.rows.clear()
+                self.execute.discovery.post = self._real_post
+                opened, resolved = [], []
+
+                def getaddrinfo(host, port, *_a, **_k):
+                    resolved.append(host)
+                    return [(2, 1, 6, "", ("172.28.0.11", port))]
+
+                with mock.patch.object(self.execute.discovery.json, "dumps",
+                                       _refusing_arguments(marker, json.dumps)), \
+                        mock.patch.object(self.execute.discovery._OPENER, "open",
+                                          lambda *a, **k: opened.append(a)), \
+                        mock.patch("socket.getaddrinfo", getaddrinfo):
+                    result = run()
+                self.assertTrue(result["isError"])
+                self.assertIn("so it was never sent", self.text(result))
+                self.assertEqual((resolved, opened), ([], []))
+                self.assertEqual(len(self.rows), 1)
+                row = self.rows[0]
+                self.assertEqual(row["status"], "transport-error")
+                self.assertEqual(row["resume_token"], token)
+                self.assertIn("so it was never sent", row["reason"])
+                self.assertNotIn("failed handling the reply", row["reason"])
 
     def test_a_claim_that_may_have_spent_the_grant_is_not_silent(self):
         # S22. The control plane writes the claim before it answers, so a lost answer

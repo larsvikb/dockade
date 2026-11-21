@@ -6,16 +6,22 @@ helpers and counters: the rest probes egress, DNS and mounts of a live sandbox. 
 grep and awk run for real. The privilege-caps probe reads a fixture file in place of
 the process's own status, the embedded-resolver check meets stubbed ``getent`` and
 ``dig`` on a PATH of grep alone, and the model-host probe, the SNI-fronting branch
-and the port-gate probe meet a stubbed ``curl``, so no verdict depends on the machine running the test.
+and the port-gate probe meet a stubbed ``curl``, and the proxy-close probe meets a
+loopback server the test scripts, so no verdict depends on the machine running the test.
 """
 from __future__ import annotations
 
 import os
 import re
+import secrets
 import shlex
 import shutil
+import socket
+import struct
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from typing import NamedTuple
@@ -548,6 +554,228 @@ class PortGateProbeTests(unittest.TestCase):
                 verdict = self._fails(output, _PORT_NO_403, rc=7)
                 if output:
                     self.assertIn("got: ", verdict)
+
+
+_WAIT = "timeout 5 "
+_SHORT_WAIT = "timeout 1 "
+
+
+def _close_block() -> str:
+    block = _lift(r"^    # The close itself:.*?^    fi\n", "proxy-close probe")
+    swapped = block.replace(_WAIT, _SHORT_WAIT)
+    # Each held-open case costs the probe's whole wait, and no verdict depends on
+    # its length.
+    if block.count(_WAIT) != 1 or _SHORT_WAIT not in swapped:
+        raise AssertionError(f"the proxy-close probe no longer waits with `{_WAIT.strip()}` once")
+    return swapped
+
+
+# What the probe must send, and nothing more: a `Connection` header or HTTP/1.0 would
+# have mitmproxy close for the request's sake, whatever the refusal said.
+_BARE_CONNECT = b"CONNECT api.anthropic.com:8443 HTTP/1.1\r\nHost: api.anthropic.com:8443\r\n\r\n"
+_FORBIDDEN = b"HTTP/1.1 403 Forbidden\r\ncontent-type: text/plain\r\ncontent-length: 23\r\n"
+_BODY = b"\r\negress denied by policy"
+
+_CLOSES = "PASS egress proxy closes the connection after refusing a CONNECT"
+_NO_ADDRESS = ("FAIL egress proxy close not probed: HTTPS_PROXY is set but EGRESS_PROXY_IP"
+               " is not (a broken launch)")
+
+
+def _kept_open(addr: str) -> str:
+    return (f"FAIL egress proxy at {addr} 403'd a CONNECT but kept the connection open"
+            " (a Node https.get it refuses would hang)")
+
+
+def _no_403(addr: str) -> str:
+    return f"FAIL egress proxy at {addr} did NOT 403 a raw CONNECT to api.anthropic.com:8443 (got: "
+
+
+class _Proxy:
+    """A loopback server that takes one connection, reads the request to its blank
+    line, answers ``response``, then closes, resets or holds the connection until
+    ``stop``."""
+
+    def __init__(self, response: bytes, then: str, at: tuple[str, int] = ("127.0.0.1", 0)):
+        self.response, self.then = response, then
+        self.request = b""
+        self._release = threading.Event()
+        self._sock = socket.socket()
+        try:
+            self._sock.bind(at)
+        except OSError:
+            self._sock.close()
+            raise
+        self._sock.listen(1)
+        self.addr = "%s:%d" % self._sock.getsockname()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self) -> None:
+        # Polled, as closing the socket from another thread does not wake accept.
+        self._sock.settimeout(0.1)
+        while True:
+            if self._release.is_set():  # stopped before the probe connected
+                return
+            try:
+                conn, _ = self._sock.accept()
+                break
+            except TimeoutError:
+                continue
+        with conn:
+            conn.settimeout(10)
+            # Read it all: closing with the request unread would reset, not close.
+            while b"\r\n\r\n" not in self.request:
+                try:
+                    chunk = conn.recv(4096)
+                except TimeoutError:  # a probe that connects and never sends
+                    return
+                if not chunk:
+                    break
+                self.request += chunk
+            conn.sendall(self.response)
+            if self.then == "reset":
+                time.sleep(0.2)  # the 403 is read before the reset arrives
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            elif self.then == "hold":
+                self._release.wait(30)
+
+    def stop(self) -> None:
+        self._release.set()
+        self._sock.close()
+        self._thread.join(30)
+
+
+@unittest.skipUnless(_BASH or _STRICT, "bash is not installed")
+class ProxyCloseProbeTests(unittest.TestCase):
+    """The refusal's ``Connection: close`` matters only if the proxy then closes: a
+    Node https.get the proxy refused never exits otherwise. curl drops a failed
+    CONNECT's connection either way, so this probe reads the close over a raw
+    socket, and must fail on a proxy that sends the header and keeps the connection."""
+
+    def _run(self, env: dict[str, str]) -> tuple[list[str], str]:
+        """The block's lines and counters under real bash, on a PATH of only the
+        tools it calls."""
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = Path(tmp) / "bin"
+            bin_dir.mkdir()
+            for tool in ("timeout", "cat", "head", "tr"):
+                found = shutil.which(tool)
+                if found is None:
+                    if _STRICT:
+                        self.fail(f"{tool} is not installed")
+                    self.skipTest(f"{tool} is not installed")
+                os.symlink(found, bin_dir / tool)
+            script = (_prelude() + _helpers() + _close_block()
+                      + 'echo "pass=$pass fail=$fail"\n')
+            proc = subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
+                [_BASH, "-c", script], cwd=tmp, env={"PATH": str(bin_dir), **env},
+                capture_output=True, text=True, encoding="utf-8", timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+        lines = proc.stdout.splitlines()
+        verdicts = [re.sub(r"\x1b\[[0-9;]*m", "", line).strip() for line in lines[:-1]]
+        return verdicts, lines[-1] if lines else ""
+
+    def _against(self, response: bytes, then: str) -> tuple[list[str], str, _Proxy]:
+        proxy = _Proxy(response, then)
+        self.addCleanup(proxy.stop)
+        ip, port = proxy.addr.split(":")
+        verdicts, counts = self._run({"EGRESS_PROXY_IP": ip, "EGRESS_PROXY_PORT": port})
+        proxy.stop()
+        return verdicts, counts, proxy
+
+    def test_a_403_then_close_passes_and_the_request_is_bare(self):
+        verdicts, counts, proxy = self._against(_FORBIDDEN + _BODY, "close")
+        self.assertEqual((verdicts, counts), ([_CLOSES], "pass=1 fail=0"))
+        self.assertEqual(proxy.request, _BARE_CONNECT)
+
+    def test_a_403_then_reset_passes(self):
+        # cat fails on the reset, neither 0 nor the timeout's 124: still closed.
+        verdicts, counts, _ = self._against(_FORBIDDEN + _BODY, "reset")
+        self.assertEqual((verdicts, counts), ([_CLOSES], "pass=1 fail=0"))
+
+    def test_a_403_held_open_fails_as_kept_open_with_or_without_the_header(self):
+        for name, head in (("Connection: close", _FORBIDDEN + b"Connection: close\r\n"),
+                           ("no Connection header", _FORBIDDEN)):
+            with self.subTest(case=name):
+                verdicts, counts, proxy = self._against(head + _BODY, "hold")
+                self.assertEqual((verdicts, counts),
+                                 ([_kept_open(proxy.addr)], "pass=0 fail=1"))
+
+    def test_any_other_status_line_fails_as_no_403_showing_it(self):
+        cases = {
+            "200": b"HTTP/1.1 200 Connection established\r\n\r\n",
+            "502": b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\n",
+            "401": b"HTTP/1.1 401 Unauthorized\r\n\r\n",
+            "403 of no HTTP/1 version": b"HTTP/1.2 403 Forbidden\r\n\r\n",
+            "403 below the status line": b"HTTP/1.1 200 OK\r\n\r\nHTTP/1.1 403 Forbidden\r\n",
+            "403 after other text": b"x HTTP/1.1 403 Forbidden\r\n\r\n",
+            "403 of another protocol": b"HTTP/2 403\r\n\r\n",
+            "4030": b"HTTP/1.1 4030 Odd\r\n\r\n",
+        }
+        for name, response in cases.items():
+            with self.subTest(case=name):
+                verdicts, counts, proxy = self._against(response, "close")
+                first = response.split(b"\r\n", 1)[0].decode()
+                self.assertEqual(counts, "pass=0 fail=1")
+                self.assertEqual(len(verdicts), 1, verdicts)
+                self.assertTrue(verdicts[0].startswith(_no_403(proxy.addr) + first), verdicts)
+
+    def test_a_bare_403_status_line_passes(self):
+        # No reason phrase: the status line ends at the code.
+        verdicts, counts, _ = self._against(b"HTTP/1.0 403\r\n\r\n", "close")
+        self.assertEqual((verdicts, counts), ([_CLOSES], "pass=1 fail=0"))
+
+    def test_a_server_that_never_answers_fails_as_no_403_not_kept_open(self):
+        verdicts, counts, proxy = self._against(b"", "hold")
+        self.assertEqual((verdicts, counts),
+                         ([_no_403(proxy.addr) + "nothing)"], "pass=0 fail=1"))
+
+    def test_nothing_listening_fails_as_no_403_showing_the_connect_error(self):
+        with socket.socket() as unused:
+            unused.bind(("127.0.0.1", 0))
+            port = unused.getsockname()[1]
+        started = time.monotonic()
+        verdicts, counts = self._run({"EGRESS_PROXY_IP": "127.0.0.1",
+                                      "EGRESS_PROXY_PORT": str(port)})
+        self.assertLess(time.monotonic() - started, 1, "refused, not waited out")
+        self.assertEqual(counts, "pass=0 fail=1")
+        self.assertEqual(len(verdicts), 1, verdicts)
+        self.assertTrue(verdicts[0].startswith(_no_403(f"127.0.0.1:{port}")), verdicts)
+        self.assertIn("Connection refused", verdicts[0])
+
+    def test_a_long_reply_shows_its_first_three_lines(self):
+        response = (b"HTTP/1.1 502 Bad Gateway\r\ncontent-type: text/plain\r\n"
+                    b"content-length: 7\r\n\r\nupstream\r\n")
+        verdicts, counts, proxy = self._against(response, "close")
+        self.assertEqual((verdicts, counts), ([
+            _no_403(proxy.addr) + "HTTP/1.1 502 Bad Gateway content-type: text/plain"
+            " content-length: 7)"], "pass=0 fail=1"))
+
+    def test_the_port_defaults_to_the_proxy_s_own(self):
+        # 8080, as init-firewall.sh opens it; unset, `set -u` must not abort the script.
+        # A fresh loopback address each run: the server closes first, so it leaves
+        # its address and port in TIME_WAIT for a minute, and a listener bound to
+        # 127.0.0.1:8080 alone holds only that address. One bound to 0.0.0.0:8080
+        # holds them all: the test then skips, or fails under DOCKADE_REQUIRE_TOOLS.
+        ip = "127.%d.%d.%d" % (1 + secrets.randbelow(254), secrets.randbelow(256),
+                               1 + secrets.randbelow(254))
+        try:
+            proxy = _Proxy(_FORBIDDEN + _BODY, "close", at=(ip, 8080))
+        except OSError:
+            if _STRICT:
+                raise
+            self.skipTest(f"{ip}:8080 is in use on this machine")
+        self.addCleanup(proxy.stop)
+        verdicts, counts = self._run({"EGRESS_PROXY_IP": ip})
+        proxy.stop()
+        self.assertEqual((verdicts, counts), ([_CLOSES], "pass=1 fail=0"))
+        self.assertEqual(proxy.request, _BARE_CONNECT)
+
+    def test_no_proxy_address_fails_naming_the_variable(self):
+        for env in ({}, {"EGRESS_PROXY_IP": ""}):
+            with self.subTest(env=env):
+                self.assertEqual(self._run(env), ([_NO_ADDRESS], "pass=0 fail=1"))
 
 
 if __name__ == "__main__":

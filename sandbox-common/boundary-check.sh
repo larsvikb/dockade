@@ -188,7 +188,8 @@ if [ -n "${HTTPS_PROXY:-}" ]; then
     # https.get the proxy refused never exits. This probe needs no rule or card, so
     # it is where a running proxy shows the header. Only curl's `< ` lines are the
     # proxy's response (`> ` lines are curl's request); a header's name is matched
-    # in any case, and curl keeps each line's CR.
+    # in any case, and curl keeps each line's CR. That the proxy then closes is the
+    # next probe's: curl drops a failed CONNECT's connection either way.
     portresp="$(curl -v -sS --connect-timeout 5 -o /dev/null https://api.anthropic.com:8443/ 2>&1 || true)"
     portlines="$(printf '%s\n' "$portresp" | grep '^< ' || true)"
     if ! printf '%s\n' "$portlines" | grep -q '^< HTTP/[0-9.]* 403'; then
@@ -197,6 +198,37 @@ if [ -n "${HTTPS_PROXY:-}" ]; then
         bad "egress proxy 403'd a non-443 CONNECT without Connection: close (got: $(printf '%s\n' "$portlines" | head -n 6 | tr -d '\r' | tr '\n' ' '))"
     else
         ok "egress proxy refuses non-443 CONNECT (api.anthropic.com:8443 -> 403, Connection: close)"
+    fi
+
+    # The close itself: the same CONNECT over a raw socket, which must reach EOF
+    # soon after the 403. The request is a bare persistent HTTP/1.1 one on purpose:
+    # mitmproxy also closes after a request carrying `Connection: close` or not
+    # HTTP/1.1, which would leave the close to the request, not the refusal. The
+    # address is the one init-firewall.sh opens, so /dev/tcp resolves no name, and
+    # connect, send and read all sit under the one timeout, so a proxy that never
+    # accepts cannot hang the script. The 403 is checked before the timeout's exit
+    # status, so silence reads as no 403; a reset after it counts as closed, since
+    # Node exits on either. stderr is kept: a connect error is what the FAIL shows.
+    if [ -z "${EGRESS_PROXY_IP:-}" ]; then
+        bad "egress proxy close not probed: HTTPS_PROXY is set but EGRESS_PROXY_IP is not (a broken launch)"
+    else
+        closeport="${EGRESS_PROXY_PORT:-8080}"
+        closeaddr="$EGRESS_PROXY_IP:$closeport"
+        # shellcheck disable=SC2016 # $1 and $2 are the inner shell's arguments
+        closeresp="$(timeout 5 "$BASH" -c 'exec 3<>"/dev/tcp/$1/$2" || exit
+            printf "CONNECT api.anthropic.com:8443 HTTP/1.1\r\nHost: api.anthropic.com:8443\r\n\r\n" >&3 || exit
+            exec cat <&3' close-probe "$EGRESS_PROXY_IP" "$closeport" 2>&1)"
+        closerc=$?
+        closestatus="${closeresp%%$'\n'*}"
+        if ! [[ "${closestatus%$'\r'}" =~ ^HTTP/1\.[01]\ 403(\ |$) ]]; then
+            closegot="$(printf '%s' "$closeresp" | head -n 3 | tr -d '\r' | tr '\n' ' ')"
+            closegot="${closegot% }"
+            bad "egress proxy at $closeaddr did NOT 403 a raw CONNECT to api.anthropic.com:8443 (got: ${closegot:-nothing})"
+        elif [ "$closerc" -eq 124 ]; then
+            bad "egress proxy at $closeaddr 403'd a CONNECT but kept the connection open (a Node https.get it refuses would hang)"
+        else
+            ok "egress proxy closes the connection after refusing a CONNECT"
+        fi
     fi
 
     # SNI / domain-fronting governance: CONNECT an allowlisted host but present a

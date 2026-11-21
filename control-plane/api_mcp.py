@@ -220,15 +220,18 @@ def edit_mcp_server(server: str, req: ServerEditRequest,
             "created_at, port, path FROM mcp_servers WHERE server=?",
             (server,)).fetchone())
 
-    # ONE row carrying both states, as ``api_egress.edit_rule`` writes. The template
-    # is safe to record because the secret is never in it.
+    # ONE row carrying both states, as ``api_egress.edit_rule`` writes. The header
+    # name and template are recorded as changed or not, never as text: a token pasted
+    # into either before the check refused it would otherwise land in the append-only
+    # audit. Their values are in `mcp_servers`.
+    header_moved = "changed" if (row["auth_header"] or "") != header else "unchanged"
+    template_moved = ("changed" if (row["auth_template"] or "") != template
+                      else "unchanged")
     store._audit("edit", stage="mcp-server", server=server, actor=actor,
                  reason=f"MCP server {server} edited; "
                         f"enabled {before['enabled']} -> {after['enabled']}, "
                         f"auth {before['auth']['type']} -> {after['auth']['type']} "
-                        f"(header {before['auth']['header']} -> "
-                        f"{after['auth']['header']}, template "
-                        f"{before['auth']['template']} -> {after['auth']['template']}), "
+                        f"(header {header_moved}, template {template_moved}), "
                         f"endpoint :{before['endpoint']['port']}"
                         f"{before['endpoint']['path']} -> :{after['endpoint']['port']}"
                         f"{after['endpoint']['path']}")

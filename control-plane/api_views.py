@@ -126,6 +126,9 @@ def api_config() -> dict:
         "lease_seconds": policy.LEASE_SECONDS,
         # The same, for the pin panel's timed button (``allow_pinned_lease``).
         "pin_lease_seconds": policy.PIN_LEASE_SECONDS,
+        # How long an approved tool card waits for its call's outcome. Without it the
+        # card says the call runs when the agent returns, and goes.
+        "tool_outcome_wait": holds.TOOL_OUTCOME_WAIT,
         # ``create_rule`` refuses a class it does not know. Not derived from the rules:
         # a class with none yet, the one most in need of its first, would be missing.
         "client_classes": list(policy._class_names()),

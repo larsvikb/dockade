@@ -59,6 +59,7 @@ os.environ["CONTROL_SEED"] = _SEED
 
 from _loader import (  # noqa: E402 (the env above is the import-time default)
     load_control_plane,
+    load_execute,
     load_outcomes,
     use_control_store,
 )
@@ -642,6 +643,7 @@ class ToolOutcomeRowTests(unittest.TestCase):
             {"ts": 1000.0, "kind": "outcome", "stage": "tool-result",
              "client": "172.30.0.130", "client_class": "sandbox", "reason": None,
              "server": "mcp-github", "tool": "get_me", "approval_id": None,
+             "settled_by": None,
              "resume_token": None, "call_token": None, "status": "ok",
              "result_bytes": None,
              "result_sha256": None, "duration": None})
@@ -753,6 +755,16 @@ class ToolOutcomeRowTests(unittest.TestCase):
         # invisible, so it is held by a test rather than by a habit.
         outcomes = load_outcomes()
         self.assertEqual(set(cp.ingest.TOOL_STATUSES), set(outcomes.STATUSES))
+
+    def test_the_unsettled_server_matches_the_gateways(self):
+        # holds._list_granted keeps a card `running` past a row on this server, since
+        # the claim it stands for may still end in a row of its own. If the gateway's
+        # `_unsettled` wrote another name, that row would read as the card's final
+        # `ended` while a concurrent resume's call might still succeed.
+        execute = load_execute()
+        with mock.patch.object(execute.outcomes, "record") as record:
+            execute._unsettled("tok", None, "why")
+        self.assertEqual(record.call_args.args[1], cp.holds.UNSETTLED_SERVER)
 
     def test_the_stdout_guard_matches_the_gateways(self):
         # The same text reaches both live feeds, and store.py's comment says they
@@ -996,6 +1008,22 @@ class ToolOutcomeDrainTests(IngestTestCase):
                    {"call_token": None, "resume_token": None})
         cp.ingest._drain(self.tool)
         self.assertEqual([r["approval_id"] for r in self.rows()], [None, None, None])
+
+    def test_only_an_id_from_a_resume_token_is_marked_as_settled_by_it(self):
+        # The mark is what tells a card's own call from the calls its pin answered,
+        # which name the same card (holds._list_granted): every other path leaves it
+        # NULL, a call token that credits the card included.
+        self._ask("op-id-own", "a" * 32)
+        token = self._mint(card="op-id-own")
+        self.write({"resume_token": "a" * 32}, {"call_token": token},
+                   {"resume_token": "f" * 32}, {"resume_token": None},
+                   {"resume_token": "a" * 32, "call_token": self._mint()})
+        cp.ingest._drain(self.tool)
+        with cp.store._connect() as conn:
+            marked = [tuple(r) for r in conn.execute(
+                "SELECT approval_id, settled_by FROM audit ORDER BY id")]
+        self.assertEqual(marked, [("op-id-own", "resume"), ("op-id-own", None),
+                                  (None, None), (None, None), (None, None)])
 
     def test_a_drain_that_rolls_back_leaves_the_token_unspent(self):
         # Exactly-once with the drain: the spend is on its connection and inside its

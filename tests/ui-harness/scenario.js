@@ -7,11 +7,17 @@
 // A PR that moves a surface out of `start()` adds the steps that exercise it here,
 // in the PR that moves it.
 
-import { HOLDS, NOW_MS, RULES, STALE_HOLD, abortConfig, answerOrder, answerToolRulesLast,
-         failRules, setRules } from "./backend.js";
+import { HOLDS, NOW_MS, RULES, STALE_HOLD, abortConfig, answerConfig, answerOrder,
+         answerToolRulesLast, failRules, serveOutcomeWait, setRules } from "./backend.js";
 
 const egressCard = page => page.locator("#pending .card:not(.tool)");
 const toolCard = page => page.locator("#pending .card.tool");
+// A push with no holds that says how the tool asks allowed lately stand.
+const grant = (page, granted) =>
+  page.evaluate(g => window.__harnessPush({ holds: [], granted: g }), granted);
+// The hour the last steps run at: later than anything the steps before them reach.
+const GRANT_AT_MS = NOW_MS + 3600 * 1000;
+const GRANT_AT = GRANT_AT_MS / 1000;
 
 export const STEPS = [
   ["load", async ({ load }) => { await load(); }],
@@ -350,4 +356,57 @@ export const STEPS = [
   // It opened on a watchdog tick, as the retry that made it was armed on one, so the
   // tick 15 s on retires it.
   ["a second silence", async ({ clock }) => { await clock(15500); }],
+
+  // An allowed tool card following its call (`grantedStep` in holds.js). After the
+  // silence steps, so every step above reads as it did: until here the config serves
+  // no outcome wait, and an allow reads and leaves as it always has. The reload gives
+  // a stream that speaks again, and the read the steps above made fail answers.
+  ["reload, the outcome wait served", async ({ load }) => {
+    answerConfig();
+    serveOutcomeWait();
+    await load();
+  }],
+  // At a fixed hour, since the reloads let the page clock run at wall-clock pace and
+  // the card's words carry times.
+  ["a tool ask arrives at a fixed hour", async ({ page, push }) => {
+    await page.clock.pauseAt(GRANT_AT_MS);
+    await push([{ ...HOLDS[1], id: "tool-g", ts: GRANT_AT - 5, deadline: GRANT_AT + 115 }]);
+  }],
+  ["the ask is allowed", async ({ page }) => {
+    await toolCard(page).getByRole("button", { name: "Allow", exact: true }).click();
+  }],
+  ["the stream says it waits for the agent", async ({ page }) => {
+    await grant(page, [{ id: "tool-g", pinned: false, state: "waiting",
+                         ends_at: GRANT_AT + 900 }]);
+  }],
+  ["the stream says it was claimed", async ({ page }) => {
+    await grant(page, [{ id: "tool-g", pinned: false, state: "running",
+                         claimed_at: GRANT_AT + 10 }]);
+  }],
+  // Markup in the reason, which is the MCP server's own text, so the run shows it
+  // rendered as text.
+  ["the call ended in a tool error", async ({ page }) => {
+    await grant(page, [{ id: "tool-g", pinned: false, state: "ended",
+                         status: "tool-error",
+                         reason: `<img src=x onerror="alert('x')"> not found`,
+                         result_bytes: 1234, duration: 0.5 }]);
+  }],
+  ["its dwell ends", async ({ page, clock }) => {
+    await page.mouse.move(0, 0);
+    await clock(60000);
+  }],
+  // A second ask, allowed and never claimed: at its deadline the live card says when
+  // the grant lapses, and goes after a resolve's dwell.
+  ["a second ask is allowed and waits", async ({ page, push }) => {
+    const at = GRANT_AT + 60;
+    await push([{ ...HOLDS[1], id: "tool-u", ts: at - 5, deadline: at + 115 }]);
+    await toolCard(page).getByRole("button", { name: "Allow", exact: true }).click();
+    await grant(page, [{ id: "tool-u", pinned: true, state: "waiting",
+                         ends_at: at + 900 }]);
+  }],
+  ["its deadline passes unclaimed", async ({ page, clock }) => {
+    await page.mouse.move(0, 0);
+    await clock(120000);
+  }],
+  ["the unclaimed card goes", async ({ clock }) => { await clock(8000); }],
 ];

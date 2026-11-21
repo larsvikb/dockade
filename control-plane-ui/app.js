@@ -29,8 +29,8 @@ import {
 } from "./mcp.js";
 import {
   renderableHolds, diffPending, shouldSweep, DWELL_MS,
-  toolRemaining, toolOutcomeMessage, holdRemaining, countdownState, departure,
-  conflictDeparture,
+  toolRemaining, toolOutcomeMessage, grantedStep, holdRemaining, countdownState,
+  departure, conflictDeparture,
   COUNTDOWN_URGENT_S, persistPreview, pinPreview, requestsLabel,
   pendingAnnouncement, approvalNotices, shouldNotify, notifyButton,
 } from "./holds.js";
@@ -93,6 +93,14 @@ function start() {
   // Seconds a timed pin lasts, from the same GET, for the pin panel's timed button
   // label and nothing else, for the same reason.
   let pinLeaseSeconds = null;
+  // Seconds an approved tool card waits for its call's outcome, from the same GET.
+  // Until it answers, an allow reads as it always did and goes after a resolve's
+  // dwell, since a card with no deadline could wait for ever.
+  let toolOutcomeWait = null;
+  // How each tool ask allowed lately stands, by approval id, from the last push's
+  // `granted` (holds._list_granted). Kept between pushes, because the stream sends a
+  // payload only when it changes.
+  let granted = new Map();
 
   // ── views ─────────────────────────────────────────────────────────────────
   const VIEWS = ["approvals", "audit", "policy", "tools"];
@@ -826,6 +834,41 @@ function start() {
     setMessage(entry, d.text, "bad");
   }
 
+  // An allowed tool card follows its call (`grantedStep` in holds.js) until a final
+  // state or its deadline, `toolOutcomeWait` from now. Entered from the resolve's
+  // allow answer, or from a push that names a card still resolving here; `pin` is the
+  // answer's, when there is one. No buttons and no countdown: nothing is left to
+  // decide, and the deadline is the page's, not the ask's.
+  function enterGranted(entry, id, pin) {
+    entry.state = "granted";
+    entry.id = id;
+    entry.grantDeadline = Date.now() + toolOutcomeWait * 1000;
+    entry.pin = pin || null;
+    entry.grant = null;
+    entry.el.classList.remove("busy", "confirming");
+    entry.el.classList.add("done-allow");
+    entry.confirm.hidden = true;
+    entry.cd.hidden = true;
+    entry.actions.hidden = true;
+    applyGranted(entry, Date.now());
+  }
+
+  function applyGranted(entry, now) {
+    const was = entry.grant;
+    const g = grantedStep(was, granted.get(entry.id),
+                          (entry.grantDeadline - now) / 1000, streamUp,
+                          { id: entry.id, pin: entry.pin });
+    entry.grant = g;
+    setMessage(entry, g.text, g.tone);
+    // The sweep's clock starts once the card may go, and again on reaching a final
+    // state, so its result is on screen for that state's whole dwell.
+    if (g.dwellMs !== null
+        && (entry.staleAt === null || (g.final && !(was && was.final)))) {
+      entry.staleAt = now;
+      entry.dwell = g.dwellMs;
+    }
+  }
+
   // `pattern` is sent only for the `*_persist` actions, and `pins` only for the two
   // pinning actions, and each is only ever what the backend itself offered on this
   // approval (it re-derives and re-validates the set, so the choice is bounded there
@@ -846,6 +889,18 @@ function start() {
                                ...(pins ? { pins } : {}) }),
       });
       const d = await r.json().catch(() => ({}));
+      // A push entered the card into `granted` while this was in flight: the allow
+      // landed, and all this answer can add is what it pinned, which only an allow's
+      // answer carries. A failure adds nothing, since the stream has already said the
+      // ask was allowed.
+      if (entry.state === "granted") {
+        if (d.pin) {
+          entry.pin = d.pin;
+          applyGranted(entry, Date.now());
+          refreshToolPins();
+        }
+        return;
+      }
       if (r.ok) {
         // Report the outcome HERE instead of waiting for the stream to drop the
         // card. The card disappearing on the next SSE tick used to be the ONLY
@@ -865,9 +920,15 @@ function start() {
           // Its own sentence, because the egress one below reports what was PERSISTED
           // and a tool ask persists nothing — the fields it reads are all absent here,
           // so it would settle on "this request only", which is both wrong and
-          // reassuring about the wrong thing.
-          const m = toolOutcomeMessage(d);
-          setMessage(entry, m.text, m.tone);
+          // reassuring about the wrong thing. An allow then waits on screen for its
+          // call to end, when the page knows how long to wait.
+          if (d.outcome === "allow" && toolOutcomeWait !== null) {
+            entry.staleAt = null;
+            enterGranted(entry, a.id, d.pin);
+          } else {
+            const m = toolOutcomeMessage(d);
+            setMessage(entry, m.text, m.tone);
+          }
           refreshAudit();
           // A pin is standing policy in the MCP tab's table, so it appears there now.
           if (d.pin) refreshToolPins();
@@ -918,6 +979,7 @@ function start() {
         setMessage(entry, `could not resolve: ${d.detail || "HTTP " + r.status}`, "bad");
       }
     } catch (e) {
+      if (entry.state === "granted") return;
       entry.state = "pending";
       entry.el.classList.remove("busy");
       disableActions(entry, false);
@@ -1012,7 +1074,9 @@ function start() {
   }
 
   // `withdrawn`: ids of tool asks the agent withdrew while pending, from the same push.
-  function renderPending(list, withdrawn) {
+  // `grants`: the push's `granted`, how the tool asks allowed lately stand.
+  function renderPending(list, withdrawn, grants) {
+    granted = new Map(grants.map(g => [g.id, g]));
     pendingCount = list.length;
     const { add, gone } = diffPending([...cards.keys()], list);
     // Before the DOM work, so the announcement reflects what is arriving rather than
@@ -1045,6 +1109,13 @@ function start() {
     for (const id of gone) {
       closeNotice(id);
       const entry = cards.get(id);
+      // A resolve still in flight here, and the stream already says a human allowed
+      // it: its answer is late, or lost, and the card follows the call regardless.
+      // `granted` names tool asks only.
+      if (entry.state === "resolving" && granted.has(id) && toolOutcomeWait !== null) {
+        enterGranted(entry, id, null);
+        continue;
+      }
       if (entry.state === "pending" || entry.state === "confirming"
           || entry.state === "resolving") {
         // Say WHICH way it went. An expiry is a decision the operator failed to make
@@ -1065,6 +1136,7 @@ function start() {
         markStale(entry, d);
       }
     }
+    updateGranted();
     sweep();
     updateIndicators();
     // Set AFTER the first push has been rendered, never at load: until a list has
@@ -1073,12 +1145,23 @@ function start() {
     notifyPrimed = true;
   }
 
+  // Every allowed tool card's words, on each push and each tick: a deadline passes
+  // with no event, and the stream going quiet changes what a kept entry can be
+  // trusted to say.
+  function updateGranted() {
+    const now = Date.now();
+    for (const entry of cards.values()) {
+      if (entry.state === "granted") applyGranted(entry, now);
+    }
+  }
+
   // Redrawn once a second for every live card. Cheap, and the only thing that makes a
   // deadline legible: the text for a reading, the bar for a glance.
   function updateCountdowns() {
     const now = Date.now();
     for (const entry of cards.values()) {
-      if (entry.state === "resolved" || entry.state === "stale") continue;
+      if (entry.state === "resolved" || entry.state === "stale"
+          || entry.state === "granted") continue;
       // A tool card carries its own absolute deadline, so it counts down whether or
       // not the config fetch ever succeeded. An egress card cannot — its window is
       // configuration — so it stays hidden rather than inventing a deadline.
@@ -1110,8 +1193,8 @@ function start() {
   // does: what changes is the passage of time, not an event, so nothing is going to
   // push a redraw at the moment one is needed.
   setInterval(() => {
-    updateCountdowns(); sweep(); renderSaturation(); updateLeaseCountdowns();
-    updatePinCountdowns();
+    updateCountdowns(); updateGranted(); sweep(); renderSaturation();
+    updateLeaseCountdowns(); updatePinCountdowns();
   }, 1000);
 
   // ── config (the hold window behind the countdown) ─────────────────────────
@@ -1133,6 +1216,9 @@ function start() {
       // Needs no relabelling: a pin panel reads it each time it renders.
       const ps = Number(c.pin_lease_seconds);
       pinLeaseSeconds = Number.isFinite(ps) && ps > 0 ? ps : null;
+      // Read by the next allow; a card already waiting keeps the deadline it has.
+      const ow = Number(c.tool_outcome_wait);
+      toolOutcomeWait = Number.isFinite(ow) && ow > 0 ? ow : null;
       receiveClientClasses(true, c.client_classes);
     } catch (e) {
       // No countdown, and no rule form; the cards are otherwise unaffected.
@@ -1205,8 +1291,11 @@ function start() {
       const d = JSON.parse(e.data);
       lastSaturation = d.saturation || null;
       renderSaturation();
-      // Empty from a backend that predates the key: those cards keep the hedge.
-      renderPending(renderableHolds(d.holds), new Set(d.withdrawn || []));
+      // Empty from a backend that predates the key: those cards keep the hedge. The
+      // same for `granted`, whose cards then read "waiting for its result" and point
+      // at the record at their deadline.
+      renderPending(renderableHolds(d.holds), new Set(d.withdrawn || []),
+                    Array.isArray(d.granted) ? d.granted : []);
     });
     es.onerror = () => {
       // The feed is the only thing that tells us about pending approvals, so losing

@@ -8,8 +8,9 @@
  * No DOM at import, so the unit tests import this file under node
  * (tests/test_control_plane_ui_js.py).
  */
+import { resultFacts } from "./audit.js";
 import { escapeNonAscii } from "./escape.js";
-import { durationWords, fmtStamp } from "./time.js";
+import { durationWords, fmtStamp, fmtTime } from "./time.js";
 
 // What changed between the pending list on screen and the one just pushed, keyed by
 // approval id so a surviving card is kept and updated IN PLACE.
@@ -49,48 +50,131 @@ export function toolRemaining(deadline, nowMs) {
   return Math.max(0, deadline - nowMs / 1000);
 }
 
-// What a decided tool ask says on the card. "Allowed" is NOT "ran": the gateway
-// executes on resumption, when the agent comes back and claims the approval, so a
-// message reading like a completed action would misreport the one property that keeps
-// an approved side effect from happening with nobody to receive it.
+// What a decided tool ask says on the card when the page cannot follow its call
+// (`grantedStep` below): a deny, or an allow with `/api/config`'s `tool_outcome_wait`
+// unknown. "Allowed" is NOT "ran": the gateway executes on resumption, when the agent
+// comes back and claims the approval, so a message reading like a completed action
+// would misreport the one property that keeps an approved side effect from happening
+// with nobody to receive it.
 export function toolOutcomeMessage(d) {
   if (!d || d.outcome !== "allow") {
     return { text: "✕ denied · the call will not run", tone: "bad" };
   }
+  return { text: `✓ allowed${pinClause(d.pin)} · runs when the agent returns for it`,
+           tone: "ok" };
+}
+
+// What an allow's answer says it pinned, as a clause to follow "✓ allowed", or "" when
+// it pinned nothing.
+function pinClause(pin) {
+  if (!pin) return "";
   // The fields come back from the BACKEND, so this reports what was pinned rather
   // than what was ticked, and says so when nothing new was written. The deadline is
   // the pin's as stored, not the button's, and a pin with none is said to be "for
   // good" outright: a timed click on values already pinned for good leaves that pin
   // permanent, and whoever clicked must not come away thinking the grant has an end.
   // A date and not only a time, since four hours from the evening is tomorrow.
-  const pin = d.pin;
-  const stamp = pin ? fmtStamp(pin.expires_at) : "";
+  const stamp = fmtStamp(pin.expires_at);
   // A rebind is a new grant under the tool's new arguments, for as long as this click
   // said.
-  const what = !pin ? ""
-    : pin.created ? "pinned"
+  const what = pin.created ? "pinned"
     : pin.rebound ? "pin rebound to the tool's current arguments,"
     : pin.extended ? (stamp ? "pin extended" : "pin made permanent")
     : "already pinned";
-  const forGood = pin && !stamp && !pin.extended ? " for good" : "";
+  const forGood = !stamp && !pin.extended ? " for good" : "";
   const until = stamp ? ` until ${stamp}` : "";
   // Which sandboxes the pin answers now: a timed one only the card's, by the prefix
   // that sandbox printed at boot, and a timed one made permanent every one.
-  const reach = !pin ? ""
-    : pin.sandbox_prefix ? ` for sandbox ${pin.sandbox_prefix} only`
+  const reach = pin.sandbox_prefix ? ` for sandbox ${pin.sandbox_prefix} only`
     : pin.promoted ? " for every sandbox"
     : "";
   // The permanent pin a timed click deleted (holds._resolve_tool_ask_pinned): a side
   // effect the operator did not pick directly, so the card says it happened.
-  const revoked = pin && pin.revoked
+  const revoked = pin.revoked
     ? ` · pin ${pin.revoked.id} revoked: it answered every sandbox, under older `
       + "arguments of the tool"
     : "";
-  const pinned = !pin ? ""
-    : ` · ${what}${forGood} on ${(pin.fields || []).join(", ")}${until}${reach} `
-      + `(pin ${pin.id})${revoked}`;
-  return { text: `✓ allowed${pinned} · runs when the agent returns for it`,
-           tone: "ok" };
+  return ` · ${what}${forGood} on ${(pin.fields || []).join(", ")}${until}${reach} `
+    + `(pin ${pin.id})${revoked}`;
+}
+
+// An approved tool card's words while it waits for its call, from one decision.
+//
+// The card enters this on the allow (app.js, `enterGranted`): its own deadline is the
+// page's clock then plus `/api/config`'s `tool_outcome_wait`, and the stream's
+// `granted` list (holds._list_granted) says how the ask stands, one entry per card:
+// `ended` with the call's status, reason and facts, `running`, `withdrawn`, `lapsed`,
+// `refused`, or `waiting`. Called on each push and each one-second tick with:
+//
+//   prev     this function's last result for the card, or null;
+//   g        the card's entry in the last push, or undefined if it had none;
+//   leftS    seconds to the card's deadline;
+//   live     whether the stream is delivering (app.js's `streamUp`), since a kept
+//            entry is only current while it is;
+//   card     { id, pin }: the approval id the record files the call under, and the
+//            pin the allow's answer reported, if any.
+//
+// Returns { state, final, text, tone, dwellMs, pinned }. `dwellMs` is null while the
+// card should stay, else how long it stays once it may go: a final state at once, for
+// as long as an expiry is read (it is the call's result, or a reason it has none),
+// and anything else at the deadline, for as long as a resolve. A final state never
+// changes. `pinned` is carried, since an entry that later drops out of the push still
+// came from a pinned card.
+//
+// Every message starts as the allow's did, "✓ allowed" and what it pinned, so the
+// decision stays on the card; a pin known only from the stream reads "pinned · see the
+// MCP tab". A pinned card that has no result says its pin may answer other calls,
+// whose results are in the record under the same id and never on this card.
+export function grantedStep(prev, g, leftS, live, card) {
+  if (prev && prev.final) return prev;
+  const pinned = Boolean(card.pin || (g && g.pinned) || (prev && prev.pinned));
+  const head = "✓ allowed"
+    + (card.pin ? pinClause(card.pin) : pinned ? " · pinned · see the MCP tab" : "");
+  const say = (state, final, words, tone, dwellMs) => ({
+    state, final, tone, dwellMs, pinned,
+    text: [head, words, pinned && state !== "ended" ? " · its pin may answer other calls"
+                                                    : ""].join(""),
+  });
+  const record = `see the record under ${card.id}`;
+  if (g && g.state === "ended") {
+    // The status, then the gateway's reason (third-party text, which app.js sets as
+    // text), then the facts. No verb: a row with NULL facts may still be a call that
+    // ran, so "ran" or "never ran" would be a guess.
+    const words = [g.status, g.reason, ...resultFacts(g)].filter(Boolean).join(" · ");
+    return say("ended", true, ` · ${words}`, g.status === "ok" ? "ok" : "bad",
+               DWELL_MS.expired);
+  }
+  if (g && g.state === "withdrawn") {
+    return say("withdrawn", true, " · withdrawn by the agent", "", DWELL_MS.expired);
+  }
+  if (g && g.state === "lapsed") {
+    return say("lapsed", true, " · not claimed in time; it will not run", "bad",
+               DWELL_MS.expired);
+  }
+  if (g && g.state === "refused") {
+    return say("refused", true, ` · claim refused by policy · ${record}`, "bad",
+               DWELL_MS.expired);
+  }
+  if (leftS > 0) {
+    if (g && g.state === "waiting") {
+      return say("waiting", false, " · waiting for the agent", "ok", null);
+    }
+    if (g && g.state === "running") {
+      return say("running", false,
+                 ` · claimed ${fmtTime(g.claimed_at)} · waiting for its result`, "ok",
+                 null);
+    }
+    return say("unknown", false, " · waiting for its result", "ok", null);
+  }
+  // The deadline. Only a live stream's `waiting` is known to be current, so only it
+  // may name when the grant lapses; anything else points at the record.
+  if (live && g && g.state === "waiting") {
+    return say("unclaimed", false,
+               ` · not claimed yet · the agent has until ${fmtTime(g.ends_at)} · the `
+               + `result will be in the record under ${card.id}`, "", DWELL_MS.resolved);
+  }
+  return say("no-result", false, ` · no result on this card · ${record}`, "",
+             DWELL_MS.resolved);
 }
 
 // What "Allow + pin" is about to write, for the confirm panel: which calls it will

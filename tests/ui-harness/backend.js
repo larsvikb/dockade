@@ -281,20 +281,32 @@ export function answerToolRulesLast() { toolRulesLast = true; }
 let exportAnswer = "ok";
 export function answerExport(how) { exportAnswer = how; }
 
+// Whether the config read serves `tool_outcome_wait`, without which an allowed tool
+// card reads as it did before the card followed its call, and leaves after a
+// resolve's dwell. Off until a step or a test turns it on: the scenario's earlier
+// steps find the cards they always did, and its last steps, after the silence ones, are
+// the ones about the wait, so a diff of the steps before them shows only what changed
+// there. `answerConfig` undoes `abortConfig`, for those last steps.
+const OUTCOME_WAIT = 120;
+let outcomeWait = false;
+export function serveOutcomeWait() { outcomeWait = true; }
+export function answerConfig() { configAborted = false; }
+
 // The tests', never the scenario's: each test in approval.test.js and
-// failing-state.test.js starts from `reset()`. `overrideResolve` changes what the
-// backend says it resolved, so the test can tell a card that reports the response from
-// one that reports the click; `overrideAck` replaces the answer to a saturation
-// acknowledgement, `{status, json}`, so the test can tell a banner that takes the count
-// the backend recorded from one that keeps its own. ui-diff never calls any of them, so
-// the switches above still carry from step to step there.
+// failing-state.test.js starts from `reset()`, which turns every switch above off,
+// the wait's included. `overrideResolve` changes what the backend says it resolved, so
+// the test can tell a card that reports the response from one that reports the click;
+// `overrideAck` replaces the answer to a saturation acknowledgement, `{status, json}`,
+// so the test can tell a banner that takes the count the backend recorded from one that
+// keeps its own. ui-diff never calls any of them, so the switches above still carry
+// from step to step there.
 let resolveOverride = null;
 let ackOverride = null;
 export function overrideResolve(change) { resolveOverride = change; }
 export function overrideAck(answer) { ackOverride = answer; }
 export function reset() {
   GETS["/api/egress/rules"] = RULES;
-  rulesFailing = configAborted = toolRulesLast = false;
+  rulesFailing = configAborted = toolRulesLast = outcomeWait = false;
   exportAnswer = "ok";
   answered.length = 0;
   resolveOverride = null;
@@ -319,6 +331,9 @@ export function answerOrder() { return answered.slice(); }
 export function respond(method, path, body, query) {
   if (toolRulesLast) answered.push(`${method} ${path}`);
   if (path === "/api/config" && configAborted) return { abort: true };
+  if (method === "GET" && path === "/api/config" && outcomeWait) {
+    return { status: 200, json: { ...CONFIG, tool_outcome_wait: OUTCOME_WAIT } };
+  }
   if (method === "GET" && path === "/api/egress/rules" && rulesFailing) {
     return { status: 503, json: { detail: "upstream unavailable" } };
   }

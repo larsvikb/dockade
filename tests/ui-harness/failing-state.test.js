@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // The approval page's "don't hide a failing state" machinery, against values written
 // down in advance: the approvals stream dropping, erring and going silent and the page
-// reconnecting, the traffic-light favicon and the conn text that follow it, and the
-// title and tab badges (control-plane-ui/DESIGN.md, "Tabbed views + traffic-light
-// favicon" and "Reconnect"). Every expected value is worked out by hand from that spec,
-// app.js's comments on lampState, backoffDelay and STREAM_SILENT_MS, and backend.js's
-// fixture; none is copied from a run.
+// reconnecting, the traffic-light favicon and the conn text that follow it, the title
+// and tab badges (control-plane-ui/DESIGN.md, "Tabbed views + traffic-light favicon"
+// and "Reconnect"), and the saturation banner (control-plane/DESIGN.md, "Dismissal is
+// server-side, and it is a high-water mark"). Every expected value is worked out by hand
+// from that spec, app.js's comments on lampState, backoffDelay and STREAM_SILENT_MS,
+// saturation.js's saturationState and ackCount with renderSaturation and the Dismiss
+// handler in app.js, and backend.js's fixture; none is copied from a run.
 //
 //   node failing-state.test.js <served dir>
 //
@@ -62,15 +64,18 @@ function litLamps(href) {
 // `hash`. `silent` silences the stream from its first instant: in an init script after
 // the heartbeats', since the beat the fake sends on opening lands during the load.
 // `beforeLoad` sets the backend up for the load's own reads. Every rules read is
-// recorded in `rulesReads` with the status it was answered.
+// recorded in `rulesReads` with the status it was answered, and every saturation
+// acknowledgement's body in `acks`.
 async function approvalPage(t, { silent = false, hash = "", beforeLoad = () => {} } = {}) {
   backend.reset();
   beforeLoad();
   const rulesReads = [];
+  const acks = [];
   const run = await openPage(browser, uiDir, {
     respond: (method, p, body, query) => {
       const answer = backend.respond(method, p, body, query);
       if (method === "GET" && p === "/api/egress/rules") rulesReads.push(answer?.status);
+      if (method === "POST" && p === "/api/saturation/ack") acks.push(body);
       return answer;
     },
     answeredLast: backend.answeredLast,
@@ -98,7 +103,8 @@ async function approvalPage(t, { silent = false, hash = "", beforeLoad = () => {
     await helpers.settle();
     assert.equal(await page.locator(`#view-${view}`).isHidden(), false);
   };
-  return { page, helpers, lamp, conn, streams, silence, tick, act, show, rulesReads };
+  return { page, helpers, lamp, conn, streams, silence, tick, act, show, rulesReads,
+           acks };
 }
 
 const LIVE = ["live", "up"];
@@ -377,4 +383,159 @@ test("a change while Policy shows sets no mark, after leaving it either", TIMEOU
   await show("approvals");
   await tick(4000);
   assert.deepEqual(await policyBadge(page), ["2", false]);
+});
+
+// ── the saturation banner ───────────────────────────────────────────────────
+
+// The banner as a user sees it: null when it does not show, else its class, its two
+// lines and whether Dismiss shows. Times in the detail are the context's Asia/Kolkata,
+// NOW's 10:00:00 UTC reading 15:30:00.
+async function banner(page) {
+  if (!await page.locator("#saturation").isVisible()) return null;
+  return {
+    level: await page.locator("#saturation").getAttribute("class"),
+    text: await page.locator("#sat-text").textContent(),
+    detail: await page.locator("#sat-detail").textContent(),
+    dismiss: await page.locator("#sat-dismiss").isVisible(),
+  };
+}
+// A push of no holds carrying `saturation`.
+const pushSaturation = (page, saturation) => page.evaluate(
+  s => window.__harnessPush({ holds: [], saturation: s }), saturation);
+// Dismiss clicked, and the banner read in the same turn, before any answer to the POST
+// can arrive: true if it still shows.
+const dismiss = page => page.evaluate(() => {
+  document.getElementById("sat-dismiss").click();
+  return document.getElementById("saturation").checkVisibility();
+});
+
+const NOW_S = backend.NOW_MS / 1000;
+const DENIED = " denied unheard — over the hold cap, so no approval card was raised";
+// backend.SATURATION as saturationState and renderSaturation read it: three unread,
+// the last 55 s before NOW, counted since an hour before NOW.
+const DETAIL = "last: registry.example.org — hit the per-client card cap for 172.28.0.5";
+const THREE = { level: "saturation recent", text: `3 requests${DENIED}`,
+                detail: `${DETAIL} at 15:29:05 · counted since 14:30:00`, dismiss: true };
+
+test("the saturation banner is hidden before any push", TIMEOUT, async t => {
+  const { page } = await approvalPage(t);
+  assert.equal(await banner(page), null);
+});
+
+test("three unacknowledged rejections 55 s old read as recent, with the host, the cap, "
+     + "the time and the count's start, and Dismiss", TIMEOUT, async t => {
+  const { page, act } = await approvalPage(t);
+  await act(() => pushSaturation(page, backend.SATURATION));
+  assert.deepEqual(await banner(page), THREE);
+});
+
+test("a shown rejection banner hides on a push that carries no saturation", TIMEOUT,
+     async t => {
+  const { page, helpers, act } = await approvalPage(t);
+  await act(() => pushSaturation(page, backend.SATURATION));
+  assert.deepEqual(await banner(page), THREE);
+  await act(() => helpers.push([]));
+  assert.equal(await banner(page), null);
+});
+
+// The record pushed once, at load: 59 s old on the tick at 4 s, and 60 s or more, so
+// past, from the tick at 5 s. Nothing but the clock moves it.
+test("the rejection banner turns from recent to past by the clock alone, at 60 s",
+     TIMEOUT, async t => {
+  const { page, act, tick } = await approvalPage(t);
+  await act(() => pushSaturation(page, backend.SATURATION));
+  await tick(4000);
+  assert.deepEqual(await banner(page), THREE);
+  await tick(2000);
+  assert.deepEqual(await banner(page), { ...THREE, level: "saturation past" });
+});
+
+// 12 of 16 requests held is the 75% that warns, and 3 of 8 cards is under it, so the
+// requests are the gauge shown; the cards are fewer than the requests, so named.
+test("a load near the cap reads requests held on cards with no Dismiss, and hides once "
+     + "the holds drain", TIMEOUT, async t => {
+  const { page, act } = await approvalPage(t);
+  await act(() => pushSaturation(page, backend.LOAD));
+  assert.deepEqual(await banner(page), {
+    level: "saturation load", text: "12/16 requests held on 3 cards",
+    detail: "near the cap — further requests would be denied without raising a card",
+    dismiss: false });
+  await act(() => pushSaturation(page, { ...backend.LOAD, in_flight: 2, cards: 1 }));
+  assert.equal(await banner(page), null);
+});
+
+test("Dismiss hides the banner at the click and posts the rejection total once",
+     TIMEOUT, async t => {
+  const { page, helpers, act, tick, acks } = await approvalPage(t);
+  await act(() => pushSaturation(page, backend.SATURATION));
+  assert.equal(await dismiss(page), false);
+  await helpers.settle();
+  assert.deepEqual(acks, [{ count: 3 }]);
+  assert.equal(await banner(page), null);
+  await tick(1000);
+  assert.equal(await banner(page), null);
+});
+
+// The acknowledgement is a high-water mark of the total (control-plane/DESIGN.md,
+// "Dismissal is server-side, and it is a high-water mark"), so a click on 2 unread of 3
+// posts 3.
+test("with 1 of 3 acknowledged the banner reads 2, and Dismiss posts 3", TIMEOUT,
+     async t => {
+  const { page, helpers, act, acks } = await approvalPage(t);
+  await act(() => pushSaturation(page, { ...backend.SATURATION, acknowledged: 1 }));
+  assert.deepEqual(await banner(page), { ...THREE, text: `2 requests${DENIED}` });
+  assert.equal(await dismiss(page), false);
+  await helpers.settle();
+  assert.deepEqual(acks, [{ count: 3 }]);
+  assert.equal(await banner(page), null);
+});
+
+test("a backend that records 1 for a click on 3 brings the banner back reading 2",
+     TIMEOUT, async t => {
+  const { page, helpers, act, acks } = await approvalPage(t);
+  backend.overrideAck({ status: 200, json: { ok: true, acknowledged: 1, rejections: 3 } });
+  await act(() => pushSaturation(page, backend.SATURATION));
+  assert.equal(await dismiss(page), false);
+  await helpers.settle();
+  assert.deepEqual(acks, [{ count: 3 }]);
+  assert.deepEqual(await banner(page), { ...THREE, text: `2 requests${DENIED}` });
+});
+
+// The 503 carries an `acknowledged` of 3, so a page that read the body of a failed
+// answer would keep the banner hidden: it is the status that must bring it back.
+test("a failed acknowledgement brings the banner back as it was", TIMEOUT, async t => {
+  const { page, helpers, act, acks } = await approvalPage(t);
+  backend.overrideAck({ status: 503, json: { detail: "upstream unavailable",
+                                             acknowledged: 3 } });
+  await act(() => pushSaturation(page, backend.SATURATION));
+  assert.equal(await dismiss(page), false);
+  await helpers.settle();
+  assert.deepEqual(acks, [{ count: 3 }]);
+  assert.deepEqual(await banner(page), THREE);
+});
+
+// A fourth rejection, at NOW, pushed before the stream carries the dismissal: the
+// click's own acknowledgement of 3 is what leaves 1 unread.
+const FOURTH = { ...backend.SATURATION, rejections: 4, last_ts: NOW_S };
+const ONE = { level: "saturation recent", text: `1 request${DENIED}`, dismiss: true };
+
+test("a new rejection after a dismissal shows again, reading 1", TIMEOUT, async t => {
+  const { page, helpers, act } = await approvalPage(t);
+  await act(() => pushSaturation(page, backend.SATURATION));
+  assert.equal(await dismiss(page), false);
+  await helpers.settle();
+  assert.equal(await banner(page), null);
+  await act(() => pushSaturation(page, FOURTH));
+  assert.deepEqual(await banner(page), {
+    ...ONE, detail: `${DETAIL} at 15:30:00 · counted since 14:30:00` });
+});
+
+// As after a reload: a page that never clicked, given the backend's acknowledgement of
+// 3 and the count's start moved to the dismissal, 30 s before NOW.
+test("a fresh page given 4 rejections with 3 acknowledged reads 1", TIMEOUT, async t => {
+  const { page, act, acks } = await approvalPage(t);
+  await act(() => pushSaturation(page, { ...FOURTH, acknowledged: 3, since: NOW_S - 30 }));
+  assert.deepEqual(await banner(page), {
+    ...ONE, detail: `${DETAIL} at 15:30:00 · counted since 15:29:30` });
+  assert.deepEqual(acks, []);
 });

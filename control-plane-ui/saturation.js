@@ -125,7 +125,8 @@ export function saturationState(sat, nowMs, dismissedCount = 0) {
 // with the number written twice, the two can disagree, and the failure is silent —
 // the banner hides, the POST returns 200, and the dismissal simply does not persist.
 // As a pure function it is also the only part of the dismiss path a unit test can
-// reach, `start()` being deliberately unverified.
+// reach; the handler in `start()` has browser tests instead
+// (tests/ui-harness/failing-state.test.js).
 export function ackCount(sat) {
   return sat ? Math.max(0, Number(sat.rejections) || 0) : 0;
 }

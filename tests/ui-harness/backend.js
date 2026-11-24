@@ -105,6 +105,24 @@ export const HOLDS = [
     } },
 ];
 
+// The saturation banner's two readings, for failing-state.test.js to push on the
+// stream, shaped as holds._saturation sends them; scenario.js pushes neither. A record
+// of three rejections none acknowledged, the last stamped 55 s before NOW at the per-
+// client card cap, the count kept since an hour before NOW; and a load with no
+// rejections, 12 of 16 requests held on 3 of 8 cards, the requests at the 75% that
+// warns and the cards under it.
+export const SATURATION = {
+  in_flight: 0, cards: 0, max_waiters: 16, max_pending: 8,
+  rejections: 3, acknowledged: 0, last_ts: NOW - 55,
+  last_scope: "client 172.28.0.5 cards", last_host: "registry.example.org",
+  since: NOW - 3600,
+};
+export const LOAD = {
+  in_flight: 12, cards: 3, max_waiters: 16, max_pending: 8,
+  rejections: 0, acknowledged: 0, last_ts: null, last_scope: null, last_host: null,
+  since: NOW - 3600,
+};
+
 // A tool ask whose call met two pins made under other arguments of the tool: a
 // permanent one a later card has rebound, which this card may neither rebind back nor
 // revoke, and its own sandbox's timed one, which it may rebind.
@@ -222,17 +240,22 @@ export function abortConfig() { configAborted = true; }
 export function answerToolRulesLast() { toolRulesLast = true; }
 
 // The tests', never the scenario's: each test in approval.test.js and
-// failing-state.test.js starts from `reset()`, and one changes what the backend says it
-// resolved, so the test can tell a card that reports the response from one that reports
-// the click. ui-diff never calls either, so the switches above still carry from step to
-// step there.
+// failing-state.test.js starts from `reset()`. `overrideResolve` changes what the
+// backend says it resolved, so the test can tell a card that reports the response from
+// one that reports the click; `overrideAck` replaces the answer to a saturation
+// acknowledgement, `{status, json}`, so the test can tell a banner that takes the count
+// the backend recorded from one that keeps its own. ui-diff never calls any of them, so
+// the switches above still carry from step to step there.
 let resolveOverride = null;
+let ackOverride = null;
 export function overrideResolve(change) { resolveOverride = change; }
+export function overrideAck(answer) { ackOverride = answer; }
 export function reset() {
   GETS["/api/egress/rules"] = RULES;
   rulesFailing = configAborted = toolRulesLast = false;
   answered.length = 0;
   resolveOverride = null;
+  ackOverride = null;
 }
 
 // Which requests the harness answers after every other one it holds (answerQueue). A
@@ -279,6 +302,15 @@ export function respond(method, path, body, query) {
   if (method === "POST" && resolve) {
     const answer = resolved(decodeURIComponent(resolve[1]), body);
     return { status: 200, json: resolveOverride ? resolveOverride(answer) : answer };
+  }
+  // Stands in for the real endpoint's answer, echoing the count sent as both what it
+  // recorded and the total there has been. It does not model the real endpoint's
+  // clamp to that total or its mark that never lowers (api_views.py,
+  // api_saturation_ack); a test wanting another answer sets `overrideAck`. The page
+  // reads only `acknowledged`.
+  if (method === "POST" && path === "/api/saturation/ack") {
+    return ackOverride ?? { status: 200, json: { ok: true, acknowledged: body.count,
+                                                 rejections: body.count } };
   }
   const write = method === "POST"
     && [...MCP_WRITES, ...RULE_WRITES].find(([re]) => re.test(path));

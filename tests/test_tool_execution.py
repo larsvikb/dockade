@@ -1256,6 +1256,20 @@ class OutcomeRecordTests(ExecutionTestCase):
         self.assertEqual(self.rows[0]["status"], "transport-error")
         self.assertIn("TypeError: something new", self.rows[0]["reason"])
 
+    def test_a_server_surface_does_not_hold_is_refused_naming_both_causes(self):
+        # Off the roster, or on it with an entry the reconcile round could not read
+        # and so did not publish: the gateway cannot tell the two apart here, and the
+        # control plane may still have the server enabled, so neither is claimed alone.
+        self.execute.surface.publish([], [])
+        result = self.allow()
+        self.assertEqual(self.called, [])
+        self.assertIn("is not on the gateway's current roster, or its roster entry "
+                      "could not be read", self.text(result))
+        self.assertEqual(self.rows[0]["status"], "transport-error")
+        self.assertEqual(self.rows[0]["reason"],
+                         "mcp-github is not on the gateway's current roster or its "
+                         "roster entry could not be read")
+
     def test_a_token_that_cannot_be_sent_names_its_file_and_dials_nothing(self):
         # On main the token read fine and http.client raised while sending it, which
         # reached the catch-all above as "gateway failed handling the reply".

@@ -330,20 +330,24 @@ def _run(server: str, tool: str, arguments: object, client: str | None = None,
 
     entry = surface.server_entry(server)
     if entry is None:
-        # Not a lookup miss. The roster stopped naming this server, which is an
-        # operator disabling or revoking it — and the control plane will have said the
-        # same thing already, so this is the second of two refusals rather than the
-        # only one.
+        # Not a lookup miss. Either the roster stopped naming this server, or its
+        # entry there could not be read (``discovery.entry_fault``). The first is an
+        # operator disabling or revoking it, and the control plane will have said the
+        # same thing already, so that is the second of two refusals rather than the
+        # only one. For an unreadable entry the control plane still has the server
+        # enabled, and this refusal is the only one.
         #
         # Audited as a transport failure rather than passed over: for an approved call
         # this is a grant that was spent and produced nothing, which is precisely the
         # gap between "a human approved it" and "it happened".
         return recorded(
             text_result(
-                f"{server!r} is not on the gateway's current roster, so it cannot be "
-                f"dialled. It was disabled, revoked, or never registered.",
+                f"{server!r} is not on the gateway's current roster, or its roster "
+                f"entry could not be read, so it cannot be dialled.",
                 is_error=True),
-            "transport-error", f"{server} left the roster before the call was made")
+            "transport-error",
+            f"{server} is not on the gateway's current roster or its roster entry "
+            f"could not be read")
     started = time.monotonic()
     try:
         response = discovery.post(

@@ -207,8 +207,8 @@ MCP_PATH = os.environ.get("GATEWAY_MCP_SERVE_PATH", "/mcp")
 #: fail-closed").
 BODY_MAX = int(os.environ.get("GATEWAY_BODY_MAX", str(1024 * 1024)))
 
-#: The header a Claude sandbox names itself in, and the one shape forwarded:
-#: claude-sandbox/tier-setup.sh mints 32 lowercase hex per boot. Anything else is
+#: The header a sandbox names itself in, and the one shape forwarded: each cloud
+#: tier's tier-setup.sh mints 32 lowercase hex per boot. Anything else is
 #: forwarded as no id rather than refused (DESIGN.md, "A card names its sandbox by an
 #: id the sandbox mints").
 SANDBOX_HEADER = "x-dockade-sandbox"

@@ -686,7 +686,7 @@ _PIN_FIELD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
 #: channel — and a longer string is content, which a pin is not for.
 _PIN_VALUE_MAX = 200
 
-#: The shape of a sandbox id (claude-sandbox/tier-setup.sh mints it, the gateway
+#: The shape of a sandbox id (each cloud tier's tier-setup.sh mints it, the gateway
 #: forwards only this shape and ``api_tool.tool_authorize`` checks it again), and how
 #: much of one an operator is shown: the prefix the sandbox prints at boot. The whole
 #: id stays in the store, so no view hands a reader an id to send as another sandbox.

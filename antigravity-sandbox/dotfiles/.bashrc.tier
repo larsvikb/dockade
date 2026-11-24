@@ -1,0 +1,5 @@
+# Tier-1 (Antigravity, agy) shell additions. Sourced from the shared
+# sandbox-common/dotfiles/.bashrc — keep tier-agnostic settings there.
+
+# agy — yolo is an explicit, conscious opt-in (not forced by settings)
+alias agy-yolo='agy --dangerously-skip-permissions'

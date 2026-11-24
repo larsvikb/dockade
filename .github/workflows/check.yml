@@ -233,7 +233,9 @@ jobs:
       #   - Claude's tier in GOVERNED mode only. opencode's needs an iGPU the runner
       #     does not have; standalone mode needs a host with no compose infra, which is
       #     also why the standalone firewall rules stay validated by hand, apart
-      #     from the blocks tests/test_init_firewall.py runs lifted out.
+      #     from the blocks tests/test_init_firewall.py runs lifted out. agy's tier
+      #     is built here but not checked: its model host is held on first use, a
+      #     fresh store has no rule for it, and a held model host fails the check.
       #   - the IPv6 probe self-skips when the runner's container has no v6 stack.
       #   - the lifeline probe needs api.anthropic.com to answer (no credentials —
       #     any HTTP response counts), so a network blip there reads as a failure.

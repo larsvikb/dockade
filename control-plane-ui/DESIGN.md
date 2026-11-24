@@ -324,7 +324,7 @@ oracle is the previous page, so there are no expected values to keep up, and the
 question only has an answer on a branch — which is what keeps it out of `check`. The
 page's expected values are `make ui-test`'s, above; the two share the harness's page
 setup (`tests/ui-harness/page.js`).
-Neither the host nor CI runs it; a move PR runs it in the tier-1 image.
+Neither the host nor CI runs it; a move PR runs it in Claude's tier-1 image.
 Each move PR adds the steps that exercise its surface to
 `tests/ui-harness/scenario.js`; the tasks page has its own
 (`tests/ui-harness/tasks-scenario.js`, `make ui-diff UI_DIFF_PAGE=tasks`).

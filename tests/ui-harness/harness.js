@@ -32,7 +32,7 @@ if (!uiDir || !outFile || !PAGES[which]) {
 const backend = await import(PAGES[which][0]);
 const { STEPS } = await import(PAGES[which][1]);
 if (!existsSync(BROWSER)) {
-  console.error(`no browser at ${BROWSER}. The tier-1 sandbox image has one; elsewhere, `
+  console.error(`no browser at ${BROWSER}. Claude's tier-1 sandbox image has one; elsewhere, `
                 + "point UI_HARNESS_BROWSER at a Chromium or headless-shell binary.");
   process.exit(2);
 }

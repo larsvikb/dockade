@@ -108,9 +108,12 @@ SCRIPTS := $(LAUNCHERS) \
            sandbox-common/boundary-check.sh \
            claude-sandbox/tier-setup.sh \
            opencode-sandbox/tier-setup.sh \
+           antigravity-sandbox/tier-setup.sh \
+           antigravity-sandbox/agy-wrapper.sh \
            claude-sandbox/statusline.sh \
            claude-sandbox/claude-wrapper.sh
 DOCKERFILES := claude-sandbox/Dockerfile opencode-sandbox/Dockerfile \
+               antigravity-sandbox/Dockerfile \
                proxies/egress/Dockerfile \
                control-plane/Dockerfile control-plane-ui/Dockerfile tasks-ui/Dockerfile \
                tool-gateway/Dockerfile task-registry/Dockerfile
@@ -146,12 +149,15 @@ REFFILES := $(SCRIPTS) \
             claude-sandbox/user-CLAUDE.md \
             opencode-sandbox/opencode.json \
             opencode-sandbox/user-AGENTS.md \
+            antigravity-sandbox/settings.json \
+            antigravity-sandbox/user-AGENTS.md \
             sandbox-common/dotfiles/.bashrc \
             sandbox-common/dotfiles/.vimrc \
             sandbox-common/dotfiles/.inputrc \
             sandbox-common/dotfiles/.gitconfig \
             claude-sandbox/dotfiles/.bashrc.tier \
             opencode-sandbox/dotfiles/.bashrc.tier \
+            antigravity-sandbox/dotfiles/.bashrc.tier \
             proxies/egress/addon.py \
             control-plane/app.py \
             control-plane/store.py \
@@ -228,7 +234,7 @@ REFFILES := $(SCRIPTS) \
         rebuild logs-ep logs-cp logs-tg tool-outcomes tool-content \
         print-config-home \
         mcp-up mcp-down mcp-ps mcp-tools gateway-tools tasks-up tasks-down \
-        claude opencode boundary check-boundary split-check ui-diff ui-test \
+        claude opencode agy boundary check-boundary split-check ui-diff ui-test \
         instructions
 
 help: ## Show this help
@@ -1402,6 +1408,9 @@ claude: ## Launch a tier-1 (Claude, governed egress) sandbox (WORKSPACE=/path, d
 
 opencode: ## Launch a tier-2 (opencode + local LLM, no egress) sandbox (WORKSPACE=/path)
 	./run-opencode-sandbox.sh "$(WORKSPACE)"
+
+agy: ## Launch a tier-1 (Antigravity agy, governed egress) sandbox (WORKSPACE=/path)
+	./run-antigravity-sandbox.sh "$(WORKSPACE)"
 
 boundary: ## Run boundary-check.sh in a running sandbox (SANDBOX=<container name>, default claude-sandbox)
 	docker exec -it --user sandbox "$(SANDBOX)" /usr/local/bin/boundary-check.sh

@@ -283,6 +283,92 @@ class WrapperTests(unittest.TestCase):
         self.assertIn("alias claude-yolo='claude ", bashrc)
 
 
+class AntigravityWiringTests(unittest.TestCase):
+    """agy's tier, where the files cannot see each other: the Dockerfile, the hook and
+    the wrapper. The hook and the wrapper are run in tests/test_antigravity_setup.py;
+    these hold what only the text says."""
+
+    DOCKERFILE = (ROOT / "antigravity-sandbox" / "Dockerfile").read_text()
+    HOOK = (ROOT / "antigravity-sandbox" / "tier-setup.sh").read_text()
+    WRAPPER = (ROOT / "antigravity-sandbox" / "agy-wrapper.sh").read_text()
+
+    def test_the_header_is_the_one_the_gateway_reads(self):
+        names = re.findall(r'"(X-[A-Za-z-]+)"', self.HOOK)
+        self.assertEqual(names, ["X-Dockade-Sandbox"])
+        self.assertEqual(load_tool_gateway({"GATEWAY_AGENT_BIND": "172.30.0.11"})
+                         .SANDBOX_HEADER, names[0].lower())
+
+    def test_the_entry_is_keyed_by_the_gateways_name(self):
+        self.assertIn(f"{{mcpServers: {{{load_protocol().SERVER_NAME}: ", self.HOOK)
+
+    def test_the_real_binary_is_off_path_where_the_wrapper_execs_it(self):
+        real = re.search(r'^REAL="(/[^"]+)"$', self.WRAPPER, re.M)
+        self.assertIsNotNone(real, "agy-wrapper.sh no longer names the real binary")
+        self.assertIn(f"\"/tmp/agy/$AGY_TARBALL_BINARY\" {real.group(1)} ", self.DOCKERFILE)
+        directory = real.group(1).rsplit("/", 1)[0]
+        path = re.search(r'^ENV PATH="([^"]+)"$', self.DOCKERFILE, re.M)
+        self.assertIsNotNone(path)
+        self.assertNotIn(directory, path.group(1))
+        self.assertNotIn(directory, ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin",
+                                     "/usr/bin", "/sbin", "/bin"))
+        self.assertIn(f"install -d -m 0755 {directory} ", self.DOCKERFILE)
+        self.assertIn("COPY antigravity-sandbox/agy-wrapper.sh /usr/local/bin/agy\n",
+                      self.DOCKERFILE)
+
+    def test_the_state_links_lead_into_the_config_volume(self):
+        # The login and settings dirs are links into /config; ~/.gemini/config, which
+        # carries the boot's sandbox id, is not, so siblings never share it.
+        links = re.findall(r"ln -s (\S+) (\S+)", self.DOCKERFILE)
+        self.assertEqual(links, [
+            ("/config/antigravity-cli", "/home/$USERNAME/.gemini/antigravity-cli"),
+            ("/config/antigravity", "/home/$USERNAME/.config/antigravity")])
+        self.assertIn("ENV SANDBOX_CONFIG_DIR=/config\n", self.DOCKERFILE)
+        self.assertIn('MCP_CONFIG="$HOME/.gemini/config/mcp_config.json"', self.HOOK)
+
+    def test_updates_are_off_by_the_value_measured_to_work(self):
+        self.assertIn("ENV AGY_CLI_DISABLE_AUTO_UPDATE=true\n", self.DOCKERFILE)
+
+    def test_the_build_runs_agy_so_a_failure_fails_it_with_updates_off(self):
+        # Assigned, not substituted inside echo, whose status hides a failed binary;
+        # the switch on the command, since the ENV comes after this layer.
+        real = re.search(r'^REAL="(/[^"]+)"$', self.WRAPPER, re.M).group(1)
+        runs = [line.strip() for line in self.DOCKERFILE.splitlines()
+                if f"{real} --version" in line]
+        self.assertEqual(runs, [
+            f'&& v="$(AGY_CLI_DISABLE_AUTO_UPDATE=true {real} --version)" \\'])
+        self.assertLess(self.DOCKERFILE.index(runs[0]),
+                        self.DOCKERFILE.index("ENV AGY_CLI_DISABLE_AUTO_UPDATE=true"))
+        self.assertIn('    && echo "agy $version: $v"\n', self.DOCKERFILE)
+
+    def test_the_download_is_checked_against_the_manifest_before_it_is_unpacked(self):
+        check = self.DOCKERFILE.index('&& echo "${sha}  /tmp/agy.tar.gz" | sha512sum -c - \\')
+        self.assertLess(self.DOCKERFILE.index('sha="$(jq -er \'.sha512\''), check)
+        self.assertLess(check, self.DOCKERFILE.index("&& tar -xzf /tmp/agy.tar.gz"))
+
+    def test_the_binary_dir_stays_root_owned(self):
+        # A sandbox-owned dir would let the agent, or agy's updater, replace the binary.
+        directory = re.search(r'^REAL="(/[^"]+)/[^/"]+"$', self.WRAPPER, re.M).group(1)
+        chowns = [line for line in self.DOCKERFILE.splitlines() if "chown" in line]
+        self.assertTrue(chowns)
+        for line in chowns:
+            with self.subTest(line=line):
+                self.assertNotIn(directory, line)
+                self.assertNotIn("/opt", line)
+        self.assertIn(f"install -d -m 0755 {directory} ", self.DOCKERFILE)
+        # The chown that follows its creation names its targets, none of them it.
+        chown = re.search(r"chown -R \$USERNAME:\$USERNAME ([^\n]+)", self.DOCKERFILE)
+        self.assertEqual(chown.group(1), "/workspace /config /home/$USERNAME")
+
+    def test_the_shared_settings_are_renamed_into_place(self):
+        # The volume is every sibling's: a write in place could be read half-done.
+        lines = [ln.strip() for ln in self.HOOK.splitlines()
+                 if "settings" in ln and not ln.lstrip().startswith("#")]
+        self.assertEqual(lines, [
+            'settings="$CONFIG_DIR/antigravity-cli/settings.json"',
+            'install -m 0600 "$IMAGE_DIR/settings.json" "$settings.tmp.$$"',
+            'mv -f "$settings.tmp.$$" "$settings"'])
+
+
 class JdkVariantWiringTests(unittest.TestCase):
     """The opt-in JDK across the Dockerfile, the boot hook and the launcher.
 
@@ -379,6 +465,7 @@ class TierHookPrivilegeTests(unittest.TestCase):
     HOOKS: ClassVar = {
         "claude-sandbox": TIER_SETUP,
         "opencode-sandbox": (ROOT / "opencode-sandbox" / "tier-setup.sh").read_text(),
+        "antigravity-sandbox": (ROOT / "antigravity-sandbox" / "tier-setup.sh").read_text(),
     }
 
     def test_every_hook_hands_itself_to_the_sandbox_user(self):

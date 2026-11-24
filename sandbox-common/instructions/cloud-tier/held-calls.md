@@ -1,5 +1,5 @@
 - **MCP tools are governed per tool, and one may be held for a human.** The tools
-  under `{{gateway_prefix}}` are brokered by a gateway that asks policy before every
+  {{gateway_tools}} are brokered by a gateway that asks policy before every
   call. Three answers: it runs, it is refused, or it is **held for approval** — and
   a held call comes back immediately as a *result* saying so, carrying an id. That
   is not a failure and not a hang: finish it with `resume_tool_call` and the same id.

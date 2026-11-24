@@ -28,7 +28,9 @@ running it in each host state shows that standalone mode never inspects the gate
 
 ``LauncherProxyEnvTests`` runs ``run-claude-sandbox.sh`` through to ``docker run``,
 with every ``docker`` call answered by the stub, to show the function's output
-reaches the container and its Tools line says what Claude's tool surface is. Two
+reaches the container and its Tools line says what Claude's tool surface is.
+``AntigravityLauncherTests`` runs ``run-antigravity-sandbox.sh`` the same way, and
+also to the refusals of a tier with no standalone fallback. Two
 other classes run the launchers themselves, but only as far as a refusal:
 ``LauncherCdpathTests``, the workspace guard's, and ``LauncherMountNameTests``,
 ``sc_workspace_mount``'s. Before them the launchers run at most ``sc_jdk_variant``
@@ -46,7 +48,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from typing import NamedTuple
+from typing import ClassVar, NamedTuple
 
 from test_launcher_run_flags import launchers
 
@@ -410,6 +412,41 @@ class GovernedEgressTests(unittest.TestCase):
         self.assertFalse(run.inspected("tool-gateway"))
 
 
+def _launch(launcher: str, *, ips: dict[str, str], internal: bool,
+            env_over: dict[str, str] | None = None,
+            ) -> tuple[subprocess.CompletedProcess, list[str] | None]:
+    """Run ``launcher`` with every ``docker`` call answered by _EGRESS_STUB on
+    ``sandbox-net``: the run, and ``docker run``'s argv, or None if it never got there."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp).resolve()
+        (root / "home").mkdir()
+        (root / "ws").mkdir()
+        (root / "bin").mkdir()
+        stub = root / "bin" / "docker"
+        stub.write_text(_EGRESS_STUB)
+        stub.chmod(0o755)
+        argv_file = root / "run.argv"
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("EGRESS_PROXY_", "TOOL_GATEWAY_", "STUB_",
+                                    "SANDBOX_", "SC_", "XDG_", "DOCKADE_"))
+               and k != "ALLOW_UNSAFE_WORKSPACE"}
+        env.update(
+            PATH=f"{root / 'bin'}{os.pathsep}{env['PATH']}",
+            HOME=str(root / "home"),
+            STUB_LOG=str(root / "calls.log"),
+            STUB_RUN_ARGV=str(argv_file),
+            STUB_NET="sandbox-net",
+            STUB_NET_INTERNAL="true" if internal else "false",
+        )
+        env.update({f"STUB_IP_{name.replace('-', '_')}": ip for name, ip in ips.items()})
+        env.update(env_over or {})
+        proc = subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
+            [_BASH, str(ROOT / launcher), str(root / "ws")],
+            capture_output=True, text=True, env=env, timeout=60)
+        argv = argv_file.read_text().splitlines() if argv_file.exists() else None
+        return proc, argv
+
+
 @unittest.skipUnless(_BASH or _STRICT, "bash is not installed")
 class LauncherProxyEnvTests(unittest.TestCase):
     """run-claude-sandbox.sh, run through to ``docker run`` with the stub answering.
@@ -426,34 +463,10 @@ class LauncherProxyEnvTests(unittest.TestCase):
 
     def _launch(self, *, ips: dict[str, str], internal: bool) -> tuple[str, list[str]]:
         """Run the launcher to ``docker run``: its stdout, and the run's argv."""
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp).resolve()
-            (root / "home").mkdir()
-            (root / "ws").mkdir()
-            (root / "bin").mkdir()
-            stub = root / "bin" / "docker"
-            stub.write_text(_EGRESS_STUB)
-            stub.chmod(0o755)
-            argv_file = root / "run.argv"
-            env = {k: v for k, v in os.environ.items()
-                   if not k.startswith(("EGRESS_PROXY_", "TOOL_GATEWAY_", "STUB_",
-                                        "SANDBOX_", "SC_", "XDG_", "DOCKADE_"))
-                   and k != "ALLOW_UNSAFE_WORKSPACE"}
-            env.update(
-                PATH=f"{root / 'bin'}{os.pathsep}{env['PATH']}",
-                HOME=str(root / "home"),
-                STUB_LOG=str(root / "calls.log"),
-                STUB_RUN_ARGV=str(argv_file),
-                STUB_NET="sandbox-net",
-                STUB_NET_INTERNAL="true" if internal else "false",
-            )
-            env.update({f"STUB_IP_{name.replace('-', '_')}": ip for name, ip in ips.items()})
-            proc = subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
-                [_BASH, str(ROOT / "run-claude-sandbox.sh"), str(root / "ws")],
-                capture_output=True, text=True, env=env, timeout=60)
-            self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertTrue(argv_file.exists(), "the launcher never reached docker run")
-            return proc.stdout, argv_file.read_text().splitlines()
+        proc, argv = _launch("run-claude-sandbox.sh", ips=ips, internal=internal)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIsNotNone(argv, "the launcher never reached docker run")
+        return proc.stdout, argv
 
     @staticmethod
     def _tools_line(stdout: str) -> str:
@@ -491,6 +504,69 @@ class LauncherProxyEnvTests(unittest.TestCase):
         self.assertEqual(self._tools_line(stdout),
                          f"Tools:     governed via tool-gateway ({_GATEWAY}:8100)")
 
+
+
+@unittest.skipUnless(_BASH or _STRICT, "bash is not installed")
+class AntigravityLauncherTests(unittest.TestCase):
+    """run-antigravity-sandbox.sh, run through to ``docker run`` as
+    LauncherProxyEnvTests runs Claude's: governed only, its model host named, and no
+    Google credential or upstream DNS handed in from the host."""
+
+    LAUNCHER = "run-antigravity-sandbox.sh"
+    #: What a host may hold that would hand agy a credential or a resolver if passed on.
+    HOST_ENV: ClassVar = {"GEMINI_API_KEY": "k", "GOOGLE_API_KEY": "k",
+                          "AGY_ADC_AUTH": "true", "GOOGLE_APPLICATION_CREDENTIALS": "/x",
+                          "GOOGLE_CLOUD_PROJECT": "p", "SANDBOX_DNS": "192.0.2.53"}
+
+    def test_the_proxy_the_gateway_and_the_model_host_reach_docker_run(self):
+        proc, argv = _launch(self.LAUNCHER, ips={"egress-proxy": _PROXY,
+                                                 "tool-gateway": _GATEWAY},
+                             internal=True, env_over=self.HOST_ENV)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIsNotNone(argv, "the launcher never reached docker run")
+        passed = [argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == "-e"]
+        url = "http://egress-proxy:8080"
+        no_proxy = f"localhost,127.0.0.1,::1,egress-proxy,tool-gateway,{_GATEWAY}"
+        for pair in (f"HTTPS_PROXY={url}", f"HTTP_PROXY={url}", f"NO_PROXY={no_proxy}",
+                     f"https_proxy={url}", f"http_proxy={url}", f"no_proxy={no_proxy}",
+                     "NODE_USE_ENV_PROXY=1", f"EGRESS_PROXY_IP={_PROXY}",
+                     "EGRESS_PROXY_PORT=8080", f"TOOL_GATEWAY_IP={_GATEWAY}",
+                     "TOOL_GATEWAY_PORT=8100",
+                     "SANDBOX_MODEL_HOSTS=daily-cloudcode-pa.googleapis.com"):
+            with self.subTest(pair=pair):
+                self.assertIn(pair, passed)
+        names = {pair.split("=", 1)[0] for pair in passed}
+        self.assertEqual({n for n in names if n.startswith(("GEMINI", "GOOGLE", "AGY"))},
+                         set())
+        self.assertNotIn("UPSTREAM_DNS", names)
+        self.assertNotIn("--dns", argv)
+        self.assertIn("antigravity-sandbox-config:/config", argv)
+        self.assertEqual(argv[-1], "antigravity-sandbox")
+        self.assertIn(f"Tools:     governed via tool-gateway ({_GATEWAY}:8100)",
+                      proc.stdout.splitlines())
+
+    def test_with_no_gateway_the_tools_line_claims_nothing_more(self):
+        proc, argv = _launch(self.LAUNCHER, ips={"egress-proxy": _PROXY}, internal=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIsNotNone(argv)
+        self.assertEqual([ln for ln in proc.stdout.splitlines() if ln.startswith("Tools:")],
+                         ["Tools:     NONE (no tool-gateway on sandbox-net)"])
+
+    def test_a_plain_bridge_is_refused_before_docker_run(self):
+        # A Claude standalone run leaves exactly this behind; a proxy on it changes
+        # nothing, since the bridge itself is the direct route.
+        for ips in ({}, {"egress-proxy": _PROXY}):
+            with self.subTest(ips=ips):
+                proc, argv = _launch(self.LAUNCHER, ips=ips, internal=False)
+                self.assertEqual(proc.returncode, 1)
+                self.assertIn("exists but is NOT internal", proc.stderr)
+                self.assertIsNone(argv)
+
+    def test_an_internal_network_with_no_proxy_is_refused_before_docker_run(self):
+        proc, argv = _launch(self.LAUNCHER, ips={"tool-gateway": _GATEWAY}, internal=True)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("is internal but no egress proxy is running", proc.stderr)
+        self.assertIsNone(argv)
 
 
 _GUARD_HARNESS = ('set -euo pipefail; source "$1"; sc_guard_workspace "$2"; '

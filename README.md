@@ -80,7 +80,42 @@ tiers differ only in the capability granted:
 | | Brain | Egress | Credentials | Launch |
 |---|---|---|---|---|
 | **Tier 1** | Claude (API) | governed — egress proxy → allowlist | Anthropic session | `make claude` |
+| **Tier 1** | Antigravity, `agy` (Google) | governed — egress proxy → allowlist | Google session | `make agy` |
 | **Tier 2** | local LLM on `sandbox-net` | **none at all** | **none at all** | `make opencode` |
+
+The second tier-1 sandbox runs Google's Antigravity CLI, `agy`, with its own image
+and config volume (`antigravity-sandbox-config`). It has no standalone fallback, so
+it needs the infra up:
+
+```bash
+make up && make agy   # or /path/to/dockade/run-antigravity-sandbox.sh /path/to/project
+agy                   # inside: sign in once, then work
+agy-yolo              # agy --dangerously-skip-permissions — a conscious opt-in
+```
+
+- **Signing in.** Start `agy` and take its headless sign-in: it prints a Google URL
+  to open in a browser on the host, and takes the code that page gives back. The
+  token lands in the config volume, so later launches and sibling sandboxes are
+  signed in. The volume also keeps the account's email address, in the token and in
+  agy's logs, and every conversation.
+- **Hosts to approve.** agy's Google hosts are held on first use like any other
+  host. Approve each as an exact-host rule, never a `*.googleapis.com` wildcard:
+  `daily-cloudcode-pa.googleapis.com` (the model; `--boundary-check` fails until it
+  has a persisted rule) and `oauth2.googleapis.com` (the sign-in). Every signed-in
+  run also asked for `aicode.googleapis.com`, `www.googleapis.com`,
+  `play.googleapis.com`, `lh3.googleusercontent.com` and `www.gstatic.com`, which were
+  not shown to be needed. Leave `jetski-webchannel.googleapis.com` (remote control)
+  and the `…us-central1.run.app` update host unapproved: the image turns updates off,
+  so a rebuild is the update.
+- **Which account.** Everything agy sends, the workspace, `/refs` and gateway results
+  included, goes to Google under the terms of the account you sign in with, and a
+  personal account's terms may let Google use and review it. dockade checks nothing
+  about the account: choose it to suit the work.
+- **Modes.** The image sets the mode agy's docs call default. In it, plain `agy` asks
+  before every command and every gateway tool call, and the gateway may then hold
+  the call too. It turns agy's own terminal sandbox off, since that cannot start in
+  this container; the container is the boundary. agy asks to trust the workspace
+  again after each restart.
 
 Tier 2 is an [opencode](https://opencode.ai) agent driven by a local model served
 in-cluster by llama.cpp, and its grant is defined by *subtraction*: no proxy, no
@@ -157,9 +192,11 @@ admin console — not in this repo. User-scope `settings.json` is used only for
 mistake-prevention/steering. See [`DESIGN.md`](DESIGN.md) and
 [`CLAUDE.md`](CLAUDE.md) for the full reasoning.
 
-**Known blind spot:** `WebSearch` runs server-side on Anthropic infrastructure,
-so the firewall cannot see or block it. It's read-only and consciously left
-enabled in v1; details in [`DESIGN.md`](DESIGN.md).
+**Known blind spots:** each cloud tier's CLI runs some tools on its vendor's side,
+where the firewall cannot see or block them. Claude's is `WebSearch`, read-only and
+consciously left enabled. agy's are `search_web`, `read_url_content`, remote agents
+and remote control, accepted for now with their reach stated. Each tier's table is in
+[`DESIGN.md` → "Server-side execution: accepted governance blind spots"](DESIGN.md#server-side-execution-accepted-governance-blind-spots).
 
 **Verifying the boundary:** run `boundary-check.sh` inside the container (as the
 agent, from the directory the session started in, which one of its checks reads)
@@ -186,10 +223,11 @@ boot continue; which ones those are is in `init-firewall.sh`.
 
 ## Yolo mode
 
-Bypass-permissions mode is available via the `claude-yolo` alias but is **never
-forced** — starting in it is a conscious opt-in. The image pre-accepts the
-bypass-mode disclaimer (in the baked user settings) so the acceptance survives
-restarts and volume wipes; it does not start Claude in yolo automatically.
+Bypass-permissions mode is available via the `claude-yolo` alias (`agy-yolo` in
+agy's tier) but is **never forced** — starting in it is a conscious opt-in. Claude's
+image pre-accepts the bypass-mode disclaimer (in the baked user settings) so the
+acceptance survives restarts and volume wipes; it does not start Claude in yolo
+automatically.
 
 ## Reference material
 
@@ -355,6 +393,7 @@ dockade/
   docker-compose.yml        # shared infra: egress proxy + control plane + UI + local LLM
   mcp-servers.yml           # MCP server catalogue (one container + profile per server)
   run-claude-sandbox.sh     # tier 1: build + launch a Claude sandbox (one or many)
+  run-antigravity-sandbox.sh  # tier 1: build + launch an agy (Antigravity CLI) sandbox
   run-opencode-sandbox.sh   # tier 2: build + launch an opencode/local-LLM sandbox
   sandbox-lib.sh            # launcher plumbing shared by every tier
   control-plane/            # governance authority BACKEND (agent cannot reach it)
@@ -502,6 +541,14 @@ dockade/
     user-CLAUDE.md          # the agent's user-scope instructions, rendered; installed the same way
     statusline.sh           # sandbox-indicator status line
     dotfiles/               # .bashrc.tier — tier-1 shell hook (claude-yolo alias)
+  antigravity-sandbox/      # TIER 1 image — agy (Google's Antigravity CLI), governed egress
+    Dockerfile
+    tier-setup.sh           # tier hook: agy's settings, the gateway entry, the instructions
+    agy-wrapper.sh          # the `agy` on PATH: exports DOCKADE_SESSION_ID per launch
+    settings.json           # baked agy settings, materialized to the config volume each boot
+    instructions.md         # source of user-AGENTS.md
+    user-AGENTS.md          # tier-1 capability facts for agy, rendered; installed as ~/.gemini/AGENTS.md
+    dotfiles/               # .bashrc.tier — the agy-yolo alias
   opencode-sandbox/         # TIER 2 image — opencode + local LLM, no egress
     Dockerfile
     tier-setup.sh           # tier hook: materialize the opencode provider config

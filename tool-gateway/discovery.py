@@ -154,6 +154,10 @@ _CONTROL_FAILURES = (OSError, http.client.HTTPException, ValueError, RecursionEr
 def fetch_roster() -> list[dict]:
     """The enabled servers and their rules, from the control plane's tool bridge.
 
+    A body that parses to something other than a list is refused with a
+    ``ValueError``, the class a body that will not parse raises, so ``poll`` reports
+    both the same way.
+
     Pulled, never pushed. The control plane has no leg on this container's networks
     and must not be given one — a push would mean the crown jewel dialling the
     agent-facing service, which is the lateral edge the bind guard exists to
@@ -161,7 +165,10 @@ def fetch_roster() -> list[dict]:
     request = urllib.request.Request(  # noqa: S310 - fixed http:// scheme, not user input
         f"{CONTROL_URL}/tool/roster", headers={"Accept": "application/json"})
     with urllib.request.urlopen(request, timeout=TIMEOUT) as response:  # noqa: S310
-        return json.loads(response.read())
+        roster = json.loads(response.read())
+    if not isinstance(roster, list):
+        raise ValueError(f"a {type(roster).__name__} where a list was expected")
+    return roster
 
 
 def check_name(server: str) -> str:
@@ -651,9 +658,9 @@ def poll() -> tuple[list[dict] | None, str]:
     """The roster, or None and a reason.
 
     A reason is returned for no answer, a reply that is not HTTP, and a body cut
-    short or that will not parse. Any other exception is a bug, and is left to raise
-    into ``_reconcile_forever``'s guard under its own class rather than read as an
-    outage.
+    short, that will not parse, or that parses to something other than a list. Any
+    other exception is a bug, and is left to raise into ``_reconcile_forever``'s
+    guard under its own class rather than read as an outage.
 
     Split from ``report`` because the two have different costs and therefore
     different cadences. This is one HTTP call to a sibling answering two indexed

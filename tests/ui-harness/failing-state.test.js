@@ -3,11 +3,14 @@
 // down in advance: the approvals stream dropping, erring and going silent and the page
 // reconnecting, the traffic-light favicon and the conn text that follow it, the title
 // and tab badges (control-plane-ui/DESIGN.md, "Tabbed views + traffic-light favicon"
-// and "Reconnect"), and the saturation banner (control-plane/DESIGN.md, "Dismissal is
-// server-side, and it is a high-water mark"). Every expected value is worked out by hand
+// and "Reconnect"), the saturation banner (control-plane/DESIGN.md, "Dismissal is
+// server-side, and it is a high-water mark"), and what each list says when its read
+// fails before or after one succeeded, stale vs failed (control-plane-ui/DESIGN.md,
+// "Empty vs. stale, on both polled lists"). Every expected value is worked out by hand
 // from that spec, app.js's comments on lampState, backoffDelay and STREAM_SILENT_MS,
 // saturation.js's saturationState and ackCount with renderSaturation and the Dismiss
-// handler in app.js, and backend.js's fixture; none is copied from a run.
+// handler in app.js, status.js's sentences, and backend.js's fixture; none is copied
+// from a run.
 //
 //   node failing-state.test.js <served dir>
 //
@@ -64,16 +67,26 @@ function litLamps(href) {
 // `hash`. `silent` silences the stream from its first instant: in an init script after
 // the heartbeats', since the beat the fake sends on opening lands during the load.
 // `beforeLoad` sets the backend up for the load's own reads. Every rules read is
-// recorded in `rulesReads` with the status it was answered, and every saturation
-// acknowledgement's body in `acks`.
+// recorded in `rulesReads` with the status it was answered, every saturation
+// acknowledgement's body in `acks`, and `answers(request)` the statuses every request,
+// "<method> <path>", was answered with. A request in `failingReads` is answered 503 for
+// as long as it is listed; a list's write shares its read's path, so the method is part
+// of what is listed.
+const failingReads = new Set();
+const UNAVAILABLE = { status: 503, json: { detail: "upstream unavailable" } };
 async function approvalPage(t, { silent = false, hash = "", beforeLoad = () => {} } = {}) {
   backend.reset();
+  failingReads.clear();
   beforeLoad();
   const rulesReads = [];
   const acks = [];
+  const requests = [];
   const run = await openPage(browser, uiDir, {
     respond: (method, p, body, query) => {
-      const answer = backend.respond(method, p, body, query);
+      const request = `${method} ${p}`;
+      const answer = failingReads.has(request)
+        ? UNAVAILABLE : backend.respond(method, p, body, query);
+      requests.push([request, answer?.status]);
       if (method === "GET" && p === "/api/egress/rules") rulesReads.push(answer?.status);
       if (method === "POST" && p === "/api/saturation/ack") acks.push(body);
       return answer;
@@ -103,8 +116,9 @@ async function approvalPage(t, { silent = false, hash = "", beforeLoad = () => {
     await helpers.settle();
     assert.equal(await page.locator(`#view-${view}`).isHidden(), false);
   };
+  const answers = request => requests.filter(([r]) => r === request).map(([, s]) => s);
   return { page, helpers, lamp, conn, streams, silence, tick, act, show, rulesReads,
-           acks };
+           acks, answers };
 }
 
 const LIVE = ["live", "up"];
@@ -538,4 +552,181 @@ test("a fresh page given 4 rejections with 3 acknowledged reads 1", TIMEOUT, asy
   assert.deepEqual(await banner(page), {
     ...ONE, detail: `${DETAIL} at 15:30:00 · counted since 15:29:30` });
   assert.deepEqual(acks, []);
+});
+
+// ── stale vs failed views ───────────────────────────────────────────────────
+
+// What a list says about itself (control-plane-ui/DESIGN.md, "Empty vs. stale, on both
+// polled lists"): a read that fails with none before it succeeding reads cold, with no
+// rows; one that fails after a success reads stale and keeps the rows it had; the next
+// good read clears the warning. The sentences are control-plane-ui/status.js's, each
+// list's its own, so a list that calls another's status function fails on the text.
+// The rows are backend.js's fixture as each list draws it.
+const DECISIONS = {
+  name: "decisions", read: "GET /api/audit", view: "audit", status: "audit-empty",
+  body: "audit",
+  // AUDIT's three rows, one each in the grouped view the page opens on.
+  rows: 3,
+  stale: "Could not refresh — these are the last events loaded successfully and may "
+       + "be out of date.",
+  cold: "Could not load recent events — the control plane may be unreachable.",
+};
+const POLICY = {
+  name: "policy", read: "GET /api/egress/rules", view: "policy", status: "rules-empty",
+  body: "rules",
+  // RULES' two.
+  rows: 2,
+  stale: "Could not refresh — this is the last policy loaded successfully and may no "
+       + "longer be what is in force.",
+  cold: "Could not load the standing policy — the control plane may be unreachable.",
+};
+const LIVE_LEASES = {
+  name: "live leases", read: "GET /api/egress/leases", view: "approvals",
+  status: "leases-empty", body: "leases",
+  // LEASES' three: the two under cdn.example are LEASE_GROUP_MIN, so drawn as the
+  // group's summary row and its two members, and files.pythonhosted.org alone.
+  rows: 4,
+  stale: "Could not refresh — these are the last live leases loaded successfully, and "
+       + "one may have lapsed or been revoked since.",
+  cold: "Could not load the live leases — the control plane may be unreachable.",
+};
+const TOOL_RULES = {
+  name: "tool rules", read: "GET /api/mcp/rules", view: "tools",
+  status: "toolrules-empty", body: "toolrules",
+  // TOOL_RULES' two.
+  rows: 2,
+  stale: "Could not refresh — this is the last tool policy loaded successfully and may "
+       + "no longer be what the gateway is enforcing.",
+  cold: "Could not load the tool policy — the control plane may be unreachable.",
+};
+const PINS = {
+  name: "pins", read: "GET /api/mcp/pins", view: "tools", status: "toolpins-empty",
+  body: "toolpins",
+  // PINS' two.
+  rows: 2,
+  stale: "Could not refresh — these are the last pins loaded successfully, and a pin "
+       + "revoked or added since may be missing.",
+  cold: "Could not load the pins — the control plane may be unreachable.",
+};
+
+// A list as a user sees it, its view open: its status line, null while hidden, else
+// its text and whether it carries the warning; and the rows its table holds.
+async function listState(page, list) {
+  const status = page.locator(`#${list.status}`);
+  return {
+    status: await status.isVisible()
+      ? { text: await status.textContent(),
+          warn: await status.evaluate(el => el.classList.contains("warn")) }
+      : null,
+    rows: await page.locator(`#${list.body} > tr`).count(),
+  };
+}
+
+// The three lists start() polls every 4 s while the tab shows, whichever view is up.
+for (const list of [DECISIONS, POLICY, LIVE_LEASES]) {
+  test(`the ${list.name} list whose first read fails reads as not loaded, with no rows, `
+       + "until a poll succeeds", TIMEOUT, async t => {
+    const { page, tick, show, answers } = await approvalPage(t, {
+      beforeLoad: () => failingReads.add(list.read),
+    });
+    await show(list.view);
+    assert.deepEqual(answers(list.read), [503]);
+    assert.deepEqual(await listState(page, list),
+                     { status: { text: list.cold, warn: true }, rows: 0 });
+
+    failingReads.delete(list.read);
+    await tick(4000);
+    assert.deepEqual(answers(list.read), [503, 200]);
+    assert.deepEqual(await listState(page, list), { status: null, rows: list.rows });
+  });
+
+  test(`the ${list.name} list whose poll fails after a success reads stale and keeps `
+       + "its rows, until a poll succeeds", TIMEOUT, async t => {
+    const { page, tick, show, answers } = await approvalPage(t);
+    await show(list.view);
+    assert.deepEqual(await listState(page, list), { status: null, rows: list.rows });
+
+    failingReads.add(list.read);
+    await tick(4000);
+    assert.deepEqual(answers(list.read), [200, 503]);
+    assert.deepEqual(await listState(page, list),
+                     { status: { text: list.stale, warn: true }, rows: list.rows });
+
+    failingReads.delete(list.read);
+    await tick(4000);
+    assert.deepEqual(answers(list.read), [200, 503, 200]);
+    assert.deepEqual(await listState(page, list), { status: null, rows: list.rows });
+  });
+}
+
+// The tool rules are read on load and after the page's own writes, of which a revoke
+// asks no confirm (mcp.js's click handler); the fake answers it ok and changes nothing.
+const revokeToolRule = page => page.locator("#toolrules button.revoke").first().click();
+
+test("the tool rules whose first read fails read as not loaded, with no rows", TIMEOUT,
+     async t => {
+  const { page, show, answers } = await approvalPage(t, {
+    beforeLoad: () => failingReads.add(TOOL_RULES.read),
+  });
+  await show("tools");
+  assert.deepEqual(answers(TOOL_RULES.read), [503]);
+  assert.deepEqual(await listState(page, TOOL_RULES),
+                   { status: { text: TOOL_RULES.cold, warn: true }, rows: 0 });
+});
+
+test("the tool rules whose re-read after a revoke fails read stale and keep their rows, "
+     + "until the next re-read succeeds", TIMEOUT, async t => {
+  const { page, show, act, answers } = await approvalPage(t);
+  await show("tools");
+  assert.deepEqual(await listState(page, TOOL_RULES),
+                   { status: null, rows: TOOL_RULES.rows });
+
+  failingReads.add(TOOL_RULES.read);
+  await act(() => revokeToolRule(page));
+  assert.deepEqual(answers(TOOL_RULES.read), [200, 503]);
+  assert.deepEqual(await listState(page, TOOL_RULES),
+                   { status: { text: TOOL_RULES.stale, warn: true },
+                     rows: TOOL_RULES.rows });
+
+  failingReads.delete(TOOL_RULES.read);
+  await act(() => revokeToolRule(page));
+  assert.deepEqual(answers(TOOL_RULES.read), [200, 503, 200]);
+  assert.deepEqual(await listState(page, TOOL_RULES),
+                   { status: null, rows: TOOL_RULES.rows });
+});
+
+// The pins are read on load and again on every opening of Tools (showView).
+test("the pins whose reads fail from the load on read as not loaded, with no rows, "
+     + "until Tools is opened again with the read restored", TIMEOUT, async t => {
+  const { page, show, answers } = await approvalPage(t, {
+    beforeLoad: () => failingReads.add(PINS.read),
+  });
+  await show("tools");
+  assert.deepEqual(answers(PINS.read), [503, 503]);
+  assert.deepEqual(await listState(page, PINS),
+                   { status: { text: PINS.cold, warn: true }, rows: 0 });
+
+  failingReads.delete(PINS.read);
+  await show("approvals");
+  await show("tools");
+  assert.deepEqual(answers(PINS.read), [503, 503, 200]);
+  assert.deepEqual(await listState(page, PINS), { status: null, rows: PINS.rows });
+});
+
+test("the pins whose read on opening Tools fails read stale and keep their rows, until "
+     + "Tools is opened again with the read restored", TIMEOUT, async t => {
+  const { page, show, answers } = await approvalPage(t);
+  assert.deepEqual(answers(PINS.read), [200]);
+
+  failingReads.add(PINS.read);
+  await show("tools");
+  assert.deepEqual(answers(PINS.read), [200, 503]);
+  assert.deepEqual(await listState(page, PINS),
+                   { status: { text: PINS.stale, warn: true }, rows: PINS.rows });
+
+  failingReads.delete(PINS.read);
+  await show("approvals");
+  await show("tools");
+  assert.deepEqual(answers(PINS.read), [200, 503, 200]);
+  assert.deepEqual(await listState(page, PINS), { status: null, rows: PINS.rows });
 });

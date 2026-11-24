@@ -93,8 +93,8 @@ mutant, and `-B` alone does not stop it".
 Behaviour that touches the DOM — `start()` in `control-plane-ui/app.js`, and the DOM
 half of a surface's own module, which `start()` mounts — runs only in a browser, so it
 is not in `make test`. The approval page's cards, approvals stream, favicon lamp, title,
-tab badges and saturation banner, and the tasks page's layout and navigation, have
-expected-value tests in a browser, `make ui-test`
+tab badges, saturation banner and stale vs failed list views, and the tasks page's
+layout and navigation, have expected-value tests in a browser, `make ui-test`
 (`tests/ui-harness/approval.test.js`, `tests/ui-harness/failing-state.test.js`,
 `tests/ui-harness/tasks.test.js`). Elsewhere, where a mistake would be silent, the
 convention is a **source-level guard** — a test that reads that module and asserts the

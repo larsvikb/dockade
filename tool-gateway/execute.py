@@ -215,9 +215,10 @@ def _ask_control(path: str, payload: dict) -> dict:
     return answer
 
 
-def parse_call(raw: str) -> tuple[dict, str]:
-    """The ``CallToolResult`` out of a server's reply, SSE or plain JSON, WITH the
-    audit status that says which layer answered.
+def parse_call(message: dict) -> tuple[dict, str]:
+    """The ``CallToolResult`` out of the server's response to ``tools/call``, as
+    ``discovery.post`` returns it, WITH the audit status that says which layer
+    answered.
 
     The status is returned rather than derived afterwards because it cannot be derived
     afterwards: a JSON-RPC rejection and a tool that ran and failed both leave here as
@@ -226,8 +227,8 @@ def parse_call(raw: str) -> tuple[dict, str]:
     load-bearing for the record: one says the call never ran, the other says it ran and
     the third party refused it.
 
-    Which message in the reply is the response is ``discovery.response_message``'s
-    call, shared with ``tools/list`` so the two cannot read the same stream differently.
+    Which message in the reply is the response is ``discovery.read_reply``'s call,
+    shared with ``tools/list`` so the two cannot read the same stream differently.
 
     A JSON-RPC ERROR IS NOT A TOOL FAILURE and is not passed off as one. The protocol
     distinguishes "the call ran and the tool reports a problem" (a result with
@@ -235,7 +236,6 @@ def parse_call(raw: str) -> tuple[dict, str]:
     would tell an agent its arguments were wrong when the server was unreachable, or
     the reverse. It becomes an error-flagged result here because that is the only shape
     a tool call can answer in, but the TEXT says which it was."""
-    message = discovery.response_message(raw)
     if "error" in message:
         return text_result(f"the server rejected the call: {message['error']}",
                            is_error=True), "rpc-error"
@@ -346,12 +346,12 @@ def _run(server: str, tool: str, arguments: object, client: str | None = None,
             "transport-error", f"{server} left the roster before the call was made")
     started = time.monotonic()
     try:
-        raw = discovery.post(
+        response = discovery.post(
             entry,
-            {"jsonrpc": "2.0", "id": discovery.REQUEST_ID, "method": "tools/call",
+            {"jsonrpc": "2.0", "method": "tools/call",
              "params": {"name": tool, "arguments": arguments}},
             timeout=CALL_TIMEOUT)
-        result, status = parse_call(raw)
+        result, status = parse_call(response)
     except discovery.DiscoveryError as exc:
         # A failure to REACH the server, told apart from a failure reported BY it. The
         # distinction matters to whoever reads the transcript: one is an infrastructure

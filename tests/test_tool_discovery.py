@@ -20,6 +20,7 @@ import http.client
 import http.server
 import io
 import json
+import re
 import socket
 import sys
 import threading
@@ -41,9 +42,44 @@ ENTRY = {"server": "mcp-github",
                    {"tool": "create_pr", "action": "ask"}]}
 
 
-def sse(result: dict) -> str:
+def sse(result: dict, request_id: int = 1) -> str:
     """An MCP reply in the shape the server actually sends — SSE, not a JSON body."""
-    return f"data: {json.dumps({'jsonrpc': '2.0', 'id': 1, 'result': result})}\n\n"
+    return (f"data: "
+            f"{json.dumps({'jsonrpc': '2.0', 'id': request_id, 'result': result})}\n\n")
+
+
+def response(result: dict) -> dict:
+    """What ``post`` returns for a reply carrying ``result``."""
+    return {"jsonrpc": "2.0", "id": 1, "result": result}
+
+
+class Reply(io.BytesIO):
+    """A server's reply as ``_OPENER.open`` hands one to ``post``: a binary stream
+    with a Content-Type."""
+
+    def __init__(self, body, content_type: str = "text/event-stream"):
+        super().__init__(body.encode() if isinstance(body, str) else body)
+        self.headers = {"Content-Type": content_type}
+
+
+def read(discovery, raw: str, request_id: int = 1, on_request=None) -> dict:
+    """``raw``, a reply's text, through the real reader: as `text/event-stream` when it
+    has a data line, as `application/json` otherwise, as a server labels each."""
+    content_type = ("text/event-stream" if re.search(r"(?m)^data:", raw)
+                    else "application/json")
+    return discovery.read_reply(Reply(raw, content_type), content_type, request_id,
+                                on_request or (lambda request: None))
+
+
+def echoing(result: dict, dialled: list | None = None):
+    """A stand-in for ``_OPENER.open`` answering each request with ``result`` under the
+    id the request carried, recording each request in ``dialled``."""
+    @contextlib.contextmanager
+    def urlopen(request, *_args, **_kwargs):
+        if dialled is not None:
+            dialled.append(request)
+        yield Reply(sse(result, json.loads(request.data)["id"]))
+    return urlopen
 
 
 #: A reply body the swapped-in ``json.loads`` refuses as too deep: a marker rather than
@@ -108,9 +144,12 @@ class ParseTests(unittest.TestCase):
     def setUp(self):
         self.discovery = load_discovery()
 
+    def parse(self, raw: str) -> list[dict]:
+        return self.discovery.parse_tools(read(self.discovery, raw))
+
     def test_the_sse_shape_is_parsed(self):
         # The measured shape (NOTES.md). If this breaks, enumeration is broken.
-        tools = self.discovery.parse_tools(sse({"tools": [{"name": "get_issue"}]}))
+        tools = self.parse(sse({"tools": [{"name": "get_issue"}]}))
         self.assertEqual([t["name"] for t in tools], ["get_issue"])
 
     def test_a_plain_json_body_is_also_parsed(self):
@@ -120,7 +159,7 @@ class ParseTests(unittest.TestCase):
         # to be trusted about.
         body = json.dumps({"jsonrpc": "2.0", "id": 1,
                            "result": {"tools": [{"name": "get_issue"}]}})
-        self.assertEqual([t["name"] for t in self.discovery.parse_tools(body)],
+        self.assertEqual([t["name"] for t in self.parse(body)],
                          ["get_issue"])
 
     def test_prose_is_reported_as_prose(self):
@@ -128,7 +167,7 @@ class ParseTests(unittest.TestCase):
         # is the symptom and the text is the diagnosis, so the text has to survive
         # into the message or an operator is left debugging a JSONDecodeError.
         with self.assertRaises(self.discovery.DiscoveryError) as caught:
-            self.discovery.parse_tools("Missing Authorization header")
+            self.parse("Missing Authorization header")
         self.assertIn("Missing Authorization header", str(caught.exception))
 
     def test_a_jsonrpc_error_is_not_an_empty_tool_list(self):
@@ -136,13 +175,13 @@ class ParseTests(unittest.TestCase):
         # reader returns [] and the report says the server exposes nothing — which
         # would read as "every rule is dead policy" and invite someone to delete them.
         with self.assertRaises(self.discovery.DiscoveryError) as caught:
-            self.discovery.parse_tools(
+            self.parse(
                 'data: {"jsonrpc":"2.0","id":1,"error":{"code":-32601}}')
         self.assertIn("-32601", str(caught.exception))
 
     def test_an_empty_reply_is_an_error(self):
         with self.assertRaises(self.discovery.DiscoveryError):
-            self.discovery.parse_tools("")
+            self.parse("")
 
     def test_valid_json_that_is_not_an_object_is_an_error_not_a_crash(self):
         # `message.get(...)` on a list or a string raised AttributeError, which
@@ -151,7 +190,7 @@ class ParseTests(unittest.TestCase):
         for raw in ("[]", '"x"', "null", "7", "data: []\n\n"):
             with self.subTest(raw=raw), \
                     self.assertRaises(self.discovery.DiscoveryError):
-                self.discovery.parse_tools(raw)
+                self.parse(raw)
 
     def test_a_result_without_a_tool_list_is_an_error_not_an_empty_list(self):
         # `{"result": null}` and `{"result": []}` are not "this server exposes
@@ -161,7 +200,7 @@ class ParseTests(unittest.TestCase):
             with self.subTest(result=result):
                 body = json.dumps({"jsonrpc": "2.0", "id": 1, "result": result})
                 with self.assertRaises(self.discovery.DiscoveryError) as caught:
-                    self.discovery.parse_tools(body)
+                    self.parse(body)
                 self.assertIn("no tool list", str(caught.exception))
 
     def test_a_notification_ahead_of_the_response_is_skipped(self):
@@ -169,7 +208,7 @@ class ParseTests(unittest.TestCase):
         # taking the first event read one of those as the reply.
         raw = ('data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1}}\n\n'
                + sse({"tools": [{"name": "get_issue"}]}))
-        self.assertEqual([t["name"] for t in self.discovery.parse_tools(raw)],
+        self.assertEqual([t["name"] for t in self.parse(raw)],
                          ["get_issue"])
 
     def test_a_request_from_the_server_is_not_taken_for_the_reply(self):
@@ -177,7 +216,7 @@ class ParseTests(unittest.TestCase):
         # as a request rather than the response to ours.
         raw = ('data: {"jsonrpc":"2.0","id":1,"method":"sampling/createMessage"}\n\n'
                + sse({"tools": [{"name": "get_issue"}]}))
-        self.assertEqual([t["name"] for t in self.discovery.parse_tools(raw)],
+        self.assertEqual([t["name"] for t in self.parse(raw)],
                          ["get_issue"])
 
     def test_sse_is_read_by_the_spec_not_by_the_line(self):
@@ -187,7 +226,7 @@ class ParseTests(unittest.TestCase):
         text = json.dumps(body, indent=1)
         split = "".join(f"data:{line}\r\n" for line in text.splitlines())
         raw = (": a comment\r\nevent: message\r\nid: 7\r\n" + split + "\r\n")
-        self.assertEqual([t["name"] for t in self.discovery.parse_tools(raw)], ["x"])
+        self.assertEqual([t["name"] for t in self.parse(raw)], ["x"])
 
     def test_a_stream_that_never_answers_our_request_is_an_error(self):
         for raw in ('data: {"jsonrpc":"2.0","method":"notifications/progress",'
@@ -195,13 +234,13 @@ class ParseTests(unittest.TestCase):
                     sse({"tools": []}).replace('"id": 1', '"id": 2')):
             with self.subTest(raw=raw), \
                     self.assertRaises(self.discovery.DiscoveryError) as caught:
-                self.discovery.parse_tools(raw)
+                self.parse(raw)
             self.assertIn("no response", str(caught.exception))
 
     def test_a_malformed_reply_is_a_line_in_the_report_not_a_dead_thread(self):
         # Through `reconcile`, which is what the loop calls: the shape error has to
         # arrive as the DiscoveryError it catches, and read as NOT ENUMERATED.
-        self.discovery.post = lambda *_a, **_k: "[]"
+        self.discovery.post = lambda *_a, **_k: read(self.discovery, "[]")
         report = "\n".join(self.discovery.format_report([self.discovery.reconcile(ENTRY)]))
         self.assertIn("NOT ENUMERATED", report)
         self.assertIn("expected a JSON object", report)
@@ -225,12 +264,8 @@ class PlacementTests(unittest.TestCase):
         self.discovery.read_secret = lambda server: "the-token"
         self.dialled = []
 
-        @contextlib.contextmanager
-        def urlopen(request, *args, **kwargs):
-            self.dialled.append(request)
-            yield mock.Mock(read=lambda: sse({"tools": []}).encode())
-
-        patcher = mock.patch.object(self.discovery._OPENER, "open", urlopen)
+        patcher = mock.patch.object(self.discovery._OPENER, "open",
+                                    echoing({"tools": []}, self.dialled))
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -493,13 +528,450 @@ class RedirectTests(unittest.TestCase):
         self.assertIn("not an HTTP reply", self._post_to(listener.getsockname()[1]))
 
 
+class _Upstream:
+    """A stand-in MCP server on loopback for what a server does on a call's stream:
+    threaded, HTTP/1.1, each call's reply SSE in chunks as it is written.
+
+    A POST carrying a ``method`` is a call, handed to ``on_call(handler, message,
+    upstream)`` to stream its reply; any other is an answer to a request the server
+    sent, recorded and answered with ``answer_status``. Every wait is bounded by
+    ``WAIT``, so a reader that gets it wrong fails rather than hangs."""
+
+    WAIT = 5
+
+    def __init__(self, test, on_call, answer_status=202, answer_headers=(),
+                 answer_reason=None, answer_delay=0.0):
+        self.calls: list[dict] = []
+        self.answers: list[dict] = []
+        self.changed = threading.Condition()
+        upstream = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):
+                message = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if "method" in message:
+                    with upstream.changed:
+                        upstream.calls.append(message)
+                        upstream.changed.notify_all()
+                    self.close_connection = True
+                    # The reader may close the stream at the response.
+                    with contextlib.suppress(OSError):
+                        on_call(self, message, upstream)
+                    return
+                with upstream.changed:
+                    upstream.answers.append({"path": self.path,
+                                             "host": self.headers["Host"],
+                                             "auth": self.headers["Authorization"],
+                                             "message": message})
+                    upstream.changed.notify_all()
+                time.sleep(answer_delay)
+                # An answer the gateway stopped waiting for has no one to read it.
+                with contextlib.suppress(OSError):
+                    self.send_response(answer_status, answer_reason)
+                    for name, value in answer_headers:
+                        self.send_header(name, value)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+
+            def stream(self):
+                self.streaming = True
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+
+            def chunk(self, data: bytes):
+                self.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
+                self.wfile.flush()
+
+            def event(self, message: dict, end: bytes = b"\n"):
+                self.chunk(b"data: " + json.dumps(message).encode() + end + end)
+
+            def finish(self):
+                if getattr(self, "streaming", False):
+                    with contextlib.suppress(OSError):
+                        self.wfile.write(b"0\r\n\r\n")
+                super().finish()
+
+            def log_message(self, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.daemon_threads = True
+        server.block_on_close = False
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        test.addCleanup(server.server_close)
+        test.addCleanup(server.shutdown)
+        self.server = server
+        self.port = server.server_address[1]
+
+    def wait_for(self, predicate) -> bool:
+        with self.changed:
+            return self.changed.wait_for(lambda: predicate(self), timeout=self.WAIT)
+
+
+def _result(text: str) -> dict:
+    return {"content": [{"type": "text", "text": text}]}
+
+
+class ServerRequestTests(unittest.TestCase):
+    """What a server sends on a call's own stream, through the real ``post`` and
+    urllib over loopback, getaddrinfo patched as in RedirectTests. A stateful server
+    sends a request there and holds the call until it is answered, and keys each
+    call's stream by its id (NOTES.md, "A stateful MCP server talks back on a call's
+    stream")."""
+
+    def setUp(self):
+        self.call = {"jsonrpc": "2.0", "method": "tools/call",
+                     "params": {"name": "delete_thing", "arguments": {}}}
+        self.discovery = load_discovery({"GATEWAY_MCP_NET": "127.0.0.0/8"})
+        self.secrets_read = 0
+
+        def read_secret(server):
+            # A new token per read, so an answer that read the credential again rather
+            # than taking the call's headers carries the wrong one.
+            self.secrets_read += 1
+            return f"token-{self.secrets_read}"
+
+        self.discovery.read_secret = read_secret
+        self.lookups = []
+
+        def getaddrinfo(host, port, *_args, **_kwargs):
+            self.lookups.append(host)
+            return [(2, 1, 6, "", ("127.0.0.1", port))]
+
+        patcher = mock.patch("socket.getaddrinfo", getaddrinfo)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def post(self, upstream, message=None):
+        entry = {**ENTRY, "endpoint": {"port": upstream.port, "path": "/mcp"}}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            response = self.discovery.post(entry, message or self.call, timeout=10)
+        return response, out.getvalue().splitlines()
+
+    def refusal(self, method: str) -> str:
+        return (f"tool-gateway: mcp-github: refused its {method} request on a call's "
+                f"stream; nothing a server asks reaches the agent")
+
+    def test_each_request_is_answered_as_it_arrives_on_the_calls_own_terms(self):
+        # The SDK's elicitation carries the call's own id; the result is withheld
+        # until all three are answered, so a reader that answers only once it has
+        # read the whole reply never gets it.
+        def on_call(handler, message, upstream):
+            handler.stream()
+            handler.event({"jsonrpc": "2.0", "method": "notifications/message",
+                           "params": {"level": "info", "data": "working"}})
+            handler.event({"jsonrpc": "2.0", "id": message["id"],
+                           "method": "elicitation/create",
+                           "params": {"message": "Sure?", "requestedSchema": {}}})
+            handler.event({"jsonrpc": "2.0", "id": "r-1", "method": "roots/list"})
+            handler.event({"jsonrpc": "2.0", "id": 0, "method": "ping"})
+            if upstream.wait_for(lambda u: len(u.answers) >= 3):
+                handler.event({"jsonrpc": "2.0", "id": message["id"],
+                               "result": _result("done")})
+
+        upstream = _Upstream(self, on_call)
+        response, lines = self.post(upstream)
+        [call] = upstream.calls
+        self.assertEqual(response, {"jsonrpc": "2.0", "id": call["id"],
+                                    "result": _result("done")})
+        refused = {"code": -32601,
+                   "message": "the gateway answers no requests from a server"}
+        self.assertEqual([answer["message"] for answer in upstream.answers],
+                         [{"jsonrpc": "2.0", "id": call["id"], "error": refused},
+                          {"jsonrpc": "2.0", "id": "r-1", "error": refused},
+                          {"jsonrpc": "2.0", "id": 0, "result": {}}])
+        for answer in upstream.answers:
+            self.assertEqual((answer["path"], answer["host"], answer["auth"]),
+                             ("/mcp", f"mcp-github:{upstream.port}", "Bearer token-1"))
+        self.assertEqual(self.secrets_read, 1)
+        # One lookup of the name across the call and every answer: an answer goes to
+        # the address the call was placed at, not to the name resolved again. The
+        # rest are socket.create_connection passing each dial's address literal
+        # through getaddrinfo, which asks no resolver; there is one per dial.
+        names = [host for host in self.lookups if host != "127.0.0.1"]
+        self.assertEqual(names, ["mcp-github"])
+        self.assertEqual(len(self.lookups), 1 + 1 + len(upstream.answers))
+        self.assertEqual(lines, [self.refusal("elicitation/create"),
+                                 self.refusal("roots/list")])
+
+    def test_a_method_cannot_forge_a_log_line_and_is_capped(self):
+        forged = "x\rtool-gateway: mcp-github: 9 tools exposed\x1b[2K"
+
+        def on_call(handler, message, upstream):
+            handler.stream()
+            handler.event({"jsonrpc": "2.0", "id": 1, "method": forged})
+            handler.event({"jsonrpc": "2.0", "id": 2, "method": "m" * 500})
+            handler.event({"jsonrpc": "2.0", "id": message["id"], "result": {}})
+
+        _response, lines = self.post(_Upstream(self, on_call))
+        self.assertEqual(lines, [
+            self.refusal("x\\rtool-gateway: mcp-github: 9 tools exposed\\x1b[2K"),
+            self.refusal("m" * 120)])
+
+    def test_overlapping_calls_each_get_their_own_result(self):
+        # Held until both have arrived, so a lock around the whole call cannot pass;
+        # an id seen before is rejected, as the SDK loses one of two calls sharing it.
+        def on_call(handler, message, upstream):
+            handler.stream()
+            if [call["id"] for call in upstream.calls].count(message["id"]) > 1:
+                handler.event({"jsonrpc": "2.0", "id": message["id"],
+                               "error": {"code": -32600, "message": "id reused"}})
+            elif upstream.wait_for(lambda u: len(u.calls) >= 2):
+                who = message["params"]["arguments"]["who"]
+                handler.event({"jsonrpc": "2.0", "id": message["id"],
+                               "result": _result(who)})
+
+        upstream = _Upstream(self, on_call)
+        entry = {**ENTRY, "endpoint": {"port": upstream.port, "path": "/mcp"}}
+        results = {}
+
+        def call(who):
+            message = {**self.call, "params": {"name": "t", "arguments": {"who": who}}}
+            try:
+                results[who] = self.discovery.post(entry, message, timeout=10)
+            except self.discovery.DiscoveryError as exc:
+                results[who] = str(exc)
+
+        threads = [threading.Thread(target=call, args=(who,), daemon=True)
+                   for who in "ab"]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(3 * _Upstream.WAIT)
+        self.assertEqual({who: result.get("result") if isinstance(result, dict)
+                          else result for who, result in results.items()},
+                         {"a": _result("a"), "b": _result("b")})
+
+    def test_the_reply_is_left_at_the_response_however_its_lines_end(self):
+        # The SDK's stream outlives its response; pinging after it, it ends only when
+        # this stand-in gives up, which a reader waiting for the end would wait for.
+        for end in (b"\n", b"\r", b"\r\n"):
+            with self.subTest(end=end):
+                gave_up = threading.Event()
+
+                def on_call(handler, message, upstream, end=end, gave_up=gave_up):
+                    handler.stream()
+                    handler.event({"jsonrpc": "2.0", "id": message["id"],
+                                   "result": _result("done")}, end)
+                    deadline = time.monotonic() + _Upstream.WAIT
+                    while time.monotonic() < deadline:
+                        handler.chunk(b": ping" + end + end)
+                        time.sleep(0.05)
+                    gave_up.set()
+
+                response, _lines = self.post(_Upstream(self, on_call))
+                self.assertFalse(gave_up.is_set())
+                self.assertEqual(response["result"], _result("done"))
+
+    def test_a_redirected_answer_is_not_followed_and_the_call_still_returns(self):
+        seen = []
+
+        class Sink(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append(self.headers.get("Authorization"))
+                self.send_response(200)
+                self.end_headers()
+
+            do_POST = do_GET
+
+            def log_message(self, *_args):
+                pass
+
+        sink = http.server.HTTPServer(("127.0.0.1", 0), Sink)
+        self.addCleanup(sink.server_close)
+        threading.Thread(target=sink.serve_forever, daemon=True).start()
+        self.addCleanup(sink.shutdown)
+
+        def on_call(handler, message, upstream):
+            handler.stream()
+            handler.event({"jsonrpc": "2.0", "id": 5, "method": "ping"})
+            handler.event({"jsonrpc": "2.0", "id": message["id"],
+                           "result": _result("done")})
+
+        for code in (301, 302, 303, 307, 308):
+            with self.subTest(code=code):
+                upstream = _Upstream(
+                    self, on_call, answer_status=code,
+                    answer_headers=[("Location", f"http://127.0.0.1:"
+                                                 f"{sink.server_address[1]}/x")])
+                response, lines = self.post(upstream)
+                self.assertEqual(response["result"], _result("done"))
+                [line] = lines
+                self.assertTrue(line.startswith(
+                    f"tool-gateway: mcp-github: the answer to its ping request was "
+                    f"not delivered — HTTP {code} from mcp-github, a redirect, not "
+                    f"followed"), line)
+        self.assertEqual(seen, [])
+
+    def test_a_json_body_is_read_whole(self):
+        # How the task registry answers: one JSON body, no stream.
+        def on_call(handler, message, upstream):
+            body = json.dumps({"jsonrpc": "2.0", "id": message["id"],
+                               "result": _result("whole")}).encode()
+            handler.send_response(200)
+            handler.send_header("Content-Type", "application/json")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+
+        upstream = _Upstream(self, on_call)
+        # Twice, so the second carries an id other than 1: a reader that matched the
+        # whole body on a constant would still pass on the first.
+        responses = [self.post(upstream)[0] for _ in range(2)]
+        self.assertEqual(responses, [{"jsonrpc": "2.0", "id": call["id"],
+                                      "result": _result("whole")}
+                                     for call in upstream.calls])
+        self.assertNotEqual(upstream.calls[1]["id"], 1)
+
+    #: The start of the line a ping's undelivered answer logs.
+    UNDELIVERED = ("tool-gateway: mcp-github: the answer to its ping request was not "
+                   "delivered — ")
+
+    @staticmethod
+    def _ping_then_result(handler, message, upstream):
+        handler.stream()
+        handler.event({"jsonrpc": "2.0", "id": 5, "method": "ping"})
+        handler.event({"jsonrpc": "2.0", "id": message["id"], "result": _result("done")})
+
+    def test_a_refused_answer_is_logged_and_the_call_still_returns(self):
+        def on_call(handler, message, upstream):
+            # The port closes once the call is in, so the answer's connect is refused.
+            upstream.server.shutdown()
+            upstream.server.socket.close()
+            self._ping_then_result(handler, message, upstream)
+
+        response, lines = self.post(_Upstream(self, on_call))
+        self.assertEqual(response["result"], _result("done"))
+        [line] = lines
+        self.assertTrue(line.startswith(self.UNDELIVERED + "unreachable: "), line)
+        self.assertIn("refused", line)
+
+    def test_an_answer_that_times_out_is_logged_and_the_call_still_returns(self):
+        upstream = _Upstream(self, self._ping_then_result, answer_delay=1.5)
+        with mock.patch.object(self.discovery, "TIMEOUT", 0.3):
+            response, lines = self.post(upstream)
+        self.assertEqual(response["result"], _result("done"))
+        self.assertEqual(lines, [self.UNDELIVERED + "no answer from mcp-github within 0.3s"])
+
+    def test_why_an_answer_failed_is_logged_capped(self):
+        # The reason phrase is the server's, of any length, once per request it sends.
+        upstream = _Upstream(self, self._ping_then_result, answer_status=500,
+                             answer_reason="x" * 20000)
+        response, lines = self.post(upstream)
+        self.assertEqual(response["result"], _result("done"))
+        [line] = lines
+        self.assertEqual(line, self.UNDELIVERED + ("HTTP 500 from mcp-github — '"
+                                                    + "x" * 200)[:200])
+
+    def test_each_request_gets_an_id_of_its_own_whatever_the_caller_sent(self):
+        dialled = []
+        message = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+        with mock.patch.object(self.discovery._OPENER, "open",
+                               echoing({"tools": []}, dialled)):
+            for _ in range(3):
+                self.discovery.post(ENTRY, message)
+        ids = [json.loads(request.data)["id"] for request in dialled]
+        self.assertEqual(len(set(ids)), 3)
+        self.assertTrue(all(type(ident) is int for ident in ids))
+        self.assertEqual(message["id"], 1)
+
+
+class _Chunks:
+    """A reply arriving in the given pieces, one per read, counting the reads."""
+
+    def __init__(self, *pieces: bytes):
+        self.pieces = list(pieces)
+        self.reads = 0
+
+    def read1(self, _size=-1) -> bytes:
+        self.reads += 1
+        return self.pieces.pop(0) if self.pieces else b""
+
+    def read(self, _size=-1) -> bytes:
+        raise AssertionError("an SSE reply was read whole")
+
+
+class ReaderTests(unittest.TestCase):
+    """``read_reply`` in memory: how a stream is cut into events, and what is a
+    request, a response, or neither."""
+
+    def setUp(self):
+        self.discovery = load_discovery()
+        self.handed = []
+
+    def read(self, *pieces: bytes, content_type="text/event-stream", request_id=1):
+        return self.discovery.read_reply(_Chunks(*pieces), content_type, request_id,
+                                         self.handed.append)
+
+    def test_an_event_split_inside_a_character_is_decoded_whole(self):
+        text = '{"jsonrpc":"2.0","id":1,"result":{"t":"räk"}}'.encode()
+        cut = text.index("ä".encode()) + 1
+        response = self.read(b"data: " + text[:cut], text[cut:] + b"\n\n")
+        self.assertEqual(response["result"], {"t": "räk"})
+
+    def test_a_crlf_split_between_reads_is_one_line_end(self):
+        response = self.read(b'data: {"jsonrpc":"2.0",\r',
+                             b'\ndata: "id":1,"result":{}}\r\n\r\n')
+        self.assertEqual(response, {"jsonrpc": "2.0", "id": 1, "result": {}})
+
+    def test_a_request_is_handed_over_before_the_next_read(self):
+        stream = _Chunks(b'data: {"jsonrpc":"2.0","id":"q","method":"ping"}\n\n',
+                         b'data: {"jsonrpc":"2.0","id":1,"result":{}}\n\n')
+        reads_when_handed = []
+        self.discovery.read_reply(stream, "text/event-stream", 1,
+                                  lambda request: reads_when_handed.append(stream.reads))
+        self.assertEqual(reads_when_handed, [1])
+
+    def test_only_a_string_or_an_integer_id_makes_a_request(self):
+        events = [{"method": "a", "id": "s"}, {"method": "b", "id": 0},
+                  {"method": "c", "id": True}, {"method": "d", "id": None},
+                  {"method": "e", "id": 1.5}, {"method": "f"},
+                  {"method": "g", "id": ["x"]}]
+        self.read(*(b"data: " + json.dumps(event).encode() + b"\n\n" for event in events),
+                  b'data: {"id":1,"result":{}}\n\n')
+        self.assertEqual([request["method"] for request in self.handed], ["a", "b"])
+
+    def test_a_response_to_another_id_or_a_bool_one_is_not_ours(self):
+        response = self.read(b'data: {"id":true,"result":"bool"}\n\n',
+                             b'data: {"id":2,"result":"other"}\n\n',
+                             b'data: {"id":1,"result":"ours"}\n\n')
+        self.assertEqual(response["result"], "ours")
+        self.assertEqual(self.read(b'data: {"id":null,"result":"null"}\n\n')["result"],
+                         "null")
+
+    def test_the_media_type_is_read_with_any_parameters_and_any_case(self):
+        for content_type in ("text/event-stream; charset=utf-8", "Text/Event-Stream",
+                             " text/event-stream"):
+            with self.subTest(content_type=content_type):
+                self.assertEqual(
+                    self.read(b'data: {"id":1,"result":{}}\n\n',
+                              content_type=content_type)["result"], {})
+
+    def test_any_other_type_is_read_whole_and_its_requests_go_unanswered(self):
+        body = (b'data: {"jsonrpc":"2.0","id":"q","method":"ping"}\n\n'
+                b'data: {"jsonrpc":"2.0","id":1,"result":{}}\n\n')
+        for content_type in ("application/json", None):
+            with self.subTest(content_type=content_type):
+                response = self.discovery.read_reply(io.BytesIO(body), content_type, 1,
+                                                     self.handed.append)
+                self.assertEqual(response["result"], {})
+        self.assertEqual(self.handed, [])
+
+    def test_an_event_with_no_data_is_passed_over(self):
+        with self.assertRaises(self.discovery.DiscoveryError) as caught:
+            self.read(b"data:\n\ndata: \n\n")
+        self.assertEqual(str(caught.exception),
+                         "the reply carried no response to the request")
+
+
 def _list_tools_of(discovery, entries: list):
     """``list_tools`` against a server whose tool list is exactly ``entries``."""
-    @contextlib.contextmanager
-    def urlopen(*_args, **_kwargs):
-        yield mock.Mock(read=lambda: sse({"tools": entries}).encode())
-
-    with mock.patch.object(discovery._OPENER, "open", urlopen), \
+    with mock.patch.object(discovery._OPENER, "open", echoing({"tools": entries})), \
             mock.patch("socket.getaddrinfo", _resolves_to("172.28.0.11")):
         return discovery.list_tools({**ENTRY, "auth": {"type": "none"}})
 
@@ -607,7 +1079,7 @@ class MalformedEntryTests(unittest.TestCase):
     def test_the_report_gives_both_counts_and_no_server_text(self):
         entries = [{"name": "get_issue"}, {"name": ["evil\nline"]},
                    {"name": "create_pr", "annotations": "evil-text"}]
-        self.discovery.post = lambda *_a, **_k: sse({"tools": entries})
+        self.discovery.post = lambda *_a, **_k: response({"tools": entries})
         result = self.discovery.reconcile(ENTRY)
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["exposed"], 2)
@@ -618,7 +1090,7 @@ class MalformedEntryTests(unittest.TestCase):
                           "1 of them dropped"])
 
     def test_a_well_formed_reply_prints_no_malformed_line(self):
-        self.discovery.post = lambda *_a, **_k: sse({"tools": [{"name": "get_issue"}]})
+        self.discovery.post = lambda *_a, **_k: response({"tools": [{"name": "get_issue"}]})
         report = "\n".join(self.discovery.format_report(
             [self.discovery.reconcile(ENTRY)]))
         self.assertNotIn("malformed", report)
@@ -894,7 +1366,7 @@ class ReconcileTests(unittest.TestCase):
                 # raises depends on the Python build, and the guard's job is to catch
                 # it whatever raises it.
                 raise RecursionError("maximum recursion depth exceeded")
-            return sse({"tools": [{"name": "get_issue"}]})
+            return response({"tools": [{"name": "get_issue"}]})
         self.discovery.post = post
         results = self.discovery.reconcile_all([raising, good, deep])
         by_server = {result["server"]: result for result in results}

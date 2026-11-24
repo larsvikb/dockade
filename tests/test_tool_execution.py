@@ -18,6 +18,7 @@ is every decision between them, which is the part that can be wrong.
 """
 from __future__ import annotations
 
+import io
 import json
 import re
 import socket
@@ -82,6 +83,26 @@ def sse(result: dict) -> str:
     return f"data: {json.dumps({'jsonrpc': '2.0', 'id': 1, 'result': result})}\n\n"
 
 
+class Reply(io.BytesIO):
+    """A server's reply as the dial hands it to the reader: a binary stream with a
+    Content-Type."""
+
+    def __init__(self, body: str, content_type: str):
+        super().__init__(body.encode())
+        self.headers = {"Content-Type": content_type}
+
+
+def read(discovery, raw: str) -> dict:
+    """What ``discovery.post`` returns for request 1 answered with ``raw``, through the
+    real reader: as `text/event-stream` when it has a data line, as `application/json`
+    otherwise, as a server labels each. A stand-in for ``post`` that returned text
+    instead would reach ``_run``'s catch-all, which a loose assertion passes."""
+    content_type = ("text/event-stream" if re.search(r"(?m)^data:", raw)
+                    else "application/json")
+    return discovery.read_reply(Reply(raw, content_type), content_type, 1,
+                                lambda request: None)
+
+
 class ExecutionTestCase(unittest.TestCase):
     """A gateway with both its peers replaced by recorders."""
 
@@ -102,7 +123,7 @@ class ExecutionTestCase(unittest.TestCase):
         def post(entry, message, timeout=None):
             self.called.append({"entry": entry, "message": message,
                                 "timeout": timeout})
-            return self.reply
+            return read(self.execute.discovery, self.reply)
 
         self.execute._ask_control = ask_control
         self._real_post = self.execute.discovery.post
@@ -943,20 +964,23 @@ class WithdrawTests(ExecutionTestCase):
 
 class UpstreamReplyTests(ExecutionTestCase):
 
+    def parse(self, raw: str) -> tuple[dict, str]:
+        return self.execute.parse_call(read(self.execute.discovery, raw))
+
     def test_the_sse_shape_is_parsed(self):
         self.assertEqual(
-            self.execute.parse_call(sse({"content": [], "isError": False})),
+            self.parse(sse({"content": [], "isError": False})),
             ({"content": [], "isError": False}, "ok"))
 
     def test_a_plain_json_body_is_also_parsed(self):
         # Legal for this transport and not what the server sends today. Accepted so a
         # version bump cannot turn every tool call into a parse failure.
         body = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"content": []}})
-        self.assertEqual(self.execute.parse_call(body), ({"content": []}, "ok"))
+        self.assertEqual(self.parse(body), ({"content": []}, "ok"))
 
     def test_a_rejection_with_a_null_id_is_still_the_answer(self):
         # How a server answers a request it could not parse: it cannot know our id.
-        _, status = self.execute.parse_call(
+        _, status = self.parse(
             'data: {"jsonrpc":"2.0","id":null,"error":{"code":-32700}}\n\n')
         self.assertEqual(status, "rpc-error")
 
@@ -968,7 +992,7 @@ class UpstreamReplyTests(ExecutionTestCase):
         # cannot: both leave here error-flagged.
         body = json.dumps({"jsonrpc": "2.0", "id": 1,
                            "error": {"code": -32602, "message": "bad params"}})
-        result, status = self.execute.parse_call(body)
+        result, status = self.parse(body)
         self.assertTrue(result["isError"])
         self.assertEqual(status, "rpc-error")
         self.assertIn("rejected the call", self.text(result))
@@ -980,7 +1004,7 @@ class UpstreamReplyTests(ExecutionTestCase):
         # success it would be audited as a PR that was opened.
         ran_and_failed = sse({"content": [{"type": "text", "text": "403"}],
                               "isError": True})
-        self.assertEqual(self.execute.parse_call(ran_and_failed)[1], "tool-error")
+        self.assertEqual(self.parse(ran_and_failed)[1], "tool-error")
 
     def test_only_a_literal_true_claims_failure(self):
         # Absent and false both mean the tool is not claiming failure, and a truthy
@@ -991,7 +1015,7 @@ class UpstreamReplyTests(ExecutionTestCase):
             with self.subTest(flag=flag):
                 body = {"content": []} if flag is None else {"content": [],
                                                              "isError": flag}
-                self.assertEqual(self.execute.parse_call(sse(body))[1], "ok")
+                self.assertEqual(self.parse(sse(body))[1], "ok")
 
     def test_valid_json_that_is_not_an_object_is_an_error_not_a_crash(self):
         # `"error" in message` and `message.get(...)` assume a dict. A bare string, a
@@ -1001,7 +1025,7 @@ class UpstreamReplyTests(ExecutionTestCase):
                     'data: "ok"\n\n', "data: []\n\n"):
             with self.subTest(raw=raw):
                 with self.assertRaises(self.execute.discovery.DiscoveryError) as caught:
-                    self.execute.parse_call(raw)
+                    self.parse(raw)
                 self.assertIn("expected a JSON object", str(caught.exception))
 
     def test_a_reply_that_is_not_one_is_an_error_rather_than_an_empty_result(self):
@@ -1010,7 +1034,7 @@ class UpstreamReplyTests(ExecutionTestCase):
         for raw in ("", "not json at all", '{"jsonrpc":"2.0","id":1}'):
             with self.subTest(raw=raw), \
                  self.assertRaises(self.execute.discovery.DiscoveryError):
-                self.execute.parse_call(raw)
+                self.parse(raw)
 
     def test_an_unreachable_server_is_reported_as_a_failed_call(self):
         def boom(entry, message, timeout=None):
@@ -1469,7 +1493,7 @@ class OutcomeRecordTests(ExecutionTestCase):
         # The monotonic clock around the dial and its parse.
         def slow(entry, message, timeout=None):
             time.sleep(0.05)
-            return self.reply
+            return read(self.execute.discovery, self.reply)
         self.execute.discovery.post = slow
         self.allow()
         self.assertGreaterEqual(self.rows[0]["duration"], 0.05)
@@ -1499,7 +1523,7 @@ class OutcomeRecordTests(ExecutionTestCase):
                 self.assertIsNone(self.rows[0]["duration"])
 
     #: Results `protocol.encode` refuses, as a server's raw reply text so each passes
-    #: through `discovery.response_message`'s real parse, and the reason's words for
+    #: through `discovery.read_reply`'s real parse, and the reason's words for
     #: each. `1e999` is strictly valid JSON that `json.loads` reads as an infinity.
     NON_FINITE = "it held NaN or an infinity"
     SURROGATE = "it held a lone surrogate"

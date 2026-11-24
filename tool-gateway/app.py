@@ -330,10 +330,11 @@ def _reconcile_forever(stop: threading.Event) -> None:
     A DAEMON loop that cannot fail the process, and — since the process would carry
     on without it — cannot be allowed to die either: ``discovery.poll`` swallows its
     own errors and returns them as text, ``discovery.reconcile_all`` guards each
-    server so one server's reply cannot stop the round, the rest of an iteration
-    (publish, report, push) is guarded below so an exception there costs one tick
-    rather than every future one, and the sleep is on an Event so a shutdown is not
-    held for the interval.
+    server so one server's reply or roster entry cannot stop the round, the rest of
+    an iteration (publish, report, push) is guarded below so an exception there costs
+    one tick rather than every future one, and the sleep is on an Event so a shutdown
+    is not held for the interval. Only the entries ``discovery.entry_fault`` passes
+    reach ``surface.publish``.
 
     POLLING AND SPEAKING ARE DIFFERENT RATES, and the split is the design. The roster
     is re-read every ROSTER_INTERVAL; the servers are dialled — and a report printed —
@@ -390,7 +391,13 @@ def _reconcile_once(enumerated, reachable, deadline):
             #
             # What it withheld is told before the report, so a report that raises
             # cannot swallow it.
-            for server, tool, why in surface.publish(roster, results):
+            #
+            # Only the entries `entry_fault` passes are published (see
+            # `surface.publish`); the digest stays over the raw roster, so fixing an
+            # entry is a change.
+            readable = [entry for entry in roster
+                        if discovery.entry_fault(entry) is None]
+            for server, tool, why in surface.publish(readable, results):
                 print(f"tool-gateway: {surface.exposed_name(server, tool)} is not in "
                       f"the agent's tool list: its description or input schema holds "
                       f"{why}, which the reply cannot carry. Calls to it are still "

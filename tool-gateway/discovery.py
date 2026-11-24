@@ -232,6 +232,47 @@ def check_endpoint(endpoint) -> tuple[int, str]:
     return port, path
 
 
+def entry_fault(entry) -> str | None:
+    """Why a roster entry cannot be read, or None if it can.
+
+    Only the shape every reader of an entry relies on: ``reconcile``, ``post``,
+    ``surface.curate`` and ``surface.publish`` index these fields directly. A failure
+    in the first two is one failed server under ``reconcile_all``'s guard, but one in
+    ``curate`` or ``publish``, or the guard's own read of a non-object entry, ends the
+    whole round; checked first, these shapes fail none of them. The name's validity
+    and the endpoint stay with ``check_name`` and ``check_endpoint``, at each dial.
+    Absent ``tools`` is no rules and absent or null ``auth`` is no descriptor, as the
+    readers take them; extra keys are ignored. The reasons are fixed words, quoting
+    nothing from the entry."""
+    if not isinstance(entry, dict):
+        return "the roster entry is not an object"
+    if not isinstance(entry.get("server"), str):
+        return "the roster entry's \"server\" is not a string"
+    if "tools" in entry:
+        rules = entry["tools"]
+        if not isinstance(rules, list):
+            return "the roster entry's \"tools\" is not a list"
+        for rule in rules:
+            if not isinstance(rule, dict):
+                return "a rule in the roster entry's \"tools\" is not an object"
+            if not isinstance(rule.get("tool"), str):
+                return "a rule in the roster entry's \"tools\" has no string \"tool\""
+            if not isinstance(rule.get("action"), str):
+                return "a rule in the roster entry's \"tools\" has no string \"action\""
+    if entry.get("auth") is not None and not isinstance(entry["auth"], dict):
+        return "the roster entry's \"auth\" is not an object"
+    return None
+
+
+def entry_name(entry, position: int) -> str:
+    """What a report and a push call a roster entry: its ``server`` when that is a
+    string, otherwise ``roster entry N`` from its 1-based ``position``. The placeholder
+    holds a space, so it is no DNS label: no real server shares it, and the control
+    plane's inventory skips it as it skips any invalid name."""
+    server = entry.get("server") if isinstance(entry, dict) else None
+    return server if isinstance(server, str) else f"roster entry {position}"
+
+
 def secret_path(server: str) -> str:
     """Where a server's token lives. One definition, because it is quoted in errors as
     well as opened, and an error naming a path nobody reads is worse than none."""
@@ -880,14 +921,23 @@ def reconcile_all(roster: list[dict]) -> list[dict]:
     message, which is why an input whose exception would quote a secret (a header
     value http.client refuses) is refused before the dial instead (``auth_header``).
 
+    An entry of a shape ``entry_fault`` refuses reads NOT ENUMERATED too, with that
+    reason and no dial. Both failures are named by ``entry_name``, so the guard's own
+    handler cannot raise whatever the entry is.
+
     No ``rules`` count, unlike a failed dial's result: nothing reads one on a server
     that was not enumerated."""
     results = []
-    for entry in roster:
+    for position, entry in enumerate(roster, 1):
+        server = entry_name(entry, position)
+        fault = entry_fault(entry)
+        if fault is not None:
+            results.append({"server": server, "status": fault})
+            continue
         try:
             results.append(reconcile(entry))
         except Exception as exc:  # noqa: BLE001 — one server must not stop the round
-            results.append({"server": entry.get("server"),
+            results.append({"server": server,
                             "status": f"gateway failed reconciling it "
                                       f"({type(exc).__name__}: {exc})"})
     return results

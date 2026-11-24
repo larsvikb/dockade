@@ -1385,6 +1385,68 @@ class ReconcileTests(unittest.TestCase):
         self.assertIn("mcp-deep: NOT ENUMERATED", report)
         self.assertIn("mcp-good: 1 tool exposed", report)
 
+    def test_a_malformed_roster_entry_is_one_failed_server_and_is_not_dialled(self):
+        # On main each of these either ended the round (the handler's own entry.get on
+        # a non-object; surface.curate and publish on the field shapes) or read as an
+        # ok server. Each reading is one result in roster order, named by its server
+        # or by its 1-based position, with a reason and no tools.
+        good = {**ENTRY, "server": "mcp-good"}
+        def bad(**over):
+            return {**ENTRY, "server": "mcp-bad", **over}
+        shapes = [
+            ("x", "roster entry 2", "is not an object"),
+            (None, "roster entry 2", "is not an object"),
+            (1, "roster entry 2", "is not an object"),
+            ({**ENTRY, "server": ["x"]}, "roster entry 2", '"server" is not a string'),
+            ({k: v for k, v in ENTRY.items() if k != "server"}, "roster entry 2",
+             '"server" is not a string'),
+            (bad(auth="x"), "mcp-bad", '"auth" is not an object'),
+            (bad(tools={"get_me": "allow"}), "mcp-bad", '"tools" is not a list'),
+            (bad(tools=None), "mcp-bad", '"tools" is not a list'),
+            (bad(tools=["get_me"]), "mcp-bad", "is not an object"),
+            (bad(tools=[{"tool": "get_me", "action": "allow"}, {"tool": "get_me"}]),
+             "mcp-bad", 'no string "action"'),
+            (bad(tools=[{"tool": ["x"], "action": "allow"}]), "mcp-bad",
+             'no string "tool"'),
+            (bad(tools=[{"tool": "get_me", "action": 1}]), "mcp-bad",
+             'no string "action"'),
+        ]
+        for entry, name, reason in shapes:
+            with self.subTest(entry=entry):
+                dialled = []
+                def post(entry, *_a, **_k):
+                    dialled.append(entry["server"])
+                    return response({"tools": [{"name": "get_issue"}]})
+                self.discovery.post = post
+                ok, failed = self.discovery.reconcile_all([good, entry])
+                self.assertEqual(dialled, ["mcp-good"])
+                self.assertEqual(ok["status"], "ok")
+                self.assertEqual([t["name"] for t in ok["tools"]], ["get_issue"])
+                self.assertEqual(failed["server"], name)
+                self.assertIn(reason, failed["status"])
+                self.assertNotIn("tools", failed)
+                self.assertIn(f"{name}: NOT ENUMERATED",
+                              "\n".join(self.discovery.format_report([ok, failed])))
+
+    def test_a_roster_shaped_entry_passes_the_shape_check(self):
+        # What api_tool.tool_roster sends, and what the readers take as no rules and
+        # no descriptor: a stricter check would drop a real server.
+        for entry in (ENTRY, {**ENTRY, "tools": []}, {**ENTRY, "auth": None},
+                      {"server": "mcp-github"}):
+            with self.subTest(entry=entry):
+                self.assertIsNone(self.discovery.entry_fault(entry))
+
+    def test_the_guards_handler_names_an_entry_it_cannot_read(self):
+        # The shape check let through, the handler alone must still not raise on a
+        # non-object entry: on main its own entry.get escaped the guard.
+        good = {**ENTRY, "server": "mcp-good"}
+        self.discovery.post = lambda *_a, **_k: response({"tools": []})
+        self.discovery.entry_fault = lambda _entry: None
+        failed, ok = self.discovery.reconcile_all(["x", good])
+        self.assertEqual(failed["server"], "roster entry 1")
+        self.assertIn("gateway failed reconciling it", failed["status"])
+        self.assertEqual(ok["status"], "ok")
+
     def test_a_template_that_cannot_be_sent_is_refused_without_the_secret(self):
         # http.client's own refusal quotes the whole header value, token included, and
         # the status is pushed to the control plane and served from it.

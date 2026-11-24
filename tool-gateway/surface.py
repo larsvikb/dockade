@@ -283,7 +283,9 @@ def publish(roster: list[dict], results: list[dict]) -> list[tuple[str, str, str
 
     A server that left the ROSTER does lose its tools, and that is a different event:
     it was disabled or revoked by an operator, which is an answer rather than a
-    failure to ask."""
+    failure to ask. So does one whose entry the caller left out because it could not be
+    read (``discovery.entry_fault``): the entry was the authority's word, and there is
+    no reading of it to act on."""
     global _ENUMERATED, _LISTING, _SERVERS
     enabled = {entry.get("server") for entry in roster}
     enumerated = {server: tools for server, tools in _ENUMERATED.items()
@@ -300,8 +302,9 @@ def publish(roster: list[dict], results: list[dict]) -> list[tuple[str, str, str
     # The roster itself, kept because EXECUTION needs the auth descriptor and the
     # endpoint, and the listing carries neither. Rebuilt outright rather than merged:
     # unlike the enumeration above, a server missing here is missing because the
-    # authority said so, and holding a descriptor for a server an operator disabled
-    # would be keeping the means to dial something we have been told not to.
+    # authority said so, or because its entry could not be read, and holding a
+    # descriptor for either would be keeping the means to dial something the authority
+    # does not now vouch for.
     _SERVERS = {entry["server"]: entry for entry in roster if entry.get("server")}
     return withheld
 
@@ -332,12 +335,14 @@ def served_schema(server: str, tool: str) -> dict | None:
 
 
 def server_entry(server: str) -> dict | None:
-    """The roster entry for ``server``, or None if it is not on the current roster.
+    """The roster entry for ``server``, or None if it is not on the current roster or
+    its entry there could not be read.
 
     None is a REFUSAL rather than a lookup miss, and the caller must treat it as one.
     The entry carries the auth descriptor, so a server that is absent here cannot be
     dialled correctly — and it is absent precisely when the control plane stopped
-    naming it, which is an operator disabling or revoking it. Falling back to dialling
-    without credentials would turn that switch into a 401 the agent reads as a broken
-    tool rather than as a closed one."""
+    naming it, which is an operator disabling or revoking it, or when the entry it sent
+    was of a shape ``discovery.entry_fault`` refuses. Falling back to dialling without
+    credentials would turn that switch into a 401 the agent reads as a broken tool
+    rather than as a closed one."""
     return _SERVERS.get(server)

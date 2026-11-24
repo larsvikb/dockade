@@ -139,6 +139,8 @@ class ReconcilePacingTests(unittest.TestCase):
         pushed = []
 
         class FakeDiscovery:
+            entry_fault = staticmethod(load_discovery().entry_fault)
+
             @staticmethod
             def poll():
                 return next(replies)
@@ -244,6 +246,8 @@ class ReconcileSurvivalTests(unittest.TestCase):
         calls = []
 
         class FakeDiscovery:
+            entry_fault = staticmethod(load_discovery().entry_fault)
+
             @staticmethod
             def poll():
                 return ([{"server": "s", "auth": {}, "tools": []}], "")
@@ -321,6 +325,60 @@ class OneBadServerTests(unittest.TestCase):
                       [tool["name"] for tool in gateway.surface.listing()])
         self.assertIn("mcp-bad: NOT ENUMERATED", out.getvalue())
 
+    def _round(self, roster, surface=None):
+        """One ``_reconcile_once`` over ``roster`` with the real discovery and
+        ``surface`` (a fresh one if not given), every server answering with
+        ``get_issue``. Returns the gateway, its discovery, what was pushed, what was
+        printed and the digest the round reports it enumerated."""
+        gateway = load_tool_gateway(GOOD)
+        gateway.surface = surface or load_surface()
+        discovery = load_discovery()
+        discovery.poll = lambda: (roster, "")
+        discovery.post = lambda *_a, **_k: {
+            "jsonrpc": "2.0", "id": 1, "result": {"tools": [{"name": "get_issue"}]}}
+        pushed = []
+        discovery.push_inventory = lambda results: pushed.append(results) or ""
+        gateway.discovery = discovery
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            done, _reachable, _deadline = gateway._reconcile_once(None, None, 0.0)
+        return gateway, discovery, pushed, out.getvalue(), done
+
+    def test_a_malformed_entry_costs_its_server_and_not_the_round(self):
+        # On main the non-object ended reconcile_all in its own handler, and the typed
+        # rule ended surface.curate: either way the round published and pushed nothing.
+        good = {"server": "mcp-good", "auth": {},
+                "tools": [{"tool": "get_issue", "action": "allow"}]}
+        typed = {"server": "mcp-typed", "auth": {},
+                 "tools": [{"tool": ["x"], "action": "allow"}]}
+        roster = [good, "x", typed]
+        gateway, discovery, pushed, printed, done = self._round(roster)
+        self.assertEqual(done, discovery.roster_digest(roster))
+        self.assertIn("mcp-good__get_issue",
+                      [tool["name"] for tool in gateway.surface.listing()])
+        self.assertEqual(len(pushed), 1)
+        self.assertEqual([r["server"] for r in pushed[0]],
+                         ["mcp-good", "roster entry 2", "mcp-typed"])
+        self.assertEqual(set(pushed[0][2]), {"server", "status"})
+        self.assertIn("roster entry 2: NOT ENUMERATED", printed)
+        self.assertIn("mcp-typed: NOT ENUMERATED", printed)
+
+    def test_an_entry_turned_unreadable_leaves_the_listing_and_the_dialable(self):
+        # "auth": "x" is a shape publish takes without raising, so only the filter in
+        # front of it can take the server out: the gateway acts on an entry it could
+        # wholly read, not on last round's.
+        entry = {"server": "mcp-github", "auth": {},
+                 "tools": [{"tool": "get_issue", "action": "allow"}]}
+        gateway, *_ = self._round([entry])
+        surface = gateway.surface
+        self.assertIsNotNone(surface.server_entry("mcp-github"))
+        self.assertIn("mcp-github__get_issue",
+                      [tool["name"] for tool in surface.listing()])
+        self._round([{**entry, "auth": "x"}], surface)
+        self.assertIsNone(surface.server_entry("mcp-github"))
+        self.assertNotIn("mcp-github__get_issue",
+                         [tool["name"] for tool in surface.listing()])
+
     def test_a_malformed_entry_no_longer_needs_the_guard(self):
         discovery = load_discovery()
         discovery.post = lambda *_a, **_k: {
@@ -349,6 +407,7 @@ class ServerTextInTheReportTests(unittest.TestCase):
 
         class FakeDiscovery:
             poll = staticmethod(lambda: (roster, ""))
+            entry_fault = staticmethod(real.entry_fault)
             roster_digest = staticmethod(real.roster_digest)
             reconcile_all = staticmethod(lambda _roster: results)
             format_report = staticmethod(real.format_report)
@@ -389,6 +448,8 @@ class WithheldToolReportTests(unittest.TestCase):
             for name in ["bad", "fine", *(tool["name"] for tool in extra)]]}]
 
         class FakeDiscovery:
+            entry_fault = staticmethod(load_discovery().entry_fault)
+
             @staticmethod
             def poll():
                 return roster, ""

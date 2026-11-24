@@ -280,7 +280,11 @@ COPY claude-sandbox/claude-wrapper.sh /usr/local/bin/claude
 COPY sandbox-common/init-firewall.sh /usr/local/bin/init-firewall.sh
 COPY sandbox-common/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY sandbox-common/boundary-check.sh /usr/local/bin/boundary-check.sh
+# Sourced by tier-setup.sh, not run, so not on PATH: appends the operator's own
+# instructions, when the launcher mounted them, after the baked CLAUDE.md.
+COPY sandbox-common/operator-instructions.sh /usr/local/lib/dockade/operator-instructions.sh
 RUN chmod 0644 /etc/claude-code/user-settings.json /etc/claude-code/CLAUDE.md.template \
+               /usr/local/lib/dockade/operator-instructions.sh \
     && chmod 0755 /etc/claude-code/statusline.sh \
     && chmod 0755 /usr/local/bin/init-firewall.sh /usr/local/bin/entrypoint.sh \
                   /usr/local/bin/boundary-check.sh /usr/local/bin/tier-setup.sh \

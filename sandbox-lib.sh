@@ -186,25 +186,38 @@ _sc_walk_path() {
 }
 
 # dockade's config home holds what every later launch reads from the host: the
-# plugins allowlist and the marketplace checkouts, which load into the agent, and
-# the MCP secrets and backups. A workspace that can write any of them is a channel
-# out of its own session — even when they do not exist yet, because a workspace of
-# ~/.config can create dockade/plugins on a fresh host. So each of the five paths is
-# walked rather than resolved, and every location on the way counts too: a
-# workspace holding ~/.config/dockade -> ~/dotfiles/dockade can replace the link
-# with a real directory, and one holding a directory or missing name that a `..`
-# leaves again can replace it with a link that sends the `..` elsewhere. Prints the
-# reason to refuse, or nothing.
+# plugins allowlist and the marketplace checkouts, which load into the agent, each
+# tier's operator files (sc_operator_config), which become its instructions, and the
+# MCP secrets and backups. A workspace that can write any of them is a channel out
+# of its own session — even when they do not exist yet, because a workspace of
+# ~/.config can create dockade/plugins on a fresh host. So each of those paths is
+# walked rather than resolved: the home, its four fixed entries, every tier's
+# folder, a sibling tier's included, and every entry already in one. A tier file
+# that does not exist yet needs a write to its folder, which the folder's walk
+# covers. Every location on the way counts too: a workspace holding
+# ~/.config/dockade -> ~/dotfiles/dockade can replace the link with a real
+# directory, and one holding a directory or missing name that a `..` leaves again
+# can replace it with a link that sends the `..` elsewhere. Prints the reason to
+# refuse, or nothing.
 # Only a location strictly inside the workspace counts: "dir <workspace>" and "dir
 # <ancestor>" do occur, and pass, because the agent cannot swap its own mount point
 # or what holds it. Only "end" is checked for "is" and "holds". A workspace of /
 # never matches "holds"; the root refusal covers it.
 _sc_config_home_reason() {
-    local real="$1" home what entry line kind path
+    local real="$1" home what entry line kind path tier found
+    local -a entries=("" /plugins /marketplaces /secrets /backups)
     home="$(sc_config_home)"
     [[ "$home" == /* ]] || home="$PWD/$home"
-    what="dockade's config home ($home), where later launches read plugins, marketplaces and secrets"
-    for entry in "" /plugins /marketplaces /secrets /backups; do
+    what="dockade's config home ($home), where later launches read plugins, marketplaces, operator files and secrets"
+    for tier in "${_SC_TIERS[@]}"; do
+        entries+=("/$tier")
+        for found in "$home/$tier"/* "$home/$tier"/.[!.]* "$home/$tier"/..?*; do
+            if [[ -e "$found" || -L "$found" ]]; then
+                entries+=("/$tier/${found##*/}")
+            fi
+        done
+    done
+    for entry in "${entries[@]}"; do
         while IFS= read -r line; do
             kind="${line%% *}"
             path="${line#* }"
@@ -273,11 +286,12 @@ sc_guard_workspace() {
     # Under the override the config home earns only the content warnings below, so a
     # workspace of ~/.config, which holds it a level down, passes this guard silently:
     # the override is the operator saying they know what the directory holds.
-    # (sc_workspace_mount then refuses that one by its folder name, `.config`.) The one
-    # exception is the marketplaces mount, which does not yield to it: when the
-    # marketplaces directory exists, sc_marketplaces still refuses a workspace that
-    # holds it or a link or directory on the way to it (a dotfiles-managed
-    # ~/.config/dockade).
+    # (sc_workspace_mount then refuses that one by its folder name, `.config`.) The
+    # exceptions are the read-only mounts from it, which do not yield to it: when the
+    # marketplaces directory or a tier's operator file exists, sc_marketplaces and
+    # sc_operator_config still refuse a workspace that holds it or a link or directory
+    # on the way to it (a dotfiles-managed ~/.config/dockade), through
+    # _sc_ro_workspace_reason.
     _sc_warn_credentials "$real_workspace" "workspace" "RW"
     # dockade's own state, when dockade is the workspace. A control-plane backup is
     # the whole policy store in a file `make restore` will install after checking its
@@ -356,12 +370,35 @@ sc_config_home() {
     fi
 }
 
+# Every tier's name, which is its folder in the config home (sc_tier_config_dir).
+# One list, because the workspace guard walks every tier's folder, not only the
+# launching tier's: a workspace that can write a sibling tier's file injects
+# instructions into that tier's next launch. tests/test_sandbox_wiring.py holds each
+# launcher's tier to it.
+_SC_TIERS=(claude opencode agy)
+
+# sc_tier_config_dir <tier>  ->  echoes the tier's folder in the config home
+#
+# Follows sc_config_home, so DOCKADE_CONFIG_HOME and XDG_CONFIG_HOME move it too. A
+# tier not in _SC_TIERS is refused: its folder would be one the guard never walks.
+sc_tier_config_dir() {
+    local tier="${1:?sc_tier_config_dir needs a tier}" known
+    for known in "${_SC_TIERS[@]}"; do
+        if [[ "$tier" == "$known" ]]; then
+            printf '%s/%s\n' "$(sc_config_home)" "$tier"
+            return 0
+        fi
+    done
+    echo "ERROR: '$tier' is not a tier sandbox-lib.sh knows (_SC_TIERS: ${_SC_TIERS[*]})." >&2
+    exit 1
+}
+
 # ---------------------------------------------------------------------------
 # Read-only mount guard  ->  echoes why <canonical_dir> must not be mounted
 # ---------------------------------------------------------------------------
-# Echoes nothing when the directory may be mounted. Shared by every read-only
-# host mount (sc_marketplaces, sc_refs), so they cannot drift apart on what
-# they refuse.
+# Echoes nothing when the path may be mounted. Shared by every read-only host
+# mount (sc_marketplaces, sc_refs, sc_operator_config), so they cannot drift apart
+# on what they refuse.
 #
 # Read-only keeps the agent from WRITING what it reads; it does nothing about
 # what it can read. So the same over-broad paths sc_guard_workspace refuses are
@@ -393,9 +430,13 @@ _sc_ro_mount_reason() {
     # MCP client credentials live under the same config home as the marketplaces,
     # so the obvious near-miss (~/.config/dockade) would mount the secrets tree
     # into the sandbox. Read-only is no comfort for a credential — readable IS
-    # the compromise.
+    # the compromise. Inside it as much as holding it: an operator file linked into
+    # the secrets directory under another name is a credential all the same.
     if [[ "$secrets" == "$real" || "$secrets" == "$real"/* ]]; then
         echo "the MCP secrets directory ($secrets) is inside it."
+        return 0
+    elif [[ "$real" == "$secrets"/* ]]; then
+        echo "it lies inside the MCP secrets directory ($secrets)."
         return 0
     fi
     # The scan below covers the tmux-<uid> and ssh-* children of /tmp.
@@ -415,6 +456,41 @@ _sc_ro_mount_reason() {
     if [[ -n "$hit" ]]; then
         echo "it holds a socket or FIFO ($hit), which read-only does not stop the agent using."
     fi
+}
+
+# _sc_ro_workspace_reason <canonical_path> <path_as_given> <canonical_workspace>
+# Echoes why a read-only mount of <path> would still be writable through the
+# workspace, which is mounted read-write, or nothing. Shared by the mounts that
+# come from the config home (sc_marketplaces, sc_operator_config), which, unlike
+# the workspace guard, do not yield to ALLOW_UNSAFE_WORKSPACE.
+# <canonical_path> is, lies inside or holds the workspace; or a link on the way
+# that the workspace holds can be replaced with a real directory or file, and a
+# directory that a `..` leaves again with a link, either of which a later launch
+# with the same path mounts. A "stop" inside the workspace before the end needs
+# the layout to change after the caller resolved every component.
+_sc_ro_workspace_reason() {
+    local real="$1" path="$2" workspace="$3" line
+    if [[ "$real" == "$workspace" ]]; then
+        echo "that is the workspace, which is mounted read-write."
+        return 0
+    elif [[ "$workspace" == "/" || "$real" == "$workspace"/* ]]; then
+        echo "it is inside the workspace ($workspace), which is mounted read-write."
+        return 0
+    elif [[ "$workspace" == "$real"/* ]]; then
+        echo "the workspace ($workspace) is inside it, and is mounted read-write."
+        return 0
+    fi
+    [[ "$path" == /* ]] || path="$PWD/$path"
+    while IFS= read -r line; do
+        case "$line" in
+            "link $workspace"/*) printf "%s" "the link ${line#link }" ;;
+            "dir $workspace"/*) printf "%s" "the directory ${line#dir }" ;;
+            "stop $workspace"/*) printf "%s" "the name ${line#stop }" ;;
+            *) continue ;;
+        esac
+        echo " on the way to it is inside the workspace ($workspace), which is mounted read-write."
+        return 0
+    done < <(_sc_walk_path "$path")
 }
 
 # ---------------------------------------------------------------------------
@@ -446,10 +522,11 @@ _sc_ro_mount_reason() {
 # sc_marketplaces <canonical_workspace>: a directory that is the workspace, lies
 # inside it, holds it, or is reached through a link or directory the workspace
 # holds is refused, because the workspace is mounted read-write and the same files
-# would be writable through /workspace whatever the :ro says.
-# Only this launch's workspace is known here. A sibling's cannot hold the default
-# directory, since sc_guard_workspace refuses what holds the config home, but the
-# cases that guard cannot see stay open (DESIGN.md, "Plugin marketplaces").
+# would be writable through /workspace whatever the :ro says
+# (_sc_ro_workspace_reason). Only this launch's workspace is known here. A
+# sibling's cannot hold the default directory, since sc_guard_workspace refuses
+# what holds the config home, but the cases that guard cannot see stay open
+# (DESIGN.md, "Plugin marketplaces").
 sc_marketplaces() {
     local workspace="${1:?sc_marketplaces needs the canonical workspace}"
     SC_MARKETPLACE_ARGS=()
@@ -474,38 +551,12 @@ sc_marketplaces() {
         return 0
     fi
 
-    # Physical, like [[ -d ]] and the walk below, so a `..` after a link means the
-    # same directory to all three; CDPATH would send a relative name elsewhere.
-    local real reason line
+    # Physical, like [[ -d ]] and the walk, so a `..` after a link means the same
+    # directory to all three; CDPATH would send a relative name elsewhere.
+    local real reason
     real="$(CDPATH='' cd -P "$dir" && pwd -P)"
     reason="$(_sc_ro_mount_reason "$real")"
-    if [[ -z "$reason" ]]; then
-        if [[ "$real" == "$workspace" ]]; then
-            reason="that is the workspace, which is mounted read-write."
-        elif [[ "$workspace" == "/" || "$real" == "$workspace"/* ]]; then
-            reason="it is inside the workspace ($workspace), which is mounted read-write."
-        elif [[ "$workspace" == "$real"/* ]]; then
-            reason="the workspace ($workspace) is inside it, and is mounted read-write."
-        fi
-    fi
-    # A link on the way that the workspace holds can be replaced with a real
-    # directory, and a directory that a `..` leaves again with a link, either of
-    # which a later launch with the same path mounts. Default path too: the
-    # workspace guard walks it, but yields to ALLOW_UNSAFE_WORKSPACE. A "stop"
-    # needs the layout to change after cd -P entered every component.
-    if [[ -z "$reason" ]]; then
-        [[ "$dir" == /* ]] || dir="$PWD/$dir"
-        while IFS= read -r line; do
-            case "$line" in
-                "link $workspace"/*) reason="the link ${line#link }" ;;
-                "dir $workspace"/*) reason="the directory ${line#dir }" ;;
-                "stop $workspace"/*) reason="the name ${line#stop }" ;;
-                *) continue ;;
-            esac
-            reason+=" on the way to it is inside the workspace ($workspace), which is mounted read-write."
-            break
-        done < <(_sc_walk_path "$dir")
-    fi
+    [[ -n "$reason" ]] || reason="$(_sc_ro_workspace_reason "$real" "$dir" "$workspace")"
     if [[ -n "$reason" ]]; then
         echo "REFUSING to mount marketplaces: $real" >&2
         echo "  $reason" >&2
@@ -624,6 +675,87 @@ sc_refs() {
             SC_REFS_DESC="$SC_REFS_DESC"$'\n'"           $real -> /refs/$name:ro"
         fi
     done
+}
+
+# ---------------------------------------------------------------------------
+# Operator customization  ->  sets SC_OPERATOR_DIR, SC_OPERATOR_ARGS (array),
+#                             SC_CUSTOM_DESC
+# ---------------------------------------------------------------------------
+# sc_operator_config <tier> <canonical_workspace> <file>...
+#
+# The operator's own additions to a tier, per machine, from the tier's folder in the
+# config home (sc_tier_config_dir): each <file> is a name in the format of the tier
+# CLI's own file, such as CLAUDE.md, which the tier's boot appends to its baked
+# instructions. DESIGN.md, "Operator customization", says what may be extended and
+# what stays fixed.
+#
+# Each named file that is present is mounted ALONE, read-only, at /operator/<file>,
+# not the folder: the sandbox gets no host path it does not need, as for the plugin
+# allowlist. A link, a dotfiles one say, is followed physically and its target is
+# what is mounted. Absent, nothing is mounted and nothing is said. Present but
+# unusable is fatal, as an explicit SANDBOX_MARKETPLACES_DIR is: the operator put it
+# there on purpose, and a launch without it would look like one with it. Refused:
+# anything but a regular file, a dangling link included; what every read-only mount
+# refuses (_sc_ro_mount_reason); a file the workspace can write, or reach on the
+# way to (_sc_ro_workspace_reason), whatever ALLOW_UNSAFE_WORKSPACE says; a path
+# holding ':', which docker -v splits on; and credential material, as for a ref.
+#
+# SC_OPERATOR_DIR is the folder, resolved physically, or empty when there is none:
+# for a later reader that builds from it rather than mounting it. Never mounted.
+#
+# SC_CUSTOM_DESC is the launch banner's "Custom:" line, one entry per active
+# customization, empty when there is none so the banner prints what it did before.
+# Started here, so this runs before anything that adds to it with _sc_custom_add.
+# shellcheck disable=SC2034  # the globals are consumed by the sourcing launcher
+sc_operator_config() {
+    local tier="${1:?sc_operator_config needs a tier}"
+    local workspace="${2:?sc_operator_config needs the canonical workspace}"
+    shift 2
+    local dir name path real reason sensitive
+    SC_OPERATOR_DIR=""
+    SC_OPERATOR_ARGS=()
+    SC_CUSTOM_DESC=""
+    dir="$(sc_tier_config_dir "$tier")" || exit 1
+    [[ "$dir" == /* ]] || dir="$PWD/$dir"
+    if [[ -d "$dir" ]]; then
+        SC_OPERATOR_DIR="$(CDPATH='' cd -P "$dir" && pwd -P)"
+    fi
+
+    _sc_deny_operator() {
+        echo "REFUSING to mount operator file: $path" >&2
+        echo "  $1" >&2
+        echo "  Keep $name in $dir as a regular file of its own, outside every workspace:" >&2
+        echo "  copy it there rather than linking it, or remove it to launch without it." >&2
+        exit 1
+    }
+
+    for name in "$@"; do
+        path="$dir/$name"
+        [[ -e "$path" || -L "$path" ]] || continue
+        [[ -e "$path" ]] || _sc_deny_operator "it is a link to nothing."
+        [[ -f "$path" ]] || _sc_deny_operator "it is not a regular file."
+        real="$(_sc_walk_path "$path" | sed -n 's/^end //p')"
+        reason="$(_sc_ro_mount_reason "$real")"
+        [[ -n "$reason" ]] || reason="$(_sc_ro_workspace_reason "$real" "$path" "$workspace")"
+        [[ -z "$reason" ]] || _sc_deny_operator "$real: $reason"
+        [[ "$real" != *:* ]] || _sc_deny_operator "$real contains ':', which docker -v cannot mount."
+        for sensitive in "${_SC_CREDENTIAL_PATHS[@]}"; do
+            if [[ "$real" == */"$sensitive" || "$real" == */"$sensitive"/* ]]; then
+                _sc_deny_operator "$real is credential material ('$sensitive')."
+            fi
+        done
+        SC_OPERATOR_ARGS+=(-v "$real":/operator/"$name":ro)
+        _sc_custom_add "$real -> /operator/$name:ro"
+    done
+}
+
+# _sc_custom_add <entry>: one more line for the banner's "Custom:" (sc_operator_config).
+_sc_custom_add() {
+    if [[ -z "${SC_CUSTOM_DESC:-}" ]]; then
+        SC_CUSTOM_DESC="$1"
+    else
+        SC_CUSTOM_DESC="$SC_CUSTOM_DESC"$'\n'"           $1"
+    fi
 }
 
 # ---------------------------------------------------------------------------

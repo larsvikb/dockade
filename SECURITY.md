@@ -183,8 +183,9 @@ report.
   request too, and its result goes to that tier's provider. A single approval stays
   with the sandbox it answered, and a timed pin with the sandbox whose card it was
   made from. See "Policy is scoped to a client class" in `DESIGN.md`.
-- **What the agent reads going to the tier's provider.** The workspace, `/refs` and
-  every gateway result enter the conversation, which goes to the vendor the operator
+- **What the agent reads going to the tier's provider.** The workspace, `/refs`, the
+  operator's instructions (`/operator`) and every gateway result enter the
+  conversation, which goes to the vendor the operator
   logged the tier in with, under that account's terms. See "Server-side execution:
   accepted governance blind spots" in `DESIGN.md`.
 - **Any agent CLI's settings file being bypassable**, including Claude Code's

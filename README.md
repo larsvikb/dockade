@@ -164,6 +164,8 @@ the measured throughput behind those decisions.
   boot — see *Plugins and marketplaces* below.
 - **Mounts reference material** at `/refs/<name>` (**read-only**, every tier)
   for each directory in `SANDBOX_REFS` — see *Reference material* below.
+- **Adds your own instructions** from `~/.config/dockade/claude/CLAUDE.md`,
+  mounted **read-only**, after the image's — see *Your own instructions* below.
 - **Adds a JDK** when `SANDBOX_JDK` is set, under its own image tag — see
   *Java in the sandbox* below.
 - **Forwards your host git identity** into the container (it is not baked into
@@ -249,6 +251,28 @@ its top — read-only does not stop the agent using those. So is a credential
 directory such as `~/.ssh`, a name with a leading dot, and an entry that is not
 a directory: every entry was named on purpose, so a bad one stops the launch
 rather than vanishing.
+
+## Your own instructions
+
+To tell every session of a tier on your machine something the image does not — how
+you like answers written, a tool you prefer — put it in that tier's folder:
+
+```bash
+mkdir -p ~/.config/dockade/claude
+printf -- '- Answer in British English.\n' > ~/.config/dockade/claude/CLAUDE.md
+./run-claude-sandbox.sh       # Custom: .../claude/CLAUDE.md -> /operator/CLAUDE.md:ro
+```
+
+`opencode/AGENTS.md` does the same for opencode, where it costs part of the model's
+small context window, and `agy/AGENTS.md` for agy. The file is mounted read-only and **appended** at each boot
+after the image's own instructions, under a heading that marks it as yours; it cannot
+replace them, since they describe what the container can do. The launch banner's
+`Custom:` line shows it is in use. It must be a regular file of its own: a link is
+followed, but a file your workspace could write, or reach through a link, is refused,
+as is one in a credential directory, so copy it out of a dotfiles repo rather than
+linking it there if you launch on that repo. An image built before this existed
+mounts the file and appends nothing until `--rebuild`. Design: DESIGN.md, "Operator
+customization".
 
 ## Java in the sandbox
 
@@ -367,6 +391,7 @@ is still shared, so:
 | `~/.config/dockade/marketplaces/` | marketplace checkouts (or one checkout directly) |
 | `~/.config/dockade/plugins` | `plugin@marketplace` ids to enable, one per line, `#` comments ok |
 | `~/.config/dockade/secrets/` | MCP client credentials (`MCP_SECRETS`) |
+| `~/.config/dockade/claude/`, `opencode/`, `agy/` | your own additions to that tier: `CLAUDE.md` for claude, `AGENTS.md` for opencode and agy — see *Your own instructions* |
 
 Durable per-machine config lives **outside this repo** on purpose: a sandbox
 pointed at dockade as its workspace bind-mounts this tree read-write, so anything
@@ -529,6 +554,7 @@ dockade/
     entrypoint.sh           # root: firewall + config, then drops to non-root
     init-firewall.sh        # default-deny egress firewall (governed/local/standalone)
     boundary-check.sh       # on-demand smoke test of the containment boundary
+    operator-instructions.sh # sourced at boot: appends the operator's own instructions to the baked ones
     dotfiles/               # shared .bashrc / .gitconfig / .inputrc / .vimrc, baked into every tier
     instructions/           # the agent instructions' shared fragments (every-tier/, cloud-tier/, bashrc-shell/), in no image
       render.py             #   make instructions: each <tier>/instructions.md to the file it names

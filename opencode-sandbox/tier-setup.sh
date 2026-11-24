@@ -84,14 +84,20 @@ install -m 0644 /etc/opencode/opencode.json "$CONFIG_DIR/opencode/opencode.json"
 # and can rewrite opencode.json, and an instruction file that only loads while a
 # config key survives is the weaker of the two. Neither is a control either way.
 #
-# Content is this tier's CAPABILITY facts. It shares with tier 1's CLAUDE.md only
-# the facts every tier shares (/workspace live, not root), which come from
-# one source; the rest of tier 1's text, its longest bullet the governed proxy's,
+# The baked content is this tier's CAPABILITY facts. It shares with tier 1's
+# CLAUDE.md only the facts every tier shares (/workspace live, not root), which come
+# from one source; the rest of tier 1's text, its longest bullet the governed proxy's,
 # is false here, where there is neither a proxy nor egress. Shorter, too, and for a
 # reason beyond taste — the window here is 24k (opencode.json) with a base prompt
 # already taking over a third of it, so every line here is paid for out of what is
 # left. Edited in opencode-sandbox/instructions.md and rendered (make instructions).
 install -m 0644 /etc/opencode/AGENTS.md.template "$CONFIG_DIR/opencode/AGENTS.md"
+# Then the operator's own, from ~/.config/dockade/opencode/AGENTS.md on the host,
+# when the launcher mounted one, under a heading after the baked text; paid for out
+# of the same window. /operator is not a path opencode searches, so it loads once.
+# shellcheck source=sandbox-common/operator-instructions.sh
+source /usr/local/lib/dockade/operator-instructions.sh
+append_operator_instructions "/operator/AGENTS.md" "$CONFIG_DIR/opencode/AGENTS.md"
 
 # opencode reads its user-scope config from ~/.config/opencode (the XDG default;
 # nothing here overrides it). Symlink that at the persistent volume so session

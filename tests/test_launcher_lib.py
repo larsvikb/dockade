@@ -891,6 +891,46 @@ class WorkspaceGuardTests(unittest.TestCase):
         self.assertIn("REFUSING to mount marketplaces", proc.stderr)
         self.assertIn("that is a Windows user profile", proc.stderr)
 
+    # Each tier's folder in the config home, and what is already in it: a workspace
+    # that can write a tier's operator file writes the instructions its next launch
+    # appends. The guard knows no launching tier, so a sibling tier's folder counts
+    # as much as Claude's. The config home here is the default, outside every
+    # workspace below, so only the tier walks can refuse.
+
+    def test_a_workspace_a_tier_folder_reaches_through_a_link_is_refused(self):
+        home = self.home / ".config" / "dockade"
+        home.mkdir(parents=True)
+        dotfiles = self.root / "cfgs" / "dotfiles"
+        for tier in ("claude", "opencode", "agy"):
+            with self.subTest(tier=tier):
+                (dotfiles / tier).mkdir(parents=True)
+                (home / tier).symlink_to(dotfiles / tier)
+                self.assertRefused(self.guard(dotfiles),
+                                   f"{dotfiles / tier} is inside it, and leads to {self._CONFIG}")
+                (home / tier).unlink()
+        self.assertAllowed(self.guard(dotfiles))
+
+    def test_a_workspace_holding_a_link_target_in_a_tier_folder_is_refused(self):
+        # Dangling too: the agent can create the file the link names. And a hidden
+        # name, which a plain * would not list.
+        dotfiles = self.root / "cfgs" / "dotfiles"
+        dotfiles.mkdir(parents=True)
+        for tier, name in (("claude", "CLAUDE.md"), ("opencode", "AGENTS.md"),
+                           ("agy", "AGENTS.md"), ("claude", ".hidden"), ("opencode", "..dots")):
+            folder = self.home / ".config" / "dockade" / tier
+            folder.mkdir(parents=True, exist_ok=True)
+            target = dotfiles / f"{tier}-{name}"
+            for exists in (False, True):
+                with self.subTest(tier=tier, name=name, exists=exists):
+                    if exists:
+                        target.write_text("Mine\n")
+                    (folder / name).symlink_to(target)
+                    self.assertRefused(self.guard(dotfiles),
+                                       f"{target} is inside it, and leads to {self._CONFIG}")
+                    (folder / name).unlink()
+                    target.unlink(missing_ok=True)
+        self.assertAllowed(self.guard(dotfiles))
+
 
 @unittest.skipUnless(_BASH or _STRICT, "bash is not installed")
 class WorkspaceMountTests(unittest.TestCase):
@@ -1397,6 +1437,237 @@ class RefsTests(unittest.TestCase):
         deep.mkdir(parents=True)
         os.mkfifo(deep / "pipe")
         self.assertEqual(len(self.mounts(f"{self.src}/b/docs")), 1)
+
+
+_TIER_DIR_HARNESS = 'set -euo pipefail; source "$1"; sc_tier_config_dir "$2"; echo "went on"'
+_OPERATOR_HARNESS = (
+    'set -euo pipefail; source "$1"; sc_operator_config "$2" "$3" "${@:4}"; '
+    'printf "DIR=%s\\n" "$SC_OPERATOR_DIR"; printf "DESC=%s\\n" "$SC_CUSTOM_DESC"; '
+    '[ ${#SC_OPERATOR_ARGS[@]} -eq 0 ] || printf "ARG=%s\\n" "${SC_OPERATOR_ARGS[@]}"')
+
+
+@unittest.skipUnless(_BASH or _STRICT, "bash is not installed")
+class OperatorConfigTests(unittest.TestCase):
+    """``sc_tier_config_dir`` and ``sc_operator_config``: the operator's own files for a
+    tier, each mounted alone and read-only at ``/operator/<name>``.
+
+    Each refusal is asserted with its reason and an empty stdout, so a refusal that had
+    already set a mount, or a file that was quietly skipped, fails."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name).resolve()
+        self.home = self.root / "home" / "alice"
+        self.home.mkdir(parents=True)
+        self.config = self.root / "config"
+        self.config.mkdir()
+        self.folder = self.config / "claude"
+        self.workspace = self.root / "work" / "app"
+        self.workspace.mkdir(parents=True)
+
+    def env(self, **env_over: str) -> dict[str, str]:
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "DOCKADE_CONFIG_HOME",
+                            "CDPATH", "ALLOW_UNSAFE_WORKSPACE")}
+        env.update(HOME=str(self.home), DOCKADE_CONFIG_HOME=str(self.config))
+        env.update(env_over)
+        return env
+
+    def tier_dir(self, tier: str, **env_over: str):
+        return subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
+            [_BASH, "-c", _TIER_DIR_HARNESS, "sc_tier_config_dir", str(LIB), tier],
+            capture_output=True, text=True, env=self.env(**env_over), timeout=60)
+
+    def operator(self, *names: str, tier: str = "claude", workspace: Path | None = None,
+                 **env_over: str):
+        return subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
+            [_BASH, "-c", _OPERATOR_HARNESS, "sc_operator_config", str(LIB), tier,
+             str(workspace or self.workspace), *(names or ("CLAUDE.md",))],
+            capture_output=True, text=True, env=self.env(**env_over), timeout=60)
+
+    def outcome(self, proc) -> tuple[str, str, list[str]]:
+        """SC_OPERATOR_DIR, SC_CUSTOM_DESC and the docker flags, from a launch that went on."""
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+        lines = proc.stdout.split("\n")
+        directory = lines[0].removeprefix("DIR=")
+        desc_end = next(i for i, line in enumerate(lines) if line.startswith("ARG=") or line == "")
+        desc = "\n".join(lines[1:desc_end]).removeprefix("DESC=")
+        args = [line.removeprefix("ARG=") for line in lines[desc_end:] if line]
+        return directory, desc, args
+
+    def write(self, name: str = "CLAUDE.md", text: str = "Mine\n") -> Path:
+        self.folder.mkdir(exist_ok=True)
+        path = self.folder / name
+        path.write_text(text)
+        return path
+
+    def assertRefused(self, proc, why: str, path: Path | None = None):
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn(f"REFUSING to mount operator file: {path or self.folder / 'CLAUDE.md'}",
+                      proc.stderr)
+        self.assertIn(why, proc.stderr)
+        self.assertIn("copy it there rather than linking it", proc.stderr)
+
+    def test_the_tier_folder_follows_sc_config_home(self):
+        xdg = self.root / "xdg"
+        unset = {"DOCKADE_CONFIG_HOME": ""}
+        for env, expected in (({}, self.config / "claude"),
+                              ({"XDG_CONFIG_HOME": str(xdg)}, self.config / "claude"),
+                              ({**unset, "XDG_CONFIG_HOME": str(xdg)}, xdg / "dockade" / "claude"),
+                              (unset, self.home / ".config" / "dockade" / "claude")):
+            with self.subTest(env=env):
+                proc = self.tier_dir("claude", **env)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout, f"{expected}\nwent on\n")
+        for tier in ("opencode", "agy"):
+            with self.subTest(tier=tier):
+                proc = self.tier_dir(tier)
+                self.assertEqual(proc.stdout, f"{self.config / tier}\nwent on\n")
+
+    def test_a_tier_not_in_the_list_is_refused(self):
+        for tier in ("widgets", "claude2", "", "claude opencode"):
+            with self.subTest(tier=tier):
+                proc = self.tier_dir(tier)
+                self.assertEqual(proc.returncode, 1, proc.stderr)
+                self.assertEqual(proc.stdout, "")
+        self.assertIn("'widgets' is not a tier sandbox-lib.sh knows", self.tier_dir("widgets").stderr)
+        proc = self.operator(tier="widgets")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("'widgets' is not a tier", proc.stderr)
+
+    def test_no_folder_or_no_file_mounts_nothing_and_says_nothing(self):
+        self.assertEqual(self.outcome(self.operator()), ("", "", []))
+        self.folder.mkdir()
+        self.write("README")
+        self.assertEqual(self.outcome(self.operator()), (str(self.folder), "", []))
+
+    def test_the_file_mounts_alone_and_read_only_with_one_banner_entry(self):
+        path = self.write()
+        self.assertEqual(self.outcome(self.operator()), (
+            str(self.folder), f"{path} -> /operator/CLAUDE.md:ro",
+            ["-v", f"{path}:/operator/CLAUDE.md:ro"]))
+
+    def test_each_name_given_mounts_and_adds_its_own_line(self):
+        # As a later caller passing a second name would: one absent is skipped.
+        first = self.write("CLAUDE.md")
+        second = self.write("settings.json", "{}\n")
+        self.assertEqual(self.outcome(self.operator("CLAUDE.md", "absent", "settings.json")), (
+            str(self.folder),
+            f"{first} -> /operator/CLAUDE.md:ro\n           {second} -> /operator/settings.json:ro",
+            ["-v", f"{first}:/operator/CLAUDE.md:ro",
+             "-v", f"{second}:/operator/settings.json:ro"]))
+
+    def test_the_folder_and_the_file_resolve_through_links(self):
+        dotfiles = self.root / "dotfiles"
+        (dotfiles / "claude").mkdir(parents=True)
+        target = dotfiles / "notes.md"
+        target.write_text("Mine\n")
+        self.folder.symlink_to(dotfiles / "claude")
+        (dotfiles / "claude" / "CLAUDE.md").symlink_to(Path("..") / "notes.md")
+        self.assertEqual(self.outcome(self.operator()), (
+            str(dotfiles / "claude"), f"{target} -> /operator/CLAUDE.md:ro",
+            ["-v", f"{target}:/operator/CLAUDE.md:ro"]))
+
+    def test_a_relative_config_home_is_taken_from_the_launch_directory(self):
+        path = self.write()
+        proc = subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
+            [_BASH, "-c", _OPERATOR_HARNESS, "sc_operator_config", str(LIB), "claude",
+             str(self.workspace), "CLAUDE.md"],
+            capture_output=True, text=True, env=self.env(DOCKADE_CONFIG_HOME="config"),
+            cwd=self.root, timeout=60)
+        self.assertEqual(self.outcome(proc)[2], ["-v", f"{path}:/operator/CLAUDE.md:ro"])
+
+    def test_a_dangling_link_is_refused(self):
+        self.folder.mkdir()
+        (self.folder / "CLAUDE.md").symlink_to(self.root / "nowhere")
+        self.assertRefused(self.operator(), "it is a link to nothing.")
+
+    def test_anything_but_a_regular_file_is_refused(self):
+        self.folder.mkdir()
+        (self.folder / "CLAUDE.md").mkdir()
+        self.assertRefused(self.operator(), "it is not a regular file.")
+        (self.folder / "CLAUDE.md").rmdir()
+        os.mkfifo(self.folder / "CLAUDE.md")
+        self.assertRefused(self.operator(), "it is not a regular file.")
+
+    def test_a_file_the_workspace_holds_is_refused_whatever_the_override_says(self):
+        # The config home inside the workspace, and the folder linked into it.
+        inside = self.workspace / "cfg"
+        (inside / "claude").mkdir(parents=True)
+        (inside / "claude" / "CLAUDE.md").write_text("Mine\n")
+        for env in ({}, {"ALLOW_UNSAFE_WORKSPACE": "1"}):
+            with self.subTest(env=env):
+                self.assertRefused(
+                    self.operator(DOCKADE_CONFIG_HOME=str(inside), **env),
+                    f"it is inside the workspace ({self.workspace}), which is mounted read-write.",
+                    inside / "claude" / "CLAUDE.md")
+
+    def test_a_link_on_the_way_inside_the_workspace_is_refused(self):
+        # The file is outside; the link that leads to it is the agent's to swap.
+        outside = self.root / "elsewhere"
+        outside.mkdir()
+        (outside / "CLAUDE.md").write_text("Mine\n")
+        (self.workspace / "via").symlink_to(outside)
+        self.folder.mkdir()
+        (self.folder / "CLAUDE.md").symlink_to(self.workspace / "via" / "CLAUDE.md")
+        self.assertRefused(self.operator(),
+                           f"the link {self.workspace / 'via'} on the way to it is inside the "
+                           f"workspace ({self.workspace}), which is mounted read-write.")
+
+    def test_a_dotfiles_workspace_holding_the_target_is_refused(self):
+        # The risk the plan names: the operator's file kept in a dotfiles repo,
+        # linked in, and that repo the workspace.
+        target = self.workspace / "CLAUDE.md"
+        target.write_text("Mine\n")
+        self.folder.mkdir()
+        (self.folder / "CLAUDE.md").symlink_to(target)
+        self.assertRefused(self.operator(), f"{target}: it is inside the workspace")
+
+    def test_a_colon_in_the_path_is_refused(self):
+        odd = self.root / "a:b"
+        odd.mkdir()
+        (odd / "CLAUDE.md").write_text("Mine\n")
+        self.folder.mkdir()
+        (self.folder / "CLAUDE.md").symlink_to(odd / "CLAUDE.md")
+        self.assertRefused(self.operator(), "contains ':', which docker -v cannot mount.")
+
+    def test_credential_material_is_refused(self):
+        (self.home / ".ssh").mkdir()
+        (self.home / ".ssh" / "notes").write_text("Mine\n")
+        (self.home / ".netrc").write_text("machine x\n")
+        self.folder.mkdir()
+        for target, what in ((self.home / ".ssh" / "notes", ".ssh"),
+                             (self.home / ".netrc", ".netrc")):
+            with self.subTest(target=target):
+                (self.folder / "CLAUDE.md").symlink_to(target)
+                self.assertRefused(self.operator(), f"is credential material ('{what}')")
+                (self.folder / "CLAUDE.md").unlink()
+
+    def test_a_file_in_the_secrets_directory_is_refused_by_its_real_name(self):
+        # The secrets directory linked to a folder of another name, and the file
+        # linked into that: a credential all the same, named by where it lies.
+        creds = self.root / "vault" / "creds"
+        creds.mkdir(parents=True)
+        (creds / "token").write_text("s3cret\n")
+        (self.config / "secrets").symlink_to(creds)
+        self.folder.mkdir()
+        (self.folder / "CLAUDE.md").symlink_to(creds / "token")
+        self.assertRefused(self.operator(),
+                           f"{creds / 'token'}: it lies inside the MCP secrets directory ({creds}).")
+
+    def test_the_read_only_mount_rules_hold(self):
+        # A file under a runtime directory: what every read-only mount refuses.
+        runtime = self.root / "run-user"
+        runtime.mkdir()
+        (runtime / "notes").write_text("Mine\n")
+        self.folder.mkdir()
+        (self.folder / "CLAUDE.md").symlink_to(runtime / "notes")
+        self.assertRefused(self.operator(XDG_RUNTIME_DIR=str(runtime)),
+                           f"that is {runtime}, where host processes keep their sockets.")
 
 
 # What run-claude-sandbox.sh does with them: pick the tag, then build it.

@@ -17,12 +17,14 @@ the same rule: ``$(wildcard tests/*.py)``, tracked or not. That glob does not de
 so a ``.py`` file below the top level of ``tests/`` would go unlinted; it fails here
 instead.
 
-``PYFILES`` applies the same rule to component code: a glob per component directory.
+``PYFILES`` applies the same rule to component code: a glob per directory.
 ``PyfilesTests`` is the one check here that asks git rather than globbing, because it
 holds that directory list complete: every tracked module outside ``tests/`` must be
 in it. The index is the set of modules the repo ships; a disk walk would sweep in
 gitignored directories such as ``models/`` and ``.claude/worktrees/``, whole copies
-of the repo inside the checkout.
+of the repo inside the checkout. Its untracked-module check takes its directories
+from ``PYFILES`` itself, each listed module's own, so a directory added there is
+covered with no second list to edit; a file named there rather than globbed fails it.
 """
 from __future__ import annotations
 
@@ -39,8 +41,6 @@ ROOT = TESTS.parent
 PATTERN = "test*.py"  # unittest discovery's default, which make test uses
 # A missing tool skips on a dev machine and fails in CI: test_docs.py's _NeedsGit.
 _STRICT = bool(os.environ.get("DOCKADE_REQUIRE_TOOLS"))
-COMPONENTS = ("proxies/egress", "control-plane", "control-plane-ui", "ui-common",
-              "tasks-ui", "tool-gateway", "task-registry", "sandbox-common/instructions")
 
 # A hook's GIT_DIR/GIT_INDEX_FILE would stage a fixture into the real repo or read
 # another repo's index, and the make variables of the ``make test`` this runs under
@@ -194,16 +194,27 @@ class PyfilesTests(unittest.TestCase):
                          "skip them: add their directory to the glob (see the comment "
                          "above PYFILES in the Makefile)")
 
-    def test_an_untracked_module_in_each_component_is_listed(self):
-        names = {f"{component}/scratch.py" for component in COMPONENTS}
+    def test_an_untracked_module_in_each_listed_directory_is_listed(self):
+        # make hands back only a := variable's expansion, so the directories are those
+        # PYFILES lists a module in; a module at the root gives the bare scratch.py.
+        directories = {Path(path).parent for path in _make_variable(self, "PYFILES", ROOT)}
+        # An empty or misdirected expansion would pass the check below vacuously.
+        self.assertTrue(directories, "PYFILES expands to nothing in the repo: see the "
+                                     "comment above it in the Makefile")
+        self.assertLessEqual({Path("proxies/egress"), Path("control-plane")}, directories,
+                             "PYFILES must list a module in proxies/egress and in "
+                             "control-plane: see the comment above it in the Makefile")
+        names = {str(directory / "scratch.py") for directory in directories}
         with tempfile.TemporaryDirectory() as tmp:
             for name in names:
-                (Path(tmp) / name).parent.mkdir(parents=True)
+                # exist_ok: the root's folder is tmp itself, and a nested directory's
+                # parent may be another listed directory, laid out first or second.
+                (Path(tmp) / name).parent.mkdir(parents=True, exist_ok=True)
                 (Path(tmp) / name).touch()
             listed = _make_variable(self, "PYFILES", tmp)
         self.assertEqual(set(listed), names,
-                         "PYFILES must glob every component directory, untracked files "
-                         "included: see the comment above it in the Makefile")
+                         "PYFILES must glob every directory it lists a module in, "
+                         "untracked files included: see the comment above it in the Makefile")
 
 
 class TrackedModulesTests(unittest.TestCase):

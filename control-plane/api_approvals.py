@@ -17,6 +17,9 @@ A tool card is answered for this call, for this call and every later one carryin
 pinned values (for good, or for ``policy.PIN_LEASE_SECONDS``), or refused:
 ``TOOL_ACTIONS``. Which fields a pin holds is the operator's choice from
 ``policy._pin_candidates``, and the values are the stored call's.
+
+A repo card, a held git fetch, is answered as an egress card is but with no
+allow-once: ``REPO_ACTIONS``, over the repo's ``policy._repo_candidates``.
 """
 from __future__ import annotations
 
@@ -37,15 +40,17 @@ router = APIRouter()
 
 
 class ResolveRequest(BaseModel):
-    action: str                    # EGRESS_ACTIONS, or TOOL_ACTIONS on a tool ask
+    # EGRESS_ACTIONS, REPO_ACTIONS on a repo card, or TOOL_ACTIONS on a tool ask.
+    action: str
     # Which pattern a `*_persist` action writes: one of the approval's
-    # ``policy._persist_candidates``, the narrowest (the exact host) if omitted.
-    # Ignored by every other egress action; refused on a tool ask.
+    # ``policy._persist_candidates``, or a repo card's ``policy._repo_candidates``, the
+    # narrowest (the exact host or repo) if omitted. Ignored by every other egress or
+    # repo action; refused on a tool ask.
     pattern: str | None = None
     # Which fields a pinning action (``PIN_ACTIONS``) pins: NAMES only, each one of
     # the ask's ``policy._pin_candidates``. The values are copied from the stored ask,
-    # never taken from here. Refused on a tool ask's other actions; an egress card has
-    # none.
+    # never taken from here. Refused on a tool ask's other actions and on a repo card;
+    # an egress card has none.
     pins: list[str] | None = None
 
 
@@ -70,8 +75,14 @@ def approvals() -> dict:
 #: ``policy.PIN_LEASE_SECONDS``) and `deny`. "This tool always" is promoting the rule,
 #: in the MCP tab, and is not a rung reached from a card. There is no pinned deny
 #: (DESIGN.md, "A pin only allows").
+#:
+#: The repo set is the egress ladder without `allow_once`, the operator's answer on the
+#: plan: one fetch is an advertisement and one or more POSTs, so a one-request allow
+#: does not fit it, and the shortest allow is a repo lease. `deny_once` stays, since
+#: refusing one fetch fits it whole (control-plane/DESIGN.md, "The repo surface").
 EGRESS_ACTIONS = ("allow_once", "allow_lease", "allow_persist",
                   "deny_once", "deny_persist")
+REPO_ACTIONS = ("allow_lease", "allow_persist", "deny_once", "deny_persist")
 TOOL_ACTIONS = ("allow", "allow_pinned", "allow_pinned_lease", "deny")
 PIN_ACTIONS = ("allow_pinned", "allow_pinned_lease")
 
@@ -110,14 +121,20 @@ _STREAM_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
 
 @router.post("/approvals/{approval_id}/resolve")
 def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResponse:
-    """One endpoint, two surfaces, dispatched on which table holds the id.
+    """One endpoint, three surfaces, dispatched on which table holds the id.
 
     The queue is merged (``holds._pending_payload``), so the id is all the client
     sends back, and it is enough: an id belongs to exactly one table, so nothing in
     the body is trusted to say which kind of card this is. The tool half is
-    ``_resolve_tool_ask_request``, so the egress path below reads straight through."""
+    ``_resolve_tool_ask_request`` and the repo half ``_resolve_repo_request``, so the
+    egress path below reads straight through."""
     if holds._get_tool_ask(approval_id) is not None:
         return _resolve_tool_ask_request(approval_id, req, request)
+    with store._connect() as conn:
+        repo_card = conn.execute("SELECT 1 FROM repo_approvals WHERE id=?",
+                                 (approval_id,)).fetchone()
+    if repo_card is not None:
+        return _resolve_repo_request(approval_id, req, request)
     # Normalised the way the tool path normalises its action, so a client that sends
     # `Allow_Once ` is refused for being unknown rather than for its spelling.
     action = (req.action or "").strip().lower()
@@ -293,6 +310,129 @@ def resolve(approval_id: str, req: ResolveRequest, request: Request) -> JSONResp
     #     off clock in the page cannot show a different one.
     return JSONResponse({"ok": True, "outcome": outcome,
                          "persisted": wrote_rule,
+                         "already_present": persist and not wrote_rule,
+                         "pattern": pattern,
+                         "leased": lease_expires_at is not None,
+                         "lease_expires_at": lease_expires_at,
+                         "client_class": client_class if persist or lease else None})
+
+
+def _resolve_repo_request(approval_id: str, req: ResolveRequest,
+                          request: Request) -> JSONResponse:
+    """Answer a repo card: the repo half of ``resolve``, and the egress half's shape
+    over the repo tables. A held fetch is blocked as a held request is, so this writes
+    the durable row and wakes the waiter, and the waiter writes the audit row
+    (``holds._authorize_repo``).
+
+    Every refusal comes before the row is written, so the card stays pending and the
+    operator can answer again."""
+    action = (req.action or "").strip().lower()
+    if action not in REPO_ACTIONS:
+        return JSONResponse(
+            {"ok": False,
+             "detail": f"action must be one of {', '.join(REPO_ACTIONS)} for a repo "
+                       f"card, not {action!r}; a repo card has no allow-once, and its "
+                       f"shortest allow is allow_lease",
+             "actions": list(REPO_ACTIONS)}, status_code=400)
+    if getattr(req, "pins", None):
+        return JSONResponse(
+            {"ok": False, "detail": "a repo card takes no pins; a pin is a tool ask's"},
+            status_code=400)
+    outcome = "allow" if action.startswith("allow") else "deny"
+    persist = action.endswith("persist")
+    lease = action == "allow_lease"
+    actor = provenance._actor(request)
+
+    with holds._LOCK:
+        event = holds._PENDING_EVENTS.get(approval_id)
+    if event is None:
+        return JSONResponse(
+            {"ok": False, "detail": "not pending (expired or already resolved)"},
+            status_code=409)
+
+    with store._connect() as conn:
+        # One write transaction, as on the egress half, so the opposite-rule check and
+        # the rule write are one step.
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT repo, client_class FROM repo_approvals WHERE id=?",
+                           (approval_id,)).fetchone()
+        client_class = row["client_class"]
+        if (persist or lease) and not holds._classified(client_class):
+            # Unreachable through ``holds._authorize_repo``, which raises no card for
+            # an unclassified client; refused all the same, since a grant scoped to
+            # nobody in particular is one to everybody unplaced.
+            conn.rollback()
+            return JSONResponse(
+                {"ok": False,
+                 "detail": f"this fetch came from an unclassified client "
+                           f"({client_class or 'none recorded'}), so no "
+                           f"{'standing rule' if persist else 'lease'} can be scoped "
+                           f"to it. Deny it, or map its network in "
+                           f"CONTROL_CLIENT_CLASSES."}, status_code=400)
+        pattern = None
+        wrote_rule = False
+        if persist:
+            allowed = policy._repo_candidates(row["repo"])
+            pattern = (req.pattern or "").strip().lower() or allowed[0]
+            if pattern not in allowed:
+                conn.rollback()
+                return JSONResponse(
+                    {"ok": False,
+                     "detail": f"pattern {pattern!r} is not one this repo card may "
+                               f"persist (allowed: {', '.join(allowed)})"},
+                    status_code=400)
+            # The egress half's opposite-rule refusal, for its reason.
+            wanted = "allow" if outcome == "allow" else "block"
+            existing = conn.execute(
+                "SELECT action FROM repo_rules WHERE pattern=? AND client_class=?",
+                (pattern, client_class)).fetchone()
+            if existing is not None and existing["action"] != wanted:
+                conn.rollback()
+                return JSONResponse(
+                    {"ok": False,
+                     "detail": f"a standing repo rule for {pattern!r} already exists "
+                               f"for client class {client_class!r} and "
+                               f"{existing['action']}s it; this would write {wanted!r} "
+                               f"and cannot, because nothing here replaces a rule. "
+                               f"Answer this fetch with a lease or deny_once, or "
+                               f"persist the other pattern.",
+                     "conflict": {"pattern": pattern, "action": existing["action"],
+                                  "client_class": client_class}},
+                    status_code=409)
+            wrote_rule = existing is None
+        now = time.time()
+        updated = conn.execute(
+            "UPDATE repo_approvals SET status=?, mode=?, resolved_at=?, resolved_by=?, "
+            "pattern=? WHERE id=? AND status='pending'",
+            ("allowed" if outcome == "allow" else "denied",
+             ("persist" if wrote_rule else "present") if persist
+             else "lease" if lease else "once", now, actor, pattern,
+             approval_id)).rowcount
+        lease_expires_at = None
+        if updated and lease:
+            # Inside the guard and swept here, as on the egress half.
+            conn.execute("DELETE FROM repo_leases WHERE expires_at <= ?", (now,))
+            lease_expires_at = now + policy.LEASE_SECONDS
+            conn.execute(
+                "INSERT INTO repo_leases(repo, client_class, approval_id, created_at, "
+                "expires_at, granted_by) VALUES (?,?,?,?,?,?)",
+                (row["repo"], client_class, approval_id, now, lease_expires_at, actor))
+        if updated and wrote_rule:
+            conn.execute(
+                "INSERT INTO repo_rules(pattern, action, source, created_at, "
+                "client_class) VALUES (?,?, 'operator', ?, ?)",
+                (pattern, wanted, now, client_class))
+        conn.commit()
+
+    if not updated:
+        return JSONResponse(
+            {"ok": False, "detail": "raced — no longer pending"}, status_code=409)
+    with holds._LOCK:
+        holds._close_group_locked(approval_id)
+        if approval_id in holds._PENDING_EVENTS:
+            event.set()
+    return JSONResponse({"ok": True, "kind": "repo", "outcome": outcome,
+                         "repo": row["repo"], "persisted": wrote_rule,
                          "already_present": persist and not wrote_rule,
                          "pattern": pattern,
                          "leased": lease_expires_at is not None,

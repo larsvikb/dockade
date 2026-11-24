@@ -13,11 +13,14 @@ other allow.
 ``_client_class`` maps a peer address to the class a rule is scoped to. It lives
 beside the matcher that consumes it, not in the proxy that observed the address.
 
-``_decide_tool`` and ``_tool_ruling`` at the bottom do the same job for the MCP
-gateway's table and share no code with the host matcher: they sit next to ``_decide``
-because each way the two differ is a decision. Where a tool's rule is `ask`, a pin
-may answer the call in advance (``_answering_pin``), and ``_tool_ruling`` names its
-card for the audit row.
+``_decide_tool`` and ``_tool_ruling`` below do the same job for the MCP gateway's
+table and share no code with the host matcher: they sit next to ``_decide`` because
+each way the two differ is a decision. Where a tool's rule is `ask`, a pin may answer
+the call in advance (``_answering_pin``), and ``_tool_ruling`` names its card for the
+audit row.
+
+``_repo_ruling`` at the bottom does ``_decide``'s job for the git surface's repo
+tables, through ``_decide``'s own rule passes, since its order is the same decision.
 """
 from __future__ import annotations
 
@@ -967,3 +970,171 @@ def _tool_ruling(server: str, tool: str, args: object = None,
     reason = f"{action!r} by rule ({tool} on {server})"
     return (action, f"{reason}; {_skipped_words(met, schema_digest)}" if met else reason,
             None)
+
+
+# ── repo policy: what a `repo_rules` row means ───────────────────────────────
+# The governed git service's surface, keyed on (pattern, client_class) as egress is,
+# over repos rather than hosts (control-plane/DESIGN.md, "The repo surface"). Written
+# beside ``_decide`` and sharing its rule passes, because the order is the same
+# decision: block, then allow, then a live lease, within the asking class.
+#
+#   - One host. The git service fronts github.com and nothing else, so a repo names
+#     only `owner/repo` under it and every other host is refused.
+#   - One wildcard, `github.com/owner/*`: every repo of one owner. A repo has no
+#     deeper hierarchy, and an owner is what a fine-grained token is issued over.
+
+#: The host every repo names, and the ``host`` of every git-surface audit row.
+REPO_HOST = "github.com"
+#: GitHub's character sets, lower-cased, since GitHub matches names without case. An
+#: owner is a user or an organization login; a repo name adds '.' and '_'.
+_REPO_OWNER_RE = re.compile(r"[a-z0-9-]{1,39}")
+_REPO_NAME_RE = re.compile(r"[a-z0-9._-]{1,100}")
+#: How much of a refused repo a reason quotes: enough to recognise, and bounded.
+_REPO_QUOTE_MAX = 200
+
+
+def _quoted(raw: object) -> str:
+    """A refused input as a reason quotes it: its ``repr``, which escapes a lone
+    surrogate and every control character, cut to ``_REPO_QUOTE_MAX``."""
+    return repr(str(raw)[:_REPO_QUOTE_MAX])
+
+
+def _split_repo(raw: object) -> tuple[str, str, str] | str:
+    """``raw`` lower-cased and split into (host, owner, name), or why it cannot be.
+    The checks both the repo and the pattern normaliser share."""
+    if not isinstance(raw, str):
+        return "the repo is not a string"
+    if store._unencodable(raw):
+        return f"the repo {_quoted(raw)} holds a lone surrogate, which has no UTF-8 form"
+    # Before lower-casing, which folds some non-ASCII letters to ASCII: U+212A KELVIN
+    # SIGN becomes `k`, so `acKme` would pass the owner check as `ackme`.
+    if not raw.isascii():
+        return (f"{_quoted(raw)} holds a character outside ASCII; GitHub's owner and "
+                f"repo names are ASCII")
+    parts = raw.lower().split("/")
+    if len(parts) != 3:
+        return (f"{_quoted(raw)} is not a repo — expected {REPO_HOST}/owner/repo, "
+                f"three segments")
+    host, owner, name = parts
+    if host != REPO_HOST:
+        return (f"{_quoted(raw)} names host {_quoted(host)}; the git surface serves "
+                f"{REPO_HOST} only")
+    if not _REPO_OWNER_RE.fullmatch(owner):
+        return (f"{_quoted(raw)} has owner {_quoted(owner)} — an owner takes letters, "
+                f"digits and '-', at most 39 characters")
+    return host, owner, name
+
+
+def _repo_name_error(raw: object, name: str) -> str | None:
+    """Why ``name`` cannot be a repo name, or None. ``.`` and ``..`` are refused even
+    though they are in the character set: GitHub refuses them, and a path built from
+    them would climb out of the owner."""
+    if name in (".", "..") or not _REPO_NAME_RE.fullmatch(name):
+        return (f"{_quoted(raw)} has repo name {_quoted(name)} — a repo name takes "
+                f"letters, digits, '.', '_' and '-', at most 100 characters, and is "
+                f"not '.' or '..'")
+    return None
+
+
+def _normalize_repo(raw: object) -> tuple[str | None, str | None]:
+    """(repo, None) with ``repo`` in the ONE form the surface compares, stores and
+    leases, or (None, why not).
+
+    Lower-cased, since GitHub reads `Acme/Widgets` as `acme/widgets`, so a block on one
+    must not miss the other. ONE trailing `.git` goes, the suffix git's clone URLs
+    carry; a second stays, since `widgets.git` is a name GitHub allows. Nothing else is
+    rewritten: an input that needs more than that to fit is refused, not repaired."""
+    split = _split_repo(raw)
+    if isinstance(split, str):
+        return None, split
+    host, owner, name = split
+    if name.endswith(".git"):
+        name = name[:-len(".git")]
+    error = _repo_name_error(raw, name)
+    if error is not None:
+        return None, error
+    return f"{host}/{owner}/{name}", None
+
+
+def _normalize_repo_pattern(raw: object) -> tuple[str | None, str | None]:
+    """(pattern, None) for an exact repo or `github.com/owner/*`, normalised as
+    ``_normalize_repo`` does, or (None, why not). Surrounding whitespace is trimmed,
+    since the operator types this one."""
+    text = raw.strip() if isinstance(raw, str) else raw
+    split = _split_repo(text)
+    if not isinstance(split, str) and split[2] == "*":
+        return f"{split[0]}/{split[1]}/*", None
+    return _normalize_repo(text)
+
+
+def _repo_covers(repo: str, pattern: str) -> bool:
+    """Whether ``pattern`` decides for ``repo``, both normalised: equality, or for
+    `github.com/owner/*` every repo of that owner and no other."""
+    if pattern.endswith("/*"):
+        return repo.startswith(pattern[:-1])
+    return repo == pattern
+
+
+def _repo_scope(pattern: str) -> str:
+    """How broadly a stored repo pattern matches, in words, beside ``_repo_covers``."""
+    return "every repo of the owner" if pattern.endswith("/*") else "exact repo"
+
+
+def _repo_candidates(repo: str) -> list[str]:
+    """The patterns an operator may persist from a repo card, NARROWEST FIRST: the
+    repo, then every repo of its owner. Derived from the card's stored repo, as
+    ``_persist_candidates`` derives from a host, so the request never supplies one."""
+    owner = repo.rsplit("/", 1)[0]
+    return [repo, f"{owner}/*"]
+
+
+#: What a repo rule may do: the egress pair, since an unknown repo is held as an
+#: unknown host is.
+REPO_RULE_ACTIONS = ("allow", "block")
+
+
+def _repo_rule_error(action: str) -> str | None:
+    """Why a repo rule cannot take ``action``, or None. The pattern's own refusals are
+    ``_normalize_repo_pattern``'s."""
+    if action not in REPO_RULE_ACTIONS:
+        return f"action must be 'allow' or 'block', not {_quoted(action)}"
+    return None
+
+
+def _live_repo_lease(conn, repo: str, client_class: str, now: float):
+    """The live lease on ``repo`` for ``client_class``, or None: ``_live_lease`` for
+    the repo table, with expiry enforced in the read for its reason."""
+    return conn.execute(
+        "SELECT id, expires_at, approval_id FROM repo_leases "
+        "WHERE repo=? AND client_class=? AND expires_at > ? "
+        "ORDER BY expires_at DESC LIMIT 1",
+        (repo, client_class, now)).fetchone()
+
+
+def _repo_ruling(repo: str, client_class: str) -> tuple[str, str, str | None]:
+    """(decision, reason, lease card) for fetching the normalised ``repo`` as
+    ``client_class``: ``_ruling`` over the repo tables.
+
+    Blocks, then allows, then a live lease, so no lease outlives a block; no match is
+    `hold`, whose reason names the other classes a rule covers it for. What a hold
+    MEANS is the caller's: ``holds._authorize_repo`` holds an advertisement and denies
+    an upload."""
+    with store._connect() as conn:
+        return _repo_ruling_in(conn, repo, client_class)
+
+
+def _repo_ruling_in(conn, repo: str, client_class: str) -> tuple[str, str, str | None]:
+    """``_repo_ruling`` on an open connection, for a write asking inside its own
+    transaction."""
+    rows = conn.execute(
+        "SELECT pattern, action, client_class FROM repo_rules").fetchall()
+    decided = _rule_pass(rows, client_class, lambda p: _repo_covers(repo, p))
+    if decided is not None:
+        return *decided, None
+    now = time.time()
+    lease = _live_repo_lease(conn, repo, client_class, now)
+    if lease is not None:
+        return ("allow", (f"allowed by lease ({repo} for {client_class}, "
+                          f"{_short_duration(lease['expires_at'] - now)} left)"),
+                lease["approval_id"])
+    return *_held(rows, client_class, lambda p: _repo_covers(repo, p)), None

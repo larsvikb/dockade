@@ -96,6 +96,9 @@ def _clear_all():
         conn.execute("DELETE FROM approvals")
         conn.execute("DELETE FROM tool_approvals")
         conn.execute("DELETE FROM tool_call_tokens")
+        conn.execute("DELETE FROM repo_rules")
+        conn.execute("DELETE FROM repo_leases")
+        conn.execute("DELETE FROM repo_approvals")
         conn.execute("DELETE FROM audit")
         conn.commit()
     cp.holds._PENDING_EVENTS.clear()
@@ -2048,7 +2051,10 @@ class AuditViewTests(_CPTestCase):
              # a host in that cell, and a tool row names `server__tool`. They are also
              # in the group key, since two `ok` outcomes for different tools are
              # different facts and would otherwise fold into one unattributable "2x".
-             "server", "tool", "status"})
+             "server", "tool", "status",
+             # The repo a git-surface row concerns, for the same reason: two allows
+             # of two repos under one `owner/*` rule are two facts.
+             "repo"})
 
     def test_the_unbounded_fields_stay_out_of_the_list_view(self):
         # url is AGENT-CONTROLLED and unbounded; method/port/proto are recorded and
@@ -2574,7 +2580,10 @@ class AuditRecordTests(_CPTestCase):
              # And how it ended, for the tool rows the gateway's stream fills, with
              # what it returned as the gateway measured it, and which handle named
              # its card.
-             "status", "result_bytes", "result_sha256", "duration", "settled_by"})
+             "status", "result_bytes", "result_sha256", "duration", "settled_by",
+             # The repo a git-surface row concerns, its identity as the tool columns
+             # are a tool row's.
+             "repo"})
         self.assertEqual(row["url"], "https://a.example/x")
 
     def test_a_tool_outcome_serves_its_result_facts(self):
@@ -3938,28 +3947,31 @@ class SaturationTests(_CPTestCase):
 
 
 class MergedQueueTests(_CPTestCase):
-    """One queue over two builders. Everything else about the tool surface splits —
-    its own tables, caps and endpoints — and this is the deliberate exception, because
+    """One queue over every surface's builder. Everything else about the tool surface
+    splits — its own tables, caps and endpoints — and this is the deliberate exception,
+    because
     a partly connected merged view is indistinguishable from an empty one: two streams
     merged in the browser render a silent subset when one drops, and a subset of a
     queue looks exactly like a queue with nothing in it."""
 
-    def test_both_kinds_arrive_in_one_list(self):
+    def test_every_kind_arrives_in_one_list(self):
         _hold("example.com", "hold-1")
         ask = cp.holds._register_tool_ask("mcp-github", "issue_write", {"n": 1})
+        _repo_hold()
         cards = cp.holds._pending_payload()["holds"]
-        self.assertEqual({c["kind"] for c in cards}, {"egress", "tool"})
+        self.assertEqual({c["kind"] for c in cards}, {"egress", "tool", "repo"})
         self.assertIn(ask.approval_id, [c["id"] for c in cards])
 
     def test_every_card_states_its_kind(self):
-        # Stated on both builders rather than defaulted on one, so neither surface is
-        # the implicit case a reader has to infer from the absence of the other.
+        # Stated on every builder rather than defaulted on one, so no surface is the
+        # implicit case a reader has to infer from the absence of the others.
         _hold("example.com", "hold-1")
         cp.holds._register_tool_ask("mcp-github", "issue_write", {"n": 1})
+        _repo_hold()
         self.assertTrue(all(c.get("kind") for c in
                             cp.holds._pending_payload()["holds"]))
 
-    def test_the_queue_is_ordered_by_age_across_both_surfaces(self):
+    def test_the_queue_is_ordered_by_age_across_the_egress_and_tool_surfaces(self):
         # The operator's question is which decision has waited longest, and that does
         # not respect which subsystem raised it. Sorting per surface and concatenating
         # would float a seconds-old ask above a minutes-old hold.
@@ -3983,9 +3995,10 @@ class MergedQueueTests(_CPTestCase):
         for field in ("requests", "persist_options", "persistable"):
             self.assertNotIn(field, card)
 
-    def test_saturation_is_reported_once_for_both(self):
-        # Unsplit: over a cap nothing raises a card on either surface, so a refusal is
-        # invisible in the queue, and an operator should not have to read two banners.
+    def test_saturation_is_reported_once_for_every_surface(self):
+        # Unsplit: over a cap nothing raises a card on any surface, so a refusal is
+        # invisible in the queue, and an operator should not have to read a banner
+        # per surface.
         self.assertIn("saturation", cp.holds._pending_payload())
 
 
@@ -10726,9 +10739,8 @@ class CardOutcomeMigrationTests(_FreshStoreTestCase):
                                 f"PRAGMA index_list({table})")))
                     for table in ("audit", "tool_approvals")}
 
-    def test_v17_is_the_current_step(self):
-        self.assertEqual(cp.store.SCHEMA_VERSION, 17)
-        self.assertEqual(cp.store._STEPS[-1][:2],
+    def test_v17_is_the_seventeenth_step(self):
+        self.assertEqual(cp.store._STEPS[16][:2],
                          (17, "a tool card's outcome: settled_by and refused_at"))
 
     def test_the_columns_are_added_as_null_and_the_rows_kept(self):
@@ -10741,7 +10753,8 @@ class CardOutcomeMigrationTests(_FreshStoreTestCase):
                 "SELECT id, status, refused_at FROM tool_approvals").fetchone())
             version = conn.execute("PRAGMA user_version").fetchone()[0]
         self.assertEqual((outcome, ask, version),
-                         (("a1", "ok", None), ("a1", "allowed", None), 17))
+                         (("a1", "ok", None), ("a1", "allowed", None),
+                          cp.store.SCHEMA_VERSION))
 
     def test_a_migrated_and_a_fresh_store_agree(self):
         self._v16_store("card-outcome-agree-migrated.db")
@@ -10750,7 +10763,8 @@ class CardOutcomeMigrationTests(_FreshStoreTestCase):
         self._use_store("card-outcome-agree-fresh.db")
         cp.store._init_db()
         self.assertEqual(migrated, self._shape())
-        self.assertEqual(migrated["audit"][0][-1][1:3], ("settled_by", "TEXT"))
+        # Then v18's `repo`, after it.
+        self.assertEqual(migrated["audit"][0][-2][1:3], ("settled_by", "TEXT"))
         self.assertEqual(migrated["tool_approvals"][0][-1][1:3], ("refused_at", "REAL"))
         self.assertIn(("audit_settled", 0, "c", 1), migrated["audit"][1])
 
@@ -10959,6 +10973,8 @@ class SqliteIntegerRangeTests(unittest.TestCase):
             ("api_mcp", "edit_mcp_rule", "rule_id"): "guarded",
             ("api_mcp", "revoke_mcp_rule", "rule_id"): "guarded",
             ("api_mcp", "revoke_mcp_pin", "pin_id"): "guarded",
+            ("api_repos", "revoke_repo_rule", "rule_id"): "guarded",
+            ("api_repos", "revoke_repo_lease", "lease_id"): "guarded",
             # audit.clamp bounds it before any bind.
             ("api_views", "api_audit", "limit"): "clamped",
             ("api_views", "api_audit_events", "limit"): "clamped",
@@ -11062,6 +11078,17 @@ class ApiSurfaceSplitTests(unittest.TestCase):
         self.assertEqual(writes & _routes(cp.authorize_app), set())
         self.assertEqual(writes & _routes(cp.tool_app), set())
 
+    def test_the_endpoints_that_write_repo_policy_are_management_only(self):
+        # The git surface's policy, held to the same roster. The git service will ask
+        # over a bridge of its own, and these writes must never appear on it.
+        writes = {r for r in _routes(cp.app)
+                  if r[0] == "POST" and "/api/git/" in r[1]}
+        self.assertEqual(writes, {("POST", "/api/git/rules"),
+                                  ("POST", "/api/git/rules/{rule_id}/revoke"),
+                                  ("POST", "/api/git/leases/{lease_id}/revoke")})
+        self.assertEqual(writes & _routes(cp.authorize_app), set())
+        self.assertEqual(writes & _routes(cp.tool_app), set())
+
     def test_the_endpoints_that_write_tool_policy_are_management_only(self):
         # The gateway's surface, held to the same roster as the egress one. The
         # gateway READS policy over a bridge of its own — a narrow one that cannot
@@ -11086,7 +11113,8 @@ class ApiSurfaceSplitTests(unittest.TestCase):
         for path in ("/approvals", "/approvals/stream", "/api/audit",
                      "/api/audit/events", "/api/egress/rules", "/api/mcp/servers",
                      "/api/mcp/rules", "/api/mcp/pins", "/api/mcp/export",
-                     "/api/config", "/status"):
+                     "/api/git/rules", "/api/git/leases", "/api/config",
+                     "/status"):
             self.assertIn(("GET", path), _routes(cp.app), path)
             self.assertNotIn(("GET", path), _routes(cp.authorize_app), path)
             # Nor on the gateway's bridge. It reads policy — that is what the roster
@@ -11336,6 +11364,822 @@ class OwnStoreTests(unittest.TestCase):
     def test_the_store_is_this_modules_own(self):
         self.assertEqual(cp.store.DB_PATH, _DB)
         self.assertEqual(cp.store.SEED_PATH, _SEED)
+
+
+
+# ── the repo surface ─────────────────────────────────────────────────────────
+
+REPO = "github.com/acme/widgets"
+OTHER_IP = "172.30.0.131"
+
+
+def _set_repo_rules(rules):
+    """(pattern, action) or (pattern, action, client_class) repo rules, replacing all."""
+    with cp.store._connect() as conn:
+        conn.execute("DELETE FROM repo_rules")
+        conn.executemany(
+            "INSERT INTO repo_rules(pattern, action, source, created_at, client_class) "
+            "VALUES (?,?, 'test', 0, ?)",
+            [r if len(r) == 3 else (*r, CLASS) for r in rules])
+        conn.commit()
+
+
+def _set_repo_lease(repo=REPO, seconds=600.0, client_class=CLASS, card="lease-card"):
+    with cp.store._connect() as conn:
+        lease_id = conn.execute(
+            "INSERT INTO repo_leases(repo, client_class, approval_id, created_at, "
+            "expires_at, granted_by) VALUES (?,?,?,?,?, 'test')",
+            (repo, client_class, card, time.time(), time.time() + seconds)).lastrowid
+        conn.commit()
+    return lease_id
+
+
+def _repo_cards():
+    return [c for c in cp.holds._pending_payload()["holds"] if c["kind"] == "repo"]
+
+
+def _repo_hold(approval_id="repo-1", repo=REPO, client=CLASS_IP, client_class=CLASS):
+    """A pending repo card with no blocked fetch behind it, as ``_hold`` builds an
+    egress one: the durable row and the slot ``resolve`` looks for, through the real
+    ``_reserve_hold``."""
+    with cp.store._connect() as conn:
+        conn.execute(
+            "INSERT INTO repo_approvals(id, ts, repo, client, client_class, status) "
+            "VALUES (?,?,?,?,?, 'pending')",
+            (approval_id, time.time(), repo, client, client_class))
+        conn.commit()
+    cp.holds._reserve_hold(approval_id, threading.Event(), client, repo, kind="repo")
+    return approval_id
+
+
+def _repo_rows(table):
+    with cp.store._connect() as conn:
+        return [dict(r) for r in conn.execute(f"SELECT * FROM {table} ORDER BY id")]  # noqa: S608
+
+
+def _repo_card_status(approval_id):
+    with cp.store._connect() as conn:
+        return dict(conn.execute(
+            "SELECT status, mode, pattern, resolved_by FROM repo_approvals WHERE id=?",
+            (approval_id,)).fetchone())
+
+
+class _RepoHoldCase(_CPTestCase):
+    """Real audit rows, and real fetches blocked in ``holds._authorize_repo``, called
+    as the git service's bridge will call it."""
+
+    audits = True
+
+    def setUp(self):
+        super().setUp()
+        for name in ("HOLD_TIMEOUT", "MAX_PENDING", "MAX_PENDING_PER_CLIENT",
+                     "MAX_WAITERS", "MAX_WAITERS_PER_CLIENT"):
+            self.addCleanup(setattr, cp.holds, name, getattr(cp.holds, name))
+        cp.holds.HOLD_TIMEOUT = 10.0
+
+    @staticmethod
+    def _fetch(repo=REPO, client=CLASS_IP, stage="advertise",
+               service="git-upload-pack"):
+        return cp.holds._authorize_repo(client, repo, service, stage)
+
+    def _held(self, *clients, repo=REPO):
+        """One blocked advertisement per client given; the threads and their
+        results, which fill in as each returns."""
+        results = [None] * len(clients)
+
+        def worker(i, client):
+            results[i] = self._fetch(repo, client)
+
+        threads = [threading.Thread(target=worker, args=(i, c))
+                   for i, c in enumerate(clients)]
+        for t in threads:
+            t.start()
+        return threads, results
+
+    def _await_cards(self, count, waiters):
+        """The repo cards, once there are ``count`` of them holding ``waiters``."""
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            cards = _repo_cards()
+            if len(cards) == count and sum(c["requests"] for c in cards) == waiters:
+                return cards
+            time.sleep(0.01)
+        raise AssertionError(f"never saw {count} repo card(s) holding {waiters}")
+
+    def _join(self, threads):
+        for t in threads:
+            t.join(5)
+            self.assertFalse(t.is_alive())
+
+    @staticmethod
+    def _audit():
+        with cp.store._connect() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT kind, stage, host, repo, client, client_class, actor, "
+                "approval_id, reason FROM audit WHERE repo IS NOT NULL ORDER BY id")]
+
+
+class RepoHoldTests(_RepoHoldCase):
+    """``holds._authorize_repo`` on an advertisement: decided by the repo tables,
+    held when they leave it open, and refused at once for everything it cannot serve."""
+
+    def test_an_allowed_repo_is_audited_with_its_repo(self):
+        _set_repo_rules([(REPO, "allow")])
+        self.assertEqual(self._fetch(), ("allow", f"allowed by rule ({REPO} for "
+                                                  f"{CLASS})", None))
+        [row] = self._audit()
+        self.assertEqual(
+            {k: row[k] for k in ("kind", "stage", "host", "repo", "client",
+                                 "client_class", "approval_id")},
+            {"kind": "allow", "stage": "git-advertise", "host": "github.com",
+             "repo": REPO, "client": CLASS_IP, "client_class": CLASS,
+             "approval_id": None})
+
+    def test_a_blocked_repo_is_denied_as_policy(self):
+        _set_repo_rules([("github.com/acme/*", "block")])
+        answer = self._fetch()
+        self.assertEqual((answer.decision, answer.refusal), ("deny", "policy"))
+        self.assertEqual([r["kind"] for r in self._audit()], ["deny"])
+        self.assertEqual(_repo_rows("repo_approvals"), [])
+
+    def test_the_repo_is_normalised_before_it_is_decided(self):
+        _set_repo_rules([(REPO, "block")])
+        self.assertEqual(self._fetch("GitHub.com/Acme/Widgets.git").decision, "deny")
+        self.assertEqual(self._audit()[0]["repo"], REPO)
+
+    def test_a_lease_allows_and_names_its_card(self):
+        _set_repo_lease()
+        self.assertEqual(self._fetch().decision, "allow")
+        self.assertEqual(self._audit()[0]["approval_id"], "lease-card")
+
+    def test_an_unknown_advertisement_waits_for_each_of_the_four_answers(self):
+        cases = (("allow_lease", "allow", None, "lease written"),
+                 ("allow_persist", "allow", None, f"standing rule written: {REPO}"),
+                 ("deny_once", "deny", "policy", "this fetch only"),
+                 ("deny_persist", "deny", "policy", f"standing rule written: {REPO}"))
+        for action, decision, refusal, scope in cases:
+            with self.subTest(action=action):
+                _clear_all()
+                threads, results = self._held(CLASS_IP)
+                [card] = self._await_cards(1, 1)
+                self.assertIsNone(results[0])
+                self.assertEqual(_resolve(card["id"], action).status_code, 200)
+                self._join(threads)
+                self.assertEqual((results[0].decision, results[0].refusal),
+                                 (decision, refusal))
+                self.assertIn(scope, results[0].reason)
+                rows = self._audit()
+                self.assertEqual([(r["kind"], r["stage"], r["approval_id"])
+                                  for r in rows],
+                                 [("hold", "git-advertise", card["id"]),
+                                  (decision, "git-advertise", card["id"])])
+                self.assertEqual(rows[1]["actor"], cp.provenance._actor(_FakeRequest()))
+                self.assertEqual(_repo_cards(), [])
+
+    def test_the_waiter_that_wins_the_expiry_closes_the_card_to_joiners(self):
+        # Before its own slot is given back: with the release held off, as when other
+        # waiters are still on the card, nothing may join a card already decided.
+        cp.holds.HOLD_TIMEOUT = 0.05
+        with mock.patch.object(cp.holds, "_release_hold"):
+            self.assertEqual(self._fetch().refusal, "unanswered")
+        [row] = _repo_rows_by_ts()
+        self.assertNotIn(row["id"], cp.holds._GROUPS.values())
+
+    def test_an_unanswered_hold_default_denies(self):
+        cp.holds.HOLD_TIMEOUT = 0.05
+        answer = self._fetch()
+        self.assertEqual((answer.decision, answer.refusal), ("deny", "unanswered"))
+        [row] = _repo_rows_by_ts()
+        self.assertEqual(row["status"], "expired")
+        self.assertEqual([r["kind"] for r in self._audit()], ["hold", "deny"])
+        self.assertEqual(cp.holds._PENDING_EVENTS, {})
+
+    def test_over_a_cap_it_is_refused_as_busy_with_no_card(self):
+        cp.holds.MAX_PENDING = 0
+        answer = self._fetch()
+        self.assertEqual((answer.decision, answer.refusal), ("deny", "busy"))
+        self.assertEqual(_repo_rows_by_ts(), [])
+        self.assertEqual([r["kind"] for r in self._audit()], ["deny"])
+        # The one saturation account, its subject the repo.
+        self.assertEqual(cp.holds._SATURATION["last_host"], REPO)
+        self.assertEqual(cp.holds._SATURATION["count"], 1)
+
+    def test_identical_fetches_share_one_card(self):
+        threads, results = self._held(CLASS_IP, CLASS_IP)
+        [card] = self._await_cards(1, 2)
+        self.assertEqual(card["requests"], 2)
+        _resolve(card["id"], "deny_once")
+        self._join(threads)
+        self.assertEqual([r.decision for r in results], ["deny", "deny"])
+
+    def test_two_clients_on_one_repo_never_join(self):
+        threads, _ = self._held(CLASS_IP, OTHER_IP)
+        cards = self._await_cards(2, 2)
+        self.assertEqual({c["client"] for c in cards}, {CLASS_IP, OTHER_IP})
+        for card in cards:
+            _resolve(card["id"], "deny_once")
+        self._join(threads)
+
+    def test_an_egress_hold_on_a_repo_shaped_host_never_joins_a_repo_card(self):
+        # The egress request has no port and no proto (AuthorizeRequest's defaults),
+        # so its key differs from the repo hold's in the surface tag alone.
+        egress = threading.Thread(
+            target=cp.api_authorize.authorize, args=(_auth_req(REPO),))
+        egress.start()
+        deadline = time.monotonic() + 5
+        while not cp.holds._list_pending() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        threads, results = self._held(CLASS_IP)
+        [card] = self._await_cards(1, 1)
+        [egress_card] = cp.holds._list_pending()
+        self.assertNotEqual(card["id"], egress_card["id"])
+        _resolve(egress_card["id"], "allow_once")
+        egress.join(5)
+        self.assertIsNone(results[0])
+        _resolve(card["id"], "deny_once")
+        self._join(threads)
+        self.assertEqual(results[0].decision, "deny")
+
+    def test_an_unclassified_client_is_denied_with_no_card(self):
+        for client in ("10.9.9.9", None, "not-an-address"):
+            with self.subTest(client=client):
+                answer = self._fetch(client=client)
+                self.assertEqual((answer.decision, answer.refusal), ("deny", "policy"))
+                self.assertIn("CONTROL_CLIENT_CLASSES", answer.reason)
+        self.assertEqual(_repo_rows_by_ts(), [])
+        self.assertEqual(cp.holds._PENDING_EVENTS, {})
+        self.assertEqual({r["client_class"] for r in self._audit()},
+                         {cp.policy.UNCLASSIFIED})
+
+    def test_only_upload_pack_is_served_whatever_the_rules_say(self):
+        _set_repo_rules([(REPO, "allow")])
+        for service in ("git-receive-pack", "", "git-upload-pack ", "GIT-UPLOAD-PACK"):
+            with self.subTest(service=service):
+                answer = self._fetch(service=service)
+                self.assertEqual((answer.decision, answer.refusal), ("deny", "policy"))
+                self.assertIn("is refused", answer.reason)
+        self.assertEqual({r["stage"] for r in self._audit()}, {"git-advertise"})
+
+    def test_an_unknown_stage_is_refused_whatever_the_rules_say(self):
+        _set_repo_rules([(REPO, "allow")])
+        for stage in ("push", "", "Advertise"):
+            with self.subTest(stage=stage):
+                self.assertEqual(self._fetch(stage=stage).decision, "deny")
+        self.assertEqual({r["stage"] for r in self._audit()}, {"git"})
+
+    def test_an_upload_is_audited_under_its_own_stage(self):
+        _set_repo_rules([(REPO, "allow")])
+        self._fetch(stage="upload")
+        self.assertEqual(self._audit()[0]["stage"], "git-upload")
+
+    def test_a_repo_it_cannot_normalise_is_refused_and_recorded_as_sent(self):
+        _set_repo_rules([("github.com/acme/*", "allow")])
+        for repo in ("gitlab.com/acme/widgets", "github.com/acme/../widgets"):
+            with self.subTest(repo=repo):
+                answer = self._fetch(repo)
+                self.assertEqual((answer.decision, answer.refusal), ("deny", "policy"))
+        self.assertEqual([r["repo"] for r in self._audit()],
+                         ["gitlab.com/acme/widgets", "github.com/acme/../widgets"])
+        self.assertEqual(_repo_rows_by_ts(), [])
+
+    def test_a_lone_surrogate_in_any_field_is_refused(self):
+        _set_repo_rules([(REPO, "allow")])
+        for field in ("client", "repo", "service", "stage"):
+            with self.subTest(field=field):
+                kw = {"repo": REPO, "client": CLASS_IP, "stage": "advertise",
+                      "service": "git-upload-pack"}
+                kw[field] += "\ud800"
+                answer = self._fetch(**kw)
+                self.assertEqual((answer.decision, answer.reason),
+                                 ("deny", cp.store.UNENCODABLE))
+        self.assertEqual(len(self._audit()), 4)
+
+
+def _repo_rows_by_ts():
+    with cp.store._connect() as conn:
+        return [dict(r) for r in conn.execute("SELECT * FROM repo_approvals ORDER BY ts")]
+
+
+class RepoUploadTests(_RepoHoldCase):
+    """The upload-pack POSTs: decided as an advertisement is, and never held."""
+
+    def test_an_upload_with_no_grant_is_denied_at_once_with_no_card(self):
+        started = time.monotonic()
+        answer = self._fetch(stage="upload")
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertEqual((answer.decision, answer.refusal), ("deny", "policy"))
+        self.assertIn("never held", answer.reason)
+        self.assertEqual(_repo_rows_by_ts(), [])
+        self.assertEqual(cp.holds._PENDING_EVENTS, {})
+
+    def test_a_rule_or_a_lease_allows_an_upload(self):
+        _set_repo_rules([("github.com/acme/*", "allow")])
+        self.assertEqual(self._fetch(stage="upload").decision, "allow")
+        _set_repo_rules([])
+        _set_repo_lease()
+        self.assertEqual(self._fetch(stage="upload").decision, "allow")
+
+    def test_a_block_written_during_a_lease_denies_the_upload(self):
+        _set_repo_lease()
+        self.assertEqual(self._fetch(stage="upload").decision, "allow")
+        _set_repo_rules([(REPO, "block")])
+        self.assertEqual(self._fetch(stage="upload").decision, "deny")
+
+    def test_after_deny_once_the_next_advertisement_is_held_anew(self):
+        threads, _ = self._held(CLASS_IP)
+        [first] = self._await_cards(1, 1)
+        _resolve(first["id"], "deny_once")
+        self._join(threads)
+        self.assertEqual(self._fetch(stage="upload").decision, "deny")
+        threads, _ = self._held(CLASS_IP)
+        [second] = self._await_cards(1, 1)
+        self.assertNotEqual(second["id"], first["id"])
+        _resolve(second["id"], "deny_once")
+        self._join(threads)
+
+
+class RepoCardTests(_CPTestCase):
+    """A repo card in the one queue: its exact fields, and its place by age."""
+
+    def test_a_repo_card_carries_exactly_its_fields(self):
+        _set_repo_rules([("github.com/acme/*", "allow", "mcp"),
+                         ("github.com/acme/*", "block")])
+        _repo_hold()
+        [card] = cp.holds._pending_payload()["holds"]
+        ts = card.pop("ts")
+        self.assertIsInstance(ts, float)
+        self.assertEqual(card, {
+            "id": "repo-1", "kind": "repo", "repo": REPO, "client": CLASS_IP,
+            "client_class": CLASS, "requests": 1, "persistable": True,
+            "leasable": True,
+            "persist_options": [
+                {"pattern": REPO, "scope": "exact repo", "existing": None},
+                {"pattern": "github.com/acme/*", "scope": "every repo of the owner",
+                 "existing": "block"}]})
+
+    def test_the_queue_is_ordered_by_age_across_every_surface(self):
+        ask = cp.holds._register_tool_ask("mcp-github", "issue_write", {"n": 1})
+        with cp.store._connect() as conn:
+            conn.execute("UPDATE tool_approvals SET ts=? WHERE id=?",
+                         (time.time() - 300, ask.approval_id))
+            conn.commit()
+        _repo_hold()
+        with cp.store._connect() as conn:
+            conn.execute("UPDATE repo_approvals SET ts=? WHERE id='repo-1'",
+                         (time.time() - 600,))
+            conn.commit()
+        _hold("example.com", "hold-1")
+        self.assertEqual([c["id"] for c in cp.holds._pending_payload()["holds"]],
+                         ["repo-1", ask.approval_id, "hold-1"])
+
+
+class RepoResolveTests(_CPTestCase):
+    """``resolve`` on a repo card: the operator's four answers, each writing exactly
+    what it says, and every other answer refused with the card still pending."""
+
+    def setUp(self):
+        super().setUp()
+        _repo_hold()
+
+    def _pending(self):
+        return _repo_card_status("repo-1")["status"] == "pending"
+
+    def test_a_lease_writes_exactly_one_repo_lease(self):
+        before = time.time()
+        resp = _resolve("repo-1", "allow_lease")
+        self.assertEqual(resp.status_code, 200)
+        [lease] = _repo_rows("repo_leases")
+        self.assertEqual({k: lease[k] for k in ("repo", "client_class", "approval_id",
+                                                "granted_by")},
+                         {"repo": REPO, "client_class": CLASS, "approval_id": "repo-1",
+                          "granted_by": cp.provenance._actor(_FakeRequest())})
+        self.assertAlmostEqual(lease["expires_at"],
+                               before + cp.policy.LEASE_SECONDS, delta=5)
+        self.assertEqual((_repo_rows("repo_rules"), _repo_rows("leases"),
+                          _repo_rows("rules")), ([], [], []))
+        self.assertEqual(_repo_card_status("repo-1")["mode"], "lease")
+        body = resp.body
+        self.assertEqual((body["kind"], body["outcome"], body["leased"],
+                          body["persisted"], body["client_class"]),
+                         ("repo", "allow", True, False, CLASS))
+
+    def test_a_lapsed_repo_lease_is_swept_by_the_next_grant(self):
+        _set_repo_lease(seconds=-5, card="old")
+        _resolve("repo-1", "allow_lease")
+        self.assertEqual([r["approval_id"] for r in _repo_rows("repo_leases")],
+                         ["repo-1"])
+
+    def test_a_persist_writes_exactly_the_chosen_rule(self):
+        for action, pattern, wanted in (
+                ("allow_persist", None, (REPO, "allow")),
+                ("allow_persist", "github.com/acme/*", ("github.com/acme/*", "allow")),
+                ("deny_persist", "GitHub.com/ACME/* ", ("github.com/acme/*", "block")),
+                ("deny_persist", REPO, (REPO, "block"))):
+            with self.subTest(action=action, pattern=pattern):
+                _clear_all()
+                _repo_hold()
+                fields = {} if pattern is None else {"pattern": pattern}
+                resp = _resolve("repo-1", action, **fields)
+                self.assertEqual(resp.status_code, 200)
+                self.assertEqual([(r["pattern"], r["action"], r["client_class"],
+                                   r["source"]) for r in _repo_rows("repo_rules")],
+                                 [(*wanted, CLASS, "operator")])
+                self.assertEqual((_repo_rows("repo_leases"), _repo_rows("rules")),
+                                 ([], []))
+                self.assertEqual(_repo_card_status("repo-1")["pattern"], wanted[0])
+                self.assertEqual(resp.body["pattern"], wanted[0])
+
+    def test_a_pattern_outside_the_candidates_is_refused_and_nothing_written(self):
+        for pattern in ("github.com/other/*", ".github.com", "github.com/acme/gadgets",
+                        "github.com/*/*", "github.com", "github.com/acme"):
+            with self.subTest(pattern=pattern):
+                resp = _resolve("repo-1", "allow_persist", pattern=pattern)
+                self.assertEqual(resp.status_code, 400)
+                self.assertTrue(self._pending())
+        self.assertEqual(_repo_rows("repo_rules"), [])
+
+    def test_an_opposite_rule_is_a_409_and_the_card_stays(self):
+        _set_repo_rules([(REPO, "block")])
+        resp = _resolve("repo-1", "allow_persist")
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.body["conflict"]["action"], "block")
+        self.assertTrue(self._pending())
+        self.assertEqual([r["action"] for r in _repo_rows("repo_rules")], ["block"])
+
+    def test_the_same_rule_in_force_is_recorded_as_present(self):
+        _set_repo_rules([(REPO, "allow"), (REPO, "block", "mcp")])
+        resp = _resolve("repo-1", "allow_persist")
+        body = resp.body
+        self.assertEqual((body["persisted"], body["already_present"]), (False, True))
+        self.assertEqual(_repo_card_status("repo-1")["mode"], "present")
+        self.assertEqual(len(_repo_rows("repo_rules")), 2)
+
+    def test_a_rule_in_another_class_is_no_conflict(self):
+        _set_repo_rules([(REPO, "block", "mcp")])
+        self.assertEqual(_resolve("repo-1", "allow_persist").status_code, 200)
+
+    def test_an_action_not_for_a_repo_card_is_a_400_and_the_card_stays(self):
+        for action in ("allow_once", "allow_pinned", "allow_pinned_lease", "allow",
+                       "deny", "deny_lease", ""):
+            with self.subTest(action=action):
+                resp = _resolve("repo-1", action)
+                self.assertEqual(resp.status_code, 400)
+                self.assertEqual(resp.body["actions"],
+                                 list(cp.api_approvals.REPO_ACTIONS))
+                self.assertTrue(self._pending())
+        self.assertEqual((_repo_rows("repo_rules"), _repo_rows("repo_leases")), ([], []))
+
+    def test_the_action_is_read_as_the_egress_half_reads_it(self):
+        self.assertEqual(_resolve("repo-1", " Deny_Once ").status_code, 200)
+
+    def test_pins_are_refused(self):
+        resp = _resolve("repo-1", "allow_lease", pins=["repo"])
+        self.assertEqual(resp.status_code, 400)
+        self.assertTrue(self._pending())
+
+    def test_a_resolved_card_is_final(self):
+        self.assertEqual(_resolve("repo-1", "deny_once").status_code, 200)
+        self.assertEqual(_repo_card_status("repo-1")["mode"], "once")
+        for action in ("allow_lease", "deny_once"):
+            with self.subTest(action=action):
+                self.assertEqual(_resolve("repo-1", action).status_code, 409)
+        self.assertEqual(_repo_card_status("repo-1")["status"], "denied")
+        self.assertEqual(_repo_rows("repo_leases"), [])
+
+    def test_a_card_whose_slot_is_gone_is_a_409(self):
+        cp.holds._release_hold("repo-1")
+        self.assertEqual(_resolve("repo-1", "allow_lease").status_code, 409)
+
+    def test_a_card_with_no_class_takes_no_grant_but_can_be_denied(self):
+        for client_class in (None, cp.policy.UNCLASSIFIED):
+            with self.subTest(client_class=client_class):
+                _clear_all()
+                _repo_hold(client_class=client_class)
+                [card] = _repo_cards()
+                self.assertEqual((card["persistable"], card["leasable"]), (False, False))
+                for action in ("allow_lease", "allow_persist", "deny_persist"):
+                    self.assertEqual(_resolve("repo-1", action).status_code, 400)
+                self.assertTrue(self._pending())
+                self.assertEqual(_resolve("repo-1", "deny_once").status_code, 200)
+        self.assertEqual((_repo_rows("repo_rules"), _repo_rows("repo_leases")), ([], []))
+
+    def test_a_decided_card_stops_accepting_joiners_at_the_click(self):
+        # As the egress test of the same name: the window closes with the decision,
+        # asserted while the waiter is still registered.
+        before = cp.holds._reserve_hold("dup", threading.Event(), CLASS_IP, REPO,
+                                        kind="repo")
+        self.assertTrue(before.joined, "joinable while pending")
+        self.assertEqual(_resolve("repo-1", "deny_once").status_code, 200)
+        self.assertIn("repo-1", cp.holds._PENDING_EVENTS, "waiters not drained yet")
+        self.assertNotIn("repo-1", cp.holds._GROUPS.values())
+        after = cp.holds._reserve_hold("late", threading.Event(), CLASS_IP, REPO,
+                                       kind="repo")
+        self.assertFalse(after.joined)
+
+    def test_a_card_its_waiter_expired_writes_nothing(self):
+        # The waiter's expiry won the row while the slot is still registered: the
+        # click is the race's loser, and its grant must not land.
+        with cp.store._connect() as conn:
+            conn.execute("UPDATE repo_approvals SET status='expired' WHERE id='repo-1'")
+            conn.commit()
+        for action in ("allow_persist", "deny_persist", "allow_lease"):
+            with self.subTest(action=action):
+                self.assertEqual(_resolve("repo-1", action).status_code, 409)
+        self.assertEqual((_repo_rows("repo_rules"), _repo_rows("repo_leases")), ([], []))
+
+    def test_an_egress_card_is_still_answered_by_the_egress_half(self):
+        _hold("example.com", "hold-1")
+        self.assertEqual(_resolve("hold-1", "allow_once").status_code, 200)
+
+
+def _create_repo_rule(pattern, action="allow", client_class=CLASS):
+    return cp.api_repos.create_repo_rule(
+        cp.api_repos.RepoRuleCreateRequest(pattern=pattern, action=action,
+                                           client_class=client_class),
+        _FakeRequest())
+
+
+class RepoRulesApiTests(_CPTestCase):
+    """``/api/git/rules``: created and revoked by the operator, each write audited."""
+
+    audits = True
+
+    @staticmethod
+    def _audit():
+        with cp.store._connect() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT kind, stage, host, repo, actor, reason FROM audit ORDER BY id")]
+
+    def test_create_validates_the_pattern_the_action_and_the_class(self):
+        for pattern, action, client_class in (
+                ("gitlab.com/acme/*", "allow", CLASS),
+                ("github.com/*/*", "allow", CLASS),
+                ("github.com/acme", "allow", CLASS),
+                (REPO, "deny", CLASS),
+                (REPO, "allow", "sandox"),
+                (REPO, "allow", cp.policy.UNCLASSIFIED)):
+            with self.subTest(pattern=pattern, action=action, cls=client_class):
+                resp = _create_repo_rule(pattern, action, client_class)
+                self.assertEqual(resp.status_code, 400)
+        self.assertEqual((_repo_rows("repo_rules"), self._audit()), ([], []))
+        self.assertIn("client_classes", 
+            _create_repo_rule(REPO, "allow", "sandox").body)
+
+    def test_create_writes_the_normalised_rule_and_audits_its_actor(self):
+        resp = _create_repo_rule(" GitHub.com/ACME/* ", "block")
+        self.assertEqual(resp.status_code, 201)
+        [rule] = _repo_rows("repo_rules")
+        self.assertEqual((rule["pattern"], rule["action"], rule["client_class"],
+                          rule["source"]),
+                         ("github.com/acme/*", "block", CLASS, "operator"))
+        [row] = self._audit()
+        self.assertEqual({k: row[k] for k in ("kind", "stage", "host", "repo", "actor")},
+                         {"kind": "create", "stage": "git-policy", "host": "github.com",
+                          "repo": "github.com/acme/*",
+                          "actor": cp.provenance._actor(_FakeRequest())})
+        self.assertIn("blocked by rule", row["reason"])
+
+    def test_the_action_and_the_class_are_trimmed_and_case_folded(self):
+        resp = _create_repo_rule(REPO, " Allow ", f" {CLASS.upper()} ")
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual([(r["action"], r["client_class"])
+                          for r in _repo_rows("repo_rules")], [("allow", CLASS)])
+
+    def test_the_same_rule_twice_writes_once_and_the_opposite_is_a_409(self):
+        _create_repo_rule(REPO, "allow")
+        again = _create_repo_rule(REPO, "allow").body
+        self.assertEqual((again["created"], again["already_present"]), (False, True))
+        self.assertEqual(_create_repo_rule(REPO, "block").status_code, 409)
+        self.assertEqual(_create_repo_rule(REPO, "block", "mcp").status_code, 201)
+        self.assertEqual(len(_repo_rows("repo_rules")), 2)
+        self.assertEqual(len(self._audit()), 2)
+
+    def test_revoke_deletes_the_rule_and_audits_its_actor(self):
+        rule_id = _create_repo_rule("github.com/acme/*").body["id"]
+        resp = cp.api_repos.revoke_repo_rule(rule_id, _FakeRequest(peer="172.31.0.9"))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(_repo_rows("repo_rules"), [])
+        row = self._audit()[-1]
+        self.assertEqual((row["kind"], row["stage"], row["repo"], row["actor"]),
+                         ("revoke", "git-policy", "github.com/acme/*",
+                          cp.provenance._actor(_FakeRequest(peer="172.31.0.9"))))
+        self.assertIn("held for approval", row["reason"])
+
+    def test_revoking_an_exact_rule_says_where_the_repo_lands(self):
+        _set_repo_rules([("github.com/acme/*", "allow")])
+        rule_id = _create_repo_rule(REPO, "block").body["id"]
+        cp.api_repos.revoke_repo_rule(rule_id, _FakeRequest())
+        self.assertIn("allowed by rule (github.com/acme/*", self._audit()[-1]["reason"])
+
+    def test_revoking_an_unknown_rule_is_a_404(self):
+        for rule_id in (999, 2**63, -2**63 - 1):
+            with self.subTest(rule_id=rule_id):
+                resp = cp.api_repos.revoke_repo_rule(rule_id, _FakeRequest())
+                self.assertEqual(resp.status_code, 404)
+        self.assertEqual(self._audit(), [])
+
+    def test_the_rules_are_listed_by_class_blocks_first_with_their_scope(self):
+        _set_repo_rules([(REPO, "allow"), ("github.com/acme/*", "block"),
+                         ("github.com/zeta/*", "allow", "mcp")])
+        self.assertEqual(
+            [(r["client_class"], r["action"], r["pattern"], r["scope"])
+             for r in cp.api_repos.api_repo_rules()],
+            [("mcp", "allow", "github.com/zeta/*", "every repo of the owner"),
+             (CLASS, "block", "github.com/acme/*", "every repo of the owner"),
+             (CLASS, "allow", REPO, "exact repo")])
+
+
+class RepoLeasesApiTests(_CPTestCase):
+    """``/api/git/leases``: the live ones listed, any one revoked, each revoke
+    audited with its actor."""
+
+    audits = True
+
+    def test_only_live_leases_are_listed_soonest_first(self):
+        _set_repo_lease(seconds=-5, card="lapsed")
+        _set_repo_lease(seconds=900, card="later")
+        _set_repo_lease(seconds=300, card="sooner")
+        self.assertEqual([r["approval_id"] for r in cp.api_repos.api_repo_leases()],
+                         ["sooner", "later"])
+
+    def test_a_revoked_lease_allows_nothing_and_its_revoke_is_audited(self):
+        lease_id = _set_repo_lease()
+        self.assertEqual(cp.holds._authorize_repo(CLASS_IP, REPO, "git-upload-pack",
+                                                  "upload").decision, "allow")
+        resp = cp.api_repos.revoke_repo_lease(lease_id, _FakeRequest())
+        self.assertTrue(resp.body["was_live"])
+        self.assertEqual(cp.holds._authorize_repo(CLASS_IP, REPO, "git-upload-pack",
+                                                  "upload").decision, "deny")
+        with cp.store._connect() as conn:
+            row = dict(conn.execute(
+                "SELECT kind, stage, repo, actor, approval_id, reason FROM audit "
+                "WHERE kind='revoke'").fetchone())
+        self.assertEqual({k: row[k] for k in ("stage", "repo", "actor", "approval_id")},
+                         {"stage": "git-policy", "repo": REPO,
+                          "actor": cp.provenance._actor(_FakeRequest()),
+                          "approval_id": "lease-card"})
+        self.assertIn("repo lease revoked", row["reason"])
+
+    def test_an_expired_lease_is_removed_and_reported_so(self):
+        lease_id = _set_repo_lease(seconds=-5)
+        body = cp.api_repos.revoke_repo_lease(lease_id, _FakeRequest()).body
+        self.assertFalse(body["was_live"])
+        self.assertEqual(_repo_rows("repo_leases"), [])
+
+    def test_revoking_an_unknown_lease_is_a_404(self):
+        for lease_id in (999, 2**63):
+            with self.subTest(lease_id=lease_id):
+                self.assertEqual(cp.api_repos.revoke_repo_lease(
+                    lease_id, _FakeRequest()).status_code, 404)
+
+
+class RepoAuditViewTests(_CPTestCase):
+    """A repo row in the two audit views: its repo served, searchable and folded on."""
+
+    audits = True
+
+    def test_a_repo_row_carries_its_repo_in_both_views(self):
+        _set_repo_rules([(REPO, "allow")])
+        cp.holds._authorize_repo(CLASS_IP, REPO, "git-upload-pack", "advertise")
+        self.assertEqual(cp.api_views.api_audit()["rows"][0]["repo"], REPO)
+        self.assertEqual(cp.api_views.api_audit_events()["rows"][0]["repo"], REPO)
+
+    def test_the_live_feed_line_names_the_repo(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cp.store._audit("deny", stage="git-advertise", host="github.com", repo=REPO,
+                            reason="r")
+        self.assertIn(f"repo={REPO}", out.getvalue())
+
+    def test_search_finds_a_repo_row_by_its_repo_in_both_views(self):
+        cp.store._audit("deny", stage="git-advertise", host="github.com",
+                        repo="github.com/acme/gizmo", reason="no reason given")
+        cp.store._audit("deny", host="other.example", reason="no reason given")
+        for view in (cp.api_views.api_audit, cp.api_views.api_audit_events):
+            with self.subTest(view=view.__name__):
+                self.assertEqual([r["repo"] for r in view(q="acme/gizmo")["rows"]],
+                                 ["github.com/acme/gizmo"])
+
+    def test_two_repos_under_one_owner_rule_never_fold(self):
+        _set_repo_rules([("github.com/acme/*", "allow")])
+        for repo in (REPO, "github.com/acme/gadgets", REPO):
+            cp.holds._authorize_repo(CLASS_IP, repo, "git-upload-pack", "advertise")
+        rows = cp.api_views.api_audit()["rows"]
+        self.assertEqual(sorted((r["repo"], r["n"]) for r in rows),
+                         [("github.com/acme/gadgets", 1), (REPO, 2)])
+
+
+class RepoStatusAndConfigTests(_CPTestCase):
+    """/status counts the repo surface; /api/config gains nothing, since a repo card's
+    one timed answer is a lease at the egress lease's length."""
+
+    def test_status_counts_repo_rules_and_cards(self):
+        _set_repo_rules([(REPO, "allow"), ("github.com/acme/*", "block")])
+        _repo_hold()
+        # A decided card is not pending, so it is not counted.
+        _repo_hold("repo-2", client=OTHER_IP)
+        _resolve("repo-2", "deny_once")
+        self.assertIn("2 repo rules", cp.api_views.status())
+        self.assertIn("1 pending repo approvals", cp.api_views.status())
+
+    def test_config_serves_the_same_keys(self):
+        self.assertEqual(set(cp.api_views.api_config()),
+                         {"hold_timeout", "lease_seconds", "pin_lease_seconds",
+                          "tool_outcome_wait", "client_classes"})
+
+
+class RepoSurfaceMigrationTests(_FreshStoreTestCase):
+    """v18: the repo tables, created empty, and ``audit.repo``, which existing rows
+    keep NULL."""
+
+    _TABLES = ("repo_rules", "repo_leases", "repo_approvals")
+
+    def _v17_store(self, name):
+        """The store v17 left: today's, without the repo tables, and with ``audit``
+        cut after v17's ``settled_by``, its indexes made again as v17 made them."""
+        self._use_store(name)
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            for table in self._TABLES:
+                conn.execute(f"DROP TABLE {table}")
+            ddl = conn.execute("SELECT sql FROM sqlite_master WHERE name='audit'"
+                               ).fetchone()[0]
+            v17 = re.sub(r"settled_by(\s+)TEXT,.*\)\s*$",
+                         r"settled_by\1TEXT\n            )", ddl, flags=re.S)
+            self.assertNotIn("repo ", v17)
+            self.assertIn("settled_by", v17)
+            conn.execute("DROP TABLE audit")
+            conn.execute(v17)
+            conn.execute("CREATE INDEX audit_ts ON audit(ts)")
+            conn.execute(cp.store._AUDIT_SETTLED_INDEX)
+            conn.execute("INSERT INTO audit(ts, kind, host, settled_by) VALUES "
+                         "(1.0, 'allow', 'a.example', 'resume')")
+            conn.execute("PRAGMA user_version = 17")
+            conn.commit()
+
+    @staticmethod
+    def _shape():
+        with cp.store._connect() as conn:
+            return (sorted(tuple(r) for r in conn.execute(
+                        "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                        "WHERE tbl_name LIKE 'repo_%'")),
+                    [tuple(r) for r in conn.execute("PRAGMA table_info(audit)")],
+                    sorted(tuple(r)[1:] for r in conn.execute("PRAGMA index_list(audit)")))
+
+    def test_v18_is_the_current_step(self):
+        self.assertEqual(cp.store.SCHEMA_VERSION, 18)
+        self.assertEqual(cp.store._STEPS[-1][:2], (18, "the repo surface"))
+
+    def test_the_tables_are_made_empty_and_the_rows_kept(self):
+        self._v17_store("repo-surface-migrate.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn:
+            for table in self._TABLES:
+                self.assertEqual(
+                    conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0], 0)  # noqa: S608
+            rows = [tuple(r) for r in conn.execute(
+                "SELECT kind, host, settled_by, repo FROM audit")]
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+        self.assertEqual(rows, [("allow", "a.example", "resume", None)])
+        self.assertEqual(version, cp.store.SCHEMA_VERSION)
+
+    def test_the_tables_exist_after_the_steps_alone(self):
+        self._v17_store("repo-surface-steps-only.db")
+        cp.store._migrate()
+        with cp.store._connect() as conn:
+            for table in self._TABLES:
+                self.assertTrue(cp.store._columns(conn, table), table)
+            self.assertIn("repo", cp.store._columns(conn, "audit"))
+            self.assertIsNotNone(conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' "
+                "AND name='repo_approvals_status'").fetchone())
+
+    def test_a_migrated_and_a_fresh_store_agree(self):
+        self._v17_store("repo-surface-agree-migrated.db")
+        cp.store._init_db()
+        migrated = self._shape()
+        self._use_store("repo-surface-agree-fresh.db")
+        cp.store._init_db()
+        self.assertEqual(migrated, self._shape())
+        self.assertEqual([c[1:3] for c in migrated[1][-2:]],
+                         [("settled_by", "TEXT"), ("repo", "TEXT")])
+
+    def test_v17_leaves_a_store_that_has_the_column_alone(self):
+        self._use_store("repo-surface-again.db")
+        cp.store._init_db()
+        before = self._shape()
+        with cp.store._connect() as conn:
+            cp.store._step_18_repo_surface(conn)
+            conn.commit()
+        self.assertEqual(self._shape(), before)
+
+    def test_a_repo_lease_refuses_a_text_deadline(self):
+        self._use_store("repo-surface-check.db")
+        cp.store._init_db()
+        with cp.store._connect() as conn, self.assertRaises(sqlite3.IntegrityError):
+            conn.execute("INSERT INTO repo_leases(repo, client_class, approval_id, "
+                         "created_at, expires_at, granted_by) VALUES "
+                         "('github.com/a/b', 'sandbox', 'c', 0, 'soon', 'g')")
 
 
 if __name__ == "__main__":

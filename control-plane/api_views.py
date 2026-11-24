@@ -158,8 +158,12 @@ def api_saturation_ack(req: AckRequest) -> dict:
 def status() -> str:
     with store._connect() as conn:
         rules = conn.execute("SELECT COUNT(*) FROM rules").fetchone()[0]
+        repo_rules = conn.execute("SELECT COUNT(*) FROM repo_rules").fetchone()[0]
         audits = conn.execute("SELECT COUNT(*) FROM audit").fetchone()[0]
         pending = conn.execute(
             "SELECT COUNT(*) FROM approvals WHERE status='pending'").fetchone()[0]
-    return (f"dockade control plane — {rules} rules, {audits} audit rows, "
-            f"{pending} pending approvals\n")
+        repo_pending = conn.execute(
+            "SELECT COUNT(*) FROM repo_approvals WHERE status='pending'").fetchone()[0]
+    return (f"dockade control plane — {rules} rules, {repo_rules} repo rules, "
+            f"{audits} audit rows, {pending} pending approvals, {repo_pending} "
+            f"pending repo approvals\n")

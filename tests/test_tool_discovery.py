@@ -1368,6 +1368,26 @@ class PollTests(unittest.TestCase):
                 self.assertEqual(failure, f"tool-gateway: roster unavailable from "
                                           f"{discovery.CONTROL_URL} — {detail}")
 
+    def test_a_roster_that_is_not_a_list_is_reported_and_not_raised(self):
+        # A parsed body that is not a list is an outage with a reason, never a
+        # roster. The float is there so a check listing bad types cannot pass.
+        for reply, kind in ((b"null", "NoneType"), (b"{}", "dict"),
+                            (b'"x"', "str"), (b"1", "int"), (b"1.5", "float")):
+            with self.subTest(reply):
+                discovery = load_discovery()
+                with control_plane_answering(discovery, reply=reply):
+                    roster, failure = discovery.poll()
+                self.assertIsNone(roster)
+                self.assertEqual(failure, f"tool-gateway: roster unavailable from "
+                                          f"{discovery.CONTROL_URL} — a {kind} where a "
+                                          f"list was expected")
+
+    def test_an_empty_roster_is_an_answer_and_not_an_outage(self):
+        # No servers enabled is a real roster: the check refuses a shape, not a size.
+        discovery = load_discovery()
+        with control_plane_answering(discovery, reply=b"[]"):
+            self.assertEqual(discovery.poll(), ([], ""))
+
     def test_a_bug_in_fetching_the_roster_still_raises(self):
         # The catch names what the control plane can do wrong, so a bug here reaches
         # the loop guard under its own class rather than reading as an outage.

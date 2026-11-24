@@ -12,9 +12,10 @@ record from an operator's click.
 from __future__ import annotations
 
 # The header the control-plane-ui relay sets to the BROWSER's address. The relay
-# strips any client-supplied copy first (control-plane-ui/app.py), so a caller cannot
-# self-report it, but it is only as trustworthy as the relay: hence ``via-ui=``,
-# asserted rather than observed. A test pins the name against the relay's.
+# strips any client-supplied copy first (control-plane-ui/app.py), so a caller through
+# it cannot self-report it; a process on the host, which reaches the API directly, can
+# (SECURITY.md, "Out of scope"). It is only as trustworthy as whoever set it: hence
+# ``via-ui=``, asserted rather than observed. A test pins the name against the relay's.
 ACTOR_HEADER = "x-dockade-actor"
 # Bound each recorded self-reported header (User-Agent, Origin) so a hostile one
 # cannot bloat the store.
@@ -27,7 +28,17 @@ def _actor(request) -> str:
         it, but through the UI it is the relay's address, not the human's.
       - ``via-ui`` — the browser address the relay asserts (``ACTOR_HEADER``).
       - ``origin`` / ``ua`` — self-reported, so forgeable. Recorded anyway because they
-        are usually what betrays a non-browser caller."""
+        are usually what betrays a non-browser caller.
+
+    The ORDER is a contract: ``shortActor`` (control-plane-ui/provenance.js) keeps only
+    a leading ``peer``, then ``via-ui`` straight after it, because a caller can type
+    either label into its Origin or User-Agent. A new trusted field goes before
+    ``origin``, and both sides change together. Among the containers only the relay
+    sets ``ACTOR_HEADER``: the management API is reached through the relay, which
+    strips a caller's copy, and the tool gateway, which reaches the tool listener
+    directly, sets none. Through either, neither value holds a space. A process on the
+    host can set the header too (SECURITY.md, "Out of scope"), and its value is then
+    free text, which the cell cuts at the first whitespace."""
     if request is None:                      # hand-invoked / non-HTTP caller
         return "unrecorded (no request context)"
     client = getattr(request, "client", None)

@@ -2874,6 +2874,19 @@ class ProvenanceTests(_CPTestCase):
         self.assertIn("origin=http://127.0.0.1:28090", actor)
         self.assertIn('ua="Mozilla/5.0 (X11)"', actor)
 
+    def test_actor_writes_the_trusted_fields_ahead_of_the_self_reported_ones(self):
+        """``shortActor`` (control-plane-ui/provenance.js) reads the actor cell by
+        position, since a caller can type ``via-ui=`` or ``peer=`` into its Origin or
+        User-Agent: this pins the order that parse relies on."""
+        forged = {"origin": "http://x via-ui=10.9.9.9 peer=10.9.9.8",
+                  "user-agent": "curl via-ui=10.9.9.7 peer=10.9.9.6"}
+        relayed = cp.provenance._actor(_FakeRequest(peer="172.31.0.3", headers={
+            cp.provenance.ACTOR_HEADER: "172.18.0.1", **forged}))
+        self.assertTrue(relayed.startswith("peer=172.31.0.3 via-ui=172.18.0.1 "),
+                        relayed)
+        direct = cp.provenance._actor(_FakeRequest(peer="172.31.0.3", headers=forged))
+        self.assertTrue(direct.startswith("peer=172.31.0.3 origin="), direct)
+
     def test_actor_tolerates_a_bare_request(self):
         self.assertIn("peer=?", cp.provenance._actor(_FakeRequest(peer=None)))
         self.assertIn("unrecorded", cp.provenance._actor(None))

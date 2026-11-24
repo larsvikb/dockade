@@ -129,10 +129,12 @@ failure it warns about.
   description and fix the check in the same PR.
 - **Touching the boundary?** Run `make check-boundary` before and after. It stands the
   infra up, launches a throwaway tier-1 sandbox and runs `boundary-check.sh` inside it,
-  exiting non-zero on any violation — a regression baseline, not a demo. It leaves your
-  volumes and any running agent session alone. CI runs the same target, so a boundary
-  regression fails the PR. Use `make boundary` instead when you already have a sandbox
-  running, or to check tier 2 (whose probes need the local model server up).
+  exiting non-zero on any violation — a regression baseline, not a demo. It keeps your
+  volumes, but infra whose image changed is recreated, and the throwaway sandbox's boot
+  rewrites the config volume running sessions share, as launching another session
+  would. CI runs the same target, so a boundary regression fails the PR. Use
+  `make boundary` instead when you already have a sandbox running, or to check tier 2
+  (whose probes need the local model server up).
 - **New source file?** Add an `SPDX-License-Identifier: Apache-2.0` header in the
   first three lines, so licence scanners never have to parse `LICENSE`.
   `make consistency` enforces this for the file types where it applies — scripts,

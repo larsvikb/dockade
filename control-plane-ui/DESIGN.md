@@ -266,7 +266,9 @@ panels' cancel and confirm, the pins sent, both kinds of countdown, and what a c
 once its resolve is answered. `tests/ui-harness/failing-state.test.js` drives the
 signals that something is wrong the same way: the approvals stream dropping, erring and
 going silent and the reconnect after each, the favicon lamp and conn text that follow
-it, and the title and tab badges. In `make test` `start()`'s DOM path has only the
+it, the title and tab badges, and the saturation banner: its levels, its decay by the
+clock, and what Dismiss sends and shows when the acknowledgement is recorded, recorded
+short or refused. In `make test` `start()`'s DOM path has only the
 guards above and the free-name check below. Mutation testing is what showed the gap: every mutation in a
 pure helper was caught and every one inside `start()` survived.
 

@@ -258,13 +258,15 @@ Not audited, deliberately: the rejections are already in the audit table with th
 reasons, and acknowledging one changes what the banner displays while touching no
 evidence. A row here would put a non-decision in the decisions log.
 
-The dismiss path also reaches into `start()`, which is unverified by choice — so it is
-built to make its own mistakes loud. `ackCount()` is a pure function purely so the
-optimistic hide and the POST body are *one expression* and cannot disagree, and the
+The dismiss path also reaches into `start()`, which `make test` cannot run; its browser
+tests are in `make ui-test` (`tests/ui-harness/failing-state.test.js`), and it is built
+to make its own mistakes loud all the same. `ackCount()` is a pure function purely so
+the optimistic hide and the POST body are *one expression* and cannot disagree, and the
 handler adopts the acknowledgement the backend **echoes back** rather than assuming its
 own number stuck, so a wrong count re-raises the banner immediately instead of failing
 silently. Those two lines are each other's safety net — drop the echo and the detector
-for the first mistake goes with it — which is why a source-level guard asserts both.
+for the first mistake goes with it — which is why a source-level guard in `make test`
+asserts both.
 
 It rides the existing SSE payload rather than a new endpoint — `/approvals` and the
 stream now return `{holds, saturation, withdrawn}` — so a rejection reaches the banner

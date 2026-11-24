@@ -6,8 +6,10 @@ helpers and counters: the rest probes egress, DNS and mounts of a live sandbox. 
 grep and awk run for real. The privilege-caps probe reads a fixture file in place of
 the process's own status, the embedded-resolver check meets stubbed ``getent`` and
 ``dig`` on a PATH of grep alone, and the model-host probe, the SNI-fronting branch
-and the port-gate probe meet a stubbed ``curl``, and the proxy-close probe meets a
-loopback server the test scripts, so no verdict depends on the machine running the test.
+and the port-gate probe meet a stubbed ``curl``, the proxy-close probe meets a
+loopback server the test scripts, and the working-directory probe tests a temporary
+directory's ``workspace/`` in place of ``/workspace/``, so no verdict depends on the
+machine running the test.
 """
 from __future__ import annotations
 
@@ -776,6 +778,119 @@ class ProxyCloseProbeTests(unittest.TestCase):
         for env in ({}, {"EGRESS_PROXY_IP": ""}):
             with self.subTest(env=env):
                 self.assertEqual(self._run(env), ([_NO_ADDRESS], "pass=0 fail=1"))
+
+
+_WORKDIR_TEST = '[[ "$workdir" == /workspace/?* ]]'
+_WORKDIR_UNREADABLE = ("working directory unreadable — this check expects to run from the"
+                       " session's start directory, under /workspace/")
+# Governed, local, and standalone with neither set: the launchers set -w in all three.
+_WORKDIR_MODES = {"governed": {"HTTPS_PROXY": "http://proxy.invalid:3128"},
+                  "local": {"SANDBOX_MODE": "local"},
+                  "standalone": {}}
+
+
+def _workdir_block(root: Path) -> str:
+    block = _lift(r"^# The session's start directory\..*?^fi\n", "working-directory probe")
+    swapped = block.replace(_WORKDIR_TEST,
+                            _WORKDIR_TEST.replace("/workspace/", f"{root}/workspace/"))
+    # Without the swap the verdict would depend on the machine having a /workspace.
+    if block.count(_WORKDIR_TEST) != 1:
+        raise AssertionError(f"the working-directory probe no longer tests {_WORKDIR_TEST} once")
+    return swapped
+
+
+def _wrong_dir(path: Path) -> str:
+    return (f"FAIL working directory {path} is not under /workspace/ — this check expects"
+            " to run from the session's start directory")
+
+
+@unittest.skipUnless(_BASH or _STRICT, "bash is not installed")
+class WorkdirProbeTests(unittest.TestCase):
+    """Claude Code keys memory, transcripts and trust by the session's start directory,
+    so a launch that lost its -w must fail here rather than share one key."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        # Resolved, as tests/test_launcher_lib.py does: a symlinked temp dir must not
+        # fail the passing cases.
+        self.root = Path(tmp.name).resolve()
+        (self.root / "workspace" / "acme" / "src").mkdir(parents=True)
+        (self.root / "workspace-acme").mkdir()
+
+    def _run(self, cwd: Path, mode: str, before: str = "") -> tuple[list[str], str]:
+        """The block's lines and counters under real bash, started in ``cwd`` with PWD
+        naming it, in ``mode``; ``before`` runs ahead of the block."""
+        env = {k: v for k, v in os.environ.items() if k not in ("HTTPS_PROXY", "SANDBOX_MODE")}
+        env.update(_WORKDIR_MODES[mode], PWD=str(cwd))
+        script = (_prelude() + _helpers() + before + _workdir_block(self.root)
+                  + 'echo "pass=$pass fail=$fail"\n')
+        proc = subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
+            [_BASH, "-c", script], cwd=cwd, env=env,
+            capture_output=True, text=True, encoding="utf-8", timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+        lines = proc.stdout.splitlines()
+        verdicts = [re.sub(r"\x1b\[[0-9;]*m", "", line).strip() for line in lines[:-1]]
+        return verdicts, lines[-1] if lines else ""
+
+    def _each_mode(self, cwd: Path, expected: tuple[list[str], str]) -> None:
+        for mode in _WORKDIR_MODES:
+            with self.subTest(mode=mode):
+                self.assertEqual(self._run(cwd, mode), expected)
+
+    def test_the_probe_sits_at_the_script_s_top_level(self):
+        # The lifted block cannot show where it sits. A mode condition or another
+        # probe's branch opened above its comment, and closed below it, leaves the
+        # script cut at the comment unclosed, which bash -n refuses.
+        anchor = "# The session's start directory."
+        self.assertEqual(SCRIPT.count(anchor), 1)
+        proc = subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
+            [_BASH, "-n"], input=SCRIPT[:SCRIPT.index(anchor)],
+            capture_output=True, text=True, encoding="utf-8", timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_a_folder_under_workspace_passes(self):
+        cwd = self.root / "workspace" / "acme"
+        self._each_mode(cwd, ([f"PASS working directory {cwd} is under /workspace/"],
+                              "pass=1 fail=0"))
+
+    def test_a_subdirectory_of_the_folder_passes(self):
+        cwd = self.root / "workspace" / "acme" / "src"
+        self._each_mode(cwd, ([f"PASS working directory {cwd} is under /workspace/"],
+                              "pass=1 fail=0"))
+
+    def test_workspace_itself_fails_as_a_lost_w(self):
+        cwd = self.root / "workspace"
+        self._each_mode(cwd, ([_wrong_dir(cwd)], "pass=0 fail=1"))
+
+    def test_the_root_fails_as_an_entrypoint_cd(self):
+        self._each_mode(self.root, ([_wrong_dir(self.root)], "pass=0 fail=1"))
+
+    def test_the_prefix_without_its_slash_fails(self):
+        cwd = self.root / "workspace-acme"
+        self._each_mode(cwd, ([_wrong_dir(cwd)], "pass=0 fail=1"))
+
+    def test_a_pwd_naming_a_symlink_to_workspace_fails(self):
+        # bash keeps an inherited PWD that names its own directory, so `pwd` and $PWD
+        # report the link, under the prefix: only the physical read fails. The echo
+        # shows bash kept it, so the case cannot pass vacuously.
+        link = self.root / "workspace" / "widgets"
+        link.symlink_to(self.root / "workspace")
+        for mode in _WORKDIR_MODES:
+            with self.subTest(mode=mode):
+                self.assertEqual(self._run(link, mode, 'echo "PWD=$PWD"\n'),
+                                 ([f"PWD={link}", _wrong_dir(self.root / "workspace")],
+                                  "pass=0 fail=1"))
+
+    def test_a_directory_removed_after_entry_fails_as_unreadable(self):
+        # Under the prefix, so a probe that read $PWD instead would pass here.
+        for mode in _WORKDIR_MODES:
+            gone = self.root / "workspace" / f"gone-{mode}"
+            gone.mkdir()
+            with self.subTest(mode=mode):
+                self.assertEqual(self._run(gone, mode, f"rmdir -- {shlex.quote(str(gone))}\n"),
+                                 ([f"FAIL {_WORKDIR_UNREADABLE}"], "pass=0 fail=1"))
 
 
 if __name__ == "__main__":

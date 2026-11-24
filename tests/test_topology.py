@@ -2762,24 +2762,33 @@ class CopyFormError(Exception):
     """A COPY or ADD line ``_copy_sources`` cannot resolve to repo files."""
 
 
+# BuildKit's continuation match for the default escape: a backslash not itself
+# escaped, or alone on the line, then only spaces or tabs.
+_CONTINUATION = re.compile(r"([^\\])\\[ \t]*\Z|^\\[ \t]*\Z")
+
+
 def _dockerfile_instructions(text: str) -> list[tuple[int, str]]:
     """Each instruction with the number of its first line, its continuation lines
-    joined and the comment lines among them dropped, as the builder reads them."""
+    joined and the comment and blank lines among them dropped, as the builder reads
+    them: moby/buildkit's frontend/dockerfile/parser/parser.go (``Parse``,
+    ``processLine``, ``trimContinuationCharacter``, the regex ``setEscapeToken``
+    builds) and ``splitCommand``'s ``TrimSpace``. Only the backslash and what
+    follows it go, so a continuation line runs on with no separator and its own
+    leading whitespace: ``a\\`` then ``.py`` is ``a.py``."""
     instructions: list[tuple[int, str]] = []
-    start, parts = 0, []
+    start, joined = 0, None
     for number, line in enumerate(text.splitlines(), 1):
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
+        if not line.strip() or line.lstrip().startswith("#"):
             continue
-        if not parts:
-            start = number
-        continued = stripped.endswith("\\")
-        parts.append(stripped[:-1].strip() if continued else stripped)
+        if joined is None:
+            start, joined = number, ""
+        line, continued = _CONTINUATION.subn(lambda m: m.group(1) or "", line)
+        joined += line
         if not continued:
-            instructions.append((start, " ".join(parts)))
-            parts = []
-    if parts:
-        instructions.append((start, " ".join(parts)))
+            instructions.append((start, joined.strip()))
+            joined = None
+    if joined is not None:
+        instructions.append((start, joined.strip()))
     return instructions
 
 
@@ -2797,7 +2806,7 @@ def _copy_sources(text: str, where: str, context: str) -> list[str]:
             raise CopyFormError(f"an escape directive: {where}:{number}: {raw.strip()}")
     sources: list[str] = []
     for number, instruction in _dockerfile_instructions(text):
-        keyword, _, rest = instruction.partition(" ")
+        keyword, rest = [*instruction.split(None, 1), "", ""][:2]
         line = f"{where}:{number}: {instruction}"
         if "<<" in instruction:
             raise CopyFormError(f"a heredoc: {line}")
@@ -2927,6 +2936,28 @@ class ReffilesCoverCopySourcesTests(_MakeRun):
                                     r"^an escape directive: fixture:2: # escape=`$"):
             _copy_sources("# syntax=docker/dockerfile:1\n# escape=`\nFROM scratch\n",
                           "fixture", ".")
+
+    def test_the_copy_reader_joins_lines_as_the_builder_does(self):
+        read = {"COPY a\\\n.py /dst/": ["a.py"],
+                "COPY\ta.py /dst/": ["a.py"],
+                "COPY\\\n\ta.py /dst/": ["a.py"],
+                "\\\n  COPY a.py /dst/": ["a.py"],
+                "RUN echo a\\\\\nCOPY b.py /dst/": ["b.py"],
+                "COPY a.py \\ \t\nb.py /dst/": ["a.py", "b.py"],
+                "COPY a.py \\\n   \n  b.py /dst/": ["a.py", "b.py"],
+                "COPY a.py /dst/\n\\": ["a.py"]}
+        for text, sources in read.items():
+            with self.subTest(text=text):
+                self.assertEqual(_copy_sources(text, "fixture", "."), sources)
+        refused = {"COPY a.py \\\n  --chmod=644 /d/":
+                       "a flag after a source: fixture:2: COPY a.py   --chmod=644 /d/",
+                   "\\\n  COPY a.py": "no source and destination: fixture:2: COPY a.py",
+                   "COPY a.py \\": "no source and destination: fixture:2: COPY a.py",
+                   "COPY a.py   ": "no source and destination: fixture:2: COPY a.py"}
+        for text, message in refused.items():
+            with self.subTest(text=text), self.assertRaisesRegex(
+                    CopyFormError, rf"^{re.escape(message)}$"):
+                _copy_sources(f"FROM scratch\n{text}\n", "fixture", ".")
 
 
 class SecretsDirTests(_MakeRun):

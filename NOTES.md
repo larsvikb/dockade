@@ -680,6 +680,30 @@ all.
 **The server's new request-body cap is 5 MiB** (github/github-mcp-server#3111), above
 the gateway's own, so the gateway's stays the one a caller meets.
 
+## A stateful MCP server talks back on a call's stream
+
+Measured by 2026-11-21 in the tier-1 sandbox, against the reference Python SDK (PyPI
+`mcp` 2.3.0, `MCPServer`, streamable HTTP, stateful, on loopback).
+
+**A tool that elicits sends the request on the call's own stream and waits.** A tool
+calling `ctx.elicit(...)` sent `elicitation/create`, carrying id 1, on the `tools/call`
+POST's SSE stream, then held the call open until the client answered. It did so even
+when the client had declared no elicitation capability. With no answer the call hung.
+POSTing a JSON-RPC error back for that id, in the same session, made the server end
+the call at once with an error result.
+
+**Not every server request comes that way.** The SDK sends `sampling/createMessage` to
+the standalone GET stream instead. A stateless server (`stateless_http=True`) refuses
+elicitation at once with "this transport context has no back-channel".
+
+**The SDK keys each POST's response stream by request id.** With two overlapping
+`tools/call`s in one session both carrying id 1, one result was lost and its call
+hung, although the tool ran. With ids 1 and 2, both returned. The spec forbids a
+requestor reusing an id within a session.
+
+**The SDK's SSE replies ping every 15 s**, so a call whose response never comes keeps
+its stream busy, and a per-read timeout never fires on it.
+
 ## What a sandbox session and a cold build actually cost
 
 Two sets of figures DESIGN.md used to carry inline, where they were both evidence for a

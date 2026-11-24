@@ -39,22 +39,49 @@ hand"; `make mcp-tools` is the same request by hand):
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import http.client
+import io
 import ipaddress
+import itertools
 import json
 import os
 import re
 import socket
+import threading
 import urllib.error
 import urllib.request
+from collections.abc import Iterable, Iterator
 
 import outcomes
 
-#: The id every request to a server carries. One call per connection, so one id is
-#: enough — and it is a name rather than a literal because the parser has to pick the
-#: reply that answers it out of whatever else the stream carries.
-REQUEST_ID = 1
+#: Where each request's id comes from: one per request for the gateway's lifetime, so
+#: no two requests in a session share one. The spec forbids a reused id, and a server
+#: that keys each call's stream by its id loses one of two overlapping calls that share
+#: it (NOTES.md, "A stateful MCP server talks back on a call's stream"). The lock covers
+#: taking the next number and never a call, so calls still overlap.
+_IDS = itertools.count(1)
+_IDS_LOCK = threading.Lock()
+
+#: The JSON-RPC error a server's request on a call's stream is answered with, unless it
+#: is `ping`: method not found, because the gateway offers a server no client methods.
+#: Root DESIGN.md, "Elicitation routes to the wrong human", says why nothing a server
+#: asks reaches the agent instead.
+_NO_SUCH_METHOD = {"code": -32601,
+                   "message": "the gateway answers no requests from a server"}
+
+#: How much of a server's method name a refusal's log line carries, after escaping.
+_METHOD_SHOWN = 120
+
+#: How much of why an answer was not delivered its log line carries, after escaping:
+#: the 200 characters the inventory keeps of a status. The reason can quote a reason
+#: phrase the server chose, of any length, once per request it sends.
+_FAILURE_SHOWN = 200
+
+#: The most an SSE reply is read in at once. A read returns what has arrived, up to
+#: this, so a server's request is seen as soon as its event ends.
+_CHUNK = 65536
 
 #: A DNS label, the same shape `policy._server_name_error` holds registration to. The
 #: name is used as a hostname and as a filename, so both uses want exactly this.
@@ -296,45 +323,75 @@ def _latin1(text: str) -> bool:
     return True
 
 
-def _sse_events(raw: str) -> list[str]:
-    """The data of each event in an SSE body, by the spec's rules rather than by
-    line: an event ends at a blank line, its ``data`` lines join with a newline, the
-    space after the colon is optional, and ``event:``, ``id:`` and ``:`` comments are
-    not data. Lines split on CR and LF only — ``str.splitlines`` also splits on
-    characters a JSON string may carry unescaped."""
-    events, data = [], []
-    for line in re.split(r"\r\n|\r|\n", raw):
+#: An SSE line end: CRLF, CR or LF.
+_LINE_END = re.compile(rb"\r\n|\r|\n")
+
+
+def _lines(stream) -> Iterator[bytes]:
+    """The lines of an SSE reply as they arrive, without their ends, split on bytes.
+
+    Each read returns what has arrived, so a line is yielded as soon as it ends rather
+    than when the stream does. Neither CR nor LF occurs inside a multi-byte UTF-8
+    sequence, so a split here never cuts a character; a read can, which is why nothing
+    is decoded until its event is whole (``_events``). A CR that ends one read and an
+    LF that starts the next are one line end, not two."""
+    parts: list[bytes] = []
+    after_cr = False
+    while chunk := stream.read1(_CHUNK):
+        if after_cr and chunk.startswith(b"\n"):
+            chunk = chunk[1:]
+        start = 0
+        for end in _LINE_END.finditer(chunk):
+            yield b"".join([*parts, chunk[start:end.start()]])
+            parts, start = [], end.end()
+        parts.append(chunk[start:])
+        after_cr = chunk.endswith(b"\r")
+    if any(parts):
+        yield b"".join(parts)
+
+
+def _events(stream) -> Iterator[str]:
+    """The data of each event in an SSE reply, by the spec's rules rather than by line,
+    each decoded once it is whole: an event ends at a blank line, its ``data`` lines
+    join with a newline, the space after the colon is optional, and ``event:``, ``id:``
+    and ``:`` comments are not data. A last event with no blank line after it still
+    counts when the stream ends."""
+    data: list[bytes] = []
+    for line in _lines(stream):
         if not line:
             if data:
-                events.append("\n".join(data))
+                yield b"\n".join(data).decode("utf-8", "replace")
                 data = []
-        elif line.startswith("data:"):
+        elif line.startswith(b"data:"):
             value = line[5:]
-            data.append(value[1:] if value.startswith(" ") else value)
+            data.append(value[1:] if value.startswith(b" ") else value)
     if data:
-        events.append("\n".join(data))
-    return events
+        yield b"\n".join(data).decode("utf-8", "replace")
 
 
-def response_message(raw: str) -> dict:
-    """The JSON-RPC response to our request out of an MCP reply, SSE or plain JSON.
+def _is_request_id(value) -> bool:
+    """Whether ``value`` can be a request's id: a string or an integer, and not a bool,
+    which is an int to Python and not to JSON-RPC."""
+    return isinstance(value, str) or (isinstance(value, int)
+                                      and not isinstance(value, bool))
 
-    Both shapes are accepted because only one of them is measured. The server answers
-    SSE today; a bare JSON body is legal for this transport and a version bump could
-    start sending one, and a reader that silently failed on that day would be worse
-    than one that kept working.
 
-    THE RESPONSE, NOT THE FIRST EVENT. A stream may carry other messages ahead of it —
-    a progress or log notification, a request from the server — and the response is
+def _response(bodies: Iterable[str], request_id: int, on_request) -> dict:
+    """The JSON-RPC response to request ``request_id`` among ``bodies``, one message
+    each, handing each request a server sends to ``on_request`` as it comes, before the
+    next body is read. It returns at the response and reads no further.
+
+    THE RESPONSE, NOT THE FIRST MESSAGE. A stream may carry other messages ahead of it
+    — a progress or log notification, a request from the server — and the response is
     the one with no ``method`` whose id is ours (or null, which is how a server answers
     a request it could not parse). Taking the first event read a notification as the
-    reply, and recorded a call that ran as one with no result."""
-    bodies = [b for b in (_sse_events(raw) if re.search(r"(?m)^data:", raw)
-                          else [raw.strip()]) if b.strip()]
-    if not bodies:
-        raise DiscoveryError("empty reply — not an MCP response")
+    reply, and recorded a call that ran as one with no result. A request has a
+    ``method`` and an id that is a string or an integer; anything else, a response to
+    another id included, is passed over."""
     problem = None
     for body in bodies:
+        if not body.strip():
+            continue
         try:
             message = json.loads(body)
         except ValueError:
@@ -352,14 +409,54 @@ def response_message(raw: str) -> dict:
             problem = problem or (f"not an MCP reply — expected a JSON object, the "
                                   f"server sent {type(message).__name__}: {body[:200]!r}")
             continue
-        if "method" not in message and message.get("id") in (REQUEST_ID, None):
-            return message
+        ident = message.get("id")
+        if "method" not in message:
+            if ident is None or (not isinstance(ident, bool) and ident == request_id):
+                return message
+        elif _is_request_id(ident):
+            on_request(message)
     raise DiscoveryError(problem or "the reply carried no response to the request")
 
 
-def parse_tools(raw: str) -> list[dict]:
-    """The tool list out of an MCP reply (see ``response_message`` for the shapes)."""
-    message = response_message(raw)
+def _unanswered(_request: dict) -> None:
+    """A request in a reply read whole: the server had ended the reply by the time it
+    was read, so there is nothing left to answer it for."""
+
+
+def read_reply(stream, content_type: str | None, request_id: int, on_request) -> dict:
+    """The JSON-RPC response to request ``request_id`` out of a server's reply, given
+    as a binary stream and its Content-Type. No network of its own: ``on_request`` is
+    handed each request the server sends ahead of the response, and answers it.
+
+    ``text/event-stream`` (with any parameters) is read event by event and left at the
+    response, without waiting for the stream to end: a stateful server sends a request
+    on a call's own stream and holds the call until it is answered, and may keep the
+    stream open after the response (NOTES.md, "A stateful MCP server talks back on a
+    call's stream"). Any other type is read whole (``response_message``)."""
+    media = (content_type or "").partition(";")[0].strip().lower()
+    if media == "text/event-stream":
+        return _response(_events(stream), request_id, on_request)
+    return response_message(stream.read(), request_id)
+
+
+def response_message(raw: bytes, request_id: int) -> dict:
+    """The JSON-RPC response to request ``request_id`` out of a reply read whole, SSE
+    or plain JSON, by ``_response``'s rules.
+
+    Both shapes are accepted because a reply not labelled `text/event-stream` may still
+    be framed as SSE, and a bare JSON body is legal for this transport: a reader that
+    silently failed on either would be worse than one that kept working. A request in
+    such a body goes unanswered, since the server ended the reply before it was read."""
+    if re.search(rb"(?m)^data:", raw):
+        return _response(_events(io.BytesIO(raw)), request_id, _unanswered)
+    body = raw.decode("utf-8", "replace").strip()
+    if not body:
+        raise DiscoveryError("empty reply — not an MCP response")
+    return _response([body], request_id, _unanswered)
+
+
+def parse_tools(message: dict) -> list[dict]:
+    """The tool list out of the response to ``tools/list``, as ``post`` returns it."""
     if "error" in message:
         raise DiscoveryError(f"server returned an error: {message['error']}")
     result = message.get("result")
@@ -398,8 +495,9 @@ _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedire
 def _body(message: dict) -> bytes:
     """THE ONE PLACE a JSON-RPC message for an upstream server becomes request bytes.
 
-    Every message the gateway sends upstream (``tools/list``, ``tools/call``, and any
-    handshake message) is encoded here before anything for it is dialled, and a call's
+    Every message the gateway sends upstream (``tools/list``, ``tools/call``, any
+    handshake message, and each answer to a server's request on a call's stream) is
+    encoded here before anything for it is dialled, and a call's
     own message before any session handshake its path performs: a call too deep to
     encode then opens nothing and dials nothing, and is a ``DiscoveryError`` (kind
     ``transport-error``), recorded as never sent rather than as a call that may have
@@ -416,22 +514,39 @@ def _body(message: dict) -> bytes:
             f"sending the same arguments again will fail the same way ({exc})") from exc
 
 
-def post(entry: dict, message: dict, timeout: float | None = None) -> str:
-    """One MCP request to the server a roster entry names, returning its raw reply body.
+def _next_id() -> int:
+    """A request id no earlier request in this process carried (``_IDS``)."""
+    with _IDS_LOCK:
+        return next(_IDS)
+
+
+def post(entry: dict, message: dict, timeout: float | None = None) -> dict:
+    """One MCP request to the server a roster entry names, returning the JSON-RPC
+    response to it.
 
     THE ONLY PLACE ANYTHING DIALS A SERVER, which is what makes the properties below
     hold for enumeration and execution alike rather than for whichever one was written
     first. Both send the same headers, resolve the same derived secret path and get the
     same errors turned into `DiscoveryError`; the difference between them is the
-    message and the timeout, which is exactly what the two arguments are.
+    message and the timeout, which is exactly what the two arguments are. ``_dial`` is
+    the dial itself, and nothing but this function and the answers it sends uses it.
 
-    The URL is assembled here and nowhere else. ``check_name`` and ``check_endpoint``
-    run on every call, so neither the name nor the endpoint can move the host —
-    checked at this choke point rather than trusted from the roster that supplied them.
+    The id is stamped here, on a copy of ``message``, and is new for every request
+    (``_IDS``), so no caller can send a constant or a reused one; the response is the
+    one that carries it (``read_reply``). A request the server sends on the call's
+    stream is answered as it arrives (``_answer``), at the address and with the
+    headers the call went with.
+
+    The URL is built from what is checked here and from nothing else (``_dial``).
+    ``check_name`` and ``check_endpoint`` run on every call, so neither the name nor
+    the endpoint can move the host — checked at this choke point rather than trusted
+    from the roster that supplied them.
     The address it dials is decided here too, before the credential is read
-    (``_placed``). The message is encoded before anything is resolved or dialled
-    (``_body``), and one too deep to encode is a ``DiscoveryError``, never sent."""
-    data = _body(message)
+    (``_placed``), and once: an answer goes to the same address, not resolved again.
+    The message is encoded before anything is resolved or dialled (``_body``), and one
+    too deep to encode is a ``DiscoveryError``, never sent."""
+    request_id = _next_id()
+    data = _body({**message, "id": request_id})
     server = entry.get("server")
     port, path = check_endpoint(entry.get("endpoint"))
     address = _placed(server, port)
@@ -442,18 +557,74 @@ def post(entry: dict, message: dict, timeout: float | None = None) -> str:
                "Host": f"{server}:{port}"}
     headers.update(auth_header(entry.get("auth") or {}, read_secret(server),
                                secret_path(server)))
-    # The scheme is a literal here, so there is no S310 to suppress: the address is one
-    # `_placed` has put on mcp-net, and the path one `check_endpoint` let through.
-    host = f"[{address}]" if ":" in address else address
-    request = urllib.request.Request(
-        f"http://{host}:{port}{path}",
-        data=data, headers=headers)
     # Resolved once, because the timeout REFUSAL names it: a record saying "no answer
     # within None" would be worse than one that said nothing.
     deadline = TIMEOUT if timeout is None else timeout
+    target = (address, port, path)
+    with _dial(server, target, data, headers, deadline) as response:
+        return read_reply(response, response.headers.get("Content-Type"), request_id,
+                          lambda request: _answer(server, target, headers, request))
+
+
+def _answer_to(request: dict) -> dict:
+    """What a server's request on a call's stream is answered with: an empty result for
+    ``ping``, as the spec asks, and ``_NO_SUCH_METHOD`` for anything else, quoting
+    nothing of the server's. Each carries its request's id.
+
+    Refused because the gateway declares no client capability a server could be asking
+    it to use, and it must not forward a server's request to the agent instead: the
+    agent is the party being governed, and a server reaching its client would ask it
+    for input outside policy and the audit (root DESIGN.md, "Elicitation routes to the
+    wrong human")."""
+    if request["method"] == "ping":
+        return {"jsonrpc": "2.0", "id": request["id"], "result": {}}
+    return {"jsonrpc": "2.0", "id": request["id"], "error": dict(_NO_SUCH_METHOD)}
+
+
+def _answer(server: str, target: tuple, headers: dict, request: dict) -> None:
+    """Answer a server's request while its call waits on the answer: a server holds a
+    call open until a request it sent on the call's stream is answered (NOTES.md, "A
+    stateful MCP server talks back on a call's stream").
+
+    To ``target`` and with ``headers``, the call's own, so it goes to the address
+    ``_placed`` chose for the call through the same checked dial, carrying what the
+    call carried. Its status is checked and its body left unread. A refusal is a line
+    in the log, the method escaped and capped, since it is the server's text. A failed
+    answer is a line as well and does not end the call: the call was sent, so its
+    reply is still what the record needs, and a server left waiting ends as a timeout,
+    the honest status for a call that may have run."""
+    reply = _answer_to(request)
+    method = outcomes.printable(request["method"])[:_METHOD_SHOWN]
+    if "error" in reply:
+        print(f"tool-gateway: {outcomes.printable(server)}: refused its {method} "
+              f"request on a call's stream; nothing a server asks reaches the agent",
+              flush=True)
+    try:
+        with _dial(server, target, _body(reply), headers, TIMEOUT):
+            pass
+    except DiscoveryError as exc:
+        print(f"tool-gateway: {outcomes.printable(server)}: the answer to its {method} "
+              f"request was not delivered — "
+              f"{outcomes.printable(exc)[:_FAILURE_SHOWN]}", flush=True)
+
+
+@contextlib.contextmanager
+def _dial(server: str, target: tuple[str, int, str], data: bytes, headers: dict,
+          deadline: float):
+    """``data`` POSTed to ``target``, an address, port and path ``post`` checked,
+    through ``_OPENER``, the response yielded open, and every way that can fail, its
+    reading included, turned into a ``DiscoveryError``. ``post``'s alone, for its
+    request and the answers it sends."""
+    address, port, path = target
+    # The URL is assembled here and nowhere else, and the scheme is a literal, so there
+    # is no S310 to suppress: the address is one `_placed` has put on mcp-net, and the
+    # path one `check_endpoint` let through.
+    host = f"[{address}]" if ":" in address else address
+    request = urllib.request.Request(f"http://{host}:{port}{path}", data=data,
+                                     headers=headers)
     try:
         with _OPENER.open(request, timeout=deadline) as response:
-            return response.read().decode("utf-8", "replace")
+            yield response
     except urllib.error.HTTPError as exc:
         # The reason phrase and the Location are the SERVER'S text, and this message is
         # printed to the log an operator reads: repr, so a CR or an escape sequence
@@ -524,8 +695,7 @@ def list_tools(entry: dict) -> tuple[list[dict], dict[str, int]]:
     description and the schema, because an agent cannot call a tool whose arguments it
     cannot see. Trimming to only the first pair is what this did first, and it made the
     served tool list uncallable."""
-    raw = post(entry, {"jsonrpc": "2.0", "id": REQUEST_ID, "method": "tools/list",
-                       "params": {}})
+    response = post(entry, {"jsonrpc": "2.0", "method": "tools/list", "params": {}})
     # Trimmed HERE, at the point of reading, rather than downstream. A real reply
     # carries inline base64 `icons` as well — measured, see the byte split
     # `make mcp-tools` prints — and nothing reads them. The narrowing that crosses to
@@ -543,7 +713,7 @@ def list_tools(entry: dict) -> tuple[list[dict], dict[str, int]]:
     # are counted, so the report says the server sent something this could not read.
     # Names are not held to TOOL_RE here: the control plane drops and counts those.
     tools, malformed, dropped = [], 0, 0
-    for tool in parse_tools(raw):
+    for tool in parse_tools(response):
         name = tool.get("name") if isinstance(tool, dict) else None
         if not isinstance(name, str) or not name:
             malformed += 1

@@ -300,8 +300,8 @@ class OneBadServerTests(unittest.TestCase):
         def post(entry, *_a, **_k):
             if entry["server"] == "mcp-bad":
                 raise RuntimeError("something nobody listed")
-            return ('data: {"jsonrpc": "2.0", "id": 1, "result": {"tools": '
-                    '[{"name": "get_issue"}]}}\n\n')
+            return {"jsonrpc": "2.0", "id": 1,
+                    "result": {"tools": [{"name": "get_issue"}]}}
         discovery.poll = lambda: (roster, "")
         discovery.post = post
         pushed = []
@@ -323,9 +323,9 @@ class OneBadServerTests(unittest.TestCase):
 
     def test_a_malformed_entry_no_longer_needs_the_guard(self):
         discovery = load_discovery()
-        discovery.post = lambda *_a, **_k: (
-            'data: {"jsonrpc": "2.0", "id": 1, "result": {"tools": '
-            '[{"name": ["x"]}, {"name": "ok", "annotations": "ro"}]}}\n\n')
+        discovery.post = lambda *_a, **_k: {
+            "jsonrpc": "2.0", "id": 1,
+            "result": {"tools": [{"name": ["x"]}, {"name": "ok", "annotations": "ro"}]}}
         result = discovery.reconcile_all([{"server": "mcp-odd", "auth": {},
                                            "tools": []}])[0]
         self.assertEqual(result["status"], "ok")
@@ -574,7 +574,14 @@ class ResponseBodyTests(unittest.TestCase):
               "tools": [{"name": "get_pr", "description": "", "inputSchema": {
                   "type": "object"}}], "ruled_but_absent": [],
               "exposed_but_unruled": []}])
-        reply = 'data: {"jsonrpc": "2.0", "id": 1, "result": {"content": [], "n": NaN}}\n\n'
+        reply = (b'data: {"jsonrpc": "2.0", "id": 1, "result": {"content": [], "n": NaN}}'
+                 b'\n\n')
+        discovery = gateway.execute.discovery
+
+        def post(entry, message, timeout=None):
+            # Through the real reader, as the server's bytes would go.
+            return discovery.read_reply(io.BytesIO(reply), "text/event-stream", 1,
+                                        lambda request: None)
         request = self._Request(json.dumps(
             {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
              "params": {"name": "mcp-github__get_pr", "arguments": {}}}).encode())
@@ -582,8 +589,7 @@ class ResponseBodyTests(unittest.TestCase):
         with mock.patch.object(gateway.execute, "_ask_control",
                                lambda path, payload: {"decision": "allow",
                                                       "reason": "ok"}), \
-                mock.patch.object(gateway.execute.discovery, "post",
-                                  lambda entry, message, timeout=None: reply), \
+                mock.patch.object(gateway.execute.discovery, "post", post), \
                 contextlib.redirect_stdout(out):
             response = asyncio.run(gateway.mcp(request))
         self.assertEqual(response.status_code, 200)
@@ -592,6 +598,9 @@ class ResponseBodyTests(unittest.TestCase):
         self.assertTrue(result["isError"])
         line = next(ln for ln in out.getvalue().splitlines() if ln.startswith("OUTCOME"))
         self.assertTrue(line.startswith("OUTCOME transport-error mcp-github__get_pr"))
+        # Its reason, and not only its status: a reply the stand-in left unread would
+        # reach `_run`'s catch-all, a transport-error too.
+        self.assertIn("it held NaN", line)
         sha = re.search(r"sha256=([0-9a-f]{64})", line).group(1)
         hashed = gateway.protocol.encode(result)
         self.assertEqual(hashlib.sha256(hashed).hexdigest(), sha)
